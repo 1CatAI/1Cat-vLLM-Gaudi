@@ -10,6 +10,12 @@ from vllm_gaudi.ops.hpu_gdn_pytorch import (
     hpu_chunk_gated_delta_rule,
     hpu_fused_gdn_gating,
     hpu_fused_recurrent_gated_delta_rule,
+    resolve_hpu_gdn_chunk_size,
+    resolve_hpu_gdn_compact_repeated_kkt,
+    resolve_hpu_gdn_compiled_qk_l2norm,
+    resolve_hpu_gdn_fused_state_matmul,
+    resolve_hpu_gdn_neumann_iters,
+    resolve_hpu_gdn_recursive_solver_base,
 )
 
 
@@ -34,12 +40,12 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # lookup.  Stored as tensor so torch.compile treats it as dynamic.
         self.cache_group_idx = None
 
-        # mamba_chunk_size: use explicit config value or default to 128
-        # for HPU bucket alignment.
-        hf_text_config = getattr(self.model_config, "hf_text_config", None)
-        has_explicit = (hf_text_config is not None and (getattr(hf_text_config, "mamba_chunk_size", None) is not None
-                                                        or getattr(hf_text_config, "chunk_size", None) is not None))
-        self.mamba_chunk_size = (self.model_config.get_mamba_chunk_size() if has_explicit else 128)
+        self.mamba_chunk_size, _ = resolve_hpu_gdn_chunk_size(self.model_config)
+        self.gdn_fused_state_matmul = resolve_hpu_gdn_fused_state_matmul()
+        self.gdn_neumann_iters = resolve_hpu_gdn_neumann_iters()
+        self.gdn_recursive_solver_base = resolve_hpu_gdn_recursive_solver_base()
+        self.gdn_compact_repeated_kkt = resolve_hpu_gdn_compact_repeated_kkt()
+        self.gdn_compiled_qk_l2norm = resolve_hpu_gdn_compiled_qk_l2norm()
 
         self.qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
         self.z_size = self.value_dim // self.tp_size
@@ -233,6 +239,11 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 chunk_size=self.mamba_chunk_size,
                 prefill_num_seqs=prefill_num_seqs,
                 prefill_seq_len=prefill_seq_len,
+                neumann_iters=self.gdn_neumann_iters,
+                fused_state_matmul=self.gdn_fused_state_matmul,
+                recursive_solver_base=self.gdn_recursive_solver_base,
+                compact_repeated_kkt=self.gdn_compact_repeated_kkt,
+                compile_qk_l2norm=self.gdn_compiled_qk_l2norm,
             )
             # State save in dynamo-disabled wrapper — index_copy_ is
             # silently dropped by HPU torch.compile on aliased tensors.

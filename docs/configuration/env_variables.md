@@ -32,6 +32,12 @@ This document lists the supported diagnostic and profiling, as well as performan
 | `VLLM_MINIMAX_M3_MOE_TOKEN_TILE` | Maximum number of tokens processed per tile by the MiniMax-M3 dense SwiGLU-OAI expert path. Non-positive values disable tiling. | `512` |
 | `VLLM_MINIMAX_M3_MOE_DECODE_GATHER` | Enables the MiniMax-M3 routed-expert gather path for low-token decode. Set to `0` or `false` to use the dense expert path. | `true` |
 | `VLLM_MINIMAX_M3_MOE_GATHER_MAX_TOKENS` | Maximum token count for the MiniMax-M3 routed-expert gather path. Larger batches use the dense expert path. | `16` |
+| `VLLM_GDN_CHUNK_SIZE` | Overrides the GDN prefill chunk size. Set to a positive multiple of 32; `0` keeps the model-provided value or the HPU default. | `0` |
+| `VLLM_GDN_NEUMANN_ITERS` | Sets the iteration budget for the approximate GDN triangular solve. Lower values can improve prefill speed but require model-level quality validation. | `14` |
+| `VLLM_GDN_FUSED_STATE_MATMUL` | Fuses the GDN phase-B output and recurrent-state projections into one larger matrix multiplication per chunk. | `false` |
+| `VLLM_GDN_RECURSIVE_SOLVER_BASE` | Enables recursive block inversion for the GDN triangular solve. Set to `0` to disable it or a power-of-two base size of which the chunk size is a power-of-two multiple. | `0` |
+| `VLLM_GDN_COMPACT_REPEATED_KKT` | Computes the GDN KKT product once per unique key head when value heads repeat the same key heads. | `false` |
+| `VLLM_GDN_COMPILED_QK_L2NORM` | Keeps GDN Q/K L2 normalization inside the compiled prefill graph. Leave disabled on HPU compiler versions where this path has not been validated. | `false` |
 
 Use `VLLM_BUCKETING_STRATEGY=exp` for the default exponential warm-up, `VLLM_BUCKETING_STRATEGY=lin` for explicitly configured linear ranges, or `VLLM_BUCKETING_STRATEGY=pad` for padding-aware ranges with absolute and relative padding limits.
 
