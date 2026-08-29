@@ -18,7 +18,11 @@ from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData, Schedu
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor)
 from vllm.v1.sample.metadata import SamplingMetadata
 import vllm_gaudi.extension.environment as environment
-from vllm_gaudi.v1.worker.hpu_model_runner import HPUModelRunner
+from vllm_gaudi.v1.worker.hpu_model_runner import (
+    HPUModelRunner,
+    HpuModelAdapter,
+    maybe_set_mamba_kv_cache_groups_ids,
+)
 from vllm_gaudi.v1.worker.hpu_input_batch import InputBatch
 
 BLOCK_SIZE = 128
@@ -658,6 +662,20 @@ def test_model_torch_regional_compilation(default_vllm_config: None, dist_init, 
     assert_compilation(model, "lm_head", VocabParallelEmbedding)
     assert_compilation(model, "model.decoder.final_layer_norm", LayerNorm)
     assert_compilation(model, "model.decoder.embed_tokens", VocabParallelEmbedding)
+
+
+def test_mamba_cache_groups_handle_whole_model_compile_wrapper():
+    base_model = torch.nn.Module()
+    base_model.config = SimpleNamespace(architectures=[])
+
+    adapter = object.__new__(HpuModelAdapter)
+    torch.nn.Module.__init__(adapter)
+    adapter.model = base_model
+
+    compiled_model = SimpleNamespace(_orig_mod=adapter)
+    kv_cache_config = SimpleNamespace(kv_cache_groups=[])
+
+    maybe_set_mamba_kv_cache_groups_ids(compiled_model, kv_cache_config)
 
 
 def test_max_cudagraph_capture_size_defaults_to_max_num_batched_tokens(model_runner):

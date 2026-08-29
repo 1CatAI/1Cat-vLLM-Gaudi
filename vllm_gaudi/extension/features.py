@@ -45,6 +45,7 @@ def get_user_flags():
         Env('VLLM_DECODE_BLOCK_BUCKET_PAD_PERCENT', int),
         Env('VLLM_BUCKETING_STRATEGY', str),
         Env('VLLM_BUCKETING_FROM_FILE', str),
+        Env('VLLM_HPU_QWEN3_COMPILE_LAYER_GROUP_SIZE', int),
 
         # Non-vllm flags that are also important to print
         Env('EXPERIMENTAL_WEIGHT_SHARING', str),

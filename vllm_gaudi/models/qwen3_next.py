@@ -2,6 +2,7 @@ from itertools import islice
 
 import torch
 from vllm.distributed import get_pp_group, tensor_model_parallel_all_gather
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.models.qwen3_next import (
     Qwen3NextAttention,
     Qwen3NextModel as UpstreamQwen3NextModel,
@@ -9,6 +10,68 @@ from vllm.model_executor.models.qwen3_next import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm_gaudi.models.utils import sequence_parallel_chunk
+
+
+class HpuQwen3DecoderLayerGroup(torch.nn.Module):
+    """Run several decoder layers inside one torch.compile region."""
+
+    def __init__(self, layers: tuple[torch.nn.Module, ...]):
+        super().__init__()
+        # The model's ModuleList remains the sole owner of these layers so
+        # state-dict and KV-cache layer names stay unchanged.
+        object.__setattr__(self, "_layers", layers)
+
+    def forward(
+        self,
+        *,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        for layer in self._layers:
+            hidden_states, residual = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+        return hidden_states, residual
+
+
+def build_hpu_qwen3_layer_groups(
+    model: "HpuQwen3NextModel",
+    group_size: int,
+) -> tuple[HpuQwen3DecoderLayerGroup, ...]:
+    if group_size < 1:
+        raise ValueError(f"group_size must be positive, got {group_size}")
+
+    layers = tuple(islice(model.layers, model.start_layer, model.end_layer))
+    return tuple(
+        HpuQwen3DecoderLayerGroup(layers[start:start + group_size])
+        for start in range(0, len(layers), group_size)
+    )
+
+
+def compile_hpu_qwen3_layer_groups(
+    model: "HpuQwen3NextModel",
+    group_size: int,
+    compile_fn,
+) -> tuple[torch.nn.Module, ...]:
+    compiled_groups = tuple(compile_fn(group) for group in build_hpu_qwen3_layer_groups(model, group_size))
+    object.__setattr__(model, "_hpu_compiled_layer_groups", compiled_groups)
+    return compiled_groups
+
+
+def can_use_hpu_qwen3_layer_groups(
+    layer_groups: tuple[torch.nn.Module, ...] | None,
+    aux_hidden_state_layers: tuple[int, ...] | list[int] | None,
+    attn_metadata,
+) -> bool:
+    return (
+        layer_groups is not None
+        and not aux_hidden_state_layers
+        and attn_metadata is not None
+        and not bool(getattr(attn_metadata, "is_prompt", False))
+    )
 
 
 class HpuQwen3NextModel(UpstreamQwen3NextModel):
@@ -36,16 +99,26 @@ class HpuQwen3NextModel(UpstreamQwen3NextModel):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
-        for layer_idx, layer in enumerate(
-                islice(self.layers, self.start_layer, self.end_layer),
-                start=self.start_layer,
-        ):
-            hidden_states, residual = layer(
-                positions=positions,
-                hidden_states=hidden_states,
-                residual=residual,
-            )
-            self._maybe_add_hidden_state(aux_hidden_states, layer_idx + 1, hidden_states, residual)
+        layer_groups = getattr(self, "_hpu_compiled_layer_groups", None)
+        attn_metadata = get_forward_context().attn_metadata
+        if can_use_hpu_qwen3_layer_groups(layer_groups, self.aux_hidden_state_layers, attn_metadata):
+            for layer_group in layer_groups:
+                hidden_states, residual = layer_group(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                )
+        else:
+            for layer_idx, layer in enumerate(
+                    islice(self.layers, self.start_layer, self.end_layer),
+                    start=self.start_layer,
+            ):
+                hidden_states, residual = layer(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                )
+                self._maybe_add_hidden_state(aux_hidden_states, layer_idx + 1, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
