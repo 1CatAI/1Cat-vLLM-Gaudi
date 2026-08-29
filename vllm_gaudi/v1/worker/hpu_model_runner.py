@@ -786,6 +786,7 @@ def patch_llama4_get_attn_scale(model):
 
 
 def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig):
+    model = getattr(model, "_orig_mod", model)
     if isinstance(model, HpuModelAdapter):
         model = model.model
 
@@ -4994,6 +4995,37 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         1. Children of the nn.ModuleList
         2. Member of regional_compilation_layers_list
         """
+        from vllm_gaudi.models.qwen3_next import (
+            HpuQwen3NextModel,
+            compile_hpu_qwen3_layer_groups,
+        )
+
+        if isinstance(module, HpuQwen3NextModel):
+            group_size = get_config().VLLM_HPU_QWEN3_COMPILE_LAYER_GROUP_SIZE or 1
+            if group_size < 1:
+                logger.warning("VLLM_HPU_QWEN3_COMPILE_LAYER_GROUP_SIZE must be positive, using 1")
+                group_size = 1
+
+            tensor_parallel_size = self.parallel_config.tensor_parallel_size
+            can_compile_groups = (
+                group_size > 1
+                and tensor_parallel_size == 1
+                and not module.aux_hidden_state_layers
+                and not hasattr(module, "_hpu_compiled_layer_groups")
+            )
+            if can_compile_groups:
+                compiled_groups = compile_hpu_qwen3_layer_groups(module, group_size, self._compile)
+                logger.info(
+                    "Compiled %d Qwen3 decoder layer groups with group size %d",
+                    len(compiled_groups),
+                    group_size,
+                )
+            elif group_size > 1 and tensor_parallel_size != 1:
+                logger.warning(
+                    "VLLM_HPU_QWEN3_COMPILE_LAYER_GROUP_SIZE is only supported with tensor parallel size 1; "
+                    "using per-layer compilation"
+                )
+
         if isinstance(module, torch.nn.ModuleList):
             for children_name, children_module in module.named_children():
                 self._compile_region(module, children_name, children_module)
