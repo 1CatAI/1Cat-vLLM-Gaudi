@@ -115,6 +115,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import Of
 from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
 from vllm.v1.core.sched.output import GrammarOutput
 from vllm_gaudi.attention.backends.hpu_attn import HPUAttentionImpl
+from vllm_gaudi.ops.hpu_gdn_pytorch import resolve_hpu_gdn_chunk_size
 
 if TYPE_CHECKING:
     import xgrammar as xgr
@@ -1427,18 +1428,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     "VLLM_COMPACT_GDN=%s", self.num_gdn, os.environ["VLLM_USE_HYBRID_CACHE"],
                     os.environ["VLLM_USE_NAIVE_MAMBA_CACHE_SHARING"], os.environ["VLLM_COMPACT_GDN"])
 
-        hf_text_config = self.model_config.hf_text_config
-        self.mamba_chunk_size_is_explicit = (self.num_mamba_like_layers > 0
-                                             and (getattr(hf_text_config, "mamba_chunk_size", None) is not None
-                                                  or getattr(hf_text_config, "chunk_size", None) is not None))
-
-        # For HPU GDN, use configured chunk size when explicitly provided;
-        # otherwise default to 128 to match bucket alignment.
         if self.num_mamba_like_layers > 0:
-            self.mamba_chunk_size = (self.model_config.get_mamba_chunk_size()
-                                     if self.mamba_chunk_size_is_explicit else 128)
+            self.mamba_chunk_size, self.mamba_chunk_size_is_explicit = resolve_hpu_gdn_chunk_size(self.model_config)
         else:
             self.mamba_chunk_size = 0
+            self.mamba_chunk_size_is_explicit = False
 
         self.use_hybrid_cache = os.getenv('VLLM_USE_HYBRID_CACHE', 'false').strip().lower() in ("1", "true")
         self.use_naive_mamba_cache_sharing = os.getenv('VLLM_USE_NAIVE_MAMBA_CACHE_SHARING',

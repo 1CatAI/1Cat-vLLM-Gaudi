@@ -21,6 +21,12 @@ if TYPE_CHECKING:
     VLLM_HPU_GDN_DIRECT_STATE: bool = True
     VLLM_HPU_CGUID_DYNAMIC_QUANT: bool = False
     VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS: int = 32
+    VLLM_GDN_CHUNK_SIZE: int = 0
+    VLLM_GDN_NEUMANN_ITERS: int = 14
+    VLLM_GDN_FUSED_STATE_MATMUL: bool = False
+    VLLM_GDN_RECURSIVE_SOLVER_BASE: int = 0
+    VLLM_GDN_COMPACT_REPEATED_KKT: bool = False
+    VLLM_GDN_COMPILED_QK_L2NORM: bool = False
 
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
@@ -113,6 +119,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ).strip().lower() in ("1", "true"),
     "VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS":
     lambda: int(os.environ.get("VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS", "32")),
+
+    # Override the GDN prefill chunk size. Zero preserves the model-provided
+    # value, or the HPU default when the model does not specify one.
+    "VLLM_GDN_CHUNK_SIZE":
+    lambda: int(os.environ.get("VLLM_GDN_CHUNK_SIZE", "0")),
+
+    # Iteration budget for the approximate GDN triangular solve.
+    "VLLM_GDN_NEUMANN_ITERS":
+    lambda: int(os.environ.get("VLLM_GDN_NEUMANN_ITERS", "14")),
+
+    # Fuse the output and recurrent-state projections in GDN phase B.
+    "VLLM_GDN_FUSED_STATE_MATMUL":
+    lambda: os.environ.get("VLLM_GDN_FUSED_STATE_MATMUL", "false").lower() in ("1", "true"),
+
+    # Use recursive block inversion for GDN unit lower-triangular matrices.
+    # Zero disables the path; a positive power of two selects the base size.
+    "VLLM_GDN_RECURSIVE_SOLVER_BASE":
+    lambda: int(os.environ.get("VLLM_GDN_RECURSIVE_SOLVER_BASE", "0")),
+
+    # Compute the GDN K @ K^T product only for unique key heads, then
+    # broadcast it across repeated value-head groups.
+    "VLLM_GDN_COMPACT_REPEATED_KKT":
+    lambda: os.environ.get("VLLM_GDN_COMPACT_REPEATED_KKT", "false").lower() in ("1", "true"),
+
+    # Keep GDN Q/K L2 normalization inside the compiled prefill graph.
+    "VLLM_GDN_COMPILED_QK_L2NORM":
+    lambda: os.environ.get("VLLM_GDN_COMPILED_QK_L2NORM", "false").lower() in ("1", "true"),
 }
 
 # end-env-vars-definition

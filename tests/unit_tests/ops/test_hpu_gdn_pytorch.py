@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib
 import os
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -189,6 +190,48 @@ class TestSolveLowerTriangularBatched:
             assert residuals[i] <= residuals[i - 1] + 1e-7, ("Residual increased: "
                                                              f"iters {iter_steps[i - 1]}->{iter_steps[i]}: "
                                                              f"{residuals[i - 1]:.6f}->{residuals[i]:.6f}")
+
+    def test_recursive_solver_matches_refinement(self, gdn):
+        n = 64
+        lmat, eye = _make_lower_triangular(n, batch=4, seed=19)
+
+        refinement_inv = gdn._hpu_solve_lower_triangular_batched(
+            lmat,
+            eye,
+            use_vectorized=True,
+            neumann_iters=8,
+        )
+        recursive_inv = gdn._hpu_solve_lower_triangular_batched(
+            lmat,
+            eye,
+            use_vectorized=True,
+            neumann_iters=8,
+            recursive_base=16,
+        )
+
+        torch.testing.assert_close(recursive_inv, refinement_inv, atol=1e-5, rtol=1e-5)
+
+    def test_recursive_solver_rejects_invalid_matrix_size(self, gdn):
+        lmat, eye = _make_lower_triangular(64, batch=1)
+
+        with pytest.raises(ValueError, match="power-of-two multiple"):
+            gdn._hpu_solve_lower_triangular_batched(
+                lmat,
+                eye,
+                use_vectorized=True,
+                neumann_iters=8,
+                recursive_base=128,
+            )
+
+        lmat, eye = _make_lower_triangular(96, batch=1)
+        with pytest.raises(ValueError, match="power-of-two multiple"):
+            gdn._hpu_solve_lower_triangular_batched(
+                lmat,
+                eye,
+                use_vectorized=True,
+                neumann_iters=8,
+                recursive_base=16,
+            )
 
     def test_identity_input(self, gdn):
         """Inverse of identity matrix is identity."""
@@ -588,6 +631,72 @@ class TestChunkGatedDeltaRule:
         assert not torch.isnan(out).any(), "NaN in output with padding"
         assert not torch.isinf(out).any(), "Inf in output with padding"
 
+    def test_fused_state_matmul_matches_separate_projections(self, gdn_exact):
+        B, T, H, K, HV, V = 1, 48, 2, 8, 2, 8
+        q, k, v, g, beta = _make_gdn_inputs(B, T, H, HV, K, V, seed=109)
+
+        separate_out, separate_state = gdn_exact.hpu_chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            chunk_size=16,
+            output_final_state=True,
+            prefill_num_seqs=B,
+            prefill_seq_len=T,
+            neumann_iters=14,
+        )
+        fused_out, fused_state = gdn_exact.hpu_chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            chunk_size=16,
+            output_final_state=True,
+            prefill_num_seqs=B,
+            prefill_seq_len=T,
+            neumann_iters=14,
+            fused_state_matmul=True,
+        )
+
+        torch.testing.assert_close(fused_out, separate_out, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(fused_state, separate_state, atol=1e-5, rtol=1e-5)
+
+    def test_compact_repeated_kkt_matches_expanded_heads(self, gdn_exact):
+        B, T, H, K, HV, V = 1, 48, 2, 8, 4, 8
+        q, k, v, g, beta = _make_gdn_inputs(B, T, H, HV, K, V, seed=131)
+
+        expanded_out, expanded_state = gdn_exact.hpu_chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            chunk_size=16,
+            output_final_state=True,
+            prefill_num_seqs=B,
+            prefill_seq_len=T,
+            neumann_iters=14,
+        )
+        compact_out, compact_state = gdn_exact.hpu_chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            chunk_size=16,
+            output_final_state=True,
+            prefill_num_seqs=B,
+            prefill_seq_len=T,
+            neumann_iters=14,
+            compact_repeated_kkt=True,
+        )
+
+        torch.testing.assert_close(compact_out, expanded_out, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(compact_state, expanded_state, atol=1e-5, rtol=1e-5)
+
     def test_chunk_multiple_sequences(self, gdn):
         """Multiple sequences (S > 1) should work."""
         S, T, H, K, HV, V = 3, 32, 2, 8, 2, 8
@@ -706,6 +815,81 @@ class TestChunkGatedDeltaRule:
 class TestEnvVarToggles:
     """Verify that environment variable toggles change behavior."""
 
+    def test_gdn_chunk_size_resolution(self):
+        default_model = SimpleNamespace(
+            hf_text_config=SimpleNamespace(),
+            get_mamba_chunk_size=lambda: 256,
+        )
+        explicit_model = SimpleNamespace(
+            hf_text_config=SimpleNamespace(mamba_chunk_size=256),
+            get_mamba_chunk_size=lambda: 256,
+        )
+
+        with mock.patch.dict(os.environ, {"VLLM_GDN_CHUNK_SIZE": "0"}):
+            mod = _import_gdn()
+            assert mod.resolve_hpu_gdn_chunk_size(default_model) == (128, False)
+            assert mod.resolve_hpu_gdn_chunk_size(explicit_model) == (256, True)
+
+        with mock.patch.dict(os.environ, {"VLLM_GDN_CHUNK_SIZE": "64"}):
+            mod = _import_gdn()
+            assert mod.resolve_hpu_gdn_chunk_size(default_model) == (64, True)
+
+        with mock.patch.dict(os.environ, {"VLLM_GDN_CHUNK_SIZE": "48"}):
+            mod = _import_gdn()
+            with pytest.raises(ValueError, match="positive multiple of 32"):
+                mod.resolve_hpu_gdn_chunk_size(default_model)
+
+    def test_gdn_neumann_iteration_resolution(self):
+        with mock.patch.dict(os.environ, {"VLLM_GDN_NEUMANN_ITERS": "14"}):
+            mod = _import_gdn()
+            assert mod.resolve_hpu_gdn_neumann_iters() == 14
+
+        with mock.patch.dict(os.environ, {"VLLM_GDN_NEUMANN_ITERS": "8"}):
+            mod = _import_gdn()
+            assert mod.resolve_hpu_gdn_neumann_iters() == 8
+
+        with mock.patch.dict(os.environ, {"VLLM_GDN_NEUMANN_ITERS": "0"}):
+            mod = _import_gdn()
+            with pytest.raises(ValueError, match="positive integer"):
+                mod.resolve_hpu_gdn_neumann_iters()
+
+    def test_gdn_fused_state_matmul_resolution(self):
+        with mock.patch.dict(os.environ, {"VLLM_GDN_FUSED_STATE_MATMUL": "1"}):
+            mod = _import_gdn()
+            assert mod.resolve_hpu_gdn_fused_state_matmul() is True
+
+        with mock.patch.dict(os.environ, {"VLLM_GDN_FUSED_STATE_MATMUL": "0"}):
+            mod = _import_gdn()
+            assert mod.resolve_hpu_gdn_fused_state_matmul() is False
+
+    def test_gdn_recursive_solver_base_resolution(self):
+        with mock.patch.dict(os.environ, {"VLLM_GDN_RECURSIVE_SOLVER_BASE": "16"}):
+            mod = _import_gdn()
+            assert mod.resolve_hpu_gdn_recursive_solver_base() == 16
+
+        with mock.patch.dict(os.environ, {"VLLM_GDN_RECURSIVE_SOLVER_BASE": "12"}):
+            mod = _import_gdn()
+            with pytest.raises(ValueError, match="power of two"):
+                mod.resolve_hpu_gdn_recursive_solver_base()
+
+    def test_gdn_compact_repeated_kkt_resolution(self):
+        with mock.patch.dict(os.environ, {"VLLM_GDN_COMPACT_REPEATED_KKT": "1"}):
+            mod = _import_gdn()
+            assert mod.resolve_hpu_gdn_compact_repeated_kkt() is True
+
+        with mock.patch.dict(os.environ, {"VLLM_GDN_COMPACT_REPEATED_KKT": "0"}):
+            mod = _import_gdn()
+            assert mod.resolve_hpu_gdn_compact_repeated_kkt() is False
+
+    def test_gdn_compiled_qk_l2norm_resolution(self):
+        with mock.patch.dict(os.environ, {"VLLM_GDN_COMPILED_QK_L2NORM": "1"}):
+            mod = _import_gdn()
+            assert mod.resolve_hpu_gdn_compiled_qk_l2norm() is True
+
+        with mock.patch.dict(os.environ, {"VLLM_GDN_COMPILED_QK_L2NORM": "0"}):
+            mod = _import_gdn()
+            assert mod.resolve_hpu_gdn_compiled_qk_l2norm() is False
+
     def test_exact_solve_flag(self):
         """VLLM_GDN_EXACT_SOLVE=1 should activate exact forward-sub."""
         mod = _import_gdn({"VLLM_GDN_EXACT_SOLVE": "1"})
@@ -803,6 +987,16 @@ class TestPreprocessAndHelpers:
         x = torch.zeros(2, 4, 8)
         normed = gdn._l2norm_last_dim(x)
         assert not torch.isnan(normed).any()
+
+    def test_compiled_qk_l2norm_matches_eager_helper(self, gdn):
+        q = torch.randn(1, 16, 2, 8, dtype=torch.bfloat16)
+        k = torch.randn(1, 16, 2, 8, dtype=torch.bfloat16)
+
+        compiled_q, compiled_k = gdn._preprocess_qk_l2norm_compiled(q, k)
+        eager_q, eager_k = gdn._preprocess_qk_l2norm(q, k)
+
+        torch.testing.assert_close(compiled_q, eager_q, atol=0, rtol=0)
+        torch.testing.assert_close(compiled_k, eager_k, atol=0, rtol=0)
 
     def test_preprocess_output_shapes(self, gdn):
         """hpu_chunk_gdr_preprocess should return correctly shaped tensors."""
