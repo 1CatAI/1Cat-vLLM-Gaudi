@@ -12,6 +12,9 @@ from vllm.sequence import IntermediateTensors
 from vllm_gaudi.models.utils import sequence_parallel_chunk
 
 
+HPU_QWEN3_LAYER_GROUP_MAX_BATCH_SIZE = 16
+
+
 class HpuQwen3DecoderLayerGroup(torch.nn.Module):
     """Run several decoder layers inside one torch.compile region."""
 
@@ -61,16 +64,30 @@ def compile_hpu_qwen3_layer_groups(
     return compiled_groups
 
 
+def can_compile_hpu_qwen3_layer_groups(
+    group_size: int,
+    tensor_parallel_size: int,
+    aux_hidden_state_layers: tuple[int, ...] | list[int] | None,
+) -> bool:
+    return (
+        group_size > 1
+        and tensor_parallel_size == 1
+        and not aux_hidden_state_layers
+    )
+
+
 def can_use_hpu_qwen3_layer_groups(
     layer_groups: tuple[torch.nn.Module, ...] | None,
     aux_hidden_state_layers: tuple[int, ...] | list[int] | None,
     attn_metadata,
+    batch_size: int,
 ) -> bool:
     return (
         layer_groups is not None
         and not aux_hidden_state_layers
         and attn_metadata is not None
         and not bool(getattr(attn_metadata, "is_prompt", False))
+        and batch_size <= HPU_QWEN3_LAYER_GROUP_MAX_BATCH_SIZE
     )
 
 
@@ -101,7 +118,12 @@ class HpuQwen3NextModel(UpstreamQwen3NextModel):
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         layer_groups = getattr(self, "_hpu_compiled_layer_groups", None)
         attn_metadata = get_forward_context().attn_metadata
-        if can_use_hpu_qwen3_layer_groups(layer_groups, self.aux_hidden_state_layers, attn_metadata):
+        if can_use_hpu_qwen3_layer_groups(
+            layer_groups,
+            self.aux_hidden_state_layers,
+            attn_metadata,
+            hidden_states.shape[0],
+        ):
             for layer_group in layer_groups:
                 hidden_states, residual = layer_group(
                     positions=positions,

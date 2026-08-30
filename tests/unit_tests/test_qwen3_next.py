@@ -9,6 +9,7 @@ import torch
 from vllm_gaudi.models.qwen3_next import (
     HpuQwen3DecoderLayerGroup,
     build_hpu_qwen3_layer_groups,
+    can_compile_hpu_qwen3_layer_groups,
     can_use_hpu_qwen3_layer_groups,
     compile_hpu_qwen3_layer_groups,
 )
@@ -73,14 +74,33 @@ def test_compile_hpu_qwen3_layer_groups_attaches_compiled_groups():
 
 
 @pytest.mark.parametrize(
-    ("layer_groups", "aux_layers", "attn_metadata", "expected"),
+    ("group_size", "tp_size", "aux_layers", "expected"),
     [
-        ((HpuQwen3DecoderLayerGroup(tuple()),), [], SimpleNamespace(is_prompt=False), True),
-        ((HpuQwen3DecoderLayerGroup(tuple()),), [], SimpleNamespace(is_prompt=True), False),
-        ((HpuQwen3DecoderLayerGroup(tuple()),), [1], SimpleNamespace(is_prompt=False), False),
-        (None, [], SimpleNamespace(is_prompt=False), False),
-        ((HpuQwen3DecoderLayerGroup(tuple()),), [], None, False),
+        (8, 1, [], True),
+        (8, 2, [], False),
+        (8, 1, [1], False),
+        (1, 1, [], False),
     ],
 )
-def test_can_use_hpu_qwen3_layer_groups(layer_groups, aux_layers, attn_metadata, expected):
-    assert can_use_hpu_qwen3_layer_groups(layer_groups, aux_layers, attn_metadata) is expected
+def test_can_compile_hpu_qwen3_layer_groups(
+    group_size,
+    tp_size,
+    aux_layers,
+    expected,
+):
+    assert can_compile_hpu_qwen3_layer_groups(group_size, tp_size, aux_layers) is expected
+
+
+@pytest.mark.parametrize(
+    ("layer_groups", "aux_layers", "attn_metadata", "batch_size", "expected"),
+    [
+        ((HpuQwen3DecoderLayerGroup(tuple()),), [], SimpleNamespace(is_prompt=False), 16, True),
+        ((HpuQwen3DecoderLayerGroup(tuple()),), [], SimpleNamespace(is_prompt=False), 17, False),
+        ((HpuQwen3DecoderLayerGroup(tuple()),), [], SimpleNamespace(is_prompt=True), 1, False),
+        ((HpuQwen3DecoderLayerGroup(tuple()),), [1], SimpleNamespace(is_prompt=False), 1, False),
+        (None, [], SimpleNamespace(is_prompt=False), 1, False),
+        ((HpuQwen3DecoderLayerGroup(tuple()),), [], None, 1, False),
+    ],
+)
+def test_can_use_hpu_qwen3_layer_groups(layer_groups, aux_layers, attn_metadata, batch_size, expected):
+    assert can_use_hpu_qwen3_layer_groups(layer_groups, aux_layers, attn_metadata, batch_size) is expected

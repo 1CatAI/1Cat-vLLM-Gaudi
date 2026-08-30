@@ -533,6 +533,14 @@ class BucketingFailedException(Exception):
     pass
 
 
+def should_synchronize_hybrid_prefill_output(
+    use_async_scheduling: bool,
+    num_mamba_like_layers: int,
+    num_prefills: int,
+) -> bool:
+    return use_async_scheduling and num_mamba_like_layers > 0 and num_prefills > 0
+
+
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncHPUModelRunnerOutput(AsyncModelRunnerOutput):
 
@@ -4778,12 +4786,23 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     finished_sending=finished_sending,
                     finished_recving=finished_recving,
                 ))
-            return AsyncHPUModelRunnerOutput(
+            async_output = AsyncHPUModelRunnerOutput(
                 model_runner_output=model_runner_output,
                 sampled_token_ids=sampled_token_ids,
                 invalid_req_indices=self.invalid_req_indices,
                 async_output_copy_stream=self.async_output_copy_stream,
             )
+            # Hybrid recurrent states and request rows are still being
+            # established while prefills enter the decode batch. Settle those
+            # transitions before scheduling another batch, then retain normal
+            # async overlap for the pure-decode steady state.
+            if should_synchronize_hybrid_prefill_output(
+                self.use_async_scheduling,
+                self.num_mamba_like_layers,
+                num_prefills,
+            ):
+                return async_output.get_output()
+            return async_output
         model_runner_output = ModelRunnerOutput(
             req_ids=all_req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
@@ -4997,6 +5016,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         """
         from vllm_gaudi.models.qwen3_next import (
             HpuQwen3NextModel,
+            can_compile_hpu_qwen3_layer_groups,
             compile_hpu_qwen3_layer_groups,
         )
 
@@ -5008,9 +5028,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
             tensor_parallel_size = self.parallel_config.tensor_parallel_size
             can_compile_groups = (
-                group_size > 1
-                and tensor_parallel_size == 1
-                and not module.aux_hidden_state_layers
+                can_compile_hpu_qwen3_layer_groups(
+                    group_size,
+                    tensor_parallel_size,
+                    module.aux_hidden_state_layers,
+                )
                 and not hasattr(module, "_hpu_compiled_layer_groups")
             )
             if can_compile_groups:

@@ -22,6 +22,7 @@ from vllm_gaudi.v1.worker.hpu_model_runner import (
     HPUModelRunner,
     HpuModelAdapter,
     maybe_set_mamba_kv_cache_groups_ids,
+    should_synchronize_hybrid_prefill_output,
 )
 from vllm_gaudi.v1.worker.hpu_input_batch import InputBatch
 
@@ -676,6 +677,19 @@ def test_mamba_cache_groups_handle_whole_model_compile_wrapper():
     kv_cache_config = SimpleNamespace(kv_cache_groups=[])
 
     maybe_set_mamba_kv_cache_groups_ids(compiled_model, kv_cache_config)
+
+
+@pytest.mark.parametrize(
+    ("use_async", "num_mamba_layers", "num_prefills", "expected"),
+    [
+        (True, 48, 1, True),
+        (True, 48, 0, False),
+        (True, 0, 1, False),
+        (False, 48, 1, False),
+    ],
+)
+def test_should_synchronize_hybrid_prefill_output(use_async, num_mamba_layers, num_prefills, expected):
+    assert should_synchronize_hybrid_prefill_output(use_async, num_mamba_layers, num_prefills) is expected
 
 
 def test_max_cudagraph_capture_size_defaults_to_max_num_batched_tokens(model_runner):
