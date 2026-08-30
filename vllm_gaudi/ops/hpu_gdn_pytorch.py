@@ -99,6 +99,44 @@ def resolve_hpu_gdn_compiled_qk_l2norm() -> bool:
     return gaudi_envs.VLLM_GDN_COMPILED_QK_L2NORM
 
 
+def resolve_hpu_gdn_fused_rmsnorm_gated() -> bool:
+    """Resolve whether Qwen GDN prefill uses Habana FusedRMSNorm."""
+    return gaudi_envs.VLLM_GDN_FUSED_RMSNORM_GATED
+
+
+def hpu_fused_rmsnorm_gated(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    activation: str,
+) -> torch.Tensor:
+    """Apply HPU FusedRMSNorm followed by the Qwen GDN output gate."""
+    if activation not in ("silu", "swish", "sigmoid"):
+        raise ValueError(f"Unsupported GDN output gate activation: {activation}.")
+
+    from vllm_gaudi.extension.kernels import rms_norm
+
+    original_shape = x.shape
+    fused_rms_norm = rms_norm()
+    if fused_rms_norm is None:
+        raise RuntimeError(
+            "Habana FusedRMSNorm is unavailable on this HPU software stack."
+        )
+    normalized = fused_rms_norm.apply(
+        x.reshape(1, -1, x.shape[-1]),
+        weight,
+        epsilon,
+    ).reshape(original_shape)
+    z_float = z.to(torch.float32)
+    gate = (
+        torch.sigmoid(z_float)
+        if activation == "sigmoid"
+        else torch.nn.functional.silu(z_float)
+    )
+    return (normalized.to(torch.float32) * gate).to(x.dtype)
+
+
 def _preprocess_qk_l2norm_compiled(q, k):
     """Normalize Q/K inside the compiled graph for validated HPU stacks."""
     q = _l2norm_last_dim(q.to(torch.float32))

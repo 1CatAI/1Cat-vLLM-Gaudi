@@ -38,6 +38,7 @@ This document lists the supported diagnostic and profiling, as well as performan
 | `VLLM_GDN_RECURSIVE_SOLVER_BASE` | Enables recursive block inversion for the GDN triangular solve. Set to `0` to disable it or a power-of-two base size of which the chunk size is a power-of-two multiple. | `0` |
 | `VLLM_GDN_COMPACT_REPEATED_KKT` | Computes the GDN KKT product once per unique key head when value heads repeat the same key heads. | `false` |
 | `VLLM_GDN_COMPILED_QK_L2NORM` | Keeps GDN Q/K L2 normalization inside the compiled prefill graph. Leave disabled on HPU compiler versions where this path has not been validated. | `false` |
+| `VLLM_GDN_FUSED_RMSNORM_GATED` | Uses Habana FusedRMSNorm for Qwen GDN output normalization before the output gate during prefill. Decode is unchanged. | `false` |
 
 Use `VLLM_BUCKETING_STRATEGY=exp` for the default exponential warm-up, `VLLM_BUCKETING_STRATEGY=lin` for explicitly configured linear ranges, or `VLLM_BUCKETING_STRATEGY=pad` for padding-aware ranges with absolute and relative padding limits.
 

@@ -347,6 +347,65 @@ class TestFusedGdnGating:
         torch.testing.assert_close(g, expected_g, atol=1e-5, rtol=1e-5)
 
 
+class TestFusedRmsNormGated:
+    """Tests for the prompt-only fused RMSNorm and output gate helper."""
+
+    @pytest.mark.parametrize("activation", ["silu", "swish", "sigmoid"])
+    def test_matches_qwen_gated_rmsnorm(self, gdn, activation):
+        class FakeFusedRMSNorm:
+            @staticmethod
+            def apply(x, weight, epsilon):
+                variance = x.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
+                normalized = x.to(torch.float32) * torch.rsqrt(variance + epsilon)
+                return (normalized * weight.to(torch.float32)).to(x.dtype)
+
+        torch.manual_seed(7)
+        x = torch.randn(2, 3, 16, dtype=torch.bfloat16)
+        z = torch.randn_like(x)
+        weight = torch.randn(16, dtype=torch.bfloat16)
+        epsilon = 1e-6
+
+        variance = x.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
+        normalized = (
+            x.to(torch.float32)
+            * torch.rsqrt(variance + epsilon)
+            * weight.to(torch.float32)
+        ).to(x.dtype)
+        z_float = z.to(torch.float32)
+        gate = (
+            torch.sigmoid(z_float)
+            if activation == "sigmoid"
+            else F.silu(z_float)
+        )
+        expected = (normalized.to(torch.float32) * gate).to(x.dtype)
+
+        with mock.patch(
+            "vllm_gaudi.extension.kernels.rms_norm",
+            return_value=FakeFusedRMSNorm,
+        ):
+            actual = gdn.hpu_fused_rmsnorm_gated(
+                x,
+                z,
+                weight,
+                epsilon,
+                activation,
+            )
+
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        assert actual.shape == x.shape
+
+    def test_rejects_unsupported_activation(self, gdn):
+        x = torch.zeros(2, 8)
+        with pytest.raises(ValueError, match="Unsupported GDN output gate activation"):
+            gdn.hpu_fused_rmsnorm_gated(x, x, torch.ones(8), 1e-6, "gelu")
+
+    def test_reports_missing_habana_kernel(self, gdn):
+        x = torch.zeros(2, 8)
+        with mock.patch("vllm_gaudi.extension.kernels.rms_norm", return_value=None):
+            with pytest.raises(RuntimeError, match="FusedRMSNorm is unavailable"):
+                gdn.hpu_fused_rmsnorm_gated(x, x, torch.ones(8), 1e-6, "silu")
+
+
 # ===================================================================
 # 3. Recurrent path tests
 # ===================================================================
@@ -889,6 +948,15 @@ class TestEnvVarToggles:
         with mock.patch.dict(os.environ, {"VLLM_GDN_COMPILED_QK_L2NORM": "0"}):
             mod = _import_gdn()
             assert mod.resolve_hpu_gdn_compiled_qk_l2norm() is False
+
+    def test_gdn_fused_rmsnorm_gated_resolution(self):
+        with mock.patch.dict(os.environ, {"VLLM_GDN_FUSED_RMSNORM_GATED": "1"}):
+            mod = _import_gdn()
+            assert mod.resolve_hpu_gdn_fused_rmsnorm_gated() is True
+
+        with mock.patch.dict(os.environ, {"VLLM_GDN_FUSED_RMSNORM_GATED": "0"}):
+            mod = _import_gdn()
+            assert mod.resolve_hpu_gdn_fused_rmsnorm_gated() is False
 
     def test_exact_solve_flag(self):
         """VLLM_GDN_EXACT_SOLVE=1 should activate exact forward-sub."""

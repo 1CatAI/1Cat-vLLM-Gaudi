@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     VLLM_GDN_RECURSIVE_SOLVER_BASE: int = 0
     VLLM_GDN_COMPACT_REPEATED_KKT: bool = False
     VLLM_GDN_COMPILED_QK_L2NORM: bool = False
+    VLLM_GDN_FUSED_RMSNORM_GATED: bool = False
 
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
@@ -120,6 +121,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Keep GDN Q/K L2 normalization inside the compiled prefill graph.
     "VLLM_GDN_COMPILED_QK_L2NORM":
     lambda: os.environ.get("VLLM_GDN_COMPILED_QK_L2NORM", "false").lower() in ("1", "true"),
+
+    # Use Habana FusedRMSNorm for the Qwen GDN output norm before applying
+    # the output gate. This is currently limited to the prefill path.
+    "VLLM_GDN_FUSED_RMSNORM_GATED":
+    lambda: os.environ.get("VLLM_GDN_FUSED_RMSNORM_GATED", "false").lower() in ("1", "true"),
 }
 
 # end-env-vars-definition

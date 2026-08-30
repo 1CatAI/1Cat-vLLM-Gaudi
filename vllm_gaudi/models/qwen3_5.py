@@ -10,9 +10,11 @@ from vllm_gaudi.ops.hpu_gdn_pytorch import (
     hpu_chunk_gated_delta_rule,
     hpu_fused_gdn_gating,
     hpu_fused_recurrent_gated_delta_rule,
+    hpu_fused_rmsnorm_gated,
     resolve_hpu_gdn_chunk_size,
     resolve_hpu_gdn_compact_repeated_kkt,
     resolve_hpu_gdn_compiled_qk_l2norm,
+    resolve_hpu_gdn_fused_rmsnorm_gated,
     resolve_hpu_gdn_fused_state_matmul,
     resolve_hpu_gdn_neumann_iters,
     resolve_hpu_gdn_recursive_solver_base,
@@ -46,6 +48,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self.gdn_recursive_solver_base = resolve_hpu_gdn_recursive_solver_base()
         self.gdn_compact_repeated_kkt = resolve_hpu_gdn_compact_repeated_kkt()
         self.gdn_compiled_qk_l2norm = resolve_hpu_gdn_compiled_qk_l2norm()
+        self.gdn_fused_rmsnorm_gated = resolve_hpu_gdn_fused_rmsnorm_gated()
 
         self.qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
         self.z_size = self.value_dim // self.tp_size
@@ -300,7 +303,16 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         z_shape_og = z.shape
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
-        core_attn_out = self.norm(core_attn_out, z)
+        if is_prompt and self.gdn_fused_rmsnorm_gated:
+            core_attn_out = hpu_fused_rmsnorm_gated(
+                core_attn_out,
+                z,
+                self.norm.weight,
+                self.norm.eps,
+                self.norm.activation,
+            )
+        else:
+            core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.flatten(-2)
 
