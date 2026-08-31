@@ -61,6 +61,7 @@ def get_user_flags():
         Env('VLLM_HPU_FSDPA_SLICE_SEQ_LEN_THLD', int),
         Env('VLLM_HPU_FSDPA_SLICE_CHUNK_SIZE', int),
         Env('VLLM_HPU_FSDPA_SLICE_WITH_GRAPH_BREAKS', boolean),
+        Env('VLLM_HPU_FSDPA_DYNAMIC_FP8', boolean),
 
         # FusedSDPA query tiling flags
         Env('VLLM_HPU_FSDPA_Q_TILE_ENABLE', boolean),

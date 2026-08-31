@@ -72,6 +72,7 @@ def _make_config(**overrides):
         bucketing_strategy='pad',
         merged_prefill=False,
         use_bucketing=True,
+        VLLM_HPU_FSDPA_DYNAMIC_FP8=None,
     )
     defaults.update(overrides)
     return Config(defaults)
@@ -530,6 +531,21 @@ class TestManualModuleConstruction:
         assert module.num_padded_ctx_chunks == 2
         assert module._with_graph_breaks is False
 
+    def test_dynamic_fp8_dispatch(self):
+        module = _make_sliced_bf16(chunk_size=2048)
+        module.dynamic_fp8 = True
+        expected = torch.randn(1, 4, 2048, 64)
+        module._forward_dynamic_fp8 = MagicMock(return_value=expected)
+        q = torch.randn(1, 4, 2048, 64)
+        k = torch.randn(1, 2, 4096, 64)
+        v = torch.randn_like(k)
+        mask = torch.zeros(1, 1, 2048, 4096)
+
+        actual = module(q, k, v, mask, 0.0, True, None, 'fast')
+
+        assert actual is expected
+        module._forward_dynamic_fp8.assert_called_once_with(q, k, v, mask, 0.0, 0.125, 'fast')
+
     def test_fp8_manual_init_sets_scales(self):
         scales = {
             'd_scale_q': torch.tensor(1.0),
@@ -874,6 +890,7 @@ class TestFsdpaSlicingUserFlags:
         assert 'VLLM_HPU_FSDPA_SLICE_SEQ_LEN_THLD' in flags
         assert 'VLLM_HPU_FSDPA_SLICE_CHUNK_SIZE' in flags
         assert 'VLLM_HPU_FSDPA_SLICE_WITH_GRAPH_BREAKS' in flags
+        assert 'VLLM_HPU_FSDPA_DYNAMIC_FP8' in flags
 
     def test_slice_enabled_flag_is_boolean(self):
         flags = get_user_flags()
@@ -889,6 +906,11 @@ class TestFsdpaSlicingUserFlags:
         flags = get_user_flags()
         flag = flags['VLLM_HPU_FSDPA_SLICE_CHUNK_SIZE']
         assert flag.value_type is int
+
+    def test_dynamic_fp8_flag_is_boolean(self):
+        flags = get_user_flags()
+        flag = flags['VLLM_HPU_FSDPA_DYNAMIC_FP8']
+        assert flag.value_type is boolean
 
     def test_enable_fsdpa_slicing_feature_registered(self):
         values, flags = get_features()
@@ -1132,10 +1154,21 @@ class TestFsdpaSlicingAccuracyBF16:
         return output
 
     @staticmethod
-    def _run_sliced(q, k, v, attn_mask, slice_thld, chunk_size, q_pad, ctx_pad, graph_breaks=False, mode='eager'):
+    def _run_sliced(q,
+                    k,
+                    v,
+                    attn_mask,
+                    slice_thld,
+                    chunk_size,
+                    q_pad,
+                    ctx_pad,
+                    graph_breaks=False,
+                    mode='eager',
+                    dynamic_fp8=False):
         """Sliced path via SlicedFusedSDPA module."""
         module = _make_sliced_bf16(chunk_size, math.ceil(q_pad / chunk_size), math.ceil(ctx_pad / chunk_size),
                                    graph_breaks)
+        module.dynamic_fp8 = dynamic_fp8
         module = module.to('hpu')
         if mode == 'compile':
             torch._dynamo.reset()
@@ -1195,6 +1228,38 @@ class TestFsdpaSlicingAccuracyBF16:
                                                             dim=0).item()
 
         assert cos_sim > 0.999, f"BF16 cosine similarity too low: {cos_sim}"
+
+    def test_dynamic_fp8_accuracy_compile(self):
+        bs = 1
+        heads = 8
+        kv_heads = 2
+        head_dim = 128
+        q_len = 2048
+        ctx_len = 4096
+        pad = 128
+        q_len_pad = q_len + pad
+        ctx_len_pad = ctx_len + pad
+        kv_len_pad = q_len_pad + ctx_len_pad
+        chunk_size = 2048
+
+        q, k, v = _generate_realistic_qkv(bs, heads, kv_heads, head_dim, q_len_pad, kv_len_pad, device='hpu')
+        attn_mask = _build_causal_mask((bs, q_len, ctx_len), (bs, q_len_pad, ctx_len_pad), device='hpu')
+        ref_out = self._run_reference(q, k, v, attn_mask)
+        fp8_out = self._run_sliced(q,
+                                    k,
+                                    v,
+                                    attn_mask,
+                                    slice_thld=kv_len_pad,
+                                    chunk_size=chunk_size,
+                                    q_pad=pad,
+                                    ctx_pad=pad,
+                                    mode='compile',
+                                    dynamic_fp8=True)
+        cos_sim = torch.nn.functional.cosine_similarity(ref_out.flatten().float(),
+                                                        fp8_out.flatten().float(),
+                                                        dim=0).item()
+
+        assert cos_sim > 0.99, f"Dynamic FP8 cosine similarity too low: {cos_sim}"
 
 
 @requires_hpu
