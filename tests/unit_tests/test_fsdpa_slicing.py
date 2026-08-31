@@ -587,6 +587,7 @@ class TestModuleFusedSDPAForwardDispatch:
         mask = torch.zeros(1, 1, 2048, 8192)
 
         module._sliced_module.return_value = torch.zeros(1, 4, 2048, 64)
+        assert module.can_use_slicing(q, k, mask, True, padding_side='right')
         module.forward(q, k, v, mask, 0.0, True, None, 'fast', True, None, padding_side='right')
         module._sliced_module.assert_called_once()
 
@@ -932,6 +933,41 @@ class TestFsdpaPromptAttentionCausalMask:
             assert call_args[3] is not None
             # is_causal (index 5) should still be True
             assert call_args[5] is True
+
+    def test_inner_slicing_suppresses_redundant_query_tiling(self):
+        class SliceAwareOp:
+            _supports_inner_slicing = True
+
+            def __init__(self):
+                self.calls = 0
+
+            def can_use_slicing(self, *args, **kwargs):
+                return True
+
+            def __call__(self, query, *args, **kwargs):
+                self.calls += 1
+                return query
+
+        cfg = MagicMock(fp32_softmax=False, enable_fsdpa_q_tiling=True)
+        fsdpa_op = SliceAwareOp()
+        q = torch.randn(1, 8, 4, 16)
+        k = torch.randn(1, 16, 4, 16)
+        v = torch.randn(1, 16, 4, 16)
+        bias = torch.zeros(1, 1, 8, 16)
+
+        with patch('vllm_gaudi.extension.ops.get_config', return_value=cfg), \
+             patch('vllm_gaudi.extension.ops._fsdpa_num_q_tiles') as mock_num_tiles:
+            output = _fsdpa_prompt_attention(query=q,
+                                             key=k,
+                                             value=v,
+                                             scale=0.25,
+                                             fsdpa_op=fsdpa_op,
+                                             is_causal=True,
+                                             attn_bias=bias)
+
+        mock_num_tiles.assert_not_called()
+        assert fsdpa_op.calls == 1
+        assert output.shape == q.shape
 
 
 # ---------------------------------------------------------------------------

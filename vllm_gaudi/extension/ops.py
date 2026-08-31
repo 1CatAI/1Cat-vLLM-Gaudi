@@ -481,7 +481,12 @@ def _fsdpa_prompt_attention(query: torch.Tensor,
     # The kernel overflows a signed-int32 *byte* offset while striding the bias plane, so the limit
     # tracks the bias element size regardless of softmax precision (fp32 softmax upcasts internally
     # but still strides the 2 B/elem bias). No fp32 special-casing needed.
-    num_q_tiles = _fsdpa_num_q_tiles(attn_bias)
+    # Inner KV slicing already tiles query rows and passes only small bias tiles
+    # to FusedSDPA. Applying outer query tiling as well creates symbolic slice
+    # shapes that the HPU compile backend cannot lower at long context.
+    inner_slicing = (getattr(fsdpa_op, '_supports_inner_slicing', False) is True
+                     and fsdpa_op.can_use_slicing(query, key, attn_bias, is_causal, padding_side, window_size, sinks))
+    num_q_tiles = 1 if inner_slicing else _fsdpa_num_q_tiles(attn_bias)
     if num_q_tiles == 1:
         attn_weights = call_fsdpa(query, attn_bias)
     else:
