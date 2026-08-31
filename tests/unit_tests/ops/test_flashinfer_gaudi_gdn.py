@@ -451,3 +451,27 @@ def test_vllm_adapter_leaves_mtp_batches_on_general_path():
             use_qk_l2norm=True,
         )
     assert result is None
+
+
+def test_vllm_adapter_auto_skips_indexed_reference():
+    q, k, v, pool, log_decay, beta = _inputs(batch=2)
+    original = pool.clone()
+    packed = torch.cat((q.reshape(2, -1), k.reshape(2, -1), v.reshape(2, -1)), dim=-1)
+    indices = torch.tensor([1, 2], dtype=torch.int32)
+
+    with mock.patch.dict(os.environ, {"VLLM_HPU_FLASHINFER_GDN": "1"}), \
+            mock.patch("vllm_gaudi.ops.flashinfer_gaudi_adapter._BACKEND_POLICY", "auto"), \
+            mock.patch("vllm_gaudi.ops.flashinfer_gaudi_adapter._PUBLIC_AUTO_PROMOTED", False), \
+            mock.patch("vllm_gaudi.ops.flashinfer_gaudi_adapter._BRIDGE_AUTO_ENABLED", False):
+        result = maybe_run_gdn_decode_packed(
+            mixed_qkv=packed,
+            log_decay=log_decay,
+            beta=beta,
+            state_pool=pool,
+            load_state_indices=indices,
+            store_state_indices=indices,
+            use_qk_l2norm=True,
+        )
+
+    assert result is None
+    torch.testing.assert_close(pool, original)

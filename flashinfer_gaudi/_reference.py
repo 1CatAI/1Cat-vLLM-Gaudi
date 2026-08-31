@@ -64,6 +64,46 @@ def _write_state_rows(
         state_pool.index_copy_(0, safe_destination, row)
 
 
+def _direct_single_token_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    log_decay: torch.Tensor,
+    beta: torch.Tensor,
+    state_pool: torch.Tensor,
+    scale: float,
+    use_qk_l2norm: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Specialize the contiguous decode path without gather/scatter scaffolding."""
+    batch, _, q_heads, key_dim = q.shape
+    value_heads, value_dim = v.shape[2:]
+    repeat = value_heads // q_heads
+
+    q_work = q[:, 0].to(torch.float32)
+    k_work = k[:, 0].to(torch.float32)
+    if use_qk_l2norm:
+        q_work = F.normalize(q_work, p=2.0, dim=-1, eps=1e-6)
+        k_work = F.normalize(k_work, p=2.0, dim=-1, eps=1e-6)
+    k_grouped = k_work.unsqueeze(2)
+
+    state = state_pool.to(torch.float32).reshape(batch, q_heads, repeat, value_dim, key_dim)
+    decay = torch.exp(_as_bt_heads(log_decay, batch, 1, value_heads, "log_decay")[:, 0].to(torch.float32))
+    decay = decay.reshape(batch, q_heads, repeat, 1, 1)
+    beta_work = _as_bt_heads(beta, batch, 1, value_heads, "beta")[:, 0].to(torch.float32)
+    beta_work = beta_work.reshape(batch, q_heads, repeat, 1)
+    value_work = v[:, 0].to(torch.float32).reshape(batch, q_heads, repeat, value_dim)
+
+    decayed_state = state * decay
+    projection = torch.matmul(decayed_state, k_grouped.unsqueeze(-1)).squeeze(-1)
+    delta = (value_work - projection) * beta_work
+    updated_state = decayed_state + delta.unsqueeze(-1) * k_grouped.unsqueeze(-2)
+    output = torch.matmul(updated_state, (q_work.unsqueeze(2) * scale).unsqueeze(-1)).squeeze(-1)
+
+    state_pool.copy_(updated_state.reshape_as(state_pool).to(state_pool.dtype))
+    output = output.reshape(batch, 1, value_heads, value_dim).to(v.dtype)
+    return output, state_pool
+
+
 def recurrent_decode_from_qkv(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -97,9 +137,14 @@ def recurrent_decode_from_qkv(
     if value_heads % q_heads:
         raise ValueError(f"Value heads ({value_heads}) must be divisible by Q/K heads ({q_heads}).")
 
+    if direct_state and slots != batch:
+        raise ValueError(f"Direct state requires one contiguous row per request; got slots={slots}, B={batch}.")
+
     if direct_state:
-        if slots != batch:
-            raise ValueError(f"Direct state requires one contiguous row per request; got slots={slots}, B={batch}.")
+        if (tokens == 1 and intermediate_states_buffer is None and ssm_state_indices is None and update_final_state):
+            if scale is None:
+                scale = key_dim**-0.5
+            return _direct_single_token_decode(q, k, v, log_decay, beta, state_pool, scale, use_qk_l2norm)
         state = state_pool.to(torch.float32)
         load_indices = torch.arange(batch, dtype=torch.long, device=state_pool.device)
         store_indices = load_indices

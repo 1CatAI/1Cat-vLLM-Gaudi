@@ -19,11 +19,14 @@ export VLLM_HPU_FLASHINFER_GDN=1
 export FLASHINFER_GAUDI_BACKEND=auto
 ```
 
-`auto` uses a public native op only after its offline tactic is promoted and
-otherwise falls back before execution. Native tactics remain unpromoted in the
-bundled offline tactic manifest until they pass both model-level quality and
-performance gates. `public` and `bridge` are strict policies: an unavailable
-implementation raises before recurrent state is modified.
+`auto` uses the compiled PyTorch implementation only with vLLM's contiguous
+group-major recurrent-state layout. Indexed state layouts fall through to
+vLLM's existing decode implementation, because the extra gather/scatter is a
+measured regression. A public native op is selected only after its offline
+tactic is promoted. Native tactics remain unpromoted in the bundled offline
+tactic manifest until they pass both model-level quality and performance
+gates. `public` and `bridge` are strict policies: an unavailable implementation
+raises before recurrent state is modified.
 
 The first native Gaudi2 GUID specializes Qwen3.8 decode (`H=16`, `HV=48`,
 `K=V=128`) with packed BF16 Q/K/V and beta, BF16 output, FP32 recurrent state,

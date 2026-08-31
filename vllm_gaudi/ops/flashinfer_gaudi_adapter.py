@@ -60,14 +60,15 @@ def maybe_run_gdn_decode_packed(
         if mixed_qkv.shape[0] <= group_span:
             state_start = direct_state_group_offset * group_span + 1
             selected_state_pool = state_pool.narrow(0, state_start, mixed_qkv.shape[0])
-            direct_indices = torch.arange(
-                mixed_qkv.shape[0],
-                dtype=load_state_indices.dtype,
-                device=load_state_indices.device,
-            )
-            load_state_indices = direct_indices
-            store_state_indices = direct_indices
             use_direct_state = True
+
+    # The indexed PyTorch compatibility path performs state gather/scatter
+    # around the recurrence and loses decisively to vLLM's existing decode
+    # implementation.  In auto mode, only select the measured contiguous
+    # state fast path; explicit ``pytorch`` policy still exposes the complete
+    # compatibility implementation for testing and unsupported layouts.
+    if use_reference and _BACKEND_POLICY == "auto" and not use_direct_state:
+        return None
 
     if use_reference:
         output, updated_pool = packed_recurrent_decode(

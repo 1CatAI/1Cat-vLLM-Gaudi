@@ -33,10 +33,23 @@ def _make_inputs(batch: int):
     return packed, log_decay, beta, state, indices
 
 
-def _compile(policy: str):
+def _compile(policy: str, reference_layout: str = "direct"):
     if policy == "pytorch":
 
         def run(packed, log_decay, beta, state, indices):
+            if reference_layout == "direct":
+                direct_state = state.narrow(0, 1, packed.shape[0])
+                return packed_recurrent_decode(
+                    packed,
+                    log_decay,
+                    beta,
+                    direct_state,
+                    None,
+                    None,
+                    None,
+                    True,
+                    True,
+                )[0]
             return packed_recurrent_decode(
                 packed,
                 log_decay,
@@ -82,13 +95,14 @@ def main() -> None:
     parser.add_argument("--warmups", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--backend", choices=("public", "bridge"), default="public")
+    parser.add_argument("--reference-layout", choices=("direct", "indexed"), default="direct")
     args = parser.parse_args()
 
     results: dict[str, object] = {"capabilities": get_capabilities(), "batches": {}}
     for batch in (int(item) for item in args.batches.split(",") if item):
         reference_inputs = _make_inputs(batch)
         candidate_inputs = tuple(tensor.clone() for tensor in reference_inputs)
-        reference = _compile("pytorch")
+        reference = _compile("pytorch", args.reference_layout)
         candidate = _compile(args.backend)
 
         reference_output = reference(*reference_inputs)
@@ -108,8 +122,9 @@ def main() -> None:
 
         reference_stats = _measure(reference, reference_inputs, args.warmups, args.iterations)
         candidate_stats = _measure(candidate, candidate_inputs, args.warmups, args.iterations)
+        reference_name = f"pytorch_{args.reference_layout}"
         results["batches"][str(batch)] = {
-            "pytorch": reference_stats,
+            reference_name: reference_stats,
             args.backend: candidate_stats,
             "median_speedup": reference_stats["median_ms"] / candidate_stats["median_ms"],
             "output_max_abs": output_max_abs,
