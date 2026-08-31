@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import inspect
 import os
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -12,11 +13,17 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer_gaudi import clear_backend_policy_override, set_backend_policy
+from flashinfer_gaudi import _native
+from flashinfer_gaudi._reference import packed_recurrent_decode
 from flashinfer_gaudi.gdn_decode import (
     BackendUnavailableError,
+    _call_native_packed,
+    gated_delta_rule_decode,
+    gated_delta_rule_mtp,
     gated_delta_rule_decode_packed,
     gated_delta_rule_decode_pretranspose,
 )
+from vllm_gaudi.ops.flashinfer_gaudi_adapter import maybe_run_gdn_decode_packed
 
 
 @pytest.fixture(autouse=True)
@@ -68,6 +75,122 @@ def test_pretranspose_signature_tracks_flashinfer_contract():
         "initial_state_indices",
         "output_state_indices",
     )
+
+
+def test_k_major_signature_tracks_flashinfer_contract():
+    parameters = inspect.signature(gated_delta_rule_decode).parameters
+    assert tuple(parameters) == (
+        "q",
+        "k",
+        "v",
+        "state",
+        "A_log",
+        "a",
+        "dt_bias",
+        "b",
+        "scale",
+        "output",
+        "use_qk_l2norm",
+    )
+
+
+def test_k_major_decode_matches_vk_reference():
+    generator = torch.Generator().manual_seed(29)
+    batch, q_heads, value_heads, key_dim, value_dim = 2, 2, 4, 8, 6
+    q = torch.randn(batch, 1, q_heads, key_dim, generator=generator)
+    k = torch.randn(batch, 1, q_heads, key_dim, generator=generator)
+    v = torch.randn(batch, 1, value_heads, value_dim, generator=generator)
+    state_kv = torch.randn(batch, value_heads, key_dim, value_dim, generator=generator)
+    expected_state_vk = state_kv.transpose(-1, -2).contiguous()
+    A_log = torch.randn(value_heads, generator=generator)
+    a = torch.randn(batch, 1, value_heads, generator=generator)
+    dt_bias = torch.randn(value_heads, generator=generator)
+    b = torch.randn(batch, 1, value_heads, generator=generator)
+
+    expected_output, _ = gated_delta_rule_decode_pretranspose(
+        q,
+        k,
+        v,
+        expected_state_vk,
+        A_log,
+        a,
+        dt_bias,
+        b,
+    )
+    output, returned_state = gated_delta_rule_decode(
+        q,
+        k,
+        v,
+        state_kv,
+        A_log,
+        a,
+        dt_bias,
+        b,
+    )
+
+    assert returned_state is state_kv
+    torch.testing.assert_close(output, expected_output)
+    torch.testing.assert_close(state_kv, expected_state_vk.transpose(-1, -2))
+
+
+def test_mtp_signature_tracks_flashinfer_contract():
+    parameters = inspect.signature(gated_delta_rule_mtp).parameters
+    assert tuple(parameters) == (
+        "q",
+        "k",
+        "v",
+        "initial_state",
+        "initial_state_indices",
+        "A_log",
+        "a",
+        "dt_bias",
+        "b",
+        "scale",
+        "output",
+        "intermediate_states_buffer",
+        "ssm_state_indices",
+        "disable_state_update",
+        "use_qk_l2norm",
+        "output_state_indices",
+    )
+
+
+def test_mtp_tracks_intermediate_and_distinct_final_state():
+    generator = torch.Generator().manual_seed(41)
+    batch, tokens, q_heads, value_heads, dim = 1, 3, 2, 4, 8
+    q = torch.randn(batch, tokens, q_heads, dim, generator=generator)
+    k = torch.randn(batch, tokens, q_heads, dim, generator=generator)
+    v = torch.randn(batch, tokens, value_heads, dim, generator=generator)
+    pool = torch.randn(6, value_heads, dim, dim, generator=generator)
+    original = pool.clone()
+    A_log = torch.randn(value_heads, generator=generator)
+    a = torch.randn(batch, tokens, value_heads, generator=generator)
+    dt_bias = torch.randn(value_heads, generator=generator)
+    b = torch.randn(batch, tokens, value_heads, generator=generator)
+    intermediate = torch.zeros(batch, tokens, value_heads, dim, dim)
+    load = torch.tensor([1], dtype=torch.int32)
+    store = torch.tensor([4], dtype=torch.int32)
+
+    output, returned_pool = gated_delta_rule_mtp(
+        q,
+        k,
+        v,
+        pool,
+        load,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        intermediate_states_buffer=intermediate,
+        disable_state_update=False,
+        output_state_indices=store,
+    )
+
+    assert returned_pool is pool
+    assert output.shape == (batch, tokens, value_heads, dim)
+    torch.testing.assert_close(pool[1], original[1])
+    torch.testing.assert_close(pool[4], intermediate[0, -1])
+    assert not torch.equal(intermediate[:, 0], intermediate[:, -1])
 
 
 def test_grouped_qk_reference_preserves_update_order():
@@ -179,6 +302,32 @@ def test_forced_native_backend_fails_before_cpu_state_update():
     torch.testing.assert_close(pool, original)
 
 
+def test_legacy_native_contract_receives_fp32_compatibility_inputs():
+
+    class LegacyOp:
+        _qualified_op_name = "custom_op::custom_gdn_packed_decode_f32_gaudi2"
+
+        def __call__(self, state, packed, decay, beta, indices):
+            assert state.dtype == torch.float32
+            assert packed.dtype == torch.float32
+            assert decay.dtype == torch.float32
+            assert beta.dtype == torch.float32
+            assert indices.dtype == torch.int32
+            return state[:packed.shape[0]], torch.zeros(packed.shape[0], 4, 8)
+
+    q, k, v, pool, log_decay, beta = _inputs(batch=1)
+    packed = torch.cat((q.reshape(1, -1), k.reshape(1, -1), v.reshape(1, -1)), dim=-1).to(torch.bfloat16)
+    output = _call_native_packed(
+        LegacyOp(),
+        packed,
+        log_decay,
+        beta.to(torch.bfloat16),
+        pool,
+        torch.tensor([1]),
+    )
+    assert output.dtype == torch.bfloat16
+
+
 def test_auto_policy_uses_reference_on_cpu():
     q, k, v, pool, log_decay, beta = _inputs(batch=1)
     packed = torch.cat((q.reshape(1, -1), k.reshape(1, -1), v.reshape(1, -1)), dim=-1)
@@ -192,6 +341,24 @@ def test_auto_policy_uses_reference_on_cpu():
             torch.tensor([1]),
         )
     assert output.shape == (1, 4, 8)
+
+
+def test_native_loader_adds_kernel_database_file_to_gc_path(tmp_path, monkeypatch):
+    package_dir = tmp_path / "flashinfer_gaudi"
+    library_dir = package_dir / "lib"
+    library_dir.mkdir(parents=True)
+    kernel_database = library_dir / "libflashinfer_gaudi_kernels.so"
+    kernel_database.touch()
+
+    monkeypatch.setattr(_native, "__file__", str(package_dir / "_native.py"))
+    monkeypatch.delenv("GC_KERNEL_PATH", raising=False)
+    _native._configure_kernel_database_path()
+
+    configured = os.environ["GC_KERNEL_PATH"].split(os.pathsep)
+    assert configured[0] == str(kernel_database)
+    system_kernel_database = Path("/usr/lib/habanalabs/libtpc_kernels.so")
+    if system_kernel_database.is_file():
+        assert configured[-1] == str(system_kernel_database)
 
 
 def test_recurrent_state_is_continuous_across_many_steps():
@@ -225,3 +392,62 @@ def test_recurrent_state_is_continuous_across_many_steps():
 
     torch.testing.assert_close(torch.stack(outputs), torch.stack(expected_outputs))
     torch.testing.assert_close(pool, reference_pool)
+
+
+def test_vllm_adapter_uses_direct_group_state_view():
+    q, k, v, _, log_decay, beta = _inputs(batch=2)
+    groups, max_requests = 3, 4
+    pool = torch.randn(groups * max_requests + 2, 4, 8, 8)
+    original = pool.clone()
+    expected_pool = pool.clone()
+    packed = torch.cat((q.reshape(2, -1), k.reshape(2, -1), v.reshape(2, -1)), dim=-1)
+    load_store = torch.tensor([max_requests + 1, max_requests + 2], dtype=torch.int32)
+    expected_output, _ = packed_recurrent_decode(
+        packed,
+        log_decay,
+        beta,
+        expected_pool,
+        load_store,
+        load_store,
+        None,
+        True,
+    )
+
+    with mock.patch.dict(os.environ, {"VLLM_HPU_FLASHINFER_GDN": "1"}):
+        result = maybe_run_gdn_decode_packed(
+            mixed_qkv=packed,
+            log_decay=log_decay,
+            beta=beta,
+            state_pool=pool,
+            load_state_indices=load_store,
+            store_state_indices=load_store,
+            use_qk_l2norm=True,
+            direct_state_layout=True,
+            direct_state_group_count=groups,
+            direct_state_group_offset=1,
+        )
+
+    assert result is not None
+    output, _ = result
+    assert output.shape == (1, 2, 4, 8)
+    torch.testing.assert_close(output.squeeze(0), expected_output)
+    torch.testing.assert_close(pool, expected_pool)
+    assert not torch.equal(pool[max_requests + 1:max_requests + 3], original[max_requests + 1:max_requests + 3])
+    torch.testing.assert_close(pool[:max_requests + 1], original[:max_requests + 1])
+
+
+def test_vllm_adapter_leaves_mtp_batches_on_general_path():
+    _, _, _, pool, log_decay, beta = _inputs(batch=2)
+    packed = torch.randn(4, 64)
+    indices = torch.tensor([1, 2], dtype=torch.int32)
+    with mock.patch.dict(os.environ, {"VLLM_HPU_FLASHINFER_GDN": "1"}):
+        result = maybe_run_gdn_decode_packed(
+            mixed_qkv=packed,
+            log_decay=log_decay,
+            beta=beta,
+            state_pool=pool,
+            load_state_indices=indices,
+            store_state_indices=indices,
+            use_qk_l2norm=True,
+        )
+    assert result is None

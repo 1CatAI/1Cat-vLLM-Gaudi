@@ -25,4 +25,3 @@ def public_gdn_auto_promoted() -> bool:
 
 def tactic_manifest() -> dict[str, object]:
     return dict(_manifest())
-

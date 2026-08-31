@@ -14,6 +14,6 @@
   },
   "stable_default": "pytorch",
   "public_native_promoted": false,
+  "public_native_status": "correctness_passed_performance_gate_pending",
   "bridge_native_promoted": false
 }
-

@@ -11,9 +11,7 @@ import torch.nn.functional as F
 
 def _as_bt_heads(value: torch.Tensor, batch: int, tokens: int, heads: int, name: str) -> torch.Tensor:
     if value.numel() != batch * tokens * heads:
-        raise ValueError(
-            f"{name} must contain B*T*HV={batch * tokens * heads} values, got shape {tuple(value.shape)}."
-        )
+        raise ValueError(f"{name} must contain B*T*HV={batch * tokens * heads} values, got shape {tuple(value.shape)}.")
     return value.reshape(batch, tokens, heads)
 
 
@@ -77,6 +75,10 @@ def recurrent_decode_from_qkv(
     store_state_indices: torch.Tensor | None = None,
     scale: float | None = None,
     use_qk_l2norm: bool = True,
+    direct_state: bool = False,
+    intermediate_states_buffer: torch.Tensor | None = None,
+    ssm_state_indices: torch.Tensor | None = None,
+    update_final_state: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Execute GDN decode while preserving the recurrent update order."""
     if q.ndim != 4 or k.shape != q.shape:
@@ -90,21 +92,27 @@ def recurrent_decode_from_qkv(
     _, _, value_heads, value_dim = v.shape
     slots, state_heads, state_value_dim, state_key_dim = state_pool.shape
     if state_heads != value_heads or state_value_dim != value_dim or state_key_dim != key_dim:
-        raise ValueError(
-            "State shape does not match Q/K/V: "
-            f"state={tuple(state_pool.shape)}, q={tuple(q.shape)}, v={tuple(v.shape)}."
-        )
+        raise ValueError("State shape does not match Q/K/V: "
+                         f"state={tuple(state_pool.shape)}, q={tuple(q.shape)}, v={tuple(v.shape)}.")
     if value_heads % q_heads:
         raise ValueError(f"Value heads ({value_heads}) must be divisible by Q/K heads ({q_heads}).")
 
-    load_indices = _canonical_indices(load_state_indices, batch, slots, state_pool.device)
-    store_indices = _canonical_indices(store_state_indices, batch, slots, state_pool.device)
-    _validate_cpu_store_indices(store_indices, slots)
-    safe_load, valid_load = _safe_indices(load_indices, slots)
-    _, valid_store = _safe_indices(store_indices, slots)
-
-    state = state_pool.index_select(0, safe_load).to(torch.float32)
-    state = torch.where(valid_load.reshape(batch, 1, 1, 1), state, torch.zeros_like(state))
+    if direct_state:
+        if slots != batch:
+            raise ValueError(f"Direct state requires one contiguous row per request; got slots={slots}, B={batch}.")
+        state = state_pool.to(torch.float32)
+        load_indices = torch.arange(batch, dtype=torch.long, device=state_pool.device)
+        store_indices = load_indices
+        valid_load = torch.ones(batch, dtype=torch.bool, device=state_pool.device)
+        valid_store = valid_load
+    else:
+        load_indices = _canonical_indices(load_state_indices, batch, slots, state_pool.device)
+        store_indices = _canonical_indices(store_state_indices, batch, slots, state_pool.device)
+        _validate_cpu_store_indices(store_indices, slots)
+        safe_load, valid_load = _safe_indices(load_indices, slots)
+        _, valid_store = _safe_indices(store_indices, slots)
+        state = state_pool.index_select(0, safe_load).to(torch.float32)
+        state = torch.where(valid_load.reshape(batch, 1, 1, 1), state, torch.zeros_like(state))
 
     repeat = value_heads // q_heads
     state = state.reshape(batch, q_heads, repeat, value_dim, key_dim)
@@ -119,6 +127,15 @@ def recurrent_decode_from_qkv(
     decay_work = _as_bt_heads(log_decay, batch, tokens, value_heads, "log_decay").to(torch.float32)
     beta_work = _as_bt_heads(beta, batch, tokens, value_heads, "beta").to(torch.float32)
     value_work = v.to(torch.float32).reshape(batch, tokens, q_heads, repeat, value_dim)
+    if intermediate_states_buffer is not None and (
+            intermediate_states_buffer.ndim != 5 or intermediate_states_buffer.shape[0] < batch
+            or intermediate_states_buffer.shape[1] < tokens
+            or tuple(intermediate_states_buffer.shape[2:]) != (value_heads, value_dim, key_dim)):
+        raise ValueError("intermediate_states_buffer must have at least "
+                         f"[{batch},{tokens},{value_heads},{value_dim},{key_dim}], got "
+                         f"{tuple(intermediate_states_buffer.shape)}.")
+    if ssm_state_indices is not None and tuple(ssm_state_indices.shape) != (batch, tokens):
+        raise ValueError(f"ssm_state_indices must have shape [{batch},{tokens}], got {ssm_state_indices.shape}.")
     outputs: list[torch.Tensor] = []
 
     for token_idx in range(tokens):
@@ -135,8 +152,27 @@ def recurrent_decode_from_qkv(
         output_t = torch.matmul(state, (q_t * scale).unsqueeze(-1)).squeeze(-1)
         outputs.append(output_t.reshape(batch, value_heads, value_dim))
 
+        state_t = state.reshape(batch, value_heads, value_dim, key_dim)
+        if intermediate_states_buffer is not None:
+            target = intermediate_states_buffer[:batch, token_idx]
+            target.copy_(torch.where(
+                valid_load.reshape(batch, 1, 1, 1),
+                state_t.to(target.dtype),
+                target,
+            ))
+        if ssm_state_indices is not None:
+            token_store_indices = ssm_state_indices[:, token_idx].to(device=state_pool.device, dtype=torch.long)
+            _validate_cpu_store_indices(token_store_indices, slots)
+            _, valid_token_store = _safe_indices(token_store_indices, slots)
+            _write_state_rows(state_pool, token_store_indices, state_t, valid_load & valid_token_store)
+
     updated_state = state.reshape(batch, value_heads, value_dim, key_dim)
-    _write_state_rows(state_pool, store_indices, updated_state, valid_store & valid_load)
+    if not update_final_state or ssm_state_indices is not None:
+        pass
+    elif direct_state:
+        state_pool.copy_(updated_state.to(state_pool.dtype))
+    else:
+        _write_state_rows(state_pool, store_indices, updated_state, valid_store & valid_load)
     output = torch.stack(outputs, dim=1).to(v.dtype)
     output = torch.where(valid_load.reshape(batch, 1, 1, 1), output, torch.zeros_like(output))
     return output, state_pool
@@ -153,9 +189,8 @@ def split_packed_qkv(
     value_width = value_heads * value_dim
     qk_width = packed_qkv.shape[1] - value_width
     if qk_width <= 0 or qk_width % (2 * key_dim):
-        raise ValueError(
-            f"Cannot infer Q/K heads from packed width {packed_qkv.shape[1]}, HV={value_heads}, K={key_dim}, V={value_dim}."
-        )
+        raise ValueError(f"Cannot infer Q/K heads from packed width {packed_qkv.shape[1]}, "
+                         f"HV={value_heads}, K={key_dim}, V={value_dim}.")
     key_heads = qk_width // (2 * key_dim)
     if value_heads % key_heads:
         raise ValueError(f"Value heads ({value_heads}) must be divisible by inferred Q/K heads ({key_heads}).")
@@ -179,6 +214,7 @@ def packed_recurrent_decode(
     store_state_indices: torch.Tensor | None,
     scale: float | None,
     use_qk_l2norm: bool,
+    direct_state: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     _, value_heads, value_dim, key_dim = state_pool.shape
     q, k, v, _ = split_packed_qkv(packed_qkv, value_heads, key_dim, value_dim)
@@ -193,6 +229,7 @@ def packed_recurrent_decode(
         store_state_indices,
         scale,
         use_qk_l2norm,
+        direct_state,
     )
     return output[:, 0], updated_pool
 

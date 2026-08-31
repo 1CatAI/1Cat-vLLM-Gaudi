@@ -4,10 +4,13 @@
 for inference primitives whose public semantics match portable FlashInfer
 operations while using Intel Gaudi execution paths.
 
-The first supported domain is Qwen gated-delta-rule decode with VK/K-last
-recurrent state. The implementation keeps a PyTorch reference for unsupported
-shapes and provides dispatch points for public TPC custom kernels and an
-optional version-locked bridge backend.
+The first supported domain is Qwen gated-delta-rule decode. The public Python
+surface follows FlashInfer 0.6.18 for `gated_delta_rule_decode_pretranspose`
+(VK/K-last state), `gated_delta_rule_decode` (KV/K-major state), and
+`gated_delta_rule_mtp` (pooled multi-token decode). The implementation keeps a
+compile-friendly reference for the complete portable contract and provides
+dispatch points for public TPC custom kernels and an optional version-locked
+bridge backend.
 
 Enable the vLLM adapter with:
 
@@ -16,11 +19,17 @@ export VLLM_HPU_FLASHINFER_GDN=1
 export FLASHINFER_GAUDI_BACKEND=auto
 ```
 
-`auto` uses a validated public native op when one is loaded and otherwise
-falls back before execution. Native tactics remain unpromoted in the bundled
-offline tactic manifest until they pass model-level gates. `public` and
-`bridge` are strict policies: an
-unavailable implementation raises before recurrent state is modified.
+`auto` uses a public native op only after its offline tactic is promoted and
+otherwise falls back before execution. Native tactics remain unpromoted in the
+bundled offline tactic manifest until they pass both model-level quality and
+performance gates. `public` and `bridge` are strict policies: an unavailable
+implementation raises before recurrent state is modified.
+
+The first native Gaudi2 GUID specializes Qwen3.8 decode (`H=16`, `HV=48`,
+`K=V=128`) with packed BF16 Q/K/V and beta, BF16 output, FP32 recurrent state,
+grouped Q/K reuse, negative-index padding, and in-place pooled-state updates.
+It is intentionally opt-in until it beats the compiled graph across the full
+decode bucket matrix; availability alone never changes the stable route.
 
 The default state precision is FP32. BF16 recurrent state is not selected by
 the production dispatcher until it passes end-to-end token and state-quality

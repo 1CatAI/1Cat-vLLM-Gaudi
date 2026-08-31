@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /**********************************************************************
 Copyright (c) 2026 Habana Labs. All rights reserved.
 
@@ -18,4 +19,3 @@ public:
         tpc_lib_api::HabanaKernelParams* inDefs,
         tpc_lib_api::HabanaKernelInstantiation* outDefs);
 };
-

@@ -39,6 +39,8 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # cache_group_idx: set later by model runner for hybrid cache
         # lookup.  Stored as tensor so torch.compile treats it as dynamic.
         self.cache_group_idx = None
+        self.compact_state_group_offset = None
+        self.compact_state_group_count = None
 
         # mamba_chunk_size: use explicit config value or default to 128
         # for HPU bucket alignment.
@@ -86,7 +88,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
-            return (False, None, None, None, None, None, None, None, 0, 0, 0, 0, None)
+            return (False, None, None, None, None, None, None, None, 0, 0, 0, 0, None, False)
 
         is_prompt = bool(getattr(attn_metadata, "is_prompt", False))
         load_state_indices = self._resolve_state_indices(attn_metadata, "load_indices_tensor")
@@ -105,6 +107,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         query_start_loc = attn_metadata.query_start_loc_p
         has_initial_state = getattr(attn_metadata, "has_initial_states_p", None)
         padding_mask_flat = getattr(attn_metadata, "padding_mask_flat", None)
+        direct_gdn_state = bool(getattr(attn_metadata, "direct_gdn_state", False))
 
         if not is_prompt:
             num_decodes = (load_state_indices.numel() if load_state_indices is not None else
@@ -134,7 +137,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         return (is_prompt, conv_state, ssm_state, load_state_indices, store_state_indices, query_start_loc,
                 has_initial_state, padding_mask_flat, num_decodes, mamba_block_size, prefill_num_seqs,
-                prefill_seq_len, initial_state)
+                prefill_seq_len, initial_state, direct_gdn_state)
 
     def forward(
         self,
@@ -157,7 +160,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # === Metadata extraction (natural graph break) ===============
         (is_prompt, conv_state, ssm_state, load_state_indices, store_state_indices, query_start_loc,
          has_initial_state, padding_mask_flat, num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len,
-         initial_state) = self._extract_metadata(num_tokens)
+         initial_state, direct_gdn_state) = self._extract_metadata(num_tokens)
 
         # === Part 1: Input Projection ================================
         if hasattr(self, 'in_proj_qkv'):
@@ -290,6 +293,9 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 store_state_indices=store_state_indices,
                 use_qk_l2norm=True,
                 scale=self.head_k_dim**-0.5,
+                direct_state_layout=direct_gdn_state,
+                direct_state_group_count=self.compact_state_group_count,
+                direct_state_group_offset=self.compact_state_group_offset,
             )
             if flashinfer_result is not None:
                 core_attn_out_result, _ = flashinfer_result

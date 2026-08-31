@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /**********************************************************************
 Copyright (c) 2026 Habana Labs. All rights reserved.
 
@@ -42,7 +43,7 @@ bool HasTypeAndRank(
 tpc_lib_api::GlueCodeReturn GdnPackedDecodeF32Gaudi2::GetKernelName(
     char kernelName[tpc_lib_api::MAX_NODE_NAME])
 {
-    std::strcpy(kernelName, "flashinfer_gaudi_gdn_decode_packed_f32_gaudi2");
+    std::strcpy(kernelName, "flashinfer_gaudi_gdn_decode_packed_bf16_f32state_gaudi2");
     return tpc_lib_api::GLUE_SUCCESS;
 }
 
@@ -51,7 +52,7 @@ tpc_lib_api::GlueCodeReturn GdnPackedDecodeF32Gaudi2::GetGcDefinitions(
     tpc_lib_api::HabanaKernelInstantiation* outDefs)
 {
     constexpr unsigned kInputCount = 5;
-    constexpr unsigned kOutputCount = 2;
+    constexpr unsigned kOutputCount = 1;
     if (inDefs->inputTensorNr != kInputCount) {
         inDefs->inputTensorNr = kInputCount;
         return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_COUNT;
@@ -66,14 +67,13 @@ tpc_lib_api::GlueCodeReturn GdnPackedDecodeF32Gaudi2::GetGcDefinitions(
     const auto& decay = inDefs->inputTensors[2];
     const auto& beta = inDefs->inputTensors[3];
     const auto& indices = inDefs->inputTensors[4];
-    auto& newState = inDefs->outputTensors[0];
-    auto& output = inDefs->outputTensors[1];
+    auto& output = inDefs->outputTensors[0];
 
     const bool inputsValid =
         HasTypeAndRank(state, tpc_lib_api::DATA_F32, 4) &&
-        HasTypeAndRank(packed, tpc_lib_api::DATA_F32, 2) &&
+        HasTypeAndRank(packed, tpc_lib_api::DATA_BF16, 2) &&
         HasTypeAndRank(decay, tpc_lib_api::DATA_F32, 2) &&
-        HasTypeAndRank(beta, tpc_lib_api::DATA_F32, 2) &&
+        HasTypeAndRank(beta, tpc_lib_api::DATA_BF16, 2) &&
         HasTypeAndRank(indices, tpc_lib_api::DATA_I32, 1);
     if (!inputsValid) {
         return tpc_lib_api::GLUE_INCOMPATIBLE_DATA_TYPE;
@@ -101,26 +101,12 @@ tpc_lib_api::GlueCodeReturn GdnPackedDecodeF32Gaudi2::GetGcDefinitions(
         return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_SIZE;
     }
 
-    const bool stateOutputMatches =
-        HasTypeAndRank(newState, tpc_lib_api::DATA_F32, 4) &&
-        newState.geometry.maxSizes[0] == keyDim && newState.geometry.maxSizes[1] == valueDim &&
-        newState.geometry.maxSizes[2] == valueHeads && newState.geometry.maxSizes[3] == batchSize;
-    if (!stateOutputMatches) {
-        newState.geometry.dataType = tpc_lib_api::DATA_F32;
-        newState.geometry.dims = 4;
-        newState.geometry.maxSizes[0] = keyDim;
-        newState.geometry.maxSizes[1] = valueDim;
-        newState.geometry.maxSizes[2] = valueHeads;
-        newState.geometry.maxSizes[3] = batchSize;
-        return tpc_lib_api::GLUE_INCOMPATIBLE_OUTPUT_SIZE;
-    }
-
     const bool outputMatches =
-        HasTypeAndRank(output, tpc_lib_api::DATA_F32, 3) &&
+        HasTypeAndRank(output, tpc_lib_api::DATA_BF16, 3) &&
         output.geometry.maxSizes[0] == valueDim && output.geometry.maxSizes[1] == valueHeads &&
         output.geometry.maxSizes[2] == batchSize;
     if (!outputMatches) {
-        output.geometry.dataType = tpc_lib_api::DATA_F32;
+        output.geometry.dataType = tpc_lib_api::DATA_BF16;
         output.geometry.dims = 3;
         output.geometry.maxSizes[0] = valueDim;
         output.geometry.maxSizes[1] = valueHeads;
@@ -147,13 +133,9 @@ tpc_lib_api::GlueCodeReturn GdnPackedDecodeF32Gaudi2::GetGcDefinitions(
     }
     MapDimension(outDefs->inputTensorAccessPattern[4], 0, 3, 1, 0, 0);
 
-    MapDimension(outDefs->outputTensorAccessPattern[0], 0, 0, 128, 0, 127);
-    MapDimension(outDefs->outputTensorAccessPattern[0], 1, 1, 32, 0, 31);
-    MapDimension(outDefs->outputTensorAccessPattern[0], 2, 2, 1, 0, 0);
-    MapDimension(outDefs->outputTensorAccessPattern[0], 3, 3, 1, 0, 0);
-    MapDimension(outDefs->outputTensorAccessPattern[1], 0, 1, 32, 0, 31);
-    MapDimension(outDefs->outputTensorAccessPattern[1], 1, 2, 1, 0, 0);
-    MapDimension(outDefs->outputTensorAccessPattern[1], 2, 3, 1, 0, 0);
+    MapDimension(outDefs->outputTensorAccessPattern[0], 0, 1, 32, 0, 31);
+    MapDimension(outDefs->outputTensorAccessPattern[0], 1, 2, 1, 0, 0);
+    MapDimension(outDefs->outputTensorAccessPattern[0], 2, 3, 1, 0, 0);
 
     outDefs->kernel.paramsNr = 0;
     const unsigned isaSize =
@@ -166,4 +148,3 @@ tpc_lib_api::GlueCodeReturn GdnPackedDecodeF32Gaudi2::GetGcDefinitions(
     std::memcpy(outDefs->kernel.kernelElf, &_binary_gdn_packed_decode_f32_gaudi2_o_start, isaSize);
     return tpc_lib_api::GLUE_SUCCESS;
 }
-

@@ -692,6 +692,43 @@ def test_should_synchronize_hybrid_prefill_output(use_async, num_mamba_layers, n
     assert should_synchronize_hybrid_prefill_output(use_async, num_mamba_layers, num_prefills) is expected
 
 
+def test_cache_block_capacity_keeps_hybrid_block_units_separate():
+    runner = object.__new__(HPUModelRunner)
+    runner.enable_bucketing = True
+    runner.bucketing_manager = SimpleNamespace(num_hpu_blocks=None)
+    runner.attn_block_size = 128
+
+    runner._set_cache_block_capacity(
+        scheduler_blocks=862,
+        attention_kernel_blocks=862 * 7,
+    )
+
+    assert runner.bucketing_manager.num_hpu_blocks == 6034
+    assert runner._PAD_BLOCK_ID == 6034
+    assert runner._PAD_SLOT_ID == 6034 * 128
+    assert runner._MAMBA_PAD_BLOCK_ID == 862
+    assert runner._dummy_num_blocks == 862
+
+
+def test_direct_gdn_state_requires_group_major_request_order():
+    runner = object.__new__(HPUModelRunner)
+    runner._direct_gdn_state_enabled = True
+    runner._compact_gdn_enabled = True
+    runner.use_prefix_caching = False
+    runner._compact_gdn_group_ids = {1, 3}
+    runner._compact_gdn_group_offset = {1: 0, 3: 1}
+    runner._gdn_max_reqs = 4
+
+    indices = torch.zeros(4, 4, dtype=torch.int32)
+    indices[1] = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+    indices[3] = torch.tensor([5, 6, 7, 8], dtype=torch.int32)
+    assert runner._can_use_direct_gdn_state(indices, num_indices=4, target_bs=4)
+    assert not runner._can_use_direct_gdn_state(indices, num_indices=4, target_bs=4, tokens_per_request=2)
+
+    indices[3] = torch.tensor([6, 5, 7, 8], dtype=torch.int32)
+    assert not runner._can_use_direct_gdn_state(indices, num_indices=4, target_bs=4)
+
+
 def test_max_cudagraph_capture_size_defaults_to_max_num_batched_tokens(model_runner):
     """max_cudagraph_capture_size defaults to max_num_batched_tokens when not configured."""
     assert model_runner.max_cudagraph_capture_size == model_runner.max_num_batched_tokens

@@ -87,7 +87,10 @@ def can_use_hpu_qwen3_layer_groups(
         and not aux_hidden_state_layers
         and attn_metadata is not None
         and not bool(getattr(attn_metadata, "is_prompt", False))
-        and batch_size <= HPU_QWEN3_LAYER_GROUP_MAX_BATCH_SIZE
+        and (
+            batch_size <= HPU_QWEN3_LAYER_GROUP_MAX_BATCH_SIZE
+            or bool(getattr(attn_metadata, "direct_gdn_state", False))
+        )
     )
 
 

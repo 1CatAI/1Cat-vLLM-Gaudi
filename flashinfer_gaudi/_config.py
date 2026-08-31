@@ -60,4 +60,3 @@ def get_state_precision() -> StatePrecision:
 
 def bridge_auto_enabled() -> bool:
     return os.environ.get(_BRIDGE_AUTO_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
-

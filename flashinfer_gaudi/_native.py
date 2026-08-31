@@ -42,9 +42,18 @@ def _configure_kernel_database_path() -> None:
     if not kernel_db.is_file():
         return
     current = [entry for entry in os.environ.get("GC_KERNEL_PATH", "").split(os.pathsep) if entry]
-    package_path = str(package_lib)
-    if package_path not in current:
-        os.environ["GC_KERNEL_PATH"] = os.pathsep.join((package_path, *current))
+    kernel_path = str(kernel_db)
+    if kernel_path in current:
+        return
+
+    configured = [kernel_path, *current]
+    # Setting GC_KERNEL_PATH replaces SynapseAI's implicit default. Preserve
+    # the stock kernel database when this package is the first component to
+    # configure the variable.
+    system_kernel_db = Path("/usr/lib/habanalabs/libtpc_kernels.so")
+    if not current and system_kernel_db.is_file():
+        configured.append(str(system_kernel_db))
+    os.environ["GC_KERNEL_PATH"] = os.pathsep.join(configured)
 
 
 def load_native_extensions() -> tuple[str, ...]:
@@ -109,3 +118,9 @@ def _reset_native_state_for_tests() -> None:
         _LOAD_ATTEMPTED = False
         _LOADED_PATHS.clear()
         _LOAD_ERRORS.clear()
+
+
+# SynapseAI reads GC_KERNEL_PATH when its graph compiler is initialized. Set
+# the packaged kernel database path as soon as this lightweight loader module
+# is imported; the PyTorch registration extension itself remains lazy.
+_configure_kernel_database_path()
