@@ -18,12 +18,33 @@ from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData, Schedu
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor)
 from vllm.v1.sample.metadata import SamplingMetadata
 import vllm_gaudi.extension.environment as environment
-from vllm_gaudi.v1.worker.hpu_model_runner import HPUModelRunner
+from vllm_gaudi.v1.worker.hpu_model_runner import (
+    HPUModelRunner,
+    _zero_compact_gdn_slot,
+)
 from vllm_gaudi.v1.worker.hpu_input_batch import InputBatch
 
 BLOCK_SIZE = 128
 NUM_BLOCKS = 10
 DEVICE = current_platform.device_type
+
+
+def test_zero_compact_gdn_slot_clears_only_reused_request_states():
+    first = torch.ones(8, 2)
+    second = torch.arange(24, dtype=torch.float32).reshape(8, 3)
+    first_before = first.clone()
+    second_before = second.clone()
+
+    _zero_compact_gdn_slot([first, second], base_slot=1, num_groups=3)
+
+    torch.testing.assert_close(first[1:4], first_before[1:4])
+    torch.testing.assert_close(second[1:4], second_before[1:4])
+    assert torch.count_nonzero(first[0]) == 0
+    assert torch.count_nonzero(second[0]) == 0
+    assert torch.count_nonzero(first[4:7]) == 0
+    assert torch.count_nonzero(second[4:7]) == 0
+    assert torch.count_nonzero(first[7]) == 0
+    assert torch.count_nonzero(second[7]) == 0
 
 
 def initialize_kv_cache(runner: HPUModelRunner):

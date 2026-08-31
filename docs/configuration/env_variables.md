@@ -35,10 +35,31 @@ This document lists the supported diagnostic and profiling, as well as performan
 | `VLLM_GDN_CHUNK_SIZE` | Overrides the GDN prefill chunk size. Set to a positive multiple of 32; `0` keeps the model-provided value or the HPU default. | `0` |
 | `VLLM_GDN_NEUMANN_ITERS` | Sets the iteration budget for the approximate GDN triangular solve. Lower values can improve prefill speed but require model-level quality validation. | `14` |
 | `VLLM_GDN_FUSED_STATE_MATMUL` | Fuses the GDN phase-B output and recurrent-state projections into one larger matrix multiplication per chunk. | `false` |
+| `VLLM_GDN_DEFERRED_OUTPUT_ADD` | Defers GDN phase-B output accumulation until after the recurrent loop, avoiding in-place writes to chunk views in compiled HPU graphs. | `false` |
 | `VLLM_GDN_RECURSIVE_SOLVER_BASE` | Enables recursive block inversion for the GDN triangular solve. Set to `0` to disable it or a power-of-two base size of which the chunk size is a power-of-two multiple. | `0` |
 | `VLLM_GDN_COMPACT_REPEATED_KKT` | Computes the GDN KKT product once per unique key head when value heads repeat the same key heads. | `false` |
+| `VLLM_GDN_COMPACT_REPEATED_LOCAL_ATTN` | Computes the phase-B local Q/K product once per unique Q/K head, then combines it with each repeated value head's causal decay. | `false` |
 | `VLLM_GDN_COMPILED_QK_L2NORM` | Keeps GDN Q/K L2 normalization inside the compiled prefill graph. Leave disabled on HPU compiler versions where this path has not been validated. | `false` |
 | `VLLM_GDN_FUSED_RMSNORM_GATED` | Uses Habana FusedRMSNorm for Qwen GDN output normalization before the output gate during prefill. Decode is unchanged. | `false` |
+| `VLLM_GDN_FLASHQLA` | Uses the experimental Gaudi-native FlashQLA similarity transforms, factorized local decay, and compact KKT layout for GDN prefill. This does not load FlashQLA's CUDA kernels. Enable `VLLM_GDN_FUSED_STATE_MATMUL` and `VLLM_GDN_DEFERRED_OUTPUT_ADD` for the validated fast path. | `false` |
+| `VLLM_GDN_FLASHQLA_FACTORIZE_PHASE_B` | Experimental factorization of FlashQLA's local gate decay in phase B. Disabled because separate positive gate factors can overflow for strongly decaying chunks. | `false` |
+| `VLLM_GDN_FLASHQLA_FP32_SCALING` | Computes the gate-free phase-A diagonal scale products in FP32 before returning to BF16 MME inputs and outputs. This reduces the reformulation's numerical drift without moving its BMMs off MME. | `false` |
+| `VLLM_GDN_BF16_BMM_F32` | Uses the experimental Synapse BF16-input, FP32-output batch GEMM for the GDN recurrent state projection. | `false` |
+| `VLLM_GDN_SOLVE_BF16_BMM_F32` | Uses the experimental BF16-input, FP32-output batch GEMM for recursive GDN KKT block merges while retaining the base 16x16 inverse in FP32. | `false` |
+| `VLLM_GDN_BF16_BMM_F32_EXTENSION` | Path to the private-ABI registration extension used by `VLLM_GDN_BF16_BMM_F32`. | empty |
+| `VLLM_GDN_QWEN38_NATIVE_QK_PREP` | Uses the fixed-shape Gaudi2 TPC kernel to fuse Qwen3.8 TP1 prompt Q/K FP32 normalization, head expansion, and final-layout writes. Decode is unchanged. | `false` |
+| `VLLM_GDN_QWEN38_BF16_QK` | Makes the native Qwen3.8 Q/K kernel write its expanded 48-head output directly in BF16, matching the optimized GDN input dtype and avoiding a large FP32 intermediate. Requires `VLLM_GDN_QWEN38_NATIVE_QK_PREP`. | `false` |
+| `VLLM_GDN_QWEN38_COMPACT_QK` | Keeps native Qwen3.8 Q/K in their 16-head BF16 layout through the GDN core and maps the 48 value heads as grouped views. Requires `VLLM_GDN_QWEN38_NATIVE_QK_PREP`; supersedes `VLLM_GDN_QWEN38_BF16_QK`. | `false` |
+| `VLLM_GDN_QWEN38_NATIVE_COMPACT_KKT` | Uses the Gaudi2 TPC compact-KKT producer for Qwen3.8 chunk-64 prefill. Requires compact Q/K and the native Q/K extension. | `false` |
+| `VLLM_GDN_COMPACT_QK_FACTOR_GATE` | Experimental compact-Q/K phase-A dataflow that applies each value head's gate to the smaller KKT coefficient matrix before the shared physical K-head multiplication. | `false` |
+| `VLLM_GDN_NATIVE_RECURRENT_SCAN` | Lowers the fused BF16 phase-B recurrent projection and additions as one mixed MME/TPC Synapse subgraph. Requires `VLLM_GDN_FUSED_STATE_MATMUL`, BF16 state, and `VLLM_GDN_BF16_BMM_F32_EXTENSION`. | `false` |
+| `VLLM_GDN_QWEN38_NATIVE_QK_PREP_EXTENSION` | Path to the built PyTorch registration extension used by `VLLM_GDN_QWEN38_NATIVE_QK_PREP`. Its TPC perf library must also be present in `GC_KERNEL_PATH`. | empty |
+| `VLLM_HPU_DYNAMIC_QUANT_CGUID` | Uses Habana `calculate_scale_for_cast` for runtime dynamic per-token FP8 activation scales on sufficiently large prefill graphs, while preserving the ordinary path's epsilon for zero and tiny rows. Model-load block-to-channel weight conversion retains the ordinary `abs().amax()` path. | `false` |
+| `VLLM_HPU_DYNAMIC_QUANT_CGUID_MIN_TOKENS` | Minimum flattened token count for `VLLM_HPU_DYNAMIC_QUANT_CGUID`. Smaller prompt and decode graphs retain the ordinary reduction path. | `2048` |
+| `VLLM_HPU_EXPLICIT_SIGMOID_SILU` | Expresses long-prompt SwiGLU as `gate * sigmoid(gate) * up`, allowing the HPU graph compiler to fuse the activation with its products and following dynamic FP8 quantization. | `false` |
+| `VLLM_HPU_EXPLICIT_SIGMOID_SILU_MIN_TOKENS` | Minimum flattened token count for explicit-sigmoid SwiGLU. Smaller prompt and decode graphs retain the ordinary HPU SiLU path. | `2048` |
+| `VLLM_GDN_HPU_CAUSAL_CONV1D` | Uses Habana's native causal-conv1d forward op for GDN prompt convolution and SiLU, then explicitly persists its functional cache output. Decode is unchanged. | `false` |
+| `VLLM_GDN_TOKEN_MAJOR_CAUSAL_CONV1D` | Keeps the compiled PyTorch GDN prompt convolution in token-major layout, avoiding the packed activation's channel-major round trip. Decode is unchanged. | `false` |
 
 Use `VLLM_BUCKETING_STRATEGY=exp` for the default exponential warm-up, `VLLM_BUCKETING_STRATEGY=lin` for explicitly configured linear ranges, or `VLLM_BUCKETING_STRATEGY=pad` for padding-aware ranges with absolute and relative padding limits.
 

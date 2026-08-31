@@ -21,6 +21,7 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization import get_quantization_config as vllm_get_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+import vllm_gaudi.envs as gaudi_envs
 
 is_hpu_gaudi2 = htexp._get_device_type() == htexp.synDeviceType.synDeviceGaudi2
 is_hpu_gaudi3 = htexp._get_device_type() == htexp.synDeviceType.synDeviceGaudi3
@@ -1010,9 +1011,23 @@ def apply_fp8_linear_hpu(
     return output
 
 
-def dynamic_quant(data, single_scale=False):
+def dynamic_quant(data, single_scale=False, use_cguid=True):
+    token_count = data.numel() // data.shape[-1]
     if single_scale:
         scale = ((torch.abs(data)).max() + 1e-8) / FP8_MAX
+    elif (use_cguid and gaudi_envs.VLLM_HPU_DYNAMIC_QUANT_CGUID
+          and token_count >= gaudi_envs.VLLM_HPU_DYNAMIC_QUANT_CGUID_MIN_TOKENS):
+        scale = torch.ops.hpu.calculate_scale_for_cast(
+            data,
+            2,  # MAX_ABS_PCS_CALCULATION
+            0,  # NO_SCALE_ROUNDING
+            -1,
+            True,
+            float(FP8_MAX),
+            1.0,
+        )
+        # Preserve the ordinary path's nonzero scale for zero/tiny rows.
+        scale = scale + (1e-8 / FP8_MAX)
     else:
         scale = ((torch.abs(data)).max(dim=-1).values + 1e-8) / FP8_MAX
         scale = scale.unsqueeze(-1)
@@ -1088,7 +1103,8 @@ def fp8_block_linear_postprocess_weights(layer, force_channel_fp8=False):
                                            layer.quant_config.weight_block_size,
                                            original_M=orig_M,
                                            original_N=orig_N,
-                                           do_unpad=True))
+                                           do_unpad=True),
+            use_cguid=False)
         weight_scale_inv = weight_scale_inv.squeeze(-1)
         layer.weight.data.copy_(weight)
         layer.weight_scale_inv = torch.nn.Parameter(weight_scale_inv, requires_grad=False)
@@ -1116,10 +1132,12 @@ def fp8_block_moe_prepare_weights(layer, force_channel_fp8=False):
         # convert to channel-wise fp8
         w13_weight, w13_weight_scale_inv = dynamic_quant(
             dequant_block_fp8_weight_naive(layer.w13_weight.data, layer.w13_weight_scale_inv.data,
-                                           layer.quant_config.weight_block_size))
+                                           layer.quant_config.weight_block_size),
+            use_cguid=False)
         w2_weight, w2_weight_scale_inv = dynamic_quant(
             dequant_block_fp8_weight_naive(layer.w2_weight.data, layer.w2_weight_scale_inv.data,
-                                           layer.quant_config.weight_block_size))
+                                           layer.quant_config.weight_block_size),
+            use_cguid=False)
         w13_weight_scale_inv, w2_weight_scale_inv \
             = w13_weight_scale_inv.squeeze(-1), w2_weight_scale_inv.squeeze(-1)
         layer.w13_weight.data.copy_(w13_weight)
