@@ -28,6 +28,12 @@ tactic manifest until they pass both model-level quality and performance
 gates. `public` and `bridge` are strict policies: an unavailable implementation
 raises before recurrent state is modified.
 
+The production `H=16`, `HV=48`, `K=V=128` direct-state route has a static
+Gaudi recipe rather than deriving head dimensions inside the compiled graph.
+It normalizes packed Q/K together with an explicit reciprocal-square-root
+form and uses `addcmul` for the FP32 rank-one state update. Other shapes keep
+the general FlashInfer-compatible implementation.
+
 The first native Gaudi2 GUID specializes Qwen3.8 decode (`H=16`, `HV=48`,
 `K=V=128`) with packed BF16 Q/K/V and beta, BF16 output, FP32 recurrent state,
 grouped Q/K reuse, negative-index padding, and in-place pooled-state updates.
@@ -37,6 +43,29 @@ decode bucket matrix; availability alone never changes the stable route.
 The default state precision is FP32. BF16 recurrent state is not selected by
 the production dispatcher until it passes end-to-end token and state-quality
 validation.
+
+## Microbenchmarking
+
+Run the production bucket matrix with both synchronized host latency and
+continuous device-wave timing:
+
+```bash
+python3 tools/benchmark_flashinfer_gaudi_gdn.py \
+  --batches 1,8,16,32 --timing-mode both --backend public
+```
+
+Compare the production direct recipe with the existing vLLM decode path with:
+
+```bash
+python3 tools/benchmark_flashinfer_gaudi_gdn.py \
+  --batches 1,8,16,32 --timing-mode both \
+  --reference-layout legacy --backend pytorch
+```
+
+`device_speedup` uses HPU events around an interleaved multi-iteration wave
+and is the promotion metric for kernel execution. `median_speedup` includes a
+device synchronization after every invocation and is retained as the exposed
+single-call latency diagnostic.
 
 ## Compatibility namespace
 

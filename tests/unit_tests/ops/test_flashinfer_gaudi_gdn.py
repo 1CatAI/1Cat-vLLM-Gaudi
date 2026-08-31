@@ -436,6 +436,43 @@ def test_vllm_adapter_uses_direct_group_state_view():
     torch.testing.assert_close(pool[:max_requests + 1], original[:max_requests + 1])
 
 
+def test_qwen38_static_direct_recipe_matches_indexed_reference():
+    generator = torch.Generator().manual_seed(53)
+    batch, q_heads, value_heads, dim = 1, 16, 48, 128
+    packed = torch.randn(batch, (2 * q_heads + value_heads) * dim, dtype=torch.bfloat16, generator=generator)
+    log_decay = -torch.rand(batch, value_heads, dtype=torch.float32, generator=generator)
+    beta = torch.sigmoid(torch.randn(batch, value_heads, dtype=torch.float32, generator=generator)).to(torch.bfloat16)
+    indexed_state = torch.randn(batch, value_heads, dim, dim, dtype=torch.float32, generator=generator)
+    direct_state = indexed_state.clone()
+    indices = torch.arange(batch, dtype=torch.int32)
+
+    expected_output, _ = packed_recurrent_decode(
+        packed,
+        log_decay,
+        beta,
+        indexed_state,
+        indices,
+        indices,
+        None,
+        True,
+    )
+    output, _ = packed_recurrent_decode(
+        packed,
+        log_decay,
+        beta,
+        direct_state,
+        None,
+        None,
+        None,
+        True,
+        True,
+    )
+
+    assert output.dtype == torch.bfloat16
+    torch.testing.assert_close(output, expected_output, atol=2e-3, rtol=2e-2)
+    torch.testing.assert_close(direct_state, indexed_state, atol=2e-5, rtol=2e-4)
+
+
 def test_vllm_adapter_leaves_mtp_batches_on_general_path():
     _, _, _, pool, log_decay, beta = _inputs(batch=2)
     packed = torch.randn(4, 64)

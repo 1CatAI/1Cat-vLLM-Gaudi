@@ -8,6 +8,13 @@ import math
 import torch
 import torch.nn.functional as F
 
+_QWEN38_KEY_HEADS = 16
+_QWEN38_VALUE_HEADS = 48
+_QWEN38_DIM = 128
+_QWEN38_HEAD_REPEAT = _QWEN38_VALUE_HEADS // _QWEN38_KEY_HEADS
+_QWEN38_QK_WIDTH = 2 * _QWEN38_KEY_HEADS * _QWEN38_DIM
+_QWEN38_PACKED_WIDTH = (_QWEN38_VALUE_HEADS + 2 * _QWEN38_KEY_HEADS) * _QWEN38_DIM
+
 
 def _as_bt_heads(value: torch.Tensor, batch: int, tokens: int, heads: int, name: str) -> torch.Tensor:
     if value.numel() != batch * tokens * heads:
@@ -64,6 +71,49 @@ def _write_state_rows(
         state_pool.index_copy_(0, safe_destination, row)
 
 
+def _l2_normalize_rsqrt(value: torch.Tensor) -> torch.Tensor:
+    """Express L2 normalization in the form Gaudi fuses most efficiently."""
+    norm_squared = torch.sum(value * value, dim=-1, keepdim=True)
+    return value * torch.rsqrt(torch.clamp_min(norm_squared, 1e-12))
+
+
+def _direct_single_token_decode_core(
+    q_work: torch.Tensor,
+    k_work: torch.Tensor,
+    value_work: torch.Tensor,
+    log_decay: torch.Tensor,
+    beta: torch.Tensor,
+    state_pool: torch.Tensor,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Update contiguous state after Q/K conversion and normalization."""
+    batch, q_heads, key_dim = q_work.shape
+    value_heads, value_dim = value_work.shape[1:]
+    repeat = value_heads // q_heads
+    output_dtype = value_work.dtype
+    k_grouped = k_work.unsqueeze(2)
+
+    state = state_pool.to(torch.float32).reshape(batch, q_heads, repeat, value_dim, key_dim)
+    decay = torch.exp(_as_bt_heads(log_decay, batch, 1, value_heads, "log_decay")[:, 0].to(torch.float32))
+    decay = decay.reshape(batch, q_heads, repeat, 1, 1)
+    beta_work = _as_bt_heads(beta, batch, 1, value_heads, "beta")[:, 0].to(torch.float32)
+    beta_work = beta_work.reshape(batch, q_heads, repeat, 1)
+    value_work = value_work.to(torch.float32).reshape(batch, q_heads, repeat, value_dim)
+
+    # Two width-one projections are faster than a single width-two MME on
+    # Gaudi2 for this state shape. Keep the recurrent update order explicit so
+    # the graph compiler can fuse the surrounding decay and rank-one update.
+    decayed_state = state * decay
+    projection = torch.matmul(decayed_state, k_grouped.unsqueeze(-1)).squeeze(-1)
+    delta = (value_work - projection) * beta_work
+    updated_state = torch.addcmul(decayed_state, delta.unsqueeze(-1), k_grouped.unsqueeze(-2))
+    output = torch.matmul(updated_state, (q_work.unsqueeze(2) * scale).unsqueeze(-1)).squeeze(-1)
+
+    state_pool.copy_(updated_state.reshape_as(state_pool).to(state_pool.dtype))
+    output = output.reshape(batch, 1, value_heads, value_dim).to(output_dtype)
+    return output, state_pool
+
+
 def _direct_single_token_decode(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -75,32 +125,121 @@ def _direct_single_token_decode(
     use_qk_l2norm: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Specialize the contiguous decode path without gather/scatter scaffolding."""
-    batch, _, q_heads, key_dim = q.shape
-    value_heads, value_dim = v.shape[2:]
-    repeat = value_heads // q_heads
-
-    q_work = q[:, 0].to(torch.float32)
-    k_work = k[:, 0].to(torch.float32)
+    q_heads = q.shape[2]
+    qk_work = torch.cat((q[:, 0], k[:, 0]), dim=1).to(torch.float32)
     if use_qk_l2norm:
-        q_work = F.normalize(q_work, p=2.0, dim=-1, eps=1e-6)
-        k_work = F.normalize(k_work, p=2.0, dim=-1, eps=1e-6)
-    k_grouped = k_work.unsqueeze(2)
+        qk_work = _l2_normalize_rsqrt(qk_work)
+    q_work, k_work = qk_work.split(q_heads, dim=1)
+    return _direct_single_token_decode_core(
+        q_work,
+        k_work,
+        v[:, 0],
+        log_decay,
+        beta,
+        state_pool,
+        scale,
+    )
 
-    state = state_pool.to(torch.float32).reshape(batch, q_heads, repeat, value_dim, key_dim)
-    decay = torch.exp(_as_bt_heads(log_decay, batch, 1, value_heads, "log_decay")[:, 0].to(torch.float32))
-    decay = decay.reshape(batch, q_heads, repeat, 1, 1)
-    beta_work = _as_bt_heads(beta, batch, 1, value_heads, "beta")[:, 0].to(torch.float32)
-    beta_work = beta_work.reshape(batch, q_heads, repeat, 1)
-    value_work = v[:, 0].to(torch.float32).reshape(batch, q_heads, repeat, value_dim)
+
+def _direct_single_token_packed_decode(
+    packed_qkv: torch.Tensor,
+    log_decay: torch.Tensor,
+    beta: torch.Tensor,
+    state_pool: torch.Tensor,
+    scale: float | None,
+    use_qk_l2norm: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Specialize packed decode so Q and K share one normalization launch."""
+    if packed_qkv.ndim != 2:
+        raise ValueError(f"packed_qkv must have [B,width] shape, got {packed_qkv.shape}.")
+    if state_pool.ndim != 4:
+        raise ValueError(f"state must have [B,HV,V,K] shape, got {state_pool.shape}.")
+    batch = packed_qkv.shape[0]
+    slots, value_heads, value_dim, key_dim = state_pool.shape
+    if slots != batch:
+        raise ValueError(f"Direct state requires one contiguous row per request; got slots={slots}, B={batch}.")
+    value_width = value_heads * value_dim
+    qk_width = packed_qkv.shape[1] - value_width
+    if qk_width <= 0 or qk_width % (2 * key_dim):
+        raise ValueError(f"Cannot infer Q/K heads from packed width {packed_qkv.shape[1]}, "
+                         f"HV={value_heads}, K={key_dim}, V={value_dim}.")
+    q_heads = qk_width // (2 * key_dim)
+    if value_heads % q_heads:
+        raise ValueError(f"Value heads ({value_heads}) must be divisible by inferred Q/K heads ({q_heads}).")
+
+    qk_work = packed_qkv[:, :qk_width].reshape(batch, 2 * q_heads, key_dim).to(torch.float32)
+    if use_qk_l2norm:
+        qk_work = _l2_normalize_rsqrt(qk_work)
+    q_work, k_work = qk_work.split(q_heads, dim=1)
+    value_work = packed_qkv[:, qk_width:].reshape(batch, value_heads, value_dim)
+    return _direct_single_token_decode_core(
+        q_work,
+        k_work,
+        value_work,
+        log_decay,
+        beta,
+        state_pool,
+        key_dim**-0.5 if scale is None else scale,
+    )
+
+
+def _direct_qwen38_single_token_packed_decode(
+    packed_qkv: torch.Tensor,
+    log_decay: torch.Tensor,
+    beta: torch.Tensor,
+    state_pool: torch.Tensor,
+    scale: float,
+    use_qk_l2norm: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Keep the production Qwen shape static for the Gaudi graph compiler."""
+    batch = packed_qkv.shape[0]
+    qk_work = packed_qkv[:, :_QWEN38_QK_WIDTH].reshape(
+        batch,
+        2 * _QWEN38_KEY_HEADS,
+        _QWEN38_DIM,
+    ).to(torch.float32)
+    if use_qk_l2norm:
+        qk_work = _l2_normalize_rsqrt(qk_work)
+    q_work, k_work = qk_work.split(_QWEN38_KEY_HEADS, dim=1)
+    k_grouped = k_work.unsqueeze(2)
+    value_work = packed_qkv[:, _QWEN38_QK_WIDTH:].reshape(
+        batch,
+        _QWEN38_KEY_HEADS,
+        _QWEN38_HEAD_REPEAT,
+        _QWEN38_DIM,
+    ).to(torch.float32)
+    state = state_pool.reshape(
+        batch,
+        _QWEN38_KEY_HEADS,
+        _QWEN38_HEAD_REPEAT,
+        _QWEN38_DIM,
+        _QWEN38_DIM,
+    )
+    decay = torch.exp(log_decay.reshape(
+        batch,
+        _QWEN38_KEY_HEADS,
+        _QWEN38_HEAD_REPEAT,
+    ).to(torch.float32)).reshape(
+        batch,
+        _QWEN38_KEY_HEADS,
+        _QWEN38_HEAD_REPEAT,
+        1,
+        1,
+    )
+    beta_work = beta.reshape(
+        batch,
+        _QWEN38_KEY_HEADS,
+        _QWEN38_HEAD_REPEAT,
+    ).to(torch.float32).unsqueeze(-1)
 
     decayed_state = state * decay
     projection = torch.matmul(decayed_state, k_grouped.unsqueeze(-1)).squeeze(-1)
     delta = (value_work - projection) * beta_work
-    updated_state = decayed_state + delta.unsqueeze(-1) * k_grouped.unsqueeze(-2)
+    updated_state = torch.addcmul(decayed_state, delta.unsqueeze(-1), k_grouped.unsqueeze(-2))
     output = torch.matmul(updated_state, (q_work.unsqueeze(2) * scale).unsqueeze(-1)).squeeze(-1)
 
-    state_pool.copy_(updated_state.reshape_as(state_pool).to(state_pool.dtype))
-    output = output.reshape(batch, 1, value_heads, value_dim).to(v.dtype)
+    state_pool.copy_(updated_state.reshape_as(state_pool))
+    output = output.reshape(batch, _QWEN38_VALUE_HEADS, _QWEN38_DIM).to(packed_qkv.dtype)
     return output, state_pool
 
 
@@ -261,6 +400,24 @@ def packed_recurrent_decode(
     use_qk_l2norm: bool,
     direct_state: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if direct_state:
+        if (packed_qkv.ndim == 2 and state_pool.ndim == 4 and state_pool.dtype == torch.float32
+                and packed_qkv.shape[1] == _QWEN38_PACKED_WIDTH
+                and tuple(state_pool.shape[1:]) == (_QWEN38_VALUE_HEADS, _QWEN38_DIM, _QWEN38_DIM)):
+            if state_pool.shape[0] != packed_qkv.shape[0]:
+                raise ValueError("Direct state requires one contiguous row per request; "
+                                 f"got slots={state_pool.shape[0]}, B={packed_qkv.shape[0]}.")
+            return _direct_qwen38_single_token_packed_decode(
+                packed_qkv,
+                log_decay,
+                beta,
+                state_pool,
+                _QWEN38_DIM**-0.5 if scale is None else scale,
+                use_qk_l2norm,
+            )
+        output, updated_pool = _direct_single_token_packed_decode(packed_qkv, log_decay, beta, state_pool, scale,
+                                                                  use_qk_l2norm)
+        return output[:, 0], updated_pool
     _, value_heads, value_dim, key_dim = state_pool.shape
     q, k, v, _ = split_packed_qkv(packed_qkv, value_heads, key_dim, value_dim)
     output, updated_pool = recurrent_decode_from_qkv(
