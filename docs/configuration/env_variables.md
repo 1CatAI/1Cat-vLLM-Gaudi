@@ -32,6 +32,14 @@ This document lists the supported diagnostic and profiling, as well as performan
 | `VLLM_MINIMAX_M3_MOE_TOKEN_TILE` | Maximum number of tokens processed per tile by the MiniMax-M3 dense SwiGLU-OAI expert path. Non-positive values disable tiling. | `512` |
 | `VLLM_MINIMAX_M3_MOE_DECODE_GATHER` | Enables the MiniMax-M3 routed-expert gather path for low-token decode. Set to `0` or `false` to use the dense expert path. | `true` |
 | `VLLM_MINIMAX_M3_MOE_GATHER_MAX_TOKENS` | Maximum token count for the MiniMax-M3 routed-expert gather path. Larger batches use the dense expert path. | `16` |
+| `VLLM_HPU_FLASHINFER_GDN` | Enables the in-tree FlashInfer-compatible packed GDN decode path for Qwen hybrid models. Unsupported shapes use the reference path when backend selection is `auto`. | `false` |
+| `FLASHINFER_GAUDI_BACKEND` | Selects `auto`, `public`, `bridge`, or `pytorch` for FlashInfer-Gaudi ops. Forced unavailable native backends fail before mutating recurrent state. | `auto` |
+| `FLASHINFER_GAUDI_STATE_DTYPE` | Selects the requested recurrent-state precision. `fp32` is the production default; `bf16` remains experimental until model-quality validation succeeds. | `fp32` |
+| `FLASHINFER_GAUDI_NATIVE_LIBRARY` | Optional path-list of native host-extension libraries to load. Packaged libraries are discovered automatically. | unset |
+| `FLASHINFER_GAUDI_ENABLE_COMPAT_SHIM` | Exposes supported modules under the `flashinfer` namespace when explicitly enabled and the official package is absent. vLLM-Gaudi does not require this shim. | `false` |
+| `FLASHINFER_GAUDI_ENABLE_PUBLIC_AUTO` | Promotes a loaded public TPC GDN tactic into `auto` selection. Keep disabled until the exact software stack passes quality and end-to-end performance gates. | `false` |
+| `FLASHINFER_GAUDI_ENABLE_BRIDGE_AUTO` | Allows `auto` to consider the ABI-private bridge backend after its version and quality gates pass. | `false` |
+| `VLLM_GAUDI_BUILD_FLASHINFER` | Controls native builds during packaging: `auto` builds when both the TPC compiler and Gaudi PyTorch package exist; `1` requires a successful build; `0` installs reference code only. | `auto` |
 
 Use `VLLM_BUCKETING_STRATEGY=exp` for the default exponential warm-up, `VLLM_BUCKETING_STRATEGY=lin` for explicitly configured linear ranges, or `VLLM_BUCKETING_STRATEGY=pad` for padding-aware ranges with absolute and relative padding limits.
 

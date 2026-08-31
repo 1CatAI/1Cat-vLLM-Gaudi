@@ -77,6 +77,9 @@ def get_experimental_flags():
         Env('VLLM_DEFRAG_THRESHOLD', int),
         Env('VLLM_DEFRAG_WITH_GRAPHS', boolean),
         Env('VLLM_DEBUG', list_of(str), check=for_all(choice('steps', 'defrag', 'fwd'))),
+        Env('VLLM_HPU_FLASHINFER_GDN', boolean),
+        Env('FLASHINFER_GAUDI_BACKEND', str),
+        Env('FLASHINFER_GAUDI_STATE_DTYPE', str),
     ]
     return to_dict(flags)
 

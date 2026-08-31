@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "device": "gaudi2",
+  "operation": "gdn_decode_packed",
+  "model_shape": {
+    "key_heads": 16,
+    "value_heads": 48,
+    "key_dim": 128,
+    "value_dim": 128,
+    "batch_buckets": [1, 8, 16, 32],
+    "input_dtype": "bfloat16",
+    "state_dtype": "float32",
+    "state_layout": "VK"
+  },
+  "stable_default": "pytorch",
+  "public_native_promoted": false,
+  "bridge_native_promoted": false
+}
+

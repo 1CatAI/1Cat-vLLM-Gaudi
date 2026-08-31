@@ -1,7 +1,12 @@
 import logging
 import os
+import importlib.util
+import shutil
+import subprocess
+import sys
 
 from setuptools import setup, find_packages
+from setuptools.command.build_py import build_py as _build_py
 from setuptools_scm import get_version
 
 try:
@@ -43,6 +48,35 @@ def get_requirements() -> list[str]:
     return requirements
 
 
+class FlashInferBuildPy(_build_py):
+    """Optionally build version-pinned native kernels into the package."""
+
+    def _native_build_enabled(self) -> bool:
+        mode = os.environ.get("VLLM_GAUDI_BUILD_FLASHINFER", "auto").strip().lower()
+        if mode in ("0", "false", "off", "no"):
+            return False
+        if mode in ("1", "true", "on", "yes"):
+            return True
+        if mode != "auto":
+            raise ValueError("VLLM_GAUDI_BUILD_FLASHINFER must be auto, 0, or 1.")
+        return shutil.which("tpc-clang") is not None and importlib.util.find_spec("habana_frameworks") is not None
+
+    def run(self):
+        super().run()
+        if not self._native_build_enabled():
+            return
+        output_dir = os.path.join(self.build_lib, "flashinfer_gaudi", "lib")
+        subprocess.run(
+            [
+                sys.executable,
+                get_path("tools", "build_flashinfer_gaudi.py"),
+                "--output-dir",
+                output_dir,
+            ],
+            check=True,
+        )
+
+
 setup(
     name="vllm_gaudi",
     version=VERSION,
@@ -59,9 +93,11 @@ setup(
         "Operating System :: OS Independent",
     ],
     packages=find_packages(exclude=("docs", "examples", "tests*", "csrc")),
+    package_data={"flashinfer_gaudi": ["lib/*.so", "tactics/*.json"]},
     py_modules=["pytest_compat"],
     install_requires=get_requirements(),
     ext_modules=ext_modules,
+    cmdclass={"build_py": FlashInferBuildPy},
     extras_require={},
     entry_points={
         "vllm.platform_plugins": ["hpu = vllm_gaudi:register"],

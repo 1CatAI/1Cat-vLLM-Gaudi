@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     VLLM_MINIMAX_M3_MOE_DECODE_GATHER: bool = True
     VLLM_MINIMAX_M3_MOE_GATHER_MAX_TOKENS: int = 16
     VLLM_MM_WARMUP_OUTSIDE_COMPILE_ONLY: bool = False
+    VLLM_HPU_FLASHINFER_GDN: bool = False
 
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
@@ -87,6 +88,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # data-dependent output shapes that must be materialized during warmup.
     "VLLM_MM_WARMUP_OUTSIDE_COMPILE_ONLY":
     lambda: os.environ.get("VLLM_MM_WARMUP_OUTSIDE_COMPILE_ONLY", "false").strip().lower() in ("1", "true"),
+
+    # Enable the in-tree FlashInfer-compatible GDN decode adapter. The adapter
+    # defaults to the public native backend when available and otherwise uses
+    # its numerically conservative PyTorch reference.
+    "VLLM_HPU_FLASHINFER_GDN":
+    lambda: os.environ.get("VLLM_HPU_FLASHINFER_GDN", "false").strip().lower() in ("1", "true"),
 }
 
 # end-env-vars-definition

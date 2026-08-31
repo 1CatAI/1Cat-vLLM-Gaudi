@@ -11,6 +11,7 @@ from vllm_gaudi.ops.hpu_gdn_pytorch import (
     hpu_fused_gdn_gating,
     hpu_fused_recurrent_gated_delta_rule,
 )
+from vllm_gaudi.ops.flashinfer_gaudi_adapter import maybe_run_gdn_decode_packed
 
 
 def _save_ssm_state(core_attn_out, final_state, ssm_state, state_indices):
@@ -21,8 +22,13 @@ def _save_ssm_state(core_attn_out, final_state, ssm_state, state_indices):
     core_attn_out as a pass-through so the compiled graph consumes
     the call — HPU drops dynamo-disabled calls whose results are unused.
     """
-    safe_si = torch.remainder(state_indices, ssm_state.shape[0]).long()
-    ssm_state.index_copy_(0, safe_si, final_state.to(device=ssm_state.device, dtype=ssm_state.dtype))
+    state_indices = state_indices.reshape(-1).to(device=ssm_state.device, dtype=torch.long)
+    valid = (state_indices >= 0) & (state_indices < ssm_state.shape[0])
+    valid_positions = torch.nonzero(valid, as_tuple=False).reshape(-1)
+    if valid_positions.numel() > 0:
+        safe_si = state_indices.index_select(0, valid_positions)
+        state_rows = final_state.index_select(0, valid_positions).to(device=ssm_state.device, dtype=ssm_state.dtype)
+        ssm_state.index_copy_(0, safe_si, state_rows)
     return core_attn_out
 
 
@@ -62,13 +68,9 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         value = value.reshape(1, value.size(0), -1, self.head_v_dim).contiguous()
         return query, key, value
 
-    def _resolve_state_indices(self, attn_metadata):
-        """Resolve load_indices_tensor, handling 2-D cache-group case.
-
-        For Qwen 3.5 (GDN), load and store indices are identical
-        so using load_indices_tensor is sufficient.
-        """
-        indices = attn_metadata.load_indices_tensor
+    def _resolve_state_indices(self, attn_metadata, attribute):
+        """Resolve one state-index tensor, handling 2-D cache groups."""
+        indices = getattr(attn_metadata, attribute, None)
         if indices is not None and indices.dim() > 1:
             cg = self.cache_group_idx
             assert cg is not None
@@ -84,10 +86,18 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
-            return (False, None, None, None, None, None, None, 0, 0, 0, 0, None)
+            return (False, None, None, None, None, None, None, None, 0, 0, 0, 0, None)
 
         is_prompt = bool(getattr(attn_metadata, "is_prompt", False))
-        state_indices = self._resolve_state_indices(attn_metadata)
+        load_state_indices = self._resolve_state_indices(attn_metadata, "load_indices_tensor")
+        store_state_indices = self._resolve_state_indices(attn_metadata, "store_indices_tensor")
+        if not getattr(self.cache_config, "enable_prefix_caching", False):
+            # The scheduler constructs equivalent load/store tensors in this
+            # mode. Preserve object identity so single-index native kernels
+            # can be selected without a device-side equality synchronization.
+            store_state_indices = load_state_indices
+        elif store_state_indices is None:
+            store_state_indices = load_state_indices
 
         conv_state = self.kv_cache[0]
         ssm_state = self.kv_cache[1]
@@ -97,7 +107,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         padding_mask_flat = getattr(attn_metadata, "padding_mask_flat", None)
 
         if not is_prompt:
-            num_decodes = (state_indices.numel() if state_indices is not None else
+            num_decodes = (load_state_indices.numel() if load_state_indices is not None else
                            (query_start_loc.numel() - 1 if query_start_loc is not None else num_tokens))
         else:
             num_decodes = 0
@@ -108,17 +118,23 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         prefill_num_seqs = 0
         prefill_seq_len = 0
         initial_state = None
-        if is_prompt and state_indices is not None:
-            prefill_num_seqs = int(state_indices.numel())
+        if is_prompt and load_state_indices is not None:
+            prefill_num_seqs = int(load_state_indices.numel())
             prefill_seq_len = (num_tokens // prefill_num_seqs if prefill_num_seqs > 0 else 0)
-            initial_state = ssm_state[state_indices].contiguous()
+            safe_load_indices = torch.where(
+                (load_state_indices >= 0) & (load_state_indices < ssm_state.shape[0]),
+                load_state_indices,
+                torch.zeros_like(load_state_indices),
+            ).long()
+            initial_state = ssm_state.index_select(0, safe_load_indices).contiguous()
             if has_initial_state is not None:
                 # Avoid scatter_nd from boolean indexing
                 mask = has_initial_state.bool().view(-1, 1, 1, 1).to(initial_state.dtype)
                 initial_state = initial_state * mask
 
-        return (is_prompt, conv_state, ssm_state, state_indices, query_start_loc, has_initial_state, padding_mask_flat,
-                num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len, initial_state)
+        return (is_prompt, conv_state, ssm_state, load_state_indices, store_state_indices, query_start_loc,
+                has_initial_state, padding_mask_flat, num_decodes, mamba_block_size, prefill_num_seqs,
+                prefill_seq_len, initial_state)
 
     def forward(
         self,
@@ -139,8 +155,8 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         num_tokens = hidden_states.size(0)
 
         # === Metadata extraction (natural graph break) ===============
-        (is_prompt, conv_state, ssm_state, state_indices, query_start_loc, has_initial_state, padding_mask_flat,
-         num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len,
+        (is_prompt, conv_state, ssm_state, load_state_indices, store_state_indices, query_start_loc,
+         has_initial_state, padding_mask_flat, num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len,
          initial_state) = self._extract_metadata(num_tokens)
 
         # === Part 1: Input Projection ================================
@@ -200,7 +216,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 activation=self.activation,
                 conv_states=conv_state,
                 has_initial_state=has_initial_state,
-                cache_indices=state_indices,
+                cache_indices=load_state_indices,
                 block_idx_first_scheduled_token=None,
                 block_idx_last_scheduled_token=None,
                 initial_state_idx=None,
@@ -240,7 +256,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 core_attn_out_result,
                 final_state,
                 ssm_state,
-                state_indices,
+                store_state_indices,
             )
 
             non_spec_out = core_attn_out_result.squeeze(0)
@@ -257,24 +273,36 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 weight=conv_weights,
                 bias=self.conv1d.bias,
                 activation=self.activation,
-                conv_state_indices=(state_indices[:num_decodes] if state_indices is not None else state_indices),
+                conv_state_indices=(load_state_indices[:num_decodes]
+                                    if load_state_indices is not None else load_state_indices),
                 block_idx_last_scheduled_token=None,
                 initial_state_idx=None,
                 query_start_loc=query_start_loc,
                 validate_data=False,
             )
 
-            query, key, value = self.rearrange_mixed_qkv(mixed_qkv_conv)
-
-            core_attn_out_result, _ = \
-                hpu_fused_recurrent_gated_delta_rule(
+            flashinfer_result = maybe_run_gdn_decode_packed(
+                mixed_qkv=mixed_qkv_conv,
+                log_decay=g,
+                beta=beta,
+                state_pool=ssm_state,
+                load_state_indices=load_state_indices,
+                store_state_indices=store_state_indices,
+                use_qk_l2norm=True,
+                scale=self.head_k_dim**-0.5,
+            )
+            if flashinfer_result is not None:
+                core_attn_out_result, _ = flashinfer_result
+            else:
+                query, key, value = self.rearrange_mixed_qkv(mixed_qkv_conv)
+                core_attn_out_result, _ = hpu_fused_recurrent_gated_delta_rule(
                     q=query, k=key, v=value, g=g, beta=beta,
                     initial_state=ssm_state,
                     inplace_final_state=True,
                     cu_seqlens=(
                         query_start_loc[:num_decodes + 1]
                         if query_start_loc is not None else None),
-                    ssm_state_indices=state_indices,
+                    ssm_state_indices=load_state_indices,
                     use_qk_l2norm_in_kernel=True,
                 )
 
