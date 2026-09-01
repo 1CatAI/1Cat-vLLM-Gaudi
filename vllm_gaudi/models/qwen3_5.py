@@ -269,19 +269,32 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             # === Part 2b: Decode =====================================
             g, beta = hpu_fused_gdn_gating(self.A_log, a, b, self.dt_bias)
 
-            conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
+            selected_conv_state = conv_state
+            direct_conv_state = False
+            if (direct_gdn_state and self.compact_state_group_count is not None
+                    and self.compact_state_group_count > 0 and self.compact_state_group_offset is not None):
+                group_span = (conv_state.shape[0] - 2) // self.compact_state_group_count
+                if num_decodes <= group_span:
+                    state_start = self.compact_state_group_offset * group_span + 1
+                    selected_conv_state = conv_state.narrow(0, state_start, num_decodes)
+                    direct_conv_state = True
+            conv_weights = self.conv1d.weight.view(
+                self.conv1d.weight.size(0),
+                self.conv1d.weight.size(2),
+            )
             mixed_qkv_conv = hpu_causal_conv1d_update(
                 x=mixed_qkv,
-                conv_state=conv_state,
+                conv_state=selected_conv_state,
                 weight=conv_weights,
                 bias=self.conv1d.bias,
                 activation=self.activation,
-                conv_state_indices=(load_state_indices[:num_decodes]
-                                    if load_state_indices is not None else load_state_indices),
+                conv_state_indices=(None if direct_conv_state else (
+                    load_state_indices[:num_decodes] if load_state_indices is not None else load_state_indices)),
                 block_idx_last_scheduled_token=None,
                 initial_state_idx=None,
                 query_start_loc=query_start_loc,
                 validate_data=False,
+                direct_state_layout=direct_conv_state,
             )
 
             flashinfer_result = maybe_run_gdn_decode_packed(

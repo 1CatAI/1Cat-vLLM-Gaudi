@@ -28,6 +28,14 @@ tactic manifest until they pass both model-level quality and performance
 gates. `public` and `bridge` are strict policies: an unavailable implementation
 raises before recurrent state is modified.
 
+The same proven group-major contract is also applied to the Qwen decode
+convolution cache. One-token decode consumes its native
+`[batch, state_length, channels]` view directly, eliminating integer-index
+gather/scatter, a transpose, and a temporary convolution window. This path is
+selected only when every active request exactly fills the static decode bucket;
+padding, prefix caching, and multi-token/speculative decode retain the general
+indexed implementation.
+
 The production `H=16`, `HV=48`, `K=V=128` direct-state route has a static
 Gaudi recipe rather than deriving head dimensions inside the compiled graph.
 It normalizes packed Q/K together with an explicit reciprocal-square-root
@@ -60,6 +68,14 @@ Compare the production direct recipe with the existing vLLM decode path with:
 python3 tools/benchmark_flashinfer_gaudi_gdn.py \
   --batches 1,8,16,32 --timing-mode both \
   --reference-layout legacy --backend pytorch
+```
+
+Benchmark the indexed and group-major convolution-cache recipes with:
+
+```bash
+python3 tools/benchmark_flashinfer_gaudi_decode_conv.py \
+  --batches 1,8,16,32 --warmups 100 \
+  --wave-iterations 500 --waves 15
 ```
 
 `device_speedup` uses HPU events around an interleaved multi-iteration wave
