@@ -97,6 +97,7 @@ def maybe_run_gdn_prefill(
         compute_dtype=compute_dtype,
         solve_in_fp32=bool(tuning["solve_in_fp32"]),
         state_in_fp32=bool(tuning["state_in_fp32"]),
+        preserve_compact_qk=bool(tuning["preserve_compact_qk"]),
     )
 
 

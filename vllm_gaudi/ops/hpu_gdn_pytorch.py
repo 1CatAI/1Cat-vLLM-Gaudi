@@ -40,21 +40,15 @@ _USE_EXACT_SOLVE = os.getenv("VLLM_GDN_EXACT_SOLVE", "0") == "1"
 def resolve_hpu_gdn_chunk_size(model_config) -> tuple[int, bool]:
     """Resolve the HPU GDN chunk size and whether bucketing must align to it."""
     hf_text_config = getattr(model_config, "hf_text_config", None)
-    model_has_explicit_size = (
-        hf_text_config is not None
-        and (
-            getattr(hf_text_config, "mamba_chunk_size", None) is not None
-            or getattr(hf_text_config, "chunk_size", None) is not None
-        )
-    )
+    model_has_explicit_size = (hf_text_config is not None
+                               and (getattr(hf_text_config, "mamba_chunk_size", None) is not None
+                                    or getattr(hf_text_config, "chunk_size", None) is not None))
 
     override = gaudi_envs.VLLM_GDN_CHUNK_SIZE
     if override != 0:
         if override < 32 or override % 32 != 0:
-            raise ValueError(
-                "VLLM_GDN_CHUNK_SIZE must be 0 or a positive multiple of 32, "
-                f"got {override}."
-            )
+            raise ValueError("VLLM_GDN_CHUNK_SIZE must be 0 or a positive multiple of 32, "
+                             f"got {override}.")
         return override, True
 
     if model_has_explicit_size:
@@ -66,10 +60,8 @@ def resolve_hpu_gdn_neumann_iters() -> int:
     """Resolve the iteration budget for the approximate triangular solve."""
     neumann_iters = gaudi_envs.VLLM_GDN_NEUMANN_ITERS
     if neumann_iters <= 0:
-        raise ValueError(
-            "VLLM_GDN_NEUMANN_ITERS must be a positive integer, "
-            f"got {neumann_iters}."
-        )
+        raise ValueError("VLLM_GDN_NEUMANN_ITERS must be a positive integer, "
+                         f"got {neumann_iters}.")
     return neumann_iters
 
 
@@ -82,10 +74,8 @@ def resolve_hpu_gdn_recursive_solver_base() -> int:
     """Resolve the recursive GDN unit-lower inverse base size."""
     base = gaudi_envs.VLLM_GDN_RECURSIVE_SOLVER_BASE
     if base != 0 and (base < 2 or base & (base - 1)):
-        raise ValueError(
-            "VLLM_GDN_RECURSIVE_SOLVER_BASE must be 0 or a power of two "
-            f"greater than one, got {base}."
-        )
+        raise ValueError("VLLM_GDN_RECURSIVE_SOLVER_BASE must be 0 or a power of two "
+                         f"greater than one, got {base}.")
     return base
 
 
@@ -128,6 +118,7 @@ def hpu_chunk_gdr_preprocess(
     seq_len: int,
     compile_qk_l2norm: bool = False,
     compute_dtype: torch.dtype | None = None,
+    preserve_compact_qk: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, float, int,
            int, int]:
     """Preprocessing stage of chunk GDR: head repeat, l2norm, flatten, cumsum.
@@ -135,18 +126,19 @@ def hpu_chunk_gdr_preprocess(
     Returns (qf, kf, vf, bf, g_cumsum, init_state,
              H, num_chunks, scale, Kdim, Vdim, S).
     """
-    _, _, H, Kdim = q.shape
+    _, _, qk_heads, Kdim = q.shape
     _, _, HV, Vdim = v.shape
     device = q.device
 
-    if H != HV:
-        if HV % H == 0:
-            repeat = HV // H
-            q = q.repeat_interleave(repeat, dim=2)
-            k = k.repeat_interleave(repeat, dim=2)
-            H = HV
+    if qk_heads != HV:
+        if HV % qk_heads == 0:
+            repeat = HV // qk_heads
+            if not preserve_compact_qk:
+                q = q.repeat_interleave(repeat, dim=2)
+                k = k.repeat_interleave(repeat, dim=2)
+                qk_heads = HV
         else:
-            raise ValueError(f"Unsupported head mapping: q/k heads={H}, value heads={HV}.")
+            raise ValueError(f"Unsupported head mapping: q/k heads={qk_heads}, value heads={HV}.")
 
     if use_qk_l2norm_in_kernel:
         if compile_qk_l2norm:
@@ -158,8 +150,8 @@ def hpu_chunk_gdr_preprocess(
         scale = k.shape[-1]**-0.5
 
     selected_compute_dtype = _GDN_COMPUTE_DTYPE if compute_dtype is None else compute_dtype
-    qf = q.reshape(-1, H, Kdim).to(selected_compute_dtype)
-    kf = k.reshape(-1, H, Kdim).to(selected_compute_dtype)
+    qf = q.reshape(-1, qk_heads, Kdim).to(selected_compute_dtype)
+    kf = k.reshape(-1, qk_heads, Kdim).to(selected_compute_dtype)
     vf = v.reshape(-1, HV, Vdim).to(selected_compute_dtype)
     gf = g.reshape(-1, HV).to(torch.float32)
     bf = beta.reshape(-1, HV).to(selected_compute_dtype)
@@ -182,11 +174,11 @@ def hpu_chunk_gdr_preprocess(
     g_cumsum = g_cumsum_block.reshape(S, -1, gf.shape[1])[:, :seq_len, :].reshape(-1, gf.shape[1])
 
     if initial_state is None:
-        init_state = torch.zeros((S, H, Vdim, Kdim), dtype=torch.float32, device=device)
+        init_state = torch.zeros((S, HV, Vdim, Kdim), dtype=torch.float32, device=device)
     else:
         init_state = initial_state.to(torch.float32)
 
-    return (qf[:total_tokens], kf[:total_tokens], vf[:total_tokens], bf[:total_tokens], g_cumsum, init_state, H,
+    return (qf[:total_tokens], kf[:total_tokens], vf[:total_tokens], bf[:total_tokens], g_cumsum, init_state, HV,
             num_chunks, scale, Kdim, Vdim, S)
 
 
@@ -208,6 +200,7 @@ def hpu_chunk_gdr_phase_a(
     compact_repeated_kkt: bool = False,
     qk_head_repeat: int = 1,
     solve_in_fp32: bool = False,
+    compact_qk_inputs: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Phase A: batched stages 2-4 for ALL chunks at once.
 
@@ -216,6 +209,8 @@ def hpu_chunk_gdr_phase_a(
     """
     device = qf.device
     tc = chunk_size
+    if compact_qk_inputs:
+        raise ValueError("Compact Q/K inputs require the FlashQLA phase-A path.")
 
     # Reshape to [S, seq_len, H, dim] then [S, C, tc, H, dim]
     q_seqs = qf.reshape(S, seq_len, H, Kdim)
@@ -252,13 +247,10 @@ def hpu_chunk_gdr_phase_a(
     coeff = b_flat.unsqueeze(-1) * (torch.exp(g_flat.unsqueeze(-1) - g_flat.unsqueeze(-2))).to(b_flat.dtype)
     if compact_repeated_kkt and qk_head_repeat > 1:
         if H % qk_head_repeat != 0:
-            raise ValueError(
-                "qk_head_repeat must divide the expanded GDN head count, "
-                f"got qk_head_repeat={qk_head_repeat}, H={H}."
-            )
+            raise ValueError("qk_head_repeat must divide the expanded GDN head count, "
+                             f"got qk_head_repeat={qk_head_repeat}, H={H}.")
         compact_heads = H // qk_head_repeat
-        compact_k = k_chunks[..., ::qk_head_repeat, :].reshape(SC, tc, compact_heads,
-                                                               Kdim).permute(0, 2, 1, 3)
+        compact_k = k_chunks[..., ::qk_head_repeat, :].reshape(SC, tc, compact_heads, Kdim).permute(0, 2, 1, 3)
         compact_k = compact_k.reshape(SC * compact_heads, tc, Kdim)
         compact_dot = torch.bmm(compact_k, compact_k.transpose(1, 2))
         compact_dot = compact_dot.reshape(SC, compact_heads, tc, tc)
@@ -312,6 +304,7 @@ def hpu_flashqla_chunk_gdr_phase_a(
     compact_repeated_kkt: bool = False,
     qk_head_repeat: int = 1,
     solve_in_fp32: bool = False,
+    compact_qk_inputs: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the stable FlashQLA gate-free phase-A reformulation.
 
@@ -323,9 +316,15 @@ def hpu_flashqla_chunk_gdr_phase_a(
     """
     device = qf.device
     tc = chunk_size
+    if compact_qk_inputs:
+        if qk_head_repeat <= 1 or H % qk_head_repeat != 0:
+            raise ValueError("Compact Q/K inputs require a valid repeated-head mapping.")
+        qk_heads = H // qk_head_repeat
+    else:
+        qk_heads = H
 
-    q_seqs = qf.reshape(S, seq_len, H, Kdim)
-    k_seqs = kf.reshape(S, seq_len, H, Kdim)
+    q_seqs = qf.reshape(S, seq_len, qk_heads, Kdim)
+    k_seqs = kf.reshape(S, seq_len, qk_heads, Kdim)
     v_seqs = vf.reshape(S, seq_len, H, Vdim)
     g_seqs = g_cumsum.reshape(S, seq_len, H)
     b_seqs = bf.reshape(S, seq_len, H)
@@ -333,44 +332,42 @@ def hpu_flashqla_chunk_gdr_phase_a(
     padded_len = num_chunks * tc
     if padded_len > seq_len:
         pad_len = padded_len - seq_len
-        q_seqs = torch.cat(
-            (q_seqs, torch.zeros(S, pad_len, H, Kdim, dtype=qf.dtype, device=device)), dim=1)
-        k_seqs = torch.cat(
-            (k_seqs, torch.zeros(S, pad_len, H, Kdim, dtype=kf.dtype, device=device)), dim=1)
-        v_seqs = torch.cat(
-            (v_seqs, torch.zeros(S, pad_len, H, Vdim, dtype=vf.dtype, device=device)), dim=1)
+        q_seqs = torch.cat((q_seqs, torch.zeros(S, pad_len, qk_heads, Kdim, dtype=qf.dtype, device=device)), dim=1)
+        k_seqs = torch.cat((k_seqs, torch.zeros(S, pad_len, qk_heads, Kdim, dtype=kf.dtype, device=device)), dim=1)
+        v_seqs = torch.cat((v_seqs, torch.zeros(S, pad_len, H, Vdim, dtype=vf.dtype, device=device)), dim=1)
         g_seqs = torch.cat((g_seqs, g_seqs[:, -1:, :].expand(S, pad_len, H)), dim=1)
-        b_seqs = torch.cat(
-            (b_seqs, torch.zeros(S, pad_len, H, dtype=bf.dtype, device=device)), dim=1)
+        b_seqs = torch.cat((b_seqs, torch.zeros(S, pad_len, H, dtype=bf.dtype, device=device)), dim=1)
 
-    q_chunks = q_seqs.reshape(S, num_chunks, tc, H, Kdim)
-    k_chunks = k_seqs.reshape(S, num_chunks, tc, H, Kdim)
+    q_chunks = q_seqs.reshape(S, num_chunks, tc, qk_heads, Kdim)
+    k_chunks = k_seqs.reshape(S, num_chunks, tc, qk_heads, Kdim)
     v_chunks = v_seqs.reshape(S, num_chunks, tc, H, Vdim)
     g_chunks = g_seqs.reshape(S, num_chunks, tc, H)
     b_chunks = b_seqs.reshape(S, num_chunks, tc, H)
 
     chunk_batch = S * num_chunks
-    k_flat = k_chunks.reshape(chunk_batch, tc, H, Kdim).permute(0, 2, 1, 3).reshape(
-        chunk_batch * H, tc, Kdim)
-    v_flat = v_chunks.reshape(chunk_batch, tc, H, Vdim).permute(0, 2, 1, 3).reshape(
-        chunk_batch * H, tc, Vdim)
+    k_head_major = k_chunks.reshape(chunk_batch, tc, qk_heads, Kdim).permute(0, 2, 1, 3)
+    k_flat = None if compact_qk_inputs else k_head_major.reshape(chunk_batch * H, tc, Kdim)
+    v_flat = v_chunks.reshape(chunk_batch, tc, H, Vdim).permute(0, 2, 1, 3).reshape(chunk_batch * H, tc, Vdim)
     g_flat = g_chunks.reshape(chunk_batch, tc, H).permute(0, 2, 1).reshape(chunk_batch * H, tc)
     b_flat = b_chunks.reshape(chunk_batch, tc, H).permute(0, 2, 1).reshape(chunk_batch * H, tc)
 
-    if compact_repeated_kkt and qk_head_repeat > 1:
+    if compact_qk_inputs:
+        compact_dot = torch.matmul(k_head_major, k_head_major.transpose(-1, -2))
+        grouped_beta = b_flat.reshape(chunk_batch, qk_heads, qk_head_repeat, tc)
+        a_lower = torch.tril(compact_dot.unsqueeze(2) * grouped_beta.unsqueeze(-1),
+                             diagonal=-1).reshape(chunk_batch * H, tc, tc)
+    elif compact_repeated_kkt and qk_head_repeat > 1:
         if H % qk_head_repeat != 0:
-            raise ValueError(
-                "qk_head_repeat must divide the expanded GDN head count, "
-                f"got qk_head_repeat={qk_head_repeat}, H={H}.")
+            raise ValueError("qk_head_repeat must divide the expanded GDN head count, "
+                             f"got qk_head_repeat={qk_head_repeat}, H={H}.")
         compact_heads = H // qk_head_repeat
-        compact_k = k_chunks[..., ::qk_head_repeat, :].reshape(
-            chunk_batch, tc, compact_heads, Kdim).permute(0, 2, 1, 3)
+        compact_k = k_chunks[..., ::qk_head_repeat, :].reshape(chunk_batch, tc, compact_heads, Kdim).permute(0, 2, 1, 3)
         compact_dot = torch.matmul(compact_k, compact_k.transpose(-1, -2))
         grouped_beta = b_flat.reshape(chunk_batch, compact_heads, qk_head_repeat, tc)
-        a_lower = torch.tril(
-            compact_dot.unsqueeze(2) * grouped_beta.unsqueeze(-1), diagonal=-1).reshape(
-                chunk_batch * H, tc, tc)
+        a_lower = torch.tril(compact_dot.unsqueeze(2) * grouped_beta.unsqueeze(-1),
+                             diagonal=-1).reshape(chunk_batch * H, tc, tc)
     else:
+        assert k_flat is not None
         dot = torch.bmm(k_flat, k_flat.transpose(1, 2))
         a_lower = torch.tril(dot * b_flat.unsqueeze(-1), diagonal=-1)
 
@@ -390,15 +387,21 @@ def hpu_flashqla_chunk_gdr_phase_a(
     causal_decay = torch.tril(torch.exp(torch.tril(gate_delta))).to(gate_free_inverse.dtype)
     transformed_inverse = (gate_free_inverse * causal_decay * b_flat.to(gate_free_inverse.dtype).unsqueeze(-2))
     u_flat = torch.bmm(transformed_inverse, v_flat.to(gate_free_inverse.dtype))
-    w_flat = torch.bmm(
-        transformed_inverse,
-        k_flat.to(gate_free_inverse.dtype) * torch.exp(g_flat).to(gate_free_inverse.dtype).unsqueeze(-1),
-    )
+    gate_exp = torch.exp(g_flat).to(gate_free_inverse.dtype)
+    if compact_qk_inputs:
+        grouped_inverse = transformed_inverse.reshape(chunk_batch, qk_heads, qk_head_repeat, tc, tc)
+        grouped_gate = gate_exp.reshape(chunk_batch, qk_heads, qk_head_repeat, tc)
+        grouped_rhs = k_head_major.to(gate_free_inverse.dtype).unsqueeze(2) * grouped_gate.unsqueeze(-1)
+        w_flat = torch.matmul(grouped_inverse, grouped_rhs).reshape(chunk_batch * H, tc, Kdim)
+    else:
+        assert k_flat is not None
+        w_flat = torch.bmm(
+            transformed_inverse,
+            k_flat.to(gate_free_inverse.dtype) * gate_exp.unsqueeze(-1),
+        )
 
-    u_all = u_flat.reshape(chunk_batch, H, tc, Vdim).permute(0, 2, 1, 3).reshape(
-        S, num_chunks, tc, H, Vdim)
-    w_all = w_flat.reshape(chunk_batch, H, tc, Kdim).permute(0, 2, 1, 3).reshape(
-        S, num_chunks, tc, H, Kdim)
+    u_all = u_flat.reshape(chunk_batch, H, tc, Vdim).permute(0, 2, 1, 3).reshape(S, num_chunks, tc, H, Vdim)
+    w_all = w_flat.reshape(chunk_batch, H, tc, Kdim).permute(0, 2, 1, 3).reshape(S, num_chunks, tc, H, Kdim)
     return u_all, w_all, q_chunks, k_chunks, g_chunks, causal_decay
 
 
@@ -422,6 +425,8 @@ def hpu_chunk_gdr_phase_b(
     deferred_output_add: bool = False,
     local_decay: torch.Tensor | None = None,
     state_in_fp32: bool = False,
+    compact_qk_inputs: bool = False,
+    qk_head_repeat: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Phase B: sequential loop — stages 5-6 (state-dependent).
 
@@ -468,6 +473,8 @@ def hpu_chunk_gdr_phase_b(
         deferred_output_add,
         local_decay,
         state_in_fp32,
+        compact_qk_inputs,
+        qk_head_repeat,
     )
 
 
@@ -496,6 +503,8 @@ def _hpu_chunk_gdr_phase_b_optimized(
     deferred_output_add: bool = False,
     local_decay: torch.Tensor | None = None,
     state_in_fp32: bool = False,
+    compact_qk_inputs: bool = False,
+    qk_head_repeat: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Optimized Phase B: chunk-local precompute hoisted out of the loop.
 
@@ -509,6 +518,12 @@ def _hpu_chunk_gdr_phase_b_optimized(
     padded_len = num_chunks * tc
     device = u_all.device
     compute_dtype = q_chunks.dtype
+    if compact_qk_inputs:
+        if qk_head_repeat <= 1 or H % qk_head_repeat != 0:
+            raise ValueError("Compact Q/K inputs require a valid repeated-head mapping.")
+        qk_heads = H // qk_head_repeat
+    else:
+        qk_heads = H
 
     # [S, C, H, ...]
     u_h = u_all.permute(0, 1, 3, 2, 4).to(compute_dtype)
@@ -528,13 +543,22 @@ def _hpu_chunk_gdr_phase_b_optimized(
 
     # Output decomposition:
     # out = (A @ U + (Q - A @ W) @ state_t) * scale
-    A = torch.matmul(q_h, k_h.transpose(-1, -2))  # [S,C,H,tc,tc]
-    A = A * pair_decay
+    if compact_qk_inputs:
+        compact_dot = torch.matmul(q_h, k_h.transpose(-1, -2))
+        grouped_decay = pair_decay.reshape(S, num_chunks, qk_heads, qk_head_repeat, tc, tc)
+        A = (compact_dot.unsqueeze(3) * grouped_decay).reshape(S, num_chunks, H, tc, tc)
+    else:
+        A = torch.matmul(q_h, k_h.transpose(-1, -2))  # [S,C,H,tc,tc]
+        A = A * pair_decay
     if local_decay is None:
         A = torch.tril(A)
 
     core_h = torch.matmul(A, u_h) * scale  # [S,C,H,tc,V]
-    Q = q_h * g_exp.unsqueeze(-1)  # [S,C,H,tc,K]
+    if compact_qk_inputs:
+        grouped_g_exp = g_exp.reshape(S, num_chunks, qk_heads, qk_head_repeat, tc)
+        Q = (q_h.unsqueeze(3) * grouped_g_exp.unsqueeze(-1)).reshape(S, num_chunks, H, tc, Kdim)
+    else:
+        Q = q_h * g_exp.unsqueeze(-1)  # [S,C,H,tc,K]
     C_h = (Q - torch.matmul(A, w_h)) * scale  # [S,C,H,tc,K]
 
     # State decomposition:
@@ -544,14 +568,21 @@ def _hpu_chunk_gdr_phase_b_optimized(
     u_decay = u_h * delta_exp.unsqueeze(-1)  # [S,C,H,tc,V]
     w_decay = w_h * delta_exp.unsqueeze(-1)  # [S,C,H,tc,K]
 
-    N = torch.matmul(u_decay.transpose(-1, -2), k_h)  # [S,C,H,V,K]
-    R = torch.matmul(w_decay.transpose(-1, -2), k_h)  # [S,C,H,K,K]
-
-    N_t = N.transpose(-1, -2)  # [S,C,H,K,V]
+    if compact_qk_inputs:
+        grouped_u = u_decay.reshape(S, num_chunks, qk_heads, qk_head_repeat, tc, Vdim)
+        grouped_w = w_decay.reshape(S, num_chunks, qk_heads, qk_head_repeat, tc, Kdim)
+        grouped_k_t = k_h.transpose(-1, -2).unsqueeze(3)
+        N_t = torch.matmul(grouped_k_t, grouped_u).reshape(S, num_chunks, H, Kdim, Vdim)
+        R_t = torch.matmul(grouped_k_t, grouped_w).reshape(S, num_chunks, H, Kdim, Kdim)
+    else:
+        N = torch.matmul(u_decay.transpose(-1, -2), k_h)  # [S,C,H,V,K]
+        R = torch.matmul(w_decay.transpose(-1, -2), k_h)  # [S,C,H,K,K]
+        N_t = N.transpose(-1, -2)  # [S,C,H,K,V]
+        R_t = R.transpose(-1, -2)
 
     alpha = torch.exp(g_last).unsqueeze(-1).to(compute_dtype)
     k_eye = torch.eye(Kdim, dtype=compute_dtype, device=device).view(1, 1, 1, Kdim, Kdim)
-    M_full = alpha * k_eye - R.transpose(-1, -2)  # [S,C,H,K,K]
+    M_full = alpha * k_eye - R_t  # [S,C,H,K,K]
 
     state_dtype = torch.float32 if state_in_fp32 else compute_dtype
     state_t = init_state.to(state_dtype).transpose(-1, -2)  # [S,H,K,V]
@@ -677,20 +708,12 @@ def _hpu_solve_lower_triangular_batched(
     lflat = lmat.reshape(-1, n, n)
     if recursive_base:
         if recursive_base < 2 or recursive_base & (recursive_base - 1):
-            raise ValueError(
-                "recursive_base must be a power of two greater than one, "
-                f"got {recursive_base}."
-            )
+            raise ValueError("recursive_base must be a power of two greater than one, "
+                             f"got {recursive_base}.")
         recursion_ratio = n // recursive_base if recursive_base <= n else 0
-        if (
-            recursive_base > n
-            or n % recursive_base != 0
-            or recursion_ratio & (recursion_ratio - 1)
-        ):
-            raise ValueError(
-                "matrix size must be a power-of-two multiple of "
-                f"recursive_base, got recursive_base={recursive_base}, n={n}."
-            )
+        if (recursive_base > n or n % recursive_base != 0 or recursion_ratio & (recursion_ratio - 1)):
+            raise ValueError("matrix size must be a power-of-two multiple of "
+                             f"recursive_base, got recursive_base={recursive_base}, n={n}.")
         return _hpu_recursive_unit_lower_inverse(
             lflat,
             recursive_base,
@@ -1124,6 +1147,7 @@ def hpu_chunk_gated_delta_rule(
     compute_dtype: torch.dtype | None = None,
     solve_in_fp32: bool = False,
     state_in_fp32: bool = False,
+    preserve_compact_qk: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """PyTorch replacement for chunk_gated_delta_rule.
 
@@ -1139,7 +1163,12 @@ def hpu_chunk_gated_delta_rule(
     B, T, H, Kdim = q.shape
     _, _, HV, Vdim = v.shape
     device = q.device
-    qk_head_repeat = HV // H if H != HV and HV % H == 0 else 1
+    qk_head_repeat = HV // H if H < HV and HV % H == 0 else 1
+    compact_qk_inputs = preserve_compact_qk and qk_head_repeat > 1
+    if preserve_compact_qk and not compact_qk_inputs:
+        raise ValueError("preserve_compact_qk requires value heads to be an integer multiple of fewer Q/K heads.")
+    if compact_qk_inputs and not flashqla_reformulation:
+        raise ValueError("preserve_compact_qk requires flashqla_reformulation=True.")
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be > 0, got {chunk_size}.")
     if neumann_iters <= 0:
@@ -1163,6 +1192,7 @@ def hpu_chunk_gated_delta_rule(
              seq_len=prefill_seq_len,
              compile_qk_l2norm=compile_qk_l2norm,
              compute_dtype=compute_dtype,
+             preserve_compact_qk=compact_qk_inputs,
          )
 
         phase_a = hpu_flashqla_chunk_gdr_phase_a if flashqla_reformulation else hpu_chunk_gdr_phase_a
@@ -1184,6 +1214,7 @@ def hpu_chunk_gated_delta_rule(
             compact_repeated_kkt=compact_repeated_kkt,
             qk_head_repeat=qk_head_repeat,
             solve_in_fp32=solve_in_fp32,
+            compact_qk_inputs=compact_qk_inputs,
         )
         if flashqla_reformulation:
             u_all, w_all, q_chunks, k_chunks, g_chunks, local_decay = phase_a_result
@@ -1211,6 +1242,8 @@ def hpu_chunk_gated_delta_rule(
             deferred_output_add=deferred_output_add,
             local_decay=local_decay,
             state_in_fp32=state_in_fp32,
+            compact_qk_inputs=compact_qk_inputs,
+            qk_head_repeat=qk_head_repeat,
         )
 
         out = out.to(q.dtype).view(B, T, H_c, Vdim)

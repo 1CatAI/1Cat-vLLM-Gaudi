@@ -634,6 +634,7 @@ def test_vllm_prefill_adapter_selects_promoted_qwen38_tactic():
     assert kwargs["solve_in_fp32"] is True
     assert kwargs["state_in_fp32"] is True
     assert kwargs["compute_dtype"] == torch.float32
+    assert kwargs["preserve_compact_qk"] is True
 
 
 def test_vllm_prefill_adapter_falls_back_for_unpromoted_shape():

@@ -28,10 +28,15 @@ all other layouts retain the general HPU implementation.
 The prefill tactic transfers the useful FlashQLA algebra to Gaudi's execution
 model: it removes pairwise gate exponentials from the triangular solve,
 reuses the causal-decay tensor in phase B, shares KKT products across repeated
-key heads, uses a recursive 16x16 block inverse, fuses the phase-B state
-projections, and defers output additions outside the recurrent dependency
-chain. The promoted correctness-first tactic keeps the graph in FP32; BF16
-bulk math remains a research option until it passes model-level quality gates.
+key heads, keeps Q/K in their 16-head grouped-query form until a value-head
+operation actually needs the three-way broadcast, uses a recursive 16x16
+block inverse, fuses the phase-B state projections, and defers output additions
+outside the recurrent dependency chain. Keeping Q/K compact also means their
+L2 normalization no longer runs redundantly over 48 materialized heads. The
+normalization remains outside the compiled graph because compiling it is a
+measured Gaudi2 regression. The promoted correctness-first tactic keeps the
+graph in FP32; BF16 bulk math remains a research option until it passes
+model-level quality gates.
 Matrix products still run on MME while `torch.compile` fuses the
 surrounding tensor graph; this is not an eager PyTorch fallback and does not
 replace MME work with a slower TPC-only kernel.
@@ -96,6 +101,16 @@ tactic at production Qwen3.8 shapes:
 
 ```bash
 python3 tools/benchmark_flashinfer_gaudi_gdn_prefill.py \
+  --tokens 2048,4096,16384 --iterations 10 --waves 7
+```
+
+Measure the incremental grouped-head optimization, including the production
+Q/K normalization boundary, with:
+
+```bash
+python3 tools/benchmark_flashinfer_gaudi_gdn_prefill.py \
+  --reference flashqla-expanded \
+  --reference-qk-l2norm eager \
   --tokens 2048,4096,16384 --iterations 10 --waves 7
 ```
 

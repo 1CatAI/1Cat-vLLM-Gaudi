@@ -18,23 +18,27 @@ def _synchronize() -> None:
     torch.hpu.synchronize()
 
 
-def _make_inputs(tokens: int) -> tuple[torch.Tensor, ...]:
+def _make_inputs(tokens: int, *, pre_normalize_qk: bool) -> tuple[torch.Tensor, ...]:
     generator = torch.Generator().manual_seed(97 + tokens)
-    q = torch.nn.functional.normalize(
-        torch.randn(1, tokens, 16, 128, dtype=torch.float32, generator=generator), dim=-1).to(
-            torch.bfloat16).to("hpu")
-    k = torch.nn.functional.normalize(
-        torch.randn(1, tokens, 16, 128, dtype=torch.float32, generator=generator), dim=-1).to(
-            torch.bfloat16).to("hpu")
+    q = torch.randn(1, tokens, 16, 128, dtype=torch.float32, generator=generator)
+    k = torch.randn(1, tokens, 16, 128, dtype=torch.float32, generator=generator)
+    if pre_normalize_qk:
+        q = torch.nn.functional.normalize(q, dim=-1)
+        k = torch.nn.functional.normalize(k, dim=-1)
+    q = q.to(torch.bfloat16).to("hpu")
+    k = k.to(torch.bfloat16).to("hpu")
     v = torch.randn(1, tokens, 48, 128, dtype=torch.bfloat16, generator=generator).to("hpu")
     log_decay = (-torch.rand(1, tokens, 48, dtype=torch.float32, generator=generator) * 0.02).to("hpu")
-    beta = torch.sigmoid(torch.randn(1, tokens, 48, dtype=torch.float32, generator=generator)).to(
-        torch.bfloat16).to("hpu")
+    beta = torch.sigmoid(torch.randn(1, tokens, 48, dtype=torch.float32,
+                                     generator=generator)).to(torch.bfloat16).to("hpu")
     state = (torch.randn(1, 48, 128, 128, dtype=torch.float32, generator=generator) * 0.01).to("hpu")
     return q, k, v, log_decay, beta, state
 
 
-def _compile(*, flashqla: bool):
+def _compile(*, flashqla: bool, compact_qk: bool = False, qk_l2norm: str = "none"):
+
+    use_qk_l2norm = qk_l2norm != "none"
+    compile_qk_l2norm = qk_l2norm == "compiled"
 
     def run(q, k, v, log_decay, beta, initial_state):
         return _chunk_gated_delta_rule_log_gate(
@@ -45,10 +49,7 @@ def _compile(*, flashqla: bool):
             beta,
             initial_state=initial_state,
             output_final_state=True,
-            # The production Q/K normalization is an intentional graph
-            # boundary shared by both paths. Keep this full-graph benchmark
-            # scoped to the GDN core that the FlashQLA tactic replaces.
-            use_qk_l2norm_in_kernel=False,
+            use_qk_l2norm_in_kernel=use_qk_l2norm,
             chunk_size=128,
             prefill_num_seqs=1,
             prefill_seq_len=q.shape[1],
@@ -56,14 +57,18 @@ def _compile(*, flashqla: bool):
             fused_state_matmul=flashqla,
             recursive_solver_base=16 if flashqla else 0,
             compact_repeated_kkt=flashqla,
+            compile_qk_l2norm=compile_qk_l2norm,
             flashqla_reformulation=flashqla,
             deferred_output_add=flashqla,
             compute_dtype=torch.float32,
             solve_in_fp32=flashqla,
             state_in_fp32=flashqla,
+            preserve_compact_qk=compact_qk,
         )
 
-    return torch.compile(run, backend="hpu_backend", fullgraph=True, dynamic=False)
+    # The production compatibility helper deliberately creates a Dynamo
+    # graph boundary. ``fullgraph=False`` is required to reproduce it.
+    return torch.compile(run, backend="hpu_backend", fullgraph=qk_l2norm != "eager", dynamic=False)
 
 
 def _relative_l2(candidate: torch.Tensor, reference: torch.Tensor) -> float:
@@ -104,15 +109,48 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--waves", type=int, default=7)
     parser.add_argument("--max-relative-l2", type=float, default=1e-3)
+    parser.add_argument("--reference", choices=("general", "flashqla-expanded", "flashqla-compact"), default="general")
+    parser.add_argument("--reference-qk-l2norm", choices=("none", "eager", "compiled"), default="none")
+    parser.add_argument("--candidate-qk-l2norm", choices=("none", "eager", "compiled"))
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
-    results: dict[str, object] = {"operation": "qwen38_gdn_prefill", "tokens": {}}
+    candidate_qk_l2norm = args.candidate_qk_l2norm or args.reference_qk_l2norm
+    reference_uses_norm = args.reference_qk_l2norm != "none"
+    candidate_uses_norm = candidate_qk_l2norm != "none"
+    if reference_uses_norm != candidate_uses_norm:
+        parser.error("reference and candidate must either both include Q/K L2Norm or both exclude it")
+
+    reference_flashqla = args.reference != "general"
+    reference_compact_qk = args.reference == "flashqla-compact"
+    reference_name = {
+        "general": "general_hpu",
+        "flashqla-expanded": "flashqla_expanded",
+        "flashqla-compact": "flashqla_compact_qk",
+    }[args.reference]
+    if args.reference_qk_l2norm != "none":
+        reference_name += f"_{args.reference_qk_l2norm}_qk_l2norm"
+    candidate_name = "flashqla_compact_qk"
+    if candidate_qk_l2norm != "none":
+        candidate_name += f"_{candidate_qk_l2norm}_qk_l2norm"
+    if reference_name == candidate_name:
+        reference_name += "_reference"
+    results: dict[str, object] = {
+        "operation": "qwen38_gdn_prefill",
+        "reference": args.reference,
+        "reference_qk_l2norm": args.reference_qk_l2norm,
+        "candidate_qk_l2norm": candidate_qk_l2norm,
+        "tokens": {},
+    }
     for tokens in (int(value) for value in args.tokens.split(",") if value):
         torch._dynamo.reset()
-        inputs = _make_inputs(tokens)
-        reference = _compile(flashqla=False)
-        candidate = _compile(flashqla=True)
+        inputs = _make_inputs(tokens, pre_normalize_qk=not reference_uses_norm)
+        reference = _compile(
+            flashqla=reference_flashqla,
+            compact_qk=reference_compact_qk,
+            qk_l2norm=args.reference_qk_l2norm,
+        )
+        candidate = _compile(flashqla=True, compact_qk=True, qk_l2norm=candidate_qk_l2norm)
 
         reference_output, reference_state = reference(*inputs)
         candidate_output, candidate_state = candidate(*inputs)
@@ -122,19 +160,17 @@ def main() -> None:
         state_relative_l2 = _relative_l2(candidate_state, reference_state)
         quality_values = (output_relative_l2, state_relative_l2)
         if not all(math.isfinite(value) and value <= args.max_relative_l2 for value in quality_values):
-            raise AssertionError(
-                "FlashQLA prefill failed the relative-L2 gate: "
-                f"output={output_relative_l2:.6f}, state={state_relative_l2:.6f}")
+            raise AssertionError("FlashQLA prefill failed the relative-L2 gate: "
+                                 f"output={output_relative_l2:.6f}, state={state_relative_l2:.6f}")
 
         for _ in range(args.warmups):
             reference(*inputs)
             candidate(*inputs)
         _synchronize()
-        reference_stats, candidate_stats = _measure_pair(
-            reference, candidate, inputs, args.iterations, args.waves)
+        reference_stats, candidate_stats = _measure_pair(reference, candidate, inputs, args.iterations, args.waves)
         results["tokens"][str(tokens)] = {
-            "general_hpu": reference_stats,
-            "flashqla_graph": candidate_stats,
+            reference_name: reference_stats,
+            candidate_name: candidate_stats,
             "device_speedup": reference_stats["device_median_ms"] / candidate_stats["device_median_ms"],
             "output_relative_l2": output_relative_l2,
             "state_relative_l2": state_relative_l2,

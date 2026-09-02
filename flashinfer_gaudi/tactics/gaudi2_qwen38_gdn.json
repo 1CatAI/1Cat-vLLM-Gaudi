@@ -39,7 +39,8 @@
       "deferred_output_add": true,
       "solve_in_fp32": true,
       "state_in_fp32": true,
-      "compute_dtype": "float32"
+      "compute_dtype": "float32",
+      "preserve_compact_qk": true
     }
   }
 }

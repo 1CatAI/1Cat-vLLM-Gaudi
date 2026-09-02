@@ -698,7 +698,7 @@ class TestChunkGatedDeltaRule:
         torch.testing.assert_close(compact_state, expanded_state, atol=1e-5, rtol=1e-5)
 
     def test_flashqla_reformulation_matches_standard_exact_path(self, gdn_exact):
-        B, T, H, K, HV, V = 1, 48, 2, 8, 4, 8
+        B, T, H, K, HV, V = 1, 50, 2, 8, 4, 8
         q, k, v, g, beta = _make_gdn_inputs(B, T, H, HV, K, V, seed=149)
 
         standard_out, standard_state = gdn_exact.hpu_chunk_gated_delta_rule(
@@ -731,12 +731,13 @@ class TestChunkGatedDeltaRule:
             deferred_output_add=True,
             solve_in_fp32=True,
             state_in_fp32=True,
+            preserve_compact_qk=True,
         )
 
-        output_relative_l2 = torch.linalg.vector_norm(flashqla_out - standard_out) / torch.linalg.vector_norm(
-            standard_out)
-        state_relative_l2 = torch.linalg.vector_norm(flashqla_state - standard_state) / torch.linalg.vector_norm(
-            standard_state)
+        output_relative_l2 = torch.linalg.vector_norm(flashqla_out -
+                                                      standard_out) / torch.linalg.vector_norm(standard_out)
+        state_relative_l2 = torch.linalg.vector_norm(flashqla_state -
+                                                     standard_state) / torch.linalg.vector_norm(standard_state)
         assert output_relative_l2 < 2e-5
         assert state_relative_l2 < 2e-5
 
@@ -1077,6 +1078,33 @@ class TestPreprocessAndHelpers:
         assert init_state.shape == (B, H, V, K)
         assert S == B
         assert num_chunks == 2  # 64 / 32
+
+    def test_preprocess_preserves_compact_qk_heads(self, gdn):
+        """The FlashQLA grouped-head path should not materialize repeated Q/K."""
+        B, T, H, K, HV, V = 1, 32, 2, 8, 4, 8
+        q, k, v, g, beta = _make_gdn_inputs(B, T, H, HV, K, V)
+
+        result = gdn.hpu_chunk_gdr_preprocess(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale=None,
+            initial_state=None,
+            use_qk_l2norm_in_kernel=True,
+            chunk_size=16,
+            num_seqs=B,
+            seq_len=T,
+            preserve_compact_qk=True,
+        )
+        qf, kf, vf, _, _, init_state, expanded_heads, _, _, _, _, _ = result
+
+        assert qf.shape == (B * T, H, K)
+        assert kf.shape == (B * T, H, K)
+        assert vf.shape == (B * T, HV, V)
+        assert init_state.shape == (B, HV, V, K)
+        assert expanded_heads == HV
 
     def test_preprocess_cumsum_resets_per_chunk(self, gdn):
         """g_cumsum should reset at chunk boundaries."""
