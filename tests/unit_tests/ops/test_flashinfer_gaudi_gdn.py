@@ -23,7 +23,8 @@ from flashinfer_gaudi.gdn_decode import (
     gated_delta_rule_decode_packed,
     gated_delta_rule_decode_pretranspose,
 )
-from vllm_gaudi.ops.flashinfer_gaudi_adapter import maybe_run_gdn_decode_packed
+from flashinfer_gaudi.gdn_prefill import chunk_gated_delta_rule
+from vllm_gaudi.ops.flashinfer_gaudi_adapter import maybe_run_gdn_decode_packed, maybe_run_gdn_prefill
 
 
 @pytest.fixture(autouse=True)
@@ -55,6 +56,86 @@ def _naive_step(q, k, v, state, log_decay, beta):
     updated = decayed + delta.unsqueeze(-1) * k[:, 0].unsqueeze(-2)
     output = torch.matmul(updated, (q[:, 0] * scale).unsqueeze(-1)).squeeze(-1)
     return output, updated
+
+
+def test_prefill_signature_tracks_flashinfer_contract():
+    parameters = inspect.signature(chunk_gated_delta_rule).parameters
+    assert tuple(parameters) == (
+        "q",
+        "k",
+        "v",
+        "g",
+        "beta",
+        "scale",
+        "initial_state",
+        "output_final_state",
+        "cu_seqlens",
+        "use_qk_l2norm_in_kernel",
+        "output",
+        "output_state",
+        "state_checkpoints",
+        "checkpoint_cu_starts",
+        "checkpoint_every_n_tokens",
+        "use_cp",
+        "state_indices",
+        "_cp_chunk_len",
+    )
+
+
+def test_prefill_public_alpha_contract_matches_log_gate_reference():
+    generator = torch.Generator().manual_seed(11)
+    tokens, q_heads, value_heads, dim = 16, 2, 4, 8
+    q = torch.randn(tokens, q_heads, dim, generator=generator) * 0.1
+    k = torch.randn(tokens, q_heads, dim, generator=generator) * 0.1
+    v = torch.randn(tokens, value_heads, dim, generator=generator) * 0.1
+    log_decay = -torch.rand(tokens, value_heads, generator=generator) * 0.02
+    beta = torch.sigmoid(torch.randn(tokens, value_heads, generator=generator))
+    initial_state = torch.randn(1, value_heads, dim, dim, generator=generator) * 0.01
+    cu_seqlens = torch.tensor([0, tokens], dtype=torch.int32)
+
+    output, final_state = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g=torch.exp(log_decay),
+        beta=beta,
+        initial_state=initial_state,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+    )
+
+    assert output.shape == (tokens, value_heads, dim)
+    assert final_state.shape == initial_state.shape
+    assert torch.isfinite(output).all()
+    assert torch.isfinite(final_state).all()
+
+
+def test_prefill_public_default_state_remains_fp32():
+    tokens, q_heads, value_heads, dim = 16, 2, 4, 8
+    q = torch.zeros(tokens, q_heads, dim, dtype=torch.bfloat16)
+    k = torch.zeros_like(q)
+    v = torch.zeros(tokens, value_heads, dim, dtype=torch.bfloat16)
+    cu_seqlens = torch.tensor([0, tokens], dtype=torch.int32)
+
+    output, final_state = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+    )
+
+    assert output.dtype == torch.bfloat16
+    assert final_state.dtype == torch.float32
+
+
+def test_prefill_rejects_unimplemented_context_parallel_state():
+    q = torch.zeros(8, 2, 8)
+    k = torch.zeros_like(q)
+    v = torch.zeros(8, 4, 8)
+    cu_seqlens = torch.tensor([0, 8], dtype=torch.int32)
+    with pytest.raises(NotImplementedError, match="Context-parallel"):
+        chunk_gated_delta_rule(q, k, v, cu_seqlens=cu_seqlens, use_cp=True)
 
 
 def test_pretranspose_signature_tracks_flashinfer_contract():
@@ -512,3 +593,70 @@ def test_vllm_adapter_auto_skips_indexed_reference():
 
     assert result is None
     torch.testing.assert_close(pool, original)
+
+
+def test_vllm_prefill_adapter_selects_promoted_qwen38_tactic():
+    tokens = 64
+    q = torch.zeros(1, tokens, 16, 128, dtype=torch.bfloat16)
+    k = torch.zeros_like(q)
+    v = torch.zeros(1, tokens, 48, 128, dtype=torch.bfloat16)
+    log_decay = torch.zeros(1, tokens, 48, dtype=torch.float32)
+    beta = torch.ones(1, tokens, 48, dtype=torch.bfloat16)
+    initial_state = torch.zeros(1, 48, 128, 128, dtype=torch.float32)
+    expected = (torch.empty_like(v), initial_state.clone())
+
+    with mock.patch.dict(os.environ, {"VLLM_HPU_FLASHINFER_GDN_PREFILL": "1"}), \
+            mock.patch(
+                "vllm_gaudi.ops.flashinfer_gaudi_adapter._chunk_gated_delta_rule_log_gate",
+                return_value=expected,
+            ) as run:
+        result = maybe_run_gdn_prefill(
+            q,
+            k,
+            v,
+            log_decay,
+            beta,
+            initial_state,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            chunk_size=128,
+            prefill_num_seqs=1,
+            prefill_seq_len=tokens,
+        )
+
+    assert result is expected
+    kwargs = run.call_args.kwargs
+    assert kwargs["flashqla_reformulation"] is True
+    assert kwargs["deferred_output_add"] is True
+    assert kwargs["fused_state_matmul"] is True
+    assert kwargs["recursive_solver_base"] == 16
+    assert kwargs["compact_repeated_kkt"] is True
+    assert kwargs["solve_in_fp32"] is True
+    assert kwargs["state_in_fp32"] is True
+    assert kwargs["compute_dtype"] == torch.float32
+
+
+def test_vllm_prefill_adapter_falls_back_for_unpromoted_shape():
+    tokens = 64
+    q = torch.zeros(1, tokens, 8, 128, dtype=torch.bfloat16)
+    k = torch.zeros_like(q)
+    v = torch.zeros(1, tokens, 24, 128, dtype=torch.bfloat16)
+    log_decay = torch.zeros(1, tokens, 24, dtype=torch.float32)
+    beta = torch.ones(1, tokens, 24, dtype=torch.bfloat16)
+
+    with mock.patch.dict(os.environ, {"VLLM_HPU_FLASHINFER_GDN_PREFILL": "1"}):
+        result = maybe_run_gdn_prefill(
+            q,
+            k,
+            v,
+            log_decay,
+            beta,
+            None,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            chunk_size=64,
+            prefill_num_seqs=1,
+            prefill_seq_len=tokens,
+        )
+
+    assert result is None

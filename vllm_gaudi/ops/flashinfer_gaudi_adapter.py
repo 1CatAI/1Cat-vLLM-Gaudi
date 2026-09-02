@@ -7,18 +7,97 @@ import torch
 
 from flashinfer_gaudi._config import bridge_auto_enabled, get_backend_policy
 from flashinfer_gaudi._reference import packed_recurrent_decode
-from flashinfer_gaudi._tactics import public_gdn_auto_promoted
+from flashinfer_gaudi._tactics import gdn_prefill_tactic, public_gdn_auto_promoted
 from flashinfer_gaudi.gdn_decode import gated_delta_rule_decode_packed
+from flashinfer_gaudi.gdn_prefill import _chunk_gated_delta_rule_log_gate
 from vllm_gaudi import envs
 
 _BACKEND_POLICY = get_backend_policy()
 _PUBLIC_AUTO_PROMOTED = public_gdn_auto_promoted()
 _BRIDGE_AUTO_ENABLED = bridge_auto_enabled()
+_GDN_PREFILL_TACTIC = gdn_prefill_tactic()
 
 
 def flashinfer_gdn_enabled() -> bool:
     """Return whether the new backend is enabled for model execution."""
     return envs.VLLM_HPU_FLASHINFER_GDN
+
+
+def flashinfer_gdn_prefill_enabled() -> bool:
+    """Return whether the promoted GDN prefill tactic is enabled."""
+    return envs.VLLM_HPU_FLASHINFER_GDN_PREFILL and bool(_GDN_PREFILL_TACTIC.get("promoted", False))
+
+
+def maybe_run_gdn_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    log_decay: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    *,
+    output_final_state: bool,
+    use_qk_l2norm_in_kernel: bool,
+    chunk_size: int,
+    prefill_num_seqs: int,
+    prefill_seq_len: int,
+    scale: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None] | None:
+    """Run the promoted single-sequence Qwen3.8 prefill tactic.
+
+    Unsupported shapes deliberately return ``None`` so other Qwen GDN
+    variants retain the general HPU implementation.
+    """
+    if not flashinfer_gdn_prefill_enabled():
+        return None
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        return None
+    if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16 or v.dtype != torch.bfloat16:
+        return None
+    if tuple(q.shape) != tuple(k.shape) or q.shape[0] != 1 or v.shape[0] != 1:
+        return None
+    if q.shape[1] != v.shape[1] or q.shape[2:] != (16, 128) or v.shape[2:] != (48, 128):
+        return None
+    if log_decay.shape != (1, q.shape[1], 48) or beta.shape != (1, q.shape[1], 48):
+        return None
+    if log_decay.dtype != torch.float32:
+        return None
+    if chunk_size != 128 or prefill_num_seqs != 1 or prefill_seq_len != q.shape[1]:
+        return None
+
+    tuning = _GDN_PREFILL_TACTIC.get("tuning", {})
+    if not isinstance(tuning, dict):
+        return None
+    compute_dtype = {
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }.get(tuning.get("compute_dtype"))
+    if compute_dtype is None:
+        return None
+    return _chunk_gated_delta_rule_log_gate(
+        q,
+        k,
+        v,
+        log_decay,
+        beta,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        chunk_size=chunk_size,
+        prefill_num_seqs=prefill_num_seqs,
+        prefill_seq_len=prefill_seq_len,
+        neumann_iters=int(tuning["neumann_iters"]),
+        fused_state_matmul=bool(tuning["fused_state_matmul"]),
+        recursive_solver_base=int(tuning["recursive_solver_base"]),
+        compact_repeated_kkt=bool(tuning["compact_repeated_kkt"]),
+        compile_qk_l2norm=bool(tuning["compile_qk_l2norm"]),
+        flashqla_reformulation=bool(tuning["flashqla_reformulation"]),
+        deferred_output_add=bool(tuning["deferred_output_add"]),
+        compute_dtype=compute_dtype,
+        solve_in_fp32=bool(tuning["solve_in_fp32"]),
+        state_in_fp32=bool(tuning["state_in_fp32"]),
+    )
 
 
 def maybe_run_gdn_decode_packed(
@@ -96,4 +175,9 @@ def maybe_run_gdn_decode_packed(
     return output.unsqueeze(0), updated_pool
 
 
-__all__ = ["flashinfer_gdn_enabled", "maybe_run_gdn_decode_packed"]
+__all__ = [
+    "flashinfer_gdn_enabled",
+    "flashinfer_gdn_prefill_enabled",
+    "maybe_run_gdn_decode_packed",
+    "maybe_run_gdn_prefill",
+]

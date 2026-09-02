@@ -17,7 +17,7 @@ from vllm_gaudi.ops.hpu_gdn_pytorch import (
     resolve_hpu_gdn_neumann_iters,
     resolve_hpu_gdn_recursive_solver_base,
 )
-from vllm_gaudi.ops.flashinfer_gaudi_adapter import maybe_run_gdn_decode_packed
+from vllm_gaudi.ops.flashinfer_gaudi_adapter import maybe_run_gdn_decode_packed, maybe_run_gdn_prefill
 
 
 def _save_ssm_state(core_attn_out, final_state, ssm_state, state_indices):
@@ -246,11 +246,11 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 g = g * token_mask_h
                 beta = beta * token_mask_h
 
-            core_attn_out_result, final_state = hpu_chunk_gated_delta_rule(
+            flashinfer_prefill_result = maybe_run_gdn_prefill(
                 q=query,
                 k=key,
                 v=value,
-                g=g,
+                log_decay=g,
                 beta=beta,
                 initial_state=initial_state,
                 output_final_state=True,
@@ -258,12 +258,30 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 chunk_size=self.mamba_chunk_size,
                 prefill_num_seqs=prefill_num_seqs,
                 prefill_seq_len=prefill_seq_len,
-                neumann_iters=self.gdn_neumann_iters,
-                fused_state_matmul=self.gdn_fused_state_matmul,
-                recursive_solver_base=self.gdn_recursive_solver_base,
-                compact_repeated_kkt=self.gdn_compact_repeated_kkt,
-                compile_qk_l2norm=self.gdn_compiled_qk_l2norm,
+                scale=self.head_k_dim**-0.5,
             )
+            if flashinfer_prefill_result is not None:
+                core_attn_out_result, final_state = flashinfer_prefill_result
+            else:
+                core_attn_out_result, final_state = hpu_chunk_gated_delta_rule(
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                    chunk_size=self.mamba_chunk_size,
+                    prefill_num_seqs=prefill_num_seqs,
+                    prefill_seq_len=prefill_seq_len,
+                    neumann_iters=self.gdn_neumann_iters,
+                    fused_state_matmul=self.gdn_fused_state_matmul,
+                    recursive_solver_base=self.gdn_recursive_solver_base,
+                    compact_repeated_kkt=self.gdn_compact_repeated_kkt,
+                    compile_qk_l2norm=self.gdn_compiled_qk_l2norm,
+                )
+            assert final_state is not None
             # State save in dynamo-disabled wrapper — index_copy_ is
             # silently dropped by HPU torch.compile on aliased tensors.
             core_attn_out_result = _save_ssm_state(

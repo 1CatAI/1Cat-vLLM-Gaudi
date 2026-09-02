@@ -18,7 +18,7 @@ def install_flashinfer_shim() -> None:
     if existing is not None and "flashinfer" not in sys.modules:
         raise RuntimeError("Official flashinfer is installed; refusing to shadow it with the Gaudi shim.")
 
-    from flashinfer_gaudi import gdn_decode
+    from flashinfer_gaudi import chunk_gated_delta_rule, gdn_decode, gdn_prefill
 
     root = sys.modules.get("flashinfer")
     if root is None:
@@ -27,7 +27,10 @@ def install_flashinfer_shim() -> None:
         root.__package__ = "flashinfer"
         sys.modules["flashinfer"] = root
     root.gdn_decode = gdn_decode
+    root.gdn_prefill = gdn_prefill
+    root.chunk_gated_delta_rule = chunk_gated_delta_rule
     sys.modules["flashinfer.gdn_decode"] = gdn_decode
+    sys.modules["flashinfer.gdn_prefill"] = gdn_prefill
 
 
 __all__ = ["install_flashinfer_shim"]

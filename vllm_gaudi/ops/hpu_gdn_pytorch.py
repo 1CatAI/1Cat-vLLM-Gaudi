@@ -25,10 +25,10 @@ logger = init_logger()
 # implementation — useful for debugging accuracy issues.
 _USE_LEGACY_PHASE_B = os.getenv("VLLM_GDN_LEGACY_PHASE_B", "0") == "1"
 
-# Set VLLM_GDN_COMPUTE_FP32=1 to use float32 instead of bfloat16 for GDN
-# compute ops (preprocess casts, decode path, state buffers). bf16 is
-# the default for performance; fp32 is useful for debugging accuracy.
-_GDN_COMPUTE_DTYPE = torch.float32 if os.getenv("VLLM_GDN_COMPUTE_FP32", "0") == "1" else torch.bfloat16
+# Set VLLM_GDN_COMPUTE_FP32=0 to opt the general GDN implementation into
+# bfloat16 compute. The established fallback remains FP32; promoted tactics
+# can request BF16 explicitly without changing unsupported model shapes.
+_GDN_COMPUTE_DTYPE = torch.float32 if os.getenv("VLLM_GDN_COMPUTE_FP32", "1") == "1" else torch.bfloat16
 
 # Set VLLM_GDN_EXACT_SOLVE=1 to use exact row-by-row forward substitution
 # instead of the Neumann iterative solver.  Exact but ~2.6x slower (127
@@ -127,6 +127,7 @@ def hpu_chunk_gdr_preprocess(
     num_seqs: int,
     seq_len: int,
     compile_qk_l2norm: bool = False,
+    compute_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, float, int,
            int, int]:
     """Preprocessing stage of chunk GDR: head repeat, l2norm, flatten, cumsum.
@@ -156,12 +157,12 @@ def hpu_chunk_gdr_preprocess(
     if scale is None:
         scale = k.shape[-1]**-0.5
 
-    # Compute dtype controlled by VLLM_GDN_COMPUTE_FP32 env var (default: bf16)
-    qf = q.reshape(-1, H, Kdim).to(_GDN_COMPUTE_DTYPE)
-    kf = k.reshape(-1, H, Kdim).to(_GDN_COMPUTE_DTYPE)
-    vf = v.reshape(-1, HV, Vdim).to(_GDN_COMPUTE_DTYPE)
+    selected_compute_dtype = _GDN_COMPUTE_DTYPE if compute_dtype is None else compute_dtype
+    qf = q.reshape(-1, H, Kdim).to(selected_compute_dtype)
+    kf = k.reshape(-1, H, Kdim).to(selected_compute_dtype)
+    vf = v.reshape(-1, HV, Vdim).to(selected_compute_dtype)
     gf = g.reshape(-1, HV).to(torch.float32)
-    bf = beta.reshape(-1, HV).to(_GDN_COMPUTE_DTYPE)
+    bf = beta.reshape(-1, HV).to(selected_compute_dtype)
 
     S = num_seqs
     num_chunks = (seq_len + chunk_size - 1) // chunk_size
@@ -206,6 +207,7 @@ def hpu_chunk_gdr_phase_a(
     recursive_solver_base: int = 0,
     compact_repeated_kkt: bool = False,
     qk_head_repeat: int = 1,
+    solve_in_fp32: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Phase A: batched stages 2-4 for ALL chunks at once.
 
@@ -271,13 +273,14 @@ def hpu_chunk_gdr_phase_a(
     lmat = (eye.unsqueeze(0) + a_lower).to(qf.dtype)
 
     # Stage 3: solve_tril
+    solve_dtype = torch.float32 if solve_in_fp32 else qf.dtype
     A_solve = _hpu_solve_lower_triangular_batched(
-        lmat,
-        eye,
+        lmat.to(solve_dtype),
+        eye.to(solve_dtype),
         use_vectorized=True,
         neumann_iters=neumann_iters,
         recursive_base=recursive_solver_base,
-    )
+    ).to(qf.dtype)
 
     # Stage 4: recompute u, w
     rhs_u = v_flat * b_flat.unsqueeze(-1)
@@ -289,6 +292,114 @@ def hpu_chunk_gdr_phase_a(
     w_all = w_flat.reshape(SC, H, tc, Kdim).permute(0, 2, 1, 3).reshape(S, num_chunks, tc, H, Kdim)
 
     return u_all, w_all, q_chunks, k_chunks, g_chunks
+
+
+def hpu_flashqla_chunk_gdr_phase_a(
+    qf: torch.Tensor,
+    kf: torch.Tensor,
+    vf: torch.Tensor,
+    bf: torch.Tensor,
+    g_cumsum: torch.Tensor,
+    seq_len: int,
+    chunk_size: int,
+    S: int,
+    num_chunks: int,
+    H: int,
+    Kdim: int,
+    Vdim: int,
+    neumann_iters: int,
+    recursive_solver_base: int = 0,
+    compact_repeated_kkt: bool = False,
+    qk_head_repeat: int = 1,
+    solve_in_fp32: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the stable FlashQLA gate-free phase-A reformulation.
+
+    The ordinary formulation places ``exp(g_i - g_j)`` inside the
+    triangular system. FlashQLA uses a diagonal similarity transform so the
+    solve itself is gate-free, then reconstructs only causal decay factors in
+    ``[0, 1]``. Returning those factors also lets phase B reuse them instead
+    of materializing a second pairwise exponential tensor.
+    """
+    device = qf.device
+    tc = chunk_size
+
+    q_seqs = qf.reshape(S, seq_len, H, Kdim)
+    k_seqs = kf.reshape(S, seq_len, H, Kdim)
+    v_seqs = vf.reshape(S, seq_len, H, Vdim)
+    g_seqs = g_cumsum.reshape(S, seq_len, H)
+    b_seqs = bf.reshape(S, seq_len, H)
+
+    padded_len = num_chunks * tc
+    if padded_len > seq_len:
+        pad_len = padded_len - seq_len
+        q_seqs = torch.cat(
+            (q_seqs, torch.zeros(S, pad_len, H, Kdim, dtype=qf.dtype, device=device)), dim=1)
+        k_seqs = torch.cat(
+            (k_seqs, torch.zeros(S, pad_len, H, Kdim, dtype=kf.dtype, device=device)), dim=1)
+        v_seqs = torch.cat(
+            (v_seqs, torch.zeros(S, pad_len, H, Vdim, dtype=vf.dtype, device=device)), dim=1)
+        g_seqs = torch.cat((g_seqs, g_seqs[:, -1:, :].expand(S, pad_len, H)), dim=1)
+        b_seqs = torch.cat(
+            (b_seqs, torch.zeros(S, pad_len, H, dtype=bf.dtype, device=device)), dim=1)
+
+    q_chunks = q_seqs.reshape(S, num_chunks, tc, H, Kdim)
+    k_chunks = k_seqs.reshape(S, num_chunks, tc, H, Kdim)
+    v_chunks = v_seqs.reshape(S, num_chunks, tc, H, Vdim)
+    g_chunks = g_seqs.reshape(S, num_chunks, tc, H)
+    b_chunks = b_seqs.reshape(S, num_chunks, tc, H)
+
+    chunk_batch = S * num_chunks
+    k_flat = k_chunks.reshape(chunk_batch, tc, H, Kdim).permute(0, 2, 1, 3).reshape(
+        chunk_batch * H, tc, Kdim)
+    v_flat = v_chunks.reshape(chunk_batch, tc, H, Vdim).permute(0, 2, 1, 3).reshape(
+        chunk_batch * H, tc, Vdim)
+    g_flat = g_chunks.reshape(chunk_batch, tc, H).permute(0, 2, 1).reshape(chunk_batch * H, tc)
+    b_flat = b_chunks.reshape(chunk_batch, tc, H).permute(0, 2, 1).reshape(chunk_batch * H, tc)
+
+    if compact_repeated_kkt and qk_head_repeat > 1:
+        if H % qk_head_repeat != 0:
+            raise ValueError(
+                "qk_head_repeat must divide the expanded GDN head count, "
+                f"got qk_head_repeat={qk_head_repeat}, H={H}.")
+        compact_heads = H // qk_head_repeat
+        compact_k = k_chunks[..., ::qk_head_repeat, :].reshape(
+            chunk_batch, tc, compact_heads, Kdim).permute(0, 2, 1, 3)
+        compact_dot = torch.matmul(compact_k, compact_k.transpose(-1, -2))
+        grouped_beta = b_flat.reshape(chunk_batch, compact_heads, qk_head_repeat, tc)
+        a_lower = torch.tril(
+            compact_dot.unsqueeze(2) * grouped_beta.unsqueeze(-1), diagonal=-1).reshape(
+                chunk_batch * H, tc, tc)
+    else:
+        dot = torch.bmm(k_flat, k_flat.transpose(1, 2))
+        a_lower = torch.tril(dot * b_flat.unsqueeze(-1), diagonal=-1)
+
+    eye = torch.eye(tc, dtype=qf.dtype, device=device)
+    solve_dtype = torch.float32 if solve_in_fp32 else qf.dtype
+    gate_free_inverse = _hpu_solve_lower_triangular_batched(
+        (eye.unsqueeze(0) + a_lower).to(solve_dtype),
+        eye.to(solve_dtype),
+        use_vectorized=True,
+        neumann_iters=neumann_iters,
+        recursive_base=recursive_solver_base,
+    ).to(qf.dtype)
+
+    gate_delta = g_flat.unsqueeze(-1) - g_flat.unsqueeze(-2)
+    # Mask before exp as well as after it: upper-triangle values have the
+    # opposite sign and can overflow even though they are never consumed.
+    causal_decay = torch.tril(torch.exp(torch.tril(gate_delta))).to(gate_free_inverse.dtype)
+    transformed_inverse = (gate_free_inverse * causal_decay * b_flat.to(gate_free_inverse.dtype).unsqueeze(-2))
+    u_flat = torch.bmm(transformed_inverse, v_flat.to(gate_free_inverse.dtype))
+    w_flat = torch.bmm(
+        transformed_inverse,
+        k_flat.to(gate_free_inverse.dtype) * torch.exp(g_flat).to(gate_free_inverse.dtype).unsqueeze(-1),
+    )
+
+    u_all = u_flat.reshape(chunk_batch, H, tc, Vdim).permute(0, 2, 1, 3).reshape(
+        S, num_chunks, tc, H, Vdim)
+    w_all = w_flat.reshape(chunk_batch, H, tc, Kdim).permute(0, 2, 1, 3).reshape(
+        S, num_chunks, tc, H, Kdim)
+    return u_all, w_all, q_chunks, k_chunks, g_chunks, causal_decay
 
 
 def hpu_chunk_gdr_phase_b(
@@ -308,6 +419,9 @@ def hpu_chunk_gdr_phase_b(
     output_final_state: bool,
     output_dtype: torch.dtype | None = None,
     fused_state_matmul: bool = False,
+    deferred_output_add: bool = False,
+    local_decay: torch.Tensor | None = None,
+    state_in_fp32: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Phase B: sequential loop — stages 5-6 (state-dependent).
 
@@ -315,6 +429,8 @@ def hpu_chunk_gdr_phase_b(
     (_phase_b_step-based) paths based on VLLM_GDN_LEGACY_PHASE_B env var.
     """
     if _USE_LEGACY_PHASE_B:
+        if local_decay is not None:
+            raise ValueError("FlashQLA phase A requires the optimized phase-B path.")
         return _hpu_chunk_gdr_phase_b_legacy(
             u_all,
             w_all,
@@ -349,6 +465,9 @@ def hpu_chunk_gdr_phase_b(
         output_final_state,
         output_dtype,
         fused_state_matmul,
+        deferred_output_add,
+        local_decay,
+        state_in_fp32,
     )
 
 
@@ -374,6 +493,9 @@ def _hpu_chunk_gdr_phase_b_optimized(
     output_final_state: bool,
     output_dtype: torch.dtype | None = None,
     fused_state_matmul: bool = False,
+    deferred_output_add: bool = False,
+    local_decay: torch.Tensor | None = None,
+    state_in_fp32: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Optimized Phase B: chunk-local precompute hoisted out of the loop.
 
@@ -397,13 +519,19 @@ def _hpu_chunk_gdr_phase_b_optimized(
 
     g_last = g_h[..., -1:]  # [S,C,H,1]
     g_exp = torch.exp(g_h).to(compute_dtype)
-    delta_exp = torch.exp(g_last - g_h).to(compute_dtype)
-    pair_decay = torch.exp(g_h.unsqueeze(-1) - g_h.unsqueeze(-2)).to(compute_dtype)
+    if local_decay is None:
+        delta_exp = torch.exp(g_last - g_h).to(compute_dtype)
+        pair_decay = torch.exp(g_h.unsqueeze(-1) - g_h.unsqueeze(-2)).to(compute_dtype)
+    else:
+        pair_decay = local_decay.reshape(S, num_chunks, H, tc, tc).to(compute_dtype)
+        delta_exp = pair_decay[..., -1, :]
 
     # Output decomposition:
     # out = (A @ U + (Q - A @ W) @ state_t) * scale
     A = torch.matmul(q_h, k_h.transpose(-1, -2))  # [S,C,H,tc,tc]
-    A = torch.tril(A * pair_decay)
+    A = A * pair_decay
+    if local_decay is None:
+        A = torch.tril(A)
 
     core_h = torch.matmul(A, u_h) * scale  # [S,C,H,tc,V]
     Q = q_h * g_exp.unsqueeze(-1)  # [S,C,H,tc,K]
@@ -425,18 +553,31 @@ def _hpu_chunk_gdr_phase_b_optimized(
     k_eye = torch.eye(Kdim, dtype=compute_dtype, device=device).view(1, 1, 1, Kdim, Kdim)
     M_full = alpha * k_eye - R.transpose(-1, -2)  # [S,C,H,K,K]
 
-    state_t = init_state.to(compute_dtype).transpose(-1, -2)  # [S,H,K,V]
+    state_dtype = torch.float32 if state_in_fp32 else compute_dtype
+    state_t = init_state.to(state_dtype).transpose(-1, -2)  # [S,H,K,V]
+    state_bias = N_t.to(state_dtype)
+    output_updates = [] if deferred_output_add else None
 
     if fused_state_matmul:
-        state_projections = torch.cat([C_h, M_full], dim=-2)
+        state_projections = torch.cat([C_h, M_full], dim=-2).to(state_dtype)
         for ci in range(num_chunks):
             projected = torch.matmul(state_projections[:, ci], state_t)
-            core_h[:, ci].add_(projected[..., :tc, :])
-            state_t = projected[..., tc:, :] + N_t[:, ci]
+            if output_updates is None:
+                core_h[:, ci].add_(projected[..., :tc, :].to(core_h.dtype))
+            else:
+                output_updates.append(projected[..., :tc, :])
+            state_t = projected[..., tc:, :] + state_bias[:, ci]
     else:
         for ci in range(num_chunks):
-            core_h[:, ci].add_(torch.matmul(C_h[:, ci], state_t))
-            state_t = torch.matmul(M_full[:, ci], state_t) + N_t[:, ci]
+            projected_output = torch.matmul(C_h[:, ci].to(state_dtype), state_t)
+            if output_updates is None:
+                core_h[:, ci].add_(projected_output.to(core_h.dtype))
+            else:
+                output_updates.append(projected_output)
+            state_t = torch.matmul(M_full[:, ci].to(state_dtype), state_t) + state_bias[:, ci]
+
+    if output_updates is not None:
+        core_h = core_h + torch.stack(output_updates, dim=1)
 
     out = _eager_reshape_output(core_h, S, padded_len, seq_len, H, Vdim)
 
@@ -978,6 +1119,11 @@ def hpu_chunk_gated_delta_rule(
     recursive_solver_base: int = 0,
     compact_repeated_kkt: bool = False,
     compile_qk_l2norm: bool = False,
+    flashqla_reformulation: bool = False,
+    deferred_output_add: bool = False,
+    compute_dtype: torch.dtype | None = None,
+    solve_in_fp32: bool = False,
+    state_in_fp32: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """PyTorch replacement for chunk_gated_delta_rule.
 
@@ -1016,9 +1162,11 @@ def hpu_chunk_gated_delta_rule(
              num_seqs=prefill_num_seqs,
              seq_len=prefill_seq_len,
              compile_qk_l2norm=compile_qk_l2norm,
+             compute_dtype=compute_dtype,
          )
 
-        u_all, w_all, q_chunks, k_chunks, g_chunks = hpu_chunk_gdr_phase_a(
+        phase_a = hpu_flashqla_chunk_gdr_phase_a if flashqla_reformulation else hpu_chunk_gdr_phase_a
+        phase_a_result = phase_a(
             qf,
             kf,
             vf,
@@ -1035,7 +1183,13 @@ def hpu_chunk_gated_delta_rule(
             recursive_solver_base=recursive_solver_base,
             compact_repeated_kkt=compact_repeated_kkt,
             qk_head_repeat=qk_head_repeat,
+            solve_in_fp32=solve_in_fp32,
         )
+        if flashqla_reformulation:
+            u_all, w_all, q_chunks, k_chunks, g_chunks, local_decay = phase_a_result
+        else:
+            u_all, w_all, q_chunks, k_chunks, g_chunks = phase_a_result
+            local_decay = None
 
         out, final_state = hpu_chunk_gdr_phase_b(
             u_all,
@@ -1054,6 +1208,9 @@ def hpu_chunk_gated_delta_rule(
             output_final_state=output_final_state,
             output_dtype=initial_state.dtype if initial_state is not None else None,
             fused_state_matmul=fused_state_matmul,
+            deferred_output_add=deferred_output_add,
+            local_decay=local_decay,
+            state_in_fp32=state_in_fp32,
         )
 
         out = out.to(q.dtype).view(B, T, H_c, Vdim)

@@ -697,6 +697,49 @@ class TestChunkGatedDeltaRule:
         torch.testing.assert_close(compact_out, expanded_out, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(compact_state, expanded_state, atol=1e-5, rtol=1e-5)
 
+    def test_flashqla_reformulation_matches_standard_exact_path(self, gdn_exact):
+        B, T, H, K, HV, V = 1, 48, 2, 8, 4, 8
+        q, k, v, g, beta = _make_gdn_inputs(B, T, H, HV, K, V, seed=149)
+
+        standard_out, standard_state = gdn_exact.hpu_chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            chunk_size=16,
+            output_final_state=True,
+            prefill_num_seqs=B,
+            prefill_seq_len=T,
+            neumann_iters=14,
+        )
+        flashqla_out, flashqla_state = gdn_exact.hpu_chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            chunk_size=16,
+            output_final_state=True,
+            prefill_num_seqs=B,
+            prefill_seq_len=T,
+            neumann_iters=14,
+            fused_state_matmul=True,
+            recursive_solver_base=16,
+            compact_repeated_kkt=True,
+            flashqla_reformulation=True,
+            deferred_output_add=True,
+            solve_in_fp32=True,
+            state_in_fp32=True,
+        )
+
+        output_relative_l2 = torch.linalg.vector_norm(flashqla_out - standard_out) / torch.linalg.vector_norm(
+            standard_out)
+        state_relative_l2 = torch.linalg.vector_norm(flashqla_state - standard_state) / torch.linalg.vector_norm(
+            standard_state)
+        assert output_relative_l2 < 2e-5
+        assert state_relative_l2 < 2e-5
+
     def test_chunk_multiple_sequences(self, gdn):
         """Multiple sequences (S > 1) should work."""
         S, T, H, K, HV, V = 3, 32, 2, 8, 2, 8
@@ -833,6 +876,13 @@ class TestEnvVarToggles:
         with mock.patch.dict(os.environ, {"VLLM_GDN_CHUNK_SIZE": "64"}):
             mod = _import_gdn()
             assert mod.resolve_hpu_gdn_chunk_size(default_model) == (64, True)
+
+        with mock.patch.dict(os.environ, {
+                "VLLM_GDN_CHUNK_SIZE": "0",
+                "VLLM_HPU_FLASHINFER_GDN_PREFILL": "1",
+        }):
+            mod = _import_gdn()
+            assert mod.resolve_hpu_gdn_chunk_size(default_model) == (128, False)
 
         with mock.patch.dict(os.environ, {"VLLM_GDN_CHUNK_SIZE": "48"}):
             mod = _import_gdn()

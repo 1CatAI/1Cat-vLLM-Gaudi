@@ -4,13 +4,13 @@
 for inference primitives whose public semantics match portable FlashInfer
 operations while using Intel Gaudi execution paths.
 
-The first supported domain is Qwen gated-delta-rule decode. The public Python
-surface follows FlashInfer 0.6.18 for `gated_delta_rule_decode_pretranspose`
-(VK/K-last state), `gated_delta_rule_decode` (KV/K-major state), and
-`gated_delta_rule_mtp` (pooled multi-token decode). The implementation keeps a
-compile-friendly reference for the complete portable contract and provides
-dispatch points for public TPC custom kernels and an optional version-locked
-bridge backend.
+The first supported domain is Qwen gated-delta-rule prefill and decode. The
+public Python surface follows FlashInfer 0.6.18 for `chunk_gated_delta_rule`,
+`gated_delta_rule_decode_pretranspose` (VK/K-last state),
+`gated_delta_rule_decode` (KV/K-major state), and `gated_delta_rule_mtp`
+(pooled multi-token decode). The implementation keeps a compile-friendly
+reference for the portable contract and provides dispatch points for public
+TPC custom kernels and an optional version-locked bridge backend.
 
 Enable the vLLM adapter with:
 
@@ -18,6 +18,35 @@ Enable the vLLM adapter with:
 export VLLM_HPU_FLASHINFER_GDN=1
 export FLASHINFER_GAUDI_BACKEND=auto
 ```
+
+This also enables the promoted Qwen3.8-27B TP1 prefill tactic. Set
+`VLLM_HPU_FLASHINFER_GDN_PREFILL=0` to keep only the decode path enabled.
+The prefill dispatcher is deliberately shape-gated to BF16
+`Hq=Hk=16`, `Hv=48`, `K=V=128`, chunk size 128, and one uniform sequence;
+all other layouts retain the general HPU implementation.
+
+The prefill tactic transfers the useful FlashQLA algebra to Gaudi's execution
+model: it removes pairwise gate exponentials from the triangular solve,
+reuses the causal-decay tensor in phase B, shares KKT products across repeated
+key heads, uses a recursive 16x16 block inverse, fuses the phase-B state
+projections, and defers output additions outside the recurrent dependency
+chain. The promoted correctness-first tactic keeps the graph in FP32; BF16
+bulk math remains a research option until it passes model-level quality gates.
+Matrix products still run on MME while `torch.compile` fuses the
+surrounding tensor graph; this is not an eager PyTorch fallback and does not
+replace MME work with a slower TPC-only kernel.
+
+The public prefill entry point is available at both locations:
+
+```python
+from flashinfer_gaudi import chunk_gated_delta_rule
+from flashinfer_gaudi.gdn_prefill import chunk_gated_delta_rule
+```
+
+It accepts FlashInfer's packed `[total_seq_len, heads, dim]` tensors and alpha
+gate semantics. Context-parallel checkpoints and indexed prefill state pools
+currently raise `NotImplementedError` rather than silently using a different
+contract.
 
 Enabling the adapter also selects Gaudi's fused scale-calculation CGUID for
 decode-sized dynamic FP8 linear inputs. This removes the separate
@@ -61,6 +90,14 @@ the production dispatcher until it passes end-to-end token and state-quality
 validation.
 
 ## Microbenchmarking
+
+Compare the general HPU GDN prefill graph with the promoted FlashQLA graph
+tactic at production Qwen3.8 shapes:
+
+```bash
+python3 tools/benchmark_flashinfer_gaudi_gdn_prefill.py \
+  --tokens 2048,4096,16384 --iterations 10 --waves 7
+```
 
 Run the production bucket matrix with both synchronized host latency and
 continuous device-wave timing:

@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "device": "gaudi2",
   "operation": "gdn_decode_packed",
   "model_shape": {
@@ -15,5 +15,31 @@
   "stable_default": "pytorch",
   "public_native_promoted": false,
   "public_native_status": "correctness_passed_performance_gate_pending",
-  "bridge_native_promoted": false
+  "bridge_native_promoted": false,
+  "gdn_prefill": {
+    "promoted": true,
+    "implementation": "flashqla_graph",
+    "model_shape": {
+      "key_heads": 16,
+      "value_heads": 48,
+      "key_dim": 128,
+      "value_dim": 128,
+      "chunk_size": 128,
+      "input_dtype": "bfloat16",
+      "state_layout": "VK",
+      "uniform_sequences": true
+    },
+    "tuning": {
+      "neumann_iters": 14,
+      "fused_state_matmul": true,
+      "recursive_solver_base": 16,
+      "compact_repeated_kkt": true,
+      "compile_qk_l2norm": false,
+      "flashqla_reformulation": true,
+      "deferred_output_add": true,
+      "solve_in_fp32": true,
+      "state_in_fp32": true,
+      "compute_dtype": "float32"
+    }
+  }
 }

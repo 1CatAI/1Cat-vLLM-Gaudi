@@ -23,5 +23,11 @@ def public_gdn_auto_promoted() -> bool:
     return bool(_manifest().get("public_native_promoted", False))
 
 
+def gdn_prefill_tactic() -> dict[str, object]:
+    """Return the offline-promoted Gaudi2 GDN prefill tactic."""
+    value = _manifest().get("gdn_prefill")
+    return dict(value) if isinstance(value, dict) else {}
+
+
 def tactic_manifest() -> dict[str, object]:
     return dict(_manifest())
