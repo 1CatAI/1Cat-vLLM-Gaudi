@@ -32,6 +32,47 @@ This document lists the supported diagnostic and profiling, as well as performan
 | `VLLM_MINIMAX_M3_MOE_TOKEN_TILE` | Maximum number of tokens processed per tile by the MiniMax-M3 dense SwiGLU-OAI expert path. Non-positive values disable tiling. | `512` |
 | `VLLM_MINIMAX_M3_MOE_DECODE_GATHER` | Enables the MiniMax-M3 routed-expert gather path for low-token decode. Set to `0` or `false` to use the dense expert path. | `true` |
 | `VLLM_MINIMAX_M3_MOE_GATHER_MAX_TOKENS` | Maximum token count for the MiniMax-M3 routed-expert gather path. Larger batches use the dense expert path. | `16` |
+| `VLLM_HPU_TRITON_MODE` | Selects Gaudi2-native Triton paths: `off`, performance-safe `hybrid`, or fail-closed `strict`. Hybrid uses only paths that passed the relevant eager/fullgraph gate; strict also exposes ungated kernels for correctness and A/B performance CI. | `off` |
+| `VLLM_HPU_TRITON_CACHE_DIR` | Overrides the private, content-addressed TPC ELF cache used by the Triton/Bridge ABI. | `None` |
+| `VLLM_HPU_TRITON_BLOCK_SIZE` | Logical Triton block size used by the initial 2048-bit TPC elementwise kernels. | `256` |
+| `VLLM_HPU_TRITON_SILU_BLOCK_SIZE` | Power-of-two row chunk used to distribute each fused SiLU-and-mul row across Gaudi2 TPC engines; accepted range is 128–1024. | `128` |
+| `VLLM_HPU_TRITON_GDN_VALUE_TILE` | Value rows owned by each experimental Qwen3.5 packed GDN decode program; accepted values are 16, 32, 64, and 128. | `16` |
+
+The Gaudi2 backend routes supported contiguous BF16 residual RMSNorm calls with
+hidden sizes up to 8192 to one Triton-generated TPC kernel. It returns both the
+normalized activations and rounded residual sum. The production path is a
+Bridge custom op inside the current HPU graph and is compatible with
+`torch.compile(..., backend="hpu_backend", fullgraph=True)`; the diagnostic
+direct-recipe launcher remains outside HPUGraph capture. The eager path has
+passed its operator gate, while hybrid mode retains the vendor implementation
+inside compiled graphs until the fullgraph gate also passes. vLLM prepares the
+fixed-GUID perf library during operator registration, before Synapse graph
+compiler initialization.
+
+The default remains `off` until the fast-path operator set passes an end-to-end
+model gate. Use `strict` for correctness/performance CI with no fallback, or
+`hybrid` when an explicit, counted HPU vendor fallback is acceptable.
+
+Run `python tools/benchmark_triton_gaudi_rms_norm.py` on Gaudi2 after setting
+the matching Triton perf-library and artifact-cache environment variables. The
+gate requires at least 1.20x geometric-mean device and wall speedup and rejects
+any tested shape below 0.95x. Fullgraph compilation is the default comparison;
+use `--eager` only for the diagnostic operator-level comparison.
+
+Packed Qwen3.5 GDN decode uses the split causal-conv + recurrent fast path in
+`hybrid` for decode batches of at least eight; smaller batches retain the
+vendor graph. Weight loading materializes the TPC-friendly transposed
+convolution weights and an FP32 decay-bias view once, so the compiled decode
+graph does not pay a transpose or dtype-conversion cost. The graph-native path
+has cleared the batch-eight full-model gate and preserves the vendor output
+hash over the measured decode window. The strict standalone diagnostic is
+`python tools/benchmark_triton_gaudi_gdn_decode.py --include-conv`; it
+validates the BF16 output, FP32 recurrent state, and BF16 convolution state
+before reporting speedup. Because a two-node micrograph can become host-submit
+bound, hybrid rollout is decided by the full-model gate rather than that
+standalone timing alone. `strict` also exposes the smaller-batch and
+recurrent-only kernels for correctness and tuning CI. SiLU-and-mul remains a
+strict-mode candidate.
 
 Use `VLLM_BUCKETING_STRATEGY=exp` for the default exponential warm-up, `VLLM_BUCKETING_STRATEGY=lin` for explicitly configured linear ranges, or `VLLM_BUCKETING_STRATEGY=pad` for padding-aware ranges with absolute and relative padding limits.
 

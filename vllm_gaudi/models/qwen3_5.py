@@ -1,3 +1,5 @@
+import os
+
 import torch
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention
 from vllm.forward_context import get_forward_context
@@ -11,6 +13,86 @@ from vllm_gaudi.ops.hpu_gdn_pytorch import (
     hpu_fused_gdn_gating,
     hpu_fused_recurrent_gated_delta_rule,
 )
+
+
+# Import only for enabled runs. The runtime keeps small hybrid decode buckets
+# on the vendor graph and selects Triton only where the composite performance
+# gate has cleared; strict mode remains the fail-closed A/B path.
+_triton_gaudi_mode = os.environ.get("VLLM_HPU_TRITON_MODE", "off").strip().lower()
+if _triton_gaudi_mode in ("hybrid", "strict"):
+    from vllm_gaudi.ops.triton_gaudi import (
+        gdn_decode_conv_split_packed as _triton_gdn_decode_conv_packed,
+        gdn_decode_packed as _triton_gdn_decode_packed,
+    )
+else:
+    _triton_gdn_decode_conv_packed = None
+    _triton_gdn_decode_packed = None
+
+
+def _try_triton_gdn_decode_conv_packed(
+    conv_state: torch.Tensor,
+    ssm_state: torch.Tensor,
+    mixed_qkv: torch.Tensor,
+    gate_a: torch.Tensor,
+    gate_b: torch.Tensor,
+    a_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_indices: torch.Tensor | None,
+    conv_weight_t: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Run the performance-gated split width-4 conv + GDN fast path."""
+    if _triton_gdn_decode_conv_packed is None:
+        return None
+    if state_indices is None or conv_weight_t is None:
+        if _triton_gaudi_mode == "strict":
+            missing = "state_indices" if state_indices is None else "transposed conv weight"
+            raise RuntimeError(
+                f"Gaudi Triton strict fused GDN decode requires {missing}")
+        return None
+    return _triton_gdn_decode_conv_packed(
+        conv_state,
+        ssm_state,
+        mixed_qkv.contiguous(),
+        gate_a.contiguous(),
+        gate_b.contiguous(),
+        a_log.contiguous(),
+        dt_bias.contiguous(),
+        state_indices.contiguous(),
+        conv_weight_t,
+    )
+
+
+def _try_triton_gdn_decode_packed(
+    ssm_state: torch.Tensor,
+    mixed_qkv_conv: torch.Tensor,
+    gate_a: torch.Tensor,
+    gate_b: torch.Tensor,
+    a_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_indices: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Run the performance-gated packed Qwen3.5 decode candidate.
+
+    Keeping this boundary immediately after causal-conv lets Dynamo place the
+    vendor conv and the state-mutating Triton op in one HPU graph. The runtime
+    validator owns the canonical TP1/single-token specialization checks.
+    """
+    if _triton_gdn_decode_packed is None:
+        return None
+    if state_indices is None:
+        if _triton_gaudi_mode == "strict":
+            raise RuntimeError(
+                "Gaudi Triton strict GDN decode requires state_indices metadata")
+        return None
+    return _triton_gdn_decode_packed(
+        ssm_state,
+        mixed_qkv_conv.contiguous(),
+        gate_a.contiguous(),
+        gate_b.contiguous(),
+        a_log.contiguous(),
+        dt_bias.contiguous(),
+        state_indices.contiguous(),
+    )
 
 
 def _save_ssm_state(core_attn_out, final_state, ssm_state, state_indices):
@@ -43,6 +125,45 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         self.qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
         self.z_size = self.value_dim // self.tp_size
+
+        # The split TPC kernels vector-load one convolution tap across channels.
+        # Materialize that tap-major layout once while the checkpoint loader
+        # writes the canonical [channels, 1, width] parameter.
+        self._triton_conv_weight_ready = False
+        self._triton_dt_bias_ready = False
+        if _triton_gaudi_mode in ("hybrid", "strict"):
+            conv_weight = self.conv1d.weight
+            self.register_buffer(
+                "_triton_conv_weight_t",
+                conv_weight.new_empty((self.conv_kernel_size, conv_weight.size(0))),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_triton_dt_bias_f32",
+                self.dt_bias.new_empty(self.dt_bias.shape, dtype=torch.float32),
+                persistent=False,
+            )
+            original_weight_loader = conv_weight.weight_loader
+            original_dt_bias_loader = self.dt_bias.weight_loader
+
+            def load_conv_weight_and_transpose(param, loaded_weight):
+                result = original_weight_loader(param, loaded_weight)
+                with torch.no_grad():
+                    self._triton_conv_weight_t.copy_(
+                        param.view(param.size(0), param.size(2)).transpose(0, 1))
+                self._triton_conv_weight_ready = True
+                return result
+
+            conv_weight.weight_loader = load_conv_weight_and_transpose
+
+            def load_dt_bias_as_fp32(param, loaded_weight):
+                result = original_dt_bias_loader(param, loaded_weight)
+                with torch.no_grad():
+                    self._triton_dt_bias_f32.copy_(param.float())
+                self._triton_dt_bias_ready = True
+                return result
+
+            self.dt_bias.weight_loader = load_dt_bias_as_fp32
 
     def rearrange_mixed_qkv(self, mixed_qkv):
         """Pure-torch rearrange – avoids einops graph breaks on HPU."""
@@ -248,37 +369,63 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         else:
             # === Part 2b: Decode =====================================
-            g, beta = hpu_fused_gdn_gating(self.A_log, a, b, self.dt_bias)
-
             conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
-            mixed_qkv_conv = hpu_causal_conv1d_update(
-                x=mixed_qkv,
-                conv_state=conv_state,
-                weight=conv_weights,
-                bias=self.conv1d.bias,
-                activation=self.activation,
-                conv_state_indices=(state_indices[:num_decodes] if state_indices is not None else state_indices),
-                block_idx_last_scheduled_token=None,
-                initial_state_idx=None,
-                query_start_loc=query_start_loc,
-                validate_data=False,
+            triton_out = _try_triton_gdn_decode_conv_packed(
+                conv_state,
+                ssm_state,
+                mixed_qkv,
+                a,
+                b,
+                self.A_log,
+                (self._triton_dt_bias_f32
+                 if self._triton_dt_bias_ready else self.dt_bias),
+                state_indices,
+                (self._triton_conv_weight_t
+                 if self._triton_conv_weight_ready else None),
             )
-
-            query, key, value = self.rearrange_mixed_qkv(mixed_qkv_conv)
-
-            core_attn_out_result, _ = \
-                hpu_fused_recurrent_gated_delta_rule(
-                    q=query, k=key, v=value, g=g, beta=beta,
-                    initial_state=ssm_state,
-                    inplace_final_state=True,
-                    cu_seqlens=(
-                        query_start_loc[:num_decodes + 1]
-                        if query_start_loc is not None else None),
-                    ssm_state_indices=state_indices,
-                    use_qk_l2norm_in_kernel=True,
+            if triton_out is None:
+                mixed_qkv_conv = hpu_causal_conv1d_update(
+                    x=mixed_qkv,
+                    conv_state=conv_state,
+                    weight=conv_weights,
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                    conv_state_indices=(
+                        state_indices[:num_decodes]
+                        if state_indices is not None else state_indices),
+                    block_idx_last_scheduled_token=None,
+                    initial_state_idx=None,
+                    query_start_loc=query_start_loc,
+                    validate_data=False,
                 )
+                triton_out = _try_triton_gdn_decode_packed(
+                    ssm_state,
+                    mixed_qkv_conv,
+                    a,
+                    b,
+                    self.A_log,
+                    (self._triton_dt_bias_f32
+                     if self._triton_dt_bias_ready else self.dt_bias),
+                    state_indices,
+                )
+            if triton_out is None:
+                g, beta = hpu_fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+                query, key, value = self.rearrange_mixed_qkv(mixed_qkv_conv)
 
-            non_spec_out = core_attn_out_result.squeeze(0)
+                core_attn_out_result, _ = \
+                    hpu_fused_recurrent_gated_delta_rule(
+                        q=query, k=key, v=value, g=g, beta=beta,
+                        initial_state=ssm_state,
+                        inplace_final_state=True,
+                        cu_seqlens=(
+                            query_start_loc[:num_decodes + 1]
+                            if query_start_loc is not None else None),
+                        ssm_state_indices=state_indices,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                non_spec_out = core_attn_out_result.squeeze(0)
+            else:
+                non_spec_out = triton_out
             if non_spec_out.shape[0] == core_attn_out.shape[0]:
                 core_attn_out.copy_(non_spec_out)
             else:

@@ -1,7 +1,14 @@
+import os
 from typing import Optional, Union
+
 import torch
 from vllm.model_executor.layers.layernorm import \
     RMSNorm, GemmaRMSNorm
+
+if os.environ.get("VLLM_HPU_TRITON_MODE", "off").strip().lower() == "off":
+    _fused_add_rms_norm = None
+else:
+    from vllm_gaudi.ops.triton_gaudi import fused_add_rms_norm as _fused_add_rms_norm
 
 
 @RMSNorm.register_oot
@@ -16,7 +23,18 @@ class HPURMSNorm(RMSNorm):
         HPUFusedRMSNorm = rms_norm()
         if residual is not None:
             orig_shape = x.shape
-            residual = residual + x.reshape(residual.shape)
+            reshaped_x = x.reshape(residual.shape)
+            if _fused_add_rms_norm is not None:
+                fused = _fused_add_rms_norm(
+                    reshaped_x,
+                    residual,
+                    self.weight,
+                    self.variance_epsilon,
+                )
+                if fused is not None:
+                    x, residual = fused
+                    return x.reshape(orig_shape), residual
+            residual = residual + reshaped_x
             # Note: HPUFusedRMSNorm requires 3D tensors as inputs
             x = HPUFusedRMSNorm.apply(residual, self.weight, self.variance_epsilon)
             return x.reshape(orig_shape), residual
@@ -39,7 +57,18 @@ class HPUGemmaRMSNorm(GemmaRMSNorm):
         gemma_weight = self.weight + 1.0
         if residual is not None:
             orig_shape = x.shape
-            residual = residual + x.reshape(residual.shape)
+            reshaped_x = x.reshape(residual.shape)
+            if _fused_add_rms_norm is not None:
+                fused = _fused_add_rms_norm(
+                    reshaped_x,
+                    residual,
+                    gemma_weight,
+                    self.variance_epsilon,
+                )
+                if fused is not None:
+                    x, residual = fused
+                    return x.reshape(orig_shape), residual
+            residual = residual + reshaped_x
             # Note: HPUFusedRMSNorm requires 3D tensors as inputs
             x = HPUFusedRMSNorm.apply(residual, gemma_weight, self.variance_epsilon)
             return x.reshape(orig_shape), residual
