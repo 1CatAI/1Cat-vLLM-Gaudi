@@ -82,6 +82,8 @@ def get_experimental_flags():
         Env('VLLM_DEBUG', list_of(str), check=for_all(choice('steps', 'defrag', 'fwd'))),
         Env('VLLM_HPU_FLASHINFER_GDN', boolean),
         Env('VLLM_HPU_GDN_DIRECT_STATE', boolean),
+        Env('VLLM_HPU_CGUID_DYNAMIC_QUANT', boolean),
+        Env('VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS', int),
         Env('FLASHINFER_GAUDI_BACKEND', str),
         Env('FLASHINFER_GAUDI_STATE_DTYPE', str),
     ]

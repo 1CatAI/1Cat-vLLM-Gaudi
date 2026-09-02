@@ -19,6 +19,8 @@ if TYPE_CHECKING:
     VLLM_MM_WARMUP_OUTSIDE_COMPILE_ONLY: bool = False
     VLLM_HPU_FLASHINFER_GDN: bool = False
     VLLM_HPU_GDN_DIRECT_STATE: bool = True
+    VLLM_HPU_CGUID_DYNAMIC_QUANT: bool = False
+    VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS: int = 32
 
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
@@ -99,6 +101,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use group-major compact GDN state views for full decode buckets.
     "VLLM_HPU_GDN_DIRECT_STATE":
     lambda: os.environ.get("VLLM_HPU_GDN_DIRECT_STATE", "true").strip().lower() in ("1", "true"),
+
+    # Use Gaudi's calculate_scale_for_cast CGUID for decode-sized per-token
+    # dynamic FP8 scales instead of materializing abs + reduce_max + scale
+    # arithmetic. Large prefill matrices retain the existing path because the
+    # CGUID changes graph fusion and numerical results there.
+    "VLLM_HPU_CGUID_DYNAMIC_QUANT":
+    lambda: os.environ.get(
+        "VLLM_HPU_CGUID_DYNAMIC_QUANT",
+        os.environ.get("VLLM_HPU_FLASHINFER_GDN", "false"),
+    ).strip().lower() in ("1", "true"),
+    "VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS":
+    lambda: int(os.environ.get("VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS", "32")),
 }
 
 # end-env-vars-definition

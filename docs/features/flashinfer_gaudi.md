@@ -19,6 +19,14 @@ export VLLM_HPU_FLASHINFER_GDN=1
 export FLASHINFER_GAUDI_BACKEND=auto
 ```
 
+Enabling the adapter also selects Gaudi's fused scale-calculation CGUID for
+decode-sized dynamic FP8 linear inputs. This removes the separate
+absolute-value and maximum-reduction chain without changing decoded tokens.
+The optimization is capped at 32 flattened rows by default, so prefill keeps
+the existing numerical path. Set `VLLM_HPU_CGUID_DYNAMIC_QUANT=0` to disable
+it independently, or tune the decode cap with
+`VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS`.
+
 `auto` uses the compiled PyTorch implementation only with vLLM's contiguous
 group-major recurrent-state layout. Indexed state layouts fall through to
 vLLM's existing decode implementation, because the extra gather/scatter is a

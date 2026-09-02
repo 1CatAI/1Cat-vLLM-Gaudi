@@ -13,6 +13,7 @@ import habana_frameworks.torch.core as htcore
 from vllm_gaudi.extension.runtime import get_config
 from vllm_gaudi.extension.utils import get_kv_fetch_extra_args
 from vllm_gaudi.extension.scales import ConvertScaleToHwAligned
+from vllm_gaudi import envs
 import vllm.model_executor.layers.quantization as vllm_quant
 import habana_frameworks.torch.utils.experimental as htexp
 import types
@@ -1010,9 +1011,28 @@ def apply_fp8_linear_hpu(
     return output
 
 
+def _use_cguid_dynamic_quant(data):
+    return (envs.VLLM_HPU_CGUID_DYNAMIC_QUANT and data.ndim == 2
+            and data.shape[0] <= envs.VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS)
+
+
 def dynamic_quant(data, single_scale=False):
     if single_scale:
         scale = ((torch.abs(data)).max() + 1e-8) / FP8_MAX
+    elif _use_cguid_dynamic_quant(data):
+        scale = torch.ops.hpu.calculate_scale_for_cast(
+            data,
+            2,  # MAX_ABS_PCS_CALCULATION
+            0,  # NO_SCALE_ROUNDING
+            -1,
+            True,
+            float(FP8_MAX),
+            1.0,
+        )
+        # Match the existing max-abs formula for tiny, non-zero rows.  The
+        # CGUID clamps an all-zero result to the BF16 minimum; that difference
+        # is harmless because the corresponding quantized row remains zero.
+        scale = scale + (1e-8 / FP8_MAX)
     else:
         scale = ((torch.abs(data)).max(dim=-1).values + 1e-8) / FP8_MAX
         scale = scale.unsqueeze(-1)
