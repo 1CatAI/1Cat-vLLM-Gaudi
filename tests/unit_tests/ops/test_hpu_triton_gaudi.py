@@ -82,6 +82,87 @@ def test_strict_fused_add_rms_norm_rejects_non_hpu_tensor(monkeypatch: pytest.Mo
         runtime.fused_add_rms_norm(hidden, hidden, torch.ones(8, dtype=torch.bfloat16), 1.0e-6)
 
 
+def test_off_mode_leaves_dynamic_quant_on_vendor_path():
+    input_tensor = torch.zeros(2, 128, dtype=torch.bfloat16)
+
+    result = runtime.dynamic_quant(input_tensor)
+
+    assert result is None
+    assert runtime.diagnostics()["counters"] == {
+        "vendor.dynamic_quant.off": 1,
+    }
+
+
+def test_hybrid_dynamic_quant_records_non_hpu_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "hybrid")
+    input_tensor = torch.zeros(2, 128, dtype=torch.bfloat16)
+
+    result = runtime.dynamic_quant(input_tensor)
+
+    assert result is None
+    assert runtime.diagnostics()["counters"] == {
+        "fallback.dynamic_quant.non_hpu_tensor": 1,
+    }
+
+
+def test_strict_dynamic_quant_rejects_non_hpu_tensor(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "strict")
+    input_tensor = torch.zeros(2, 128, dtype=torch.bfloat16)
+
+    with pytest.raises(
+        runtime.FastPathUnavailable,
+        match="dynamic_quant: non_hpu_tensor",
+    ):
+        runtime.dynamic_quant(input_tensor)
+
+
+def test_dynamic_quant_validator_keeps_prefill_outside_fast_path():
+    class FakeHpuTensor:
+        device = torch.device("hpu")
+        ndim = 2
+        shape = (33, 4096)
+        dtype = torch.bfloat16
+
+        @staticmethod
+        def numel():
+            return 33 * 4096
+
+        @staticmethod
+        def is_contiguous():
+            return True
+
+    assert runtime._dynamic_quant_rejection_reason(FakeHpuTensor()) == "prefill_shape"
+
+
+def test_eager_hybrid_dynamic_quant_keeps_candidate_on_vendor_path(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "hybrid")
+
+    class FakeHpuTensor:
+        device = torch.device("hpu")
+        ndim = 2
+        shape = (8, 4096)
+        dtype = torch.bfloat16
+
+        @staticmethod
+        def numel():
+            return 8 * 4096
+
+        @staticmethod
+        def is_contiguous():
+            return True
+
+    assert runtime.dynamic_quant(FakeHpuTensor()) is None
+    assert runtime.diagnostics()["counters"] == {
+        "vendor.dynamic_quant.performance_gate": 1,
+    }
+
+
 def test_compile_off_mode_does_not_enable_fast_path(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     hidden = torch.zeros(2, 8, dtype=torch.bfloat16)
@@ -116,10 +197,12 @@ def test_compile_hybrid_mode_keeps_ungated_kernels_on_vendor_path(
         torch.ones(8, dtype=torch.bfloat16),
         1.0e-6,
     )
+    dynamic_quant_result = runtime.dynamic_quant(hidden)
     silu_result = runtime.silu_and_mul(hidden)
     gdn_result = runtime.gdn_decode_packed(*_cpu_gdn_inputs())
 
     assert rms_result is None
+    assert dynamic_quant_result is None
     assert silu_result is None
     assert gdn_result is None
     assert runtime.diagnostics()["counters"] == {}
@@ -341,6 +424,37 @@ def test_gdn_decode_triton_ast_compiles_to_canonical_artifact():
     }
     assert manifest["parameters"]["mutates_arg"] == 0
     assert manifest["parameters"]["state_slots_arg"] == 8
+
+
+@pytest.mark.skipif(shutil.which("tpc-clang") is None, reason="tpc-clang is not installed")
+def test_dynamic_quant_triton_ast_compiles_mlp_width_to_canonical_artifact():
+    from vllm_gaudi.ops.triton_gaudi.kernels import _compile_dynamic_quant
+
+    artifact, block_size = _compile_dynamic_quant(11008)
+    manifest = artifact.manifest
+
+    assert artifact.elf.startswith(b"\x7fELF")
+    assert block_size == 16384
+    assert manifest["kind"] == "dynamic_quant"
+    assert manifest["input_args"] == [0]
+    assert manifest["output_args"] == [1, 2]
+    assert [argument["dtype"] for argument in manifest["arguments"]] == [
+        "bf16",
+        "fp8e4nv",
+        "f32",
+    ]
+    assert manifest["index_space"] == {
+        "rank": 1,
+        "block_size": 16384,
+        "vector_lanes": 256,
+        "program_id_axes": [0],
+    }
+    assert manifest["parameters"] == {
+        "n_cols": 11008,
+        "fp8_max": 240.0,
+        "scale_epsilon": 1.0e-8,
+        "vlm_bytes": 0,
+    }
 
 
 def test_hybrid_split_gdn_decode_keeps_small_batch_on_vendor_path(

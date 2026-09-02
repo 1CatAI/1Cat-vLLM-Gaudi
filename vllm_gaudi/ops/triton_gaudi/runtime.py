@@ -38,6 +38,7 @@ _counters: Counter[str] = Counter()
 # sizes at or above eight. Gaudi2 fullgraph A/B keeps the two launches behind
 # the performance gate for small batches, where fixed launch cost dominates.
 _GDN_CONV_SPLIT_MIN_BATCH = 8
+_DYNAMIC_QUANT_MAX_ROWS = 32
 
 
 def _mode() -> FastPathMode:
@@ -242,6 +243,90 @@ def fused_add_rms_norm(
             f"Gaudi Triton fused add+RMSNorm failed ({exc}); using the HPU vendor path",
         )
         _counters["fallback.fused_add_rms_norm.launch"] += 1
+        return None
+
+
+def _reject_dynamic_quant(reason: str) -> None:
+    _counters[f"fallback.dynamic_quant.{reason}"] += 1
+    if _mode() is FastPathMode.STRICT:
+        raise FastPathUnavailable(
+            f"Gaudi Triton strict mode rejected dynamic_quant: {reason}")
+    return None
+
+
+def _dynamic_quant_rejection_reason(
+    input_tensor: "torch.Tensor",
+) -> str | None:
+    if input_tensor.device.type != "hpu":
+        return "non_hpu_tensor"
+    if input_tensor.ndim != 2 or input_tensor.shape[0] <= 0:
+        return "shape_mismatch"
+    rows, n_cols = input_tensor.shape
+    if rows > _DYNAMIC_QUANT_MAX_ROWS:
+        return "prefill_shape"
+    if n_cols <= 0 or n_cols > 16384 or input_tensor.numel() == 0:
+        return "unsupported_size"
+    if input_tensor.dtype != torch.bfloat16:
+        return "unsupported_dtype"
+    if not input_tensor.is_contiguous():
+        return "non_contiguous"
+    return None
+
+
+def dynamic_quant(
+    input_tensor: "torch.Tensor",
+) -> tuple["torch.Tensor", "torch.Tensor"] | None:
+    """Quantize decode-sized BF16 rows with one Gaudi2-native TPC node."""
+    if torch.compiler.is_compiling():
+        compile_mode = _compile_fast_path_mode()
+        if compile_mode == FastPathMode.OFF.value:
+            return None
+        if compile_mode == FastPathMode.HYBRID.value:
+            return None
+        rejection_reason = _dynamic_quant_rejection_reason(input_tensor)
+        if rejection_reason is not None:
+            if compile_mode == FastPathMode.STRICT.value:
+                raise FastPathUnavailable(
+                    "Gaudi Triton strict mode rejected dynamic_quant: "
+                    f"{rejection_reason}")
+            return None
+        from vllm_gaudi.ops.triton_gaudi.kernels import (
+            dynamic_quant as launch_dynamic_quant,
+        )
+
+        return launch_dynamic_quant(input_tensor)
+
+    if _mode() is FastPathMode.OFF:
+        _counters["vendor.dynamic_quant.off"] += 1
+        return None
+    rejection_reason = _dynamic_quant_rejection_reason(input_tensor)
+    if rejection_reason is not None:
+        return _reject_dynamic_quant(rejection_reason)
+    if _mode() is FastPathMode.HYBRID:
+        _counters["vendor.dynamic_quant.performance_gate"] += 1
+        return None
+    if not prepare_if_enabled():
+        return _reject_dynamic_quant("initialization")
+
+    try:
+        from vllm_gaudi.ops.triton_gaudi.kernels import (
+            dynamic_quant as launch_dynamic_quant,
+        )
+
+        output = launch_dynamic_quant(input_tensor)
+        _counters["triton.dynamic_quant"] += 1
+        return output
+    except Exception as exc:
+        if _mode() is FastPathMode.STRICT:
+            raise FastPathUnavailable(
+                "Gaudi Triton dynamic quantization compilation or launch failed"
+            ) from exc
+        _warn_once(
+            "dynamic_quant.launch",
+            "Gaudi Triton dynamic quantization failed "
+            f"({exc}); using the HPU vendor path",
+        )
+        _counters["fallback.dynamic_quant.launch"] += 1
         return None
 
 

@@ -34,6 +34,12 @@ import os
 
 logger = logging.getLogger(__name__)
 
+_triton_dynamic_quant = None
+try:
+    from vllm_gaudi.ops.triton_gaudi import dynamic_quant as _triton_dynamic_quant
+except ImportError:
+    pass
+
 # MAX_EXPERTS_PER_SLICE is needed for 1.20, up to 64 experts per slice
 try:
     MAX_EXPERTS_PER_SLICE = int(os.environ.get("MAX_EXPERTS_PER_SLICE", -1))
@@ -1014,6 +1020,10 @@ def dynamic_quant(data, single_scale=False):
     if single_scale:
         scale = ((torch.abs(data)).max() + 1e-8) / FP8_MAX
     else:
+        if _triton_dynamic_quant is not None and data.ndim == 2:
+            triton_result = _triton_dynamic_quant(data)
+            if triton_result is not None:
+                return triton_result
         scale = ((torch.abs(data)).max(dim=-1).values + 1e-8) / FP8_MAX
         scale = scale.unsqueeze(-1)
     data_fp8 = torch.ops.hpu.cast_to_fp8_v2(data, 1.0 / scale, False, False, torch.float8_e4m3fn)[0]

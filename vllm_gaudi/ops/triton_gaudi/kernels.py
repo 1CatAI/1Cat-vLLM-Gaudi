@@ -54,6 +54,16 @@ def _silu_and_mul_schedule() -> dict[str, object]:
     ).as_backend_options()
 
 
+@functools.lru_cache(maxsize=None)
+def _dynamic_quant_schedule() -> dict[str, object]:
+    return GaudiConfig(
+        unroll=1,
+        pipeline_depth=1,
+        engine="tpc",
+        mode="strict",
+    ).as_backend_options()
+
+
 @functools.lru_cache(maxsize=4)
 def _gdn_decode_schedule(value_tile: int) -> dict[str, object]:
     return GaudiConfig(
@@ -137,6 +147,28 @@ def _compile_silu_and_mul(n_cols: int, block_size: int) -> GaudiKernelArtifactV1
         options=_silu_and_mul_schedule(),
     )
     return GaudiKernelArtifactV1.from_bytes(compiled.asm["gabin"])
+
+
+@functools.lru_cache(maxsize=32)
+def _compile_dynamic_quant(n_cols: int) -> tuple[GaudiKernelArtifactV1, int]:
+    block_size = triton.next_power_of_2(n_cols)
+    source = triton.compiler.ASTSource(
+        fn=_dynamic_quant_kernel,
+        signature={
+            "input_ptr": "*bf16",
+            "output_ptr": "*fp8e4nv",
+            "scale_ptr": "*fp32",
+            "N_COLS": "constexpr",
+            "BLOCK_SIZE": "constexpr",
+        },
+        constexprs={"N_COLS": n_cols, "BLOCK_SIZE": block_size},
+    )
+    compiled = triton.compile(
+        source,
+        target=GPUTarget("gaudi", "gaudi2"),
+        options=_dynamic_quant_schedule(),
+    )
+    return GaudiKernelArtifactV1.from_bytes(compiled.asm["gabin"]), block_size
 
 
 @functools.lru_cache(maxsize=4)
@@ -289,6 +321,18 @@ def _prepare_silu_and_mul(n_cols: int, block_size: int) -> str:
     return _prepare_silu_and_mul_cached(n_cols, block_size)
 
 
+@functools.lru_cache(maxsize=32)
+def _prepare_dynamic_quant_cached(n_cols: int) -> tuple[str, int]:
+    artifact, block_size = _compile_dynamic_quant(n_cols)
+    _materialize_graph_artifact(artifact, torch.hpu.current_device())
+    return artifact.artifact_hash, block_size
+
+
+@torch.compiler.assume_constant_result
+def _prepare_dynamic_quant(n_cols: int) -> tuple[str, int]:
+    return _prepare_dynamic_quant_cached(n_cols)
+
+
 @functools.lru_cache(maxsize=4)
 def _prepare_gdn_decode_packed_cached(value_tile: int) -> str:
     artifact = _compile_gdn_decode_packed(value_tile)
@@ -414,6 +458,27 @@ def _silu_and_mul_kernel(
     up = tl.load(input_ptr + up_offsets, mask=mask, other=0.0).to(tl.float32)
     result = gate * tl.sigmoid(gate) * up
     tl.store(output_ptr + output_offsets, result, mask=mask)
+
+
+@triton.jit
+def _dynamic_quant_kernel(
+    input_ptr,
+    output_ptr,
+    scale_ptr,
+    N_COLS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    columns = tl.arange(0, BLOCK_SIZE)
+    mask = columns < N_COLS
+    offsets = row * N_COLS + columns
+    values = tl.load(input_ptr + offsets, mask=mask, other=0.0).to(
+        tl.float32)
+    abs_max = tl.max(tl.abs(values), axis=0)
+    scale = (abs_max + 1.0e-8) / 240.0
+    tl.store(scale_ptr + row, scale)
+    quantized = values / scale
+    tl.store(output_ptr + offsets, quantized, mask=mask)
 
 
 @triton.jit
@@ -814,6 +879,45 @@ def silu_and_mul_direct(input_tensor: torch.Tensor) -> torch.Tensor:
         backend_options=_silu_and_mul_schedule(),
     )
     return output.view(*input_tensor.shape[:-1], n_cols)
+
+
+def dynamic_quant(
+    input_tensor: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Launch graph-native row-wise BF16 to Gaudi2 E4M3 quantization."""
+    if input_tensor.ndim != 2:
+        raise ValueError("Gaudi Triton dynamic quantization requires a 2D tensor")
+    rows, n_cols = input_tensor.shape
+    artifact_hash, block_size = _prepare_dynamic_quant(n_cols)
+    quantized, scale = torch.ops.triton_gaudi.dynamic_quant.default(
+        input_tensor.view(-1),
+        artifact_hash,
+        block_size,
+        n_cols,
+        rows,
+    )
+    return quantized.view(input_tensor.shape), scale.view(rows, 1)
+
+
+def dynamic_quant_direct(
+    input_tensor: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Direct recipe launch retained for quantization ABI diagnostics."""
+    if input_tensor.ndim != 2:
+        raise ValueError("Gaudi Triton dynamic quantization requires a 2D tensor")
+    rows, n_cols = input_tensor.shape
+    output = torch.empty_like(input_tensor, dtype=torch.float8_e4m3fn)
+    scale = torch.empty((rows, 1), dtype=torch.float32, device=input_tensor.device)
+    block_size = triton.next_power_of_2(n_cols)
+    _dynamic_quant_kernel[(rows, )](
+        input_tensor,
+        output,
+        scale,
+        N_COLS=n_cols,
+        BLOCK_SIZE=block_size,
+        backend_options=_dynamic_quant_schedule(),
+    )
+    return output, scale
 
 
 def gdn_decode_packed(

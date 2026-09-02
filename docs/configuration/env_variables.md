@@ -53,6 +53,16 @@ The default remains `off` until the fast-path operator set passes an end-to-end
 model gate. Use `strict` for correctness/performance CI with no fallback, or
 `hybrid` when an explicit, counted HPU vendor fallback is acceptable.
 
+Row-wise BF16-to-E4M3 dynamic quantization is available as a strict-mode
+candidate for decode shapes with at most 32 rows and hidden sizes up to 16384.
+It folds max-abs reduction, F32 scale generation, and FP8 conversion into one
+Triton-generated TPC node. Larger prefill shapes and `single_scale=True` retain
+the vendor path. Run
+`python tools/benchmark_triton_gaudi_dynamic_quant.py` to compare the candidate
+against the existing `amax` plus `cast_to_fp8_v2` fullgraph. Hybrid rollout
+remains closed until that generated-kernel gate and the model-level output gate
+both pass on Gaudi2.
+
 Run `python tools/benchmark_triton_gaudi_rms_norm.py` on Gaudi2 after setting
 the matching Triton perf-library and artifact-cache environment variables. The
 gate requires at least 1.20x geometric-mean device and wall speedup and rejects
