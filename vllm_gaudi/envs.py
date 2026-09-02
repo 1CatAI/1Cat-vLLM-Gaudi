@@ -17,6 +17,11 @@ if TYPE_CHECKING:
     VLLM_MINIMAX_M3_MOE_DECODE_GATHER: bool = True
     VLLM_MINIMAX_M3_MOE_GATHER_MAX_TOKENS: int = 16
     VLLM_MM_WARMUP_OUTSIDE_COMPILE_ONLY: bool = False
+    VLLM_HPU_TRITON_MODE: str = "off"
+    VLLM_HPU_TRITON_CACHE_DIR: Optional[str] = None
+    VLLM_HPU_TRITON_BLOCK_SIZE: int = 256
+    VLLM_HPU_TRITON_SILU_BLOCK_SIZE: int = 128
+    VLLM_HPU_TRITON_GDN_VALUE_TILE: int = 16
 
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
@@ -87,6 +92,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # data-dependent output shapes that must be materialized during warmup.
     "VLLM_MM_WARMUP_OUTSIDE_COMPILE_ONLY":
     lambda: os.environ.get("VLLM_MM_WARMUP_OUTSIDE_COMPILE_ONLY", "false").strip().lower() in ("1", "true"),
+
+    # Gaudi2-native Triton backend policy. `off` preserves the vendor path,
+    # `hybrid` permits a recorded vendor fallback, and `strict` fails closed.
+    "VLLM_HPU_TRITON_MODE":
+    lambda: os.environ.get("VLLM_HPU_TRITON_MODE", "off").strip().lower(),
+    "VLLM_HPU_TRITON_CACHE_DIR":
+    lambda: os.environ.get("VLLM_HPU_TRITON_CACHE_DIR", None),
+    "VLLM_HPU_TRITON_BLOCK_SIZE":
+    lambda: int(os.environ.get("VLLM_HPU_TRITON_BLOCK_SIZE", "256")),
+    "VLLM_HPU_TRITON_SILU_BLOCK_SIZE":
+    lambda: int(os.environ.get("VLLM_HPU_TRITON_SILU_BLOCK_SIZE", "128")),
+    "VLLM_HPU_TRITON_GDN_VALUE_TILE":
+    lambda: int(os.environ.get("VLLM_HPU_TRITON_GDN_VALUE_TILE", "16")),
 }
 
 # end-env-vars-definition
