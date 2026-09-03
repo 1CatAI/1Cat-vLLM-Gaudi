@@ -729,6 +729,22 @@ def test_direct_gdn_state_requires_group_major_request_order():
     assert not runner._can_use_direct_gdn_state(indices, num_indices=4, target_bs=4)
 
 
+def test_model_adapter_selects_hidden_states_inside_logits_region():
+    adapter = SimpleNamespace(model=SimpleNamespace(compute_logits=lambda hidden_states: hidden_states * 3), )
+    hidden_states = torch.arange(24).view(2, 3, 4)
+    logits_indices = torch.tensor([1, 4])
+
+    selected, logits = HpuModelAdapter.select_and_compute_logits(
+        adapter,
+        hidden_states,
+        logits_indices,
+    )
+
+    expected = hidden_states.view(-1, 4)[logits_indices]
+    assert torch.equal(selected, expected)
+    assert torch.equal(logits, expected * 3)
+
+
 def test_max_cudagraph_capture_size_defaults_to_max_num_batched_tokens(model_runner):
     """max_cudagraph_capture_size defaults to max_num_batched_tokens when not configured."""
     assert model_runner.max_cudagraph_capture_size == model_runner.max_num_batched_tokens

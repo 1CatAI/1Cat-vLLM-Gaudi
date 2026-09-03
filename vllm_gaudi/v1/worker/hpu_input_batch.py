@@ -677,7 +677,7 @@ class InputBatch:
             async_h2d_update(self.allowed_token_ids_mask_cpu_tensor, self.allowed_token_ids_mask, req_indices)
             allowed_token_ids_mask = self.allowed_token_ids_mask[req_indices]
         return SamplingMetadata(
-            temperature=self.temperature[req_indices],
+            temperature=None if self.all_greedy else self.temperature[req_indices],
             all_greedy=self.all_greedy,
             all_random=self.all_random,
             top_p=None if self.no_top_p else self.top_p[req_indices],
@@ -688,9 +688,9 @@ class InputBatch:
             },
             max_num_logprobs=self.max_num_logprobs,
             prompt_token_ids=prompt_token_ids,
-            frequency_penalties=self.frequency_penalties[req_indices],
-            presence_penalties=self.presence_penalties[req_indices],
-            repetition_penalties=self.repetition_penalties[req_indices],
+            frequency_penalties=None if self.no_penalties else self.frequency_penalties[req_indices],
+            presence_penalties=None if self.no_penalties else self.presence_penalties[req_indices],
+            repetition_penalties=None if self.no_penalties else self.repetition_penalties[req_indices],
             output_token_ids=cast(list[list[int]], output_token_ids),
             no_penalties=self.no_penalties,
             allowed_token_ids_mask=allowed_token_ids_mask,

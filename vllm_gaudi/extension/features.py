@@ -133,6 +133,8 @@ def get_features():
         Value('moe_token_boundary', "", env_var='VLLM_MOE_TOKEN_BOUNDARY', env_var_type=list_of(int)),
         Value('row_parallel_chunks', 1, env_var='VLLM_ROW_PARALLEL_CHUNKS', env_var_type=int),
         Value('row_parallel_chunk_threshold', 8192, env_var='VLLM_ROW_PARALLEL_CHUNK_THRESHOLD', env_var_type=int),
+        Value('tp2_fused_ar_norm', False, env_var='VLLM_HPU_TP2_FUSED_AR_NORM', env_var_type=boolean),
+        Value('tp2_fused_ar_norm_max_bytes', 524288, env_var='VLLM_HPU_TP2_FUSED_AR_NORM_MAX_BYTES', env_var_type=int),
         Value('use_dispatch_fn',
               All(VersionRange(">=1.24.0.460"), MinPackageVersion("neural_compressor_pt", "3.7")),
               env_var_type=boolean),
