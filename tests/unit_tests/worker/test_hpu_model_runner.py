@@ -18,6 +18,7 @@ from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData, Schedu
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor)
 from vllm.v1.sample.metadata import SamplingMetadata
 import vllm_gaudi.extension.environment as environment
+import vllm_gaudi.v1.worker.hpu_model_runner as model_runner_module
 from vllm_gaudi.v1.worker.hpu_model_runner import (
     HPUModelRunner,
     HpuModelAdapter,
@@ -400,6 +401,33 @@ def test_update_config(model_runner):
 def test_reload_weights_before_load_model(model_runner):
     with pytest.raises(AssertionError):
         model_runner.reload_weights()
+
+
+def test_tp2_fused_text_only_mm_inputs_defer_embedding(monkeypatch):
+    embedded = []
+    runner = SimpleNamespace(
+        supports_mm_inputs=True,
+        uses_mrope=False,
+        is_mm_embed=SimpleNamespace(copy_to_gpu=lambda _tokens: torch.tensor([], dtype=torch.bool)),
+        attn_backend_name='HPUAttentionBackendV1',
+        model=SimpleNamespace(embed_input_ids=lambda *args, **kwargs: embedded.append((args, kwargs))),
+        _execute_mm_encoder=lambda *_args: None,
+        _gather_mm_embeddings=lambda *_args, **_kwargs: ([], torch.tensor([], dtype=torch.bool)),
+        _extract_mm_kwargs=lambda _scheduler_output: {},
+    )
+    monkeypatch.setattr(model_runner_module, 'get_config', lambda: SimpleNamespace(tp2_fused_ar_norm=True))
+
+    inputs_embeds, model_mm_kwargs = HPUModelRunner._get_model_mm_inputs(
+        runner,
+        torch.tensor([[1, 2, 3]]),
+        3,
+        SimpleNamespace(),
+        ['request'],
+    )
+
+    assert inputs_embeds is None
+    assert model_mm_kwargs == {}
+    assert embedded == []
 
 
 def test_init_kv_cache_with_kv_sharing_invalid_target_layer_order(default_vllm_config: None):

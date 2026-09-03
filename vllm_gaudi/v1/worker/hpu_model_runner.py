@@ -2278,18 +2278,28 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                                 req_ids,
                                                                 total_num_scheduled_tokens=effective_total_tokens,
                                                                 padded_seq_len=padded_seq_len)
+            # Qwen3.5 is registered as multimodal even for text-only requests,
+            # so this path normally materializes ``inputs_embeds`` before the
+            # language model.  The TP2 fused path deliberately leaves the
+            # sharded vocabulary embedding unreduced and consumes it in layer
+            # 0's fused all-reduce/RMSNorm boundary.  Let the language model
+            # perform that embedding when there is no multimodal payload;
+            # otherwise its guard correctly rejects the unsupported mixed
+            # replicated/sharded embedding layout.
+            defer_text_embedding = get_config().tp2_fused_ar_norm and not mm_embeds
             # TODO: Only get embeddings for valid token_ids. Ignore token_ids[<pad_idxs>] # noqa
             # This may require moving multimodal input preps into _prepare_inputs,        # noqa
             # to avoid padding issues.
             htorch.core.mark_step()
-            if self.attn_backend_name == 'HPUAttentionBackendV1' and \
-                token_ids.ndim == 2 and token_ids.shape[0] == 1:
-                token_ids = token_ids.squeeze(0)
-            inputs_embeds = self.model.embed_input_ids(
-                token_ids,
-                multimodal_embeddings=mm_embeds,
-                is_multimodal=is_mm_embed,
-            )
+            if not defer_text_embedding:
+                if self.attn_backend_name == 'HPUAttentionBackendV1' and \
+                    token_ids.ndim == 2 and token_ids.shape[0] == 1:
+                    token_ids = token_ids.squeeze(0)
+                inputs_embeds = self.model.embed_input_ids(
+                    token_ids,
+                    multimodal_embeddings=mm_embeds,
+                    is_multimodal=is_mm_embed,
+                )
 
             model_mm_kwargs = self._extract_mm_kwargs(scheduler_output)
 
