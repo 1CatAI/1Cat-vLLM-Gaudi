@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     VLLM_MINIMAX_M3_MOE_GATHER_MAX_TOKENS: int = 16
     VLLM_MM_WARMUP_OUTSIDE_COMPILE_ONLY: bool = False
     VLLM_HPU_FLASHINFER_GDN: bool = False
+    VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE: bool = False
     VLLM_HPU_FLASHINFER_GDN_PREFILL: bool = False
     VLLM_HPU_GDN_DIRECT_STATE: bool = True
     VLLM_HPU_CGUID_DYNAMIC_QUANT: bool = False
@@ -104,6 +105,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # compile-friendly reference implementation.
     "VLLM_HPU_FLASHINFER_GDN":
     lambda: os.environ.get("VLLM_HPU_FLASHINFER_GDN", "false").strip().lower() in ("1", "true"),
+
+    # Enable the qualified Qwen3.8 TP1 fused direct-state decode recipe. By
+    # default this follows the parent FlashInfer-Gaudi GDN switch.
+    "VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE":
+    lambda: os.environ.get(
+        "VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE",
+        os.environ.get("VLLM_HPU_FLASHINFER_GDN", "false"),
+    ).strip().lower() in ("1", "true"),
 
     # Enable the shape-gated FlashQLA graph tactic for GDN prefill. By
     # default this follows the parent FlashInfer-Gaudi GDN switch.

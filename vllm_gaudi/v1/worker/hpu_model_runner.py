@@ -1449,9 +1449,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # is `g * max_num_reqs + s + 1` (1-based, slot 0 unused).
         # Tensor size: max_num_reqs * num_gdn_groups + 2.
         self._compact_gdn_enabled = os.environ.get("VLLM_COMPACT_GDN", "1").strip().lower() in ("1", "true")
-        self._direct_gdn_state_enabled = (
-            gaudi_envs.VLLM_HPU_FLASHINFER_GDN and gaudi_envs.VLLM_HPU_GDN_DIRECT_STATE
-        )
+        self._direct_gdn_state_enabled = (gaudi_envs.VLLM_HPU_FLASHINFER_GDN and gaudi_envs.VLLM_HPU_GDN_DIRECT_STATE)
         self._compact_gdn_group_ids: set[int] = set()
         self._compact_gdn_group_offset: dict[int, int] = {}  # {group_idx: g_offset}
         self._num_gdn_groups = 0  # set during initialize_kv_cache
@@ -4854,9 +4852,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # transitions before scheduling another batch, then retain normal
             # async overlap for the pure-decode steady state.
             if should_synchronize_hybrid_prefill_output(
-                self.use_async_scheduling,
-                self.num_mamba_like_layers,
-                num_prefills,
+                    self.use_async_scheduling,
+                    self.num_mamba_like_layers,
+                    num_prefills,
             ):
                 return async_output.get_output()
             return async_output
@@ -5084,14 +5082,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 group_size = 1
 
             tensor_parallel_size = self.parallel_config.tensor_parallel_size
-            can_compile_groups = (
-                can_compile_hpu_qwen3_layer_groups(
-                    group_size,
-                    tensor_parallel_size,
-                    module.aux_hidden_state_layers,
-                )
-                and not hasattr(module, "_hpu_compiled_layer_groups")
-            )
+            can_compile_groups = (can_compile_hpu_qwen3_layer_groups(
+                group_size,
+                tensor_parallel_size,
+                module.aux_hidden_state_layers,
+            ) and not hasattr(module, "_hpu_compiled_layer_groups"))
             if can_compile_groups:
                 compiled_groups = compile_hpu_qwen3_layer_groups(module, group_size, self._compile)
                 logger.info(
@@ -5100,10 +5095,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     group_size,
                 )
             elif group_size > 1 and tensor_parallel_size != 1:
-                logger.warning(
-                    "VLLM_HPU_QWEN3_COMPILE_LAYER_GROUP_SIZE is only supported with tensor parallel size 1; "
-                    "using per-layer compilation"
-                )
+                logger.warning("VLLM_HPU_QWEN3_COMPILE_LAYER_GROUP_SIZE is only supported with tensor parallel size 1; "
+                               "using per-layer compilation")
 
         if isinstance(module, torch.nn.ModuleList):
             for children_name, children_module in module.named_children():

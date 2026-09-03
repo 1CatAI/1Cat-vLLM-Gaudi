@@ -14,7 +14,7 @@ import torch.nn.functional as F
 
 from flashinfer_gaudi import clear_backend_policy_override, set_backend_policy
 from flashinfer_gaudi import _native
-from flashinfer_gaudi._reference import packed_recurrent_decode
+from flashinfer_gaudi._reference import packed_recurrent_decode, qwen38_fused_decode_step_direct
 from flashinfer_gaudi.gdn_decode import (
     BackendUnavailableError,
     _call_native_packed,
@@ -23,8 +23,15 @@ from flashinfer_gaudi.gdn_decode import (
     gated_delta_rule_decode_packed,
     gated_delta_rule_decode_pretranspose,
 )
+from flashinfer_gaudi.gdn_fused_decode import gdn_fused_decode_step, gdn_fused_decode_step_supported
 from flashinfer_gaudi.gdn_prefill import chunk_gated_delta_rule
-from vllm_gaudi.ops.flashinfer_gaudi_adapter import maybe_run_gdn_decode_packed, maybe_run_gdn_prefill
+from vllm_gaudi.ops.causal_conv1d_pytorch import hpu_causal_conv1d_update
+from vllm_gaudi.ops.flashinfer_gaudi_adapter import (
+    maybe_run_gdn_decode_packed,
+    maybe_run_gdn_fused_decode_step,
+    maybe_run_gdn_prefill,
+)
+from vllm_gaudi.ops.hpu_gdn_pytorch import hpu_fused_gdn_gating
 
 
 @pytest.fixture(autouse=True)
@@ -212,6 +219,89 @@ def test_k_major_decode_matches_vk_reference():
     assert returned_state is state_kv
     torch.testing.assert_close(output, expected_output)
     torch.testing.assert_close(state_kv, expected_state_vk.transpose(-1, -2))
+
+
+def test_fused_decode_signature_tracks_flashinfer_contract():
+    parameters = inspect.signature(gdn_fused_decode_step).parameters
+    assert tuple(parameters) == (
+        "hidden_states",
+        "w_ba",
+        "mixed_qkv",
+        "conv_weight",
+        "conv_bias",
+        "conv_state",
+        "A_log",
+        "dt_bias",
+        "scale",
+        "ssm_state",
+        "state_indices",
+        "use_qk_l2norm",
+        "out",
+    )
+
+
+def test_fused_decode_support_probe_does_not_promote_reference():
+    assert not gdn_fused_decode_step_supported(1, device="cpu")
+    assert not gdn_fused_decode_step_supported(16, device="cpu")
+    assert not gdn_fused_decode_step_supported(1, hidden_size=4096, device="cpu")
+
+
+def test_fused_decode_updates_live_rows_and_skips_padding():
+    generator = torch.Generator().manual_seed(113)
+    batch, slots = 3, 4
+    hidden_size, qk_heads, value_heads, dim, width = 6, 2, 4, 4, 4
+    qkv_dim = (2 * qk_heads + value_heads) * dim
+    hidden_states = torch.randn(batch, hidden_size, dtype=torch.bfloat16, generator=generator)
+    w_ba = torch.randn(hidden_size, 2 * value_heads, dtype=torch.bfloat16, generator=generator) * 0.1
+    mixed_qkv = torch.randn(batch, qkv_dim, dtype=torch.bfloat16, generator=generator) * 0.1
+    conv_weight = torch.randn(qkv_dim, width, dtype=torch.bfloat16, generator=generator) * 0.1
+    conv_bias = torch.randn(qkv_dim, dtype=torch.bfloat16, generator=generator) * 0.1
+    # Exercise FlashInfer's logical [P,D,S] view over vLLM's physical SD rows.
+    conv_state_sd = torch.randn(slots, width - 1, qkv_dim, dtype=torch.bfloat16, generator=generator) * 0.1
+    ssm_state = torch.randn(slots, value_heads, dim, dim, generator=generator) * 0.1
+    A_log = torch.randn(value_heads, generator=generator) * 0.1
+    dt_bias = torch.randn(value_heads, dtype=torch.bfloat16, generator=generator) * 0.1
+    state_indices = torch.tensor([2, -1, 0], dtype=torch.int32)
+
+    expected_conv = conv_state_sd.clone()
+    expected_ssm = ssm_state.clone()
+    expected, _, _ = gdn_fused_decode_step(
+        hidden_states[[0, 2]],
+        w_ba,
+        mixed_qkv[[0, 2]],
+        conv_weight,
+        conv_bias,
+        expected_conv.transpose(-1, -2),
+        A_log,
+        dt_bias,
+        None,
+        expected_ssm,
+        torch.tensor([2, 0], dtype=torch.int32),
+    )
+
+    output_buffer = torch.empty(batch, 1, value_heads, dim, dtype=torch.bfloat16)
+    actual, returned_conv, returned_ssm = gdn_fused_decode_step(
+        hidden_states,
+        w_ba,
+        mixed_qkv,
+        conv_weight,
+        conv_bias,
+        conv_state_sd.transpose(-1, -2),
+        A_log,
+        dt_bias,
+        0.0,
+        ssm_state,
+        state_indices,
+        out=output_buffer,
+    )
+
+    assert actual is output_buffer
+    assert returned_conv.untyped_storage().data_ptr() == conv_state_sd.untyped_storage().data_ptr()
+    assert returned_ssm is ssm_state
+    torch.testing.assert_close(actual[[0, 2]], expected)
+    torch.testing.assert_close(actual[1], torch.zeros_like(actual[1]))
+    torch.testing.assert_close(conv_state_sd, expected_conv)
+    torch.testing.assert_close(ssm_state, expected_ssm)
 
 
 def test_mtp_signature_tracks_flashinfer_contract():
@@ -554,6 +644,64 @@ def test_qwen38_static_direct_recipe_matches_indexed_reference():
     torch.testing.assert_close(direct_state, indexed_state, atol=2e-5, rtol=2e-4)
 
 
+def test_qwen38_fused_direct_step_matches_existing_decode_chain():
+    generator = torch.Generator().manual_seed(127)
+    batch, q_heads, value_heads, dim = 1, 16, 48, 128
+    packed_width = (2 * q_heads + value_heads) * dim
+    packed = torch.randn(batch, packed_width, dtype=torch.bfloat16, generator=generator) * 0.1
+    a = torch.randn(batch, value_heads, dtype=torch.bfloat16, generator=generator) * 0.1
+    b = torch.randn(batch, value_heads, dtype=torch.bfloat16, generator=generator) * 0.1
+    A_log = torch.randn(value_heads, dtype=torch.float32, generator=generator) * 0.1 - 2.0
+    dt_bias = torch.randn(value_heads, dtype=torch.bfloat16, generator=generator) * 0.1
+    conv_weight = torch.randn(packed_width, 4, dtype=torch.bfloat16, generator=generator) * 0.05
+    expected_conv_state = torch.randn(batch, 3, packed_width, dtype=torch.bfloat16, generator=generator) * 0.1
+    actual_conv_state = expected_conv_state.clone()
+    expected_ssm_state = torch.randn(batch, value_heads, dim, dim, generator=generator) * 0.01
+    actual_ssm_state = expected_ssm_state.clone()
+    scale = dim**-0.5
+
+    log_decay, beta = hpu_fused_gdn_gating(A_log, a, b, dt_bias)
+    convolved = hpu_causal_conv1d_update(
+        x=packed,
+        conv_state=expected_conv_state,
+        weight=conv_weight,
+        bias=None,
+        activation="silu",
+        query_start_loc=torch.arange(batch + 1, dtype=torch.int32),
+        direct_state_layout=True,
+    )
+    expected_output, _ = packed_recurrent_decode(
+        convolved,
+        log_decay,
+        beta,
+        expected_ssm_state,
+        None,
+        None,
+        scale,
+        True,
+        True,
+    )
+
+    actual_output, returned_conv_state, returned_ssm_state = qwen38_fused_decode_step_direct(
+        packed,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        actual_conv_state,
+        conv_weight,
+        None,
+        actual_ssm_state,
+        scale,
+    )
+
+    assert returned_conv_state is actual_conv_state
+    assert returned_ssm_state is actual_ssm_state
+    torch.testing.assert_close(actual_output, expected_output, atol=0, rtol=0)
+    torch.testing.assert_close(actual_conv_state, expected_conv_state, atol=0, rtol=0)
+    torch.testing.assert_close(actual_ssm_state, expected_ssm_state, atol=0, rtol=0)
+
+
 def test_vllm_adapter_leaves_mtp_batches_on_general_path():
     _, _, _, pool, log_decay, beta = _inputs(batch=2)
     packed = torch.randn(4, 64)
@@ -569,6 +717,78 @@ def test_vllm_adapter_leaves_mtp_batches_on_general_path():
             use_qk_l2norm=True,
         )
     assert result is None
+
+
+@pytest.mark.parametrize("batch", [1, 16, 32])
+def test_vllm_adapter_routes_qualified_fused_direct_step_without_conv_bias(batch: int):
+    packed = torch.empty(batch, 10240, dtype=torch.bfloat16)
+    a = torch.empty(batch, 48, dtype=torch.bfloat16)
+    b = torch.zeros_like(a)
+    A_log = torch.zeros(48, dtype=torch.float32)
+    dt_bias = torch.zeros(48, dtype=torch.bfloat16)
+    conv_state = torch.empty(batch, 3, 10240, dtype=torch.bfloat16)
+    conv_weight = torch.zeros(10240, 4, dtype=torch.bfloat16)
+    ssm_state = torch.empty(batch + 2, 48, 128, 128, dtype=torch.float32)
+    load_indices = torch.arange(1, batch + 1, dtype=torch.int32)
+    expected_output = torch.empty(batch, 48, 128, dtype=torch.bfloat16)
+    expected = (expected_output, conv_state, ssm_state.narrow(0, 1, batch))
+
+    with mock.patch.dict(os.environ, {"VLLM_HPU_FLASHINFER_GDN": "1"}), \
+            mock.patch(
+                "vllm_gaudi.ops.flashinfer_gaudi_adapter.qwen38_fused_decode_step_direct",
+                return_value=expected,
+            ) as run:
+        result = maybe_run_gdn_fused_decode_step(
+            packed,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            conv_state,
+            conv_weight,
+            None,
+            ssm_state,
+            load_indices,
+            direct_conv_state=True,
+            direct_gdn_state=True,
+            direct_state_group_count=1,
+            direct_state_group_offset=0,
+            scale=128**-0.5,
+        )
+
+    assert result is not None
+    assert result[0].shape == (1, batch, 48, 128)
+    assert result[1].untyped_storage().data_ptr() == ssm_state.untyped_storage().data_ptr()
+    assert run.call_count == 1
+    assert run.call_args.args[7] is None
+    assert run.call_args.args[8].untyped_storage().data_ptr() == ssm_state.untyped_storage().data_ptr()
+
+
+@pytest.mark.parametrize("batch", [12, 20])
+def test_vllm_adapter_keeps_unqualified_exponential_buckets_on_fallback(batch: int):
+    load_indices = torch.arange(batch, dtype=torch.int32)
+    with mock.patch.dict(os.environ, {"VLLM_HPU_FLASHINFER_GDN": "1"}), \
+            mock.patch("vllm_gaudi.ops.flashinfer_gaudi_adapter.qwen38_fused_decode_step_direct") as run:
+        result = maybe_run_gdn_fused_decode_step(
+            torch.empty(batch, 1),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            None,
+            torch.empty(0),
+            load_indices,
+            direct_conv_state=True,
+            direct_gdn_state=True,
+            direct_state_group_count=1,
+            direct_state_group_offset=0,
+            scale=1.0,
+        )
+
+    assert result is None
+    run.assert_not_called()
 
 
 def test_vllm_adapter_auto_skips_indexed_reference():

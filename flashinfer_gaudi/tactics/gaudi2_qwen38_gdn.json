@@ -16,6 +16,29 @@
   "public_native_promoted": false,
   "public_native_status": "correctness_passed_performance_gate_pending",
   "bridge_native_promoted": false,
+  "gdn_fused_decode": {
+    "promoted": true,
+    "implementation": "qwen38_direct_graph",
+    "model_shape": {
+      "tensor_parallel_size": 1,
+      "key_heads": 16,
+      "value_heads": 48,
+      "key_dim": 128,
+      "value_dim": 128,
+      "packed_qkv_dim": 10240,
+      "conv_width": 4,
+      "batch_buckets": [1, 2, 4, 8, 16, 32],
+      "input_dtype": "bfloat16",
+      "state_dtype": "float32",
+      "state_layout": "VK",
+      "direct_state_layout": true
+    },
+    "tuning": {
+      "static_manual_conv": true,
+      "recurrent_state_update": "out_of_place_then_copy",
+      "regional_graph_group_size": 8
+    }
+  },
   "gdn_prefill": {
     "promoted": true,
     "implementation": "flashqla_graph",

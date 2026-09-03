@@ -5,11 +5,12 @@ from __future__ import annotations
 
 import os
 
-from flashinfer_gaudi import gdn_decode, gdn_prefill
+from flashinfer_gaudi import gdn_decode, gdn_fused_decode, gdn_prefill
 from flashinfer_gaudi._capabilities import get_capabilities
 from flashinfer_gaudi._config import clear_backend_policy_override, set_backend_policy
 from flashinfer_gaudi._native import load_native_extensions
 from flashinfer_gaudi.gdn_prefill import chunk_gated_delta_rule
+from flashinfer_gaudi.gdn_fused_decode import gdn_fused_decode_step, gdn_fused_decode_step_supported
 
 __version__ = "0.1.0"
 FLASHINFER_API_COMPAT = "0.6.18"
@@ -24,6 +25,9 @@ __all__ = [
     "clear_backend_policy_override",
     "chunk_gated_delta_rule",
     "gdn_decode",
+    "gdn_fused_decode",
+    "gdn_fused_decode_step",
+    "gdn_fused_decode_step_supported",
     "gdn_prefill",
     "get_capabilities",
     "load_native_extensions",

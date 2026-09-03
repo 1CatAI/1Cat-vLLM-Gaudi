@@ -81,6 +81,7 @@ def get_experimental_flags():
         Env('VLLM_DEFRAG_WITH_GRAPHS', boolean),
         Env('VLLM_DEBUG', list_of(str), check=for_all(choice('steps', 'defrag', 'fwd'))),
         Env('VLLM_HPU_FLASHINFER_GDN', boolean),
+        Env('VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE', boolean),
         Env('VLLM_HPU_FLASHINFER_GDN_PREFILL', boolean),
         Env('VLLM_HPU_GDN_DIRECT_STATE', boolean),
         Env('VLLM_HPU_CGUID_DYNAMIC_QUANT', boolean),

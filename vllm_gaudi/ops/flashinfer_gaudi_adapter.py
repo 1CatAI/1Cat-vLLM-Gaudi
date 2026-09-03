@@ -6,8 +6,8 @@ from __future__ import annotations
 import torch
 
 from flashinfer_gaudi._config import bridge_auto_enabled, get_backend_policy
-from flashinfer_gaudi._reference import packed_recurrent_decode
-from flashinfer_gaudi._tactics import gdn_prefill_tactic, public_gdn_auto_promoted
+from flashinfer_gaudi._reference import packed_recurrent_decode, qwen38_fused_decode_step_direct
+from flashinfer_gaudi._tactics import gdn_fused_decode_tactic, gdn_prefill_tactic, public_gdn_auto_promoted
 from flashinfer_gaudi.gdn_decode import gated_delta_rule_decode_packed
 from flashinfer_gaudi.gdn_prefill import _chunk_gated_delta_rule_log_gate
 from vllm_gaudi import envs
@@ -16,6 +16,10 @@ _BACKEND_POLICY = get_backend_policy()
 _PUBLIC_AUTO_PROMOTED = public_gdn_auto_promoted()
 _BRIDGE_AUTO_ENABLED = bridge_auto_enabled()
 _GDN_PREFILL_TACTIC = gdn_prefill_tactic()
+_GDN_FUSED_DECODE_TACTIC = gdn_fused_decode_tactic()
+_GDN_FUSED_DECODE_MODEL_SHAPE = _GDN_FUSED_DECODE_TACTIC.get("model_shape", {})
+_GDN_FUSED_DECODE_BATCHES = frozenset(
+    _GDN_FUSED_DECODE_MODEL_SHAPE.get("batch_buckets", ()) if isinstance(_GDN_FUSED_DECODE_MODEL_SHAPE, dict) else ())
 
 
 def flashinfer_gdn_enabled() -> bool:
@@ -26,6 +30,11 @@ def flashinfer_gdn_enabled() -> bool:
 def flashinfer_gdn_prefill_enabled() -> bool:
     """Return whether the promoted GDN prefill tactic is enabled."""
     return envs.VLLM_HPU_FLASHINFER_GDN_PREFILL and bool(_GDN_PREFILL_TACTIC.get("promoted", False))
+
+
+def flashinfer_gdn_fused_decode_enabled() -> bool:
+    """Return whether the qualified fused direct-state recipe is enabled."""
+    return envs.VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE and bool(_GDN_FUSED_DECODE_TACTIC.get("promoted", False))
 
 
 def maybe_run_gdn_prefill(
@@ -177,9 +186,78 @@ def maybe_run_gdn_decode_packed(
     return output.unsqueeze(0), updated_pool
 
 
+def maybe_run_gdn_fused_decode_step(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor | None,
+    ssm_state: torch.Tensor | None,
+    load_state_indices: torch.Tensor | None,
+    *,
+    direct_conv_state: bool,
+    direct_gdn_state: bool,
+    direct_state_group_count: int | None,
+    direct_state_group_offset: int | None,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Run the qualified Qwen3.8 fused direct-state decode composition."""
+    use_reference = _BACKEND_POLICY == "pytorch" or (_BACKEND_POLICY == "auto" and not _PUBLIC_AUTO_PROMOTED
+                                                     and not _BRIDGE_AUTO_ENABLED)
+    if (not flashinfer_gdn_enabled() or not flashinfer_gdn_fused_decode_enabled() or not use_reference
+            or ssm_state is None or load_state_indices is None):
+        return None
+    if not direct_conv_state or not direct_gdn_state:
+        return None
+    if direct_state_group_count is None or direct_state_group_count <= 0 or direct_state_group_offset is None:
+        return None
+    batch = mixed_qkv.shape[0]
+    if batch != load_state_indices.numel() or batch not in _GDN_FUSED_DECODE_BATCHES:
+        return None
+    if (mixed_qkv.dtype != torch.bfloat16 or a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16
+            or tuple(mixed_qkv.shape[1:]) != (10240, ) or tuple(a.shape) != (batch, 48)
+            or tuple(b.shape) != (batch, 48)):
+        return None
+    if (tuple(conv_state.shape) != (batch, 3, 10240) or conv_state.dtype != torch.bfloat16
+            or tuple(conv_weight.shape) != (10240, 4) or conv_weight.dtype != torch.bfloat16):
+        return None
+    if conv_bias is not None and (tuple(conv_bias.shape) != (10240, ) or conv_bias.dtype != torch.bfloat16):
+        return None
+    if (tuple(A_log.shape) != (48, ) or tuple(dt_bias.shape) != (48, ) or A_log.dtype != torch.float32
+            or dt_bias.dtype != torch.bfloat16):
+        return None
+
+    group_span = (ssm_state.shape[0] - 2) // direct_state_group_count
+    if batch > group_span or not 0 <= direct_state_group_offset < direct_state_group_count:
+        return None
+    state_start = direct_state_group_offset * group_span + 1
+    selected_ssm_state = ssm_state.narrow(0, state_start, batch)
+    if tuple(selected_ssm_state.shape) != (batch, 48, 128, 128) or selected_ssm_state.dtype != torch.float32:
+        return None
+
+    output, _, updated_state = qwen38_fused_decode_step_direct(
+        mixed_qkv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        conv_state,
+        conv_weight,
+        conv_bias,
+        selected_ssm_state,
+        scale,
+    )
+    return output.unsqueeze(0), updated_state
+
+
 __all__ = [
     "flashinfer_gdn_enabled",
+    "flashinfer_gdn_fused_decode_enabled",
     "flashinfer_gdn_prefill_enabled",
     "maybe_run_gdn_decode_packed",
+    "maybe_run_gdn_fused_decode_step",
     "maybe_run_gdn_prefill",
 ]

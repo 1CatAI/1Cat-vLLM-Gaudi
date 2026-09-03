@@ -10,7 +10,9 @@ public Python surface follows FlashInfer 0.6.18 for `chunk_gated_delta_rule`,
 `gated_delta_rule_decode` (KV/K-major state), and `gated_delta_rule_mtp`
 (pooled multi-token decode). The implementation keeps a compile-friendly
 reference for the portable contract and provides dispatch points for public
-TPC custom kernels and an optional version-locked bridge backend.
+TPC custom kernels and an optional version-locked bridge backend. The public
+surface also includes FlashInfer 0.6.18's `gdn_fused_decode_step` and its
+support probe.
 
 Enable the vLLM adapter with:
 
@@ -87,6 +89,14 @@ It normalizes packed Q/K together with an explicit reciprocal-square-root
 form and uses `addcmul` for the FP32 rank-one state update. Other shapes keep
 the general FlashInfer-compatible implementation.
 
+For Qwen3.8-27B TP1 decode batches 1, 2, 4, 8, 16, and 32, the fused direct-state
+recipe additionally combines gating, the static width-4 convolution update,
+and packed recurrence in one compile graph. Recurrent projections stay on MME,
+and the recurrent state update retains the regional-graph-friendly
+out-of-place ordering before copying into the owned contiguous cache view. Set
+`VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE=0` to disable this recipe independently
+while keeping the remaining FlashInfer-Gaudi route.
+
 The first native Gaudi2 GUID specializes Qwen3.8 decode (`H=16`, `HV=48`,
 `K=V=128`) with packed BF16 Q/K/V and beta, BF16 output, FP32 recurrent state,
 grouped Q/K reuse, negative-index padding, and in-place pooled-state updates.
@@ -150,6 +160,18 @@ python3 tools/benchmark_flashinfer_gaudi_decode_conv.py \
   --batches 1,8,16,32 --warmups 100 \
   --wave-iterations 500 --waves 15
 ```
+
+Compare fused decode candidates against the exact current Qwen3.8 chain with:
+
+```bash
+python3 tools/benchmark_flashinfer_gaudi_gdn_fused_decode.py \
+  --batches 1,2,4,8,12,16,20,32 --warmups 50 \
+  --wave-iterations 750 --waves 16
+```
+
+The default matrix deliberately includes the exponential strategy's B12 and
+B20 decode buckets. They remain on the established fallback until separate
+operator and end-to-end measurements qualify them for the fused recipe.
 
 `device_speedup` uses HPU events around an interleaved multi-iteration wave
 and is the promotion metric for kernel execution. `median_speedup` includes a

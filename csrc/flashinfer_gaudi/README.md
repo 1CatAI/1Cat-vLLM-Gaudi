@@ -16,4 +16,3 @@ python3 tools/build_flashinfer_gaudi.py
 The build requires the Gaudi TPC compiler, the PyTorch Gaudi bridge headers,
 and the same Gaudi software version used at runtime. The optional bridge
 backend is intentionally separate from this stable public-CustomOp path.
-

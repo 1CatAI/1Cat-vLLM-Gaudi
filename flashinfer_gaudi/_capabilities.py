@@ -31,6 +31,14 @@ def get_capabilities() -> dict[str, object]:
             "separate_load_store_indices": True,
             "intermediate_mtp_states": True,
         },
+        "gdn_fused_decode": {
+            "reference": True,
+            "specialized": False,
+            "registered_batches": (),
+            "vllm_direct_recipe": True,
+            "vllm_direct_recipe_batches": (1, 2, 4, 8, 16, 32),
+            "conv_state_layouts": ("SD", "DS"),
+        },
         "gdn_prefill": {
             "reference": True,
             "flashqla_graph": True,

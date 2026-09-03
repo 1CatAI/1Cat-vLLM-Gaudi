@@ -17,7 +17,11 @@ from vllm_gaudi.ops.hpu_gdn_pytorch import (
     resolve_hpu_gdn_neumann_iters,
     resolve_hpu_gdn_recursive_solver_base,
 )
-from vllm_gaudi.ops.flashinfer_gaudi_adapter import maybe_run_gdn_decode_packed, maybe_run_gdn_prefill
+from vllm_gaudi.ops.flashinfer_gaudi_adapter import (
+    maybe_run_gdn_decode_packed,
+    maybe_run_gdn_fused_decode_step,
+    maybe_run_gdn_prefill,
+)
 
 
 def _save_ssm_state(core_attn_out, final_state, ssm_state, state_indices):
@@ -142,8 +146,8 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 initial_state = initial_state * mask
 
         return (is_prompt, conv_state, ssm_state, load_state_indices, store_state_indices, query_start_loc,
-                has_initial_state, padding_mask_flat, num_decodes, mamba_block_size, prefill_num_seqs,
-                prefill_seq_len, initial_state, direct_gdn_state)
+                has_initial_state, padding_mask_flat, num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len,
+                initial_state, direct_gdn_state)
 
     def forward(
         self,
@@ -164,9 +168,9 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         num_tokens = hidden_states.size(0)
 
         # === Metadata extraction (natural graph break) ===============
-        (is_prompt, conv_state, ssm_state, load_state_indices, store_state_indices, query_start_loc,
-         has_initial_state, padding_mask_flat, num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len,
-         initial_state, direct_gdn_state) = self._extract_metadata(num_tokens)
+        (is_prompt, conv_state, ssm_state, load_state_indices, store_state_indices, query_start_loc, has_initial_state,
+         padding_mask_flat, num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len, initial_state,
+         direct_gdn_state) = self._extract_metadata(num_tokens)
 
         # === Part 1: Input Projection ================================
         if hasattr(self, 'in_proj_qkv'):
@@ -296,12 +300,10 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         else:
             # === Part 2b: Decode =====================================
-            g, beta = hpu_fused_gdn_gating(self.A_log, a, b, self.dt_bias)
-
             selected_conv_state = conv_state
             direct_conv_state = False
-            if (direct_gdn_state and self.compact_state_group_count is not None
-                    and self.compact_state_group_count > 0 and self.compact_state_group_offset is not None):
+            if (direct_gdn_state and self.compact_state_group_count is not None and self.compact_state_group_count > 0
+                    and self.compact_state_group_offset is not None):
                 group_span = (conv_state.shape[0] - 2) // self.compact_state_group_count
                 if num_decodes <= group_span:
                     state_start = self.compact_state_group_offset * group_span + 1
@@ -311,48 +313,68 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 self.conv1d.weight.size(0),
                 self.conv1d.weight.size(2),
             )
-            mixed_qkv_conv = hpu_causal_conv1d_update(
-                x=mixed_qkv,
+            flashinfer_result = maybe_run_gdn_fused_decode_step(
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
                 conv_state=selected_conv_state,
-                weight=conv_weights,
-                bias=self.conv1d.bias,
-                activation=self.activation,
-                conv_state_indices=(None if direct_conv_state else (
-                    load_state_indices[:num_decodes] if load_state_indices is not None else load_state_indices)),
-                block_idx_last_scheduled_token=None,
-                initial_state_idx=None,
-                query_start_loc=query_start_loc,
-                validate_data=False,
-                direct_state_layout=direct_conv_state,
-            )
-
-            flashinfer_result = maybe_run_gdn_decode_packed(
-                mixed_qkv=mixed_qkv_conv,
-                log_decay=g,
-                beta=beta,
-                state_pool=ssm_state,
+                conv_weight=conv_weights,
+                conv_bias=self.conv1d.bias,
+                ssm_state=ssm_state,
                 load_state_indices=load_state_indices,
-                store_state_indices=store_state_indices,
-                use_qk_l2norm=True,
-                scale=self.head_k_dim**-0.5,
-                direct_state_layout=direct_gdn_state,
+                direct_conv_state=direct_conv_state,
+                direct_gdn_state=direct_gdn_state,
                 direct_state_group_count=self.compact_state_group_count,
                 direct_state_group_offset=self.compact_state_group_offset,
+                scale=self.head_k_dim**-0.5,
             )
+            if flashinfer_result is None:
+                g, beta = hpu_fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+                mixed_qkv_conv = hpu_causal_conv1d_update(
+                    x=mixed_qkv,
+                    conv_state=selected_conv_state,
+                    weight=conv_weights,
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                    conv_state_indices=(None if direct_conv_state else (
+                        load_state_indices[:num_decodes] if load_state_indices is not None else load_state_indices)),
+                    block_idx_last_scheduled_token=None,
+                    initial_state_idx=None,
+                    query_start_loc=query_start_loc,
+                    validate_data=False,
+                    direct_state_layout=direct_conv_state,
+                )
+                flashinfer_result = maybe_run_gdn_decode_packed(
+                    mixed_qkv=mixed_qkv_conv,
+                    log_decay=g,
+                    beta=beta,
+                    state_pool=ssm_state,
+                    load_state_indices=load_state_indices,
+                    store_state_indices=store_state_indices,
+                    use_qk_l2norm=True,
+                    scale=self.head_k_dim**-0.5,
+                    direct_state_layout=direct_gdn_state,
+                    direct_state_group_count=self.compact_state_group_count,
+                    direct_state_group_offset=self.compact_state_group_offset,
+                )
+                if flashinfer_result is None:
+                    query, key, value = self.rearrange_mixed_qkv(mixed_qkv_conv)
+                    core_attn_out_result, _ = hpu_fused_recurrent_gated_delta_rule(
+                        q=query,
+                        k=key,
+                        v=value,
+                        g=g,
+                        beta=beta,
+                        initial_state=ssm_state,
+                        inplace_final_state=True,
+                        cu_seqlens=(query_start_loc[:num_decodes + 1] if query_start_loc is not None else None),
+                        ssm_state_indices=load_state_indices,
+                        use_qk_l2norm_in_kernel=True,
+                    )
             if flashinfer_result is not None:
                 core_attn_out_result, _ = flashinfer_result
-            else:
-                query, key, value = self.rearrange_mixed_qkv(mixed_qkv_conv)
-                core_attn_out_result, _ = hpu_fused_recurrent_gated_delta_rule(
-                    q=query, k=key, v=value, g=g, beta=beta,
-                    initial_state=ssm_state,
-                    inplace_final_state=True,
-                    cu_seqlens=(
-                        query_start_loc[:num_decodes + 1]
-                        if query_start_loc is not None else None),
-                    ssm_state_indices=load_state_indices,
-                    use_qk_l2norm_in_kernel=True,
-                )
 
             non_spec_out = core_attn_out_result.squeeze(0)
             if non_spec_out.shape[0] == core_attn_out.shape[0]:

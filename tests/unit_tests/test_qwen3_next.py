@@ -94,14 +94,13 @@ def test_can_compile_hpu_qwen3_layer_groups(
 @pytest.mark.parametrize(
     ("layer_groups", "aux_layers", "attn_metadata", "batch_size", "expected"),
     [
-        ((HpuQwen3DecoderLayerGroup(tuple()),), [], SimpleNamespace(is_prompt=False), 16, True),
-        ((HpuQwen3DecoderLayerGroup(tuple()),), [], SimpleNamespace(is_prompt=False), 17, False),
-        ((HpuQwen3DecoderLayerGroup(tuple()),), [], SimpleNamespace(is_prompt=False, direct_gdn_state=True), 32,
-         True),
-        ((HpuQwen3DecoderLayerGroup(tuple()),), [], SimpleNamespace(is_prompt=True), 1, False),
-        ((HpuQwen3DecoderLayerGroup(tuple()),), [1], SimpleNamespace(is_prompt=False), 1, False),
+        ((HpuQwen3DecoderLayerGroup(tuple()), ), [], SimpleNamespace(is_prompt=False), 16, True),
+        ((HpuQwen3DecoderLayerGroup(tuple()), ), [], SimpleNamespace(is_prompt=False), 17, False),
+        ((HpuQwen3DecoderLayerGroup(tuple()), ), [], SimpleNamespace(is_prompt=False, direct_gdn_state=True), 32, True),
+        ((HpuQwen3DecoderLayerGroup(tuple()), ), [], SimpleNamespace(is_prompt=True), 1, False),
+        ((HpuQwen3DecoderLayerGroup(tuple()), ), [1], SimpleNamespace(is_prompt=False), 1, False),
         (None, [], SimpleNamespace(is_prompt=False), 1, False),
-        ((HpuQwen3DecoderLayerGroup(tuple()),), [], None, 1, False),
+        ((HpuQwen3DecoderLayerGroup(tuple()), ), [], None, 1, False),
     ],
 )
 def test_can_use_hpu_qwen3_layer_groups(layer_groups, aux_layers, attn_metadata, batch_size, expected):

@@ -237,10 +237,55 @@ def _direct_qwen38_single_token_packed_decode(
     delta = (value_work - projection) * beta_work
     updated_state = torch.addcmul(decayed_state, delta.unsqueeze(-1), k_grouped.unsqueeze(-2))
     output = torch.matmul(updated_state, (q_work.unsqueeze(2) * scale).unsqueeze(-1)).squeeze(-1)
-
     state_pool.copy_(updated_state.reshape_as(state_pool))
+
     output = output.reshape(batch, _QWEN38_VALUE_HEADS, _QWEN38_DIM).to(packed_qkv.dtype)
     return output, state_pool
+
+
+def qwen38_fused_decode_step_direct(
+    packed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor | None,
+    ssm_state: torch.Tensor,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse the static Qwen3.8 direct-state decode composition.
+
+    MME continues to execute the two recurrent projections.  This function
+    removes generic convolution/indexing scaffolding while retaining the
+    proven recurrent-state update order used by grouped regional graphs.
+    """
+    gate_input = a.to(torch.float32) + dt_bias.to(torch.float32)
+    softplus = torch.where(gate_input <= 20.0, torch.log1p(torch.exp(gate_input)), gate_input)
+    log_decay = -torch.exp(A_log.to(torch.float32)) * softplus
+    beta = torch.sigmoid(b.to(torch.float32)).to(b.dtype)
+
+    weights = conv_weight.to(torch.float32)
+    convolved = conv_state[:, 0, :] * weights[:, 0]
+    convolved = convolved + conv_state[:, 1, :] * weights[:, 1]
+    convolved = convolved + conv_state[:, 2, :] * weights[:, 2]
+    convolved = convolved + packed_qkv * weights[:, 3]
+    if conv_bias is not None:
+        convolved = convolved + conv_bias.to(torch.float32)
+    convolved = convolved.to(torch.bfloat16)
+    convolved = F.silu(convolved)
+    conv_state.copy_(torch.cat((conv_state[:, 1:, :], packed_qkv.unsqueeze(1)), dim=1))
+
+    output, _ = _direct_qwen38_single_token_packed_decode(
+        convolved,
+        log_decay,
+        beta,
+        ssm_state,
+        scale,
+        True,
+    )
+    return output, conv_state, ssm_state
 
 
 def recurrent_decode_from_qkv(

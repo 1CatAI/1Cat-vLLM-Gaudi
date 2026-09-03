@@ -29,5 +29,11 @@ def gdn_prefill_tactic() -> dict[str, object]:
     return dict(value) if isinstance(value, dict) else {}
 
 
+def gdn_fused_decode_tactic() -> dict[str, object]:
+    """Return the offline-promoted Gaudi2 fused GDN decode tactic."""
+    value = _manifest().get("gdn_fused_decode")
+    return dict(value) if isinstance(value, dict) else {}
+
+
 def tactic_manifest() -> dict[str, object]:
     return dict(_manifest())
