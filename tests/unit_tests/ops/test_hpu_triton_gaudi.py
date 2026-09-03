@@ -124,6 +124,45 @@ def test_hybrid_fused_add_rms_norm_records_non_hpu_fallback(monkeypatch: pytest.
     assert runtime.diagnostics()["counters"] == {"fallback.fused_add_rms_norm.non_hpu_tensor": 1}
 
 
+def test_eager_hybrid_fused_add_rms_norm_keeps_candidate_on_vendor_path(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "hybrid")
+
+    class FakeHpuTensor:
+        device = torch.device("hpu")
+        ndim = 2
+        shape = (8, 5120)
+        dtype = torch.bfloat16
+
+        @staticmethod
+        def numel():
+            return 8 * 5120
+
+        @staticmethod
+        def is_contiguous():
+            return True
+
+    class FakeHpuWeight(FakeHpuTensor):
+        ndim = 1
+        shape = (5120,)
+
+        @staticmethod
+        def numel():
+            return 5120
+
+    hidden = FakeHpuTensor()
+    assert runtime.fused_add_rms_norm(
+        hidden,
+        FakeHpuTensor(),
+        FakeHpuWeight(),
+        1.0e-6,
+    ) is None
+    assert runtime.diagnostics()["counters"] == {
+        "vendor.fused_add_rms_norm.performance_gate": 1,
+    }
+
+
 def test_strict_fused_add_rms_norm_rejects_non_hpu_tensor(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "strict")
     hidden = torch.zeros(2, 8, dtype=torch.bfloat16)
@@ -355,6 +394,31 @@ def test_hybrid_silu_and_mul_records_non_hpu_fallback(monkeypatch: pytest.Monkey
 
     assert result is None
     assert runtime.diagnostics()["counters"] == {"fallback.silu_and_mul.non_hpu_tensor": 1}
+
+
+def test_eager_hybrid_silu_and_mul_keeps_candidate_on_vendor_path(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "hybrid")
+
+    class FakeHpuTensor:
+        device = torch.device("hpu")
+        ndim = 2
+        shape = (8, 34816)
+        dtype = torch.bfloat16
+
+        @staticmethod
+        def numel():
+            return 8 * 34816
+
+        @staticmethod
+        def is_contiguous():
+            return True
+
+    assert runtime.silu_and_mul(FakeHpuTensor()) is None
+    assert runtime.diagnostics()["counters"] == {
+        "vendor.silu_and_mul.performance_gate": 1,
+    }
 
 
 def test_strict_silu_and_mul_rejects_non_hpu_tensor(monkeypatch: pytest.MonkeyPatch):
@@ -689,6 +753,20 @@ def test_hybrid_split_gdn_decode_keeps_small_batch_on_vendor_path(
     }
 
 
+def test_hybrid_split_gdn_decode_keeps_large_batch_on_vendor_path(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "hybrid")
+
+    result = runtime.gdn_decode_conv_split_packed(
+        *_cpu_gdn_conv_inputs(batch=32))
+
+    assert result is None
+    assert runtime.diagnostics()["counters"] == {
+        "vendor.gdn_decode_conv_split_packed.performance_gate": 1,
+    }
+
+
 def test_hybrid_split_gdn_decode_falls_back_for_invalid_large_batch(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -713,3 +791,31 @@ def test_strict_split_gdn_decode_rejects_non_hpu_tensor(
         match="gdn_decode_conv_split_packed: non_hpu_tensor",
     ):
         runtime.gdn_decode_conv_split_packed(*_cpu_gdn_conv_inputs(batch=8))
+
+
+def test_compile_strict_split_gdn_rejects_unsafe_graph_batch(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "strict")
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(runtime, "_prepared", True)
+    monkeypatch.setattr(runtime, "_available", True)
+
+    with pytest.raises(
+        runtime.FastPathUnavailable,
+        match="unsupported_graph_batch",
+    ):
+        runtime.gdn_decode_conv_split_packed(
+            *_cpu_gdn_conv_inputs(batch=12))
+
+
+def test_bridge_pass_api_requires_gdn_reinplace():
+    from vllm_gaudi.ops.triton_gaudi import fusion
+
+    incomplete = SimpleNamespace(
+        OptimizationPassPlacement=object(),
+        register_pass_at_optimization_pass=lambda *args: None,
+    )
+
+    with pytest.raises(RuntimeError, match="pass_reinplace_triton_gaudi_gdn_decode"):
+        fusion._validate_bridge_pass_api(incomplete)

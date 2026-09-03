@@ -80,8 +80,8 @@ any tested shape below 0.95x. Fullgraph compilation is the default comparison;
 use `--eager` only for the diagnostic operator-level comparison.
 
 Packed Qwen3.5 GDN decode uses the split causal-conv + recurrent fast path in
-`hybrid` for decode batches of at least eight; smaller batches retain the
-vendor graph. Weight loading materializes the TPC-friendly transposed
+`hybrid` only for the batch-eight decode bucket; smaller and larger buckets
+retain the vendor graph. Weight loading materializes the TPC-friendly transposed
 convolution weights and an FP32 decay-bias view once, so the compiled decode
 graph does not pay a transpose or dtype-conversion cost. The graph-native path
 has cleared the batch-eight full-model gate and preserves the vendor output
@@ -91,8 +91,11 @@ validates the BF16 output, FP32 recurrent state, and BF16 convolution state
 before reporting speedup. Because a two-node micrograph can become host-submit
 bound, hybrid rollout is decided by the full-model gate rather than that
 standalone timing alone. `strict` also exposes the smaller-batch and
-recurrent-only kernels for correctness and tuning CI. SiLU-and-mul remains a
-strict-mode candidate.
+recurrent-only kernels for correctness and tuning CI, but compiled split GDN
+fails closed outside the graph-validated batch buckets. A complete Gaudi Bridge
+installation must include the GDN reinplace compiler pass; initialization
+rejects stale Python package overlays instead of running the functionalized
+full-cache-copy graph. SiLU-and-mul remains a strict-mode candidate.
 
 Use `VLLM_BUCKETING_STRATEGY=exp` for the default exponential warm-up, `VLLM_BUCKETING_STRATEGY=lin` for explicitly configured linear ranges, or `VLLM_BUCKETING_STRATEGY=pad` for padding-aware ranges with absolute and relative padding limits.
 

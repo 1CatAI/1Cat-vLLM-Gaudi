@@ -34,10 +34,12 @@ _mode_value: FastPathMode | None = None
 _warned: set[str] = set()
 _counters: Counter[str] = Counter()
 
-# The split causal-conv + GDN path is enabled in hybrid only for decode batch
-# sizes at or above eight. Gaudi2 fullgraph A/B keeps the two launches behind
-# the performance gate for small batches, where fixed launch cost dominates.
-_GDN_CONV_SPLIT_MIN_BATCH = 8
+# The split causal-conv + GDN path currently wins end-to-end only for the
+# batch-eight decode bucket. Larger buckets lose to the vendor graph, while
+# non-power-of-two graph geometries do not yet preserve every conv-cache
+# mutation. Keep hybrid Pareto-safe and strict graph execution fail-closed.
+_GDN_CONV_SPLIT_HYBRID_BATCH = 8
+_GDN_CONV_SPLIT_GRAPH_BATCHES = frozenset((1, 8, 32))
 _DYNAMIC_QUANT_MAX_ROWS = 32
 _SILU_DYNAMIC_QUANT_MAX_COLS = 4096
 
@@ -226,12 +228,16 @@ def fused_add_rms_norm(
 
         return launch_fused_add_rms_norm(hidden_states, residual, weight, float(epsilon))
 
-    if _mode() is FastPathMode.OFF:
+    mode = _mode()
+    if mode is FastPathMode.OFF:
         _counters["vendor.fused_add_rms_norm.off"] += 1
         return None
     rejection_reason = _fused_add_rms_norm_rejection_reason(hidden_states, residual, weight)
     if rejection_reason is not None:
         return _reject_fused_add_rms_norm(rejection_reason)
+    if mode is FastPathMode.HYBRID:
+        _counters["vendor.fused_add_rms_norm.performance_gate"] += 1
+        return None
     if not prepare_if_enabled():
         return _reject_fused_add_rms_norm("initialization")
 
@@ -484,12 +490,16 @@ def silu_and_mul(input_tensor: "torch.Tensor") -> "torch.Tensor" | None:
 
         return launch_silu_and_mul(input_tensor)
 
-    if _mode() is FastPathMode.OFF:
+    mode = _mode()
+    if mode is FastPathMode.OFF:
         _counters["vendor.silu_and_mul.off"] += 1
         return None
     rejection_reason = _silu_and_mul_rejection_reason(input_tensor)
     if rejection_reason is not None:
         return _reject_silu_and_mul(rejection_reason)
+    if mode is FastPathMode.HYBRID:
+        _counters["vendor.silu_and_mul.performance_gate"] += 1
+        return None
     if not prepare_if_enabled():
         return _reject_silu_and_mul("initialization")
 
@@ -850,9 +860,14 @@ def gdn_decode_conv_split_packed(
         compile_mode = _compile_fast_path_mode()
         if compile_mode == FastPathMode.OFF.value:
             return None
+        batch = packed_qkv.shape[0]
         if (compile_mode == FastPathMode.HYBRID.value and
-                packed_qkv.shape[0] < _GDN_CONV_SPLIT_MIN_BATCH):
+                batch != _GDN_CONV_SPLIT_HYBRID_BATCH):
             return None
+        if batch not in _GDN_CONV_SPLIT_GRAPH_BATCHES:
+            raise FastPathUnavailable(
+                "Gaudi Triton strict mode rejected "
+                "gdn_decode_conv_split_packed: unsupported_graph_batch")
         rejection_reason = _gdn_decode_conv_packed_rejection_reason(
             conv_state,
             state_cache,
@@ -892,7 +907,7 @@ def gdn_decode_conv_split_packed(
         _counters["vendor.gdn_decode_conv_split_packed.off"] += 1
         return None
     if (mode is FastPathMode.HYBRID and
-            packed_qkv.shape[0] < _GDN_CONV_SPLIT_MIN_BATCH):
+            packed_qkv.shape[0] != _GDN_CONV_SPLIT_HYBRID_BATCH):
         _counters[
             "vendor.gdn_decode_conv_split_packed.performance_gate"] += 1
         return None

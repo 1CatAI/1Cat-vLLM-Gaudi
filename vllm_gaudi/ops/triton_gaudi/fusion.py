@@ -16,6 +16,24 @@ _registered = False
 _MISSING = object()
 
 
+def _validate_bridge_pass_api(passes_module: Any) -> tuple[Any, Any]:
+    required = (
+        "OptimizationPassPlacement",
+        "register_pass_at_optimization_pass",
+        "pass_reinplace_triton_gaudi_gdn_decode",
+    )
+    missing = [name for name in required if not hasattr(passes_module, name)]
+    if missing:
+        raise RuntimeError(
+            "Gaudi Bridge is missing required hpu_backend passes: "
+            + ", ".join(missing)
+        )
+    return (
+        passes_module.OptimizationPassPlacement,
+        passes_module.register_pass_at_optimization_pass,
+    )
+
+
 def _resolve_triton_ops() -> tuple[Any, Any, Any]:
     try:
         return (
@@ -148,13 +166,15 @@ def register_silu_dynamic_quant_fusion_pass() -> None:
             return
         _resolve_triton_ops()
         try:
-            from habana_frameworks.torch.dynamo.compile_backend.passes import (
-                OptimizationPassPlacement,
-                register_pass_at_optimization_pass,
+            from habana_frameworks.torch.dynamo.compile_backend import (
+                passes as bridge_passes,
             )
-        except (AttributeError, ImportError) as exc:
+            OptimizationPassPlacement, register_pass_at_optimization_pass = (
+                _validate_bridge_pass_api(bridge_passes)
+            )
+        except (AttributeError, ImportError, RuntimeError) as exc:
             raise RuntimeError(
-                "Gaudi Bridge does not expose custom hpu_backend pass registration"
+                "Gaudi Bridge does not expose the required hpu_backend pass API"
             ) from exc
         register_pass_at_optimization_pass(
             pass_fuse_triton_gaudi_silu_dynamic_quant,
