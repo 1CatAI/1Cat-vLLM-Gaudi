@@ -893,7 +893,10 @@ def apply_model_specific_patches(model_runner):
     patch_llama4_get_attn_scale(model_runner.model)
     _init_mamba_split_weights(model_runner.model)
     from vllm_gaudi.models.llama4 import (apply_hpu_llama4_post_load_patches, is_hpu_llama4_model)
-    from vllm_gaudi.models.qwen3_next import apply_hpu_qwen3_residual_fix
+    from vllm_gaudi.models.qwen3_next import (
+        apply_hpu_qwen3_residual_fix,
+        enable_hpu_qwen3_tp2_fused_ar_norm,
+    )
 
     is_llama4 = is_hpu_llama4_model(model_runner.model)
     model_type = getattr(model_runner.vllm_config.model_config.hf_config, "model_type", "")
@@ -905,6 +908,14 @@ def apply_model_specific_patches(model_runner):
         apply_hpu_llama4_post_load_patches(model_runner.model)
     if is_qwen_moe:
         apply_hpu_qwen3_residual_fix(model_runner.model)
+        if get_config().tp2_fused_ar_norm:
+            fused_boundaries = enable_hpu_qwen3_tp2_fused_ar_norm(model_runner.model)
+            if fused_boundaries == 0:
+                raise RuntimeError("VLLM_HPU_TP2_FUSED_AR_NORM requires a dense Qwen3.5/Qwen3-Next TP2 model")
+            logger.info(
+                "Enabled %d TP2 all-reduce/residual/RMSNorm boundaries",
+                fused_boundaries,
+            )
 
 
 def compute_prefix_caching_block_indices(num_reqs: int, num_computed_tokens, num_scheduled_tokens,
@@ -1099,6 +1110,11 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
 
     def compute_logits(self, *args, **kwargs):
         return self.model.compute_logits(*args, **kwargs)
+
+    def select_and_compute_logits(self, hidden_states, logits_indices):
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        hidden_states = hidden_states[logits_indices]
+        return hidden_states, self.model.compute_logits(hidden_states)
 
     # def sample(self, *args, **kwargs):
     #    return self.sampler(*args, **kwargs)
@@ -3769,14 +3785,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             non_flattened_hidden_states = hidden_states
             aux_hidden_states = None
 
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        hidden_states = hidden_states[logits_indices]
         LoraMask.setLoraMask(lora_logits_mask)
         with self.profiler.record_event('internal', ('compute_logits'
                                                      f'{batch_size}_'
                                                      f'seq{seq_len}_ctx'
                                                      f'{num_blocks}')):
-            logits = self.model.compute_logits(hidden_states)
+            hidden_states, logits = self.model.select_and_compute_logits(hidden_states, logits_indices)
         return non_flattened_hidden_states, aux_hidden_states, \
             hidden_states, logits
 
@@ -5056,6 +5070,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             'metadata_processor.process_metadata',
             '_rotary_prepare_cos_sin',
             'compute_logits',
+            'select_and_compute_logits',
         ]
         for method_name in compiled_methods:
             method = getattr_nested(self.model, method_name, None)
@@ -5071,8 +5086,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         """
         from vllm_gaudi.models.qwen3_next import (
             HpuQwen3NextModel,
-            can_compile_hpu_qwen3_layer_groups,
             compile_hpu_qwen3_layer_groups,
+            supports_hpu_qwen3_layer_group_compilation,
         )
 
         if isinstance(module, HpuQwen3NextModel):
@@ -5082,21 +5097,30 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 group_size = 1
 
             tensor_parallel_size = self.parallel_config.tensor_parallel_size
-            can_compile_groups = (can_compile_hpu_qwen3_layer_groups(
-                group_size,
+            supports_grouped_collectives = supports_hpu_qwen3_layer_group_compilation(
                 tensor_parallel_size,
-                module.aux_hidden_state_layers,
-            ) and not hasattr(module, "_hpu_compiled_layer_groups"))
+                get_config().tp2_fused_ar_norm,
+            )
+            can_compile_groups = (group_size > 1 and supports_grouped_collectives and not module.aux_hidden_state_layers
+                                  and not hasattr(module, "_hpu_compiled_layer_groups"))
             if can_compile_groups:
-                compiled_groups = compile_hpu_qwen3_layer_groups(module, group_size, self._compile)
+                final_norm = module.norm if get_pp_group().is_last_rank else None
+                compiled_groups = compile_hpu_qwen3_layer_groups(
+                    module,
+                    group_size,
+                    self._compile,
+                    final_norm=final_norm,
+                )
                 logger.info(
-                    "Compiled %d Qwen3 decoder layer groups with group size %d",
+                    "Compiled %d Qwen3 decoder layer groups with group size %d; final norm fused: %s",
                     len(compiled_groups),
                     group_size,
+                    final_norm is not None,
                 )
-            elif group_size > 1 and tensor_parallel_size != 1:
-                logger.warning("VLLM_HPU_QWEN3_COMPILE_LAYER_GROUP_SIZE is only supported with tensor parallel size 1; "
-                               "using per-layer compilation")
+            elif group_size > 1 and not supports_grouped_collectives:
+                logger.warning(
+                    "VLLM_HPU_QWEN3_COMPILE_LAYER_GROUP_SIZE requires tensor parallel size 1, or tensor parallel "
+                    "size 2 with VLLM_HPU_TP2_FUSED_AR_NORM enabled; using per-layer compilation")
 
         if isinstance(module, torch.nn.ModuleList):
             for children_name, children_module in module.named_children():
