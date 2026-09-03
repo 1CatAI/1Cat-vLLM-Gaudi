@@ -64,6 +64,18 @@ def _dynamic_quant_schedule() -> dict[str, object]:
     ).as_backend_options()
 
 
+@functools.lru_cache(maxsize=32)
+def _silu_and_mul_dynamic_quant_schedule(n_cols: int) -> dict[str, object]:
+    vlm_bytes = ((n_cols + 127) // 128) * 256
+    return GaudiConfig(
+        unroll=4,
+        pipeline_depth=1,
+        engine="tpc",
+        mode="strict",
+        vlm_budget_bytes=vlm_bytes,
+    ).as_backend_options()
+
+
 @functools.lru_cache(maxsize=4)
 def _gdn_decode_schedule(value_tile: int) -> dict[str, object]:
     return GaudiConfig(
@@ -167,6 +179,30 @@ def _compile_dynamic_quant(n_cols: int) -> tuple[GaudiKernelArtifactV1, int]:
         source,
         target=GPUTarget("gaudi", "gaudi2"),
         options=_dynamic_quant_schedule(),
+    )
+    return GaudiKernelArtifactV1.from_bytes(compiled.asm["gabin"]), block_size
+
+
+@functools.lru_cache(maxsize=32)
+def _compile_silu_and_mul_dynamic_quant(
+    n_cols: int,
+) -> tuple[GaudiKernelArtifactV1, int]:
+    block_size = max(128, triton.next_power_of_2(n_cols))
+    source = triton.compiler.ASTSource(
+        fn=_silu_and_mul_dynamic_quant_kernel,
+        signature={
+            "input_ptr": "*bf16",
+            "output_ptr": "*fp8e4nv",
+            "scale_ptr": "*fp32",
+            "N_COLS": "constexpr",
+            "BLOCK_SIZE": "constexpr",
+        },
+        constexprs={"N_COLS": n_cols, "BLOCK_SIZE": block_size},
+    )
+    compiled = triton.compile(
+        source,
+        target=GPUTarget("gaudi", "gaudi2"),
+        options=_silu_and_mul_dynamic_quant_schedule(n_cols),
     )
     return GaudiKernelArtifactV1.from_bytes(compiled.asm["gabin"]), block_size
 
@@ -333,6 +369,20 @@ def _prepare_dynamic_quant(n_cols: int) -> tuple[str, int]:
     return _prepare_dynamic_quant_cached(n_cols)
 
 
+@functools.lru_cache(maxsize=32)
+def _prepare_silu_and_mul_dynamic_quant_cached(
+    n_cols: int,
+) -> tuple[str, int]:
+    artifact, block_size = _compile_silu_and_mul_dynamic_quant(n_cols)
+    _materialize_graph_artifact(artifact, torch.hpu.current_device())
+    return artifact.artifact_hash, block_size
+
+
+@torch.compiler.assume_constant_result
+def _prepare_silu_and_mul_dynamic_quant(n_cols: int) -> tuple[str, int]:
+    return _prepare_silu_and_mul_dynamic_quant_cached(n_cols)
+
+
 @functools.lru_cache(maxsize=4)
 def _prepare_gdn_decode_packed_cached(value_tile: int) -> str:
     artifact = _compile_gdn_decode_packed(value_tile)
@@ -479,6 +529,45 @@ def _dynamic_quant_kernel(
     tl.store(scale_ptr + row, scale)
     quantized = values / scale
     tl.store(output_ptr + offsets, quantized, mask=mask)
+
+
+@triton.jit
+def _silu_and_mul_dynamic_quant_kernel(
+    input_ptr,
+    output_ptr,
+    scale_ptr,
+    N_COLS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    columns = tl.arange(0, BLOCK_SIZE)
+    mask = columns < N_COLS
+    input_row = row * (2 * N_COLS)
+    gate = tl.load(
+        input_ptr + input_row + columns,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    up = tl.load(
+        input_ptr + input_row + N_COLS + columns,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    sigmoid = 1.0 / (1.0 + tl.exp(-gate))
+    rounded = (gate * sigmoid * up).to(tl.bfloat16)
+    values = rounded.to(tl.float32)
+    abs_max = tl.max(tl.abs(values), axis=0)
+    scale = (abs_max + 1.0e-8) / 240.0
+    tl.store(scale_ptr + row, scale)
+    quantized = (values / scale).to(
+        tl.float8e4nv,
+        fp_downcast_rounding="rtne",
+    )
+    tl.store(
+        output_ptr + row * N_COLS + columns,
+        quantized,
+        mask=mask,
+    )
 
 
 @triton.jit
@@ -852,13 +941,20 @@ def silu_and_mul(input_tensor: torch.Tensor) -> torch.Tensor:
     rows = input_tensor.numel() // input_width
     block_size = _silu_and_mul_block_size(n_cols)
     artifact_hash = _prepare_silu_and_mul(n_cols, block_size)
+    logical_input = (
+        input_tensor
+        if input_tensor.ndim == 2
+        else input_tensor.view(rows, input_width)
+    )
     output = torch.ops.triton_gaudi.silu_and_mul.default(
-        input_tensor.view(rows, input_width),
+        logical_input,
         artifact_hash,
         block_size,
         n_cols,
         rows,
     )
+    if input_tensor.ndim == 2:
+        return output
     return output.view(*input_tensor.shape[:-1], n_cols)
 
 
@@ -890,13 +986,13 @@ def dynamic_quant(
     rows, n_cols = input_tensor.shape
     artifact_hash, block_size = _prepare_dynamic_quant(n_cols)
     quantized, scale = torch.ops.triton_gaudi.dynamic_quant.default(
-        input_tensor.view(-1),
+        input_tensor,
         artifact_hash,
         block_size,
         n_cols,
         rows,
     )
-    return quantized.view(input_tensor.shape), scale.view(rows, 1)
+    return quantized, scale
 
 
 def dynamic_quant_direct(
@@ -916,6 +1012,61 @@ def dynamic_quant_direct(
         N_COLS=n_cols,
         BLOCK_SIZE=block_size,
         backend_options=_dynamic_quant_schedule(),
+    )
+    return output, scale
+
+
+def silu_and_mul_dynamic_quant(
+    input_tensor: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Launch graph-native SwiGLU plus row-wise E4M3 quantization."""
+    if input_tensor.ndim != 2:
+        raise ValueError(
+            "Gaudi Triton fused SiLU dynamic quantization requires a 2D tensor"
+        )
+    rows, input_width = input_tensor.shape
+    if input_width <= 0 or input_width % 2:
+        raise ValueError("fused SiLU dynamic quantization requires an even input width")
+    n_cols = input_width // 2
+    artifact_hash, block_size = _prepare_silu_and_mul_dynamic_quant(n_cols)
+    quantized, scale = (
+        torch.ops.triton_gaudi.silu_and_mul_dynamic_quant.default(
+            input_tensor,
+            artifact_hash,
+            block_size,
+            n_cols,
+            rows,
+        )
+    )
+    return quantized, scale
+
+
+def silu_and_mul_dynamic_quant_direct(
+    input_tensor: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Direct recipe launch retained for fused-path diagnostics."""
+    if input_tensor.ndim != 2:
+        raise ValueError(
+            "Gaudi Triton fused SiLU dynamic quantization requires a 2D tensor"
+        )
+    rows, input_width = input_tensor.shape
+    if input_width <= 0 or input_width % 2:
+        raise ValueError("fused SiLU dynamic quantization requires an even input width")
+    n_cols = input_width // 2
+    output = torch.empty(
+        (rows, n_cols),
+        dtype=torch.float8_e4m3fn,
+        device=input_tensor.device,
+    )
+    scale = torch.empty((rows, 1), dtype=torch.float32, device=input_tensor.device)
+    block_size = max(128, triton.next_power_of_2(n_cols))
+    _silu_and_mul_dynamic_quant_kernel[(rows, )](
+        input_tensor,
+        output,
+        scale,
+        N_COLS=n_cols,
+        BLOCK_SIZE=block_size,
+        backend_options=_silu_and_mul_dynamic_quant_schedule(n_cols),
     )
     return output, scale
 

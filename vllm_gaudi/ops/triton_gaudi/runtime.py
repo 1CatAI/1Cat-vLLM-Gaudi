@@ -39,6 +39,7 @@ _counters: Counter[str] = Counter()
 # the performance gate for small batches, where fixed launch cost dominates.
 _GDN_CONV_SPLIT_MIN_BATCH = 8
 _DYNAMIC_QUANT_MAX_ROWS = 32
+_SILU_DYNAMIC_QUANT_MAX_COLS = 4096
 
 
 def _mode() -> FastPathMode:
@@ -114,6 +115,11 @@ def prepare_if_enabled() -> bool:
 
                 prepare_environment()
                 validate_bridge_launch_abi()
+                from vllm_gaudi.ops.triton_gaudi.fusion import (
+                    register_silu_dynamic_quant_fusion_pass,
+                )
+
+                register_silu_dynamic_quant_fusion_pass()
                 _available = True
             except (ImportError, OSError, RuntimeError) as exc:
                 _prepare_error = str(exc)
@@ -327,6 +333,111 @@ def dynamic_quant(
             f"({exc}); using the HPU vendor path",
         )
         _counters["fallback.dynamic_quant.launch"] += 1
+        return None
+
+
+def _reject_silu_and_mul_dynamic_quant(reason: str) -> None:
+    _counters[f"fallback.silu_and_mul_dynamic_quant.{reason}"] += 1
+    if _mode() is FastPathMode.STRICT:
+        raise FastPathUnavailable(
+            "Gaudi Triton strict mode rejected "
+            f"silu_and_mul_dynamic_quant: {reason}"
+        )
+    return None
+
+
+def _silu_and_mul_dynamic_quant_rejection_reason(
+    input_tensor: torch.Tensor,
+) -> str | None:
+    if input_tensor.device.type != "hpu":
+        return "non_hpu_tensor"
+    if (
+        input_tensor.ndim != 2
+        or input_tensor.shape[0] <= 0
+        or input_tensor.shape[1] <= 0
+        or input_tensor.shape[1] % 2
+    ):
+        return "shape_mismatch"
+    rows, input_width = input_tensor.shape
+    n_cols = input_width // 2
+    if (
+        rows > (1 << 32) - 1
+        or n_cols <= 128
+        or n_cols > _SILU_DYNAMIC_QUANT_MAX_COLS
+        or input_tensor.numel() == 0
+    ):
+        return "unsupported_size"
+    if input_tensor.dtype != torch.bfloat16:
+        return "unsupported_dtype"
+    if not input_tensor.is_contiguous():
+        return "non_contiguous"
+    return None
+
+
+def silu_and_mul_dynamic_quant(
+    input_tensor: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Fuse SwiGLU and per-row E4M3 quantization into one TPC node."""
+    if torch.compiler.is_compiling():
+        compile_mode = _compile_fast_path_mode()
+        if compile_mode == FastPathMode.OFF.value:
+            return None
+        if compile_mode == FastPathMode.HYBRID.value:
+            return None
+        rejection_reason = _silu_and_mul_dynamic_quant_rejection_reason(
+            input_tensor
+        )
+        if rejection_reason is not None:
+            if compile_mode == FastPathMode.STRICT.value:
+                raise FastPathUnavailable(
+                    "Gaudi Triton strict mode rejected "
+                    "silu_and_mul_dynamic_quant: "
+                    f"{rejection_reason}"
+                )
+            return None
+        from vllm_gaudi.ops.triton_gaudi.kernels import (
+            silu_and_mul_dynamic_quant as launch_fused,
+        )
+
+        return launch_fused(input_tensor)
+
+    mode = _mode()
+    if mode is FastPathMode.OFF:
+        _counters["vendor.silu_and_mul_dynamic_quant.off"] += 1
+        return None
+    rejection_reason = _silu_and_mul_dynamic_quant_rejection_reason(
+        input_tensor
+    )
+    if rejection_reason is not None:
+        return _reject_silu_and_mul_dynamic_quant(rejection_reason)
+    if mode is FastPathMode.HYBRID:
+        _counters[
+            "vendor.silu_and_mul_dynamic_quant.performance_gate"
+        ] += 1
+        return None
+    if not prepare_if_enabled():
+        return _reject_silu_and_mul_dynamic_quant("initialization")
+
+    try:
+        from vllm_gaudi.ops.triton_gaudi.kernels import (
+            silu_and_mul_dynamic_quant as launch_fused,
+        )
+
+        output = launch_fused(input_tensor)
+        _counters["triton.silu_and_mul_dynamic_quant"] += 1
+        return output
+    except Exception as exc:
+        if mode is FastPathMode.STRICT:
+            raise FastPathUnavailable(
+                "Gaudi Triton fused SiLU dynamic quantization "
+                "compilation or launch failed"
+            ) from exc
+        _warn_once(
+            "silu_and_mul_dynamic_quant.launch",
+            "Gaudi Triton fused SiLU dynamic quantization failed "
+            f"({exc}); using the HPU vendor path",
+        )
+        _counters["fallback.silu_and_mul_dynamic_quant.launch"] += 1
         return None
 
 

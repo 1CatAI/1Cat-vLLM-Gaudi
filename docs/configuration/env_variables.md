@@ -63,6 +63,16 @@ against the existing `amax` plus `cast_to_fp8_v2` fullgraph. Hybrid rollout
 remains closed until that generated-kernel gate and the model-level output gate
 both pass on Gaudi2.
 
+When a strict fullgraph contains an exclusive SiLU-and-mul result immediately
+consumed by row-wise dynamic quantization, the HPU compiler pass replaces both
+custom nodes and their alias-only view chain with one Triton-generated TPC
+node. The fusion is limited to static two-dimensional BF16 shapes with output
+widths up to 4096 and fails closed on extra activation consumers or mismatched
+specializations. Run
+`python tools/benchmark_triton_gaudi_silu_dynamic_quant.py` to exercise the
+actual graph rewrite against the vendor fullgraph. Hybrid rollout remains
+closed until this combined graph gate passes.
+
 Run `python tools/benchmark_triton_gaudi_rms_norm.py` on Gaudi2 after setting
 the matching Triton perf-library and artifact-cache environment variables. The
 gate requires at least 1.20x geometric-mean device and wall speedup and rejects

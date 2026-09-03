@@ -1,11 +1,61 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import operator
 import shutil
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from vllm_gaudi.ops.triton_gaudi import runtime
+
+
+def _fake_silu_and_mul(input_tensor, artifact_hash, block_size, n_cols, rows):
+    return input_tensor
+
+
+def _fake_dynamic_quant(input_tensor, artifact_hash, block_size, n_cols, rows):
+    return input_tensor, input_tensor
+
+
+def _fake_silu_and_mul_dynamic_quant(
+    input_tensor,
+    artifact_hash,
+    block_size,
+    n_cols,
+    rows,
+):
+    return input_tensor, input_tensor
+
+
+def _make_silu_dynamic_quant_graph(
+    *,
+    extra_silu_user: bool = False,
+    quant_n_cols: int = 3584,
+) -> torch.fx.GraphModule:
+    graph = torch.fx.Graph()
+    input_tensor = graph.placeholder("input_tensor")
+    silu = graph.call_function(
+        _fake_silu_and_mul,
+        args=(input_tensor, "a" * 64, 128, 3584, 8),
+    )
+    logical_view = graph.call_function(
+        torch.ops.aten.view.default,
+        args=(silu, [8, 3584]),
+    )
+    flattened = graph.call_function(
+        torch.ops.aten.view.default,
+        args=(logical_view, [-1]),
+    )
+    quantized_and_scale = graph.call_function(
+        _fake_dynamic_quant,
+        args=(flattened, "b" * 64, 4096, quant_n_cols, 8),
+    )
+    quantized = graph.call_function(operator.getitem, args=(quantized_and_scale, 0))
+    scale = graph.call_function(operator.getitem, args=(quantized_and_scale, 1))
+    outputs = (quantized, scale, silu) if extra_silu_user else (quantized, scale)
+    graph.output(outputs)
+    return torch.fx.GraphModule({}, graph)
 
 
 @pytest.fixture(autouse=True)
@@ -163,6 +213,51 @@ def test_eager_hybrid_dynamic_quant_keeps_candidate_on_vendor_path(
     }
 
 
+def test_off_mode_leaves_fused_silu_dynamic_quant_on_vendor_path():
+    input_tensor = torch.zeros(2, 512, dtype=torch.bfloat16)
+
+    result = runtime.silu_and_mul_dynamic_quant(input_tensor)
+
+    assert result is None
+    assert runtime.diagnostics()["counters"] == {
+        "vendor.silu_and_mul_dynamic_quant.off": 1,
+    }
+
+
+def test_strict_fused_silu_dynamic_quant_rejects_non_hpu_tensor(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "strict")
+    input_tensor = torch.zeros(2, 512, dtype=torch.bfloat16)
+
+    with pytest.raises(
+        runtime.FastPathUnavailable,
+        match="silu_and_mul_dynamic_quant: non_hpu_tensor",
+    ):
+        runtime.silu_and_mul_dynamic_quant(input_tensor)
+
+
+def test_fused_silu_dynamic_quant_rejects_width_above_vlm_fast_path():
+    class FakeHpuTensor:
+        device = torch.device("hpu")
+        ndim = 2
+        shape = (8, 8194)
+        dtype = torch.bfloat16
+
+        @staticmethod
+        def numel():
+            return 8 * 8194
+
+        @staticmethod
+        def is_contiguous():
+            return True
+
+    assert (
+        runtime._silu_and_mul_dynamic_quant_rejection_reason(FakeHpuTensor())
+        == "unsupported_size"
+    )
+
+
 def test_compile_off_mode_does_not_enable_fast_path(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     hidden = torch.zeros(2, 8, dtype=torch.bfloat16)
@@ -199,11 +294,13 @@ def test_compile_hybrid_mode_keeps_ungated_kernels_on_vendor_path(
     )
     dynamic_quant_result = runtime.dynamic_quant(hidden)
     silu_result = runtime.silu_and_mul(hidden)
+    fused_silu_quant_result = runtime.silu_and_mul_dynamic_quant(hidden)
     gdn_result = runtime.gdn_decode_packed(*_cpu_gdn_inputs())
 
     assert rms_result is None
     assert dynamic_quant_result is None
     assert silu_result is None
+    assert fused_silu_quant_result is None
     assert gdn_result is None
     assert runtime.diagnostics()["counters"] == {}
 
@@ -405,6 +502,93 @@ def test_gdn_decode_validator_accepts_only_canonical_specialization():
     assert runtime._gdn_decode_packed_rejection_reason(*non_contiguous) == "non_contiguous"
 
 
+def test_silu_dynamic_quant_pass_fuses_exclusive_view_chain(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_gaudi.ops.triton_gaudi import fusion, kernels
+
+    graph_module = _make_silu_dynamic_quant_graph()
+    monkeypatch.setattr(
+        fusion,
+        "_resolve_triton_ops",
+        lambda: (
+            _fake_silu_and_mul,
+            _fake_dynamic_quant,
+            _fake_silu_and_mul_dynamic_quant,
+        ),
+    )
+    monkeypatch.setattr(
+        kernels,
+        "_prepare_silu_and_mul_dynamic_quant",
+        lambda n_cols: ("f" * 64, 4096),
+    )
+
+    assert fusion.pass_fuse_triton_gaudi_silu_dynamic_quant(
+        SimpleNamespace(graph_module=graph_module)
+    )
+
+    call_targets = [
+        node.target
+        for node in graph_module.graph.nodes
+        if node.op == "call_function"
+    ]
+    assert _fake_silu_and_mul not in call_targets
+    assert _fake_dynamic_quant not in call_targets
+    assert call_targets.count(_fake_silu_and_mul_dynamic_quant) == 1
+    fused = next(
+        node
+        for node in graph_module.graph.nodes
+        if node.target is _fake_silu_and_mul_dynamic_quant
+    )
+    assert fused.args[1:] == ("f" * 64, 4096, 3584, 8)
+    assert fused.args[0].op == "placeholder"
+
+
+@pytest.mark.parametrize(
+    ("extra_silu_user", "quant_n_cols"),
+    ((True, 3584), (False, 4096)),
+)
+def test_silu_dynamic_quant_pass_rejects_unsafe_graphs(
+    monkeypatch: pytest.MonkeyPatch,
+    extra_silu_user: bool,
+    quant_n_cols: int,
+):
+    from vllm_gaudi.ops.triton_gaudi import fusion, kernels
+
+    graph_module = _make_silu_dynamic_quant_graph(
+        extra_silu_user=extra_silu_user,
+        quant_n_cols=quant_n_cols,
+    )
+    monkeypatch.setattr(
+        fusion,
+        "_resolve_triton_ops",
+        lambda: (
+            _fake_silu_and_mul,
+            _fake_dynamic_quant,
+            _fake_silu_and_mul_dynamic_quant,
+        ),
+    )
+    prepare_calls = []
+    monkeypatch.setattr(
+        kernels,
+        "_prepare_silu_and_mul_dynamic_quant",
+        lambda n_cols: prepare_calls.append(n_cols),
+    )
+
+    assert not fusion.pass_fuse_triton_gaudi_silu_dynamic_quant(
+        SimpleNamespace(graph_module=graph_module)
+    )
+    assert prepare_calls == []
+    call_targets = [
+        node.target
+        for node in graph_module.graph.nodes
+        if node.op == "call_function"
+    ]
+    assert _fake_silu_and_mul in call_targets
+    assert _fake_dynamic_quant in call_targets
+    assert _fake_silu_and_mul_dynamic_quant not in call_targets
+
+
 @pytest.mark.skipif(shutil.which("tpc-clang") is None, reason="tpc-clang is not installed")
 def test_gdn_decode_triton_ast_compiles_to_canonical_artifact():
     from vllm_gaudi.ops.triton_gaudi.kernels import _compile_gdn_decode_packed
@@ -454,6 +638,40 @@ def test_dynamic_quant_triton_ast_compiles_mlp_width_to_canonical_artifact():
         "fp8_max": 240.0,
         "scale_epsilon": 1.0e-8,
         "vlm_bytes": 0,
+    }
+
+
+@pytest.mark.skipif(shutil.which("tpc-clang") is None, reason="tpc-clang is not installed")
+def test_fused_silu_dynamic_quant_triton_ast_compiles_to_canonical_artifact():
+    from vllm_gaudi.ops.triton_gaudi.kernels import (
+        _compile_silu_and_mul_dynamic_quant,
+    )
+
+    artifact, block_size = _compile_silu_and_mul_dynamic_quant(3584)
+    manifest = artifact.manifest
+
+    assert artifact.elf.startswith(b"\x7fELF")
+    assert block_size == 4096
+    assert manifest["kind"] == "silu_and_mul_dynamic_quant"
+    assert manifest["input_args"] == [0]
+    assert manifest["output_args"] == [1, 2]
+    assert [argument["dtype"] for argument in manifest["arguments"]] == [
+        "bf16",
+        "fp8e4nv",
+        "f32",
+    ]
+    assert manifest["index_space"] == {
+        "rank": 1,
+        "block_size": 4096,
+        "vector_lanes": 256,
+        "program_id_axes": [0],
+    }
+    assert manifest["parameters"] == {
+        "n_cols": 3584,
+        "input_row_stride": 7168,
+        "fp8_max": 240.0,
+        "scale_epsilon": 1.0e-8,
+        "vlm_bytes": 7168,
     }
 
 

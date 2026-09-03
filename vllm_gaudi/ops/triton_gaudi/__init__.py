@@ -9,7 +9,9 @@ from vllm_gaudi.ops.triton_gaudi.runtime import (FastPathMode, diagnostics,
                                                  gdn_decode_conv_split_packed,
                                                  gdn_decode_packed,
                                                  prepare_if_enabled,
-                                                 silu_and_mul, vector_add)
+                                                 silu_and_mul,
+                                                 silu_and_mul_dynamic_quant,
+                                                 vector_add)
 
 __all__ = [
     "FastPathMode",
@@ -21,5 +23,6 @@ __all__ = [
     "gdn_decode_packed",
     "prepare_if_enabled",
     "silu_and_mul",
+    "silu_and_mul_dynamic_quant",
     "vector_add",
 ]
