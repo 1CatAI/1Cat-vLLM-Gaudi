@@ -211,7 +211,10 @@ class HPUBucketingManager():
                     max_blocks=self.num_hpu_blocks,
                     skip_decode_block_clamp=getattr(self, 'skip_decode_block_clamp', False))
 
-                bs_range = strategy.get_range(bs_cfg)
+                if isinstance(strategy, ExponentialBucketingStrategy):
+                    bs_range = strategy.get_decode_bs_range(bs_cfg)
+                else:
+                    bs_range = strategy.get_range(bs_cfg)
                 query_range = strategy.get_range(query_cfg)
                 ctx_range = strategy.get_range(ctx_cfg)
 

@@ -18,7 +18,12 @@ from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData, Schedu
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor)
 from vllm.v1.sample.metadata import SamplingMetadata
 import vllm_gaudi.extension.environment as environment
-from vllm_gaudi.v1.worker.hpu_model_runner import HPUModelRunner
+from vllm_gaudi.v1.worker.hpu_model_runner import (
+    HPUModelRunner,
+    HpuModelAdapter,
+    maybe_set_mamba_kv_cache_groups_ids,
+    should_synchronize_hybrid_prefill_output,
+)
 from vllm_gaudi.v1.worker.hpu_input_batch import InputBatch
 
 BLOCK_SIZE = 128
@@ -658,6 +663,70 @@ def test_model_torch_regional_compilation(default_vllm_config: None, dist_init, 
     assert_compilation(model, "lm_head", VocabParallelEmbedding)
     assert_compilation(model, "model.decoder.final_layer_norm", LayerNorm)
     assert_compilation(model, "model.decoder.embed_tokens", VocabParallelEmbedding)
+
+
+def test_mamba_cache_groups_handle_whole_model_compile_wrapper():
+    base_model = torch.nn.Module()
+    base_model.config = SimpleNamespace(architectures=[])
+
+    adapter = object.__new__(HpuModelAdapter)
+    torch.nn.Module.__init__(adapter)
+    adapter.model = base_model
+
+    compiled_model = SimpleNamespace(_orig_mod=adapter)
+    kv_cache_config = SimpleNamespace(kv_cache_groups=[])
+
+    maybe_set_mamba_kv_cache_groups_ids(compiled_model, kv_cache_config)
+
+
+@pytest.mark.parametrize(
+    ("use_async", "num_mamba_layers", "num_prefills", "expected"),
+    [
+        (True, 48, 1, True),
+        (True, 48, 0, False),
+        (True, 0, 1, False),
+        (False, 48, 1, False),
+    ],
+)
+def test_should_synchronize_hybrid_prefill_output(use_async, num_mamba_layers, num_prefills, expected):
+    assert should_synchronize_hybrid_prefill_output(use_async, num_mamba_layers, num_prefills) is expected
+
+
+def test_cache_block_capacity_keeps_hybrid_block_units_separate():
+    runner = object.__new__(HPUModelRunner)
+    runner.enable_bucketing = True
+    runner.bucketing_manager = SimpleNamespace(num_hpu_blocks=None)
+    runner.attn_block_size = 128
+
+    runner._set_cache_block_capacity(
+        scheduler_blocks=862,
+        attention_kernel_blocks=862 * 7,
+    )
+
+    assert runner.bucketing_manager.num_hpu_blocks == 6034
+    assert runner._PAD_BLOCK_ID == 6034
+    assert runner._PAD_SLOT_ID == 6034 * 128
+    assert runner._MAMBA_PAD_BLOCK_ID == 862
+    assert runner._dummy_num_blocks == 862
+
+
+def test_direct_gdn_state_requires_group_major_request_order():
+    runner = object.__new__(HPUModelRunner)
+    runner._direct_gdn_state_enabled = True
+    runner._compact_gdn_enabled = True
+    runner.use_prefix_caching = False
+    runner._compact_gdn_group_ids = {1, 3}
+    runner._compact_gdn_group_offset = {1: 0, 3: 1}
+    runner._gdn_max_reqs = 4
+
+    indices = torch.zeros(4, 4, dtype=torch.int32)
+    indices[1] = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+    indices[3] = torch.tensor([5, 6, 7, 8], dtype=torch.int32)
+    assert runner._can_use_direct_gdn_state(indices, num_indices=4, target_bs=4)
+    assert not runner._can_use_direct_gdn_state(indices, num_indices=4, target_bs=4, tokens_per_request=2)
+
+    indices[3] = torch.tensor([6, 5, 7, 8], dtype=torch.int32)
+    assert not runner._can_use_direct_gdn_state(indices, num_indices=4, target_bs=4)
 
 
 def test_max_cudagraph_capture_size_defaults_to_max_num_batched_tokens(model_runner):

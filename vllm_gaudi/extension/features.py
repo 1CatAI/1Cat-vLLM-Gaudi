@@ -5,7 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 ###############################################################################
 
-from vllm_gaudi.extension.config import Not, Hardware, VersionRange, ModelType, Kernel, Any, All, Value, ValueFromList, Env, Eq, Disabled, Enabled, MinPackageVersion, boolean, to_dict, split_values_and_flags, list_of
+from vllm_gaudi.extension.config import (All, Any, Disabled, Enabled, Env, Eq, Hardware, Kernel, MinPackageVersion,
+                                         ModelType, Not, Value, ValueFromList, VersionRange, boolean, list_of,
+                                         split_values_and_flags, to_dict)
 from vllm_gaudi.extension.kernels import fsdpa, block_softmax_adjustment
 from vllm_gaudi.extension.validation import for_all, choice
 
@@ -45,6 +47,7 @@ def get_user_flags():
         Env('VLLM_DECODE_BLOCK_BUCKET_PAD_PERCENT', int),
         Env('VLLM_BUCKETING_STRATEGY', str),
         Env('VLLM_BUCKETING_FROM_FILE', str),
+        Env('VLLM_HPU_QWEN3_COMPILE_LAYER_GROUP_SIZE', int),
 
         # Non-vllm flags that are also important to print
         Env('EXPERIMENTAL_WEIGHT_SHARING', str),
@@ -77,6 +80,14 @@ def get_experimental_flags():
         Env('VLLM_DEFRAG_THRESHOLD', int),
         Env('VLLM_DEFRAG_WITH_GRAPHS', boolean),
         Env('VLLM_DEBUG', list_of(str), check=for_all(choice('steps', 'defrag', 'fwd'))),
+        Env('VLLM_HPU_FLASHINFER_GDN', boolean),
+        Env('VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE', boolean),
+        Env('VLLM_HPU_FLASHINFER_GDN_PREFILL', boolean),
+        Env('VLLM_HPU_GDN_DIRECT_STATE', boolean),
+        Env('VLLM_HPU_CGUID_DYNAMIC_QUANT', boolean),
+        Env('VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS', int),
+        Env('FLASHINFER_GAUDI_BACKEND', str),
+        Env('FLASHINFER_GAUDI_STATE_DTYPE', str),
     ]
     return to_dict(flags)
 

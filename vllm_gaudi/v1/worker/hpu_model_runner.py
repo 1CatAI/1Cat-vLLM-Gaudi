@@ -115,6 +115,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import Of
 from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
 from vllm.v1.core.sched.output import GrammarOutput
 from vllm_gaudi.attention.backends.hpu_attn import HPUAttentionImpl
+from vllm_gaudi.ops.hpu_gdn_pytorch import resolve_hpu_gdn_chunk_size
 
 if TYPE_CHECKING:
     import xgrammar as xgr
@@ -533,6 +534,14 @@ class BucketingFailedException(Exception):
     pass
 
 
+def should_synchronize_hybrid_prefill_output(
+    use_async_scheduling: bool,
+    num_mamba_like_layers: int,
+    num_prefills: int,
+) -> bool:
+    return use_async_scheduling and num_mamba_like_layers > 0 and num_prefills > 0
+
+
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncHPUModelRunnerOutput(AsyncModelRunnerOutput):
 
@@ -786,6 +795,7 @@ def patch_llama4_get_attn_scale(model):
 
 
 def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig):
+    model = getattr(model, "_orig_mod", model)
     if isinstance(model, HpuModelAdapter):
         model = model.model
 
@@ -796,6 +806,11 @@ def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig):
     if not any(arch in getattr(model.config, 'architectures', []) for arch in mamba_like_arch):
         return
     mamba_like_layer = ['.mixer', '.linear_attn']
+    compact_gdn_group_ids = [
+        group_idx for group_idx, group in enumerate(kv_cache_config.kv_cache_groups)
+        if isinstance(group.kv_cache_spec, MambaSpec) and group.kv_cache_spec.mamba_type in _GDN_MAMBA_TYPES
+    ]
+    compact_gdn_offsets = {group_idx: offset for offset, group_idx in enumerate(compact_gdn_group_ids)}
 
     def _get_decoder_layer_by_idx(model_obj, idx: int):
         # Qwen3.5 multimodal path: model.language_model.model.layers
@@ -839,6 +854,8 @@ def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig):
                 layer = _get_decoder_layer_by_idx(model, layer_idx)
                 if layer is not None and hasattr(layer, "linear_attn"):
                     layer.linear_attn.cache_group_idx = torch.tensor(group_idx, dtype=torch.long, device="hpu")
+                    layer.linear_attn.compact_state_group_offset = compact_gdn_offsets.get(group_idx)
+                    layer.linear_attn.compact_state_group_count = len(compact_gdn_group_ids)
 
 
 def maybe_set_chunked_attention_layers(model_runner):
@@ -1165,7 +1182,7 @@ def trim_attn_metadata(metadata: HPUAttentionMetadataV1) -> object:
         'chunked_block_list', 'chunked_block_usage', 'chunked_block_groups', 'prep_initial_states',
         'has_initial_states_p', 'last_chunk_indices_p', 'load_indices_tensor', 'store_indices_tensor',
         'query_start_loc', 'query_start_loc_p', 'padding_mask_flat', 'blocks_caching_range',
-        'mamba_chunks_to_block_mapping', 'seqlens_offsets_for_blocks'
+        'mamba_chunks_to_block_mapping', 'seqlens_offsets_for_blocks', 'direct_gdn_state'
     ])
     return attention_metadata
 
@@ -1411,18 +1428,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     "VLLM_COMPACT_GDN=%s", self.num_gdn, os.environ["VLLM_USE_HYBRID_CACHE"],
                     os.environ["VLLM_USE_NAIVE_MAMBA_CACHE_SHARING"], os.environ["VLLM_COMPACT_GDN"])
 
-        hf_text_config = self.model_config.hf_text_config
-        self.mamba_chunk_size_is_explicit = (self.num_mamba_like_layers > 0
-                                             and (getattr(hf_text_config, "mamba_chunk_size", None) is not None
-                                                  or getattr(hf_text_config, "chunk_size", None) is not None))
-
-        # For HPU GDN, use configured chunk size when explicitly provided;
-        # otherwise default to 128 to match bucket alignment.
         if self.num_mamba_like_layers > 0:
-            self.mamba_chunk_size = (self.model_config.get_mamba_chunk_size()
-                                     if self.mamba_chunk_size_is_explicit else 128)
+            self.mamba_chunk_size, self.mamba_chunk_size_is_explicit = resolve_hpu_gdn_chunk_size(self.model_config)
         else:
             self.mamba_chunk_size = 0
+            self.mamba_chunk_size_is_explicit = False
 
         self.use_hybrid_cache = os.getenv('VLLM_USE_HYBRID_CACHE', 'false').strip().lower() in ("1", "true")
         self.use_naive_mamba_cache_sharing = os.getenv('VLLM_USE_NAIVE_MAMBA_CACHE_SHARING',
@@ -1432,16 +1442,20 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # GDN recurrent states are fixed-size per request (independent of
         # sequence length), so we can allocate fewer slots than num_blocks.
         # IMPORTANT: all GDN groups share the same underlying state tensor,
-        # so each request needs num_gdn_groups distinct slot indices.
-        # For request with base_slot `s` in group `g`, the actual tensor
-        # index is `s * num_gdn_groups + g + 1` (1-based, slot 0 unused).
+        # so each request needs num_gdn_groups distinct slot indices. Groups
+        # occupy contiguous max_num_reqs-sized spans so a full decode batch can
+        # update state without index_select/index_copy.
+        # For request with base_slot `s` in group `g`, the actual tensor index
+        # is `g * max_num_reqs + s + 1` (1-based, slot 0 unused).
         # Tensor size: max_num_reqs * num_gdn_groups + 2.
         self._compact_gdn_enabled = os.environ.get("VLLM_COMPACT_GDN", "1").strip().lower() in ("1", "true")
+        self._direct_gdn_state_enabled = (gaudi_envs.VLLM_HPU_FLASHINFER_GDN and gaudi_envs.VLLM_HPU_GDN_DIRECT_STATE)
         self._compact_gdn_group_ids: set[int] = set()
         self._compact_gdn_group_offset: dict[int, int] = {}  # {group_idx: g_offset}
         self._num_gdn_groups = 0  # set during initialize_kv_cache
         self._gdn_slot_free_list: list[int] = []  # stack of free base-slot IDs
         self._gdn_req_to_base_slot: dict[str, int] = {}
+        self._logged_direct_gdn_state = False
 
         # Lazy initialization
         # self.model: nn.Module  # set after load_model
@@ -1590,6 +1604,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         return self.defragmenter.resolve_all(block_table_list)
 
+    def _set_cache_block_capacity(self, scheduler_blocks: int, attention_kernel_blocks: int) -> None:
+        """Keep scheduler-page and attention-kernel block units separate."""
+        attention_kernel_blocks = attention_kernel_blocks or scheduler_blocks
+        if self.enable_bucketing:
+            self.bucketing_manager.num_hpu_blocks = attention_kernel_blocks
+        self._PAD_BLOCK_ID = attention_kernel_blocks
+        self._PAD_SLOT_ID = attention_kernel_blocks * self.attn_block_size
+        self._MAMBA_PAD_BLOCK_ID = scheduler_blocks
+        self._dummy_num_blocks = scheduler_blocks
+
     def reset_encoder_cache(self) -> None:
         """Clear the HPU-side encoder cache storing vision embeddings.
 
@@ -1611,7 +1635,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 for i, req_idx in enumerate(req_indices):
                     req_id = self.input_batch.req_ids[req_idx]
                     base_slot = self._gdn_req_to_base_slot[req_id]
-                    state_indices_cpu[i] = base_slot * self._num_gdn_groups + g_offset + 1
+                    state_indices_cpu[i] = g_offset * self._gdn_max_reqs + base_slot + 1
             else:
                 block_table_cpu_tensor = self.input_batch.block_table[group_idx].get_cpu_tensor()
                 state_indices_cpu = block_table_cpu_tensor[req_indices, block_table_offsets].clone()
@@ -1624,6 +1648,24 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             all_state_indices_cpu.append(state_indices_cpu)
 
         return torch.stack(all_state_indices_cpu, dim=0)  # Shape: [num_groups, target_bs]
+
+    def _can_use_direct_gdn_state(
+        self,
+        state_indices: torch.Tensor,
+        num_indices: int,
+        target_bs: int,
+        tokens_per_request: int = 1,
+    ) -> bool:
+        if (not self._direct_gdn_state_enabled or not self._compact_gdn_enabled or self.use_prefix_caching
+                or not self._compact_gdn_group_ids or num_indices != target_bs or tokens_per_request != 1):
+            return False
+        base_slots = torch.arange(num_indices, dtype=torch.int32)
+        for group_idx in self._compact_gdn_group_ids:
+            group_offset = self._compact_gdn_group_offset[group_idx]
+            expected = group_offset * self._gdn_max_reqs + base_slots + 1
+            if not torch.equal(state_indices[group_idx, :num_indices], expected):
+                return False
+        return True
 
     def create_lora_mask(self, input_tokens: torch.Tensor, lora_ids: list[int], is_prompt: bool):
         '''
@@ -1982,7 +2024,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         if self._compact_gdn_group_ids:
             for req_id in req_ids_to_add:
                 if req_id not in self._gdn_req_to_base_slot:
-                    base_slot = self._gdn_slot_free_list.pop()
+                    req_index = self.input_batch.req_id_to_index[req_id]
+                    if req_index in self._gdn_slot_free_list:
+                        self._gdn_slot_free_list.remove(req_index)
+                        base_slot = req_index
+                    else:
+                        base_slot = self._gdn_slot_free_list.pop()
                     self._gdn_req_to_base_slot[req_id] = base_slot
                     logger.debug("GDN_COMPACT alloc req=%s base_slot=%d free_list_len=%d", req_id, base_slot,
                                  len(self._gdn_slot_free_list))
@@ -3311,6 +3358,21 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 load_state_indices_cpu = store_state_indices_cpu = \
                     self.prepare_mamba_state_idxs(req_indices, zeros, padded_batch_size)
 
+            direct_gdn_state = self._can_use_direct_gdn_state(
+                load_state_indices_cpu,
+                num_decodes,
+                padded_batch_size,
+                num_tokens,
+            ) and torch.equal(load_state_indices_cpu, store_state_indices_cpu)
+            if direct_gdn_state and not self._logged_direct_gdn_state and not self.warmup_mode:
+                self._logged_direct_gdn_state = True
+                logger.info(
+                    "GDN direct-state decode enabled: active_bs=%d padded_bs=%d groups=%d",
+                    num_decodes,
+                    padded_batch_size,
+                    len(self._compact_gdn_group_ids),
+                )
+
             seq_lens_cpu = torch.tensor(num_tokens_per_req, dtype=torch.int32, device='cpu', pin_memory=self.pin_memory)
 
             query_start_loc_p_cpu = torch.zeros(len(seq_lens_cpu) + 1,
@@ -3329,6 +3391,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             load_indices_tensor = None
             store_indices_tensor = None
             query_start_loc_p = None
+            direct_gdn_state = False
 
         # CPU<>HPU sync *should not* happen here.
         block_list_device = async_h2d_copy(block_list, device=self.device)
@@ -3399,6 +3462,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             store_indices_tensor=store_indices_tensor,
             seq_lens_tensor=seq_lens_tensor,
             query_start_loc=query_start_loc_p,
+            direct_gdn_state=direct_gdn_state,
         )
 
         return DecodeInputData(num_decodes=num_decodes,
@@ -4777,12 +4841,23 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     finished_sending=finished_sending,
                     finished_recving=finished_recving,
                 ))
-            return AsyncHPUModelRunnerOutput(
+            async_output = AsyncHPUModelRunnerOutput(
                 model_runner_output=model_runner_output,
                 sampled_token_ids=sampled_token_ids,
                 invalid_req_indices=self.invalid_req_indices,
                 async_output_copy_stream=self.async_output_copy_stream,
             )
+            # Hybrid recurrent states and request rows are still being
+            # established while prefills enter the decode batch. Settle those
+            # transitions before scheduling another batch, then retain normal
+            # async overlap for the pure-decode steady state.
+            if should_synchronize_hybrid_prefill_output(
+                    self.use_async_scheduling,
+                    self.num_mamba_like_layers,
+                    num_prefills,
+            ):
+                return async_output.get_output()
+            return async_output
         model_runner_output = ModelRunnerOutput(
             req_ids=all_req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
@@ -4994,6 +5069,35 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         1. Children of the nn.ModuleList
         2. Member of regional_compilation_layers_list
         """
+        from vllm_gaudi.models.qwen3_next import (
+            HpuQwen3NextModel,
+            can_compile_hpu_qwen3_layer_groups,
+            compile_hpu_qwen3_layer_groups,
+        )
+
+        if isinstance(module, HpuQwen3NextModel):
+            group_size = get_config().VLLM_HPU_QWEN3_COMPILE_LAYER_GROUP_SIZE or 1
+            if group_size < 1:
+                logger.warning("VLLM_HPU_QWEN3_COMPILE_LAYER_GROUP_SIZE must be positive, using 1")
+                group_size = 1
+
+            tensor_parallel_size = self.parallel_config.tensor_parallel_size
+            can_compile_groups = (can_compile_hpu_qwen3_layer_groups(
+                group_size,
+                tensor_parallel_size,
+                module.aux_hidden_state_layers,
+            ) and not hasattr(module, "_hpu_compiled_layer_groups"))
+            if can_compile_groups:
+                compiled_groups = compile_hpu_qwen3_layer_groups(module, group_size, self._compile)
+                logger.info(
+                    "Compiled %d Qwen3 decoder layer groups with group size %d",
+                    len(compiled_groups),
+                    group_size,
+                )
+            elif group_size > 1 and tensor_parallel_size != 1:
+                logger.warning("VLLM_HPU_QWEN3_COMPILE_LAYER_GROUP_SIZE is only supported with tensor parallel size 1; "
+                               "using per-layer compilation")
+
         if isinstance(module, torch.nn.ModuleList):
             for children_name, children_module in module.named_children():
                 self._compile_region(module, children_name, children_module)
@@ -6604,6 +6708,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         kv_caches: dict[str, torch.Tensor] = {}
         num_blocks = 0
+        max_attention_kernel_blocks = 0
 
         # Pre-count GDN groups for compact allocation (shared by both
         # hybrid and naive_mamba_cache_sharing paths).
@@ -6629,7 +6734,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # which coalesces *all* of a group's layers at distinct byte offsets, so
         # propagating across it now collapses a whole group onto one state.
         # State slots are selected per group (compact GDN:
-        # base_slot * num_gdn_groups + g_offset + 1; otherwise the group's own
+        # g_offset * max_num_reqs + base_slot + 1; otherwise the group's own
         # block table), so only the tensor identity can separate layers inside a
         # group. Key by position to restore the pre-#51718 sharing.
         mamba_state_cache: dict[tuple, tuple[torch.Tensor, ...]] = {}
@@ -6711,6 +6816,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         # The flat tensor must accommodate all kernel blocks.
                         blocks_per_kv_block = kv_cache_spec.block_size // attn_kernel_block_size
                         num_kernel_blocks = num_blocks * blocks_per_kv_block
+                        max_attention_kernel_blocks = max(max_attention_kernel_blocks, num_kernel_blocks)
                         kv_cache_shape = self.attn_backend.get_kv_cache_shape(num_kernel_blocks + 1,
                                                                               attn_kernel_block_size,
                                                                               kv_cache_spec.num_kv_heads,
@@ -6793,6 +6899,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     # not a per-layer size. Use the engine block count directly.
                     num_blocks = kv_cache_config.num_blocks
                     if isinstance(kv_cache_spec, FullAttentionSpec):
+                        max_attention_kernel_blocks = max(max_attention_kernel_blocks, num_blocks)
                         kv_cache_shape = self.attn_backend.get_kv_cache_shape(num_blocks + 1, kv_cache_spec.block_size,
                                                                               kv_cache_spec.num_kv_heads,
                                                                               kv_cache_spec.head_size)
@@ -6850,6 +6957,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     # (including heterogeneous ones like Gemma4).
                     num_blocks = kv_cache_config.num_blocks
                     if isinstance(kv_cache_spec, FullAttentionSpec):
+                        max_attention_kernel_blocks = max(max_attention_kernel_blocks, num_blocks)
                         kv_cache_shape = self.attn_backend.get_kv_cache_shape(num_blocks + 1, kv_cache_spec.block_size,
                                                                               kv_cache_spec.num_kv_heads,
                                                                               kv_cache_spec.head_size)
@@ -6907,18 +7015,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         assert layer_names == set(kv_caches.keys()), "Some layers are not correctly initialized"
         bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, self.kv_caches)
 
-        if self.enable_bucketing:
-            self.bucketing_manager.num_hpu_blocks = num_blocks
-
-        self._PAD_BLOCK_ID = num_blocks
-        self._PAD_SLOT_ID = num_blocks * self.attn_block_size
-        self._MAMBA_PAD_BLOCK_ID = num_blocks
-        self._dummy_num_blocks = num_blocks
+        self._set_cache_block_capacity(num_blocks, max_attention_kernel_blocks)
 
         # Initialize the GDN compact slot free-list.
         # The free-list contains base-slot IDs [0..max_num_reqs-1].
         # For request with base_slot `s` in group `g` (0-indexed within
-        # compact groups), the tensor index is s * num_gdn_groups + g + 1.
+        # compact groups), the tensor index is g * max_num_reqs + s + 1.
         if self._compact_gdn_group_ids:
             self._compact_gdn_group_offset = {gid: i for i, gid in enumerate(sorted(self._compact_gdn_group_ids))}
             gdn_max_reqs = self._gdn_max_reqs
