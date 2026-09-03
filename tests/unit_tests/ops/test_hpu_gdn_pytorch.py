@@ -713,7 +713,7 @@ class TestChunkGatedDeltaRule:
             prefill_seq_len=T,
             neumann_iters=14,
         )
-        flashqla_out, flashqla_state = gdn_exact.hpu_chunk_gated_delta_rule(
+        legacy_flashqla_out, legacy_flashqla_state = gdn_exact.hpu_chunk_gated_delta_rule(
             q,
             k,
             v,
@@ -733,7 +733,30 @@ class TestChunkGatedDeltaRule:
             state_in_fp32=True,
             preserve_compact_qk=True,
         )
+        flashqla_out, flashqla_state = gdn_exact.hpu_chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            chunk_size=16,
+            output_final_state=True,
+            prefill_num_seqs=B,
+            prefill_seq_len=T,
+            neumann_iters=14,
+            fused_state_matmul=True,
+            recursive_solver_base=16,
+            compact_repeated_kkt=True,
+            flashqla_reformulation=True,
+            deferred_output_add=True,
+            solve_in_fp32=True,
+            state_in_fp32=True,
+            preserve_compact_qk=True,
+            masked_triangular_decay=True,
+        )
 
+        torch.testing.assert_close(flashqla_out, legacy_flashqla_out, atol=0, rtol=0)
+        torch.testing.assert_close(flashqla_state, legacy_flashqla_state, atol=0, rtol=0)
         output_relative_l2 = torch.linalg.vector_norm(flashqla_out -
                                                       standard_out) / torch.linalg.vector_norm(standard_out)
         state_relative_l2 = torch.linalg.vector_norm(flashqla_state -

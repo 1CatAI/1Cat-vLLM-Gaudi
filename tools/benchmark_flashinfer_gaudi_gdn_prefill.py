@@ -35,7 +35,13 @@ def _make_inputs(tokens: int, *, pre_normalize_qk: bool) -> tuple[torch.Tensor, 
     return q, k, v, log_decay, beta, state
 
 
-def _compile(*, flashqla: bool, compact_qk: bool = False, qk_l2norm: str = "none"):
+def _compile(
+    *,
+    flashqla: bool,
+    compact_qk: bool = False,
+    qk_l2norm: str = "none",
+    masked_triangular_decay: bool = False,
+):
 
     use_qk_l2norm = qk_l2norm != "none"
     compile_qk_l2norm = qk_l2norm == "compiled"
@@ -64,6 +70,7 @@ def _compile(*, flashqla: bool, compact_qk: bool = False, qk_l2norm: str = "none
             solve_in_fp32=flashqla,
             state_in_fp32=flashqla,
             preserve_compact_qk=compact_qk,
+            masked_triangular_decay=masked_triangular_decay,
         )
 
     # The production compatibility helper deliberately creates a Dynamo
@@ -112,6 +119,8 @@ def main() -> None:
     parser.add_argument("--reference", choices=("general", "flashqla-expanded", "flashqla-compact"), default="general")
     parser.add_argument("--reference-qk-l2norm", choices=("none", "eager", "compiled"), default="none")
     parser.add_argument("--candidate-qk-l2norm", choices=("none", "eager", "compiled"))
+    parser.add_argument("--reference-masked-triangular-decay", action="store_true")
+    parser.add_argument("--candidate-masked-triangular-decay", action="store_true")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
@@ -140,6 +149,8 @@ def main() -> None:
         "reference": args.reference,
         "reference_qk_l2norm": args.reference_qk_l2norm,
         "candidate_qk_l2norm": candidate_qk_l2norm,
+        "reference_masked_triangular_decay": args.reference_masked_triangular_decay,
+        "candidate_masked_triangular_decay": args.candidate_masked_triangular_decay,
         "tokens": {},
     }
     for tokens in (int(value) for value in args.tokens.split(",") if value):
@@ -149,8 +160,14 @@ def main() -> None:
             flashqla=reference_flashqla,
             compact_qk=reference_compact_qk,
             qk_l2norm=args.reference_qk_l2norm,
+            masked_triangular_decay=args.reference_masked_triangular_decay,
         )
-        candidate = _compile(flashqla=True, compact_qk=True, qk_l2norm=candidate_qk_l2norm)
+        candidate = _compile(
+            flashqla=True,
+            compact_qk=True,
+            qk_l2norm=candidate_qk_l2norm,
+            masked_triangular_decay=args.candidate_masked_triangular_decay,
+        )
 
         reference_output, reference_state = reference(*inputs)
         candidate_output, candidate_state = candidate(*inputs)

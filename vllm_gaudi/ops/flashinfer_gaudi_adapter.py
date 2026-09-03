@@ -98,6 +98,7 @@ def maybe_run_gdn_prefill(
         solve_in_fp32=bool(tuning["solve_in_fp32"]),
         state_in_fp32=bool(tuning["state_in_fp32"]),
         preserve_compact_qk=bool(tuning["preserve_compact_qk"]),
+        masked_triangular_decay=bool(tuning["masked_triangular_decay"]),
     )
 
 

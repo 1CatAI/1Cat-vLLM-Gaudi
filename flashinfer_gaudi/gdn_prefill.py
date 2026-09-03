@@ -34,6 +34,7 @@ def _chunk_gated_delta_rule_log_gate(
     solve_in_fp32: bool = False,
     state_in_fp32: bool = False,
     preserve_compact_qk: bool = False,
+    masked_triangular_decay: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Internal log-gate entry point used by the vLLM adapter.
 
@@ -68,6 +69,7 @@ def _chunk_gated_delta_rule_log_gate(
         solve_in_fp32=solve_in_fp32,
         state_in_fp32=state_in_fp32,
         preserve_compact_qk=preserve_compact_qk,
+        masked_triangular_decay=masked_triangular_decay,
     )
 
 
@@ -190,6 +192,7 @@ def chunk_gated_delta_rule(
         solve_in_fp32=True,
         state_in_fp32=True,
         preserve_compact_qk=v.shape[1] > q.shape[1],
+        masked_triangular_decay=True,
     )
     result = result.squeeze(0)
     if output is not None:

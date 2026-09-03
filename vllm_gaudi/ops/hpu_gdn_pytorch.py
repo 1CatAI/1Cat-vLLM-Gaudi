@@ -201,6 +201,7 @@ def hpu_chunk_gdr_phase_a(
     qk_head_repeat: int = 1,
     solve_in_fp32: bool = False,
     compact_qk_inputs: bool = False,
+    masked_triangular_decay: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Phase A: batched stages 2-4 for ALL chunks at once.
 
@@ -211,6 +212,8 @@ def hpu_chunk_gdr_phase_a(
     tc = chunk_size
     if compact_qk_inputs:
         raise ValueError("Compact Q/K inputs require the FlashQLA phase-A path.")
+    if masked_triangular_decay:
+        raise ValueError("Masked triangular decay requires the FlashQLA phase-A path.")
 
     # Reshape to [S, seq_len, H, dim] then [S, C, tc, H, dim]
     q_seqs = qf.reshape(S, seq_len, H, Kdim)
@@ -305,6 +308,7 @@ def hpu_flashqla_chunk_gdr_phase_a(
     qk_head_repeat: int = 1,
     solve_in_fp32: bool = False,
     compact_qk_inputs: bool = False,
+    masked_triangular_decay: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the stable FlashQLA gate-free phase-A reformulation.
 
@@ -351,11 +355,17 @@ def hpu_flashqla_chunk_gdr_phase_a(
     g_flat = g_chunks.reshape(chunk_batch, tc, H).permute(0, 2, 1).reshape(chunk_batch * H, tc)
     b_flat = b_chunks.reshape(chunk_batch, tc, H).permute(0, 2, 1).reshape(chunk_batch * H, tc)
 
+    strict_lower_mask = None
+    if masked_triangular_decay:
+        positions = torch.arange(tc, device=device)
+        strict_lower_mask = positions.unsqueeze(-1) > positions.unsqueeze(0)
+
     if compact_qk_inputs:
         compact_dot = torch.matmul(k_head_major, k_head_major.transpose(-1, -2))
         grouped_beta = b_flat.reshape(chunk_batch, qk_heads, qk_head_repeat, tc)
-        a_lower = torch.tril(compact_dot.unsqueeze(2) * grouped_beta.unsqueeze(-1),
-                             diagonal=-1).reshape(chunk_batch * H, tc, tc)
+        a_product = compact_dot.unsqueeze(2) * grouped_beta.unsqueeze(-1)
+        a_lower = (torch.tril(a_product, diagonal=-1) if strict_lower_mask is None else a_product * strict_lower_mask)
+        a_lower = a_lower.reshape(chunk_batch * H, tc, tc)
     elif compact_repeated_kkt and qk_head_repeat > 1:
         if H % qk_head_repeat != 0:
             raise ValueError("qk_head_repeat must divide the expanded GDN head count, "
@@ -364,12 +374,14 @@ def hpu_flashqla_chunk_gdr_phase_a(
         compact_k = k_chunks[..., ::qk_head_repeat, :].reshape(chunk_batch, tc, compact_heads, Kdim).permute(0, 2, 1, 3)
         compact_dot = torch.matmul(compact_k, compact_k.transpose(-1, -2))
         grouped_beta = b_flat.reshape(chunk_batch, compact_heads, qk_head_repeat, tc)
-        a_lower = torch.tril(compact_dot.unsqueeze(2) * grouped_beta.unsqueeze(-1),
-                             diagonal=-1).reshape(chunk_batch * H, tc, tc)
+        a_product = compact_dot.unsqueeze(2) * grouped_beta.unsqueeze(-1)
+        a_lower = (torch.tril(a_product, diagonal=-1) if strict_lower_mask is None else a_product * strict_lower_mask)
+        a_lower = a_lower.reshape(chunk_batch * H, tc, tc)
     else:
         assert k_flat is not None
         dot = torch.bmm(k_flat, k_flat.transpose(1, 2))
-        a_lower = torch.tril(dot * b_flat.unsqueeze(-1), diagonal=-1)
+        a_product = dot * b_flat.unsqueeze(-1)
+        a_lower = (torch.tril(a_product, diagonal=-1) if strict_lower_mask is None else a_product * strict_lower_mask)
 
     eye = torch.eye(tc, dtype=qf.dtype, device=device)
     solve_dtype = torch.float32 if solve_in_fp32 else qf.dtype
@@ -384,7 +396,12 @@ def hpu_flashqla_chunk_gdr_phase_a(
     gate_delta = g_flat.unsqueeze(-1) - g_flat.unsqueeze(-2)
     # Mask before exp as well as after it: upper-triangle values have the
     # opposite sign and can overflow even though they are never consumed.
-    causal_decay = torch.tril(torch.exp(torch.tril(gate_delta))).to(gate_free_inverse.dtype)
+    if strict_lower_mask is None:
+        causal_decay = torch.tril(torch.exp(torch.tril(gate_delta)))
+    else:
+        causal_mask = strict_lower_mask | torch.eye(tc, dtype=torch.bool, device=device)
+        causal_decay = torch.exp(torch.where(causal_mask, gate_delta, float("-inf")))
+    causal_decay = causal_decay.to(gate_free_inverse.dtype)
     transformed_inverse = (gate_free_inverse * causal_decay * b_flat.to(gate_free_inverse.dtype).unsqueeze(-2))
     u_flat = torch.bmm(transformed_inverse, v_flat.to(gate_free_inverse.dtype))
     gate_exp = torch.exp(g_flat).to(gate_free_inverse.dtype)
@@ -1148,6 +1165,7 @@ def hpu_chunk_gated_delta_rule(
     solve_in_fp32: bool = False,
     state_in_fp32: bool = False,
     preserve_compact_qk: bool = False,
+    masked_triangular_decay: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """PyTorch replacement for chunk_gated_delta_rule.
 
@@ -1169,6 +1187,8 @@ def hpu_chunk_gated_delta_rule(
         raise ValueError("preserve_compact_qk requires value heads to be an integer multiple of fewer Q/K heads.")
     if compact_qk_inputs and not flashqla_reformulation:
         raise ValueError("preserve_compact_qk requires flashqla_reformulation=True.")
+    if masked_triangular_decay and not flashqla_reformulation:
+        raise ValueError("masked_triangular_decay requires flashqla_reformulation=True.")
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be > 0, got {chunk_size}.")
     if neumann_iters <= 0:
@@ -1215,6 +1235,7 @@ def hpu_chunk_gated_delta_rule(
             qk_head_repeat=qk_head_repeat,
             solve_in_fp32=solve_in_fp32,
             compact_qk_inputs=compact_qk_inputs,
+            masked_triangular_decay=masked_triangular_decay,
         )
         if flashqla_reformulation:
             u_all, w_all, q_chunks, k_chunks, g_chunks, local_decay = phase_a_result

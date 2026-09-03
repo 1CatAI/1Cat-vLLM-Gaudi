@@ -40,7 +40,8 @@
       "solve_in_fp32": true,
       "state_in_fp32": true,
       "compute_dtype": "float32",
-      "preserve_compact_qk": true
+      "preserve_compact_qk": true,
+      "masked_triangular_decay": true
     }
   }
 }
