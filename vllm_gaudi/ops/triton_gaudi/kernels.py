@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-
 """Triton source for Gaudi2-native vLLM kernels.
 
 This module is imported only after the runtime has verified that the Gaudi
@@ -17,13 +16,12 @@ import triton.language as tl
 from triton.backends.compiler import GPUTarget
 from triton.backends.gaudi import GaudiConfig, GaudiKernelArtifactV1
 
-
 _graph_artifact_lock = threading.Lock()
 _graph_artifact_handles: dict[tuple[str, int], int] = {}
 QK_CONV_TILE = 256
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _elementwise_schedule() -> dict[str, object]:
     return GaudiConfig(
         unroll=1,
@@ -44,7 +42,7 @@ def _rms_norm_schedule(block_size: int) -> dict[str, object]:
     ).as_backend_options()
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _silu_and_mul_schedule() -> dict[str, object]:
     return GaudiConfig(
         unroll=1,
@@ -54,7 +52,7 @@ def _silu_and_mul_schedule() -> dict[str, object]:
     ).as_backend_options()
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _dynamic_quant_schedule() -> dict[str, object]:
     return GaudiConfig(
         unroll=1,
@@ -86,7 +84,7 @@ def _gdn_decode_schedule(value_tile: int) -> dict[str, object]:
     ).as_backend_options()
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _gdn_decode_conv_schedule() -> dict[str, object]:
     return GaudiConfig(
         unroll=1,
@@ -96,7 +94,7 @@ def _gdn_decode_conv_schedule() -> dict[str, object]:
     ).as_backend_options()
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _gdn_qk_conv_schedule() -> dict[str, object]:
     return GaudiConfig(
         unroll=1,
@@ -131,7 +129,10 @@ def _compile_fused_add_rms_norm(n_cols: int) -> tuple[GaudiKernelArtifactV1, int
             "N_COLS": "constexpr",
             "BLOCK_SIZE": "constexpr",
         },
-        constexprs={"N_COLS": n_cols, "BLOCK_SIZE": block_size},
+        constexprs={
+            "N_COLS": n_cols,
+            "BLOCK_SIZE": block_size
+        },
     )
     compiled = triton.compile(
         source,
@@ -151,7 +152,10 @@ def _compile_silu_and_mul(n_cols: int, block_size: int) -> GaudiKernelArtifactV1
             "N_COLS": "constexpr",
             "BLOCK_SIZE": "constexpr",
         },
-        constexprs={"N_COLS": n_cols, "BLOCK_SIZE": block_size},
+        constexprs={
+            "N_COLS": n_cols,
+            "BLOCK_SIZE": block_size
+        },
     )
     compiled = triton.compile(
         source,
@@ -173,7 +177,10 @@ def _compile_dynamic_quant(n_cols: int) -> tuple[GaudiKernelArtifactV1, int]:
             "N_COLS": "constexpr",
             "BLOCK_SIZE": "constexpr",
         },
-        constexprs={"N_COLS": n_cols, "BLOCK_SIZE": block_size},
+        constexprs={
+            "N_COLS": n_cols,
+            "BLOCK_SIZE": block_size
+        },
     )
     compiled = triton.compile(
         source,
@@ -184,9 +191,7 @@ def _compile_dynamic_quant(n_cols: int) -> tuple[GaudiKernelArtifactV1, int]:
 
 
 @functools.lru_cache(maxsize=32)
-def _compile_silu_and_mul_dynamic_quant(
-    n_cols: int,
-) -> tuple[GaudiKernelArtifactV1, int]:
+def _compile_silu_and_mul_dynamic_quant(n_cols: int, ) -> tuple[GaudiKernelArtifactV1, int]:
     block_size = max(128, triton.next_power_of_2(n_cols))
     source = triton.compiler.ASTSource(
         fn=_silu_and_mul_dynamic_quant_kernel,
@@ -197,7 +202,10 @@ def _compile_silu_and_mul_dynamic_quant(
             "N_COLS": "constexpr",
             "BLOCK_SIZE": "constexpr",
         },
-        constexprs={"N_COLS": n_cols, "BLOCK_SIZE": block_size},
+        constexprs={
+            "N_COLS": n_cols,
+            "BLOCK_SIZE": block_size
+        },
     )
     compiled = triton.compile(
         source,
@@ -284,9 +292,7 @@ def _compile_gdn_qk_conv_packed() -> GaudiKernelArtifactV1:
 
 
 @functools.lru_cache(maxsize=4)
-def _compile_gdn_decode_value_conv_packed(
-    value_tile: int,
-) -> GaudiKernelArtifactV1:
+def _compile_gdn_decode_value_conv_packed(value_tile: int, ) -> GaudiKernelArtifactV1:
     source = triton.compiler.ASTSource(
         fn=_gdn_decode_value_conv_packed_kernel,
         signature={
@@ -370,9 +376,7 @@ def _prepare_dynamic_quant(n_cols: int) -> tuple[str, int]:
 
 
 @functools.lru_cache(maxsize=32)
-def _prepare_silu_and_mul_dynamic_quant_cached(
-    n_cols: int,
-) -> tuple[str, int]:
+def _prepare_silu_and_mul_dynamic_quant_cached(n_cols: int, ) -> tuple[str, int]:
     artifact, block_size = _compile_silu_and_mul_dynamic_quant(n_cols)
     _materialize_graph_artifact(artifact, torch.hpu.current_device())
     return artifact.artifact_hash, block_size
@@ -435,8 +439,7 @@ def _prepare_gdn_decode_value_conv_packed(value_tile: int) -> str:
 def _gdn_decode_value_tile() -> int:
     value = int(os.environ.get("VLLM_HPU_TRITON_GDN_VALUE_TILE", "16"))
     if value not in (16, 32, 64, 128):
-        raise ValueError(
-            "VLLM_HPU_TRITON_GDN_VALUE_TILE must be 16, 32, 64, or 128")
+        raise ValueError("VLLM_HPU_TRITON_GDN_VALUE_TILE must be 16, 32, 64, or 128")
     return value
 
 
@@ -522,8 +525,7 @@ def _dynamic_quant_kernel(
     columns = tl.arange(0, BLOCK_SIZE)
     mask = columns < N_COLS
     offsets = row * N_COLS + columns
-    values = tl.load(input_ptr + offsets, mask=mask, other=0.0).to(
-        tl.float32)
+    values = tl.load(input_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     abs_max = tl.max(tl.abs(values), axis=0)
     scale = (abs_max + 1.0e-8) / 240.0
     tl.store(scale_ptr + row, scale)
@@ -747,20 +749,13 @@ def _gdn_qk_conv_packed_kernel(
     raw_slot = tl.load(state_indices + batch)
     conv_slot = ((raw_slot % conv_slots) + conv_slots) % conv_slots
     raw = tl.load(packed_qkv + batch * 10240 + channels)
-    history0 = tl.load(
-        conv_state + (conv_slot * 3 + 0) * 10240 + channels)
-    history1 = tl.load(
-        conv_state + (conv_slot * 3 + 1) * 10240 + channels)
-    history2 = tl.load(
-        conv_state + (conv_slot * 3 + 2) * 10240 + channels)
-    conv = history0.to(tl.float32) * tl.load(
-        conv_weight_t + 0 * 10240 + channels).to(tl.float32)
-    conv += history1.to(tl.float32) * tl.load(
-        conv_weight_t + 1 * 10240 + channels).to(tl.float32)
-    conv += history2.to(tl.float32) * tl.load(
-        conv_weight_t + 2 * 10240 + channels).to(tl.float32)
-    conv += raw.to(tl.float32) * tl.load(
-        conv_weight_t + 3 * 10240 + channels).to(tl.float32)
+    history0 = tl.load(conv_state + (conv_slot * 3 + 0) * 10240 + channels)
+    history1 = tl.load(conv_state + (conv_slot * 3 + 1) * 10240 + channels)
+    history2 = tl.load(conv_state + (conv_slot * 3 + 2) * 10240 + channels)
+    conv = history0.to(tl.float32) * tl.load(conv_weight_t + 0 * 10240 + channels).to(tl.float32)
+    conv += history1.to(tl.float32) * tl.load(conv_weight_t + 1 * 10240 + channels).to(tl.float32)
+    conv += history2.to(tl.float32) * tl.load(conv_weight_t + 2 * 10240 + channels).to(tl.float32)
+    conv += raw.to(tl.float32) * tl.load(conv_weight_t + 3 * 10240 + channels).to(tl.float32)
     rounded = conv.to(tl.bfloat16).to(tl.float32)
     activated = (rounded * tl.sigmoid(rounded)).to(tl.bfloat16)
     tl.store(conv_state + (conv_slot * 3 + 0) * 10240 + channels, history1)
@@ -793,11 +788,8 @@ def _gdn_decode_value_conv_packed_kernel(
     key_head = value_head // 3
     key_offsets = tl.arange(0, 128)
     qk_row = batch * 4096
-    q = tl.load(qk_conv + qk_row + key_head * 128 + key_offsets).to(
-        tl.float32)
-    k = tl.load(
-        qk_conv + qk_row + 2048 + key_head * 128 + key_offsets).to(
-            tl.float32)
+    q = tl.load(qk_conv + qk_row + key_head * 128 + key_offsets).to(tl.float32)
+    k = tl.load(qk_conv + qk_row + 2048 + key_head * 128 + key_offsets).to(tl.float32)
     q = q * tl.rsqrt(tl.sum(q * q, axis=0) + 1.0e-6)
     q *= 0.08838834764831845
     k = k * tl.rsqrt(tl.sum(k * k, axis=0) + 1.0e-6)
@@ -822,23 +814,15 @@ def _gdn_decode_value_conv_packed_kernel(
         value_row = value_start + value_offset
         channel = 4096 + value_head * 128 + value_row
         raw_value = tl.load(packed_qkv + packed_row + channel)
-        history0 = tl.load(
-            conv_state + (conv_slot * 3 + 0) * 10240 + channel)
-        history1 = tl.load(
-            conv_state + (conv_slot * 3 + 1) * 10240 + channel)
-        history2 = tl.load(
-            conv_state + (conv_slot * 3 + 2) * 10240 + channel)
-        value_conv = history0.to(tl.float32) * tl.load(
-            conv_weight_t + 0 * 10240 + channel).to(tl.float32)
-        value_conv += history1.to(tl.float32) * tl.load(
-            conv_weight_t + 1 * 10240 + channel).to(tl.float32)
-        value_conv += history2.to(tl.float32) * tl.load(
-            conv_weight_t + 2 * 10240 + channel).to(tl.float32)
-        value_conv += raw_value.to(tl.float32) * tl.load(
-            conv_weight_t + 3 * 10240 + channel).to(tl.float32)
+        history0 = tl.load(conv_state + (conv_slot * 3 + 0) * 10240 + channel)
+        history1 = tl.load(conv_state + (conv_slot * 3 + 1) * 10240 + channel)
+        history2 = tl.load(conv_state + (conv_slot * 3 + 2) * 10240 + channel)
+        value_conv = history0.to(tl.float32) * tl.load(conv_weight_t + 0 * 10240 + channel).to(tl.float32)
+        value_conv += history1.to(tl.float32) * tl.load(conv_weight_t + 1 * 10240 + channel).to(tl.float32)
+        value_conv += history2.to(tl.float32) * tl.load(conv_weight_t + 2 * 10240 + channel).to(tl.float32)
+        value_conv += raw_value.to(tl.float32) * tl.load(conv_weight_t + 3 * 10240 + channel).to(tl.float32)
         value_rounded = value_conv.to(tl.bfloat16).to(tl.float32)
-        value = (value_rounded * tl.sigmoid(value_rounded)).to(
-            tl.bfloat16).to(tl.float32)
+        value = (value_rounded * tl.sigmoid(value_rounded)).to(tl.bfloat16).to(tl.float32)
         tl.store(
             conv_state + (conv_slot * 3 + 0) * 10240 + channel,
             history1,
@@ -852,9 +836,7 @@ def _gdn_decode_value_conv_packed_kernel(
             raw_value,
         )
 
-        state_offsets = (
-            ((state_slot * 48 + value_head) * 128 + value_row) * 128 +
-            key_offsets)
+        state_offsets = (((state_slot * 48 + value_head) * 128 + value_row) * 128 + key_offsets)
         state = tl.load(state_cache + state_offsets)
         state *= decay
         projection = tl.sum(state * k, axis=0)
@@ -941,11 +923,7 @@ def silu_and_mul(input_tensor: torch.Tensor) -> torch.Tensor:
     rows = input_tensor.numel() // input_width
     block_size = _silu_and_mul_block_size(n_cols)
     artifact_hash = _prepare_silu_and_mul(n_cols, block_size)
-    logical_input = (
-        input_tensor
-        if input_tensor.ndim == 2
-        else input_tensor.view(rows, input_width)
-    )
+    logical_input = (input_tensor if input_tensor.ndim == 2 else input_tensor.view(rows, input_width))
     output = torch.ops.triton_gaudi.silu_and_mul.default(
         logical_input,
         artifact_hash,
@@ -977,9 +955,7 @@ def silu_and_mul_direct(input_tensor: torch.Tensor) -> torch.Tensor:
     return output.view(*input_tensor.shape[:-1], n_cols)
 
 
-def dynamic_quant(
-    input_tensor: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+def dynamic_quant(input_tensor: torch.Tensor, ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch graph-native row-wise BF16 to Gaudi2 E4M3 quantization."""
     if input_tensor.ndim != 2:
         raise ValueError("Gaudi Triton dynamic quantization requires a 2D tensor")
@@ -995,9 +971,7 @@ def dynamic_quant(
     return quantized, scale
 
 
-def dynamic_quant_direct(
-    input_tensor: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+def dynamic_quant_direct(input_tensor: torch.Tensor, ) -> tuple[torch.Tensor, torch.Tensor]:
     """Direct recipe launch retained for quantization ABI diagnostics."""
     if input_tensor.ndim != 2:
         raise ValueError("Gaudi Triton dynamic quantization requires a 2D tensor")
@@ -1016,39 +990,29 @@ def dynamic_quant_direct(
     return output, scale
 
 
-def silu_and_mul_dynamic_quant(
-    input_tensor: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+def silu_and_mul_dynamic_quant(input_tensor: torch.Tensor, ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch graph-native SwiGLU plus row-wise E4M3 quantization."""
     if input_tensor.ndim != 2:
-        raise ValueError(
-            "Gaudi Triton fused SiLU dynamic quantization requires a 2D tensor"
-        )
+        raise ValueError("Gaudi Triton fused SiLU dynamic quantization requires a 2D tensor")
     rows, input_width = input_tensor.shape
     if input_width <= 0 or input_width % 2:
         raise ValueError("fused SiLU dynamic quantization requires an even input width")
     n_cols = input_width // 2
     artifact_hash, block_size = _prepare_silu_and_mul_dynamic_quant(n_cols)
-    quantized, scale = (
-        torch.ops.triton_gaudi.silu_and_mul_dynamic_quant.default(
-            input_tensor,
-            artifact_hash,
-            block_size,
-            n_cols,
-            rows,
-        )
-    )
+    quantized, scale = (torch.ops.triton_gaudi.silu_and_mul_dynamic_quant.default(
+        input_tensor,
+        artifact_hash,
+        block_size,
+        n_cols,
+        rows,
+    ))
     return quantized, scale
 
 
-def silu_and_mul_dynamic_quant_direct(
-    input_tensor: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+def silu_and_mul_dynamic_quant_direct(input_tensor: torch.Tensor, ) -> tuple[torch.Tensor, torch.Tensor]:
     """Direct recipe launch retained for fused-path diagnostics."""
     if input_tensor.ndim != 2:
-        raise ValueError(
-            "Gaudi Triton fused SiLU dynamic quantization requires a 2D tensor"
-        )
+        raise ValueError("Gaudi Triton fused SiLU dynamic quantization requires a 2D tensor")
     rows, input_width = input_tensor.shape
     if input_width <= 0 or input_width % 2:
         raise ValueError("fused SiLU dynamic quantization requires an even input width")

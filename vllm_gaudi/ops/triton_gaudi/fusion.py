@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-
 """Fail-closed HPU graph fusion for Gaudi2 Triton activation quantization."""
 
 from __future__ import annotations
@@ -10,10 +9,20 @@ from typing import Any
 import torch
 from torch.fx import GraphModule, Node
 
-
 _registration_lock = threading.Lock()
 _registered = False
 _MISSING = object()
+_GDN_GRAPH_BATCH_ARGS = {
+    "gdn_decode_packed": 1,
+    "gdn_decode_value_conv_packed": 3,
+    "gdn_qk_conv_packed": 1,
+}
+_GDN_GRAPH_BATCHES = frozenset((8, ))
+_STATEFUL_GDN_OPS = frozenset({
+    "gdn_decode_conv_packed",
+    "gdn_decode_packed",
+    *_GDN_GRAPH_BATCH_ARGS,
+})
 
 
 def _validate_bridge_pass_api(passes_module: Any) -> tuple[Any, Any]:
@@ -24,14 +33,26 @@ def _validate_bridge_pass_api(passes_module: Any) -> tuple[Any, Any]:
     )
     missing = [name for name in required if not hasattr(passes_module, name)]
     if missing:
-        raise RuntimeError(
-            "Gaudi Bridge is missing required hpu_backend passes: "
-            + ", ".join(missing)
-        )
+        raise RuntimeError("Gaudi Bridge is missing required hpu_backend passes: " + ", ".join(missing))
     return (
         passes_module.OptimizationPassPlacement,
         passes_module.register_pass_at_optimization_pass,
     )
+
+
+def _validate_bridge_gdn_graph_policy(shared_layer_module: Any) -> None:
+    actual = getattr(shared_layer_module, "TRITON_GAUDI_GDN_BATCH_ARGS", None)
+    actual_batches = getattr(shared_layer_module, "TRITON_GAUDI_GDN_BATCHES", None)
+    graph_ops = getattr(shared_layer_module, "TRITON_GAUDI_GRAPH_OPS", ())
+    shape_gate = getattr(
+        shared_layer_module,
+        "_is_supported_triton_gaudi_gdn_graph",
+        None,
+    )
+    if (actual != _GDN_GRAPH_BATCH_ARGS or actual_batches != _GDN_GRAPH_BATCHES or not callable(shape_gate)):
+        raise RuntimeError("Gaudi Bridge is missing shape-gated GDN placement")
+    if _STATEFUL_GDN_OPS.intersection(graph_ops or ()):
+        raise RuntimeError("Gaudi Bridge enables unsafe generic GDN placement")
 
 
 def _resolve_triton_ops() -> tuple[Any, Any, Any]:
@@ -42,9 +63,7 @@ def _resolve_triton_ops() -> tuple[Any, Any, Any]:
             torch.ops.triton_gaudi.silu_and_mul_dynamic_quant.default,
         )
     except AttributeError as exc:
-        raise RuntimeError(
-            "Gaudi Bridge launch ABI v1.10 fused activation quantization op is missing"
-        ) from exc
+        raise RuntimeError("Gaudi Bridge launch ABI v1.10 fused activation quantization op is missing") from exc
 
 
 def _view_targets() -> set[Any]:
@@ -102,36 +121,21 @@ def pass_fuse_triton_gaudi_silu_dynamic_quant(ctx: Any) -> bool:
         quant_input = _argument(quant_node, 0, "input")
         n_cols = _argument(quant_node, 3, "n_cols")
         rows = _argument(quant_node, 4, "rows")
-        if (
-            not isinstance(n_cols, int)
-            or not isinstance(rows, int)
-            or n_cols <= 128
-            or n_cols > 4096
-            or rows <= 0
-        ):
+        if not isinstance(n_cols, int) or not isinstance(rows, int) or n_cols <= 128 or n_cols > 4096 or rows <= 0:
             continue
 
         source, _ = _unwrap_exclusive_views(quant_input)
-        if (
-            not isinstance(source, Node)
-            or source.op != "call_function"
-            or source.target != silu_op
-            or len(source.users) != 1
-        ):
+        if (not isinstance(source, Node) or source.op != "call_function" or source.target != silu_op
+                or len(source.users) != 1):
             continue
         silu_input = _argument(source, 0, "input")
         silu_n_cols = _argument(source, 3, "n_cols")
         silu_rows = _argument(source, 4, "rows")
-        if (
-            not isinstance(silu_input, Node)
-            or silu_n_cols != n_cols
-            or silu_rows != rows
-        ):
+        if not isinstance(silu_input, Node) or silu_n_cols != n_cols or silu_rows != rows:
             continue
 
         from vllm_gaudi.ops.triton_gaudi.kernels import (
-            _prepare_silu_and_mul_dynamic_quant,
-        )
+            _prepare_silu_and_mul_dynamic_quant, )
 
         artifact_hash, block_size = _prepare_silu_and_mul_dynamic_quant(n_cols)
         with graph.inserting_before(quant_node):
@@ -168,14 +172,13 @@ def register_silu_dynamic_quant_fusion_pass() -> None:
         try:
             from habana_frameworks.torch.dynamo.compile_backend import (
                 passes as bridge_passes,
+                shared_layer as bridge_shared_layer,
             )
-            OptimizationPassPlacement, register_pass_at_optimization_pass = (
-                _validate_bridge_pass_api(bridge_passes)
-            )
+
+            OptimizationPassPlacement, register_pass_at_optimization_pass = _validate_bridge_pass_api(bridge_passes)
+            _validate_bridge_gdn_graph_policy(bridge_shared_layer)
         except (AttributeError, ImportError, RuntimeError) as exc:
-            raise RuntimeError(
-                "Gaudi Bridge does not expose the required hpu_backend pass API"
-            ) from exc
+            raise RuntimeError("Gaudi Bridge does not expose the required hpu_backend pass API") from exc
         register_pass_at_optimization_pass(
             pass_fuse_triton_gaudi_silu_dynamic_quant,
             OptimizationPassPlacement.PRE_PLACEMENT,

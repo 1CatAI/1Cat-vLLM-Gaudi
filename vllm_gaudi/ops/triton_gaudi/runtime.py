@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-
 """Policy and diagnostics for the Gaudi2-native Triton fast path."""
 
 from __future__ import annotations
@@ -62,10 +61,9 @@ def _compile_fast_path_mode() -> str:
     """Freeze rollout policy before Dynamo builds an HPU graph."""
     mode = _mode()
     if mode is not FastPathMode.OFF and not (_prepared and _available):
-        raise FastPathUnavailable(
-            "Gaudi Triton must be prepared before torch.compile and before "
-            "the first HPU allocation; call prepare_if_enabled() during "
-            "operator registration")
+        raise FastPathUnavailable("Gaudi Triton must be prepared before torch.compile and before "
+                                  "the first HPU allocation; call prepare_if_enabled() during "
+                                  "operator registration")
     return mode.value
 
 
@@ -118,8 +116,7 @@ def prepare_if_enabled() -> bool:
                 prepare_environment()
                 validate_bridge_launch_abi()
                 from vllm_gaudi.ops.triton_gaudi.fusion import (
-                    register_silu_dynamic_quant_fusion_pass,
-                )
+                    register_silu_dynamic_quant_fusion_pass, )
 
                 register_silu_dynamic_quant_fusion_pass()
                 _available = True
@@ -221,8 +218,7 @@ def fused_add_rms_norm(
         rejection_reason = _fused_add_rms_norm_rejection_reason(hidden_states, residual, weight)
         if rejection_reason is not None:
             if compile_mode == FastPathMode.STRICT.value:
-                raise FastPathUnavailable(
-                    f"Gaudi Triton strict mode rejected fused_add_rms_norm: {rejection_reason}")
+                raise FastPathUnavailable(f"Gaudi Triton strict mode rejected fused_add_rms_norm: {rejection_reason}")
             return None
         from vllm_gaudi.ops.triton_gaudi.kernels import fused_add_rms_norm as launch_fused_add_rms_norm
 
@@ -261,14 +257,11 @@ def fused_add_rms_norm(
 def _reject_dynamic_quant(reason: str) -> None:
     _counters[f"fallback.dynamic_quant.{reason}"] += 1
     if _mode() is FastPathMode.STRICT:
-        raise FastPathUnavailable(
-            f"Gaudi Triton strict mode rejected dynamic_quant: {reason}")
+        raise FastPathUnavailable(f"Gaudi Triton strict mode rejected dynamic_quant: {reason}")
     return None
 
 
-def _dynamic_quant_rejection_reason(
-    input_tensor: "torch.Tensor",
-) -> str | None:
+def _dynamic_quant_rejection_reason(input_tensor: "torch.Tensor", ) -> str | None:
     if input_tensor.device.type != "hpu":
         return "non_hpu_tensor"
     if input_tensor.ndim != 2 or input_tensor.shape[0] <= 0:
@@ -285,9 +278,7 @@ def _dynamic_quant_rejection_reason(
     return None
 
 
-def dynamic_quant(
-    input_tensor: "torch.Tensor",
-) -> tuple["torch.Tensor", "torch.Tensor"] | None:
+def dynamic_quant(input_tensor: "torch.Tensor", ) -> tuple["torch.Tensor", "torch.Tensor"] | None:
     """Quantize decode-sized BF16 rows with one Gaudi2-native TPC node."""
     if torch.compiler.is_compiling():
         compile_mode = _compile_fast_path_mode()
@@ -298,13 +289,11 @@ def dynamic_quant(
         rejection_reason = _dynamic_quant_rejection_reason(input_tensor)
         if rejection_reason is not None:
             if compile_mode == FastPathMode.STRICT.value:
-                raise FastPathUnavailable(
-                    "Gaudi Triton strict mode rejected dynamic_quant: "
-                    f"{rejection_reason}")
+                raise FastPathUnavailable("Gaudi Triton strict mode rejected dynamic_quant: "
+                                          f"{rejection_reason}")
             return None
         from vllm_gaudi.ops.triton_gaudi.kernels import (
-            dynamic_quant as launch_dynamic_quant,
-        )
+            dynamic_quant as launch_dynamic_quant, )
 
         return launch_dynamic_quant(input_tensor)
 
@@ -322,17 +311,14 @@ def dynamic_quant(
 
     try:
         from vllm_gaudi.ops.triton_gaudi.kernels import (
-            dynamic_quant as launch_dynamic_quant,
-        )
+            dynamic_quant as launch_dynamic_quant, )
 
         output = launch_dynamic_quant(input_tensor)
         _counters["triton.dynamic_quant"] += 1
         return output
     except Exception as exc:
         if _mode() is FastPathMode.STRICT:
-            raise FastPathUnavailable(
-                "Gaudi Triton dynamic quantization compilation or launch failed"
-            ) from exc
+            raise FastPathUnavailable("Gaudi Triton dynamic quantization compilation or launch failed") from exc
         _warn_once(
             "dynamic_quant.launch",
             "Gaudi Triton dynamic quantization failed "
@@ -345,33 +331,20 @@ def dynamic_quant(
 def _reject_silu_and_mul_dynamic_quant(reason: str) -> None:
     _counters[f"fallback.silu_and_mul_dynamic_quant.{reason}"] += 1
     if _mode() is FastPathMode.STRICT:
-        raise FastPathUnavailable(
-            "Gaudi Triton strict mode rejected "
-            f"silu_and_mul_dynamic_quant: {reason}"
-        )
+        raise FastPathUnavailable("Gaudi Triton strict mode rejected "
+                                  f"silu_and_mul_dynamic_quant: {reason}")
     return None
 
 
-def _silu_and_mul_dynamic_quant_rejection_reason(
-    input_tensor: torch.Tensor,
-) -> str | None:
+def _silu_and_mul_dynamic_quant_rejection_reason(input_tensor: torch.Tensor, ) -> str | None:
     if input_tensor.device.type != "hpu":
         return "non_hpu_tensor"
-    if (
-        input_tensor.ndim != 2
-        or input_tensor.shape[0] <= 0
-        or input_tensor.shape[1] <= 0
-        or input_tensor.shape[1] % 2
-    ):
+    if (input_tensor.ndim != 2 or input_tensor.shape[0] <= 0 or input_tensor.shape[1] <= 0
+            or input_tensor.shape[1] % 2):
         return "shape_mismatch"
     rows, input_width = input_tensor.shape
     n_cols = input_width // 2
-    if (
-        rows > (1 << 32) - 1
-        or n_cols <= 128
-        or n_cols > _SILU_DYNAMIC_QUANT_MAX_COLS
-        or input_tensor.numel() == 0
-    ):
+    if (rows > (1 << 32) - 1 or n_cols <= 128 or n_cols > _SILU_DYNAMIC_QUANT_MAX_COLS or input_tensor.numel() == 0):
         return "unsupported_size"
     if input_tensor.dtype != torch.bfloat16:
         return "unsupported_dtype"
@@ -380,9 +353,7 @@ def _silu_and_mul_dynamic_quant_rejection_reason(
     return None
 
 
-def silu_and_mul_dynamic_quant(
-    input_tensor: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
+def silu_and_mul_dynamic_quant(input_tensor: torch.Tensor, ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Fuse SwiGLU and per-row E4M3 quantization into one TPC node."""
     if torch.compiler.is_compiling():
         compile_mode = _compile_fast_path_mode()
@@ -390,20 +361,15 @@ def silu_and_mul_dynamic_quant(
             return None
         if compile_mode == FastPathMode.HYBRID.value:
             return None
-        rejection_reason = _silu_and_mul_dynamic_quant_rejection_reason(
-            input_tensor
-        )
+        rejection_reason = _silu_and_mul_dynamic_quant_rejection_reason(input_tensor)
         if rejection_reason is not None:
             if compile_mode == FastPathMode.STRICT.value:
-                raise FastPathUnavailable(
-                    "Gaudi Triton strict mode rejected "
-                    "silu_and_mul_dynamic_quant: "
-                    f"{rejection_reason}"
-                )
+                raise FastPathUnavailable("Gaudi Triton strict mode rejected "
+                                          "silu_and_mul_dynamic_quant: "
+                                          f"{rejection_reason}")
             return None
         from vllm_gaudi.ops.triton_gaudi.kernels import (
-            silu_and_mul_dynamic_quant as launch_fused,
-        )
+            silu_and_mul_dynamic_quant as launch_fused, )
 
         return launch_fused(input_tensor)
 
@@ -411,33 +377,26 @@ def silu_and_mul_dynamic_quant(
     if mode is FastPathMode.OFF:
         _counters["vendor.silu_and_mul_dynamic_quant.off"] += 1
         return None
-    rejection_reason = _silu_and_mul_dynamic_quant_rejection_reason(
-        input_tensor
-    )
+    rejection_reason = _silu_and_mul_dynamic_quant_rejection_reason(input_tensor)
     if rejection_reason is not None:
         return _reject_silu_and_mul_dynamic_quant(rejection_reason)
     if mode is FastPathMode.HYBRID:
-        _counters[
-            "vendor.silu_and_mul_dynamic_quant.performance_gate"
-        ] += 1
+        _counters["vendor.silu_and_mul_dynamic_quant.performance_gate"] += 1
         return None
     if not prepare_if_enabled():
         return _reject_silu_and_mul_dynamic_quant("initialization")
 
     try:
         from vllm_gaudi.ops.triton_gaudi.kernels import (
-            silu_and_mul_dynamic_quant as launch_fused,
-        )
+            silu_and_mul_dynamic_quant as launch_fused, )
 
         output = launch_fused(input_tensor)
         _counters["triton.silu_and_mul_dynamic_quant"] += 1
         return output
     except Exception as exc:
         if mode is FastPathMode.STRICT:
-            raise FastPathUnavailable(
-                "Gaudi Triton fused SiLU dynamic quantization "
-                "compilation or launch failed"
-            ) from exc
+            raise FastPathUnavailable("Gaudi Triton fused SiLU dynamic quantization "
+                                      "compilation or launch failed") from exc
         _warn_once(
             "silu_and_mul_dynamic_quant.launch",
             "Gaudi Triton fused SiLU dynamic quantization failed "
@@ -523,8 +482,7 @@ def silu_and_mul(input_tensor: "torch.Tensor") -> "torch.Tensor" | None:
 def _reject_gdn_decode_packed(reason: str) -> None:
     _counters[f"fallback.gdn_decode_packed.{reason}"] += 1
     if _mode() is FastPathMode.STRICT:
-        raise FastPathUnavailable(
-            f"Gaudi Triton strict mode rejected gdn_decode_packed: {reason}")
+        raise FastPathUnavailable(f"Gaudi Triton strict mode rejected gdn_decode_packed: {reason}")
     _warn_once(
         f"gdn_decode_packed.{reason}",
         f"Gaudi Triton packed GDN decode unavailable ({reason}); using the HPU vendor path",
@@ -561,7 +519,7 @@ def _gdn_decode_packed_rejection_reason(
     batch = packed_qkv.shape[0]
     if gate_a.shape != (batch, 48) or gate_b.shape != gate_a.shape:
         return "gate_shape"
-    if a_log.shape != (48,) or dt_bias.shape != (48,) or state_indices.shape != (batch,):
+    if a_log.shape != (48, ) or dt_bias.shape != (48, ) or state_indices.shape != (batch, ):
         return "parameter_shape"
     expected_dtypes = (
         torch.float32,
@@ -606,13 +564,11 @@ def gdn_decode_packed(
         )
         if rejection_reason is not None:
             if compile_mode == FastPathMode.STRICT.value:
-                raise FastPathUnavailable(
-                    "Gaudi Triton strict mode rejected gdn_decode_packed: "
-                    f"{rejection_reason}")
+                raise FastPathUnavailable("Gaudi Triton strict mode rejected gdn_decode_packed: "
+                                          f"{rejection_reason}")
             return None
         from vllm_gaudi.ops.triton_gaudi.kernels import (
-            gdn_decode_packed as launch_gdn_decode_packed,
-        )
+            gdn_decode_packed as launch_gdn_decode_packed, )
 
         return launch_gdn_decode_packed(
             state_cache,
@@ -646,8 +602,7 @@ def gdn_decode_packed(
 
     try:
         from vllm_gaudi.ops.triton_gaudi.kernels import (
-            gdn_decode_packed as launch_gdn_decode_packed,
-        )
+            gdn_decode_packed as launch_gdn_decode_packed, )
 
         output = launch_gdn_decode_packed(
             state_cache,
@@ -662,8 +617,7 @@ def gdn_decode_packed(
         return output
     except Exception as exc:
         if _mode() is FastPathMode.STRICT:
-            raise FastPathUnavailable(
-                "Gaudi Triton gdn_decode_packed compilation or launch failed") from exc
+            raise FastPathUnavailable("Gaudi Triton gdn_decode_packed compilation or launch failed") from exc
         _warn_once(
             "gdn_decode_packed.launch",
             f"Gaudi Triton packed GDN decode failed ({exc}); using the HPU vendor path",
@@ -675,9 +629,8 @@ def gdn_decode_packed(
 def _reject_gdn_decode_conv_packed(reason: str) -> None:
     _counters[f"fallback.gdn_decode_conv_packed.{reason}"] += 1
     if _mode() is FastPathMode.STRICT:
-        raise FastPathUnavailable(
-            "Gaudi Triton strict mode rejected gdn_decode_conv_packed: "
-            f"{reason}")
+        raise FastPathUnavailable("Gaudi Triton strict mode rejected gdn_decode_conv_packed: "
+                                  f"{reason}")
     _warn_once(
         f"gdn_decode_conv_packed.{reason}",
         "Gaudi Triton fused causal-conv + GDN unavailable "
@@ -712,21 +665,17 @@ def _gdn_decode_conv_packed_rejection_reason(
         return "non_hpu_tensor"
     if any(tensor.device != conv_state.device for tensor in tensors[1:]):
         return "device_mismatch"
-    if (conv_state.ndim != 3 or conv_state.shape[0] <= 0 or
-            tuple(conv_state.shape[1:]) != (3, 10240)):
+    if (conv_state.ndim != 3 or conv_state.shape[0] <= 0 or tuple(conv_state.shape[1:]) != (3, 10240)):
         return "conv_state_shape"
-    if (state_cache.ndim != 4 or state_cache.shape[0] <= 0 or
-            tuple(state_cache.shape[1:]) != (48, 128, 128)):
+    if (state_cache.ndim != 4 or state_cache.shape[0] <= 0 or tuple(state_cache.shape[1:]) != (48, 128, 128)):
         return "state_shape"
-    if (packed_qkv.ndim != 2 or packed_qkv.shape[0] <= 0 or
-            packed_qkv.shape[1] != 10240):
+    if (packed_qkv.ndim != 2 or packed_qkv.shape[0] <= 0 or packed_qkv.shape[1] != 10240):
         return "packed_shape"
     batch = packed_qkv.shape[0]
     if gate_a.shape != (batch, 48) or gate_b.shape != gate_a.shape:
         return "gate_shape"
-    if (a_log.shape != (48,) or dt_bias.shape != (48,) or
-            state_indices.shape != (batch,) or
-            conv_weight_t.shape != (4, 10240)):
+    if (a_log.shape != (48, ) or dt_bias.shape != (48, ) or state_indices.shape != (batch, )
+            or conv_weight_t.shape != (4, 10240)):
         return "parameter_shape"
     expected_dtypes = (
         torch.bfloat16,
@@ -739,8 +688,7 @@ def _gdn_decode_conv_packed_rejection_reason(
         torch.int32,
         torch.bfloat16,
     )
-    if any(tensor.dtype != dtype
-           for tensor, dtype in zip(tensors, expected_dtypes)):
+    if any(tensor.dtype != dtype for tensor, dtype in zip(tensors, expected_dtypes)):
         return "unsupported_dtype"
     if any(not tensor.is_contiguous() for tensor in tensors):
         return "non_contiguous"
@@ -778,12 +726,10 @@ def gdn_decode_conv_packed(
             conv_weight_t,
         )
         if rejection_reason is not None:
-            raise FastPathUnavailable(
-                "Gaudi Triton strict mode rejected gdn_decode_conv_packed: "
-                f"{rejection_reason}")
+            raise FastPathUnavailable("Gaudi Triton strict mode rejected gdn_decode_conv_packed: "
+                                      f"{rejection_reason}")
         from vllm_gaudi.ops.triton_gaudi.kernels import (
-            gdn_decode_conv_packed as launch_gdn_decode_conv_packed,
-        )
+            gdn_decode_conv_packed as launch_gdn_decode_conv_packed, )
 
         return launch_gdn_decode_conv_packed(
             conv_state,
@@ -822,8 +768,7 @@ def gdn_decode_conv_packed(
 
     try:
         from vllm_gaudi.ops.triton_gaudi.kernels import (
-            gdn_decode_conv_packed as launch_gdn_decode_conv_packed,
-        )
+            gdn_decode_conv_packed as launch_gdn_decode_conv_packed, )
 
         output = launch_gdn_decode_conv_packed(
             conv_state,
@@ -839,9 +784,7 @@ def gdn_decode_conv_packed(
         _counters["triton.gdn_decode_conv_packed"] += 1
         return output
     except Exception as exc:
-        raise FastPathUnavailable(
-            "Gaudi Triton gdn_decode_conv_packed compilation or launch failed"
-        ) from exc
+        raise FastPathUnavailable("Gaudi Triton gdn_decode_conv_packed compilation or launch failed") from exc
 
 
 def gdn_decode_conv_split_packed(
@@ -861,13 +804,11 @@ def gdn_decode_conv_split_packed(
         if compile_mode == FastPathMode.OFF.value:
             return None
         batch = packed_qkv.shape[0]
-        if (compile_mode == FastPathMode.HYBRID.value and
-                batch != _GDN_CONV_SPLIT_HYBRID_BATCH):
+        if (compile_mode == FastPathMode.HYBRID.value and batch != _GDN_CONV_SPLIT_HYBRID_BATCH):
             return None
         if batch not in _GDN_CONV_SPLIT_GRAPH_BATCHES:
-            raise FastPathUnavailable(
-                "Gaudi Triton strict mode rejected "
-                "gdn_decode_conv_split_packed: unsupported_graph_batch")
+            raise FastPathUnavailable("Gaudi Triton strict mode rejected "
+                                      "gdn_decode_conv_split_packed: unsupported_graph_batch")
         rejection_reason = _gdn_decode_conv_packed_rejection_reason(
             conv_state,
             state_cache,
@@ -881,14 +822,12 @@ def gdn_decode_conv_split_packed(
         )
         if rejection_reason is not None:
             if compile_mode == FastPathMode.STRICT.value:
-                raise FastPathUnavailable(
-                    "Gaudi Triton strict mode rejected "
-                    "gdn_decode_conv_split_packed: "
-                    f"{rejection_reason}")
+                raise FastPathUnavailable("Gaudi Triton strict mode rejected "
+                                          "gdn_decode_conv_split_packed: "
+                                          f"{rejection_reason}")
             return None
         from vllm_gaudi.ops.triton_gaudi.kernels import (
-            gdn_decode_conv_split_packed as launch_split_gdn,
-        )
+            gdn_decode_conv_split_packed as launch_split_gdn, )
 
         return launch_split_gdn(
             conv_state,
@@ -906,10 +845,8 @@ def gdn_decode_conv_split_packed(
     if mode is FastPathMode.OFF:
         _counters["vendor.gdn_decode_conv_split_packed.off"] += 1
         return None
-    if (mode is FastPathMode.HYBRID and
-            packed_qkv.shape[0] != _GDN_CONV_SPLIT_HYBRID_BATCH):
-        _counters[
-            "vendor.gdn_decode_conv_split_packed.performance_gate"] += 1
+    if (mode is FastPathMode.HYBRID and packed_qkv.shape[0] != _GDN_CONV_SPLIT_HYBRID_BATCH):
+        _counters["vendor.gdn_decode_conv_split_packed.performance_gate"] += 1
         return None
     rejection_reason = _gdn_decode_conv_packed_rejection_reason(
         conv_state,
@@ -924,23 +861,19 @@ def gdn_decode_conv_split_packed(
     )
     if rejection_reason is not None:
         if mode is FastPathMode.STRICT:
-            raise FastPathUnavailable(
-                "Gaudi Triton strict mode rejected "
-                "gdn_decode_conv_split_packed: "
-                f"{rejection_reason}")
-        _counters[
-            f"fallback.gdn_decode_conv_split_packed.{rejection_reason}"] += 1
+            raise FastPathUnavailable("Gaudi Triton strict mode rejected "
+                                      "gdn_decode_conv_split_packed: "
+                                      f"{rejection_reason}")
+        _counters[f"fallback.gdn_decode_conv_split_packed.{rejection_reason}"] += 1
         return None
     if not prepare_if_enabled():
         if mode is FastPathMode.STRICT:
-            raise FastPathUnavailable(
-                "Gaudi Triton split fused GDN cannot initialize")
+            raise FastPathUnavailable("Gaudi Triton split fused GDN cannot initialize")
         _counters["fallback.gdn_decode_conv_split_packed.initialization"] += 1
         return None
     try:
         from vllm_gaudi.ops.triton_gaudi.kernels import (
-            gdn_decode_conv_split_packed as launch_split_gdn,
-        )
+            gdn_decode_conv_split_packed as launch_split_gdn, )
 
         output = launch_split_gdn(
             conv_state,
@@ -957,9 +890,7 @@ def gdn_decode_conv_split_packed(
         return output
     except Exception as exc:
         if mode is FastPathMode.STRICT:
-            raise FastPathUnavailable(
-                "Gaudi Triton split fused GDN compilation or launch failed"
-            ) from exc
+            raise FastPathUnavailable("Gaudi Triton split fused GDN compilation or launch failed") from exc
         _warn_once(
             "gdn_decode_conv_split_packed.launch",
             "Gaudi Triton split fused GDN failed "

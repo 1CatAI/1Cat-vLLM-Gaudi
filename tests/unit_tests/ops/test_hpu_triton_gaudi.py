@@ -124,9 +124,7 @@ def test_hybrid_fused_add_rms_norm_records_non_hpu_fallback(monkeypatch: pytest.
     assert runtime.diagnostics()["counters"] == {"fallback.fused_add_rms_norm.non_hpu_tensor": 1}
 
 
-def test_eager_hybrid_fused_add_rms_norm_keeps_candidate_on_vendor_path(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_eager_hybrid_fused_add_rms_norm_keeps_candidate_on_vendor_path(monkeypatch: pytest.MonkeyPatch, ):
     monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "hybrid")
 
     class FakeHpuTensor:
@@ -145,19 +143,19 @@ def test_eager_hybrid_fused_add_rms_norm_keeps_candidate_on_vendor_path(
 
     class FakeHpuWeight(FakeHpuTensor):
         ndim = 1
-        shape = (5120,)
+        shape = (5120, )
 
         @staticmethod
         def numel():
             return 5120
 
     hidden = FakeHpuTensor()
-    assert runtime.fused_add_rms_norm(
+    assert (runtime.fused_add_rms_norm(
         hidden,
         FakeHpuTensor(),
         FakeHpuWeight(),
         1.0e-6,
-    ) is None
+    ) is None)
     assert runtime.diagnostics()["counters"] == {
         "vendor.fused_add_rms_norm.performance_gate": 1,
     }
@@ -182,9 +180,7 @@ def test_off_mode_leaves_dynamic_quant_on_vendor_path():
     }
 
 
-def test_hybrid_dynamic_quant_records_non_hpu_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_hybrid_dynamic_quant_records_non_hpu_fallback(monkeypatch: pytest.MonkeyPatch, ):
     monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "hybrid")
     input_tensor = torch.zeros(2, 128, dtype=torch.bfloat16)
 
@@ -196,20 +192,19 @@ def test_hybrid_dynamic_quant_records_non_hpu_fallback(
     }
 
 
-def test_strict_dynamic_quant_rejects_non_hpu_tensor(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_strict_dynamic_quant_rejects_non_hpu_tensor(monkeypatch: pytest.MonkeyPatch, ):
     monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "strict")
     input_tensor = torch.zeros(2, 128, dtype=torch.bfloat16)
 
     with pytest.raises(
-        runtime.FastPathUnavailable,
-        match="dynamic_quant: non_hpu_tensor",
+            runtime.FastPathUnavailable,
+            match="dynamic_quant: non_hpu_tensor",
     ):
         runtime.dynamic_quant(input_tensor)
 
 
 def test_dynamic_quant_validator_keeps_prefill_outside_fast_path():
+
     class FakeHpuTensor:
         device = torch.device("hpu")
         ndim = 2
@@ -227,9 +222,7 @@ def test_dynamic_quant_validator_keeps_prefill_outside_fast_path():
     assert runtime._dynamic_quant_rejection_reason(FakeHpuTensor()) == "prefill_shape"
 
 
-def test_eager_hybrid_dynamic_quant_keeps_candidate_on_vendor_path(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_eager_hybrid_dynamic_quant_keeps_candidate_on_vendor_path(monkeypatch: pytest.MonkeyPatch, ):
     monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "hybrid")
 
     class FakeHpuTensor:
@@ -263,20 +256,19 @@ def test_off_mode_leaves_fused_silu_dynamic_quant_on_vendor_path():
     }
 
 
-def test_strict_fused_silu_dynamic_quant_rejects_non_hpu_tensor(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_strict_fused_silu_dynamic_quant_rejects_non_hpu_tensor(monkeypatch: pytest.MonkeyPatch, ):
     monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "strict")
     input_tensor = torch.zeros(2, 512, dtype=torch.bfloat16)
 
     with pytest.raises(
-        runtime.FastPathUnavailable,
-        match="silu_and_mul_dynamic_quant: non_hpu_tensor",
+            runtime.FastPathUnavailable,
+            match="silu_and_mul_dynamic_quant: non_hpu_tensor",
     ):
         runtime.silu_and_mul_dynamic_quant(input_tensor)
 
 
 def test_fused_silu_dynamic_quant_rejects_width_above_vlm_fast_path():
+
     class FakeHpuTensor:
         device = torch.device("hpu")
         ndim = 2
@@ -291,10 +283,7 @@ def test_fused_silu_dynamic_quant_rejects_width_above_vlm_fast_path():
         def is_contiguous():
             return True
 
-    assert (
-        runtime._silu_and_mul_dynamic_quant_rejection_reason(FakeHpuTensor())
-        == "unsupported_size"
-    )
+    assert runtime._silu_and_mul_dynamic_quant_rejection_reason(FakeHpuTensor()) == "unsupported_size"
 
 
 def test_compile_off_mode_does_not_enable_fast_path(monkeypatch: pytest.MonkeyPatch):
@@ -316,9 +305,7 @@ def test_compile_mode_requires_early_preparation(monkeypatch: pytest.MonkeyPatch
         runtime.fused_add_rms_norm(hidden, hidden, torch.ones(8, dtype=torch.bfloat16), 1.0e-6)
 
 
-def test_compile_hybrid_mode_keeps_ungated_kernels_on_vendor_path(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_compile_hybrid_mode_keeps_ungated_kernels_on_vendor_path(monkeypatch: pytest.MonkeyPatch, ):
     monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "hybrid")
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     monkeypatch.setattr(runtime, "_prepared", True)
@@ -344,9 +331,7 @@ def test_compile_hybrid_mode_keeps_ungated_kernels_on_vendor_path(
     assert runtime.diagnostics()["counters"] == {}
 
 
-def test_compile_hybrid_gdn_keeps_large_batch_on_vendor_path(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_compile_hybrid_gdn_keeps_candidate_on_vendor_path(monkeypatch: pytest.MonkeyPatch, ):
     monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "hybrid")
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     monkeypatch.setattr(runtime, "_prepared", True)
@@ -361,9 +346,7 @@ def test_compile_hybrid_gdn_keeps_large_batch_on_vendor_path(
     assert result is None
 
 
-def test_eager_hybrid_gdn_keeps_candidate_on_vendor_path(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_eager_hybrid_gdn_keeps_candidate_on_vendor_path(monkeypatch: pytest.MonkeyPatch, ):
     monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "hybrid")
     monkeypatch.setattr(
         runtime,
@@ -396,9 +379,7 @@ def test_hybrid_silu_and_mul_records_non_hpu_fallback(monkeypatch: pytest.Monkey
     assert runtime.diagnostics()["counters"] == {"fallback.silu_and_mul.non_hpu_tensor": 1}
 
 
-def test_eager_hybrid_silu_and_mul_keeps_candidate_on_vendor_path(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_eager_hybrid_silu_and_mul_keeps_candidate_on_vendor_path(monkeypatch: pytest.MonkeyPatch, ):
     monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "hybrid")
 
     class FakeHpuTensor:
@@ -430,6 +411,7 @@ def test_strict_silu_and_mul_rejects_non_hpu_tensor(monkeypatch: pytest.MonkeyPa
 
 
 def test_silu_and_mul_rejects_odd_input_width():
+
     class FakeHpuTensor:
         device = torch.device("hpu")
         ndim = 2
@@ -476,9 +458,7 @@ def test_off_mode_leaves_gdn_decode_on_vendor_path():
     }
 
 
-def test_hybrid_gdn_decode_applies_performance_gate_before_validation(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_hybrid_gdn_decode_applies_performance_gate_before_validation(monkeypatch: pytest.MonkeyPatch, ):
     monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "hybrid")
 
     result = runtime.gdn_decode_packed(*_cpu_gdn_inputs())
@@ -489,14 +469,12 @@ def test_hybrid_gdn_decode_applies_performance_gate_before_validation(
     }
 
 
-def test_strict_gdn_decode_rejects_non_hpu_tensor(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_strict_gdn_decode_rejects_non_hpu_tensor(monkeypatch: pytest.MonkeyPatch, ):
     monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "strict")
 
     with pytest.raises(
-        runtime.FastPathUnavailable,
-        match="gdn_decode_packed: non_hpu_tensor",
+            runtime.FastPathUnavailable,
+            match="gdn_decode_packed: non_hpu_tensor",
     ):
         runtime.gdn_decode_packed(*_cpu_gdn_inputs())
 
@@ -510,9 +488,7 @@ def test_off_mode_leaves_fused_gdn_decode_on_vendor_path():
     }
 
 
-def test_hybrid_fused_gdn_decode_stays_behind_performance_gate(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_hybrid_fused_gdn_decode_stays_behind_performance_gate(monkeypatch: pytest.MonkeyPatch, ):
     monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "hybrid")
 
     result = runtime.gdn_decode_conv_packed(*_cpu_gdn_conv_inputs(batch=8))
@@ -523,19 +499,18 @@ def test_hybrid_fused_gdn_decode_stays_behind_performance_gate(
     }
 
 
-def test_strict_fused_gdn_decode_rejects_non_hpu_tensor(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_strict_fused_gdn_decode_rejects_non_hpu_tensor(monkeypatch: pytest.MonkeyPatch, ):
     monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "strict")
 
     with pytest.raises(
-        runtime.FastPathUnavailable,
-        match="gdn_decode_conv_packed: non_hpu_tensor",
+            runtime.FastPathUnavailable,
+            match="gdn_decode_conv_packed: non_hpu_tensor",
     ):
         runtime.gdn_decode_conv_packed(*_cpu_gdn_conv_inputs())
 
 
 def test_gdn_decode_validator_accepts_only_canonical_specialization():
+
     class FakeHpuTensor:
         device = torch.device("hpu")
 
@@ -553,22 +528,20 @@ def test_gdn_decode_validator_accepts_only_canonical_specialization():
         FakeHpuTensor((1, 10240), torch.bfloat16),
         FakeHpuTensor((1, 48), torch.bfloat16),
         FakeHpuTensor((1, 48), torch.bfloat16),
-        FakeHpuTensor((48,), torch.float32),
-        FakeHpuTensor((48,), torch.float32),
-        FakeHpuTensor((1,), torch.int32),
+        FakeHpuTensor((48, ), torch.float32),
+        FakeHpuTensor((48, ), torch.float32),
+        FakeHpuTensor((1, ), torch.int32),
     )
     assert runtime._gdn_decode_packed_rejection_reason(*tensors) is None
 
-    wrong_dtype = (*tensors[:-1], FakeHpuTensor((1,), torch.int64))
+    wrong_dtype = (*tensors[:-1], FakeHpuTensor((1, ), torch.int64))
     assert runtime._gdn_decode_packed_rejection_reason(*wrong_dtype) == "unsupported_dtype"
 
-    non_contiguous = (*tensors[:-1], FakeHpuTensor((1,), torch.int32, False))
+    non_contiguous = (*tensors[:-1], FakeHpuTensor((1, ), torch.int32, False))
     assert runtime._gdn_decode_packed_rejection_reason(*non_contiguous) == "non_contiguous"
 
 
-def test_silu_dynamic_quant_pass_fuses_exclusive_view_chain(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_silu_dynamic_quant_pass_fuses_exclusive_view_chain(monkeypatch: pytest.MonkeyPatch, ):
     from vllm_gaudi.ops.triton_gaudi import fusion, kernels
 
     graph_module = _make_silu_dynamic_quant_graph()
@@ -587,23 +560,13 @@ def test_silu_dynamic_quant_pass_fuses_exclusive_view_chain(
         lambda n_cols: ("f" * 64, 4096),
     )
 
-    assert fusion.pass_fuse_triton_gaudi_silu_dynamic_quant(
-        SimpleNamespace(graph_module=graph_module)
-    )
+    assert fusion.pass_fuse_triton_gaudi_silu_dynamic_quant(SimpleNamespace(graph_module=graph_module))
 
-    call_targets = [
-        node.target
-        for node in graph_module.graph.nodes
-        if node.op == "call_function"
-    ]
+    call_targets = [node.target for node in graph_module.graph.nodes if node.op == "call_function"]
     assert _fake_silu_and_mul not in call_targets
     assert _fake_dynamic_quant not in call_targets
     assert call_targets.count(_fake_silu_and_mul_dynamic_quant) == 1
-    fused = next(
-        node
-        for node in graph_module.graph.nodes
-        if node.target is _fake_silu_and_mul_dynamic_quant
-    )
+    fused = next(node for node in graph_module.graph.nodes if node.target is _fake_silu_and_mul_dynamic_quant)
     assert fused.args[1:] == ("f" * 64, 4096, 3584, 8)
     assert fused.args[0].op == "placeholder"
 
@@ -639,15 +602,9 @@ def test_silu_dynamic_quant_pass_rejects_unsafe_graphs(
         lambda n_cols: prepare_calls.append(n_cols),
     )
 
-    assert not fusion.pass_fuse_triton_gaudi_silu_dynamic_quant(
-        SimpleNamespace(graph_module=graph_module)
-    )
+    assert not fusion.pass_fuse_triton_gaudi_silu_dynamic_quant(SimpleNamespace(graph_module=graph_module))
     assert prepare_calls == []
-    call_targets = [
-        node.target
-        for node in graph_module.graph.nodes
-        if node.op == "call_function"
-    ]
+    call_targets = [node.target for node in graph_module.graph.nodes if node.op == "call_function"]
     assert _fake_silu_and_mul in call_targets
     assert _fake_dynamic_quant in call_targets
     assert _fake_silu_and_mul_dynamic_quant not in call_targets
@@ -672,6 +629,37 @@ def test_gdn_decode_triton_ast_compiles_to_canonical_artifact():
     }
     assert manifest["parameters"]["mutates_arg"] == 0
     assert manifest["parameters"]["state_slots_arg"] == 8
+
+
+@pytest.mark.skipif(shutil.which("tpc-clang") is None, reason="tpc-clang is not installed")
+def test_split_gdn_triton_ast_emits_stateful_two_kernel_artifacts():
+    from vllm_gaudi.ops.triton_gaudi.kernels import (
+        QK_CONV_TILE,
+        _compile_gdn_decode_value_conv_packed,
+        _compile_gdn_qk_conv_packed,
+    )
+
+    qk_manifest = _compile_gdn_qk_conv_packed().manifest
+    assert qk_manifest["input_args"] == [0, 1, 2, 3]
+    assert qk_manifest["output_args"] == [4]
+    assert qk_manifest["index_space"]["block_size"] == QK_CONV_TILE == 256
+    assert qk_manifest["index_space"]["vector_lanes"] == 128
+    assert qk_manifest["parameters"]["mutates_args"] == [0]
+    assert qk_manifest["parameters"]["conv_slots_arg"] == 5
+    assert qk_manifest["access_patterns"][0]["role"] == "mutable_input"
+    assert qk_manifest["access_patterns"][4]["role"] == "output"
+
+    value_manifest = _compile_gdn_decode_value_conv_packed(16).manifest
+    assert value_manifest["input_args"] == list(range(10))
+    assert value_manifest["output_args"] == [10]
+    assert value_manifest["parameters"]["mutates_args"] == [0, 1]
+    assert value_manifest["parameters"]["conv_slots_arg"] == 11
+    assert value_manifest["parameters"]["state_slots_arg"] == 12
+    assert [pattern["role"] for pattern in value_manifest["access_patterns"][:2]] == [
+        "mutable_input",
+        "mutable_input",
+    ]
+    assert value_manifest["access_patterns"][10]["role"] == "output"
 
 
 @pytest.mark.skipif(shutil.which("tpc-clang") is None, reason="tpc-clang is not installed")
@@ -708,8 +696,7 @@ def test_dynamic_quant_triton_ast_compiles_mlp_width_to_canonical_artifact():
 @pytest.mark.skipif(shutil.which("tpc-clang") is None, reason="tpc-clang is not installed")
 def test_fused_silu_dynamic_quant_triton_ast_compiles_to_canonical_artifact():
     from vllm_gaudi.ops.triton_gaudi.kernels import (
-        _compile_silu_and_mul_dynamic_quant,
-    )
+        _compile_silu_and_mul_dynamic_quant, )
 
     artifact, block_size = _compile_silu_and_mul_dynamic_quant(3584)
     manifest = artifact.manifest
@@ -739,13 +726,10 @@ def test_fused_silu_dynamic_quant_triton_ast_compiles_to_canonical_artifact():
     }
 
 
-def test_hybrid_split_gdn_decode_keeps_small_batch_on_vendor_path(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_hybrid_split_gdn_decode_keeps_small_batch_on_vendor_path(monkeypatch: pytest.MonkeyPatch, ):
     monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "hybrid")
 
-    result = runtime.gdn_decode_conv_split_packed(
-        *_cpu_gdn_conv_inputs(batch=1))
+    result = runtime.gdn_decode_conv_split_packed(*_cpu_gdn_conv_inputs(batch=1))
 
     assert result is None
     assert runtime.diagnostics()["counters"] == {
@@ -753,13 +737,10 @@ def test_hybrid_split_gdn_decode_keeps_small_batch_on_vendor_path(
     }
 
 
-def test_hybrid_split_gdn_decode_keeps_large_batch_on_vendor_path(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_hybrid_split_gdn_decode_keeps_large_batch_on_vendor_path(monkeypatch: pytest.MonkeyPatch, ):
     monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "hybrid")
 
-    result = runtime.gdn_decode_conv_split_packed(
-        *_cpu_gdn_conv_inputs(batch=32))
+    result = runtime.gdn_decode_conv_split_packed(*_cpu_gdn_conv_inputs(batch=32))
 
     assert result is None
     assert runtime.diagnostics()["counters"] == {
@@ -767,13 +748,10 @@ def test_hybrid_split_gdn_decode_keeps_large_batch_on_vendor_path(
     }
 
 
-def test_hybrid_split_gdn_decode_falls_back_for_invalid_large_batch(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_hybrid_split_gdn_decode_falls_back_for_invalid_large_batch(monkeypatch: pytest.MonkeyPatch, ):
     monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "hybrid")
 
-    result = runtime.gdn_decode_conv_split_packed(
-        *_cpu_gdn_conv_inputs(batch=8))
+    result = runtime.gdn_decode_conv_split_packed(*_cpu_gdn_conv_inputs(batch=8))
 
     assert result is None
     assert runtime.diagnostics()["counters"] == {
@@ -781,32 +759,27 @@ def test_hybrid_split_gdn_decode_falls_back_for_invalid_large_batch(
     }
 
 
-def test_strict_split_gdn_decode_rejects_non_hpu_tensor(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_strict_split_gdn_decode_rejects_non_hpu_tensor(monkeypatch: pytest.MonkeyPatch, ):
     monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "strict")
 
     with pytest.raises(
-        runtime.FastPathUnavailable,
-        match="gdn_decode_conv_split_packed: non_hpu_tensor",
+            runtime.FastPathUnavailable,
+            match="gdn_decode_conv_split_packed: non_hpu_tensor",
     ):
         runtime.gdn_decode_conv_split_packed(*_cpu_gdn_conv_inputs(batch=8))
 
 
-def test_compile_strict_split_gdn_rejects_unsafe_graph_batch(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_compile_strict_split_gdn_rejects_unsafe_graph_batch(monkeypatch: pytest.MonkeyPatch, ):
     monkeypatch.setenv("VLLM_HPU_TRITON_MODE", "strict")
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     monkeypatch.setattr(runtime, "_prepared", True)
     monkeypatch.setattr(runtime, "_available", True)
 
     with pytest.raises(
-        runtime.FastPathUnavailable,
-        match="unsupported_graph_batch",
+            runtime.FastPathUnavailable,
+            match="unsupported_graph_batch",
     ):
-        runtime.gdn_decode_conv_split_packed(
-            *_cpu_gdn_conv_inputs(batch=12))
+        runtime.gdn_decode_conv_split_packed(*_cpu_gdn_conv_inputs(batch=12))
 
 
 def test_bridge_pass_api_requires_gdn_reinplace():
@@ -819,3 +792,37 @@ def test_bridge_pass_api_requires_gdn_reinplace():
 
     with pytest.raises(RuntimeError, match="pass_reinplace_triton_gaudi_gdn_decode"):
         fusion._validate_bridge_pass_api(incomplete)
+
+
+def test_bridge_gdn_graph_policy_requires_shape_gate():
+    from vllm_gaudi.ops.triton_gaudi import fusion
+
+    with pytest.raises(RuntimeError, match="shape-gated GDN placement"):
+        fusion._validate_bridge_gdn_graph_policy(SimpleNamespace())
+
+
+def test_bridge_gdn_graph_policy_accepts_shape_gate():
+    from vllm_gaudi.ops.triton_gaudi import fusion
+
+    supported = SimpleNamespace(
+        TRITON_GAUDI_GDN_BATCH_ARGS=dict(fusion._GDN_GRAPH_BATCH_ARGS),
+        TRITON_GAUDI_GDN_BATCHES=fusion._GDN_GRAPH_BATCHES,
+        TRITON_GAUDI_GRAPH_OPS={"dynamic_quant"},
+        _is_supported_triton_gaudi_gdn_graph=lambda *args: True,
+    )
+
+    fusion._validate_bridge_gdn_graph_policy(supported)
+
+
+def test_bridge_gdn_graph_policy_rejects_generic_placement():
+    from vllm_gaudi.ops.triton_gaudi import fusion
+
+    unsafe = SimpleNamespace(
+        TRITON_GAUDI_GDN_BATCH_ARGS=dict(fusion._GDN_GRAPH_BATCH_ARGS),
+        TRITON_GAUDI_GDN_BATCHES=fusion._GDN_GRAPH_BATCHES,
+        TRITON_GAUDI_GRAPH_OPS={"gdn_decode_packed"},
+        _is_supported_triton_gaudi_gdn_graph=lambda *args: True,
+    )
+
+    with pytest.raises(RuntimeError, match="unsafe generic GDN placement"):
+        fusion._validate_bridge_gdn_graph_policy(unsafe)

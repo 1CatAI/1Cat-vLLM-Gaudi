@@ -79,23 +79,25 @@ gate requires at least 1.20x geometric-mean device and wall speedup and rejects
 any tested shape below 0.95x. Fullgraph compilation is the default comparison;
 use `--eager` only for the diagnostic operator-level comparison.
 
-Packed Qwen3.5 GDN decode uses the split causal-conv + recurrent fast path in
-`hybrid` only for the batch-eight decode bucket; smaller and larger buckets
-retain the vendor graph. Weight loading materializes the TPC-friendly transposed
-convolution weights and an FP32 decay-bias view once, so the compiled decode
-graph does not pay a transpose or dtype-conversion cost. The graph-native path
-has cleared the batch-eight full-model gate and preserves the vendor output
-hash over the measured decode window. The strict standalone diagnostic is
-`python tools/benchmark_triton_gaudi_gdn_decode.py --include-conv`; it
-validates the BF16 output, FP32 recurrent state, and BF16 convolution state
-before reporting speedup. Because a two-node micrograph can become host-submit
-bound, hybrid rollout is decided by the full-model gate rather than that
-standalone timing alone. `strict` also exposes the smaller-batch and
-recurrent-only kernels for correctness and tuning CI, but compiled split GDN
-fails closed outside the graph-validated batch buckets. A complete Gaudi Bridge
-installation must include the GDN reinplace compiler pass; initialization
-rejects stale Python package overlays instead of running the functionalized
-full-cache-copy graph. SiLU-and-mul remains a strict-mode candidate.
+Packed Qwen3.5 GDN decode remains on the complete vendor graph in `hybrid`.
+Both the recurrent-only kernel and the experimental split Q/K-conv plus
+value-conv/GDN path are available only in `strict` mode for standalone
+diagnostics. The recurrent kernel wins its operator microbenchmark, but its
+48-layer full-model graph has not cleared the no-regression gate; the split path
+also does not yet preserve convolution state across decode-recipe re-entry.
+Weight loading still materializes the TPC-friendly transposed convolution
+weights and an FP32 decay-bias view once for strict diagnostics. The Bridge
+admits stateful GDN nodes to a native graph only for the validated batch-eight
+shape and keeps every other shape on the custom-op path. The strict standalone
+diagnostic is `python tools/benchmark_triton_gaudi_gdn_decode.py --include-conv`;
+it validates the BF16 output, FP32 recurrent state, and BF16 convolution state
+before reporting speedup. Add `--check-recipe-reentry` to validate state after
+switching to another batch recipe and back. Because a two-node micrograph can
+become host-submit bound, hybrid rollout is decided by the full-model gate
+rather than that standalone timing alone. A complete Gaudi Bridge installation
+must include the GDN reinplace compiler pass; initialization rejects stale
+Python package overlays instead of running the functionalized full-cache-copy
+graph. SiLU-and-mul remains a strict-mode candidate.
 
 Use `VLLM_BUCKETING_STRATEGY=exp` for the default exponential warm-up, `VLLM_BUCKETING_STRATEGY=lin` for explicitly configured linear ranges, or `VLLM_BUCKETING_STRATEGY=pad` for padding-aware ranges with absolute and relative padding limits.
 

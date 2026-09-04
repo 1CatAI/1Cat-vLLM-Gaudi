@@ -14,7 +14,6 @@ from vllm_gaudi.ops.hpu_gdn_pytorch import (
     hpu_fused_recurrent_gated_delta_rule,
 )
 
-
 # Import only for enabled runs. The runtime keeps small hybrid decode buckets
 # on the vendor graph and selects Triton only where the composite performance
 # gate has cleared; strict mode remains the fail-closed A/B path.
@@ -43,11 +42,12 @@ def _try_triton_gdn_decode_conv_packed(
     """Run the performance-gated split width-4 conv + GDN fast path."""
     if _triton_gdn_decode_conv_packed is None:
         return None
+    if _triton_gaudi_mode == "hybrid":
+        return None
     if state_indices is None or conv_weight_t is None:
         if _triton_gaudi_mode == "strict":
             missing = "state_indices" if state_indices is None else "transposed conv weight"
-            raise RuntimeError(
-                f"Gaudi Triton strict fused GDN decode requires {missing}")
+            raise RuntimeError(f"Gaudi Triton strict fused GDN decode requires {missing}")
         return None
     return _triton_gdn_decode_conv_packed(
         conv_state,
@@ -79,10 +79,11 @@ def _try_triton_gdn_decode_packed(
     """
     if _triton_gdn_decode_packed is None:
         return None
+    if _triton_gaudi_mode == "hybrid":
+        return None
     if state_indices is None:
         if _triton_gaudi_mode == "strict":
-            raise RuntimeError(
-                "Gaudi Triton strict GDN decode requires state_indices metadata")
+            raise RuntimeError("Gaudi Triton strict GDN decode requires state_indices metadata")
         return None
     return _triton_gdn_decode_packed(
         ssm_state,
@@ -149,8 +150,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             def load_conv_weight_and_transpose(param, loaded_weight):
                 result = original_weight_loader(param, loaded_weight)
                 with torch.no_grad():
-                    self._triton_conv_weight_t.copy_(
-                        param.view(param.size(0), param.size(2)).transpose(0, 1))
+                    self._triton_conv_weight_t.copy_(param.view(param.size(0), param.size(2)).transpose(0, 1))
                 self._triton_conv_weight_ready = True
                 return result
 
@@ -377,11 +377,9 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 a,
                 b,
                 self.A_log,
-                (self._triton_dt_bias_f32
-                 if self._triton_dt_bias_ready else self.dt_bias),
+                (self._triton_dt_bias_f32 if self._triton_dt_bias_ready else self.dt_bias),
                 state_indices,
-                (self._triton_conv_weight_t
-                 if self._triton_conv_weight_ready else None),
+                (self._triton_conv_weight_t if self._triton_conv_weight_ready else None),
             )
             if triton_out is None:
                 mixed_qkv_conv = hpu_causal_conv1d_update(
@@ -390,9 +388,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     weight=conv_weights,
                     bias=self.conv1d.bias,
                     activation=self.activation,
-                    conv_state_indices=(
-                        state_indices[:num_decodes]
-                        if state_indices is not None else state_indices),
+                    conv_state_indices=(state_indices[:num_decodes] if state_indices is not None else state_indices),
                     block_idx_last_scheduled_token=None,
                     initial_state_idx=None,
                     query_start_loc=query_start_loc,
@@ -404,8 +400,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     a,
                     b,
                     self.A_log,
-                    (self._triton_dt_bias_f32
-                     if self._triton_dt_bias_ready else self.dt_bias),
+                    (self._triton_dt_bias_f32 if self._triton_dt_bias_ready else self.dt_bias),
                     state_indices,
                 )
             if triton_out is None:
