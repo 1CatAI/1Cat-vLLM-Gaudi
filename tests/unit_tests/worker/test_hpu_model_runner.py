@@ -738,7 +738,7 @@ def test_cache_block_capacity_keeps_hybrid_block_units_separate():
     assert runner._dummy_num_blocks == 862
 
 
-def test_direct_gdn_state_requires_group_major_request_order():
+def test_direct_gdn_state_accepts_contiguous_request_prefix_and_free_padding():
     runner = object.__new__(HPUModelRunner)
     runner._direct_gdn_state_enabled = True
     runner._compact_gdn_enabled = True
@@ -746,12 +746,26 @@ def test_direct_gdn_state_requires_group_major_request_order():
     runner._compact_gdn_group_ids = {1, 3}
     runner._compact_gdn_group_offset = {1: 0, 3: 1}
     runner._gdn_max_reqs = 4
+    runner._gdn_slot_free_list = []
 
     indices = torch.zeros(4, 4, dtype=torch.int32)
     indices[1] = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
     indices[3] = torch.tensor([5, 6, 7, 8], dtype=torch.int32)
     assert runner._can_use_direct_gdn_state(indices, num_indices=4, target_bs=4)
     assert not runner._can_use_direct_gdn_state(indices, num_indices=4, target_bs=4, tokens_per_request=2)
+
+    padded_indices = indices.clone()
+    padded_indices[1] = torch.tensor([1, 2, 3, -1], dtype=torch.int32)
+    padded_indices[3] = torch.tensor([5, 6, 7, -1], dtype=torch.int32)
+    runner._gdn_slot_free_list = [3]
+    assert runner._can_use_direct_gdn_state(padded_indices, num_indices=3, target_bs=4)
+
+    runner._gdn_slot_free_list = []
+    assert not runner._can_use_direct_gdn_state(padded_indices, num_indices=3, target_bs=4)
+
+    runner._gdn_slot_free_list = [3]
+    padded_indices[3, 3] = 8
+    assert not runner._can_use_direct_gdn_state(padded_indices, num_indices=3, target_bs=4)
 
     indices[3] = torch.tensor([6, 5, 7, 8], dtype=torch.int32)
     assert not runner._can_use_direct_gdn_state(indices, num_indices=4, target_bs=4)

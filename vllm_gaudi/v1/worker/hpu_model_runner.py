@@ -1480,6 +1480,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self._gdn_slot_free_list: list[int] = []  # stack of free base-slot IDs
         self._gdn_req_to_base_slot: dict[str, int] = {}
         self._logged_direct_gdn_state = False
+        self._logged_padded_direct_gdn_state = False
 
         # Lazy initialization
         # self.model: nn.Module  # set after load_model
@@ -1681,13 +1682,25 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         tokens_per_request: int = 1,
     ) -> bool:
         if (not self._direct_gdn_state_enabled or not self._compact_gdn_enabled or self.use_prefix_caching
-                or not self._compact_gdn_group_ids or num_indices != target_bs or tokens_per_request != 1):
+                or not self._compact_gdn_group_ids or num_indices > target_bs or target_bs > self._gdn_max_reqs
+                or tokens_per_request != 1):
             return False
         base_slots = torch.arange(num_indices, dtype=torch.int32)
         for group_idx in self._compact_gdn_group_ids:
             group_offset = self._compact_gdn_group_offset[group_idx]
             expected = group_offset * self._gdn_max_reqs + base_slots + 1
             if not torch.equal(state_indices[group_idx, :num_indices], expected):
+                return False
+
+            # Direct decode mutates the full padded prefix of the compact
+            # group-major pool. Padding rows may alias only free base slots;
+            # paused requests retain their slots while they are unscheduled.
+            if target_bs > num_indices and not torch.all(state_indices[group_idx, num_indices:target_bs] == -1):
+                return False
+
+        if target_bs > num_indices:
+            free_slots = set(self._gdn_slot_free_list)
+            if any(slot not in free_slots for slot in range(num_indices, target_bs)):
                 return False
         return True
 
@@ -3402,6 +3415,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 self._logged_direct_gdn_state = True
                 logger.info(
                     "GDN direct-state decode enabled: active_bs=%d padded_bs=%d groups=%d",
+                    num_decodes,
+                    padded_batch_size,
+                    len(self._compact_gdn_group_ids),
+                )
+            if (direct_gdn_state and num_decodes < padded_batch_size and not self._logged_padded_direct_gdn_state
+                    and not self.warmup_mode):
+                self._logged_padded_direct_gdn_state = True
+                logger.info(
+                    "GDN padded direct-state decode enabled: active_bs=%d padded_bs=%d groups=%d",
                     num_decodes,
                     padded_batch_size,
                     len(self._compact_gdn_group_ids),
