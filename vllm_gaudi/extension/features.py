@@ -86,6 +86,7 @@ def get_experimental_flags():
         Env('VLLM_HPU_GDN_DIRECT_STATE', boolean),
         Env('VLLM_HPU_CGUID_DYNAMIC_QUANT', boolean),
         Env('VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS', int),
+        Env('VLLM_HPU_FUSED_GREEDY_LOGITS', boolean),
         Env('FLASHINFER_GAUDI_BACKEND', str),
         Env('FLASHINFER_GAUDI_STATE_DTYPE', str),
     ]

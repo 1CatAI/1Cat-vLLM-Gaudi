@@ -98,7 +98,7 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.sample.sampler import Sampler
-from vllm.v1.sample.logits_processor import build_logitsprocs
+from vllm.v1.sample.logits_processor import (LogitBiasLogitsProcessor, MinTokensLogitsProcessor, build_logitsprocs)
 from torch.nn.utils.rnn import pad_sequence
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.sampling_params import SamplingParams
@@ -1115,6 +1115,14 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         hidden_states = hidden_states[logits_indices]
         return hidden_states, self.model.compute_logits(hidden_states)
+
+    def select_compute_logits_and_greedy(self, hidden_states, logits_indices):
+        """Keep the LM head and plain-greedy argmax in one compiled region."""
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        hidden_states = hidden_states[logits_indices]
+        logits = self.model.compute_logits(hidden_states)
+        sampled_token_ids = logits.to(torch.float32).argmax(dim=-1)
+        return hidden_states, sampled_token_ids.to(torch.int32).unsqueeze(-1)
 
     # def sample(self, *args, **kwargs):
     #    return self.sampler(*args, **kwargs)
@@ -3753,7 +3761,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                lora_mask,
                                warmup_mode=False,
                                inputs_embeds=None,
-                               model_mm_kwargs=None):
+                               model_mm_kwargs=None,
+                               fuse_greedy_sampling=False):
         # FORWARD.
         batch_size = token_ids.size(0)
         seq_len = self._seq_len(attn_metadata)
@@ -3800,9 +3809,17 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                      f'{batch_size}_'
                                                      f'seq{seq_len}_ctx'
                                                      f'{num_blocks}')):
-            hidden_states, logits = self.model.select_and_compute_logits(hidden_states, logits_indices)
+            if fuse_greedy_sampling:
+                hidden_states, fused_sampled_token_ids = self.model.select_compute_logits_and_greedy(
+                    hidden_states,
+                    logits_indices,
+                )
+                logits = None
+            else:
+                hidden_states, logits = self.model.select_and_compute_logits(hidden_states, logits_indices)
+                fused_sampled_token_ids = None
         return non_flattened_hidden_states, aux_hidden_states, \
-            hidden_states, logits
+            hidden_states, logits, fused_sampled_token_ids
 
     def _get_prompt_logprobs_dict(
         self,
@@ -4107,6 +4124,34 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             lora_mask, lora_logits_mask = self.create_lora_mask(input, lora_ids, is_prompt)
 
         return lora_mask, lora_logits_mask
+
+    def _can_fuse_plain_greedy_sampling(self, request_ids: list[str]) -> bool:
+        """Whether argmax can safely run in the compiled LM-head region."""
+        if not gaudi_envs.VLLM_HPU_FUSED_GREEDY_LOGITS:
+            return False
+        if not request_ids or self.speculative_config is not None or self.use_structured_output:
+            return False
+
+        # Built-in min-tokens and logit-bias processors are covered by the
+        # SamplingParams checks below. Conservatively reject any custom
+        # processor that can change argmax.
+        builtin_processors = (LogitBiasLogitsProcessor, MinTokensLogitsProcessor)
+        if any(not isinstance(processor, builtin_processors)
+               for processor in self.input_batch.logitsprocs.non_argmax_invariant):
+            return False
+
+        for request_id in request_ids:
+            sampling_params = self.requests[request_id].sampling_params
+            if sampling_params is None or sampling_params.sampling_type != SamplingType.GREEDY:
+                return False
+            if (sampling_params.logprobs is not None or sampling_params.logprob_token_ids
+                    or sampling_params.min_tokens != 0 or sampling_params.logit_bias
+                    or sampling_params.allowed_token_ids or sampling_params.bad_words_token_ids
+                    or sampling_params.presence_penalty != 0.0 or sampling_params.frequency_penalty != 0.0
+                    or sampling_params.repetition_penalty != 1.0 or sampling_params.thinking_token_budget is not None
+                    or sampling_params.extra_args or sampling_params.trace_decode_token_ids is not None):
+                return False
+        return True
 
     def _run_sampling(self,
                       batch_changed: bool,
@@ -4549,7 +4594,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
                 htorch.core.mark_step()
                 non_flattened_hidden_states, aux_hidden_states, \
-                    sample_hidden_states, logits_device = \
+                    sample_hidden_states, logits_device, _ = \
                     self._execute_model_generic(
                         token_ids, position_ids, attn_metadata, logits_indices,
                         self.kv_caches,
@@ -4606,7 +4651,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             for idx, (req_id, prompt_len, token_ids, position_ids, attn_metadata, logits_indices,
                       logits_requests) in enumerate(zip(*shallow_tuple(dummy_prefill_input_data_batches_across_dp))):
                 htorch.core.mark_step()
-                _, _, _, dummy_logits_device = \
+                _, _, _, dummy_logits_device, _ = \
                 self._execute_model_generic(
                     token_ids,
                     position_ids,
@@ -4626,9 +4671,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                                pd_info.decode_req_ids, False)
             self.event_start = self.profiler.get_timestamp_us()
             self.profiler.start("internal", "decode")
+            fuse_greedy_sampling = self._can_fuse_plain_greedy_sampling(pd_info.decode_req_ids)
             htorch.core.mark_step()
             non_flattened_hidden_states, aux_hidden_states, \
-                sample_hidden_states, logits_device = \
+                sample_hidden_states, logits_device, fused_sampled_token_ids = \
                     self._execute_model_generic(
                 decode_data.token_ids,
                 decode_data.position_ids,
@@ -4637,13 +4683,19 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 self.kv_caches,
                 lora_logits_mask,
                 lora_mask,
-                warmup_mode=warmup_mode)
+                warmup_mode=warmup_mode,
+                fuse_greedy_sampling=fuse_greedy_sampling)
             htorch.core.mark_step()
 
             if self.use_structured_output:
+                assert logits_device is not None
                 logits_decode.append(logits_device[:num_decodes])
                 decode_sampled_requests.extend(self.input_batch.req_ids[:num_decodes])
+            elif fused_sampled_token_ids is not None:
+                decode_sampled_token_ids.append(fused_sampled_token_ids.flatten())
+                decode_sampled_requests.extend(self.input_batch.req_ids[:num_decodes])
             else:
+                assert logits_device is not None
                 with self.profiler.record_event('internal', "sampler"):
                     ##### Sampling Start #####
                     spec_decode_metadata = decode_data.spec_decode_metadata
@@ -4701,14 +4753,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         elif dummy_decode_input_data_across_dp is not None:
             htorch.core.mark_step()
-            _, _, _, dummy_logits_device = self._execute_model_generic(dummy_decode_input_data_across_dp.token_ids,
-                                                                       dummy_decode_input_data_across_dp.position_ids,
-                                                                       dummy_decode_input_data_across_dp.attn_metadata,
-                                                                       dummy_decode_input_data_across_dp.logits_indices,
-                                                                       self.kv_caches,
-                                                                       None,
-                                                                       None,
-                                                                       warmup_mode=warmup_mode)
+            _, _, _, dummy_logits_device, _ = self._execute_model_generic(
+                dummy_decode_input_data_across_dp.token_ids,
+                dummy_decode_input_data_across_dp.position_ids,
+                dummy_decode_input_data_across_dp.attn_metadata,
+                dummy_decode_input_data_across_dp.logits_indices,
+                self.kv_caches,
+                None,
+                None,
+                warmup_mode=warmup_mode)
             htorch.core.mark_step()
 
         if self.use_structured_output:
@@ -5081,6 +5134,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             '_rotary_prepare_cos_sin',
             'compute_logits',
             'select_and_compute_logits',
+            'select_compute_logits_and_greedy',
         ]
         for method_name in compiled_methods:
             method = getattr_nested(self.model, method_name, None)

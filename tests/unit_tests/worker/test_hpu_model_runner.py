@@ -773,6 +773,50 @@ def test_model_adapter_selects_hidden_states_inside_logits_region():
     assert torch.equal(logits, expected * 3)
 
 
+def test_model_adapter_fuses_plain_greedy_with_logits_region():
+    adapter = SimpleNamespace(model=SimpleNamespace(compute_logits=lambda hidden_states: hidden_states * 3), )
+    hidden_states = torch.arange(24).view(2, 3, 4)
+    logits_indices = torch.tensor([1, 4])
+
+    selected, sampled_token_ids = HpuModelAdapter.select_compute_logits_and_greedy(
+        adapter,
+        hidden_states,
+        logits_indices,
+    )
+
+    expected = hidden_states.view(-1, 4)[logits_indices]
+    assert torch.equal(selected, expected)
+    assert torch.equal(sampled_token_ids, torch.tensor([[3], [3]], dtype=torch.int32))
+
+
+def test_plain_greedy_fusion_is_strictly_gated(monkeypatch):
+    runner = object.__new__(HPUModelRunner)
+    runner.speculative_config = None
+    runner.use_structured_output = False
+    runner.input_batch = SimpleNamespace(logitsprocs=SimpleNamespace(non_argmax_invariant=[
+        object.__new__(model_runner_module.MinTokensLogitsProcessor),
+        object.__new__(model_runner_module.LogitBiasLogitsProcessor),
+    ]))
+    runner.requests = {"req": SimpleNamespace(sampling_params=SamplingParams(temperature=0.0))}
+
+    monkeypatch.setenv("VLLM_HPU_FUSED_GREEDY_LOGITS", "true")
+    assert runner._can_fuse_plain_greedy_sampling(["req"])
+
+    runner.requests["req"].sampling_params = SamplingParams(temperature=0.0, logprobs=1)
+    assert not runner._can_fuse_plain_greedy_sampling(["req"])
+
+    runner.requests["req"].sampling_params = SamplingParams(temperature=0.7)
+    assert not runner._can_fuse_plain_greedy_sampling(["req"])
+
+    runner.requests["req"].sampling_params = SamplingParams(temperature=0.0)
+    runner.input_batch.logitsprocs.non_argmax_invariant.append(SimpleNamespace())
+    assert not runner._can_fuse_plain_greedy_sampling(["req"])
+
+    monkeypatch.setenv("VLLM_HPU_FUSED_GREEDY_LOGITS", "false")
+    runner.input_batch.logitsprocs.non_argmax_invariant.pop()
+    assert not runner._can_fuse_plain_greedy_sampling(["req"])
+
+
 def test_max_cudagraph_capture_size_defaults_to_max_num_batched_tokens(model_runner):
     """max_cudagraph_capture_size defaults to max_num_batched_tokens when not configured."""
     assert model_runner.max_cudagraph_capture_size == model_runner.max_num_batched_tokens
