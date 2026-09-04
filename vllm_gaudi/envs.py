@@ -45,6 +45,13 @@ if TYPE_CHECKING:
     VLLM_HPU_DYNAMIC_QUANT_CGUID_MIN_TOKENS: int = 2048
     VLLM_HPU_EXPLICIT_SIGMOID_SILU: bool = False
     VLLM_HPU_EXPLICIT_SIGMOID_SILU_MIN_TOKENS: int = 2048
+    VLLM_HPU_FLASHINFER_GDN: bool = False
+    VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE: bool = False
+    VLLM_HPU_FLASHINFER_GDN_PREFILL: bool = False
+    VLLM_HPU_GDN_DIRECT_STATE: bool = True
+    VLLM_HPU_CGUID_DYNAMIC_QUANT: bool = False
+    VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS: int = 32
+    VLLM_HPU_FUSED_GREEDY_LOGITS: bool = False
 
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
@@ -116,6 +123,50 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MM_WARMUP_OUTSIDE_COMPILE_ONLY":
     lambda: os.environ.get("VLLM_MM_WARMUP_OUTSIDE_COMPILE_ONLY", "false").strip().lower() in ("1", "true"),
 
+    # Enable the in-tree FlashInfer-compatible GDN decode adapter. Auto mode
+    # uses only offline-promoted native tactics and otherwise selects the
+    # compile-friendly reference implementation.
+    "VLLM_HPU_FLASHINFER_GDN":
+    lambda: os.environ.get("VLLM_HPU_FLASHINFER_GDN", "false").strip().lower() in ("1", "true"),
+
+    # Enable the qualified Qwen3.8 TP1 fused direct-state decode recipe. By
+    # default this follows the parent FlashInfer-Gaudi GDN switch.
+    "VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE":
+    lambda: os.environ.get(
+        "VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE",
+        os.environ.get("VLLM_HPU_FLASHINFER_GDN", "false"),
+    ).strip().lower() in ("1", "true"),
+
+    # Enable the shape-gated FlashQLA graph tactic for GDN prefill. By
+    # default this follows the parent FlashInfer-Gaudi GDN switch.
+    "VLLM_HPU_FLASHINFER_GDN_PREFILL":
+    lambda: os.environ.get(
+        "VLLM_HPU_FLASHINFER_GDN_PREFILL",
+        os.environ.get("VLLM_HPU_FLASHINFER_GDN", "false"),
+    ).strip().lower() in ("1", "true"),
+
+    # Use group-major compact GDN state views for full decode buckets.
+    "VLLM_HPU_GDN_DIRECT_STATE":
+    lambda: os.environ.get("VLLM_HPU_GDN_DIRECT_STATE", "true").strip().lower() in ("1", "true"),
+
+    # Use Gaudi's calculate_scale_for_cast CGUID for decode-sized per-token
+    # dynamic FP8 scales instead of materializing abs + reduce_max + scale
+    # arithmetic. Large prefill matrices retain the existing path because the
+    # CGUID changes graph fusion and numerical results there.
+    "VLLM_HPU_CGUID_DYNAMIC_QUANT":
+    lambda: os.environ.get(
+        "VLLM_HPU_CGUID_DYNAMIC_QUANT",
+        os.environ.get("VLLM_HPU_FLASHINFER_GDN", "false"),
+    ).strip().lower() in ("1", "true"),
+    "VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS":
+    lambda: int(os.environ.get("VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS", "32")),
+
+    # Fuse hidden-state selection, the LM head, and argmax for plain greedy
+    # decode requests. Sampling features that can change logits or require
+    # logprobs retain the general sampler path.
+    "VLLM_HPU_FUSED_GREEDY_LOGITS":
+    lambda: os.environ.get("VLLM_HPU_FUSED_GREEDY_LOGITS", "false").strip().lower() in ("1", "true"),
+
     # Override the GDN prefill chunk size. Zero preserves the model-provided
     # value, or the HPU default when the model does not specify one.
     "VLLM_GDN_CHUNK_SIZE":
@@ -132,7 +183,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Avoid per-chunk in-place writes to views of the phase-B output tensor.
     "VLLM_GDN_DEFERRED_OUTPUT_ADD":
     lambda: os.environ.get("VLLM_GDN_DEFERRED_OUTPUT_ADD", "false").lower() in ("1", "true"),
-
     # Use recursive block inversion for GDN unit lower-triangular matrices.
     # Zero disables the path; a positive power of two selects the base size.
     "VLLM_GDN_RECURSIVE_SOLVER_BASE":

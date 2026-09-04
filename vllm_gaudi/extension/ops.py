@@ -13,6 +13,7 @@ import habana_frameworks.torch.core as htcore
 from vllm_gaudi.extension.runtime import get_config
 from vllm_gaudi.extension.utils import get_kv_fetch_extra_args
 from vllm_gaudi.extension.scales import ConvertScaleToHwAligned
+from vllm_gaudi import envs
 import vllm.model_executor.layers.quantization as vllm_quant
 import habana_frameworks.torch.utils.experimental as htexp
 import types
@@ -1016,12 +1017,20 @@ def apply_fp8_linear_hpu(
     return output
 
 
-def dynamic_quant(data, single_scale=False, use_cguid=True):
+def _use_cguid_dynamic_quant(data, use_cguid=True):
     token_count = data.numel() // data.shape[-1]
+    return use_cguid and (
+        (envs.VLLM_HPU_CGUID_DYNAMIC_QUANT and data.ndim == 2
+         and data.shape[0] <= envs.VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS)
+        or (gaudi_envs.VLLM_HPU_DYNAMIC_QUANT_CGUID
+            and token_count >= gaudi_envs.VLLM_HPU_DYNAMIC_QUANT_CGUID_MIN_TOKENS)
+    )
+
+
+def dynamic_quant(data, single_scale=False, use_cguid=True):
     if single_scale:
         scale = ((torch.abs(data)).max() + 1e-8) / FP8_MAX
-    elif (use_cguid and gaudi_envs.VLLM_HPU_DYNAMIC_QUANT_CGUID
-          and token_count >= gaudi_envs.VLLM_HPU_DYNAMIC_QUANT_CGUID_MIN_TOKENS):
+    elif _use_cguid_dynamic_quant(data, use_cguid=use_cguid):
         scale = torch.ops.hpu.calculate_scale_for_cast(
             data,
             2,  # MAX_ABS_PCS_CALCULATION

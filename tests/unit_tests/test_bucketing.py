@@ -307,6 +307,16 @@ def test_exponential_warmup_range_respects_max(mock_get_config):
 
 
 @patch('vllm_gaudi.extension.bucketing.exponential.get_config')
+def test_exponential_decode_bs_range_keeps_power_of_two_anchors(mock_get_config):
+    mock_get_config.return_value = _MockConfig(use_contiguous_pa=False)
+    strategy = ExponentialBucketingStrategy()
+
+    buckets = strategy.get_decode_bs_range((1, 2, 32, 6))
+
+    assert buckets == [1, 2, 4, 8, 12, 16, 20, 32]
+
+
+@patch('vllm_gaudi.extension.bucketing.exponential.get_config')
 def test_exponential_warmup_range_contiguous_pa(mock_get_config):
     """warmup_range_with_limit with use_contiguous_pa should set last bucket to bmax exactly."""
     mock_get_config.return_value = _MockConfig(use_contiguous_pa=True)

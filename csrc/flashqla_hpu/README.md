@@ -1,18 +1,14 @@
-# FlashQLA HPU research kernels
+# FlashQLA HPU kernels
 
-This directory contains Gaudi2 research prototypes used to determine which
-parts of FlashQLA can profitably be moved to public HPU custom operators.
-They are not loaded by the vLLM Gaudi runtime. FlashQLA's TileLang kernels
-target NVIDIA SMs and cannot be compiled for HPU; public Gaudi custom ops run
-on TPC and cannot issue MME matrix operations from the same kernel.
+This directory contains the optional Gaudi2 kernels used by the Qwen3.8 GDN
+prefill path. FlashQLA's TileLang kernels target NVIDIA SMs and cannot be
+compiled for HPU, so the port combines public TPC custom operators with the
+compiled PyTorch MME graph. The runtime loads these kernels only when their
+corresponding feature flags and extension paths are configured.
 
-The current prototypes are numerically correct but slower than the compiled
-HPU graph at Qwen3.8-27B's 16K shape. See `RESULTS.md` before attempting to
-wire one into the model path.
-
-`DESIGN.md` describes the mixed MME/TPC implementation required for a useful
-port. `native_backend/` contains a research-only compound-backend probe; it is
-not loaded by vLLM.
+`native_backend/` contains the optional compound-backend bridge used by the
+mixed-precision triangular solve experiment. It is not required by the
+default path.
 
 Build the TPC performance library and PyTorch registration module:
 

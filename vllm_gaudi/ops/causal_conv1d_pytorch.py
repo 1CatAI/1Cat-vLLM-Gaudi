@@ -610,6 +610,7 @@ def hpu_causal_conv1d_update(
     block_idx_last_scheduled_token: torch.Tensor | None = None,
     initial_state_idx: torch.Tensor | None = None,
     validate_data: bool = False,
+    direct_state_layout: bool = False,
 ):
     if num_accepted_tokens is not None:
         raise NotImplementedError("Speculative decoding updates are not supported in the reference implementation.")
@@ -634,6 +635,7 @@ def hpu_causal_conv1d_update(
         metadata=None,
         validate_data=validate_data,
         is_prompt=False,
+        direct_state_layout=direct_state_layout,
     )
     return reshape_spec.reshape_fn(result)
 
@@ -655,6 +657,7 @@ def hpu_causal_conv1d_fn_update(
     metadata=None,
     validate_data: bool = False,
     is_prompt: bool = True,
+    direct_state_layout: bool = False,
 ):
     if any(ptr is not None for ptr in (
             block_idx_first_scheduled_token,
@@ -700,25 +703,54 @@ def hpu_causal_conv1d_fn_update(
         if has_initial_state is not None and has_initial_state.numel() != padded_batch:
             raise ValueError("'has_initial_state' must align with 'query_start_loc'.")
 
-    out = torch.zeros_like(x_work)
+    if direct_state_layout:
+        if cache_indices is not None:
+            raise ValueError("'cache_indices' must be None for direct conv-state layout.")
+        if conv_states.shape[0] != padded_batch:
+            raise ValueError("Direct conv-state view must contain exactly one row per request.")
+        if x_work.shape[0] != padded_batch or cu_seqlen != 1 or state_len == 0:
+            raise ValueError("Direct conv-state layout supports one decode token per request.")
+        # The model runner proves that request slots are contiguous and in
+        # batch order before selecting this path. Basic slicing avoids the
+        # gather/scatter nodes and their integer-index recipe boundary.
+        state_rows = conv_states[:, -state_len:, :]
 
-    # Get cache indices
-    if cache_indices is None:
-        batch_cache_idx = torch.arange(padded_batch, device=x_work.device, dtype=torch.long)
+        # For one-token decode, consume the native [B, state_len, dim]
+        # layout directly. This avoids transposing and concatenating a
+        # temporary [B, dim, width] window merely to take one output column.
+        token_x = x_work[:, :, 0]
+        needs_upcast = work_dtype in (torch.bfloat16, torch.float16)
+        tap_weights = weight_work.float() if needs_upcast else weight_work
+        output_token = state_rows[:, 0, :] * tap_weights[:, 0]
+        for tap in range(1, state_len):
+            output_token = output_token + state_rows[:, tap, :] * tap_weights[:, tap]
+        output_token = output_token + token_x * tap_weights[:, state_len]
+        if bias_work is not None:
+            output_token = output_token + (bias_work.float() if needs_upcast else bias_work)
+        if needs_upcast:
+            output_token = output_token.to(work_dtype)
+
+        seq_out = _apply_activation(output_token.unsqueeze(-1), activation)
+        new_state = torch.cat([state_rows[:, 1:, :], token_x.unsqueeze(1)], dim=1)
+        with torch.no_grad():
+            conv_states[:, -state_len:, :].copy_(new_state)
+        return seq_out.to(original_dtype)
     else:
-        # Ensure cache_indices is on the correct device
-        batch_cache_idx = cache_indices.to(x_work.device) if cache_indices.device != x_work.device else cache_indices
+        # Get cache indices
+        if cache_indices is None:
+            batch_cache_idx = torch.arange(padded_batch, device=x_work.device, dtype=torch.long)
+        else:
+            # Ensure cache_indices is on the correct device
+            batch_cache_idx = (cache_indices.to(x_work.device)
+                               if cache_indices.device != x_work.device else cache_indices)
 
-    # HPU bucketing pads the batch with state_indices == -1
-    # (PAD_SLOT_ID).  Route padding to a *garbage slot* (last entry
-    # in the conv_states tensor, unused by any real request).
-    # Use torch.remainder (not torch.where) — HPU torch.compile
-    # silently miscompiles torch.where on integer tensors.
-    # remainder(-1, N) == N-1, remainder(valid, N) == valid.
-    num_conv_slots = conv_states.shape[0]
-    safe_cache_idx = torch.remainder(batch_cache_idx, num_conv_slots)
-
-    init_state = conv_states[safe_cache_idx, -state_len:, :]
+        # HPU bucketing pads the batch with state_indices == -1
+        # (PAD_SLOT_ID). Route padding to a garbage slot (last entry).
+        # Use remainder because HPU torch.compile miscompiles torch.where on
+        # integer tensors. remainder(-1, N) == N-1.
+        num_conv_slots = conv_states.shape[0]
+        safe_cache_idx = torch.remainder(batch_cache_idx, num_conv_slots)
+        init_state = conv_states[safe_cache_idx, -state_len:, :]
     init_state = init_state.transpose(-1, -2)
 
     seq_input = torch.cat([init_state, x_work], dim=2)
@@ -727,9 +759,8 @@ def hpu_causal_conv1d_fn_update(
     # spatial_convolution input1 weight-transpose stall.
     seq_out = _depthwise_conv1d_tpc(seq_input, weight_work, bias_work)
     seq_out = _apply_activation(seq_out, activation)
-    out = seq_out
 
     with torch.no_grad():
         conv_states[safe_cache_idx, -state_len:, :] = new_state.transpose(-1, -2)
 
-    return out.to(original_dtype)
+    return seq_out.to(original_dtype)

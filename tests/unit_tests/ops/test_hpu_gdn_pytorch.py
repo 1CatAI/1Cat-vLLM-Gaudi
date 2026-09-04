@@ -786,6 +786,65 @@ class TestChunkGatedDeltaRule:
         torch.testing.assert_close(compact_out, expanded_out, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(compact_state, expanded_state, atol=1e-5, rtol=1e-5)
 
+    def test_explicit_flashqla_options_match_standard_exact_path(self, gdn_exact):
+        """Main's per-call FlashInfer options remain compatible with the PR2 path."""
+        B, T, H, K, HV, V = 1, 50, 2, 8, 4, 8
+        q, k, v, g, beta = _make_gdn_inputs(B, T, H, HV, K, V, seed=149)
+
+        standard_out, standard_state = gdn_exact.hpu_chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            chunk_size=16,
+            output_final_state=True,
+            prefill_num_seqs=B,
+            prefill_seq_len=T,
+            neumann_iters=14,
+        )
+        common = dict(
+            chunk_size=16,
+            output_final_state=True,
+            prefill_num_seqs=B,
+            prefill_seq_len=T,
+            neumann_iters=14,
+            fused_state_matmul=True,
+            recursive_solver_base=16,
+            compact_repeated_kkt=True,
+            flashqla_reformulation=True,
+            deferred_output_add=True,
+            solve_in_fp32=True,
+            state_in_fp32=True,
+            preserve_compact_qk=True,
+        )
+        legacy_out, legacy_state = gdn_exact.hpu_chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            **common,
+        )
+        masked_out, masked_state = gdn_exact.hpu_chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            masked_triangular_decay=True,
+            **common,
+        )
+
+        torch.testing.assert_close(masked_out, legacy_out, atol=0, rtol=0)
+        torch.testing.assert_close(masked_state, legacy_state, atol=0, rtol=0)
+        output_relative_l2 = torch.linalg.vector_norm(
+            masked_out - standard_out) / torch.linalg.vector_norm(standard_out)
+        state_relative_l2 = torch.linalg.vector_norm(
+            masked_state - standard_state) / torch.linalg.vector_norm(standard_state)
+        assert output_relative_l2 < 2e-5
+        assert state_relative_l2 < 2e-5
+
     def test_preexpanded_qk_preserves_compact_head_metadata(self, gdn_exact):
         B, T, H, K, HV, V = 1, 48, 2, 8, 4, 8
         q, k, v, g, beta = _make_gdn_inputs(B, T, H, HV, K, V, seed=137)

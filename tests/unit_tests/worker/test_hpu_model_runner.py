@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
+
 import pytest
 import torch
 from types import SimpleNamespace
@@ -18,15 +20,26 @@ from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData, Schedu
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor)
 from vllm.v1.sample.metadata import SamplingMetadata
 import vllm_gaudi.extension.environment as environment
+import vllm_gaudi.v1.worker.hpu_model_runner as model_runner_module
 from vllm_gaudi.v1.worker.hpu_model_runner import (
     HPUModelRunner,
+    HpuModelAdapter,
     _zero_compact_gdn_slot,
+    maybe_set_mamba_kv_cache_groups_ids,
+    should_synchronize_hybrid_prefill_output,
 )
 from vllm_gaudi.v1.worker.hpu_input_batch import InputBatch
 
 BLOCK_SIZE = 128
 NUM_BLOCKS = 10
 DEVICE = current_platform.device_type
+
+
+@pytest.fixture(autouse=True)
+def restore_default_dtype():
+    default_dtype = torch.get_default_dtype()
+    yield
+    torch.set_default_dtype(default_dtype)
 
 
 def test_zero_compact_gdn_slot_clears_only_reused_request_states():
@@ -418,6 +431,34 @@ def test_reload_weights_before_load_model(model_runner):
         model_runner.reload_weights()
 
 
+def test_tp2_fused_text_only_mm_inputs_defer_embedding(monkeypatch):
+    embedded = []
+    runner = SimpleNamespace(
+        supports_mm_inputs=True,
+        uses_mrope=False,
+        profiler=SimpleNamespace(record_event=lambda *_args: nullcontext()),
+        is_mm_embed=SimpleNamespace(copy_to_gpu=lambda _tokens: torch.tensor([], dtype=torch.bool)),
+        attn_backend_name='HPUAttentionBackendV1',
+        model=SimpleNamespace(embed_input_ids=lambda *args, **kwargs: embedded.append((args, kwargs))),
+        _execute_mm_encoder=lambda *_args: None,
+        _gather_mm_embeddings=lambda *_args, **_kwargs: ([], torch.tensor([], dtype=torch.bool)),
+        _extract_mm_kwargs=lambda _scheduler_output: {},
+    )
+    monkeypatch.setattr(model_runner_module, 'get_config', lambda: SimpleNamespace(tp2_fused_ar_norm=True))
+
+    inputs_embeds, model_mm_kwargs = HPUModelRunner._get_model_mm_inputs(
+        runner,
+        torch.tensor([[1, 2, 3]]),
+        3,
+        SimpleNamespace(),
+        ['request'],
+    )
+
+    assert inputs_embeds is None
+    assert model_mm_kwargs == {}
+    assert embedded == []
+
+
 def test_init_kv_cache_with_kv_sharing_invalid_target_layer_order(default_vllm_config: None):
     torch.set_default_dtype(torch.bfloat16)
     layer_0 = "model.layers.0.self_attn.attn"
@@ -679,6 +720,130 @@ def test_model_torch_regional_compilation(default_vllm_config: None, dist_init, 
     assert_compilation(model, "lm_head", VocabParallelEmbedding)
     assert_compilation(model, "model.decoder.final_layer_norm", LayerNorm)
     assert_compilation(model, "model.decoder.embed_tokens", VocabParallelEmbedding)
+
+
+def test_mamba_cache_groups_handle_whole_model_compile_wrapper():
+    base_model = torch.nn.Module()
+    base_model.config = SimpleNamespace(architectures=[])
+
+    adapter = object.__new__(HpuModelAdapter)
+    torch.nn.Module.__init__(adapter)
+    adapter.model = base_model
+
+    compiled_model = SimpleNamespace(_orig_mod=adapter)
+    kv_cache_config = SimpleNamespace(kv_cache_groups=[])
+
+    maybe_set_mamba_kv_cache_groups_ids(compiled_model, kv_cache_config)
+
+
+@pytest.mark.parametrize(
+    ("use_async", "num_mamba_layers", "num_prefills", "expected"),
+    [
+        (True, 48, 1, True),
+        (True, 48, 0, False),
+        (True, 0, 1, False),
+        (False, 48, 1, False),
+    ],
+)
+def test_should_synchronize_hybrid_prefill_output(use_async, num_mamba_layers, num_prefills, expected):
+    assert should_synchronize_hybrid_prefill_output(use_async, num_mamba_layers, num_prefills) is expected
+
+
+def test_cache_block_capacity_keeps_hybrid_block_units_separate():
+    runner = object.__new__(HPUModelRunner)
+    runner.enable_bucketing = True
+    runner.bucketing_manager = SimpleNamespace(num_hpu_blocks=None)
+    runner.attn_block_size = 128
+
+    runner._set_cache_block_capacity(
+        scheduler_blocks=862,
+        attention_kernel_blocks=862 * 7,
+    )
+
+    assert runner.bucketing_manager.num_hpu_blocks == 6034
+    assert runner._PAD_BLOCK_ID == 6034
+    assert runner._PAD_SLOT_ID == 6034 * 128
+    assert runner._MAMBA_PAD_BLOCK_ID == 862
+    assert runner._dummy_num_blocks == 862
+
+
+def test_direct_gdn_state_requires_group_major_request_order():
+    runner = object.__new__(HPUModelRunner)
+    runner._direct_gdn_state_enabled = True
+    runner._compact_gdn_enabled = True
+    runner.use_prefix_caching = False
+    runner._compact_gdn_group_ids = {1, 3}
+    runner._compact_gdn_group_offset = {1: 0, 3: 1}
+    runner._gdn_max_reqs = 4
+
+    indices = torch.zeros(4, 4, dtype=torch.int32)
+    indices[1] = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+    indices[3] = torch.tensor([5, 6, 7, 8], dtype=torch.int32)
+    assert runner._can_use_direct_gdn_state(indices, num_indices=4, target_bs=4)
+    assert not runner._can_use_direct_gdn_state(indices, num_indices=4, target_bs=4, tokens_per_request=2)
+
+    indices[3] = torch.tensor([6, 5, 7, 8], dtype=torch.int32)
+    assert not runner._can_use_direct_gdn_state(indices, num_indices=4, target_bs=4)
+
+
+def test_model_adapter_selects_hidden_states_inside_logits_region():
+    adapter = SimpleNamespace(model=SimpleNamespace(compute_logits=lambda hidden_states: hidden_states * 3), )
+    hidden_states = torch.arange(24).view(2, 3, 4)
+    logits_indices = torch.tensor([1, 4])
+
+    selected, logits = HpuModelAdapter.select_and_compute_logits(
+        adapter,
+        hidden_states,
+        logits_indices,
+    )
+
+    expected = hidden_states.view(-1, 4)[logits_indices]
+    assert torch.equal(selected, expected)
+    assert torch.equal(logits, expected * 3)
+
+
+def test_model_adapter_fuses_plain_greedy_with_logits_region():
+    adapter = SimpleNamespace(model=SimpleNamespace(compute_logits=lambda hidden_states: hidden_states * 3), )
+    hidden_states = torch.arange(24).view(2, 3, 4)
+    logits_indices = torch.tensor([1, 4])
+
+    selected, sampled_token_ids = HpuModelAdapter.select_compute_logits_and_greedy(
+        adapter,
+        hidden_states,
+        logits_indices,
+    )
+
+    expected = hidden_states.view(-1, 4)[logits_indices]
+    assert torch.equal(selected, expected)
+    assert torch.equal(sampled_token_ids, torch.tensor([[3], [3]], dtype=torch.int32))
+
+
+def test_plain_greedy_fusion_is_strictly_gated(monkeypatch):
+    runner = object.__new__(HPUModelRunner)
+    runner.speculative_config = None
+    runner.use_structured_output = False
+    runner.input_batch = SimpleNamespace(logitsprocs=SimpleNamespace(non_argmax_invariant=[
+        object.__new__(model_runner_module.MinTokensLogitsProcessor),
+        object.__new__(model_runner_module.LogitBiasLogitsProcessor),
+    ]))
+    runner.requests = {"req": SimpleNamespace(sampling_params=SamplingParams(temperature=0.0))}
+
+    monkeypatch.setenv("VLLM_HPU_FUSED_GREEDY_LOGITS", "true")
+    assert runner._can_fuse_plain_greedy_sampling(["req"])
+
+    runner.requests["req"].sampling_params = SamplingParams(temperature=0.0, logprobs=1)
+    assert not runner._can_fuse_plain_greedy_sampling(["req"])
+
+    runner.requests["req"].sampling_params = SamplingParams(temperature=0.7)
+    assert not runner._can_fuse_plain_greedy_sampling(["req"])
+
+    runner.requests["req"].sampling_params = SamplingParams(temperature=0.0)
+    runner.input_batch.logitsprocs.non_argmax_invariant.append(SimpleNamespace())
+    assert not runner._can_fuse_plain_greedy_sampling(["req"])
+
+    monkeypatch.setenv("VLLM_HPU_FUSED_GREEDY_LOGITS", "false")
+    runner.input_batch.logitsprocs.non_argmax_invariant.pop()
+    assert not runner._can_fuse_plain_greedy_sampling(["req"])
 
 
 def test_max_cudagraph_capture_size_defaults_to_max_num_batched_tokens(model_runner):

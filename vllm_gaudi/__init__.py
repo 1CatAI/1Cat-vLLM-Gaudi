@@ -98,6 +98,9 @@ def register_utils():
 
 def register_ops():
     """Register custom PluggableLayers for the HPU platform"""
+    from flashinfer_gaudi import load_native_extensions
+
+    load_native_extensions()
     import vllm_gaudi.attention.oot_mla  # noqa: F401
     """Register custom ops for the HPU platform."""
     import vllm_gaudi.v1.sample.hpu_rejection_sampler  # noqa: F401
@@ -114,6 +117,7 @@ def register_ops():
     import vllm_gaudi.ops.hpu_mamba_mixer2  # noqa: F401
     import vllm_gaudi.ops.hpu_rotary_embedding  # noqa: F401
     import vllm_gaudi.ops.hpu_silu_and_mul  # noqa: F401
+    import vllm_gaudi.ops.hpu_vocab_parallel_embedding  # noqa: F401
     import vllm_gaudi.ops.hpu_modelopt  # noqa: F401
     import vllm_gaudi.ops.hpu_compressed_tensors  # noqa: F401
     import vllm_gaudi.ops.hpu_fp8  # noqa: F401

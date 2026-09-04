@@ -11,6 +11,45 @@ from vllm_gaudi.utils import HPUCompileConfig
 from vllm.forward_context import override_forward_context
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from safetensors import safe_open
+from vllm_gaudi.extension.ops import _use_cguid_dynamic_quant, dynamic_quant
+
+
+def test_cguid_dynamic_quant_decode_shape_gate(monkeypatch):
+    monkeypatch.setenv("VLLM_HPU_CGUID_DYNAMIC_QUANT", "1")
+    monkeypatch.setenv("VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS", "32")
+
+    assert _use_cguid_dynamic_quant(torch.empty(32, 64))
+    assert not _use_cguid_dynamic_quant(torch.empty(33, 64))
+    assert not _use_cguid_dynamic_quant(torch.empty(1, 1, 64))
+
+
+def test_cguid_dynamic_quant_follows_flashinfer_by_default(monkeypatch):
+    monkeypatch.delenv("VLLM_HPU_CGUID_DYNAMIC_QUANT", raising=False)
+    monkeypatch.setenv("VLLM_HPU_FLASHINFER_GDN", "1")
+    monkeypatch.setenv("VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS", "32")
+
+    assert _use_cguid_dynamic_quant(torch.empty(32, 64))
+
+    monkeypatch.setenv("VLLM_HPU_CGUID_DYNAMIC_QUANT", "0")
+    assert not _use_cguid_dynamic_quant(torch.empty(32, 64))
+
+
+@pytest.mark.parametrize("rows", [1, 8, 16, 32])
+def test_cguid_dynamic_quant_matches_decode_reference(monkeypatch, rows):
+    torch.manual_seed(37 + rows)
+    data = torch.randn(rows, 256, dtype=torch.bfloat16, device="hpu")
+    if rows > 1:
+        data[0].zero_()
+        data[1].fill_(1e-8)
+
+    monkeypatch.setenv("VLLM_HPU_CGUID_DYNAMIC_QUANT", "0")
+    expected_fp8, expected_scale = dynamic_quant(data)
+    monkeypatch.setenv("VLLM_HPU_CGUID_DYNAMIC_QUANT", "1")
+    monkeypatch.setenv("VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS", "32")
+    actual_fp8, actual_scale = dynamic_quant(data)
+
+    assert torch.equal(expected_fp8, actual_fp8)
+    torch.testing.assert_close(expected_scale, actual_scale, atol=3e-13, rtol=0)
 
 
 def test_fp8_linear_method(default_vllm_config: None, dist_init, monkeypatch):

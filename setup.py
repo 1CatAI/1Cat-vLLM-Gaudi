@@ -1,7 +1,14 @@
+import importlib.util
 import logging
 import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
 
-from setuptools import setup, find_packages
+from setuptools import find_packages, setup
+from setuptools.command.build_py import build_py as _build_py
+from setuptools.dist import Distribution
 from setuptools_scm import get_version
 
 try:
@@ -43,6 +50,48 @@ def get_requirements() -> list[str]:
     return requirements
 
 
+def _native_flashinfer_build_enabled() -> bool:
+    mode = os.environ.get("VLLM_GAUDI_BUILD_FLASHINFER", "auto").strip().lower()
+    if mode in ("0", "false", "off", "no"):
+        return False
+    if mode in ("1", "true", "on", "yes"):
+        return True
+    if mode != "auto":
+        raise ValueError("VLLM_GAUDI_BUILD_FLASHINFER must be auto, 0, or 1.")
+    return shutil.which("tpc-clang") is not None and importlib.util.find_spec("habana_frameworks") is not None
+
+
+class FlashInferBuildPy(_build_py):
+    """Optionally build version-pinned native kernels into the package."""
+
+    def run(self):
+        super().run()
+        output_dir = os.path.join(self.build_lib, "flashinfer_gaudi", "lib")
+        if not _native_flashinfer_build_enabled():
+            # A previous native wheel build may have left binaries in the
+            # reusable setuptools build tree. Never leak those artifacts into
+            # a later explicitly pure build.
+            for library in Path(output_dir).glob("*.so"):
+                library.unlink()
+            return
+        subprocess.run(
+            [
+                sys.executable,
+                get_path("tools", "build_flashinfer_gaudi.py"),
+                "--output-dir",
+                output_dir,
+            ],
+            check=True,
+        )
+
+
+class FlashInferDistribution(Distribution):
+    """Mark native builds as platform wheels even though build_py creates them."""
+
+    def has_ext_modules(self) -> bool:
+        return _native_flashinfer_build_enabled() or super().has_ext_modules()
+
+
 setup(
     name="vllm_gaudi",
     version=VERSION,
@@ -59,9 +108,20 @@ setup(
         "Operating System :: OS Independent",
     ],
     packages=find_packages(exclude=("docs", "examples", "tests*", "csrc")),
+    package_data={
+        "flashinfer_gaudi": [
+            "tactics/*.json",
+            *(["lib/*.so"] if _native_flashinfer_build_enabled() else []),
+        ]
+    },
+    exclude_package_data=({} if _native_flashinfer_build_enabled() else {
+        "flashinfer_gaudi": ["lib/*.so"]
+    }),
     py_modules=["pytest_compat"],
     install_requires=get_requirements(),
     ext_modules=ext_modules,
+    cmdclass={"build_py": FlashInferBuildPy},
+    distclass=FlashInferDistribution,
     extras_require={},
     entry_points={
         "vllm.platform_plugins": ["hpu = vllm_gaudi:register"],

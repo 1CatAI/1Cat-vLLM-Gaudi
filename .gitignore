@@ -12,6 +12,7 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+flashinfer_gaudi/lib/*.so
 cmake-build-*/
 CMakeUserPresets.json
 develop-eggs/

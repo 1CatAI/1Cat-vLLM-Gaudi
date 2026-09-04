@@ -16,6 +16,20 @@ class HPURMSNorm(RMSNorm):
         HPUFusedRMSNorm = rms_norm()
         if residual is not None:
             orig_shape = x.shape
+            if getattr(self, "_hpu_tp2_fused_ar_norm", False):
+                from vllm.forward_context import get_forward_context
+                from vllm_gaudi.distributed.tp2_fused_ar_norm import tp2_allreduce_residual_rms_norm
+
+                attn_metadata = get_forward_context().attn_metadata
+                is_prompt = bool(attn_metadata is not None and getattr(attn_metadata, "is_prompt", False))
+                normalized, residual = tp2_allreduce_residual_rms_norm(
+                    x.reshape(residual.shape),
+                    residual,
+                    self.weight,
+                    self.variance_epsilon,
+                    is_prompt=is_prompt,
+                )
+                return normalized.reshape(orig_shape), residual
             residual = residual + x.reshape(residual.shape)
             # Note: HPUFusedRMSNorm requires 3D tensors as inputs
             x = HPUFusedRMSNorm.apply(residual, self.weight, self.variance_epsilon)

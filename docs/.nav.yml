@@ -31,6 +31,7 @@ nav:
       - configuration/warm-up/managing_warm-up.md
   - Features:
     - features/supported_features.md
+    - features/flashinfer_gaudi.md
     - features/bucketing_mechanism.md
     - features/floating_point_8.md
     - features/warmup.md

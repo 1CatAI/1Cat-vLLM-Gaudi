@@ -159,6 +159,7 @@ class HPUAttentionMetadata(HPUPagedAttentionMetadata, AttentionMetadata):
     last_chunk_indices_p: Optional[torch.Tensor] = None
     load_indices_tensor: Optional[torch.Tensor] = None  # shape: [batch,]
     store_indices_tensor: Optional[torch.Tensor] = None  # shape: [batch,]
+    direct_gdn_state: bool = False
 
 
 @dataclass

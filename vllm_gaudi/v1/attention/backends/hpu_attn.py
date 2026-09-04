@@ -92,7 +92,8 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                               blocks_caching_range=None,
                               mamba_chunks_to_block_mapping=None,
                               seqlens_offsets_for_blocks=None,
-                              window_block_list=None):
+                              window_block_list=None,
+                              direct_gdn_state=False):
         return cls(is_prompt=True,
                    block_list=block_list,
                    block_mapping=None,
@@ -116,7 +117,8 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    blocks_caching_range=blocks_caching_range,
                    mamba_chunks_to_block_mapping=mamba_chunks_to_block_mapping,
                    seqlens_offsets_for_blocks=seqlens_offsets_for_blocks,
-                   window_block_list=window_block_list)
+                   window_block_list=window_block_list,
+                   direct_gdn_state=direct_gdn_state)
 
     @classmethod
     def make_decode_metadata(cls,
@@ -135,7 +137,8 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                              load_indices_tensor=None,
                              store_indices_tensor=None,
                              query_start_loc=None,
-                             seq_lens_tensor=None):
+                             seq_lens_tensor=None,
+                             direct_gdn_state=False):
         return cls(is_prompt=False,
                    block_mapping=None,
                    alibi_blocks=None,
@@ -158,4 +161,5 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    load_indices_tensor=load_indices_tensor,
                    store_indices_tensor=store_indices_tensor,
                    query_start_loc=query_start_loc,
-                   query_start_loc_p=query_start_loc)
+                   query_start_loc_p=query_start_loc,
+                   direct_gdn_state=direct_gdn_state)
