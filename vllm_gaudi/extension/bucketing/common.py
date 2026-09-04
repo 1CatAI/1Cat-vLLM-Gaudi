@@ -2,10 +2,6 @@ import logging
 import os
 import bisect
 import math
-from typing import Dict
-import inspect
-from dataclasses import dataclass, field
-from typing import List, Tuple
 
 from vllm_gaudi.extension.logger import logger as logger
 from vllm_gaudi.extension.runtime import get_config
@@ -41,7 +37,7 @@ def calc_fallback_value(n: int, base_step: int):
     return math.ceil(n / bucket_size) * bucket_size
 
 
-class HPUBucketingManager():
+class HPUBucketingManager:
     # Keep an active-manager handle for code paths that cannot access
     # the runner-local manager object directly (for example, fsdpa setup).
     _active_instance = None
@@ -49,11 +45,11 @@ class HPUBucketingManager():
     def __init__(self):
         # All mutable state must be instance-local to avoid cross-model
         # contamination when multiple runners are stashed/restored.
-        self.prompt_buckets: List[Tuple[int, int, int]] = []
-        self.decode_buckets: List[Tuple[int, int, int]] = []
+        self.prompt_buckets: list[tuple[int, int, int]] = []
+        self.decode_buckets: list[tuple[int, int, int]] = []
         # Seed buckets are the buckets originally generated from bucketing configuration
         # Spec decode may automatically add new buckets based on the seed buckets
-        self.seed_decode_buckets: List[Tuple[int, int, int]] | None = None
+        self.seed_decode_buckets: list[tuple[int, int, int]] | None = None
         self.initialized = False
 
     def activate(self):
@@ -107,9 +103,8 @@ class HPUBucketingManager():
             self.slice_thld = get_config().VLLM_FUSEDSDPA_SLIDE_THLD if \
                 get_config().VLLM_FUSEDSDPA_SLIDE_THLD is not None else 8192
 
-            msg = (
-                f"use_sliding_window {self.use_sliding_window}, slice_size {self.slice_size}, threshold {self.slice_thld}"
-            )
+            msg = (f"use_sliding_window {self.use_sliding_window}, slice_size {self.slice_size}, "
+                   f"threshold {self.slice_thld}")
             logger().info(msg)
 
     ### GENERATE BUCKETS FUNCTIONS ###
@@ -119,9 +114,16 @@ class HPUBucketingManager():
         strategy = FileBucketingStrategy()
         return strategy.get_buckets(file_name, is_prompt)
 
-    def get_bucketing_strategy(self):
-        # TODO - we can use different strategies for decode and prompt
-        bucketing_strategy = get_config().bucketing_strategy
+    def get_bucketing_strategy(self, phase=None):
+        """Resolve the global strategy, optionally overridden for one phase."""
+        config = get_config()
+        bucketing_strategy = config.bucketing_strategy
+        if phase is not None:
+            if phase not in ('prompt', 'decode'):
+                raise ValueError(f"Invalid bucketing phase: {phase}, please choose from ['prompt', 'decode']")
+            phase_strategy = getattr(config, f'VLLM_{phase.upper()}_BUCKETING_STRATEGY')
+            if phase_strategy is not None:
+                bucketing_strategy = phase_strategy
         if bucketing_strategy == 'exp':
             strategy = ExponentialBucketingStrategy()
         elif bucketing_strategy == 'lin':
@@ -135,18 +137,14 @@ class HPUBucketingManager():
         # for backward compatibility - if VLLM_EXPONENTIAL_BUCKETING is set, it will override the bucketing strategy
         exp_bucketing_env = os.getenv('VLLM_EXPONENTIAL_BUCKETING', None)
         if exp_bucketing_env is not None:
-            logger().warning(
-                "VLLM_EXPONENTIAL_BUCKETING is deprecated and will be removed in a future release. Use VLLM_BUCKETING_STRATEGY='exp'|'lin'|'pad' instead."
-            )
+            logger().warning("VLLM_EXPONENTIAL_BUCKETING is deprecated and will be removed in a future release. "
+                             "Use VLLM_BUCKETING_STRATEGY='exp'|'lin'|'pad' instead.")
             use_exp_bucketing = boolean(exp_bucketing_env)
-            if use_exp_bucketing:
-                override_strategy = ExponentialBucketingStrategy()
-            else:
-                override_strategy = LinearBucketingStrategy()
+            override_strategy = ExponentialBucketingStrategy() if use_exp_bucketing else LinearBucketingStrategy()
             if override_strategy.__class__ != strategy.__class__:
-                logger().warning(
-                    f"Overriding bucketing strategy {strategy.__class__.__name__} with {override_strategy.__class__.__name__} due to VLLM_EXPONENTIAL_BUCKETING={exp_bucketing_env}"
-                )
+                logger().warning(f"Overriding bucketing strategy {strategy.__class__.__name__} with "
+                                 f"{override_strategy.__class__.__name__} due to "
+                                 f"VLLM_EXPONENTIAL_BUCKETING={exp_bucketing_env}")
                 strategy = override_strategy
         return strategy
 
@@ -159,7 +157,7 @@ class HPUBucketingManager():
             if get_config().VLLM_BUCKETING_FROM_FILE:
                 buckets_from_file = self.read_from_file(is_prompt=True)
             else:
-                strategy = self.get_bucketing_strategy()
+                strategy = self.get_bucketing_strategy('prompt')
 
                 bs_cfg, query_cfg, ctx_cfg = strategy.get_prompt_cfgs(
                     max_num_prefill_seqs=self.max_num_prefill_seqs,
@@ -201,7 +199,7 @@ class HPUBucketingManager():
             if get_config().VLLM_BUCKETING_FROM_FILE:
                 buckets_from_file = self.read_from_file(is_prompt=False)
             else:
-                strategy = self.get_bucketing_strategy()
+                strategy = self.get_bucketing_strategy('decode')
 
                 bs_cfg, query_cfg, ctx_cfg = strategy.get_decode_cfgs(
                     max_num_seqs=self.max_num_seqs,
@@ -452,9 +450,9 @@ def generate_buckets(bs_range,
         smaller_than_limit = ctx <= max_num_prefill_seqs * math.ceil(
             (max_model_len - math.floor(query / max_num_prefill_seqs)) // block_size)
         if not smaller_than_limit:
-            omitted_buckets.add((
-                "ctx <= max_num_prefill_seqs * math.ceil((max_model_len - math.floor(query / max_num_prefill_seqs)) // block_size)",
-                "-> bs, query, ctx: ", bs, query, ctx))
+            omitted_buckets.add(
+                ("ctx <= max_num_prefill_seqs * math.ceil((max_model_len - "
+                 "math.floor(query / max_num_prefill_seqs)) // block_size)", "-> bs, query, ctx: ", bs, query, ctx))
         return smaller_than_limit
 
     def no_corrections(bs, query, ctx):

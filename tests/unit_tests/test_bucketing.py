@@ -55,6 +55,33 @@ def test_get_bucketing_strategy_default_when_env_not_set(monkeypatch):
     assert isinstance(strategy, ExponentialBucketingStrategy)
 
 
+@pytest.mark.parametrize(
+    ("phase", "env_name", "expected_type"),
+    [
+        ("prompt", "VLLM_PROMPT_BUCKETING_STRATEGY", LinearBucketingStrategy),
+        ("decode", "VLLM_DECODE_BUCKETING_STRATEGY", PaddingAwareBucketingStrategy),
+    ],
+)
+def test_get_bucketing_strategy_phase_override(monkeypatch, phase, env_name, expected_type):
+    monkeypatch.setenv("VLLM_BUCKETING_STRATEGY", "exp")
+    monkeypatch.setenv(env_name, "lin" if phase == "prompt" else "pad")
+    clear_config()
+
+    manager = HPUBucketingManager.__new__(HPUBucketingManager)
+
+    assert isinstance(manager.get_bucketing_strategy(phase), expected_type)
+    assert isinstance(manager.get_bucketing_strategy(), ExponentialBucketingStrategy)
+
+
+def test_get_bucketing_strategy_rejects_invalid_phase_override(monkeypatch):
+    monkeypatch.setenv("VLLM_DECODE_BUCKETING_STRATEGY", "invalid")
+    clear_config()
+
+    manager = HPUBucketingManager.__new__(HPUBucketingManager)
+    with pytest.raises(RuntimeError, match="VLLM_DECODE_BUCKETING_STRATEGY"):
+        manager.get_bucketing_strategy("decode")
+
+
 def test_get_instance_raises_when_no_active_manager(monkeypatch):
     monkeypatch.setattr(HPUBucketingManager, "_active_instance", None)
 
