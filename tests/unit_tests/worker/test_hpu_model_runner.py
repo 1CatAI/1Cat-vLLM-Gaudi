@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
+
 import pytest
 import torch
 from types import SimpleNamespace
@@ -22,6 +24,7 @@ import vllm_gaudi.v1.worker.hpu_model_runner as model_runner_module
 from vllm_gaudi.v1.worker.hpu_model_runner import (
     HPUModelRunner,
     HpuModelAdapter,
+    _zero_compact_gdn_slot,
     maybe_set_mamba_kv_cache_groups_ids,
     should_synchronize_hybrid_prefill_output,
 )
@@ -30,6 +33,31 @@ from vllm_gaudi.v1.worker.hpu_input_batch import InputBatch
 BLOCK_SIZE = 128
 NUM_BLOCKS = 10
 DEVICE = current_platform.device_type
+
+
+@pytest.fixture(autouse=True)
+def restore_default_dtype():
+    default_dtype = torch.get_default_dtype()
+    yield
+    torch.set_default_dtype(default_dtype)
+
+
+def test_zero_compact_gdn_slot_clears_only_reused_request_states():
+    first = torch.ones(8, 2)
+    second = torch.arange(24, dtype=torch.float32).reshape(8, 3)
+    first_before = first.clone()
+    second_before = second.clone()
+
+    _zero_compact_gdn_slot([first, second], base_slot=1, num_groups=3)
+
+    torch.testing.assert_close(first[1:4], first_before[1:4])
+    torch.testing.assert_close(second[1:4], second_before[1:4])
+    assert torch.count_nonzero(first[0]) == 0
+    assert torch.count_nonzero(second[0]) == 0
+    assert torch.count_nonzero(first[4:7]) == 0
+    assert torch.count_nonzero(second[4:7]) == 0
+    assert torch.count_nonzero(first[7]) == 0
+    assert torch.count_nonzero(second[7]) == 0
 
 
 def initialize_kv_cache(runner: HPUModelRunner):
@@ -408,6 +436,7 @@ def test_tp2_fused_text_only_mm_inputs_defer_embedding(monkeypatch):
     runner = SimpleNamespace(
         supports_mm_inputs=True,
         uses_mrope=False,
+        profiler=SimpleNamespace(record_event=lambda *_args: nullcontext()),
         is_mm_embed=SimpleNamespace(copy_to_gpu=lambda _tokens: torch.tensor([], dtype=torch.bool)),
         attn_backend_name='HPUAttentionBackendV1',
         model=SimpleNamespace(embed_input_ids=lambda *args, **kwargs: embedded.append((args, kwargs))),

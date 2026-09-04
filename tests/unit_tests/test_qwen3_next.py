@@ -7,6 +7,7 @@ import pytest
 import torch
 
 import vllm_gaudi.models.qwen3_next as qwen3_next_module
+from vllm_gaudi.models.qwen3_5 import _save_ssm_state
 from vllm_gaudi.models.qwen3_next import (
     HpuQwen3DecoderLayerGroup,
     build_hpu_qwen3_layer_groups,
@@ -34,6 +35,34 @@ class _FinalNorm(torch.nn.Module):
     def forward(self, hidden_states, residual):
         residual = hidden_states + residual
         return residual * 2, residual
+
+
+def test_single_prefill_state_save_uses_the_only_real_slot():
+    output = torch.tensor([7.0])
+    final_state = torch.ones(1, 2, 3, 4)
+    state_pool = torch.zeros(5, 2, 3, 4)
+
+    returned = _save_ssm_state(output, final_state, state_pool, torch.tensor([2]))
+
+    assert returned is output
+    torch.testing.assert_close(state_pool[2], final_state[0])
+    assert torch.count_nonzero(state_pool[:2]) == 0
+    assert torch.count_nonzero(state_pool[3:]) == 0
+
+
+def test_batched_prefill_state_save_ignores_padding_indices():
+    output = torch.tensor([7.0])
+    final_state = torch.stack((torch.ones(2, 3, 4), torch.full((2, 3, 4), 2.0), torch.full((2, 3, 4), 3.0)))
+    state_pool = torch.zeros(5, 2, 3, 4)
+
+    returned = _save_ssm_state(output, final_state, state_pool, torch.tensor([1, -1, 3]))
+
+    assert returned is output
+    torch.testing.assert_close(state_pool[1], final_state[0])
+    torch.testing.assert_close(state_pool[3], final_state[2])
+    assert torch.count_nonzero(state_pool[0]) == 0
+    assert torch.count_nonzero(state_pool[2]) == 0
+    assert torch.count_nonzero(state_pool[4]) == 0
 
 
 def test_build_hpu_qwen3_layer_groups_preserves_order_and_tail():

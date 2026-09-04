@@ -2,20 +2,30 @@ import torch
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention
 from vllm.forward_context import get_forward_context
 
+import vllm_gaudi.envs as gaudi_envs
 from vllm_gaudi.ops.causal_conv1d_pytorch import (
     hpu_causal_conv1d_fn,
+    hpu_causal_conv1d_fn_token_major,
     hpu_causal_conv1d_update,
 )
 from vllm_gaudi.ops.hpu_gdn_pytorch import (
     hpu_chunk_gated_delta_rule,
     hpu_fused_gdn_gating,
     hpu_fused_recurrent_gated_delta_rule,
+    hpu_fused_rmsnorm_gated,
     resolve_hpu_gdn_chunk_size,
     resolve_hpu_gdn_compact_repeated_kkt,
+    resolve_hpu_gdn_compact_repeated_local_attn,
     resolve_hpu_gdn_compiled_qk_l2norm,
+    resolve_hpu_gdn_fused_rmsnorm_gated,
     resolve_hpu_gdn_fused_state_matmul,
     resolve_hpu_gdn_neumann_iters,
     resolve_hpu_gdn_recursive_solver_base,
+)
+from vllm_gaudi.ops.qwen38_native_qk import (
+    load_qwen38_native_qk_prep,
+    qwen38_native_qk_prep,
+    validate_qwen38_native_qk_shape,
 )
 from vllm_gaudi.ops.flashinfer_gaudi_adapter import (
     maybe_run_gdn_decode_packed,
@@ -33,6 +43,13 @@ def _save_ssm_state(core_attn_out, final_state, ssm_state, state_indices):
     the call — HPU drops dynamo-disabled calls whose results are unused.
     """
     state_indices = state_indices.reshape(-1).to(device=ssm_state.device, dtype=torch.long)
+    if state_indices.numel() == 1:
+        # A real single-request prefill always owns its only state slot. Keep
+        # this hot path to one index operation per GDN layer; materializing
+        # nonzero(valid) here adds a device/host synchronization.
+        safe_si = torch.remainder(state_indices, ssm_state.shape[0])
+        ssm_state.index_copy_(0, safe_si, final_state.to(device=ssm_state.device, dtype=ssm_state.dtype))
+        return core_attn_out
     valid = (state_indices >= 0) & (state_indices < ssm_state.shape[0])
     valid_positions = torch.nonzero(valid, as_tuple=False).reshape(-1)
     if valid_positions.numel() > 0:
@@ -57,10 +74,47 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self.gdn_neumann_iters = resolve_hpu_gdn_neumann_iters()
         self.gdn_recursive_solver_base = resolve_hpu_gdn_recursive_solver_base()
         self.gdn_compact_repeated_kkt = resolve_hpu_gdn_compact_repeated_kkt()
+        self.gdn_compact_repeated_local_attn = (
+            resolve_hpu_gdn_compact_repeated_local_attn()
+        )
         self.gdn_compiled_qk_l2norm = resolve_hpu_gdn_compiled_qk_l2norm()
+        self.gdn_fused_rmsnorm_gated = resolve_hpu_gdn_fused_rmsnorm_gated()
 
         self.qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
         self.z_size = self.value_dim // self.tp_size
+        self.gdn_native_qk_prep = load_qwen38_native_qk_prep()
+        self.gdn_compact_qk_input = gaudi_envs.VLLM_GDN_QWEN38_COMPACT_QK
+        self.gdn_native_compact_kkt = (
+            gaudi_envs.VLLM_GDN_QWEN38_NATIVE_COMPACT_KKT
+        )
+        self.gdn_compact_qk_factor_gate = (
+            gaudi_envs.VLLM_GDN_COMPACT_QK_FACTOR_GATE
+        )
+        if self.gdn_compact_qk_factor_gate and not self.gdn_compact_qk_input:
+            raise ValueError(
+                "VLLM_GDN_COMPACT_QK_FACTOR_GATE requires compact Q/K."
+            )
+        if self.gdn_compact_qk_input and not self.gdn_native_qk_prep:
+            raise ValueError(
+                "VLLM_GDN_QWEN38_COMPACT_QK requires native Q/K preparation."
+            )
+        if self.gdn_native_compact_kkt and not self.gdn_compact_qk_input:
+            raise ValueError(
+                "VLLM_GDN_QWEN38_NATIVE_COMPACT_KKT requires compact Q/K."
+            )
+        self.gdn_token_major_causal_conv1d = (
+            gaudi_envs.VLLM_GDN_TOKEN_MAJOR_CAUSAL_CONV1D
+        )
+        self.gdn_native_qk_head_repeat = None
+        if self.gdn_native_qk_prep:
+            self.gdn_native_qk_head_repeat = validate_qwen38_native_qk_shape(
+                tp_size=self.tp_size,
+                qkv_width=self.qkv_size,
+                key_width=self.key_dim // self.tp_size,
+                value_width=self.value_dim // self.tp_size,
+                key_head_dim=self.head_k_dim,
+                value_head_dim=self.head_v_dim,
+            )
 
     def rearrange_mixed_qkv(self, mixed_qkv):
         """Pure-torch rearrange – avoids einops graph breaks on HPU."""
@@ -134,16 +188,24 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         if is_prompt and load_state_indices is not None:
             prefill_num_seqs = int(load_state_indices.numel())
             prefill_seq_len = (num_tokens // prefill_num_seqs if prefill_num_seqs > 0 else 0)
-            safe_load_indices = torch.where(
-                (load_state_indices >= 0) & (load_state_indices < ssm_state.shape[0]),
-                load_state_indices,
-                torch.zeros_like(load_state_indices),
-            ).long()
-            initial_state = ssm_state.index_select(0, safe_load_indices).contiguous()
+            if prefill_num_seqs == 1:
+                # Avoid three validity-mask kernels in every GDN layer for
+                # the latency-critical one-request prefill path.
+                initial_state = ssm_state[load_state_indices].contiguous()
+            else:
+                safe_load_indices = torch.where(
+                    (load_state_indices >= 0) & (load_state_indices < ssm_state.shape[0]),
+                    load_state_indices,
+                    torch.zeros_like(load_state_indices),
+                ).long()
+                initial_state = ssm_state.index_select(0, safe_load_indices).contiguous()
             if has_initial_state is not None:
-                # Avoid scatter_nd from boolean indexing
-                mask = has_initial_state.bool().view(-1, 1, 1, 1).to(initial_state.dtype)
-                initial_state = initial_state * mask
+                mask = has_initial_state.bool().view(-1, 1, 1, 1)
+                initial_state = torch.where(
+                    mask,
+                    initial_state,
+                    torch.zeros_like(initial_state),
+                )
 
         return (is_prompt, conv_state, ssm_state, load_state_indices, store_state_indices, query_start_loc,
                 has_initial_state, padding_mask_flat, num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len,
@@ -222,28 +284,60 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             g, beta = hpu_fused_gdn_gating(self.A_log, a, b, self.dt_bias)
 
             conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
-            mixed_qkv_conv = hpu_causal_conv1d_fn(
-                x=mixed_qkv.transpose(0, 1),
-                weight=conv_weights,
-                bias=self.conv1d.bias,
-                activation=self.activation,
-                conv_states=conv_state,
-                has_initial_state=has_initial_state,
-                cache_indices=load_state_indices,
-                block_idx_first_scheduled_token=None,
-                block_idx_last_scheduled_token=None,
-                initial_state_idx=None,
-                query_start_loc=query_start_loc,
-                block_size_to_align=mamba_block_size,
-                num_computed_tokens=None,
-                metadata=None,
-                is_prompt=True,
-            ).transpose(0, 1)
+            if self.gdn_token_major_causal_conv1d:
+                mixed_qkv_conv = hpu_causal_conv1d_fn_token_major(
+                    x=mixed_qkv,
+                    weight=conv_weights,
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                    conv_states=conv_state,
+                    has_initial_state=has_initial_state,
+                    cache_indices=load_state_indices,
+                    query_start_loc=query_start_loc,
+                    block_size_to_align=mamba_block_size,
+                    is_prompt=True,
+                )
+            else:
+                mixed_qkv_conv = hpu_causal_conv1d_fn(
+                    x=mixed_qkv.transpose(0, 1),
+                    weight=conv_weights,
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                    conv_states=conv_state,
+                    has_initial_state=has_initial_state,
+                    cache_indices=load_state_indices,
+                    block_idx_first_scheduled_token=None,
+                    block_idx_last_scheduled_token=None,
+                    initial_state_idx=None,
+                    query_start_loc=query_start_loc,
+                    block_size_to_align=mamba_block_size,
+                    num_computed_tokens=None,
+                    metadata=None,
+                    is_prompt=True,
+                ).transpose(0, 1)
 
             if token_mask_flat is not None:
                 mixed_qkv_conv = mixed_qkv_conv * token_mask_flat
 
-            query, key, value = self.rearrange_mixed_qkv(mixed_qkv_conv)
+            if self.gdn_native_qk_prep:
+                query, key = qwen38_native_qk_prep(mixed_qkv_conv)
+                query = query.unsqueeze(0)
+                key = key.unsqueeze(0)
+                value_offset = 2 * (self.key_dim // self.tp_size)
+                value = mixed_qkv_conv.narrow(
+                    -1,
+                    value_offset,
+                    self.value_dim // self.tp_size,
+                ).reshape(
+                    1,
+                    mixed_qkv_conv.size(0),
+                    self.num_v_heads // self.tp_size,
+                    self.head_v_dim,
+                ).contiguous()
+                use_qk_l2norm_in_kernel = False
+            else:
+                query, key, value = self.rearrange_mixed_qkv(mixed_qkv_conv)
+                use_qk_l2norm_in_kernel = True
 
             if token_mask_flat is not None:
                 token_mask_h = token_mask_flat.view(1, -1, 1).to(dtype=g.dtype)
@@ -258,7 +352,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 beta=beta,
                 initial_state=initial_state,
                 output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
                 chunk_size=self.mamba_chunk_size,
                 prefill_num_seqs=prefill_num_seqs,
                 prefill_seq_len=prefill_seq_len,
@@ -275,7 +369,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     beta=beta,
                     initial_state=initial_state,
                     output_final_state=True,
-                    use_qk_l2norm_in_kernel=True,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
                     chunk_size=self.mamba_chunk_size,
                     prefill_num_seqs=prefill_num_seqs,
                     prefill_seq_len=prefill_seq_len,
@@ -284,6 +378,10 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     recursive_solver_base=self.gdn_recursive_solver_base,
                     compact_repeated_kkt=self.gdn_compact_repeated_kkt,
                     compile_qk_l2norm=self.gdn_compiled_qk_l2norm,
+                    qk_head_repeat_override=self.gdn_native_qk_head_repeat,
+                    compact_repeated_local_attn=self.gdn_compact_repeated_local_attn,
+                    preserve_compact_qk=self.gdn_compact_qk_input,
+                    compact_qk_factor_gate=self.gdn_compact_qk_factor_gate,
                 )
             assert final_state is not None
             # State save in dynamo-disabled wrapper — index_copy_ is
@@ -387,7 +485,16 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         z_shape_og = z.shape
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
-        core_attn_out = self.norm(core_attn_out, z)
+        if is_prompt and self.gdn_fused_rmsnorm_gated:
+            core_attn_out = hpu_fused_rmsnorm_gated(
+                core_attn_out,
+                z,
+                self.norm.weight,
+                self.norm.eps,
+                self.norm.activation,
+            )
+        else:
+            core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.flatten(-2)
 

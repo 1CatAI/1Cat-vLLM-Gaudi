@@ -170,6 +170,8 @@ class SlicedFusedSDPABase(torch.nn.Module):
     :class:`SlicedFP8FusedSDPA`.
     """
 
+    dynamic_fp8 = False
+
     def __init__(self):
         super().__init__()
         self.enable_slicing = self._setup_slicing()
@@ -253,6 +255,12 @@ class SlicedFusedSDPABase(torch.nn.Module):
                f"chunk size {self.chunk_size}, num padded query chunks {self.num_padded_query_chunks}, "
                f"num padded ctx chunks {self.num_padded_ctx_chunks}, with graph breaks {self._with_graph_breaks}.")
         logger().debug_once(msg)
+
+        self.dynamic_fp8 = bool(get_config().VLLM_HPU_FSDPA_DYNAMIC_FP8)
+        if self.dynamic_fp8:
+            logger().warning_once(
+                "Dynamic FP8 sliced FusedSDPA is enabled. Q/K/V are quantized per attention call; "
+                "the attention output remains BF16 and the online-softmax merge remains FP32.")
 
         return True
 
@@ -368,8 +376,63 @@ class SlicedFusedSDPA(SlicedFusedSDPABase):
     :class:`ModuleFusedSDPA`.
     """
 
+    @staticmethod
+    def _dynamic_quant_single_scale(tensor):
+        from vllm_gaudi.extension.ops import dynamic_quant
+        return dynamic_quant(tensor, single_scale=True)
+
+    def _forward_dynamic_fp8(self, query, key, value, attn_mask, dropout_p, scale, softmax_mode):
+        from habana_frameworks.torch.hpex.kernels.Fp8FusedSDPA import gqa_input_reshape_fwd, gqa_output_reshape
+
+        query_fp8, d_scale_q = self._dynamic_quant_single_scale(query)
+        key_fp8, d_scale_k = self._dynamic_quant_single_scale(key)
+        value_fp8, d_scale_v = self._dynamic_quant_single_scale(value)
+        q, k, v, attn_mask = gqa_input_reshape_fwd(query_fp8, key_fp8, value_fp8, attn_mask)
+
+        # Scale softmax probabilities into FP8's useful range while keeping the
+        # FSDPA result itself in BF16 (q_scale_o=None). This avoids compounding
+        # input quantization error with a second FP8 quantization of the output.
+        q_scale_s = torch.tensor(128.0, dtype=torch.float32, device=query.device)
+        d_scale_s = torch.tensor(1.0 / 128.0, dtype=torch.float32, device=query.device)
+
+        def chunk_kernel(q_c, k_c, v_c, mask_c, dp, sc, is_c, sm):
+            res = torch.ops.hpu.fp8_sdpa_recomp_fwd(
+                q_c,
+                k_c,
+                v_c,
+                mask_c,
+                dp,
+                sc,
+                is_c,
+                True,
+                sm,
+                d_scale_q,
+                d_scale_k,
+                d_scale_v,
+                q_scale_s,
+                None,  # BF16 attention output
+                d_scale_s,
+                False,
+                False,
+                None,
+                "right",
+            )
+            out, m, linv = (gqa_output_reshape(tensor) for tensor in res[:3])
+            out = out.to(torch.float32)
+            m = m.to(torch.float32)
+            linv = linv.to(torch.float32) * (128.0 if sm == "fast" else 1.0)
+            return out, m, linv
+
+        output = self._chunked_attention(q, k, v, attn_mask, dropout_p, scale, softmax_mode, chunk_kernel)
+        return output.to(query.dtype)
+
     def forward(self, query, key, value, attn_mask, dropout_p, is_causal, scale, softmax_mode):
         assert is_causal and attn_mask is not None
+
+        if self.dynamic_fp8:
+            if scale is None:
+                scale = 1.0 / (query.shape[-1]**0.5)
+            return self._forward_dynamic_fp8(query, key, value, attn_mask, dropout_p, scale, softmax_mode)
 
         from habana_frameworks.torch.hpex.kernels.FusedSDPA import is_gqa, gqa_input_reshape_fwd, gqa_output_reshape
         gqa = is_gqa(query, key)
@@ -391,11 +454,25 @@ class SlicedFusedSDPA(SlicedFusedSDPABase):
 
 class ModuleFusedSDPA(torch.nn.Module):
 
+    _supports_inner_slicing = True
+
     def __init__(self, fusedSDPA):
         super().__init__()
         assert fusedSDPA is not None, f'fusedSDPA kernel is None'
         self._hpu_kernel_fsdpa = fusedSDPA
         self._sliced_module = SlicedFusedSDPA()
+
+    def can_use_slicing(self,
+                        query,
+                        key,
+                        attn_mask,
+                        is_causal,
+                        padding_side="left",
+                        window_size=None,
+                        sinks=None):
+        return (self._sliced_module.enable_slicing and key.shape[-2] >= self._sliced_module.slice_thld
+                and query.shape[0] == 1 and query.shape[-2] != key.shape[-2] and is_causal
+                and attn_mask is not None and padding_side == 'right' and window_size is None and sinks is None)
 
     def forward(
         self,
@@ -413,15 +490,7 @@ class ModuleFusedSDPA(torch.nn.Module):
         window_size=None,
         sinks=None,
     ):
-        if (self._sliced_module.enable_slicing
-                and key.shape[-2] >= self._sliced_module.slice_thld  # apply for kv_len >= slice_thld only
-                and query.shape[0] == 1  # bs should be 1 for prefix-prefill
-                and query.shape[-2] != key.shape[-2]  # normal prefill with q_len == kv_len route to the default
-                and is_causal and attn_mask is not None  # only supports causal attention with mask
-                and padding_side == 'right'  # supports right padding only for the chunks that may have padding
-                and window_size is None  # slicing is not compatible with sliding window attention
-                and sinks is None  # slicing is not compatible with kernel fusion with sinks
-            ):
+        if self.can_use_slicing(query, key, attn_mask, is_causal, padding_side, window_size, sinks):
             return self._sliced_module(query, key, value, attn_mask, dropout_p, is_causal, scale, softmax_mode)
 
         if is_causal and attn_mask is not None:
@@ -509,6 +578,8 @@ class SlicedFP8FusedSDPA(SlicedFusedSDPABase):
 
 class ModuleFP8FusedSDPA(torch.nn.Module):
 
+    _supports_inner_slicing = True
+
     def __init__(self, fusedSDPA):
         super().__init__()
         assert fusedSDPA is not None, f'FP8 fusedSDPA kernel is None'
@@ -525,6 +596,18 @@ class ModuleFP8FusedSDPA(torch.nn.Module):
         self.d_scale_v = torch.tensor(1.0, dtype=torch.float32)
         self.d_scale_output = torch.tensor(1.0, dtype=torch.float32)
         self._sliced_module = SlicedFP8FusedSDPA(parent=self)
+
+    def can_use_slicing(self,
+                        query,
+                        key,
+                        attn_mask,
+                        is_causal,
+                        padding_side="left",
+                        window_size=None,
+                        sinks=None):
+        return (self._sliced_module.enable_slicing and key.shape[-2] >= self._sliced_module.slice_thld
+                and query.shape[0] == 1 and query.shape[-2] != key.shape[-2] and is_causal
+                and attn_mask is not None and padding_side == 'right' and window_size is None and sinks is None)
 
     def quant_input(self, x, scale):
         return torch.ops.hpu.cast_to_fp8_v2(x, scale, False, False, torch.float8_e4m3fn)[0]
@@ -549,16 +632,7 @@ class ModuleFP8FusedSDPA(torch.nn.Module):
         kinput = self.quant_input(key, self.scale_k).detach()
         vinput = self.quant_input(value, self.scale_v).detach()
 
-        bs = query.shape[0]
-        q_len = query.shape[-2]
-        kv_len = key.shape[-2]
-        if (self._sliced_module.enable_slicing and kv_len >= self._sliced_module.slice_thld \
-                and bs == 1  # bs should be 1 for chunked prefill
-                and q_len != kv_len  # normal causal prefill route to the default dispatch for better performance
-                and is_causal and attn_mask is not None  # only supports causal attention with mask
-                and padding_side == 'right'  # currently only supports right padding for the chunks that may have padding
-                and window_size is None  # slicing is not compatible with sliding window attention
-            ):
+        if self.can_use_slicing(query, key, attn_mask, is_causal, padding_side, window_size):
             return self._sliced_module(qinput, kinput, vinput, attn_mask, dropout_p, is_causal, scale,
                                        softmax_mode).to(query.dtype)
 
