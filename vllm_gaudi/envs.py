@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     VLLM_HPU_GDN_DIRECT_STATE: bool = True
     VLLM_HPU_CGUID_DYNAMIC_QUANT: bool = False
     VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS: int = 32
+    VLLM_HPU_FUSED_GREEDY_LOGITS: bool = False
     VLLM_GDN_CHUNK_SIZE: int = 0
     VLLM_GDN_NEUMANN_ITERS: int = 14
     VLLM_GDN_FUSED_STATE_MATMUL: bool = False
@@ -137,6 +138,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ).strip().lower() in ("1", "true"),
     "VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS":
     lambda: int(os.environ.get("VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS", "32")),
+
+    # Fuse hidden-state selection, the LM head, and argmax for plain greedy
+    # decode requests. Sampling features that can change logits or require
+    # logprobs retain the general sampler path.
+    "VLLM_HPU_FUSED_GREEDY_LOGITS":
+    lambda: os.environ.get("VLLM_HPU_FUSED_GREEDY_LOGITS", "false").strip().lower() in ("1", "true"),
 
     # Override the GDN prefill chunk size. Zero preserves the model-provided
     # value, or the HPU default when the model does not specify one.
