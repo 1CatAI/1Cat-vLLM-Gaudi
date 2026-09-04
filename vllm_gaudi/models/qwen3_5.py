@@ -43,6 +43,13 @@ def _save_ssm_state(core_attn_out, final_state, ssm_state, state_indices):
     the call — HPU drops dynamo-disabled calls whose results are unused.
     """
     state_indices = state_indices.reshape(-1).to(device=ssm_state.device, dtype=torch.long)
+    if state_indices.numel() == 1:
+        # A real single-request prefill always owns its only state slot. Keep
+        # this hot path to one index operation per GDN layer; materializing
+        # nonzero(valid) here adds a device/host synchronization.
+        safe_si = torch.remainder(state_indices, ssm_state.shape[0])
+        ssm_state.index_copy_(0, safe_si, final_state.to(device=ssm_state.device, dtype=ssm_state.dtype))
+        return core_attn_out
     valid = (state_indices >= 0) & (state_indices < ssm_state.shape[0])
     valid_positions = torch.nonzero(valid, as_tuple=False).reshape(-1)
     if valid_positions.numel() > 0:
@@ -181,12 +188,17 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         if is_prompt and load_state_indices is not None:
             prefill_num_seqs = int(load_state_indices.numel())
             prefill_seq_len = (num_tokens // prefill_num_seqs if prefill_num_seqs > 0 else 0)
-            safe_load_indices = torch.where(
-                (load_state_indices >= 0) & (load_state_indices < ssm_state.shape[0]),
-                load_state_indices,
-                torch.zeros_like(load_state_indices),
-            ).long()
-            initial_state = ssm_state.index_select(0, safe_load_indices).contiguous()
+            if prefill_num_seqs == 1:
+                # Avoid three validity-mask kernels in every GDN layer for
+                # the latency-critical one-request prefill path.
+                initial_state = ssm_state[load_state_indices].contiguous()
+            else:
+                safe_load_indices = torch.where(
+                    (load_state_indices >= 0) & (load_state_indices < ssm_state.shape[0]),
+                    load_state_indices,
+                    torch.zeros_like(load_state_indices),
+                ).long()
+                initial_state = ssm_state.index_select(0, safe_load_indices).contiguous()
             if has_initial_state is not None:
                 mask = has_initial_state.bool().view(-1, 1, 1, 1)
                 initial_state = torch.where(
