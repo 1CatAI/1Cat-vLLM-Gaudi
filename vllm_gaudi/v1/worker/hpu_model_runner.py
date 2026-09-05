@@ -956,6 +956,16 @@ def apply_model_specific_patches(model_runner):
             if chunked_mlps == 0:
                 raise RuntimeError("MLP prefill chunking requires a dense Qwen3 TP2 model with standard reductions")
             logger.info("Enabled chunked prefill pipeline for %d dense MLPs", chunked_mlps)
+        if get_config().qwen3_boundary_chunks > 1:
+            from vllm_gaudi.models.qwen3_boundary import enable_hpu_qwen3_boundary_pipeline
+            if get_config().tp2_fused_ar_norm or model_runner.vllm_config.lora_config is not None:
+                raise RuntimeError("Boundary prefill pipeline does not support deferred reductions or LoRA")
+            count = enable_hpu_qwen3_boundary_pipeline(model_runner.model,
+                                                       get_config().qwen3_boundary_chunks,
+                                                       get_config().row_parallel_chunk_threshold)
+            if count == 0:
+                raise RuntimeError("Boundary prefill pipeline requires a supported dense Qwen3 TP2 topology")
+            logger.info("Enabled attention/MLP prefill pipeline for %d decoder layers", count)
         if get_config().tp2_fused_ar_norm:
             fused_boundaries = enable_hpu_qwen3_tp2_fused_ar_norm(model_runner.model)
             if fused_boundaries == 0:

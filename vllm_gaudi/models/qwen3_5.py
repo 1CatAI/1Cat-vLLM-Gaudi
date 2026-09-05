@@ -322,6 +322,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        return_core: bool = False,
     ) -> torch.Tensor:
         """HPU compile-friendly GDN forward.
 
@@ -628,6 +629,8 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.flatten(-2)
 
+        if return_core:
+            return core_attn_out
         output, _ = self.out_proj(core_attn_out)
         # Restore caller's original layout (2-D flat or 3-D [B, L, H]) so
         # the residual add in the decoder layer stays shape-consistent.

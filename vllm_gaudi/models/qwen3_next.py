@@ -235,7 +235,7 @@ _orig_qwen3next_attention_forward = Qwen3NextAttention.forward
 # ``output`` in-place buffer; caller now does
 #   hidden_states = self.self_attn(hidden_states=..., positions=...)
 # ====================================================================
-def _hpu_qwen3next_attention_forward(self, positions, hidden_states):
+def _hpu_qwen3next_attention_forward(self, positions, hidden_states, return_core=False):
 
     # Patch any 3D layout (BS > 1):
     #   Decode:  hidden_states [B, 1, H]
@@ -246,6 +246,13 @@ def _hpu_qwen3next_attention_forward(self, positions, hidden_states):
     # mismatch in `attn_output * gate`.  We flatten both to 2D.
     is_3d = (hidden_states is not None and hidden_states.dim() == 3)
     if not is_3d:
+        if return_core:
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v, gate = self._project_qkv_gate(qkv, positions)
+            attn_output = self.attn(q, k, v)
+            if gate is not None:
+                attn_output = attn_output * torch.sigmoid(gate)
+            return attn_output
         return _orig_qwen3next_attention_forward(self, positions, hidden_states)
 
     orig_shape = hidden_states.shape
@@ -278,6 +285,8 @@ def _hpu_qwen3next_attention_forward(self, positions, hidden_states):
         gate_2d = torch.sigmoid(gate).view(-1, gate.shape[-1])
         attn_output_2d = attn_output_2d * gate_2d
 
+    if return_core:
+        return attn_output_2d
     proj_out, _ = self.o_proj(attn_output_2d)
 
     # Restore caller's original 3-D layout [B, L, H_out] so the residual
