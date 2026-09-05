@@ -26,6 +26,20 @@ PyTorch numerical decomposition does not count as a native operation.
 
 No native tactic in this delivery is enabled automatically in vLLM.
 
+## GDN normalization contract
+
+The reference, direct packed decode, and indexed/MTP paths use an additive
+epsilon inside the squared-norm denominator: Q/K are normalized with
+`rsqrt(sum(x*x) + 1e-6)`. This matches the pinned FlashInfer decode contract;
+`F.normalize(..., eps=1e-6)` clamps the norm instead and is not equivalent,
+particularly for small Q/K values.
+
+Independent FP64 division/sqrt tests cover zero and small inputs, packed
+Qwen shapes, indexed state, padding, and all MTP checkpoints. An opt-in
+compiled Gaudi2 test covers repeated Qwen-shaped state updates. These
+checks do not replace full-model quality or renewed performance
+qualification after the numerical correction.
+
 ## Experimental gated activation / row-FP8 quantization
 
 `flashinfer_gaudi.silu_and_mul_quant` accepts contiguous inference BF16 HPU

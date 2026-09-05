@@ -72,9 +72,9 @@ def _write_state_rows(
 
 
 def _l2_normalize_rsqrt(value: torch.Tensor) -> torch.Tensor:
-    """Express L2 normalization in the form Gaudi fuses most efficiently."""
+    """Preserve FlashInfer's additive-epsilon contract in the fused form."""
     norm_squared = torch.sum(value * value, dim=-1, keepdim=True)
-    return value * torch.rsqrt(torch.clamp_min(norm_squared, 1e-12))
+    return value * torch.rsqrt(norm_squared + 1e-6)
 
 
 def _direct_single_token_decode_core(
@@ -348,8 +348,8 @@ def recurrent_decode_from_qkv(
     q_work = q.to(torch.float32)
     k_work = k.to(torch.float32)
     if use_qk_l2norm:
-        q_work = F.normalize(q_work, p=2.0, dim=-1, eps=1e-6)
-        k_work = F.normalize(k_work, p=2.0, dim=-1, eps=1e-6)
+        q_work = _l2_normalize_rsqrt(q_work)
+        k_work = _l2_normalize_rsqrt(k_work)
     if scale is None:
         scale = key_dim**-0.5
 

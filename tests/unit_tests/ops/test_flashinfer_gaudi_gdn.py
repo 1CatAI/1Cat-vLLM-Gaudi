@@ -10,7 +10,6 @@ from unittest import mock
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 from flashinfer_gaudi import clear_backend_policy_override, set_backend_policy
 from flashinfer_gaudi import _native
@@ -54,8 +53,9 @@ def _inputs(batch=2, q_heads=2, value_heads=4, dim=8, slots=6):
 
 def _naive_step(q, k, v, state, log_decay, beta):
     repeat = v.shape[2] // q.shape[2]
-    q = F.normalize(q.float(), dim=-1, eps=1e-6).repeat_interleave(repeat, dim=2)
-    k = F.normalize(k.float(), dim=-1, eps=1e-6).repeat_interleave(repeat, dim=2)
+    q, k = q.float(), k.float()
+    q = (q / torch.sqrt(q.square().sum(-1, keepdim=True) + 1e-6)).repeat_interleave(repeat, dim=2)
+    k = (k / torch.sqrt(k.square().sum(-1, keepdim=True) + 1e-6)).repeat_interleave(repeat, dim=2)
     scale = q.shape[-1]**-0.5
     decayed = state * torch.exp(log_decay[:, 0]).unsqueeze(-1).unsqueeze(-1)
     projection = torch.matmul(decayed, k[:, 0].unsqueeze(-1)).squeeze(-1)
