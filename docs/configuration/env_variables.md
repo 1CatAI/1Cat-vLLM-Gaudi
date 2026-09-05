@@ -77,6 +77,82 @@ This document lists the supported diagnostic and profiling, as well as performan
 | `FLASHINFER_GAUDI_ENABLE_PUBLIC_AUTO` | Promotes a loaded public TPC GDN tactic into `auto` selection. Keep disabled until the exact software stack passes quality and end-to-end performance gates. | `false` |
 | `FLASHINFER_GAUDI_ENABLE_BRIDGE_AUTO` | Allows `auto` to consider the ABI-private bridge backend after its version and quality gates pass. | `false` |
 | `VLLM_GAUDI_BUILD_FLASHINFER` | Controls native builds during packaging: `auto` builds when both the TPC compiler and Gaudi PyTorch package exist; `1` requires a successful build; `0` installs reference code only. | `auto` |
+| `VLLM_HPU_TRITON_MODE` | Selects Gaudi2-native Triton paths: `off`, performance-safe `hybrid`, or fail-closed `strict`. Hybrid uses only paths that passed the relevant eager/fullgraph gate; strict also exposes ungated kernels for correctness and A/B performance CI. | `off` |
+| `VLLM_HPU_TRITON_CACHE_DIR` | Overrides the private, content-addressed TPC ELF cache used by the Triton/Bridge ABI. | `None` |
+| `VLLM_HPU_TRITON_BLOCK_SIZE` | Logical Triton block size used by the initial 2048-bit TPC elementwise kernels. | `256` |
+| `VLLM_HPU_TRITON_SILU_BLOCK_SIZE` | Power-of-two row chunk used to distribute each fused SiLU-and-mul row across Gaudi2 TPC engines; accepted range is 128–1024. | `128` |
+| `VLLM_HPU_TRITON_GDN_VALUE_TILE` | Value rows owned by each experimental Qwen3.5 packed GDN decode program; accepted values are 16, 32, 64, and 128. | `16` |
+
+The Gaudi2 backend routes supported contiguous BF16 residual RMSNorm calls with
+hidden sizes up to 8192 to one Triton-generated TPC kernel. It returns both the
+normalized activations and rounded residual sum. The production path is a
+Bridge custom op inside the current HPU graph and is compatible with
+`torch.compile(..., backend="hpu_backend", fullgraph=True)`; the diagnostic
+direct-recipe launcher remains outside HPUGraph capture. The eager path has
+passed its operator gate, while hybrid mode retains the vendor implementation
+inside compiled graphs until the fullgraph gate also passes. vLLM prepares the
+fixed-GUID perf library during operator registration, before Synapse graph
+compiler initialization.
+
+The default remains `off` until the fast-path operator set passes an end-to-end
+model gate. Use `strict` for correctness/performance CI with no fallback, or
+`hybrid` when an explicit, counted HPU vendor fallback is acceptable.
+
+Row-wise BF16-to-E4M3 dynamic quantization is available as a strict-mode
+candidate for decode shapes with at most 32 rows and hidden sizes up to 16384.
+It folds max-abs reduction, F32 scale generation, and FP8 conversion into one
+Triton-generated TPC node. Larger prefill shapes and `single_scale=True` retain
+the vendor path. Run
+`python tools/benchmark_triton_gaudi_dynamic_quant.py` to compare the candidate
+against the existing `amax` plus `cast_to_fp8_v2` fullgraph. Hybrid rollout
+remains closed until that generated-kernel gate and the model-level output gate
+both pass on Gaudi2.
+
+When a strict fullgraph contains an exclusive SiLU-and-mul result immediately
+consumed by row-wise dynamic quantization, the HPU compiler pass replaces both
+custom nodes and their alias-only view chain with one Triton-generated TPC
+node. The fusion is limited to static two-dimensional BF16 shapes with output
+widths up to 4096 and fails closed on extra activation consumers or mismatched
+specializations. Run
+`python tools/benchmark_triton_gaudi_silu_dynamic_quant.py` to exercise the
+actual graph rewrite against the vendor fullgraph. Hybrid rollout remains
+closed until this combined graph gate passes.
+
+Run `python tools/benchmark_triton_gaudi_rms_norm.py` on Gaudi2 after setting
+the matching Triton perf-library and artifact-cache environment variables. The
+gate requires at least 1.20x geometric-mean device and wall speedup and rejects
+any tested shape below 0.95x. Fullgraph compilation is the default comparison;
+use `--eager` only for the diagnostic operator-level comparison.
+
+Packed Qwen3.5 GDN decode remains on the complete vendor graph in `hybrid`.
+Both the recurrent-only kernel and the experimental split Q/K-conv plus
+value-conv/GDN path are available only in `strict` mode for standalone
+diagnostics. The recurrent kernel wins its operator microbenchmark, but its
+48-layer full-model graph has not cleared the no-regression gate; the split path
+also does not yet preserve convolution state across decode-recipe re-entry.
+Weight loading still materializes the TPC-friendly transposed convolution
+weights and an FP32 decay-bias view once for strict diagnostics. The Bridge
+admits stateful GDN nodes to a native graph only for the validated batch-eight
+shape and keeps every other shape on the custom-op path. The strict standalone
+diagnostic is `python tools/benchmark_triton_gaudi_gdn_decode.py --include-conv`;
+it validates the BF16 output, FP32 recurrent state, and BF16 convolution state
+before reporting speedup. Add `--check-recipe-reentry` to validate state after
+switching to another batch recipe and back. Because a two-node micrograph can
+become host-submit bound, hybrid rollout is decided by the full-model gate
+rather than that standalone timing alone. A complete Gaudi Bridge installation
+must include the GDN reinplace compiler pass; initialization rejects stale
+Python package overlays instead of running the functionalized full-cache-copy
+graph. SiLU-and-mul remains a strict-mode candidate.
+
+Triton and FlashInfer-Gaudi coexist in the same checkout. With Triton `off`,
+the existing FlashInfer switches select its graph tactics or the general HPU
+implementation. Triton `hybrid` also preserves that GDN selection. Triton
+`strict` takes precedence for recurrent decode and requires identical load/store
+state-index tensors; it cannot silently execute FlashInfer instead. The known
+recipe-reentry issue keeps split convolution kernels out of model execution;
+they remain available through the standalone diagnostic. TP2 collective/RMSNorm
+fusion retains ownership of its communication boundary before local Triton
+RMSNorm is considered.
 
 Use `VLLM_BUCKETING_STRATEGY=exp` for the default exponential warm-up, `VLLM_BUCKETING_STRATEGY=lin` for explicitly configured linear ranges, or `VLLM_BUCKETING_STRATEGY=pad` for padding-aware ranges with absolute and relative padding limits.
 

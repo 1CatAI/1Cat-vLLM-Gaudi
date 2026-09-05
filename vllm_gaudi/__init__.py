@@ -106,6 +106,13 @@ def register_ops():
     import vllm_gaudi.v1.sample.hpu_rejection_sampler  # noqa: F401
     import vllm_gaudi.distributed.kv_transfer.kv_connector.v1.hpu_nixl_connector  # noqa: F401
 
+    # Validate the optional native Triton/Bridge ABI before model warmup. In
+    # hybrid mode a missing backend remains an explicit, counted fallback;
+    # strict mode fails closed here.
+    from vllm_gaudi.ops.triton_gaudi import prepare_if_enabled
+
+    prepare_if_enabled()
+
     if os.getenv("VLLM_HPU_HETERO_KV_LAYOUT", "false").lower() == "true":
         import vllm_gaudi.distributed.kv_transfer.kv_connector.v1.hetero_hpu_nixl_connector  # noqa: F401
     import vllm_gaudi.v1.kv_offload.worker.cpu_hpu  # noqa: F401
