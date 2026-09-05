@@ -90,6 +90,62 @@ cost, not infer a gain from kernel count or isolated profiler durations.
 
 ## Experimental mixed-engine plan
 
+### Exact-scale block-weight linear
+
+`flashinfer_gaudi.block_fp8_linear(x, weight, scale)` implements the preserved
+block-weight route: native TPC weight dequantization followed by BF16 MME GEMM
+in one Synapse recipe. This is **not FP8 MME** and adds no activation
+quantization. The TPC kernel uses load-pipe 8-to-16 unpack before conversion
+to avoid generic linear-conversion lane shuffles.
+
+The v1 contract is contiguous inference BF16 `x[M,K]`, E4M3 `weight[N,K]` and
+FP32 `scale[N/128,K/128]`, with positive dimensions and N/K divisible by 128.
+Dimensions must fit INT32. Weight values follow the existing Gaudi2 loader's
+encoding/scale adjustment; this API does not reinterpret an unadjusted CUDA
+checkpoint. Weight and scale are each rounded to BF16 before BF16
+multiplication, exactly as in the existing block-weight dequantization path.
+The result is BF16 `[M,N]`; there is no bias, padding/unpadding, arbitrary
+stride, autograd, output mutation or persistent BF16-weight cache in v1.
+
+`block_fp8_dequant(weight, scale)` exposes the same TPC conversion separately
+for verification. Use the complete linear chain for performance qualification,
+not an isolated conversion timing. Both functions require explicit
+`load_bridge_adapter()` before compiling their native path, use the same
+private adapter/version/hash rules below, and never promote themselves in
+`auto`. `native`/`bridge` fail closed; `public` rejects the private adapter.
+
+```python
+from flashinfer_gaudi import block_fp8_linear, set_backend_policy
+from flashinfer_gaudi._bridge import load_bridge_adapter
+
+load_bridge_adapter()
+set_backend_policy("native")
+linear = torch.compile(block_fp8_linear, backend="hpu_backend", fullgraph=True, dynamic=False)
+y = linear(x, weight, scale)
+```
+
+```bash
+python tools/benchmark_flashinfer_native_block_linear.py \
+  --output /tmp/native-block-linear.json --trace
+```
+
+The default matrix covers MLP TP1/TP2 local weight shapes and decode/prefill
+batch sizes; these are weight-free operator tests, not distributed or model
+benchmarks. The strong reference is compiled existing vLLM block-weight
+dequantization plus GEMM, excluding model metadata `.item()` overhead on both
+sides. A predequantized BF16 GEMM is also measured as a diagnostic: it uses a
+different persistent-memory contract and is not the promotion baseline.
+Reports retain failed cases/workers, native FX/CPU/engine/recipe-launch audits,
+and source/ELF hashes. No new vLLM linear dispatch is enabled by this delivery.
+
+Offline qualification currently shows a limited win for the down-projection
+shape, not the full matrix. Gate/up cases still regress. Keep dispatch
+unchanged until matching real-weight, model integration and end-to-end
+qualification; shape-only synthetic evidence does not authorize a global
+native linear override.
+
+### BF16 GEMM / gated activation
+
 `flashinfer_gaudi.gemm.GemmSiluPlan` adds a BF16 MME GEMM followed by the
 native TPC SiLU-multiply kernel **inside one Synapse graph**. Inputs are
 contiguous BF16 `x[M,K]`, `weight[K,2*D]`, with positive dimensions and D

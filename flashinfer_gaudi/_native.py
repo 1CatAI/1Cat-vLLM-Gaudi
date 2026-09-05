@@ -17,6 +17,8 @@ _LOADED_PATHS: list[str] = []
 _LOAD_ERRORS: list[str] = []
 _SILU_AND_MUL_OP: Callable | None = None
 _SILU_MUL_QUANT_OP: Callable | None = None
+_BLOCK_FP8_DEQUANT_OP: Callable | None = None
+_BLOCK_FP8_LINEAR_OP: Callable | None = None
 
 
 def _library_candidates() -> list[str]:
@@ -128,15 +130,20 @@ def native_diagnostics() -> dict[str, object]:
         "bridge_packed_gdn": bridge_packed_gdn_op() is not None,
         "silu_and_mul": silu_and_mul_op() is not None,
         "silu_and_mul_quant": silu_mul_quant_op() is not None,
+        "block_fp8_dequant": block_fp8_dequant_op() is not None,
+        "block_fp8_linear": block_fp8_linear_op() is not None,
     }
 
 
 def _reset_native_state_for_tests() -> None:
     global _LOAD_ATTEMPTED, _SILU_AND_MUL_OP, _SILU_MUL_QUANT_OP
+    global _BLOCK_FP8_DEQUANT_OP, _BLOCK_FP8_LINEAR_OP
     with _LOAD_LOCK:
         _LOAD_ATTEMPTED = False
         _SILU_AND_MUL_OP = None
         _SILU_MUL_QUANT_OP = None
+        _BLOCK_FP8_DEQUANT_OP = None
+        _BLOCK_FP8_LINEAR_OP = None
         _LOADED_PATHS.clear()
         _LOAD_ERRORS.clear()
 
@@ -145,6 +152,15 @@ def silu_mul_quant_op() -> Callable | None:
     if not _LOAD_ATTEMPTED:
         load_native_extensions()
     return _SILU_MUL_QUANT_OP
+
+
+def block_fp8_dequant_op() -> Callable | None:
+    # Private ops are published only by load_bridge_adapter before compile.
+    return _BLOCK_FP8_DEQUANT_OP
+
+
+def block_fp8_linear_op() -> Callable | None:
+    return _BLOCK_FP8_LINEAR_OP
 
 
 # SynapseAI reads GC_KERNEL_PATH when its graph compiler is initialized. Set

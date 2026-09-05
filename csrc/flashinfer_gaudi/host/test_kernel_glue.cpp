@@ -5,6 +5,7 @@
 #include <vector>
 #include "silu_and_mul_bf16_gaudi2.hpp"
 #include "silu_mul_quant_bf16_gaudi2.hpp"
+#include "block_fp8_dequant_gaudi2.hpp"
 
 extern "C" tpc_lib_api::GlueCodeReturn GetKernelGuids(
     tpc_lib_api::DeviceId, uint32_t*, tpc_lib_api::GuidInfo*);
@@ -14,20 +15,24 @@ extern "C" tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(
 int main() {
     using namespace tpc_lib_api;
     uint32_t count = 0;
-    assert(GetKernelGuids(DEVICE_ID_GAUDI2, &count, nullptr) == GLUE_SUCCESS && count == 3);
-    GuidInfo guids[3]{};
+    assert(GetKernelGuids(DEVICE_ID_GAUDI2, &count, nullptr) == GLUE_SUCCESS && count == 4);
+    GuidInfo guids[4]{};
     count = 0;
-    assert(GetKernelGuids(DEVICE_ID_GAUDI2, &count, guids) == GLUE_SUCCESS && count == 3);
+    assert(GetKernelGuids(DEVICE_ID_GAUDI2, &count, guids) == GLUE_SUCCESS && count == 4);
     assert(guids[0].name[0] == '\0');
     count = 1;
-    assert(GetKernelGuids(DEVICE_ID_GAUDI2, &count, guids) == GLUE_FAILED && count == 3);
+    assert(GetKernelGuids(DEVICE_ID_GAUDI2, &count, guids) == GLUE_FAILED && count == 4);
     assert(guids[0].name[0] == '\0');
     count = 2;
-    assert(GetKernelGuids(DEVICE_ID_GAUDI2, &count, guids) == GLUE_FAILED && count == 3);
+    assert(GetKernelGuids(DEVICE_ID_GAUDI2, &count, guids) == GLUE_FAILED && count == 4);
     assert(guids[0].name[0] == '\0' && guids[1].name[0] == '\0');
+    count = 3;
+    assert(GetKernelGuids(DEVICE_ID_GAUDI2, &count, guids) == GLUE_FAILED && count == 4);
+    assert(guids[2].name[0] == '\0');
     assert(GetKernelGuids(DEVICE_ID_GAUDI2, &count, guids) == GLUE_SUCCESS);
     assert(std::strcmp(guids[1].name, SiluAndMulBf16Gaudi2::name) == 0);
     assert(std::strcmp(guids[2].name, SiluMulQuantBf16Gaudi2::name) == 0);
+    assert(std::strcmp(guids[3].name, BlockFp8DequantGaudi2::name) == 0);
     assert(GetKernelGuids(DEVICE_ID_GAUDI, &count, guids) == GLUE_SUCCESS && count == 0);
     assert(GetKernelGuids(DEVICE_ID_GAUDI2, nullptr, nullptr) == GLUE_FAILED);
 
@@ -113,5 +118,52 @@ int main() {
     quantOutputs[1].geometry.maxSizes[0] = 1;
     quantOutputs[0].geometry.dataType = DATA_BF16;
     assert(quantKernel.GetGcDefinitions(params.get(), instance.get()) == GLUE_INCOMPATIBLE_DATA_TYPE);
+
+    Tensor block_inputs[2]{}, block_outputs[1]{};
+    TensorAccessPattern block_input_patterns[2]{}, block_output_patterns[1]{};
+    params->inputTensors = block_inputs;
+    params->outputTensors = block_outputs;
+    params->inputTensorNr = 2;
+    params->outputTensorNr = 1;
+    instance->inputTensorAccessPattern = block_input_patterns;
+    instance->outputTensorAccessPattern = block_output_patterns;
+    for (auto* tensor : {&block_inputs[0], &block_inputs[1], &block_outputs[0]}) tensor->geometry.dims = 2;
+    block_inputs[0].geometry.dataType = DATA_F8_143;
+    block_inputs[0].geometry.maxSizes[0] = 384;
+    block_inputs[0].geometry.maxSizes[1] = 256;
+    block_outputs[0].geometry = block_inputs[0].geometry;
+    block_outputs[0].geometry.dataType = DATA_BF16;
+    block_inputs[1].geometry.dataType = DATA_F32;
+    block_inputs[1].geometry.maxSizes[0] = 3;
+    block_inputs[1].geometry.maxSizes[1] = 2;
+    BlockFp8DequantGaudi2 block;
+    assert(block.GetGcDefinitions(nullptr, instance.get()) == GLUE_FAILED);
+    assert(block.GetGcDefinitions(params.get(), nullptr) == GLUE_FAILED);
+    instance->kernel.elfSize = 0;
+    assert(block.GetGcDefinitions(params.get(), instance.get()) == GLUE_INSUFFICIENT_ELF_BUFFER);
+    elf.resize(instance->kernel.elfSize);
+    instance->kernel.kernelElf = elf.data();
+    assert(block.GetGcDefinitions(params.get(), instance.get()) == GLUE_SUCCESS);
+    assert(instance->indexSpaceRank == 2 && instance->indexSpaceGeometry[0] == 2 && instance->indexSpaceGeometry[1] == 2);
+    assert(block_input_patterns[0].mapping[0].a == 256 && block_input_patterns[0].mapping[1].end_b == 127);
+    assert(block_input_patterns[1].mapping[0].a == 2 && block_input_patterns[1].mapping[1].end_b == 0);
+    assert(block_output_patterns[0].mapping[1].a == 128);
+    assert(std::memcmp(elf.data(), "\177ELF", 4) == 0);
+    instance->kernel.kernelElf = nullptr;
+    assert(block.GetGcDefinitions(params.get(), instance.get()) == GLUE_FAILED);
+    instance->kernel.kernelElf = elf.data();
+    params->inputTensorNr = 1;
+    assert(block.GetGcDefinitions(params.get(), instance.get()) == GLUE_INCOMPATIBLE_INPUT_COUNT);
+    params->inputTensorNr = 2;
+    params->outputTensorNr = 2;
+    assert(block.GetGcDefinitions(params.get(), instance.get()) == GLUE_INCOMPATIBLE_OUTPUT_COUNT);
+    params->outputTensorNr = 1;
+    block_inputs[1].geometry.maxSizes[1] = 3;
+    assert(block.GetGcDefinitions(params.get(), instance.get()) == GLUE_INCOMPATIBLE_INPUT_SIZE);
+    block_inputs[1].geometry.maxSizes[1] = 2;
+    block_inputs[0].geometry.maxSizes[0] = 383;
+    assert(block.GetGcDefinitions(params.get(), instance.get()) == GLUE_INCOMPATIBLE_INPUT_SIZE);
+    block_inputs[0].geometry.dataType = DATA_BF16;
+    assert(block.GetGcDefinitions(params.get(), instance.get()) == GLUE_INCOMPATIBLE_DATA_TYPE);
     return 0;
 }

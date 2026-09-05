@@ -79,13 +79,21 @@ def validate_manifest(manifest: dict, identity: dict, files: dict[str, Path]) ->
     return hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def _publish_bridge_ops():
+    from flashinfer_gaudi import _native
+    # Availability is not qualification. Older locally sealed adapters may
+    # lack a newly added op; callers must reject it rather than decompose it.
+    _native._SILU_MUL_QUANT_OP = torch.ops.custom_op.flashinfer_gaudi_silu_mul_quant
+    _native._BLOCK_FP8_DEQUANT_OP = getattr(torch.ops.custom_op, "flashinfer_gaudi_block_fp8_dequant", None)
+    _native._BLOCK_FP8_LINEAR_OP = getattr(torch.ops.custom_op, "flashinfer_gaudi_block_fp8_linear", None)
+
+
 def load_bridge_adapter() -> dict:
     """Explicit opt-in; never called by auto dispatch or CPU-only imports."""
-    from flashinfer_gaudi import _native
     global _LOADED
     with _LOCK:
         if _LOADED is not None:
-            _native._SILU_MUL_QUANT_OP = torch.ops.custom_op.flashinfer_gaudi_silu_mul_quant
+            _publish_bridge_ops()
             return dict(_LOADED)
         directory = Path(__file__).resolve().parent / "lib"
         try:
@@ -104,7 +112,7 @@ def load_bridge_adapter() -> dict:
                         raise BackendUnavailableError("A different native Bridge library is already mapped")
             _configure_kernel_database_path()
             torch.ops.load_library(str(files["adapter"]))
-            _native._SILU_MUL_QUANT_OP = torch.ops.custom_op.flashinfer_gaudi_silu_mul_quant
+            _publish_bridge_ops()
         except BackendUnavailableError:
             raise
         except Exception as exc:

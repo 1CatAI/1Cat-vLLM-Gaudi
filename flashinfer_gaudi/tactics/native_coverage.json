@@ -7,8 +7,8 @@
   "whole_library_native": false,
   "domains": {
     "activation_norm": "native_silu_candidate_only",
-    "quantization": "native_silu_row_fp8_candidate_only",
-    "gemm": "native_bf16_gemm_silu_candidate_only",
+    "quantization": "native_silu_row_fp8_and_block_weight_dequant_candidates",
+    "gemm": "native_bf16_gemm_silu_and_block_weight_linear_candidates",
     "gdn_kda_mamba": "reference_graph_and_partial_native_prototype",
     "kv_cache_rope": "planned",
     "dense_attention": "planned",
@@ -18,6 +18,25 @@
     "communication": "planned"
   },
   "operations": {
+    "block_fp8_linear": {
+      "native_implemented": true,
+      "entry": "flashinfer_gaudi.block_fp8_linear",
+      "engines": ["tpc", "mme"],
+      "contract": "contiguous inference BF16 x[M,K], E4M3 weight[N,K], FP32 scale[N/128,K/128]; aligned 128x128 blocks; BF16 output",
+      "compute": "TPC block-weight BF16 dequantization then BF16 MME; not FP8 MME",
+      "abi": "Bridge 1.24.1.482, Synapse 1.24.1, per-build checksummed artifact",
+      "correctness": "requires_matching_build_hardware_report",
+      "performance": "requires_shape_and_artifact_qualification",
+      "production_promoted": false
+    },
+    "block_fp8_dequant": {
+      "native_implemented": true,
+      "guid": "flashinfer_gaudi_block_fp8_dequant_gaudi2",
+      "contract": "aligned 128x128 E4M3 weight blocks and FP32 scales; BF16 scale cast before BF16 multiply",
+      "correctness": "requires_matching_build_hardware_report",
+      "performance": "requires_whole_linear_qualification",
+      "production_promoted": false
+    },
     "silu_and_mul_quant": {
       "native_implemented": true,
       "entry": "flashinfer_gaudi.silu_and_mul_quant",
