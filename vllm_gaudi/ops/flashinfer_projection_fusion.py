@@ -9,6 +9,7 @@ shapes and unrecognized metadata are left unchanged.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import operator
 import threading
 
@@ -95,6 +96,13 @@ def _private_temporary_update(node):
             if any(argument.alias_info is not None and argument.alias_info.is_write for argument in schema.arguments):
                 return False
     return True
+
+
+def _fresh_output_value(source):
+    value = source.meta["val"]
+    mode = getattr(value, "fake_mode", None)
+    with mode if mode is not None else nullcontext():
+        return torch.empty(source.meta["output_shapes"][0], dtype=source.meta["output_dtypes"][0], device=value.device)
 
 
 def _match(gemm, allowed_shapes):
@@ -186,13 +194,17 @@ def fuse_projection_graph(graph_module, allowed_shapes):
             fused = graph.call_function(native.default, (x, residual, gamma, 1e-6, False))
             replacements = []
             sources = (q, scale, normed, summed)
+            values = tuple(_fresh_output_value(source) for source in sources)
             for index, source in enumerate(sources):
                 node = graph.call_function(operator.getitem, (fused, index))
                 node.meta = dict(source.meta)
+                node.meta["val"] = values[index]
+                node.meta["placement"] = "hpu_cluster"
                 replacements.append(node)
             fused.meta = dict(norm.meta)
             fused.meta.pop("tensor_meta", None)
-            fused.meta["val"] = tuple(source.meta["val"] for source in sources)
+            fused.meta["val"] = values
+            fused.meta["placement"] = "hpu_cluster"
             for name in ("output_shapes", "output_dtypes", "output_layouts", "output_strides", "output_contiguous",
                          "output_offset"):
                 if all(name in source.meta for source in sources):
@@ -231,10 +243,15 @@ def register_projection_fusion_pass(qualified_shapes=()):
 
         def fuse(ctx):
             global _fused_count
+            if getattr(ctx, "is_training", False) or getattr(ctx, "is_backward", False):
+                return False
             count = fuse_projection_graph(ctx.graph_module, shapes)
             if count:
-                passes.pass_fake_propagation(ctx)
-                passes.pass_mark_placement(ctx)
+                # This callback runs after Bridge's layout/view rewrites.
+                # Re-executing the whole graph with FakeTensor propagation
+                # is invalid (e.g. flattened HPU BMM inputs are no longer a
+                # valid aten.bmm program). Only the new native nodes receive
+                # fresh, non-aliasing values and complete placement metadata.
                 _fused_count += count
             return bool(count)
 

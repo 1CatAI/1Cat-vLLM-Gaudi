@@ -129,3 +129,30 @@ def test_no_default_promotion_and_unqualified_shape_rejected():
     with pytest.raises(ValueError, match="Unqualified"):
         fusion.fuse_projection_graph(module, {(32, 5120, 34816)})
     assert not fusion.projection_fusion_stats()["production_default"]
+
+
+@pytest.mark.parametrize("training,backward", [(False, False), (True, False), (False, True)])
+def test_registered_pass_never_reexecutes_bridge_rewritten_graph(monkeypatch, training, backward):
+    from habana_frameworks.torch.dynamo.compile_backend import passes
+
+    module = _graph("private_update")
+    original = module.code
+    callbacks = []
+    monkeypatch.setattr(fusion, "_registered_shapes", None)
+    monkeypatch.setattr(passes, "register_pass_at_optimization_pass", lambda fn, stage: callbacks.append(fn))
+    original_target = fusion._target
+    with mock.patch.object(fusion, "_target", side_effect=lambda node, name: (
+            node.meta.get("op_name") == name if isinstance(node, torch.fx.Node) and "op_name" in node.meta
+            else original_target(node, name))), mock.patch("flashinfer_gaudi._native.add_rmsnorm_quant_op",
+                                                           return_value=SimpleNamespace(default=_fake_op)), \
+         mock.patch.object(passes, "pass_fake_propagation", side_effect=AssertionError("unexpected graph replay")), \
+         mock.patch.object(passes, "pass_mark_placement", side_effect=AssertionError("unexpected graph placement")):
+        fusion.register_projection_fusion_pass(((8, 5120, 34816), ))
+        changed = callbacks[0](SimpleNamespace(graph_module=module, is_training=training, is_backward=backward))
+    assert changed is (not training and not backward)
+    if training or backward:
+        assert module.code == original
+    else:
+        fused = next(node for node in module.graph.nodes if node.target is _fake_op)
+        assert fused.meta["placement"] == "hpu_cluster"
+        assert len({value.data_ptr() for value in fused.meta["val"]}) == 4

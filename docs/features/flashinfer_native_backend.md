@@ -272,6 +272,77 @@ Each shape must beat the ordinary vendor, CGUID, and formula baselines under
 the existing paired performance gate. Full FP8-GEMM consumer, model-quality,
 and end-to-end qualification remain separate requirements.
 
+## Complete FP8 projections and model integration
+
+An isolated norm/quant win is not a projection win. The projection harness
+includes residual addition, normalization, row quantization and the public
+`hpu.fp8_gemm_v2` consumer. Ordinary serving quantization uses the exact
+`max(dim).values` and reciprocal expressions; CGUID and formula comparisons
+remain separate numerical contracts. An incompatible baseline stays failed
+in the report even when another baseline qualifies.
+
+```bash
+python tools/benchmark_flashinfer_native_projection.py \
+  --output /tmp/native-projection.json --sessions 3 --trace
+```
+
+Per-shape fixtures are independent of traversal order. Qualification requires
+three distinct process identities, matching source/library/input hashes,
+unchanged inputs, shape reentry, native FX dataflow and device trace evidence.
+The projection is not one kernel: the public MME consumer can also generate
+an FP32 device kernel. All stages and recipe launches are reported.
+
+The real-model validation tools provide three deliberately separate steps:
+
+```bash
+# Use the same channel-FP8, CGUID and grouped-compilation settings in both arms.
+export VLLM_HPU_FORCE_CHANNEL_FP8=true
+export VLLM_HPU_CGUID_DYNAMIC_QUANT=1
+export VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS=32
+export VLLM_HPU_QWEN3_COMPILE_LAYER_GROUP_SIZE=8
+export VLLM_SKIP_WARMUP=true
+python tools/capture_flashinfer_model_projection.py \
+  --model MODEL --output /tmp/model-projection-inputs
+python tools/replay_flashinfer_model_projection.py \
+  --capture /tmp/model-projection-inputs \
+  --output /tmp/model-projection-replay.json --sessions 3 --trace
+python tools/benchmark_flashinfer_model_projection.py \
+  --model MODEL --output /tmp/model-projection-aba --trace
+```
+
+Capture uses named worker-control RPCs, without enabling pickle RPCs. It
+loads the actual checkpoint and captures postprocessed FP8 weights plus
+residual/normalization/projection tensors. Hooks do not change model outputs
+and are removed afterwards. Capture runs eager and is **not** a performance
+benchmark. The requested decode buckets must actually be observed; request
+concurrency alone does not establish the operator batch. Compiled replay
+checks its baselines separately from the originating eager model output.
+Differences between eager and compiled outputs are retained, not explained
+away by changing tolerances.
+
+`vllm_gaudi.ops.flashinfer_projection_fusion` is an experimental graph adapter,
+not a new stable FlashInfer API. It has no automatic registration: an empty
+shape request is a no-op. The trial tool explicitly requests only the qualified
+CGUID B=8, K=5120, N=34816 pattern. Other shapes, ordinary quantization,
+unknown layouts, extra consumers and externally observable mutation remain
+unchanged. Identity views are accepted only with matching contiguous metadata.
+Bridge-created `add_` reuse is replaced only after proving a graph-private
+owner with no escaping aliases or future reads; the obsolete update is then
+explicitly erased because FX DCE preserves impure nodes.
+Only inserted nodes receive fresh, non-aliasing metadata. Do not rerun
+whole-graph FakeTensor propagation after Bridge's HPU layout rewrites: some
+resulting BMM graphs are valid for HPU lowering but no longer valid aten
+programs for generic shape execution. Training/backward contexts are skipped.
+
+The model A/B/A screen uses fresh processes and checks source stability,
+actual native-kernel execution, token IDs and baseline-return drift. Profiling
+is limited to five B=8 decode model forwards, outside request timings. Device
+kernel activity records are not logical invocation counts. Match the existing
+serving eager-fallback policy in both model arms (Bridge normally permits
+metadata views); this is separate from the projection tests, which disable
+eager fallback. A small warm-request screen is not general LLM acceptance,
+and neither a report nor the adapter enables a production default.
+
 ## Build and execute
 
 ```bash
