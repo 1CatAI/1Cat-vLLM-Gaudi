@@ -34,6 +34,14 @@ def _graph(violation=None):
     weight = metadata(graph.placeholder("weight"), (projection, width), torch.float8_e4m3fn)
     weight_scale = metadata(graph.placeholder("weight_scale"), (projection, ), torch.float32)
     summed = metadata(graph.call_function(torch.ops.aten.add.Tensor, (x, residual)), (batch, width), torch.bfloat16)
+    private_owner = summed
+    if violation in ("private_update", "live_owner", "aliased_owner", "input_mutation"):
+        owner = x if violation == "input_mutation" else private_owner
+        if violation == "aliased_owner":
+            owner = metadata(graph.call_function(torch.ops.aten.view.default, (owner, (batch, width))), (batch, width),
+                             torch.bfloat16)
+        summed = metadata(graph.call_function(torch.ops.aten.add_.Tensor, (owner, residual)), (batch, width),
+                          torch.bfloat16)
     norm = graph.call_function(_fake_op, (summed, gamma, 1e-6))
     norm.meta["op_name"] = "hpu.rms_norm"
     norm.meta["output_offset"] = [0, 0]
@@ -55,6 +63,8 @@ def _graph(violation=None):
                     (batch, projection), torch.bfloat16)
     gemm.meta["op_name"] = "hpu.fp8_gemm_v2"
     output = (gemm, summed, normed) if violation == "extra_user" else (gemm, summed)
+    if violation == "live_owner":
+        output = (*output, private_owner)
     graph.output(output)
     if violation == "gamma_dtype":
         gamma.meta["output_dtypes"] = [torch.float32]
@@ -80,8 +90,9 @@ def _graph(violation=None):
 
 
 @pytest.mark.parametrize("violation", [
-    None, "identity_view", "reshape_rank", "batch", "extra_user", "gamma_dtype", "cpu", "strided", "metadata", "grad",
-    "epsilon", "range", "stochastic", "ordinary", "bias"
+    None, "identity_view", "private_update", "live_owner", "aliased_owner", "input_mutation", "reshape_rank", "batch",
+    "extra_user", "gamma_dtype", "cpu", "strided", "metadata", "grad", "epsilon", "range", "stochastic", "ordinary",
+    "bias"
 ])
 def test_only_exclusive_qualified_cguid_projection_rewrites(violation):
     module = _graph(violation)
@@ -95,7 +106,7 @@ def test_only_exclusive_qualified_cguid_projection_rewrites(violation):
          if isinstance(node, torch.fx.Node) and "op_name" in node.meta else original_target(node, name))), mock.patch(
              "flashinfer_gaudi._native.add_rmsnorm_quant_op", return_value=SimpleNamespace(default=_fake_op)):
         count = fusion.fuse_projection_graph(module, {(8, 5120, 34816)})
-        expected = violation in (None, "identity_view")
+        expected = violation in (None, "identity_view", "private_update")
         assert count == int(expected)
         module.graph.lint()
         if not expected:

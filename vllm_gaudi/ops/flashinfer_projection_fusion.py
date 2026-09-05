@@ -61,6 +61,42 @@ def _identity_views(node):
     return node, views
 
 
+def _private_temporary_update(node):
+    """Prove a Bridge-created add_ has no externally observable mutation.
+
+    The owner must be a fresh functional add/native residual inside this graph,
+    never a placeholder, parameter or view. Every intervening owner must have
+    only non-aliasing reads before this update, apart from the update chain.
+    Replacing such an internal storage-reuse optimization with a fresh residual
+    preserves the original functional model contract.
+    """
+    if not _target(node, "aten.add_.Tensor") or len(node.args) != 2 or node.kwargs:
+        return False
+    order = {value: index for index, value in enumerate(node.graph.nodes)}
+    current, child, owners = node.args[0], node, []
+    while _target(current, "aten.add_.Tensor"):
+        if len(current.args) != 2 or current.kwargs:
+            return False
+        owners.append((current, child))
+        child, current = current, current.args[0]
+    fresh_native = (_getitem(current, 3) and _target(current.args[0], "custom_op.flashinfer_gaudi_add_rmsnorm_quant"))
+    if not _target(current, "aten.add.Tensor") and not fresh_native:
+        return False
+    owners.append((current, child))
+    for owner, next_update in owners:
+        for user in owner.users:
+            if user is next_update:
+                continue
+            if user.op != "call_function" or order[user] >= order[node]:
+                return False
+            schema = getattr(user.target, "_schema", None)
+            if schema is None or any(result.alias_info is not None for result in schema.returns):
+                return False
+            if any(argument.alias_info is not None and argument.alias_info.is_write for argument in schema.arguments):
+                return False
+    return True
+
+
 def _match(gemm, allowed_shapes):
     if not _target(gemm, "hpu.fp8_gemm_v2"):
         return None
@@ -81,7 +117,7 @@ def _match(gemm, allowed_shapes):
     normed, inverse = cast.args[:2]
     raw_normed, views = _identity_views(normed)
     if not _getitem(raw_normed, 0) or not _target(inverse,
-                                              "aten.mul.Tensor") or inverse.args[1:] != (1.0, ) or inverse.kwargs:
+                                                  "aten.mul.Tensor") or inverse.args[1:] != (1.0, ) or inverse.kwargs:
         return None
     reciprocal = inverse.args[0]
     add_scale = scale.args[0]
@@ -95,7 +131,8 @@ def _match(gemm, allowed_shapes):
             or (len(norm.args) == 5 and norm.args[3:] != (None, False)) or norm.args[2] != 1e-6):
         return None
     summed, gamma = norm.args[:2]
-    if not _target(summed, "aten.add.Tensor") or len(summed.args) != 2 or summed.kwargs:
+    if (not (_target(summed, "aten.add.Tensor") or _private_temporary_update(summed)) or len(summed.args) != 2
+            or summed.kwargs):
         return None
     x, residual = summed.args
     sizes = gemm.meta.get("output_shapes", [])

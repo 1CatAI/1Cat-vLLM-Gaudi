@@ -23,7 +23,9 @@ def test_graph_fusion_public_recipe_reentry_and_shape_fallback(tmp_path):
     torch.hpu.init()
 
     def projection(x, residual, gamma, weight, weight_scale):
-        summed = x + residual
+        # Bridge may reuse the first private sum's storage for the second add.
+        # The adapter must preserve this without ever mutating a graph input.
+        summed = (x + residual) + x
         normed = torch.ops.hpu.rms_norm(summed, gamma, 1e-6, None, False)[0]
         normed = normed.view(-1, normed.shape[-1]).reshape(x.shape)
         scale = torch.ops.hpu.calculate_scale_for_cast(normed, 2, 0, -1, True, 240., 1.) + 1e-8 / 240.
@@ -44,6 +46,7 @@ def test_graph_fusion_public_recipe_reentry_and_shape_fallback(tmp_path):
         for batch in (1, 8, 32)
     }
     compiled = torch.compile(projection, backend="hpu_backend", fullgraph=True, dynamic=False)
+    snapshots = {batch: tuple(value.cpu() for value in inputs[:2]) for batch, inputs in samples.items()}
     expected = {batch: tuple(value.cpu() for value in compiled(*inputs)) for batch, inputs in samples.items()}
     register_projection_fusion_pass(((8, 5120, 34816), ))
     torch._dynamo.reset()
@@ -56,6 +59,9 @@ def test_graph_fusion_public_recipe_reentry_and_shape_fallback(tmp_path):
         outputs = compiled(*samples[8])
     torch.hpu.synchronize()
     validate(outputs, expected[8])
+    for batch, inputs in samples.items():
+        for value, snapshot in zip(inputs[:2], snapshots[batch]):
+            torch.testing.assert_close(value.cpu(), snapshot, rtol=0, atol=0)
     with torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.HPU]) as profiler:
         for _ in range(5):
@@ -63,4 +69,9 @@ def test_graph_fusion_public_recipe_reentry_and_shape_fallback(tmp_path):
         torch.hpu.synchronize()
     path = tmp_path / "trace.json"
     profiler.export_chrome_trace(str(path))
-    audit_trace(json.loads(path.read_text())["traceEvents"])
+    events = json.loads(path.read_text())["traceEvents"]
+    # This context deliberately has one additional residual producer. Audit it
+    # separately; do not weaken the complete projection benchmark's allowlist.
+    assert sum(event.get("cat") == "kernel" and event.get("name") == "add_fwd_bf16" for event in events) == 5
+    audit_trace(
+        [event for event in events if not (event.get("cat") == "kernel" and event.get("name") == "add_fwd_bf16")])

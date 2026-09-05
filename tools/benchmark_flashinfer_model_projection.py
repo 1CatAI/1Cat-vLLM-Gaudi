@@ -53,20 +53,55 @@ class ProjectionTrialWorkerExtension:
 
     def start_projection_trial_trace(self):
         import torch
+        from vllm.forward_context import get_forward_context
+
         self._projection_trial_profiler = torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.HPU])
-        self._projection_trial_profiler.start()
+        self._projection_trial_trace_started = False
+        self._projection_trial_trace_stopped = False
+        self._projection_trial_steps = 0
+        self._projection_trial_active_step = False
+
+        def before(module, args, kwargs):
+            metadata = get_forward_context().attn_metadata
+            inputs = kwargs.get("input_ids", args[0] if args else None)
+            active = (metadata is not None and not bool(getattr(metadata, "is_prompt", False))
+                      and isinstance(inputs, torch.Tensor) and inputs.numel() == 8
+                      and not self._projection_trial_trace_stopped)
+            self._projection_trial_active_step = active
+            if active and not self._projection_trial_trace_started:
+                self._projection_trial_profiler.start()
+                self._projection_trial_trace_started = True
+
+        def after(module, args, output):
+            if self._projection_trial_active_step:
+                self._projection_trial_steps += 1
+                if self._projection_trial_steps == 5:
+                    torch.hpu.synchronize()
+                    self._projection_trial_profiler.stop()
+                    self._projection_trial_trace_stopped = True
+
+        model = self.get_model()
+        self._projection_trial_hooks = (model.register_forward_pre_hook(before, with_kwargs=True),
+                                        model.register_forward_hook(after))
 
     def stop_projection_trial_trace(self, output):
         import torch
         torch.hpu.synchronize()
-        self._projection_trial_profiler.stop()
+        for handle in self._projection_trial_hooks:
+            handle.remove()
+        del self._projection_trial_hooks
+        if not self._projection_trial_trace_stopped:
+            if self._projection_trial_trace_started:
+                self._projection_trial_profiler.stop()
+            raise RuntimeError("Trace did not observe five B=8 decode model forwards")
         self._projection_trial_profiler.export_chrome_trace(output)
         del self._projection_trial_profiler
         events = json.loads(Path(output).read_text())["traceEvents"]
         counts = Counter(event["name"] for event in events if event.get("cat") == "kernel")
         return {
             "kernels": dict(counts),
+            "scope": "five B=8 decode model forwards; profiler excluded from request timings",
             "native_projection_kernel_calls": counts["flashinfer_gaudi_add_rmsnorm_quant_bf16_gaudi2"]
         }
 
@@ -75,6 +110,16 @@ def worker(args):
     import habana_frameworks.torch  # noqa: F401
     from vllm import LLM, SamplingParams
 
+    root = Path(__file__).resolve().parents[1]
+
+    def fingerprints():
+        paths = (Path(__file__).resolve(), root / "vllm_gaudi/ops/flashinfer_projection_fusion.py",
+                 root / "vllm_gaudi/ops/hpu_layernorm.py", root / "vllm_gaudi/extension/ops.py",
+                 root / "vllm_gaudi/models/qwen3_next.py", root / "vllm_gaudi/models/qwen3_5.py",
+                 root / "flashinfer_gaudi/lib/libflashinfer_gaudi_kernels.so", root / "flashinfer_gaudi/norm.py")
+        return {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+
+    source_sha256 = fingerprints()
     args.output.mkdir(parents=True, exist_ok=False)
     llm = LLM(model=args.model,
               tensor_parallel_size=1,
@@ -108,6 +153,7 @@ def worker(args):
     llm.generate(prompts, sampling, use_tqdm=False)
     report = {
         "mode": args.mode,
+        "source_sha256": source_sha256,
         "whole_model_eager_fallback_policy": os.environ.get("PT_HPU_USE_EAGER_FALLBACK", "1"),
         "device_module": os.environ.get("HLS_MODULE_ID"),
         "configuration": configuration,
@@ -139,6 +185,7 @@ def worker(args):
     report["route_hit"] = bool(enabled and any(stats["compiled_matches"] > 0 for stats in report["fusion_stats"])
                                and (not args.trace or any(item["native_projection_kernel_calls"] > 0
                                                           for item in report["trace"])))
+    report["sources_unchanged"] = fingerprints() == source_sha256
     (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps({key: value for key, value in report.items() if key not in ("rounds", "trace")}, indent=2))
 
@@ -180,6 +227,9 @@ def main():
         (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     if not report["worker_errors"] and len(report["workers"]) == 3:
         first, candidate, last = report["workers"]
+        report["source_control_valid"] = (all(item.get("sources_unchanged") for item in report["workers"]) and len(
+            {json.dumps(item["source_sha256"], sort_keys=True)
+             for item in report["workers"]}) == 1)
         baseline = statistics.median(
             [row["output_tokens_per_s"] for worker_report in (first, last) for row in worker_report["rounds"]])
         report["candidate_speedup"] = candidate["median_output_tokens_per_s"] / baseline
