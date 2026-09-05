@@ -162,3 +162,46 @@ def test_enable_preserves_projection_reduction_flags():
     assert isinstance(layer, pipeline.HpuQwen3BoundaryDecoderLayer)
     assert projection is layer.linear_attn.out_proj
     assert projection.reduce_results and layer.mlp.down_proj.reduce_results
+
+
+@pytest.mark.parametrize("three_dimensional", [False, True])
+def test_full_attention_core_preserves_default_projection_path(three_dimensional):
+    from vllm_gaudi.models.qwen3_next import _hpu_qwen3next_attention_forward
+    torch.manual_seed(23)
+    projection = Projection(4, 4)
+    attention = SimpleNamespace(
+        qkv_proj=Projection(4, 16),
+        o_proj=projection,
+        q_size=4,
+        kv_size=4,
+        num_heads=2,
+        num_kv_heads=2,
+        head_dim=2,
+        attn_output_gate=True,
+        q_norm=torch.nn.Identity(),
+        k_norm=torch.nn.Identity(),
+        rotary_emb=lambda positions, q, k: (q, k),
+        attn=lambda q, k, v: q + k + v.reshape_as(q),
+    )
+
+    def project_qkv_gate(qkv, positions):
+        q_gate, k, v = qkv.split([8, 4, 4], dim=-1)
+        q, gate = q_gate.view(-1, 2, 4).chunk(2, dim=-1)
+        return q.reshape(-1, 4), k.reshape(-1, 4), v.reshape(-1, 4), gate.reshape(-1, 4)
+
+    attention._project_qkv_gate = project_qkv_gate
+    x = torch.randn(1, 7, 4) if three_dimensional else torch.randn(7, 4)
+    positions = torch.arange(7)
+    core = _hpu_qwen3next_attention_forward(attention, positions, x, return_core=True)
+    output = _hpu_qwen3next_attention_forward(attention, positions, x)
+    expected, _ = projection(core)
+    torch.testing.assert_close(output, expected.reshape_as(x))
+
+
+def test_decoder_uses_original_forward_when_disabled(monkeypatch):
+    layer = make_layer()
+    pipeline.enable_hpu_qwen3_boundary_pipeline(make_model([layer]), 4, 2)
+    layer._hpu_boundary_chunks = 1
+    expected = object()
+    monkeypatch.setattr(pipeline.Qwen3_5DecoderLayer, "forward", lambda self, *args, **kwargs: expected)
+    assert layer(torch.zeros(7, 4), None, torch.arange(7)) is expected
