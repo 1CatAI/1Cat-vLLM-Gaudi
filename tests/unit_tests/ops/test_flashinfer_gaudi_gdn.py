@@ -461,7 +461,7 @@ def test_forced_native_backend_fails_before_cpu_state_update():
     original = pool.clone()
     packed = torch.cat((q.reshape(1, -1), k.reshape(1, -1), v.reshape(1, -1)), dim=-1)
     set_backend_policy("public")
-    with pytest.raises(BackendUnavailableError, match="requires an HPU tensor"):
+    with pytest.raises(BackendUnavailableError, match="decomposition is forbidden"):
         gated_delta_rule_decode_packed(
             packed,
             log_decay,

@@ -15,6 +15,7 @@ _LOAD_LOCK = threading.Lock()
 _LOAD_ATTEMPTED = False
 _LOADED_PATHS: list[str] = []
 _LOAD_ERRORS: list[str] = []
+_SILU_AND_MUL_OP: Callable | None = None
 
 
 def _library_candidates() -> list[str]:
@@ -62,7 +63,7 @@ def load_native_extensions() -> tuple[str, ...]:
     Loading failures are recorded for diagnostics. They are not raised here so
     CPU-only imports and the PyTorch reference fallback remain usable.
     """
-    global _LOAD_ATTEMPTED
+    global _LOAD_ATTEMPTED, _SILU_AND_MUL_OP
     if _LOAD_ATTEMPTED:
         return tuple(_LOADED_PATHS)
     with _LOAD_LOCK:
@@ -79,6 +80,10 @@ def load_native_extensions() -> tuple[str, ...]:
                 _LOAD_ERRORS.append(f"{candidate}: {type(exc).__name__}: {exc}")
             else:
                 _LOADED_PATHS.append(candidate)
+        try:
+            _SILU_AND_MUL_OP = torch.ops.custom_op.flashinfer_gaudi_silu_and_mul
+        except (AttributeError, RuntimeError):
+            _SILU_AND_MUL_OP = None
         _LOAD_ATTEMPTED = True
     return tuple(_LOADED_PATHS)
 
@@ -102,6 +107,15 @@ def bridge_packed_gdn_op() -> Callable | None:
     return _resolve_op("flashinfer_gaudi_bridge", "gdn_decode_packed")
 
 
+def silu_and_mul_op() -> Callable | None:
+    # The public CustomOp API requires custom_op for full torch.compile support.
+    # Registration is immutable after the one-shot loader. Resolve it at
+    # compilation rather than installing guards on loader locks/path lists.
+    if not _LOAD_ATTEMPTED:
+        load_native_extensions()
+    return _SILU_AND_MUL_OP
+
+
 def native_diagnostics() -> dict[str, object]:
     load_native_extensions()
     return {
@@ -109,13 +123,15 @@ def native_diagnostics() -> dict[str, object]:
         "load_errors": tuple(_LOAD_ERRORS),
         "public_packed_gdn": public_packed_gdn_op() is not None,
         "bridge_packed_gdn": bridge_packed_gdn_op() is not None,
+        "silu_and_mul": silu_and_mul_op() is not None,
     }
 
 
 def _reset_native_state_for_tests() -> None:
-    global _LOAD_ATTEMPTED
+    global _LOAD_ATTEMPTED, _SILU_AND_MUL_OP
     with _LOAD_LOCK:
         _LOAD_ATTEMPTED = False
+        _SILU_AND_MUL_OP = None
         _LOADED_PATHS.clear()
         _LOAD_ERRORS.clear()
 

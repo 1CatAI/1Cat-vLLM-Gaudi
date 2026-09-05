@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "source_baseline": "5c158439bc0e50318199e3898c99aa87fc617c31",
+  "flashinfer_contract": "3a75b4e353ce113171c4d075fc2d3cb5b7dd6c08",
+  "target": "gaudi2",
+  "synapse_version": "1.24.1",
+  "whole_library_native": false,
+  "domains": {
+    "activation_norm": "native_silu_candidate_only",
+    "quantization": "planned",
+    "gemm": "compound_probe_only",
+    "gdn_kda_mamba": "reference_graph_and_partial_native_prototype",
+    "kv_cache_rope": "planned",
+    "dense_attention": "planned",
+    "mla_sparse_cascade": "planned",
+    "moe": "planned",
+    "sampling_speculative": "planned",
+    "communication": "planned"
+  },
+  "operations": {
+    "silu_and_mul": {
+      "native_implemented": true,
+      "guid": "flashinfer_gaudi_silu_and_mul_bf16_gaudi2",
+      "contract": "contiguous rank-2 BF16 HPU, B>0, D divisible by 128, out=None",
+      "correctness": "requires_matching_build_hardware_report",
+      "performance": "unqualified",
+      "production_promoted": false
+    },
+    "gdn_decode_packed": {
+      "native_implemented": false,
+      "partial_tpc_prototype": true,
+      "reason": "legacy torch exp/cast/contiguous prologue",
+      "production_promoted": false
+    },
+    "gdn_decode_pretranspose": {"native_implemented": false, "production_promoted": false},
+    "gdn_decode": {"native_implemented": false, "production_promoted": false},
+    "gdn_mtp": {"native_implemented": false, "production_promoted": false},
+    "gdn_fused_decode_step": {"native_implemented": false, "production_promoted": false},
+    "chunk_gated_delta_rule": {"native_implemented": false, "production_promoted": false}
+  }
+}

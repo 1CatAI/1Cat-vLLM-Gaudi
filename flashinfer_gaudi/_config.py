@@ -6,13 +6,12 @@ from __future__ import annotations
 import os
 from typing import Literal, cast
 
-BackendPolicy = Literal["auto", "public", "bridge", "pytorch"]
+BackendPolicy = Literal["auto", "native", "public", "bridge", "pytorch"]
 StatePrecision = Literal["fp32", "bf16"]
 
 _BACKEND_ENV = "FLASHINFER_GAUDI_BACKEND"
 _STATE_DTYPE_ENV = "FLASHINFER_GAUDI_STATE_DTYPE"
-_BRIDGE_AUTO_ENV = "FLASHINFER_GAUDI_ENABLE_BRIDGE_AUTO"
-_VALID_BACKENDS = frozenset(("auto", "public", "bridge", "pytorch"))
+_VALID_BACKENDS = frozenset(("auto", "native", "public", "bridge", "pytorch"))
 _VALID_STATE_DTYPES = frozenset(("fp32", "bf16"))
 
 _backend_override: BackendPolicy | None = None
@@ -59,4 +58,6 @@ def get_state_precision() -> StatePrecision:
 
 
 def bridge_auto_enabled() -> bool:
-    return os.environ.get(_BRIDGE_AUTO_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
+    # The bridge prototype has no qualified whole-operation native tactic.
+    # A process environment flag is not evidence of qualification.
+    return False

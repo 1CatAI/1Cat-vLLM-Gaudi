@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-import os
 from functools import lru_cache
 from importlib import resources
 
@@ -17,10 +16,8 @@ def _manifest() -> dict[str, object]:
 
 
 def public_gdn_auto_promoted() -> bool:
-    override = os.environ.get("FLASHINFER_GAUDI_ENABLE_PUBLIC_AUTO")
-    if override is not None:
-        return override.strip().lower() in ("1", "true", "yes", "on")
-    return bool(_manifest().get("public_native_promoted", False))
+    # Environment flags must not bypass offline correctness/performance gates.
+    return bool(_manifest().get("public_native_promoted", False) and _manifest().get("whole_operation_native", False))
 
 
 def gdn_prefill_tactic() -> dict[str, object]:
