@@ -8,7 +8,7 @@
   "domains": {
     "activation_norm": "native_silu_candidate_only",
     "quantization": "planned",
-    "gemm": "compound_probe_only",
+    "gemm": "native_bf16_gemm_silu_candidate_only",
     "gdn_kda_mamba": "reference_graph_and_partial_native_prototype",
     "kv_cache_rope": "planned",
     "dense_attention": "planned",
@@ -18,6 +18,16 @@
     "communication": "planned"
   },
   "operations": {
+    "bf16_gemm_silu_mul": {
+      "native_implemented": true,
+      "entry": "flashinfer_gaudi.gemm.GemmSiluPlan",
+      "engines": ["mme", "tpc"],
+      "contract": "contiguous BF16 HPU x[M,K], weight[K,2D], D divisible by 128; functional or nonaliasing native out",
+      "abi": "Bridge 1.24.1.482, Synapse 1.24.1, per-build checksummed artifact",
+      "correctness": "requires_matching_build_hardware_report",
+      "performance": "unqualified",
+      "production_promoted": false
+    },
     "silu_and_mul": {
       "native_implemented": true,
       "guid": "flashinfer_gaudi_silu_and_mul_bf16_gaudi2",

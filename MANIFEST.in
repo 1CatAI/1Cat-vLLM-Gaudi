@@ -1,4 +1,6 @@
 recursive-include csrc/flashinfer_gaudi *
 recursive-include flashinfer_gaudi/tactics *.json
 include tools/build_flashinfer_gaudi.py
+include tools/build_flashinfer_gaudi_bridge.py
 exclude flashinfer_gaudi/lib/*.so
+exclude flashinfer_gaudi/lib/bridge_artifact_v1.json

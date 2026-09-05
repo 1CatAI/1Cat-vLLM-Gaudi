@@ -26,6 +26,83 @@ PyTorch numerical decomposition does not count as a native operation.
 
 No native tactic in this delivery is enabled automatically in vLLM.
 
+## Experimental mixed-engine plan
+
+`flashinfer_gaudi.gemm.GemmSiluPlan` adds a BF16 MME GEMM followed by the
+native TPC SiLU-multiply kernel **inside one Synapse graph**. Inputs are
+contiguous BF16 `x[M,K]`, `weight[K,2*D]`, with positive dimensions and D
+divisible by 128. The GEMM result is BF16, SiLU is rounded to BF16 before
+the multiplication, and no quantization or scale semantics are changed.
+This is a Gaudi-specific compound primitive, not a claim of upstream
+FlashInfer GEMM API completeness or FP8 model acceleration.
+
+The optional adapter uses private Bridge headers and is restricted to Bridge
+`1.24.1.482`, Synapse `1.24.1` and eager mode. Build against the source and
+generated dependency tree matching the installed Bridge:
+
+```bash
+python tools/build_flashinfer_gaudi.py
+PT_HPU_LAZY_MODE=0 python tools/build_flashinfer_gaudi_bridge.py \
+  --bridge-source "$GAUDI_PYTORCH_BRIDGE_SOURCE" \
+  --bridge-build "$GAUDI_BRIDGE_BUILD"
+```
+
+The builder reuses Bridge's `_deps` checkouts and generated headers. It does
+not modify or rebuild Bridge. This adapter is source-build-only; ordinary
+wheels exclude its private-ABI binary and local manifest.
+`bridge_artifact_v1.json` binds the adapter,
+TPC kernel database, Synapse library and both linked Bridge libraries by
+SHA256, together with the exact torch/Bridge/Synapse versions and C++ ABI.
+The loader rejects mismatches before loading adapter code. Rebuilding the
+TPC database or changing the runtime requires rebuilding the adapter
+artifact and starting a fresh process. This is compatibility checking for
+trusted local builds, not a signed-artifact security boundary.
+
+```python
+from flashinfer_gaudi.gemm import GemmSiluPlan
+
+plan = GemmSiluPlan(m, k, d)
+# Allocate x, weight and out on HPU before the hot path.
+plan.run(x, weight, out=out)
+# For integration in an allocating compiled graph:
+fn = torch.compile(plan.functional_op, backend="hpu_backend",
+                   fullgraph=True, dynamic=False)
+result = fn(x, weight)
+```
+
+`out` is bound directly through Bridge's native out interface, with no
+post-compute `copy_`. Invalid shapes, types, layouts, autograd inputs and
+shared-storage aliases reject before submission. `run` is an eager native
+recipe-replay interface; do not compile its mutable out variant. The
+functional registered op is the supported fullgraph compilation boundary.
+
+Plan construction verifies the adapter; the first run compiles the recipe.
+Plans hold no tensors or mutable workspace. Independent output buffers can
+be submitted on different streams; callers own cross-stream ordering and
+must not reuse the same output concurrently. Internal temporaries and scratch
+are owned by Synapse. Caller-provided workspaces, guaranteed SRAM placement,
+general graph artifacts, and recipe serialization are not implemented yet.
+`plan.artifact` serializes only this static graph specification and its
+adapter identity, not a warmed recipe, tensor pointer, or model weights.
+
+Measure both compiled functional and native out replay against the same
+compiled allocating HPU reference:
+
+```bash
+python tools/benchmark_flashinfer_native_gemm.py \
+  --output /tmp/native-gemm-silu.json --trace
+```
+
+The output mode is labeled explicitly: its preallocated output contract is
+different from the allocating baseline. It must not be reported as isolated
+MME/TPC compute acceleration. Neither mode is auto-promoted by a report.
+
+The first mixed-chain qualification did not meet the performance gate.
+Reference traces already contain MME GEMM plus a fused TPC epilogue; simply
+replacing that epilogue does not remove a graph launch or an engine stage.
+Prioritize activation/quant and residual/norm/quant fusion with unchanged
+scale semantics, and separately reduce out-replay submission overhead.
+
 ## Build and execute
 
 ```bash
@@ -77,8 +154,9 @@ are not end-to-end model speedups. Existing graph tactics remain the baseline.
 ## Remaining implementation sequence
 
 1. Complete the pinned upstream API inventory, execution reporting, ABI-bound
-   AOT artifacts and mixed-engine adapter. Add plan/run workspaces,
-   preallocated outputs and concurrency qualification.
+   AOT artifacts and general mixed-engine adapter. Extend the first static
+   GEMM-SiLU plan to caller workspaces, recipe serialization and broader
+   concurrency qualification.
 2. Implement residual/norm/quant, gated activation/quant, QK/RoPE/KV fusion;
    complete native GDN decode/MTP/prefill and KDA/Mamba/state contracts.
 3. Add MME linear/GEMM and exact-scale block quantization pipelines; then
