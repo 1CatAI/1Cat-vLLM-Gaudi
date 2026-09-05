@@ -21,3 +21,15 @@ python setup.py build_ext --inplace
 Before starting Python, prepend the resulting performance library to
 `GC_KERNEL_PATH` and load `flashqla_pair_transform_pt2*.so` with
 `torch.ops.load_library`.
+
+The compact post-convolution Q/K operator accepts the Qwen3.8 TP1 packed
+width 10240 and TP2 packed width 5120. The build preserves the 16-head TPC
+variant and adds an eight-head variant for TP2. Real and fake output metadata
+both retain the local compact head count. The compact-KKT operator uses the
+head and repeat dimensions supplied by its tensors and supports either layout.
+
+To validate both native layouts, set `GC_KERNEL_PATH` and
+`VLLM_GDN_QWEN38_NATIVE_QK_PREP_EXTENSION` to the newly built libraries, select
+an available HPU, and run `pytest tests/unit_tests/ops/test_qwen38_native_qk.py`
+from the repository root.
+The hardware checks are skipped when the extension path is absent.

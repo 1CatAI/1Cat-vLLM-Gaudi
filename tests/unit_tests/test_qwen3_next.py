@@ -8,6 +8,7 @@ import torch
 
 import vllm_gaudi.models.qwen3_next as qwen3_next_module
 from vllm_gaudi.models.qwen3_5 import _save_ssm_state
+from vllm_gaudi.ops.hpu_layernorm import HPUGemmaRMSNorm, HPURMSNorm
 from vllm_gaudi.models.qwen3_next import (
     HpuQwen3DecoderLayerGroup,
     build_hpu_qwen3_layer_groups,
@@ -210,13 +211,13 @@ def test_supports_hpu_qwen3_layer_group_compilation(
     ) is expected)
 
 
-def _fake_dense_layer(attention_name):
+def _fake_dense_layer(attention_name, norm_factory=SimpleNamespace):
     output_projection = SimpleNamespace(reduce_results=True)
     attention = SimpleNamespace(**{attention_name: output_projection})
     layer = SimpleNamespace(
         mlp=SimpleNamespace(down_proj=SimpleNamespace(reduce_results=True)),
-        input_layernorm=SimpleNamespace(),
-        post_attention_layernorm=SimpleNamespace(),
+        input_layernorm=norm_factory(),
+        post_attention_layernorm=norm_factory(),
         use_attn_reduce_scatter_for_moe=False,
     )
     if attention_name == "o_proj":
@@ -226,17 +227,18 @@ def _fake_dense_layer(attention_name):
     return layer
 
 
-def test_enable_tp2_fused_ar_norm_moves_all_dense_reductions(monkeypatch):
+@pytest.mark.parametrize("norm_type", [HPURMSNorm, HPUGemmaRMSNorm])
+def test_enable_tp2_fused_ar_norm_moves_all_dense_reductions(monkeypatch, default_vllm_config, norm_type):
 
     class FakeQwenModel:
         pass
 
-    layers = (_fake_dense_layer("o_proj"), _fake_dense_layer("out_proj"))
+    layers = tuple(_fake_dense_layer(name, lambda: norm_type(8)) for name in ("o_proj", "out_proj"))
     inner_model = FakeQwenModel()
     inner_model.layers = layers
     inner_model.start_layer = 0
     inner_model.end_layer = len(layers)
-    inner_model.norm = SimpleNamespace()
+    inner_model.norm = norm_type(8)
     inner_model.embed_tokens = SimpleNamespace()
     model = SimpleNamespace(model=inner_model)
     initialized = []
@@ -283,3 +285,35 @@ def test_enable_tp2_fused_ar_norm_rejects_non_dense_topology(monkeypatch):
 
     assert enable_hpu_qwen3_tp2_fused_ar_norm(SimpleNamespace(model=inner_model)) == 0
     assert layer.self_attn.o_proj.reduce_results is True
+
+
+@pytest.mark.parametrize("unsupported_boundary", ["input_layernorm", "post_attention_layernorm", "final_norm"])
+def test_enable_tp2_fused_ar_norm_rejects_unsupported_norm_before_mutation(monkeypatch, default_vllm_config,
+                                                                           unsupported_boundary):
+
+    class FakeQwenModel:
+        pass
+
+    layer = _fake_dense_layer("o_proj", lambda: HPUGemmaRMSNorm(8))
+    inner_model = FakeQwenModel()
+    inner_model.layers = (layer, )
+    inner_model.start_layer = 0
+    inner_model.end_layer = 1
+    inner_model.norm = HPUGemmaRMSNorm(8)
+    inner_model.embed_tokens = SimpleNamespace()
+    if unsupported_boundary == "final_norm":
+        inner_model.norm = SimpleNamespace()
+    else:
+        setattr(layer, unsupported_boundary, SimpleNamespace())
+
+    monkeypatch.setattr(qwen3_next_module, "UpstreamQwen3NextModel", FakeQwenModel)
+    import vllm_gaudi.distributed.tp2_fused_ar_norm as fused_module
+
+    monkeypatch.setattr(fused_module, "initialize_tp2_fused_ar_norm_runtime",
+                        lambda: pytest.fail("Unsupported normalization must not initialize the runtime"))
+
+    assert enable_hpu_qwen3_tp2_fused_ar_norm(SimpleNamespace(model=inner_model)) == 0
+    assert layer.self_attn.o_proj.reduce_results is True
+    assert layer.mlp.down_proj.reduce_results is True
+    assert not hasattr(inner_model.embed_tokens, "_hpu_defer_tp2_reduce")
+    assert not hasattr(inner_model, "_hpu_tp2_defer_embedding_reduce")

@@ -249,8 +249,11 @@ def tp2_allreduce_residual_rms_norm(
     epsilon: float,
     *,
     is_prompt: bool,
+    allow_fused: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Use the fused decode path, or preserve stock HCCL semantics."""
+    if not allow_fused:
+        return _fallback(partial, residual, weight, epsilon)
     max_bytes = get_config().tp2_fused_ar_norm_max_bytes
     reason = _rejection_reason(
         partial,

@@ -27,6 +27,16 @@ constexpr const char* kConvQkvSchema =
 constexpr const char* kRmsNormGatedSchema =
     "custom_op::qwen38_rmsnorm_gated_bf16_gaudi2";
 
+int64_t compact_post_conv_heads(const at::Tensor& packed) {
+  TORCH_CHECK(packed.scalar_type() == at::ScalarType::BFloat16);
+  TORCH_CHECK(
+      packed.dim() == 2 &&
+          (packed.size(1) == 10240 || packed.size(1) == 5120),
+      "expected compact QKV shape [tokens, 10240] or [tokens, 5120], got ",
+      packed.sizes());
+  return packed.size(1) == 5120 ? 8 : 16;
+}
+
 bool register_flashqla_pair_transform() {
   auto output_meta = [](const at::Stack& inputs) {
     const auto& a0 = inputs.at(0).toTensor();
@@ -112,7 +122,7 @@ bool register_flashqla_pair_transform() {
     const auto tokens = packed.size(0);
     habana::PartialOutputMetaData q;
     q.dtype = at::ScalarType::BFloat16;
-    q.shape = {tokens, 16, 128};
+    q.shape = {tokens, compact_post_conv_heads(packed), 128};
     return habana::PartialOutputMetaDataVector{q, q};
   };
   habana::custom_op::registerUserCustomOp(
@@ -360,11 +370,7 @@ std::tuple<at::Tensor, at::Tensor> post_conv_qk_meta(
 
 std::tuple<at::Tensor, at::Tensor> compact_post_conv_qk_hpu(
     const at::Tensor& packed) {
-  TORCH_CHECK(packed.scalar_type() == at::ScalarType::BFloat16);
-  TORCH_CHECK(
-      packed.dim() == 2 && packed.size(1) == 10240,
-      "expected packed QKV shape [tokens, 10240], got ",
-      packed.sizes());
+  compact_post_conv_heads(packed);
   TORCH_CHECK(kRegistered);
 
   auto descriptor =
@@ -377,11 +383,12 @@ std::tuple<at::Tensor, at::Tensor> compact_post_conv_qk_hpu(
 
 std::tuple<at::Tensor, at::Tensor> compact_post_conv_qk_meta(
     const at::Tensor& packed) {
+  const auto heads = compact_post_conv_heads(packed);
   const auto options = packed.options().dtype(at::ScalarType::BFloat16);
   const auto tokens = packed.size(0);
   return {
-      at::empty({tokens, 16, 128}, options),
-      at::empty({tokens, 16, 128}, options),
+      at::empty({tokens, heads, 128}, options),
+      at::empty({tokens, heads, 128}, options),
   };
 }
 

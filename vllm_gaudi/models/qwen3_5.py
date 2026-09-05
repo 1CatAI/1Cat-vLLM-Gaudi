@@ -183,6 +183,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 value_width=self.value_dim // self.tp_size,
                 key_head_dim=self.head_k_dim,
                 value_head_dim=self.head_v_dim,
+                compact_qk=self.gdn_compact_qk_input,
             )
 
         # The split TPC kernels vector-load one convolution tap across channels.
