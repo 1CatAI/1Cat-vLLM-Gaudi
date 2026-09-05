@@ -140,3 +140,32 @@ The following recommendations are based on isolated layer benchmarks using the M
 This feature is implemented in `vllm_gaudi/ops/hpu_row_parallel_linear.py` as `HPURowParallelLinear`, which registers as an out-of-tree (OOT) override for vLLM's `RowParallelLinear`. The chunking logic is entirely self-contained in the `forward` method and does not modify any other part of the model or the inference pipeline.
 
 Each chunk boundary introduces a `torch._dynamo.graph_break()` to ensure correct async all-reduce semantics under `torch.compile`. This means the compiled graph will be split at chunk boundaries, which is a necessary trade-off for enabling async communication.
+
+## Experimental dense Qwen3 MLP pipeline
+
+`VLLM_HPU_QWEN3_MLP_CHUNKS` optionally expands the overlap region to the entire
+dense MLP: gate/up projection, SiLU activation, down projection and all-reduce.
+The next chunk's gate/up computation can then overlap the previous chunk's
+reduction. Every chunk is reduced before a single concatenation assembles the
+output; the logical collective payload is unchanged.
+
+This opt-in path requires a dense Qwen3 TP2 model with standard reductions and
+no LoRA. It accepts both flattened `[tokens, hidden]` and single-sequence
+`[1, tokens, hidden]` inputs. Attention metadata must identify prefill with one
+sequence, and the token count must meet `VLLM_ROW_PARALLEL_CHUNK_THRESHOLD`.
+Decode and other input layouts use the original MLP forward implementation.
+Unsupported model topologies are rejected before any layers are modified.
+
+```bash
+export VLLM_HPU_TP2_FUSED_AR_NORM=false
+export VLLM_HPU_QWEN3_MLP_CHUNKS=4
+export VLLM_ROW_PARALLEL_CHUNKS=1
+export VLLM_ROW_PARALLEL_CHUNK_THRESHOLD=8192
+```
+
+The MLP option defaults to `1` (disabled). Increasing the chunk count is not
+monotonically beneficial: extra compilation boundaries, smaller matrix
+operations and output assembly can offset additional communication overlap.
+Qualify output correctness and end-to-end latency on the intended workload.
+If row-parallel chunking is also enabled, the whole-MLP path performs its own
+down-projection reduction without recursively invoking row chunking.

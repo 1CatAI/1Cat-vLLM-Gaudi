@@ -946,6 +946,16 @@ def apply_model_specific_patches(model_runner):
         apply_hpu_llama4_post_load_patches(model_runner.model)
     if is_qwen_moe:
         apply_hpu_qwen3_residual_fix(model_runner.model)
+        if get_config().qwen3_mlp_chunks > 1:
+            from vllm_gaudi.models.qwen3_mlp import enable_hpu_qwen3_mlp_chunking
+            if get_config().tp2_fused_ar_norm or model_runner.vllm_config.lora_config is not None:
+                raise RuntimeError("MLP prefill chunking does not support deferred reductions or LoRA")
+            chunked_mlps = enable_hpu_qwen3_mlp_chunking(model_runner.model,
+                                                         get_config().qwen3_mlp_chunks,
+                                                         get_config().row_parallel_chunk_threshold)
+            if chunked_mlps == 0:
+                raise RuntimeError("MLP prefill chunking requires a dense Qwen3 TP2 model with standard reductions")
+            logger.info("Enabled chunked prefill pipeline for %d dense MLPs", chunked_mlps)
         if get_config().tp2_fused_ar_norm:
             fused_boundaries = enable_hpu_qwen3_tp2_fused_ar_norm(model_runner.model)
             if fused_boundaries == 0:
