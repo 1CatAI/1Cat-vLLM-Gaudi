@@ -342,6 +342,12 @@ serving eager-fallback policy in both model arms (Bridge normally permits
 metadata views); this is separate from the projection tests, which disable
 eager fallback. A small warm-request screen is not general LLM acceptance,
 and neither a report nor the adapter enables a production default.
+The harness now requires at least two symmetric warmup rounds and rejects
+timed rounds deviating more than ten percent from their worker median. Earlier
+single-warmup screens exposed residual cold/recompile overhead; retain those
+rounds as diagnostics, not as steady-state speedup evidence. Forced-length
+generation ignores EOS for timing, so raw token disagreement must also be
+examined before the first EOS; it is not itself a semantic quality score.
 
 ## Build and execute
 

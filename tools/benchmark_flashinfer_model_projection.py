@@ -11,12 +11,33 @@ import argparse
 from collections import Counter
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import statistics
 import subprocess
 import sys
 import time
+
+
+def warm_model(llm, prompts, sampling, rounds):
+    if rounds < 2:
+        raise ValueError("At least two symmetric model warmup rounds are required")
+    for _ in range(rounds):
+        llm.generate(prompts, sampling, use_tqdm=False)
+
+
+def warm_timings_stable(workers):
+    if len(workers) != 3:
+        return False
+    for worker_report in workers:
+        rates = [row["output_tokens_per_s"] for row in worker_report.get("rounds", ())]
+        if len(rates) < 3 or not all(math.isfinite(rate) and rate > 0 for rate in rates):
+            return False
+        median = statistics.median(rates)
+        if min(rates) < median * .9 or max(rates) > median * 1.1:
+            return False
+    return True
 
 
 class ProjectionTrialWorkerExtension:
@@ -150,9 +171,10 @@ def worker(args):
                                              enable_thinking=False)
         prompts.append({"prompt_token_ids": tokenizer.encode(text, add_special_tokens=False)})
     sampling = SamplingParams(temperature=0, max_tokens=128, ignore_eos=True)
-    llm.generate(prompts, sampling, use_tqdm=False)
+    warm_model(llm, prompts, sampling, args.warmup_rounds)
     report = {
         "mode": args.mode,
+        "warmup_rounds": args.warmup_rounds,
         "source_sha256": source_sha256,
         "whole_model_eager_fallback_policy": os.environ.get("PT_HPU_USE_EAGER_FALLBACK", "1"),
         "device_module": os.environ.get("HLS_MODULE_ID"),
@@ -195,12 +217,15 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--warmup-rounds", type=int, default=2)
     parser.add_argument("--trace", action="store_true")
     parser.add_argument("--mode", choices=("baseline", "candidate"), default="baseline")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.rounds < 1:
         parser.error("Require positive rounds")
+    if args.warmup_rounds < 2:
+        parser.error("Require at least two symmetric model warmup rounds")
     if args.worker:
         worker(args)
         return
@@ -212,7 +237,8 @@ def main():
             sys.executable,
             str(Path(__file__).resolve()), "--worker", "--mode", mode, "--model", args.model, "--output",
             str(directory), "--rounds",
-            str(args.rounds)
+            str(args.rounds), "--warmup-rounds",
+            str(args.warmup_rounds)
         ]
         if args.trace and mode == "candidate":
             command.append("--trace")
@@ -237,8 +263,10 @@ def main():
         report["token_ids_equal"] = all(row["token_ids"] == first["rounds"][0]["token_ids"]
                                         for worker_report in report["workers"] for row in worker_report["rounds"])
         report["route_hit"] = candidate["route_hit"]
+        report["warm_timings_stable"] = warm_timings_stable(report["workers"])
         report["screen_valid"] = bool(report["source_control_valid"] and report["token_ids_equal"]
-                                      and report["route_hit"] and .95 <= report["baseline_return_ratio"] <= 1.05)
+                                      and report["route_hit"] and report["warm_timings_stable"]
+                                      and .95 <= report["baseline_return_ratio"] <= 1.05)
     (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps({key: value for key, value in report.items() if key != "workers"}, indent=2))
 
