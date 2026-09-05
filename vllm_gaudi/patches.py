@@ -90,6 +90,13 @@ Currently:
   version that uses FusedSDPA when the ``fsdpa_impl`` attention implementation
   is configured, providing 1.4-2x performance improvement for models that use
   transformers SDPA attention (e.g., vision encoders in Gemma4 models).
+
+* ``habana_frameworks`` FX-to-JIT stack trace lowering — graph breaks can
+  produce a valid FX ``stack_trace`` containing only a ``File ...`` line and
+  no source-code line. PyTorch's ``_parse_stack_trace`` returns ``None`` for
+  that form, but SynapseAI 1.24 dereferences ``parsed_st.file`` unconditionally
+  and aborts otherwise valid resumed graphs. Treat an unparseable trace as
+  absent debug metadata; this does not alter the lowered graph.
 """
 
 import gc
@@ -99,6 +106,34 @@ from typing import Callable, Optional
 import torch
 
 from vllm import envs
+
+
+def _patch_hpu_fx_stack_trace_parser() -> None:
+    """Ignore missing optional source metadata in resumed Dynamo graphs."""
+    try:
+        from habana_frameworks.torch.dynamo._fx_to_jit_lowering import (
+            FxToJitLowering,
+        )
+    except ImportError:
+        return
+
+    original = FxToJitLowering._get_stack_trace
+    if getattr(original, "_vllm_gaudi_safe_stack_trace", False):
+        return
+
+    def _safe_get_stack_trace(self, fx_node):
+        try:
+            return original(self, fx_node)
+        except AttributeError as exc:
+            if (
+                "'NoneType' object has no attribute 'file'" in str(exc)
+                and getattr(fx_node, "stack_trace", None)
+            ):
+                return None
+            raise
+
+    _safe_get_stack_trace._vllm_gaudi_safe_stack_trace = True
+    FxToJitLowering._get_stack_trace = _safe_get_stack_trace
 
 # NOTE: neither ``vllm.platforms.current_platform`` nor
 # ``vllm.distributed.parallel_state`` is imported at module top level — both

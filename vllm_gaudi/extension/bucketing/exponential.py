@@ -140,6 +140,17 @@ class ExponentialBucketingStrategy():
         range_for_cfg = warmup_range_with_limit(cfg, self.long_context)
         return sorted(range_for_cfg)
 
+    def get_decode_bs_range(self, cfg):
+        """Keep common power-of-two decode batches as exact graph shapes."""
+        bmin, bstep, bmax, _ = cfg
+        buckets = set(self.get_range(cfg))
+        power_of_two = 1
+        while power_of_two <= bmax:
+            if power_of_two >= bmin and (power_of_two == bmin or power_of_two % bstep == 0):
+                buckets.add(power_of_two)
+            power_of_two *= 2
+        return sorted(buckets)
+
 
 def warmup_range_with_limit(config: Tuple[int, int, int, int], long_context=False):
     """ 

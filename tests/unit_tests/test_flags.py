@@ -232,3 +232,21 @@ def test_defrag_override_respected_with_contiguous_pa():
 
     assert config.get('use_contiguous_pa') is True
     assert config.get('defrag') is False
+
+
+def test_tp2_fused_ar_norm_feature_defaults():
+    feature_values, feature_flags = get_features()
+    config = Config(feature_values, feature_flags)
+
+    assert config.get('tp2_fused_ar_norm') is False
+    assert config.get('tp2_fused_ar_norm_max_bytes') == 524288
+
+
+def test_tp2_fused_ar_norm_feature_overrides(monkeypatch):
+    monkeypatch.setenv('VLLM_HPU_TP2_FUSED_AR_NORM', 'true')
+    monkeypatch.setenv('VLLM_HPU_TP2_FUSED_AR_NORM_MAX_BYTES', '327680')
+    feature_values, feature_flags = get_features()
+    config = Config(feature_values, feature_flags)
+
+    assert config.get('tp2_fused_ar_norm') is True
+    assert config.get('tp2_fused_ar_norm_max_bytes') == 327680

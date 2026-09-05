@@ -266,6 +266,44 @@ def test_sampling_metadata_in_input_batch(device: str, batch_size: int):
 
 
 @pytest.mark.parametrize("device", CUDA_DEVICES)
+def test_selective_sampling_metadata_skips_greedy_penalty_tensors(device: str):
+    input_batch = InputBatch(
+        max_num_reqs=1,
+        max_model_len=1024,
+        max_num_batched_tokens=1024,
+        device=torch.device(device),
+        pin_memory=is_pin_memory_available(),
+        vocab_size=VOCAB_SIZE,
+        block_sizes=[1],
+        kernel_block_sizes=[1],
+    )
+    request = CachedRequestState(
+        req_id="greedy",
+        prompt_token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(temperature=0),
+        pooling_params=None,
+        mm_features=[],
+        block_ids=([], ),
+        generator=None,
+        num_computed_tokens=3,
+        output_token_ids=[4],
+    )
+    input_batch.add_request(request)
+
+    metadata = input_batch.make_selective_sampling_metadata(
+        [(request.req_id, request.output_token_ids)],
+        skip_copy=True,
+    )
+
+    assert metadata.all_greedy
+    assert metadata.no_penalties
+    assert metadata.temperature is None
+    assert metadata.frequency_penalties is None
+    assert metadata.presence_penalties is None
+    assert metadata.repetition_penalties is None
+
+
+@pytest.mark.parametrize("device", CUDA_DEVICES)
 @pytest.mark.parametrize("batch_size", [32])
 @pytest.mark.parametrize("swap_list", [((0, 1), )])
 def test_swap_states_in_input_batch(device: str, batch_size: int, swap_list: list):

@@ -2,6 +2,7 @@ from itertools import islice
 
 import torch
 from vllm.distributed import get_pp_group, tensor_model_parallel_all_gather
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.models.qwen3_next import (
     Qwen3NextAttention,
     Qwen3NextModel as UpstreamQwen3NextModel,
@@ -9,6 +10,144 @@ from vllm.model_executor.models.qwen3_next import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm_gaudi.models.utils import sequence_parallel_chunk
+
+HPU_QWEN3_LAYER_GROUP_MAX_BATCH_SIZE = 16
+
+
+def _qwen3_inner_model(model):
+    if hasattr(model, "language_model") and hasattr(model.language_model, "model"):
+        return model.language_model.model
+    return getattr(model, "model", None)
+
+
+def enable_hpu_qwen3_tp2_fused_ar_norm(model) -> int:
+    """Move dense Qwen3 row-parallel reductions to following RMSNorms.
+
+    Returns the number of all-reduce/RMSNorm boundaries enabled. No module is
+    mutated when the model does not match the supported dense topology.
+    """
+    inner_model = _qwen3_inner_model(model)
+    if not isinstance(inner_model, UpstreamQwen3NextModel):
+        return 0
+    layers = tuple(islice(inner_model.layers, inner_model.start_layer, inner_model.end_layer))
+    if not layers or inner_model.start_layer != 0:
+        return 0
+
+    row_parallel_layers = []
+    for layer in layers:
+        attention = getattr(layer, "self_attn", None)
+        output_projection = getattr(attention, "o_proj", None)
+        if output_projection is None:
+            attention = getattr(layer, "linear_attn", None)
+            output_projection = getattr(attention, "out_proj", None)
+        down_projection = getattr(getattr(layer, "mlp", None), "down_proj", None)
+        if output_projection is None or down_projection is None:
+            return 0
+        if getattr(layer, "use_attn_reduce_scatter_for_moe", False):
+            return 0
+        row_parallel_layers.extend((output_projection, down_projection))
+
+    from vllm_gaudi.distributed.tp2_fused_ar_norm import initialize_tp2_fused_ar_norm_runtime
+
+    initialize_tp2_fused_ar_norm_runtime()
+    inner_model._hpu_tp2_defer_embedding_reduce = True
+    inner_model.embed_tokens._hpu_defer_tp2_reduce = True
+    for projection in row_parallel_layers:
+        projection.reduce_results = False
+    for layer in layers:
+        layer.input_layernorm._hpu_tp2_fused_ar_norm = True
+        layer.post_attention_layernorm._hpu_tp2_fused_ar_norm = True
+    inner_model.norm._hpu_tp2_fused_ar_norm = True
+    return len(row_parallel_layers) + 1
+
+
+class HpuQwen3DecoderLayerGroup(torch.nn.Module):
+    """Run several decoder layers inside one torch.compile region."""
+
+    def __init__(
+        self,
+        layers: tuple[torch.nn.Module, ...],
+        final_norm: torch.nn.Module | None = None,
+    ):
+        super().__init__()
+        # The model's ModuleList remains the sole owner of these layers so
+        # state-dict and KV-cache layer names stay unchanged.
+        object.__setattr__(self, "_layers", layers)
+        object.__setattr__(self, "_final_norm", final_norm)
+
+    def forward(
+        self,
+        *,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        for layer in self._layers:
+            hidden_states, residual = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+        if self._final_norm is not None:
+            hidden_states, residual = self._final_norm(hidden_states, residual)
+        return hidden_states, residual
+
+
+def build_hpu_qwen3_layer_groups(
+    model: "HpuQwen3NextModel",
+    group_size: int,
+    final_norm: torch.nn.Module | None = None,
+) -> tuple[HpuQwen3DecoderLayerGroup, ...]:
+    if group_size < 1:
+        raise ValueError(f"group_size must be positive, got {group_size}")
+
+    layers = tuple(islice(model.layers, model.start_layer, model.end_layer))
+    groups = tuple(
+        HpuQwen3DecoderLayerGroup(layers[start:start + group_size]) for start in range(0, len(layers), group_size))
+    if groups and final_norm is not None:
+        object.__setattr__(groups[-1], "_final_norm", final_norm)
+    return groups
+
+
+def compile_hpu_qwen3_layer_groups(
+    model: "HpuQwen3NextModel",
+    group_size: int,
+    compile_fn,
+    final_norm: torch.nn.Module | None = None,
+) -> tuple[torch.nn.Module, ...]:
+    groups = build_hpu_qwen3_layer_groups(model, group_size, final_norm)
+    compiled_groups = tuple(compile_fn(group) for group in groups)
+    object.__setattr__(model, "_hpu_compiled_layer_groups", compiled_groups)
+    object.__setattr__(model, "_hpu_compiled_groups_include_final_norm", final_norm is not None)
+    return compiled_groups
+
+
+def can_compile_hpu_qwen3_layer_groups(
+    group_size: int,
+    tensor_parallel_size: int,
+    aux_hidden_state_layers: tuple[int, ...] | list[int] | None,
+) -> bool:
+    return (group_size > 1 and tensor_parallel_size == 1 and not aux_hidden_state_layers)
+
+
+def can_use_hpu_qwen3_layer_groups(
+    layer_groups: tuple[torch.nn.Module, ...] | None,
+    aux_hidden_state_layers: tuple[int, ...] | list[int] | None,
+    attn_metadata,
+    batch_size: int,
+) -> bool:
+    return (layer_groups is not None and not aux_hidden_state_layers and attn_metadata is not None
+            and not bool(getattr(attn_metadata, "is_prompt", False))
+            and (batch_size <= HPU_QWEN3_LAYER_GROUP_MAX_BATCH_SIZE
+                 or bool(getattr(attn_metadata, "direct_gdn_state", False))))
+
+
+def supports_hpu_qwen3_layer_group_compilation(
+    tensor_parallel_size: int,
+    tp2_fused_ar_norm: bool,
+) -> bool:
+    """Return whether grouped Qwen3 decode graphs can contain collectives."""
+    return tensor_parallel_size == 1 or (tensor_parallel_size == 2 and tp2_fused_ar_norm)
 
 
 class HpuQwen3NextModel(UpstreamQwen3NextModel):
@@ -28,6 +167,8 @@ class HpuQwen3NextModel(UpstreamQwen3NextModel):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
+            if getattr(self, "_hpu_tp2_defer_embedding_reduce", False) and inputs_embeds is not None:
+                raise RuntimeError("TP2 fused embedding reduction does not support inputs_embeds")
             hidden_states = inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
             residual = torch.zeros_like(hidden_states)
         else:
@@ -36,20 +177,38 @@ class HpuQwen3NextModel(UpstreamQwen3NextModel):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
-        for layer_idx, layer in enumerate(
-                islice(self.layers, self.start_layer, self.end_layer),
-                start=self.start_layer,
+        layer_groups = getattr(self, "_hpu_compiled_layer_groups", None)
+        attn_metadata = get_forward_context().attn_metadata
+        if can_use_hpu_qwen3_layer_groups(
+                layer_groups,
+                self.aux_hidden_state_layers,
+                attn_metadata,
+                hidden_states.shape[0],
         ):
-            hidden_states, residual = layer(
-                positions=positions,
-                hidden_states=hidden_states,
-                residual=residual,
-            )
-            self._maybe_add_hidden_state(aux_hidden_states, layer_idx + 1, hidden_states, residual)
+            for layer_group in layer_groups:
+                hidden_states, residual = layer_group(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                )
+            used_grouped_final_norm = getattr(self, "_hpu_compiled_groups_include_final_norm", False)
+        else:
+            used_grouped_final_norm = False
+            for layer_idx, layer in enumerate(
+                    islice(self.layers, self.start_layer, self.end_layer),
+                    start=self.start_layer,
+            ):
+                hidden_states, residual = layer(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                )
+                self._maybe_add_hidden_state(aux_hidden_states, layer_idx + 1, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if not used_grouped_final_norm:
+            hidden_states, _ = self.norm(hidden_states, residual)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states

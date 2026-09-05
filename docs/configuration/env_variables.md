@@ -26,12 +26,57 @@ This document lists the supported diagnostic and profiling, as well as performan
 | `VLLM_BUCKETING_FROM_FILE`   | Enables reading bucket configuration from file.              | `None`        |
 | `VLLM_ROW_PARALLEL_CHUNKS`   | Number of chunks to split input into for pipelining matmul with all-reduce in RowParallelLinear layers. Setting to a value greater than 1 enables chunking. See [Row-Parallel Chunking](../features/row_parallel_chunking.md). | `1` (disabled) |
 | `VLLM_ROW_PARALLEL_CHUNK_THRESHOLD` | Minimum number of tokens required to activate row-parallel chunking. Inputs below this threshold use the standard non-chunked path. | `8192` |
+| `VLLM_HPU_TP2_FUSED_AR_NORM` | Enables the experimental dense Qwen3.5/Qwen3-Next TP2 decode path that submits stock HCCL all-reduce and a residual-add/RMSNorm recipe as one graph-native collective boundary. The embedding reduction is deferred to the first input RMSNorm so all decode all-reduces use this boundary. Requires `PT_HPU_ENABLE_LAZY_COLLECTIVES=1`; prefill, unsupported payloads, and decode batches above 20 tokens use the standard path. | `false` |
+| `VLLM_HPU_TP2_FUSED_AR_NORM_MAX_BYTES` | Largest BF16 activation payload accepted by the experimental TP2 fused path. | `524288` |
+| `VLLM_HPU_TP2_FUSED_AR_NORM_BRIDGE` | Path to the native bridge built by `tools/communication/build_tp2_fused_ar_norm_bridge.py`; required only when `VLLM_HPU_TP2_FUSED_AR_NORM=true`. | `None` |
 | `VLLM_PROMPT_BS_BUCKET_MAX`  | Sets prefill batch size | `1` |
 | `VLLM_MULTIMODAL_BUCKETS`    | Overrides the per-model patch-count buckets used to warm up native-resolution vision towers (models where `is_batch_based=False`, e.g. Gemma4, Kimi-K2.5/K2.6, Qwen2.5/3/3.5-VL). Comma-separated list of integers. Set to `None` to disable bucketing for these models. | model-specific |
 | `VLLM_MULTIMODAL_RESOLUTIONS` | Pins explicit raw pixel resolutions (comma-separated, e.g. `1024x768,768x1024`) to warm up for native-resolution vision towers. Each entry is `WxH`, `WxHxN` (pin the count-`N` graph), or `WxHxN-M` (warm the item-count range `[N, M]`); `WxH` alone warms one graph at the `--limit-mm-per-prompt` ceiling. See [Warm-up](../features/warmup.md#multimodal-warm-up). | `None` |
 | `VLLM_MINIMAX_M3_MOE_TOKEN_TILE` | Maximum number of tokens processed per tile by the MiniMax-M3 dense SwiGLU-OAI expert path. Non-positive values disable tiling. | `512` |
 | `VLLM_MINIMAX_M3_MOE_DECODE_GATHER` | Enables the MiniMax-M3 routed-expert gather path for low-token decode. Set to `0` or `false` to use the dense expert path. | `true` |
 | `VLLM_MINIMAX_M3_MOE_GATHER_MAX_TOKENS` | Maximum token count for the MiniMax-M3 routed-expert gather path. Larger batches use the dense expert path. | `16` |
+| `VLLM_GDN_CHUNK_SIZE` | Overrides the GDN prefill chunk size. Set to a positive multiple of 32; `0` keeps the model-provided value or the HPU default. | `0` |
+| `VLLM_GDN_NEUMANN_ITERS` | Sets the iteration budget for the approximate GDN triangular solve. Lower values can improve prefill speed but require model-level quality validation. | `14` |
+| `VLLM_GDN_FUSED_STATE_MATMUL` | Fuses the GDN phase-B output and recurrent-state projections into one larger matrix multiplication per chunk. | `false` |
+| `VLLM_GDN_DEFERRED_OUTPUT_ADD` | Defers GDN phase-B output accumulation until after the recurrent loop, avoiding in-place writes to chunk views in compiled HPU graphs. | `false` |
+| `VLLM_GDN_RECURSIVE_SOLVER_BASE` | Enables recursive block inversion for the GDN triangular solve. Set to `0` to disable it or a power-of-two base size of which the chunk size is a power-of-two multiple. | `0` |
+| `VLLM_GDN_COMPACT_REPEATED_KKT` | Computes the GDN KKT product once per unique key head when value heads repeat the same key heads. | `false` |
+| `VLLM_GDN_COMPACT_REPEATED_LOCAL_ATTN` | Computes the phase-B local Q/K product once per unique Q/K head, then combines it with each repeated value head's causal decay. | `false` |
+| `VLLM_GDN_COMPILED_QK_L2NORM` | Keeps GDN Q/K L2 normalization inside the compiled prefill graph. Leave disabled on HPU compiler versions where this path has not been validated. | `false` |
+| `VLLM_GDN_FUSED_RMSNORM_GATED` | Uses Habana FusedRMSNorm for Qwen GDN output normalization before the output gate during prefill. Decode is unchanged. | `false` |
+| `VLLM_GDN_FLASHQLA` | Uses the experimental Gaudi-native FlashQLA similarity transforms, factorized local decay, and compact KKT layout for GDN prefill. This does not load FlashQLA's CUDA kernels. Enable `VLLM_GDN_FUSED_STATE_MATMUL` and `VLLM_GDN_DEFERRED_OUTPUT_ADD` for the validated fast path. | `false` |
+| `VLLM_GDN_FLASHQLA_FACTORIZE_PHASE_B` | Experimental factorization of FlashQLA's local gate decay in phase B. Disabled because separate positive gate factors can overflow for strongly decaying chunks. | `false` |
+| `VLLM_GDN_FLASHQLA_FP32_SCALING` | Computes the gate-free phase-A diagonal scale products in FP32 before returning to BF16 MME inputs and outputs. This reduces the reformulation's numerical drift without moving its BMMs off MME. | `false` |
+| `VLLM_GDN_BF16_BMM_F32` | Uses the experimental Synapse BF16-input, FP32-output batch GEMM for the GDN recurrent state projection. | `false` |
+| `VLLM_GDN_SOLVE_BF16_BMM_F32` | Uses the experimental BF16-input, FP32-output batch GEMM for recursive GDN KKT block merges while retaining the base 16x16 inverse in FP32. | `false` |
+| `VLLM_GDN_BF16_BMM_F32_EXTENSION` | Path to the private-ABI registration extension used by `VLLM_GDN_BF16_BMM_F32`. | empty |
+| `VLLM_GDN_QWEN38_NATIVE_QK_PREP` | Uses the fixed-shape Gaudi2 TPC kernel to fuse Qwen3.8 TP1 prompt Q/K FP32 normalization, head expansion, and final-layout writes. Decode is unchanged. | `false` |
+| `VLLM_GDN_QWEN38_BF16_QK` | Makes the native Qwen3.8 Q/K kernel write its expanded 48-head output directly in BF16, matching the optimized GDN input dtype and avoiding a large FP32 intermediate. Requires `VLLM_GDN_QWEN38_NATIVE_QK_PREP`. | `false` |
+| `VLLM_GDN_QWEN38_COMPACT_QK` | Keeps native Qwen3.8 Q/K in their 16-head BF16 layout through the GDN core and maps the 48 value heads as grouped views. Requires `VLLM_GDN_QWEN38_NATIVE_QK_PREP`; supersedes `VLLM_GDN_QWEN38_BF16_QK`. | `false` |
+| `VLLM_GDN_QWEN38_NATIVE_COMPACT_KKT` | Uses the Gaudi2 TPC compact-KKT producer for Qwen3.8 chunk-64 prefill. Requires compact Q/K and the native Q/K extension. | `false` |
+| `VLLM_GDN_COMPACT_QK_FACTOR_GATE` | Experimental compact-Q/K phase-A dataflow that applies each value head's gate to the smaller KKT coefficient matrix before the shared physical K-head multiplication. | `false` |
+| `VLLM_GDN_NATIVE_RECURRENT_SCAN` | Lowers the fused BF16 phase-B recurrent projection and additions as one mixed MME/TPC Synapse subgraph. Requires `VLLM_GDN_FUSED_STATE_MATMUL`, BF16 state, and `VLLM_GDN_BF16_BMM_F32_EXTENSION`. | `false` |
+| `VLLM_GDN_QWEN38_NATIVE_QK_PREP_EXTENSION` | Path to the built PyTorch registration extension used by `VLLM_GDN_QWEN38_NATIVE_QK_PREP`. Its TPC perf library must also be present in `GC_KERNEL_PATH`. | empty |
+| `VLLM_HPU_DYNAMIC_QUANT_CGUID` | Uses Habana `calculate_scale_for_cast` for runtime dynamic per-token FP8 activation scales on sufficiently large prefill graphs, while preserving the ordinary path's epsilon for zero and tiny rows. Model-load block-to-channel weight conversion retains the ordinary `abs().amax()` path. | `false` |
+| `VLLM_HPU_DYNAMIC_QUANT_CGUID_MIN_TOKENS` | Minimum flattened token count for `VLLM_HPU_DYNAMIC_QUANT_CGUID`. Smaller prompt and decode graphs retain the ordinary reduction path. | `2048` |
+| `VLLM_HPU_EXPLICIT_SIGMOID_SILU` | Expresses long-prompt SwiGLU as `gate * sigmoid(gate) * up`, allowing the HPU graph compiler to fuse the activation with its products and following dynamic FP8 quantization. | `false` |
+| `VLLM_HPU_EXPLICIT_SIGMOID_SILU_MIN_TOKENS` | Minimum flattened token count for explicit-sigmoid SwiGLU. Smaller prompt and decode graphs retain the ordinary HPU SiLU path. | `2048` |
+| `VLLM_GDN_HPU_CAUSAL_CONV1D` | Uses Habana's native causal-conv1d forward op for GDN prompt convolution and SiLU, then explicitly persists its functional cache output. Decode is unchanged. | `false` |
+| `VLLM_GDN_TOKEN_MAJOR_CAUSAL_CONV1D` | Keeps the compiled PyTorch GDN prompt convolution in token-major layout, avoiding the packed activation's channel-major round trip. Decode is unchanged. | `false` |
+| `VLLM_HPU_FLASHINFER_GDN` | Enables the in-tree FlashInfer-compatible packed GDN decode path for Qwen hybrid models. In `auto`, only the measured contiguous-state fast path is selected; other layouts use the existing vLLM implementation. | `false` |
+| `VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE` | Enables the qualified Qwen3.8 TP1 fused direct-state decode recipe for batches 1, 2, 4, 8, 16, and 32. Unsupported shapes retain the existing packed GDN path. When unset, this follows `VLLM_HPU_FLASHINFER_GDN`. | `false` (`true` with FlashInfer GDN) |
+| `VLLM_HPU_FLASHINFER_GDN_PREFILL` | Enables the offline-promoted FlashQLA graph tactic for Qwen3.8 GDN prefill. Unsupported shapes retain the general HPU path. When unset, this follows `VLLM_HPU_FLASHINFER_GDN`. | `false` (`true` with FlashInfer GDN) |
+| `VLLM_HPU_GDN_DIRECT_STATE` | Uses group-major compact recurrent-state spans when a decode bucket is full, prefix caching is disabled, and request slots are contiguous. | `true` |
+| `VLLM_HPU_CGUID_DYNAMIC_QUANT` | Uses Gaudi's fused scale-calculation CGUID for decode-sized per-token dynamic FP8 quantization. Large prefill matrices retain the existing reduction path to preserve its numerical behavior. When unset, this follows `VLLM_HPU_FLASHINFER_GDN`. | `false` (`true` with FlashInfer GDN) |
+| `VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS` | Maximum flattened row count eligible for CGUID dynamic quantization. Keep this below the smallest prefill token bucket; increasing it can change prefill graph fusion. | `32` |
+| `VLLM_HPU_FUSED_GREEDY_LOGITS` | Fuses hidden-state selection, the LM-head projection, FP32 conversion, and argmax into one compiled decode region for plain greedy requests. Requests using logprobs, penalties, token masks, logit processors, structured output, or speculative decoding retain the general sampler path. | `false` |
+| `FLASHINFER_GAUDI_BACKEND` | Selects `auto`, `public`, `bridge`, or `pytorch` for FlashInfer-Gaudi ops. Forced unavailable native backends fail before mutating recurrent state. | `auto` |
+| `FLASHINFER_GAUDI_STATE_DTYPE` | Selects the requested recurrent-state precision. `fp32` is the production default; `bf16` remains experimental until model-quality validation succeeds. | `fp32` |
+| `FLASHINFER_GAUDI_NATIVE_LIBRARY` | Optional path-list of native host-extension libraries to load. Packaged libraries are discovered automatically. | unset |
+| `FLASHINFER_GAUDI_ENABLE_COMPAT_SHIM` | Exposes supported modules under the `flashinfer` namespace when explicitly enabled and the official package is absent. vLLM-Gaudi does not require this shim. | `false` |
+| `FLASHINFER_GAUDI_ENABLE_PUBLIC_AUTO` | Promotes a loaded public TPC GDN tactic into `auto` selection. Keep disabled until the exact software stack passes quality and end-to-end performance gates. | `false` |
+| `FLASHINFER_GAUDI_ENABLE_BRIDGE_AUTO` | Allows `auto` to consider the ABI-private bridge backend after its version and quality gates pass. | `false` |
+| `VLLM_GAUDI_BUILD_FLASHINFER` | Controls native builds during packaging: `auto` builds when both the TPC compiler and Gaudi PyTorch package exist; `1` requires a successful build; `0` installs reference code only. | `auto` |
 | `VLLM_HPU_TRITON_MODE` | Selects Gaudi2-native Triton paths: `off`, performance-safe `hybrid`, or fail-closed `strict`. Hybrid uses only paths that passed the relevant eager/fullgraph gate; strict also exposes ungated kernels for correctness and A/B performance CI. | `off` |
 | `VLLM_HPU_TRITON_CACHE_DIR` | Overrides the private, content-addressed TPC ELF cache used by the Triton/Bridge ABI. | `None` |
 | `VLLM_HPU_TRITON_BLOCK_SIZE` | Logical Triton block size used by the initial 2048-bit TPC elementwise kernels. | `256` |
@@ -99,6 +144,16 @@ must include the GDN reinplace compiler pass; initialization rejects stale
 Python package overlays instead of running the functionalized full-cache-copy
 graph. SiLU-and-mul remains a strict-mode candidate.
 
+Triton and FlashInfer-Gaudi coexist in the same checkout. With Triton `off`,
+the existing FlashInfer switches select its graph tactics or the general HPU
+implementation. Triton `hybrid` also preserves that GDN selection. Triton
+`strict` takes precedence for recurrent decode and requires identical load/store
+state-index tensors; it cannot silently execute FlashInfer instead. The known
+recipe-reentry issue keeps split convolution kernels out of model execution;
+they remain available through the standalone diagnostic. TP2 collective/RMSNorm
+fusion retains ownership of its communication boundary before local Triton
+RMSNorm is considered.
+
 Use `VLLM_BUCKETING_STRATEGY=exp` for the default exponential warm-up, `VLLM_BUCKETING_STRATEGY=lin` for explicitly configured linear ranges, or `VLLM_BUCKETING_STRATEGY=pad` for padding-aware ranges with absolute and relative padding limits.
 
 Leave `VLLM_EXPONENTIAL_BUCKETING` unset when using `VLLM_BUCKETING_STRATEGY`. The legacy flag is checked for backward compatibility and still overrides the selected strategy when present.
@@ -117,6 +172,7 @@ To enter developer mode use `VLLM_DEVELOPER_MODE`:
 | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- |
 | `VLLM_HANDLE_TOPK_DUPLICATES` | Handles duplicates outside top-k.                                                                                                                                                             | `false`       |
 | `VLLM_CONFIG_HIDDEN_LAYERS`   | Sets the number of hidden layers to run per HPUGraph for model splitting among hidden layers when TP is 1. It improves throughput by reducing inter-token latency limitations in some models. | `1`           |
+| `VLLM_HPU_QWEN3_COMPILE_LAYER_GROUP_SIZE` | Compiles consecutive Qwen3-Next/Qwen3.5 decoder layers as one regional graph during decode and folds the final RMSNorm into the last group. Prefill remains per-layer. Values greater than 1 require non-eager execution and are supported with TP=1, or TP=2 when `VLLM_HPU_TP2_FUSED_AR_NORM=true`. Decode batches above 16 use grouped execution only with the validated direct GDN state layout; other layouts retain per-layer compilation. | `1` |
 | `VLLM_WORKER_MULTIPROC_METHOD` | Sets the Python `multiprocessing` start method used by the `mp` distributed executor backend when launching worker processes. The upstream default is `fork`. On HPU, it is automatically overridden to `spawn` with a warning because forked child processes inherit HPU driver state and can hang on exit. The override is applied when `--distributed-executor-backend` is `mp` or `uni`. With `uni`, no subprocess is created, so the value has no practical effect. With `external_launcher` and `ray`, workers are not started through Python `multiprocessing`, so the value is irrelevant. Set `VLLM_WORKER_MULTIPROC_METHOD=spawn` explicitly to suppress the auto-override warning, or set it to `fork` to opt out of the override, which is not recommended. | `spawn` on HPU (auto-overridden from upstream `fork`) |
 
 ## Heterogeneous KV Transfer (NIXL)

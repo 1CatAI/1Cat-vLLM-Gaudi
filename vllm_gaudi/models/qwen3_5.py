@@ -4,14 +4,35 @@ import torch
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention
 from vllm.forward_context import get_forward_context
 
+import vllm_gaudi.envs as gaudi_envs
 from vllm_gaudi.ops.causal_conv1d_pytorch import (
     hpu_causal_conv1d_fn,
+    hpu_causal_conv1d_fn_token_major,
     hpu_causal_conv1d_update,
 )
 from vllm_gaudi.ops.hpu_gdn_pytorch import (
     hpu_chunk_gated_delta_rule,
     hpu_fused_gdn_gating,
     hpu_fused_recurrent_gated_delta_rule,
+    hpu_fused_rmsnorm_gated,
+    resolve_hpu_gdn_chunk_size,
+    resolve_hpu_gdn_compact_repeated_kkt,
+    resolve_hpu_gdn_compact_repeated_local_attn,
+    resolve_hpu_gdn_compiled_qk_l2norm,
+    resolve_hpu_gdn_fused_rmsnorm_gated,
+    resolve_hpu_gdn_fused_state_matmul,
+    resolve_hpu_gdn_neumann_iters,
+    resolve_hpu_gdn_recursive_solver_base,
+)
+from vllm_gaudi.ops.qwen38_native_qk import (
+    load_qwen38_native_qk_prep,
+    qwen38_native_qk_prep,
+    validate_qwen38_native_qk_shape,
+)
+from vllm_gaudi.ops.flashinfer_gaudi_adapter import (
+    maybe_run_gdn_decode_packed,
+    maybe_run_gdn_fused_decode_step,
+    maybe_run_gdn_prefill,
 )
 
 # Import only for enabled runs. The runtime keeps small hybrid decode buckets
@@ -104,8 +125,20 @@ def _save_ssm_state(core_attn_out, final_state, ssm_state, state_indices):
     core_attn_out as a pass-through so the compiled graph consumes
     the call — HPU drops dynamo-disabled calls whose results are unused.
     """
-    safe_si = torch.remainder(state_indices, ssm_state.shape[0]).long()
-    ssm_state.index_copy_(0, safe_si, final_state.to(device=ssm_state.device, dtype=ssm_state.dtype))
+    state_indices = state_indices.reshape(-1).to(device=ssm_state.device, dtype=torch.long)
+    if state_indices.numel() == 1:
+        # A real single-request prefill always owns its only state slot. Keep
+        # this hot path to one index operation per GDN layer; materializing
+        # nonzero(valid) here adds a device/host synchronization.
+        safe_si = torch.remainder(state_indices, ssm_state.shape[0])
+        ssm_state.index_copy_(0, safe_si, final_state.to(device=ssm_state.device, dtype=ssm_state.dtype))
+        return core_attn_out
+    valid = (state_indices >= 0) & (state_indices < ssm_state.shape[0])
+    valid_positions = torch.nonzero(valid, as_tuple=False).reshape(-1)
+    if valid_positions.numel() > 0:
+        safe_si = state_indices.index_select(0, valid_positions)
+        state_rows = final_state.index_select(0, valid_positions).to(device=ssm_state.device, dtype=ssm_state.dtype)
+        ssm_state.index_copy_(0, safe_si, state_rows)
     return core_attn_out
 
 
@@ -116,16 +149,41 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # cache_group_idx: set later by model runner for hybrid cache
         # lookup.  Stored as tensor so torch.compile treats it as dynamic.
         self.cache_group_idx = None
+        self.compact_state_group_offset = None
+        self.compact_state_group_count = None
 
-        # mamba_chunk_size: use explicit config value or default to 128
-        # for HPU bucket alignment.
-        hf_text_config = getattr(self.model_config, "hf_text_config", None)
-        has_explicit = (hf_text_config is not None and (getattr(hf_text_config, "mamba_chunk_size", None) is not None
-                                                        or getattr(hf_text_config, "chunk_size", None) is not None))
-        self.mamba_chunk_size = (self.model_config.get_mamba_chunk_size() if has_explicit else 128)
+        self.mamba_chunk_size, _ = resolve_hpu_gdn_chunk_size(self.model_config)
+        self.gdn_fused_state_matmul = resolve_hpu_gdn_fused_state_matmul()
+        self.gdn_neumann_iters = resolve_hpu_gdn_neumann_iters()
+        self.gdn_recursive_solver_base = resolve_hpu_gdn_recursive_solver_base()
+        self.gdn_compact_repeated_kkt = resolve_hpu_gdn_compact_repeated_kkt()
+        self.gdn_compact_repeated_local_attn = (resolve_hpu_gdn_compact_repeated_local_attn())
+        self.gdn_compiled_qk_l2norm = resolve_hpu_gdn_compiled_qk_l2norm()
+        self.gdn_fused_rmsnorm_gated = resolve_hpu_gdn_fused_rmsnorm_gated()
 
         self.qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
         self.z_size = self.value_dim // self.tp_size
+        self.gdn_native_qk_prep = load_qwen38_native_qk_prep()
+        self.gdn_compact_qk_input = gaudi_envs.VLLM_GDN_QWEN38_COMPACT_QK
+        self.gdn_native_compact_kkt = (gaudi_envs.VLLM_GDN_QWEN38_NATIVE_COMPACT_KKT)
+        self.gdn_compact_qk_factor_gate = (gaudi_envs.VLLM_GDN_COMPACT_QK_FACTOR_GATE)
+        if self.gdn_compact_qk_factor_gate and not self.gdn_compact_qk_input:
+            raise ValueError("VLLM_GDN_COMPACT_QK_FACTOR_GATE requires compact Q/K.")
+        if self.gdn_compact_qk_input and not self.gdn_native_qk_prep:
+            raise ValueError("VLLM_GDN_QWEN38_COMPACT_QK requires native Q/K preparation.")
+        if self.gdn_native_compact_kkt and not self.gdn_compact_qk_input:
+            raise ValueError("VLLM_GDN_QWEN38_NATIVE_COMPACT_KKT requires compact Q/K.")
+        self.gdn_token_major_causal_conv1d = (gaudi_envs.VLLM_GDN_TOKEN_MAJOR_CAUSAL_CONV1D)
+        self.gdn_native_qk_head_repeat = None
+        if self.gdn_native_qk_prep:
+            self.gdn_native_qk_head_repeat = validate_qwen38_native_qk_shape(
+                tp_size=self.tp_size,
+                qkv_width=self.qkv_size,
+                key_width=self.key_dim // self.tp_size,
+                value_width=self.value_dim // self.tp_size,
+                key_head_dim=self.head_k_dim,
+                value_head_dim=self.head_v_dim,
+            )
 
         # The split TPC kernels vector-load one convolution tap across channels.
         # Materialize that tap-major layout once while the checkpoint loader
@@ -183,13 +241,9 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         value = value.reshape(1, value.size(0), -1, self.head_v_dim).contiguous()
         return query, key, value
 
-    def _resolve_state_indices(self, attn_metadata):
-        """Resolve load_indices_tensor, handling 2-D cache-group case.
-
-        For Qwen 3.5 (GDN), load and store indices are identical
-        so using load_indices_tensor is sufficient.
-        """
-        indices = attn_metadata.load_indices_tensor
+    def _resolve_state_indices(self, attn_metadata, attribute):
+        """Resolve one state-index tensor, handling 2-D cache groups."""
+        indices = getattr(attn_metadata, attribute, None)
         if indices is not None and indices.dim() > 1:
             cg = self.cache_group_idx
             assert cg is not None
@@ -205,10 +259,18 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
-            return (False, None, None, None, None, None, None, 0, 0, 0, 0, None)
+            return (False, None, None, None, None, None, None, None, 0, 0, 0, 0, None, False)
 
         is_prompt = bool(getattr(attn_metadata, "is_prompt", False))
-        state_indices = self._resolve_state_indices(attn_metadata)
+        load_state_indices = self._resolve_state_indices(attn_metadata, "load_indices_tensor")
+        store_state_indices = self._resolve_state_indices(attn_metadata, "store_indices_tensor")
+        if not getattr(self.cache_config, "enable_prefix_caching", False):
+            # The scheduler constructs equivalent load/store tensors in this
+            # mode. Preserve object identity so single-index native kernels
+            # can be selected without a device-side equality synchronization.
+            store_state_indices = load_state_indices
+        elif store_state_indices is None:
+            store_state_indices = load_state_indices
 
         conv_state = self.kv_cache[0]
         ssm_state = self.kv_cache[1]
@@ -216,9 +278,10 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         query_start_loc = attn_metadata.query_start_loc_p
         has_initial_state = getattr(attn_metadata, "has_initial_states_p", None)
         padding_mask_flat = getattr(attn_metadata, "padding_mask_flat", None)
+        direct_gdn_state = bool(getattr(attn_metadata, "direct_gdn_state", False))
 
         if not is_prompt:
-            num_decodes = (state_indices.numel() if state_indices is not None else
+            num_decodes = (load_state_indices.numel() if load_state_indices is not None else
                            (query_start_loc.numel() - 1 if query_start_loc is not None else num_tokens))
         else:
             num_decodes = 0
@@ -229,17 +292,31 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         prefill_num_seqs = 0
         prefill_seq_len = 0
         initial_state = None
-        if is_prompt and state_indices is not None:
-            prefill_num_seqs = int(state_indices.numel())
+        if is_prompt and load_state_indices is not None:
+            prefill_num_seqs = int(load_state_indices.numel())
             prefill_seq_len = (num_tokens // prefill_num_seqs if prefill_num_seqs > 0 else 0)
-            initial_state = ssm_state[state_indices].contiguous()
+            if prefill_num_seqs == 1:
+                # Avoid three validity-mask kernels in every GDN layer for
+                # the latency-critical one-request prefill path.
+                initial_state = ssm_state[load_state_indices].contiguous()
+            else:
+                safe_load_indices = torch.where(
+                    (load_state_indices >= 0) & (load_state_indices < ssm_state.shape[0]),
+                    load_state_indices,
+                    torch.zeros_like(load_state_indices),
+                ).long()
+                initial_state = ssm_state.index_select(0, safe_load_indices).contiguous()
             if has_initial_state is not None:
-                # Avoid scatter_nd from boolean indexing
-                mask = has_initial_state.bool().view(-1, 1, 1, 1).to(initial_state.dtype)
-                initial_state = initial_state * mask
+                mask = has_initial_state.bool().view(-1, 1, 1, 1)
+                initial_state = torch.where(
+                    mask,
+                    initial_state,
+                    torch.zeros_like(initial_state),
+                )
 
-        return (is_prompt, conv_state, ssm_state, state_indices, query_start_loc, has_initial_state, padding_mask_flat,
-                num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len, initial_state)
+        return (is_prompt, conv_state, ssm_state, load_state_indices, store_state_indices, query_start_loc,
+                has_initial_state, padding_mask_flat, num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len,
+                initial_state, direct_gdn_state)
 
     def forward(
         self,
@@ -260,9 +337,9 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         num_tokens = hidden_states.size(0)
 
         # === Metadata extraction (natural graph break) ===============
-        (is_prompt, conv_state, ssm_state, state_indices, query_start_loc, has_initial_state, padding_mask_flat,
-         num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len,
-         initial_state) = self._extract_metadata(num_tokens)
+        (is_prompt, conv_state, ssm_state, load_state_indices, store_state_indices, query_start_loc, has_initial_state,
+         padding_mask_flat, num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len, initial_state,
+         direct_gdn_state) = self._extract_metadata(num_tokens)
 
         # === Part 1: Input Projection ================================
         if hasattr(self, 'in_proj_qkv'):
@@ -314,54 +391,113 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             g, beta = hpu_fused_gdn_gating(self.A_log, a, b, self.dt_bias)
 
             conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
-            mixed_qkv_conv = hpu_causal_conv1d_fn(
-                x=mixed_qkv.transpose(0, 1),
-                weight=conv_weights,
-                bias=self.conv1d.bias,
-                activation=self.activation,
-                conv_states=conv_state,
-                has_initial_state=has_initial_state,
-                cache_indices=state_indices,
-                block_idx_first_scheduled_token=None,
-                block_idx_last_scheduled_token=None,
-                initial_state_idx=None,
-                query_start_loc=query_start_loc,
-                block_size_to_align=mamba_block_size,
-                num_computed_tokens=None,
-                metadata=None,
-                is_prompt=True,
-            ).transpose(0, 1)
+            if self.gdn_token_major_causal_conv1d:
+                mixed_qkv_conv = hpu_causal_conv1d_fn_token_major(
+                    x=mixed_qkv,
+                    weight=conv_weights,
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                    conv_states=conv_state,
+                    has_initial_state=has_initial_state,
+                    cache_indices=load_state_indices,
+                    query_start_loc=query_start_loc,
+                    block_size_to_align=mamba_block_size,
+                    is_prompt=True,
+                )
+            else:
+                mixed_qkv_conv = hpu_causal_conv1d_fn(
+                    x=mixed_qkv.transpose(0, 1),
+                    weight=conv_weights,
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                    conv_states=conv_state,
+                    has_initial_state=has_initial_state,
+                    cache_indices=load_state_indices,
+                    block_idx_first_scheduled_token=None,
+                    block_idx_last_scheduled_token=None,
+                    initial_state_idx=None,
+                    query_start_loc=query_start_loc,
+                    block_size_to_align=mamba_block_size,
+                    num_computed_tokens=None,
+                    metadata=None,
+                    is_prompt=True,
+                ).transpose(0, 1)
 
             if token_mask_flat is not None:
                 mixed_qkv_conv = mixed_qkv_conv * token_mask_flat
 
-            query, key, value = self.rearrange_mixed_qkv(mixed_qkv_conv)
+            if self.gdn_native_qk_prep:
+                query, key = qwen38_native_qk_prep(mixed_qkv_conv)
+                query = query.unsqueeze(0)
+                key = key.unsqueeze(0)
+                value_offset = 2 * (self.key_dim // self.tp_size)
+                value = mixed_qkv_conv.narrow(
+                    -1,
+                    value_offset,
+                    self.value_dim // self.tp_size,
+                ).reshape(
+                    1,
+                    mixed_qkv_conv.size(0),
+                    self.num_v_heads // self.tp_size,
+                    self.head_v_dim,
+                ).contiguous()
+                use_qk_l2norm_in_kernel = False
+            else:
+                query, key, value = self.rearrange_mixed_qkv(mixed_qkv_conv)
+                use_qk_l2norm_in_kernel = True
 
             if token_mask_flat is not None:
                 token_mask_h = token_mask_flat.view(1, -1, 1).to(dtype=g.dtype)
                 g = g * token_mask_h
                 beta = beta * token_mask_h
 
-            core_attn_out_result, final_state = hpu_chunk_gated_delta_rule(
+            flashinfer_prefill_result = maybe_run_gdn_prefill(
                 q=query,
                 k=key,
                 v=value,
-                g=g,
+                log_decay=g,
                 beta=beta,
                 initial_state=initial_state,
                 output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
                 chunk_size=self.mamba_chunk_size,
                 prefill_num_seqs=prefill_num_seqs,
                 prefill_seq_len=prefill_seq_len,
+                scale=self.head_k_dim**-0.5,
             )
+            if flashinfer_prefill_result is not None:
+                core_attn_out_result, final_state = flashinfer_prefill_result
+            else:
+                core_attn_out_result, final_state = hpu_chunk_gated_delta_rule(
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                    chunk_size=self.mamba_chunk_size,
+                    prefill_num_seqs=prefill_num_seqs,
+                    prefill_seq_len=prefill_seq_len,
+                    neumann_iters=self.gdn_neumann_iters,
+                    fused_state_matmul=self.gdn_fused_state_matmul,
+                    recursive_solver_base=self.gdn_recursive_solver_base,
+                    compact_repeated_kkt=self.gdn_compact_repeated_kkt,
+                    compile_qk_l2norm=self.gdn_compiled_qk_l2norm,
+                    qk_head_repeat_override=self.gdn_native_qk_head_repeat,
+                    compact_repeated_local_attn=self.gdn_compact_repeated_local_attn,
+                    preserve_compact_qk=self.gdn_compact_qk_input,
+                    compact_qk_factor_gate=self.gdn_compact_qk_factor_gate,
+                )
+            assert final_state is not None
             # State save in dynamo-disabled wrapper — index_copy_ is
             # silently dropped by HPU torch.compile on aliased tensors.
             core_attn_out_result = _save_ssm_state(
                 core_attn_out_result,
                 final_state,
                 ssm_state,
-                state_indices,
+                store_state_indices,
             )
 
             non_spec_out = core_attn_out_result.squeeze(0)
@@ -369,58 +505,105 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         else:
             # === Part 2b: Decode =====================================
-            conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
-            triton_out = _try_triton_gdn_decode_conv_packed(
-                conv_state,
-                ssm_state,
-                mixed_qkv,
-                a,
-                b,
-                self.A_log,
-                (self._triton_dt_bias_f32 if self._triton_dt_bias_ready else self.dt_bias),
-                state_indices,
-                (self._triton_conv_weight_t if self._triton_conv_weight_ready else None),
+            selected_conv_state = conv_state
+            direct_conv_state = False
+            if (direct_gdn_state and self.compact_state_group_count is not None and self.compact_state_group_count > 0
+                    and self.compact_state_group_offset is not None):
+                group_span = (conv_state.shape[0] - 2) // self.compact_state_group_count
+                if num_decodes <= group_span:
+                    state_start = self.compact_state_group_offset * group_span + 1
+                    selected_conv_state = conv_state.narrow(0, state_start, num_decodes)
+                    direct_conv_state = True
+            conv_weights = self.conv1d.weight.view(
+                self.conv1d.weight.size(0),
+                self.conv1d.weight.size(2),
             )
-            if triton_out is None:
+            # Strict decode must validate the mutation contract before convolution
+            # changes its cache. Other modes preserve the mainline graph tactics.
+            if _triton_gaudi_mode == "strict" and (load_state_indices is None
+                                                   or load_state_indices is not store_state_indices):
+                raise RuntimeError("Triton strict GDN requires identical load/store state-index tensors")
+            flashinfer_result = None
+            if _triton_gaudi_mode != "strict":
+                flashinfer_result = maybe_run_gdn_fused_decode_step(
+                    mixed_qkv=mixed_qkv,
+                    a=a,
+                    b=b,
+                    A_log=self.A_log,
+                    dt_bias=self.dt_bias,
+                    conv_state=selected_conv_state,
+                    conv_weight=conv_weights,
+                    conv_bias=self.conv1d.bias,
+                    ssm_state=ssm_state,
+                    load_state_indices=load_state_indices,
+                    direct_conv_state=direct_conv_state,
+                    direct_gdn_state=direct_gdn_state,
+                    direct_state_group_count=self.compact_state_group_count,
+                    direct_state_group_offset=self.compact_state_group_offset,
+                    scale=self.head_k_dim**-0.5,
+                )
+            if flashinfer_result is None:
+                if _triton_gaudi_mode != "strict":
+                    g, beta = hpu_fused_gdn_gating(self.A_log, a, b, self.dt_bias)
                 mixed_qkv_conv = hpu_causal_conv1d_update(
                     x=mixed_qkv,
-                    conv_state=conv_state,
+                    conv_state=selected_conv_state,
                     weight=conv_weights,
                     bias=self.conv1d.bias,
                     activation=self.activation,
-                    conv_state_indices=(state_indices[:num_decodes] if state_indices is not None else state_indices),
+                    conv_state_indices=(None if direct_conv_state else (
+                        load_state_indices[:num_decodes] if load_state_indices is not None else load_state_indices)),
                     block_idx_last_scheduled_token=None,
                     initial_state_idx=None,
                     query_start_loc=query_start_loc,
                     validate_data=False,
+                    direct_state_layout=direct_conv_state,
                 )
-                triton_out = _try_triton_gdn_decode_packed(
-                    ssm_state,
-                    mixed_qkv_conv,
-                    a,
-                    b,
-                    self.A_log,
-                    (self._triton_dt_bias_f32 if self._triton_dt_bias_ready else self.dt_bias),
-                    state_indices,
-                )
-            if triton_out is None:
-                g, beta = hpu_fused_gdn_gating(self.A_log, a, b, self.dt_bias)
-                query, key, value = self.rearrange_mixed_qkv(mixed_qkv_conv)
-
-                core_attn_out_result, _ = \
-                    hpu_fused_recurrent_gated_delta_rule(
-                        q=query, k=key, v=value, g=g, beta=beta,
+                if _triton_gaudi_mode == "strict":
+                    triton_out = _try_triton_gdn_decode_packed(
+                        ssm_state,
+                        mixed_qkv_conv,
+                        a,
+                        b,
+                        self.A_log,
+                        self._triton_dt_bias_f32 if self._triton_dt_bias_ready else self.dt_bias,
+                        load_state_indices,
+                    )
+                    if triton_out is None:
+                        raise RuntimeError("Triton strict GDN did not select a recurrent kernel")
+                    flashinfer_result = (triton_out.unsqueeze(0), ssm_state)
+                else:
+                    flashinfer_result = maybe_run_gdn_decode_packed(
+                        mixed_qkv=mixed_qkv_conv,
+                        log_decay=g,
+                        beta=beta,
+                        state_pool=ssm_state,
+                        load_state_indices=load_state_indices,
+                        store_state_indices=store_state_indices,
+                        use_qk_l2norm=True,
+                        scale=self.head_k_dim**-0.5,
+                        direct_state_layout=direct_gdn_state,
+                        direct_state_group_count=self.compact_state_group_count,
+                        direct_state_group_offset=self.compact_state_group_offset,
+                    )
+                if flashinfer_result is None:
+                    query, key, value = self.rearrange_mixed_qkv(mixed_qkv_conv)
+                    core_attn_out_result, _ = hpu_fused_recurrent_gated_delta_rule(
+                        q=query,
+                        k=key,
+                        v=value,
+                        g=g,
+                        beta=beta,
                         initial_state=ssm_state,
                         inplace_final_state=True,
-                        cu_seqlens=(
-                            query_start_loc[:num_decodes + 1]
-                            if query_start_loc is not None else None),
-                        ssm_state_indices=state_indices,
+                        cu_seqlens=(query_start_loc[:num_decodes + 1] if query_start_loc is not None else None),
+                        ssm_state_indices=load_state_indices,
                         use_qk_l2norm_in_kernel=True,
                     )
-                non_spec_out = core_attn_out_result.squeeze(0)
-            else:
-                non_spec_out = triton_out
+            if flashinfer_result is not None:
+                core_attn_out_result, _ = flashinfer_result
+
+            non_spec_out = core_attn_out_result.squeeze(0)
             if non_spec_out.shape[0] == core_attn_out.shape[0]:
                 core_attn_out.copy_(non_spec_out)
             else:
@@ -431,7 +614,16 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         z_shape_og = z.shape
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
-        core_attn_out = self.norm(core_attn_out, z)
+        if is_prompt and self.gdn_fused_rmsnorm_gated:
+            core_attn_out = hpu_fused_rmsnorm_gated(
+                core_attn_out,
+                z,
+                self.norm.weight,
+                self.norm.eps,
+                self.norm.activation,
+            )
+        else:
+            core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.flatten(-2)
 
