@@ -26,6 +26,68 @@ PyTorch numerical decomposition does not count as a native operation.
 
 No native tactic in this delivery is enabled automatically in vLLM.
 
+## Experimental gated activation / row-FP8 quantization
+
+`flashinfer_gaudi.silu_and_mul_quant` accepts contiguous inference BF16 HPU
+input `[B,2D]`, B positive and at most INT32_MAX, with D divisible by 128 in
+`[256,17408]`. It returns E4M3 values `[B,D]` and FP32 **dequantization** scales
+`[B,1]`. This is a Gaudi-specific extension, not upstream FlashInfer's NVFP4
+or block-quantization API.
+
+The native recipe contains a logical split, Synapse `silu_fwd_bf16`, and an
+AOT TPC kernel fusing multiplication, absmax, scale, reciprocal, normalization
+and FP8 packing. It is not a monolithic custom SiLU kernel: vendor SiLU keeps
+the established HPU unary approximation. There is no PyTorch numerical
+prologue, nested launch, input conversion or output copy in the native path.
+
+The contract preserves BF16 rounding boundaries in
+`a = silu(gate) * up`, `s = (amax(abs(a)) + 1e-8) / 240`, and `1/s`, followed
+by HPU E4M3 conversion with range +/-240. The scale is not rounded to a power
+of two. Zero rows retain the positive epsilon scale. Explicit lane reduction
+and a BF16-qualified reciprocal avoid LUT use, allowing the intermediate row
+to stay in the compiler-approved VLM budget even at the maximum width.
+
+Build both libraries with the commands in the next section, then load the
+ABI-locked adapter **before** compiling:
+
+```python
+import torch
+from flashinfer_gaudi import load_native_extensions, set_backend_policy, silu_and_mul_quant
+from flashinfer_gaudi._bridge import load_bridge_adapter
+
+load_native_extensions()
+load_bridge_adapter()
+set_backend_policy("native")
+fn = torch.compile(silu_and_mul_quant, backend="hpu_backend", fullgraph=True, dynamic=False)
+quantized, dequant_scale = fn(x)
+```
+
+`native` and `bridge` fail closed; `public` rejects the private-ABI adapter.
+`auto` and `pytorch` keep the reference. The CPU reference is for contract
+testing, not bitwise equivalence with HPU unary approximations. No serving
+dispatch is changed. In particular, this does not replace preserved model
+block-FP8 weight scales with channel scales or claim an end-to-end speedup
+for a model that does not use this row-activation quantization path.
+
+```bash
+python tools/benchmark_flashinfer_native_quant.py \
+  --output /tmp/native-silu-quant.json --trace
+```
+
+This compares the complete compiled candidate against both the ordinary HPU
+chain and the `calculate_scale_for_cast` CGUID chain. Both gates must pass.
+Reports include artifact hashes, shape reentry, scale/reconstruction checks,
+native-only FX audit and the actual device kernels. Synapse may name vendor
+SiLU as a generated `fused_kernel`; that is not evidence of an extra custom
+activation or of a single-kernel recipe. Timing includes host submission gaps.
+The candidate remains unqualified and is not automatically promoted.
+
+The initial complete matrix passed correctness but not the joint performance
+gate. At some larger shapes the ordinary compiled HPU chain is already one
+fused TPC kernel; the candidate still uses two stages. Further work must
+qualify single-kernel numerical equivalence and reduce inter-stage scheduling
+cost, not infer a gain from kernel count or isolated profiler durations.
+
 ## Experimental mixed-engine plan
 
 `flashinfer_gaudi.gemm.GemmSiluPlan` adds a BF16 MME GEMM followed by the

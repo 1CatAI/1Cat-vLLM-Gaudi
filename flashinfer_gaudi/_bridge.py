@@ -81,9 +81,11 @@ def validate_manifest(manifest: dict, identity: dict, files: dict[str, Path]) ->
 
 def load_bridge_adapter() -> dict:
     """Explicit opt-in; never called by auto dispatch or CPU-only imports."""
+    from flashinfer_gaudi import _native
     global _LOADED
     with _LOCK:
         if _LOADED is not None:
+            _native._SILU_MUL_QUANT_OP = torch.ops.custom_op.flashinfer_gaudi_silu_mul_quant
             return dict(_LOADED)
         directory = Path(__file__).resolve().parent / "lib"
         try:
@@ -102,6 +104,7 @@ def load_bridge_adapter() -> dict:
                         raise BackendUnavailableError("A different native Bridge library is already mapped")
             _configure_kernel_database_path()
             torch.ops.load_library(str(files["adapter"]))
+            _native._SILU_MUL_QUANT_OP = torch.ops.custom_op.flashinfer_gaudi_silu_mul_quant
         except BackendUnavailableError:
             raise
         except Exception as exc:

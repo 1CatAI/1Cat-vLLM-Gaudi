@@ -74,6 +74,8 @@ def main():
         hashlib.sha256(subprocess.check_output(["git", "diff", "HEAD"], cwd=source)).hexdigest(),
         "adapter_source_sha256":
         sha256(native_source / "gemm_silu.cpp"),
+        "silu_quant_source_sha256":
+        sha256(native_source / "silu_quant.cpp"),
         "sha256": {
             name: sha256(path)
             for name, path in files.items()

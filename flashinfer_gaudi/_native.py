@@ -16,6 +16,7 @@ _LOAD_ATTEMPTED = False
 _LOADED_PATHS: list[str] = []
 _LOAD_ERRORS: list[str] = []
 _SILU_AND_MUL_OP: Callable | None = None
+_SILU_MUL_QUANT_OP: Callable | None = None
 
 
 def _library_candidates() -> list[str]:
@@ -84,6 +85,8 @@ def load_native_extensions() -> tuple[str, ...]:
             _SILU_AND_MUL_OP = torch.ops.custom_op.flashinfer_gaudi_silu_and_mul
         except (AttributeError, RuntimeError):
             _SILU_AND_MUL_OP = None
+        # Private compound ops are published only by the verified Bridge
+        # loader, not by probing an arbitrary externally registered symbol.
         _LOAD_ATTEMPTED = True
     return tuple(_LOADED_PATHS)
 
@@ -124,16 +127,24 @@ def native_diagnostics() -> dict[str, object]:
         "public_packed_gdn": public_packed_gdn_op() is not None,
         "bridge_packed_gdn": bridge_packed_gdn_op() is not None,
         "silu_and_mul": silu_and_mul_op() is not None,
+        "silu_and_mul_quant": silu_mul_quant_op() is not None,
     }
 
 
 def _reset_native_state_for_tests() -> None:
-    global _LOAD_ATTEMPTED, _SILU_AND_MUL_OP
+    global _LOAD_ATTEMPTED, _SILU_AND_MUL_OP, _SILU_MUL_QUANT_OP
     with _LOAD_LOCK:
         _LOAD_ATTEMPTED = False
         _SILU_AND_MUL_OP = None
+        _SILU_MUL_QUANT_OP = None
         _LOADED_PATHS.clear()
         _LOAD_ERRORS.clear()
+
+
+def silu_mul_quant_op() -> Callable | None:
+    if not _LOAD_ATTEMPTED:
+        load_native_extensions()
+    return _SILU_MUL_QUANT_OP
 
 
 # SynapseAI reads GC_KERNEL_PATH when its graph compiler is initialized. Set

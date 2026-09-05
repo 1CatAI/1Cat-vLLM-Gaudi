@@ -28,7 +28,7 @@ setup(
     ext_modules=[
         CppExtension(
             "flashinfer_gaudi_bridge_ops",
-            ["gemm_silu.cpp"],
+            ["gemm_silu.cpp", "silu_quant.cpp"],
             include_dirs=includes,
             library_dirs=[get_lib_dir()],
             libraries=["habana_pytorch2_plugin.upstream", "habana_pytorch_backend.upstream"],

@@ -12,7 +12,7 @@ set(TPC_INCLUDE_DIR "/usr/lib/habanatools/include" CACHE PATH "TPC compiler incl
 set(HABANA_INCLUDE_DIR "/usr/include/habanalabs" CACHE PATH "Gaudi host API include directory")
 
 set(TPC_EMBEDDED_OBJECTS)
-foreach(KERNEL gdn_packed_decode_f32_gaudi2 silu_and_mul_bf16_gaudi2)
+foreach(KERNEL gdn_packed_decode_f32_gaudi2 silu_and_mul_bf16_gaudi2 silu_mul_quant_bf16_gaudi2)
     set(TPC_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/kernels/${KERNEL}.c")
     set(TPC_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/${KERNEL}.o")
     set(TPC_EMBEDDED_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/${KERNEL}_embedded.o")
@@ -41,6 +41,7 @@ add_library(
     host/entry_points.cpp
     host/gdn_packed_decode_f32_gaudi2.cpp
     host/silu_and_mul_bf16_gaudi2.cpp
+    host/silu_mul_quant_bf16_gaudi2.cpp
     ${TPC_EMBEDDED_OBJECTS}
 )
 target_include_directories(
