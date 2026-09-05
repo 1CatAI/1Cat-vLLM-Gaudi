@@ -323,6 +323,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self,
         hidden_states: torch.Tensor,
         return_core: bool = False,
+        projected_input: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """HPU compile-friendly GDN forward.
 
@@ -345,6 +346,8 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         # === Part 1: Input Projection ================================
         if hasattr(self, 'in_proj_qkv'):
+            if projected_input is not None:
+                raise RuntimeError("Preprojected GDN inputs do not support separate LoRA projections")
             # LoRA path (Qwen3.5 only): separate in_proj_qkv and in_proj_z
             mixed_qkv, _ = self.in_proj_qkv(hidden_states)
             ba, _ = self.in_proj_ba(hidden_states)
@@ -354,8 +357,11 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             b = b.contiguous()
             a = a.contiguous()
         else:
-            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
+            if projected_input is None:
+                mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+                ba, _ = self.in_proj_ba(hidden_states)
+            else:
+                mixed_qkvz, ba = projected_input
 
             if self.gqa_interleaved_layout:
                 # Qwen3-Next: unpack the interleaved GQA layout

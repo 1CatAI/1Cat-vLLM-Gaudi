@@ -175,17 +175,13 @@ def _zero_compact_gdn_slot(
 ) -> None:
     """Clear every group state before a compact GDN slot is reused."""
     if base_slot < 0 or num_groups <= 0:
-        raise ValueError(
-            f"Invalid compact GDN slot: base_slot={base_slot}, num_groups={num_groups}"
-        )
+        raise ValueError(f"Invalid compact GDN slot: base_slot={base_slot}, num_groups={num_groups}")
     start = base_slot * num_groups + 1
     needs_hpu_sync = False
     for state in state_tensors:
         if state.ndim == 0 or start + num_groups > state.shape[0]:
-            raise ValueError(
-                "Compact GDN state tensor is too small for slot clear: "
-                f"shape={tuple(state.shape)}, start={start}, num_groups={num_groups}"
-            )
+            raise ValueError("Compact GDN state tensor is too small for slot clear: "
+                             f"shape={tuple(state.shape)}, start={start}, num_groups={num_groups}")
         # Slot 0 and the final slot are global sentinels. Compiled padded
         # prompt/decode graphs may write them, so stale non-finite values must
         # not survive into the next request. Update the base tensor directly:
@@ -962,7 +958,8 @@ def apply_model_specific_patches(model_runner):
                 raise RuntimeError("Boundary prefill pipeline does not support deferred reductions or LoRA")
             count = enable_hpu_qwen3_boundary_pipeline(model_runner.model,
                                                        get_config().qwen3_boundary_chunks,
-                                                       get_config().row_parallel_chunk_threshold)
+                                                       get_config().row_parallel_chunk_threshold,
+                                                       prefetch=get_config().qwen3_boundary_prefetch)
             if count == 0:
                 raise RuntimeError("Boundary prefill pipeline requires a supported dense Qwen3 TP2 topology")
             logger.info("Enabled attention/MLP prefill pipeline for %d decoder layers", count)

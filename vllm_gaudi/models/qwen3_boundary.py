@@ -31,7 +31,7 @@ def partial_projection(projection, x):
     return projection.quant_method.apply(projection, x, bias)
 
 
-def pipeline_attention_mlp(core, residual, projection, norm, mlp, chunks):
+def pipeline_attention_mlp(core, residual, projection, norm, mlp, chunks, next_layer=None, return_prefetched=False):
     """Return reduced MLP outputs and updated residuals, both token-major.
 
     Every attention chunk is reduced before its norm/MLP consumes it. The
@@ -68,36 +68,81 @@ def pipeline_attention_mlp(core, residual, projection, norm, mlp, chunks):
         mlp_outputs.append(output)
         updated_residuals.append(updated.reshape(-1, updated.shape[-1]))
 
-    for work in mlp_work:
+    if next_layer is None:
+        for work in mlp_work:
+            work.wait()
+        torch._dynamo.graph_break()
+        result = torch.cat(mlp_outputs, dim=0), torch.cat(updated_residuals, dim=0)
+        return (*result, None) if return_prefetched else result
+
+    # Use completed MLP chunks immediately, while later reductions remain in
+    # flight. Only token-local norm and input projections move across layers;
+    # the next attention core still receives the full ordered sequence.
+    next_hidden, next_residuals, first_projection, second_projection = [], [], [], []
+    for output, work, updated in zip(mlp_outputs, mlp_work, updated_residuals):
         work.wait()
+        torch._dynamo.graph_break()
+        normalized, next_residual = next_layer.input_layernorm(output, updated.unsqueeze(0))
+        if next_layer.layer_type == "linear_attention":
+            projected, _ = next_layer.linear_attn.in_proj_qkvz(normalized)
+            ba, _ = next_layer.linear_attn.in_proj_ba(normalized)
+            second_projection.append(ba)
+        else:
+            projected, _ = next_layer.self_attn.qkv_proj(normalized)
+        first_projection.append(projected)
+        next_hidden.append(normalized)
+        next_residuals.append(next_residual.reshape(-1, next_residual.shape[-1]))
     torch._dynamo.graph_break()
-    return torch.cat(mlp_outputs, dim=0), torch.cat(updated_residuals, dim=0)
+    projected = (torch.cat(first_projection, dim=0), )
+    if second_projection:
+        projected = (*projected, torch.cat(second_projection, dim=0))
+    return torch.cat(next_hidden, dim=0), torch.cat(next_residuals, dim=0), projected
 
 
 class HpuQwen3BoundaryDecoderLayer(Qwen3_5DecoderLayer):
 
-    def forward(self, hidden_states, residual, positions=None, **kwargs):
+    def forward(self, hidden_states, residual, positions=None, prefetched=None, return_prefetched=False, **kwargs):
         if self._hpu_boundary_chunks <= 1 or not can_pipeline_prefill(hidden_states, self._hpu_boundary_threshold):
-            return super().forward(hidden_states, residual, positions, **kwargs)
+            if prefetched is not None:
+                raise RuntimeError("Prefetched projections require the active boundary pipeline")
+            result = super().forward(hidden_states, residual, positions, **kwargs)
+            return (*result, None) if return_prefetched else result
         hidden_shape = hidden_states.shape
-        if residual is None:
+        if prefetched is not None:
+            # The previous layer already performed this input norm and both
+            # input projections on completed chunks.
+            pass
+        elif residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         residual_shape = residual.shape
         if self.layer_type == "linear_attention":
-            core = self.linear_attn(hidden_states=hidden_states, return_core=True)
+            core = self.linear_attn(hidden_states=hidden_states, return_core=True, projected_input=prefetched)
             projection = self.linear_attn.out_proj
         else:
-            core = self.self_attn(hidden_states=hidden_states, positions=positions, return_core=True)
+            core = self.self_attn(hidden_states=hidden_states,
+                                  positions=positions,
+                                  return_core=True,
+                                  projected_input=prefetched)
             projection = self.self_attn.o_proj
-        output, residual = pipeline_attention_mlp(core, residual, projection, self.post_attention_layernorm, self.mlp,
-                                                  self._hpu_boundary_chunks)
+        result = pipeline_attention_mlp(
+            core,
+            residual,
+            projection,
+            self.post_attention_layernorm,
+            self.mlp,
+            self._hpu_boundary_chunks,
+            next_layer=getattr(self, "_hpu_prefetch_next", None) if return_prefetched else None,
+            return_prefetched=return_prefetched)
+        output, residual = result[:2]
+        if return_prefetched:
+            return output.reshape(hidden_shape), residual.reshape(residual_shape), result[2]
         return output.reshape(hidden_shape), residual.reshape(residual_shape)
 
 
-def enable_hpu_qwen3_boundary_pipeline(model, chunks, threshold):
+def enable_hpu_qwen3_boundary_pipeline(model, chunks, threshold, prefetch=False):
     if chunks < 1 or threshold < 2:
         raise ValueError("Boundary chunks must be positive and prefill threshold at least two")
     if chunks == 1:
@@ -106,6 +151,9 @@ def enable_hpu_qwen3_boundary_pipeline(model, chunks, threshold):
         model = model.language_model
     inner = getattr(model, "model", None)
     if not isinstance(inner, Qwen3NextModel):
+        return 0
+    if prefetch and (inner.start_layer != 0 or inner.end_layer != len(inner.layers)
+                     or getattr(inner, "aux_hidden_state_layers", ())):
         return 0
     layers = tuple(islice(inner.layers, inner.start_layer, inner.end_layer))
     for layer in layers:
@@ -133,4 +181,10 @@ def enable_hpu_qwen3_boundary_pipeline(model, chunks, threshold):
         layer._hpu_boundary_chunks = chunks
         layer._hpu_boundary_threshold = threshold
         layer.__class__ = HpuQwen3BoundaryDecoderLayer
+    if prefetch:
+        for index, layer in enumerate(layers):
+            # Preserve sole parameter ownership by the original ModuleList.
+            following = layers[index + 1] if index + 1 < len(layers) else None
+            object.__setattr__(layer, "_hpu_prefetch_next", following)
+        inner._hpu_boundary_prefetch = True
     return len(layers)

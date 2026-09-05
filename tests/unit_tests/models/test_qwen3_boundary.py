@@ -205,3 +205,57 @@ def test_decoder_uses_original_forward_when_disabled(monkeypatch):
     expected = object()
     monkeypatch.setattr(pipeline.Qwen3_5DecoderLayer, "forward", lambda self, *args, **kwargs: expected)
     assert layer(torch.zeros(7, 4), None, torch.arange(7)) is expected
+
+
+@pytest.mark.parametrize("layer_type", ["linear_attention", "full_attention"])
+@pytest.mark.parametrize("chunks", [2, 4, 16])
+def test_next_layer_prefetch_matches_token_local_reference(monkeypatch, layer_type, chunks):
+    torch.manual_seed(31)
+    core, residual = torch.randn(7, 3), torch.randn(7, 4)
+    projection, norm, mlp = Projection(3, 4), Norm(), make_mlp()
+    next_layer = SimpleNamespace(layer_type=layer_type, input_layernorm=Norm())
+    if layer_type == "linear_attention":
+        next_layer.linear_attn = SimpleNamespace(in_proj_qkvz=Projection(4, 6), in_proj_ba=Projection(4, 2))
+        input_projections = (next_layer.linear_attn.in_proj_qkvz, next_layer.linear_attn.in_proj_ba)
+    else:
+        next_layer.self_attn = SimpleNamespace(qkv_proj=Projection(4, 6))
+        input_projections = (next_layer.self_attn.qkv_proj, )
+    normed, updated = norm(pipeline.partial_projection(projection, core) * 2, residual.unsqueeze(0))
+    gate_up, _ = mlp.gate_up_proj(normed)
+    output = pipeline.partial_projection(mlp.down_proj, mlp.act_fn(gate_up)) * 2
+    expected_hidden, expected_residual = next_layer.input_layernorm(output, updated)
+    expected_projected = tuple(p(expected_hidden)[0] for p in input_projections)
+    monkeypatch.setattr(pipeline, "get_tp_group", lambda: SimpleNamespace(device_group="group"))
+    monkeypatch.setattr(torch.distributed, "all_reduce",
+                        lambda tensor, **kwargs: SimpleNamespace(wait=lambda: tensor.mul_(2)))
+    hidden, residual, projected = pipeline.pipeline_attention_mlp(core,
+                                                                  residual,
+                                                                  projection,
+                                                                  norm,
+                                                                  mlp,
+                                                                  chunks,
+                                                                  next_layer=next_layer,
+                                                                  return_prefetched=True)
+    torch.testing.assert_close(hidden, expected_hidden)
+    torch.testing.assert_close(residual, expected_residual.reshape(7, 4))
+    for actual, expected in zip(projected, expected_projected):
+        torch.testing.assert_close(actual, expected)
+
+
+def test_prefetch_links_preserve_module_ownership():
+    first, second = make_layer(), make_layer()
+    model = make_model([first, second])
+    before = list(model.model.named_modules())
+    assert pipeline.enable_hpu_qwen3_boundary_pipeline(model, 4, 2, prefetch=True) == 2
+    assert first._hpu_prefetch_next is second
+    assert second._hpu_prefetch_next is None
+    assert model.model._hpu_boundary_prefetch
+    assert list(model.model.named_modules()) == before
+
+
+def test_prefetch_rejects_auxiliary_hidden_state_consumers():
+    first = make_layer()
+    model = make_model([first])
+    model.model.aux_hidden_state_layers = (0, )
+    assert pipeline.enable_hpu_qwen3_boundary_pipeline(model, 4, 2, prefetch=True) == 0
+    assert type(first) is pipeline.Qwen3_5DecoderLayer
