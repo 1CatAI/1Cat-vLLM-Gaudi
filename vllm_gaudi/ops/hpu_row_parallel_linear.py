@@ -121,26 +121,16 @@ class HPURowParallelLinear(RowParallelLinear):
                     # Chunk along batch dimension for batched decodes
                     chunk_dim = 0
                     total_tokens = batch_size
-                output = torch.empty(batch_size,
-                                     seq_len,
-                                     self.output_size_per_partition,
-                                     dtype=input_parallel.dtype,
-                                     device=input_parallel.device)
             else:
                 # Input is [batch*seq, hidden], chunk along batch dimension
                 total_tokens, hidden_dim = input_parallel.shape
                 chunk_dim = 0
-                output = torch.empty(total_tokens,
-                                     self.output_size_per_partition,
-                                     dtype=input_parallel.dtype,
-                                     device=input_parallel.device)
 
             chunk_size = (total_tokens + self.num_chunks - 1) // self.num_chunks
 
-            # Lists to store chunks and handles
+            # Keep outputs alive until their asynchronous reductions finish.
             output_chunks = []
             handles = []
-            chunk_ranges = []
 
             # Phase 1: Compute all chunks and start all-reduces
             for i in range(self.num_chunks):
@@ -170,10 +160,9 @@ class HPURowParallelLinear(RowParallelLinear):
                 # Start async all-reduce for this chunk
                 handle = torch.distributed.all_reduce(output_chunk, group=get_tp_group().device_group, async_op=True)
 
-                # Store chunk, handle, and range info
+                # Store chunk and handle.
                 output_chunks.append(output_chunk)
                 handles.append(handle)
-                chunk_ranges.append((start_idx, end_idx))
 
             # Phase 2: Wait for all handles and combine outputs
             for handle in handles:
@@ -181,17 +170,9 @@ class HPURowParallelLinear(RowParallelLinear):
 
             torch._dynamo.graph_break()
 
-            # Copy all chunks to output
-            for chunk, (start_idx, end_idx) in zip(output_chunks, chunk_ranges):
-                if is_3d:
-                    if chunk_dim == 1:
-                        # Chunked along sequence dimension
-                        output[:, start_idx:end_idx, :] = chunk
-                    else:
-                        # Chunked along batch dimension
-                        output[start_idx:end_idx, :, :] = chunk
-                else:
-                    output[start_idx:end_idx] = chunk
+            # Assemble once instead of functionalizing repeated slice writes
+            # into full-output insert/copy kernels.
+            output = torch.cat(output_chunks, dim=chunk_dim)
 
             torch._dynamo.graph_break()
 
