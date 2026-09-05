@@ -259,3 +259,60 @@ def test_prefetch_rejects_auxiliary_hidden_state_consumers():
     model.model.aux_hidden_state_layers = (0, )
     assert pipeline.enable_hpu_qwen3_boundary_pipeline(model, 4, 2, prefetch=True) == 0
     assert type(first) is pipeline.Qwen3_5DecoderLayer
+
+
+def test_prefetch_rejects_separate_input_projections_before_mutation():
+    first, last = make_layer(), make_layer()
+    last.linear_attn.in_proj_qkv = torch.nn.Identity()
+    assert pipeline.enable_hpu_qwen3_boundary_pipeline(make_model([first, last]), 4, 2, prefetch=True) == 0
+    assert type(first) is pipeline.Qwen3_5DecoderLayer
+
+
+@pytest.mark.parametrize("three_dimensional", [False, True])
+def test_prefetched_decoder_chain_matches_nonprefetched_chain(monkeypatch, three_dimensional):
+
+    class Attention(torch.nn.Module):
+
+        def __init__(self):
+            super().__init__()
+            self.in_proj_qkvz = Projection(4, 3)
+            self.in_proj_ba = Projection(4, 2)
+            self.out_proj = Projection(3, 4)
+            self.core_calls = 0
+
+        def forward(self, hidden_states, return_core=False, projected_input=None):
+            assert return_core
+            self.core_calls += 1
+            if projected_input is None:
+                flat = hidden_states.reshape(-1, 4)
+                projected_input = (self.in_proj_qkvz(flat)[0], self.in_proj_ba(flat)[0])
+            return projected_input[0] * torch.sigmoid(projected_input[1].sum(-1, keepdim=True))
+
+    torch.manual_seed(79)
+    layers = [make_layer() for _ in range(3)]
+    for index, layer in enumerate(layers):
+        layer.__class__ = pipeline.HpuQwen3BoundaryDecoderLayer
+        layer._hpu_boundary_chunks = 4
+        layer._hpu_boundary_threshold = 2
+        layer.input_layernorm = Norm()
+        layer.post_attention_layernorm = Norm()
+        layer.linear_attn = Attention()
+        object.__setattr__(layer, "_hpu_prefetch_next", layers[index + 1] if index < 2 else None)
+    monkeypatch.setattr(pipeline, "can_pipeline_prefill", lambda *_: True)
+    monkeypatch.setattr(pipeline, "get_tp_group", lambda: SimpleNamespace(device_group="group"))
+    monkeypatch.setattr(torch.distributed, "all_reduce",
+                        lambda tensor, **_: SimpleNamespace(wait=lambda: tensor.mul_(2)))
+    original = torch.randn(1, 7, 4) if three_dimensional else torch.randn(7, 4)
+    reference, reference_residual = original, torch.zeros(1, 7, 4)
+    for layer in layers:
+        reference, reference_residual = layer(reference, reference_residual)
+    actual, actual_residual, prefetched = original, torch.zeros(1, 7, 4), None
+    for layer in layers:
+        actual, actual_residual, prefetched = layer(actual,
+                                                    actual_residual,
+                                                    prefetched=prefetched,
+                                                    return_prefetched=True)
+    assert prefetched is None
+    torch.testing.assert_close(actual, reference)
+    torch.testing.assert_close(actual_residual, reference_residual)
+    assert all(layer.linear_attn.core_calls == 2 for layer in layers)

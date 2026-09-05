@@ -168,6 +168,8 @@ def enable_hpu_qwen3_boundary_pipeline(model, chunks, threshold, prefetch=False)
                 for norm in (layer.input_layernorm, layer.post_attention_layernorm)):
             return 0
         if layer.layer_type == "linear_attention" and isinstance(layer.linear_attn, HPUGatedDeltaNetAttention):
+            if prefetch and hasattr(layer.linear_attn, "in_proj_qkv"):
+                return 0
             projection = layer.linear_attn.out_proj
         elif layer.layer_type == "full_attention" and isinstance(layer.self_attn, Qwen3NextAttention):
             projection = layer.self_attn.o_proj
