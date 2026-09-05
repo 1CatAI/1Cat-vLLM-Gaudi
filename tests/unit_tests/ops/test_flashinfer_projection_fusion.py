@@ -114,6 +114,7 @@ def test_only_exclusive_qualified_cguid_projection_rewrites(violation):
         else:
             assert "reciprocal" not in module.code and "_to_copy" not in module.code
             assert len([node for node in module.graph.nodes if node.target is _fake_op]) == 2
+            assert all(node.target != torch.ops.aten.add_.Tensor for node in module.graph.nodes)
             fused = next(node for node in module.graph.nodes if node.target is _fake_op)
             assert fused.meta["output_offset"] == [0, 0, 0, 0]
             assert fusion.fuse_projection_graph(module, {(8, 5120, 34816)}) == 0

@@ -200,6 +200,12 @@ def fuse_projection_graph(graph_module, allowed_shapes):
         q.replace_all_uses_with(replacements[0])
         scale.replace_all_uses_with(replacements[1])
         summed.replace_all_uses_with(replacements[3])
+        if _target(summed, "aten.add_.Tensor"):
+            # FX DCE deliberately retains impure nodes, even after their last
+            # use disappears. The private-owner proof above permits removal
+            # of this obsolete storage update; leaving it can mutate the
+            # new native producer's input before that producer executes.
+            graph.erase_node(summed)
         count += 1
         graph.eliminate_dead_code()
     if count:

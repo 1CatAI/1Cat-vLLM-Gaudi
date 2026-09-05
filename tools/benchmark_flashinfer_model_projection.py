@@ -102,7 +102,7 @@ class ProjectionTrialWorkerExtension:
         return {
             "kernels": dict(counts),
             "scope": "five B=8 decode model forwards; profiler excluded from request timings",
-            "native_projection_kernel_calls": counts["flashinfer_gaudi_add_rmsnorm_quant_bf16_gaudi2"]
+            "native_projection_kernel_events": counts["flashinfer_gaudi_add_rmsnorm_quant_bf16_gaudi2"]
         }
 
 
@@ -183,7 +183,7 @@ def worker(args):
         report["trace"] = llm.collective_rpc("stop_projection_trial_trace",
                                              args=(str((args.output / "trace.json").resolve()), ))
     report["route_hit"] = bool(enabled and any(stats["compiled_matches"] > 0 for stats in report["fusion_stats"])
-                               and (not args.trace or any(item["native_projection_kernel_calls"] > 0
+                               and (not args.trace or any(item["native_projection_kernel_events"] > 0
                                                           for item in report["trace"])))
     report["sources_unchanged"] = fingerprints() == source_sha256
     (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
@@ -237,6 +237,8 @@ def main():
         report["token_ids_equal"] = all(row["token_ids"] == first["rounds"][0]["token_ids"]
                                         for worker_report in report["workers"] for row in worker_report["rounds"])
         report["route_hit"] = candidate["route_hit"]
+        report["screen_valid"] = bool(report["source_control_valid"] and report["token_ids_equal"]
+                                      and report["route_hit"] and .95 <= report["baseline_return_ratio"] <= 1.05)
     (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps({key: value for key, value in report.items() if key != "workers"}, indent=2))
 

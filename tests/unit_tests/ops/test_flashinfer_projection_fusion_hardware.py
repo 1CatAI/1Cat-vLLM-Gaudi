@@ -13,7 +13,7 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLASHINFER_GAUDI_RUN_HARDWARE_TE
 
 def test_graph_fusion_public_recipe_reentry_and_shape_fallback(tmp_path):
     import habana_frameworks.torch  # noqa: F401
-    from habana_frameworks.torch.dynamo.compile_backend import config
+    from habana_frameworks.torch.dynamo.compile_backend import config, passes
     from flashinfer_gaudi import load_native_extensions
     from tools.benchmark_flashinfer_native_projection import audit_trace, validate
     from vllm_gaudi.ops.flashinfer_projection_fusion import register_projection_fusion_pass, projection_fusion_stats
@@ -49,6 +49,18 @@ def test_graph_fusion_public_recipe_reentry_and_shape_fallback(tmp_path):
     snapshots = {batch: tuple(value.cpu() for value in inputs[:2]) for batch, inputs in samples.items()}
     expected = {batch: tuple(value.cpu() for value in compiled(*inputs)) for batch, inputs in samples.items()}
     register_projection_fusion_pass(((8, 5120, 34816), ))
+    adapted_graphs = []
+
+    def audit_context(ctx):
+        targets = [str(node.target) for node in ctx.graph_module.graph.nodes if node.op == "call_function"]
+        if "custom_op.flashinfer_gaudi_add_rmsnorm_quant.default" in targets:
+            assert targets.count("aten.add.Tensor") == 1
+            assert targets.count("custom_op.flashinfer_gaudi_add_rmsnorm_quant.default") == 1
+            assert not any(target.startswith("aten.add_") for target in targets)
+            adapted_graphs.append(targets)
+        return False
+
+    passes.register_pass_at_optimization_pass(audit_context, passes.OptimizationPassPlacement.PRE_PLACEMENT)
     torch._dynamo.reset()
     with torch.inference_mode():
         for batch in (1, 8, 32, 8):
@@ -72,6 +84,9 @@ def test_graph_fusion_public_recipe_reentry_and_shape_fallback(tmp_path):
     events = json.loads(path.read_text())["traceEvents"]
     # This context deliberately has one additional residual producer. Audit it
     # separately; do not weaken the complete projection benchmark's allowlist.
-    assert sum(event.get("cat") == "kernel" and event.get("name") == "add_fwd_bf16" for event in events) == 5
+    # One logical TPC node emits multiple engine/slice activity records. The FX
+    # audit checks node cardinality; runtime Launch events check recipe count.
+    assert adapted_graphs
+    assert any(event.get("cat") == "kernel" and event.get("name") == "add_fwd_bf16" for event in events)
     audit_trace(
         [event for event in events if not (event.get("cat") == "kernel" and event.get("name") == "add_fwd_bf16")])
