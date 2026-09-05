@@ -1,14 +1,21 @@
 // Qwen3.8-27B GDN compact post-convolution Q/K preparation for Gaudi2.
 //
-// Normalize the 16 physical Q/K heads in FP32, then write one BF16 copy of
-// each head. The GDN graph can broadcast these heads to the 48 value heads
+// Normalize the physical Q/K heads in FP32, then write one BF16 copy of
+// each head. The GDN graph can broadcast these heads to the value heads
 // after the expensive FP32 normalization boundary.
+#ifndef QWEN38_QK_HEADS
+#define QWEN38_QK_HEADS 16
+#endif
+#if QWEN38_QK_HEADS != 16 && QWEN38_QK_HEADS != 8
+#error "Only Qwen3.8 TP1 and TP2 compact Q/K layouts are supported"
+#endif
+
 void main(tensor packed_qkv, tensor q_out, tensor k_out)
 {
     const int5 start = get_index_space_offset();
     const int5 end = start + get_index_space_size();
     const uchar256 broadcast_lane_zero = 0x80;
-    const int qk_heads = 16;
+    const int qk_heads = QWEN38_QK_HEADS;
     const int head_dim = 128;
     const int key_offset = qk_heads * head_dim;
 

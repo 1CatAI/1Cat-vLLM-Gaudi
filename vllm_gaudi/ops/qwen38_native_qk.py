@@ -75,8 +75,9 @@ def validate_qwen38_native_qk_shape(
     value_width: int,
     key_head_dim: int,
     value_head_dim: int,
+    compact_qk: bool = False,
 ) -> int:
-    """Validate the fixed Qwen3.8 TP1 kernel contract and return head repeat."""
+    """Validate the TP1 or compact TP2 kernel layout and return head repeat."""
     actual = (
         tp_size,
         qkv_width,
@@ -93,12 +94,19 @@ def validate_qwen38_native_qk_shape(
         _EXPECTED_HEAD_DIM,
         _EXPECTED_HEAD_DIM,
     )
-    if actual != expected:
-        raise ValueError(
-            "VLLM_GDN_QWEN38_NATIVE_QK_PREP currently requires the Qwen3.8 "
-            "TP1 layout (qkv=10240, key=2048, value=6144, head_dim=128), "
-            f"got {actual}."
-        )
+    compact_tp2 = (
+        2,
+        _EXPECTED_QKV_WIDTH // 2,
+        _EXPECTED_KEY_WIDTH // 2,
+        _EXPECTED_VALUE_WIDTH // 2,
+        _EXPECTED_HEAD_DIM,
+        _EXPECTED_HEAD_DIM,
+    )
+    if actual != expected and not (compact_qk and actual == compact_tp2):
+        raise ValueError("VLLM_GDN_QWEN38_NATIVE_QK_PREP requires the Qwen3.8 "
+                         "TP1 layout (qkv=10240, key=2048, value=6144, head_dim=128) "
+                         "or compact TP2 layout (qkv=5120, key=1024, value=3072, head_dim=128), "
+                         f"got {actual}, compact_qk={compact_qk}.")
     return _EXPECTED_VALUE_HEADS // _EXPECTED_QK_HEADS
 
 
@@ -115,33 +123,27 @@ def load_qwen38_native_qk_prep() -> bool:
 
     configured_path = gaudi_envs.VLLM_GDN_QWEN38_NATIVE_QK_PREP_EXTENSION
     if not configured_path:
-        raise RuntimeError(
-            "VLLM_GDN_QWEN38_NATIVE_QK_PREP_EXTENSION must point to the "
-            "built flashqla_pair_transform_pt2 extension when native Q/K "
-            "preparation is enabled."
-        )
+        raise RuntimeError("VLLM_GDN_QWEN38_NATIVE_QK_PREP_EXTENSION must point to the "
+                           "built flashqla_pair_transform_pt2 extension when native Q/K "
+                           "preparation is enabled.")
 
     extension = Path(configured_path).expanduser().resolve()
     if not extension.is_file():
         raise RuntimeError(f"Native Q/K preparation extension does not exist: {extension}")
     if _loaded_extension is not None:
         if extension != _loaded_extension:
-            raise RuntimeError(
-                "Native Q/K preparation was already loaded from "
-                f"{_loaded_extension}, cannot reload it from {extension}."
-            )
+            raise RuntimeError("Native Q/K preparation was already loaded from "
+                               f"{_loaded_extension}, cannot reload it from {extension}.")
         return True
 
     torch.ops.load_library(str(extension))
     try:
         _resolve_post_conv_op()
         if gaudi_envs.VLLM_GDN_QWEN38_NATIVE_COMPACT_KKT:
-            torch.ops.custom_op.qwen38_compact_kkt_bf16_gaudi2
+            _ = torch.ops.custom_op.qwen38_compact_kkt_bf16_gaudi2
     except AttributeError as exc:
-        raise RuntimeError(
-            "The configured extension is missing a requested Qwen3.8 "
-            "Gaudi2 custom op."
-        ) from exc
+        raise RuntimeError("The configured extension is missing a requested Qwen3.8 "
+                           "Gaudi2 custom op.") from exc
 
     _loaded_extension = extension
     return True

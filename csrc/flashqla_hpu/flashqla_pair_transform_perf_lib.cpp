@@ -33,6 +33,10 @@ extern "C" unsigned char
 extern "C" unsigned char
     _binary_qwen38_post_conv_qk_compact_bf16_gaudi2_o_end;
 extern "C" unsigned char
+    _binary_qwen38_post_conv_qk_compact_tp2_bf16_gaudi2_o_start;
+extern "C" unsigned char
+    _binary_qwen38_post_conv_qk_compact_tp2_bf16_gaudi2_o_end;
+extern "C" unsigned char
     _binary_qwen38_post_conv_qk_expanded_bf16_gaudi2_o_start;
 extern "C" unsigned char
     _binary_qwen38_post_conv_qk_expanded_bf16_gaudi2_o_end;
@@ -636,13 +640,15 @@ tpc_lib_api::GlueCodeReturn instantiate_compact_post_conv_qk(
   auto& q = params->outputTensors[0].geometry;
   auto& k = params->outputTensors[1].geometry;
   const uint64_t tokens = packed.maxSizes[1];
+  const unsigned heads = packed.maxSizes[0] == 5120 ? 8 : 16;
   const bool packed_shape =
-      packed.dims == 2 && packed.maxSizes[0] == 10240;
+      packed.dims == 2 &&
+      (packed.maxSizes[0] == 10240 || packed.maxSizes[0] == 5120);
   const bool qk_shape =
       q.dims == 3 && q.maxSizes[0] == 128 &&
-      q.maxSizes[1] == 16 && q.maxSizes[2] == tokens &&
+      q.maxSizes[1] == heads && q.maxSizes[2] == tokens &&
       k.dims == 3 && k.maxSizes[0] == 128 &&
-      k.maxSizes[1] == 16 && k.maxSizes[2] == tokens;
+      k.maxSizes[1] == heads && k.maxSizes[2] == tokens;
   if (!packed_shape || !qk_shape) {
     return tpc_lib_api::GLUE_UNSUPPORTED_LAYER_CONFIGURATION;
   }
@@ -658,16 +664,22 @@ tpc_lib_api::GlueCodeReturn instantiate_compact_post_conv_qk(
   instance->indexSpaceRank = 1;
   instance->indexSpaceGeometry[0] = tokens;
   set_mapping(
-      instance->inputTensorAccessPattern[0], 0, 0, 0, 0, 4095);
+      instance->inputTensorAccessPattern[0], 0, 0, 0, 0, 2 * heads * 128 - 1);
   set_mapping(
       instance->inputTensorAccessPattern[0], 1, 0, 1, 0, 0);
   for (unsigned output : {0U, 1U}) {
     set_mapping(
         instance->outputTensorAccessPattern[output], 0, 0, 0, 0, 127);
     set_mapping(
-        instance->outputTensorAccessPattern[output], 1, 0, 0, 0, 15);
+        instance->outputTensorAccessPattern[output], 1, 0, 0, 0, heads - 1);
     set_mapping(
         instance->outputTensorAccessPattern[output], 2, 0, 1, 0, 0);
+  }
+  if (heads == 8) {
+    return copy_elf(
+        instance,
+        &_binary_qwen38_post_conv_qk_compact_tp2_bf16_gaudi2_o_start,
+        &_binary_qwen38_post_conv_qk_compact_tp2_bf16_gaudi2_o_end);
   }
   return copy_elf(
       instance,
