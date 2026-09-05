@@ -1,5 +1,17 @@
 # FlashInfer-compatible Gaudi operators
 
+## Native backend migration
+
+The project is transitioning from compatible graph tactics to complete native
+operations. See [Native backend qualification](flashinfer_native_backend.md).
+`native`, `public`, and `bridge` are now whole-operation strict policies:
+all GDN compute entry points reject their remaining PyTorch decomposition,
+including the packed prototype's exponential/cast/contiguous prologue.
+The prototype kernel remains available for explicitly labeled diagnostic
+benchmarks; it is not a complete native implementation of the public API.
+Existing `auto` graph tactics remain the serving default.
+Environment promotion overrides no longer bypass the offline gates.
+
 `vllm-gaudi` contains an independently namespaced `flashinfer_gaudi` package
 for inference primitives whose public semantics match portable FlashInfer
 operations while using Intel Gaudi execution paths.
@@ -72,8 +84,8 @@ vLLM's existing decode implementation, because the extra gather/scatter is a
 measured regression. A public native op is selected only after its offline
 tactic is promoted. Native tactics remain unpromoted in the bundled offline
 tactic manifest until they pass both model-level quality and performance
-gates. `public` and `bridge` are strict policies: an unavailable implementation
-raises before recurrent state is modified.
+gates. Strict policies currently reject all GDN compute entry points before
+recurrent state is modified, including reference-only prefill and MTP.
 
 The same proven group-major contract is also applied to the Qwen decode
 convolution cache. One-token decode consumes its native

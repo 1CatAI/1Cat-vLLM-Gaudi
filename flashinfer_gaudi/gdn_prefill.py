@@ -7,6 +7,8 @@ from typing import Literal
 
 import torch
 
+from flashinfer_gaudi._dispatch import require_reference_allowed
+
 
 def _chunk_gated_delta_rule_log_gate(
     q: torch.Tensor,
@@ -42,6 +44,7 @@ def _chunk_gated_delta_rule_log_gate(
     entry point avoids an otherwise redundant ``exp`` followed by ``log`` at
     every GDN layer while the public API retains FlashInfer's alpha contract.
     """
+    require_reference_allowed("chunk_gated_delta_rule log-gate reference")
     from vllm_gaudi.ops.hpu_gdn_pytorch import hpu_chunk_gated_delta_rule
 
     return hpu_chunk_gated_delta_rule(
@@ -122,6 +125,7 @@ def chunk_gated_delta_rule(
     Context-parallel checkpointing and indexed state pools are not yet part
     of the promoted Gaudi2 tactic; requesting either fails explicitly.
     """
+    require_reference_allowed("chunk_gated_delta_rule")
     _validate_inputs(q, k, v, cu_seqlens)
     assert cu_seqlens is not None
     if use_cp not in ("auto", True, False):

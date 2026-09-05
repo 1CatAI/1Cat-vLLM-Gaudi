@@ -67,6 +67,12 @@ class FlashInferBuildPy(_build_py):
     def run(self):
         super().run()
         output_dir = os.path.join(self.build_lib, "flashinfer_gaudi", "lib")
+        # Private-ABI research adapters are source-build-only, including when
+        # the reusable wheel staging directory contains an earlier build.
+        for name in ("flashinfer_gaudi_bridge_ops.so", "bridge_artifact_v1.json"):
+            staged = Path(output_dir) / name
+            if staged.is_file():
+                staged.unlink()
         if not _native_flashinfer_build_enabled():
             # A previous native wheel build may have left binaries in the
             # reusable setuptools build tree. Never leak those artifacts into
@@ -114,9 +120,13 @@ setup(
             *(["lib/*.so"] if _native_flashinfer_build_enabled() else []),
         ]
     },
-    exclude_package_data=({} if _native_flashinfer_build_enabled() else {
-        "flashinfer_gaudi": ["lib/*.so"]
-    }),
+    exclude_package_data={
+        "flashinfer_gaudi": [
+            "lib/flashinfer_gaudi_bridge_ops.so",
+            "lib/bridge_artifact_v1.json",
+            *([] if _native_flashinfer_build_enabled() else ["lib/*.so"]),
+        ]
+    },
     py_modules=["pytest_compat"],
     install_requires=get_requirements(),
     ext_modules=ext_modules,

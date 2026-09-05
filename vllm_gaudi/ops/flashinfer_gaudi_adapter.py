@@ -6,6 +6,7 @@ from __future__ import annotations
 import torch
 
 from flashinfer_gaudi._config import bridge_auto_enabled, get_backend_policy
+from flashinfer_gaudi._dispatch import require_reference_allowed
 from flashinfer_gaudi._reference import packed_recurrent_decode, qwen38_fused_decode_step_direct
 from flashinfer_gaudi._tactics import gdn_fused_decode_tactic, gdn_prefill_tactic, public_gdn_auto_promoted
 from flashinfer_gaudi.gdn_decode import gated_delta_rule_decode_packed
@@ -57,6 +58,8 @@ def maybe_run_gdn_prefill(
     Unsupported shapes deliberately return ``None`` so other Qwen GDN
     variants retain the general HPU implementation.
     """
+    if flashinfer_gdn_enabled():
+        require_reference_allowed("vLLM GDN prefill")
     if not flashinfer_gdn_prefill_enabled():
         return None
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
@@ -130,6 +133,8 @@ def maybe_run_gdn_decode_packed(
     Backend availability fallback is handled inside ``flashinfer_gaudi``
     before any state-mutating operation is launched.
     """
+    if flashinfer_gdn_enabled():
+        require_reference_allowed("vLLM GDN packed decode")
     if not flashinfer_gdn_enabled() or state_pool is None or load_state_indices is None:
         return None
     # The packed integration currently replaces vLLM's one-token recurrent
@@ -205,6 +210,8 @@ def maybe_run_gdn_fused_decode_step(
     scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Run the qualified Qwen3.8 fused direct-state decode composition."""
+    if flashinfer_gdn_enabled():
+        require_reference_allowed("vLLM fused GDN decode")
     use_reference = _BACKEND_POLICY == "pytorch" or (_BACKEND_POLICY == "auto" and not _PUBLIC_AUTO_PROMOTED
                                                      and not _BRIDGE_AUTO_ENABLED)
     if (not flashinfer_gdn_enabled() or not flashinfer_gdn_fused_decode_enabled() or not use_reference

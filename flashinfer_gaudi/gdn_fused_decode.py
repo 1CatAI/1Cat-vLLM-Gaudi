@@ -13,6 +13,8 @@ import math
 import torch
 import torch.nn.functional as F
 
+from flashinfer_gaudi._dispatch import require_reference_allowed
+
 _QWEN38_BATCHES = frozenset((1, 2, 4, 8, 16, 32))
 _QWEN38_GEOMETRY = (5120, 96, 10240, 16, 48, 128, 4, 3)
 
@@ -150,6 +152,7 @@ def gdn_fused_decode_step(
     advertised by :func:`gdn_fused_decode_step_supported` until a specialized
     tactic beats the existing vLLM-Gaudi path.
     """
+    require_reference_allowed("gdn_fused_decode_step")
     value_heads, qk_heads, key_dim, value_dim = _validate_inputs(
         hidden_states,
         w_ba,
