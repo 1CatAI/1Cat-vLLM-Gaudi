@@ -6,8 +6,8 @@
   "synapse_version": "1.24.1",
   "whole_library_native": false,
   "domains": {
-    "activation_norm": "native_silu_candidate_only",
-    "quantization": "native_silu_row_fp8_and_block_weight_dequant_candidates",
+    "activation_norm": "native_silu_and_residual_norm_quant_candidates",
+    "quantization": "native_norm_row_fp8_silu_row_fp8_and_block_weight_dequant_candidates",
     "gemm": "native_bf16_gemm_silu_and_block_weight_linear_candidates",
     "gdn_kda_mamba": "reference_graph_and_partial_native_prototype",
     "kv_cache_rope": "planned",
@@ -18,6 +18,17 @@
     "communication": "planned"
   },
   "operations": {
+    "fused_add_rmsnorm_quant": {
+      "native_implemented": true,
+      "entry": "flashinfer_gaudi.fused_add_rmsnorm_quant",
+      "guid": "flashinfer_gaudi_add_rmsnorm_quant_bf16_gaudi2",
+      "contract": "functional contiguous inference BF16 input/residual [B,D], weight [D]; D in [256,17408] divisible by 128; positive normal FP32 epsilon",
+      "outputs": ["E4M3 [B,D]", "FP32 row scale [B,1]", "BF16 normalized [B,D]", "BF16 residual [B,D]"],
+      "scale_modes": ["bf16_reciprocal", "fp32_divide"],
+      "correctness": "requires_matching_build_hardware_report",
+      "performance": "requires_shape_mode_and_artifact_qualification",
+      "production_promoted": false
+    },
     "block_fp8_linear": {
       "native_implemented": true,
       "entry": "flashinfer_gaudi.block_fp8_linear",

@@ -12,15 +12,19 @@ set(TPC_INCLUDE_DIR "/usr/lib/habanatools/include" CACHE PATH "TPC compiler incl
 set(HABANA_INCLUDE_DIR "/usr/include/habanalabs" CACHE PATH "Gaudi host API include directory")
 
 set(TPC_EMBEDDED_OBJECTS)
-foreach(KERNEL gdn_packed_decode_f32_gaudi2 silu_and_mul_bf16_gaudi2 silu_mul_quant_bf16_gaudi2 block_fp8_dequant_gaudi2)
+foreach(KERNEL gdn_packed_decode_f32_gaudi2 silu_and_mul_bf16_gaudi2 silu_mul_quant_bf16_gaudi2 block_fp8_dequant_gaudi2 add_rmsnorm_quant_bf16_gaudi2 add_rmsnorm_quant_bf16_gaudi2_small)
     set(TPC_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/kernels/${KERNEL}.c")
     set(TPC_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/${KERNEL}.o")
     set(TPC_EMBEDDED_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/${KERNEL}_embedded.o")
+    set(TPC_EXTRA_DEPENDENCIES)
+    if(KERNEL STREQUAL "add_rmsnorm_quant_bf16_gaudi2_small")
+        list(APPEND TPC_EXTRA_DEPENDENCIES "${CMAKE_CURRENT_SOURCE_DIR}/kernels/add_rmsnorm_quant_bf16_gaudi2.c")
+    endif()
     add_custom_command(
         OUTPUT "${TPC_OBJECT}"
         COMMAND "${TPC_COMPILER}" -Wall -Werror -O2 -march=gaudi2
                 -I"${TPC_INCLUDE_DIR}" "${TPC_SOURCE}" -c -o "${TPC_OBJECT}"
-        DEPENDS "${TPC_SOURCE}"
+        DEPENDS "${TPC_SOURCE}" ${TPC_EXTRA_DEPENDENCIES}
         VERBATIM
     )
     add_custom_command(
@@ -43,6 +47,7 @@ add_library(
     host/silu_and_mul_bf16_gaudi2.cpp
     host/silu_mul_quant_bf16_gaudi2.cpp
     host/block_fp8_dequant_gaudi2.cpp
+    host/add_rmsnorm_quant_bf16_gaudi2.cpp
     ${TPC_EMBEDDED_OBJECTS}
 )
 target_include_directories(
@@ -64,4 +69,10 @@ if(FLASHINFER_GAUDI_BUILD_TESTS)
     target_compile_options(flashinfer_gaudi_host_test PRIVATE -UNDEBUG)
     target_link_libraries(flashinfer_gaudi_host_test PRIVATE flashinfer_gaudi_kernels)
     add_test(NAME flashinfer_gaudi_kernel_glue COMMAND flashinfer_gaudi_host_test)
+    add_executable(flashinfer_gaudi_norm_host_test host/test_norm_kernel_glue.cpp)
+    target_include_directories(flashinfer_gaudi_norm_host_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/host" "${HABANA_INCLUDE_DIR}" "${TPC_INCLUDE_DIR}")
+    target_compile_options(flashinfer_gaudi_norm_host_test PRIVATE -UNDEBUG)
+    target_link_libraries(flashinfer_gaudi_norm_host_test PRIVATE flashinfer_gaudi_kernels)
+    add_test(NAME flashinfer_gaudi_norm_kernel_glue COMMAND flashinfer_gaudi_norm_host_test)
 endif()
