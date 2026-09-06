@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 import torch
 from unittest.mock import Mock
 
@@ -8,6 +9,7 @@ from vllm_gaudi.distributed.tp2_fused_ar_norm import (
     _MAX_FUSED_DECODE_TOKENS,
     _exceeds_fused_decode_token_limit,
     _rejection_reason,
+    _native_probe_valid,
 )
 
 
@@ -69,3 +71,28 @@ def test_explicit_stock_boundary_never_enters_native_fusion(monkeypatch):
     assert result[1] is residual
     fallback.assert_called_once_with(partial, residual, weight, 1e-6)
     runtime.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", [None, "nan", "inf", "wrong_norm", "wrong_residual", "missing_launch",
+                                     "extra_launch", "wrong_shape", "wrong_dtype"])
+def test_native_probe_fails_closed(failure):
+    expected = (torch.ones((1, 2, 8), dtype=torch.bfloat16), torch.full((1, 2, 8), 2, dtype=torch.bfloat16))
+    actual = [value.clone() for value in expected]
+    launches = 1
+    if failure == "nan":
+        actual[0][0, 0, 0] = float("nan")
+    elif failure == "inf":
+        actual[1][0, 0, 0] = float("inf")
+    elif failure == "wrong_norm":
+        actual[0].zero_()
+    elif failure == "wrong_residual":
+        actual[1][0, 0, 0] += 0.015625
+    elif failure == "missing_launch":
+        launches = 0
+    elif failure == "extra_launch":
+        launches = 2
+    elif failure == "wrong_shape":
+        actual[0] = actual[0].reshape(2, 8)
+    elif failure == "wrong_dtype":
+        actual[0] = actual[0].float()
+    assert _native_probe_valid(actual, expected, launches) is (failure is None)

@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import statistics
@@ -41,6 +42,7 @@ import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402
 
 import habana_frameworks.torch.core as htcore  # noqa: E402, F401
+from tp2_validation import validate_outputs  # noqa: E402
 
 
 def _load_bridge(path: Path):
@@ -212,11 +214,17 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--debug-values", action="store_true")
+    parser.add_argument("--validation-atol", type=float, default=0.015625)
+    parser.add_argument("--validation-rtol", type=float, default=0.015625)
     args = parser.parse_args()
     if args.elements <= 0 or args.elements % args.hidden_size:
         parser.error("elements must be a positive multiple of hidden-size")
     if args.calls <= 0:
         parser.error("calls must be positive")
+    if args.validation_replays <= 0 or args.iterations <= 0 or args.warmup < 0:
+        parser.error("validation-replays and iterations must be positive; warmup must be nonnegative")
+    if not all(math.isfinite(value) and value >= 0 for value in (args.validation_atol, args.validation_rtol)):
+        parser.error("validation tolerances must be finite and nonnegative")
 
     dist.init_process_group("hccl")
     rank = dist.get_rank()
@@ -282,10 +290,21 @@ def main() -> None:
             partial.copy_(partial_cpu)
             residual.copy_(residual_cpu)
             weight.copy_(weight_cpu)
+        launch_count_before = bridge.collective_launch_count()
         chain_result = run_chain(partial, residual, weight)
         normalized, residual_out = chain_result[:2]
         torch.hpu.synchronize()
         expected_norm, expected_residual = _reference(args.elements, args.hidden_size, replay, args.calls, args.epsilon)
+        valid, errors = validate_outputs(
+            (normalized.cpu(), residual_out.cpu()), (expected_norm, expected_residual),
+            atol=args.validation_atol, rtol=args.validation_rtol,
+            launches=bridge.collective_launch_count() - launch_count_before,
+            expected_launches=args.calls if args.mode in ("native", "compile-native") else None)
+        failed = torch.tensor([int(not valid)], dtype=torch.int32, device="hpu")
+        dist.all_reduce(failed)
+        if failed.cpu().item():
+            dist.destroy_process_group()
+            raise RuntimeError(f"TP2 validation failed before timing: replay={replay}, errors={errors}")
         if args.debug_values and replay == 0:
             print(
                 json.dumps({
@@ -339,6 +358,9 @@ def main() -> None:
         "calls": args.calls,
         "mode": args.mode,
         "validation_replays": args.validation_replays,
+        "validation_passed": True,
+        "validation_atol": args.validation_atol,
+        "validation_rtol": args.validation_rtol,
         "max_norm_error": max_norm_error,
         "max_residual_error": max_residual_error,
         "host_sync_median_us": statistics.median(samples_us),

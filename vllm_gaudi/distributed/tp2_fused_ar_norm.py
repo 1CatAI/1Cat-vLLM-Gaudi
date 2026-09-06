@@ -103,6 +103,64 @@ def _resolve_runtime():
     return runtime
 
 
+def _native_probe_valid(actual, expected, launches: int) -> bool:
+    """Fail closed on missing execution, nonfinite values or incorrect outputs."""
+    if launches != 1 or len(actual) != 2 or len(expected) != 2:
+        return False
+    for output, reference in zip(actual, expected):
+        if output.shape != reference.shape or output.dtype != reference.dtype:
+            return False
+        if not bool(torch.isfinite(output).all() and torch.isfinite(reference).all()):
+            return False
+    return (torch.equal(actual[1], expected[1])
+            and torch.allclose(actual[0].float(), expected[0].float(), atol=0.015625, rtol=0.015625))
+
+
+def validate_tp2_gemma_fusion_runtime(hidden_size: int) -> None:
+    """Check the loaded Bridge/extension pair before enabling Gemma fusion.
+
+    The extension depends on a Bridge collective-output metadata ABI. Merely
+    importing its schema does not establish that the loaded backend executes it.
+    This startup-only check also exercises graph-produced effective weights and
+    changing allocations. It never adds synchronization to the decode path.
+    """
+    bridge, _backend, communicator_id = _resolve_runtime()
+    if not callable(getattr(bridge, "collective_launch_count", None)):
+        raise RuntimeError("Rebuild the TP2 extension with native execution counters")
+    tp_group = get_tp_group().device_group
+    rank = dist.get_rank(group=tp_group)
+
+    def native(partial, residual, raw_weight):
+        packed, _inverse = torch.ops.hccl.tp2_allreduce_residual_rms_norm(
+            partial, residual, raw_weight + 1.0, 1e-6, communicator_id)
+        return packed[0], packed[1]
+
+    compiled = torch.compile(native, backend="hpu_backend", fullgraph=True, dynamic=False)
+    index = torch.arange(hidden_size * 2)
+    weight_index = torch.arange(hidden_size)
+    for replay in range(3):
+        p0 = ((((index * 17 + replay * 7) % 127) - 63).float() / 64).to(torch.bfloat16)
+        p1 = ((((index * 17 + 29 + replay * 7) % 127) - 63).float() / 64).to(torch.bfloat16)
+        residual = ((((index * 11 + replay * 5) % 113) - 56).float() / 32).to(torch.bfloat16)
+        weight = ((((weight_index * 3 + replay * 5) % 31) - 15).float() / 128).to(torch.bfloat16)
+        shape = (1, 2, hidden_size)
+        expected_residual = (residual + (p0 + p1)).reshape(shape)
+        rf = expected_residual.float()
+        expected_norm = (rf * torch.rsqrt(rf.square().mean(-1, keepdim=True) + 1e-6)
+                         * (weight + 1.0).float()).to(torch.bfloat16)
+        inputs = ((p0 if rank == 0 else p1).reshape(shape).to("hpu"), residual.reshape(shape).to("hpu"),
+                  weight.to("hpu"))
+        before = bridge.collective_launch_count()
+        actual = tuple(output.cpu() for output in compiled(*inputs))
+        valid = _native_probe_valid(actual, (expected_norm, expected_residual),
+                                    bridge.collective_launch_count() - before)
+        failure = torch.tensor([int(not valid)], dtype=torch.int32, device="hpu")
+        dist.all_reduce(failure, group=tp_group)
+        if failure.cpu().item():
+            raise RuntimeError("TP2 Gemma native fusion validation failed; use a matching patched Bridge/extension "
+                               "or disable VLLM_HPU_TP2_GEMMA_FUSED_AR_NORM. No model reductions were changed.")
+
+
 def _tp2_fused_ar_norm_impl(
     partial: torch.Tensor,
     residual: torch.Tensor,
