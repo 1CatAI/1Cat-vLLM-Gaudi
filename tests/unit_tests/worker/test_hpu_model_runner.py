@@ -50,12 +50,12 @@ def test_zero_compact_gdn_slot_clears_only_reused_request_states():
 
     _zero_compact_gdn_slot([first, second], base_slot=1, num_groups=3)
 
-    torch.testing.assert_close(first[1:4], first_before[1:4])
-    torch.testing.assert_close(second[1:4], second_before[1:4])
+    torch.testing.assert_close(first[[1, 3, 5]], first_before[[1, 3, 5]])
+    torch.testing.assert_close(second[[1, 3, 5]], second_before[[1, 3, 5]])
     assert torch.count_nonzero(first[0]) == 0
     assert torch.count_nonzero(second[0]) == 0
-    assert torch.count_nonzero(first[4:7]) == 0
-    assert torch.count_nonzero(second[4:7]) == 0
+    assert torch.count_nonzero(first[[2, 4, 6]]) == 0
+    assert torch.count_nonzero(second[[2, 4, 6]]) == 0
     assert torch.count_nonzero(first[7]) == 0
     assert torch.count_nonzero(second[7]) == 0
 
@@ -770,6 +770,7 @@ def test_cache_block_capacity_keeps_hybrid_block_units_separate():
 def test_direct_gdn_state_accepts_contiguous_request_prefix_and_free_padding():
     runner = object.__new__(HPUModelRunner)
     runner._direct_gdn_state_enabled = True
+    runner._padded_direct_gdn_state_enabled = True
     runner._compact_gdn_enabled = True
     runner.use_prefix_caching = False
     runner._compact_gdn_group_ids = {1, 3}
