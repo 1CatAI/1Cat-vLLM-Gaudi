@@ -178,14 +178,19 @@ def _zero_compact_gdn_slot(
         raise ValueError(
             f"Invalid compact GDN slot: base_slot={base_slot}, num_groups={num_groups}"
         )
-    start = base_slot * num_groups + 1
+    state_tensors = tuple(state_tensors)
+    # Validate all pools before mutating any of them. Their first dimension
+    # contains group-major spans plus the two global sentinel rows.
+    for state in state_tensors:
+        if (state.ndim == 0 or state.shape[0] <= 2 or (state.shape[0] - 2) % num_groups
+                or base_slot >= (state.shape[0] - 2) // num_groups):
+            raise ValueError(
+                "Invalid group-major compact GDN state tensor for slot clear: "
+                f"shape={tuple(state.shape)}, base_slot={base_slot}, num_groups={num_groups}"
+            )
     needs_hpu_sync = False
     for state in state_tensors:
-        if state.ndim == 0 or start + num_groups > state.shape[0]:
-            raise ValueError(
-                "Compact GDN state tensor is too small for slot clear: "
-                f"shape={tuple(state.shape)}, start={start}, num_groups={num_groups}"
-            )
+        group_span = (state.shape[0] - 2) // num_groups
         # Slot 0 and the final slot are global sentinels. Compiled padded
         # prompt/decode graphs may write them, so stale non-finite values must
         # not survive into the next request. Update the base tensor directly:
@@ -195,7 +200,7 @@ def _zero_compact_gdn_slot(
             state.zero_()
         else:
             clear_indices = torch.tensor(
-                [0, *range(start, start + num_groups), state.shape[0] - 1],
+                [0, *(group * group_span + base_slot + 1 for group in range(num_groups)), state.shape[0] - 1],
                 dtype=torch.long,
                 device=state.device,
             )
@@ -1512,6 +1517,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # Tensor size: max_num_reqs * num_gdn_groups + 2.
         self._compact_gdn_enabled = os.environ.get("VLLM_COMPACT_GDN", "1").strip().lower() in ("1", "true")
         self._direct_gdn_state_enabled = (gaudi_envs.VLLM_HPU_FLASHINFER_GDN and gaudi_envs.VLLM_HPU_GDN_DIRECT_STATE)
+        self._padded_direct_gdn_state_enabled = gaudi_envs.VLLM_HPU_GDN_PADDED_DIRECT_STATE
         self._compact_gdn_group_ids: set[int] = set()
         self._compact_gdn_group_offset: dict[int, int] = {}  # {group_idx: g_offset}
         self._num_gdn_groups = 0  # set during initialize_kv_cache
@@ -1519,6 +1525,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self._gdn_req_to_base_slot: dict[str, int] = {}
         self._compact_gdn_state_tensors: list[torch.Tensor] = []
         self._logged_direct_gdn_state = False
+        self._logged_padded_direct_gdn_state = False
 
         # Lazy initialization
         # self.model: nn.Module  # set after load_model
@@ -1720,13 +1727,33 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         tokens_per_request: int = 1,
     ) -> bool:
         if (not self._direct_gdn_state_enabled or not self._compact_gdn_enabled or self.use_prefix_caching
-                or not self._compact_gdn_group_ids or num_indices != target_bs or tokens_per_request != 1):
+                or not self._compact_gdn_group_ids or not 0 < num_indices <= target_bs <= self._gdn_max_reqs
+                or tokens_per_request != 1):
             return False
-        base_slots = torch.arange(num_indices, dtype=torch.int32)
+        if num_indices < target_bs and not self._padded_direct_gdn_state_enabled:
+            return False
+        # This gate runs on scheduler metadata, before async H2D copies. Do not
+        # accidentally add a device synchronization when proving ownership.
+        if (state_indices.device.type != "cpu" or state_indices.ndim != 2 or state_indices.shape[1] != target_bs
+                or any(group_idx < 0 or group_idx >= state_indices.shape[0]
+                       for group_idx in self._compact_gdn_group_ids)):
+            return False
+        base_slots = torch.arange(num_indices, dtype=torch.int32, device="cpu")
         for group_idx in self._compact_gdn_group_ids:
             group_offset = self._compact_gdn_group_offset[group_idx]
             expected = group_offset * self._gdn_max_reqs + base_slots + 1
             if not torch.equal(state_indices[group_idx, :num_indices], expected):
+                return False
+
+            # Direct decode mutates the full padded prefix of the compact
+            # group-major pool. Padding rows may alias only free base slots;
+            # paused requests retain their slots while they are unscheduled.
+            if target_bs > num_indices and not torch.all(state_indices[group_idx, num_indices:target_bs] == -1):
+                return False
+
+        if target_bs > num_indices:
+            free_slots = set(self._gdn_slot_free_list)
+            if any(slot not in free_slots for slot in range(num_indices, target_bs)):
                 return False
         return True
 
@@ -3446,6 +3473,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 self._logged_direct_gdn_state = True
                 logger.info(
                     "GDN direct-state decode enabled: active_bs=%d padded_bs=%d groups=%d",
+                    num_decodes,
+                    padded_batch_size,
+                    len(self._compact_gdn_group_ids),
+                )
+            if (direct_gdn_state and num_decodes < padded_batch_size and not self._logged_padded_direct_gdn_state
+                    and not self.warmup_mode):
+                self._logged_padded_direct_gdn_state = True
+                logger.info(
+                    "GDN padded direct-state decode enabled: active_bs=%d padded_bs=%d groups=%d",
                     num_decodes,
                     padded_batch_size,
                     len(self._compact_gdn_group_ids),

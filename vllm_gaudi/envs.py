@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE: bool = False
     VLLM_HPU_FLASHINFER_GDN_PREFILL: bool = False
     VLLM_HPU_GDN_DIRECT_STATE: bool = True
+    VLLM_HPU_GDN_PADDED_DIRECT_STATE: bool = False
     VLLM_HPU_CGUID_DYNAMIC_QUANT: bool = False
     VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS: int = 32
     VLLM_HPU_FUSED_GREEDY_LOGITS: bool = False
@@ -167,6 +168,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use group-major compact GDN state views for full decode buckets.
     "VLLM_HPU_GDN_DIRECT_STATE":
     lambda: os.environ.get("VLLM_HPU_GDN_DIRECT_STATE", "true").strip().lower() in ("1", "true"),
+
+    # Opt in to free-slot padding of the compact direct-state decode path.
+    "VLLM_HPU_GDN_PADDED_DIRECT_STATE":
+    lambda: os.environ.get("VLLM_HPU_GDN_PADDED_DIRECT_STATE", "false").strip().lower() in ("1", "true"),
 
     # Use Gaudi's calculate_scale_for_cast CGUID for decode-sized per-token
     # dynamic FP8 scales instead of materializing abs + reduce_max + scale
