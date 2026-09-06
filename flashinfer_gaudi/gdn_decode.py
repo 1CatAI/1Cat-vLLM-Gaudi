@@ -7,52 +7,9 @@ import warnings
 
 import torch
 
-from flashinfer_gaudi._config import bridge_auto_enabled, get_backend_policy
-from flashinfer_gaudi._native import bridge_packed_gdn_op, public_packed_gdn_op
+from flashinfer_gaudi._dispatch import BackendUnavailableError as BackendUnavailableError
+from flashinfer_gaudi._dispatch import require_reference_allowed
 from flashinfer_gaudi._reference import gating_parameters, packed_recurrent_decode, recurrent_decode_from_qkv
-from flashinfer_gaudi._tactics import public_gdn_auto_promoted
-
-
-class BackendUnavailableError(RuntimeError):
-    """Raised when a forced backend cannot execute the requested shape."""
-
-
-def _device_is_hpu(tensor: torch.Tensor) -> bool:
-    return tensor.device.type in ("hpu", "privateuseone")
-
-
-def _native_packed_supported(
-    packed_qkv: torch.Tensor,
-    log_decay: torch.Tensor,
-    beta: torch.Tensor,
-    state_pool: torch.Tensor,
-    load_state_indices: torch.Tensor | None,
-    store_state_indices: torch.Tensor | None,
-    scale: float | None,
-    use_qk_l2norm: bool,
-) -> bool:
-    if not _device_is_hpu(packed_qkv):
-        return False
-    if state_pool.dtype != torch.float32 or state_pool.ndim != 4:
-        return False
-    if packed_qkv.dtype != torch.bfloat16 or log_decay.dtype != torch.float32 or beta.dtype != torch.bfloat16:
-        return False
-    if state_pool.shape[-2:] != (128, 128):
-        return False
-    if not use_qk_l2norm:
-        return False
-    expected_scale = 128**-0.5
-    if scale is not None and abs(scale - expected_scale) > 1e-12:
-        return False
-    if load_state_indices is None or store_state_indices is None:
-        return False
-    if load_state_indices.shape != store_state_indices.shape:
-        return False
-    # Legacy public GUIDs only support same-slot read/write. New native ops may
-    # relax this, but equality remains the safe common contract.
-    if load_state_indices is not store_state_indices:
-        return False
-    return packed_qkv.shape[0] == load_state_indices.numel()
 
 
 def _call_native_packed(
@@ -63,6 +20,7 @@ def _call_native_packed(
     state_pool: torch.Tensor,
     state_indices: torch.Tensor,
 ) -> torch.Tensor:
+    require_reference_allowed("gdn_decode_packed legacy torch prologue")
     qualified_name = getattr(op, "_qualified_op_name", "")
     legacy_f32_contract = qualified_name in (
         "custom_op::custom_gdn_packed_decode_f32_gaudi2",
@@ -111,48 +69,7 @@ def gated_delta_rule_decode_packed(
     Backend selection is completed before an implementation is called. A
     failed state-mutating native call is deliberately not retried.
     """
-    policy = get_backend_policy()
-    if not _device_is_hpu(packed_qkv) and policy in ("public", "bridge"):
-        raise BackendUnavailableError(f"The forced {policy} backend requires an HPU tensor.")
-    if policy == "pytorch" or not _device_is_hpu(packed_qkv):
-        return packed_recurrent_decode(
-            packed_qkv,
-            log_decay,
-            beta,
-            state_pool,
-            load_state_indices,
-            store_state_indices,
-            scale,
-            use_qk_l2norm,
-        )
-
-    supported = _native_packed_supported(
-        packed_qkv,
-        log_decay,
-        beta,
-        state_pool,
-        load_state_indices,
-        store_state_indices,
-        scale,
-        use_qk_l2norm,
-    )
-    assert load_state_indices is not None
-
-    if policy == "bridge" or (policy == "auto" and bridge_auto_enabled()):
-        bridge_op = bridge_packed_gdn_op()
-        if supported and bridge_op is not None:
-            return _call_native_packed(bridge_op, packed_qkv, log_decay, beta, state_pool,
-                                       load_state_indices), state_pool
-        if policy == "bridge":
-            raise BackendUnavailableError("The bridge GDN backend is unavailable for this runtime or shape.")
-
-    public_op = public_packed_gdn_op()
-    use_public = policy == "public" or (policy == "auto" and public_gdn_auto_promoted())
-    if use_public and supported and public_op is not None:
-        return _call_native_packed(public_op, packed_qkv, log_decay, beta, state_pool, load_state_indices), state_pool
-    if policy == "public":
-        raise BackendUnavailableError("The public native GDN backend is unavailable for this runtime or shape.")
-
+    require_reference_allowed("gated_delta_rule_decode_packed")
     return packed_recurrent_decode(
         packed_qkv,
         log_decay,
@@ -182,6 +99,7 @@ def gated_delta_rule_decode_pretranspose(
     output_state_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run GDN decode using the FlashInfer VK/K-last state convention."""
+    require_reference_allowed("gated_delta_rule_decode_pretranspose")
     if state is None:
         if initial_state is None:
             state = torch.zeros(
@@ -232,6 +150,7 @@ def gated_delta_rule_decode(
     use_qk_l2norm: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the FlashInfer K-major decode API on a ``[B,HV,K,V]`` state."""
+    require_reference_allowed("gated_delta_rule_decode")
     if state.ndim != 4:
         raise ValueError(f"state must have [B,HV,K,V] shape, got {state.shape}.")
     batch, _, _, key_dim = q.shape
@@ -284,6 +203,7 @@ def gated_delta_rule_mtp(
     output_state_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Portable implementation of FlashInfer's pooled multi-token GDN API."""
+    require_reference_allowed("gated_delta_rule_mtp")
     if disable_state_update is None:
         warnings.warn(
             "disable_state_update currently defaults to True for FlashInfer 0.6.18 compatibility; "

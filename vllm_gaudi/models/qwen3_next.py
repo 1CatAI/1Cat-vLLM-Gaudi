@@ -47,6 +47,16 @@ def enable_hpu_qwen3_tp2_fused_ar_norm(model) -> int:
             return 0
         row_parallel_layers.extend((output_projection, down_projection))
 
+    from vllm_gaudi.ops.hpu_layernorm import HPUGemmaRMSNorm, HPURMSNorm
+
+    norms = [getattr(inner_model, "norm", None)]
+    for layer in layers:
+        norms.extend((getattr(layer, "input_layernorm", None), getattr(layer, "post_attention_layernorm", None)))
+    if not all(isinstance(norm, (HPURMSNorm, HPUGemmaRMSNorm)) for norm in norms):
+        # Never disable a reduction unless its consumer implements the
+        # deferred collective, including upstream normalization variants.
+        return 0
+
     from vllm_gaudi.distributed.tp2_fused_ar_norm import initialize_tp2_fused_ar_norm_runtime
 
     initialize_tp2_fused_ar_norm_runtime()
@@ -54,10 +64,8 @@ def enable_hpu_qwen3_tp2_fused_ar_norm(model) -> int:
     inner_model.embed_tokens._hpu_defer_tp2_reduce = True
     for projection in row_parallel_layers:
         projection.reduce_results = False
-    for layer in layers:
-        layer.input_layernorm._hpu_tp2_fused_ar_norm = True
-        layer.post_attention_layernorm._hpu_tp2_fused_ar_norm = True
-    inner_model.norm._hpu_tp2_fused_ar_norm = True
+    for norm in norms:
+        norm._hpu_tp2_fused_ar_norm = True
     return len(row_parallel_layers) + 1
 
 

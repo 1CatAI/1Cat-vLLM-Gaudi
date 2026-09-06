@@ -17,6 +17,40 @@ if TYPE_CHECKING:
     VLLM_MINIMAX_M3_MOE_DECODE_GATHER: bool = True
     VLLM_MINIMAX_M3_MOE_GATHER_MAX_TOKENS: int = 16
     VLLM_MM_WARMUP_OUTSIDE_COMPILE_ONLY: bool = False
+    VLLM_HPU_TRITON_MODE: str = "off"
+    VLLM_HPU_TRITON_CACHE_DIR: Optional[str] = None
+    VLLM_HPU_TRITON_BLOCK_SIZE: int = 256
+    VLLM_HPU_TRITON_SILU_BLOCK_SIZE: int = 128
+    VLLM_HPU_TRITON_GDN_VALUE_TILE: int = 16
+
+    VLLM_GDN_CHUNK_SIZE: int = 0
+    VLLM_GDN_NEUMANN_ITERS: int = 14
+    VLLM_GDN_FUSED_STATE_MATMUL: bool = False
+    VLLM_GDN_DEFERRED_OUTPUT_ADD: bool = False
+    VLLM_GDN_RECURSIVE_SOLVER_BASE: int = 0
+    VLLM_GDN_COMPACT_REPEATED_KKT: bool = False
+    VLLM_GDN_COMPACT_REPEATED_LOCAL_ATTN: bool = False
+    VLLM_GDN_COMPILED_QK_L2NORM: bool = False
+    VLLM_GDN_FUSED_RMSNORM_GATED: bool = False
+    VLLM_GDN_FLASHQLA: bool = False
+    VLLM_GDN_FLASHQLA_FACTORIZE_PHASE_B: bool = False
+    VLLM_GDN_FLASHQLA_FP32_SCALING: bool = False
+    VLLM_GDN_BF16_BMM_F32: bool = False
+    VLLM_GDN_SOLVE_BF16_BMM_F32: bool = False
+    VLLM_GDN_BF16_BMM_F32_EXTENSION: str = ""
+    VLLM_GDN_QWEN38_NATIVE_QK_PREP: bool = False
+    VLLM_GDN_QWEN38_BF16_QK: bool = False
+    VLLM_GDN_QWEN38_COMPACT_QK: bool = False
+    VLLM_GDN_QWEN38_NATIVE_COMPACT_KKT: bool = False
+    VLLM_GDN_COMPACT_QK_FACTOR_GATE: bool = False
+    VLLM_GDN_NATIVE_RECURRENT_SCAN: bool = False
+    VLLM_GDN_QWEN38_NATIVE_QK_PREP_EXTENSION: str = ""
+    VLLM_GDN_HPU_CAUSAL_CONV1D: bool = False
+    VLLM_GDN_TOKEN_MAJOR_CAUSAL_CONV1D: bool = False
+    VLLM_HPU_DYNAMIC_QUANT_CGUID: bool = False
+    VLLM_HPU_DYNAMIC_QUANT_CGUID_MIN_TOKENS: int = 2048
+    VLLM_HPU_EXPLICIT_SIGMOID_SILU: bool = False
+    VLLM_HPU_EXPLICIT_SIGMOID_SILU_MIN_TOKENS: int = 2048
     VLLM_HPU_FLASHINFER_GDN: bool = False
     VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE: bool = False
     VLLM_HPU_FLASHINFER_GDN_PREFILL: bool = False
@@ -24,12 +58,6 @@ if TYPE_CHECKING:
     VLLM_HPU_CGUID_DYNAMIC_QUANT: bool = False
     VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS: int = 32
     VLLM_HPU_FUSED_GREEDY_LOGITS: bool = False
-    VLLM_GDN_CHUNK_SIZE: int = 0
-    VLLM_GDN_NEUMANN_ITERS: int = 14
-    VLLM_GDN_FUSED_STATE_MATMUL: bool = False
-    VLLM_GDN_RECURSIVE_SOLVER_BASE: int = 0
-    VLLM_GDN_COMPACT_REPEATED_KKT: bool = False
-    VLLM_GDN_COMPILED_QK_L2NORM: bool = False
 
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
@@ -101,6 +129,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MM_WARMUP_OUTSIDE_COMPILE_ONLY":
     lambda: os.environ.get("VLLM_MM_WARMUP_OUTSIDE_COMPILE_ONLY", "false").strip().lower() in ("1", "true"),
 
+    # Gaudi2-native Triton backend policy. `off` preserves the vendor path,
+    # `hybrid` permits a recorded vendor fallback, and `strict` fails closed.
+    "VLLM_HPU_TRITON_MODE":
+    lambda: os.environ.get("VLLM_HPU_TRITON_MODE", "off").strip().lower(),
+    "VLLM_HPU_TRITON_CACHE_DIR":
+    lambda: os.environ.get("VLLM_HPU_TRITON_CACHE_DIR", None),
+    "VLLM_HPU_TRITON_BLOCK_SIZE":
+    lambda: int(os.environ.get("VLLM_HPU_TRITON_BLOCK_SIZE", "256")),
+    "VLLM_HPU_TRITON_SILU_BLOCK_SIZE":
+    lambda: int(os.environ.get("VLLM_HPU_TRITON_SILU_BLOCK_SIZE", "128")),
+    "VLLM_HPU_TRITON_GDN_VALUE_TILE":
+    lambda: int(os.environ.get("VLLM_HPU_TRITON_GDN_VALUE_TILE", "16")),
+
     # Enable the in-tree FlashInfer-compatible GDN decode adapter. Auto mode
     # uses only offline-promoted native tactics and otherwise selects the
     # compile-friendly reference implementation.
@@ -158,6 +199,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GDN_FUSED_STATE_MATMUL":
     lambda: os.environ.get("VLLM_GDN_FUSED_STATE_MATMUL", "false").lower() in ("1", "true"),
 
+    # Avoid per-chunk in-place writes to views of the phase-B output tensor.
+    "VLLM_GDN_DEFERRED_OUTPUT_ADD":
+    lambda: os.environ.get("VLLM_GDN_DEFERRED_OUTPUT_ADD", "false").lower() in ("1", "true"),
     # Use recursive block inversion for GDN unit lower-triangular matrices.
     # Zero disables the path; a positive power of two selects the base size.
     "VLLM_GDN_RECURSIVE_SOLVER_BASE":
@@ -168,9 +212,112 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GDN_COMPACT_REPEATED_KKT":
     lambda: os.environ.get("VLLM_GDN_COMPACT_REPEATED_KKT", "false").lower() in ("1", "true"),
 
+    # Compute phase-B Q @ K^T only for unique Q/K heads, then combine the
+    # compact product with each repeated value head's causal decay.
+    "VLLM_GDN_COMPACT_REPEATED_LOCAL_ATTN":
+    lambda: os.environ.get("VLLM_GDN_COMPACT_REPEATED_LOCAL_ATTN", "false").lower() in ("1", "true"),
+
     # Keep GDN Q/K L2 normalization inside the compiled prefill graph.
     "VLLM_GDN_COMPILED_QK_L2NORM":
     lambda: os.environ.get("VLLM_GDN_COMPILED_QK_L2NORM", "false").lower() in ("1", "true"),
+
+    # Use Habana FusedRMSNorm for the Qwen GDN output norm before applying
+    # the output gate. This is currently limited to the prefill path.
+    "VLLM_GDN_FUSED_RMSNORM_GATED":
+    lambda: os.environ.get("VLLM_GDN_FUSED_RMSNORM_GATED", "false").lower() in ("1", "true"),
+
+    # Use the FlashQLA algebraic reformulation for GDN prefill. This is a
+    # Gaudi-native implementation and does not load FlashQLA's CUDA kernels.
+    "VLLM_GDN_FLASHQLA":
+    lambda: os.environ.get("VLLM_GDN_FLASHQLA", "false").lower() in ("1", "true"),
+
+    # Keep the algebraically factorized local-decay matrix in FlashQLA phase
+    # B. This research path is disabled because separate positive gate factors
+    # can overflow even when their final causal-decay product is finite.
+    "VLLM_GDN_FLASHQLA_FACTORIZE_PHASE_B":
+    lambda: os.environ.get("VLLM_GDN_FLASHQLA_FACTORIZE_PHASE_B", "false").lower() in ("1", "true"),
+
+    # Evaluate FlashQLA phase-A diagonal scale products in FP32 before
+    # returning to the BF16 MME path.
+    "VLLM_GDN_FLASHQLA_FP32_SCALING":
+    lambda: os.environ.get("VLLM_GDN_FLASHQLA_FP32_SCALING", "false").lower() in ("1", "true"),
+
+    # Use a research Synapse batch_gemm backend with BF16 inputs and an FP32
+    # output for the GDN recurrent state projection.
+    "VLLM_GDN_BF16_BMM_F32":
+    lambda: os.environ.get("VLLM_GDN_BF16_BMM_F32", "false").lower() in ("1", "true"),
+
+    # Use the mixed-output batch_gemm for recursive KKT block merges. The
+    # base 16x16 inverse remains FP32 for numerical stability.
+    "VLLM_GDN_SOLVE_BF16_BMM_F32":
+    lambda: os.environ.get("VLLM_GDN_SOLVE_BF16_BMM_F32", "false").lower() in ("1", "true"),
+
+    # PyTorch registration extension for the mixed-output batch_gemm backend.
+    "VLLM_GDN_BF16_BMM_F32_EXTENSION":
+    lambda: os.environ.get("VLLM_GDN_BF16_BMM_F32_EXTENSION", ""),
+
+    # Use the fixed-shape Gaudi2 TPC kernel for Qwen3.8 TP1 prompt Q/K
+    # normalization and grouped-head expansion.
+    "VLLM_GDN_QWEN38_NATIVE_QK_PREP":
+    lambda: os.environ.get("VLLM_GDN_QWEN38_NATIVE_QK_PREP", "false").lower() in ("1", "true"),
+
+    # Write the Qwen3.8 native expanded Q/K output directly as BF16, matching
+    # the dtype consumed by the optimized GDN graph.
+    "VLLM_GDN_QWEN38_BF16_QK":
+    lambda: os.environ.get("VLLM_GDN_QWEN38_BF16_QK", "false").lower() in ("1", "true"),
+
+    # Keep Qwen3.8 prompt Q/K at their 16 physical heads. The GDN grouped
+    # value-head path maps each of 48 value heads to its compact Q/K head.
+    "VLLM_GDN_QWEN38_COMPACT_QK":
+    lambda: os.environ.get("VLLM_GDN_QWEN38_COMPACT_QK", "false").lower() in ("1", "true"),
+
+    # Fuse compact Qwen3.8 KKT broadcast, beta scaling, lower masking, and
+    # identity insertion in one Gaudi2 TPC kernel.
+    "VLLM_GDN_QWEN38_NATIVE_COMPACT_KKT":
+    lambda: os.environ.get("VLLM_GDN_QWEN38_NATIVE_COMPACT_KKT", "false").lower() in ("1", "true"),
+
+    # For compact Q/K, apply the per-value-head gate to the smaller KKT
+    # coefficient matrix before multiplying by the shared physical K head.
+    "VLLM_GDN_COMPACT_QK_FACTOR_GATE":
+    lambda: os.environ.get("VLLM_GDN_COMPACT_QK_FACTOR_GATE", "false").lower() in ("1", "true"),
+
+    # Lower the BF16 phase-B recurrent chain as one mixed MME/TPC Synapse
+    # subgraph so the compiler can retain state and remove chunk-wise DMA.
+    "VLLM_GDN_NATIVE_RECURRENT_SCAN":
+    lambda: os.environ.get("VLLM_GDN_NATIVE_RECURRENT_SCAN", "false").lower() in ("1", "true"),
+
+    # PyTorch registration extension for the Qwen3.8 native Q/K TPC kernel.
+    "VLLM_GDN_QWEN38_NATIVE_QK_PREP_EXTENSION":
+    lambda: os.environ.get("VLLM_GDN_QWEN38_NATIVE_QK_PREP_EXTENSION", ""),
+
+    # Use the native HPU causal-conv1d forward op for GDN prefill. The
+    # returned functional cache is persisted by the model wrapper.
+    "VLLM_GDN_HPU_CAUSAL_CONV1D":
+    lambda: os.environ.get("VLLM_GDN_HPU_CAUSAL_CONV1D", "false").lower() in ("1", "true"),
+
+    # Keep the compiled PyTorch GDN prompt convolution in token-major layout
+    # so its large packed activation does not need two DMA transposes.
+    "VLLM_GDN_TOKEN_MAJOR_CAUSAL_CONV1D":
+    lambda: os.environ.get("VLLM_GDN_TOKEN_MAJOR_CAUSAL_CONV1D", "false").lower() in ("1", "true"),
+
+    # Use Habana's scale-calculation compound GUID for dynamic per-token FP8
+    # activation quantization.
+    "VLLM_HPU_DYNAMIC_QUANT_CGUID":
+    lambda: os.environ.get("VLLM_HPU_DYNAMIC_QUANT_CGUID", "false").lower() in ("1", "true"),
+
+    # Restrict the dynamic-quantization compound GUID to large static prefill
+    # graphs. Small prompt and decode graphs use the ordinary reduction path.
+    "VLLM_HPU_DYNAMIC_QUANT_CGUID_MIN_TOKENS":
+    lambda: int(os.environ.get("VLLM_HPU_DYNAMIC_QUANT_CGUID_MIN_TOKENS", "2048")),
+
+    # Express long-prompt SwiGLU as gate * sigmoid(gate) * up. On Gaudi this
+    # lets the graph compiler fuse activation, multiply, and FP8 quantization.
+    "VLLM_HPU_EXPLICIT_SIGMOID_SILU":
+    lambda: os.environ.get("VLLM_HPU_EXPLICIT_SIGMOID_SILU", "false").lower() in ("1", "true"),
+
+    # Keep the ordinary HPU SiLU kernel for small prompt and decode graphs.
+    "VLLM_HPU_EXPLICIT_SIGMOID_SILU_MIN_TOKENS":
+    lambda: int(os.environ.get("VLLM_HPU_EXPLICIT_SIGMOID_SILU_MIN_TOKENS", "2048")),
 }
 
 # end-env-vars-definition

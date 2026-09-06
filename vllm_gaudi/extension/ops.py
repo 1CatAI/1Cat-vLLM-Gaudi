@@ -22,6 +22,7 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization import get_quantization_config as vllm_get_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+import vllm_gaudi.envs as gaudi_envs
 
 is_hpu_gaudi2 = htexp._get_device_type() == htexp.synDeviceType.synDeviceGaudi2
 is_hpu_gaudi3 = htexp._get_device_type() == htexp.synDeviceType.synDeviceGaudi3
@@ -34,6 +35,12 @@ import logging
 import os
 
 logger = logging.getLogger(__name__)
+
+_triton_dynamic_quant = None
+try:
+    from vllm_gaudi.ops.triton_gaudi import dynamic_quant as _triton_dynamic_quant
+except ImportError:
+    pass
 
 # MAX_EXPERTS_PER_SLICE is needed for 1.20, up to 64 experts per slice
 try:
@@ -481,7 +488,12 @@ def _fsdpa_prompt_attention(query: torch.Tensor,
     # The kernel overflows a signed-int32 *byte* offset while striding the bias plane, so the limit
     # tracks the bias element size regardless of softmax precision (fp32 softmax upcasts internally
     # but still strides the 2 B/elem bias). No fp32 special-casing needed.
-    num_q_tiles = _fsdpa_num_q_tiles(attn_bias)
+    # Inner KV slicing already tiles query rows and passes only small bias tiles
+    # to FusedSDPA. Applying outer query tiling as well creates symbolic slice
+    # shapes that the HPU compile backend cannot lower at long context.
+    inner_slicing = (getattr(fsdpa_op, '_supports_inner_slicing', False) is True
+                     and fsdpa_op.can_use_slicing(query, key, attn_bias, is_causal, padding_side, window_size, sinks))
+    num_q_tiles = 1 if inner_slicing else _fsdpa_num_q_tiles(attn_bias)
     if num_q_tiles == 1:
         attn_weights = call_fsdpa(query, attn_bias)
     else:
@@ -1011,15 +1023,24 @@ def apply_fp8_linear_hpu(
     return output
 
 
-def _use_cguid_dynamic_quant(data):
-    return (envs.VLLM_HPU_CGUID_DYNAMIC_QUANT and data.ndim == 2
-            and data.shape[0] <= envs.VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS)
+def _use_cguid_dynamic_quant(data, use_cguid=True):
+    token_count = data.numel() // data.shape[-1]
+    return use_cguid and (
+        (envs.VLLM_HPU_CGUID_DYNAMIC_QUANT and data.ndim == 2
+         and data.shape[0] <= envs.VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS)
+        or (gaudi_envs.VLLM_HPU_DYNAMIC_QUANT_CGUID
+            and token_count >= gaudi_envs.VLLM_HPU_DYNAMIC_QUANT_CGUID_MIN_TOKENS)
+    )
 
 
-def dynamic_quant(data, single_scale=False):
+def dynamic_quant(data, single_scale=False, use_cguid=True):
+    if not single_scale and _triton_dynamic_quant is not None and data.ndim == 2:
+        triton_result = _triton_dynamic_quant(data)
+        if triton_result is not None:
+            return triton_result
     if single_scale:
         scale = ((torch.abs(data)).max() + 1e-8) / FP8_MAX
-    elif _use_cguid_dynamic_quant(data):
+    elif _use_cguid_dynamic_quant(data, use_cguid=use_cguid):
         scale = torch.ops.hpu.calculate_scale_for_cast(
             data,
             2,  # MAX_ABS_PCS_CALCULATION
@@ -1029,9 +1050,7 @@ def dynamic_quant(data, single_scale=False):
             float(FP8_MAX),
             1.0,
         )
-        # Match the existing max-abs formula for tiny, non-zero rows.  The
-        # CGUID clamps an all-zero result to the BF16 minimum; that difference
-        # is harmless because the corresponding quantized row remains zero.
+        # Preserve the ordinary path's nonzero scale for zero/tiny rows.
         scale = scale + (1e-8 / FP8_MAX)
     else:
         scale = ((torch.abs(data)).max(dim=-1).values + 1e-8) / FP8_MAX
@@ -1108,7 +1127,8 @@ def fp8_block_linear_postprocess_weights(layer, force_channel_fp8=False):
                                            layer.quant_config.weight_block_size,
                                            original_M=orig_M,
                                            original_N=orig_N,
-                                           do_unpad=True))
+                                           do_unpad=True),
+            use_cguid=False)
         weight_scale_inv = weight_scale_inv.squeeze(-1)
         layer.weight.data.copy_(weight)
         layer.weight_scale_inv = torch.nn.Parameter(weight_scale_inv, requires_grad=False)
@@ -1136,10 +1156,12 @@ def fp8_block_moe_prepare_weights(layer, force_channel_fp8=False):
         # convert to channel-wise fp8
         w13_weight, w13_weight_scale_inv = dynamic_quant(
             dequant_block_fp8_weight_naive(layer.w13_weight.data, layer.w13_weight_scale_inv.data,
-                                           layer.quant_config.weight_block_size))
+                                           layer.quant_config.weight_block_size),
+            use_cguid=False)
         w2_weight, w2_weight_scale_inv = dynamic_quant(
             dequant_block_fp8_weight_naive(layer.w2_weight.data, layer.w2_weight_scale_inv.data,
-                                           layer.quant_config.weight_block_size))
+                                           layer.quant_config.weight_block_size),
+            use_cguid=False)
         w13_weight_scale_inv, w2_weight_scale_inv \
             = w13_weight_scale_inv.squeeze(-1), w2_weight_scale_inv.squeeze(-1)
         layer.w13_weight.data.copy_(w13_weight)

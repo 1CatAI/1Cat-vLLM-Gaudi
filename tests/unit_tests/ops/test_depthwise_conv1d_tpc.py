@@ -13,10 +13,97 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from vllm_gaudi.ops.causal_conv1d_pytorch import _depthwise_conv1d_tpc
+from vllm_gaudi.ops.causal_conv1d_pytorch import (
+    _depthwise_conv1d_tpc,
+    hpu_causal_conv1d_fn,
+    hpu_causal_conv1d_fn_token_major,
+)
 from vllm.platforms import current_platform
 
 DEVICE = current_platform.device_type
+
+
+def test_prefill_without_initial_state_masks_nonfinite_cache():
+    dim, seq_len, width = 4, 8, 4
+    x = torch.randn(dim, seq_len, device=DEVICE)
+    weight = torch.randn(dim, width, device=DEVICE)
+    conv_states = torch.full(
+        (2, width - 1, dim),
+        torch.nan,
+        device=DEVICE,
+    )
+    query_start_loc = torch.tensor([0, seq_len], device=DEVICE)
+
+    output = hpu_causal_conv1d_fn(
+        x=x,
+        weight=weight,
+        bias=None,
+        conv_states=conv_states,
+        query_start_loc=query_start_loc,
+        cache_indices=torch.tensor([0], device=DEVICE),
+        has_initial_state=torch.tensor([False], device=DEVICE),
+        activation=None,
+    )
+
+    assert torch.isfinite(output).all()
+    assert torch.isfinite(conv_states[0]).all()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_token_major_prefill_matches_channel_first(dtype):
+    torch.manual_seed(2917)
+    batch, seq_len, dim, width = 2, 9, 7, 4
+    x = torch.randn(batch * seq_len, dim, dtype=dtype)
+    weight = torch.randn(dim, width, dtype=dtype)
+    bias = torch.randn(dim, dtype=dtype)
+    base_states = torch.randn(4, width - 1, dim, dtype=dtype)
+    channel_states = base_states.clone()
+    token_states = base_states.clone()
+    query_start_loc = torch.tensor([0, seq_len, 2 * seq_len])
+    cache_indices = torch.tensor([1, 2])
+    has_initial_state = torch.tensor([True, False])
+
+    expected = hpu_causal_conv1d_fn(
+        x=x.transpose(0, 1),
+        weight=weight,
+        bias=bias,
+        conv_states=channel_states,
+        query_start_loc=query_start_loc,
+        cache_indices=cache_indices,
+        has_initial_state=has_initial_state,
+        activation="silu",
+    ).transpose(0, 1)
+    actual = hpu_causal_conv1d_fn_token_major(
+        x=x,
+        weight=weight,
+        bias=bias,
+        conv_states=token_states,
+        query_start_loc=query_start_loc,
+        cache_indices=cache_indices,
+        has_initial_state=has_initial_state,
+        activation="silu",
+    )
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(token_states, channel_states, atol=0, rtol=0)
+
+
+def test_token_major_prefill_masks_nonfinite_cache():
+    dim, seq_len, width = 4, 8, 4
+    conv_states = torch.full((2, width - 1, dim), torch.nan)
+    output = hpu_causal_conv1d_fn_token_major(
+        x=torch.randn(seq_len, dim),
+        weight=torch.randn(dim, width),
+        bias=None,
+        conv_states=conv_states,
+        query_start_loc=torch.tensor([0, seq_len]),
+        cache_indices=torch.tensor([0]),
+        has_initial_state=torch.tensor([False]),
+        activation=None,
+    )
+
+    assert torch.isfinite(output).all()
+    assert torch.isfinite(conv_states[0]).all()
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "source_baseline": "5c158439bc0e50318199e3898c99aa87fc617c31",
+  "flashinfer_contract": "3a75b4e353ce113171c4d075fc2d3cb5b7dd6c08",
+  "target": "gaudi2",
+  "synapse_version": "1.24.1",
+  "whole_library_native": false,
+  "domains": {
+    "activation_norm": "native_silu_candidate_only",
+    "quantization": "native_silu_row_fp8_and_block_weight_dequant_candidates",
+    "gemm": "native_bf16_gemm_silu_and_block_weight_linear_candidates",
+    "gdn_kda_mamba": "reference_graph_and_partial_native_prototype",
+    "kv_cache_rope": "planned",
+    "dense_attention": "planned",
+    "mla_sparse_cascade": "planned",
+    "moe": "planned",
+    "sampling_speculative": "planned",
+    "communication": "planned"
+  },
+  "operations": {
+    "block_fp8_linear": {
+      "native_implemented": true,
+      "entry": "flashinfer_gaudi.block_fp8_linear",
+      "engines": ["tpc", "mme"],
+      "contract": "contiguous inference BF16 x[M,K], E4M3 weight[N,K], FP32 scale[N/128,K/128]; aligned 128x128 blocks; BF16 output",
+      "compute": "TPC block-weight BF16 dequantization then BF16 MME; not FP8 MME",
+      "abi": "Bridge 1.24.1.482, Synapse 1.24.1, per-build checksummed artifact",
+      "correctness": "requires_matching_build_hardware_report",
+      "performance": "requires_shape_and_artifact_qualification",
+      "production_promoted": false
+    },
+    "block_fp8_dequant": {
+      "native_implemented": true,
+      "guid": "flashinfer_gaudi_block_fp8_dequant_gaudi2",
+      "contract": "aligned 128x128 E4M3 weight blocks and FP32 scales; BF16 scale cast before BF16 multiply",
+      "correctness": "requires_matching_build_hardware_report",
+      "performance": "requires_whole_linear_qualification",
+      "production_promoted": false
+    },
+    "silu_and_mul_quant": {
+      "native_implemented": true,
+      "entry": "flashinfer_gaudi.silu_and_mul_quant",
+      "nodes": ["silu_fwd_bf16", "flashinfer_gaudi_silu_mul_quant_bf16_gaudi2"],
+      "contract": "contiguous inference BF16 HPU [B,2D]; D in [256,17408], divisible by 128; E4M3 [B,D] and FP32 dequantization scale [B,1]",
+      "abi": "Bridge 1.24.1.482, Synapse 1.24.1, per-build checksummed artifact",
+      "correctness": "requires_matching_build_hardware_report",
+      "performance": "unqualified",
+      "production_promoted": false
+    },
+    "bf16_gemm_silu_mul": {
+      "native_implemented": true,
+      "entry": "flashinfer_gaudi.gemm.GemmSiluPlan",
+      "engines": ["mme", "tpc"],
+      "contract": "contiguous BF16 HPU x[M,K], weight[K,2D], D divisible by 128; functional or nonaliasing native out",
+      "abi": "Bridge 1.24.1.482, Synapse 1.24.1, per-build checksummed artifact",
+      "correctness": "requires_matching_build_hardware_report",
+      "performance": "unqualified",
+      "production_promoted": false
+    },
+    "silu_and_mul": {
+      "native_implemented": true,
+      "guid": "flashinfer_gaudi_silu_and_mul_bf16_gaudi2",
+      "contract": "contiguous rank-2 BF16 HPU, B>0, D divisible by 128, out=None",
+      "correctness": "requires_matching_build_hardware_report",
+      "performance": "unqualified",
+      "production_promoted": false
+    },
+    "gdn_decode_packed": {
+      "native_implemented": false,
+      "partial_tpc_prototype": true,
+      "reason": "legacy torch exp/cast/contiguous prologue",
+      "production_promoted": false
+    },
+    "gdn_decode_pretranspose": {"native_implemented": false, "production_promoted": false},
+    "gdn_decode": {"native_implemented": false, "production_promoted": false},
+    "gdn_mtp": {"native_implemented": false, "production_promoted": false},
+    "gdn_fused_decode_step": {"native_implemented": false, "production_promoted": false},
+    "chunk_gated_delta_rule": {"native_implemented": false, "production_promoted": false}
+  }
+}

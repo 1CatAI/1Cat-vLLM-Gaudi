@@ -9,6 +9,9 @@ from flashinfer_gaudi import gdn_decode, gdn_fused_decode, gdn_prefill
 from flashinfer_gaudi._capabilities import get_capabilities
 from flashinfer_gaudi._config import clear_backend_policy_override, set_backend_policy
 from flashinfer_gaudi._native import load_native_extensions
+from flashinfer_gaudi.activation import silu_and_mul
+from flashinfer_gaudi.quantization import silu_and_mul_quant
+from flashinfer_gaudi.block_scaled import block_fp8_dequant, block_fp8_linear
 from flashinfer_gaudi.gdn_prefill import chunk_gated_delta_rule
 from flashinfer_gaudi.gdn_fused_decode import gdn_fused_decode_step, gdn_fused_decode_step_supported
 
@@ -32,4 +35,8 @@ __all__ = [
     "get_capabilities",
     "load_native_extensions",
     "set_backend_policy",
+    "silu_and_mul",
+    "silu_and_mul_quant",
+    "block_fp8_dequant",
+    "block_fp8_linear",
 ]

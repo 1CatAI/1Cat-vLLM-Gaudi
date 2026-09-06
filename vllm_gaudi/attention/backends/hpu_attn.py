@@ -542,7 +542,8 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
         output_shape = query.shape
         if query.dim() == 2:
             if attn_metadata.seq_lens_tensor is not None:
-                batch_size = attn_metadata.seq_lens_tensor.shape[0] if not self.use_merged_prefill else 1
+                batch_size = 1 if self.use_merged_prefill and attn_metadata.is_prompt \
+                    else attn_metadata.seq_lens_tensor.shape[0]
             else:
                 assert attn_metadata.block_mapping is not None, \
                     "seq_lens_tensor must be provided for attention"

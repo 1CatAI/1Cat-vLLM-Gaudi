@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import collections
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 import copy
 import contextlib
 from copy import deepcopy
@@ -166,6 +166,44 @@ try:
                         "linear_attention")
 except (ImportError, AttributeError):
     pass
+
+
+def _zero_compact_gdn_slot(
+    state_tensors: Iterable[torch.Tensor],
+    base_slot: int,
+    num_groups: int,
+) -> None:
+    """Clear every group state before a compact GDN slot is reused."""
+    if base_slot < 0 or num_groups <= 0:
+        raise ValueError(
+            f"Invalid compact GDN slot: base_slot={base_slot}, num_groups={num_groups}"
+        )
+    start = base_slot * num_groups + 1
+    needs_hpu_sync = False
+    for state in state_tensors:
+        if state.ndim == 0 or start + num_groups > state.shape[0]:
+            raise ValueError(
+                "Compact GDN state tensor is too small for slot clear: "
+                f"shape={tuple(state.shape)}, start={start}, num_groups={num_groups}"
+            )
+        # Slot 0 and the final slot are global sentinels. Compiled padded
+        # prompt/decode graphs may write them, so stale non-finite values must
+        # not survive into the next request. Update the base tensor directly:
+        # HPU eager mode does not reliably persist zero_() on indexed views.
+        if state.shape[0] == num_groups + 2:
+            # max_num_seqs=1: every non-sentinel row belongs to this request.
+            state.zero_()
+        else:
+            clear_indices = torch.tensor(
+                [0, *range(start, start + num_groups), state.shape[0] - 1],
+                dtype=torch.long,
+                device=state.device,
+            )
+            state.index_fill_(0, clear_indices, 0)
+        needs_hpu_sync = needs_hpu_sync or state.device.type == "hpu"
+    if needs_hpu_sync:
+        htorch.hpu.synchronize()
+
 
 _TYPE_CACHE: dict[str, dict[str, Any]] = {}
 
@@ -1479,6 +1517,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self._num_gdn_groups = 0  # set during initialize_kv_cache
         self._gdn_slot_free_list: list[int] = []  # stack of free base-slot IDs
         self._gdn_req_to_base_slot: dict[str, int] = {}
+        self._compact_gdn_state_tensors: list[torch.Tensor] = []
         self._logged_direct_gdn_state = False
         self._logged_padded_direct_gdn_state = False
 
@@ -2067,6 +2106,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         base_slot = req_index
                     else:
                         base_slot = self._gdn_slot_free_list.pop()
+                    _zero_compact_gdn_slot(
+                        self._compact_gdn_state_tensors,
+                        base_slot,
+                        self._num_gdn_groups,
+                    )
                     self._gdn_req_to_base_slot[req_id] = base_slot
                     logger.debug("GDN_COMPACT alloc req=%s base_slot=%d free_list_len=%d", req_id, base_slot,
                                  len(self._gdn_slot_free_list))
@@ -6756,6 +6800,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         """
         self._compact_gdn_group_ids.clear()
         self._compact_gdn_group_offset.clear()
+        self._compact_gdn_state_tensors.clear()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
@@ -6954,7 +6999,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         compact_total = gdn_max_reqs * self._num_gdn_groups + 2
                         logger.debug("GDN compact tensor: %d slots (max_reqs=%d * groups=%d + 2) vs baseline %d",
                                      compact_total, gdn_max_reqs, self._num_gdn_groups, num_blocks + 1)
-                        kv_caches[layer_name] = _mamba_state_tensors(kv_cache_spec, layer_pos, compact_total)
+                        state_tensors = _mamba_state_tensors(kv_cache_spec, layer_pos, compact_total)
+                        kv_caches[layer_name] = state_tensors
+                        for state in state_tensors:
+                            if not any(state is cached for cached in self._compact_gdn_state_tensors):
+                                self._compact_gdn_state_tensors.append(state)
                     elif isinstance(kv_cache_spec, MambaSpec) and \
                             kv_cache_spec.mamba_type in _GDN_MAMBA_TYPES:
                         # GDN/linear_attention: non-compact (baseline) allocation
