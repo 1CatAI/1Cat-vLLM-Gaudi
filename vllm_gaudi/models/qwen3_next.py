@@ -57,15 +57,26 @@ def enable_hpu_qwen3_tp2_fused_ar_norm(model) -> int:
         # deferred collective, including upstream normalization variants.
         return 0
 
-    from vllm_gaudi.distributed.tp2_fused_ar_norm import initialize_tp2_fused_ar_norm_runtime
+    from vllm_gaudi.distributed.tp2_fused_ar_norm import (
+        initialize_tp2_fused_ar_norm_runtime,
+        validate_tp2_gemma_fusion_runtime,
+    )
+    from vllm_gaudi.extension.runtime import get_config
 
     initialize_tp2_fused_ar_norm_runtime()
+    gemma_native = get_config().tp2_gemma_fused_ar_norm
+    if gemma_native:
+        widths = {norm.weight.numel() for norm in norms}
+        if len(widths) != 1 or any(norm.weight.dtype != torch.bfloat16 for norm in norms):
+            raise RuntimeError("TP2 Gemma native fusion requires uniform BF16 normalization weights")
+        validate_tp2_gemma_fusion_runtime(widths.pop())
     inner_model._hpu_tp2_defer_embedding_reduce = True
     inner_model.embed_tokens._hpu_defer_tp2_reduce = True
     for projection in row_parallel_layers:
         projection.reduce_results = False
     for norm in norms:
         norm._hpu_tp2_fused_ar_norm = True
+        norm._hpu_tp2_gemma_native_ready = gemma_native
     return len(row_parallel_layers) + 1
 
 

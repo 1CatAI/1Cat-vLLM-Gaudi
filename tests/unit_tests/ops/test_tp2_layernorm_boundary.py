@@ -13,7 +13,9 @@ from vllm_gaudi.ops.hpu_layernorm import HPUGemmaRMSNorm, HPURMSNorm
 @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("is_prompt", [False, True])
 @pytest.mark.parametrize("deferred", [False, True])
-def test_tp2_norm_boundary_preserves_collective_and_weight(monkeypatch, norm_type, weight_dtype, is_prompt, deferred):
+@pytest.mark.parametrize("gemma_ready", [False, True])
+def test_tp2_norm_boundary_preserves_collective_and_weight(monkeypatch, norm_type, weight_dtype, is_prompt, deferred,
+                                                         gemma_ready):
     import vllm.forward_context as forward_context
     import vllm_gaudi.distributed.tp2_fused_ar_norm as fused_module
     import vllm_gaudi.extension.kernels as kernels
@@ -55,6 +57,7 @@ def test_tp2_norm_boundary_preserves_collective_and_weight(monkeypatch, norm_typ
     residual = torch.full_like(peer, 0.25)
     original_residual = residual.clone()
     norm = SimpleNamespace(weight=weight, variance_epsilon=1e-6, _hpu_tp2_fused_ar_norm=deferred)
+    norm._hpu_tp2_gemma_native_ready = gemma_ready
 
     normalized, residual_out = norm_type.forward_oot(norm, partial, residual)
 
@@ -66,7 +69,8 @@ def test_tp2_norm_boundary_preserves_collective_and_weight(monkeypatch, norm_typ
     torch.testing.assert_close(normalized, expected_normalized.reshape(partial.shape), atol=0, rtol=0)
     torch.testing.assert_close(residual, original_residual, atol=0, rtol=0)
     assert len(reductions) == int(deferred)
-    assert boundary_options == ([{"is_prompt": is_prompt, "allow_fused": norm_type is HPURMSNorm}] if deferred else [])
+    assert boundary_options == ([{"is_prompt": is_prompt, "allow_fused": norm_type is HPURMSNorm or gemma_ready}]
+                                if deferred else [])
     torch.testing.assert_close(calls[0][0], expected_weight, atol=0, rtol=0)
     assert calls[0][0].dtype == weight_dtype
     assert normalized.dtype == partial.dtype
