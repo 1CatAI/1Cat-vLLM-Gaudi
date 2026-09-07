@@ -181,10 +181,16 @@ class SlicedFusedSDPABase(torch.nn.Module):
         if not enable_slicing:
             return False
 
-        if get_config().bucketing_strategy != 'pad':
+        prompt_strategy = get_config().VLLM_PROMPT_BUCKETING_STRATEGY or get_config().bucketing_strategy
+        if prompt_strategy != 'pad' or os.getenv('VLLM_EXPONENTIAL_BUCKETING') is not None:
             logger().warning_once(
                 'FusedSDPA slicing is only compatible with padding-based bucketing strategy, slicing in FusedSDPA will be disabled.'
             )
+            return False
+
+        if get_config().VLLM_BUCKETING_FROM_FILE:
+            # Arbitrary file buckets do not establish padding bounds.
+            logger().warning_once('FusedSDPA slicing requires generated padding-aware prompt buckets.')
             return False
 
         if get_config().merged_prefill:
@@ -202,7 +208,7 @@ class SlicedFusedSDPABase(torch.nn.Module):
         assert bucketing_manager is not None and bucketing_manager.initialized, 'Bucketing manager should be instantiated and initialized to enable FusedSDPA slicing.'
 
         from vllm_gaudi.extension.bucketing.padding_aware import PaddingAwareBucketingStrategy
-        strategy = bucketing_manager.get_bucketing_strategy()
+        strategy = bucketing_manager.get_bucketing_strategy('prompt')
         assert isinstance(
             strategy,
             PaddingAwareBucketingStrategy), 'Bucketing strategy should be Padding-Aware to enable FusedSDPA slicing.'
@@ -258,9 +264,8 @@ class SlicedFusedSDPABase(torch.nn.Module):
 
         self.dynamic_fp8 = bool(get_config().VLLM_HPU_FSDPA_DYNAMIC_FP8)
         if self.dynamic_fp8:
-            logger().warning_once(
-                "Dynamic FP8 sliced FusedSDPA is enabled. Q/K/V are quantized per attention call; "
-                "the attention output remains BF16 and the online-softmax merge remains FP32.")
+            logger().warning_once("Dynamic FP8 sliced FusedSDPA is enabled. Q/K/V are quantized per attention call; "
+                                  "the attention output remains BF16 and the online-softmax merge remains FP32.")
 
         return True
 
@@ -462,17 +467,10 @@ class ModuleFusedSDPA(torch.nn.Module):
         self._hpu_kernel_fsdpa = fusedSDPA
         self._sliced_module = SlicedFusedSDPA()
 
-    def can_use_slicing(self,
-                        query,
-                        key,
-                        attn_mask,
-                        is_causal,
-                        padding_side="left",
-                        window_size=None,
-                        sinks=None):
+    def can_use_slicing(self, query, key, attn_mask, is_causal, padding_side="left", window_size=None, sinks=None):
         return (self._sliced_module.enable_slicing and key.shape[-2] >= self._sliced_module.slice_thld
-                and query.shape[0] == 1 and query.shape[-2] != key.shape[-2] and is_causal
-                and attn_mask is not None and padding_side == 'right' and window_size is None and sinks is None)
+                and query.shape[0] == 1 and query.shape[-2] != key.shape[-2] and is_causal and attn_mask is not None
+                and padding_side == 'right' and window_size is None and sinks is None)
 
     def forward(
         self,
@@ -597,17 +595,10 @@ class ModuleFP8FusedSDPA(torch.nn.Module):
         self.d_scale_output = torch.tensor(1.0, dtype=torch.float32)
         self._sliced_module = SlicedFP8FusedSDPA(parent=self)
 
-    def can_use_slicing(self,
-                        query,
-                        key,
-                        attn_mask,
-                        is_causal,
-                        padding_side="left",
-                        window_size=None,
-                        sinks=None):
+    def can_use_slicing(self, query, key, attn_mask, is_causal, padding_side="left", window_size=None, sinks=None):
         return (self._sliced_module.enable_slicing and key.shape[-2] >= self._sliced_module.slice_thld
-                and query.shape[0] == 1 and query.shape[-2] != key.shape[-2] and is_causal
-                and attn_mask is not None and padding_side == 'right' and window_size is None and sinks is None)
+                and query.shape[0] == 1 and query.shape[-2] != key.shape[-2] and is_causal and attn_mask is not None
+                and padding_side == 'right' and window_size is None and sinks is None)
 
     def quant_input(self, x, scale):
         return torch.ops.hpu.cast_to_fp8_v2(x, scale, False, False, torch.float8_e4m3fn)[0]
