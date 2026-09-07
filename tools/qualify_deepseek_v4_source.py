@@ -25,7 +25,9 @@ def run_request(url, model, tokens, timeout=240, drop_intervals=10, prompt="Hell
     }
     started = time.perf_counter_ns()
     events = []
-    with requests.post(f"{url}/v1/completions", json=payload, stream=True, timeout=timeout) as response:
+    session = requests.Session()
+    session.trust_env = False
+    with session, session.post(f"{url}/v1/completions", json=payload, stream=True, timeout=timeout) as response:
         response.raise_for_status()
         for line in response.iter_lines(chunk_size=1):
             if not line.startswith(b"data: ") or line == b"data: [DONE]":

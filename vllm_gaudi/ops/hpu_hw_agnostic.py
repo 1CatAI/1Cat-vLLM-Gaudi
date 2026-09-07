@@ -2954,7 +2954,8 @@ else:
             out=out,
         )
 
-    _hpu_sparse_decode_fp8.supports_local_topk_mapping = envs.VLLM_HPU_DSV4_TPC_PAGED_SPARSE_ATTN or envs.VLLM_HPU_DSV4_MME_PAGED_SPARSE_ATTN
+    _hpu_sparse_decode_fp8.supports_local_topk_mapping = (
+        envs.VLLM_HPU_DSV4_TPC_PAGED_SPARSE_ATTN or envs.VLLM_HPU_DSV4_MME_PAGED_SPARSE_ATTN)
     _hpu_sparse_decode_fp8.supports_sequential_topk = (
         envs.VLLM_HPU_DSV4_TPC_PAGED_SPARSE_ATTN
         or envs.VLLM_HPU_DSV4_MME_PAGED_SPARSE_ATTN) and envs.VLLM_HPU_DSV4_SHORT_INDEXER_SKIP
@@ -4155,8 +4156,10 @@ else:
     deepseek_v4_fused_qk_rmsnorm_module.fused_q_kv_rmsnorm = (_hpu_fused_q_kv_rmsnorm)
     deepseek_v4_attention_module.fused_q_kv_rmsnorm = (_hpu_fused_q_kv_rmsnorm)
     deepseek_v4_attention_module.triton_inv_rope_einsum = (_hpu_dsv4_inv_rope_einsum)
-    deepseek_v4_attention_module.DeepseekV4MultiHeadLatentAttentionWrapper.attn_gemm_parallel_execute = _hpu_attn_gemm_parallel_execute
-    deepseek_v4_attention_module.DeepseekV4MultiHeadLatentAttentionWrapper.attention_frontend_impl = _hpu_deepseek_v4_attention_frontend_impl
+    deepseek_v4_attention_module.DeepseekV4MultiHeadLatentAttentionWrapper.attn_gemm_parallel_execute = (
+        _hpu_attn_gemm_parallel_execute)
+    deepseek_v4_attention_module.DeepseekV4MultiHeadLatentAttentionWrapper.attention_frontend_impl = (
+        _hpu_deepseek_v4_attention_frontend_impl)
     deepseek_v4_cache_utils_module.quantize_and_insert_k_cache = (_hpu_quantize_and_insert_k_cache)
     deepseek_v4_cache_utils_module.dequantize_and_gather_k_cache = (_hpu_dequantize_and_gather_k_cache)
     deepseek_v4_cache_utils_module.combine_topk_swa_indices = (_hpu_combine_topk_swa_indices)
