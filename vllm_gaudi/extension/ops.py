@@ -4,6 +4,7 @@
 # This source code is licensed under the Apache 2.0 license found in the
 # LICENSE file in the root directory of this source tree.
 ###############################################################################
+from contextlib import nullcontext
 from typing import Callable, Optional, Tuple, List, Union
 import habana_frameworks.torch as htorch
 import torch
@@ -33,6 +34,7 @@ if is_hpu_gaudi2:
 
 import logging
 import os
+import vllm_gaudi.envs as gaudi_envs
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,17 @@ try:
     from vllm_gaudi.ops.triton_gaudi import dynamic_quant as _triton_dynamic_quant
 except ImportError:
     pass
+
+_DSV4_PROFILE_STAGES = os.getenv("VLLM_DSV4_PROFILE_STAGES", "0").lower() in (
+    "1",
+    "true",
+)
+
+
+def _dsv4_profile_stage(name: str):
+    if not _DSV4_PROFILE_STAGES:
+        return nullcontext()
+    return torch.profiler.record_function(f"dsv4::{name}")
 
 # MAX_EXPERTS_PER_SLICE is needed for 1.20, up to 64 experts per slice
 try:
@@ -953,7 +966,11 @@ def apply_block_fp8_linear_hpu(
     force_channel_fp8: bool = False,
 ) -> torch.Tensor:
     if force_channel_fp8:
-        input_2d = input.view(-1, input.shape[-1])
+        input_2d = (
+            input
+            if input.ndim == 2
+            else input.contiguous().view(-1, input.shape[-1])
+        )
         output = apply_fp8_linear_hpu(
             input_2d,
             layer.weight,
@@ -961,14 +978,20 @@ def apply_block_fp8_linear_hpu(
             bias,
         )
         return output.to(dtype=input.dtype).view(*input.shape[:-1], -1)
+    original_M = getattr(layer, "_hpu_orig_M", None)
+    original_N = getattr(layer, "_hpu_orig_N", None)
+    if original_M is None:
+        original_M = layer.orig_M
+    if original_N is None:
+        original_N = layer.orig_N
     return apply_block_fp8_linear_hpu_dequant(
         input,
         layer.weight,
         block_size,
         layer.weight_scale_inv,
         bias=bias,
-        original_M=layer.orig_M,
-        original_N=layer.orig_N,
+        original_M=original_M,
+        original_N=original_N,
         do_unpad=do_unpad,
     )
 
@@ -980,15 +1003,21 @@ def apply_block_fp8_linear_hpu_dequant(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
-    original_M: Optional[torch.Tensor] = None,
-    original_N: Optional[torch.Tensor] = None,
+    original_M: Optional[int | torch.Tensor] = None,
+    original_N: Optional[int | torch.Tensor] = None,
     do_unpad: bool = False,
 ) -> torch.Tensor:
     assert input_scale is None
     # View input as 2D matrix for fp8 methods
-    input_2d = input.view(-1, input.shape[-1])
-    original_M = original_M.data.item()
-    original_N = original_N.data.item()
+    input_2d = (
+        input
+        if input.ndim == 2
+        else input.contiguous().view(-1, input.shape[-1])
+    )
+    if isinstance(original_M, torch.Tensor):
+        original_M = original_M.data.item()
+    if isinstance(original_N, torch.Tensor):
+        original_N = original_N.data.item()
     weight = dequant_block_fp8_weight_naive(weight, weight_scale, block_size, input.dtype, original_M, original_N,
                                             do_unpad)
     output = torch.nn.functional.linear(input_2d, weight, bias=None)
@@ -1033,7 +1062,23 @@ def _use_cguid_dynamic_quant(data, use_cguid=True):
     )
 
 
+def _use_jit_dynamic_quant(data, single_scale=False):
+    return (
+        gaudi_envs.VLLM_HPU_FP8_JIT_DYNAMIC_QUANT
+        and is_hpu_gaudi2
+        and not single_scale
+        and data.ndim >= 2
+    )
+
+
 def dynamic_quant(data, single_scale=False, use_cguid=True):
+    if _use_jit_dynamic_quant(data, single_scale):
+        return torch.ops.hpu.cast_to_fp8_just_in_time(
+            data,
+            [1, data.shape[-1]],
+            out_dtype=torch.float8_e4m3fn,
+            scale_dtype=torch.float32,
+        )
     if not single_scale and _triton_dynamic_quant is not None and data.ndim == 2:
         triton_result = _triton_dynamic_quant(data)
         if triton_result is not None:
@@ -1091,6 +1136,8 @@ def gaudi_weight_wrapper(weight_loader):
                 loaded_weight = args[1]
             if loaded_weight.dtype == torch.float8_e4m3fn:
                 loaded_weight = (loaded_weight.float() * 0.5).to(torch.float8_e4m3fn)
+            elif loaded_weight.dtype == torch.float8_e8m0fnu:
+                loaded_weight = loaded_weight.float() * 2.0
             else:
                 loaded_weight = (loaded_weight.data * 2.0)
             if in_kwargs:
@@ -1124,6 +1171,8 @@ def fp8_perchannel_linear_postprocess_weights(layer):
 def fp8_block_linear_postprocess_weights(layer, force_channel_fp8=False):
     weight, orig_M, orig_N = pad_block_fp8_weight_naive(layer.weight.data, layer.weight_scale_inv.data,
                                                         layer.quant_config.weight_block_size)
+    layer._hpu_orig_M = int(orig_M)
+    layer._hpu_orig_N = int(orig_N)
     if force_channel_fp8:
         # convert to channel-wise fp8
         weight, weight_scale_inv = dynamic_quant(
@@ -1692,6 +1741,142 @@ class MoeMXFP4Matmul(torch.nn.Module):
         self.bias = b
 
 
+def _gather_mxfp4_decode_weights(
+    expert_routing_table,
+    router_weights,
+    w13,
+    w2,
+    w13_scale,
+    w2_scale,
+):
+    # Keep the router's top-k order; the native MoE receives matching dense
+    # local IDs, so no global-ID sort or router-weight permutation is needed.
+    gathered_experts = expert_routing_table.shape[-1]
+    local_ids = torch.arange(
+        gathered_experts,
+        dtype=torch.int32,
+        device=expert_routing_table.device,
+    ).view(1, -1)
+
+    can_use_tpc_gather = (
+        gaudi_envs.VLLM_HPU_DSV4_TPC_MXFP4_GATHER
+        and expert_routing_table.shape == (1, 6)
+        and w13.shape == (256, 2048, 2048)
+        and w2.shape == (256, 4096, 512)
+        and w13_scale.shape == (256, 2048, 128)
+        and w2_scale.shape == (256, 4096, 32)
+    )
+    if can_use_tpc_gather:
+        w13_g, w2_g, w13_scale_g, w2_scale_g = (
+            torch.ops.custom_op
+            .custom_deepseek_v4_mxfp4_gather_u8_gaudi2(
+                expert_routing_table,
+                w13,
+                w2,
+                w13_scale,
+                w2_scale,
+            )
+        )
+        return (
+            local_ids,
+            router_weights,
+            w13_g,
+            w2_g,
+            w13_scale_g,
+            w2_scale_g,
+        )
+
+    gather_ids = expert_routing_table.reshape(-1)
+    return (
+        local_ids,
+        router_weights,
+        w13.index_select(0, gather_ids),
+        w2.index_select(0, gather_ids),
+        w13_scale.index_select(0, gather_ids),
+        w2_scale.index_select(0, gather_ids),
+    )
+
+
+def _mxfp4_hpu_backend(graph_module, example_inputs):
+    if os.getenv("VLLM_HPU_MXFP4_DUMP_GRAPH") == "1":
+        input_metadata = []
+        for index, value in enumerate(example_inputs):
+            if isinstance(value, torch.Tensor):
+                input_metadata.append(
+                    (
+                        index,
+                        tuple(value.shape),
+                        tuple(value.stride()),
+                        value.dtype,
+                        value.device,
+                        value.is_contiguous(),
+                    )
+                )
+            else:
+                input_metadata.append(
+                    (index, type(value).__name__, repr(value))
+                )
+        logger.warning(
+            "MXFP4 graph inputs=%s\n%s",
+            input_metadata,
+            graph_module.code,
+        )
+    return torch._dynamo.lookup_backend("hpu_backend")(
+        graph_module,
+        example_inputs,
+    )
+
+
+def _mxfp4_bias_fused_fwd(hidden_states, expert_routing_table,
+                          router_weights, w12_list, w3_list, w12_bias,
+                          w3_bias, d_scale_w12, d_scale_w3, block_size,
+                          experts_min, experts_max, chunk_size, total_experts,
+                          alpha, limit):
+    return torch.ops.hpu.mixture_of_experts.bias_mxfp4_fused_weights(
+        hidden_states,
+        expert_routing_table,
+        router_weights,
+        w12_list,
+        w3_list,
+        w12_bias,
+        w3_bias,
+        d_scale_w12,
+        d_scale_w3,
+        block_size=block_size,
+        permuted_weights=True,
+        experts_min=experts_min,
+        experts_max=experts_max,
+        is_fp4=True,
+        chunk_size=chunk_size,
+        total_experts=total_experts,
+        alpha=alpha,
+        limit=limit,
+    )
+
+
+def _mxfp4_fused_fwd(hidden_states, expert_routing_table, router_weights,
+                     w12_list, w3_list, d_scale_w12, d_scale_w3, block_size,
+                     activation, experts_min, experts_max, chunk_size,
+                     total_experts):
+    return torch.ops.hpu.mixture_of_experts.mxfp4_fused_weights(
+        hidden_states,
+        expert_routing_table,
+        router_weights,
+        w12_list,
+        w3_list,
+        d_scale_w12,
+        d_scale_w3,
+        block_size=block_size,
+        permuted_weights=True,
+        activation=activation,
+        experts_min=experts_min,
+        experts_max=experts_max,
+        is_fp4=True,
+        chunk_size=chunk_size,
+        total_experts=total_experts,
+    )
+
+
 class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
     """Native MXFP4 MOE op using torch.ops.hpu.mixture_of_experts.mxfp4_fused_weights.
 
@@ -1731,7 +1916,17 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
         self._cached_w2_scale_views = None
         self._cached_w13_bias_views = None
         self._cached_w2_bias_views = None
+        self._stacked_w13 = None
+        self._stacked_w2 = None
+        self._stacked_w13_scale = None
+        self._stacked_w2_scale = None
         self._compiled_forward = None
+
+    def set_stacked_weights(self, w13, w2, w13_scale, w2_scale):
+        self._stacked_w13 = w13
+        self._stacked_w2 = w2
+        self._stacked_w13_scale = w13_scale
+        self._stacked_w2_scale = w2_scale
 
     def _cache_weight_lists(self):
         experts_range = range(self.num_experts)
@@ -1759,59 +1954,14 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
 
     def _get_compiled_forward(self):
         if self._compiled_forward is None:
-            if self.has_bias:
-
-                @torch.compile(backend="hpu_backend")
-                def _mxfp4_bias_fused_fwd(hidden_states, expert_routing_table, router_weights, w12_list, w3_list,
-                                          w12_bias, w3_bias, d_scale_w12, d_scale_w3, block_size, experts_min,
-                                          experts_max, chunk_size, total_experts, alpha, limit):
-                    return torch.ops.hpu.mixture_of_experts.bias_mxfp4_fused_weights(
-                        hidden_states,
-                        expert_routing_table,
-                        router_weights,
-                        w12_list,
-                        w3_list,
-                        w12_bias,
-                        w3_bias,
-                        d_scale_w12,
-                        d_scale_w3,
-                        block_size=block_size,
-                        permuted_weights=True,
-                        experts_min=experts_min,
-                        experts_max=experts_max,
-                        is_fp4=True,
-                        chunk_size=chunk_size,
-                        total_experts=total_experts,
-                        alpha=alpha,
-                        limit=limit,
-                    )
-
-                self._compiled_forward = _mxfp4_bias_fused_fwd
-            else:
-
-                @torch.compile(backend="hpu_backend")
-                def _mxfp4_fused_fwd(hidden_states, expert_routing_table, router_weights, w12_list, w3_list,
-                                     d_scale_w12, d_scale_w3, block_size, activation, experts_min, experts_max,
-                                     chunk_size, total_experts):
-                    return torch.ops.hpu.mixture_of_experts.mxfp4_fused_weights(
-                        hidden_states,
-                        expert_routing_table,
-                        router_weights,
-                        w12_list,
-                        w3_list,
-                        d_scale_w12,
-                        d_scale_w3,
-                        block_size=block_size,
-                        permuted_weights=True,
-                        activation=activation,
-                        experts_min=experts_min,
-                        experts_max=experts_max,
-                        is_fp4=True,
-                        chunk_size=chunk_size,
-                        total_experts=total_experts,
-                    )
-
-                self._compiled_forward = _mxfp4_fused_fwd
+            target = (
+                _mxfp4_bias_fused_fwd
+                if self.has_bias else _mxfp4_fused_fwd
+            )
+            self._compiled_forward = torch.compile(
+                target,
+                backend=_mxfp4_hpu_backend,
+            )
         return self._compiled_forward
 
     def forward(self, hidden_states, expert_routing_table, router_weights, permuted_weights=True, activation="silu"):
@@ -1833,41 +1983,147 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
         if expert_routing_table.dtype != torch.int32:
             expert_routing_table = expert_routing_table.to(torch.int32)
 
-        compiled_fwd = self._get_compiled_forward()
+        can_use_indexed_tpc = (
+            gaudi_envs.VLLM_HPU_DSV4_TPC_MXFP4_INDEXED
+            and tokens_num == 1
+            and hidden_states.shape == (1, 4096)
+            and hidden_states.dtype == torch.bfloat16
+            and expert_routing_table.shape == (1, 6)
+            and router_weights.shape == (1, 6)
+            and router_weights.dtype == torch.bfloat16
+            and permuted_weights
+            and activation == "silu"
+            and self.block_size == 32
+            and not self.has_bias
+            and self.num_experts == 256
+            and self.experts_min == 0
+            and self.experts_max == 255
+            and self._stacked_w13 is not None
+            and self._stacked_w13.shape == (256, 2048, 2048)
+            and self._stacked_w2.shape == (256, 4096, 512)
+            and self._stacked_w13_scale.shape == (256, 2048, 128)
+            and self._stacked_w2_scale.shape == (256, 4096, 32)
+            and hidden_states.is_contiguous()
+            and expert_routing_table.is_contiguous()
+            and router_weights.is_contiguous()
+            and self._stacked_w13.is_contiguous()
+            and self._stacked_w2.is_contiguous()
+            and self._stacked_w13_scale.is_contiguous()
+            and self._stacked_w2_scale.is_contiguous()
+        )
+        if can_use_indexed_tpc:
+            with _dsv4_profile_stage("moe_mxfp4_indexed_tpc"):
+                return (
+                    torch.ops.custom_op
+                    .custom_deepseek_v4_mxfp4_indexed_moe_gaudi2(
+                        hidden_states,
+                        expert_routing_table,
+                        router_weights,
+                        self._stacked_w13,
+                        self._stacked_w2,
+                        self._stacked_w13_scale,
+                        self._stacked_w2_scale,
+                    )
+                )
+
+        if torch.compiler.is_compiling():
+            compiled_fwd = (
+                _mxfp4_bias_fused_fwd
+                if self.has_bias else _mxfp4_fused_fwd
+            )
+        else:
+            compiled_fwd = self._get_compiled_forward()
+        can_gather_decode = (
+            gaudi_envs.VLLM_HPU_MXFP4_DECODE_GATHER
+            and tokens_num == 1
+            and not self.has_bias
+            and self.experts_min == 0
+            and self.experts_max == self.num_experts - 1
+            and self._stacked_w13 is not None
+            and expert_routing_table.shape[-1] < self.num_experts
+        )
+        if can_gather_decode:
+            with _dsv4_profile_stage("moe_mxfp4_gather"):
+                (
+                    local_ids,
+                    sorted_weights,
+                    w13_g,
+                    w2_g,
+                    w13_scale_g,
+                    w2_scale_g,
+                ) = _gather_mxfp4_decode_weights(
+                    expert_routing_table,
+                    router_weights,
+                    self._stacked_w13,
+                    self._stacked_w2,
+                    self._stacked_w13_scale,
+                    self._stacked_w2_scale,
+                )
+                gathered_experts = expert_routing_table.shape[-1]
+                selected_w13 = tuple(
+                    w13_g[i] for i in range(gathered_experts)
+                )
+                selected_w2 = tuple(
+                    w2_g[i] for i in range(gathered_experts)
+                )
+                selected_w13_scale = tuple(
+                    w13_scale_g[i] for i in range(gathered_experts)
+                )
+                selected_w2_scale = tuple(
+                    w2_scale_g[i] for i in range(gathered_experts)
+                )
+            with _dsv4_profile_stage("moe_mxfp4_native_selected"):
+                return compiled_fwd(
+                    hidden_states,
+                    local_ids,
+                    sorted_weights,
+                    selected_w13,
+                    selected_w2,
+                    selected_w13_scale,
+                    selected_w2_scale,
+                    self.block_size,
+                    activation,
+                    0,
+                    gathered_experts - 1,
+                    chunk_size,
+                    total_experts,
+                )
         if self.has_bias:
+            with _dsv4_profile_stage("moe_mxfp4_native_bias"):
+                return compiled_fwd(
+                    hidden_states,
+                    expert_routing_table,
+                    router_weights,
+                    w13_list,
+                    w2_list,
+                    self._cached_w13_bias_views,
+                    self._cached_w2_bias_views,
+                    w13_scale,
+                    w2_scale,
+                    self.block_size,
+                    self.experts_min,
+                    self.experts_max,
+                    chunk_size,
+                    total_experts,
+                    self.alpha,
+                    self.limit,
+                )
+        with _dsv4_profile_stage("moe_mxfp4_native_full"):
             return compiled_fwd(
                 hidden_states,
                 expert_routing_table,
                 router_weights,
                 w13_list,
                 w2_list,
-                self._cached_w13_bias_views,
-                self._cached_w2_bias_views,
                 w13_scale,
                 w2_scale,
                 self.block_size,
+                activation,
                 self.experts_min,
                 self.experts_max,
                 chunk_size,
                 total_experts,
-                self.alpha,
-                self.limit,
             )
-        return compiled_fwd(
-            hidden_states,
-            expert_routing_table,
-            router_weights,
-            w13_list,
-            w2_list,
-            w13_scale,
-            w2_scale,
-            self.block_size,
-            activation,
-            self.experts_min,
-            self.experts_max,
-            chunk_size,
-            total_experts,
-        )
 
 
 def oot_get_quantization_config(quantization: str) -> QuantizationConfig:

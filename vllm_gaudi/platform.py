@@ -198,7 +198,14 @@ class HpuPlatform(Platform):
     ray_device_key: str = "HPU"
     device_control_env_var: str = "HABANA_VISIBLE_MODULES"
     supported_quantization: list[str] = [
-        "compressed-tensors", "fp8", "inc", "awq_hpu", "gptq_hpu", "modelopt", "gpt_oss_mxfp4"
+        "compressed-tensors",
+        "fp8",
+        "deepseek_v4_fp8",
+        "inc",
+        "awq_hpu",
+        "gptq_hpu",
+        "modelopt",
+        "gpt_oss_mxfp4",
     ]
     simple_compile_backend = "hpu_backend"
     additional_env_vars = [k for k, v in os.environ.items() if retain_envs(k)]
@@ -277,6 +284,10 @@ class HpuPlatform(Platform):
         # a lazy-mode subprocess (GAUDISW-248809) and always respect values the
         # user set explicitly (GAUDISW-249135).
         cls.set_compile_env_defaults()
+        from vllm_gaudi.ops.deepseek_v4_config import configure_defaults
+        if getattr(getattr(vllm_config.model_config, "hf_config", None), "model_type", None) == "deepseek_v4":
+            import habana_frameworks.torch.utils.experimental as htexp
+            configure_defaults(vllm_config, gaudi2=htexp._get_device_type() == htexp.synDeviceType.synDeviceGaudi2)
         _enable_hpu_v1_dflash2_validation()
         parallel_config = vllm_config.parallel_config
 

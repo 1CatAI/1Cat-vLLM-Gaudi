@@ -164,6 +164,53 @@ they remain available through the standalone diagnostic. TP2 collective/RMSNorm
 fusion retains ownership of its communication boundary before local Triton
 RMSNorm is considered.
 
+## DeepSeek V4
+
+The [source-integrated Gaudi2 TP2 profile](../features/deepseek_v4_flash.md)
+selects the accepted short-context defaults during normal platform setup.
+The table below lists raw environment fallbacks outside that profile.
+
+| Variable | Description | Default |
+|---|---|---|
+| `VLLM_HPU_DSV4_EARLY_OUTPUT_LOWERING` | Lowers q1 attention output dependencies before HPU graph partitioning, retaining required clones. Enabled by the bounded source profile. | `false` |
+| `VLLM_HPU_DSV4_WORKER_CPUS` | Optional comma-separated CPU IDs, one distinct allowed CPU per rank. No affinity change when unset. | unset |
+| `VLLM_HPU_MXFP4_DECODE_GATHER` | Gathers only the routed packed experts before single-token MXFP4 MoE decode. Disable to use the full expert TensorList. | `true` |
+| `VLLM_HPU_DSV4_TPC_MXFP4_GATHER` | Uses one experimental Gaudi2 TPC launch to gather DeepSeek V4's four packed MXFP4 weight/scale tensors for the six routed experts. | `false` |
+| `VLLM_HPU_DSV4_TPC_MXFP4_INDEXED` | Uses the experimental Gaudi2 direct-indexed MXFP4 decode path, reading six routed experts from stacked weights without materializing selected weights. | `false` |
+| `VLLM_HPU_DSV4_BF16_ATTN_WEIGHT_CACHE` | Caches transposed BF16 copies of DeepSeek V4's fused Q/KV and Q-projection weights for single-token decode. Prompt processing stays on the block-FP8 path. | `false` |
+| `VLLM_HPU_DSV4_COMPILED_ATTN_FRONTEND` | Runs DeepSeek V4 single-token projection, Q/KV normalization, and Q projection through shared HPU-compiled functions. Requires the BF16 attention weight cache. | `false` |
+| `VLLM_HPU_DSV4_INLINE_ATTN_FRONTEND` | Inlines the DeepSeek V4 single-token projection frontend into coarse decoder graphs while keeping cache mutations and MLA behind a custom-op boundary. Requires the BF16 attention weight cache. | `false` |
+| `VLLM_HPU_DSV4_NATIVE_FP8_ATTN_FRONTEND` | Uses native FP8 MME for the two DeepSeek V4 attention projections during single-token decode. Keeps the BF16 path available as a quality fallback. | `false` |
+| `VLLM_HPU_DSV4_SHORT_INDEXER_SKIP` | Skips DeepSeek V4 indexer scoring when all compressed candidates fit in top-k, while retaining cache writes. | `true` |
+| `VLLM_HPU_DSV4_SHORT_INDEXER_CACHE_SKIP` | Also skips the unused DeepSeek V4 indexer projection and K-cache write during decode when the configured maximum compressed sequence fits entirely in top-k. Long contexts and mixed prefill/decode batches automatically fall back. | `false` |
+| `VLLM_HPU_DSV4_FUSED_SDPA` | Uses Gaudi FusedSDPA plus an explicit attention-sink merge for the gathered DeepSeek V4 sparse-attention core. | `false` |
+| `VLLM_HPU_DSV4_TPC_DEQUANT_GATHER` | Uses the experimental Gaudi2 TPC packed-cache dequant/gather kernel for DeepSeek V4 decode. | `false` |
+| `VLLM_HPU_DSV4_TPC_SPARSE_ATTN` | Uses the experimental Gaudi2 TPC sparse-attention kernel for DeepSeek V4 decode. | `false` |
+| `VLLM_HPU_DSV4_TPC_SPARSE_ATTN_MAX_WIDTH` | Maximum gathered width that uses the experimental DeepSeek V4 sparse-attention TPC kernel; larger widths retain the graph implementation. | `128` |
+| `VLLM_HPU_DSV4_TPC_PAGED_SPARSE_ATTN` | Uses the experimental Gaudi2 native-FP8 paged sparse-attention kernel for single-token DeepSeek V4 decode. | `false` |
+| `VLLM_HPU_DSV4_TPC_PAIR_HEADS` | Tiles two DeepSeek V4 MQA query heads per Gaudi2 paged-attention program so C4 decode shares each packed KV load and dequantization. | `false` |
+| `VLLM_HPU_DSV4_FLASHMLA_SPLIT_KV` | Uses the functional split-KV FlashMLA-style packed-FP8 decode path. | `false` |
+| `VLLM_HPU_DSV4_FLASHMLA_TILED` | Selects the experimental four-token tiled-softmax partial kernel for the split-KV FlashMLA path. | `false` |
+| `VLLM_HPU_DSV4_FLASHMLA_SPLITS` | Number of split-KV partitions used by the FlashMLA-style decode path. | `2` |
+| `VLLM_HPU_DSV4_FLASHMLA_PREFILL` | Uses the experimental length-aware Gaudi2 sparse-prefill kernel, mirroring FlashMLA `flash_mla_sparse_fwd` without scanning aligned index padding. | `false` |
+| `VLLM_HPU_DSV4_FLASHMLA_PREFILL_MAX_WIDTH` | Maximum aligned sparse-index width accepted by the experimental length-aware prefill kernel. | `640` |
+| `VLLM_HPU_DSV4_MME_PAGED_SPARSE_ATTN` | Uses TPC packed-cache dual gather with FP32 Gaudi MME QK/PV for single-token DeepSeek V4 decode. | `false` |
+| `VLLM_HPU_DSV4_ATTENTION_BACKEND` | Selects the DeepSeek V4 decode backend: `auto`, `flashmla_hpu`, `mme`, or `legacy`. `auto` prefers the direct packed-FP8 FlashMLA-style path. | `auto` |
+| `VLLM_HPU_DSV4_DIRECT_DECODE_DISPATCH` | Bypasses generic per-layer backend planning for eligible C4 single-token decode and dispatches directly to the selected packed-FP8 TPC kernel. | `false` |
+| `VLLM_HPU_DSV4_TPC_SAVE_COMPRESS_NORM_C4` | Uses the experimental fused C4/C128 state-save, compression, norm, RoPE, and packed-cache producer for single-token DeepSeek V4 decode. | `false` |
+| `VLLM_HPU_DSV4_TPC_ORDERED_COMPRESSOR` | Uses the experimental alias-free C4 Compressor write with an explicit device dependency on the following attention operation. | `false` |
+| `VLLM_HPU_DSV4_TPC_ORDERED_C128_COMPRESSOR` | Extends the alias-free ordered Compressor path to C128 decode while preserving an explicit dependency on the following sparse attention operation. | `false` |
+| `VLLM_HPU_DSV4_FUSED_COMPRESSOR_FLASHMLA` | Places the C4 Compressor cache producer and tiled FlashMLA partial/combine kernels in one ordered Gaudi2 recipe for eligible single-token decode. | `false` |
+| `VLLM_HPU_DSV4_FUSED_QNORM_COMPRESSOR` | Co-schedules the independent QNorm/RoPE/SWA-cache and C4 Compressor cache producers in one compiled Gaudi2 recipe while keeping MLA in a downstream recipe. | `false` |
+| `VLLM_HPU_DSV4_TPC_BF16_COMPRESS_INPUTS` | Experimental precision-changing path that keeps DeepSeek V4 compressor projections and norm inputs in native BF16. | `false` |
+| `VLLM_HPU_DSV4_TPC_MIXED_COMPRESS_INPUTS` | Preserves FP32 compressor projections while reading the static norm in BF16 and using the fused vector-RoPE TPC path. | `false` |
+| `VLLM_HPU_DSV4_TPC_QNORM_ROPE_KV_PACK` | Uses the experimental per-head fused Q norm/RoPE, KV RoPE/FP8 quantization, and direct paged-cache writer for single-token DeepSeek V4 decode. | `false` |
+| `VLLM_HPU_DSV4_TPC_MHC` | Uses the decode-specialized Gaudi2 fused post+pre MHC TPC kernel for the DeepSeek V4 hardware-agnostic model path. | `false` |
+| `VLLM_HPU_DSV4_PACKED_DECODE_METADATA` | Packs DeepSeek V4 q1 framework attention metadata into one persistent int32 host-to-device transfer per decode step. | `false` |
+| `VLLM_HPU_DSV4_DECODE_METADATA_RING_SIZE` | Number of host/device packed metadata buffers rotated by the DeepSeek V4 q1 decode path to avoid overwriting in-flight graph inputs. | `2` |
+| `VLLM_HPU_DSV4_Q1_METADATA_FASTPATH` | Enables uniform q1 shortcuts in DeepSeek V4 metadata builders, removing redundant per-step tensor construction and uploads. | `false` |
+| `VLLM_HPU_DSV4_TPC_OP_LIBRARY` | Path to the PyTorch registration library for the experimental DeepSeek V4 TPC operators. | unset |
+
 Use `VLLM_BUCKETING_STRATEGY=exp` for the default exponential warm-up, `VLLM_BUCKETING_STRATEGY=lin` for explicitly configured linear ranges, or `VLLM_BUCKETING_STRATEGY=pad` for padding-aware ranges with absolute and relative padding limits.
 
 Leave `VLLM_EXPONENTIAL_BUCKETING` unset when using `VLLM_BUCKETING_STRATEGY`. The legacy flag is checked for backward compatibility and still overrides the selected strategy when present.

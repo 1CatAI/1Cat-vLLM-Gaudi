@@ -49,6 +49,27 @@ def test_explicit_mamba_block_table_width_for_spec_decode(device: str):
     assert input_batch.block_table[0].get_cpu_tensor()[0, :8].tolist() == block_ids
 
 
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+def test_custom_max_num_blocks_per_req(device: str):
+    input_batch = InputBatch(
+        max_num_reqs=1,
+        max_model_len=512,
+        max_num_batched_tokens=512,
+        device=torch.device(device),
+        pin_memory=is_pin_memory_available(),
+        vocab_size=VOCAB_SIZE,
+        block_sizes=[256, 64],
+        kernel_block_sizes=[256, 64],
+        max_num_blocks_per_req=[4, 8],
+    )
+
+    assert input_batch.max_num_blocks_per_req == [4, 8]
+    assert [
+        block_table.max_num_blocks_per_req
+        for block_table in input_batch.block_table.block_tables
+    ] == [4, 8]
+
+
 def _compare_objs(obj1, obj2, skip: Sequence = ("logitsprocs", "batch_update_builder")):
     attrs = inspect.getmembers(obj1, lambda a: not (inspect.isroutine(a)))
     attr_names = set([a[0] for a in attrs if not (a[0].startswith('__') and a[0].endswith('__'))])

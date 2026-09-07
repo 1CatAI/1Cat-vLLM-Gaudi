@@ -92,6 +92,9 @@ For more information, see [docs/configuration/env_variables.md](docs/configurati
 
 ## Contributing
 
+For the source-built DeepSeek V4 Flash TP2 integration, see
+[DeepSeek V4 Flash on Gaudi2](docs/features/deepseek_v4_flash.md).
+
 We welcome and value any contributions and collaborations.
 
 ## Contact Us

@@ -38,7 +38,7 @@ from vllm_gaudi.extension.debug import init_debug_logger
 from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
 from vllm_gaudi.v1.worker.gdn_state_layout import has_contiguous_dflash_checkpoints
 
-from vllm.v1.attention.backend import AttentionBackend, AttentionType
+from vllm.v1.attention.backend import AttentionBackend, AttentionType, CommonAttentionMetadata
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.v1.attention.selector import get_attn_backend
@@ -71,6 +71,8 @@ from vllm_gaudi.v1.attention.backends.hpu_attn import HPUAttentionMetadataV1
 from vllm.v1.attention.backends.utils import create_fast_prefill_custom_backend
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    compute_layer_kv_cache_shape_bytes,
+    compute_layout_strides,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -93,7 +95,8 @@ from vllm.distributed.parallel_state import get_pp_group, get_dp_group
 from vllm.model_executor.models.interfaces import (supports_eagle3, supports_transcription)
 from vllm.model_executor.models.interfaces_base import (VllmModelForPooling, is_pooling_model, is_text_generation_model)
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
-from vllm.v1.worker.utils import (AttentionGroup, prepare_kernel_block_sizes, sanity_check_mm_encoder_outputs)
+from vllm.v1.worker.utils import (AttentionGroup, allocate_kv_cache, prepare_kernel_block_sizes,
+                                  sanity_check_mm_encoder_outputs)
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -108,6 +111,7 @@ from vllm.lora.layers import LoRAMapping
 from vllm.lora.request import LoRARequest
 from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
 from vllm.model_executor.models import supports_lora, supports_multimodal
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm_gaudi.extension.ops import LoraMask as LoraMask
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiKVConnectorMetadata
@@ -133,6 +137,53 @@ from vllm_gaudi.extension.logger import logger as init_logger
 from vllm.model_executor.models.bert import _encode_token_type_ids
 
 logger = init_logger()
+
+
+def _hpu_init_sync(stage: str) -> None:
+    if os.getenv("VLLM_HPU_INIT_SYNC_DEBUG") != "1":
+        return
+    torch.hpu.synchronize()
+    logger.warning("HPU model runner init sync passed: %s", stage)
+
+
+def _dynamo_cache_limit(
+    bucket_count: int,
+    regional_compilation: bool,
+    model_type: str,
+    num_model_layers: int,
+) -> int:
+    region_variants = 5 if regional_compilation else 1
+    if model_type == "deepseek_v4":
+        # DeepSeek attention embeds layer_name in a custom-op call, so each
+        # decoder layer specializes the shared forward code once.
+        region_variants += max(num_model_layers - 1, 0)
+    return 1 + region_variants * bucket_count
+
+
+def _configure_dynamo_cache_limits(
+    cache_size_limit: int,
+    dynamo_config=None,
+) -> None:
+    if dynamo_config is None:
+        dynamo_config = torch._dynamo.config
+    for name in ("cache_size_limit", "recompile_limit"):
+        if hasattr(dynamo_config, name):
+            setattr(
+                dynamo_config,
+                name,
+                max(cache_size_limit, getattr(dynamo_config, name)),
+            )
+    accumulated_limit = cache_size_limit * 8
+    for name in (
+        "accumulated_cache_size_limit",
+        "accumulated_recompile_limit",
+    ):
+        if hasattr(dynamo_config, name):
+            setattr(
+                dynamo_config,
+                name,
+                max(accumulated_limit, getattr(dynamo_config, name)),
+            )
 
 
 def is_interleaved(config: Any) -> bool:
@@ -216,7 +267,10 @@ HPU_TORCH_DTYPE_TO_STR_DTYPE = {
     torch.float32: "float32",
     torch.bfloat16: "bfloat16",
     torch.float16: "float16",
-    torch.float8_e4m3fn: "fp8_e4m3"
+    torch.float8_e4m3fn: "fp8_e4m3",
+    # Upstream represents the generic "fp8" KV-cache choice as uint8.
+    # HPU's attention backend calls the same packed format "fp8_inc".
+    torch.uint8: "fp8_inc",
 }
 
 shutdown_inc_called = False
@@ -409,6 +463,16 @@ def _rebind_moe_expert_weights(model: torch.nn.Module) -> None:
                         moe_op.w13_list[i].set_bias(w13_bias[i])
                     if hasattr(moe_op.w2_list[i], "set_bias"):
                         moe_op.w2_list[i].set_bias(w2_bias[i])
+            if hasattr(moe_op, "set_stacked_weights"):
+                w13_scale = getattr(module, "w13_weight_scale", None)
+                w2_scale = getattr(module, "w2_weight_scale", None)
+                if w13_scale is not None and w2_scale is not None:
+                    moe_op.set_stacked_weights(
+                        w13_weight.data,
+                        w2_weight.data,
+                        w13_scale.data,
+                        w2_scale.data,
+                    )
             # Rebuild cache only when we rebound the plain-attr views, because
             # model.to() → _apply() left the cache pointing at the old device's
             # storage.
@@ -931,6 +995,228 @@ def _init_mamba_split_weights(model):
             module._init_split_weights()
 
 
+def _needs_compile_validation_warmup(model_type: str) -> bool:
+    # These models specialize the same compiled layer code across materially
+    # different layer variants. DeepSeek V4 alternates 0/4/128 compression
+    # ratios, so compile-only warmup alone can leave the first real request
+    # recompiling a guard specialization on the host.
+    return model_type in (
+        "qwen3_moe",
+        "qwen3_5",
+        "qwen3_5_text",
+        "qwen3_5_moe",
+        "gemma4",
+        "deepseek_v4",
+    )
+
+
+def _dsv4_decode_only_compile_enabled(model_type: str) -> bool:
+    return (
+        model_type == "deepseek_v4"
+        and os.getenv("VLLM_HPU_DSV4_DECODE_ONLY_WARMUP", "0")
+        .strip()
+        .lower()
+        in ("1", "true")
+    )
+
+
+class _HPUDeepseekV4PhaseChunk:
+    def __init__(self, eager_chunk, compiled_chunk) -> None:
+        self.eager_chunk = eager_chunk
+        self.compiled_chunk = compiled_chunk
+
+    def __call__(self, hidden_states, *args, **kwargs):
+        phase = _dsv4_forward_phase()
+        if phase == "prefill":
+            chunk = self.eager_chunk
+        elif phase == "decode":
+            chunk = self.compiled_chunk
+        else:
+            chunk = (
+                self.eager_chunk
+                if hidden_states.shape[0] > 1
+                else self.compiled_chunk
+            )
+        return chunk(hidden_states, *args, **kwargs)
+
+
+def _dsv4_forward_phase() -> str | None:
+    try:
+        attn_metadata = get_forward_context().attn_metadata
+    except AssertionError:
+        return None
+
+    if isinstance(attn_metadata, list):
+        metadata_groups = attn_metadata
+    else:
+        metadata_groups = [attn_metadata]
+
+    saw_decode = False
+    for metadata_group in metadata_groups:
+        if isinstance(metadata_group, Mapping):
+            metadata_values = metadata_group.values()
+        else:
+            metadata_values = (metadata_group,)
+        for metadata in metadata_values:
+            if metadata is None:
+                continue
+            if int(getattr(metadata, "num_prefills", 0)) > 0:
+                return "prefill"
+            if int(getattr(metadata, "num_decodes", 0)) > 0:
+                saw_decode = True
+            is_prompt = getattr(metadata, "is_prompt", None)
+            if is_prompt is True:
+                return "prefill"
+            if is_prompt is False:
+                saw_decode = True
+    return "decode" if saw_decode else None
+
+
+@contextlib.contextmanager
+def _dsv4_compile_only_scope(enabled: bool):
+    if not enabled:
+        yield
+        return
+
+    from vllm_gaudi.ops.hpu_hw_agnostic import (
+        _set_hpu_dsv4_compile_only,
+    )
+
+    previous = _set_hpu_dsv4_compile_only(True)
+    env_name = "_VLLM_HPU_DSV4_COMPILE_ONLY_ACTIVE"
+    previous_env = os.environ.get(env_name)
+    os.environ[env_name] = "1"
+    try:
+        yield
+    finally:
+        _set_hpu_dsv4_compile_only(previous)
+        if previous_env is None:
+            os.environ.pop(env_name, None)
+        else:
+            os.environ[env_name] = previous_env
+
+
+def _configure_deepseek_v4_inline_attention(model) -> int:
+    inline_all = gaudi_envs.VLLM_HPU_DSV4_INLINE_ATTENTION
+    inline_frontend = gaudi_envs.VLLM_HPU_DSV4_INLINE_ATTN_FRONTEND
+    if not inline_all and not inline_frontend:
+        return 0
+    if inline_all and inline_frontend:
+        raise ValueError(
+            "VLLM_HPU_DSV4_INLINE_ATTENTION and "
+            "VLLM_HPU_DSV4_INLINE_ATTN_FRONTEND are mutually exclusive"
+        )
+    from vllm.models.deepseek_v4.hw_agnostic.attention.attention import (
+        DeepseekV4MultiHeadLatentAttentionWrapper,
+    )
+
+    configured = 0
+    for module in model.modules():
+        if isinstance(module, DeepseekV4MultiHeadLatentAttentionWrapper):
+            if inline_all:
+                module.inline_attention_impl = True
+            else:
+                module.inline_attention_frontend = True
+            configured += 1
+    return configured
+
+
+def _promote_deepseek_v4_rope_buffers(model) -> int:
+    if not htorch.utils.internal.is_lazy():
+        return 0
+    promoted = 0
+    for module in model.modules():
+        cache = module._buffers.get("cos_sin_cache")
+        if cache is None or cache.device.type != "hpu":
+            continue
+        del module._buffers["cos_sin_cache"]
+        module.register_parameter(
+            "cos_sin_cache",
+            torch.nn.Parameter(cache.detach().clone(), requires_grad=False),
+        )
+        promoted += 1
+    return promoted
+
+
+def _preload_deepseek_v4_tpc_ops() -> bool:
+    if not gaudi_envs.VLLM_HPU_DSV4_TPC_OP_LIBRARY:
+        return False
+    from vllm_gaudi.ops.hpu_hw_agnostic import (
+        _ensure_dsv4_tpc_ops_loaded,
+    )
+
+    _ensure_dsv4_tpc_ops_loaded()
+    return True
+
+
+def _prewarm_deepseek_v4_qnorm_tpc(model: torch.nn.Module) -> int:
+    if not gaudi_envs.VLLM_HPU_DSV4_TPC_QNORM_ROPE_KV_PACK:
+        return 0
+
+    from vllm.models.deepseek_v4.hw_agnostic.attention.attention import (
+        DeepseekV4MultiHeadLatentAttentionWrapper,
+    )
+    from vllm_gaudi.ops.hpu_hw_agnostic import (
+        _hpu_qnorm_rope_kv_fp8_insert,
+        _set_hpu_dsv4_qnorm_tpc_prewarmed,
+    )
+
+    _set_hpu_dsv4_qnorm_tpc_prewarmed(False)
+    warmed_shapes: set[tuple[Any, ...]] = set()
+    for module in model.modules():
+        if not isinstance(
+            module, DeepseekV4MultiHeadLatentAttentionWrapper
+        ):
+            continue
+        cache_layer = module.swa_cache_layer
+        storage = cache_layer.kv_cache_storage
+        geometry = cache_layer.kv_cache_geometry
+        if storage.numel() == 0 or geometry.numel() != 4:
+            continue
+        cos_sin_cache = module.rotary_emb.cos_sin_cache.contiguous()
+        recipe_shape = (
+            module.n_local_heads,
+            tuple(storage.shape),
+            tuple(storage.stride()),
+            tuple(cos_sin_cache.shape),
+            tuple(cos_sin_cache.stride()),
+        )
+        if recipe_shape in warmed_shapes:
+            continue
+
+        device = storage.device
+        q = torch.zeros(
+            (1, module.n_local_heads, module.head_dim),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        kv = torch.zeros(
+            (1, module.head_dim),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        slots = torch.full((1,), -1, dtype=torch.int32, device=device)
+        positions = torch.zeros((1,), dtype=torch.int32, device=device)
+        _hpu_qnorm_rope_kv_fp8_insert(
+            q,
+            kv,
+            cache_layer.kv_cache,
+            slots,
+            positions,
+            cos_sin_cache,
+            module.eps,
+            cache_layer.block_size,
+            storage,
+            geometry,
+        )
+        torch.hpu.synchronize()
+        warmed_shapes.add(recipe_shape)
+
+    if warmed_shapes:
+        _set_hpu_dsv4_qnorm_tpc_prewarmed(True)
+    return len(warmed_shapes)
+
+
 def apply_model_specific_patches(model_runner):
     """The function applies model-specific monkey patches."""
     maybe_set_chunked_attention_layers(model_runner)
@@ -945,9 +1231,61 @@ def apply_model_specific_patches(model_runner):
     is_llama4 = is_hpu_llama4_model(model_runner.model)
     model_type = getattr(model_runner.vllm_config.model_config.hf_config, "model_type", "")
     is_qwen_moe = model_type in ("qwen3_moe", "qwen3_5", "qwen3_5_text", "qwen3_5_moe")
-    is_gemma4 = model_type in ("gemma4", )
 
-    model_runner._has_heterogeneous_layers = is_llama4 or is_qwen_moe or is_gemma4
+    if model_type == "deepseek_v4":
+        promoted_rope_buffers = _promote_deepseek_v4_rope_buffers(
+            model_runner.model
+        )
+        if promoted_rope_buffers:
+            logger.info(
+                "Promoted %d DeepSeek V4 RoPE buffers to lazy graph constants",
+                promoted_rope_buffers,
+            )
+        if _preload_deepseek_v4_tpc_ops():
+            logger.info("Preloaded DeepSeek V4 TPC operators before graph warmup")
+            logger.info(
+                "DeepSeek V4 decode TPC config: direct=%s paged=%s "
+                "short_indexer_cache_skip=%s pair_heads=%s "
+                "pair_op_registered=%s compress_bf16=%s "
+                "compress_bf16_op_registered=%s compress_mixed=%s "
+                "compress_mixed_op_registered=%s",
+                gaudi_envs.VLLM_HPU_DSV4_DIRECT_DECODE_DISPATCH,
+                gaudi_envs.VLLM_HPU_DSV4_TPC_PAGED_SPARSE_ATTN,
+                gaudi_envs.VLLM_HPU_DSV4_SHORT_INDEXER_CACHE_SKIP,
+                gaudi_envs.VLLM_HPU_DSV4_TPC_PAIR_HEADS,
+                hasattr(
+                    torch.ops.custom_op,
+                    "custom_deepseek_v4_paged_sparse_attn_pair_"
+                    "sequential_fp8_gaudi2",
+                ),
+                gaudi_envs.VLLM_HPU_DSV4_TPC_BF16_COMPRESS_INPUTS,
+                hasattr(
+                    torch.ops.custom_op,
+                    "custom_deepseek_v4_save_compress_norm_c4_"
+                    "bf16_gaudi2",
+                ),
+                gaudi_envs.VLLM_HPU_DSV4_TPC_MIXED_COMPRESS_INPUTS,
+                hasattr(
+                    torch.ops.custom_op,
+                    "custom_deepseek_v4_save_compress_norm_c4_"
+                    "mixed_gaudi2",
+                ),
+            )
+        inline_attention_layers = _configure_deepseek_v4_inline_attention(
+            model_runner.model
+        )
+        if inline_attention_layers:
+            logger.info(
+                "Enabled inline DeepSeek V4 %s for %d layers",
+                (
+                    "attention"
+                    if gaudi_envs.VLLM_HPU_DSV4_INLINE_ATTENTION
+                    else "attention frontend"
+                ),
+                inline_attention_layers,
+            )
+
+    model_runner._has_heterogeneous_layers = is_llama4 or _needs_compile_validation_warmup(model_type)
     if is_llama4:
         apply_hpu_llama4_post_load_patches(model_runner.model)
     if is_qwen_moe:
@@ -1097,15 +1435,12 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
         # kwargs['attn_metadata'].slot_mapping, compared to untrimmed metadata
         kwargs = kwargs.copy()
         #        selected_token_indices = kwargs.pop('selected_token_indices')
-        if 'lora_mask' in kwargs:
-            lora_mask = kwargs['lora_mask']
-            LoraMask.setLoraMask(lora_mask)
-            kwargs.pop('lora_mask')
         if 'warmup_mode' in kwargs:
             kwargs.pop('warmup_mode')
         input_ids = kwargs['input_ids']
         model_has_chunked_attention = kwargs.pop('model_has_chunked_attention', False)
-        if 'attn_metadata' in kwargs and not self.pooling_model:
+        framework_attn_metadata = isinstance(kwargs.get('attn_metadata'), Mapping)
+        if 'attn_metadata' in kwargs and not self.pooling_model and not framework_attn_metadata:
             kwargs['attn_metadata'] = self.metadata_processor.process_metadata(kwargs['attn_metadata'],
                                                                                input_ids.size(0), input_ids.size(1),
                                                                                input_ids.device, self.dtype,
@@ -1132,6 +1467,8 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
             else input_ids.size(0) * input_ids.size(1)
         if self.flatten_input:
             kwargs['input_ids'] = input_ids.view(-1)
+            if framework_attn_metadata:
+                kwargs['positions'] = kwargs['positions'].view(-1)
         # here num_tokens and num_tokens_across_dp are dummy values which are
         # used to skip sync in forward_context between DP ranks
         with set_forward_context(attn_meta,
@@ -1442,6 +1779,29 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         finalize_config()
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
+        if (
+            self.model_config.hf_config.model_type == "deepseek_v4"
+            and not self.model_config.enforce_eager
+        ):
+            num_model_layers = int(
+                self.model_config.hf_config.num_hidden_layers
+            )
+            regional_compilation = (
+                HPUCompileConfig().regional_compilation
+            )
+            initial_cache_limit = _dynamo_cache_limit(
+                bucket_count=2,
+                regional_compilation=regional_compilation,
+                model_type="deepseek_v4",
+                num_model_layers=num_model_layers,
+            )
+            _configure_dynamo_cache_limits(initial_cache_limit)
+            logger.info(
+                "Configured initial DeepSeek V4 Dynamo limits: "
+                "recompile=%s accumulated=%s",
+                torch._dynamo.config.recompile_limit,
+                torch._dynamo.config.accumulated_recompile_limit,
+            )
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
         self.load_config = vllm_config.load_config
@@ -1673,7 +2033,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         # Keep in int64 to avoid overflow with long context
         self.max_num_reqs = self.scheduler_config.max_num_seqs
+        _hpu_init_sync("before_seq_lens")
         self.seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+        _hpu_init_sync("after_seq_lens")
 
         # Keep in int64 to avoid overflow with long context
         self.arange_np = np.arange(max(self.max_num_reqs + 1, self.max_model_len, self.max_num_tokens), dtype=np.int64)
@@ -1702,6 +2064,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             logitsprocs=build_logitsprocs(self.vllm_config, self.device, self.pin_memory, self.is_pooling_model,
                                           self.vllm_config.model_config.logits_processors),
         )
+        _hpu_init_sync("after_input_batch")
 
         self.use_async_scheduling = self.scheduler_config.async_scheduling
         self.use_structured_output: bool = False  # Default to false. Set to true when needed during a run
@@ -2041,8 +2404,118 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     dtype=self.kv_cache_dtype,
                     cache_dtype_str=cache_dtype_str,
                 )
+            elif isinstance(attn_module, AttentionLayerBase):
+                spec = attn_module.get_kv_cache_spec(self.vllm_config)
+                if spec is None:
+                    continue
+                if isinstance(spec, AttentionSpec):
+                    spec = attn_module.get_attn_backend().customize_spec(spec)
+                kv_cache_spec[layer_name] = spec
 
         return kv_cache_spec
+
+    def uses_framework_kv_cache_layout(self, layer_name: str) -> bool:
+        attn_module = self.vllm_config.compilation_config.static_forward_context[layer_name]
+        return isinstance(attn_module, AttentionLayerBase) and not isinstance(
+            attn_module,
+            (Attention, MLAAttention, MambaBase),
+        )
+
+    def allocate_framework_kv_cache_layer(self, layer_spec: KVCacheSpec, num_blocks: int) -> torch.Tensor:
+        """Allocate one layer using vLLM's logical [B, H, N, C] cache layout."""
+        layout = self.cache_config.get_resolved_kv_cache_layout()
+        shape_bytes = compute_layer_kv_cache_shape_bytes(
+            layer_spec,
+            num_blocks,
+            kernel_block_size=layer_spec.block_size,
+        )
+        strides = compute_layout_strides(
+            layer_spec,
+            num_blocks,
+            1,
+            layout,
+            kernel_block_size=layer_spec.block_size,
+        )
+        dtype = getattr(layer_spec, "dtype", None) or torch.int8
+        dtype_size = get_dtype_size(dtype)
+        allocation_bytes = num_blocks * layer_spec.page_size_bytes
+        assert allocation_bytes % dtype_size == 0
+        assert shape_bytes[-1] % dtype_size == 0
+        assert strides[-1] == 1
+        assert all(stride % dtype_size == 0 for stride in strides[:-1])
+
+        # Allocating the backing tensor in its final dtype is equivalent to
+        # viewing the byte layout, but avoids aten::view(dtype), which the
+        # upstream PyTorch lazy bridge cannot represent in alias analysis.
+        raw = torch.zeros(
+            allocation_bytes // dtype_size,
+            dtype=dtype,
+            device=self.device,
+        )
+        shape = (*shape_bytes[:-1], shape_bytes[-1] // dtype_size)
+        typed_strides = tuple(
+            stride // dtype_size for stride in strides[:-1]
+        ) + (1,)
+        return torch.as_strided(
+            raw,
+            size=(1, *shape),
+            stride=typed_strides,
+        )[0]
+
+    def bind_framework_kv_caches(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        runner_kv_caches: list[torch.Tensor],
+    ) -> None:
+        """Bind multiple cache modules per decoder layer in a stable order."""
+        assert len(runner_kv_caches) == 0
+        ordered_layer_names = sorted(
+            kv_caches,
+            key=lambda layer_name: (extract_layer_index(layer_name), layer_name),
+        )
+        forward_context = self.vllm_config.compilation_config.static_forward_context
+        for layer_name in ordered_layer_names:
+            kv_cache = kv_caches[layer_name]
+            runner_kv_caches.append(kv_cache)
+            forward_context[layer_name].bind_kv_cache(kv_cache)
+
+    @staticmethod
+    def _get_layer_kv_cache_spec(kv_cache_config: KVCacheConfig, layer_name: str) -> KVCacheSpec:
+        for group in kv_cache_config.kv_cache_groups:
+            if layer_name not in group.layer_names:
+                continue
+            spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = spec.kv_cache_specs[layer_name]
+            return spec
+        raise KeyError(f"No KV cache spec for layer {layer_name}")
+
+    def _add_framework_kv_cache_pad_block(self, kv_cache_config: KVCacheConfig) -> KVCacheConfig:
+        """Extend a planner layout by one block reserved for HPU padding tokens."""
+        padded_config = deepcopy(kv_cache_config)
+        old_num_blocks = padded_config.num_blocks
+        padded_config.num_blocks = old_num_blocks + 1
+
+        max_extent = 0
+        for tensor in padded_config.kv_cache_tensors:
+            spec = self._get_layer_kv_cache_spec(padded_config, tensor.layers[0])
+            page_size = spec.page_size_bytes
+            if tensor.block_stride == page_size and tensor.layer_stride == old_num_blocks * page_size:
+                tensor.layer_stride = padded_config.num_blocks * page_size
+            elif not (tensor.layer_stride == page_size
+                      and tensor.block_stride >= len(tensor.layers) * page_size):
+                raise ValueError(
+                    "Unsupported HPU KV cache placement for padding block: "
+                    f"layers={tensor.layers}, layer_stride={tensor.layer_stride}, "
+                    f"block_stride={tensor.block_stride}, page_size={page_size}")
+
+            extent = (tensor.offset + (len(tensor.layers) - 1) * tensor.layer_stride
+                      + (padded_config.num_blocks - 1) * tensor.block_stride + page_size)
+            max_extent = max(max_extent, extent)
+
+        for tensor in padded_config.kv_cache_tensors:
+            tensor.size = max_extent
+        return padded_config
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> bool:
         """Update the cached states and the persistent batch with the scheduler
@@ -3025,6 +3498,593 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         return attn_mask.unflatten(0, (1, -1))
 
+    def _framework_attention_index_dtype(self) -> torch.dtype:
+        # DeepSeek V4's native HPU cache/attention kernels consume int32
+        # metadata. Produce that representation once per scheduler step so
+        # every decoder layer does not cast positions and slot mappings.
+        if self._get_model_type() == "deepseek_v4":
+            return torch.int32
+        return torch.int64
+
+    def _build_framework_prefill_attention_metadata(
+        self,
+        req_ids: list[str],
+        query_lens: list[int],
+        context_lens: list[int],
+        token_positions: list[list[int]],
+    ) -> dict[str, Any]:
+        num_reqs = len(req_ids)
+        query_lens = query_lens[:num_reqs]
+        context_lens = context_lens[:num_reqs]
+        token_positions = token_positions[:num_reqs]
+
+        query_start_loc_cpu = torch.zeros(num_reqs + 1, dtype=torch.int32)
+        query_start_loc_cpu[1:] = torch.cumsum(
+            torch.tensor(query_lens, dtype=torch.int32),
+            dim=0,
+        )
+        seq_lens_cpu = torch.tensor(
+            [context_len + query_len for context_len, query_len in zip(context_lens, query_lens)],
+            dtype=torch.int32,
+        )
+        context_lens_cpu = torch.tensor(context_lens, dtype=torch.int32)
+        index_dtype = self._framework_attention_index_dtype()
+        flat_positions_cpu = torch.tensor(
+            [
+                position
+                for positions, query_len in zip(token_positions, query_lens)
+                for position in positions[:query_len]
+            ],
+            dtype=index_dtype,
+        )
+
+        query_start_loc = async_h2d_copy(query_start_loc_cpu, dtype=torch.int32)
+        seq_lens = async_h2d_copy(seq_lens_cpu, dtype=torch.int32)
+        positions = async_h2d_copy(flat_positions_cpu, dtype=index_dtype)
+        is_prefilling = torch.ones(num_reqs, dtype=torch.bool, device=self.device)
+        num_actual_tokens = int(query_start_loc_cpu[-1])
+        req_indices = [self.input_batch.req_id_to_index[req_id] for req_id in req_ids]
+
+        attn_metadata: dict[str, Any] = {}
+        block_table_idx = 0
+        for kv_cache_gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
+            if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
+                continue
+
+            block_table = self.input_batch.block_table[block_table_idx]
+            block_table_cpu = block_table.get_cpu_tensor()[req_indices].clone()
+            block_table_tensor = async_h2d_copy(block_table_cpu, dtype=torch.int32)
+            kernel_block_size = block_table.block_size
+
+            slot_mapping_cpu: list[int] = []
+            for req_row, (positions_row, query_len) in enumerate(zip(token_positions, query_lens)):
+                blocks = block_table_cpu[req_row]
+                for position in positions_row[:query_len]:
+                    if position < 0:
+                        slot_mapping_cpu.append(-1)
+                        continue
+                    block_idx, block_offset = divmod(position, kernel_block_size)
+                    if block_idx >= blocks.shape[0]:
+                        raise ValueError(
+                            "Framework KV slot mapping exceeds block table width: "
+                            f"kv_cache_gid={kv_cache_gid}, position={position}, "
+                            f"block_idx={block_idx}, width={blocks.shape[0]}, "
+                            f"kernel_block_size={kernel_block_size}"
+                        )
+                    slot_mapping_cpu.append(int(blocks[block_idx]) * kernel_block_size + block_offset)
+            slot_mapping = async_h2d_copy(slot_mapping_cpu, dtype=index_dtype)
+
+            common_attn_metadata = CommonAttentionMetadata(
+                query_start_loc=query_start_loc,
+                query_start_loc_cpu=query_start_loc_cpu,
+                seq_lens=seq_lens,
+                _seq_lens_cpu=seq_lens_cpu,
+                _num_computed_tokens_cpu=context_lens_cpu,
+                seq_lens_cpu_upper_bound=seq_lens_cpu,
+                num_reqs=num_reqs,
+                num_actual_tokens=num_actual_tokens,
+                max_query_len=max(query_lens, default=0),
+                max_seq_len=max(seq_lens_cpu.tolist(), default=0),
+                block_table_tensor=block_table_tensor,
+                slot_mapping=slot_mapping,
+                causal=True,
+                is_prefilling=is_prefilling,
+                positions=positions,
+            )
+            for attn_group in self.attn_groups[kv_cache_gid]:
+                metadata = attn_group.get_metadata_builder().build(
+                    common_prefix_len=0,
+                    common_attn_metadata=common_attn_metadata,
+                )
+                for layer_name in attn_group.layer_names:
+                    attn_metadata[layer_name] = metadata
+            block_table_idx += 1
+
+        return attn_metadata
+
+    @staticmethod
+    def _build_framework_q1_derived_cpu_metadata(
+        builder: Any,
+        position: int,
+        seq_len: int,
+        block_table_cpu: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Build DeepSeek V4 q1 sparse metadata before the packed H2D."""
+        if position != seq_len - 1:
+            raise ValueError(
+                "DeepSeek V4 q1 position/sequence mismatch: "
+                f"position={position}, seq_len={seq_len}"
+            )
+
+        builder_name = type(builder).__name__
+
+        def map_slot(logical_position: int, block_size: int) -> int:
+            block_index, block_offset = divmod(
+                logical_position, block_size
+            )
+            if block_index >= block_table_cpu.shape[1]:
+                raise ValueError(
+                    "DeepSeek V4 q1 metadata exceeds block table width: "
+                    f"builder={builder_name}, position={logical_position}, "
+                    f"block_size={block_size}, "
+                    f"width={block_table_cpu.shape[1]}"
+                )
+            block_number = int(block_table_cpu[0, block_index])
+            if block_number < 0:
+                return -1
+            return block_number * block_size + block_offset
+
+        if builder_name == "DeepseekSparseSWAMetadataBuilder":
+            window_size = int(builder.window_size)
+            start_position = max(position - window_size + 1, 0)
+            window_len = position - start_position + 1
+            indices = torch.full(
+                (1, 1, window_size), -1, dtype=torch.int32
+            )
+            for offset, logical_position in enumerate(
+                range(start_position, position + 1)
+            ):
+                indices[0, 0, offset] = map_slot(
+                    logical_position, int(builder.block_size)
+                )
+            return {
+                "decode_swa_indices": indices,
+                "decode_swa_lens": torch.tensor(
+                    [window_len], dtype=torch.int32
+                ),
+            }
+
+        if builder_name not in (
+            "DeepseekV4IndexerMetadataBuilder",
+            "DeepseekV4HWAgnosticMetadataBuilder",
+        ):
+            return {}
+
+        compress_ratio = int(builder.compress_ratio)
+        if compress_ratio <= 1:
+            return {}
+        compressed_slot = -1
+        if (position + 1) % compress_ratio == 0:
+            compressed_position = position // compress_ratio
+            compressed_slot = map_slot(
+                compressed_position,
+                int(builder.kv_cache_spec.num_states),
+            )
+        result = {
+            "compressed_slot_mapping": torch.tensor(
+                [compressed_slot], dtype=torch.int32
+            )
+        }
+
+        if builder_name == "DeepseekV4IndexerMetadataBuilder":
+            result["compressed_seq_lens"] = torch.tensor(
+                [[seq_len // compress_ratio]], dtype=torch.int32
+            )
+            return result
+
+        if compress_ratio == 128:
+            width = int(builder.c128a_max_compressed)
+            num_compressed = min(seq_len // compress_ratio, width)
+            global_topk = torch.full((1, width), -1, dtype=torch.int32)
+            block_size = int(builder.kv_cache_spec.block_size) // compress_ratio
+            for compressed_position in range(num_compressed):
+                global_topk[0, compressed_position] = map_slot(
+                    compressed_position, block_size
+                )
+            result["c128a_global_decode_topk_indices"] = global_topk.view(
+                1, 1, width
+            )
+            result["c128a_decode_topk_lens"] = torch.tensor(
+                [num_compressed], dtype=torch.int32
+            )
+        return result
+
+    def _build_framework_decode_attention_metadata(
+        self,
+        num_decodes: int,
+        padded_batch_size: int,
+        context_lens: np.ndarray,
+        positions_cpu: torch.Tensor,
+        positions_device: Optional[torch.Tensor] = None,
+    ) -> dict[str, Any]:
+        """Build framework attention metadata for a padded q1 decode batch.
+
+        HPU's legacy decode metadata is a single ``HPUAttentionMetadataV1``
+        object. Framework-layout layers such as DeepSeek V4 instead resolve
+        per-layer metadata from a dictionary in ``ForwardContext``. Treat the
+        bucket padding rows as invalid decode requests so the metadata tensor
+        shapes still match the static HPU decode batch.
+        """
+        if positions_cpu.shape != (padded_batch_size, 1):
+            raise ValueError(
+                "Framework-layout HPU decode currently supports q1 only, got "
+                f"positions shape {tuple(positions_cpu.shape)}"
+            )
+
+        req_ids = list(self.input_batch.req_ids[:num_decodes])
+        req_indices = [
+            self.input_batch.req_id_to_index[req_id] for req_id in req_ids
+        ]
+        context_lens_cpu = torch.zeros(padded_batch_size, dtype=torch.int32)
+        context_lens_cpu[:num_decodes] = torch.as_tensor(
+            context_lens[:num_decodes], dtype=torch.int32
+        )
+        seq_lens_cpu = context_lens_cpu + 1
+        query_start_loc_cpu = torch.arange(
+            padded_batch_size + 1, dtype=torch.int32
+        )
+        index_dtype = self._framework_attention_index_dtype()
+        flat_positions_cpu = positions_cpu.reshape(-1).to(index_dtype)
+        q1_metadata_fastpath = (
+            gaudi_envs.VLLM_HPU_DSV4_Q1_METADATA_FASTPATH
+            and num_decodes == padded_batch_size
+            and padded_batch_size == 1
+        )
+
+        positions = (
+            async_h2d_copy(flat_positions_cpu, dtype=index_dtype)
+            if positions_device is None
+            else positions_device.reshape(-1)
+        )
+        is_prefilling_cache = getattr(
+            self, "_framework_decode_is_prefilling", None
+        )
+        if is_prefilling_cache is None:
+            is_prefilling_cache = {}
+            self._framework_decode_is_prefilling = is_prefilling_cache
+        is_prefilling = is_prefilling_cache.get(padded_batch_size)
+        if is_prefilling is None:
+            is_prefilling = torch.zeros(
+                padded_batch_size, dtype=torch.bool, device=self.device
+            )
+            is_prefilling_cache[padded_batch_size] = is_prefilling
+
+        group_cpu_metadata = []
+        block_table_idx = 0
+        for kv_cache_gid, kv_cache_group in enumerate(
+            self.kv_cache_config.kv_cache_groups
+        ):
+            if isinstance(
+                kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec
+            ):
+                continue
+
+            block_table = self.input_batch.block_table[block_table_idx]
+            scheduler_block_table = block_table.get_cpu_tensor()
+            selected_block_table = scheduler_block_table[req_indices].clone()
+            block_table_cpu = torch.full(
+                (padded_batch_size, scheduler_block_table.shape[1]),
+                self._PAD_BLOCK_ID,
+                dtype=torch.int32,
+            )
+            block_table_cpu[:num_decodes].copy_(
+                selected_block_table.to(torch.int32)
+            )
+            if q1_metadata_fastpath:
+                block_table_cpu.clamp_min_(0)
+
+            kernel_block_size = block_table.block_size
+            slot_mapping_cpu = torch.full(
+                (padded_batch_size,), -1, dtype=index_dtype
+            )
+            for req_row in range(num_decodes):
+                position = int(flat_positions_cpu[req_row])
+                block_idx, block_offset = divmod(
+                    position, kernel_block_size
+                )
+                if block_idx >= selected_block_table.shape[1]:
+                    raise ValueError(
+                        "Framework KV slot mapping exceeds block table width: "
+                        f"kv_cache_gid={kv_cache_gid}, position={position}, "
+                        f"block_idx={block_idx}, "
+                        f"width={selected_block_table.shape[1]}, "
+                        f"kernel_block_size={kernel_block_size}"
+                    )
+                block_number = int(selected_block_table[req_row, block_idx])
+                if block_number >= 0:
+                    slot_mapping_cpu[req_row] = (
+                        block_number * kernel_block_size + block_offset
+                    )
+            group_cpu_metadata.append(
+                (kv_cache_gid, block_table_cpu, slot_mapping_cpu)
+            )
+            block_table_idx += 1
+
+        use_packed_metadata = (
+            gaudi_envs.VLLM_HPU_DSV4_PACKED_DECODE_METADATA
+            and index_dtype == torch.int32
+        )
+        builder_cpu_metadata = []
+        if use_packed_metadata and q1_metadata_fastpath:
+            position = int(flat_positions_cpu[0])
+            seq_len = int(seq_lens_cpu[0])
+            for kv_cache_gid, block_table_cpu, _ in group_cpu_metadata:
+                for attn_group in self.attn_groups[kv_cache_gid]:
+                    builder = attn_group.get_metadata_builder()
+                    fields = HPUModelRunner._build_framework_q1_derived_cpu_metadata(
+                        builder,
+                        position,
+                        seq_len,
+                        block_table_cpu,
+                    )
+                    if fields:
+                        builder_cpu_metadata.append(
+                            (id(builder), fields)
+                        )
+        group_device_metadata = []
+        builder_device_metadata: dict[int, dict[str, torch.Tensor]] = {}
+        if use_packed_metadata:
+            ring_size = gaudi_envs.VLLM_HPU_DSV4_DECODE_METADATA_RING_SIZE
+            if ring_size < 2:
+                raise ValueError(
+                    "VLLM_HPU_DSV4_DECODE_METADATA_RING_SIZE must be at "
+                    "least 2"
+                )
+            packed_sources = [query_start_loc_cpu, seq_lens_cpu]
+            for _, block_table_cpu, slot_mapping_cpu in group_cpu_metadata:
+                packed_sources.extend((block_table_cpu, slot_mapping_cpu))
+            builder_source_layout = []
+            for builder_id, fields in builder_cpu_metadata:
+                for name, source in fields.items():
+                    builder_source_layout.append((builder_id, name))
+                    packed_sources.append(source)
+
+            packed_key = (
+                padded_batch_size,
+                tuple(tuple(source.shape) for source in packed_sources),
+                ring_size,
+            )
+            packed_cache = getattr(
+                self, "_framework_decode_metadata_packs", None
+            )
+            if packed_cache is None:
+                packed_cache = {}
+                self._framework_decode_metadata_packs = packed_cache
+            packed_entry = packed_cache.get(packed_key)
+            packed_numel = sum(source.numel() for source in packed_sources)
+            if packed_entry is None:
+                packed_entry = {
+                    "buffers": [
+                        (
+                            torch.empty(packed_numel, dtype=torch.int32),
+                            torch.empty(
+                                packed_numel,
+                                dtype=torch.int32,
+                                device=self.device,
+                            ),
+                        )
+                        for _ in range(ring_size)
+                    ],
+                    "next": 0,
+                }
+                packed_cache[packed_key] = packed_entry
+                logger.info(
+                    "Allocated packed DeepSeek V4 decode metadata: "
+                    "batch=%d groups=%d int32_values=%d ring=%d",
+                    padded_batch_size,
+                    len(group_cpu_metadata),
+                    packed_numel,
+                    ring_size,
+                )
+            buffer_index = packed_entry["next"]
+            packed_entry["next"] = (buffer_index + 1) % ring_size
+            packed_cpu, packed_device = packed_entry["buffers"][
+                buffer_index
+            ]
+            packed_views = []
+            offset = 0
+            for source in packed_sources:
+                numel = source.numel()
+                packed_cpu[offset:offset + numel].copy_(
+                    source.reshape(-1)
+                )
+                packed_views.append(
+                    packed_device[offset:offset + numel].view(source.shape)
+                )
+                offset += numel
+            async_h2d_copy(
+                packed_cpu,
+                dest_tensor=packed_device,
+                device=self.device,
+            )
+            query_start_loc, seq_lens = packed_views[:2]
+            view_index = 2
+            for kv_cache_gid, _, _ in group_cpu_metadata:
+                group_device_metadata.append(
+                    (
+                        kv_cache_gid,
+                        packed_views[view_index],
+                        packed_views[view_index + 1],
+                    )
+                )
+                view_index += 2
+            for builder_id, name in builder_source_layout:
+                builder_device_metadata.setdefault(builder_id, {})[
+                    name
+                ] = packed_views[view_index]
+                view_index += 1
+        else:
+            query_start_loc = async_h2d_copy(
+                query_start_loc_cpu, dtype=torch.int32
+            )
+            seq_lens = async_h2d_copy(seq_lens_cpu, dtype=torch.int32)
+            for kv_cache_gid, block_table_cpu, slot_mapping_cpu in (
+                group_cpu_metadata
+            ):
+                group_device_metadata.append(
+                    (
+                        kv_cache_gid,
+                        async_h2d_copy(
+                            block_table_cpu, dtype=torch.int32
+                        ),
+                        async_h2d_copy(
+                            slot_mapping_cpu, dtype=index_dtype
+                        ),
+                    )
+                )
+
+        attn_metadata: dict[str, Any] = {}
+        for kv_cache_gid, block_table_tensor, slot_mapping in (
+            group_device_metadata
+        ):
+            common_attn_metadata = CommonAttentionMetadata(
+                query_start_loc=query_start_loc,
+                query_start_loc_cpu=query_start_loc_cpu,
+                seq_lens=seq_lens,
+                _seq_lens_cpu=seq_lens_cpu,
+                _num_computed_tokens_cpu=context_lens_cpu,
+                seq_lens_cpu_upper_bound=seq_lens_cpu,
+                num_reqs=padded_batch_size,
+                num_actual_tokens=padded_batch_size,
+                max_query_len=1,
+                max_seq_len=int(seq_lens_cpu.max()),
+                block_table_tensor=block_table_tensor,
+                slot_mapping=slot_mapping,
+                causal=True,
+                is_prefilling=is_prefilling,
+                positions=positions,
+            )
+            if builder_device_metadata:
+                common_attn_metadata._dsv4_q1_fast_metadata = (
+                    builder_device_metadata
+                )
+            for attn_group in self.attn_groups[kv_cache_gid]:
+                metadata = attn_group.get_metadata_builder().build(
+                    common_prefix_len=0,
+                    common_attn_metadata=common_attn_metadata,
+                    fast_build=q1_metadata_fastpath,
+                )
+                for layer_name in attn_group.layer_names:
+                    attn_metadata[layer_name] = metadata
+
+        return attn_metadata
+
+    def _create_framework_decode_input_data(
+        self,
+        num_decodes: int,
+        num_scheduled_tokens: list[int],
+        context_lens: np.ndarray,
+        scheduler_output=None,
+    ) -> DecodeInputData:
+        """Prepare q1 framework-layout decode without legacy HPU metadata."""
+        decode_block_size = self.attn_block_size
+        num_blocks = np.ceil(
+            (context_lens + 1) / decode_block_size
+        ).astype(np.int32).tolist()
+        num_tokens_per_req = num_scheduled_tokens[:num_decodes]
+        num_tokens = max(num_tokens_per_req)
+        if num_tokens != 1:
+            raise ValueError(
+                "Framework-layout HPU decode currently supports q1 only, "
+                f"got max scheduled tokens {num_tokens}"
+            )
+
+        padded_batch_size = self.bucketing_manager.find_decode_bucket(
+            num_decodes,
+            sum(num_blocks),
+            False,
+        )[0]
+        padded_batch_size += self.get_dp_padding(padded_batch_size)
+
+        with torch.profiler.record_function(
+            "dsv4::decode_framework_base_cpu"
+        ):
+            position_dtype = self._framework_attention_index_dtype()
+            positions_cpu = torch.zeros(
+                (padded_batch_size, 1), dtype=position_dtype
+            )
+            positions_cpu[:num_decodes] = self.positions_cpu[
+                :num_decodes
+            ].view(-1, 1)
+            token_ids_cpu = torch.zeros(
+                (padded_batch_size, 1), dtype=torch.int32
+            )
+            token_ids_cpu[:num_decodes] = self.input_ids_cpu[
+                :num_decodes
+            ].view(-1, 1)
+            logits_indices_cpu = torch.zeros(
+                padded_batch_size, dtype=torch.int32
+            )
+            logits_indices_cpu[:num_decodes] = torch.arange(
+                num_decodes, dtype=torch.int32
+            )
+
+        # The model and framework attention consume the same positions. Keep a
+        # single device allocation/upload instead of transferring it twice.
+        with torch.profiler.record_function(
+            "dsv4::decode_framework_base_h2d"
+        ):
+            positions_flat_device = async_h2d_copy(
+                positions_cpu.reshape(-1),
+                dtype=position_dtype,
+                device=self.device,
+            )
+            positions_device = positions_flat_device.view(
+                padded_batch_size, 1
+            )
+            token_ids_device = async_h2d_copy(
+                token_ids_cpu, device=self.device
+            )
+
+        if self.use_async_scheduling and scheduler_output is not None:
+            self._prepare_input_ids(scheduler_output)
+            token_ids_device[:num_decodes] = self.input_ids_hpu[
+                :num_decodes
+            ].view(-1, 1)
+
+        if scheduler_output is not None:
+            logits_indices_cpu, spec_decode_metadata = (
+                self._prepare_spec_decode_inputs(
+                    scheduler_output,
+                    logits_indices_cpu,
+                    token_ids_device,
+                    num_tokens,
+                )
+            )
+        else:
+            spec_decode_metadata = None
+        with torch.profiler.record_function(
+            "dsv4::decode_framework_attention_metadata"
+        ):
+            logits_indices_device = async_h2d_copy(
+                logits_indices_cpu, device=self.device
+            )
+            attn_metadata = self._build_framework_decode_attention_metadata(
+                num_decodes=num_decodes,
+                padded_batch_size=padded_batch_size,
+                context_lens=context_lens,
+                positions_cpu=positions_cpu,
+                positions_device=positions_flat_device,
+            )
+        return DecodeInputData(
+            num_decodes=num_decodes,
+            token_ids=token_ids_device,
+            position_ids=positions_device,
+            logits_indices=logits_indices_device,
+            attn_metadata=attn_metadata,
+            spec_decode_metadata=spec_decode_metadata,
+        )
+
     def _form_prefill_batch(self, contents):
         if len(contents.req_ids) == 0:
             return PrefillInputData()
@@ -3042,7 +4102,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # slot indices match the InputBatch block_table which is keyed
         # by kernel_block_size (= attn_block_size on HPU).  self.block_size
         # may be larger for hybrid models after page-size unification.
-        slot_block_size = self.attn_block_size
+        if self.use_framework_kv_cache_layout:
+            slot_block_size = self.input_batch.block_table[0].block_size
+        else:
+            slot_block_size = self.attn_block_size
         block_assignment = [[divmod(pos, slot_block_size) for pos in positions] for positions in token_positions]
 
         token_slots = [[blocks[bi] * slot_block_size + bo for bi, bo in assignment]
@@ -3308,9 +4371,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             seqlens_offsets_for_blocks = None
             mamba_chunks_to_block_mapping = None
 
+        framework_query_lens_cpu = list(query_lens)
+        framework_context_lens_cpu = list(context_lens)
+        framework_positions_cpu = token_positions
+
         query_lens = async_h2d_copy(query_lens, dtype=torch.int32)
         token_ids = async_h2d_copy(token_ids, dtype=torch.int32)
-        token_positions = async_h2d_copy(token_positions, dtype=torch.int32)
+        position_dtype = (
+            self._framework_attention_index_dtype()
+            if self.use_framework_kv_cache_layout
+            else torch.int32
+        )
+        token_positions = async_h2d_copy(token_positions, dtype=position_dtype)
         token_slots = async_h2d_copy(token_slots, dtype=torch.int64)
         logits_indices = async_h2d_copy(logits_indices, dtype=torch.int32)
         context_lens = async_h2d_copy(context_lens, dtype=torch.int32)
@@ -3327,24 +4399,32 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             window_context_blocks = align_and_pad(window_context_blocks_raw, (target_bs, sliding_block_size),
                                                   itertools.repeat(-1))
             window_context_blocks_t = async_h2d_copy(window_context_blocks, dtype=torch.int32).flatten()
-        attn_metadata = HPUAttentionMetadataV1.make_prefill_metadata(
-            seq_lens_tensor=query_lens,
-            context_lens_tensor=context_lens,
-            slot_mapping=token_slots,
-            block_list=context_blocks_t,
-            attn_bias=attn_bias,
-            block_size=self.attn_block_size,
-            prep_initial_states=prep_initial_states,
-            has_initial_states_p=has_initial_states_p,
-            last_chunk_indices_p=last_chunk_indices_p,
-            load_indices_tensor=load_indices_tensor,
-            store_indices_tensor=store_indices_tensor,
-            query_start_loc=query_start_loc_p,
-            padding_mask_flat=padding_mask_flat,
-            blocks_caching_range=blocks_caching_range,
-            mamba_chunks_to_block_mapping=mamba_chunks_to_block_mapping,
-            seqlens_offsets_for_blocks=seqlens_offsets_for_blocks,
-            window_block_list=window_context_blocks_t)
+        if self.use_framework_kv_cache_layout:
+            attn_metadata = self._build_framework_prefill_attention_metadata(
+                req_ids,
+                framework_query_lens_cpu,
+                framework_context_lens_cpu,
+                framework_positions_cpu,
+            )
+        else:
+            attn_metadata = HPUAttentionMetadataV1.make_prefill_metadata(
+                seq_lens_tensor=query_lens,
+                context_lens_tensor=context_lens,
+                slot_mapping=token_slots,
+                block_list=context_blocks_t,
+                attn_bias=attn_bias,
+                block_size=self.attn_block_size,
+                prep_initial_states=prep_initial_states,
+                has_initial_states_p=has_initial_states_p,
+                last_chunk_indices_p=last_chunk_indices_p,
+                load_indices_tensor=load_indices_tensor,
+                store_indices_tensor=store_indices_tensor,
+                query_start_loc=query_start_loc_p,
+                padding_mask_flat=padding_mask_flat,
+                blocks_caching_range=blocks_caching_range,
+                mamba_chunks_to_block_mapping=mamba_chunks_to_block_mapping,
+                seqlens_offsets_for_blocks=seqlens_offsets_for_blocks,
+                window_block_list=window_context_blocks_t)
         return PrefillInputData(request_ids=[req_ids],
                                 prompt_lens=[query_lens],
                                 token_ids=[token_ids],
@@ -3397,6 +4477,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                   block_table_cpu_tensor,
                                   scheduler_output=None) -> DecodeInputData:
 
+        if self.use_framework_kv_cache_layout:
+            return self._create_framework_decode_input_data(
+                num_decodes,
+                num_scheduled_tokens,
+                context_lens,
+                scheduler_output,
+            )
+
         decode_block_size = self.attn_block_size
 
         num_tokens_per_req = num_scheduled_tokens[:num_decodes]
@@ -3441,7 +4529,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # NOTE(Chendi): Follow GPU_Model_Runner to use global
         # self.positions_cpu, which updated in prepare_inputs from
         # self.input_batch.num_computed_tokens_cpu[req_indices]
-        positions = torch.zeros((padded_batch_size, num_tokens), dtype=torch.int32)
+        position_dtype = (
+            self._framework_attention_index_dtype()
+            if self.use_framework_kv_cache_layout
+            else torch.int32
+        )
+        positions = torch.zeros((padded_batch_size, num_tokens), dtype=position_dtype)
         if num_tokens == 1:
             positions[:num_decodes] = self.positions_cpu[:num_decodes].view(-1, 1)
         else:
@@ -3545,7 +4638,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         logits_indices[:num_decodes] = query_start_loc_cpu[1:num_decodes + 1] - 1
 
-        positions_device = async_h2d_copy(positions, device=self.device)
+        positions_device = async_h2d_copy(positions, dtype=position_dtype, device=self.device)
         block_tables_list = self._resolve_all_blocks(block_tables_list)
 
         # CONTEXT_LENS [batch_size]
@@ -3750,27 +4843,35 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     padded_batch_size,
                 )
 
-        attn_metadata = HPUAttentionMetadataV1.make_decode_metadata(
-            block_list=block_list_device,
-            block_usage=block_usage_device,
-            block_groups=block_groups_device,
-            input_positions=None,
-            slot_mapping=slot_mapping_device,
-            block_size=decode_block_size,
-            window_block_list=window_block_list_device,
-            window_block_usage=window_block_usage_device,
-            window_block_groups=window_block_groups_device,
-            chunked_block_list=chunked_block_list_device,
-            chunked_block_usage=chunked_block_usage_device,
-            chunked_block_groups=chunked_block_groups_device,
-            load_indices_tensor=load_indices_tensor,
-            store_indices_tensor=store_indices_tensor,
-            num_accepted_tokens=num_accepted_tokens,
-            seq_lens_tensor=seq_lens_tensor,
-            query_start_loc=query_start_loc_p,
-            direct_gdn_state=direct_gdn_state,
-            dflash_full_query=dflash_full_query,
-        )
+        if self.use_framework_kv_cache_layout:
+            attn_metadata = self._build_framework_decode_attention_metadata(
+                num_decodes=num_decodes,
+                padded_batch_size=padded_batch_size,
+                context_lens=context_lens,
+                positions_cpu=positions,
+            )
+        else:
+            attn_metadata = HPUAttentionMetadataV1.make_decode_metadata(
+                block_list=block_list_device,
+                block_usage=block_usage_device,
+                block_groups=block_groups_device,
+                input_positions=None,
+                slot_mapping=slot_mapping_device,
+                block_size=decode_block_size,
+                window_block_list=window_block_list_device,
+                window_block_usage=window_block_usage_device,
+                window_block_groups=window_block_groups_device,
+                chunked_block_list=chunked_block_list_device,
+                chunked_block_usage=chunked_block_usage_device,
+                chunked_block_groups=chunked_block_groups_device,
+                load_indices_tensor=load_indices_tensor,
+                store_indices_tensor=store_indices_tensor,
+                num_accepted_tokens=num_accepted_tokens,
+                direct_gdn_state=direct_gdn_state,
+                dflash_full_query=dflash_full_query,
+                seq_lens_tensor=seq_lens_tensor,
+                query_start_loc=query_start_loc_p,
+            )
 
         return DecodeInputData(num_decodes=num_decodes,
                                token_ids=token_ids_device,
@@ -4039,19 +5140,37 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                fuse_greedy_sampling=False):
         # FORWARD.
         batch_size = token_ids.size(0)
-        seq_len = self._seq_len(attn_metadata)
-        num_blocks = self._num_blocks(attn_metadata)
-        self._check_config(batch_size, seq_len, num_blocks, attn_metadata, warmup_mode)
+        framework_attn_metadata = isinstance(attn_metadata, Mapping)
+        if framework_attn_metadata:
+            seq_len = token_ids.size(-1)
+            num_blocks = max(
+                (
+                    metadata.block_table.shape[-1]
+                    for metadata in attn_metadata.values()
+                    if getattr(metadata, "block_table", None) is not None
+                ),
+                default=0,
+            )
+            phase = "prompt" if seq_len > 1 else "decode"
+            cfg = (phase, batch_size, seq_len, num_blocks)
+            seen = cfg in self.seen_configs
+            self.seen_configs.add(cfg)
+            if not seen and not warmup_mode:
+                logger.warning("Configuration: %s was not warmed-up!", cfg)
+        else:
+            seq_len = self._seq_len(attn_metadata)
+            num_blocks = self._num_blocks(attn_metadata)
+            self._check_config(batch_size, seq_len, num_blocks, attn_metadata, warmup_mode)
         additional_kwargs = {}
         if htorch.utils.internal.is_lazy():
-            use_graphs = self._use_graphs(attn_metadata, batch_size)
+            use_graphs = False if framework_attn_metadata else self._use_graphs(attn_metadata, batch_size)
             additional_kwargs.update({"bypass_hpu_graphs": not use_graphs})
         else:
             # no hpu graphs for t.compile?
             use_graphs = False
         if self.model_has_chunked_attention:
             additional_kwargs.update({"model_has_chunked_attention": True})
-        trimmed_attn_metadata = trim_attn_metadata(attn_metadata)
+        trimmed_attn_metadata = attn_metadata if framework_attn_metadata else trim_attn_metadata(attn_metadata)
         if self.is_driver_worker:
             model_event_name = ("model_forward_"
                                 f"bs{batch_size}_"
@@ -4060,15 +5179,48 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                 f"graphs{'T' if use_graphs else 'F'}")
         else:
             model_event_name = 'model_executable'
+        quality_debug = (
+            os.getenv("VLLM_HPU_DSV4_QUALITY_DEBUG") == "1"
+            and not warmup_mode
+            and self.is_driver_worker
+        )
+        if quality_debug:
+            torch.hpu.synchronize()
+            logger.warning(
+                "DSV4 quality input_ids=%s positions=%s logits_indices=%s",
+                token_ids.detach().cpu().tolist(),
+                position_ids.detach().cpu().tolist(),
+                logits_indices.detach().cpu().tolist(),
+            )
+
         with self.profiler.record_event('internal', model_event_name):
+            # Keep Python class-state mutation outside the compiled model.
+            # Full-graph Dynamo cannot trace setattr on LoraMask, while doing
+            # it immediately before the call preserves the existing lifetime.
+            LoraMask.setLoraMask(lora_mask)
             hidden_states = self.model.forward(input_ids=token_ids,
                                                positions=position_ids,
                                                attn_metadata=trimmed_attn_metadata,
                                                kv_caches=kv_caches,
                                                inputs_embeds=inputs_embeds,
                                                model_mm_kwargs=model_mm_kwargs,
-                                               lora_mask=lora_mask,
                                                **additional_kwargs)
+        if quality_debug and isinstance(hidden_states, torch.Tensor):
+            hidden_flat = hidden_states.reshape(-1, hidden_states.shape[-1]).float()
+            hidden_norms = torch.linalg.vector_norm(hidden_flat, dim=-1)
+            if hidden_flat.shape[0] > 1:
+                hidden_deltas = torch.linalg.vector_norm(
+                    hidden_flat[1:] - hidden_flat[:-1], dim=-1
+                )
+            else:
+                hidden_deltas = hidden_norms.new_empty((0,))
+            torch.hpu.synchronize()
+            logger.warning(
+                "DSV4 quality hidden_norms=%s adjacent_deltas=%s samples=%s",
+                hidden_norms.detach().cpu().tolist(),
+                hidden_deltas.detach().cpu().tolist(),
+                hidden_flat[:, :8].detach().cpu().tolist(),
+            )
         # NOTE(kzawora): returning hidden_states is required in prompt logprobs
         # scenarios, as they will do logit processing on their own
         if self.use_aux_hidden_state_outputs:
@@ -5458,7 +6610,37 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             torch._dynamo.config.force_parameter_static_shapes = False
             self.compile_config = HPUCompileConfig()
 
-            if self.compile_config.regional_compilation:
+            chunk_size = gaudi_envs.VLLM_HPU_DSV4_COMPILE_CHUNK_SIZE
+            if chunk_size < 0:
+                raise ValueError(
+                    "VLLM_HPU_DSV4_COMPILE_CHUNK_SIZE must be non-negative"
+                )
+            use_deepseek_chunks = (
+                self.model_config.hf_config.model_type == "deepseek_v4"
+                and chunk_size > 0
+            )
+
+            if use_deepseek_chunks:
+                self._compile_methods()
+                self.regional_compilation_layers_list = [
+                    RMSNorm,
+                    VocabParallelEmbedding,
+                ]
+                self._regional_compilation(
+                    self.model,
+                    skip_deepseek_decoder_layers=True,
+                )
+                chunk_count = self._compile_deepseek_v4_layer_chunks(
+                    chunk_size
+                )
+                self.sampler = self._compile(self.sampler)
+                logger.info(
+                    "Configured DeepSeek V4 coarse compilation: "
+                    "chunk_size=%d chunks=%d",
+                    chunk_size,
+                    chunk_count,
+                )
+            elif self.compile_config.regional_compilation:
                 self._compile_methods()
                 self.regional_compilation_layers_list = [RMSNorm, VocabParallelEmbedding]
                 self._regional_compilation(self.model)
@@ -5509,7 +6691,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             if method is not None:
                 self._compile_region(model, method_name, method)
 
-    def _regional_compilation(self, module, parent_module=None, module_name=None):
+    def _regional_compilation(
+        self,
+        module,
+        parent_module=None,
+        module_name=None,
+        skip_deepseek_decoder_layers=False,
+    ):
         """
         Recursively traverses a PyTorch module and compiles its regions, which
         can be one of two:
@@ -5555,6 +6743,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     "size 2 with VLLM_HPU_TP2_FUSED_AR_NORM enabled; using per-layer compilation")
 
         if isinstance(module, torch.nn.ModuleList):
+            if (
+                skip_deepseek_decoder_layers
+                and len(module) > 0
+                and all(
+                    child.__class__.__name__ == "DeepseekV4DecoderLayer"
+                    for child in module
+                )
+            ):
+                return
             for children_name, children_module in module.named_children():
                 self._compile_region(module, children_name, children_module)
         elif any(isinstance(module, layer) for layer in self.regional_compilation_layers_list):
@@ -5565,7 +6762,67 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             )
         else:
             for children_name, children_module in module.named_children():
-                self._regional_compilation(children_module, module, children_name)
+                self._regional_compilation(
+                    children_module,
+                    module,
+                    children_name,
+                    skip_deepseek_decoder_layers,
+                )
+
+    def _compile_deepseek_v4_layer_chunks(self, chunk_size: int) -> int:
+        from vllm.models.deepseek_v4.hw_agnostic.model import (
+            DeepseekV4DecoderLayerChunk,
+            DeepseekV4Model,
+        )
+
+        compile_args = HPUCompileConfig(
+            fullgraph=True,
+            dynamic=False,
+        ).get_compile_args()
+        if gaudi_envs.VLLM_HPU_DSV4_EARLY_OUTPUT_LOWERING:
+            from vllm_gaudi.compilation.deepseek_v4 import make_backend
+            compile_args["backend"] = make_backend()
+        chunk_count = 0
+        models = [
+            module
+            for module in self.model.modules()
+            if isinstance(module, DeepseekV4Model)
+        ]
+        for model in models:
+            layers = list(
+                itertools.islice(
+                    model.layers,
+                    model.start_layer,
+                    model.end_layer,
+                )
+            )
+            compiled_chunks = []
+            decode_only_compile = _dsv4_decode_only_compile_enabled(
+                self.model_config.hf_config.model_type
+            )
+            for offset in range(0, len(layers), chunk_size):
+                chunk_layers = layers[offset:offset + chunk_size]
+                chunk = DeepseekV4DecoderLayerChunk(
+                    chunk_layers,
+                    start_layer=model.start_layer + offset,
+                    model_end_layer=model.end_layer,
+                )
+                chunk.train(model.training)
+                compiled_chunk = torch.compile(chunk, **compile_args)
+                compiled_chunks.append(
+                    _HPUDeepseekV4PhaseChunk(chunk, compiled_chunk)
+                    if decode_only_compile
+                    else compiled_chunk
+                )
+            object.__setattr__(
+                model,
+                "_hpu_compiled_layer_chunks",
+                compiled_chunks,
+            )
+            chunk_count += len(compiled_chunks)
+        if chunk_count == 0:
+            raise RuntimeError("No DeepSeek V4 decoder layers found to compile")
+        return chunk_count
 
     def _compile_region(self, model, name, module):
         module = self._compile(module)
@@ -6102,13 +7359,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 total_tokens_for_blocks = self.max_model_len
 
         prompt_token_ids = list(range(total_tokens))
-        num_blocks = round_up(total_tokens_for_blocks, self.block_size) // self.block_size
 
         req_id = f'{len(requests)}'
-        block_ids = [[block_id] *
-                     (round_up(total_tokens_for_blocks, g.kv_cache_spec.block_size) // g.kv_cache_spec.block_size)
-                     for g in self.kv_cache_config.kv_cache_groups] if self.num_mamba_like_layers > 0 else [[block_id] *
-                                                                                                            num_blocks]
+        block_ids = [
+            [block_id] * (round_up(total_tokens_for_blocks, group.kv_cache_spec.block_size)
+                          // group.kv_cache_spec.block_size)
+            for group in self.kv_cache_config.kv_cache_groups
+            if not isinstance(group.kv_cache_spec, EncoderOnlyAttentionSpec)
+        ]
         if self.is_pooling_model:
             model = cast(VllmModelForPooling, self.get_model())
             if hasattr(self.model_config, 'task') and self.model_config.task is not None:
@@ -6834,14 +8092,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         kv_caches = self.kv_caches
 
         if not htorch.utils.internal.is_lazy() and not self.model_config.enforce_eager:
-            multiplier = 5 if self.compile_config.regional_compilation else 1
-            cache_size_limit = 1 + multiplier * (len(self.bucketing_manager.prompt_buckets) +
-                                                 len(self.bucketing_manager.decode_buckets))
-            torch._dynamo.config.cache_size_limit = max(cache_size_limit, torch._dynamo.config.cache_size_limit)
-            # Multiply by 8 to follow the original default ratio between
-            # the cache_size_limit and accumulated_cache_size_limit
-            torch._dynamo.config.accumulated_cache_size_limit = max(cache_size_limit * 8,
-                                                                    torch._dynamo.config.accumulated_cache_size_limit)
+            layers = self._get_model_layers()
+            num_model_layers = len(layers) if layers is not None else 1
+            cache_size_limit = _dynamo_cache_limit(
+                len(self.bucketing_manager.prompt_buckets) + len(self.bucketing_manager.decode_buckets),
+                self.compile_config.regional_compilation,
+                get_config().model_type,
+                num_model_layers,
+            )
+            _configure_dynamo_cache_limits(cache_size_limit)
 
         if self.skip_warmup:
             logger.info("Skipping warmup...")
@@ -6852,6 +8111,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         start_time = time.perf_counter()
 
         use_torch_compile = (not htorch.utils.internal.is_lazy() and not self.model_config.enforce_eager)
+        skip_prompt_graph_warmup = _dsv4_decode_only_compile_enabled(
+            self._get_model_type()
+        )
         mm_warmup_outside = gaudi_envs.VLLM_MM_WARMUP_OUTSIDE_COMPILE_ONLY
         if self.supports_mm_inputs and (not use_torch_compile or mm_warmup_outside):
             self.warmup_multimodal_graphs(self.get_model().vision_bucket_manager.multimodal_buckets)
@@ -6867,7 +8129,28 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             logger.warning('Cannot use PT_COMPILE_ONLY_MODE. '
                            'Warmup time will be negatively impacted. '
                            'Please update Gaudi Software Suite.')
-        with compile_only_mode_context() if can_use_compile_only_mode else contextlib.nullcontext():
+        if (
+            can_use_compile_only_mode
+            and use_torch_compile
+            and self._get_model_type() == "deepseek_v4"
+        ):
+            qnorm_recipe_count = _prewarm_deepseek_v4_qnorm_tpc(
+                self.get_model()
+            )
+            if qnorm_recipe_count:
+                logger.info(
+                    "Prewarmed %d DeepSeek V4 qnorm TPC recipe shape(s) "
+                    "before compile-only graph capture",
+                    qnorm_recipe_count,
+                )
+        with (
+            compile_only_mode_context()
+            if can_use_compile_only_mode
+            else contextlib.nullcontext()
+        ), _dsv4_compile_only_scope(
+            can_use_compile_only_mode
+            and self._get_model_type() == "deepseek_v4"
+        ):
             if self.supports_mm_inputs and use_torch_compile and not mm_warmup_outside:
                 self.warmup_multimodal_graphs(self.get_model().vision_bucket_manager.multimodal_buckets)
 
@@ -6883,10 +8166,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     self.defragmenter.warmup()
 
                 # TODO(kzawora): align_workers
-                mem_post_prompt, prompt_batch_seq, prompt_captured_all = \
-                    self.warmup_graphs(
-                        self.bucketing_manager.prompt_buckets, True, kv_caches)
-                self.log_graph_warmup_summary(self.bucketing_manager.prompt_buckets, True, mem_post_prompt)
+                if skip_prompt_graph_warmup:
+                    logger.warning(
+                        "Skipping DeepSeek V4 prompt graph warmup; only decode "
+                        "graphs will be captured. This is an experimental "
+                        "profiling mode."
+                    )
+                else:
+                    mem_post_prompt, prompt_batch_seq, prompt_captured_all = \
+                        self.warmup_graphs(
+                            self.bucketing_manager.prompt_buckets, True, kv_caches)
+                    self.log_graph_warmup_summary(
+                        self.bucketing_manager.prompt_buckets, True, mem_post_prompt)
                 if not self.is_pooling_model:
                     is_dflash = (self.speculative_config is not None and self.speculative_config.use_dflash())
                     decode_warmup_buckets = _model_warmup_decode_buckets(
@@ -6905,8 +8196,19 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # Validation warmup: run smallest buckets outside compile-only mode
         # to trigger torch.compile guard specializations for heterogeneous layers
         # (e.g. Llama4 mix of MoE/MLP feed_forward types).
+        skip_validation_warmup = (
+            skip_prompt_graph_warmup
+            and os.getenv(
+                "VLLM_HPU_DSV4_SKIP_VALIDATION_WARMUP", "0"
+            ).strip().lower()
+            in ("1", "true")
+        )
+        if skip_validation_warmup:
+            logger.warning(
+                "Skipping DeepSeek V4 validation warmup by request."
+            )
         if (can_use_compile_only_mode and not self.model_config.enforce_eager and not self.is_pooling_model
-                and self._has_heterogeneous_layers):
+                and self._has_heterogeneous_layers and not skip_validation_warmup):
             logger.info("Running validation warmup to trigger guard specializations...")
             saved_graphed = self.graphed_buckets.copy()
             self.graphed_buckets.clear()
@@ -6921,7 +8223,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # the NEWEST dynamo compilations (which will be selected first at
             # inference) have Synapse recipes for the max seq_len shapes.
             prompt_buckets = self.bucketing_manager.prompt_buckets
-            if prompt_buckets:
+            if prompt_buckets and not skip_prompt_graph_warmup:
                 max_seq_len = max(b[1] for b in prompt_buckets)
                 max_seq_buckets = [b for b in prompt_buckets if b[1] == max_seq_len]
                 logger.info("Validation warmup: %s prompt buckets (seq_len=%s)", len(max_seq_buckets), max_seq_len)
@@ -7113,6 +8415,24 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         for i, attn_backend_map in enumerate(attention_backend_maps):
             self.attn_groups.append(create_attn_groups(attn_backend_map, i))
 
+    def initialize_framework_metadata_builders(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kernel_block_sizes: list[int],
+    ) -> None:
+        kernel_idx = 0
+        for kv_cache_gid, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
+            if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
+                continue
+            kernel_block_size = kernel_block_sizes[kernel_idx]
+            kernel_idx += 1
+            for attn_group in self.attn_groups[kv_cache_gid]:
+                attn_group.create_metadata_builders(
+                    self.vllm_config,
+                    self.device,
+                    kernel_block_size,
+                )
+
     def _kv_cache_spec_attn_group_iterator(self) -> collections.abc.Iterator[AttentionGroup]:
         if not self.kv_cache_config.kv_cache_groups:
             return
@@ -7187,8 +8507,29 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # KV cache groups.  For GDN/linear_attention we additionally compute
         # kernel block sizes; for other hybrid (mamba) models we still need to
         # reinitialize so that MultiGroupBlockTable has one entry per group.
-        if self.num_gdn > 0 or self.num_mamba_like_layers > 0:
+        managed_layer_names = {
+            layer_name
+            for group in kv_cache_config.kv_cache_groups
+            for layer_name in group.layer_names
+            if layer_name not in self.runner_only_attn_layers
+        }
+        framework_layout_layer_names = {
+            layer_name
+            for layer_name in managed_layer_names
+            if self.uses_framework_kv_cache_layout(layer_name)
+        }
+        use_framework_kv_cache_layout = bool(framework_layout_layer_names)
+        self.use_framework_kv_cache_layout = use_framework_kv_cache_layout
+        if use_framework_kv_cache_layout and framework_layout_layer_names != managed_layer_names:
+            raise NotImplementedError(
+                "Mixing framework-layout and legacy HPU KV cache layers is not supported: "
+                f"framework={sorted(framework_layout_layer_names)}, all={sorted(managed_layer_names)}")
+
+        kernel_block_sizes: list[int] = []
+        if self.num_gdn > 0 or self.num_mamba_like_layers > 0 or use_framework_kv_cache_layout:
             kernel_block_sizes = prepare_kernel_block_sizes(kv_cache_config, self.attn_groups)
+            if use_framework_kv_cache_layout:
+                self.initialize_framework_metadata_builders(kv_cache_config, kernel_block_sizes)
             self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
 
             kernel_block_size_by_gid: dict[int, int] = {}
@@ -7263,7 +8604,38 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 mamba_state_cache[key] = tensors
             return tensors
 
-        if self.use_hybrid_cache and self.num_mamba_like_layers > 0:
+        if use_framework_kv_cache_layout:
+            padded_kv_cache_config = self._add_framework_kv_cache_pad_block(kv_cache_config)
+            if htorch.utils.internal.is_lazy():
+                # Upstream allocate_kv_cache creates int8 backing tensors and
+                # reinterprets each layer with view(dtype). The upstream lazy
+                # bridge cannot represent those cross-dtype aliases, so keep
+                # the same logical layout in one typed allocation per layer.
+                kv_caches = {
+                    layer_name: self.allocate_framework_kv_cache_layer(
+                        self._get_layer_kv_cache_spec(
+                            padded_kv_cache_config,
+                            layer_name,
+                        ),
+                        padded_kv_cache_config.num_blocks,
+                    )
+                    for layer_name in sorted(framework_layout_layer_names)
+                }
+            else:
+                kv_caches = allocate_kv_cache(
+                    padded_kv_cache_config,
+                    self.device,
+                    self.cache_config.get_resolved_kv_cache_layout(),
+                    kernel_block_sizes,
+                )
+            num_blocks = kv_cache_config.num_blocks
+            logger.info(
+                "Allocated framework-layout HPU KV cache for %d layers: "
+                "%d scheduler blocks plus one padding block",
+                len(kv_caches),
+                num_blocks,
+            )
+        elif self.use_hybrid_cache and self.num_mamba_like_layers > 0:
             # Build layer_name -> spec lookup for skipping raw buffer
             # allocation for GDN/linear_attention groups (they use
             # contiguous tensors instead).
@@ -7543,7 +8915,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
                 kv_caches[layer_name] = kv_caches[target_layer_name]
         assert layer_names == set(kv_caches.keys()), "Some layers are not correctly initialized"
-        bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, self.kv_caches)
+        if use_framework_kv_cache_layout:
+            self.bind_framework_kv_caches(kv_caches, self.kv_caches)
+        else:
+            bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, self.kv_caches)
 
         self._set_cache_block_capacity(num_blocks, max_attention_kernel_blocks)
 
