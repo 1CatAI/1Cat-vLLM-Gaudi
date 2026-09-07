@@ -22,6 +22,8 @@ This document lists the supported diagnostic and profiling, as well as performan
 | ---------------------------- | ------------------------------------------------------------- | ------------- |
 | `VLLM_GRAPH_RESERVED_MEM`    | Percentage of memory dedicated to HPUGraph capture.           | `0.1`         |
 | `VLLM_BUCKETING_STRATEGY`    | Selects the bucketing strategy: `exp`, `lin`, or `pad`.      | `exp`         |
+| `VLLM_PROMPT_BUCKETING_STRATEGY` | Overrides the strategy for prompt/prefill buckets: `exp`, `lin`, or `pad`. | `None` (use global strategy) |
+| `VLLM_DECODE_BUCKETING_STRATEGY` | Overrides the strategy for decode buckets: `exp`, `lin`, or `pad`. | `None` (use global strategy) |
 | `VLLM_EXPONENTIAL_BUCKETING` | Deprecated compatibility flag. If set, it overrides `VLLM_BUCKETING_STRATEGY`: `true` forces `exp`, `false` forces `lin`. It cannot select `pad` and will be removed in a future release. | `None`        |
 | `VLLM_BUCKETING_FROM_FILE`   | Enables reading bucket configuration from file.              | `None`        |
 | `VLLM_ROW_PARALLEL_CHUNKS`   | Number of chunks to split input into for pipelining matmul with all-reduce in RowParallelLinear layers. Setting to a value greater than 1 enables chunking. See [Row-Parallel Chunking](../features/row_parallel_chunking.md). | `1` (disabled) |
@@ -166,7 +168,9 @@ RMSNorm is considered.
 
 Use `VLLM_BUCKETING_STRATEGY=exp` for the default exponential warm-up, `VLLM_BUCKETING_STRATEGY=lin` for explicitly configured linear ranges, or `VLLM_BUCKETING_STRATEGY=pad` for padding-aware ranges with absolute and relative padding limits.
 
-Leave `VLLM_EXPONENTIAL_BUCKETING` unset when using `VLLM_BUCKETING_STRATEGY`. The legacy flag is checked for backward compatibility and still overrides the selected strategy when present.
+Set `VLLM_PROMPT_BUCKETING_STRATEGY` or `VLLM_DECODE_BUCKETING_STRATEGY` to override only that phase. For example, `VLLM_BUCKETING_STRATEGY=exp` with `VLLM_DECODE_BUCKETING_STRATEGY=pad` keeps exponential prompt buckets and uses padding-aware decode buckets. An unset phase override falls back to the global strategy. This configuration does not enable padded direct GDN state access.
+
+Leave `VLLM_EXPONENTIAL_BUCKETING` unset when using global or phase-specific strategy settings. The legacy flag still overrides both phases when present. `VLLM_BUCKETING_FROM_FILE` takes precedence over generated buckets for both phases.
 
 ## Developer Mode Parameters
 
@@ -225,7 +229,7 @@ HPU PyTorch bridge environment variables impacting vLLM execution:
 - `{param}` is in `['MIN', 'STEP', 'MAX']` for the `lin` strategy.
 - `{param}` is in `['MIN', 'STEP', 'MAX', 'PAD_MAX', 'PAD_PERCENT']` for the `pad` strategy.
 
-The following table lists the available variables with their default values. `PAD_MAX` and `PAD_PERCENT` are used only when `VLLM_BUCKETING_STRATEGY=pad`.
+The following table lists the available variables with their default values. `PAD_MAX` and `PAD_PERCENT` are used when the corresponding phase selects `pad`, through either the global strategy or its phase override.
 
 | Phase  | Variable name                                                            | Default value                                                                                                       |
 |--------|--------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------|
@@ -290,7 +294,7 @@ FusedSDPA can be split into smaller chunks to improve performance while using th
 | `VLLM_HPU_FSDPA_SLICE_WITH_GRAPH_BREAKS` | Places each chunk in a separate graph to reduce compilation time.                            | `true` for lazy mode and `false` otherwise  |
 
 !!! note
-    These parameters are effective only with the padding-aware bucketing strategy set by `VLLM_BUCKETING_STRATEGY="pad"`.
+    These parameters require generated padding-aware prompt buckets, selected by `VLLM_PROMPT_BUCKETING_STRATEGY="pad"` or inherited from `VLLM_BUCKETING_STRATEGY="pad"`. Decode overrides do not enable prompt slicing. File-based buckets and the deprecated exponential-bucketing flag disable slicing because they do not establish the required padding bounds.
 
 The slicing is only activated if all the following additional conditions are satisfied:
 - The batch size should be 1.
