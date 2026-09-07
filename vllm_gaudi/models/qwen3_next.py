@@ -187,7 +187,22 @@ class HpuQwen3NextModel(UpstreamQwen3NextModel):
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         layer_groups = getattr(self, "_hpu_compiled_layer_groups", None)
         attn_metadata = get_forward_context().attn_metadata
-        if can_use_hpu_qwen3_layer_groups(
+        use_boundary_prefetch = False
+        if getattr(self, "_hpu_boundary_prefetch", False):
+            from vllm_gaudi.models.qwen3_boundary import can_pipeline_prefill
+            first_layer = self.layers[self.start_layer]
+            use_boundary_prefetch = (first_layer._hpu_boundary_chunks > 1
+                                     and can_pipeline_prefill(hidden_states, first_layer._hpu_boundary_threshold))
+        if use_boundary_prefetch:
+            prefetched = None
+            for layer in islice(self.layers, self.start_layer, self.end_layer):
+                hidden_states, residual, prefetched = layer(positions=positions,
+                                                            hidden_states=hidden_states,
+                                                            residual=residual,
+                                                            prefetched=prefetched,
+                                                            return_prefetched=True)
+            used_grouped_final_norm = False
+        elif can_use_hpu_qwen3_layer_groups(
                 layer_groups,
                 self.aux_hidden_state_layers,
                 attn_metadata,
@@ -235,7 +250,7 @@ _orig_qwen3next_attention_forward = Qwen3NextAttention.forward
 # ``output`` in-place buffer; caller now does
 #   hidden_states = self.self_attn(hidden_states=..., positions=...)
 # ====================================================================
-def _hpu_qwen3next_attention_forward(self, positions, hidden_states):
+def _hpu_qwen3next_attention_forward(self, positions, hidden_states, return_core=False, projected_input=None):
 
     # Patch any 3D layout (BS > 1):
     #   Decode:  hidden_states [B, 1, H]
@@ -246,11 +261,26 @@ def _hpu_qwen3next_attention_forward(self, positions, hidden_states):
     # mismatch in `attn_output * gate`.  We flatten both to 2D.
     is_3d = (hidden_states is not None and hidden_states.dim() == 3)
     if not is_3d:
+        if return_core or projected_input is not None:
+            if projected_input is None:
+                qkv, _ = self.qkv_proj(hidden_states)
+            else:
+                qkv = projected_input[0]
+            q, k, v, gate = self._project_qkv_gate(qkv, positions)
+            attn_output = self.attn(q, k, v)
+            if gate is not None:
+                attn_output = attn_output * torch.sigmoid(gate)
+            if return_core:
+                return attn_output
+            return self.o_proj(attn_output)[0]
         return _orig_qwen3next_attention_forward(self, positions, hidden_states)
 
     orig_shape = hidden_states.shape
 
-    qkv, _ = self.qkv_proj(hidden_states)
+    if projected_input is None:
+        qkv, _ = self.qkv_proj(hidden_states)
+    else:
+        qkv = projected_input[0].reshape(*orig_shape[:-1], -1)
 
     gate = None
     if self.attn_output_gate:
@@ -278,6 +308,8 @@ def _hpu_qwen3next_attention_forward(self, positions, hidden_states):
         gate_2d = torch.sigmoid(gate).view(-1, gate.shape[-1])
         attn_output_2d = attn_output_2d * gate_2d
 
+    if return_core:
+        return attn_output_2d
     proj_out, _ = self.o_proj(attn_output_2d)
 
     # Restore caller's original 3-D layout [B, L, H_out] so the residual
