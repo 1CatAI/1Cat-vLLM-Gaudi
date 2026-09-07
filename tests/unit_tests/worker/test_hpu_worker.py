@@ -121,3 +121,17 @@ def test_init_device_initializes_workspace_before_model_runner(monkeypatch):
     assert events[4][1]["vllm_config"] is worker.vllm_config
     assert events[4][1]["is_driver_worker"] is False
     assert events[5] == "profiler"
+
+
+def test_profiler_summary_uses_effective_legacy_directory(monkeypatch, tmp_path):
+    worker = HPUWorker.__new__(HPUWorker)
+    directory = tmp_path / "legacy"
+    worker.vllm_config = SimpleNamespace(profiler_config=SimpleNamespace(
+        profiler=None, torch_profiler_dir=None, torch_profiler_summary_only=True))
+    worker.rank = 1
+    monkeypatch.setenv("VLLM_TORCH_PROFILER_DIR", str(directory))
+    worker.init_profiler()
+    worker.profiler = SimpleNamespace(key_averages=lambda: SimpleNamespace(
+        table=lambda **kwargs: "operator summary"))
+    worker._write_profiler_summary()
+    assert (directory / "operator-summary-rank1.txt").read_text().count("operator summary") == 3

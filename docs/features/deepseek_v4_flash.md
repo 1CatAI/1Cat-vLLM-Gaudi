@@ -79,3 +79,20 @@ The short-context profile does not establish long-context, concurrent-request,
 DSpark, or general model-accuracy parity. Existing diagnostic and quality
 counterexamples remain relevant; a token-exact small cohort is not a full
 accuracy evaluation.
+
+### Known Cold-Start Limitation
+
+The source candidate reproduces the previously recorded difference between
+initial and subsequent greedy completions for the same prompt. Stable requests
+and the preserved quality cohort match the old source reference token for token,
+but the request-history dependence has not been explained or fixed. Do not
+interpret stable-token equality as a guarantee of cold-start determinism or full
+model accuracy. Preserve cold failures separately; do not warm repeatedly until
+an arbitrary mismatch disappears or report those attempts as a clean pass.
+
+For an isolated compiler contract check, select a free device and run
+`tools/check_deepseek_v4_compiler.py` in its own process with both
+`HABANA_VISIBLE_MODULES` and `HLS_MODULE_ID` set. It checks that prefill retains
+its original boundaries, decode lowering preserves producer dependencies, and
+repeated compiled calls remain exact without recompilation. It does not load a
+checkpoint, collect a latency baseline, or mutate any serving worker.

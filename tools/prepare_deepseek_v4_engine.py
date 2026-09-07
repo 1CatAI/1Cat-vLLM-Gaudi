@@ -18,6 +18,8 @@ def main():
     if head != VLLM_COMMIT:
         parser.error(f"Expected vLLM {VLLM_COMMIT}; refusing to patch a different revision")
     patches = sorted((Path(__file__).resolve().parents[1] / "patches/deepseek_v4").glob("*.patch"))
+    if not patches:
+        parser.error("Engine patch series is missing from this source distribution")
     command = ["git", "apply", *(str(path) for path in patches)]
     if subprocess.run([*command, "--reverse", "--check"], cwd=engine, capture_output=True).returncode == 0:
         print("DeepSeek V4 engine source patches are already applied")

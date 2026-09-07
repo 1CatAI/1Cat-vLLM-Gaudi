@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Decode output dependency lowering in the normal HPU compiler pipeline."""
 
-import logging
 import threading
 
 import torch
 
 from vllm_gaudi.compilation.functionalization import lower_functionalized
 from vllm_gaudi.compilation.ordered_boundary import attention_out_op, make_output_dependency
+from vllm_gaudi.extension.logger import logger as init_logger
 
-logger = logging.getLogger(__name__)
+logger = init_logger()
 _compile_lock = threading.RLock()
 
 
@@ -24,11 +24,16 @@ def make_backend():
     def transform(ctx):
         nodes = [node for node in ctx.graph_module.graph.nodes if node.target is hop and node.args[0] is op]
         if not nodes:
+            logger.debug("DeepSeek V4 compile graph has no mutable attention boundaries")
             return False
         # Only the qualified q1 output contract is lowered. Prefill and other
         # shapes retain the normal HPU backend, without a runtime fallback.
-        if not all(tuple(base.meta["val"].shape) == (1, 64, 512)
-                   for node in nodes for base in node.kwargs["_all_bases"]):
+        shapes = [tuple(base.meta["val"].shape) for node in nodes for base in node.kwargs["_all_bases"]]
+        if not all(shape == (1, 64, 512) for shape in shapes):
+            if any(shape and shape[0] == 1 for shape in shapes):
+                raise RuntimeError(f"Unsupported DeepSeek V4 single-token output contract: {shapes}")
+            logger.info("DeepSeek V4 retained prefill attention boundaries with shapes %s",
+                        shapes)
             return False
         candidate, audit = lower_functionalized(ctx.graph_module, (op,), reinplace=False)
         ctx.graph_module.graph = candidate.graph

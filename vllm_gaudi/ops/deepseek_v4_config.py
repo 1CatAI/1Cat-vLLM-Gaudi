@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Defaults for the qualified short-context DeepSeek V4 Gaudi2 TP2 path."""
+"""Defaults for the bounded source-integrated DeepSeek V4 Gaudi2 TP2 path."""
 
 import os
 from pathlib import Path

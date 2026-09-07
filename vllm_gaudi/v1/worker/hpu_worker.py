@@ -213,9 +213,10 @@ class HPUWorker(WorkerBase):
             except (AttributeError, KeyError, RuntimeError) as exc:
                 tables.append(f"Unable to sort by {sort_key}: {exc}")
         summary_path = os.path.join(
-            self.vllm_config.profiler_config.torch_profiler_dir,
+            self.torch_profiler_dir,
             f"operator-summary-rank{self.rank}.txt",
         )
+        os.makedirs(self.torch_profiler_dir, exist_ok=True)
         with open(summary_path, 'w', encoding='utf-8') as summary_file:
             summary_file.write('\n\n'.join(tables))
         logger.info("Profiler operator summary written to %s", summary_path)
