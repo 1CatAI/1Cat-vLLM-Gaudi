@@ -48,6 +48,23 @@ def _set_fetch_by_id(kv_cache, value: bool) -> None:
         orig._fetch_by_id = value
 
 
+def _attention_batch_size(attn_metadata: "HPUAttentionMetadata", use_merged_prefill: bool) -> int:
+    """Return the batch dimension used by the attention kernel.
+
+    Multi-token decode is flattened to one paged-attention query per token.
+    Its request-level ``seq_lens_tensor`` is still needed by hybrid state-space
+    layers, but must not be used to reshape attention QKV.  ``block_mapping``
+    carries the expanded attention batch in that case.
+    """
+    if not attn_metadata.is_prompt and attn_metadata.block_mapping is not None:
+        return attn_metadata.block_mapping.shape[1]
+    if attn_metadata.seq_lens_tensor is not None:
+        return 1 if use_merged_prefill else attn_metadata.seq_lens_tensor.shape[0]
+    assert attn_metadata.block_mapping is not None, \
+        "seq_lens_tensor or block_mapping must be provided for attention"
+    return attn_metadata.block_mapping.shape[1]
+
+
 class HPUAttentionBackend(AttentionBackend):
 
     @staticmethod
@@ -159,7 +176,12 @@ class HPUAttentionMetadata(HPUPagedAttentionMetadata, AttentionMetadata):
     last_chunk_indices_p: Optional[torch.Tensor] = None
     load_indices_tensor: Optional[torch.Tensor] = None  # shape: [batch,]
     store_indices_tensor: Optional[torch.Tensor] = None  # shape: [batch,]
+    num_accepted_tokens: Optional[torch.Tensor] = None  # shape: [batch,]
     direct_gdn_state: bool = False
+    # DFlash2 verifies a candidate block with bidirectional attention inside
+    # that block. Keep the default causal so existing prefill paths are
+    # unchanged, while allowing the draft model to opt out explicitly.
+    causal: bool = True
 
 
 @dataclass
@@ -309,7 +331,7 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
                                       query=q,
                                       key=k,
                                       value=v_padded,
-                                      is_causal=True,
+                                      is_causal=attn_metadata.causal,
                                       attn_bias=attn_metadata.attn_bias,
                                       position_bias=None,
                                       valid_seq_lengths=attn_metadata.seq_lens_tensor,
@@ -487,6 +509,37 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
 
         self.is_chunked_attention = False
 
+    def do_kv_cache_update(
+        self,
+        layer: AttentionLayer,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Store externally projected K/V using the standard vLLM contract.
+
+        DFlash2 precomputes context K/V outside the draft model forward and
+        calls this hook directly. HPU's regular forward performs the same
+        operation inline, so keep both paths on the shared cache modules.
+        """
+        if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
+            return
+        if kv_cache is None or self.kv_sharing_target_layer_name is not None:
+            return
+
+        key_cache, value_cache, k_scales, v_scales = HPUPagedAttention.split_kv_cache(
+            kv_cache, self.num_kv_heads, self.head_size)
+        key = key.reshape(-1, self.num_kv_heads, self.head_size)
+        value = value.reshape(-1, self.num_kv_heads, self.head_size)
+        slots = slot_mapping.flatten()
+        if key.dtype == torch.float32 and key.dtype != key_cache.dtype:
+            key = key.to(key_cache.dtype)
+        if value.dtype == torch.float32 and value.dtype != value_cache.dtype:
+            value = value.to(value_cache.dtype)
+        self.k_cache(key, key_cache, slots, scales=k_scales, is_prompt=True)
+        self.v_cache(value, value_cache, slots, scales=v_scales, is_prompt=True)
+
     def _maybe_init_alibi_biases(
         self,
         max_seq_len,
@@ -541,14 +594,11 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
         # Set return shape
         output_shape = query.shape
         if query.dim() == 2:
-            if attn_metadata.seq_lens_tensor is not None:
-                batch_size = 1 if self.use_merged_prefill and attn_metadata.is_prompt \
-                    else attn_metadata.seq_lens_tensor.shape[0]
-            else:
-                assert attn_metadata.block_mapping is not None, \
-                    "seq_lens_tensor must be provided for attention"
-                batch_size = attn_metadata.block_mapping.shape[1]
+            batch_size = _attention_batch_size(attn_metadata, self.use_merged_prefill)
             num_tokens, hidden_size = query.shape
+            assert num_tokens % batch_size == 0, \
+                (f"query token count ({num_tokens}) must be divisible by "
+                 f"attention batch size ({batch_size})")
             seq_len = num_tokens // batch_size
             query = query.view(batch_size, seq_len, -1)
         else:
@@ -647,15 +697,16 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                 hasattr(attn_metadata, 'chunked_attn_bias') and attn_metadata.chunked_attn_bias is not None:
                 attn_bias = attn_metadata.chunked_attn_bias
 
-            out = ops.prompt_attention(impl=self.prefill_impl,
-                                       query=query.view(query_shape),
-                                       key=key.view(kv_shape),
-                                       value=value.view(kv_shape),
-                                       is_causal=True,
-                                       attn_bias=attn_bias,
-                                       position_bias=position_bias,
-                                       valid_seq_lengths=attn_metadata.seq_lens_tensor,
-                                       **common_args)
+            out = ops.prompt_attention(
+                impl=self.prefill_impl,
+                query=query.view(query_shape),
+                key=key.view(kv_shape),
+                value=value.view(kv_shape),
+                is_causal=attn_metadata.causal,
+                attn_bias=attn_bias,
+                position_bias=position_bias,
+                valid_seq_lengths=(attn_metadata.seq_lens_tensor if attn_metadata.causal else None),
+                **common_args)
 
             output = out.reshape(batch_size, seq_len, hidden_size)
         else:

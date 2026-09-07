@@ -1052,6 +1052,11 @@ def dynamic_quant(data, single_scale=False, use_cguid=True):
         )
         # Preserve the ordinary path's nonzero scale for zero/tiny rows.
         scale = scale + (1e-8 / FP8_MAX)
+        # Keep the reciprocal in FP32. On Gaudi2, composing a gated BF16
+        # activation, the scale CGUID and a BF16 reciprocal in one compiled
+        # region can corrupt the subsequent FP8 cast. Casting after taking
+        # the reciprocal does not avoid that failure.
+        scale = scale.float()
     else:
         scale = ((torch.abs(data)).max(dim=-1).values + 1e-8) / FP8_MAX
         scale = scale.unsqueeze(-1)

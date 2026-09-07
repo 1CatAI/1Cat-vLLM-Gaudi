@@ -3,6 +3,11 @@
 #include <cstring>
 #include <memory>
 #include <vector>
+#include "dflash2_score_select_i64_bf16_f32_gaudi2.hpp"
+#include "dflash2_select_path_i64_f32_gaudi2.hpp"
+#include "gdn_mtp_packed_f32_gaudi2.hpp"
+#include "gdn_mtp_prepared_f32_gaudi2.hpp"
+#include "gdn_packed_decode_f32_gaudi2.hpp"
 #include "silu_and_mul_bf16_gaudi2.hpp"
 #include "silu_mul_quant_bf16_gaudi2.hpp"
 #include "block_fp8_dequant_gaudi2.hpp"
@@ -14,25 +19,36 @@ extern "C" tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(
 
 int main() {
     using namespace tpc_lib_api;
+    constexpr uint32_t expectedKernelCount = 8;
     uint32_t count = 0;
-    assert(GetKernelGuids(DEVICE_ID_GAUDI2, &count, nullptr) == GLUE_SUCCESS && count == 4);
-    GuidInfo guids[4]{};
+    assert(GetKernelGuids(DEVICE_ID_GAUDI2, &count, nullptr) == GLUE_SUCCESS && count == expectedKernelCount);
+    GuidInfo guids[expectedKernelCount]{};
     count = 0;
-    assert(GetKernelGuids(DEVICE_ID_GAUDI2, &count, guids) == GLUE_SUCCESS && count == 4);
+    assert(GetKernelGuids(DEVICE_ID_GAUDI2, &count, guids) == GLUE_SUCCESS && count == expectedKernelCount);
     assert(guids[0].name[0] == '\0');
-    count = 1;
-    assert(GetKernelGuids(DEVICE_ID_GAUDI2, &count, guids) == GLUE_FAILED && count == 4);
-    assert(guids[0].name[0] == '\0');
-    count = 2;
-    assert(GetKernelGuids(DEVICE_ID_GAUDI2, &count, guids) == GLUE_FAILED && count == 4);
-    assert(guids[0].name[0] == '\0' && guids[1].name[0] == '\0');
-    count = 3;
-    assert(GetKernelGuids(DEVICE_ID_GAUDI2, &count, guids) == GLUE_FAILED && count == 4);
-    assert(guids[2].name[0] == '\0');
+    for (uint32_t capacity = 1; capacity < expectedKernelCount; ++capacity) {
+        count = capacity;
+        assert(GetKernelGuids(DEVICE_ID_GAUDI2, &count, guids) == GLUE_FAILED && count == expectedKernelCount);
+        for (uint32_t i = 0; i < expectedKernelCount; ++i) {
+            assert(guids[i].name[0] == '\0');
+        }
+    }
+    count = expectedKernelCount;
     assert(GetKernelGuids(DEVICE_ID_GAUDI2, &count, guids) == GLUE_SUCCESS);
-    assert(std::strcmp(guids[1].name, SiluAndMulBf16Gaudi2::name) == 0);
-    assert(std::strcmp(guids[2].name, SiluMulQuantBf16Gaudi2::name) == 0);
-    assert(std::strcmp(guids[3].name, BlockFp8DequantGaudi2::name) == 0);
+    char expectedName[MAX_NODE_NAME]{};
+    GdnPackedDecodeF32Gaudi2{}.GetKernelName(expectedName);
+    assert(std::strcmp(guids[0].name, expectedName) == 0);
+    GdnMtpPackedF32Gaudi2{}.GetKernelName(expectedName);
+    assert(std::strcmp(guids[1].name, expectedName) == 0);
+    DFlash2SelectPathI64F32Gaudi2{}.GetKernelName(expectedName);
+    assert(std::strcmp(guids[2].name, expectedName) == 0);
+    DFlash2ScoreSelectI64Bf16F32Gaudi2{}.GetKernelName(expectedName);
+    assert(std::strcmp(guids[3].name, expectedName) == 0);
+    GdnMtpPreparedF32Gaudi2{}.GetKernelName(expectedName);
+    assert(std::strcmp(guids[4].name, expectedName) == 0);
+    assert(std::strcmp(guids[5].name, SiluAndMulBf16Gaudi2::name) == 0);
+    assert(std::strcmp(guids[6].name, SiluMulQuantBf16Gaudi2::name) == 0);
+    assert(std::strcmp(guids[7].name, BlockFp8DequantGaudi2::name) == 0);
     assert(GetKernelGuids(DEVICE_ID_GAUDI, &count, guids) == GLUE_SUCCESS && count == 0);
     assert(GetKernelGuids(DEVICE_ID_GAUDI2, nullptr, nullptr) == GLUE_FAILED);
 

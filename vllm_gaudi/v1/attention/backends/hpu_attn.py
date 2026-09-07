@@ -21,6 +21,11 @@ logger = init_logger()
 @register_backend(AttentionBackendEnum.CUSTOM, "HPU_ATTN_V1")
 class HPUAttentionBackendV1(HPUAttentionBackend):
 
+    @classmethod
+    def supports_non_causal(cls) -> bool:
+        """The prompt path accepts an explicit bidirectional attention bias."""
+        return True
+
     @staticmethod
     def get_name() -> str:
         return "CUSTOM"
@@ -65,6 +70,7 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
     mamba_chunks_to_block_mapping: Optional[torch.Tensor] = None
     seqlens_offsets_for_blocks: Optional[torch.Tensor] = None
     window_block_list: Optional[torch.Tensor] = None
+    dflash_full_query: bool = False
 
     def seq_len(self):
         return self.slot_mapping.size(-1)
@@ -87,13 +93,16 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                               last_chunk_indices_p=None,
                               load_indices_tensor=None,
                               store_indices_tensor=None,
+                              num_accepted_tokens=None,
                               query_start_loc=None,
                               padding_mask_flat=None,
                               blocks_caching_range=None,
                               mamba_chunks_to_block_mapping=None,
                               seqlens_offsets_for_blocks=None,
                               window_block_list=None,
-                              direct_gdn_state=False):
+                              direct_gdn_state=False,
+                              causal=True,
+                              window_attn_bias=None):
         return cls(is_prompt=True,
                    block_list=block_list,
                    block_mapping=None,
@@ -111,6 +120,7 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    last_chunk_indices_p=last_chunk_indices_p,
                    load_indices_tensor=load_indices_tensor,
                    store_indices_tensor=store_indices_tensor,
+                   num_accepted_tokens=num_accepted_tokens,
                    query_start_loc=query_start_loc,
                    query_start_loc_p=query_start_loc,
                    padding_mask_flat=padding_mask_flat,
@@ -118,7 +128,9 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    mamba_chunks_to_block_mapping=mamba_chunks_to_block_mapping,
                    seqlens_offsets_for_blocks=seqlens_offsets_for_blocks,
                    window_block_list=window_block_list,
-                   direct_gdn_state=direct_gdn_state)
+                   window_attn_bias=window_attn_bias,
+                   direct_gdn_state=direct_gdn_state,
+                   causal=causal)
 
     @classmethod
     def make_decode_metadata(cls,
@@ -136,9 +148,12 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                              chunked_block_groups,
                              load_indices_tensor=None,
                              store_indices_tensor=None,
+                             num_accepted_tokens=None,
                              query_start_loc=None,
                              seq_lens_tensor=None,
-                             direct_gdn_state=False):
+                             direct_gdn_state=False,
+                             dflash_full_query=False,
+                             causal=True):
         return cls(is_prompt=False,
                    block_mapping=None,
                    alibi_blocks=None,
@@ -160,6 +175,9 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    prep_initial_states=None,
                    load_indices_tensor=load_indices_tensor,
                    store_indices_tensor=store_indices_tensor,
+                   num_accepted_tokens=num_accepted_tokens,
                    query_start_loc=query_start_loc,
                    query_start_loc_p=query_start_loc,
-                   direct_gdn_state=direct_gdn_state)
+                   direct_gdn_state=direct_gdn_state,
+                   dflash_full_query=dflash_full_query,
+                   causal=causal)

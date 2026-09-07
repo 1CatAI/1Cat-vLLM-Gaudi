@@ -25,7 +25,6 @@ import habana_frameworks.torch.internal.bridge_config as bc
 import numpy as np
 import torch
 import torch.distributed
-import torch.nn.functional as F
 import torch.nn as nn
 import vllm_gaudi.envs as gaudi_envs
 import vllm_gaudi.extension.environment as environment
@@ -37,6 +36,7 @@ from vllm_gaudi.extension.runtime import clear_config, finalize_config, get_conf
 from vllm_gaudi.extension.utils import align_and_pad, pad_list, with_default
 from vllm_gaudi.extension.debug import init_debug_logger
 from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
+from vllm_gaudi.v1.worker.gdn_state_layout import has_contiguous_dflash_checkpoints
 
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.model_executor.layers.attention import Attention
@@ -81,6 +81,7 @@ from vllm.v1.kv_cache_interface import (
     EncoderOnlyAttentionSpec,
 )
 from vllm.v1.worker.kv_connector_model_runner_mixin import (KVConnectorModelRunnerMixin)
+from vllm.v1.worker.block_table import SlotMappingMode
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsLists, LogprobsTensors, DraftTokenIds,
                              ModelRunnerOutput, AsyncModelRunnerOutput, KVConnectorOutput)
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
@@ -172,30 +173,34 @@ def _zero_compact_gdn_slot(
     state_tensors: Iterable[torch.Tensor],
     base_slot: int,
     num_groups: int,
+    max_num_reqs: int,
+    state_slots_per_req: int = 1,
 ) -> None:
-    """Clear every group state before a compact GDN slot is reused."""
-    if base_slot < 0 or num_groups <= 0:
-        raise ValueError(
-            f"Invalid compact GDN slot: base_slot={base_slot}, num_groups={num_groups}"
-        )
-    start = base_slot * num_groups + 1
+    """Clear every group/checkpoint state before a compact slot is reused."""
+    if (base_slot < 0 or base_slot >= max_num_reqs or num_groups <= 0 or max_num_reqs <= 0 or state_slots_per_req <= 0):
+        raise ValueError("Invalid compact GDN slot: "
+                         f"base_slot={base_slot}, num_groups={num_groups}, "
+                         f"max_num_reqs={max_num_reqs}, "
+                         f"state_slots_per_req={state_slots_per_req}")
+    clear_rows = [0]
+    for group_offset in range(num_groups):
+        start = ((group_offset * max_num_reqs + base_slot) * state_slots_per_req + 1)
+        clear_rows.extend(range(start, start + state_slots_per_req))
     needs_hpu_sync = False
     for state in state_tensors:
-        if state.ndim == 0 or start + num_groups > state.shape[0]:
-            raise ValueError(
-                "Compact GDN state tensor is too small for slot clear: "
-                f"shape={tuple(state.shape)}, start={start}, num_groups={num_groups}"
-            )
+        if state.ndim == 0 or clear_rows[-1] >= state.shape[0] - 1:
+            raise ValueError("Compact GDN state tensor is too small for slot clear: "
+                             f"shape={tuple(state.shape)}, last_row={clear_rows[-1]}")
         # Slot 0 and the final slot are global sentinels. Compiled padded
         # prompt/decode graphs may write them, so stale non-finite values must
         # not survive into the next request. Update the base tensor directly:
         # HPU eager mode does not reliably persist zero_() on indexed views.
-        if state.shape[0] == num_groups + 2:
+        if state.shape[0] == num_groups * state_slots_per_req + 2:
             # max_num_seqs=1: every non-sentinel row belongs to this request.
             state.zero_()
         else:
             clear_indices = torch.tensor(
-                [0, *range(start, start + num_groups), state.shape[0] - 1],
+                [*clear_rows, state.shape[0] - 1],
                 dtype=torch.long,
                 device=state.device,
             )
@@ -691,6 +696,7 @@ class DecodeInputData:
     attn_metadata: Optional[HPUAttentionMetadataV1] = None
     logits_indices: Optional[torch.Tensor] = None
     spec_decode_metadata: Optional[SpecDecodeMetadata] = None
+    draft_block_table: Optional[torch.Tensor] = None
 
 
 def bool_helper(value):
@@ -1162,6 +1168,84 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
         sampled_token_ids = logits.to(torch.float32).argmax(dim=-1)
         return hidden_states, sampled_token_ids.to(torch.int32).unsqueeze(-1)
 
+    def combine_hidden_states(self, *args, **kwargs):
+        return self.model.combine_hidden_states(*args, **kwargs)
+
+    def precompute_and_store_context_kv(self, *args, **kwargs):
+        return self.model.precompute_and_store_context_kv(*args, **kwargs)
+
+    def prepare_dflash2_inputs(self, *args, **kwargs):
+        from flashinfer_gaudi.dflash2 import prepare_device_inputs
+
+        return prepare_device_inputs(*args, **kwargs)
+
+    def compute_candidates(self, *args, **kwargs):
+        return self.model.compute_candidates(*args, **kwargs)
+
+    def score_dflash2_candidates(self, candidate_ids, unary_logits, hidden_states, anchor_token_ids):
+        return self.model.model.candidate_selector(candidate_ids, unary_logits, hidden_states, anchor_token_ids)
+
+    def select_dflash2_candidates(self, hidden_states, anchor_token_ids):
+        """Generate, score, and select a DFlash2 path in one HPU region."""
+        from flashinfer_gaudi.dflash2 import select_path
+
+        batch_size, num_steps, _ = hidden_states.shape
+        candidate_ids, unary_logits = self.model.compute_candidates(hidden_states.flatten(0, 1))
+        candidate_ids = candidate_ids.to(torch.int32).reshape(batch_size, num_steps, -1)
+        unary_logits = unary_logits.reshape_as(candidate_ids)
+        selected = self.maybe_select_dflash2_candidates(
+            candidate_ids,
+            unary_logits,
+            hidden_states,
+            anchor_token_ids,
+        )
+        if selected is not None:
+            return selected
+        scores = self.score_dflash2_candidates(
+            candidate_ids,
+            unary_logits,
+            hidden_states,
+            anchor_token_ids,
+        )
+        return select_path(candidate_ids, scores)
+
+    def sample_dflash2_greedy(
+        self,
+        logits,
+        draft_token_ids,
+        target_logits_indices,
+        bonus_logits_indices,
+        cu_num_draft_tokens,
+    ):
+        from vllm_gaudi.v1.sample.hpu_rejection_sampler import (
+            dflash2_greedy_rejection_sample_packed, )
+
+        return dflash2_greedy_rejection_sample_packed(
+            logits,
+            draft_token_ids,
+            target_logits_indices,
+            bonus_logits_indices,
+            cu_num_draft_tokens,
+        )
+
+    def maybe_select_dflash2_candidates(self, candidate_ids, unary_logits, hidden_states, anchor_token_ids):
+        from flashinfer_gaudi._tactics import dflash2_score_select_auto_promoted
+
+        if not dflash2_score_select_auto_promoted():
+            return None
+        from flashinfer_gaudi.dflash2 import maybe_score_and_select_path
+
+        selector = self.model.model.candidate_selector
+        projected_hidden = selector.hidden_projection(hidden_states)
+        return maybe_score_and_select_path(
+            selector.predecessor_codebook,
+            selector.successor_codebook,
+            candidate_ids,
+            unary_logits,
+            projected_hidden,
+            anchor_token_ids,
+        )
+
     # def sample(self, *args, **kwargs):
     #    return self.sampler(*args, **kwargs)
 
@@ -1243,14 +1327,38 @@ def trim_attn_metadata(metadata: HPUAttentionMetadataV1) -> object:
         'window_block_usage', 'window_block_groups', 'window_attn_bias', 'chunked_block_mapping', 'chunked_attn_bias',
         'chunked_block_list', 'chunked_block_usage', 'chunked_block_groups', 'prep_initial_states',
         'has_initial_states_p', 'last_chunk_indices_p', 'load_indices_tensor', 'store_indices_tensor',
-        'query_start_loc', 'query_start_loc_p', 'padding_mask_flat', 'blocks_caching_range',
-        'mamba_chunks_to_block_mapping', 'seqlens_offsets_for_blocks', 'direct_gdn_state'
+        'num_accepted_tokens', 'query_start_loc', 'query_start_loc_p', 'padding_mask_flat', 'blocks_caching_range',
+        'mamba_chunks_to_block_mapping', 'seqlens_offsets_for_blocks', 'direct_gdn_state', 'dflash_full_query', 'causal'
     ])
     return attention_metadata
 
 
 def round_up(value: int, k: int):
     return (value + k - 1) // k * k
+
+
+def _sampler_warmup_batch_sizes(decode_buckets, max_num_reqs: int) -> list[int]:
+    """Return request-level sampler batches, excluding flattened spec QKV."""
+    return list(dict.fromkeys([1] + [bucket[0] for bucket in decode_buckets if 0 < bucket[0] <= max_num_reqs]))
+
+
+def _model_warmup_decode_buckets(bucketing_manager, is_dflash: bool):
+    """Avoid treating flattened DFlash verification buckets as requests."""
+    if is_dflash:
+        return bucketing_manager.seed_decode_buckets
+    return bucketing_manager.decode_buckets
+
+
+def _is_full_dflash_query_block(
+    is_dflash_spec: bool,
+    num_decodes: int,
+    padded_batch_size: int,
+    num_tokens_per_req: list[int],
+    state_width: int,
+) -> bool:
+    """Prove that the verification block contains no padded state rows."""
+    return (is_dflash_spec and num_decodes == padded_batch_size
+            and all(int(length) == state_width for length in num_tokens_per_req))
 
 
 def get_dp_padding(num_tokens: int, dp_size: int, dp_rank: int) -> int:
@@ -1507,17 +1615,28 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # so each request needs num_gdn_groups distinct slot indices. Groups
         # occupy contiguous max_num_reqs-sized spans so a full decode batch can
         # update state without index_select/index_copy.
-        # For request with base_slot `s` in group `g`, the actual tensor index
-        # is `g * max_num_reqs + s + 1` (1-based, slot 0 unused).
-        # Tensor size: max_num_reqs * num_gdn_groups + 2.
+        # DFlash2 retains one recurrent checkpoint for every token in its
+        # verification block. Other paths retain one checkpoint per request.
+        self._gdn_state_slots_per_req = (1 + self.speculative_config.num_speculative_tokens
+                                         if self.speculative_config is not None
+                                         and self.speculative_config.use_dflash() else 1)
         self._compact_gdn_enabled = os.environ.get("VLLM_COMPACT_GDN", "1").strip().lower() in ("1", "true")
         self._direct_gdn_state_enabled = (gaudi_envs.VLLM_HPU_FLASHINFER_GDN and gaudi_envs.VLLM_HPU_GDN_DIRECT_STATE)
+        self._direct_dflash_checkpoints_enabled = gaudi_envs.VLLM_HPU_DFLASH2_DIRECT_CHECKPOINTS
+        # The HPU runner normally consumes block tables from CPU.  The
+        # device-resident DFlash2 bridge keeps a persistent HPU copy instead.
+        # Track the last CPU contents so a steady decode does not enqueue a
+        # write to the same tensor that the previous draft attention still
+        # reads.  Such a write-after-read dependency serializes the streams on
+        # Gaudi even though the table itself is tiny.
+        self._dflash2_device_block_table_snapshots: dict[int, tuple[int, torch.Tensor]] = {}
         self._compact_gdn_group_ids: set[int] = set()
         self._compact_gdn_group_offset: dict[int, int] = {}  # {group_idx: g_offset}
         self._num_gdn_groups = 0  # set during initialize_kv_cache
         self._gdn_slot_free_list: list[int] = []  # stack of free base-slot IDs
         self._gdn_req_to_base_slot: dict[str, int] = {}
         self._compact_gdn_state_tensors: list[torch.Tensor] = []
+        self._gdn_num_accepted_by_req: dict[str, int] = {}
         self._logged_direct_gdn_state = False
 
         # Lazy initialization
@@ -1535,6 +1654,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         if self.speculative_config:
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
+            elif self.speculative_config.use_dflash():
+                from vllm_gaudi.v1.spec_decode.hpu_dflash2 import HpuDFlash2Proposer
+
+                self.drafter = HpuDFlash2Proposer(self.vllm_config, self.device, self)  # type: ignore
+                self.use_aux_hidden_state_outputs = self.drafter.use_aux_hidden_state
             elif self.speculative_config.use_eagle():
                 from vllm_gaudi.v1.spec_decode.hpu_eagle import HpuEagleProposer
                 self.drafter = HpuEagleProposer(self.vllm_config, self.device, self)  # type: ignore
@@ -1688,29 +1812,55 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
     def _make_buffer(self, *size: Union[int, torch.SymInt], dtype: torch.dtype, numpy: bool = True) -> CpuGpuBuffer:
         return CpuGpuBuffer(*size, dtype=dtype, device=self.device, pin_memory=self.pin_memory, with_numpy=numpy)
 
-    def prepare_mamba_state_idxs(self, req_indices, block_table_offsets, target_bs):
+    def prepare_mamba_state_idxs(
+        self,
+        req_indices,
+        block_table_offsets,
+        target_bs,
+        state_width=1,
+        checkpoint_offsets=None,
+    ):
         num_indices = len(req_indices)
+        if checkpoint_offsets is not None:
+            if state_width != 1:
+                raise ValueError("checkpoint_offsets are valid only for scalar state indices")
+            if len(checkpoint_offsets) != num_indices:
+                raise ValueError("checkpoint_offsets must contain one entry per request")
         all_state_indices_cpu = []
         for group_idx in range(len(self.input_batch.block_table.block_tables)):
             if group_idx in self._compact_gdn_group_ids:
                 g_offset = self._compact_gdn_group_offset[group_idx]
-                state_indices_cpu = torch.zeros(num_indices, dtype=torch.int32)
+                state_indices_cpu = torch.zeros((num_indices, state_width), dtype=torch.int32)
                 for i, req_idx in enumerate(req_indices):
                     req_id = self.input_batch.req_ids[req_idx]
                     base_slot = self._gdn_req_to_base_slot[req_id]
-                    state_indices_cpu[i] = g_offset * self._gdn_max_reqs + base_slot + 1
+                    first_slot = ((g_offset * self._gdn_max_reqs + base_slot) * self._gdn_state_slots_per_req + 1)
+                    if checkpoint_offsets is None:
+                        offsets = torch.arange(state_width, dtype=torch.int32)
+                    else:
+                        offset = max(0, min(int(checkpoint_offsets[i]), self._gdn_state_slots_per_req - 1))
+                        offsets = torch.tensor([offset], dtype=torch.int32)
+                    state_indices_cpu[i] = first_slot + offsets
             else:
                 block_table_cpu_tensor = self.input_batch.block_table[group_idx].get_cpu_tensor()
-                state_indices_cpu = block_table_cpu_tensor[req_indices, block_table_offsets].clone()
+                state_indices_cpu = block_table_cpu_tensor[req_indices, block_table_offsets].clone().reshape(-1, 1)
+                if state_width > 1:
+                    state_indices_cpu = state_indices_cpu.expand(-1, state_width).clone()
 
             if num_indices < target_bs:
                 pad_val = -1 if group_idx in self._compact_gdn_group_ids else self._MAMBA_PAD_BLOCK_ID
-                padding = torch.full((target_bs - num_indices, ), pad_val, dtype=torch.int32, device='cpu')
+                padding = torch.full(
+                    (target_bs - num_indices, state_width),
+                    pad_val,
+                    dtype=torch.int32,
+                    device='cpu',
+                )
                 state_indices_cpu = torch.cat([state_indices_cpu, padding])
 
             all_state_indices_cpu.append(state_indices_cpu)
 
-        return torch.stack(all_state_indices_cpu, dim=0)  # Shape: [num_groups, target_bs]
+        state_indices = torch.stack(all_state_indices_cpu, dim=0)
+        return state_indices.squeeze(-1) if state_width == 1 else state_indices
 
     def _can_use_direct_gdn_state(
         self,
@@ -1718,9 +1868,23 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         num_indices: int,
         target_bs: int,
         tokens_per_request: int = 1,
+        full_query: bool = False,
     ) -> bool:
+        if (self._direct_gdn_state_enabled and getattr(self, "_direct_dflash_checkpoints_enabled", False)
+                and self._compact_gdn_enabled and not self.use_prefix_caching and tokens_per_request == 8):
+            return has_contiguous_dflash_checkpoints(
+                state_indices,
+                self._compact_gdn_group_offset,
+                self._gdn_max_reqs,
+                num_indices,
+                target_bs,
+                tokens_per_request,
+                self._gdn_state_slots_per_req,
+                full_query,
+            )
         if (not self._direct_gdn_state_enabled or not self._compact_gdn_enabled or self.use_prefix_caching
-                or not self._compact_gdn_group_ids or num_indices != target_bs or tokens_per_request != 1):
+                or self._gdn_state_slots_per_req != 1 or not self._compact_gdn_group_ids or num_indices != target_bs
+                or tokens_per_request != 1):
             return False
         base_slots = torch.arange(num_indices, dtype=torch.int32)
         for group_idx in self._compact_gdn_group_ids:
@@ -1893,6 +2057,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
+            self._gdn_num_accepted_by_req.pop(req_id, None)
 
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
@@ -1953,6 +2118,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # Add new requests to the cached states.
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
+            self._gdn_num_accepted_by_req[req_id] = 1
             sampling_params = new_req_data.sampling_params
             pooling_params = new_req_data.pooling_params
             if sampling_params and \
@@ -2097,6 +2263,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         self._compact_gdn_state_tensors,
                         base_slot,
                         self._num_gdn_groups,
+                        self._gdn_max_reqs,
+                        self._gdn_state_slots_per_req,
                     )
                     self._gdn_req_to_base_slot[req_id] = base_slot
                     logger.debug("GDN_COMPACT alloc req=%s base_slot=%d free_list_len=%d", req_id, base_slot,
@@ -3231,13 +3399,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         decode_block_size = self.attn_block_size
 
-        # NOTE(kzawora): the +1 is what causes this entire thing to work,
-        # as in the paged attention, we don't fetch just the context from cache,
-        # but also kvs for the current token
-        num_blocks = np.ceil((context_lens + 1) / decode_block_size).astype(np.int32).tolist()
-
         num_tokens_per_req = num_scheduled_tokens[:num_decodes]
         num_tokens = max(num_tokens_per_req)
+        # Bucketing must cover the last scheduled verification token, not
+        # only the first one. A DFlash2 block can cross a physical KV page.
+        query_ends = context_lens + np.asarray(num_tokens_per_req, dtype=np.int64)
+        num_blocks = ((query_ends + decode_block_size - 1) // decode_block_size).astype(np.int32).tolist()
         # Spec decode to use seed buckets to get padded batch size
         seek_buckets = bool(num_tokens > 1)
 
@@ -3255,7 +3422,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         for i, n in enumerate(num_blocks):
             seq_block_table = block_table_cpu_tensor[i, :n].tolist()
             assert len(seq_block_table) == n
-            block_tables_list.extend([seq_block_table] * num_tokens)
+            query_len = int(num_tokens_per_req[i])
+            first_page_count = (int(context_lens[i]) + decode_block_size) // decode_block_size
+            if first_page_count == n:
+                block_tables_list.extend([seq_block_table] * query_len)
+            else:
+                # Each flattened query is a different causal prefix. Sharing
+                # the first token's pages drops the next page after a crossing;
+                # sharing the last token's pages exposes future tokens before it.
+                for token in range(query_len):
+                    page_count = (int(context_lens[i]) + token + decode_block_size) // decode_block_size
+                    block_tables_list.append(seq_block_table[:page_count])
+            block_tables_list.extend([[self._PAD_BLOCK_ID]] * (num_tokens - query_len))
 
         ###################################
         # initialize positions with padding
@@ -3278,30 +3456,22 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         index = positions.to(torch.int64)[:num_decodes]
         padded_index[:num_decodes] = index
 
-        input_mrope_positions_list: list[list[int]] = [[] for _ in range(3)]
         if self.uses_mrope:
-            for idx, req_id in enumerate(self.input_batch.req_ids[:num_decodes]):
-                seq_data = self.requests[req_id]
-                context_len = context_lens[idx]
-                position = context_len
-                if seq_data.mrope_position_delta is not None:
-                    seq_data.mrope_position_delta = int(seq_data.mrope_position_delta)
-                    pos_for_mrope = MRotaryEmbedding \
-                        .get_next_input_positions(
-                            seq_data.mrope_position_delta,
-                            context_len=context_len,
-                            seq_len=context_len + 1)
-                else:
-                    pos_for_mrope = [[position]] * 3
-                for idx in range(3):
-                    input_mrope_positions_list[idx].extend(pos_for_mrope[idx])
-
-            positions = torch.tensor(input_mrope_positions_list, dtype=torch.int32, device='cpu')
-
-            # Pad the right side of input_mrope_positions by padded_batch_size
-            pad_size = padded_batch_size - positions.size(1)
-            if pad_size > 0:
-                positions = F.pad(positions, (0, pad_size), value=-1, mode='constant')
+            # Decode extends all three M-RoPE axes by the same per-request
+            # delta. Keep every scheduled token, including T8 verification,
+            # in [3, padded_batch * query_width] layout. A [T, 1] tensor would
+            # make MRotaryEmbedding interpret query tokens as spatial axes.
+            deltas = torch.zeros((padded_batch_size, 1), dtype=torch.int32)
+            deltas[:num_decodes, 0] = torch.tensor([
+                int(self.requests[req_id].mrope_position_delta or 0)
+                for req_id in self.input_batch.req_ids[:num_decodes]
+            ],
+                                                   dtype=torch.int32)
+            query_lengths = torch.tensor(num_tokens_per_req, dtype=torch.int32)
+            valid_positions = torch.arange(num_tokens).unsqueeze(0) < query_lengths.unsqueeze(1)
+            shifted_positions = padded_index.to(torch.int32) + deltas
+            shifted_positions = torch.where(valid_positions, shifted_positions, -1)
+            positions = shifted_positions.reshape(1, -1).expand(3, -1).contiguous()
 
         ###################################
         # initialize token_ids with padding
@@ -3337,14 +3507,20 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         slot_mapping = slot_mapping[:padded_batch_size]
         pad_slot_base = self._PAD_BLOCK_ID * decode_block_size
         dummy_slots = itertools.cycle(range(pad_slot_base, pad_slot_base + decode_block_size))
-        slot_mapping[num_decodes:].apply_(lambda _, ds=dummy_slots: next(ds))
+        for request_index, query_len in enumerate(num_tokens_per_req):
+            if query_len < num_tokens:
+                # Ragged speculative requests also contain padding *inside*
+                # a live request row. Never insert those tokens at position 0
+                # of the live cache just because their padded position is 0.
+                slot_mapping[request_index, query_len:].apply_(lambda _, ds=dummy_slots: next(ds))
 
         #####################################
         # NOTE(Chendi): Since we can't actually do num_tokens = 2,
         # convert to [batch_size * num_tokens, 1]
         if num_tokens > 1:
             token_ids = token_ids.view(-1, 1)
-            positions = padded_index.view(-1, 1)
+            if not self.uses_mrope:
+                positions = padded_index.view(-1, 1)
             slot_mapping = slot_mapping.view(-1, 1)
 
         logits_indices = torch.zeros(padded_batch_size, dtype=torch.int32, device='cpu')
@@ -3426,21 +3602,52 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 )
 
             req_indices = list(range(num_decodes))
+            is_dflash_decode = self.speculative_config is not None and self.speculative_config.use_dflash()
+            is_dflash_spec = is_dflash_decode and num_tokens > 1
+            state_width = num_tokens if is_dflash_spec else 1
+            dflash_full_query = _is_full_dflash_query_block(
+                is_dflash_spec,
+                num_decodes,
+                padded_batch_size,
+                num_tokens_per_req,
+                state_width,
+            )
+            if is_dflash_decode:
+                accepted_counts = [
+                    self._gdn_num_accepted_by_req.get(req_id, 1) for req_id in self.input_batch.req_ids[:num_decodes]
+                ]
+                load_checkpoint_offsets = None if is_dflash_spec else [count - 1 for count in accepted_counts]
+            else:
+                accepted_counts = []
+                load_checkpoint_offsets = None
             if self.use_prefix_caching:
                 load_state_indices_cpu = self.prepare_mamba_state_idxs(req_indices, block_idx_last_computed_token_cpu,
-                                                                       padded_batch_size)
+                                                                       padded_batch_size, state_width,
+                                                                       load_checkpoint_offsets)
                 store_state_indices_cpu = self.prepare_mamba_state_idxs(req_indices, block_idx_last_scheduled_token_cpu,
-                                                                        padded_batch_size)
+                                                                        padded_batch_size, state_width)
             else:
                 zeros = [0] * len(req_indices)
-                load_state_indices_cpu = store_state_indices_cpu = \
-                    self.prepare_mamba_state_idxs(req_indices, zeros, padded_batch_size)
+                load_state_indices_cpu = self.prepare_mamba_state_idxs(
+                    req_indices,
+                    zeros,
+                    padded_batch_size,
+                    state_width,
+                    load_checkpoint_offsets,
+                )
+                store_state_indices_cpu = self.prepare_mamba_state_idxs(
+                    req_indices,
+                    zeros,
+                    padded_batch_size,
+                    state_width,
+                )
 
             direct_gdn_state = self._can_use_direct_gdn_state(
                 load_state_indices_cpu,
                 num_decodes,
                 padded_batch_size,
                 num_tokens,
+                dflash_full_query,
             ) and torch.equal(load_state_indices_cpu, store_state_indices_cpu)
             if direct_gdn_state and not self._logged_direct_gdn_state and not self.warmup_mode:
                 self._logged_direct_gdn_state = True
@@ -3463,6 +3670,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             load_indices_tensor = async_h2d_copy(load_state_indices_cpu, device=self.device)
             store_indices_tensor = async_h2d_copy(store_state_indices_cpu, device=self.device)
             query_start_loc_p = async_h2d_copy(query_start_loc_p_cpu, dtype=torch.int32)
+            if is_dflash_decode:
+                accepted_counts.extend([1] * (padded_batch_size - num_decodes))
+                num_accepted_tokens = async_h2d_copy(
+                    torch.tensor(accepted_counts, dtype=torch.int32),
+                    device=self.device,
+                )
+            else:
+                num_accepted_tokens = None
 
         else:
             seq_lens_tensor = None
@@ -3470,6 +3685,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             store_indices_tensor = None
             query_start_loc_p = None
             direct_gdn_state = False
+            num_accepted_tokens = None
+            dflash_full_query = False
 
         # CPU<>HPU sync *should not* happen here.
         block_list_device = async_h2d_copy(block_list, device=self.device)
@@ -3523,6 +3740,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             spec_decode_metadata = None
         logits_indices_device = async_h2d_copy(logits_indices, device=self.device)
 
+        draft_block_table = None
+        if (spec_decode_metadata is not None and gaudi_envs.VLLM_HPU_DFLASH2_DEVICE_PREPARE
+                and self.speculative_config is not None and self.speculative_config.use_dflash()):
+            defragmenter = getattr(self, 'defragmenter', None)
+            if defragmenter is None or not defragmenter.enabled:
+                draft_block_table = self._dflash2_commit_block_table_if_changed(
+                    self.drafter.kv_cache_gid,
+                    padded_batch_size,
+                )
+
         attn_metadata = HPUAttentionMetadataV1.make_decode_metadata(
             block_list=block_list_device,
             block_usage=block_usage_device,
@@ -3538,9 +3765,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             chunked_block_groups=chunked_block_groups_device,
             load_indices_tensor=load_indices_tensor,
             store_indices_tensor=store_indices_tensor,
+            num_accepted_tokens=num_accepted_tokens,
             seq_lens_tensor=seq_lens_tensor,
             query_start_loc=query_start_loc_p,
             direct_gdn_state=direct_gdn_state,
+            dflash_full_query=dflash_full_query,
         )
 
         return DecodeInputData(num_decodes=num_decodes,
@@ -3548,7 +3777,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                position_ids=positions_device,
                                logits_indices=logits_indices_device,
                                attn_metadata=attn_metadata,
-                               spec_decode_metadata=spec_decode_metadata)
+                               spec_decode_metadata=spec_decode_metadata,
+                               draft_block_table=draft_block_table)
 
     def _prepare_decode_inputs(self,
                                num_decodes,
@@ -4584,6 +4814,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         prefill_sampled_requests = []
         decode_sampled_token_ids = []
         decode_sampled_requests = []
+        device_prepared_dflash_drafts = None
         # Logprobs tracking: collect (req_ids, logprobs_tensors) segments
         # from each sampling call to combine at the end.
         logprobs_segments: list[tuple[list[str], LogprobsTensors | None]] = []
@@ -4743,23 +4974,71 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 with self.profiler.record_event('internal', "sampler"):
                     ##### Sampling Start #####
                     spec_decode_metadata = decode_data.spec_decode_metadata
-                    sampler_output, sampling_metadata = self._run_sampling(
-                        batch_changed, logits_device
-                        if spec_decode_metadata is None else logits_device[spec_decode_metadata.bonus_logits_indices],
-                        pd_info.decode_req_ids, logits_device.shape[0])
+                    is_dflash_spec = (spec_decode_metadata is not None and self.speculative_config is not None
+                                      and self.speculative_config.use_dflash())
+                    if is_dflash_spec:
+                        # RejectionSampler already samples the bonus row. The
+                        # old common path sampled it once here and discarded
+                        # that result before sampling it a second time below.
+                        htorch.core.mark_step()
+                        sampling_metadata = self._prepare_sampling(
+                            batch_changed,
+                            pd_info.decode_req_ids,
+                            logits_device.shape[0],
+                        )
+                        htorch.core.mark_step()
+                        sampler_output = None
+                    else:
+                        sampler_output, sampling_metadata = self._run_sampling(
+                            batch_changed, logits_device if spec_decode_metadata is None else
+                            logits_device[spec_decode_metadata.bonus_logits_indices], pd_info.decode_req_ids,
+                            logits_device.shape[0])
 
                     if spec_decode_metadata is None:
+                        assert sampler_output is not None
                         decode_sampled_token_ids.append(sampler_output.sampled_token_ids.flatten())
                         logprobs_segments.append((list(pd_info.decode_req_ids), sampler_output.logprobs_tensors))
+                        if self.speculative_config is not None and self.speculative_config.use_dflash():
+                            # A plain target step reads the accepted checkpoint
+                            # selected by the metadata builder and writes the
+                            # resulting recurrent state back to checkpoint 0.
+                            # The next verification starts from that canonical
+                            # checkpoint.
+                            for req_id in self.input_batch.req_ids[:num_decodes]:
+                                self._gdn_num_accepted_by_req[req_id] = 1
                     else:
                         # Handling spec decode sampling.
-                        sampler_output = self.rejection_sampler(
-                            spec_decode_metadata,
-                            None,  # draft_probs
-                            logits_device,
-                            sampling_metadata,
-                        )
-                        sampled_token_ids = sampler_output.sampled_token_ids
+                        sampled_token_ids = None
+                        if is_dflash_spec and not self.rejection_sampler.synthetic_mode:
+                            from vllm_gaudi.v1.sample.hpu_rejection_sampler import (
+                                _dflash2_greedy_fastpath_supported, )
+
+                            if _dflash2_greedy_fastpath_supported(sampling_metadata):
+                                sampled_token_ids = self.model.sample_dflash2_greedy(
+                                    logits_device,
+                                    spec_decode_metadata.draft_token_ids,
+                                    spec_decode_metadata.target_logits_indices,
+                                    spec_decode_metadata.bonus_logits_indices,
+                                    spec_decode_metadata.cu_num_draft_tokens,
+                                )
+                        if sampled_token_ids is None:
+                            sampler_output = self.rejection_sampler(
+                                spec_decode_metadata,
+                                None,  # draft_probs
+                                logits_device,
+                                sampling_metadata,
+                            )
+                            sampled_token_ids = sampler_output.sampled_token_ids
+                        if (is_dflash_spec and num_prefills == 0
+                                and self._can_use_dflash2_device_prepare(sampled_token_ids, num_decodes, decode_data)):
+                            with self.profiler.record_event('internal', "dflash2_device_prepare"):
+                                device_prepared_dflash_drafts = self.propose_dflash2_decode_device(
+                                    sampled_token_ids,
+                                    non_flattened_hidden_states,
+                                    aux_hidden_states,
+                                    num_decodes,
+                                    decode_data,
+                                )
                         decode_sampled_token_ids = \
                             self.rejection_sampler.parse_output(
                                 sampled_token_ids,
@@ -4769,6 +5048,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                             decode_sampled_token_ids, _ = decode_sampled_token_ids
                         # Trim output in case of dummy padding
                         decode_sampled_token_ids = decode_sampled_token_ids[:num_decodes]
+                        if self.speculative_config.use_dflash():
+                            for req_id, accepted_tokens in zip(
+                                    self.input_batch.req_ids[:num_decodes],
+                                    decode_sampled_token_ids,
+                            ):
+                                self._gdn_num_accepted_by_req[req_id] = max(1, len(accepted_tokens))
                         # convert decode_sampled_token_ids as list of tensor
                         spec_decode_num_tokens = [len(v) for v in decode_sampled_token_ids]
                         decode_sampled_token_ids = [
@@ -4929,12 +5214,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         ################## Spec Decode ##################
         # Now, we will call drafter to propose draft token ids
         if self.speculative_config:
-            self._draft_token_ids = self.propose_draft_token_ids(
-                scheduler_output, postprocessed_sampled_token_ids, sampling_metadata, non_flattened_hidden_states,
-                sample_hidden_states, aux_hidden_states, prefill_sampled_token_ids_device,
-                decode_sampled_token_ids_device, non_flattened_hidden_states_prefills, sample_hidden_states_prefills,
-                aux_hidden_states_prefills, num_decodes, prefill_data if num_prefills > 0 else None,
-                decode_data if num_decodes > 0 else None)
+            if device_prepared_dflash_drafts is not None:
+                self._draft_token_ids = device_prepared_dflash_drafts
+            else:
+                self._draft_token_ids = self.propose_draft_token_ids(
+                    scheduler_output, postprocessed_sampled_token_ids, sampling_metadata, non_flattened_hidden_states,
+                    sample_hidden_states, aux_hidden_states, prefill_sampled_token_ids_device,
+                    decode_sampled_token_ids_device, non_flattened_hidden_states_prefills,
+                    sample_hidden_states_prefills, aux_hidden_states_prefills, num_decodes,
+                    prefill_data if num_prefills > 0 else None, decode_data if num_decodes > 0 else None)
         ################## Spec Decode end ##################
 
         # Create output.
@@ -5119,7 +5407,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 #logger.info("Loading drafter model %s...", self.vllm_config.speculative_config.draft_model_config)
                 self.drafter.load_model(self.model.model)
                 if self.use_aux_hidden_state_outputs:
-                    if supports_eagle3(self.model.model):
+                    if self.speculative_config.use_dflash():
+                        from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+                            set_eagle3_aux_hidden_state_layers, )
+
+                        set_eagle3_aux_hidden_state_layers(self.model.model, self.speculative_config)
+                    elif supports_eagle3(self.model.model):
                         self.model.model.set_aux_hidden_state_layers(
                             self.model.model.get_eagle3_default_aux_hidden_state_layers())
                     else:
@@ -5131,7 +5424,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 self.drafter.model = self.drafter.model.to("hpu")
                 torch.hpu.synchronize()
                 with HabanaMemoryProfiler() as m:  # noqa: SIM117
-                    self.drafter.model = _maybe_wrap_in_hpu_graph(self.drafter.model, vllm_config=self.vllm_config)
+                    draft_adapter_config = (self.drafter.get_hpu_adapter_config()
+                                            if self.speculative_config.use_dflash() else self.vllm_config)
+                    self.drafter.model = _maybe_wrap_in_hpu_graph(
+                        self.drafter.model,
+                        vllm_config=draft_adapter_config,
+                    )
                 self.model_memory_usage = m.consumed_device_memory
                 logger.info("Wrapping in HPUGraph took %.4f GB", self.model_memory_usage / float(2**30))
         #############################################
@@ -5164,26 +5462,52 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 self._compile_methods()
                 self.regional_compilation_layers_list = [RMSNorm, VocabParallelEmbedding]
                 self._regional_compilation(self.model)
+                if (self.speculative_config is not None and self.speculative_config.use_dflash()
+                        and hasattr(self.drafter, "model")):
+                    self._regional_compilation(self.drafter.model)
+                    logger.info("Enabled regional compilation for the DFlash2 drafter")
                 self.sampler = self._compile(self.sampler)
             else:
                 self.model = self._compile(self.model)
+                if (self.speculative_config is not None and self.speculative_config.use_dflash()
+                        and hasattr(self.drafter, "model")):
+                    self.drafter.model = self._compile(self.drafter.model)
+                    logger.info("Enabled compilation for the DFlash2 drafter")
 
     def _compile_methods(self):
         """
         Compile methods which are not part of the compiled model i.e. those
         which will not be compiled during model's compilation.
         """
-        compiled_methods = [
+        target_methods = [
             'metadata_processor.process_metadata',
             '_rotary_prepare_cos_sin',
             'compute_logits',
             'select_and_compute_logits',
             'select_compute_logits_and_greedy',
         ]
-        for method_name in compiled_methods:
-            method = getattr_nested(self.model, method_name, None)
+        if self.speculative_config is not None and self.speculative_config.use_dflash():
+            target_methods.append('sample_dflash2_greedy')
+        self._compile_named_methods(self.model, target_methods)
+        if (self.speculative_config is not None and self.speculative_config.use_dflash()
+                and hasattr(self.drafter, "model")):
+            self._compile_named_methods(
+                self.drafter.model,
+                [
+                    'combine_hidden_states',
+                    'precompute_and_store_context_kv',
+                    'compute_candidates',
+                    'prepare_dflash2_inputs',
+                    'score_dflash2_candidates',
+                    'select_dflash2_candidates',
+                ],
+            )
+
+    def _compile_named_methods(self, model, method_names):
+        for method_name in method_names:
+            method = getattr_nested(model, method_name, None)
             if method is not None:
-                self._compile_region(self.model, method_name, method)
+                self._compile_region(model, method_name, method)
 
     def _regional_compilation(self, module, parent_module=None, module_name=None):
         """
@@ -5593,8 +5917,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         """
         # Choose batch sizes for warmup based on bucketing
         # Note: We skip batch_size=0 because you can't sample from empty logits
-        test_batch_sizes = list(
-            dict.fromkeys([1] + [bucket[0] for bucket in self.bucketing_manager.decode_buckets if bucket[0] > 0]))
+        # Speculative target verification expands B requests into
+        # B * (K + 1) paged-attention queries.  That expanded dimension is a
+        # model-forward bucket, not a sampler batch: sampling and rejection
+        # still operate on B requests.  Hybrid models keep InputBatch at the
+        # scheduler request capacity, so warming the expanded bucket here
+        # would write beyond every request-level sampling buffer.
+        test_batch_sizes = _sampler_warmup_batch_sizes(
+            self.bucketing_manager.decode_buckets,
+            self.input_batch.max_num_reqs,
+        )
 
         # Test different sampling configurations
         sampling_configs = [
@@ -5759,11 +6091,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                            scheduled_tokens,
                            is_prompt,
                            block_id=0):
-        # Spec decode: blocks should include look ahead tokens (eagle)
+        # Spec decode: reserve the same lookahead used by the scheduler. DFlash2
+        # needs one more slot than EAGLE for its bonus-token query.
         total_tokens_for_blocks = total_tokens
-        if self.speculative_config and self.speculative_config.use_eagle():
-            # Consider the block space for draft tokens to propose
-            total_tokens_for_blocks += self.speculative_config.num_speculative_tokens
+        num_lookahead_tokens = self.vllm_config.num_lookahead_tokens
+        if num_lookahead_tokens:
+            total_tokens_for_blocks += num_lookahead_tokens
             # Check the limit of the max model length
             if total_tokens_for_blocks > self.max_model_len:
                 total_tokens_for_blocks = self.max_model_len
@@ -5831,11 +6164,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             blocks[i] += 1
 
         # Leave space for the output token and draft tokens to propose
-        num_lookahead_tokens = 1
-        if self.speculative_config and self.speculative_config.use_eagle():
-            # Consider the token space for draft tokens to propose
-            # The draft tokens for eagle consumes block table space
-            num_lookahead_tokens += self.speculative_config.num_speculative_tokens
+        num_lookahead_tokens = 1 + self.vllm_config.num_lookahead_tokens
         seq_lengths = [
             min(b * block_size - num_lookahead_tokens, self.max_model_len - num_lookahead_tokens) for b in blocks
         ]
@@ -5898,17 +6227,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         prompt_total_tokens = [capped_ctx * self.block_size + prompt_query_len]
             for _ in range(prompt_bs):
                 for tokens, context_len in zip(prompt_total_tokens, prompt_num_context_blocks):
-                    if self.speculative_config and self.speculative_config.use_eagle():
-                        # Leave the block space for draft tokens to propose
-                        # The draft tokens for eagle consumes block table space
-                        num_speculative_tokens = self.speculative_config.num_speculative_tokens
-                        tokens -= num_speculative_tokens
-                        prompt_query_len -= num_speculative_tokens
+                    scheduled_prompt_query_len = prompt_query_len
+                    num_lookahead_tokens = self.vllm_config.num_lookahead_tokens
+                    if num_lookahead_tokens:
+                        # The profiling bucket already includes the tail in
+                        # which the drafter writes its speculative KV/state.
+                        tokens -= num_lookahead_tokens
+                        scheduled_prompt_query_len -= num_lookahead_tokens
                     self._add_dummy_request(requests,
                                             scheduled_tokens,
                                             num_computed_tokens=(context_len * self.block_size),
                                             total_tokens=tokens,
-                                            scheduled_tokens=prompt_query_len,
+                                            scheduled_tokens=scheduled_prompt_query_len,
                                             is_prompt=True)
         if decode_cfg:
             decode_bs, decode_query_len, decode_num_blocks = decode_cfg
@@ -5974,6 +6304,45 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         )
         self.execute_model(sched_output, warmup_mode=True)
         self.sample_tokens(None)
+        if self.speculative_config is not None and self.speculative_config.use_dflash():
+            # The first pass warms the one-token/prefill target and the DFlash
+            # proposer. Feed its drafts back once so every decode bucket also
+            # captures the K+1 target verification and rollback-state graphs.
+            # Do not read proposer output in compile-only mode: recipe output
+            # storage is intentionally uninitialized. Any in-vocabulary token
+            # exercises the same target verification graph.
+            self._draft_token_ids = None
+            draft_tokens = [0] * self.speculative_config.num_speculative_tokens
+            verify_req_ids = [req.req_id for req in requests if self.requests[req.req_id].output_token_ids]
+            if verify_req_ids:
+                verify_scheduled_tokens = {req_id: 1 + len(draft_tokens) for req_id in verify_req_ids}
+                cached_requests = CachedRequestData(
+                    req_ids=verify_req_ids,
+                    resumed_req_ids=set(),
+                    new_token_ids=[[] for _ in verify_req_ids],
+                    all_token_ids={},
+                    new_block_ids=[None for _ in verify_req_ids],
+                    num_computed_tokens=[
+                        self.requests[req_id].num_computed_tokens + scheduled_tokens[req_id]
+                        for req_id in verify_req_ids
+                    ],
+                    num_output_tokens=[len(self.requests[req_id].output_token_ids) for req_id in verify_req_ids],
+                )
+                verify_output = SchedulerOutput(
+                    scheduled_new_reqs=[],
+                    scheduled_cached_reqs=cached_requests,
+                    num_scheduled_tokens=verify_scheduled_tokens,
+                    total_num_scheduled_tokens=sum(verify_scheduled_tokens.values()),
+                    scheduled_spec_decode_tokens={req_id: draft_tokens
+                                                  for req_id in verify_req_ids},
+                    scheduled_encoder_inputs={},
+                    num_common_prefix_blocks=0,
+                    finished_req_ids=set(),
+                    free_encoder_mm_hashes=[],
+                )
+                self.execute_model(verify_output, warmup_mode=True)
+                self.sample_tokens(None)
+                self._draft_token_ids = None
         self.execute_model(cleanup, warmup_mode=True)
 
     def _generate_profiling(self, prompt_cfg, decode_cfg):
@@ -6519,10 +6888,19 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         self.bucketing_manager.prompt_buckets, True, kv_caches)
                 self.log_graph_warmup_summary(self.bucketing_manager.prompt_buckets, True, mem_post_prompt)
                 if not self.is_pooling_model:
+                    is_dflash = (self.speculative_config is not None and self.speculative_config.use_dflash())
+                    decode_warmup_buckets = _model_warmup_decode_buckets(
+                        self.bucketing_manager,
+                        is_dflash,
+                    )
+                    # _execute_dummy_scenario performs DFlash's second-stage
+                    # K+1 verification for each request-level seed bucket.
+                    # Iterating the generated flattened buckets directly would
+                    # misinterpret B*(K+1) queries as that many requests.
                     mem_post_decode, decode_batch_seq, decode_captured_all = \
                       self.warmup_graphs(
-                          self.bucketing_manager.decode_buckets, False, kv_caches)
-                    self.log_graph_warmup_summary(self.bucketing_manager.decode_buckets, False, mem_post_decode)
+                          decode_warmup_buckets, False, kv_caches)
+                    self.log_graph_warmup_summary(decode_warmup_buckets, False, mem_post_decode)
 
         # Validation warmup: run smallest buckets outside compile-only mode
         # to trigger torch.compile guard specializations for heterogeneous layers
@@ -6803,12 +7181,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     self.bucketing_manager.block_size = self.block_size
             maybe_set_mamba_kv_cache_groups_ids(self.model, self.kv_cache_config)
         self.initialize_attn_backend(kv_cache_config)
+        kernel_block_sizes: list[int] = []
 
         # Reinitialize the input batch with the correct block sizes for all
         # KV cache groups.  For GDN/linear_attention we additionally compute
         # kernel block sizes; for other hybrid (mamba) models we still need to
         # reinitialize so that MultiGroupBlockTable has one entry per group.
-        #kernel_block_sizes: list[int] = []
         if self.num_gdn > 0 or self.num_mamba_like_layers > 0:
             kernel_block_sizes = prepare_kernel_block_sizes(kv_cache_config, self.attn_groups)
             self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
@@ -6838,6 +7216,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         elif self.is_encoder_only_attn:
             kernel_block_sizes = []
             self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
+
+        if self.speculative_config is not None and self.speculative_config.use_dflash():
+            self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
         kv_caches: dict[str, torch.Tensor] = {}
         num_blocks = 0
@@ -6970,13 +7351,21 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         # GDN/linear_attention: compact allocation.
                         # All GDN groups share the same state tensor, so each
                         # request needs _num_gdn_groups distinct indices.
-                        # Total slots: max_num_reqs * num_gdn_groups + 2
+                        # Total slots also includes one state checkpoint per
+                        # verification token when DFlash2 is active.
                         # (slot 0 unused, last slot for -1 padding).
                         self._compact_gdn_group_ids.add(group_idx)
                         gdn_max_reqs = self._gdn_max_reqs
-                        compact_total = gdn_max_reqs * self._num_gdn_groups + 2
-                        logger.debug("GDN compact tensor: %d slots (max_reqs=%d * groups=%d + 2) vs baseline %d",
-                                     compact_total, gdn_max_reqs, self._num_gdn_groups, num_blocks + 1)
+                        compact_total = (gdn_max_reqs * self._num_gdn_groups * self._gdn_state_slots_per_req + 2)
+                        logger.debug(
+                            "GDN compact tensor: %d slots (max_reqs=%d * groups=%d * checkpoints=%d + 2) "
+                            "vs baseline %d",
+                            compact_total,
+                            gdn_max_reqs,
+                            self._num_gdn_groups,
+                            self._gdn_state_slots_per_req,
+                            num_blocks + 1,
+                        )
                         state_tensors = _mamba_state_tensors(kv_cache_spec, layer_pos, compact_total)
                         kv_caches[layer_name] = state_tensors
                         for state in state_tensors:
@@ -7050,8 +7439,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         # GDN/linear_attention: compact allocation.
                         self._compact_gdn_group_ids.add(group_idx)
                         gdn_max_reqs = self._gdn_max_reqs
-                        compact_total = gdn_max_reqs * self._num_gdn_groups + 2
-                        kv_caches[layer_name] = _mamba_state_tensors(kv_cache_spec, layer_pos, compact_total)
+                        compact_total = (gdn_max_reqs * self._num_gdn_groups * self._gdn_state_slots_per_req + 2)
+                        state_tensors = _mamba_state_tensors(kv_cache_spec, layer_pos, compact_total)
+                        kv_caches[layer_name] = state_tensors
+                        for state in state_tensors:
+                            if not any(state is cached for cached in self._compact_gdn_state_tensors):
+                                self._compact_gdn_state_tensors.append(state)
                     elif isinstance(kv_cache_spec, MambaSpec) and \
                             kv_cache_spec.mamba_type in _GDN_MAMBA_TYPES:
                         # GDN/linear_attention: non-compact (baseline) allocation.
@@ -7156,14 +7549,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         # Initialize the GDN compact slot free-list.
         # The free-list contains base-slot IDs [0..max_num_reqs-1].
-        # For request with base_slot `s` in group `g` (0-indexed within
-        # compact groups), the tensor index is g * max_num_reqs + s + 1.
+        # Each request owns `_gdn_state_slots_per_req` consecutive rows in
+        # every compact group so speculative checkpoints never alias.
         if self._compact_gdn_group_ids:
             self._compact_gdn_group_offset = {gid: i for i, gid in enumerate(sorted(self._compact_gdn_group_ids))}
             gdn_max_reqs = self._gdn_max_reqs
             self._gdn_slot_free_list = list(range(gdn_max_reqs - 1, -1, -1))
             self._gdn_req_to_base_slot.clear()
-            compact_total = gdn_max_reqs * self._num_gdn_groups + 2
+            compact_total = gdn_max_reqs * self._num_gdn_groups * self._gdn_state_slots_per_req + 2
             logger.info("GDN compact: %d groups, %d base_slots, tensor_dim0=%d vs baseline=%d, free_list_len=%d",
                         len(self._compact_gdn_group_ids), gdn_max_reqs, compact_total, num_blocks + 1,
                         len(self._gdn_slot_free_list))
@@ -7212,12 +7605,26 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             kv_cache_config: The KV cache configuration.
             kernel_block_sizes: The kernel block sizes for each KV cache group.
         """
-        block_sizes = [
-            kv_cache_group.kv_cache_spec.block_size for kv_cache_group in kv_cache_config.kv_cache_groups
-            if not isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec)
+        cache_groups = [
+            group for group in kv_cache_config.kv_cache_groups
+            if not isinstance(group.kv_cache_spec, EncoderOnlyAttentionSpec)
         ]
+        block_sizes = [group.kv_cache_spec.block_size for group in cache_groups]
+        block_table_max_model_len = max(self.max_model_len, self.max_encoder_len)
+        max_num_blocks_per_req = [
+            group.kv_cache_spec.max_num_blocks_per_req(self.vllm_config, block_table_max_model_len)
+            for group in cache_groups
+        ]
+        slot_mapping_modes = [
+            SlotMappingMode.NONE if isinstance(group.kv_cache_spec, MambaSpec) else SlotMappingMode.TOKEN_TO_KV_SLOT
+            for group in cache_groups
+        ]
+        default_max_num_blocks = [cdiv(block_table_max_model_len, block_size) for block_size in block_sizes]
+        default_slot_mapping_modes = [SlotMappingMode.TOKEN_TO_KV_SLOT] * len(block_sizes)
 
-        if block_sizes != [self.cache_config.block_size] or kernel_block_sizes != [self.cache_config.block_size]:
+        if (block_sizes != [self.cache_config.block_size] or kernel_block_sizes != [self.cache_config.block_size]
+                or max_num_blocks_per_req != default_max_num_blocks
+                or slot_mapping_modes != default_slot_mapping_modes):
             assert self.vllm_config.offload_config.uva.cpu_offload_gb == 0, (
                 "Cannot re-initialize the input batch when CPU weight "
                 "offloading is enabled. See https://github.com/vllm-project/vllm/pull/18298 "  # noqa: E501
@@ -7231,6 +7638,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 vocab_size=self.model_config.get_vocab_size(),
                 block_sizes=block_sizes,
                 kernel_block_sizes=kernel_block_sizes,
+                max_num_blocks_per_req=max_num_blocks_per_req,
+                slot_mapping_modes=slot_mapping_modes,
                 is_spec_decode=bool(self.vllm_config.speculative_config),
                 logitsprocs=self.input_batch.logitsprocs,
                 is_pooling_model=self.is_pooling_model,
@@ -7357,6 +7766,43 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         if self.speculative_config.method == "ngram":
             assert isinstance(self.drafter, NgramProposer)
             draft_token_ids = self.propose_ngram_draft_token_ids(sampled_token_ids)
+        elif self.speculative_config.use_dflash():
+            if not sampling_metadata.all_greedy:
+                raise NotImplementedError("HPU DFlash2 currently supports greedy sampling only; set temperature=0")
+            draft_parts: list[torch.Tensor] = []
+            if decode_data is not None:
+                assert num_decodes is not None
+                with self.profiler.record_event('internal', "dflash2_proposer_decode"):
+                    draft_parts.append(
+                        self.propose_dflash2_decode(
+                            sampled_token_ids,
+                            hidden_states,
+                            aux_hidden_states,
+                            num_decodes,
+                            decode_data,
+                        ))
+            if prefill_data is not None:
+                assert hidden_states_prefills is not None
+                for idx, (req_ids, _prompt_lens, token_ids, _position_ids, _attn_metadata, _logits_indices,
+                          logits_requests) in enumerate(zip(*shallow_tuple(prefill_data))):
+                    with self.profiler.record_event('internal', "dflash2_proposer_prefill"):
+                        draft_parts.append(
+                            self.propose_dflash2_prefill(
+                                scheduler_output,
+                                sampled_token_ids,
+                                hidden_states_prefills[idx],
+                                aux_hidden_states_prefills[idx] if aux_hidden_states_prefills else None,
+                                req_ids,
+                                logits_requests,
+                                token_ids.shape[1],
+                            ))
+            if not draft_parts:
+                return torch.empty(
+                    (0, self.speculative_config.num_speculative_tokens),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            draft_token_ids = draft_parts[0] if len(draft_parts) == 1 else torch.cat(draft_parts, dim=0)
         elif self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)
 
@@ -7410,6 +7856,289 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 return draft_token_ids.view(-1, 1)  # type: ignore
 
         return draft_token_ids
+
+    def _can_use_dflash2_device_prepare(
+        self,
+        sampled_token_ids: torch.Tensor,
+        num_decodes: int,
+        decode_data: DecodeInputData,
+    ) -> bool:
+        """Qualify the fixed-width, device-resident target-to-draft bridge."""
+        if not gaudi_envs.VLLM_HPU_DFLASH2_DEVICE_PREPARE:
+            return False
+        from vllm_gaudi.v1.spec_decode.hpu_dflash2 import HpuDFlash2Proposer
+
+        if not isinstance(self.drafter, HpuDFlash2Proposer):
+            return False
+        metadata = decode_data.spec_decode_metadata
+        if metadata is None or decode_data.token_ids is None or num_decodes <= 0:
+            return False
+        target_width = self.drafter.num_query_per_req
+        if any(num_draft != target_width - 1 for num_draft in metadata.num_draft_tokens[:num_decodes]):
+            return False
+        if decode_data.token_ids.shape[0] % target_width != 0:
+            return False
+        padded_batch_size = decode_data.token_ids.shape[0] // target_width
+        return (sampled_token_ids.ndim == 2 and sampled_token_ids.shape[0] == padded_batch_size
+                and sampled_token_ids.shape[1] == target_width)
+
+    def _dflash2_resolved_device_block_table(
+        self,
+        group_id: int,
+        padded_batch_size: int,
+        committed_table: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if committed_table is not None:
+            return committed_table
+        block_table = self.input_batch.block_table[group_id]
+        defragmenter = getattr(self, 'defragmenter', None)
+        if defragmenter is None or not defragmenter.enabled:
+            # Defensive fallback for direct tests or callers that did not pass
+            # through _create_decode_input_data.
+            return self._dflash2_commit_block_table_if_changed(group_id, padded_batch_size)
+        resolved = self._resolve_all_blocks(block_table.get_cpu_tensor()[:padded_batch_size].tolist())
+        return async_h2d_copy(torch.tensor(resolved, dtype=torch.int32), device=self.device)
+
+    def _dflash2_commit_block_table_if_changed(
+        self,
+        group_id: int,
+        padded_batch_size: int,
+    ) -> torch.Tensor:
+        """Return a current device table without copying unchanged CPU rows."""
+        block_table = self.input_batch.block_table[group_id]
+        cpu_rows = block_table.get_cpu_tensor()[:padded_batch_size]
+        snapshots = getattr(self, '_dflash2_device_block_table_snapshots', None)
+        if snapshots is None:
+            snapshots = {}
+            self._dflash2_device_block_table_snapshots = snapshots
+
+        snapshot_entry = snapshots.get(group_id)
+        table_identity = id(block_table)
+        changed = snapshot_entry is None or snapshot_entry[0] != table_identity
+        if not changed:
+            snapshot = snapshot_entry[1]
+            changed = (snapshot.shape[0] < padded_batch_size or snapshot.shape[1:] != cpu_rows.shape[1:]
+                       or not torch.equal(snapshot[:padded_batch_size], cpu_rows))
+
+        if changed:
+            # Enqueue only real structural updates.  Placement before Target
+            # execution lets the occasional H2D copy overlap Target, while
+            # steady speculative rounds reuse the persistent device tensor.
+            block_table.commit_block_table(padded_batch_size)
+            snapshots[group_id] = (table_identity, cpu_rows.clone())
+        return block_table.get_device_tensor(padded_batch_size)
+
+    def propose_dflash2_decode_device(
+        self,
+        sampled_token_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        aux_hidden_states: Optional[torch.Tensor],
+        num_decodes: int,
+        decode_data: DecodeInputData,
+    ) -> torch.Tensor:
+        """Queue DFlash2 directly from fixed-width HPU rejection output."""
+        from vllm_gaudi.v1.spec_decode.hpu_dflash2 import HpuDFlash2Proposer
+
+        assert isinstance(self.drafter, HpuDFlash2Proposer)
+        assert decode_data.token_ids is not None
+        target_width = self.drafter.num_query_per_req
+        padded_batch_size = decode_data.token_ids.shape[0] // target_width
+
+        base_positions = torch.zeros(padded_batch_size, dtype=torch.int64)
+        base_positions[:num_decodes] = torch.from_numpy(self.input_batch.num_computed_tokens_cpu[:num_decodes].astype(
+            np.int64, copy=False))
+        active_mask = torch.zeros(padded_batch_size, dtype=torch.bool)
+        active_mask[:num_decodes] = True
+
+        first_blocks = torch.zeros(padded_batch_size, dtype=torch.int64)
+        last_blocks = torch.full((padded_batch_size, ), -1, dtype=torch.int64)
+        for row in range(num_decodes):
+            base = int(base_positions[row])
+            earliest_query_start = base + 1
+            if self.drafter.sliding_window is None:
+                first_position = 0
+            else:
+                first_position = max(0, earliest_query_start - (int(self.drafter.sliding_window) - 1))
+            first_blocks[row] = first_position // self.drafter.block_size
+            last_blocks[row] = (base + target_width - 1) // self.drafter.block_size
+        max_context_blocks = max(int(last_blocks[row] - first_blocks[row] + 1) for row in range(num_decodes))
+
+        block_table = self._dflash2_resolved_device_block_table(
+            self.drafter.kv_cache_gid,
+            padded_batch_size,
+            getattr(decode_data, 'draft_block_table', None),
+        )
+        prepared = self.drafter.prepare_decode_device_inputs(
+            sampled_token_ids,
+            async_h2d_copy(base_positions, device=self.device),
+            block_table,
+            async_h2d_copy(active_mask, device=self.device),
+            async_h2d_copy(first_blocks, device=self.device),
+            async_h2d_copy(last_blocks, device=self.device),
+            self,
+            max_context_blocks,
+        )
+        context_states = self.drafter.combine_context_hidden_states_fixed(
+            hidden_states,
+            aux_hidden_states,
+            padded_batch_size * target_width,
+        )
+        self.drafter.store_context_device(
+            context_states,
+            prepared[1],
+            prepared[2],
+        )
+        return self.drafter.propose_prepared_query_block(prepared, self, num_decodes)
+
+    def propose_dflash2_decode(
+        self,
+        sampled_token_ids: list[list[int]],
+        hidden_states: torch.Tensor,
+        aux_hidden_states: Optional[torch.Tensor],
+        num_decodes: int,
+        decode_data: DecodeInputData,
+    ) -> torch.Tensor:
+        from vllm_gaudi.v1.spec_decode.hpu_dflash2 import HpuDFlash2Proposer
+
+        assert isinstance(self.drafter, HpuDFlash2Proposer)
+        metadata = decode_data.spec_decode_metadata
+        # A request can temporarily run a plain one-token decode (first decode,
+        # scheduler budget pressure, or a boundary step). It still needs a new
+        # DFlash block; only the source row width changes from K+1 to one.
+        target_width = max(metadata.num_draft_tokens) + 1 if metadata is not None else 1
+        active_rows = [row for row in range(num_decodes) if sampled_token_ids[row]]
+        if not active_rows:
+            return torch.full(
+                (num_decodes, self.speculative_config.num_speculative_tokens),
+                -1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+
+        source_indices: list[int] = []
+        context_positions_by_row: list[list[int]] = []
+        query_starts: list[int] = []
+        bonus_token_ids: list[int] = []
+        for row in active_rows:
+            valid_count = len(sampled_token_ids[row])
+            start = int(self.input_batch.num_computed_tokens_cpu[row])
+            source_indices.extend(row * target_width + offset for offset in range(valid_count))
+            context_positions_by_row.append(list(range(start, start + valid_count)))
+            query_starts.append(start + valid_count)
+            bonus_token_ids.append(int(sampled_token_ids[row][-1]))
+
+        source_indices_hpu = async_h2d_copy(torch.tensor(source_indices, dtype=torch.int64), device=self.device)
+        context_states = self.drafter.combine_context_hidden_states(
+            hidden_states,
+            aux_hidden_states,
+            source_indices_hpu,
+        )
+        block_table = self.input_batch.block_table[self.drafter.kv_cache_gid].get_cpu_tensor()
+        context_slot_parts = [
+            self.drafter.make_slot_mapping(block_table, [row], [positions], self).reshape(-1)
+            for row, positions in zip(active_rows, context_positions_by_row)
+        ]
+        context_slots = (context_slot_parts[0] if len(context_slot_parts) == 1 else torch.cat(context_slot_parts))
+        self.drafter.store_context(
+            context_states,
+            [position for positions in context_positions_by_row for position in positions],
+            context_slots,
+        )
+        drafts = self.drafter.propose_query_block(
+            bonus_token_ids,
+            query_starts,
+            block_table,
+            active_rows,
+            self,
+            padded_batch_size=decode_data.token_ids.shape[0] // target_width,
+        )
+        if len(active_rows) == num_decodes:
+            return drafts
+        output = torch.full(
+            (num_decodes, self.speculative_config.num_speculative_tokens),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        active_rows_hpu = async_h2d_copy(torch.tensor(active_rows, dtype=torch.int64), device=self.device)
+        output.index_copy_(0, active_rows_hpu, drafts)
+        return output
+
+    def propose_dflash2_prefill(
+        self,
+        scheduler_output: "SchedulerOutput",
+        sampled_token_ids: list[list[int]],
+        hidden_states: torch.Tensor,
+        aux_hidden_states: Optional[torch.Tensor],
+        req_ids: list[str],
+        logits_requests: list[str],
+        padded_query_len: int,
+    ) -> torch.Tensor:
+        from vllm_gaudi.v1.spec_decode.hpu_dflash2 import HpuDFlash2Proposer
+
+        assert isinstance(self.drafter, HpuDFlash2Proposer)
+        output = torch.full(
+            (len(req_ids), self.speculative_config.num_speculative_tokens),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        if not req_ids:
+            return output
+        multimodal_req_ids = [req_id for req_id in req_ids if self.requests[req_id].mm_features]
+        if multimodal_req_ids:
+            raise NotImplementedError(
+                "HPU DFlash2 currently supports text-only requests; received multimodal inputs for "
+                f"{multimodal_req_ids}")
+
+        block_table = self.input_batch.block_table[self.drafter.kv_cache_gid].get_cpu_tensor()
+        batch_rows = [self.input_batch.req_id_to_index[req_id] for req_id in req_ids]
+        query_lens = [int(scheduler_output.num_scheduled_tokens[req_id]) for req_id in req_ids]
+        starts = [int(self.input_batch.num_computed_tokens_cpu[row]) for row in batch_rows]
+        source_indices = [
+            local_row * padded_query_len + offset for local_row, query_len in enumerate(query_lens)
+            for offset in range(query_len)
+        ]
+        context_positions_by_row = [
+            list(range(start, start + query_len)) for start, query_len in zip(starts, query_lens)
+        ]
+        source_indices_hpu = async_h2d_copy(torch.tensor(source_indices, dtype=torch.int64), device=self.device)
+        context_states = self.drafter.combine_context_hidden_states(
+            hidden_states,
+            aux_hidden_states,
+            source_indices_hpu,
+        )
+        context_slots = torch.cat([
+            self.drafter.make_slot_mapping(block_table, [row], [positions], self).reshape(-1)
+            for row, positions in zip(batch_rows, context_positions_by_row)
+        ])
+        self.drafter.store_context(
+            context_states,
+            [position for positions in context_positions_by_row for position in positions],
+            context_slots,
+        )
+
+        local_by_req = {req_id: local_row for local_row, req_id in enumerate(req_ids)}
+        active_req_ids = [req_id for req_id in logits_requests if req_id in local_by_req]
+        active_local_rows = [local_by_req[req_id] for req_id in active_req_ids]
+        if not active_local_rows:
+            return output
+        active_batch_rows = [batch_rows[row] for row in active_local_rows]
+        query_starts = [starts[row] + query_lens[row] for row in active_local_rows]
+        bonus_token_ids = [
+            int(sampled_token_ids[self.input_batch.req_id_to_index[req_id]][-1]) for req_id in active_req_ids
+        ]
+        drafts = self.drafter.propose_query_block(
+            bonus_token_ids,
+            query_starts,
+            block_table,
+            active_batch_rows,
+            self,
+            padded_batch_size=hidden_states.shape[0] if hidden_states.dim() == 3 else len(req_ids),
+        )
+        active_rows_hpu = async_h2d_copy(torch.tensor(active_local_rows, dtype=torch.int64), device=self.device)
+        output.index_copy_(0, active_rows_hpu, drafts)
+        return output
 
     def propose_eagle_decode(
         self,
@@ -7727,8 +8456,11 @@ class HPUAttentionMetadataProcessor:
 
         len_mask = (torch.arange(0, seq_len, device=device, dtype=torch.int32).view(1, seq_len).ge(
             seq_lens_t.unsqueeze(-1)).view(batch_size, 1, 1, seq_len))
-        causal_mask = torch.triu(torch.ones((batch_size, 1, seq_len, seq_len), device=device, dtype=torch.bool),
-                                 diagonal=1)
+        if prefill_metadata.causal:
+            causal_mask = torch.triu(torch.ones((batch_size, 1, seq_len, seq_len), device=device, dtype=torch.bool),
+                                     diagonal=1)
+        else:
+            causal_mask = torch.zeros((batch_size, 1, seq_len, seq_len), device=device, dtype=torch.bool)
         mask = causal_mask.logical_or(len_mask)
         mask = torch.concat((past_mask, mask), dim=-1)
         attn_bias = (torch.zeros_like(mask, dtype=dtype).masked_fill_(mask, -math.inf))
@@ -7752,7 +8484,7 @@ class HPUAttentionMetadataProcessor:
         Returns:
             Updated attention metadata with window_attn_bias set
         """
-        if (attn_metadata is None or not attn_metadata.is_prompt):
+        if (attn_metadata is None or not attn_metadata.is_prompt or attn_metadata.window_attn_bias is not None):
             return attn_metadata
 
         prefill_metadata = attn_metadata

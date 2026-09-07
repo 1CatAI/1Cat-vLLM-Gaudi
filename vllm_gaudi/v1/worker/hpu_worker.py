@@ -406,28 +406,54 @@ class HPUWorker(WorkerBase):
         # recipes we will use the extra memory for graphs/blocks
         free_hpu_memory = torch.hpu.mem_get_info()[0]
 
-        try:
-            graph_reserved_mem = (float(os.environ.get('VLLM_GRAPH_RESERVED_MEM', '0.1'))
-                                  if not self.model_config.enforce_eager else 0)
-        except ValueError:
-            graph_reserved_mem = 0.0 if self.model_config.enforce_eager else 0.1
-            logger.warning("Invalid VLLM_GRAPH_RESERVED_MEM value, using default %s", graph_reserved_mem)
-        graph_headroom = 1 - graph_reserved_mem
-        available_hpu_memory = free_hpu_memory * \
-            self.cache_config.gpu_memory_utilization
-        hpu_memory_margin = free_hpu_memory * (1 - self.cache_config.gpu_memory_utilization)
-        self.model_runner.mem_margin = hpu_memory_margin  # type: ignore[union-attr]
-        cache_size_bytes = available_hpu_memory * graph_headroom
-        graph_headroom_bytes = available_hpu_memory * (1 - graph_headroom)
         dummy_block_headroom = single_kv_block_size_bytes
-        msg = (f"Free device memory: {format_bytes(free_hpu_memory)}, "
-               f"{format_bytes(available_hpu_memory)} usable "
-               f"(gpu_memory_utilization={self.cache_config.gpu_memory_utilization}),"
-               f" {format_bytes(graph_headroom_bytes)} reserved for HPUGraphs "
-               f"(VLLM_GRAPH_RESERVED_MEM={graph_reserved_mem}), "
-               f"{format_bytes(dummy_block_headroom)} reserved for KV cache dummy "
-               f"block {format_bytes(cache_size_bytes - dummy_block_headroom)} "
-               "reserved for usable KV cache")
+        explicit_kv_cache_size = self.cache_config.kv_cache_memory_bytes
+        if explicit_kv_cache_size is not None:
+            if explicit_kv_cache_size > free_hpu_memory:
+                raise ValueError("Requested KV cache memory "
+                                 f"({format_bytes(explicit_kv_cache_size)}) exceeds free HPU "
+                                 f"memory after profiling ({format_bytes(free_hpu_memory)}). "
+                                 "Decrease --kv-cache-memory-bytes.")
+            if explicit_kv_cache_size <= dummy_block_headroom:
+                raise ValueError("Requested KV cache memory "
+                                 f"({format_bytes(explicit_kv_cache_size)}) must exceed the "
+                                 "HPU dummy-block reservation "
+                                 f"({format_bytes(dummy_block_headroom)}).")
+
+            # Match core vLLM's explicit-memory contract: an explicit byte
+            # budget takes precedence over gpu_memory_utilization. HPU keeps
+            # one extra padding block outside the scheduler-visible cache, so
+            # subtract that fixed allocation below before returning.
+            cache_size_bytes = int(explicit_kv_cache_size)
+            self.model_runner.mem_margin = max(  # type: ignore[union-attr]
+                0, free_hpu_memory - cache_size_bytes)
+            msg = (f"Free device memory: {format_bytes(free_hpu_memory)}, "
+                   f"using explicit KV cache budget {format_bytes(cache_size_bytes)} "
+                   "(--kv-cache-memory-bytes; gpu_memory_utilization ignored), "
+                   f"{format_bytes(dummy_block_headroom)} reserved for KV cache dummy "
+                   f"block, {format_bytes(cache_size_bytes - dummy_block_headroom)} "
+                   "reserved for usable KV cache")
+        else:
+            try:
+                graph_reserved_mem = (float(os.environ.get('VLLM_GRAPH_RESERVED_MEM', '0.1'))
+                                      if not self.model_config.enforce_eager else 0)
+            except ValueError:
+                graph_reserved_mem = 0.0 if self.model_config.enforce_eager else 0.1
+                logger.warning("Invalid VLLM_GRAPH_RESERVED_MEM value, using default %s", graph_reserved_mem)
+            graph_headroom = 1 - graph_reserved_mem
+            available_hpu_memory = free_hpu_memory * self.cache_config.gpu_memory_utilization
+            hpu_memory_margin = free_hpu_memory * (1 - self.cache_config.gpu_memory_utilization)
+            self.model_runner.mem_margin = hpu_memory_margin  # type: ignore[union-attr]
+            cache_size_bytes = available_hpu_memory * graph_headroom
+            graph_headroom_bytes = available_hpu_memory * (1 - graph_headroom)
+            msg = (f"Free device memory: {format_bytes(free_hpu_memory)}, "
+                   f"{format_bytes(available_hpu_memory)} usable "
+                   f"(gpu_memory_utilization={self.cache_config.gpu_memory_utilization}),"
+                   f" {format_bytes(graph_headroom_bytes)} reserved for HPUGraphs "
+                   f"(VLLM_GRAPH_RESERVED_MEM={graph_reserved_mem}), "
+                   f"{format_bytes(dummy_block_headroom)} reserved for KV cache dummy "
+                   f"block {format_bytes(cache_size_bytes - dummy_block_headroom)} "
+                   "reserved for usable KV cache")
 
         logger.info(msg)
 

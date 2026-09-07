@@ -52,6 +52,11 @@ if TYPE_CHECKING:
     VLLM_HPU_EXPLICIT_SIGMOID_SILU: bool = False
     VLLM_HPU_EXPLICIT_SIGMOID_SILU_MIN_TOKENS: int = 2048
     VLLM_HPU_FLASHINFER_GDN: bool = False
+    VLLM_HPU_FLASHINFER_DFLASH2: bool = False
+    VLLM_HPU_DFLASH2_CONV_ROUND_BEFORE_ACTIVATION: bool = False
+    VLLM_HPU_DFLASH2_FULL_QUERY_CONV: bool = False
+    VLLM_HPU_DFLASH2_DIRECT_CHECKPOINTS: bool = False
+    VLLM_HPU_DFLASH2_DEVICE_PREPARE: bool = False
     VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE: bool = False
     VLLM_HPU_FLASHINFER_GDN_PREFILL: bool = False
     VLLM_HPU_GDN_DIRECT_STATE: bool = True
@@ -147,6 +152,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # compile-friendly reference implementation.
     "VLLM_HPU_FLASHINFER_GDN":
     lambda: os.environ.get("VLLM_HPU_FLASHINFER_GDN", "false").strip().lower() in ("1", "true"),
+
+    # Enable the HPU DFlash2 V1 proposer and its FlashInfer-Gaudi operator
+    # adapters. This follows the parent GDN switch because rollback-safe GDN
+    # state handling is part of the DFlash2 correctness contract.
+    "VLLM_HPU_FLASHINFER_DFLASH2":
+    lambda: os.environ.get(
+        "VLLM_HPU_FLASHINFER_DFLASH2",
+        os.environ.get("VLLM_HPU_FLASHINFER_GDN", "false"),
+    ).strip().lower() in ("1", "true"),
+
+    # Experimental alignment with the ordinary HPU convolution/SiLU dtype
+    # boundary. Keep off until independent DFlash2 quality qualification.
+    "VLLM_HPU_DFLASH2_CONV_ROUND_BEFORE_ACTIVATION":
+    lambda: os.environ.get("VLLM_HPU_DFLASH2_CONV_ROUND_BEFORE_ACTIVATION", "false").strip().lower() in ("1", "true"),
+
+    # Skip speculative-convolution padding work only for CPU-proven full
+    # verification blocks with compact, request-owned state rows.
+    "VLLM_HPU_DFLASH2_FULL_QUERY_CONV":
+    lambda: os.environ.get("VLLM_HPU_DFLASH2_FULL_QUERY_CONV", "false").strip().lower() in ("1", "true"),
+
+    # Specialize native checkpoint writes only after CPU ownership validation.
+    "VLLM_HPU_DFLASH2_DIRECT_CHECKPOINTS":
+    lambda: os.environ.get("VLLM_HPU_DFLASH2_DIRECT_CHECKPOINTS", "false").strip().lower() in ("1", "true"),
+
+    # Keep accepted lengths and draft input preparation on HPU so the draft
+    # can be queued before target samples are materialized on the host.
+    "VLLM_HPU_DFLASH2_DEVICE_PREPARE":
+    lambda: os.environ.get("VLLM_HPU_DFLASH2_DEVICE_PREPARE", "false").strip().lower() in ("1", "true"),
 
     # Enable the qualified Qwen3.8 TP1 fused direct-state decode recipe. By
     # default this follows the parent FlashInfer-Gaudi GDN switch.

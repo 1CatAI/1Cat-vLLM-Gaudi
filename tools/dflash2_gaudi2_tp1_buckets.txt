@@ -1,0 +1,9 @@
+# Minimal Qwen3.8-27B DFlash2 TP1 qualification buckets.
+# Prompt: (batch_size, query_len, context_blocks)
+(1, 128, 0)
+(2, 128, 0)
+
+# Decode seeds. With seven speculative tokens the HPU bucketer also creates
+# flattened target-verification buckets for every request batch.
+(1, 1, [1, 2, 4, 6, 8])
+(2, 1, [2, 4, 6, 8])

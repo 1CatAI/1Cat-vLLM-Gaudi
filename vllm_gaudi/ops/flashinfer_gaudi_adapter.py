@@ -127,6 +127,7 @@ def maybe_run_gdn_decode_packed(
     direct_state_layout: bool = False,
     direct_state_group_count: int | None = None,
     direct_state_group_offset: int | None = None,
+    allow_indexed_reference: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Run the packed GDN backend, or return ``None`` when it is disabled.
 
@@ -162,7 +163,7 @@ def maybe_run_gdn_decode_packed(
     # implementation.  In auto mode, only select the measured contiguous
     # state fast path; explicit ``pytorch`` policy still exposes the complete
     # compatibility implementation for testing and unsupported layouts.
-    if use_reference and _BACKEND_POLICY == "auto" and not use_direct_state:
+    if use_reference and _BACKEND_POLICY == "auto" and not use_direct_state and not allow_indexed_reference:
         return None
 
     if use_reference:

@@ -7,9 +7,15 @@ import torch
 import json
 from importlib import resources
 
-from flashinfer_gaudi._config import get_backend_policy, get_state_precision
+from flashinfer_gaudi._config import get_backend_policy, get_state_precision, mtp_prepared_enabled
 from flashinfer_gaudi._native import native_diagnostics
-from flashinfer_gaudi._tactics import tactic_manifest
+from flashinfer_gaudi._tactics import (
+    dflash2_select_path_auto_promoted,
+    dflash2_score_select_auto_promoted,
+    dflash2_top_k_auto_promoted,
+    public_mtp_gdn_auto_promoted,
+    tactic_manifest,
+)
 
 
 def get_capabilities() -> dict[str, object]:
@@ -40,6 +46,10 @@ def get_capabilities() -> dict[str, object]:
             "prototype_decode_tokens": (1, ),
             "separate_load_store_indices": True,
             "intermediate_mtp_states": True,
+            "public_native_mtp_tokens": (8, ) if native["public_mtp_gdn"] else (),
+            "public_native_mtp_auto_promoted": public_mtp_gdn_auto_promoted(),
+            "experimental_prepared_mtp_available": native.get("public_mtp_prepared", False),
+            "experimental_prepared_mtp_requested": mtp_prepared_enabled(),
         },
         "gdn_fused_decode": {
             "reference": True,
@@ -61,6 +71,20 @@ def get_capabilities() -> dict[str, object]:
             "context_parallel": False,
             "state_checkpoints": False,
             "indexed_state_pool": False,
+        },
+        "dflash2": {
+            "reference": True,
+            "greedy_path": True,
+            "grouped_conv_native": native["dflash2_grouped_conv"],
+            "selector_path_native": native["dflash2_select_path"],
+            "selector_path_auto_promoted": dflash2_select_path_auto_promoted(),
+            "score_select_native": native["dflash2_score_select"],
+            "score_select_auto_promoted": dflash2_score_select_auto_promoted(),
+            "top_k_native": native["dflash2_top_k"],
+            "top_k_vendor_cguid": True,
+            "top_k_auto_promoted": dflash2_top_k_auto_promoted(),
+            "query_tokens_per_request": 8,
+            "selector_top_k": 16,
         },
         "native":
         native,

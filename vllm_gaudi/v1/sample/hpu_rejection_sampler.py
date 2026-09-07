@@ -1,12 +1,81 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from vllm.v1.sample import rejection_sampler
-import torch
 from typing import Optional
+
+import torch
+from vllm.v1.sample import rejection_sampler
+from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 PLACEHOLDER_TOKEN_ID = rejection_sampler.PLACEHOLDER_TOKEN_ID
 GREEDY_TEMPERATURE = rejection_sampler.GREEDY_TEMPERATURE
+
+
+def _dflash2_greedy_fastpath_supported(sampling_metadata: SamplingMetadata, ) -> bool:
+    """Return whether argmax can bypass the general sampler losslessly."""
+    if not sampling_metadata.all_greedy:
+        return False
+    if sampling_metadata.max_num_logprobs is not None or sampling_metadata.logprob_token_ids:
+        return False
+    if not sampling_metadata.no_penalties:
+        return False
+    if sampling_metadata.allowed_token_ids_mask is not None or sampling_metadata.bad_words_token_ids:
+        return False
+
+    # Spec decode currently installs only MinTokens as an argmax-changing
+    # processor. It is a true no-op once its active request map is empty.
+    for processor in sampling_metadata.logitsprocs.non_argmax_invariant:
+        if not isinstance(processor, MinTokensLogitsProcessor) or processor.min_toks:
+            return False
+
+    holder = sampling_metadata.thinking_budget_state_holder
+    return holder is None or not holder.has_tracked_requests()
+
+
+def dflash2_greedy_rejection_sample(
+    logits: torch.Tensor,
+    metadata: SpecDecodeMetadata,
+    sampling_metadata: SamplingMetadata,
+) -> torch.Tensor | None:
+    """Fuse DFlash2's two greedy sampler passes into one vocabulary argmax.
+
+    The general rejection sampler separately gathers/casts/samples bonus and
+    target rows. For the common unconstrained greedy request, casting cannot
+    change the argmax, so one argmax over the already-packed verification
+    logits is exactly equivalent and avoids materializing FP32 vocabulary
+    tensors twice.
+    """
+    if not _dflash2_greedy_fastpath_supported(sampling_metadata):
+        return None
+
+    return dflash2_greedy_rejection_sample_packed(
+        logits,
+        metadata.draft_token_ids,
+        metadata.target_logits_indices,
+        metadata.bonus_logits_indices,
+        metadata.cu_num_draft_tokens,
+    )
+
+
+def dflash2_greedy_rejection_sample_packed(
+    logits: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+    bonus_logits_indices: torch.Tensor,
+    cu_num_draft_tokens: torch.Tensor,
+) -> torch.Tensor:
+    """Tensor-only DFlash2 greedy sampler suitable for regional compile."""
+    all_token_ids = logits.argmax(dim=-1).to(torch.int32)
+    target_token_ids = torch.index_select(all_token_ids, 0, target_logits_indices)
+    bonus_token_ids = torch.index_select(all_token_ids, 0, bonus_logits_indices).view(-1, 1)
+    return _rejection_sample_pytorch(
+        draft_token_ids,
+        target_token_ids,
+        bonus_token_ids,
+        bonus_logits_indices.shape[0],
+        cu_num_draft_tokens,
+    )
 
 
 def rejection_sample_pytorch(
@@ -48,80 +117,61 @@ def rejection_sample_pytorch(
         torch.Tensor: The resulting tensor of accepted tokens.
             Shape: (num_seqs, max_draft_tokens + 1)
     """
-    # 0. wait for device processing to finish
-    # NOTE(chendi): Found CPU processing is faster than HPU for this step.
-    padded_draft_token_ids = padded_draft_token_ids.cpu().to(torch.int32)
-    padded_target_token_ids = padded_target_token_ids.cpu().to(torch.int32)
-    bonus_token_ids = bonus_token_ids.cpu().to(torch.int32)
-    cu_num_draft_tokens = cu_num_draft_tokens.cpu()
-    # 1. Get tensor dimensions and device for calculations
-    num_seqs = len(num_draft_tokens)
+    return _rejection_sample_pytorch(
+        padded_draft_token_ids,
+        padded_target_token_ids,
+        bonus_token_ids,
+        len(num_draft_tokens),
+        cu_num_draft_tokens,
+    )
+
+
+def _rejection_sample_pytorch(
+    padded_draft_token_ids: torch.Tensor,
+    padded_target_token_ids: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    num_seqs: int,
+    cu_num_draft_tokens: torch.Tensor,
+) -> torch.Tensor:
+    # Keep the prefix comparison and output packing on the input device.  The
+    # caller already performs one final D2H copy when parsing engine output;
+    # copying all draft/target rows here adds an extra synchronization to every
+    # speculative step and is especially expensive for short decode batches.
+    padded_draft_token_ids = padded_draft_token_ids.to(torch.int32)
+    padded_target_token_ids = padded_target_token_ids.to(torch.int32)
+    bonus_token_ids = bonus_token_ids.to(torch.int32)
     padded_draft_token_ids = padded_draft_token_ids.view(num_seqs, -1)
     max_draft_tokens = padded_draft_token_ids.shape[-1]
     padded_target_token_ids = padded_target_token_ids.view(num_seqs, -1)
     bonus_token_ids = bonus_token_ids.view(num_seqs, -1)
     device = padded_draft_token_ids.device
 
-    # 2. Calculate the number of draft tokens for each sequence from the
-    # cumulative sum
-    start_indices = torch.cat((torch.tensor([0], device=device,
-                                            dtype=cu_num_draft_tokens.dtype), cu_num_draft_tokens[:-1]))
+    # Calculate the number of draft tokens for each request without moving the
+    # cumulative lengths to the host.
+    cu_num_draft_tokens = cu_num_draft_tokens.to(device=device)
+    start_indices = torch.cat((torch.zeros(1, device=device,
+                                           dtype=cu_num_draft_tokens.dtype), cu_num_draft_tokens[:-1]))
     num_draft_tokens_per_seq = cu_num_draft_tokens - start_indices
 
-    # 3. Find the first mismatch, ignoring padding tokens
-    # Create a mask to only consider valid tokens for each sequence
-    pos = torch.arange(max_draft_tokens, device=device)
+    # Find the first mismatch while ignoring padded draft positions.
+    pos = torch.arange(max_draft_tokens, device=device, dtype=num_draft_tokens_per_seq.dtype)
     valid_token_mask = pos < num_draft_tokens_per_seq.unsqueeze(-1)
-
-    matches = (padded_draft_token_ids == padded_target_token_ids)
-
-    mismatches = ~matches
+    mismatches = (padded_draft_token_ids != padded_target_token_ids) & valid_token_mask
     any_mismatch = mismatches.any(dim=1)
-    # For sequence that the num draft tokens is 0, always consider all match
-    any_mismatch[num_draft_tokens_per_seq == 0] = False
     first_mismatch_idx = torch.argmax(mismatches.int(), dim=1)
 
-    # 4. Determine the number of accepted tokens for each sequence
-    # If a mismatch occurs, we accept tokens up to and including the mismatch.
-    # If no mismatch, accept all *actual* draft tokens.
-    num_accepted = ((first_mismatch_idx + 1) * any_mismatch + num_draft_tokens_per_seq * (~any_mismatch))
+    prefix_len = torch.where(any_mismatch, first_mismatch_idx + 1, num_draft_tokens_per_seq)
+    prefix_mask = (pos < prefix_len.unsqueeze(-1)) & valid_token_mask
+    placeholder = torch.full_like(padded_target_token_ids, PLACEHOLDER_TOKEN_ID, dtype=torch.int32)
+    output_prefix = torch.where(prefix_mask, padded_target_token_ids, placeholder)
 
-    # 5. Create the output tensor by masking the target tokens
-    # Initialize the output tensor with the padding value.
-    # Create output buffer.
-    output_tokens = torch.empty(
-        (num_seqs, max_draft_tokens + 1),
-        dtype=torch.int32,  # Consistent with SamplerOutput.sampled_token_ids.
-        device=device,
+    output_tokens = torch.cat(
+        (output_prefix, placeholder[:, :1]),
+        dim=1,
     )
-    output_tokens.fill_(PLACEHOLDER_TOKEN_ID)
-
-    # Create a mask that is True for all positions up to the number of
-    # accepted tokens.
-    acceptance_mask = pos < num_accepted.unsqueeze(-1)
-    acceptance_mask = acceptance_mask & valid_token_mask
-
-    # Use the mask to copy the accepted target tokens into the output tensor.
-    output_slice = output_tokens[:, :max_draft_tokens]
-    output_slice[acceptance_mask] = padded_target_token_ids[acceptance_mask]
-
-    # 6. Add the bonus token where all draft tokens were accepted
-    # Create a boolean mask for sequences where all drafts were a match.
-    all_accepted_mask = ~any_mismatch
-
-    # If any sequences were fully accepted, place the bonus tokens.
-    if all_accepted_mask.sum() > 0:
-        # Get the column indices (positions) for the bonus tokens using the mask
-        bonus_pos_indices = num_draft_tokens_per_seq[all_accepted_mask].long()
-
-        # Get the corresponding bonus token values using the mask.
-        bonus_values = bonus_token_ids[all_accepted_mask].squeeze(-1)
-
-        # Place the bonus tokens using boolean indexing for rows and integer
-        # indexing for columns.
-        output_tokens[all_accepted_mask, bonus_pos_indices] = bonus_values
-
-    return output_tokens
+    output_pos = torch.arange(max_draft_tokens + 1, device=device, dtype=num_draft_tokens_per_seq.dtype)
+    bonus_mask = (~any_mismatch).unsqueeze(-1) & (output_pos.unsqueeze(0) == num_draft_tokens_per_seq.unsqueeze(-1))
+    return torch.where(bonus_mask, bonus_token_ids[:, :1], output_tokens)
 
 
 def rejection_sample(

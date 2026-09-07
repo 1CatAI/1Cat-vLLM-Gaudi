@@ -6,6 +6,7 @@ from contextlib import nullcontext
 import pytest
 import torch
 from types import SimpleNamespace
+from unittest import mock
 import habana_frameworks.torch  # noqa: F401
 from habana_frameworks.torch.utils.internal import is_lazy
 from vllm.model_executor.model_loader import get_model
@@ -25,6 +26,9 @@ from vllm_gaudi.v1.worker.hpu_model_runner import (
     HPUModelRunner,
     HpuModelAdapter,
     _zero_compact_gdn_slot,
+    _is_full_dflash_query_block,
+    _model_warmup_decode_buckets,
+    _sampler_warmup_batch_sizes,
     maybe_set_mamba_kv_cache_groups_ids,
     should_synchronize_hybrid_prefill_output,
 )
@@ -48,16 +52,38 @@ def test_zero_compact_gdn_slot_clears_only_reused_request_states():
     first_before = first.clone()
     second_before = second.clone()
 
-    _zero_compact_gdn_slot([first, second], base_slot=1, num_groups=3)
+    _zero_compact_gdn_slot(
+        [first, second],
+        base_slot=1,
+        num_groups=3,
+        max_num_reqs=2,
+    )
 
-    torch.testing.assert_close(first[1:4], first_before[1:4])
-    torch.testing.assert_close(second[1:4], second_before[1:4])
+    torch.testing.assert_close(first[[1, 3, 5]], first_before[[1, 3, 5]])
+    torch.testing.assert_close(second[[1, 3, 5]], second_before[[1, 3, 5]])
     assert torch.count_nonzero(first[0]) == 0
     assert torch.count_nonzero(second[0]) == 0
-    assert torch.count_nonzero(first[4:7]) == 0
-    assert torch.count_nonzero(second[4:7]) == 0
+    assert torch.count_nonzero(first[[2, 4, 6]]) == 0
+    assert torch.count_nonzero(second[[2, 4, 6]]) == 0
     assert torch.count_nonzero(first[7]) == 0
     assert torch.count_nonzero(second[7]) == 0
+
+
+def test_zero_compact_gdn_slot_clears_all_dflash_checkpoints():
+    state = torch.ones(26, 2)
+
+    _zero_compact_gdn_slot(
+        [state],
+        base_slot=1,
+        num_groups=2,
+        max_num_reqs=3,
+        state_slots_per_req=4,
+    )
+
+    expected_cleared = torch.tensor([0, 5, 6, 7, 8, 17, 18, 19, 20, 25])
+    expected_preserved = torch.tensor([1, 2, 3, 4, 9, 10, 11, 12, 13, 14, 15, 16, 21, 22, 23, 24])
+    assert torch.count_nonzero(state[expected_cleared]) == 0
+    assert torch.count_nonzero(state[expected_preserved]) == expected_preserved.numel() * 2
 
 
 def initialize_kv_cache(runner: HPUModelRunner):
@@ -95,6 +121,164 @@ def initialize_kv_cache(runner: HPUModelRunner):
 
 
 #    runner.initialize_attn_backend(kv_cache_config)
+
+
+def test_sampler_warmup_excludes_flattened_spec_decode_batch():
+    buckets = [(1, 1, 1), (8, 1, 8), (16, 1, 32)]
+
+    assert _sampler_warmup_batch_sizes(buckets, max_num_reqs=1) == [1]
+    assert _sampler_warmup_batch_sizes(buckets, max_num_reqs=8) == [1, 8]
+
+
+def test_dflash_model_warmup_uses_request_level_seed_buckets():
+    manager = SimpleNamespace(
+        seed_decode_buckets=[(1, 1, 1), (1, 1, 2)],
+        decode_buckets=[(1, 1, 1), (1, 1, 2), (8, 1, 8), (8, 1, 16)],
+    )
+
+    assert _model_warmup_decode_buckets(manager, is_dflash=True) == manager.seed_decode_buckets
+    assert _model_warmup_decode_buckets(manager, is_dflash=False) == manager.decode_buckets
+
+
+@pytest.mark.parametrize(
+    ("is_spec", "active", "padded", "lengths", "expected"),
+    [
+        (True, 1, 1, [8], True),
+        (True, 2, 2, [8, 8], True),
+        (True, 1, 2, [8, 0], False),
+        (True, 2, 2, [8, 5], False),
+        (False, 1, 1, [8], False),
+    ],
+)
+def test_full_dflash_query_block_requires_all_rows_and_tokens(
+    is_spec,
+    active,
+    padded,
+    lengths,
+    expected,
+):
+    assert _is_full_dflash_query_block(is_spec, active, padded, lengths, 8) is expected
+
+
+def test_dflash_candidate_scoring_is_regionally_compiled():
+    runner = object.__new__(HPUModelRunner)
+    runner.model = object()
+    runner.drafter = SimpleNamespace(model=object())
+    runner.speculative_config = SimpleNamespace(use_dflash=lambda: True)
+    calls = []
+    runner._compile_named_methods = lambda model, names: calls.append((model, names))
+
+    runner._compile_methods()
+
+    assert calls[1][0] is runner.drafter.model
+    assert calls[1][1] == [
+        "combine_hidden_states",
+        "precompute_and_store_context_kv",
+        "compute_candidates",
+        "prepare_dflash2_inputs",
+        "score_dflash2_candidates",
+        "select_dflash2_candidates",
+    ]
+
+
+def test_dflash_decode_all_active_returns_drafts_without_scatter():
+    from vllm_gaudi.v1.spec_decode.hpu_dflash2 import HpuDFlash2Proposer
+
+    runner = object.__new__(HPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.speculative_config = SimpleNamespace(num_speculative_tokens=7)
+    runner.input_batch = SimpleNamespace(
+        num_computed_tokens_cpu=[4, 9],
+        block_table=[SimpleNamespace(get_cpu_tensor=lambda: torch.zeros(2, 4, dtype=torch.int32))],
+    )
+
+    drafter = object.__new__(HpuDFlash2Proposer)
+    drafter.kv_cache_gid = 0
+    drafter.combine_context_hidden_states = mock.Mock(return_value=torch.zeros(2, 8))
+    drafter.make_slot_mapping = mock.Mock(return_value=torch.tensor([[1]], dtype=torch.int64))
+    drafter.store_context = mock.Mock()
+    drafts = torch.arange(14, dtype=torch.int32).reshape(2, 7)
+    drafter.propose_query_block = mock.Mock(return_value=drafts)
+    runner.drafter = drafter
+
+    actual = runner.propose_dflash2_decode(
+        sampled_token_ids=[[11], [12]],
+        hidden_states=torch.zeros(2, 8),
+        aux_hidden_states=None,
+        num_decodes=2,
+        decode_data=SimpleNamespace(
+            spec_decode_metadata=None,
+            token_ids=torch.zeros(2, 1, dtype=torch.int32),
+        ),
+    )
+
+    assert actual is drafts
+
+
+def test_dflash_device_block_table_commit_skips_unchanged_rows():
+
+    class BlockTable:
+
+        def __init__(self):
+            self.cpu = torch.tensor([[3, 5, 0], [7, 9, 0]], dtype=torch.int32)
+            self.device = torch.zeros_like(self.cpu)
+            self.commits = 0
+
+        def get_cpu_tensor(self):
+            return self.cpu
+
+        def commit_block_table(self, num_reqs):
+            self.commits += 1
+            self.device[:num_reqs].copy_(self.cpu[:num_reqs])
+
+        def get_device_tensor(self, num_reqs):
+            return self.device[:num_reqs]
+
+    table = BlockTable()
+    runner = object.__new__(HPUModelRunner)
+    runner.input_batch = SimpleNamespace(block_table=[table])
+    runner._dflash2_device_block_table_snapshots = {}
+
+    first = runner._dflash2_commit_block_table_if_changed(0, 1)
+    second = runner._dflash2_commit_block_table_if_changed(0, 1)
+
+    assert table.commits == 1
+    torch.testing.assert_close(first, table.cpu[:1])
+    assert second.data_ptr() == first.data_ptr()
+
+    table.cpu[0, 1] = 11
+    runner._dflash2_commit_block_table_if_changed(0, 1)
+    assert table.commits == 2
+    torch.testing.assert_close(table.device[:1], table.cpu[:1])
+
+    # Growing the padded batch exposes a row not covered by the snapshot and
+    # therefore requires one more commit. Shrinking again can reuse it.
+    runner._dflash2_commit_block_table_if_changed(0, 2)
+    runner._dflash2_commit_block_table_if_changed(0, 1)
+    assert table.commits == 3
+
+
+def test_dflash_device_block_table_commit_detects_replaced_table():
+    old_table = SimpleNamespace(
+        get_cpu_tensor=lambda: torch.tensor([[4, 0]], dtype=torch.int32),
+        commit_block_table=mock.Mock(),
+        get_device_tensor=lambda num_reqs: torch.tensor([[4, 0]], dtype=torch.int32)[:num_reqs],
+    )
+    new_table = SimpleNamespace(
+        get_cpu_tensor=lambda: torch.tensor([[4, 0]], dtype=torch.int32),
+        commit_block_table=mock.Mock(),
+        get_device_tensor=lambda num_reqs: torch.tensor([[4, 0]], dtype=torch.int32)[:num_reqs],
+    )
+    runner = object.__new__(HPUModelRunner)
+    runner.input_batch = SimpleNamespace(block_table=[old_table])
+    runner._dflash2_device_block_table_snapshots = {}
+
+    runner._dflash2_commit_block_table_if_changed(0, 1)
+    runner.input_batch.block_table[0] = new_table
+    runner._dflash2_commit_block_table_if_changed(0, 1)
+
+    old_table.commit_block_table.assert_called_once_with(1)
+    new_table.commit_block_table.assert_called_once_with(1)
 
 
 def get_vllm_config():
@@ -775,6 +959,7 @@ def test_direct_gdn_state_requires_group_major_request_order():
     runner._compact_gdn_group_ids = {1, 3}
     runner._compact_gdn_group_offset = {1: 0, 3: 1}
     runner._gdn_max_reqs = 4
+    runner._gdn_state_slots_per_req = 1
 
     indices = torch.zeros(4, 4, dtype=torch.int32)
     indices[1] = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
@@ -844,6 +1029,52 @@ def test_plain_greedy_fusion_is_strictly_gated(monkeypatch):
     monkeypatch.setenv("VLLM_HPU_FUSED_GREEDY_LOGITS", "false")
     runner.input_batch.logitsprocs.non_argmax_invariant.pop()
     assert not runner._can_fuse_plain_greedy_sampling(["req"])
+
+
+def test_dflash_plain_decode_loads_accepted_checkpoint_and_stores_base():
+    runner = object.__new__(HPUModelRunner)
+    runner._compact_gdn_group_ids = {0, 1}
+    runner._compact_gdn_group_offset = {0: 0, 1: 1}
+    runner._gdn_max_reqs = 4
+    runner._gdn_state_slots_per_req = 8
+    runner._gdn_req_to_base_slot = {"request-a": 1, "request-b": 3}
+    runner.input_batch = SimpleNamespace(
+        req_ids=["request-a", "request-b"],
+        block_table=SimpleNamespace(block_tables=[None, None]),
+    )
+
+    load = runner.prepare_mamba_state_idxs(
+        req_indices=[0, 1],
+        block_table_offsets=[0, 0],
+        target_bs=3,
+        checkpoint_offsets=[1, 7],
+    )
+    store = runner.prepare_mamba_state_idxs(
+        req_indices=[0, 1],
+        block_table_offsets=[0, 0],
+        target_bs=3,
+    )
+
+    torch.testing.assert_close(
+        load,
+        torch.tensor(
+            [
+                [10, 32, -1],
+                [42, 64, -1],
+            ],
+            dtype=torch.int32,
+        ),
+    )
+    torch.testing.assert_close(
+        store,
+        torch.tensor(
+            [
+                [9, 25, -1],
+                [41, 57, -1],
+            ],
+            dtype=torch.int32,
+        ),
+    )
 
 
 def test_max_cudagraph_capture_size_defaults_to_max_num_batched_tokens(model_runner):

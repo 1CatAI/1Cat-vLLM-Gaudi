@@ -82,6 +82,7 @@ def get_experimental_flags():
         Env('VLLM_DEFRAG_WITH_GRAPHS', boolean),
         Env('VLLM_DEBUG', list_of(str), check=for_all(choice('steps', 'defrag', 'fwd'))),
         Env('VLLM_HPU_FLASHINFER_GDN', boolean),
+        Env('VLLM_HPU_FLASHINFER_DFLASH2', boolean),
         Env('VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE', boolean),
         Env('VLLM_HPU_FLASHINFER_GDN_PREFILL', boolean),
         Env('VLLM_HPU_GDN_DIRECT_STATE', boolean),
@@ -90,6 +91,9 @@ def get_experimental_flags():
         Env('VLLM_HPU_FUSED_GREEDY_LOGITS', boolean),
         Env('FLASHINFER_GAUDI_BACKEND', str),
         Env('FLASHINFER_GAUDI_STATE_DTYPE', str),
+        Env('FLASHINFER_GAUDI_ENABLE_PUBLIC_AUTO', boolean),
+        Env('FLASHINFER_GAUDI_ENABLE_MTP_AUTO', boolean),
+        Env('FLASHINFER_GAUDI_ENABLE_BRIDGE_AUTO', boolean),
     ]
     return to_dict(flags)
 
