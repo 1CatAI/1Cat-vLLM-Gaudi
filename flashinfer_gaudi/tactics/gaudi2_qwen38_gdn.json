@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 4,
   "device": "gaudi2",
   "operation": "gdn_decode_packed",
   "model_shape": {
@@ -15,6 +15,14 @@
   "stable_default": "pytorch",
   "public_native_promoted": false,
   "public_native_status": "correctness_passed_performance_gate_pending",
+  "public_mtp_native_promoted": false,
+  "public_mtp_native_status": "b1_reference_b2plus_native_candidate_e2e_pending",
+  "dflash2_select_path_native_promoted": false,
+  "dflash2_select_path_native_status": "static_build_passed_hardware_qualification_pending",
+  "dflash2_top_k_promoted": false,
+  "dflash2_top_k_status": "vendor_cguid_available_hardware_qualification_pending",
+  "dflash2_score_select_native_promoted": false,
+  "dflash2_score_select_native_status": "static_build_passed_hardware_qualification_pending",
   "bridge_native_promoted": false,
   "gdn_fused_decode": {
     "promoted": true,

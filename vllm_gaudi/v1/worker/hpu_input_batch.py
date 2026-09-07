@@ -17,7 +17,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.worker.block_table import MultiGroupBlockTable
+from vllm.v1.worker.block_table import MultiGroupBlockTable, SlotMappingMode
 from vllm.v1.sample.logits_processor import (BatchUpdateBuilder, LogitsProcessors)
 
 from vllm_gaudi.utils import async_h2d_copy, async_h2d_update
@@ -75,6 +75,8 @@ class InputBatch:
         vocab_size: int,
         block_sizes: list[int],  # The block_size of each kv cache group
         kernel_block_sizes: list[int],
+        max_num_blocks_per_req: Optional[list[int]] = None,
+        slot_mapping_modes: Optional[list[SlotMappingMode]] = None,
         logitsprocs: Optional[LogitsProcessors] = None,
         is_spec_decode: bool = False,
         is_pooling_model: bool = False,
@@ -119,14 +121,16 @@ class InputBatch:
         # requires the caller to pass the per-group block count. HPU does not
         # use DCP (cp_world_size == 1), so max_num_blocks reduces to
         # cdiv(max_model_len, block_size) per KV cache group.
-        max_num_blocks = [cdiv(max_model_len, block_size) for block_size in block_sizes]
+        max_num_blocks = (max_num_blocks_per_req if max_num_blocks_per_req is not None else
+                          [cdiv(max_model_len, block_size) for block_size in block_sizes])
         self.block_table = MultiGroupBlockTable(max_num_reqs=max_num_reqs,
                                                 max_num_batched_tokens=max_num_batched_tokens,
                                                 pin_memory=pin_memory,
                                                 device=device,
                                                 block_sizes=block_sizes,
                                                 kernel_block_sizes=kernel_block_sizes,
-                                                max_num_blocks=max_num_blocks)
+                                                max_num_blocks=max_num_blocks,
+                                                slot_mapping_modes=slot_mapping_modes)
 
         # Sampling-related.
         self.temperature = torch.empty((max_num_reqs, ), dtype=torch.float32, device=device)

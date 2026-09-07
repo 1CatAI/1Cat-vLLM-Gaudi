@@ -14,14 +14,21 @@ import torch.nn.functional as F
 
 from flashinfer_gaudi import clear_backend_policy_override, set_backend_policy
 from flashinfer_gaudi import _native
-from flashinfer_gaudi._reference import packed_recurrent_decode, qwen38_fused_decode_step_direct
+from flashinfer_gaudi._reference import (
+    _l2_normalize_rsqrt,
+    packed_recurrent_decode,
+    qwen38_fused_decode_step_direct,
+    recurrent_decode_from_qkv,
+)
 from flashinfer_gaudi.gdn_decode import (
     BackendUnavailableError,
     _call_native_packed,
     gated_delta_rule_decode,
-    gated_delta_rule_mtp,
     gated_delta_rule_decode_packed,
     gated_delta_rule_decode_pretranspose,
+    gated_delta_rule_mtp,
+    gated_delta_rule_mtp_packed,
+    gated_delta_rule_mtp_rollback,
 )
 from flashinfer_gaudi.gdn_fused_decode import gdn_fused_decode_step, gdn_fused_decode_step_supported
 from flashinfer_gaudi.gdn_prefill import chunk_gated_delta_rule
@@ -52,10 +59,23 @@ def _inputs(batch=2, q_heads=2, value_heads=4, dim=8, slots=6):
     return q, k, v, state, log_decay, beta
 
 
+def _qwen38_mtp_native_inputs(batch=1, value_heads=48):
+    tokens = 8
+    packed = torch.zeros(batch, tokens, 10240, dtype=torch.bfloat16)
+    log_decay = torch.zeros(batch, tokens, value_heads, dtype=torch.float32)
+    beta = torch.zeros(batch, tokens, value_heads, dtype=torch.bfloat16)
+    state = torch.zeros(1, value_heads, 128, 128, dtype=torch.float32)
+    state_indices = torch.zeros(batch, tokens, dtype=torch.int32)
+    accepted = torch.ones(batch, dtype=torch.int32)
+    query_lengths = torch.full((batch, ), tokens, dtype=torch.int32)
+    return packed, log_decay, beta, state, state_indices, accepted, query_lengths
+
+
 def _naive_step(q, k, v, state, log_decay, beta):
     repeat = v.shape[2] // q.shape[2]
-    q = F.normalize(q.float(), dim=-1, eps=1e-6).repeat_interleave(repeat, dim=2)
-    k = F.normalize(k.float(), dim=-1, eps=1e-6).repeat_interleave(repeat, dim=2)
+    q, k = q.float(), k.float()
+    q = (q / torch.sqrt((q * q).sum(dim=-1, keepdim=True) + 1e-6)).repeat_interleave(repeat, dim=2)
+    k = (k / torch.sqrt((k * k).sum(dim=-1, keepdim=True) + 1e-6)).repeat_interleave(repeat, dim=2)
     scale = q.shape[-1]**-0.5
     decayed = state * torch.exp(log_decay[:, 0]).unsqueeze(-1).unsqueeze(-1)
     projection = torch.matmul(decayed, k[:, 0].unsqueeze(-1)).squeeze(-1)
@@ -63,6 +83,49 @@ def _naive_step(q, k, v, state, log_decay, beta):
     updated = decayed + delta.unsqueeze(-1) * k[:, 0].unsqueeze(-2)
     output = torch.matmul(updated, (q[:, 0] * scale).unsqueeze(-1)).squeeze(-1)
     return output, updated
+
+
+@pytest.mark.parametrize("magnitude", [0.0, 1e-6, 1e-4, 0.1, 1.0])
+def test_gdn_normalization_adds_epsilon_to_squared_norm(magnitude):
+    value = torch.tensor([[1.0, -2.0, 3.0, -4.0]], dtype=torch.float32) * magnitude
+    expected = value / torch.sqrt(torch.sum(value.square(), dim=-1, keepdim=True) + 1e-6)
+    actual = _l2_normalize_rsqrt(value)
+    torch.testing.assert_close(actual, expected, rtol=2e-7, atol=1e-8)
+    if 0 < magnitude <= 1e-4:
+        assert not torch.allclose(actual, F.normalize(value, dim=-1, eps=1e-6))
+
+
+@pytest.mark.parametrize("magnitude", [0.0, 1e-4, 0.1])
+def test_dflash_verify_small_qk_preserves_every_accepted_state(magnitude):
+    generator = torch.Generator().manual_seed(517)
+    q = torch.randn(1, 8, 2, 8, generator=generator) * magnitude
+    k = torch.randn(1, 8, 2, 8, generator=generator) * magnitude
+    v = torch.randn(1, 8, 4, 8, generator=generator) * 0.1
+    g = -torch.rand(1, 8, 4, generator=generator) * 0.1
+    beta = torch.rand(1, 8, 4, generator=generator)
+    pool = torch.randn(10, 4, 8, 8, generator=generator) * 0.01
+    expected_pool = pool.clone()
+    packed = torch.cat((q.flatten(2), k.flatten(2), v.flatten(2)), dim=-1)
+    indices = torch.tensor([[8, 2, 4, 6, 1, 7, 3, 5]], dtype=torch.int32)
+    lengths = torch.tensor([8], dtype=torch.int32)
+    for accepted in range(1, 9):
+        state = expected_pool[indices[0, accepted - 1]:indices[0, accepted - 1] + 1].clone()
+        outputs = []
+        for token in range(8):
+            output, state = _naive_step(q[:, token:token + 1], k[:, token:token + 1], v[:, token:token + 1], state,
+                                        g[:, token:token + 1], beta[:, token:token + 1])
+            expected_pool[indices[0, token]] = state[0]
+            outputs.append(output)
+        actual, _ = gated_delta_rule_mtp_packed(packed,
+                                                g,
+                                                beta,
+                                                pool,
+                                                indices,
+                                                torch.tensor([accepted], dtype=torch.int32),
+                                                lengths,
+                                                assume_full_query=True)
+        torch.testing.assert_close(actual, torch.stack(outputs, dim=1), rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(pool, expected_pool, rtol=1e-5, atol=1e-6)
 
 
 def test_prefill_signature_tracks_flashinfer_contract():
@@ -364,6 +427,433 @@ def test_mtp_tracks_intermediate_and_distinct_final_state():
     assert not torch.equal(intermediate[:, 0], intermediate[:, -1])
 
 
+def test_mtp_rollback_selects_checkpoint_and_masks_bucket_padding():
+    generator = torch.Generator().manual_seed(211)
+    batch, tokens, q_heads, value_heads, dim = 2, 3, 2, 4, 8
+    q = torch.randn(batch, tokens, q_heads, dim, generator=generator)
+    k = torch.randn(batch, tokens, q_heads, dim, generator=generator)
+    v = torch.randn(batch, tokens, value_heads, dim, generator=generator)
+    pool = torch.randn(8, value_heads, dim, dim, generator=generator)
+    original = pool.clone()
+    log_decay = -torch.rand(batch, tokens, value_heads, generator=generator)
+    beta = torch.sigmoid(torch.randn(batch, tokens, value_heads, generator=generator))
+    state_indices = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
+    accepted = torch.tensor([1, 2], dtype=torch.int32)
+    token_mask = torch.tensor([[True, True, True], [True, False, False]])
+
+    expected_outputs = torch.zeros(batch, tokens, value_heads, dim)
+    expected_checkpoints: dict[int, torch.Tensor] = {}
+    for row, initial_slot in enumerate((1, 5)):
+        state = original[initial_slot:initial_slot + 1]
+        for token in range(tokens):
+            if not token_mask[row, token]:
+                continue
+            output, state = _naive_step(
+                q[row:row + 1, token:token + 1],
+                k[row:row + 1, token:token + 1],
+                v[row:row + 1, token:token + 1],
+                state,
+                log_decay[row:row + 1, token:token + 1],
+                beta[row:row + 1, token:token + 1],
+            )
+            expected_outputs[row, token] = output[0]
+            expected_checkpoints[int(state_indices[row, token])] = state[0]
+
+    output, returned_pool = gated_delta_rule_mtp_rollback(
+        q,
+        k,
+        v,
+        pool,
+        state_indices,
+        accepted,
+        log_decay,
+        beta,
+        token_mask,
+    )
+
+    assert returned_pool is pool
+    torch.testing.assert_close(output, expected_outputs)
+    for slot, expected in expected_checkpoints.items():
+        torch.testing.assert_close(pool[slot], expected)
+    torch.testing.assert_close(pool[5], original[5])
+    torch.testing.assert_close(pool[6], original[6])
+    torch.testing.assert_close(pool[0], original[0])
+
+
+def test_mtp_rollback_matches_committed_state_across_multiple_rounds():
+    generator = torch.Generator().manual_seed(219)
+    batch, tokens, q_heads, value_heads, dim = 1, 4, 2, 4, 8
+    pool = torch.zeros(tokens + 1, value_heads, dim, dim)
+    pool[1] = torch.randn(value_heads, dim, dim, generator=generator)
+    state_indices = torch.arange(1, tokens + 1, dtype=torch.int32).view(1, tokens)
+    committed_state = pool[1:2].clone()
+    previous_accepted = 1
+
+    for current_accepted in (3, 1, 4, 2):
+        q = torch.randn(batch, tokens, q_heads, dim, generator=generator)
+        k = torch.randn(batch, tokens, q_heads, dim, generator=generator)
+        v = torch.randn(batch, tokens, value_heads, dim, generator=generator)
+        log_decay = -torch.rand(batch, tokens, value_heads, generator=generator)
+        beta = torch.sigmoid(torch.randn(batch, tokens, value_heads, generator=generator))
+
+        expected_state = committed_state.clone()
+        expected_output, _ = recurrent_decode_from_qkv(
+            q,
+            k,
+            v,
+            log_decay,
+            beta,
+            expected_state,
+            direct_state=True,
+        )
+        actual_output, _ = gated_delta_rule_mtp_rollback(
+            q,
+            k,
+            v,
+            pool,
+            state_indices,
+            torch.tensor([previous_accepted], dtype=torch.int32),
+            log_decay,
+            beta,
+        )
+        torch.testing.assert_close(actual_output, expected_output)
+
+        committed_state = committed_state.clone()
+        recurrent_decode_from_qkv(
+            q[:, :current_accepted],
+            k[:, :current_accepted],
+            v[:, :current_accepted],
+            log_decay[:, :current_accepted],
+            beta[:, :current_accepted],
+            committed_state,
+            direct_state=True,
+        )
+        torch.testing.assert_close(
+            pool[state_indices[0, current_accepted - 1]],
+            committed_state[0],
+        )
+        previous_accepted = current_accepted
+
+
+def test_packed_mtp_fallback_matches_rollback_api():
+    generator = torch.Generator().manual_seed(223)
+    batch, tokens, q_heads, value_heads, dim = 2, 3, 2, 4, 8
+    q = torch.randn(batch, tokens, q_heads, dim, generator=generator)
+    k = torch.randn(batch, tokens, q_heads, dim, generator=generator)
+    v = torch.randn(batch, tokens, value_heads, dim, generator=generator)
+    packed = torch.cat(
+        (q.flatten(2), k.flatten(2), v.flatten(2)),
+        dim=-1,
+    )
+    expected_pool = torch.randn(8, value_heads, dim, dim, generator=generator)
+    actual_pool = expected_pool.clone()
+    state_indices = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
+    accepted = torch.tensor([1, 2], dtype=torch.int32)
+    query_lengths = torch.tensor([3, 1], dtype=torch.int32)
+    log_decay = -torch.rand(batch, tokens, value_heads, generator=generator)
+    beta = torch.sigmoid(torch.randn(batch, tokens, value_heads, generator=generator))
+    token_mask = torch.arange(tokens).unsqueeze(0) < query_lengths.unsqueeze(1)
+
+    expected, _ = gated_delta_rule_mtp_rollback(
+        q,
+        k,
+        v,
+        expected_pool,
+        state_indices,
+        accepted,
+        log_decay,
+        beta,
+        token_mask,
+    )
+    actual, returned_pool = gated_delta_rule_mtp_packed(
+        packed,
+        log_decay,
+        beta,
+        actual_pool,
+        state_indices,
+        accepted,
+        query_lengths,
+    )
+
+    assert returned_pool is actual_pool
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_pool, expected_pool)
+
+
+def test_packed_mtp_full_query_fast_path_is_exact():
+    generator = torch.Generator().manual_seed(227)
+    batch, tokens, q_heads, value_heads, dim = 2, 3, 2, 4, 8
+    q = torch.randn(batch, tokens, q_heads, dim, generator=generator)
+    k = torch.randn(batch, tokens, q_heads, dim, generator=generator)
+    v = torch.randn(batch, tokens, value_heads, dim, generator=generator)
+    packed = torch.cat((q.flatten(2), k.flatten(2), v.flatten(2)), dim=-1)
+    reference_pool = torch.randn(8, value_heads, dim, dim, generator=generator)
+    fast_pool = reference_pool.clone()
+    state_indices = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
+    accepted = torch.tensor([1, 2], dtype=torch.int32)
+    query_lengths = torch.full((batch, ), tokens, dtype=torch.int32)
+    log_decay = -torch.rand(batch, tokens, value_heads, generator=generator)
+    beta = torch.sigmoid(torch.randn(batch, tokens, value_heads, generator=generator))
+
+    reference, _ = gated_delta_rule_mtp_packed(
+        packed,
+        log_decay,
+        beta,
+        reference_pool,
+        state_indices,
+        accepted,
+        query_lengths,
+    )
+    fast, returned_pool = gated_delta_rule_mtp_packed(
+        packed,
+        log_decay,
+        beta,
+        fast_pool,
+        state_indices,
+        accepted,
+        query_lengths,
+        assume_full_query=True,
+    )
+
+    assert returned_pool is fast_pool
+    torch.testing.assert_close(fast, reference, rtol=0, atol=0)
+    torch.testing.assert_close(fast_pool, reference_pool, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("use_qk_l2norm", [False, True])
+@pytest.mark.parametrize("scale", [None, 0.25])
+def test_full_query_preparation_preserves_every_rollback_checkpoint(batch, use_qk_l2norm, scale):
+    generator = torch.Generator().manual_seed(331)
+    tokens, q_heads, value_heads, dim = 8, 2, 6, 8
+    q = torch.randn(batch, tokens, q_heads, dim, generator=generator)
+    k = torch.randn(batch, tokens, q_heads, dim, generator=generator)
+    v = torch.randn(batch, tokens, value_heads, dim, generator=generator)
+    packed = torch.cat((q.flatten(2), k.flatten(2), v.flatten(2)), dim=-1)
+    # Leave guard rows untouched and use non-contiguous slot ownership.
+    indices = (torch.randperm(batch * tokens, generator=generator) + 1).to(torch.int32).reshape(batch, tokens)
+    reference_pool = torch.randn(batch * tokens + 2, value_heads, dim, dim, generator=generator)
+    fast_pool = reference_pool.clone()
+    query_lengths = torch.full((batch, ), tokens, dtype=torch.int32)
+    log_decay = -torch.rand(batch, tokens, value_heads, generator=generator)
+    beta = torch.sigmoid(torch.randn(batch, tokens, value_heads, generator=generator))
+
+    for checkpoint in range(1, tokens + 1):
+        accepted = torch.full((batch, ), checkpoint, dtype=torch.int32)
+        expected, _ = gated_delta_rule_mtp_packed(
+            packed,
+            log_decay,
+            beta,
+            reference_pool,
+            indices,
+            accepted,
+            query_lengths,
+            scale=scale,
+            use_qk_l2norm=use_qk_l2norm,
+        )
+        actual, returned_pool = gated_delta_rule_mtp_packed(
+            packed,
+            log_decay,
+            beta,
+            fast_pool,
+            indices,
+            accepted,
+            query_lengths,
+            scale=scale,
+            use_qk_l2norm=use_qk_l2norm,
+            assume_full_query=True,
+        )
+        assert returned_pool is fast_pool
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(fast_pool, reference_pool, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("policy,compiling,batch,full_query,selected", [
+    ("auto", True, 1, True, True),
+    ("pytorch", True, 1, True, False),
+    ("auto", False, 1, True, False),
+    ("auto", True, 2, True, False),
+    ("auto", True, 1, False, False),
+])
+def test_prepared_mtp_opt_in_is_scoped(policy, compiling, batch, full_query, selected):
+    inputs = _qwen38_mtp_native_inputs(batch=batch)
+    sentinel = torch.zeros(batch, 8, 48, 128, dtype=torch.bfloat16)
+    prepared = mock.Mock(return_value=(sentinel, inputs[3]))
+    reference = mock.Mock(return_value=(sentinel, inputs[3]))
+    with (
+            mock.patch("flashinfer_gaudi.gdn_decode.get_backend_policy", return_value=policy),
+            mock.patch("flashinfer_gaudi.gdn_decode.mtp_prepared_enabled", return_value=True),
+            mock.patch("flashinfer_gaudi.gdn_decode._device_is_hpu", return_value=True),
+            mock.patch("torch.compiler.is_compiling", return_value=compiling),
+            mock.patch("flashinfer_gaudi.gdn_decode.public_mtp_gdn_auto_promoted", return_value=False),
+            mock.patch("flashinfer_gaudi.gdn_decode._gated_delta_rule_mtp_prepared", prepared),
+            mock.patch("flashinfer_gaudi.gdn_decode._gated_delta_rule_mtp_packed_reference", reference),
+    ):
+        output, pool = gated_delta_rule_mtp_packed(*inputs, assume_full_query=full_query)
+    assert output is sentinel and pool is inputs[3]
+    assert prepared.call_count == int(selected)
+    assert reference.call_count == int(not selected)
+
+
+def test_prepared_mtp_missing_extension_does_not_mutate_state():
+    from flashinfer_gaudi.gdn_decode import _gated_delta_rule_mtp_prepared
+    inputs = _qwen38_mtp_native_inputs()
+    before = inputs[3].clone()
+    with (
+            mock.patch("flashinfer_gaudi.gdn_decode.public_mtp_prepared_op", return_value=None),
+            pytest.raises(BackendUnavailableError, match="prepared MTP"),
+    ):
+        _gated_delta_rule_mtp_prepared(*inputs[:-1])
+    torch.testing.assert_close(inputs[3], before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("distinct", [False, True])
+def test_prepared_mtp_preserves_checkpoint_write_ownership(distinct):
+    from flashinfer_gaudi.gdn_decode import _gated_delta_rule_mtp_prepared
+    inputs = list(_qwen38_mtp_native_inputs())
+    inputs[3] = torch.full((10, 48, 128, 128), -1.0)
+    inputs[4] = (torch.arange(1, 9, dtype=torch.int32).reshape(1, 8)
+                 if distinct else torch.ones(1, 8, dtype=torch.int32))
+    checkpoints = torch.arange(1, 9, dtype=torch.float32).reshape(1, 8, 1, 1, 1).expand(1, 8, 48, 128, 128)
+    native = mock.Mock(return_value=(torch.zeros(1, 8, 48, 128), checkpoints))
+    with mock.patch("flashinfer_gaudi.gdn_decode.public_mtp_prepared_op", return_value=native):
+        _, returned_pool = _gated_delta_rule_mtp_prepared(*inputs[:-1], assume_distinct_checkpoints=distinct)
+    assert returned_pool is inputs[3]
+    assert torch.all(returned_pool[0] == -1) and torch.all(returned_pool[-1] == -1)
+    if distinct:
+        torch.testing.assert_close(returned_pool[1:9], checkpoints[0], rtol=0, atol=0)
+    else:
+        assert torch.all(returned_pool[1] == 8)
+        assert torch.all(returned_pool[2:] == -1)
+
+
+@pytest.mark.parametrize("start", [1, 9])
+def test_prepared_direct_checkpoints_preserve_accepted_load_and_guard_rows(start):
+    from flashinfer_gaudi.gdn_decode import _gated_delta_rule_mtp_prepared
+    inputs = list(_qwen38_mtp_native_inputs())
+    inputs[3] = torch.arange(18, dtype=torch.float32).reshape(18, 1, 1, 1).expand(18, 48, 128, 128).clone()
+    before = inputs[3].clone()
+    inputs[4] = torch.arange(start, start + 8, dtype=torch.int32).reshape(1, 8)
+    inputs[5].fill_(4)
+    checkpoints = torch.arange(101, 109, dtype=torch.float32).reshape(1, 8, 1, 1, 1).expand(1, 8, 48, 128, 128)
+    native = mock.Mock(return_value=(torch.zeros(1, 8, 48, 128), checkpoints))
+    with mock.patch("flashinfer_gaudi.gdn_decode.public_mtp_prepared_op", return_value=native):
+        _, pool = _gated_delta_rule_mtp_prepared(*inputs[:-1], assume_distinct_checkpoints=True, checkpoint_start=start)
+    assert pool is inputs[3]
+    torch.testing.assert_close(native.call_args.args[0], before[start + 3:start + 4], rtol=0, atol=0)
+    torch.testing.assert_close(pool[start:start + 8], checkpoints[0], rtol=0, atol=0)
+    torch.testing.assert_close(pool[:start], before[:start], rtol=0, atol=0)
+    torch.testing.assert_close(pool[start + 8:], before[start + 8:], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("start,distinct", [(0, True), (-1, True), (3, True), (1, False)])
+def test_prepared_direct_checkpoints_reject_invalid_static_destination_before_native_call(start, distinct):
+    from flashinfer_gaudi.gdn_decode import _gated_delta_rule_mtp_prepared
+    inputs = list(_qwen38_mtp_native_inputs())
+    inputs[3] = torch.zeros(10, 48, 128, 128)
+    before = inputs[3].clone()
+    native = mock.Mock()
+    with (mock.patch("flashinfer_gaudi.gdn_decode.public_mtp_prepared_op",
+                     return_value=native), pytest.raises(ValueError, match="caller-proven")):
+        _gated_delta_rule_mtp_prepared(*inputs[:-1], assume_distinct_checkpoints=distinct, checkpoint_start=start)
+    native.assert_not_called()
+    torch.testing.assert_close(inputs[3], before, rtol=0, atol=0)
+
+
+def test_mtp_auto_does_not_dispatch_unpromoted_native_kernel():
+    inputs = _qwen38_mtp_native_inputs()
+    sentinel = torch.zeros(1, 8, 48, 128, dtype=torch.bfloat16)
+    native = mock.Mock(return_value=sentinel)
+    fallback = mock.Mock(return_value=(sentinel, inputs[3]))
+
+    with (
+            mock.patch("flashinfer_gaudi.gdn_decode._device_is_hpu", return_value=True),
+            mock.patch("flashinfer_gaudi.gdn_decode.public_mtp_gdn_auto_promoted", return_value=False),
+            mock.patch("flashinfer_gaudi.gdn_decode.public_mtp_gdn_op", return_value=native),
+            mock.patch("flashinfer_gaudi.gdn_decode.gated_delta_rule_mtp_rollback", fallback),
+    ):
+        output, returned_pool = gated_delta_rule_mtp_packed(*inputs)
+
+    assert output is sentinel
+    assert returned_pool is inputs[3]
+    native.assert_not_called()
+    fallback.assert_called_once()
+
+
+def test_mtp_auto_dispatches_only_after_independent_promotion():
+    inputs = _qwen38_mtp_native_inputs(batch=2)
+    sentinel = torch.zeros(2, 8, 48, 128, dtype=torch.bfloat16)
+    native = mock.Mock(return_value=sentinel)
+
+    with (
+            mock.patch("flashinfer_gaudi.gdn_decode._device_is_hpu", return_value=True),
+            mock.patch("flashinfer_gaudi.gdn_decode.public_mtp_gdn_auto_promoted", return_value=True),
+            mock.patch("flashinfer_gaudi.gdn_decode.public_mtp_gdn_op", return_value=native),
+    ):
+        output, returned_pool = gated_delta_rule_mtp_packed(*inputs)
+
+    assert output is sentinel
+    assert returned_pool is inputs[3]
+    native.assert_called_once()
+    assert native.call_args.args[2].dtype == torch.float32
+
+
+def test_mtp_auto_keeps_single_request_on_reference_after_promotion():
+    inputs = _qwen38_mtp_native_inputs()
+    sentinel = torch.zeros(1, 8, 48, 128, dtype=torch.bfloat16)
+    native = mock.Mock(return_value=sentinel)
+    fallback = mock.Mock(return_value=(sentinel, inputs[3]))
+
+    with (
+            mock.patch("flashinfer_gaudi.gdn_decode._device_is_hpu", return_value=True),
+            mock.patch("flashinfer_gaudi.gdn_decode.public_mtp_gdn_auto_promoted", return_value=True),
+            mock.patch("flashinfer_gaudi.gdn_decode.public_mtp_gdn_op", return_value=native),
+            mock.patch("flashinfer_gaudi.gdn_decode.gated_delta_rule_mtp_rollback", fallback),
+    ):
+        output, returned_pool = gated_delta_rule_mtp_packed(*inputs)
+
+    assert output is sentinel
+    assert returned_pool is inputs[3]
+    native.assert_not_called()
+    fallback.assert_called_once()
+
+
+def test_mtp_auto_keeps_compiled_model_on_reference_after_promotion():
+    inputs = _qwen38_mtp_native_inputs(batch=2)
+    sentinel = torch.zeros(2, 8, 48, 128, dtype=torch.bfloat16)
+    native = mock.Mock(return_value=sentinel)
+    fallback = mock.Mock(return_value=(sentinel, inputs[3]))
+
+    with (
+            mock.patch("flashinfer_gaudi.gdn_decode._device_is_hpu", return_value=True),
+            mock.patch("flashinfer_gaudi.gdn_decode.public_mtp_gdn_auto_promoted", return_value=True),
+            mock.patch("flashinfer_gaudi.gdn_decode.public_mtp_gdn_op", return_value=native),
+            mock.patch("flashinfer_gaudi.gdn_decode.gated_delta_rule_mtp_rollback", fallback),
+            mock.patch("torch.compiler.is_compiling", return_value=True),
+    ):
+        output, returned_pool = gated_delta_rule_mtp_packed(*inputs)
+
+    assert output is sentinel
+    assert returned_pool is inputs[3]
+    native.assert_not_called()
+    fallback.assert_called_once()
+
+
+def test_forced_mtp_native_rejects_non_qwen38_head_shape():
+    inputs = _qwen38_mtp_native_inputs(value_heads=47)
+    native = mock.Mock()
+    set_backend_policy("public")
+
+    with (
+            mock.patch("flashinfer_gaudi.gdn_decode._device_is_hpu", return_value=True),
+            mock.patch("flashinfer_gaudi.gdn_decode.public_mtp_gdn_op", return_value=native),
+            pytest.raises(BackendUnavailableError, match="unavailable for this runtime or shape"),
+    ):
+        gated_delta_rule_mtp_packed(*inputs)
+
+    native.assert_not_called()
+
+
 def test_grouped_qk_reference_preserves_update_order():
     q, k, v, pool, log_decay, beta = _inputs()
     indices = torch.tensor([4, 1])
@@ -419,6 +909,32 @@ def test_negative_padding_does_not_mutate_any_slot():
     torch.testing.assert_close(pool[0], original[0])
     unchanged = torch.tensor([0, 1, 2, 4, 5])
     torch.testing.assert_close(pool.index_select(0, unchanged), original.index_select(0, unchanged))
+
+
+def test_padding_write_cannot_clobber_live_slot_zero():
+    q, k, v, pool, log_decay, beta = _inputs()
+    original = pool.clone()
+    expected_output, expected_state = _naive_step(
+        q[:1],
+        k[:1],
+        v[:1],
+        original[:1],
+        log_decay[:1],
+        beta[:1],
+    )
+    packed = torch.cat((q.reshape(2, -1), k.reshape(2, -1), v.reshape(2, -1)), dim=-1)
+    output, _ = gated_delta_rule_decode_packed(
+        packed,
+        log_decay,
+        beta,
+        pool,
+        torch.tensor([0, -1]),
+        torch.tensor([0, -1]),
+    )
+
+    torch.testing.assert_close(output[0], expected_output[0])
+    torch.testing.assert_close(output[1], torch.zeros_like(output[1]))
+    torch.testing.assert_close(pool[0], expected_state[0])
 
 
 def test_duplicate_output_indices_are_rejected_before_update():
@@ -813,6 +1329,41 @@ def test_vllm_adapter_auto_skips_indexed_reference():
 
     assert result is None
     torch.testing.assert_close(pool, original)
+
+
+def test_vllm_adapter_allows_indexed_reference_for_dflash_transition():
+    q, k, v, pool, log_decay, beta = _inputs(batch=1)
+    packed = torch.cat((q.reshape(1, -1), k.reshape(1, -1), v.reshape(1, -1)), dim=-1)
+    load = torch.tensor([2], dtype=torch.int32)
+    store = torch.tensor([5], dtype=torch.int32)
+    expected_pool = pool.clone()
+    expected, _ = gated_delta_rule_decode_packed(
+        packed,
+        log_decay,
+        beta,
+        expected_pool,
+        load,
+        store,
+    )
+
+    with mock.patch.dict(os.environ, {"VLLM_HPU_FLASHINFER_GDN": "1"}), \
+            mock.patch("vllm_gaudi.ops.flashinfer_gaudi_adapter._BACKEND_POLICY", "auto"), \
+            mock.patch("vllm_gaudi.ops.flashinfer_gaudi_adapter._PUBLIC_AUTO_PROMOTED", False), \
+            mock.patch("vllm_gaudi.ops.flashinfer_gaudi_adapter._BRIDGE_AUTO_ENABLED", False):
+        result = maybe_run_gdn_decode_packed(
+            mixed_qkv=packed,
+            log_decay=log_decay,
+            beta=beta,
+            state_pool=pool,
+            load_state_indices=load,
+            store_state_indices=store,
+            use_qk_l2norm=True,
+            allow_indexed_reference=True,
+        )
+
+    assert result is not None
+    torch.testing.assert_close(result[0], expected.unsqueeze(0))
+    torch.testing.assert_close(pool, expected_pool)
 
 
 def test_vllm_prefill_adapter_selects_promoted_qwen38_tactic():

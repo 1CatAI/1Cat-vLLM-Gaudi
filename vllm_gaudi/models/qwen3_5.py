@@ -1,8 +1,10 @@
 import os
 
 import torch
+from flashinfer_gaudi.gdn_decode import gated_delta_rule_mtp_packed
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention
 from vllm.forward_context import get_forward_context
+from vllm_gaudi import envs
 
 import vllm_gaudi.envs as gaudi_envs
 from vllm_gaudi.ops.causal_conv1d_pytorch import (
@@ -151,6 +153,8 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self.cache_group_idx = None
         self.compact_state_group_offset = None
         self.compact_state_group_count = None
+        self.dflash_conv_round_before_activation = envs.VLLM_HPU_DFLASH2_CONV_ROUND_BEFORE_ACTIVATION
+        self.dflash_full_query_conv = envs.VLLM_HPU_DFLASH2_FULL_QUERY_CONV
 
         self.mamba_chunk_size, _ = resolve_hpu_gdn_chunk_size(self.model_config)
         self.gdn_fused_state_matmul = resolve_hpu_gdn_fused_state_matmul()
@@ -260,15 +264,17 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
-            return (False, None, None, None, None, None, None, None, 0, 0, 0, 0, None, False)
+            return (False, None, None, None, None, None, None, None, 0, 0, 0, 0, None, False, None, False)
 
         is_prompt = bool(getattr(attn_metadata, "is_prompt", False))
         load_state_indices = self._resolve_state_indices(attn_metadata, "load_indices_tensor")
         store_state_indices = self._resolve_state_indices(attn_metadata, "store_indices_tensor")
-        if not getattr(self.cache_config, "enable_prefix_caching", False):
+        num_accepted_tokens = getattr(attn_metadata, "num_accepted_tokens", None)
+        if not getattr(self.cache_config, "enable_prefix_caching", False) and num_accepted_tokens is None:
             # The scheduler constructs equivalent load/store tensors in this
-            # mode. Preserve object identity so single-index native kernels
-            # can be selected without a device-side equality synchronization.
+            # ordinary decode mode. A DFlash T1 transition instead reads the
+            # accepted checkpoint and commits to the canonical base slot.
+            # Preserve identity only when those destinations are equivalent.
             store_state_indices = load_state_indices
         elif store_state_indices is None:
             store_state_indices = load_state_indices
@@ -280,10 +286,11 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         has_initial_state = getattr(attn_metadata, "has_initial_states_p", None)
         padding_mask_flat = getattr(attn_metadata, "padding_mask_flat", None)
         direct_gdn_state = bool(getattr(attn_metadata, "direct_gdn_state", False))
+        dflash_full_query = bool(getattr(attn_metadata, "dflash_full_query", False))
 
         if not is_prompt:
-            num_decodes = (load_state_indices.numel() if load_state_indices is not None else
-                           (query_start_loc.numel() - 1 if query_start_loc is not None else num_tokens))
+            num_decodes = (query_start_loc.numel() - 1 if query_start_loc is not None else
+                           (load_state_indices.shape[0] if load_state_indices is not None else num_tokens))
         else:
             num_decodes = 0
 
@@ -317,7 +324,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         return (is_prompt, conv_state, ssm_state, load_state_indices, store_state_indices, query_start_loc,
                 has_initial_state, padding_mask_flat, num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len,
-                initial_state, direct_gdn_state)
+                initial_state, direct_gdn_state, num_accepted_tokens, dflash_full_query)
 
     def forward(
         self,
@@ -340,7 +347,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # === Metadata extraction (natural graph break) ===============
         (is_prompt, conv_state, ssm_state, load_state_indices, store_state_indices, query_start_loc, has_initial_state,
          padding_mask_flat, num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len, initial_state,
-         direct_gdn_state) = self._extract_metadata(num_tokens)
+         direct_gdn_state, num_accepted_tokens, dflash_full_query) = self._extract_metadata(num_tokens)
 
         # === Part 1: Input Projection ================================
         if hasattr(self, 'in_proj_qkv'):
@@ -506,10 +513,13 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         else:
             # === Part 2b: Decode =====================================
+            has_dflash_state = num_accepted_tokens is not None and load_state_indices is not None
+            is_spec_decode = has_dflash_state and load_state_indices.dim() == 2
+            is_dflash_transition = has_dflash_state and load_state_indices.dim() == 1
             selected_conv_state = conv_state
             direct_conv_state = False
-            if (direct_gdn_state and self.compact_state_group_count is not None and self.compact_state_group_count > 0
-                    and self.compact_state_group_offset is not None):
+            if (not is_spec_decode and direct_gdn_state and self.compact_state_group_count is not None
+                    and self.compact_state_group_count > 0 and self.compact_state_group_offset is not None):
                 group_span = (conv_state.shape[0] - 2) // self.compact_state_group_count
                 if num_decodes <= group_span:
                     state_start = self.compact_state_group_offset * group_span + 1
@@ -525,7 +535,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                                                    or load_state_indices is not store_state_indices):
                 raise RuntimeError("Triton strict GDN requires identical load/store state-index tensors")
             flashinfer_result = None
-            if _triton_gaudi_mode != "strict":
+            if _triton_gaudi_mode != "strict" and not has_dflash_state:
                 flashinfer_result = maybe_run_gdn_fused_decode_step(
                     mixed_qkv=mixed_qkv,
                     a=a,
@@ -546,19 +556,34 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             if flashinfer_result is None:
                 if _triton_gaudi_mode != "strict":
                     g, beta = hpu_fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+                conv_indices = load_state_indices
+                if is_spec_decode:
+                    conv_indices = load_state_indices[:num_decodes, 0]
+                elif is_dflash_transition and store_state_indices is not None:
+                    # Recurrent state loads from the accepted checkpoint,
+                    # while convolution history uses the accepted offset in
+                    # the request's base row.
+                    conv_indices = store_state_indices[:num_decodes]
+                elif conv_indices is not None:
+                    conv_indices = conv_indices[:num_decodes]
                 mixed_qkv_conv = hpu_causal_conv1d_update(
                     x=mixed_qkv,
                     conv_state=selected_conv_state,
                     weight=conv_weights,
                     bias=self.conv1d.bias,
                     activation=self.activation,
-                    conv_state_indices=(None if direct_conv_state else (
-                        load_state_indices[:num_decodes] if load_state_indices is not None else load_state_indices)),
+                    conv_state_indices=None if direct_conv_state else conv_indices,
+                    num_accepted_tokens=num_accepted_tokens if has_dflash_state else None,
                     block_idx_last_scheduled_token=None,
                     initial_state_idx=None,
                     query_start_loc=query_start_loc,
+                    max_query_len=(load_state_indices.size(1) if is_spec_decode else 1 if is_dflash_transition else -1),
                     validate_data=False,
                     direct_state_layout=direct_conv_state,
+                    round_before_activation=self.dflash_conv_round_before_activation,
+                    full_query_valid_state=(self.dflash_full_query_conv and is_spec_decode and dflash_full_query
+                                            and self.compact_state_group_offset is not None
+                                            and not getattr(self.cache_config, "enable_prefix_caching", True)),
                 )
                 if _triton_gaudi_mode == "strict":
                     triton_out = _try_triton_gdn_decode_packed(
@@ -573,6 +598,38 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     if triton_out is None:
                         raise RuntimeError("Triton strict GDN did not select a recurrent kernel")
                     flashinfer_result = (triton_out.unsqueeze(0), ssm_state)
+                elif is_spec_decode:
+                    assert query_start_loc is not None
+                    tokens_per_request = load_state_indices.size(1)
+                    state_indices = load_state_indices[:num_decodes, :tokens_per_request]
+                    query_lens = (query_start_loc[1:num_decodes + 1] - query_start_loc[:num_decodes]).clamp(
+                        min=0,
+                        max=tokens_per_request,
+                    )
+                    checkpoint_start = None
+                    if (direct_gdn_state and dflash_full_query and self.compact_state_group_offset is not None
+                            and self.compact_state_group_count is not None and self.compact_state_group_count > 0):
+                        group_span = (ssm_state.shape[0] - 2) // self.compact_state_group_count
+                        checkpoint_start = self.compact_state_group_offset * group_span + 1
+                    core_attn_out_result, _ = gated_delta_rule_mtp_packed(
+                        packed_qkv=mixed_qkv_conv.reshape(num_decodes, tokens_per_request, -1),
+                        log_decay=g.reshape(num_decodes, tokens_per_request, -1),
+                        beta=beta.reshape(num_decodes, tokens_per_request, -1),
+                        state_pool=ssm_state,
+                        state_indices=state_indices,
+                        num_accepted_tokens=num_accepted_tokens[:num_decodes],
+                        query_lengths=query_lens,
+                        scale=self.head_k_dim**-0.5,
+                        use_qk_l2norm=True,
+                        assume_full_query=dflash_full_query,
+                        # Compact no-prefix-cache state assigns a different
+                        # contiguous slot to every verification token.
+                        assume_distinct_checkpoints=(self.compact_state_group_offset is not None
+                                                     and not getattr(self.cache_config, "enable_prefix_caching", True)),
+                        checkpoint_start=checkpoint_start,
+                    )
+                    core_attn_out_result = core_attn_out_result.reshape(1, num_tokens, core_attn_out_result.size(-2),
+                                                                        core_attn_out_result.size(-1))
                 else:
                     flashinfer_result = maybe_run_gdn_decode_packed(
                         mixed_qkv=mixed_qkv_conv,
@@ -586,8 +643,9 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         direct_state_layout=direct_gdn_state,
                         direct_state_group_count=self.compact_state_group_count,
                         direct_state_group_offset=self.compact_state_group_offset,
+                        allow_indexed_reference=is_dflash_transition,
                     )
-                if flashinfer_result is None:
+                if flashinfer_result is None and not is_spec_decode:
                     query, key, value = self.rearrange_mixed_qkv(mixed_qkv_conv)
                     core_attn_out_result, _ = hpu_fused_recurrent_gated_delta_rule(
                         q=query,

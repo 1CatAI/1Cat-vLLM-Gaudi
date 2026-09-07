@@ -57,24 +57,39 @@ def _write_state_rows(
     store_indices: torch.Tensor,
     updated_state: torch.Tensor,
     valid_store: torch.Tensor,
+    reserved_padding_slot: int | None = None,
 ) -> None:
-    # Keep shapes static for torch.compile. Invalid rows target slot zero but
-    # write back the value read immediately before the update, so padding is a
-    # true no-op even when slot zero contains live data.
+    candidate = updated_state.to(state_pool.dtype)
+    if reserved_padding_slot is not None:
+        # DFlash compact state reserves slot zero. All padding rows can then be
+        # coalesced into a single batched write without any live-slot alias.
+        padding = torch.full_like(store_indices, reserved_padding_slot)
+        safe_destination = torch.where(valid_store, store_indices, padding)
+        padding_value = state_pool.narrow(0, reserved_padding_slot, 1)
+        rows = torch.where(valid_store.reshape(-1, 1, 1, 1), candidate, padding_value)
+        state_pool.index_copy_(0, safe_destination, rows)
+        return
+
+    # Generic indexed APIs permit slot zero to be live. Preserve exact
+    # sequential semantics for invalid rows rather than aliasing a live slot.
     for batch_idx in range(updated_state.shape[0]):
         destination = store_indices.narrow(0, batch_idx, 1)
         valid = valid_store.narrow(0, batch_idx, 1)
         safe_destination = torch.where(valid, destination, torch.zeros_like(destination))
         previous = state_pool.index_select(0, safe_destination)
-        candidate = updated_state.narrow(0, batch_idx, 1).to(state_pool.dtype)
-        row = torch.where(valid.reshape(1, 1, 1, 1), candidate, previous)
+        row = torch.where(valid.reshape(1, 1, 1, 1), candidate.narrow(0, batch_idx, 1), previous)
         state_pool.index_copy_(0, safe_destination, row)
 
 
 def _l2_normalize_rsqrt(value: torch.Tensor) -> torch.Tensor:
-    """Express L2 normalization in the form Gaudi fuses most efficiently."""
+    """Use the additive epsilon of the GDN kernel contract.
+
+    This is not ``F.normalize``: clamping the norm changes small Q/K
+    vectors and can make decode disagree with prefill and target-only.
+    Callers select the compute dtype before normalization.
+    """
     norm_squared = torch.sum(value * value, dim=-1, keepdim=True)
-    return value * torch.rsqrt(torch.clamp_min(norm_squared, 1e-12))
+    return value * torch.rsqrt(norm_squared + 1e-6)
 
 
 def _direct_single_token_decode_core(
@@ -303,6 +318,9 @@ def recurrent_decode_from_qkv(
     intermediate_states_buffer: torch.Tensor | None = None,
     ssm_state_indices: torch.Tensor | None = None,
     update_final_state: bool = True,
+    token_mask: torch.Tensor | None = None,
+    reserved_padding_slot: int | None = None,
+    assume_valid_indices: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Execute GDN decode while preserving the recurrent update order."""
     if q.ndim != 4 or k.shape != q.shape:
@@ -324,8 +342,14 @@ def recurrent_decode_from_qkv(
     if direct_state and slots != batch:
         raise ValueError(f"Direct state requires one contiguous row per request; got slots={slots}, B={batch}.")
 
+    if token_mask is not None:
+        if tuple(token_mask.shape) != (batch, tokens):
+            raise ValueError(f"token_mask must have shape [{batch},{tokens}], got {token_mask.shape}.")
+        token_mask = token_mask.to(device=state_pool.device, dtype=torch.bool)
+
     if direct_state:
-        if (tokens == 1 and intermediate_states_buffer is None and ssm_state_indices is None and update_final_state):
+        if (tokens == 1 and intermediate_states_buffer is None and ssm_state_indices is None and update_final_state
+                and token_mask is None):
             if scale is None:
                 scale = key_dim**-0.5
             return _direct_single_token_decode(q, k, v, log_decay, beta, state_pool, scale, use_qk_l2norm)
@@ -337,19 +361,30 @@ def recurrent_decode_from_qkv(
     else:
         load_indices = _canonical_indices(load_state_indices, batch, slots, state_pool.device)
         store_indices = _canonical_indices(store_state_indices, batch, slots, state_pool.device)
-        _validate_cpu_store_indices(store_indices, slots)
-        safe_load, valid_load = _safe_indices(load_indices, slots)
-        _, valid_store = _safe_indices(store_indices, slots)
-        state = state_pool.index_select(0, safe_load).to(torch.float32)
-        state = torch.where(valid_load.reshape(batch, 1, 1, 1), state, torch.zeros_like(state))
+        if assume_valid_indices:
+            valid_load = torch.ones(batch, dtype=torch.bool, device=state_pool.device)
+            valid_store = valid_load
+            state = state_pool.index_select(0, load_indices).to(torch.float32)
+        else:
+            _validate_cpu_store_indices(store_indices, slots)
+            safe_load, valid_load = _safe_indices(load_indices, slots)
+            _, valid_store = _safe_indices(store_indices, slots)
+            state = state_pool.index_select(0, safe_load).to(torch.float32)
+            state = torch.where(valid_load.reshape(batch, 1, 1, 1), state, torch.zeros_like(state))
 
     repeat = value_heads // q_heads
     state = state.reshape(batch, q_heads, repeat, value_dim, key_dim)
     q_work = q.to(torch.float32)
     k_work = k.to(torch.float32)
     if use_qk_l2norm:
-        q_work = F.normalize(q_work, p=2.0, dim=-1, eps=1e-6)
-        k_work = F.normalize(k_work, p=2.0, dim=-1, eps=1e-6)
+        # Keep verification numerically aligned with the promoted one-token
+        # Qwen3.8 decode path.  A different normalization spelling here is
+        # enough to change a near-tied target argmax after several accepted
+        # blocks, which breaks greedy speculative decoding's lossless
+        # contract even when checkpoint rollback itself is correct.
+        qk_work = torch.cat((q_work, k_work), dim=2)
+        qk_work = _l2_normalize_rsqrt(qk_work)
+        q_work, k_work = qk_work.split(q_heads, dim=2)
     if scale is None:
         scale = key_dim**-0.5
 
@@ -365,35 +400,66 @@ def recurrent_decode_from_qkv(
                          f"{tuple(intermediate_states_buffer.shape)}.")
     if ssm_state_indices is not None and tuple(ssm_state_indices.shape) != (batch, tokens):
         raise ValueError(f"ssm_state_indices must have shape [{batch},{tokens}], got {ssm_state_indices.shape}.")
+    # Prepare independent token work together for the single-request MTP
+    # bucket. Keep the state recurrence and checkpoint update order intact.
+    prepare_tokens = assume_valid_indices and token_mask is None and batch == 1 and tokens == 8
+    if prepare_tokens:
+        decay_work = torch.exp(decay_work)
+        q_work = q_work * scale
     outputs: list[torch.Tensor] = []
 
     for token_idx in range(tokens):
         q_t = q_work[:, token_idx].unsqueeze(2)
         k_t = k_work[:, token_idx].unsqueeze(2)
         v_t = value_work[:, token_idx]
-        decay_t = torch.exp(decay_work[:, token_idx]).reshape(batch, q_heads, repeat, 1, 1)
+        decay_t = decay_work[:, token_idx] if prepare_tokens else torch.exp(decay_work[:, token_idx])
+        decay_t = decay_t.reshape(batch, q_heads, repeat, 1, 1)
         beta_t = beta_work[:, token_idx].reshape(batch, q_heads, repeat, 1)
 
         decayed_state = state * decay_t
         projection = torch.matmul(decayed_state, k_t.unsqueeze(-1)).squeeze(-1)
         delta = (v_t - projection) * beta_t
-        state = decayed_state + delta.unsqueeze(-1) * k_t.unsqueeze(-2)
-        output_t = torch.matmul(state, (q_t * scale).unsqueeze(-1)).squeeze(-1)
-        outputs.append(output_t.reshape(batch, value_heads, value_dim))
+        # Match _direct_single_token_decode_core exactly.  In particular,
+        # addcmul has a distinct HPU lowering from a separately materialized
+        # multiply followed by add.
+        candidate_state = torch.addcmul(decayed_state, delta.unsqueeze(-1), k_t.unsqueeze(-2))
+        active_t = valid_load
+        if token_mask is not None:
+            active_t = active_t & token_mask[:, token_idx]
+        if assume_valid_indices and token_mask is None:
+            state = candidate_state
+        else:
+            state = torch.where(active_t.reshape(batch, 1, 1, 1, 1), candidate_state, state)
+        output_q = q_t if prepare_tokens else q_t * scale
+        output_t = torch.matmul(state, output_q.unsqueeze(-1)).squeeze(-1)
+        output_t = output_t.reshape(batch, value_heads, value_dim)
+        if assume_valid_indices and token_mask is None:
+            outputs.append(output_t)
+        else:
+            outputs.append(torch.where(active_t.reshape(batch, 1, 1), output_t, torch.zeros_like(output_t)))
 
         state_t = state.reshape(batch, value_heads, value_dim, key_dim)
         if intermediate_states_buffer is not None:
             target = intermediate_states_buffer[:batch, token_idx]
             target.copy_(torch.where(
-                valid_load.reshape(batch, 1, 1, 1),
+                active_t.reshape(batch, 1, 1, 1),
                 state_t.to(target.dtype),
                 target,
             ))
         if ssm_state_indices is not None:
             token_store_indices = ssm_state_indices[:, token_idx].to(device=state_pool.device, dtype=torch.long)
-            _validate_cpu_store_indices(token_store_indices, slots)
-            _, valid_token_store = _safe_indices(token_store_indices, slots)
-            _write_state_rows(state_pool, token_store_indices, state_t, valid_load & valid_token_store)
+            if assume_valid_indices:
+                state_pool.index_copy_(0, token_store_indices, state_t.to(state_pool.dtype))
+            else:
+                _validate_cpu_store_indices(token_store_indices, slots)
+                _, valid_token_store = _safe_indices(token_store_indices, slots)
+                _write_state_rows(
+                    state_pool,
+                    token_store_indices,
+                    state_t,
+                    active_t & valid_token_store,
+                    reserved_padding_slot,
+                )
 
     updated_state = state.reshape(batch, value_heads, value_dim, key_dim)
     if not update_final_state or ssm_state_indices is not None:
@@ -401,9 +467,19 @@ def recurrent_decode_from_qkv(
     elif direct_state:
         state_pool.copy_(updated_state.to(state_pool.dtype))
     else:
-        _write_state_rows(state_pool, store_indices, updated_state, valid_store & valid_load)
+        active_rows = valid_load
+        if token_mask is not None:
+            active_rows = active_rows & torch.any(token_mask, dim=1)
+        _write_state_rows(
+            state_pool,
+            store_indices,
+            updated_state,
+            valid_store & active_rows,
+            reserved_padding_slot,
+        )
     output = torch.stack(outputs, dim=1).to(v.dtype)
-    output = torch.where(valid_load.reshape(batch, 1, 1, 1), output, torch.zeros_like(output))
+    if not assume_valid_indices:
+        output = torch.where(valid_load.reshape(batch, 1, 1, 1), output, torch.zeros_like(output))
     return output, state_pool
 
 
