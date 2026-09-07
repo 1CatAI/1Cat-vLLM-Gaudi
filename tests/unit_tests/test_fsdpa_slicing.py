@@ -59,7 +59,8 @@ class _MockBucketingManager:
         self.block_size = block_size
         self._strategy_cls = strategy_cls
 
-    def get_bucketing_strategy(self):
+    def get_bucketing_strategy(self, phase=None):
+        assert phase == 'prompt'
         if self._strategy_cls is not None:
             return self._strategy_cls()
         return PaddingAwareBucketingStrategy()
@@ -70,6 +71,8 @@ def _make_config(**overrides):
     defaults = dict(
         enable_fsdpa_slicing=True,
         bucketing_strategy='pad',
+        VLLM_PROMPT_BUCKETING_STRATEGY=None,
+        VLLM_BUCKETING_FROM_FILE=None,
         merged_prefill=False,
         use_bucketing=True,
         VLLM_HPU_FSDPA_DYNAMIC_FP8=None,
@@ -957,6 +960,7 @@ class TestFsdpaPromptAttentionCausalMask:
             assert call_args[5] is True
 
     def test_inner_slicing_suppresses_redundant_query_tiling(self):
+
         class SliceAwareOp:
             _supports_inner_slicing = True
 
@@ -1246,17 +1250,16 @@ class TestFsdpaSlicingAccuracyBF16:
         attn_mask = _build_causal_mask((bs, q_len, ctx_len), (bs, q_len_pad, ctx_len_pad), device='hpu')
         ref_out = self._run_reference(q, k, v, attn_mask)
         fp8_out = self._run_sliced(q,
-                                    k,
-                                    v,
-                                    attn_mask,
-                                    slice_thld=kv_len_pad,
-                                    chunk_size=chunk_size,
-                                    q_pad=pad,
-                                    ctx_pad=pad,
-                                    mode='compile',
-                                    dynamic_fp8=True)
-        cos_sim = torch.nn.functional.cosine_similarity(ref_out.flatten().float(),
-                                                        fp8_out.flatten().float(),
+                                   k,
+                                   v,
+                                   attn_mask,
+                                   slice_thld=kv_len_pad,
+                                   chunk_size=chunk_size,
+                                   q_pad=pad,
+                                   ctx_pad=pad,
+                                   mode='compile',
+                                   dynamic_fp8=True)
+        cos_sim = torch.nn.functional.cosine_similarity(ref_out.flatten().float(), fp8_out.flatten().float(),
                                                         dim=0).item()
 
         assert cos_sim > 0.99, f"Dynamic FP8 cosine similarity too low: {cos_sim}"

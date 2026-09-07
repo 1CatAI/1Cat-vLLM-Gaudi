@@ -46,6 +46,8 @@ def get_user_flags():
         Env('VLLM_DECODE_BLOCK_BUCKET_PAD_MAX', int),
         Env('VLLM_DECODE_BLOCK_BUCKET_PAD_PERCENT', int),
         Env('VLLM_BUCKETING_STRATEGY', str),
+        Env('VLLM_PROMPT_BUCKETING_STRATEGY', str, check=choice('exp', 'lin', 'pad')),
+        Env('VLLM_DECODE_BUCKETING_STRATEGY', str, check=choice('exp', 'lin', 'pad')),
         Env('VLLM_BUCKETING_FROM_FILE', str),
         Env('VLLM_HPU_QWEN3_COMPILE_LAYER_GROUP_SIZE', int),
 
@@ -146,8 +148,11 @@ def get_features():
               env_var_type=boolean),
         Value('use_hpu_aligned_scale', False, env_var='HPU_ALIGNED_SCALE', env_var_type=boolean),
         Value('enable_fsdpa_slicing',
-              All(Eq('use_bucketing', True), Eq('bucketing_strategy', 'pad'), Disabled('merged_prefill'),
-                  Kernel(fsdpa)),
+              All(
+                  Eq('use_bucketing', True),
+                  Any(Eq('VLLM_PROMPT_BUCKETING_STRATEGY', 'pad'),
+                      All(Eq('VLLM_PROMPT_BUCKETING_STRATEGY', None), Eq('bucketing_strategy', 'pad'))),
+                  Disabled('merged_prefill'), Kernel(fsdpa)),
               env_var='VLLM_HPU_FSDPA_SLICE_ENABLED',
               env_var_type=boolean),
         # Splits the query dim of prompt attention so no per-call attn_bias reaches 2**31 bytes,
