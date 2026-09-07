@@ -3,6 +3,10 @@
 
 from contextlib import nullcontext
 
+import contextlib
+import os
+
+import numpy as np
 import pytest
 import torch
 from types import SimpleNamespace
@@ -22,6 +26,7 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig, KVCach
 from vllm.v1.sample.metadata import SamplingMetadata
 import vllm_gaudi.extension.environment as environment
 import vllm_gaudi.v1.worker.hpu_model_runner as model_runner_module
+import vllm_gaudi.v1.worker.hpu_model_runner as hpu_model_runner
 from vllm_gaudi.v1.worker.hpu_model_runner import (
     HPUModelRunner,
     HpuModelAdapter,
@@ -31,6 +36,9 @@ from vllm_gaudi.v1.worker.hpu_model_runner import (
     _sampler_warmup_batch_sizes,
     maybe_set_mamba_kv_cache_groups_ids,
     should_synchronize_hybrid_prefill_output,
+    _HPUDeepseekV4PhaseChunk,
+    _dsv4_compile_only_scope,
+    _dsv4_decode_only_compile_enabled,
 )
 from vllm_gaudi.v1.worker.hpu_input_batch import InputBatch
 
@@ -84,6 +92,123 @@ def test_zero_compact_gdn_slot_clears_all_dflash_checkpoints():
     expected_preserved = torch.tensor([1, 2, 3, 4, 9, 10, 11, 12, 13, 14, 15, 16, 21, 22, 23, 24])
     assert torch.count_nonzero(state[expected_cleared]) == 0
     assert torch.count_nonzero(state[expected_preserved]) == expected_preserved.numel() * 2
+
+
+def test_dsv4_decode_only_compile_flag(monkeypatch):
+    monkeypatch.setenv("VLLM_HPU_DSV4_DECODE_ONLY_WARMUP", "1")
+    assert _dsv4_decode_only_compile_enabled("deepseek_v4")
+    assert not _dsv4_decode_only_compile_enabled("qwen3")
+
+
+def test_dsv4_phase_chunk_keeps_prefill_eager_and_decode_compiled():
+    calls = []
+
+    def eager(hidden_states, *args, **kwargs):
+        calls.append("eager")
+        return hidden_states
+
+    def compiled(hidden_states, *args, **kwargs):
+        calls.append("compiled")
+        return hidden_states
+
+    chunk = _HPUDeepseekV4PhaseChunk(eager, compiled)
+    chunk(torch.empty(64, 1))
+    chunk(torch.empty(1, 1))
+
+    assert calls == ["eager", "compiled"]
+
+
+def test_dsv4_phase_chunk_uses_metadata_for_single_token_prefill(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        hpu_model_runner,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata={
+                "layer.swa_cache": SimpleNamespace(
+                    num_prefills=1,
+                    num_decodes=0,
+                )
+            }
+        ),
+    )
+
+    chunk = _HPUDeepseekV4PhaseChunk(
+        lambda hidden_states: calls.append("eager") or hidden_states,
+        lambda hidden_states: calls.append("compiled") or hidden_states,
+    )
+    chunk(torch.empty(1, 1))
+
+    assert calls == ["eager"]
+
+
+def test_dsv4_phase_chunk_uses_metadata_for_decode(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        hpu_model_runner,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata={
+                "layer.swa_cache": SimpleNamespace(
+                    num_prefills=0,
+                    num_decodes=1,
+                )
+            }
+        ),
+    )
+
+    chunk = _HPUDeepseekV4PhaseChunk(
+        lambda hidden_states: calls.append("eager") or hidden_states,
+        lambda hidden_states: calls.append("compiled") or hidden_states,
+    )
+    chunk(torch.empty(64, 1))
+
+    assert calls == ["compiled"]
+
+
+def test_dsv4_compile_only_scope_is_process_global(monkeypatch):
+    import vllm_gaudi.ops.hpu_hw_agnostic as hpu_hw_agnostic
+
+    monkeypatch.setattr(
+        hpu_hw_agnostic,
+        "_DSV4_COMPILE_ONLY_ACTIVE",
+        False,
+    )
+    monkeypatch.delenv("_VLLM_HPU_DSV4_COMPILE_ONLY_ACTIVE", raising=False)
+    with _dsv4_compile_only_scope(True):
+        assert hpu_hw_agnostic._DSV4_COMPILE_ONLY_ACTIVE
+        assert os.environ["_VLLM_HPU_DSV4_COMPILE_ONLY_ACTIVE"] == "1"
+    assert not hpu_hw_agnostic._DSV4_COMPILE_ONLY_ACTIVE
+    assert "_VLLM_HPU_DSV4_COMPILE_ONLY_ACTIVE" not in os.environ
+
+
+def test_dummy_request_uses_each_cache_group_block_size():
+    runner = SimpleNamespace(
+        speculative_config=None,
+        max_model_len=512,
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=256)),
+                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=64)),
+                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=4)),
+            ]),
+        is_pooling_model=False,
+    )
+    requests = []
+    scheduled_tokens = {}
+
+    HPUModelRunner._add_dummy_request(
+        runner,
+        requests,
+        scheduled_tokens,
+        num_computed_tokens=0,
+        total_tokens=512,
+        scheduled_tokens=512,
+        is_prompt=True,
+    )
+
+    assert [len(blocks) for blocks in requests[0].block_ids] == [2, 8, 128]
+    assert scheduled_tokens == {"0": 512}
 
 
 def initialize_kv_cache(runner: HPUModelRunner):
@@ -1076,6 +1201,434 @@ def test_dflash_plain_decode_loads_accepted_checkpoint_and_stores_base():
         ),
     )
 
+
+
+def test_deepseek_v4_dynamo_cache_limit_includes_layer_specializations():
+    from vllm_gaudi.v1.worker.hpu_model_runner import _dynamo_cache_limit
+
+    assert _dynamo_cache_limit(
+        bucket_count=2,
+        regional_compilation=True,
+        model_type="deepseek_v4",
+        num_model_layers=43,
+    ) == 95
+    assert _dynamo_cache_limit(
+        bucket_count=2,
+        regional_compilation=False,
+        model_type="deepseek_v4",
+        num_model_layers=43,
+    ) == 87
+
+
+def test_deepseek_v4_needs_compile_validation_warmup():
+    from vllm_gaudi.v1.worker.hpu_model_runner import (
+        _needs_compile_validation_warmup,
+    )
+
+    assert _needs_compile_validation_warmup("deepseek_v4")
+    assert not _needs_compile_validation_warmup("llama")
+
+
+@pytest.mark.parametrize(
+    ("model_type", "expected_dtype"),
+    [
+        ("deepseek_v4", torch.int32),
+        ("llama", torch.int64),
+    ],
+)
+def test_framework_attention_index_dtype(model_type, expected_dtype):
+    runner = SimpleNamespace(_get_model_type=lambda: model_type)
+
+    assert (
+        HPUModelRunner._framework_attention_index_dtype(runner)
+        == expected_dtype
+    )
+
+
+def test_framework_decode_dispatch_skips_legacy_metadata_path():
+    expected = object()
+    calls = []
+    runner = SimpleNamespace(
+        use_framework_kv_cache_layout=True,
+        _create_framework_decode_input_data=lambda *args: (
+            calls.append(args) or expected
+        ),
+    )
+    context_lens = np.array([7], dtype=np.int32)
+
+    result = HPUModelRunner._create_decode_input_data(
+        runner,
+        1,
+        [1],
+        context_lens,
+        torch.tensor([[0]], dtype=torch.int32),
+        "scheduler-output",
+    )
+
+    assert result is expected
+    assert calls == [(1, [1], context_lens, "scheduler-output")]
+
+
+def test_framework_decode_fast_path_reuses_position_upload(monkeypatch):
+    h2d_sources = []
+
+    def fake_h2d_copy(source, dest_tensor=None, dtype=None, device="hpu"):
+        assert dest_tensor is None
+        h2d_sources.append(source)
+        return source.clone()
+
+    captured = {}
+    runner = SimpleNamespace(
+        attn_block_size=128,
+        bucketing_manager=SimpleNamespace(
+            find_decode_bucket=lambda *args: (1, 1, 1)
+        ),
+        get_dp_padding=lambda batch_size: 0,
+        _framework_attention_index_dtype=lambda: torch.int32,
+        positions_cpu=torch.tensor([7], dtype=torch.int64),
+        input_ids_cpu=torch.tensor([11], dtype=torch.int32),
+        device="cpu",
+        profiler=SimpleNamespace(
+            record_event=lambda *args: contextlib.nullcontext()
+        ),
+        use_async_scheduling=False,
+        _prepare_spec_decode_inputs=lambda *args: (args[1], None),
+        _build_framework_decode_attention_metadata=lambda **kwargs: (
+            captured.update(kwargs) or {"layer": "metadata"}
+        ),
+    )
+    monkeypatch.setattr(
+        hpu_model_runner,
+        "async_h2d_copy",
+        fake_h2d_copy,
+    )
+
+    result = HPUModelRunner._create_framework_decode_input_data(
+        runner,
+        num_decodes=1,
+        num_scheduled_tokens=[1],
+        context_lens=np.array([7], dtype=np.int32),
+        scheduler_output=object(),
+    )
+
+    assert len(h2d_sources) == 3
+    assert result.position_ids.shape == (1, 1)
+    assert torch.equal(result.position_ids, torch.tensor([[7]], dtype=torch.int32))
+    assert captured["positions_device"].data_ptr() == result.position_ids.data_ptr()
+
+
+def test_framework_decode_attention_metadata_uses_one_persistent_pack(
+    monkeypatch,
+):
+    h2d_calls = []
+
+    def fake_h2d_copy(source, dest_tensor=None, dtype=None, device="hpu"):
+        h2d_calls.append((source, dest_tensor))
+        if dest_tensor is not None:
+            dest_tensor.copy_(source)
+            return dest_tensor
+        return source.clone()
+
+    captured = []
+    fast_build_flags = []
+    builder = SimpleNamespace(
+        build=lambda **kwargs: (
+            fast_build_flags.append(kwargs["fast_build"])
+            or
+            captured.append(kwargs["common_attn_metadata"])
+            or kwargs["common_attn_metadata"]
+        )
+    )
+    block_table = SimpleNamespace(
+        get_cpu_tensor=lambda: torch.tensor(
+            [[3, -1]], dtype=torch.int32
+        ),
+        block_size=128,
+    )
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(
+            req_ids=["request"],
+            req_id_to_index={"request": 0},
+            block_table=[block_table],
+        ),
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=SimpleNamespace())
+            ]
+        ),
+        attn_groups=[
+            [
+                SimpleNamespace(
+                    get_metadata_builder=lambda: builder,
+                    layer_names=["layer"],
+                )
+            ]
+        ],
+        _PAD_BLOCK_ID=99,
+        device="cpu",
+        _framework_attention_index_dtype=lambda: torch.int32,
+    )
+    monkeypatch.setenv(
+        "VLLM_HPU_DSV4_PACKED_DECODE_METADATA", "1"
+    )
+    monkeypatch.setenv(
+        "VLLM_HPU_DSV4_Q1_METADATA_FASTPATH", "1"
+    )
+    monkeypatch.setattr(
+        hpu_model_runner,
+        "async_h2d_copy",
+        fake_h2d_copy,
+    )
+
+    result = HPUModelRunner._build_framework_decode_attention_metadata(
+        runner,
+        num_decodes=1,
+        padded_batch_size=1,
+        context_lens=np.array([7], dtype=np.int32),
+        positions_cpu=torch.tensor([[7]], dtype=torch.int32),
+        positions_device=torch.tensor([7], dtype=torch.int32),
+    )
+    first_pack_ptr = captured[-1].query_start_loc.data_ptr()
+    HPUModelRunner._build_framework_decode_attention_metadata(
+        runner,
+        num_decodes=1,
+        padded_batch_size=1,
+        context_lens=np.array([8], dtype=np.int32),
+        positions_cpu=torch.tensor([[8]], dtype=torch.int32),
+        positions_device=torch.tensor([8], dtype=torch.int32),
+    )
+    second_pack_ptr = captured[-1].query_start_loc.data_ptr()
+    HPUModelRunner._build_framework_decode_attention_metadata(
+        runner,
+        num_decodes=1,
+        padded_batch_size=1,
+        context_lens=np.array([9], dtype=np.int32),
+        positions_cpu=torch.tensor([[9]], dtype=torch.int32),
+        positions_device=torch.tensor([9], dtype=torch.int32),
+    )
+
+    assert list(result) == ["layer"]
+    assert len(h2d_calls) == 3
+    assert all(dest is not None for _, dest in h2d_calls)
+    assert second_pack_ptr != first_pack_ptr
+    assert captured[-1].query_start_loc.data_ptr() == first_pack_ptr
+    assert torch.equal(
+        captured[-1].block_table_tensor,
+        torch.tensor([[3, 0]], dtype=torch.int32),
+    )
+    assert torch.equal(
+        captured[-1].slot_mapping,
+        torch.tensor([393], dtype=torch.int32),
+    )
+    assert all(item.max_query_len == 1 for item in captured)
+    assert fast_build_flags == [True, True, True]
+
+
+@pytest.mark.parametrize(
+    ("builder_name", "builder_attrs", "position", "seq_len", "expected"),
+    [
+        (
+            "DeepseekSparseSWAMetadataBuilder",
+            {"window_size": 4, "block_size": 4},
+            5,
+            6,
+            {
+                "decode_swa_indices": [[[14, 15, 20, 21]]],
+                "decode_swa_lens": [4],
+            },
+        ),
+        (
+            "DeepseekV4IndexerMetadataBuilder",
+            {
+                "compress_ratio": 4,
+                "kv_cache_spec": SimpleNamespace(num_states=2),
+            },
+            7,
+            8,
+            {
+                "compressed_slot_mapping": [7],
+                "compressed_seq_lens": [[2]],
+            },
+        ),
+        (
+            "DeepseekV4HWAgnosticMetadataBuilder",
+            {
+                "compress_ratio": 128,
+                "c128a_max_compressed": 4,
+                "kv_cache_spec": SimpleNamespace(
+                    num_states=2, block_size=256
+                ),
+            },
+            255,
+            256,
+            {
+                "compressed_slot_mapping": [7],
+                "c128a_global_decode_topk_indices": [[[6, 7, -1, -1]]],
+                "c128a_decode_topk_lens": [2],
+            },
+        ),
+    ],
+)
+def test_framework_q1_derived_cpu_metadata_matches_sparse_layouts(
+    builder_name,
+    builder_attrs,
+    position,
+    seq_len,
+    expected,
+):
+    builder = type(builder_name, (), {})()
+    for name, value in builder_attrs.items():
+        setattr(builder, name, value)
+
+    result = HPUModelRunner._build_framework_q1_derived_cpu_metadata(
+        builder,
+        position,
+        seq_len,
+        torch.tensor([[3, 5]], dtype=torch.int32),
+    )
+
+    assert {name: value.tolist() for name, value in result.items()} == expected
+
+
+def _make_framework_q1_common_metadata():
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+
+    return CommonAttentionMetadata(
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
+        seq_lens=torch.tensor([256], dtype=torch.int32),
+        num_reqs=1,
+        num_actual_tokens=1,
+        max_query_len=1,
+        max_seq_len=256,
+        block_table_tensor=torch.tensor([[3, 5]], dtype=torch.int32),
+        slot_mapping=torch.tensor([1023], dtype=torch.int32),
+        causal=True,
+        positions=torch.tensor([255], dtype=torch.int32),
+    )
+
+
+def test_framework_q1_packed_swa_bypasses_device_metadata_kernel(monkeypatch):
+    sparse_swa = pytest.importorskip(
+        "vllm.models.deepseek_v4.hw_agnostic.attention.sparse_swa"
+    )
+
+    builder = sparse_swa.DeepseekSparseSWAMetadataBuilder.__new__(
+        sparse_swa.DeepseekSparseSWAMetadataBuilder
+    )
+    builder.decode_threshold = 1
+    builder.window_size = 4
+    builder.block_size = 4
+    builder.token_to_req_indices = torch.arange(8, dtype=torch.int32)
+    builder.is_valid_token = torch.ones(8, dtype=torch.int32)
+    builder.decode_swa_indices = torch.empty((8, 1, 4), dtype=torch.int32)
+    builder.decode_swa_lens = torch.empty(8, dtype=torch.int32)
+    packed_indices = torch.tensor([[[14, 15, 20, 21]]], dtype=torch.int32)
+    packed_lens = torch.tensor([4], dtype=torch.int32)
+    common = _make_framework_q1_common_metadata()
+    common._dsv4_q1_fast_metadata = {
+        id(builder): {
+            "decode_swa_indices": packed_indices,
+            "decode_swa_lens": packed_lens,
+        }
+    }
+    monkeypatch.setattr(
+        sparse_swa,
+        "_compute_swa_indices_and_lens_kernel",
+        None,
+    )
+
+    metadata = builder.build(0, common, fast_build=True)
+
+    assert metadata.decode_swa_indices is packed_indices
+    assert metadata.decode_swa_lens is packed_lens
+
+
+def test_framework_q1_packed_mla_bypasses_compressed_and_c128_builders(
+    monkeypatch,
+):
+    sparse_mla = pytest.importorskip(
+        "vllm.models.deepseek_v4.hw_agnostic.attention.sparse_mla"
+    )
+
+    builder = sparse_mla.DeepseekV4HWAgnosticMetadataBuilder.__new__(
+        sparse_mla.DeepseekV4HWAgnosticMetadataBuilder
+    )
+    builder.compress_ratio = 128
+    builder.kv_cache_spec = SimpleNamespace(block_size=256, num_states=2)
+    packed_slot = torch.tensor([7], dtype=torch.int32)
+    packed_topk = torch.tensor([[[6, 7, -1, -1]]], dtype=torch.int32)
+    packed_lens = torch.tensor([2], dtype=torch.int32)
+    common = _make_framework_q1_common_metadata()
+    common._dsv4_q1_fast_metadata = {
+        id(builder): {
+            "compressed_slot_mapping": packed_slot,
+            "c128a_global_decode_topk_indices": packed_topk,
+            "c128a_decode_topk_lens": packed_lens,
+        }
+    }
+    monkeypatch.setattr(sparse_mla, "_get_compressed_slot_mapping", None)
+
+    metadata = builder.build(0, common, fast_build=True)
+
+    assert metadata.slot_mapping is packed_slot
+    assert metadata.c128a_global_decode_topk_indices is packed_topk
+    assert metadata.c128a_decode_topk_lens is packed_lens
+
+
+def test_framework_q1_packed_indexer_bypasses_compressed_slot_builder(
+    monkeypatch,
+):
+    indexer = pytest.importorskip(
+        "vllm.models.deepseek_v4.hw_agnostic.attention.indexer"
+    )
+
+    builder = indexer.DeepseekV4IndexerMetadataBuilder.__new__(
+        indexer.DeepseekV4IndexerMetadataBuilder
+    )
+    builder.reorder_batch_threshold = 1
+    builder.num_speculative_tokens = 0
+    builder.compress_ratio = 4
+    builder.kv_cache_spec = SimpleNamespace(num_states=64)
+    builder.decode_lens_buffer = torch.ones(8, dtype=torch.int32)
+    packed_slot = torch.tensor([255], dtype=torch.int32)
+    packed_seq_lens = torch.tensor([[64]], dtype=torch.int32)
+    common = _make_framework_q1_common_metadata()
+    common._dsv4_q1_fast_metadata = {
+        id(builder): {
+            "compressed_slot_mapping": packed_slot,
+            "compressed_seq_lens": packed_seq_lens,
+        }
+    }
+    monkeypatch.setattr(indexer, "_get_compressed_slot_mapping", None)
+
+    metadata = builder.build(0, common, fast_build=True)
+
+    assert metadata.slot_mapping is packed_slot
+    assert metadata.decode is not None
+    assert metadata.decode.seq_lens is packed_seq_lens
+    assert torch.equal(metadata.decode.decode_lens, torch.ones(1, dtype=torch.int32))
+
+
+def test_configure_dynamo_cache_limits_sets_pytorch_211_names():
+    from types import SimpleNamespace
+
+    from vllm_gaudi.v1.worker.hpu_model_runner import (
+        _configure_dynamo_cache_limits,
+    )
+
+    config = SimpleNamespace(
+        cache_size_limit=8,
+        recompile_limit=8,
+        accumulated_cache_size_limit=256,
+        accumulated_recompile_limit=256,
+    )
+    _configure_dynamo_cache_limits(87, config)
+
+    assert config.cache_size_limit == 87
+    assert config.recompile_limit == 87
+    assert config.accumulated_cache_size_limit == 696
+    assert config.accumulated_recompile_limit == 696
 
 def test_max_cudagraph_capture_size_defaults_to_max_num_batched_tokens(model_runner):
     """max_cudagraph_capture_size defaults to max_num_batched_tokens when not configured."""

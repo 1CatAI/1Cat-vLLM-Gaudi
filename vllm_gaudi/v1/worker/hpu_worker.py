@@ -30,6 +30,7 @@ from vllm.utils.torch_utils import (STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size, se
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig, KVCacheSpec, MambaSpec)
 from vllm.v1.outputs import (DraftTokenIds, AsyncModelRunnerOutput, ModelRunnerOutput)
 from vllm.v1.worker.utils import bind_kv_cache
+from vllm.v1.worker.workspace import init_workspace_manager
 from vllm_gaudi.extension.bucketing.common import HPUBucketingManager
 from vllm_gaudi.utils import is_fake_hpu
 from vllm_gaudi.v1.worker.hpu_model_runner import (HPUModelRunner, _GDN_MAMBA_TYPES, _rebind_moe_expert_weights)
@@ -116,31 +117,68 @@ class HPUWorker(WorkerBase):
         )
 
     def init_profiler(self):
-        """Initialize the profiler."""
-        torch_profiler_dir = os.getenv('VLLM_TORCH_PROFILER_DIR')
+        """Record profiler configuration without touching Kineto.
+
+        Constructing ``torch.profiler.profile`` before HPU graph warmup changes
+        Dynamo/Synapse graph partitioning.  In particular, mutable custom ops
+        can then fail graph compilation even though the same graph compiles and
+        runs normally without profiling.  Keep profiler construction lazy so
+        graph capture finishes before the /start_profile request arrives.
+        """
+        profiler_config = self.vllm_config.profiler_config
+        legacy_profiler_dir = os.getenv('VLLM_TORCH_PROFILER_DIR')
+        torch_profiler_dir = (
+            legacy_profiler_dir
+            or (
+                profiler_config.torch_profiler_dir
+                if profiler_config.profiler == 'torch'
+                else None
+            )
+        )
+        self.profiler_summary_only = getattr(profiler_config, "torch_profiler_summary_only", False)
+        self.torch_profiler_dir = torch_profiler_dir
+        self.profiler = None
         if torch_profiler_dir:
-            logger.warning("VLLM_TORCH_PROFILER_DIR is deprecated!")
-            torch_profiler_trace_dir = torch_profiler_dir
-            logger.info("Profiling enabled. Traces will be saved to: %s", torch_profiler_trace_dir)
-            if os.getenv('VLLM_PROFILER_ENABLED') == 'full':
-                fn = self.model_runner.profiler.full_trace_handler  # type: ignore[union-attr]
-                with_stack = False
-            else:
-                fn = torch.profiler.tensorboard_trace_handler
-                with_stack = True
-            self.profiler = torch.profiler.profile(activities=[
+            if legacy_profiler_dir:
+                logger.warning("VLLM_TORCH_PROFILER_DIR is deprecated!")
+            logger.info("Profiling enabled. Traces will be saved to: %s", torch_profiler_dir)
+            logger.info("Profiler summary-only mode: %s", self.profiler_summary_only)
+
+    def _create_profiler(self) -> None:
+        if self.profiler is not None:
+            return
+        if not self.torch_profiler_dir:
+            raise RuntimeError("Profiler is not enabled.")
+
+        profiler_config = self.vllm_config.profiler_config
+        if os.getenv('VLLM_PROFILER_ENABLED') == 'full':
+            fn = self.model_runner.profiler.full_trace_handler  # type: ignore[union-attr]
+            with_stack = False
+        else:
+            fn = torch.profiler.tensorboard_trace_handler
+            with_stack = profiler_config.torch_profiler_with_stack
+        trace_handler = (
+            None
+            if self.profiler_summary_only
+            else fn(
+                self.torch_profiler_dir,
+                use_gzip=profiler_config.torch_profiler_use_gzip,
+            )
+        )
+        self.profiler = torch.profiler.profile(
+            activities=[
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.HPU,
             ],
-                                                   with_stack=with_stack,
-                                                   on_trace_ready=fn(torch_profiler_trace_dir, use_gzip=True))
-
-        else:
-            self.profiler = None
+            record_shapes=profiler_config.torch_profiler_record_shapes,
+            profile_memory=profiler_config.torch_profiler_with_memory,
+            with_stack=with_stack,
+            with_flops=profiler_config.torch_profiler_with_flops,
+            on_trace_ready=trace_handler,
+        )
 
     def start_profile(self):
-        if self.profiler is None:
-            raise RuntimeError("Profiler is not enabled.")
+        self._create_profiler()
         high_level_profiler = self.model_runner.profiler  # type: ignore[union-attr]
         with high_level_profiler.record_event('internal', 'start_profiler'):
             # Clean up the queue
@@ -155,13 +193,48 @@ class HPUWorker(WorkerBase):
         if self.profiler is None:
             raise RuntimeError("Profiler is not enabled.")
         self.profiler.stop()
+        self._write_profiler_summary()
+
+    def _write_profiler_summary(self) -> None:
+        if not self.profiler_summary_only:
+            return
+        averages = self.profiler.key_averages()
+        tables = []
+        for sort_key in (
+            'self_hpu_time_total',
+            'self_device_time_total',
+            'self_cpu_time_total',
+        ):
+            try:
+                tables.append(
+                    f"Sorted by {sort_key}\n"
+                    + averages.table(sort_by=sort_key, row_limit=200)
+                )
+            except (AttributeError, KeyError, RuntimeError) as exc:
+                tables.append(f"Unable to sort by {sort_key}: {exc}")
+        summary_path = os.path.join(
+            self.torch_profiler_dir,
+            f"operator-summary-rank{self.rank}.txt",
+        )
+        os.makedirs(self.torch_profiler_dir, exist_ok=True)
+        with open(summary_path, 'w', encoding='utf-8') as summary_file:
+            summary_file.write('\n\n'.join(tables))
+        logger.info("Profiler operator summary written to %s", summary_path)
 
     def init_device(self):
+        # HCCL is imported before the multiprocessing worker receives its
+        # local rank, so its import-time device selection cannot honor
+        # HABANA_VISIBLE_MODULES. Bind explicitly before the first HPU
+        # allocation to keep each worker on its assigned visible module.
+        device_index = self.local_rank if self.local_rank >= 0 else 0
+        torch.hpu.set_device(device_index)
         self.device = torch.device("hpu")
         # Initialize the distributed environment.
         init_worker_distributed_environment(self.vllm_config, self.rank, self.distributed_init_method, self.local_rank)
         # Set random seed.
         set_random_seed(self.model_config.seed)
+        num_ubatches = 2 if self.parallel_config.enable_dbo else 1
+        init_workspace_manager(self.device, num_ubatches)
         with set_current_vllm_config(self.vllm_config):
             self.model_runner = HPUModelRunner(vllm_config=self.vllm_config, is_driver_worker=self.is_driver_worker)
         self.init_profiler()
@@ -337,7 +410,13 @@ class HPUWorker(WorkerBase):
         kv_cache_spec = self.model_runner.get_kv_cache_spec()  # type: ignore[union-attr]
         single_kv_block_size_bytes = 0
         for layer_name, layer_spec in kv_cache_spec.items():
-            if isinstance(layer_spec, FullAttentionSpec):
+            if self.model_runner.uses_framework_kv_cache_layout(layer_name):
+                kv_caches[layer_name] = self.model_runner.allocate_framework_kv_cache_layer(
+                    layer_spec,
+                    num_blocks=1,
+                )
+                single_kv_block_size_bytes += layer_spec.page_size_bytes
+            elif isinstance(layer_spec, FullAttentionSpec):
                 dtype = layer_spec.dtype
                 if dtype == torch.float8_e4m3fn and os.environ.get('QUANT_CONFIG', None) is not None and \
                     os.environ.get('VLLM_DYNAMIC_KV_QUANT', None) is not None and not self.model_config.use_mla:
@@ -391,7 +470,10 @@ class HPUWorker(WorkerBase):
                 raise NotImplementedError
 
         runner_kv_caches: list[torch.Tensor] = []
-        bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, runner_kv_caches)
+        if kv_caches and all(self.model_runner.uses_framework_kv_cache_layout(name) for name in kv_caches):
+            self.model_runner.bind_framework_kv_caches(kv_caches, runner_kv_caches)
+        else:
+            bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, runner_kv_caches)
 
         if is_fake_hpu():
             fake_hpu_cache_alloc = 4 * 2**30  # take 4 GiB flat on fake hpu
@@ -576,6 +658,9 @@ class HPUWorker(WorkerBase):
         self.compile_or_warm_up_model()
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        if self.model_config.hf_config.model_type == "deepseek_v4":
+            from vllm_gaudi.ops.deepseek_v4_config import bind_worker_cpu
+            bind_worker_cpu(self.rank)
         # Don't run the warmup if the model is already warmed up
         if not getattr(self.model_runner, 'graphed_buckets', None):
             self.model_runner.warmup_model()  # type: ignore[union-attr]
@@ -624,12 +709,14 @@ class HPUWorker(WorkerBase):
         return self.model_runner.take_draft_token_ids()  # type: ignore[union-attr]
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
-        if self.profiler is None:
-            raise RuntimeError("Profiler is not enabled.")
         if is_start:
+            self._create_profiler()
             self.profiler.start()
         else:
+            if self.profiler is None:
+                raise RuntimeError("Profiler is not enabled.")
             self.profiler.stop()
+            self._write_profiler_summary()
 
     def execute_dummy_batch(self) -> None:
         self.model_runner._dummy_run(1)  # type: ignore[union-attr]

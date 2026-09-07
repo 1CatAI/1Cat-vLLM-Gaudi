@@ -117,19 +117,22 @@ class InputBatch:
             self.num_computed_tokens_cpu_tensor.numpy()
 
         # Block table.
-        # vLLM #40996 dropped max_model_len from MultiGroupBlockTable and now
-        # requires the caller to pass the per-group block count. HPU does not
-        # use DCP (cp_world_size == 1), so max_num_blocks reduces to
-        # cdiv(max_model_len, block_size) per KV cache group.
-        max_num_blocks = (max_num_blocks_per_req if max_num_blocks_per_req is not None else
-                          [cdiv(max_model_len, block_size) for block_size in block_sizes])
+        if max_num_blocks_per_req is None:
+            max_num_blocks_per_req = [
+                cdiv(max_model_len, block_size) for block_size in block_sizes
+            ]
+        if len(max_num_blocks_per_req) != len(block_sizes):
+            raise ValueError(
+                "max_num_blocks_per_req length must match block_sizes length"
+            )
+        self.max_num_blocks_per_req = max_num_blocks_per_req
         self.block_table = MultiGroupBlockTable(max_num_reqs=max_num_reqs,
                                                 max_num_batched_tokens=max_num_batched_tokens,
                                                 pin_memory=pin_memory,
                                                 device=device,
                                                 block_sizes=block_sizes,
                                                 kernel_block_sizes=kernel_block_sizes,
-                                                max_num_blocks=max_num_blocks,
+                                                max_num_blocks=max_num_blocks_per_req,
                                                 slot_mapping_modes=slot_mapping_modes)
 
         # Sampling-related.
