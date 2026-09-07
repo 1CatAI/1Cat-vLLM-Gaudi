@@ -195,8 +195,8 @@ class HPURowParallelLinear(RowParallelLinear):
 
             torch._dynamo.graph_break()
 
-            # Apply bias after all-reduce (only on rank 0 if not skip_bias_add)
-            if self.bias is not None and self.tp_rank == 0 and not self.skip_bias_add:
+            # Every rank holds the reduced output and must add the bias once.
+            if self.bias is not None and not self.skip_bias_add:
                 output = output + self.bias
         else:
             # Original single-shot computation
