@@ -84,7 +84,7 @@ def _normalize_packed_qk(packed: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
     batch = packed.shape[0]
     qk = packed[:, :_QK_WIDTH].reshape(batch, 2 * _QK_HEADS, _DIM).float()
     squared_norm = torch.sum(qk * qk, dim=-1, keepdim=True)
-    qk = qk * torch.rsqrt(torch.clamp_min(squared_norm, 1e-12))
+    qk = qk * torch.rsqrt(squared_norm + 1e-6)
     q, k = qk.split(_QK_HEADS, dim=1)
     value = packed[:, _QK_WIDTH:].reshape(batch, _QK_HEADS, _HEAD_REPEAT, _DIM).float()
     return q, k, value
