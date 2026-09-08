@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "qualification": "experimental; not production quality or performance qualified",
+  "components": {
+    "bridge": {
+      "repository": "https://github.com/HabanaAI/gaudi-pytorch-bridge.git",
+      "base_commit": "5176b1b2d6865608514e83a2b1fd66459920676e",
+      "patch": "bridge.patch",
+      "sha256": "9bae39b8e20493d376c3e5eb7e2033d63473981273b4e6c7d042f166d0d69dc6"
+    },
+    "synapse": {
+      "repository": "https://github.com/heyuanliu-intel/Intel_Gaudi3_Software.git",
+      "base_commit": "6de1f66a4ab658685f23dbe007bdc9eb8fe8dbdf",
+      "patch": "synapse.patch",
+      "sha256": "dd30b910f7188a9cdc8bc2d3cf924057684fdb3d1376830f9aa2c44412d58a81"
+    },
+    "hcl": {
+      "repository": "https://github.com/HabanaAI/HCL.git",
+      "base_commit": "11f9114b88038174d8b2c9ac09e2295b75455078",
+      "patch": "hcl.patch",
+      "sha256": "e8c4c37846ebdf0f604a24a9a1c812ac91875a1e859bb2d7308fcc046f2bce3f"
+    }
+  }
+}

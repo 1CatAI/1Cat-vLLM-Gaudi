@@ -7,6 +7,7 @@ import torch
 import habana_frameworks.torch as htorch
 
 from vllm import envs
+from vllm_gaudi import envs as gaudi_envs
 
 from vllm.platforms import Platform, PlatformEnum
 from vllm_gaudi.extension.runtime import get_config
@@ -211,6 +212,18 @@ class HpuPlatform(Platform):
     additional_env_vars = [k for k, v in os.environ.items() if retain_envs(k)]
 
     @classmethod
+    def check_runner_kv_caches_multi_layer(cls) -> None:
+        """Allow distinct attention caches to share a numeric layer index.
+
+        Speculative models keep target and draft attention modules in the same
+        static forward context.  Their qualified names are distinct, although
+        both can contain (for example) ``layers.0``.  The HPU runner stores and
+        processes every cache entry independently, just like the CUDA runner,
+        so flattening both entries into ``runner_kv_caches`` is supported.
+        """
+        return
+
+    @classmethod
     def get_attn_backend_cls(
         cls,
         selected_backend: "AttentionBackendEnum",
@@ -279,6 +292,25 @@ class HpuPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        if gaudi_envs.VLLM_HPU_NATIVE_DECODE_GRAPH:
+            if not (gaudi_envs.VLLM_HPU_TP2_STATIC_GROUP_PLAN and gaudi_envs.VLLM_HPU_TP2_PREPARED_COMM
+                    and gaudi_envs.VLLM_HPU_GDN_DIRECT_STATE_UPDATE):
+                raise RuntimeError(
+                    "VLLM_HPU_NATIVE_DECODE_GRAPH requires the static group plan, prepared communication, "
+                    "and direct GDN state update; no fallback was selected")
+            # The Bridge caching allocator is created before native capture.
+            # Leave a fixed cold-path budget in Synapse's global-HBM pool for
+            # graph-owned recipe programs instead of consuming all free HBM.
+            pool_percent_text = os.environ.setdefault("PT_HPU_POOL_MEM_ACQUIRE_PERC", "95")
+            try:
+                pool_percent = int(pool_percent_text)
+            except ValueError as error:
+                raise RuntimeError("VLLM_HPU_NATIVE_DECODE_GRAPH requires an integer "
+                                   "PT_HPU_POOL_MEM_ACQUIRE_PERC between 1 and 95") from error
+            if not 1 <= pool_percent <= 95:
+                raise RuntimeError(
+                    "VLLM_HPU_NATIVE_DECODE_GRAPH requires PT_HPU_POOL_MEM_ACQUIRE_PERC between 1 and 95 "
+                    "so Synapse can retain fixed recipe program storage")
         # Apply torch.compile/eager-only env defaults here (engine construction
         # time) instead of at plugin registration time, so they cannot leak into
         # a lazy-mode subprocess (GAUDISW-248809) and always respect values the
@@ -290,6 +322,8 @@ class HpuPlatform(Platform):
             configure_defaults(vllm_config, gaudi2=htexp._get_device_type() == htexp.synDeviceType.synDeviceGaudi2)
         _enable_hpu_v1_dflash2_validation()
         parallel_config = vllm_config.parallel_config
+        if (gaudi_envs.VLLM_HPU_NATIVE_DECODE_GRAPH and parallel_config.tensor_parallel_size != 2):
+            raise RuntimeError("VLLM_HPU_NATIVE_DECODE_GRAPH currently requires tensor_parallel_size=2")
 
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = \

@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import statistics
@@ -41,6 +42,7 @@ import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402
 
 import habana_frameworks.torch.core as htcore  # noqa: E402, F401
+from tp2_validation import validate_outputs  # noqa: E402
 
 
 def _load_bridge(path: Path):
@@ -209,14 +211,27 @@ def main() -> None:
         default="direct",
     )
     parser.add_argument("--validation-replays", type=int, default=3)
+    parser.add_argument(
+        "--validation-reference",
+        choices=("cpu", "stock-hpu"),
+        default="cpu",
+        help="Compare against the analytical CPU reference or a separately compiled stock HCCL/FusedRMSNorm chain.",
+    )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--debug-values", action="store_true")
+    parser.add_argument("--tensor-id-aba", action="store_true")
+    parser.add_argument("--validation-atol", type=float, default=0.015625)
+    parser.add_argument("--validation-rtol", type=float, default=0.015625)
     args = parser.parse_args()
     if args.elements <= 0 or args.elements % args.hidden_size:
         parser.error("elements must be a positive multiple of hidden-size")
     if args.calls <= 0:
         parser.error("calls must be positive")
+    if args.validation_replays <= 0 or args.iterations <= 0 or args.warmup < 0:
+        parser.error("validation-replays and iterations must be positive; warmup must be nonnegative")
+    if not all(math.isfinite(value) and value >= 0 for value in (args.validation_atol, args.validation_rtol)):
+        parser.error("validation tolerances must be finite and nonnegative")
 
     dist.init_process_group("hccl")
     rank = dist.get_rank()
@@ -226,7 +241,15 @@ def main() -> None:
     dist.all_reduce(warmup_collective)
     torch.hpu.synchronize()
     bridge = _load_bridge(args.bridge)
+    if callable(getattr(bridge, "reset_host_stage_debug", None)):
+        bridge.reset_host_stage_debug()
     backend = dist.group.WORLD._get_backend(torch.device("hpu"))
+    if args.debug_values and rank == 0:
+        loaded_libraries = [
+            line.rsplit(maxsplit=1)[-1] for line in Path("/proc/self/maps").read_text(encoding="utf-8").splitlines()
+            if "libhabana_pytorch_backend" in line or line.endswith("/libhcl.so")
+        ]
+        print(json.dumps({"loaded_libraries": sorted(set(loaded_libraries))}), flush=True)
     shape = (args.elements // args.hidden_size, args.hidden_size)
     outputs = _allocate_outputs(shape, args.calls)
     if args.mode in ("baseline", "compile-baseline"):
@@ -266,12 +289,23 @@ def main() -> None:
 
             compile_config = HPUCompileConfig(fullgraph=True, dynamic=False)
             run_chain = torch.compile(run_chain, **compile_config.get_compile_args())
+
+    stock_reference = None
+    if args.validation_reference == "stock-hpu":
+        from vllm_gaudi.utils import HPUCompileConfig
+
+        compile_config = HPUCompileConfig(fullgraph=True, dynamic=False)
+        stock_reference = torch.compile(_BaselineChain(args.calls, args.epsilon), **compile_config.get_compile_args())
     weight = None
     partial = None
     residual = None
 
     max_norm_error = 0.0
     max_residual_error = 0.0
+    norm_bitwise_equal = True
+    residual_bitwise_equal = True
+    max_norm_mismatches = 0
+    max_residual_mismatches = 0
     for replay in range(args.validation_replays):
         partial_cpu, residual_cpu, weight_cpu = _cpu_inputs(args.elements, args.hidden_size, rank, replay)
         if partial is None:
@@ -282,10 +316,51 @@ def main() -> None:
             partial.copy_(partial_cpu)
             residual.copy_(residual_cpu)
             weight.copy_(weight_cpu)
+        launch_count_before = bridge.collective_launch_count()
         chain_result = run_chain(partial, residual, weight)
         normalized, residual_out = chain_result[:2]
         torch.hpu.synchronize()
-        expected_norm, expected_residual = _reference(args.elements, args.hidden_size, replay, args.calls, args.epsilon)
+        if stock_reference is None:
+            expected_norm, expected_residual = _reference(args.elements, args.hidden_size, replay, args.calls,
+                                                          args.epsilon)
+        else:
+            expected_norm_hpu, expected_residual_hpu = stock_reference(partial, residual, weight)
+            torch.hpu.synchronize()
+            expected_norm, expected_residual = expected_norm_hpu.cpu(), expected_residual_hpu.cpu()
+        actual_cpu = normalized.cpu(), residual_out.cpu()
+        expected_launches = (args.calls if args.mode in (
+            "direct",
+            "custom-op",
+            "custom-op-out",
+            "compile",
+            "compile-out",
+            "native",
+            "compile-native",
+        ) else None)
+        valid, errors = validate_outputs(actual_cpu, (expected_norm, expected_residual),
+                                         atol=args.validation_atol,
+                                         rtol=args.validation_rtol,
+                                         launches=bridge.collective_launch_count() - launch_count_before,
+                                         expected_launches=expected_launches)
+        if args.debug_values and not valid:
+            print(
+                json.dumps({
+                    "rank": rank,
+                    "launches": bridge.collective_launch_count() - launch_count_before,
+                    "collective_debug_counts": bridge.collective_debug_counts(),
+                    "errors": errors,
+                    "actual_norm": actual_cpu[0].flatten()[:8].float().tolist(),
+                    "expected_norm": expected_norm.flatten()[:8].float().tolist(),
+                    "actual_residual": actual_cpu[1].flatten()[:8].float().tolist(),
+                    "expected_residual": expected_residual.flatten()[:8].float().tolist(),
+                }),
+                flush=True,
+            )
+        failed = torch.tensor([int(not valid)], dtype=torch.int32, device="hpu")
+        dist.all_reduce(failed)
+        if failed.cpu().item():
+            dist.destroy_process_group()
+            raise RuntimeError(f"TP2 validation failed before timing: replay={replay}, errors={errors}")
         if args.debug_values and replay == 0:
             print(
                 json.dumps({
@@ -312,23 +387,46 @@ def main() -> None:
             )
         max_norm_error = max(
             max_norm_error,
-            (normalized.cpu().float() - expected_norm.float()).abs().max().item(),
+            (actual_cpu[0].float() - expected_norm.float()).abs().max().item(),
         )
         max_residual_error = max(
             max_residual_error,
-            (residual_out.cpu().float() - expected_residual.float()).abs().max().item(),
+            (actual_cpu[1].float() - expected_residual.float()).abs().max().item(),
         )
+        norm_mismatches = int(torch.count_nonzero(actual_cpu[0] != expected_norm))
+        residual_mismatches = int(torch.count_nonzero(actual_cpu[1] != expected_residual))
+        norm_bitwise_equal &= norm_mismatches == 0
+        residual_bitwise_equal &= residual_mismatches == 0
+        max_norm_mismatches = max(max_norm_mismatches, norm_mismatches)
+        max_residual_mismatches = max(max_residual_mismatches, residual_mismatches)
 
     assert partial is not None and residual is not None and weight is not None
-    for _ in range(args.warmup):
-        chain_result = run_chain(partial, residual, weight)
-    torch.hpu.synchronize()
+    tensor_id_phases = []
+    phase_settings = (("default", None), )
+    if args.tensor_id_aba:
+        if not callable(getattr(bridge, "set_use_tensor_ids", None)):
+            raise RuntimeError("The bridge does not expose tensor-ID A/B control")
+        phase_settings = (("name-a0", False), ("id-b0", True), ("name-a1", False), ("id-b1", True))
     samples_us = []
-    for _ in range(args.iterations):
-        start = time.perf_counter_ns()
-        chain_result = run_chain(partial, residual, weight)
+    for phase_name, use_tensor_ids in phase_settings:
         torch.hpu.synchronize()
-        samples_us.append((time.perf_counter_ns() - start) / 1_000)
+        if use_tensor_ids is not None:
+            bridge.set_use_tensor_ids(use_tensor_ids)
+        for _ in range(args.warmup):
+            chain_result = run_chain(partial, residual, weight)
+        torch.hpu.synchronize()
+        samples_us = []
+        for _ in range(args.iterations):
+            start = time.perf_counter_ns()
+            chain_result = run_chain(partial, residual, weight)
+            torch.hpu.synchronize()
+            samples_us.append((time.perf_counter_ns() - start) / 1_000)
+        tensor_id_phases.append({
+            "phase": phase_name,
+            "use_tensor_ids": use_tensor_ids,
+            "host_sync_median_us": statistics.median(samples_us),
+            "per_call_median_us": statistics.median(samples_us) / args.calls,
+        })
 
     result = {
         "rank": rank,
@@ -339,13 +437,33 @@ def main() -> None:
         "calls": args.calls,
         "mode": args.mode,
         "validation_replays": args.validation_replays,
+        "validation_reference": args.validation_reference,
+        "validation_passed": True,
+        "validation_atol": args.validation_atol,
+        "validation_rtol": args.validation_rtol,
         "max_norm_error": max_norm_error,
         "max_residual_error": max_residual_error,
+        "norm_bitwise_equal": norm_bitwise_equal,
+        "residual_bitwise_equal": residual_bitwise_equal,
+        "max_norm_mismatches": max_norm_mismatches,
+        "max_residual_mismatches": max_residual_mismatches,
         "host_sync_median_us": statistics.median(samples_us),
         "host_sync_p95_us": sorted(samples_us)[max(0,
                                                    int(len(samples_us) * 0.95) - 1)],
         "per_call_median_us": statistics.median(samples_us) / args.calls,
     }
+    if callable(getattr(bridge, "host_stage_debug", None)):
+        calls, lock_ns, hccl_ns, recipe_ns, producer_ns, total_ns = bridge.host_stage_debug()
+        result["host_stage_debug"] = {
+            "calls": calls,
+            "lock_us_per_call": lock_ns / max(calls, 1) / 1_000,
+            "hccl_us_per_call": hccl_ns / max(calls, 1) / 1_000,
+            "recipe_us_per_call": recipe_ns / max(calls, 1) / 1_000,
+            "producer_us_per_call": producer_ns / max(calls, 1) / 1_000,
+            "total_us_per_call": total_ns / max(calls, 1) / 1_000,
+        }
+    if args.tensor_id_aba:
+        result["tensor_id_phases"] = tensor_id_phases
     print(json.dumps(result, sort_keys=True), flush=True)
     dist.destroy_process_group()
 

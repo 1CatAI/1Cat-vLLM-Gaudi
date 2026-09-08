@@ -1,0 +1,4 @@
+
+# Preserve upstream context whitespace in patches; validate added source with git apply.
+tools/communication/patches/*.patch -whitespace
+tools/communication/patches/native-runtime/*.patch -whitespace

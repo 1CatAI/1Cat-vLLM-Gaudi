@@ -68,6 +68,26 @@ target_compile_options(flashinfer_gaudi_kernels PRIVATE -Wall -Wextra -Werror -f
 target_link_options(flashinfer_gaudi_kernels PRIVATE -Wl,-z,noexecstack)
 
 option(FLASHINFER_GAUDI_BUILD_TESTS "Build CPU kernel-glue contract tests" OFF)
+
+# Separate research database: existing FlashInfer GUIDs and libraries retain
+# their current registration and qualification.
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/tp2_dynamic_quant_bf16_gaudi2.o"
+    COMMAND "${TPC_COMPILER}" -Wall -Werror -O2 -march=gaudi2 -I"${TPC_INCLUDE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/kernels/tp2_dynamic_quant_bf16_gaudi2.c"
+            -c -o "${CMAKE_CURRENT_BINARY_DIR}/tp2_dynamic_quant_bf16_gaudi2.o"
+    DEPENDS kernels/tp2_dynamic_quant_bf16_gaudi2.c VERBATIM)
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/tp2_dynamic_quant_bf16_gaudi2_embedded.o"
+    COMMAND "${ELF_OBJCOPY}" -I binary -O elf64-x86-64 -B i386:x86-64
+            tp2_dynamic_quant_bf16_gaudi2.o tp2_dynamic_quant_bf16_gaudi2_embedded.o
+    DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/tp2_dynamic_quant_bf16_gaudi2.o"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}" VERBATIM)
+set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/tp2_dynamic_quant_bf16_gaudi2_embedded.o"
+    PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+add_library(tp2_dynamic_quant_kernels SHARED host/tp2_quant_entry.cpp host/tp2_dynamic_quant_bf16_gaudi2.cpp
+    "${CMAKE_CURRENT_BINARY_DIR}/tp2_dynamic_quant_bf16_gaudi2_embedded.o")
+target_include_directories(tp2_dynamic_quant_kernels PRIVATE host "${TPC_INCLUDE_DIR}" "${HABANA_INCLUDE_DIR}")
+target_compile_options(tp2_dynamic_quant_kernels PRIVATE -Wall -Wextra -Werror -fno-strict-aliasing)
+target_link_options(tp2_dynamic_quant_kernels PRIVATE -Wl,-z,noexecstack)
 if(FLASHINFER_GAUDI_BUILD_TESTS)
     enable_testing()
     add_executable(flashinfer_gaudi_host_test host/test_kernel_glue.cpp)

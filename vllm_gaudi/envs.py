@@ -65,6 +65,7 @@ if TYPE_CHECKING:
     VLLM_HPU_TRITON_BLOCK_SIZE: int = 256
     VLLM_HPU_TRITON_SILU_BLOCK_SIZE: int = 128
     VLLM_HPU_TRITON_GDN_VALUE_TILE: int = 16
+    VLLM_HPU_NATIVE_DECODE_GRAPH: bool = False
 
     VLLM_GDN_CHUNK_SIZE: int = 0
     VLLM_GDN_NEUMANN_ITERS: int = 14
@@ -100,9 +101,21 @@ if TYPE_CHECKING:
     VLLM_HPU_DFLASH2_FULL_QUERY_CONV: bool = False
     VLLM_HPU_DFLASH2_DIRECT_CHECKPOINTS: bool = False
     VLLM_HPU_DFLASH2_DEVICE_PREPARE: bool = False
+    VLLM_HPU_FLASHINFER_GDN_TP2: bool = False
     VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE: bool = False
     VLLM_HPU_FLASHINFER_GDN_PREFILL: bool = False
     VLLM_HPU_GDN_DIRECT_STATE: bool = True
+    VLLM_HPU_GDN_ACTIVE_STATE_VIEWS: bool = False
+    VLLM_HPU_GDN_ASYNC_STATE_DMA: bool = False
+    VLLM_HPU_GDN_DIRECT_STATE_UPDATE: bool = False
+    VLLM_HPU_GDN_PRECISE_DMA_EVENTS: bool = False
+    VLLM_HPU_TP2_PREPARED_COMM: bool = False
+    VLLM_HPU_TP2_STATIC_GROUP_PLAN: bool = False
+    VLLM_HPU_TP2_NATIVE_JOINT_PLAN: bool = False
+    VLLM_HPU_TP2_GQA_COMPACT_KV: bool = False
+    VLLM_HPU_TP2_COMPILED_CONSUMER_NORM: bool = False
+    VLLM_HPU_TP2_NATIVE_DYNAMIC_QUANT: bool = False
+    VLLM_HPU_GDN_PADDED_DIRECT_STATE: bool = False
     VLLM_HPU_CGUID_DYNAMIC_QUANT: bool = False
     VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS: int = 32
     VLLM_HPU_FUSED_GREEDY_LOGITS: bool = False
@@ -114,6 +127,12 @@ if TYPE_CHECKING:
 environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HPU_DSV4_EARLY_OUTPUT_LOWERING":
     lambda: os.environ.get("VLLM_HPU_DSV4_EARLY_OUTPUT_LOWERING", "0").lower() in ("1", "true"),
+    "VLLM_HPU_TP2_NATIVE_DYNAMIC_QUANT":
+    lambda: os.environ.get("VLLM_HPU_TP2_NATIVE_DYNAMIC_QUANT", "0") == "1",
+    # Require the version-locked native decoder compute/collective replay path.
+    "VLLM_HPU_NATIVE_DECODE_GRAPH":
+    lambda: os.environ.get("VLLM_HPU_NATIVE_DECODE_GRAPH", "false").strip().lower() in ("1", "true"),
+
     # Contiguous cache fetching to avoid using costly gather operation on
     # Gaudi3. This is only applicable to HPU contiguous cache. If set to true,
     # contiguous cache fetch will be used.
@@ -128,9 +147,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
 
     # Fuse per-row amax, scale calculation, and FP8 cast on Gaudi2.
     "VLLM_HPU_FP8_JIT_DYNAMIC_QUANT":
-    lambda: os.environ.get(
-        "VLLM_HPU_FP8_JIT_DYNAMIC_QUANT", "false"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_FP8_JIT_DYNAMIC_QUANT", "false").lower() in ("1", "true"),
 
     # Enable prefill side kv_layout and block_size for heterogeneous run.
     "VLLM_HPU_HETERO_KV_LAYOUT":
@@ -187,16 +204,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fuse the four selected-expert packed-weight copies into one Gaudi2 TPC
     # launch for DeepSeek V4 single-token decode.
     "VLLM_HPU_DSV4_TPC_MXFP4_GATHER":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_TPC_MXFP4_GATHER", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_TPC_MXFP4_GATHER", "0").lower() in ("1", "true"),
 
     # Run the DeepSeek V4 single-token MXFP4 experts directly from stacked
     # weights using runtime expert IDs, avoiding selected-weight copies.
     "VLLM_HPU_DSV4_TPC_MXFP4_INDEXED":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_TPC_MXFP4_INDEXED", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_TPC_MXFP4_INDEXED", "0").lower() in ("1", "true"),
 
     # Skip DeepSeek V4 indexer scoring when every compressed candidate is
     # guaranteed to fit in top-k.
@@ -206,9 +219,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Keep DeepSeek V4 compressor/indexer score projections on the BF16 MME
     # path and cast only their small outputs to FP32.
     "VLLM_HPU_DSV4_BF16_SCORE_PROJECTION":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_BF16_SCORE_PROJECTION", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_BF16_SCORE_PROJECTION", "0").lower() in ("1", "true"),
 
     # Use Gaudi FusedSDPA for the gathered DeepSeek V4 sparse-attention core.
     "VLLM_HPU_DSV4_FUSED_SDPA":
@@ -218,139 +229,73 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gather and sparse attention. The PyTorch registration library is kept
     # external while the kernels are under performance validation.
     "VLLM_HPU_DSV4_TPC_DEQUANT_GATHER":
-    lambda: os.environ.get("VLLM_HPU_DSV4_TPC_DEQUANT_GATHER", "0").lower() in
-    ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_TPC_DEQUANT_GATHER", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_TPC_SPARSE_ATTN":
-    lambda: os.environ.get("VLLM_HPU_DSV4_TPC_SPARSE_ATTN", "0").lower() in
-    ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_TPC_SPARSE_ATTN", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_TPC_SPARSE_ATTN_MAX_WIDTH":
     lambda: int(os.environ.get("VLLM_HPU_DSV4_TPC_SPARSE_ATTN_MAX_WIDTH", "128")),
     "VLLM_HPU_DSV4_TPC_PAGED_SPARSE_ATTN":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_TPC_PAGED_SPARSE_ATTN", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_TPC_PAGED_SPARSE_ATTN", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_TPC_PAIR_HEADS":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_TPC_PAIR_HEADS", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_TPC_PAIR_HEADS", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_FLASHMLA_SPLIT_KV":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_FLASHMLA_SPLIT_KV", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_FLASHMLA_SPLIT_KV", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_FLASHMLA_TILED":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_FLASHMLA_TILED", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_FLASHMLA_TILED", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_FLASHMLA_SPLITS":
     lambda: int(os.environ.get("VLLM_HPU_DSV4_FLASHMLA_SPLITS", "2")),
     "VLLM_HPU_DSV4_FLASHMLA_PREFILL":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_FLASHMLA_PREFILL", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_FLASHMLA_PREFILL", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_FLASHMLA_PREFILL_MAX_WIDTH":
-    lambda: int(
-        os.environ.get(
-            "VLLM_HPU_DSV4_FLASHMLA_PREFILL_MAX_WIDTH", "640"
-        )
-    ),
+    lambda: int(os.environ.get("VLLM_HPU_DSV4_FLASHMLA_PREFILL_MAX_WIDTH", "640")),
     "VLLM_HPU_DSV4_MME_PAGED_SPARSE_ATTN":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_MME_PAGED_SPARSE_ATTN", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_MME_PAGED_SPARSE_ATTN", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_ATTENTION_BACKEND":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_ATTENTION_BACKEND", "auto"
-    ),
+    lambda: os.environ.get("VLLM_HPU_DSV4_ATTENTION_BACKEND", "auto"),
     "VLLM_HPU_DSV4_DIRECT_DECODE_DISPATCH":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_DIRECT_DECODE_DISPATCH", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_DIRECT_DECODE_DISPATCH", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_SHORT_INDEXER_CACHE_SKIP":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_SHORT_INDEXER_CACHE_SKIP", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_SHORT_INDEXER_CACHE_SKIP", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_TPC_SAVE_PARTIAL_STATES":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_TPC_SAVE_PARTIAL_STATES", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_TPC_SAVE_PARTIAL_STATES", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_TPC_SAVE_PARTIAL_STATES_MAX_WIDTH":
-    lambda: int(
-        os.environ.get(
-            "VLLM_HPU_DSV4_TPC_SAVE_PARTIAL_STATES_MAX_WIDTH", "1024"
-        )
-    ),
+    lambda: int(os.environ.get("VLLM_HPU_DSV4_TPC_SAVE_PARTIAL_STATES_MAX_WIDTH", "1024")),
     "VLLM_HPU_DSV4_TPC_SAVE_COMPRESS_NORM_C4":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_TPC_SAVE_COMPRESS_NORM_C4", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_TPC_SAVE_COMPRESS_NORM_C4", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_TPC_ORDERED_COMPRESSOR":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_TPC_ORDERED_COMPRESSOR", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_TPC_ORDERED_COMPRESSOR", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_TPC_ORDERED_C128_COMPRESSOR":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_TPC_ORDERED_C128_COMPRESSOR", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_TPC_ORDERED_C128_COMPRESSOR", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_FUSED_COMPRESSOR_FLASHMLA":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_FUSED_COMPRESSOR_FLASHMLA", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_FUSED_COMPRESSOR_FLASHMLA", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_FUSED_QNORM_COMPRESSOR":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_FUSED_QNORM_COMPRESSOR", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_FUSED_QNORM_COMPRESSOR", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_TPC_BF16_COMPRESS_INPUTS":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_TPC_BF16_COMPRESS_INPUTS", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_TPC_BF16_COMPRESS_INPUTS", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_TPC_MIXED_COMPRESS_INPUTS":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_TPC_MIXED_COMPRESS_INPUTS", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_TPC_MIXED_COMPRESS_INPUTS", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_TPC_QNORM_ROPE_KV_PACK":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_TPC_QNORM_ROPE_KV_PACK", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_TPC_QNORM_ROPE_KV_PACK", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_INLINE_ATTENTION":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_INLINE_ATTENTION", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_INLINE_ATTENTION", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_INLINE_ATTN_FRONTEND":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_INLINE_ATTN_FRONTEND", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_INLINE_ATTN_FRONTEND", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_COMPILE_CHUNK_SIZE":
-    lambda: int(os.environ.get(
-        "VLLM_HPU_DSV4_COMPILE_CHUNK_SIZE", "0"
-    )),
+    lambda: int(os.environ.get("VLLM_HPU_DSV4_COMPILE_CHUNK_SIZE", "0")),
     "VLLM_HPU_DSV4_BF16_ATTN_WEIGHT_CACHE":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_BF16_ATTN_WEIGHT_CACHE", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_BF16_ATTN_WEIGHT_CACHE", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_COMPILED_ATTN_FRONTEND":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_COMPILED_ATTN_FRONTEND", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_COMPILED_ATTN_FRONTEND", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_NATIVE_FP8_ATTN_FRONTEND":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_NATIVE_FP8_ATTN_FRONTEND", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_NATIVE_FP8_ATTN_FRONTEND", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_TPC_MHC":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_TPC_MHC", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_TPC_MHC", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_PACKED_DECODE_METADATA":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_PACKED_DECODE_METADATA", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_PACKED_DECODE_METADATA", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_DECODE_METADATA_RING_SIZE":
-    lambda: int(os.environ.get(
-        "VLLM_HPU_DSV4_DECODE_METADATA_RING_SIZE", "2"
-    )),
+    lambda: int(os.environ.get("VLLM_HPU_DSV4_DECODE_METADATA_RING_SIZE", "2")),
     "VLLM_HPU_DSV4_Q1_METADATA_FASTPATH":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_Q1_METADATA_FASTPATH", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_Q1_METADATA_FASTPATH", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_TPC_OP_LIBRARY":
     lambda: os.environ.get("VLLM_HPU_DSV4_TPC_OP_LIBRARY", None),
 
@@ -406,8 +351,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HPU_DFLASH2_DEVICE_PREPARE":
     lambda: os.environ.get("VLLM_HPU_DFLASH2_DEVICE_PREPARE", "false").strip().lower() in ("1", "true"),
 
-    # Enable the qualified Qwen3.8 TP1 fused direct-state decode recipe. By
+    # Enable the Qwen3.8 fused direct-state recipe for supported local TP heads. By
     # default this follows the parent FlashInfer-Gaudi GDN switch.
+    "VLLM_HPU_FLASHINFER_GDN_TP2":
+    lambda: os.environ.get("VLLM_HPU_FLASHINFER_GDN_TP2", "false").strip().lower() in ("1", "true"),
     "VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE":
     lambda: os.environ.get(
         "VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE",
@@ -425,6 +372,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use group-major compact GDN state views for full decode buckets.
     "VLLM_HPU_GDN_DIRECT_STATE":
     lambda: os.environ.get("VLLM_HPU_GDN_DIRECT_STATE", "true").strip().lower() in ("1", "true"),
+
+    # Bind active recurrent-state spans before entering compiled decoder groups.
+    "VLLM_HPU_GDN_ACTIVE_STATE_VIEWS":
+    lambda: os.environ.get("VLLM_HPU_GDN_ACTIVE_STATE_VIEWS", "false").strip().lower() in ("1", "true"),
+    "VLLM_HPU_GDN_ASYNC_STATE_DMA":
+    lambda: os.environ.get("VLLM_HPU_GDN_ASYNC_STATE_DMA", "false").strip().lower() in ("1", "true"),
+    "VLLM_HPU_GDN_DIRECT_STATE_UPDATE":
+    lambda: os.environ.get("VLLM_HPU_GDN_DIRECT_STATE_UPDATE", "false").strip().lower() in ("1", "true"),
+    "VLLM_HPU_GDN_PRECISE_DMA_EVENTS":
+    lambda: os.environ.get("VLLM_HPU_GDN_PRECISE_DMA_EVENTS", "false").strip().lower() in ("1", "true"),
+    "VLLM_HPU_TP2_PREPARED_COMM":
+    lambda: os.environ.get("VLLM_HPU_TP2_PREPARED_COMM", "false").strip().lower() in ("1", "true"),
+    "VLLM_HPU_TP2_STATIC_GROUP_PLAN":
+    lambda: os.environ.get("VLLM_HPU_TP2_STATIC_GROUP_PLAN", "false").strip().lower() in ("1", "true"),
+    "VLLM_HPU_TP2_NATIVE_JOINT_PLAN":
+    lambda: os.environ.get("VLLM_HPU_TP2_NATIVE_JOINT_PLAN", "0") == "1",
+    "VLLM_HPU_TP2_GQA_COMPACT_KV":
+    lambda: os.environ.get("VLLM_HPU_TP2_GQA_COMPACT_KV", "0") == "1",
+    "VLLM_HPU_TP2_COMPILED_CONSUMER_NORM":
+    lambda: os.environ.get("VLLM_HPU_TP2_COMPILED_CONSUMER_NORM", "0") == "1",
+
+    # Opt in to free-slot padding of the compact direct-state decode path.
+    "VLLM_HPU_GDN_PADDED_DIRECT_STATE":
+    lambda: os.environ.get("VLLM_HPU_GDN_PADDED_DIRECT_STATE", "false").strip().lower() in ("1", "true"),
 
     # Use Gaudi's calculate_scale_for_cast CGUID for decode-sized per-token
     # dynamic FP8 scales instead of materializing abs + reduce_max + scale
