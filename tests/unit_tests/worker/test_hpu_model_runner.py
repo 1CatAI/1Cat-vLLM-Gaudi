@@ -35,6 +35,7 @@ from vllm_gaudi.v1.worker.hpu_model_runner import (
     _model_warmup_decode_buckets,
     _sampler_warmup_batch_sizes,
     maybe_set_mamba_kv_cache_groups_ids,
+    prepare_tp2_fused_ar_norm_before_model_load,
     should_synchronize_hybrid_prefill_output,
     _HPUDeepseekV4PhaseChunk,
     _dsv4_compile_only_scope,
@@ -123,14 +124,10 @@ def test_dsv4_phase_chunk_uses_metadata_for_single_token_prefill(monkeypatch):
     monkeypatch.setattr(
         hpu_model_runner,
         "get_forward_context",
-        lambda: SimpleNamespace(
-            attn_metadata={
-                "layer.swa_cache": SimpleNamespace(
-                    num_prefills=1,
-                    num_decodes=0,
-                )
-            }
-        ),
+        lambda: SimpleNamespace(attn_metadata={"layer.swa_cache": SimpleNamespace(
+            num_prefills=1,
+            num_decodes=0,
+        )}),
     )
 
     chunk = _HPUDeepseekV4PhaseChunk(
@@ -147,14 +144,10 @@ def test_dsv4_phase_chunk_uses_metadata_for_decode(monkeypatch):
     monkeypatch.setattr(
         hpu_model_runner,
         "get_forward_context",
-        lambda: SimpleNamespace(
-            attn_metadata={
-                "layer.swa_cache": SimpleNamespace(
-                    num_prefills=0,
-                    num_decodes=1,
-                )
-            }
-        ),
+        lambda: SimpleNamespace(attn_metadata={"layer.swa_cache": SimpleNamespace(
+            num_prefills=0,
+            num_decodes=1,
+        )}),
     )
 
     chunk = _HPUDeepseekV4PhaseChunk(
@@ -168,6 +161,9 @@ def test_dsv4_phase_chunk_uses_metadata_for_decode(monkeypatch):
 
 def test_dsv4_compile_only_scope_is_process_global(monkeypatch):
     import vllm_gaudi.ops.hpu_hw_agnostic as hpu_hw_agnostic
+
+    if not hasattr(hpu_hw_agnostic, "_set_hpu_dsv4_compile_only"):
+        pytest.skip("DeepSeek native attention backend is not installed for this test process")
 
     monkeypatch.setattr(
         hpu_hw_agnostic,
@@ -186,12 +182,11 @@ def test_dummy_request_uses_each_cache_group_block_size():
     runner = SimpleNamespace(
         speculative_config=None,
         max_model_len=512,
-        kv_cache_config=SimpleNamespace(
-            kv_cache_groups=[
-                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=256)),
-                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=64)),
-                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=4)),
-            ]),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[
+            SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=256)),
+            SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=64)),
+            SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=4)),
+        ]),
         is_pooling_model=False,
     )
     requests = []
@@ -768,6 +763,28 @@ def test_tp2_fused_text_only_mm_inputs_defer_embedding(monkeypatch):
     assert embedded == []
 
 
+def test_prepare_tp2_fused_ar_norm_before_model_load(monkeypatch):
+    import vllm_gaudi.distributed.tp2_fused_ar_norm as fused_module
+
+    calls = []
+    monkeypatch.setattr(
+        model_runner_module,
+        "get_config",
+        lambda: SimpleNamespace(tp2_fused_ar_norm=True, tp2_gemma_fused_ar_norm=True),
+    )
+    monkeypatch.setattr(fused_module, "initialize_tp2_fused_ar_norm_runtime", lambda: calls.append("initialize"))
+    monkeypatch.setattr(fused_module, "validate_tp2_gemma_fusion_runtime", lambda width: calls.append(width))
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="qwen3_5_text")),
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+        hidden_size=5120,
+    )
+
+    prepare_tp2_fused_ar_norm_before_model_load(runner)
+
+    assert calls == ["initialize", 5120]
+
+
 def test_init_kv_cache_with_kv_sharing_invalid_target_layer_order(default_vllm_config: None):
     torch.set_default_dtype(torch.bfloat16)
     layer_0 = "model.layers.0.self_attn.attn"
@@ -1076,21 +1093,36 @@ def test_cache_block_capacity_keeps_hybrid_block_units_separate():
     assert runner._dummy_num_blocks == 862
 
 
-def test_direct_gdn_state_requires_group_major_request_order():
+def test_direct_gdn_state_accepts_contiguous_request_prefix_and_free_padding():
     runner = object.__new__(HPUModelRunner)
     runner._direct_gdn_state_enabled = True
+    runner._padded_direct_gdn_state_enabled = True
     runner._compact_gdn_enabled = True
     runner.use_prefix_caching = False
     runner._compact_gdn_group_ids = {1, 3}
     runner._compact_gdn_group_offset = {1: 0, 3: 1}
     runner._gdn_max_reqs = 4
     runner._gdn_state_slots_per_req = 1
+    runner._gdn_slot_free_list = []
 
     indices = torch.zeros(4, 4, dtype=torch.int32)
     indices[1] = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
     indices[3] = torch.tensor([5, 6, 7, 8], dtype=torch.int32)
     assert runner._can_use_direct_gdn_state(indices, num_indices=4, target_bs=4)
     assert not runner._can_use_direct_gdn_state(indices, num_indices=4, target_bs=4, tokens_per_request=2)
+
+    padded_indices = indices.clone()
+    padded_indices[1] = torch.tensor([1, 2, 3, -1], dtype=torch.int32)
+    padded_indices[3] = torch.tensor([5, 6, 7, -1], dtype=torch.int32)
+    runner._gdn_slot_free_list = [3]
+    assert runner._can_use_direct_gdn_state(padded_indices, num_indices=3, target_bs=4)
+
+    runner._gdn_slot_free_list = []
+    assert not runner._can_use_direct_gdn_state(padded_indices, num_indices=3, target_bs=4)
+
+    runner._gdn_slot_free_list = [3]
+    padded_indices[3, 3] = 8
+    assert not runner._can_use_direct_gdn_state(padded_indices, num_indices=3, target_bs=4)
 
     indices[3] = torch.tensor([6, 5, 7, 8], dtype=torch.int32)
     assert not runner._can_use_direct_gdn_state(indices, num_indices=4, target_bs=4)
@@ -1202,7 +1234,6 @@ def test_dflash_plain_decode_loads_accepted_checkpoint_and_stores_base():
     )
 
 
-
 def test_deepseek_v4_dynamo_cache_limit_includes_layer_specializations():
     from vllm_gaudi.v1.worker.hpu_model_runner import _dynamo_cache_limit
 
@@ -1222,8 +1253,7 @@ def test_deepseek_v4_dynamo_cache_limit_includes_layer_specializations():
 
 def test_deepseek_v4_needs_compile_validation_warmup():
     from vllm_gaudi.v1.worker.hpu_model_runner import (
-        _needs_compile_validation_warmup,
-    )
+        _needs_compile_validation_warmup, )
 
     assert _needs_compile_validation_warmup("deepseek_v4")
     assert not _needs_compile_validation_warmup("llama")
@@ -1239,10 +1269,7 @@ def test_deepseek_v4_needs_compile_validation_warmup():
 def test_framework_attention_index_dtype(model_type, expected_dtype):
     runner = SimpleNamespace(_get_model_type=lambda: model_type)
 
-    assert (
-        HPUModelRunner._framework_attention_index_dtype(runner)
-        == expected_dtype
-    )
+    assert (HPUModelRunner._framework_attention_index_dtype(runner) == expected_dtype)
 
 
 def test_framework_decode_dispatch_skips_legacy_metadata_path():
@@ -1250,9 +1277,7 @@ def test_framework_decode_dispatch_skips_legacy_metadata_path():
     calls = []
     runner = SimpleNamespace(
         use_framework_kv_cache_layout=True,
-        _create_framework_decode_input_data=lambda *args: (
-            calls.append(args) or expected
-        ),
+        _create_framework_decode_input_data=lambda *args: (calls.append(args) or expected),
     )
     context_lens = np.array([7], dtype=np.int32)
 
@@ -1280,22 +1305,18 @@ def test_framework_decode_fast_path_reuses_position_upload(monkeypatch):
     captured = {}
     runner = SimpleNamespace(
         attn_block_size=128,
-        bucketing_manager=SimpleNamespace(
-            find_decode_bucket=lambda *args: (1, 1, 1)
-        ),
+        bucketing_manager=SimpleNamespace(find_decode_bucket=lambda *args: (1, 1, 1)),
         get_dp_padding=lambda batch_size: 0,
         _framework_attention_index_dtype=lambda: torch.int32,
         positions_cpu=torch.tensor([7], dtype=torch.int64),
         input_ids_cpu=torch.tensor([11], dtype=torch.int32),
         device="cpu",
-        profiler=SimpleNamespace(
-            record_event=lambda *args: contextlib.nullcontext()
-        ),
+        profiler=SimpleNamespace(record_event=lambda *args: contextlib.nullcontext()),
         use_async_scheduling=False,
         _prepare_spec_decode_inputs=lambda *args: (args[1], None),
-        _build_framework_decode_attention_metadata=lambda **kwargs: (
-            captured.update(kwargs) or {"layer": "metadata"}
-        ),
+        _build_framework_decode_attention_metadata=lambda **kwargs: (captured.update(kwargs) or {
+            "layer": "metadata"
+        }),
     )
     monkeypatch.setattr(
         hpu_model_runner,
@@ -1317,9 +1338,7 @@ def test_framework_decode_fast_path_reuses_position_upload(monkeypatch):
     assert captured["positions_device"].data_ptr() == result.position_ids.data_ptr()
 
 
-def test_framework_decode_attention_metadata_uses_one_persistent_pack(
-    monkeypatch,
-):
+def test_framework_decode_attention_metadata_uses_one_persistent_pack(monkeypatch, ):
     h2d_calls = []
 
     def fake_h2d_copy(source, dest_tensor=None, dtype=None, device="hpu"):
@@ -1331,18 +1350,10 @@ def test_framework_decode_attention_metadata_uses_one_persistent_pack(
 
     captured = []
     fast_build_flags = []
-    builder = SimpleNamespace(
-        build=lambda **kwargs: (
-            fast_build_flags.append(kwargs["fast_build"])
-            or
-            captured.append(kwargs["common_attn_metadata"])
-            or kwargs["common_attn_metadata"]
-        )
-    )
+    builder = SimpleNamespace(build=lambda **kwargs: (fast_build_flags.append(kwargs["fast_build"]) or captured.append(
+        kwargs["common_attn_metadata"]) or kwargs["common_attn_metadata"]))
     block_table = SimpleNamespace(
-        get_cpu_tensor=lambda: torch.tensor(
-            [[3, -1]], dtype=torch.int32
-        ),
+        get_cpu_tensor=lambda: torch.tensor([[3, -1]], dtype=torch.int32),
         block_size=128,
     )
     runner = SimpleNamespace(
@@ -1351,29 +1362,17 @@ def test_framework_decode_attention_metadata_uses_one_persistent_pack(
             req_id_to_index={"request": 0},
             block_table=[block_table],
         ),
-        kv_cache_config=SimpleNamespace(
-            kv_cache_groups=[
-                SimpleNamespace(kv_cache_spec=SimpleNamespace())
-            ]
-        ),
-        attn_groups=[
-            [
-                SimpleNamespace(
-                    get_metadata_builder=lambda: builder,
-                    layer_names=["layer"],
-                )
-            ]
-        ],
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace())]),
+        attn_groups=[[SimpleNamespace(
+            get_metadata_builder=lambda: builder,
+            layer_names=["layer"],
+        )]],
         _PAD_BLOCK_ID=99,
         device="cpu",
         _framework_attention_index_dtype=lambda: torch.int32,
     )
-    monkeypatch.setenv(
-        "VLLM_HPU_DSV4_PACKED_DECODE_METADATA", "1"
-    )
-    monkeypatch.setenv(
-        "VLLM_HPU_DSV4_Q1_METADATA_FASTPATH", "1"
-    )
+    monkeypatch.setenv("VLLM_HPU_DSV4_PACKED_DECODE_METADATA", "1")
+    monkeypatch.setenv("VLLM_HPU_DSV4_Q1_METADATA_FASTPATH", "1")
     monkeypatch.setattr(
         hpu_model_runner,
         "async_h2d_copy",
@@ -1429,7 +1428,10 @@ def test_framework_decode_attention_metadata_uses_one_persistent_pack(
     [
         (
             "DeepseekSparseSWAMetadataBuilder",
-            {"window_size": 4, "block_size": 4},
+            {
+                "window_size": 4,
+                "block_size": 4
+            },
             5,
             6,
             {
@@ -1455,9 +1457,7 @@ def test_framework_decode_attention_metadata_uses_one_persistent_pack(
             {
                 "compress_ratio": 128,
                 "c128a_max_compressed": 4,
-                "kv_cache_spec": SimpleNamespace(
-                    num_states=2, block_size=256
-                ),
+                "kv_cache_spec": SimpleNamespace(num_states=2, block_size=256),
             },
             255,
             256,
@@ -1509,13 +1509,9 @@ def _make_framework_q1_common_metadata():
 
 
 def test_framework_q1_packed_swa_bypasses_device_metadata_kernel(monkeypatch):
-    sparse_swa = pytest.importorskip(
-        "vllm.models.deepseek_v4.hw_agnostic.attention.sparse_swa"
-    )
+    sparse_swa = pytest.importorskip("vllm.models.deepseek_v4.hw_agnostic.attention.sparse_swa")
 
-    builder = sparse_swa.DeepseekSparseSWAMetadataBuilder.__new__(
-        sparse_swa.DeepseekSparseSWAMetadataBuilder
-    )
+    builder = sparse_swa.DeepseekSparseSWAMetadataBuilder.__new__(sparse_swa.DeepseekSparseSWAMetadataBuilder)
     builder.decode_threshold = 1
     builder.window_size = 4
     builder.block_size = 4
@@ -1544,16 +1540,10 @@ def test_framework_q1_packed_swa_bypasses_device_metadata_kernel(monkeypatch):
     assert metadata.decode_swa_lens is packed_lens
 
 
-def test_framework_q1_packed_mla_bypasses_compressed_and_c128_builders(
-    monkeypatch,
-):
-    sparse_mla = pytest.importorskip(
-        "vllm.models.deepseek_v4.hw_agnostic.attention.sparse_mla"
-    )
+def test_framework_q1_packed_mla_bypasses_compressed_and_c128_builders(monkeypatch, ):
+    sparse_mla = pytest.importorskip("vllm.models.deepseek_v4.hw_agnostic.attention.sparse_mla")
 
-    builder = sparse_mla.DeepseekV4HWAgnosticMetadataBuilder.__new__(
-        sparse_mla.DeepseekV4HWAgnosticMetadataBuilder
-    )
+    builder = sparse_mla.DeepseekV4HWAgnosticMetadataBuilder.__new__(sparse_mla.DeepseekV4HWAgnosticMetadataBuilder)
     builder.compress_ratio = 128
     builder.kv_cache_spec = SimpleNamespace(block_size=256, num_states=2)
     packed_slot = torch.tensor([7], dtype=torch.int32)
@@ -1576,16 +1566,10 @@ def test_framework_q1_packed_mla_bypasses_compressed_and_c128_builders(
     assert metadata.c128a_decode_topk_lens is packed_lens
 
 
-def test_framework_q1_packed_indexer_bypasses_compressed_slot_builder(
-    monkeypatch,
-):
-    indexer = pytest.importorskip(
-        "vllm.models.deepseek_v4.hw_agnostic.attention.indexer"
-    )
+def test_framework_q1_packed_indexer_bypasses_compressed_slot_builder(monkeypatch, ):
+    indexer = pytest.importorskip("vllm.models.deepseek_v4.hw_agnostic.attention.indexer")
 
-    builder = indexer.DeepseekV4IndexerMetadataBuilder.__new__(
-        indexer.DeepseekV4IndexerMetadataBuilder
-    )
+    builder = indexer.DeepseekV4IndexerMetadataBuilder.__new__(indexer.DeepseekV4IndexerMetadataBuilder)
     builder.reorder_batch_threshold = 1
     builder.num_speculative_tokens = 0
     builder.compress_ratio = 4
@@ -1614,8 +1598,7 @@ def test_configure_dynamo_cache_limits_sets_pytorch_211_names():
     from types import SimpleNamespace
 
     from vllm_gaudi.v1.worker.hpu_model_runner import (
-        _configure_dynamo_cache_limits,
-    )
+        _configure_dynamo_cache_limits, )
 
     config = SimpleNamespace(
         cache_size_limit=8,
@@ -1629,6 +1612,7 @@ def test_configure_dynamo_cache_limits_sets_pytorch_211_names():
     assert config.recompile_limit == 87
     assert config.accumulated_cache_size_limit == 696
     assert config.accumulated_recompile_limit == 696
+
 
 def test_max_cudagraph_capture_size_defaults_to_max_num_batched_tokens(model_runner):
     """max_cudagraph_capture_size defaults to max_num_batched_tokens when not configured."""

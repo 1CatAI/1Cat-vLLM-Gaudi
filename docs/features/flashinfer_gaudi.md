@@ -33,16 +33,18 @@ export VLLM_HPU_FLASHINFER_GDN=1
 export FLASHINFER_GAUDI_BACKEND=auto
 ```
 
-This also enables the promoted Qwen3.8-27B TP1 prefill tactic. Set
+This also enables the shape-gated Qwen3.8-27B prefill tactic. Set
 `VLLM_HPU_FLASHINFER_GDN_PREFILL=0` to keep only the decode path enabled.
 The prefill dispatcher is deliberately shape-gated to BF16
-`Hq=Hk=16`, `Hv=48`, `K=V=128`, chunk size 128, and one uniform sequence;
+`Hq=Hk=16`, `Hv=48` for TP1, or rank-local `Hq=Hk=8`, `Hv=24` for TP2,
+with `K=V=128`, chunk size 128, and one uniform sequence. The TP2 shapes require
+`VLLM_HPU_FLASHINFER_GDN_TP2=1` in addition to the parent GDN flag;
 all other layouts retain the general HPU implementation.
 
 The prefill tactic transfers the useful FlashQLA algebra to Gaudi's execution
 model: it removes pairwise gate exponentials from the triangular solve,
 reuses the causal-decay tensor in phase B, shares KKT products across repeated
-key heads, keeps Q/K in their 16-head grouped-query form until a value-head
+key heads, keeps Q/K in their rank-local grouped-query form until a value-head
 operation actually needs the three-way broadcast, replaces three full
 triangular-band materialization passes with chunk-static causal masks, uses a
 recursive 16x16 block inverse, fuses the phase-B state projections, and defers
@@ -50,7 +52,7 @@ output additions outside the recurrent dependency chain. The masked decay
 also replaces invalid upper-triangle gate deltas with negative infinity before
 the exponential, preserving overflow safety without a second triangular pass.
 Keeping Q/K compact also means their L2 normalization no longer runs
-redundantly over 48 materialized heads. The normalization remains outside the
+redundantly over the three times larger set of value heads. The normalization remains outside the
 compiled graph because compiling it is a measured Gaudi2 regression. The
 promoted correctness-first tactic keeps the graph in FP32; BF16 bulk math
 remains a research option until it passes model-level quality gates.
@@ -98,16 +100,23 @@ indexed implementation.
 The production `H=16`, `HV=48`, `K=V=128` direct-state route has a static
 Gaudi recipe rather than deriving head dimensions inside the compiled graph.
 It normalizes packed Q/K together with an explicit reciprocal-square-root
-form and uses `addcmul` for the FP32 rank-one state update. Other shapes keep
+form, preserving the additive-epsilon contract `x * rsqrt(sum(x*x) + 1e-6)`,
+and uses `addcmul` for the FP32 rank-one state update. Other shapes keep
 the general FlashInfer-compatible implementation.
 
-For Qwen3.8-27B TP1 decode batches 1, 2, 4, 8, 16, and 32, the fused direct-state
+For Qwen3.8-27B TP1/TP2 decode batches 1, 2, 4, 8, 16, and 32, the fused direct-state
 recipe additionally combines gating, the static width-4 convolution update,
 and packed recurrence in one compile graph. Recurrent projections stay on MME,
 and the recurrent state update retains the regional-graph-friendly
 out-of-place ordering before copying into the owned contiguous cache view. Set
 `VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE=0` to disable this recipe independently
 while keeping the remaining FlashInfer-Gaudi route.
+
+The default-off TP2 port requires `VLLM_HPU_FLASHINFER_GDN_TP2=1` and uses a static `H=8`, `HV=24`, packed-width-5120 recurrence in
+this fused composition. Each rank retains its own head shard and state; the
+existing tensor-parallel reductions are unchanged. TP2 has focused operator
+checks and a batch-one serving screen. This does not extend the original TP1
+qualification to every TP2 bucket or to speculative decoding.
 
 The first native Gaudi2 GUID specializes Qwen3.8 decode (`H=16`, `HV=48`,
 `K=V=128`) with packed BF16 Q/K/V and beta, BF16 output, FP32 recurrent state,

@@ -21,6 +21,10 @@ _GDN_FUSED_DECODE_TACTIC = gdn_fused_decode_tactic()
 _GDN_FUSED_DECODE_MODEL_SHAPE = _GDN_FUSED_DECODE_TACTIC.get("model_shape", {})
 _GDN_FUSED_DECODE_BATCHES = frozenset(
     _GDN_FUSED_DECODE_MODEL_SHAPE.get("batch_buckets", ()) if isinstance(_GDN_FUSED_DECODE_MODEL_SHAPE, dict) else ())
+_GDN_FUSED_DECODE_LOCAL_GEOMETRIES = frozenset({
+    (10240, 48),
+    (5120, 24),
+})
 
 
 def flashinfer_gdn_enabled() -> bool:
@@ -38,6 +42,15 @@ def flashinfer_gdn_fused_decode_enabled() -> bool:
     return envs.VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE and bool(_GDN_FUSED_DECODE_TACTIC.get("promoted", False))
 
 
+def can_bind_gdn_active_state(batch: int, packed_width: int, value_heads: int) -> bool:
+    """Gate the eager state-view binding to the direct reference composition."""
+    use_reference = _BACKEND_POLICY == "pytorch" or (_BACKEND_POLICY == "auto" and not _PUBLIC_AUTO_PROMOTED
+                                                     and not _BRIDGE_AUTO_ENABLED)
+    return (flashinfer_gdn_enabled() and flashinfer_gdn_fused_decode_enabled() and use_reference
+            and batch in _GDN_FUSED_DECODE_BATCHES and (packed_width, value_heads) in _GDN_FUSED_DECODE_LOCAL_GEOMETRIES
+            and (value_heads != 24 or envs.VLLM_HPU_FLASHINFER_GDN_TP2))
+
+
 def maybe_run_gdn_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -53,7 +66,7 @@ def maybe_run_gdn_prefill(
     prefill_seq_len: int,
     scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None] | None:
-    """Run the promoted single-sequence Qwen3.8 prefill tactic.
+    """Run the single-sequence Qwen3.8 prefill tactic on local TP heads.
 
     Unsupported shapes deliberately return ``None`` so other Qwen GDN
     variants retain the general HPU implementation.
@@ -68,9 +81,13 @@ def maybe_run_gdn_prefill(
         return None
     if tuple(q.shape) != tuple(k.shape) or q.shape[0] != 1 or v.shape[0] != 1:
         return None
-    if q.shape[1] != v.shape[1] or q.shape[2:] != (16, 128) or v.shape[2:] != (48, 128):
+    key_heads, value_heads = q.shape[2], v.shape[2]
+    if (q.shape[1] != v.shape[1] or q.shape[3] != 128 or v.shape[3] != 128
+            or (key_heads, value_heads) not in ((16, 48), (8, 24))):
         return None
-    if log_decay.shape != (1, q.shape[1], 48) or beta.shape != (1, q.shape[1], 48):
+    if value_heads == 24 and not envs.VLLM_HPU_FLASHINFER_GDN_TP2:
+        return None
+    if log_decay.shape != (1, q.shape[1], value_heads) or beta.shape != (1, q.shape[1], value_heads):
         return None
     if log_decay.dtype != torch.float32:
         return None
@@ -209,8 +226,10 @@ def maybe_run_gdn_fused_decode_step(
     direct_state_group_count: int | None,
     direct_state_group_offset: int | None,
     scale: float,
+    state_is_active_view: bool = False,
+    defer_state_writeback: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Run the qualified Qwen3.8 fused direct-state decode composition."""
+    """Run the shape-gated direct-state decode composition on local TP heads."""
     if flashinfer_gdn_enabled():
         require_reference_allowed("vLLM fused GDN decode")
     use_reference = _BACKEND_POLICY == "pytorch" or (_BACKEND_POLICY == "auto" and not _PUBLIC_AUTO_PROMOTED
@@ -222,28 +241,44 @@ def maybe_run_gdn_fused_decode_step(
         return None
     if direct_state_group_count is None or direct_state_group_count <= 0 or direct_state_group_offset is None:
         return None
-    batch = mixed_qkv.shape[0]
-    if batch != load_state_indices.numel() or batch not in _GDN_FUSED_DECODE_BATCHES:
+    token_rows = mixed_qkv.shape[0]
+    state_rows = load_state_indices.numel()
+    ordinary_decode = token_rows == state_rows and token_rows in _GDN_FUSED_DECODE_BATCHES
+    if not ordinary_decode:
+        return None
+    if defer_state_writeback and (not ordinary_decode or not state_is_active_view):
+        return None
+    packed_width = mixed_qkv.shape[1] if mixed_qkv.ndim == 2 else -1
+    value_heads = A_log.numel()
+    if value_heads == 24 and not envs.VLLM_HPU_FLASHINFER_GDN_TP2:
+        return None
+    if (packed_width, value_heads) not in _GDN_FUSED_DECODE_LOCAL_GEOMETRIES:
         return None
     if (mixed_qkv.dtype != torch.bfloat16 or a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16
-            or tuple(mixed_qkv.shape[1:]) != (10240, ) or tuple(a.shape) != (batch, 48)
-            or tuple(b.shape) != (batch, 48)):
+            or tuple(mixed_qkv.shape[1:]) != (packed_width, ) or tuple(a.shape) != (token_rows, value_heads)
+            or tuple(b.shape) != (token_rows, value_heads)):
         return None
-    if (tuple(conv_state.shape) != (batch, 3, 10240) or conv_state.dtype != torch.bfloat16
-            or tuple(conv_weight.shape) != (10240, 4) or conv_weight.dtype != torch.bfloat16):
+    if (tuple(conv_state.shape) != (state_rows, 3, packed_width) or conv_state.dtype != torch.bfloat16
+            or tuple(conv_weight.shape) != (packed_width, 4) or conv_weight.dtype != torch.bfloat16):
         return None
-    if conv_bias is not None and (tuple(conv_bias.shape) != (10240, ) or conv_bias.dtype != torch.bfloat16):
+    if conv_bias is not None and (tuple(conv_bias.shape) != (packed_width, ) or conv_bias.dtype != torch.bfloat16):
         return None
-    if (tuple(A_log.shape) != (48, ) or tuple(dt_bias.shape) != (48, ) or A_log.dtype != torch.float32
+    if (tuple(A_log.shape) != (value_heads, ) or tuple(dt_bias.shape) != (value_heads, ) or A_log.dtype != torch.float32
             or dt_bias.dtype != torch.bfloat16):
         return None
 
-    group_span = (ssm_state.shape[0] - 2) // direct_state_group_count
-    if batch > group_span or not 0 <= direct_state_group_offset < direct_state_group_count:
-        return None
-    state_start = direct_state_group_offset * group_span + 1
-    selected_ssm_state = ssm_state.narrow(0, state_start, batch)
-    if tuple(selected_ssm_state.shape) != (batch, 48, 128, 128) or selected_ssm_state.dtype != torch.float32:
+    if state_is_active_view:
+        if not ordinary_decode:
+            return None
+        selected_ssm_state = ssm_state
+    else:
+        group_span = (ssm_state.shape[0] - 2) // direct_state_group_count
+        if state_rows > group_span or not 0 <= direct_state_group_offset < direct_state_group_count:
+            return None
+        state_start = direct_state_group_offset * group_span + 1
+        selected_ssm_state = ssm_state.narrow(0, state_start, state_rows)
+    if (tuple(selected_ssm_state.shape) != (state_rows, value_heads, 128, 128)
+            or selected_ssm_state.dtype != torch.float32):
         return None
 
     output, _, updated_state = qwen38_fused_decode_step_direct(
@@ -257,6 +292,9 @@ def maybe_run_gdn_fused_decode_step(
         conv_bias,
         selected_ssm_state,
         scale,
+        inplace_state=not defer_state_writeback,
+        direct_state_update=(envs.VLLM_HPU_GDN_DIRECT_STATE_UPDATE and state_is_active_view and token_rows == 1
+                             and value_heads == 24 and not defer_state_writeback),
     )
     return output.unsqueeze(0), updated_state
 

@@ -287,6 +287,45 @@ def test_enable_tp2_fused_ar_norm_rejects_non_dense_topology(monkeypatch):
     assert layer.self_attn.o_proj.reduce_results is True
 
 
+@pytest.mark.parametrize("probe_passes", [False, True])
+def test_gemma_native_probe_precedes_model_mutation(monkeypatch, default_vllm_config, probe_passes):
+    import vllm_gaudi.distributed.tp2_fused_ar_norm as fused_module
+    import vllm_gaudi.extension.runtime as runtime
+
+    class FakeQwenModel:
+        pass
+
+    layer = _fake_dense_layer("o_proj", lambda: HPUGemmaRMSNorm(8).to(torch.bfloat16))
+    inner = FakeQwenModel()
+    inner.layers, inner.start_layer, inner.end_layer = (layer, ), 0, 1
+    inner.norm = HPUGemmaRMSNorm(8).to(torch.bfloat16)
+    inner.embed_tokens = SimpleNamespace()
+    monkeypatch.setattr(qwen3_next_module, "UpstreamQwen3NextModel", FakeQwenModel)
+    monkeypatch.setattr(runtime, "get_config", lambda: SimpleNamespace(tp2_gemma_fused_ar_norm=True))
+    monkeypatch.setattr(fused_module, "initialize_tp2_fused_ar_norm_runtime", lambda: None)
+
+    def probe(width):
+        assert width == 8
+        assert layer.self_attn.o_proj.reduce_results
+        assert layer.mlp.down_proj.reduce_results
+        assert not hasattr(inner, "_hpu_tp2_defer_embedding_reduce")
+        if not probe_passes:
+            raise RuntimeError("probe failed")
+
+    monkeypatch.setattr(fused_module, "validate_tp2_gemma_fusion_runtime", probe)
+    if probe_passes:
+        assert enable_hpu_qwen3_tp2_fused_ar_norm(SimpleNamespace(model=inner)) == 3
+        assert inner.norm._hpu_tp2_gemma_native_ready
+        assert layer.input_layernorm._hpu_tp2_gemma_native_ready
+        assert not layer.self_attn.o_proj.reduce_results
+    else:
+        with pytest.raises(RuntimeError, match="probe failed"):
+            enable_hpu_qwen3_tp2_fused_ar_norm(SimpleNamespace(model=inner))
+        assert layer.self_attn.o_proj.reduce_results
+        assert layer.mlp.down_proj.reduce_results
+        assert not hasattr(inner.norm, "_hpu_tp2_gemma_native_ready")
+
+
 @pytest.mark.parametrize("unsupported_boundary", ["input_layernorm", "post_attention_layernorm", "final_norm"])
 def test_enable_tp2_fused_ar_norm_rejects_unsupported_norm_before_mutation(monkeypatch, default_vllm_config,
                                                                            unsupported_boundary):

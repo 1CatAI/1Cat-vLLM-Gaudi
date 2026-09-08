@@ -76,6 +76,7 @@ def get_user_flags():
 
 def get_experimental_flags():
     flags = [
+        Env('VLLM_HPU_NATIVE_DECODE_GRAPH', boolean),
         Env('VLLM_PT_PROFILE', str),
         Env('VLLM_PROFILE_PROMPT', str),
         Env('VLLM_PROFILE_DECODE', str),
@@ -142,6 +143,7 @@ def get_features():
         Value('row_parallel_chunks', 1, env_var='VLLM_ROW_PARALLEL_CHUNKS', env_var_type=int),
         Value('row_parallel_chunk_threshold', 8192, env_var='VLLM_ROW_PARALLEL_CHUNK_THRESHOLD', env_var_type=int),
         Value('tp2_fused_ar_norm', False, env_var='VLLM_HPU_TP2_FUSED_AR_NORM', env_var_type=boolean),
+        Value('tp2_gemma_fused_ar_norm', False, env_var='VLLM_HPU_TP2_GEMMA_FUSED_AR_NORM', env_var_type=boolean),
         Value('tp2_fused_ar_norm_max_bytes', 524288, env_var='VLLM_HPU_TP2_FUSED_AR_NORM_MAX_BYTES', env_var_type=int),
         Value('use_dispatch_fn',
               All(VersionRange(">=1.24.0.460"), MinPackageVersion("neural_compressor_pt", "3.7")),

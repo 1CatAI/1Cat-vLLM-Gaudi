@@ -17,6 +17,7 @@ def _tp2_allreduce_residual_norm(
     epsilon: float,
     *,
     allow_fused: bool = True,
+    prefer_direct: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from vllm.forward_context import get_forward_context
     from vllm_gaudi.distributed.tp2_fused_ar_norm import tp2_allreduce_residual_rms_norm
@@ -30,6 +31,7 @@ def _tp2_allreduce_residual_norm(
         epsilon,
         is_prompt=is_prompt,
         allow_fused=allow_fused,
+        prefer_direct=prefer_direct,
     )
     return normalized.reshape(x.shape), residual
 
@@ -82,10 +84,14 @@ class HPUGemmaRMSNorm(GemmaRMSNorm):
         gemma_weight = self.weight + 1.0
         if residual is not None:
             if getattr(self, "_hpu_tp2_fused_ar_norm", False):
-                # Row-parallel layers have deferred their reduction to this
-                # boundary. Gemma has not validated the native fused decode
-                # path: preserve its effective weight/dtype with stock HCCL.
-                return _tp2_allreduce_residual_norm(x, residual, gemma_weight, self.variance_epsilon, allow_fused=False)
+                # Stock HCCL remains the default. The experimental native path
+                # is marked ready only after both ranks pass a startup probe.
+                return _tp2_allreduce_residual_norm(x,
+                                                    residual,
+                                                    gemma_weight,
+                                                    self.variance_epsilon,
+                                                    allow_fused=getattr(self, "_hpu_tp2_gemma_native_ready", False),
+                                                    prefer_direct=getattr(self, "_hpu_tp2_gemma_native_ready", False))
             orig_shape = x.shape
             residual = residual + x.reshape(residual.shape)
             # Note: HPUFusedRMSNorm requires 3D tensors as inputs

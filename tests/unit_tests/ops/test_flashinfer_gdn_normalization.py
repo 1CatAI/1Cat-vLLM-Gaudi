@@ -53,10 +53,10 @@ def test_fused_step_benchmark_uses_the_same_normalization_contract(amplitude):
 
 
 @pytest.mark.parametrize("direct", [False, True])
-@pytest.mark.parametrize("qwen_shape", [False, True])
+@pytest.mark.parametrize("geometry", [(2, 4, 8), (16, 48, 128), (8, 24, 128)])
 @pytest.mark.parametrize("amplitude", [0.0, 1e-8, 1e-3, 0.1])
-def test_packed_decode_matches_independent_small_qk_oracle(direct, qwen_shape, amplitude):
-    q_heads, value_heads, dim = (16, 48, 128) if qwen_shape else (2, 4, 8)
+def test_packed_decode_matches_independent_small_qk_oracle(direct, geometry, amplitude):
+    q_heads, value_heads, dim = geometry
     generator = torch.Generator().manual_seed(521)
     q = (torch.randn(1, 1, q_heads, dim, generator=generator) * amplitude).bfloat16()
     k = (torch.randn(q.shape, generator=generator) * amplitude).bfloat16()
@@ -108,7 +108,8 @@ def test_mtp_normalization_preserves_all_checkpoints_padding_and_final_state(nor
 
 @pytest.mark.skipif(os.environ.get("FLASHINFER_GAUDI_RUN_HARDWARE_TESTS") != "1",
                     reason="explicit Gaudi2 hardware test opt-in required")
-def test_compiled_qwen_decode_small_qk_multistep_matches_independent_oracle():
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_compiled_qwen_decode_small_qk_multistep_matches_independent_oracle(tp_size):
     import habana_frameworks.torch  # noqa: F401
 
     def run(packed, decay, beta, state):
@@ -116,14 +117,15 @@ def test_compiled_qwen_decode_small_qk_multistep_matches_independent_oracle():
 
     compiled = torch.compile(run, backend="hpu_backend", fullgraph=True, dynamic=False)
     generator = torch.Generator().manual_seed(829)
-    state_cpu = torch.randn(1, 48, 128, 128, generator=generator) * 0.01
+    key_heads, value_heads = 16 // tp_size, 48 // tp_size
+    state_cpu = torch.randn(1, value_heads, 128, 128, generator=generator) * 0.01
     state = state_cpu.to("hpu")
     for step in range(32):
         amplitude = (0.0, 1e-8, 1e-3, 0.1)[step % 4]
-        q = (torch.randn(1, 1, 16, 128, generator=generator) * amplitude).bfloat16()
+        q = (torch.randn(1, 1, key_heads, 128, generator=generator) * amplitude).bfloat16()
         k = (torch.randn(q.shape, generator=generator) * amplitude).bfloat16()
-        v = (torch.randn(1, 1, 48, 128, generator=generator) * 0.1).bfloat16()
-        decay = -torch.rand(1, 1, 48, generator=generator) * 0.1
+        v = (torch.randn(1, 1, value_heads, 128, generator=generator) * 0.1).bfloat16()
+        decay = -torch.rand(1, 1, value_heads, generator=generator) * 0.1
         beta = torch.sigmoid(torch.randn(decay.shape, generator=generator)).bfloat16()
         expected, checkpoints = _oracle(q, k, v, state_cpu, decay, beta)
         state_cpu = checkpoints[:, -1].float()

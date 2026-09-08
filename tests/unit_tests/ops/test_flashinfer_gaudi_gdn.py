@@ -1160,9 +1160,12 @@ def test_qwen38_static_direct_recipe_matches_indexed_reference():
     torch.testing.assert_close(direct_state, indexed_state, atol=2e-5, rtol=2e-4)
 
 
-def test_qwen38_fused_direct_step_matches_existing_decode_chain():
+@pytest.mark.parametrize("tp_size", [1, 2])
+@pytest.mark.parametrize("batch", [1, 8])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_qwen38_fused_direct_step_matches_existing_decode_chain(tp_size: int, batch: int, with_bias: bool):
     generator = torch.Generator().manual_seed(127)
-    batch, q_heads, value_heads, dim = 1, 16, 48, 128
+    q_heads, value_heads, dim = 16 // tp_size, 48 // tp_size, 128
     packed_width = (2 * q_heads + value_heads) * dim
     packed = torch.randn(batch, packed_width, dtype=torch.bfloat16, generator=generator) * 0.1
     a = torch.randn(batch, value_heads, dtype=torch.bfloat16, generator=generator) * 0.1
@@ -1170,6 +1173,7 @@ def test_qwen38_fused_direct_step_matches_existing_decode_chain():
     A_log = torch.randn(value_heads, dtype=torch.float32, generator=generator) * 0.1 - 2.0
     dt_bias = torch.randn(value_heads, dtype=torch.bfloat16, generator=generator) * 0.1
     conv_weight = torch.randn(packed_width, 4, dtype=torch.bfloat16, generator=generator) * 0.05
+    conv_bias = (torch.randn(packed_width, dtype=torch.bfloat16, generator=generator) * 0.01 if with_bias else None)
     expected_conv_state = torch.randn(batch, 3, packed_width, dtype=torch.bfloat16, generator=generator) * 0.1
     actual_conv_state = expected_conv_state.clone()
     expected_ssm_state = torch.randn(batch, value_heads, dim, dim, generator=generator) * 0.01
@@ -1181,7 +1185,7 @@ def test_qwen38_fused_direct_step_matches_existing_decode_chain():
         x=packed,
         conv_state=expected_conv_state,
         weight=conv_weight,
-        bias=None,
+        bias=conv_bias,
         activation="silu",
         query_start_loc=torch.arange(batch + 1, dtype=torch.int32),
         direct_state_layout=True,
@@ -1206,7 +1210,7 @@ def test_qwen38_fused_direct_step_matches_existing_decode_chain():
         dt_bias,
         actual_conv_state,
         conv_weight,
-        None,
+        conv_bias,
         actual_ssm_state,
         scale,
     )
@@ -1236,20 +1240,22 @@ def test_vllm_adapter_leaves_mtp_batches_on_general_path():
 
 
 @pytest.mark.parametrize("batch", [1, 16, 32])
-def test_vllm_adapter_routes_qualified_fused_direct_step_without_conv_bias(batch: int):
-    packed = torch.empty(batch, 10240, dtype=torch.bfloat16)
-    a = torch.empty(batch, 48, dtype=torch.bfloat16)
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_vllm_adapter_routes_qualified_fused_direct_step_without_conv_bias(batch: int, tp_size: int):
+    packed_width, value_heads = 10240 // tp_size, 48 // tp_size
+    packed = torch.empty(batch, packed_width, dtype=torch.bfloat16)
+    a = torch.empty(batch, value_heads, dtype=torch.bfloat16)
     b = torch.zeros_like(a)
-    A_log = torch.zeros(48, dtype=torch.float32)
-    dt_bias = torch.zeros(48, dtype=torch.bfloat16)
-    conv_state = torch.empty(batch, 3, 10240, dtype=torch.bfloat16)
-    conv_weight = torch.zeros(10240, 4, dtype=torch.bfloat16)
-    ssm_state = torch.empty(batch + 2, 48, 128, 128, dtype=torch.float32)
+    A_log = torch.zeros(value_heads, dtype=torch.float32)
+    dt_bias = torch.zeros(value_heads, dtype=torch.bfloat16)
+    conv_state = torch.empty(batch, 3, packed_width, dtype=torch.bfloat16)
+    conv_weight = torch.zeros(packed_width, 4, dtype=torch.bfloat16)
+    ssm_state = torch.empty(batch + 2, value_heads, 128, 128, dtype=torch.float32)
     load_indices = torch.arange(1, batch + 1, dtype=torch.int32)
-    expected_output = torch.empty(batch, 48, 128, dtype=torch.bfloat16)
+    expected_output = torch.empty(batch, value_heads, 128, dtype=torch.bfloat16)
     expected = (expected_output, conv_state, ssm_state.narrow(0, 1, batch))
 
-    with mock.patch.dict(os.environ, {"VLLM_HPU_FLASHINFER_GDN": "1"}), \
+    with mock.patch.dict(os.environ, {"VLLM_HPU_FLASHINFER_GDN": "1", "VLLM_HPU_FLASHINFER_GDN_TP2": "1"}), \
             mock.patch(
                 "vllm_gaudi.ops.flashinfer_gaudi_adapter.qwen38_fused_decode_step_direct",
                 return_value=expected,
@@ -1273,7 +1279,7 @@ def test_vllm_adapter_routes_qualified_fused_direct_step_without_conv_bias(batch
         )
 
     assert result is not None
-    assert result[0].shape == (1, batch, 48, 128)
+    assert result[0].shape == (1, batch, value_heads, 128)
     assert result[1].untyped_storage().data_ptr() == ssm_state.untyped_storage().data_ptr()
     assert run.call_count == 1
     assert run.call_args.args[7] is None
@@ -1366,17 +1372,19 @@ def test_vllm_adapter_allows_indexed_reference_for_dflash_transition():
     torch.testing.assert_close(pool, expected_pool)
 
 
-def test_vllm_prefill_adapter_selects_promoted_qwen38_tactic():
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_vllm_prefill_adapter_selects_promoted_qwen38_tactic(tp_size: int):
     tokens = 64
-    q = torch.zeros(1, tokens, 16, 128, dtype=torch.bfloat16)
+    key_heads, value_heads = 16 // tp_size, 48 // tp_size
+    q = torch.zeros(1, tokens, key_heads, 128, dtype=torch.bfloat16)
     k = torch.zeros_like(q)
-    v = torch.zeros(1, tokens, 48, 128, dtype=torch.bfloat16)
-    log_decay = torch.zeros(1, tokens, 48, dtype=torch.float32)
-    beta = torch.ones(1, tokens, 48, dtype=torch.bfloat16)
-    initial_state = torch.zeros(1, 48, 128, 128, dtype=torch.float32)
+    v = torch.zeros(1, tokens, value_heads, 128, dtype=torch.bfloat16)
+    log_decay = torch.zeros(1, tokens, value_heads, dtype=torch.float32)
+    beta = torch.ones(1, tokens, value_heads, dtype=torch.bfloat16)
+    initial_state = torch.zeros(1, value_heads, 128, 128, dtype=torch.float32)
     expected = (torch.empty_like(v), initial_state.clone())
 
-    with mock.patch.dict(os.environ, {"VLLM_HPU_FLASHINFER_GDN_PREFILL": "1"}), \
+    with mock.patch.dict(os.environ, {"VLLM_HPU_FLASHINFER_GDN_PREFILL": "1", "VLLM_HPU_FLASHINFER_GDN_TP2": "1"}), \
             mock.patch(
                 "vllm_gaudi.ops.flashinfer_gaudi_adapter._chunk_gated_delta_rule_log_gate",
                 return_value=expected,

@@ -32,6 +32,7 @@ from vllm_gaudi.ops.qwen38_native_qk import (
     validate_qwen38_native_qk_shape,
 )
 from vllm_gaudi.ops.flashinfer_gaudi_adapter import (
+    can_bind_gdn_active_state,
     maybe_run_gdn_decode_packed,
     maybe_run_gdn_fused_decode_step,
     maybe_run_gdn_prefill,
@@ -155,6 +156,8 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self.compact_state_group_count = None
         self.dflash_conv_round_before_activation = envs.VLLM_HPU_DFLASH2_CONV_ROUND_BEFORE_ACTIVATION
         self.dflash_full_query_conv = envs.VLLM_HPU_DFLASH2_FULL_QUERY_CONV
+        self._hpu_defer_ssm_writeback = False
+        self._hpu_pending_ssm_state = None
 
         self.mamba_chunk_size, _ = resolve_hpu_gdn_chunk_size(self.model_config)
         self.gdn_fused_state_matmul = resolve_hpu_gdn_fused_state_matmul()
@@ -255,6 +258,39 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             indices = indices.index_select(0, cg.view(1)).squeeze(0)
         return indices
 
+    def prepare_decode_state_view(self, attn_metadata, num_tokens: int) -> None:
+        """Bind a cache alias before Dynamo sees the decoder group's inputs.
+
+        Selecting the span inside the compiled forward exposes the whole pool
+        to functionalization. A cached external view limits mutation outputs
+        to the active rows while retaining the scheduler-owned backing cache.
+        """
+        self._hpu_active_ssm_state = None
+        if (attn_metadata is None or bool(getattr(attn_metadata, "is_prompt", False))
+                or not bool(getattr(attn_metadata, "direct_gdn_state", False))
+                or getattr(self.cache_config, "enable_prefix_caching", False) or _triton_gaudi_mode == "strict"):
+            return
+        indices = getattr(attn_metadata, "load_indices_tensor", None)
+        if indices is None or not self.kv_cache:
+            return
+        batch = indices.shape[-1]
+        if num_tokens != batch or not can_bind_gdn_active_state(batch, self.qkv_size, self.A_log.numel()):
+            return
+        pool = self.kv_cache[1]
+        count, offset = self.compact_state_group_count, self.compact_state_group_offset
+        if count is None or count <= 0 or offset is None or not 0 <= offset < count:
+            return
+        span, remainder = divmod(pool.shape[0] - 2, count)
+        if remainder or not 0 < batch <= span:
+            return
+        key = (count, offset, batch)
+        if (getattr(self, "_hpu_active_ssm_source", None) is not pool
+                or getattr(self, "_hpu_active_ssm_key", None) != key):
+            self._hpu_cached_ssm_view = pool.narrow(0, offset * span + 1, batch)
+            self._hpu_active_ssm_source = pool
+            self._hpu_active_ssm_key = key
+        self._hpu_active_ssm_state = self._hpu_cached_ssm_view
+
     def _extract_metadata(self, num_tokens):
         """Extract forward-context metadata into plain tensors.
 
@@ -264,7 +300,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
-            return (False, None, None, None, None, None, None, None, 0, 0, 0, 0, None, False, None, False)
+            return (False, None, None, None, None, None, None, None, 0, 0, 0, 0, None, False, None, False, False)
 
         is_prompt = bool(getattr(attn_metadata, "is_prompt", False))
         load_state_indices = self._resolve_state_indices(attn_metadata, "load_indices_tensor")
@@ -280,7 +316,10 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             store_state_indices = load_state_indices
 
         conv_state = self.kv_cache[0]
-        ssm_state = self.kv_cache[1]
+        active_state = getattr(self, "_hpu_active_ssm_state", None)
+        state_is_active_view = (not is_prompt and bool(getattr(attn_metadata, "direct_gdn_state", False))
+                                and active_state is not None and active_state.shape[0] == num_tokens)
+        ssm_state = active_state if state_is_active_view else self.kv_cache[1]
 
         query_start_loc = attn_metadata.query_start_loc_p
         has_initial_state = getattr(attn_metadata, "has_initial_states_p", None)
@@ -324,7 +363,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         return (is_prompt, conv_state, ssm_state, load_state_indices, store_state_indices, query_start_loc,
                 has_initial_state, padding_mask_flat, num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len,
-                initial_state, direct_gdn_state, num_accepted_tokens, dflash_full_query)
+                initial_state, direct_gdn_state, num_accepted_tokens, dflash_full_query, state_is_active_view)
 
     def forward(
         self,
@@ -347,7 +386,8 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # === Metadata extraction (natural graph break) ===============
         (is_prompt, conv_state, ssm_state, load_state_indices, store_state_indices, query_start_loc, has_initial_state,
          padding_mask_flat, num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len, initial_state,
-         direct_gdn_state, num_accepted_tokens, dflash_full_query) = self._extract_metadata(num_tokens)
+         direct_gdn_state, num_accepted_tokens, dflash_full_query,
+         state_is_active_view) = self._extract_metadata(num_tokens)
 
         # === Part 1: Input Projection ================================
         if hasattr(self, 'in_proj_qkv'):
@@ -524,6 +564,11 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 if num_decodes <= group_span:
                     state_start = self.compact_state_group_offset * group_span + 1
                     selected_conv_state = conv_state.narrow(0, state_start, num_decodes)
+                    # A speculative cache reserves one extra convolution slot.
+                    # The promoted direct kernel consumes only the canonical
+                    # width-1 history; MTP rejection is handled by the explicit
+                    # checkpoint rather than by exposing the reserve slot.
+                    selected_conv_state = selected_conv_state[:, -(self.conv_kernel_size - 1):, :]
                     direct_conv_state = True
             conv_weights = self.conv1d.weight.view(
                 self.conv1d.weight.size(0),
@@ -552,8 +597,12 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     direct_state_group_count=self.compact_state_group_count,
                     direct_state_group_offset=self.compact_state_group_offset,
                     scale=self.head_k_dim**-0.5,
+                    state_is_active_view=state_is_active_view,
+                    defer_state_writeback=self._hpu_defer_ssm_writeback,
                 )
             if flashinfer_result is None:
+                if state_is_active_view:
+                    raise RuntimeError("Bound active GDN state requires the fused direct decode adapter")
                 if _triton_gaudi_mode != "strict":
                     g, beta = hpu_fused_gdn_gating(self.A_log, a, b, self.dt_bias)
                 conv_indices = load_state_indices
@@ -660,7 +709,9 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         use_qk_l2norm_in_kernel=True,
                     )
             if flashinfer_result is not None:
-                core_attn_out_result, _ = flashinfer_result
+                core_attn_out_result, next_state = flashinfer_result
+                if self._hpu_defer_ssm_writeback:
+                    self._hpu_pending_ssm_state = next_state
 
             non_spec_out = core_attn_out_result.squeeze(0)
             if non_spec_out.shape[0] == core_attn_out.shape[0]:

@@ -127,14 +127,8 @@ class HPUWorker(WorkerBase):
         """
         profiler_config = self.vllm_config.profiler_config
         legacy_profiler_dir = os.getenv('VLLM_TORCH_PROFILER_DIR')
-        torch_profiler_dir = (
-            legacy_profiler_dir
-            or (
-                profiler_config.torch_profiler_dir
-                if profiler_config.profiler == 'torch'
-                else None
-            )
-        )
+        torch_profiler_dir = (legacy_profiler_dir
+                              or (profiler_config.torch_profiler_dir if profiler_config.profiler == 'torch' else None))
         self.profiler_summary_only = getattr(profiler_config, "torch_profiler_summary_only", False)
         self.torch_profiler_dir = torch_profiler_dir
         self.profiler = None
@@ -157,14 +151,10 @@ class HPUWorker(WorkerBase):
         else:
             fn = torch.profiler.tensorboard_trace_handler
             with_stack = profiler_config.torch_profiler_with_stack
-        trace_handler = (
-            None
-            if self.profiler_summary_only
-            else fn(
-                self.torch_profiler_dir,
-                use_gzip=profiler_config.torch_profiler_use_gzip,
-            )
-        )
+        trace_handler = (None if self.profiler_summary_only else fn(
+            self.torch_profiler_dir,
+            use_gzip=profiler_config.torch_profiler_use_gzip,
+        ))
         self.profiler = torch.profiler.profile(
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
@@ -201,15 +191,12 @@ class HPUWorker(WorkerBase):
         averages = self.profiler.key_averages()
         tables = []
         for sort_key in (
-            'self_hpu_time_total',
-            'self_device_time_total',
-            'self_cpu_time_total',
+                'self_hpu_time_total',
+                'self_device_time_total',
+                'self_cpu_time_total',
         ):
             try:
-                tables.append(
-                    f"Sorted by {sort_key}\n"
-                    + averages.table(sort_by=sort_key, row_limit=200)
-                )
+                tables.append(f"Sorted by {sort_key}\n" + averages.table(sort_by=sort_key, row_limit=200))
             except (AttributeError, KeyError, RuntimeError) as exc:
                 tables.append(f"Unable to sort by {sort_key}: {exc}")
         summary_path = os.path.join(
@@ -240,6 +227,11 @@ class HPUWorker(WorkerBase):
         self.init_profiler()
 
     def shutdown(self):
+        from vllm_gaudi import envs as gaudi_envs
+        if gaudi_envs.VLLM_HPU_TP2_STATIC_GROUP_PLAN:
+            from vllm_gaudi.ops.tp2_prepared_plan import shutdown_prepared_group_plans
+
+            shutdown_prepared_group_plans()
         self._model_runner_stash.clear()
         self._model_runner_state_stash.clear()
         if self.model_runner is not None:

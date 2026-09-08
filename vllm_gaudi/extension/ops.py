@@ -20,7 +20,6 @@ import habana_frameworks.torch.utils.experimental as htexp
 import types
 from vllm.model_executor.layers.fused_moe import FusedMoeWeightScaleSupported
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization import get_quantization_config as vllm_get_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 import vllm_gaudi.envs as gaudi_envs
@@ -34,7 +33,6 @@ if is_hpu_gaudi2:
 
 import logging
 import os
-import vllm_gaudi.envs as gaudi_envs
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +52,7 @@ def _dsv4_profile_stage(name: str):
     if not _DSV4_PROFILE_STAGES:
         return nullcontext()
     return torch.profiler.record_function(f"dsv4::{name}")
+
 
 # MAX_EXPERTS_PER_SLICE is needed for 1.20, up to 64 experts per slice
 try:
@@ -120,8 +119,17 @@ def matmul_shape(lhs, rhs):
     return result
 
 
-def pipelined_pa(attn, value, block_bias, block_groups, block_mapping, sink, batch_size, matmul_av_op,
-                 batch2block_matmul_op, block2batch_matmul_op):
+def pipelined_pa(attn,
+                 value,
+                 block_bias,
+                 block_groups,
+                 block_mapping,
+                 sink,
+                 batch_size,
+                 matmul_av_op,
+                 batch2block_matmul_op,
+                 block2batch_matmul_op,
+                 compact_gqa=False):
     # When fp32_softmax is enabled attn is left in fp32 after Q@K
     # We can return to native dtype after we renormalize and calculate the adjustments
     if block_bias is not None and attn.dtype != block_bias.dtype:
@@ -158,7 +166,12 @@ def pipelined_pa(attn, value, block_bias, block_groups, block_mapping, sink, bat
             #Looks like a Synapse issue, need to investigate further.
             block_sums_sink = attn_sink.sum(dim=-1, keepdim=True)
             block_sums = block_sums + block_sums_sink
-    attn = matmul_av_op(attn, value)
+    if compact_gqa:
+        from vllm_gaudi.ops.gqa_compact import compact_gqa_matmul
+
+        attn = compact_gqa_matmul(attn, value, matmul_av_op)
+    else:
+        attn = matmul_av_op(attn, value)
     if get_config().fused_block_softmax_adjustment:
         out_shape = list(attn.shape[:3]) + [1] * (attn.dim() - 3)
         rescale = torch.ops.hpu.block_softmax_adjustment(block_max, block_sums.to(block_max.dtype), block_groups,
@@ -248,6 +261,11 @@ def flat_pa(query, key_cache, value_cache, block_list, block_mapping, block_bias
     batch_size, _, hidden_size = query.shape
     _, kv_heads, head_size = key_cache.shape
     q_heads = hidden_size // head_size
+    compact_gqa = gaudi_envs.VLLM_HPU_TP2_GQA_COMPACT_KV
+    if compact_gqa and not (is_hpu_gaudi2 and batch_size == 1 and (q_heads, kv_heads, head_size) == (12, 2, 256)
+                            and query.dtype == key_cache.dtype == value_cache.dtype == torch.bfloat16
+                            and k_scales is None and v_scales is None and not get_config().fp32_softmax):
+        raise RuntimeError("Compact GQA candidate requires Gaudi2 TP2 C1 Qwen BF16 KV and BF16 attention scores")
     k_scales_uf = None
     v_scales_uf = None
     if k_scales is not None:
@@ -285,7 +303,12 @@ def flat_pa(query, key_cache, value_cache, block_list, block_mapping, block_bias
             position_bias = position_bias.float()
         attn = matmul_qk_op(query, key, out=attn)
     else:
-        attn = matmul_qk_op(query, key)
+        if compact_gqa:
+            from vllm_gaudi.ops.gqa_compact import compact_gqa_matmul
+
+            attn = compact_gqa_matmul(query, key, matmul_qk_op)
+        else:
+            attn = matmul_qk_op(query, key)
 
     if position_bias is not None:
         if attn.dtype != position_bias.dtype:
@@ -301,7 +324,8 @@ def flat_pa(query, key_cache, value_cache, block_list, block_mapping, block_bias
                         batch_size=batch_size,
                         matmul_av_op=matmul_av_op,
                         batch2block_matmul_op=batch2block_matmul_op,
-                        block2batch_matmul_op=block2batch_matmul_op)
+                        block2batch_matmul_op=block2batch_matmul_op,
+                        compact_gqa=compact_gqa)
     attn = block2batch(attn, block_mapping, block2batch_matmul_op)
     attn = attn.squeeze(-2)
 
@@ -966,11 +990,7 @@ def apply_block_fp8_linear_hpu(
     force_channel_fp8: bool = False,
 ) -> torch.Tensor:
     if force_channel_fp8:
-        input_2d = (
-            input
-            if input.ndim == 2
-            else input.contiguous().view(-1, input.shape[-1])
-        )
+        input_2d = (input if input.ndim == 2 else input.contiguous().view(-1, input.shape[-1]))
         output = apply_fp8_linear_hpu(
             input_2d,
             layer.weight,
@@ -1009,11 +1029,7 @@ def apply_block_fp8_linear_hpu_dequant(
 ) -> torch.Tensor:
     assert input_scale is None
     # View input as 2D matrix for fp8 methods
-    input_2d = (
-        input
-        if input.ndim == 2
-        else input.contiguous().view(-1, input.shape[-1])
-    )
+    input_2d = (input if input.ndim == 2 else input.contiguous().view(-1, input.shape[-1]))
     if isinstance(original_M, torch.Tensor):
         original_M = original_M.data.item()
     if isinstance(original_N, torch.Tensor):
@@ -1056,22 +1072,19 @@ def _use_cguid_dynamic_quant(data, use_cguid=True):
     token_count = data.numel() // data.shape[-1]
     return use_cguid and (
         (envs.VLLM_HPU_CGUID_DYNAMIC_QUANT and data.ndim == 2
-         and data.shape[0] <= envs.VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS)
-        or (gaudi_envs.VLLM_HPU_DYNAMIC_QUANT_CGUID
-            and token_count >= gaudi_envs.VLLM_HPU_DYNAMIC_QUANT_CGUID_MIN_TOKENS)
-    )
+         and data.shape[0] <= envs.VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS) or
+        (gaudi_envs.VLLM_HPU_DYNAMIC_QUANT_CGUID and token_count >= gaudi_envs.VLLM_HPU_DYNAMIC_QUANT_CGUID_MIN_TOKENS))
 
 
 def _use_jit_dynamic_quant(data, single_scale=False):
-    return (
-        gaudi_envs.VLLM_HPU_FP8_JIT_DYNAMIC_QUANT
-        and is_hpu_gaudi2
-        and not single_scale
-        and data.ndim >= 2
-    )
+    return (gaudi_envs.VLLM_HPU_FP8_JIT_DYNAMIC_QUANT and is_hpu_gaudi2 and not single_scale and data.ndim >= 2)
 
 
 def dynamic_quant(data, single_scale=False, use_cguid=True):
+    if (gaudi_envs.VLLM_HPU_TP2_NATIVE_DYNAMIC_QUANT and not single_scale and data.ndim == 2 and data.shape[0] == 1):
+        if not _use_cguid_dynamic_quant(data, use_cguid=use_cguid):
+            raise RuntimeError("Native TP2 quant requires the qualified CGUID scale contract")
+        return torch.ops.custom_op.tp2_dynamic_quant(data)
     if _use_jit_dynamic_quant(data, single_scale):
         return torch.ops.hpu.cast_to_fp8_just_in_time(
             data,
@@ -1175,14 +1188,13 @@ def fp8_block_linear_postprocess_weights(layer, force_channel_fp8=False):
     layer._hpu_orig_N = int(orig_N)
     if force_channel_fp8:
         # convert to channel-wise fp8
-        weight, weight_scale_inv = dynamic_quant(
-            dequant_block_fp8_weight_naive(weight,
-                                           layer.weight_scale_inv.data,
-                                           layer.quant_config.weight_block_size,
-                                           original_M=orig_M,
-                                           original_N=orig_N,
-                                           do_unpad=True),
-            use_cguid=False)
+        weight, weight_scale_inv = dynamic_quant(dequant_block_fp8_weight_naive(weight,
+                                                                                layer.weight_scale_inv.data,
+                                                                                layer.quant_config.weight_block_size,
+                                                                                original_M=orig_M,
+                                                                                original_N=orig_N,
+                                                                                do_unpad=True),
+                                                 use_cguid=False)
         weight_scale_inv = weight_scale_inv.squeeze(-1)
         layer.weight.data.copy_(weight)
         layer.weight_scale_inv = torch.nn.Parameter(weight_scale_inv, requires_grad=False)
@@ -1208,14 +1220,12 @@ def fp8_block_linear_postprocess_weights(layer, force_channel_fp8=False):
 def fp8_block_moe_prepare_weights(layer, force_channel_fp8=False):
     if force_channel_fp8:
         # convert to channel-wise fp8
-        w13_weight, w13_weight_scale_inv = dynamic_quant(
-            dequant_block_fp8_weight_naive(layer.w13_weight.data, layer.w13_weight_scale_inv.data,
-                                           layer.quant_config.weight_block_size),
-            use_cguid=False)
-        w2_weight, w2_weight_scale_inv = dynamic_quant(
-            dequant_block_fp8_weight_naive(layer.w2_weight.data, layer.w2_weight_scale_inv.data,
-                                           layer.quant_config.weight_block_size),
-            use_cguid=False)
+        w13_weight, w13_weight_scale_inv = dynamic_quant(dequant_block_fp8_weight_naive(
+            layer.w13_weight.data, layer.w13_weight_scale_inv.data, layer.quant_config.weight_block_size),
+                                                         use_cguid=False)
+        w2_weight, w2_weight_scale_inv = dynamic_quant(dequant_block_fp8_weight_naive(
+            layer.w2_weight.data, layer.w2_weight_scale_inv.data, layer.quant_config.weight_block_size),
+                                                       use_cguid=False)
         w13_weight_scale_inv, w2_weight_scale_inv \
             = w13_weight_scale_inv.squeeze(-1), w2_weight_scale_inv.squeeze(-1)
         layer.w13_weight.data.copy_(w13_weight)
@@ -1758,25 +1768,17 @@ def _gather_mxfp4_decode_weights(
         device=expert_routing_table.device,
     ).view(1, -1)
 
-    can_use_tpc_gather = (
-        gaudi_envs.VLLM_HPU_DSV4_TPC_MXFP4_GATHER
-        and expert_routing_table.shape == (1, 6)
-        and w13.shape == (256, 2048, 2048)
-        and w2.shape == (256, 4096, 512)
-        and w13_scale.shape == (256, 2048, 128)
-        and w2_scale.shape == (256, 4096, 32)
-    )
+    can_use_tpc_gather = (gaudi_envs.VLLM_HPU_DSV4_TPC_MXFP4_GATHER and expert_routing_table.shape == (1, 6)
+                          and w13.shape == (256, 2048, 2048) and w2.shape == (256, 4096, 512)
+                          and w13_scale.shape == (256, 2048, 128) and w2_scale.shape == (256, 4096, 32))
     if can_use_tpc_gather:
-        w13_g, w2_g, w13_scale_g, w2_scale_g = (
-            torch.ops.custom_op
-            .custom_deepseek_v4_mxfp4_gather_u8_gaudi2(
-                expert_routing_table,
-                w13,
-                w2,
-                w13_scale,
-                w2_scale,
-            )
-        )
+        w13_g, w2_g, w13_scale_g, w2_scale_g = (torch.ops.custom_op.custom_deepseek_v4_mxfp4_gather_u8_gaudi2(
+            expert_routing_table,
+            w13,
+            w2,
+            w13_scale,
+            w2_scale,
+        ))
         return (
             local_ids,
             router_weights,
@@ -1802,20 +1804,16 @@ def _mxfp4_hpu_backend(graph_module, example_inputs):
         input_metadata = []
         for index, value in enumerate(example_inputs):
             if isinstance(value, torch.Tensor):
-                input_metadata.append(
-                    (
-                        index,
-                        tuple(value.shape),
-                        tuple(value.stride()),
-                        value.dtype,
-                        value.device,
-                        value.is_contiguous(),
-                    )
-                )
+                input_metadata.append((
+                    index,
+                    tuple(value.shape),
+                    tuple(value.stride()),
+                    value.dtype,
+                    value.device,
+                    value.is_contiguous(),
+                ))
             else:
-                input_metadata.append(
-                    (index, type(value).__name__, repr(value))
-                )
+                input_metadata.append((index, type(value).__name__, repr(value)))
         logger.warning(
             "MXFP4 graph inputs=%s\n%s",
             input_metadata,
@@ -1827,10 +1825,8 @@ def _mxfp4_hpu_backend(graph_module, example_inputs):
     )
 
 
-def _mxfp4_bias_fused_fwd(hidden_states, expert_routing_table,
-                          router_weights, w12_list, w3_list, w12_bias,
-                          w3_bias, d_scale_w12, d_scale_w3, block_size,
-                          experts_min, experts_max, chunk_size, total_experts,
+def _mxfp4_bias_fused_fwd(hidden_states, expert_routing_table, router_weights, w12_list, w3_list, w12_bias, w3_bias,
+                          d_scale_w12, d_scale_w3, block_size, experts_min, experts_max, chunk_size, total_experts,
                           alpha, limit):
     return torch.ops.hpu.mixture_of_experts.bias_mxfp4_fused_weights(
         hidden_states,
@@ -1854,10 +1850,8 @@ def _mxfp4_bias_fused_fwd(hidden_states, expert_routing_table,
     )
 
 
-def _mxfp4_fused_fwd(hidden_states, expert_routing_table, router_weights,
-                     w12_list, w3_list, d_scale_w12, d_scale_w3, block_size,
-                     activation, experts_min, experts_max, chunk_size,
-                     total_experts):
+def _mxfp4_fused_fwd(hidden_states, expert_routing_table, router_weights, w12_list, w3_list, d_scale_w12, d_scale_w3,
+                     block_size, activation, experts_min, experts_max, chunk_size, total_experts):
     return torch.ops.hpu.mixture_of_experts.mxfp4_fused_weights(
         hidden_states,
         expert_routing_table,
@@ -1954,10 +1948,7 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
 
     def _get_compiled_forward(self):
         if self._compiled_forward is None:
-            target = (
-                _mxfp4_bias_fused_fwd
-                if self.has_bias else _mxfp4_fused_fwd
-            )
+            target = (_mxfp4_bias_fused_fwd if self.has_bias else _mxfp4_fused_fwd)
             self._compiled_forward = torch.compile(
                 target,
                 backend=_mxfp4_hpu_backend,
@@ -1983,65 +1974,38 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
         if expert_routing_table.dtype != torch.int32:
             expert_routing_table = expert_routing_table.to(torch.int32)
 
-        can_use_indexed_tpc = (
-            gaudi_envs.VLLM_HPU_DSV4_TPC_MXFP4_INDEXED
-            and tokens_num == 1
-            and hidden_states.shape == (1, 4096)
-            and hidden_states.dtype == torch.bfloat16
-            and expert_routing_table.shape == (1, 6)
-            and router_weights.shape == (1, 6)
-            and router_weights.dtype == torch.bfloat16
-            and permuted_weights
-            and activation == "silu"
-            and self.block_size == 32
-            and not self.has_bias
-            and self.num_experts == 256
-            and self.experts_min == 0
-            and self.experts_max == 255
-            and self._stacked_w13 is not None
-            and self._stacked_w13.shape == (256, 2048, 2048)
-            and self._stacked_w2.shape == (256, 4096, 512)
-            and self._stacked_w13_scale.shape == (256, 2048, 128)
-            and self._stacked_w2_scale.shape == (256, 4096, 32)
-            and hidden_states.is_contiguous()
-            and expert_routing_table.is_contiguous()
-            and router_weights.is_contiguous()
-            and self._stacked_w13.is_contiguous()
-            and self._stacked_w2.is_contiguous()
-            and self._stacked_w13_scale.is_contiguous()
-            and self._stacked_w2_scale.is_contiguous()
-        )
+        can_use_indexed_tpc = (gaudi_envs.VLLM_HPU_DSV4_TPC_MXFP4_INDEXED and tokens_num == 1
+                               and hidden_states.shape == (1, 4096) and hidden_states.dtype == torch.bfloat16
+                               and expert_routing_table.shape == (1, 6) and router_weights.shape == (1, 6)
+                               and router_weights.dtype == torch.bfloat16 and permuted_weights and activation == "silu"
+                               and self.block_size == 32 and not self.has_bias and self.num_experts == 256
+                               and self.experts_min == 0 and self.experts_max == 255 and self._stacked_w13 is not None
+                               and self._stacked_w13.shape == (256, 2048, 2048)
+                               and self._stacked_w2.shape == (256, 4096, 512)
+                               and self._stacked_w13_scale.shape == (256, 2048, 128)
+                               and self._stacked_w2_scale.shape == (256, 4096, 32) and hidden_states.is_contiguous()
+                               and expert_routing_table.is_contiguous() and router_weights.is_contiguous()
+                               and self._stacked_w13.is_contiguous() and self._stacked_w2.is_contiguous()
+                               and self._stacked_w13_scale.is_contiguous() and self._stacked_w2_scale.is_contiguous())
         if can_use_indexed_tpc:
             with _dsv4_profile_stage("moe_mxfp4_indexed_tpc"):
-                return (
-                    torch.ops.custom_op
-                    .custom_deepseek_v4_mxfp4_indexed_moe_gaudi2(
-                        hidden_states,
-                        expert_routing_table,
-                        router_weights,
-                        self._stacked_w13,
-                        self._stacked_w2,
-                        self._stacked_w13_scale,
-                        self._stacked_w2_scale,
-                    )
-                )
+                return (torch.ops.custom_op.custom_deepseek_v4_mxfp4_indexed_moe_gaudi2(
+                    hidden_states,
+                    expert_routing_table,
+                    router_weights,
+                    self._stacked_w13,
+                    self._stacked_w2,
+                    self._stacked_w13_scale,
+                    self._stacked_w2_scale,
+                ))
 
         if torch.compiler.is_compiling():
-            compiled_fwd = (
-                _mxfp4_bias_fused_fwd
-                if self.has_bias else _mxfp4_fused_fwd
-            )
+            compiled_fwd = (_mxfp4_bias_fused_fwd if self.has_bias else _mxfp4_fused_fwd)
         else:
             compiled_fwd = self._get_compiled_forward()
-        can_gather_decode = (
-            gaudi_envs.VLLM_HPU_MXFP4_DECODE_GATHER
-            and tokens_num == 1
-            and not self.has_bias
-            and self.experts_min == 0
-            and self.experts_max == self.num_experts - 1
-            and self._stacked_w13 is not None
-            and expert_routing_table.shape[-1] < self.num_experts
-        )
+        can_gather_decode = (gaudi_envs.VLLM_HPU_MXFP4_DECODE_GATHER and tokens_num == 1 and not self.has_bias
+                             and self.experts_min == 0 and self.experts_max == self.num_experts - 1
+                             and self._stacked_w13 is not None and expert_routing_table.shape[-1] < self.num_experts)
         if can_gather_decode:
             with _dsv4_profile_stage("moe_mxfp4_gather"):
                 (
@@ -2060,18 +2024,10 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
                     self._stacked_w2_scale,
                 )
                 gathered_experts = expert_routing_table.shape[-1]
-                selected_w13 = tuple(
-                    w13_g[i] for i in range(gathered_experts)
-                )
-                selected_w2 = tuple(
-                    w2_g[i] for i in range(gathered_experts)
-                )
-                selected_w13_scale = tuple(
-                    w13_scale_g[i] for i in range(gathered_experts)
-                )
-                selected_w2_scale = tuple(
-                    w2_scale_g[i] for i in range(gathered_experts)
-                )
+                selected_w13 = tuple(w13_g[i] for i in range(gathered_experts))
+                selected_w2 = tuple(w2_g[i] for i in range(gathered_experts))
+                selected_w13_scale = tuple(w13_scale_g[i] for i in range(gathered_experts))
+                selected_w2_scale = tuple(w2_scale_g[i] for i in range(gathered_experts))
             with _dsv4_profile_stage("moe_mxfp4_native_selected"):
                 return compiled_fwd(
                     hidden_states,
