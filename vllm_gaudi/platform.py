@@ -292,6 +292,9 @@ class HpuPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+            from vllm_gaudi.ops.deepseek_v4_native import validate_config
+            validate_config(vllm_config)
         if gaudi_envs.VLLM_HPU_NATIVE_DECODE_GRAPH:
             if not (gaudi_envs.VLLM_HPU_TP2_STATIC_GROUP_PLAN and gaudi_envs.VLLM_HPU_TP2_PREPARED_COMM
                     and gaudi_envs.VLLM_HPU_GDN_DIRECT_STATE_UPDATE):

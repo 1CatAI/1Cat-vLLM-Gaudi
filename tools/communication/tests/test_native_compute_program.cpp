@@ -51,7 +51,22 @@ int main()
     assert(!external.canReplayAt((1ULL << 60) - external.completionDelta - 2));
     assert(full.canReplayAt((1ULL << 60) - full.completionDelta - 2));
     assert(!full.canReplayAt((1ULL << 60) - full.completionDelta - 1));
-    for (const auto& invalid : std::vector<std::vector<uint32_t>>{{0},{2},{1,1}})
+    auto shared = NativeComputeProgram::prepare({&pre, &post}, {1, 1}, wait, 16, 256);
+    assert(shared.producerOffsets == std::vector<uint64_t>({2, 2}));
+    assert(shared.completionDelta == program.completionDelta);
+    std::array<unsigned, 2> wait_counts{};
+    const Sync independent[] = {{8, 32767}, {8, 32768}};
+    for (const auto& page : shared.pages) {
+        std::vector<uint8_t> bytes(page.bytes.size());
+        NativeComputeProgram::writePage(bytes.data(), page, independent);
+        for (const auto& patch : page.patches) {
+            uint32_t word; std::memcpy(&word, bytes.data() + patch.byteOffset, 4);
+            assert((word >> 17) == ((independent[patch.dependency].targetValue >> patch.sourceShift) & 0x7fff));
+            ++wait_counts.at(patch.dependency);
+        }
+    }
+    assert(wait_counts[0] == 4 && wait_counts[1] == 4);
+    for (const auto& invalid : std::vector<std::vector<uint32_t>>{{0},{2},{1,0}})
     {
         bool rejected=false;
         try { NativeComputeProgram::prepare({&pre,&post}, invalid, wait, 16, 128); }

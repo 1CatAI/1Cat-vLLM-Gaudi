@@ -21,6 +21,8 @@ def _address(tensor):
 def _metadata_items(metadata):
     # The model runner's processed metadata is a generated named tuple.
     # Discovery happens once; replay reads only the selected tensor fields.
+    if isinstance(metadata, dict):
+        return metadata.items()
     if isinstance(metadata, tuple) and hasattr(metadata, "_fields"):
         return ((name, getattr(metadata, name)) for name in metadata._fields)
     if is_dataclass(metadata):
@@ -40,7 +42,12 @@ class _Binding:
         if self.source == "root":
             return roots[self.name]
         if self.source == "metadata":
-            return getattr(roots["metadata"], self.name)
+            value = roots["metadata"]
+            for name in self.name:
+                value = value[name] if isinstance(value, dict) or isinstance(name, int) else getattr(value, name)
+            return value
+        if self.source == "attention_inputs":
+            return roots["attention_inputs"][self.name]
         return getattr(self.owner, self.name)
 
 
@@ -56,12 +63,24 @@ class FixedDecodeInputs:
     def __init__(self, model, roots, captured_inputs):
         used = {_storage(value) for row in captured_inputs for value in row if isinstance(value, torch.Tensor)}
         candidates = []
-        for name in ("positions", "hidden_states", "residual"):
-            candidates.append(("root", name, None, roots[name]))
+        for name in ("positions", "hidden_states", "residual", "input_ids", "metadata_pack"):
+            destination = (roots.get("metadata_destination", roots.get(name))
+                           if name == "metadata_pack" else roots.get(name))
+            candidates.append(("root", name, None, destination))
         metadata = roots["metadata"]
-        for name, value in _metadata_items(metadata):
-            if isinstance(value, torch.Tensor):
-                candidates.append(("metadata", name, None, value))
+        if "attention_inputs" in roots:
+            pack = roots.get("metadata_destination", roots.get("metadata_pack"))
+            for index, value in enumerate(roots["attention_inputs"]):
+                if pack is None or _storage(value) != _storage(pack):
+                    candidates.append(("attention_inputs", index, None, value))
+        else:
+            def discover(value, path=()):
+                for name, item in _metadata_items(value):
+                    if isinstance(item, torch.Tensor):
+                        candidates.append(("metadata", (*path, name), None, item))
+                    elif isinstance(item, dict) or is_dataclass(item):
+                        discover(item, (*path, name))
+            discover(metadata)
         # Rotary preparation is already compiled, but replaces these buffers
         # before each decoder invocation. Their values must reach captured views.
         for module in model.modules():
@@ -85,10 +104,22 @@ class FixedDecodeInputs:
             for name in ("is_prompt", "direct_gdn_state", "block_size")
         }
         self.input_copies = 0
+        self.state_generation = roots.get("state_generation")
+        self.state_tensors = tuple(roots.get("state_tensors", ()))
+        self.state_signatures = tuple((_storage(value), _address(value), _layout(value))
+                                      for value in self.state_tensors)
+        self.native_staging = getattr(roots.get("adapter"), "name", None) == "deepseek_v4"
 
     def updates(self, roots):
         """Preflight every changing binding before copying any input."""
         metadata = roots["metadata"]
+        if roots.get("state_generation") != self.state_generation:
+            return None
+        state = tuple(roots.get("state_tensors", ()))
+        if len(state) != len(self.state_tensors) or any(
+                not isinstance(value, torch.Tensor) or (_storage(value), _address(value), _layout(value)) != signature
+                for value, signature in zip(state, self.state_signatures)):
+            return None
         if type(metadata) is not self.metadata_type:
             return None
         if any(getattr(metadata, name, None) != value for name, value in self.static_metadata.items()):
@@ -106,9 +137,13 @@ class FixedDecodeInputs:
                 pending.append((binding.destination, source))
         return pending
 
-    def apply(self, updates):
-        for destination, source in updates:
-            destination.copy_(source)
+    def apply(self, updates, graph=None):
+        if self.native_staging and graph is not None:
+            graph.stage_fixed_inputs([source for _, source in updates],
+                                     [destination for destination, _ in updates])
+        else:
+            for destination, source in updates:
+                destination.copy_(source)
         self.input_copies += len(updates)
 
     def tensors(self):

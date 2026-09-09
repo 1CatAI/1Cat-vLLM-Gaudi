@@ -35,6 +35,7 @@ _library.define("tp2_allreduce_residual_rms_norm_out(Tensor partial, Tensor resi
                 "Tensor weight, Tensor(a!) reduced, Tensor(b!) normalized, "
                 "Tensor(c!) residual_out, Tensor(d!) inverse_rms, float epsilon) -> ()")
 _library.define("tp2_exchange_peer(Tensor partial) -> Tensor")
+_library.define("tp2_allreduce_plain(Tensor partial) -> Tensor")
 
 
 def _exceeds_fused_decode_token_limit(partial: torch.Tensor, weight: torch.Tensor) -> bool:
@@ -84,6 +85,8 @@ def _load_bridge(path: Path):
 
 def initialize_tp2_fused_ar_norm_runtime() -> None:
     """Load the native bridge and bind it to the TP process group."""
+    from vllm_gaudi.extension.logger import logger as init_logger
+    log = init_logger()
     if getattr(torch, _RUNTIME_ATTR, None) is not None:
         return
     if not dist.is_initialized():
@@ -151,11 +154,13 @@ def initialize_tp2_fused_ar_norm_runtime() -> None:
     # Ensure ProcessGroupEagerHCCL owns an initialized communicator before the
     # bridge requests its current-stream handle.
     probe = torch.ones(128, dtype=torch.bfloat16, device="hpu")
+    log.info("TP2 prepared runtime: initializing communicator")
     dist.all_reduce(probe, group=tp_group)
     torch.hpu.synchronize()
     if not torch.equal(probe.cpu(), torch.full((128, ), 2, dtype=torch.bfloat16)):
         raise RuntimeError("TP2 HCCL process-group initialization failed")
 
+    log.info("TP2 prepared runtime: loading native adapter")
     bridge = _load_bridge(bridge_path)
     bridge.set_use_tensor_ids(use_tensor_ids == "1")
     backend = tp_group._get_backend(torch.device("hpu"))
@@ -183,18 +188,26 @@ def initialize_tp2_fused_ar_norm_runtime() -> None:
 
         register_gdn_state_update_pass()
     if envs.VLLM_HPU_TP2_STATIC_GROUP_PLAN:
+        log.info("TP2 prepared runtime: checking runtime fingerprints")
         _verify_prepared_runtime(bridge_path)
-        if not envs.VLLM_HPU_GDN_DIRECT_STATE_UPDATE or not envs.VLLM_HPU_TP2_PREPARED_COMM:
+        if not envs.VLLM_HPU_TP2_PREPARED_COMM or not (
+                envs.VLLM_HPU_GDN_DIRECT_STATE_UPDATE or envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH):
             raise RuntimeError("Prepared TP2 groups require direct state update and prepared communication")
         from vllm_gaudi.ops.tp2_prepared_plan import register_tp2_prepared_group_pass
 
         register_tp2_prepared_group_pass()
-    if envs.VLLM_HPU_NATIVE_DECODE_GRAPH:
+    if envs.VLLM_HPU_NATIVE_DECODE_GRAPH or envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+        if (envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH
+                and torch.hpu.get_device_name().upper().replace(" ", "") != "GAUDI2"):
+            raise RuntimeError("V4 native decode currently requires Gaudi2")
         required = ("NativeDecodeGraph", "native_decode_graph_available")
+        if envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+            required += ("record_native_completion", "copy_sampled_tokens_to_host")
         if not all(hasattr(bridge, name) for name in required) or not bridge.native_decode_graph_available():
             raise RuntimeError(
                 "VLLM_HPU_NATIVE_DECODE_GRAPH requires the version-locked Synapse and HCL native replay APIs; "
                 "no fallback was selected")
+    log.info("TP2 prepared runtime: initialization complete")
 
 
 def _resolve_runtime():
@@ -448,6 +461,18 @@ def _tp2_exchange_peer_fake(partial: torch.Tensor) -> torch.Tensor:
 
 _library.impl("tp2_exchange_peer", _tp2_exchange_peer_impl, dispatch_key="HPU")
 _library._register_fake("tp2_exchange_peer", _tp2_exchange_peer_fake)
+
+
+def _tp2_allreduce_plain_impl(partial: torch.Tensor) -> torch.Tensor:
+    bridge, backend, _ = _resolve_runtime()
+    if partial.shape != (1, 4096) or partial.dtype != torch.bfloat16 or not partial.is_contiguous():
+        raise RuntimeError("V4 native AllReduce requires contiguous BF16 [1, 4096]")
+    reduced = torch.empty_like(partial)
+    return bridge.tp2_allreduce_plain_current_stream(backend, partial, reduced)
+
+
+_library.impl("tp2_allreduce_plain", _tp2_allreduce_plain_impl, dispatch_key="HPU")
+_library._register_fake("tp2_allreduce_plain", _tp2_exchange_peer_fake)
 
 
 def _tp2_exchange_residual_rms_norm(

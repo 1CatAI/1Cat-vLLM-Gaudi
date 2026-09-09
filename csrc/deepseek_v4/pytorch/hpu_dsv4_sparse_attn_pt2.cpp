@@ -365,6 +365,11 @@ bool register_hybrid_qnorm_rope_kv_pack() {
       kHybridQnormRopeKvPackGuid,
       output_meta,
       nullptr);
+  for (const auto* schema : {
+           "custom_op::custom_deepseek_v4_native_qnorm_rope_kv_pack_bf16_gaudi2",
+           "custom_op::custom_deepseek_v4_native_qnorm_rope_kv_pack_ordered_bf16_gaudi2"}) {
+    habana::custom_op::registerUserCustomOp(schema, kHybridQnormRopeKvPackGuid, output_meta, nullptr);
+  }
   return true;
 }
 
@@ -3609,9 +3614,50 @@ qnorm_compressor_c4_functionalize(
   return completion;
 }
 
+// The mutable public contract is functionalized without cloning the KV pool.
+// The private form is consumed only with the returned completion dependency.
+at::Tensor native_qnorm_functionalize(
+    const at::Tensor& q,
+    const at::Tensor& kv,
+    const at::Tensor& cache_storage_u8,
+    const at::Tensor& cache_geometry,
+    const at::Tensor& slots,
+    const at::Tensor& positions,
+    const at::Tensor& cos_sin_cache) {
+  auto q_ = unwrap_functional_tensor(q);
+  auto kv_ = unwrap_functional_tensor(kv);
+  auto cache_storage_u8_ = unwrap_functional_tensor(cache_storage_u8);
+  auto cache_geometry_ = unwrap_functional_tensor(cache_geometry);
+  auto slots_ = unwrap_functional_tensor(slots);
+  auto positions_ = unwrap_functional_tensor(positions);
+  auto cos_sin_cache_ = unwrap_functional_tensor(cos_sin_cache);
+  static auto handle = c10::Dispatcher::singleton()
+      .findSchemaOrThrow("custom_op::custom_deepseek_v4_native_qnorm_rope_kv_pack_ordered_bf16_gaudi2", "")
+      .typed<at::Tensor(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&)>();
+  at::Tensor completion;
+  {
+    at::AutoDispatchSkipFunctionalize guard;
+    completion = handle.call(q_, kv_, cache_storage_u8_, cache_geometry_, slots_, positions_, cos_sin_cache_);
+  }
+  for (const auto& update : {
+           std::pair<const at::Tensor*, const at::Tensor*>{&q, &q_},
+           {&cache_storage_u8, &cache_storage_u8_}}) {
+    at::functionalization::impl::replace_(*update.first, *update.second);
+    at::functionalization::impl::commit_update(*update.first);
+    at::functionalization::impl::sync(*update.first);
+  }
+  return completion;
+}
+
 }  // namespace
 
 TORCH_LIBRARY_FRAGMENT(custom_op, m) {
+  m.def("custom_deepseek_v4_native_qnorm_rope_kv_pack_bf16_gaudi2("
+        "Tensor(a!) q, Tensor kv, Tensor(b!) cache_storage_u8, "
+        "Tensor cache_geometry, Tensor slots, Tensor positions, Tensor cos_sin_cache) -> Tensor");
+  m.def("custom_deepseek_v4_native_qnorm_rope_kv_pack_ordered_bf16_gaudi2("
+        "Tensor q, Tensor kv, Tensor cache_storage_u8, "
+        "Tensor cache_geometry, Tensor slots, Tensor positions, Tensor cos_sin_cache) -> Tensor");
   m.def(
       "custom_deepseek_v4_sparse_attn_bf16_gaudi2("
       "Tensor q, Tensor kv, Tensor indices, Tensor attn_sink, "
@@ -3852,6 +3898,8 @@ TORCH_LIBRARY_FRAGMENT(custom_op, m) {
 }
 
 TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
+  m.impl("custom_deepseek_v4_native_qnorm_rope_kv_pack_bf16_gaudi2", hybrid_qnorm_rope_kv_pack_hpu);
+  m.impl("custom_deepseek_v4_native_qnorm_rope_kv_pack_ordered_bf16_gaudi2", hybrid_qnorm_rope_kv_pack_hpu);
   m.impl(
       "custom_deepseek_v4_sparse_attn_bf16_gaudi2",
       sparse_attention_hpu);
@@ -3951,6 +3999,8 @@ TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
 }
 
 TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
+  m.impl("custom_deepseek_v4_native_qnorm_rope_kv_pack_bf16_gaudi2", qnorm_rope_kv_pack_meta);
+  m.impl("custom_deepseek_v4_native_qnorm_rope_kv_pack_ordered_bf16_gaudi2", qnorm_rope_kv_pack_meta);
   m.impl(
       "custom_deepseek_v4_sparse_attn_bf16_gaudi2",
       sparse_attention_meta);
@@ -4050,6 +4100,7 @@ TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
 }
 
 TORCH_LIBRARY_IMPL(custom_op, Functionalize, m) {
+  m.impl("custom_deepseek_v4_native_qnorm_rope_kv_pack_bf16_gaudi2", native_qnorm_functionalize);
   m.impl(
       "custom_deepseek_v4_save_compress_norm_c4_f32_noclone_gaudi2",
       save_compress_norm_c4_noclone_functionalize);

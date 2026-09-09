@@ -6,12 +6,15 @@
 #include <dlfcn.h>
 #include <pybind11/pybind11.h>
 #include <torch/extension.h>
+#include <ATen/record_function.h>
 #include <torch/csrc/jit/python/pybind_utils.h>
 
 #include <array>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <exception>
 #include <time.h>
 #include <cstdint>
 #include <cstdlib>
@@ -27,6 +30,7 @@
 #include "backend/habana_device/HPUDevice.h"
 #include "backend/habana_device/HPUStream.h"
 #include "backend/helpers/generic_resource_holder.h"
+#include "backend/helpers/get_n_bytes.h"
 #include "backend/helpers/tensor_info.h"
 #include "backend/helpers/tensor_utils.h"
 #include "habana_eager/eager_pipeline_utils.h"
@@ -407,7 +411,7 @@ void validateTensor(const at::Tensor &tensor, const at::Tensor &reference,
 void runTp2ExchangePeer(
     const std::shared_ptr<habana::HcclCommunicator> &communicator,
     at::Tensor partial, at::Tensor peer,
-    synapse_helpers::hpuStream_t hpu_stream) {
+    synapse_helpers::hpuStream_t hpu_stream, bool reduction_only = false) {
   g_collective_launch_count.fetch_add(1, std::memory_order_relaxed);
   auto device_context = communicator->getDeviceCtxt();
   auto &device = habana::HPUDeviceContext::get_device();
@@ -425,11 +429,15 @@ void runTp2ExchangePeer(
   device_context->lock_address(tensor_addresses,
                                resources->get_address_lock());
   const auto &locked = *resources->get_address_lock();
-  const hcclResult_t result = resolveTp2DirectExchange()(
-      reinterpret_cast<const void *>(locked.at(0)),
-      reinterpret_cast<void *>(locked.at(1)),
-      static_cast<size_t>(partial.numel()), hcclBfloat16, hcclSum,
-      *(communicator->GetHcclHandle()), stream);
+  const hcclResult_t result = reduction_only
+      ? hcclAllReduce(reinterpret_cast<const void *>(locked.at(0)),
+                      reinterpret_cast<void *>(locked.at(1)),
+                      static_cast<size_t>(partial.numel()), hcclBfloat16, hcclSum,
+                      *(communicator->GetHcclHandle()), stream)
+      : resolveTp2DirectExchange()(reinterpret_cast<const void *>(locked.at(0)),
+                      reinterpret_cast<void *>(locked.at(1)),
+                      static_cast<size_t>(partial.numel()), hcclBfloat16, hcclSum,
+                      *(communicator->GetHcclHandle()), stream);
   TORCH_CHECK(result == hcclSuccess, "HCCL TP2 exchange returned error ",
               result);
 
@@ -687,7 +695,7 @@ void queueGdnStateWaits(std::vector<std::shared_ptr<GdnStateDMATicket>> tickets,
 
 at::Tensor tp2ExchangePeer(c10d::ProcessGroupEagerHCCL *backend,
                            const at::Tensor &partial,
-                           const at::Tensor &peer) {
+                           const at::Tensor &peer, bool reduction_only = false) {
   TORCH_CHECK(tp2ExchangeEnabled(),
               "TP2 peer exchange requires the tp2-exchange algorithm");
   TORCH_CHECK(partial.dim() >= 2, "partial must have at least two dimensions");
@@ -715,13 +723,13 @@ at::Tensor tp2ExchangePeer(c10d::ProcessGroupEagerHCCL *backend,
     }
     habana::eager::PipelineTask<habana::eager::ThreadType::EXECUTE>(
         [communicator, backend_tensors = std::move(backend_tensors),
-         hpu_stream]() mutable {
+         hpu_stream, reduction_only]() mutable {
           runTp2ExchangePeer(communicator, std::move(backend_tensors[0]),
-                             std::move(backend_tensors[1]), hpu_stream);
+                             std::move(backend_tensors[1]), hpu_stream, reduction_only);
         });
   } else {
     habana::eager::JoinPendingPipelineThreads();
-    runTp2ExchangePeer(communicator, partial, peer, hpu_stream);
+    runTp2ExchangePeer(communicator, partial, peer, hpu_stream, reduction_only);
   }
   return peer;
 }
@@ -1165,8 +1173,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       })
       .def("add_compute", &PreparedGroupPlan::add_compute)
       .def("add_norm_view", &PreparedGroupPlan::add_norm_view)
+      .def("add_reshape_view", &PreparedGroupPlan::add_reshape_view)
       .def("add_exchange", &PreparedGroupPlan::add_exchange)
       .def("add_peer_exchange", &PreparedGroupPlan::add_peer_exchange)
+      .def("add_all_reduce", &PreparedGroupPlan::add_all_reduce)
       .def("prepare", [](PreparedGroupPlan& self, const c10::intrusive_ptr<c10d::Backend>& backend,
                           std::vector<int64_t> outputs) {
         auto* group = dynamic_cast<c10d::ProcessGroupEagerHCCL*>(backend.get());
@@ -1180,9 +1190,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       })
       .def("outputs", &PreparedGroupPlan::outputs)
       .def("invalidate", [](PreparedGroupPlan& self) { self.valid.store(false); });
+  module.def("record_native_completion", &tp2_native::recordNativeCompletion);
+  module.def("copy_sampled_tokens_to_host", &tp2_native::copySampledTokensToHost);
+  py::class_<tp2_native::NativeCompletion, std::shared_ptr<tp2_native::NativeCompletion>>(
+      module, "NativeCompletion")
+      .def("query", &tp2_native::NativeCompletion::query, py::call_guard<py::gil_scoped_release>())
+      .def("synchronize", &tp2_native::NativeCompletion::synchronize, py::call_guard<py::gil_scoped_release>());
+
   py::class_<tp2_native::NativeDecodeGraph, std::shared_ptr<tp2_native::NativeDecodeGraph>>(
       module, "NativeDecodeGraph")
       .def(py::init<>())
+      .def("configure_topology", &tp2_native::NativeDecodeGraph::configureTopology)
       .def("capture", [](const std::shared_ptr<tp2_native::NativeDecodeGraph>& self,
                           std::vector<std::shared_ptr<PreparedGroupPlan>> plans, py::list inputs) {
         std::vector<torch::jit::Stack> stacks;
@@ -1195,7 +1213,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       })
       .def("instantiate", &tp2_native::NativeDecodeGraph::instantiate)
       .def("bind_dynamic_inputs", &tp2_native::NativeDecodeGraph::bindDynamicInputs)
+      .def("bind_state_tensors", &tp2_native::NativeDecodeGraph::bindStateTensors)
+      .def("workspace_bytes", &tp2_native::NativeDecodeGraph::workspaceBytes)
+      .def("stage_fixed_inputs", &tp2_native::NativeDecodeGraph::stageFixedInputs)
       .def("replay_fixed", &tp2_native::NativeDecodeGraph::replayFixed)
+      .def("replay_fixed_with_completion", &tp2_native::NativeDecodeGraph::replayFixedWithCompletion)
       .def("update_inputs", [](const std::shared_ptr<tp2_native::NativeDecodeGraph>& self,
                                 std::vector<std::shared_ptr<PreparedGroupPlan>> plans, py::list inputs) {
         std::vector<torch::jit::Stack> stacks;
@@ -1226,6 +1248,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       .def("input_update_copies", &tp2_native::NativeDecodeGraph::inputUpdateCopies)
       .def("input_update_bytes", &tp2_native::NativeDecodeGraph::inputUpdateBytes)
       .def("joint_info", &tp2_native::NativeDecodeGraph::jointInfo)
+      .def("hcl_shared_stream_info", &tp2_native::NativeDecodeGraph::hclSharedStreamInfo)
       .def("retirement_info", &tp2_native::NativeDecodeGraph::retirementInfo);
   module.def("native_decode_graph_available", [] { return tp2_native::RuntimeApis::get().available(); });
   py::class_<tp2_native::NativeTp2GraphProbe, std::shared_ptr<tp2_native::NativeTp2GraphProbe>>(
@@ -1357,4 +1380,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         return tp2ExchangePeer(hccl_backend, partial, peer);
       },
       py::arg("backend"), py::arg("partial"), py::arg("peer"));
+  module.def(
+      "tp2_allreduce_plain_current_stream",
+      [](const c10::intrusive_ptr<c10d::Backend> &backend,
+         const at::Tensor &partial, const at::Tensor &reduced) {
+        auto *hccl_backend = dynamic_cast<c10d::ProcessGroupEagerHCCL *>(backend.get());
+        TORCH_CHECK(hccl_backend != nullptr, "Plain TP2 reduction requires ProcessGroupEagerHCCL");
+        return tp2ExchangePeer(hccl_backend, partial, reduced, true);
+      }, py::arg("backend"), py::arg("partial"), py::arg("reduced"));
 }

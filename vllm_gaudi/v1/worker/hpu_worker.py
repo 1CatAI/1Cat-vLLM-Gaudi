@@ -169,6 +169,7 @@ class HPUWorker(WorkerBase):
 
     def start_profile(self):
         self._create_profiler()
+        self._write_native_decoder_stats("profile-start")
         high_level_profiler = self.model_runner.profiler  # type: ignore[union-attr]
         with high_level_profiler.record_event('internal', 'start_profiler'):
             # Clean up the queue
@@ -178,12 +179,44 @@ class HPUWorker(WorkerBase):
                 except queue.Empty:
                     break
             self.profiler.start()
+            self._refresh_native_profiler_commands()
 
     def stop_profile(self):
         if self.profiler is None:
             raise RuntimeError("Profiler is not enabled.")
         self.profiler.stop()
         self._write_profiler_summary()
+        self._write_native_decoder_stats("profile-stop")
+        self._refresh_native_profiler_commands()
+
+    @staticmethod
+    def _refresh_native_profiler_commands():
+        from vllm_gaudi import envs as gaudi_envs
+        if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+            from vllm_gaudi.ops.tp2_prepared_plan import recapture_native_decoder_programs
+            recapture_native_decoder_programs()
+
+    def _write_native_decoder_stats(self, phase):
+        from vllm_gaudi import envs as gaudi_envs
+        if not gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+            return
+        from vllm_gaudi.ops.tp2_prepared_plan import prepared_group_stats
+        import json
+        from pathlib import Path
+        torch.hpu.synchronize()
+        stats = prepared_group_stats()
+        stats.update(rank=self.rank, phase=phase)
+        if self.model_runner is not None:
+            stats["capture_snapshot_bytes"] = sum(
+                decoder.capture_bytes for module in self.model_runner.get_model().modules()
+                if (decoder := getattr(module, "_hpu_native_decoder", None)) is not None)
+            stats["allocated_bytes"] = torch.hpu.memory_allocated()
+            stats["peak_allocated_bytes"] = torch.hpu.max_memory_allocated()
+        logger.info("V4 native decoder statistics: %s", json.dumps(stats))
+        if self.torch_profiler_dir:
+            destination = Path(self.torch_profiler_dir)
+            destination.mkdir(parents=True, exist_ok=True)
+            (destination / f"rank{self.rank}-native-{phase}.json").write_text(json.dumps(stats, indent=2))
 
     def _write_profiler_summary(self) -> None:
         if not self.profiler_summary_only:
@@ -229,6 +262,7 @@ class HPUWorker(WorkerBase):
     def shutdown(self):
         from vllm_gaudi import envs as gaudi_envs
         if gaudi_envs.VLLM_HPU_TP2_STATIC_GROUP_PLAN:
+            self._write_native_decoder_stats("shutdown")
             from vllm_gaudi.ops.tp2_prepared_plan import shutdown_prepared_group_plans
 
             shutdown_prepared_group_plans()
@@ -660,6 +694,10 @@ class HPUWorker(WorkerBase):
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
 
+        if self.model_config.hf_config.model_type == "deepseek_v4":
+            from vllm_gaudi.ops.deepseek_v4_config import bind_worker_helpers
+            bind_worker_helpers(self.rank)
+
         return CompilationTimes(
             language_model=self.vllm_config.compilation_config.compilation_time,
             encoder=self.vllm_config.compilation_config.encoder_compilation_time,
@@ -702,13 +740,9 @@ class HPUWorker(WorkerBase):
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         if is_start:
-            self._create_profiler()
-            self.profiler.start()
+            self.start_profile()
         else:
-            if self.profiler is None:
-                raise RuntimeError("Profiler is not enabled.")
-            self.profiler.stop()
-            self._write_profiler_summary()
+            self.stop_profile()
 
     def execute_dummy_batch(self) -> None:
         self.model_runner._dummy_run(1)  # type: ignore[union-attr]

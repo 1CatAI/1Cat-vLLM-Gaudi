@@ -1,0 +1,129 @@
+diff --git a/vllm/models/deepseek_v4/hw_agnostic/attention/attention.py b/vllm/models/deepseek_v4/hw_agnostic/attention/attention.py
+index 291d1a9056..386c3fa4c5 100644
+--- a/vllm/models/deepseek_v4/hw_agnostic/attention/attention.py
++++ b/vllm/models/deepseek_v4/hw_agnostic/attention/attention.py
+@@ -224,6 +224,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
+         positions: torch.Tensor,
+         hidden_states: torch.Tensor,
+         llama_4_scaling: torch.Tensor | None = None,
++        decode_inputs: tuple[torch.Tensor, ...] | None = None,
+     ) -> torch.Tensor:
+         num_tokens = hidden_states.shape[0]
+         o_padded = torch.empty(
+@@ -232,7 +233,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
+             device=hidden_states.device,
+         )
+ 
+-        if self.inline_attention_frontend and hidden_states.shape[0] == 1:
++        if decode_inputs is not None:
++            o_padded = self._hpu_native_decode(hidden_states, positions, decode_inputs)
++        elif self.inline_attention_frontend and hidden_states.shape[0] == 1:
+             self.attention_frontend_impl(
+                 hidden_states, positions, o_padded
+             )
+diff --git a/vllm/models/deepseek_v4/hw_agnostic/model.py b/vllm/models/deepseek_v4/hw_agnostic/model.py
+index 44f4cc7e53..51b9b6044a 100644
+--- a/vllm/models/deepseek_v4/hw_agnostic/model.py
++++ b/vllm/models/deepseek_v4/hw_agnostic/model.py
+@@ -439,8 +439,9 @@ class DeepseekV4Attention(nn.Module):
+         positions: torch.Tensor,
+         hidden_states: torch.Tensor,
+         llama_4_scaling: torch.Tensor | None,
++        decode_inputs: tuple[torch.Tensor, ...] | None = None,
+     ):
+-        return self.mla_attn(positions, hidden_states, llama_4_scaling)
++        return self.mla_attn(positions, hidden_states, llama_4_scaling, decode_inputs)
+ 
+ 
+ class DeepseekV4DecoderLayer(nn.Module):
+@@ -548,6 +549,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+         post_mix: torch.Tensor | None = None,
+         res_mix: torch.Tensor | None = None,
+         residual: torch.Tensor | None = None,
++        decode_inputs: tuple[torch.Tensor, ...] | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+         if residual is None:
+             # First layer: standalone hc_pre.
+@@ -574,7 +576,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+                 norm_eps=self.attn_norm.variance_epsilon,
+             )
+ 
+-        x = self.attn(positions, x, None)
++        x = self.attn(positions, x, None, decode_inputs)
+ 
+         residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
+             x,
+@@ -608,6 +610,7 @@ class DeepseekV4DecoderLayerChunk(nn.Module):
+         self.layers = nn.ModuleList(layers)
+         self.start_layer = start_layer
+         self.debug_layers = (0, 1, 10, 20, model_end_layer - 1)
++        self.native_tail = None
+ 
+     def forward(
+         self,
+@@ -617,7 +620,12 @@ class DeepseekV4DecoderLayerChunk(nn.Module):
+         post_mix: torch.Tensor | None,
+         res_mix: torch.Tensor | None,
+         residual: torch.Tensor | None,
++        attention_inputs: tuple[tuple[torch.Tensor, ...], ...] | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++        if attention_inputs is not None and self.start_layer == 0:
++            hidden_states = hidden_states.unsqueeze(-2).repeat(
++                1, self.layers[0].hc_mult, 1
++            )
+         for offset, layer in enumerate(self.layers):
+             layer_index = self.start_layer + offset
+             hidden_states, residual, post_mix, res_mix = layer(
+@@ -627,6 +635,7 @@ class DeepseekV4DecoderLayerChunk(nn.Module):
+                 post_mix,
+                 res_mix,
+                 residual,
++                None if attention_inputs is None else attention_inputs[offset],
+             )
+             if layer_index in self.debug_layers:
+                 _dsv4_quality_debug_tensor(
+@@ -635,6 +644,8 @@ class DeepseekV4DecoderLayerChunk(nn.Module):
+                 _dsv4_quality_debug_tensor(
+                     f"layer_{layer_index}_residual", residual
+                 )
++        if attention_inputs is not None and self.native_tail is not None:
++            hidden_states = self.native_tail(hidden_states, residual, post_mix, res_mix)
+         return hidden_states, residual, post_mix, res_mix
+ 
+ 
+@@ -758,12 +769,18 @@ class DeepseekV4Model(nn.Module):
+         intermediate_tensors: IntermediateTensors | None,
+         inputs_embeds: torch.Tensor | None = None,
+     ) -> torch.Tensor | IntermediateTensors:
++        native_decoder = getattr(self, "_hpu_native_decoder", None)
++        native_decode = native_decoder is not None and native_decoder.is_decode()
+         if get_pp_group().is_first_rank:
+             if inputs_embeds is not None:
+                 hidden_states = inputs_embeds
++            elif native_decode:
++                hidden_states = native_decoder.embed(input_ids)
+             else:
+                 hidden_states = self.embed_input_ids(input_ids)
+             _dsv4_quality_debug_tensor("embedding", hidden_states)
++            if native_decode:
++                return native_decoder(hidden_states, positions, input_ids)
+             hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+         else:
+             assert intermediate_tensors is not None
+@@ -824,7 +841,16 @@ class DeepseekV4Model(nn.Module):
+         _dsv4_quality_debug_tensor("final_norm", hidden_states)
+         return hidden_states
+ 
++    def _apply(self, fn, recurse=True):
++        native_decoder = getattr(self, "_hpu_native_decoder", None)
++        if native_decoder is not None:
++            native_decoder.invalidate()
++        return super()._apply(fn, recurse=recurse)
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        native_decoder = getattr(self, "_hpu_native_decoder", None)
++        if native_decoder is not None:
++            native_decoder.invalidate()
+         stacked_params_mapping = [
+             # (param_name, shard_name, shard_id)
+             ("gate_up_proj", "w1", 0),

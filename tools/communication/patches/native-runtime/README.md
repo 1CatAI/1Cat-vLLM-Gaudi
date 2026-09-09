@@ -70,11 +70,14 @@ requires replacing shared production libraries.
 
 ## Execution contract
 
-The native path requires the static group plan, prepared communication, active
-GDN state views and direct state update. TP2 GDN local-head shapes additionally
-require `VLLM_HPU_FLASHINFER_GDN_TP2=1`; enabling the parent GDN switch alone does
-not opt into them. See the [environment variable reference](../../../../docs/configuration/env_variables.md)
-for the full set of prerequisite flags.
+The native path requires the static group plan and prepared communication.
+The Qwen adapter also requires active GDN state views and direct state update.
+TP2 GDN local-head shapes additionally require
+`VLLM_HPU_FLASHINFER_GDN_TP2=1`; enabling the parent GDN switch alone does not
+opt into them. The DeepSeek V4 adapter has its own attention and mHC state
+contract and does not require GDN. See the
+[V4 native decoder guide](../../../../docs/features/deepseek_v4_native_decode.md)
+and [environment variable reference](../../../../docs/configuration/env_variables.md).
 
 Preparation owns fixed inputs, state views, recipe metadata, compute program
 storage and communication resources. The joint plan publishes prepared command
@@ -88,6 +91,29 @@ Invalidate on allocation, slot binding or communicator changes; drain consumers
 before releasing resources. An error after state mutation terminates that
 execution without retrying another implementation. Counter rollover, queue
 wraparound and producer/consumer visibility are part of correctness.
+
+Ordinary V4 AllReduce nodes use a peer transfer followed by the original BF16
+addition in the compiled consumer. They do not use the Qwen residual/norm
+formula. Multiple independent transfers may share a compute consumer; every
+transfer retains its own completion wait and counter relocation. Contiguous
+reshape aliases retain their source storage range and are refreshed when
+external inputs are rebound.
+
+## Profiler compatibility
+
+The public Synapse snapshot uses the older profiler virtual interface. The
+patch routes SDK APIs added after that interface directly to their internal
+implementations; dispatching those methods through an older profiler object
+would call unrelated virtual functions. Use a matching profiler shim, SDK,
+plugins, parser and control executable together in a private process environment.
+
+When that SDK needs the older one-argument logger registration overload, build
+`tools/communication/tp2_profiler_logger_compat.cpp` as a shared library against
+the snapshot's `hl_logger` headers and the selected Bridge logger library.
+Preload this adapter only in the isolated profiling process. Select the Bridge
+logger before the profiler SDK directory in the library search path. Record
+all profiler and runtime fingerprints with the trace; a CPU-only trace does
+not validate device acquisition.
 
 ## Validation
 

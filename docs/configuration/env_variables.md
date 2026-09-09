@@ -100,7 +100,10 @@ are in progress.
 | `VLLM_HPU_TP2_COMPILED_CONSUMER_NORM` | Research-only Gaudi2 TP2 C1: keep dedicated exchange as a side-effect boundary and compile local add/residual/RMSNorm into its consumer. Requires the native joint plan and exact qualification. | `0` |
 | `VLLM_HPU_TP2_NATIVE_DYNAMIC_QUANT` | Research Gaudi2 TP2 C1: one TPC node for the unchanged CGUID BF16 scale/epsilon/reciprocal/FP8 sequence. Requires the separate kernel database, native adapter and complete exact/model qualification. | `0` |
 | `VLLM_HPU_TP2_STATIC_GROUP_PLAN` | Retains the eight compiled decoder groups, their fixed bindings, and their compute/collective dependency order. Requires prepared communication and direct GDN state update. | `false` |
+| `VLLM_HPU_TP2_PLAN_DUMP_DIR` | Optional directory for prepared compiler graphs, recipe IDs and compute/communication order. Writes only during preparation. | unset |
 | `VLLM_HPU_NATIVE_DECODE_GRAPH` | Research-only native replay for the Gaudi2 Qwen3.8 TP2 C1 decoder. Captures the eight compiled groups and 128 layer TP2 reductions into fixed-address Synapse/SCAL/HCL templates; the embedding reduction remains outside the decoder graph. Requires the two TP2 options above, direct GDN state update, matching custom runtime libraries, and `PT_HPU_POOL_MEM_ACQUIRE_PERC<=95` for persistent recipe storage. Explicit requests fail closed when any contract is missing. | `false` |
+| `VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH` | Experimental Gaudi2 DeepSeek V4 Flash BF16 TP2 C1 native decoder. Uses six compiled groups for all 43 layers, 86 ordinary AllReduces and the mHC/head/norm tail. Requires the prepared communication and joint-plan runtime, packed q1 metadata and context <=512; does not require GDN. Runtime ABI fingerprints are checked before model loading. | `false` |
+| `VLLM_HPU_DSV4_WORKER_HELPER_CPUS` | Semicolon-separated per-rank CPU sets for initialized background worker threads, e.g. `30-34,86-90;38-43,94-99`. Requires one main CPU per rank in `VLLM_HPU_DSV4_WORKER_CPUS`. Helper sets must be disjoint and exclude every main CPU and its SMT sibling. Applied in normal worker warmup. | unset |
 | `VLLM_HPU_GDN_PADDED_DIRECT_STATE` | Opts partially filled decode buckets into the direct-state path. Requires FlashInfer GDN and direct state to be enabled, a contiguous active-slot prefix, and every padding slot to be free. Paused requests retain their slots and are never used as padding. Prefix caching and multi-token decode retain the general path. | `false` |
 | `VLLM_HPU_CGUID_DYNAMIC_QUANT` | Uses Gaudi's fused scale-calculation CGUID for decode-sized per-token dynamic FP8 quantization. Large prefill matrices retain the existing reduction path to preserve its numerical behavior. When unset, this follows `VLLM_HPU_FLASHINFER_GDN`. | `false` (`true` with FlashInfer GDN) |
 | `VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS` | Maximum flattened row count eligible for CGUID dynamic quantization. Keep this below the smallest prefill token bucket; increasing it can change prefill graph fusion. | `32` |
@@ -207,6 +210,7 @@ The table below lists raw environment fallbacks outside that profile.
 | `VLLM_HPU_MXFP4_DECODE_GATHER` | Gathers only the routed packed experts before single-token MXFP4 MoE decode. Disable to use the full expert TensorList. | `true` |
 | `VLLM_HPU_DSV4_TPC_MXFP4_GATHER` | Uses one experimental Gaudi2 TPC launch to gather DeepSeek V4's four packed MXFP4 weight/scale tensors for the six routed experts. | `false` |
 | `VLLM_HPU_DSV4_TPC_MXFP4_INDEXED` | Uses the experimental Gaudi2 direct-indexed MXFP4 decode path, reading six routed experts from stacked weights without materializing selected weights. | `false` |
+| `VLLM_HPU_DSV4_MXFP4_PREPARED_MME` | Prepares DeepSeek V4 TP2 expert weights in the Gaudi2 Q16/S16 layout at load time and uses the exact BF16 direct-indexed MME path for single-token top-6 decode. Unsupported calls restore the checkpoint layout within a bounded temporary buffer. | `false` |
 | `VLLM_HPU_DSV4_BF16_ATTN_WEIGHT_CACHE` | Caches transposed BF16 copies of DeepSeek V4's fused Q/KV and Q-projection weights for single-token decode. Prompt processing stays on the block-FP8 path. | `false` |
 | `VLLM_HPU_DSV4_COMPILED_ATTN_FRONTEND` | Runs DeepSeek V4 single-token projection, Q/KV normalization, and Q projection through shared HPU-compiled functions. Requires the BF16 attention weight cache. | `false` |
 | `VLLM_HPU_DSV4_INLINE_ATTN_FRONTEND` | Inlines the DeepSeek V4 single-token projection frontend into coarse decoder graphs while keeping cache mutations and MLA behind a custom-op boundary. Requires the BF16 attention weight cache. | `false` |
@@ -236,6 +240,7 @@ The table below lists raw environment fallbacks outside that profile.
 | `VLLM_HPU_DSV4_TPC_MIXED_COMPRESS_INPUTS` | Preserves FP32 compressor projections while reading the static norm in BF16 and using the fused vector-RoPE TPC path. | `false` |
 | `VLLM_HPU_DSV4_TPC_QNORM_ROPE_KV_PACK` | Uses the experimental per-head fused Q norm/RoPE, KV RoPE/FP8 quantization, and direct paged-cache writer for single-token DeepSeek V4 decode. | `false` |
 | `VLLM_HPU_DSV4_TPC_MHC` | Uses the decode-specialized Gaudi2 fused post+pre MHC TPC kernel for the DeepSeek V4 hardware-agnostic model path. | `false` |
+| `VLLM_HPU_DSV4_TPC_SINKHORN` | Experimental V4 compiler fusion for the complete39-step FP32 C1 Sinkhorn chain. Preserves the surrounding projection, gates, softmax, norm and BF16 boundaries; requires the matching native kernel library. | `false` |
 | `VLLM_HPU_DSV4_PACKED_DECODE_METADATA` | Packs DeepSeek V4 q1 framework attention metadata into one persistent int32 host-to-device transfer per decode step. | `false` |
 | `VLLM_HPU_DSV4_DECODE_METADATA_RING_SIZE` | Number of host/device packed metadata buffers rotated by the DeepSeek V4 q1 decode path to avoid overwriting in-flight graph inputs. | `2` |
 | `VLLM_HPU_DSV4_Q1_METADATA_FASTPATH` | Enables uniform q1 shortcuts in DeepSeek V4 metadata builders, removing redundant per-step tensor construction and uploads. | `false` |
@@ -397,3 +402,23 @@ full K/V and the results simply concatenate; the output is unchanged apart from 
 !!! note
     This is independent of `VLLM_HPU_FSDPA_SLICE_ENABLED` and works with any bucketing strategy.
     When enabled, shapes whose bias already fits below the limit take the untiled path unchanged.
+
+## DeepSeek V4 indexed MXFP4 MME candidate
+
+`VLLM_HPU_DSV4_MXFP4_INDEXED_MME=1` selects the experimental BF16
+indexed MoE implementation for the existing Gaudi2 DeepSeek V4 TP2,
+single-token, top-6 shape. It defaults to `0`. Unsupported shapes continue
+through the existing path. If the old indexed TPC flag is also set, this
+MME candidate takes precedence for matching inputs.
+
+Immutable scales are checked once at weight load. Ordinary E8M0 codes
+`2..254` select a shorter exact BF16 decoder; other codes retain the
+complete decoder. Both implementations preserve the checkpoint values.
+
+The native compound op addresses packed weights using runtime expert IDs
+and emits two logical batched MME operations. It preserves BF16 activation
+boundaries and never converts weights through FP8. Decoded weights are
+internal to the Synapse recipe; this does **not** guarantee SRAM placement.
+Keep this flag disabled for production until compiled placement, correctness
+and end-to-end performance have all been qualified. See
+[the implementation and qualification contract](../features/deepseek_v4_indexed_mme.md).

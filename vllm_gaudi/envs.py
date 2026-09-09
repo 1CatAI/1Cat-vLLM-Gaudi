@@ -20,6 +20,9 @@ if TYPE_CHECKING:
     VLLM_HPU_MXFP4_DECODE_GATHER: bool = True
     VLLM_HPU_DSV4_TPC_MXFP4_GATHER: bool = False
     VLLM_HPU_DSV4_TPC_MXFP4_INDEXED: bool = False
+    VLLM_HPU_DSV4_MXFP4_INDEXED_MME: bool = False
+    VLLM_HPU_DSV4_MXFP4_PREPARED_MME: bool = False
+    VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH: bool = False
     VLLM_HPU_DSV4_SHORT_INDEXER_SKIP: bool = True
     VLLM_HPU_DSV4_BF16_SCORE_PROJECTION: bool = False
     VLLM_HPU_DSV4_FUSED_SDPA: bool = False
@@ -55,6 +58,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV4_COMPILED_ATTN_FRONTEND: bool = False
     VLLM_HPU_DSV4_NATIVE_FP8_ATTN_FRONTEND: bool = False
     VLLM_HPU_DSV4_TPC_MHC: bool = False
+    VLLM_HPU_DSV4_TPC_SINKHORN: bool = False
     VLLM_HPU_DSV4_PACKED_DECODE_METADATA: bool = False
     VLLM_HPU_DSV4_DECODE_METADATA_RING_SIZE: int = 2
     VLLM_HPU_DSV4_Q1_METADATA_FASTPATH: bool = False
@@ -111,6 +115,7 @@ if TYPE_CHECKING:
     VLLM_HPU_GDN_PRECISE_DMA_EVENTS: bool = False
     VLLM_HPU_TP2_PREPARED_COMM: bool = False
     VLLM_HPU_TP2_STATIC_GROUP_PLAN: bool = False
+    VLLM_HPU_TP2_PLAN_DUMP_DIR: str | None = None
     VLLM_HPU_TP2_NATIVE_JOINT_PLAN: bool = False
     VLLM_HPU_TP2_GQA_COMPACT_KV: bool = False
     VLLM_HPU_TP2_COMPILED_CONSUMER_NORM: bool = False
@@ -211,6 +216,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HPU_DSV4_TPC_MXFP4_INDEXED":
     lambda: os.environ.get("VLLM_HPU_DSV4_TPC_MXFP4_INDEXED", "0").lower() in ("1", "true"),
 
+    # The indexed MME candidate keeps BF16 and uses graph-internal decoded
+    # weights. SRAM placement and E2E quality are not yet qualified.
+    "VLLM_HPU_DSV4_MXFP4_INDEXED_MME":
+    lambda: os.environ.get(
+        "VLLM_HPU_DSV4_MXFP4_INDEXED_MME", "0"
+    ).lower() in ("1", "true"),
+
+    # Load-time Q16/S16 layout for the exact BF16 Gaudi2 TP2 decoder. This
+    # remains opt-in until full-model quality and end-to-end gates pass.
+    "VLLM_HPU_DSV4_MXFP4_PREPARED_MME":
+    lambda: os.environ.get(
+        "VLLM_HPU_DSV4_MXFP4_PREPARED_MME", "0"
+    ).lower() in ("1", "true"),
+
+    # Experimental V4 adapter for the version-locked joint compute/NIC plan.
+    "VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH":
+    lambda: os.environ.get("VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH", "0").lower() in ("1", "true"),
+
     # Skip DeepSeek V4 indexer scoring when every compressed candidate is
     # guaranteed to fit in top-k.
     "VLLM_HPU_DSV4_SHORT_INDEXER_SKIP":
@@ -290,6 +313,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV4_NATIVE_FP8_ATTN_FRONTEND", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_TPC_MHC":
     lambda: os.environ.get("VLLM_HPU_DSV4_TPC_MHC", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV4_TPC_SINKHORN":
+    lambda: os.environ.get("VLLM_HPU_DSV4_TPC_SINKHORN", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_PACKED_DECODE_METADATA":
     lambda: os.environ.get("VLLM_HPU_DSV4_PACKED_DECODE_METADATA", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV4_DECODE_METADATA_RING_SIZE":
@@ -386,6 +411,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_TP2_PREPARED_COMM", "false").strip().lower() in ("1", "true"),
     "VLLM_HPU_TP2_STATIC_GROUP_PLAN":
     lambda: os.environ.get("VLLM_HPU_TP2_STATIC_GROUP_PLAN", "false").strip().lower() in ("1", "true"),
+    "VLLM_HPU_TP2_PLAN_DUMP_DIR":
+    lambda: os.environ.get("VLLM_HPU_TP2_PLAN_DUMP_DIR"),
     "VLLM_HPU_TP2_NATIVE_JOINT_PLAN":
     lambda: os.environ.get("VLLM_HPU_TP2_NATIVE_JOINT_PLAN", "0") == "1",
     "VLLM_HPU_TP2_GQA_COMPACT_KV":

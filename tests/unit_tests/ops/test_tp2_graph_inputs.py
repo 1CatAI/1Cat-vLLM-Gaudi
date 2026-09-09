@@ -77,6 +77,19 @@ def test_prefill_transition_invalidates_decode_bindings():
     assert bindings.updates(changed) is None
 
 
+def test_state_allocation_is_held_without_copy_and_replacement_invalidates_replay():
+    first = roots()
+    state = torch.arange(32, dtype=torch.uint8)
+    first["state_tensors"] = (state,)
+    bindings = FixedDecodeInputs(torch.nn.Identity(), first, [[first["positions"], state]])
+    assert bindings.state_tensors[0] is state
+    state[4] = 19
+    assert bindings.updates(first) == []
+    assert bindings.updates(dict(first, state_tensors=(state.clone(),))) is None
+    assert bindings.updates(dict(first, state_tensors=())) is None
+    assert state[4].item() == 19
+
+
 def test_pool_pointer_facade_cannot_skip_changed_offset(monkeypatch):
     first = roots()
     pool = torch.arange(8).float()
@@ -86,6 +99,54 @@ def test_pool_pointer_facade_cannot_skip_changed_offset(monkeypatch):
     changed = dict(first, hidden_states=pool[4:].view(1, 4))
     assert bindings.updates(changed) is None
     assert torch.equal(pool, torch.arange(8).float())
+
+
+def test_v4_pack_copies_once_and_updates_all_captured_metadata_views():
+    first = roots()
+    first.update(metadata={}, input_ids=torch.tensor([1]), state_generation=3,
+                 metadata_pack=torch.arange(12, dtype=torch.int32))
+    first["attention_inputs"] = (first["metadata_pack"][:4], first["metadata_pack"][4:])
+    captured = [[first["input_ids"], *first["attention_inputs"]]]
+    bindings = FixedDecodeInputs(torch.nn.Identity(), first, captured)
+    updated = dict(first, input_ids=torch.tensor([9]), metadata_pack=torch.arange(12, dtype=torch.int32) + 20)
+    updates = bindings.updates(updated)
+    assert len(updates) == 2
+    bindings.apply(updates)
+    assert captured[0][0].item() == 9
+    assert torch.equal(captured[0][2], torch.arange(4, 12, dtype=torch.int32) + 20)
+    assert bindings.updates(dict(updated, state_generation=4)) is None
+
+
+def test_fixed_metadata_destination_is_independent_of_h2d_ring_reuse():
+    first = roots()
+    ring = [torch.arange(12, dtype=torch.int32), torch.arange(12, dtype=torch.int32) + 20]
+    destination = ring[0].clone()
+    first.update(metadata={}, metadata_pack=ring[0], metadata_destination=destination,
+                 attention_inputs=(destination[:4], destination[4:]))
+    captured = [[*first["attention_inputs"]]]
+    bindings = FixedDecodeInputs(torch.nn.Identity(), first, captured)
+    updates = bindings.updates(dict(first, metadata_pack=ring[1]))
+    assert len(updates) == 1
+    bindings.apply(updates)
+    # Reusing a retired transfer slot cannot overwrite the later token's
+    # currently consumed capture destination.
+    ring[0].fill_(99)
+    assert torch.equal(captured[0][1], torch.arange(4, 12, dtype=torch.int32) + 20)
+    bindings.apply(bindings.updates(dict(first, metadata_pack=ring[0])))
+    assert torch.equal(destination, torch.full((12,), 99, dtype=torch.int32))
+
+
+def test_nested_v4_metadata_fields_are_dynamic():
+    first = roots()
+    first["metadata"] = {"layer0": SimpleNamespace(lengths=torch.tensor([5]))}
+    # Dataclass metadata is the model runner's normal nested representation.
+    cls = make_dataclass("LayerMetadata", [("lengths", torch.Tensor)])
+    first["metadata"]["layer0"] = cls(torch.tensor([5]))
+    captured = first["metadata"]["layer0"].lengths
+    bindings = FixedDecodeInputs(torch.nn.Identity(), first, [[captured]])
+    updated = dict(first, metadata={"layer0": cls(torch.tensor([11]))})
+    bindings.apply(bindings.updates(updated))
+    assert captured.item() == 11
 
 
 def test_pointer_facade_copies_from_new_storage(monkeypatch):

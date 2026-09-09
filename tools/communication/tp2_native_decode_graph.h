@@ -54,6 +54,7 @@ class RuntimeApis {
   using SynBeginReplay = synStatus (*)(SynGraph);
   using SynReplaySegment = synStatus (*)(SynGraph, uint64_t, const SyncInfo*, uint8_t, SyncInfo*);
   using SynGetInfo = synStatus (*)(SynGraph, ComputeGraphInfo*);
+  using SynGetWorkspaceBytes = synStatus (*)(SynGraph, uint64_t*);
   using SynDestroy = synStatus (*)(SynGraph);
   using HclCreate = hcclResult_t (*)(const void*, void*, size_t, hcclDataType_t, hcclRedOp_t,
                                      hcclComm_t, void*, int, HclGraph*);
@@ -85,6 +86,7 @@ class RuntimeApis {
       syn_begin_replay = resolve<SynBeginReplay>("synNativeComputeGraphBeginReplay");
       syn_replay_segment = resolve<SynReplaySegment>("synNativeComputeGraphReplaySegment");
       syn_get_info = resolve<SynGetInfo>("synNativeComputeGraphGetInfo");
+      syn_get_workspace_bytes = resolve<SynGetWorkspaceBytes>("synNativeComputeGraphGetWorkspaceBytes");
       syn_destroy = resolve<SynDestroy>("synNativeComputeGraphDestroy");
       hcl_create = resolve<HclCreate>("hcclTp2NativeGraphCreate");
       hcl_capture = resolve<HclCapture>("hcclTp2NativeGraphCapture");
@@ -125,6 +127,7 @@ class RuntimeApis {
   SynBeginReplay syn_begin_replay = nullptr;
   SynReplaySegment syn_replay_segment = nullptr;
   SynGetInfo syn_get_info = nullptr;
+  SynGetWorkspaceBytes syn_get_workspace_bytes = nullptr;
   SynDestroy syn_destroy = nullptr;
   HclCreate hcl_create = nullptr;
   HclCapture hcl_capture = nullptr;
@@ -185,6 +188,131 @@ struct PendingInputCopy {
   uint64_t bytes = 0;
 };
 
+class NativeCompletion {
+ public:
+  ~NativeCompletion() {
+    if (event_ && habana::HPUDeviceContext::is_device_acquired()) synEventDestroy(event_);
+  }
+
+  // Like the PR's precise state-copy events, this observes one physical stream
+  // completion, without taking Bridge's user-event mutex or joining pipelines.
+  void record(synStreamHandle stream) {
+    auto& device = habana::HPUDeviceContext::get_device();
+    checkSynapse(synEventCreate(&event_, device.id(), 0), "native completion create");
+    checkSynapse(synEventRecord(event_, stream), "native completion record");
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      published_ = true;
+    }
+    condition_.notify_all();
+  }
+
+  void fail(std::exception_ptr error) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      error_ = error;
+      published_ = true;
+    }
+    condition_.notify_all();
+  }
+
+  void completeHostCopy() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      host_copy_complete_ = true;
+      published_ = true;
+    }
+    condition_.notify_all();
+  }
+
+  bool query() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (error_) std::rethrow_exception(error_);
+    if (!published_) return false;
+    if (host_copy_complete_) return true;
+    const auto status = synEventQuery(event_);
+    if (status == synBusy) return false;
+    checkSynapse(status, "native completion query");
+    return true;
+  }
+
+  void synchronize() {
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      condition_.wait(lock, [&] { return published_; });
+      if (error_) std::rethrow_exception(error_);
+      if (host_copy_complete_) return;
+    }
+    checkSynapse(synEventSynchronize(event_), "native completion wait");
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable condition_;
+  synEventHandle event_ = nullptr;
+  bool published_ = false;
+  bool host_copy_complete_ = false;
+  std::exception_ptr error_;
+};
+
+inline std::shared_ptr<NativeCompletion> recordNativeCompletion() {
+  auto ticket = std::make_shared<NativeCompletion>();
+  habana::eager::PipelineTask<habana::eager::ThreadType::LOWERING>([ticket]() {
+    habana::HPUDeviceContext::execute_thread().enqueue([ticket]() {
+      try {
+        ticket->record(habana::HPUDeviceContext::get_device().get_stream(0));
+      } catch (...) {
+        ticket->fail(std::current_exception());
+        throw;
+      }
+    });
+  });
+  return ticket;
+}
+
+inline std::pair<at::Tensor, std::shared_ptr<NativeCompletion>> copySampledTokensToHost(const at::Tensor& source) {
+  TORCH_CHECK(source.device().type() == at::kHPU && source.sizes() == at::IntArrayRef({1, 1}) &&
+                  (source.scalar_type() == at::kInt || source.scalar_type() == at::kLong) &&
+                  source.is_contiguous() && source.storage_offset() == 0,
+              "Native sampled-token copy requires a contiguous C1 integer tensor");
+  TORCH_CHECK(c10::hpu::getCurrentHPUStream().stream() == 0,
+              "Native sampled-token copy requires the default producer stream");
+  // Some Bridge configurations store logical int64 as int32 on the device.
+  // The private host buffer uses that exact wire type; Python consumes integer
+  // values with tolist() only after the actual copy-completion callback.
+  const auto bytes = habana_helpers::GetNBytes(source);
+  TORCH_CHECK(bytes == 4 || bytes == 8, "Unsupported sampled-token wire width");
+  auto host = at::empty({1, 1}, at::TensorOptions().device(at::kCPU)
+                                  .dtype(bytes == 4 ? at::kInt : at::kLong).pinned_memory(true));
+  auto ticket = std::make_shared<NativeCompletion>();
+  habana::eager::PipelineTask<habana::eager::ThreadType::LOWERING>([source, host, ticket, bytes]() {
+    try {
+      auto backend = habana::eager::HbEagerTensorPool::get_backend_tensor(source);
+      habana::HPUDeviceContext::execute_thread().enqueue([backend, host, ticket, bytes]() {
+        try {
+          TORCH_CHECK(backend.is_contiguous() && backend.storage_offset() == 0 &&
+                          habana_helpers::GetNBytes(backend) == bytes,
+                      "Sampled-token storage changed before its asynchronous copy");
+          // The normal device copy helper retains producer/substream waits and
+          // its address lock. FIFO lowering places this after the sampler's
+          // launch without a frontend stream switch or pipeline join.
+          habana::HPUDeviceContext::copy_data_to_host(
+              reinterpret_cast<synapse_helpers::device_ptr>(backend.data_ptr()), host.data_ptr(),
+              reinterpret_cast<synapse_helpers::device_ptr>(backend.storage().data_ptr().get()), bytes,
+              [backend, host, ticket]() { ticket->completeHostCopy(); }, true, 0);
+        } catch (...) {
+          ticket->fail(std::current_exception());
+          throw;
+        }
+      });
+    } catch (...) {
+      ticket->fail(std::current_exception());
+      throw;
+    }
+  });
+  return {host, ticket};
+}
+
 class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph> {
  public:
   enum class State { Created, Capturing, Instantiated, Invalid, Closed };
@@ -206,6 +334,14 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
         if (!signatures_[group][index].matches(inputs[group][index])) return false;
     }
     return state_.load() == State::Capturing || state_.load() == State::Instantiated;
+  }
+
+  void configureTopology(size_t groups, size_t collectives, bool externalPrefix) {
+    TORCH_CHECK(state_.load() == State::Created && groups > 0 && collectives > 0,
+                "Topology must be configured before capture");
+    expected_groups_ = groups;
+    expected_collectives_ = collectives;
+    external_prefix_ = externalPrefix;
   }
 
   void capture(std::vector<std::shared_ptr<PreparedGroupPlan>> plans,
@@ -287,7 +423,75 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
     fixed_inputs_ready_ = true;
   }
 
+  void stageFixedInputs(const std::vector<at::Tensor>& sources,
+                        const std::vector<at::Tensor>& destinations) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    TORCH_CHECK(state_.load() == State::Instantiated && fixed_inputs_ready_,
+                "Fixed input staging requires an instantiated native plan");
+    TORCH_CHECK(sources.size() == destinations.size() && pending_input_copies_.empty(),
+                "Fixed input staging count mismatch or an unreplayed update");
+    std::vector<PendingInputCopy> copies;
+    for (size_t index = 0; index < sources.size(); ++index) {
+      const auto& source = sources[index];
+      const auto& destination = destinations[index];
+      const bool bound = std::any_of(dynamic_inputs_.begin(), dynamic_inputs_.end(), [&](const at::Tensor& tensor) {
+        return tensor.unsafeGetTensorImpl() == destination.unsafeGetTensorImpl();
+      });
+      TORCH_CHECK(bound && source.device().type() == at::kHPU && source.device() == destination.device() &&
+                      source.scalar_type() == destination.scalar_type() && source.sizes() == destination.sizes() &&
+                      source.is_contiguous() && destination.is_contiguous(),
+                  "Fixed input staging changed a bound tensor contract");
+      copies.push_back({source, destination, source.numel() * source.element_size()});
+    }
+    for (auto& copy : copies) {
+      copy.source = habana::eager::HbEagerTensorPool::get_backend_tensor(copy.source);
+      copy.destination = habana::eager::HbEagerTensorPool::get_backend_tensor(copy.destination);
+      habana::get_tensor_extra_meta(copy.source)->set_tensor_pipelined();
+      habana::get_tensor_extra_meta(copy.destination)->set_tensor_pipelined();
+    }
+    pending_input_copies_ = std::move(copies);
+  }
+
+  void bindStateTensors(std::vector<at::Tensor> tensors) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    TORCH_CHECK(state_.load() == State::Instantiated && fixed_inputs_ready_ &&
+                    replay_count_.load() == 0 && state_tensors_.empty(),
+                "State allocations must be bound once before the first fixed replay");
+    TORCH_CHECK(!tensors.empty(), "Explicit native state bindings cannot be empty");
+    for (const auto& tensor : tensors) {
+      TORCH_CHECK(tensor.device().type() == at::kHPU,
+                  "Native state allocations must reside on HPU");
+      const auto address = reinterpret_cast<synapse_helpers::device_ptr>(tensor.storage().data_ptr().get());
+      bool captured = false;
+      for (const auto& frame : frames_)
+        for (const auto& value : frame->values)
+          if (value.isTensor() && value.toTensor().device().type() == at::kHPU &&
+              value.toTensor().storage().data_ptr().get() == tensor.storage().data_ptr().get())
+            captured = true;
+      TORCH_CHECK(captured, "Native state allocation is absent from the captured tensor program");
+      input_dependencies_.push_back(address);
+    }
+    state_tensors_ = std::move(tensors);
+    std::sort(input_dependencies_.begin(), input_dependencies_.end());
+    input_dependencies_.erase(std::unique(input_dependencies_.begin(), input_dependencies_.end()),
+                              input_dependencies_.end());
+    // Mutated state is both a consumer of preceding prefill/reset writes and
+    // a producer for the next request. Keep the allocation, not a copy of it.
+    prepareCompletionAddresses();
+  }
+
   void replayFixed() {
+    scheduleFixed(nullptr);
+  }
+
+  std::shared_ptr<NativeCompletion> replayFixedWithCompletion() {
+    auto ticket = std::make_shared<NativeCompletion>();
+    scheduleFixed(ticket);
+    return ticket;
+  }
+
+  void scheduleFixed(const std::shared_ptr<NativeCompletion>& ticket) {
+    RECORD_FUNCTION("vllm_gaudi::native_decoder_enqueue", std::vector<c10::IValue>());
     {
       std::lock_guard<std::mutex> lock(mutex_);
       TORCH_CHECK(state_.load() == State::Instantiated && fixed_inputs_ready_,
@@ -295,20 +499,45 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
       const uint64_t epoch = input_epoch_.fetch_add(1) + 1;
       TORCH_CHECK(epoch == scheduled_epoch_.load() + 1, "Native fixed replay input epoch changed");
     }
-    replay();
+    replayImpl(ticket);
   }
 
   void replay() {
+    replayImpl(nullptr);
+  }
+
+  void replayImpl(const std::shared_ptr<NativeCompletion>& ticket) {
     std::lock_guard<std::mutex> lock(mutex_);
     TORCH_CHECK(state_.load() == State::Instantiated,
                 "Native decoder graph is not instantiated; no fallback was executed");
     const uint64_t epoch = input_epoch_.load();
+    TORCH_CHECK(!ticket || prefix_node_count_ == 0,
+                "Native completion tickets require a decoder without an external prefix");
     TORCH_CHECK(epoch == scheduled_epoch_.load() + 1,
                 "Native decoder replay requires exactly one preceding input update");
     scheduled_epoch_.store(epoch);
     auto copies = std::move(pending_input_copies_);
     auto dependencies = std::move(pending_input_dependencies_);
     auto self = shared_from_this();
+    if (ticket) {
+      habana::eager::PipelineTask<habana::eager::ThreadType::LOWERING>(
+          [self, epoch, ticket, copies = std::move(copies), dependencies = std::move(dependencies)]() mutable {
+        habana::HPUDeviceContext::execute_thread().enqueue(
+            [self, epoch, ticket, copies = std::move(copies), dependencies = std::move(dependencies)]() {
+          try {
+            if (!copies.empty()) self->stageInputCopiesOnExecute(copies);
+            self->prepareInputDependenciesOnExecute(dependencies);
+            self->replayOnExecute(epoch);
+            ticket->record(habana::HPUDeviceContext::get_device().get_stream(0));
+          } catch (...) {
+            self->state_.store(State::Invalid);
+            ticket->fail(std::current_exception());
+            throw;
+          }
+        });
+      });
+      return;
+    }
     habana::eager::PipelineTask<habana::eager::ThreadType::LOWERING>(
         [self, epoch, copies = std::move(copies), dependencies = std::move(dependencies)]() mutable {
       if (!copies.empty())
@@ -378,6 +607,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
     plans_.clear();
     signatures_.clear();
     dynamic_inputs_.clear();
+    state_tensors_.clear();
     pending_input_copies_.clear();
     pending_input_dependencies_.clear();
     input_dependencies_.clear();
@@ -397,6 +627,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
   uint64_t capturedRelocationCount() const { return captured_relocation_count_.load(); }
   uint64_t globalProgramBytes() const { return global_program_bytes_.load(); }
   uint64_t arcProgramBytes() const { return arc_program_bytes_.load(); }
+  uint64_t workspaceBytes() const { return workspace_bytes_.load(); }
   uint64_t hclCommandBytesPerReplay() const { return hcl_command_bytes_per_replay_.load(); }
   uint64_t hclStreamCcbBytes() const { return hcl_stream_ccb_bytes_.load(); }
   uint64_t hclReplayBytes() const { return hcl_replay_bytes_.load(); }
@@ -410,6 +641,17 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
     return joint_statistics_;
   }
 
+  std::array<uint64_t, 3> hclSharedStreamInfo() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (hcl_graphs_.empty()) return {};
+    HclGraphInfo info;
+    TORCH_CHECK(RuntimeApis::get().hcl_get_info(hcl_graphs_.back(), &info) == hcclSuccess,
+                "hcclTp2NativeGraphGetInfo failed during stream statistics snapshot");
+    // These live stream counters include any other users of the same streams.
+    // Do not sum snapshots from different graphs that share those streams.
+    return {info.nativeReplayBytes, info.nativeCcbWrapCount, info.nativeSubmissionCount};
+  }
+
   std::array<uint64_t, 8> retirementInfo() const {
     std::lock_guard<std::mutex> lock(mutex_);
     TORCH_CHECK(state_.load() == State::Closed, "Retirement counters require completed graph close");
@@ -417,9 +659,14 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
   }
 
  private:
+  size_t expected_groups_ = 0;
+  size_t expected_collectives_ = 0;
+  bool external_prefix_ = false;
+
   void validateAndRememberInputs(const std::vector<std::shared_ptr<PreparedGroupPlan>>& plans,
                                  const std::vector<torch::jit::Stack>& inputs) {
-    TORCH_CHECK((plans.size() == 1 || plans.size() == 8) && plans.size() == inputs.size(),
+    TORCH_CHECK((expected_groups_ ? plans.size() == expected_groups_ : (plans.size() == 1 || plans.size() == 8))
+                    && plans.size() == inputs.size(),
                 "Native decoder requires one qualification group or eight full decoder groups");
     signatures_.clear();
     signatures_.reserve(inputs.size());
@@ -449,6 +696,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
       auto incoming = std::move(inputs[group]);
       for (size_t index = 0; index < incoming.size(); ++index)
         held->values[plans[group]->input_slots[index]] = std::move(incoming[index]);
+      plans[group]->refresh_reshape_views(held->values);
       for (const auto& value : held->values)
         if (value.isTensor() && value.toTensor().device().type() == at::kHPU)
           habana::get_tensor_extra_meta(value.toTensor())->set_tensor_pipelined();
@@ -501,7 +749,8 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
         TORCH_CHECK(!node.peer_only || jointPlanEnabled(), "Exchange-only capture requires the unified command plan");
         node_kinds.push_back({node.exchange, node.peer_only});
       }
-    const auto topology = NativeGraphTopology::prepare(node_kinds, plans.size(), jointPlanEnabled());
+    const auto topology = NativeGraphTopology::prepare(node_kinds, plans.size(), jointPlanEnabled(),
+                                                      expected_collectives_, external_prefix_);
     prefix_node_count_ = topology.prefixNodes;
     segment_count_.store(topology.computeCount);
     collective_count_.store(topology.consumers.size());
@@ -557,6 +806,8 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
   void captureExchangeOnExecute(size_t index, const PreparedNode& node, torch::jit::Stack values) {
     try {
       TORCH_CHECK(state_.load() == State::Capturing, "Native decoder capture was invalidated");
+      TORCH_CHECK(!node.reduction_only,
+                  "Native plain AllReduce requires peer transfer and a compiled BF16 sum");
       TORCH_CHECK(index < hcl_graphs_.size() &&
                       (node.peer_only ? values.size() == 2 : values.size() == 7 && node.communication_recipe),
                   "Invalid native TP2 exchange capture binding");
@@ -574,7 +825,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
       auto& device = habana::HPUDeviceContext::get_device();
       synStreamHandle stream = device.get_stream(0);
       auto& api = RuntimeApis::get();
-      constexpr int exchange_mode = 1;
+      const int exchange_mode = node.reduction_only ? 0 : 1;
       const size_t peer_index = node.peer_only ? 1 : 3;
       const hcclResult_t create = api.hcl_create(
           reinterpret_cast<const void*>(locked.at(0)), reinterpret_cast<void*>(locked.at(peer_index)),
@@ -613,6 +864,10 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
                   "Native compute graph did not retain program memory");
       global_program_bytes_.store(info.globalProgramBytes);
       arc_program_bytes_.store(info.arcProgramBytes);
+      uint64_t workspaceBytes = 0;
+      checkSynapse(api.syn_get_workspace_bytes(syn_graph_, &workspaceBytes),
+                   "synNativeComputeGraphGetWorkspaceBytes(capture)");
+      workspace_bytes_.store(workspaceBytes);
       uint64_t commands = 0;
       uint64_t relocations = 0;
       uint64_t hcl_command_bytes = 0;
@@ -667,6 +922,40 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
   }
 
   void stageInputCopiesOnExecute(const std::vector<PendingInputCopy>& copies) {
+    auto address = [](const at::Tensor& tensor) {
+      return reinterpret_cast<uint64_t>(tensor.storage().data_ptr().get()) +
+          tensor.storage_offset() * tensor.element_size();
+    };
+    auto overlaps = [](uint64_t left, uint64_t leftBytes, uint64_t right, uint64_t rightBytes) {
+      return left < right + rightBytes && right < left + leftBytes;
+    };
+    // Validate the whole transaction after prior producers allocate their
+    // storage, and before any DMA can overwrite another staged source.
+    for (size_t i = 0; i < copies.size(); ++i) {
+      for (size_t j = 0; j < copies.size(); ++j) {
+        TORCH_CHECK(!overlaps(address(copies[i].destination), copies[i].bytes,
+                              address(copies[j].source), copies[j].bytes),
+                    "Native input copy destination overlaps a source");
+        if (i < j)
+          TORCH_CHECK(!overlaps(address(copies[i].destination), copies[i].bytes,
+                                address(copies[j].destination), copies[j].bytes),
+                      "Native input copy destinations overlap");
+      }
+    }
+    std::vector<synapse_helpers::device_ptr> destinations;
+    destinations.reserve(copies.size());
+    for (const auto& copy : copies) {
+      destinations.push_back(reinterpret_cast<synapse_helpers::device_ptr>(
+          copy.destination.storage().data_ptr().get()));
+    }
+    auto& device = habana::HPUDeviceContext::get_device();
+    // Input storage is also an output of the previous replay's lifetime.
+    // The generic D2D helper waits for its source, but does not wait for the
+    // destination's old consumer. Protect every destination before the first
+    // copy: a ready position upload can otherwise run before the next hidden
+    // input's producer and overwrite a still-running decoder's input.
+    device.add_wait_events_on_stream(
+        destinations, device.get_stream(0, synapse_helpers::default_stream_type::DMA_D2D));
     for (const auto& copy : copies) {
       // This helper retains both allocations and establishes DMA producer
       // dependencies. Full decoder steady replay uses its fixed input table.
@@ -689,6 +978,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
   }
 
   void replayOnExecute(uint64_t epoch) {
+    RECORD_FUNCTION("vllm_gaudi::native_decoder_publish", std::vector<c10::IValue>());
     std::lock_guard<std::mutex> lock(mutex_);
     TORCH_CHECK(state_.load() == State::Instantiated,
                 "Native decoder graph is not instantiated; no fallback was executed");
@@ -795,6 +1085,8 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
   std::vector<PendingInputCopy> pending_input_copies_;
   std::vector<synapse_helpers::device_ptr> pending_input_dependencies_;
   std::vector<synapse_helpers::device_ptr> input_dependencies_, completion_addresses_;
+  std::vector<at::Tensor> state_tensors_;
+  std::atomic<uint64_t> workspace_bytes_{0};
   bool fixed_inputs_ready_ = false;
   std::vector<std::shared_ptr<GenericResourceHolder>> resources_;
   std::shared_ptr<habana::HcclCommunicator> communicator_;

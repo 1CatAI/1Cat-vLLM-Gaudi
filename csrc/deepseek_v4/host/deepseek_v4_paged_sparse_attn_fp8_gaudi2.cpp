@@ -85,6 +85,15 @@ DeepseekV4PagedSparseAttnFP8Gaudi2::GetKernelName(
     } else if (mode_ == SWA_ONLY) {
         name = "custom_deepseek_v4_paged_swa_attn_fp8_gaudi2";
     }
+    if (functionalOutput_) {
+        if (mode_ == GLOBAL_SLOTS) {
+            name = "custom_deepseek_v4_native_paged_sparse_attn_fp8_gaudi2";
+        } else if (mode_ == SWA_ONLY) {
+            name = "custom_deepseek_v4_native_paged_swa_attn_fp8_gaudi2";
+        } else {
+            return tpc_lib_api::GLUE_FAILED;
+        }
+    }
     std::strcpy(kernelName, name);
     return tpc_lib_api::GLUE_SUCCESS;
 }
@@ -102,10 +111,15 @@ DeepseekV4PagedSparseAttnFP8Gaudi2::GetGcDefinitions(
         mode_ == SEQUENTIAL_BLOCK_TABLE || pairHeads || fusedQnorm;
     const unsigned inputShift = fusedQnorm ? 2 : 0;
     const unsigned tailShift = fusedQnorm ? 1 : 0;
-    const unsigned kInputCount = fusedQnorm
+    if (functionalOutput_ && mode_ != GLOBAL_SLOTS && mode_ != SWA_ONLY) {
+        return tpc_lib_api::GLUE_FAILED;
+    }
+    const unsigned legacyInputCount = fusedQnorm
         ? 15
         : (sequentialTopk ? 14 : (localTopk ? 13 : 11));
-    constexpr unsigned kOutputCount = 1;
+    const unsigned kInputCount = legacyInputCount - (functionalOutput_ ? 1 : 0);
+    const unsigned kOutputCount = functionalOutput_ ? 2 : 1;
+    const unsigned statsIndex = functionalOutput_ ? 1 : 0;
     if (inDefs->inputTensorNr != kInputCount) {
         inDefs->inputTensorNr = kInputCount;
         return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_COUNT;
@@ -186,7 +200,10 @@ DeepseekV4PagedSparseAttnFP8Gaudi2::GetGcDefinitions(
             return tpc_lib_api::GLUE_INCOMPATIBLE_DATA_TYPE;
         }
     }
-    if (!HasDataType(inDefs->outputTensors[0], tpc_lib_api::DATA_F32)) {
+    if (functionalOutput_ && !HasDataType(inDefs->outputTensors[0], tpc_lib_api::DATA_BF16)) {
+        return tpc_lib_api::GLUE_INCOMPATIBLE_DATA_TYPE;
+    }
+    if (!HasDataType(inDefs->outputTensors[statsIndex], tpc_lib_api::DATA_F32)) {
         return tpc_lib_api::GLUE_INCOMPATIBLE_DATA_TYPE;
     }
 
@@ -220,8 +237,8 @@ DeepseekV4PagedSparseAttnFP8Gaudi2::GetGcDefinitions(
     const auto& swaIndices = inDefs->inputTensors[swaIndicesIndex];
     const auto& swaLens = inDefs->inputTensors[swaLensIndex];
     const auto& sink = inDefs->inputTensors[sinkIndex];
-    const auto& output = inDefs->inputTensors[outputIndex];
-    auto& scoreDebug = inDefs->outputTensors[0];
+    const auto& output = functionalOutput_ ? inDefs->outputTensors[0] : inDefs->inputTensors[outputIndex];
+    auto& scoreDebug = inDefs->outputTensors[statsIndex];
 
     bool ranksMatch =
         q.geometry.dims == 3 && compressedStorage.geometry.dims == 1 &&
@@ -451,26 +468,29 @@ DeepseekV4PagedSparseAttnFP8Gaudi2::GetGcDefinitions(
         headsPerProgram,
         0,
         headsPerProgram - 1);
+    // Moving the final writable tensor from inputs to output 0 leaves every
+    // physical TPC tensor ordinal unchanged. Both forms reuse the same ELF.
+    auto& outputPattern = functionalOutput_ ? outDefs->outputTensorAccessPattern[0]
+                                           : outDefs->inputTensorAccessPattern[outputIndex];
+    MapDimension(outputPattern, 0, 0, 512, 0, 511);
     MapDimension(
-        outDefs->inputTensorAccessPattern[outputIndex], 0, 0, 512, 0, 511);
-    MapDimension(
-        outDefs->inputTensorAccessPattern[outputIndex],
+        outputPattern,
         1,
         1,
         headsPerProgram,
         0,
         headsPerProgram - 1);
     MapDimension(
-        outDefs->inputTensorAccessPattern[outputIndex], 2, 2, 1, 0, 0);
+        outputPattern, 2, 2, 1, 0, 0);
     MapDimension(
-        outDefs->outputTensorAccessPattern[0],
+        outDefs->outputTensorAccessPattern[statsIndex],
         0,
         1,
         headsPerProgram,
         0,
         headsPerProgram - 1);
     MapDimension(
-        outDefs->outputTensorAccessPattern[0], 1, 2, 1, 0, 0);
+        outDefs->outputTensorAccessPattern[statsIndex], 1, 2, 1, 0, 0);
 
     outDefs->kernel.paramsNr = 0;
     const unsigned char* isaStart =

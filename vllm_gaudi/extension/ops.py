@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 ###############################################################################
 from contextlib import nullcontext
+import functools
 from typing import Callable, Optional, Tuple, List, Union
 import habana_frameworks.torch as htorch
 import torch
@@ -1871,6 +1872,125 @@ def _mxfp4_fused_fwd(hidden_states, expert_routing_table, router_weights, w12_li
     )
 
 
+def _prepared_mxfp4_compat_graph(hidden_states, expert_routing_table,
+                                 router_weights, w13_q16, w2_q16, w13_s16,
+                                 w2_s16):
+    """Restore one prepared layer inside a reusable compatibility recipe."""
+    from vllm_gaudi.ops.deepseek_v4_mxfp4 import (
+        restore_mxfp4_scale_u8,
+        restore_mxfp4_u8,
+    )
+
+    def restore_list(values, restore):
+        result = []
+        for start in range(0, 256, 4):
+            chunk = restore(values[start:start + 4])
+            result.extend(chunk.unbind(0))
+        return tuple(result)
+
+    return _mxfp4_fused_fwd(
+        hidden_states,
+        expert_routing_table,
+        router_weights,
+        restore_list(w13_q16, restore_mxfp4_u8),
+        restore_list(w2_q16, restore_mxfp4_u8),
+        restore_list(w13_s16, restore_mxfp4_scale_u8),
+        restore_list(w2_s16, restore_mxfp4_scale_u8),
+        32,
+        "silu",
+        0,
+        255,
+        0,
+        0,
+    )
+
+
+def _prepared_mxfp4_weighted_sum_fp32(
+    expert_outputs: torch.Tensor,
+    router_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Match the stock kernel's ordered FP32 product and accumulation."""
+    products = (
+        expert_outputs.float()
+        * router_weights.reshape(6, 1).float()
+    )
+    result = products[0]
+    for expert in range(1, 6):
+        result = result + products[expert]
+    return result.unsqueeze(0).to(torch.bfloat16)
+
+
+_prepared_mxfp4_compat_compiled = torch.compile(
+    _prepared_mxfp4_compat_graph,
+    backend=_mxfp4_hpu_backend,
+    fullgraph=True,
+    dynamic=False,
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _prepared_token_program():
+    return torch.compile(
+        torch.ops.custom_op.custom_deepseek_v4_mxfp4_prepared_moe_bf16_gaudi2,
+        backend=_mxfp4_hpu_backend, fullgraph=True, dynamic=False)
+
+
+def _prepared_mxfp4_compat_hpu(hidden_states, expert_routing_table,
+                               router_weights, w13_q16, w2_q16, w13_s16,
+                               w2_s16):
+    if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+        # The pinned native replay runtime predates packed-MXFP4 graph types.
+        # Reuse the exact prepared MoE for each prefill row, retaining bounded
+        # recipe temporaries and the same ordered expert reduction per token.
+        from vllm_gaudi.ops.deepseek_v4_mxfp4 import mxfp4_bf16_lut
+
+        program = _prepared_token_program()
+        lookup = mxfp4_bf16_lut(hidden_states.device)
+        result = torch.empty_like(hidden_states)
+        for row in range(hidden_states.shape[0]):
+            value = program(hidden_states[row:row + 1].clone(),
+                            expert_routing_table[row:row + 1].clone(),
+                            router_weights[row:row + 1].clone(),
+                            w13_q16, w2_q16, w13_s16, w2_s16, lookup, False)
+            result[row:row + 1].copy_(value)
+        return result
+    return _prepared_mxfp4_compat_compiled(
+        hidden_states,
+        expert_routing_table,
+        router_weights,
+        w13_q16,
+        w2_q16,
+        w13_s16,
+        w2_s16,
+    )
+
+
+def _prepared_mxfp4_compat_fake(hidden_states, expert_routing_table,
+                                router_weights, w13_q16, w2_q16, w13_s16,
+                                w2_s16):
+    del expert_routing_table, router_weights, w13_q16, w2_q16, w13_s16, w2_s16
+    return torch.empty_like(hidden_states)
+
+
+# Keep the full-model graph compact: preparation fallback is a single outer
+# node, while this HPU implementation compiles and reuses one layer recipe.
+_prepared_mxfp4_library = torch.library.Library("vllm_gaudi", "FRAGMENT")
+_prepared_mxfp4_library.define(
+    "deepseek_v4_mxfp4_prepared_compat(Tensor hidden_states, "
+    "Tensor expert_routing_table, Tensor router_weights, Tensor w13_q16, "
+    "Tensor w2_q16, Tensor w13_s16, Tensor w2_s16) -> Tensor"
+)
+_prepared_mxfp4_library.impl(
+    "deepseek_v4_mxfp4_prepared_compat",
+    _prepared_mxfp4_compat_hpu,
+    dispatch_key="HPU",
+)
+_prepared_mxfp4_library._register_fake(
+    "deepseek_v4_mxfp4_prepared_compat",
+    _prepared_mxfp4_compat_fake,
+)
+
+
 class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
     """Native MXFP4 MOE op using torch.ops.hpu.mixture_of_experts.mxfp4_fused_weights.
 
@@ -1892,9 +2012,11 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
                  has_bias: bool = False,
                  alpha: float = 1.702,
                  limit: float = 7.0,
-                 dispatch_fn: Callable[[torch.Tensor], torch.Tensor] = None):
+                 dispatch_fn: Callable[[torch.Tensor], torch.Tensor] = None,
+                 tensor_parallel_size: int = 1):
         super().__init__(global_num_experts, num_total_experts, experts_min, experts_max, None, dispatch_fn)
         self.block_size = block_size
+        self.tensor_parallel_size = tensor_parallel_size
         # GPT-OSS SwiGLU-OAI: per-expert bias on both projections + alpha/limit.
         # When has_bias is set, the op applies gpt_swiglu (clamp ±limit, alpha-silu)
         # internally and the "activation" string is ignored.
@@ -1914,13 +2036,231 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
         self._stacked_w2 = None
         self._stacked_w13_scale = None
         self._stacked_w2_scale = None
+        self._indexed_mme_normal_scales = False
+        self._weight_generation = 0
+        self._prepared_w13_shape = None
+        self._prepared_w2_shape = None
+        self._prepared_w13_scale_shape = None
+        self._prepared_w2_scale_shape = None
+        self._prepared_normal_scales = False
+        self._standard_weights_released = False
+        self.register_buffer("_prepared_w13_q16", None, persistent=False)
+        self.register_buffer("_prepared_w2_q16", None, persistent=False)
+        self.register_buffer("_prepared_w13_s16", None, persistent=False)
+        self.register_buffer("_prepared_w2_s16", None, persistent=False)
+        self.register_buffer("_prepared_lookup", None, persistent=False)
+        self.register_buffer("_prepared_token_to_chunk", None, persistent=False)
+        self.register_buffer("_prepared_token_in_chunk", None, persistent=False)
         self._compiled_forward = None
 
     def set_stacked_weights(self, w13, w2, w13_scale, w2_scale):
+        self._weight_generation += 1
+        self._clear_prepared_weights()
         self._stacked_w13 = w13
         self._stacked_w2 = w2
         self._stacked_w13_scale = w13_scale
         self._stacked_w2_scale = w2_scale
+        self._standard_weights_released = False
+        self._indexed_mme_normal_scales = False
+        if (gaudi_envs.VLLM_HPU_DSV4_MXFP4_INDEXED_MME and is_hpu_gaudi2 and self.tensor_parallel_size == 2
+                and w13.shape == (256, 2048, 2048) and w2.shape == (256, 4096, 512)):
+            from vllm_gaudi.ops.deepseek_v4_mxfp4 import normal_e8m0_scales
+            self._indexed_mme_normal_scales = normal_e8m0_scales(w13_scale, w2_scale)
+
+    def _clear_prepared_weights(self):
+        self._prepared_w13_q16 = None
+        self._prepared_w2_q16 = None
+        self._prepared_w13_s16 = None
+        self._prepared_w2_s16 = None
+        self._prepared_lookup = None
+        self._prepared_token_to_chunk = None
+        self._prepared_token_in_chunk = None
+        self._prepared_w13_shape = None
+        self._prepared_w2_shape = None
+        self._prepared_w13_scale_shape = None
+        self._prepared_w2_scale_shape = None
+        self._prepared_normal_scales = False
+        self._compiled_forward = None
+
+    def _has_prepared_weights(self):
+        return all(
+            value is not None for value in (
+                self._prepared_w13_q16,
+                self._prepared_w2_q16,
+                self._prepared_w13_s16,
+                self._prepared_w2_s16,
+                self._prepared_lookup,
+                self._prepared_token_to_chunk,
+                self._prepared_token_in_chunk,
+                self._prepared_w13_shape,
+                self._prepared_w2_shape,
+                self._prepared_w13_scale_shape,
+                self._prepared_w2_scale_shape,
+            )
+        )
+
+    def prepared_weight_descriptors(self):
+        """Return immutable descriptors for diagnostics and lifecycle checks."""
+        if not self._has_prepared_weights():
+            return None
+        from vllm_gaudi.ops.deepseek_v4_mxfp4 import PreparedMxfp4Weight
+        return (
+            PreparedMxfp4Weight(
+                q16=self._prepared_w13_q16,
+                s16=self._prepared_w13_s16,
+                original_shape=self._prepared_w13_shape,
+                scale_shape=self._prepared_w13_scale_shape,
+                normal_scales=self._prepared_normal_scales,
+                generation=self._weight_generation,
+            ),
+            PreparedMxfp4Weight(
+                q16=self._prepared_w2_q16,
+                s16=self._prepared_w2_s16,
+                original_shape=self._prepared_w2_shape,
+                scale_shape=self._prepared_w2_scale_shape,
+                normal_scales=self._prepared_normal_scales,
+                generation=self._weight_generation,
+            ),
+        )
+
+    def set_prepared_weights(self, w13, w2, lookup):
+        """Install already prepared matrices and validate their shared contract."""
+        from vllm_gaudi.ops.deepseek_v4_mxfp4 import MXFP4_PREPARED_LAYOUT_VERSION
+        if w13.layout_version != MXFP4_PREPARED_LAYOUT_VERSION or w2.layout_version != MXFP4_PREPARED_LAYOUT_VERSION:
+            raise ValueError("unsupported prepared MXFP4 layout version")
+        if w13.generation != w2.generation or w13.generation != self._weight_generation:
+            raise ValueError("prepared MXFP4 weight generation mismatch")
+        tensors = (w13.q16, w2.q16, w13.s16, w2.s16, lookup)
+        if any(not value.is_contiguous() for value in tensors):
+            raise ValueError("prepared MXFP4 tensors must be contiguous")
+        if len({value.device for value in tensors}) != 1:
+            raise ValueError("prepared MXFP4 tensors must share one device")
+        if (w13.q16.dtype != torch.int16 or w2.q16.dtype != torch.int16
+                or w13.s16.dtype != torch.bfloat16 or w2.s16.dtype != torch.bfloat16
+                or lookup.dtype != torch.bfloat16 or lookup.shape != (128,)):
+            raise ValueError("prepared MXFP4 tensor dtype or lookup shape mismatch")
+        self._prepared_w13_q16 = w13.q16
+        self._prepared_w2_q16 = w2.q16
+        self._prepared_w13_s16 = w13.s16
+        self._prepared_w2_s16 = w2.s16
+        self._prepared_lookup = lookup
+        self._prepared_token_to_chunk = torch.arange(
+            6, dtype=torch.int32, device=lookup.device
+        ).view(1, 6)
+        self._prepared_token_in_chunk = torch.zeros(
+            (1, 6), dtype=torch.int32, device=lookup.device
+        )
+        self._prepared_w13_shape = w13.original_shape
+        self._prepared_w2_shape = w2.original_shape
+        self._prepared_w13_scale_shape = w13.scale_shape
+        self._prepared_w2_scale_shape = w2.scale_shape
+        self._prepared_normal_scales = w13.normal_scales and w2.normal_scales
+        self._compiled_forward = None
+
+    def can_prepare_stacked_weights(self):
+        """Check the bounded Gaudi2 TP2 load-time preparation contract."""
+        tensors = (
+            self._stacked_w13,
+            self._stacked_w2,
+            self._stacked_w13_scale,
+            self._stacked_w2_scale,
+        )
+        return (
+            gaudi_envs.VLLM_HPU_DSV4_MXFP4_PREPARED_MME
+            and is_hpu_gaudi2
+            and self.tensor_parallel_size == 2
+            and not self.has_bias
+            and self.block_size == 32
+            and self.num_experts == 256
+            and self.experts_min == 0
+            and self.experts_max == 255
+            and all(value is not None for value in tensors)
+            and self._stacked_w13.shape == (256, 2048, 2048)
+            and self._stacked_w2.shape == (256, 4096, 512)
+            and self._stacked_w13_scale.shape == (256, 2048, 128)
+            and self._stacked_w2_scale.shape == (256, 4096, 32)
+            and self._stacked_w13.dtype == torch.uint8
+            and self._stacked_w2.dtype == torch.uint8
+            and self._stacked_w13_scale.dtype == torch.uint8
+            and self._stacked_w2_scale.dtype == torch.uint8
+            and len({value.device for value in tensors}) == 1
+            and all(value.is_contiguous() for value in tensors)
+        )
+
+    def prepare_stacked_weights(self):
+        """Replace checkpoint layout tensors with the prepared decoder layout."""
+        if not self.can_prepare_stacked_weights():
+            return False
+        from vllm_gaudi.ops.deepseek_v4_mxfp4 import (
+            make_prepared_mxfp4_weight,
+            mxfp4_bf16_lut,
+            normal_e8m0_scales,
+        )
+        normal_scales = normal_e8m0_scales(self._stacked_w13_scale, self._stacked_w2_scale)
+        w13 = make_prepared_mxfp4_weight(
+            self._stacked_w13,
+            self._stacked_w13_scale,
+            generation=self._weight_generation,
+            normal_scales=normal_scales,
+        )
+        w2 = make_prepared_mxfp4_weight(
+            self._stacked_w2,
+            self._stacked_w2_scale,
+            generation=self._weight_generation,
+            normal_scales=normal_scales,
+        )
+        lookup = mxfp4_bf16_lut(self._stacked_w13.device)
+        self.set_prepared_weights(w13, w2, lookup)
+        if self._stacked_w13.device.type == "hpu":
+            torch.hpu.synchronize()
+        return True
+
+    def release_standard_weight_references(self):
+        """Drop every alias after the parent parameters have been emptied."""
+        if not self._has_prepared_weights():
+            raise RuntimeError("prepared MXFP4 weights must be installed before release")
+        device = self._prepared_w13_q16.device
+        empty = torch.empty(0, dtype=torch.uint8, device=device)
+        for weight_list in (self.w13_list, self.w2_list):
+            for item in weight_list:
+                item.weight = empty
+                item.scale = empty
+        self._stacked_w13 = None
+        self._stacked_w2 = None
+        self._stacked_w13_scale = None
+        self._stacked_w2_scale = None
+        self._cached_w13_views = None
+        self._cached_w2_views = None
+        self._cached_w13_scale_views = None
+        self._cached_w2_scale_views = None
+        self._standard_weights_released = True
+
+    def _restore_prepared_weights(self):
+        from vllm_gaudi.ops.deepseek_v4_mxfp4 import restore_mxfp4_scale_u8, restore_mxfp4_u8
+        if not self._has_prepared_weights():
+            raise RuntimeError("prepared MXFP4 weights are unavailable")
+        restored_bytes = sum((
+            self._prepared_w13_q16.numel() * self._prepared_w13_q16.element_size(),
+            self._prepared_w2_q16.numel() * self._prepared_w2_q16.element_size(),
+            self._prepared_w13_s16.numel(),
+            self._prepared_w2_s16.numel(),
+        ))
+        if restored_bytes > 2 * 1024**3:
+            raise RuntimeError("prepared MXFP4 compatibility conversion exceeds 2 GiB")
+
+        def restore_list(values, restore):
+            result = []
+            for start in range(0, self.num_experts, 4):
+                chunk = restore(values[start:start + 4])
+                result.extend(chunk.unbind(0))
+            return tuple(result)
+
+        return (
+            restore_list(self._prepared_w13_q16, restore_mxfp4_u8),
+            restore_list(self._prepared_w2_q16, restore_mxfp4_u8),
+            restore_list(self._prepared_w13_s16, restore_mxfp4_scale_u8),
+            restore_list(self._prepared_w2_s16, restore_mxfp4_scale_u8),
+        )
 
     def _cache_weight_lists(self):
         experts_range = range(self.num_experts)
@@ -1937,13 +2277,26 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
                               error_msgs):
+        self._weight_generation += 1
+        self._clear_prepared_weights()
+        self._indexed_mme_normal_scales = False
         super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
                                       error_msgs)
         self._cache_weight_lists()
 
     def _apply(self, fn):
+        had_prepared = self._has_prepared_weights()
+        self._indexed_mme_normal_scales = False
         ret = super()._apply(fn)
-        self._cache_weight_lists()
+        self._weight_generation += 1
+        self._compiled_forward = None
+        if had_prepared:
+            # Module._apply replaced the registered buffer tensors. Metadata
+            # stays valid, and descriptors are rebuilt lazily with this new
+            # generation so stale compiled recipes cannot be reused.
+            self._standard_weights_released = True
+        else:
+            self._cache_weight_lists()
         return ret
 
     def _get_compiled_forward(self):
@@ -1962,50 +2315,171 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
         chunk_size = kwargs.get("chunk_size", 0)
         total_experts = kwargs.get("total_experts", 0)
 
-        if self._cached_w13_views is None or self._cached_w2_views is None:
-            self._cache_weight_lists()
-
-        w13_list = self._cached_w13_views
-        w2_list = self._cached_w2_views
-        w13_scale = self._cached_w13_scale_views
-        w2_scale = self._cached_w2_scale_views
+        has_prepared = self._has_prepared_weights()
 
         # expert_routing_table must be int32 for the mxfp4 op
         if expert_routing_table.dtype != torch.int32:
             expert_routing_table = expert_routing_table.to(torch.int32)
 
-        can_use_indexed_tpc = (gaudi_envs.VLLM_HPU_DSV4_TPC_MXFP4_INDEXED and tokens_num == 1
-                               and hidden_states.shape == (1, 4096) and hidden_states.dtype == torch.bfloat16
-                               and expert_routing_table.shape == (1, 6) and router_weights.shape == (1, 6)
-                               and router_weights.dtype == torch.bfloat16 and permuted_weights and activation == "silu"
-                               and self.block_size == 32 and not self.has_bias and self.num_experts == 256
-                               and self.experts_min == 0 and self.experts_max == 255 and self._stacked_w13 is not None
-                               and self._stacked_w13.shape == (256, 2048, 2048)
-                               and self._stacked_w2.shape == (256, 4096, 512)
-                               and self._stacked_w13_scale.shape == (256, 2048, 128)
-                               and self._stacked_w2_scale.shape == (256, 4096, 32) and hidden_states.is_contiguous()
-                               and expert_routing_table.is_contiguous() and router_weights.is_contiguous()
-                               and self._stacked_w13.is_contiguous() and self._stacked_w2.is_contiguous()
-                               and self._stacked_w13_scale.is_contiguous() and self._stacked_w2_scale.is_contiguous())
-        if can_use_indexed_tpc:
-            with _dsv4_profile_stage("moe_mxfp4_indexed_tpc"):
-                return (torch.ops.custom_op.custom_deepseek_v4_mxfp4_indexed_moe_gaudi2(
+        can_use_prepared = (
+            gaudi_envs.VLLM_HPU_DSV4_MXFP4_PREPARED_MME
+            and has_prepared
+            and self.tensor_parallel_size == 2
+            and is_hpu_gaudi2
+            and tokens_num == 1
+            and hidden_states.shape == (1, 4096)
+            and hidden_states.dtype == torch.bfloat16
+            and expert_routing_table.shape == (1, 6)
+            and router_weights.shape == (1, 6)
+            and router_weights.dtype == torch.bfloat16
+            and permuted_weights
+            and activation == "silu"
+            and self.block_size == 32
+            and not self.has_bias
+            and self.num_experts == 256
+            and self.experts_min == 0
+            and self.experts_max == 255
+            and self._prepared_w13_shape == (256, 2048, 2048)
+            and self._prepared_w2_shape == (256, 4096, 512)
+            and self._prepared_w13_scale_shape == (256, 2048, 128)
+            and self._prepared_w2_scale_shape == (256, 4096, 32)
+            and hidden_states.is_contiguous()
+            and expert_routing_table.is_contiguous()
+            and router_weights.is_contiguous()
+            and self._prepared_token_to_chunk.is_contiguous()
+            and self._prepared_token_in_chunk.is_contiguous()
+        )
+        if can_use_prepared:
+            with _dsv4_profile_stage("moe_mxfp4_prepared_mme"):
+                return torch.ops.custom_op.custom_deepseek_v4_mxfp4_prepared_moe_bf16_gaudi2(
                     hidden_states,
                     expert_routing_table,
                     router_weights,
-                    self._stacked_w13,
-                    self._stacked_w2,
-                    self._stacked_w13_scale,
-                    self._stacked_w2_scale,
-                ))
+                    self._prepared_w13_q16,
+                    self._prepared_w2_q16,
+                    self._prepared_w13_s16,
+                    self._prepared_w2_s16,
+                    self._prepared_lookup,
+                    self._prepared_normal_scales,
+                )
+
+        if has_prepared and hidden_states.device.type == "hpu":
+            with _dsv4_profile_stage("moe_mxfp4_prepared_compat"):
+                # Keep prefill inside the caller's compiled graph. Routing the
+                # compatibility path through a nested torch.library HPU op
+                # creates one opaque boundary per decoder layer; that changes
+                # the production graph partition even though the isolated MoE
+                # result is bit exact. The direct form exposes each bounded
+                # layout restore immediately before its stock MXFP4 consumer.
+                if (torch.compiler.is_compiling()
+                        and not gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH):
+                    return _prepared_mxfp4_compat_graph(
+                        hidden_states,
+                        expert_routing_table,
+                        router_weights,
+                        self._prepared_w13_q16,
+                        self._prepared_w2_q16,
+                        self._prepared_w13_s16,
+                        self._prepared_w2_s16,
+                    )
+                return torch.ops.vllm_gaudi.deepseek_v4_mxfp4_prepared_compat(
+                    hidden_states,
+                    expert_routing_table,
+                    router_weights,
+                    self._prepared_w13_q16,
+                    self._prepared_w2_q16,
+                    self._prepared_w13_s16,
+                    self._prepared_w2_s16,
+                )
+
+        if has_prepared:
+            w13_list, w2_list, w13_scale, w2_scale = self._restore_prepared_weights()
+            stacked_w13 = None
+            stacked_w2 = None
+            stacked_w13_scale = None
+            stacked_w2_scale = None
+        else:
+            if self._cached_w13_views is None or self._cached_w2_views is None:
+                self._cache_weight_lists()
+            w13_list = self._cached_w13_views
+            w2_list = self._cached_w2_views
+            w13_scale = self._cached_w13_scale_views
+            w2_scale = self._cached_w2_scale_views
+            stacked_w13 = self._stacked_w13
+            stacked_w2 = self._stacked_w2
+            stacked_w13_scale = self._stacked_w13_scale
+            stacked_w2_scale = self._stacked_w2_scale
+
+        use_indexed_mme = gaudi_envs.VLLM_HPU_DSV4_MXFP4_INDEXED_MME and self.tensor_parallel_size == 2
+        can_use_indexed = (
+            (gaudi_envs.VLLM_HPU_DSV4_TPC_MXFP4_INDEXED or use_indexed_mme)
+            and is_hpu_gaudi2
+            and tokens_num == 1
+            and hidden_states.shape == (1, 4096)
+            and hidden_states.dtype == torch.bfloat16
+            and expert_routing_table.shape == (1, 6)
+            and router_weights.shape == (1, 6)
+            and router_weights.dtype == torch.bfloat16
+            and permuted_weights
+            and activation == "silu"
+            and self.block_size == 32
+            and not self.has_bias
+            and self.num_experts == 256
+            and self.experts_min == 0
+            and self.experts_max == 255
+            and stacked_w13 is not None
+            and stacked_w13.shape == (256, 2048, 2048)
+            and stacked_w2.shape == (256, 4096, 512)
+            and stacked_w13_scale.shape == (256, 2048, 128)
+            and stacked_w2_scale.shape == (256, 4096, 32)
+            and hidden_states.is_contiguous()
+            and expert_routing_table.is_contiguous()
+            and router_weights.is_contiguous()
+            and stacked_w13.is_contiguous()
+            and stacked_w2.is_contiguous()
+            and stacked_w13_scale.is_contiguous()
+            and stacked_w2_scale.is_contiguous()
+        )
+        if can_use_indexed and use_indexed_mme:
+            with _dsv4_profile_stage("moe_mxfp4_indexed_mme"):
+                return torch.ops.custom_op.custom_deepseek_v4_mxfp4_indexed_mme_bf16_gaudi2(
+                    hidden_states,
+                    expert_routing_table,
+                    router_weights,
+                    stacked_w13,
+                    stacked_w2,
+                    stacked_w13_scale,
+                    stacked_w2_scale,
+                    self._indexed_mme_normal_scales,
+                )
+        if can_use_indexed:
+            with _dsv4_profile_stage("moe_mxfp4_indexed_tpc"):
+                return (
+                    torch.ops.custom_op
+                    .custom_deepseek_v4_mxfp4_indexed_moe_gaudi2(
+                        hidden_states,
+                        expert_routing_table,
+                        router_weights,
+                        stacked_w13,
+                        stacked_w2,
+                        stacked_w13_scale,
+                        stacked_w2_scale,
+                    )
+                )
 
         if torch.compiler.is_compiling():
             compiled_fwd = (_mxfp4_bias_fused_fwd if self.has_bias else _mxfp4_fused_fwd)
         else:
             compiled_fwd = self._get_compiled_forward()
-        can_gather_decode = (gaudi_envs.VLLM_HPU_MXFP4_DECODE_GATHER and tokens_num == 1 and not self.has_bias
-                             and self.experts_min == 0 and self.experts_max == self.num_experts - 1
-                             and self._stacked_w13 is not None and expert_routing_table.shape[-1] < self.num_experts)
+        can_gather_decode = (
+            gaudi_envs.VLLM_HPU_MXFP4_DECODE_GATHER
+            and tokens_num == 1
+            and not self.has_bias
+            and self.experts_min == 0
+            and self.experts_max == self.num_experts - 1
+            and stacked_w13 is not None
+            and expert_routing_table.shape[-1] < self.num_experts
+        )
         if can_gather_decode:
             with _dsv4_profile_stage("moe_mxfp4_gather"):
                 (
@@ -2018,10 +2492,10 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
                 ) = _gather_mxfp4_decode_weights(
                     expert_routing_table,
                     router_weights,
-                    self._stacked_w13,
-                    self._stacked_w2,
-                    self._stacked_w13_scale,
-                    self._stacked_w2_scale,
+                    stacked_w13,
+                    stacked_w2,
+                    stacked_w13_scale,
+                    stacked_w2_scale,
                 )
                 gathered_experts = expert_routing_table.shape[-1]
                 selected_w13 = tuple(w13_g[i] for i in range(gathered_experts))

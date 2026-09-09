@@ -667,13 +667,21 @@ class AsyncHPUModelRunnerOutput(AsyncModelRunnerOutput):
         sampled_token_ids: torch.Tensor,
         invalid_req_indices: list[int],
         async_output_copy_stream: torch.hpu.Stream,
+        native_copy: bool = False,
     ):
         self._model_runner_output = model_runner_output
-        self._invalid_req_indices = invalid_req_indices
+        self._invalid_req_indices = list(invalid_req_indices) if native_copy else invalid_req_indices
 
         # Keep a reference to the device tensor to avoid it being
         # deallocated until we finish copying it to the host.
         self._sampled_token_ids = sampled_token_ids
+
+        if native_copy:
+            from vllm_gaudi.distributed.tp2_fused_ar_norm import _resolve_runtime
+            bridge, _, _ = _resolve_runtime()
+            self._sampled_token_ids_cpu, self._async_copy_ready_event = bridge.copy_sampled_tokens_to_host(
+                sampled_token_ids)
+            return
 
         self._async_copy_ready_event = torch.hpu.Event()
         default_stream = torch.hpu.current_stream()
@@ -1281,6 +1289,10 @@ def apply_model_specific_patches(model_runner):
 
 def prepare_tp2_fused_ar_norm_before_model_load(model_runner):
     """Compile small TP2 recipes before model weights consume device memory."""
+    if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+        from vllm_gaudi.distributed.tp2_fused_ar_norm import initialize_tp2_fused_ar_norm_runtime
+        initialize_tp2_fused_ar_norm_runtime()
+        return
     config = get_config()
     if not (config.tp2_fused_ar_norm and config.tp2_gemma_fused_ar_norm):
         return
@@ -2703,6 +2715,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         runner_kv_caches: list[torch.Tensor],
     ) -> None:
         """Bind multiple cache modules per decoder layer in a stable order."""
+        if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+            from vllm_gaudi.ops.deepseek_v4_native import invalidate_model
+            invalidate_model(self.model)
         assert len(runner_kv_caches) == 0
         ordered_layer_names = sorted(
             kv_caches,
@@ -3844,6 +3859,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         block_table_cpu: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """Build DeepSeek V4 q1 sparse metadata before the packed H2D."""
+        if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+            from vllm_gaudi.ops.deepseek_v4_native_metadata import build_q1_metadata
+            return build_q1_metadata(builder, position, seq_len, block_table_cpu)
         if position != seq_len - 1:
             raise ValueError("DeepSeek V4 q1 position/sequence mismatch: "
                              f"position={position}, seq_len={seq_len}")
@@ -4016,6 +4034,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     builder_source_layout.append((builder_id, name))
                     packed_sources.append(source)
 
+            if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+                # C1 q1 has one valid token mapped to request row zero. Keep
+                # these fields in the changing pack as well, so no freshly
+                # allocated builder tensor can escape the fixed bindings.
+                packed_sources.extend((torch.zeros(1, dtype=torch.int32), torch.ones(1, dtype=torch.int32)))
+
             packed_key = (
                 padded_batch_size,
                 tuple(tuple(source.shape) for source in packed_sources),
@@ -4040,6 +4064,20 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     "next":
                     0,
                 }
+                if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+                    packed_entry["completion"] = [None] * ring_size
+                    packed_entry["generations"] = [0] * ring_size
+                packed_entry["views"] = []
+                packed_entry["cpu_views"] = []
+                for cpu_buffer, device_buffer in packed_entry["buffers"]:
+                    device_views, cpu_views, offset = [], [], 0
+                    for source in packed_sources:
+                        end = offset + source.numel()
+                        device_views.append(device_buffer[offset:end].view(source.shape))
+                        cpu_views.append(cpu_buffer[offset:end].view(source.shape))
+                        offset = end
+                    packed_entry["views"].append(device_views)
+                    packed_entry["cpu_views"].append(cpu_views)
                 packed_cache[packed_key] = packed_entry
                 logger.info(
                     "Allocated packed DeepSeek V4 decode metadata: "
@@ -4052,13 +4090,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             buffer_index = packed_entry["next"]
             packed_entry["next"] = (buffer_index + 1) % ring_size
             packed_cpu, packed_device = packed_entry["buffers"][buffer_index]
-            packed_views = []
-            offset = 0
-            for source in packed_sources:
-                numel = source.numel()
-                packed_cpu[offset:offset + numel].copy_(source.reshape(-1))
-                packed_views.append(packed_device[offset:offset + numel].view(source.shape))
-                offset += numel
+            if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH and packed_entry["generations"][buffer_index]:
+                completion = packed_entry["completion"][buffer_index]
+                if not completion.query():
+                    completion.synchronize()
+            packed_views = packed_entry["views"][buffer_index]
+            for destination, source in zip(packed_entry["cpu_views"][buffer_index], packed_sources, strict=True):
+                destination.copy_(source)
             async_h2d_copy(
                 packed_cpu,
                 dest_tensor=packed_device,
@@ -4113,9 +4151,19 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     common_attn_metadata=common_attn_metadata,
                     fast_build=q1_metadata_fastpath,
                 )
+                if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+                    if hasattr(metadata, "token_to_req_indices"):
+                        metadata.token_to_req_indices = packed_views[-2]
+                    if hasattr(metadata, "is_valid_token"):
+                        metadata.is_valid_token = packed_views[-1]
                 for layer_name in attn_group.layer_names:
                     attn_metadata[layer_name] = metadata
 
+        if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+            if not use_packed_metadata or not q1_metadata_fastpath:
+                raise RuntimeError("V4 native decoder requires packed q1 metadata")
+            from vllm_gaudi.ops.deepseek_v4_native import NativeDecodeMetadata
+            attn_metadata = NativeDecodeMetadata(attn_metadata, packed_entry, buffer_index)
         return attn_metadata
 
     def _create_framework_decode_input_data(
@@ -6508,6 +6556,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 sampled_token_ids=sampled_token_ids,
                 invalid_req_indices=self.invalid_req_indices,
                 async_output_copy_stream=self.async_output_copy_stream,
+                native_copy=gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH and num_prefills == 0 and num_decodes == 1,
             )
             # Hybrid recurrent states and request rows are still being
             # established while prefills enter the decode batch. Settle those
@@ -6880,6 +6929,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 model.end_layer,
             ))
             compiled_chunks = []
+            native_chunks = []
             decode_only_compile = _dsv4_decode_only_compile_enabled(self.model_config.hf_config.model_type)
             for offset in range(0, len(layers), chunk_size):
                 chunk_layers = layers[offset:offset + chunk_size]
@@ -6889,6 +6939,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     model_end_layer=model.end_layer,
                 )
                 chunk.train(model.training)
+                native_chunks.append(chunk)
                 compiled_chunk = torch.compile(chunk, **compile_args)
                 compiled_chunks.append(
                     _HPUDeepseekV4PhaseChunk(chunk, compiled_chunk) if decode_only_compile else compiled_chunk)
@@ -6898,6 +6949,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 compiled_chunks,
             )
             chunk_count += len(compiled_chunks)
+            if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+                from vllm_gaudi.ops.deepseek_v4_native import NativeDecoder
+                object.__setattr__(model, "_hpu_native_decoder", NativeDecoder(model, native_chunks))
         if chunk_count == 0:
             raise RuntimeError("No DeepSeek V4 decoder layers found to compile")
         return chunk_count
@@ -8205,6 +8259,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             logger.warning('Cannot use PT_COMPILE_ONLY_MODE. '
                            'Warmup time will be negatively impacted. '
                            'Please update Gaudi Software Suite.')
+        if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+            can_use_compile_only_mode = False
         if (can_use_compile_only_mode and use_torch_compile and self._get_model_type() == "deepseek_v4"):
             qnorm_recipe_count = _prewarm_deepseek_v4_qnorm_tpc(self.get_model())
             if qnorm_recipe_count:
@@ -9164,6 +9220,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         assert getattr(self, "model", None) is not None, \
             "Cannot reload weights before model is loaded."
         model_loader = get_model_loader(self.load_config)
+        if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+            from vllm_gaudi.ops.deepseek_v4_native import invalidate_model
+            invalidate_model(self.model)
         logger.info("Reloading weights inplace...")
         model_loader.load_weights(self.model, model_config=self.model_config)
         torch.hpu.synchronize()
