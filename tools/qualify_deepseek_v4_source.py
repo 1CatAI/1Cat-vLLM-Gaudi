@@ -11,7 +11,7 @@ import traceback
 import requests
 
 
-def run_request(url, model, tokens, timeout=240, drop_intervals=10, prompt="Hello"):
+def run_request(url, model, tokens, timeout=240, drop_intervals=10, prompt="Hello", raw_output=None):
     if tokens < drop_intervals + 2:
         raise ValueError("Request is too short for the selected interval warmup")
     payload = {
@@ -25,24 +25,31 @@ def run_request(url, model, tokens, timeout=240, drop_intervals=10, prompt="Hell
     }
     started = time.perf_counter_ns()
     events = []
+    messages = []
     session = requests.Session()
     session.trust_env = False
-    with session, session.post(f"{url}/v1/completions", json=payload, stream=True, timeout=timeout) as response:
-        response.raise_for_status()
-        for line in response.iter_lines(chunk_size=1):
-            if not line.startswith(b"data: ") or line == b"data: [DONE]":
-                continue
-            body = json.loads(line[6:])
-            for choice in body.get("choices", []):
-                events.append(
-                    {
-                        "received_ns": time.perf_counter_ns(),
-                        "text": choice.get("text", ""),
-                        "token_ids": choice.get("token_ids"),
-                        "finish_reason": choice.get("finish_reason"),
-                        "request_id": body.get("id"),
-                    }
-                )
+    try:
+        with session, session.post(f"{url}/v1/completions", json=payload, stream=True, timeout=timeout) as response:
+            response.raise_for_status()
+            for line in response.iter_lines(chunk_size=1):
+                if not line.startswith(b"data: ") or line == b"data: [DONE]":
+                    continue
+                body = json.loads(line[6:])
+                messages.append(body)
+                for choice in body.get("choices", []):
+                    events.append(
+                        {
+                            "received_ns": time.perf_counter_ns(),
+                            "text": choice.get("text", ""),
+                            "token_ids": choice.get("token_ids"),
+                            "finish_reason": choice.get("finish_reason"),
+                            "request_id": body.get("id"),
+                        }
+                    )
+    finally:
+        if raw_output is not None:
+            Path(raw_output).write_text(json.dumps(dict(payload=payload, started_ns=started,
+                                                       events=events, messages=messages)) + "\n")
     arrivals = [e for e in events if e["token_ids"]]
     if len(arrivals) != tokens or any(len(e["token_ids"]) != 1 for e in arrivals):
         raise RuntimeError(f"Expected {tokens} separate token arrivals, got {len(arrivals)}")

@@ -55,6 +55,33 @@ def restore_default_dtype():
     torch.set_default_dtype(default_dtype)
 
 
+@pytest.mark.parametrize("invalid,expected", [([], [[1234]]), ([0], [[]])])
+def test_native_async_output_waits_for_copy_without_switching_streams(monkeypatch, invalid, expected):
+    ready = False
+
+    class Completion:
+        def synchronize(self):
+            nonlocal ready
+            ready = True
+
+    class HostValues:
+        def tolist(self):
+            assert ready
+            return [[1234]]
+
+    bridge = SimpleNamespace(copy_sampled_tokens_to_host=lambda source: (HostValues(), Completion()))
+    monkeypatch.setattr(torch, "_vllm_gaudi_tp2_fused_ar_norm_runtime", (bridge, None, None), raising=False)
+    monkeypatch.setattr(torch.hpu, "Event", mock.Mock(side_effect=AssertionError("Unexpected Bridge user event")))
+    monkeypatch.setattr(torch.hpu, "current_stream", mock.Mock(side_effect=AssertionError("Unexpected stream lookup")))
+    output = SimpleNamespace(sampled_token_ids=[[]])
+    wrapper = model_runner_module.AsyncHPUModelRunnerOutput(
+        output, torch.zeros((1, 1), dtype=torch.int32), invalid, None, native_copy=True)
+    invalid.clear()  # The next scheduler step can update its own row mask.
+    assert not ready
+    assert wrapper.get_output().sampled_token_ids == expected
+    assert not hasattr(wrapper, "_sampled_token_ids")
+
+
 def test_zero_compact_gdn_slot_clears_only_reused_request_states():
     first = torch.ones(8, 2)
     second = torch.arange(24, dtype=torch.float32).reshape(8, 3)

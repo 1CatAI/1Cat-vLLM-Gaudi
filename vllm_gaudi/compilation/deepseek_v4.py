@@ -14,12 +14,21 @@ _compile_lock = threading.RLock()
 
 
 def make_backend():
+    from vllm_gaudi import envs
     from habana_frameworks.torch.dynamo.compile_backend import passes
     from habana_frameworks.torch.dynamo.compile_backend.backends import hpu_backend
 
     op = torch.ops.vllm.deepseek_v4_attention.default
     ordered_op = attention_out_op()
     hop = torch.ops.higher_order.auto_functionalized_v2
+
+    def sinkhorn_transform(ctx):
+        from vllm_gaudi.compilation.deepseek_v4_sinkhorn import fuse_sinkhorn4
+        count = fuse_sinkhorn4(ctx.graph_module)
+        if count:
+            passes.pass_fake_propagation(ctx)
+            logger.info("DeepSeek V4 compiler fused %d complete Sinkhorn chains", count)
+        return bool(count)
 
     def transform(ctx):
         nodes = [node for node in ctx.graph_module.graph.nodes if node.target is hop and node.args[0] is op]
@@ -54,10 +63,15 @@ def make_backend():
 
     def backend(gm, inputs, **kwargs):
         with _compile_lock:
+            fuse_sinkhorn = envs.VLLM_HPU_DSV4_TPC_SINKHORN
+            if fuse_sinkhorn:
+                passes.custom_pass_at_pre_stagepasses.append(sinkhorn_transform)
             passes.custom_pass_at_pre_stagepasses.append(transform)
             try:
                 return hpu_backend(gm, inputs, **kwargs)
             finally:
                 passes.custom_pass_at_pre_stagepasses.remove(transform)
+                if fuse_sinkhorn:
+                    passes.custom_pass_at_pre_stagepasses.remove(sinkhorn_transform)
 
     return backend

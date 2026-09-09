@@ -12,7 +12,7 @@
       "repository": "https://github.com/heyuanliu-intel/Intel_Gaudi3_Software.git",
       "base_commit": "6de1f66a4ab658685f23dbe007bdc9eb8fe8dbdf",
       "patch": "synapse.patch",
-      "sha256": "dd30b910f7188a9cdc8bc2d3cf924057684fdb3d1376830f9aa2c44412d58a81"
+      "sha256": "4298fa1360f33c836388fcc993b7f75e6735ce1a7f72137c92fa30e52dd18859"
     },
     "hcl": {
       "repository": "https://github.com/HabanaAI/HCL.git",

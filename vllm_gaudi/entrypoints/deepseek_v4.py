@@ -42,10 +42,16 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--worker-cpus", help="One allowed CPU per rank, e.g. 6,16; omitted leaves affinity unchanged")
+    parser.add_argument("--worker-helper-cpus", help="One helper CPU set per rank, separated by ';'")
+    parser.add_argument("--native-decode-graph", action="store_true", help="Enable the experimental joint V4 decoder")
     args, extra = parser.parse_known_args()
     prepare_environment()
+    if args.native_decode_graph:
+        os.environ["VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH"] = "1"
     if args.worker_cpus:
         os.environ["VLLM_HPU_DSV4_WORKER_CPUS"] = args.worker_cpus
+    if args.worker_helper_cpus:
+        os.environ["VLLM_HPU_DSV4_WORKER_HELPER_CPUS"] = args.worker_helper_cpus
     sys.argv = ["vllm", "serve", args.model, "--host", args.host, "--port", str(args.port),
                 "--dtype", "bfloat16", "--max-model-len", "512", "--generation-config", "vllm",
                 "--tensor-parallel-size", "2", "--gpu-memory-utilization", "0.09", "--kv-cache-dtype", "fp8",

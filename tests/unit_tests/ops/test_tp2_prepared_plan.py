@@ -43,6 +43,7 @@ def runtime(monkeypatch):
 def module(key):
     instance = replay.PreparedGroupModule(torch.nn.Identity())
     instance.plans.append(Plan(key, torch.tensor(key)))
+    instance.plan_owners.append(None)
     return instance
 
 
@@ -72,6 +73,23 @@ def test_consecutive_groups_share_one_submission(runtime):
     assert runtime == [((1, 2), [[1], [2]])]
 
 
+def test_v4_callsite_prevents_cross_group_plan_aliasing(runtime, monkeypatch):
+    from vllm_gaudi.ops.tp2_model_adapter import DEEPSEEK_V4
+    owner = torch.nn.Identity()
+    prepared = module(1)
+    prepared.plan_owners[0] = (id(owner), 0, 7)
+    cold = []
+    monkeypatch.setattr(prepared, "_prepare", lambda inputs: cold.append(inputs) or (torch.tensor(99),))
+    with replay.collect_prepared_group_replays(owner=owner, adapter=DEEPSEEK_V4,
+                                             state_generation=7) as context:
+        context["group_index"] = 0
+        assert prepared([1])[0].item() == 1
+        context["group_index"] = 1
+        assert prepared([1])[0].item() == 99
+    assert cold == [[1]]
+    assert runtime == [((1,), [[1]])]
+
+
 def test_state_mutation_failure_is_never_retried(runtime, monkeypatch):
     first, cold = module(1), module(9)
     state = torch.tensor(0)
@@ -96,6 +114,29 @@ def test_invalidation_submits_pending_work_then_releases_generation(runtime):
         replay.invalidate_prepared_group_plans()
         assert runtime == [((1, ), [[1]])]
     assert not plan.valid and not first.plans
+
+
+def test_profiler_recapture_waits_before_retiring_commands_and_preserves_recipes(runtime, monkeypatch):
+    events = []
+    first = module(1)
+    plan = first.plans[0]
+
+    class Graph:
+        def reset_slots(self):
+            events.append("reset")
+
+        def close(self):
+            events.append("close")
+
+    replay._native_graphs["probe"] = Graph()
+    monkeypatch.setattr(torch.hpu, "synchronize", lambda: events.append("wait"))
+    generation = replay._native_program_generation
+    replay.recapture_native_decoder_programs()
+    assert events == ["wait", "reset", "close"]
+    assert plan.valid and first.plans == [plan]
+    assert replay._native_program_generation == generation + 1
+    with replay.collect_prepared_group_replays(), pytest.raises(RuntimeError, match="inside a decoder call"):
+        replay.recapture_native_decoder_programs()
 
 
 @pytest.mark.parametrize("groups", [1, 8])
@@ -229,6 +270,16 @@ def test_norm_singleton_alias_does_not_allow_rebinding_or_state_aliases():
     assert not replay._is_norm_singleton_view(value, value.view(5120))
     state = value.float()
     assert not replay._is_norm_singleton_view(state, state.view(1, 1, 5120))
+
+
+def test_v4_mhc_reshape_retains_the_complete_source_storage_range():
+    pool = torch.zeros(2, 4, dtype=torch.bfloat16)
+    value = pool[:1]
+    assert replay._is_contiguous_reshape(value, value.view(1, 4, 1))
+    assert not replay._is_contiguous_reshape(value, pool[1:].view(1, 4, 1))
+    assert not replay._is_contiguous_reshape(value, value.clone().view(1, 4, 1))
+    assert not replay._is_contiguous_reshape(value, value[:, :2])
+    assert not replay._is_contiguous_reshape(value, value.view(2, 2).t())
 
 
 def test_consumer_fusion_coverage_requires_all_new_compute_programs():

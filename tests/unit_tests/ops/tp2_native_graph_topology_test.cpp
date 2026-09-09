@@ -40,5 +40,24 @@ int main() {
   auto mixed = chain(1, true); mixed[3].peerOnly = false;
   const auto layout = NativeGraphTopology::prepare(mixed, 1);
   assert(layout.computeCount == 18 && layout.consumers[1] == 2 && layout.consumers[2] == 4);
+  std::vector<NativeNodeKind> v4;
+  for (size_t index = 0; index < 86; ++index) {
+    v4.push_back({false, false});
+    v4.push_back({true, true});
+  }
+  v4.push_back({false, false});
+  const auto v4_layout = NativeGraphTopology::prepare(v4, 6, false, 86, false);
+  assert(v4_layout.computeCount == 87 && v4_layout.consumers.size() == 86);
+  assert(v4_layout.prefixNodes == 0 && v4_layout.externalCollectives == 0);
+  const auto shared_consumer = NativeGraphTopology::prepare(
+      {{false, false}, {true, true}, {true, true}, {false, false}}, 1, false, 2, false);
+  assert(shared_consumer.computeCount == 2);
+  assert(shared_consumer.consumers == std::vector<uint32_t>({1, 1}));
+  auto incomplete_v4 = v4;
+  incomplete_v4.erase(incomplete_v4.begin() + 1);
+  bool rejected = false;
+  try { NativeGraphTopology::prepare(incomplete_v4, 6, false, 86, false); }
+  catch (const std::invalid_argument&) { rejected = true; }
+  assert(rejected);
   std::cout << "NATIVE_TOPOLOGY_EXACT\n";
 }

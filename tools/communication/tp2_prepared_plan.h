@@ -48,6 +48,7 @@ struct PreparedInputSignature {
 struct PreparedNode {
   bool exchange = false;
   bool peer_only = false;
+  bool reduction_only = false;
   uint64_t recipe_id = 0;
   habana::graph::GraphExec* graph = nullptr;
   std::vector<int64_t> inputs, outputs;
@@ -61,6 +62,11 @@ class PreparedGroupPlan : public std::enable_shared_from_this<PreparedGroupPlan>
   std::vector<int64_t> input_slots, result_slots;
   std::vector<PreparedInputSignature> signatures;
   std::vector<PreparedNode> nodes;
+  struct ReshapeView {
+    int64_t source, output;
+    std::vector<int64_t> shape;
+  };
+  std::vector<ReshapeView> reshape_views;
   std::shared_ptr<habana::HcclCommunicator> communicator;
   bool sealed = false;
   std::atomic<bool> valid{true};
@@ -96,6 +102,23 @@ class PreparedGroupPlan : public std::enable_shared_from_this<PreparedGroupPlan>
     return add_slot(tensor.view(shape), false);
   }
 
+  int64_t add_reshape_view(int64_t source, const std::vector<int64_t>& shape) {
+    TORCH_CHECK(!sealed, "Prepared reshape cannot change a sealed plan");
+    const auto tensor = slots.at(source).toTensor();
+    TORCH_CHECK(tensor.is_contiguous(), "Prepared reshape requires contiguous storage");
+    const auto view = tensor.view(shape);
+    TORCH_CHECK(view.numel() == tensor.numel() && view.storage_offset() == tensor.storage_offset(),
+                "Prepared reshape must retain the complete source range");
+    const auto output = add_slot(view, false);
+    reshape_views.push_back({source, output, shape});
+    return output;
+  }
+
+  void refresh_reshape_views(torch::jit::Stack& values) const {
+    for (const auto& view : reshape_views)
+      values.at(view.output) = values.at(view.source).toTensor().view(view.shape);
+  }
+
   void add_exchange(std::vector<int64_t> inputs, std::vector<int64_t> outputs, double epsilon) {
     TORCH_CHECK(!sealed && inputs.size() == 3 && outputs.size() == 4, "Invalid prepared exchange bindings");
     PreparedNode node;
@@ -116,6 +139,11 @@ class PreparedGroupPlan : public std::enable_shared_from_this<PreparedGroupPlan>
     nodes.push_back(std::move(node));
   }
 
+  void add_all_reduce(int64_t input, int64_t output) {
+    add_peer_exchange(input, output);
+    nodes.back().reduction_only = true;
+  }
+
   void prepare(c10d::ProcessGroupEagerHCCL* backend, std::vector<int64_t> results) {
     TORCH_CHECK(!sealed && !nodes.empty() && tp2ExchangeEnabled(), "Prepared plans require dedicated TP2 exchange");
     TORCH_CHECK(GET_ENV_FLAG_NEW(PT_HPU_LAZY_MODE) == 0 &&
@@ -132,7 +160,10 @@ class PreparedGroupPlan : public std::enable_shared_from_this<PreparedGroupPlan>
         const auto partial = slots.at(node.inputs[0]).toTensor();
         if (node.peer_only) {
           const auto peer = slots.at(node.outputs[0]).toTensor();
-          TORCH_CHECK(partial.sizes() == at::IntArrayRef({1, 5120}) &&
+          const int64_t hidden = partial.numel();
+          TORCH_CHECK(hidden == 4096 || (!node.reduction_only && hidden == 5120),
+                      "Unsupported prepared TP2 hidden width");
+          TORCH_CHECK(partial.sizes() == at::IntArrayRef({1, hidden}) &&
                           partial.scalar_type() == at::kBFloat16 && partial.device().type() == at::kHPU,
                       "Prepared peer exchange requires TP2 C1 BF16 hidden states");
           validateTensor(peer, partial, "prepared peer", at::kBFloat16);
@@ -183,7 +214,7 @@ void runPreparedExchangeNode(const std::shared_ptr<habana::HcclCommunicator>& co
                              const PreparedNode& node, const torch::jit::Stack& values) {
   if (node.peer_only) {
     TORCH_CHECK(values.size() == 2, "Invalid prepared peer bindings");
-    runTp2ExchangePeer(communicator, values[0].toTensor(), values[1].toTensor(), 0);
+    runTp2ExchangePeer(communicator, values[0].toTensor(), values[1].toTensor(), 0, node.reduction_only);
   } else {
     TORCH_CHECK(values.size() == 7, "Invalid prepared fused norm bindings");
     runFusedAllReduceNorm(communicator,
@@ -209,6 +240,7 @@ void replayPreparedGroups(std::vector<std::shared_ptr<PreparedGroupPlan>> plans,
     auto incoming = std::move(inputs[i]);
     for (size_t j = 0; j < incoming.size(); ++j)
       frame.values[plan->input_slots[j]] = std::move(incoming[j]);
+    plan->refresh_reshape_views(frame.values);
     for (const auto& value : frame.values)
       if (value.isTensor() && value.toTensor().device().type() == at::kHPU)
         habana::get_tensor_extra_meta(value.toTensor())->set_tensor_pipelined();

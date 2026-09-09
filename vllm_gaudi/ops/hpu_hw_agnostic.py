@@ -515,7 +515,9 @@ else:
             return torch.int32
 
         def process_weights_after_loading(self, layer: RoutedExperts) -> None:
-            if (envs.VLLM_HPU_DSV4_TPC_MXFP4_GATHER or envs.VLLM_HPU_DSV4_TPC_MXFP4_INDEXED):
+            if (envs.VLLM_HPU_DSV4_TPC_MXFP4_GATHER or envs.VLLM_HPU_DSV4_TPC_MXFP4_INDEXED
+                    or envs.VLLM_HPU_DSV4_MXFP4_INDEXED_MME
+                    or envs.VLLM_HPU_DSV4_MXFP4_PREPARED_MME):
                 _ensure_dsv4_tpc_ops_loaded()
             w13 = layer.w13_weight
             w2 = layer.w2_weight
@@ -568,6 +570,7 @@ else:
                 ep_shift + num_experts - 1,
                 block_size=self.MXFP4_BLOCK_SIZE,
                 has_bias=has_bias,
+                tensor_parallel_size=layer.moe_config.moe_parallel_config.tp_size,
             )
 
             for expert_id in range(num_experts):
@@ -585,7 +588,33 @@ else:
                 w13_scale.data,
                 w2_scale.data,
             )
-            layer.moe_op._cache_weight_lists()
+            prepared = layer.moe_op.prepare_stacked_weights()
+            if prepared:
+                standard_bytes = sum(
+                    value.numel() * value.element_size()
+                    for value in (w13, w2, w13_scale, w2_scale)
+                )
+                descriptors = layer.moe_op.prepared_weight_descriptors()
+                assert descriptors is not None
+                prepared_bytes = sum(
+                    value.numel() * value.element_size()
+                    for descriptor in descriptors
+                    for value in (descriptor.q16, descriptor.s16)
+                )
+                for value in (w13, w2, w13_scale, w2_scale):
+                    value.data = torch.empty(0, dtype=value.dtype, device=value.device)
+                layer.moe_op.release_standard_weight_references()
+                logger.info(
+                    "Prepared DeepSeek V4 MXFP4 layer %s generation=%d "
+                    "layout=%d resident=%.1f MiB released=%.1f MiB",
+                    layer.layer_name,
+                    descriptors[0].generation,
+                    descriptors[0].layout_version,
+                    prepared_bytes / (1024 * 1024),
+                    standard_bytes / (1024 * 1024),
+                )
+            else:
+                layer.moe_op._cache_weight_lists()
             self.moe_quant_config = self.get_fused_moe_quant_config(layer)
 
         def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig:
@@ -4105,6 +4134,14 @@ else:
     _ORIGINAL_DEEPSEEK_V4_MLA_FORWARD_PREFILL = (deepseek_v4_attention_module.DeepseekV4MLAAttention._forward_prefill)
     deepseek_v4_attention_module.DeepseekV4MultiHeadLatentAttentionWrapper.attention_impl = (
         _hpu_deepseek_v4_attention_impl)
+
+    def _make_native_decode_attention(self, storage_bindings):
+        from vllm_gaudi.ops.deepseek_v4_native import NativeAttention
+        _ensure_dsv4_tpc_ops_loaded()
+        return NativeAttention(self, _hpu_dsv4_frontend_no_scores, _hpu_dsv4_frontend_compressor, storage_bindings)
+
+    deepseek_v4_attention_module.DeepseekV4MultiHeadLatentAttentionWrapper.make_hpu_native_decode = (
+        _make_native_decode_attention)
     deepseek_v4_attention_module.DeepseekV4MLAAttention._forward_decode = (_hpu_dsv4_mla_forward_decode)
     deepseek_v4_attention_module.DeepseekV4MLAAttention._forward_prefill = (_hpu_dsv4_mla_forward_prefill)
     _ORIGINAL_DEEPSEEK_V4_INDEXER_FORWARD = (deepseek_v4_attention_module.DeepseekV4Indexer.forward)

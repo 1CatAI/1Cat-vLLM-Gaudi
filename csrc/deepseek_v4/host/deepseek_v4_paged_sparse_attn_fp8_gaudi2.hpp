@@ -23,8 +23,8 @@ public:
     };
 
     explicit DeepseekV4PagedSparseAttnFP8Gaudi2(
-        TopkMode mode = GLOBAL_SLOTS)
-        : mode_(mode)
+        TopkMode mode = GLOBAL_SLOTS, bool functionalOutput = false)
+        : mode_(mode), functionalOutput_(functionalOutput)
     {
     }
 
@@ -37,4 +37,5 @@ public:
 
 private:
     TopkMode mode_;
+    bool functionalOutput_;
 };

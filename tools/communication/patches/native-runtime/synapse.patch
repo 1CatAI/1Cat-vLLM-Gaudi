@@ -2553,10 +2553,10 @@ index fc94c65..850dc1a 100644
  
  #endif /*_SYN_SYN_SINGLETON_INTERFACE_H_*/
 diff --git a/synapse/include/synapse_api.h b/synapse/include/synapse_api.h
-index f765083..11f9ffc 100644
+index f765083..4682d5f 100644
 --- a/synapse/include/synapse_api.h
 +++ b/synapse/include/synapse_api.h
-@@ -114,6 +114,34 @@ synStatus SYN_API_CALL synStreamSynchronize( const synStreamHandle streamHandle
+@@ -114,6 +114,36 @@ synStatus SYN_API_CALL synStreamSynchronize( const synStreamHandle streamHandle
   */
  synStatus SYN_API_CALL synStreamQuery( const synStreamHandle streamHandle );
  
@@ -2578,6 +2578,8 @@ index f765083..11f9ffc 100644
 +                                                          synNativeGraphSyncInfo*       completion);
 +synStatus SYN_API_CALL synNativeComputeGraphGetInfo(synNativeComputeGraphHandle graphHandle,
 +                                                    synNativeComputeGraphInfo*   graphInfo);
++synStatus SYN_API_CALL synNativeComputeGraphGetWorkspaceBytes(synNativeComputeGraphHandle graphHandle,
++                                                             uint64_t* workspaceBytes);
 +synStatus SYN_API_CALL synNativeComputeGraphDestroy(synNativeComputeGraphHandle graphHandle);
 +// Internal research plan. The caller retains the callback context and graph
 +// until all queued consumers complete; one replay publishes the prepared NIC
@@ -2591,7 +2593,7 @@ index f765083..11f9ffc 100644
  //!
  /*!
   ***************************************************************************************************
-@@ -1351,6 +1379,12 @@ synStatus SYN_API_CALL synNodeSetDeterministic( const synGraphHandle   graphHand
+@@ -1351,6 +1381,12 @@ synStatus SYN_API_CALL synNodeSetDeterministic( const synGraphHandle   graphHand
                                                  const synNodeId        nodeId,
                                                  const bool             useDeterministic);
  
@@ -2604,7 +2606,7 @@ index f765083..11f9ffc 100644
  //!
  /*!
   ***************************************************************************************************
-@@ -2315,6 +2349,13 @@ synStatus SYN_API_CALL synTensorSetQuantizationData(synTensor               tens
+@@ -2315,6 +2351,13 @@ synStatus SYN_API_CALL synTensorSetQuantizationData(synTensor               tens
  synStatus SYN_API_CALL synTensorSetExternal(synTensor               tensor,
                                              bool                    isExternal);
  
@@ -2618,7 +2620,7 @@ index f765083..11f9ffc 100644
  //!
  /*!
   ***************************************************************************************************
-@@ -2627,6 +2668,8 @@ synStatus SYN_API_CALL synTensorGetGeometryExt(const synTensor         tensor,
+@@ -2627,6 +2670,8 @@ synStatus SYN_API_CALL synTensorGetGeometryExt(const synTensor         tensor,
  synStatus SYN_API_CALL synTensorGetExternal(const synTensor         tensor,
                                              bool*                   isExternal);
  
@@ -2627,7 +2629,7 @@ index f765083..11f9ffc 100644
  //!
  /*!
   ***************************************************************************************************
-@@ -2896,6 +2939,19 @@ synStatus SYN_API_CALL synNodeGetUserParams( const synGraphHandle   graphHandle,
+@@ -2896,6 +2941,19 @@ synStatus SYN_API_CALL synNodeGetUserParams( const synGraphHandle   graphHandle,
   */
  synStatus SYN_API_CALL synStatusGetBriefDescription(synStatus status, char* statusDescription, size_t len);
  
@@ -4132,6 +4134,73 @@ index 0000000..72fea1c
 +template std::string hl_gcfg::GcfgItemImpl<uint64_t, uint64_t>::getDefaultValuesStr() const;
 +template std::string hl_gcfg::GcfgItemImpl<bool, bool>::getDefaultValuesStr() const;
 +template std::string hl_gcfg::GcfgItemImpl<float, float>::getDefaultValuesStr() const;
+diff --git a/synapse/src/runtime/common/graph_entries_container.cpp b/synapse/src/runtime/common/graph_entries_container.cpp
+index 2cb8614..2b114ec 100644
+--- a/synapse/src/runtime/common/graph_entries_container.cpp
++++ b/synapse/src/runtime/common/graph_entries_container.cpp
+@@ -114,7 +114,7 @@ HabanaGraph* GraphEntriesContainer::_getGraph(GraphId graphId)
+     return itGraph->second.graph.get();
+ }
+ 
+-HabanaGraphPtr GraphEntriesContainer::destroyGraph(synGraphHandle graphHandle)
++HabanaGraphPtr GraphEntriesContainer::destroyGraph(synGraphHandle graphHandle, SectionHandleVec* retiredSections)
+ {
+     GraphId graphId = graphHandle->graphId;
+     auto    itGraph = m_graphs.find(graphId);
+@@ -124,7 +124,19 @@ HabanaGraphPtr GraphEntriesContainer::destroyGraph(synGraphHandle graphHandle)
+         return HabanaGraphPtr();
+     }
+     _destroyTensors(itGraph->second);
+-    _destroySections(itGraph->second);
++    if (retiredSections != nullptr)
++    {
++        retiredSections->clear();
++        for (synSectionHandle section : itGraph->second.sectionHandles)
++        {
++            retiredSections->push_back(section);
++        }
++        itGraph->second.sectionHandles.clear();
++    }
++    else
++    {
++        _destroySections(itGraph->second);
++    }
+     HabanaGraphPtr graphPtr(std::move(itGraph->second.graph));
+     m_graphs.erase(graphId);
+     return graphPtr;
+@@ -177,6 +189,10 @@ void GraphEntriesContainer::destroyAllGraphs()
+     for (auto& graphPair : m_graphs)
+     {
+         _destroyTensors(graphPair.second);
++        graphPair.second.graph.reset();
++    }
++    for (auto& graphPair : m_graphs)
++    {
+         _destroySections(graphPair.second);
+     }
+     m_graphs.clear();
+diff --git a/synapse/src/runtime/common/graph_entries_container.hpp b/synapse/src/runtime/common/graph_entries_container.hpp
+index e548db5..f5585cf 100644
+--- a/synapse/src/runtime/common/graph_entries_container.hpp
++++ b/synapse/src/runtime/common/graph_entries_container.hpp
+@@ -49,7 +49,8 @@ public:
+ 
+     synStatus getCurrentGraphId(GraphId& graphId);
+ 
+-    HabanaGraphPtr destroyGraph(synGraphHandle graphHandle);
++    using SectionHandleVec = llvm_vecsmall::SmallVector<synSectionHandle, MAX_TENSOR_NR>;
++    HabanaGraphPtr destroyGraph(synGraphHandle graphHandle, SectionHandleVec* retiredSections = nullptr);
+ 
+     void destroyAllGraphs();
+ 
+@@ -81,7 +82,6 @@ public:
+                            void*                      ptr,
+                            uint32_t                   graphId);
+ 
+-    using SectionHandleVec = llvm_vecsmall::SmallVector<synSectionHandle, MAX_TENSOR_NR>;
+     void setSections(GraphId currGraph, const SectionHandleVec& sectionHandles);
+     void setSection(GraphId currGraph, synSectionHandle sectionHandle);
+     void removeSection(GraphId currGraph, synSectionHandle sectionHandle);
 diff --git a/synapse/src/runtime/common/legacy_logger_compat.cpp b/synapse/src/runtime/common/legacy_logger_compat.cpp
 new file mode 100644
 index 0000000..35746c6
@@ -4208,6 +4277,33 @@ index 1f8eeef..5d02cd9 100644
      if (!pipe)
      {
          LOG_ERR(SYN_OSAL, "popen failed");
+diff --git a/synapse/src/runtime/common/section_handle.cpp b/synapse/src/runtime/common/section_handle.cpp
+index 5776af2..584a8ad 100644
+--- a/synapse/src/runtime/common/section_handle.cpp
++++ b/synapse/src/runtime/common/section_handle.cpp
+@@ -26,7 +26,14 @@ bool InternalSectionHandle::setRMW(bool isRMW)
+ 
+ bool InternalSectionHandle::setSectionHandle(synSectionHandle sectionHandle)
+ {
+-    return safeModify([&]() { m_sectionHandle = sectionHandle; }, __FUNCTION__);
++    // A graph clone inherits its locked section ID but receives a fresh slot.
++    // Initializing that slot identity must not unlock or modify its properties.
++    if (m_sectionHandle == nullptr)
++    {
++        m_sectionHandle = sectionHandle;
++        return true;
++    }
++    return m_sectionHandle == sectionHandle;
+ }
+ 
+ bool InternalSectionHandle::setIDAndLock(InternalSectionHandle::SectionIDType id)
+@@ -46,4 +53,4 @@ bool InternalSectionHandle::safeModify(std::function<void()> modifier, const std
+     }
+     modifier();
+     return true;
+-}
+\ No newline at end of file
++}
 diff --git a/synapse/src/runtime/common/syn_api_stat.hpp b/synapse/src/runtime/common/syn_api_stat.hpp
 index b65e012..c70e726 100644
 --- a/synapse/src/runtime/common/syn_api_stat.hpp
@@ -4465,7 +4561,7 @@ index 6b2a973..3800937 100644
 \ No newline at end of file
 +SlotMapItemSptr<InternalSectionHandle> getSectionPtrFromHandle(synSectionHandle handle);
 diff --git a/synapse/src/runtime/common/syn_singleton_graph.cpp b/synapse/src/runtime/common/syn_singleton_graph.cpp
-index 3b622ce..6ce8e30 100644
+index 3b622ce..28fc713 100644
 --- a/synapse/src/runtime/common/syn_singleton_graph.cpp
 +++ b/synapse/src/runtime/common/syn_singleton_graph.cpp
 @@ -14,6 +14,9 @@
@@ -4478,7 +4574,24 @@ index 3b622ce..6ce8e30 100644
  #include <vector>
  #include <malloc.h>
  
-@@ -635,6 +638,151 @@ HabanaGraph* synSingleton::getGraph(const synGraphHandle graphHandle)
+@@ -511,12 +514,14 @@ synStatus synSingleton::duplicateGraph(synGraphHandle      graphHandle,
+                             "{}: Failed to create duplicate graph for graph {}, section duplication failed",
+                             HLLOG_FUNC,
+                             graphHandle->graphId);
+-                    // cleanup on failure
++                    // Graph nodes and the duplication map retain section
++                    // references. Release both before returning their slots.
++                    tensorsPtrMapVec.clear();
++                    m_graphEntries.destroyGraph(*newGraphHandle).reset();
+                     for (synSectionHandle newlyCreatedSection : newSections)
+                     {
+                         m_sectionHndlSlopMap.erase((SMHandle)newlyCreatedSection);
+                     }
+-                    m_graphEntries.destroyGraph(*newGraphHandle);
+                     return synFail;
+                 }
+                 ptr->setSectionHandle((synSectionHandle)handle);
+@@ -635,6 +640,151 @@ HabanaGraph* synSingleton::getGraph(const synGraphHandle graphHandle)
      return returnValue;
  }
  
@@ -4630,7 +4743,7 @@ index 3b622ce..6ce8e30 100644
  /*
   ***************************************************************************************************
   *   @brief Compile the current graph
-@@ -663,6 +811,13 @@ synStatus synSingleton::compileGraph(synRecipeHandle*     pRecipeHandle,
+@@ -663,6 +813,13 @@ synStatus synSingleton::compileGraph(synRecipeHandle*     pRecipeHandle,
          return synFail;
      }
  
@@ -4644,7 +4757,35 @@ index 3b622ce..6ce8e30 100644
      InternalRecipeHandle* pInternalRecipeHandle = nullptr;
      synStatus             status =
          m_recipeManager
-@@ -1059,6 +1214,38 @@ synStatus synSingleton::nodeSetDeterministic(const synGraphHandle graphHandle,
+@@ -994,9 +1151,10 @@ synStatus synSingleton::destroyGraph(const synGraphHandle graphHandle)
+     VERIFY_IS_NULL_POINTER(SYN_API, graphHandle, "graphHandle");
+ 
+     HabanaGraphPtr graphPtr;
++    GraphEntriesContainer::SectionHandleVec retiredSections;
+     {
+         std::unique_lock<std::mutex> guard(m_graphsMutex);
+-        graphPtr = m_graphEntries.destroyGraph(graphHandle);
++        graphPtr = m_graphEntries.destroyGraph(graphHandle, &retiredSections);
+         if (!graphPtr)
+         {
+             return synFail;
+@@ -1005,6 +1163,15 @@ synStatus synSingleton::destroyGraph(const synGraphHandle graphHandle)
+     // actual graph destructor is called outside of the lock scope
+     const auto nbNodes = graphPtr->getNumNodes();
+     graphPtr.reset();
++    // Tensor section references held by graph nodes are gone only after the
++    // actual graph destructor. Erasing earlier leaks every occupied slot.
++    for (synSectionHandle section : retiredSections)
++    {
++        if (!m_sectionHndlSlopMap.erase((SMHandle)section))
++        {
++            LOG_ERR(SYN_GRAPH, "failed to retire section 0x{:x} after graph destruction", (SMHandle)section);
++        }
++    }
+     delete graphHandle;
+     // large graphs create glibc heap fragmentation (objects have different liftime)
+     // glibc does not handle fragmentation automatically (jemalloc does)
+@@ -1059,6 +1226,38 @@ synStatus synSingleton::nodeSetDeterministic(const synGraphHandle graphHandle,
      return synSuccess;
  }
  
@@ -4752,7 +4893,7 @@ index af75566..dd0fc9e 100644
  {
      VERIFY_NULL_GET_TENSOR_UNSAFE(tensor, permutation, synTensorPropPermutation);
 diff --git a/synapse/src/runtime/common/synapse_api_impl.cpp b/synapse/src/runtime/common/synapse_api_impl.cpp
-index bc1c1d0..0aac609 100644
+index bc1c1d0..4e41200 100644
 --- a/synapse/src/runtime/common/synapse_api_impl.cpp
 +++ b/synapse/src/runtime/common/synapse_api_impl.cpp
 @@ -12,10 +12,26 @@
@@ -4875,7 +5016,7 @@ index bc1c1d0..0aac609 100644
  synStatus SYN_API_CALL synEventCreate(synEventHandle* pEventHandle, const synDeviceId deviceId, const uint32_t flags)
  {
      API_ENTRY_STATUS_TIMED()
-@@ -756,6 +858,16 @@ synStatus SYN_API_CALL synNodeSetDeterministic(const synGraphHandle graphHandle,
+@@ -756,6 +858,18 @@ synStatus SYN_API_CALL synNodeSetDeterministic(const synGraphHandle graphHandle,
      API_EXIT_STATUS_TIMED(status, synNodeSetDeterministicP);
  }
  
@@ -4885,14 +5026,16 @@ index bc1c1d0..0aac609 100644
 +{
 +    API_ENTRY_STATUS_TIMED()
 +    LOG_SYN_API("graphHandle 0x{:x} synNodeId {}", TO64(graphHandle), nodeId);
-+    status = _SYN_SINGLETON_->nodeSetUserProgrammability(graphHandle, nodeId, userProgrammability);
++    // These backported APIs are absent from the version-locked profiler shim.
++    // Dispatch to the internal object instead of an old plugin's virtual table.
++    status = _SYN_SINGLETON_INTERNAL->synSingleton::nodeSetUserProgrammability(graphHandle, nodeId, userProgrammability);
 +    API_EXIT_STATUS_TIMED(status, synNodeSetUserProgrammabilityP);
 +}
 +
  synStatus SYN_API_CALL synNodeGetDeterministic(const synGraphHandle graphHandle,
                                                 const synNodeId      nodeId,
                                                 bool*                pUseDeterministic)
-@@ -1167,6 +1279,22 @@ synStatus SYN_API_CALL synTensorSetExternal(synTensor tensor, bool isExternal)
+@@ -1167,6 +1281,22 @@ synStatus SYN_API_CALL synTensorSetExternal(synTensor tensor, bool isExternal)
      API_EXIT_STATUS_TIMED(status, synTensorSetExternalP);
  }
  
@@ -4900,7 +5043,7 @@ index bc1c1d0..0aac609 100644
 +{
 +    API_ENTRY_STATUS_TIMED()
 +    LOG_SYN_API();
-+    status = _SYN_SINGLETON_->tensorSetIsReusable(tensor, isReusable);
++    status = _SYN_SINGLETON_INTERNAL->synSingleton::tensorSetIsReusable(tensor, isReusable);
 +    API_EXIT_STATUS_TIMED(status, synTensorSetMemoryReuseP);
 +}
 +
@@ -4908,14 +5051,14 @@ index bc1c1d0..0aac609 100644
 +{
 +    API_ENTRY_STATUS_TIMED()
 +    LOG_SYN_API();
-+    status = _SYN_SINGLETON_->tensorSetMinimalLatency(tensor, minimalLatency);
++    status = _SYN_SINGLETON_INTERNAL->synSingleton::tensorSetMinimalLatency(tensor, minimalLatency);
 +    API_EXIT_STATUS_TIMED(status, synTensorSetMinimalLatencyP);
 +}
 +
  synStatus SYN_API_CALL synTensorSetGeometryExt(synTensor                   tensor,
                                                 const synTensorGeometryExt* geometry,
                                                 synGeometryType             geometryType)
-@@ -1183,7 +1311,11 @@ synStatus SYN_API_CALL synTensorSetGeometry(synTensor                tensor,
+@@ -1183,7 +1313,11 @@ synStatus SYN_API_CALL synTensorSetGeometry(synTensor                tensor,
  {
      API_ENTRY_STATUS_TIMED()
      LOG_SYN_API();
@@ -4928,7 +5071,7 @@ index bc1c1d0..0aac609 100644
      API_EXIT_STATUS_TIMED(status, synTensorSetGeometryP);
  }
  
-@@ -1276,7 +1408,7 @@ synStatus SYN_API_CALL synTensorGetGeometry(synTensor tensor, synTensorGeometry*
+@@ -1276,7 +1410,7 @@ synStatus SYN_API_CALL synTensorGetGeometry(synTensor tensor, synTensorGeometry*
  {
      API_ENTRY_STATUS_TIMED()
      LOG_SYN_API();
@@ -4937,7 +5080,7 @@ index bc1c1d0..0aac609 100644
      API_EXIT_STATUS_TIMED(status, synTensorGetGeometryP);
  }
  
-@@ -1304,6 +1436,14 @@ synStatus SYN_API_CALL synTensorGetExternal(const synTensor tensor, bool* isExte
+@@ -1304,6 +1438,14 @@ synStatus SYN_API_CALL synTensorGetExternal(const synTensor tensor, bool* isExte
      API_EXIT_STATUS_TIMED(status, synTensorGetExternalP);
  }
  
@@ -4945,14 +5088,14 @@ index bc1c1d0..0aac609 100644
 +{
 +    API_ENTRY_STATUS_TIMED()
 +    LOG_SYN_API();
-+    status = _SYN_SINGLETON_->tensorGetMinimalLatency(tensor, minimalLatency);
++    status = _SYN_SINGLETON_INTERNAL->synSingleton::tensorGetMinimalLatency(tensor, minimalLatency);
 +    API_EXIT_STATUS_TIMED(status, synTensorGetMinimalLatencyP);
 +}
 +
  synStatus SYN_API_CALL synTensorGetDeviceDataType(synTensor tensor, synDataType* deviceDataType)
  {
      API_ENTRY_STATUS_TIMED()
-@@ -1451,4 +1591,26 @@ synStatus SYN_API_CALL synNodeGetUserParams(const synGraphHandle graphHandle,
+@@ -1451,4 +1593,26 @@ synStatus SYN_API_CALL synNodeGetUserParams(const synGraphHandle graphHandle,
  synStatus SYN_API_CALL synStatusGetBriefDescription(synStatus status, char* statusDescription, size_t len)
  {
      return synSingleton::convertStatusToString(status, statusDescription, len);
@@ -4964,7 +5107,7 @@ index bc1c1d0..0aac609 100644
 +{
 +    API_ENTRY_STATUS_TIMED()
 +    LOG_SYN_API("usedMem {} timestampSec {}", usedMem, timestampSec);
-+    status = _SYN_SINGLETON_->updateMemoryConsumption(usedMem, timestampSec);
++    status = _SYN_SINGLETON_INTERNAL->synSingleton::updateMemoryConsumption(usedMem, timestampSec);
 +    API_EXIT_STATUS_TIMED(status, synUpdateMemoryConsumptionP);
 +}
 +
@@ -4978,7 +5121,7 @@ index bc1c1d0..0aac609 100644
 +
 +    API_ENTRY_STATUS_TIMED()
 +    LOG_SYN_API("flags {:#x}", flags);
-+    status = _SYN_SINGLETON_->synDumpStateAndTerminate(msg, flags);
++    status = _SYN_SINGLETON_INTERNAL->synSingleton::synDumpStateAndTerminate(msg, flags);
 +    API_EXIT_STATUS_TIMED(status, synDumpStateAndTerminateP);
 +}
 diff --git a/synapse/src/runtime/qman/common/parser/define.hpp b/synapse/src/runtime/qman/common/parser/define.hpp
@@ -5831,10 +5974,10 @@ index 387a2ee..c562c4e 100644
 +}
 diff --git a/synapse/src/runtime/scal/common/native_compute_graph.hpp b/synapse/src/runtime/scal/common/native_compute_graph.hpp
 new file mode 100644
-index 0000000..3cec802
+index 0000000..77417c1
 --- /dev/null
 +++ b/synapse/src/runtime/scal/common/native_compute_graph.hpp
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,110 @@
 +#pragma once
 +
 +#include "runtime/scal/common/entities/scal_stream_base.hpp"
@@ -5906,6 +6049,7 @@ index 0000000..3cec802
 +                                       const synLaunchTensorInfoExt* launchTensors,
 +                                       uint32_t                      launchTensorCount,
 +                                       uint64_t                      workspaceAddress,
++                                       uint64_t                      workspaceSize,
 +                                       synStatus&                    status);
 +    void commitSegment(CompiledSegment& segment, NativeScalCommandBuffer&& commands);
 +    void invalidate();
@@ -5915,6 +6059,7 @@ index 0000000..3cec802
 +    size_t segmentCount() const { return m_segments.size(); }
 +    uint64_t globalProgramBytes() const { return m_globalProgramBytes; }
 +    uint64_t arcProgramBytes() const { return m_arcProgramBytes; }
++    uint64_t workspaceAllocationBytes() const { return m_workspaceAllocationBytes; }
 +    const ScalLongSyncObject& lastCompletion() const { return m_lastCompletion; }
 +
 +private:
@@ -5941,6 +6086,7 @@ index 0000000..3cec802
 +    uint64_t                    m_arcProgramBytes    = 0;
 +    size_t                      m_nextReplaySegment = 0;
 +    bool                        m_replayActive      = false;
++    uint64_t                    m_workspaceAllocationBytes = 0;
 +};
 diff --git a/synapse/src/runtime/scal/common/native_compute_graph_handle.hpp b/synapse/src/runtime/scal/common/native_compute_graph_handle.hpp
 new file mode 100644
@@ -5974,10 +6120,10 @@ index 0000000..2e1f4ad
 +};
 diff --git a/synapse/src/runtime/scal/common/native_compute_program.hpp b/synapse/src/runtime/scal/common/native_compute_program.hpp
 new file mode 100644
-index 0000000..61acb37
+index 0000000..6d2af18
 --- /dev/null
 +++ b/synapse/src/runtime/scal/common/native_compute_program.hpp
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,170 @@
 +#pragma once
 +
 +#include <algorithm>
@@ -6059,8 +6205,8 @@ index 0000000..61acb37
 +            throw std::invalid_argument("Invalid native compute plan shape");
 +        for (size_t i = 0; i < consumers.size(); ++i)
 +            if ((consumers[i] == 0 && !externalInputCompletion) || consumers[i] >= segments.size() ||
-+                (i && consumers[i] <= consumers[i - 1]))
-+                throw std::invalid_argument("Native NIC consumers must follow distinct ordered producers");
++                (i && consumers[i] < consumers[i - 1]))
++                throw std::invalid_argument("Native NIC consumers must follow ordered producers");
 +        NativeComputeProgram plan;
 +        plan.externalInputCompletion = externalInputCompletion && consumers.front() == 0;
 +        auto append = [&](const std::vector<uint8_t>& bytes, const std::vector<NativeComputePatch>& patches,
@@ -6095,7 +6241,10 @@ index 0000000..61acb37
 +        {
 +            const auto* source = segments[segment];
 +            if (!source || source->empty()) throw std::invalid_argument("Empty native compute segment");
-+            if (nextConsumer < consumers.size() && segment == consumers[nextConsumer])
++            // Independent exchanges may share a compiled producer/consumer.
++            // Retain a separate wait and completion relocation for every NIC
++            // operation so the consumer cannot run after only the first one.
++            while (nextConsumer < consumers.size() && segment == consumers[nextConsumer])
 +            {
 +                if (!plan.completionDelta && !plan.externalInputCompletion)
 +                    throw std::invalid_argument("NIC has no compute producer");
@@ -6147,10 +6296,10 @@ index 0000000..61acb37
 +};
 diff --git a/synapse/src/runtime/scal/common/native_recipe_memory.hpp b/synapse/src/runtime/scal/common/native_recipe_memory.hpp
 new file mode 100644
-index 0000000..286dec7
+index 0000000..7f7743a
 --- /dev/null
 +++ b/synapse/src/runtime/scal/common/native_recipe_memory.hpp
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,53 @@
 +#pragma once
 +
 +#include "runtime/scal/common/infra/scal_includes.hpp"
@@ -6173,7 +6322,7 @@ index 0000000..286dec7
 +    NativeRecipeMemory(const NativeRecipeMemory&)            = delete;
 +    NativeRecipeMemory& operator=(const NativeRecipeMemory&) = delete;
 +
-+    synStatus initialize(uint64_t globalSize, uint64_t arcSize);
++    synStatus initialize(uint64_t globalSize, uint64_t arcSize, uint64_t workspaceSize = 0);
 +    synStatus close();
 +
 +    bool initialized() const { return m_initialized; }
@@ -6184,6 +6333,8 @@ index 0000000..286dec7
 +    uint32_t arcCoreAddress() const { return m_arcCoreAddress; }
 +    uint64_t globalAllocationBytes() const { return m_globalAllocationBytes; }
 +    uint64_t arcAllocationBytes() const { return m_arcAllocationBytes; }
++    uint64_t workspaceDeviceAddress() const { return m_workspaceDeviceAddress; }
++    uint64_t workspaceAllocationBytes() const { return m_workspaceAllocationBytes; }
 +
 +private:
 +    ScalMemoryPool& m_globalPool;
@@ -6198,6 +6349,9 @@ index 0000000..286dec7
 +    uint64_t             m_arcAllocationBytes    = 0;
 +    bool                 m_initialized         = false;
 +    bool                 m_closed              = false;
++    scal_buffer_handle_t m_workspaceBuffer = nullptr;
++    uint64_t             m_workspaceDeviceAddress = 0;
++    uint64_t             m_workspaceAllocationBytes = 0;
 +};
 diff --git a/synapse/src/runtime/scal/common/recipe_launcher/recipe_launcher.cpp b/synapse/src/runtime/scal/common/recipe_launcher/recipe_launcher.cpp
 index 4b8287b..eb1d508 100644
@@ -6403,7 +6557,7 @@ index 04f5b65..df92eb6 100644
      uint32_t m_computeWorkCompletionValue   = 0;
  };
 diff --git a/synapse/src/runtime/scal/common/stream_compute_scal.cpp b/synapse/src/runtime/scal/common/stream_compute_scal.cpp
-index df58f41..47d9d15 100644
+index df58f41..05aa264 100644
 --- a/synapse/src/runtime/scal/common/stream_compute_scal.cpp
 +++ b/synapse/src/runtime/scal/common/stream_compute_scal.cpp
 @@ -1,4 +1,5 @@
@@ -6412,7 +6566,7 @@ index df58f41..47d9d15 100644
  
  #include "habana_global_conf_runtime.h"
  #include "runtime/common/recipe/recipe_handle_impl.hpp"
-@@ -13,23 +14,530 @@
+@@ -13,23 +14,570 @@
  
  #include "runtime/scal/common/entities/scal_completion_group.hpp"
  #include "runtime/scal/common/entities/scal_memory_pool.hpp"
@@ -6444,7 +6598,7 @@ index df58f41..47d9d15 100644
 +    }
 +}
 +
-+synStatus NativeRecipeMemory::initialize(uint64_t globalSize, uint64_t arcSize)
++synStatus NativeRecipeMemory::initialize(uint64_t globalSize, uint64_t arcSize, uint64_t workspaceSize)
 +{
 +    if (m_initialized)
 +    {
@@ -6471,7 +6625,8 @@ index df58f41..47d9d15 100644
 +    // arena base contract or a zero-offset dynamic ECB list is rejected.
 +    constexpr uint64_t arcAlignment    = 256;
 +    if (globalSize > std::numeric_limits<uint64_t>::max() - (globalAlignment - 1) ||
-+        arcSize > std::numeric_limits<uint64_t>::max() - (arcAlignment - 1))
++        arcSize > std::numeric_limits<uint64_t>::max() - (arcAlignment - 1) ||
++        workspaceSize > std::numeric_limits<uint64_t>::max() - (globalAlignment - 1))
 +    {
 +        return synInvalidArgument;
 +    }
@@ -6530,6 +6685,28 @@ index df58f41..47d9d15 100644
 +    m_arcDeviceAddress = rawArcDeviceAddress + arcShift;
 +    m_arcCoreAddress   = static_cast<uint32_t>(static_cast<uint64_t>(rawArcCoreAddress) + arcShift);
 +
++    // Bridge's shared workspace can grow or move during later prefill or
++    // output-head launches. Captured descriptor addresses must instead point
++    // to graph-owned storage, retained through the final graph completion.
++    if (workspaceSize)
++    {
++        m_workspaceAllocationBytes = workspaceSize + globalAlignment - 1;
++        status = m_globalPool.allocateDeviceMemory(m_workspaceAllocationBytes, m_workspaceBuffer);
++        uint64_t rawWorkspaceAddress = 0;
++        uint32_t unusedCoreAddress = 0;
++        if (status == synSuccess)
++            status = m_globalPool.getDeviceMemoryAddress(m_workspaceBuffer, unusedCoreAddress, rawWorkspaceAddress);
++        if (status != synSuccess)
++        {
++            if (m_workspaceBuffer) m_globalPool.releaseDeviceMemory(m_workspaceBuffer);
++            m_hbmSharedPool.releaseDeviceMemory(m_arcBuffer);
++            m_globalPool.releaseDeviceMemory(m_globalBuffer);
++            m_workspaceBuffer = m_arcBuffer = m_globalBuffer = nullptr;
++            return status;
++        }
++        m_workspaceDeviceAddress = (rawWorkspaceAddress + globalAlignment - 1) & ~(globalAlignment - 1);
++    }
++
 +    LOG_INFO(SYN_MEM_ALLOC,
 +             "Native recipe storage global raw/aligned 0x{:x}/0x{:x} bytes {}/{}; "
 +             "ARC raw/aligned 0x{:x}/0x{:x} core 0x{:x}/0x{:x} bytes {}/{}",
@@ -6559,12 +6736,18 @@ index df58f41..47d9d15 100644
 +    }
 +
 +    synStatus firstFailure = synSuccess;
++    if (m_workspaceBuffer != nullptr)
++    {
++        const synStatus status = m_globalPool.releaseDeviceMemory(m_workspaceBuffer);
++        if (status != synSuccess) firstFailure = status;
++        else m_workspaceBuffer = nullptr;
++    }
 +    if (m_arcBuffer != nullptr)
 +    {
 +        const synStatus status = m_hbmSharedPool.releaseDeviceMemory(m_arcBuffer);
 +        if (status != synSuccess)
 +        {
-+            firstFailure = status;
++            if (firstFailure == synSuccess) firstFailure = status;
 +        }
 +        else
 +        {
@@ -6630,6 +6813,7 @@ index df58f41..47d9d15 100644
 +    const synLaunchTensorInfoExt* launchTensors,
 +    uint32_t                      launchTensorCount,
 +    uint64_t                      workspaceAddress,
++    uint64_t                      workspaceSize,
 +    synStatus&                    status)
 +{
 +    status = synSuccess;
@@ -6641,7 +6825,16 @@ index df58f41..47d9d15 100644
 +
 +    CompiledSegment segment;
 +    segment.memory = std::make_unique<NativeRecipeMemory>(m_globalPool, m_hbmSharedPool);
-+    status         = segment.memory->initialize(globalSize, arcSize);
++    // Bound new native scratch residency independently of the model's KV pool.
++    constexpr uint64_t maximumWorkspaceBytes = uint64_t(2) << 30;
++    if (m_workspaceAllocationBytes > maximumWorkspaceBytes || workspaceSize > maximumWorkspaceBytes ||
++        (workspaceSize && workspaceSize + 8191 > maximumWorkspaceBytes - m_workspaceAllocationBytes))
++    {
++        status = synOutOfDeviceMemory;
++        m_state = State::INVALID;
++        return nullptr;
++    }
++    status         = segment.memory->initialize(globalSize, arcSize, workspaceSize);
 +    if (status != synSuccess)
 +    {
 +        m_state = State::INVALID;
@@ -6658,10 +6851,11 @@ index df58f41..47d9d15 100644
 +        std::memcpy(binding.sizes, launchTensors[index].tensorSize, sizeof(binding.sizes));
 +        segment.bindings.push_back(binding);
 +    }
-+    segment.workspaceAddress = workspaceAddress;
++    segment.workspaceAddress = workspaceSize ? segment.memory->workspaceDeviceAddress() : workspaceAddress;
 +    segment.recipeSequence   = recipeSequence;
 +    m_globalProgramBytes += segment.memory->globalAllocationBytes();
 +    m_arcProgramBytes += segment.memory->arcAllocationBytes();
++    m_workspaceAllocationBytes += segment.memory->workspaceAllocationBytes();
 +    m_segments.push_back(std::move(segment));
 +    return &m_segments.back();
 +}
@@ -6944,7 +7138,7 @@ index df58f41..47d9d15 100644
    m_computeResources(*pComputeResources)
  {
      // Currently, we will have internal-signal for the TX-Command
-@@ -40,6 +548,162 @@ QueueComputeScal::QueueComputeScal(const BasicQueueInfo&           rBasicQueueIn
+@@ -40,6 +588,171 @@ QueueComputeScal::QueueComputeScal(const BasicQueueInfo&           rBasicQueueIn
  
  QueueComputeScal::~QueueComputeScal() {}
  
@@ -7081,6 +7275,15 @@ index df58f41..47d9d15 100644
 +    return synSuccess;
 +}
 +
++extern "C" synStatus SYN_API_CALL synNativeComputeGraphGetWorkspaceBytes(synNativeComputeGraphHandle handle,
++                                                                        uint64_t* bytes)
++{
++    if (!handle || !handle->graph || !bytes) return synInvalidArgument;
++    std::lock_guard<std::mutex> lock(handle->replayMutex);
++    *bytes = handle->graph->workspaceAllocationBytes();
++    return synSuccess;
++}
++
 +extern "C" synStatus SYN_API_CALL synNativeComputeGraphReplayPlan(synNativeComputeGraphHandle handle,
 +    synNativeGraphSyncInfo* completion, uint64_t* statistics, uint64_t count)
 +{
@@ -7107,7 +7310,7 @@ index df58f41..47d9d15 100644
  synStatus QueueComputeScal::eventRecord(EventInterface& rEventInterface, synStreamHandle streamHandle)
  {
      LOG_DEBUG(SYN_STREAM, "{} Stream {}", HLLOG_FUNC, m_basicQueueInfo.getDescription());
-@@ -332,6 +996,32 @@ synStatus QueueComputeScal::launch(const LaunchInfo& launchInfo)
+@@ -332,6 +1045,52 @@ synStatus QueueComputeScal::launch(const LaunchInfo& launchInfo)
      ScalStreamComputeInterface* pComputeScalStream = dynamic_cast<ScalStreamComputeInterface*>(m_scalStream);
      VERIFY_IS_NULL_POINTER(SYN_STREAM, pComputeScalStream, "pComputeScalStream");
  
@@ -7123,12 +7326,32 @@ index df58f41..47d9d15 100644
 +        synStatus nativeStatus = synSuccess;
 +        const RecipeStaticInfoScal& staticInfo =
 +            launchInfo.pRecipeHandle->deviceAgnosticRecipeHandle.m_recipeStaticInfoScal;
-+        nativeSegment = m_activeNativeGraph->addPendingSegment(staticInfo.m_glbHbmSizeTotal,
++        const recipe_t& capturedRecipe = *launchInfo.pRecipeHandle->basicRecipeHandle.recipe;
++        // The reserved PROGRAM range used by section validation can extend
++        // beyond the downloaded execution blobs. A standalone allocation must
++        // own that entire range, as well as the physical SCAL recipe sections.
++        // The usual program arena hides this difference in its larger chunks.
++        uint64_t nativeGlobalSize = staticInfo.m_glbHbmSizeTotal;
++        for (const auto section : {PROGRAM_DATA, NON_PATCHABLE})
++        {
++            const uint64_t size = capturedRecipe.workspace_sizes[
++                section == PROGRAM_DATA ? MEMORY_ID_RESERVED_FOR_PROGRAM_DATA : MEMORY_ID_RESERVED_FOR_PROGRAM];
++            const uint64_t offset = staticInfo.recipeSections[section].offsetHbm;
++            if (size > std::numeric_limits<uint64_t>::max() - offset)
++            {
++                m_activeNativeGraph->invalidate();
++                return synInvalidArgument;
++            }
++            nativeGlobalSize = std::max(nativeGlobalSize, offset + size);
++        }
++        nativeSegment = m_activeNativeGraph->addPendingSegment(nativeGlobalSize,
 +                                                               staticInfo.m_arcHbmSize,
 +                                                               launchInfo.pRecipeHandle->recipeSeqNum,
 +                                                               launchInfo.pEnqueueTensorsInfo,
 +                                                               launchInfo.pEnqueueTensorsInfoAmount,
 +                                                               launchInfo.workspaceAddress,
++                                                               launchInfo.pRecipeHandle->basicRecipeHandle.recipe
++                                                                   ->workspace_sizes[MEMORY_ID_RESERVED_FOR_WORKSPACE],
 +                                                               nativeStatus);
 +        if (nativeStatus != synSuccess || nativeSegment == nullptr)
 +        {
@@ -7140,16 +7363,22 @@ index df58f41..47d9d15 100644
      std::unique_ptr<RecipeLauncher> recipeLauncher = std::make_unique<RecipeLauncher>(pComputeScalStream,
                                                                                        &m_computeResources,
                                                                                        m_devMemoryAlloc,
-@@ -340,11 +1030,17 @@ synStatus QueueComputeScal::launch(const LaunchInfo& launchInfo)
+@@ -340,11 +1099,21 @@ synStatus QueueComputeScal::launch(const LaunchInfo& launchInfo)
                                                                                        launchInfo.pRecipeHandle,
                                                                                        dsdProcessor,
                                                                                        ++m_runningId,
 -                                                                                      launchInfo.m_apiId);
+-
+-    synStatus status = recipeLauncher->launch(launchInfo);
 +                                                                                      launchInfo.m_apiId,
 +                                                                                      nativeSegment == nullptr ? nullptr : nativeSegment->memory.get(),
 +                                                                                      nativeSegment == nullptr ? nullptr : &nativeSegment->commands);
- 
-     synStatus status = recipeLauncher->launch(launchInfo);
++
++    const LaunchInfo retainedLaunchInfo(launchInfo.pEnqueueTensorsInfo, launchInfo.pEnqueueTensorsInfoAmount,
++        nativeSegment ? nativeSegment->workspaceAddress : launchInfo.workspaceAddress,
++        launchInfo.m_assertAsyncMappedAddress, const_cast<InternalRecipeHandle*>(launchInfo.pRecipeHandle),
++        launchInfo.launchFlags, launchInfo.devSpecificInfo, launchInfo.events, launchInfo.m_apiId);
++    synStatus status = recipeLauncher->launch(retainedLaunchInfo);
      if (status != synSuccess)
      {
 +        if (m_activeNativeGraph != nullptr)
@@ -7159,7 +7388,7 @@ index df58f41..47d9d15 100644
          LOG_ERR(SYN_STREAM,
                  "{}: recipeLauncher launch failed, recipe seq {}",
                  HLLOG_FUNC,
-@@ -357,6 +1053,16 @@ synStatus QueueComputeScal::launch(const LaunchInfo& launchInfo)
+@@ -357,6 +1126,16 @@ synStatus QueueComputeScal::launch(const LaunchInfo& launchInfo)
          return status;
      }
  

@@ -42,6 +42,10 @@ class HpuCommunicator(DeviceCommunicatorBase):
         self.rank = dist.get_rank(group=self.cpu_group)
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        from vllm_gaudi import envs as gaudi_envs
+        if (gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH and torch.compiler.is_compiling()
+                and input_.shape == (1, 4096) and input_.dtype == torch.bfloat16):
+            return torch.ops.vllm_gaudi.tp2_allreduce_plain(input_)
         # FIXME(kzawora): this is a workaround for a bug in Habana PT bridge
         # occurring when PT_HPU_ENABLE_LAZY_COLLECTIVES=true env var is used
         # (which is required for tensor parallel HPUGraph inference)
