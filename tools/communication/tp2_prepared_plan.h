@@ -14,6 +14,12 @@ c10::IValue preparedIValue(py::handle value) {
   TORCH_CHECK(false, "Prepared bindings accept only tensors, fixed scalars, and None");
 }
 
+bool isPreparedStateTensor(const at::Tensor& tensor) {
+  return (tensor.scalar_type() == at::kFloat && tensor.numel() >= 393216) ||
+      (tensor.scalar_type() == at::kBFloat16 && tensor.dim() == 3 &&
+       tensor.size(0) == 1 && tensor.size(1) == 3 && tensor.size(2) == 5120);
+}
+
 struct PreparedInputSignature {
   c10::IValue value;
   std::vector<int64_t> sizes, strides;
@@ -34,7 +40,7 @@ struct PreparedInputSignature {
           actual.sizes().equals(sizes) && actual.strides().equals(strides) && actual.storage_offset() == offset &&
           // A state destination identifies the decoder group and cache generation.
           // Sharing scratch outputs between different groups would create aliases.
-          (!(expected.scalar_type() == at::kFloat && expected.numel() >= 393216) ||
+          (!isPreparedStateTensor(expected) ||
            actual.data_ptr() == expected.data_ptr());
     }
     if (value.isNone()) return input.isNone();

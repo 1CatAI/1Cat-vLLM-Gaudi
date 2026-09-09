@@ -1432,6 +1432,14 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
         if model is None:
             return None
 
+        if gaudi_envs.VLLM_HPU_TP2_PREPARED_MROPE:
+            from vllm_gaudi.ops.hpu_rotary_embedding import HPUMRotaryEmbedding
+
+            rotary = [module for module in model.modules() if isinstance(module, HPUMRotaryEmbedding)]
+            if len(rotary) != 1 or not rotary[0]._hpu_prepared_mrope:
+                raise RuntimeError("Prepared MRoPE requires one shared, qualified decoder rotary module")
+            return rotary[0]
+
         if model.__class__.__name__.endswith("RotaryEmbedding"):
             return model
 
@@ -1667,12 +1675,19 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
             layer._hpu_cached_ssm_view = None
             layer._hpu_active_ssm_source = None
             layer._hpu_active_ssm_key = None
+            layer._hpu_active_conv_state = None
+            layer._hpu_cached_conv_view = None
+            layer._hpu_active_conv_source = None
+            layer._hpu_active_conv_key = None
 
     @torch.compiler.disable
     def _prepare_gdn_state_views(self, attn_meta, num_real_tokens: int) -> None:
         indices = getattr(attn_meta, "load_indices_tensor", None)
         key = (bool(getattr(attn_meta, "is_prompt", False)), bool(getattr(attn_meta, "direct_gdn_state", False)),
                num_real_tokens, None if indices is None else indices.shape[-1])
+        if gaudi_envs.VLLM_HPU_GDN_ACTIVE_CONV_STATE_VIEWS:
+            key += (getattr(attn_meta, "num_accepted_tokens", None)
+                    is not None, bool(getattr(attn_meta, "dflash_full_query", False)))
         # Direct-state eligibility already guarantees fixed group-major prefix
         # slots. New requests/reset contents share these aliases; cache-pool
         # replacement explicitly invalidates them in initialize_kv_cache.

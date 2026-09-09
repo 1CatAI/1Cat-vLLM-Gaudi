@@ -106,6 +106,7 @@ if TYPE_CHECKING:
     VLLM_HPU_FLASHINFER_GDN_PREFILL: bool = False
     VLLM_HPU_GDN_DIRECT_STATE: bool = True
     VLLM_HPU_GDN_ACTIVE_STATE_VIEWS: bool = False
+    VLLM_HPU_GDN_ACTIVE_CONV_STATE_VIEWS: bool = False
     VLLM_HPU_GDN_ASYNC_STATE_DMA: bool = False
     VLLM_HPU_GDN_DIRECT_STATE_UPDATE: bool = False
     VLLM_HPU_GDN_PRECISE_DMA_EVENTS: bool = False
@@ -115,6 +116,12 @@ if TYPE_CHECKING:
     VLLM_HPU_TP2_GQA_COMPACT_KV: bool = False
     VLLM_HPU_TP2_COMPILED_CONSUMER_NORM: bool = False
     VLLM_HPU_TP2_NATIVE_DYNAMIC_QUANT: bool = False
+    VLLM_HPU_TP2_PREPARED_CONV_TAPS: bool = False
+    VLLM_HPU_TP2_SINGLE_BATCH_MAPPING: bool = False
+    VLLM_HPU_TP2_PREPARED_GEMMA_WEIGHT: bool = False
+    VLLM_HPU_TP2_MLP_SPLIT_SCALE: bool = False
+    VLLM_HPU_TP2_PREPARED_MROPE: bool = False
+    VLLM_HPU_TP2_GQA_NATIVE_MATMUL: bool = False
     VLLM_HPU_GDN_PADDED_DIRECT_STATE: bool = False
     VLLM_HPU_CGUID_DYNAMIC_QUANT: bool = False
     VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS: int = 32
@@ -129,6 +136,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV4_EARLY_OUTPUT_LOWERING", "0").lower() in ("1", "true"),
     "VLLM_HPU_TP2_NATIVE_DYNAMIC_QUANT":
     lambda: os.environ.get("VLLM_HPU_TP2_NATIVE_DYNAMIC_QUANT", "0") == "1",
+    "VLLM_HPU_TP2_PREPARED_CONV_TAPS":
+    lambda: os.environ.get("VLLM_HPU_TP2_PREPARED_CONV_TAPS", "0") == "1",
+    "VLLM_HPU_TP2_SINGLE_BATCH_MAPPING":
+    lambda: os.environ.get("VLLM_HPU_TP2_SINGLE_BATCH_MAPPING", "0") == "1",
+    "VLLM_HPU_TP2_PREPARED_GEMMA_WEIGHT":
+    lambda: os.environ.get("VLLM_HPU_TP2_PREPARED_GEMMA_WEIGHT", "0") == "1",
+    "VLLM_HPU_TP2_MLP_SPLIT_SCALE":
+    lambda: os.environ.get("VLLM_HPU_TP2_MLP_SPLIT_SCALE", "0") == "1",
+    "VLLM_HPU_TP2_PREPARED_MROPE":
+    lambda: os.environ.get("VLLM_HPU_TP2_PREPARED_MROPE", "0") == "1",
     # Require the version-locked native decoder compute/collective replay path.
     "VLLM_HPU_NATIVE_DECODE_GRAPH":
     lambda: os.environ.get("VLLM_HPU_NATIVE_DECODE_GRAPH", "false").strip().lower() in ("1", "true"),
@@ -376,6 +393,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Bind active recurrent-state spans before entering compiled decoder groups.
     "VLLM_HPU_GDN_ACTIVE_STATE_VIEWS":
     lambda: os.environ.get("VLLM_HPU_GDN_ACTIVE_STATE_VIEWS", "false").strip().lower() in ("1", "true"),
+    "VLLM_HPU_GDN_ACTIVE_CONV_STATE_VIEWS":
+    lambda: os.environ.get("VLLM_HPU_GDN_ACTIVE_CONV_STATE_VIEWS", "0") == "1",
     "VLLM_HPU_GDN_ASYNC_STATE_DMA":
     lambda: os.environ.get("VLLM_HPU_GDN_ASYNC_STATE_DMA", "false").strip().lower() in ("1", "true"),
     "VLLM_HPU_GDN_DIRECT_STATE_UPDATE":
@@ -390,6 +409,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_TP2_NATIVE_JOINT_PLAN", "0") == "1",
     "VLLM_HPU_TP2_GQA_COMPACT_KV":
     lambda: os.environ.get("VLLM_HPU_TP2_GQA_COMPACT_KV", "0") == "1",
+    "VLLM_HPU_TP2_GQA_NATIVE_MATMUL":
+    lambda: os.environ.get("VLLM_HPU_TP2_GQA_NATIVE_MATMUL", "0") == "1",
     "VLLM_HPU_TP2_COMPILED_CONSUMER_NORM":
     lambda: os.environ.get("VLLM_HPU_TP2_COMPILED_CONSUMER_NORM", "0") == "1",
 

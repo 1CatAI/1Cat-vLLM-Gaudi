@@ -63,7 +63,8 @@ def main() -> None:
         sources=[
             str(source),
             str(source.with_name("gdn_state_update.cpp")),
-            str(source.with_name("tp2_dynamic_quant.cpp"))
+            str(source.with_name("tp2_dynamic_quant.cpp")),
+            str(source.with_name("tp2_gqa_matmul.cpp"))
         ],
         extra_include_paths=[
             str(args.bridge_source.resolve()),

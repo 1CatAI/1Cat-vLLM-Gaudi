@@ -765,7 +765,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
         const auto& value = frame->values.at(index);
         if (!value.isTensor()) continue;
         const at::Tensor tensor = value.toTensor();
-        if (tensor.scalar_type() == at::kFloat && tensor.numel() >= 393216)
+        if (isPreparedStateTensor(tensor))
           outputs.push_back(reinterpret_cast<synapse_helpers::device_ptr>(tensor.storage().data_ptr().get()));
       }
     std::sort(outputs.begin(), outputs.end());

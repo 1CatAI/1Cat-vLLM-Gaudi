@@ -83,8 +83,10 @@ def prepared_group_stats():
 
 def _signature_key(value):
     if isinstance(value, torch.Tensor):
-        address = (value.untyped_storage().data_ptr() + value.storage_offset() * value.element_size()
-                   if value.dtype == torch.float32 and value.numel() >= 393216 else None)
+        state = ((value.dtype == torch.float32 and value.numel() >= 393216)
+                 or (value.dtype == torch.bfloat16 and value.shape == (1, 3, 5120)))
+        address = (value.untyped_storage().data_ptr() +
+                   value.storage_offset() * value.element_size() if state else None)
         return (str(value.device), str(value.dtype), tuple(value.shape), value.stride(), value.storage_offset(),
                 address)
     return (type(value).__name__, value)
