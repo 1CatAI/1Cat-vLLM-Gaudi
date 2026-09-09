@@ -73,6 +73,21 @@ class HPURMSNorm(RMSNorm):
 @GemmaRMSNorm.register_oot
 class HPUGemmaRMSNorm(GemmaRMSNorm):
 
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__(hidden_size, eps)
+        from vllm_gaudi import envs as gaudi_envs
+
+        self._hpu_prepared_gemma_weight = gaudi_envs.VLLM_HPU_TP2_PREPARED_GEMMA_WEIGHT and hidden_size == 5120
+        if self._hpu_prepared_gemma_weight:
+            from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
+            from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+            from vllm_gaudi.ops.prepared_gemma_weight import install_decode_gemma_weight
+            from vllm_gaudi.ops.tp2_prepared_plan import shutdown_prepared_group_plans
+
+            if get_tensor_model_parallel_world_size() != 2:
+                raise RuntimeError("Prepared Gemma decode weights require TP2")
+            install_decode_gemma_weight(self, default_weight_loader, shutdown_prepared_group_plans)
+
     def forward_oot(
         self,
         x: torch.Tensor,
@@ -81,7 +96,18 @@ class HPUGemmaRMSNorm(GemmaRMSNorm):
         from vllm_gaudi.extension.kernels import rms_norm
         HPUFusedRMSNorm = rms_norm()
         # GemmaRMSNorm uses (1 + w) instead of w
-        gemma_weight = self.weight + 1.0
+        gemma_weight = None
+        if getattr(self, "_hpu_prepared_gemma_weight", False) and x.numel() == self.weight.numel():
+            from vllm.forward_context import get_forward_context
+
+            metadata = get_forward_context().attn_metadata
+            if (metadata is not None and not getattr(metadata, "is_prompt", True)
+                    and getattr(metadata, "direct_gdn_state", False)):
+                if not self._hpu_decode_gemma_weight_ready:
+                    raise RuntimeError("Prepared Gemma decode weights must be loaded before capture")
+                gemma_weight = self._hpu_decode_gemma_weight
+        if gemma_weight is None:
+            gemma_weight = self.weight + 1.0
         if residual is not None:
             if getattr(self, "_hpu_tp2_fused_ar_norm", False):
                 # Stock HCCL remains the default. The experimental native path

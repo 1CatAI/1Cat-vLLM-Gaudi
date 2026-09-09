@@ -231,6 +231,14 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
             self.dt_bias.weight_loader = load_dt_bias_as_fp32
 
+        self._hpu_prepared_conv_taps = gaudi_envs.VLLM_HPU_TP2_PREPARED_CONV_TAPS
+        if self._hpu_prepared_conv_taps:
+            if self.tp_size != 2 or self.conv_kernel_size != 4:
+                raise ValueError("Prepared GDN convolution taps require TP2 and a four-tap convolution")
+            from vllm_gaudi.ops.gdn_conv_taps import install_decode_conv_taps
+
+            install_decode_conv_taps(self, self.conv1d)
+
     def rearrange_mixed_qkv(self, mixed_qkv):
         """Pure-torch rearrange – avoids einops graph breaks on HPU."""
         if mixed_qkv is None:
@@ -266,6 +274,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         to the active rows while retaining the scheduler-owned backing cache.
         """
         self._hpu_active_ssm_state = None
+        self._hpu_active_conv_state = None
         if (attn_metadata is None or bool(getattr(attn_metadata, "is_prompt", False))
                 or not bool(getattr(attn_metadata, "direct_gdn_state", False))
                 or getattr(self.cache_config, "enable_prefix_caching", False) or _triton_gaudi_mode == "strict"):
@@ -290,6 +299,23 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             self._hpu_active_ssm_source = pool
             self._hpu_active_ssm_key = key
         self._hpu_active_ssm_state = self._hpu_cached_ssm_view
+        if (gaudi_envs.VLLM_HPU_GDN_ACTIVE_CONV_STATE_VIEWS and self.tp_size == 2 and batch == 1
+                and self.qkv_size == 5120 and self.A_log.numel() == 24
+                and getattr(attn_metadata, "num_accepted_tokens", None) is None
+                and not bool(getattr(attn_metadata, "dflash_full_query", False))):
+            conv_pool = self.kv_cache[0]
+            history = self.conv_kernel_size - 1
+            if (conv_pool.dtype != torch.bfloat16 or conv_pool.ndim != 3 or conv_pool.shape[0] != pool.shape[0]
+                    or history != 3 or conv_pool.shape[1] < history or conv_pool.shape[2] != self.qkv_size
+                    or not conv_pool.is_contiguous()):
+                raise RuntimeError("Active convolution binding requires a contiguous BF16 compact state pool")
+            conv_key = (*key, tuple(conv_pool.shape), conv_pool.storage_offset())
+            if (getattr(self, "_hpu_active_conv_source", None) is not conv_pool
+                    or getattr(self, "_hpu_active_conv_key", None) != conv_key):
+                self._hpu_cached_conv_view = conv_pool.narrow(0, offset * span + 1, 1)[:, -history:, :]
+                self._hpu_active_conv_source = conv_pool
+                self._hpu_active_conv_key = conv_key
+            self._hpu_active_conv_state = self._hpu_cached_conv_view
 
     def _extract_metadata(self, num_tokens):
         """Extract forward-context metadata into plain tensors.
@@ -316,6 +342,11 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             store_state_indices = load_state_indices
 
         conv_state = self.kv_cache[0]
+        active_conv = getattr(self, "_hpu_active_conv_state", None)
+        if (not is_prompt and bool(getattr(attn_metadata, "direct_gdn_state", False)) and num_tokens == 1
+                and num_accepted_tokens is None and not bool(getattr(attn_metadata, "dflash_full_query", False))
+                and active_conv is not None):
+            conv_state = active_conv
         active_state = getattr(self, "_hpu_active_ssm_state", None)
         state_is_active_view = (not is_prompt and bool(getattr(attn_metadata, "direct_gdn_state", False))
                                 and active_state is not None and active_state.shape[0] == num_tokens)
@@ -557,9 +588,11 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             is_spec_decode = has_dflash_state and load_state_indices.dim() == 2
             is_dflash_transition = has_dflash_state and load_state_indices.dim() == 1
             selected_conv_state = conv_state
-            direct_conv_state = False
-            if (not is_spec_decode and direct_gdn_state and self.compact_state_group_count is not None
-                    and self.compact_state_group_count > 0 and self.compact_state_group_offset is not None):
+            direct_conv_state = (gaudi_envs.VLLM_HPU_GDN_ACTIVE_CONV_STATE_VIEWS and not has_dflash_state
+                                 and direct_gdn_state and num_tokens == 1 and conv_state.shape == (1, 3, 5120))
+            if (not direct_conv_state and not is_spec_decode and direct_gdn_state
+                    and self.compact_state_group_count is not None and self.compact_state_group_count > 0
+                    and self.compact_state_group_offset is not None):
                 group_span = (conv_state.shape[0] - 2) // self.compact_state_group_count
                 if num_decodes <= group_span:
                     state_start = self.compact_state_group_offset * group_span + 1
@@ -574,6 +607,11 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 self.conv1d.weight.size(0),
                 self.conv1d.weight.size(2),
             )
+            prepared_conv_taps = None
+            if self._hpu_prepared_conv_taps and direct_conv_state and num_tokens == 1 and not has_dflash_state:
+                if not self._hpu_decode_conv_taps_ready:
+                    raise RuntimeError("GDN convolution taps were not initialized by the weight loader")
+                prepared_conv_taps = self._hpu_decode_conv_taps
             # Strict decode must validate the mutation contract before convolution
             # changes its cache. Other modes preserve the mainline graph tactics.
             if _triton_gaudi_mode == "strict" and (load_state_indices is None
@@ -629,6 +667,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     max_query_len=(load_state_indices.size(1) if is_spec_decode else 1 if is_dflash_transition else -1),
                     validate_data=False,
                     direct_state_layout=direct_conv_state,
+                    prepared_tap_weights=prepared_conv_taps,
                     round_before_activation=self.dflash_conv_round_before_activation,
                     full_query_valid_state=(self.dflash_full_query_conv and is_spec_decode and dflash_full_query
                                             and self.compact_state_group_offset is not None

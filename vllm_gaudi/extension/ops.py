@@ -104,6 +104,11 @@ def b2b_impl(tensor, block_mapping, matmul_op):
 
 
 def batch2block(tensor, block_mapping, matmul_op=torch.matmul):
+    if (gaudi_envs.VLLM_HPU_TP2_SINGLE_BATCH_MAPPING and gaudi_envs.VLLM_HPU_TP2_GQA_COMPACT_KV and tensor.shape[0] == 1
+            and block_mapping.shape[1] == 1 and tensor.dtype == block_mapping.dtype == torch.bfloat16):
+        from vllm_gaudi.ops.gqa_compact import single_batch_to_blocks
+
+        return single_batch_to_blocks(tensor, block_mapping)
     return b2b_impl(tensor, block_mapping, matmul_op)
 
 
@@ -129,7 +134,8 @@ def pipelined_pa(attn,
                  matmul_av_op,
                  batch2block_matmul_op,
                  block2batch_matmul_op,
-                 compact_gqa=False):
+                 compact_gqa=False,
+                 native_gqa=False):
     # When fp32_softmax is enabled attn is left in fp32 after Q@K
     # We can return to native dtype after we renormalize and calculate the adjustments
     if block_bias is not None and attn.dtype != block_bias.dtype:
@@ -166,7 +172,11 @@ def pipelined_pa(attn,
             #Looks like a Synapse issue, need to investigate further.
             block_sums_sink = attn_sink.sum(dim=-1, keepdim=True)
             block_sums = block_sums + block_sums_sink
-    if compact_gqa:
+    if native_gqa:
+        from vllm_gaudi.ops.gqa_compact import native_gqa_matmul
+
+        attn = native_gqa_matmul(attn, value)
+    elif compact_gqa:
         from vllm_gaudi.ops.gqa_compact import compact_gqa_matmul
 
         attn = compact_gqa_matmul(attn, value, matmul_av_op)
@@ -262,6 +272,9 @@ def flat_pa(query, key_cache, value_cache, block_list, block_mapping, block_bias
     _, kv_heads, head_size = key_cache.shape
     q_heads = hidden_size // head_size
     compact_gqa = gaudi_envs.VLLM_HPU_TP2_GQA_COMPACT_KV
+    native_gqa = gaudi_envs.VLLM_HPU_TP2_GQA_NATIVE_MATMUL
+    if native_gqa and not compact_gqa:
+        raise RuntimeError("Native GQA requires compact TP2 attention")
     if compact_gqa and not (is_hpu_gaudi2 and batch_size == 1 and (q_heads, kv_heads, head_size) == (12, 2, 256)
                             and query.dtype == key_cache.dtype == value_cache.dtype == torch.bfloat16
                             and k_scales is None and v_scales is None and not get_config().fp32_softmax):
@@ -295,7 +308,8 @@ def flat_pa(query, key_cache, value_cache, block_list, block_mapping, block_bias
             position_bias = position_bias.unflatten(1, (kv_heads, -1))
         if block_bias is not None:
             block_bias = block_bias.unsqueeze(2)
-    key = key.transpose(-2, -1)
+    if not native_gqa:
+        key = key.transpose(-2, -1)
 
     if get_config().fp32_softmax:
         attn = torch.empty(matmul_shape(query, key), dtype=torch.float32, device=query.device)
@@ -303,7 +317,11 @@ def flat_pa(query, key_cache, value_cache, block_list, block_mapping, block_bias
             position_bias = position_bias.float()
         attn = matmul_qk_op(query, key, out=attn)
     else:
-        if compact_gqa:
+        if native_gqa:
+            from vllm_gaudi.ops.gqa_compact import native_gqa_matmul
+
+            attn = native_gqa_matmul(query, key, transpose_rhs=True)
+        elif compact_gqa:
             from vllm_gaudi.ops.gqa_compact import compact_gqa_matmul
 
             attn = compact_gqa_matmul(query, key, matmul_qk_op)
@@ -325,7 +343,8 @@ def flat_pa(query, key_cache, value_cache, block_list, block_mapping, block_bias
                         matmul_av_op=matmul_av_op,
                         batch2block_matmul_op=batch2block_matmul_op,
                         block2batch_matmul_op=block2batch_matmul_op,
-                        compact_gqa=compact_gqa)
+                        compact_gqa=compact_gqa,
+                        native_gqa=native_gqa)
     attn = block2batch(attn, block_mapping, block2batch_matmul_op)
     attn = attn.squeeze(-2)
 

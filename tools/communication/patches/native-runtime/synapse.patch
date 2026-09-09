@@ -158,6 +158,72 @@ index 47a0119..6b1937c 100644
  #include <memory>
  #include <mutex>
  #include <unordered_map>
+diff --git a/mme/src/mme_common/recipe_generator.cpp b/mme/src/mme_common/recipe_generator.cpp
+index a3222cd..4a2267a 100644
+--- a/mme/src/mme_common/recipe_generator.cpp
++++ b/mme/src/mme_common/recipe_generator.cpp
+@@ -10,6 +10,8 @@
+ #include "mme_assert.h"
+ #include "src/utils/logger.h"
+ #include <algorithm>
++#include <cstdlib>
++#include <cstring>
+ 
+ // A threshold used to avoid having high number of descriptors when applying SB reuse for BGEMM
+ #define MAX_BATCH_NR_FOR_SB_REUSE 16
+@@ -32,6 +34,25 @@ static_assert(false, "ENABLE_RECIPE_WORKAROUNDS must be defined");
+ 
+ namespace MmeCommon
+ {
++// Narrow compatibility experiment for the audited 2048-token prefill GEMM.
++// The production descriptor dump uses four aligned CD partials and a 2x2
++// output tile. This does not claim general compatibility with newer MME ABIs.
++static bool useReferenceFp8Partition(const RecipeConstants& constants, const MmeRecipe& recipe)
++{
++    const char* enabled = std::getenv("SYN_NATIVE_MME_REFERENCE_SPLIT");
++    const auto& p = constants.params;
++    const bool selected = enabled && std::strcmp(enabled, "1") == 0 && recipe.reuseA() &&
++           p.strategy.sbReuse && p.strategy.pattern == e_mme_sp_reduction_fck &&
++           constants.mmeHalReader.getChipType() == ChipType::e_mme_Gaudi2 &&
++           p.opType == e_mme_abt && p.x.elementType == e_type_fp8_143 &&
++           p.w.elementType == e_type_fp8_143 && p.x.sizes[0] == 8704 && p.x.sizes[1] == 2048 &&
++           p.w.sizes[0] == 8704 && (p.w.sizes[1] == 1280 || p.w.sizes[1] == 1024) &&
++           p.x.sizes[2] == 1 && p.x.sizes[3] == 1 && p.x.sizes[4] == 1 &&
++           p.w.sizes[2] == 1 && p.w.sizes[3] == 1 && p.w.sizes[4] == 1 &&
++           constants.geoAttr.getGeometryWidth() == 256 && constants.geoAttr.getGeometryHeight() == 512;
++    return selected;
++}
++
+ // Valid alignment for reduction tree.
+ // "roundDown": determines how to round the misalignment.
+ unsigned calcCommonDimAlignment(const MmeRecipe& recipe,
+@@ -954,6 +975,17 @@ void RecipeGridsCreator::create(unsigned fcdStepCapacity, unsigned spStepCapacit
+     }
+     GridsParams recipeGridsParams(fcdStepCapacity, spStepCapacity, cdGrids);
+     defineGrids(recipeGridsParams);
++    if (useReferenceFp8Partition(m_constants, m_recipe))
++    {
++        MME_ASSERT(cdGrids == 1 && m_recipe.reuseA(), "Reference FP8 split requires one static A-reuse GEMM");
++        auto& cd = recipeGridsParams.commonDimParamsVec[0];
++        MME_ASSERT(cd.reuseType == SB_PARTIAL_REUSE_NO_DIM_INCLUDED && !cd.partialToMemory &&
++                   cd.atomicUnitLength && 2176 % cd.atomicUnitLength == 0,
++                   "Reference FP8 partial alignment or accumulation contract differs");
++        cd.maxFitNr = 2176 / cd.atomicUnitLength;
++        recipeGridsParams.fcdStepCapacity = 2;
++        recipeGridsParams.spStepCapacity = 1;
++    }
+     createGrids(recipeGridsParams);
+ }
+ 
+@@ -1257,7 +1289,7 @@ const MmeRecipe& RecipeGenerator::generateRecipe()
+     // Possible extension of SP grids according to GC pipeline level. The logic can affect spatial or FCD grids
+     // but not common dim grid.
+ #if ENABLE_PIPELINE_LEVEL_HINT
+-    handlePipelineLevelHint();
++    if (!useReferenceFp8Partition(m_constants, m_recipe)) handlePipelineLevelHint();
+ #endif
+ 
+     // Create recipe sub-views.
 diff --git a/qman_fw/engines-arc/include/gaudi2_arc_common_packets.h b/qman_fw/engines-arc/include/gaudi2_arc_common_packets.h
 index 2006bf8..34b9c37 100644
 --- a/qman_fw/engines-arc/include/gaudi2_arc_common_packets.h
@@ -3539,10 +3605,10 @@ index ef3d760..755a14d 100644
 \ No newline at end of file
 +#endif  // _OP_VALIDATOR_H_
 diff --git a/synapse/src/graph_compiler/passes/allocate_tensors.cpp b/synapse/src/graph_compiler/passes/allocate_tensors.cpp
-index 58d6357..8f655d6 100644
+index 58d6357..e3465ad 100644
 --- a/synapse/src/graph_compiler/passes/allocate_tensors.cpp
 +++ b/synapse/src/graph_compiler/passes/allocate_tensors.cpp
-@@ -82,45 +82,56 @@ static void clearAllocationStateBeforeRecalculation(HabanaGraph& g, const Tensor
+@@ -82,45 +82,61 @@ static void clearAllocationStateBeforeRecalculation(HabanaGraph& g, const Tensor
      std::for_each(tensors.begin(), tensors.end(), [](auto& tensor) { tensor->unsetDramOffset(); });
  }
  
@@ -3564,8 +3630,13 @@ index 58d6357..8f655d6 100644
 -            if (g.getNumberOfTensorProducers(t) != 0)
 +            const bool isOutput = g.getNumberOfTensorProducers(t) != 0;
 +            const bool reuseOutput = isOutput && GCFG_ENABLE_PERSISTENT_OUTPUT_REUSE.value();
++            // A later overlapping output keeps this address live after the
++            // input's final local read. Checking only previous overlaps is
++            // sufficient for output reuse, but not for input reuse.
 +            const bool reuseInput  = !isOutput && t->isMemoryReusable() &&
-+                                    GCFG_ENABLE_PERSISTENT_INPUT_REUSE.value();
++                                    GCFG_ENABLE_PERSISTENT_INPUT_REUSE.value() &&
++                                    !g.isOutputTensor(t) && !t->isEnforcedOutput() &&
++                                    !memoryCoherence->overlapsWithOthersInSection(t);
 +            if (reuseOutput || reuseInput)
              {
                  if (memoryCoherence->previousOverlapsWithOthersInSection(t)) continue;
@@ -3610,7 +3681,7 @@ index 58d6357..8f655d6 100644
  }
  
  static bool allocateRemainingTensors(HabanaGraph& g, const TensorVector& tensors)
-@@ -131,12 +142,12 @@ static bool allocateRemainingTensors(HabanaGraph& g, const TensorVector& tensors
+@@ -131,12 +147,12 @@ static bool allocateRemainingTensors(HabanaGraph& g, const TensorVector& tensors
      AllLivenessAnalysis            allLivenessAnalysis(&g);
      auto                           maxLiveCapacity = livenessAnalysis.getGraphMaxCapacity();
      const std::vector<uint64_t>&   usedMem         = livenessAnalysis.getUsedMem();
@@ -3628,7 +3699,7 @@ index 58d6357..8f655d6 100644
                                                allLivenessAnalysis,
                                                workSpaceAllocator,
                                                0);
-@@ -150,7 +161,7 @@ static bool allocateRemainingTensors(HabanaGraph& g, const TensorVector& tensors
+@@ -150,7 +166,7 @@ static bool allocateRemainingTensors(HabanaGraph& g, const TensorVector& tensors
          // actual allocation
          LOG_INFO(TENSORS_ALLOC,
                   "DRAM allocation using default allocator -- Tensors workspace size: {}, max live capacity measured: "
@@ -3637,7 +3708,7 @@ index 58d6357..8f655d6 100644
                   initialWorkspaceSize,
                   maxLiveCapacity,
                   adjustedMaxLiveCapacity);
-@@ -177,7 +188,7 @@ static bool allocateRemainingTensors(HabanaGraph& g, const TensorVector& tensors
+@@ -177,7 +193,7 @@ static bool allocateRemainingTensors(HabanaGraph& g, const TensorVector& tensors
      {
          // learning of the workspace size, we use a local allocator in here
          currentWorkspaceSize            = (minWorkspaceSize + maxWorkspaceSize) / 2;
@@ -3646,7 +3717,7 @@ index 58d6357..8f655d6 100644
          double workspaceSizeRangeFactor = static_cast<double>(maxWorkspaceSize) / minWorkspaceSize;
          if (workspaceSizeRangeFactor <= 1 + GCFG_WORKSPACE_EPOCH_SIZE_PERCISION.value()) break;
          clearAllocationStateBeforeRecalculation(g, tensors);
-@@ -222,7 +233,7 @@ static bool allocateRemainingTensors(HabanaGraph& g, const TensorVector& tensors
+@@ -222,7 +238,7 @@ static bool allocateRemainingTensors(HabanaGraph& g, const TensorVector& tensors
          LOG_INFO(TENSORS_ALLOC,
                   "DRAM allocation using epoch allocator -- Epoch size {} Tensors workspace size: {}, default allocator "
                   "workspace "
@@ -3655,7 +3726,7 @@ index 58d6357..8f655d6 100644
                   bestEpochSize,
                   bestWorkspaceSize,
                   defaultAllocationSuccess ? initialWorkspaceSize : UINT64_MAX,
-@@ -237,7 +248,7 @@ static bool allocateRemainingTensors(HabanaGraph& g, const TensorVector& tensors
+@@ -237,7 +253,7 @@ static bool allocateRemainingTensors(HabanaGraph& g, const TensorVector& tensors
      }
      LOG_INFO(TENSORS_ALLOC,
               "DRAM allocation using default allocator -- Tensors workspace size: {}, max live capacity measured: {}, "
@@ -3664,7 +3735,7 @@ index 58d6357..8f655d6 100644
               initialWorkspaceSize,
               maxLiveCapacity,
               adjustedMaxLiveCapacity);
-@@ -373,9 +384,9 @@ bool allocateTensors(HabanaGraph& g)
+@@ -373,9 +389,9 @@ bool allocateTensors(HabanaGraph& g)
          }
      }
  
@@ -3879,6 +3950,43 @@ index 2a09c51..9e07c88 100644
      virtual void visit(TransposeNode* node) override;
  };
  
+diff --git a/synapse/src/platform/gaudi2/graph_compiler/passes/generate_mme_descriptors.cpp b/synapse/src/platform/gaudi2/graph_compiler/passes/generate_mme_descriptors.cpp
+index 5f5b367..9f5303f 100644
+--- a/synapse/src/platform/gaudi2/graph_compiler/passes/generate_mme_descriptors.cpp
++++ b/synapse/src/platform/gaudi2/graph_compiler/passes/generate_mme_descriptors.cpp
+@@ -1,4 +1,6 @@
+ #include "generate_mme_descriptors.h"
++#include <cstdlib>
++#include <cstring>
+ 
+ // synapse api (relative to include/)
+ #include "synapse_common_types.h"
+@@ -351,12 +353,25 @@ struct PerfComp
+ ParamsAndPerfsVector generatePerfAttrCandidates(MmeLayerParams layerParams, MmeCommon::MmeBrain& brain)
+ {
+     ParamsAndPerfsVector   candidates;
++    const char* reference = std::getenv("SYN_NATIVE_MME_REFERENCE_SPLIT");
++    const bool referencePartition = reference && std::strcmp(reference, "1") == 0 &&
++        layerParams.opType == MmeCommon::e_mme_abt && layerParams.strategy.sbReuse &&
++        layerParams.x.elementType == MmeCommon::e_type_fp8_143 &&
++        layerParams.w.elementType == MmeCommon::e_type_fp8_143 &&
++        layerParams.x.sizes == MmeCommon::SizeArray({8704, 2048, 1, 1, 1}) &&
++        layerParams.w.sizes[0] == 8704 &&
++        (layerParams.w.sizes[1] == 1024 || layerParams.w.sizes[1] == 1280) &&
++        layerParams.w.sizes[2] == 1 && layerParams.w.sizes[3] == 1 && layerParams.w.sizes[4] == 1;
+     const std::string_view geometryNames[] = {"4xw", "2xw", "2xh", "4xh"};
+     for (bool walkDown : {false, true})
+     {
+         layerParams.setPattern(walkDown);
+         for (auto geometry : brain.getGeometries(layerParams))
+         {
++            // The reference partition specifies an accumulation traversal as
++            // well as a tile size. A different performance candidate would
++            // silently restore another FP32 reduction order after enumeration.
++            if (referencePartition && (walkDown || geometry != MmeCommon::e_mme_geometry_2xh)) continue;
+             layerParams.strategy.geometry = geometry;
+             MmeCommon::PerfAttr perf {};
+             brain.getPerfAttr(layerParams, perf);
 diff --git a/synapse/src/runtime/common/device/device_interface.hpp b/synapse/src/runtime/common/device/device_interface.hpp
 index f7b244b..50bb831 100644
 --- a/synapse/src/runtime/common/device/device_interface.hpp
@@ -5478,7 +5586,7 @@ index a0a841f..fcc8bfc 100644
 \ No newline at end of file
 +};
 diff --git a/synapse/src/runtime/scal/common/entities/scal_stream_base.cpp b/synapse/src/runtime/scal/common/entities/scal_stream_base.cpp
-index 3229db9..91cb7ae 100644
+index 3229db9..014220a 100644
 --- a/synapse/src/runtime/scal/common/entities/scal_stream_base.cpp
 +++ b/synapse/src/runtime/scal/common/entities/scal_stream_base.cpp
 @@ -6,6 +6,8 @@
@@ -5490,7 +5598,7 @@ index 3229db9..91cb7ae 100644
  #define LOG_SCALSTRM_TRACE(msg, ...)                                                                                   \
      LOG_TRACE(SYN_STREAM, "stream {}:" msg, m_name, ##__VA_ARGS__)
  #define LOG_SCALSTRM_DEBUG(msg, ...)                                                                                   \
-@@ -67,6 +69,177 @@ ScalStreamBase::~ScalStreamBase()
+@@ -67,6 +69,212 @@ ScalStreamBase::~ScalStreamBase()
      releaseResources();
  }
  
@@ -5588,28 +5696,63 @@ index 3229db9..91cb7ae 100644
 +}
 +
 +synStatus ScalStreamBase::publishNativeComputeProgram(const NativeComputeProgram& program,
-+    const synNativeGraphSyncInfo* completions, const ScalLongSyncObject& base,
++    const NativePublicationPlan& publication, const synNativeGraphSyncInfo* completions, const ScalLongSyncObject& base,
 +    std::vector<CommandSubmissionData>& scratch, uint64_t& submissions)
 +{
 +    if (m_nativeCommandCaptureActive || scratch.size() != 2 || program.pages.empty()) return synInvalidArgument;
++    auto* ccb = getStreamCyclicBuffer();
++    const auto* phase = publication.enabled() ? &publication.at(ccb->nativePublicationOffset()) : nullptr;
++    if (phase && (phase->publishBefore.size() != program.pages.size() || ccb->nativeRequiresImmediatePublication()))
++        return synInvalidArgument;
++    CommandSubmissionData pending {0, 0, nullptr, false};
++    auto publish = [&]() {
++        if (!pending.valid) return synSuccess;
++        if (scal_stream_submit(m_streamHndl, pending.pi, m_submitAlign) != SCAL_SUCCESS)
++            return synFailedToSubmitWorkload;
++        ++submissions;
++        pending.valid = false;
++        return synSuccess;
++    };
 +    submissions = 0;
-+    for (const auto& page : program.pages)
++    for (size_t index = 0; index < program.pages.size(); ++index)
 +    {
++        const auto& page = program.pages[index];
++        // addCommand can block in handleCommandsBarrier. The phase includes
++        // padding that lands on a chunk entry, so flush BEFORE calling it.
++        if (phase && phase->publishBefore[index])
++        {
++            const auto status = publish();
++            if (status != synSuccess) return status;
++        }
 +        for (auto& entry : scratch) entry = {0, 0, nullptr, false};
 +        auto copy = [&](uint8_t* destination) { NativeComputeProgram::writePage(destination, page, completions); };
-+        synStatus status = getStreamCyclicBuffer()->addCommand(page.bytes.size(), true, copy, scratch);
++        const bool last = index + 1 == program.pages.size();
++        const bool send = !phase || last || phase->publishBefore[index + 1];
++        // Prepare the complete prefix PI at each planned flush. Intermediate
++        // alignment records can be covered by that later publication.
++        synStatus status = ccb->addCommand(page.bytes.size(), send, copy, scratch);
 +        if (status != synSuccess) return status;
 +        ScalLongSyncObject retire = base;
 +        retire.m_targetValue += page.completionOffset;
-+        getStreamCyclicBuffer()->recordNativePageCompletion(page.bytes.size(), retire);
++        ccb->recordNativePageCompletion(page.bytes.size(), retire);
 +        for (const auto& entry : scratch)
 +            if (entry.valid)
 +            {
-+                if (scal_stream_submit(m_streamHndl, entry.pi, m_submitAlign) != SCAL_SUCCESS)
-+                    return synFailedToSubmitWorkload;
-+                ++submissions;
++                pending = entry;
++                if (!phase)
++                {
++                    status = publish();
++                    if (status != synSuccess) return status;
++                }
 +            }
++        if (phase && last)
++        {
++            status = publish();
++            if (status != synSuccess) return status;
++        }
 +    }
++    if (phase && ccb->nativePublicationOffset() % publication.chunkBytes != phase->finalOffset)
++        return synFail;
 +    getMonitor()->nativeArmCompleted(completions[program.producerOffsets.size() - 1].targetValue);
 +    m_prevCmdIsWait = false;
 +    m_consecutiveWaitCommands = 0;
@@ -5668,7 +5811,7 @@ index 3229db9..91cb7ae 100644
  /*
   ***************************************************************************************************
   *   @brief init() init the stream. If fails, release all resources.
-@@ -490,6 +663,23 @@ synStatus ScalStreamBase::doneChunkOfCommands(bool isUserReq, ScalLongSyncObject
+@@ -490,6 +698,23 @@ synStatus ScalStreamBase::doneChunkOfCommands(bool isUserReq, ScalLongSyncObject
      rLongSo = getIncrementedLongSo(isUserReq);
      getStreamCyclicBuffer()->doneChunkOfCommands(rLongSo);
  
@@ -5692,7 +5835,7 @@ index 3229db9..91cb7ae 100644
      return synSuccess;
  }
  
-@@ -587,4 +777,4 @@ uint8_t ScalStreamCopyBase::getContextId(enum PdmaDirCtx dir, ResourceStreamType
+@@ -587,4 +812,4 @@ uint8_t ScalStreamCopyBase::getContextId(enum PdmaDirCtx dir, ResourceStreamType
      return (((((uint8_t)dir) & ContextEncoding::DIR_MASK) << ContextEncoding::DIR_OFFSET) |
              ((((uint8_t)type) & ContextEncoding::TYPE_MASK) << ContextEncoding::TYPE_OFFSET) |
              ((((uint8_t)index) & ContextEncoding::STREAM_MASK) << ContextEncoding::STREAM_OFFSET));
@@ -5700,21 +5843,22 @@ index 3229db9..91cb7ae 100644
 \ No newline at end of file
 +}
 diff --git a/synapse/src/runtime/scal/common/entities/scal_stream_base.hpp b/synapse/src/runtime/scal/common/entities/scal_stream_base.hpp
-index 252d3d4..b1b9a45 100644
+index 252d3d4..ffc98e8 100644
 --- a/synapse/src/runtime/scal/common/entities/scal_stream_base.hpp
 +++ b/synapse/src/runtime/scal/common/entities/scal_stream_base.hpp
-@@ -6,6 +6,10 @@
+@@ -6,6 +6,11 @@
  #include "runtime/scal/common/entities/scal_monitor.hpp"
  #include "scal_internal/pkt_macros.hpp"
  
 +#include <cstdint>
 +#include <vector>
 +#include "runtime/scal/common/native_compute_program.hpp"
++#include "runtime/scal/common/native_publication_plan.hpp"
 +
  class ScalStreamBase : virtual public ScalStreamCopyInterface
  {
  public:
-@@ -62,6 +66,31 @@ public:
+@@ -62,6 +67,32 @@ public:
  
      synStatus init();
  
@@ -5736,6 +5880,7 @@ index 252d3d4..b1b9a45 100644
 +    uint32_t nativeCommandAlignment() const { return m_cmdAlign; }
 +    uint64_t nativeAvailableBytes() const;
 +    synStatus publishNativeComputeProgram(const NativeComputeProgram& program,
++                                         const NativePublicationPlan& publication,
 +                                         const synNativeGraphSyncInfo* completions,
 +                                         const ScalLongSyncObject& base,
 +                                         std::vector<CommandSubmissionData>& submissionScratch,
@@ -5746,7 +5891,7 @@ index 252d3d4..b1b9a45 100644
      uint64_t getStreamCyclicBufferOccupancyWatermark() { return getStreamCyclicBuffer()->getStreamCyclicBufferOccupancyWatermark(); };
  
  protected:
-@@ -131,6 +160,9 @@ protected:
+@@ -131,6 +162,9 @@ protected:
      const DevStreamInfo& m_devStreamInfo;
      uint32_t m_workCompletionValue;
  
@@ -5756,7 +5901,7 @@ index 252d3d4..b1b9a45 100644
  private:
      const scal_handle_t  m_devHndl;
      const uint32_t       m_streamIdx;
-@@ -199,13 +231,38 @@ synStatus ScalStreamBase::addPacketCommon(bool send, size_t cmdSize, Args&&... a
+@@ -199,13 +233,38 @@ synStatus ScalStreamBase::addPacketCommon(bool send, size_t cmdSize, Args&&... a
  template<class TPacketBuildFunc>
  synStatus ScalStreamBase::addCmd(uint32_t cmdSize, bool send, TPacketBuildFunc packetBuildFunc)
  {
@@ -5796,7 +5941,7 @@ index 252d3d4..b1b9a45 100644
      for (auto& commandSubmissionDataElement : commandSubmissionDataList)
      {
          if (commandSubmissionDataElement.valid)
-@@ -225,4 +282,4 @@ synStatus ScalStreamBase::addCmd(uint32_t cmdSize, bool send, TPacketBuildFunc p
+@@ -225,4 +284,4 @@ synStatus ScalStreamBase::addCmd(uint32_t cmdSize, bool send, TPacketBuildFunc p
      }
  
      return synSuccess;
@@ -5804,10 +5949,10 @@ index 252d3d4..b1b9a45 100644
 \ No newline at end of file
 +}
 diff --git a/synapse/src/runtime/scal/common/entities/stream_cyclic_buffer_base.hpp b/synapse/src/runtime/scal/common/entities/stream_cyclic_buffer_base.hpp
-index 387a2ee..c562c4e 100644
+index 387a2ee..7b59393 100644
 --- a/synapse/src/runtime/scal/common/entities/stream_cyclic_buffer_base.hpp
 +++ b/synapse/src/runtime/scal/common/entities/stream_cyclic_buffer_base.hpp
-@@ -52,6 +52,14 @@ public:
+@@ -52,8 +52,18 @@ public:
      }
  
      void doneChunkOfCommands(ScalLongSyncObject& rLongSo);
@@ -5821,8 +5966,12 @@ index 387a2ee..c562c4e 100644
 +    }
  
      inline bool isFirstJobInChunk() const { return m_isFirstJobInChunk; };
++    uint64_t nativePublicationOffset() const { return m_offsetInBuffer; }
++    bool nativeRequiresImmediatePublication() const { return m_debugSendEachPacket; }
  
-@@ -187,4 +195,4 @@ synStatus StreamCyclicBufferBase::addCommand(
+     const std::string dfaInfo() const;
+ 
+@@ -187,4 +197,4 @@ synStatus StreamCyclicBufferBase::addCommand(
      }
  
      return synSuccess;
@@ -5831,10 +5980,10 @@ index 387a2ee..c562c4e 100644
 +}
 diff --git a/synapse/src/runtime/scal/common/native_compute_graph.hpp b/synapse/src/runtime/scal/common/native_compute_graph.hpp
 new file mode 100644
-index 0000000..3cec802
+index 0000000..903015c
 --- /dev/null
 +++ b/synapse/src/runtime/scal/common/native_compute_graph.hpp
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,108 @@
 +#pragma once
 +
 +#include "runtime/scal/common/entities/scal_stream_base.hpp"
@@ -5921,6 +6070,7 @@ index 0000000..3cec802
 +    struct JointPlan
 +    {
 +        NativeComputeProgram program;
++        NativePublicationPlan publication;
 +        uint32_t nicLongSoIndex = 0;
 +        synNativeGraphExchangeReplay callback = nullptr;
 +        void* context = nullptr;
@@ -6143,6 +6293,78 @@ index 0000000..61acb37
 +            word = (word & ~patch.mask) | ((value << patch.destinationShift) & patch.mask);
 +            std::memcpy(output + patch.byteOffset, &word, sizeof(word));
 +        }
++    }
++};
+diff --git a/synapse/src/runtime/scal/common/native_publication_plan.hpp b/synapse/src/runtime/scal/common/native_publication_plan.hpp
+new file mode 100644
+index 0000000..8cbf6b5
+--- /dev/null
++++ b/synapse/src/runtime/scal/common/native_publication_plan.hpp
+@@ -0,0 +1,66 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++
++#include "native_compute_program.hpp"
++
++// The CCB reclaims space at chunk entries, independently of command alignment.
++// Prepare every word-aligned starting phase once. Replay selects a row and
++// publishes its prefix before entering a potentially blocking reclaim check.
++struct NativePublicationPlan
++{
++    struct Phase
++    {
++        std::vector<uint8_t> publishBefore;
++        uint32_t finalOffset = 0;
++    };
++    std::vector<Phase> phases;
++    uint32_t chunkBytes = 0;
++
++    bool enabled() const { return !phases.empty(); }
++
++    const Phase& at(uint64_t offset) const
++    {
++        if (!enabled() || offset % sizeof(uint32_t))
++            throw std::invalid_argument("Invalid native publication phase");
++        return phases[(offset % chunkBytes) / sizeof(uint32_t)];
++    }
++
++    static NativePublicationPlan prepare(const NativeComputeProgram& program, uint32_t alignment,
++                                          uint64_t bufferBytes, uint32_t chunks)
++    {
++        if (program.pages.empty() || chunks <= 2 || !alignment || (alignment & (alignment - 1)) ||
++            alignment % sizeof(uint32_t) || bufferBytes % chunks ||
++            bufferBytes / chunks > std::numeric_limits<uint32_t>::max())
++            throw std::invalid_argument("Invalid native publication geometry");
++        const uint64_t chunk = bufferBytes / chunks;
++        if (!chunk || chunk % alignment || program.maximumPendingBytes > bufferBytes - 2 * chunk ||
++            chunk / sizeof(uint32_t) > (64 * 1024 * 1024ULL) / program.pages.size())
++            throw std::invalid_argument("Native publication exceeds bounded CCB capacity");
++        for (const auto& page : program.pages)
++            if (page.bytes.empty() || page.bytes.size() > alignment || page.bytes.size() % sizeof(uint32_t))
++                throw std::invalid_argument("Invalid native publication command page");
++        NativePublicationPlan plan;
++        plan.chunkBytes = chunk;
++        plan.phases.resize(chunk / sizeof(uint32_t));
++        for (uint64_t start = 0; start < chunk; start += sizeof(uint32_t))
++        {
++            auto& phase = plan.phases[start / sizeof(uint32_t)];
++            uint64_t position = start;
++            for (const auto& page : program.pages)
++            {
++                const uint64_t remaining = alignment - position % alignment;
++                if (page.bytes.size() > remaining) position += remaining;
++                phase.publishBefore.push_back(position % chunk == 0);
++                position += page.bytes.size();
++            }
++            phase.finalOffset = position % chunk;
++        }
++        // All NIC queues are published before compute. A reclaim target belongs
++        // to the first job two chunks ahead, from the previous ring lap. The
++        // existing maximumPendingBytes bound ensures its completion page fits
++        // before reclamation. Flushing the written prefix before EVERY chunk
++        // entry makes that completion reachable even when publication is batched.
++        // Trailing scheduler releases retain the next real completion guard.
++        return plan;
 +    }
 +};
 diff --git a/synapse/src/runtime/scal/common/native_recipe_memory.hpp b/synapse/src/runtime/scal/common/native_recipe_memory.hpp
@@ -6403,7 +6625,7 @@ index 04f5b65..df92eb6 100644
      uint32_t m_computeWorkCompletionValue   = 0;
  };
 diff --git a/synapse/src/runtime/scal/common/stream_compute_scal.cpp b/synapse/src/runtime/scal/common/stream_compute_scal.cpp
-index df58f41..47d9d15 100644
+index df58f41..ea2c941 100644
 --- a/synapse/src/runtime/scal/common/stream_compute_scal.cpp
 +++ b/synapse/src/runtime/scal/common/stream_compute_scal.cpp
 @@ -1,4 +1,5 @@
@@ -6412,7 +6634,7 @@ index df58f41..47d9d15 100644
  
  #include "habana_global_conf_runtime.h"
  #include "runtime/common/recipe/recipe_handle_impl.hpp"
-@@ -13,23 +14,530 @@
+@@ -13,23 +14,536 @@
  
  #include "runtime/scal/common/entities/scal_completion_group.hpp"
  #include "runtime/scal/common/entities/scal_memory_pool.hpp"
@@ -6425,6 +6647,7 @@ index df58f41..47d9d15 100644
  #include "profiler_api.hpp"
  
 +#include <cstring>
++#include <cstdlib>
 +#include <limits>
 +
 +NativeRecipeMemory::NativeRecipeMemory(ScalMemoryPool& globalPool, ScalMemoryPool& hbmSharedPool)
@@ -6720,6 +6943,11 @@ index df58f41..47d9d15 100644
 +        plan->program = NativeComputeProgram::prepare(buffers, {consumers, consumers + count},
 +            m_streamBase.prepareNativeWaitPackets(nicIndex), m_streamBase.nativeCommandAlignment(),
 +            m_streamBase.nativeAvailableBytes(), terminalRelease, consumers[0] == 0);
++        const char* publication = std::getenv("SYN_NATIVE_GRAPH_BATCH_PUBLICATION");
++        if (publication && std::strcmp(publication, "1") == 0)
++            plan->publication = NativePublicationPlan::prepare(plan->program,
++                m_streamBase.nativeCommandAlignment(), uint64_t(GCFG_HOST_CYCLIC_BUFFER_SIZE.value()) * 1024,
++                GCFG_HOST_CYCLIC_BUFFER_CHUNKS_AMOUNT.value());
 +        plan->nicLongSoIndex = nicIndex;
 +        plan->callback = callback;
 +        plan->context = context;
@@ -6781,7 +7009,7 @@ index df58f41..47d9d15 100644
 +                plan.completions[n].targetValue >= (uint64_t(1) << 60) ||
 +                (n && plan.completions[n].targetValue != plan.completions[n - 1].targetValue + 1)) return fail();
 +        uint64_t submissions = 0;
-+        if (m_streamBase.publishNativeComputeProgram(plan.program, plan.completions.data(), base,
++        if (m_streamBase.publishNativeComputeProgram(plan.program, plan.publication, plan.completions.data(), base,
 +                                                     plan.submissionScratch, submissions) != synSuccess) return fail();
 +        if (!plan.statistics[0]) plan.statistics[9] = final.m_targetValue;
 +        plan.statistics[10] = final.m_targetValue;
@@ -6944,7 +7172,7 @@ index df58f41..47d9d15 100644
    m_computeResources(*pComputeResources)
  {
      // Currently, we will have internal-signal for the TX-Command
-@@ -40,6 +548,162 @@ QueueComputeScal::QueueComputeScal(const BasicQueueInfo&           rBasicQueueIn
+@@ -40,6 +554,162 @@ QueueComputeScal::QueueComputeScal(const BasicQueueInfo&           rBasicQueueIn
  
  QueueComputeScal::~QueueComputeScal() {}
  
@@ -7107,7 +7335,7 @@ index df58f41..47d9d15 100644
  synStatus QueueComputeScal::eventRecord(EventInterface& rEventInterface, synStreamHandle streamHandle)
  {
      LOG_DEBUG(SYN_STREAM, "{} Stream {}", HLLOG_FUNC, m_basicQueueInfo.getDescription());
-@@ -332,6 +996,32 @@ synStatus QueueComputeScal::launch(const LaunchInfo& launchInfo)
+@@ -332,6 +1002,32 @@ synStatus QueueComputeScal::launch(const LaunchInfo& launchInfo)
      ScalStreamComputeInterface* pComputeScalStream = dynamic_cast<ScalStreamComputeInterface*>(m_scalStream);
      VERIFY_IS_NULL_POINTER(SYN_STREAM, pComputeScalStream, "pComputeScalStream");
  
@@ -7140,7 +7368,7 @@ index df58f41..47d9d15 100644
      std::unique_ptr<RecipeLauncher> recipeLauncher = std::make_unique<RecipeLauncher>(pComputeScalStream,
                                                                                        &m_computeResources,
                                                                                        m_devMemoryAlloc,
-@@ -340,11 +1030,17 @@ synStatus QueueComputeScal::launch(const LaunchInfo& launchInfo)
+@@ -340,11 +1036,17 @@ synStatus QueueComputeScal::launch(const LaunchInfo& launchInfo)
                                                                                        launchInfo.pRecipeHandle,
                                                                                        dsdProcessor,
                                                                                        ++m_runningId,
@@ -7159,7 +7387,7 @@ index df58f41..47d9d15 100644
          LOG_ERR(SYN_STREAM,
                  "{}: recipeLauncher launch failed, recipe seq {}",
                  HLLOG_FUNC,
-@@ -357,6 +1053,16 @@ synStatus QueueComputeScal::launch(const LaunchInfo& launchInfo)
+@@ -357,6 +1059,16 @@ synStatus QueueComputeScal::launch(const LaunchInfo& launchInfo)
          return status;
      }
  

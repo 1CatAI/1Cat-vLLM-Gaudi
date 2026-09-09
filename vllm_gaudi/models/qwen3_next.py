@@ -180,6 +180,10 @@ def build_hpu_qwen3_layer_groups(
         raise ValueError(f"group_size must be positive, got {group_size}")
 
     layers = tuple(islice(model.layers, model.start_layer, model.end_layer))
+    if gaudi_envs.VLLM_HPU_TP2_MLP_SPLIT_SCALE:
+        from vllm_gaudi.ops.tp2_mlp_split_scale import prepare_mlp_split_scale
+
+        prepare_mlp_split_scale(layers)
     groups = tuple(
         HpuQwen3DecoderLayerGroup(layers[start:start + group_size]) for start in range(0, len(layers), group_size))
     if groups and final_norm is not None:

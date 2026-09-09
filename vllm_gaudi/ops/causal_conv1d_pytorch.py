@@ -706,11 +706,14 @@ def hpu_causal_conv1d_update(
     direct_state_layout: bool = False,
     round_before_activation: bool = False,
     full_query_valid_state: bool = False,
+    prepared_tap_weights: torch.Tensor | None = None,
 ):
     if block_idx_last_scheduled_token is not None or initial_state_idx is not None:
         raise NotImplementedError("Prefix caching metadata is not supported in the reference implementation.")
     activation = _normalize_activation(activation)
     if num_accepted_tokens is not None:
+        if prepared_tap_weights is not None:
+            raise ValueError("Prepared convolution taps support ordinary single-token decode only")
         if conv_state_indices is None or query_start_loc is None:
             raise ValueError("Speculative convolution requires state indices and query_start_loc.")
         return _hpu_causal_conv1d_spec_update(
@@ -745,6 +748,7 @@ def hpu_causal_conv1d_update(
         validate_data=validate_data,
         is_prompt=False,
         direct_state_layout=direct_state_layout,
+        prepared_tap_weights=prepared_tap_weights,
     )
     return reshape_spec.reshape_fn(result)
 
@@ -767,6 +771,7 @@ def hpu_causal_conv1d_fn_update(
     validate_data: bool = False,
     is_prompt: bool = True,
     direct_state_layout: bool = False,
+    prepared_tap_weights: torch.Tensor | None = None,
 ):
     if any(ptr is not None for ptr in (
             block_idx_first_scheduled_token,
@@ -799,6 +804,12 @@ def hpu_causal_conv1d_fn_update(
     state_len = max(width - 1, 0)
     state_start = 0 if conv_states.shape[1] > state_len else conv_states.shape[1] - state_len
 
+    if (prepared_tap_weights is not None
+            and (not direct_state_layout or work_dtype != torch.bfloat16 or prepared_tap_weights.dtype != torch.float32
+                 or prepared_tap_weights.shape != (width, dim) or not prepared_tap_weights.is_contiguous()
+                 or prepared_tap_weights.device != x_work.device)):
+        raise ValueError("Prepared convolution taps require contiguous FP32 [width, channels] and direct BF16 state")
+
     if validate_data:
         if x_work.dim() != 2:
             raise ValueError("'x' must be 2-D (dim, cu_seq_len).")
@@ -830,11 +841,15 @@ def hpu_causal_conv1d_fn_update(
         # temporary [B, dim, width] window merely to take one output column.
         token_x = x_work[:, :, 0]
         needs_upcast = work_dtype in (torch.bfloat16, torch.float16)
-        tap_weights = weight_work.float() if needs_upcast else weight_work
-        output_token = state_rows[:, 0, :] * tap_weights[:, 0]
+        tap_weights = prepared_tap_weights if prepared_tap_weights is not None else (
+            weight_work.float() if needs_upcast else weight_work)
+        first_weight = tap_weights[0] if prepared_tap_weights is not None else tap_weights[:, 0]
+        output_token = state_rows[:, 0, :] * first_weight
         for tap in range(1, state_len):
-            output_token = output_token + state_rows[:, tap, :] * tap_weights[:, tap]
-        output_token = output_token + token_x * tap_weights[:, state_len]
+            tap_weight = tap_weights[tap] if prepared_tap_weights is not None else tap_weights[:, tap]
+            output_token = output_token + state_rows[:, tap, :] * tap_weight
+        last_weight = tap_weights[state_len] if prepared_tap_weights is not None else tap_weights[:, state_len]
+        output_token = output_token + token_x * last_weight
         if bias_work is not None:
             output_token = output_token + (bias_work.float() if needs_upcast else bias_work)
         if needs_upcast:

@@ -627,11 +627,38 @@ class HPULlama4VisionRotaryEmbedding(Llama4VisionRotaryEmbedding):
 @MRotaryEmbedding.register_oot
 class HPUMRotaryEmbedding(MRotaryEmbedding):
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from vllm_gaudi import envs
+
+        self._hpu_prepared_mrope = envs.VLLM_HPU_TP2_PREPARED_MROPE
+        self.recompute_cos_sin = False
+        if self._hpu_prepared_mrope:
+            from vllm.distributed import get_tensor_model_parallel_world_size
+            from vllm_gaudi.extension.ops import is_hpu_gaudi2
+            from vllm_gaudi.ops.prepared_mrope import make_mrope_selection
+
+            if (not is_hpu_gaudi2 or get_tensor_model_parallel_world_size() != 2 or self.head_size != 256
+                    or self.cos_sin_cache.dtype != torch.bfloat16
+                    or not self.is_neox_style or not self.mrope_interleaved):
+                raise RuntimeError("Prepared MRoPE requires the qualified Gaudi2 TP2 interleaved rotary layout")
+            self.register_buffer("_hpu_mrope_selection",
+                                 make_mrope_selection(self.rotary_dim, self.mrope_section, self.cos_sin_cache.device),
+                                 persistent=False)
+
     def prepare_cos_sin(self,
                         positions: torch.Tensor,
                         offsets: Optional[torch.Tensor] = None,
                         recompute_cos_sin: bool = False):
         self.recompute_cos_sin = recompute_cos_sin
+        if (self._hpu_prepared_mrope and not recompute_cos_sin and offsets is None
+                and tuple(positions.shape) in ((3, 1), (3, 1, 1))):
+            from vllm_gaudi.ops.prepared_mrope import prepare_mrope_coefficients
+
+            cos, sin = prepare_mrope_coefficients(self.cos_sin_cache, positions, self._hpu_mrope_selection)
+            self.register_buffer("cos", cos, persistent=False)
+            self.register_buffer("sin", sin, persistent=False)
+            return
         if offsets is not None:
             offsets = offsets.view(positions.shape[0], -1)
             positions = positions + offsets
@@ -664,24 +691,41 @@ class HPUMRotaryEmbedding(MRotaryEmbedding):
             assert positions.shape[-1] == 1, "Expected last dimension to be 1 for 3d positions"
             positions = positions.squeeze(-1)
         num_tokens = positions.shape[-1]
-        cos_sin = self.cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        if positions.ndim == 2:
-            assert self.mrope_section
-            if getattr(self, "mrope_interleaved", False):
-                from vllm.model_executor.layers.rotary_embedding.mrope import apply_interleaved_rope
+        prepared = False
+        if (self._hpu_prepared_mrope and query.dtype == torch.bfloat16 and num_tokens == 1
+                and positions.ndim == 2 and offsets is None):
+            from vllm.forward_context import get_forward_context
 
-                cos = apply_interleaved_rope(cos, self.mrope_section)
-                sin = apply_interleaved_rope(sin, self.mrope_section)
-            else:
-                cos = torch.cat([m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))], dim=-1)
-                sin = torch.cat([m[i] for i, m in enumerate(sin.split(self.mrope_section, dim=-1))], dim=-1)
-        if self.is_neox_style:
-            cos = torch.cat((cos, cos), dim=-1).unsqueeze(-2)
-            sin = torch.cat((sin, sin), dim=-1).unsqueeze(-2)
+            metadata = get_forward_context().attn_metadata
+            prepared = (metadata is not None and not getattr(metadata, "is_prompt", True)
+                        and getattr(metadata, "direct_gdn_state", False)
+                        and getattr(metadata, "num_accepted_tokens", None) is None
+                        and not getattr(metadata, "dflash_full_query", False)
+                        and not self.recompute_cos_sin)
+        if prepared:
+            if (not hasattr(self, "cos") or not hasattr(self, "sin") or tuple(self.cos.shape) != (1, 1, 64)
+                    or tuple(self.sin.shape) != (1, 1, 64)):
+                raise RuntimeError("Prepared MRoPE coefficients must be published before decoder capture or replay")
+            cos, sin = self.cos, self.sin
         else:
-            sin = torch.repeat_interleave(sin, 2, dim=-1, output_size=cos_sin.shape[-1]).unsqueeze(-2)
-            cos = torch.repeat_interleave(cos, 2, dim=-1, output_size=cos_sin.shape[-1]).unsqueeze(-2)
+            cos_sin = self.cos_sin_cache[positions]
+            cos, sin = cos_sin.chunk(2, dim=-1)
+            if positions.ndim == 2:
+                assert self.mrope_section
+                if getattr(self, "mrope_interleaved", False):
+                    from vllm.model_executor.layers.rotary_embedding.mrope import apply_interleaved_rope
+
+                    cos = apply_interleaved_rope(cos, self.mrope_section)
+                    sin = apply_interleaved_rope(sin, self.mrope_section)
+                else:
+                    cos = torch.cat([m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))], dim=-1)
+                    sin = torch.cat([m[i] for i, m in enumerate(sin.split(self.mrope_section, dim=-1))], dim=-1)
+            if self.is_neox_style:
+                cos = torch.cat((cos, cos), dim=-1).unsqueeze(-2)
+                sin = torch.cat((sin, sin), dim=-1).unsqueeze(-2)
+            else:
+                sin = torch.repeat_interleave(sin, 2, dim=-1, output_size=cos_sin.shape[-1]).unsqueeze(-2)
+                cos = torch.repeat_interleave(cos, 2, dim=-1, output_size=cos_sin.shape[-1]).unsqueeze(-2)
         # HPU RoPE kernel requires hidden dimension for cos and sin to be equal
         # to query hidden dimension, so the original tensors need to be
         # expanded
