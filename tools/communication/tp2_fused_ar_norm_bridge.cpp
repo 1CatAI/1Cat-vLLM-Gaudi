@@ -31,6 +31,7 @@
 #include "backend/habana_device/HPUStream.h"
 #include "backend/helpers/generic_resource_holder.h"
 #include "backend/helpers/get_n_bytes.h"
+#include "backend/helpers/create_tensor.h"
 #include "backend/helpers/tensor_info.h"
 #include "backend/helpers/tensor_utils.h"
 #include "habana_eager/eager_pipeline_utils.h"
@@ -598,6 +599,42 @@ void copyGdnStates(c10d::ProcessGroupEagerHCCL *backend,
     habana::eager::JoinPendingPipelineThreads();
     runGdnStateCopies(communicator, sources, destinations, hpu_stream);
   }
+}
+
+void copyC1PipelineTensors(c10d::ProcessGroupEagerHCCL* backend,
+                           std::vector<at::Tensor> sources,
+                           std::vector<at::Tensor> destinations) {
+  TORCH_CHECK(GET_ENV_FLAG_NEW(PT_HPU_LAZY_MODE) == 0 &&
+                  GET_ENV_FLAG_NEW(PT_HPU_EAGER_PIPELINE_ENABLE) &&
+                  c10::hpu::getCurrentHPUStream().stream() == 0,
+              "C1 PP DMA requires the eager default producer stream");
+  TORCH_CHECK(sources.size() == 2 && destinations.size() == 2,
+              "C1 PP DMA requires hidden and pre-mix");
+  for (size_t i = 0; i < 2; ++i) {
+    const auto dtype = i == 0 ? at::kBFloat16 : at::kFloat;
+    const int64_t elements = i == 0 ? 20480 : 4;
+    TORCH_CHECK(sources[i].device().type() == at::kHPU &&
+                    sources[i].device() == destinations[i].device() &&
+                    sources[i].device() == sources[0].device() &&
+                    sources[i].scalar_type() == dtype && destinations[i].scalar_type() == dtype &&
+                    sources[i].numel() == elements && destinations[i].numel() == elements &&
+                    sources[i].is_contiguous() && destinations[i].is_contiguous(),
+                "C1 PP DMA changed the contiguous hidden/pre-mix contract");
+  }
+  auto communicator = backend->lowLatencyCommunicator();
+  TORCH_CHECK(communicator != nullptr, "C1 PP DMA requires an initialized communicator");
+  prepareGdnBackendTensors(sources, destinations);
+  habana::eager::PipelineTask<habana::eager::ThreadType::EXECUTE>(
+      [communicator, sources = std::move(sources), destinations = std::move(destinations)]() {
+        for (const auto* values : {&sources, &destinations}) {
+          for (const auto& tensor : *values) {
+            const auto permutation = std::get<0>(habana_helpers::get_tensor_memory_permutation(tensor));
+            TORCH_CHECK(std::is_sorted(permutation.begin(), permutation.end()),
+                        "C1 PP DMA cannot consume a permuted physical tensor");
+          }
+        }
+        runGdnStateCopies(communicator, sources, destinations, 0);
+      });
 }
 
 std::shared_ptr<GdnStateDMATicket> queueGdnStateCopies(
@@ -1192,6 +1229,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       .def("invalidate", [](PreparedGroupPlan& self) { self.valid.store(false); });
   module.def("record_native_completion", &tp2_native::recordNativeCompletion);
   module.def("copy_sampled_tokens_to_host", &tp2_native::copySampledTokensToHost);
+  module.def("copy_integer_record_to_host", &tp2_native::copyIntegerRecordToHost);
+  module.def("copy_c1_pipeline_tensors",
+      [](const c10::intrusive_ptr<c10d::Backend>& backend, std::vector<at::Tensor> sources,
+         std::vector<at::Tensor> destinations) {
+        auto* hccl_backend = dynamic_cast<c10d::ProcessGroupEagerHCCL*>(backend.get());
+        TORCH_CHECK(hccl_backend != nullptr, "C1 PP DMA requires ProcessGroupEagerHCCL");
+        copyC1PipelineTensors(hccl_backend, std::move(sources), std::move(destinations));
+      });
   py::class_<tp2_native::NativeCompletion, std::shared_ptr<tp2_native::NativeCompletion>>(
       module, "NativeCompletion")
       .def("query", &tp2_native::NativeCompletion::query, py::call_guard<py::gil_scoped_release>())

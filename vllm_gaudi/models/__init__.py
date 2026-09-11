@@ -2,6 +2,9 @@ from vllm.model_executor.models.registry import ModelRegistry
 
 
 def register_model():
+    ModelRegistry.register_model("DeepseekV41ForCausalLM", "vllm_gaudi.models.deepseek_v41:HpuDeepseekV41ForCausalLM")
+    ModelRegistry.register_model("DSparkV41DraftModel", "vllm_gaudi.models.deepseek_v41_program:PreparedDraft")
+    import vllm_gaudi.models.deepseek_v41_loader  # noqa: F401
     from vllm_gaudi.models.gemma3_mm import HpuGemma3ForConditionalGeneration  # noqa: F401
     ModelRegistry.register_model(
         "Gemma3ForConditionalGeneration",  # Original architecture identifier in vLLM

@@ -41,7 +41,23 @@ int main() {
             }
         }
     }
-    assert(custom_count == 43);
+    assert(custom_count == 62);
+    for (const char* required : {
+             "custom_deepseek_v41_selected_kv_valid_ordered_bf16_gaudi2",
+             "custom_deepseek_v41_selected_kv_valid_cache_ordered_bf16_gaudi2",
+             "custom_deepseek_v41_rope_bf16_gaudi2",
+             "custom_deepseek_v41_c1_indices_i32_gaudi2",
+             "custom_deepseek_v41_fp4_pack_g16_bf16_gaudi2",
+             "custom_deepseek_v41_fp4_pack_g32_bf16_gaudi2",
+             "custom_deepseek_v41_fp4_cache_write_bf16_gaudi2",
+             "custom_deepseek_v41_selected_kv_cache_ordered_bf16_gaudi2",
+             "custom_deepseek_v41_swa_pack_bf16_gaudi2",
+             "custom_deepseek_v41_swa_pack_write_bf16_gaudi2",
+             "custom_deepseek_v41_selected_kv_ordered_bf16_gaudi2"}) {
+        unsigned matches = 0;
+        for (const auto& guid : guids) matches += std::strcmp(guid.name, required) == 0;
+        assert(matches == 1);
+    }
     HabanaKernelParams params{};
     HabanaKernelInstantiation instance{};
     std::strcpy(

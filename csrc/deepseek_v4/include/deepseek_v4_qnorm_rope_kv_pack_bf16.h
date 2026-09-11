@@ -107,10 +107,17 @@ float64 dsv4_qkv_apply_pairwise_rope_f32(
         cos_groups, cos_directions, 0, 0.0f);
     const float64 sin_values = v_f32_shuffle_b(
         sin_groups, sin_directions, 0, 0.0f);
+#ifdef DSV4_ROPE_SECOND_TERM_FMA
+    // V4.1's compiled tensor reference rounds the first product, then fuses
+    // the second multiply with the add/subtract. Keep V4's default unchanged.
+    const float64 roped_real = v_f32_mac_b(imag, sin_values, real * cos_values, SW_NEG);
+    const float64 roped_imag = v_f32_mac_b(imag, cos_values, real * sin_values, 0);
+#else
     const float64 roped_real =
         real * cos_values - imag * sin_values;
     const float64 roped_imag =
         imag * cos_values + real * sin_values;
+#endif
     return v_f32_sel_eq_u32_b(
         lanes & 1, 1, roped_imag, roped_real);
 }

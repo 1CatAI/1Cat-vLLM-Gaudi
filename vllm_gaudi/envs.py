@@ -23,6 +23,30 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV4_MXFP4_INDEXED_MME: bool = False
     VLLM_HPU_DSV4_MXFP4_PREPARED_MME: bool = False
     VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH: bool = False
+    VLLM_HPU_DSV41_PREPARED_SHARDS: bool = False
+    VLLM_HPU_DSV41_ENGRAM_HOST_TABLE: bool = False
+    VLLM_HPU_DSV41_GRAPH_REPLAY: bool = False
+    VLLM_HPU_DSV41_DSPARK: bool = False
+    VLLM_HPU_DSV41_VISION: bool = False
+    VLLM_HPU_DSV41_QUANT_ROUNDTRIP: bool = False
+    VLLM_HPU_DSV41_SWA_PACK_WRITE: bool = False
+    VLLM_HPU_DSV41_FP4_CACHE_WRITE: bool = False
+    VLLM_HPU_DSV41_NATIVE_ROPE: bool = False
+    VLLM_HPU_DSV41_C1_INDICES: bool = False
+    VLLM_HPU_DSV41_SELECTED_VALID_ONLY: bool = False
+    VLLM_HPU_DSV41_PACKED_ATTENTION: bool = False
+    VLLM_HPU_DSV41_FIXED_POSITIONS: bool = False
+    VLLM_HPU_DSV41_PACKED_PP: bool = False
+    VLLM_HPU_DSV41_TPC_MHC: bool = False
+    VLLM_HPU_DSV41_DIRECT_TOKEN_IDS: bool = False
+    VLLM_HPU_DSV41_DEVICE_COMMIT: bool = False
+    VLLM_HPU_DSV41_NATIVE_PP_COPY: bool = False
+    VLLM_HPU_DSV41_PREPARED_OUTPUT: bool = False
+    VLLM_HPU_DSV41_BOUNDED_ATTENTION: bool = False
+    VLLM_HPU_DSV41_ISOLATE_CONTROL: bool = False
+    VLLM_HPU_DSV41_ENGINE_CPUS: Optional[str] = None
+    VLLM_HPU_DSV41_API_CPUS: Optional[str] = None
+    VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR: Optional[str] = None
     VLLM_HPU_DSV4_SHORT_INDEXER_SKIP: bool = True
     VLLM_HPU_DSV4_BF16_SCORE_PROJECTION: bool = False
     VLLM_HPU_DSV4_FUSED_SDPA: bool = False
@@ -205,6 +229,59 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Gather only routed packed experts for single-token MXFP4 decode.
     "VLLM_HPU_MXFP4_DECODE_GATHER":
     lambda: os.environ.get("VLLM_HPU_MXFP4_DECODE_GATHER", "1").lower() in ("1", "true"),
+
+    # V4.1 is a separate opt-in contract; none of the V4 defaults enable it.
+    "VLLM_HPU_DSV41_PREPARED_SHARDS":
+    lambda: os.environ.get("VLLM_HPU_DSV41_PREPARED_SHARDS", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_ENGRAM_HOST_TABLE":
+    lambda: os.environ.get("VLLM_HPU_DSV41_ENGRAM_HOST_TABLE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_GRAPH_REPLAY":
+    lambda: os.environ.get("VLLM_HPU_DSV41_GRAPH_REPLAY", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK":
+    lambda: os.environ.get("VLLM_HPU_DSV41_DSPARK", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_VISION":
+    lambda: os.environ.get("VLLM_HPU_DSV41_VISION", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_QUANT_ROUNDTRIP":
+    lambda: os.environ.get("VLLM_HPU_DSV41_QUANT_ROUNDTRIP", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_SWA_PACK_WRITE":
+    lambda: os.environ.get("VLLM_HPU_DSV41_SWA_PACK_WRITE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_FP4_CACHE_WRITE":
+    lambda: os.environ.get("VLLM_HPU_DSV41_FP4_CACHE_WRITE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_NATIVE_ROPE":
+    lambda: os.environ.get("VLLM_HPU_DSV41_NATIVE_ROPE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_C1_INDICES":
+    lambda: os.environ.get("VLLM_HPU_DSV41_C1_INDICES", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_SELECTED_VALID_ONLY":
+    lambda: os.environ.get("VLLM_HPU_DSV41_SELECTED_VALID_ONLY", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_PACKED_ATTENTION":
+    lambda: os.environ.get("VLLM_HPU_DSV41_PACKED_ATTENTION", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_FIXED_POSITIONS":
+    lambda: os.environ.get("VLLM_HPU_DSV41_FIXED_POSITIONS", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_PACKED_PP":
+    lambda: os.environ.get("VLLM_HPU_DSV41_PACKED_PP", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_TPC_MHC":
+    lambda: os.environ.get("VLLM_HPU_DSV41_TPC_MHC", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DIRECT_TOKEN_IDS":
+    lambda: os.environ.get("VLLM_HPU_DSV41_DIRECT_TOKEN_IDS", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DEVICE_COMMIT":
+    lambda: os.environ.get("VLLM_HPU_DSV41_DEVICE_COMMIT", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_NATIVE_PP_COPY":
+    lambda: os.environ.get("VLLM_HPU_DSV41_NATIVE_PP_COPY", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_PREPARED_OUTPUT":
+    lambda: os.environ.get("VLLM_HPU_DSV41_PREPARED_OUTPUT", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_FP8_DECODE": lambda: os.environ.get("VLLM_HPU_DSV41_FP8_DECODE", "0") == "1",
+    "VLLM_HPU_DSV41_FP8_SIDECAR": lambda: os.environ.get("VLLM_HPU_DSV41_FP8_SIDECAR", ""),
+    "VLLM_HPU_DSV41_FP8_CONFIG": lambda: os.environ.get("VLLM_HPU_DSV41_FP8_CONFIG", ""),
+    "VLLM_HPU_DSV41_BOUNDED_ATTENTION":
+    lambda: os.environ.get("VLLM_HPU_DSV41_BOUNDED_ATTENTION", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_ISOLATE_CONTROL":
+    lambda: os.environ.get("VLLM_HPU_DSV41_ISOLATE_CONTROL", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_ENGINE_CPUS":
+    lambda: os.environ.get("VLLM_HPU_DSV41_ENGINE_CPUS"),
+    "VLLM_HPU_DSV41_API_CPUS":
+    lambda: os.environ.get("VLLM_HPU_DSV41_API_CPUS"),
+    "VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR":
+    lambda: os.environ.get("VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR"),
 
     # Fuse the four selected-expert packed-weight copies into one Gaudi2 TPC
     # launch for DeepSeek V4 single-token decode.

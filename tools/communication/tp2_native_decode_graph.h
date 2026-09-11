@@ -270,8 +270,8 @@ inline std::shared_ptr<NativeCompletion> recordNativeCompletion() {
   return ticket;
 }
 
-inline std::pair<at::Tensor, std::shared_ptr<NativeCompletion>> copySampledTokensToHost(const at::Tensor& source) {
-  TORCH_CHECK(source.device().type() == at::kHPU && source.sizes() == at::IntArrayRef({1, 1}) &&
+inline std::pair<at::Tensor, std::shared_ptr<NativeCompletion>> copyIntegerRowToHost(const at::Tensor& source, int64_t columns) {
+  TORCH_CHECK(source.device().type() == at::kHPU && source.sizes() == at::IntArrayRef({1, columns}) &&
                   (source.scalar_type() == at::kInt || source.scalar_type() == at::kLong) &&
                   source.is_contiguous() && source.storage_offset() == 0,
               "Native sampled-token copy requires a contiguous C1 integer tensor");
@@ -281,9 +281,10 @@ inline std::pair<at::Tensor, std::shared_ptr<NativeCompletion>> copySampledToken
   // The private host buffer uses that exact wire type; Python consumes integer
   // values with tolist() only after the actual copy-completion callback.
   const auto bytes = habana_helpers::GetNBytes(source);
-  TORCH_CHECK(bytes == 4 || bytes == 8, "Unsupported sampled-token wire width");
-  auto host = at::empty({1, 1}, at::TensorOptions().device(at::kCPU)
-                                  .dtype(bytes == 4 ? at::kInt : at::kLong).pinned_memory(true));
+  TORCH_CHECK((columns == 1 || columns == 4) && (bytes == 4 * columns || bytes == 8 * columns),
+              "Unsupported bounded integer row wire width");
+  auto host = at::empty({1, columns}, at::TensorOptions().device(at::kCPU)
+                                  .dtype(bytes == 4 * columns ? at::kInt : at::kLong).pinned_memory(true));
   auto ticket = std::make_shared<NativeCompletion>();
   habana::eager::PipelineTask<habana::eager::ThreadType::LOWERING>([source, host, ticket, bytes]() {
     try {
@@ -311,6 +312,14 @@ inline std::pair<at::Tensor, std::shared_ptr<NativeCompletion>> copySampledToken
     }
   });
   return {host, ticket};
+}
+
+inline std::pair<at::Tensor, std::shared_ptr<NativeCompletion>> copySampledTokensToHost(const at::Tensor& source) {
+  return copyIntegerRowToHost(source, 1);
+}
+
+inline std::pair<at::Tensor, std::shared_ptr<NativeCompletion>> copyIntegerRecordToHost(const at::Tensor& source) {
+  return copyIntegerRowToHost(source, 4);
 }
 
 class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph> {

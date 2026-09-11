@@ -94,7 +94,10 @@ def initialize_tp2_fused_ar_norm_runtime() -> None:
 
     tp_group = get_tp_group().device_group
     tp_size = dist.get_world_size(group=tp_group)
-    if tp_size != 2 or dist.get_world_size() != 2:
+    v41 = os.environ.get("VLLM_HPU_DSV41_GRAPH_REPLAY") == "1"
+    from vllm.distributed import get_pp_group
+    v41_world = v41 and dist.get_world_size() == 4 and get_pp_group().world_size == 2
+    if tp_size != 2 or (dist.get_world_size() != 2 and not v41_world):
         raise RuntimeError("TP2 fused all-reduce currently requires a two-rank, TP-only process world")
     direct_algorithm = os.environ.get(_DIRECT_ALGORITHM_ENV, "hccl").strip().lower()
     if direct_algorithm not in ("hccl", "tp2-exchange"):
@@ -157,7 +160,7 @@ def initialize_tp2_fused_ar_norm_runtime() -> None:
     log.info("TP2 prepared runtime: initializing communicator")
     dist.all_reduce(probe, group=tp_group)
     torch.hpu.synchronize()
-    if not torch.equal(probe.cpu(), torch.full((128, ), 2, dtype=torch.bfloat16)):
+    if not torch.equal(probe.cpu(), torch.full((128, ), 2, dtype=torch.bfloat16, device="cpu")):
         raise RuntimeError("TP2 HCCL process-group initialization failed")
 
     log.info("TP2 prepared runtime: loading native adapter")
@@ -191,18 +194,24 @@ def initialize_tp2_fused_ar_norm_runtime() -> None:
         log.info("TP2 prepared runtime: checking runtime fingerprints")
         _verify_prepared_runtime(bridge_path)
         if not envs.VLLM_HPU_TP2_PREPARED_COMM or not (
-                envs.VLLM_HPU_GDN_DIRECT_STATE_UPDATE or envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH):
+                envs.VLLM_HPU_GDN_DIRECT_STATE_UPDATE or envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH
+                or envs.VLLM_HPU_DSV41_GRAPH_REPLAY):
             raise RuntimeError("Prepared TP2 groups require direct state update and prepared communication")
         from vllm_gaudi.ops.tp2_prepared_plan import register_tp2_prepared_group_pass
 
         register_tp2_prepared_group_pass()
-    if envs.VLLM_HPU_NATIVE_DECODE_GRAPH or envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
-        if (envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH
+    if (envs.VLLM_HPU_NATIVE_DECODE_GRAPH or envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH
+            or envs.VLLM_HPU_DSV41_GRAPH_REPLAY):
+        if ((envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH or envs.VLLM_HPU_DSV41_GRAPH_REPLAY)
                 and torch.hpu.get_device_name().upper().replace(" ", "") != "GAUDI2"):
             raise RuntimeError("V4 native decode currently requires Gaudi2")
         required = ("NativeDecodeGraph", "native_decode_graph_available")
-        if envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+        if envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH or envs.VLLM_HPU_DSV41_GRAPH_REPLAY:
             required += ("record_native_completion", "copy_sampled_tokens_to_host")
+        if envs.VLLM_HPU_DSV41_DEVICE_COMMIT:
+            required += ("copy_integer_record_to_host",)
+        if envs.VLLM_HPU_DSV41_NATIVE_PP_COPY:
+            required += ("copy_c1_pipeline_tensors",)
         if not all(hasattr(bridge, name) for name in required) or not bridge.native_decode_graph_available():
             raise RuntimeError(
                 "VLLM_HPU_NATIVE_DECODE_GRAPH requires the version-locked Synapse and HCL native replay APIs; "

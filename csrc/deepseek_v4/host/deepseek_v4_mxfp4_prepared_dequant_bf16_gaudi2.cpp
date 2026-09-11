@@ -18,7 +18,10 @@ extern unsigned char _binary___deepseek_v4_mxfp4_prepared_dequant_up_normal_bf16
 tpc_lib_api::GlueCodeReturn DeepseekV4Mxfp4PreparedDequantBF16Gaudi2::GetKernelName(
     char name[tpc_lib_api::MAX_NODE_NAME]) {
     const char* kernel = nullptr;
-    if (half_ == 0) {
+    if (v41_) {
+        kernel = normal_ ? "custom_deepseek_v41_mxfp4_prepared_dequant_normal_bf16_gaudi2"
+                         : "custom_deepseek_v41_mxfp4_prepared_dequant_bf16_gaudi2";
+    } else if (half_ == 0) {
         kernel = normal_ ? "custom_deepseek_v4_mxfp4_prepared_gate_normal_bf16_gaudi2"
                          : "custom_deepseek_v4_mxfp4_prepared_gate_bf16_gaudi2";
     } else if (half_ == 1) {
@@ -59,29 +62,33 @@ tpc_lib_api::GlueCodeReturn DeepseekV4Mxfp4PreparedDequantBF16Gaudi2::GetGcDefin
         output.dataType = DATA_BF16;
         return GLUE_INCOMPATIBLE_DATA_TYPE;
     }
-    if (ids.dims != 2 || ids.maxSizes[0] != 6 || ids.maxSizes[1] != 1 ||
+    const bool validSlots = v41_ ? ids.maxSizes[0] > 0 && ids.maxSizes[0] <= 3072 : ids.maxSizes[0] == 6;
+    if (ids.dims != 2 || !validSlots || ids.maxSizes[1] != 1 ||
         q16.dims != 3 || s16.dims != 3 || q16.maxSizes[0] == 0 ||
-        q16.maxSizes[0] % 16384 || q16.maxSizes[1] == 0 || q16.maxSizes[1] > 32 ||
+        q16.maxSizes[0] % (v41_ ? 4096 : 16384) || q16.maxSizes[1] == 0 ||
+        q16.maxSizes[1] > (v41_ ? 40 : 32) ||
         q16.maxSizes[2] == 0 || q16.maxSizes[0] != s16.maxSizes[0] * 8 ||
         q16.maxSizes[1] != s16.maxSizes[1] || q16.maxSizes[2] != s16.maxSizes[2] ||
         lookup.dims != 1 || lookup.maxSizes[0] != 128) {
         return GLUE_INCOMPATIBLE_INPUT_SIZE;
     }
+    if (v41_ && (half_ >= 0 || q16.maxSizes[0] > 163840 || q16.maxSizes[2] > 384))
+        return GLUE_INCOMPATIBLE_INPUT_SIZE;
     if (half_ >= 0 && q16.maxSizes[1] != 16) {
         return GLUE_INCOMPATIBLE_INPUT_SIZE;
     }
     const unsigned nBlocks = half_ >= 0 ? 8 : q16.maxSizes[1];
     if (output.dims != 3 || output.maxSizes[0] != nBlocks * 128 ||
-        output.maxSizes[1] != q16.maxSizes[0] / 32 || output.maxSizes[2] != 6) {
+        output.maxSizes[1] != q16.maxSizes[0] / 32 || output.maxSizes[2] != ids.maxSizes[0]) {
         output.dims = 3;
         output.maxSizes[0] = nBlocks * 128;
         output.maxSizes[1] = q16.maxSizes[0] / 32;
-        output.maxSizes[2] = 6;
+        output.maxSizes[2] = ids.maxSizes[0];
         return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
     }
     out->indexSpaceRank = 2;
     out->indexSpaceGeometry[0] = nBlocks;
-    out->indexSpaceGeometry[1] = 6;
+    out->indexSpaceGeometry[1] = ids.maxSizes[0];
     auto map = [](TensorAccessPattern& pattern, unsigned dim, unsigned indexSpaceDim,
                   int coefficient, int start, int end) {
         pattern.mapping[dim].indexSpaceDim = indexSpaceDim;

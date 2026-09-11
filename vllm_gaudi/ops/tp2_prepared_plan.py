@@ -134,9 +134,11 @@ def _flush():
 
         context = getattr(_local, "native_context", None)
         adapter = context.get("adapter") if context else None
-        v4 = adapter is not None and adapter.name == "deepseek_v4"
+        v41 = adapter is not None and adapter.name.startswith("deepseek_v41_")
+        v4 = adapter is not None and (adapter.name == "deepseek_v4" or v41)
         full_groups = adapter.groups if adapter is not None else 8
-        enabled = gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH if v4 else gaudi_envs.VLLM_HPU_NATIVE_DECODE_GRAPH
+        enabled = (gaudi_envs.VLLM_HPU_DSV41_GRAPH_REPLAY if v41 else
+                   gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH if v4 else gaudi_envs.VLLM_HPU_NATIVE_DECODE_GRAPH)
         diagnostic_host = v4 and context.get("diagnostic_host_replay", False)
         if enabled and len(plans) == full_groups and not diagnostic_host:
             groups = full_groups if v4 else native_decode_graph_qualification_groups()
@@ -153,7 +155,7 @@ def _flush():
                 graph = bridge.NativeDecodeGraph()
                 _native_graphs[key] = graph
                 if v4:
-                    graph.configure_topology(groups, adapter.reductions, adapter.external_prefix)
+                    graph.configure_topology(groups, adapter.collectives, adapter.external_prefix)
                 snapshot = context["snapshot"]() if v4 else None
                 graph.capture(native_plans, native_inputs)
                 graph.instantiate()
@@ -183,10 +185,10 @@ def _flush():
             bridge.replay_prepared_groups(plans, inputs)
 
 
-def record_native_decoder_outputs(hidden_states, residual=None):
+def record_native_decoder_outputs(hidden_states, residual=None, *extra_outputs):
     context = getattr(_local, "native_context", None)
     if context is not None:
-        context["outputs"] = hidden_states, residual
+        context["outputs"] = hidden_states, residual, *extra_outputs
 
 
 def replay_native_decoder(owner, **roots):
@@ -324,9 +326,17 @@ def _is_contiguous_reshape(source, result):
             and source.untyped_storage()._cdata == result.untyped_storage()._cdata)
 
 
+def _is_static_scalar(node):
+    if node.op != "call_function" or node.target != torch.ops.aten.scalar_tensor.default:
+        return False
+    return (len(node.args) == 1 and type(node.args[0]) in (bool, int, float)
+            and set(node.kwargs) <= {"dtype", "layout", "device", "pin_memory"}
+            and all(not isinstance(value, torch.fx.Node) for value in node.kwargs.values()))
+
+
 def _eligible(graph):
     from vllm_gaudi import envs as gaudi_envs
-    if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+    if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH or gaudi_envs.VLLM_HPU_DSV41_GRAPH_REPLAY:
         context = getattr(_local, "native_context", None)
         if context is None or context.get("adapter", None) is None:
             # Profile/prefill compilation has no decoder state contract.
@@ -339,7 +349,7 @@ def _eligible(graph):
         return False
     # V1 only captures groups already qualified for destination-bound GDN.
     # Ordinary/reference groups retain the normal compiler execution path.
-    v4 = gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH
+    v4 = gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH or gaudi_envs.VLLM_HPU_DSV41_GRAPH_REPLAY
     native = None if v4 else torch.ops.custom_op.gdn_state_update_out.default
     if not v4 and not any(child.op == "call_function" and child.target == native
                for module in graph.modules() if type(module).__name__ == "HabanaGraphModule"
@@ -355,6 +365,8 @@ def _eligible(graph):
             continue
         if node.op == "call_function" and (node.target in (operator.getitem, collective, peer_exchange, plain,
                                                            *_view_targets()) or _is_clear(node.target)):
+            continue
+        if _is_static_scalar(node):
             continue
         raise RuntimeError(f"Unsupported operation in prepared TP2 group: {node.op}:{node.target}")
     return True
@@ -435,6 +447,9 @@ class PreparedGroupModule(torch.nn.Module):
             elif node.op == "call_function" and node.target == operator.getitem:
                 value, index = resolve(node.args)
                 env[node] = value[index]
+            elif _is_static_scalar(node):
+                # The plan retains this literal tensor; no factory runs during replay.
+                env[node] = slot(node.target(*node.args, **node.kwargs))
             elif node.op == "call_function" and node.target in _view_targets():
                 arguments = resolve(node.args)
                 source = arguments[0]
@@ -530,7 +545,7 @@ class PreparedGroupModule(torch.nn.Module):
         context = getattr(_local, "native_context", None)
         if context is None or context.get("adapter", None) is None:
             return None
-        if context["adapter"].name != "deepseek_v4":
+        if context["adapter"].name != "deepseek_v4" and not context["adapter"].name.startswith("deepseek_v41_"):
             return None
         return id(context["owner"]), context.get("group_index", 0), context.get("state_generation", 0)
 
@@ -598,7 +613,18 @@ def register_tp2_prepared_group_pass():
 
         def prepare_group_pass(context):
             graph = context.graph_module
-            if not _eligible(graph):
+            try:
+                eligible = _eligible(graph)
+            except RuntimeError:
+                directory = os.environ.get("VLLM_HPU_TP2_PLAN_DUMP_DIR")
+                if directory:
+                    from pathlib import Path
+                    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                    path = Path(directory) / f"rank{rank}"
+                    path.mkdir(parents=True, exist_ok=True)
+                    (path / f"rejected-{id(graph)}.py").write_text(graph.print_readable(print_output=False))
+                raise
+            if not eligible:
                 return False
             original = torch.fx.GraphModule(graph, copy.deepcopy(graph.graph))
             prepared = PreparedGroupModule(original)

@@ -5,6 +5,18 @@ import torch
 from vllm_gaudi.ops import tp2_prepared_plan as replay
 
 
+def test_static_scalar_detection_rejects_changing_graph_inputs():
+    graph = torch.fx.Graph()
+    source = graph.placeholder("changing_value")
+    static = graph.call_function(torch.ops.aten.scalar_tensor.default, (1e-20,),
+                                 {"dtype": torch.float32, "device": torch.device("cpu")})
+    dynamic = graph.call_function(torch.ops.aten.scalar_tensor.default, (source,))
+    changing_device = graph.call_function(torch.ops.aten.scalar_tensor.default, (1,), {"device": source})
+    assert replay._is_static_scalar(static)
+    assert not replay._is_static_scalar(dynamic)
+    assert not replay._is_static_scalar(changing_device)
+
+
 class Plan:
 
     def __init__(self, key, output):

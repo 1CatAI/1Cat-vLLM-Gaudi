@@ -35,6 +35,7 @@ nav:
     - features/flashinfer_native_backend.md
     - features/deepseek_v4_indexed_mme.md
     - features/deepseek_v4_native_decode.md
+    - features/deepseek_v41.md
     - features/bucketing_mechanism.md
     - features/floating_point_8.md
     - features/warmup.md

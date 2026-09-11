@@ -192,13 +192,13 @@ class HPUWorker(WorkerBase):
     @staticmethod
     def _refresh_native_profiler_commands():
         from vllm_gaudi import envs as gaudi_envs
-        if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+        if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH or gaudi_envs.VLLM_HPU_DSV41_GRAPH_REPLAY:
             from vllm_gaudi.ops.tp2_prepared_plan import recapture_native_decoder_programs
             recapture_native_decoder_programs()
 
     def _write_native_decoder_stats(self, phase):
         from vllm_gaudi import envs as gaudi_envs
-        if not gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+        if not (gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH or gaudi_envs.VLLM_HPU_DSV41_GRAPH_REPLAY):
             return
         from vllm_gaudi.ops.tp2_prepared_plan import prepared_group_stats
         import json
@@ -212,7 +212,21 @@ class HPUWorker(WorkerBase):
                 if (decoder := getattr(module, "_hpu_native_decoder", None)) is not None)
             stats["allocated_bytes"] = torch.hpu.memory_allocated()
             stats["peak_allocated_bytes"] = torch.hpu.max_memory_allocated()
-        logger.info("V4 native decoder statistics: %s", json.dumps(stats))
+            if gaudi_envs.VLLM_HPU_DSV41_PREPARED_SHARDS:
+                owner = self.model_runner.model.program.replay_owner
+                stats["capture_snapshot_bytes"] = sum(variant.capture_bytes for variant in owner.variants.values())
+                stats["v41"] = self.model_runner.audit
+                stats["state_bytes"] = self.model_runner.state.allocated_bytes
+                stats["pp"] = {key: getattr(self.model_runner.pp, key) for key in ("sends", "receives", "commits")}
+                if gaudi_envs.VLLM_HPU_DSV41_NATIVE_PP_COPY:
+                    from vllm_gaudi.distributed.tp2_fused_ar_norm import _resolve_runtime
+                    # This target has no GDN state copies; the reused DMA
+                    # backend counters therefore cover only its PP packets.
+                    bridge, _, _ = _resolve_runtime()
+                    stats["pp"]["native_dma_batches_tensors_bytes"] = bridge.gdn_state_dma_counts()
+                host = self.model_runner.model.engram_host
+                stats["engram"] = None if host is None else host.audit
+        logger.info("Native decoder statistics: %s", json.dumps(stats))
         if self.torch_profiler_dir:
             destination = Path(self.torch_profiler_dir)
             destination.mkdir(parents=True, exist_ok=True)
@@ -247,6 +261,21 @@ class HPUWorker(WorkerBase):
         # HABANA_VISIBLE_MODULES. Bind explicitly before the first HPU
         # allocation to keep each worker on its assigned visible module.
         device_index = self.local_rank if self.local_rank >= 0 else 0
+        from vllm_gaudi.ops.deepseek_v41_config import is_v41
+        if is_v41(self.vllm_config):
+            modules = os.environ["HABANA_VISIBLE_MODULES"].split(",")
+            if len(modules) != 4 or device_index >= len(modules):
+                raise RuntimeError("V4.1 requires four explicitly assigned HPU modules")
+            os.environ["HLS_MODULE_ID"] = modules[device_index]
+            if "{rank}" in os.environ.get("PT_HPU_RECIPE_CACHE_CONFIG", ""):
+                os.environ["PT_HPU_RECIPE_CACHE_CONFIG"] = os.environ["PT_HPU_RECIPE_CACHE_CONFIG"].replace(
+                    "{rank}", str(self.rank))
+            if os.environ.get("GRAPH_VISUALIZATION") == "1":
+                from pathlib import Path
+                graph_dir = Path(os.environ["GRAPH_VISUALIZATION_DIR"]) / f"rank{self.rank}"
+                graph_dir.mkdir(parents=True, exist_ok=True)
+                os.environ["GRAPH_VISUALIZATION_DIR"] = str(graph_dir)
+                os.environ["PT_HPU_GRAPH_DUMP_PREFIX"] = str(graph_dir)
         torch.hpu.set_device(device_index)
         self.device = torch.device("hpu")
         # Initialize the distributed environment.
@@ -256,8 +285,16 @@ class HPUWorker(WorkerBase):
         num_ubatches = 2 if self.parallel_config.enable_dbo else 1
         init_workspace_manager(self.device, num_ubatches)
         with set_current_vllm_config(self.vllm_config):
-            self.model_runner = HPUModelRunner(vllm_config=self.vllm_config, is_driver_worker=self.is_driver_worker)
+            self.model_runner = self._create_model_runner()
         self.init_profiler()
+
+    def _create_model_runner(self):
+        from vllm_gaudi.ops.deepseek_v41_config import is_v41
+        runner_class = HPUModelRunner
+        if is_v41(self.vllm_config):
+            from vllm_gaudi.v1.worker.deepseek_v41_runner import V41ModelRunner
+            runner_class = V41ModelRunner
+        return runner_class(vllm_config=self.vllm_config, is_driver_worker=self.is_driver_worker)
 
     def shutdown(self):
         from vllm_gaudi import envs as gaudi_envs
@@ -357,10 +394,7 @@ class HPUWorker(WorkerBase):
                 return
 
             with set_current_vllm_config(vllm_config):
-                self.model_runner = HPUModelRunner(
-                    vllm_config=vllm_config,
-                    is_driver_worker=self.is_driver_worker,
-                )
+                self.model_runner = self._create_model_runner()
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()  # type: ignore[union-attr]
 
@@ -684,7 +718,7 @@ class HPUWorker(WorkerBase):
         self.compile_or_warm_up_model()
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
-        if self.model_config.hf_config.model_type == "deepseek_v4":
+        if self.model_config.hf_config.model_type in ("deepseek_v4", "deepseek_v41"):
             from vllm_gaudi.ops.deepseek_v4_config import bind_worker_cpu
             bind_worker_cpu(self.rank)
         # Don't run the warmup if the model is already warmed up
@@ -694,7 +728,7 @@ class HPUWorker(WorkerBase):
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
 
-        if self.model_config.hf_config.model_type == "deepseek_v4":
+        if self.model_config.hf_config.model_type in ("deepseek_v4", "deepseek_v41"):
             from vllm_gaudi.ops.deepseek_v4_config import bind_worker_helpers
             bind_worker_helpers(self.rank)
 

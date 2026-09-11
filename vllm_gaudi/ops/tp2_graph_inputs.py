@@ -63,7 +63,7 @@ class FixedDecodeInputs:
     def __init__(self, model, roots, captured_inputs):
         used = {_storage(value) for row in captured_inputs for value in row if isinstance(value, torch.Tensor)}
         candidates = []
-        for name in ("positions", "hidden_states", "residual", "input_ids", "metadata_pack"):
+        for name in ("positions", "hidden_states", "residual", "pre_mix", "input_ids", "metadata_pack"):
             destination = (roots.get("metadata_destination", roots.get(name))
                            if name == "metadata_pack" else roots.get(name))
             candidates.append(("root", name, None, destination))
@@ -108,7 +108,8 @@ class FixedDecodeInputs:
         self.state_tensors = tuple(roots.get("state_tensors", ()))
         self.state_signatures = tuple((_storage(value), _address(value), _layout(value))
                                       for value in self.state_tensors)
-        self.native_staging = getattr(roots.get("adapter"), "name", None) == "deepseek_v4"
+        adapter_name = getattr(roots.get("adapter"), "name", "")
+        self.native_staging = adapter_name == "deepseek_v4" or adapter_name.startswith("deepseek_v41_")
 
     def updates(self, roots):
         """Preflight every changing binding before copying any input."""
