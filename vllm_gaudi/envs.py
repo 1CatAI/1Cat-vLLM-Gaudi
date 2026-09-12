@@ -273,6 +273,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_NATIVE_PP_COPY", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_PREPARED_OUTPUT":
     lambda: os.environ.get("VLLM_HPU_DSV41_PREPARED_OUTPUT", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_EXPERT_K128": lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_K128", "0") == "1",
     "VLLM_HPU_DSV41_FP8_DECODE": lambda: os.environ.get("VLLM_HPU_DSV41_FP8_DECODE", "0") == "1",
     "VLLM_HPU_DSV41_FP8_SIDECAR": lambda: os.environ.get("VLLM_HPU_DSV41_FP8_SIDECAR", ""),
     "VLLM_HPU_DSV41_FP8_CONFIG": lambda: os.environ.get("VLLM_HPU_DSV41_FP8_CONFIG", ""),

@@ -15,6 +15,10 @@
 
 #define DSV4_MXFP4_PREPARED_N_TILE 128
 
+#ifndef DSV41_MXFP4_PREPARED_K128
+#define DSV41_MXFP4_PREPARED_K128 0
+#endif
+
 static inline ushort128 decode_prepared_bits(ushort128 nibble, ushort128 scale)
 {
     const ushort128 magnitude = v_u16_and_b(nibble, 7);
@@ -57,9 +61,16 @@ void main(tensor expert_ids, tensor q16, tensor s16, tensor lookup, tensor outpu
     const int5 start = get_index_space_offset();
     const int5 end = start + get_index_space_size();
     const int experts = get_dim_size(q16, 2);
-    const int kPairs = get_dim_size(q16, 0) / 64;
+#if DSV41_MXFP4_PREPARED_K128
+    const int pairBegin = start[2] * 64;
+    const int pairEnd = end[2] * 64;
+#else
+    const int pairBegin = 0;
+    const int pairEnd = get_dim_size(q16, 0) / 64;
+#endif
 #if !DSV4_MXFP4_PREPARED_STORE_DIAGNOSTIC
-    const int groups = kPairs / 16;
+    const int groupBegin = pairBegin / 16;
+    const int groupEnd = pairEnd / 16;
 #endif
 #if DSV4_MXFP4_PREPARED_NORMAL && !DSV4_MXFP4_PREPARED_STORE_DIAGNOSTIC
     const uchar256 table = v_u8_ld_tnsr_b((int5){0, 0, 0, 0, 0}, lookup);
@@ -70,8 +81,8 @@ void main(tensor expert_ids, tensor q16, tensor s16, tensor lookup, tensor outpu
             const int row = nBlock * 128;
             const int sourceNBlock = nBlock + DSV4_MXFP4_PREPARED_N_BLOCK_OFFSET;
             if (expert < 0 || expert >= experts) {
-                int5 dst = {row, 0, slot, 0, 0};
-                for (int pair = 0; pair < kPairs; ++pair) {
+                int5 dst = {row, pairBegin * 2, slot, 0, 0};
+                for (int pair = pairBegin; pair < pairEnd; ++pair) {
                     v_bf16_st_tnsr(dst, output, (bfloat128){0});
                     dst[1] += 1;
                     v_bf16_st_tnsr(dst, output, (bfloat128){0});
@@ -80,15 +91,15 @@ void main(tensor expert_ids, tensor q16, tensor s16, tensor lookup, tensor outpu
                 continue;
             }
 #if DSV4_MXFP4_PREPARED_STORE_DIAGNOSTIC
-            int5 dst = {row, 0, slot, 0, 0};
-            for (int pair = 0; pair < kPairs; ++pair) {
+            int5 dst = {row, pairBegin * 2, slot, 0, 0};
+            for (int pair = pairBegin; pair < pairEnd; ++pair) {
                 v_bf16_st_tnsr(dst, output, (bfloat128){0});
                 dst[1] += 1;
                 v_bf16_st_tnsr(dst, output, (bfloat128){0});
                 dst[1] += 1;
             }
 #else
-            for (int group = 0; group < groups; ++group) {
+            for (int group = groupBegin; group < groupEnd; ++group) {
                 const bfloat128 scale = v_bf16_ld_tnsr_b(
                     (int5){group * 128, sourceNBlock, expert, 0, 0}, s16);
 #if DSV4_MXFP4_PREPARED_NORMAL

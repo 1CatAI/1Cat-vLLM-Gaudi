@@ -123,6 +123,7 @@ def main():
     parser.add_argument("--process-record", type=Path)
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--tokens", type=int, default=192)
+    parser.add_argument("--target-ms", type=float, default=24., help="Strict per-round steady ITL target")
     parser.add_argument("--warmup-tokens", type=int, default=32)
     parser.add_argument("--profile", action="store_true", help="Profiling-only acquisition, not speed qualification")
     args = parser.parse_args()
@@ -160,7 +161,9 @@ def main():
                  and all(row["timing_valid"] and row["intervals"] == 181 for row in results))
         record = {"finished_at": datetime.now(timezone.utc).isoformat(), "profile": args.profile,
                   "profile_stop_error": stop_error,
-                  "qualified_measurement": valid, "all_three_below_24_ms": valid and all(
+                  "qualified_measurement": valid, "target_ms": args.target_ms,
+                  "all_three_below_target_ms": valid and all(row["steady_ms"] < args.target_ms for row in results),
+                  "all_three_below_24_ms": valid and all(
                       row["steady_ms"] < 24 for row in results), "results": results}
         (args.output / "result.json").write_text(json.dumps(record, indent=2) + "\n")
         if stop_error:

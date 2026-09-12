@@ -12,6 +12,10 @@ constexpr auto kDecode = "custom_deepseek_v41_mxfp4_prepared_dequant_bf16_gaudi2
 constexpr auto kDecodeNormal = "custom_deepseek_v41_mxfp4_prepared_dequant_normal_bf16_gaudi2";
 constexpr auto kDecodeSchema = "custom_op::custom_deepseek_v41_mxfp4_prepared_dequant_bf16_gaudi2";
 constexpr auto kMoeSchema = "custom_op::custom_deepseek_v41_mxfp4_prepared_moe_bf16_gaudi2";
+constexpr auto kDecodeK128 = "custom_deepseek_v41_mxfp4_prepared_dequant_k128_bf16_gaudi2";
+constexpr auto kDecodeK128Normal = "custom_deepseek_v41_mxfp4_prepared_dequant_k128n_bf16_gaudi2";
+constexpr auto kDecodeK128Schema = "custom_op::custom_deepseek_v41_mxfp4_prepared_dequant_k128_bf16_gaudi2";
+constexpr auto kMoeK128Schema = "custom_op::custom_deepseek_v41_mxfp4_prepared_moe_k128_bf16_gaudi2";
 constexpr auto kMoeFp8Schema = "custom_op::custom_deepseek_v41_mxfp4_prepared_moe_fp8_gaudi2";
 constexpr auto kDecodeFp8 = "custom_deepseek_v41_mxfp4_prepared_dequant_fp8_gaudi2";
 constexpr auto kDynamicQuant = "custom_deepseek_v41_dynamic_quant_bf16_gaudi2";
@@ -74,6 +78,11 @@ void fp8_contract(const at::Stack& stack) {
 class PreparedV41 final : public habana::OpBackend {
     bool moe_;
     bool fp8_;
+    bool k128_;
+
+    const char* decode_guid(bool normal) const {
+        return k128_ ? (normal ? kDecodeK128Normal : kDecodeK128) : (normal ? kDecodeNormal : kDecode);
+    }
     using Tensor = synapse_helpers::tensor;
 
     Tensor cast(synapse_helpers::graph& graph, synTensor input, const std::vector<int64_t>& shape, bool toFloat) {
@@ -130,7 +139,7 @@ class PreparedV41 final : public habana::OpBackend {
             auto rounded = cast(graph, scaled.at(0).get(), resultShape, false);
             return ReshapeHelper(graph, rounded.get(), {1, experts, n}, at::kBFloat16);
         }
-        auto decoded = BuildNode(this, graph, {normal ? kDecodeNormal : kDecode, {ids, q, s, lookup},
+        auto decoded = BuildNode(this, graph, {decode_guid(normal), {ids, q, s, lookup},
             {{{tokens * experts, k, n}, at::kBFloat16}}});
         // Keep the TPC and MME batch axes identical. A [T,E,K,N] reshape
         // between them prevents the Gaudi2 slicer from composing the access
@@ -152,8 +161,8 @@ class PreparedV41 final : public habana::OpBackend {
     }
 
  public:
-    PreparedV41(int device, c10::ScalarType dtype, bool moe, bool fp8 = false)
-        : OpBackend(device, NO_TPC + std::string("dsv41_prepared_mxfp4"), dtype, {0}, {}, {}, false), moe_(moe), fp8_(fp8) {
+    PreparedV41(int device, c10::ScalarType dtype, bool moe, bool fp8 = false, bool k128 = false)
+        : OpBackend(device, NO_TPC + std::string("dsv41_prepared_mxfp4"), dtype, {0}, {}, {}, false), moe_(moe), fp8_(fp8), k128_(k128) {
         SetOutputMetaFn([moe, fp8](const at::Stack& stack) {
             if (fp8) fp8_contract(stack);
             return habana::OutputMetaDataVector{{at::kBFloat16, moe ? moe_shape(stack) : decode_shape(stack)}};
@@ -167,7 +176,7 @@ class PreparedV41 final : public habana::OpBackend {
         const auto& idsTensor = stack.at(moe_ ? 1 : 0).toTensor();
         auto ids = ReshapeHelper(graph, syn_in(moe_ ? 1 : 0), {1, idsTensor.numel()}, at::kInt);
         if (!moe_) {
-            auto result = BuildNode(this, graph, {normal ? kDecodeNormal : kDecode,
+            auto result = BuildNode(this, graph, {decode_guid(normal),
                 {ids.get(), syn_in(1), syn_in(2), syn_in(3)}, {{resultShape, at::kBFloat16, 0}}});
             syn_out(0) = std::move(result.at(0));
             return;
@@ -214,25 +223,31 @@ class PreparedV41 final : public habana::OpBackend {
 };
 
 const bool registered = [] {
-    for (int mode : {0, 1, 2}) {
-        const bool moe = mode != 0, fp8 = mode == 2;
-        const char* schema = fp8 ? kMoeFp8Schema : moe ? kMoeSchema : kDecodeSchema;
+    for (int mode : {0, 1, 2, 3, 4}) {
+        const bool moe = mode == 1 || mode == 2 || mode == 4, fp8 = mode == 2, k128 = mode >= 3;
+        const char* schema = k128 ? (moe ? kMoeK128Schema : kDecodeK128Schema)
+                                 : fp8 ? kMoeFp8Schema : moe ? kMoeSchema : kDecodeSchema;
         habana::custom_op::registerUserCustomOp(schema, kDecode, [moe, fp8](const at::Stack& stack) {
             if (fp8) fp8_contract(stack);
             return habana::PartialOutputMetaDataVector{{at::kBFloat16, moe ? moe_shape(stack) : decode_shape(stack)}};
         }, nullptr);
-        habana::KernelRegistry().add(schema, [moe, fp8](synDeviceId device, c10::ScalarType dtype) {
-            return std::make_shared<PreparedV41>(device, dtype, moe, fp8);
+        habana::KernelRegistry().add(schema, [moe, fp8, k128](synDeviceId device, c10::ScalarType dtype) {
+            return std::make_shared<PreparedV41>(device, dtype, moe, fp8, k128);
         });
     }
     return true;
 }();
 
-at::Tensor run(const at::Stack& stack, bool moe, bool meta) {
+at::Tensor run(const at::Stack& stack, bool moe, bool meta, bool k128) {
     const auto shape = moe ? moe_shape(stack) : decode_shape(stack);
+    if (moe && k128) {
+        TORCH_CHECK(stack.at(0).toTensor().size(0) == 1 && stack.at(1).toTensor().size(1) == 6,
+                    "V4.1 K128 MoE requires C1 and top6");
+    }
     if (meta) return at::empty(shape, stack.at(0).toTensor().options().dtype(at::kBFloat16));
     TORCH_CHECK(registered && stack.at(0).toTensor().device().type() == at::kHPU, "V4.1 MXFP4 requires HPU");
-    auto descriptor = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(moe ? kMoeSchema : kDecodeSchema);
+    auto descriptor = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(
+        k128 ? (moe ? kMoeK128Schema : kDecodeK128Schema) : (moe ? kMoeSchema : kDecodeSchema));
     return descriptor.execute(stack).at(0);
 }
 
@@ -247,29 +262,35 @@ template<bool Meta> at::Tensor moe_fp8(const at::Tensor& x, const at::Tensor& id
     return descriptor.execute(stack).at(0);
 }
 
-template<bool Meta> at::Tensor dequant(const at::Tensor& ids, const at::Tensor& q, const at::Tensor& s,
+template<bool Meta, bool K128 = false> at::Tensor dequant(const at::Tensor& ids, const at::Tensor& q, const at::Tensor& s,
                                       const at::Tensor& lookup, bool normal) {
-    return run({ids, q, s, lookup, normal}, false, Meta);
+    return run({ids, q, s, lookup, normal}, false, Meta, K128);
 }
-template<bool Meta> at::Tensor moe(const at::Tensor& x, const at::Tensor& ids, const at::Tensor& router,
+template<bool Meta, bool K128 = false> at::Tensor moe(const at::Tensor& x, const at::Tensor& ids, const at::Tensor& router,
                                   const at::Tensor& q13, const at::Tensor& q2, const at::Tensor& s13,
                                   const at::Tensor& s2, const at::Tensor& lookup, bool normal) {
-    return run({x, ids, router, q13, q2, s13, s2, lookup, normal}, true, Meta);
+    return run({x, ids, router, q13, q2, s13, s2, lookup, normal}, true, Meta, K128);
 }
 }
 
 TORCH_LIBRARY_FRAGMENT(custom_op, m) {
     m.def("custom_deepseek_v41_mxfp4_prepared_moe_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, bool normal) -> Tensor");
     m.def("custom_deepseek_v41_mxfp4_prepared_dequant_bf16_gaudi2(Tensor ids, Tensor q16, Tensor s16, Tensor lookup, bool normal=False) -> Tensor");
+    m.def("custom_deepseek_v41_mxfp4_prepared_dequant_k128_bf16_gaudi2(Tensor ids, Tensor q16, Tensor s16, Tensor lookup, bool normal=False) -> Tensor");
     m.def("custom_deepseek_v41_mxfp4_prepared_moe_bf16_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, bool normal=False) -> Tensor");
+    m.def("custom_deepseek_v41_mxfp4_prepared_moe_k128_bf16_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, bool normal=False) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
     m.impl("custom_deepseek_v41_mxfp4_prepared_moe_fp8_gaudi2", moe_fp8<false>);
     m.impl("custom_deepseek_v41_mxfp4_prepared_dequant_bf16_gaudi2", dequant<false>);
+    m.impl("custom_deepseek_v41_mxfp4_prepared_dequant_k128_bf16_gaudi2", dequant<false, true>);
     m.impl("custom_deepseek_v41_mxfp4_prepared_moe_bf16_gaudi2", moe<false>);
+    m.impl("custom_deepseek_v41_mxfp4_prepared_moe_k128_bf16_gaudi2", moe<false, true>);
 }
 TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
     m.impl("custom_deepseek_v41_mxfp4_prepared_moe_fp8_gaudi2", moe_fp8<true>);
     m.impl("custom_deepseek_v41_mxfp4_prepared_dequant_bf16_gaudi2", dequant<true>);
+    m.impl("custom_deepseek_v41_mxfp4_prepared_dequant_k128_bf16_gaudi2", dequant<true, true>);
     m.impl("custom_deepseek_v41_mxfp4_prepared_moe_bf16_gaudi2", moe<true>);
+    m.impl("custom_deepseek_v41_mxfp4_prepared_moe_k128_bf16_gaudi2", moe<true, true>);
 }

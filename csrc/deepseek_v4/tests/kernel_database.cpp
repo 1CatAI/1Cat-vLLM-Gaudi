@@ -41,8 +41,10 @@ int main() {
             }
         }
     }
-    assert(custom_count == 62);
+    assert(custom_count == 64);
     for (const char* required : {
+             "custom_deepseek_v41_mxfp4_prepared_dequant_k128_bf16_gaudi2",
+             "custom_deepseek_v41_mxfp4_prepared_dequant_k128n_bf16_gaudi2",
              "custom_deepseek_v41_selected_kv_valid_ordered_bf16_gaudi2",
              "custom_deepseek_v41_selected_kv_valid_cache_ordered_bf16_gaudi2",
              "custom_deepseek_v41_rope_bf16_gaudi2",

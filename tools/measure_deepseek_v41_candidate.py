@@ -19,6 +19,7 @@ def main():
     parser.add_argument("--url", default="http://127.0.0.1:18162")
     parser.add_argument("--model", default="DeepSeek-V4.1-Flash-C1")
     parser.add_argument("--trace", action="store_true")
+    parser.add_argument("--target-ms", type=float, default=24.)
     parser.add_argument("--trace-tokens", type=int, default=64,
                         help="Independent profiler request length; three timed requests remain 192 tokens")
     args = parser.parse_args()
@@ -69,9 +70,11 @@ def main():
             raise TimeoutError("Owned candidate did not become healthy before startup deadline")
         status["phase"] = "unprofiled_requests"
         save()
-        invoke("performance", [])
+        invoke("performance", ["--target-ms", str(args.target_ms)])
         performance = json.loads((run / "performance/result.json").read_text())
         status["all_three_below_24_ms"] = performance["all_three_below_24_ms"]
+        status["target_ms"] = performance["target_ms"]
+        status["all_three_below_target_ms"] = performance["all_three_below_target_ms"]
         # Timing coalescence can invalidate ITL without invalidating the saved
         # hardware execution. A failed or incomplete request cannot advance.
         if any(row["error"] or row["token_count"] != 192 for row in performance["results"]):

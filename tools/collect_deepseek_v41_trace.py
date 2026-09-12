@@ -7,6 +7,8 @@ analysis. No old layer counts, packet clustering or timing windows are reused.
 
 import argparse
 import collections
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import contextlib
 import hashlib
 import json
 from pathlib import Path
@@ -55,10 +57,8 @@ def recipe_symbols(path):
     target = struct.pack("<II", 1, 2)
     offset, matches = 0, []
     while (offset := data.find(target, offset)) >= 0:
-        try:
+        with contextlib.suppress(AssertionError, struct.error, UnicodeDecodeError, IndexError):
             matches.append(parse_symbols(data, offset))
-        except (AssertionError, struct.error, UnicodeDecodeError, IndexError):
-            pass
         offset += 1
     if len(matches) != 1:
         raise ValueError(f"Recipe debug section is not unique: {path}, candidates={len(matches)}")
@@ -69,6 +69,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--jobs", type=int, choices=range(1, 5), default=1,
+                        help="Independent rank extraction workers; does not acquire another trace")
     args = parser.parse_args()
     run = args.run.resolve()
     output = args.output or run / "trace-analysis"
@@ -81,7 +83,7 @@ def main():
               "extractor_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
               "reuse": "20260909_dsv4-native-joint-decode/extract_native_trace.py and decode_native_recipe_symbols.py",
               "status": "collecting; physical calls and complete token windows not yet reconstructed"}
-    for rank in range(4):
+    def extract_rank(rank):
         pp, tp = divmod(rank, 2)
         stop = run / f"traces/rank{rank}-native-profile-stop.json"
         if not stop.is_file():
@@ -101,11 +103,26 @@ def main():
             raise ValueError(f"Rank {rank} has no private serialized recipes")
         (output / f"rank{rank}/recipe-symbols.json").write_text(json.dumps({
             "recipes": recipes, "source_runtime_profile": str(run / "runtime-profile.json")}, indent=2) + "\n")
-        record["ranks"].append({"rank": rank, "pp": pp, "tp": tp, "pid": int(pid),
-                                "trace": str(traces[0]), "serialized_recipes": len(recipes),
-                                "stats": json.loads(stop.read_text())})
-        (output / "collection.json").write_text(json.dumps(record, indent=2) + "\n")
-        print(f"Rank {rank}: extracted trace and {len(recipes)} exact recipe records", flush=True)
+        return {"rank": rank, "pp": pp, "tp": tp, "pid": int(pid),
+                "trace": str(traces[0]), "serialized_recipes": len(recipes),
+                "stats": json.loads(stop.read_text())}
+
+    errors = []
+    with ThreadPoolExecutor(max_workers=args.jobs) as executor:
+        futures = {executor.submit(extract_rank, rank): rank for rank in range(4)}
+        for future in as_completed(futures):
+            rank = futures[future]
+            try:
+                item = future.result()
+                record["ranks"].append(item)
+                record["ranks"].sort(key=lambda item: item["rank"])
+                print(f"Rank {rank}: extracted trace and {item['serialized_recipes']} exact recipe records", flush=True)
+            except Exception as error:
+                errors.append({"rank": rank, "error": repr(error)})
+            record["errors"] = errors
+            (output / "collection.json").write_text(json.dumps(record, indent=2) + "\n")
+    if errors:
+        raise RuntimeError(f"Rank extraction failed; partial artifacts retained: {errors}")
     graph_roots = [run / "graphs"]
     seed = run / "recipe-seed-manifest.json"
     if seed.exists():

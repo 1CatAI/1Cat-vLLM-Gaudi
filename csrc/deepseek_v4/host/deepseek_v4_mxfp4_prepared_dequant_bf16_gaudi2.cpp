@@ -2,6 +2,11 @@
 #include "deepseek_v4_mxfp4_prepared_dequant_bf16_gaudi2.hpp"
 #include <cstring>
 
+extern unsigned char _binary___deepseek_v41_mxfp4_prepared_dequant_k128_bf16_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_mxfp4_prepared_dequant_k128_bf16_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_mxfp4_prepared_dequant_k128_normal_bf16_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_mxfp4_prepared_dequant_k128_normal_bf16_gaudi2_o_end;
+
 extern unsigned char _binary___deepseek_v4_mxfp4_prepared_dequant_bf16_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v4_mxfp4_prepared_dequant_bf16_gaudi2_o_end;
 extern unsigned char _binary___deepseek_v4_mxfp4_prepared_dequant_normal_bf16_gaudi2_o_start;
@@ -18,7 +23,12 @@ extern unsigned char _binary___deepseek_v4_mxfp4_prepared_dequant_up_normal_bf16
 tpc_lib_api::GlueCodeReturn DeepseekV4Mxfp4PreparedDequantBF16Gaudi2::GetKernelName(
     char name[tpc_lib_api::MAX_NODE_NAME]) {
     const char* kernel = nullptr;
-    if (v41_) {
+    if (v41_ && k128_) {
+        static_assert(sizeof("custom_deepseek_v41_mxfp4_prepared_dequant_k128n_bf16_gaudi2") <=
+                      tpc_lib_api::MAX_NODE_NAME);
+        kernel = normal_ ? "custom_deepseek_v41_mxfp4_prepared_dequant_k128n_bf16_gaudi2"
+                         : "custom_deepseek_v41_mxfp4_prepared_dequant_k128_bf16_gaudi2";
+    } else if (v41_) {
         kernel = normal_ ? "custom_deepseek_v41_mxfp4_prepared_dequant_normal_bf16_gaudi2"
                          : "custom_deepseek_v41_mxfp4_prepared_dequant_bf16_gaudi2";
     } else if (half_ == 0) {
@@ -86,9 +96,11 @@ tpc_lib_api::GlueCodeReturn DeepseekV4Mxfp4PreparedDequantBF16Gaudi2::GetGcDefin
         output.maxSizes[2] = ids.maxSizes[0];
         return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
     }
-    out->indexSpaceRank = 2;
+    if (k128_ && (!v41_ || half_ >= 0)) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+    out->indexSpaceRank = k128_ ? 3 : 2;
     out->indexSpaceGeometry[0] = nBlocks;
     out->indexSpaceGeometry[1] = ids.maxSizes[0];
+    if (k128_) out->indexSpaceGeometry[2] = q16.maxSizes[0] / 4096;
     auto map = [](TensorAccessPattern& pattern, unsigned dim, unsigned indexSpaceDim,
                   int coefficient, int start, int end) {
         pattern.mapping[dim].indexSpaceDim = indexSpaceDim;
@@ -112,10 +124,23 @@ tpc_lib_api::GlueCodeReturn DeepseekV4Mxfp4PreparedDequantBF16Gaudi2::GetGcDefin
     map(outputPattern, 0, 0, 128, 0, 127);
     map(outputPattern, 1, 0, 0, 0, q16.maxSizes[0] / 32 - 1);
     map(outputPattern, 2, 1, 1, 0, 0);
+    if (k128_) {
+        // Partition only the independent decoder work. The consuming MME
+        // retains complete K; no partial products or Split-K reduction.
+        map(qPattern, 0, 2, 4096, 0, 4095);
+        map(sPattern, 0, 2, 512, 0, 511);
+        map(outputPattern, 1, 2, 128, 0, 127);
+    }
     out->kernel.paramsNr = 0;
     const unsigned char* start = nullptr;
     const unsigned char* end = nullptr;
-    if (half_ == 0 && normal_) {
+    if (k128_ && normal_) {
+        start = &_binary___deepseek_v41_mxfp4_prepared_dequant_k128_normal_bf16_gaudi2_o_start;
+        end = &_binary___deepseek_v41_mxfp4_prepared_dequant_k128_normal_bf16_gaudi2_o_end;
+    } else if (k128_) {
+        start = &_binary___deepseek_v41_mxfp4_prepared_dequant_k128_bf16_gaudi2_o_start;
+        end = &_binary___deepseek_v41_mxfp4_prepared_dequant_k128_bf16_gaudi2_o_end;
+    } else if (half_ == 0 && normal_) {
         start = &_binary___deepseek_v4_mxfp4_prepared_dequant_gate_normal_bf16_gaudi2_o_start;
         end = &_binary___deepseek_v4_mxfp4_prepared_dequant_gate_normal_bf16_gaudi2_o_end;
     } else if (half_ == 0) {

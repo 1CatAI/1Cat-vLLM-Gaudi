@@ -94,6 +94,9 @@ class PreparedMoE(nn.Module):
         self.normal_scales, self.reduce = normal_scales, reduce
         self.register_buffer("lookup", lookup, False)
         self.fp8 = False
+        self.expert_k128 = gaudi_envs.VLLM_HPU_DSV41_EXPERT_K128
+        if self.expert_k128 and gaudi_envs.VLLM_HPU_DSV41_FP8_DECODE:
+            raise ValueError("V4.1 K128 BF16 and FP8 decode must be selected independently")
         self.register_buffer("fp8_w13_scale", None, False)
         self.register_buffer("fp8_w2_scale", None, False)
 
@@ -111,6 +114,12 @@ class PreparedMoE(nn.Module):
             output = torch.ops.custom_op.custom_deepseek_v41_mxfp4_prepared_moe_fp8_gaudi2(
                 value, ids.to(torch.int32), routing.float(), experts.w13_q16, experts.w2_q16, experts.w13_s16,
                 experts.w2_s16, self.lookup, self.fp8_w13_scale, self.fp8_w2_scale, self.normal_scales)
+        elif self.expert_k128 and value.shape[0] == 1:
+            if self.topk != 6:
+                raise ValueError("V4.1 K128 decode requires top6")
+            output = torch.ops.custom_op.custom_deepseek_v41_mxfp4_prepared_moe_k128_bf16_gaudi2(
+                value, ids.to(torch.int32), routing.float(), experts.w13_q16, experts.w2_q16, experts.w13_s16,
+                experts.w2_s16, self.lookup, self.normal_scales)
         else:
             output = torch.ops.custom_op.custom_deepseek_v41_mxfp4_prepared_moe_bf16_gaudi2(
                 value, ids.to(torch.int32), routing.float(), experts.w13_q16, experts.w2_q16, experts.w13_s16,

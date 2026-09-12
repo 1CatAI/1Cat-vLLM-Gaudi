@@ -119,17 +119,19 @@ def analyze(root, rank):
             selected = bisect.bisect_right(window_ends, start)
             if selected >= len(windows):
                 continue
-            low, high = windows[selected]
-            end = min(start + duration, high)
-            start = max(start, low)
-            if end <= start:
-                continue
             node = inv["nodes"][index]
             symbol = mapped.get(index)
             kernel = symbol["kernel"] if symbol else node["kernel"]
-            grouped[(node["engine"], kernel)].append((start, end))
-            engines[node["engine"]].append((start, end))
-            counts[(node["engine"], kernel)] += 1
+            counted = False
+            while selected < len(windows) and windows[selected][0] < start + duration:
+                low, high = windows[selected]
+                begin, end = max(start, low), min(start + duration, high)
+                if begin < end:
+                    grouped[(node["engine"], kernel)].append((begin, end))
+                    engines[node["engine"]].append((begin, end))
+                    counted = True
+                selected += 1
+            counts[(node["engine"], kernel)] += int(counted)
     scale = len(windows) * 1000
     tpc, mme = union(engines["TPC"]), union(engines["MME"])
     compute = union(engines["TPC"] + engines["MME"])

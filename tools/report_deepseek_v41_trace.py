@@ -174,6 +174,8 @@ def analyze(root, rank, common):
     period = sum(b - a for a, b in windows)
     groups = collections.defaultdict(lambda: collections.defaultdict(list))
     raw, engines = collections.defaultdict(list), collections.defaultdict(list)
+    packet_counts = collections.Counter()
+    clipped_calls = set()
     first_index = {}
     with gzip.open(path / "hardware.jsonl.gz", "rt") as stream:
         for line in stream:
@@ -181,18 +183,24 @@ def analyze(root, rank, common):
             win = bisect.bisect_right(ends, start)
             if win >= len(windows):
                 continue
-            lo, hi = windows[win]
-            stop, begin = min(start + duration, hi), max(start, lo)
-            if stop <= begin:
-                continue
             node, symbol = inv["nodes"][index], mapped.get(index)
             key = ((node["recipe"].split(":")[0], symbol["device_type"], symbol["full_context_id"])
                    if symbol else (node["recipe"], -1, index))
-            first_index[key] = index
-            groups[key][win].append((begin, stop, lane))
             kernel = symbol["kernel"] if symbol else node["kernel"]
-            raw[(node["engine"], kernel)].append((begin, stop))
-            engines[node["engine"]].append((begin, stop))
+            counted = False
+            while win < len(windows) and windows[win][0] < start + duration:
+                lo, hi = windows[win]
+                stop, begin = min(start + duration, hi), max(start, lo)
+                if begin < stop:
+                    first_index[key] = index
+                    groups[key][win].append((begin, stop, lane))
+                    if begin != start or stop != start + duration:
+                        clipped_calls.add((key, win))
+                    raw[(node["engine"], kernel)].append((begin, stop))
+                    engines[node["engine"]].append((begin, stop))
+                    counted = True
+                win += 1
+            packet_counts[key] += int(counted)
     details, aggregated, recovered = [], collections.defaultdict(list), collections.defaultdict(list)
     for key, by_window in groups.items():
         index = first_index[key]
@@ -226,8 +234,10 @@ def analyze(root, rank, common):
             category, purpose = "mHC", "已由原生计划和编译分区核验的独立控制/统计/混合分支"
         spans = [row[:2] for rows in by_window.values() for row in rows]
         samples, count, missing = [], 0, []
-        for rows in by_window.values():
-            if symbol:
+        for win, rows in by_window.items():
+            if (key, win) in clipped_calls:
+                values, n, reason = [], None, "invocation crosses the accounting window; activity retained"
+            elif symbol:
                 values, n, reason = invocation_samples(rows, symbol, frequency.get(key[0]))
             else:
                 values, n, reason = [], None, "unserialized eager node has no working-engine contract"
@@ -242,7 +252,7 @@ def analyze(root, rank, common):
                "mean_invocation_ms": statistics.mean(samples) if samples else None,
                "complete_invocation_samples": len(samples), "observed_calls": count if not missing else None,
                "calls_per_token": count / len(tokens) if not missing else None,
-               "observed_lane_packets": sum(map(len, by_window.values())), "count_limitations": sorted(set(missing)),
+               "observed_lane_packets": packet_counts[key], "count_limitations": sorted(set(missing)),
                "activity_ms_per_token": duration / len(tokens) / 1000, "period_pct": duration / period * 100,
                "inputs": inputs, "outputs": outputs, "compiler_contract": contract}
         row["classification_provenance"] = origin
