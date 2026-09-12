@@ -99,6 +99,7 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_MXFP4_PREPARED_DEQUANT_NORMAL_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V41_MXFP4_PREPARED_DEQUANT_K128_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V41_MXFP4_PREPARED_DEQUANT_K128_NORMAL_BF16,
+    GAUDI2_KERNEL_DEEPSEEK_V41_MXFP4_PREPARED_DEQUANT_PIPE_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V41_BF16_IDENTITY,
     GAUDI2_KERNEL_DEEPSEEK_V41_QUANT_ROUNDTRIP_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_KV_BF16,
@@ -387,6 +388,8 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
            preparedV41K128.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MXFP4_PREPARED_DEQUANT_K128_BF16].name);
            DeepseekV4Mxfp4PreparedDequantBF16Gaudi2 preparedV41K128Normal(true, -1, true, true);
            preparedV41K128Normal.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MXFP4_PREPARED_DEQUANT_K128_NORMAL_BF16].name);
+           DeepseekV4Mxfp4PreparedDequantBF16Gaudi2 preparedV41Pipeline(true, -1, true, true, true);
+           preparedV41Pipeline.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MXFP4_PREPARED_DEQUANT_PIPE_BF16].name);
            DeepseekV4BF16IdentityGaudi2 v41Identity(true);
            DeepseekV41QuantRoundtripGaudi2 v41Quant;
            DeepseekV41ControlGemvGaudi2 v41Control;
@@ -774,6 +777,10 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     v41Identity.GetKernelName(kernelName);
     if (strcmp(params->guid.name, kernelName) == 0)
         return v41Identity.GetGcDefinitions(params, instance);
+    DeepseekV4Mxfp4PreparedDequantBF16Gaudi2 preparedV41Pipeline(true, -1, true, true, true);
+    preparedV41Pipeline.GetKernelName(kernelName);
+    if (strcmp(params->guid.name, kernelName) == 0)
+        return preparedV41Pipeline.GetGcDefinitions(params, instance);
     for (bool normal : {false, true}) {
         for (bool k128 : {false, true}) {
             DeepseekV4Mxfp4PreparedDequantBF16Gaudi2 preparedV41(normal, -1, true, k128);

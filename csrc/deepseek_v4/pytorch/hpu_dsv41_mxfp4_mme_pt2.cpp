@@ -4,6 +4,8 @@
 #include <ATen/ATen.h>
 #include <torch/library.h>
 #include <limits>
+#include <cstdlib>
+#include <cstring>
 #include "perf_lib_layer_params.h"
 #include "hpu_ops/op_backend.h"
 
@@ -81,6 +83,11 @@ class PreparedV41 final : public habana::OpBackend {
     bool k128_;
 
     const char* decode_guid(bool normal) const {
+        // Read only while building the recipe; the immutable launch profile
+        // and native binary fingerprint own this experimental selection.
+        const char* pipeline = std::getenv("VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE");
+        if (k128_ && normal && pipeline && std::strcmp(pipeline, "1") == 0)
+            return "custom_deepseek_v41_mxfp4_prepared_dequant_pipe_bf16_gaudi2";
         return k128_ ? (normal ? kDecodeK128Normal : kDecodeK128) : (normal ? kDecodeNormal : kDecode);
     }
     using Tensor = synapse_helpers::tensor;

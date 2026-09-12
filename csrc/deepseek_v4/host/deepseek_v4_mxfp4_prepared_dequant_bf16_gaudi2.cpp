@@ -2,6 +2,9 @@
 #include "deepseek_v4_mxfp4_prepared_dequant_bf16_gaudi2.hpp"
 #include <cstring>
 
+extern unsigned char _binary___deepseek_v41_mxfp4_prepared_dequant_pipe_bf16_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_mxfp4_prepared_dequant_pipe_bf16_gaudi2_o_end;
+
 extern unsigned char _binary___deepseek_v41_mxfp4_prepared_dequant_k128_bf16_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_mxfp4_prepared_dequant_k128_bf16_gaudi2_o_end;
 extern unsigned char _binary___deepseek_v41_mxfp4_prepared_dequant_k128_normal_bf16_gaudi2_o_start;
@@ -23,7 +26,9 @@ extern unsigned char _binary___deepseek_v4_mxfp4_prepared_dequant_up_normal_bf16
 tpc_lib_api::GlueCodeReturn DeepseekV4Mxfp4PreparedDequantBF16Gaudi2::GetKernelName(
     char name[tpc_lib_api::MAX_NODE_NAME]) {
     const char* kernel = nullptr;
-    if (v41_ && k128_) {
+    if (pipeline_) {
+        kernel = "custom_deepseek_v41_mxfp4_prepared_dequant_pipe_bf16_gaudi2";
+    } else if (v41_ && k128_) {
         static_assert(sizeof("custom_deepseek_v41_mxfp4_prepared_dequant_k128n_bf16_gaudi2") <=
                       tpc_lib_api::MAX_NODE_NAME);
         kernel = normal_ ? "custom_deepseek_v41_mxfp4_prepared_dequant_k128n_bf16_gaudi2"
@@ -97,6 +102,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV4Mxfp4PreparedDequantBF16Gaudi2::GetGcDefin
         return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
     }
     if (k128_ && (!v41_ || half_ >= 0)) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+    if (pipeline_ && (!k128_ || !normal_)) return GLUE_INCOMPATIBLE_INPUT_SIZE;
     out->indexSpaceRank = k128_ ? 3 : 2;
     out->indexSpaceGeometry[0] = nBlocks;
     out->indexSpaceGeometry[1] = ids.maxSizes[0];
@@ -134,7 +140,10 @@ tpc_lib_api::GlueCodeReturn DeepseekV4Mxfp4PreparedDequantBF16Gaudi2::GetGcDefin
     out->kernel.paramsNr = 0;
     const unsigned char* start = nullptr;
     const unsigned char* end = nullptr;
-    if (k128_ && normal_) {
+    if (pipeline_) {
+        start = &_binary___deepseek_v41_mxfp4_prepared_dequant_pipe_bf16_gaudi2_o_start;
+        end = &_binary___deepseek_v41_mxfp4_prepared_dequant_pipe_bf16_gaudi2_o_end;
+    } else if (k128_ && normal_) {
         start = &_binary___deepseek_v41_mxfp4_prepared_dequant_k128_normal_bf16_gaudi2_o_start;
         end = &_binary___deepseek_v41_mxfp4_prepared_dequant_k128_normal_bf16_gaudi2_o_end;
     } else if (k128_) {

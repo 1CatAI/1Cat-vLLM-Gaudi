@@ -95,6 +95,9 @@ class PreparedMoE(nn.Module):
         self.register_buffer("lookup", lookup, False)
         self.fp8 = False
         self.expert_k128 = gaudi_envs.VLLM_HPU_DSV41_EXPERT_K128
+        if gaudi_envs.VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE and (not self.expert_k128
+                                                                or gaudi_envs.VLLM_HPU_DSV41_FP8_DECODE):
+            raise ValueError("V4.1 expert coordinate pipeline requires the K128 BF16 decoder")
         if self.expert_k128 and gaudi_envs.VLLM_HPU_DSV41_FP8_DECODE:
             raise ValueError("V4.1 K128 BF16 and FP8 decode must be selected independently")
         self.register_buffer("fp8_w13_scale", None, False)

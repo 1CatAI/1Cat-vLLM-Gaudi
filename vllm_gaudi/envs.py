@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_SELECTED_VALID_ONLY: bool = False
     VLLM_HPU_DSV41_ATTENTION_BLOCK_EXP: bool = False
     VLLM_HPU_DSV41_PHASE_TRACE: bool = False
+    VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE: bool = False
     VLLM_HPU_DSV41_DECODED_KV_STATE: bool = False
     VLLM_HPU_DSV41_SELECTED_KV_VECTOR: bool = False
     VLLM_HPU_DSV41_PACKED_ATTENTION: bool = False
@@ -260,6 +261,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: bool(int(os.getenv("VLLM_HPU_DSV41_ATTENTION_BLOCK_EXP", "0"))),
     "VLLM_HPU_DSV41_PHASE_TRACE":
     lambda: os.environ.get("VLLM_HPU_DSV41_PHASE_TRACE", "0") == "1",
+    "VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE":
+    lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE", "0") == "1",
     "VLLM_HPU_DSV41_DECODED_KV_STATE":
     lambda: bool(int(os.getenv("VLLM_HPU_DSV41_DECODED_KV_STATE", "0"))),
     "VLLM_HPU_DSV41_SELECTED_KV_VECTOR":

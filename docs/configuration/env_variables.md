@@ -479,3 +479,5 @@ and end-to-end performance have all been qualified. See
 ### V4.1 expert decoder work distribution
 
 `VLLM_HPU_DSV41_EXPERT_K128` (default `0`) selects the independent K128 TPC decoder for C1 top-6 BF16 MoE. It retains the prepared weight layout and full-K MME contract. Non-C1 calls use the existing operator. This experimental path requires matching native registrations and kernels; missing implementations fail explicitly. Do not combine it with FP8 decode.
+
+`VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE` (default `0`) tests rolling tensor coordinates with bounded loop expansion inside the normal-scale K128 decoder. It requires `VLLM_HPU_DSV41_EXPERT_K128`, keeps the same prepared weights and BF16 MME interface, and leaves the general-scale decoder intact. Set it before process startup and use a separate recipe cache; its native kernel must be included in the verified build manifest. It is not a qualified performance default.
