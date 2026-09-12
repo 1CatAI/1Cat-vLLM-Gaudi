@@ -33,18 +33,35 @@ static inline float128 dsv41_exp_pair(float64 first, float64 second, bool64 odd)
 void main(
     tensor q,
     tensor kv,
+#ifdef DSV41_DECODED_KV_READ
+    tensor main_cache,
+#endif
     tensor indices,
     tensor attn_sink,
     tensor softmax_scale,
     tensor topk_lengths,
+#ifdef DSV41_DECODED_KV_READ
+    tensor swa_completion,
+    tensor main_completion,
+#endif
     tensor output,
     tensor max_logits,
-    tensor softmax_lse)
+    tensor softmax_lse
+#ifdef DSV41_DECODED_KV_READ
+    , int swa_offset, int main_rows
+#endif
+    )
 {
     const uchar256 broadcast_lane_zero = 0x80;
     const int5 index_start = get_index_space_offset();
     const int5 index_end = get_index_space_size() + index_start;
+#ifdef DSV41_DECODED_KV_READ
+    const int sequence_length = 512 + main_rows;
+    const bool ready = s_i32_ld_g(gen_addr((int5){0}, swa_completion)) >= 0 &&
+                       s_i32_ld_g(gen_addr((int5){0}, main_completion)) >= 0;
+#else
     const int sequence_length = get_dim_size(kv, 1);
+#endif
     const int topk_width = get_dim_size(indices, 0);
 #if DSV41_ATTENTION_PAIRED_EXP
     const bool64 odd_lanes = v_u32_cmp_eq_b(read_lane_id_4b_b() & 1, 1);
@@ -58,6 +75,9 @@ void main(
         int5 length_coords = {batch, 0, 0, 0, 0};
         int valid_width =
             s_i32_ld_g(gen_addr(length_coords, topk_lengths));
+#ifdef DSV41_DECODED_KV_READ
+        if (!ready) valid_width = 0;
+#endif
         if (valid_width < 0) {
             valid_width = 0;
         }
@@ -93,7 +113,17 @@ void main(
                 for (int chunk = 0; chunk < DSV4_VECTOR_COUNT; ++chunk) {
                     int5 kv_coords = {
                         chunk * DSV4_BF16_VECTOR_WIDTH, kv_index, 0, 0, 0};
+#ifdef DSV41_DECODED_KV_READ
+                    if (kv_index < 512) {
+                        kv_coords[1] = swa_offset + kv_index;
+                        kv_vectors[chunk] = v_bf16_ld_tnsr_b(kv_coords, kv);
+                    } else {
+                        kv_coords[1] = kv_index - 512;
+                        kv_vectors[chunk] = v_bf16_ld_tnsr_b(kv_coords, main_cache);
+                    }
+#else
                     kv_vectors[chunk] = v_bf16_ld_tnsr_b(kv_coords, kv);
+#endif
                     dot_accum = v_bf16_mac_acc32_b(
                         q_vectors[chunk], kv_vectors[chunk], dot_accum,
                         (e_no_negation) << 1);

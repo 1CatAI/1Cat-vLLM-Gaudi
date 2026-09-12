@@ -20,8 +20,12 @@ from map_deepseek_v41_trace_contracts import graph_nodes, tensor
 
 
 def io(node, prefix):
-    return [tensor(v) for k, v in sorted(node["attrs"].items(), key=lambda pair: (
-        int(pair[0].split(":")[-1]) if pair[0].startswith(prefix) else -1)) if k.startswith(prefix)]
+    return [
+        tensor(v)
+        for k, v in sorted(node["attrs"].items(),
+                           key=lambda pair: (int(pair[0].split(":")[-1]) if pair[0].startswith(prefix) else -1))
+        if k.startswith(prefix)
+    ]
 
 
 def classify(node, kernel, inputs, outputs):
@@ -32,6 +36,10 @@ def classify(node, kernel, inputs, outputs):
         return "mHC", "FP32 控制投影"
     if "deepseek_v41_rope" in kernel or "deepseek_v41_c1_indices" in kernel:
         return "CSA2", "C1 RoPE/可见索引准备"
+    if "deepseek_v41_swa_decoded_write" in kernel:
+        return "CSA2", "SWA 编码/scale/packed 写入及增量 BF16 KV 副本写入"
+    if "deepseek_v41_fp4_decoded_write" in kernel:
+        return "CSA2", "FP4 主 KV/index 编码写入及增量 BF16 KV 副本写入"
     if "deepseek_v41_swa_pack" in kernel:
         return "CSA2", "SWA 精确 FP8 编码/scale/缓存写入"
     if "deepseek_v41_fp4_cache_write" in kernel:
@@ -60,9 +68,14 @@ def classify(node, kernel, inputs, outputs):
         if "/attention/" in name:
             if inputs and inputs[0]["dtype"] == "float32":
                 return "Attention", "Compressor FP32 投影；wkv/wgate 绑定尚待逐节点还原"
-            shapes = {(1280, 5120): "wq_a 输入投影", (16384, 1280): "wq_b Q 展开",
-                      (512, 5120): "wkv 输入投影", (5120, 4096): "wo_b 输出投影",
-                      (128, 512): "index K 投影", (1024, 4096): "wo_a 分组输出 GEMM"}
+            shapes = {
+                (1280, 5120): "wq_a 输入投影",
+                (16384, 1280): "wq_b Q 展开",
+                (512, 5120): "wkv 输入投影",
+                (5120, 4096): "wo_b 输出投影",
+                (128, 512): "index K 投影",
+                (1024, 4096): "wo_a 分组输出 GEMM"
+            }
             if "/bmm" in name:
                 return "Attention", "wo_a 分组输出 BMM"
             return "Attention", shapes.get(tuple(weight), "Compressor/其他投影，见节点合同")
@@ -71,7 +84,7 @@ def classify(node, kernel, inputs, outputs):
         if weight and weight[0] == 64640:
             return "输出头", "TP 词表投影"
         return "矩阵计算待细分", "源节点及完整操作数已保留"
-    if "sparse_attn" in kernel:
+    if "sparse_attn" in kernel or "decoded_attn" in kernel:
         return "Attention", "顺序 QK/online softmax/V 累加"
     if "sinkhorn" in kernel:
         return "mHC", "4×4 Sinkhorn"
@@ -122,8 +135,10 @@ def write_csv(path, rows):
     with path.open("w") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
         writer.writeheader()
-        writer.writerows({k: json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v
-                         for k, v in row.items()} for row in rows)
+        writer.writerows({
+            k: json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v
+            for k, v in row.items()
+        } for row in rows)
 
 
 def analyze(root, rank, common):
@@ -131,8 +146,10 @@ def analyze(root, rank, common):
     inv = json.loads((path / "inventory.json").read_text())
     recipes = json.loads((path / "recipe-symbols.json").read_text())["recipes"]
     mapped = symbols(inv, recipes)
-    contracts = {(str(row["recipe_id"]), row["symbol"]["device_type"], row["symbol"]["full_context_id"]): row
-                 for row in json.loads((path / "node-contracts.json").read_text())}
+    contracts = {
+        (str(row["recipe_id"]), row["symbol"]["device_type"], row["symbol"]["full_context_id"]): row
+        for row in json.loads((path / "node-contracts.json").read_text())
+    }
     bundle_categories = collections.defaultdict(set)
     for contract in contracts.values():
         symbol = contract["symbol"]
@@ -166,8 +183,8 @@ def analyze(root, rank, common):
                 raise RuntimeError("mHC capture order differs from actual compiler symbols")
             mhc_recipes.add(rid)
             provenance.append(dict(program=entry, synapse_recipe=rid, enqueue=enqueue))
-    (path / "mhc-partition-provenance.json").write_text(json.dumps(
-        dict(plans=plan_sources, bindings=provenance), indent=2) + "\n")
+    (path / "mhc-partition-provenance.json"
+     ).write_text(json.dumps(dict(plans=plan_sources, bindings=provenance), indent=2) + "\n")
     frequency = collections.Counter(row[2].split(":")[0] for row in own["capture_order"])
     windows, tokens = common["windows_us"], common["tokens"]
     ends = [w[1] for w in windows]
@@ -184,8 +201,8 @@ def analyze(root, rank, common):
             if win >= len(windows):
                 continue
             node, symbol = inv["nodes"][index], mapped.get(index)
-            key = ((node["recipe"].split(":")[0], symbol["device_type"], symbol["full_context_id"])
-                   if symbol else (node["recipe"], -1, index))
+            key = ((node["recipe"].split(":")[0], symbol["device_type"], symbol["full_context_id"]) if symbol else
+                   (node["recipe"], -1, index))
             kernel = symbol["kernel"] if symbol else node["kernel"]
             counted = False
             while win < len(windows) and windows[win][0] < start + duration:
@@ -218,9 +235,15 @@ def analyze(root, rank, common):
                                    if n["name"] == node["node"] and n["op"] == node["kernel"])
             if len(options) == 1:
                 graph, match = options[0]
-                contract = {"inputs": io(match, "inputTensor:"), "outputs": io(match, "outputTensor:"),
-                            "graph": {"path": str(graph), "sha256": hashlib.sha256(graph.read_bytes()).hexdigest()},
-                            "attributes": match["attrs"]}
+                contract = {
+                    "inputs": io(match, "inputTensor:"),
+                    "outputs": io(match, "outputTensor:"),
+                    "graph": {
+                        "path": str(graph),
+                        "sha256": hashlib.sha256(graph.read_bytes()).hexdigest()
+                    },
+                    "attributes": match["attrs"]
+                }
         kernel = symbol["kernel"] if symbol else node["kernel"]
         source = symbol["node"] if symbol else node["node"]
         inputs, outputs = (contract.get(part, []) if contract else [] for part in ("inputs", "outputs"))
@@ -247,14 +270,27 @@ def analyze(root, rank, common):
             if reason:
                 missing.append(reason)
         duration = union(spans)
-        row = {"rank": rank, "recipe_id": key[0], "context_id": key[2], "engine": node["engine"],
-               "category": category, "purpose": purpose, "kernel": kernel, "source_node": source,
-               "mean_invocation_ms": statistics.mean(samples) if samples else None,
-               "complete_invocation_samples": len(samples), "observed_calls": count if not missing else None,
-               "calls_per_token": count / len(tokens) if not missing else None,
-               "observed_lane_packets": packet_counts[key], "count_limitations": sorted(set(missing)),
-               "activity_ms_per_token": duration / len(tokens) / 1000, "period_pct": duration / period * 100,
-               "inputs": inputs, "outputs": outputs, "compiler_contract": contract}
+        row = {
+            "rank": rank,
+            "recipe_id": key[0],
+            "context_id": key[2],
+            "engine": node["engine"],
+            "category": category,
+            "purpose": purpose,
+            "kernel": kernel,
+            "source_node": source,
+            "mean_invocation_ms": statistics.mean(samples) if samples else None,
+            "complete_invocation_samples": len(samples),
+            "observed_calls": count if not missing else None,
+            "calls_per_token": count / len(tokens) if not missing else None,
+            "observed_lane_packets": packet_counts[key],
+            "count_limitations": sorted(set(missing)),
+            "activity_ms_per_token": duration / len(tokens) / 1000,
+            "period_pct": duration / period * 100,
+            "inputs": inputs,
+            "outputs": outputs,
+            "compiler_contract": contract
+        }
         row["classification_provenance"] = origin
         details.append(row)
         dtype_shape = json.dumps([[(v["dtype"], v["shape"]) for v in part] for part in (inputs, outputs)])
@@ -270,32 +306,49 @@ def analyze(root, rank, common):
         unknown = any(row["observed_calls"] is None for row, _, _ in items)
         count = None if unknown else sum(row["observed_calls"] for row, _, _ in items)
         duration = union(spans)
-        summary.append({"rank": rank, "category": key[0], "purpose": key[1], "engine": key[2], "kernel": key[3],
-                        "dtype_shapes": json.loads(key[4]),
-                        "mean_invocation_ms": statistics.mean(samples) if samples else None,
-                        "complete_invocation_samples": len(samples), "observed_calls": count,
-                        "calls_per_token": count / len(tokens) if count is not None else None,
-                        "activity_ms_per_token": duration / len(tokens) / 1000, "period_pct": duration / period * 100,
-                        "node_keys": [[r["recipe_id"], r["context_id"]] for r, _, _ in items]})
+        summary.append({
+            "rank": rank,
+            "category": key[0],
+            "purpose": key[1],
+            "engine": key[2],
+            "kernel": key[3],
+            "dtype_shapes": json.loads(key[4]),
+            "mean_invocation_ms": statistics.mean(samples) if samples else None,
+            "complete_invocation_samples": len(samples),
+            "observed_calls": count,
+            "calls_per_token": count / len(tokens) if count is not None else None,
+            "activity_ms_per_token": duration / len(tokens) / 1000,
+            "period_pct": duration / period * 100,
+            "node_keys": [[r["recipe_id"], r["context_id"]] for r, _, _ in items]
+        })
     scale = len(tokens) * 1000
     tpc, mme = union(engines["TPC"]), union(engines["MME"])
     compute = union(engines["TPC"] + engines["MME"])
     all_device = union([span for spans in engines.values() for span in spans])
-    partition = {"TPC_only_ms": (compute - mme) / scale, "MME_only_ms": (compute - tpc) / scale,
-                 "TPC_MME_overlap_ms": (tpc + mme - compute) / scale,
-                 "other_recorded_device_only_ms": (all_device - compute) / scale,
-                 "unattributed_or_other_stage_ms": (period - all_device) / scale}
+    partition = {
+        "TPC_only_ms": (compute - mme) / scale,
+        "MME_only_ms": (compute - tpc) / scale,
+        "TPC_MME_overlap_ms": (tpc + mme - compute) / scale,
+        "other_recorded_device_only_ms": (all_device - compute) / scale,
+        "unattributed_or_other_stage_ms": (period - all_device) / scale
+    }
     assert abs(sum(partition.values()) - period / scale) < 1e-8
     details.sort(key=lambda r: -r["activity_ms_per_token"])
     summary.sort(key=lambda r: -r["activity_ms_per_token"])
     write_csv(path / "kernel-breakdown.csv", summary)
     (path / "node-breakdown.json").write_text(json.dumps(details, ensure_ascii=False, indent=2) + "\n")
-    result = {"rank": rank, "tokens": tokens, "period_ms": period / scale, "partition": partition,
-              "trace_sha256": inv["trace_sha256"], "measured_nodes": len(details),
-              "unmatched_nodes": sum(r["compiler_contract"] is None for r in details),
-              "nodes_with_unknown_calls": sum(r["observed_calls"] is None for r in details),
-              "status": "all activity retained; unknown invocation boundaries and fused origins remain explicit",
-              "kernel_rows": summary}
+    result = {
+        "rank": rank,
+        "tokens": tokens,
+        "period_ms": period / scale,
+        "partition": partition,
+        "trace_sha256": inv["trace_sha256"],
+        "measured_nodes": len(details),
+        "unmatched_nodes": sum(r["compiler_contract"] is None for r in details),
+        "nodes_with_unknown_calls": sum(r["observed_calls"] is None for r in details),
+        "status": "all activity retained; unknown invocation boundaries and fused origins remain explicit",
+        "kernel_rows": summary
+    }
     (path / "kernel-breakdown.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
     print(json.dumps({k: v for k, v in result.items() if k != "kernel_rows"}), flush=True)
 

@@ -33,9 +33,11 @@ def main(rank, ROOT, OUT):
     for key, r in bykey.items():
         if 'mxfp4_prepared_dequant' in r['kernel']:
             reasons[key] = 'expert_decode'
+        elif 'decoded_write' in r['kernel']:
+            reasons[key] = 'incremental_kv_write'
         elif 'selected_kv' in r['kernel']:
             reasons[key] = 'selected_kv'
-        elif 'sparse_attn' in r['kernel'] and 'bf16' in r['kernel']:
+        elif ('sparse_attn' in r['kernel'] or 'decoded_attn' in r['kernel']) and 'bf16' in r['kernel']:
             reasons[key] = 'sparse_attention'
         elif r['engine'] == 'MME' and r['category'] == '路由专家':
             reasons[key] = 'expert_mme'

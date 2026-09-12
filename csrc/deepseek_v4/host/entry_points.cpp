@@ -38,6 +38,7 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVE
 #include "deepseek_v41_fp4_pack_gaudi2.hpp"
 #include "deepseek_v41_csa2_prep_gaudi2.hpp"
 #include "deepseek_v41_selected_kv_gaudi2.hpp"
+#include "deepseek_v41_decoded_kv_gaudi2.hpp"
 #include "deepseek_v41_control_gemv_gaudi2.hpp"
 #include "deepseek_v41_mxfp4_prepared_dequant_fp8_gaudi2.hpp"
 #include "deepseek_v41_dynamic_quant_bf16_gaudi2.hpp"
@@ -45,6 +46,9 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVE
 #include "deepseek_v4_fill_short_topk_i32_gaudi2.hpp"
 
 enum KernelIndex {
+    GAUDI2_KERNEL_DEEPSEEK_V41_SWA_DECODED_WRITE,
+    GAUDI2_KERNEL_DEEPSEEK_V41_FP4_DECODED_WRITE,
+    GAUDI2_KERNEL_DEEPSEEK_V41_DECODED_ATTN,
     GAUDI2_KERNEL_DEEPSEEK_V4_SPARSE_ATTN_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V4_SPARSE_ATTN_BF16_LENGTHS,
     GAUDI2_KERNEL_DEEPSEEK_V41_SPARSE_ATTN_PAIRED_EXP,
@@ -393,6 +397,12 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
            fp4g16.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_FP4_PACK_G16_BF16].name);
            fp4g32.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_FP4_PACK_G32_BF16].name);
            fp4write.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_FP4_CACHE_WRITE_BF16].name);
+           DeepseekV41DecodedKVGaudi2 decodedSwa(DeepseekV41DecodedKVGaudi2::SWA_WRITE);
+           DeepseekV41DecodedKVGaudi2 decodedFp4(DeepseekV41DecodedKVGaudi2::FP4_WRITE);
+           DeepseekV41DecodedKVGaudi2 decodedAttn(DeepseekV41DecodedKVGaudi2::ATTENTION);
+           decodedSwa.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_SWA_DECODED_WRITE].name);
+           decodedFp4.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_FP4_DECODED_WRITE].name);
+           decodedAttn.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_DECODED_ATTN].name);
            DeepseekV41SelectedKVGaudi2 validOrdered(1, true), validCacheOrdered(2, true);
            DeepseekV41SelectedKVGaudi2 vec(0, false, true), vecOrdered(1, true, true), vecCache(2, true, true);
            vec.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_KV_VEC_BF16].name);
@@ -814,6 +824,12 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
         return fillShortTopkInstance.GetGcDefinitions(params, instance);
     }
 
+    for (auto mode : {DeepseekV41DecodedKVGaudi2::SWA_WRITE, DeepseekV41DecodedKVGaudi2::FP4_WRITE,
+                      DeepseekV41DecodedKVGaudi2::ATTENTION}) {
+        DeepseekV41DecodedKVGaudi2 decoded(mode);
+        decoded.GetKernelName(kernelName);
+        if (strcmp(params->guid.name, kernelName) == 0) return decoded.GetGcDefinitions(params, instance);
+    }
     DeepseekV41Mxfp4PreparedDequantFP8Gaudi2 v41fp8;
     v41fp8.GetKernelName(kernelName);
     if (strcmp(params->guid.name, kernelName) == 0) return v41fp8.GetGcDefinitions(params, instance);

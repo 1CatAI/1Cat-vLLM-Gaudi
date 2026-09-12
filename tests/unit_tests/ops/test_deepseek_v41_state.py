@@ -55,13 +55,15 @@ def test_single_token_prefill_keeps_disjoint_transport_buffers(monkeypatch):
     from vllm_gaudi.v1.worker import deepseek_v41_runner as runner
     sent = []
     monkeypatch.setattr(runner.envs, "VLLM_HPU_DSV41_PACKED_PP", True)
-    monkeypatch.setattr(runner, "get_pp_group", lambda: SimpleNamespace(
-        is_first_rank=True, ranks=[0, 2], device_group=None))
-    monkeypatch.setattr(runner.dist, "isend", lambda value, **kwargs: (
-        sent.append(value), SimpleNamespace(wait=lambda: None))[1])
+    monkeypatch.setattr(runner, "get_pp_group",
+                        lambda: SimpleNamespace(is_first_rank=True, ranks=[0, 2], device_group=None))
+    monkeypatch.setattr(runner.dist, "isend", lambda value, **kwargs:
+                        (sent.append(value), SimpleNamespace(wait=lambda: None))[1])
     buffers = runner.PPBuffers("cpu", dspark=False)
-    values = {"hidden_states": torch.zeros(1, 4, 5120, dtype=torch.bfloat16),
-              "pre_mix": torch.zeros(1, 4, dtype=torch.float32)}
+    values = {
+        "hidden_states": torch.zeros(1, 4, 5120, dtype=torch.bfloat16),
+        "pre_mix": torch.zeros(1, 4, dtype=torch.float32)
+    }
     buffers.exchange(values, 1, decode=False)
     assert len(sent) == 2 and buffers.packed.generation == 0
     assert sent[0].untyped_storage()._cdata != sent[1].untyped_storage()._cdata
@@ -78,6 +80,7 @@ def test_direct_token_binding_consumes_updates_and_rejects_foreign_request_prefi
     consumed = []
 
     class Model:
+
         def prepare_step(self, *args, **kwargs):
             pass
 
@@ -130,7 +133,7 @@ def test_engine_registers_opaque_state_without_worker_model_initialization(monke
 
 
 def test_pp_scheduler_reconciliation_does_not_append_broadcast_tokens_twice():
-    state = RequestState("a", [10, 11], [], None, ([1],), output=[12, 13])
+    state = RequestState("a", [10, 11], [], None, ([1], ), output=[12, 13])
     state.reconcile(2, [12, 13])
     assert state.tokens == [10, 11, 12, 13]
     state.reconcile(1, [12])
@@ -196,10 +199,22 @@ def test_target_only_loading_never_reads_or_allocates_draft_tensors(tmp_path, mo
     (tmp_path / "config.json").write_text(json.dumps(config))
 
     class Shard:
+
         def __init__(self, *args):
-            self.specs = {"head.weight": {"dtype": "BF16", "shape": [3, 2]},
-                          "norm.weight": {"dtype": "BF16", "shape": [2]},
-                          "mtp.embed.weight": {"dtype": "BF16", "shape": [3, 2]}}
+            self.specs = {
+                "head.weight": {
+                    "dtype": "BF16",
+                    "shape": [3, 2]
+                },
+                "norm.weight": {
+                    "dtype": "BF16",
+                    "shape": [2]
+                },
+                "mtp.embed.weight": {
+                    "dtype": "BF16",
+                    "shape": [3, 2]
+                }
+            }
             self.specs.update({f"layers.{i}.weight": {"dtype": "BF16", "shape": [2]} for i in range(20, 40)})
             self.manifest = {"normal_scales": {f"layers.{i}.ffn.experts": [True, True] for i in range(20, 40)}}
             self.reads = []
@@ -212,6 +227,7 @@ def test_target_only_loading_never_reads_or_allocates_draft_tensors(tmp_path, mo
             pass
 
     class Layer(torch.nn.Module):
+
         def __init__(self, weights, config, layer, *args, collect_target_state=False):
             super().__init__()
             self.layer, self.collect_target_state = layer, collect_target_state
@@ -232,8 +248,8 @@ def test_target_only_loading_never_reads_or_allocates_draft_tensors(tmp_path, mo
     assert stage.draft is None and not hasattr(stage.weights, "mtp")
     assert len(stage.layers) == 20 and len(stage.shard.reads) == 22
     assert not any(name.startswith("mtp.") for name in stage.shard.reads)
-    output, _, aux = stage(torch.ones(1, 4, 2, dtype=torch.bfloat16), torch.full((1, 4), 0.25),
-                           torch.tensor([0]), torch.tensor([1]), ())
+    output, _, aux = stage(torch.ones(1, 4, 2, dtype=torch.bfloat16), torch.full((1, 4), 0.25), torch.tensor([0]),
+                           torch.tensor([1]), ())
     assert output.shape == (1, 2) and aux is None
 
 
@@ -249,7 +265,7 @@ def test_non_speculative_sampling_commits_exactly_one_real_token():
                                 commit=torch.tensor([1, 1, 1, 1]))
     runner.pp.commit_token = runner.pp.commit[3:4]
     runner.model = SimpleNamespace(complete_step=committed.append)
-    state = RequestState("c1", [10], [], None, ([1],))
+    state = RequestState("c1", [10], [], None, ([1], ))
     runner.pending = state, 1, 1, 1, [], True, torch.tensor([[1]])
     result = runner._sample_single()
     assert result.sampled_token_ids == [[1]] and state.output == [1]
@@ -327,6 +343,7 @@ def test_all_prefill_tails_across_five_groups_use_bounded_compile_cache(monkeypa
     from vllm_gaudi.models.deepseek_v41_program import CompiledStage
 
     class Layer(torch.nn.Module):
+
         def __init__(self, layer):
             super().__init__()
             self.layer = layer
@@ -336,7 +353,10 @@ def test_all_prefill_tails_across_five_groups_use_bounded_compile_cache(monkeypa
             return residual + self.layer + positions[:, None, None], pre, None
 
     stage = SimpleNamespace(layers=torch.nn.ModuleList(Layer(i) for i in range(20)),
-                            pp_rank=0, config={"text_config": {"rms_norm_eps": 1e-20}})
+                            pp_rank=0,
+                            config={"text_config": {
+                                "rms_norm_eps": 1e-20
+                            }})
     compiled_graphs = []
 
     def backend(graph, inputs):
@@ -344,8 +364,9 @@ def test_all_prefill_tails_across_five_groups_use_bounded_compile_cache(monkeypa
         return graph.forward
 
     compile_fn = torch.compile
-    monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: compile_fn(
-        fn, backend=backend, fullgraph=kwargs["fullgraph"], dynamic=kwargs["dynamic"]))
+    monkeypatch.setattr(
+        torch, "compile",
+        lambda fn, **kwargs: compile_fn(fn, backend=backend, fullgraph=kwargs["fullgraph"], dynamic=kwargs["dynamic"]))
     previous = (torch._dynamo.config.cache_size_limit, torch._dynamo.config.accumulated_cache_size_limit)
     torch._dynamo.reset()
     try:
@@ -363,7 +384,34 @@ def test_all_prefill_tails_across_five_groups_use_bounded_compile_cache(monkeypa
             if before:
                 assert len(compiled_graphs) == before
         assert len(compiled_graphs) == 30
-        assert previous == (torch._dynamo.config.cache_size_limit,
-                            torch._dynamo.config.accumulated_cache_size_limit)
+        assert previous == (torch._dynamo.config.cache_size_limit, torch._dynamo.config.accumulated_cache_size_limit)
     finally:
         torch._dynamo.reset()
+
+
+def test_decoded_kv_state_capture_clear_and_block_rebinding():
+    from vllm_gaudi.ops.deepseek_v41_replay import stage_state_tensors
+    program = torch.nn.Module()
+    program.pp_rank, program.generation, program.replay_owner = 0, 0, None
+    program.shared = torch.nn.Module()
+    program.shared.register_buffer("decoded_swa", torch.zeros(1024, 512, dtype=torch.bfloat16))
+    program.shared.register_buffer("decoded_main", torch.zeros(768, 512, dtype=torch.bfloat16))
+    program.reader = program.shared
+    state = StageStateBlocks(program)
+    state.allocate(2, "cpu")
+    assert len(state.bindings) == 2
+    assert len(stage_state_tensors(program)) == 2
+    captured = tuple(x.clone() for x in stage_state_tensors(program))
+    program.shared.decoded_swa.fill_(3.)
+    program.shared.decoded_main.fill_(5.)
+    for destination, saved in zip(stage_state_tensors(program), captured, strict=True):
+        destination.copy_(saved)
+    assert not program.reader.decoded_swa.any() and not program.reader.decoded_main.any()
+    program.shared.decoded_main[0, 0] = 17
+    state.bind(1)
+    assert not program.reader.decoded_main.any()
+    state.bind(0)
+    assert program.reader.decoded_main[0, 0] == 17
+    state.clear()
+    assert not program.reader.decoded_main.any()
+    assert state.allocated_bytes == 2 * (1024 + 768) * 512 * 2

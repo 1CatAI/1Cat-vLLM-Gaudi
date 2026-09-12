@@ -24,8 +24,10 @@ def tags(row):
         names.append('woa_mme')
     if row['engine'] == 'MME' and cat == 'Attention':
         names.append('attention_all_projection_mme')
-    if 'sparse_attn' in k and 'bf16' in k:
+    if ('sparse_attn' in k or 'decoded_attn' in k) and 'bf16' in k:
         names.append('sparse_attention')
+    if 'decoded_write' in k:
+        names.append('incremental_kv_write')
     if 'selected_kv' in k:
         names.append('selected_kv')
     if 'generate_bitonic_chunks' in k:
@@ -200,7 +202,7 @@ def main():
     unions = {tag: merge(v) for tag, v in global_spans.items()}
     chains = {
         'expert_decode_and_mme': ['expert_decode', 'expert_mme'],
-        'selected_kv_and_attention': ['selected_kv', 'sparse_attention'],
+        'selected_kv_and_attention': ['selected_kv', 'incremental_kv_write', 'sparse_attention'],
         'woa_copy_and_mme': ['woa_copy', 'woa_mme'],
         'router_score_and_bitonic': ['router_score_mme', 'router_bitonic']
     }

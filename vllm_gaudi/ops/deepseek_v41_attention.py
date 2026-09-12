@@ -29,6 +29,15 @@ class CSA2SharedState(nn.Module):
         if not 1 <= max_length <= config["index_topk"] or max_length > 512:
             raise ValueError("This CSA2 plan requires context <= 512 and exact short-context selection")
         self.length = max_length
+        self.layer_start = layer_start
+        self.decoded_kv_state = gaudi_envs.VLLM_HPU_DSV41_DECODED_KV_STATE
+        if self.decoded_kv_state:
+            if max_length != 512 or gaudi_envs.VLLM_HPU_DSV41_DSPARK:
+                raise ValueError("Decoded KV state requires context512 and DSpark disabled")
+            # One stage-owned allocation survives request block rebinding.
+            self.register_buffer(
+                "decoded_swa",
+                torch.zeros((layer_stop - layer_start) * max_length, 512, dtype=torch.bfloat16, device=device), False)
         self.sources = nn.ModuleDict()
         self.topk = nn.ModuleDict()
         for source in config["kv_source_layer_ids"]:
@@ -40,6 +49,9 @@ class CSA2SharedState(nn.Module):
                 rows = max_length // ratio + max_length
                 cache.register_buffer("main", torch.zeros(rows, 288, dtype=torch.uint8, device=device), False)
                 cache.register_buffer("index", torch.zeros(rows, 68, dtype=torch.uint8, device=device), False)
+                if self.decoded_kv_state:
+                    cache.register_buffer("decoded_main", torch.zeros(rows, 512, dtype=torch.bfloat16, device=device),
+                                          False)
                 self.sources[str(source)] = cache
         for source in config["index_source_layer_ids"]:
             if layer_start <= source < layer_stop:
@@ -74,6 +86,14 @@ class CSA2Attention(nn.Module):
         self.selected_kv_vector = gaudi_envs.VLLM_HPU_DSV41_SELECTED_KV_VECTOR
         self.paired_exp = gaudi_envs.VLLM_HPU_DSV41_ATTENTION_PAIRED_EXP
         self.head_pair = gaudi_envs.VLLM_HPU_DSV41_ATTENTION_HEAD_PAIR
+        self.decoded_kv_state = shared.decoded_kv_state
+        if self.decoded_kv_state:
+            if not (self.c1_indices and self.selected_valid_only and self.fp4_cache_write):
+                raise ValueError("Decoded KV requires ordered C1 indices and fused packed cache writes")
+            if self.head_pair or self.paired_exp or self.selected_kv_vector:
+                raise ValueError("Decoded KV state is an independent attention candidate")
+            self.shared = shared
+            self.decoded_swa_offset = (layer - shared.layer_start) * shared.length
         if self.head_pair and self.paired_exp:
             raise ValueError("Choose one V4.1 attention variant")
         if (self.paired_exp or self.head_pair) and not (self.selected_valid_only and self.bounded_decode):
@@ -192,11 +212,18 @@ class CSA2Attention(nn.Module):
         index = rms_norm(self.linear(latent, indexer.wk), indexer.k_norm.weight, self.eps)
         index = self._rope(index, first)
         rotated = self._rope(latent, first)
+        if self.decoded_kv_state and value.shape[0] == 1:
+            return torch.ops.custom_op.custom_deepseek_v41_fp4_decoded_write_bf16_gaudi2(
+                self.cache.main, self.cache.index, rotated.contiguous(), index.contiguous(), slots.contiguous(),
+                self.cache.decoded_main)
         if self.fp4_cache_write and value.shape[0] == 1:
             return torch.ops.custom_op.custom_deepseek_v41_fp4_cache_write_bf16_gaudi2(
                 self.cache.main, self.cache.index, rotated.contiguous(), index.contiguous(), slots.contiguous())
         self.cache.index.index_copy_(0, slots.long(), pack_fp4(index, 32))
-        self.cache.main.index_copy_(0, slots.long(), pack_fp4(rotated, 16))
+        packed_main = pack_fp4(rotated, 16)
+        self.cache.main.index_copy_(0, slots.long(), packed_main)
+        if self.decoded_kv_state:
+            self.cache.decoded_main.index_copy_(0, slots.long(), unpack_fp4(packed_main))
         return None
 
     def _select(self, positions):
@@ -224,11 +251,18 @@ class CSA2Attention(nn.Module):
         kv = rms_norm(self.linear(value, self.weights.wkv), self.weights.kv_norm.weight, self.eps)
         kv = self._rope(kv, positions)
         completion = None
-        if self.swa_pack_write and value.shape[0] == 1:
+        if self.decoded_kv_state and value.shape[0] == 1:
+            completion = torch.ops.custom_op.custom_deepseek_v41_swa_decoded_write_bf16_gaudi2(
+                self.swa, kv.contiguous(), positions, self.shared.decoded_swa, self.decoded_swa_offset)
+        elif self.swa_pack_write and value.shape[0] == 1:
             completion = torch.ops.custom_op.custom_deepseek_v41_swa_pack_write_bf16_gaudi2(
                 self.swa, kv.contiguous(), positions)
         else:
-            self.swa.index_copy_(0, positions.long(), pack_swa(kv))
+            packed_swa = pack_swa(kv)
+            self.swa.index_copy_(0, positions.long(), packed_swa)
+            if self.decoded_kv_state:
+                self.shared.decoded_swa.index_copy_(0,
+                                                    positions.long() + self.decoded_swa_offset, unpack_swa(packed_swa))
         use_c1_indices = self.c1_indices and value.shape[0] == 1
         if not use_c1_indices:
             window = positions.unsqueeze(-1) - self.window + 1 + self.window_offsets.unsqueeze(0)
@@ -245,7 +279,17 @@ class CSA2Attention(nn.Module):
         if use_c1_indices:
             indices, lengths = torch.ops.custom_op.custom_deepseek_v41_c1_indices_i32_gaudi2(
                 positions, compressed_indices.contiguous(), self.ratio)
-        if self.packed_decode and value.shape[0] == 1:
+        if self.decoded_kv_state and value.shape[0] == 1:
+            main = self.cache.decoded_main if self.ratio else self.shared.decoded_swa
+            # Reuse layers are downstream of their source layer's completed
+            # attention and hidden state. Source layers additionally consume
+            # their own FP4 writer completion in this recipe.
+            main_done = compressed_completion if compressed_completion is not None else completion
+            output, _, _ = torch.ops.custom_op.custom_deepseek_v41_decoded_attn_bf16_gaudi2(
+                query.contiguous(), self.shared.decoded_swa, main, indices.contiguous(), self.weights.attn_sink,
+                self.scale, lengths.contiguous(), completion, main_done, self.decoded_swa_offset,
+                self.length // self.ratio if self.ratio else 0)
+        elif self.packed_decode and value.shape[0] == 1:
             # A SWA-width second input denotes an inactive main cache. It
             # aliases existing storage and cannot admit a compressed row.
             main = self.cache.main[:self.length // self.ratio] if self.ratio else self.swa
@@ -254,8 +298,8 @@ class CSA2Attention(nn.Module):
                 if self.paired_exp or self.head_pair:
                     if completion is None:
                         raise RuntimeError("V4.1 paired attention requires the SWA write completion")
-                    vector_options = ((self.selected_kv_vector, False, True) if self.head_pair
-                                      else (self.selected_kv_vector, True))
+                    vector_options = ((self.selected_kv_vector, False, True) if self.head_pair else
+                                      (self.selected_kv_vector, True))
                 # At context <=512, Full/Reindex/Reuse retain every visible
                 # compressed row followed by invalid padding. Keep its order.
                 if not use_c1_indices:

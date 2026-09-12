@@ -58,9 +58,13 @@ def register_state_spec(vllm_config=None):
 
 
 class StageStateBlocks:
+
     def __init__(self, program):
         self.program = program
-        mutable = {"swa", "main", "index", "indices", "candidate_pool", "kv_history", "score_history"}
+        mutable = {
+            "swa", "main", "decoded_swa", "decoded_main", "index", "indices", "candidate_pool", "kv_history",
+            "score_history"
+        }
         self.bindings, self.specs, self.allocations = {}, {}, {}
         for module_name, module in program.named_modules():
             for name, value in module.named_buffers(recurse=False):
@@ -76,8 +80,10 @@ class StageStateBlocks:
             raise ValueError("V4.1 state allocator requires at least one whole request block")
         if self.program.replay_owner is not None:
             self.program.replay_owner.close()
-        self.allocations = {name: torch.zeros((blocks, *spec.state_shape), dtype=spec.state_dtype, device=device)
-                            for name, spec in self.specs.items()}
+        self.allocations = {
+            name: torch.zeros((blocks, *spec.state_shape), dtype=spec.state_dtype, device=device)
+            for name, spec in self.specs.items()
+        }
         self.blocks, self.active = blocks, None
         self.bind(0)
 

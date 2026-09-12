@@ -41,8 +41,11 @@ int main() {
             }
         }
     }
-    assert(custom_count == 69);
+    assert(custom_count == 72);
     for (const char* required : {
+             "custom_deepseek_v41_swa_decoded_write_bf16_gaudi2",
+             "custom_deepseek_v41_fp4_decoded_write_bf16_gaudi2",
+             "custom_deepseek_v41_decoded_attn_bf16_gaudi2",
              "custom_deepseek_v41_selected_kv_vec_bf16_gaudi2",
              "custom_deepseek_v41_selected_kv_vec_ordered_bf16_gaudi2",
              "custom_deepseek_v41_selected_kv_vec_cache_bf16_gaudi2",
