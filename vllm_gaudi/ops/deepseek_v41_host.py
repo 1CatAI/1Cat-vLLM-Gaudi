@@ -10,6 +10,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from vllm_gaudi.ops.deepseek_v41_diagnostics import trace_phase
+
 from vllm_gaudi import envs as gaudi_envs
 
 from vllm_gaudi.ops.deepseek_v41_engram import (
@@ -48,6 +50,7 @@ class _TransferSlot:
         self.decode_gather_weights = self.gather.weights[:heads].reshape(1, heads, width)
         self.decode_gather_scales = self.gather.scales[:heads].reshape(1, heads, width // 32)
 
+    @trace_phase
     def fill(self, count):
         if count == 1:
             np.copyto(self.decode_weights, self.decode_gather_weights)
@@ -60,6 +63,7 @@ class _TransferSlot:
         host[:, :, width:].copy_(self.scale_view[:rows].reshape(count, heads, width // 32))
         return host, self.device[:count]
 
+    @trace_phase
     def reuse(self):
         if self.inflight:
             self.consumer_done.synchronize()
@@ -152,6 +156,7 @@ class EngramHost:
                 slot.reuse()
         self.history.reset(request_id)
 
+    @trace_phase
     def prepare(self, request_id, token_ids, image_mask=None):
         if self.closed or self.pending is not None:
             raise RuntimeError("Engram is closed or its preceding input transaction is still pending")
@@ -226,6 +231,7 @@ class EngramHost:
         self.pending = ticket
         return ticket
 
+    @trace_phase
     def complete(self, ticket, committed_inputs):
         if self.pending is not ticket or ticket.generation != self.generation:
             raise RuntimeError("Stale Engram transfer/verify completion")

@@ -4,6 +4,8 @@
 from pathlib import Path
 
 import torch
+
+from vllm_gaudi.ops.deepseek_v41_diagnostics import trace_phase
 from torch import nn
 
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_rank
@@ -78,7 +80,8 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             if not envs.VLLM_HPU_DSV41_ENGRAM_HOST_TABLE:
                 raise RuntimeError("V4.1 Engram must use the native host table; no HBM/eager fallback is available")
             self.engram_host = EngramHost(self.directory, self.tp_rank, self.device,
-                checkpoint_audit=self.extra.get("checkpoint_audit"), force_lock=self.extra.get("engram_force_lock", False))
+                checkpoint_audit=self.extra.get("checkpoint_audit"),
+                force_lock=self.extra.get("engram_force_lock", False))
             self._bind_vision()
 
     def _bind_vision(self):
@@ -148,6 +151,7 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             "pre_mix": torch.empty(batch_size, 4, dtype=torch.float32, device=device),
         })
 
+    @trace_phase
     def prepare_step(self, request_id, token_ids, *, is_decode, reset=False):
         self.step_is_decode = is_decode
         if self.pp_rank == 0:
@@ -158,6 +162,7 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             image_mask = [token in (129264, 129265) for token in token_ids]
             self.step_ticket = self.engram_host.prepare(request_id, token_ids, image_mask)
 
+    @trace_phase
     def complete_step(self, committed_inputs):
         if self.pp_rank == 0:
             if self.step_ticket is None:
@@ -165,6 +170,7 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             self.engram_host.complete(self.step_ticket, committed_inputs)
             self.step_ticket = None
 
+    @trace_phase
     def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None, **kwargs):
         del kwargs
         if not self.program.loaded:

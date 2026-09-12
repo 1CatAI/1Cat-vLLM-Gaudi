@@ -54,6 +54,16 @@ causal critical-path ownership. Resource unions overlap. Busy cores do not prove
 instruction efficiency, and engine activity does not establish peak throughput.
 The tools retain unknown invocation boundaries, resource counters and gaps.
 
+For a specific unresolved host boundary, set `VLLM_HPU_DSV41_PHASE_TRACE=1`
+before worker initialization and use a short capture with stack recording off.
+Ranges carry a hashed request ID, PP completion generation, rank, stage and
+next packet slot. Nested host ranges must be intersected with the same
+capture's device gaps; their inclusive durations are not additive. Native
+segment, collective and event IDs remain null where the host wrapper cannot
+observe them. Disabled instrumentation returns the original functions and
+adds no per-call wrapper to formal unprofiled timing. Diagnostics never change
+wait placement or error propagation.
+
 Use `compare_deepseek_v41_candidate.py PARENT_RESULT CANDIDATE_RESULT --checks
 CHECKS_JSON --output DECISION_JSON --target-ms TARGET --structural-change` to
 apply the per-round target and minimum net-gain rule. `CHECKS_JSON` records

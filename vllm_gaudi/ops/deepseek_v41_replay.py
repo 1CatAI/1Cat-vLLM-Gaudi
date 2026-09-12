@@ -6,6 +6,8 @@ import weakref
 
 import torch
 
+from vllm_gaudi.ops.deepseek_v41_diagnostics import trace_phase
+
 from vllm_gaudi.ops.tp2_model_adapter import DEEPSEEK_V41_PP0, DEEPSEEK_V41_PP1
 
 
@@ -75,6 +77,7 @@ class StageVariant(torch.nn.Module):
         self.capture_bytes = snapshot.bytes
         return snapshot
 
+    @trace_phase
     def forward(self, hidden, pre_mix, positions, input_ids, engram):
         from vllm_gaudi.ops.tp2_prepared_plan import (
             collect_prepared_group_replays,
@@ -120,6 +123,7 @@ class StageReplay:
         self.program = weakref.ref(program)
         self.variants = {}
 
+    @trace_phase
     def __call__(self, hidden, pre_mix, positions, input_ids, engram):
         tokens = input_ids.numel()
         if tokens not in ((1, 6) if self.program().dspark else (1, )):

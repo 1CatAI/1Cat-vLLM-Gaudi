@@ -8,6 +8,8 @@ Transport uses persistent HPU buffers and HCCL, with one outstanding request.
 from dataclasses import dataclass, field
 
 import torch
+
+from vllm_gaudi.ops.deepseek_v41_diagnostics import trace_phase
 import torch.distributed as dist
 
 from vllm.distributed import get_pp_group
@@ -88,11 +90,13 @@ class PPBuffers:
             from vllm_gaudi.ops.deepseek_v41_pp import PackedC1Buffers
             self.packed = PackedC1Buffers(device, native_copy=envs.VLLM_HPU_DSV41_NATIVE_PP_COPY)
 
+    @trace_phase
     def drain(self):
         for work in self.pending:
             work.wait()
         self.pending.clear()
 
+    @trace_phase
     def exchange(self, values, count, *, decode=False):
         self.drain()
         if self.packed is not None and decode and count == 1:
@@ -136,6 +140,7 @@ class PPBuffers:
         self.commits += 1
         return record[1], record[4:4 + record[2]], record[10:10 + record[3]]
 
+    @trace_phase
     def finish_single(self, consumed=None, token=None):
         if self.dspark:
             raise RuntimeError("Ordinary token completion cannot commit DSpark verification")
@@ -156,6 +161,7 @@ class PPBuffers:
         if self.packed is not None:
             self.packed.complete()
 
+    @trace_phase
     def finish_single_device(self):
         if not self.device_commit or self.dspark:
             raise RuntimeError("Device completion is not enabled for ordinary C1")
@@ -274,6 +280,7 @@ class V41ModelRunner:
         self.kv_caches = [(value,) for value in self.state.allocations.values()]
         self.kv_cache_config = config
 
+    @trace_phase
     def _bind_request(self, request):
         if len(request.block_ids) != 1 or len(request.block_ids[0]) != 1:
             raise RuntimeError("V4.1 expects one scheduler-owned whole-request state block")
@@ -288,6 +295,7 @@ class V41ModelRunner:
             self.active_request = request.req_id
             self.audit["requests"] += 1
 
+    @trace_phase
     def _update(self, scheduled):
         for req_id in scheduled.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -322,8 +330,10 @@ class V41ModelRunner:
                 or params.presence_penalty != 0 or params.frequency_penalty != 0 or params.repetition_penalty != 1
                 or params.allowed_token_ids is not None or params.bad_words or params.logit_bias
                 or params.structured_outputs is not None):
-            raise ValueError("The initial V4.1 runner supports unmodified greedy sampling; unsupported options rejected")
+            raise ValueError("The initial V4.1 runner supports unmodified greedy sampling; "
+                             "unsupported options rejected")
 
+    @trace_phase
     def _image_embeddings(self, request, start, count):
         if not request.mm_features or not self.pp.group.is_first_rank:
             return None
@@ -344,6 +354,7 @@ class V41ModelRunner:
                 destination.copy_(torch.where(mask.unsqueeze(-1), source, destination))
         return values
 
+    @trace_phase
     def _forward(self, request_id, tokens, start, *, decode, reset=False, request=None):
         count = len(tokens)
         ids, positions = self.input_views[count], self.position_views[count]
@@ -399,6 +410,7 @@ class V41ModelRunner:
         return result
 
     @torch.inference_mode()
+    @trace_phase
     def execute_model(self, scheduled):
         if self.pending is not None:
             raise RuntimeError("Previous V4.1 execution has not completed sampling/verify")
@@ -442,6 +454,7 @@ class V41ModelRunner:
         return None
 
     @torch.inference_mode()
+    @trace_phase
     def sample_tokens(self, grammar_output=None):
         if grammar_output is not None:
             raise ValueError("V4.1 prepared greedy verification does not support grammar sampling")
@@ -479,6 +492,7 @@ class V41ModelRunner:
         return ModelRunnerOutput(req_ids=[request.req_id], req_id_to_index={request.req_id: 0},
                                  sampled_token_ids=[output])
 
+    @trace_phase
     def _sample_single(self):
         request, start, count, last_count, proposed, need_sample, selected = self.pending
         if proposed:
