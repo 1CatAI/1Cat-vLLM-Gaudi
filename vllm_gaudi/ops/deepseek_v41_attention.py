@@ -73,7 +73,10 @@ class CSA2Attention(nn.Module):
         self.selected_valid_only = gaudi_envs.VLLM_HPU_DSV41_SELECTED_VALID_ONLY
         self.selected_kv_vector = gaudi_envs.VLLM_HPU_DSV41_SELECTED_KV_VECTOR
         self.paired_exp = gaudi_envs.VLLM_HPU_DSV41_ATTENTION_PAIRED_EXP
-        if self.paired_exp and not (self.selected_valid_only and self.bounded_decode):
+        self.head_pair = gaudi_envs.VLLM_HPU_DSV41_ATTENTION_HEAD_PAIR
+        if self.head_pair and self.paired_exp:
+            raise ValueError("Choose one V4.1 attention variant")
+        if (self.paired_exp or self.head_pair) and not (self.selected_valid_only and self.bounded_decode):
             raise ValueError("V4.1 paired exponentials require the ordered bounded attention path")
         if self.selected_kv_vector and not self.selected_valid_only:
             raise ValueError("V4.1 vector selected KV requires SELECTED_VALID_ONLY")
@@ -248,10 +251,11 @@ class CSA2Attention(nn.Module):
             main = self.cache.main[:self.length // self.ratio] if self.ratio else self.swa
             if self.bounded_decode:
                 vector_options = (True, ) if self.selected_kv_vector else ()
-                if self.paired_exp:
+                if self.paired_exp or self.head_pair:
                     if completion is None:
                         raise RuntimeError("V4.1 paired attention requires the SWA write completion")
-                    vector_options = (self.selected_kv_vector, True)
+                    vector_options = ((self.selected_kv_vector, False, True) if self.head_pair
+                                      else (self.selected_kv_vector, True))
                 # At context <=512, Full/Reindex/Reuse retain every visible
                 # compressed row followed by invalid padding. Keep its order.
                 if not use_c1_indices:

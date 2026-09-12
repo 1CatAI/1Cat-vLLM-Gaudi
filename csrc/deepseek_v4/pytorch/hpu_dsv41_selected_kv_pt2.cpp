@@ -14,6 +14,8 @@ constexpr auto kAttentionSchema = "custom_op::custom_deepseek_v41_packed_attenti
 constexpr auto kLengthsSchema = "custom_op::custom_deepseek_v41_packed_attention_bf16_lengths_gaudi2";
 constexpr auto kPairExpGuid = "custom_deepseek_v41_sparse_attn_pair_exp_bf16_gaudi2";
 constexpr auto kPairExpSchema = "custom_op::custom_deepseek_v41_sparse_attn_pair_exp_bf16_gaudi2";
+constexpr auto kHeadPairGuid = "custom_deepseek_v41_sparse_attn_head_pair_bf16_gaudi2";
+constexpr auto kHeadPairSchema = "custom_op::custom_deepseek_v41_sparse_attn_head_pair_bf16_gaudi2";
 using Pair = std::tuple<at::Tensor, at::Tensor>;
 
 void tensor_contract(const at::Tensor& value, at::ScalarType dtype, const at::Device& device) {
@@ -87,6 +89,8 @@ public:
         const bool valid_only = ordered_ && stack.at(compressed_ ? 9 : 8).toBool();
         const bool vector = ordered_ && stack.at(compressed_ ? 10 : 9).toBool();
         const bool paired_exp = ordered_ && stack.at(compressed_ ? 11 : 10).toBool();
+        const bool head_pair = ordered_ && stack.at(compressed_ ? 12 : 11).toBool();
+        TORCH_CHECK(!(paired_exp && head_pair), "Choose one attention variant");
         TORCH_CHECK(!vector || valid_only, "Vector selected KV requires the ordered valid-only consumer");
         const char* guid = vector ? (compressed_ ? "custom_deepseek_v41_selected_kv_vec_cache_bf16_gaudi2"
                                                  : "custom_deepseek_v41_selected_kv_vec_ordered_bf16_gaudi2")
@@ -98,19 +102,22 @@ public:
             {{{k,512}, at::kBFloat16}, {{1,k}, at::kInt}}});
         std::vector<synTensor> inputs{syn_in(0), selected.at(0).get(), selected.at(1).get(), syn_in(4), syn_in(5)};
         if (lengths_) inputs.push_back(syn_in(6));
-        auto result = BuildNode(this, graph, {paired_exp ? kPairExpGuid : lengths_ ? "custom_deepseek_v4_sparse_attn_bf16_lengths_gaudi2"
+        auto result = BuildNode(this, graph, {head_pair ? kHeadPairGuid : paired_exp ? kPairExpGuid : lengths_ ? "custom_deepseek_v4_sparse_attn_bf16_lengths_gaudi2"
                                                      : "custom_deepseek_v4_sparse_attn_bf16_gaudi2", inputs,
             {{{1,32,512}, at::kBFloat16, 0}, {{1,32}, at::kFloat}, {{1,32}, at::kFloat}}});
         syn_out(0) = std::move(result.at(0));
     }
 };
 const bool registered = [] {
-    habana::custom_op::registerUserCustomOp(kPairExpSchema, kPairExpGuid, [](const at::Stack& stack) {
+    for (const auto& descriptor : {std::make_pair(kPairExpSchema, kPairExpGuid),
+                                   std::make_pair(kHeadPairSchema, kHeadPairGuid)}) {
+    habana::custom_op::registerUserCustomOp(descriptor.first, descriptor.second, [](const at::Stack& stack) {
         const auto& q = stack.at(0).toTensor();
         return habana::PartialOutputMetaDataVector{
             {at::kBFloat16, q.sizes().vec()}, {at::kFloat, {q.size(0), q.size(1)}},
             {at::kFloat, {q.size(0), q.size(1)}}};
     }, nullptr);
+    }
     for (int mode : {0, 1, 2, 3, 4}) {
         const bool attention = mode != 0, lengths = mode >= 2, ordered = mode >= 3, compressed = mode == 4;
         const auto schema = compressed ? kCacheOrderedSchema : ordered ? kOrderedSchema : lengths ? kLengthsSchema : attention ? kAttentionSchema : kGatherSchema;
@@ -151,8 +158,9 @@ template<bool Meta> at::Tensor attention_lengths(const at::Tensor& q, const at::
 }
 template<bool Meta> at::Tensor attention_ordered_lengths(const at::Tensor& q, const at::Tensor& swa,
     const at::Tensor& main, const at::Tensor& ids, const at::Tensor& sink, const at::Tensor& scale,
-    const at::Tensor& lengths, const at::Tensor& completion, bool valid_only, bool vector, bool paired_exp) {
-    const at::Stack stack{q,swa,main,ids,sink,scale,lengths,completion,valid_only,vector,paired_exp};
+    const at::Tensor& lengths, const at::Tensor& completion, bool valid_only, bool vector, bool paired_exp, bool head_pair) {
+    TORCH_CHECK(!(paired_exp && head_pair), "Choose one attention variant");
+    const at::Stack stack{q,swa,main,ids,sink,scale,lengths,completion,valid_only,vector,paired_exp,head_pair};
     TORCH_CHECK(!vector || valid_only, "Vector selected KV requires valid_only"); slots(stack, true, true, true);
     if (Meta) return at::empty_like(q);
     TORCH_CHECK(registered && q.device().type() == at::kHPU);
@@ -161,8 +169,9 @@ template<bool Meta> at::Tensor attention_ordered_lengths(const at::Tensor& q, co
 }
 template<bool Meta> at::Tensor attention_ordered_cache_lengths(const at::Tensor& q, const at::Tensor& swa,
     const at::Tensor& main, const at::Tensor& ids, const at::Tensor& sink, const at::Tensor& scale,
-    const at::Tensor& lengths, const at::Tensor& completion, const at::Tensor& compressed_completion, bool valid_only, bool vector, bool paired_exp) {
-    const at::Stack stack{q,swa,main,ids,sink,scale,lengths,completion,compressed_completion,valid_only,vector,paired_exp};
+    const at::Tensor& lengths, const at::Tensor& completion, const at::Tensor& compressed_completion, bool valid_only, bool vector, bool paired_exp, bool head_pair) {
+    TORCH_CHECK(!(paired_exp && head_pair), "Choose one attention variant");
+    const at::Stack stack{q,swa,main,ids,sink,scale,lengths,completion,compressed_completion,valid_only,vector,paired_exp,head_pair};
     TORCH_CHECK(!vector || valid_only, "Vector selected KV requires valid_only");
     slots(stack, true, true, true, true);
     if (Meta) return at::empty_like(q);
@@ -171,13 +180,14 @@ template<bool Meta> at::Tensor attention_ordered_cache_lengths(const at::Tensor&
     return descriptor.execute(stack).at(0);
 }
 
-template<bool Meta> std::tuple<at::Tensor, at::Tensor, at::Tensor> attention_pair_exp(
+template<bool Meta, bool HeadPair = false> std::tuple<at::Tensor, at::Tensor, at::Tensor> attention_pair_exp(
     const at::Tensor& q, const at::Tensor& kv, const at::Tensor& indices,
     const at::Tensor& sink, const at::Tensor& scale, const at::Tensor& lengths) {
     for (const auto& tensor : {q, kv}) tensor_contract(tensor, at::kBFloat16, q.device());
     for (const auto& tensor : {indices, lengths}) tensor_contract(tensor, at::kInt, q.device());
     for (const auto& tensor : {sink, scale}) tensor_contract(tensor, at::kFloat, q.device());
     TORCH_CHECK(q.dim() == 3 && q.size(2) == 512 && kv.dim() == 2 && kv.size(1) == 512);
+    TORCH_CHECK(!HeadPair || (q.size(1) > 0 && q.size(1) % 2 == 0));
     TORCH_CHECK(indices.dim() == 2 && indices.size(0) == q.size(0));
     TORCH_CHECK(lengths.dim() == 1 && lengths.size(0) == q.size(0));
     TORCH_CHECK(sink.dim() == 1 && sink.size(0) == q.size(1) && scale.numel() == 1);
@@ -185,21 +195,23 @@ template<bool Meta> std::tuple<at::Tensor, at::Tensor, at::Tensor> attention_pai
         at::empty({q.size(0), q.size(1)}, q.options().dtype(at::kFloat)),
         at::empty({q.size(0), q.size(1)}, q.options().dtype(at::kFloat))};
     TORCH_CHECK(registered && q.device().type() == at::kHPU);
-    auto descriptor = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(kPairExpSchema);
+    auto descriptor = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(HeadPair ? kHeadPairSchema : kPairExpSchema);
     auto outputs = descriptor.execute({q, kv, indices, sink, scale, lengths});
     return {outputs.at(0), outputs.at(1), outputs.at(2)};
 }
 }
 TORCH_LIBRARY_FRAGMENT(custom_op, m) {
     m.def("custom_deepseek_v41_sparse_attn_pair_exp_bf16_gaudi2(Tensor q, Tensor kv, Tensor indices, Tensor sink, Tensor scale, Tensor lengths) -> (Tensor, Tensor, Tensor)");
-    m.def("custom_deepseek_v41_packed_attention_bf16_ordered_cache_lengths_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor indices, Tensor sink, Tensor scale, Tensor lengths, Tensor completion, Tensor compressed_completion, bool valid_only=False, bool vector=False, bool paired_exp=False) -> Tensor");
-    m.def("custom_deepseek_v41_packed_attention_bf16_ordered_lengths_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor indices, Tensor sink, Tensor scale, Tensor lengths, Tensor completion, bool valid_only=False, bool vector=False, bool paired_exp=False) -> Tensor");
+    m.def("custom_deepseek_v41_sparse_attn_head_pair_bf16_gaudi2(Tensor q, Tensor kv, Tensor indices, Tensor sink, Tensor scale, Tensor lengths) -> (Tensor, Tensor, Tensor)");
+    m.def("custom_deepseek_v41_packed_attention_bf16_ordered_cache_lengths_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor indices, Tensor sink, Tensor scale, Tensor lengths, Tensor completion, Tensor compressed_completion, bool valid_only=False, bool vector=False, bool paired_exp=False, bool head_pair=False) -> Tensor");
+    m.def("custom_deepseek_v41_packed_attention_bf16_ordered_lengths_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor indices, Tensor sink, Tensor scale, Tensor lengths, Tensor completion, bool valid_only=False, bool vector=False, bool paired_exp=False, bool head_pair=False) -> Tensor");
     m.def("custom_deepseek_v41_selected_kv_bf16_gaudi2(Tensor swa, Tensor main, Tensor indices, bool vector=False) -> (Tensor, Tensor)");
     m.def("custom_deepseek_v41_packed_attention_bf16_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor indices, Tensor sink, Tensor scale) -> Tensor");
     m.def("custom_deepseek_v41_packed_attention_bf16_lengths_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor indices, Tensor sink, Tensor scale, Tensor lengths) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
     m.impl("custom_deepseek_v41_sparse_attn_pair_exp_bf16_gaudi2", attention_pair_exp<false>);
+    m.impl("custom_deepseek_v41_sparse_attn_head_pair_bf16_gaudi2", attention_pair_exp<false, true>);
     m.impl("custom_deepseek_v41_packed_attention_bf16_ordered_cache_lengths_gaudi2", attention_ordered_cache_lengths<false>);
     m.impl("custom_deepseek_v41_packed_attention_bf16_ordered_lengths_gaudi2", attention_ordered_lengths<false>);
     m.impl("custom_deepseek_v41_selected_kv_bf16_gaudi2", gather<false>);
@@ -208,6 +220,7 @@ TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
 }
 TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
     m.impl("custom_deepseek_v41_sparse_attn_pair_exp_bf16_gaudi2", attention_pair_exp<true>);
+    m.impl("custom_deepseek_v41_sparse_attn_head_pair_bf16_gaudi2", attention_pair_exp<true, true>);
     m.impl("custom_deepseek_v41_packed_attention_bf16_ordered_cache_lengths_gaudi2", attention_ordered_cache_lengths<true>);
     m.impl("custom_deepseek_v41_packed_attention_bf16_ordered_lengths_gaudi2", attention_ordered_lengths<true>);
     m.impl("custom_deepseek_v41_selected_kv_bf16_gaudi2", gather<true>);

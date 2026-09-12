@@ -19,7 +19,11 @@ from vllm_gaudi.ops.deepseek_v41_math import pack_fp4, pack_swa  # noqa: E402
 
 torch.ops.load_library(os.environ["VLLM_HPU_DSV4_TPC_OP_LIBRARY"])
 REFERENCE = torch.ops.custom_op.custom_deepseek_v4_sparse_attn_bf16_lengths_gaudi2
-CANDIDATE = torch.ops.custom_op.custom_deepseek_v41_sparse_attn_pair_exp_bf16_gaudi2
+CANDIDATES = {
+    "paired_exp": torch.ops.custom_op.custom_deepseek_v41_sparse_attn_pair_exp_bf16_gaudi2,
+    "head_pair": torch.ops.custom_op.custom_deepseek_v41_sparse_attn_head_pair_bf16_gaudi2,
+}
+OPTIONS = {"paired_exp": (False, True), "head_pair": (False, False, True)}
 SWA = torch.ops.custom_op.custom_deepseek_v41_swa_pack_write_bf16_gaudi2
 FP4 = torch.ops.custom_op.custom_deepseek_v41_fp4_cache_write_bf16_gaudi2
 ATTN = torch.ops.custom_op.custom_deepseek_v41_packed_attention_bf16_ordered_lengths_gaudi2
@@ -37,8 +41,9 @@ def compare(name, expected, actual):
     assert count == 0, (name, count)
 
 
+@pytest.mark.parametrize("variant", ["paired_exp", "head_pair"])
 @pytest.mark.parametrize("special", [False, True])
-def test_recurrence_output_and_f32_statistics(special):
+def test_recurrence_output_and_f32_statistics(special, variant):
     torch._dynamo.reset()
     torch.manual_seed(7105)
     q = torch.randn(1, 32, 512).bfloat16()
@@ -56,7 +61,7 @@ def test_recurrence_output_and_f32_statistics(special):
         sink = torch.tensor(sink_bits * 2, dtype=torch.int32).view(torch.float32)
 
     def program(q, kv, ids, sink, scale, lengths):
-        return REFERENCE(q, kv, ids, sink, scale, lengths), CANDIDATE(q, kv, ids, sink, scale, lengths)
+        return REFERENCE(q, kv, ids, sink, scale, lengths), CANDIDATES[variant](q, kv, ids, sink, scale, lengths)
 
     compiled = torch.compile(program, backend="hpu_backend", fullgraph=True, dynamic=False)
     for generation, length in enumerate((-1, 0, 1, 2, 17, 127, 128, 129, 191, 256, 512, 640, 999)):
@@ -68,14 +73,15 @@ def test_recurrence_output_and_f32_statistics(special):
         expected, actual = compiled(*(x.to("hpu")
                                       for x in (q, keys, ids, sink, scale, torch.tensor([length], dtype=torch.int32))))
         for field, left, right in zip(("output", "max", "lse"), expected, actual, strict=True):
-            compare(f"recurrence-{special}-{generation}-{field}", left, right)
+            compare(f"recurrence-{variant}-{special}-{generation}-{field}", left, right)
     torch._dynamo.reset()
 
 
 # Reuse the selected-KV producer/consumer boundary cases with only the
 # attention exponent implementation changed.
+@pytest.mark.parametrize("variant", ["paired_exp", "head_pair"])
 @pytest.mark.parametrize("main_rows,write_compressed", [(0, False), (256, False), (256, True), (512, True)])
-def test_ordered_cache_consumer(main_rows, write_compressed):
+def test_ordered_cache_consumer(main_rows, write_compressed, variant):
     torch._dynamo.reset()
     torch.manual_seed(4300 + main_rows)
     swa = pack_swa(torch.randn(512, 512).bfloat16()).to("hpu")
@@ -89,10 +95,10 @@ def test_ordered_cache_consumer(main_rows, write_compressed):
         if write_compressed:
             fp4_done = FP4(main, index, main_value, index_value, slot)
             expected = CACHE_ATTN(q, swa, main, ids, sink, scale, lengths, swa_done, fp4_done, True, False)
-            actual = CACHE_ATTN(q, swa, main, ids, sink, scale, lengths, swa_done, fp4_done, True, False, True)
+            actual = CACHE_ATTN(q, swa, main, ids, sink, scale, lengths, swa_done, fp4_done, True, *OPTIONS[variant])
         else:
             expected = ATTN(q, swa, main, ids, sink, scale, lengths, swa_done, True, False)
-            actual = ATTN(q, swa, main, ids, sink, scale, lengths, swa_done, True, False, True)
+            actual = ATTN(q, swa, main, ids, sink, scale, lengths, swa_done, True, *OPTIONS[variant])
         return expected, actual
 
     compiled = torch.compile(program, backend="hpu_backend", fullgraph=True, dynamic=False)
@@ -113,5 +119,25 @@ def test_ordered_cache_consumer(main_rows, write_compressed):
         values = [torch.randn(1, width).bfloat16().to("hpu") for width in (512, 512, 128)]
         query = torch.randn(1, 32, 512).bfloat16().to("hpu")
         expected, actual = compiled(query, *values, position, slot, ids.unsqueeze(0).to("hpu"), lengths)
-        compare(f"consumer-{main_rows}-{write_compressed}-{generation}", expected, actual)
+        compare(f"consumer-{variant}-{main_rows}-{write_compressed}-{generation}", expected, actual)
+    torch._dynamo.reset()
+
+
+def test_head_pair_batch_mapping():
+    torch._dynamo.reset()
+    torch.manual_seed(7106)
+    inputs = (torch.randn(2, 2,
+                          512).bfloat16(), torch.randn(64,
+                                                       512).bfloat16(), torch.arange(32,
+                                                                                     dtype=torch.int32).repeat(2, 1),
+              torch.randn(2), torch.tensor([512**-.5]), torch.tensor([13, 31], dtype=torch.int32))
+    inputs[2][1, :4] = torch.tensor([-1, 0, 0, 99], dtype=torch.int32)
+
+    def program(*args):
+        return REFERENCE(*args), CANDIDATES["head_pair"](*args)
+
+    compiled = torch.compile(program, backend="hpu_backend", fullgraph=True, dynamic=False)
+    expected, actual = compiled(*(x.to("hpu") for x in inputs))
+    for field, left, right in zip(("output", "max", "lse"), expected, actual, strict=True):
+        compare("head-pair-batch-" + field, left, right)
     torch._dynamo.reset()

@@ -41,7 +41,7 @@ int main() {
             }
         }
     }
-    assert(custom_count == 68);
+    assert(custom_count == 69);
     for (const char* required : {
              "custom_deepseek_v41_selected_kv_vec_bf16_gaudi2",
              "custom_deepseek_v41_selected_kv_vec_ordered_bf16_gaudi2",

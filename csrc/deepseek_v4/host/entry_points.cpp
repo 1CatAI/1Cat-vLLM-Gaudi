@@ -48,6 +48,7 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V4_SPARSE_ATTN_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V4_SPARSE_ATTN_BF16_LENGTHS,
     GAUDI2_KERNEL_DEEPSEEK_V41_SPARSE_ATTN_PAIRED_EXP,
+    GAUDI2_KERNEL_DEEPSEEK_V41_SPARSE_ATTN_HEAD_PAIR,
     GAUDI2_KERNEL_DEEPSEEK_V4_DEQUANT_GATHER_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V4_DUAL_DEQUANT_GATHER_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V4_LOCAL_DUAL_DEQUANT_GATHER_BF16,
@@ -204,6 +205,10 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
                DeepseekV4SparseAttnBF16Gaudi2::PAIRED_EXP_LENGTHS);
            sparseAttnPairExpInstance.GetKernelName(
                guids[GAUDI2_KERNEL_DEEPSEEK_V41_SPARSE_ATTN_PAIRED_EXP].name);
+           DeepseekV4SparseAttnBF16Gaudi2 sparseAttnHeadPairInstance(
+               DeepseekV4SparseAttnBF16Gaudi2::HEAD_PAIR_LENGTHS);
+           sparseAttnHeadPairInstance.GetKernelName(
+               guids[GAUDI2_KERNEL_DEEPSEEK_V41_SPARSE_ATTN_HEAD_PAIR].name);
            sparseAttnLengthsInstance.GetKernelName(
                guids[
                    GAUDI2_KERNEL_DEEPSEEK_V4_SPARSE_ATTN_BF16_LENGTHS]
@@ -440,6 +445,11 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     sparseAttnPairExpInstance.GetKernelName(kernelName);
     if (strcmp(params->guid.name, kernelName) == 0)
         return sparseAttnPairExpInstance.GetGcDefinitions(params, instance);
+    DeepseekV4SparseAttnBF16Gaudi2 sparseAttnHeadPairInstance(
+        DeepseekV4SparseAttnBF16Gaudi2::HEAD_PAIR_LENGTHS);
+    sparseAttnHeadPairInstance.GetKernelName(kernelName);
+    if (strcmp(params->guid.name, kernelName) == 0)
+        return sparseAttnHeadPairInstance.GetGcDefinitions(params, instance);
     DeepseekV4SparseAttnBF16Gaudi2 sparseAttnInstance;
     sparseAttnInstance.GetKernelName(kernelName);
     if (strcmp(params->guid.name, kernelName) == 0)
