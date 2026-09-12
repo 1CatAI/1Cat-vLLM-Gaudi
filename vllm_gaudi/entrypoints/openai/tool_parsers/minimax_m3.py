@@ -61,14 +61,16 @@ import re
 from collections.abc import Sequence
 
 from vllm.entrypoints.chat_utils import make_tool_call_id
-from vllm.entrypoints.openai.engine.protocol import (
-    DeltaFunctionCall,
-    DeltaMessage,
-    DeltaToolCall,
-    ExtractedToolCallInformation,
-    FunctionCall,
-    ToolCall,
-)
+try:
+    from vllm.entrypoints.generate.base.protocol import (
+        DeltaFunctionCall, DeltaMessage, DeltaToolCall, ExtractedToolCallInformation, FunctionCall, ToolCall,
+    )
+except ModuleNotFoundError as error:
+    if not error.name.startswith("vllm.entrypoints.generate"):
+        raise
+    from vllm.entrypoints.openai.engine.protocol import (
+        DeltaFunctionCall, DeltaMessage, DeltaToolCall, ExtractedToolCallInformation, FunctionCall, ToolCall,
+    )
 from vllm.logger import init_logger
 from vllm.tool_parsers import ToolParser, ToolParserManager
 
