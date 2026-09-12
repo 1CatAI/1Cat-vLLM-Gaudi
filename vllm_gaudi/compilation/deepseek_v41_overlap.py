@@ -15,6 +15,35 @@ from torch.fx.passes.split_module import split_module
 _lock = threading.RLock()
 
 
+def _result_metadata(node):
+    """Keep canonical Bridge offsets; reconstruct only newly created nodes."""
+    meta = dict(node.meta)
+    value = meta.get("val")
+    if isinstance(value, torch.Tensor):
+        defaults = dict(output_device=value.device, output_dtypes=[value.dtype], output_layouts=[value.layout],
+                        output_shapes=[list(value.shape)], output_strides=[list(value.stride())],
+                        output_offset=[value.storage_offset()], output_contiguous=[value.is_contiguous()])
+        for key, default in defaults.items():
+            meta.setdefault(key, default)
+    return meta
+
+
+def _partition_metadata(child):
+    output = next(n for n in child.graph.nodes if n.op == "output").args[0]
+    if isinstance(output, torch.fx.Node):
+        return _result_metadata(output)
+    if not isinstance(output, tuple) or not all(isinstance(n, torch.fx.Node) for n in output):
+        raise RuntimeError("mHC partitions require explicit tensor outputs")
+    items = [_result_metadata(n) for n in output]
+    meta = {"val": tuple(item.get("val") for item in items), "_mhc_result_meta": items}
+    if items:
+        meta["output_device"] = items[0].get("output_device")
+        for key in ("output_dtypes", "output_layouts", "output_shapes", "output_strides",
+                    "output_offset", "output_contiguous"):
+            meta[key] = [value for item in items for value in item.get(key, [])]
+    return meta
+
+
 def deduplicate_float_casts(module, selected):
     seen = {}
     removed = 0
@@ -193,14 +222,22 @@ def split_mhc_consumers(module, exchange):
                     continue
                 if node.op == "call_module":
                     target = f"{call.target}_mhc_{node.target}"
-                    module.add_submodule(target, wrapper.get_submodule(node.target))
+                    partition = wrapper.get_submodule(node.target)
+                    module.add_submodule(target, partition)
                     copied = graph.call_module(target, map_arg(node.args, env.__getitem__),
                                                map_arg(node.kwargs, env.__getitem__))
-                    copied.meta = dict(call.meta)
+                    copied.meta = {key: value for key, value in call.meta.items()
+                                   if not key.startswith("output_") and key not in ("val", "tensor_meta")}
+                    copied.meta.update(_partition_metadata(partition))
                 elif node.op == "get_attr":
                     raise RuntimeError("Unexpected mHC split captured attribute")
                 else:
                     copied = graph.node_copy(node, env.__getitem__)
+                    import operator
+                    if node.target != operator.getitem or "_mhc_result_meta" not in copied.args[0].meta:
+                        raise RuntimeError("Unexpected mHC partition wrapper operation")
+                    copied.meta = dict(copied.args[0].meta["_mhc_result_meta"][copied.args[1]])
+                    copied.meta["placement"] = "eager"
                 env[node] = copied
         graph.erase_node(call)
         audit.append({"partition": call.target, "independent_nodes": len(selected), "casts_removed": casts_removed,
@@ -230,7 +267,9 @@ def make_backend():
         logger().info("V4.1 TP/mHC partition transform examined %d modules, split %d",
                       sum(node.op == "call_module" for node in ctx.graph_module.graph.nodes), len(audit))
         if audit:
-            passes.pass_fake_propagation(ctx)
+            # Full fake propagation after Bridge partitioning replays already
+            # canonicalized views and rejects their saved storage offsets.
+            # New calls/getitems inherit the exact child-output contract above.
             passes.pass_add_fused_op_metadata(ctx)
             logger().info("V4.1 TP/mHC independent partitions: %s", audit)
         return bool(audit)
