@@ -41,6 +41,11 @@ def classify(node, kernel, inputs, outputs):
     if "mxfp4" in name or "mxfp4" in kernel:
         shape = inputs[1]["shape"] if kernel in ("GEMM", "BatchGemm") and len(inputs) > 1 else []
         stage = "W13 gate/up" if shape and 2304 in shape else "W2 down" if shape and 1152 in shape else "阶段见张量合同"
+        if not shape and outputs:
+            if outputs[0]["shape"][-2:] == [5120, 2304]:
+                stage = "W13 gate/up"
+            elif outputs[0]["shape"][-2:] == [1152, 5120]:
+                stage = "W2 down"
         return "路由专家", stage + ("矩阵计算" if shape else "压缩权重直接寻址/解码")
     if "bf16_identity" in kernel:
         return "路由专家", "MoE 结果/编译块完成依赖"
@@ -53,6 +58,8 @@ def classify(node, kernel, inputs, outputs):
         if weight == [25600, 6144]:
             return "Engram", "查询行到 key/value 投影"
         if "/attention/" in name:
+            if inputs and inputs[0]["dtype"] == "float32":
+                return "Attention", "Compressor FP32 投影；wkv/wgate 绑定尚待逐节点还原"
             shapes = {(1280, 5120): "wq_a 输入投影", (16384, 1280): "wq_b Q 展开",
                       (512, 5120): "wkv 输入投影", (5120, 4096): "wo_b 输出投影",
                       (128, 512): "index K 投影"}
