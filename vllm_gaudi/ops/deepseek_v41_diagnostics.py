@@ -3,10 +3,30 @@
 from contextvars import ContextVar
 from functools import wraps
 import hashlib
-import json
 import os
+from urllib.parse import quote, unquote
 
 _context = ContextVar("dsv41_diagnostic_context", default=None)
+
+
+def phase_name(fields):
+    # Some activity-profiler builds concatenate names into JSON without
+    # escaping embedded quotes. Percent encoding keeps that exporter valid.
+    return "dsv41_phase:v1;" + ";".join(f"{key}={quote(str(value), safe='._-')}"
+                                        for key, value in sorted(fields.items()))
+
+
+def phase_fields(name):
+    prefix = "dsv41_phase:v1;"
+    if not name.startswith(prefix):
+        raise ValueError("Unsupported host phase schema")
+    result = dict(field.split("=", 1) for field in name.removeprefix(prefix).split(";"))
+    for key, value in result.items():
+        decoded = unquote(value)
+        result[key] = None if decoded == "None" else decoded
+        if key in ("rank", "stage", "generation", "next_packet_slot") and result[key] is not None:
+            result[key] = int(result[key])
+    return result
 
 
 def trace_phase(function):
@@ -36,7 +56,7 @@ def trace_phase(function):
                       completion_event=None)
         # Missing native identifiers stay null; host context does not prove
         # ownership of a device stall or completion of a collective.
-        name = "dsv41_phase:" + json.dumps(fields, separators=(",", ":"), sort_keys=True)
+        name = phase_name(fields)
         with torch.profiler.record_function(name):
             return function(self, *args, **kwargs)
 

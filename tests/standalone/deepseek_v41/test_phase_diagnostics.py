@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_gaudi.ops.deepseek_v41_diagnostics import trace_phase
+from vllm_gaudi.ops.deepseek_v41_diagnostics import phase_fields, phase_name, trace_phase
 
 
 def test_disabled_instrumentation_returns_original_function(monkeypatch):
@@ -44,7 +44,14 @@ def test_enabled_ranges_keep_generation_and_propagate_failures(monkeypatch):
     assert execute_model(worker, scheduled) == 1
     with pytest.raises(RuntimeError, match="already changed"):
         sample(worker)
-    fields = [json.loads(name.removeprefix("dsv41_phase:")) for name in names]
+    fields = [phase_fields(name) for name in names]
     assert all(row["generation"] == 4 and row["rank"] == 2 and row["stage"] == 1 for row in fields)
     assert all(row["segment"] is None and row["completion_event"] is None for row in fields)
     assert all("test-request" not in name for name in names)
+
+
+def test_name_survives_exporters_without_json_string_escaping():
+    fields = dict(phase='quoted";\\scope', rank=2, generation=13, completion_event=None)
+    name = phase_name(fields)
+    assert json.loads('{"name":"' + name + '"}')["name"] == name
+    assert phase_fields(name) == fields

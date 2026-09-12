@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "tools"))
 from analyze_deepseek_v41_resources import clip_windows, occupancy  # noqa: E402
 from compare_deepseek_v41_candidate import REQUIRED_CHECKS, decide  # noqa: E402
 import analyze_deepseek_v41_gaps as gaps_tool  # noqa: E402
+from analyze_deepseek_v41_phases import exclusive_phases, intersections  # noqa: E402
 
 
 def recorded_rounds(means):
@@ -100,3 +101,12 @@ def test_gap_endpoints_preserve_work_without_inventing_nic_duration(tmp_path, mo
     assert pairs[0][0]["execution_index"] is None
     with pytest.raises(ValueError, match="ordered"):
         gaps_tool.boundaries(tmp_path, 0, [(30, 40), (10, 20)])
+
+
+def test_host_phase_nesting_is_exclusive_without_calling_waits_causal():
+    rows = [{"start_us": 0, "end_us": 20}, {"start_us": 3, "end_us": 12}, {"start_us": 5, "end_us": 8}]
+    result = exclusive_phases(rows)
+    assert [spans for _, spans in result] == [[(0, 3), (12, 20)], [(3, 5), (8, 12)], [(5, 8)]]
+    assert intersections([(0, 20)], [(2, 4), (9, 10)]) == [(2, 4), (9, 10)]
+    with pytest.raises(ValueError, match="Crossing"):
+        exclusive_phases([{"start_us": 0, "end_us": 10}, {"start_us": 8, "end_us": 12}])
