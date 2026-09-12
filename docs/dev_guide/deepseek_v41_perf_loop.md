@@ -43,6 +43,11 @@ For a completed capture, run these tools in dependency order:
    intervals with the global device gaps. It caches the extraction and retains
    parent identifiers. Nested scopes and wait envelopes are correlations, not
    additive costs or proof that the gaps can be removed.
+9. `analyze_deepseek_v41_gaps.py ANALYSIS` locates the last and next recorded
+   engine work around each global gap and preserves each rank's endpoints.
+   Category groups partition the unknown intervals; they do not assign a
+   causal owner. Exact same-recipe tensor edges are reported separately and
+   do not establish invocation identity across repeated recipe executions.
 
 The disjoint ledger reconciles the capture; its group ordering does not establish
 causal critical-path ownership. Resource unions overlap. Busy cores do not prove

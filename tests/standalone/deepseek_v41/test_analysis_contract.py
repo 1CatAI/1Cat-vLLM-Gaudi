@@ -3,12 +3,15 @@
 
 from pathlib import Path
 import sys
+import gzip
+import json
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "tools"))
 from analyze_deepseek_v41_resources import clip_windows, occupancy  # noqa: E402
 from compare_deepseek_v41_candidate import REQUIRED_CHECKS, decide  # noqa: E402
+import analyze_deepseek_v41_gaps as gaps_tool  # noqa: E402
 
 
 def recorded_rounds(means):
@@ -68,3 +71,32 @@ def test_coalesced_events_cannot_qualify_fast_timing():
     candidate["results"][0]["coalesced_token_events"] = 1
     with pytest.raises(ValueError, match="Invalid ITL"):
         decide(recorded_rounds([23.5] * 3), candidate, {}, 15., .5, True)
+
+
+def test_gap_endpoints_preserve_work_without_inventing_nic_duration(tmp_path, monkeypatch):
+    rank = tmp_path / "rank0"
+    rank.mkdir()
+    inventory = {"nodes": [{"recipe": "r", "engine": kind} for kind in ("TPC", "DMA", "NIC")]}
+    (rank / "inventory.json").write_text(json.dumps(inventory))
+    (rank / "recipe-symbols.json").write_text(json.dumps({"recipes": {}}))
+    (rank / "node-breakdown.json").write_text(
+        json.dumps([{
+            "recipe_id": "r",
+            "engine": "DMA",
+            "context_id": 1,
+            "purpose": "transfer",
+            "compiler_contract": None,
+            "inputs": [],
+            "outputs": []
+        }]))
+    monkeypatch.setattr(gaps_tool, "symbols", lambda *_: {})
+    with gzip.open(rank / "hardware.jsonl.gz", "wt") as stream:
+        for event in [(1, 4, 0, 0), (6, 2, 0, 1), (9, 0, 0, 2), (50, 2, 0, 0)]:
+            stream.write(json.dumps(event) + "\n")
+    pairs = gaps_tool.boundaries(tmp_path, 0, [(10, 20), (30, 40), (60, 70)])
+    assert [a["end_us"] for a, _ in pairs] == [8, 8, 52]
+    assert [b["start_us"] if b else None for _, b in pairs] == [50, 50, None]
+    assert pairs[0][0]["purpose"] == "transfer"
+    assert pairs[0][0]["execution_index"] is None
+    with pytest.raises(ValueError, match="ordered"):
+        gaps_tool.boundaries(tmp_path, 0, [(30, 40), (10, 20)])
