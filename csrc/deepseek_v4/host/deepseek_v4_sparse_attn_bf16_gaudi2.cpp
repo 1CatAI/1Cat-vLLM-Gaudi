@@ -18,6 +18,8 @@ extern unsigned char
     _binary___deepseek_v4_sparse_attn_bf16_lengths_gaudi2_o_start;
 extern unsigned char
     _binary___deepseek_v4_sparse_attn_bf16_lengths_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_sparse_attn_pair_exp_bf16_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_sparse_attn_pair_exp_bf16_gaudi2_o_end;
 
 namespace {
 
@@ -55,7 +57,9 @@ tpc_lib_api::GlueCodeReturn DeepseekV4SparseAttnBF16Gaudi2::GetKernelName(
 {
     std::strcpy(
         kernelName,
-        m_mode == EXPLICIT_LENGTHS
+        m_mode == PAIRED_EXP_LENGTHS
+            ? "custom_deepseek_v41_sparse_attn_pair_exp_bf16_gaudi2"
+            : m_mode == EXPLICIT_LENGTHS
             ? "custom_deepseek_v4_sparse_attn_bf16_lengths_gaudi2"
             : "custom_deepseek_v4_sparse_attn_bf16_gaudi2");
     return tpc_lib_api::GLUE_SUCCESS;
@@ -66,7 +70,7 @@ DeepseekV4SparseAttnBF16Gaudi2::GetGcDefinitions(
     tpc_lib_api::HabanaKernelParams* inDefs,
     tpc_lib_api::HabanaKernelInstantiation* outDefs)
 {
-    const unsigned inputCount = m_mode == EXPLICIT_LENGTHS ? 6 : 5;
+    const unsigned inputCount = m_mode != WIDTH_ONLY ? 6 : 5;
     constexpr unsigned kOutputCount = 3;
     if (inDefs->inputTensorNr != inputCount) {
         inDefs->inputTensorNr = inputCount;
@@ -104,7 +108,7 @@ DeepseekV4SparseAttnBF16Gaudi2::GetGcDefinitions(
     const auto& indices = inDefs->inputTensors[2];
     const auto& sink = inDefs->inputTensors[3];
     const auto& scale = inDefs->inputTensors[4];
-    const auto* topkLengths = m_mode == EXPLICIT_LENGTHS
+    const auto* topkLengths = m_mode != WIDTH_ONLY
         ? &inDefs->inputTensors[5]
         : nullptr;
     auto& output = inDefs->outputTensors[0];
@@ -220,11 +224,15 @@ DeepseekV4SparseAttnBF16Gaudi2::GetGcDefinitions(
 
     outDefs->kernel.paramsNr = 0;
     const unsigned char* isaStart =
-        m_mode == EXPLICIT_LENGTHS
+        m_mode == PAIRED_EXP_LENGTHS
+        ? &_binary___deepseek_v41_sparse_attn_pair_exp_bf16_gaudi2_o_start
+        : m_mode == EXPLICIT_LENGTHS
         ? &_binary___deepseek_v4_sparse_attn_bf16_lengths_gaudi2_o_start
         : &_binary___deepseek_v4_sparse_attn_bf16_gaudi2_o_start;
     const unsigned char* isaEnd =
-        m_mode == EXPLICIT_LENGTHS
+        m_mode == PAIRED_EXP_LENGTHS
+        ? &_binary___deepseek_v41_sparse_attn_pair_exp_bf16_gaudi2_o_end
+        : m_mode == EXPLICIT_LENGTHS
         ? &_binary___deepseek_v4_sparse_attn_bf16_lengths_gaudi2_o_end
         : &_binary___deepseek_v4_sparse_attn_bf16_gaudi2_o_end;
     const unsigned isaSize = isaEnd - isaStart;

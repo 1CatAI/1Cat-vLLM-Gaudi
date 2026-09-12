@@ -10,6 +10,24 @@ license are met.
 #define DSV4_BF16_VECTOR_WIDTH 128
 #define DSV4_VECTOR_COUNT (DSV4_HEAD_DIM / DSV4_BF16_VECTOR_WIDTH)
 
+#ifndef DSV41_ATTENTION_PAIRED_EXP
+#define DSV41_ATTENTION_PAIRED_EXP 0
+#endif
+
+#if DSV41_ATTENTION_PAIRED_EXP
+// Both arguments are broadcast scalars within every shuffle group. Interleave
+// them so the unchanged lane-wise Cephes routine evaluates both in one pass.
+static inline float128 dsv41_exp_pair(float64 first, float64 second, bool64 odd)
+{
+    const float64 arguments = v_f32_mov_vb(second, 0, first, odd);
+    const float64 values = v_exp_cephes_f32(arguments);
+    float128 result;
+    result.v1 = v_f32_shuffle_b(values, (uchar256)0x80, 0, values);
+    result.v2 = v_f32_shuffle_b(values, (uchar256)0x81, 0, values);
+    return result;
+}
+#endif
+
 // FlashMLA-style sparse prefill. The caller supplies the valid prefix length
 // for each row so aligned index padding is never scanned by the TPC program.
 void main(
@@ -28,6 +46,9 @@ void main(
     const int5 index_end = get_index_space_size() + index_start;
     const int sequence_length = get_dim_size(kv, 1);
     const int topk_width = get_dim_size(indices, 0);
+#if DSV41_ATTENTION_PAIRED_EXP
+    const bool64 odd_lanes = v_u32_cmp_eq_b(read_lane_id_4b_b() & 1, 1);
+#endif
 
     int5 scale_coords = {0, 0, 0, 0, 0};
     const float scale_value =
@@ -85,9 +106,16 @@ void main(
                 score *= scale_value;
 
                 const float64 next_max = v_f32_max_b(running_max, score);
+#if DSV41_ATTENTION_PAIRED_EXP
+                const float128 exponentials = dsv41_exp_pair(
+                    running_max - next_max, score - next_max, odd_lanes);
+                const float64 previous_scale = exponentials.v1;
+                const float64 weight = exponentials.v2;
+#else
                 const float64 previous_scale =
                     v_exp_cephes_f32(running_max - next_max);
                 const float64 weight = v_exp_cephes_f32(score - next_max);
+#endif
                 running_sum = running_sum * previous_scale + weight;
 
                 #pragma unroll (DSV4_VECTOR_COUNT)
@@ -111,10 +139,17 @@ void main(
                 s_f32_ld_g(gen_addr(sink_coords, attn_sink));
             const float64 sink_score = sink_value;
             const float64 final_max = v_f32_max_b(running_max, sink_score);
+#if DSV41_ATTENTION_PAIRED_EXP
+            const float128 final_exponentials = dsv41_exp_pair(
+                running_max - final_max, sink_score - final_max, odd_lanes);
+            const float64 data_scale = final_exponentials.v1;
+            const float64 sink_weight = final_exponentials.v2;
+#else
             const float64 data_scale =
                 v_exp_cephes_f32(running_max - final_max);
             const float64 sink_weight =
                 v_exp_cephes_f32(sink_score - final_max);
+#endif
             running_sum = running_sum * data_scale + sink_weight;
             const float64 inverse_sum = v_reciprocal_f32(running_sum);
             const float64 lse = final_max + v_log_f32(running_sum);

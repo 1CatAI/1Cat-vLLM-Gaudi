@@ -16,6 +16,7 @@ public:
     enum KernelMode {
         WIDTH_ONLY,
         EXPLICIT_LENGTHS,
+        PAIRED_EXP_LENGTHS,
     };
 
     explicit DeepseekV4SparseAttnBF16Gaudi2(

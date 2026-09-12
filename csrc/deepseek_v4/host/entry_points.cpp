@@ -47,6 +47,7 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVE
 enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V4_SPARSE_ATTN_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V4_SPARSE_ATTN_BF16_LENGTHS,
+    GAUDI2_KERNEL_DEEPSEEK_V41_SPARSE_ATTN_PAIRED_EXP,
     GAUDI2_KERNEL_DEEPSEEK_V4_DEQUANT_GATHER_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V4_DUAL_DEQUANT_GATHER_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V4_LOCAL_DUAL_DEQUANT_GATHER_BF16,
@@ -199,6 +200,10 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
                guids[GAUDI2_KERNEL_DEEPSEEK_V4_SPARSE_ATTN_BF16].name);
            DeepseekV4SparseAttnBF16Gaudi2 sparseAttnLengthsInstance(
                DeepseekV4SparseAttnBF16Gaudi2::EXPLICIT_LENGTHS);
+           DeepseekV4SparseAttnBF16Gaudi2 sparseAttnPairExpInstance(
+               DeepseekV4SparseAttnBF16Gaudi2::PAIRED_EXP_LENGTHS);
+           sparseAttnPairExpInstance.GetKernelName(
+               guids[GAUDI2_KERNEL_DEEPSEEK_V41_SPARSE_ATTN_PAIRED_EXP].name);
            sparseAttnLengthsInstance.GetKernelName(
                guids[
                    GAUDI2_KERNEL_DEEPSEEK_V4_SPARSE_ATTN_BF16_LENGTHS]
@@ -430,6 +435,11 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     tpc_lib_api::HabanaKernelInstantiation* instance) {
     if (!params || !instance) return tpc_lib_api::GLUE_FAILED;
     char kernelName[tpc_lib_api::MAX_NODE_NAME];
+    DeepseekV4SparseAttnBF16Gaudi2 sparseAttnPairExpInstance(
+        DeepseekV4SparseAttnBF16Gaudi2::PAIRED_EXP_LENGTHS);
+    sparseAttnPairExpInstance.GetKernelName(kernelName);
+    if (strcmp(params->guid.name, kernelName) == 0)
+        return sparseAttnPairExpInstance.GetGcDefinitions(params, instance);
     DeepseekV4SparseAttnBF16Gaudi2 sparseAttnInstance;
     sparseAttnInstance.GetKernelName(kernelName);
     if (strcmp(params->guid.name, kernelName) == 0)
