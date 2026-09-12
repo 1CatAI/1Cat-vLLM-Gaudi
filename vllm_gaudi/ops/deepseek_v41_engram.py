@@ -197,7 +197,8 @@ class EngramTokenHistory:
             tokens = np.asarray(token_ids, dtype=np.int64)
             if tokens.ndim != 1 or not len(tokens) or tokens.min() < 0 or tokens.max() >= len(self.token_map):
                 raise ValueError("Invalid Engram input token IDs")
-            dead = np.zeros(len(tokens), dtype=bool) if image_mask is None else np.array(image_mask, dtype=bool, copy=True)
+            dead = (np.zeros(len(tokens), dtype=bool) if image_mask is None
+                    else np.array(image_mask, dtype=bool, copy=True))
             if dead.shape != tokens.shape:
                 raise ValueError("Image span mask does not match input tokens")
             compressed = self.token_map[tokens].copy()
@@ -205,7 +206,8 @@ class EngramTokenHistory:
             stream = np.concatenate((self.history, compressed))
             positions = np.arange(len(tokens), dtype=np.int64) + len(self.history)
             rolling = np.zeros((len(tokens), len(self.layout.layer_ids)), dtype=np.int64)
-            hashes = np.empty((len(tokens), len(self.layout.layer_ids), (self.layout.max_ngram - 1) * self.layout.heads),
+            hash_shape = (len(tokens), len(self.layout.layer_ids), (self.layout.max_ngram - 1) * self.layout.heads)
+            hashes = np.empty(hash_shape,
                               dtype=np.int32)
             blocked = np.zeros(len(tokens), dtype=bool)
             for shift in range(self.layout.max_ngram):
@@ -235,6 +237,19 @@ class EngramTokenHistory:
             self.position += committed_input_tokens
             self.pending = None
             self.generation += 1
+
+    def prepare_c1(self, request_id, token_id, image, native, transfer_generation, slot):
+        """Native hash/gather shares the ordinary history transaction owner."""
+        with self.lock:
+            if request_id != self.request_id or self.pending is not None:
+                raise RuntimeError("Engram request changed or its previous input is still pending")
+            compressed, hashes, faults = native.prepare(request_id, self.generation, transfer_generation,
+                                                        slot, token_id, image, self.history)
+            active = np.array([not image], dtype=bool)
+            for array in (compressed, hashes, active):
+                array.setflags(write=False)
+            self.pending = EngramHashBatch(request_id, self.generation, self.position, compressed, hashes, active)
+            return self.pending, faults
 
     def discard(self, batch: EngramHashBatch):
         self.commit(batch, 0)

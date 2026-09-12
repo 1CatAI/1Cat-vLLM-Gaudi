@@ -36,24 +36,26 @@ def test_staging_views_preserve_all_bytes_and_capacity(heads):
 
 
 @pytest.mark.parametrize("tp_rank", [0, 1])
+@pytest.mark.parametrize("native_c1", [False, True])
 @torch.inference_mode()
-def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, tp_rank):
+def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, tp_rank, native_c1):
     import habana_frameworks.torch.core  # noqa: F401
-    from vllm_gaudi.lib.dsv41_host_gather import HostRows
+    from vllm_gaudi.lib.dsv41_host_gather import HostRows, NativeC1Prepare
 
     host = EngramHost.__new__(EngramHost)
     host.layout = EngramHashLayout.from_config({
-        "engram_layer_ids": [1, 14], "engram_num_embeddings": [72, 204],
-        "engram_max_ngram_size": 4, "engram_n_heads": 2, "engram_compressed_vocab_size": 8,
+        "engram_layer_ids": [1, 14], "engram_num_embeddings": [10000, 10000],
+        "engram_max_ngram_size": 4, "engram_n_heads": 8, "engram_compressed_vocab_size": 8,
         "engram_vocab_size": 5, "engram_pad_token_id": 2, "engram_head_dim": 256})
     host.history = EngramTokenHistory(host.layout, np.arange(16) % 8)
     host.tables, host.shards, host.slots = {}, {}, {}
     host.stream = torch.hpu.Stream()
     host.generation, host.pending, host.closed = 0, None, False
+    host.native_c1 = None
     host.max_tokens, host.ring_size = 6, 3
     host.audit = dict(gathers=0, major_faults=0, dma_bytes=0, generations=0)
     tables = {}
-    for layer, rows in ((1, 72), (14, 204)):
+    for layer, rows in ((1, 10000), (14, 10000)):
         weights = np.arange(rows * 256, dtype=np.uint8).reshape(rows, 256)
         weights ^= np.arange(rows, dtype=np.uint8)[:, None]
         scales = np.arange(rows * 8, dtype=np.uint8).reshape(rows, 8)
@@ -64,8 +66,16 @@ def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, tp_rank):
         host.tables[layer] = HostRows(str(path), first * 256, str(path), weights.size + first * 8,
                                      first, last, 256, True, False)
         host.shards[layer] = shard
-        host.slots[layer] = [_TransferSlot(6, 3, 256, "hpu") for _ in range(3)]
+        host.slots[layer] = [_TransferSlot(6, 12, 256, "hpu") for _ in range(3)]
         tables[layer] = weights, scales
+    if native_c1:
+        layers = host.layout.layer_ids
+        host.native_c1 = NativeC1Prepare(
+            host.history.token_map, host.layout.multipliers, host.layout.primes, host.layout.offsets,
+            np.array([host.shards[layer]["head_start"] for layer in layers], dtype=np.int64),
+            np.array([host.shards[layer]["head_stop"] for layer in layers], dtype=np.int64), host.history.pad_id,
+            [host.tables[layer] for layer in layers],
+            [[host.slots[layer][slot].decode_host.numpy() for layer in layers] for slot in range(3)])
     pending_results = []
     consumer = torch.hpu.Stream()
     try:
@@ -93,5 +103,6 @@ def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, tp_rank):
             assert torch.equal(actual.cpu(), expected)
         assert host.audit["gathers"] == 36
         assert host.audit["generations"] == 18
+        assert host.audit.get("native_c1", 0) == (12 if native_c1 else 0)
     finally:
         host.close()

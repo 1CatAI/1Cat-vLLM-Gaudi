@@ -10,6 +10,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from vllm_gaudi import envs as gaudi_envs
+
 from vllm_gaudi.ops.deepseek_v41_engram import (
     EngramHashLayout, EngramTokenHistory, build_compressed_token_map,
 )
@@ -71,6 +73,9 @@ class EngramHost:
         from vllm_gaudi.lib import dsv41_host_gather as native
         if native.abi_version != 1 or torch.device(device).type != "hpu":
             raise RuntimeError("V4.1 Engram requires its native host gather and an HPU DMA runtime")
+        self.native_c1 = None
+        if gaudi_envs.VLLM_HPU_DSV41_ENGRAM_NATIVE_C1 and getattr(native, "c1_abi_version", None) != 1:
+            raise RuntimeError("The enabled Engram C1 path requires its matching native preparation ABI")
         if max_tokens not in range(1, 513) or ring_size < 2:
             raise ValueError("Invalid bounded Engram staging geometry")
         self.directory, self.tp_rank = Path(directory), tp_rank
@@ -111,6 +116,14 @@ class EngramHost:
                 self.layout.head_dim, True, force_lock)
             self.slots[layer] = [_TransferSlot(max_tokens, shard["head_stop"] - shard["head_start"],
                                               self.layout.head_dim, device) for _ in range(ring_size)]
+        if gaudi_envs.VLLM_HPU_DSV41_ENGRAM_NATIVE_C1:
+            layers = self.layout.layer_ids
+            targets = [[self.slots[layer][slot].decode_host.numpy() for layer in layers] for slot in range(ring_size)]
+            self.native_c1 = native.NativeC1Prepare(
+                self.history.token_map, self.layout.multipliers, self.layout.primes, self.layout.offsets,
+                np.array([self.shards[layer]["head_start"] for layer in layers], dtype=np.int64),
+                np.array([self.shards[layer]["head_stop"] for layer in layers], dtype=np.int64),
+                self.history.pad_id, [self.tables[layer] for layer in layers], targets)
 
     def _verify_source(self, item, checkpoint_audit):
         path = Path(item["file"])
@@ -145,6 +158,8 @@ class EngramHost:
         count = len(token_ids)
         if count == 0 or count > self.max_tokens:
             raise ValueError("Engram input exceeds fixed staging capacity")
+        if count == 1 and self.native_c1 is not None:
+            return self._prepare_native_c1(request_id, token_ids, image_mask)
         batch = self.history.prepare(request_id, token_ids, image_mask)
         self.generation += 1
         ring = (self.generation - 1) % self.ring_size
@@ -185,6 +200,32 @@ class EngramHost:
         self.audit["generations"] += 1
         return ticket
 
+    def _prepare_native_c1(self, request_id, token_ids, image_mask):
+        if image_mask is not None and len(image_mask) != 1:
+            raise ValueError("Image span mask does not match C1 input")
+        image = bool(image_mask[0]) if image_mask is not None else False
+        self.generation += 1
+        ring = (self.generation - 1) % self.ring_size
+        for layer in self.layout.layer_ids:
+            self.slots[layer][ring].reuse()
+        batch, faults = self.history.prepare_c1(request_id, int(token_ids[0]), image, self.native_c1,
+                                                self.generation, ring)
+        stream = torch.hpu.current_stream()
+        buffers = []
+        for layer in self.layout.layer_ids:
+            slot = self.slots[layer][ring]
+            slot.decode_device.copy_(slot.decode_host, non_blocking=True)
+            slot.dma_done.record(stream)
+            buffers.append(slot.decode_device)
+            self.audit["dma_bytes"] += slot.decode_host.numel()
+        self.audit["major_faults"] += faults
+        self.audit["gathers"] += len(self.layout.layer_ids)
+        self.audit["generations"] += 1
+        self.audit["native_c1"] = self.audit.get("native_c1", 0) + 1
+        ticket = EngramTransfer(self.generation, ring, batch, tuple(buffers))
+        self.pending = ticket
+        return ticket
+
     def complete(self, ticket, committed_inputs):
         if self.pending is not ticket or ticket.generation != self.generation:
             raise RuntimeError("Stale Engram transfer/verify completion")
@@ -194,6 +235,8 @@ class EngramHost:
             slot.consumer_done.record(consumer_stream)
             slot.inflight = True
         self.history.commit(ticket.batch, committed_inputs)
+        if self.native_c1 is not None and len(ticket.batch.compressed_ids) == 1:
+            self.native_c1.complete(ticket.batch.request_id, ticket.batch.generation, ticket.generation)
         self.pending = None
 
     def close(self):
@@ -203,8 +246,12 @@ class EngramHost:
         # this owner's transfers/consumers before releasing mmap and staging.
         torch.hpu.synchronize()
         if self.pending is not None:
+            if self.native_c1 is not None and len(self.pending.batch.compressed_ids) == 1:
+                self.native_c1.complete(self.pending.batch.request_id, self.pending.batch.generation,
+                                        self.pending.generation)
             self.history.discard(self.pending.batch)
             self.pending = None
+        self.native_c1 = None
         self.slots.clear()
         self.tables.clear()
         self.closed = True
