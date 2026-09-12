@@ -20,7 +20,7 @@ def tags(row):
         names.append('expert_mme')
     if k == 'DmaMemcpy' and row['inputs'] and row['inputs'][0]['shape'] == [1, 4096, 1024]:
         names.append('woa_copy')
-    if p == 'wo_a 分组输出 BMM':
+    if p in ('wo_a 分组输出 BMM', 'wo_a 分组输出 GEMM'):
         names.append('woa_mme')
     if row['engine'] == 'MME' and cat == 'Attention':
         names.append('attention_all_projection_mme')
@@ -218,11 +218,11 @@ def main():
             for tag, v in unions.items()
         },
         'chain_activity_union_ms': {
-            name: length(merge([x for tag in parts for x in unions[tag]])) / scale
+            name: length(merge([x for tag in parts for x in unions.get(tag, [])])) / scale
             for name, parts in chains.items()
         },
         'woa_copy_without_any_rank_compute_ms':
-        length(subtract(unions['woa_copy'], unions['all_compute'])) / scale,
+        length(subtract(unions.get('woa_copy', []), unions['all_compute'])) / scale,
         'limitations': [
             'Overlapping activity unions are not additive or removable wall time.',
             'Busy TPC cores do not imply useful instruction issue; hardware stall counters are unavailable here.',

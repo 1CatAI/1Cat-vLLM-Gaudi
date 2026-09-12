@@ -37,7 +37,7 @@ def main(rank, ROOT, OUT):
             reasons[key] = 'expert_mme'
         elif r['kernel'] == 'DmaMemcpy' and r['inputs'] and r['inputs'][0]['shape'] == [1, 4096, 1024]:
             reasons[key] = 'woa_copy'
-        elif r['engine'] == 'MME' and r['purpose'] == 'wo_a 分组输出 BMM':
+        elif r['engine'] == 'MME' and r['purpose'] in ('wo_a 分组输出 BMM', 'wo_a 分组输出 GEMM'):
             reasons[key] = 'woa_mme'
     for i, symbol in mapped.items():
         node = inv['nodes'][i]
@@ -132,6 +132,15 @@ def main(rank, ROOT, OUT):
             continue
         prod = producers.get((key[0], r['inputs'][1]['name']))
         if prod is None:
+            if reasons[key] == 'woa_mme' and r['inputs'][1]['location'] == 'DRAM':
+                paired.append(
+                    dict(producer=None,
+                         consumer=key,
+                         kind='woa_direct_weight',
+                         input_bytes=r['inputs'][1]['bytes'],
+                         qualification='MME reads DRAM operand; no separate decoded/copy producer. '
+                         'Memory stalls are included in MME activity and not independently measured.'))
+                continue
             raise RuntimeError(('missing producer', key))
         wait = []
         chain = []

@@ -8,14 +8,22 @@ DeepSeek dba1be0 reference. No CUDA/Triton implementation is imported.
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from vllm_gaudi import envs as gaudi_envs
 from vllm_gaudi.ops.deepseek_v41_math import (
-    apply_rope, pack_fp4, pack_swa, rms_norm, rotary_table, unpack_fp4, unpack_swa,
+    apply_rope,
+    pack_fp4,
+    pack_swa,
+    rms_norm,
+    rotary_table,
+    unpack_fp4,
+    unpack_swa,
 )
 
 
 class CSA2SharedState(nn.Module):
+
     def __init__(self, config, layer_start, layer_stop, device, max_length=512):
         super().__init__()
         if not 1 <= max_length <= config["index_topk"] or max_length > 512:
@@ -36,18 +44,23 @@ class CSA2SharedState(nn.Module):
         for source in config["index_source_layer_ids"]:
             if layer_start <= source < layer_stop:
                 cache = nn.Module()
-                cache.register_buffer("indices", torch.full((max_length, 512), -1, dtype=torch.int32, device=device), False)
+                cache.register_buffer("indices", torch.full((max_length, 512), -1, dtype=torch.int32, device=device),
+                                      False)
                 self.topk[str(source)] = cache
         candidate_source = config["candidate_source_layer_id"]
         if layer_start <= candidate_source < layer_stop:
-            self.register_buffer("candidate_pool", torch.full(
-                (max_length, config["candidate_topk_blocks"], config["candidate_block_size"]),
-                -1, dtype=torch.int32, device=device), False)
+            self.register_buffer(
+                "candidate_pool",
+                torch.full((max_length, config["candidate_topk_blocks"], config["candidate_block_size"]),
+                           -1,
+                           dtype=torch.int32,
+                           device=device), False)
         else:
             self.register_buffer("candidate_pool", None, False)
 
 
 class CSA2Attention(nn.Module):
+
     def __init__(self, weights, config, layer, shared, linear, reduce, device):
         super().__init__()
         self.weights = weights
@@ -69,12 +82,15 @@ class CSA2Attention(nn.Module):
         if self.c1_indices and not self.bounded_decode:
             raise ValueError("Native C1 index preparation requires bounded packed attention")
         self.prepared_output = gaudi_envs.VLLM_HPU_DSV41_PREPARED_OUTPUT and layer < config["num_hidden_layers"]
+        self.output_gemm_layout = (gaudi_envs.VLLM_HPU_DSV41_OUTPUT_GEMM_LAYOUT and layer < config["num_hidden_layers"])
+        if self.output_gemm_layout and not self.prepared_output:
+            raise ValueError("V4.1 output GEMM layout requires prepared output weights")
         self.linear, self.reduce = linear, reduce
         self.layer, self.ratio, self.length = layer, config["compress_ratios"][layer], shared.length
         self.heads, self.groups = config["num_attention_heads"] // 2, config["o_groups"] // 2
         self.eps, self.window = config["rms_norm_eps"], config["sliding_window"]
-        if (self.c1_indices or self.native_rope) and (
-                self.length != 512 or self.window != 128 or config["qk_rope_head_dim"] != 64):
+        if (self.c1_indices or self.native_rope) and (self.length != 512 or self.window != 128
+                                                      or config["qk_rope_head_dim"] != 64):
             raise ValueError("Native V4.1 C1 preparation requires context512, SWA128 and RoPE64")
         self.owns_kv = layer in config["kv_source_layer_ids"]
         self.owns_index = layer in config["index_source_layer_ids"]
@@ -94,8 +110,8 @@ class CSA2Attention(nn.Module):
         scaling = config["rope_scaling"]
         table = rotary_table(config["qk_rope_head_dim"], self.length,
                              config["compress_rope_theta"] if self.ratio else config["rope_theta"],
-                             scaling["original_max_position_embeddings"] if self.ratio else 0,
-                             scaling["factor"], scaling["beta_fast"], scaling["beta_slow"])
+                             scaling["original_max_position_embeddings"] if self.ratio else 0, scaling["factor"],
+                             scaling["beta_fast"], scaling["beta_slow"])
         self.register_buffer("rotary", table.to(device), False)
         # V4's verified TPC helper consumes [cos32, sin32]. Prepare both signs
         # once; preserve the original interleaved table for non-C1 execution.
@@ -109,18 +125,29 @@ class CSA2Attention(nn.Module):
         self.register_buffer("inactive_compressed", self.compressed_offsets.view(1, 512), False)
         self.register_buffer("scale", torch.tensor([512**-0.5], device=device, dtype=torch.float32), False)
         if layer == self.candidate_source:
-            self.register_buffer("candidate_offsets", torch.arange(
-                config["candidate_topk_blocks"] * config["candidate_block_size"],
-                device=device, dtype=torch.int32), False)
+            self.register_buffer(
+                "candidate_offsets",
+                torch.arange(config["candidate_topk_blocks"] * config["candidate_block_size"],
+                             device=device,
+                             dtype=torch.int32), False)
 
     def prepare_output_weight(self):
         if self.prepared_output:
             weight = self.weights.wo_a.weight
             if weight.dtype != torch.bfloat16 or weight.numel() != self.heads * 512 * 1024:
                 raise ValueError("V4.1 output weight contract changed")
-            self.weights.wo_a.weight = weight.reshape(self.groups, 1024, -1).transpose(1, 2).contiguous()
+            grouped = weight.reshape(self.groups, 1024, -1)
+            self.weights.wo_a.weight = (grouped if self.output_gemm_layout else grouped.transpose(1, 2).contiguous())
 
     def project_output(self, value):
+        if self.output_gemm_layout:
+            weight = self.weights.wo_a.weight
+            if value.shape[0] == 1:
+                # Statically unrolled inside the stage graph. Each projection
+                # retains complete K and the input's existing BF16 boundary.
+                return torch.cat(tuple(F.linear(value[:, group], weight[group]) for group in range(self.groups)),
+                                 dim=-1)
+            return torch.einsum("tgd,grd->tgr", value, weight).flatten(1)
         if self.prepared_output:
             return torch.einsum("tgd,gdr->tgr", value, self.weights.wo_a.weight).flatten(1)
         weight = self.weights.wo_a.weight.reshape(self.groups, 1024, -1)
@@ -217,8 +244,8 @@ class CSA2Attention(nn.Module):
                 # At context <=512, Full/Reindex/Reuse retain every visible
                 # compressed row followed by invalid padding. Keep its order.
                 if not use_c1_indices:
-                    lengths = (self.window + (positions + 1) // self.ratio if self.ratio else
-                               torch.full_like(positions, self.window))
+                    lengths = (self.window +
+                               (positions + 1) // self.ratio if self.ratio else torch.full_like(positions, self.window))
                 if compressed_completion is not None:
                     output = torch.ops.custom_op.custom_deepseek_v41_packed_attention_bf16_ordered_cache_lengths_gaudi2(
                         query.contiguous(), self.swa, main, indices.contiguous(), self.weights.attn_sink, self.scale,

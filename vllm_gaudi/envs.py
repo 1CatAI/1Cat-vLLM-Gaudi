@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_DEVICE_COMMIT: bool = False
     VLLM_HPU_DSV41_NATIVE_PP_COPY: bool = False
     VLLM_HPU_DSV41_PREPARED_OUTPUT: bool = False
+    VLLM_HPU_DSV41_OUTPUT_GEMM_LAYOUT: bool = False
     VLLM_HPU_DSV41_BOUNDED_ATTENTION: bool = False
     VLLM_HPU_DSV41_ISOLATE_CONTROL: bool = False
     VLLM_HPU_DSV41_ENGINE_CPUS: Optional[str] = None
@@ -274,6 +275,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HPU_DSV41_PREPARED_OUTPUT":
     lambda: os.environ.get("VLLM_HPU_DSV41_PREPARED_OUTPUT", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_EXPERT_K128": lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_K128", "0") == "1",
+    "VLLM_HPU_DSV41_OUTPUT_GEMM_LAYOUT":
+    lambda: os.environ.get("VLLM_HPU_DSV41_OUTPUT_GEMM_LAYOUT", "0") == "1",
     "VLLM_HPU_DSV41_FP8_DECODE": lambda: os.environ.get("VLLM_HPU_DSV41_FP8_DECODE", "0") == "1",
     "VLLM_HPU_DSV41_FP8_SIDECAR": lambda: os.environ.get("VLLM_HPU_DSV41_FP8_SIDECAR", ""),
     "VLLM_HPU_DSV41_FP8_CONFIG": lambda: os.environ.get("VLLM_HPU_DSV41_FP8_CONFIG", ""),

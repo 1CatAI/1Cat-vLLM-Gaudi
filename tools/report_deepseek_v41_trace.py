@@ -62,7 +62,7 @@ def classify(node, kernel, inputs, outputs):
                 return "Attention", "Compressor FP32 投影；wkv/wgate 绑定尚待逐节点还原"
             shapes = {(1280, 5120): "wq_a 输入投影", (16384, 1280): "wq_b Q 展开",
                       (512, 5120): "wkv 输入投影", (5120, 4096): "wo_b 输出投影",
-                      (128, 512): "index K 投影"}
+                      (128, 512): "index K 投影", (1024, 4096): "wo_a 分组输出 GEMM"}
             if "/bmm" in name:
                 return "Attention", "wo_a 分组输出 BMM"
             return "Attention", shapes.get(tuple(weight), "Compressor/其他投影，见节点合同")
