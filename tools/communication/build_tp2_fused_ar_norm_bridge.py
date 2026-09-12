@@ -140,6 +140,10 @@ def main() -> None:
         "schema": 1,
         "torch_version": torch.__version__,
         "binary_sha256": digest(binary),
+        "adapter_sources": {
+            str(path.resolve()): digest(path)
+            for path in (source, source.with_name("tp2_input_preflight.h"))
+        },
         "eager_runtime": [{
             "path": str(path),
             "sha256": digest(path)

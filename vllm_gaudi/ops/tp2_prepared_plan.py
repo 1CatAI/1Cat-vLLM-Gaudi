@@ -162,7 +162,7 @@ def _flush():
                 if groups == full_groups and context is not None and context.get("outputs") is not None:
                     from vllm_gaudi.ops.tp2_graph_inputs import FixedDecodeInputs
 
-                    bindings = FixedDecodeInputs(context["owner"], context, inputs)
+                    bindings = FixedDecodeInputs(context["owner"], context, inputs, native_bridge=bridge)
                     graph.bind_dynamic_inputs(bindings.tensors())
                     if v4 and bindings.state_tensors:
                         if not hasattr(graph, "bind_state_tensors"):

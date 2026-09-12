@@ -165,11 +165,18 @@ def initialize_tp2_fused_ar_norm_runtime() -> None:
 
     log.info("TP2 prepared runtime: loading native adapter")
     bridge = _load_bridge(bridge_path)
+    from vllm_gaudi import envs
+
+    if envs.VLLM_HPU_DSV41_NATIVE_INPUT_PREFLIGHT:
+        if not v41:
+            raise RuntimeError("V4.1 native input preflight requires V4.1 graph replay")
+        if (getattr(bridge, "fixed_input_preflight_api_version", None) != 1
+                or not hasattr(bridge, "FixedInputPreflight")):
+            raise RuntimeError("V4.1 native input preflight requires the version 1 bridge API")
     bridge.set_use_tensor_ids(use_tensor_ids == "1")
     backend = tp_group._get_backend(torch.device("hpu"))
     communicator_id = bridge.communicator_id(backend)
     setattr(torch, _RUNTIME_ATTR, (bridge, backend, communicator_id))
-    from vllm_gaudi import envs
 
     if envs.VLLM_HPU_TP2_NATIVE_DYNAMIC_QUANT:
         if torch.hpu.get_device_name().upper().replace(" ", "") != "GAUDI2":

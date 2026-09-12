@@ -149,10 +149,19 @@ def main(rank, ROOT, OUT):
         wait = []
         chain = []
         sample = None
+        incomplete_windows = []
         if reasons[prod] == 'expert_decode':
             for w in range(len(windows)):
                 aa, bb = calls.get((prod, w), []), calls.get((key, w), [])
-                assert len(aa) == len(bb), (prod, key, w, len(aa), len(bb))
+                if len(aa) != len(bb):
+                    # A common window may cut a different rank's invocation.
+                    # Retain all activity but do not invent matching endpoints.
+                    incomplete_windows.append({
+                        'window': w,
+                        'reconstructed_producers': len(aa),
+                        'reconstructed_consumers': len(bb)
+                    })
+                    continue
                 for a, b in zip(aa, bb):
                     wait.append((b['start'] - a['end']) / 1000)
                     chain.append((b['end'] - a['start']) / 1000)
@@ -179,6 +188,9 @@ def main(rank, ROOT, OUT):
                  input_bytes=r['inputs'][1]['bytes'],
                  wait_or_overlap_ms=statistics_ms(wait),
                  chain_envelope_ms=statistics_ms(chain),
+                 incomplete_windows=incomplete_windows,
+                 pairing_qualification='Endpoint statistics use only equally reconstructed complete calls; '
+                 'activity unions retain all clipped packets.',
                  first_window_example=sample))
     es = merge(spans['expert_decode'])
     em = merge(spans['expert_mme'])

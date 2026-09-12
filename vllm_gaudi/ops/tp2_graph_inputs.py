@@ -60,7 +60,7 @@ class FixedDecodeInputs:
     merely because they share one storage (e.g. separate cosine/sine slices).
     """
 
-    def __init__(self, model, roots, captured_inputs):
+    def __init__(self, model, roots, captured_inputs, native_bridge=None):
         used = {_storage(value) for row in captured_inputs for value in row if isinstance(value, torch.Tensor)}
         candidates = []
         for name in ("positions", "hidden_states", "residual", "pre_mix", "input_ids", "metadata_pack"):
@@ -74,12 +74,14 @@ class FixedDecodeInputs:
                 if pack is None or _storage(value) != _storage(pack):
                     candidates.append(("attention_inputs", index, None, value))
         else:
+
             def discover(value, path=()):
                 for name, item in _metadata_items(value):
                     if isinstance(item, torch.Tensor):
                         candidates.append(("metadata", (*path, name), None, item))
                     elif isinstance(item, dict) or is_dataclass(item):
                         discover(item, (*path, name))
+
             discover(metadata)
         # Rotary preparation is already compiled, but replaces these buffers
         # before each decoder invocation. Their values must reach captured views.
@@ -106,10 +108,19 @@ class FixedDecodeInputs:
         self.input_copies = 0
         self.state_generation = roots.get("state_generation")
         self.state_tensors = tuple(roots.get("state_tensors", ()))
-        self.state_signatures = tuple((_storage(value), _address(value), _layout(value))
-                                      for value in self.state_tensors)
+        self.state_signatures = tuple(
+            (_storage(value), _address(value), _layout(value)) for value in self.state_tensors)
         adapter_name = getattr(roots.get("adapter"), "name", "")
         self.native_staging = adapter_name == "deepseek_v4" or adapter_name.startswith("deepseek_v41_")
+        self.native_preflight = None
+        if adapter_name.startswith("deepseek_v41_"):
+            from vllm_gaudi import envs
+
+            if envs.VLLM_HPU_DSV41_NATIVE_INPUT_PREFLIGHT:
+                if (getattr(native_bridge, "fixed_input_preflight_api_version", None) != 1
+                        or not hasattr(native_bridge, "FixedInputPreflight")):
+                    raise RuntimeError("V4.1 native input preflight requires the version 1 bridge API")
+                self.native_preflight = native_bridge.FixedInputPreflight(self.state_tensors, self.tensors())
 
     def updates(self, roots):
         """Preflight every changing binding before copying any input."""
@@ -117,14 +128,20 @@ class FixedDecodeInputs:
         if roots.get("state_generation") != self.state_generation:
             return None
         state = tuple(roots.get("state_tensors", ()))
-        if len(state) != len(self.state_tensors) or any(
+        if self.native_preflight is None and (len(state) != len(self.state_tensors) or any(
                 not isinstance(value, torch.Tensor) or (_storage(value), _address(value), _layout(value)) != signature
-                for value, signature in zip(state, self.state_signatures)):
+                for value, signature in zip(state, self.state_signatures))):
             return None
         if type(metadata) is not self.metadata_type:
             return None
         if any(getattr(metadata, name, None) != value for name, value in self.static_metadata.items()):
             return None
+        if self.native_preflight is not None:
+            sources = [binding.read(roots) for binding in self.bindings]
+            changed = self.native_preflight.updates(state, sources)
+            if changed is None:
+                return None
+            return [(self.bindings[index].destination, sources[index]) for index in changed]
         pending = []
         for binding in self.bindings:
             source = binding.read(roots)
@@ -140,8 +157,7 @@ class FixedDecodeInputs:
 
     def apply(self, updates, graph=None):
         if self.native_staging and graph is not None:
-            graph.stage_fixed_inputs([source for _, source in updates],
-                                     [destination for destination, _ in updates])
+            graph.stage_fixed_inputs([source for _, source in updates], [destination for destination, _ in updates])
         else:
             for destination, source in updates:
                 destination.copy_(source)
