@@ -134,6 +134,9 @@ def test_profiler_recapture_waits_before_retiring_commands_and_preserves_recipes
     plan = first.plans[0]
 
     class Graph:
+        def state(self):
+            return 2
+
         def reset_slots(self):
             events.append("reset")
 
@@ -149,6 +152,24 @@ def test_profiler_recapture_waits_before_retiring_commands_and_preserves_recipes
     assert replay._native_program_generation == generation + 1
     with replay.collect_prepared_group_replays(), pytest.raises(RuntimeError, match="inside a decoder call"):
         replay.recapture_native_decoder_programs()
+
+
+def test_rejected_capture_closes_without_resetting_uninstantiated_slots():
+    events = []
+
+    class RejectedGraph:
+        def state(self):
+            return 1
+
+        def reset_slots(self):
+            raise AssertionError("A rejected capture has no instantiated replay slots")
+
+        def close(self):
+            events.append("close")
+
+    replay._native_graphs["rejected"] = RejectedGraph()
+    replay._release_native_graphs()
+    assert events == ["close"] and not replay._native_graphs
 
 
 @pytest.mark.parametrize("groups", [1, 8])

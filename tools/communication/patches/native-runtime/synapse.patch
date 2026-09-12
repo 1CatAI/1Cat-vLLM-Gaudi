@@ -2553,10 +2553,10 @@ index fc94c65..850dc1a 100644
  
  #endif /*_SYN_SYN_SINGLETON_INTERFACE_H_*/
 diff --git a/synapse/include/synapse_api.h b/synapse/include/synapse_api.h
-index f765083..4682d5f 100644
+index f765083..43574b7 100644
 --- a/synapse/include/synapse_api.h
 +++ b/synapse/include/synapse_api.h
-@@ -114,6 +114,36 @@ synStatus SYN_API_CALL synStreamSynchronize( const synStreamHandle streamHandle
+@@ -114,6 +114,40 @@ synStatus SYN_API_CALL synStreamSynchronize( const synStreamHandle streamHandle
   */
  synStatus SYN_API_CALL synStreamQuery( const synStreamHandle streamHandle );
  
@@ -2587,13 +2587,17 @@ index f765083..4682d5f 100644
 +synStatus SYN_API_CALL synNativeComputeGraphPreparePlan(synNativeComputeGraphHandle graphHandle,
 +    const uint32_t* consumerSegments, uint64_t count, uint32_t nicLongSoIndex,
 +    synNativeGraphExchangeReplay exchangeReplay, void* context);
++// V2: producerSegments names the completed segment; UINT32_MAX means external input.
++synStatus SYN_API_CALL synNativeComputeGraphPreparePlanV2(synNativeComputeGraphHandle graphHandle,
++    const uint32_t* producerSegments, const uint32_t* consumerSegments, uint64_t count, uint32_t nicLongSoIndex,
++    synNativeGraphExchangeReplay exchangeReplay, void* context);
 +synStatus SYN_API_CALL synNativeComputeGraphReplayPlan(synNativeComputeGraphHandle graphHandle,
 +    synNativeGraphSyncInfo* completion, uint64_t* statistics, uint64_t statisticsCount);
 +
  //!
  /*!
   ***************************************************************************************************
-@@ -1351,6 +1381,12 @@ synStatus SYN_API_CALL synNodeSetDeterministic( const synGraphHandle   graphHand
+@@ -1351,6 +1385,12 @@ synStatus SYN_API_CALL synNodeSetDeterministic( const synGraphHandle   graphHand
                                                  const synNodeId        nodeId,
                                                  const bool             useDeterministic);
  
@@ -2606,7 +2610,7 @@ index f765083..4682d5f 100644
  //!
  /*!
   ***************************************************************************************************
-@@ -2315,6 +2351,13 @@ synStatus SYN_API_CALL synTensorSetQuantizationData(synTensor               tens
+@@ -2315,6 +2355,13 @@ synStatus SYN_API_CALL synTensorSetQuantizationData(synTensor               tens
  synStatus SYN_API_CALL synTensorSetExternal(synTensor               tensor,
                                              bool                    isExternal);
  
@@ -2620,7 +2624,7 @@ index f765083..4682d5f 100644
  //!
  /*!
   ***************************************************************************************************
-@@ -2627,6 +2670,8 @@ synStatus SYN_API_CALL synTensorGetGeometryExt(const synTensor         tensor,
+@@ -2627,6 +2674,8 @@ synStatus SYN_API_CALL synTensorGetGeometryExt(const synTensor         tensor,
  synStatus SYN_API_CALL synTensorGetExternal(const synTensor         tensor,
                                              bool*                   isExternal);
  
@@ -2629,7 +2633,7 @@ index f765083..4682d5f 100644
  //!
  /*!
   ***************************************************************************************************
-@@ -2896,6 +2941,19 @@ synStatus SYN_API_CALL synNodeGetUserParams( const synGraphHandle   graphHandle,
+@@ -2896,6 +2945,19 @@ synStatus SYN_API_CALL synNodeGetUserParams( const synGraphHandle   graphHandle,
   */
  synStatus SYN_API_CALL synStatusGetBriefDescription(synStatus status, char* statusDescription, size_t len);
  
@@ -5974,7 +5978,7 @@ index 387a2ee..c562c4e 100644
 +}
 diff --git a/synapse/src/runtime/scal/common/native_compute_graph.hpp b/synapse/src/runtime/scal/common/native_compute_graph.hpp
 new file mode 100644
-index 0000000..77417c1
+index 0000000..1e638ca
 --- /dev/null
 +++ b/synapse/src/runtime/scal/common/native_compute_graph.hpp
 @@ -0,0 +1,110 @@
@@ -6040,7 +6044,7 @@ index 0000000..77417c1
 +                            ScalLongSyncObject&       completion);
 +    synStatus close();
 +    synStatus preparePlan(const uint32_t* consumerSegments, uint64_t count, uint32_t nicLongSoIndex,
-+                          synNativeGraphExchangeReplay callback, void* context);
++                          synNativeGraphExchangeReplay callback, void* context, const uint32_t* producers = nullptr);
 +    synStatus replayPlan(synNativeGraphSyncInfo& completion, uint64_t* statistics, uint64_t count);
 +
 +    CompiledSegment* addPendingSegment(uint64_t                      globalSize,
@@ -6120,10 +6124,10 @@ index 0000000..2e1f4ad
 +};
 diff --git a/synapse/src/runtime/scal/common/native_compute_program.hpp b/synapse/src/runtime/scal/common/native_compute_program.hpp
 new file mode 100644
-index 0000000..6d2af18
+index 0000000..334705e
 --- /dev/null
 +++ b/synapse/src/runtime/scal/common/native_compute_program.hpp
-@@ -0,0 +1,170 @@
+@@ -0,0 +1,185 @@
 +#pragma once
 +
 +#include <algorithm>
@@ -6198,17 +6202,26 @@ index 0000000..6d2af18
 +        const std::vector<uint32_t>& consumers,
 +        const std::vector<NativeComputeWaitPacket>& waitPackets,
 +        uint32_t alignment, uint64_t availableBytes, bool deferredTerminalRetirement = false,
-+        bool externalInputCompletion = false)
++        bool externalInputCompletion = false, const std::vector<uint32_t>& producers = {})
 +    {
 +        if (segments.empty() || consumers.empty() || consumers.size() > 128 || waitPackets.empty() ||
 +            alignment == 0 || (alignment & (alignment - 1)) != 0)
 +            throw std::invalid_argument("Invalid native compute plan shape");
++        if (!producers.empty() && producers.size() != consumers.size())
++            throw std::invalid_argument("Native producer/consumer coverage differs");
 +        for (size_t i = 0; i < consumers.size(); ++i)
++        {
 +            if ((consumers[i] == 0 && !externalInputCompletion) || consumers[i] >= segments.size() ||
 +                (i && consumers[i] < consumers[i - 1]))
 +                throw std::invalid_argument("Native NIC consumers must follow ordered producers");
++            if (!producers.empty() &&
++                (producers[i] == UINT32_MAX ? !externalInputCompletion : producers[i] >= consumers[i]))
++                throw std::invalid_argument("Native producer must finish before its consumer");
++        }
 +        NativeComputeProgram plan;
-+        plan.externalInputCompletion = externalInputCompletion && consumers.front() == 0;
++        plan.externalInputCompletion = externalInputCompletion &&
++            (producers.empty() ? consumers.front() == 0 :
++             std::find(producers.begin(), producers.end(), UINT32_MAX) != producers.end());
 +        auto append = [&](const std::vector<uint8_t>& bytes, const std::vector<NativeComputePatch>& patches,
 +                          uint32_t dependency, bool completes) {
 +            if (bytes.empty() || bytes.size() > alignment)
@@ -6237,6 +6250,7 @@ index 0000000..6d2af18
 +            ++plan.sourcePacketCount;
 +        };
 +        size_t nextConsumer = 0;
++        std::vector<uint64_t> segmentEnds(segments.size());
 +        for (size_t segment = 0; segment < segments.size(); ++segment)
 +        {
 +            const auto* source = segments[segment];
@@ -6248,7 +6262,11 @@ index 0000000..6d2af18
 +            {
 +                if (!plan.completionDelta && !plan.externalInputCompletion)
 +                    throw std::invalid_argument("NIC has no compute producer");
-+                plan.producerOffsets.push_back(plan.completionDelta);
++                const uint64_t producer = producers.empty() ? plan.completionDelta :
++                    (producers[nextConsumer] == UINT32_MAX ? 0 : segmentEnds.at(producers[nextConsumer]));
++                if (!producer && !plan.externalInputCompletion)
++                    throw std::invalid_argument("Native producer has no completion target");
++                plan.producerOffsets.push_back(producer);
 +                for (const auto& packet : waitPackets) append(packet.bytes, packet.patches, nextConsumer, false);
 +                ++nextConsumer;
 +            }
@@ -6256,6 +6274,7 @@ index 0000000..6d2af18
 +                throw std::overflow_error("Native compute completion overflow");
 +            plan.completionDelta += source->completionIncrementsBeforeCommands;
 +            for (const auto& command : source->commands) append(command.bytes, {}, 0, command.completesChunk);
++            segmentEnds[segment] = plan.completionDelta;
 +        }
 +        if (nextConsumer != consumers.size() || (!plan.pages.back().endsCompletion && !deferredTerminalRetirement) ||
 +            !plan.completionDelta || plan.completionDelta >= (uint64_t(1) << 60) - 1)
@@ -6557,7 +6576,7 @@ index 04f5b65..df92eb6 100644
      uint32_t m_computeWorkCompletionValue   = 0;
  };
 diff --git a/synapse/src/runtime/scal/common/stream_compute_scal.cpp b/synapse/src/runtime/scal/common/stream_compute_scal.cpp
-index df58f41..05aa264 100644
+index df58f41..f3a3611 100644
 --- a/synapse/src/runtime/scal/common/stream_compute_scal.cpp
 +++ b/synapse/src/runtime/scal/common/stream_compute_scal.cpp
 @@ -1,4 +1,5 @@
@@ -6566,7 +6585,7 @@ index df58f41..05aa264 100644
  
  #include "habana_global_conf_runtime.h"
  #include "runtime/common/recipe/recipe_handle_impl.hpp"
-@@ -13,23 +14,570 @@
+@@ -13,23 +14,572 @@
  
  #include "runtime/scal/common/entities/scal_completion_group.hpp"
  #include "runtime/scal/common/entities/scal_memory_pool.hpp"
@@ -6895,7 +6914,7 @@ index df58f41..05aa264 100644
 +}
 +
 +synStatus NativeComputeGraph::preparePlan(const uint32_t* consumers, uint64_t count, uint32_t nicIndex,
-+                                         synNativeGraphExchangeReplay callback, void* context)
++                                         synNativeGraphExchangeReplay callback, void* context, const uint32_t* producers)
 +{
 +    if (m_state != State::INSTANTIATED || m_replayActive || m_jointPlan || !consumers || !callback || !context ||
 +        !count || count > 128 || nicIndex % 8 || (nicIndex >> 3) > 0xff)
@@ -6913,7 +6932,9 @@ index df58f41..05aa264 100644
 +        const bool terminalRelease = m_streamBase.nativeTerminalRelease(m_segments.back().commands);
 +        plan->program = NativeComputeProgram::prepare(buffers, {consumers, consumers + count},
 +            m_streamBase.prepareNativeWaitPackets(nicIndex), m_streamBase.nativeCommandAlignment(),
-+            m_streamBase.nativeAvailableBytes(), terminalRelease, consumers[0] == 0);
++            m_streamBase.nativeAvailableBytes(), terminalRelease,
++            producers ? std::find(producers, producers + count, UINT32_MAX) != producers + count : consumers[0] == 0,
++            producers ? std::vector<uint32_t>(producers, producers + count) : std::vector<uint32_t>{});
 +        plan->nicLongSoIndex = nicIndex;
 +        plan->callback = callback;
 +        plan->context = context;
@@ -7138,7 +7159,7 @@ index df58f41..05aa264 100644
    m_computeResources(*pComputeResources)
  {
      // Currently, we will have internal-signal for the TX-Command
-@@ -40,6 +588,171 @@ QueueComputeScal::QueueComputeScal(const BasicQueueInfo&           rBasicQueueIn
+@@ -40,6 +590,186 @@ QueueComputeScal::QueueComputeScal(const BasicQueueInfo&           rBasicQueueIn
  
  QueueComputeScal::~QueueComputeScal() {}
  
@@ -7226,11 +7247,11 @@ index df58f41..05aa264 100644
 +}
 +
 +synStatus QueueComputeScal::prepareNativeComputePlan(NativeComputeGraph& graph, const uint32_t* consumers,
-+    uint64_t count, uint32_t nicIndex, synNativeGraphExchangeReplay callback, void* context)
++    uint64_t count, uint32_t nicIndex, synNativeGraphExchangeReplay callback, void* context, const uint32_t* producers)
 +{
 +    std::lock_guard<std::timed_mutex> lock(m_userOpLock);
 +    if (m_activeNativeGraph != nullptr) return synInvalidArgument;
-+    return graph.preparePlan(consumers, count, nicIndex, callback, context);
++    return graph.preparePlan(consumers, count, nicIndex, callback, context, producers);
 +}
 +
 +synStatus QueueComputeScal::replayNativeComputePlan(NativeComputeGraph& graph, synNativeGraphSyncInfo& completion,
@@ -7275,6 +7296,21 @@ index df58f41..05aa264 100644
 +    return synSuccess;
 +}
 +
++extern "C" synStatus SYN_API_CALL synNativeComputeGraphPreparePlanV2(synNativeComputeGraphHandle handle,
++    const uint32_t* producers, const uint32_t* consumers, uint64_t count, uint32_t nicIndex, synNativeGraphExchangeReplay callback, void* context)
++{
++    if (!producers || !handle || !handle->queue || !handle->graph || !handle->stream) return synInvalidArgument;
++    std::lock_guard<std::mutex> lock(handle->replayMutex);
++    if (handle->preparedReplayJob) return synInvalidArgument;
++    const synStatus status = handle->queue->prepareNativeComputePlan(*handle->graph, consumers, count, nicIndex,
++                                                                    callback, context, producers);
++    if (status != synSuccess) return status;
++    // Instantiated once. Stream::addJob runs this same object synchronously;
++    // no per-recipe executor or per-replay job allocation is introduced.
++    handle->preparedReplayJob = std::make_unique<NativeComputeReplayJob>(*handle);
++    return synSuccess;
++}
++
 +extern "C" synStatus SYN_API_CALL synNativeComputeGraphGetWorkspaceBytes(synNativeComputeGraphHandle handle,
 +                                                                        uint64_t* bytes)
 +{
@@ -7310,7 +7346,7 @@ index df58f41..05aa264 100644
  synStatus QueueComputeScal::eventRecord(EventInterface& rEventInterface, synStreamHandle streamHandle)
  {
      LOG_DEBUG(SYN_STREAM, "{} Stream {}", HLLOG_FUNC, m_basicQueueInfo.getDescription());
-@@ -332,6 +1045,52 @@ synStatus QueueComputeScal::launch(const LaunchInfo& launchInfo)
+@@ -332,6 +1062,52 @@ synStatus QueueComputeScal::launch(const LaunchInfo& launchInfo)
      ScalStreamComputeInterface* pComputeScalStream = dynamic_cast<ScalStreamComputeInterface*>(m_scalStream);
      VERIFY_IS_NULL_POINTER(SYN_STREAM, pComputeScalStream, "pComputeScalStream");
  
@@ -7363,7 +7399,7 @@ index df58f41..05aa264 100644
      std::unique_ptr<RecipeLauncher> recipeLauncher = std::make_unique<RecipeLauncher>(pComputeScalStream,
                                                                                        &m_computeResources,
                                                                                        m_devMemoryAlloc,
-@@ -340,11 +1099,21 @@ synStatus QueueComputeScal::launch(const LaunchInfo& launchInfo)
+@@ -340,11 +1116,21 @@ synStatus QueueComputeScal::launch(const LaunchInfo& launchInfo)
                                                                                        launchInfo.pRecipeHandle,
                                                                                        dsdProcessor,
                                                                                        ++m_runningId,
@@ -7388,7 +7424,7 @@ index df58f41..05aa264 100644
          LOG_ERR(SYN_STREAM,
                  "{}: recipeLauncher launch failed, recipe seq {}",
                  HLLOG_FUNC,
-@@ -357,6 +1126,16 @@ synStatus QueueComputeScal::launch(const LaunchInfo& launchInfo)
+@@ -357,6 +1143,16 @@ synStatus QueueComputeScal::launch(const LaunchInfo& launchInfo)
          return status;
      }
  
@@ -7406,7 +7442,7 @@ index df58f41..05aa264 100644
      m_launchTracker.add(std::move(recipeLauncher));
  
 diff --git a/synapse/src/runtime/scal/common/stream_compute_scal.hpp b/synapse/src/runtime/scal/common/stream_compute_scal.hpp
-index 11acbd0..28b6e68 100644
+index 11acbd0..202941a 100644
 --- a/synapse/src/runtime/scal/common/stream_compute_scal.hpp
 +++ b/synapse/src/runtime/scal/common/stream_compute_scal.hpp
 @@ -13,6 +13,8 @@ struct PreAllocatedStreamMemoryAll;
@@ -7440,7 +7476,7 @@ index 11acbd0..28b6e68 100644
 +    synStatus replayNativeComputeGraph(NativeComputeGraph& graph);
 +    synStatus beginNativeComputeGraphReplay(NativeComputeGraph& graph);
 +    synStatus prepareNativeComputePlan(NativeComputeGraph& graph, const uint32_t* consumers,
-+        uint64_t count, uint32_t nicIndex, synNativeGraphExchangeReplay callback, void* context);
++        uint64_t count, uint32_t nicIndex, synNativeGraphExchangeReplay callback, void* context, const uint32_t* producers = nullptr);
 +    synStatus replayNativeComputePlan(NativeComputeGraph& graph, synNativeGraphSyncInfo& completion,
 +        uint64_t* statistics, uint64_t count);
 +    synStatus replayNativeComputeGraphSegment(NativeComputeGraph&       graph,

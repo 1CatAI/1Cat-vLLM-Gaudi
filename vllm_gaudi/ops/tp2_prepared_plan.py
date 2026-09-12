@@ -252,8 +252,13 @@ def _release_native_graphs():
     _native_entries.clear()
     if _native_graphs:
         for graph in tuple(_native_graphs.values()):
-            graph.reset_slots()
-            graph.close()
+            # A rejected cold capture has no replay slots to reset. Its
+            # partially retained programs must still reach close/abort.
+            try:
+                if graph.state() == 2:  # NativeDecodeGraph::Instantiated
+                    graph.reset_slots()
+            finally:
+                graph.close()
         _native_graphs.clear()
 
 
