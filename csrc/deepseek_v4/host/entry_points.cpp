@@ -104,6 +104,9 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_KV_CACHE_ORDERED_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_KV_VALID_ORDERED_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_KV_VALID_CACHE_ORDERED_BF16,
+    GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_KV_VEC_BF16,
+    GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_KV_VEC_ORDERED_BF16,
+    GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_KV_VEC_CACHE_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V41_SWA_PACK_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V41_SWA_PACK_WRITE_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_GEMV_F32,
@@ -381,6 +384,10 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
            fp4g32.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_FP4_PACK_G32_BF16].name);
            fp4write.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_FP4_CACHE_WRITE_BF16].name);
            DeepseekV41SelectedKVGaudi2 validOrdered(1, true), validCacheOrdered(2, true);
+           DeepseekV41SelectedKVGaudi2 vec(0, false, true), vecOrdered(1, true, true), vecCache(2, true, true);
+           vec.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_KV_VEC_BF16].name);
+           vecOrdered.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_KV_VEC_ORDERED_BF16].name);
+           vecCache.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_KV_VEC_CACHE_BF16].name);
            validOrdered.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_KV_VALID_ORDERED_BF16].name);
            validCacheOrdered.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_KV_VALID_CACHE_ORDERED_BF16].name);
            DeepseekV41SelectedKVGaudi2 cacheOrdered(2);
@@ -702,6 +709,11 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
         DeepseekV41Fp4PackGaudi2 fp4(mode);
         fp4.GetKernelName(kernelName);
         if (strcmp(params->guid.name, kernelName) == 0) return fp4.GetGcDefinitions(params, instance);
+    }
+    for (unsigned order : {0u, 1u, 2u}) {
+        DeepseekV41SelectedKVGaudi2 vector(order, order != 0, true);
+        vector.GetKernelName(kernelName);
+        if (strcmp(params->guid.name, kernelName) == 0) return vector.GetGcDefinitions(params, instance);
     }
     for (unsigned order : {1u, 2u}) {
         DeepseekV41SelectedKVGaudi2 valid(order, true);

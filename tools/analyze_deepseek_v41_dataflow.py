@@ -33,6 +33,10 @@ def main(rank, ROOT, OUT):
     for key, r in bykey.items():
         if 'mxfp4_prepared_dequant' in r['kernel']:
             reasons[key] = 'expert_decode'
+        elif 'selected_kv' in r['kernel']:
+            reasons[key] = 'selected_kv'
+        elif 'sparse_attn_bf16' in r['kernel']:
+            reasons[key] = 'sparse_attention'
         elif r['engine'] == 'MME' and r['category'] == '路由专家':
             reasons[key] = 'expert_mme'
         elif r['kernel'] == 'DmaMemcpy' and r['inputs'] and r['inputs'][0]['shape'] == [1, 4096, 1024]:

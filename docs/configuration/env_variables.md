@@ -470,6 +470,7 @@ and end-to-end performance have all been qualified. See
 - `VLLM_HPU_DSV41_C1_INDICES` (default `0`): fuse C1 SWA/window, compressed-slot mask/offset and visible-length preparation. Requires bounded packed attention; preserves Full/Reindex/Reuse state publication.
 
 - `VLLM_HPU_DSV41_SELECTED_VALID_ONLY` (default `0`): omit BF16 stores for invalid selected slots inside ordered packed attention. The attention consumer rejects their remapped `-1` IDs before loading; the public selected-KV gather retains zero-filled invalid rows. Requires SWA pack/write.
+- `VLLM_HPU_DSV41_SELECTED_KV_VECTOR` (default `0`): use full-vector C1 selected KV decoding with row scale reuse and cyclic slot work. Requires selected-valid-only; preserves the ordered attention consumer and cache write dependencies.
 
 ### V4.1 expert decoder work distribution
 

@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "deepseek_v41_selected_kv_gaudi2.hpp"
 #include <cstring>
+#include <algorithm>
+extern unsigned char _binary___deepseek_v41_selected_kv_vec_bf16_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_selected_kv_vec_bf16_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_selected_kv_vec_ordered_bf16_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_selected_kv_vec_ordered_bf16_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_selected_kv_vec_cache_bf16_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_selected_kv_vec_cache_bf16_gaudi2_o_end;
 extern unsigned char _binary___deepseek_v41_selected_kv_bf16_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_selected_kv_bf16_gaudi2_o_end;
 extern unsigned char _binary___deepseek_v41_selected_kv_ordered_bf16_gaudi2_o_start;
@@ -12,6 +19,13 @@ extern unsigned char _binary___deepseek_v41_selected_kv_valid_ordered_bf16_gaudi
 extern unsigned char _binary___deepseek_v41_selected_kv_valid_cache_ordered_bf16_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_selected_kv_valid_cache_ordered_bf16_gaudi2_o_end;
 tpc_lib_api::GlueCodeReturn DeepseekV41SelectedKVGaudi2::GetKernelName(char name[tpc_lib_api::MAX_NODE_NAME]) {
+    if (vector_) {
+        static_assert(sizeof("custom_deepseek_v41_selected_kv_vec_ordered_bf16_gaudi2") <= tpc_lib_api::MAX_NODE_NAME);
+        std::strcpy(name, ordered_ == 2 ? "custom_deepseek_v41_selected_kv_vec_cache_bf16_gaudi2" :
+                          ordered_ ? "custom_deepseek_v41_selected_kv_vec_ordered_bf16_gaudi2" :
+                                     "custom_deepseek_v41_selected_kv_vec_bf16_gaudi2");
+        return tpc_lib_api::GLUE_SUCCESS;
+    }
     if (valid_only_) {
         std::strcpy(name, ordered_ == 2 ? "custom_deepseek_v41_selected_kv_valid_cache_ordered_bf16_gaudi2" :
                                          "custom_deepseek_v41_selected_kv_valid_ordered_bf16_gaudi2");
@@ -28,6 +42,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41SelectedKVGaudi2::GetGcDefinitions(
     if (in->inputTensorNr != inputs) { in->inputTensorNr = inputs; return GLUE_INCOMPATIBLE_INPUT_COUNT; }
     if (in->outputTensorNr != 2) { in->outputTensorNr = 2; return GLUE_INCOMPATIBLE_OUTPUT_COUNT; }
     const auto slots = in->inputTensors[2].geometry.maxSizes[0];
+    if (vector_ && ordered_ && !valid_only_) return GLUE_FAILED;
     const TensorDataType types[] = {DATA_U8, DATA_U8, DATA_I32, DATA_BF16, DATA_I32};
     for (unsigned i = 0; i < 5; ++i) {
         auto& g = i < 3 ? in->inputTensors[i].geometry : in->outputTensors[i-3].geometry;
@@ -48,6 +63,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41SelectedKVGaudi2::GetGcDefinitions(
                 map.a = (i == 3 ? d == 1 : d == 0) ? 1 : 0;
                 map.start_b = 0;
                 map.end_b = i == 3 && d == 0 ? 511 : 0;
+                if (vector_ && map.a == 1) map.end_b = ((slots - 1) / 128) * 128;
             }
         }
     }
@@ -64,7 +80,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41SelectedKVGaudi2::GetGcDefinitions(
         out->inputTensorAccessPattern[4].allRequired = true;
     }
     out->indexSpaceRank = 1;
-    out->indexSpaceGeometry[0] = slots;
+    out->indexSpaceGeometry[0] = vector_ ? std::min<uint64_t>(slots, 128) : slots;
     out->kernel.paramsNr = 0;
     auto* start = ordered_ == 2 ? &_binary___deepseek_v41_selected_kv_cache_ordered_bf16_gaudi2_o_start : ordered_ ? &_binary___deepseek_v41_selected_kv_ordered_bf16_gaudi2_o_start
                            : &_binary___deepseek_v41_selected_kv_bf16_gaudi2_o_start;
@@ -75,6 +91,14 @@ tpc_lib_api::GlueCodeReturn DeepseekV41SelectedKVGaudi2::GetGcDefinitions(
                                 &_binary___deepseek_v41_selected_kv_valid_ordered_bf16_gaudi2_o_start;
         end = ordered_ == 2 ? &_binary___deepseek_v41_selected_kv_valid_cache_ordered_bf16_gaudi2_o_end :
                               &_binary___deepseek_v41_selected_kv_valid_ordered_bf16_gaudi2_o_end;
+    }
+    if (vector_) {
+        start = ordered_ == 2 ? &_binary___deepseek_v41_selected_kv_vec_cache_bf16_gaudi2_o_start :
+                ordered_ ? &_binary___deepseek_v41_selected_kv_vec_ordered_bf16_gaudi2_o_start :
+                           &_binary___deepseek_v41_selected_kv_vec_bf16_gaudi2_o_start;
+        end = ordered_ == 2 ? &_binary___deepseek_v41_selected_kv_vec_cache_bf16_gaudi2_o_end :
+              ordered_ ? &_binary___deepseek_v41_selected_kv_vec_ordered_bf16_gaudi2_o_end :
+                         &_binary___deepseek_v41_selected_kv_vec_bf16_gaudi2_o_end;
     }
     const unsigned capacity = out->kernel.elfSize;
     out->kernel.elfSize = end - start;

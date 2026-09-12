@@ -73,7 +73,8 @@ public:
         const int k = slots(stack, attention_, lengths_, ordered_, compressed_);
         const unsigned shift = attention_ ? 1 : 0;
         if (!attention_) {
-            auto result = BuildNode(this, graph, {kGather, {syn_in(0), syn_in(1), syn_in(2)},
+            const bool vector = stack.at(3).toBool();
+            auto result = BuildNode(this, graph, {vector ? "custom_deepseek_v41_selected_kv_vec_bf16_gaudi2" : kGather, {syn_in(0), syn_in(1), syn_in(2)},
                 {{{k,512}, at::kBFloat16, 0}, {{1,k}, at::kInt, 1}}});
             syn_out(0) = std::move(result.at(0)); syn_out(1) = std::move(result.at(1));
             return;
@@ -82,7 +83,11 @@ public:
         if (ordered_) gather_inputs.push_back(syn_in(7));
         if (compressed_) gather_inputs.push_back(syn_in(8));
         const bool valid_only = ordered_ && stack.at(compressed_ ? 9 : 8).toBool();
-        const char* guid = valid_only ? (compressed_ ? "custom_deepseek_v41_selected_kv_valid_cache_ordered_bf16_gaudi2"
+        const bool vector = ordered_ && stack.at(compressed_ ? 10 : 9).toBool();
+        TORCH_CHECK(!vector || valid_only, "Vector selected KV requires the ordered valid-only consumer");
+        const char* guid = vector ? (compressed_ ? "custom_deepseek_v41_selected_kv_vec_cache_bf16_gaudi2"
+                                                 : "custom_deepseek_v41_selected_kv_vec_ordered_bf16_gaudi2")
+                                     : valid_only ? (compressed_ ? "custom_deepseek_v41_selected_kv_valid_cache_ordered_bf16_gaudi2"
                                                     : "custom_deepseek_v41_selected_kv_valid_ordered_bf16_gaudi2")
                                      : (compressed_ ? kCacheOrderedGather : ordered_ ? kOrderedGather : kGather);
         auto selected = BuildNode(this, graph, {guid,
@@ -111,8 +116,8 @@ const bool registered = [] {
     }
     return true;
 }();
-template<bool Meta> Pair gather(const at::Tensor& swa, const at::Tensor& main, const at::Tensor& ids) {
-    const at::Stack stack{swa, main, ids}; const int k = slots(stack, false);
+template<bool Meta> Pair gather(const at::Tensor& swa, const at::Tensor& main, const at::Tensor& ids, bool vector) {
+    const at::Stack stack{swa, main, ids, vector}; const int k = slots(stack, false);
     if (Meta) return {at::empty({k,512}, swa.options().dtype(at::kBFloat16)), at::empty({1,k}, ids.options())};
     TORCH_CHECK(registered && swa.device().type() == at::kHPU);
     auto descriptor = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(kGatherSchema);
@@ -137,8 +142,9 @@ template<bool Meta> at::Tensor attention_lengths(const at::Tensor& q, const at::
 }
 template<bool Meta> at::Tensor attention_ordered_lengths(const at::Tensor& q, const at::Tensor& swa,
     const at::Tensor& main, const at::Tensor& ids, const at::Tensor& sink, const at::Tensor& scale,
-    const at::Tensor& lengths, const at::Tensor& completion, bool valid_only) {
-    const at::Stack stack{q,swa,main,ids,sink,scale,lengths,completion,valid_only}; slots(stack, true, true, true);
+    const at::Tensor& lengths, const at::Tensor& completion, bool valid_only, bool vector) {
+    const at::Stack stack{q,swa,main,ids,sink,scale,lengths,completion,valid_only,vector};
+    TORCH_CHECK(!vector || valid_only, "Vector selected KV requires valid_only"); slots(stack, true, true, true);
     if (Meta) return at::empty_like(q);
     TORCH_CHECK(registered && q.device().type() == at::kHPU);
     auto descriptor = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(kOrderedSchema);
@@ -146,8 +152,9 @@ template<bool Meta> at::Tensor attention_ordered_lengths(const at::Tensor& q, co
 }
 template<bool Meta> at::Tensor attention_ordered_cache_lengths(const at::Tensor& q, const at::Tensor& swa,
     const at::Tensor& main, const at::Tensor& ids, const at::Tensor& sink, const at::Tensor& scale,
-    const at::Tensor& lengths, const at::Tensor& completion, const at::Tensor& compressed_completion, bool valid_only) {
-    const at::Stack stack{q,swa,main,ids,sink,scale,lengths,completion,compressed_completion,valid_only};
+    const at::Tensor& lengths, const at::Tensor& completion, const at::Tensor& compressed_completion, bool valid_only, bool vector) {
+    const at::Stack stack{q,swa,main,ids,sink,scale,lengths,completion,compressed_completion,valid_only,vector};
+    TORCH_CHECK(!vector || valid_only, "Vector selected KV requires valid_only");
     slots(stack, true, true, true, true);
     if (Meta) return at::empty_like(q);
     TORCH_CHECK(registered && q.device().type() == at::kHPU);
@@ -156,9 +163,9 @@ template<bool Meta> at::Tensor attention_ordered_cache_lengths(const at::Tensor&
 }
 }
 TORCH_LIBRARY_FRAGMENT(custom_op, m) {
-    m.def("custom_deepseek_v41_packed_attention_bf16_ordered_cache_lengths_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor indices, Tensor sink, Tensor scale, Tensor lengths, Tensor completion, Tensor compressed_completion, bool valid_only=False) -> Tensor");
-    m.def("custom_deepseek_v41_packed_attention_bf16_ordered_lengths_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor indices, Tensor sink, Tensor scale, Tensor lengths, Tensor completion, bool valid_only=False) -> Tensor");
-    m.def("custom_deepseek_v41_selected_kv_bf16_gaudi2(Tensor swa, Tensor main, Tensor indices) -> (Tensor, Tensor)");
+    m.def("custom_deepseek_v41_packed_attention_bf16_ordered_cache_lengths_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor indices, Tensor sink, Tensor scale, Tensor lengths, Tensor completion, Tensor compressed_completion, bool valid_only=False, bool vector=False) -> Tensor");
+    m.def("custom_deepseek_v41_packed_attention_bf16_ordered_lengths_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor indices, Tensor sink, Tensor scale, Tensor lengths, Tensor completion, bool valid_only=False, bool vector=False) -> Tensor");
+    m.def("custom_deepseek_v41_selected_kv_bf16_gaudi2(Tensor swa, Tensor main, Tensor indices, bool vector=False) -> (Tensor, Tensor)");
     m.def("custom_deepseek_v41_packed_attention_bf16_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor indices, Tensor sink, Tensor scale) -> Tensor");
     m.def("custom_deepseek_v41_packed_attention_bf16_lengths_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor indices, Tensor sink, Tensor scale, Tensor lengths) -> Tensor");
 }

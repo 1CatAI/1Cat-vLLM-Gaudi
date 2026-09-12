@@ -36,6 +36,13 @@ For a completed capture, run these tools in dependency order:
    whole-token and stage activity and TPC concurrency.
 7. `analyze_deepseek_v41_dataflow.py ANALYSIS --rank RANK --output-dir RESOURCES`
    joins expert/attention weight producers with their actual MME consumers.
+   It also reconstructs selected-KV and sparse-attention TPC work distribution.
+8. When a host-side hypothesis needs scope evidence,
+   `analyze_deepseek_v41_host_scopes.py ANALYSIS --rank RANK --output-dir SCOPES`
+   extracts Python calls from the preserved raw trace and intersects their
+   intervals with the global device gaps. It caches the extraction and retains
+   parent identifiers. Nested scopes and wait envelopes are correlations, not
+   additive costs or proof that the gaps can be removed.
 
 The disjoint ledger reconciles the capture; its group ordering does not establish
 causal critical-path ownership. Resource unions overlap. Busy cores do not prove

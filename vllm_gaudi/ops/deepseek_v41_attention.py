@@ -71,6 +71,9 @@ class CSA2Attention(nn.Module):
         self.native_rope = gaudi_envs.VLLM_HPU_DSV41_NATIVE_ROPE
         self.c1_indices = gaudi_envs.VLLM_HPU_DSV41_C1_INDICES
         self.selected_valid_only = gaudi_envs.VLLM_HPU_DSV41_SELECTED_VALID_ONLY
+        self.selected_kv_vector = gaudi_envs.VLLM_HPU_DSV41_SELECTED_KV_VECTOR
+        if self.selected_kv_vector and not self.selected_valid_only:
+            raise ValueError("V4.1 vector selected KV requires SELECTED_VALID_ONLY")
         if self.selected_valid_only and not self.swa_pack_write:
             raise ValueError("Valid-only selected KV requires the ordered SWA/attention path")
         if self.bounded_decode and not self.packed_decode:
@@ -241,6 +244,7 @@ class CSA2Attention(nn.Module):
             # aliases existing storage and cannot admit a compressed row.
             main = self.cache.main[:self.length // self.ratio] if self.ratio else self.swa
             if self.bounded_decode:
+                vector_options = (True, ) if self.selected_kv_vector else ()
                 # At context <=512, Full/Reindex/Reuse retain every visible
                 # compressed row followed by invalid padding. Keep its order.
                 if not use_c1_indices:
@@ -249,11 +253,12 @@ class CSA2Attention(nn.Module):
                 if compressed_completion is not None:
                     output = torch.ops.custom_op.custom_deepseek_v41_packed_attention_bf16_ordered_cache_lengths_gaudi2(
                         query.contiguous(), self.swa, main, indices.contiguous(), self.weights.attn_sink, self.scale,
-                        lengths.contiguous(), completion, compressed_completion, self.selected_valid_only)
+                        lengths.contiguous(), completion, compressed_completion, self.selected_valid_only,
+                        *vector_options)
                 elif completion is not None:
                     output = torch.ops.custom_op.custom_deepseek_v41_packed_attention_bf16_ordered_lengths_gaudi2(
                         query.contiguous(), self.swa, main, indices.contiguous(), self.weights.attn_sink, self.scale,
-                        lengths.contiguous(), completion, self.selected_valid_only)
+                        lengths.contiguous(), completion, self.selected_valid_only, *vector_options)
                 else:
                     output = torch.ops.custom_op.custom_deepseek_v41_packed_attention_bf16_lengths_gaudi2(
                         query.contiguous(), self.swa, main, indices.contiguous(), self.weights.attn_sink, self.scale,
