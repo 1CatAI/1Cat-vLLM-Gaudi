@@ -11,6 +11,18 @@ from pathlib import Path
 from analyze_deepseek_v41_trace import union
 
 
+def window_fragments(start, duration, windows, ends):
+    """Preserve every covered window without treating fragments as new calls."""
+    chosen = bisect.bisect_right(ends, start)
+    finish = start + duration
+    while chosen < len(windows) and windows[chosen][0] < finish:
+        lo, hi = windows[chosen]
+        begin, end = max(start, lo), min(finish, hi)
+        if begin < end:
+            yield chosen, begin, end
+        chosen += 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("analysis", type=Path)
@@ -21,23 +33,24 @@ def main():
     scale = len(windows) * 1000
     for rank in range(4):
         groups = collections.defaultdict(list)
+        calls = collections.Counter()
         events = []
         with gzip.open(args.analysis / f"rank{rank}/host.jsonl.gz", "rt") as stream:
             for line in stream:
                 start, duration, pid, tid, category, name = json.loads(line)
-                chosen = bisect.bisect_right(ends, start)
-                if chosen >= len(windows):
+                fragments = list(window_fragments(start, duration, windows, ends))
+                if not fragments:
                     continue
-                lo, hi = windows[chosen]
-                begin, end = max(start, lo), min(start + duration, hi)
-                if end <= begin:
-                    continue
-                groups[(category, name)].append((begin, end))
+                calls[(category, name)] += 1
+                groups[(category, name)].extend((begin, end) for _, begin, end in fragments)
                 if "compileGraph" in name or "native_decoder_enqueue" in name:
-                    events.append({"token": common["tokens"][chosen], "pid": pid, "tid": tid,
+                    events.append({"token": common["tokens"][fragments[0][0]],
+                                   "overlapped_tokens": [common["tokens"][i] for i, _, _ in fragments],
+                                   "pid": pid, "tid": tid,
                                    "category": category, "name": name, "start_us": start,
                                    "duration_ms": duration / 1000})
-        rows = [{"category": category, "name": name, "calls_per_token": len(spans) / len(windows),
+        rows = [{"category": category, "name": name, "calls": calls[(category, name)],
+                 "calls_per_token": calls[(category, name)] / len(windows),
                  "inclusive_sum_ms_per_token": sum(b-a for a, b in spans) / scale,
                  "activity_union_ms_per_token": union(spans) / scale}
                 for (category, name), spans in groups.items()]
