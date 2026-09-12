@@ -27,7 +27,7 @@ def main():
         native["sources"][str(path.relative_to(root))] = hashlib.sha256(path.read_bytes()).hexdigest()
     for path in output.glob("dsv41_host_gather*.so"):
         native["binaries"][path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
-    native.update(prepared_layout_version=2, host_gather_abi_version=1)
+    native.update(prepared_layout_version=2, host_gather_abi_version=1, host_c1_abi_version=1)
     (output / "deepseek_v41_build.json").write_text(json.dumps(native, indent=2) + "\n")
 
 

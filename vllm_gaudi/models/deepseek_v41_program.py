@@ -341,7 +341,13 @@ class CompiledStage:
         self.groups = tuple(
             PreparedLayerGroup(stage, start, start + 4, fp8_decode=native and stage.fp8_decode)
             for start in range(0, 20, 4))
-        self.chunks = tuple(_compile_group(group, native=native) for group in self.groups)
+        backend = "hpu_backend"
+        if native and gaudi_envs.VLLM_HPU_DSV41_TP_MHC_OVERLAP:
+            if stage.dspark or stage.fp8_decode:
+                raise ValueError("TP/mHC overlap requires BF16 C1 with DSpark disabled")
+            from vllm_gaudi.compilation.deepseek_v41_overlap import make_backend
+            backend = make_backend()
+        self.chunks = tuple(_compile_group(group, native=native, backend=backend) for group in self.groups)
 
     def __call__(self, hidden, pre_mix, positions, input_ids, engram):
         for chunk in self.chunks:

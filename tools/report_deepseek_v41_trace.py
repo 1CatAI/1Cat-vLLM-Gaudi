@@ -26,6 +26,12 @@ def io(node, prefix):
 
 def classify(node, kernel, inputs, outputs):
     name = node.lower()
+    if "topk" in name or "bitonic" in kernel:
+        return "Router", "专家 Top-k 排序；实际输入见张量合同"
+    if "deepseek_v41_control_gemv" in kernel:
+        return "mHC", "FP32 控制投影"
+    if "deepseek_v41_rope" in kernel or "deepseek_v41_c1_indices" in kernel:
+        return "CSA2", "C1 RoPE/可见索引准备"
     if "deepseek_v41_swa_pack" in kernel:
         return "CSA2", "SWA 精确 FP8 编码/scale/缓存写入"
     if "deepseek_v41_fp4_cache_write" in kernel:
@@ -35,6 +41,11 @@ def classify(node, kernel, inputs, outputs):
     if "mxfp4" in name or "mxfp4" in kernel:
         shape = inputs[1]["shape"] if kernel in ("GEMM", "BatchGemm") and len(inputs) > 1 else []
         stage = "W13 gate/up" if shape and 2304 in shape else "W2 down" if shape and 1152 in shape else "阶段见张量合同"
+        if not shape and outputs:
+            if outputs[0]["shape"][-2:] == [5120, 2304]:
+                stage = "W13 gate/up"
+            elif outputs[0]["shape"][-2:] == [1152, 5120]:
+                stage = "W2 down"
         return "路由专家", stage + ("矩阵计算" if shape else "压缩权重直接寻址/解码")
     if "bf16_identity" in kernel:
         return "路由专家", "MoE 结果/编译块完成依赖"
@@ -47,6 +58,8 @@ def classify(node, kernel, inputs, outputs):
         if weight == [25600, 6144]:
             return "Engram", "查询行到 key/value 投影"
         if "/attention/" in name:
+            if inputs and inputs[0]["dtype"] == "float32":
+                return "Attention", "Compressor FP32 投影；wkv/wgate 绑定尚待逐节点还原"
             shapes = {(1280, 5120): "wq_a 输入投影", (16384, 1280): "wq_b Q 展开",
                       (512, 5120): "wkv 输入投影", (5120, 4096): "wo_b 输出投影",
                       (128, 512): "index K 投影"}
@@ -71,6 +84,15 @@ def classify(node, kernel, inputs, outputs):
     if kernel.startswith("fused_kernel_"):
         return "融合表达式待细分", "保留实际 GUID 与输入输出；内部子算子无独立计时"
     return "入口/尾部/其他张量", node
+
+
+def bundle_key(contract):
+    if not contract:
+        return None
+    bundle = contract.get("attributes", {}).get("Bundle_idx")
+    if bundle in (None, "N/A"):
+        return None
+    return contract["graph"]["path"], str(bundle)
 
 
 def invocation_samples(rows, symbol, expected):
@@ -111,7 +133,41 @@ def analyze(root, rank, common):
     mapped = symbols(inv, recipes)
     contracts = {(str(row["recipe_id"]), row["symbol"]["device_type"], row["symbol"]["full_context_id"]): row
                  for row in json.loads((path / "node-contracts.json").read_text())}
+    bundle_categories = collections.defaultdict(set)
+    for contract in contracts.values():
+        symbol = contract["symbol"]
+        category, _ = classify(symbol["node"], symbol["kernel"], contract["inputs"], contract["outputs"])
+        key = bundle_key(contract)
+        if key and category in ("路由专家", "Attention", "共享专家", "Engram", "mHC", "Router"):
+            bundle_categories[key].add(category)
     own = json.loads((path / "device-windows.json").read_text())
+    mhc_recipes = set()
+    plan_entries, plan_sources = [], []
+    plan_root = root.parent / f"plans/rank{rank}"
+    for group in range(5):
+        files = list(plan_root.glob(f"group{group}-*-prepare1.json"))
+        if len(files) != 1:
+            plan_entries = []
+            break
+        plan_sources.append(str(files[0]))
+        plan_entries.extend(row for row in json.loads(files[0].read_text()) if row.get("kind") == "compute")
+    provenance = []
+    if any(entry.get("name", "").endswith("_mhc_submod_0") for entry in plan_entries):
+        if len(plan_entries) != len(own["capture_order"]):
+            raise RuntimeError("Prepared compute order differs from captured native segments")
+        by_id = {str(recipe["recipe_id"]): recipe for recipe in recipes}
+        for entry, enqueue in zip(plan_entries, own["capture_order"], strict=True):
+            if not entry["name"].endswith("_mhc_submod_0"):
+                continue
+            # Bridge's program ID and Synapse's serialized recipe ID are
+            # different namespaces. The exact captured segment order joins them.
+            rid = enqueue[2].split(":")[0]
+            if rid not in by_id or not any("control_gemv" in n["kernel"] for n in by_id[rid]["nodes"]):
+                raise RuntimeError("mHC capture order differs from actual compiler symbols")
+            mhc_recipes.add(rid)
+            provenance.append(dict(program=entry, synapse_recipe=rid, enqueue=enqueue))
+    (path / "mhc-partition-provenance.json").write_text(json.dumps(
+        dict(plans=plan_sources, bindings=provenance), indent=2) + "\n")
     frequency = collections.Counter(row[2].split(":")[0] for row in own["capture_order"])
     windows, tokens = common["windows_us"], common["tokens"]
     ends = [w[1] for w in windows]
@@ -161,6 +217,13 @@ def analyze(root, rank, common):
         source = symbol["node"] if symbol else node["node"]
         inputs, outputs = (contract.get(part, []) if contract else [] for part in ("inputs", "outputs"))
         category, purpose = classify(source, kernel, inputs, outputs)
+        origin = None
+        if category == "融合表达式待细分" and bundle_categories.get(bundle_key(contract)) == {"路由专家"}:
+            category = "路由专家"
+            purpose = "同一编译 bundle 的专家激活/结果处理；内部表达式未独立计时"
+            origin = {"rule": "unambiguous expert bundle", "bundle": bundle_key(contract)}
+        if key[0] in mhc_recipes:
+            category, purpose = "mHC", "已由原生计划和编译分区核验的独立控制/统计/混合分支"
         spans = [row[:2] for rows in by_window.values() for row in rows]
         samples, count, missing = [], 0, []
         for rows in by_window.values():
@@ -182,6 +245,7 @@ def analyze(root, rank, common):
                "observed_lane_packets": sum(map(len, by_window.values())), "count_limitations": sorted(set(missing)),
                "activity_ms_per_token": duration / len(tokens) / 1000, "period_pct": duration / period * 100,
                "inputs": inputs, "outputs": outputs, "compiler_contract": contract}
+        row["classification_provenance"] = origin
         details.append(row)
         dtype_shape = json.dumps([[(v["dtype"], v["shape"]) for v in part] for part in (inputs, outputs)])
         group_key = (category, purpose, node["engine"], kernel, dtype_shape)
@@ -197,7 +261,8 @@ def analyze(root, rank, common):
         count = None if unknown else sum(row["observed_calls"] for row, _, _ in items)
         duration = union(spans)
         summary.append({"rank": rank, "category": key[0], "purpose": key[1], "engine": key[2], "kernel": key[3],
-                        "dtype_shapes": json.loads(key[4]), "mean_invocation_ms": statistics.mean(samples) if samples else None,
+                        "dtype_shapes": json.loads(key[4]),
+                        "mean_invocation_ms": statistics.mean(samples) if samples else None,
                         "complete_invocation_samples": len(samples), "observed_calls": count,
                         "calls_per_token": count / len(tokens) if count is not None else None,
                         "activity_ms_per_token": duration / len(tokens) / 1000, "period_pct": duration / period * 100,
