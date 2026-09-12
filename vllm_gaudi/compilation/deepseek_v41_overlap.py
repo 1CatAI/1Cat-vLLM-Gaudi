@@ -31,8 +31,25 @@ def deduplicate_float_casts(module, selected):
             module.graph.erase_node(node)
             removed += 1
         else:
-            seen[key] = node
+            source = node.args[0]
+            base = (source.args[0] if isinstance(source, torch.fx.Node)
+                    and source.target == torch.ops.aten.view.default else None)
+            base_key = ((base,), key[1])
+            if base is not None and base_key in seen:
+                # Casting the residual once and viewing the FP32 result keeps
+                # element order and every later reduction/rounding boundary.
+                with module.graph.inserting_before(node):
+                    viewed = module.graph.call_function(torch.ops.aten.view.default,
+                                                        (seen[base_key], source.args[1]))
+                    viewed.meta = dict(node.meta)
+                node.replace_all_uses_with(viewed)
+                module.graph.erase_node(node)
+                seen[key] = viewed
+                removed += 1
+            else:
+                seen[key] = node
     if removed:
+        module.graph.eliminate_dead_code()
         module.graph.lint()
         module.recompile()
     return removed
@@ -154,8 +171,7 @@ def split_mhc_consumers(module, exchange):
         casts_removed = deduplicate_float_casts(child, selected)
         if casts_removed:
             selected = independent_mhc_nodes(child, dependent)
-        wrapper = split_module(child, child, lambda node, selected=selected: 0 if node in selected else 1,
-                               keep_original_order=True)
+        wrapper = split_module(child, child, lambda node, selected=selected: 0 if node in selected else 1)
         env = dict(zip((n for n in wrapper.graph.nodes if n.op == "placeholder"), call.args, strict=True))
         with graph.inserting_before(call):
             for node in wrapper.graph.nodes:

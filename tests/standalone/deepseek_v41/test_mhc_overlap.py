@@ -6,7 +6,9 @@ import operator
 import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 
-from vllm_gaudi.compilation.deepseek_v41_overlap import independent_mhc_nodes, split_mhc_consumers
+from vllm_gaudi.compilation.deepseek_v41_overlap import (
+    deduplicate_float_casts, independent_mhc_nodes, split_mhc_consumers,
+)
 
 
 @torch.library.custom_op("dsv41_overlap_test::deepseek_v41_control_gemv", mutates_args=())
@@ -118,3 +120,18 @@ def test_private_reinplaced_adds_move_but_peer_sum_stays_after_wait():
     assert all(item["private_adds_restored"] == 1 for item in audit)
     r, w, p = _example()
     assert torch.equal(source(r.clone(), w, p.clone()), candidate(r.clone(), w, p.clone()))
+
+
+def test_residual_and_flat_control_share_exact_float_conversion():
+    def casts(residual):
+        mixed = residual.float()
+        flat = residual.view(1, 32).float()
+        return mixed.square().sum(1), flat.square().mean(-1)
+
+    r, _, _ = _example()
+    original = make_fx(casts)(r)
+    candidate = copy.deepcopy(original)
+    assert deduplicate_float_casts(candidate, set(candidate.graph.nodes)) == 1
+    assert sum(n.target == torch.ops.aten._to_copy.default for n in candidate.graph.nodes) == 1
+    for value in (r, r * 0, r * 16):
+        assert all(torch.equal(a, b) for a, b in zip(original(value), candidate(value)))
