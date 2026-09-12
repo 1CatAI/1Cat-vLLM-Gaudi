@@ -35,7 +35,7 @@ def main(rank, ROOT, OUT):
             reasons[key] = 'expert_decode'
         elif 'selected_kv' in r['kernel']:
             reasons[key] = 'selected_kv'
-        elif 'sparse_attn_bf16' in r['kernel']:
+        elif 'sparse_attn' in r['kernel'] and 'bf16' in r['kernel']:
             reasons[key] = 'sparse_attention'
         elif r['engine'] == 'MME' and r['category'] == '路由专家':
             reasons[key] = 'expert_mme'

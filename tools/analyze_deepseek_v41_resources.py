@@ -24,7 +24,7 @@ def tags(row):
         names.append('woa_mme')
     if row['engine'] == 'MME' and cat == 'Attention':
         names.append('attention_all_projection_mme')
-    if 'sparse_attn_bf16' in k:
+    if 'sparse_attn' in k and 'bf16' in k:
         names.append('sparse_attention')
     if 'selected_kv' in k:
         names.append('selected_kv')
