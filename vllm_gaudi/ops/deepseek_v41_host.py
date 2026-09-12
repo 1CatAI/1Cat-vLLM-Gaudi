@@ -2,6 +2,7 @@
 """Engram mmap, native row gather and HPU staging with completion ownership."""
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 import fcntl
 import json
 from pathlib import Path
@@ -37,6 +38,25 @@ class _TransferSlot:
         self.generation = 0
         self.weight_view = torch.from_numpy(self.gather.weights)
         self.scale_view = torch.from_numpy(self.gather.scales)
+        # C1 uses fixed views of the existing pinned allocation. NumPy copies
+        # preserve the raw weight/scale bytes without invoking tensor dispatch.
+        self.decode_host, self.decode_device = self.host[:1], self.device[:1]
+        packed = self.decode_host.numpy()
+        self.decode_weights, self.decode_scales = packed[:, :, :width], packed[:, :, width:]
+        self.decode_gather_weights = self.gather.weights[:heads].reshape(1, heads, width)
+        self.decode_gather_scales = self.gather.scales[:heads].reshape(1, heads, width // 32)
+
+    def fill(self, count):
+        if count == 1:
+            np.copyto(self.decode_weights, self.decode_gather_weights)
+            np.copyto(self.decode_scales, self.decode_gather_scales)
+            return self.decode_host, self.decode_device
+        heads, width = self.host.shape[1], self.weight_view.shape[1]
+        rows = count * heads
+        host = self.host[:count]
+        host[:, :, :width].copy_(self.weight_view[:rows].reshape(count, heads, width))
+        host[:, :, width:].copy_(self.scale_view[:rows].reshape(count, heads, width // 32))
+        return host, self.device[:count]
 
     def reuse(self):
         if self.inflight:
@@ -138,24 +158,28 @@ class EngramHost:
             ids = np.ascontiguousarray(batch.hash_ids[:, index, shard["head_start"]:shard["head_stop"]])
             slot.generation = slot.gather.submit(self.tables[layer], ids)
         submit(0)
-        for index, layer in enumerate(self.layout.layer_ids):
-            slot = self.slots[layer][ring]
-            slot.gather.wait(slot.generation)
-            if index + 1 < len(self.layout.layer_ids):
-                submit(index + 1)
-            heads = slot.host.shape[1]
-            rows, width = count * heads, self.layout.head_dim
-            slot.host[:count, :, :width].copy_(slot.weight_view[:rows].reshape(count, heads, width))
-            slot.host[:count, :, width:].copy_(slot.scale_view[:rows].reshape(count, heads, width // 32))
-            self.audit["major_faults"] += slot.gather.major_faults
-            self.audit["gathers"] += 1
-            slot.gather.release(slot.generation)
-            with torch.hpu.stream(self.stream):
-                slot.device[:count].copy_(slot.host[:count], non_blocking=True)
-                slot.dma_done.record(self.stream)
-            torch.hpu.current_stream().wait_event(slot.dma_done)
-            buffers.append(slot.device[:count])
-            self.audit["dma_bytes"] += count * heads * (width + width // 32)
+        consumer_stream = torch.hpu.current_stream()
+        # A C1 layer uploads only a few KiB and is immediately consumed on
+        # the caller's stream. Queue order replaces a cross-stream handoff.
+        transfer_stream = consumer_stream if count == 1 else self.stream
+        with nullcontext() if count == 1 else torch.hpu.stream(transfer_stream):
+            for index, layer in enumerate(self.layout.layer_ids):
+                slot = self.slots[layer][ring]
+                slot.gather.wait(slot.generation)
+                if index + 1 < len(self.layout.layer_ids):
+                    submit(index + 1)
+                host, device = slot.fill(count)
+                self.audit["major_faults"] += slot.gather.major_faults
+                self.audit["gathers"] += 1
+                slot.gather.release(slot.generation)
+                device.copy_(host, non_blocking=True)
+                slot.dma_done.record(transfer_stream)
+                buffers.append(device)
+                self.audit["dma_bytes"] += host.numel()
+        # Both layer DMAs are ordered on this stream. The last event covers
+        # every input; retain individual events for each slot's reuse guard.
+        if count != 1:
+            consumer_stream.wait_event(slot.dma_done)
         ticket = EngramTransfer(self.generation, ring, batch, tuple(buffers))
         self.pending = ticket
         self.audit["generations"] += 1
@@ -164,9 +188,10 @@ class EngramHost:
     def complete(self, ticket, committed_inputs):
         if self.pending is not ticket or ticket.generation != self.generation:
             raise RuntimeError("Stale Engram transfer/verify completion")
+        consumer_stream = torch.hpu.current_stream()
         for layer in self.layout.layer_ids:
             slot = self.slots[layer][ticket.slot]
-            slot.consumer_done.record(torch.hpu.current_stream())
+            slot.consumer_done.record(consumer_stream)
             slot.inflight = True
         self.history.commit(ticket.batch, committed_inputs)
         self.pending = None
