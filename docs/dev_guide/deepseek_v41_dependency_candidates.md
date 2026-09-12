@@ -40,7 +40,7 @@ existing `--runtime-profile` argument.
 ## Native Engram C1 preparation
 
 `VLLM_HPU_DSV41_ENGRAM_NATIVE_C1=1` requires the normally built host extension's
-`c1_abi_version()` contract. The C++ entry compresses tokens, computes the existing
+`c1_abi_version` contract. The C++ entry compresses tokens, computes the existing
 wrapped-integer hashes and copies selected mmap rows directly into the registered
 final packed staging buffer. The Python history owner remains the sole committed
 history; preparation is a transaction identified by request, history generation,
