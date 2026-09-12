@@ -50,7 +50,7 @@ Both layers' row bounds and all destination contracts are checked before writing
 The existing consumer-stream upload and DMA/consumer retirement rules remain.
 Image boundaries, short histories, request resets and non-C1 prefill retain their
 compatibility paths. No extra Engram table, second history or layer-14 prefetch
-worker is introduced. Rebuild through `tools/build_deepseek_v41_host.py` so the
+worker is introduced. Rebuild through `tools/build_deepseek_v41.py` so the
 normal package loads the C1 ABI; runtime injection is not supported.
 
 This implementation is retained for experiments. Its measured incremental
