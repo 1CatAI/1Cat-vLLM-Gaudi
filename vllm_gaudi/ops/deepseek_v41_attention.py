@@ -86,7 +86,10 @@ class CSA2Attention(nn.Module):
         self.selected_kv_vector = gaudi_envs.VLLM_HPU_DSV41_SELECTED_KV_VECTOR
         self.paired_exp = gaudi_envs.VLLM_HPU_DSV41_ATTENTION_PAIRED_EXP
         self.head_pair = gaudi_envs.VLLM_HPU_DSV41_ATTENTION_HEAD_PAIR
+        self.block_exp = gaudi_envs.VLLM_HPU_DSV41_ATTENTION_BLOCK_EXP
         self.decoded_kv_state = shared.decoded_kv_state
+        if self.block_exp and not self.decoded_kv_state:
+            raise ValueError("Blocked exponentials require the exact decoded-KV C1 state")
         if self.decoded_kv_state:
             if not (self.c1_indices and self.selected_valid_only and self.fp4_cache_write):
                 raise ValueError("Decoded KV requires ordered C1 indices and fused packed cache writes")
@@ -285,10 +288,11 @@ class CSA2Attention(nn.Module):
             # attention and hidden state. Source layers additionally consume
             # their own FP4 writer completion in this recipe.
             main_done = compressed_completion if compressed_completion is not None else completion
-            output, _, _ = torch.ops.custom_op.custom_deepseek_v41_decoded_attn_bf16_gaudi2(
-                query.contiguous(), self.shared.decoded_swa, main, indices.contiguous(), self.weights.attn_sink,
-                self.scale, lengths.contiguous(), completion, main_done, self.decoded_swa_offset,
-                self.length // self.ratio if self.ratio else 0)
+            attention = (torch.ops.custom_op.custom_deepseek_v41_decoded_attn_block_bf16_gaudi2
+                         if self.block_exp else torch.ops.custom_op.custom_deepseek_v41_decoded_attn_bf16_gaudi2)
+            output, _, _ = attention(query.contiguous(), self.shared.decoded_swa, main, indices.contiguous(),
+                                     self.weights.attn_sink, self.scale, lengths.contiguous(), completion, main_done,
+                                     self.decoded_swa_offset, self.length // self.ratio if self.ratio else 0)
         elif self.packed_decode and value.shape[0] == 1:
             # A SWA-width second input denotes an inactive main cache. It
             # aliases existing storage and cannot admit a compressed row.

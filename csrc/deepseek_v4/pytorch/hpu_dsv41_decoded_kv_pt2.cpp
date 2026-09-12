@@ -12,6 +12,7 @@ constexpr auto kSwaOrdered = "custom_op::custom_deepseek_v41_swa_decoded_ordered
 constexpr auto kFp4 = "custom_op::custom_deepseek_v41_fp4_decoded_write_bf16_gaudi2";
 constexpr auto kFp4Ordered = "custom_op::custom_deepseek_v41_fp4_decoded_ordered_bf16_gaudi2";
 constexpr auto kAttention = "custom_op::custom_deepseek_v41_decoded_attn_bf16_gaudi2";
+constexpr auto kBlockAttention = "custom_op::custom_deepseek_v41_decoded_attn_block_bf16_gaudi2";
 using Outputs = std::tuple<at::Tensor, at::Tensor, at::Tensor>;
 struct AttentionParams { int32_t offset; int32_t main_rows; };
 
@@ -69,7 +70,8 @@ const bool registered = [] {
         habana::custom_op::registerUserCustomOp(name, "custom_deepseek_v41_fp4_decoded_write_bf16_gaudi2",
             [](const at::Stack&) { return habana::PartialOutputMetaDataVector{{at::kInt,{36}}}; }, nullptr);
     }
-    habana::custom_op::registerUserCustomOp(kAttention, "custom_deepseek_v41_decoded_attn_bf16_gaudi2",
+    for (const auto name : {kAttention, kBlockAttention}) {
+    habana::custom_op::registerUserCustomOp(name, name + std::string("custom_op::").size(),
         [](const at::Stack& stack) {
             const auto q = stack.at(0).toTensor();
             return habana::PartialOutputMetaDataVector{{at::kBFloat16,q.sizes().vec()},
@@ -79,6 +81,7 @@ const bool registered = [] {
             return std::make_shared<AttentionParams>(AttentionParams{int32_t(stack.at(9).toInt()),
                                                                     int32_t(stack.at(10).toInt())});
         });
+    }
     return true;
 }();
 template<bool Meta, bool Ordered> at::Tensor swa_write(const at::Tensor& cache, const at::Tensor& value,
@@ -97,7 +100,7 @@ template<bool Meta, bool Ordered> at::Tensor fp4_write(const at::Tensor& main, c
     auto op = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(Ordered ? kFp4Ordered : kFp4);
     return op.execute({main,index,mv,iv,position,decoded}).at(0);
 }
-template<bool Meta> Outputs attention(const at::Tensor& q, const at::Tensor& swa, const at::Tensor& main,
+template<bool Meta, bool Block = false> Outputs attention(const at::Tensor& q, const at::Tensor& swa, const at::Tensor& main,
     const at::Tensor& ids, const at::Tensor& sink, const at::Tensor& scale, const at::Tensor& lengths,
     const at::Tensor& swa_done, const at::Tensor& main_done, int64_t offset, int64_t rows) {
     const at::Stack stack{q,swa,main,ids,sink,scale,lengths,swa_done,main_done,offset,rows};
@@ -105,7 +108,7 @@ template<bool Meta> Outputs attention(const at::Tensor& q, const at::Tensor& swa
     if (Meta) return {at::empty_like(q),at::empty({q.size(0),q.size(1)},q.options().dtype(at::kFloat)),
                                       at::empty({q.size(0),q.size(1)},q.options().dtype(at::kFloat))};
     TORCH_CHECK(registered && q.device().type() == at::kHPU);
-    auto op = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(kAttention);
+    auto op = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(Block ? kBlockAttention : kAttention);
     auto out = op.execute(stack); return {out.at(0),out.at(1),out.at(2)};
 }
 at::Tensor unwrap(const at::Tensor& tensor) {
@@ -144,6 +147,7 @@ TORCH_LIBRARY_FRAGMENT(custom_op, m) {
     m.def("custom_deepseek_v41_fp4_decoded_write_bf16_gaudi2(Tensor(a!) main, Tensor(b!) index, Tensor main_value, Tensor index_value, Tensor position, Tensor(c!) decoded) -> Tensor");
     m.def("custom_deepseek_v41_fp4_decoded_ordered_bf16_gaudi2(Tensor main, Tensor index, Tensor main_value, Tensor index_value, Tensor position, Tensor decoded) -> Tensor");
     m.def("custom_deepseek_v41_decoded_attn_bf16_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor indices, Tensor sink, Tensor scale, Tensor lengths, Tensor swa_completion, Tensor main_completion, int offset, int main_rows) -> (Tensor, Tensor, Tensor)");
+    m.def("custom_deepseek_v41_decoded_attn_block_bf16_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor indices, Tensor sink, Tensor scale, Tensor lengths, Tensor swa_completion, Tensor main_completion, int offset, int main_rows) -> (Tensor, Tensor, Tensor)");
 }
 TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
     m.impl("custom_deepseek_v41_swa_decoded_write_bf16_gaudi2",swa_write<false,false>);
@@ -151,6 +155,7 @@ TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
     m.impl("custom_deepseek_v41_fp4_decoded_write_bf16_gaudi2",fp4_write<false,false>);
     m.impl("custom_deepseek_v41_fp4_decoded_ordered_bf16_gaudi2",fp4_write<false,true>);
     m.impl("custom_deepseek_v41_decoded_attn_bf16_gaudi2",attention<false>);
+    m.impl("custom_deepseek_v41_decoded_attn_block_bf16_gaudi2",attention<false,true>);
 }
 TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
     m.impl("custom_deepseek_v41_swa_decoded_write_bf16_gaudi2",swa_write<true,false>);
@@ -158,6 +163,7 @@ TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
     m.impl("custom_deepseek_v41_fp4_decoded_write_bf16_gaudi2",fp4_write<true,false>);
     m.impl("custom_deepseek_v41_fp4_decoded_ordered_bf16_gaudi2",fp4_write<true,true>);
     m.impl("custom_deepseek_v41_decoded_attn_bf16_gaudi2",attention<true>);
+    m.impl("custom_deepseek_v41_decoded_attn_block_bf16_gaudi2",attention<true,true>);
 }
 TORCH_LIBRARY_IMPL(custom_op, Functionalize, m) {
     m.impl("custom_deepseek_v41_swa_decoded_write_bf16_gaudi2",swa_functionalize);

@@ -58,3 +58,9 @@ evidenced Boolean contracts for `source_and_runtime`,
 `trace_mechanism` when execution structure changes. Missing evidence cannot
 qualify a candidate. Passing speed starts full quality/lifecycle qualification;
 the comparison tool never enables a production default.
+
+### Blocked attention exponent preparation
+
+`VLLM_HPU_DSV41_ATTENTION_BLOCK_EXP=1` requires decoded KV state and selects an independent C1 TPC kernel. It prepares the original maximum/score differences over at most 64 positions, applies the original lane-wise Cephes routine to those packed arguments, then consumes coefficients in original position order. QK arithmetic, running sum, V recurrence and final sink arithmetic retain their reference formulas. The extra KV read and coefficient broadcast are part of the measured kernel.
+
+The switch defaults off. Qualify block tails, invalid/repeated slots, zeros/nonfinite data, output statistics and continuous state replay before candidate measurements. No manually addressed TPC local-memory scratch, added persistent state or FP8 MME is used. Register pressure and extra reads must be evaluated together with reduced exponent work; fewer vector exponential calls alone do not qualify performance.

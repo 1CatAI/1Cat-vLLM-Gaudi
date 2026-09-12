@@ -41,7 +41,7 @@ int main() {
             }
         }
     }
-    assert(custom_count == 72);
+    assert(custom_count == 73);
     for (const char* required : {
              "custom_deepseek_v41_swa_decoded_write_bf16_gaudi2",
              "custom_deepseek_v41_fp4_decoded_write_bf16_gaudi2",

@@ -49,6 +49,7 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_SWA_DECODED_WRITE,
     GAUDI2_KERNEL_DEEPSEEK_V41_FP4_DECODED_WRITE,
     GAUDI2_KERNEL_DEEPSEEK_V41_DECODED_ATTN,
+    GAUDI2_KERNEL_DEEPSEEK_V41_DECODED_ATTN_BLOCK,
     GAUDI2_KERNEL_DEEPSEEK_V4_SPARSE_ATTN_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V4_SPARSE_ATTN_BF16_LENGTHS,
     GAUDI2_KERNEL_DEEPSEEK_V41_SPARSE_ATTN_PAIRED_EXP,
@@ -403,6 +404,8 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
            decodedSwa.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_SWA_DECODED_WRITE].name);
            decodedFp4.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_FP4_DECODED_WRITE].name);
            decodedAttn.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_DECODED_ATTN].name);
+           DeepseekV41DecodedKVGaudi2 decodedBlock(DeepseekV41DecodedKVGaudi2::ATTENTION_BLOCK);
+           decodedBlock.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_DECODED_ATTN_BLOCK].name);
            DeepseekV41SelectedKVGaudi2 validOrdered(1, true), validCacheOrdered(2, true);
            DeepseekV41SelectedKVGaudi2 vec(0, false, true), vecOrdered(1, true, true), vecCache(2, true, true);
            vec.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_KV_VEC_BF16].name);
@@ -825,7 +828,7 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     }
 
     for (auto mode : {DeepseekV41DecodedKVGaudi2::SWA_WRITE, DeepseekV41DecodedKVGaudi2::FP4_WRITE,
-                      DeepseekV41DecodedKVGaudi2::ATTENTION}) {
+                      DeepseekV41DecodedKVGaudi2::ATTENTION, DeepseekV41DecodedKVGaudi2::ATTENTION_BLOCK}) {
         DeepseekV41DecodedKVGaudi2 decoded(mode);
         decoded.GetKernelName(kernelName);
         if (strcmp(params->guid.name, kernelName) == 0) return decoded.GetGcDefinitions(params, instance);
