@@ -9,6 +9,7 @@ license are met.
 
 #include <cstring>
 
+#include "add_rmsnorm_quant_bf16_gaudi2.hpp"
 #include "dflash2_score_select_i64_bf16_f32_gaudi2.hpp"
 #include "dflash2_select_path_i64_f32_gaudi2.hpp"
 #include "gdn_mtp_packed_f32_gaudi2.hpp"
@@ -33,11 +34,11 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(
         return tpc_lib_api::GLUE_SUCCESS;
     }
     const uint32_t capacity = *kernelCount;
-    *kernelCount = 8;
+    *kernelCount = 9;
     if (guids == nullptr || capacity == 0) return tpc_lib_api::GLUE_SUCCESS;
-    if (capacity < 8) return tpc_lib_api::GLUE_FAILED;
+    if (capacity < 9) return tpc_lib_api::GLUE_FAILED;
     if (guids != nullptr) {
-        std::memset(guids, 0, 8 * sizeof(tpc_lib_api::GuidInfo));
+        std::memset(guids, 0, 9 * sizeof(tpc_lib_api::GuidInfo));
         GdnPackedDecodeF32Gaudi2 decodeKernel;
         GdnMtpPackedF32Gaudi2 mtpKernel;
         GdnMtpPreparedF32Gaudi2 preparedMtpKernel;
@@ -51,6 +52,7 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(
         std::strcpy(guids[5].name, SiluAndMulBf16Gaudi2::name);
         std::strcpy(guids[6].name, SiluMulQuantBf16Gaudi2::name);
         std::strcpy(guids[7].name, BlockFp8DequantGaudi2::name);
+        std::strcpy(guids[8].name, AddRmsNormQuantBf16Gaudi2::name);
     }
     return tpc_lib_api::GLUE_SUCCESS;
 }
@@ -94,6 +96,9 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(
     scoreSelectKernel.GetKernelName(kernelName);
     if (std::strcmp(params->guid.name, kernelName) == 0) {
         return scoreSelectKernel.GetGcDefinitions(params, instance);
+    }
+    if (std::strcmp(params->guid.name, AddRmsNormQuantBf16Gaudi2::name) == 0) {
+        return AddRmsNormQuantBf16Gaudi2{}.GetGcDefinitions(params, instance);
     }
     return tpc_lib_api::GLUE_NODE_NOT_FOUND;
 }

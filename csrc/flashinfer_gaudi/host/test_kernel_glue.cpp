@@ -3,6 +3,7 @@
 #include <cstring>
 #include <memory>
 #include <vector>
+#include "add_rmsnorm_quant_bf16_gaudi2.hpp"
 #include "dflash2_score_select_i64_bf16_f32_gaudi2.hpp"
 #include "dflash2_select_path_i64_f32_gaudi2.hpp"
 #include "gdn_mtp_packed_f32_gaudi2.hpp"
@@ -19,7 +20,7 @@ extern "C" tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(
 
 int main() {
     using namespace tpc_lib_api;
-    constexpr uint32_t expectedKernelCount = 8;
+    constexpr uint32_t expectedKernelCount = 9;
     uint32_t count = 0;
     assert(GetKernelGuids(DEVICE_ID_GAUDI2, &count, nullptr) == GLUE_SUCCESS && count == expectedKernelCount);
     GuidInfo guids[expectedKernelCount]{};
@@ -49,6 +50,7 @@ int main() {
     assert(std::strcmp(guids[5].name, SiluAndMulBf16Gaudi2::name) == 0);
     assert(std::strcmp(guids[6].name, SiluMulQuantBf16Gaudi2::name) == 0);
     assert(std::strcmp(guids[7].name, BlockFp8DequantGaudi2::name) == 0);
+    assert(std::strcmp(guids[8].name, AddRmsNormQuantBf16Gaudi2::name) == 0);
     assert(GetKernelGuids(DEVICE_ID_GAUDI, &count, guids) == GLUE_SUCCESS && count == 0);
     assert(GetKernelGuids(DEVICE_ID_GAUDI2, nullptr, nullptr) == GLUE_FAILED);
 

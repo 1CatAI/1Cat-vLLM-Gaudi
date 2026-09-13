@@ -10,7 +10,7 @@ setup(
     ext_modules=[
         CppExtension(
             "flashinfer_gaudi_ops",
-            ["hpu_flashinfer_gaudi.cpp", "hpu_flashinfer_activation.cpp"],
+            ["hpu_flashinfer_gaudi.cpp", "hpu_flashinfer_activation.cpp", "hpu_flashinfer_norm.cpp"],
             include_dirs=[get_include_dir(), "/usr/include/habanalabs"],
             library_dirs=[get_lib_dir()],
             libraries=["habana_pytorch2_plugin.upstream"],
