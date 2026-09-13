@@ -19,12 +19,23 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from vllm_gaudi.platform import HpuPlatform
+from vllm_gaudi.platform import (
+    HpuPlatform,
+    _QWEN38_DFLASH2_DRAFT_FIELDS,
+    _QWEN38_DFLASH2_HEAD_FIELDS,
+    _QWEN38_TARGET_FIELDS,
+    _validate_hpu_dflash2_config,
+)
 
 _EAGER_ONLY_VARS = (
     "RUNTIME_SCALE_PATCHING",
     "FUSER_ENABLE_MULTI_THREADED_INVOCATIONS",
 )
+
+
+def test_runner_kv_caches_allow_distinct_layers_with_same_numeric_index():
+    """Target and MTP draft layers may both have a ``layers.0`` cache."""
+    assert HpuPlatform.check_runner_kv_caches_multi_layer() is None
 
 
 @pytest.fixture(autouse=True)
@@ -33,6 +44,14 @@ def _clean_env():
     touched = (
         "PT_HPU_WEIGHT_SHARING",
         "PT_HPU_ENABLE_LAZY_COLLECTIVES",
+        "VLLM_HPU_FLASHINFER_GDN",
+        "VLLM_HPU_FLASHINFER_DFLASH2",
+        "VLLM_COMPACT_GDN",
+        "VLLM_HPU_NATIVE_DECODE_GRAPH",
+        "VLLM_HPU_TP2_STATIC_GROUP_PLAN",
+        "VLLM_HPU_TP2_PREPARED_COMM",
+        "VLLM_HPU_GDN_DIRECT_STATE_UPDATE",
+        "PT_HPU_POOL_MEM_ACQUIRE_PERC",
         *_EAGER_ONLY_VARS,
     )
     # set_torch_compile() flips torch._dynamo.config.disable in lazy mode;
@@ -49,6 +68,82 @@ def _clean_env():
 
 def _set_lazy(is_lazy: bool):
     return mock.patch("vllm_gaudi.platform.htorch.utils.internal.is_lazy", return_value=is_lazy)
+
+
+def _qwen38_dflash2_vllm_config():
+    draft_values = dict(_QWEN38_DFLASH2_DRAFT_FIELDS)
+    draft_values["layer_types"] = list(draft_values["layer_types"])
+    head_values = dict(_QWEN38_DFLASH2_HEAD_FIELDS)
+    head_values["target_layer_ids"] = list(head_values["target_layer_ids"])
+    draft_values["dflash_config"] = head_values
+    draft = SimpleNamespace(
+        architectures=["DFlash2DraftModel"],
+        hf_config=SimpleNamespace(**draft_values),
+    )
+
+    target_values = dict(_QWEN38_TARGET_FIELDS)
+    target_values["layer_types"] = [
+        "full_attention" if (layer + 1) % 4 == 0 else "linear_attention" for layer in range(64)
+    ]
+    model_config = SimpleNamespace(
+        is_hybrid=True,
+        architecture="Qwen3_5ForConditionalGeneration",
+        hf_config=SimpleNamespace(architectures=["Qwen3_5ForConditionalGeneration"]),
+        hf_text_config=SimpleNamespace(**target_values),
+    )
+    return SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            use_dflash=lambda: True,
+            draft_model_config=draft,
+            num_speculative_tokens=7,
+        ),
+        model_config=model_config,
+        scheduler_config=SimpleNamespace(max_num_seqs=16),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+        ),
+        lora_config=None,
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+    )
+
+
+def test_native_decode_graph_requires_all_structural_prerequisites(monkeypatch):
+    monkeypatch.setenv("VLLM_HPU_NATIVE_DECODE_GRAPH", "1")
+    config = SimpleNamespace(parallel_config=SimpleNamespace(worker_cls="auto"))
+    with (
+            _set_lazy(False),
+            patch.object(HpuPlatform, "set_compile_env_defaults") as defaults,
+            pytest.raises(RuntimeError, match="static group plan") as error,
+    ):
+        HpuPlatform.check_and_update_config(config)
+    defaults.assert_not_called()
+    assert config.parallel_config.worker_cls == "auto"
+    assert "no fallback was selected" in str(error.value)
+
+
+def test_native_decode_graph_requires_tp2(monkeypatch):
+    monkeypatch.setenv("VLLM_HPU_NATIVE_DECODE_GRAPH", "1")
+    monkeypatch.setenv("VLLM_HPU_TP2_STATIC_GROUP_PLAN", "1")
+    monkeypatch.setenv("VLLM_HPU_TP2_PREPARED_COMM", "1")
+    monkeypatch.setenv("VLLM_HPU_GDN_DIRECT_STATE_UPDATE", "1")
+    config = SimpleNamespace(model_config=SimpleNamespace(hf_config=None),
+                             parallel_config=SimpleNamespace(worker_cls="auto", tensor_parallel_size=1))
+    with _set_lazy(False), pytest.raises(RuntimeError, match="tensor_parallel_size=2"):
+        HpuPlatform.check_and_update_config(config)
+    assert os.environ["PT_HPU_POOL_MEM_ACQUIRE_PERC"] == "95"
+
+
+def test_native_decode_graph_rejects_pool_without_program_reserve(monkeypatch):
+    monkeypatch.setenv("VLLM_HPU_NATIVE_DECODE_GRAPH", "1")
+    monkeypatch.setenv("VLLM_HPU_TP2_STATIC_GROUP_PLAN", "1")
+    monkeypatch.setenv("VLLM_HPU_TP2_PREPARED_COMM", "1")
+    monkeypatch.setenv("VLLM_HPU_GDN_DIRECT_STATE_UPDATE", "1")
+    monkeypatch.setenv("PT_HPU_POOL_MEM_ACQUIRE_PERC", "100")
+    config = SimpleNamespace(parallel_config=SimpleNamespace(worker_cls="auto", tensor_parallel_size=2))
+    with _set_lazy(False), pytest.raises(RuntimeError, match="between 1 and 95"):
+        HpuPlatform.check_and_update_config(config)
 
 
 @pytest.mark.parametrize("is_lazy", [True, False])
@@ -136,6 +231,36 @@ def test_pt_hpu_enable_lazy_collectives_default_and_respect():
     with _set_lazy(True):
         HpuPlatform.set_torch_compile()
     assert os.environ["PT_HPU_ENABLE_LAZY_COLLECTIVES"] == "false"
+
+
+def test_qwen38_dflash2_exact_qualification_contract_passes():
+    config = _qwen38_dflash2_vllm_config()
+    with mock.patch.dict(
+            os.environ,
+        {
+            "VLLM_HPU_FLASHINFER_GDN": "1",
+            "VLLM_HPU_FLASHINFER_DFLASH2": "1",
+            "VLLM_COMPACT_GDN": "1",
+        },
+    ):
+        _validate_hpu_dflash2_config(config)
+
+
+def test_qwen38_dflash2_rejects_unqualified_selector_shape():
+    config = _qwen38_dflash2_vllm_config()
+    config.speculative_config.draft_model_config.hf_config.dflash_config["selector_top_k"] = 8
+    with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "VLLM_HPU_FLASHINFER_GDN": "1",
+                    "VLLM_HPU_FLASHINFER_DFLASH2": "1",
+                    "VLLM_COMPACT_GDN": "1",
+                },
+            ),
+            pytest.raises(ValueError, match=r"selector_top_k=8 .*expected 16"),
+    ):
+        _validate_hpu_dflash2_config(config)
 
 
 # ---------------------------------------------------------------------------

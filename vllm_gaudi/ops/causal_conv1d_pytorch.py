@@ -219,6 +219,108 @@ def _flatten_inputs_for_update(
     raise ValueError("Could not infer how to flatten 'x' for the provided dimensions.")
 
 
+def _hpu_causal_conv1d_spec_update(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    activation: str | None,
+    conv_state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    max_query_len: int,
+    round_before_activation: bool = False,
+    full_query_valid_state: bool = False,
+) -> torch.Tensor:
+    """Rollback and advance expanded convolution state for speculative decode.
+
+    The state layout matches the upstream kernel: after a T-token verification
+    pass it stores ``width - 2`` history rows followed by all T candidate input
+    rows. On the next pass, ``num_accepted_tokens - 1`` selects the committed
+    history window without copying or compacting state on the host.
+
+    ``full_query_valid_state`` is a caller-proven contract: every padded
+    position is a real token and every state index is an owned, in-range row.
+    It removes masking and redundant state reads, not arithmetic or rounding.
+    """
+    if x.ndim != 2 or x.shape[1] != weight.shape[0]:
+        raise ValueError("Speculative convolution expects token-first x with shape [B*T, dim].")
+    if conv_state_indices.ndim != 1:
+        raise ValueError("conv_state_indices must have shape [B] for speculative convolution.")
+
+    batch = conv_state_indices.numel()
+    if batch == 0 or x.shape[0] % batch:
+        raise ValueError("Speculative convolution input must contain a fixed padded token width per request.")
+    padded_tokens = x.shape[0] // batch
+    if max_query_len not in (-1, None) and int(max_query_len) != padded_tokens:
+        raise ValueError(f"max_query_len={max_query_len} does not match padded token width {padded_tokens}.")
+
+    dim, width = weight.shape
+    history_len = width - 1
+    if history_len < 1:
+        raise ValueError("Speculative convolution requires a kernel width of at least two.")
+    state_is_sd = conv_state.ndim == 3 and conv_state.shape[-1] == dim
+    state_is_ds = conv_state.ndim == 3 and conv_state.shape[1] == dim
+    if not state_is_sd and not state_is_ds:
+        raise ValueError("conv_state must use [slots,state_len,dim] or [slots,dim,state_len] layout.")
+    state_view = conv_state if state_is_sd else conv_state.transpose(1, 2)
+    required_state_len = history_len - 1 + padded_tokens
+    if state_view.shape[1] < required_state_len:
+        raise ValueError(f"Expanded conv state has {state_view.shape[1]} rows, requires at least {required_state_len}.")
+
+    device = x.device
+    state_indices = conv_state_indices.to(device=device, dtype=torch.long)
+    safe_indices = state_indices if full_query_valid_state else torch.remainder(state_indices, state_view.shape[0])
+    state_rows = state_view.index_select(0, safe_indices)
+    max_checkpoint = state_view.shape[1] - history_len + 1
+    accepted_offset = num_accepted_tokens.to(device=device, dtype=torch.long).clamp(
+        min=1,
+        max=max_checkpoint,
+    ) - 1
+    history_indices = accepted_offset[:, None] + torch.arange(history_len, dtype=torch.long, device=device)[None, :]
+    history_indices = history_indices.unsqueeze(-1).expand(-1, -1, dim)
+    history = torch.gather(state_rows, 1, history_indices)
+
+    x_batch = x.reshape(batch, padded_tokens, dim).to(state_view.dtype)
+    if not full_query_valid_state:
+        query_lens = (_ensure_query_start_loc(query_start_loc)[1:] - _ensure_query_start_loc(query_start_loc)[:-1])
+        query_lens = query_lens[:batch].clamp(min=0, max=padded_tokens)
+        token_offsets = torch.arange(padded_tokens, dtype=torch.long, device=device)
+        token_mask = token_offsets.unsqueeze(0) < query_lens.unsqueeze(1)
+        x_batch = x_batch * token_mask.unsqueeze(-1).to(x_batch.dtype)
+
+    sequence = torch.cat((history, x_batch), dim=1)
+    work_dtype = torch.float32 if x_batch.dtype in (torch.bfloat16, torch.float16) else x_batch.dtype
+    sequence_work = sequence.to(work_dtype)
+    weight_work = weight.to(work_dtype)
+    output = sequence_work[:, :padded_tokens] * weight_work[:, 0].view(1, 1, dim)
+    for tap in range(1, width):
+        output = output + sequence_work[:, tap:tap + padded_tokens] * weight_work[:, tap].view(1, 1, dim)
+    if bias is not None:
+        output = output + bias.to(work_dtype).view(1, 1, dim)
+    if round_before_activation:
+        # Ordinary HPU decode rounds the convolution result to cache dtype
+        # before SiLU. Keep this explicit when checking speculative parity
+        # against that path; rounding only after SiLU is a different contract.
+        output = output.to(state_view.dtype)
+    output = _apply_activation(output, activation)
+    if not full_query_valid_state:
+        output = output * token_mask.unsqueeze(-1).to(output.dtype)
+
+    new_state = torch.cat((history[:, 1:], x_batch), dim=1)
+    if new_state.shape[1] < state_view.shape[1]:
+        new_state = torch.nn.functional.pad(new_state, (0, 0, 0, state_view.shape[1] - new_state.shape[1]))
+    elif new_state.shape[1] > state_view.shape[1]:
+        new_state = new_state[:, :state_view.shape[1]]
+    if not full_query_valid_state:
+        previous = state_view.index_select(0, safe_indices)
+        update_rows = (state_indices >= 0) & (query_lens > 0)
+        new_state = torch.where(update_rows.view(-1, 1, 1), new_state, previous)
+    with torch.no_grad():
+        state_view.index_copy_(0, safe_indices, new_state)
+    return output.reshape_as(x).to(x.dtype)
+
+
 def hpu_causal_conv1d_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -266,6 +368,9 @@ def hpu_causal_conv1d_fn(
     dim, cu_seqlen = x_work.shape
     _, width = weight_work.shape
     state_len = max(width - 1, 0)
+    # Expanded speculative states keep the committed prefill history at the
+    # front; in the ordinary width-1 layout front and tail are identical.
+    state_start = 0 if conv_states.shape[1] > state_len else conv_states.shape[1] - state_len
 
     if validate_data:
         if x_work.dim() != 2:
@@ -309,7 +414,8 @@ def hpu_causal_conv1d_fn(
 
         # Gather init states for all sequences at once: (B, state_len, dim) -> (B, dim, state_len)
         if has_initial_state is not None:
-            raw_states = conv_states.index_select(0, safe_cache_idx_prefill)[:, -state_len:, :].transpose(-1, -2)
+            raw_states = conv_states.index_select(0, safe_cache_idx_prefill)[:, state_start:state_start + state_len, :]
+            raw_states = raw_states.transpose(-1, -2)
             # has_initial_state may have fewer elements than padded_batch;
             # pad with False (0) so the mask broadcasts correctly.
             his = has_initial_state
@@ -356,9 +462,14 @@ def hpu_causal_conv1d_fn(
         with torch.no_grad():
             update_mask = (actual_qlens > 0).view(-1, 1, 1)
             new_states_t = new_states.transpose(-1, -2)  # [B, state_len, dim]
-            existing_states = conv_states.index_select(0, safe_cache_idx_prefill)[:, -state_len:, :]
-            conv_states[safe_cache_idx_prefill, -state_len:, :] = torch.where(update_mask, new_states_t,
-                                                                              existing_states)
+            existing_states = conv_states.index_select(0,
+                                                       safe_cache_idx_prefill)[:,
+                                                                               state_start:state_start + state_len, :]
+            conv_states[safe_cache_idx_prefill, state_start:state_start + state_len, :] = torch.where(
+                update_mask,
+                new_states_t,
+                existing_states,
+            )
 
     else:
         # Fallback: variable-length sequences — per-sequence loop
@@ -377,7 +488,8 @@ def hpu_causal_conv1d_fn(
             cache_idx_b = safe_cache_idx_prefill[b:b + 1]
 
             if has_initial_state is not None:
-                raw_state_b = conv_states[cache_idx_b, -state_len:, :].transpose(-1, -2).squeeze(0)
+                raw_state_b = conv_states[cache_idx_b, state_start:state_start + state_len, :].transpose(-1,
+                                                                                                         -2).squeeze(0)
                 mask_b = has_initial_state[b] if has_initial_state.numel() > 1 else has_initial_state[0]
                 init_state_b = torch.where(mask_b, raw_state_b,
                                            torch.zeros(dim, state_len, device=x_work.device, dtype=work_dtype))
@@ -396,7 +508,8 @@ def hpu_causal_conv1d_fn(
             seq_out[:, seq_start:seq_end] = out_b
 
             with torch.no_grad():
-                conv_states[cache_idx_b, -state_len:, :] = new_state_b.unsqueeze(0).transpose(-1, -2)
+                conv_states[cache_idx_b,
+                            state_start:state_start + state_len, :] = new_state_b.unsqueeze(0).transpose(-1, -2)
 
     seq_out = _apply_activation(seq_out, activation)
 
@@ -436,10 +549,8 @@ def hpu_causal_conv1d_fn_token_major(
             initial_state_idx,
             num_computed_tokens,
     )):
-        raise NotImplementedError(
-            "Prefix caching metadata is not supported in the PyTorch "
-            "reference implementation."
-        )
+        raise NotImplementedError("Prefix caching metadata is not supported in the PyTorch "
+                                  "reference implementation.")
 
     activation = _normalize_activation(activation)
     if x.dim() != 2:
@@ -453,9 +564,7 @@ def hpu_causal_conv1d_fn_token_major(
     weight_work = weight.to(work_dtype)
     bias_work = bias.to(work_dtype) if bias is not None else None
     if conv_states.device != x_work.device:
-        raise ValueError(
-            "'conv_states' must reside on the same device as 'x'."
-        )
+        raise ValueError("'conv_states' must reside on the same device as 'x'.")
 
     qsl = _ensure_query_start_loc(query_start_loc)
     padded_batch = qsl.numel() - 1
@@ -469,13 +578,9 @@ def hpu_causal_conv1d_fn_token_major(
         if bias_work is not None and bias_work.shape != (dim, ):
             raise ValueError("'bias' must match the feature dimension.")
         if cache_indices is not None and cache_indices.numel() != padded_batch:
-            raise ValueError(
-                "'cache_indices' must align with 'query_start_loc'."
-            )
+            raise ValueError("'cache_indices' must align with 'query_start_loc'.")
         if has_initial_state is not None and has_initial_state.numel() != padded_batch:
-            raise ValueError(
-                "'has_initial_state' must align with 'query_start_loc'."
-            )
+            raise ValueError("'has_initial_state' must align with 'query_start_loc'.")
 
     # The token-major fast path targets the equal-size HPU prompt buckets.
     # Retain the established implementation for variable-length fallback.
@@ -499,11 +604,7 @@ def hpu_causal_conv1d_fn_token_major(
             dtype=torch.long,
         )
     else:
-        batch_cache_idx = (
-            cache_indices.to(x_work.device)
-            if cache_indices.device != x_work.device
-            else cache_indices
-        )
+        batch_cache_idx = (cache_indices.to(x_work.device) if cache_indices.device != x_work.device else cache_indices)
     safe_cache_idx = torch.remainder(
         batch_cache_idx,
         conv_states.shape[0],
@@ -558,26 +659,18 @@ def hpu_causal_conv1d_fn_token_major(
         dtype=work_dtype,
     )
     for tap in range(width):
-        seq_out_batch = seq_out_batch + (
-            seq_input[:, tap:tap + seq_len_each, :]
-            * weight_work[:, tap].view(1, 1, dim)
-        )
+        seq_out_batch = seq_out_batch + (seq_input[:, tap:tap + seq_len_each, :] * weight_work[:, tap].view(1, 1, dim))
     if bias_work is not None:
         seq_out_batch = seq_out_batch + bias_work.view(1, 1, dim)
 
     if state_len:
-        actual_qlens = (
-            qsl[1:padded_batch + 1] - qsl[:padded_batch]
-        ).clamp(min=0)
+        actual_qlens = (qsl[1:padded_batch + 1] - qsl[:padded_batch]).clamp(min=0)
         state_offsets = torch.arange(
             state_len,
             device=x_work.device,
             dtype=torch.int64,
         )
-        state_indices = (
-            actual_qlens.unsqueeze(-1).to(torch.int64)
-            + state_offsets.unsqueeze(0)
-        )
+        state_indices = (actual_qlens.unsqueeze(-1).to(torch.int64) + state_offsets.unsqueeze(0))
         state_indices = state_indices.unsqueeze(-1).expand(-1, -1, dim)
         new_states = torch.gather(seq_input, 1, state_indices)
         with torch.no_grad():
@@ -611,15 +704,31 @@ def hpu_causal_conv1d_update(
     initial_state_idx: torch.Tensor | None = None,
     validate_data: bool = False,
     direct_state_layout: bool = False,
+    round_before_activation: bool = False,
+    full_query_valid_state: bool = False,
 ):
-    if num_accepted_tokens is not None:
-        raise NotImplementedError("Speculative decoding updates are not supported in the reference implementation.")
     if block_idx_last_scheduled_token is not None or initial_state_idx is not None:
         raise NotImplementedError("Prefix caching metadata is not supported in the reference implementation.")
+    activation = _normalize_activation(activation)
+    if num_accepted_tokens is not None:
+        if conv_state_indices is None or query_start_loc is None:
+            raise ValueError("Speculative convolution requires state indices and query_start_loc.")
+        return _hpu_causal_conv1d_spec_update(
+            x,
+            conv_state,
+            weight,
+            bias,
+            activation,
+            conv_state_indices,
+            num_accepted_tokens,
+            query_start_loc,
+            max_query_len,
+            round_before_activation,
+            full_query_valid_state,
+        )
     if max_query_len not in (-1, None):  # Provided only for Triton helper parity
         raise NotImplementedError("'max_query_len' is not used in the reference implementation.")
 
-    activation = _normalize_activation(activation)
     dim = weight.size(0)
 
     flat_x, qsl, reshape_spec = _flatten_inputs_for_update(x, query_start_loc, dim)
@@ -688,6 +797,7 @@ def hpu_causal_conv1d_fn_update(
     _, dim, cu_seqlen = x_work.shape
     _, width = weight_work.shape
     state_len = max(width - 1, 0)
+    state_start = 0 if conv_states.shape[1] > state_len else conv_states.shape[1] - state_len
 
     if validate_data:
         if x_work.dim() != 2:
@@ -713,7 +823,7 @@ def hpu_causal_conv1d_fn_update(
         # The model runner proves that request slots are contiguous and in
         # batch order before selecting this path. Basic slicing avoids the
         # gather/scatter nodes and their integer-index recipe boundary.
-        state_rows = conv_states[:, -state_len:, :]
+        state_rows = conv_states[:, state_start:state_start + state_len, :]
 
         # For one-token decode, consume the native [B, state_len, dim]
         # layout directly. This avoids transposing and concatenating a
@@ -733,7 +843,7 @@ def hpu_causal_conv1d_fn_update(
         seq_out = _apply_activation(output_token.unsqueeze(-1), activation)
         new_state = torch.cat([state_rows[:, 1:, :], token_x.unsqueeze(1)], dim=1)
         with torch.no_grad():
-            conv_states[:, -state_len:, :].copy_(new_state)
+            conv_states[:, state_start:state_start + state_len, :].copy_(new_state)
         return seq_out.to(original_dtype)
     else:
         # Get cache indices
@@ -750,7 +860,7 @@ def hpu_causal_conv1d_fn_update(
         # integer tensors. remainder(-1, N) == N-1.
         num_conv_slots = conv_states.shape[0]
         safe_cache_idx = torch.remainder(batch_cache_idx, num_conv_slots)
-        init_state = conv_states[safe_cache_idx, -state_len:, :]
+        init_state = conv_states[safe_cache_idx, state_start:state_start + state_len, :]
     init_state = init_state.transpose(-1, -2)
 
     seq_input = torch.cat([init_state, x_work], dim=2)
@@ -761,6 +871,6 @@ def hpu_causal_conv1d_fn_update(
     seq_out = _apply_activation(seq_out, activation)
 
     with torch.no_grad():
-        conv_states[safe_cache_idx, -state_len:, :] = new_state.transpose(-1, -2)
+        conv_states[safe_cache_idx, state_start:state_start + state_len, :] = new_state.transpose(-1, -2)
 
     return seq_out.to(original_dtype)

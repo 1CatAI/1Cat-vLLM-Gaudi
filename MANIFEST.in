@@ -2,5 +2,14 @@ recursive-include csrc/flashinfer_gaudi *
 recursive-include flashinfer_gaudi/tactics *.json
 include tools/build_flashinfer_gaudi.py
 include tools/build_flashinfer_gaudi_bridge.py
+recursive-include csrc/deepseek_v4 *.c *.cpp *.h *.hpp *.py CMakeLists.txt
+include csrc/deepseek_v4/NOTICE
+recursive-include patches/deepseek_v4 *.patch
+include patches/deepseek_v4/README.md
+include tools/build_deepseek_v4.py
+include tools/prepare_deepseek_v4_engine.py
+include tools/check_deepseek_v4_kernels.py
+include tools/check_deepseek_v4_compiler.py
+include tools/qualify_deepseek_v4_source.py
 exclude flashinfer_gaudi/lib/*.so
 exclude flashinfer_gaudi/lib/bridge_artifact_v1.json

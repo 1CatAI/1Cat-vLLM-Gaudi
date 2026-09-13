@@ -25,7 +25,6 @@ import habana_frameworks.torch.internal.bridge_config as bc
 import numpy as np
 import torch
 import torch.distributed
-import torch.nn.functional as F
 import torch.nn as nn
 import vllm_gaudi.envs as gaudi_envs
 import vllm_gaudi.extension.environment as environment
@@ -37,8 +36,9 @@ from vllm_gaudi.extension.runtime import clear_config, finalize_config, get_conf
 from vllm_gaudi.extension.utils import align_and_pad, pad_list, with_default
 from vllm_gaudi.extension.debug import init_debug_logger
 from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
+from vllm_gaudi.v1.worker.gdn_state_layout import has_contiguous_dflash_checkpoints
 
-from vllm.v1.attention.backend import AttentionBackend, AttentionType
+from vllm.v1.attention.backend import AttentionBackend, AttentionType, CommonAttentionMetadata
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.v1.attention.selector import get_attn_backend
@@ -71,6 +71,8 @@ from vllm_gaudi.v1.attention.backends.hpu_attn import HPUAttentionMetadataV1
 from vllm.v1.attention.backends.utils import create_fast_prefill_custom_backend
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    compute_layer_kv_cache_shape_bytes,
+    compute_layout_strides,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -86,13 +88,15 @@ from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsLists, LogprobsT
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.worker.utils import bind_kv_cache, add_kv_sharing_layers_to_kv_cache_groups
+from vllm.v1.worker.block_table import SlotMappingMode
 from vllm.v1.utils import CpuGpuBuffer
 from vllm_gaudi.v1.worker.hpu_input_batch import InputBatch, CachedRequestState
 from vllm.distributed.parallel_state import get_pp_group, get_dp_group
 from vllm.model_executor.models.interfaces import (supports_eagle3, supports_transcription)
 from vllm.model_executor.models.interfaces_base import (VllmModelForPooling, is_pooling_model, is_text_generation_model)
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
-from vllm.v1.worker.utils import (AttentionGroup, prepare_kernel_block_sizes, sanity_check_mm_encoder_outputs)
+from vllm.v1.worker.utils import (AttentionGroup, allocate_kv_cache, prepare_kernel_block_sizes,
+                                  sanity_check_mm_encoder_outputs)
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -107,6 +111,7 @@ from vllm.lora.layers import LoRAMapping
 from vllm.lora.request import LoRARequest
 from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
 from vllm.model_executor.models import supports_lora, supports_multimodal
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm_gaudi.extension.ops import LoraMask as LoraMask
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiKVConnectorMetadata
@@ -132,6 +137,53 @@ from vllm_gaudi.extension.logger import logger as init_logger
 from vllm.model_executor.models.bert import _encode_token_type_ids
 
 logger = init_logger()
+
+
+def _hpu_init_sync(stage: str) -> None:
+    if os.getenv("VLLM_HPU_INIT_SYNC_DEBUG") != "1":
+        return
+    torch.hpu.synchronize()
+    logger.warning("HPU model runner init sync passed: %s", stage)
+
+
+def _dynamo_cache_limit(
+    bucket_count: int,
+    regional_compilation: bool,
+    model_type: str,
+    num_model_layers: int,
+) -> int:
+    region_variants = 5 if regional_compilation else 1
+    if model_type == "deepseek_v4":
+        # DeepSeek attention embeds layer_name in a custom-op call, so each
+        # decoder layer specializes the shared forward code once.
+        region_variants += max(num_model_layers - 1, 0)
+    return 1 + region_variants * bucket_count
+
+
+def _configure_dynamo_cache_limits(
+    cache_size_limit: int,
+    dynamo_config=None,
+) -> None:
+    if dynamo_config is None:
+        dynamo_config = torch._dynamo.config
+    for name in ("cache_size_limit", "recompile_limit"):
+        if hasattr(dynamo_config, name):
+            setattr(
+                dynamo_config,
+                name,
+                max(cache_size_limit, getattr(dynamo_config, name)),
+            )
+    accumulated_limit = cache_size_limit * 8
+    for name in (
+            "accumulated_cache_size_limit",
+            "accumulated_recompile_limit",
+    ):
+        if hasattr(dynamo_config, name):
+            setattr(
+                dynamo_config,
+                name,
+                max(accumulated_limit, getattr(dynamo_config, name)),
+            )
 
 
 def is_interleaved(config: Any) -> bool:
@@ -172,30 +224,38 @@ def _zero_compact_gdn_slot(
     state_tensors: Iterable[torch.Tensor],
     base_slot: int,
     num_groups: int,
+    max_num_reqs: int,
+    state_slots_per_req: int = 1,
 ) -> None:
-    """Clear every group state before a compact GDN slot is reused."""
-    if base_slot < 0 or num_groups <= 0:
-        raise ValueError(
-            f"Invalid compact GDN slot: base_slot={base_slot}, num_groups={num_groups}"
-        )
-    start = base_slot * num_groups + 1
+    """Clear every group/checkpoint state before a compact slot is reused."""
+    if (base_slot < 0 or base_slot >= max_num_reqs or num_groups <= 0 or max_num_reqs <= 0 or state_slots_per_req <= 0):
+        raise ValueError("Invalid compact GDN slot: "
+                         f"base_slot={base_slot}, num_groups={num_groups}, "
+                         f"max_num_reqs={max_num_reqs}, "
+                         f"state_slots_per_req={state_slots_per_req}")
+    clear_rows = [0]
+    for group_offset in range(num_groups):
+        start = ((group_offset * max_num_reqs + base_slot) * state_slots_per_req + 1)
+        clear_rows.extend(range(start, start + state_slots_per_req))
+    # Validate the complete allocation set before modifying any recurrent state.
+    state_tensors = tuple(state_tensors)
+    expected_rows = num_groups * max_num_reqs * state_slots_per_req + 2
+    for state in state_tensors:
+        if state.ndim == 0 or state.shape[0] != expected_rows:
+            raise ValueError("Invalid compact GDN state allocation: "
+                             f"shape={tuple(state.shape)}, expected_rows={expected_rows}")
     needs_hpu_sync = False
     for state in state_tensors:
-        if state.ndim == 0 or start + num_groups > state.shape[0]:
-            raise ValueError(
-                "Compact GDN state tensor is too small for slot clear: "
-                f"shape={tuple(state.shape)}, start={start}, num_groups={num_groups}"
-            )
         # Slot 0 and the final slot are global sentinels. Compiled padded
         # prompt/decode graphs may write them, so stale non-finite values must
         # not survive into the next request. Update the base tensor directly:
         # HPU eager mode does not reliably persist zero_() on indexed views.
-        if state.shape[0] == num_groups + 2:
+        if state.shape[0] == num_groups * state_slots_per_req + 2:
             # max_num_seqs=1: every non-sentinel row belongs to this request.
             state.zero_()
         else:
             clear_indices = torch.tensor(
-                [0, *range(start, start + num_groups), state.shape[0] - 1],
+                [*clear_rows, state.shape[0] - 1],
                 dtype=torch.long,
                 device=state.device,
             )
@@ -208,10 +268,18 @@ def _zero_compact_gdn_slot(
 _TYPE_CACHE: dict[str, dict[str, Any]] = {}
 
 HPU_TORCH_DTYPE_TO_STR_DTYPE = {
-    torch.float32: "float32",
-    torch.bfloat16: "bfloat16",
-    torch.float16: "float16",
-    torch.float8_e4m3fn: "fp8_e4m3"
+    torch.float32:
+    "float32",
+    torch.bfloat16:
+    "bfloat16",
+    torch.float16:
+    "float16",
+    torch.float8_e4m3fn:
+    "fp8_e4m3",
+    # Upstream represents the generic "fp8" KV-cache choice as uint8.
+    # HPU's attention backend calls the same packed format "fp8_inc".
+    torch.uint8:
+    "fp8_inc",
 }
 
 shutdown_inc_called = False
@@ -404,6 +472,16 @@ def _rebind_moe_expert_weights(model: torch.nn.Module) -> None:
                         moe_op.w13_list[i].set_bias(w13_bias[i])
                     if hasattr(moe_op.w2_list[i], "set_bias"):
                         moe_op.w2_list[i].set_bias(w2_bias[i])
+            if hasattr(moe_op, "set_stacked_weights"):
+                w13_scale = getattr(module, "w13_weight_scale", None)
+                w2_scale = getattr(module, "w2_weight_scale", None)
+                if w13_scale is not None and w2_scale is not None:
+                    moe_op.set_stacked_weights(
+                        w13_weight.data,
+                        w2_weight.data,
+                        w13_scale.data,
+                        w2_scale.data,
+                    )
             # Rebuild cache only when we rebound the plain-attr views, because
             # model.to() → _apply() left the cache pointing at the old device's
             # storage.
@@ -589,13 +667,21 @@ class AsyncHPUModelRunnerOutput(AsyncModelRunnerOutput):
         sampled_token_ids: torch.Tensor,
         invalid_req_indices: list[int],
         async_output_copy_stream: torch.hpu.Stream,
+        native_copy: bool = False,
     ):
         self._model_runner_output = model_runner_output
-        self._invalid_req_indices = invalid_req_indices
+        self._invalid_req_indices = list(invalid_req_indices) if native_copy else invalid_req_indices
 
         # Keep a reference to the device tensor to avoid it being
         # deallocated until we finish copying it to the host.
         self._sampled_token_ids = sampled_token_ids
+
+        if native_copy:
+            from vllm_gaudi.distributed.tp2_fused_ar_norm import _resolve_runtime
+            bridge, _, _ = _resolve_runtime()
+            self._sampled_token_ids_cpu, self._async_copy_ready_event = bridge.copy_sampled_tokens_to_host(
+                sampled_token_ids)
+            return
 
         self._async_copy_ready_event = torch.hpu.Event()
         default_stream = torch.hpu.current_stream()
@@ -691,6 +777,7 @@ class DecodeInputData:
     attn_metadata: Optional[HPUAttentionMetadataV1] = None
     logits_indices: Optional[torch.Tensor] = None
     spec_decode_metadata: Optional[SpecDecodeMetadata] = None
+    draft_block_table: Optional[torch.Tensor] = None
 
 
 def bool_helper(value):
@@ -925,6 +1012,206 @@ def _init_mamba_split_weights(model):
             module._init_split_weights()
 
 
+def _needs_compile_validation_warmup(model_type: str) -> bool:
+    # These models specialize the same compiled layer code across materially
+    # different layer variants. DeepSeek V4 alternates 0/4/128 compression
+    # ratios, so compile-only warmup alone can leave the first real request
+    # recompiling a guard specialization on the host.
+    return model_type in (
+        "qwen3_moe",
+        "qwen3_5",
+        "qwen3_5_text",
+        "qwen3_5_moe",
+        "gemma4",
+        "deepseek_v4",
+    )
+
+
+def _dsv4_decode_only_compile_enabled(model_type: str) -> bool:
+    return (model_type == "deepseek_v4"
+            and os.getenv("VLLM_HPU_DSV4_DECODE_ONLY_WARMUP", "0").strip().lower() in ("1", "true"))
+
+
+class _HPUDeepseekV4PhaseChunk:
+
+    def __init__(self, eager_chunk, compiled_chunk) -> None:
+        self.eager_chunk = eager_chunk
+        self.compiled_chunk = compiled_chunk
+
+    def __call__(self, hidden_states, *args, **kwargs):
+        phase = _dsv4_forward_phase()
+        if phase == "prefill":
+            chunk = self.eager_chunk
+        elif phase == "decode":
+            chunk = self.compiled_chunk
+        else:
+            chunk = (self.eager_chunk if hidden_states.shape[0] > 1 else self.compiled_chunk)
+        return chunk(hidden_states, *args, **kwargs)
+
+
+def _dsv4_forward_phase() -> str | None:
+    try:
+        attn_metadata = get_forward_context().attn_metadata
+    except AssertionError:
+        return None
+
+    metadata_groups = attn_metadata if isinstance(attn_metadata, list) else [attn_metadata]
+
+    saw_decode = False
+    for metadata_group in metadata_groups:
+        metadata_values = metadata_group.values() if isinstance(metadata_group, Mapping) else (metadata_group, )
+        for metadata in metadata_values:
+            if metadata is None:
+                continue
+            if int(getattr(metadata, "num_prefills", 0)) > 0:
+                return "prefill"
+            if int(getattr(metadata, "num_decodes", 0)) > 0:
+                saw_decode = True
+            is_prompt = getattr(metadata, "is_prompt", None)
+            if is_prompt is True:
+                return "prefill"
+            if is_prompt is False:
+                saw_decode = True
+    return "decode" if saw_decode else None
+
+
+@contextlib.contextmanager
+def _dsv4_compile_only_scope(enabled: bool):
+    if not enabled:
+        yield
+        return
+
+    from vllm_gaudi.ops.hpu_hw_agnostic import (
+        _set_hpu_dsv4_compile_only, )
+
+    previous = _set_hpu_dsv4_compile_only(True)
+    env_name = "_VLLM_HPU_DSV4_COMPILE_ONLY_ACTIVE"
+    previous_env = os.environ.get(env_name)
+    os.environ[env_name] = "1"
+    try:
+        yield
+    finally:
+        _set_hpu_dsv4_compile_only(previous)
+        if previous_env is None:
+            os.environ.pop(env_name, None)
+        else:
+            os.environ[env_name] = previous_env
+
+
+def _configure_deepseek_v4_inline_attention(model) -> int:
+    inline_all = gaudi_envs.VLLM_HPU_DSV4_INLINE_ATTENTION
+    inline_frontend = gaudi_envs.VLLM_HPU_DSV4_INLINE_ATTN_FRONTEND
+    if not inline_all and not inline_frontend:
+        return 0
+    if inline_all and inline_frontend:
+        raise ValueError("VLLM_HPU_DSV4_INLINE_ATTENTION and "
+                         "VLLM_HPU_DSV4_INLINE_ATTN_FRONTEND are mutually exclusive")
+    from vllm.models.deepseek_v4.hw_agnostic.attention.attention import (
+        DeepseekV4MultiHeadLatentAttentionWrapper, )
+
+    configured = 0
+    for module in model.modules():
+        if isinstance(module, DeepseekV4MultiHeadLatentAttentionWrapper):
+            if inline_all:
+                module.inline_attention_impl = True
+            else:
+                module.inline_attention_frontend = True
+            configured += 1
+    return configured
+
+
+def _promote_deepseek_v4_rope_buffers(model) -> int:
+    if not htorch.utils.internal.is_lazy():
+        return 0
+    promoted = 0
+    for module in model.modules():
+        cache = module._buffers.get("cos_sin_cache")
+        if cache is None or cache.device.type != "hpu":
+            continue
+        del module._buffers["cos_sin_cache"]
+        module.register_parameter(
+            "cos_sin_cache",
+            torch.nn.Parameter(cache.detach().clone(), requires_grad=False),
+        )
+        promoted += 1
+    return promoted
+
+
+def _preload_deepseek_v4_tpc_ops() -> bool:
+    if not gaudi_envs.VLLM_HPU_DSV4_TPC_OP_LIBRARY:
+        return False
+    from vllm_gaudi.ops.hpu_hw_agnostic import (
+        _ensure_dsv4_tpc_ops_loaded, )
+
+    _ensure_dsv4_tpc_ops_loaded()
+    return True
+
+
+def _prewarm_deepseek_v4_qnorm_tpc(model: torch.nn.Module) -> int:
+    if not gaudi_envs.VLLM_HPU_DSV4_TPC_QNORM_ROPE_KV_PACK:
+        return 0
+
+    from vllm.models.deepseek_v4.hw_agnostic.attention.attention import (
+        DeepseekV4MultiHeadLatentAttentionWrapper, )
+    from vllm_gaudi.ops.hpu_hw_agnostic import (
+        _hpu_qnorm_rope_kv_fp8_insert,
+        _set_hpu_dsv4_qnorm_tpc_prewarmed,
+    )
+
+    _set_hpu_dsv4_qnorm_tpc_prewarmed(False)
+    warmed_shapes: set[tuple[Any, ...]] = set()
+    for module in model.modules():
+        if not isinstance(module, DeepseekV4MultiHeadLatentAttentionWrapper):
+            continue
+        cache_layer = module.swa_cache_layer
+        storage = cache_layer.kv_cache_storage
+        geometry = cache_layer.kv_cache_geometry
+        if storage.numel() == 0 or geometry.numel() != 4:
+            continue
+        cos_sin_cache = module.rotary_emb.cos_sin_cache.contiguous()
+        recipe_shape = (
+            module.n_local_heads,
+            tuple(storage.shape),
+            tuple(storage.stride()),
+            tuple(cos_sin_cache.shape),
+            tuple(cos_sin_cache.stride()),
+        )
+        if recipe_shape in warmed_shapes:
+            continue
+
+        device = storage.device
+        q = torch.zeros(
+            (1, module.n_local_heads, module.head_dim),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        kv = torch.zeros(
+            (1, module.head_dim),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        slots = torch.full((1, ), -1, dtype=torch.int32, device=device)
+        positions = torch.zeros((1, ), dtype=torch.int32, device=device)
+        _hpu_qnorm_rope_kv_fp8_insert(
+            q,
+            kv,
+            cache_layer.kv_cache,
+            slots,
+            positions,
+            cos_sin_cache,
+            module.eps,
+            cache_layer.block_size,
+            storage,
+            geometry,
+        )
+        torch.hpu.synchronize()
+        warmed_shapes.add(recipe_shape)
+
+    if warmed_shapes:
+        _set_hpu_dsv4_qnorm_tpc_prewarmed(True)
+    return len(warmed_shapes)
+
+
 def apply_model_specific_patches(model_runner):
     """The function applies model-specific monkey patches."""
     maybe_set_chunked_attention_layers(model_runner)
@@ -939,9 +1226,53 @@ def apply_model_specific_patches(model_runner):
     is_llama4 = is_hpu_llama4_model(model_runner.model)
     model_type = getattr(model_runner.vllm_config.model_config.hf_config, "model_type", "")
     is_qwen_moe = model_type in ("qwen3_moe", "qwen3_5", "qwen3_5_text", "qwen3_5_moe")
-    is_gemma4 = model_type in ("gemma4", )
 
-    model_runner._has_heterogeneous_layers = is_llama4 or is_qwen_moe or is_gemma4
+    if model_type == "deepseek_v4":
+        promoted_rope_buffers = _promote_deepseek_v4_rope_buffers(model_runner.model)
+        if promoted_rope_buffers:
+            logger.info(
+                "Promoted %d DeepSeek V4 RoPE buffers to lazy graph constants",
+                promoted_rope_buffers,
+            )
+        if _preload_deepseek_v4_tpc_ops():
+            logger.info("Preloaded DeepSeek V4 TPC operators before graph warmup")
+            logger.info(
+                "DeepSeek V4 decode TPC config: direct=%s paged=%s "
+                "short_indexer_cache_skip=%s pair_heads=%s "
+                "pair_op_registered=%s compress_bf16=%s "
+                "compress_bf16_op_registered=%s compress_mixed=%s "
+                "compress_mixed_op_registered=%s",
+                gaudi_envs.VLLM_HPU_DSV4_DIRECT_DECODE_DISPATCH,
+                gaudi_envs.VLLM_HPU_DSV4_TPC_PAGED_SPARSE_ATTN,
+                gaudi_envs.VLLM_HPU_DSV4_SHORT_INDEXER_CACHE_SKIP,
+                gaudi_envs.VLLM_HPU_DSV4_TPC_PAIR_HEADS,
+                hasattr(
+                    torch.ops.custom_op,
+                    "custom_deepseek_v4_paged_sparse_attn_pair_"
+                    "sequential_fp8_gaudi2",
+                ),
+                gaudi_envs.VLLM_HPU_DSV4_TPC_BF16_COMPRESS_INPUTS,
+                hasattr(
+                    torch.ops.custom_op,
+                    "custom_deepseek_v4_save_compress_norm_c4_"
+                    "bf16_gaudi2",
+                ),
+                gaudi_envs.VLLM_HPU_DSV4_TPC_MIXED_COMPRESS_INPUTS,
+                hasattr(
+                    torch.ops.custom_op,
+                    "custom_deepseek_v4_save_compress_norm_c4_"
+                    "mixed_gaudi2",
+                ),
+            )
+        inline_attention_layers = _configure_deepseek_v4_inline_attention(model_runner.model)
+        if inline_attention_layers:
+            logger.info(
+                "Enabled inline DeepSeek V4 %s for %d layers",
+                ("attention" if gaudi_envs.VLLM_HPU_DSV4_INLINE_ATTENTION else "attention frontend"),
+                inline_attention_layers,
+            )
+
+    model_runner._has_heterogeneous_layers = is_llama4 or _needs_compile_validation_warmup(model_type)
     if is_llama4:
         apply_hpu_llama4_post_load_patches(model_runner.model)
     if is_qwen_moe:
@@ -954,6 +1285,30 @@ def apply_model_specific_patches(model_runner):
                 "Enabled %d TP2 all-reduce/residual/RMSNorm boundaries",
                 fused_boundaries,
             )
+
+
+def prepare_tp2_fused_ar_norm_before_model_load(model_runner):
+    """Compile small TP2 recipes before model weights consume device memory."""
+    if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+        from vllm_gaudi.distributed.tp2_fused_ar_norm import initialize_tp2_fused_ar_norm_runtime
+        initialize_tp2_fused_ar_norm_runtime()
+        return
+    config = get_config()
+    if not (config.tp2_fused_ar_norm and config.tp2_gemma_fused_ar_norm):
+        return
+    model_type = getattr(model_runner.model_config.hf_config, "model_type", "")
+    if model_type not in ("qwen3_moe", "qwen3_5", "qwen3_5_text", "qwen3_5_moe"):
+        return
+    if model_runner.parallel_config.tensor_parallel_size != 2:
+        return
+
+    from vllm_gaudi.distributed.tp2_fused_ar_norm import (
+        initialize_tp2_fused_ar_norm_runtime,
+        validate_tp2_gemma_fusion_runtime,
+    )
+
+    initialize_tp2_fused_ar_norm_runtime()
+    validate_tp2_gemma_fusion_runtime(model_runner.hidden_size)
 
 
 def compute_prefix_caching_block_indices(num_reqs: int, num_computed_tokens, num_scheduled_tokens,
@@ -1022,6 +1377,30 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
     def __init__(self, model, vllm_config):
         super().__init__()
         self.model = model
+        self._async_gdn_inner_model = None
+        self._gdn_dma_first_submission = None
+        self._gdn_dma_validated = False
+        self._gdn_direct_first_submission = None
+        self._gdn_direct_validated = False
+        self._tp2_prepared_first_submission = None
+        self._tp2_prepared_validated = False
+        self._tp2_prepared_warm_steps = 0
+        if gaudi_envs.VLLM_HPU_GDN_ASYNC_STATE_DMA or gaudi_envs.VLLM_HPU_GDN_DIRECT_STATE_UPDATE:
+            if not gaudi_envs.VLLM_HPU_GDN_ACTIVE_STATE_VIEWS:
+                raise RuntimeError("GDN async DMA requires active state views")
+            if (vllm_config.parallel_config.tensor_parallel_size != 2 or vllm_config.speculative_config is not None
+                    or vllm_config.cache_config.enable_prefix_caching):
+                raise RuntimeError("GDN async DMA currently requires TP2 without speculation or prefix caching")
+            from vllm_gaudi.models.qwen3_next import _qwen3_inner_model
+
+            object.__setattr__(self, "_async_gdn_inner_model", _qwen3_inner_model(model))
+        self._gdn_state_view_layers = tuple(
+            module for module in model.modules()
+            if hasattr(module, "prepare_decode_state_view")) if gaudi_envs.VLLM_HPU_GDN_ACTIVE_STATE_VIEWS else ()
+        self._gdn_state_views_logged = False
+        self._gdn_state_view_key = None
+        if gaudi_envs.VLLM_HPU_GDN_ACTIVE_STATE_VIEWS:
+            logger.info("Active GDN state-view binding registered for %d modules", len(self._gdn_state_view_layers))
         self.recompute_cos_sin = os.getenv('VLLM_COS_SIN_RECOMPUTE', 'false').lower() in ['1', 'true']
         self.vllm_config = vllm_config
         self.block_size = vllm_config.cache_config.block_size
@@ -1091,15 +1470,12 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
         # kwargs['attn_metadata'].slot_mapping, compared to untrimmed metadata
         kwargs = kwargs.copy()
         #        selected_token_indices = kwargs.pop('selected_token_indices')
-        if 'lora_mask' in kwargs:
-            lora_mask = kwargs['lora_mask']
-            LoraMask.setLoraMask(lora_mask)
-            kwargs.pop('lora_mask')
         if 'warmup_mode' in kwargs:
             kwargs.pop('warmup_mode')
         input_ids = kwargs['input_ids']
         model_has_chunked_attention = kwargs.pop('model_has_chunked_attention', False)
-        if 'attn_metadata' in kwargs and not self.pooling_model:
+        framework_attn_metadata = isinstance(kwargs.get('attn_metadata'), Mapping)
+        if 'attn_metadata' in kwargs and not self.pooling_model and not framework_attn_metadata:
             kwargs['attn_metadata'] = self.metadata_processor.process_metadata(kwargs['attn_metadata'],
                                                                                input_ids.size(0), input_ids.size(1),
                                                                                input_ids.device, self.dtype,
@@ -1124,8 +1500,150 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
 
         num_real_tokens = input_ids.size(0) if self.pooling_model \
             else input_ids.size(0) * input_ids.size(1)
+        if self._gdn_state_view_layers:
+            self._prepare_gdn_state_views(attn_meta, num_real_tokens)
+        dma_pipeline = self.gdn_dma_pipeline()
+        eligible_dma = (num_real_tokens == 1 and not bool(getattr(attn_meta, "is_prompt", False))
+                        and bool(getattr(attn_meta, "direct_gdn_state", False)))
+        if gaudi_envs.VLLM_HPU_GDN_DIRECT_STATE_UPDATE and eligible_dma:
+            from vllm_gaudi.distributed.tp2_fused_ar_norm import _resolve_runtime
+            from vllm_gaudi.ops.gdn_state_update import state_update_lowering_stats
+
+            bridge = _resolve_runtime()[0]
+            if dma_pipeline is not None:
+                raise RuntimeError("Direct GDN state update must not create queued state DMA")
+            if self._gdn_direct_first_submission is not None:
+                previous_ar, previous_dma = self._gdn_direct_first_submission
+                inner = self._async_gdn_inner_model
+                expected_ar = 2 * (inner.end_layer - inner.start_layer) + 1
+                actual_ar = bridge.collective_launch_count() - previous_ar
+                dma = tuple(new - old for new, old in zip(bridge.gdn_state_dma_counts(), previous_dma, strict=True))
+                sites = state_update_lowering_stats()["updates"]
+                if actual_ar != expected_ar or dma != (0, 0, 0) or sites == 0:
+                    raise RuntimeError(f"Direct GDN path mismatch: reductions={actual_ar}/{expected_ar}, "
+                                       f"queued_dma={dma}, lowered_sites={sites}")
+                logger.info("Direct GDN state validated: reductions=%d bound_layers=%d lowered_sites=%d queued_dma=0",
+                            actual_ar, len(self._gdn_state_view_layers), sites)
+                self._gdn_direct_first_submission = None
+                self._gdn_direct_validated = True
+            if not self._gdn_direct_validated:
+                self._gdn_direct_first_submission = bridge.collective_launch_count(), bridge.gdn_state_dma_counts()
+        if (gaudi_envs.VLLM_HPU_TP2_STATIC_GROUP_PLAN and eligible_dma and self._gdn_direct_validated
+                and not self._tp2_prepared_validated):
+            from vllm_gaudi.distributed.tp2_fused_ar_norm import _resolve_runtime
+
+            from vllm_gaudi.ops.tp2_prepared_plan import prepared_group_stats
+
+            counts = tuple(_resolve_runtime()[0].prepared_plan_counts())
+            stats = prepared_group_stats()
+            prepares = stats["prepares"]
+            if self._tp2_prepared_first_submission is not None:
+                (previous, previous_prepares, previous_native_replays, previous_entry_replays,
+                 previous_group_replays) = self._tp2_prepared_first_submission
+                delta = tuple(new - old for new, old in zip(counts, previous, strict=True))
+                inner = self._async_gdn_inner_model
+                expected_groups = len(inner._hpu_compiled_layer_groups)
+                embedding = int(bool(getattr(inner, "_hpu_tp2_defer_embedding_reduce", False)))
+                expected_reductions = 2 * (inner.end_layer - inner.start_layer) + embedding
+                if gaudi_envs.VLLM_HPU_NATIVE_DECODE_GRAPH:
+                    from vllm_gaudi.ops.tp2_prepared_plan import (
+                        native_compute_coverage_matches,
+                        native_decode_graph_qualification_groups,
+                    )
+                    native_groups = native_decode_graph_qualification_groups()
+                    native_delta = stats["native_replays"] - previous_native_replays
+                    native_reductions = 16 * native_groups
+                    complete = (stats["native_graphs"] == 1 and native_delta == 1
+                                and stats["native_collectives"] == native_reductions
+                                and stats["external_collectives"] == (embedding if native_groups == 8 else 0)
+                                and native_compute_coverage_matches(
+                                    stats["native_segments"], native_reductions, native_groups,
+                                    gaudi_envs.VLLM_HPU_TP2_COMPILED_CONSUMER_NORM) and stats["native_commands"] > 0
+                                and stats["native_relocations"] > 0 and stats["native_global_program_bytes"] > 0
+                                and stats["native_arc_program_bytes"] > 0
+                                and stats["native_hcl_command_bytes_per_replay"] > 0
+                                and stats["native_hcl_stream_ccb_bytes"] > 0 and stats["native_hcl_replay_bytes"] > 0
+                                and stats["native_hcl_submissions"] > 0)
+                    if gaudi_envs.VLLM_HPU_TP2_NATIVE_JOINT_PLAN:
+                        complete = (complete and stats["native_joint_replays"] == stats["native_replays"]
+                                    and stats["native_joint_hcl_callbacks"] == stats["native_replays"]
+                                    and stats["native_joint_compute_submissions"] > 0)
+                    entry_delta = stats["native_entry_replays"] - previous_entry_replays
+                    group_delta = stats["replays"] - previous_group_replays
+                    if native_groups == 8:
+                        complete = (complete and entry_delta == 1 and group_delta == 0 and delta[0] == 0
+                                    and delta[1] == 0)
+                else:
+                    complete = delta[0] == 1 and delta[1] == expected_groups and delta[3] == expected_reductions
+                if complete:
+                    if gaudi_envs.VLLM_HPU_NATIVE_DECODE_GRAPH:
+                        logger.info(
+                            "Native TP2 decoder structure checked: bridge_entries=1 segments=%d collectives=%d "
+                            "embedding_reductions=%d program_bytes=%d/%d hcl_template_bytes=%d "
+                            "ccb_bytes=%d replay_bytes=%d ccb_wraps=%d submissions=%d device_graph_qualified=0",
+                            stats["native_segments"], stats["native_collectives"], embedding,
+                            stats["native_global_program_bytes"], stats["native_arc_program_bytes"],
+                            stats["native_hcl_command_bytes_per_replay"], stats["native_hcl_stream_ccb_bytes"],
+                            stats["native_hcl_replay_bytes"], stats["native_hcl_ccb_wraps"],
+                            stats["native_hcl_submissions"])
+                        logger.info(
+                            "Native joint plan: enabled=%s replays=%d compute_pages=%d "
+                            "compute_submissions=%d hcl_batch_callbacks=%d qualification_groups=%d",
+                            gaudi_envs.VLLM_HPU_TP2_NATIVE_JOINT_PLAN, stats["native_joint_replays"],
+                            stats["native_joint_compute_pages"], stats["native_joint_compute_submissions"],
+                            stats["native_joint_hcl_callbacks"], native_groups)
+                        logger.info(
+                            "Native decoder model entry: direct_replays=%d group_wrappers=%d "
+                            "prepared_batches=%d prepared_groups=%d", entry_delta, group_delta, delta[0], delta[1])
+                    else:
+                        logger.info(
+                            "Prepared TP2 host replay validated: native_batches=%d groups=%d "
+                            "compute_recipes=%d planned_reductions=%d embedding_reductions=%d "
+                            "device_graph_replays=0", *delta, embedding)
+                    self._tp2_prepared_validated = True
+                else:
+                    self._tp2_prepared_warm_steps += 1
+                    cold = prepares - previous_prepares
+                    logger.info("TP2 graph is still preparing: replay=%s native=%s cold_groups=%d step=%d", delta,
+                                stats, cold, self._tp2_prepared_warm_steps)
+                    if ((not gaudi_envs.VLLM_HPU_NATIVE_DECODE_GRAPH and cold <= 0)
+                            or self._tp2_prepared_warm_steps >= 8):
+                        raise RuntimeError(f"TP2 graph did not reach full steady coverage: replay={delta}, {stats}")
+            self._tp2_prepared_first_submission = (counts, prepares, stats["native_replays"],
+                                                   stats["native_entry_replays"], stats["replays"])
+        if (gaudi_envs.VLLM_HPU_GDN_ASYNC_STATE_DMA and not gaudi_envs.VLLM_HPU_GDN_DIRECT_STATE_UPDATE
+                and dma_pipeline is None and eligible_dma):
+            raise RuntimeError("GDN async DMA requires compiled Qwen3 decoder groups")
+        async_decode = (dma_pipeline is not None and num_real_tokens == 1
+                        and not bool(getattr(attn_meta, "is_prompt", False))
+                        and bool(getattr(attn_meta, "direct_gdn_state", False)))
+        if dma_pipeline is not None and not async_decode:
+            dma_pipeline.wait_all()
+        if dma_pipeline is not None and self._gdn_dma_first_submission is not None:
+            bridge = dma_pipeline.runtime[0]
+            previous_ar, previous_dma, expected_ar, expected_dma = self._gdn_dma_first_submission
+            actual_ar = bridge.collective_launch_count() - previous_ar
+            actual_dma = tuple(new - old for new, old in zip(bridge.gdn_state_dma_counts(), previous_dma, strict=True))
+            if actual_ar != expected_ar or actual_dma != expected_dma:
+                raise RuntimeError(f"Queued GDN native execution mismatch: AR={actual_ar}/{expected_ar}, "
+                                   f"DMA={actual_dma}/{expected_dma}")
+            logger.info("Queued GDN DMA validated: reductions=%d batches=%d states=%d bytes=%d compute=%s copy=%s",
+                        actual_ar, *actual_dma, torch.hpu.current_stream(), dma_pipeline.copy_stream)
+            self._gdn_dma_first_submission = None
+            self._gdn_dma_validated = True
+        if async_decode and not self._gdn_dma_validated:
+            bridge = dma_pipeline.runtime[0]
+            inner = self._async_gdn_inner_model
+            expected_dma = (len(inner._hpu_compiled_layer_groups), len(self._gdn_state_view_layers),
+                            sum(layer._hpu_active_ssm_state.numel() * layer._hpu_active_ssm_state.element_size()
+                                for layer in self._gdn_state_view_layers))
+            self._gdn_dma_first_submission = (bridge.collective_launch_count(), bridge.gdn_state_dma_counts(),
+                                              2 * (inner.end_layer - inner.start_layer) + 1, expected_dma)
+        submitted_before = dma_pipeline.submitted_groups if async_decode else 0
         if self.flatten_input:
             kwargs['input_ids'] = input_ids.view(-1)
+            if framework_attn_metadata:
+                kwargs['positions'] = kwargs['positions'].view(-1)
         # here num_tokens and num_tokens_across_dp are dummy values which are
         # used to skip sync in forward_context between DP ranks
         with set_forward_context(attn_meta,
@@ -1134,9 +1652,69 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
                                  num_tokens_across_dp=self.dummy_num_tokens_across_dp_cpu), set_hpu_dp_metadata(
                                      self.vllm_config, num_real_tokens):
             hidden_states = self.model(*args, **kwargs)
+            if async_decode:
+                expected = len(self._async_gdn_inner_model._hpu_compiled_layer_groups)
+                if dma_pipeline.submitted_groups - submitted_before != expected:
+                    raise RuntimeError("Async GDN DMA requires every compiled decoder group to execute")
             if self._rotary_prepare_cos_sin is not None:
                 self._reset_rotary_cos_sin()
         return hidden_states
+
+    def gdn_dma_pipeline(self):
+        inner = getattr(self, "_async_gdn_inner_model", None)
+        return getattr(inner, "_hpu_gdn_dma_pipeline", None)
+
+    def invalidate_gdn_state_views(self) -> None:
+        """Release aliases before the runner replaces or clears cache pools."""
+        if gaudi_envs.VLLM_HPU_TP2_STATIC_GROUP_PLAN:
+            from vllm_gaudi.ops.tp2_prepared_plan import invalidate_prepared_group_plans
+
+            invalidate_prepared_group_plans()
+        pipeline = self.gdn_dma_pipeline()
+        if pipeline is not None:
+            pipeline.clear_bindings()
+        self._gdn_state_view_key = None
+        for layer in self._gdn_state_view_layers:
+            layer._hpu_active_ssm_state = None
+            layer._hpu_cached_ssm_view = None
+            layer._hpu_active_ssm_source = None
+            layer._hpu_active_ssm_key = None
+
+    @torch.compiler.disable
+    def _prepare_gdn_state_views(self, attn_meta, num_real_tokens: int) -> None:
+        indices = getattr(attn_meta, "load_indices_tensor", None)
+        key = (bool(getattr(attn_meta, "is_prompt", False)), bool(getattr(attn_meta, "direct_gdn_state", False)),
+               num_real_tokens, None if indices is None else indices.shape[-1])
+        # Direct-state eligibility already guarantees fixed group-major prefix
+        # slots. New requests/reset contents share these aliases; cache-pool
+        # replacement explicitly invalidates them in initialize_kv_cache.
+        if key != self._gdn_state_view_key:
+            active_layers = 0
+            for layer in self._gdn_state_view_layers:
+                layer.prepare_decode_state_view(attn_meta, num_real_tokens)
+                active_layers += layer._hpu_active_ssm_state is not None
+            if (num_real_tokens == 1 and bool(getattr(attn_meta, "direct_gdn_state", False))
+                    and not bool(getattr(attn_meta, "is_prompt", False))
+                    and active_layers != len(self._gdn_state_view_layers)):
+                layer = self._gdn_state_view_layers[0]
+                indices = getattr(attn_meta, "load_indices_tensor", None)
+                raise RuntimeError(
+                    f"Active GDN state binding incomplete: {active_layers}/{len(self._gdn_state_view_layers)}; "
+                    f"indices={None if indices is None else tuple(indices.shape)} "
+                    f"pool={tuple(layer.kv_cache[1].shape)} groups={layer.compact_state_group_count} "
+                    f"offset={layer.compact_state_group_offset} qkv={layer.qkv_size} heads={layer.A_log.numel()} "
+                    f"prefix={getattr(layer.cache_config, 'enable_prefix_caching', False)}")
+            if active_layers and not self._gdn_state_views_logged:
+                logger.info("Bound %d active GDN state views before model entry (rows=%d)", active_layers,
+                            num_real_tokens)
+                self._gdn_state_views_logged = True
+            if gaudi_envs.VLLM_HPU_GDN_DIRECT_STATE_UPDATE and active_layers and num_real_tokens == 1:
+                from vllm_gaudi.ops.gdn_state_update import validate_direct_state_views
+
+                bound = validate_direct_state_views(
+                    tuple(layer._hpu_active_ssm_state for layer in self._gdn_state_view_layers))
+                logger.info("Direct GDN state destinations bound: layers=%d; queued state DMA disabled", bound)
+            self._gdn_state_view_key = key
 
     def embed_input_ids(self, input_ids, multimodal_embeddings=None, is_multimodal=False):
         return self.model.embed_input_ids(input_ids=input_ids,
@@ -1161,6 +1739,84 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
         logits = self.model.compute_logits(hidden_states)
         sampled_token_ids = logits.to(torch.float32).argmax(dim=-1)
         return hidden_states, sampled_token_ids.to(torch.int32).unsqueeze(-1)
+
+    def combine_hidden_states(self, *args, **kwargs):
+        return self.model.combine_hidden_states(*args, **kwargs)
+
+    def precompute_and_store_context_kv(self, *args, **kwargs):
+        return self.model.precompute_and_store_context_kv(*args, **kwargs)
+
+    def prepare_dflash2_inputs(self, *args, **kwargs):
+        from flashinfer_gaudi.dflash2 import prepare_device_inputs
+
+        return prepare_device_inputs(*args, **kwargs)
+
+    def compute_candidates(self, *args, **kwargs):
+        return self.model.compute_candidates(*args, **kwargs)
+
+    def score_dflash2_candidates(self, candidate_ids, unary_logits, hidden_states, anchor_token_ids):
+        return self.model.model.candidate_selector(candidate_ids, unary_logits, hidden_states, anchor_token_ids)
+
+    def select_dflash2_candidates(self, hidden_states, anchor_token_ids):
+        """Generate, score, and select a DFlash2 path in one HPU region."""
+        from flashinfer_gaudi.dflash2 import select_path
+
+        batch_size, num_steps, _ = hidden_states.shape
+        candidate_ids, unary_logits = self.model.compute_candidates(hidden_states.flatten(0, 1))
+        candidate_ids = candidate_ids.to(torch.int32).reshape(batch_size, num_steps, -1)
+        unary_logits = unary_logits.reshape_as(candidate_ids)
+        selected = self.maybe_select_dflash2_candidates(
+            candidate_ids,
+            unary_logits,
+            hidden_states,
+            anchor_token_ids,
+        )
+        if selected is not None:
+            return selected
+        scores = self.score_dflash2_candidates(
+            candidate_ids,
+            unary_logits,
+            hidden_states,
+            anchor_token_ids,
+        )
+        return select_path(candidate_ids, scores)
+
+    def sample_dflash2_greedy(
+        self,
+        logits,
+        draft_token_ids,
+        target_logits_indices,
+        bonus_logits_indices,
+        cu_num_draft_tokens,
+    ):
+        from vllm_gaudi.v1.sample.hpu_rejection_sampler import (
+            dflash2_greedy_rejection_sample_packed, )
+
+        return dflash2_greedy_rejection_sample_packed(
+            logits,
+            draft_token_ids,
+            target_logits_indices,
+            bonus_logits_indices,
+            cu_num_draft_tokens,
+        )
+
+    def maybe_select_dflash2_candidates(self, candidate_ids, unary_logits, hidden_states, anchor_token_ids):
+        from flashinfer_gaudi._tactics import dflash2_score_select_auto_promoted
+
+        if not dflash2_score_select_auto_promoted():
+            return None
+        from flashinfer_gaudi.dflash2 import maybe_score_and_select_path
+
+        selector = self.model.model.candidate_selector
+        projected_hidden = selector.hidden_projection(hidden_states)
+        return maybe_score_and_select_path(
+            selector.predecessor_codebook,
+            selector.successor_codebook,
+            candidate_ids,
+            unary_logits,
+            projected_hidden,
+            anchor_token_ids,
+        )
 
     # def sample(self, *args, **kwargs):
     #    return self.sampler(*args, **kwargs)
@@ -1243,14 +1899,38 @@ def trim_attn_metadata(metadata: HPUAttentionMetadataV1) -> object:
         'window_block_usage', 'window_block_groups', 'window_attn_bias', 'chunked_block_mapping', 'chunked_attn_bias',
         'chunked_block_list', 'chunked_block_usage', 'chunked_block_groups', 'prep_initial_states',
         'has_initial_states_p', 'last_chunk_indices_p', 'load_indices_tensor', 'store_indices_tensor',
-        'query_start_loc', 'query_start_loc_p', 'padding_mask_flat', 'blocks_caching_range',
-        'mamba_chunks_to_block_mapping', 'seqlens_offsets_for_blocks', 'direct_gdn_state'
+        'num_accepted_tokens', 'query_start_loc', 'query_start_loc_p', 'padding_mask_flat', 'blocks_caching_range',
+        'mamba_chunks_to_block_mapping', 'seqlens_offsets_for_blocks', 'direct_gdn_state', 'dflash_full_query', 'causal'
     ])
     return attention_metadata
 
 
 def round_up(value: int, k: int):
     return (value + k - 1) // k * k
+
+
+def _sampler_warmup_batch_sizes(decode_buckets, max_num_reqs: int) -> list[int]:
+    """Return request-level sampler batches, excluding flattened spec QKV."""
+    return list(dict.fromkeys([1] + [bucket[0] for bucket in decode_buckets if 0 < bucket[0] <= max_num_reqs]))
+
+
+def _model_warmup_decode_buckets(bucketing_manager, is_dflash: bool):
+    """Avoid treating flattened DFlash verification buckets as requests."""
+    if is_dflash:
+        return bucketing_manager.seed_decode_buckets
+    return bucketing_manager.decode_buckets
+
+
+def _is_full_dflash_query_block(
+    is_dflash_spec: bool,
+    num_decodes: int,
+    padded_batch_size: int,
+    num_tokens_per_req: list[int],
+    state_width: int,
+) -> bool:
+    """Prove that the verification block contains no padded state rows."""
+    return (is_dflash_spec and num_decodes == padded_batch_size
+            and all(int(length) == state_width for length in num_tokens_per_req))
 
 
 def get_dp_padding(num_tokens: int, dp_size: int, dp_rank: int) -> int:
@@ -1334,6 +2014,22 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         finalize_config()
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
+        if (self.model_config.hf_config.model_type == "deepseek_v4" and not self.model_config.enforce_eager):
+            num_model_layers = int(self.model_config.hf_config.num_hidden_layers)
+            regional_compilation = (HPUCompileConfig().regional_compilation)
+            initial_cache_limit = _dynamo_cache_limit(
+                bucket_count=2,
+                regional_compilation=regional_compilation,
+                model_type="deepseek_v4",
+                num_model_layers=num_model_layers,
+            )
+            _configure_dynamo_cache_limits(initial_cache_limit)
+            logger.info(
+                "Configured initial DeepSeek V4 Dynamo limits: "
+                "recompile=%s accumulated=%s",
+                torch._dynamo.config.recompile_limit,
+                torch._dynamo.config.accumulated_recompile_limit,
+            )
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
         self.load_config = vllm_config.load_config
@@ -1507,18 +2203,31 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # so each request needs num_gdn_groups distinct slot indices. Groups
         # occupy contiguous max_num_reqs-sized spans so a full decode batch can
         # update state without index_select/index_copy.
-        # For request with base_slot `s` in group `g`, the actual tensor index
-        # is `g * max_num_reqs + s + 1` (1-based, slot 0 unused).
-        # Tensor size: max_num_reqs * num_gdn_groups + 2.
+        # DFlash2 retains one recurrent checkpoint for every token in its
+        # verification block. Other paths retain one checkpoint per request.
+        self._gdn_state_slots_per_req = (1 + self.speculative_config.num_speculative_tokens
+                                         if self.speculative_config is not None
+                                         and self.speculative_config.use_dflash() else 1)
         self._compact_gdn_enabled = os.environ.get("VLLM_COMPACT_GDN", "1").strip().lower() in ("1", "true")
         self._direct_gdn_state_enabled = (gaudi_envs.VLLM_HPU_FLASHINFER_GDN and gaudi_envs.VLLM_HPU_GDN_DIRECT_STATE)
+        self._direct_dflash_checkpoints_enabled = gaudi_envs.VLLM_HPU_DFLASH2_DIRECT_CHECKPOINTS
+        # The HPU runner normally consumes block tables from CPU.  The
+        # device-resident DFlash2 bridge keeps a persistent HPU copy instead.
+        # Track the last CPU contents so a steady decode does not enqueue a
+        # write to the same tensor that the previous draft attention still
+        # reads.  Such a write-after-read dependency serializes the streams on
+        # Gaudi even though the table itself is tiny.
+        self._dflash2_device_block_table_snapshots: dict[int, tuple[int, torch.Tensor]] = {}
+        self._padded_direct_gdn_state_enabled = gaudi_envs.VLLM_HPU_GDN_PADDED_DIRECT_STATE
         self._compact_gdn_group_ids: set[int] = set()
         self._compact_gdn_group_offset: dict[int, int] = {}  # {group_idx: g_offset}
         self._num_gdn_groups = 0  # set during initialize_kv_cache
         self._gdn_slot_free_list: list[int] = []  # stack of free base-slot IDs
         self._gdn_req_to_base_slot: dict[str, int] = {}
         self._compact_gdn_state_tensors: list[torch.Tensor] = []
+        self._gdn_num_accepted_by_req: dict[str, int] = {}
         self._logged_direct_gdn_state = False
+        self._logged_padded_direct_gdn_state = False
 
         # Lazy initialization
         # self.model: nn.Module  # set after load_model
@@ -1535,6 +2244,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         if self.speculative_config:
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
+            elif self.speculative_config.use_dflash():
+                from vllm_gaudi.v1.spec_decode.hpu_dflash2 import HpuDFlash2Proposer
+
+                self.drafter = HpuDFlash2Proposer(self.vllm_config, self.device, self)  # type: ignore
+                self.use_aux_hidden_state_outputs = self.drafter.use_aux_hidden_state
             elif self.speculative_config.use_eagle():
                 from vllm_gaudi.v1.spec_decode.hpu_eagle import HpuEagleProposer
                 self.drafter = HpuEagleProposer(self.vllm_config, self.device, self)  # type: ignore
@@ -1549,7 +2263,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         # Keep in int64 to avoid overflow with long context
         self.max_num_reqs = self.scheduler_config.max_num_seqs
+        _hpu_init_sync("before_seq_lens")
         self.seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+        _hpu_init_sync("after_seq_lens")
 
         # Keep in int64 to avoid overflow with long context
         self.arange_np = np.arange(max(self.max_num_reqs + 1, self.max_model_len, self.max_num_tokens), dtype=np.int64)
@@ -1578,6 +2294,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             logitsprocs=build_logitsprocs(self.vllm_config, self.device, self.pin_memory, self.is_pooling_model,
                                           self.vllm_config.model_config.logits_processors),
         )
+        _hpu_init_sync("after_input_batch")
 
         self.use_async_scheduling = self.scheduler_config.async_scheduling
         self.use_structured_output: bool = False  # Default to false. Set to true when needed during a run
@@ -1688,29 +2405,55 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
     def _make_buffer(self, *size: Union[int, torch.SymInt], dtype: torch.dtype, numpy: bool = True) -> CpuGpuBuffer:
         return CpuGpuBuffer(*size, dtype=dtype, device=self.device, pin_memory=self.pin_memory, with_numpy=numpy)
 
-    def prepare_mamba_state_idxs(self, req_indices, block_table_offsets, target_bs):
+    def prepare_mamba_state_idxs(
+        self,
+        req_indices,
+        block_table_offsets,
+        target_bs,
+        state_width=1,
+        checkpoint_offsets=None,
+    ):
         num_indices = len(req_indices)
+        if checkpoint_offsets is not None:
+            if state_width != 1:
+                raise ValueError("checkpoint_offsets are valid only for scalar state indices")
+            if len(checkpoint_offsets) != num_indices:
+                raise ValueError("checkpoint_offsets must contain one entry per request")
         all_state_indices_cpu = []
         for group_idx in range(len(self.input_batch.block_table.block_tables)):
             if group_idx in self._compact_gdn_group_ids:
                 g_offset = self._compact_gdn_group_offset[group_idx]
-                state_indices_cpu = torch.zeros(num_indices, dtype=torch.int32)
+                state_indices_cpu = torch.zeros((num_indices, state_width), dtype=torch.int32)
                 for i, req_idx in enumerate(req_indices):
                     req_id = self.input_batch.req_ids[req_idx]
                     base_slot = self._gdn_req_to_base_slot[req_id]
-                    state_indices_cpu[i] = g_offset * self._gdn_max_reqs + base_slot + 1
+                    first_slot = ((g_offset * self._gdn_max_reqs + base_slot) * self._gdn_state_slots_per_req + 1)
+                    if checkpoint_offsets is None:
+                        offsets = torch.arange(state_width, dtype=torch.int32)
+                    else:
+                        offset = max(0, min(int(checkpoint_offsets[i]), self._gdn_state_slots_per_req - 1))
+                        offsets = torch.tensor([offset], dtype=torch.int32)
+                    state_indices_cpu[i] = first_slot + offsets
             else:
                 block_table_cpu_tensor = self.input_batch.block_table[group_idx].get_cpu_tensor()
-                state_indices_cpu = block_table_cpu_tensor[req_indices, block_table_offsets].clone()
+                state_indices_cpu = block_table_cpu_tensor[req_indices, block_table_offsets].clone().reshape(-1, 1)
+                if state_width > 1:
+                    state_indices_cpu = state_indices_cpu.expand(-1, state_width).clone()
 
             if num_indices < target_bs:
                 pad_val = -1 if group_idx in self._compact_gdn_group_ids else self._MAMBA_PAD_BLOCK_ID
-                padding = torch.full((target_bs - num_indices, ), pad_val, dtype=torch.int32, device='cpu')
+                padding = torch.full(
+                    (target_bs - num_indices, state_width),
+                    pad_val,
+                    dtype=torch.int32,
+                    device='cpu',
+                )
                 state_indices_cpu = torch.cat([state_indices_cpu, padding])
 
             all_state_indices_cpu.append(state_indices_cpu)
 
-        return torch.stack(all_state_indices_cpu, dim=0)  # Shape: [num_groups, target_bs]
+        state_indices = torch.stack(all_state_indices_cpu, dim=0)
+        return state_indices.squeeze(-1) if state_width == 1 else state_indices
 
     def _can_use_direct_gdn_state(
         self,
@@ -1718,15 +2461,48 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         num_indices: int,
         target_bs: int,
         tokens_per_request: int = 1,
+        full_query: bool = False,
     ) -> bool:
+        if (self._direct_gdn_state_enabled and getattr(self, "_direct_dflash_checkpoints_enabled", False)
+                and self._compact_gdn_enabled and not self.use_prefix_caching and tokens_per_request == 8):
+            return has_contiguous_dflash_checkpoints(
+                state_indices,
+                self._compact_gdn_group_offset,
+                self._gdn_max_reqs,
+                num_indices,
+                target_bs,
+                tokens_per_request,
+                self._gdn_state_slots_per_req,
+                full_query,
+            )
         if (not self._direct_gdn_state_enabled or not self._compact_gdn_enabled or self.use_prefix_caching
-                or not self._compact_gdn_group_ids or num_indices != target_bs or tokens_per_request != 1):
+                or self._gdn_state_slots_per_req != 1 or not self._compact_gdn_group_ids
+                or not 0 < num_indices <= target_bs <= self._gdn_max_reqs or tokens_per_request != 1):
             return False
-        base_slots = torch.arange(num_indices, dtype=torch.int32)
+        if num_indices < target_bs and not self._padded_direct_gdn_state_enabled:
+            return False
+        # This gate runs on scheduler metadata, before async H2D copies. Do not
+        # accidentally add a device synchronization when proving ownership.
+        if (state_indices.device.type != "cpu" or state_indices.ndim != 2 or state_indices.shape[1] != target_bs
+                or any(group_idx < 0 or group_idx >= state_indices.shape[0]
+                       for group_idx in self._compact_gdn_group_ids)):
+            return False
+        base_slots = torch.arange(num_indices, dtype=torch.int32, device="cpu")
         for group_idx in self._compact_gdn_group_ids:
             group_offset = self._compact_gdn_group_offset[group_idx]
             expected = group_offset * self._gdn_max_reqs + base_slots + 1
             if not torch.equal(state_indices[group_idx, :num_indices], expected):
+                return False
+
+            # Direct decode mutates the full padded prefix of the compact
+            # group-major pool. Padding rows may alias only free base slots;
+            # paused requests retain their slots while they are unscheduled.
+            if target_bs > num_indices and not torch.all(state_indices[group_idx, num_indices:target_bs] == -1):
+                return False
+
+        if target_bs > num_indices:
+            free_slots = set(self._gdn_slot_free_list)
+            if any(slot not in free_slots for slot in range(num_indices, target_bs)):
                 return False
         return True
 
@@ -1877,8 +2653,117 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     dtype=self.kv_cache_dtype,
                     cache_dtype_str=cache_dtype_str,
                 )
+            elif isinstance(attn_module, AttentionLayerBase):
+                spec = attn_module.get_kv_cache_spec(self.vllm_config)
+                if spec is None:
+                    continue
+                if isinstance(spec, AttentionSpec):
+                    spec = attn_module.get_attn_backend().customize_spec(spec)
+                kv_cache_spec[layer_name] = spec
 
         return kv_cache_spec
+
+    def uses_framework_kv_cache_layout(self, layer_name: str) -> bool:
+        attn_module = self.vllm_config.compilation_config.static_forward_context[layer_name]
+        return isinstance(attn_module, AttentionLayerBase) and not isinstance(
+            attn_module,
+            (Attention, MLAAttention, MambaBase),
+        )
+
+    def allocate_framework_kv_cache_layer(self, layer_spec: KVCacheSpec, num_blocks: int) -> torch.Tensor:
+        """Allocate one layer using vLLM's logical [B, H, N, C] cache layout."""
+        layout = self.cache_config.get_resolved_kv_cache_layout()
+        shape_bytes = compute_layer_kv_cache_shape_bytes(
+            layer_spec,
+            num_blocks,
+            kernel_block_size=layer_spec.block_size,
+        )
+        strides = compute_layout_strides(
+            layer_spec,
+            num_blocks,
+            1,
+            layout,
+            kernel_block_size=layer_spec.block_size,
+        )
+        dtype = getattr(layer_spec, "dtype", None) or torch.int8
+        dtype_size = get_dtype_size(dtype)
+        allocation_bytes = num_blocks * layer_spec.page_size_bytes
+        assert allocation_bytes % dtype_size == 0
+        assert shape_bytes[-1] % dtype_size == 0
+        assert strides[-1] == 1
+        assert all(stride % dtype_size == 0 for stride in strides[:-1])
+
+        # Allocating the backing tensor in its final dtype is equivalent to
+        # viewing the byte layout, but avoids aten::view(dtype), which the
+        # upstream PyTorch lazy bridge cannot represent in alias analysis.
+        raw = torch.zeros(
+            allocation_bytes // dtype_size,
+            dtype=dtype,
+            device=self.device,
+        )
+        shape = (*shape_bytes[:-1], shape_bytes[-1] // dtype_size)
+        typed_strides = tuple(stride // dtype_size for stride in strides[:-1]) + (1, )
+        return torch.as_strided(
+            raw,
+            size=(1, *shape),
+            stride=typed_strides,
+        )[0]
+
+    def bind_framework_kv_caches(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        runner_kv_caches: list[torch.Tensor],
+    ) -> None:
+        """Bind multiple cache modules per decoder layer in a stable order."""
+        if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+            from vllm_gaudi.ops.deepseek_v4_native import invalidate_model
+            invalidate_model(self.model)
+        assert len(runner_kv_caches) == 0
+        ordered_layer_names = sorted(
+            kv_caches,
+            key=lambda layer_name: (extract_layer_index(layer_name), layer_name),
+        )
+        forward_context = self.vllm_config.compilation_config.static_forward_context
+        for layer_name in ordered_layer_names:
+            kv_cache = kv_caches[layer_name]
+            runner_kv_caches.append(kv_cache)
+            forward_context[layer_name].bind_kv_cache(kv_cache)
+
+    @staticmethod
+    def _get_layer_kv_cache_spec(kv_cache_config: KVCacheConfig, layer_name: str) -> KVCacheSpec:
+        for group in kv_cache_config.kv_cache_groups:
+            if layer_name not in group.layer_names:
+                continue
+            spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = spec.kv_cache_specs[layer_name]
+            return spec
+        raise KeyError(f"No KV cache spec for layer {layer_name}")
+
+    def _add_framework_kv_cache_pad_block(self, kv_cache_config: KVCacheConfig) -> KVCacheConfig:
+        """Extend a planner layout by one block reserved for HPU padding tokens."""
+        padded_config = deepcopy(kv_cache_config)
+        old_num_blocks = padded_config.num_blocks
+        padded_config.num_blocks = old_num_blocks + 1
+
+        max_extent = 0
+        for tensor in padded_config.kv_cache_tensors:
+            spec = self._get_layer_kv_cache_spec(padded_config, tensor.layers[0])
+            page_size = spec.page_size_bytes
+            if tensor.block_stride == page_size and tensor.layer_stride == old_num_blocks * page_size:
+                tensor.layer_stride = padded_config.num_blocks * page_size
+            elif not (tensor.layer_stride == page_size and tensor.block_stride >= len(tensor.layers) * page_size):
+                raise ValueError("Unsupported HPU KV cache placement for padding block: "
+                                 f"layers={tensor.layers}, layer_stride={tensor.layer_stride}, "
+                                 f"block_stride={tensor.block_stride}, page_size={page_size}")
+
+            extent = (tensor.offset + (len(tensor.layers) - 1) * tensor.layer_stride +
+                      (padded_config.num_blocks - 1) * tensor.block_stride + page_size)
+            max_extent = max(max_extent, extent)
+
+        for tensor in padded_config.kv_cache_tensors:
+            tensor.size = max_extent
+        return padded_config
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> bool:
         """Update the cached states and the persistent batch with the scheduler
@@ -1893,6 +2778,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
+            self._gdn_num_accepted_by_req.pop(req_id, None)
 
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
@@ -1953,6 +2839,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # Add new requests to the cached states.
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
+            self._gdn_num_accepted_by_req[req_id] = 1
             sampling_params = new_req_data.sampling_params
             pooling_params = new_req_data.pooling_params
             if sampling_params and \
@@ -2093,10 +2980,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         base_slot = req_index
                     else:
                         base_slot = self._gdn_slot_free_list.pop()
+                    if gaudi_envs.VLLM_HPU_GDN_ASYNC_STATE_DMA:
+                        for module in self.model.modules():
+                            if isinstance(module, HpuModelAdapter) and module.gdn_dma_pipeline() is not None:
+                                module.gdn_dma_pipeline().wait_all()
                     _zero_compact_gdn_slot(
                         self._compact_gdn_state_tensors,
                         base_slot,
                         self._num_gdn_groups,
+                        self._gdn_max_reqs,
+                        self._gdn_state_slots_per_req,
                     )
                     self._gdn_req_to_base_slot[req_id] = base_slot
                     logger.debug("GDN_COMPACT alloc req=%s base_slot=%d free_list_len=%d", req_id, base_slot,
@@ -2857,6 +3750,496 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         return attn_mask.unflatten(0, (1, -1))
 
+    def _framework_attention_index_dtype(self) -> torch.dtype:
+        # DeepSeek V4's native HPU cache/attention kernels consume int32
+        # metadata. Produce that representation once per scheduler step so
+        # every decoder layer does not cast positions and slot mappings.
+        if self._get_model_type() == "deepseek_v4":
+            return torch.int32
+        return torch.int64
+
+    def _build_framework_prefill_attention_metadata(
+        self,
+        req_ids: list[str],
+        query_lens: list[int],
+        context_lens: list[int],
+        token_positions: list[list[int]],
+    ) -> dict[str, Any]:
+        num_reqs = len(req_ids)
+        query_lens = query_lens[:num_reqs]
+        context_lens = context_lens[:num_reqs]
+        token_positions = token_positions[:num_reqs]
+
+        query_start_loc_cpu = torch.zeros(num_reqs + 1, dtype=torch.int32)
+        query_start_loc_cpu[1:] = torch.cumsum(
+            torch.tensor(query_lens, dtype=torch.int32),
+            dim=0,
+        )
+        seq_lens_cpu = torch.tensor(
+            [context_len + query_len for context_len, query_len in zip(context_lens, query_lens)],
+            dtype=torch.int32,
+        )
+        context_lens_cpu = torch.tensor(context_lens, dtype=torch.int32)
+        index_dtype = self._framework_attention_index_dtype()
+        flat_positions_cpu = torch.tensor(
+            [
+                position for positions, query_len in zip(token_positions, query_lens)
+                for position in positions[:query_len]
+            ],
+            dtype=index_dtype,
+        )
+
+        query_start_loc = async_h2d_copy(query_start_loc_cpu, dtype=torch.int32)
+        seq_lens = async_h2d_copy(seq_lens_cpu, dtype=torch.int32)
+        positions = async_h2d_copy(flat_positions_cpu, dtype=index_dtype)
+        is_prefilling = torch.ones(num_reqs, dtype=torch.bool, device=self.device)
+        num_actual_tokens = int(query_start_loc_cpu[-1])
+        req_indices = [self.input_batch.req_id_to_index[req_id] for req_id in req_ids]
+
+        attn_metadata: dict[str, Any] = {}
+        block_table_idx = 0
+        for kv_cache_gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
+            if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
+                continue
+
+            block_table = self.input_batch.block_table[block_table_idx]
+            block_table_cpu = block_table.get_cpu_tensor()[req_indices].clone()
+            block_table_tensor = async_h2d_copy(block_table_cpu, dtype=torch.int32)
+            kernel_block_size = block_table.block_size
+
+            slot_mapping_cpu: list[int] = []
+            for req_row, (positions_row, query_len) in enumerate(zip(token_positions, query_lens)):
+                blocks = block_table_cpu[req_row]
+                for position in positions_row[:query_len]:
+                    if position < 0:
+                        slot_mapping_cpu.append(-1)
+                        continue
+                    block_idx, block_offset = divmod(position, kernel_block_size)
+                    if block_idx >= blocks.shape[0]:
+                        raise ValueError("Framework KV slot mapping exceeds block table width: "
+                                         f"kv_cache_gid={kv_cache_gid}, position={position}, "
+                                         f"block_idx={block_idx}, width={blocks.shape[0]}, "
+                                         f"kernel_block_size={kernel_block_size}")
+                    slot_mapping_cpu.append(int(blocks[block_idx]) * kernel_block_size + block_offset)
+            slot_mapping = async_h2d_copy(slot_mapping_cpu, dtype=index_dtype)
+
+            common_attn_metadata = CommonAttentionMetadata(
+                query_start_loc=query_start_loc,
+                query_start_loc_cpu=query_start_loc_cpu,
+                seq_lens=seq_lens,
+                _seq_lens_cpu=seq_lens_cpu,
+                _num_computed_tokens_cpu=context_lens_cpu,
+                seq_lens_cpu_upper_bound=seq_lens_cpu,
+                num_reqs=num_reqs,
+                num_actual_tokens=num_actual_tokens,
+                max_query_len=max(query_lens, default=0),
+                max_seq_len=max(seq_lens_cpu.tolist(), default=0),
+                block_table_tensor=block_table_tensor,
+                slot_mapping=slot_mapping,
+                causal=True,
+                is_prefilling=is_prefilling,
+                positions=positions,
+            )
+            for attn_group in self.attn_groups[kv_cache_gid]:
+                metadata = attn_group.get_metadata_builder().build(
+                    common_prefix_len=0,
+                    common_attn_metadata=common_attn_metadata,
+                )
+                for layer_name in attn_group.layer_names:
+                    attn_metadata[layer_name] = metadata
+            block_table_idx += 1
+
+        return attn_metadata
+
+    @staticmethod
+    def _build_framework_q1_derived_cpu_metadata(
+        builder: Any,
+        position: int,
+        seq_len: int,
+        block_table_cpu: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Build DeepSeek V4 q1 sparse metadata before the packed H2D."""
+        if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+            from vllm_gaudi.ops.deepseek_v4_native_metadata import build_q1_metadata
+            return build_q1_metadata(builder, position, seq_len, block_table_cpu)
+        if position != seq_len - 1:
+            raise ValueError("DeepSeek V4 q1 position/sequence mismatch: "
+                             f"position={position}, seq_len={seq_len}")
+
+        builder_name = type(builder).__name__
+
+        def map_slot(logical_position: int, block_size: int) -> int:
+            block_index, block_offset = divmod(logical_position, block_size)
+            if block_index >= block_table_cpu.shape[1]:
+                raise ValueError("DeepSeek V4 q1 metadata exceeds block table width: "
+                                 f"builder={builder_name}, position={logical_position}, "
+                                 f"block_size={block_size}, "
+                                 f"width={block_table_cpu.shape[1]}")
+            block_number = int(block_table_cpu[0, block_index])
+            if block_number < 0:
+                return -1
+            return block_number * block_size + block_offset
+
+        if builder_name == "DeepseekSparseSWAMetadataBuilder":
+            window_size = int(builder.window_size)
+            start_position = max(position - window_size + 1, 0)
+            window_len = position - start_position + 1
+            indices = torch.full((1, 1, window_size), -1, dtype=torch.int32)
+            for offset, logical_position in enumerate(range(start_position, position + 1)):
+                indices[0, 0, offset] = map_slot(logical_position, int(builder.block_size))
+            return {
+                "decode_swa_indices": indices,
+                "decode_swa_lens": torch.tensor([window_len], dtype=torch.int32),
+            }
+
+        if builder_name not in (
+                "DeepseekV4IndexerMetadataBuilder",
+                "DeepseekV4HWAgnosticMetadataBuilder",
+        ):
+            return {}
+
+        compress_ratio = int(builder.compress_ratio)
+        if compress_ratio <= 1:
+            return {}
+        compressed_slot = -1
+        if (position + 1) % compress_ratio == 0:
+            compressed_position = position // compress_ratio
+            compressed_slot = map_slot(
+                compressed_position,
+                int(builder.kv_cache_spec.num_states),
+            )
+        result = {"compressed_slot_mapping": torch.tensor([compressed_slot], dtype=torch.int32)}
+
+        if builder_name == "DeepseekV4IndexerMetadataBuilder":
+            result["compressed_seq_lens"] = torch.tensor([[seq_len // compress_ratio]], dtype=torch.int32)
+            return result
+
+        if compress_ratio == 128:
+            width = int(builder.c128a_max_compressed)
+            num_compressed = min(seq_len // compress_ratio, width)
+            global_topk = torch.full((1, width), -1, dtype=torch.int32)
+            block_size = int(builder.kv_cache_spec.block_size) // compress_ratio
+            for compressed_position in range(num_compressed):
+                global_topk[0, compressed_position] = map_slot(compressed_position, block_size)
+            result["c128a_global_decode_topk_indices"] = global_topk.view(1, 1, width)
+            result["c128a_decode_topk_lens"] = torch.tensor([num_compressed], dtype=torch.int32)
+        return result
+
+    def _build_framework_decode_attention_metadata(
+        self,
+        num_decodes: int,
+        padded_batch_size: int,
+        context_lens: np.ndarray,
+        positions_cpu: torch.Tensor,
+        positions_device: Optional[torch.Tensor] = None,
+    ) -> dict[str, Any]:
+        """Build framework attention metadata for a padded q1 decode batch.
+
+        HPU's legacy decode metadata is a single ``HPUAttentionMetadataV1``
+        object. Framework-layout layers such as DeepSeek V4 instead resolve
+        per-layer metadata from a dictionary in ``ForwardContext``. Treat the
+        bucket padding rows as invalid decode requests so the metadata tensor
+        shapes still match the static HPU decode batch.
+        """
+        if positions_cpu.shape != (padded_batch_size, 1):
+            raise ValueError("Framework-layout HPU decode currently supports q1 only, got "
+                             f"positions shape {tuple(positions_cpu.shape)}")
+
+        req_ids = list(self.input_batch.req_ids[:num_decodes])
+        req_indices = [self.input_batch.req_id_to_index[req_id] for req_id in req_ids]
+        context_lens_cpu = torch.zeros(padded_batch_size, dtype=torch.int32)
+        context_lens_cpu[:num_decodes] = torch.as_tensor(context_lens[:num_decodes], dtype=torch.int32)
+        seq_lens_cpu = context_lens_cpu + 1
+        query_start_loc_cpu = torch.arange(padded_batch_size + 1, dtype=torch.int32)
+        index_dtype = self._framework_attention_index_dtype()
+        flat_positions_cpu = positions_cpu.reshape(-1).to(index_dtype)
+        q1_metadata_fastpath = (gaudi_envs.VLLM_HPU_DSV4_Q1_METADATA_FASTPATH and num_decodes == padded_batch_size
+                                and padded_batch_size == 1)
+
+        positions = (async_h2d_copy(flat_positions_cpu, dtype=index_dtype)
+                     if positions_device is None else positions_device.reshape(-1))
+        is_prefilling_cache = getattr(self, "_framework_decode_is_prefilling", None)
+        if is_prefilling_cache is None:
+            is_prefilling_cache = {}
+            self._framework_decode_is_prefilling = is_prefilling_cache
+        is_prefilling = is_prefilling_cache.get(padded_batch_size)
+        if is_prefilling is None:
+            is_prefilling = torch.zeros(padded_batch_size, dtype=torch.bool, device=self.device)
+            is_prefilling_cache[padded_batch_size] = is_prefilling
+
+        group_cpu_metadata = []
+        block_table_idx = 0
+        for kv_cache_gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
+            if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
+                continue
+
+            block_table = self.input_batch.block_table[block_table_idx]
+            scheduler_block_table = block_table.get_cpu_tensor()
+            selected_block_table = scheduler_block_table[req_indices].clone()
+            block_table_cpu = torch.full(
+                (padded_batch_size, scheduler_block_table.shape[1]),
+                self._PAD_BLOCK_ID,
+                dtype=torch.int32,
+            )
+            block_table_cpu[:num_decodes].copy_(selected_block_table.to(torch.int32))
+            if q1_metadata_fastpath:
+                block_table_cpu.clamp_min_(0)
+
+            kernel_block_size = block_table.block_size
+            slot_mapping_cpu = torch.full((padded_batch_size, ), -1, dtype=index_dtype)
+            for req_row in range(num_decodes):
+                position = int(flat_positions_cpu[req_row])
+                block_idx, block_offset = divmod(position, kernel_block_size)
+                if block_idx >= selected_block_table.shape[1]:
+                    raise ValueError("Framework KV slot mapping exceeds block table width: "
+                                     f"kv_cache_gid={kv_cache_gid}, position={position}, "
+                                     f"block_idx={block_idx}, "
+                                     f"width={selected_block_table.shape[1]}, "
+                                     f"kernel_block_size={kernel_block_size}")
+                block_number = int(selected_block_table[req_row, block_idx])
+                if block_number >= 0:
+                    slot_mapping_cpu[req_row] = (block_number * kernel_block_size + block_offset)
+            group_cpu_metadata.append((kv_cache_gid, block_table_cpu, slot_mapping_cpu))
+            block_table_idx += 1
+
+        use_packed_metadata = (gaudi_envs.VLLM_HPU_DSV4_PACKED_DECODE_METADATA and index_dtype == torch.int32)
+        builder_cpu_metadata = []
+        if use_packed_metadata and q1_metadata_fastpath:
+            position = int(flat_positions_cpu[0])
+            seq_len = int(seq_lens_cpu[0])
+            for kv_cache_gid, block_table_cpu, _ in group_cpu_metadata:
+                for attn_group in self.attn_groups[kv_cache_gid]:
+                    builder = attn_group.get_metadata_builder()
+                    fields = HPUModelRunner._build_framework_q1_derived_cpu_metadata(
+                        builder,
+                        position,
+                        seq_len,
+                        block_table_cpu,
+                    )
+                    if fields:
+                        builder_cpu_metadata.append((id(builder), fields))
+        group_device_metadata = []
+        builder_device_metadata: dict[int, dict[str, torch.Tensor]] = {}
+        if use_packed_metadata:
+            ring_size = gaudi_envs.VLLM_HPU_DSV4_DECODE_METADATA_RING_SIZE
+            if ring_size < 2:
+                raise ValueError("VLLM_HPU_DSV4_DECODE_METADATA_RING_SIZE must be at "
+                                 "least 2")
+            packed_sources = [query_start_loc_cpu, seq_lens_cpu]
+            for _, block_table_cpu, slot_mapping_cpu in group_cpu_metadata:
+                packed_sources.extend((block_table_cpu, slot_mapping_cpu))
+            builder_source_layout = []
+            for builder_id, fields in builder_cpu_metadata:
+                for name, source in fields.items():
+                    builder_source_layout.append((builder_id, name))
+                    packed_sources.append(source)
+
+            if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+                # C1 q1 has one valid token mapped to request row zero. Keep
+                # these fields in the changing pack as well, so no freshly
+                # allocated builder tensor can escape the fixed bindings.
+                packed_sources.extend((torch.zeros(1, dtype=torch.int32), torch.ones(1, dtype=torch.int32)))
+
+            packed_key = (
+                padded_batch_size,
+                tuple(tuple(source.shape) for source in packed_sources),
+                ring_size,
+            )
+            packed_cache = getattr(self, "_framework_decode_metadata_packs", None)
+            if packed_cache is None:
+                packed_cache = {}
+                self._framework_decode_metadata_packs = packed_cache
+            packed_entry = packed_cache.get(packed_key)
+            packed_numel = sum(source.numel() for source in packed_sources)
+            if packed_entry is None:
+                packed_entry = {
+                    "buffers": [(
+                        torch.empty(packed_numel, dtype=torch.int32),
+                        torch.empty(
+                            packed_numel,
+                            dtype=torch.int32,
+                            device=self.device,
+                        ),
+                    ) for _ in range(ring_size)],
+                    "next":
+                    0,
+                }
+                if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+                    packed_entry["completion"] = [None] * ring_size
+                    packed_entry["generations"] = [0] * ring_size
+                packed_entry["views"] = []
+                packed_entry["cpu_views"] = []
+                for cpu_buffer, device_buffer in packed_entry["buffers"]:
+                    device_views, cpu_views, offset = [], [], 0
+                    for source in packed_sources:
+                        end = offset + source.numel()
+                        device_views.append(device_buffer[offset:end].view(source.shape))
+                        cpu_views.append(cpu_buffer[offset:end].view(source.shape))
+                        offset = end
+                    packed_entry["views"].append(device_views)
+                    packed_entry["cpu_views"].append(cpu_views)
+                packed_cache[packed_key] = packed_entry
+                logger.info(
+                    "Allocated packed DeepSeek V4 decode metadata: "
+                    "batch=%d groups=%d int32_values=%d ring=%d",
+                    padded_batch_size,
+                    len(group_cpu_metadata),
+                    packed_numel,
+                    ring_size,
+                )
+            buffer_index = packed_entry["next"]
+            packed_entry["next"] = (buffer_index + 1) % ring_size
+            packed_cpu, packed_device = packed_entry["buffers"][buffer_index]
+            if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH and packed_entry["generations"][buffer_index]:
+                completion = packed_entry["completion"][buffer_index]
+                if not completion.query():
+                    completion.synchronize()
+            packed_views = packed_entry["views"][buffer_index]
+            for destination, source in zip(packed_entry["cpu_views"][buffer_index], packed_sources, strict=True):
+                destination.copy_(source)
+            async_h2d_copy(
+                packed_cpu,
+                dest_tensor=packed_device,
+                device=self.device,
+            )
+            query_start_loc, seq_lens = packed_views[:2]
+            view_index = 2
+            for kv_cache_gid, _, _ in group_cpu_metadata:
+                group_device_metadata.append((
+                    kv_cache_gid,
+                    packed_views[view_index],
+                    packed_views[view_index + 1],
+                ))
+                view_index += 2
+            for builder_id, name in builder_source_layout:
+                builder_device_metadata.setdefault(builder_id, {})[name] = packed_views[view_index]
+                view_index += 1
+        else:
+            query_start_loc = async_h2d_copy(query_start_loc_cpu, dtype=torch.int32)
+            seq_lens = async_h2d_copy(seq_lens_cpu, dtype=torch.int32)
+            for kv_cache_gid, block_table_cpu, slot_mapping_cpu in (group_cpu_metadata):
+                group_device_metadata.append((
+                    kv_cache_gid,
+                    async_h2d_copy(block_table_cpu, dtype=torch.int32),
+                    async_h2d_copy(slot_mapping_cpu, dtype=index_dtype),
+                ))
+
+        attn_metadata: dict[str, Any] = {}
+        for kv_cache_gid, block_table_tensor, slot_mapping in (group_device_metadata):
+            common_attn_metadata = CommonAttentionMetadata(
+                query_start_loc=query_start_loc,
+                query_start_loc_cpu=query_start_loc_cpu,
+                seq_lens=seq_lens,
+                _seq_lens_cpu=seq_lens_cpu,
+                _num_computed_tokens_cpu=context_lens_cpu,
+                seq_lens_cpu_upper_bound=seq_lens_cpu,
+                num_reqs=padded_batch_size,
+                num_actual_tokens=padded_batch_size,
+                max_query_len=1,
+                max_seq_len=int(seq_lens_cpu.max()),
+                block_table_tensor=block_table_tensor,
+                slot_mapping=slot_mapping,
+                causal=True,
+                is_prefilling=is_prefilling,
+                positions=positions,
+            )
+            if builder_device_metadata:
+                common_attn_metadata._dsv4_q1_fast_metadata = (builder_device_metadata)
+            for attn_group in self.attn_groups[kv_cache_gid]:
+                metadata = attn_group.get_metadata_builder().build(
+                    common_prefix_len=0,
+                    common_attn_metadata=common_attn_metadata,
+                    fast_build=q1_metadata_fastpath,
+                )
+                if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+                    if hasattr(metadata, "token_to_req_indices"):
+                        metadata.token_to_req_indices = packed_views[-2]
+                    if hasattr(metadata, "is_valid_token"):
+                        metadata.is_valid_token = packed_views[-1]
+                for layer_name in attn_group.layer_names:
+                    attn_metadata[layer_name] = metadata
+
+        if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+            if not use_packed_metadata or not q1_metadata_fastpath:
+                raise RuntimeError("V4 native decoder requires packed q1 metadata")
+            from vllm_gaudi.ops.deepseek_v4_native import NativeDecodeMetadata
+            attn_metadata = NativeDecodeMetadata(attn_metadata, packed_entry, buffer_index)
+        return attn_metadata
+
+    def _create_framework_decode_input_data(
+        self,
+        num_decodes: int,
+        num_scheduled_tokens: list[int],
+        context_lens: np.ndarray,
+        scheduler_output=None,
+    ) -> DecodeInputData:
+        """Prepare q1 framework-layout decode without legacy HPU metadata."""
+        decode_block_size = self.attn_block_size
+        num_blocks = np.ceil((context_lens + 1) / decode_block_size).astype(np.int32).tolist()
+        num_tokens_per_req = num_scheduled_tokens[:num_decodes]
+        num_tokens = max(num_tokens_per_req)
+        if num_tokens != 1:
+            raise ValueError("Framework-layout HPU decode currently supports q1 only, "
+                             f"got max scheduled tokens {num_tokens}")
+
+        padded_batch_size = self.bucketing_manager.find_decode_bucket(
+            num_decodes,
+            sum(num_blocks),
+            False,
+        )[0]
+        padded_batch_size += self.get_dp_padding(padded_batch_size)
+
+        with torch.profiler.record_function("dsv4::decode_framework_base_cpu"):
+            position_dtype = self._framework_attention_index_dtype()
+            positions_cpu = torch.zeros((padded_batch_size, 1), dtype=position_dtype)
+            positions_cpu[:num_decodes] = self.positions_cpu[:num_decodes].view(-1, 1)
+            token_ids_cpu = torch.zeros((padded_batch_size, 1), dtype=torch.int32)
+            token_ids_cpu[:num_decodes] = self.input_ids_cpu[:num_decodes].view(-1, 1)
+            logits_indices_cpu = torch.zeros(padded_batch_size, dtype=torch.int32)
+            logits_indices_cpu[:num_decodes] = torch.arange(num_decodes, dtype=torch.int32)
+
+        # The model and framework attention consume the same positions. Keep a
+        # single device allocation/upload instead of transferring it twice.
+        with torch.profiler.record_function("dsv4::decode_framework_base_h2d"):
+            positions_flat_device = async_h2d_copy(
+                positions_cpu.reshape(-1),
+                dtype=position_dtype,
+                device=self.device,
+            )
+            positions_device = positions_flat_device.view(padded_batch_size, 1)
+            token_ids_device = async_h2d_copy(token_ids_cpu, device=self.device)
+
+        if self.use_async_scheduling and scheduler_output is not None:
+            self._prepare_input_ids(scheduler_output)
+            token_ids_device[:num_decodes] = self.input_ids_hpu[:num_decodes].view(-1, 1)
+
+        if scheduler_output is not None:
+            logits_indices_cpu, spec_decode_metadata = (self._prepare_spec_decode_inputs(
+                scheduler_output,
+                logits_indices_cpu,
+                token_ids_device,
+                num_tokens,
+            ))
+        else:
+            spec_decode_metadata = None
+        with torch.profiler.record_function("dsv4::decode_framework_attention_metadata"):
+            logits_indices_device = async_h2d_copy(logits_indices_cpu, device=self.device)
+            attn_metadata = self._build_framework_decode_attention_metadata(
+                num_decodes=num_decodes,
+                padded_batch_size=padded_batch_size,
+                context_lens=context_lens,
+                positions_cpu=positions_cpu,
+                positions_device=positions_flat_device,
+            )
+        return DecodeInputData(
+            num_decodes=num_decodes,
+            token_ids=token_ids_device,
+            position_ids=positions_device,
+            logits_indices=logits_indices_device,
+            attn_metadata=attn_metadata,
+            spec_decode_metadata=spec_decode_metadata,
+        )
+
     def _form_prefill_batch(self, contents):
         if len(contents.req_ids) == 0:
             return PrefillInputData()
@@ -2874,7 +4257,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # slot indices match the InputBatch block_table which is keyed
         # by kernel_block_size (= attn_block_size on HPU).  self.block_size
         # may be larger for hybrid models after page-size unification.
-        slot_block_size = self.attn_block_size
+        if self.use_framework_kv_cache_layout:
+            slot_block_size = self.input_batch.block_table[0].block_size
+        else:
+            slot_block_size = self.attn_block_size
         block_assignment = [[divmod(pos, slot_block_size) for pos in positions] for positions in token_positions]
 
         token_slots = [[blocks[bi] * slot_block_size + bo for bi, bo in assignment]
@@ -3140,9 +4526,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             seqlens_offsets_for_blocks = None
             mamba_chunks_to_block_mapping = None
 
+        framework_query_lens_cpu = list(query_lens)
+        framework_context_lens_cpu = list(context_lens)
+        framework_positions_cpu = token_positions
+
         query_lens = async_h2d_copy(query_lens, dtype=torch.int32)
         token_ids = async_h2d_copy(token_ids, dtype=torch.int32)
-        token_positions = async_h2d_copy(token_positions, dtype=torch.int32)
+        position_dtype = (self._framework_attention_index_dtype()
+                          if self.use_framework_kv_cache_layout else torch.int32)
+        token_positions = async_h2d_copy(token_positions, dtype=position_dtype)
         token_slots = async_h2d_copy(token_slots, dtype=torch.int64)
         logits_indices = async_h2d_copy(logits_indices, dtype=torch.int32)
         context_lens = async_h2d_copy(context_lens, dtype=torch.int32)
@@ -3159,24 +4551,32 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             window_context_blocks = align_and_pad(window_context_blocks_raw, (target_bs, sliding_block_size),
                                                   itertools.repeat(-1))
             window_context_blocks_t = async_h2d_copy(window_context_blocks, dtype=torch.int32).flatten()
-        attn_metadata = HPUAttentionMetadataV1.make_prefill_metadata(
-            seq_lens_tensor=query_lens,
-            context_lens_tensor=context_lens,
-            slot_mapping=token_slots,
-            block_list=context_blocks_t,
-            attn_bias=attn_bias,
-            block_size=self.attn_block_size,
-            prep_initial_states=prep_initial_states,
-            has_initial_states_p=has_initial_states_p,
-            last_chunk_indices_p=last_chunk_indices_p,
-            load_indices_tensor=load_indices_tensor,
-            store_indices_tensor=store_indices_tensor,
-            query_start_loc=query_start_loc_p,
-            padding_mask_flat=padding_mask_flat,
-            blocks_caching_range=blocks_caching_range,
-            mamba_chunks_to_block_mapping=mamba_chunks_to_block_mapping,
-            seqlens_offsets_for_blocks=seqlens_offsets_for_blocks,
-            window_block_list=window_context_blocks_t)
+        if self.use_framework_kv_cache_layout:
+            attn_metadata = self._build_framework_prefill_attention_metadata(
+                req_ids,
+                framework_query_lens_cpu,
+                framework_context_lens_cpu,
+                framework_positions_cpu,
+            )
+        else:
+            attn_metadata = HPUAttentionMetadataV1.make_prefill_metadata(
+                seq_lens_tensor=query_lens,
+                context_lens_tensor=context_lens,
+                slot_mapping=token_slots,
+                block_list=context_blocks_t,
+                attn_bias=attn_bias,
+                block_size=self.attn_block_size,
+                prep_initial_states=prep_initial_states,
+                has_initial_states_p=has_initial_states_p,
+                last_chunk_indices_p=last_chunk_indices_p,
+                load_indices_tensor=load_indices_tensor,
+                store_indices_tensor=store_indices_tensor,
+                query_start_loc=query_start_loc_p,
+                padding_mask_flat=padding_mask_flat,
+                blocks_caching_range=blocks_caching_range,
+                mamba_chunks_to_block_mapping=mamba_chunks_to_block_mapping,
+                seqlens_offsets_for_blocks=seqlens_offsets_for_blocks,
+                window_block_list=window_context_blocks_t)
         return PrefillInputData(request_ids=[req_ids],
                                 prompt_lens=[query_lens],
                                 token_ids=[token_ids],
@@ -3229,15 +4629,22 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                   block_table_cpu_tensor,
                                   scheduler_output=None) -> DecodeInputData:
 
-        decode_block_size = self.attn_block_size
+        if self.use_framework_kv_cache_layout:
+            return self._create_framework_decode_input_data(
+                num_decodes,
+                num_scheduled_tokens,
+                context_lens,
+                scheduler_output,
+            )
 
-        # NOTE(kzawora): the +1 is what causes this entire thing to work,
-        # as in the paged attention, we don't fetch just the context from cache,
-        # but also kvs for the current token
-        num_blocks = np.ceil((context_lens + 1) / decode_block_size).astype(np.int32).tolist()
+        decode_block_size = self.attn_block_size
 
         num_tokens_per_req = num_scheduled_tokens[:num_decodes]
         num_tokens = max(num_tokens_per_req)
+        # Bucketing must cover the last scheduled verification token, not
+        # only the first one. A DFlash2 block can cross a physical KV page.
+        query_ends = context_lens + np.asarray(num_tokens_per_req, dtype=np.int64)
+        num_blocks = ((query_ends + decode_block_size - 1) // decode_block_size).astype(np.int32).tolist()
         # Spec decode to use seed buckets to get padded batch size
         seek_buckets = bool(num_tokens > 1)
 
@@ -3255,7 +4662,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         for i, n in enumerate(num_blocks):
             seq_block_table = block_table_cpu_tensor[i, :n].tolist()
             assert len(seq_block_table) == n
-            block_tables_list.extend([seq_block_table] * num_tokens)
+            query_len = int(num_tokens_per_req[i])
+            first_page_count = (int(context_lens[i]) + decode_block_size) // decode_block_size
+            if first_page_count == n:
+                block_tables_list.extend([seq_block_table] * query_len)
+            else:
+                # Each flattened query is a different causal prefix. Sharing
+                # the first token's pages drops the next page after a crossing;
+                # sharing the last token's pages exposes future tokens before it.
+                for token in range(query_len):
+                    page_count = (int(context_lens[i]) + token + decode_block_size) // decode_block_size
+                    block_tables_list.append(seq_block_table[:page_count])
+            block_tables_list.extend([[self._PAD_BLOCK_ID]] * (num_tokens - query_len))
 
         ###################################
         # initialize positions with padding
@@ -3263,7 +4681,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # NOTE(Chendi): Follow GPU_Model_Runner to use global
         # self.positions_cpu, which updated in prepare_inputs from
         # self.input_batch.num_computed_tokens_cpu[req_indices]
-        positions = torch.zeros((padded_batch_size, num_tokens), dtype=torch.int32)
+        position_dtype = (self._framework_attention_index_dtype()
+                          if self.use_framework_kv_cache_layout else torch.int32)
+        positions = torch.zeros((padded_batch_size, num_tokens), dtype=position_dtype)
         if num_tokens == 1:
             positions[:num_decodes] = self.positions_cpu[:num_decodes].view(-1, 1)
         else:
@@ -3278,30 +4698,22 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         index = positions.to(torch.int64)[:num_decodes]
         padded_index[:num_decodes] = index
 
-        input_mrope_positions_list: list[list[int]] = [[] for _ in range(3)]
         if self.uses_mrope:
-            for idx, req_id in enumerate(self.input_batch.req_ids[:num_decodes]):
-                seq_data = self.requests[req_id]
-                context_len = context_lens[idx]
-                position = context_len
-                if seq_data.mrope_position_delta is not None:
-                    seq_data.mrope_position_delta = int(seq_data.mrope_position_delta)
-                    pos_for_mrope = MRotaryEmbedding \
-                        .get_next_input_positions(
-                            seq_data.mrope_position_delta,
-                            context_len=context_len,
-                            seq_len=context_len + 1)
-                else:
-                    pos_for_mrope = [[position]] * 3
-                for idx in range(3):
-                    input_mrope_positions_list[idx].extend(pos_for_mrope[idx])
-
-            positions = torch.tensor(input_mrope_positions_list, dtype=torch.int32, device='cpu')
-
-            # Pad the right side of input_mrope_positions by padded_batch_size
-            pad_size = padded_batch_size - positions.size(1)
-            if pad_size > 0:
-                positions = F.pad(positions, (0, pad_size), value=-1, mode='constant')
+            # Decode extends all three M-RoPE axes by the same per-request
+            # delta. Keep every scheduled token, including T8 verification,
+            # in [3, padded_batch * query_width] layout. A [T, 1] tensor would
+            # make MRotaryEmbedding interpret query tokens as spatial axes.
+            deltas = torch.zeros((padded_batch_size, 1), dtype=torch.int32)
+            deltas[:num_decodes, 0] = torch.tensor([
+                int(self.requests[req_id].mrope_position_delta or 0)
+                for req_id in self.input_batch.req_ids[:num_decodes]
+            ],
+                                                   dtype=torch.int32)
+            query_lengths = torch.tensor(num_tokens_per_req, dtype=torch.int32)
+            valid_positions = torch.arange(num_tokens).unsqueeze(0) < query_lengths.unsqueeze(1)
+            shifted_positions = padded_index.to(torch.int32) + deltas
+            shifted_positions = torch.where(valid_positions, shifted_positions, -1)
+            positions = shifted_positions.reshape(1, -1).expand(3, -1).contiguous()
 
         ###################################
         # initialize token_ids with padding
@@ -3337,14 +4749,20 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         slot_mapping = slot_mapping[:padded_batch_size]
         pad_slot_base = self._PAD_BLOCK_ID * decode_block_size
         dummy_slots = itertools.cycle(range(pad_slot_base, pad_slot_base + decode_block_size))
-        slot_mapping[num_decodes:].apply_(lambda _, ds=dummy_slots: next(ds))
+        for request_index, query_len in enumerate(num_tokens_per_req):
+            if query_len < num_tokens:
+                # Ragged speculative requests also contain padding *inside*
+                # a live request row. Never insert those tokens at position 0
+                # of the live cache just because their padded position is 0.
+                slot_mapping[request_index, query_len:].apply_(lambda _, ds=dummy_slots: next(ds))
 
         #####################################
         # NOTE(Chendi): Since we can't actually do num_tokens = 2,
         # convert to [batch_size * num_tokens, 1]
         if num_tokens > 1:
             token_ids = token_ids.view(-1, 1)
-            positions = padded_index.view(-1, 1)
+            if not self.uses_mrope:
+                positions = padded_index.view(-1, 1)
             slot_mapping = slot_mapping.view(-1, 1)
 
         logits_indices = torch.zeros(padded_batch_size, dtype=torch.int32, device='cpu')
@@ -3369,7 +4787,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         logits_indices[:num_decodes] = query_start_loc_cpu[1:num_decodes + 1] - 1
 
-        positions_device = async_h2d_copy(positions, device=self.device)
+        positions_device = async_h2d_copy(positions, dtype=position_dtype, device=self.device)
         block_tables_list = self._resolve_all_blocks(block_tables_list)
 
         # CONTEXT_LENS [batch_size]
@@ -3426,26 +4844,66 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 )
 
             req_indices = list(range(num_decodes))
+            is_dflash_decode = self.speculative_config is not None and self.speculative_config.use_dflash()
+            is_dflash_spec = is_dflash_decode and num_tokens > 1
+            state_width = num_tokens if is_dflash_spec else 1
+            dflash_full_query = _is_full_dflash_query_block(
+                is_dflash_spec,
+                num_decodes,
+                padded_batch_size,
+                num_tokens_per_req,
+                state_width,
+            )
+            if is_dflash_decode:
+                accepted_counts = [
+                    self._gdn_num_accepted_by_req.get(req_id, 1) for req_id in self.input_batch.req_ids[:num_decodes]
+                ]
+                load_checkpoint_offsets = None if is_dflash_spec else [count - 1 for count in accepted_counts]
+            else:
+                accepted_counts = []
+                load_checkpoint_offsets = None
             if self.use_prefix_caching:
                 load_state_indices_cpu = self.prepare_mamba_state_idxs(req_indices, block_idx_last_computed_token_cpu,
-                                                                       padded_batch_size)
+                                                                       padded_batch_size, state_width,
+                                                                       load_checkpoint_offsets)
                 store_state_indices_cpu = self.prepare_mamba_state_idxs(req_indices, block_idx_last_scheduled_token_cpu,
-                                                                        padded_batch_size)
+                                                                        padded_batch_size, state_width)
             else:
                 zeros = [0] * len(req_indices)
-                load_state_indices_cpu = store_state_indices_cpu = \
-                    self.prepare_mamba_state_idxs(req_indices, zeros, padded_batch_size)
+                load_state_indices_cpu = self.prepare_mamba_state_idxs(
+                    req_indices,
+                    zeros,
+                    padded_batch_size,
+                    state_width,
+                    load_checkpoint_offsets,
+                )
+                store_state_indices_cpu = self.prepare_mamba_state_idxs(
+                    req_indices,
+                    zeros,
+                    padded_batch_size,
+                    state_width,
+                )
 
             direct_gdn_state = self._can_use_direct_gdn_state(
                 load_state_indices_cpu,
                 num_decodes,
                 padded_batch_size,
                 num_tokens,
+                dflash_full_query,
             ) and torch.equal(load_state_indices_cpu, store_state_indices_cpu)
             if direct_gdn_state and not self._logged_direct_gdn_state and not self.warmup_mode:
                 self._logged_direct_gdn_state = True
                 logger.info(
                     "GDN direct-state decode enabled: active_bs=%d padded_bs=%d groups=%d",
+                    num_decodes,
+                    padded_batch_size,
+                    len(self._compact_gdn_group_ids),
+                )
+            if (direct_gdn_state and num_decodes < padded_batch_size and not self._logged_padded_direct_gdn_state
+                    and not self.warmup_mode):
+                self._logged_padded_direct_gdn_state = True
+                logger.info(
+                    "GDN padded direct-state decode enabled: active_bs=%d padded_bs=%d groups=%d",
                     num_decodes,
                     padded_batch_size,
                     len(self._compact_gdn_group_ids),
@@ -3463,6 +4921,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             load_indices_tensor = async_h2d_copy(load_state_indices_cpu, device=self.device)
             store_indices_tensor = async_h2d_copy(store_state_indices_cpu, device=self.device)
             query_start_loc_p = async_h2d_copy(query_start_loc_p_cpu, dtype=torch.int32)
+            if is_dflash_decode:
+                accepted_counts.extend([1] * (padded_batch_size - num_decodes))
+                num_accepted_tokens = async_h2d_copy(
+                    torch.tensor(accepted_counts, dtype=torch.int32),
+                    device=self.device,
+                )
+            else:
+                num_accepted_tokens = None
 
         else:
             seq_lens_tensor = None
@@ -3470,6 +4936,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             store_indices_tensor = None
             query_start_loc_p = None
             direct_gdn_state = False
+            num_accepted_tokens = None
+            dflash_full_query = False
 
         # CPU<>HPU sync *should not* happen here.
         block_list_device = async_h2d_copy(block_list, device=self.device)
@@ -3523,32 +4991,53 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             spec_decode_metadata = None
         logits_indices_device = async_h2d_copy(logits_indices, device=self.device)
 
-        attn_metadata = HPUAttentionMetadataV1.make_decode_metadata(
-            block_list=block_list_device,
-            block_usage=block_usage_device,
-            block_groups=block_groups_device,
-            input_positions=None,
-            slot_mapping=slot_mapping_device,
-            block_size=decode_block_size,
-            window_block_list=window_block_list_device,
-            window_block_usage=window_block_usage_device,
-            window_block_groups=window_block_groups_device,
-            chunked_block_list=chunked_block_list_device,
-            chunked_block_usage=chunked_block_usage_device,
-            chunked_block_groups=chunked_block_groups_device,
-            load_indices_tensor=load_indices_tensor,
-            store_indices_tensor=store_indices_tensor,
-            seq_lens_tensor=seq_lens_tensor,
-            query_start_loc=query_start_loc_p,
-            direct_gdn_state=direct_gdn_state,
-        )
+        draft_block_table = None
+        if (spec_decode_metadata is not None and gaudi_envs.VLLM_HPU_DFLASH2_DEVICE_PREPARE
+                and self.speculative_config is not None and self.speculative_config.use_dflash()):
+            defragmenter = getattr(self, 'defragmenter', None)
+            if defragmenter is None or not defragmenter.enabled:
+                draft_block_table = self._dflash2_commit_block_table_if_changed(
+                    self.drafter.kv_cache_gid,
+                    padded_batch_size,
+                )
+
+        if self.use_framework_kv_cache_layout:
+            attn_metadata = self._build_framework_decode_attention_metadata(
+                num_decodes=num_decodes,
+                padded_batch_size=padded_batch_size,
+                context_lens=context_lens,
+                positions_cpu=positions,
+            )
+        else:
+            attn_metadata = HPUAttentionMetadataV1.make_decode_metadata(
+                block_list=block_list_device,
+                block_usage=block_usage_device,
+                block_groups=block_groups_device,
+                input_positions=None,
+                slot_mapping=slot_mapping_device,
+                block_size=decode_block_size,
+                window_block_list=window_block_list_device,
+                window_block_usage=window_block_usage_device,
+                window_block_groups=window_block_groups_device,
+                chunked_block_list=chunked_block_list_device,
+                chunked_block_usage=chunked_block_usage_device,
+                chunked_block_groups=chunked_block_groups_device,
+                load_indices_tensor=load_indices_tensor,
+                store_indices_tensor=store_indices_tensor,
+                num_accepted_tokens=num_accepted_tokens,
+                direct_gdn_state=direct_gdn_state,
+                dflash_full_query=dflash_full_query,
+                seq_lens_tensor=seq_lens_tensor,
+                query_start_loc=query_start_loc_p,
+            )
 
         return DecodeInputData(num_decodes=num_decodes,
                                token_ids=token_ids_device,
                                position_ids=positions_device,
                                logits_indices=logits_indices_device,
                                attn_metadata=attn_metadata,
-                               spec_decode_metadata=spec_decode_metadata)
+                               spec_decode_metadata=spec_decode_metadata,
+                               draft_block_table=draft_block_table)
 
     def _prepare_decode_inputs(self,
                                num_decodes,
@@ -3809,19 +5298,34 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                fuse_greedy_sampling=False):
         # FORWARD.
         batch_size = token_ids.size(0)
-        seq_len = self._seq_len(attn_metadata)
-        num_blocks = self._num_blocks(attn_metadata)
-        self._check_config(batch_size, seq_len, num_blocks, attn_metadata, warmup_mode)
+        framework_attn_metadata = isinstance(attn_metadata, Mapping)
+        if framework_attn_metadata:
+            seq_len = token_ids.size(-1)
+            num_blocks = max(
+                (metadata.block_table.shape[-1]
+                 for metadata in attn_metadata.values() if getattr(metadata, "block_table", None) is not None),
+                default=0,
+            )
+            phase = "prompt" if seq_len > 1 else "decode"
+            cfg = (phase, batch_size, seq_len, num_blocks)
+            seen = cfg in self.seen_configs
+            self.seen_configs.add(cfg)
+            if not seen and not warmup_mode:
+                logger.warning("Configuration: %s was not warmed-up!", cfg)
+        else:
+            seq_len = self._seq_len(attn_metadata)
+            num_blocks = self._num_blocks(attn_metadata)
+            self._check_config(batch_size, seq_len, num_blocks, attn_metadata, warmup_mode)
         additional_kwargs = {}
         if htorch.utils.internal.is_lazy():
-            use_graphs = self._use_graphs(attn_metadata, batch_size)
+            use_graphs = False if framework_attn_metadata else self._use_graphs(attn_metadata, batch_size)
             additional_kwargs.update({"bypass_hpu_graphs": not use_graphs})
         else:
             # no hpu graphs for t.compile?
             use_graphs = False
         if self.model_has_chunked_attention:
             additional_kwargs.update({"model_has_chunked_attention": True})
-        trimmed_attn_metadata = trim_attn_metadata(attn_metadata)
+        trimmed_attn_metadata = attn_metadata if framework_attn_metadata else trim_attn_metadata(attn_metadata)
         if self.is_driver_worker:
             model_event_name = ("model_forward_"
                                 f"bs{batch_size}_"
@@ -3830,15 +5334,42 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                 f"graphs{'T' if use_graphs else 'F'}")
         else:
             model_event_name = 'model_executable'
+        quality_debug = (os.getenv("VLLM_HPU_DSV4_QUALITY_DEBUG") == "1" and not warmup_mode and self.is_driver_worker)
+        if quality_debug:
+            torch.hpu.synchronize()
+            logger.warning(
+                "DSV4 quality input_ids=%s positions=%s logits_indices=%s",
+                token_ids.detach().cpu().tolist(),
+                position_ids.detach().cpu().tolist(),
+                logits_indices.detach().cpu().tolist(),
+            )
+
         with self.profiler.record_event('internal', model_event_name):
+            # Keep Python class-state mutation outside the compiled model.
+            # Full-graph Dynamo cannot trace setattr on LoraMask, while doing
+            # it immediately before the call preserves the existing lifetime.
+            LoraMask.setLoraMask(lora_mask)
             hidden_states = self.model.forward(input_ids=token_ids,
                                                positions=position_ids,
                                                attn_metadata=trimmed_attn_metadata,
                                                kv_caches=kv_caches,
                                                inputs_embeds=inputs_embeds,
                                                model_mm_kwargs=model_mm_kwargs,
-                                               lora_mask=lora_mask,
                                                **additional_kwargs)
+        if quality_debug and isinstance(hidden_states, torch.Tensor):
+            hidden_flat = hidden_states.reshape(-1, hidden_states.shape[-1]).float()
+            hidden_norms = torch.linalg.vector_norm(hidden_flat, dim=-1)
+            if hidden_flat.shape[0] > 1:
+                hidden_deltas = torch.linalg.vector_norm(hidden_flat[1:] - hidden_flat[:-1], dim=-1)
+            else:
+                hidden_deltas = hidden_norms.new_empty((0, ))
+            torch.hpu.synchronize()
+            logger.warning(
+                "DSV4 quality hidden_norms=%s adjacent_deltas=%s samples=%s",
+                hidden_norms.detach().cpu().tolist(),
+                hidden_deltas.detach().cpu().tolist(),
+                hidden_flat[:, :8].detach().cpu().tolist(),
+            )
         # NOTE(kzawora): returning hidden_states is required in prompt logprobs
         # scenarios, as they will do logit processing on their own
         if self.use_aux_hidden_state_outputs:
@@ -4584,6 +6115,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         prefill_sampled_requests = []
         decode_sampled_token_ids = []
         decode_sampled_requests = []
+        device_prepared_dflash_drafts = None
         # Logprobs tracking: collect (req_ids, logprobs_tensors) segments
         # from each sampling call to combine at the end.
         logprobs_segments: list[tuple[list[str], LogprobsTensors | None]] = []
@@ -4743,23 +6275,71 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 with self.profiler.record_event('internal', "sampler"):
                     ##### Sampling Start #####
                     spec_decode_metadata = decode_data.spec_decode_metadata
-                    sampler_output, sampling_metadata = self._run_sampling(
-                        batch_changed, logits_device
-                        if spec_decode_metadata is None else logits_device[spec_decode_metadata.bonus_logits_indices],
-                        pd_info.decode_req_ids, logits_device.shape[0])
+                    is_dflash_spec = (spec_decode_metadata is not None and self.speculative_config is not None
+                                      and self.speculative_config.use_dflash())
+                    if is_dflash_spec:
+                        # RejectionSampler already samples the bonus row. The
+                        # old common path sampled it once here and discarded
+                        # that result before sampling it a second time below.
+                        htorch.core.mark_step()
+                        sampling_metadata = self._prepare_sampling(
+                            batch_changed,
+                            pd_info.decode_req_ids,
+                            logits_device.shape[0],
+                        )
+                        htorch.core.mark_step()
+                        sampler_output = None
+                    else:
+                        sampler_output, sampling_metadata = self._run_sampling(
+                            batch_changed, logits_device if spec_decode_metadata is None else
+                            logits_device[spec_decode_metadata.bonus_logits_indices], pd_info.decode_req_ids,
+                            logits_device.shape[0])
 
                     if spec_decode_metadata is None:
+                        assert sampler_output is not None
                         decode_sampled_token_ids.append(sampler_output.sampled_token_ids.flatten())
                         logprobs_segments.append((list(pd_info.decode_req_ids), sampler_output.logprobs_tensors))
+                        if self.speculative_config is not None and self.speculative_config.use_dflash():
+                            # A plain target step reads the accepted checkpoint
+                            # selected by the metadata builder and writes the
+                            # resulting recurrent state back to checkpoint 0.
+                            # The next verification starts from that canonical
+                            # checkpoint.
+                            for req_id in self.input_batch.req_ids[:num_decodes]:
+                                self._gdn_num_accepted_by_req[req_id] = 1
                     else:
                         # Handling spec decode sampling.
-                        sampler_output = self.rejection_sampler(
-                            spec_decode_metadata,
-                            None,  # draft_probs
-                            logits_device,
-                            sampling_metadata,
-                        )
-                        sampled_token_ids = sampler_output.sampled_token_ids
+                        sampled_token_ids = None
+                        if is_dflash_spec and not self.rejection_sampler.synthetic_mode:
+                            from vllm_gaudi.v1.sample.hpu_rejection_sampler import (
+                                _dflash2_greedy_fastpath_supported, )
+
+                            if _dflash2_greedy_fastpath_supported(sampling_metadata):
+                                sampled_token_ids = self.model.sample_dflash2_greedy(
+                                    logits_device,
+                                    spec_decode_metadata.draft_token_ids,
+                                    spec_decode_metadata.target_logits_indices,
+                                    spec_decode_metadata.bonus_logits_indices,
+                                    spec_decode_metadata.cu_num_draft_tokens,
+                                )
+                        if sampled_token_ids is None:
+                            sampler_output = self.rejection_sampler(
+                                spec_decode_metadata,
+                                None,  # draft_probs
+                                logits_device,
+                                sampling_metadata,
+                            )
+                            sampled_token_ids = sampler_output.sampled_token_ids
+                        if (is_dflash_spec and num_prefills == 0
+                                and self._can_use_dflash2_device_prepare(sampled_token_ids, num_decodes, decode_data)):
+                            with self.profiler.record_event('internal', "dflash2_device_prepare"):
+                                device_prepared_dflash_drafts = self.propose_dflash2_decode_device(
+                                    sampled_token_ids,
+                                    non_flattened_hidden_states,
+                                    aux_hidden_states,
+                                    num_decodes,
+                                    decode_data,
+                                )
                         decode_sampled_token_ids = \
                             self.rejection_sampler.parse_output(
                                 sampled_token_ids,
@@ -4769,6 +6349,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                             decode_sampled_token_ids, _ = decode_sampled_token_ids
                         # Trim output in case of dummy padding
                         decode_sampled_token_ids = decode_sampled_token_ids[:num_decodes]
+                        if self.speculative_config.use_dflash():
+                            for req_id, accepted_tokens in zip(
+                                    self.input_batch.req_ids[:num_decodes],
+                                    decode_sampled_token_ids,
+                            ):
+                                self._gdn_num_accepted_by_req[req_id] = max(1, len(accepted_tokens))
                         # convert decode_sampled_token_ids as list of tensor
                         spec_decode_num_tokens = [len(v) for v in decode_sampled_token_ids]
                         decode_sampled_token_ids = [
@@ -4929,12 +6515,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         ################## Spec Decode ##################
         # Now, we will call drafter to propose draft token ids
         if self.speculative_config:
-            self._draft_token_ids = self.propose_draft_token_ids(
-                scheduler_output, postprocessed_sampled_token_ids, sampling_metadata, non_flattened_hidden_states,
-                sample_hidden_states, aux_hidden_states, prefill_sampled_token_ids_device,
-                decode_sampled_token_ids_device, non_flattened_hidden_states_prefills, sample_hidden_states_prefills,
-                aux_hidden_states_prefills, num_decodes, prefill_data if num_prefills > 0 else None,
-                decode_data if num_decodes > 0 else None)
+            if device_prepared_dflash_drafts is not None:
+                self._draft_token_ids = device_prepared_dflash_drafts
+            else:
+                self._draft_token_ids = self.propose_draft_token_ids(
+                    scheduler_output, postprocessed_sampled_token_ids, sampling_metadata, non_flattened_hidden_states,
+                    sample_hidden_states, aux_hidden_states, prefill_sampled_token_ids_device,
+                    decode_sampled_token_ids_device, non_flattened_hidden_states_prefills,
+                    sample_hidden_states_prefills, aux_hidden_states_prefills, num_decodes,
+                    prefill_data if num_prefills > 0 else None, decode_data if num_decodes > 0 else None)
         ################## Spec Decode end ##################
 
         # Create output.
@@ -4967,6 +6556,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 sampled_token_ids=sampled_token_ids,
                 invalid_req_indices=self.invalid_req_indices,
                 async_output_copy_stream=self.async_output_copy_stream,
+                native_copy=gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH and num_prefills == 0 and num_decodes == 1,
             )
             # Hybrid recurrent states and request rows are still being
             # established while prefills enter the decode batch. Settle those
@@ -5000,6 +6590,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         import habana_frameworks.torch.core as htcore
         if self._is_quant_with_inc() or self.model_config.quantization == 'fp8':
             htcore.hpu_inference_set_env()
+        prepare_tp2_fused_ar_norm_before_model_load(self)
         logger.info("Starting to load model %s...", self.model_config.model)
         with HabanaMemoryProfiler() as m:  # noqa: SIM117
             # When load_config.device differs from the platform device (e.g.
@@ -5119,7 +6710,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 #logger.info("Loading drafter model %s...", self.vllm_config.speculative_config.draft_model_config)
                 self.drafter.load_model(self.model.model)
                 if self.use_aux_hidden_state_outputs:
-                    if supports_eagle3(self.model.model):
+                    if self.speculative_config.use_dflash():
+                        from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+                            set_eagle3_aux_hidden_state_layers, )
+
+                        set_eagle3_aux_hidden_state_layers(self.model.model, self.speculative_config)
+                    elif supports_eagle3(self.model.model):
                         self.model.model.set_aux_hidden_state_layers(
                             self.model.model.get_eagle3_default_aux_hidden_state_layers())
                     else:
@@ -5131,7 +6727,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 self.drafter.model = self.drafter.model.to("hpu")
                 torch.hpu.synchronize()
                 with HabanaMemoryProfiler() as m:  # noqa: SIM117
-                    self.drafter.model = _maybe_wrap_in_hpu_graph(self.drafter.model, vllm_config=self.vllm_config)
+                    draft_adapter_config = (self.drafter.get_hpu_adapter_config()
+                                            if self.speculative_config.use_dflash() else self.vllm_config)
+                    self.drafter.model = _maybe_wrap_in_hpu_graph(
+                        self.drafter.model,
+                        vllm_config=draft_adapter_config,
+                    )
                 self.model_memory_usage = m.consumed_device_memory
                 logger.info("Wrapping in HPUGraph took %.4f GB", self.model_memory_usage / float(2**30))
         #############################################
@@ -5160,32 +6761,87 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             torch._dynamo.config.force_parameter_static_shapes = False
             self.compile_config = HPUCompileConfig()
 
-            if self.compile_config.regional_compilation:
+            chunk_size = gaudi_envs.VLLM_HPU_DSV4_COMPILE_CHUNK_SIZE
+            if chunk_size < 0:
+                raise ValueError("VLLM_HPU_DSV4_COMPILE_CHUNK_SIZE must be non-negative")
+            use_deepseek_chunks = (self.model_config.hf_config.model_type == "deepseek_v4" and chunk_size > 0)
+
+            if use_deepseek_chunks:
+                self._compile_methods()
+                self.regional_compilation_layers_list = [
+                    RMSNorm,
+                    VocabParallelEmbedding,
+                ]
+                self._regional_compilation(
+                    self.model,
+                    skip_deepseek_decoder_layers=True,
+                )
+                chunk_count = self._compile_deepseek_v4_layer_chunks(chunk_size)
+                self.sampler = self._compile(self.sampler)
+                logger.info(
+                    "Configured DeepSeek V4 coarse compilation: "
+                    "chunk_size=%d chunks=%d",
+                    chunk_size,
+                    chunk_count,
+                )
+            elif self.compile_config.regional_compilation:
                 self._compile_methods()
                 self.regional_compilation_layers_list = [RMSNorm, VocabParallelEmbedding]
                 self._regional_compilation(self.model)
+                if (self.speculative_config is not None and self.speculative_config.use_dflash()
+                        and hasattr(self.drafter, "model")):
+                    self._regional_compilation(self.drafter.model)
+                    logger.info("Enabled regional compilation for the DFlash2 drafter")
                 self.sampler = self._compile(self.sampler)
             else:
                 self.model = self._compile(self.model)
+                if (self.speculative_config is not None and self.speculative_config.use_dflash()
+                        and hasattr(self.drafter, "model")):
+                    self.drafter.model = self._compile(self.drafter.model)
+                    logger.info("Enabled compilation for the DFlash2 drafter")
 
     def _compile_methods(self):
         """
         Compile methods which are not part of the compiled model i.e. those
         which will not be compiled during model's compilation.
         """
-        compiled_methods = [
+        target_methods = [
             'metadata_processor.process_metadata',
             '_rotary_prepare_cos_sin',
             'compute_logits',
             'select_and_compute_logits',
             'select_compute_logits_and_greedy',
         ]
-        for method_name in compiled_methods:
-            method = getattr_nested(self.model, method_name, None)
-            if method is not None:
-                self._compile_region(self.model, method_name, method)
+        if self.speculative_config is not None and self.speculative_config.use_dflash():
+            target_methods.append('sample_dflash2_greedy')
+        self._compile_named_methods(self.model, target_methods)
+        if (self.speculative_config is not None and self.speculative_config.use_dflash()
+                and hasattr(self.drafter, "model")):
+            self._compile_named_methods(
+                self.drafter.model,
+                [
+                    'combine_hidden_states',
+                    'precompute_and_store_context_kv',
+                    'compute_candidates',
+                    'prepare_dflash2_inputs',
+                    'score_dflash2_candidates',
+                    'select_dflash2_candidates',
+                ],
+            )
 
-    def _regional_compilation(self, module, parent_module=None, module_name=None):
+    def _compile_named_methods(self, model, method_names):
+        for method_name in method_names:
+            method = getattr_nested(model, method_name, None)
+            if method is not None:
+                self._compile_region(model, method_name, method)
+
+    def _regional_compilation(
+        self,
+        module,
+        parent_module=None,
+        module_name=None,
+        skip_deepseek_decoder_layers=False,
+    ):
         """
         Recursively traverses a PyTorch module and compiles its regions, which
         can be one of two:
@@ -5231,6 +6887,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     "size 2 with VLLM_HPU_TP2_FUSED_AR_NORM enabled; using per-layer compilation")
 
         if isinstance(module, torch.nn.ModuleList):
+            if (skip_deepseek_decoder_layers and len(module) > 0
+                    and all(child.__class__.__name__ == "DeepseekV4DecoderLayer" for child in module)):
+                return
             for children_name, children_module in module.named_children():
                 self._compile_region(module, children_name, children_module)
         elif any(isinstance(module, layer) for layer in self.regional_compilation_layers_list):
@@ -5241,7 +6900,61 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             )
         else:
             for children_name, children_module in module.named_children():
-                self._regional_compilation(children_module, module, children_name)
+                self._regional_compilation(
+                    children_module,
+                    module,
+                    children_name,
+                    skip_deepseek_decoder_layers,
+                )
+
+    def _compile_deepseek_v4_layer_chunks(self, chunk_size: int) -> int:
+        from vllm.models.deepseek_v4.hw_agnostic.model import (
+            DeepseekV4DecoderLayerChunk,
+            DeepseekV4Model,
+        )
+
+        compile_args = HPUCompileConfig(
+            fullgraph=True,
+            dynamic=False,
+        ).get_compile_args()
+        if gaudi_envs.VLLM_HPU_DSV4_EARLY_OUTPUT_LOWERING:
+            from vllm_gaudi.compilation.deepseek_v4 import make_backend
+            compile_args["backend"] = make_backend()
+        chunk_count = 0
+        models = [module for module in self.model.modules() if isinstance(module, DeepseekV4Model)]
+        for model in models:
+            layers = list(itertools.islice(
+                model.layers,
+                model.start_layer,
+                model.end_layer,
+            ))
+            compiled_chunks = []
+            native_chunks = []
+            decode_only_compile = _dsv4_decode_only_compile_enabled(self.model_config.hf_config.model_type)
+            for offset in range(0, len(layers), chunk_size):
+                chunk_layers = layers[offset:offset + chunk_size]
+                chunk = DeepseekV4DecoderLayerChunk(
+                    chunk_layers,
+                    start_layer=model.start_layer + offset,
+                    model_end_layer=model.end_layer,
+                )
+                chunk.train(model.training)
+                native_chunks.append(chunk)
+                compiled_chunk = torch.compile(chunk, **compile_args)
+                compiled_chunks.append(
+                    _HPUDeepseekV4PhaseChunk(chunk, compiled_chunk) if decode_only_compile else compiled_chunk)
+            object.__setattr__(
+                model,
+                "_hpu_compiled_layer_chunks",
+                compiled_chunks,
+            )
+            chunk_count += len(compiled_chunks)
+            if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+                from vllm_gaudi.ops.deepseek_v4_native import NativeDecoder
+                object.__setattr__(model, "_hpu_native_decoder", NativeDecoder(model, native_chunks))
+        if chunk_count == 0:
+            raise RuntimeError("No DeepSeek V4 decoder layers found to compile")
+        return chunk_count
 
     def _compile_region(self, model, name, module):
         module = self._compile(module)
@@ -5593,8 +7306,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         """
         # Choose batch sizes for warmup based on bucketing
         # Note: We skip batch_size=0 because you can't sample from empty logits
-        test_batch_sizes = list(
-            dict.fromkeys([1] + [bucket[0] for bucket in self.bucketing_manager.decode_buckets if bucket[0] > 0]))
+        # Speculative target verification expands B requests into
+        # B * (K + 1) paged-attention queries.  That expanded dimension is a
+        # model-forward bucket, not a sampler batch: sampling and rejection
+        # still operate on B requests.  Hybrid models keep InputBatch at the
+        # scheduler request capacity, so warming the expanded bucket here
+        # would write beyond every request-level sampling buffer.
+        test_batch_sizes = _sampler_warmup_batch_sizes(
+            self.bucketing_manager.decode_buckets,
+            self.input_batch.max_num_reqs,
+        )
 
         # Test different sampling configurations
         sampling_configs = [
@@ -5759,23 +7480,25 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                            scheduled_tokens,
                            is_prompt,
                            block_id=0):
-        # Spec decode: blocks should include look ahead tokens (eagle)
+        # Spec decode: reserve the same lookahead used by the scheduler. DFlash2
+        # needs one more slot than EAGLE for its bonus-token query.
         total_tokens_for_blocks = total_tokens
-        if self.speculative_config and self.speculative_config.use_eagle():
-            # Consider the block space for draft tokens to propose
-            total_tokens_for_blocks += self.speculative_config.num_speculative_tokens
+        num_lookahead_tokens = self.vllm_config.num_lookahead_tokens
+        if num_lookahead_tokens:
+            total_tokens_for_blocks += num_lookahead_tokens
             # Check the limit of the max model length
             if total_tokens_for_blocks > self.max_model_len:
                 total_tokens_for_blocks = self.max_model_len
 
         prompt_token_ids = list(range(total_tokens))
-        num_blocks = round_up(total_tokens_for_blocks, self.block_size) // self.block_size
 
         req_id = f'{len(requests)}'
-        block_ids = [[block_id] *
-                     (round_up(total_tokens_for_blocks, g.kv_cache_spec.block_size) // g.kv_cache_spec.block_size)
-                     for g in self.kv_cache_config.kv_cache_groups] if self.num_mamba_like_layers > 0 else [[block_id] *
-                                                                                                            num_blocks]
+        block_ids = [
+            [block_id] *
+            (round_up(total_tokens_for_blocks, group.kv_cache_spec.block_size) // group.kv_cache_spec.block_size)
+            for group in self.kv_cache_config.kv_cache_groups
+            if not isinstance(group.kv_cache_spec, EncoderOnlyAttentionSpec)
+        ]
         if self.is_pooling_model:
             model = cast(VllmModelForPooling, self.get_model())
             if hasattr(self.model_config, 'task') and self.model_config.task is not None:
@@ -5831,11 +7554,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             blocks[i] += 1
 
         # Leave space for the output token and draft tokens to propose
-        num_lookahead_tokens = 1
-        if self.speculative_config and self.speculative_config.use_eagle():
-            # Consider the token space for draft tokens to propose
-            # The draft tokens for eagle consumes block table space
-            num_lookahead_tokens += self.speculative_config.num_speculative_tokens
+        num_lookahead_tokens = 1 + self.vllm_config.num_lookahead_tokens
         seq_lengths = [
             min(b * block_size - num_lookahead_tokens, self.max_model_len - num_lookahead_tokens) for b in blocks
         ]
@@ -5898,17 +7617,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         prompt_total_tokens = [capped_ctx * self.block_size + prompt_query_len]
             for _ in range(prompt_bs):
                 for tokens, context_len in zip(prompt_total_tokens, prompt_num_context_blocks):
-                    if self.speculative_config and self.speculative_config.use_eagle():
-                        # Leave the block space for draft tokens to propose
-                        # The draft tokens for eagle consumes block table space
-                        num_speculative_tokens = self.speculative_config.num_speculative_tokens
-                        tokens -= num_speculative_tokens
-                        prompt_query_len -= num_speculative_tokens
+                    scheduled_prompt_query_len = prompt_query_len
+                    num_lookahead_tokens = self.vllm_config.num_lookahead_tokens
+                    if num_lookahead_tokens:
+                        # The profiling bucket already includes the tail in
+                        # which the drafter writes its speculative KV/state.
+                        tokens -= num_lookahead_tokens
+                        scheduled_prompt_query_len -= num_lookahead_tokens
                     self._add_dummy_request(requests,
                                             scheduled_tokens,
                                             num_computed_tokens=(context_len * self.block_size),
                                             total_tokens=tokens,
-                                            scheduled_tokens=prompt_query_len,
+                                            scheduled_tokens=scheduled_prompt_query_len,
                                             is_prompt=True)
         if decode_cfg:
             decode_bs, decode_query_len, decode_num_blocks = decode_cfg
@@ -5974,6 +7694,45 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         )
         self.execute_model(sched_output, warmup_mode=True)
         self.sample_tokens(None)
+        if self.speculative_config is not None and self.speculative_config.use_dflash():
+            # The first pass warms the one-token/prefill target and the DFlash
+            # proposer. Feed its drafts back once so every decode bucket also
+            # captures the K+1 target verification and rollback-state graphs.
+            # Do not read proposer output in compile-only mode: recipe output
+            # storage is intentionally uninitialized. Any in-vocabulary token
+            # exercises the same target verification graph.
+            self._draft_token_ids = None
+            draft_tokens = [0] * self.speculative_config.num_speculative_tokens
+            verify_req_ids = [req.req_id for req in requests if self.requests[req.req_id].output_token_ids]
+            if verify_req_ids:
+                verify_scheduled_tokens = {req_id: 1 + len(draft_tokens) for req_id in verify_req_ids}
+                cached_requests = CachedRequestData(
+                    req_ids=verify_req_ids,
+                    resumed_req_ids=set(),
+                    new_token_ids=[[] for _ in verify_req_ids],
+                    all_token_ids={},
+                    new_block_ids=[None for _ in verify_req_ids],
+                    num_computed_tokens=[
+                        self.requests[req_id].num_computed_tokens + scheduled_tokens[req_id]
+                        for req_id in verify_req_ids
+                    ],
+                    num_output_tokens=[len(self.requests[req_id].output_token_ids) for req_id in verify_req_ids],
+                )
+                verify_output = SchedulerOutput(
+                    scheduled_new_reqs=[],
+                    scheduled_cached_reqs=cached_requests,
+                    num_scheduled_tokens=verify_scheduled_tokens,
+                    total_num_scheduled_tokens=sum(verify_scheduled_tokens.values()),
+                    scheduled_spec_decode_tokens={req_id: draft_tokens
+                                                  for req_id in verify_req_ids},
+                    scheduled_encoder_inputs={},
+                    num_common_prefix_blocks=0,
+                    finished_req_ids=set(),
+                    free_encoder_mm_hashes=[],
+                )
+                self.execute_model(verify_output, warmup_mode=True)
+                self.sample_tokens(None)
+                self._draft_token_ids = None
         self.execute_model(cleanup, warmup_mode=True)
 
     def _generate_profiling(self, prompt_cfg, decode_cfg):
@@ -6465,14 +8224,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         kv_caches = self.kv_caches
 
         if not htorch.utils.internal.is_lazy() and not self.model_config.enforce_eager:
-            multiplier = 5 if self.compile_config.regional_compilation else 1
-            cache_size_limit = 1 + multiplier * (len(self.bucketing_manager.prompt_buckets) +
-                                                 len(self.bucketing_manager.decode_buckets))
-            torch._dynamo.config.cache_size_limit = max(cache_size_limit, torch._dynamo.config.cache_size_limit)
-            # Multiply by 8 to follow the original default ratio between
-            # the cache_size_limit and accumulated_cache_size_limit
-            torch._dynamo.config.accumulated_cache_size_limit = max(cache_size_limit * 8,
-                                                                    torch._dynamo.config.accumulated_cache_size_limit)
+            layers = self._get_model_layers()
+            num_model_layers = len(layers) if layers is not None else 1
+            cache_size_limit = _dynamo_cache_limit(
+                len(self.bucketing_manager.prompt_buckets) + len(self.bucketing_manager.decode_buckets),
+                self.compile_config.regional_compilation,
+                get_config().model_type,
+                num_model_layers,
+            )
+            _configure_dynamo_cache_limits(cache_size_limit)
 
         if self.skip_warmup:
             logger.info("Skipping warmup...")
@@ -6483,6 +8243,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         start_time = time.perf_counter()
 
         use_torch_compile = (not htorch.utils.internal.is_lazy() and not self.model_config.enforce_eager)
+        skip_prompt_graph_warmup = _dsv4_decode_only_compile_enabled(self._get_model_type())
         mm_warmup_outside = gaudi_envs.VLLM_MM_WARMUP_OUTSIDE_COMPILE_ONLY
         if self.supports_mm_inputs and (not use_torch_compile or mm_warmup_outside):
             self.warmup_multimodal_graphs(self.get_model().vision_bucket_manager.multimodal_buckets)
@@ -6498,7 +8259,19 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             logger.warning('Cannot use PT_COMPILE_ONLY_MODE. '
                            'Warmup time will be negatively impacted. '
                            'Please update Gaudi Software Suite.')
-        with compile_only_mode_context() if can_use_compile_only_mode else contextlib.nullcontext():
+        if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+            can_use_compile_only_mode = False
+        if (can_use_compile_only_mode and use_torch_compile and self._get_model_type() == "deepseek_v4"):
+            qnorm_recipe_count = _prewarm_deepseek_v4_qnorm_tpc(self.get_model())
+            if qnorm_recipe_count:
+                logger.info(
+                    "Prewarmed %d DeepSeek V4 qnorm TPC recipe shape(s) "
+                    "before compile-only graph capture",
+                    qnorm_recipe_count,
+                )
+        with (compile_only_mode_context() if can_use_compile_only_mode else
+              contextlib.nullcontext()), _dsv4_compile_only_scope(can_use_compile_only_mode
+                                                                  and self._get_model_type() == "deepseek_v4"):
             if self.supports_mm_inputs and use_torch_compile and not mm_warmup_outside:
                 self.warmup_multimodal_graphs(self.get_model().vision_bucket_manager.multimodal_buckets)
 
@@ -6514,21 +8287,39 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     self.defragmenter.warmup()
 
                 # TODO(kzawora): align_workers
-                mem_post_prompt, prompt_batch_seq, prompt_captured_all = \
-                    self.warmup_graphs(
-                        self.bucketing_manager.prompt_buckets, True, kv_caches)
-                self.log_graph_warmup_summary(self.bucketing_manager.prompt_buckets, True, mem_post_prompt)
+                if skip_prompt_graph_warmup:
+                    logger.warning("Skipping DeepSeek V4 prompt graph warmup; only decode "
+                                   "graphs will be captured. This is an experimental "
+                                   "profiling mode.")
+                else:
+                    mem_post_prompt, prompt_batch_seq, prompt_captured_all = \
+                        self.warmup_graphs(
+                            self.bucketing_manager.prompt_buckets, True, kv_caches)
+                    self.log_graph_warmup_summary(self.bucketing_manager.prompt_buckets, True, mem_post_prompt)
                 if not self.is_pooling_model:
+                    is_dflash = (self.speculative_config is not None and self.speculative_config.use_dflash())
+                    decode_warmup_buckets = _model_warmup_decode_buckets(
+                        self.bucketing_manager,
+                        is_dflash,
+                    )
+                    # _execute_dummy_scenario performs DFlash's second-stage
+                    # K+1 verification for each request-level seed bucket.
+                    # Iterating the generated flattened buckets directly would
+                    # misinterpret B*(K+1) queries as that many requests.
                     mem_post_decode, decode_batch_seq, decode_captured_all = \
                       self.warmup_graphs(
-                          self.bucketing_manager.decode_buckets, False, kv_caches)
-                    self.log_graph_warmup_summary(self.bucketing_manager.decode_buckets, False, mem_post_decode)
+                          decode_warmup_buckets, False, kv_caches)
+                    self.log_graph_warmup_summary(decode_warmup_buckets, False, mem_post_decode)
 
         # Validation warmup: run smallest buckets outside compile-only mode
         # to trigger torch.compile guard specializations for heterogeneous layers
         # (e.g. Llama4 mix of MoE/MLP feed_forward types).
+        skip_validation_warmup = (skip_prompt_graph_warmup and os.getenv("VLLM_HPU_DSV4_SKIP_VALIDATION_WARMUP",
+                                                                         "0").strip().lower() in ("1", "true"))
+        if skip_validation_warmup:
+            logger.warning("Skipping DeepSeek V4 validation warmup by request.")
         if (can_use_compile_only_mode and not self.model_config.enforce_eager and not self.is_pooling_model
-                and self._has_heterogeneous_layers):
+                and self._has_heterogeneous_layers and not skip_validation_warmup):
             logger.info("Running validation warmup to trigger guard specializations...")
             saved_graphed = self.graphed_buckets.copy()
             self.graphed_buckets.clear()
@@ -6543,7 +8334,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # the NEWEST dynamo compilations (which will be selected first at
             # inference) have Synapse recipes for the max seq_len shapes.
             prompt_buckets = self.bucketing_manager.prompt_buckets
-            if prompt_buckets:
+            if prompt_buckets and not skip_prompt_graph_warmup:
                 max_seq_len = max(b[1] for b in prompt_buckets)
                 max_seq_buckets = [b for b in prompt_buckets if b[1] == max_seq_len]
                 logger.info("Validation warmup: %s prompt buckets (seq_len=%s)", len(max_seq_buckets), max_seq_len)
@@ -6735,6 +8526,24 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         for i, attn_backend_map in enumerate(attention_backend_maps):
             self.attn_groups.append(create_attn_groups(attn_backend_map, i))
 
+    def initialize_framework_metadata_builders(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kernel_block_sizes: list[int],
+    ) -> None:
+        kernel_idx = 0
+        for kv_cache_gid, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
+            if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
+                continue
+            kernel_block_size = kernel_block_sizes[kernel_idx]
+            kernel_idx += 1
+            for attn_group in self.attn_groups[kv_cache_gid]:
+                attn_group.create_metadata_builders(
+                    self.vllm_config,
+                    self.device,
+                    kernel_block_size,
+                )
+
     def _kv_cache_spec_attn_group_iterator(self) -> collections.abc.Iterator[AttentionGroup]:
         if not self.kv_cache_config.kv_cache_groups:
             return
@@ -6776,6 +8585,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
+        if gaudi_envs.VLLM_HPU_GDN_ACTIVE_STATE_VIEWS:
+            for module in self.model.modules():
+                if isinstance(module, HpuModelAdapter):
+                    module.invalidate_gdn_state_views()
         self._compact_gdn_group_ids.clear()
         self._compact_gdn_group_offset.clear()
         self._compact_gdn_state_tensors.clear()
@@ -6803,14 +8616,33 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     self.bucketing_manager.block_size = self.block_size
             maybe_set_mamba_kv_cache_groups_ids(self.model, self.kv_cache_config)
         self.initialize_attn_backend(kv_cache_config)
+        kernel_block_sizes: list[int] = []
 
         # Reinitialize the input batch with the correct block sizes for all
         # KV cache groups.  For GDN/linear_attention we additionally compute
         # kernel block sizes; for other hybrid (mamba) models we still need to
         # reinitialize so that MultiGroupBlockTable has one entry per group.
-        #kernel_block_sizes: list[int] = []
-        if self.num_gdn > 0 or self.num_mamba_like_layers > 0:
+        managed_layer_names = {
+            layer_name
+            for group in kv_cache_config.kv_cache_groups
+            for layer_name in group.layer_names if layer_name not in self.runner_only_attn_layers
+        }
+        framework_layout_layer_names = {
+            layer_name
+            for layer_name in managed_layer_names if self.uses_framework_kv_cache_layout(layer_name)
+        }
+        use_framework_kv_cache_layout = bool(framework_layout_layer_names)
+        self.use_framework_kv_cache_layout = use_framework_kv_cache_layout
+        if use_framework_kv_cache_layout and framework_layout_layer_names != managed_layer_names:
+            raise NotImplementedError(
+                "Mixing framework-layout and legacy HPU KV cache layers is not supported: "
+                f"framework={sorted(framework_layout_layer_names)}, all={sorted(managed_layer_names)}")
+
+        kernel_block_sizes: list[int] = []
+        if self.num_gdn > 0 or self.num_mamba_like_layers > 0 or use_framework_kv_cache_layout:
             kernel_block_sizes = prepare_kernel_block_sizes(kv_cache_config, self.attn_groups)
+            if use_framework_kv_cache_layout:
+                self.initialize_framework_metadata_builders(kv_cache_config, kernel_block_sizes)
             self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
 
             kernel_block_size_by_gid: dict[int, int] = {}
@@ -6838,6 +8670,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         elif self.is_encoder_only_attn:
             kernel_block_sizes = []
             self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
+
+        if self.speculative_config is not None and self.speculative_config.use_dflash():
+            self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
         kv_caches: dict[str, torch.Tensor] = {}
         num_blocks = 0
@@ -6882,7 +8717,39 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 mamba_state_cache[key] = tensors
             return tensors
 
-        if self.use_hybrid_cache and self.num_mamba_like_layers > 0:
+        if use_framework_kv_cache_layout:
+            padded_kv_cache_config = self._add_framework_kv_cache_pad_block(kv_cache_config)
+            if htorch.utils.internal.is_lazy():
+                # Upstream allocate_kv_cache creates int8 backing tensors and
+                # reinterprets each layer with view(dtype). The upstream lazy
+                # bridge cannot represent those cross-dtype aliases, so keep
+                # the same logical layout in one typed allocation per layer.
+                kv_caches = {
+                    layer_name:
+                    self.allocate_framework_kv_cache_layer(
+                        self._get_layer_kv_cache_spec(
+                            padded_kv_cache_config,
+                            layer_name,
+                        ),
+                        padded_kv_cache_config.num_blocks,
+                    )
+                    for layer_name in sorted(framework_layout_layer_names)
+                }
+            else:
+                kv_caches = allocate_kv_cache(
+                    padded_kv_cache_config,
+                    self.device,
+                    self.cache_config.get_resolved_kv_cache_layout(),
+                    kernel_block_sizes,
+                )
+            num_blocks = kv_cache_config.num_blocks
+            logger.info(
+                "Allocated framework-layout HPU KV cache for %d layers: "
+                "%d scheduler blocks plus one padding block",
+                len(kv_caches),
+                num_blocks,
+            )
+        elif self.use_hybrid_cache and self.num_mamba_like_layers > 0:
             # Build layer_name -> spec lookup for skipping raw buffer
             # allocation for GDN/linear_attention groups (they use
             # contiguous tensors instead).
@@ -6970,13 +8837,21 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         # GDN/linear_attention: compact allocation.
                         # All GDN groups share the same state tensor, so each
                         # request needs _num_gdn_groups distinct indices.
-                        # Total slots: max_num_reqs * num_gdn_groups + 2
+                        # Total slots also includes one state checkpoint per
+                        # verification token when DFlash2 is active.
                         # (slot 0 unused, last slot for -1 padding).
                         self._compact_gdn_group_ids.add(group_idx)
                         gdn_max_reqs = self._gdn_max_reqs
-                        compact_total = gdn_max_reqs * self._num_gdn_groups + 2
-                        logger.debug("GDN compact tensor: %d slots (max_reqs=%d * groups=%d + 2) vs baseline %d",
-                                     compact_total, gdn_max_reqs, self._num_gdn_groups, num_blocks + 1)
+                        compact_total = (gdn_max_reqs * self._num_gdn_groups * self._gdn_state_slots_per_req + 2)
+                        logger.debug(
+                            "GDN compact tensor: %d slots (max_reqs=%d * groups=%d * checkpoints=%d + 2) "
+                            "vs baseline %d",
+                            compact_total,
+                            gdn_max_reqs,
+                            self._num_gdn_groups,
+                            self._gdn_state_slots_per_req,
+                            num_blocks + 1,
+                        )
                         state_tensors = _mamba_state_tensors(kv_cache_spec, layer_pos, compact_total)
                         kv_caches[layer_name] = state_tensors
                         for state in state_tensors:
@@ -7050,8 +8925,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         # GDN/linear_attention: compact allocation.
                         self._compact_gdn_group_ids.add(group_idx)
                         gdn_max_reqs = self._gdn_max_reqs
-                        compact_total = gdn_max_reqs * self._num_gdn_groups + 2
-                        kv_caches[layer_name] = _mamba_state_tensors(kv_cache_spec, layer_pos, compact_total)
+                        compact_total = (gdn_max_reqs * self._num_gdn_groups * self._gdn_state_slots_per_req + 2)
+                        state_tensors = _mamba_state_tensors(kv_cache_spec, layer_pos, compact_total)
+                        kv_caches[layer_name] = state_tensors
+                        for state in state_tensors:
+                            if not any(state is cached for cached in self._compact_gdn_state_tensors):
+                                self._compact_gdn_state_tensors.append(state)
                     elif isinstance(kv_cache_spec, MambaSpec) and \
                             kv_cache_spec.mamba_type in _GDN_MAMBA_TYPES:
                         # GDN/linear_attention: non-compact (baseline) allocation.
@@ -7150,20 +9029,23 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
                 kv_caches[layer_name] = kv_caches[target_layer_name]
         assert layer_names == set(kv_caches.keys()), "Some layers are not correctly initialized"
-        bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, self.kv_caches)
+        if use_framework_kv_cache_layout:
+            self.bind_framework_kv_caches(kv_caches, self.kv_caches)
+        else:
+            bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, self.kv_caches)
 
         self._set_cache_block_capacity(num_blocks, max_attention_kernel_blocks)
 
         # Initialize the GDN compact slot free-list.
         # The free-list contains base-slot IDs [0..max_num_reqs-1].
-        # For request with base_slot `s` in group `g` (0-indexed within
-        # compact groups), the tensor index is g * max_num_reqs + s + 1.
+        # Each request owns `_gdn_state_slots_per_req` consecutive rows in
+        # every compact group so speculative checkpoints never alias.
         if self._compact_gdn_group_ids:
             self._compact_gdn_group_offset = {gid: i for i, gid in enumerate(sorted(self._compact_gdn_group_ids))}
             gdn_max_reqs = self._gdn_max_reqs
             self._gdn_slot_free_list = list(range(gdn_max_reqs - 1, -1, -1))
             self._gdn_req_to_base_slot.clear()
-            compact_total = gdn_max_reqs * self._num_gdn_groups + 2
+            compact_total = gdn_max_reqs * self._num_gdn_groups * self._gdn_state_slots_per_req + 2
             logger.info("GDN compact: %d groups, %d base_slots, tensor_dim0=%d vs baseline=%d, free_list_len=%d",
                         len(self._compact_gdn_group_ids), gdn_max_reqs, compact_total, num_blocks + 1,
                         len(self._gdn_slot_free_list))
@@ -7212,12 +9094,26 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             kv_cache_config: The KV cache configuration.
             kernel_block_sizes: The kernel block sizes for each KV cache group.
         """
-        block_sizes = [
-            kv_cache_group.kv_cache_spec.block_size for kv_cache_group in kv_cache_config.kv_cache_groups
-            if not isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec)
+        cache_groups = [
+            group for group in kv_cache_config.kv_cache_groups
+            if not isinstance(group.kv_cache_spec, EncoderOnlyAttentionSpec)
         ]
+        block_sizes = [group.kv_cache_spec.block_size for group in cache_groups]
+        block_table_max_model_len = max(self.max_model_len, self.max_encoder_len)
+        max_num_blocks_per_req = [
+            group.kv_cache_spec.max_num_blocks_per_req(self.vllm_config, block_table_max_model_len)
+            for group in cache_groups
+        ]
+        slot_mapping_modes = [
+            SlotMappingMode.NONE if isinstance(group.kv_cache_spec, MambaSpec) else SlotMappingMode.TOKEN_TO_KV_SLOT
+            for group in cache_groups
+        ]
+        default_max_num_blocks = [cdiv(block_table_max_model_len, block_size) for block_size in block_sizes]
+        default_slot_mapping_modes = [SlotMappingMode.TOKEN_TO_KV_SLOT] * len(block_sizes)
 
-        if block_sizes != [self.cache_config.block_size] or kernel_block_sizes != [self.cache_config.block_size]:
+        if (block_sizes != [self.cache_config.block_size] or kernel_block_sizes != [self.cache_config.block_size]
+                or max_num_blocks_per_req != default_max_num_blocks
+                or slot_mapping_modes != default_slot_mapping_modes):
             assert self.vllm_config.offload_config.uva.cpu_offload_gb == 0, (
                 "Cannot re-initialize the input batch when CPU weight "
                 "offloading is enabled. See https://github.com/vllm-project/vllm/pull/18298 "  # noqa: E501
@@ -7231,6 +9127,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 vocab_size=self.model_config.get_vocab_size(),
                 block_sizes=block_sizes,
                 kernel_block_sizes=kernel_block_sizes,
+                max_num_blocks_per_req=max_num_blocks_per_req,
+                slot_mapping_modes=slot_mapping_modes,
                 is_spec_decode=bool(self.vllm_config.speculative_config),
                 logitsprocs=self.input_batch.logitsprocs,
                 is_pooling_model=self.is_pooling_model,
@@ -7322,6 +9220,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         assert getattr(self, "model", None) is not None, \
             "Cannot reload weights before model is loaded."
         model_loader = get_model_loader(self.load_config)
+        if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+            from vllm_gaudi.ops.deepseek_v4_native import invalidate_model
+            invalidate_model(self.model)
         logger.info("Reloading weights inplace...")
         model_loader.load_weights(self.model, model_config=self.model_config)
         torch.hpu.synchronize()
@@ -7357,6 +9258,43 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         if self.speculative_config.method == "ngram":
             assert isinstance(self.drafter, NgramProposer)
             draft_token_ids = self.propose_ngram_draft_token_ids(sampled_token_ids)
+        elif self.speculative_config.use_dflash():
+            if not sampling_metadata.all_greedy:
+                raise NotImplementedError("HPU DFlash2 currently supports greedy sampling only; set temperature=0")
+            draft_parts: list[torch.Tensor] = []
+            if decode_data is not None:
+                assert num_decodes is not None
+                with self.profiler.record_event('internal', "dflash2_proposer_decode"):
+                    draft_parts.append(
+                        self.propose_dflash2_decode(
+                            sampled_token_ids,
+                            hidden_states,
+                            aux_hidden_states,
+                            num_decodes,
+                            decode_data,
+                        ))
+            if prefill_data is not None:
+                assert hidden_states_prefills is not None
+                for idx, (req_ids, _prompt_lens, token_ids, _position_ids, _attn_metadata, _logits_indices,
+                          logits_requests) in enumerate(zip(*shallow_tuple(prefill_data))):
+                    with self.profiler.record_event('internal', "dflash2_proposer_prefill"):
+                        draft_parts.append(
+                            self.propose_dflash2_prefill(
+                                scheduler_output,
+                                sampled_token_ids,
+                                hidden_states_prefills[idx],
+                                aux_hidden_states_prefills[idx] if aux_hidden_states_prefills else None,
+                                req_ids,
+                                logits_requests,
+                                token_ids.shape[1],
+                            ))
+            if not draft_parts:
+                return torch.empty(
+                    (0, self.speculative_config.num_speculative_tokens),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            draft_token_ids = draft_parts[0] if len(draft_parts) == 1 else torch.cat(draft_parts, dim=0)
         elif self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)
 
@@ -7410,6 +9348,289 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 return draft_token_ids.view(-1, 1)  # type: ignore
 
         return draft_token_ids
+
+    def _can_use_dflash2_device_prepare(
+        self,
+        sampled_token_ids: torch.Tensor,
+        num_decodes: int,
+        decode_data: DecodeInputData,
+    ) -> bool:
+        """Qualify the fixed-width, device-resident target-to-draft bridge."""
+        if not gaudi_envs.VLLM_HPU_DFLASH2_DEVICE_PREPARE:
+            return False
+        from vllm_gaudi.v1.spec_decode.hpu_dflash2 import HpuDFlash2Proposer
+
+        if not isinstance(self.drafter, HpuDFlash2Proposer):
+            return False
+        metadata = decode_data.spec_decode_metadata
+        if metadata is None or decode_data.token_ids is None or num_decodes <= 0:
+            return False
+        target_width = self.drafter.num_query_per_req
+        if any(num_draft != target_width - 1 for num_draft in metadata.num_draft_tokens[:num_decodes]):
+            return False
+        if decode_data.token_ids.shape[0] % target_width != 0:
+            return False
+        padded_batch_size = decode_data.token_ids.shape[0] // target_width
+        return (sampled_token_ids.ndim == 2 and sampled_token_ids.shape[0] == padded_batch_size
+                and sampled_token_ids.shape[1] == target_width)
+
+    def _dflash2_resolved_device_block_table(
+        self,
+        group_id: int,
+        padded_batch_size: int,
+        committed_table: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if committed_table is not None:
+            return committed_table
+        block_table = self.input_batch.block_table[group_id]
+        defragmenter = getattr(self, 'defragmenter', None)
+        if defragmenter is None or not defragmenter.enabled:
+            # Defensive fallback for direct tests or callers that did not pass
+            # through _create_decode_input_data.
+            return self._dflash2_commit_block_table_if_changed(group_id, padded_batch_size)
+        resolved = self._resolve_all_blocks(block_table.get_cpu_tensor()[:padded_batch_size].tolist())
+        return async_h2d_copy(torch.tensor(resolved, dtype=torch.int32), device=self.device)
+
+    def _dflash2_commit_block_table_if_changed(
+        self,
+        group_id: int,
+        padded_batch_size: int,
+    ) -> torch.Tensor:
+        """Return a current device table without copying unchanged CPU rows."""
+        block_table = self.input_batch.block_table[group_id]
+        cpu_rows = block_table.get_cpu_tensor()[:padded_batch_size]
+        snapshots = getattr(self, '_dflash2_device_block_table_snapshots', None)
+        if snapshots is None:
+            snapshots = {}
+            self._dflash2_device_block_table_snapshots = snapshots
+
+        snapshot_entry = snapshots.get(group_id)
+        table_identity = id(block_table)
+        changed = snapshot_entry is None or snapshot_entry[0] != table_identity
+        if not changed:
+            snapshot = snapshot_entry[1]
+            changed = (snapshot.shape[0] < padded_batch_size or snapshot.shape[1:] != cpu_rows.shape[1:]
+                       or not torch.equal(snapshot[:padded_batch_size], cpu_rows))
+
+        if changed:
+            # Enqueue only real structural updates.  Placement before Target
+            # execution lets the occasional H2D copy overlap Target, while
+            # steady speculative rounds reuse the persistent device tensor.
+            block_table.commit_block_table(padded_batch_size)
+            snapshots[group_id] = (table_identity, cpu_rows.clone())
+        return block_table.get_device_tensor(padded_batch_size)
+
+    def propose_dflash2_decode_device(
+        self,
+        sampled_token_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        aux_hidden_states: Optional[torch.Tensor],
+        num_decodes: int,
+        decode_data: DecodeInputData,
+    ) -> torch.Tensor:
+        """Queue DFlash2 directly from fixed-width HPU rejection output."""
+        from vllm_gaudi.v1.spec_decode.hpu_dflash2 import HpuDFlash2Proposer
+
+        assert isinstance(self.drafter, HpuDFlash2Proposer)
+        assert decode_data.token_ids is not None
+        target_width = self.drafter.num_query_per_req
+        padded_batch_size = decode_data.token_ids.shape[0] // target_width
+
+        base_positions = torch.zeros(padded_batch_size, dtype=torch.int64)
+        base_positions[:num_decodes] = torch.from_numpy(self.input_batch.num_computed_tokens_cpu[:num_decodes].astype(
+            np.int64, copy=False))
+        active_mask = torch.zeros(padded_batch_size, dtype=torch.bool)
+        active_mask[:num_decodes] = True
+
+        first_blocks = torch.zeros(padded_batch_size, dtype=torch.int64)
+        last_blocks = torch.full((padded_batch_size, ), -1, dtype=torch.int64)
+        for row in range(num_decodes):
+            base = int(base_positions[row])
+            earliest_query_start = base + 1
+            if self.drafter.sliding_window is None:
+                first_position = 0
+            else:
+                first_position = max(0, earliest_query_start - (int(self.drafter.sliding_window) - 1))
+            first_blocks[row] = first_position // self.drafter.block_size
+            last_blocks[row] = (base + target_width - 1) // self.drafter.block_size
+        max_context_blocks = max(int(last_blocks[row] - first_blocks[row] + 1) for row in range(num_decodes))
+
+        block_table = self._dflash2_resolved_device_block_table(
+            self.drafter.kv_cache_gid,
+            padded_batch_size,
+            getattr(decode_data, 'draft_block_table', None),
+        )
+        prepared = self.drafter.prepare_decode_device_inputs(
+            sampled_token_ids,
+            async_h2d_copy(base_positions, device=self.device),
+            block_table,
+            async_h2d_copy(active_mask, device=self.device),
+            async_h2d_copy(first_blocks, device=self.device),
+            async_h2d_copy(last_blocks, device=self.device),
+            self,
+            max_context_blocks,
+        )
+        context_states = self.drafter.combine_context_hidden_states_fixed(
+            hidden_states,
+            aux_hidden_states,
+            padded_batch_size * target_width,
+        )
+        self.drafter.store_context_device(
+            context_states,
+            prepared[1],
+            prepared[2],
+        )
+        return self.drafter.propose_prepared_query_block(prepared, self, num_decodes)
+
+    def propose_dflash2_decode(
+        self,
+        sampled_token_ids: list[list[int]],
+        hidden_states: torch.Tensor,
+        aux_hidden_states: Optional[torch.Tensor],
+        num_decodes: int,
+        decode_data: DecodeInputData,
+    ) -> torch.Tensor:
+        from vllm_gaudi.v1.spec_decode.hpu_dflash2 import HpuDFlash2Proposer
+
+        assert isinstance(self.drafter, HpuDFlash2Proposer)
+        metadata = decode_data.spec_decode_metadata
+        # A request can temporarily run a plain one-token decode (first decode,
+        # scheduler budget pressure, or a boundary step). It still needs a new
+        # DFlash block; only the source row width changes from K+1 to one.
+        target_width = max(metadata.num_draft_tokens) + 1 if metadata is not None else 1
+        active_rows = [row for row in range(num_decodes) if sampled_token_ids[row]]
+        if not active_rows:
+            return torch.full(
+                (num_decodes, self.speculative_config.num_speculative_tokens),
+                -1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+
+        source_indices: list[int] = []
+        context_positions_by_row: list[list[int]] = []
+        query_starts: list[int] = []
+        bonus_token_ids: list[int] = []
+        for row in active_rows:
+            valid_count = len(sampled_token_ids[row])
+            start = int(self.input_batch.num_computed_tokens_cpu[row])
+            source_indices.extend(row * target_width + offset for offset in range(valid_count))
+            context_positions_by_row.append(list(range(start, start + valid_count)))
+            query_starts.append(start + valid_count)
+            bonus_token_ids.append(int(sampled_token_ids[row][-1]))
+
+        source_indices_hpu = async_h2d_copy(torch.tensor(source_indices, dtype=torch.int64), device=self.device)
+        context_states = self.drafter.combine_context_hidden_states(
+            hidden_states,
+            aux_hidden_states,
+            source_indices_hpu,
+        )
+        block_table = self.input_batch.block_table[self.drafter.kv_cache_gid].get_cpu_tensor()
+        context_slot_parts = [
+            self.drafter.make_slot_mapping(block_table, [row], [positions], self).reshape(-1)
+            for row, positions in zip(active_rows, context_positions_by_row)
+        ]
+        context_slots = (context_slot_parts[0] if len(context_slot_parts) == 1 else torch.cat(context_slot_parts))
+        self.drafter.store_context(
+            context_states,
+            [position for positions in context_positions_by_row for position in positions],
+            context_slots,
+        )
+        drafts = self.drafter.propose_query_block(
+            bonus_token_ids,
+            query_starts,
+            block_table,
+            active_rows,
+            self,
+            padded_batch_size=decode_data.token_ids.shape[0] // target_width,
+        )
+        if len(active_rows) == num_decodes:
+            return drafts
+        output = torch.full(
+            (num_decodes, self.speculative_config.num_speculative_tokens),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        active_rows_hpu = async_h2d_copy(torch.tensor(active_rows, dtype=torch.int64), device=self.device)
+        output.index_copy_(0, active_rows_hpu, drafts)
+        return output
+
+    def propose_dflash2_prefill(
+        self,
+        scheduler_output: "SchedulerOutput",
+        sampled_token_ids: list[list[int]],
+        hidden_states: torch.Tensor,
+        aux_hidden_states: Optional[torch.Tensor],
+        req_ids: list[str],
+        logits_requests: list[str],
+        padded_query_len: int,
+    ) -> torch.Tensor:
+        from vllm_gaudi.v1.spec_decode.hpu_dflash2 import HpuDFlash2Proposer
+
+        assert isinstance(self.drafter, HpuDFlash2Proposer)
+        output = torch.full(
+            (len(req_ids), self.speculative_config.num_speculative_tokens),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        if not req_ids:
+            return output
+        multimodal_req_ids = [req_id for req_id in req_ids if self.requests[req_id].mm_features]
+        if multimodal_req_ids:
+            raise NotImplementedError(
+                "HPU DFlash2 currently supports text-only requests; received multimodal inputs for "
+                f"{multimodal_req_ids}")
+
+        block_table = self.input_batch.block_table[self.drafter.kv_cache_gid].get_cpu_tensor()
+        batch_rows = [self.input_batch.req_id_to_index[req_id] for req_id in req_ids]
+        query_lens = [int(scheduler_output.num_scheduled_tokens[req_id]) for req_id in req_ids]
+        starts = [int(self.input_batch.num_computed_tokens_cpu[row]) for row in batch_rows]
+        source_indices = [
+            local_row * padded_query_len + offset for local_row, query_len in enumerate(query_lens)
+            for offset in range(query_len)
+        ]
+        context_positions_by_row = [
+            list(range(start, start + query_len)) for start, query_len in zip(starts, query_lens)
+        ]
+        source_indices_hpu = async_h2d_copy(torch.tensor(source_indices, dtype=torch.int64), device=self.device)
+        context_states = self.drafter.combine_context_hidden_states(
+            hidden_states,
+            aux_hidden_states,
+            source_indices_hpu,
+        )
+        context_slots = torch.cat([
+            self.drafter.make_slot_mapping(block_table, [row], [positions], self).reshape(-1)
+            for row, positions in zip(batch_rows, context_positions_by_row)
+        ])
+        self.drafter.store_context(
+            context_states,
+            [position for positions in context_positions_by_row for position in positions],
+            context_slots,
+        )
+
+        local_by_req = {req_id: local_row for local_row, req_id in enumerate(req_ids)}
+        active_req_ids = [req_id for req_id in logits_requests if req_id in local_by_req]
+        active_local_rows = [local_by_req[req_id] for req_id in active_req_ids]
+        if not active_local_rows:
+            return output
+        active_batch_rows = [batch_rows[row] for row in active_local_rows]
+        query_starts = [starts[row] + query_lens[row] for row in active_local_rows]
+        bonus_token_ids = [
+            int(sampled_token_ids[self.input_batch.req_id_to_index[req_id]][-1]) for req_id in active_req_ids
+        ]
+        drafts = self.drafter.propose_query_block(
+            bonus_token_ids,
+            query_starts,
+            block_table,
+            active_batch_rows,
+            self,
+            padded_batch_size=hidden_states.shape[0] if hidden_states.dim() == 3 else len(req_ids),
+        )
+        active_rows_hpu = async_h2d_copy(torch.tensor(active_local_rows, dtype=torch.int64), device=self.device)
+        output.index_copy_(0, active_rows_hpu, drafts)
+        return output
 
     def propose_eagle_decode(
         self,
@@ -7727,8 +9948,11 @@ class HPUAttentionMetadataProcessor:
 
         len_mask = (torch.arange(0, seq_len, device=device, dtype=torch.int32).view(1, seq_len).ge(
             seq_lens_t.unsqueeze(-1)).view(batch_size, 1, 1, seq_len))
-        causal_mask = torch.triu(torch.ones((batch_size, 1, seq_len, seq_len), device=device, dtype=torch.bool),
-                                 diagonal=1)
+        if prefill_metadata.causal:
+            causal_mask = torch.triu(torch.ones((batch_size, 1, seq_len, seq_len), device=device, dtype=torch.bool),
+                                     diagonal=1)
+        else:
+            causal_mask = torch.zeros((batch_size, 1, seq_len, seq_len), device=device, dtype=torch.bool)
         mask = causal_mask.logical_or(len_mask)
         mask = torch.concat((past_mask, mask), dim=-1)
         attn_bias = (torch.zeros_like(mask, dtype=dtype).masked_fill_(mask, -math.inf))
@@ -7752,7 +9976,7 @@ class HPUAttentionMetadataProcessor:
         Returns:
             Updated attention metadata with window_attn_bias set
         """
-        if (attn_metadata is None or not attn_metadata.is_prompt):
+        if (attn_metadata is None or not attn_metadata.is_prompt or attn_metadata.window_attn_bias is not None):
             return attn_metadata
 
         prefill_metadata = attn_metadata

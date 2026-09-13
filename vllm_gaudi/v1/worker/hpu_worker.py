@@ -30,6 +30,7 @@ from vllm.utils.torch_utils import (STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size, se
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig, KVCacheSpec, MambaSpec)
 from vllm.v1.outputs import (DraftTokenIds, AsyncModelRunnerOutput, ModelRunnerOutput)
 from vllm.v1.worker.utils import bind_kv_cache
+from vllm.v1.worker.workspace import init_workspace_manager
 from vllm_gaudi.extension.bucketing.common import HPUBucketingManager
 from vllm_gaudi.utils import is_fake_hpu
 from vllm_gaudi.v1.worker.hpu_model_runner import (HPUModelRunner, _GDN_MAMBA_TYPES, _rebind_moe_expert_weights)
@@ -116,31 +117,59 @@ class HPUWorker(WorkerBase):
         )
 
     def init_profiler(self):
-        """Initialize the profiler."""
-        torch_profiler_dir = os.getenv('VLLM_TORCH_PROFILER_DIR')
+        """Record profiler configuration without touching Kineto.
+
+        Constructing ``torch.profiler.profile`` before HPU graph warmup changes
+        Dynamo/Synapse graph partitioning.  In particular, mutable custom ops
+        can then fail graph compilation even though the same graph compiles and
+        runs normally without profiling.  Keep profiler construction lazy so
+        graph capture finishes before the /start_profile request arrives.
+        """
+        profiler_config = self.vllm_config.profiler_config
+        legacy_profiler_dir = os.getenv('VLLM_TORCH_PROFILER_DIR')
+        torch_profiler_dir = (legacy_profiler_dir
+                              or (profiler_config.torch_profiler_dir if profiler_config.profiler == 'torch' else None))
+        self.profiler_summary_only = getattr(profiler_config, "torch_profiler_summary_only", False)
+        self.torch_profiler_dir = torch_profiler_dir
+        self.profiler = None
         if torch_profiler_dir:
-            logger.warning("VLLM_TORCH_PROFILER_DIR is deprecated!")
-            torch_profiler_trace_dir = torch_profiler_dir
-            logger.info("Profiling enabled. Traces will be saved to: %s", torch_profiler_trace_dir)
-            if os.getenv('VLLM_PROFILER_ENABLED') == 'full':
-                fn = self.model_runner.profiler.full_trace_handler  # type: ignore[union-attr]
-                with_stack = False
-            else:
-                fn = torch.profiler.tensorboard_trace_handler
-                with_stack = True
-            self.profiler = torch.profiler.profile(activities=[
+            if legacy_profiler_dir:
+                logger.warning("VLLM_TORCH_PROFILER_DIR is deprecated!")
+            logger.info("Profiling enabled. Traces will be saved to: %s", torch_profiler_dir)
+            logger.info("Profiler summary-only mode: %s", self.profiler_summary_only)
+
+    def _create_profiler(self) -> None:
+        if self.profiler is not None:
+            return
+        if not self.torch_profiler_dir:
+            raise RuntimeError("Profiler is not enabled.")
+
+        profiler_config = self.vllm_config.profiler_config
+        if os.getenv('VLLM_PROFILER_ENABLED') == 'full':
+            fn = self.model_runner.profiler.full_trace_handler  # type: ignore[union-attr]
+            with_stack = False
+        else:
+            fn = torch.profiler.tensorboard_trace_handler
+            with_stack = profiler_config.torch_profiler_with_stack
+        trace_handler = (None if self.profiler_summary_only else fn(
+            self.torch_profiler_dir,
+            use_gzip=profiler_config.torch_profiler_use_gzip,
+        ))
+        self.profiler = torch.profiler.profile(
+            activities=[
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.HPU,
             ],
-                                                   with_stack=with_stack,
-                                                   on_trace_ready=fn(torch_profiler_trace_dir, use_gzip=True))
-
-        else:
-            self.profiler = None
+            record_shapes=profiler_config.torch_profiler_record_shapes,
+            profile_memory=profiler_config.torch_profiler_with_memory,
+            with_stack=with_stack,
+            with_flops=profiler_config.torch_profiler_with_flops,
+            on_trace_ready=trace_handler,
+        )
 
     def start_profile(self):
-        if self.profiler is None:
-            raise RuntimeError("Profiler is not enabled.")
+        self._create_profiler()
+        self._write_native_decoder_stats("profile-start")
         high_level_profiler = self.model_runner.profiler  # type: ignore[union-attr]
         with high_level_profiler.record_event('internal', 'start_profiler'):
             # Clean up the queue
@@ -150,23 +179,130 @@ class HPUWorker(WorkerBase):
                 except queue.Empty:
                     break
             self.profiler.start()
+            self._refresh_native_profiler_commands()
 
     def stop_profile(self):
         if self.profiler is None:
             raise RuntimeError("Profiler is not enabled.")
         self.profiler.stop()
+        self._write_profiler_summary()
+        self._write_native_decoder_stats("profile-stop")
+        self._refresh_native_profiler_commands()
+
+    @staticmethod
+    def _refresh_native_profiler_commands():
+        from vllm_gaudi import envs as gaudi_envs
+        if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH or gaudi_envs.VLLM_HPU_DSV41_GRAPH_REPLAY:
+            from vllm_gaudi.ops.tp2_prepared_plan import recapture_native_decoder_programs
+            recapture_native_decoder_programs()
+
+    def _write_native_decoder_stats(self, phase):
+        from vllm_gaudi import envs as gaudi_envs
+        if not (gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH or gaudi_envs.VLLM_HPU_DSV41_GRAPH_REPLAY):
+            return
+        from vllm_gaudi.ops.tp2_prepared_plan import prepared_group_stats
+        import json
+        from pathlib import Path
+        torch.hpu.synchronize()
+        stats = prepared_group_stats()
+        stats.update(rank=self.rank, phase=phase)
+        if self.model_runner is not None:
+            stats["capture_snapshot_bytes"] = sum(
+                decoder.capture_bytes for module in self.model_runner.get_model().modules()
+                if (decoder := getattr(module, "_hpu_native_decoder", None)) is not None)
+            stats["allocated_bytes"] = torch.hpu.memory_allocated()
+            stats["peak_allocated_bytes"] = torch.hpu.max_memory_allocated()
+            if gaudi_envs.VLLM_HPU_DSV41_PREPARED_SHARDS:
+                owner = self.model_runner.model.program.replay_owner
+                stats["capture_snapshot_bytes"] = sum(variant.capture_bytes for variant in owner.variants.values())
+                stats["v41"] = self.model_runner.audit
+                stats["state_bytes"] = self.model_runner.state.allocated_bytes
+                stats["pp"] = {key: getattr(self.model_runner.pp, key) for key in ("sends", "receives", "commits")}
+                if gaudi_envs.VLLM_HPU_DSV41_NATIVE_PP_COPY:
+                    from vllm_gaudi.distributed.tp2_fused_ar_norm import _resolve_runtime
+                    # This target has no GDN state copies; the reused DMA
+                    # backend counters therefore cover only its PP packets.
+                    bridge, _, _ = _resolve_runtime()
+                    stats["pp"]["native_dma_batches_tensors_bytes"] = bridge.gdn_state_dma_counts()
+                host = self.model_runner.model.engram_host
+                stats["engram"] = None if host is None else host.audit
+        logger.info("Native decoder statistics: %s", json.dumps(stats))
+        if self.torch_profiler_dir:
+            destination = Path(self.torch_profiler_dir)
+            destination.mkdir(parents=True, exist_ok=True)
+            (destination / f"rank{self.rank}-native-{phase}.json").write_text(json.dumps(stats, indent=2))
+
+    def _write_profiler_summary(self) -> None:
+        if not self.profiler_summary_only:
+            return
+        averages = self.profiler.key_averages()
+        tables = []
+        for sort_key in (
+                'self_hpu_time_total',
+                'self_device_time_total',
+                'self_cpu_time_total',
+        ):
+            try:
+                tables.append(f"Sorted by {sort_key}\n" + averages.table(sort_by=sort_key, row_limit=200))
+            except (AttributeError, KeyError, RuntimeError) as exc:
+                tables.append(f"Unable to sort by {sort_key}: {exc}")
+        summary_path = os.path.join(
+            self.torch_profiler_dir,
+            f"operator-summary-rank{self.rank}.txt",
+        )
+        os.makedirs(self.torch_profiler_dir, exist_ok=True)
+        with open(summary_path, 'w', encoding='utf-8') as summary_file:
+            summary_file.write('\n\n'.join(tables))
+        logger.info("Profiler operator summary written to %s", summary_path)
 
     def init_device(self):
+        # HCCL is imported before the multiprocessing worker receives its
+        # local rank, so its import-time device selection cannot honor
+        # HABANA_VISIBLE_MODULES. Bind explicitly before the first HPU
+        # allocation to keep each worker on its assigned visible module.
+        device_index = self.local_rank if self.local_rank >= 0 else 0
+        from vllm_gaudi.ops.deepseek_v41_config import is_v41
+        if is_v41(self.vllm_config):
+            modules = os.environ["HABANA_VISIBLE_MODULES"].split(",")
+            if len(modules) != 4 or device_index >= len(modules):
+                raise RuntimeError("V4.1 requires four explicitly assigned HPU modules")
+            os.environ["HLS_MODULE_ID"] = modules[device_index]
+            if "{rank}" in os.environ.get("PT_HPU_RECIPE_CACHE_CONFIG", ""):
+                os.environ["PT_HPU_RECIPE_CACHE_CONFIG"] = os.environ["PT_HPU_RECIPE_CACHE_CONFIG"].replace(
+                    "{rank}", str(self.rank))
+            if os.environ.get("GRAPH_VISUALIZATION") == "1":
+                from pathlib import Path
+                graph_dir = Path(os.environ["GRAPH_VISUALIZATION_DIR"]) / f"rank{self.rank}"
+                graph_dir.mkdir(parents=True, exist_ok=True)
+                os.environ["GRAPH_VISUALIZATION_DIR"] = str(graph_dir)
+                os.environ["PT_HPU_GRAPH_DUMP_PREFIX"] = str(graph_dir)
+        torch.hpu.set_device(device_index)
         self.device = torch.device("hpu")
         # Initialize the distributed environment.
         init_worker_distributed_environment(self.vllm_config, self.rank, self.distributed_init_method, self.local_rank)
         # Set random seed.
         set_random_seed(self.model_config.seed)
+        num_ubatches = 2 if self.parallel_config.enable_dbo else 1
+        init_workspace_manager(self.device, num_ubatches)
         with set_current_vllm_config(self.vllm_config):
-            self.model_runner = HPUModelRunner(vllm_config=self.vllm_config, is_driver_worker=self.is_driver_worker)
+            self.model_runner = self._create_model_runner()
         self.init_profiler()
 
+    def _create_model_runner(self):
+        from vllm_gaudi.ops.deepseek_v41_config import is_v41
+        runner_class = HPUModelRunner
+        if is_v41(self.vllm_config):
+            from vllm_gaudi.v1.worker.deepseek_v41_runner import V41ModelRunner
+            runner_class = V41ModelRunner
+        return runner_class(vllm_config=self.vllm_config, is_driver_worker=self.is_driver_worker)
+
     def shutdown(self):
+        from vllm_gaudi import envs as gaudi_envs
+        if gaudi_envs.VLLM_HPU_TP2_STATIC_GROUP_PLAN:
+            self._write_native_decoder_stats("shutdown")
+            from vllm_gaudi.ops.tp2_prepared_plan import shutdown_prepared_group_plans
+
+            shutdown_prepared_group_plans()
         self._model_runner_stash.clear()
         self._model_runner_state_stash.clear()
         if self.model_runner is not None:
@@ -258,10 +394,7 @@ class HPUWorker(WorkerBase):
                 return
 
             with set_current_vllm_config(vllm_config):
-                self.model_runner = HPUModelRunner(
-                    vllm_config=vllm_config,
-                    is_driver_worker=self.is_driver_worker,
-                )
+                self.model_runner = self._create_model_runner()
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()  # type: ignore[union-attr]
 
@@ -337,7 +470,13 @@ class HPUWorker(WorkerBase):
         kv_cache_spec = self.model_runner.get_kv_cache_spec()  # type: ignore[union-attr]
         single_kv_block_size_bytes = 0
         for layer_name, layer_spec in kv_cache_spec.items():
-            if isinstance(layer_spec, FullAttentionSpec):
+            if self.model_runner.uses_framework_kv_cache_layout(layer_name):
+                kv_caches[layer_name] = self.model_runner.allocate_framework_kv_cache_layer(
+                    layer_spec,
+                    num_blocks=1,
+                )
+                single_kv_block_size_bytes += layer_spec.page_size_bytes
+            elif isinstance(layer_spec, FullAttentionSpec):
                 dtype = layer_spec.dtype
                 if dtype == torch.float8_e4m3fn and os.environ.get('QUANT_CONFIG', None) is not None and \
                     os.environ.get('VLLM_DYNAMIC_KV_QUANT', None) is not None and not self.model_config.use_mla:
@@ -391,7 +530,10 @@ class HPUWorker(WorkerBase):
                 raise NotImplementedError
 
         runner_kv_caches: list[torch.Tensor] = []
-        bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, runner_kv_caches)
+        if kv_caches and all(self.model_runner.uses_framework_kv_cache_layout(name) for name in kv_caches):
+            self.model_runner.bind_framework_kv_caches(kv_caches, runner_kv_caches)
+        else:
+            bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, runner_kv_caches)
 
         if is_fake_hpu():
             fake_hpu_cache_alloc = 4 * 2**30  # take 4 GiB flat on fake hpu
@@ -406,28 +548,54 @@ class HPUWorker(WorkerBase):
         # recipes we will use the extra memory for graphs/blocks
         free_hpu_memory = torch.hpu.mem_get_info()[0]
 
-        try:
-            graph_reserved_mem = (float(os.environ.get('VLLM_GRAPH_RESERVED_MEM', '0.1'))
-                                  if not self.model_config.enforce_eager else 0)
-        except ValueError:
-            graph_reserved_mem = 0.0 if self.model_config.enforce_eager else 0.1
-            logger.warning("Invalid VLLM_GRAPH_RESERVED_MEM value, using default %s", graph_reserved_mem)
-        graph_headroom = 1 - graph_reserved_mem
-        available_hpu_memory = free_hpu_memory * \
-            self.cache_config.gpu_memory_utilization
-        hpu_memory_margin = free_hpu_memory * (1 - self.cache_config.gpu_memory_utilization)
-        self.model_runner.mem_margin = hpu_memory_margin  # type: ignore[union-attr]
-        cache_size_bytes = available_hpu_memory * graph_headroom
-        graph_headroom_bytes = available_hpu_memory * (1 - graph_headroom)
         dummy_block_headroom = single_kv_block_size_bytes
-        msg = (f"Free device memory: {format_bytes(free_hpu_memory)}, "
-               f"{format_bytes(available_hpu_memory)} usable "
-               f"(gpu_memory_utilization={self.cache_config.gpu_memory_utilization}),"
-               f" {format_bytes(graph_headroom_bytes)} reserved for HPUGraphs "
-               f"(VLLM_GRAPH_RESERVED_MEM={graph_reserved_mem}), "
-               f"{format_bytes(dummy_block_headroom)} reserved for KV cache dummy "
-               f"block {format_bytes(cache_size_bytes - dummy_block_headroom)} "
-               "reserved for usable KV cache")
+        explicit_kv_cache_size = self.cache_config.kv_cache_memory_bytes
+        if explicit_kv_cache_size is not None:
+            if explicit_kv_cache_size > free_hpu_memory:
+                raise ValueError("Requested KV cache memory "
+                                 f"({format_bytes(explicit_kv_cache_size)}) exceeds free HPU "
+                                 f"memory after profiling ({format_bytes(free_hpu_memory)}). "
+                                 "Decrease --kv-cache-memory-bytes.")
+            if explicit_kv_cache_size <= dummy_block_headroom:
+                raise ValueError("Requested KV cache memory "
+                                 f"({format_bytes(explicit_kv_cache_size)}) must exceed the "
+                                 "HPU dummy-block reservation "
+                                 f"({format_bytes(dummy_block_headroom)}).")
+
+            # Match core vLLM's explicit-memory contract: an explicit byte
+            # budget takes precedence over gpu_memory_utilization. HPU keeps
+            # one extra padding block outside the scheduler-visible cache, so
+            # subtract that fixed allocation below before returning.
+            cache_size_bytes = int(explicit_kv_cache_size)
+            self.model_runner.mem_margin = max(  # type: ignore[union-attr]
+                0, free_hpu_memory - cache_size_bytes)
+            msg = (f"Free device memory: {format_bytes(free_hpu_memory)}, "
+                   f"using explicit KV cache budget {format_bytes(cache_size_bytes)} "
+                   "(--kv-cache-memory-bytes; gpu_memory_utilization ignored), "
+                   f"{format_bytes(dummy_block_headroom)} reserved for KV cache dummy "
+                   f"block, {format_bytes(cache_size_bytes - dummy_block_headroom)} "
+                   "reserved for usable KV cache")
+        else:
+            try:
+                graph_reserved_mem = (float(os.environ.get('VLLM_GRAPH_RESERVED_MEM', '0.1'))
+                                      if not self.model_config.enforce_eager else 0)
+            except ValueError:
+                graph_reserved_mem = 0.0 if self.model_config.enforce_eager else 0.1
+                logger.warning("Invalid VLLM_GRAPH_RESERVED_MEM value, using default %s", graph_reserved_mem)
+            graph_headroom = 1 - graph_reserved_mem
+            available_hpu_memory = free_hpu_memory * self.cache_config.gpu_memory_utilization
+            hpu_memory_margin = free_hpu_memory * (1 - self.cache_config.gpu_memory_utilization)
+            self.model_runner.mem_margin = hpu_memory_margin  # type: ignore[union-attr]
+            cache_size_bytes = available_hpu_memory * graph_headroom
+            graph_headroom_bytes = available_hpu_memory * (1 - graph_headroom)
+            msg = (f"Free device memory: {format_bytes(free_hpu_memory)}, "
+                   f"{format_bytes(available_hpu_memory)} usable "
+                   f"(gpu_memory_utilization={self.cache_config.gpu_memory_utilization}),"
+                   f" {format_bytes(graph_headroom_bytes)} reserved for HPUGraphs "
+                   f"(VLLM_GRAPH_RESERVED_MEM={graph_reserved_mem}), "
+                   f"{format_bytes(dummy_block_headroom)} reserved for KV cache dummy "
+                   f"block {format_bytes(cache_size_bytes - dummy_block_headroom)} "
+                   "reserved for usable KV cache")
 
         logger.info(msg)
 
@@ -550,12 +718,19 @@ class HPUWorker(WorkerBase):
         self.compile_or_warm_up_model()
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        if self.model_config.hf_config.model_type in ("deepseek_v4", "deepseek_v41"):
+            from vllm_gaudi.ops.deepseek_v4_config import bind_worker_cpu
+            bind_worker_cpu(self.rank)
         # Don't run the warmup if the model is already warmed up
         if not getattr(self.model_runner, 'graphed_buckets', None):
             self.model_runner.warmup_model()  # type: ignore[union-attr]
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
+
+        if self.model_config.hf_config.model_type in ("deepseek_v4", "deepseek_v41"):
+            from vllm_gaudi.ops.deepseek_v4_config import bind_worker_helpers
+            bind_worker_helpers(self.rank)
 
         return CompilationTimes(
             language_model=self.vllm_config.compilation_config.compilation_time,
@@ -598,12 +773,10 @@ class HPUWorker(WorkerBase):
         return self.model_runner.take_draft_token_ids()  # type: ignore[union-attr]
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
-        if self.profiler is None:
-            raise RuntimeError("Profiler is not enabled.")
         if is_start:
-            self.profiler.start()
+            self.start_profile()
         else:
-            self.profiler.stop()
+            self.stop_profile()
 
     def execute_dummy_batch(self) -> None:
         self.model_runner._dummy_run(1)  # type: ignore[union-attr]

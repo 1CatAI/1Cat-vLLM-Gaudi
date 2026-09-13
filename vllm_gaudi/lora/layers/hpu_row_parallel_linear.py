@@ -55,15 +55,15 @@ class HPURowParallelLinearWithShardedLoRA(RowParallelLinearWithShardedLoRA):
 
 
 def register_hpu_lora_layers():
-    """Register HPU LoRA layers in the global lora_utils._all_lora_classes set.
-    
-    This must be called before LoRA model creation to ensure HPU layers
-    are checked before upstream layers.
-    """
-    # Remove the upstream classes first (they use strict type check)
-    lora_utils._all_lora_classes.discard(RowParallelLinearWithLoRA)
-    lora_utils._all_lora_classes.discard(RowParallelLinearWithShardedLoRA)
-
-    # Add HPU-aware classes
-    lora_utils._all_lora_classes.add(HPURowParallelLinearWithLoRA)
-    lora_utils._all_lora_classes.add(HPURowParallelLinearWithShardedLoRA)
+    """Replace upstream wrappers before LoRA model creation, preserving priority."""
+    replacements = {
+        RowParallelLinearWithLoRA: HPURowParallelLinearWithLoRA,
+        RowParallelLinearWithShardedLoRA: HPURowParallelLinearWithShardedLoRA,
+    }
+    # Other HPU wrappers may already have converted the registry to a tuple.
+    registry = lora_utils._all_lora_classes
+    updated = list(dict.fromkeys(replacements.get(cls, cls) for cls in registry))
+    for replacement in replacements.values():
+        if replacement not in updated:
+            updated.append(replacement)
+    lora_utils._all_lora_classes = type(registry)(updated)

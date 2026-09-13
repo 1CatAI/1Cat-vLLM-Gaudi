@@ -1,0 +1,3710 @@
+diff --git a/hcl/include/internal/hccl_tp2_native_graph.h b/hcl/include/internal/hccl_tp2_native_graph.h
+new file mode 100644
+index 0000000..a7101dc
+--- /dev/null
++++ b/hcl/include/internal/hccl_tp2_native_graph.h
+@@ -0,0 +1,103 @@
++#pragma once
++
++#include "hccl_types.h"
++
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct InternalHcclTp2NativeGraph* hcclTp2NativeGraphHandle;
++typedef struct InternalHcclTp2NativeBatch* hcclTp2NativeBatchHandle;
++
++typedef enum
++{
++    hcclTp2NativeGraphCreated = 0,
++    hcclTp2NativeGraphCapturing,
++    hcclTp2NativeGraphInstantiated,
++    hcclTp2NativeGraphInvalid,
++    hcclTp2NativeGraphClosed
++} hcclTp2NativeGraphState;
++
++typedef enum
++{
++    hcclTp2NativeReduction = 0,
++    hcclTp2NativeExchange  = 1
++} hcclTp2NativeMode;
++
++typedef struct
++{
++    uint32_t longSoIndex;
++    uint64_t targetValue;
++} hcclTp2NativeSyncInfo;
++
++typedef struct
++{
++    hcclTp2NativeGraphState state;
++    uint64_t                preparedReplayCount;
++    uint64_t                nativeReplayCount;
++    uint64_t                capturedCommandCount;
++    uint64_t                capturedStreamCount;
++    uint64_t                capturedRelocationCount;
++    uint64_t                dependencyRelocationCount;
++    uint64_t                wqeRelocationCount;
++    uint64_t                externalCompletionAddressRelocationCount;
++    uint64_t                internalCompletionAddressRelocationCount;
++    uint64_t                capturedByteCount;
++    uint64_t                maxStreamBytes;
++    uint64_t                streamCcbBytes;
++    uint64_t                nativeReplayBytes;
++    uint64_t                nativeCcbWrapCount;
++    uint64_t                nativeSubmissionCount;
++    uint64_t                wrapCapturedCommandCount;
++    uint64_t                completionRingSize;
++    uint64_t                nativeWrapReplayCount;
++    hcclTp2NativeSyncInfo   completion;
++} hcclTp2NativeGraphInfo;
++
++hcclResult_t hcclTp2NativeGraphCreate(const void*               sendbuff,
++                                      void*                     recvbuff,
++                                      size_t                    count,
++                                      hcclDataType_t            datatype,
++                                      hcclRedOp_t               reduceOp,
++                                      hcclComm_t                comm,
++                                      void*                     streamHandle,
++                                      hcclTp2NativeMode         mode,
++                                      hcclTp2NativeGraphHandle* graphHandle);
++hcclResult_t hcclTp2NativeGraphCapture(hcclTp2NativeGraphHandle graphHandle);
++
++// Prepared replay is an intermediate qualification path: it reuses the
++// instantiated primitive graph and skips the public HCCL dispatcher, but still
++// regenerates scheduler commands. It is deliberately separate from the final
++// packet-template replay API so it cannot be reported as native replay.
++hcclResult_t hcclTp2NativeGraphReplayPrepared(hcclTp2NativeGraphHandle graphHandle,
++                                             const hcclTp2NativeSyncInfo* dependency,
++                                             hcclTp2NativeSyncInfo*       completion);
++// Per-collective native path: patches dependency/WQE fields and publishes the
++// microstream templates without HcclGraph::submit(). It is not whole-chain replay.
++hcclResult_t hcclTp2NativeGraphReplay(hcclTp2NativeGraphHandle   graphHandle,
++                                     const hcclTp2NativeSyncInfo* dependency,
++                                     hcclTp2NativeSyncInfo*       completion);
++hcclResult_t hcclTp2NativeGraphStage(hcclTp2NativeGraphHandle    graphHandle,
++                                    const hcclTp2NativeSyncInfo* dependency,
++                                    hcclTp2NativeSyncInfo*       completion);
++hcclResult_t hcclTp2NativeGraphSubmit(hcclTp2NativeGraphHandle graphHandle);
++hcclResult_t hcclTp2NativeGraphGetInfo(hcclTp2NativeGraphHandle graphHandle,
++                                      hcclTp2NativeGraphInfo*   graphInfo);
++hcclResult_t hcclTp2NativeGraphDestroy(hcclTp2NativeGraphHandle graphHandle);
++
++// One prepared program per microstream and completion-ring phase. Handles are
++// exclusively leased until batch destruction; no per-node Stage API is used.
++hcclResult_t hcclTp2NativeBatchCreate(const hcclTp2NativeGraphHandle* graphs, size_t count,
++                                     hcclTp2NativeBatchHandle* batch);
++hcclResult_t hcclTp2NativeBatchReplay(hcclTp2NativeBatchHandle batch,
++                                     const hcclTp2NativeSyncInfo* dependencies, size_t count,
++                                     hcclTp2NativeSyncInfo* completions);
++hcclResult_t hcclTp2NativeBatchDestroy(hcclTp2NativeBatchHandle batch);
++
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/hcl/src/CMakeLists.txt b/hcl/src/CMakeLists.txt
+index dc831ca..ed649eb 100644
+--- a/hcl/src/CMakeLists.txt
++++ b/hcl/src/CMakeLists.txt
+@@ -100,11 +100,16 @@ endforeach()
+ 
+ add_library(${TARGET_NAME_SO} SHARED ${SRCS})
+ 
+-file(MAKE_DIRECTORY /usr/lib/habanalabs)
++if(DEFINED ENV{HCL_OUTPUT_DIR} AND NOT "$ENV{HCL_OUTPUT_DIR}" STREQUAL "")
++    set(HCL_OUTPUT_DIR "$ENV{HCL_OUTPUT_DIR}")
++else()
++    set(HCL_OUTPUT_DIR "${CMAKE_BINARY_DIR}/lib")
++endif()
++file(MAKE_DIRECTORY "${HCL_OUTPUT_DIR}")
+ set_target_properties(${TARGET_NAME_SO} PROPERTIES
+     CXX_VISIBILITY_PRESET hidden
+-    LIBRARY_OUTPUT_DIRECTORY /usr/lib/habanalabs
+-    ARCHIVE_OUTPUT_DIRECTORY /usr/lib/habanalabs
++    LIBRARY_OUTPUT_DIRECTORY "${HCL_OUTPUT_DIR}"
++    ARCHIVE_OUTPUT_DIRECTORY "${HCL_OUTPUT_DIR}"
+ )
+ 
+ target_link_libraries(
+@@ -112,7 +117,10 @@ target_link_libraries(
+     $ENV{HCL_LIB_DIR}/libhl_logger.so
+     $ENV{HCL_LIB_DIR}/libhl_gcfg.so
+     $ENV{HCL_LIB_DIR}/libhwloc_embedded.a
+-    $ENV{HCL_LIB_DIR}/libglpk.a
+ )
+ 
+-separate_debug_symbols(${TARGET_NAME_SO})
+\ No newline at end of file
++if(EXISTS "$ENV{HCL_LIB_DIR}/libglpk.a")
++    target_link_libraries(${TARGET_NAME_SO} $ENV{HCL_LIB_DIR}/libglpk.a)
++endif()
++
++separate_debug_symbols(${TARGET_NAME_SO})
+diff --git a/hcl/src/collective_interface/collectives/all_reduce.cpp b/hcl/src/collective_interface/collectives/all_reduce.cpp
+index 4a013e0..35b50f8 100644
+--- a/hcl/src/collective_interface/collectives/all_reduce.cpp
++++ b/hcl/src/collective_interface/collectives/all_reduce.cpp
+@@ -4,6 +4,46 @@
+ #include "collective_interface/hccl_graph.h"
+ #include "collective_interface/prims/simple_prims.h"
+ #include "collective_interface/prims/scaleup_prims.h"
++#include "hcl_global_conf.h"
++#include "hccl/tp2_direct_api_context.h"
++
++static hcclResult_t ar_runTp2ReplicatedReduceScatter(IHcclGraphEngine* engine,
++                                                     HclCollectiveParams& params,
++                                                     bool directNicTransfer,
++                                                     bool directNicReduction)
++{
++    params.m_currentOp = eHCLReduceScatter;
++    params.m_directScaleupNicTransfer = directNicTransfer;
++    params.m_directScaleupNicReduction = directNicReduction;
++    HcclGraph graph(engine, &params);
++    graph.createPrim<HcclPrimReduceScatter>(ReduceScatterPrimArgs {
++        {params.m_sendBufferAddr, params.m_recvBufferAddr, {}, params.m_count},
++        false,
++        true,
++        directNicTransfer,
++        directNicReduction,
++    });
++    return graph.submit();
++}
++
++std::unique_ptr<HcclGraph> ar_createTp2DirectGraph(IHcclGraphEngine* engine,
++                                                  HclCollectiveParams& params,
++                                                  bool directNicReduction)
++{
++    params.m_currentOp = eHCLReduceScatter;
++    params.m_directScaleupNicTransfer = true;
++    params.m_directScaleupNicReduction = directNicReduction;
++    auto graph = std::make_unique<HcclGraph>(engine, &params);
++    graph->createPrim<HcclPrimReduceScatter>(ReduceScatterPrimArgs {
++        {params.m_sendBufferAddr, params.m_recvBufferAddr, {}, params.m_count},
++        false,
++        true,
++        true,
++        directNicReduction,
++    });
++    graph->instantiate();
++    return graph;
++}
+ 
+ hcclResult_t ar_runPairwise(IHcclGraphEngine* engine, HclCollectiveParams& params)
+ {
+@@ -15,6 +55,31 @@ hcclResult_t ar_runPairwise(IHcclGraphEngine* engine, HclCollectiveParams& param
+     const uint64_t countPerRank     = params.m_count / commSize;
+     const uint64_t rankAddrOffset   = countPerRank * dataTypeSizeInBytes(params.m_dataType);
+ 
++    const bool dedicatedDirectRequested = HclGen2::isTp2DedicatedDirectCall();
++    const bool dedicatedExchangeRequested = HclGen2::isTp2DedicatedExchangeCall();
++    const bool directNicExchangeRequested =
++        dedicatedExchangeRequested ||
++        (!dedicatedDirectRequested && GCFG_HCL_TP2_DIRECT_NIC_EXCHANGE.value());
++    const bool directNicRequested =
++        dedicatedDirectRequested || GCFG_HCL_TP2_DIRECT_NIC_RS_AR.value() || directNicExchangeRequested;
++    const bool inPlace = params.m_sendBufferAddr == params.m_recvBufferAddr;
++    const bool useInPlaceStaging = directNicRequested &&
++                                   GCFG_HCL_TP2_DIRECT_INPLACE_STAGING.value() && inPlace;
++    const bool useDirectOutOfPlace = directNicRequested &&
++                                     !GCFG_HCL_TP2_DIRECT_INPLACE_STAGING.value() && !inPlace;
++    const bool useDirectNicExchange = useDirectOutOfPlace && directNicExchangeRequested;
++    const bool useDirectNicReduction = useInPlaceStaging ||
++                                       (useDirectOutOfPlace && !useDirectNicExchange);
++    const bool useDirectNicTransfer = useDirectNicReduction || useDirectNicExchange;
++    const bool validBufferLayout = useDirectNicTransfer || inPlace;
++    if ((GCFG_HCL_TP2_REPLICATED_RS_AR.value() || useDirectNicTransfer) && commSize == 2 &&
++        scaleupGroupSize == 2 && boxesCount == 1 && validBufferLayout && params.m_dataType == hcclBfloat16 &&
++        params.m_reduceOp == hcclSum && params.m_count > 0)
++    {
++        return ar_runTp2ReplicatedReduceScatter(
++            engine, params, useDirectNicTransfer, useDirectNicReduction);
++    }
++
+     {
+         params.m_currentOp = eHCLReduceScatter;
+         HcclGraph graph(engine, &params);
+@@ -105,4 +170,4 @@ hcclResult_t ar_runPairwise(IHcclGraphEngine* engine, HclCollectiveParams& param
+         }
+         return graph.submit();
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/hcl/src/collective_interface/collectives/all_reduce.h b/hcl/src/collective_interface/collectives/all_reduce.h
+index 441e693..617d152 100644
+--- a/hcl/src/collective_interface/collectives/all_reduce.h
++++ b/hcl/src/collective_interface/collectives/all_reduce.h
+@@ -2,6 +2,12 @@
+ #include "hccl_types.h"
+ #include "hcl_collective_params.h"
+ 
++#include <memory>
++
+ class IHcclGraphEngine;
++class HcclGraph;
+ 
+-hcclResult_t ar_runPairwise(IHcclGraphEngine* engine, HclCollectiveParams& params);
+\ No newline at end of file
++hcclResult_t ar_runPairwise(IHcclGraphEngine* engine, HclCollectiveParams& params);
++std::unique_ptr<HcclGraph> ar_createTp2DirectGraph(IHcclGraphEngine* engine,
++                                                  HclCollectiveParams& params,
++                                                  bool directNicReduction);
+diff --git a/hcl/src/collective_interface/hccl_graph.cpp b/hcl/src/collective_interface/hccl_graph.cpp
+index dca4b01..29b47f7 100644
+--- a/hcl/src/collective_interface/hccl_graph.cpp
++++ b/hcl/src/collective_interface/hccl_graph.cpp
+@@ -74,7 +74,7 @@ void HcclGraph::setupExecSets()
+ 
+ hcclResult_t HcclGraph::submit()
+ {
+-    setupExecSets();
++    instantiate();
+     uint64_t startVal = m_graphEngine->initGraph(this);
+     for (size_t j = 0; j < m_completionSets.size(); j++)
+     {
+@@ -91,6 +91,16 @@ hcclResult_t HcclGraph::submit()
+     return hcclSuccess;
+ }
+ 
++void HcclGraph::instantiate()
++{
++    if (m_instantiated)
++    {
++        return;
++    }
++    setupExecSets();
++    m_instantiated = true;
++}
++
+ int HcclGraph::getWaits(bool incRequests)
+ {
+     int oldVal = m_requestedWaits;
+@@ -111,4 +121,4 @@ bool HcclGraph::checkTypeAllocation(BufferType type)
+ void HcclGraph::verifyHandle(const BufferToken& handle)
+ {
+     return bufferGenerator.verifyHandle(handle);
+-}
+\ No newline at end of file
++}
+diff --git a/hcl/src/collective_interface/hccl_graph.h b/hcl/src/collective_interface/hccl_graph.h
+index dcff4f6..9abb315 100644
+--- a/hcl/src/collective_interface/hccl_graph.h
++++ b/hcl/src/collective_interface/hccl_graph.h
+@@ -72,6 +72,8 @@ public:
+      * @return hcclResult_t enum type for submission result
+      */
+     hcclResult_t submit();
++    void         instantiate();
++    bool         instantiated() const { return m_instantiated; }
+ 
+     /**
+      * @brief Create primitive of generic type
+@@ -142,4 +144,5 @@ private:
+ 
+     int m_primCtr        = 0;
+     int m_requestedWaits = 0;
+-};
+\ No newline at end of file
++    bool m_instantiated  = false;
++};
+diff --git a/hcl/src/collective_interface/prims/scaleup_prims.cpp b/hcl/src/collective_interface/prims/scaleup_prims.cpp
+index 424c6c2..4d96187 100644
+--- a/hcl/src/collective_interface/prims/scaleup_prims.cpp
++++ b/hcl/src/collective_interface/prims/scaleup_prims.cpp
+@@ -109,12 +109,20 @@ void HcclPrimBroadcast::updateCounts()
+ }
+ 
+ HcclPrimReduceScatter::HcclPrimReduceScatter(ReduceScatterPrimArgs& args)
+-: HcclScaleupPrim(args.scaleupArg), m_castUp(args.castUp)
++: HcclScaleupPrim(args.scaleupArg),
++  m_castUp(args.castUp),
++  m_replicateInput(args.replicateInput),
++  m_directNicTransfer(args.directNicTransfer || args.directNicReduction),
++  m_directNicReduction(args.directNicReduction)
+ {
+ }
+ 
+ HcclPrimReduceScatter::HcclPrimReduceScatter(ReduceScatterPrimArgs&& args)
+-: HcclScaleupPrim(args.scaleupArg), m_castUp(args.castUp)
++: HcclScaleupPrim(args.scaleupArg),
++  m_castUp(args.castUp),
++  m_replicateInput(args.replicateInput),
++  m_directNicTransfer(args.directNicTransfer || args.directNicReduction),
++  m_directNicReduction(args.directNicReduction)
+ {
+ }
+ 
+@@ -125,19 +133,33 @@ hcclResult_t HcclPrimReduceScatter::process(IHcclGraphEngine* engine)
+ 
+ signalEvents_t HcclPrimReduceScatter::getSignalEvents()
+ {
++    if (m_directNicTransfer)
++    {
++        return {SignalEvent::SCALEUP_SEND, SignalEvent::SCALEUP_RECV};
++    }
+     return {SignalEvent::EDMA_BATCH};
+ }
+ 
+ void HcclPrimReduceScatter::init(HcclGraph* graph, int idx)
+ {
+     HcclScaleupPrim::init(graph, idx);
+-    m_scaleupCountPerRank = div(inputCount(), (uint64_t)m_scaleupGroupSize);
++    if (m_replicateInput)
++    {
++        VERIFY(m_scaleupGroupSize == 2, "Replicated reduce-scatter requires TP2");
++        m_scaleupCountPerRank = inputCount();
++    }
++    else
++    {
++        m_scaleupCountPerRank = div(inputCount(), (uint64_t)m_scaleupGroupSize);
++    }
+ }
+ 
+ void HcclPrimReduceScatter::updateCounts()
+ {
+     m_graph->sendSlice().m_rankScaleOutCount = m_scaleupCountPerRank;  // for edma chunk size
+     m_graph->sendSlice().m_rankScaleUpCount = m_graph->recvSlice().m_rankScaleUpCount = m_scaleupCountPerRank;
+-    m_graph->sendSlice().m_scaleUpStrideCount = m_graph->recvSlice().m_scaleUpStrideCount = m_scaleupCountPerRank;
+-    m_graph->sendSlice().m_boxCount = m_graph->recvSlice().m_boxCount = inputCount();
++    m_graph->sendSlice().m_scaleUpStrideCount = m_graph->recvSlice().m_scaleUpStrideCount =
++        m_replicateInput ? 0 : m_scaleupCountPerRank;
++    m_graph->sendSlice().m_boxCount = m_graph->recvSlice().m_boxCount =
++        m_replicateInput ? inputCount() * m_scaleupGroupSize : inputCount();
+ }
+diff --git a/hcl/src/collective_interface/prims/scaleup_prims.h b/hcl/src/collective_interface/prims/scaleup_prims.h
+index b3e2481..4f5e80b 100644
+--- a/hcl/src/collective_interface/prims/scaleup_prims.h
++++ b/hcl/src/collective_interface/prims/scaleup_prims.h
+@@ -102,6 +102,9 @@ struct ReduceScatterPrimArgs
+ {
+     ScaleupPrimArgs scaleupArg;
+     bool            castUp = false;
++    bool            replicateInput = false;
++    bool            directNicTransfer = false;
++    bool            directNicReduction = false;
+ };
+ 
+ class HcclPrimReduceScatter : public HcclScaleupPrim
+@@ -122,8 +125,14 @@ public:
+ 
+     inline uint64_t getCountPerRank() { return m_scaleupCountPerRank; }
+     inline bool     castUp() const { return m_castUp; }
++    inline bool     replicateInput() const { return m_replicateInput; }
++    inline bool     directNicTransfer() const { return m_directNicTransfer; }
++    inline bool     directNicReduction() const { return m_directNicReduction; }
+ 
+ private:
+     uint64_t m_scaleupCountPerRank = 0;
+     bool     m_castUp              = false;
+-};
+\ No newline at end of file
++    bool     m_replicateInput      = false;
++    bool     m_directNicTransfer   = false;
++    bool     m_directNicReduction  = false;
++};
+diff --git a/hcl/src/hccl/hccl.cpp b/hcl/src/hccl/hccl.cpp
+index cb2a6ef..c682726 100644
+--- a/hcl/src/hccl/hccl.cpp
++++ b/hcl/src/hccl/hccl.cpp
+@@ -15,6 +15,7 @@
+ #include <common/shim_typedefs.h>  // for PFN_ShimFinish, PFN...
+ #include <dlfcn.h>                 // for dlclose, dlsym, dle...
+ #include <climits>                 // for INT_MAX
++#include <algorithm>
+ #include <cstdlib>                 // for getenv
+ #include <cstring>                 // for strcmp
+ #include <memory>                  // for shared_ptr
+@@ -22,6 +23,7 @@
+ #include <mutex>                   // for mutx, unique_lock
+ #include <atomic>
+ #include <condition_variable>
++#include <cstdio>
+ 
+ #include "common/shim_types.h"       // for SHIM_API_HCCL, SHIM...
+ #include "dfa_defines.hpp"           // for DfaErrorCode, DfaEr...
+@@ -36,13 +38,205 @@
+ #include "hcl_utils.h"               // for HCL_API_LOG_ENTRY
+ #include "hccl_api_inc.h"            // for HCCL_* macros
+ #include "internal/hccl_internal.h"  // for hcclDFA, hcclDestro...
++#include "internal/hccl_tp2_native_graph.h"
+ #include "hcl_log_manager.h"         // for LOG_ERR, LOG_DEBUG
+ #include "hccl_gen2_impl.h"          // for Gen2 hccl impl under HclGen2
++#include "hccl/tp2_direct_api_context.h"
+ #include "hccl_wrapper.h"            // for hccl*_Wrapper
+ #include "fault_tolerance_inc.h"     // for HLFT.* macros
++#include "collective_interface/collectives/all_reduce.h"
++#include "platform/gen2_arch_common/hccl_device.h"
++
++#include <mutex>
+ 
+ struct HCL_Request;
+ 
++struct InternalHcclTp2NativeGraph
++{
++    enum class ReplayPath
++    {
++        None,
++        Prepared,
++        Native
++    };
++
++    InternalHcclTp2NativeGraph(hccl_communicator*                  communicatorIn,
++                               HclCollectiveRoutinesGen2Arch*      routinesIn,
++                               HclDynamicCommunicator&             dynamicComm,
++                               const void*                         sendbuff,
++                               void*                               recvbuff,
++                               size_t                              count,
++                               hcclDataType_t                      datatype,
++                               hcclRedOp_t                         reduceOp,
++                               void*                               streamHandleIn,
++                               hcclTp2NativeMode                   modeIn,
++                               uint8_t                             apiId)
++    : communicator(communicatorIn),
++      routines(routinesIn),
++      params(eHCLAllReduce,
++             streamHandleIn,
++             reinterpret_cast<uint64_t>(sendbuff),
++             reinterpret_cast<uint64_t>(recvbuff),
++             count,
++             datatype,
++             dynamicComm,
++             apiId,
++             eHCCLAPICall,
++             reduceOp),
++      streamHandle(streamHandleIn),
++      mode(modeIn)
++    {
++    }
++
++    hccl_communicator*                              communicator = nullptr;
++    HclCollectiveRoutinesGen2Arch*                  routines     = nullptr;
++    HclCollectiveParams                             params;
++    std::unique_ptr<HcclGraph>                      graph;
++    HclDeviceControllerGen2Arch::NativeGraphCapture capture;
++    HclDeviceControllerGen2Arch::NativeGraphCapture wrapCapture;
++    void*                                           streamHandle = nullptr;
++    hcclTp2NativeMode                               mode = hcclTp2NativeReduction;
++    hcclTp2NativeGraphState                         state = hcclTp2NativeGraphCreated;
++    uint64_t                                        preparedReplayCount = 0;
++    uint64_t                                        nativeReplayCount = 0;
++    uint64_t                                        nativeWrapReplayCount = 0;
++    bool                                            nativeRelocationsValidated = false;
++    bool                                            batchOwned = false;
++    uint64_t                                        completionRingSize = 0;
++    HclDeviceControllerGen2Arch::NativeReplayCounters captureCounters;
++    HclDeviceControllerGen2Arch::NativeGraphCapture   diagnosticPreparedCapture;
++    bool                                              diagnosticPreparedCaptureValid = false;
++    uint64_t                                          diagnosticPreparedExecution = 0;
++    ReplayPath                                      replayPath = ReplayPath::None;
++    std::mutex                                      mutex;
++};
++
++struct InternalHcclTp2NativeBatch
++{
++    struct Phase
++    {
++        std::vector<const HclDeviceControllerGen2Arch::NativeGraphCapture*> captures;
++        HclDeviceControllerGen2Arch::NativeBatchProgram program;
++    };
++    std::vector<hcclTp2NativeGraphHandle> graphs;
++    std::vector<Phase> phases;
++    std::vector<hcl::NativeHclReplayState> states;
++    std::vector<hcl::syncInfo> dependencies, completions;
++    bool valid = true;
++    std::mutex mutex;
++};
++
++static void dumpNativeCaptureDiff(
++    const HclDeviceControllerGen2Arch::NativeGraphCapture& captured,
++    const HclDeviceControllerGen2Arch::NativeGraphCapture& prepared,
++    uint64_t                                                fromExecution,
++    uint64_t                                                toExecution)
++{
++    std::fprintf(stderr,
++                 "NATIVE_HCL_DIFF summary executions=%llu->%llu streams=%zu/%zu commands=%zu/%zu "
++                 "targets=%llu,%llu/%llu,%llu "
++                 "completion_addresses=0x%x,0x%x/0x%x,0x%x\n",
++                 static_cast<unsigned long long>(fromExecution),
++                 static_cast<unsigned long long>(toExecution),
++                 captured.streams.size(),
++                 prepared.streams.size(),
++                 captured.commandCount(),
++                 prepared.commandCount(),
++                 static_cast<unsigned long long>(captured.externalTargetDelta),
++                 static_cast<unsigned long long>(captured.internalTargetDelta),
++                 static_cast<unsigned long long>(prepared.externalTargetDelta),
++                 static_cast<unsigned long long>(prepared.internalTargetDelta),
++                 captured.capturedExternalCompletionAddress,
++                 captured.capturedInternalCompletionAddress,
++                 prepared.capturedExternalCompletionAddress,
++                 prepared.capturedInternalCompletionAddress);
++    size_t differences = 0;
++    constexpr size_t maxPrintedDifferences = 512;
++    for (const auto& oldStream : captured.streams)
++    {
++        const auto newStream = std::find_if(
++            prepared.streams.begin(), prepared.streams.end(), [&](const auto& candidate) {
++                return candidate.streamIndex == oldStream.streamIndex;
++            });
++        if (newStream == prepared.streams.end())
++        {
++            std::fprintf(stderr,
++                         "NATIVE_HCL_DIFF missing_stream stream=%u\n",
++                         static_cast<unsigned>(oldStream.streamIndex));
++            continue;
++        }
++        std::fprintf(stderr,
++                     "NATIVE_HCL_DIFF stream=%u commands=%zu/%zu relocations=%zu/%zu\n",
++                     static_cast<unsigned>(oldStream.streamIndex),
++                     oldStream.commandTemplate.commands.size(),
++                     newStream->commandTemplate.commands.size(),
++                     oldStream.commandTemplate.relocations.size(),
++                     newStream->commandTemplate.relocations.size());
++        const size_t commands = std::min(oldStream.commandTemplate.commands.size(),
++                                         newStream->commandTemplate.commands.size());
++        for (size_t commandIndex = 0; commandIndex < commands; ++commandIndex)
++        {
++            const auto& oldBytes = oldStream.commandTemplate.commands[commandIndex].bytes;
++            const auto& newBytes = newStream->commandTemplate.commands[commandIndex].bytes;
++            if (oldBytes.size() != newBytes.size())
++            {
++                std::fprintf(stderr,
++                             "NATIVE_HCL_DIFF size stream=%u command=%zu bytes=%zu/%zu\n",
++                             static_cast<unsigned>(oldStream.streamIndex),
++                             commandIndex,
++                             oldBytes.size(),
++                             newBytes.size());
++            }
++            const size_t bytes = std::min(oldBytes.size(), newBytes.size());
++            for (size_t offset = 0; offset < bytes; offset += sizeof(uint32_t))
++            {
++                const size_t width = std::min(sizeof(uint32_t), bytes - offset);
++                uint32_t oldWord = 0;
++                uint32_t newWord = 0;
++                std::memcpy(&oldWord, oldBytes.data() + offset, width);
++                std::memcpy(&newWord, newBytes.data() + offset, width);
++                if (oldWord == newWord)
++                {
++                    continue;
++                }
++                if (differences < maxPrintedDifferences)
++                {
++                    std::fprintf(stderr,
++                                 "NATIVE_HCL_DIFF word stream=%u command=%zu offset=%zu old=0x%08x "
++                                 "new=0x%08x xor=0x%08x\n",
++                                 static_cast<unsigned>(oldStream.streamIndex),
++                                 commandIndex,
++                                 offset,
++                                 oldWord,
++                                 newWord,
++                                 oldWord ^ newWord);
++                    for (const auto& relocation : oldStream.commandTemplate.relocations)
++                    {
++                        const size_t relocationBegin = relocation.byteOffset;
++                        const size_t relocationEnd = relocation.byteOffset + relocation.width;
++                        if (relocation.commandIndex == commandIndex && relocationBegin < offset + width &&
++                            relocationEnd > offset)
++                        {
++                            std::fprintf(stderr,
++                                         "NATIVE_HCL_DIFF relocation stream=%u command=%zu offset=%u width=%u "
++                                         "mask=0x%llx kind=%u\n",
++                                         static_cast<unsigned>(oldStream.streamIndex),
++                                         commandIndex,
++                                         relocation.byteOffset,
++                                         static_cast<unsigned>(relocation.width),
++                                         static_cast<unsigned long long>(relocation.mask),
++                                         static_cast<unsigned>(relocation.kind));
++                        }
++                    }
++                }
++                ++differences;
++            }
++        }
++    }
++    std::fprintf(stderr, "NATIVE_HCL_DIFF total_changed_words=%zu\n", differences);
++    std::fflush(stderr);
++}
++
+ // ------------------------------------------------------------------------------------------------
+ // Global context singleton objects.
+ //
+@@ -523,6 +717,45 @@ static void HCCL_StopShim(void)
+ namespace HclGen2
+ {
+ 
++namespace
++{
++enum class Tp2DedicatedMode
++{
++    none,
++    reduction,
++    exchange,
++};
++
++thread_local Tp2DedicatedMode s_tp2DedicatedMode = Tp2DedicatedMode::none;
++
++class ScopedTp2DedicatedDirectCall
++{
++public:
++    explicit ScopedTp2DedicatedDirectCall(Tp2DedicatedMode mode) : m_previous(s_tp2DedicatedMode)
++    {
++        s_tp2DedicatedMode = mode;
++    }
++
++    ~ScopedTp2DedicatedDirectCall()
++    {
++        s_tp2DedicatedMode = m_previous;
++    }
++
++private:
++    Tp2DedicatedMode m_previous;
++};
++}  // namespace
++
++bool isTp2DedicatedDirectCall()
++{
++    return s_tp2DedicatedMode != Tp2DedicatedMode::none;
++}
++
++bool isTp2DedicatedExchangeCall()
++{
++    return s_tp2DedicatedMode == Tp2DedicatedMode::exchange;
++}
++
+ hcclResult_t HCCL_API_CALL hcclGetVersion_impl(int* version)
+ {
+     HCL_API_LOG_ENTRY("(&version={:p})", (void*)version);
+@@ -723,6 +956,52 @@ hcclResult_t HCCL_API_CALL hcclAllReduce_impl(const void*     sendbuff,
+                  ->pfn_hcclAllReduce)(sendbuff, recvbuff, count, datatype, reduceOp, comm, stream_handle);
+ }
+ 
++hcclResult_t HCCL_API_CALL hcclTp2DirectAllReduce_impl(const void*     sendbuff,
++                                                       void*           recvbuff,
++                                                       size_t          count,
++                                                       hcclDataType_t  datatype,
++                                                       hcclRedOp_t     reduceOp,
++                                                       hcclComm_t      comm,
++                                                       synStreamHandle stream_handle)
++{
++    if (!GCFG_HCL_TP2_DEDICATED_DIRECT_API.value() || sendbuff == recvbuff || datatype != hcclBfloat16 ||
++        reduceOp != hcclSum || count == 0)
++    {
++        return hcclInvalidArgument;
++    }
++    const uint64_t maxCount = GCFG_HCL_TP2_DIRECT_MAX_COUNT.value();
++    if (maxCount > 0 && count > maxCount)
++    {
++        return hcclInvalidArgument;
++    }
++
++    ScopedTp2DedicatedDirectCall scope(Tp2DedicatedMode::reduction);
++    return hcclAllReduce_impl(sendbuff, recvbuff, count, datatype, reduceOp, comm, stream_handle);
++}
++
++hcclResult_t HCCL_API_CALL hcclTp2DirectExchange_impl(const void*     sendbuff,
++                                                      void*           recvbuff,
++                                                      size_t          count,
++                                                      hcclDataType_t  datatype,
++                                                      hcclRedOp_t     reduceOp,
++                                                      hcclComm_t      comm,
++                                                      synStreamHandle stream_handle)
++{
++    if (!GCFG_HCL_TP2_DEDICATED_DIRECT_API.value() || sendbuff == recvbuff || datatype != hcclBfloat16 ||
++        reduceOp != hcclSum || count == 0)
++    {
++        return hcclInvalidArgument;
++    }
++    const uint64_t maxCount = GCFG_HCL_TP2_DIRECT_MAX_COUNT.value();
++    if (maxCount > 0 && count > maxCount)
++    {
++        return hcclInvalidArgument;
++    }
++
++    ScopedTp2DedicatedDirectCall scope(Tp2DedicatedMode::exchange);
++    return hcclAllReduce_impl(sendbuff, recvbuff, count, datatype, reduceOp, comm, stream_handle);
++}
++
+ hcclResult_t HCCL_API_CALL hcclReduce_impl(const void*     sendbuff,
+                                            void*           recvbuff,
+                                            size_t          count,
+@@ -1109,3 +1388,647 @@ hcclResult_t HCCL_API_CALL hcclDeviceInit_impl(void* device, void* context)
+ }
+ 
+ }  // namespace HclGen2
++
++extern "C" hcclResult_t HCCL_API_CALL hcclTp2DirectAllReduce(const void*     sendbuff,
++                                                              void*           recvbuff,
++                                                              size_t          count,
++                                                              hcclDataType_t  datatype,
++                                                              hcclRedOp_t     reduceOp,
++                                                              hcclComm_t      comm,
++                                                              synStreamHandle stream_handle)
++{
++    return HclGen2::hcclTp2DirectAllReduce_impl(
++        sendbuff, recvbuff, count, datatype, reduceOp, comm, stream_handle);
++}
++
++extern "C" hcclResult_t HCCL_API_CALL hcclTp2DirectExchange(const void*     sendbuff,
++                                                            void*           recvbuff,
++                                                            size_t          count,
++                                                            hcclDataType_t  datatype,
++                                                            hcclRedOp_t     reduceOp,
++                                                            hcclComm_t      comm,
++                                                            synStreamHandle stream_handle)
++{
++    return HclGen2::hcclTp2DirectExchange_impl(
++        sendbuff, recvbuff, count, datatype, reduceOp, comm, stream_handle);
++}
++
++extern "C" hcclResult_t HCCL_API_CALL hcclTp2NativeGraphCreate(
++    const void*               sendbuff,
++    void*                     recvbuff,
++    size_t                    count,
++    hcclDataType_t            datatype,
++    hcclRedOp_t               reduceOp,
++    hcclComm_t                comm,
++    void*                     streamHandle,
++    hcclTp2NativeMode         mode,
++    hcclTp2NativeGraphHandle* graphHandle)
++{
++    if (graphHandle == nullptr || sendbuff == nullptr || recvbuff == nullptr || sendbuff == recvbuff || count == 0 ||
++        datatype != hcclBfloat16 || reduceOp != hcclSum ||
++        (mode != hcclTp2NativeReduction && mode != hcclTp2NativeExchange) || streamHandle == nullptr ||
++        !GCFG_HCL_TP2_DEDICATED_DIRECT_API.value())
++    {
++        return hcclInvalidArgument;
++    }
++    *graphHandle = nullptr;
++
++    const uint64_t maxCount = GCFG_HCL_TP2_DIRECT_MAX_COUNT.value();
++    if (maxCount > 0 && count > maxCount)
++    {
++        return hcclInvalidArgument;
++    }
++
++    auto* communicator = hccl_ctx.communicator(comm);
++    if (communicator == nullptr || communicator->getDynamicComm() == nullptr || communicator->getCommSize() != 2 ||
++        communicator->getDynamicComm()->getScaleupGroupSize() != 2)
++    {
++        return hcclInvalidArgument;
++    }
++
++    try
++    {
++        const uint32_t streamId = hccl_device().nativeStreamId(streamHandle);
++        HclCollectiveRoutinesGen2Arch* routines = hccl_device().nativeCollectiveRoutines(streamId);
++        if (routines == nullptr)
++        {
++            return hcclInvalidUsage;
++        }
++
++        auto* handle = new InternalHcclTp2NativeGraph(communicator,
++                                                       routines,
++                                                       *communicator->getDynamicComm(),
++                                                       sendbuff,
++                                                       recvbuff,
++                                                       count,
++                                                       datatype,
++                                                       reduceOp,
++                                                       streamHandle,
++                                                       mode,
++                                                       hccl_ctx.generateApiId());
++        handle->graph = ar_createTp2DirectGraph(
++            routines, handle->params, mode == hcclTp2NativeReduction);
++        if (handle->graph == nullptr || !handle->graph->instantiated())
++        {
++            delete handle;
++            return hcclInternalError;
++        }
++        *graphHandle = handle;
++        return hcclSuccess;
++    }
++    catch (...)
++    {
++        return hcclInternalError;
++    }
++}
++
++extern "C" hcclResult_t HCCL_API_CALL hcclTp2NativeGraphCapture(hcclTp2NativeGraphHandle graphHandle)
++{
++    if (graphHandle == nullptr)
++    {
++        return hcclInvalidArgument;
++    }
++
++    std::lock_guard<std::mutex> lock(graphHandle->mutex);
++    if (graphHandle->state != hcclTp2NativeGraphCreated)
++    {
++        return hcclInvalidUsage;
++    }
++
++    const hcclResult_t syncStatus =
++        syncHCLStreamHandle(reinterpret_cast<synStreamHandle>(graphHandle->streamHandle));
++    if (syncStatus != hcclSuccess)
++    {
++        graphHandle->state = hcclTp2NativeGraphInvalid;
++        return syncStatus;
++    }
++
++    bool forcedBufferAddressRefresh = false;
++    try
++    {
++        // The first execution installs NIC collective context and emits two
++        // one-time scheduler commands.  Those commands are valid cold-path
++        // setup, but they are not a replayable steady-state template.
++        graphHandle->communicator->incCollectiveCtr();
++        graphHandle->params.m_apiId = hccl_ctx.generateApiId();
++        const hcclResult_t warmupStatus = graphHandle->graph->submit();
++        if (warmupStatus != hcclSuccess)
++        {
++            graphHandle->state = hcclTp2NativeGraphInvalid;
++            return warmupStatus;
++        }
++        // A second Synapse stream sync does not create a new dependency when
++        // no compute was added to the stream.  Use the completed cold HCL
++        // epoch as the capture-time placeholder instead.  Its long-SO fields
++        // are relocation sites and are replaced with the current compute
++        // completion on every native replay.
++        graphHandle->routines->nativeWaitOn(graphHandle->routines->nativeCompletion());
++
++        graphHandle->communicator->incCollectiveCtr();
++        graphHandle->params.m_apiId = hccl_ctx.generateApiId();
++        graphHandle->state = hcclTp2NativeGraphCapturing;
++        // Each fixed-buffer template installs its own send/receive address
++        // MSB. Keep synchronization fields on their real completion phase.
++        graphHandle->routines->setNativeScaleupBufferAddressRefresh(true);
++        forcedBufferAddressRefresh = true;
++        graphHandle->routines->beginNativeCapture();
++        const hcclResult_t status = graphHandle->graph->submit();
++        graphHandle->routines->setNativeScaleupBufferAddressRefresh(false);
++        forcedBufferAddressRefresh = false;
++        if (status != hcclSuccess)
++        {
++            graphHandle->routines->cancelNativeCapture();
++            graphHandle->state = hcclTp2NativeGraphInvalid;
++            return status;
++        }
++        graphHandle->capture = graphHandle->routines->endNativeCapture();
++        if (graphHandle->capture.commandCount() == 0)
++        {
++            graphHandle->state = hcclTp2NativeGraphInvalid;
++            return hcclInternalError;
++        }
++
++        // Reusing the first completion-SO slot requires a transient NIC
++        // collective-context update on both scale-up streams.  Capture that
++        // boundary shape once on the cold path as a second native template.
++        // Intermediate executions are ordinary instantiation work; replay
++        // never calls HcclGraph::submit().
++        graphHandle->completionRingSize = graphHandle->routines->nativeCompletionRingSize();
++        const uint64_t currentTarget = graphHandle->routines->nativeCompletion().targetValue;
++        if (graphHandle->completionRingSize < 2 || currentTarget == 0)
++        {
++            graphHandle->state = hcclTp2NativeGraphInvalid;
++            return hcclInternalError;
++        }
++        const uint64_t position = (currentTarget - 1) % graphHandle->completionRingSize;
++        const uint64_t executionsToWrap = graphHandle->completionRingSize - position;
++        for (uint64_t execution = 1; execution <= executionsToWrap; ++execution)
++        {
++            graphHandle->routines->nativeWaitOn(graphHandle->routines->nativeCompletion());
++            const bool captureWrap = execution == executionsToWrap;
++            if (captureWrap)
++            {
++                graphHandle->routines->setNativeScaleupBufferAddressRefresh(true);
++                forcedBufferAddressRefresh = true;
++                graphHandle->routines->beginNativeCapture();
++            }
++            graphHandle->communicator->incCollectiveCtr();
++            graphHandle->params.m_apiId = hccl_ctx.generateApiId();
++            const hcclResult_t wrapStatus = graphHandle->graph->submit();
++            if (captureWrap)
++            {
++                graphHandle->routines->setNativeScaleupBufferAddressRefresh(false);
++                forcedBufferAddressRefresh = false;
++            }
++            if (wrapStatus != hcclSuccess)
++            {
++                if (captureWrap)
++                {
++                    graphHandle->routines->cancelNativeCapture();
++                }
++                graphHandle->state = hcclTp2NativeGraphInvalid;
++                return wrapStatus;
++            }
++            if (captureWrap)
++            {
++                graphHandle->wrapCapture = graphHandle->routines->endNativeCapture();
++            }
++        }
++        if (!graphHandle->wrapCapture.validate() ||
++            graphHandle->wrapCapture.commandCount() < graphHandle->capture.commandCount() ||
++            graphHandle->wrapCapture.externalTargetDelta != graphHandle->capture.externalTargetDelta ||
++            graphHandle->wrapCapture.internalTargetDelta != graphHandle->capture.internalTargetDelta)
++        {
++            graphHandle->state = hcclTp2NativeGraphInvalid;
++            return hcclInternalError;
++        }
++
++        for (const auto* candidate : {&graphHandle->capture, &graphHandle->wrapCapture})
++        {
++            const size_t targets = candidate->relocationCount(hcl::NativeHclRelocationKind::DEPENDENCY_TARGET);
++            const size_t indexes = candidate->relocationCount(hcl::NativeHclRelocationKind::DEPENDENCY_LONG_SO_INDEX);
++            const size_t notify = candidate->relocationCount(hcl::NativeHclRelocationKind::WQE_NOTIFY);
++            const size_t wait = candidate->relocationCount(hcl::NativeHclRelocationKind::WQE_WAIT);
++            if (!candidate->executableValidated || targets == 0 || targets % 4 != 0 ||
++                indexes * 4 != targets || notify == 0 || notify != wait)
++            {
++                graphHandle->state = hcclTp2NativeGraphInvalid;
++                return hcclInternalError;
++            }
++        }
++        graphHandle->nativeRelocationsValidated = true;
++        graphHandle->captureCounters = graphHandle->routines->nativeReplayCounters(graphHandle->capture);
++        const char* diagnostics = std::getenv("HCL_TP2_NATIVE_REPLAY_DIAGNOSTICS");
++        if (diagnostics != nullptr && std::strcmp(diagnostics, "1") == 0)
++        {
++            std::fprintf(stderr,
++                         "NATIVE_HCL_CAPTURE commands=%zu/%zu streams=%zu ring=%llu dependency=%zu/%zu "
++                         "wqe=%zu/%zu completion_addresses=%zu/%zu\n",
++                         graphHandle->capture.commandCount(),
++                         graphHandle->wrapCapture.commandCount(),
++                         graphHandle->capture.streams.size(),
++                         static_cast<unsigned long long>(graphHandle->completionRingSize),
++                         graphHandle->capture.relocationCount(hcl::NativeHclRelocationKind::DEPENDENCY_TARGET),
++                         graphHandle->capture.relocationCount(
++                             hcl::NativeHclRelocationKind::DEPENDENCY_LONG_SO_INDEX),
++                         graphHandle->capture.relocationCount(hcl::NativeHclRelocationKind::WQE_NOTIFY),
++                         graphHandle->capture.relocationCount(hcl::NativeHclRelocationKind::WQE_WAIT),
++                         graphHandle->capture.relocationCount(
++                             hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS),
++                         graphHandle->capture.relocationCount(
++                             hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_ADDRESS));
++            std::fflush(stderr);
++        }
++        graphHandle->state = hcclTp2NativeGraphInstantiated;
++        return hcclSuccess;
++    }
++    catch (...)
++    {
++        if (forcedBufferAddressRefresh)
++        {
++            graphHandle->routines->setNativeScaleupBufferAddressRefresh(false);
++        }
++        graphHandle->routines->cancelNativeCapture();
++        graphHandle->state = hcclTp2NativeGraphInvalid;
++        return hcclInternalError;
++    }
++}
++
++extern "C" hcclResult_t HCCL_API_CALL hcclTp2NativeGraphReplayPrepared(
++    hcclTp2NativeGraphHandle   graphHandle,
++    const hcclTp2NativeSyncInfo* dependency,
++    hcclTp2NativeSyncInfo*       completion)
++{
++    if (graphHandle == nullptr || completion == nullptr)
++    {
++        return hcclInvalidArgument;
++    }
++
++    std::lock_guard<std::mutex> lock(graphHandle->mutex);
++    if (graphHandle->batchOwned) return hcclInvalidUsage;
++    if (graphHandle->state != hcclTp2NativeGraphInstantiated)
++    {
++        return hcclInvalidUsage;
++    }
++    if (graphHandle->replayPath == InternalHcclTp2NativeGraph::ReplayPath::Native)
++    {
++        return hcclInvalidUsage;
++    }
++
++    try
++    {
++        if (dependency != nullptr && dependency->targetValue != 0)
++        {
++            graphHandle->routines->nativeWaitOn(
++                {.long_so_index = dependency->longSoIndex, .targetValue = dependency->targetValue});
++        }
++        graphHandle->communicator->incCollectiveCtr();
++        graphHandle->params.m_apiId = hccl_ctx.generateApiId();
++        const char* comparePrepared = std::getenv("HCL_TP2_NATIVE_COMPARE_PREPARED");
++        const bool comparePreparedEnabled =
++            comparePrepared != nullptr && std::strcmp(comparePrepared, "1") == 0;
++        const bool capturePrepared = comparePreparedEnabled &&
++                                     (graphHandle->preparedReplayCount < 3 ||
++                                      (graphHandle->preparedReplayCount >= 60 &&
++                                       graphHandle->preparedReplayCount < 65));
++        if (capturePrepared)
++        {
++            graphHandle->routines->beginNativeCapture();
++        }
++        const hcclResult_t status = graphHandle->graph->submit();
++        if (status != hcclSuccess)
++        {
++            if (capturePrepared)
++            {
++                graphHandle->routines->cancelNativeCapture();
++            }
++            graphHandle->state = hcclTp2NativeGraphInvalid;
++            return status;
++        }
++        if (capturePrepared)
++        {
++            const auto preparedCapture = graphHandle->routines->endNativeCapture();
++            const auto& previousCapture = graphHandle->diagnosticPreparedCaptureValid
++                                              ? graphHandle->diagnosticPreparedCapture
++                                              : graphHandle->capture;
++            const uint64_t currentExecution = graphHandle->preparedReplayCount + 3;
++            dumpNativeCaptureDiff(previousCapture,
++                                  preparedCapture,
++                                  graphHandle->diagnosticPreparedCaptureValid
++                                      ? graphHandle->diagnosticPreparedExecution
++                                      : 2,
++                                  currentExecution);
++            graphHandle->diagnosticPreparedCapture = preparedCapture;
++            graphHandle->diagnosticPreparedCaptureValid = true;
++            graphHandle->diagnosticPreparedExecution = currentExecution;
++        }
++        const hcl::syncInfo done = graphHandle->routines->nativeCompletion();
++        completion->longSoIndex = done.long_so_index;
++        completion->targetValue = done.targetValue;
++        graphHandle->replayPath = InternalHcclTp2NativeGraph::ReplayPath::Prepared;
++        ++graphHandle->preparedReplayCount;
++        return hcclSuccess;
++    }
++    catch (...)
++    {
++        graphHandle->state = hcclTp2NativeGraphInvalid;
++        return hcclInternalError;
++    }
++}
++
++static hcclResult_t replayTp2NativeGraphLocked(hcclTp2NativeGraphHandle    graphHandle,
++                                               const hcclTp2NativeSyncInfo* dependency,
++                                               hcclTp2NativeSyncInfo*       completion,
++                                               bool                         submit)
++{
++    if (graphHandle->state != hcclTp2NativeGraphInstantiated ||
++        graphHandle->replayPath == InternalHcclTp2NativeGraph::ReplayPath::Prepared)
++    {
++        return hcclInvalidUsage;
++    }
++
++    const hcl::syncInfo currentCompletion = graphHandle->routines->nativeCompletion();
++    const uint64_t nextTarget = currentCompletion.targetValue + graphHandle->capture.externalTargetDelta;
++    const bool useWrapCapture = graphHandle->completionRingSize > 0 && nextTarget > 1 &&
++                                (nextTarget - 1) % graphHandle->completionRingSize == 0;
++    const auto& selectedCapture = useWrapCapture ? graphHandle->wrapCapture : graphHandle->capture;
++    if (!graphHandle->nativeRelocationsValidated || graphHandle->batchOwned)
++    {
++        graphHandle->state = hcclTp2NativeGraphInvalid;
++        return hcclInvalidUsage;
++    }
++
++    try
++    {
++        graphHandle->communicator->incCollectiveCtr();
++        const hcl::syncInfo done = graphHandle->routines->replayNativeCapture(
++            selectedCapture,
++            *graphHandle->communicator->getDynamicComm(),
++            {.long_so_index = dependency->longSoIndex, .targetValue = dependency->targetValue},
++            submit);
++        completion->longSoIndex = done.long_so_index;
++        completion->targetValue = done.targetValue;
++        graphHandle->replayPath = InternalHcclTp2NativeGraph::ReplayPath::Native;
++        ++graphHandle->nativeReplayCount;
++        graphHandle->nativeWrapReplayCount += useWrapCapture;
++        return hcclSuccess;
++    }
++    catch (...)
++    {
++        graphHandle->state = hcclTp2NativeGraphInvalid;
++        return hcclInternalError;
++    }
++}
++
++extern "C" hcclResult_t HCCL_API_CALL hcclTp2NativeGraphReplay(
++    hcclTp2NativeGraphHandle    graphHandle,
++    const hcclTp2NativeSyncInfo* dependency,
++    hcclTp2NativeSyncInfo*       completion)
++{
++    if (graphHandle == nullptr || dependency == nullptr || dependency->targetValue == 0 || completion == nullptr)
++    {
++        return hcclInvalidArgument;
++    }
++    std::lock_guard<std::mutex> lock(graphHandle->mutex);
++    return replayTp2NativeGraphLocked(graphHandle, dependency, completion, true);
++}
++
++extern "C" hcclResult_t HCCL_API_CALL hcclTp2NativeGraphStage(
++    hcclTp2NativeGraphHandle    graphHandle,
++    const hcclTp2NativeSyncInfo* dependency,
++    hcclTp2NativeSyncInfo*       completion)
++{
++    if (graphHandle == nullptr || dependency == nullptr || dependency->targetValue == 0 || completion == nullptr)
++    {
++        return hcclInvalidArgument;
++    }
++    std::lock_guard<std::mutex> lock(graphHandle->mutex);
++    return replayTp2NativeGraphLocked(graphHandle, dependency, completion, false);
++}
++
++extern "C" hcclResult_t HCCL_API_CALL hcclTp2NativeGraphSubmit(hcclTp2NativeGraphHandle graphHandle)
++{
++    if (graphHandle == nullptr)
++    {
++        return hcclInvalidArgument;
++    }
++    std::lock_guard<std::mutex> lock(graphHandle->mutex);
++    if (graphHandle->state != hcclTp2NativeGraphInstantiated ||
++        graphHandle->replayPath != InternalHcclTp2NativeGraph::ReplayPath::Native)
++    {
++        return hcclInvalidUsage;
++    }
++    try
++    {
++        graphHandle->routines->submitNativeReplay();
++        return hcclSuccess;
++    }
++    catch (...)
++    {
++        graphHandle->state = hcclTp2NativeGraphInvalid;
++        return hcclInternalError;
++    }
++}
++
++extern "C" hcclResult_t HCCL_API_CALL hcclTp2NativeGraphGetInfo(hcclTp2NativeGraphHandle graphHandle,
++                                                                 hcclTp2NativeGraphInfo*   graphInfo)
++{
++    if (graphHandle == nullptr || graphInfo == nullptr)
++    {
++        return hcclInvalidArgument;
++    }
++    std::lock_guard<std::mutex> lock(graphHandle->mutex);
++    graphInfo->state                = graphHandle->state;
++    graphInfo->preparedReplayCount  = graphHandle->preparedReplayCount;
++    graphInfo->nativeReplayCount    = graphHandle->nativeReplayCount;
++    graphInfo->capturedCommandCount = graphHandle->capture.commandCount();
++    graphInfo->capturedStreamCount  = graphHandle->capture.streams.size();
++    graphInfo->capturedRelocationCount = 0;
++    graphInfo->capturedByteCount = 0;
++    graphInfo->maxStreamBytes = 0;
++    for (const auto& stream : graphHandle->capture.streams)
++    {
++        graphInfo->capturedRelocationCount += stream.commandTemplate.relocations.size();
++        uint64_t streamBytes = 0;
++        for (const auto& command : stream.commandTemplate.commands)
++        {
++            streamBytes += command.bytes.size();
++        }
++        graphInfo->capturedByteCount += streamBytes;
++        graphInfo->maxStreamBytes = std::max(graphInfo->maxStreamBytes, streamBytes);
++    }
++    graphInfo->streamCcbBytes = hcl::ScalStream::getCcbSize();
++    const auto replayCounters = graphHandle->routines->nativeReplayCounters(graphHandle->capture);
++    graphInfo->nativeReplayBytes = replayCounters.bytes >= graphHandle->captureCounters.bytes
++                                       ? replayCounters.bytes - graphHandle->captureCounters.bytes
++                                       : 0;
++    graphInfo->nativeCcbWrapCount = replayCounters.ccbWraps >= graphHandle->captureCounters.ccbWraps
++                                        ? replayCounters.ccbWraps - graphHandle->captureCounters.ccbWraps
++                                        : 0;
++    graphInfo->nativeSubmissionCount = replayCounters.submissions >= graphHandle->captureCounters.submissions
++                                           ? replayCounters.submissions - graphHandle->captureCounters.submissions
++                                           : 0;
++    graphInfo->wrapCapturedCommandCount = graphHandle->wrapCapture.commandCount();
++    graphInfo->completionRingSize = graphHandle->completionRingSize;
++    graphInfo->nativeWrapReplayCount = graphHandle->nativeWrapReplayCount;
++    graphInfo->dependencyRelocationCount = graphHandle->capture.relocationCount(
++        hcl::NativeHclRelocationKind::DEPENDENCY_TARGET);
++    graphInfo->wqeRelocationCount =
++        graphHandle->capture.relocationCount(hcl::NativeHclRelocationKind::WQE_NOTIFY) +
++        graphHandle->capture.relocationCount(hcl::NativeHclRelocationKind::WQE_WAIT);
++    graphInfo->externalCompletionAddressRelocationCount = graphHandle->capture.relocationCount(
++        hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS);
++    graphInfo->internalCompletionAddressRelocationCount = graphHandle->capture.relocationCount(
++        hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_ADDRESS);
++    const hcl::syncInfo done         = graphHandle->routines->nativeCompletion();
++    graphInfo->completion.longSoIndex = done.long_so_index;
++    graphInfo->completion.targetValue = done.targetValue;
++    return hcclSuccess;
++}
++
++extern "C" hcclResult_t HCCL_API_CALL hcclTp2NativeGraphDestroy(hcclTp2NativeGraphHandle graphHandle)
++{
++    if (graphHandle == nullptr)
++    {
++        return hcclInvalidArgument;
++    }
++
++    std::unique_lock<std::mutex> lock(graphHandle->mutex);
++    if (graphHandle->batchOwned) return hcclInvalidUsage;
++    try
++    {
++        if (graphHandle->state == hcclTp2NativeGraphCapturing)
++        {
++            graphHandle->routines->cancelNativeCapture();
++        }
++        graphHandle->routines->nativeSynchronize();
++        graphHandle->state = hcclTp2NativeGraphClosed;
++    }
++    catch (...)
++    {
++        graphHandle->state = hcclTp2NativeGraphInvalid;
++        return hcclInternalError;
++    }
++    lock.unlock();
++    delete graphHandle;
++    return hcclSuccess;
++}
++
++extern "C" hcclResult_t HCCL_API_CALL hcclTp2NativeBatchCreate(
++    const hcclTp2NativeGraphHandle* graphs, size_t count, hcclTp2NativeBatchHandle* result)
++{
++    if (!graphs || !result || count == 0 || count > 128) return hcclInvalidArgument;
++    *result = nullptr;
++    auto batch = std::make_unique<InternalHcclTp2NativeBatch>();
++    // Roll back leases on preparation failure; no commands have been submitted.
++    try
++    {
++        for (size_t index = 0; index < count; ++index)
++        {
++            auto graph = graphs[index];
++            VERIFY(graph != nullptr, "Null native batch graph");
++            std::lock_guard<std::mutex> lock(graph->mutex);
++            VERIFY(!graph->batchOwned && graph->nativeRelocationsValidated &&
++                   graph->state == hcclTp2NativeGraphInstantiated && graph->capture.externalTargetDelta == 1 &&
++                   graph->wrapCapture.externalTargetDelta == 1 && graph->completionRingSize == 64,
++                   "Native batch requires exclusive, qualified, unit-completion TP2 graphs");
++            if (index != 0)
++                VERIFY(graph->communicator == graphs[0]->communicator && graph->routines == graphs[0]->routines &&
++                       graph->streamHandle == graphs[0]->streamHandle,
++                       "Native batch topology or communicator differs");
++            batch->graphs.push_back(graph);
++            graph->batchOwned = true;
++        }
++        batch->states.resize(count);
++        batch->dependencies.resize(count);
++        batch->completions.resize(count);
++        batch->phases.resize(64);
++        for (size_t phase = 0; phase < batch->phases.size(); ++phase)
++        {
++            auto& prepared = batch->phases[phase];
++            prepared.captures.reserve(count);
++            for (size_t node = 0; node < count; ++node)
++            {
++                auto graph = graphs[node];
++                prepared.captures.push_back((phase + node) % 64 == 0 ? &graph->wrapCapture : &graph->capture);
++            }
++            prepared.program = graphs[0]->routines->prepareNativeBatch(prepared.captures);
++        }
++        *result = batch.release();
++        return hcclSuccess;
++    }
++    catch (...)
++    {
++        for (auto graph : batch->graphs)
++        {
++            std::lock_guard<std::mutex> lock(graph->mutex);
++            graph->batchOwned = false;
++        }
++        return hcclInvalidUsage;
++    }
++}
++
++extern "C" hcclResult_t HCCL_API_CALL hcclTp2NativeBatchReplay(
++    hcclTp2NativeBatchHandle batch, const hcclTp2NativeSyncInfo* dependencies,
++    size_t count, hcclTp2NativeSyncInfo* completions)
++{
++    if (!batch || !dependencies || !completions || count != batch->graphs.size()) return hcclInvalidArgument;
++    std::lock_guard<std::mutex> lock(batch->mutex);
++    if (!batch->valid) return hcclInvalidUsage;
++    // Validate all dynamic fields before advancing counters or mutating queues.
++    for (size_t node = 0; node < count; ++node)
++    {
++        if (!dependencies[node].targetValue || dependencies[node].longSoIndex % 8 != 0 ||
++            (dependencies[node].longSoIndex >> 3) > 0xff ||
++            dependencies[node].targetValue >= (uint64_t(1) << 60)) return hcclInvalidArgument;
++        batch->dependencies[node] = {dependencies[node].longSoIndex, dependencies[node].targetValue};
++    }
++    auto first = batch->graphs.front();
++    std::lock_guard<std::mutex> streamLock(first->routines->nativeStreamLock());
++    const uint64_t target = first->routines->nativeCompletion().targetValue;
++    if (first->routines->nativeCompletion().long_so_index > std::numeric_limits<uint32_t>::max() ||
++        !target || target >= (uint64_t(1) << 60) - count) return hcclInvalidUsage;
++    const auto& phase = batch->phases[target % batch->phases.size()];
++    try
++    {
++        for (size_t node = 0; node < count; ++node) first->communicator->incCollectiveCtr();
++        first->routines->replayNativeBatch(phase.program, phase.captures,
++            *first->communicator->getDynamicComm(), batch->dependencies.data(),
++            batch->states.data(), batch->completions.data());
++        for (size_t node = 0; node < count; ++node)
++        {
++            auto graph = batch->graphs[node];
++            std::lock_guard<std::mutex> graphLock(graph->mutex);
++            ++graph->nativeReplayCount;
++            graph->nativeWrapReplayCount += phase.captures[node] == &graph->wrapCapture;
++            graph->replayPath = InternalHcclTp2NativeGraph::ReplayPath::Native;
++            completions[node] = {static_cast<uint32_t>(batch->completions[node].long_so_index), batch->completions[node].targetValue};
++        }
++        return hcclSuccess;
++    }
++    catch (...)
++    {
++        batch->valid = false;
++        for (auto graph : batch->graphs) graph->state = hcclTp2NativeGraphInvalid;
++        return hcclInternalError;
++    }
++}
++
++extern "C" hcclResult_t HCCL_API_CALL hcclTp2NativeBatchDestroy(hcclTp2NativeBatchHandle batch)
++{
++    if (!batch) return hcclInvalidArgument;
++    std::unique_lock<std::mutex> lock(batch->mutex);
++    try
++    {
++        batch->graphs.front()->routines->nativeSynchronize();
++        for (auto graph : batch->graphs)
++        {
++            std::lock_guard<std::mutex> graphLock(graph->mutex);
++            graph->batchOwned = false;
++        }
++    }
++    catch (...) { batch->valid = false; return hcclInternalError; }
++    lock.unlock();
++    delete batch;
++    return hcclSuccess;
++}
+diff --git a/hcl/src/hccl/tp2_direct_api_context.h b/hcl/src/hccl/tp2_direct_api_context.h
+new file mode 100644
+index 0000000..7cf1701
+--- /dev/null
++++ b/hcl/src/hccl/tp2_direct_api_context.h
+@@ -0,0 +1,7 @@
++#pragma once
++
++namespace HclGen2
++{
++bool isTp2DedicatedDirectCall();
++bool isTp2DedicatedExchangeCall();
++}
+diff --git a/hcl/src/hcl_collective_params.h b/hcl/src/hcl_collective_params.h
+index 2d3ce4e..b95a813 100644
+--- a/hcl/src/hcl_collective_params.h
++++ b/hcl/src/hcl_collective_params.h
+@@ -74,6 +74,8 @@ struct HclCollectiveParams
+     hcclRedOp_t      m_reduceOp        = hcclOpNone;
+     HCL_Rank         m_root            = HCL_INVALID_RANK;
+     uint64_t         m_remainder_count = 0;
++    bool             m_directScaleupNicTransfer  = false;
++    bool             m_directScaleupNicReduction = false;
+ 
+     HclDynamicCommunicator& m_dynamicComm;
+ };
+diff --git a/hcl/src/hcl_global_conf.cpp b/hcl/src/hcl_global_conf.cpp
+index ce717f7..93eda71 100644
+--- a/hcl/src/hcl_global_conf.cpp
++++ b/hcl/src/hcl_global_conf.cpp
+@@ -372,6 +372,48 @@ GlobalConfUint64 GCFG_HCCL_PRIM_COLLECTIVE_MASK(
+         DfltUint64(DEFAULT_PRIM_COLLECTIVE_MASK) ,
+         MakePublic);
+ 
++GlobalConfBool GCFG_HCL_TP2_REPLICATED_RS_AR(
++        "HCL_TP2_REPLICATED_RS_AR",
++        "Use a replicated-input reduce-scatter for in-place TP2 BF16 all-reduce",
++        false,
++        MakePublic);
++
++GlobalConfBool GCFG_HCL_TP2_DIRECT_NIC_RS_AR(
++        "HCL_TP2_DIRECT_NIC_RS_AR",
++        "Add a replicated TP2 BF16 source into a preinitialized distinct HBM accumulator with the scale-up NIC",
++        false,
++        MakePublic);
++
++GlobalConfBool GCFG_HCL_TP2_DIRECT_NIC_EXCHANGE(
++        "HCL_TP2_DIRECT_NIC_EXCHANGE",
++        "Exchange replicated TP2 BF16 inputs into distinct HBM buffers without NIC reduction",
++        false,
++        MakePublic);
++
++GlobalConfBool GCFG_HCL_TP2_DIRECT_INPLACE_STAGING(
++        "HCL_TP2_DIRECT_INPLACE_STAGING",
++        "Stage the local TP2 input before direct NIC reduction into the original buffer",
++        false,
++        MakePublic);
++
++GlobalConfBool GCFG_HCL_TP2_DEDICATED_DIRECT_API(
++        "HCL_TP2_DEDICATED_DIRECT_API",
++        "Enable the dedicated preinitialized TP2 direct all-reduce API",
++        false,
++        MakePublic);
++
++GlobalConfUint64 GCFG_HCL_TP2_DIRECT_MAX_COUNT(
++        "HCL_TP2_DIRECT_MAX_COUNT",
++        "Maximum element count handled by the TP2 direct primitive; zero disables the limit",
++        DfltUint64(0),
++        MakePublic);
++
++GlobalConfBool GCFG_HCL_TP2_PRUNE_SCALEOUT_STREAMS(
++        "HCL_TP2_PRUNE_SCALEOUT_STREAMS",
++        "Skip idle scale-out scheduler streams for a direct single-box TP2 NIC reduction",
++        false,
++        MakePublic);
++
+ GlobalConfBool GCFG_HCL_COLLECTIVE_LOG(
+         "HCL_COLLECTIVE_LOG",
+         "Collect HCL collective logs from all ranks to coordinator",
+diff --git a/hcl/src/hcl_global_conf.h b/hcl/src/hcl_global_conf.h
+index b20f2bb..68fd863 100644
+--- a/hcl/src/hcl_global_conf.h
++++ b/hcl/src/hcl_global_conf.h
+@@ -74,6 +74,13 @@ extern GlobalConfBool   GCFG_HCL_USE_NIC_COMPRESSION;
+ 
+ extern GlobalConfBool   GCFG_HCL_NULL_SUBMIT;
+ extern GlobalConfUint64 GCFG_HCCL_PRIM_COLLECTIVE_MASK;
++extern GlobalConfBool   GCFG_HCL_TP2_REPLICATED_RS_AR;
++extern GlobalConfBool   GCFG_HCL_TP2_DIRECT_NIC_RS_AR;
++extern GlobalConfBool   GCFG_HCL_TP2_DIRECT_NIC_EXCHANGE;
++extern GlobalConfBool   GCFG_HCL_TP2_DIRECT_INPLACE_STAGING;
++extern GlobalConfBool   GCFG_HCL_TP2_DEDICATED_DIRECT_API;
++extern GlobalConfUint64 GCFG_HCL_TP2_DIRECT_MAX_COUNT;
++extern GlobalConfBool   GCFG_HCL_TP2_PRUNE_SCALEOUT_STREAMS;
+ 
+ extern GlobalConfBool   GCFG_HCL_COLLECTIVE_LOG;
+ extern GlobalConfInt64  GCFG_OP_DRIFT_THRESHOLD_MS;
+diff --git a/hcl/src/infra/scal/gen2_arch_common/cyclic_buffer_manager.cpp b/hcl/src/infra/scal/gen2_arch_common/cyclic_buffer_manager.cpp
+index a7a6a5f..ab5140b 100644
+--- a/hcl/src/infra/scal/gen2_arch_common/cyclic_buffer_manager.cpp
++++ b/hcl/src/infra/scal/gen2_arch_common/cyclic_buffer_manager.cpp
+@@ -74,7 +74,9 @@ void CyclicBufferManager::advanceAlignment(size_t size)
+     {
+         uint64_t alignSize = m_streamInfo.command_alignment - (startAddress & commandAlignmentMask);
+ 
++        m_writingAlignmentPacket = true;
+         m_commands.serializeNopCommand(*m_scalStream, m_schedIdx, alignSize);
++        m_writingAlignmentPacket = false;
+         incPi(alignSize);
+ 
+         startAddress = getPi();
+@@ -219,6 +221,7 @@ void CyclicBufferManager::submit(bool force)
+     {
+         incPi(m_sizeSinceAlignment);
+         m_scalWrapper.sendStream(m_streamHandle, getPi(), m_streamInfo.submission_alignment);
++        ++m_submissionCount;
+     }
+ }
+ 
+@@ -329,4 +332,4 @@ void CyclicBufferManager::dfaLog(hl_logger::LoggerSPtr synDevFailLog)
+     }
+ 
+     HLLOG_UNTYPED(synDevFailLog, HLLOG_LEVEL_INFO, "{}", out);
+-}
+\ No newline at end of file
++}
+diff --git a/hcl/src/infra/scal/gen2_arch_common/cyclic_buffer_manager.h b/hcl/src/infra/scal/gen2_arch_common/cyclic_buffer_manager.h
+index c70a9d3..d33c0db 100644
+--- a/hcl/src/infra/scal/gen2_arch_common/cyclic_buffer_manager.h
++++ b/hcl/src/infra/scal/gen2_arch_common/cyclic_buffer_manager.h
+@@ -55,6 +55,9 @@ public:
+     void        updateCcbHalfFullMechanism();
+ 
+     virtual uint64_t getPi() = 0;
++    uint64_t         getUnwrappedPi() const { return m_pi; }
++    uint64_t         getSubmissionCount() const { return m_submissionCount; }
++    bool             isWritingAlignmentPacket() const { return m_writingAlignmentPacket; }
+     void             disableCcb(bool disable) { m_disableCcb = disable; }
+     void             dfaLog(hl_logger::LoggerSPtr synDevFailLog);
+ 
+@@ -96,5 +99,7 @@ protected:
+     bool           m_disableCcb = false;  // used for null submission
+     const uint64_t m_logOfBufferSize;     // Cyclic buffer size
+     const uint64_t m_pi_mask;
++    bool           m_writingAlignmentPacket = false;
++    uint64_t       m_submissionCount = 0;
+ };
+ }  // namespace hcl
+diff --git a/hcl/src/infra/scal/gen2_arch_common/native_hcl_program.h b/hcl/src/infra/scal/gen2_arch_common/native_hcl_program.h
+new file mode 100644
+index 0000000..0e27bd2
+--- /dev/null
++++ b/hcl/src/infra/scal/gen2_arch_common/native_hcl_program.h
+@@ -0,0 +1,102 @@
++#pragma once
++
++#include "native_hcl_relocation.h"
++#include <stdexcept>
++#include <utility>
++
++namespace hcl
++{
++struct NativeHclProgramPatch
++{
++    uint32_t stateIndex = 0;
++    NativeHclRelocation field;
++};
++
++struct NativeHclProgramPage
++{
++    std::vector<uint8_t> bytes;
++    std::vector<NativeHclProgramPatch> patches;
++    uint32_t lastStateIndex = 0;
++    bool publishAfter = false;
++};
++
++// An immutable stream program can combine any number of collective templates.
++// Packet boundaries and relocation validity are resolved once at instantiation.
++class NativeHclProgram
++{
++public:
++    using Input = std::pair<const NativeHclStreamTemplate*, uint32_t>;
++
++    static NativeHclProgram prepare(const std::vector<Input>& inputs, size_t alignment,
++                                    bool preserveCapturedPublications = true)
++    {
++        if (inputs.empty() || alignment == 0 || (alignment & (alignment - 1)) != 0)
++            throw std::invalid_argument("Invalid native HCL program alignment or inputs");
++        NativeHclProgram result;
++        result.m_alignment = alignment;
++        for (const auto& input : inputs)
++        {
++            if (input.first == nullptr || !validateNativeHclStreamTemplate(*input.first))
++                throw std::invalid_argument("Invalid native HCL program template");
++            const auto& commandTemplate = *input.first;
++            size_t patch = 0;
++            for (size_t commandIndex = 0; commandIndex < commandTemplate.commands.size(); ++commandIndex)
++            {
++                const auto& command = commandTemplate.commands[commandIndex];
++                if (command.bytes.empty() || command.bytes.size() > alignment)
++                    throw std::invalid_argument("Native HCL packet exceeds its scheduler alignment");
++                if (result.m_pages.empty() || result.m_pages.back().publishAfter ||
++                    result.m_pages.back().bytes.size() + command.bytes.size() > alignment)
++                    result.m_pages.emplace_back();
++                auto& page = result.m_pages.back();
++                const size_t offset = page.bytes.size();
++                page.bytes.insert(page.bytes.end(), command.bytes.begin(), command.bytes.end());
++                page.lastStateIndex = input.second;
++                page.publishAfter = preserveCapturedPublications && command.submitAfter;
++                while (patch < commandTemplate.relocations.size() &&
++                       commandTemplate.relocations[patch].commandIndex == commandIndex)
++                {
++                    auto field = commandTemplate.relocations[patch++];
++                    if (offset > std::numeric_limits<uint32_t>::max() - field.byteOffset)
++                        throw std::overflow_error("Native HCL program relocation offset overflow");
++                    field.byteOffset += static_cast<uint32_t>(offset);
++                    field.commandIndex = 0;
++                    page.patches.push_back({input.second, field});
++                }
++                result.m_bytes += command.bytes.size();
++            }
++            result.m_stateCount = std::max(result.m_stateCount, size_t(input.second) + 1);
++        }
++        return result;
++    }
++
++    const std::vector<NativeHclProgramPage>& pages() const { return m_pages; }
++    size_t stateCount() const { return m_stateCount; }
++    size_t alignment() const { return m_alignment; }
++    size_t bytes() const { return m_bytes; }
++
++    // Caller checks stateCount once for the program. Each field was validated
++    // during prepare, so this hot loop performs only the required epoch update.
++    static void writePage(uint8_t* destination,
++                          const NativeHclProgramPage& page,
++                          const NativeHclReplayState* states)
++    {
++        std::memcpy(destination, page.bytes.data(), page.bytes.size());
++        for (const auto& patch : page.patches)
++        {
++            const auto& field = patch.field;
++            uint64_t word = 0;
++            std::memcpy(&word, destination + field.byteOffset, field.width);
++            const uint64_t value = states[patch.stateIndex].get(field.kind) >> field.sourceShift;
++            word = (word & ~field.mask) | ((value << field.destinationShift) & field.mask);
++            std::memcpy(destination + field.byteOffset, &word, field.width);
++        }
++    }
++
++private:
++    std::vector<NativeHclProgramPage> m_pages;
++    size_t m_alignment = 0;
++    size_t m_stateCount = 0;
++    size_t m_bytes = 0;
++};
++} // namespace hcl
+diff --git a/hcl/src/infra/scal/gen2_arch_common/native_hcl_relocation.h b/hcl/src/infra/scal/gen2_arch_common/native_hcl_relocation.h
+new file mode 100644
+index 0000000..c25e6d7
+--- /dev/null
++++ b/hcl/src/infra/scal/gen2_arch_common/native_hcl_relocation.h
+@@ -0,0 +1,186 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <algorithm>
++#include <limits>
++#include <vector>
++
++namespace hcl
++{
++enum class NativeHclRelocationKind : uint8_t
++{
++    DEPENDENCY_TARGET,
++    DEPENDENCY_LONG_SO_INDEX,
++    EXTERNAL_COMPLETION_TARGET,
++    INTERNAL_COMPLETION_TARGET,
++    EXTERNAL_COMPLETION_ADDRESS,
++    INTERNAL_COMPLETION_ADDRESS,
++    GPSO_0_ADDRESS,
++    GPSO_1_ADDRESS,
++    RECEIVE_STATE,
++    QUEUE_COUNTER,
++    WQE_COUNTER,
++    WQE_NOTIFY,
++    WQE_WAIT,
++    COUNT
++};
++
++struct NativeHclRelocation
++{
++    uint32_t                commandIndex    = 0;
++    uint32_t                byteOffset      = 0;
++    uint8_t                 width           = 0;
++    uint64_t                mask            = 0;
++    uint8_t                 destinationShift = 0;
++    uint8_t                 sourceShift      = 0;
++    NativeHclRelocationKind kind             = NativeHclRelocationKind::DEPENDENCY_TARGET;
++};
++
++struct NativeHclCommand
++{
++    std::vector<uint8_t> bytes;
++    bool                 submitAfter = false;
++};
++
++struct NativeHclStreamTemplate
++{
++    std::vector<NativeHclCommand>    commands;
++    std::vector<NativeHclRelocation> relocations;
++    uint64_t                         captureTargetValue = 0;
++
++    bool empty() const { return commands.empty(); }
++};
++
++struct NativeHclReplayState
++{
++    uint64_t values[static_cast<size_t>(NativeHclRelocationKind::COUNT)] {};
++
++    uint64_t get(NativeHclRelocationKind kind) const
++    {
++        return values[static_cast<size_t>(kind)];
++    }
++};
++
++inline bool isNativeHclRelocationWellFormed(const NativeHclRelocation& relocation)
++{
++    if (relocation.width != 1 && relocation.width != 2 && relocation.width != 4 && relocation.width != 8)
++    {
++        return false;
++    }
++    if (relocation.destinationShift >= relocation.width * 8 || relocation.sourceShift >= 64 ||
++        relocation.kind >= NativeHclRelocationKind::COUNT)
++    {
++        return false;
++    }
++    const uint64_t widthMask = relocation.width == 8
++                                   ? std::numeric_limits<uint64_t>::max()
++                                   : ((uint64_t {1} << (relocation.width * 8)) - 1);
++    if (relocation.mask == 0 || (relocation.mask & ~widthMask) != 0)
++    {
++        return false;
++    }
++    const uint64_t bitsBelowDestination = relocation.destinationShift == 0
++                                              ? 0
++                                              : ((uint64_t {1} << relocation.destinationShift) - 1);
++    return (relocation.mask & bitsBelowDestination) == 0;
++}
++
++inline bool nativeHclRelocationLess(const NativeHclRelocation& left, const NativeHclRelocation& right)
++{
++    if (left.commandIndex != right.commandIndex)
++    {
++        return left.commandIndex < right.commandIndex;
++    }
++    if (left.byteOffset != right.byteOffset)
++    {
++        return left.byteOffset < right.byteOffset;
++    }
++    return left.mask < right.mask;
++}
++
++inline bool validateNativeHclStreamTemplate(const NativeHclStreamTemplate& commandTemplate)
++{
++    if (commandTemplate.empty())
++    {
++        return false;
++    }
++    for (size_t index = 0; index < commandTemplate.relocations.size(); ++index)
++    {
++        const NativeHclRelocation& relocation = commandTemplate.relocations[index];
++        if (!isNativeHclRelocationWellFormed(relocation) ||
++            relocation.commandIndex >= commandTemplate.commands.size())
++        {
++            return false;
++        }
++        const NativeHclCommand& command = commandTemplate.commands[relocation.commandIndex];
++        if (relocation.byteOffset > command.bytes.size() ||
++            relocation.width > command.bytes.size() - relocation.byteOffset)
++        {
++            return false;
++        }
++        if (index != 0 && nativeHclRelocationLess(relocation, commandTemplate.relocations[index - 1]))
++        {
++            return false;
++        }
++    }
++    return true;
++}
++
++// Completion SOB addresses advance with the HCL completion epoch. The graph
++// generators identify the semantic address at capture time, while scheduler
++// packet writers flatten it into one or more 32-bit LBW fields. Add the
++// corresponding fixed-address relocations once during instantiation.
++inline size_t addNativeHclCapturedWordRelocations(NativeHclStreamTemplate& commandTemplate,
++                                                  uint32_t                 capturedWord,
++                                                  NativeHclRelocationKind  kind)
++{
++    size_t added = 0;
++    for (size_t commandIndex = 0; commandIndex < commandTemplate.commands.size(); ++commandIndex)
++    {
++        const NativeHclCommand& command = commandTemplate.commands[commandIndex];
++        for (size_t byteOffset = 0; byteOffset + sizeof(uint32_t) <= command.bytes.size();
++             byteOffset += sizeof(uint32_t))
++        {
++            uint32_t word = 0;
++            std::memcpy(&word, command.bytes.data() + byteOffset, sizeof(word));
++            if (word != capturedWord)
++            {
++                continue;
++            }
++            commandTemplate.relocations.push_back({.commandIndex = static_cast<uint32_t>(commandIndex),
++                                                    .byteOffset = static_cast<uint32_t>(byteOffset),
++                                                    .width = sizeof(uint32_t),
++                                                    .mask = 0xffffffffu,
++                                                    .destinationShift = 0,
++                                                    .sourceShift = 0,
++                                                    .kind = kind});
++            ++added;
++        }
++    }
++    std::sort(commandTemplate.relocations.begin(),
++              commandTemplate.relocations.end(),
++              nativeHclRelocationLess);
++    return added;
++}
++
++inline bool patchNativeHclRelocation(uint8_t*                    commandBytes,
++                                     size_t                      commandSize,
++                                     const NativeHclRelocation&  relocation,
++                                     const NativeHclReplayState& replayState)
++{
++    if (commandBytes == nullptr || !isNativeHclRelocationWellFormed(relocation) ||
++        relocation.byteOffset > commandSize || relocation.width > commandSize - relocation.byteOffset)
++    {
++        return false;
++    }
++
++    uint64_t word = 0;
++    std::memcpy(&word, commandBytes + relocation.byteOffset, relocation.width);
++    const uint64_t value = replayState.get(relocation.kind) >> relocation.sourceShift;
++    word = (word & ~relocation.mask) | ((value << relocation.destinationShift) & relocation.mask);
++    std::memcpy(commandBytes + relocation.byteOffset, &word, relocation.width);
++    return true;
++}
++}  // namespace hcl
+diff --git a/hcl/src/infra/scal/gen2_arch_common/scal_stream.cpp b/hcl/src/infra/scal/gen2_arch_common/scal_stream.cpp
+index 951a746..61ffeec 100644
+--- a/hcl/src/infra/scal/gen2_arch_common/scal_stream.cpp
++++ b/hcl/src/infra/scal/gen2_arch_common/scal_stream.cpp
+@@ -7,6 +7,9 @@
+ #include "hcl_log_manager.h"        // for LOG*
+ #include "scal_wrapper.h"           // for Gen2ArchScalWrapper
+ 
++#include <algorithm>
++#include <cstring>
++
+ using namespace hcl;
+ 
+ void* ScalStreamBase::getNextPtr(size_t size)
+@@ -64,11 +67,21 @@ ScalStream::ScalStream(ScalJsonNames&       scalNames,
+ void ScalStream::setTargetValue(uint64_t targetValue)
+ {
+     m_cyclicBuffer->setTargetValue(targetValue);
++    if (m_nativeCaptureActive)
++    {
++        m_nativeCaptureTarget = targetValue;
++    }
+ }
+ 
+ void* ScalStream::getNextPtr(size_t size)
+ {
+-    return m_cyclicBuffer->getNextPtr(size);
++    void* pointer = m_cyclicBuffer->getNextPtr(size);
++    if (m_nativeCaptureActive && !m_cyclicBuffer->isWritingAlignmentPacket())
++    {
++        m_pendingNativeCommands.push_back(
++            {.pointer = static_cast<uint8_t*>(pointer), .size = size, .submitAfter = false});
++    }
++    return pointer;
+ }
+ 
+ bool ScalStream::requiresSubmission()
+@@ -78,9 +91,175 @@ bool ScalStream::requiresSubmission()
+ 
+ void ScalStream::submit()
+ {
++    if (m_nativeCaptureActive && !m_pendingNativeCommands.empty())
++    {
++        m_pendingNativeCommands.back().submitAfter = true;
++    }
+     m_cyclicBuffer->submit();
+ }
+ 
++void ScalStream::beginNativeCapture()
++{
++    VERIFY(!m_nativeCaptureActive, "Native HCL capture is already active for {}", m_schedNameAndStreamNum);
++    m_nativeCaptureActive  = true;
++    m_nativeCaptureStartPi = m_cyclicBuffer->getUnwrappedPi();
++    m_nativeCaptureTarget  = 0;
++    m_pendingNativeCommands.clear();
++    m_pendingNativeRelocations.clear();
++}
++
++NativeHclStreamTemplate ScalStream::endNativeCapture()
++{
++    VERIFY(m_nativeCaptureActive, "Native HCL capture is not active for {}", m_schedNameAndStreamNum);
++    const uint64_t bytesAdvanced = m_cyclicBuffer->getUnwrappedPi() - m_nativeCaptureStartPi;
++    VERIFY(bytesAdvanced <= m_hostCyclicBufferSize,
++           "Native HCL capture for {} advanced {} bytes and overwrote its {} byte CCB",
++           m_schedNameAndStreamNum,
++           bytesAdvanced,
++           m_hostCyclicBufferSize);
++
++    NativeHclStreamTemplate result;
++    result.captureTargetValue = m_nativeCaptureTarget;
++    result.relocations        = std::move(m_pendingNativeRelocations);
++    std::sort(result.relocations.begin(), result.relocations.end(), nativeHclRelocationLess);
++    result.commands.reserve(m_pendingNativeCommands.size());
++    for (const PendingNativeCommand& pending : m_pendingNativeCommands)
++    {
++        NativeHclCommand command;
++        command.bytes.assign(pending.pointer, pending.pointer + pending.size);
++        command.submitAfter = pending.submitAfter;
++        result.commands.push_back(std::move(command));
++    }
++
++    m_nativeCaptureActive = false;
++    m_pendingNativeCommands.clear();
++    m_pendingNativeRelocations.clear();
++    return result;
++}
++
++void ScalStream::cancelNativeCapture()
++{
++    m_nativeCaptureActive = false;
++    m_pendingNativeCommands.clear();
++    m_pendingNativeRelocations.clear();
++}
++
++void ScalStream::addNativeRelocation(const void*             fieldAddress,
++                                     uint8_t                 width,
++                                     uint64_t                mask,
++                                     uint8_t                 destinationShift,
++                                     uint8_t                 sourceShift,
++                                     NativeHclRelocationKind kind)
++{
++    if (!m_nativeCaptureActive)
++    {
++        return;
++    }
++    VERIFY(width == 1 || width == 2 || width == 4 || width == 8, "Unsupported native relocation width {}", width);
++
++    const uintptr_t field = reinterpret_cast<uintptr_t>(fieldAddress);
++    for (size_t index = m_pendingNativeCommands.size(); index > 0; --index)
++    {
++        const PendingNativeCommand& command = m_pendingNativeCommands[index - 1];
++        const uintptr_t begin = reinterpret_cast<uintptr_t>(command.pointer);
++        const uintptr_t end   = begin + command.size;
++        if (field >= begin && field + width <= end)
++        {
++            m_pendingNativeRelocations.push_back({.commandIndex = static_cast<uint32_t>(index - 1),
++                                                  .byteOffset = static_cast<uint32_t>(field - begin),
++                                                  .width = width,
++                                                  .mask = mask,
++                                                  .destinationShift = destinationShift,
++                                                  .sourceShift = sourceShift,
++                                                  .kind = kind});
++            return;
++        }
++    }
++    VERIFY(false, "Native relocation field is not inside the most recent captured HCL command");
++}
++
++void ScalStream::addNativeRelocationToLastCommandTail(uint32_t                bytesFromEnd,
++                                                      uint8_t                 width,
++                                                      uint64_t                mask,
++                                                      uint8_t                 destinationShift,
++                                                      uint8_t                 sourceShift,
++                                                      NativeHclRelocationKind kind)
++{
++    if (!m_nativeCaptureActive)
++    {
++        return;
++    }
++    VERIFY(!m_pendingNativeCommands.empty(), "Native relocation requires a captured HCL command");
++    const PendingNativeCommand& command = m_pendingNativeCommands.back();
++    VERIFY(bytesFromEnd >= width && bytesFromEnd <= command.size,
++           "Native relocation tail offset {} width {} exceeds command size {}",
++           bytesFromEnd,
++           width,
++           command.size);
++    addNativeRelocation(command.pointer + command.size - bytesFromEnd,
++                        width,
++                        mask,
++                        destinationShift,
++                        sourceShift,
++                        kind);
++}
++
++void ScalStream::replayNativeTemplate(const NativeHclStreamTemplate& commandTemplate,
++                                      const NativeHclReplayState&    replayState,
++                                      bool                           preserveSubmissions,
++                                      bool                           submitAtEnd)
++{
++    VERIFY(!m_nativeCaptureActive, "Cannot replay while native HCL capture is active");
++    VERIFY(validateNativeHclStreamTemplate(commandTemplate),
++           "Cannot replay an invalid native HCL stream template");
++
++    setTargetValue(replayState.get(NativeHclRelocationKind::EXTERNAL_COMPLETION_TARGET));
++    size_t relocationIndex = 0;
++    for (size_t index = 0; index < commandTemplate.commands.size(); ++index)
++    {
++        const NativeHclCommand& command = commandTemplate.commands[index];
++        uint8_t* destination = static_cast<uint8_t*>(m_cyclicBuffer->getNextPtr(command.bytes.size()));
++        std::memcpy(destination, command.bytes.data(), command.bytes.size());
++        while (relocationIndex < commandTemplate.relocations.size() &&
++               commandTemplate.relocations[relocationIndex].commandIndex == index)
++        {
++            const NativeHclRelocation& relocation = commandTemplate.relocations[relocationIndex++];
++            VERIFY(patchNativeHclRelocation(destination, command.bytes.size(), relocation, replayState),
++                   "Native HCL relocation cannot be applied");
++        }
++        if (preserveSubmissions && commandTemplate.commands[index].submitAfter)
++        {
++            m_cyclicBuffer->submit();
++        }
++    }
++    VERIFY(relocationIndex == commandTemplate.relocations.size(),
++           "Native HCL relocation command index is out of range or unsorted");
++    if (submitAtEnd)
++    {
++        m_cyclicBuffer->submit();
++    }
++}
++
++void ScalStream::replayNativeProgram(const NativeHclProgram& program,
++                                     const NativeHclReplayState* states, size_t stateCount)
++{
++    VERIFY(!m_nativeCaptureActive && states != nullptr && stateCount >= program.stateCount(),
++           "Native HCL program has invalid replay state");
++    VERIFY(program.alignment() == m_streamInfo.command_alignment && !program.pages().empty(),
++           "Native HCL program scheduler configuration changed");
++    for (const auto& page : program.pages())
++    {
++        // A page may contain multiple collectives. It stays live until the last
++        // collective using it completes, preserving the CCB's normal recycling.
++        setTargetValue(states[page.lastStateIndex].get(NativeHclRelocationKind::EXTERNAL_COMPLETION_TARGET));
++        auto* destination = static_cast<uint8_t*>(m_cyclicBuffer->getNextPtr(page.bytes.size()));
++        NativeHclProgram::writePage(destination, page, states);
++        // Captured publication can protect NIC context/data visibility across
++        // microstreams. Do not erase it without an equivalent device edge.
++        if (page.publishAfter) m_cyclicBuffer->submit();
++    }
++}
++
+ bool ScalStream::isACcbHalfFullForDeviceBenchMark()
+ {
+     return CyclicBufferManager::isACcbHalfFullForDeviceBenchMark();
+diff --git a/hcl/src/infra/scal/gen2_arch_common/scal_stream.h b/hcl/src/infra/scal/gen2_arch_common/scal_stream.h
+index 216e279..73c5583 100644
+--- a/hcl/src/infra/scal/gen2_arch_common/scal_stream.h
++++ b/hcl/src/infra/scal/gen2_arch_common/scal_stream.h
+@@ -8,6 +8,8 @@
+ #include "scal.h"                    // for scal_buffer_handle_t, scal_buffer_info_t, scal_s...
+ #include "hl_logger/hllog_core.hpp"  // for hl_logger::LoggerSPtr
+ #include "infra/scal/gen2_arch_common/cyclic_buffer_factory.h"  // for CyclicBufferFactory
++#include "infra/scal/gen2_arch_common/native_hcl_relocation.h"
++#include "infra/scal/gen2_arch_common/native_hcl_program.h"
+ #include "factory_types.h"                                      // for CyclicBufferType
+ 
+ namespace hcl
+@@ -36,6 +38,15 @@ public:
+ 
+     virtual void*        getNextPtr(size_t size);
+     virtual std::string* getStreamName() { return &m_defaultStream; };
++    virtual bool         isNativeCaptureActive() const { return false; }
++    virtual void addNativeRelocation(const void*,
++                                     uint8_t,
++                                     uint64_t,
++                                     uint8_t,
++                                     uint8_t,
++                                     NativeHclRelocationKind)
++    {
++    }
+ 
+     std::vector<uint32_t> m_buffer;
+     std::string           m_defaultStream = "unknown_stream";
+@@ -74,6 +85,32 @@ public:
+     void        disableCcb(bool disable);
+     void        dfaLog(hl_logger::LoggerSPtr synDevFailLog);
+ 
++    void beginNativeCapture();
++    NativeHclStreamTemplate endNativeCapture();
++    void cancelNativeCapture();
++    void addNativeRelocation(const void*             fieldAddress,
++                             uint8_t                 width,
++                             uint64_t                mask,
++                             uint8_t                 destinationShift,
++                             uint8_t                 sourceShift,
++                             NativeHclRelocationKind kind) override;
++    void addNativeRelocationToLastCommandTail(uint32_t                bytesFromEnd,
++                                              uint8_t                 width,
++                                              uint64_t                mask,
++                                              uint8_t                 destinationShift,
++                                              uint8_t                 sourceShift,
++                                              NativeHclRelocationKind kind);
++    void replayNativeTemplate(const NativeHclStreamTemplate& commandTemplate,
++                              const NativeHclReplayState&    replayState,
++                              bool                           preserveSubmissions,
++                              bool                           submitAtEnd);
++    void replayNativeProgram(const NativeHclProgram& program,
++                              const NativeHclReplayState* states, size_t stateCount);
++    uint32_t nativeCommandAlignment() const { return m_streamInfo.command_alignment; }
++    bool isNativeCaptureActive() const override { return m_nativeCaptureActive; }
++    uint64_t getUnwrappedPi() const { return m_cyclicBuffer->getUnwrappedPi(); }
++    uint64_t getSubmissionCount() const { return m_cyclicBuffer->getSubmissionCount(); }
++
+     inline unsigned        getUarchStreamIndex() { return m_internalStreamIdx; };
+     inline unsigned        getSchedIdx() { return m_schedIdx; };
+     inline unsigned        getArchStreamIndex() { return m_archStreamIndex; }
+@@ -100,5 +137,17 @@ protected:
+     static const uint64_t m_hostCyclicBufferSize = m_core_counter_max_value * piQuant;
+ 
+     std::unique_ptr<CyclicBufferManager> m_cyclicBuffer;
++
++    struct PendingNativeCommand
++    {
++        uint8_t* pointer = nullptr;
++        size_t   size    = 0;
++        bool     submitAfter = false;
++    };
++    bool                              m_nativeCaptureActive = false;
++    uint64_t                          m_nativeCaptureStartPi = 0;
++    uint64_t                          m_nativeCaptureTarget = 0;
++    std::vector<PendingNativeCommand> m_pendingNativeCommands;
++    std::vector<NativeHclRelocation>  m_pendingNativeRelocations;
+ };
+ }  // namespace hcl
+diff --git a/hcl/src/platform/gaudi2/commands/hcl_commands.cpp b/hcl/src/platform/gaudi2/commands/hcl_commands.cpp
+index f9b76e8..2d65adf 100644
+--- a/hcl/src/platform/gaudi2/commands/hcl_commands.cpp
++++ b/hcl/src/platform/gaudi2/commands/hcl_commands.cpp
+@@ -302,7 +302,9 @@ void HclCommandsGaudi2::serializeScaleUpCollectiveOp(hcl::ScalStreamBase&   scal
+     }
+ 
+     // here we create the collective context which we would like to have in the FW
+-    hcclRedOp_t               effectiveReductionOp = hcclOpNone;
++    hcclRedOp_t effectiveReductionOp = scaleupCollectiveOp.m_directNicReduction && scaleupCollectiveOp.m_isSend
++                                           ? scaleupCollectiveOp.m_reduceOp
++                                           : hcclOpNone;
+     RequiredCollectiveContext requiredContext(scaleupCollectiveOp.m_collectiveOp,
+                                               effectiveReductionOp,
+                                               scaleupCollectiveOp.m_soAddress,
+@@ -310,6 +312,11 @@ void HclCommandsGaudi2::serializeScaleUpCollectiveOp(hcl::ScalStreamBase&   scal
+                                               scaleupCollectiveOp.m_baseAddress >> 32,
+                                               scaleupCollectiveOp.m_dataType,
+                                               scaleupCollectiveOp.m_strideCount);
++    if (scaleupCollectiveOp.m_directNicReduction && scaleupCollectiveOp.m_isSend &&
++        scaleupCollectiveOp.m_dataType == hcclBfloat16)
++    {
++        requiredContext.m_reductionOpcode.datatype = REDUCTION_BF16;
++    }
+ 
+     std::array<UniqueCollectiveContext, HLS2_BOX_SIZE> uniqueContexts;
+     int                                                numberOfEnabledConnections = 0;
+@@ -325,7 +332,8 @@ void HclCommandsGaudi2::serializeScaleUpCollectiveOp(hcl::ScalStreamBase&   scal
+                                                           scaleupCollectiveOp.m_isSend,
+                                                           scaleupCollectiveOp.m_isComplexCollective,
+                                                           scaleupCollectiveOp.m_isReductionInIMB,
+-                                                          scaleupCollectiveOp.m_isReduction,
++                                                          scaleupCollectiveOp.m_isReduction ||
++                                                              scaleupCollectiveOp.m_directNicTransfer,
+                                                           scaleupCollectiveOp.m_isHierarchical,
+                                                           scaleupCollectiveOp.m_count,
+                                                           scaleupCollectiveOp.m_cellCount,
+@@ -793,4 +801,4 @@ void HclCommandsGaudi2::serializeSetTraceMarker(hcl::ScalStreamBase& scalStream,
+         schedIdx,
+         GAUDI2_SCHED_INSTANT_STM_ADDR(g2fw::CPU_ID_SCHED_ARC3, SCHED_INSTANT_EVENT_TYPE_ID),
+         val << 16 | g2fw::SCHED_INST_EVENT_COLLECT_TIMESTAMP);
+-}
+\ No newline at end of file
++}
+diff --git a/hcl/src/platform/gaudi2/context_manager.cpp b/hcl/src/platform/gaudi2/context_manager.cpp
+index 78c136a..0ca78a4 100644
+--- a/hcl/src/platform/gaudi2/context_manager.cpp
++++ b/hcl/src/platform/gaudi2/context_manager.cpp
+@@ -244,9 +244,11 @@ void ContextManager::updateCommonDword(unsigned                         collecti
+         cachedCollectiveContext = &m_cachedCollectiveContextsScaleOut[collectiveContextIndex];
+     }
+ 
++    const bool forceAll = isScaleup && !m_cachedCollectiveContextsScaleUpValid.at(collectiveContextIndex);
++
+     if (dwordsForUpdate.DW0)
+     {
+-        VERIFY(requiredContext.m_reductionOpcode.raw != cachedCollectiveContext->m_data.reduction_opcode);
++        VERIFY(forceAll || requiredContext.m_reductionOpcode.raw != cachedCollectiveContext->m_data.reduction_opcode);
+ 
+         updateDWord(contextValues, DW0, requiredContext.m_reductionOpcode.raw);
+         cachedCollectiveContext->m_data.reduction_opcode = requiredContext.m_reductionOpcode.raw;
+@@ -254,7 +256,7 @@ void ContextManager::updateCommonDword(unsigned                         collecti
+ 
+     if (dwordsForUpdate.DW1)
+     {
+-        VERIFY(requiredContext.m_syncObjectAddress != cachedCollectiveContext->m_data.sync_object_address_0);
++        VERIFY(forceAll || requiredContext.m_syncObjectAddress != cachedCollectiveContext->m_data.sync_object_address_0);
+ 
+         updateDWord(contextValues, DW1, requiredContext.m_syncObjectAddress);
+         cachedCollectiveContext->m_data.sync_object_address_0 = requiredContext.m_syncObjectAddress;
+@@ -262,7 +264,7 @@ void ContextManager::updateCommonDword(unsigned                         collecti
+ 
+     if (dwordsForUpdate.DW2)
+     {
+-        VERIFY(requiredContext.m_syncObjectAddress != cachedCollectiveContext->m_data.sync_object_address_1);
++        VERIFY(forceAll || requiredContext.m_syncObjectAddress != cachedCollectiveContext->m_data.sync_object_address_1);
+ 
+         updateDWord(contextValues, DW2, requiredContext.m_syncObjectAddress);
+         cachedCollectiveContext->m_data.sync_object_address_1 = requiredContext.m_syncObjectAddress;
+@@ -270,7 +272,8 @@ void ContextManager::updateCommonDword(unsigned                         collecti
+ 
+     if (dwordsForUpdate.DW3)
+     {
+-        VERIFY(requiredContext.m_addressMSB != cachedCollectiveContext->m_data.buffer_addr_msb);
++        VERIFY(forceAll || (isScaleup && m_forceScaleupBufferAddressUpdate) ||
++               requiredContext.m_addressMSB != cachedCollectiveContext->m_data.buffer_addr_msb);
+ 
+         updateDWord(contextValues, DW3, requiredContext.m_addressMSB);
+         cachedCollectiveContext->m_data.buffer_addr_msb = requiredContext.m_addressMSB;
+@@ -278,7 +281,7 @@ void ContextManager::updateCommonDword(unsigned                         collecti
+ 
+     if (dwordsForUpdate.DW4)
+     {
+-        VERIFY(requiredContext.m_stride != cachedCollectiveContext->m_data.stride);
++        VERIFY(forceAll || requiredContext.m_stride != cachedCollectiveContext->m_data.stride);
+ 
+         updateDWord(contextValues, DW4, requiredContext.m_stride);
+         cachedCollectiveContext->m_data.stride = requiredContext.m_stride;
+@@ -477,6 +480,7 @@ void ContextManager::createCollectiveContexts(HclCommandsGen2Arch& commands, con
+     {
+         m_cachedCollectiveContextsScaleUp.push_back(
+             CachedCollectiveContextScaleUp(i, m_nicEngines, m_serverConnectivity, commands));
++        m_cachedCollectiveContextsScaleUpValid.push_back(false);
+         m_cachedCollectiveContextsScaleOut.push_back(
+             CachedCollectiveContextScaleOut(i, m_nicEngines, m_serverConnectivity, commands));
+     }
+@@ -602,6 +606,22 @@ edwords_t ContextManager::getDwordsForUpdate(bool                             is
+ 
+     cachedCollectiveContext->dwordDiff(requiredContext, dwordsForUpdate);
+ 
++    if (isScaleup && !m_cachedCollectiveContextsScaleUpValid.at(collectiveContextIndex))
++    {
++        dwordsForUpdate.DW0 = true;
++        dwordsForUpdate.DW1 = true;
++        dwordsForUpdate.DW2 = true;
++        dwordsForUpdate.DW3 = true;
++        dwordsForUpdate.DW4 = true;
++    }
++
++    // Fixed-buffer decoder graphs may be entered after an ordinary collective
++    // that left the same NIC context pointing at another HBM allocation.  A
++    // replayable template must therefore install its own buffer MSB.  Do not
++    // force the synchronization-address dwords: those advance with the SOB
++    // pools and require their normal phase-specific update contract.
++    if (isScaleup && m_forceScaleupBufferAddressUpdate) dwordsForUpdate.DW3 = true;
++
+     if (isScaleup)
+     {
+         CachedCollectiveContextScaleUp* cachedCollectiveContextScaleUp =
+@@ -647,6 +667,14 @@ void ContextManager::updateCollectiveContextScaleUp(hcl::ScalStreamBase&
+ {
+     edwords_t dwordsForUpdate =
+         pDwordsForUpdate ? *pDwordsForUpdate : getDwordsForUpdate(true, collectiveContextIndex, comm, requiredContext);
++    if (!m_cachedCollectiveContextsScaleUpValid.at(collectiveContextIndex))
++    {
++        dwordsForUpdate.DW0 = true;
++        dwordsForUpdate.DW1 = true;
++        dwordsForUpdate.DW2 = true;
++        dwordsForUpdate.DW3 = true;
++        dwordsForUpdate.DW4 = true;
++    }
+ 
+     if (dwordsForUpdate > 0)
+     {
+@@ -691,6 +719,14 @@ void ContextManager::updateCollectiveContextScaleUp(hcl::ScalStreamBase&
+     m_cachedCollectiveContextsScaleUp[collectiveContextIndex].advanceSOB(dwordsForUpdate,
+                                                                          syncObjectAddressIndex,
+                                                                          requiredContext.m_syncObjectAddress);
++    m_cachedCollectiveContextsScaleUpValid.at(collectiveContextIndex) = true;
++}
++
++void ContextManager::invalidateScaleupContextCache()
++{
++    std::fill(m_cachedCollectiveContextsScaleUpValid.begin(),
++              m_cachedCollectiveContextsScaleUpValid.end(),
++              false);
+ }
+ 
+ void ContextManager::updateCollectiveContextScaleOut(unsigned                         collectiveContextIndex,
+diff --git a/hcl/src/platform/gaudi2/context_manager.h b/hcl/src/platform/gaudi2/context_manager.h
+index b29205f..86a0bbf 100644
+--- a/hcl/src/platform/gaudi2/context_manager.h
++++ b/hcl/src/platform/gaudi2/context_manager.h
+@@ -46,6 +46,9 @@ public:
+     static std::array<UniqueCollectiveContext, HLS2_BOX_SIZE>
+     createUniqueContexts(const RequiredCollectiveContext& context);
+ 
++    void forceScaleupBufferAddressUpdate(bool enabled) { m_forceScaleupBufferAddressUpdate = enabled; }
++    void invalidateScaleupContextCache();
++
+     edwords_t getDwordsForUpdate(bool                             isScaleup,
+                                  unsigned                         collectiveContextIndex,
+                                  HCL_Comm                         comm,
+@@ -123,6 +126,7 @@ private:
+     std::vector<g2fw::nic_glbl_ctxt_t>           m_scaleoutGlobalContexts;            // one per EARC
+     std::vector<CachedCollectiveContextScaleUp>  m_cachedCollectiveContextsScaleUp;   // one per Collective Context
+     std::vector<CachedCollectiveContextScaleOut> m_cachedCollectiveContextsScaleOut;  // one per Collective Context
++    std::vector<bool>                            m_cachedCollectiveContextsScaleUpValid;
+ 
+     std::array<bool, MAX_NICS_GEN2ARCH> m_activeNics;
+ 
+@@ -130,4 +134,5 @@ private:
+     int                               m_maxCollectiveContexts = -1;
+     HclDeviceGaudi2&                  m_device;
+     const Gen2ArchServerConnectivity& m_serverConnectivity;
++    bool                              m_forceScaleupBufferAddressUpdate = false;
+ };
+diff --git a/hcl/src/platform/gaudi2/hcl_mem_handler.cpp b/hcl/src/platform/gaudi2/hcl_mem_handler.cpp
+index 5d0cf07..c3c52fa 100644
+--- a/hcl/src/platform/gaudi2/hcl_mem_handler.cpp
++++ b/hcl/src/platform/gaudi2/hcl_mem_handler.cpp
+@@ -20,7 +20,8 @@ void HclCollectiveMemHandlerGaudi2::generateBaseAddressOrSubBuffIdx(SliceState&
+                                                                     uint64_t&         baseAddress,
+                                                                     uint32_t&         subBuffIndex)
+ {
+-    if (!sliceState.m_isReductionCollective || currentOp == eHCLAllGather || currentOp == eHCLGather)
++    if (sliceState.m_execution.m_directScaleupNicTransfer || !sliceState.m_isReductionCollective ||
++        currentOp == eHCLAllGather || currentOp == eHCLGather)
+     {
+         baseAddress =
+             m_addressGenerator.generateScaleUpRecvAddress(sliceState, sliceIter, boxNumInfo, currentOp, offset);
+diff --git a/hcl/src/platform/gaudi2/hcl_packets.cpp b/hcl/src/platform/gaudi2/hcl_packets.cpp
+index 3bf4d2d..c7581d5 100644
+--- a/hcl/src/platform/gaudi2/hcl_packets.cpp
++++ b/hcl/src/platform/gaudi2/hcl_packets.cpp
+@@ -7,6 +7,7 @@
+ #include <cstdint>             // for uint32_t, uint16_t
+ #include <memory>              // for __shared_ptr_ac...
+ #include <utility>             // for pair, move
++#include <vector>
+ 
+ #include "hcl_utils.h"                                // for VERIFY
+ #include "infra/scal/gen2_arch_common/scal_names.h"   // for SchedulersIndex
+@@ -29,6 +30,59 @@ static const unsigned edmaOpCodesPerSched[(unsigned)hcl::SchedulersIndex::count]
+     INVALID_SCHED,
+     g2fw::SCHED_SCALEOUT_RECV_ARC_CMD_NIC_EDMA_OPS};
+ 
++namespace
++{
++template<typename Packet, typename Setter>
++void registerNativeBooleanRelocation(hcl::ScalStreamBase&    scalStream,
++                                     Packet*                  packet,
++                                     size_t                   packetSize,
++                                     bool                     capturedValue,
++                                     hcl::NativeHclRelocationKind kind,
++                                     Setter&&                 setter)
++{
++    if (!scalStream.isNativeCaptureActive())
++    {
++        return;
++    }
++
++    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(packet);
++    std::vector<uint8_t> original(bytes, bytes + packetSize);
++    setter(!capturedValue);
++
++    size_t  changedByte = packetSize;
++    uint8_t changedMask = 0;
++    unsigned changedBits = 0;
++    for (size_t index = 0; index < packetSize; ++index)
++    {
++        const uint8_t difference = original[index] ^ bytes[index];
++        if (difference != 0)
++        {
++            changedByte = index;
++            changedMask = difference;
++            for (uint8_t bits = difference; bits != 0; bits >>= 1)
++            {
++                changedBits += bits & 1;
++            }
++        }
++    }
++    setter(capturedValue);
++
++    VERIFY(changedBits == 1 && changedByte < packetSize,
++           "Native WQE relocation must describe exactly one packet bit");
++    uint8_t destinationShift = 0;
++    while (((changedMask >> destinationShift) & 1u) == 0u)
++    {
++        ++destinationShift;
++    }
++    scalStream.addNativeRelocation(reinterpret_cast<const uint8_t*>(packet) + changedByte,
++                                   1,
++                                   changedMask,
++                                   destinationShift,
++                                   0,
++                                   kind);
++}
++}  // namespace
++
+ void SchedArcCommandsGaudi2::serializeNopCommand(hcl::ScalStreamBase& scalStream, unsigned schedIdx, uint32_t padding)
+ {
+     g2fw::sched_arc_cmd_nop_t* command =
+@@ -1008,6 +1062,22 @@ void SchedArcCommandsGaudi2::serializeCollectiveSendShortCommand(hcl::ScalStream
+     SET_FIELD(cmd_coll_ops_short->comm_desc_index, commDescIndex);
+     SET_FIELD(cmd_coll_ops_short->buffer_addr_lsb, (address >> 4));
+ 
++    if (!isSend)
++    {
++        registerNativeBooleanRelocation(scalStream,
++                                        command,
++                                        dwords * sizeof(uint32_t),
++                                        notifyRndvAck,
++                                        hcl::NativeHclRelocationKind::WQE_NOTIFY,
++                                        [&](bool value) { cmd_coll_ops_short->notify_rndv_ack = value; });
++        registerNativeBooleanRelocation(scalStream,
++                                        command,
++                                        dwords * sizeof(uint32_t),
++                                        waitForRndvAcks,
++                                        hcl::NativeHclRelocationKind::WQE_WAIT,
++                                        [&](bool value) { cmd_coll_ops_short->wait_for_rndv_acks = value; });
++    }
++
+     if (hasBufferSize)
+     {
+         std::memcpy(&cmd_coll_ops_short->buffer_size, &bufferSize, sizeof(uint32_t));
+@@ -1070,6 +1140,19 @@ void SchedArcCommandsGaudi2::serializeCollectiveRecvShortInOrderCommand(hcl::Sca
+     SET_FIELD(cmd_coll_ops_short->notify_rndv_ack, notifyRndvAck);
+     SET_FIELD(cmd_coll_ops_short->wait_for_rndv_acks, waitForRndvAcks);
+ 
++    registerNativeBooleanRelocation(scalStream,
++                                    command,
++                                    dwords * sizeof(uint32_t),
++                                    notifyRndvAck,
++                                    hcl::NativeHclRelocationKind::WQE_NOTIFY,
++                                    [&](bool value) { cmd_coll_ops_short->notify_rndv_ack = value; });
++    registerNativeBooleanRelocation(scalStream,
++                                    command,
++                                    dwords * sizeof(uint32_t),
++                                    waitForRndvAcks,
++                                    hcl::NativeHclRelocationKind::WQE_WAIT,
++                                    [&](bool value) { cmd_coll_ops_short->wait_for_rndv_acks = value; });
++
+     /**<
+      * Reduction parameters to be used when accumulating data into
+      * SIB Order buffer. For the rest of the NICs it uses Reduction
+@@ -1149,6 +1232,22 @@ void SchedArcCommandsGaudi2::serializeCollectiveSendLongCommand(hcl::ScalStreamB
+     SET_FIELD(cmd_coll_ops_long->buffer_addr_lsb, (address & 0xffffffff));  // 32 bits
+     SET_FIELD(cmd_coll_ops_long->addr_msb, ((address >> 32) & 0x1fff));     // 13 bits
+ 
++    if (!isSend)
++    {
++        registerNativeBooleanRelocation(scalStream,
++                                        command,
++                                        dwords * sizeof(uint32_t),
++                                        notifyRndvAck,
++                                        hcl::NativeHclRelocationKind::WQE_NOTIFY,
++                                        [&](bool value) { cmd_coll_ops_long->notify_rndv_ack = value; });
++        registerNativeBooleanRelocation(scalStream,
++                                        command,
++                                        dwords * sizeof(uint32_t),
++                                        waitForRndvAcks,
++                                        hcl::NativeHclRelocationKind::WQE_WAIT,
++                                        [&](bool value) { cmd_coll_ops_long->wait_for_rndv_acks = value; });
++    }
++
+     if (hasBufferSize)
+     {
+         std::memcpy(&cmd_coll_ops_long->buffer_size, &bufferSize, sizeof(uint32_t));
+diff --git a/hcl/src/platform/gaudi2/simb_pool_container_allocator.cpp b/hcl/src/platform/gaudi2/simb_pool_container_allocator.cpp
+index 37aae12..825c01b 100644
+--- a/hcl/src/platform/gaudi2/simb_pool_container_allocator.cpp
++++ b/hcl/src/platform/gaudi2/simb_pool_container_allocator.cpp
+@@ -40,7 +40,7 @@ void SimbPoolContainerAllocatorGaudi2::init()
+     poolTypes[SIBO_STANDARD_SIMB_SIZE].push_back(REDUCE_POOL);
+     poolTypes[SIBO_STANDARD_SIMB_SIZE].push_back(SCALEUP_AND_ALL2ALL_POOL);
+ 
+-    if (GCFG_HCCL_PRIM_COLLECTIVE_MASK.value())
++    if (GCFG_HCCL_PRIM_COLLECTIVE_MASK.value() || GCFG_HCL_TP2_DEDICATED_DIRECT_API.value())
+     {
+         poolTypes[SIBO_DOUBLE_SIMB_SIZE].push_back(PRIMITIVE_POOL);
+     }
+diff --git a/hcl/src/platform/gaudi2/wqe_tracker.cpp b/hcl/src/platform/gaudi2/wqe_tracker.cpp
+index db7a19c..424efd4 100644
+--- a/hcl/src/platform/gaudi2/wqe_tracker.cpp
++++ b/hcl/src/platform/gaudi2/wqe_tracker.cpp
+@@ -4,6 +4,19 @@
+ #include "hcl_dynamic_communicator.h"  // for HclDynamicCommunicator
+ #include "hcl_utils.h"                 // for VERIFY
+ 
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++namespace
++{
++bool nativeWqeDiagnosticsEnabled()
++{
++    const char* value = std::getenv("HCL_TP2_NATIVE_REPLAY_DIAGNOSTICS");
++    return value != nullptr && std::strcmp(value, "1") == 0;
++}
++}  // namespace
++
+ WqeTrackerGaudi2::WqeTrackerGaudi2(unsigned cgSize) : WqeTracker(cgSize)
+ {
+     VERIFY(m_recvWqeEntriesNum == cgSize >> 1,
+@@ -28,7 +41,8 @@ void WqeTrackerGaudi2::incWqe(const HCL_Comm commId, const unsigned rank, const
+     VERIFY(qpTypeIdx < (unsigned)QpType::QPTypeSize);
+     VERIFY((int)qpType >= (int)QpType::ScaleOutAllGather || rank < DEFAULT_BOX_SIZE);
+ 
+-    if (((++m_wqePerConnection[qpTypeIdx][commId][rank]) & (m_recvWqeEntriesNum - 1)) == 0)
++    const uint64_t counter = ++m_wqePerConnection[qpTypeIdx][commId][rank];
++    if ((counter & (m_recvWqeEntriesNum - 1)) == 0)
+     {
+         switch (qpType)
+         {
+@@ -44,6 +58,21 @@ void WqeTrackerGaudi2::incWqe(const HCL_Comm commId, const unsigned rank, const
+                 assert(false);
+         }
+     }
++    if (nativeWqeDiagnosticsEnabled() && counter >= m_recvWqeEntriesNum - 4 &&
++        counter <= m_recvWqeEntriesNum + 4)
++    {
++        const auto& bits = m_wqeWraparoundBits[qpTypeIdx][commId][0];
++        std::fprintf(stderr,
++                     "NATIVE_WQE inc comm=%u rank=%u qp=%u counter=%llu entries=%u notify=%u wait=%u\n",
++                     static_cast<unsigned>(commId),
++                     rank,
++                     static_cast<unsigned>(qpType),
++                     static_cast<unsigned long long>(counter),
++                     m_recvWqeEntriesNum,
++                     static_cast<unsigned>(bits.notify_rndv_ack),
++                     static_cast<unsigned>(bits.wait_for_rndv_acks));
++        std::fflush(stderr);
++    }
+ }
+ 
+ /**
+@@ -102,6 +131,18 @@ WqeWraparoundBits WqeTrackerGaudi2::getWqeWraparoundBits(HCL_Comm commId, unsign
+ 
+     auto bitsToReturn = m_wqeWraparoundBits[qpTypeIdx][commId][rank];
+ 
++    if (nativeWqeDiagnosticsEnabled() && (bitsToReturn.notify_rndv_ack || bitsToReturn.wait_for_rndv_acks))
++    {
++        std::fprintf(stderr,
++                     "NATIVE_WQE get comm=%u rank=%u qp=%u notify=%u wait=%u\n",
++                     static_cast<unsigned>(commId),
++                     rank,
++                     static_cast<unsigned>(qpType),
++                     static_cast<unsigned>(bitsToReturn.notify_rndv_ack),
++                     static_cast<unsigned>(bitsToReturn.wait_for_rndv_acks));
++        std::fflush(stderr);
++    }
++
+     auto& ptr              = m_wqeWraparoundBits[qpTypeIdx][commId][rank];
+     ptr.wait_for_rndv_acks = ptr.notify_rndv_ack;
+     ptr.notify_rndv_ack    = false;
+diff --git a/hcl/src/platform/gen2_arch_common/active_stream_manager.cpp b/hcl/src/platform/gen2_arch_common/active_stream_manager.cpp
+index 06b7a3f..bc2460f 100644
+--- a/hcl/src/platform/gen2_arch_common/active_stream_manager.cpp
++++ b/hcl/src/platform/gen2_arch_common/active_stream_manager.cpp
+@@ -47,8 +47,13 @@ void ActiveStreamManagerGen2Arch::initializeActiveStreams(CommonState& commonSta
+         auto& streamList = m_activeStreamsPerScheduler[static_cast<int>(sched)];
+         std::fill(streamList.begin(), streamList.end(), nullptr);
+ 
+-        // add the collective stream to the active stream list for each scaleup/scaleout scheduler
+-        if (sched != hcl::SchedulersIndex::gp)
++        const bool unusedScaleoutScheduler = GCFG_HCL_TP2_PRUNE_SCALEOUT_STREAMS.value() &&
++                                             m_commonState->m_directScaleupNicTransfer &&
++                                             (sched == hcl::SchedulersIndex::sendScaleOut ||
++                                              sched == hcl::SchedulersIndex::recvScaleOut);
++
++        // A single-box direct-NIC reduction has no scale-out work or credits to arbitrate.
++        if (sched != hcl::SchedulersIndex::gp && !unusedScaleoutScheduler)
+         {
+             addCollectiveStreamToActiveStreamList((hcl::SchedulersIndex)sched);
+         }
+@@ -158,6 +163,10 @@ hcl::ScalStream& ActiveStreamManagerGen2Arch::getArbitratorStream(const hcl::Sch
+ 
+ bool ActiveStreamManagerGen2Arch::isReductionStreamActive(bool reductionRS)
+ {
++    if (m_commonState->m_directScaleupNicTransfer)
++    {
++        return false;
++    }
+     return ((m_commonState->m_16BitReduction || (!m_commonState->m_inPlace && !m_commonState->m_isMultiScaleupGroup)) &&
+             reductionRS && m_commonState->m_dynamicComm.getScaleupGroupSize() != 1) ||
+            (m_commonState->m_currentOp == eHCLReduceScatter && m_commonState->m_dynamicComm.getScaleupGroupSize() != 1);
+@@ -202,4 +211,4 @@ bool ActiveStreamManagerGen2Arch::isGdrStreamActive(bool isFirstBox)
+ {
+     return m_scaleoutProvider->isGaudiDirect() && m_commonState->m_isMultiScaleupGroup &&
+            m_commonState->m_currentOp == eHCLReduceScatter && !isFirstBox && !m_commonState->isRSContReduction();
+-}
+\ No newline at end of file
++}
+diff --git a/hcl/src/platform/gen2_arch_common/api_aggregator.cpp b/hcl/src/platform/gen2_arch_common/api_aggregator.cpp
+index 5deb756..1db42ff 100644
+--- a/hcl/src/platform/gen2_arch_common/api_aggregator.cpp
++++ b/hcl/src/platform/gen2_arch_common/api_aggregator.cpp
+@@ -13,6 +13,7 @@
+ #include "hccl_context.h"
+ #include "hccl_prim_collectives.h"
+ #include "hccl_api_inc.h"                           // for HCCL_CHECK_STOP*
++#include "hccl/tp2_direct_api_context.h"
+ #include "hccl_communicator.h"                      // for hccl_communicator
+ #include "interfaces/hcl_idevice.h"                 // for IHclDevice
+ #include "platform/gen2_arch_common/hccl_device.h"  // for hccl_device()
+@@ -20,7 +21,7 @@
+ ApiAggregatorGen2Arch::ApiAggregatorGen2Arch(HclCollectiveRoutinesGen2Arch* collectiveRoutines)
+ : m_collectiveRoutines(collectiveRoutines)
+ {
+-    if (GCFG_HCCL_PRIM_COLLECTIVE_MASK.value() != 0)
++    if (GCFG_HCCL_PRIM_COLLECTIVE_MASK.value() != 0 || GCFG_HCL_TP2_DEDICATED_DIRECT_API.value())
+     {
+         HcclPrimitives::initPrimitiveImpl();
+     }
+@@ -269,7 +270,15 @@ hcclResult_t ApiAggregatorGen2Arch::addCollectiveApiCall(HclCollectiveParams& pa
+ {
+     if (m_counter == 0)  // no group mode
+     {
+-        if (CHECK_PRIM_IMPL(params.m_collectiveOp))
++        const uint64_t tp2DirectMaxCount = GCFG_HCL_TP2_DIRECT_MAX_COUNT.value();
++        const bool dedicatedTp2DirectCall = HclGen2::isTp2DedicatedDirectCall();
++        const bool tp2DirectRequested = dedicatedTp2DirectCall || GCFG_HCL_TP2_DIRECT_NIC_RS_AR.value() ||
++                                        GCFG_HCL_TP2_DIRECT_NIC_EXCHANGE.value();
++        const bool bypassTp2DirectPrimitive =
++            params.m_collectiveOp == eHCLAllReduce &&
++            tp2DirectRequested &&
++            tp2DirectMaxCount > 0 && params.m_count > tp2DirectMaxCount;
++        if ((dedicatedTp2DirectCall || CHECK_PRIM_IMPL(params.m_collectiveOp)) && !bypassTp2DirectPrimitive)
+         {
+             return HcclPrimitives::run(m_collectiveRoutines, params);
+         }
+diff --git a/hcl/src/platform/gen2_arch_common/collective_states.cpp b/hcl/src/platform/gen2_arch_common/collective_states.cpp
+index a645bbe..a7a7704 100644
+--- a/hcl/src/platform/gen2_arch_common/collective_states.cpp
++++ b/hcl/src/platform/gen2_arch_common/collective_states.cpp
+@@ -879,6 +879,10 @@ uint64_t CommonState::getChunkCountToClear()
+ 
+ uint64_t CommonState::getStrideCount()
+ {
++    if (m_currentOp == eHCLReduceScatter && m_scaleUpStrideCount == 0)
++    {
++        return 0;
++    }
+     if (isComplexImplementation())
+     {
+         return m_rankScaleUpCount;
+diff --git a/hcl/src/platform/gen2_arch_common/collective_states.h b/hcl/src/platform/gen2_arch_common/collective_states.h
+index dd47f42..6b98b73 100644
+--- a/hcl/src/platform/gen2_arch_common/collective_states.h
++++ b/hcl/src/platform/gen2_arch_common/collective_states.h
+@@ -339,6 +339,12 @@ struct SliceExecutionOutput
+     // flag requests reduction execution of data within slice
+     bool m_doReduction = false;
+ 
++    // flag requests a linear HBM receive directly from the scale-up NIC
++    bool m_directScaleupNicTransfer = false;
++
++    // flag requests reduction while performing the direct scale-up NIC transfer
++    bool m_directScaleupNicReduction = false;
++
+     // flag requests casts operation of slice data
+     castFlag casts;
+ };
+diff --git a/hcl/src/platform/gen2_arch_common/commands/hcl_commands_types.h b/hcl/src/platform/gen2_arch_common/commands/hcl_commands_types.h
+index a45d799..3d3fe0f 100644
+--- a/hcl/src/platform/gen2_arch_common/commands/hcl_commands_types.h
++++ b/hcl/src/platform/gen2_arch_common/commands/hcl_commands_types.h
+@@ -162,7 +162,9 @@ struct ScaleUpCollectiveOp
+     uint64_t                m_strideCount;
+     bool                    m_notifyRndvAck;
+     bool                    m_waitForRndvAcks;
+-    bool                    m_isReduction       = false;
++    bool                    m_isReduction        = false;
++    bool                    m_directNicTransfer  = false;
++    bool                    m_directNicReduction = false;
+     uint32_t                m_subBuffIndex      = 0;
+     HCL_CollectiveOp        m_complexCollective = eHCLNoCollective;
+     bool                    m_isRoot            = false;
+diff --git a/hcl/src/platform/gen2_arch_common/hccl_device.h b/hcl/src/platform/gen2_arch_common/hccl_device.h
+index bc73b4e..8265bc9 100644
+--- a/hcl/src/platform/gen2_arch_common/hccl_device.h
++++ b/hcl/src/platform/gen2_arch_common/hccl_device.h
+@@ -59,6 +59,12 @@ public:
+     virtual hcclResult_t send_recv_call(int myRank, const SendRecvApiEntry& entry);
+     virtual hcclResult_t collective_call(HclCollectiveParams& params);
+ 
++    uint32_t nativeStreamId(void* streamHandle) { return stream_id(streamHandle); }
++    HclCollectiveRoutinesGen2Arch* nativeCollectiveRoutines(uint32_t streamId)
++    {
++        return streamId < collectives_.size() ? collectives_[streamId] : nullptr;
++    }
++
+     virtual hcl_device_t operator->() { return device_; }
+     virtual              operator hcl_device_t() { return device_; }
+ 
+diff --git a/hcl/src/platform/gen2_arch_common/hcl_collective_routines.cpp b/hcl/src/platform/gen2_arch_common/hcl_collective_routines.cpp
+index c7fa9f3..91fcd55 100644
+--- a/hcl/src/platform/gen2_arch_common/hcl_collective_routines.cpp
++++ b/hcl/src/platform/gen2_arch_common/hcl_collective_routines.cpp
+@@ -14,6 +14,7 @@
+ #include "hcl_log_manager.h"                                  // for LOG_*
+ #include "platform/gen2_arch_common/commands/hcl_commands.h"  // for HclComm...
+ #include "platform/gen2_arch_common/hcl_device.h"             // for HclDevi...
++#include "platform/gaudi2/hcl_device.h"
+ #include "platform/gen2_arch_common/collective_states.h"
+ #include "hcl_utils.h"  // for VERIFY
+ #include "platform/gen2_arch_common/device_simb_pool_manager.h"
+@@ -70,6 +71,92 @@ HclCollectiveRoutinesGen2Arch::~HclCollectiveRoutinesGen2Arch()
+     }
+ }
+ 
++void HclCollectiveRoutinesGen2Arch::setNativeScaleupBufferAddressRefresh(bool enabled)
++{
++    auto* gaudi2 = dynamic_cast<HclDeviceGaudi2*>(m_device);
++    VERIFY(gaudi2 != nullptr, "Native TP2 buffer-address refresh requires a Gaudi2 device");
++    gaudi2->getContextManager().forceScaleupBufferAddressUpdate(enabled);
++}
++
++void HclCollectiveRoutinesGen2Arch::invalidateNativeScaleupContextCache()
++{
++    auto* gaudi2 = dynamic_cast<HclDeviceGaudi2*>(m_device);
++    VERIFY(gaudi2 != nullptr, "Native TP2 context invalidation requires a Gaudi2 device");
++    gaudi2->getContextManager().invalidateScaleupContextCache();
++}
++
++hcl::syncInfo HclCollectiveRoutinesGen2Arch::replayNativeCapture(
++    const HclDeviceControllerGen2Arch::NativeGraphCapture& capture,
++    HclDynamicCommunicator&                                 dynamicComm,
++    const hcl::syncInfo&                                    dependency,
++    bool                                                    submit)
++{
++    VERIFY(dynamicComm.getScaleupGroupSize() == 2, "Native direct graph requires TP2");
++    VERIFY(!m_nullSubmit, "Native direct graph cannot run with null submission enabled");
++    VERIFY(dependency.targetValue != 0, "Native direct graph requires a compute dependency");
++    VERIFY((dependency.long_so_index >> 3) <= 0xff,
++           "Native direct graph dependency long-SO {} is outside the configured long-monitor quarter",
++           dependency.long_so_index);
++
++    std::lock_guard<std::mutex> streamLock(m_deviceController.getStreamLock(m_streamId));
++    const unsigned peerRankInScaleupGroup = dynamicComm.getRankInScaleupGroup() ^ 1u;
++    m_wqeTracker->incWqe(dynamicComm, peerRankInScaleupGroup, QpType::ScaleUpReduceScatter);
++    const WqeWraparoundBits wraparound =
++        m_wqeTracker->getWqeWraparoundBits(dynamicComm, 0, QpType::ScaleUpReduceScatter);
++
++    hcl::NativeHclReplayState replayState;
++    replayState.values[static_cast<size_t>(hcl::NativeHclRelocationKind::DEPENDENCY_TARGET)] =
++        dependency.targetValue;
++    replayState.values[static_cast<size_t>(hcl::NativeHclRelocationKind::DEPENDENCY_LONG_SO_INDEX)] =
++        dependency.long_so_index;
++    replayState.values[static_cast<size_t>(hcl::NativeHclRelocationKind::WQE_NOTIFY)] =
++        wraparound.notify_rndv_ack;
++    replayState.values[static_cast<size_t>(hcl::NativeHclRelocationKind::WQE_WAIT)] =
++        wraparound.wait_for_rndv_acks;
++
++    hcl::syncInfo completion =
++        m_deviceController.replayNativeCapture(m_streamId, capture, replayState, submit);
++    if (submit) invalidateNativeScaleupContextCache();
++    dynamicComm.updateFaultToleranceCollectivesCounters(static_cast<HCL_StreamId>(m_streamId),
++                                                        completion.targetValue);
++    dynamicComm.m_streamLatestLongSo[m_streamId] = completion.targetValue;
++    return completion;
++}
++
++void HclCollectiveRoutinesGen2Arch::replayNativeBatch(
++    const HclDeviceControllerGen2Arch::NativeBatchProgram& program,
++    const std::vector<const HclDeviceControllerGen2Arch::NativeGraphCapture*>& captures,
++    HclDynamicCommunicator& dynamicComm, const hcl::syncInfo* dependencies,
++    hcl::NativeHclReplayState* states, hcl::syncInfo* completions)
++{
++    VERIFY(!m_nullSubmit && dynamicComm.getScaleupGroupSize() == 2, "Invalid native TP2 batch runtime");
++    // Batch owner holds the stream lock across phase selection and publication.
++    const unsigned peer = dynamicComm.getRankInScaleupGroup() ^ 1u;
++    for (size_t node = 0; node < captures.size(); ++node)
++    {
++        m_wqeTracker->incWqe(dynamicComm, peer, QpType::ScaleUpReduceScatter);
++        const auto bits = m_wqeTracker->getWqeWraparoundBits(dynamicComm, 0, QpType::ScaleUpReduceScatter);
++        auto& state = states[node];
++        state.values[static_cast<size_t>(hcl::NativeHclRelocationKind::DEPENDENCY_TARGET)] = dependencies[node].targetValue;
++        state.values[static_cast<size_t>(hcl::NativeHclRelocationKind::DEPENDENCY_LONG_SO_INDEX)] = dependencies[node].long_so_index;
++        state.values[static_cast<size_t>(hcl::NativeHclRelocationKind::WQE_NOTIFY)] = bits.notify_rndv_ack;
++        state.values[static_cast<size_t>(hcl::NativeHclRelocationKind::WQE_WAIT)] = bits.wait_for_rndv_acks;
++        state = m_deviceController.prepareNativeReplayState(m_streamId, *captures[node], state);
++        completions[node] = m_longSo;
++        dynamicComm.updateFaultToleranceCollectivesCounters(static_cast<HCL_StreamId>(m_streamId), m_longSo.targetValue);
++        dynamicComm.m_streamLatestLongSo[m_streamId] = m_longSo.targetValue;
++    }
++    m_deviceController.publishNativeBatch(m_streamId, program, states, captures.size());
++    invalidateNativeScaleupContextCache();
++}
++
++void HclCollectiveRoutinesGen2Arch::submitNativeReplay()
++{
++    std::lock_guard<std::mutex> streamLock(m_deviceController.getStreamLock(m_streamId));
++    m_deviceController.submitNativeReplay(m_streamId);
++    invalidateNativeScaleupContextCache();
++}
++
+ /**
+  * @brief initialize data related per new communicator should be called on hcclCommInitRank
+  *
+@@ -677,8 +764,22 @@ void HclCollectiveRoutinesGen2Arch::finalizeExec(HcclGraph* graph, int exec)
+                            requiredCredits,
+                            commonState->m_currentOp);
+ 
+-    createScaleOutSendProgs(graph->sendSlice(), requiredCredits);
+-    createScaleOutRecvProgs(graph->recvSlice(), requiredCredits);
++    if (!commonState->m_directScaleupNicTransfer || !GCFG_HCL_TP2_PRUNE_SCALEOUT_STREAMS.value())
++    {
++        createScaleOutSendProgs(graph->sendSlice(), requiredCredits);
++        createScaleOutRecvProgs(graph->recvSlice(), requiredCredits);
++    }
++    else
++    {
++        const llvm_vecsmall::SmallVector<unsigned, MAX_STREAM_PER_SCHED> noActiveStreams = {};
++        for (const hcl::SchedulersIndex sched :
++             {hcl::SchedulersIndex::sendScaleOut, hcl::SchedulersIndex::recvScaleOut})
++        {
++            hcl::ScalStream& arbStream = m_deviceController.getScalArbUarchStream(m_streamId, sched);
++            arbStream.setTargetValue(m_longSo.targetValue);
++            m_deviceController.setOpExecutionConditions(arbStream, requiredCredits, noActiveStreams);
++        }
++    }
+ 
+     createGeneralPurposeProgs(requiredCredits);
+ 
+@@ -1005,10 +1106,32 @@ hcclResult_t HclCollectiveRoutinesGen2Arch::processRsPrim(HcclGraph* graph, Hccl
+     m_requestStrongOrderIter |= rsPrim->isStrongOrderRequired();
+     auto& commonState = *(graph->graphState());
+ 
+-    graph->completionSets()[rsPrim->execSet()].requiredResources.tempBuff |= true;
++    const bool directNicTransfer = rsPrim->directNicTransfer();
++    const bool directNicReduction = rsPrim->directNicReduction();
++    const bool stagedInPlaceDirect = directNicTransfer && rsPrim->sendAddr() == rsPrim->recvAddr();
++    graph->completionSets()[rsPrim->execSet()].requiredResources.tempBuff |=
++        !directNicTransfer || stagedInPlaceDirect;
+ 
+-    m_addressGenerator->addressContainer().setScaleupSendAddr(rsPrim->sendAddr());
+-    if (rsPrim->useBuffer())
++    if (stagedInPlaceDirect)
++    {
++        m_addressGenerator->addressContainer().setScaleupMemcpySrcAddr(rsPrim->sendAddr());
++        m_addressGenerator->addressContainer().setScaleupMemcpyDstPool(SCALEUP_AND_ALL2ALL_POOL);
++        m_addressGenerator->addressContainer().setScaleupSendPool(SCALEUP_AND_ALL2ALL_POOL);
++    }
++    else
++    {
++        m_addressGenerator->addressContainer().setScaleupSendAddr(rsPrim->sendAddr());
++    }
++    if (directNicTransfer)
++    {
++        VERIFY(!rsPrim->useBuffer(), "Direct NIC transfer requires an explicit receive address");
++        m_addressGenerator->addressContainer().setScaleupRecvAddr(rsPrim->recvAddr());
++        graph->sendSlice().m_execution.m_directScaleupNicTransfer = true;
++        graph->recvSlice().m_execution.m_directScaleupNicTransfer = true;
++        graph->sendSlice().m_execution.m_directScaleupNicReduction = directNicReduction;
++        graph->recvSlice().m_execution.m_directScaleupNicReduction = directNicReduction;
++    }
++    else if (rsPrim->useBuffer())
+     {
+         m_addressGenerator->addressContainer().setScaleupMemcpyDstPool(
+             DeviceSimbPoolManagerBase::fetchPool(rsPrim->getBuffer()));
+@@ -1020,14 +1143,19 @@ hcclResult_t HclCollectiveRoutinesGen2Arch::processRsPrim(HcclGraph* graph, Hccl
+ 
+     graph->sendSlice().m_execution.casts.scaleupSendCastUp = rsPrim->castUp();
+ 
+-    VERIFY(rsPrim->getCountPerRank() * commonState.m_dataTypeSizeInBytes <= m_device->getSIBBufferSize(),
+-           "Maximal size to be processed per rank by RS primitive is defined by HCL_IMB_SIZE ({}B), consider slicing",
+-           m_device->getSIBBufferSize());
+-
+-    m_addressGenerator->addressContainer().setScaleupRecvPool(SCALEUP_AND_ALL2ALL_POOL);
+-    uint64_t offset = commonState.m_dynamicComm.getRankInScaleupGroup() * rsPrim->getCountPerRank() *
+-                      commonState.m_dataTypeSizeInBytes;
+-    m_addressGenerator->addressContainer().setScaleupMemcpySrcAddr(rsPrim->sendAddr() + offset);
++    if (!directNicTransfer)
++    {
++        VERIFY(rsPrim->getCountPerRank() * commonState.m_dataTypeSizeInBytes <= m_device->getSIBBufferSize(),
++               "Maximal size to be processed per rank by RS primitive is defined by HCL_IMB_SIZE ({}B), consider slicing",
++               m_device->getSIBBufferSize());
++
++        m_addressGenerator->addressContainer().setScaleupRecvPool(SCALEUP_AND_ALL2ALL_POOL);
++        uint64_t offset = rsPrim->replicateInput()
++                              ? 0
++                              : commonState.m_dynamicComm.getRankInScaleupGroup() * rsPrim->getCountPerRank() *
++                                    commonState.m_dataTypeSizeInBytes;
++        m_addressGenerator->addressContainer().setScaleupMemcpySrcAddr(rsPrim->sendAddr() + offset);
++    }
+ 
+     LOG_HCL_CONTEXT_INFO(HCL, "processing RS primitive, inputCount={}", rsPrim->inputCount());
+ 
+@@ -1039,14 +1167,28 @@ hcclResult_t HclCollectiveRoutinesGen2Arch::processRsPrim(HcclGraph* graph, Hccl
+     }
+ 
+     WaitMethod waitMethod = rsPrim->getWaitResource(true);
+-    m_signalsManager->enqueueWait(WaitEvent::DMA_WAIT_FOR_SU_RECV,
+-                                  {SignalEvent::SCALEUP_RECV},
+-                                  waitMethod,
+-                                  m_signalsManager->getNextPhase(waitMethod));
++    if (stagedInPlaceDirect)
++    {
++        m_signalsManager->enqueueWait(WaitEvent::GRAPH_SCALEUP_WAIT_EVENT,
++                                      {SignalEvent::EDMA_MEMCOPY},
++                                      waitMethod,
++                                      m_signalsManager->getNextPhase(waitMethod),
++                                      2);
++    }
++    else if (!directNicTransfer)
++    {
++        m_signalsManager->enqueueWait(WaitEvent::DMA_WAIT_FOR_SU_RECV,
++                                      {SignalEvent::SCALEUP_RECV},
++                                      waitMethod,
++                                      m_signalsManager->getNextPhase(waitMethod));
++    }
+ 
+     enqueueWaitsForPrim(rsPrim, waitMethod, std::move(signalEvents));
+ 
+-    m_signalsManager->enqueueCompletion({SignalEvent::SCALEUP_SEND});
++    if (!directNicTransfer)
++    {
++        m_signalsManager->enqueueCompletion({SignalEvent::SCALEUP_SEND});
++    }
+ 
+     rsPrim->updateCounts();
+ 
+@@ -1563,4 +1705,4 @@ void HclCollectiveRoutinesGen2Arch::dfaLogAddress(uint64_t address, uint64_t siz
+         m_dfaUsedAddresses[m_dfaUsedAddressesHead].size    = size;
+         m_dfaUsedAddressesHead                             = (m_dfaUsedAddressesHead + 1) % m_dfaUsedAddresses.size();
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/hcl/src/platform/gen2_arch_common/hcl_collective_routines.h b/hcl/src/platform/gen2_arch_common/hcl_collective_routines.h
+index 7c30ae3..2d2c150 100644
+--- a/hcl/src/platform/gen2_arch_common/hcl_collective_routines.h
++++ b/hcl/src/platform/gen2_arch_common/hcl_collective_routines.h
+@@ -72,6 +72,44 @@ public:
+ 
+     int enqueueWaitsForPrim(HcclPrim* prim, WaitMethod waitMethod, signalEvents_t&& signalEvents);
+ 
++    void beginNativeCapture() { m_deviceController.beginNativeCapture(m_streamId); }
++    HclDeviceControllerGen2Arch::NativeGraphCapture endNativeCapture()
++    {
++        return m_deviceController.endNativeCapture(m_streamId);
++    }
++    void cancelNativeCapture() { m_deviceController.cancelNativeCapture(m_streamId); }
++    void setNativeScaleupBufferAddressRefresh(bool enabled);
++    void invalidateNativeScaleupContextCache();
++    hcl::syncInfo replayNativeCapture(const HclDeviceControllerGen2Arch::NativeGraphCapture& capture,
++                                      HclDynamicCommunicator&                                 dynamicComm,
++                                      const hcl::syncInfo&                                    dependency,
++                                      bool                                                    submit);
++    void replayNativeBatch(
++        const HclDeviceControllerGen2Arch::NativeBatchProgram& program,
++        const std::vector<const HclDeviceControllerGen2Arch::NativeGraphCapture*>& captures,
++        HclDynamicCommunicator& dynamicComm, const hcl::syncInfo* dependencies,
++        hcl::NativeHclReplayState* states, hcl::syncInfo* completions);
++    void submitNativeReplay();
++    HclDeviceControllerGen2Arch::NativeReplayCounters nativeReplayCounters(
++        const HclDeviceControllerGen2Arch::NativeGraphCapture& capture)
++    {
++        return m_deviceController.nativeReplayCounters(m_streamId, capture);
++    }
++    void nativeWaitOn(const hcl::syncInfo& dependency)
++    {
++        m_deviceController.streamWaitEvent(m_streamId, dependency);
++    }
++    hcl::syncInfo nativeCompletion() const { return m_longSo; }
++    HclDeviceControllerGen2Arch::NativeBatchProgram prepareNativeBatch(
++        const std::vector<const HclDeviceControllerGen2Arch::NativeGraphCapture*>& captures)
++    {
++        return m_deviceController.prepareNativeBatch(m_streamId, captures);
++    }
++    std::mutex& nativeStreamLock() { return m_deviceController.getStreamLock(m_streamId); }
++    unsigned nativeCompletionRingSize() { return m_graphSync.getCgData(true).size; }
++    void nativeSynchronize() { m_deviceController.synchronizeStream(m_streamId); }
++    int  nativeStreamId() const { return m_streamId; }
++
+     void           configureExternalSoForCompletion(LBWBurstData_t& completionInfoArr);
+     LBWBurstData_t getLbwDataForExternalSoCompletion(unsigned numSignals);
+ 
+diff --git a/hcl/src/platform/gen2_arch_common/hcl_collective_routines_progs.cpp b/hcl/src/platform/gen2_arch_common/hcl_collective_routines_progs.cpp
+index 4591b46..d9fb207 100644
+--- a/hcl/src/platform/gen2_arch_common/hcl_collective_routines_progs.cpp
++++ b/hcl/src/platform/gen2_arch_common/hcl_collective_routines_progs.cpp
+@@ -680,6 +680,9 @@ void HclCollectiveRoutinesGen2Arch::createScaleUpSendProgs(SliceState&      send
+                                 sendSliceState.m_collectiveOp,
+                                 sendSliceState.isRoot()};
+ 
++        op.m_directNicTransfer = sendSliceState.m_execution.m_directScaleupNicTransfer;
++        op.m_directNicReduction = sendSliceState.m_execution.m_directScaleupNicReduction;
++
+         this->createScaleUpCollectiveOp(currentStream, op);
+     }
+ }
+@@ -1358,6 +1361,11 @@ void HclCollectiveRoutinesGen2Arch::createScaleUpRecvProgs(SliceState&      slic
+ 
+     LOG_HCL_CONTEXT_TRACE(HCL, "Serializing scaleup recv scheduler command");
+ 
++    if (sliceState.m_execution.m_directScaleupNicTransfer)
++    {
++        streamAddSingleWaitIfNeeded(currentStream, {WaitEvent::GRAPH_SCALEUP_WAIT_EVENT});
++    }
++
+     if (m_signalsManager->isEventRegistered(SignalEvent::SCALEUP_RECV))
+     {
+         box_devices_t deviceToRemoteIndex;
+@@ -1406,6 +1414,8 @@ void HclCollectiveRoutinesGen2Arch::createScaleUpRecvProgs(SliceState&      slic
+ 
+         syncWithLtuIfNeeded(sliceState, currentStream);
+ 
++        const bool directNicTransfer = sliceState.m_execution.m_directScaleupNicTransfer;
++        const bool directNicReduction = sliceState.m_execution.m_directScaleupNicReduction;
+         ScaleUpCollectiveOp op {
+             deviceToRemoteIndex,
+             sliceState.m_dynamicComm.m_rankInfo.header.hwModuleID,
+@@ -1416,7 +1426,7 @@ void HclCollectiveRoutinesGen2Arch::createScaleUpRecvProgs(SliceState&      slic
+             m_signalsManager->dequeueSoAddress(SignalEvent::SCALEUP_RECV),
+             false /*receive*/,
+             sliceState.isComplexImplementation(),
+-            sliceState.m_isReductionCollective,
++            sliceState.m_isReductionCollective && !directNicTransfer,
+             sliceState.m_isMultiScaleupGroup && !(sliceState.m_collectiveOp == eHCLReduce &&
+                                                   boxNumInfo.m_boxNum == sliceState.m_dynamicComm.getMyScaleupGroup()),
+             baseAddress,
+@@ -1427,11 +1437,15 @@ void HclCollectiveRoutinesGen2Arch::createScaleUpRecvProgs(SliceState&      slic
+             strideCount,
+             wraparoundBits.notify_rndv_ack,
+             wraparoundBits.wait_for_rndv_acks,
+-            sliceState.m_isReductionCollective && (currentOp != eHCLAllGather && currentOp != eHCLGather),
++            sliceState.m_isReductionCollective && !directNicTransfer &&
++                (currentOp != eHCLAllGather && currentOp != eHCLGather),
+             subBuffIndex,
+             sliceState.m_collectiveOp,
+             sliceState.isRoot()};
+ 
++        op.m_directNicTransfer = directNicTransfer;
++        op.m_directNicReduction = directNicReduction;
++
+         this->createScaleUpCollectiveOp(currentStream, op);
+     }
+ }
+diff --git a/hcl/src/platform/gen2_arch_common/hcl_device_controller.cpp b/hcl/src/platform/gen2_arch_common/hcl_device_controller.cpp
+index be7ab37..18f627c 100644
+--- a/hcl/src/platform/gen2_arch_common/hcl_device_controller.cpp
++++ b/hcl/src/platform/gen2_arch_common/hcl_device_controller.cpp
+@@ -1,3 +1,4 @@
++#include "infra/scal/gen2_arch_common/cyclic_buffer_manager.h"
+ #include "platform/gen2_arch_common/hcl_device_controller.h"
+ #include "infra/scal/gen2_arch_common/scal_manager.h"         // for Gen2Arc...
+ #include "platform/gen2_arch_common/commands/hcl_commands.h"  // for HclComm...
+@@ -6,6 +7,37 @@
+ #include "infra/scal/gen2_arch_common/scal_names.h"
+ #include "infra/scal/gen2_arch_common/scal_utils.h"
+ 
++#include <cstdlib>
++#include <cstdio>
++#include <cstring>
++
++bool HclDeviceControllerGen2Arch::NativeGraphCapture::validate() const
++{
++    if (streams.empty() || externalTargetDelta == 0 || capturedExternalCompletionAddress == 0 ||
++        relocationCount(hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS) == 0)
++    {
++        return false;
++    }
++    if (internalTargetDelta != 0 &&
++        (capturedInternalCompletionAddress == 0 ||
++         relocationCount(hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_ADDRESS) == 0))
++    {
++        return false;
++    }
++    for (const NativeStreamCapture& stream : streams)
++    {
++        if (stream.commandTemplate.empty())
++        {
++            return false;
++        }
++        if (!hcl::validateNativeHclStreamTemplate(stream.commandTemplate))
++        {
++            return false;
++        }
++    }
++    return true;
++}
++
+ HclDeviceControllerGen2Arch::HclDeviceControllerGen2Arch(const unsigned numOfStreams) : m_numOfStreams(numOfStreams)
+ {
+     m_graphSync        = std::make_unique<std::unique_ptr<HclGraphSyncGen2Arch>[]>(m_numOfStreams);
+@@ -367,6 +399,276 @@ void HclDeviceControllerGen2Arch::submitWork(int archStreamId, bool submitToHw)
+     syncParams.m_signalFinalize();
+ }
+ 
++void HclDeviceControllerGen2Arch::beginNativeCapture(int archStreamId)
++{
++    auto& syncParams = getSyncParams(archStreamId);
++    VERIFY(!syncParams.m_nativeCaptureActive, "Native HCL graph capture is already active");
++    VERIFY(syncParams.m_longSo != nullptr, "Native HCL graph requires an initialized completion group");
++    syncParams.m_nativeCaptureActive        = true;
++    syncParams.m_nativeCaptureExternalStart = syncParams.m_longSo->targetValue;
++    syncParams.m_nativeCaptureInternalStart = syncParams.m_InternalCgTargetValue;
++    for (unsigned streamIndex = 0; streamIndex < m_streamLayout->getTotalMicroArchStreamCount(); ++streamIndex)
++    {
++        getScalStream(archStreamId, static_cast<HclStreamIndex>(streamIndex)).beginNativeCapture();
++    }
++}
++
++HclDeviceControllerGen2Arch::NativeGraphCapture HclDeviceControllerGen2Arch::endNativeCapture(int archStreamId)
++{
++    auto& syncParams = getSyncParams(archStreamId);
++    VERIFY(syncParams.m_nativeCaptureActive, "Native HCL graph capture is not active");
++    NativeGraphCapture capture;
++    for (unsigned streamIndex = 0; streamIndex < m_streamLayout->getTotalMicroArchStreamCount(); ++streamIndex)
++    {
++        hcl::NativeHclStreamTemplate commandTemplate =
++            getScalStream(archStreamId, static_cast<HclStreamIndex>(streamIndex)).endNativeCapture();
++        if (!commandTemplate.empty())
++        {
++            capture.streams.push_back(
++                {.streamIndex = static_cast<HclStreamIndex>(streamIndex),
++                 .commandTemplate = std::move(commandTemplate)});
++        }
++    }
++    capture.externalTargetDelta = syncParams.m_longSo->targetValue - syncParams.m_nativeCaptureExternalStart;
++    capture.internalTargetDelta =
++        syncParams.m_InternalCgTargetValue - syncParams.m_nativeCaptureInternalStart;
++    capture.completionLongSoIndex = syncParams.m_longSo->long_so_index;
++    capture.capturedExternalCompletionAddress =
++        m_graphSync[archStreamId]->getCurrentCgSoAddr(CgType::eExternal);
++    capture.capturedInternalCompletionAddress =
++        m_graphSync[archStreamId]->getCurrentCgSoAddr(CgType::eInternal);
++    capture.capturedGpso0Address =
++        m_graphSync[archStreamId]->getCurrentGpsoAddr(WaitMethod::GPSO_0);
++    capture.capturedGpso1Address =
++        m_graphSync[archStreamId]->getCurrentGpsoAddr(WaitMethod::GPSO_1);
++    size_t externalAddressRelocations = 0;
++    size_t internalAddressRelocations = 0;
++    for (NativeStreamCapture& streamCapture : capture.streams)
++    {
++        externalAddressRelocations += hcl::addNativeHclCapturedWordRelocations(
++            streamCapture.commandTemplate,
++            capture.capturedExternalCompletionAddress,
++            hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS);
++        if (capture.internalTargetDelta != 0)
++        {
++            internalAddressRelocations += hcl::addNativeHclCapturedWordRelocations(
++                streamCapture.commandTemplate,
++                capture.capturedInternalCompletionAddress,
++                hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_ADDRESS);
++        }
++        hcl::addNativeHclCapturedWordRelocations(
++            streamCapture.commandTemplate,
++            capture.capturedGpso0Address,
++            hcl::NativeHclRelocationKind::GPSO_0_ADDRESS);
++        hcl::addNativeHclCapturedWordRelocations(
++            streamCapture.commandTemplate,
++            capture.capturedGpso1Address,
++            hcl::NativeHclRelocationKind::GPSO_1_ADDRESS);
++        streamCapture.program = hcl::NativeHclProgram::prepare(
++            {{&streamCapture.commandTemplate, 0}},
++            getScalStream(archStreamId, streamCapture.streamIndex).nativeCommandAlignment());
++    }
++    syncParams.m_nativeCaptureActive = false;
++    VERIFY(externalAddressRelocations != 0,
++           "Native HCL graph did not capture its external completion SOB address 0x{:x}",
++           capture.capturedExternalCompletionAddress);
++    VERIFY(capture.internalTargetDelta == 0 || internalAddressRelocations != 0,
++           "Native HCL graph did not capture its internal completion SOB address 0x{:x}",
++           capture.capturedInternalCompletionAddress);
++    VERIFY(capture.validate(), "Captured native HCL graph has an invalid command or completion contract");
++    capture.executableValidated = true;
++    return capture;
++}
++
++void HclDeviceControllerGen2Arch::cancelNativeCapture(int archStreamId)
++{
++    for (unsigned streamIndex = 0; streamIndex < m_streamLayout->getTotalMicroArchStreamCount(); ++streamIndex)
++    {
++        getScalStream(archStreamId, static_cast<HclStreamIndex>(streamIndex)).cancelNativeCapture();
++    }
++    getSyncParams(archStreamId).m_nativeCaptureActive = false;
++}
++
++hcl::NativeHclReplayState HclDeviceControllerGen2Arch::prepareNativeReplayState(
++    int                              archStreamId,
++    const NativeGraphCapture&        capture,
++    const hcl::NativeHclReplayState& replayState)
++{
++    VERIFY(capture.executableValidated, "Cannot replay a native HCL graph before instantiation");
++    auto& syncParams = getSyncParams(archStreamId);
++    VERIFY(!syncParams.m_nativeCaptureActive, "Cannot replay native HCL commands during capture");
++    VERIFY(syncParams.m_longSo != nullptr, "Native HCL graph requires an initialized completion group");
++    VERIFY(syncParams.m_longSo->long_so_index == capture.completionLongSoIndex,
++           "Native HCL graph completion group changed from {} to {}",
++           capture.completionLongSoIndex,
++           syncParams.m_longSo->long_so_index);
++
++    const uint64_t nextExternalTarget = syncParams.m_longSo->targetValue + capture.externalTargetDelta;
++    const uint64_t nextInternalTarget = syncParams.m_InternalCgTargetValue + capture.internalTargetDelta;
++
++    hcl::NativeHclReplayState patchedState = replayState;
++    patchedState.values[static_cast<size_t>(hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_TARGET)] =
++        nextExternalTarget;
++    patchedState.values[static_cast<size_t>(hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_TARGET)] =
++        nextInternalTarget;
++    m_graphSync[archStreamId]->incSoIndex(static_cast<unsigned>(capture.externalTargetDelta));
++    patchedState.values[static_cast<size_t>(hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS)] =
++        m_graphSync[archStreamId]->getCurrentCgSoAddr(CgType::eExternal);
++    patchedState.values[static_cast<size_t>(hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_ADDRESS)] =
++        m_graphSync[archStreamId]->getCurrentCgSoAddr(CgType::eInternal);
++    patchedState.values[static_cast<size_t>(hcl::NativeHclRelocationKind::GPSO_0_ADDRESS)] =
++        m_graphSync[archStreamId]->getCurrentGpsoAddr(WaitMethod::GPSO_0);
++    patchedState.values[static_cast<size_t>(hcl::NativeHclRelocationKind::GPSO_1_ADDRESS)] =
++        m_graphSync[archStreamId]->getCurrentGpsoAddr(WaitMethod::GPSO_1);
++
++    const char* diagnostics = std::getenv("HCL_TP2_NATIVE_REPLAY_DIAGNOSTICS");
++    if (diagnostics != nullptr && std::strcmp(diagnostics, "1") == 0)
++    {
++        std::fprintf(stderr,
++                     "NATIVE_HCL_REPLAY dependency=%llu:%llu external_target=%llu->%llu "
++                     "internal_target=%llu->%llu external_address=0x%llx->0x%llx "
++                     "internal_address=0x%llx->0x%llx gpso0=0x%llx->0x%llx gpso1=0x%llx->0x%llx "
++                     "relocations=%zu/%zu/%zu/%zu/%zu\n",
++                     static_cast<unsigned long long>(
++                         replayState.get(hcl::NativeHclRelocationKind::DEPENDENCY_LONG_SO_INDEX)),
++                     static_cast<unsigned long long>(
++                         replayState.get(hcl::NativeHclRelocationKind::DEPENDENCY_TARGET)),
++                     static_cast<unsigned long long>(syncParams.m_longSo->targetValue),
++                     static_cast<unsigned long long>(nextExternalTarget),
++                     static_cast<unsigned long long>(syncParams.m_InternalCgTargetValue),
++                     static_cast<unsigned long long>(nextInternalTarget),
++                     static_cast<unsigned long long>(capture.capturedExternalCompletionAddress),
++                     static_cast<unsigned long long>(
++                         patchedState.get(hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS)),
++                     static_cast<unsigned long long>(capture.capturedInternalCompletionAddress),
++                     static_cast<unsigned long long>(
++                         patchedState.get(hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_ADDRESS)),
++                     static_cast<unsigned long long>(capture.capturedGpso0Address),
++                     static_cast<unsigned long long>(patchedState.get(hcl::NativeHclRelocationKind::GPSO_0_ADDRESS)),
++                     static_cast<unsigned long long>(capture.capturedGpso1Address),
++                     static_cast<unsigned long long>(patchedState.get(hcl::NativeHclRelocationKind::GPSO_1_ADDRESS)),
++                     capture.relocationCount(hcl::NativeHclRelocationKind::DEPENDENCY_TARGET),
++                     capture.relocationCount(hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS),
++                     capture.relocationCount(hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_ADDRESS),
++                     capture.relocationCount(hcl::NativeHclRelocationKind::GPSO_0_ADDRESS),
++                     capture.relocationCount(hcl::NativeHclRelocationKind::GPSO_1_ADDRESS));
++        std::fflush(stderr);
++        LOG_INFO(HCL,
++                 "Native HCL replay dependency {}:{} external target {}->{} internal target {}->{} "
++                 "external completion address 0x{:x}->0x{:x} internal completion address 0x{:x}->0x{:x} "
++                 "relocations dependency={} external-address={} internal-address={}",
++                 replayState.get(hcl::NativeHclRelocationKind::DEPENDENCY_LONG_SO_INDEX),
++                 replayState.get(hcl::NativeHclRelocationKind::DEPENDENCY_TARGET),
++                 syncParams.m_longSo->targetValue,
++                 nextExternalTarget,
++                 syncParams.m_InternalCgTargetValue,
++                 nextInternalTarget,
++                 capture.capturedExternalCompletionAddress,
++                 patchedState.get(hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS),
++                 capture.capturedInternalCompletionAddress,
++                 patchedState.get(hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_ADDRESS),
++                 capture.relocationCount(hcl::NativeHclRelocationKind::DEPENDENCY_TARGET),
++                 capture.relocationCount(hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS),
++                 capture.relocationCount(hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_ADDRESS));
++    }
++
++    syncParams.m_longSo->targetValue = nextExternalTarget;
++    syncParams.m_InternalCgTargetValue = nextInternalTarget;
++    return patchedState;
++}
++
++hcl::syncInfo HclDeviceControllerGen2Arch::replayNativeCapture(
++    int archStreamId, const NativeGraphCapture& capture,
++    const hcl::NativeHclReplayState& replayState, bool submit)
++{
++    const auto state = prepareNativeReplayState(archStreamId, capture, replayState);
++    for (const auto& streamCapture : capture.streams)
++        getScalStream(archStreamId, streamCapture.streamIndex).replayNativeProgram(streamCapture.program, &state, 1);
++    if (submit) submitNativeReplay(archStreamId);
++    return *getSyncParams(archStreamId).m_longSo;
++}
++
++HclDeviceControllerGen2Arch::NativeBatchProgram HclDeviceControllerGen2Arch::prepareNativeBatch(
++    int archStreamId, const std::vector<const NativeGraphCapture*>& captures)
++{
++    VERIFY(!captures.empty() && captures.size() <= 128, "Invalid native NIC batch size");
++    std::map<HclStreamIndex, std::vector<hcl::NativeHclProgram::Input>> byStream;
++    for (size_t node = 0; node < captures.size(); ++node)
++    {
++        VERIFY(captures[node] && captures[node]->executableValidated, "Native NIC batch input is unprepared");
++        for (const auto& stream : captures[node]->streams)
++            byStream[stream.streamIndex].push_back({&stream.commandTemplate, static_cast<uint32_t>(node)});
++    }
++    NativeBatchProgram result;
++    for (const auto& entry : byStream)
++    {
++        const auto alignment = getScalStream(archStreamId, entry.first).nativeCommandAlignment();
++        // The bounded batch is published in full before compute starts. Every
++        // producer/consumer wait remains in the command bytes; captured host
++        // PI writes are unnecessary here. Single-graph replay keeps them.
++        auto program = hcl::NativeHclProgram::prepare(entry.second, alignment, false);
++        // Keep one batch below half the CCB, including worst alignment padding.
++        // Two divisions cover the existing PI/CI lag workaround. Therefore any
++        // CCB recycle wait while writing this batch belongs to earlier,
++        // already-published work, never to its as-yet-unpublished compute peer.
++        const auto ccb = hcl::ScalStream::getCcbSize();
++        const auto division = ccb / hcl::CyclicBufferManager::m_numberOfDivisions;
++        VERIFY(program.pages().size() + 1 <= (ccb / 2 - 2 * division) / alignment,
++               "Native NIC batch exceeds bounded publication capacity");
++        result.push_back({entry.first, std::move(program)});
++    }
++    return result;
++}
++
++void HclDeviceControllerGen2Arch::publishNativeBatch(int archStreamId,
++    const NativeBatchProgram& program, const hcl::NativeHclReplayState* states, size_t stateCount)
++{
++    for (const auto& stream : program)
++        getScalStream(archStreamId, stream.streamIndex).replayNativeProgram(stream.program, states, stateCount);
++    submitNativeReplay(archStreamId);
++}
++
++void HclDeviceControllerGen2Arch::submitNativeReplay(int archStreamId)
++{
++    auto& syncParams = getSyncParams(archStreamId);
++    VERIFY(syncParams.m_longSo != nullptr, "Native HCL graph requires an initialized completion group");
++    for (unsigned streamIndex = 0; streamIndex < m_streamLayout->getTotalMicroArchStreamCount(); ++streamIndex)
++    {
++        hcl::ScalStream& stream = getScalStream(archStreamId, static_cast<HclStreamIndex>(streamIndex));
++        if (stream.requiresSubmission())
++        {
++            stream.submit();
++        }
++    }
++
++    scal_completion_group_set_expected_ctr(m_scalManager->getCgHandle(archStreamId, true),
++                                           syncParams.m_longSo->targetValue);
++    syncParams.m_submittedTargetValue = syncParams.m_longSo->targetValue;
++    if (syncParams.m_InternalCgTargetValue != syncParams.m_submittedInternalCgTargetValue)
++    {
++        scal_completion_group_set_expected_ctr(m_scalManager->getCgHandle(archStreamId, false),
++                                               syncParams.m_InternalCgTargetValue);
++        syncParams.m_submittedInternalCgTargetValue = syncParams.m_InternalCgTargetValue;
++    }
++    syncParams.m_signalFinalize();
++}
++
++HclDeviceControllerGen2Arch::NativeReplayCounters HclDeviceControllerGen2Arch::nativeReplayCounters(
++    int                       archStreamId,
++    const NativeGraphCapture& capture)
++{
++    NativeReplayCounters counters;
++    for (const NativeStreamCapture& streamCapture : capture.streams)
++    {
++        const hcl::ScalStream& stream = getScalStream(archStreamId, streamCapture.streamIndex);
++        const uint64_t         pi     = stream.getUnwrappedPi();
++        counters.bytes += pi;
++        counters.ccbWraps += pi / hcl::ScalStream::getCcbSize();
++        counters.submissions += stream.getSubmissionCount();
++    }
++    return counters;
++}
++
+ void HclDeviceControllerGen2Arch::streamAddWait(hcl::ScalStream&            scalStream,
+                                                 const SyncObjectDescriptor& descriptor,
+                                                 bool                        useEqual)
+@@ -563,4 +865,4 @@ void HclDeviceControllerGen2Arch::setTraceMarker(int archStreamId, HclStreamInde
+     hcl::ScalStream& currentStream = getScalStream(archStreamId, streamIdx);
+ 
+     m_commands->serializeSetTraceMarker(currentStream, currentStream.getSchedIdx(), val);
+-}
+\ No newline at end of file
++}
+diff --git a/hcl/src/platform/gen2_arch_common/hcl_device_controller.h b/hcl/src/platform/gen2_arch_common/hcl_device_controller.h
+index 18d73a3..f294454 100644
+--- a/hcl/src/platform/gen2_arch_common/hcl_device_controller.h
++++ b/hcl/src/platform/gen2_arch_common/hcl_device_controller.h
+@@ -9,6 +9,7 @@
+ #include "device_simb_pool_manager.h"
+ #include "llvm/small_vector.h"  // for SmallVector
+ #include "infra/scal/gen2_arch_common/stream_layout.h"
++#include "infra/scal/gen2_arch_common/scal_stream.h"
+ 
+ class HclDeviceGen2Arch;
+ class HclCommandsGen2Arch;
+@@ -39,6 +40,9 @@ struct ArchStreamSyncParams
+     uint64_t m_InternalCgTargetValue          = 0;
+     unsigned m_requestedExtraCredits          = 0;
+     bool     m_isPrevWaitEvent                = false;
++    bool     m_nativeCaptureActive            = false;
++    uint64_t m_nativeCaptureExternalStart     = 0;
++    uint64_t m_nativeCaptureInternalStart     = 0;
+ 
+     hcl::syncInfo* m_longSo           = nullptr;
+     hcl::syncInfo* m_longSoNullSubmit = nullptr;
+@@ -60,6 +64,55 @@ class ScalStream;
+ class HclDeviceControllerGen2Arch
+ {
+ public:
++    struct NativeStreamCapture
++    {
++        HclStreamIndex               streamIndex;
++        hcl::NativeHclStreamTemplate commandTemplate;
++        hcl::NativeHclProgram        program;
++    };
++
++    struct NativeGraphCapture
++    {
++        std::vector<NativeStreamCapture> streams;
++        uint64_t externalTargetDelta = 0;
++        uint64_t internalTargetDelta = 0;
++        uint32_t completionLongSoIndex = 0;
++        uint32_t capturedExternalCompletionAddress = 0;
++        uint32_t capturedInternalCompletionAddress = 0;
++        uint32_t capturedGpso0Address = 0;
++        uint32_t capturedGpso1Address = 0;
++        bool executableValidated = false;
++
++        size_t commandCount() const
++        {
++            size_t count = 0;
++            for (const auto& stream : streams) count += stream.commandTemplate.commands.size();
++            return count;
++        }
++
++        size_t relocationCount(hcl::NativeHclRelocationKind kind) const
++        {
++            size_t count = 0;
++            for (const auto& stream : streams)
++            {
++                for (const auto& relocation : stream.commandTemplate.relocations)
++                {
++                    count += relocation.kind == kind;
++                }
++            }
++            return count;
++        }
++
++        bool validate() const;
++    };
++
++    struct NativeReplayCounters
++    {
++        uint64_t bytes = 0;
++        uint64_t ccbWraps = 0;
++        uint64_t submissions = 0;
++    };
++
+     HclDeviceControllerGen2Arch(const unsigned numOfStreams);
+     virtual ~HclDeviceControllerGen2Arch();
+     HclDeviceControllerGen2Arch(const HclDeviceControllerGen2Arch&)            = delete;
+@@ -91,6 +144,27 @@ public:
+      */
+     void setupHFCMonitors(int archStreamId, ArchStreamSyncParams& syncParams);
+     void submitWork(int archStreamId, bool submitToHw = true);
++    void               beginNativeCapture(int archStreamId);
++    NativeGraphCapture endNativeCapture(int archStreamId);
++    void               cancelNativeCapture(int archStreamId);
++    hcl::syncInfo replayNativeCapture(int                         archStreamId,
++                                      const NativeGraphCapture&   capture,
++                                      const hcl::NativeHclReplayState& replayState,
++                                      bool                             submit);
++    struct NativeBatchStream
++    {
++        HclStreamIndex streamIndex;
++        hcl::NativeHclProgram program;
++    };
++    using NativeBatchProgram = std::vector<NativeBatchStream>;
++    NativeBatchProgram prepareNativeBatch(int archStreamId,
++        const std::vector<const NativeGraphCapture*>& captures);
++    hcl::NativeHclReplayState prepareNativeReplayState(int archStreamId,
++        const NativeGraphCapture& capture, const hcl::NativeHclReplayState& replayState);
++    void publishNativeBatch(int archStreamId, const NativeBatchProgram& program,
++        const hcl::NativeHclReplayState* states, size_t stateCount);
++    void submitNativeReplay(int archStreamId);
++    NativeReplayCounters nativeReplayCounters(int archStreamId, const NativeGraphCapture& capture);
+ 
+     /**
+      * @brief
+diff --git a/hcl/src/platform/gen2_arch_common/hcl_graph_sync.cpp b/hcl/src/platform/gen2_arch_common/hcl_graph_sync.cpp
+index 1cd99d6..278f6a5 100644
+--- a/hcl/src/platform/gen2_arch_common/hcl_graph_sync.cpp
++++ b/hcl/src/platform/gen2_arch_common/hcl_graph_sync.cpp
+@@ -193,16 +193,18 @@ void HclGraphSyncGen2Arch::createArmLongMonMessages(hcl::ScalStream& scalStream,
+     const uint32_t monArmSize   = getArmMonSize();
+     const uint32_t baseAddrInSm = getOffsetMonArm(monitorIdx);
+     LBWBurstData_t destData;
++    llvm_vecsmall::SmallVector<unsigned, LONG_MON_DWORD_SIZE> targetChunks;
+ 
+     for (int i = LONG_MON_DWORD_SIZE - 1; i >= 0; --i)
+     {
+         uint32_t addr  = smBase + baseAddrInSm + (i * monArmSize);
+         uint32_t value = createMonArm(soValue, true, mask, soIdxNoMask, i, useEqual);
+ 
+-        if (i == 0 ||
++        if (scalStream.isNativeCaptureActive() || i == 0 ||
+             (m_longMonitorStatus.find(addr) == m_longMonitorStatus.end() || m_longMonitorStatus[addr] != value))
+         {
+             destData.push_back({addr, value});
++            targetChunks.push_back(static_cast<unsigned>(i));
+             if (!m_nullSubmit)
+             {
+                 m_longMonitorStatus[addr] = value;
+@@ -210,6 +212,33 @@ void HclGraphSyncGen2Arch::createArmLongMonMessages(hcl::ScalStream& scalStream,
+         }
+     }
+     m_commands.serializeLbwBurstWriteCommand(scalStream, scalStream.getSchedIdx(), destData);
++    for (size_t entry = 0; entry < targetChunks.size(); ++entry)
++    {
++        // Each LBW entry is the trailing {address, data} pair in the packet.
++        // reg_mon_arm.sod occupies bits 17..31 and carries one 15-bit piece of
++        // the dependency target.  Native capture emits all four pieces so a
++        // replay remains valid when the long-SO target carries into a new
++        // 15-bit word.
++        const uint32_t dataBytesFromEnd =
++            static_cast<uint32_t>((destData.size() - entry) * sizeof(LbwData) - sizeof(uint32_t));
++        scalStream.addNativeRelocationToLastCommandTail(dataBytesFromEnd,
++                                                        sizeof(uint32_t),
++                                                        0xfffe0000u,
++                                                        17,
++                                                        targetChunks[entry] * SO_VAL_BITS,
++                                                        hcl::NativeHclRelocationKind::DEPENDENCY_TARGET);
++        if (targetChunks[entry] == 0)
++        {
++            // reg_mon_arm.sid is bits 0..7 and stores longSoIndex >> 3.
++            scalStream.addNativeRelocationToLastCommandTail(
++                dataBytesFromEnd,
++                sizeof(uint32_t),
++                0x000000ffu,
++                0,
++                3,
++                hcl::NativeHclRelocationKind::DEPENDENCY_LONG_SO_INDEX);
++        }
++    }
+     m_commands.serializeFenceDecCommand(scalStream, scalStream.getSchedIdx(), fenceIdx);
+ }
+ 
+diff --git a/hcl/src/platform/gen2_arch_common/hcl_mem_handler.cpp b/hcl/src/platform/gen2_arch_common/hcl_mem_handler.cpp
+index 9c0bb1e..3cdac6c 100644
+--- a/hcl/src/platform/gen2_arch_common/hcl_mem_handler.cpp
++++ b/hcl/src/platform/gen2_arch_common/hcl_mem_handler.cpp
+@@ -166,7 +166,8 @@ void HclCollectiveMemHandlerGen2Arch::createMemCopyCommands(SimbPoolContainerAll
+                       dstAddr,
+                       srcAddr,
+                       dataTypeForDma,
+-                      sliceState.m_isReductionCollective,
++                      sliceState.m_isReductionCollective &&
++                          !sliceState.m_execution.m_directScaleupNicTransfer,
+                       useSibo,
+                       numberOfRanks,
+                       numberOfSubBuffers,
+diff --git a/hcl/tests/native_hcl_relocation_test.cpp b/hcl/tests/native_hcl_relocation_test.cpp
+new file mode 100644
+index 0000000..8664440
+--- /dev/null
++++ b/hcl/tests/native_hcl_relocation_test.cpp
+@@ -0,0 +1,160 @@
++#include "infra/scal/gen2_arch_common/native_hcl_relocation.h"
++
++#include <array>
++#include <cstdint>
++#include <cstdlib>
++#include <iostream>
++
++namespace
++{
++void require(bool condition, const char* message)
++{
++    if (!condition)
++    {
++        std::cerr << message << '\n';
++        std::exit(1);
++    }
++}
++
++uint32_t readWord(const std::array<uint8_t, 16>& bytes, size_t offset)
++{
++    uint32_t word = 0;
++    std::memcpy(&word, bytes.data() + offset, sizeof(word));
++    return word;
++}
++
++void testLongSoChunks(uint64_t target)
++{
++    constexpr uint32_t preserved = 0x00015500u;
++    std::array<uint8_t, 16> bytes {};
++    for (size_t chunk = 0; chunk < 4; ++chunk)
++    {
++        std::memcpy(bytes.data() + chunk * sizeof(uint32_t), &preserved, sizeof(preserved));
++    }
++
++    hcl::NativeHclReplayState state;
++    state.values[static_cast<size_t>(hcl::NativeHclRelocationKind::DEPENDENCY_TARGET)] = target;
++    for (size_t chunk = 0; chunk < 4; ++chunk)
++    {
++        hcl::NativeHclRelocation relocation;
++        relocation.byteOffset      = static_cast<uint32_t>(chunk * sizeof(uint32_t));
++        relocation.width           = sizeof(uint32_t);
++        relocation.mask            = 0xfffe0000u;
++        relocation.destinationShift = 17;
++        relocation.sourceShift      = static_cast<uint8_t>(chunk * 15);
++        relocation.kind             = hcl::NativeHclRelocationKind::DEPENDENCY_TARGET;
++        require(hcl::patchNativeHclRelocation(bytes.data(), bytes.size(), relocation, state),
++                "long-SO relocation rejected");
++        const uint32_t expectedChunk = static_cast<uint32_t>((target >> (chunk * 15)) & 0x7fffu);
++        const uint32_t actual = readWord(bytes, chunk * sizeof(uint32_t));
++        require((actual >> 17) == expectedChunk, "long-SO chunk mismatch");
++        require((actual & ~0xfffe0000u) == preserved, "long-SO relocation changed unrelated bits");
++    }
++}
++
++void testWqeBits()
++{
++    std::array<uint8_t, 1> bytes {0b10100101u};
++    hcl::NativeHclReplayState state;
++    hcl::NativeHclRelocation notify;
++    notify.width = 1;
++    notify.mask = 0x08;
++    notify.destinationShift = 3;
++    notify.kind = hcl::NativeHclRelocationKind::WQE_NOTIFY;
++    hcl::NativeHclRelocation wait = notify;
++    wait.mask = 0x40;
++    wait.destinationShift = 6;
++    wait.kind = hcl::NativeHclRelocationKind::WQE_WAIT;
++
++    state.values[static_cast<size_t>(hcl::NativeHclRelocationKind::WQE_NOTIFY)] = 1;
++    state.values[static_cast<size_t>(hcl::NativeHclRelocationKind::WQE_WAIT)] = 0;
++    require(hcl::patchNativeHclRelocation(bytes.data(), bytes.size(), notify, state), "WQE notify patch rejected");
++    require(hcl::patchNativeHclRelocation(bytes.data(), bytes.size(), wait, state), "WQE wait patch rejected");
++    require(bytes[0] == 0b10101101u, "WQE patch changed the wrong bits");
++
++    state.values[static_cast<size_t>(hcl::NativeHclRelocationKind::WQE_NOTIFY)] = 0;
++    state.values[static_cast<size_t>(hcl::NativeHclRelocationKind::WQE_WAIT)] = 1;
++    require(hcl::patchNativeHclRelocation(bytes.data(), bytes.size(), notify, state), "WQE notify clear rejected");
++    require(hcl::patchNativeHclRelocation(bytes.data(), bytes.size(), wait, state), "WQE wait set rejected");
++    require(bytes[0] == 0b11100101u, "WQE wrap patch changed the wrong bits");
++}
++
++void testTemplateValidation()
++{
++    hcl::NativeHclStreamTemplate commandTemplate;
++    commandTemplate.commands.resize(2);
++    commandTemplate.commands[0].bytes.resize(8);
++    commandTemplate.commands[1].bytes.resize(8);
++
++    hcl::NativeHclRelocation first;
++    first.commandIndex = 0;
++    first.byteOffset = 4;
++    first.width = 4;
++    first.mask = 0xfffe0000u;
++    first.destinationShift = 17;
++    hcl::NativeHclRelocation second = first;
++    second.commandIndex = 1;
++    second.byteOffset = 0;
++    commandTemplate.relocations = {first, second};
++    require(hcl::validateNativeHclStreamTemplate(commandTemplate), "valid relocation template rejected");
++
++    std::swap(commandTemplate.relocations[0], commandTemplate.relocations[1]);
++    require(!hcl::validateNativeHclStreamTemplate(commandTemplate), "unsorted relocation template accepted");
++    std::swap(commandTemplate.relocations[0], commandTemplate.relocations[1]);
++    commandTemplate.relocations[1].byteOffset = 6;
++    require(!hcl::validateNativeHclStreamTemplate(commandTemplate), "out-of-range relocation accepted");
++    commandTemplate.relocations[1].byteOffset = 0;
++    commandTemplate.relocations[1].width = 3;
++    require(!hcl::validateNativeHclStreamTemplate(commandTemplate), "invalid relocation width accepted");
++}
++
++void testCapturedCompletionAddress()
++{
++    constexpr uint32_t capturedAddress = 0xf3a01234u;
++    constexpr uint32_t replayAddress = 0xf3a01238u;
++    hcl::NativeHclStreamTemplate commandTemplate;
++    commandTemplate.commands.resize(2);
++    commandTemplate.commands[0].bytes.resize(12);
++    commandTemplate.commands[1].bytes.resize(9);
++    std::memcpy(commandTemplate.commands[0].bytes.data() + 4, &capturedAddress, sizeof(capturedAddress));
++    // An unaligned copy must not be treated as a scheduler dword field.
++    std::memcpy(commandTemplate.commands[1].bytes.data() + 1, &capturedAddress, sizeof(capturedAddress));
++
++    const size_t added = hcl::addNativeHclCapturedWordRelocations(
++        commandTemplate,
++        capturedAddress,
++        hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS);
++    require(added == 1, "completion-address discovery did not select exactly the aligned field");
++    require(hcl::validateNativeHclStreamTemplate(commandTemplate),
++            "completion-address relocation made the template invalid");
++
++    hcl::NativeHclReplayState state;
++    state.values[static_cast<size_t>(hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS)] = replayAddress;
++    const auto& relocation = commandTemplate.relocations.front();
++    require(hcl::patchNativeHclRelocation(commandTemplate.commands[0].bytes.data(),
++                                          commandTemplate.commands[0].bytes.size(),
++                                          relocation,
++                                          state),
++            "completion-address relocation rejected");
++    uint32_t actual = 0;
++    std::memcpy(&actual, commandTemplate.commands[0].bytes.data() + 4, sizeof(actual));
++    require(actual == replayAddress, "completion-address relocation patched the wrong value");
++}
++}  // namespace
++
++int main()
++{
++    testLongSoChunks(0);
++    testLongSoChunks((uint64_t {1} << 15) - 1);
++    testLongSoChunks(uint64_t {1} << 15);
++    testLongSoChunks((uint64_t {1} << 30) - 1);
++    testLongSoChunks(uint64_t {1} << 30);
++    testLongSoChunks((uint64_t {1} << 45) - 1);
++    testLongSoChunks(uint64_t {1} << 45);
++    testLongSoChunks((uint64_t {1} << 60) - 1);
++    testWqeBits();
++    testTemplateValidation();
++    testCapturedCompletionAddress();
++    std::cout << "native HCL relocation tests passed\n";
++    return 0;
++}

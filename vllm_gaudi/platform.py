@@ -7,6 +7,7 @@ import torch
 import habana_frameworks.torch as htorch
 
 from vllm import envs
+from vllm_gaudi import envs as gaudi_envs
 
 from vllm.platforms import Platform, PlatformEnum
 from vllm_gaudi.extension.runtime import get_config
@@ -38,6 +39,55 @@ QWEN3_5_HYBRID_ARCHS = frozenset({
     "Qwen3_5MoeForConditionalGeneration",
 })
 
+_QWEN38_DFLASH2_DRAFT_FIELDS = {
+    # SpeculativeConfig wraps DFlash checkpoints in EAGLEConfig at runtime.
+    # The original Hugging Face config is qwen3, but validation runs after
+    # that normalization and therefore sees the wrapper's model type.
+    "model_type": "eagle",
+    "hidden_size": 5120,
+    "num_hidden_layers": 5,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 8,
+    "head_dim": 128,
+    "vocab_size": 248320,
+    "sliding_window": 2048,
+    "is_causal": False,
+    "layer_types": ("sliding_attention", ) * 5,
+}
+_QWEN38_DFLASH2_HEAD_FIELDS = {
+    "block_size": 8,
+    "conv_group_size": 16,
+    "conv_kernel_size": 2,
+    "mask_token_id": 248070,
+    "selector_rank": 256,
+    "selector_top_k": 16,
+    "target_layer_ids": (5, 19, 33, 47, 61),
+}
+_QWEN38_TARGET_FIELDS = {
+    "model_type": "qwen3_5_text",
+    "hidden_size": 5120,
+    "num_hidden_layers": 64,
+    "vocab_size": 248320,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 48,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "linear_conv_kernel_dim": 4,
+    "full_attention_interval": 4,
+}
+
+
+def _config_field_mismatches(config, expected: dict[str, object]) -> list[str]:
+    """Return stable diagnostics for an exact qualification contract."""
+    mismatches = []
+    for field, expected_value in expected.items():
+        actual = config.get(field) if isinstance(config, dict) else getattr(config, field, None)
+        if isinstance(expected_value, tuple) and actual is not None:
+            actual = tuple(actual)
+        if actual != expected_value:
+            mismatches.append(f"{field}={actual!r} (expected {expected_value!r})")
+    return mismatches
+
 
 def retain_envs(var_name):
     retain_var_list = ['GLOO_SOCKET_IFNAME', 'HCCL_SOCKET_IFNAME', 'NCCL_SOCKET_IFNAME']
@@ -56,6 +106,91 @@ def is_qwen3_5_hybrid_model(model_config: Optional[ModelConfig]) -> bool:
     return any(arch in QWEN3_5_HYBRID_ARCHS for arch in architectures)
 
 
+def _enable_hpu_v1_dflash2_validation() -> None:
+    """Allow only the HPU-qualified DFlash2 subset on the V1 runner.
+
+    Upstream intentionally rejects DFlash2 on V1 because its candidate
+    selector lives in the V2 speculator. The HPU plugin supplies an equivalent
+    selector and must use V1 (Gaudi has no Triton), so remove only that exact
+    rejection while this experimental backend is enabled. All other upstream
+    V1 validation remains intact.
+    """
+    from vllm.config import VllmConfig
+
+    method = VllmConfig._get_v1_model_runner_unsupported_features
+    if getattr(method, "_vllm_gaudi_dflash2", False):
+        return
+
+    def _get_v1_model_runner_unsupported_features(self):
+        unsupported = method(self)
+        from vllm_gaudi import envs as gaudi_envs
+
+        if gaudi_envs.VLLM_HPU_FLASHINFER_DFLASH2 and self._is_dflash2_draft():
+            unsupported = [feature for feature in unsupported if feature != "dflash2 drafts"]
+        return unsupported
+
+    _get_v1_model_runner_unsupported_features._vllm_gaudi_dflash2 = True
+    VllmConfig._get_v1_model_runner_unsupported_features = _get_v1_model_runner_unsupported_features
+
+
+def _validate_hpu_dflash2_config(vllm_config: VllmConfig) -> None:
+    from vllm_gaudi import envs as gaudi_envs
+
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is None or not speculative_config.use_dflash():
+        return
+    if not gaudi_envs.VLLM_HPU_FLASHINFER_DFLASH2:
+        return
+    if not gaudi_envs.VLLM_HPU_FLASHINFER_GDN:
+        raise ValueError("HPU DFlash2 requires VLLM_HPU_FLASHINFER_GDN=1 for rollback-safe recurrent state")
+    if os.environ.get("VLLM_COMPACT_GDN", "1").strip().lower() not in ("1", "true"):
+        raise ValueError("HPU DFlash2 currently requires VLLM_COMPACT_GDN=1 for per-token state checkpoints")
+
+    draft_model_config = speculative_config.draft_model_config
+    if draft_model_config is None:
+        raise ValueError("HPU DFlash2 requires an explicit draft model checkpoint")
+    architectures = set(getattr(draft_model_config, "architectures", ()) or ())
+    if "DFlash2DraftModel" not in architectures:
+        raise ValueError("The HPU DFlash backend currently supports only DFlash2DraftModel checkpoints")
+    if speculative_config.num_speculative_tokens != 7:
+        raise ValueError("HPU DFlash2 currently requires exactly 7 speculative tokens (an 8-token verify block)")
+    if not is_qwen3_5_hybrid_model(vllm_config.model_config):
+        raise ValueError("HPU DFlash2 currently supports Qwen3.8/Qwen3.5 hybrid targets only")
+
+    draft_hf_config = getattr(draft_model_config, "hf_config", None)
+    draft_mismatches = _config_field_mismatches(draft_hf_config, _QWEN38_DFLASH2_DRAFT_FIELDS)
+    dflash_config = getattr(draft_hf_config, "dflash_config", None) or {}
+    draft_mismatches.extend(_config_field_mismatches(dflash_config, _QWEN38_DFLASH2_HEAD_FIELDS))
+    if draft_mismatches:
+        raise ValueError("HPU DFlash2 is currently qualified only for the official Qwen3.8-27B-DFlash2 shape; " +
+                         "; ".join(draft_mismatches))
+
+    target_text_config = getattr(vllm_config.model_config, "hf_text_config", None)
+    target_mismatches = _config_field_mismatches(target_text_config, _QWEN38_TARGET_FIELDS)
+    expected_layer_types = tuple("full_attention" if (layer + 1) % 4 == 0 else "linear_attention"
+                                 for layer in range(64))
+    target_mismatches.extend(_config_field_mismatches(target_text_config, {"layer_types": expected_layer_types}))
+    if target_mismatches:
+        raise ValueError("HPU DFlash2 is currently qualified only for the Qwen3.8-27B target shape; " +
+                         "; ".join(target_mismatches))
+    if vllm_config.scheduler_config.max_num_seqs > 16:
+        raise ValueError("HPU DFlash2 currently requires max_num_seqs <= 16 because each active request reserves "
+                         "eight rollback checkpoints per GDN layer")
+
+    parallel_config = vllm_config.parallel_config
+    parallel_sizes = (
+        parallel_config.tensor_parallel_size,
+        parallel_config.pipeline_parallel_size,
+        parallel_config.data_parallel_size,
+    )
+    if parallel_sizes != (1, 1, 1):
+        raise ValueError("HPU DFlash2 currently supports only TP1/PP1/DP1")
+    if vllm_config.lora_config is not None:
+        raise ValueError("HPU DFlash2 does not yet support LoRA")
+    if vllm_config.cache_config.enable_prefix_caching:
+        raise ValueError("HPU DFlash2 requires prefix caching to be disabled")
+
+
 class HpuPlatform(Platform):
     _enum = PlatformEnum.OOT
     device_name: str = "hpu"
@@ -64,10 +199,29 @@ class HpuPlatform(Platform):
     ray_device_key: str = "HPU"
     device_control_env_var: str = "HABANA_VISIBLE_MODULES"
     supported_quantization: list[str] = [
-        "compressed-tensors", "fp8", "inc", "awq_hpu", "gptq_hpu", "modelopt", "gpt_oss_mxfp4"
+        "compressed-tensors",
+        "fp8",
+        "deepseek_v4_fp8",
+        "inc",
+        "awq_hpu",
+        "gptq_hpu",
+        "modelopt",
+        "gpt_oss_mxfp4",
     ]
     simple_compile_backend = "hpu_backend"
     additional_env_vars = [k for k, v in os.environ.items() if retain_envs(k)]
+
+    @classmethod
+    def check_runner_kv_caches_multi_layer(cls) -> None:
+        """Allow distinct attention caches to share a numeric layer index.
+
+        Speculative models keep target and draft attention modules in the same
+        static forward context.  Their qualified names are distinct, although
+        both can contain (for example) ``layers.0``.  The HPU runner stores and
+        processes every cache entry independently, just like the CUDA runner,
+        so flattening both entries into ``runner_kv_caches`` is supported.
+        """
+        return
 
     @classmethod
     def get_attn_backend_cls(
@@ -138,12 +292,41 @@ class HpuPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+            from vllm_gaudi.ops.deepseek_v4_native import validate_config
+            validate_config(vllm_config)
+        if gaudi_envs.VLLM_HPU_NATIVE_DECODE_GRAPH:
+            if not (gaudi_envs.VLLM_HPU_TP2_STATIC_GROUP_PLAN and gaudi_envs.VLLM_HPU_TP2_PREPARED_COMM
+                    and gaudi_envs.VLLM_HPU_GDN_DIRECT_STATE_UPDATE):
+                raise RuntimeError(
+                    "VLLM_HPU_NATIVE_DECODE_GRAPH requires the static group plan, prepared communication, "
+                    "and direct GDN state update; no fallback was selected")
+            # The Bridge caching allocator is created before native capture.
+            # Leave a fixed cold-path budget in Synapse's global-HBM pool for
+            # graph-owned recipe programs instead of consuming all free HBM.
+            pool_percent_text = os.environ.setdefault("PT_HPU_POOL_MEM_ACQUIRE_PERC", "95")
+            try:
+                pool_percent = int(pool_percent_text)
+            except ValueError as error:
+                raise RuntimeError("VLLM_HPU_NATIVE_DECODE_GRAPH requires an integer "
+                                   "PT_HPU_POOL_MEM_ACQUIRE_PERC between 1 and 95") from error
+            if not 1 <= pool_percent <= 95:
+                raise RuntimeError(
+                    "VLLM_HPU_NATIVE_DECODE_GRAPH requires PT_HPU_POOL_MEM_ACQUIRE_PERC between 1 and 95 "
+                    "so Synapse can retain fixed recipe program storage")
         # Apply torch.compile/eager-only env defaults here (engine construction
         # time) instead of at plugin registration time, so they cannot leak into
         # a lazy-mode subprocess (GAUDISW-248809) and always respect values the
         # user set explicitly (GAUDISW-249135).
         cls.set_compile_env_defaults()
+        from vllm_gaudi.ops.deepseek_v4_config import configure_defaults
+        if getattr(getattr(vllm_config.model_config, "hf_config", None), "model_type", None) == "deepseek_v4":
+            import habana_frameworks.torch.utils.experimental as htexp
+            configure_defaults(vllm_config, gaudi2=htexp._get_device_type() == htexp.synDeviceType.synDeviceGaudi2)
+        _enable_hpu_v1_dflash2_validation()
         parallel_config = vllm_config.parallel_config
+        if (gaudi_envs.VLLM_HPU_NATIVE_DECODE_GRAPH and parallel_config.tensor_parallel_size != 2):
+            raise RuntimeError("VLLM_HPU_NATIVE_DECODE_GRAPH currently requires tensor_parallel_size=2")
 
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = \
@@ -166,6 +349,8 @@ class HpuPlatform(Platform):
             cache_config.block_size = 128
             if cache_config.mamba_cache_mode == "align":
                 cache_config.mamba_block_size = 128
+        from vllm_gaudi.ops.deepseek_v41_config import configure as configure_v41
+        configure_v41(vllm_config)
         # Hybrid GDN/Mamba models: upstream HybridAttentionMambaModelConfig
         # already ran and computed block_size / mamba_page_size_padded for
         # GPU.  HPU overrode block_size to 128 above, so we must re-align
@@ -279,6 +464,7 @@ class HpuPlatform(Platform):
         # However, for HPU, speculative decoding is not supported with async scheduling.
         vllm_config.scheduler_config.async_scheduling = \
             vllm_config.scheduler_config.async_scheduling and vllm_config.speculative_config is None
+        _validate_hpu_dflash2_config(vllm_config)
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
@@ -383,6 +569,30 @@ class HpuPlatform(Platform):
     @classmethod
     def get_device_communicator_cls(cls) -> str:
         return "vllm_gaudi.distributed.device_communicators.hpu_communicator.HpuCommunicator"  # noqa
+
+    @classmethod
+    def supports_v1_speculative_method(cls, method, vllm_config):
+        from vllm_gaudi.ops.deepseek_v41_config import supports_dspark
+        return method == "dspark" and supports_dspark(vllm_config)
+
+    @classmethod
+    def get_max_concurrent_batches(cls, vllm_config):
+        from vllm_gaudi.ops.deepseek_v41_config import is_v41
+        # This runner owns one PP/verify transaction. The scheduler must commit
+        # its sampled anchor before submitting the following draft block.
+        return 1 if is_v41(vllm_config) else None
+
+    @classmethod
+    def configure_control_process(cls, role):
+        from vllm_gaudi.ops.deepseek_v41_cpu import bind_control_process
+        bind_control_process(role)
+
+
+    @classmethod
+    def register_custom_kv_cache_specs(cls, vllm_config):
+        if gaudi_envs.VLLM_HPU_DSV41_PREPARED_SHARDS:
+            from vllm_gaudi.ops.deepseek_v41_state import register_state_spec
+            register_state_spec(vllm_config)
 
     @classmethod
     def supports_structured_output(cls) -> bool:

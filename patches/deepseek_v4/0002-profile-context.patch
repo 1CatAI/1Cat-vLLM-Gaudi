@@ -1,0 +1,25 @@
+diff --git a/vllm/models/deepseek_v4/hw_agnostic/attention/_profile.py b/vllm/models/deepseek_v4/hw_agnostic/attention/_profile.py
+new file mode 100644
+index 0000000000..3b7273746d
+--- /dev/null
++++ b/vllm/models/deepseek_v4/hw_agnostic/attention/_profile.py
+@@ -0,0 +1,19 @@
++# SPDX-License-Identifier: Apache-2.0
++
++import os
++from contextlib import nullcontext
++from typing import ContextManager
++
++import torch
++
++
++_PROFILE_STAGES = os.getenv("VLLM_DSV4_PROFILE_STAGES", "0").lower() in (
++    "1",
++    "true",
++)
++
++
++def dsv4_profile_stage(name: str) -> ContextManager:
++    if not _PROFILE_STAGES:
++        return nullcontext()
++    return torch.profiler.record_function(f"dsv4::{name}")

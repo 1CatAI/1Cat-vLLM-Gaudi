@@ -119,9 +119,16 @@ class HPUBucketingManager():
         strategy = FileBucketingStrategy()
         return strategy.get_buckets(file_name, is_prompt)
 
-    def get_bucketing_strategy(self):
-        # TODO - we can use different strategies for decode and prompt
-        bucketing_strategy = get_config().bucketing_strategy
+    def get_bucketing_strategy(self, phase=None):
+        """Resolve the global strategy, optionally overridden for one phase."""
+        config = get_config()
+        bucketing_strategy = config.bucketing_strategy
+        if phase is not None:
+            if phase not in ('prompt', 'decode'):
+                raise ValueError(f"Invalid bucketing phase: {phase}, please choose from ['prompt', 'decode']")
+            phase_strategy = getattr(config, f'VLLM_{phase.upper()}_BUCKETING_STRATEGY')
+            if phase_strategy is not None:
+                bucketing_strategy = phase_strategy
         if bucketing_strategy == 'exp':
             strategy = ExponentialBucketingStrategy()
         elif bucketing_strategy == 'lin':
@@ -159,7 +166,7 @@ class HPUBucketingManager():
             if get_config().VLLM_BUCKETING_FROM_FILE:
                 buckets_from_file = self.read_from_file(is_prompt=True)
             else:
-                strategy = self.get_bucketing_strategy()
+                strategy = self.get_bucketing_strategy('prompt')
 
                 bs_cfg, query_cfg, ctx_cfg = strategy.get_prompt_cfgs(
                     max_num_prefill_seqs=self.max_num_prefill_seqs,
@@ -201,7 +208,7 @@ class HPUBucketingManager():
             if get_config().VLLM_BUCKETING_FROM_FILE:
                 buckets_from_file = self.read_from_file(is_prompt=False)
             else:
-                strategy = self.get_bucketing_strategy()
+                strategy = self.get_bucketing_strategy('decode')
 
                 bs_cfg, query_cfg, ctx_cfg = strategy.get_decode_cfgs(
                     max_num_seqs=self.max_num_seqs,
