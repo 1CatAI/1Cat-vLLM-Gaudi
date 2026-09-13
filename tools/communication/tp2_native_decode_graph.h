@@ -376,9 +376,8 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
                std::vector<torch::jit::Stack> inputs) {
     RuntimeApis::get().require();
     if (mhcOverlapEnabled()) {
-      TORCH_CHECK(jointPlanEnabled() && !external_prefix_ &&
-                      ((expected_groups_ == 5 && (expected_collectives_ == 40 || expected_collectives_ == 42)) ||
-                       (expected_groups_ == 1 && expected_collectives_ == 8)),
+      TORCH_CHECK(jointPlanEnabled() && NativeGraphTopology::supportsV41Dependencies(
+                      expected_groups_, expected_collectives_, external_prefix_),
                   "Explicit TP dependencies require the V4.1 C1 stage topology");
       RuntimeApis::get().requirePlanV2();
     }

@@ -469,3 +469,15 @@ and end-to-end performance have all been qualified. See
 - `VLLM_HPU_DSV41_C1_INDICES` (default `0`): fuse C1 SWA/window, compressed-slot mask/offset and visible-length preparation. Requires bounded packed attention; preserves Full/Reindex/Reuse state publication.
 
 - `VLLM_HPU_DSV41_SELECTED_VALID_ONLY` (default `0`): omit BF16 stores for invalid selected slots inside ordered packed attention. The attention consumer rejects their remapped `-1` IDs before loading; the public selected-KV gather retains zero-filled invalid rows. Requires SWA pack/write.
+
+### V4.1 native input capture
+
+`VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH` (default `0`) includes PP0 embedding and its
+TP reduction in the first native decoder group for ordinary BF16 C1 decode.
+The native PP0 plan retains its 40 layer reductions, two Engram collectives and
+one embedding reduction. It does not replace prefill, explicit input embeddings,
+PP1, or DSpark execution. Enable it only with native stage replay, before process
+startup, and use a separate recipe cache. Rebuild the native bridge from the
+matching source so its dependency validation accepts the complete PP0 topology.
+This is an unqualified experimental path; output/state equivalence and
+complete-chain latency must be validated for the selected runtime configuration.

@@ -11,6 +11,12 @@ struct NativeNodeKind {
 };
 
 struct NativeGraphTopology {
+  static bool supportsV41Dependencies(size_t groups, size_t collectives, bool externalPrefix) {
+    return !externalPrefix &&
+        ((groups == 5 && (collectives == 40 || collectives == 42 || collectives == 43)) ||
+         (groups == 1 && collectives == 8));
+  }
+
   size_t prefixNodes = 0;
   uint32_t computeCount = 0;
   size_t externalCollectives = 0;

@@ -6,7 +6,7 @@ import weakref
 
 import torch
 
-from vllm_gaudi.ops.tp2_model_adapter import DEEPSEEK_V41_PP0, DEEPSEEK_V41_PP1
+from vllm_gaudi.ops.tp2_model_adapter import DEEPSEEK_V41_PP0, DEEPSEEK_V41_PP0_INPUT, DEEPSEEK_V41_PP1
 
 
 def stage_collectives(tp_rank, native):
@@ -51,12 +51,13 @@ def stage_state_tensors(program):
 
 
 class StageVariant(torch.nn.Module):
-    def __init__(self, program, hidden, pre_mix, positions, input_ids, engram):
+    def __init__(self, program, hidden, pre_mix, positions, input_ids, engram, *, native_input=False):
         super().__init__()
         self.program = program
-        self.adapter = DEEPSEEK_V41_PP0 if program.pp_rank == 0 else DEEPSEEK_V41_PP1
+        self.adapter = (DEEPSEEK_V41_PP0_INPUT if native_input else
+                        DEEPSEEK_V41_PP0 if program.pp_rank == 0 else DEEPSEEK_V41_PP1)
         from vllm_gaudi.models.deepseek_v41_program import CompiledStage
-        self.compiled = CompiledStage(program, native=True)
+        self.compiled = CompiledStage(program, native=True, native_input=native_input)
         self.fixed = tuple(value.clone() for value in (hidden, pre_mix, positions, input_ids))
         self.engram = tuple(value.clone() for value in engram)
         self.states = stage_state_tensors(program)
@@ -99,20 +100,37 @@ class StageVariant(torch.nn.Module):
 
 class StageReplay:
     def __init__(self, program):
+        from vllm_gaudi import envs
         self.program = weakref.ref(program)
         self.variants = {}
+        self.native_input_enabled = envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH and program.pp_rank == 0
+        self.input_seed = None
 
-    def __call__(self, hidden, pre_mix, positions, input_ids, engram):
+    def from_input_ids(self, positions, input_ids, engram):
+        if (not self.native_input_enabled or input_ids.numel() != 1 or self.program().dspark
+                or self.program().fp8_decode):
+            raise ValueError("Native input capture requires enabled ordinary BF16 C1 PP0 decode")
+        if self.input_seed is None:
+            # The first compiled group replaces these unused seed arguments.
+            # Keeping its call signature preserves the common group executor.
+            self.input_seed = (torch.zeros(1, 4, 5120, device=input_ids.device, dtype=torch.bfloat16),
+                               torch.zeros(1, 4, device=input_ids.device, dtype=torch.float32))
+        return self(*self.input_seed, positions, input_ids, engram, native_input=True)
+
+    def __call__(self, hidden, pre_mix, positions, input_ids, engram, *, native_input=False):
         tokens = input_ids.numel()
         if tokens not in ((1, 6) if self.program().dspark else (1,)):
             raise ValueError("V4.1 replay shape must match C1 decode or enabled C6 DSpark verification")
-        if tokens not in self.variants:
-            self.variants[tokens] = StageVariant(self.program(), hidden, pre_mix, positions, input_ids, engram)
-        return self.variants[tokens](hidden, pre_mix, positions, input_ids, engram)
+        key = (tokens, "input") if native_input else tokens
+        if key not in self.variants:
+            self.variants[key] = StageVariant(self.program(), hidden, pre_mix, positions, input_ids, engram,
+                                             native_input=native_input)
+        return self.variants[key](hidden, pre_mix, positions, input_ids, engram)
 
     def require_ready(self, tokens):
         from vllm_gaudi.ops.tp2_prepared_plan import _native_entries
-        variant = self.variants.get(tokens)
+        key = (tokens, "input") if self.native_input_enabled and tokens == 1 else tokens
+        variant = self.variants.get(key)
         if variant is None or variant not in _native_entries:
             raise RuntimeError("V4.1 warmup did not capture its complete native stage; serving cannot start")
 
@@ -120,3 +138,4 @@ class StageReplay:
         from vllm_gaudi.ops.tp2_prepared_plan import invalidate_prepared_group_plans
         invalidate_prepared_group_plans()
         self.variants.clear()
+        self.input_seed = None
