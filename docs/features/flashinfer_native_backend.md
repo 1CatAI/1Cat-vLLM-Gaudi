@@ -236,6 +236,134 @@ replacing that epilogue does not remove a graph launch or an engine stage.
 Prioritize activation/quant and residual/norm/quant fusion with unchanged
 scale semantics, and separately reduce out-replay submission overhead.
 
+## Experimental residual / RMSNorm / row-FP8 fusion
+
+`flashinfer_gaudi.fused_add_rmsnorm_quant(x, residual, weight, eps=1e-6)`
+is a functional Gaudi extension, not the upstream in-place or block-scale API.
+It returns four independently allocated outputs: E4M3 values `[B,D]`, FP32 row
+scales `[B,1]`, BF16 normalized values `[B,D]`, and BF16 residual sums `[B,D]`.
+Inputs are read-only; input/residual aliases are allowed. Native support is
+limited to contiguous inference BF16 inputs and weights, positive rows within
+signed 32-bit index range, and widths from 256 to 17408 divisible by 128.
+The epsilon must be a positive normal FP32 value.
+
+The public CustomOp lowers to one AOT TPC kernel, without a numerical torch
+prologue or the private mixed-graph Bridge adapter. Four independent input
+accumulators and a balanced row reduction shorten dependency chains. Weighted
+BF16 values are cached in VLM; direct BF16-to-FP8 conversion preserves the
+BF16 product rounding while avoiding repeated FP32 conversion.
+Widths through 8192 use the compiler's lookup rsqrt with a bounded 16-KiB
+row cache. Wider rows use the lookup-free variant with a larger cache. The
+host instantiation selects the ELF by width; both keep the same GUID and
+scalar ABI. Host and hardware tests cover the resource boundary.
+
+The normalization preserves the current HPU vendor's BF16 weight-product
+boundary. Row scales use Gaudi2's finite E4M3 range of +/-240. The explicit
+`scale_mode` selects `bf16_reciprocal` (BF16-rounded reciprocal of 240) or
+`fp32_divide` (FP32 reciprocal), with BF16-rounded scale and inverse scale.
+Vendor, ordinary compiled, and CGUID graphs can differ in these intermediate
+precision boundaries, especially when embedded in a GEMM consumer. Do not
+infer the correct mode from shape, or treat matching isolated outputs as
+proof that a full projection or model is numerically equivalent.
+
+Use `native` or `public` policy to request the native implementation, and load
+the extension before compilation. `auto` and `pytorch` remain reference-only;
+no model dispatch is changed by this candidate or by a benchmark report.
+
+```bash
+FLASHINFER_GAUDI_RUN_HARDWARE_TESTS=1 python -m pytest -q \
+  tests/unit_tests/ops/test_flashinfer_norm_quant_hardware.py
+python tools/benchmark_flashinfer_native_norm.py \
+  --output /tmp/native-norm-quant.json --sessions 3 --trace
+```
+
+The hardware tests cover both scale modes, all output lanes, tails, shape
+reentry, input updates, read-only aliases, output non-aliasing, non-default
+streams, and the compiled reference's BF16 scale boundary. Qualification
+requires a first-session device trace, audited native FX graphs in every
+session, unchanged matching source/library hashes, and disabled eager
+fallback. Omitting `--trace` permits screening but cannot qualify a shape.
+Each shape must beat the ordinary vendor, CGUID, and formula baselines under
+the existing paired performance gate. Full FP8-GEMM consumer, model-quality,
+and end-to-end qualification remain separate requirements.
+
+## Complete FP8 projections and model integration
+
+An isolated norm/quant win is not a projection win. The projection harness
+includes residual addition, normalization, row quantization and the public
+`hpu.fp8_gemm_v2` consumer. Ordinary serving quantization uses the exact
+`max(dim).values` and reciprocal expressions; CGUID and formula comparisons
+remain separate numerical contracts. An incompatible baseline stays failed
+in the report even when another baseline qualifies.
+
+```bash
+python tools/benchmark_flashinfer_native_projection.py \
+  --output /tmp/native-projection.json --sessions 3 --trace
+```
+
+Per-shape fixtures are independent of traversal order. Qualification requires
+three distinct process identities, matching source/library/input hashes,
+unchanged inputs, shape reentry, native FX dataflow and device trace evidence.
+The projection is not one kernel: the public MME consumer can also generate
+an FP32 device kernel. All stages and recipe launches are reported.
+
+The real-model validation tools provide three deliberately separate steps:
+
+```bash
+# Use the same channel-FP8, CGUID and grouped-compilation settings in both arms.
+export VLLM_HPU_FORCE_CHANNEL_FP8=true
+export VLLM_HPU_CGUID_DYNAMIC_QUANT=1
+export VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS=32
+export VLLM_HPU_QWEN3_COMPILE_LAYER_GROUP_SIZE=8
+export VLLM_SKIP_WARMUP=true
+python tools/capture_flashinfer_model_projection.py \
+  --model MODEL --output /tmp/model-projection-inputs
+python tools/replay_flashinfer_model_projection.py \
+  --capture /tmp/model-projection-inputs \
+  --output /tmp/model-projection-replay.json --sessions 3 --trace
+python tools/benchmark_flashinfer_model_projection.py \
+  --model MODEL --output /tmp/model-projection-aba --trace
+```
+
+Capture uses named worker-control RPCs, without enabling pickle RPCs. It
+loads the actual checkpoint and captures postprocessed FP8 weights plus
+residual/normalization/projection tensors. Hooks do not change model outputs
+and are removed afterwards. Capture runs eager and is **not** a performance
+benchmark. The requested decode buckets must actually be observed; request
+concurrency alone does not establish the operator batch. Compiled replay
+checks its baselines separately from the originating eager model output.
+Differences between eager and compiled outputs are retained, not explained
+away by changing tolerances.
+
+`vllm_gaudi.ops.flashinfer_projection_fusion` is an experimental graph adapter,
+not a new stable FlashInfer API. It has no automatic registration: an empty
+shape request is a no-op. The trial tool explicitly requests only the qualified
+CGUID B=8, K=5120, N=34816 pattern. Other shapes, ordinary quantization,
+unknown layouts, extra consumers and externally observable mutation remain
+unchanged. Identity views are accepted only with matching contiguous metadata.
+Bridge-created `add_` reuse is replaced only after proving a graph-private
+owner with no escaping aliases or future reads; the obsolete update is then
+explicitly erased because FX DCE preserves impure nodes.
+Only inserted nodes receive fresh, non-aliasing metadata. Do not rerun
+whole-graph FakeTensor propagation after Bridge's HPU layout rewrites: some
+resulting BMM graphs are valid for HPU lowering but no longer valid aten
+programs for generic shape execution. Training/backward contexts are skipped.
+
+The model A/B/A screen uses fresh processes and checks source stability,
+actual native-kernel execution, token IDs and baseline-return drift. Profiling
+is limited to five B=8 decode model forwards, outside request timings. Device
+kernel activity records are not logical invocation counts. Match the existing
+serving eager-fallback policy in both model arms (Bridge normally permits
+metadata views); this is separate from the projection tests, which disable
+eager fallback. A small warm-request screen is not general LLM acceptance,
+and neither a report nor the adapter enables a production default.
+The harness now requires at least two symmetric warmup rounds and rejects
+timed rounds deviating more than ten percent from their worker median. Earlier
+single-warmup screens exposed residual cold/recompile overhead; retain those
+rounds as diagnostics, not as steady-state speedup evidence. Forced-length
+generation ignores EOS for timing, so raw token disagreement must also be
+examined before the first EOS; it is not itself a semantic quality score.
+
 ## Build and execute
 
 ```bash
@@ -290,8 +418,9 @@ are not end-to-end model speedups. Existing graph tactics remain the baseline.
    AOT artifacts and general mixed-engine adapter. Extend the first static
    GEMM-SiLU plan to caller workspaces, recipe serialization and broader
    concurrency qualification.
-2. Implement residual/norm/quant, gated activation/quant, QK/RoPE/KV fusion;
-   complete native GDN decode/MTP/prefill and KDA/Mamba/state contracts.
+2. Qualify residual/norm/quant inside complete models; finish gated
+   activation/quant and QK/RoPE/KV fusion, native GDN decode/MTP/prefill,
+   and KDA/Mamba/state contracts.
 3. Add MME linear/GEMM and exact-scale block quantization pipelines; then
    paged/variable-length GQA, dense, MLA, sparse and cascade attention.
 4. Add MoE dispatch/grouped compute/combine, device sampling and speculative
