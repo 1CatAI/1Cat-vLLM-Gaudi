@@ -279,6 +279,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_TPC_MHC", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_ENGRAM_NATIVE_C1":
     lambda: os.environ.get("VLLM_HPU_DSV41_ENGRAM_NATIVE_C1", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_ENGRAM_C1_PACKET":
+    lambda: os.environ.get("VLLM_HPU_DSV41_ENGRAM_C1_PACKET", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_TP_MHC_OVERLAP":
     lambda: os.environ.get("VLLM_HPU_DSV41_TP_MHC_OVERLAP", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_NATIVE_INPUT_PREFLIGHT":
