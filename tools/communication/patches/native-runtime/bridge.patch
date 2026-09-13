@@ -1,0 +1,123 @@
+diff --git a/backend/helpers/collective_kernel_info.cpp b/backend/helpers/collective_kernel_info.cpp
+index dcaf449bd..ca70ae872 100644
+--- a/backend/helpers/collective_kernel_info.cpp
++++ b/backend/helpers/collective_kernel_info.cpp
+@@ -85,7 +85,12 @@ void CollectiveKernelInfos::Launch(
+     habana::CollectiveOperator& collective = *kernel_info.kernel;
+     PT_BRIDGE_DEBUG("Running collective op ", collective.GetGuid());
+     collective.RunCollective(
+-        kernel_info.input_tensor_infos, pt_inputs, pt_outputs, async, done_cb);
++        kernel_info.input_tensor_infos,
++        kernel_info.output_tensor_infos,
++        pt_inputs,
++        pt_outputs,
++        async,
++        done_cb);
+   }
+ }
+ void CollectiveKernelInfos::ClearAllPtAndSynTensors() {
+diff --git a/backend/kernel/hpu_habana_launch_op_pt.cpp b/backend/kernel/hpu_habana_launch_op_pt.cpp
+index da7db3be1..4a889f5fc 100644
+--- a/backend/kernel/hpu_habana_launch_op_pt.cpp
++++ b/backend/kernel/hpu_habana_launch_op_pt.cpp
+@@ -5303,6 +5303,15 @@ void HabanaLaunchOpPT::run(
+     ProcessGraphForConstantTensors(*jit_ir_graph_, value_to_ivalue_);
+   }
+ 
++  for (const auto* node : jit_ir_graph_->nodes()) {
++    if (node->kind().toQualString() ==
++        std::string_view("hccl::tp2_allreduce_residual_rms_norm")) {
++      enable_shape_agnostic_caching_ = false;
++      jit_graph_and_meta_data_->set_is_shape_agnostic_supported(false);
++      break;
++    }
++  }
++
+   if (enable_shape_agnostic_caching_) {
+     ValidateInputsAndOutputsAndDisableSA(input_refs_);
+   }
+diff --git a/habana_eager/graph_execs_group.h b/habana_eager/graph_execs_group.h
+index 2b8501f2d..10be40fa7 100644
+--- a/habana_eager/graph_execs_group.h
++++ b/habana_eager/graph_execs_group.h
+@@ -53,6 +53,19 @@ struct GraphExecsGroup {
+ 
+   void ResetSeed();
+ 
++  // Internal ABI for prepared inference plans. No object layout changes.
++  // Call after warm execution and after joining the lowering queue. A plan
++  // validates every input's shape, stride and offset before each replay.
++  GraphExec* prepared_static_exec(torch::jit::Stack& inputs) {
++    HABANA_ASSERT(!m_dynamic && m_inference && !m_has_randoms,
++                  "Prepared execution requires static deterministic inference");
++    const auto key = generate_key(inputs);
++    const auto found = m_graph_exec_storage.find(key);
++    HABANA_ASSERT(found != m_graph_exec_storage.end(), "Prepared graph offset variant was not warmed");
++    HABANA_ASSERT(found->second.HasOptimizedGraph(), "Prepared graph was not lowered");
++    return &found->second;
++  }
++
+   GraphExecsGroup() = delete;
+   GraphExecsGroup(const GraphExecsGroup&) = delete;
+   GraphExecsGroup(GraphExecsGroup&&) = default;
+diff --git a/habana_eager/graph_storage.h b/habana_eager/graph_storage.h
+index 0d883a1a9..4b45765ec 100644
+--- a/habana_eager/graph_storage.h
++++ b/habana_eager/graph_storage.h
+@@ -44,6 +44,13 @@ class GraphStorage {
+       std::string& parent_graph_name);
+   void reset_seeds();
+ 
++  // The unordered-map element retained by this pointer remains stable when
++  // the recipe catalog grows. GraphStorage retains recipes for process life.
++  GraphExec* prepared_static_exec(size_t recipe_id, torch::jit::Stack& inputs) {
++    HABANA_ASSERT(recipe_id < m_storage_vec.size(), "Unknown prepared recipe");
++    return m_storage_vec.at(recipe_id).prepared_static_exec(inputs);
++  }
++
+  private:
+   GraphStorage() {};
+   GraphStorage(const GraphStorage&) = delete;
+diff --git a/habana_kernels/hccl_kernels.h b/habana_kernels/hccl_kernels.h
+index 024e0f17b..0df10b2d2 100644
+--- a/habana_kernels/hccl_kernels.h
++++ b/habana_kernels/hccl_kernels.h
+@@ -37,6 +37,21 @@ class CollectiveOperator : public habana::HabanaOperator {
+       std::vector<at::Tensor>& pt_outputs,
+       bool async,
+       synapse_helpers::event_done_callback cleanup_callback) const = 0;
++  virtual void RunCollective(
++      const std::vector<PtTensorInfoShared>& inputs,
++      const std::vector<PtTensorInfoShared>& outputs,
++      std::vector<at::Tensor>& pt_inputs,
++      std::vector<at::Tensor>& pt_outputs,
++      bool async,
++      synapse_helpers::event_done_callback cleanup_callback) const {
++    (void)outputs;
++    RunCollective(
++        inputs,
++        pt_inputs,
++        pt_outputs,
++        async,
++        std::move(cleanup_callback));
++  }
+ 
+   int GetDeviceId() const {
+     return device_id_;
+diff --git a/python_packages/habana_frameworks/torch/distributed/hccl/process_group_eager_hccl.hpp b/python_packages/habana_frameworks/torch/distributed/hccl/process_group_eager_hccl.hpp
+index a1cead7e4..0b4933318 100644
+--- a/python_packages/habana_frameworks/torch/distributed/hccl/process_group_eager_hccl.hpp
++++ b/python_packages/habana_frameworks/torch/distributed/hccl/process_group_eager_hccl.hpp
+@@ -84,6 +84,12 @@ class TORCH_API ProcessGroupEagerHCCL : public ProcessGroupHcclBase {
+ 
+   void restoreOddSizeSendTensors(std::vector<at::Tensor>& tensors);
+ 
++  // Isolated integration hook for a stream-ordered TP2 inference prototype.
++  // The caller must preserve tensor lifetime and HCCL stream ordering.
++  std::shared_ptr<habana::HcclCommunicator> lowLatencyCommunicator() const {
++    return comm_;
++  }
++
+  protected:
+   void groupStart() override;
+ 

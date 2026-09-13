@@ -17,7 +17,7 @@ from vllm.v1.pool.metadata import PoolingMetadata
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.utils import CpuGpuBuffer
-from vllm.v1.worker.block_table import BlockTable, MultiGroupBlockTable
+from vllm.v1.worker.block_table import (BlockTable, MultiGroupBlockTable, SlotMappingMode)
 from vllm_gaudi.v1.worker.hpu_input_batch import InputBatch, CachedRequestState
 
 VOCAB_SIZE = 1024
@@ -25,6 +25,49 @@ NUM_OUTPUT_TOKENS = 20
 MAX_PROMPT_SIZE = 100
 CUDA_DEVICES = ['hpu']
 MAX_NUM_PROMPT_TOKENS = 64
+
+
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+def test_explicit_mamba_block_table_width_for_spec_decode(device: str):
+    """Mamba rows must retain one entry for every speculative checkpoint."""
+    input_batch = InputBatch(
+        max_num_reqs=1,
+        max_model_len=4096,
+        max_num_batched_tokens=4096,
+        device=torch.device(device),
+        pin_memory=is_pin_memory_available(),
+        vocab_size=VOCAB_SIZE,
+        block_sizes=[4096],
+        kernel_block_sizes=[4096],
+        max_num_blocks_per_req=[8],
+        slot_mapping_modes=[SlotMappingMode.NONE],
+        is_spec_decode=True,
+    )
+
+    block_ids = list(range(8))
+    input_batch.block_table.add_row((block_ids, ), 0)
+    assert input_batch.block_table[0].get_cpu_tensor()[0, :8].tolist() == block_ids
+
+
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+def test_custom_max_num_blocks_per_req(device: str):
+    input_batch = InputBatch(
+        max_num_reqs=1,
+        max_model_len=512,
+        max_num_batched_tokens=512,
+        device=torch.device(device),
+        pin_memory=is_pin_memory_available(),
+        vocab_size=VOCAB_SIZE,
+        block_sizes=[256, 64],
+        kernel_block_sizes=[256, 64],
+        max_num_blocks_per_req=[4, 8],
+    )
+
+    assert input_batch.max_num_blocks_per_req == [4, 8]
+    assert [
+        block_table.max_num_blocks_per_req
+        for block_table in input_batch.block_table.block_tables
+    ] == [4, 8]
 
 
 def _compare_objs(obj1, obj2, skip: Sequence = ("logitsprocs", "batch_update_builder")):

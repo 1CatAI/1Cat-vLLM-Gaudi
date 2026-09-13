@@ -126,6 +126,30 @@ def silu_and_mul_op() -> Callable | None:
     return _SILU_AND_MUL_OP
 
 
+def public_mtp_gdn_op() -> Callable | None:
+    return _resolve_op("flashinfer_gaudi", "gdn_mtp_packed")
+
+
+def public_mtp_prepared_op() -> Callable | None:
+    return _resolve_op("custom_op", "flashinfer_gaudi_gdn_mtp_prepared")
+
+
+def native_dflash2_grouped_conv_op() -> Callable | None:
+    return _resolve_op("flashinfer_gaudi", "dflash2_grouped_conv")
+
+
+def native_dflash2_select_path_op() -> Callable | None:
+    return _resolve_op("flashinfer_gaudi", "dflash2_select_path")
+
+
+def native_dflash2_score_select_op() -> Callable | None:
+    return _resolve_op("flashinfer_gaudi", "dflash2_score_select")
+
+
+def native_dflash2_top_k_op() -> Callable | None:
+    return _resolve_op("flashinfer_gaudi", "dflash2_top_k")
+
+
 def native_diagnostics() -> dict[str, object]:
     load_native_extensions()
     return {
@@ -138,6 +162,12 @@ def native_diagnostics() -> dict[str, object]:
         "block_fp8_dequant": block_fp8_dequant_op() is not None,
         "block_fp8_linear": block_fp8_linear_op() is not None,
         "fused_add_rmsnorm_quant": add_rmsnorm_quant_op() is not None,
+        "public_mtp_gdn": public_mtp_gdn_op() is not None,
+        "public_mtp_prepared": public_mtp_prepared_op() is not None,
+        "dflash2_grouped_conv": native_dflash2_grouped_conv_op() is not None,
+        "dflash2_select_path": native_dflash2_select_path_op() is not None,
+        "dflash2_score_select": native_dflash2_score_select_op() is not None,
+        "dflash2_top_k": native_dflash2_top_k_op() is not None,
     }
 
 

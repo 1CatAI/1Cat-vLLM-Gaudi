@@ -2,6 +2,20 @@
 
 This document lists the supported diagnostic and profiling, as well as performance tuning options.
 
+`VLLM_HPU_NATIVE_DECODE_GRAPH` selects the research native replay path for the
+Gaudi2 Qwen3.8 TP2 C1 decoder. Warmup retains eight compiled decoder groups,
+fixed tensor bindings, recipe memory, and HCL command templates. Stable decode
+then updates the fixed input buffers and publishes the staged compute and
+communication queues from one outer `NativeDecodeGraph` replay. The path
+requires the version-locked Synapse and HCL builds plus the three structural
+options listed below. It also reserves five percent of global HBM from the
+Bridge caching allocator for graph-owned recipe programs unless the user has
+selected a smaller pool. Missing symbols, a changed address or shape, an invalid
+state transition, or incomplete graph coverage raises an error; it never
+falls back after a token may have mutated recurrent state. The option remains
+disabled and unqualified while the device correctness and performance gates
+are in progress.
+
 ## Diagnostic and Profiling Parameters
 
 | Parameter name                            | Description                                                                                                                                                                                                                                                                                                                                                                                                             | Default value |
@@ -22,11 +36,14 @@ This document lists the supported diagnostic and profiling, as well as performan
 | ---------------------------- | ------------------------------------------------------------- | ------------- |
 | `VLLM_GRAPH_RESERVED_MEM`    | Percentage of memory dedicated to HPUGraph capture.           | `0.1`         |
 | `VLLM_BUCKETING_STRATEGY`    | Selects the bucketing strategy: `exp`, `lin`, or `pad`.      | `exp`         |
+| `VLLM_PROMPT_BUCKETING_STRATEGY` | Overrides the strategy for prompt/prefill buckets: `exp`, `lin`, or `pad`. | `None` (use global strategy) |
+| `VLLM_DECODE_BUCKETING_STRATEGY` | Overrides the strategy for decode buckets: `exp`, `lin`, or `pad`. | `None` (use global strategy) |
 | `VLLM_EXPONENTIAL_BUCKETING` | Deprecated compatibility flag. If set, it overrides `VLLM_BUCKETING_STRATEGY`: `true` forces `exp`, `false` forces `lin`. It cannot select `pad` and will be removed in a future release. | `None`        |
 | `VLLM_BUCKETING_FROM_FILE`   | Enables reading bucket configuration from file.              | `None`        |
 | `VLLM_ROW_PARALLEL_CHUNKS`   | Number of chunks to split input into for pipelining matmul with all-reduce in RowParallelLinear layers. Setting to a value greater than 1 enables chunking. See [Row-Parallel Chunking](../features/row_parallel_chunking.md). | `1` (disabled) |
 | `VLLM_ROW_PARALLEL_CHUNK_THRESHOLD` | Minimum number of tokens required to activate row-parallel chunking. Inputs below this threshold use the standard non-chunked path. | `8192` |
-| `VLLM_HPU_TP2_FUSED_AR_NORM` | Enables experimental deferred all-reduce/RMSNorm boundaries for dense Qwen3.5/Qwen3-Next TP2, including the embedding reduction at the first input norm. Supported RMSNorm decode inputs use the graph-native fused collective. GemmaRMSNorm always uses stock HCCL plus its original effective-weight normalization; native fusion is not validated for that variant. Unknown normalization consumers are rejected before reductions are disabled. Requires `PT_HPU_ENABLE_LAZY_COLLECTIVES=1`; prefill, unsupported payloads, and decode batches above 20 tokens also use the standard path. | `false` |
+| `VLLM_HPU_TP2_FUSED_AR_NORM` | Enables experimental deferred all-reduce/RMSNorm boundaries for dense Qwen3.5/Qwen3-Next TP2, including the embedding reduction at the first input norm. Supported RMSNorm decode inputs use the graph-native fused collective. GemmaRMSNorm uses stock HCCL unless the separately gated native experiment below is enabled. Unknown normalization consumers are rejected before reductions are disabled. Requires `PT_HPU_ENABLE_LAZY_COLLECTIVES=1`; prefill, unsupported payloads, and decode batches above 20 tokens also use the standard path. | `false` |
+| `VLLM_HPU_TP2_GEMMA_FUSED_AR_NORM` | Experimental Gemma decode fusion; requires the deferred-boundary flag and a matching patched Bridge/extension. Both ranks must pass changing-input compiled startup checks, including actual collective execution and graph-produced `weight + 1`, before any model reduction flags are changed. A failed check aborts initialization; it does not silently fall back. Passing this probe is not model accuracy or performance qualification. See `tools/communication/README.md`. | `false` |
 | `VLLM_HPU_TP2_FUSED_AR_NORM_MAX_BYTES` | Largest BF16 activation payload accepted by the experimental TP2 fused path. | `524288` |
 | `VLLM_HPU_TP2_FUSED_AR_NORM_BRIDGE` | Path to the native bridge built by `tools/communication/build_tp2_fused_ar_norm_bridge.py`; required only when `VLLM_HPU_TP2_FUSED_AR_NORM=true`. | `None` |
 | `VLLM_PROMPT_BS_BUCKET_MAX`  | Sets prefill batch size | `1` |
@@ -64,9 +81,30 @@ This document lists the supported diagnostic and profiling, as well as performan
 | `VLLM_GDN_HPU_CAUSAL_CONV1D` | Uses Habana's native causal-conv1d forward op for GDN prompt convolution and SiLU, then explicitly persists its functional cache output. Decode is unchanged. | `false` |
 | `VLLM_GDN_TOKEN_MAJOR_CAUSAL_CONV1D` | Keeps the compiled PyTorch GDN prompt convolution in token-major layout, avoiding the packed activation's channel-major round trip. Decode is unchanged. | `false` |
 | `VLLM_HPU_FLASHINFER_GDN` | Enables the in-tree FlashInfer-compatible packed GDN decode path for Qwen hybrid models. In `auto`, only the measured contiguous-state fast path is selected; other layouts use the existing vLLM implementation. | `false` |
+| `VLLM_HPU_FLASHINFER_DFLASH2` | Enables the experimental HPU V1 DFlash2 proposer and FlashInfer-Gaudi grouped-convolution, candidate-selection, and rollback-safe GDN paths. The initial qualification scope is greedy Qwen3.8/Qwen3.5 hybrid inference, TP1/PP1/DP1, text-only requests, at most 16 sequences, with prefix caching and LoRA disabled. When unset, this follows `VLLM_HPU_FLASHINFER_GDN`. | `false` (`true` with FlashInfer GDN) |
+| `VLLM_HPU_DFLASH2_CONV_ROUND_BEFORE_ACTIVATION` | Experimental numerical-contract check: round speculative convolution to the cache dtype before activation, matching ordinary HPU decode. Retains convolution rollback and padding behavior. Off by default pending independent model-quality and acceptance qualification; this is not a kernel promotion. | `false` |
+| `VLLM_HPU_DFLASH2_FULL_QUERY_CONV` | Experimental removal of redundant speculative-convolution masks and state reads. Requires a CPU-proven complete DFlash2 verification block, compact request-owned state, and prefix caching disabled. Ragged batches and single-token transitions retain the reference path. Arithmetic and activation rounding are unchanged. | `false` |
+| `VLLM_HPU_DFLASH2_DIRECT_CHECKPOINTS` | Experimental internal contiguous destination for the prepared native DFlash2 Target checkpoint writes. Requires full T8 verification, compact state, no prefix caching, and an exact CPU proof of group-major request/checkpoint ownership. Other layouts retain indexed writes. Does not enable or promote the native kernel itself. | `false` |
+| `VLLM_HPU_DFLASH2_DEVICE_PREPARE` | Experimental fixed-width DFlash2 target-to-draft bridge. Accepted lengths, context/query positions, KV slots, block lists, and attention bias remain on HPU so draft work can be queued before target samples are copied to the host. Unsupported or ragged decode batches retain the CPU preparation path. | `false` |
+| `VLLM_HPU_FLASHINFER_GDN_TP2` | Opt in to the experimental TP2 local-head GDN prefill and fused decode shapes. The parent GDN switch alone keeps the existing geometry. | `false` |
 | `VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE` | Enables the qualified Qwen3.8 TP1 fused direct-state decode recipe for batches 1, 2, 4, 8, 16, and 32. Unsupported shapes retain the existing packed GDN path. When unset, this follows `VLLM_HPU_FLASHINFER_GDN`. | `false` (`true` with FlashInfer GDN) |
 | `VLLM_HPU_FLASHINFER_GDN_PREFILL` | Enables the offline-promoted FlashQLA graph tactic for Qwen3.8 GDN prefill. Unsupported shapes retain the general HPU path. When unset, this follows `VLLM_HPU_FLASHINFER_GDN`. | `false` (`true` with FlashInfer GDN) |
 | `VLLM_HPU_GDN_DIRECT_STATE` | Uses group-major compact recurrent-state spans when a decode bucket is full, prefix caching is disabled, and request slots are contiguous. | `true` |
+| `VLLM_HPU_GDN_ACTIVE_STATE_VIEWS` | Experimental: binds only active recurrent-state rows outside compiled Qwen3 decoder groups to reduce state writeback dependencies. Requires FlashInfer fused direct-state ordinary decode; prefill, indexed state, and speculative decode retain their existing cache paths. | `false` |
+| `VLLM_HPU_GDN_ASYNC_STATE_DMA` | Experimental: compiled Qwen3 decoder groups return fresh SSM states for native DMA on a separate HPU stream. Disjoint state slices and queued consumer/reset events avoid whole-pool write dependencies. Requires active state views, regional decoder groups, and a TP2 bridge exporting `queue_gdn_state_copies` / `queue_gdn_state_waits`; currently TP2 batch-one ordinary decode with speculation and prefix caching disabled. | `false` |
+| `VLLM_HPU_GDN_DIRECT_STATE_UPDATE` | Experimental TP2 C1 state-update epilogue bound to the final FP32 active cache row. Requires active state views, regional compilation, and the matching native bridge. Compiler liveness checks reject unsafe mutation lowering. Overrides queued state DMA; speculation and prefix caching are unsupported. Remains unqualified until exact state and end-to-end checks pass. | `false` |
+| `VLLM_HPU_GDN_PRECISE_DMA_EVENTS` | Experimental queued-state DMA tickets use physical producer/copy/consumer events. Ordinary reads wait on compute only; reset and prefill join all generic substreams and retain events through every consumer. Requires queued state DMA and the matching native bridge. Direct state updates remove this DMA path. | `false` |
+| `VLLM_HPU_TP2_PREPARED_COMM` | Prepares fixed TP2 exchange buffers and the local reduction/RMSNorm recipe during warmup. Required by the static group plan and native decoder graph. | `false` |
+| `VLLM_HPU_TP2_NATIVE_JOINT_PLAN` | Internal Gaudi2 TP2 research path (`1` enables). Instantiates compute command pages and a prepared NIC batch; requires matching native runtime APIs. Unqualified candidates remain disabled. | `0` |
+| `VLLM_HPU_TP2_GQA_COMPACT_KV` | Research Gaudi2 TP2 C1 Qwen decode layout: share BF16 K/V between grouped query rows; requires exact MME qualification. | `0` |
+| `VLLM_HPU_TP2_COMPILED_CONSUMER_NORM` | Research-only Gaudi2 TP2 C1: keep dedicated exchange as a side-effect boundary and compile local add/residual/RMSNorm into its consumer. Requires the native joint plan and exact qualification. | `0` |
+| `VLLM_HPU_TP2_NATIVE_DYNAMIC_QUANT` | Research Gaudi2 TP2 C1: one TPC node for the unchanged CGUID BF16 scale/epsilon/reciprocal/FP8 sequence. Requires the separate kernel database, native adapter and complete exact/model qualification. | `0` |
+| `VLLM_HPU_TP2_STATIC_GROUP_PLAN` | Retains the eight compiled decoder groups, their fixed bindings, and their compute/collective dependency order. Requires prepared communication and direct GDN state update. | `false` |
+| `VLLM_HPU_TP2_PLAN_DUMP_DIR` | Optional directory for prepared compiler graphs, recipe IDs and compute/communication order. Writes only during preparation. | unset |
+| `VLLM_HPU_NATIVE_DECODE_GRAPH` | Research-only native replay for the Gaudi2 Qwen3.8 TP2 C1 decoder. Captures the eight compiled groups and 128 layer TP2 reductions into fixed-address Synapse/SCAL/HCL templates; the embedding reduction remains outside the decoder graph. Requires the two TP2 options above, direct GDN state update, matching custom runtime libraries, and `PT_HPU_POOL_MEM_ACQUIRE_PERC<=95` for persistent recipe storage. Explicit requests fail closed when any contract is missing. | `false` |
+| `VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH` | Experimental Gaudi2 DeepSeek V4 Flash BF16 TP2 C1 native decoder. Uses six compiled groups for all 43 layers, 86 ordinary AllReduces and the mHC/head/norm tail. Requires the prepared communication and joint-plan runtime, packed q1 metadata and context <=512; does not require GDN. Runtime ABI fingerprints are checked before model loading. | `false` |
+| `VLLM_HPU_DSV4_WORKER_HELPER_CPUS` | Semicolon-separated per-rank CPU sets for initialized background worker threads, e.g. `30-34,86-90;38-43,94-99`. Requires one main CPU per rank in `VLLM_HPU_DSV4_WORKER_CPUS`. Helper sets must be disjoint and exclude every main CPU and its SMT sibling. Applied in normal worker warmup. | unset |
+| `VLLM_HPU_GDN_PADDED_DIRECT_STATE` | Opts partially filled decode buckets into the direct-state path. Requires FlashInfer GDN and direct state to be enabled, a contiguous active-slot prefix, and every padding slot to be free. Paused requests retain their slots and are never used as padding. Prefix caching and multi-token decode retain the general path. | `false` |
 | `VLLM_HPU_CGUID_DYNAMIC_QUANT` | Uses Gaudi's fused scale-calculation CGUID for decode-sized per-token dynamic FP8 quantization. Large prefill matrices retain the existing reduction path to preserve its numerical behavior. When unset, this follows `VLLM_HPU_FLASHINFER_GDN`. | `false` (`true` with FlashInfer GDN) |
 | `VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS` | Maximum flattened row count eligible for CGUID dynamic quantization. Keep this below the smallest prefill token bucket; increasing it can change prefill graph fusion. | `32` |
 | `VLLM_HPU_FUSED_GREEDY_LOGITS` | Fuses hidden-state selection, the LM-head projection, FP32 conversion, and argmax into one compiled decode region for plain greedy requests. Requests using logprobs, penalties, token masks, logit processors, structured output, or speculative decoding retain the general sampler path. | `false` |
@@ -75,7 +113,12 @@ This document lists the supported diagnostic and profiling, as well as performan
 | `FLASHINFER_GAUDI_NATIVE_LIBRARY` | Optional path-list of native host-extension libraries to load. Packaged libraries are discovered automatically. | unset |
 | `FLASHINFER_GAUDI_ENABLE_COMPAT_SHIM` | Exposes supported modules under the `flashinfer` namespace when explicitly enabled and the official package is absent. vLLM-Gaudi does not require this shim. | `false` |
 | `FLASHINFER_GAUDI_ENABLE_PUBLIC_AUTO` | Deprecated, ignored. Environment flags cannot bypass offline whole-operation correctness and performance qualification. | ignored |
+| `FLASHINFER_GAUDI_ENABLE_MTP_AUTO` | Deprecated, ignored. DFlash2 MTP automatic selection is controlled by the offline tactic manifest. | ignored |
 | `FLASHINFER_GAUDI_ENABLE_BRIDGE_AUTO` | Deprecated, ignored. The bridge GDN prototype is not qualified for whole-operation native dispatch. | ignored |
+| `FLASHINFER_GAUDI_ENABLE_MTP_PREPARED` | Experimental qualification switch for the graph-native Qwen3.8 B1/T8 full-query MTP core. Requires rebuilt native libraries and `auto` or `public`; forced `pytorch`, eager calls, padded/partial queries, and other batches keep their existing routes. It remains off until full-model quality and end-to-end latency gates pass. | `false` |
+| `FLASHINFER_GAUDI_ENABLE_DFLASH2_SELECT_AUTO` | Deprecated, ignored. DFlash2 path selection is controlled by the offline tactic manifest. | ignored |
+| `FLASHINFER_GAUDI_ENABLE_DFLASH2_TOPK_AUTO` | Deprecated, ignored. DFlash2 TopK selection is controlled by the offline tactic manifest. | ignored |
+| `FLASHINFER_GAUDI_ENABLE_DFLASH2_SCORE_SELECT_AUTO` | Deprecated, ignored. DFlash2 score-selection is controlled by the offline tactic manifest. | ignored |
 | `VLLM_GAUDI_BUILD_FLASHINFER` | Controls native builds during packaging: `auto` builds when both the TPC compiler and Gaudi PyTorch package exist; `1` requires a successful build; `0` installs reference code only. | `auto` |
 | `VLLM_HPU_TRITON_MODE` | Selects Gaudi2-native Triton paths: `off`, performance-safe `hybrid`, or fail-closed `strict`. Hybrid uses only paths that passed the relevant eager/fullgraph gate; strict also exposes ungated kernels for correctness and A/B performance CI. | `off` |
 | `VLLM_HPU_TRITON_CACHE_DIR` | Overrides the private, content-addressed TPC ELF cache used by the Triton/Bridge ABI. | `None` |
@@ -154,9 +197,96 @@ they remain available through the standalone diagnostic. TP2 collective/RMSNorm
 fusion retains ownership of its communication boundary before local Triton
 RMSNorm is considered.
 
+## DeepSeek V4.1
+
+The experimental [prepared TP2×PP2 profile](../features/deepseek_v41.md)
+uses explicit switches and rejects unsupported execution contracts.
+
+| Variable | Description | Default |
+|---|---|---|
+| `VLLM_HPU_DSV41_PREPARED_SHARDS` | Enables the rank-local loader and bounded CSA2 runner on four Gaudi2 devices. Requires the immutable TP2×PP2 manifest. | `false` |
+| `VLLM_HPU_DSV41_ENGRAM_HOST_TABLE` | Uses shared read-only host mmap tables, native asynchronous row gather, and generation-owned HPU staging. | `false` |
+| `VLLM_HPU_DSV41_GRAPH_REPLAY` | Captures each PP stage with the ABI-locked native compute/communication plan. Requires prepared communication and the static group plan. | `false` |
+| `VLLM_HPU_DSV41_DSPARK` | Runs the three-layer draft on PP1 with accepted-prefix context insertion and Engram rollback. Requires `method=dspark`, five speculative tokens. | `false` |
+| `VLLM_HPU_DSV41_VISION` | Binds the portable upstream ViT/aligner to prepared PP0 weights. Requires `mm_encoder_tp_mode=data`. | `false` |
+| `VLLM_HPU_DSV41_QUANT_ROUNDTRIP` | Fuses BF16 activation group-32 E4M3FN quantization and restoration in TPC. Matrix operands remain BF16. Experimental. | `false` |
+| `VLLM_HPU_DSV41_PACKED_ATTENTION` | Uses a C1 native composite to decode selected packed KV rows once for all heads, then consumes them with the existing ordered attention arithmetic. Experimental; other token counts keep their existing path. | `false` |
+| `VLLM_HPU_DSV41_BOUNDED_ATTENTION` | Limits C1 packed attention to its runtime visible prefix at context lengths up to 512. Reuses the ordered V4 attention kernel and retains Full/Reindex/Reuse state publication. Requires packed attention; experimental. | `false` |
+| `VLLM_HPU_DSV41_FP8_DECODE` | Enables selected routed experts in ordinary C1 native replay to decode Q16/S16 directly into E4M3 SRAM weights for FP8 MME. Requires prepared channel sidecars; prefill keeps the existing precision. Experimental and not quality qualified. | `false` |
+| `VLLM_HPU_DSV41_FP8_SIDECAR` | Directory produced by `tools/prepare_deepseek_v41_fp8.py`, with channel scales and a manifest bound to the immutable prepared shards. | empty |
+| `VLLM_HPU_DSV41_FP8_CONFIG` | Optional JSON precision configuration with `version: 1` and selected `routed_experts` layer IDs. `attention`, `shared_experts`, and `mhc` must be empty in this candidate. | all routed expert layers |
+| `VLLM_HPU_DSV41_FIXED_POSITIONS` | Binds cached views of an immutable device position bank directly to C1 decode native staging. Prefill keeps its disjoint input buffers. Requires the single-in-flight V4.1 runner. | `false` |
+| `VLLM_HPU_DSV41_PACKED_PP` | Packs ordinary C1 BF16 hidden and FP32 pre-mix bits into one HCCL message using two generation-owned buffers. DSpark and multi-token transfers retain their existing transport. Experimental. | `false` |
+| `VLLM_HPU_DSV41_TPC_MHC` | Uses FP32 TPC GEMV for the C1 mHC control projection. Preserves FP32 operands but changes reduction order from MME; requires separate model quality qualification. Other shapes retain MME. Experimental. | `false` |
+| `VLLM_HPU_DSV41_ENGRAM_NATIVE_C1` | Performs C1 compression, integer hash, TP row lookup and final pinned staging copies in the native host extension. Requires C1 ABI version 1; retains consumer-stream DMA, request history transactions and the existing prefill path. Experimental, not performance or quality qualified. | `false` |
+| `VLLM_HPU_DSV41_TP_MHC_OVERLAP` | Splits proven independent C1 residual/mHC work between TP production and consumption. Requires the versioned native dependency API, BF16 ordinary decode and joint replay; rejects a capture with no independent segment. Experimental, not performance or quality qualified. | `false` |
+| `VLLM_HPU_DSV41_DIRECT_TOKEN_IDS` | Binds the completed int32 device token directly to C1 embedding and native stage inputs, with request/position checks. Prefill retains int64 input storage. Experimental. | `false` |
+| `VLLM_HPU_DSV41_DEVICE_COMMIT` | Builds the C1 completion record after the compiled greedy head, broadcasts it through PP, and copies the four integers to the host with a native completion ticket. Requires the matching Bridge API, graph replay, and DSpark disabled. Experimental. | `false` |
+| `VLLM_HPU_DSV41_NATIVE_PP_COPY` | Packs contiguous C1 hidden/pre-mix tensors through bounded native DMA with existing storage dependencies. Requires packed PP, graph replay and the matching Bridge API; rejects unsupported physical permutations. Experimental. | `false` |
+| `VLLM_HPU_DSV41_PREPARED_OUTPUT` | Prepares the BF16 wo_a K,N layout once after target weights load, replacing its original buffer to avoid repeated weight transposes. Reload invalidates recipes and prepares the new weights again. Experimental. | `false` |
+| `VLLM_HPU_DSV41_ISOLATE_CONTROL` | Enables startup CPU isolation for the V4.1 EngineCore and API after worker processes have been spawned. The launcher reserves separate NUMA-local physical cores. Experimental. | `false` |
+| `VLLM_HPU_DSV41_ENGINE_CPUS` | EngineCore CPU set, including its I/O threads. Must be allowed by the initial launch affinity and disjoint from worker and API cores and their SMT siblings. | unset |
+| `VLLM_HPU_DSV41_API_CPUS` | API CPU set with the same ownership checks. Both control sets are recorded by the launcher. | unset |
+| `VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR` | Selects an independently built native kernel directory. Both binaries must match its build manifest; communication runtime ABI checks remain required. | unset |
+
+`VLLM_HPU_DSV4_WORKER_CPUS` and `VLLM_HPU_DSV4_WORKER_HELPER_CPUS`
+also apply to this profile, with one entry per rank. Each worker sets
+`HLS_MODULE_ID` from its assignment in `HABANA_VISIBLE_MODULES` before allocation.
+
+## DeepSeek V4
+
+The [source-integrated Gaudi2 TP2 profile](../features/deepseek_v4_flash.md)
+selects the accepted short-context defaults during normal platform setup.
+The table below lists raw environment fallbacks outside that profile.
+
+| Variable | Description | Default |
+|---|---|---|
+| `VLLM_HPU_DSV4_EARLY_OUTPUT_LOWERING` | Lowers q1 attention output dependencies before HPU graph partitioning, retaining required clones. Enabled by the bounded source profile. | `false` |
+| `VLLM_HPU_DSV4_WORKER_CPUS` | Optional comma-separated CPU IDs, one distinct allowed CPU per rank. No affinity change when unset. | unset |
+| `VLLM_HPU_MXFP4_DECODE_GATHER` | Gathers only the routed packed experts before single-token MXFP4 MoE decode. Disable to use the full expert TensorList. | `true` |
+| `VLLM_HPU_DSV4_TPC_MXFP4_GATHER` | Uses one experimental Gaudi2 TPC launch to gather DeepSeek V4's four packed MXFP4 weight/scale tensors for the six routed experts. | `false` |
+| `VLLM_HPU_DSV4_TPC_MXFP4_INDEXED` | Uses the experimental Gaudi2 direct-indexed MXFP4 decode path, reading six routed experts from stacked weights without materializing selected weights. | `false` |
+| `VLLM_HPU_DSV4_MXFP4_PREPARED_MME` | Prepares DeepSeek V4 TP2 expert weights in the Gaudi2 Q16/S16 layout at load time and uses the exact BF16 direct-indexed MME path for single-token top-6 decode. Unsupported calls restore the checkpoint layout within a bounded temporary buffer. | `false` |
+| `VLLM_HPU_DSV4_BF16_ATTN_WEIGHT_CACHE` | Caches transposed BF16 copies of DeepSeek V4's fused Q/KV and Q-projection weights for single-token decode. Prompt processing stays on the block-FP8 path. | `false` |
+| `VLLM_HPU_DSV4_COMPILED_ATTN_FRONTEND` | Runs DeepSeek V4 single-token projection, Q/KV normalization, and Q projection through shared HPU-compiled functions. Requires the BF16 attention weight cache. | `false` |
+| `VLLM_HPU_DSV4_INLINE_ATTN_FRONTEND` | Inlines the DeepSeek V4 single-token projection frontend into coarse decoder graphs while keeping cache mutations and MLA behind a custom-op boundary. Requires the BF16 attention weight cache. | `false` |
+| `VLLM_HPU_DSV4_NATIVE_FP8_ATTN_FRONTEND` | Uses native FP8 MME for the two DeepSeek V4 attention projections during single-token decode. Keeps the BF16 path available as a quality fallback. | `false` |
+| `VLLM_HPU_DSV4_SHORT_INDEXER_SKIP` | Skips DeepSeek V4 indexer scoring when all compressed candidates fit in top-k, while retaining cache writes. | `true` |
+| `VLLM_HPU_DSV4_SHORT_INDEXER_CACHE_SKIP` | Also skips the unused DeepSeek V4 indexer projection and K-cache write during decode when the configured maximum compressed sequence fits entirely in top-k. Long contexts and mixed prefill/decode batches automatically fall back. | `false` |
+| `VLLM_HPU_DSV4_FUSED_SDPA` | Uses Gaudi FusedSDPA plus an explicit attention-sink merge for the gathered DeepSeek V4 sparse-attention core. | `false` |
+| `VLLM_HPU_DSV4_TPC_DEQUANT_GATHER` | Uses the experimental Gaudi2 TPC packed-cache dequant/gather kernel for DeepSeek V4 decode. | `false` |
+| `VLLM_HPU_DSV4_TPC_SPARSE_ATTN` | Uses the experimental Gaudi2 TPC sparse-attention kernel for DeepSeek V4 decode. | `false` |
+| `VLLM_HPU_DSV4_TPC_SPARSE_ATTN_MAX_WIDTH` | Maximum gathered width that uses the experimental DeepSeek V4 sparse-attention TPC kernel; larger widths retain the graph implementation. | `128` |
+| `VLLM_HPU_DSV4_TPC_PAGED_SPARSE_ATTN` | Uses the experimental Gaudi2 native-FP8 paged sparse-attention kernel for single-token DeepSeek V4 decode. | `false` |
+| `VLLM_HPU_DSV4_TPC_PAIR_HEADS` | Tiles two DeepSeek V4 MQA query heads per Gaudi2 paged-attention program so C4 decode shares each packed KV load and dequantization. | `false` |
+| `VLLM_HPU_DSV4_FLASHMLA_SPLIT_KV` | Uses the functional split-KV FlashMLA-style packed-FP8 decode path. | `false` |
+| `VLLM_HPU_DSV4_FLASHMLA_TILED` | Selects the experimental four-token tiled-softmax partial kernel for the split-KV FlashMLA path. | `false` |
+| `VLLM_HPU_DSV4_FLASHMLA_SPLITS` | Number of split-KV partitions used by the FlashMLA-style decode path. | `2` |
+| `VLLM_HPU_DSV4_FLASHMLA_PREFILL` | Uses the experimental length-aware Gaudi2 sparse-prefill kernel, mirroring FlashMLA `flash_mla_sparse_fwd` without scanning aligned index padding. | `false` |
+| `VLLM_HPU_DSV4_FLASHMLA_PREFILL_MAX_WIDTH` | Maximum aligned sparse-index width accepted by the experimental length-aware prefill kernel. | `640` |
+| `VLLM_HPU_DSV4_MME_PAGED_SPARSE_ATTN` | Uses TPC packed-cache dual gather with FP32 Gaudi MME QK/PV for single-token DeepSeek V4 decode. | `false` |
+| `VLLM_HPU_DSV4_ATTENTION_BACKEND` | Selects the DeepSeek V4 decode backend: `auto`, `flashmla_hpu`, `mme`, or `legacy`. `auto` prefers the direct packed-FP8 FlashMLA-style path. | `auto` |
+| `VLLM_HPU_DSV4_DIRECT_DECODE_DISPATCH` | Bypasses generic per-layer backend planning for eligible C4 single-token decode and dispatches directly to the selected packed-FP8 TPC kernel. | `false` |
+| `VLLM_HPU_DSV4_TPC_SAVE_COMPRESS_NORM_C4` | Uses the experimental fused C4/C128 state-save, compression, norm, RoPE, and packed-cache producer for single-token DeepSeek V4 decode. | `false` |
+| `VLLM_HPU_DSV4_TPC_ORDERED_COMPRESSOR` | Uses the experimental alias-free C4 Compressor write with an explicit device dependency on the following attention operation. | `false` |
+| `VLLM_HPU_DSV4_TPC_ORDERED_C128_COMPRESSOR` | Extends the alias-free ordered Compressor path to C128 decode while preserving an explicit dependency on the following sparse attention operation. | `false` |
+| `VLLM_HPU_DSV4_FUSED_COMPRESSOR_FLASHMLA` | Places the C4 Compressor cache producer and tiled FlashMLA partial/combine kernels in one ordered Gaudi2 recipe for eligible single-token decode. | `false` |
+| `VLLM_HPU_DSV4_FUSED_QNORM_COMPRESSOR` | Co-schedules the independent QNorm/RoPE/SWA-cache and C4 Compressor cache producers in one compiled Gaudi2 recipe while keeping MLA in a downstream recipe. | `false` |
+| `VLLM_HPU_DSV4_TPC_BF16_COMPRESS_INPUTS` | Experimental precision-changing path that keeps DeepSeek V4 compressor projections and norm inputs in native BF16. | `false` |
+| `VLLM_HPU_DSV4_TPC_MIXED_COMPRESS_INPUTS` | Preserves FP32 compressor projections while reading the static norm in BF16 and using the fused vector-RoPE TPC path. | `false` |
+| `VLLM_HPU_DSV4_TPC_QNORM_ROPE_KV_PACK` | Uses the experimental per-head fused Q norm/RoPE, KV RoPE/FP8 quantization, and direct paged-cache writer for single-token DeepSeek V4 decode. | `false` |
+| `VLLM_HPU_DSV4_TPC_MHC` | Uses the decode-specialized Gaudi2 fused post+pre MHC TPC kernel for the DeepSeek V4 hardware-agnostic model path. | `false` |
+| `VLLM_HPU_DSV4_TPC_SINKHORN` | Experimental V4 compiler fusion for the complete39-step FP32 C1 Sinkhorn chain. Preserves the surrounding projection, gates, softmax, norm and BF16 boundaries; requires the matching native kernel library. | `false` |
+| `VLLM_HPU_DSV4_PACKED_DECODE_METADATA` | Packs DeepSeek V4 q1 framework attention metadata into one persistent int32 host-to-device transfer per decode step. | `false` |
+| `VLLM_HPU_DSV4_DECODE_METADATA_RING_SIZE` | Number of host/device packed metadata buffers rotated by the DeepSeek V4 q1 decode path to avoid overwriting in-flight graph inputs. | `2` |
+| `VLLM_HPU_DSV4_Q1_METADATA_FASTPATH` | Enables uniform q1 shortcuts in DeepSeek V4 metadata builders, removing redundant per-step tensor construction and uploads. | `false` |
+| `VLLM_HPU_DSV4_TPC_OP_LIBRARY` | Path to the PyTorch registration library for the experimental DeepSeek V4 TPC operators. | unset |
+
 Use `VLLM_BUCKETING_STRATEGY=exp` for the default exponential warm-up, `VLLM_BUCKETING_STRATEGY=lin` for explicitly configured linear ranges, or `VLLM_BUCKETING_STRATEGY=pad` for padding-aware ranges with absolute and relative padding limits.
 
-Leave `VLLM_EXPONENTIAL_BUCKETING` unset when using `VLLM_BUCKETING_STRATEGY`. The legacy flag is checked for backward compatibility and still overrides the selected strategy when present.
+Set `VLLM_PROMPT_BUCKETING_STRATEGY` or `VLLM_DECODE_BUCKETING_STRATEGY` to override only that phase. For example, `VLLM_BUCKETING_STRATEGY=exp` with `VLLM_DECODE_BUCKETING_STRATEGY=pad` keeps exponential prompt buckets and uses padding-aware decode buckets. An unset phase override falls back to the global strategy. This configuration does not enable padded direct GDN state access.
+
+Leave `VLLM_EXPONENTIAL_BUCKETING` unset when using global or phase-specific strategy settings. The legacy flag still overrides both phases when present. `VLLM_BUCKETING_FROM_FILE` takes precedence over generated buckets for both phases.
 
 ## Developer Mode Parameters
 
@@ -215,7 +345,7 @@ HPU PyTorch bridge environment variables impacting vLLM execution:
 - `{param}` is in `['MIN', 'STEP', 'MAX']` for the `lin` strategy.
 - `{param}` is in `['MIN', 'STEP', 'MAX', 'PAD_MAX', 'PAD_PERCENT']` for the `pad` strategy.
 
-The following table lists the available variables with their default values. `PAD_MAX` and `PAD_PERCENT` are used only when `VLLM_BUCKETING_STRATEGY=pad`.
+The following table lists the available variables with their default values. `PAD_MAX` and `PAD_PERCENT` are used when the corresponding phase selects `pad`, through either the global strategy or its phase override.
 
 | Phase  | Variable name                                                            | Default value                                                                                                       |
 |--------|--------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------|
@@ -280,7 +410,7 @@ FusedSDPA can be split into smaller chunks to improve performance while using th
 | `VLLM_HPU_FSDPA_SLICE_WITH_GRAPH_BREAKS` | Places each chunk in a separate graph to reduce compilation time.                            | `true` for lazy mode and `false` otherwise  |
 
 !!! note
-    These parameters are effective only with the padding-aware bucketing strategy set by `VLLM_BUCKETING_STRATEGY="pad"`.
+    These parameters require generated padding-aware prompt buckets, selected by `VLLM_PROMPT_BUCKETING_STRATEGY="pad"` or inherited from `VLLM_BUCKETING_STRATEGY="pad"`. Decode overrides do not enable prompt slicing. File-based buckets and the deprecated exponential-bucketing flag disable slicing because they do not establish the required padding bounds.
 
 The slicing is only activated if all the following additional conditions are satisfied:
 - The batch size should be 1.
@@ -308,3 +438,34 @@ full K/V and the results simply concatenate; the output is unchanged apart from 
 !!! note
     This is independent of `VLLM_HPU_FSDPA_SLICE_ENABLED` and works with any bucketing strategy.
     When enabled, shapes whose bias already fits below the limit take the untiled path unchanged.
+
+## DeepSeek V4 indexed MXFP4 MME candidate
+
+`VLLM_HPU_DSV4_MXFP4_INDEXED_MME=1` selects the experimental BF16
+indexed MoE implementation for the existing Gaudi2 DeepSeek V4 TP2,
+single-token, top-6 shape. It defaults to `0`. Unsupported shapes continue
+through the existing path. If the old indexed TPC flag is also set, this
+MME candidate takes precedence for matching inputs.
+
+Immutable scales are checked once at weight load. Ordinary E8M0 codes
+`2..254` select a shorter exact BF16 decoder; other codes retain the
+complete decoder. Both implementations preserve the checkpoint values.
+
+The native compound op addresses packed weights using runtime expert IDs
+and emits two logical batched MME operations. It preserves BF16 activation
+boundaries and never converts weights through FP8. Decoded weights are
+internal to the Synapse recipe; this does **not** guarantee SRAM placement.
+Keep this flag disabled for production until compiled placement, correctness
+and end-to-end performance have all been qualified. See
+[the implementation and qualification contract](../features/deepseek_v4_indexed_mme.md).
+
+### V4.1 fused SWA cache writes
+
+`VLLM_HPU_DSV41_SWA_PACK_WRITE` (default `0`) enables experimental C1 group-32 checkpoint byte encoding and in-place SWA row writes. It requires bounded packed attention, which consumes the explicit write-completion tensor. Other token shapes retain their existing path. The cache encoding, row positions and state ownership are preserved; this does not enable FP8 matrix arithmetic.
+
+`VLLM_HPU_DSV41_FP4_CACHE_WRITE` (default `0`) extends the ordered C1 path to native main-KV and index-K encoding and row writes. It requires `VLLM_HPU_DSV41_SWA_PACK_WRITE=1`. Main rows retain group-16 E4M3FN scales and index rows retain group-32 UE8M0 scales. Incomplete compression groups keep their scratch-row writes. Attention explicitly waits for both cache completions; other token shapes retain the existing path.
+
+- `VLLM_HPU_DSV41_NATIVE_ROPE` (default `0`): C1 BF16 pairwise RoPE through the V4 TPC helper, with prepared FP32 cos/sin tables. Context512, SWA128, RoPE64. Other shapes keep existing execution.
+- `VLLM_HPU_DSV41_C1_INDICES` (default `0`): fuse C1 SWA/window, compressed-slot mask/offset and visible-length preparation. Requires bounded packed attention; preserves Full/Reindex/Reuse state publication.
+
+- `VLLM_HPU_DSV41_SELECTED_VALID_ONLY` (default `0`): omit BF16 stores for invalid selected slots inside ordered packed attention. The attention consumer rejects their remapped `-1` IDs before loading; the public selected-KV gather retains zero-filled invalid rows. Requires SWA pack/write.

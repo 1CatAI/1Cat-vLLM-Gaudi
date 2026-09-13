@@ -1,0 +1,77 @@
+diff --git a/backend/helpers/collective_kernel_info.cpp b/backend/helpers/collective_kernel_info.cpp
+--- a/backend/helpers/collective_kernel_info.cpp
++++ b/backend/helpers/collective_kernel_info.cpp
+@@ -85,7 +85,12 @@ void CollectiveKernelInfos::Launch(
+     habana::CollectiveOperator& collective = *kernel_info.kernel;
+     PT_BRIDGE_DEBUG("Running collective op ", collective.GetGuid());
+     collective.RunCollective(
+-        kernel_info.input_tensor_infos, pt_inputs, pt_outputs, async, done_cb);
++        kernel_info.input_tensor_infos,
++        kernel_info.output_tensor_infos,
++        pt_inputs,
++        pt_outputs,
++        async,
++        done_cb);
+   }
+ }
+ void CollectiveKernelInfos::ClearAllPtAndSynTensors() {
+diff --git a/backend/kernel/hpu_habana_launch_op_pt.cpp b/backend/kernel/hpu_habana_launch_op_pt.cpp
+--- a/backend/kernel/hpu_habana_launch_op_pt.cpp
++++ b/backend/kernel/hpu_habana_launch_op_pt.cpp
+@@ -5303,6 +5303,15 @@ void HabanaLaunchOpPT::run(
+     ProcessGraphForConstantTensors(*jit_ir_graph_, value_to_ivalue_);
+   }
+ 
++  for (const auto* node : jit_ir_graph_->nodes()) {
++    if (node->kind().toQualString() ==
++        std::string_view("hccl::tp2_allreduce_residual_rms_norm")) {
++      enable_shape_agnostic_caching_ = false;
++      jit_graph_and_meta_data_->set_is_shape_agnostic_supported(false);
++      break;
++    }
++  }
++
+   if (enable_shape_agnostic_caching_) {
+     ValidateInputsAndOutputsAndDisableSA(input_refs_);
+   }
+diff --git a/habana_kernels/hccl_kernels.h b/habana_kernels/hccl_kernels.h
+--- a/habana_kernels/hccl_kernels.h
++++ b/habana_kernels/hccl_kernels.h
+@@ -37,6 +37,21 @@ class CollectiveOperator : public habana::HabanaOperator {
+       std::vector<at::Tensor>& pt_outputs,
+       bool async,
+       synapse_helpers::event_done_callback cleanup_callback) const = 0;
++  virtual void RunCollective(
++      const std::vector<PtTensorInfoShared>& inputs,
++      const std::vector<PtTensorInfoShared>& outputs,
++      std::vector<at::Tensor>& pt_inputs,
++      std::vector<at::Tensor>& pt_outputs,
++      bool async,
++      synapse_helpers::event_done_callback cleanup_callback) const {
++    (void)outputs;
++    RunCollective(
++        inputs,
++        pt_inputs,
++        pt_outputs,
++        async,
++        std::move(cleanup_callback));
++  }
+ 
+   int GetDeviceId() const {
+     return device_id_;
+diff --git a/python_packages/habana_frameworks/torch/distributed/hccl/process_group_eager_hccl.hpp b/python_packages/habana_frameworks/torch/distributed/hccl/process_group_eager_hccl.hpp
+--- a/python_packages/habana_frameworks/torch/distributed/hccl/process_group_eager_hccl.hpp
++++ b/python_packages/habana_frameworks/torch/distributed/hccl/process_group_eager_hccl.hpp
+@@ -84,6 +84,12 @@ class TORCH_API ProcessGroupEagerHCCL : public ProcessGroupHcclBase {
+ 
+   void restoreOddSizeSendTensors(std::vector<at::Tensor>& tensors);
+ 
++  // Isolated integration hook for a stream-ordered TP2 inference prototype.
++  // The caller must preserve tensor lifetime and HCCL stream ordering.
++  std::shared_ptr<habana::HcclCommunicator> lowLatencyCommunicator() const {
++    return comm_;
++  }
++
+  protected:
+   void groupStart() override;
+ 

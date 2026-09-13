@@ -46,6 +46,8 @@ def get_user_flags():
         Env('VLLM_DECODE_BLOCK_BUCKET_PAD_MAX', int),
         Env('VLLM_DECODE_BLOCK_BUCKET_PAD_PERCENT', int),
         Env('VLLM_BUCKETING_STRATEGY', str),
+        Env('VLLM_PROMPT_BUCKETING_STRATEGY', str, check=choice('exp', 'lin', 'pad')),
+        Env('VLLM_DECODE_BUCKETING_STRATEGY', str, check=choice('exp', 'lin', 'pad')),
         Env('VLLM_BUCKETING_FROM_FILE', str),
         Env('VLLM_HPU_QWEN3_COMPILE_LAYER_GROUP_SIZE', int),
 
@@ -74,6 +76,7 @@ def get_user_flags():
 
 def get_experimental_flags():
     flags = [
+        Env('VLLM_HPU_NATIVE_DECODE_GRAPH', boolean),
         Env('VLLM_PT_PROFILE', str),
         Env('VLLM_PROFILE_PROMPT', str),
         Env('VLLM_PROFILE_DECODE', str),
@@ -82,6 +85,7 @@ def get_experimental_flags():
         Env('VLLM_DEFRAG_WITH_GRAPHS', boolean),
         Env('VLLM_DEBUG', list_of(str), check=for_all(choice('steps', 'defrag', 'fwd'))),
         Env('VLLM_HPU_FLASHINFER_GDN', boolean),
+        Env('VLLM_HPU_FLASHINFER_DFLASH2', boolean),
         Env('VLLM_HPU_FLASHINFER_GDN_FUSED_DECODE', boolean),
         Env('VLLM_HPU_FLASHINFER_GDN_PREFILL', boolean),
         Env('VLLM_HPU_GDN_DIRECT_STATE', boolean),
@@ -90,6 +94,9 @@ def get_experimental_flags():
         Env('VLLM_HPU_FUSED_GREEDY_LOGITS', boolean),
         Env('FLASHINFER_GAUDI_BACKEND', str),
         Env('FLASHINFER_GAUDI_STATE_DTYPE', str),
+        Env('FLASHINFER_GAUDI_ENABLE_PUBLIC_AUTO', boolean),
+        Env('FLASHINFER_GAUDI_ENABLE_MTP_AUTO', boolean),
+        Env('FLASHINFER_GAUDI_ENABLE_BRIDGE_AUTO', boolean),
     ]
     return to_dict(flags)
 
@@ -125,7 +132,7 @@ def get_features():
         Value(
             'flatten_input',
             Any(ModelType('qwen3_moe'), ModelType('qwen3_5'), ModelType('qwen3_5_text'), ModelType('granitemoe'),
-                ModelType('glm4_moe'), ModelType('gemma4'), ModelType('nemotron_h'))),
+                ModelType('glm4_moe'), ModelType('gemma4'), ModelType('nemotron_h'), ModelType('deepseek_v4'))),
         Value('high_level_profiler_enabled', False, env_var='VLLM_PROFILER_ENABLED', env_var_type=boolean),
         Value('track_graph_compilation', False, env_var='PT_HPU_METRICS_GC_DETAILS', env_var_type=boolean),
         Value('per_token_kv_scaling_support',
@@ -136,14 +143,18 @@ def get_features():
         Value('row_parallel_chunks', 1, env_var='VLLM_ROW_PARALLEL_CHUNKS', env_var_type=int),
         Value('row_parallel_chunk_threshold', 8192, env_var='VLLM_ROW_PARALLEL_CHUNK_THRESHOLD', env_var_type=int),
         Value('tp2_fused_ar_norm', False, env_var='VLLM_HPU_TP2_FUSED_AR_NORM', env_var_type=boolean),
+        Value('tp2_gemma_fused_ar_norm', False, env_var='VLLM_HPU_TP2_GEMMA_FUSED_AR_NORM', env_var_type=boolean),
         Value('tp2_fused_ar_norm_max_bytes', 524288, env_var='VLLM_HPU_TP2_FUSED_AR_NORM_MAX_BYTES', env_var_type=int),
         Value('use_dispatch_fn',
               All(VersionRange(">=1.24.0.460"), MinPackageVersion("neural_compressor_pt", "3.7")),
               env_var_type=boolean),
         Value('use_hpu_aligned_scale', False, env_var='HPU_ALIGNED_SCALE', env_var_type=boolean),
         Value('enable_fsdpa_slicing',
-              All(Eq('use_bucketing', True), Eq('bucketing_strategy', 'pad'), Disabled('merged_prefill'),
-                  Kernel(fsdpa)),
+              All(
+                  Eq('use_bucketing', True),
+                  Any(Eq('VLLM_PROMPT_BUCKETING_STRATEGY', 'pad'),
+                      All(Eq('VLLM_PROMPT_BUCKETING_STRATEGY', None), Eq('bucketing_strategy', 'pad'))),
+                  Disabled('merged_prefill'), Kernel(fsdpa)),
               env_var='VLLM_HPU_FSDPA_SLICE_ENABLED',
               env_var_type=boolean),
         # Splits the query dim of prompt attention so no per-call attn_bias reaches 2**31 bytes,

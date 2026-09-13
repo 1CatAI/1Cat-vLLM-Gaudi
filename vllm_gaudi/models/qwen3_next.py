@@ -1,7 +1,10 @@
 from itertools import islice
+from contextlib import nullcontext
+import os
+import time
 
 import torch
-from vllm.distributed import get_pp_group, tensor_model_parallel_all_gather
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_rank, tensor_model_parallel_all_gather
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.models.qwen3_next import (
     Qwen3NextAttention,
@@ -10,6 +13,7 @@ from vllm.model_executor.models.qwen3_next import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm_gaudi.models.utils import sequence_parallel_chunk
+from vllm_gaudi import envs as gaudi_envs
 
 HPU_QWEN3_LAYER_GROUP_MAX_BATCH_SIZE = 16
 
@@ -57,15 +61,26 @@ def enable_hpu_qwen3_tp2_fused_ar_norm(model) -> int:
         # deferred collective, including upstream normalization variants.
         return 0
 
-    from vllm_gaudi.distributed.tp2_fused_ar_norm import initialize_tp2_fused_ar_norm_runtime
+    from vllm_gaudi.distributed.tp2_fused_ar_norm import (
+        initialize_tp2_fused_ar_norm_runtime,
+        validate_tp2_gemma_fusion_runtime,
+    )
+    from vllm_gaudi.extension.runtime import get_config
 
     initialize_tp2_fused_ar_norm_runtime()
+    gemma_native = get_config().tp2_gemma_fused_ar_norm
+    if gemma_native:
+        widths = {norm.weight.numel() for norm in norms}
+        if len(widths) != 1 or any(norm.weight.dtype != torch.bfloat16 for norm in norms):
+            raise RuntimeError("TP2 Gemma native fusion requires uniform BF16 normalization weights")
+        validate_tp2_gemma_fusion_runtime(widths.pop())
     inner_model._hpu_tp2_defer_embedding_reduce = True
     inner_model.embed_tokens._hpu_defer_tp2_reduce = True
     for projection in row_parallel_layers:
         projection.reduce_results = False
     for norm in norms:
         norm._hpu_tp2_fused_ar_norm = True
+        norm._hpu_tp2_gemma_native_ready = gemma_native
     return len(row_parallel_layers) + 1
 
 
@@ -82,6 +97,10 @@ class HpuQwen3DecoderLayerGroup(torch.nn.Module):
         # state-dict and KV-cache layer names stay unchanged.
         object.__setattr__(self, "_layers", layers)
         object.__setattr__(self, "_final_norm", final_norm)
+        object.__setattr__(
+            self, "_state_layers",
+            tuple(layer.linear_attn for layer in layers
+                  if hasattr(getattr(layer, "linear_attn", None), "prepare_decode_state_view")))
 
     def forward(
         self,
@@ -89,7 +108,11 @@ class HpuQwen3DecoderLayerGroup(torch.nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_state_updates: bool = False,
+    ):
+        if return_state_updates:
+            for attention in self._state_layers:
+                attention._hpu_defer_ssm_writeback = True
         for layer in self._layers:
             hidden_states, residual = layer(
                 positions=positions,
@@ -98,6 +121,53 @@ class HpuQwen3DecoderLayerGroup(torch.nn.Module):
             )
         if self._final_norm is not None:
             hidden_states, residual = self._final_norm(hidden_states, residual)
+        if return_state_updates:
+            updates = tuple(attention._hpu_pending_ssm_state for attention in self._state_layers)
+            for attention in self._state_layers:
+                attention._hpu_defer_ssm_writeback = False
+                attention._hpu_pending_ssm_state = None
+            return hidden_states, residual, updates
+        return hidden_states, residual
+
+
+class HpuQwen3AsyncStateGroup(torch.nn.Module):
+    """Normal eager boundary around compiled group computation and DMA."""
+
+    def __init__(self, compiled, group, group_index, pipeline):
+        super().__init__()
+        object.__setattr__(self, "_compiled", compiled)
+        object.__setattr__(self, "_state_layers", group._state_layers)
+        self.group_index = group_index
+        self.pipeline = pipeline
+        self.async_calls = 0
+
+    @torch.compiler.disable
+    def forward(self, *, positions, hidden_states, residual):
+        metadata = get_forward_context().attn_metadata
+        asynchronous = (metadata is not None and not bool(getattr(metadata, "is_prompt", False))
+                        and bool(getattr(metadata, "direct_gdn_state", False))
+                        and hidden_states.numel() // hidden_states.shape[-1] == 1)
+        if not asynchronous:
+            self.pipeline.wait_all()
+            return self._compiled(positions=positions, hidden_states=hidden_states, residual=residual)
+        self.pipeline.before_read(self.group_index)
+        try:
+            hidden_states, residual, states = self._compiled(positions=positions,
+                                                             hidden_states=hidden_states,
+                                                             residual=residual,
+                                                             return_state_updates=True)
+            updates = tuple((attention._hpu_active_ssm_state, state)
+                            for attention, state in zip(self._state_layers, states, strict=True))
+            if any(destination is None or state is None for destination, state in updates):
+                raise RuntimeError("Async GDN group did not produce every active state update")
+            self.pipeline.submit(self.group_index, updates)
+        finally:
+            # Also reset these Python attributes if an eager/compile failure
+            # interrupted the group before its normal attribute cleanup.
+            for attention in self._state_layers:
+                attention._hpu_defer_ssm_writeback = False
+                attention._hpu_pending_ssm_state = None
+        self.async_calls += 1
         return hidden_states, residual
 
 
@@ -125,6 +195,16 @@ def compile_hpu_qwen3_layer_groups(
 ) -> tuple[torch.nn.Module, ...]:
     groups = build_hpu_qwen3_layer_groups(model, group_size, final_norm)
     compiled_groups = tuple(compile_fn(group) for group in groups)
+    if gaudi_envs.VLLM_HPU_GDN_ASYNC_STATE_DMA and not gaudi_envs.VLLM_HPU_GDN_DIRECT_STATE_UPDATE:
+        if not gaudi_envs.VLLM_HPU_GDN_ACTIVE_STATE_VIEWS:
+            raise RuntimeError("GDN async DMA requires VLLM_HPU_GDN_ACTIVE_STATE_VIEWS")
+        from vllm_gaudi.ops.gdn_async_state import GDNQueuedStateDMAPipeline
+
+        pipeline = GDNQueuedStateDMAPipeline(precise_events=gaudi_envs.VLLM_HPU_GDN_PRECISE_DMA_EVENTS)
+        compiled_groups = tuple(
+            HpuQwen3AsyncStateGroup(compiled, group, index, pipeline)
+            for index, (compiled, group) in enumerate(zip(compiled_groups, groups, strict=True)))
+        object.__setattr__(model, "_hpu_gdn_dma_pipeline", pipeline)
     object.__setattr__(model, "_hpu_compiled_layer_groups", compiled_groups)
     object.__setattr__(model, "_hpu_compiled_groups_include_final_norm", final_norm is not None)
     return compiled_groups
@@ -193,12 +273,54 @@ class HpuQwen3NextModel(UpstreamQwen3NextModel):
                 attn_metadata,
                 hidden_states.shape[0],
         ):
-            for layer_group in layer_groups:
-                hidden_states, residual = layer_group(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    residual=residual,
-                )
+            group_timing = (os.environ.get("HPU_MTP1_GROUP_TIMING", "0").strip().lower() in ("1", "true")
+                            and bool(getattr(attn_metadata, "direct_gdn_state", False)) and hidden_states.shape[0] == 2)
+            from vllm_gaudi.ops.tp2_prepared_plan import (
+                collect_prepared_group_replays,
+                record_native_decoder_outputs,
+                replay_native_decoder,
+            )
+
+            native_context = dict(owner=self,
+                                  positions=positions,
+                                  hidden_states=hidden_states,
+                                  residual=residual,
+                                  metadata=attn_metadata)
+            if (gaudi_envs.VLLM_HPU_NATIVE_DECODE_GRAPH
+                    and not getattr(self, "_hpu_compiled_groups_include_final_norm", False)):
+                raise RuntimeError("Native decoder replay requires a captured final norm")
+            native_outputs = (replay_native_decoder(
+                self, **{
+                    key: value
+                    for key, value in native_context.items() if key != "owner"
+                }) if gaudi_envs.VLLM_HPU_NATIVE_DECODE_GRAPH else None)
+            if native_outputs is not None:
+                # This graph includes the decoder's final norm. Auxiliary
+                # outputs and PP are outside the native graph eligibility gate.
+                return native_outputs[0]
+
+            replay_context = (collect_prepared_group_replays(
+                **(native_context if gaudi_envs.VLLM_HPU_NATIVE_DECODE_GRAPH else {}))
+                              if gaudi_envs.VLLM_HPU_TP2_STATIC_GROUP_PLAN else nullcontext())
+            with replay_context:
+                for group_index, layer_group in enumerate(layer_groups):
+                    if group_timing:
+                        torch.hpu.synchronize()
+                        group_started = time.perf_counter()
+                    hidden_states, residual = layer_group(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        residual=residual,
+                    )
+                    if group_timing:
+                        torch.hpu.synchronize()
+                        print(
+                            "MTP1 layer-group "
+                            f"index={group_index} elapsed_ms={(time.perf_counter() - group_started) * 1000:.3f} "
+                            f"rank={get_tensor_model_parallel_rank()}",
+                            flush=True,
+                        )
+                record_native_decoder_outputs(hidden_states, residual)
             used_grouped_final_norm = getattr(self, "_hpu_compiled_groups_include_final_norm", False)
         else:
             used_grouped_final_norm = False
