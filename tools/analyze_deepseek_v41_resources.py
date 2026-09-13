@@ -20,6 +20,12 @@ def tags(row):
         names.append('expert_mme')
     if k == 'DmaMemcpy' and row['inputs'] and row['inputs'][0]['shape'] == [1, 4096, 1024]:
         names.append('woa_copy')
+    if 'deepseek_v41_woa_stage' in k:
+        names.append('woa_copy')
+    if 'deepseek_v41_woa_quant' in k:
+        names.append('woa_activation_quant')
+    if 'deepseek_v41_woa_scale' in k:
+        names.append('woa_result_scale')
     if p in ('wo_a 分组输出 BMM', 'wo_a 分组输出 GEMM'):
         names.append('woa_mme')
     if row['engine'] == 'MME' and cat == 'Attention':
@@ -32,6 +38,8 @@ def tags(row):
         names.append('selected_kv')
     if 'generate_bitonic_chunks' in k:
         names.append('router_bitonic')
+    if 'deepseek_v41_router_top6' in k:
+        names.append('router_top6')
     if row['engine'] == 'MME' and cat == 'Router':
         names.append('router_score_mme')
     if row['engine'] == 'MME' and cat == '共享专家':
@@ -42,6 +50,8 @@ def tags(row):
         names.append('argmax')
     if row['engine'] in ('TPC', 'MME'):
         names.append('all_compute')
+        if 'woa_copy' not in names:
+            names.append('compute_excluding_woa_transfer')
     return names
 
 
@@ -204,7 +214,8 @@ def main():
         'expert_decode_and_mme': ['expert_decode', 'expert_mme'],
         'selected_kv_and_attention': ['selected_kv', 'incremental_kv_write', 'sparse_attention'],
         'woa_copy_and_mme': ['woa_copy', 'woa_mme'],
-        'router_score_and_bitonic': ['router_score_mme', 'router_bitonic']
+        'woa_complete_activity': ['woa_copy', 'woa_activation_quant', 'woa_mme', 'woa_result_scale'],
+        'router_score_and_selection': ['router_score_mme', 'router_bitonic', 'router_top6']
     }
     result = {
         'capture':
@@ -223,11 +234,12 @@ def main():
             name: length(merge([x for tag in parts for x in unions.get(tag, [])])) / scale
             for name, parts in chains.items()
         },
-        'woa_copy_without_any_rank_compute_ms':
-        length(subtract(unions.get('woa_copy', []), unions['all_compute'])) / scale,
+        'woa_copy_without_other_rank_or_local_compute_ms':
+        length(subtract(unions.get('woa_copy', []), unions.get('compute_excluding_woa_transfer', []))) / scale,
         'limitations': [
             'Overlapping activity unions are not additive or removable wall time.',
             'Busy TPC cores do not imply useful instruction issue; hardware stall counters are unavailable here.',
+            'Copy exposure excludes the TPC weight-transfer kernel itself from competing compute activity.',
             'DMA remains descriptor activity; no physical-copy invocation count inferred.'
         ]
     }

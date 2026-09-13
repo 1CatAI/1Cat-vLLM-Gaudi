@@ -31,7 +31,13 @@ def main(rank, ROOT, OUT):
     selected = {}
     reasons = {}
     for key, r in bykey.items():
-        if 'mxfp4_prepared_dequant' in r['kernel']:
+        if 'deepseek_v41_woa_stage' in r['kernel']:
+            reasons[key] = 'woa_copy'
+        elif 'deepseek_v41_woa_quant' in r['kernel']:
+            reasons[key] = 'woa_activation_quant'
+        elif 'deepseek_v41_woa_scale' in r['kernel']:
+            reasons[key] = 'woa_result_scale'
+        elif 'mxfp4_prepared_dequant' in r['kernel']:
             reasons[key] = 'expert_decode'
         elif 'decoded_write' in r['kernel']:
             reasons[key] = 'incremental_kv_write'
@@ -56,7 +62,7 @@ def main(rank, ROOT, OUT):
         for line in stream:
             start, dur, lane, i = json.loads(line)
             for w, left, right in clip_windows(start, start + dur, windows, ends):
-                if inv['nodes'][i]['engine'] in ('TPC', 'MME'):
+                if (inv['nodes'][i]['engine'] in ('TPC', 'MME') and reasons.get(selected.get(i)) != 'woa_copy'):
                     all_compute.append((left, right))
                 if i in selected:
                     data[selected[i]][w].append((left, right, lane))
@@ -152,7 +158,7 @@ def main(rank, ROOT, OUT):
         chain = []
         sample = None
         incomplete_windows = []
-        if reasons[prod] == 'expert_decode':
+        if bykey[prod]['engine'] == 'TPC':
             for w in range(len(windows)):
                 aa, bb = calls.get((prod, w), []), calls.get((key, w), [])
                 if len(aa) != len(bb):
@@ -199,22 +205,27 @@ def main(rank, ROOT, OUT):
     wc = merge(spans['woa_copy'])
     wm = merge(spans['woa_mme'])
     compute = merge(all_compute)
-    summary = dict(rank=rank,
-                   tokens=len(windows),
-                   window_ms=length(windows) / scale,
-                   expert_decode_union_ms=length(es) / scale,
-                   expert_mme_union_ms=length(em) / scale,
-                   expert_overlap_ms=(length(es) + length(em) - length(merge(es + em))) / scale,
-                   expert_decode_without_expert_mme_ms=length(subtract(es, em)) / scale,
-                   expert_mme_without_decode_ms=length(subtract(em, es)) / scale,
-                   woa_copy_union_ms=length(wc) / scale,
-                   woa_mme_union_ms=length(wm) / scale,
-                   woa_copy_without_any_compute_ms=length(subtract(wc, compute)) / scale,
-                   woa_copy_without_woa_mme_ms=length(subtract(wc, wm)) / scale,
-                   details=details,
-                   pairs=paired,
-                   method=('Common capture window; same-context TPC/MME invocation reconstruction; '
-                           'EDMA copies remain descriptor intervals; no profiler rerun'))
+    summary = dict(
+        rank=rank,
+        tokens=len(windows),
+        window_ms=length(windows) / scale,
+        expert_decode_union_ms=length(es) / scale,
+        expert_mme_union_ms=length(em) / scale,
+        expert_overlap_ms=(length(es) + length(em) - length(merge(es + em))) / scale,
+        expert_decode_without_expert_mme_ms=length(subtract(es, em)) / scale,
+        expert_mme_without_decode_ms=length(subtract(em, es)) / scale,
+        woa_copy_union_ms=length(wc) / scale,
+        woa_mme_union_ms=length(wm) / scale,
+        woa_activation_quant_union_ms=union(spans['woa_activation_quant']) / scale,
+        woa_result_scale_union_ms=union(spans['woa_result_scale']) / scale,
+        woa_complete_activity_union_ms=union(wc + wm + spans['woa_activation_quant'] + spans['woa_result_scale']) /
+        scale,
+        woa_copy_without_other_compute_ms=length(subtract(wc, compute)) / scale,
+        woa_copy_without_woa_mme_ms=length(subtract(wc, wm)) / scale,
+        details=details,
+        pairs=paired,
+        method=('Common capture window; same-context TPC/MME invocation reconstruction; '
+                'EDMA copies remain descriptor intervals; no profiler rerun'))
     (OUT / f'rank{rank}-dataflow.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2) + '\n')
     (OUT / f'rank{rank}-first-token-lanes.json').write_text(json.dumps(raw, indent=2) + '\n')
     print(json.dumps({

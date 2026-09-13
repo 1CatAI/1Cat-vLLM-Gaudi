@@ -76,6 +76,7 @@ class CSA2Attention(nn.Module):
     def __init__(self, weights, config, layer, shared, linear, reduce, device):
         super().__init__()
         self.weights = weights
+        self.woa_fp8 = False
         self.packed_decode = gaudi_envs.VLLM_HPU_DSV41_PACKED_ATTENTION
         self.bounded_decode = gaudi_envs.VLLM_HPU_DSV41_BOUNDED_ATTENTION
         self.swa_pack_write = gaudi_envs.VLLM_HPU_DSV41_SWA_PACK_WRITE
@@ -164,6 +165,8 @@ class CSA2Attention(nn.Module):
                              dtype=torch.int32), False)
 
     def prepare_output_weight(self):
+        if self.woa_fp8:
+            return
         if self.prepared_output:
             weight = self.weights.wo_a.weight
             if weight.dtype != torch.bfloat16 or weight.numel() != self.heads * 512 * 1024:
@@ -172,6 +175,9 @@ class CSA2Attention(nn.Module):
             self.weights.wo_a.weight = (grouped if self.output_gemm_layout else grouped.transpose(1, 2).contiguous())
 
     def project_output(self, value):
+        if self.woa_fp8:
+            return torch.ops.custom_op.custom_deepseek_v41_woa_fp8_gaudi2(value.contiguous(), self.weights.wo_a.weight,
+                                                                          self.weights.wo_a.channel_scale)
         if self.output_gemm_layout:
             weight = self.weights.wo_a.weight
             if value.shape[0] == 1:

@@ -90,7 +90,7 @@ class StageVariant(torch.nn.Module):
                      input_ids=input_ids,
                      attention_inputs=engram,
                      metadata=self.metadata,
-                     state_generation=self.program.generation,
+                     state_generation=(self.program.generation, self.program.precision_fingerprint),
                      state_tensors=self.states)
         outputs = replay_native_decoder(self, **roots)
         if outputs is not None:

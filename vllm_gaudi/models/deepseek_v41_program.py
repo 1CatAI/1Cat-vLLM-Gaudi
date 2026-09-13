@@ -23,6 +23,7 @@ from vllm_gaudi.ops.deepseek_v41_math import (
     unpack_swa,
 )
 from vllm_gaudi.ops.deepseek_v41_shard_loader import PreparedV41Shard
+from vllm_gaudi.ops.deepseek_v41_weights import canonical_hash
 
 
 def linear(value, layer):
@@ -54,11 +55,21 @@ def _weight_tree(specs):
     return root
 
 
-def load_weight_tree(shard, tree, device, specs=None):
+def load_weight_tree(shard, tree, device, specs=None, *, woa_sidecar=None, woa_layers=()):
     for name, spec in (shard.specs if specs is None else specs).items():
+        if name.endswith(".attn.wo_a.weight") and int(name.split(".")[1]) in woa_layers:
+            module = tree.get_submodule(name.rpartition(".")[0])
+            module.weight = woa_sidecar.tensor(name, device)
+            channel = woa_sidecar.tensor(name.removesuffix("weight") + "channel_scale", device)
+            if "channel_scale" not in module._buffers:
+                module.register_buffer("channel_scale", channel, False)
+            else:
+                module.channel_scale = channel
+            continue
         value = shard.dense(name, device) if spec["dtype"] == "F8_E4M3" else shard.tensor(name, device)
         if (name.endswith("ffn.gate.weight") or name.endswith("confidence_head.proj.weight")
-                or name in ("head.weight", "mtp.2.markov_head.head.weight")
+                or name == "mtp.2.markov_head.head.weight"
+                or (name == "head.weight" and not gaudi_envs.VLLM_HPU_DSV41_BF16_LM_HEAD)
                 or (".compressor.w" in name and ".weight" in name and int(name.split(".")[1]) in (2, 8, 14))):
             value = value.float()
         module_name, _, attribute = name.rpartition(".")
@@ -94,6 +105,7 @@ class PreparedMoE(nn.Module):
         self.normal_scales, self.reduce = normal_scales, reduce
         self.register_buffer("lookup", lookup, False)
         self.fp8 = False
+        self.router_top6 = gaudi_envs.VLLM_HPU_DSV41_ROUTER_TOP6
         self.expert_k128 = gaudi_envs.VLLM_HPU_DSV41_EXPERT_K128
         if gaudi_envs.VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE and (not self.expert_k128
                                                                 or gaudi_envs.VLLM_HPU_DSV41_FP8_DECODE):
@@ -106,10 +118,16 @@ class PreparedMoE(nn.Module):
     def forward(self, value, image_mask, *, fp8_decode=False):
         w = self.weights
         scores = F.softplus(F.linear(value.float(), w.gate.weight)).sqrt()
-        bias = torch.where(image_mask.unsqueeze(-1), w.gate.bias_vl, w.gate.bias)
-        ids = torch.topk(scores + bias, self.topk, dim=-1, sorted=True).indices
-        routing = scores.gather(1, ids)
-        routing = routing / (routing.sum(-1, keepdim=True) + 1e-20) * 1.5
+        if self.router_top6:
+            if self.topk != 6 or scores.shape[1] != 384:
+                raise ValueError("Native V4.1 Router requires 384 experts and top6")
+            ids, routing = torch.ops.custom_op.custom_deepseek_v41_router_top6_gaudi2(
+                scores, w.gate.bias, w.gate.bias_vl, image_mask)
+        else:
+            bias = torch.where(image_mask.unsqueeze(-1), w.gate.bias_vl, w.gate.bias)
+            ids = torch.topk(scores + bias, self.topk, dim=-1, sorted=True).indices
+            routing = scores.gather(1, ids)
+            routing = routing / (routing.sum(-1, keepdim=True) + 1e-20) * 1.5
         experts = w.experts
         if self.fp8 and fp8_decode:
             if value.shape[0] != 1:
@@ -186,6 +204,15 @@ class PreparedStage(nn.Module):
         self.pp_rank, self.tp_rank, self.length = pp_rank, tp_rank, max_length
         self.reduce, self.all_gather = reduce, all_gather
         self.dspark = bool(dspark)
+        self.bf16_head = gaudi_envs.VLLM_HPU_DSV41_BF16_LM_HEAD
+        if self.dspark and (self.bf16_head or gaudi_envs.VLLM_HPU_DSV41_ROUTER_TOP6):
+            raise ValueError("Projection candidates require DSpark disabled")
+        self.woa_config = {"version": 1, "layers": []}
+        if gaudi_envs.VLLM_HPU_DSV41_WO_A_FP8:
+            from vllm_gaudi.ops.deepseek_v41_woa_fp8 import layer_selection
+            if self.dspark:
+                raise ValueError("wo_a FP8 requires DSpark disabled")
+            self.woa_config = layer_selection(gaudi_envs.VLLM_HPU_DSV41_WO_A_FP8_CONFIG)
         self.fp8_decode = gaudi_envs.VLLM_HPU_DSV41_FP8_DECODE
         if self.fp8_decode and (self.dspark or not gaudi_envs.VLLM_HPU_DSV41_GRAPH_REPLAY):
             raise ValueError("V4.1 FP8 decode requires ordinary C1 native stage replay")
@@ -223,7 +250,21 @@ class PreparedStage(nn.Module):
     def load_prepared(self, device):
         if self.loaded:
             self.invalidate()
-        load_weight_tree(self.shard, self.weights, device, self.weight_specs)
+        sidecar = None
+        if gaudi_envs.VLLM_HPU_DSV41_WO_A_FP8:
+            from vllm_gaudi.ops.deepseek_v41_woa_fp8 import WoaFP8Sidecar
+            sidecar = WoaFP8Sidecar(gaudi_envs.VLLM_HPU_DSV41_WO_A_FP8_SIDECAR, self.shard)
+        load_weight_tree(self.shard,
+                         self.weights,
+                         device,
+                         self.weight_specs,
+                         woa_sidecar=sidecar,
+                         woa_layers=self.woa_config["layers"])
+        for layer in self.layers:
+            layer.attention.woa_fp8 = layer.layer in self.woa_config["layers"]
+        if sidecar is not None:
+            self.runtime_precision["wo_a_fp8"] = {"config": self.woa_config, "weight_fingerprint": sidecar.fingerprint}
+
         if gaudi_envs.VLLM_HPU_DSV41_PREPARED_OUTPUT:
             for layer in self.layers:
                 layer.attention.prepare_output_weight()
@@ -243,6 +284,10 @@ class PreparedStage(nn.Module):
                 "weight_fingerprint": sidecar.fingerprint,
                 "route": "MXFP4 -> E4M3 SRAM -> FP8xFP8 MME -> FP32 scale -> BF16"
             }
+        self.runtime_precision["router_selection"] = ("FP32 scores / native top6 / smallest-ID ties"
+                                                      if gaudi_envs.VLLM_HPU_DSV41_ROUTER_TOP6 else "torch.topk")
+        self.runtime_precision["head"] = "BF16xBF16 MME -> FP32" if self.bf16_head else "FP32 MME"
+        self.precision_fingerprint = canonical_hash(self.runtime_precision)
         self.loaded = True
         self.generation += 1
 
@@ -276,17 +321,23 @@ class PreparedStage(nn.Module):
         value = rms_norm(value, self.weights.norm.weight, self.config["text_config"]["rms_norm_eps"])
         return value, pre_mix, torch.cat(target_states, -1) if target_states else None
 
+    def _head_projection(self, hidden):
+        if self.bf16_head:
+            return torch.ops.custom_op.custom_deepseek_v41_bf16_linear_f32_gaudi2(hidden.contiguous(),
+                                                                                  self.weights.head.weight)
+        return F.linear(hidden.float(), self.weights.head.weight)
+
     def logits(self, hidden):
         if self.pp_rank != 1:
             raise RuntimeError("Only the final PP stage owns the output head")
-        local = F.linear(hidden.float(), self.weights.head.weight)
+        local = self._head_projection(hidden)
         return self.all_gather(local, dim=-1)
 
     def sample_greedy(self, hidden):
         from vllm_gaudi.ops.deepseek_v41_sampling import local_greedy_candidate, select_greedy_candidate
         if self.pp_rank != 1 or hidden.shape[0] != 1:
             raise ValueError("Ordinary greedy head requires one token on the final PP stage")
-        local = F.linear(hidden.float(), self.weights.head.weight)
+        local = self._head_projection(hidden)
         candidates = self.all_gather(local_greedy_candidate(local, self.tp_rank), dim=-1)
         return select_greedy_candidate(candidates)
 

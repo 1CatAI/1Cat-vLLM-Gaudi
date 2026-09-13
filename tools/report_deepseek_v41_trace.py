@@ -30,6 +30,18 @@ def io(node, prefix):
 
 def classify(node, kernel, inputs, outputs):
     name = node.lower()
+    if "deepseek_v41_router_top6" in kernel:
+        return "Router", "text/image bias 选择、六次最大值选择、原分数归一化"
+    if "deepseek_v41_woa_stage" in kernel:
+        return "Attention", "wo_a FP8 权重 HBM→SRAM 分块搬运"
+    if "deepseek_v41_woa_quant" in kernel:
+        return "Attention", "wo_a 分组激活最大值、二次幂 scale、FP8 量化"
+    if "deepseek_v41_woa_scale" in kernel:
+        return "Attention", "wo_a FP32 结果乘通道/激活 scale 并转 BF16"
+    if "deepseek_v41_woa_fp8" in name and kernel in ("GEMM", "BatchGemm"):
+        return "Attention", "wo_a 分组输出 BMM"
+    if "deepseek_v41_bf16_linear_f32" in name and kernel in ("GEMM", "BatchGemm"):
+        return "输出头", "BF16×BF16 TP 词表投影，FP32 logits"
     if "topk" in name or "bitonic" in kernel:
         return "Router", "专家 Top-k 排序；实际输入见张量合同"
     if "deepseek_v41_control_gemv" in kernel:

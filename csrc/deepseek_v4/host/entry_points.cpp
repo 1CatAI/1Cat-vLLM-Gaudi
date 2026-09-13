@@ -42,6 +42,9 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVE
 #include "deepseek_v41_control_gemv_gaudi2.hpp"
 #include "deepseek_v41_mxfp4_prepared_dequant_fp8_gaudi2.hpp"
 #include "deepseek_v41_dynamic_quant_bf16_gaudi2.hpp"
+#include "deepseek_v41_woa_gaudi2.hpp"
+#include "deepseek_v41_woa_stage_gaudi2.hpp"
+#include "deepseek_v41_router_top6_gaudi2.hpp"
 #include "deepseek_v4_topk_softplus_sqrt_gaudi2.hpp"
 #include "deepseek_v4_fill_short_topk_i32_gaudi2.hpp"
 
@@ -120,6 +123,10 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_GEMV_F32,
     GAUDI2_KERNEL_DEEPSEEK_V41_MXFP4_PREPARED_DEQUANT_FP8,
     GAUDI2_KERNEL_DEEPSEEK_V41_DYNAMIC_QUANT_BF16,
+    GAUDI2_KERNEL_DEEPSEEK_V41_WOA_QUANT,
+    GAUDI2_KERNEL_DEEPSEEK_V41_WOA_SCALE,
+    GAUDI2_KERNEL_DEEPSEEK_V41_ROUTER_TOP6,
+    GAUDI2_KERNEL_DEEPSEEK_V41_WOA_STAGE,
     KERNEL_COUNT
 };
 
@@ -200,7 +207,10 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     std::memset(guids, 0, KERNEL_COUNT * sizeof(*guids));
            DeepseekV41Mxfp4PreparedDequantFP8Gaudi2 v41fp8;
            v41fp8.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MXFP4_PREPARED_DEQUANT_FP8].name);
-           DeepseekV41DynamicQuantBf16Gaudi2 v41quant;
+           std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_WOA_QUANT].name, DeepseekV41WoaGaudi2::quant_name);
+           std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_WOA_SCALE].name, DeepseekV41WoaGaudi2::scale_name);
+           std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_ROUTER_TOP6].name, DeepseekV41RouterTop6Gaudi2::name);
+           std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_WOA_STAGE].name, DeepseekV41WoaStageGaudi2::name);
            std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_DYNAMIC_QUANT_BF16].name, DeepseekV41DynamicQuantBf16Gaudi2::name);
            DeepseekV4SparseAttnBF16Gaudi2 sparseAttnInstance;
            sparseAttnInstance.GetKernelName(
@@ -843,6 +853,14 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     DeepseekV41Mxfp4PreparedDequantFP8Gaudi2 v41fp8;
     v41fp8.GetKernelName(kernelName);
     if (strcmp(params->guid.name, kernelName) == 0) return v41fp8.GetGcDefinitions(params, instance);
+    if (strcmp(params->guid.name, DeepseekV41WoaGaudi2::quant_name) == 0)
+        return DeepseekV41WoaGaudi2(true).GetGcDefinitions(params, instance);
+    if (strcmp(params->guid.name, DeepseekV41WoaGaudi2::scale_name) == 0)
+        return DeepseekV41WoaGaudi2(false).GetGcDefinitions(params, instance);
+    if (strcmp(params->guid.name, DeepseekV41RouterTop6Gaudi2::name) == 0)
+        return DeepseekV41RouterTop6Gaudi2().GetGcDefinitions(params, instance);
+    if (strcmp(params->guid.name, DeepseekV41WoaStageGaudi2::name) == 0)
+        return DeepseekV41WoaStageGaudi2().GetGcDefinitions(params, instance);
     DeepseekV41DynamicQuantBf16Gaudi2 v41quant;
     if (strcmp(params->guid.name, DeepseekV41DynamicQuantBf16Gaudi2::name) == 0)
         return v41quant.GetGcDefinitions(params, instance);

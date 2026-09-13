@@ -41,8 +41,12 @@ int main() {
             }
         }
     }
-    assert(custom_count == 74);
+    assert(custom_count == 78);
     for (const char* required : {
+             "custom_deepseek_v41_router_top6_gaudi2",
+             "custom_deepseek_v41_woa_quant_gaudi2",
+             "custom_deepseek_v41_woa_scale_gaudi2",
+             "custom_deepseek_v41_woa_stage_gaudi2",
              "custom_deepseek_v41_mxfp4_prepared_dequant_pipe_bf16_gaudi2",
              "custom_deepseek_v41_swa_decoded_write_bf16_gaudi2",
              "custom_deepseek_v41_fp4_decoded_write_bf16_gaudi2",

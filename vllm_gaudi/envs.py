@@ -301,6 +301,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_K128", "0") == "1",
     "VLLM_HPU_DSV41_OUTPUT_GEMM_LAYOUT":
     lambda: os.environ.get("VLLM_HPU_DSV41_OUTPUT_GEMM_LAYOUT", "0") == "1",
+    "VLLM_HPU_DSV41_WO_A_FP8":
+    lambda: os.environ.get("VLLM_HPU_DSV41_WO_A_FP8", "0") == "1",
+    "VLLM_HPU_DSV41_WO_A_FP8_SIDECAR":
+    lambda: os.environ.get("VLLM_HPU_DSV41_WO_A_FP8_SIDECAR", ""),
+    "VLLM_HPU_DSV41_WO_A_FP8_CONFIG":
+    lambda: os.environ.get("VLLM_HPU_DSV41_WO_A_FP8_CONFIG", ""),
+    "VLLM_HPU_DSV41_ROUTER_TOP6":
+    lambda: os.environ.get("VLLM_HPU_DSV41_ROUTER_TOP6", "0") == "1",
+    "VLLM_HPU_DSV41_BF16_LM_HEAD":
+    lambda: os.environ.get("VLLM_HPU_DSV41_BF16_LM_HEAD", "0") == "1",
     "VLLM_HPU_DSV41_FP8_DECODE":
     lambda: os.environ.get("VLLM_HPU_DSV41_FP8_DECODE", "0") == "1",
     "VLLM_HPU_DSV41_FP8_SIDECAR":
