@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_NATIVE_ROPE: bool = False
     VLLM_HPU_DSV41_C1_INDICES: bool = False
     VLLM_HPU_DSV41_SELECTED_VALID_ONLY: bool = False
+    VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH: bool = False
     VLLM_HPU_DSV41_PACKED_ATTENTION: bool = False
     VLLM_HPU_DSV41_FIXED_POSITIONS: bool = False
     VLLM_HPU_DSV41_PACKED_PP: bool = False
@@ -251,6 +252,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_NATIVE_ROPE", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_C1_INDICES":
     lambda: os.environ.get("VLLM_HPU_DSV41_C1_INDICES", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH":
+    lambda: os.environ.get("VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH", "0") == "1",
     "VLLM_HPU_DSV41_SELECTED_VALID_ONLY":
     lambda: os.environ.get("VLLM_HPU_DSV41_SELECTED_VALID_ONLY", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_PACKED_ATTENTION":
