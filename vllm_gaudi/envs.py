@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_NATIVE_ROPE: bool = False
     VLLM_HPU_DSV41_C1_INDICES: bool = False
     VLLM_HPU_DSV41_SELECTED_VALID_ONLY: bool = False
+    VLLM_HPU_DSV41_MLA_MME: bool = False
     VLLM_HPU_DSV41_ATTENTION_BLOCK_EXP: bool = False
     VLLM_HPU_DSV41_PHASE_TRACE: bool = False
     VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE: bool = False
@@ -257,6 +258,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_NATIVE_ROPE", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_C1_INDICES":
     lambda: os.environ.get("VLLM_HPU_DSV41_C1_INDICES", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_MLA_MME": lambda: bool(int(os.getenv("VLLM_HPU_DSV41_MLA_MME", "0"))),
     "VLLM_HPU_DSV41_ATTENTION_BLOCK_EXP":
     lambda: bool(int(os.getenv("VLLM_HPU_DSV41_ATTENTION_BLOCK_EXP", "0"))),
     "VLLM_HPU_DSV41_PHASE_TRACE":

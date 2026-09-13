@@ -43,7 +43,8 @@ def benchmark(name,
               output,
               rounds,
               recorder,
-              candidate_only=False):
+              candidate_only=False,
+              ordinary_validator=None):
     # Each sweep visits every layer once. Distinct real matrices exceed on-chip
     # storage; weights are never copied inside the timed region. Compilation is
     # fullgraph and recipes persist across input/weight changes.
@@ -89,7 +90,9 @@ def benchmark(name,
                 "ordinary": ordinary,
                 "input": x.cpu()
             }, output / f"{name}-{arm}-ordinary-difference.pt")
-            if name == "head":
+            if ordinary_validator is not None:
+                record["checks"].append(ordinary_validator(arm, x, w, actual, ordinary))
+            elif name == "head":
                 assert torch.equal(actual[0][:, 1], ordinary[0][:, 1]), "head token differs"
                 torch.testing.assert_close(actual[0][:, 0], ordinary[0][:, 0], rtol=2e-6, atol=2e-5)
             elif name != "router":

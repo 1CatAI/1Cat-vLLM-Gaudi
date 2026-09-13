@@ -42,6 +42,7 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVE
 #include "deepseek_v41_control_gemv_gaudi2.hpp"
 #include "deepseek_v41_mxfp4_prepared_dequant_fp8_gaudi2.hpp"
 #include "deepseek_v41_dynamic_quant_bf16_gaudi2.hpp"
+#include "deepseek_v41_mla_gaudi2.hpp"
 #include "deepseek_v41_woa_gaudi2.hpp"
 #include "deepseek_v41_woa_stage_gaudi2.hpp"
 #include "deepseek_v41_router_top6_gaudi2.hpp"
@@ -127,6 +128,8 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_WOA_SCALE,
     GAUDI2_KERNEL_DEEPSEEK_V41_ROUTER_TOP6,
     GAUDI2_KERNEL_DEEPSEEK_V41_WOA_STAGE,
+    GAUDI2_KERNEL_DEEPSEEK_V41_MLA_GATHER,
+    GAUDI2_KERNEL_DEEPSEEK_V41_MLA_SOFTMAX,
     KERNEL_COUNT
 };
 
@@ -209,6 +212,8 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
            v41fp8.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MXFP4_PREPARED_DEQUANT_FP8].name);
            std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_WOA_QUANT].name, DeepseekV41WoaGaudi2::quant_name);
            std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_WOA_SCALE].name, DeepseekV41WoaGaudi2::scale_name);
+           std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MLA_GATHER].name, DeepseekV41MlaGaudi2::gather_name);
+           std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MLA_SOFTMAX].name, DeepseekV41MlaGaudi2::softmax_name);
            std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_ROUTER_TOP6].name, DeepseekV41RouterTop6Gaudi2::name);
            std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_WOA_STAGE].name, DeepseekV41WoaStageGaudi2::name);
            std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_DYNAMIC_QUANT_BF16].name, DeepseekV41DynamicQuantBf16Gaudi2::name);
@@ -465,6 +470,10 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
 tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams* params,
     tpc_lib_api::HabanaKernelInstantiation* instance) {
     if (!params || !instance) return tpc_lib_api::GLUE_FAILED;
+    if (strcmp(params->guid.name, DeepseekV41MlaGaudi2::gather_name) == 0)
+        return DeepseekV41MlaGaudi2(true).GetGcDefinitions(params, instance);
+    if (strcmp(params->guid.name, DeepseekV41MlaGaudi2::softmax_name) == 0)
+        return DeepseekV41MlaGaudi2(false).GetGcDefinitions(params, instance);
     char kernelName[tpc_lib_api::MAX_NODE_NAME];
     DeepseekV4SparseAttnBF16Gaudi2 sparseAttnPairExpInstance(
         DeepseekV4SparseAttnBF16Gaudi2::PAIRED_EXP_LENGTHS);

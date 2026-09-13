@@ -497,3 +497,7 @@ The codec uses bias 7, maximum magnitude 240, nearest-even rounding followed by 
 These are independent experimental candidates. A native MME operand contract or a reduced weight footprint does not establish an end-to-end improvement. The wo_a candidate still has an unresolved ordinary/compiled numerical-consistency issue at the largest supported prefill shape. Its activation-scale implementation also needs qualification for nonfinite inputs and extremely small BF16 row maxima. Keep it disabled in production until these contracts pass. Failed candidates must not be silently substituted during an active request.
 
 The prepared sidecar validates its source manifest, rank ownership, payload hash and encoding/layout fingerprint before binding weights. Model reload invalidates existing recipes; the replay binding includes the loaded precision fingerprint and weight/state generation. The existing native runtime loader continues to validate the actual Bridge/Synapse/HCL and extension artifacts independently. A precision change requires a reload, including rebuilding the sidecar when its encoding contract changes.
+
+`VLLM_HPU_DSV41_MLA_MME=1` selects the experimental C1 shared-KV MME attention path.
+It requires decoded KV state, keeps FP32 softmax/PV consumption and the BF16 output
+boundary, and remains off by default. Prefill retains the existing path.

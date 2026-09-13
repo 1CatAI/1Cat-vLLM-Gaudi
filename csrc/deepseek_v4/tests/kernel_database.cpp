@@ -41,7 +41,7 @@ int main() {
             }
         }
     }
-    assert(custom_count == 78);
+    assert(custom_count == 80);
     for (const char* required : {
              "custom_deepseek_v41_router_top6_gaudi2",
              "custom_deepseek_v41_woa_quant_gaudi2",

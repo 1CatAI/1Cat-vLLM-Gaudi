@@ -204,6 +204,8 @@ class PreparedStage(nn.Module):
         self.pp_rank, self.tp_rank, self.length = pp_rank, tp_rank, max_length
         self.reduce, self.all_gather = reduce, all_gather
         self.dspark = bool(dspark)
+        if self.dspark and gaudi_envs.VLLM_HPU_DSV41_MLA_MME:
+            raise ValueError("MME MLA candidate requires ordinary C1 decode")
         self.bf16_head = gaudi_envs.VLLM_HPU_DSV41_BF16_LM_HEAD
         if self.dspark and (self.bf16_head or gaudi_envs.VLLM_HPU_DSV41_ROUTER_TOP6):
             raise ValueError("Projection candidates require DSpark disabled")
@@ -287,6 +289,8 @@ class PreparedStage(nn.Module):
         self.runtime_precision["router_selection"] = ("FP32 scores / native top6 / smallest-ID ties"
                                                       if gaudi_envs.VLLM_HPU_DSV41_ROUTER_TOP6 else "torch.topk")
         self.runtime_precision["head"] = "BF16xBF16 MME -> FP32" if self.bf16_head else "FP32 MME"
+        self.runtime_precision["mla"] = ("shared-KV BF16 QK / FP32 softmax and PV / BF16 output v1"
+                                         if gaudi_envs.VLLM_HPU_DSV41_MLA_MME else "TPC online softmax")
         self.precision_fingerprint = canonical_hash(self.runtime_precision)
         self.loaded = True
         self.generation += 1
