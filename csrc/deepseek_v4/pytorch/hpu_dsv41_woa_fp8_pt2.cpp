@@ -43,10 +43,11 @@ public:
         }
         auto q = BuildNode(this, graph, {kQuant, {syn_in(0)},
             {{{4,tokens,4096}, at::ScalarType::Float8_e4m3fn}, {{4,tokens,1}, at::kFloat}}});
-        auto staged = BuildNode(this, graph, {"custom_deepseek_v41_woa_stage_gaudi2", {syn_in(1)},
-            {{{4,4096,1024}, at::ScalarType::Float8_e4m3fn}}});
+        // Prepared FP8 is already the final MME weight representation. Let
+        // the compiler supply this persistent operand directly; an explicit
+        // TPC byte-copy adds a second pass without changing its representation.
         synGEMMParams params{false, false};
-        auto product = BuildNode(this, graph, {"batch_gemm", {q.at(0).get(), staged.at(0).get()},
+        auto product = BuildNode(this, graph, {"batch_gemm", {q.at(0).get(), syn_in(1)},
             {{{4,tokens,1024}, at::kFloat}}, &params, sizeof(params)});
         auto scaled = BuildNode(this, graph, {kScale, {product.at(0).get(), syn_in(2), q.at(1).get()},
             {{{tokens,4,1024}, at::kBFloat16}}});
