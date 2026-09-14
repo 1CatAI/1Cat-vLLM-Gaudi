@@ -449,6 +449,7 @@ class PreparedLayerGroup(nn.Module):
         self.final = stage.pp_rank == 1 and stop == len(stage.layers)
         self.norm = stage.weights.norm if self.final else None
         self.eps = stage.config["text_config"]["rms_norm_eps"]
+        self.native_input = None
 
     def forward(self, residual, pre_mix, positions, input_ids, engram_rows):
         image_mask = (input_ids == 129264) | (input_ids == 129265)
@@ -470,6 +471,8 @@ class PreparedLayerGroup(nn.Module):
         return value, pre_mix, torch.cat(target_states, -1) if target_states else None
 
     def native_forward(self, residual, pre_mix, positions, input_ids, engram_rows):
+        if self.native_input is not None:
+            residual, pre_mix = self.native_input(input_ids)
         return self(residual, pre_mix, positions, input_ids, engram_rows)
 
 
@@ -491,7 +494,9 @@ def _compile_group(group, *, native, backend="hpu_backend"):
 
 class CompiledStage:
 
-    def __init__(self, stage, *, native=False):
+    def __init__(self, stage, *, native=False, native_input=False):
+        if native_input and (not native or stage.pp_rank != 0 or stage.dspark or stage.fp8_decode):
+            raise ValueError("Native input capture requires ordinary BF16 PP0 decode")
         backend = "hpu_backend"
         if native and gaudi_envs.VLLM_HPU_DSV41_TP_MHC_OVERLAP:
             if stage.dspark or (stage.fp8_decode and not stage.expert_n256):
@@ -501,6 +506,8 @@ class CompiledStage:
         self.groups = tuple(
             PreparedLayerGroup(stage, start, start + 4, fp8_decode=native and stage.fp8_decode)
             for start in range(0, 20, 4))
+        if native_input:
+            self.groups[0].native_input = PreparedInput(stage.weights.embed, stage.tp_rank, stage.reduce)
         self.chunks = tuple(_compile_group(group, native=native, backend=backend) for group in self.groups)
 
     def __call__(self, hidden, pre_mix, positions, input_ids, engram):

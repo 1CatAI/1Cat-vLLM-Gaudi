@@ -501,3 +501,15 @@ The prepared sidecar validates its source manifest, rank ownership, payload hash
 `VLLM_HPU_DSV41_MLA_MME=1` selects the experimental C1 shared-KV MME attention path.
 It requires decoded KV state, keeps FP32 softmax/PV consumption and the BF16 output
 boundary, and remains off by default. Prefill retains the existing path.
+
+### V4.1 native input capture
+
+`VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH` (default `0`) includes PP0 embedding and its
+TP reduction in the first native decoder group for ordinary BF16 C1 decode.
+The native PP0 plan retains its 40 layer reductions, two Engram collectives and
+one embedding reduction. It does not replace prefill, explicit input embeddings,
+PP1, or DSpark execution. Enable it only with native stage replay, before process
+startup, and use a separate recipe cache. Rebuild the native bridge from the
+matching source so its dependency validation accepts the complete PP0 topology.
+This is an unqualified experimental path; output/state equivalence and
+complete-chain latency must be validated for the selected runtime configuration.

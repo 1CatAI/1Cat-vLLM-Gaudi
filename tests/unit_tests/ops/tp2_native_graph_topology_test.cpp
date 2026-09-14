@@ -15,6 +15,28 @@ static std::vector<NativeNodeKind> chain(size_t groups, bool peer) {
 }
 
 int main() {
+  for (size_t collectives : {40, 42, 43}) {
+    assert(NativeGraphTopology::supportsV41Dependencies(5, collectives, false));
+    assert(!NativeGraphTopology::supportsV41Dependencies(5, collectives, true));
+    std::vector<NativeNodeKind> nodes;
+    for (size_t index = 0; index < collectives; ++index) {
+      nodes.push_back({false, false});
+      nodes.push_back({true, true});
+    }
+    nodes.push_back({false, false});
+    const auto layout = NativeGraphTopology::prepare(nodes, 5, false, collectives, false);
+    assert(layout.externalCollectives == 0 && layout.consumers.size() == collectives);
+    assert(layout.computeCount == collectives + 1);
+    nodes.erase(nodes.begin() + 1);
+    bool rejected = false;
+    try { NativeGraphTopology::prepare(nodes, 5, false, collectives, false); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    assert(rejected);
+  }
+  assert(NativeGraphTopology::supportsV41Dependencies(1, 8, false));
+  assert(!NativeGraphTopology::supportsV41Dependencies(5, 41, false));
+  assert(!NativeGraphTopology::supportsV41Dependencies(5, 44, false));
+  assert(!NativeGraphTopology::supportsV41Dependencies(4, 43, false));
   for (size_t groups : {1, 8}) for (bool peer : {false, true}) {
     const auto nodes = chain(groups, peer);
     const auto layout = NativeGraphTopology::prepare(nodes, groups);

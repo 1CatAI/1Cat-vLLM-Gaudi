@@ -176,10 +176,15 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         if not self.program.loaded:
             raise RuntimeError("Prepared V4.1 weights have not been loaded")
         input_ids, positions = input_ids.reshape(-1), positions.reshape(-1).to(torch.int32)
+        native_input = (self.pp_rank == 0 and self.native and self.step_is_decode
+                        and envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH and not self.program.dspark
+                        and inputs_embeds is None and input_ids.numel() == 1)
         if self.pp_rank == 0:
             if self.step_ticket is None:
                 raise RuntimeError("V4.1 input metadata was not prepared by its worker")
-            if (inputs_embeds is None and self.input_program is not None
+            if native_input:
+                residual, pre = None, None
+            elif (inputs_embeds is None and self.input_program is not None
                     and self.step_is_decode and input_ids.numel() == 1):
                 residual, pre = self.input_program(input_ids)
             else:
@@ -194,7 +199,10 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             residual, pre = intermediate_tensors["hidden_states"], intermediate_tensors["pre_mix"]
             engram = ()
         execute = self.program.replay_owner if self.native and self.step_is_decode else self.ordinary
-        output, pre, aux = execute(residual, pre, positions, input_ids, engram)
+        if native_input:
+            output, pre, aux = execute.from_input_ids(positions, input_ids, engram)
+        else:
+            output, pre, aux = execute(residual, pre, positions, input_ids, engram)
         self.last_aux = aux
         if self.pp_rank == 0:
             return IntermediateTensors({"hidden_states": output, "pre_mix": pre})

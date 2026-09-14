@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE: bool = False
     VLLM_HPU_DSV41_DECODED_KV_STATE: bool = False
     VLLM_HPU_DSV41_SELECTED_KV_VECTOR: bool = False
+    VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH: bool = False
     VLLM_HPU_DSV41_PACKED_ATTENTION: bool = False
     VLLM_HPU_DSV41_FIXED_POSITIONS: bool = False
     VLLM_HPU_DSV41_PACKED_PP: bool = False
@@ -270,6 +271,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: bool(int(os.getenv("VLLM_HPU_DSV41_DECODED_KV_STATE", "0"))),
     "VLLM_HPU_DSV41_SELECTED_KV_VECTOR":
     lambda: os.environ.get("VLLM_HPU_DSV41_SELECTED_KV_VECTOR", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH":
+    lambda: os.environ.get("VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH", "0") == "1",
     "VLLM_HPU_DSV41_SELECTED_VALID_ONLY":
     lambda: os.environ.get("VLLM_HPU_DSV41_SELECTED_VALID_ONLY", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_PACKED_ATTENTION":
