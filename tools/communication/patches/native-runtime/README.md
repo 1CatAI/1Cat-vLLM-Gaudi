@@ -129,3 +129,17 @@ reference with its fingerprint when available. A successful small chain or
 same-runtime model comparison does not qualify equivalence to the frozen
 production model. Full-model quality and end-to-end qualification are separate
 gates, and remain required before enabling defaults.
+
+## Optional TPC fusion ownership repair
+
+`synapse-tpc-fuser-state.patch` isolates replacement-node accumulation to one
+optimized cluster. The original process-static containers could retain nodes
+across early returns or concurrent graph compilations. Subgraph accumulation
+and replacement order are preserved. The triggering relationship to an observed
+compiler assertion remains under investigation; this is not a performance claim.
+
+Use only in an independent candidate checkout after `synapse.patch`. Verify the
+file and patch hashes in `synapse-tpc-fuser-state.json`, apply with `git apply`,
+and rebuild Synapse through the normal source build above. Rebuild the adapter
+against the new private library so its ABI sidecar verifies the loaded binary.
+Do not edit an existing sidecar or replace a shared runtime library.

@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Reuse the exact group-32 scale/RNE approach of the V4.1 activation codec.
 // The result is checkpoint E4M3FN bytes, not Gaudi's native hfloat8 format.
-static inline void swa_pack_group(tensor value, tensor output, int group, int input_row, int output_row) {
+#ifdef DSV41_DECODED_KV_WRITE
+#include "deepseek_v41_kv_decode.h"
+#endif
+static inline void swa_pack_group(tensor value, tensor output, int group, int input_row, int output_row
+#ifdef DSV41_DECODED_KV_WRITE
+                                 , tensor decoded, int decoded_row
+#endif
+                                 ) {
     const int width = get_dim_size(value, 0);
     const bfloat128 input = v_bf16_ld_tnsr_partial_b((int5){32 * group, input_row, 0, 0, 0}, value, 31, 0);
     const float64 number = convert_bfloat128_to_float128(input, SW_LINEAR).v1;
@@ -29,6 +36,12 @@ static inline void swa_pack_group(tensor value, tensor output, int group, int in
     const int64 scale_code = scale_exponent + 127;
     uint256 wide = {0};
     wide.v1 = as_uint64(code) | ((as_uint64(number) >> 24) & 128);
+#ifdef DSV41_DECODED_KV_WRITE
+    float128 decoded_value = {0};
+    decoded_value.v1 = e4m3fn(wide.v1) * ue8m0(as_uint64(scale_code));
+    const bfloat128 decoded_bf16 = convert_float128_to_bfloat128(decoded_value, SW_RHNE | SW_LINEAR);
+    v_bf16_st_tnsr_partial((int5){32 * group, decoded_row, 0, 0, 0}, decoded, decoded_bf16, 31, 0);
+#endif
     const uchar256 encoded = convert_uint256_to_uchar256(wide, SW_LINEAR);
     v_u8_st_tnsr_partial((int5){32 * group, output_row, 0, 0, 0}, output, encoded, 31, 0);
     wide.v1 = as_uint64(scale_code);

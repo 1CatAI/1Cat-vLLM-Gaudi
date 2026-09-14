@@ -42,6 +42,7 @@
 #include "habana_serialization/deserializers.h"
 #include "habana_serialization/serializers.h"
 #include "python_packages/habana_frameworks/torch/distributed/hccl/process_group_eager_hccl.hpp"
+#include "tp2_input_preflight.h"
 
 namespace {
 
@@ -1202,6 +1203,10 @@ TORCH_LIBRARY_IMPL(hccl, Meta, library) {
 namespace py = pybind11;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.attr("fixed_input_preflight_api_version") = 1;
+  py::class_<tp2_input::FixedInputPreflight>(module, "FixedInputPreflight")
+      .def(py::init<const std::vector<at::Tensor>&, std::vector<at::Tensor>>())
+      .def("updates", &tp2_input::FixedInputPreflight::updates);
   module.def("set_prepared_communication", [](bool enabled) { g_prepared_comm_enabled.store(enabled); });
   py::class_<PreparedGroupPlan, std::shared_ptr<PreparedGroupPlan>>(module, "PreparedGroupPlan")
       .def(py::init<>())

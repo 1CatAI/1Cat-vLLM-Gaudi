@@ -6,6 +6,8 @@ import weakref
 
 import torch
 
+from vllm_gaudi.ops.deepseek_v41_diagnostics import trace_phase
+
 from vllm_gaudi.ops.tp2_model_adapter import DEEPSEEK_V41_PP0, DEEPSEEK_V41_PP0_INPUT, DEEPSEEK_V41_PP1
 
 
@@ -25,6 +27,7 @@ def stage_collectives(tp_rank, native):
             first, second = (value, peer) if tp_rank == 0 else (peer, value)
             return torch.cat((first, second), dim=dim)
         return tensor_model_parallel_all_gather(value, dim=dim)
+
     return reduce, gather
 
 
@@ -34,6 +37,7 @@ class _Metadata:
 
 
 class _Snapshot:
+
     def __init__(self, tensors):
         self.tensors = tensors
         self.saved = tuple(value.clone() for value in tensors)
@@ -45,17 +49,21 @@ class _Snapshot:
 
 
 def stage_state_tensors(program):
-    mutable = {"swa", "main", "index", "indices", "candidate_pool", "kv_history", "score_history"}
+    mutable = {
+        "swa", "main", "decoded_swa", "decoded_main", "index", "indices", "candidate_pool", "kv_history",
+        "score_history"
+    }
     return tuple(value for name, value in program.named_buffers()
                  if not name.startswith("draft.") and name.rsplit(".", 1)[-1] in mutable)
 
 
 class StageVariant(torch.nn.Module):
+
     def __init__(self, program, hidden, pre_mix, positions, input_ids, engram, *, native_input=False):
         super().__init__()
         self.program = program
-        self.adapter = (DEEPSEEK_V41_PP0_INPUT if native_input else
-                        DEEPSEEK_V41_PP0 if program.pp_rank == 0 else DEEPSEEK_V41_PP1)
+        self.adapter = (DEEPSEEK_V41_PP0_INPUT
+                        if native_input else DEEPSEEK_V41_PP0 if program.pp_rank == 0 else DEEPSEEK_V41_PP1)
         from vllm_gaudi.models.deepseek_v41_program import CompiledStage
         self.compiled = CompiledStage(program, native=True, native_input=native_input)
         self.fixed = tuple(value.clone() for value in (hidden, pre_mix, positions, input_ids))
@@ -70,12 +78,20 @@ class StageVariant(torch.nn.Module):
         self.capture_bytes = snapshot.bytes
         return snapshot
 
+    @trace_phase
     def forward(self, hidden, pre_mix, positions, input_ids, engram):
         from vllm_gaudi.ops.tp2_prepared_plan import (
-            collect_prepared_group_replays, record_native_decoder_outputs, replay_native_decoder,
+            collect_prepared_group_replays,
+            record_native_decoder_outputs,
+            replay_native_decoder,
         )
-        roots = dict(hidden_states=hidden, pre_mix=pre_mix, positions=positions, input_ids=input_ids,
-                     attention_inputs=engram, metadata=self.metadata, state_generation=self.program.generation,
+        roots = dict(hidden_states=hidden,
+                     pre_mix=pre_mix,
+                     positions=positions,
+                     input_ids=input_ids,
+                     attention_inputs=engram,
+                     metadata=self.metadata,
+                     state_generation=(self.program.generation, self.program.precision_fingerprint),
                      state_tensors=self.states)
         outputs = replay_native_decoder(self, **roots)
         if outputs is not None:
@@ -85,10 +101,14 @@ class StageVariant(torch.nn.Module):
         for destination, source in zip(self.engram, engram, strict=True):
             destination.copy_(source)
         fixed_hidden, fixed_pre, fixed_positions, fixed_ids = self.fixed
-        fixed_roots = dict(roots, hidden_states=fixed_hidden, pre_mix=fixed_pre, positions=fixed_positions,
-                           input_ids=fixed_ids, attention_inputs=self.engram)
+        fixed_roots = dict(roots,
+                           hidden_states=fixed_hidden,
+                           pre_mix=fixed_pre,
+                           positions=fixed_positions,
+                           input_ids=fixed_ids,
+                           attention_inputs=self.engram)
         with collect_prepared_group_replays(owner=self, adapter=self.adapter, snapshot=self.snapshot,
-                                           **fixed_roots) as context:
+                                            **fixed_roots) as context:
             for index, chunk in enumerate(self.compiled.chunks):
                 context["group_index"] = index
                 fixed_hidden, fixed_pre, aux = chunk(fixed_hidden, fixed_pre, fixed_positions, fixed_ids, self.engram)
@@ -99,6 +119,7 @@ class StageVariant(torch.nn.Module):
 
 
 class StageReplay:
+
     def __init__(self, program):
         from vllm_gaudi import envs
         self.program = weakref.ref(program)
@@ -117,14 +138,20 @@ class StageReplay:
                                torch.zeros(1, 4, device=input_ids.device, dtype=torch.float32))
         return self(*self.input_seed, positions, input_ids, engram, native_input=True)
 
+    @trace_phase
     def __call__(self, hidden, pre_mix, positions, input_ids, engram, *, native_input=False):
         tokens = input_ids.numel()
-        if tokens not in ((1, 6) if self.program().dspark else (1,)):
+        if tokens not in ((1, 6) if self.program().dspark else (1, )):
             raise ValueError("V4.1 replay shape must match C1 decode or enabled C6 DSpark verification")
         key = (tokens, "input") if native_input else tokens
         if key not in self.variants:
-            self.variants[key] = StageVariant(self.program(), hidden, pre_mix, positions, input_ids, engram,
-                                             native_input=native_input)
+            self.variants[key] = StageVariant(self.program(),
+                                              hidden,
+                                              pre_mix,
+                                              positions,
+                                              input_ids,
+                                              engram,
+                                              native_input=native_input)
         return self.variants[key](hidden, pre_mix, positions, input_ids, engram)
 
     def require_ready(self, tokens):

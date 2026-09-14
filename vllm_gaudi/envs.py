@@ -34,6 +34,14 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_NATIVE_ROPE: bool = False
     VLLM_HPU_DSV41_C1_INDICES: bool = False
     VLLM_HPU_DSV41_SELECTED_VALID_ONLY: bool = False
+    VLLM_HPU_DSV41_MLA_MME: bool = False
+    VLLM_HPU_DSV41_ATTENTION_BLOCK_EXP: bool = False
+    VLLM_HPU_DSV41_PHASE_TRACE: bool = False
+    VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE: bool = False
+    VLLM_HPU_DSV41_EXPERT_N256_FP8: bool = False
+    VLLM_HPU_DSV41_EXPERT_FUSED_QUANT: bool = False
+    VLLM_HPU_DSV41_DECODED_KV_STATE: bool = False
+    VLLM_HPU_DSV41_SELECTED_KV_VECTOR: bool = False
     VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH: bool = False
     VLLM_HPU_DSV41_PACKED_ATTENTION: bool = False
     VLLM_HPU_DSV41_FIXED_POSITIONS: bool = False
@@ -43,11 +51,13 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_DEVICE_COMMIT: bool = False
     VLLM_HPU_DSV41_NATIVE_PP_COPY: bool = False
     VLLM_HPU_DSV41_PREPARED_OUTPUT: bool = False
+    VLLM_HPU_DSV41_OUTPUT_GEMM_LAYOUT: bool = False
     VLLM_HPU_DSV41_BOUNDED_ATTENTION: bool = False
     VLLM_HPU_DSV41_ISOLATE_CONTROL: bool = False
     VLLM_HPU_DSV41_ENGINE_CPUS: Optional[str] = None
     VLLM_HPU_DSV41_API_CPUS: Optional[str] = None
     VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR: Optional[str] = None
+    VLLM_HPU_DSV41_QKV_FUSED_INPUT: bool = False
     VLLM_HPU_DSV4_SHORT_INDEXER_SKIP: bool = True
     VLLM_HPU_DSV4_BF16_SCORE_PROJECTION: bool = False
     VLLM_HPU_DSV4_FUSED_SDPA: bool = False
@@ -252,6 +262,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_NATIVE_ROPE", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_C1_INDICES":
     lambda: os.environ.get("VLLM_HPU_DSV41_C1_INDICES", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_MLA_MME":
+    lambda: bool(int(os.getenv("VLLM_HPU_DSV41_MLA_MME", "0"))),
+    "VLLM_HPU_DSV41_ATTENTION_BLOCK_EXP":
+    lambda: bool(int(os.getenv("VLLM_HPU_DSV41_ATTENTION_BLOCK_EXP", "0"))),
+    "VLLM_HPU_DSV41_PHASE_TRACE":
+    lambda: os.environ.get("VLLM_HPU_DSV41_PHASE_TRACE", "0") == "1",
+    "VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE":
+    lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE", "0") == "1",
+    "VLLM_HPU_DSV41_DECODED_KV_STATE":
+    lambda: bool(int(os.getenv("VLLM_HPU_DSV41_DECODED_KV_STATE", "0"))),
+    "VLLM_HPU_DSV41_SELECTED_KV_VECTOR":
+    lambda: os.environ.get("VLLM_HPU_DSV41_SELECTED_KV_VECTOR", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH":
     lambda: os.environ.get("VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH", "0") == "1",
     "VLLM_HPU_DSV41_SELECTED_VALID_ONLY":
@@ -266,8 +288,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_TPC_MHC", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_ENGRAM_NATIVE_C1":
     lambda: os.environ.get("VLLM_HPU_DSV41_ENGRAM_NATIVE_C1", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_ENGRAM_C1_PACKET":
+    lambda: os.environ.get("VLLM_HPU_DSV41_ENGRAM_C1_PACKET", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_TP_MHC_OVERLAP":
     lambda: os.environ.get("VLLM_HPU_DSV41_TP_MHC_OVERLAP", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_NATIVE_INPUT_PREFLIGHT":
+    lambda: os.environ.get("VLLM_HPU_DSV41_NATIVE_INPUT_PREFLIGHT", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_ATTENTION_PAIRED_EXP":
+    lambda: os.environ.get("VLLM_HPU_DSV41_ATTENTION_PAIRED_EXP", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_ATTENTION_HEAD_PAIR":
+    lambda: bool(int(os.getenv("VLLM_HPU_DSV41_ATTENTION_HEAD_PAIR", "0"))),
     "VLLM_HPU_DSV41_DIRECT_TOKEN_IDS":
     lambda: os.environ.get("VLLM_HPU_DSV41_DIRECT_TOKEN_IDS", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_DEVICE_COMMIT":
@@ -276,9 +306,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_NATIVE_PP_COPY", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_PREPARED_OUTPUT":
     lambda: os.environ.get("VLLM_HPU_DSV41_PREPARED_OUTPUT", "0").lower() in ("1", "true"),
-    "VLLM_HPU_DSV41_FP8_DECODE": lambda: os.environ.get("VLLM_HPU_DSV41_FP8_DECODE", "0") == "1",
-    "VLLM_HPU_DSV41_FP8_SIDECAR": lambda: os.environ.get("VLLM_HPU_DSV41_FP8_SIDECAR", ""),
-    "VLLM_HPU_DSV41_FP8_CONFIG": lambda: os.environ.get("VLLM_HPU_DSV41_FP8_CONFIG", ""),
+    "VLLM_HPU_DSV41_EXPERT_K128":
+    lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_K128", "0") == "1",
+    "VLLM_HPU_DSV41_OUTPUT_GEMM_LAYOUT":
+    lambda: os.environ.get("VLLM_HPU_DSV41_OUTPUT_GEMM_LAYOUT", "0") == "1",
+    "VLLM_HPU_DSV41_WO_A_FP8":
+    lambda: os.environ.get("VLLM_HPU_DSV41_WO_A_FP8", "0") == "1",
+    "VLLM_HPU_DSV41_WO_A_FP8_SIDECAR":
+    lambda: os.environ.get("VLLM_HPU_DSV41_WO_A_FP8_SIDECAR", ""),
+    "VLLM_HPU_DSV41_WO_A_FP8_CONFIG":
+    lambda: os.environ.get("VLLM_HPU_DSV41_WO_A_FP8_CONFIG", ""),
+    "VLLM_HPU_DSV41_ROUTER_TOP6":
+    lambda: os.environ.get("VLLM_HPU_DSV41_ROUTER_TOP6", "0") == "1",
+    "VLLM_HPU_DSV41_BF16_LM_HEAD":
+    lambda: os.environ.get("VLLM_HPU_DSV41_BF16_LM_HEAD", "0") == "1",
+    "VLLM_HPU_DSV41_EXPERT_N256_FP8":
+    lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_N256_FP8", "0") == "1",
+    "VLLM_HPU_DSV41_EXPERT_FUSED_QUANT":
+    lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_FUSED_QUANT", "0") == "1",
+    "VLLM_HPU_DSV41_FP8_DECODE":
+    lambda: os.environ.get("VLLM_HPU_DSV41_FP8_DECODE", "0") == "1",
+    "VLLM_HPU_DSV41_FP8_SIDECAR":
+    lambda: os.environ.get("VLLM_HPU_DSV41_FP8_SIDECAR", ""),
+    "VLLM_HPU_DSV41_FP8_CONFIG":
+    lambda: os.environ.get("VLLM_HPU_DSV41_FP8_CONFIG", ""),
     "VLLM_HPU_DSV41_BOUNDED_ATTENTION":
     lambda: os.environ.get("VLLM_HPU_DSV41_BOUNDED_ATTENTION", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_ISOLATE_CONTROL":
@@ -289,6 +340,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_API_CPUS"),
     "VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR":
     lambda: os.environ.get("VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR"),
+    "VLLM_HPU_DSV41_QKV_FUSED_INPUT":
+    lambda: os.environ.get("VLLM_HPU_DSV41_QKV_FUSED_INPUT", "0").lower() in ("1", "true"),
 
     # Fuse the four selected-expert packed-weight copies into one Gaudi2 TPC
     # launch for DeepSeek V4 single-token decode.
@@ -303,16 +356,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The indexed MME candidate keeps BF16 and uses graph-internal decoded
     # weights. SRAM placement and E2E quality are not yet qualified.
     "VLLM_HPU_DSV4_MXFP4_INDEXED_MME":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_MXFP4_INDEXED_MME", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_MXFP4_INDEXED_MME", "0").lower() in ("1", "true"),
 
     # Load-time Q16/S16 layout for the exact BF16 Gaudi2 TP2 decoder. This
     # remains opt-in until full-model quality and end-to-end gates pass.
     "VLLM_HPU_DSV4_MXFP4_PREPARED_MME":
-    lambda: os.environ.get(
-        "VLLM_HPU_DSV4_MXFP4_PREPARED_MME", "0"
-    ).lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV4_MXFP4_PREPARED_MME", "0").lower() in ("1", "true"),
 
     # Experimental V4 adapter for the version-locked joint compute/NIC plan.
     "VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH":

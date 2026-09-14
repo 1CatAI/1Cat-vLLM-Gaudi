@@ -73,6 +73,41 @@ token without proposal or verification. Native warmup captures C1 only;
 multi-token prefill retains its compiled compatibility path and tail handling.
 This mode is under separate performance and quality qualification.
 
+### Accelerated C1 candidates
+
+The ordinary decode implementation also provides independently disabled
+expert, attention and projection optimizations. The combined experimental
+profile uses N256 FP8 experts with fused activation preparation, channel-scaled
+FP8 wo_a, dedicated Router top-6, decoded KV with shared-KV MME attention,
+BF16 head operands with FP32 logits, and fused Q/KV input projection.
+It retains stage replay, the mHC/TP dependency schedule and native Engram
+preparation. See the [environment variable contracts](../configuration/env_variables.md)
+for precision choices and dependencies.
+
+Build these kernels and the host gather extension together with
+`tools/build_deepseek_v41.py`. Set `VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR` to that
+build's output directory, including its source/binary manifest. A copied
+shared library without its matching manifest is insufficient. Rebuild the
+native replay adapter against the pinned runtime and use the supplied runtime
+source patches where required; do not relax ABI checks to load a different
+Bridge, Synapse or HCL build.
+
+N256 expert preparation reuses the original prepared shard files and retains
+one compressed device allocation. Original scale encodings support BF16
+prefill on that allocation. Prepare wo_a separately using
+`tools/prepare_deepseek_v41_woa_fp8.py PREPARED_DIR SIDECAR_DIR` and set
+`VLLM_HPU_DSV41_WO_A_FP8_SIDECAR` before loading. FP8 wo_a has no resident BF16
+weight duplicate. Precision, layout or weight changes require model reload
+and new recipes.
+
+The combined C1 candidate does not enable the separate legacy
+`VLLM_HPU_DSV41_FP8_DECODE`, coordinate-pipeline, or native PP0 input-capture
+experiments. Native PP0 input capture retains its ordinary BF16-only contract.
+Neither successful component checks nor relative decode improvements establish
+production quality: generated outputs differ from the preceding candidate,
+and full quality, prefill numerical consistency and long replay/shutdown
+qualification remain open. All new switches remain off by default.
+
 The scheduler owns one complete request-state block for the bounded context.
 Null block 0 and request block 1 each have separate allocations for the actual
 SWA, FP4 main/index, candidate, Top-512, compressor and draft arrays. Prefix

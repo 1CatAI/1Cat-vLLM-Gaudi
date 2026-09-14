@@ -8,6 +8,8 @@ Transport uses persistent HPU buffers and HCCL, with one outstanding request.
 from dataclasses import dataclass, field
 
 import torch
+
+from vllm_gaudi.ops.deepseek_v41_diagnostics import trace_phase
 import torch.distributed as dist
 
 from vllm.distributed import get_pp_group
@@ -62,6 +64,7 @@ def greedy_verify(target_ids, proposed_ids):
 
 
 class PPBuffers:
+
     def __init__(self, device, capacity=6, *, dspark=True):
         self.group = get_pp_group()
         self.hidden = torch.empty(capacity, 4, 5120, dtype=torch.bfloat16, device=device)
@@ -82,17 +85,19 @@ class PPBuffers:
         self.sends, self.receives, self.commits = 0, 0, 0
         self.packed = None
         if envs.VLLM_HPU_DSV41_NATIVE_PP_COPY and (dspark or not envs.VLLM_HPU_DSV41_PACKED_PP
-                                                 or not envs.VLLM_HPU_DSV41_GRAPH_REPLAY):
+                                                   or not envs.VLLM_HPU_DSV41_GRAPH_REPLAY):
             raise ValueError("Native PP copy requires ordinary packed C1 graph replay")
         if envs.VLLM_HPU_DSV41_PACKED_PP and not dspark:
             from vllm_gaudi.ops.deepseek_v41_pp import PackedC1Buffers
             self.packed = PackedC1Buffers(device, native_copy=envs.VLLM_HPU_DSV41_NATIVE_PP_COPY)
 
+    @trace_phase
     def drain(self):
         for work in self.pending:
             work.wait()
         self.pending.clear()
 
+    @trace_phase
     def exchange(self, values, count, *, decode=False):
         self.drain()
         if self.packed is not None and decode and count == 1:
@@ -136,6 +141,7 @@ class PPBuffers:
         self.commits += 1
         return record[1], record[4:4 + record[2]], record[10:10 + record[3]]
 
+    @trace_phase
     def finish_single(self, consumed=None, token=None):
         if self.dspark:
             raise RuntimeError("Ordinary token completion cannot commit DSpark verification")
@@ -156,6 +162,7 @@ class PPBuffers:
         if self.packed is not None:
             self.packed.complete()
 
+    @trace_phase
     def finish_single_device(self):
         if not self.device_commit or self.dspark:
             raise RuntimeError("Device completion is not enabled for ordinary C1")
@@ -205,8 +212,14 @@ class V41ModelRunner:
         if envs.VLLM_HPU_DSV41_FIXED_POSITIONS and not self.use_dspark:
             from vllm_gaudi.ops.deepseek_v41_inputs import PositionBank
             self.position_bank = PositionBank(self.model_config.max_model_len, 6, self.device)
-        self.audit = {"target_steps": 0, "target_tokens": 0, "draft_steps": 0,
-                      "accepted_drafts": 0, "rejected_drafts": 0, "requests": 0}
+        self.audit = {
+            "target_steps": 0,
+            "target_tokens": 0,
+            "draft_steps": 0,
+            "accepted_drafts": 0,
+            "rejected_drafts": 0,
+            "requests": 0
+        }
 
     def load_model(self):
         before = torch.hpu.memory_allocated()
@@ -219,24 +232,30 @@ class V41ModelRunner:
         self.model_memory_usage = torch.hpu.memory_allocated() - before
         if self.pp.group.is_last_rank and envs.VLLM_HPU_DSV41_DSPARK:
             draft = self.model.program.draft
-            self.insert_context = torch.compile(draft.insert_context, backend="hpu_backend", fullgraph=True,
+            self.insert_context = torch.compile(draft.insert_context,
+                                                backend="hpu_backend",
+                                                fullgraph=True,
                                                 dynamic=False)
             self.run_draft = torch.compile(draft, backend="hpu_backend", fullgraph=True, dynamic=False)
             self.sample_draft = torch.compile(draft.sample_greedy, backend="hpu_backend", fullgraph=True, dynamic=False)
         elif self.pp.group.is_last_rank:
-            self.sample_target = torch.compile(self.model.program.sample_greedy, backend="hpu_backend",
-                                               fullgraph=True, dynamic=False)
+            self.sample_target = torch.compile(self.model.program.sample_greedy,
+                                               backend="hpu_backend",
+                                               fullgraph=True,
+                                               dynamic=False)
             if self.pp.device_commit:
                 self.sample_target_commit = torch.compile(self.model.program.sample_greedy_commit,
-                                                          backend="hpu_backend", fullgraph=True, dynamic=False)
-        logger.info("V4.1 PP%d prepared weights loaded; allocated %d bytes",
-                    self.model.pp_rank, self.model_memory_usage)
+                                                          backend="hpu_backend",
+                                                          fullgraph=True,
+                                                          dynamic=False)
+        logger.info("V4.1 PP%d prepared weights loaded; allocated %d bytes", self.model.pp_rank,
+                    self.model_memory_usage)
 
     def get_model(self):
         return self.model
 
     def get_supported_tasks(self):
-        return ("generate",)
+        return ("generate", )
 
     def reset_encoder_cache(self):
         self.encoder_cache.clear()
@@ -262,7 +281,7 @@ class V41ModelRunner:
             raise ValueError("V4.1 state arrays must share scheduler block ownership")
         self.state.blocks, self.state.active = counts.pop(), None
         self.state.bind(0)
-        runner_caches.extend((value,) for value in caches.values())
+        runner_caches.extend((value, ) for value in caches.values())
 
     def initialize_kv_cache(self, config):
         names = {name for group in config.kv_cache_groups for name in group.layer_names}
@@ -271,9 +290,10 @@ class V41ModelRunner:
         self.state.allocate(config.num_blocks, self.device)
         self.state.bind(1)
         self.state.clear()
-        self.kv_caches = [(value,) for value in self.state.allocations.values()]
+        self.kv_caches = [(value, ) for value in self.state.allocations.values()]
         self.kv_cache_config = config
 
+    @trace_phase
     def _bind_request(self, request):
         if len(request.block_ids) != 1 or len(request.block_ids[0]) != 1:
             raise RuntimeError("V4.1 expects one scheduler-owned whole-request state block")
@@ -288,6 +308,7 @@ class V41ModelRunner:
             self.active_request = request.req_id
             self.audit["requests"] += 1
 
+    @trace_phase
     def _update(self, scheduled):
         for req_id in scheduled.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -300,7 +321,7 @@ class V41ModelRunner:
                 raise ValueError("V4.1 prepared execution requires processor-owned token/image inputs")
             self._validate_sampling(new.sampling_params)
             self.requests[new.req_id] = RequestState(new.req_id, list(new.prompt_token_ids), new.mm_features,
-                                                    new.sampling_params, new.block_ids, new.num_computed_tokens)
+                                                     new.sampling_params, new.block_ids, new.num_computed_tokens)
         cached = scheduled.scheduled_cached_reqs
         for index, req_id in enumerate(cached.req_ids):
             request = self.requests[req_id]
@@ -322,8 +343,10 @@ class V41ModelRunner:
                 or params.presence_penalty != 0 or params.frequency_penalty != 0 or params.repetition_penalty != 1
                 or params.allowed_token_ids is not None or params.bad_words or params.logit_bias
                 or params.structured_outputs is not None):
-            raise ValueError("The initial V4.1 runner supports unmodified greedy sampling; unsupported options rejected")
+            raise ValueError("The initial V4.1 runner supports unmodified greedy sampling; "
+                             "unsupported options rejected")
 
+    @trace_phase
     def _image_embeddings(self, request, start, count):
         if not request.mm_features or not self.pp.group.is_first_rank:
             return None
@@ -344,6 +367,7 @@ class V41ModelRunner:
                 destination.copy_(torch.where(mask.unsqueeze(-1), source, destination))
         return values
 
+    @trace_phase
     def _forward(self, request_id, tokens, start, *, decode, reset=False, request=None):
         count = len(tokens)
         ids, positions = self.input_views[count], self.position_views[count]
@@ -399,6 +423,7 @@ class V41ModelRunner:
         return result
 
     @torch.inference_mode()
+    @trace_phase
     def execute_model(self, scheduled):
         if self.pending is not None:
             raise RuntimeError("Previous V4.1 execution has not completed sampling/verify")
@@ -418,12 +443,16 @@ class V41ModelRunner:
         if len(tokens) != count or start + count > self.model_config.max_model_len:
             raise RuntimeError("Scheduled V4.1 inputs do not match the committed prefix and context budget")
         decode = start >= len(request.prompt)
-        if decode and count not in ((1, 6) if self.use_dspark else (1,)):
+        if decode and count not in ((1, 6) if self.use_dspark else (1, )):
             raise RuntimeError("Unexpected partial DSpark verify; draft proposal must respect the request budget")
         for offset in range(0, count, 6):
             chunk = tokens[offset:offset + 6]
-            hidden = self._forward(req_id, chunk, start + offset, decode=decode,
-                                   reset=start + offset == 0, request=request)
+            hidden = self._forward(req_id,
+                                   chunk,
+                                   start + offset,
+                                   decode=decode,
+                                   reset=start + offset == 0,
+                                   request=request)
             if offset + len(chunk) < count:
                 self._insert(self.model.last_aux, self.positions[:len(chunk)])
                 self.model.complete_step(len(chunk))
@@ -442,6 +471,7 @@ class V41ModelRunner:
         return None
 
     @torch.inference_mode()
+    @trace_phase
     def sample_tokens(self, grammar_output=None):
         if grammar_output is not None:
             raise ValueError("V4.1 prepared greedy verification does not support grammar sampling")
@@ -476,9 +506,11 @@ class V41ModelRunner:
         self.pending = None
         if not self.pp.group.is_last_rank:
             return None
-        return ModelRunnerOutput(req_ids=[request.req_id], req_id_to_index={request.req_id: 0},
+        return ModelRunnerOutput(req_ids=[request.req_id],
+                                 req_id_to_index={request.req_id: 0},
                                  sampled_token_ids=[output])
 
+    @trace_phase
     def _sample_single(self):
         request, start, count, last_count, proposed, need_sample, selected = self.pending
         if proposed:
@@ -492,8 +524,8 @@ class V41ModelRunner:
                 token = int(host[0, 0])
             else:
                 token = int(selected.cpu()[0, 0])
-        consumed, output = (self.pp.finish_single_device() if device_commit else
-                            self.pp.finish_single(last_count, token))
+        consumed, output = (self.pp.finish_single_device() if device_commit else self.pp.finish_single(
+            last_count, token))
         if consumed != last_count:
             raise RuntimeError("Ordinary PP completion did not consume the complete input chunk")
         self.model.complete_step(consumed)
@@ -503,7 +535,8 @@ class V41ModelRunner:
         self.pending = self.draft_token_ids = None
         if not self.pp.group.is_last_rank:
             return None
-        return ModelRunnerOutput(req_ids=[request.req_id], req_id_to_index={request.req_id: 0},
+        return ModelRunnerOutput(req_ids=[request.req_id],
+                                 req_id_to_index={request.req_id: 0},
                                  sampled_token_ids=[output])
 
     def take_draft_token_ids(self):
@@ -512,16 +545,14 @@ class V41ModelRunner:
 
     @torch.inference_mode()
     def _dummy_run(self, tokens, *, native=False):
-        logger.info("V4.1 PP%d C%d warmup target start (native=%s, preceding steps=%d)",
-                    self.model.pp_rank, tokens, bool(native), self.audit["target_steps"])
+        logger.info("V4.1 PP%d C%d warmup target start (native=%s, preceding steps=%d)", self.model.pp_rank, tokens,
+                    bool(native), self.audit["target_steps"])
         self.state.clear()
-        hidden = self._forward("__v41_warmup__", [1 + index for index in range(tokens)], 0,
-                               decode=native, reset=True)
+        hidden = self._forward("__v41_warmup__", [1 + index for index in range(tokens)], 0, decode=native, reset=True)
         from vllm_gaudi.ops.tp2_prepared_plan import prepared_group_stats
         stats = prepared_group_stats()
-        logger.info("V4.1 PP%d target submitted (native graphs=%d, replays=%d, entries=%d)",
-                    self.model.pp_rank, stats["native_graphs"], stats["native_replays"],
-                    stats["native_entry_replays"])
+        logger.info("V4.1 PP%d target submitted (native graphs=%d, replays=%d, entries=%d)", self.model.pp_rank,
+                    stats["native_graphs"], stats["native_replays"], stats["native_entry_replays"])
         if self.pp.group.is_last_rank:
             if self.use_dspark:
                 self.model.compute_logits(hidden)
@@ -547,7 +578,7 @@ class V41ModelRunner:
         logger.info("V4.1 PP%d completed C6 memory profile", self.model.pp_rank)
 
     def warmup_model(self):
-        for count in ((1, 6) if self.use_dspark else (1,)):
+        for count in ((1, 6) if self.use_dspark else (1, )):
             for _ in range(4 if self.model.native else 1):
                 self._dummy_run(count, native=self.model.native)
             if self.model.native:

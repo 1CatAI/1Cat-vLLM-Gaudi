@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "qualification": "experimental compiler ownership fix; device validation pending",
+  "repository": "https://github.com/heyuanliu-intel/Intel_Gaudi3_Software.git",
+  "base_commit": "6de1f66a4ab658685f23dbe007bdc9eb8fe8dbdf",
+  "apply_after": "synapse.patch",
+  "patch": "synapse-tpc-fuser-state.patch",
+  "patch_sha256": "4317181de57c70402478a211e41dd846e9134c2902419f8682c2cb83a58f9d65",
+  "file": "synapse/src/graph_compiler/passes/tpc_fuser.cpp",
+  "before_sha256": "248bd21b1dcbf9847ef6401d785ef0b0cb7f5e4a18f2bba9afdc65d6fd432af0",
+  "after_sha256": "646f9d8004c09965ef7b96a26bd7cec5113f8ed19475f65d5ac74ed869aeb7e0"
+}
