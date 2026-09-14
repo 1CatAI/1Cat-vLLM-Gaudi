@@ -25,8 +25,8 @@ DEFAULT_PROMPT = ("A red fox walks through a snowy forest while its footsteps cr
 DEFAULT_FFPROBE = Path("/opt/habanalabs/media/ffmpeg/bin/ffprobe")
 DEFAULT_VALIDATION_FFMPEG = Path("/opt/habanalabs/media/ffmpeg/bin/ffmpeg")
 DEFAULT_ENCODING_FFMPEG = Path(imageio_ffmpeg.get_ffmpeg_exe())
-BALANCED_SIGMA_POINTS = 10
-OFFICIAL_BASE_SIGMA_POINTS = 50
+BASE_20_DENOISE_STEPS = 20
+PINNED_OMNI_REFERENCE_SIGMA_POINTS = 50
 
 
 def _run(command: list[str], log_path: Path, *, timeout: float | None = None) -> None:
@@ -233,8 +233,8 @@ def _request_command(args: argparse.Namespace, run_dir: Path) -> list[str]:
         "--timeout",
         str(args.timeout),
     ]
-    if args.official_base_default:
-        command.append("--official-base-default")
+    if args.pinned_omni_reference:
+        command.append("--pinned-omni-reference")
     else:
         command.extend(("--sigma-points", str(args.sigma_points)))
     return command
@@ -302,7 +302,7 @@ def _one_run(args: argparse.Namespace, index: int) -> dict[str, Any]:
                                           height=768,
                                           frames=120,
                                           exact_duration=5.0)
-    sigma_points = OFFICIAL_BASE_SIGMA_POINTS if args.official_base_default else args.sigma_points
+    sigma_points = PINNED_OMNI_REFERENCE_SIGMA_POINTS if args.pinned_omni_reference else args.sigma_points
     expected_dit_forwards = sigma_points - 1
     dit_forwards = _progress_total(args.server_log, log_offset)
     if dit_forwards != expected_dit_forwards:
@@ -315,7 +315,7 @@ def _one_run(args: argparse.Namespace, index: int) -> dict[str, Any]:
         "started_at": started_at,
         "wall_seconds": wall_seconds,
         "harness_wall_seconds": harness_wall_seconds,
-        "request_sampling_fields_omitted": args.official_base_default,
+        "request_sampling_fields_omitted": args.pinned_omni_reference,
         "resolved_sigma_points": sigma_points,
         "actual_joint_dit_forwards": dit_forwards,
         "profiler_enabled": False,
@@ -341,14 +341,21 @@ def main() -> int:
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     schedule = parser.add_mutually_exclusive_group()
     schedule.add_argument(
-        "--sigma-points",
+        "--denoise-steps",
         type=int,
-        help="sigma grid points including terminal zero; default: 10 points / 9 DiT forwards",
+        help="actual Base Euler DiT calls; default: 20 (translated to 21 sigma points)",
     )
     schedule.add_argument(
+        "--sigma-points",
+        type=int,
+        help="expert override: Omni sigma grid points including terminal zero",
+    )
+    schedule.add_argument(
+        "--pinned-omni-reference",
         "--official-base-default",
+        dest="pinned_omni_reference",
         action="store_true",
-        help="deliberately benchmark the official 50-point / 49-forward Base schedule",
+        help="deliberately reproduce pinned Omni's 50-point / 49-forward Base schedule",
     )
     parser.add_argument("--poll-seconds", type=float, default=5.0)
     parser.add_argument("--timeout", type=float, default=14400.0)
@@ -358,15 +365,18 @@ def main() -> int:
     args = parser.parse_args()
     if args.runs < 4:
         raise ValueError("the acceptance protocol needs one first request and at least three subsequent requests")
-    if args.sigma_points is None and not args.official_base_default:
-        args.sigma_points = BALANCED_SIGMA_POINTS
+    if args.sigma_points is None and not args.pinned_omni_reference:
+        denoise_steps = BASE_20_DENOISE_STEPS if args.denoise_steps is None else args.denoise_steps
+        if denoise_steps < 1:
+            raise ValueError("MiniMax H3 needs at least one denoise step")
+        args.sigma_points = denoise_steps + 1
     if args.sigma_points is not None and args.sigma_points < 2:
         raise ValueError("MiniMax H3 needs at least two sigma grid points")
     args.output_dir = args.output_dir.expanduser().resolve()
     args.server_log = args.server_log.expanduser().resolve()
     args.output_dir.mkdir(parents=True, exist_ok=False)
 
-    sigma_points = OFFICIAL_BASE_SIGMA_POINTS if args.official_base_default else args.sigma_points
+    sigma_points = PINNED_OMNI_REFERENCE_SIGMA_POINTS if args.pinned_omni_reference else args.sigma_points
     results = [_one_run(args, index) for index in range(args.runs)]
     warmed = [item["wall_seconds"] for item in results[1:4]]
     summary = {
@@ -381,7 +391,8 @@ def main() -> int:
             "internal_frames": 124,
             "delivery_frames": 120,
             "seed": 2101,
-            "sampling_fields_omitted": args.official_base_default,
+            "sampling_fields_omitted": args.pinned_omni_reference,
+            "sampler": "omni_euler_eta0",
             "resolved_sigma_points": sigma_points,
             "actual_joint_dit_forwards": sigma_points - 1,
             "profiler_enabled": False,

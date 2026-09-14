@@ -19,8 +19,8 @@ _IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/heic", "image/he
 _VIDEO_TYPES = {"video/mp4", "video/quicktime"}
 _AUDIO_TYPES = {"audio/wav", "audio/x-wav", "audio/mpeg"}
 _T2VA_RATIOS = {"21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}
-_OFFICIAL_BASE_SIGMA_POINTS = 50
-_BALANCED_SIGMA_POINTS = 10
+_PINNED_OMNI_REFERENCE_SIGMA_POINTS = 50
+_BASE_20_DENOISE_STEPS = 20
 
 
 def _response_metrics(headers: dict[str, str]) -> dict[str, object]:
@@ -52,12 +52,18 @@ def _response_metrics(headers: dict[str, str]) -> dict[str, object]:
     }
 
 
-def _resolve_sigma_points(requested: int | None, official_base_default: bool) -> int | None:
-    """Use a short practical schedule unless the official Base grid is requested."""
+def _resolve_sigma_points(
+    requested: int | None,
+    denoise_steps: int | None,
+    pinned_omni_reference: bool,
+) -> int | None:
+    """Use 20 denoiser calls unless the pinned Omni reference is requested."""
 
-    if official_base_default:
+    if pinned_omni_reference:
         return None
-    return _BALANCED_SIGMA_POINTS if requested is None else requested
+    if requested is not None:
+        return requested
+    return (denoise_steps if denoise_steps is not None else _BASE_20_DENOISE_STEPS) + 1
 
 
 def _mime_type(path: Path) -> str:
@@ -125,10 +131,9 @@ def _request_data(args: argparse.Namespace) -> dict[str, str]:
         "seed": str(args.seed),
         "extra_params": json.dumps(extra, separators=(",", ":")),
     }
-    # MiniMax H3 Base defines 50 sigma grid points in its official serving
-    # workflow. The terminal zero is included, so this resolves to 49 joint
-    # video/audio DiT forwards. Omitting the field exercises that model-owned
-    # default instead of presenting it as 50 transformer steps.
+    # The pinned Omni Base reference defines 50 sigma grid points. The terminal
+    # zero is included, so it resolves to 49 joint video/audio DiT forwards.
+    # This differs from ComfyUI's 20-step RES multistep Base workflow.
     if args.sigma_points is not None:
         data["num_inference_steps"] = str(args.sigma_points)
     if args.flow_shift is not None:
@@ -162,16 +167,22 @@ def main() -> int:
     parser.add_argument("--fps", type=int, default=24)
     schedule = parser.add_mutually_exclusive_group()
     schedule.add_argument(
-        "--sigma-points",
-        "--steps",
-        dest="sigma_points",
+        "--denoise-steps",
         type=int,
-        help="sigma grid points including terminal zero; default: 10 points / 9 DiT forwards",
+        help="actual Base Euler DiT calls; default: 20 (translated to 21 sigma points)",
     )
     schedule.add_argument(
+        "--sigma-points",
+        dest="sigma_points",
+        type=int,
+        help="expert override: Omni sigma grid points including terminal zero",
+    )
+    schedule.add_argument(
+        "--pinned-omni-reference",
         "--official-base-default",
+        dest="pinned_omni_reference",
         action="store_true",
-        help="omit the field and use the Base checkpoint's 50-point / 49-forward schedule",
+        help="omit the field and reproduce pinned Omni's 50-point / 49-forward Base schedule",
     )
     parser.add_argument("--flow-shift", type=float, help="omitted uses checkpoint release metadata (Base: 12)")
     parser.add_argument(
@@ -182,7 +193,11 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=2101)
     parser.add_argument("--timeout", type=float, default=14400.0)
     args = parser.parse_args()
-    args.sigma_points = _resolve_sigma_points(args.sigma_points, args.official_base_default)
+    args.sigma_points = _resolve_sigma_points(
+        args.sigma_points,
+        args.denoise_steps,
+        args.pinned_omni_reference,
+    )
 
     references = [(path.expanduser().resolve(), _mime_type(path)) for path in args.reference]
     for path, _ in references:
@@ -225,8 +240,10 @@ def main() -> int:
             "request_field": "num_inference_steps",
             "meaning": "sigma_grid_points_including_terminal_zero",
             "field_was_omitted": args.sigma_points is None,
-            "resolved_sigma_points": args.sigma_points or _OFFICIAL_BASE_SIGMA_POINTS,
-            "expected_joint_dit_forwards": (args.sigma_points or _OFFICIAL_BASE_SIGMA_POINTS) - 1,
+            "sampler": "omni_euler_eta0",
+            "profile": "pinned_omni_reference" if args.sigma_points is None else "explicit_base_grid",
+            "resolved_sigma_points": args.sigma_points or _PINNED_OMNI_REFERENCE_SIGMA_POINTS,
+            "expected_joint_dit_forwards": (args.sigma_points or _PINNED_OMNI_REFERENCE_SIGMA_POINTS) - 1,
             "video_and_audio_share_each_forward": True,
         },
         "references": [{

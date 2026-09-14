@@ -80,38 +80,40 @@ vLLM arguments go after an explicit `--`.
 Start the reference partition by changing `--partition Ref2VA`. Only one
 partition is loaded, and shared components are instantiated once.
 
-## Official Base sampling contract
+## Sampling workflows
 
-[MiniMax's reproducible H3 Base requests](https://github.com/MiniMax-AI/MiniMax-H3)
-leave the sampling fields unset. The project recommends its
-[SGLang H3 workflow](https://docs.sglang.io/cookbook/diffusion/MiniMax/MiniMax-H3)
-for local deployment. That implementation and the pinned Omni revision resolve
-the omitted fields as follows:
+H3 currently has three different public sampling contracts. Weight precision
+does not select one: INT8 or FP8 describes linear-layer storage and compute,
+while the sampler and distilled adapter determine the number of denoiser calls.
 
-| Quantity | Base value |
-| --- | ---: |
-| Sigma grid points, including terminal zero | 50 |
-| Joint denoising intervals and DiT forwards | 49 |
-| Video sigma shift | 12 |
-| Audio sigma shift | 3 |
+| Workflow | Sampler contract | Actual joint DiT calls |
+| --- | --- | ---: |
+| [ComfyUI Base template](https://github.com/Comfy-Org/workflow_templates/blob/main/templates/video_minimax_h3_t2v.json) | `res_multistep` + `simple` | 20 |
+| [Pinned Omni Base reference](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md) | uniform `euler_eta0`, 50 sigma points | 49 |
+| [Matching Turbo LoRA](https://github.com/ModelTC/LightX2V/) | artifact-owned distilled schedule | 4 or 8 |
+
+The official ComfyUI template's 20-step INT8 example and the pinned Omni
+reference therefore use the same H3 model family but not the same numerical
+solver. A Base checkpoint cannot be changed to four or eight steps by changing
+one request integer; those schedules require the matching distilled LoRA.
 
 Video and audio latents occupy one packed sequence and are predicted in the
-same transformer call. H3 Base is CFG-distilled, so there is one branch per
-interval. Thus the workload is 49 joint DiT forwards, rather than 50 video
-calls plus 50 audio calls. Turbo LoRA schedules have different contracts and
-are not interchangeable with this native-FP8 Base checkpoint.
+same transformer call. H3 Base is CFG-distilled, so each denoising step uses one
+joint branch rather than separate video, audio, positive, and negative calls.
+The released Base shifts remain 12 for video and 3 for audio.
 
-The request helper defaults to a balanced **10-point sigma grid and nine actual
-DiT forwards** for development and ordinary samples. Add
-`--official-base-default` to omit the sampling field and deliberately run the
-50-point/49-forward Base schedule. `--sigma-points` can name any explicit grid
-for a controlled experiment; the legacy `--steps` spelling is an alias, not a
-count of actual forwards.
+For current native-FP8 HPU development, the request helper defaults to **20
+actual Omni Euler DiT calls**, represented by 21 sigma grid points including
+terminal zero. This matches the useful Base compute count but is not claimed to
+be numerically equivalent to ComfyUI's 20-step RES result. Add
+`--pinned-omni-reference` only to reproduce the pinned Omni 50-point/49-call
+reference. `--sigma-points` names an explicit Omni grid for a controlled
+experiment.
 
 ## Requests
 
-Generate T2VA with the normal balanced schedule (10 sigma points and nine
-actual DiT forwards):
+Generate T2VA with the normal Base schedule (21 sigma points and 20 actual
+Omni Euler DiT forwards):
 
 ```bash
 python tools/minimax_h3/request_video.py \
@@ -123,8 +125,8 @@ python tools/minimax_h3/request_video.py \
   --metadata t2va.json
 ```
 
-Add `--official-base-default` only when deliberately reproducing the Base
-quality baseline with 49 actual DiT forwards.
+Add `--pinned-omni-reference` only when deliberately reproducing the pinned
+Omni Base quality baseline with 49 actual DiT forwards.
 
 On an FL2VA server, select first frame, last frame, or both:
 
@@ -173,11 +175,11 @@ python tools/minimax_h3/benchmark_t2va.py \
 ```
 
 The tool makes one first request followed by three measured requests. It
-defaults to the balanced 10-point grid and nine DiT forwards. Add
-`--official-base-default` to the benchmark command only for a deliberate
-49-forward quality baseline, or set `--sigma-points` explicitly for another
-controlled schedule. Each request uses 1344x768, 24 FPS, five seconds, seed
-2101, and validates a 124-frame internal MP4. It retains that file, trims a
+defaults to the 21-point grid and 20 actual Omni Euler DiT forwards. Add
+`--pinned-omni-reference` to the benchmark command only for a deliberate
+pinned-Omni 49-forward reproduction, or set `--sigma-points` explicitly for
+another controlled schedule. Each request uses 1344x768, 24 FPS, five seconds,
+seed 2101, and validates a 124-frame internal MP4. It retains that file, trims a
 separate delivery file to exactly 120 frames/five seconds, runs full video and
 audio decode through the Habana FFmpeg build, samples HBM and host memory, and
 reports the warmed median and range. Profiling is disabled for these main

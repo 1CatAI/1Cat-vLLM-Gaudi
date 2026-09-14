@@ -70,7 +70,7 @@ def _write_fp8_partition(root: Path, partition: str) -> Path:
     return target
 
 
-def test_official_base_schedule_has_50_points_and_49_joint_forwards():
+def test_pinned_omni_base_schedule_has_50_points_and_49_joint_forwards():
     video = minimax_h3_time_shift_sigmas(num_steps=50, shift_scale=12.0)
     audio = minimax_h3_time_shift_sigmas(num_steps=50, shift_scale=3.0)
 
@@ -80,7 +80,7 @@ def test_official_base_schedule_has_50_points_and_49_joint_forwards():
     assert len(video) - 1 == 49
 
 
-def test_request_omits_sampling_fields_for_explicit_official_model_default():
+def test_request_omits_sampling_fields_for_explicit_pinned_omni_reference():
     args = _request_args()
     request_video._validate(args, [])
     data = request_video._request_data(args)
@@ -90,10 +90,11 @@ def test_request_omits_sampling_fields_for_explicit_official_model_default():
     assert json.loads(data["extra_params"]) == {"task": "t2va", "duration": 5.0}
 
 
-def test_request_cli_resolves_to_short_balanced_schedule():
-    assert request_video._resolve_sigma_points(None, False) == 10
-    assert request_video._resolve_sigma_points(7, False) == 7
-    assert request_video._resolve_sigma_points(None, True) is None
+def test_request_cli_resolves_to_20_forward_base_schedule():
+    assert request_video._resolve_sigma_points(None, None, False) == 21
+    assert request_video._resolve_sigma_points(None, 8, False) == 9
+    assert request_video._resolve_sigma_points(7, None, False) == 7
+    assert request_video._resolve_sigma_points(None, None, True) is None
 
 
 def _benchmark_args(**overrides):
@@ -101,27 +102,27 @@ def _benchmark_args(**overrides):
         "api_url": "http://127.0.0.1:8097/v1/videos/sync",
         "prompt": "A fox walks through snow.",
         "timeout": 3600,
-        "sigma_points": 10,
-        "official_base_default": False,
+        "sigma_points": 21,
+        "pinned_omni_reference": False,
     }
     values.update(overrides)
     return Namespace(**values)
 
 
-def test_benchmark_defaults_to_balanced_schedule(tmp_path):
+def test_benchmark_defaults_to_20_forward_base_schedule(tmp_path):
     command = benchmark_t2va._request_command(_benchmark_args(), tmp_path)
 
-    assert command[command.index("--sigma-points") + 1] == "10"
-    assert "--official-base-default" not in command
+    assert command[command.index("--sigma-points") + 1] == "21"
+    assert "--pinned-omni-reference" not in command
 
 
-def test_formal_benchmark_requires_explicit_official_base_schedule(tmp_path):
+def test_formal_benchmark_requires_explicit_pinned_omni_reference(tmp_path):
     command = benchmark_t2va._request_command(
-        _benchmark_args(sigma_points=None, official_base_default=True),
+        _benchmark_args(sigma_points=None, pinned_omni_reference=True),
         tmp_path,
     )
 
-    assert "--official-base-default" in command
+    assert "--pinned-omni-reference" in command
     assert "--sigma-points" not in command
 
 
