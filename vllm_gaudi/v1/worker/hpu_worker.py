@@ -326,6 +326,10 @@ class HPUWorker(WorkerBase):
         if is_v41(self.vllm_config):
             from vllm_gaudi.v1.worker.deepseek_v41_runner import V41ModelRunner
             runner_class = V41ModelRunner
+            from vllm_gaudi.ops.deepseek_v41_config import uses_v2
+            if uses_v2(self.vllm_config):
+                from vllm_gaudi.v1.worker.deepseek_v41_v2_runner import V41V2ModelRunner
+                runner_class = V41V2ModelRunner
         return runner_class(vllm_config=self.vllm_config, is_driver_worker=self.is_driver_worker)
 
     def shutdown(self):

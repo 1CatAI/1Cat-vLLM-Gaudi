@@ -313,7 +313,7 @@ class NativeC1Prepare {
     }
 
     py::tuple prepare(const std::string& request, uint64_t historyGeneration, uint64_t generation,
-                      size_t slot, int64_t token, bool image, I64 history) {
+                      size_t slot, int64_t token, bool image, I64 history, bool lateOnly) {
         // No Python operation occurs while the native mutex is held without
         // the GIL. Complete cannot race the transaction that creates its token.
         require(history.ndim() == 1 && history.size() <= 3, "C1 history suffix exceeds three tokens");
@@ -365,13 +365,14 @@ class NativeC1Prepare {
                     }
                 }
                 // Validate both layers before modifying either destination.
-                for (size_t layer = 0; layer < 2; ++layer)
+                const size_t firstLayer = lateOnly ? 1 : 0;
+                for (size_t layer = firstLayer; layer < 2; ++layer)
                     for (int64_t head = first_[layer]; head < last_[layer]; ++head)
                         require(hash[layer * 24 + head] >= tables_[layer]->start &&
                                 hash[layer * 24 + head] < tables_[layer]->stop, "C1 row does not belong to its TP shard");
                 struct rusage before{}, after{};
                 getrusage(RUSAGE_THREAD, &before);
-                for (size_t layer = 0; layer < 2; ++layer)
+                for (size_t layer = firstLayer; layer < 2; ++layer)
                     tables_[layer]->gather_packed(hash + layer * 24 + first_[layer],
                                                   last_[layer] - first_[layer], destinations[layer]);
                 getrusage(RUSAGE_THREAD, &after);
@@ -394,7 +395,7 @@ class NativeC1Prepare {
 
 PYBIND11_MODULE(dsv41_host_gather, m) {
     m.attr("abi_version") = 1;
-    m.attr("c1_abi_version") = 1;
+    m.attr("c1_abi_version") = 2;
     m.attr("packed_output_version") = 1;
     py::class_<HostRows, std::shared_ptr<HostRows>>(m, "HostRows")
         .def(py::init<const std::string&, uint64_t, const std::string&, uint64_t, int64_t, int64_t, size_t, bool, bool>(),
@@ -418,6 +419,8 @@ PYBIND11_MODULE(dsv41_host_gather, m) {
     py::class_<NativeC1Prepare>(m, "NativeC1Prepare")
         .def(py::init<I64, I64, I64, I64, I64, I64, int64_t,
              std::vector<std::shared_ptr<HostRows>>, std::vector<std::vector<U8>>>())
-        .def("prepare", &NativeC1Prepare::prepare)
+        .def("prepare", &NativeC1Prepare::prepare,
+             py::arg("request"), py::arg("history_generation"), py::arg("generation"), py::arg("slot"),
+             py::arg("token"), py::arg("image"), py::arg("history"), py::arg("late_only") = false)
         .def("complete", &NativeC1Prepare::complete);
 }

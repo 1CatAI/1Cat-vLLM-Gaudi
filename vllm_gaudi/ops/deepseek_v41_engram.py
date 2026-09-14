@@ -243,13 +243,13 @@ class EngramTokenHistory:
             self.pending = None
             self.generation += 1
 
-    def prepare_c1(self, request_id, token_id, image, native, transfer_generation, slot):
+    def prepare_c1(self, request_id, token_id, image, native, transfer_generation, slot, late_only=False):
         """Native hash/gather shares the ordinary history transaction owner."""
         with self.lock:
             if request_id != self.request_id or self.pending is not None:
                 raise RuntimeError("Engram request changed or its previous input is still pending")
-            compressed, hashes, faults = native.prepare(request_id, self.generation, transfer_generation, slot,
-                                                        token_id, image, self.history)
+            arguments = (request_id, self.generation, transfer_generation, slot, token_id, image, self.history)
+            compressed, hashes, faults = native.prepare(*arguments, True) if late_only else native.prepare(*arguments)
             active = np.array([not image], dtype=bool)
             for array in (compressed, hashes, active):
                 array.setflags(write=False)

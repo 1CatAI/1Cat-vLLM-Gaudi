@@ -1,9 +1,9 @@
 diff --git a/hcl/include/internal/hccl_tp2_native_graph.h b/hcl/include/internal/hccl_tp2_native_graph.h
 new file mode 100644
-index 0000000..a7101dc
+index 0000000..f96e033
 --- /dev/null
 +++ b/hcl/include/internal/hccl_tp2_native_graph.h
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,111 @@
 +#pragma once
 +
 +#include "hccl_types.h"
@@ -101,6 +101,14 @@ index 0000000..a7101dc
 +hcclResult_t hcclTp2NativeBatchReplay(hcclTp2NativeBatchHandle batch,
 +                                     const hcclTp2NativeSyncInfo* dependencies, size_t count,
 +                                     hcclTp2NativeSyncInfo* completions);
++// Cold-configure one fixed publication boundary. Segmented replay then accepts
++// exactly prefix followed by suffix; the ordinary whole-batch path remains valid.
++hcclResult_t hcclTp2NativeBatchConfigureSplit(hcclTp2NativeBatchHandle batch,
++                                             size_t prefixCount);
++hcclResult_t hcclTp2NativeBatchReplaySegmented(hcclTp2NativeBatchHandle batch,
++                                              const hcclTp2NativeSyncInfo* dependencies,
++                                              size_t count,
++                                              hcclTp2NativeSyncInfo* completions);
 +hcclResult_t hcclTp2NativeBatchDestroy(hcclTp2NativeBatchHandle batch);
 +
 +
@@ -408,7 +416,7 @@ index b3e2481..4f5e80b 100644
 +    bool     m_directNicReduction  = false;
 +};
 diff --git a/hcl/src/hccl/hccl.cpp b/hcl/src/hccl/hccl.cpp
-index cb2a6ef..c682726 100644
+index cb2a6ef..47cb476 100644
 --- a/hcl/src/hccl/hccl.cpp
 +++ b/hcl/src/hccl/hccl.cpp
 @@ -15,6 +15,7 @@
@@ -427,7 +435,7 @@ index cb2a6ef..c682726 100644
  
  #include "common/shim_types.h"       // for SHIM_API_HCCL, SHIM...
  #include "dfa_defines.hpp"           // for DfaErrorCode, DfaEr...
-@@ -36,13 +38,205 @@
+@@ -36,13 +38,231 @@
  #include "hcl_utils.h"               // for HCL_API_LOG_ENTRY
  #include "hccl_api_inc.h"            // for HCCL_* macros
  #include "internal/hccl_internal.h"  // for hcclDFA, hcclDestro...
@@ -511,13 +519,39 @@ index cb2a6ef..c682726 100644
 +        std::vector<const HclDeviceControllerGen2Arch::NativeGraphCapture*> captures;
 +        HclDeviceControllerGen2Arch::NativeBatchProgram program;
 +    };
++    using PhaseSet = std::vector<Phase>;
 +    std::vector<hcclTp2NativeGraphHandle> graphs;
-+    std::vector<Phase> phases;
++    PhaseSet phases;
++    PhaseSet prefixPhases;
++    PhaseSet suffixPhases;
 +    std::vector<hcl::NativeHclReplayState> states;
 +    std::vector<hcl::syncInfo> dependencies, completions;
++    size_t split = 0;
++    bool segmentedActive = false;
 +    bool valid = true;
 +    std::mutex mutex;
 +};
++
++static InternalHcclTp2NativeBatch::PhaseSet prepareNativeBatchPhases(
++    InternalHcclTp2NativeBatch& batch, size_t offset, size_t count)
++{
++    VERIFY(count != 0 && offset <= batch.graphs.size() && count <= batch.graphs.size() - offset,
++           "Invalid native batch phase range");
++    InternalHcclTp2NativeBatch::PhaseSet phases(64);
++    for (size_t phase = 0; phase < phases.size(); ++phase)
++    {
++        auto& prepared = phases[phase];
++        prepared.captures.reserve(count);
++        for (size_t node = 0; node < count; ++node)
++        {
++            auto graph = batch.graphs[offset + node];
++            prepared.captures.push_back(hcl::nativeHclBatchUsesWrapCapture(phase, node)
++                                           ? &graph->wrapCapture : &graph->capture);
++        }
++        prepared.program = batch.graphs.front()->routines->prepareNativeBatch(prepared.captures);
++    }
++    return phases;
++}
 +
 +static void dumpNativeCaptureDiff(
 +    const HclDeviceControllerGen2Arch::NativeGraphCapture& captured,
@@ -633,7 +667,7 @@ index cb2a6ef..c682726 100644
  // ------------------------------------------------------------------------------------------------
  // Global context singleton objects.
  //
-@@ -523,6 +717,45 @@ static void HCCL_StopShim(void)
+@@ -523,6 +743,45 @@ static void HCCL_StopShim(void)
  namespace HclGen2
  {
  
@@ -679,7 +713,7 @@ index cb2a6ef..c682726 100644
  hcclResult_t HCCL_API_CALL hcclGetVersion_impl(int* version)
  {
      HCL_API_LOG_ENTRY("(&version={:p})", (void*)version);
-@@ -723,6 +956,52 @@ hcclResult_t HCCL_API_CALL hcclAllReduce_impl(const void*     sendbuff,
+@@ -723,6 +982,52 @@ hcclResult_t HCCL_API_CALL hcclAllReduce_impl(const void*     sendbuff,
                   ->pfn_hcclAllReduce)(sendbuff, recvbuff, count, datatype, reduceOp, comm, stream_handle);
  }
  
@@ -732,7 +766,7 @@ index cb2a6ef..c682726 100644
  hcclResult_t HCCL_API_CALL hcclReduce_impl(const void*     sendbuff,
                                             void*           recvbuff,
                                             size_t          count,
-@@ -1109,3 +1388,647 @@ hcclResult_t HCCL_API_CALL hcclDeviceInit_impl(void* device, void* context)
+@@ -1109,3 +1414,694 @@ hcclResult_t HCCL_API_CALL hcclDeviceInit_impl(void* device, void* context)
  }
  
  }  // namespace HclGen2
@@ -1290,18 +1324,7 @@ index cb2a6ef..c682726 100644
 +        batch->states.resize(count);
 +        batch->dependencies.resize(count);
 +        batch->completions.resize(count);
-+        batch->phases.resize(64);
-+        for (size_t phase = 0; phase < batch->phases.size(); ++phase)
-+        {
-+            auto& prepared = batch->phases[phase];
-+            prepared.captures.reserve(count);
-+            for (size_t node = 0; node < count; ++node)
-+            {
-+                auto graph = graphs[node];
-+                prepared.captures.push_back((phase + node) % 64 == 0 ? &graph->wrapCapture : &graph->capture);
-+            }
-+            prepared.program = graphs[0]->routines->prepareNativeBatch(prepared.captures);
-+        }
++        batch->phases = prepareNativeBatchPhases(*batch, 0, count);
 +        *result = batch.release();
 +        return hcclSuccess;
 +    }
@@ -1316,50 +1339,108 @@ index cb2a6ef..c682726 100644
 +    }
 +}
 +
-+extern "C" hcclResult_t HCCL_API_CALL hcclTp2NativeBatchReplay(
-+    hcclTp2NativeBatchHandle batch, const hcclTp2NativeSyncInfo* dependencies,
-+    size_t count, hcclTp2NativeSyncInfo* completions)
++static hcclResult_t replayNativeBatchRangeLocked(
++    InternalHcclTp2NativeBatch& batch, size_t offset,
++    const InternalHcclTp2NativeBatch::PhaseSet& phases,
++    const hcclTp2NativeSyncInfo* dependencies, size_t count,
++    hcclTp2NativeSyncInfo* completions)
 +{
-+    if (!batch || !dependencies || !completions || count != batch->graphs.size()) return hcclInvalidArgument;
-+    std::lock_guard<std::mutex> lock(batch->mutex);
-+    if (!batch->valid) return hcclInvalidUsage;
++    if (!batch.valid || phases.size() != 64 || !dependencies || !completions || count == 0 ||
++        offset > batch.graphs.size() || count > batch.graphs.size() - offset) return hcclInvalidArgument;
 +    // Validate all dynamic fields before advancing counters or mutating queues.
 +    for (size_t node = 0; node < count; ++node)
 +    {
 +        if (!dependencies[node].targetValue || dependencies[node].longSoIndex % 8 != 0 ||
 +            (dependencies[node].longSoIndex >> 3) > 0xff ||
 +            dependencies[node].targetValue >= (uint64_t(1) << 60)) return hcclInvalidArgument;
-+        batch->dependencies[node] = {dependencies[node].longSoIndex, dependencies[node].targetValue};
++        batch.dependencies[offset + node] = {dependencies[node].longSoIndex, dependencies[node].targetValue};
 +    }
-+    auto first = batch->graphs.front();
++    auto first = batch.graphs.front();
 +    std::lock_guard<std::mutex> streamLock(first->routines->nativeStreamLock());
 +    const uint64_t target = first->routines->nativeCompletion().targetValue;
 +    if (first->routines->nativeCompletion().long_so_index > std::numeric_limits<uint32_t>::max() ||
 +        !target || target >= (uint64_t(1) << 60) - count) return hcclInvalidUsage;
-+    const auto& phase = batch->phases[target % batch->phases.size()];
++    const auto& phase = phases[target % phases.size()];
 +    try
 +    {
 +        for (size_t node = 0; node < count; ++node) first->communicator->incCollectiveCtr();
 +        first->routines->replayNativeBatch(phase.program, phase.captures,
-+            *first->communicator->getDynamicComm(), batch->dependencies.data(),
-+            batch->states.data(), batch->completions.data());
++            *first->communicator->getDynamicComm(), batch.dependencies.data() + offset,
++            batch.states.data() + offset, batch.completions.data() + offset);
 +        for (size_t node = 0; node < count; ++node)
 +        {
-+            auto graph = batch->graphs[node];
++            auto graph = batch.graphs[offset + node];
 +            std::lock_guard<std::mutex> graphLock(graph->mutex);
 +            ++graph->nativeReplayCount;
 +            graph->nativeWrapReplayCount += phase.captures[node] == &graph->wrapCapture;
 +            graph->replayPath = InternalHcclTp2NativeGraph::ReplayPath::Native;
-+            completions[node] = {static_cast<uint32_t>(batch->completions[node].long_so_index), batch->completions[node].targetValue};
++            const auto& completion = batch.completions[offset + node];
++            completions[node] = {static_cast<uint32_t>(completion.long_so_index), completion.targetValue};
 +        }
 +        return hcclSuccess;
 +    }
 +    catch (...)
 +    {
-+        batch->valid = false;
-+        for (auto graph : batch->graphs) graph->state = hcclTp2NativeGraphInvalid;
++        batch.valid = false;
++        for (auto graph : batch.graphs) graph->state = hcclTp2NativeGraphInvalid;
 +        return hcclInternalError;
 +    }
++}
++
++extern "C" hcclResult_t HCCL_API_CALL hcclTp2NativeBatchReplay(
++    hcclTp2NativeBatchHandle batch, const hcclTp2NativeSyncInfo* dependencies,
++    size_t count, hcclTp2NativeSyncInfo* completions)
++{
++    if (!batch || count != batch->graphs.size()) return hcclInvalidArgument;
++    std::lock_guard<std::mutex> lock(batch->mutex);
++    if (batch->segmentedActive) return hcclInvalidUsage;
++    return replayNativeBatchRangeLocked(*batch, 0, batch->phases, dependencies, count, completions);
++}
++
++extern "C" hcclResult_t HCCL_API_CALL hcclTp2NativeBatchConfigureSplit(
++    hcclTp2NativeBatchHandle batch, size_t prefixCount)
++{
++    if (!batch || prefixCount == 0 || prefixCount >= batch->graphs.size()) return hcclInvalidArgument;
++    std::lock_guard<std::mutex> lock(batch->mutex);
++    if (!batch->valid || batch->split || batch->segmentedActive) return hcclInvalidUsage;
++    try
++    {
++        batch->prefixPhases = prepareNativeBatchPhases(*batch, 0, prefixCount);
++        batch->suffixPhases = prepareNativeBatchPhases(*batch, prefixCount, batch->graphs.size() - prefixCount);
++        batch->split = prefixCount;
++        return hcclSuccess;
++    }
++    catch (...)
++    {
++        batch->prefixPhases.clear();
++        batch->suffixPhases.clear();
++        batch->split = 0;
++        return hcclInvalidUsage;
++    }
++}
++
++extern "C" hcclResult_t HCCL_API_CALL hcclTp2NativeBatchReplaySegmented(
++    hcclTp2NativeBatchHandle batch, const hcclTp2NativeSyncInfo* dependencies,
++    size_t count, hcclTp2NativeSyncInfo* completions)
++{
++    if (!batch || !dependencies || !completions) return hcclInvalidArgument;
++    std::lock_guard<std::mutex> lock(batch->mutex);
++    if (!batch->valid || !batch->split) return hcclInvalidUsage;
++    if (!batch->segmentedActive)
++    {
++        if (count == batch->graphs.size())
++            return replayNativeBatchRangeLocked(*batch, 0, batch->phases, dependencies, count, completions);
++        if (count != batch->split) return hcclInvalidArgument;
++        const hcclResult_t result = replayNativeBatchRangeLocked(
++            *batch, 0, batch->prefixPhases, dependencies, count, completions);
++        if (result == hcclSuccess) batch->segmentedActive = true;
++        return result;
++    }
++    if (count != batch->graphs.size() - batch->split) return hcclInvalidArgument;
++    const hcclResult_t result = replayNativeBatchRangeLocked(
++        *batch, batch->split, batch->suffixPhases, dependencies, count, completions);
++    if (result == hcclSuccess) batch->segmentedActive = false;
++    return result;
 +}
 +
 +extern "C" hcclResult_t HCCL_API_CALL hcclTp2NativeBatchDestroy(hcclTp2NativeBatchHandle batch)
@@ -1638,10 +1719,10 @@ index 0000000..0e27bd2
 +} // namespace hcl
 diff --git a/hcl/src/infra/scal/gen2_arch_common/native_hcl_relocation.h b/hcl/src/infra/scal/gen2_arch_common/native_hcl_relocation.h
 new file mode 100644
-index 0000000..c25e6d7
+index 0000000..57554bb
 --- /dev/null
 +++ b/hcl/src/infra/scal/gen2_arch_common/native_hcl_relocation.h
-@@ -0,0 +1,186 @@
+@@ -0,0 +1,193 @@
 +#pragma once
 +
 +#include <cstddef>
@@ -1653,6 +1734,13 @@ index 0000000..c25e6d7
 +
 +namespace hcl
 +{
++inline bool nativeHclBatchUsesWrapCapture(uint64_t currentTarget, size_t rangeNode)
++{
++    // Batch replay advances the completion target before the next range starts.
++    // A suffix uses that new target, not the original batch's graph offset.
++    return (currentTarget % 64 + rangeNode % 64) % 64 == 0;
++}
++
 +enum class NativeHclRelocationKind : uint8_t
 +{
 +    DEPENDENCY_TARGET,
@@ -3582,10 +3670,10 @@ index 9c0bb1e..3cdac6c 100644
                        numberOfSubBuffers,
 diff --git a/hcl/tests/native_hcl_relocation_test.cpp b/hcl/tests/native_hcl_relocation_test.cpp
 new file mode 100644
-index 0000000..9c69fd6
+index 0000000..84952ce
 --- /dev/null
 +++ b/hcl/tests/native_hcl_relocation_test.cpp
-@@ -0,0 +1,187 @@
+@@ -0,0 +1,206 @@
 +#include "infra/scal/gen2_arch_common/native_hcl_relocation.h"
 +
 +#include <array>
@@ -3638,6 +3726,24 @@ index 0000000..9c69fd6
 +        require((actual >> 17) == expectedChunk, "long-SO chunk mismatch");
 +        require((actual & ~0xfffe0000u) == preserved, "long-SO relocation changed unrelated bits");
 +    }
++}
++
++void testSegmentedBatchPhases()
++{
++    for (uint64_t phase = 0; phase < 64; ++phase)
++        for (size_t count = 2; count <= 128; ++count)
++            for (size_t split = 1; split < count; ++split)
++                for (size_t node = 0; node < count; ++node)
++                {
++                    const uint64_t base = 64 + phase;
++                    const bool expected = (base + node) % 64 == 0;
++                    const bool actual = node < split
++                        ? hcl::nativeHclBatchUsesWrapCapture(base, node)
++                        : hcl::nativeHclBatchUsesWrapCapture(base + split, node - split);
++                    require(actual == expected, "segmented completion-ring phase differs from whole replay");
++                }
++    require(hcl::nativeHclBatchUsesWrapCapture(64, 0), "suffix must wrap at its current completion target");
++    require(!hcl::nativeHclBatchUsesWrapCapture(64, 3), "global graph offset must not be added twice");
 +}
 +
 +void testWqeBits()
@@ -3758,6 +3864,7 @@ index 0000000..9c69fd6
 +
 +int main()
 +{
++    testSegmentedBatchPhases();
 +    testEncodedNicSobAddress();
 +    testLongSoChunks(0);
 +    testLongSoChunks((uint64_t {1} << 15) - 1);

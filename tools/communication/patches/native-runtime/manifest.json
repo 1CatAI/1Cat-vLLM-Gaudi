@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "qualification": "experimental; not production quality or performance qualified",
+  "qualification": "experimental; the V2 device-continuation bundle is end-to-end performance qualified, while production quality qualification remains open",
   "components": {
     "bridge": {
       "repository": "https://github.com/HabanaAI/gaudi-pytorch-bridge.git",
@@ -12,13 +12,13 @@
       "repository": "https://github.com/heyuanliu-intel/Intel_Gaudi3_Software.git",
       "base_commit": "6de1f66a4ab658685f23dbe007bdc9eb8fe8dbdf",
       "patch": "synapse.patch",
-      "sha256": "6ebeaebaba4d19245755ef570aaf4a85705c5b98edd5cbeb787eee9daafe1491"
+      "sha256": "eeeb7478d958920b8d8282081ef2479d170d5c188c68932a5542f1fbe796f641"
     },
     "hcl": {
       "repository": "https://github.com/HabanaAI/HCL.git",
       "base_commit": "11f9114b88038174d8b2c9ac09e2295b75455078",
       "patch": "hcl.patch",
-      "sha256": "565f0dfac904590e8f79493b320adc029c386840896333dd58a0bc80c1e3fd68"
+      "sha256": "79363f2a329e1b38d60a3ccb14a5330ae46f9db4563658516ac8236f4707dd31"
     }
   }
 }

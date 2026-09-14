@@ -37,7 +37,7 @@ def test_staging_views_preserve_all_bytes_and_capacity(heads):
 
 
 @pytest.mark.parametrize("tp_rank", [0, 1])
-@pytest.mark.parametrize("preparation", ["compat", "native", "packet"])
+@pytest.mark.parametrize("preparation", ["compat", "native", "packet", "direct"])
 @torch.inference_mode()
 def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, tp_rank, preparation):
     import habana_frameworks.torch.core  # noqa: F401
@@ -56,9 +56,15 @@ def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, tp_rank, preparati
     })
     host.history = EngramTokenHistory(host.layout, np.arange(16) % 8)
     host.tables, host.shards, host.slots = {}, {}, {}
+    host.histories, host.table_page_counts = {}, {}
     host.stream = torch.hpu.Stream()
     host.generation, host.pending, host.closed = 0, None, False
+    host.ready_ticket, host.profile_records, host.batches = None, None, None
     host.native_c1 = None
+    host.c1_abi = 2 if preparation != "compat" else None
+    host.device_c1 = host.device_rows = host.device_history = None
+    host.device_history_parity = 0
+    host.device_request = host.device_position = host.device_pending = None
     host.c1_packets = None
     host.max_tokens, host.ring_size = 6, 3
     host.audit = dict(gathers=0, major_faults=0, dma_bytes=0, generations=0)
@@ -78,8 +84,10 @@ def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, tp_rank, preparati
         tables[layer] = weights, scales
     if preparation != "compat":
         layers = host.layout.layer_ids
-        if preparation == "packet":
-            host.c1_packets = [_C1Packet([12, 12], 256, "hpu") for _ in range(3)]
+        if preparation in ("packet", "direct"):
+            first = _C1Packet([12, 12], 256, "hpu")
+            destination = first.device if preparation == "direct" else None
+            host.c1_packets = [first] + [_C1Packet([12, 12], 256, "hpu", destination=destination) for _ in range(2)]
             targets = [packet.targets for packet in host.c1_packets]
             for packet in host.c1_packets:
                 assert packet.host.is_pinned("hpu")
@@ -100,7 +108,7 @@ def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, tp_rank, preparati
                 tokens = [(step + i) % 16 for i in range(count)]
                 with torch.hpu.stream(consumer):
                     ticket = host.prepare(request, tokens, [i == 1 or step == 6 for i in range(count)])
-                    assert ticket.packet == (preparation == "packet" and count == 1)
+                    assert ticket.packet == (preparation in ("packet", "direct") and count == 1)
                     if ticket.packet:
                         packet = host.c1_packets[ticket.slot]
                         with pytest.raises(RuntimeError, match="pending"):
@@ -126,6 +134,6 @@ def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, tp_rank, preparati
         assert host.audit["gathers"] == 36
         assert host.audit["generations"] == 18
         assert host.audit.get("native_c1", 0) == (12 if preparation != "compat" else 0)
-        assert host.audit.get("c1_packets", 0) == (12 if preparation == "packet" else 0)
+        assert host.audit.get("c1_packets", 0) == (12 if preparation in ("packet", "direct") else 0)
     finally:
         host.close()

@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH: bool = False
     VLLM_HPU_DSV41_EXPERT_N256: bool = False
     VLLM_HPU_DSV41_DEFAULT_FASTPATHS: bool = False
+    VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS: bool = False
     VLLM_HPU_DSV41_EXPERT_N256_FP8: bool = False
     VLLM_HPU_DSV41_EXPERT_FUSED_QUANT: bool = False
     VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE: bool = False
@@ -56,6 +57,11 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_ENGRAM_C1_PACKET: bool = False
     VLLM_HPU_DSV41_TP_MHC_OVERLAP: bool = False
     VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH: bool = False
+    VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT: bool = False
+    VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT: bool = False
+    VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX: bool = False
+    VLLM_HPU_DSV41_V2_DEVICE_ENGRAM: bool = False
+    VLLM_HPU_DSV41_V2: bool = False
     VLLM_HPU_DSV41_NATIVE_INPUT_PREFLIGHT: bool = False
     VLLM_HPU_DSV41_DIRECT_TOKEN_IDS: bool = False
     VLLM_HPU_DSV41_DEVICE_COMMIT: bool = False
@@ -334,6 +340,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # V4.1 is a separate opt-in contract; none of the V4 defaults enable it.
     "VLLM_HPU_DSV41_DEFAULT_FASTPATHS":
     lambda: os.environ.get("VLLM_HPU_DSV41_DEFAULT_FASTPATHS", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS":
+    lambda: os.environ.get("VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_EXPERT_N256":
     lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_N256", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_EXPERT_N256_FP8":
@@ -396,6 +404,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_TP_MHC_OVERLAP", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH":
     lambda: os.environ.get("VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT":
+    lambda: os.environ.get("VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT":
+    lambda: os.environ.get("VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX":
+    lambda: os.environ.get("VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_V2_DEVICE_ENGRAM":
+    lambda: os.environ.get("VLLM_HPU_DSV41_V2_DEVICE_ENGRAM", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_V2":
+    lambda: os.environ.get("VLLM_HPU_DSV41_V2", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_NATIVE_INPUT_PREFLIGHT":
     lambda: os.environ.get("VLLM_HPU_DSV41_NATIVE_INPUT_PREFLIGHT", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_DIRECT_TOKEN_IDS":

@@ -317,7 +317,7 @@ def analyze(root, rank, common):
     first_index = {}
     with gzip.open(path / "hardware.jsonl.gz", "rt") as stream:
         for line in stream:
-            start, duration, lane, index = json.loads(line)
+            start, duration, lane, index = json.loads(line)[:4]
             win = bisect.bisect_right(ends, start)
             if win >= len(windows):
                 continue

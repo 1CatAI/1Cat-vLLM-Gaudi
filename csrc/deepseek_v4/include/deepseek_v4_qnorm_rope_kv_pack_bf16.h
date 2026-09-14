@@ -105,8 +105,11 @@ float64 dsv4_qkv_apply_pairwise_rope_f32(
         values, imag_directions, 0, 0.0f);
     const float64 cos_values = v_f32_shuffle_b(
         cos_groups, cos_directions, 0, 0.0f);
-    const float64 sin_values = v_f32_shuffle_b(
+    float64 sin_values = v_f32_shuffle_b(
         sin_groups, sin_directions, 0, 0.0f);
+#ifdef DSV4_ROPE_INVERSE
+    sin_values = -sin_values;
+#endif
 #ifdef DSV4_ROPE_SECOND_TERM_FMA
     // V4.1's compiled tensor reference rounds the first product, then fuses
     // the second multiply with the add/subtract. Keep V4's default unchanged.

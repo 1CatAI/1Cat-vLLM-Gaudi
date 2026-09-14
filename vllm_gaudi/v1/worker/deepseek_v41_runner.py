@@ -154,11 +154,12 @@ def _decode_exchange_pre(wire, pre):
 
 class PPBuffers:
 
-    def __init__(self, device, capacity=6, *, dspark=True):
+    def __init__(self, device, capacity=6, *, dspark=True, device_commit=None):
         self.group = get_pp_group()
         self.dspark = bool(dspark)
         if not self.dspark:
-            self.device_commit_enabled = envs.VLLM_HPU_DSV41_DEVICE_COMMIT
+            self.device_commit_enabled = (envs.VLLM_HPU_DSV41_DEVICE_COMMIT
+                                          if device_commit is None else bool(device_commit))
             self.device_commit = self.device_commit_enabled
             if (self.device_commit_enabled and not envs.VLLM_HPU_DSV41_GRAPH_REPLAY):
                 raise ValueError("Device completion requires ordinary V4.1 native decode")
@@ -651,6 +652,7 @@ class PPBuffers:
 
 class V41ModelRunner:
     _PAD_BLOCK_ID, _PAD_SLOT_ID = 0, 0
+    v2_completion = False
 
     def __init__(self, vllm_config, is_driver_worker=False):
         del is_driver_worker
@@ -671,7 +673,9 @@ class V41ModelRunner:
         self.profiler = HabanaHighLevelProfiler()
         self.model_memory_usage = self.mem_margin = 0
         self.serving_workspace_reserve = (3 << 30) if self.model_config.max_model_len > 512 else 0
-        self.pp = PPBuffers(self.device, dspark=self.use_dspark)
+        self.pp = PPBuffers(self.device,
+                            dspark=self.use_dspark,
+                            device_commit=False if self.v2_completion else None)
         self.input_ids = torch.empty(6, dtype=torch.int64, device=self.device)
         self.positions = torch.empty(6, dtype=torch.int32, device=self.device)
         self.input_views = {count: self.input_ids[:count] for count in range(1, 7)}
@@ -781,7 +785,8 @@ class V41ModelRunner:
         elif envs.VLLM_HPU_DSV41_DEVICE_VERIFY and envs.VLLM_HPU_DSV41_DSPARK:
             self.verify_ring = VerifyRing(self.device, last_rank=False)
         elif self.pp.group.is_last_rank:
-            self.sample_target = torch.compile(self.model.program.sample_greedy,
+            sampler = self.model.program.sample_greedy_token if self.v2_completion else self.model.program.sample_greedy
+            self.sample_target = torch.compile(sampler,
                                                backend="hpu_backend",
                                                fullgraph=True,
                                                dynamic=False)
@@ -1286,19 +1291,24 @@ class V41ModelRunner:
                 async_result = result
             elif result is not None:
                 outputs.extend(result.sampled_token_ids)
-                execution_rounds.extend(result.execution_rounds or [])
+                execution_rounds.extend(getattr(result, "execution_rounds", None) or ())
                 if self.draft_token_ids is not None:
                     drafts.extend(self.draft_token_ids.draft_token_ids)
         if async_result is None and self.pp.group.is_last_rank:
             self.draft_token_ids = DraftTokenIds(ids, drafts)
-        self.batch_result = async_result if async_result is not None else (
-            ModelRunnerOutput(req_ids=ids,
-                              req_id_to_index={
-                                  key: index
-                                  for index, key in enumerate(ids)
-                              },
-                              sampled_token_ids=outputs,
-                              execution_rounds=execution_rounds or None) if self.pp.group.is_last_rank else None)
+        if async_result is not None:
+            self.batch_result = async_result
+        elif self.pp.group.is_last_rank:
+            self.batch_result = ModelRunnerOutput(req_ids=ids,
+                                                  req_id_to_index={
+                                                      key: index
+                                                      for index, key in enumerate(ids)
+                                                  },
+                                                  sampled_token_ids=outputs)
+            if execution_rounds:
+                self.batch_result.execution_rounds = execution_rounds
+        else:
+            self.batch_result = None
         self.pending = "batch_ready"
         return None
 
@@ -1341,7 +1351,7 @@ class V41ModelRunner:
                     sample_input = self.sample_target_commit(hidden[-1:], self.pp.commit)
                 else:
                     sample_input = self.sample_target(hidden[-1:])
-                if self.model.native and not (decode and self.pp.device_commit_enabled):
+                if self.model.native and not (decode and (self.pp.device_commit_enabled or self.v2_completion)):
                     from vllm_gaudi.distributed.tp2_fused_ar_norm import _resolve_runtime
                     bridge, _, _ = _resolve_runtime()
                     self._token_copy = bridge.copy_sampled_tokens_to_host(sample_input)

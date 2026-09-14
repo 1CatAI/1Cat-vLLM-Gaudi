@@ -2553,10 +2553,10 @@ index fc94c65..850dc1a 100644
  
  #endif /*_SYN_SYN_SINGLETON_INTERFACE_H_*/
 diff --git a/synapse/include/synapse_api.h b/synapse/include/synapse_api.h
-index f765083..43574b7 100644
+index f765083..a2bd601 100644
 --- a/synapse/include/synapse_api.h
 +++ b/synapse/include/synapse_api.h
-@@ -114,6 +114,40 @@ synStatus SYN_API_CALL synStreamSynchronize( const synStreamHandle streamHandle
+@@ -114,6 +114,56 @@ synStatus SYN_API_CALL synStreamSynchronize( const synStreamHandle streamHandle
   */
  synStatus SYN_API_CALL synStreamQuery( const synStreamHandle streamHandle );
  
@@ -2591,13 +2591,29 @@ index f765083..43574b7 100644
 +synStatus SYN_API_CALL synNativeComputeGraphPreparePlanV2(synNativeComputeGraphHandle graphHandle,
 +    const uint32_t* producerSegments, const uint32_t* consumerSegments, uint64_t count, uint32_t nicLongSoIndex,
 +    synNativeGraphExchangeReplay exchangeReplay, void* context);
++// Preserve one captured graph while publishing an early compute/NIC prefix and
++// its dependent suffix in two ordered calls. The split counts NIC operations.
++synStatus SYN_API_CALL synNativeComputeGraphPrepareSegmentedPlanV2(
++    synNativeComputeGraphHandle graphHandle, const uint32_t* producerSegments,
++    const uint32_t* consumerSegments, uint64_t count, uint64_t prefixCollectives,
++    uint32_t nicLongSoIndex, synNativeGraphExchangeReplay exchangeReplay, void* context);
++// V3 separates the compute boundary from NIC consumers. The caller verifies
++// that prefixComputes excludes every recipe reading a late input binding.
++synStatus SYN_API_CALL synNativeComputeGraphPrepareSegmentedPlanV3(
++    synNativeComputeGraphHandle graphHandle, const uint32_t* producerSegments,
++    const uint32_t* consumerSegments, uint64_t count, uint64_t prefixCollectives,
++    uint32_t prefixComputes, uint32_t nicLongSoIndex, synNativeGraphExchangeReplay exchangeReplay, void* context);
 +synStatus SYN_API_CALL synNativeComputeGraphReplayPlan(synNativeComputeGraphHandle graphHandle,
++    synNativeGraphSyncInfo* completion, uint64_t* statistics, uint64_t statisticsCount);
++synStatus SYN_API_CALL synNativeComputeGraphReplayPlanPrefix(synNativeComputeGraphHandle graphHandle,
++    synNativeGraphSyncInfo* completion, uint64_t* statistics, uint64_t statisticsCount);
++synStatus SYN_API_CALL synNativeComputeGraphReplayPlanFinish(synNativeComputeGraphHandle graphHandle,
 +    synNativeGraphSyncInfo* completion, uint64_t* statistics, uint64_t statisticsCount);
 +
  //!
  /*!
   ***************************************************************************************************
-@@ -1351,6 +1385,12 @@ synStatus SYN_API_CALL synNodeSetDeterministic( const synGraphHandle   graphHand
+@@ -1351,6 +1401,12 @@ synStatus SYN_API_CALL synNodeSetDeterministic( const synGraphHandle   graphHand
                                                  const synNodeId        nodeId,
                                                  const bool             useDeterministic);
  
@@ -2610,7 +2626,7 @@ index f765083..43574b7 100644
  //!
  /*!
   ***************************************************************************************************
-@@ -2315,6 +2355,13 @@ synStatus SYN_API_CALL synTensorSetQuantizationData(synTensor               tens
+@@ -2315,6 +2371,13 @@ synStatus SYN_API_CALL synTensorSetQuantizationData(synTensor               tens
  synStatus SYN_API_CALL synTensorSetExternal(synTensor               tensor,
                                              bool                    isExternal);
  
@@ -2624,7 +2640,7 @@ index f765083..43574b7 100644
  //!
  /*!
   ***************************************************************************************************
-@@ -2627,6 +2674,8 @@ synStatus SYN_API_CALL synTensorGetGeometryExt(const synTensor         tensor,
+@@ -2627,6 +2690,8 @@ synStatus SYN_API_CALL synTensorGetGeometryExt(const synTensor         tensor,
  synStatus SYN_API_CALL synTensorGetExternal(const synTensor         tensor,
                                              bool*                   isExternal);
  
@@ -2633,7 +2649,7 @@ index f765083..43574b7 100644
  //!
  /*!
   ***************************************************************************************************
-@@ -2896,6 +2945,19 @@ synStatus SYN_API_CALL synNodeGetUserParams( const synGraphHandle   graphHandle,
+@@ -2896,6 +2961,19 @@ synStatus SYN_API_CALL synNodeGetUserParams( const synGraphHandle   graphHandle,
   */
  synStatus SYN_API_CALL synStatusGetBriefDescription(synStatus status, char* statusDescription, size_t len);
  
@@ -3682,6 +3698,117 @@ index 58d6357..8f655d6 100644
      {
          for (const TensorPtr& t : g.getTensors())
          {
+diff --git a/synapse/src/graph_compiler/passes/sram_management/pipeline_management/pipeline_bundlizer.cpp b/synapse/src/graph_compiler/passes/sram_management/pipeline_management/pipeline_bundlizer.cpp
+index 90f1286..e613e9b 100644
+--- a/synapse/src/graph_compiler/passes/sram_management/pipeline_management/pipeline_bundlizer.cpp
++++ b/synapse/src/graph_compiler/passes/sram_management/pipeline_management/pipeline_bundlizer.cpp
+@@ -1386,6 +1386,21 @@ bool MantaRayBundlizer::canBundleSharedInputMmeNode(const MMENodePtr& candidate,
+                                                     const MMENodeSet& committedCandidates,
+                                                     const TensorPtr&  sharedInput)
+ {
++    // Each output window of this compound operator has a decoded full-K
++    // producer. Sharing its small activation across MMEs may leave one of
++    // those producers outside the SRAM bundle. Use the single-MME producer
++    // bundler for these windows; other operators keep normal shared-input
++    // bundling. No reduction dimension or arithmetic is changed.
++    if (candidate->getNumInputs() > 1)
++    {
++        const NodePtr producer = m_graph.getTensorProducer(candidate->getInput(1));
++        constexpr const char* prefix = "custom_deepseek_v41_mxfp4_n512_dequant";
++        if (producer && producer->getGUID().compare(0, std::char_traits<char>::length(prefix), prefix) == 0)
++        {
++            LOG_DEBUG(SRAM_SLICE, "Use independent SRAM producer bundle for {}", candidate->getNodeName());
++            return false;
++        }
++    }
+     // Check if the candidate node has ancestors in the candidates group
+     // Check against the full candidates group as this relation is asymmetric -
+     // no risk of loosing both nodes while we could keep one
+diff --git a/synapse/src/graph_compiler/passes/tpc_fuser.cpp b/synapse/src/graph_compiler/passes/tpc_fuser.cpp
+index c2a3037..5f5721d 100644
+--- a/synapse/src/graph_compiler/passes/tpc_fuser.cpp
++++ b/synapse/src/graph_compiler/passes/tpc_fuser.cpp
+@@ -24,6 +24,7 @@
+ #include <lemon/list_graph.h>
+ #include <lemon/unionfind.h>
+ 
++#include <atomic>
+ #include <memory>
+ #include <mutex>
+ #include <string.h>
+@@ -2413,13 +2414,14 @@ optimizedGraphStatus tryNodesReplacementInGraph(HabanaGraph&
+                                                 const std::pair<NodePtr, NodeList>&       fusedNodeOrigNodePair,
+                                                 std::map<NodePtr, std::vector<unsigned>>& newNodesPerFusedNode,
+                                                 std::map<unsigned, NodePtr>&              newNodeIdMap,
++                                                NodeList&                                 nodesToAdd,
++                                                std::unordered_set<NodePtr>&              totalOriginalNodesSet,
+                                                 bool                                      isNeedToReplaceNodes = true,
+                                                 bool                                      isPartOfSubgraph     = false)
+ {
+     // Replace received nodes from fuser with their original nodes in the graph
+     // If the node belongs to subgraph send all subgraph nodes and then originals to the same call of replaceNodes
+ 
+-    static NodeList nodesToAdd;
+     const NodePtr&  fusedNode     = fusedNodeOrigNodePair.first;
+     NodeList        originalNodes = fusedNodeOrigNodePair.second;
+ 
+@@ -2461,7 +2463,6 @@ optimizedGraphStatus tryNodesReplacementInGraph(HabanaGraph&
+     if (isPartOfSubgraph)
+     {
+         // The node is part of subgraph, add it all original nodes to the total original nodes in this subgraph
+-        static std::unordered_set<NodePtr> totalOriginalNodesSet;
+         totalOriginalNodesSet.insert(originalNodes.begin(), originalNodes.end());
+ 
+         if (isNeedToReplaceNodes)
+@@ -2496,11 +2497,15 @@ optimizedGraphStatus tryNodesReplacementInGraph(HabanaGraph&
+ //     If false value returned to the caller - GC graph remains unmodified
+ optimizedGraphStatus replaceOptimizedCluster(HabanaGraph& graph, const std::shared_ptr<GCTPCFuserWrapper>& fuser)
+ {
+-    static int fusedClustersCounter = -1;
+-    int        fusedNodesCounter    = 0;
+-    int        newNodesCounter      = 0;
++    static std::atomic<int> nextClusterId {0};
++    const int fusedClustersCounter = nextClusterId.fetch_add(1, std::memory_order_relaxed);
++    int       fusedNodesCounter    = 0;
++    int       newNodesCounter      = 0;
+ 
+-    fusedClustersCounter++;
++    // Pending replacements belong to this cluster, including early failure paths.
++    // Concurrent graph compilations must never exchange node ownership.
++    NodeList                    nodesToAdd;
++    std::unordered_set<NodePtr> totalOriginalNodesSet;
+ 
+     LOG_DEBUG(GC_TPC_FUSER, "tpcFuser: fusing nodes of subgraph (cluster) {}.", fusedClustersCounter);
+ 
+@@ -2756,6 +2761,8 @@ optimizedGraphStatus replaceOptimizedCluster(HabanaGraph& graph, const std::shar
+                                                             fusedNodeOrigNodesPair,
+                                                             newNodesPerFusedNode,
+                                                             newNodeIdMap,
++                                                            nodesToAdd,
++                                                            totalOriginalNodesSet,
+                                                             isLastNodeInSubgraph,
+                                                             true);
+                         if (status != optimizedGraphSuccess) return status;
+@@ -2774,7 +2781,8 @@ optimizedGraphStatus replaceOptimizedCluster(HabanaGraph& graph, const std::shar
+                           fusedNode->getId());
+ 
+                 // this node is not part of subgraph
+-                status = tryNodesReplacementInGraph(graph, pair, newNodesPerFusedNode, newNodeIdMap, true);
++                status = tryNodesReplacementInGraph(
++                    graph, pair, newNodesPerFusedNode, newNodeIdMap, nodesToAdd, totalOriginalNodesSet, true);
+                 if (status != optimizedGraphSuccess) return status;
+             }
+         }
+@@ -2788,7 +2796,8 @@ optimizedGraphStatus replaceOptimizedCluster(HabanaGraph& graph, const std::shar
+                       fusedNode->getId());
+ 
+             // this node is not part of subgraph
+-            status = tryNodesReplacementInGraph(graph, pair, newNodesPerFusedNode, newNodeIdMap, true);
++            status = tryNodesReplacementInGraph(
++                    graph, pair, newNodesPerFusedNode, newNodeIdMap, nodesToAdd, totalOriginalNodesSet, true);
+             if (status != optimizedGraphSuccess) return status;
+         }
+     }
 diff --git a/synapse/src/graph_compiler/scheduler.cpp b/synapse/src/graph_compiler/scheduler.cpp
 index 3dfaea6..3079eb3 100644
 --- a/synapse/src/graph_compiler/scheduler.cpp
@@ -5668,7 +5795,7 @@ index a0a841f..fcc8bfc 100644
 \ No newline at end of file
 +};
 diff --git a/synapse/src/runtime/scal/common/entities/scal_stream_base.cpp b/synapse/src/runtime/scal/common/entities/scal_stream_base.cpp
-index 3229db9..91cb7ae 100644
+index 3229db9..726fb0e 100644
 --- a/synapse/src/runtime/scal/common/entities/scal_stream_base.cpp
 +++ b/synapse/src/runtime/scal/common/entities/scal_stream_base.cpp
 @@ -6,6 +6,8 @@
@@ -5680,7 +5807,7 @@ index 3229db9..91cb7ae 100644
  #define LOG_SCALSTRM_TRACE(msg, ...)                                                                                   \
      LOG_TRACE(SYN_STREAM, "stream {}:" msg, m_name, ##__VA_ARGS__)
  #define LOG_SCALSTRM_DEBUG(msg, ...)                                                                                   \
-@@ -67,6 +69,177 @@ ScalStreamBase::~ScalStreamBase()
+@@ -67,6 +69,179 @@ ScalStreamBase::~ScalStreamBase()
      releaseResources();
  }
  
@@ -5800,7 +5927,9 @@ index 3229db9..91cb7ae 100644
 +                ++submissions;
 +            }
 +    }
-+    getMonitor()->nativeArmCompleted(completions[program.producerOffsets.size() - 1].targetValue);
++    const size_t lastWait = program.lastWaitDependency();
++    if (lastWait != std::numeric_limits<size_t>::max())
++        getMonitor()->nativeArmCompleted(completions[lastWait].targetValue);
 +    m_prevCmdIsWait = false;
 +    m_consecutiveWaitCommands = 0;
 +    return synSuccess;
@@ -5858,7 +5987,7 @@ index 3229db9..91cb7ae 100644
  /*
   ***************************************************************************************************
   *   @brief init() init the stream. If fails, release all resources.
-@@ -490,6 +663,23 @@ synStatus ScalStreamBase::doneChunkOfCommands(bool isUserReq, ScalLongSyncObject
+@@ -490,6 +665,23 @@ synStatus ScalStreamBase::doneChunkOfCommands(bool isUserReq, ScalLongSyncObject
      rLongSo = getIncrementedLongSo(isUserReq);
      getStreamCyclicBuffer()->doneChunkOfCommands(rLongSo);
  
@@ -5882,7 +6011,7 @@ index 3229db9..91cb7ae 100644
      return synSuccess;
  }
  
-@@ -587,4 +777,4 @@ uint8_t ScalStreamCopyBase::getContextId(enum PdmaDirCtx dir, ResourceStreamType
+@@ -587,4 +779,4 @@ uint8_t ScalStreamCopyBase::getContextId(enum PdmaDirCtx dir, ResourceStreamType
      return (((((uint8_t)dir) & ContextEncoding::DIR_MASK) << ContextEncoding::DIR_OFFSET) |
              ((((uint8_t)type) & ContextEncoding::TYPE_MASK) << ContextEncoding::TYPE_OFFSET) |
              ((((uint8_t)index) & ContextEncoding::STREAM_MASK) << ContextEncoding::STREAM_OFFSET));
@@ -6021,10 +6150,10 @@ index 387a2ee..c562c4e 100644
 +}
 diff --git a/synapse/src/runtime/scal/common/native_compute_graph.hpp b/synapse/src/runtime/scal/common/native_compute_graph.hpp
 new file mode 100644
-index 0000000..1e638ca
+index 0000000..965717c
 --- /dev/null
 +++ b/synapse/src/runtime/scal/common/native_compute_graph.hpp
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,121 @@
 +#pragma once
 +
 +#include "runtime/scal/common/entities/scal_stream_base.hpp"
@@ -6088,7 +6217,13 @@ index 0000000..1e638ca
 +    synStatus close();
 +    synStatus preparePlan(const uint32_t* consumerSegments, uint64_t count, uint32_t nicLongSoIndex,
 +                          synNativeGraphExchangeReplay callback, void* context, const uint32_t* producers = nullptr);
++    synStatus prepareSegmentedPlan(const uint32_t* producerSegments, const uint32_t* consumerSegments,
++                                   uint64_t count, uint64_t prefixCollectives, uint32_t prefixComputes,
++                                   uint32_t nicLongSoIndex,
++                                   synNativeGraphExchangeReplay callback, void* context);
 +    synStatus replayPlan(synNativeGraphSyncInfo& completion, uint64_t* statistics, uint64_t count);
++    synStatus replayPlanPrefix(synNativeGraphSyncInfo& completion, uint64_t* statistics, uint64_t count);
++    synStatus replayPlanFinish(synNativeGraphSyncInfo& completion, uint64_t* statistics, uint64_t count);
 +
 +    CompiledSegment* addPendingSegment(uint64_t                      globalSize,
 +                                       uint64_t                      arcSize,
@@ -6113,12 +6248,17 @@ index 0000000..1e638ca
 +    struct JointPlan
 +    {
 +        NativeComputeProgram program;
++        NativeComputeProgram prefixProgram;
++        NativeComputeProgram suffixProgram;
 +        uint32_t nicLongSoIndex = 0;
 +        synNativeGraphExchangeReplay callback = nullptr;
 +        void* context = nullptr;
 +        std::vector<synNativeGraphSyncInfo> producers, completions;
 +        std::vector<CommandSubmissionData> submissionScratch;
 +        std::array<uint64_t, 12> statistics {};
++        size_t collectiveSplit = 0;
++        size_t suffixDependencyBegin = 0;
++        ScalLongSyncObject segmentedBase = LongSoEmpty;
 +    };
 +    std::unique_ptr<JointPlan> m_jointPlan;
 +    ScalStreamComputeInterface& m_stream;
@@ -6137,10 +6277,10 @@ index 0000000..1e638ca
 +};
 diff --git a/synapse/src/runtime/scal/common/native_compute_graph_handle.hpp b/synapse/src/runtime/scal/common/native_compute_graph_handle.hpp
 new file mode 100644
-index 0000000..2e1f4ad
+index 0000000..f3999d2
 --- /dev/null
 +++ b/synapse/src/runtime/scal/common/native_compute_graph_handle.hpp
-@@ -0,0 +1,24 @@
+@@ -0,0 +1,26 @@
 +#pragma once
 +
 +#include "runtime/scal/common/native_compute_graph.hpp"
@@ -6160,6 +6300,8 @@ index 0000000..2e1f4ad
 +    std::unique_ptr<NativeComputeGraph> graph;
 +    SlotMapItemSptr<Stream>              stream;
 +    std::unique_ptr<StreamJob>           preparedReplayJob;
++    std::unique_ptr<StreamJob>           preparedPrefixReplayJob;
++    std::unique_ptr<StreamJob>           preparedFinishReplayJob;
 +    std::mutex                          replayMutex;
 +    synNativeGraphSyncInfo*              replayCompletion = nullptr;
 +    uint64_t*                           replayStatistics = nullptr;
@@ -6167,10 +6309,10 @@ index 0000000..2e1f4ad
 +};
 diff --git a/synapse/src/runtime/scal/common/native_compute_program.hpp b/synapse/src/runtime/scal/common/native_compute_program.hpp
 new file mode 100644
-index 0000000..334705e
+index 0000000..4f0a13c
 --- /dev/null
 +++ b/synapse/src/runtime/scal/common/native_compute_program.hpp
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,326 @@
 +#pragma once
 +
 +#include <algorithm>
@@ -6178,6 +6320,7 @@ index 0000000..334705e
 +#include <cstring>
 +#include <limits>
 +#include <stdexcept>
++#include <utility>
 +#include <vector>
 +
 +struct NativeScalCommand
@@ -6216,6 +6359,7 @@ index 0000000..334705e
 +    std::vector<uint8_t> bytes;
 +    std::vector<NativeComputePatch> patches;
 +    uint64_t completionOffset = 0;
++    uint64_t sourcePacketCount = 0;
 +    bool endsCompletion = false;
 +};
 +
@@ -6223,6 +6367,30 @@ index 0000000..334705e
 +// Runtime publishes pages, never revisits recipe/segment descriptions.
 +struct NativeComputeProgram
 +{
++    enum class ContinuationInput { Invalid, Ready, NeedsFence };
++
++    static uint64_t continuationProducerOffset(uint64_t fullOffset, uint64_t prefixDelta)
++    {
++        return fullOffset > prefixDelta ? fullOffset - prefixDelta : 0;
++    }
++
++    static bool producerAvailableToPrefix(uint32_t producerSegment, uint32_t prefixComputes)
++    {
++        return producerSegment == UINT32_MAX || producerSegment < prefixComputes;
++    }
++
++    static ContinuationInput continuationInput(uint32_t expectedIndex, uint64_t expectedTarget,
++                                               uint32_t currentIndex, uint64_t currentTarget,
++                                               bool pendingWait)
++    {
++        if (!expectedTarget || currentIndex != expectedIndex || currentTarget < expectedTarget ||
++            currentTarget >= (uint64_t(1) << 60))
++            return ContinuationInput::Invalid;
++        // Completed Bridge events need no wait. SCAL may also have emitted a
++        // completion barrier while queuing waits at a CCB chunk boundary.
++        return pendingWait ? ContinuationInput::NeedsFence : ContinuationInput::Ready;
++    }
++
 +    std::vector<NativeComputePage> pages;
 +    std::vector<uint64_t> producerOffsets;
 +    uint64_t completionDelta = 0;
@@ -6230,6 +6398,10 @@ index 0000000..334705e
 +    uint64_t maximumPendingBytes = 0;
 +    uint64_t sourcePacketCount = 0;
 +    bool externalInputCompletion = false;
++    std::vector<size_t> segmentPageEnds;
++    std::vector<size_t> segmentPageByteEnds;
++    std::vector<uint64_t> segmentPagePacketEnds;
++    std::vector<uint64_t> segmentCompletionOffsets;
 +
 +    bool canReplayAt(uint64_t base) const
 +    {
@@ -6238,6 +6410,13 @@ index 0000000..334705e
 +        const uint64_t margin = externalInputCompletion ? 2 : 1;
 +        return completionDelta < (uint64_t(1) << 60) - margin &&
 +               base < (uint64_t(1) << 60) - completionDelta - margin;
++    }
++
++    size_t lastWaitDependency() const
++    {
++        for (auto page = pages.rbegin(); page != pages.rend(); ++page)
++            if (!page->patches.empty()) return page->patches.back().dependency;
++        return std::numeric_limits<size_t>::max();
 +    }
 +
 +    static NativeComputeProgram prepare(
@@ -6290,6 +6469,7 @@ index 0000000..334705e
 +                page.completionOffset = ++plan.completionDelta;
 +            }
 +            plan.byteCount += bytes.size();
++            ++page.sourcePacketCount;
 +            ++plan.sourcePacketCount;
 +        };
 +        size_t nextConsumer = 0;
@@ -6318,6 +6498,10 @@ index 0000000..334705e
 +            plan.completionDelta += source->completionIncrementsBeforeCommands;
 +            for (const auto& command : source->commands) append(command.bytes, {}, 0, command.completesChunk);
 +            segmentEnds[segment] = plan.completionDelta;
++            plan.segmentPageEnds.push_back(plan.pages.size());
++            plan.segmentPageByteEnds.push_back(plan.pages.back().bytes.size());
++            plan.segmentPagePacketEnds.push_back(plan.pages.back().sourcePacketCount);
++            plan.segmentCompletionOffsets.push_back(plan.completionDelta);
 +        }
 +        if (nextConsumer != consumers.size() || (!plan.pages.back().endsCompletion && !deferredTerminalRetirement) ||
 +            !plan.completionDelta || plan.completionDelta >= (uint64_t(1) << 60) - 1)
@@ -6340,6 +6524,105 @@ index 0000000..334705e
 +        if (plan.maximumPendingBytes > availableBytes)
 +            throw std::invalid_argument("Native compute job exceeds safe CCB publication capacity");
 +        return plan;
++    }
++
++    std::pair<NativeComputeProgram, NativeComputeProgram> split(
++        size_t prefixPageCount, size_t prefixPageBytes, uint64_t prefixPagePackets,
++        uint64_t prefixCompletionDelta,
++        size_t collectiveSplit, size_t& suffixDependencyBegin) const
++    {
++        if (!prefixPageCount || prefixPageCount >= pages.size() || !prefixCompletionDelta ||
++            prefixCompletionDelta >= completionDelta || !collectiveSplit ||
++            collectiveSplit >= producerOffsets.size() || !prefixPageBytes ||
++            prefixPageBytes > pages[prefixPageCount - 1].bytes.size() ||
++            prefixPagePackets > pages[prefixPageCount - 1].sourcePacketCount)
++            throw std::invalid_argument("Invalid native compute publication split");
++
++        NativeComputeProgram prefix, suffix;
++        prefix.pages.assign(pages.begin(), pages.begin() + prefixPageCount);
++        suffix.pages.assign(pages.begin() + prefixPageCount, pages.end());
++        const auto& shared = pages[prefixPageCount - 1];
++        if (prefixPageBytes < shared.bytes.size())
++        {
++            NativeComputePage suffixHead = shared;
++            std::vector<NativeComputePatch> prefixPatches, suffixPatches;
++            for (auto patch : shared.patches)
++            {
++                if (patch.byteOffset + sizeof(uint32_t) <= prefixPageBytes)
++                    prefixPatches.push_back(patch);
++                else if (patch.byteOffset >= prefixPageBytes)
++                {
++                    patch.byteOffset -= prefixPageBytes;
++                    suffixPatches.push_back(patch);
++                }
++                else
++                    throw std::invalid_argument("Native relocation crosses the publication split");
++            }
++            auto& prefixTail = prefix.pages.back();
++            prefixTail.bytes.resize(prefixPageBytes);
++            prefixTail.patches = std::move(prefixPatches);
++            prefixTail.sourcePacketCount = prefixPagePackets;
++            prefixTail.endsCompletion = false;
++            suffixHead.bytes.erase(suffixHead.bytes.begin(), suffixHead.bytes.begin() + prefixPageBytes);
++            suffixHead.patches = std::move(suffixPatches);
++            suffixHead.sourcePacketCount -= prefixPagePackets;
++            if (suffixHead.bytes.empty() || !suffixHead.sourcePacketCount)
++                throw std::invalid_argument("Native suffix has an empty split page");
++            suffix.pages.insert(suffix.pages.begin(), std::move(suffixHead));
++        }
++        const auto& prefixTail = prefix.pages.back();
++        if ((!prefixTail.endsCompletion && prefixTail.completionOffset != prefixCompletionDelta + 1) ||
++            (prefixTail.endsCompletion && prefixTail.completionOffset != prefixCompletionDelta))
++            throw std::invalid_argument("Native prefix tail has no bounded retirement completion");
++        prefix.producerOffsets.assign(producerOffsets.begin(), producerOffsets.begin() + collectiveSplit);
++        prefix.completionDelta = prefixCompletionDelta;
++        prefix.externalInputCompletion = externalInputCompletion;
++
++        suffixDependencyBegin = producerOffsets.size();
++        for (const auto& page : prefix.pages)
++            for (const auto& patch : page.patches)
++                if (patch.dependency >= collectiveSplit)
++                    throw std::invalid_argument("Native prefix waits on a suffix collective");
++        for (const auto& page : suffix.pages)
++            for (const auto& patch : page.patches)
++                suffixDependencyBegin = std::min(suffixDependencyBegin, size_t(patch.dependency));
++        if (suffixDependencyBegin > collectiveSplit || suffixDependencyBegin >= producerOffsets.size())
++            throw std::invalid_argument("Native suffix lacks its boundary collective dependency");
++        suffix.producerOffsets.assign(producerOffsets.begin() + suffixDependencyBegin, producerOffsets.end());
++        suffix.completionDelta = completionDelta - prefixCompletionDelta;
++        suffix.externalInputCompletion = false;
++        for (auto& page : suffix.pages)
++        {
++            if (page.completionOffset <= prefixCompletionDelta)
++                throw std::invalid_argument("Native suffix page retires before its split");
++            page.completionOffset -= prefixCompletionDelta;
++            for (auto& patch : page.patches)
++            {
++                if (patch.dependency < suffixDependencyBegin)
++                    throw std::invalid_argument("Native suffix dependency precedes retained boundary");
++                patch.dependency -= suffixDependencyBegin;
++            }
++        }
++        auto summarize = [](NativeComputeProgram& program) {
++            program.byteCount = 0;
++            program.sourcePacketCount = 0;
++            uint64_t nextCompletion = program.completionDelta + 1, pending = 0;
++            for (auto& page : program.pages)
++            {
++                program.byteCount += page.bytes.size();
++                program.sourcePacketCount += page.sourcePacketCount;
++            }
++            for (auto it = program.pages.rbegin(); it != program.pages.rend(); ++it)
++            {
++                if (it->endsCompletion) { nextCompletion = it->completionOffset; pending = 0; }
++                it->completionOffset = nextCompletion;
++                pending += it->bytes.size();
++                program.maximumPendingBytes = std::max(program.maximumPendingBytes, pending + it->bytes.size());
++            }
++        };
++        summarize(prefix);
++        summarize(suffix);
++        return {std::move(prefix), std::move(suffix)};
 +    }
 +
 +    template<class Sync>
@@ -6619,7 +6902,7 @@ index 04f5b65..df92eb6 100644
      uint32_t m_computeWorkCompletionValue   = 0;
  };
 diff --git a/synapse/src/runtime/scal/common/stream_compute_scal.cpp b/synapse/src/runtime/scal/common/stream_compute_scal.cpp
-index df58f41..f3a3611 100644
+index df58f41..6aa13fd 100644
 --- a/synapse/src/runtime/scal/common/stream_compute_scal.cpp
 +++ b/synapse/src/runtime/scal/common/stream_compute_scal.cpp
 @@ -1,4 +1,5 @@
@@ -6628,7 +6911,7 @@ index df58f41..f3a3611 100644
  
  #include "habana_global_conf_runtime.h"
  #include "runtime/common/recipe/recipe_handle_impl.hpp"
-@@ -13,23 +14,572 @@
+@@ -13,23 +14,755 @@
  
  #include "runtime/scal/common/entities/scal_completion_group.hpp"
  #include "runtime/scal/common/entities/scal_memory_pool.hpp"
@@ -7001,6 +7284,78 @@ index df58f41..f3a3611 100644
 +    }
 +}
 +
++synStatus NativeComputeGraph::prepareSegmentedPlan(
++    const uint32_t* producers, const uint32_t* consumers, uint64_t count,
++    uint64_t prefixCollectives, uint32_t prefixComputes, uint32_t nicIndex,
++    synNativeGraphExchangeReplay callback, void* context)
++{
++    if (m_state != State::INSTANTIATED || m_replayActive || m_jointPlan || !producers || !consumers ||
++        !callback || !context || count < 2 || count > 128 || !prefixCollectives ||
++        prefixCollectives >= count || nicIndex % 8 || (nicIndex >> 3) > 0xff)
++        return synInvalidArgument;
++    try
++    {
++        auto plan = std::make_unique<JointPlan>();
++        std::vector<const NativeScalCommandBuffer*> buffers;
++        for (const auto& segment : m_segments) buffers.push_back(&segment.commands);
++        const bool terminalRelease = m_streamBase.nativeTerminalRelease(m_segments.back().commands);
++        plan->program = NativeComputeProgram::prepare(
++            buffers, {consumers, consumers + count}, m_streamBase.prepareNativeWaitPackets(nicIndex),
++            m_streamBase.nativeCommandAlignment(), m_streamBase.nativeAvailableBytes(), terminalRelease,
++            std::find(producers, producers + count, UINT32_MAX) != producers + count,
++            std::vector<uint32_t>(producers, producers + count));
++        const size_t splitSegment = prefixComputes;
++        if (!splitSegment || splitSegment >= plan->program.segmentPageEnds.size())
++            return synInvalidArgument;
++        for (size_t n = 0; n < count; ++n)
++            // UINT32_MAX is a stream-ordered device producer outside this
++            // captured graph. Prefix replay binds it to the current compute
++            // completion through externalInputCompletion.
++            if ((n < prefixCollectives &&
++                 !NativeComputeProgram::producerAvailableToPrefix(producers[n], splitSegment)) ||
++                (n >= prefixCollectives && consumers[n] < splitSegment))
++                return synInvalidArgument;
++        const size_t prefixPages = plan->program.segmentPageEnds[splitSegment - 1];
++        const uint64_t prefixDelta = plan->program.segmentCompletionOffsets[splitSegment - 1];
++        auto parts = plan->program.split(prefixPages,
++                                         plan->program.segmentPageByteEnds[splitSegment - 1],
++                                         plan->program.segmentPagePacketEnds[splitSegment - 1],
++                                         prefixDelta, prefixCollectives,
++                                         plan->suffixDependencyBegin);
++        plan->prefixProgram = std::move(parts.first);
++        plan->suffixProgram = std::move(parts.second);
++        plan->collectiveSplit = prefixCollectives;
++        plan->nicLongSoIndex = nicIndex;
++        plan->callback = callback;
++        plan->context = context;
++        plan->producers.resize(count);
++        plan->completions.resize(count);
++        plan->submissionScratch.resize(2);
++        plan->statistics[1] = plan->program.pages.size();
++        plan->statistics[2] = plan->program.sourcePacketCount;
++        plan->statistics[3] = plan->program.byteCount;
++        plan->statistics[4] = plan->program.completionDelta;
++        plan->statistics[5] = plan->program.maximumPendingBytes;
++        plan->statistics[8] = count;
++        std::fprintf(stderr,
++            "NATIVE_SEGMENTED_PLAN_READY split=%llu prefix_pages=%zu suffix_pages=%zu "
++            "prefix_delta=%llu suffix_delta=%llu carry=%zu\n",
++            static_cast<unsigned long long>(prefixCollectives), plan->prefixProgram.pages.size(),
++            plan->suffixProgram.pages.size(),
++            static_cast<unsigned long long>(plan->prefixProgram.completionDelta),
++            static_cast<unsigned long long>(plan->suffixProgram.completionDelta),
++            plan->suffixDependencyBegin);
++        m_jointPlan = std::move(plan);
++        return synSuccess;
++    }
++    catch (const std::exception& error)
++    {
++        LOG_ERR(SYN_STREAM, "Segmented native compute plan prepare rejected: {}", error.what());
++        std::fprintf(stderr, "NATIVE_SEGMENTED_PLAN_REJECT reason=%s\n", error.what());
++        return synInvalidArgument;
++    }
++}
++
 +synStatus NativeComputeGraph::replayPlan(synNativeGraphSyncInfo& completion, uint64_t* statistics, uint64_t count)
 +{
 +    if (m_state != State::INSTANTIATED || m_replayActive || !m_jointPlan || !statistics || count != 12)
@@ -7049,6 +7404,117 @@ index df58f41..f3a3611 100644
 +        m_lastCompletion = final;
 +        ++m_replayCount;
 +        m_replayActive = false;
++        completion = {uint32_t(final.m_index), final.m_targetValue};
++        std::copy(plan.statistics.begin(), plan.statistics.end(), statistics);
++        return synSuccess;
++    }
++    catch (...) { return fail(); }
++}
++
++synStatus NativeComputeGraph::replayPlanPrefix(
++    synNativeGraphSyncInfo& completion, uint64_t* statistics, uint64_t count)
++{
++    if (m_state != State::INSTANTIATED || m_replayActive || !m_jointPlan || !statistics || count != 12 ||
++        m_jointPlan->collectiveSplit == 0 || m_jointPlan->prefixProgram.pages.empty())
++        return synInvalidArgument;
++    auto& plan = *m_jointPlan;
++    if (!plan.prefixProgram.canReplayAt(m_streamBase.getTargetLongSo(0).m_targetValue))
++        return synInvalidArgument;
++    m_replayActive = true;
++    auto fail = [&]() { m_state = State::INVALID; m_replayActive = false; return synFail; };
++    try
++    {
++        if (plan.prefixProgram.externalInputCompletion && m_streamBase.prevCmdIsWait())
++        {
++            ScalLongSyncObject inputReady;
++            if (m_streamBase.addBarrierOrEmptyPdma(inputReady) != synSuccess) return fail();
++        }
++        const ScalLongSyncObject base = m_streamBase.getTargetLongSo(0);
++        if (!base.m_targetValue || !plan.prefixProgram.canReplayAt(base.m_targetValue)) return fail();
++        const ScalLongSyncObject prefixFinal =
++            m_streamBase.getIncrementedLongSo(true, plan.prefixProgram.completionDelta);
++        for (size_t n = 0; n < plan.collectiveSplit; ++n)
++            plan.producers[n] = {uint32_t(base.m_index), base.m_targetValue + plan.program.producerOffsets[n]};
++        ++plan.statistics[11];
++        if (plan.callback(plan.context, plan.producers.data(), plan.collectiveSplit,
++                          plan.completions.data()) != 0)
++            return fail();
++        for (size_t n = 0; n < plan.collectiveSplit; ++n)
++            if (plan.completions[n].longSoIndex != plan.nicLongSoIndex ||
++                !plan.completions[n].targetValue || plan.completions[n].targetValue >= (uint64_t(1) << 60) ||
++                (n && plan.completions[n].targetValue != plan.completions[n - 1].targetValue + 1))
++                return fail();
++        uint64_t submissions = 0;
++        if (m_streamBase.publishNativeComputeProgram(plan.prefixProgram, plan.completions.data(), base,
++                                                     plan.submissionScratch, submissions) != synSuccess)
++            return fail();
++        plan.statistics[6] += submissions;
++        plan.statistics[7] = submissions;
++        plan.segmentedBase = base;
++        completion = {uint32_t(prefixFinal.m_index), prefixFinal.m_targetValue};
++        std::copy(plan.statistics.begin(), plan.statistics.end(), statistics);
++        return synSuccess;
++    }
++    catch (...) { return fail(); }
++}
++
++synStatus NativeComputeGraph::replayPlanFinish(
++    synNativeGraphSyncInfo& completion, uint64_t* statistics, uint64_t count)
++{
++    if (m_state != State::INSTANTIATED || !m_replayActive || !m_jointPlan || !statistics || count != 12 ||
++        m_jointPlan->collectiveSplit == 0 || m_jointPlan->suffixProgram.pages.empty() ||
++        m_jointPlan->segmentedBase.m_targetValue == 0)
++        return synInvalidArgument;
++    auto& plan = *m_jointPlan;
++    auto fail = [&]() { m_state = State::INVALID; m_replayActive = false; return synFail; };
++    try
++    {
++        ScalLongSyncObject suffixBase = m_streamBase.getTargetLongSo(0);
++        const auto input = NativeComputeProgram::continuationInput(
++            uint32_t(plan.segmentedBase.m_index),
++            plan.segmentedBase.m_targetValue + plan.prefixProgram.completionDelta,
++            uint32_t(suffixBase.m_index), suffixBase.m_targetValue, m_streamBase.prevCmdIsWait());
++        if (input == NativeComputeProgram::ContinuationInput::Invalid)
++            return fail();
++        // Turn an outstanding input wait into a producer SO for the first
++        // suffix exchange. A retired Bridge event is already ready and may
++        // legitimately leave no wait packet or extra compute completion.
++        if (input == NativeComputeProgram::ContinuationInput::NeedsFence &&
++            m_streamBase.addBarrierOrEmptyPdma(suffixBase) != synSuccess)
++            return fail();
++        if (!plan.suffixProgram.canReplayAt(suffixBase.m_targetValue))
++            return fail();
++        const ScalLongSyncObject final =
++            m_streamBase.getIncrementedLongSo(true, plan.suffixProgram.completionDelta);
++        for (size_t n = plan.collectiveSplit; n < plan.producers.size(); ++n)
++            plan.producers[n] = {uint32_t(suffixBase.m_index),
++                                 suffixBase.m_targetValue +
++                                     NativeComputeProgram::continuationProducerOffset(
++                                         plan.program.producerOffsets[n], plan.prefixProgram.completionDelta)};
++        ++plan.statistics[11];
++        if (plan.callback(plan.context, plan.producers.data() + plan.collectiveSplit,
++                          plan.producers.size() - plan.collectiveSplit,
++                          plan.completions.data() + plan.collectiveSplit) != 0)
++            return fail();
++        for (size_t n = plan.collectiveSplit; n < plan.completions.size(); ++n)
++            if (plan.completions[n].longSoIndex != plan.nicLongSoIndex ||
++                !plan.completions[n].targetValue || plan.completions[n].targetValue >= (uint64_t(1) << 60) ||
++                plan.completions[n].targetValue != plan.completions[n - 1].targetValue + 1)
++                return fail();
++        uint64_t submissions = 0;
++        if (m_streamBase.publishNativeComputeProgram(
++                plan.suffixProgram, plan.completions.data() + plan.suffixDependencyBegin, suffixBase,
++                plan.submissionScratch, submissions) != synSuccess)
++            return fail();
++        if (!plan.statistics[0]) plan.statistics[9] = final.m_targetValue;
++        plan.statistics[10] = final.m_targetValue;
++        ++plan.statistics[0];
++        plan.statistics[6] += submissions;
++        plan.statistics[7] = submissions;
++        m_lastCompletion = final;
++        ++m_replayCount;
++        m_replayActive = false;
++        plan.segmentedBase = LongSoEmpty;
 +        completion = {uint32_t(final.m_index), final.m_targetValue};
 +        std::copy(plan.statistics.begin(), plan.statistics.end(), statistics);
 +        return synSuccess;
@@ -7202,7 +7668,7 @@ index df58f41..f3a3611 100644
    m_computeResources(*pComputeResources)
  {
      // Currently, we will have internal-signal for the TX-Command
-@@ -40,6 +590,186 @@ QueueComputeScal::QueueComputeScal(const BasicQueueInfo&           rBasicQueueIn
+@@ -40,6 +773,299 @@ QueueComputeScal::QueueComputeScal(const BasicQueueInfo&           rBasicQueueIn
  
  QueueComputeScal::~QueueComputeScal() {}
  
@@ -7297,6 +7763,17 @@ index df58f41..f3a3611 100644
 +    return graph.preparePlan(consumers, count, nicIndex, callback, context, producers);
 +}
 +
++synStatus QueueComputeScal::prepareSegmentedNativeComputePlan(
++    NativeComputeGraph& graph, const uint32_t* producers, const uint32_t* consumers,
++    uint64_t count, uint64_t prefixCollectives, uint32_t prefixComputes, uint32_t nicIndex,
++    synNativeGraphExchangeReplay callback, void* context)
++{
++    std::lock_guard<std::timed_mutex> lock(m_userOpLock);
++    if (m_activeNativeGraph != nullptr) return synInvalidArgument;
++    return graph.prepareSegmentedPlan(producers, consumers, count, prefixCollectives,
++                                      prefixComputes, nicIndex, callback, context);
++}
++
 +synStatus QueueComputeScal::replayNativeComputePlan(NativeComputeGraph& graph, synNativeGraphSyncInfo& completion,
 +                                                 uint64_t* statistics, uint64_t count)
 +{
@@ -7305,22 +7782,51 @@ index df58f41..f3a3611 100644
 +    return graph.replayPlan(completion, statistics, count);
 +}
 +
++synStatus QueueComputeScal::replayNativeComputePlanPrefix(
++    NativeComputeGraph& graph, synNativeGraphSyncInfo& completion,
++    uint64_t* statistics, uint64_t count)
++{
++    std::lock_guard<std::timed_mutex> lock(m_userOpLock);
++    if (m_activeNativeGraph != nullptr) return synInvalidArgument;
++    return graph.replayPlanPrefix(completion, statistics, count);
++}
++
++synStatus QueueComputeScal::replayNativeComputePlanFinish(
++    NativeComputeGraph& graph, synNativeGraphSyncInfo& completion,
++    uint64_t* statistics, uint64_t count)
++{
++    std::lock_guard<std::timed_mutex> lock(m_userOpLock);
++    if (m_activeNativeGraph != nullptr) return synInvalidArgument;
++    return graph.replayPlanFinish(completion, statistics, count);
++}
++
 +namespace {
 +class NativeComputeReplayJob final : public StreamJob
 +{
 +public:
-+    explicit NativeComputeReplayJob(InternalNativeComputeGraphHandle& owner)
-+    : StreamJob(JobType::COMPUTE), m_owner(owner) {}
++    enum class Part { Full, Prefix, Finish };
++    NativeComputeReplayJob(InternalNativeComputeGraphHandle& owner, Part part)
++    : StreamJob(JobType::COMPUTE), m_owner(owner), m_part(part) {}
 +
 +    synStatus run(QueueInterface* queue) override
 +    {
 +        if (queue != m_owner.queue || !m_owner.replayCompletion || !m_owner.replayStatistics)
 +            return synInvalidArgument;
++        if (m_part == Part::Prefix)
++            return m_owner.queue->replayNativeComputePlanPrefix(*m_owner.graph, *m_owner.replayCompletion,
++                                                                m_owner.replayStatistics,
++                                                                m_owner.replayStatisticCount);
++        if (m_part == Part::Finish)
++            return m_owner.queue->replayNativeComputePlanFinish(*m_owner.graph, *m_owner.replayCompletion,
++                                                                m_owner.replayStatistics,
++                                                                m_owner.replayStatisticCount);
 +        return m_owner.queue->replayNativeComputePlan(*m_owner.graph, *m_owner.replayCompletion,
-+                                                      m_owner.replayStatistics, m_owner.replayStatisticCount);
++                                                      m_owner.replayStatistics,
++                                                      m_owner.replayStatisticCount);
 +    }
 +private:
 +    InternalNativeComputeGraphHandle& m_owner;
++    Part m_part;
 +};
 +}
 +
@@ -7335,7 +7841,8 @@ index df58f41..f3a3611 100644
 +    if (status != synSuccess) return status;
 +    // Instantiated once. Stream::addJob runs this same object synchronously;
 +    // no per-recipe executor or per-replay job allocation is introduced.
-+    handle->preparedReplayJob = std::make_unique<NativeComputeReplayJob>(*handle);
++    handle->preparedReplayJob =
++        std::make_unique<NativeComputeReplayJob>(*handle, NativeComputeReplayJob::Part::Full);
 +    return synSuccess;
 +}
 +
@@ -7350,7 +7857,41 @@ index df58f41..f3a3611 100644
 +    if (status != synSuccess) return status;
 +    // Instantiated once. Stream::addJob runs this same object synchronously;
 +    // no per-recipe executor or per-replay job allocation is introduced.
-+    handle->preparedReplayJob = std::make_unique<NativeComputeReplayJob>(*handle);
++    handle->preparedReplayJob =
++        std::make_unique<NativeComputeReplayJob>(*handle, NativeComputeReplayJob::Part::Full);
++    return synSuccess;
++}
++
++extern "C" synStatus SYN_API_CALL synNativeComputeGraphPrepareSegmentedPlanV2(
++    synNativeComputeGraphHandle handle, const uint32_t* producers, const uint32_t* consumers,
++    uint64_t count, uint64_t prefixCollectives, uint32_t nicIndex,
++    synNativeGraphExchangeReplay callback, void* context)
++{
++    if (!consumers || !prefixCollectives || prefixCollectives >= count) return synInvalidArgument;
++    return synNativeComputeGraphPrepareSegmentedPlanV3(
++        handle, producers, consumers, count, prefixCollectives, consumers[prefixCollectives],
++        nicIndex, callback, context);
++}
++
++extern "C" synStatus SYN_API_CALL synNativeComputeGraphPrepareSegmentedPlanV3(
++    synNativeComputeGraphHandle handle, const uint32_t* producers, const uint32_t* consumers,
++    uint64_t count, uint64_t prefixCollectives, uint32_t prefixComputes, uint32_t nicIndex,
++    synNativeGraphExchangeReplay callback, void* context)
++{
++    if (!producers || !handle || !handle->queue || !handle->graph || !handle->stream)
++        return synInvalidArgument;
++    std::lock_guard<std::mutex> lock(handle->replayMutex);
++    if (handle->preparedReplayJob || handle->preparedPrefixReplayJob || handle->preparedFinishReplayJob)
++        return synInvalidArgument;
++    const synStatus status = handle->queue->prepareSegmentedNativeComputePlan(
++        *handle->graph, producers, consumers, count, prefixCollectives, prefixComputes, nicIndex, callback, context);
++    if (status != synSuccess) return status;
++    handle->preparedReplayJob =
++        std::make_unique<NativeComputeReplayJob>(*handle, NativeComputeReplayJob::Part::Full);
++    handle->preparedPrefixReplayJob =
++        std::make_unique<NativeComputeReplayJob>(*handle, NativeComputeReplayJob::Part::Prefix);
++    handle->preparedFinishReplayJob =
++        std::make_unique<NativeComputeReplayJob>(*handle, NativeComputeReplayJob::Part::Finish);
 +    return synSuccess;
 +}
 +
@@ -7386,10 +7927,48 @@ index df58f41..f3a3611 100644
 +    return status;
 +}
 +
++static synStatus replayNativeComputeGraphPart(
++    synNativeComputeGraphHandle handle, std::unique_ptr<StreamJob>& job,
++    synNativeGraphSyncInfo* completion, uint64_t* statistics, uint64_t count)
++{
++    if (!handle || !handle->queue || !handle->graph || !handle->stream || !job ||
++        !completion || !statistics || count != 12) return synInvalidArgument;
++    std::lock_guard<std::mutex> lock(handle->replayMutex);
++    handle->replayCompletion = completion;
++    handle->replayStatistics = statistics;
++    handle->replayStatisticCount = count;
++    synStatus status;
++    try { status = handle->stream->addJob(job); }
++    catch (...) { status = synFail; }
++    handle->replayCompletion = nullptr;
++    handle->replayStatistics = nullptr;
++    handle->replayStatisticCount = 0;
++    if (status != synSuccess) handle->graph->invalidate();
++    return status;
++}
++
++extern "C" synStatus SYN_API_CALL synNativeComputeGraphReplayPlanPrefix(
++    synNativeComputeGraphHandle handle, synNativeGraphSyncInfo* completion,
++    uint64_t* statistics, uint64_t count)
++{
++    if (!handle) return synInvalidArgument;
++    return replayNativeComputeGraphPart(handle, handle->preparedPrefixReplayJob,
++                                        completion, statistics, count);
++}
++
++extern "C" synStatus SYN_API_CALL synNativeComputeGraphReplayPlanFinish(
++    synNativeComputeGraphHandle handle, synNativeGraphSyncInfo* completion,
++    uint64_t* statistics, uint64_t count)
++{
++    if (!handle) return synInvalidArgument;
++    return replayNativeComputeGraphPart(handle, handle->preparedFinishReplayJob,
++                                        completion, statistics, count);
++}
++
  synStatus QueueComputeScal::eventRecord(EventInterface& rEventInterface, synStreamHandle streamHandle)
  {
      LOG_DEBUG(SYN_STREAM, "{} Stream {}", HLLOG_FUNC, m_basicQueueInfo.getDescription());
-@@ -332,6 +1062,52 @@ synStatus QueueComputeScal::launch(const LaunchInfo& launchInfo)
+@@ -332,6 +1358,52 @@ synStatus QueueComputeScal::launch(const LaunchInfo& launchInfo)
      ScalStreamComputeInterface* pComputeScalStream = dynamic_cast<ScalStreamComputeInterface*>(m_scalStream);
      VERIFY_IS_NULL_POINTER(SYN_STREAM, pComputeScalStream, "pComputeScalStream");
  
@@ -7442,7 +8021,7 @@ index df58f41..f3a3611 100644
      std::unique_ptr<RecipeLauncher> recipeLauncher = std::make_unique<RecipeLauncher>(pComputeScalStream,
                                                                                        &m_computeResources,
                                                                                        m_devMemoryAlloc,
-@@ -340,11 +1116,21 @@ synStatus QueueComputeScal::launch(const LaunchInfo& launchInfo)
+@@ -340,11 +1412,21 @@ synStatus QueueComputeScal::launch(const LaunchInfo& launchInfo)
                                                                                        launchInfo.pRecipeHandle,
                                                                                        dsdProcessor,
                                                                                        ++m_runningId,
@@ -7467,7 +8046,7 @@ index df58f41..f3a3611 100644
          LOG_ERR(SYN_STREAM,
                  "{}: recipeLauncher launch failed, recipe seq {}",
                  HLLOG_FUNC,
-@@ -357,6 +1143,16 @@ synStatus QueueComputeScal::launch(const LaunchInfo& launchInfo)
+@@ -357,6 +1439,16 @@ synStatus QueueComputeScal::launch(const LaunchInfo& launchInfo)
          return status;
      }
  
@@ -7485,7 +8064,7 @@ index df58f41..f3a3611 100644
      m_launchTracker.add(std::move(recipeLauncher));
  
 diff --git a/synapse/src/runtime/scal/common/stream_compute_scal.hpp b/synapse/src/runtime/scal/common/stream_compute_scal.hpp
-index 11acbd0..202941a 100644
+index 11acbd0..b51a840 100644
 --- a/synapse/src/runtime/scal/common/stream_compute_scal.hpp
 +++ b/synapse/src/runtime/scal/common/stream_compute_scal.hpp
 @@ -13,6 +13,8 @@ struct PreAllocatedStreamMemoryAll;
@@ -7508,7 +8087,7 @@ index 11acbd0..202941a 100644
  
      virtual ~QueueComputeScal();
  
-@@ -77,6 +81,22 @@ public:
+@@ -77,6 +81,29 @@ public:
      virtual synStatus getDynamicShapesTensorInfoArray(synRecipeHandle             recipeHandle,
                                                        std::vector<tensor_info_t>& tensorInfoArray) const;
  
@@ -7520,7 +8099,14 @@ index 11acbd0..202941a 100644
 +    synStatus beginNativeComputeGraphReplay(NativeComputeGraph& graph);
 +    synStatus prepareNativeComputePlan(NativeComputeGraph& graph, const uint32_t* consumers,
 +        uint64_t count, uint32_t nicIndex, synNativeGraphExchangeReplay callback, void* context, const uint32_t* producers = nullptr);
++    synStatus prepareSegmentedNativeComputePlan(NativeComputeGraph& graph, const uint32_t* producers,
++        const uint32_t* consumers, uint64_t count, uint64_t prefixCollectives, uint32_t prefixComputes, uint32_t nicIndex,
++        synNativeGraphExchangeReplay callback, void* context);
 +    synStatus replayNativeComputePlan(NativeComputeGraph& graph, synNativeGraphSyncInfo& completion,
++        uint64_t* statistics, uint64_t count);
++    synStatus replayNativeComputePlanPrefix(NativeComputeGraph& graph, synNativeGraphSyncInfo& completion,
++        uint64_t* statistics, uint64_t count);
++    synStatus replayNativeComputePlanFinish(NativeComputeGraph& graph, synNativeGraphSyncInfo& completion,
 +        uint64_t* statistics, uint64_t count);
 +    synStatus replayNativeComputeGraphSegment(NativeComputeGraph&       graph,
 +                                              size_t                    segmentIndex,
@@ -7531,7 +8117,7 @@ index 11acbd0..202941a 100644
  private:
      synStatus initMemMgrs();
      synStatus      launch(const LaunchInfo& launchInfo);
-@@ -93,6 +113,8 @@ private:
+@@ -93,6 +120,8 @@ private:
      LaunchTracker m_launchTracker;
  
      DevMemoryAllocInterface& m_devMemoryAlloc;
@@ -7540,7 +8126,7 @@ index 11acbd0..202941a 100644
  
      uint64_t m_runningId = 0;
  
-@@ -108,4 +130,5 @@ private:
+@@ -108,4 +137,5 @@ private:
      std::unordered_map<uint64_t, std::unique_ptr<DynamicRecipe>> m_dynamicShapeProcessor;
  
      const ComputeCompoundResources m_computeResources;
@@ -7825,115 +8411,3 @@ index c10255e..6567ca6 100644
  TEST_F_SYN(SynApiNoDeviceTest, section_group_semantic_checks)
  {
      synSectionHandle hSection {};
-diff --git a/synapse/src/graph_compiler/passes/tpc_fuser.cpp b/synapse/src/graph_compiler/passes/tpc_fuser.cpp
-index c2a3037..5f5721d 100644
---- a/synapse/src/graph_compiler/passes/tpc_fuser.cpp
-+++ b/synapse/src/graph_compiler/passes/tpc_fuser.cpp
-@@ -24,6 +24,7 @@
- #include <lemon/list_graph.h>
- #include <lemon/unionfind.h>
- 
-+#include <atomic>
- #include <memory>
- #include <mutex>
- #include <string.h>
-@@ -2413,13 +2414,14 @@ optimizedGraphStatus tryNodesReplacementInGraph(HabanaGraph&
-                                                 const std::pair<NodePtr, NodeList>&       fusedNodeOrigNodePair,
-                                                 std::map<NodePtr, std::vector<unsigned>>& newNodesPerFusedNode,
-                                                 std::map<unsigned, NodePtr>&              newNodeIdMap,
-+                                                NodeList&                                 nodesToAdd,
-+                                                std::unordered_set<NodePtr>&              totalOriginalNodesSet,
-                                                 bool                                      isNeedToReplaceNodes = true,
-                                                 bool                                      isPartOfSubgraph     = false)
- {
-     // Replace received nodes from fuser with their original nodes in the graph
-     // If the node belongs to subgraph send all subgraph nodes and then originals to the same call of replaceNodes
- 
--    static NodeList nodesToAdd;
-     const NodePtr&  fusedNode     = fusedNodeOrigNodePair.first;
-     NodeList        originalNodes = fusedNodeOrigNodePair.second;
- 
-@@ -2461,7 +2463,6 @@ optimizedGraphStatus tryNodesReplacementInGraph(HabanaGraph&
-     if (isPartOfSubgraph)
-     {
-         // The node is part of subgraph, add it all original nodes to the total original nodes in this subgraph
--        static std::unordered_set<NodePtr> totalOriginalNodesSet;
-         totalOriginalNodesSet.insert(originalNodes.begin(), originalNodes.end());
- 
-         if (isNeedToReplaceNodes)
-@@ -2496,11 +2497,15 @@ optimizedGraphStatus tryNodesReplacementInGraph(HabanaGraph&
- //     If false value returned to the caller - GC graph remains unmodified
- optimizedGraphStatus replaceOptimizedCluster(HabanaGraph& graph, const std::shared_ptr<GCTPCFuserWrapper>& fuser)
- {
--    static int fusedClustersCounter = -1;
--    int        fusedNodesCounter    = 0;
--    int        newNodesCounter      = 0;
-+    static std::atomic<int> nextClusterId {0};
-+    const int fusedClustersCounter = nextClusterId.fetch_add(1, std::memory_order_relaxed);
-+    int       fusedNodesCounter    = 0;
-+    int       newNodesCounter      = 0;
- 
--    fusedClustersCounter++;
-+    // Pending replacements belong to this cluster, including early failure paths.
-+    // Concurrent graph compilations must never exchange node ownership.
-+    NodeList                    nodesToAdd;
-+    std::unordered_set<NodePtr> totalOriginalNodesSet;
- 
-     LOG_DEBUG(GC_TPC_FUSER, "tpcFuser: fusing nodes of subgraph (cluster) {}.", fusedClustersCounter);
- 
-@@ -2756,6 +2761,8 @@ optimizedGraphStatus replaceOptimizedCluster(HabanaGraph& graph, const std::shar
-                                                             fusedNodeOrigNodesPair,
-                                                             newNodesPerFusedNode,
-                                                             newNodeIdMap,
-+                                                            nodesToAdd,
-+                                                            totalOriginalNodesSet,
-                                                             isLastNodeInSubgraph,
-                                                             true);
-                         if (status != optimizedGraphSuccess) return status;
-@@ -2774,7 +2781,8 @@ optimizedGraphStatus replaceOptimizedCluster(HabanaGraph& graph, const std::shar
-                           fusedNode->getId());
- 
-                 // this node is not part of subgraph
--                status = tryNodesReplacementInGraph(graph, pair, newNodesPerFusedNode, newNodeIdMap, true);
-+                status = tryNodesReplacementInGraph(
-+                    graph, pair, newNodesPerFusedNode, newNodeIdMap, nodesToAdd, totalOriginalNodesSet, true);
-                 if (status != optimizedGraphSuccess) return status;
-             }
-         }
-@@ -2788,7 +2796,8 @@ optimizedGraphStatus replaceOptimizedCluster(HabanaGraph& graph, const std::shar
-                       fusedNode->getId());
- 
-             // this node is not part of subgraph
--            status = tryNodesReplacementInGraph(graph, pair, newNodesPerFusedNode, newNodeIdMap, true);
-+            status = tryNodesReplacementInGraph(
-+                    graph, pair, newNodesPerFusedNode, newNodeIdMap, nodesToAdd, totalOriginalNodesSet, true);
-             if (status != optimizedGraphSuccess) return status;
-         }
-     }
-
-diff --git a/synapse/src/graph_compiler/passes/sram_management/pipeline_management/pipeline_bundlizer.cpp b/synapse/src/graph_compiler/passes/sram_management/pipeline_management/pipeline_bundlizer.cpp
-index 90f1286..e613e9b 100644
---- a/synapse/src/graph_compiler/passes/sram_management/pipeline_management/pipeline_bundlizer.cpp
-+++ b/synapse/src/graph_compiler/passes/sram_management/pipeline_management/pipeline_bundlizer.cpp
-@@ -1386,6 +1386,21 @@ bool MantaRayBundlizer::canBundleSharedInputMmeNode(const MMENodePtr& candidate,
-                                                     const MMENodeSet& committedCandidates,
-                                                     const TensorPtr&  sharedInput)
- {
-+    // Each output window of this compound operator has a decoded full-K
-+    // producer. Sharing its small activation across MMEs may leave one of
-+    // those producers outside the SRAM bundle. Use the single-MME producer
-+    // bundler for these windows; other operators keep normal shared-input
-+    // bundling. No reduction dimension or arithmetic is changed.
-+    if (candidate->getNumInputs() > 1)
-+    {
-+        const NodePtr producer = m_graph.getTensorProducer(candidate->getInput(1));
-+        constexpr const char* prefix = "custom_deepseek_v41_mxfp4_n512_dequant";
-+        if (producer && producer->getGUID().compare(0, std::char_traits<char>::length(prefix), prefix) == 0)
-+        {
-+            LOG_DEBUG(SRAM_SLICE, "Use independent SRAM producer bundle for {}", candidate->getNodeName());
-+            return false;
-+        }
-+    }
-     // Check if the candidate node has ancestors in the candidates group
-     // Check against the full candidates group as this relation is asymmetric -
-     // no risk of loosing both nodes while we could keep one

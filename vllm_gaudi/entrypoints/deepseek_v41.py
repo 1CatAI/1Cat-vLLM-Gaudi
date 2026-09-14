@@ -31,11 +31,24 @@ _C1_FASTPATH_DEFAULTS = {
     "VLLM_HPU_DSV41_ENGRAM_NATIVE_C1": "1",
     "VLLM_HPU_DSV41_ENGRAM_C1_PACKET": "1",
     "VLLM_HPU_DSV41_DECODED_KV_STATE": "1",
+    "VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH": "1",
+    "VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT": "1",
+    "VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT": "1",
+    "VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX": "1",
+    "VLLM_HPU_DSV41_V2_DEVICE_ENGRAM": "1",
+    "VLLM_HPU_DSV41_V2": "1",
+    "VLLM_USE_V2_MODEL_RUNNER": "1",
+    "VLLM_HPU_DSV41_EXPERT_K128": "1",
+    "VLLM_HPU_TP2_NATIVE_JOINT_PLAN": "1",
+    "VLLM_HPU_TP2_PREPARED_COMM": "1",
+    "VLLM_HPU_TP2_STATIC_GROUP_PLAN": "1",
+}
+
+_NUMERIC_FASTPATH_DEFAULTS = {
     "VLLM_HPU_DSV41_WO_A_FP8": "1",
     "VLLM_HPU_DSV41_ROUTER_TOP6": "1",
     "VLLM_HPU_DSV41_BF16_LM_HEAD": "1",
     "VLLM_HPU_DSV41_MLA_MME": "1",
-    "VLLM_HPU_DSV41_EXPERT_K128": "1",
     "VLLM_HPU_DSV41_EXPERT_N256_FP8": "1",
     "VLLM_HPU_DSV41_EXPERT_FUSED_QUANT": "1",
     "VLLM_HPU_DSV41_QKV_FUSED_INPUT": "1",
@@ -46,9 +59,6 @@ _C1_FASTPATH_DEFAULTS = {
     "VLLM_HPU_DSV41_ATTN_DENSE_FP8": "1",
     "VLLM_HPU_DSV41_Q_SCALE_ROPE": "1",
     "VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE": "1",
-    "VLLM_HPU_TP2_NATIVE_JOINT_PLAN": "1",
-    "VLLM_HPU_TP2_PREPARED_COMM": "1",
-    "VLLM_HPU_TP2_STATIC_GROUP_PLAN": "1",
 }
 
 _SIDECARS = {
@@ -62,14 +72,23 @@ def _enabled(value):
 
 
 def prepare_default_fastpaths(model, sidecars=None):
-    """Enable the qualified ordinary-C1 profile from one aggregate switch."""
+    """Enable the frozen-reference C1/V2 profile from one aggregate switch."""
     if not _enabled(os.environ.get("VLLM_HPU_DSV41_DEFAULT_FASTPATHS", "1")):
         return
     os.environ.setdefault("VLLM_HPU_DSV41_DSPARK", "0")
     if _enabled(os.environ["VLLM_HPU_DSV41_DSPARK"]):
         return
+    selected_v2 = os.environ.get("VLLM_USE_V2_MODEL_RUNNER")
+    selected_adapter = os.environ.get("VLLM_HPU_DSV41_V2")
+    if selected_v2 is not None and selected_adapter is None:
+        os.environ["VLLM_HPU_DSV41_V2"] = "1" if _enabled(selected_v2) else "0"
+    elif selected_adapter is not None and selected_v2 is None:
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1" if _enabled(selected_adapter) else "0"
     for key, value in _C1_FASTPATH_DEFAULTS.items():
         os.environ.setdefault(key, value)
+    if _enabled(os.environ.get("VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS", "0")):
+        for key, value in _NUMERIC_FASTPATH_DEFAULTS.items():
+            os.environ.setdefault(key, value)
     model = Path(model).resolve()
     configured = sidecars or {}
     for name, (enabled_key, path_key) in _SIDECARS.items():
@@ -103,7 +122,7 @@ def prepare_native_libraries():
         host_manifest = json.loads((library_dir / "deepseek_v41_build.json").read_text())
         hosts = list(library_dir.glob("dsv41_host_gather*.so"))
         if (len(hosts) != 1 or host_manifest.get("host_gather_abi_version") != 1
-                or host_manifest.get("host_c1_abi_version") != 1
+                or host_manifest.get("host_c1_abi_version") != 2
                 or host_manifest.get("host_gather_packed_output_version") != 1
                 or host_manifest.get("host_gather_profiling_version") != 1
                 or hashlib.sha256(hosts[0].read_bytes()).hexdigest() != host_manifest["binaries"].get(hosts[0].name)):
@@ -156,7 +175,15 @@ def main():
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--checkpoint-audit")
     parser.add_argument("--runtime-profile", default=runtime_profile or settings.get("runtime_profile"))
+    v2 = parser.add_mutually_exclusive_group()
+    v2.add_argument("--v2", dest="v2", action="store_true", help="Use the V2 HPU scheduling/completion adapter")
+    v2.add_argument("--no-v2", dest="v2", action="store_false", help="Use the synchronous V4.1 model runner")
+    parser.set_defaults(v2=None)
     args, extra = parser.parse_known_args()
+    if args.v2 is not None:
+        selected = "1" if args.v2 else "0"
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = selected
+        os.environ["VLLM_HPU_DSV41_V2"] = selected
     if args.model is None:
         parser.error("A prepared model directory is required")
     if args.runtime_profile:
@@ -241,12 +268,13 @@ def main():
     from vllm_gaudi import envs as gaudi_envs
     speculative = (["--speculative-config", '{"method":"dspark","num_speculative_tokens":5}']
                    if gaudi_envs.VLLM_HPU_DSV41_DSPARK else [])
+    scheduling = "--async-scheduling" if gaudi_envs.VLLM_HPU_DSV41_V2 else "--no-async-scheduling"
     sys.argv = [
         "vllm", "serve", args.model, "--host", args.host, "--port",
         str(args.port), "--dtype", "bfloat16", "--max-model-len", "512", "--generation-config", "vllm",
         "--tensor-parallel-size", "2", "--pipeline-parallel-size", "2", "--max-num-seqs", "1",
         "--max-num-batched-tokens", "512", "--load-format", "dsv41_prepared", "--model-loader-extra-config",
-        json.dumps(loader), "--mm-encoder-tp-mode", "data", "--no-enable-prefix-caching", "--no-async-scheduling",
+        json.dumps(loader), "--mm-encoder-tp-mode", "data", "--no-enable-prefix-caching", scheduling,
         "--block-size", "512", *speculative, *extra
     ]
     from vllm.entrypoints.cli.main import main as serve

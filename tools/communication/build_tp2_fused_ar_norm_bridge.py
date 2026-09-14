@@ -147,7 +147,18 @@ def main() -> None:
         "binary_sha256": digest(binary),
         "adapter_sources": {
             str(path.resolve()): digest(path)
-            for path in (source, source.with_name("tp2_input_preflight.h"))
+            for path in (
+                source,
+                source.with_name("gdn_state_update.cpp"),
+                source.with_name("tp2_dynamic_quant.cpp"),
+                source.with_name("tp2_input_preflight.h"),
+                source.with_name("tp2_prepared_plan.h"),
+                source.with_name("tp2_native_decode_graph.h"),
+                source.with_name("tp2_native_dependencies.h"),
+                source.with_name("tp2_native_graph_topology.h"),
+                source.with_name("tp2_native_graph_probe.h"),
+                source.with_name("dsv41_verify_timing.h"),
+            )
         },
         "eager_runtime": [{
             "path": str(path),

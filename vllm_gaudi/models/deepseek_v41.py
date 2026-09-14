@@ -76,6 +76,8 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         self.ordinary = CompiledStage(self.program)
         self.long_context_programs = {}
         self.engram_host, self.step_ticket, self.last_aux = None, None, None
+        self._decode_prefix = None
+        self._step_request_id = None
         self.step_use_replay = False
         self.extra = dict(vllm_config.load_config.model_loader_extra_config or {})
         self.vision = self.aligner = None
@@ -174,13 +176,30 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
 
     def prepare_step(self, request_id, token_ids, *, is_decode, reset=False, use_replay=None):
         self.step_use_replay = is_decode if use_replay is None else use_replay
+        self._step_request_id = request_id
         if self.pp_rank == 0:
             if self.step_ticket is not None:
                 raise RuntimeError("Previous V4.1 verify has not committed its accepted input prefix")
             if reset:
                 self.engram_host.reset(request_id)
             image_mask = [token in (129264, 129265) for token in token_ids]
-            self.step_ticket = self.engram_host.prepare(request_id, token_ids, image_mask, defer_wait=True)
+            device_layer1 = bool(envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and is_decode
+                                 and self.engram_host.device_pending == request_id)
+            self.step_ticket = self.engram_host.prepare(request_id,
+                                                        token_ids,
+                                                        image_mask,
+                                                        defer_wait=True,
+                                                        device_layer1=device_layer1)
+            if (envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and is_decode
+                    and self.engram_host.device_pending is None):
+                self.engram_host.stage_device_c1_reference(request_id, self.step_ticket.buffers[0])
+
+    def prepare_device_engram(self, request_id, device_token):
+        if self.pp_rank != 0 or not envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM:
+            raise RuntimeError("Device Engram preparation is outside the qualified PP0 V2 path")
+        if self.step_ticket is not None or self._decode_prefix is not None:
+            raise RuntimeError("Device Engram preparation overlaps an unfinished model input")
+        return self.engram_host.prepare_device_c1(request_id, device_token)
 
     def complete_step(self, committed_inputs):
         if self.pp_rank == 0:
@@ -188,12 +207,32 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 raise RuntimeError("V4.1 completion has no input transaction")
             self.engram_host.complete(self.step_ticket, committed_inputs)
             self.step_ticket = None
+            self._step_request_id = None
 
     def complete_step_device(self, committed_inputs):
         """Finish a verify after PP has transferred the validated scalar."""
         if isinstance(committed_inputs, torch.Tensor):
             raise RuntimeError("complete_step_device expects the consumed committed scalar")
         self.complete_step(int(committed_inputs))
+
+    @staticmethod
+    def _input_signature(value):
+        return (value.untyped_storage()._cdata, value.storage_offset(), tuple(value.shape), value.stride(), value.dtype,
+                value.device)
+
+    def begin_decode_prefix(self, input_ids, positions):
+        if (self.pp_rank != 0 or not self.native or not envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX
+                or self.program.dspark or input_ids.numel() != 1):
+            raise RuntimeError("V4.1 decode prefix is outside the qualified PP0 C1 path")
+        if self.step_ticket is not None or self._decode_prefix is not None:
+            raise RuntimeError("V4.1 decode prefix overlaps an unfinished input transaction")
+        self.program.replay_owner.begin_segmented_from_input_ids(positions.reshape(-1), input_ids.reshape(-1))
+        self._decode_prefix = (self._input_signature(input_ids.reshape(-1)),
+                               self._input_signature(positions.reshape(-1)))
+
+    @property
+    def decode_prefix_pending(self):
+        return self._decode_prefix is not None
 
     def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None, **kwargs):
         del kwargs
@@ -217,9 +256,14 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 residual = values.unsqueeze(1).expand(-1, 4, -1).contiguous()
                 pre = torch.zeros(input_ids.numel(), 4, device=values.device, dtype=torch.float32)
                 pre[:, 0] = 1
-            # Embedding and residual preparation are independent of the host
-            # lookup. The decoder still receives explicit DMA dependencies.
-            engram = self.engram_host.wait(self.step_ticket)
+            if envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and self.step_use_replay:
+                layer1 = self.engram_host.consume_device_c1(self._step_request_id)
+                buffers = self.engram_host.wait(self.step_ticket)
+                engram = (layer1, buffers[1])
+            else:
+                # Embedding and residual preparation are independent of the host
+                # lookup. The decoder still receives explicit DMA dependencies.
+                engram = self.engram_host.wait(self.step_ticket)
         else:
             if intermediate_tensors is None:
                 raise RuntimeError("PP1 has no matching PP0 hidden/pre-mix generation")
@@ -237,7 +281,16 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             execute = self.long_context_programs[key]
         else:
             execute = self.program.replay_owner if self.native and self.step_use_replay else self.ordinary
-        if native_input:
+        if self._decode_prefix is not None:
+            if not native_input or execute is not self.program.replay_owner:
+                raise RuntimeError("V4.1 segmented prefix reached an incompatible model invocation")
+            ids_signature, positions_signature = self._decode_prefix
+            if (self._input_signature(input_ids) != ids_signature
+                    or self._input_signature(positions) != positions_signature):
+                raise RuntimeError("V4.1 segmented prefix does not belong to this token/position generation")
+            output, pre, aux = execute.finish_segmented(positions, input_ids, engram)
+            self._decode_prefix = None
+        elif native_input:
             if execute is not self.program.replay_owner:
                 raise RuntimeError("Native input requires its qualified replay stage")
             output, pre, aux = execute.from_input_ids(positions, input_ids, engram)
@@ -267,6 +320,8 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         return self.last_aux
 
     def close(self):
+        self._decode_prefix = None
+        self._step_request_id = None
         self.program.invalidate()
         if self.engram_host is not None:
             self.engram_host.close()

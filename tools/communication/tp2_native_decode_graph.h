@@ -69,11 +69,15 @@ class RuntimeApis {
   using HclBatch = void*;
   using HclBatchCreate = hcclResult_t (*)(const HclGraph*, size_t, HclBatch*);
   using HclBatchReplay = hcclResult_t (*)(HclBatch, const SyncInfo*, size_t, SyncInfo*);
+  using HclBatchConfigureSplit = hcclResult_t (*)(HclBatch, size_t);
+  using HclBatchReplaySegmented = hcclResult_t (*)(HclBatch, const SyncInfo*, size_t, SyncInfo*);
   using HclBatchDestroy = hcclResult_t (*)(HclBatch);
   using SynExchangeCallback = int (*)(void*, const SyncInfo*, uint64_t, SyncInfo*);
   using SynPreparePlan = synStatus (*)(SynGraph, const uint32_t*, uint64_t, uint32_t, SynExchangeCallback, void*);
   using SynPreparePlanV2 = synStatus (*)(SynGraph, const uint32_t*, const uint32_t*, uint64_t, uint32_t,
                                         SynExchangeCallback, void*);
+  using SynPrepareSegmentedPlanV3 = synStatus (*)(SynGraph, const uint32_t*, const uint32_t*, uint64_t,
+                                                  uint64_t, uint32_t, uint32_t, SynExchangeCallback, void*);
   using SynReplayPlan = synStatus (*)(SynGraph, SyncInfo*, uint64_t*, uint64_t);
 
   static RuntimeApis& get() {
@@ -131,7 +135,26 @@ class RuntimeApis {
     });
   }
 
+  void requireSegmentedPlan() {
+    requirePlanV2();
+    std::call_once(segmented_once_, [this]() {
+      hcl_batch_configure_split =
+          resolve<HclBatchConfigureSplit>("hcclTp2NativeBatchConfigureSplit");
+      hcl_batch_replay_segmented =
+          resolve<HclBatchReplaySegmented>("hcclTp2NativeBatchReplaySegmented");
+      syn_prepare_segmented_plan_v3 =
+          resolve<SynPrepareSegmentedPlanV3>("synNativeComputeGraphPrepareSegmentedPlanV3");
+      syn_replay_plan_prefix =
+          resolve<SynReplayPlan>("synNativeComputeGraphReplayPlanPrefix");
+      syn_replay_plan_finish =
+          resolve<SynReplayPlan>("synNativeComputeGraphReplayPlanFinish");
+    });
+  }
+
   SynPreparePlanV2 syn_prepare_plan_v2 = nullptr;
+  SynPrepareSegmentedPlanV3 syn_prepare_segmented_plan_v3 = nullptr;
+  SynReplayPlan syn_replay_plan_prefix = nullptr;
+  SynReplayPlan syn_replay_plan_finish = nullptr;
 
   SynCreate syn_create = nullptr;
   SynBeginCapture syn_begin_capture = nullptr;
@@ -151,6 +174,8 @@ class RuntimeApis {
   HclDestroy hcl_destroy = nullptr;
   HclBatchCreate hcl_batch_create = nullptr;
   HclBatchReplay hcl_batch_replay = nullptr;
+  HclBatchConfigureSplit hcl_batch_configure_split = nullptr;
+  HclBatchReplaySegmented hcl_batch_replay_segmented = nullptr;
   HclBatchDestroy hcl_batch_destroy = nullptr;
   SynPreparePlan syn_prepare_plan = nullptr;
   SynReplayPlan syn_replay_plan = nullptr;
@@ -169,6 +194,7 @@ class RuntimeApis {
   std::once_flag once_;
   std::once_flag plan_once_;
   std::once_flag plan_v2_once_;
+  std::once_flag segmented_once_;
   bool complete_ = false;
 };
 
@@ -182,8 +208,19 @@ inline bool mhcOverlapEnabled() {
   return value && (std::strcmp(value, "1") == 0 || strcasecmp(value, "true") == 0);
 }
 
+inline bool segmentedPrefixEnabled() {
+  const char* value = std::getenv("VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX");
+  return value && (std::strcmp(value, "1") == 0 || strcasecmp(value, "true") == 0);
+}
+
 inline int replayNicBatch(void* context, const SyncInfo* producers, uint64_t count, SyncInfo* completions) {
   return static_cast<int>(RuntimeApis::get().hcl_batch_replay(context, producers, count, completions));
+}
+
+inline int replayNicSegmentedBatch(
+    void* context, const SyncInfo* producers, uint64_t count, SyncInfo* completions) {
+  return static_cast<int>(
+      RuntimeApis::get().hcl_batch_replay_segmented(context, producers, count, completions));
 }
 
 struct FixedInputSignature {
@@ -372,6 +409,15 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
     external_prefix_ = externalPrefix;
   }
 
+  void configureLateInputs(std::vector<at::Tensor> inputs) {
+    TORCH_CHECK(state_.load() == State::Created && segmentedPrefixConfigured() && !inputs.empty(),
+                "Late inputs must be configured before segmented PP0 capture");
+    for (const auto& input : inputs)
+      TORCH_CHECK(input.device().type() == at::kHPU && input.numel() && input.is_contiguous(),
+                  "Segmented late inputs require nonempty contiguous HPU bindings");
+    late_inputs_ = std::move(inputs);
+  }
+
   void capture(std::vector<std::shared_ptr<PreparedGroupPlan>> plans,
                std::vector<torch::jit::Stack> inputs) {
     RuntimeApis::get().require();
@@ -524,12 +570,84 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
     return ticket;
   }
 
+  void replayFixedPrefix() {
+    RECORD_FUNCTION("vllm_gaudi::native_decoder_prefix_enqueue", std::vector<c10::IValue>());
+    uint64_t epoch;
+    std::vector<PendingInputCopy> copies;
+    std::vector<synapse_helpers::device_ptr> dependencies;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      TORCH_CHECK(segmentedPrefixConfigured() && state_.load() == State::Instantiated && fixed_inputs_ready_ &&
+                      segmented_scheduled_epoch_.load() == 0,
+                  "Native segmented prefix requires an idle prepared PP0 input graph");
+      epoch = input_epoch_.fetch_add(1) + 1;
+      TORCH_CHECK(epoch == scheduled_epoch_.load() + 1,
+                  "Native segmented prefix input epoch changed");
+      scheduled_epoch_.store(epoch);
+      segmented_scheduled_epoch_.store(epoch);
+      copies = std::move(pending_input_copies_);
+      dependencies = std::move(pending_input_dependencies_);
+    }
+    auto self = shared_from_this();
+    habana::eager::PipelineTask<habana::eager::ThreadType::LOWERING>(
+        [self, epoch, copies = std::move(copies), dependencies = std::move(dependencies)]() mutable {
+      habana::HPUDeviceContext::execute_thread().enqueue(
+          [self, epoch, copies = std::move(copies), dependencies = std::move(dependencies)]() {
+        try {
+          if (!copies.empty()) self->stageInputCopiesOnExecute(copies);
+          self->prepareInputDependenciesOnExecute(dependencies);
+          self->replayPrefixOnExecute(epoch);
+        } catch (...) {
+          self->state_.store(State::Invalid);
+          throw;
+        }
+      });
+    });
+  }
+
+  std::shared_ptr<NativeCompletion> replayFixedFinishWithCompletion() {
+    RECORD_FUNCTION("vllm_gaudi::native_decoder_finish_enqueue", std::vector<c10::IValue>());
+    auto ticket = std::make_shared<NativeCompletion>();
+    uint64_t epoch;
+    std::vector<PendingInputCopy> copies;
+    std::vector<synapse_helpers::device_ptr> dependencies;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      epoch = segmented_scheduled_epoch_.load();
+      TORCH_CHECK(segmentedPrefixConfigured() && state_.load() == State::Instantiated && fixed_inputs_ready_ &&
+                      epoch != 0 && epoch == scheduled_epoch_.load(),
+                  "Native segmented suffix has no matching prefix epoch");
+      copies = std::move(pending_input_copies_);
+      dependencies = std::move(pending_input_dependencies_);
+    }
+    auto self = shared_from_this();
+    habana::eager::PipelineTask<habana::eager::ThreadType::LOWERING>(
+        [self, epoch, ticket, copies = std::move(copies), dependencies = std::move(dependencies)]() mutable {
+      habana::HPUDeviceContext::execute_thread().enqueue(
+          [self, epoch, ticket, copies = std::move(copies), dependencies = std::move(dependencies)]() {
+        try {
+          if (!copies.empty()) self->stageInputCopiesOnExecute(copies);
+          self->prepareInputDependenciesOnExecute(dependencies);
+          self->replayFinishOnExecute(epoch);
+          ticket->record(habana::HPUDeviceContext::get_device().get_stream(0));
+        } catch (...) {
+          self->state_.store(State::Invalid);
+          ticket->fail(std::current_exception());
+          throw;
+        }
+      });
+    });
+    return ticket;
+  }
+
   void scheduleFixed(const std::shared_ptr<NativeCompletion>& ticket) {
     RECORD_FUNCTION("vllm_gaudi::native_decoder_enqueue", std::vector<c10::IValue>());
     {
       std::lock_guard<std::mutex> lock(mutex_);
       TORCH_CHECK(state_.load() == State::Instantiated && fixed_inputs_ready_,
                   "Native fixed replay requires prepared input ownership");
+      TORCH_CHECK(segmented_scheduled_epoch_.load() == 0,
+                  "Whole replay cannot overtake an active segmented prefix");
       const uint64_t epoch = input_epoch_.fetch_add(1) + 1;
       TORCH_CHECK(epoch == scheduled_epoch_.load() + 1, "Native fixed replay input epoch changed");
     }
@@ -642,6 +760,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
     signatures_.clear();
     dynamic_inputs_.clear();
     state_tensors_.clear();
+    late_inputs_.clear();
     pending_input_copies_.clear();
     pending_input_dependencies_.clear();
     input_dependencies_.clear();
@@ -696,6 +815,17 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
   size_t expected_groups_ = 0;
   size_t expected_collectives_ = 0;
   bool external_prefix_ = false;
+  std::vector<at::Tensor> late_inputs_;
+  NativeInputPrefix input_prefix_;
+
+  static NativeBufferRange tensorRange(const at::Tensor& tensor) {
+    uint64_t elements = 1;
+    for (int64_t dim = 0; dim < tensor.dim(); ++dim) {
+      TORCH_CHECK(tensor.stride(dim) >= 0, "Explicit TP binding has a negative stride");
+      elements += (tensor.size(dim) - 1) * tensor.stride(dim);
+    }
+    return {reinterpret_cast<uint64_t>(tensor.data_ptr()), elements * tensor.element_size()};
+  }
 
   void validateAndRememberInputs(const std::vector<std::shared_ptr<PreparedGroupPlan>>& plans,
                                  const std::vector<torch::jit::Stack>& inputs) {
@@ -804,12 +934,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
               if (!value.isTensor()) continue;
               const auto tensor = value.toTensor();
               if (tensor.device().type() != c10::DeviceType::HPU || !tensor.numel()) continue;
-              uint64_t elements = 1;
-              for (int64_t dim = 0; dim < tensor.dim(); ++dim) {
-                TORCH_CHECK(tensor.stride(dim) >= 0, "Explicit TP binding has a negative stride");
-                elements += (tensor.size(dim) - 1) * tensor.stride(dim);
-              }
-              result.push_back({reinterpret_cast<uint64_t>(tensor.data_ptr()), elements * tensor.element_size()});
+              result.push_back(tensorRange(tensor));
             }
             return result;
           };
@@ -818,6 +943,13 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
           bindings.push_back(std::move(binding));
         }
       prepared_dependencies_ = prepareNativeDependencies(bindings);
+      if (segmentedPrefixConfigured()) {
+        std::vector<NativeBufferRange> late;
+        for (const auto& input : late_inputs_) late.push_back(tensorRange(input));
+        input_prefix_ = prepareNativeInputPrefix(bindings, late, prepared_dependencies_);
+        std::fprintf(stderr, "NATIVE_INPUT_PREFIX_VERIFIED computes=%u collectives=%zu late_inputs=%zu\n",
+                     input_prefix_.computes, input_prefix_.collectives, late.size());
+      }
       TORCH_CHECK(prepared_dependencies_.size() == topology.consumers.size(),
                   "Explicit TP dependency coverage differs");
       prepared_consumers_.clear();
@@ -982,7 +1114,20 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
                     "hcclTp2NativeBatchCreate(decoder) failed");
         HclGraphInfo last;
         TORCH_CHECK(api.hcl_get_info(hcl_graphs_.back(), &last) == hcclSuccess, "HCL batch completion unavailable");
-        if (mhcOverlapEnabled()) {
+        if (segmentedPrefixConfigured()) {
+          TORCH_CHECK(expected_groups_ == 5 && expected_collectives_ == 43 && !external_prefix_ &&
+                          mhcOverlapEnabled() && prepared_producers_.size() == hcl_graphs_.size(),
+                      "Segmented V4.1 replay requires the complete PP0 input graph and explicit TP dependencies");
+          api.requireSegmentedPlan();
+          TORCH_CHECK(api.hcl_batch_configure_split(hcl_batch_, input_prefix_.collectives) == hcclSuccess,
+                      "hcclTp2NativeBatchConfigureSplit(decoder) failed");
+          checkSynapse(api.syn_prepare_segmented_plan_v3(
+                           syn_graph_, prepared_producers_.data(), prepared_consumers_.data(),
+                           prepared_consumers_.size(), input_prefix_.collectives, input_prefix_.computes,
+                           last.completion.longSoIndex,
+                           replayNicSegmentedBatch, hcl_batch_),
+                       "synNativeComputeGraphPrepareSegmentedPlanV3(decoder)");
+        } else if (mhcOverlapEnabled()) {
           api.requirePlanV2();
           checkSynapse(api.syn_prepare_plan_v2(syn_graph_, prepared_producers_.data(), prepared_consumers_.data(),
                        prepared_consumers_.size(), last.completion.longSoIndex, replayNicBatch, hcl_batch_),
@@ -1067,6 +1212,8 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
     std::lock_guard<std::mutex> lock(mutex_);
     TORCH_CHECK(state_.load() == State::Instantiated,
                 "Native decoder graph is not instantiated; no fallback was executed");
+    TORCH_CHECK(segmented_scheduled_epoch_.load() == 0,
+                "Whole native replay cannot execute during a segmented replay");
     try {
       auto& api = RuntimeApis::get();
       auto& device = habana::HPUDeviceContext::get_device();
@@ -1122,6 +1269,69 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
       state_.store(State::Invalid);
       throw;
     }
+  }
+
+  void replayPrefixOnExecute(uint64_t epoch) {
+    RECORD_FUNCTION("vllm_gaudi::native_decoder_prefix_publish", std::vector<c10::IValue>());
+    std::lock_guard<std::mutex> lock(mutex_);
+    TORCH_CHECK(segmentedPrefixConfigured() && state_.load() == State::Instantiated &&
+                    hcl_batch_ != nullptr && segmented_scheduled_epoch_.load() == epoch &&
+                    epoch == scheduled_epoch_.load() && epoch == executed_epoch_.load() + 1,
+                "Native segmented prefix epoch or graph state changed before publication");
+    try {
+      SyncInfo completion;
+      auto& api = RuntimeApis::get();
+      api.requireSegmentedPlan();
+      checkSynapse(api.syn_replay_plan_prefix(
+                       syn_graph_, &completion, joint_statistics_.data(), joint_statistics_.size()),
+                   "synNativeComputeGraphReplayPlanPrefix(decoder)");
+      TORCH_CHECK(completion.targetValue != 0,
+                  "Native segmented prefix did not reserve compute completion progress");
+    } catch (...) {
+      state_.store(State::Invalid);
+      throw;
+    }
+  }
+
+  void replayFinishOnExecute(uint64_t epoch) {
+    RECORD_FUNCTION("vllm_gaudi::native_decoder_finish_publish", std::vector<c10::IValue>());
+    std::lock_guard<std::mutex> lock(mutex_);
+    TORCH_CHECK(segmentedPrefixConfigured() && state_.load() == State::Instantiated &&
+                    hcl_batch_ != nullptr && segmented_scheduled_epoch_.load() == epoch &&
+                    epoch == scheduled_epoch_.load() && epoch == executed_epoch_.load() + 1,
+                "Native segmented suffix epoch or graph state changed before publication");
+    try {
+      SyncInfo completion;
+      auto& api = RuntimeApis::get();
+      api.requireSegmentedPlan();
+      checkSynapse(api.syn_replay_plan_finish(
+                       syn_graph_, &completion, joint_statistics_.data(), joint_statistics_.size()),
+                   "synNativeComputeGraphReplayPlanFinish(decoder)");
+      TORCH_CHECK(completion.targetValue != 0,
+                  "Native segmented suffix did not publish a completion target");
+      if (replay_count_.load() == 0) {
+        HclGraphInfo replay_info;
+        TORCH_CHECK(api.hcl_get_info(hcl_graphs_.back(), &replay_info) == hcclSuccess,
+                    "hcclTp2NativeGraphGetInfo failed after first segmented replay");
+        TORCH_CHECK(replay_info.nativeReplayBytes > 0 && replay_info.nativeSubmissionCount > 0,
+                    "Segmented native HCL replay did not advance real stream PI/submission counters");
+        hcl_replay_bytes_.store(replay_info.nativeReplayBytes);
+        hcl_ccb_wrap_count_.store(replay_info.nativeCcbWrapCount);
+        hcl_submission_count_.store(replay_info.nativeSubmissionCount);
+      }
+      executed_epoch_.store(epoch);
+      segmented_scheduled_epoch_.store(0);
+      ++replay_count_;
+      registerOutputs();
+    } catch (...) {
+      state_.store(State::Invalid);
+      throw;
+    }
+  }
+
+  bool segmentedPrefixConfigured() const {
+    return segmentedPrefixEnabled() && NativeGraphTopology::supportsV41SegmentedPrefix(
+        expected_groups_, expected_collectives_, external_prefix_);
   }
 
   void prepareCompletionAddresses() {
@@ -1194,6 +1404,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
   std::atomic<uint64_t> input_update_bytes_{0};
   std::atomic<uint64_t> scheduled_epoch_{0};
   std::atomic<uint64_t> executed_epoch_{0};
+  std::atomic<uint64_t> segmented_scheduled_epoch_{0};
   size_t prefix_node_count_ = 0;
   std::atomic<uint64_t> replay_count_{0};
 };

@@ -60,7 +60,7 @@ def main(rank, ROOT, OUT):
     all_compute = []
     with gzip.open(p / 'hardware.jsonl.gz', 'rt') as stream:
         for line in stream:
-            start, dur, lane, i = json.loads(line)
+            start, dur, lane, i = json.loads(line)[:4]
             for w, left, right in clip_windows(start, start + dur, windows, ends):
                 if (inv['nodes'][i]['engine'] in ('TPC', 'MME') and reasons.get(selected.get(i)) != 'woa_copy'):
                     all_compute.append((left, right))

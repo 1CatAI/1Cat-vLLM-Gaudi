@@ -2,8 +2,12 @@
 import pytest
 import torch
 
-from vllm_gaudi.models.deepseek_v41_program import CompiledStage, PreparedInput, PreparedLayerGroup
-from vllm_gaudi.ops.deepseek_v41_replay import StageReplay
+from vllm_gaudi.models.deepseek_v41_program import (
+    CompiledStage,
+    PreparedInput,
+    PreparedLayerGroup,
+)
+from vllm_gaudi.ops.deepseek_v41_replay import StageReplay, capture_engram_inputs
 from vllm_gaudi.ops.tp2_model_adapter import DEEPSEEK_V41_PP0, DEEPSEEK_V41_PP0_INPUT, DEEPSEEK_V41_PP1
 
 
@@ -16,9 +20,10 @@ class EchoGroup(torch.nn.Module):
         return hidden, pre, positions, ids, engram
 
 
-def program(pp_rank=0, dspark=False, fp8=False):
+def program(pp_rank=0, dspark=False, fp8=False, expert_n256=False):
     value = torch.nn.Module()
     value.pp_rank, value.dspark, value.fp8_decode = pp_rank, dspark, fp8
+    value.expert_n256 = expert_n256
     return value
 
 
@@ -77,6 +82,63 @@ def test_seeds_are_persistent_and_external_call_stays_separate(monkeypatch):
         replay.from_input_ids(positions.expand(6), ids.expand(6), ())
 
 
+def test_segmented_input_replay_keeps_the_complete_variant(monkeypatch):
+    from vllm_gaudi.ops import tp2_prepared_plan
+
+    monkeypatch.setenv("VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH", "1")
+    monkeypatch.setenv("VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX", "1")
+    calls = []
+
+    class CaptureSegmented(StageReplay):
+        def begin_segmented_from_input_ids(self, positions, ids):
+            calls.append(("prefix", positions, ids))
+
+        def finish_segmented(self, positions, ids, engram):
+            calls.append(("suffix", positions, ids, engram))
+            return "output"
+
+    owner = program()
+    replay = CaptureSegmented(owner)
+    class Variant:
+        pass
+
+    variant = Variant()
+    replay.variants[(1, "input")] = variant
+    tp2_prepared_plan._native_entries[variant] = object()
+    ids, positions, engram = torch.tensor([7]), torch.tensor([3], dtype=torch.int32), (object(), object())
+    try:
+        assert replay.from_input_ids(positions, ids, engram) == "output"
+    finally:
+        tp2_prepared_plan._native_entries.pop(variant, None)
+    assert calls == [("prefix", positions, ids), ("suffix", positions, ids, engram)]
+
+
+def test_direct_engram_retains_exact_packed_views():
+    packed = torch.arange(2 * 12 * 264, dtype=torch.int64).to(torch.uint8)
+    views = packed[:12 * 264].view(1, 12, 264), packed[12 * 264:].view(1, 12, 264)
+    captured = capture_engram_inputs(views, direct=True)
+    assert all(a is b for a, b in zip(captured, views))
+    copies = capture_engram_inputs(views)
+    assert all(torch.equal(a, b) and a.data_ptr() != b.data_ptr() for a, b in zip(copies, views))
+    for invalid in ((views[0], views[0]), tuple(reversed(views)), copies, views[:1],
+                    (views[0].transpose(1, 2), views[1])):
+        with pytest.raises(ValueError, match="Engram"):
+            capture_engram_inputs(invalid, direct=True)
+
+
+def test_device_engram_retains_decoded_and_late_inputs():
+    layer1 = torch.empty((1, 12, 256), dtype=torch.bfloat16)
+    layer14 = torch.empty((1, 12, 264), dtype=torch.uint8)
+    captured = capture_engram_inputs((layer1, layer14), direct=True, device_layer1=True)
+    assert captured[0] is layer1 and captured[1] is layer14
+    invalid = ((layer1.to(torch.float32), layer14), (layer1[:, :, :255], layer14),
+               (layer1, layer14.to(torch.int8)), (layer1, layer14[:, :, :263]),
+               (layer1.transpose(1, 2), layer14))
+    for values in invalid:
+        with pytest.raises(ValueError, match="Device Engram"):
+            capture_engram_inputs(values, direct=True, device_layer1=True)
+
+
 def test_native_input_is_disabled_by_default(monkeypatch):
     monkeypatch.delenv("VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH", raising=False)
     owner = program()
@@ -84,6 +146,21 @@ def test_native_input_is_disabled_by_default(monkeypatch):
     assert not replay.native_input_enabled
     with pytest.raises(ValueError, match="enabled"):
         replay.from_input_ids(torch.tensor([0]), torch.tensor([1]), ())
+
+
+def test_direct_engram_does_not_require_a_pp0_input_graph_on_pp1(monkeypatch):
+    monkeypatch.setenv("VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH", "1")
+    monkeypatch.setenv("VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT", "1")
+    replay = StageReplay(program(pp_rank=1))
+    assert not replay.native_input_enabled
+
+
+@pytest.mark.parametrize("pp_rank", [0, 1])
+def test_direct_engram_accepts_n256_fp8_with_bf16_stage_boundaries(monkeypatch, pp_rank):
+    monkeypatch.setenv("VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH", "1")
+    monkeypatch.setenv("VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT", "1")
+    replay = StageReplay(program(pp_rank=pp_rank, fp8=True, expert_n256=True))
+    assert replay.native_input_enabled == (pp_rank == 0)
 
 
 def test_input_modes_have_separate_cached_variants(monkeypatch):

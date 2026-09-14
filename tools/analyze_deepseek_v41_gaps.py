@@ -37,7 +37,7 @@ def boundaries(root, rank, gaps):
     previous, following = [None] * len(gaps), [None] * len(gaps)
     with gzip.open(path / "hardware.jsonl.gz", "rt") as stream:
         for line in stream:
-            start, duration, _, index = json.loads(line)
+            start, duration, _, index = json.loads(line)[:4]
             node = inventory["nodes"][index]
             if node["engine"] not in ("TPC", "MME", "DMA") or duration <= 0:
                 continue

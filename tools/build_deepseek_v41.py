@@ -55,7 +55,7 @@ def main():
         native["binaries"][path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
     native.update(prepared_layout_version=2,
                   host_gather_abi_version=1,
-                  host_c1_abi_version=1,
+                  host_c1_abi_version=2,
                   host_gather_packed_output_version=1,
                   host_gather_profiling_version=1)
     (output / "deepseek_v41_build.json").write_text(json.dumps(native, indent=2) + "\n")

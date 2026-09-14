@@ -14,7 +14,9 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cerrno>
 #include <exception>
+#include <fcntl.h>
 #include <time.h>
 #include <cstdint>
 #include <cstdlib>
@@ -22,7 +24,10 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unordered_map>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -42,6 +47,7 @@
 #include "habana_serialization/serializers.h"
 #include "python_packages/habana_frameworks/torch/distributed/hccl/process_group_eager_hccl.hpp"
 #include "dsv41_verify_timing.h"
+#include "tp2_input_preflight.h"
 
 namespace {
 
@@ -601,6 +607,42 @@ void copyGdnStates(c10d::ProcessGroupEagerHCCL *backend,
   }
 }
 
+void copyC1PipelineTensors(c10d::ProcessGroupEagerHCCL* backend,
+                           std::vector<at::Tensor> sources,
+                           std::vector<at::Tensor> destinations) {
+  TORCH_CHECK(GET_ENV_FLAG_NEW(PT_HPU_LAZY_MODE) == 0 &&
+                  GET_ENV_FLAG_NEW(PT_HPU_EAGER_PIPELINE_ENABLE) &&
+                  c10::hpu::getCurrentHPUStream().stream() == 0,
+              "C1 PP DMA requires the eager default producer stream");
+  TORCH_CHECK(sources.size() == 2 && destinations.size() == 2,
+              "C1 PP DMA requires hidden and pre-mix");
+  for (size_t i = 0; i < 2; ++i) {
+    const auto dtype = i == 0 ? at::kBFloat16 : at::kFloat;
+    const int64_t elements = i == 0 ? 20480 : 4;
+    TORCH_CHECK(sources[i].device().type() == at::kHPU &&
+                    sources[i].device() == destinations[i].device() &&
+                    sources[i].device() == sources[0].device() &&
+                    sources[i].scalar_type() == dtype && destinations[i].scalar_type() == dtype &&
+                    sources[i].numel() == elements && destinations[i].numel() == elements &&
+                    sources[i].is_contiguous() && destinations[i].is_contiguous(),
+                "C1 PP DMA changed the contiguous hidden/pre-mix contract");
+  }
+  auto communicator = backend->lowLatencyCommunicator();
+  TORCH_CHECK(communicator != nullptr, "C1 PP DMA requires an initialized communicator");
+  prepareGdnBackendTensors(sources, destinations);
+  habana::eager::PipelineTask<habana::eager::ThreadType::EXECUTE>(
+      [communicator, sources = std::move(sources), destinations = std::move(destinations)]() {
+        for (const auto* values : {&sources, &destinations}) {
+          for (const auto& tensor : *values) {
+            const auto permutation = std::get<0>(habana_helpers::get_tensor_memory_permutation(tensor));
+            TORCH_CHECK(std::is_sorted(permutation.begin(), permutation.end()),
+                        "C1 PP DMA cannot consume a permuted physical tensor");
+          }
+        }
+        runGdnStateCopies(communicator, sources, destinations, 0);
+      });
+}
+
 std::shared_ptr<GdnStateDMATicket> queueGdnStateCopies(
     c10d::ProcessGroupEagerHCCL *backend, std::vector<at::Tensor> sources,
     std::vector<at::Tensor> destinations, synapse_helpers::hpuStream_t copy_stream,
@@ -910,6 +952,387 @@ allReduceResidualRmsNorm(c10d::ProcessGroupEagerHCCL *backend,
   return {normalized, residual_out};
 }
 
+constexpr uint64_t kDeviceEngramHeads = 12;
+constexpr uint64_t kDeviceEngramHistory = 3;
+constexpr uint64_t kDeviceEngramParameters = 47;
+constexpr uint64_t kDeviceEngramWidth = 256;
+constexpr uint64_t kDeviceEngramScales = 8;
+constexpr char kDeviceEngramGuid[] =
+    "custom_deepseek_v41_engram_hash_gather_bf16_gaudi2";
+
+class MappedCheckpointRange {
+ public:
+  MappedCheckpointRange(synDeviceId device, const std::string &path,
+                        uint64_t offset, uint64_t bytes)
+      : device_(device), bytes_(bytes) {
+    TORCH_CHECK(bytes > 0 && bytes <= SIZE_MAX,
+                "Device Engram checkpoint range is invalid");
+    const long system_page = sysconf(_SC_PAGESIZE);
+    TORCH_CHECK(system_page > 0, "Cannot query the host page size");
+    const uint64_t page = static_cast<uint64_t>(system_page);
+    delta_ = offset % page;
+    TORCH_CHECK(bytes <= SIZE_MAX - delta_,
+                "Device Engram checkpoint mapping overflows size_t");
+    mapped_bytes_ = static_cast<size_t>(bytes + delta_);
+    const int descriptor = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    TORCH_CHECK(descriptor >= 0, "Cannot open Device Engram checkpoint range: ",
+                path, ": ", std::strerror(errno));
+    struct stat info {};
+    const bool valid = fstat(descriptor, &info) == 0 &&
+        offset <= static_cast<uint64_t>(info.st_size) &&
+        bytes <= static_cast<uint64_t>(info.st_size) - offset;
+    if (!valid) {
+      ::close(descriptor);
+      TORCH_CHECK(false, "Device Engram checkpoint range exceeds its file: ", path);
+    }
+    base_ = mmap(nullptr, mapped_bytes_, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_POPULATE, descriptor, offset - delta_);
+    ::close(descriptor);
+    TORCH_CHECK(base_ != MAP_FAILED, "Cannot mmap Device Engram checkpoint range: ",
+                path, ": ", std::strerror(errno));
+    const synStatus status = synHostMap(device_, mapped_bytes_, base_);
+    if (status != synSuccess) {
+      munmap(base_, mapped_bytes_);
+      base_ = MAP_FAILED;
+      checkSynapse(status, "synHostMap(device Engram)");
+    }
+    mapped_ = true;
+    data_ = static_cast<uint8_t *>(base_) + delta_;
+  }
+
+  MappedCheckpointRange(const MappedCheckpointRange &) = delete;
+  MappedCheckpointRange &operator=(const MappedCheckpointRange &) = delete;
+
+  ~MappedCheckpointRange() { release(false); }
+
+  uint64_t address() const { return reinterpret_cast<uint64_t>(data_); }
+  uint64_t bytes() const { return bytes_; }
+
+  void close() { release(true); }
+
+ private:
+  void release(bool checked) {
+    synStatus unmap_status = synSuccess;
+    int munmap_status = 0;
+    int munmap_error = 0;
+    if (mapped_) {
+      unmap_status = synHostUnmap(device_, base_);
+      mapped_ = false;
+    }
+    if (base_ != MAP_FAILED) {
+      munmap_status = munmap(base_, mapped_bytes_);
+      munmap_error = errno;
+      base_ = MAP_FAILED;
+    }
+    data_ = nullptr;
+    if (checked) {
+      checkSynapse(unmap_status, "synHostUnmap(device Engram)");
+      TORCH_CHECK(munmap_status == 0, "munmap(device Engram) failed: ",
+                  std::strerror(munmap_error));
+    }
+  }
+
+  synDeviceId device_ = 0;
+  void *base_ = MAP_FAILED;
+  uint8_t *data_ = nullptr;
+  size_t mapped_bytes_ = 0;
+  uint64_t delta_ = 0;
+  uint64_t bytes_ = 0;
+  bool mapped_ = false;
+};
+
+struct DeviceEngramRecipe {
+  synGraphHandle graph = nullptr;
+  synRecipeHandle handle = nullptr;
+  std::vector<synSectionHandle> sections;
+  std::array<uint64_t, 8> tensor_ids{};
+  std::array<synLaunchTensorInfo, 8> launch_template{};
+  uint64_t workspace_address = 0;
+  uint64_t workspace_bytes = 0;
+
+  ~DeviceEngramRecipe() { release(false); }
+
+  synTensor tensor(synTensorType kind, const char *name,
+                   std::initializer_list<uint64_t> sizes, synDataType dtype,
+                   void *compile_data = nullptr,
+                   uint64_t compile_bytes = 0) {
+    synSectionHandle section = nullptr;
+    checkSynapse(synSectionCreate(&section, 0, graph),
+                 "synSectionCreate(device Engram)");
+    checkSynapse(synSectionSetPersistent(section, true),
+                 "synSectionSetPersistent(device Engram)");
+    sections.push_back(section);
+    synTensor result = nullptr;
+    checkSynapse(synTensorHandleCreate(&result, graph, kind, name),
+                 "synTensorHandleCreate(device Engram)");
+    synTensorGeometry geometry{};
+    geometry.dims = sizes.size();
+    unsigned dimension = 0;
+    for (uint64_t size : sizes) geometry.sizes[dimension++] = size;
+    checkSynapse(synTensorSetGeometry(result, &geometry, synGeometrySizes),
+                 "synTensorSetGeometry(device Engram)");
+    checkSynapse(synTensorSetDeviceDataType(result, dtype),
+                 "synTensorSetDeviceDataType(device Engram)");
+    checkSynapse(synTensorAssignToSection(result, section, 0),
+                 "synTensorAssignToSection(device Engram)");
+    if (compile_data != nullptr)
+      checkSynapse(synTensorSetHostPtr(result, compile_data, compile_bytes,
+                                      dtype, true),
+                   "synTensorSetHostPtr(device Engram)");
+    return result;
+  }
+
+  void compile(uint64_t vocab_size, uint64_t rows) {
+    checkSynapse(synGraphCreate(&graph, synDeviceGaudi2),
+                 "synGraphCreate(device Engram)");
+    std::array<uint8_t, 1> compile_byte{};
+    synTensor inputs[6] = {
+        tensor(DATA_TENSOR, "raw_token", {1, 1}, syn_type_int32),
+        tensor(DATA_TENSOR, "history", {kDeviceEngramHistory, 1},
+               syn_type_int32),
+        tensor(DATA_TENSOR, "token_map", {vocab_size, 1}, syn_type_int32),
+        tensor(DATA_TENSOR, "parameters", {kDeviceEngramParameters, 1},
+               syn_type_int32),
+        tensor(HOST_TO_DEVICE_TENSOR, "weights", {kDeviceEngramWidth, rows},
+               syn_type_uint8, compile_byte.data(), compile_byte.size()),
+        tensor(HOST_TO_DEVICE_TENSOR, "scales", {kDeviceEngramScales, rows},
+               syn_type_uint8, compile_byte.data(), compile_byte.size()),
+    };
+    synTensor outputs[2] = {
+        tensor(DATA_TENSOR, "decoded_rows",
+               {kDeviceEngramWidth, kDeviceEngramHeads}, syn_type_bf16),
+        tensor(DATA_TENSOR, "next_history", {kDeviceEngramHistory, 1},
+               syn_type_int32),
+    };
+    checkSynapse(synNodeCreate(graph, inputs, outputs, 6, 2, nullptr, 0,
+                               kDeviceEngramGuid, "device_engram_layer1",
+                               nullptr, nullptr),
+                 "synNodeCreate(device Engram)");
+    checkSynapse(synGraphCompile(&handle, graph,
+                                 "dsv41_device_engram_layer1", nullptr),
+                 "synGraphCompile(device Engram)");
+    checkSynapse(synWorkspaceGetSize(&workspace_bytes, handle),
+                 "synWorkspaceGetSize(device Engram)");
+    if (workspace_bytes != 0) {
+      workspace_address =
+          habana::HPUDeviceContext::get_device().get_workspace_buffer(
+              workspace_bytes);
+      TORCH_CHECK(workspace_address != 0,
+                  "HPU backend returned a null Device Engram workspace");
+    }
+    std::array<const char *, 8> names = {
+        "raw_token", "history", "token_map", "parameters", "weights",
+        "scales", "decoded_rows", "next_history"};
+    checkSynapse(synTensorRetrieveIds(handle, names.data(), tensor_ids.data(),
+                                      names.size()),
+                 "synTensorRetrieveIds(device Engram)");
+    for (size_t index = 0; index < names.size(); ++index) {
+      launch_template[index].tensorName = names[index];
+      launch_template[index].tensorId = tensor_ids[index];
+      launch_template[index].tensorType =
+          index == 4 || index == 5 ? HOST_TO_DEVICE_TENSOR : DATA_TENSOR;
+    }
+    checkSynapse(synGraphDestroy(graph), "synGraphDestroy(device Engram)");
+    graph = nullptr;
+    sections.clear();
+  }
+
+  void close() { release(true); }
+
+ private:
+  void release(bool checked) {
+    synStatus recipe_status = synSuccess;
+    synStatus graph_status = synSuccess;
+    if (handle != nullptr) {
+      recipe_status = synRecipeDestroy(handle);
+      handle = nullptr;
+    }
+    if (graph != nullptr) {
+      graph_status = synGraphDestroy(graph);
+      graph = nullptr;
+    }
+    sections.clear();
+    if (checked) {
+      checkSynapse(recipe_status, "synRecipeDestroy(device Engram)");
+      checkSynapse(graph_status, "synGraphDestroy(device Engram)");
+    }
+  }
+};
+
+class DeviceEngramProducer
+    : public std::enable_shared_from_this<DeviceEngramProducer> {
+ public:
+  DeviceEngramProducer(const c10::intrusive_ptr<c10d::Backend> &backend,
+                       const std::string &weight_file,
+                       uint64_t weight_offset, uint64_t weight_bytes,
+                       const std::string &scale_file, uint64_t scale_offset,
+                       uint64_t scale_bytes, uint64_t rows,
+                       at::Tensor token_map, at::Tensor parameters)
+      : token_map_(std::move(token_map)), parameters_(std::move(parameters)) {
+    auto *group = dynamic_cast<c10d::ProcessGroupEagerHCCL *>(backend.get());
+    TORCH_CHECK(group != nullptr,
+                "Device Engram requires ProcessGroupEagerHCCL");
+    communicator_ = group->lowLatencyCommunicator();
+    TORCH_CHECK(communicator_ != nullptr,
+                "Device Engram requires an initialized HCCL communicator");
+    TORCH_CHECK(GET_ENV_FLAG_NEW(PT_HPU_LAZY_MODE) == 0 &&
+                    GET_ENV_FLAG_NEW(PT_HPU_EAGER_PIPELINE_ENABLE) &&
+                    c10::hpu::getCurrentHPUStream().stream() == 0,
+                "Device Engram requires eager pipeline execution on stream 0");
+    validateI32(token_map_, "token_map", 1, false);
+    validateI32(parameters_, "parameters", kDeviceEngramParameters, true);
+    TORCH_CHECK(rows > 0 && rows <= INT32_MAX &&
+                    weight_bytes == rows * kDeviceEngramWidth &&
+                    scale_bytes == rows * kDeviceEngramScales,
+                "Device Engram checkpoint geometry differs from the fused recipe");
+    auto &device = habana::HPUDeviceContext::get_device();
+    weights_ = std::make_unique<MappedCheckpointRange>(
+        device.id(), weight_file, weight_offset, weight_bytes);
+    scales_ = std::make_unique<MappedCheckpointRange>(
+        device.id(), scale_file, scale_offset, scale_bytes);
+    recipe_.compile(token_map_.numel(), rows);
+  }
+
+  ~DeviceEngramProducer() {
+    if (!closed_) {
+      try {
+        close();
+      } catch (...) {
+      }
+    }
+  }
+
+  void launch(at::Tensor raw_token, at::Tensor history,
+              at::Tensor next_history, at::Tensor decoded_rows) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      TORCH_CHECK(!closed_, "Device Engram producer is closed");
+    }
+    validateI32(raw_token, "raw_token", 1, true);
+    validateI32(history, "history", kDeviceEngramHistory, true);
+    validateI32(next_history, "next_history", kDeviceEngramHistory, true);
+    TORCH_CHECK(decoded_rows.device().type() == at::kHPU &&
+                    decoded_rows.scalar_type() == at::kBFloat16 &&
+                    decoded_rows.numel() ==
+                        kDeviceEngramHeads * kDeviceEngramWidth &&
+                    decoded_rows.is_contiguous(),
+                "Device Engram decoded_rows must be contiguous 12x256 BF16 on HPU");
+    TORCH_CHECK(raw_token.device() == history.device() &&
+                    history.device() == next_history.device() &&
+                    next_history.device() == decoded_rows.device() &&
+                    decoded_rows.device() == token_map_.device(),
+                "Device Engram tensors must share one HPU device");
+    std::array<at::Tensor, 6> tensors = {
+        std::move(raw_token), std::move(history), token_map_, parameters_,
+        std::move(decoded_rows), std::move(next_history)};
+    for (at::Tensor &tensor : tensors) {
+      tensor = habana::eager::HbEagerTensorPool::get_backend_tensor(tensor);
+      habana::get_tensor_extra_meta(tensor)->set_tensor_pipelined();
+    }
+    auto self = shared_from_this();
+    habana::eager::PipelineTask<habana::eager::ThreadType::LOWERING>(
+        [self, tensors = std::move(tensors)]() mutable {
+          habana::HPUDeviceContext::execute_thread().enqueue(
+              [self, tensors = std::move(tensors)]() mutable {
+                self->launchOnExecute(std::move(tensors));
+              });
+        });
+  }
+
+  uint64_t mappedBytes() const {
+    return weights_->bytes() + scales_->bytes();
+  }
+  uint64_t workspaceBytes() const { return recipe_.workspace_bytes; }
+  uint64_t launchCount() const { return launches_.load(); }
+
+  void close() {
+    habana::eager::JoinPendingPipelineThreads();
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (closed_) return;
+    auto &device = habana::HPUDeviceContext::get_device();
+    checkSynapse(synStreamSynchronize(device.get_stream(0)),
+                 "synStreamSynchronize(device Engram close)");
+    recipe_.close();
+    scales_->close();
+    weights_->close();
+    scales_.reset();
+    weights_.reset();
+    token_map_ = at::Tensor();
+    parameters_ = at::Tensor();
+    closed_ = true;
+  }
+
+ private:
+  static void validateI32(const at::Tensor &tensor, const char *name,
+                          int64_t elements, bool exact) {
+    TORCH_CHECK(tensor.device().type() == at::kHPU &&
+                    tensor.scalar_type() == at::kInt &&
+                    (exact ? tensor.numel() == elements
+                           : tensor.numel() >= elements) &&
+                    tensor.is_contiguous(),
+                "Device Engram ", name,
+                " must be a contiguous I32 tensor on HPU");
+  }
+
+  void launchOnExecute(std::array<at::Tensor, 6> tensors) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    TORCH_CHECK(!closed_ && recipe_.handle != nullptr,
+                "Device Engram launch raced producer close");
+    auto device_context = communicator_->getDeviceCtxt();
+    auto &device = habana::HPUDeviceContext::get_device();
+    auto &stream = device.get_stream(0);
+    auto resources = std::make_shared<GenericResourceHolder>();
+    std::vector<void *> addresses;
+    std::vector<synapse_helpers::device_ptr> inputs;
+    std::vector<synapse_helpers::device_ptr> outputs;
+    addresses.reserve(tensors.size());
+    for (size_t index = 0; index < tensors.size(); ++index) {
+      resources->add_tensor(tensors[index]);
+      addresses.push_back(tensors[index].data_ptr());
+      auto storage = reinterpret_cast<synapse_helpers::device_ptr>(
+          tensors[index].storage().data_ptr().get());
+      (index < 4 ? inputs : outputs).push_back(storage);
+    }
+    device.add_wait_events_on_stream(inputs, stream);
+    device.add_wait_events_on_stream(outputs, stream);
+    device_context->lock_address(addresses, resources->get_address_lock());
+    const auto &locked = *resources->get_address_lock();
+    auto descriptors = recipe_.launch_template;
+    descriptors[0].pTensorAddress = locked.at(0);
+    descriptors[1].pTensorAddress = locked.at(1);
+    descriptors[2].pTensorAddress = locked.at(2);
+    descriptors[3].pTensorAddress = locked.at(3);
+    descriptors[4].pTensorAddress = weights_->address();
+    descriptors[5].pTensorAddress = scales_->address();
+    descriptors[6].pTensorAddress = locked.at(4);
+    descriptors[7].pTensorAddress = locked.at(5);
+    checkSynapse(synLaunch(stream, descriptors.data(), descriptors.size(),
+                           recipe_.workspace_address, recipe_.handle,
+                           SYN_FLAGS_TENSOR_NAME),
+                 "synLaunch(device Engram)");
+    auto &recipe_counter = device_context->get_active_recipe_counter();
+    recipe_counter.increase();
+    auto self = shared_from_this();
+    device.register_producer_on_stream(
+        std::move(outputs), stream,
+        [self, resources, &recipe_counter]() mutable {
+          resources.reset();
+          recipe_counter.decrease_and_notify();
+        });
+    launches_.fetch_add(1);
+  }
+
+  std::shared_ptr<habana::HcclCommunicator> communicator_;
+  at::Tensor token_map_;
+  at::Tensor parameters_;
+  std::unique_ptr<MappedCheckpointRange> weights_;
+  std::unique_ptr<MappedCheckpointRange> scales_;
+  DeviceEngramRecipe recipe_;
+  mutable std::mutex mutex_;
+  std::atomic<uint64_t> launches_{0};
+  bool closed_ = false;
+};
+
 #include "tp2_prepared_plan.h"
 #include "tp2_native_decode_graph.h"
 #include "tp2_native_graph_probe.h"
@@ -1172,6 +1595,10 @@ namespace py = pybind11;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   dsv41_timing::bind(module);
+  module.attr("fixed_input_preflight_api_version") = 1;
+  py::class_<tp2_input::FixedInputPreflight>(module, "FixedInputPreflight")
+      .def(py::init<const std::vector<at::Tensor>&, std::vector<at::Tensor>>())
+      .def("updates", &tp2_input::FixedInputPreflight::updates);
   module.def("set_prepared_communication", [](bool enabled) { g_prepared_comm_enabled.store(enabled); });
   py::class_<PreparedGroupPlan, std::shared_ptr<PreparedGroupPlan>>(module, "PreparedGroupPlan")
       .def(py::init<>())
@@ -1199,6 +1626,30 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       .def("invalidate", [](PreparedGroupPlan& self) { self.valid.store(false); });
   module.def("record_native_completion", &tp2_native::recordNativeCompletion);
   module.def("copy_sampled_tokens_to_host", &tp2_native::copySampledTokensToHost);
+  module.def("copy_integer_record_to_host", &tp2_native::copyIntegerRecordToHost);
+  module.def("copy_c1_pipeline_tensors",
+      [](const c10::intrusive_ptr<c10d::Backend>& backend, std::vector<at::Tensor> sources,
+         std::vector<at::Tensor> destinations) {
+        auto* hccl_backend = dynamic_cast<c10d::ProcessGroupEagerHCCL*>(backend.get());
+        TORCH_CHECK(hccl_backend != nullptr, "C1 PP DMA requires ProcessGroupEagerHCCL");
+        copyC1PipelineTensors(hccl_backend, std::move(sources), std::move(destinations));
+      });
+  py::class_<DeviceEngramProducer, std::shared_ptr<DeviceEngramProducer>>(
+      module, "DeviceEngramProducer")
+      .def(py::init<const c10::intrusive_ptr<c10d::Backend> &,
+                    const std::string &, uint64_t, uint64_t,
+                    const std::string &, uint64_t, uint64_t, uint64_t,
+                    at::Tensor, at::Tensor>(),
+           py::arg("backend"), py::arg("weight_file"),
+           py::arg("weight_offset"), py::arg("weight_bytes"),
+           py::arg("scale_file"), py::arg("scale_offset"),
+           py::arg("scale_bytes"), py::arg("rows"),
+           py::arg("token_map"), py::arg("parameters"))
+      .def("launch", &DeviceEngramProducer::launch)
+      .def("mapped_bytes", &DeviceEngramProducer::mappedBytes)
+      .def("workspace_bytes", &DeviceEngramProducer::workspaceBytes)
+      .def("launch_count", &DeviceEngramProducer::launchCount)
+      .def("close", &DeviceEngramProducer::close);
   py::class_<tp2_native::NativeCompletion, std::shared_ptr<tp2_native::NativeCompletion>>(
       module, "NativeCompletion")
       .def("query", &tp2_native::NativeCompletion::query, py::call_guard<py::gil_scoped_release>())
@@ -1208,6 +1659,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       module, "NativeDecodeGraph")
       .def(py::init<>())
       .def("configure_topology", &tp2_native::NativeDecodeGraph::configureTopology)
+      .def("configure_late_inputs", &tp2_native::NativeDecodeGraph::configureLateInputs)
       .def("capture", [](const std::shared_ptr<tp2_native::NativeDecodeGraph>& self,
                           std::vector<std::shared_ptr<PreparedGroupPlan>> plans, py::list inputs) {
         std::vector<torch::jit::Stack> stacks;
@@ -1225,6 +1677,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       .def("stage_fixed_inputs", &tp2_native::NativeDecodeGraph::stageFixedInputs)
       .def("replay_fixed", &tp2_native::NativeDecodeGraph::replayFixed)
       .def("replay_fixed_with_completion", &tp2_native::NativeDecodeGraph::replayFixedWithCompletion)
+      .def("replay_fixed_prefix", &tp2_native::NativeDecodeGraph::replayFixedPrefix)
+      .def("replay_fixed_finish_with_completion",
+           &tp2_native::NativeDecodeGraph::replayFixedFinishWithCompletion)
       .def("update_inputs", [](const std::shared_ptr<tp2_native::NativeDecodeGraph>& self,
                                 std::vector<std::shared_ptr<PreparedGroupPlan>> plans, py::list inputs) {
         std::vector<torch::jit::Stack> stacks;
