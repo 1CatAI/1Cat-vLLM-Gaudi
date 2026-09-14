@@ -15,11 +15,19 @@ foreach(SOURCE IN LISTS KERNEL_SOURCES)
     get_filename_component(NAME "${SOURCE}" NAME_WE)
     set(OBJECT "${CMAKE_CURRENT_BINARY_DIR}/${NAME}.o")
     set(EMBEDDED "${CMAKE_CURRENT_BINARY_DIR}/${NAME}_embedded.o")
+    set(EXTRA_HEADERS)
+    if(NAME STREQUAL "deepseek_v41_attention_norm_bf16_gaudi2")
+        list(APPEND EXTRA_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/../flashinfer_gaudi/kernels/norm_math_gaudi2.h")
+    elseif(NAME STREQUAL "deepseek_v41_mla_shared_kv_gaudi2")
+        list(APPEND EXTRA_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/deepseek_v41_mla_gather_gaudi2.c")
+    elseif(NAME STREQUAL "deepseek_v41_mla_exp_bf16_gaudi2")
+        list(APPEND EXTRA_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/deepseek_v41_mla_softmax_gaudi2.c")
+    endif()
     add_custom_command(OUTPUT "${OBJECT}"
         COMMAND "${TPC_COMPILER}" -Wall -Werror -O2 -march=gaudi2
             -I${TPC_INCLUDE_DIR} -I${CMAKE_CURRENT_SOURCE_DIR}/include
             "${SOURCE}" -c -o "${OBJECT}"
-        DEPENDS "${SOURCE}" ${KERNEL_HEADERS} VERBATIM)
+        DEPENDS "${SOURCE}" ${KERNEL_HEADERS} ${EXTRA_HEADERS} VERBATIM)
     add_custom_command(OUTPUT "${EMBEDDED}"
         COMMAND "${ELF_OBJCOPY}" -I binary -O elf64-x86-64 -B i386:x86-64
             "./${NAME}.o" "${NAME}_embedded.o"

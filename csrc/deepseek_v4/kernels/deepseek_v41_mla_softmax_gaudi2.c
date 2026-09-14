@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Sink contributes to the denominator once and has no value row. Probabilities
 // remain FP32 through the PV matrix operation; padding is explicitly masked.
-void main(tensor logits, tensor mask, tensor sink, tensor scale, tensor probabilities) {
+void main(tensor logits, tensor mask, tensor sink, tensor scale, tensor probabilities
+#ifdef DSV41_MLA_BF16_PV
+          , tensor inverse_denominator
+#endif
+          ) {
     const int5 start = get_index_space_offset();
     const int5 end = start + get_index_space_size();
     const int chunks = get_dim_size(logits, 0) / 64;
@@ -29,7 +33,16 @@ void main(tensor logits, tensor mask, tensor sink, tensor scale, tensor probabil
         total = v_f32_reduce_add(total) + v_exp_cephes_f32(sink_value - maximum);
         float64 inverse = v_reciprocal_f32(total);
         inverse = inverse * (2.0f - total * inverse);
+#ifdef DSV41_MLA_BF16_PV
+        v_f32_st_tnsr_partial((int5){0, head, 0, 0, 0}, inverse_denominator, inverse, 0, 0);
+        for (int c = 0; c < chunks; ++c) {
+            float128 wide = {0}; wide.v1 = exponentials[c];
+            v_bf16_st_tnsr_partial((int5){c * 64, head, 0, 0, 0}, probabilities,
+                                  convert_float128_to_bfloat128(wide, SW_LINEAR), 63, 0);
+        }
+#else
         for (int c = 0; c < chunks; ++c)
             v_f32_st_tnsr((int5){c * 64, head, 0, 0, 0}, probabilities, exponentials[c] * inverse);
+#endif
     }
 }

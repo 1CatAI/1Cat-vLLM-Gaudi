@@ -92,6 +92,14 @@ class CSA2Attention(nn.Module):
         self.paired_exp = gaudi_envs.VLLM_HPU_DSV41_ATTENTION_PAIRED_EXP
         self.head_pair = gaudi_envs.VLLM_HPU_DSV41_ATTENTION_HEAD_PAIR
         self.mla_mme = gaudi_envs.VLLM_HPU_DSV41_MLA_MME
+        self.mla_bf16_pv = gaudi_envs.VLLM_HPU_DSV41_MLA_BF16_PV
+        if self.mla_bf16_pv and not self.mla_mme:
+            raise ValueError("BF16 PV requires the shared-KV MME MLA path")
+        self.q_scale_rope = gaudi_envs.VLLM_HPU_DSV41_Q_SCALE_ROPE
+        if self.q_scale_rope and not (self.native_rope and gaudi_envs.VLLM_HPU_DSV41_ATTN_DENSE_FP8):
+            raise ValueError("Q scale/RoPE fusion requires native RoPE and prepared dense FP8")
+        self.kv_first = gaudi_envs.VLLM_HPU_DSV41_ATTN_KV_FIRST
+        self.fused_norm = gaudi_envs.VLLM_HPU_DSV41_ATTN_FUSED_NORM
         self.block_exp = gaudi_envs.VLLM_HPU_DSV41_ATTENTION_BLOCK_EXP
         self.prepared_output = (gaudi_envs.VLLM_HPU_DSV41_PREPARED_OUTPUT and layer < config["num_hidden_layers"])
         self.output_gemm_layout = (gaudi_envs.VLLM_HPU_DSV41_OUTPUT_GEMM_LAYOUT and layer < config["num_hidden_layers"])
@@ -254,6 +262,14 @@ class CSA2Attention(nn.Module):
                 value.reshape(1, -1, shape[-1]).contiguous(), positions, table).reshape(shape)
         return apply_rope(value, positions, self.rotary, inverse=inverse)
 
+    def project_query(self, value, positions):
+        weight = self.weights.wq_b
+        if self.q_scale_rope and value.shape[0] == 1 and getattr(weight, "dense_fp8", False):
+            value = quantize_activation(value) if hasattr(weight, "scale") else value
+            return torch.ops.custom_op.custom_deepseek_v41_q_projection_rope_gaudi2(
+                value, weight.weight, weight.channel_scale, positions, self.rotary_native).reshape(-1, self.heads, 512)
+        return self._rope(self.linear(value, weight).reshape(-1, self.heads, 512), positions)
+
     def _compress(self, value, positions):
         compressor = self.weights.compressor
         if self.ratio == 2:
@@ -310,10 +326,13 @@ class CSA2Attention(nn.Module):
 
     def forward(self, value, positions, ready_outputs=()):
         query_input, kv_input = self._project_qkv_input(value)
-        query = rms_norm(query_input, self.weights.q_norm.weight, self.eps)
-        query = self.linear(query, self.weights.wq_b).reshape(-1, self.heads, 512)
-        query = self._rope(query, positions)
-        kv = rms_norm(kv_input, self.weights.kv_norm.weight, self.eps)
+        norm = (torch.ops.custom_op.custom_deepseek_v41_attention_norm_bf16_gaudi2
+                if self.fused_norm and value.shape[0] == 1 else rms_norm)
+        query = norm(query_input, self.weights.q_norm.weight, self.eps)
+        delay_q = self.kv_first and value.shape[0] == 1
+        if not delay_q:
+            query = self.project_query(query, positions)
+        kv = norm(kv_input, self.weights.kv_norm.weight, self.eps)
         kv = self._rope(kv, positions)
         completion = None
         if self.decoded_kv_state and value.shape[0] == 1:
@@ -344,6 +363,8 @@ class CSA2Attention(nn.Module):
         if use_c1_indices:
             indices, lengths = torch.ops.custom_op.custom_deepseek_v41_c1_indices_i32_gaudi2(
                 positions, compressed_indices.contiguous(), self.ratio)
+        if delay_q:
+            query = self.project_query(query, positions)
         if self.decoded_kv_state and value.shape[0] == 1:
             main = self.cache.decoded_main if self.ratio else self.shared.decoded_swa
             # Reuse layers are downstream of their source layer's completed
@@ -351,7 +372,9 @@ class CSA2Attention(nn.Module):
             # their own FP4 writer completion in this recipe.
             main_done = compressed_completion if compressed_completion is not None else completion
             if self.mla_mme:
-                output = torch.ops.custom_op.custom_deepseek_v41_mla_mme_gaudi2(
+                mla = (torch.ops.custom_op.custom_deepseek_v41_mla_bf16_pv_gaudi2 if self.mla_bf16_pv
+                       else torch.ops.custom_op.custom_deepseek_v41_mla_mme_gaudi2)
+                output = mla(
                     query.contiguous(), self.shared.decoded_swa, main, indices.contiguous(), self.weights.attn_sink,
                     self.scale, lengths.contiguous(), completion, main_done, self.decoded_swa_offset,
                     self.length // self.ratio if self.ratio else 0)

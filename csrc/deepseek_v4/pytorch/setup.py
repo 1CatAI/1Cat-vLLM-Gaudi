@@ -50,8 +50,11 @@ setup(
                 "hpu_dsv41_paged_attention_pt2.cpp", "hpu_dsv41_selected_mla_pt2.cpp", "hpu_dsv41_kv_pack_pt2.cpp",
                 "hpu_dsv41_rope_pt2.cpp", "hpu_dsv41_prefix_layout_pt2.cpp", "hpu_dsv41_control_gemv_pt2.cpp",
                 "hpu_dsv41_csa2_prep_pt2.cpp", "hpu_dsv41_decoded_kv_pt2.cpp", "hpu_dsv41_fp4_pack_pt2.cpp",
-                "hpu_dsv41_fp8_operands_pt2.cpp", "hpu_dsv41_mla_mme_pt2.cpp", "hpu_dsv41_router_top6_pt2.cpp",
-                "hpu_dsv41_swa_pack_pt2.cpp", "hpu_dsv41_woa_fp8_pt2.cpp", "hpu_dsv41_bf16_linear_f32_pt2.cpp"
+                "hpu_dsv41_fp8_operands_pt2.cpp", "hpu_dsv41_dense_fp8_pt2.cpp",
+                "hpu_dsv41_q_projection_rope_pt2.cpp", "hpu_dsv41_mla_mme_pt2.cpp",
+                "hpu_dsv41_router_top6_pt2.cpp",
+                "hpu_dsv41_swa_pack_pt2.cpp", "hpu_dsv41_woa_fp8_pt2.cpp",
+                "hpu_dsv41_bf16_linear_f32_pt2.cpp", "hpu_dsv41_mhc_gates_pt2.cpp"
             ],
             include_dirs=includes,
             library_dirs=[get_lib_dir()],

@@ -24,8 +24,10 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV4_MXFP4_PREPARED_MME: bool = False
     VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH: bool = False
     VLLM_HPU_DSV41_EXPERT_N256: bool = False
+    VLLM_HPU_DSV41_DEFAULT_FASTPATHS: bool = False
     VLLM_HPU_DSV41_EXPERT_N256_FP8: bool = False
     VLLM_HPU_DSV41_EXPERT_FUSED_QUANT: bool = False
+    VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE: bool = False
     VLLM_HPU_DSV41_MLA_MME: bool = False
     VLLM_HPU_DSV41_QKV_FUSED_INPUT: bool = False
     VLLM_HPU_DSV41_PREPARED_SHARDS: bool = False
@@ -49,6 +51,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_FIXED_POSITIONS: bool = False
     VLLM_HPU_DSV41_PACKED_PP: bool = False
     VLLM_HPU_DSV41_TPC_MHC: bool = False
+    VLLM_HPU_DSV41_MHC_GATES_FUSED: bool = False
     VLLM_HPU_DSV41_ENGRAM_NATIVE_C1: bool = False
     VLLM_HPU_DSV41_ENGRAM_C1_PACKET: bool = False
     VLLM_HPU_DSV41_TP_MHC_OVERLAP: bool = False
@@ -59,10 +62,19 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_NATIVE_PP_COPY: bool = False
     VLLM_HPU_DSV41_PREPARED_OUTPUT: bool = False
     VLLM_HPU_DSV41_OUTPUT_GEMM_LAYOUT: bool = False
+    VLLM_HPU_DSV41_ATTN_DENSE_FP8: bool = False
+    VLLM_HPU_DSV41_ATTN_KV_FIRST: bool = False
+    VLLM_HPU_DSV41_ATTN_FUSED_NORM: bool = False
+    VLLM_HPU_DSV41_MLA_BF16_PV: bool = False
+    VLLM_HPU_DSV41_Q_SCALE_ROPE: bool = False
+    VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR: str = ""
+    VLLM_HPU_DSV41_ATTN_DENSE_FP8_CONFIG: str = ""
     VLLM_HPU_DSV41_EXPERT_K128: bool = False
     VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE: bool = False
     VLLM_HPU_DSV41_ROUTER_TOP6: bool = False
     VLLM_HPU_DSV41_BF16_LM_HEAD: bool = False
+    VLLM_HPU_DSV41_SHARED_GATE_UP: bool = False
+    VLLM_HPU_DSV41_BF16_ROUTER_GATE: bool = False
     VLLM_HPU_DSV41_FP8_DECODE: bool = False
     VLLM_HPU_DSV41_FP8_SIDECAR: str = ""
     VLLM_HPU_DSV41_FP8_CONFIG: str = ""
@@ -297,12 +309,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_MXFP4_DECODE_GATHER", "1").lower() in ("1", "true"),
 
     # V4.1 is a separate opt-in contract; none of the V4 defaults enable it.
+    "VLLM_HPU_DSV41_DEFAULT_FASTPATHS":
+    lambda: os.environ.get("VLLM_HPU_DSV41_DEFAULT_FASTPATHS", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_EXPERT_N256":
     lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_N256", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_EXPERT_N256_FP8":
     lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_N256_FP8", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_EXPERT_FUSED_QUANT":
     lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_FUSED_QUANT", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE":
+    lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MLA_MME":
     lambda: os.environ.get("VLLM_HPU_DSV41_MLA_MME", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_QKV_FUSED_INPUT":
@@ -347,6 +363,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_PACKED_PP", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_TPC_MHC":
     lambda: os.environ.get("VLLM_HPU_DSV41_TPC_MHC", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_MHC_GATES_FUSED":
+    lambda: os.environ.get("VLLM_HPU_DSV41_MHC_GATES_FUSED", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_ENGRAM_NATIVE_C1":
     lambda: os.environ.get("VLLM_HPU_DSV41_ENGRAM_NATIVE_C1", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_ENGRAM_C1_PACKET":
@@ -367,6 +385,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_PREPARED_OUTPUT", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_OUTPUT_GEMM_LAYOUT":
     lambda: os.environ.get("VLLM_HPU_DSV41_OUTPUT_GEMM_LAYOUT", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_ATTN_DENSE_FP8":
+    lambda: os.environ.get("VLLM_HPU_DSV41_ATTN_DENSE_FP8", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_ATTN_KV_FIRST":
+    lambda: os.environ.get("VLLM_HPU_DSV41_ATTN_KV_FIRST", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_ATTN_FUSED_NORM":
+    lambda: os.environ.get("VLLM_HPU_DSV41_ATTN_FUSED_NORM", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_MLA_BF16_PV":
+    lambda: os.environ.get("VLLM_HPU_DSV41_MLA_BF16_PV", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_Q_SCALE_ROPE":
+    lambda: os.environ.get("VLLM_HPU_DSV41_Q_SCALE_ROPE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR":
+    lambda: os.environ.get("VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR", ""),
+    "VLLM_HPU_DSV41_ATTN_DENSE_FP8_CONFIG":
+    lambda: os.environ.get("VLLM_HPU_DSV41_ATTN_DENSE_FP8_CONFIG", ""),
     "VLLM_HPU_DSV41_EXPERT_K128":
     lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_K128", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE":
@@ -375,6 +407,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_ROUTER_TOP6", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_BF16_LM_HEAD":
     lambda: os.environ.get("VLLM_HPU_DSV41_BF16_LM_HEAD", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_SHARED_GATE_UP":
+    lambda: os.environ.get("VLLM_HPU_DSV41_SHARED_GATE_UP", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_BF16_ROUTER_GATE":
+    lambda: os.environ.get("VLLM_HPU_DSV41_BF16_ROUTER_GATE", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_FP8_DECODE":
     lambda: os.environ.get("VLLM_HPU_DSV41_FP8_DECODE", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_FP8_SIDECAR":

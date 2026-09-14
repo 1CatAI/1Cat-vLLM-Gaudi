@@ -83,8 +83,17 @@ def prepare_rows(codes, scales):
     """Prepare aligned N rows; source and expanded temporaries stay bounded."""
     if codes.dtype != np.uint8 or codes.ndim != 2 or codes.shape[1] != 4096 or codes.shape[0] % 32:
         raise ValueError("wo_a row blocks require uint8 [multiple-of-32,4096]")
-    if scales.dtype != np.uint8 or scales.shape != (codes.shape[0] // 32, 128) or np.any(scales == 255):
-        raise ValueError("wo_a requires finite UE8M0 block32 scales")
+    return prepare_block32_rows(codes, scales)
+
+
+def prepare_block32_rows(codes, scales):
+    """Channel-requantize a bounded, aligned block without discarding K scales."""
+    if (codes.dtype != np.uint8 or codes.ndim != 2 or codes.shape[0] % 32 or codes.shape[1] % 32
+            or not codes.size):
+        raise ValueError("Channel preparation requires nonempty block32-aligned uint8 rows")
+    if (scales.dtype != np.uint8 or scales.shape != (codes.shape[0] // 32, codes.shape[1] // 32)
+            or np.any(scales == 255)):
+        raise ValueError("Channel preparation requires finite UE8M0 block32 scales")
     powers = np.repeat(np.repeat(scales.astype(np.int32) - 127, 32, 0), 32, 1)
     values = np.ldexp(decode_e4m3fn(codes), powers)
     channel = covering_scale(np.max(np.abs(values), axis=1, keepdims=True))

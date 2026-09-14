@@ -8,6 +8,84 @@ import os
 from pathlib import Path
 import sys
 
+_C1_FASTPATH_DEFAULTS = {
+    "VLLM_HPU_DSV41_PREPARED_SHARDS": "1",
+    "VLLM_HPU_DSV41_ENGRAM_HOST_TABLE": "1",
+    "VLLM_HPU_DSV41_GRAPH_REPLAY": "1",
+    "VLLM_HPU_DSV41_VISION": "1",
+    "VLLM_HPU_DSV41_QUANT_ROUNDTRIP": "1",
+    "VLLM_HPU_DSV41_PACKED_ATTENTION": "1",
+    "VLLM_HPU_DSV41_FIXED_POSITIONS": "1",
+    "VLLM_HPU_DSV41_PACKED_PP": "1",
+    "VLLM_HPU_DSV41_TPC_MHC": "1",
+    "VLLM_HPU_DSV41_DIRECT_TOKEN_IDS": "1",
+    "VLLM_HPU_DSV41_NATIVE_PP_COPY": "1",
+    "VLLM_HPU_DSV41_PREPARED_OUTPUT": "1",
+    "VLLM_HPU_DSV41_BOUNDED_ATTENTION": "1",
+    "VLLM_HPU_DSV41_SWA_PACK_WRITE": "1",
+    "VLLM_HPU_DSV41_FP4_CACHE_WRITE": "1",
+    "VLLM_HPU_DSV41_NATIVE_ROPE": "1",
+    "VLLM_HPU_DSV41_C1_INDICES": "1",
+    "VLLM_HPU_DSV41_SELECTED_VALID_ONLY": "1",
+    "VLLM_HPU_DSV41_TP_MHC_OVERLAP": "1",
+    "VLLM_HPU_DSV41_ENGRAM_NATIVE_C1": "1",
+    "VLLM_HPU_DSV41_ENGRAM_C1_PACKET": "1",
+    "VLLM_HPU_DSV41_DECODED_KV_STATE": "1",
+    "VLLM_HPU_DSV41_WO_A_FP8": "1",
+    "VLLM_HPU_DSV41_ROUTER_TOP6": "1",
+    "VLLM_HPU_DSV41_BF16_LM_HEAD": "1",
+    "VLLM_HPU_DSV41_MLA_MME": "1",
+    "VLLM_HPU_DSV41_EXPERT_K128": "1",
+    "VLLM_HPU_DSV41_EXPERT_N256_FP8": "1",
+    "VLLM_HPU_DSV41_EXPERT_FUSED_QUANT": "1",
+    "VLLM_HPU_DSV41_QKV_FUSED_INPUT": "1",
+    "VLLM_HPU_DSV41_ATTN_FUSED_NORM": "1",
+    "VLLM_HPU_DSV41_SHARED_GATE_UP": "1",
+    "VLLM_HPU_DSV41_BF16_ROUTER_GATE": "1",
+    "VLLM_HPU_DSV41_MHC_GATES_FUSED": "1",
+    "VLLM_HPU_DSV41_ATTN_DENSE_FP8": "1",
+    "VLLM_HPU_DSV41_Q_SCALE_ROPE": "1",
+    "VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE": "1",
+    "VLLM_HPU_TP2_NATIVE_JOINT_PLAN": "1",
+    "VLLM_HPU_TP2_PREPARED_COMM": "1",
+    "VLLM_HPU_TP2_STATIC_GROUP_PLAN": "1",
+}
+
+_SIDECARS = {
+    "wo_a_fp8": ("VLLM_HPU_DSV41_WO_A_FP8", "VLLM_HPU_DSV41_WO_A_FP8_SIDECAR"),
+    "attention_dense_fp8": ("VLLM_HPU_DSV41_ATTN_DENSE_FP8", "VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR"),
+}
+
+
+def _enabled(value):
+    return str(value).strip().lower() in ("1", "true")
+
+
+def prepare_default_fastpaths(model, sidecars=None):
+    """Enable the qualified ordinary-C1 profile from one aggregate switch."""
+    if not _enabled(os.environ.get("VLLM_HPU_DSV41_DEFAULT_FASTPATHS", "1")):
+        return
+    os.environ.setdefault("VLLM_HPU_DSV41_DSPARK", "0")
+    if _enabled(os.environ["VLLM_HPU_DSV41_DSPARK"]):
+        return
+    for key, value in _C1_FASTPATH_DEFAULTS.items():
+        os.environ.setdefault(key, value)
+    model = Path(model).resolve()
+    configured = sidecars or {}
+    for name, (enabled_key, path_key) in _SIDECARS.items():
+        if not _enabled(os.environ.get(enabled_key, "0")) or os.environ.get(path_key):
+            continue
+        candidates = []
+        if configured.get(name):
+            candidates.append(Path(configured[name]).expanduser())
+        candidates.extend((model / "sidecars" / name, model.parent / f"{model.name}-{name}"))
+        directory = next((candidate.resolve() for candidate in candidates if candidate.is_dir()), None)
+        if directory is None:
+            raise RuntimeError(
+                f"Default V4.1 fast paths require the {name} sidecar; prepare {model / 'sidecars' / name} "
+                f"or disable {enabled_key}")
+        os.environ[path_key] = str(directory)
+
 
 def prepare_native_libraries():
     configured_library = os.environ.get("VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR")
@@ -39,7 +117,9 @@ def prepare_native_libraries():
     os.environ["VLLM_HPU_DSV4_TPC_OP_LIBRARY"] = str(extensions[0])
 
 
-def prepare_environment():
+def prepare_environment(model=None, sidecars=None):
+    if model is not None:
+        prepare_default_fastpaths(model, sidecars)
     prepare_native_libraries()
     defaults = {
         "PT_HPU_LAZY_MODE": "0",
@@ -135,7 +215,7 @@ def main():
     if settings and not leased_run:
         from vllm_gaudi.entrypoints.serving_resources import prepare_serving_resources
         prepare_serving_resources(settings, args.model, extra)
-    prepare_environment()
+    prepare_environment(args.model, settings.get("sidecars"))
     loader = {} if args.checkpoint_audit is None else {"checkpoint_audit": args.checkpoint_audit}
     trace_dir = os.environ.get("VLLM_TORCH_PROFILER_DIR")
     if trace_dir and not any(value.startswith("--profiler-config") for value in extra):
@@ -158,14 +238,16 @@ def main():
         extra += ["--reasoning-parser", "deepseek_v41"]
     if not any(value.startswith("--served-model-name") for value in extra):
         extra += ["--served-model-name", "DeepSeek-V4.1-Flash"]
+    from vllm_gaudi import envs as gaudi_envs
+    speculative = (["--speculative-config", '{"method":"dspark","num_speculative_tokens":5}']
+                   if gaudi_envs.VLLM_HPU_DSV41_DSPARK else [])
     sys.argv = [
         "vllm", "serve", args.model, "--host", args.host, "--port",
-        str(args.port), "--dtype", "bfloat16", "--max-model-len", "1048576", "--generation-config", "vllm",
-        "--override-generation-config", '{"temperature":0}', "--tensor-parallel-size", "2", "--pipeline-parallel-size",
-        "2", "--max-num-seqs", "32", "--max-num-batched-tokens", "8192", "--enable-chunked-prefill", "--load-format",
-        "dsv41_prepared", "--model-loader-extra-config",
+        str(args.port), "--dtype", "bfloat16", "--max-model-len", "512", "--generation-config", "vllm",
+        "--tensor-parallel-size", "2", "--pipeline-parallel-size", "2", "--max-num-seqs", "1",
+        "--max-num-batched-tokens", "512", "--load-format", "dsv41_prepared", "--model-loader-extra-config",
         json.dumps(loader), "--mm-encoder-tp-mode", "data", "--no-enable-prefix-caching", "--no-async-scheduling",
-        "--speculative-config", '{"method":"dspark","num_speculative_tokens":5}', *extra
+        "--block-size", "512", *speculative, *extra
     ]
     from vllm.entrypoints.cli.main import main as serve
     serve()

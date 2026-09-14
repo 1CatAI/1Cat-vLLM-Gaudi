@@ -29,8 +29,11 @@ def main():
     parser.add_argument("--include-missing-reference", action="store_true")
     parser.add_argument("--profile-only", action="store_true")
     parser.add_argument("--fused-quant", action="store_true")
+    parser.add_argument("--fused-reduce", action="store_true")
     parser.add_argument("--layers", type=int, nargs="+", default=[0, 4, 14, 19])
     args = parser.parse_args()
+    if args.fused_reduce and not args.fused_quant:
+        parser.error("--fused-reduce requires --fused-quant")
     output = Path(os.environ["DSV41_RUN_EVIDENCE"])
     torch.ops.load_library(os.environ["VLLM_HPU_DSV4_TPC_OP_LIBRARY"])
     bind_worker_cpu(0)
@@ -41,11 +44,12 @@ def main():
     lookup = mxfp4_bf16_lut("hpu")
     selected = list(range(12))
     inputs, weights = [], {"candidate": []}
-    if args.include_missing_reference:
+    if args.include_missing_reference or args.fused_reduce:
         weights["reference"] = []
     record = {
         "layout_fingerprint": FINGERPRINT,
         "fused_quant": args.fused_quant,
+        "fused_reduce": args.fused_reduce,
         "layers": args.layers,
         "selected_real_experts": selected,
         "uninitialized_experts_never_addressed": True,
@@ -93,12 +97,17 @@ def main():
             shared = torch.randn(1, 5120).bfloat16().to("hpu")
             weights["candidate"].append((ids, route, new["w13"][0], new["w2"][0], new["w13"][1], new["w2"][1], lookup,
                                          new["w13"][2], new["w2"][2], shared))
-            if args.include_missing_reference:
+            if args.fused_reduce:
+                # Isolate only the finalize tail. Both arms consume identical
+                # prepared N256 weights and changing IDs/activations.
+                weights["reference"].append(weights["candidate"][-1])
+            elif args.include_missing_reference:
                 weights["reference"].append(
                     (ids, route, old["w13"][0], old["w2"][0], old["w13"][1], old["w2"][1], lookup, shared))
 
         def candidate(x, ids, route, q13, q2, s13, s2, lut, c13, c2, shared):
-            op = (torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2
+            op = (torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2
+                  if args.fused_reduce else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2
                   if args.fused_quant else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fp8_gaudi2)
             value = op(x, ids, route, q13, q2, s13, s2, lut, c13, c2, True)
             return (value.float() + shared.float()).bfloat16()
@@ -108,15 +117,54 @@ def main():
                 x, ids, route, q13, q2, s13, s2, lut, True)
             return (value.float() + shared.float()).bfloat16()
 
+        def fused_reference(x, ids, route, q13, q2, s13, s2, lut, c13, c2, shared):
+            value = torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2(
+                x, ids, route, q13, q2, s13, s2, lut, c13, c2, True)
+            return (value.float() + shared.float()).bfloat16()
+
         replays, compiled = {}, {}
         for arm in weights:
-            fn = candidate if arm == "candidate" else reference
+            fn = candidate if arm == "candidate" else fused_reference if args.fused_reduce else reference
             compiled[arm] = torch.compile(fn, backend="hpu_backend", fullgraph=True, dynamic=False)
             for x, w in zip(inputs, weights[arm], strict=True):
                 ordinary = fn(x, *w).cpu()
                 actual = compiled[arm](x, *w).cpu()
                 assert torch.equal(ordinary.view(torch.int16), actual.view(torch.int16)), (arm, "ordinary/compiled")
             replays[arm] = recorder.prepare(compiled[arm], inputs, weights[arm])
+        if args.fused_reduce:
+            for layer, (x, candidate_weights, reference_weights) in enumerate(
+                    zip(inputs, weights["candidate"], weights["reference"], strict=True)):
+                actual = compiled["candidate"](x, *candidate_weights).cpu()
+                expected = compiled["reference"](x, *reference_weights).cpu()
+                if not torch.equal(actual.view(torch.int16), expected.view(torch.int16)):
+                    delta = actual.float() - expected.float()
+                    mismatched = actual.view(torch.int16) != expected.view(torch.int16)
+                    record["finalize_mismatch"] = {
+                        "layer_index": layer,
+                        "mismatched_elements": int(mismatched.sum()),
+                        "total_elements": actual.numel(),
+                        "maximum_absolute_error": float(delta.abs().max()),
+                        "mean_absolute_error": float(delta.abs().mean()),
+                        "candidate_first_16": actual.flatten()[:16].float().tolist(),
+                        "reference_first_16": expected.flatten()[:16].float().tolist(),
+                    }
+                    np.save(output / "finalize_candidate.npy", actual.float().numpy())
+                    np.save(output / "finalize_reference.npy", expected.float().numpy())
+                    np.save(output / "finalize_shared.npy", candidate_weights[-1].cpu().float().numpy())
+                    candidate_core = torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2(
+                        x, *candidate_weights[:-1], True).cpu()
+                    reference_core = torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2(
+                        x, *reference_weights[:-1], True).cpu()
+                    np.save(output / "finalize_candidate_core.npy", candidate_core.float().numpy())
+                    np.save(output / "finalize_reference_core.npy", reference_core.float().numpy())
+                    (output / "result.json").write_text(json.dumps(record, indent=2))
+                    raise AssertionError((layer, "finalize mismatch", record["finalize_mismatch"]))
+            record["checks"].append({
+                "candidate_reference_bitwise_equal":
+                True,
+                "comparison":
+                "same N256 W13/W2 chain; fused finalize versus materialized six-row tail",
+            })
         bind_worker_helpers(0)
         record["peak_hpu_allocated_bytes"] = torch.hpu.max_memory_allocated()
         record["thread_affinity"] = {
