@@ -583,10 +583,20 @@ class HpuPlatform(Platform):
 
     @classmethod
     def get_max_concurrent_batches(cls, vllm_config):
-        from vllm_gaudi.ops.deepseek_v41_config import is_v41
+        from vllm_gaudi.ops.deepseek_v41_config import is_v41, uses_v2
+        if uses_v2(vllm_config):
+            return vllm_config.parallel_config.pipeline_parallel_size + 1
         # This runner owns one PP/verify transaction. The scheduler must commit
         # its sampled anchor before submitting the following draft block.
         return 1 if is_v41(vllm_config) else None
+
+    @classmethod
+    def supports_v2_without_triton(cls, vllm_config):
+        from vllm_gaudi.ops.deepseek_v41_config import uses_v2, validate_v2
+        if not uses_v2(vllm_config):
+            return False
+        validate_v2(vllm_config)
+        return True
 
     @classmethod
     def configure_control_process(cls, role):

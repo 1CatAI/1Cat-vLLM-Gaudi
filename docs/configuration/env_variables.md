@@ -203,15 +203,17 @@ RMSNorm is considered.
 
 The experimental [prepared TP2×PP2 profile](../features/deepseek_v41.md)
 rejects unsupported execution contracts. Its dedicated entrypoint enables the
-measured ordinary-C1 bundle by default; the generic vLLM entrypoint keeps the
-individual switches disabled.
+frozen-reference structural and V2 device-continuation bundle by default; the
+generic vLLM entrypoint keeps the individual switches disabled.
 
 | Variable | Description | Default |
 |---|---|---|
-| `VLLM_HPU_DSV41_DEFAULT_FASTPATHS` | Controls the measured ordinary-C1 bundle in `vllm_gaudi.entrypoints.deepseek_v41`. Set to `0` for the compatibility profile. Individual feature variables remain valid overrides. | `true` in the dedicated entrypoint; otherwise `false` |
+| `VLLM_HPU_DSV41_DEFAULT_FASTPATHS` | Controls the frozen-reference ordinary-C1 and V2 device-continuation bundle in `vllm_gaudi.entrypoints.deepseek_v41`. Set to `0` for the compatibility profile. Individual feature variables remain valid overrides. | `true` in the dedicated entrypoint; otherwise `false` |
+| `VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS` | Enables the separate arithmetic-changing FP8, Router, MLA and fused numerical bundle in the dedicated entrypoint. These paths remain opt-in because their archived full-model outputs did not pass the frozen-reference quality gate. | `false` |
 | `VLLM_HPU_DSV41_PREPARED_SHARDS` | Enables the rank-local loader and bounded CSA2 runner on four Gaudi2 devices. Requires the immutable TP2×PP2 manifest. | `false` |
 | `VLLM_HPU_DSV41_ENGRAM_HOST_TABLE` | Uses shared read-only host mmap tables, native asynchronous row gather, and generation-owned HPU staging. | `false` |
 | `VLLM_HPU_DSV41_GRAPH_REPLAY` | Captures each PP stage with the ABI-locked native compute/communication plan. Requires prepared communication and the static group plan. | `false` |
+| `VLLM_HPU_DSV41_V2` | Selects the V2 HPU adapter with device token relay and deferred host output. Requires `VLLM_USE_V2_MODEL_RUNNER=1`, async scheduling, native replay, direct token IDs, and the engine's non-Triton V2 platform capability hook. Ordinary C1 only; incompatible with DSpark and inline completion. The complete device-continuation bundle passed the frozen 3x192-token output and end-to-end gates. | `true` in the dedicated entrypoint; otherwise `false` |
 | `VLLM_HPU_DSV41_DSPARK` | Runs the three-layer draft on PP1 with accepted-prefix context insertion and Engram rollback. Requires `method=dspark`, five speculative tokens. | `false` |
 | `VLLM_HPU_DSV41_VISION` | Binds the portable upstream ViT/aligner to prepared PP0 weights. Requires `mm_encoder_tp_mode=data`. | `false` |
 | `VLLM_HPU_DSV41_QUANT_ROUNDTRIP` | Fuses BF16 activation group-32 E4M3FN quantization and restoration in TPC. Matrix operands remain BF16. Experimental. | `false` |
@@ -223,8 +225,12 @@ individual switches disabled.
 | `VLLM_HPU_DSV41_FIXED_POSITIONS` | Binds cached views of an immutable device position bank directly to C1 decode native staging. Prefill keeps its disjoint input buffers. Requires the single-in-flight V4.1 runner. | `false` |
 | `VLLM_HPU_DSV41_PACKED_PP` | Packs ordinary C1 BF16 hidden and FP32 pre-mix bits into one HCCL message using two generation-owned buffers. DSpark and multi-token transfers retain their existing transport. Experimental. | `false` |
 | `VLLM_HPU_DSV41_TPC_MHC` | Uses FP32 TPC GEMV for the C1 mHC control projection. Preserves FP32 operands but changes reduction order from MME; requires separate model quality qualification. Other shapes retain MME. Experimental. | `false` |
-| `VLLM_HPU_DSV41_ENGRAM_NATIVE_C1` | Performs C1 compression, integer hash, TP row lookup and final pinned staging copies in the native host extension. Requires C1 ABI version 1; retains consumer-stream DMA, request history transactions and the existing prefill path. Experimental, not performance or quality qualified. | `false` |
+| `VLLM_HPU_DSV41_ENGRAM_NATIVE_C1` | Performs C1 compression, integer hash, TP row lookup and final pinned staging copies in the native host extension. Requires a matching native C1 ABI; device Engram requires ABI version 2. Retains consumer-stream DMA, request history transactions and the existing prefill path. Experimental, not performance or quality qualified. | `false` |
 | `VLLM_HPU_DSV41_ENGRAM_C1_PACKET` | Requires native C1 preparation. Packs both Engram layers into one fixed pinned C1 transfer, with one consumer completion event protecting packet reuse. Prefill keeps its existing buffers and transfers. Experimental. | `false` |
+| `VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT` | Experimental ordinary BF16 C1 path requiring native input replay and C1 packets. Retains the pinned host ring but shares one packed device destination with the captured graph, avoiding two intermediate D2D copies. Bridge storage dependencies and packet completion still protect old readers and host reuse. Qualified as part of the V2 device-continuation bundle. | `false` |
+| `VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT` | Experimental V2 ordinary C1 input commit before waiting for the next sampled token. Engram consumer events still protect input storage; PP retirement and sampled-token publication still wait for the true host-copy completion. Qualified as part of the V2 device-continuation bundle. | `false` |
+| `VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX` | Experimental V2 PP0 publication split within one complete compiled graph. Derives the prefix from captured late-input reads, retaining TP and input-copy dependencies. Requires native input replay, TP/mHC overlap, early input commit and the Synapse segmented-plan V3 API. Qualified as part of the V2 device-continuation bundle. | `false` |
+| `VLLM_HPU_DSV41_V2_DEVICE_ENGRAM` | Experimental PP0 C1 continuation path. Fuses exact device-token hashing, production layer-1 host-mapped gather and FP8 decode into one TPC recipe, while native host C1 prepares only the late layer-14 packet. Requires segmented replay, native C1 packets and direct graph inputs. Qualified as part of the V2 device-continuation bundle. | `false` |
 | `VLLM_HPU_DSV41_TP_MHC_OVERLAP` | Splits proven independent C1 residual/mHC work between TP production and consumption. Requires the versioned native dependency API, BF16 ordinary decode and joint replay; rejects a capture with no independent segment. Experimental, not performance or quality qualified. | `false` |
 | `VLLM_HPU_DSV41_NATIVE_INPUT_PREFLIGHT` | Batches V4.1 C1 input and state allocation/layout guards in the native adapter before copying inputs and replaying. Requires graph replay and the version 1 preflight API; retains generation and alias checks. Experimental. | `false` |
 | `VLLM_HPU_DSV41_ATTENTION_PAIRED_EXP` | Evaluates the two broadcast scalar exponentials of ordered C1 attention together in SIMD lanes, using the existing Cephes routine. Requires bounded, selected-valid-only attention and its SWA write dependency. Experimental. | `false` |
@@ -508,7 +514,7 @@ explicit. It does not enable the separate legacy FP8 decode candidate.
 `VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE` (default `0`) additionally reduces the six
 already scaled routed-expert rows in routing order inside one TPC consumer. It
 requires N256 FP8 and fused quantization. The dedicated ordinary-C1 entrypoint
-enables it through the aggregate bundle.
+enables it only through the experimental numerical aggregate bundle.
 
 ### V4.1 projection candidates
 
@@ -516,9 +522,9 @@ enables it through the aggregate bundle.
 
 The native projection consumes the prepared FP8 weight directly instead of imposing a TPC weight-copy pass. Compiler-selected SRAM/DRAM placement must still be verified in the actual combined model graph. Activation preparation retains the per-token/group maximum and exact power-of-two scaling contract.
 
-The codec uses bias 7, maximum magnitude 240, nearest-even rounding followed by flushing FP8 subnormals and canonicalizing zero. Original block scales are consumed during bounded channel preparation. This changes the numerical contract, including activation quantization. The dedicated ordinary-C1 entrypoint enables it through the aggregate bundle; the generic entrypoint leaves it disabled.
+The codec uses bias 7, maximum magnitude 240, nearest-even rounding followed by flushing FP8 subnormals and canonicalizing zero. Original block scales are consumed during bounded channel preparation. This changes the numerical contract, including activation quantization. The dedicated ordinary-C1 entrypoint enables it only through the experimental numerical aggregate bundle; the generic entrypoint leaves it disabled.
 
-`VLLM_HPU_DSV41_ROUTER_TOP6=1` retains FP32 gate scores and replaces the generic sort/gather/normalization with native repeated-max top6 selection, including text/image bias selection and smallest-ID ties. The selection uses paired score/ID comparisons and packs the six results into two vector writes. `VLLM_HPU_DSV41_BF16_ROUTER_GATE=1` keeps the checkpoint gate in BF16 and produces FP32 logits from BF16 MME operands. `VLLM_HPU_DSV41_BF16_LM_HEAD=1` retains the checkpoint BF16 head and uses BF16 MME operands with FP32 accumulation and logits. All require DSpark disabled. The dedicated ordinary-C1 entrypoint enables them through the aggregate bundle; the generic entrypoint leaves them disabled.
+`VLLM_HPU_DSV41_ROUTER_TOP6=1` retains FP32 gate scores and replaces the generic sort/gather/normalization with native repeated-max top6 selection, including text/image bias selection and smallest-ID ties. The selection uses paired score/ID comparisons and packs the six results into two vector writes. `VLLM_HPU_DSV41_BF16_ROUTER_GATE=1` keeps the checkpoint gate in BF16 and produces FP32 logits from BF16 MME operands. `VLLM_HPU_DSV41_BF16_LM_HEAD=1` retains the checkpoint BF16 head and uses BF16 MME operands with FP32 accumulation and logits. All require DSpark disabled. The dedicated ordinary-C1 entrypoint enables them only through the experimental numerical aggregate bundle; the generic entrypoint leaves them disabled.
 
 `VLLM_HPU_DSV41_SHARED_GATE_UP=1` concatenates each shared expert's gate and up
 weights once at model load and executes one projection before the existing
@@ -544,7 +550,7 @@ precision configuration only by reconstructing/reloading the model and recipes.
 `VLLM_HPU_DSV41_ATTN_FUSED_NORM=1` replaces C1 Q/KV RMSNorm with a TPC row kernel,
 reusing FlashInfer-Gaudi reduction primitives while keeping the V4.1 FP32 weight
 product and final BF16 boundary. Prefill retains its existing normalization.
-The dedicated ordinary-C1 entrypoint enables it through the aggregate bundle;
+The dedicated ordinary-C1 entrypoint enables it only through the experimental numerical aggregate bundle;
 the generic entrypoint leaves it disabled. Performance and model quality
 qualification remain separate gates.
 

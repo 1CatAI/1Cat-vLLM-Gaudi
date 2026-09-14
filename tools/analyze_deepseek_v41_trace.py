@@ -39,6 +39,34 @@ def symbols(inventory, recipes):
     return result
 
 
+def logical_replay_markers(inventory, expected):
+    legacy = sorted(row for row in inventory["cpu_markers"]
+                    if row[2] == "vllm_gaudi::native_decoder_enqueue")
+    if len(legacy) == expected:
+        return legacy, {"mode": "single", "single": len(legacy)}
+
+    prefixes = sorted(row for row in inventory["cpu_markers"]
+                      if row[2] == "vllm_gaudi::native_decoder_prefix_enqueue")
+    finishes = sorted(row for row in inventory["cpu_markers"]
+                      if row[2] == "vllm_gaudi::native_decoder_finish_enqueue")
+    if len(legacy) + len(prefixes) != expected or len(prefixes) != len(finishes):
+        raise AssertionError({
+            "expected": expected,
+            "single": len(legacy),
+            "prefix": len(prefixes),
+            "finish": len(finishes),
+        })
+    for index, (prefix, finish) in enumerate(zip(prefixes, finishes)):
+        if prefix[0] > finish[0] or (index + 1 < len(prefixes) and finish[0] > prefixes[index + 1][0]):
+            raise AssertionError({"unpaired_segmented_replay": index, "prefix": prefix, "finish": finish})
+    return sorted(legacy + prefixes), {
+        "mode": "segmented",
+        "single": len(legacy),
+        "prefix": len(prefixes),
+        "finish": len(finishes),
+    }
+
+
 def analyze(root, rank):
     path = root / f"rank{rank}"
     inv = json.loads((path / "inventory.json").read_text())
@@ -48,8 +76,7 @@ def analyze(root, rank):
     byid = {str(recipe["recipe_id"]): recipe for recipe in recipes}
     stats = json.loads((root.parent / f"traces/rank{rank}-native-profile-stop.json").read_text())
     mapped = symbols(inv, recipes)
-    markers = [row for row in inv["cpu_markers"] if row[2] == "vllm_gaudi::native_decoder_enqueue"]
-    assert len(markers) == stats["native_replays"]
+    markers, marker_proof = logical_replay_markers(inv, stats["native_replays"])
     first = min(row[0] for row in markers)
     capture = [
         row for row in inv["host_enqueues"] if row[0] < first and ("/graph_" in row[3] or row[3].endswith(".recipe"))
@@ -128,7 +155,8 @@ def analyze(root, rank):
                 "windows_us": windows,
                 "calls": calls,
                 "boundary_proofs": proofs,
-                "capture_order": capture
+                "capture_order": capture,
+                "replay_marker_proof": marker_proof,
             },
             indent=2) + "\n")
     period = sum(b - a for a, b in windows)
@@ -137,7 +165,7 @@ def analyze(root, rank):
     window_ends = [end for _, end in windows]
     with gzip.open(path / "hardware.jsonl.gz", "rt") as stream:
         for line in stream:
-            start, duration, lane, index = json.loads(line)
+            start, duration, lane, index = json.loads(line)[:4]
             selected = bisect.bisect_right(window_ends, start)
             if selected >= len(windows):
                 continue

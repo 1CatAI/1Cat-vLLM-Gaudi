@@ -23,11 +23,14 @@ int main() {
     assert(GetKernelGuids(DEVICE_ID_GAUDI2, &count, guids.data()) == GLUE_SUCCESS);
     uint32_t custom_count = 0;
     bool selected_kv_seen = false;
+    bool device_engram_seen = false;
     for (const auto& guid : guids) {
         if (std::strstr(guid.name, "deepseek_v4")) {
             ++custom_count;
             selected_kv_seen |= std::strcmp(
                 guid.name, "custom_deepseek_v41_selected_kv_bf16_gaudi2") == 0;
+            device_engram_seen |= std::strcmp(
+                guid.name, "custom_deepseek_v41_engram_hash_gather_bf16_gaudi2") == 0;
             HabanaKernelParams query{};
             query.guid = guid;
             uint32_t layouts_count = 0;
@@ -46,6 +49,7 @@ int main() {
     }
     assert(custom_count >= 52);
     assert(selected_kv_seen);
+    assert(device_engram_seen);
     HabanaKernelParams params{};
     HabanaKernelInstantiation instance{};
     std::strcpy(

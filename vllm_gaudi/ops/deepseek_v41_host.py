@@ -24,6 +24,29 @@ from vllm_gaudi.ops.deepseek_v41_weights import file_hash, publish_json
 envs = gaudi_envs
 
 
+def _signed_i32_bits(value):
+    value = int(value) & 0xffffffff
+    return value if value < 0x80000000 else value - 0x100000000
+
+
+def device_engram_parameters(layout, layer, tp_rank, pad_id):
+    """Pack the split-u64 hash constants consumed by the device producer."""
+    layer_index = layout.layer_ids.index(layer)
+    shard = layout.head_shard(layer, tp_rank)
+    result = [int(pad_id), shard["head_start"], shard["row_start"]]
+    for multiplier in layout.multipliers[layer_index]:
+        bits = int(multiplier) & 0xffffffffffffffff
+        result.extend((_signed_i32_bits(bits), _signed_i32_bits(bits >> 32)))
+    first, last = shard["head_start"], shard["head_stop"]
+    primes = [int(value) for value in layout.primes[layer_index, first:last]]
+    result.extend(primes)
+    result.extend(int(value) for value in layout.offsets[layer_index, first:last])
+    result.extend(pow(2, 64, prime) for prime in primes)
+    if len(result) != 47:
+        raise RuntimeError("Device Engram parameter ABI requires exactly 47 I32 values")
+    return result
+
+
 @cache
 def _configured_host_native(directory):
     root = Path(directory).resolve()
@@ -60,18 +83,23 @@ class EngramTransfer:
 class _C1Packet:
     """One ownership event covers upload and both Engram consumers."""
 
-    def __init__(self, heads, width, device):
+    def __init__(self, heads, width, device, *, destination=None):
         stride = width + width // 32
         self.host = torch.empty(sum(heads) * stride, dtype=torch.uint8, device="cpu").pin_memory("hpu")
         if not self.host.is_pinned("hpu"):
             raise RuntimeError("The HPU runtime did not pin Engram packet staging")
-        self.device = torch.empty_like(self.host, device=device)
+        if destination is not None and (destination.shape != self.host.shape or destination.dtype != torch.uint8
+                                        or not destination.is_contiguous() or destination.storage_offset() != 0
+                                        or destination.device.type != torch.device(device).type):
+            raise ValueError("Direct Engram destination must be one contiguous byte packet on the target device")
+        self.device = torch.empty_like(self.host, device=device) if destination is None else destination
         host_views, device_views, start = [], [], 0
         for count in heads:
             stop = start + count * stride
             host_views.append(self.host[start:stop].view(1, count, stride))
             device_views.append(self.device[start:stop].view(1, count, stride))
             start = stop
+        self.host_buffers = tuple(host_views)
         self.targets = [value.numpy() for value in host_views]
         self.buffers = tuple(device_views)
         self.consumer_done = torch.hpu.Event()
@@ -86,11 +114,14 @@ class _C1Packet:
             self.consumer_done.synchronize()
         self.inflight = False
 
-    def upload(self, generation):
+    def upload(self, generation, *, late_only=False):
         if self.inflight or self.pending_generation or generation <= self.generation:
             raise RuntimeError("Stale or occupied Engram packet generation")
         self.pending_generation = generation
-        self.device.copy_(self.host, non_blocking=True)
+        if late_only:
+            self.buffers[1].copy_(self.host_buffers[1], non_blocking=True)
+        else:
+            self.device.copy_(self.host, non_blocking=True)
 
     def complete(self, generation, stream):
         if self.pending_generation != generation:
@@ -205,11 +236,26 @@ class EngramHost:
         if native.abi_version != 1 or torch.device(device).type != "hpu":
             raise RuntimeError("V4.1 Engram requires its native host gather and an HPU DMA runtime")
         self.native_c1 = None
+        self.device_c1 = None
+        self.device_rows = None
+        self.device_history = None
+        self.device_history_parity = 0
+        self.device_request = None
+        self.device_position = None
+        self.device_pending = None
         self.c1_packets = None
         if (gaudi_envs.VLLM_HPU_DSV41_ENGRAM_C1_PACKET and not gaudi_envs.VLLM_HPU_DSV41_ENGRAM_NATIVE_C1):
             raise RuntimeError("Engram C1 packets require native C1 preparation")
-        if (gaudi_envs.VLLM_HPU_DSV41_ENGRAM_NATIVE_C1 and getattr(native, "c1_abi_version", None) != 1):
+        if (gaudi_envs.VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT
+                and not (gaudi_envs.VLLM_HPU_DSV41_ENGRAM_C1_PACKET
+                         and gaudi_envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH
+                         and gaudi_envs.VLLM_HPU_DSV41_GRAPH_REPLAY)):
+            raise RuntimeError("Direct Engram inputs require C1 packets and native input graph replay")
+        self.c1_abi = getattr(native, "c1_abi_version", None)
+        if gaudi_envs.VLLM_HPU_DSV41_ENGRAM_NATIVE_C1 and self.c1_abi not in (1, 2):
             raise RuntimeError("The enabled Engram C1 path requires its matching native preparation ABI")
+        if gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and self.c1_abi != 2:
+            raise RuntimeError("Device Engram requires native host C1 ABI 2")
         if max_tokens not in range(1, 513) or ring_size < 2:
             raise ValueError("Invalid bounded Engram staging geometry")
         self.directory, self.tp_rank = Path(directory), tp_rank
@@ -265,9 +311,13 @@ class EngramHost:
             layers = self.layout.layer_ids
             if gaudi_envs.VLLM_HPU_DSV41_ENGRAM_C1_PACKET:
                 heads = [self.shards[layer]["head_stop"] - self.shards[layer]["head_start"] for layer in layers]
-                self.c1_packets = [_C1Packet(heads, self.layout.head_dim, device) for _ in range(ring_size)]
+                first = _C1Packet(heads, self.layout.head_dim, device)
+                destination = first.device if gaudi_envs.VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT else None
+                self.c1_packets = [first] + [_C1Packet(heads, self.layout.head_dim, device, destination=destination)
+                                            for _ in range(ring_size - 1)]
                 targets = [packet.targets for packet in self.c1_packets]
                 self.audit["c1_packet_bytes"] = sum(packet.host.numel() for packet in self.c1_packets)
+                self.audit["direct_input"] = destination is not None
             else:
                 targets = [[self.slots[layer][slot].decode_host.numpy() for layer in layers]
                            for slot in range(ring_size)]
@@ -276,6 +326,8 @@ class EngramHost:
                 np.array([self.shards[layer]["head_start"] for layer in layers], dtype=np.int64),
                 np.array([self.shards[layer]["head_stop"] for layer in layers], dtype=np.int64), self.history.pad_id,
                 [self.tables[layer] for layer in layers], targets)
+        if gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM:
+            self._initialize_device_c1(host, device)
         self.batches = None
         if envs.VLLM_HPU_DSV41_BATCHED_INPUT_STAGING:
             if max_tokens != 6 or not envs.VLLM_HPU_DSV41_FUSED_STAGE_IO:
@@ -293,6 +345,84 @@ class EngramHost:
             }
             for layer, table in self.tables.items()
         }
+
+    def _initialize_device_c1(self, host, device):
+        from vllm_gaudi.distributed.tp2_fused_ar_norm import _resolve_runtime
+
+        layer = self.layout.layer_ids[0]
+        if layer != 1:
+            raise RuntimeError("Device Engram currently owns the layer-1 table only")
+        shard = self.shards[layer]
+        local_heads = shard["head_stop"] - shard["head_start"]
+        if local_heads != 12 or self.layout.head_dim != 256:
+            raise RuntimeError("Device Engram requires the qualified 12x256 TP-local geometry")
+        weight = host["tables"][f"layers.{layer}.engram.embed.weight"]
+        scale = host["tables"][f"layers.{layer}.engram.embed.scale"]
+        rows = shard["row_stop"] - shard["row_start"]
+        token_map = torch.from_numpy(self.history.token_map.astype(np.int32)).to(device)
+        parameters = torch.tensor(device_engram_parameters(self.layout, layer, self.tp_rank, self.history.pad_id),
+                                  dtype=torch.int32,
+                                  device=device)
+        self.device_rows = torch.empty((1, local_heads, self.layout.head_dim), dtype=torch.bfloat16, device=device)
+        self.device_history = (
+            torch.empty(3, dtype=torch.int32, device=device),
+            torch.empty(3, dtype=torch.int32, device=device),
+        )
+        bridge, backend, _ = _resolve_runtime()
+        if not hasattr(bridge, "DeviceEngramProducer"):
+            raise RuntimeError("The TP2 bridge lacks the device Engram producer ABI")
+        self.device_c1 = bridge.DeviceEngramProducer(
+            backend,
+            weight["file"],
+            int(weight["shard_offset"]),
+            rows * self.layout.head_dim,
+            scale["file"],
+            int(scale["shard_offset"]),
+            rows * (self.layout.head_dim // 32),
+            rows,
+            token_map,
+            parameters,
+        )
+        self.audit["device_c1_mapped_bytes"] = self.device_c1.mapped_bytes()
+        self.audit["device_c1_workspace_bytes"] = self.device_c1.workspace_bytes()
+
+    def prepare_device_c1(self, request_id, raw_token):
+        if self.device_c1 is None or self.closed or self.pending is not None or self.device_pending is not None:
+            raise RuntimeError("Device Engram preparation started outside an idle layer-1 transaction")
+        if raw_token.device.type != "hpu" or raw_token.dtype != torch.int32 or raw_token.numel() != 1:
+            raise ValueError("Device Engram requires one raw I32 HPU token")
+        if self.device_request != request_id or self.device_position != self.history.position:
+            suffix = np.full(3, -1, dtype=np.int32)
+            committed = self.history.history[-3:][::-1]
+            suffix[:len(committed)] = committed
+            self.device_history[0].copy_(torch.from_numpy(suffix), non_blocking=True)
+            self.device_history_parity = 0
+            self.device_request = request_id
+            self.device_position = self.history.position
+            self.audit["device_c1_history_resets"] = self.audit.get("device_c1_history_resets", 0) + 1
+        next_parity = self.device_history_parity ^ 1
+        self.device_c1.launch(raw_token.reshape(-1), self.device_history[self.device_history_parity],
+                              self.device_history[next_parity], self.device_rows)
+        self.device_history_parity = next_parity
+        self.device_position += 1
+        self.device_pending = request_id
+        self.audit["device_c1_launches"] = self.audit.get("device_c1_launches", 0) + 1
+        return self.device_rows
+
+    def stage_device_c1_reference(self, request_id, packed_rows):
+        if self.device_c1 is None or self.device_pending is not None:
+            raise RuntimeError("Device Engram warmup staging overlaps another layer-1 generation")
+        from vllm_gaudi.ops.deepseek_v41_math import unpack_swa
+
+        self.device_rows.copy_(unpack_swa(packed_rows, self.layout.head_dim))
+        self.device_pending = request_id
+        return self.device_rows
+
+    def consume_device_c1(self, request_id):
+        if self.device_c1 is None or self.device_pending != request_id:
+            raise RuntimeError("No matching device Engram layer-1 generation is ready")
+        self.device_pending = None
+        return self.device_rows
 
     def _verify_source(self, item, checkpoint_audit):
         path = Path(item["file"])
@@ -329,6 +459,9 @@ class EngramHost:
         for batch in getattr(self, "batches", None) or ():
             batch.reuse()
         self.history.reset(request_id)
+        self.device_request = None
+        self.device_position = None
+        self.device_pending = None
 
     def activate(self, request_id, *, reset=False):
         if self.pending is not None:
@@ -344,14 +477,16 @@ class EngramHost:
     def release_request(self, request_id):
         self.histories.pop(request_id, None)
 
-    def prepare(self, request_id, token_ids, image_mask=None, *, defer_wait=False):
+    def prepare(self, request_id, token_ids, image_mask=None, *, defer_wait=False, device_layer1=False):
         if self.closed or self.pending is not None:
             raise RuntimeError("Engram is closed or its preceding input transaction is still pending")
         count = len(token_ids)
         if count == 0 or count > self.max_tokens:
             raise ValueError("Engram input exceeds fixed staging capacity")
+        if device_layer1 and (count != 1 or self.device_c1 is None or self.device_pending != request_id):
+            raise RuntimeError("Layer-14-only preparation requires the matching device layer-1 generation")
         if count == 1 and self.native_c1 is not None:
-            ticket = self._prepare_native_c1(request_id, token_ids, image_mask)
+            ticket = self._prepare_native_c1(request_id, token_ids, image_mask, device_layer1=device_layer1)
             if not defer_wait:
                 self.wait(ticket)
             return ticket
@@ -375,7 +510,7 @@ class EngramHost:
             self.wait(ticket)
         return ticket
 
-    def _prepare_native_c1(self, request_id, token_ids, image_mask):
+    def _prepare_native_c1(self, request_id, token_ids, image_mask, *, device_layer1=False):
         if image_mask is not None and len(image_mask) != 1:
             raise ValueError("Image span mask does not match C1 input")
         image = bool(image_mask[0]) if image_mask is not None else False
@@ -387,12 +522,17 @@ class EngramHost:
         else:
             for layer in self.layout.layer_ids:
                 self.slots[layer][ring].reuse()
-        batch, faults = self.history.prepare_c1(request_id, int(token_ids[0]), image, self.native_c1, self.generation,
-                                                ring)
+        arguments = (request_id, int(token_ids[0]), image, self.native_c1, self.generation, ring)
+        if self.c1_abi == 2:
+            batch, faults = self.history.prepare_c1(*arguments, device_layer1)
+        else:
+            if device_layer1:
+                raise RuntimeError("Layer-14-only preparation requires native C1 ABI 2")
+            batch, faults = self.history.prepare_c1(*arguments)
         if packet is not None:
-            packet.upload(self.generation)
+            packet.upload(self.generation, late_only=device_layer1)
             buffers = packet.buffers
-            self.audit["dma_bytes"] += packet.host.numel()
+            self.audit["dma_bytes"] += packet.host_buffers[1].numel() if device_layer1 else packet.host.numel()
             self.audit["c1_packets"] = self.audit.get("c1_packets", 0) + 1
         else:
             stream = torch.hpu.current_stream()
@@ -404,7 +544,7 @@ class EngramHost:
                 buffers.append(slot.decode_device)
                 self.audit["dma_bytes"] += slot.decode_host.numel()
         self.audit["major_faults"] += faults
-        self.audit["gathers"] += len(self.layout.layer_ids)
+        self.audit["gathers"] += 1 if device_layer1 else len(self.layout.layer_ids)
         self.audit["generations"] += 1
         self.audit["native_c1"] = self.audit.get("native_c1", 0) + 1
         ticket = EngramTransfer(self.generation, ring, batch, tuple(buffers), packet is not None)
@@ -512,6 +652,8 @@ class EngramHost:
                 slot.consumer_done.record(torch.hpu.current_stream())
                 slot.inflight = True
         self.history.commit(ticket.batch, committed_inputs)
+        if self.c1_abi == 2 and self.native_c1 is not None and len(ticket.batch.compressed_ids) == 1:
+            self.native_c1.complete(ticket.batch.request_id, ticket.batch.generation, ticket.generation)
         self.pending = None
         self.ready_ticket = None
 
@@ -533,9 +675,18 @@ class EngramHost:
         # this owner's transfers/consumers before releasing mmap and staging.
         torch.hpu.synchronize()
         if self.pending is not None:
+            if self.c1_abi == 2 and self.native_c1 is not None and len(self.pending.batch.compressed_ids) == 1:
+                self.native_c1.complete(self.pending.batch.request_id, self.pending.batch.generation,
+                                        self.pending.generation)
             self.history.discard(self.pending.batch)
             self.pending = None
         self.ready_ticket = None
+        self.native_c1 = None
+        if self.device_c1 is not None:
+            self.device_c1.close()
+        self.device_c1 = None
+        self.device_rows = None
+        self.device_history = None
         self.slots.clear()
         if self.c1_packets is not None:
             self.c1_packets.clear()

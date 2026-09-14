@@ -25,6 +25,54 @@ struct NativeCollectiveDependency {
   NativeBufferRange input, output;
 };
 
+struct NativeInputPrefix {
+  uint32_t computes = UINT32_MAX;
+  size_t collectives = 0;
+};
+
+inline NativeInputPrefix prepareNativeInputPrefix(
+    const std::vector<NativeDependencyNode>& nodes, const std::vector<NativeBufferRange>& lateInputs,
+    const std::vector<NativeCollectiveDependency>& dependencies) {
+  if (lateInputs.empty() || dependencies.empty())
+    throw std::invalid_argument("Native input prefix requires late input bindings and TP dependencies");
+  NativeInputPrefix prefix;
+  std::vector<bool> used(lateInputs.size(), false);
+  uint32_t segment = 0;
+  for (const auto& node : nodes) {
+    for (size_t i = 0; i < lateInputs.size(); ++i) {
+      if (!lateInputs[i].bytes) throw std::invalid_argument("Native late input is empty");
+      for (const auto& output : node.outputs)
+        if (output.overlaps(lateInputs[i]))
+          throw std::invalid_argument("Native graph mutates a late input binding");
+      for (const auto& input : node.inputs)
+        if (input.overlaps(lateInputs[i])) {
+          prefix.computes = std::min(prefix.computes, segment);
+          used[i] = true;
+        }
+    }
+    if (!node.exchange) ++segment;
+  }
+  if (!prefix.computes || prefix.computes == UINT32_MAX ||
+      std::find(used.begin(), used.end(), false) != used.end())
+    throw std::invalid_argument("Native graph has no verified late-input-free prefix");
+  for (const auto& dependency : dependencies) {
+    // A device-side producer can live outside the captured compute graph while
+    // its exchange still feeds a prefix compute. Publish that collective with
+    // the prefix; stream input readiness protects its external source.
+    const bool producedInPrefix =
+        dependency.producer != UINT32_MAX && dependency.producer < prefix.computes;
+    const bool consumedInPrefix = dependency.consumer < prefix.computes;
+    if (!producedInPrefix && !consumedInPrefix) break;
+    ++prefix.collectives;
+  }
+  if (!prefix.collectives || prefix.collectives == dependencies.size())
+    throw std::invalid_argument("Native input boundary does not split TP publication");
+  for (size_t i = prefix.collectives; i < dependencies.size(); ++i)
+    if (dependencies[i].consumer < prefix.computes)
+      throw std::invalid_argument("Native input prefix consumes an unpublished exchange");
+  return prefix;
+}
+
 inline std::vector<NativeCollectiveDependency> prepareNativeDependencies(
     const std::vector<NativeDependencyNode>& nodes) {
   std::vector<uint32_t> segments(nodes.size());

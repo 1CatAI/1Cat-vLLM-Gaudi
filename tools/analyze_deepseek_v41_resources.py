@@ -103,7 +103,10 @@ def clip_windows(start, end, windows, ends):
 
 def stage_windows(own, markers, boundary_spans):
     """Bound the stage by its first/last recipe's actual device execution."""
-    enqueues = sorted(t for t, _, name in markers if name == 'vllm_gaudi::native_decoder_enqueue')
+    marker_names = {'vllm_gaudi::native_decoder_enqueue'}
+    if own.get('replay_marker_proof', {}).get('mode') == 'segmented':
+        marker_names.add('vllm_gaudi::native_decoder_prefix_enqueue')
+    enqueues = sorted(t for t, _, name in markers if name in marker_names)
     grouped = collections.defaultdict(list)
     for call in own['calls']:
         if call['complete']:
@@ -114,9 +117,18 @@ def stage_windows(own, markers, boundary_spans):
         if [call['layer'] for call in calls] != list(range(20)):
             continue
         index = bisect.bisect_right(enqueues, calls[0]['start']) - 1
-        if index < 0 or index + 1 == len(enqueues):
+        if index < 0:
             continue
-        lower, upper = enqueues[index:index + 2]
+        lower = enqueues[index]
+        if own.get('replay_marker_proof', {}).get('mode') == 'segmented':
+            next_calls = grouped.get(token + 1)
+            if not next_calls:
+                continue
+            upper = min(call['start'] for call in next_calls)
+        else:
+            if index + 1 == len(enqueues):
+                continue
+            upper = enqueues[index + 1]
         starts = [a for a, _ in boundary_spans['first'] if lower <= a < calls[0]['start']]
         ends = [b for a, b in boundary_spans['last'] if calls[-1]['end'] <= a < upper]
         if starts and ends:
@@ -156,7 +168,7 @@ def main():
         expert_lanes, tpc_lanes = collections.defaultdict(list), collections.defaultdict(list)
         with gzip.open(root / 'hardware.jsonl.gz', 'rt') as stream:
             for line in stream:
-                a, d, lane, i = json.loads(line)
+                a, d, lane, i = json.loads(line)[:4]
                 b = a + d
                 node = inv['nodes'][i]
                 if node['engine'] in ('TPC', 'MME', 'DMA'):

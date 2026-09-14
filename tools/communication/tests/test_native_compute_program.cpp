@@ -6,8 +6,100 @@
 
 struct Sync { uint32_t longSoIndex; uint64_t targetValue; };
 
+void testContinuationInput()
+{
+    using Input = NativeComputeProgram::ContinuationInput;
+    assert(NativeComputeProgram::continuationProducerOffset(2, 3) == 0);
+    assert(NativeComputeProgram::continuationProducerOffset(3, 3) == 0);
+    assert(NativeComputeProgram::continuationProducerOffset(4, 3) == 1);
+    assert(NativeComputeProgram::continuationProducerOffset(6, 3) == 3);
+    assert(NativeComputeProgram::producerAvailableToPrefix(UINT32_MAX, 3));
+    assert(NativeComputeProgram::producerAvailableToPrefix(0, 3));
+    assert(NativeComputeProgram::producerAvailableToPrefix(2, 3));
+    assert(!NativeComputeProgram::producerAvailableToPrefix(3, 3));
+    assert(!NativeComputeProgram::producerAvailableToPrefix(4, 3));
+    assert(NativeComputeProgram::continuationInput(8, 100, 8, 100, false) == Input::Ready);
+    assert(NativeComputeProgram::continuationInput(8, 100, 8, 100, true) == Input::NeedsFence);
+    assert(NativeComputeProgram::continuationInput(8, 100, 8, 101, false) == Input::Ready);
+    assert(NativeComputeProgram::continuationInput(8, 100, 8, 101, true) == Input::NeedsFence);
+    for (bool wait : {false, true}) {
+        assert(NativeComputeProgram::continuationInput(8, 100, 16, 100, wait) == Input::Invalid);
+        assert(NativeComputeProgram::continuationInput(8, 100, 8, 99, wait) == Input::Invalid);
+        assert(NativeComputeProgram::continuationInput(8, 0, 8, 100, wait) == Input::Invalid);
+        assert(NativeComputeProgram::continuationInput(8, 100, 8, 1ULL << 60, wait) == Input::Invalid);
+    }
+}
+
+void testSegmentedPublication()
+{
+    NativeScalCommandBuffer segment;
+    segment.commands = {{{1, 2, 3, 4}, false, true, true}, {{5, 6, 7, 8}, true, false, false}};
+    std::vector<const NativeScalCommandBuffer*> segments(8, &segment);
+    std::vector<NativeComputeWaitPacket> waits;
+    for (uint8_t part : {1, 2, 3, 0})
+        waits.push_back({{0, 0, 0, 0}, {{0, 0, 0xfffe0000u, uint8_t(part * 15), 17}}});
+    auto whole = NativeComputeProgram::prepare(segments, {1, 3, 5, 5, 7}, waits, 256, 32768,
+                                               true, false, {0, 1, 3, 3, 5});
+    size_t earlyCarry;
+    const auto early = whole.split(whole.segmentPageEnds[2], whole.segmentPageByteEnds[2],
+                                   whole.segmentPagePacketEnds[2], whole.segmentCompletionOffsets[2], 2, earlyCarry);
+    assert(earlyCarry == 1 && early.first.completionDelta == 3 && early.second.completionDelta == 5);
+    assert(early.first.lastWaitDependency() == 0);
+    assert(NativeComputeProgram::continuationProducerOffset(whole.producerOffsets[2], 3) == 1);
+    assert(NativeComputeProgram::continuationProducerOffset(whole.producerOffsets[3], 3) == 1);
+    const size_t pages = whole.segmentPageEnds[4];
+    assert(whole.segmentPageByteEnds[4] < whole.pages[pages - 1].bytes.size());
+    size_t carry;
+    auto parts = whole.split(pages, whole.segmentPageByteEnds[4], whole.segmentPagePacketEnds[4],
+                             whole.segmentCompletionOffsets[4], 3, carry);
+    const auto& prefix = parts.first;
+    const auto& suffix = parts.second;
+    assert(carry == 2 && prefix.completionDelta == 5 && suffix.completionDelta == 3);
+    assert(prefix.producerOffsets.size() == 3 && prefix.lastWaitDependency() == 1);
+    assert(suffix.lastWaitDependency() == 2 && whole.lastWaitDependency() == 4);
+    assert(prefix.byteCount + suffix.byteCount == whole.byteCount);
+    assert(prefix.sourcePacketCount + suffix.sourcePacketCount == whole.sourcePacketCount);
+    assert(!prefix.pages.back().endsCompletion && prefix.pages.back().completionOffset == 6);
+    auto emitted = [](const NativeComputeProgram& program, const Sync* completions) {
+        std::vector<uint8_t> result;
+        for (const auto& page : program.pages) {
+            const size_t begin = result.size();
+            result.resize(begin + page.bytes.size());
+            NativeComputeProgram::writePage(result.data() + begin, page, completions);
+        }
+        return result;
+    };
+    for (uint64_t start : {32765ULL, (1ULL << 30) - 3, (1ULL << 45) - 3}) {
+        std::array<Sync, 5> completions;
+        for (size_t i = 0; i < completions.size(); ++i) completions[i] = {8, start + i};
+        auto splitBytes = emitted(prefix, completions.data());
+        auto suffixBytes = emitted(suffix, completions.data() + carry);
+        splitBytes.insert(splitBytes.end(), suffixBytes.begin(), suffixBytes.end());
+        assert(splitBytes == emitted(whole, completions.data()));
+        auto earlyBytes = emitted(early.first, completions.data());
+        auto lateBytes = emitted(early.second, completions.data() + earlyCarry);
+        earlyBytes.insert(earlyBytes.end(), lateBytes.begin(), lateBytes.end());
+        assert(earlyBytes == emitted(whole, completions.data()));
+    }
+    NativeComputeProgram noWait;
+    assert(noWait.lastWaitDependency() == std::numeric_limits<size_t>::max());
+
+    auto externalWhole = NativeComputeProgram::prepare(
+        segments, {1, 3, 5, 5, 7}, waits, 256, 32768, true, true, {UINT32_MAX, 1, 3, 3, 5});
+    size_t externalCarry;
+    auto externalParts = externalWhole.split(
+        externalWhole.segmentPageEnds[4], externalWhole.segmentPageByteEnds[4],
+        externalWhole.segmentPagePacketEnds[4], externalWhole.segmentCompletionOffsets[4], 3, externalCarry);
+    assert(externalCarry == 2);
+    assert(externalParts.first.externalInputCompletion);
+    assert(externalParts.first.producerOffsets.front() == 0);
+    assert(!externalParts.second.externalInputCompletion);
+}
+
 int main()
 {
+    testContinuationInput();
+    testSegmentedPublication();
     NativeScalCommandBuffer pre, post;
     pre.completionIncrementsBeforeCommands = 1;
     pre.commands = {{{0x81, 0x82, 0x83, 0x84}, false, true, true}};
@@ -112,5 +204,6 @@ int main()
     auto retained = NativeComputeProgram::prepare({&pre,&trailing,&terminal}, {1}, wait, 16, 128);
     assert(retained.completionDelta == 5 && retained.pages.back().completionOffset == 5);
     assert(retained.pages.back().bytes.front() == 0x71);
-    std::cout << "native compute program: offsets/capacity/128 dependencies and 15/30/45/60-bit carry boundaries exact\n";
+    std::cout << "native compute program: offsets/capacity/128 dependencies and "
+                 "15/30/45/60-bit carry boundaries exact\n";
 }

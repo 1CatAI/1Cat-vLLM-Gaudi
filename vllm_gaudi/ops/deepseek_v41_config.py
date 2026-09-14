@@ -13,6 +13,38 @@ def supports_dspark(config):
     return is_v41(config) and envs.VLLM_HPU_DSV41_PREPARED_SHARDS and envs.VLLM_HPU_DSV41_DSPARK
 
 
+def uses_v2(config):
+    return is_v41(config) and envs.VLLM_HPU_DSV41_V2
+
+
+def validate_v2(config):
+    if not uses_v2(config):
+        return
+    if not config.use_v2_model_runner or not config.scheduler_config.async_scheduling:
+        raise ValueError("V4.1 V2 requires VLLM_USE_V2_MODEL_RUNNER=1 and async scheduling")
+    if envs.VLLM_HPU_DSV41_DSPARK or config.speculative_config is not None:
+        raise ValueError("V4.1 V2 supports ordinary C1 without DSpark")
+    if not envs.VLLM_HPU_DSV41_GRAPH_REPLAY or not envs.VLLM_HPU_DSV41_DIRECT_TOKEN_IDS:
+        raise ValueError("V4.1 V2 requires native graph replay and direct device token inputs")
+    if (envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX
+            and not (envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH
+                     and envs.VLLM_HPU_DSV41_FIXED_POSITIONS
+                     and envs.VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT
+                     and envs.VLLM_HPU_TP2_NATIVE_JOINT_PLAN
+                     and envs.VLLM_HPU_DSV41_TP_MHC_OVERLAP)):
+        raise ValueError("V4.1 segmented prefix requires native fixed inputs, early commit, and TP dependencies")
+    if envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX and envs.VLLM_HPU_DSV41_FUSED_STAGE_IO:
+        raise ValueError("V4.1 segmented prefix requires the native input graph instead of fused stage I/O")
+    if (envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM
+            and not (envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX
+                     and envs.VLLM_HPU_DSV41_ENGRAM_NATIVE_C1
+                     and envs.VLLM_HPU_DSV41_ENGRAM_C1_PACKET
+                     and envs.VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT)):
+        raise ValueError("Device Engram requires segmented PP0 replay, native C1 packets, and direct inputs")
+    if envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and config.model_config.max_model_len > 512:
+        raise ValueError("Device Engram is qualified only for the bounded context-512 profile")
+
+
 def validate_sampling(params):
     from vllm.exceptions import VLLMValidationError
     if params is None:
@@ -57,8 +89,11 @@ def configure(config):
             raise ValueError("Adaptive DSpark verification is outside the bounded V4.1 profile")
     elif spec is not None:
         raise ValueError("Enable VLLM_HPU_DSV41_DSPARK for the integrated draft")
-    if config.scheduler_config.async_scheduling:
+    validate_v2(config)
+    if config.scheduler_config.async_scheduling and not uses_v2(config):
         raise ValueError("V4.1 PP verify commits currently require --no-async-scheduling")
+    if config.use_v2_model_runner and not uses_v2(config):
+        raise ValueError("V4.1 V2 needs the explicit VLLM_HPU_DSV41_V2 backend adapter")
     if config.lora_config is not None or config.kv_transfer_config is not None:
         raise ValueError("V4.1 prepared state does not support LoRA or external KV transfer")
     if (envs.VLLM_HPU_DSV41_GRAPH_REPLAY

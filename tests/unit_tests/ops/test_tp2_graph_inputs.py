@@ -251,3 +251,51 @@ def test_native_failure_is_propagated_without_a_second_execution(monkeypatch):
     with pytest.raises(RuntimeError, match="failed after mutation"):
         replay.replay_native_decoder(model, **first)
     assert calls == ["mutation"] and model not in replay._native_entries
+
+
+def test_segmented_native_replay_stages_root_then_attention_inputs(monkeypatch):
+    from vllm_gaudi.ops import tp2_prepared_plan as replay
+
+    metadata = SimpleNamespace(is_prompt=False,
+                               direct_gdn_state=True,
+                               block_size=16,
+                               native_completion=None)
+    first = dict(positions=torch.tensor([3]),
+                 input_ids=torch.tensor([7]),
+                 attention_inputs=(torch.tensor([11]), torch.tensor([12])),
+                 metadata=metadata,
+                 state_generation=5,
+                 state_tensors=(),
+                 adapter=SimpleNamespace(name="deepseek_v41_pp0_input"))
+    owner = torch.nn.Identity()
+    captured = [[first["positions"], first["input_ids"], *first["attention_inputs"]]]
+    bindings = FixedDecodeInputs(owner, first, captured)
+    calls = []
+
+    class Graph:
+
+        def stage_fixed_inputs(self, sources, destinations):
+            calls.append(("stage", tuple(value.item() for value in sources), len(destinations)))
+
+        def replay_fixed_prefix(self):
+            calls.append(("prefix", ))
+
+        def replay_fixed_finish_with_completion(self):
+            calls.append(("finish", ))
+            return "completion"
+
+    communicator = object()
+    graph = Graph()
+    replay._native_entries[owner] = graph, bindings, ("output", ), communicator
+    monkeypatch.setattr(replay, "_runtime", lambda: (None, communicator))
+    updated = dict(first,
+                   positions=torch.tensor([4]),
+                   input_ids=torch.tensor([8]),
+                   attention_inputs=(torch.tensor([21]), torch.tensor([22])))
+    assert replay.begin_segmented_native_decoder(owner, **updated) == ("output", )
+    assert replay.finish_segmented_native_decoder(owner, **updated) == ("output", )
+    assert calls == [("stage", (4, 8), 2), ("prefix", ),
+                     ("stage", (21, 22), 2), ("finish", )]
+    assert metadata.native_completion == "completion"
+    assert owner not in replay._segmented_native_entries
+    replay._native_entries.pop(owner)

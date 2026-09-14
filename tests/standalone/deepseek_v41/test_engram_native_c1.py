@@ -6,8 +6,12 @@ import gc
 import numpy as np
 import pytest
 
-from vllm_gaudi.lib.dsv41_host_gather import HostRows, NativeC1Prepare
 from vllm_gaudi.ops.deepseek_v41_engram import EngramHashLayout, EngramTokenHistory
+from vllm_gaudi.ops.deepseek_v41_host import host_native
+
+native = host_native()
+HostRows = native.HostRows
+NativeC1Prepare = native.NativeC1Prepare
 
 
 def fixture(tmp_path, tp, width=256, overflow=False):
@@ -122,3 +126,25 @@ def test_bad_second_layer_rows_fail_before_any_write(tmp_path):
     assert all(np.array_equal(a, b) for row, saved in zip(targets, before) for a, b in zip(row, saved))
     with pytest.raises(RuntimeError, match="failed"):
         native.prepare("a", 1, 2, 0, 1, False, state.history)
+
+
+@pytest.mark.parametrize("tp", [0, 1])
+def test_late_only_c1_hashes_both_layers_but_writes_only_layer_14(tmp_path, tp):
+    state, native, targets, sources, args = fixture(tmp_path, tp)
+    reference = EngramTokenHistory(state.layout, state.token_map)
+    state.reset("late")
+    reference.reset("late")
+    expected = reference.prepare("late", [7], [False])
+    before_layer1 = targets[0][0].copy()
+
+    batch, faults = state.prepare_c1("late", 7, False, native, 1, 0, late_only=True)
+
+    first, last = args[4][1], args[5][1]
+    ids = expected.hash_ids[:, 1, first:last]
+    weights, scales = sources[1]
+    assert faults == 0
+    assert np.array_equal(batch.hash_ids, expected.hash_ids)
+    assert np.array_equal(targets[0][0], before_layer1)
+    assert np.array_equal(targets[0][1], np.concatenate((weights[ids], scales[ids]), axis=-1))
+    native.complete("late", batch.generation, 1)
+    state.commit(batch, 1)

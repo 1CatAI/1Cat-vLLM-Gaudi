@@ -20,6 +20,7 @@ _local = threading.local()
 _modules = weakref.WeakSet()
 _native_graphs = {}
 _native_entries = weakref.WeakKeyDictionary()
+_segmented_native_entries = weakref.WeakKeyDictionary()
 _native_entry_replays = 0
 _native_program_generation = 0
 _native_graph_owners = {}
@@ -171,6 +172,12 @@ def _flush():
                     _native_graph_owners[key] = weakref.ref(context["owner"])
                 if v4:
                     graph.configure_topology(groups, adapter.collectives, adapter.external_prefix)
+                if (v41 and gaudi_envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX
+                        and adapter.collectives == 43 and not adapter.external_prefix):
+                    attention_inputs = list(context["attention_inputs"])
+                    if gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM:
+                        attention_inputs = attention_inputs[1:]
+                    graph.configure_late_inputs(attention_inputs)
                 snapshot = context["snapshot"]() if v4 else None
                 graph.capture(native_plans, native_inputs)
                 graph.instantiate()
@@ -237,6 +244,53 @@ def replay_native_decoder(owner, **roots):
     return outputs
 
 
+def begin_segmented_native_decoder(owner, **roots):
+    """Publish the dependency-closed prefix of one complete native PP0 graph."""
+    entry = _native_entries.get(owner)
+    if entry is None:
+        raise RuntimeError("Segmented native replay has no warmed complete decoder entry")
+    if owner in _segmented_native_entries:
+        raise RuntimeError("Segmented native replay already has an active prefix")
+    graph, bindings, outputs, communicator = entry
+    if _runtime()[1] is not communicator:
+        raise RuntimeError("Segmented native replay communicator generation changed")
+    updates = bindings.updates(roots, sources={"root", "buffer"})
+    if updates is None:
+        raise RuntimeError("Segmented native prefix changed its fixed input contract")
+    try:
+        bindings.apply(updates, graph)
+        graph.replay_fixed_prefix()
+    except BaseException:
+        _native_entries.pop(owner, None)
+        raise
+    _segmented_native_entries[owner] = entry
+    return outputs
+
+
+def finish_segmented_native_decoder(owner, **roots):
+    """Publish the suffix after its late Engram inputs become available."""
+    global _native_entry_replays
+    entry = _segmented_native_entries.get(owner)
+    if entry is None or _native_entries.get(owner) is not entry:
+        raise RuntimeError("Segmented native suffix has no matching active prefix")
+    graph, bindings, outputs, communicator = entry
+    if _runtime()[1] is not communicator:
+        raise RuntimeError("Segmented native suffix communicator generation changed")
+    updates = bindings.updates(roots, sources={"attention_inputs"})
+    if updates is None:
+        raise RuntimeError("Segmented native suffix changed its fixed input contract")
+    try:
+        bindings.apply(updates, graph)
+        roots["metadata"].native_completion = graph.replay_fixed_finish_with_completion()
+    except BaseException:
+        _native_entries.pop(owner, None)
+        _segmented_native_entries.pop(owner, None)
+        raise
+    _segmented_native_entries.pop(owner, None)
+    _native_entry_replays += 1
+    return outputs
+
+
 @contextmanager
 def collect_prepared_group_replays(**native_context):
     """Collect consecutive prepared groups, flushing before any cold capture."""
@@ -270,8 +324,10 @@ def _release_native_graphs(owner=None):
     if owner is None:
         keys = list(_native_graphs)
         _native_entries.clear()
+        _segmented_native_entries.clear()
     else:
         entry = _native_entries.pop(owner, None)
+        _segmented_native_entries.pop(owner, None)
         keys = [
             key for key, graph in _native_graphs.items()
             if (_native_graph_owners.get(key, lambda: None)() is owner or (entry is not None and graph is entry[0]))

@@ -31,6 +31,7 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVE
 #include "deepseek_v41_csa2_prep_gaudi2.hpp"
 #include "deepseek_v41_decoded_kv_gaudi2.hpp"
 #include "deepseek_v41_control_gemv_gaudi2.hpp"
+#include "deepseek_v41_engram_hash_gather_bf16_gaudi2.hpp"
 #include "deepseek_v41_mxfp4_prepared_dequant_fp8_gaudi2.hpp"
 #include "deepseek_v41_mla_gaudi2.hpp"
 #include "deepseek_v41_woa_gaudi2.hpp"
@@ -174,6 +175,7 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_DYNAMIC_QUANT,
     GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_MLA_GATHER,
     GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_MLA_SOFTMAX,
+    GAUDI2_KERNEL_DEEPSEEK_V41_ENGRAM_HASH_GATHER_BF16,
     KERNEL_COUNT
 };
 
@@ -293,6 +295,9 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     swaWrite.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_SWA_PACK_WRITE_BF16].name);
     DeepseekV41ControlGemvGaudi2 controlGemv;
     controlGemv.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_GEMV_F32].name);
+    DeepseekV41EngramHashGatherBf16Gaudi2 engramHashGather;
+    engramHashGather.GetKernelName(
+        guids[GAUDI2_KERNEL_DEEPSEEK_V41_ENGRAM_HASH_GATHER_BF16].name);
     DeepseekV41Mxfp4PreparedDequantFP8Gaudi2 preparedFp8;
     preparedFp8.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MXFP4_PREPARED_DEQUANT_FP8].name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_ATTENTION_NORM].name, DeepseekV41AttentionNormGaudi2::name);
@@ -633,6 +638,10 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     controlGemv.GetKernelName(kernelName);
     if (std::strcmp(params->guid.name, kernelName) == 0)
         return controlGemv.GetGcDefinitions(params, instance);
+    DeepseekV41EngramHashGatherBf16Gaudi2 engramHashGather;
+    engramHashGather.GetKernelName(kernelName);
+    if (std::strcmp(params->guid.name, kernelName) == 0)
+        return engramHashGather.GetGcDefinitions(params, instance);
     DeepseekV41Mxfp4PreparedDequantFP8Gaudi2 preparedFp8;
     preparedFp8.GetKernelName(kernelName);
     if (std::strcmp(params->guid.name, kernelName) == 0)

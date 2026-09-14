@@ -14,6 +14,10 @@ from vllm_gaudi.ops.tp2_model_adapter import (
 )
 
 
+def _native_input_precision_compatible(program):
+    return not program.dspark and not (program.fp8_decode and not getattr(program, "expert_n256", False))
+
+
 def stage_collectives(tp_rank, native):
     from vllm.distributed import tensor_model_parallel_all_gather, tensor_model_parallel_all_reduce
 
@@ -66,6 +70,32 @@ def stage_state_tensors(program):
                  if not name.startswith("draft.") and name.rsplit(".", 1)[-1] in mutable)
 
 
+def capture_engram_inputs(engram, *, direct=False, device_layer1=False):
+    if not direct:
+        return tuple(value.clone() for value in engram)
+    if len(engram) != 2:
+        raise ValueError("Direct Engram capture requires both layer inputs")
+    if device_layer1:
+        first, late = engram
+        if (first.dtype != torch.bfloat16 or tuple(first.shape) != (1, 12, 256) or not first.is_contiguous()
+                or late.dtype != torch.uint8 or tuple(late.shape) != (1, 12, 264) or not late.is_contiguous()
+                or first.device != late.device):
+            raise ValueError("Device Engram capture requires fixed BF16 layer-1 and packed U8 layer-14 inputs")
+        return tuple(engram)
+    first = engram[0]
+    offset = 0
+    for value in engram:
+        if (value.dtype != torch.uint8 or value.ndim != 3 or value.shape[0] != 1 or not value.is_contiguous()
+                or value.device != first.device or value.shape[-1] != first.shape[-1]
+                or value.untyped_storage()._cdata != first.untyped_storage()._cdata
+                or value.storage_offset() != offset or value.numel() == 0):
+            raise ValueError("Direct Engram inputs must be ordered views of one complete C1 packet")
+        offset += value.numel()
+    if first.untyped_storage().nbytes() != offset:
+        raise ValueError("Direct Engram capture requires the complete packet allocation")
+    return tuple(engram)
+
+
 class StageVariant(torch.nn.Module):
 
     def __init__(self,
@@ -104,7 +134,11 @@ class StageVariant(torch.nn.Module):
         # The PP receive tensor has a persistent allocation. Native input
         # dependencies wait for its producer and register its last consumer.
         self.pp_wire = (pp_wire if envs.VLLM_HPU_DSV41_DIRECT_PP_WIRE else pp_wire.clone()) if self.wire_input else None
-        self.engram = tuple(value.clone() for value in engram)
+        self.direct_engram = bool(engram) and native_input and envs.VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT
+        self.device_engram = bool(engram) and native_input and envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM
+        self.engram = capture_engram_inputs(engram,
+                                            direct=self.direct_engram,
+                                            device_layer1=self.device_engram)
         self.states = stage_state_tensors(program)
         self.metadata = _Metadata()
         self.capture_bytes = 0
@@ -153,8 +187,9 @@ class StageVariant(torch.nn.Module):
                 destination.copy_(source)
         if self.wire_input and self.pp_wire is not pp_wire:
             self.pp_wire.copy_(pp_wire)
-        for destination, source in zip(self.engram, engram, strict=True):
-            destination.copy_(source)
+        if not self.direct_engram:
+            for destination, source in zip(self.engram, engram, strict=True):
+                destination.copy_(source)
         fixed_hidden, fixed_pre, fixed_positions, fixed_ids = self.fixed
         fixed_roots = dict(roots,
                            hidden_states=fixed_hidden,
@@ -183,18 +218,78 @@ class StageReplay:
         self.program = weakref.ref(program)
         self.variants = {}
         self.native_input_enabled = (envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH and program.pp_rank == 0)
+        self.segmented_prefix_enabled = envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX and program.pp_rank == 0
+        if self.segmented_prefix_enabled and not self.native_input_enabled:
+            raise ValueError("V2 segmented prefix requires native PP0 input replay")
+        if (envs.VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT
+                and (not _native_input_precision_compatible(program)
+                     or not envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH)):
+            raise ValueError("Direct Engram capture requires ordinary BF16 native input replay")
         self.input_seed = None
 
-    def from_input_ids(self, positions, input_ids, engram):
-        program = self.program()
-        if (not self.native_input_enabled or input_ids.numel() != 1 or program.dspark or program.fp8_decode):
-            raise ValueError("Native input capture requires enabled ordinary BF16 C1 PP0 decode")
+    def _input_seed(self, input_ids):
         if self.input_seed is None:
             self.input_seed = (
                 torch.zeros(1, 4, 5120, device=input_ids.device, dtype=torch.bfloat16),
                 torch.zeros(1, 4, device=input_ids.device, dtype=torch.float32),
             )
-        return self(*self.input_seed, positions, input_ids, engram, native_input=True)
+        return self.input_seed
+
+    def from_input_ids(self, positions, input_ids, engram):
+        program = self.program()
+        if (not self.native_input_enabled or input_ids.numel() != 1
+                or not _native_input_precision_compatible(program)):
+            raise ValueError("Native input capture requires enabled ordinary BF16 C1 PP0 decode")
+        if self.segmented_prefix_enabled:
+            from vllm_gaudi.ops.tp2_prepared_plan import _native_entries
+            variant = self.variants.get((1, "input"))
+            if variant is not None and variant in _native_entries:
+                self.begin_segmented_from_input_ids(positions, input_ids)
+                return self.finish_segmented(positions, input_ids, engram)
+        return self(*self._input_seed(input_ids), positions, input_ids, engram, native_input=True)
+
+    def _complete_input_variant(self):
+        variant = self.variants.get((1, "input"))
+        if variant is None:
+            raise RuntimeError("Segmented replay requires the warmed complete PP0 input graph")
+        return variant
+
+    @trace_phase
+    def begin_segmented_from_input_ids(self, positions, input_ids):
+        program = self.program()
+        if (not self.segmented_prefix_enabled or input_ids.numel() != 1
+                or not _native_input_precision_compatible(program)):
+            raise ValueError("V2 segmented prefix requires enabled ordinary BF16 C1 PP0 decode")
+        from vllm_gaudi.ops.tp2_prepared_plan import begin_segmented_native_decoder
+        variant = self._complete_input_variant()
+        hidden, pre_mix = self._input_seed(input_ids)
+        roots = dict(hidden_states=hidden,
+                     pre_mix=pre_mix,
+                     positions=positions,
+                     input_ids=input_ids,
+                     attention_inputs=variant.engram,
+                     metadata=variant.metadata,
+                     state_generation=(program.generation, program.precision_fingerprint),
+                     state_tensors=variant.states)
+        begin_segmented_native_decoder(variant, **roots)
+
+    @trace_phase
+    def finish_segmented(self, positions, input_ids, engram):
+        if not self.segmented_prefix_enabled or input_ids.numel() != 1:
+            raise ValueError("V2 segmented suffix requires an active C1 PP0 prefix")
+        from vllm_gaudi.ops.tp2_prepared_plan import finish_segmented_native_decoder
+        variant = self._complete_input_variant()
+        program = self.program()
+        hidden, pre_mix = self._input_seed(input_ids)
+        roots = dict(hidden_states=hidden,
+                     pre_mix=pre_mix,
+                     positions=positions,
+                     input_ids=input_ids,
+                     attention_inputs=engram,
+                     metadata=variant.metadata,
+                     state_generation=(program.generation, program.precision_fingerprint),
+                     state_tensors=variant.states)
+        return finish_segmented_native_decoder(variant, **roots)
 
     @trace_phase
     def __call__(self,
@@ -211,7 +306,8 @@ class StageReplay:
         allowed = 1 <= tokens <= 6 if program.dspark else tokens == 1
         if not allowed:
             raise ValueError("V4.1 replay shape must match C1 decode or enabled C1-C6 DSpark verification")
-        if native_input and (not self.native_input_enabled or program.dspark or program.fp8_decode or tokens != 1):
+        if native_input and (not self.native_input_enabled or not _native_input_precision_compatible(program)
+                             or tokens != 1):
             raise ValueError("Native input capture requires enabled ordinary BF16 C1 PP0 decode")
         search = getattr(program, "search_length", 512)
         key = ((tokens,
@@ -233,7 +329,7 @@ class StageReplay:
         from vllm_gaudi.ops.tp2_prepared_plan import _native_entries
         from vllm_gaudi import envs
         program = self.program()
-        native_input = (self.native_input_enabled and tokens == 1 and not program.dspark and not program.fp8_decode)
+        native_input = (self.native_input_enabled and tokens == 1 and _native_input_precision_compatible(program))
         fused = (program.pp_rank == 0 and envs.VLLM_HPU_DSV41_FUSED_STAGE_IO)
         key = ((tokens, "input") if native_input else tokens if search <= 512 and not fused else
                (tokens, search, fused))

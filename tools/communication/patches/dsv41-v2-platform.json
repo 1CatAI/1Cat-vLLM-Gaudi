@@ -1,0 +1,17 @@
+{
+  "base_commit": "e47aa780bccf59f59dfa2cbb18e17a10b4fe69ba",
+  "prerequisite": "Existing prepared V4.1 engine delta; see the required parent file hashes",
+  "files": [
+    {
+      "path": "vllm/config/vllm.py",
+      "parent_sha256": "ceb524f6c5e46e9bffb14536a354f2e3802044a78bff77b164b7a0b437606ff9",
+      "candidate_sha256": "3f280c3f59fd2e91207509d1b65317bcb2b3a8455c9c90fa59ded7d46bd939ca"
+    },
+    {
+      "path": "vllm/platforms/interface.py",
+      "parent_sha256": "68f26398df4f12c1485b6b21d58e69a3609dbc20393a4e2f25a8d247d523e655",
+      "candidate_sha256": "471a1e0f39cf6ace44d44d2c1a123b8f7a193bf61b462e2ddc42b0241afd781e"
+    }
+  ],
+  "patch_sha256": "ddf16a4caa56c704b6c28177dca7fb97a2af76aed0ba29ea0d6e54f25dad9b86"
+}

@@ -15,7 +15,7 @@ prepare_environment()
 import habana_frameworks.torch.core  # noqa: E402,F401
 import torch  # noqa: E402
 
-from vllm_gaudi.ops.deepseek_v41_math import apply_rope, rotary_table  # noqa: E402
+from vllm_gaudi.ops.deepseek_v41_math import _apply_rope_torch, rotary_table  # noqa: E402
 
 torch.ops.load_library(os.environ["VLLM_HPU_DSV4_TPC_OP_LIBRARY"])
 ROPE = torch.ops.custom_op.custom_deepseek_v41_rope_bf16_gaudi2
@@ -30,9 +30,9 @@ def isolated_compile_cache():
     torch._dynamo.reset()
 
 
-@pytest.mark.parametrize("heads,width", ((1,128),(1,512),(32,512)))
-def test_c1_rope_matches_original(heads, width):
-    torch.manual_seed(4120 + heads + width)
+@pytest.mark.parametrize("tokens,heads,width", ((1,1,128),(1,1,512),(1,32,512),(3,2,256)))
+def test_c1_rope_matches_original(tokens, heads, width):
+    torch.manual_seed(4120 + tokens + heads + width)
     table_cpu = rotary_table(64,512,10000,4096,16,32,1)
     table = table_cpu.to("hpu")
     prepared = [torch.cat((table_cpu[...,0], sign * table_cpu[...,1]),dim=-1).contiguous().to("hpu")
@@ -40,18 +40,19 @@ def test_c1_rope_matches_original(heads, width):
     compiled = torch.compile(ROPE,backend="hpu_backend",fullgraph=True,dynamic=False)
 
     def original(value, position, inverse):
-        return apply_rope(value,position,table,inverse=inverse)
+        return _apply_rope_torch(value,position,table,inverse=inverse)
 
     reference = torch.compile(original,backend="hpu_backend",fullgraph=True,dynamic=False)
     results = []
     for inverse in (False,True):
         for position in (0,1,2,63,64,127,128,255,256,511,0):
-            value = torch.randn(1,heads,width).bfloat16()
+            value = torch.randn(tokens,heads,width).bfloat16()
             value[...,::16], value[...,1::16] = 0., -0.
             if position == 256:
                 value *= torch.exp2(torch.linspace(-64,64,width)).bfloat16()
             value = value.to("hpu")
-            pos = torch.tensor([position],dtype=torch.int32,device="hpu")
+            pos = torch.tensor([(position + token * 17) % 512 for token in range(tokens)],
+                               dtype=torch.int32,device="hpu")
             expected = reference(value,pos,inverse).cpu()
             actual = compiled(value,pos,prepared[inverse]).cpu()
             eager = ROPE(value,pos,prepared[inverse]).cpu()
@@ -60,10 +61,10 @@ def test_c1_rope_matches_original(heads, width):
                     "ordinary_compiled_exact":torch.equal(actual.view(torch.int16),eager.view(torch.int16))}
             if len(mismatches):
                 torch.save({"input":value.cpu(),"actual":actual,"expected":expected},
-                           EVIDENCE / f"rope-{heads}-{width}-{inverse}-{position}.pt")
+                           EVIDENCE / f"rope-{tokens}-{heads}-{width}-{inverse}-{position}.pt")
                 item["first_mismatch"] = mismatches[:8].tolist()
             results.append(item)
-    (EVIDENCE / f"rope-{heads}-{width}.json").write_text(json.dumps(results,indent=2)+"\n")
+    (EVIDENCE / f"rope-{tokens}-{heads}-{width}.json").write_text(json.dumps(results,indent=2)+"\n")
     assert all(r["bf16_mismatches"] == 0 and r["ordinary_compiled_exact"] for r in results), results
 
 

@@ -142,7 +142,7 @@ def account(root):
         grouped, engine_spans = collections.defaultdict(list), collections.defaultdict(list)
         with gzip.open(path / "hardware.jsonl.gz", "rt") as stream:
             for line in stream:
-                start, duration, _, index = json.loads(line)
+                start, duration, _, index = json.loads(line)[:4]
                 win = bisect.bisect_right(ends, start)
                 # A rare long event may cross a token boundary; preserve both sides.
                 while win < len(windows) and windows[win][0] < start + duration:

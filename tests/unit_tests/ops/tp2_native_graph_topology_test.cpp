@@ -15,6 +15,11 @@ static std::vector<NativeNodeKind> chain(size_t groups, bool peer) {
 }
 
 int main() {
+  assert(NativeGraphTopology::supportsV41SegmentedPrefix(5, 43, false));
+  for (size_t collectives : {3, 8, 40, 42, 44})
+    assert(!NativeGraphTopology::supportsV41SegmentedPrefix(5, collectives, false));
+  assert(!NativeGraphTopology::supportsV41SegmentedPrefix(5, 43, true));
+  assert(!NativeGraphTopology::supportsV41SegmentedPrefix(1, 43, false));
   for (size_t collectives : {40, 42, 43}) {
     assert(NativeGraphTopology::supportsV41Dependencies(5, collectives, false));
     assert(!NativeGraphTopology::supportsV41Dependencies(5, collectives, true));

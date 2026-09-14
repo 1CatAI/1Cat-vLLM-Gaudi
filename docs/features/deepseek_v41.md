@@ -43,25 +43,29 @@ dense device cache. The C1 FP8 sidecars below have their own storage contract.
 
 ## Execution
 
-The dedicated entrypoint enables the measured ordinary-C1 fast-path bundle by
-default. Prepare the two FP8 sidecars in their standard locations, then launch
-without a feature-variable list:
+The dedicated entrypoint enables the frozen-reference ordinary-C1 and V2
+device-continuation bundle by default. Launch without a feature-variable list:
 
 ```bash
-.venv/bin/python tools/prepare_deepseek_v41_woa_fp8.py PREPARED_DIR
-.venv/bin/python tools/prepare_deepseek_v41_dense_fp8.py PREPARED_DIR
 .venv/bin/python -m vllm_gaudi.entrypoints.deepseek_v41 PREPARED_DIR \
   --checkpoint-audit CHECKPOINT_AUDIT
 ```
 
-The standard sidecar directories are `PREPARED_DIR/sidecars/wo_a_fp8` and
-`PREPARED_DIR/sidecars/attention_dense_fp8`. The entrypoint discovers both and
-fails before model loading if a required artifact is absent. Set
+Set `--no-v2` to retain the synchronous runner, or
 `VLLM_HPU_DSV41_DEFAULT_FASTPATHS=0` to suppress the entrypoint's default
-injection; it does not unset existing variables or reconstruct a reference
-environment. Individual feature overrides belong in the effective runtime
-configuration; see [configuration precedence](../1cat_gaudi_guide.md#runtime-profile).
-The generic vLLM entrypoint retains the opt-in defaults from `vllm_gaudi.envs`.
+injection. The aggregate opt-out does not unset existing variables or
+reconstruct a reference environment. Individual feature overrides belong in
+the effective runtime configuration; see
+[configuration precedence](../1cat_gaudi_guide.md#runtime-profile). The generic
+vLLM entrypoint retains the opt-in defaults from `vllm_gaudi.envs`.
+
+Arithmetic-changing FP8, Router, MLA and fused numerical candidates are not in
+the default bundle. To test them explicitly, prepare the two FP8 sidecars in
+`PREPARED_DIR/sidecars/wo_a_fp8` and
+`PREPARED_DIR/sidecars/attention_dense_fp8`, then set
+`VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS=1`. The entrypoint validates and
+discovers both sidecars before model loading. This aggregate remains an
+experimental quality profile, not a production default.
 
 Reserve four free modules using the project's device lease mechanism before
 launching. `tools/run_deepseek_v41.py` provides an archived invocation wrapper
@@ -113,15 +117,13 @@ weight duplicate. Precision, layout or weight changes require model reload
 and new recipes.
 
 The default C1 bundle does not enable the separate legacy
-`VLLM_HPU_DSV41_FP8_DECODE`, coordinate-pipeline, or native PP0 input-capture
-experiments. Native PP0 input capture retains its ordinary BF16-only contract.
-Neither successful component checks nor relative decode improvements establish
-production quality: generated outputs differ from the preceding candidate,
-and full quality, prefill numerical consistency and long replay/shutdown
-qualification remain open. The dedicated entrypoint is an experimental contract;
-use a complete archived reference configuration for compatibility and
-production-reference comparisons. The aggregate opt-out only suppresses default
-injection and is insufficient to restore that reference on its own.
+`VLLM_HPU_DSV41_FP8_DECODE`, coordinate-pipeline, FP8 projection, N256-FP8
+expert, Router-top6, MLA-MME, or fused numerical experiments. Native PP0 input
+capture is enabled only as part of the frozen-reference V2 continuation
+contract. Successful component checks and relative decode improvements do not
+establish production quality; arithmetic-changing candidates stay behind the
+experimental numerical aggregate until their full quality, prefill numerical
+consistency and long replay/shutdown gates pass.
 
 The scheduler owns one complete request-state block for the bounded context.
 Null block 0 and request block 1 each have separate allocations for the actual
@@ -144,6 +146,42 @@ device-window reconciliation and overlap handled explicitly.
 
 The complete quality gate additionally covers frozen-reference generation,
 image spans, accepted-prefix rollback, request changes, state reuse and
-shutdown. The dedicated entrypoint enables the experimental ordinary-C1 bundle;
-the generic entrypoint retains opt-in defaults, and DSpark remains disabled by
-default. Production-quality promotion still requires the complete gate.
+shutdown. The structural V2 bundle is the dedicated entrypoint's qualified
+ordinary-C1 default; numerical candidates and DSpark remain default-off until
+their complete gates pass. The generic entrypoint retains opt-in defaults.
+
+## Default V2 HPU Adapter
+
+The prepared entrypoint selects the HPU adapter for vLLM V2 scheduling and
+asynchronous output by default; `--v2` is an explicit equivalent and `--no-v2`
+selects the synchronous compatibility runner. This is not the CUDA/Triton GPU runner.
+It requires the matching engine platform capability hook, native graph replay,
+and direct token IDs. The engine uses its normal async scheduler and output
+thread. On PP0, layer-1 Engram preparation continues from the sampled device
+token while host C1 prepares only the later layer-14 input.
+
+The incremental hook is provided in
+`tools/communication/patches/dsv41-v2-platform.patch`. Apply it to the existing
+prepared V4.1 engine, not a stock checkout; the adjacent JSON manifest records
+the pinned revision and required parent file hashes. Other platforms still
+require Triton, and all remaining V2 feature checks stay enabled.
+
+Only ordinary C1 decode is supported. DSpark, inline completion, resumed
+generated-prefix replay, and non-greedy sampling are rejected. Prefill keeps the
+synchronous completion path. The full V2 device-continuation bundle passed an
+exact three-run end-to-end cohort with a 10.4% median latency improvement; its
+trace-localized turnover residual fell by about 60%. Unsupported sampling,
+speculative and broader-shape contracts remain rejected explicitly.
+
+The segmented-prefix path retains the complete PP0 compiled
+graph and divides only command publication. It registers both late Engram
+bindings before capture and stops the prefix before their first recipe read.
+Compiler scheduling can place Engram unpacking in an earlier layer's recipe,
+so the first Engram exchange is not a sufficient boundary. The versioned native
+plan retains cross-boundary TP waits and actual producer completion offsets;
+PP1 keeps ordinary replay. The device Engram producer hashes the sampled token,
+gathers the production layer-1 rows, and decodes them before the suffix is
+published. Request identity, history parity, late-input storage dependencies,
+and the real scheduler authorization are checked before continuation. This is
+the performance-qualified combination; the constituent switches are not
+independent performance claims.

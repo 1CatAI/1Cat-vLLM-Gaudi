@@ -11,6 +11,10 @@ struct NativeNodeKind {
 };
 
 struct NativeGraphTopology {
+  static bool supportsV41SegmentedPrefix(size_t groups, size_t collectives, bool externalPrefix) {
+    return groups == 5 && collectives == 43 && !externalPrefix;
+  }
+
   static bool supportsV41Dependencies(size_t groups, size_t collectives, bool externalPrefix) {
     return !externalPrefix &&
         ((groups == 5 && (collectives == 40 || collectives == 42 || collectives == 43)) ||

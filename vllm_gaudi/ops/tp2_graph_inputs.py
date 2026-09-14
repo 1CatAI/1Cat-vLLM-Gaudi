@@ -122,8 +122,9 @@ class FixedDecodeInputs:
                 self.native_preflight = native_bridge.FixedInputPreflight(self.state_tensors, self.tensors())
         self.last_invalidation_reason = None
 
-    def updates(self, roots):
-        """Preflight every changing binding before copying any input."""
+    def updates(self, roots, sources=None):
+        """Preflight bindings, optionally changing only selected source classes."""
+        sources = None if sources is None else frozenset(sources)
         self.last_invalidation_reason = None
         metadata = roots["metadata"]
         if roots.get("state_generation") != self.state_generation:
@@ -142,15 +143,17 @@ class FixedDecodeInputs:
             self.last_invalidation_reason = "metadata_contract"
             return None
         if self.native_preflight is not None:
-            sources = [binding.read(roots) for binding in self.bindings]
-            changed = self.native_preflight.updates(state, sources)
+            values = [binding.read(roots) if sources is None or binding.source in sources else binding.destination
+                      for binding in self.bindings]
+            changed = self.native_preflight.updates(state, values)
             if changed is None:
                 self.last_invalidation_reason = "native_preflight"
                 return None
-            return [(self.bindings[index].destination, sources[index]) for index in changed]
+            return [(self.bindings[index].destination, values[index]) for index in changed]
         pending = []
         for binding in self.bindings:
-            source = binding.read(roots)
+            source = (binding.read(roots)
+                      if sources is None or binding.source in sources else binding.destination)
             if not isinstance(source, torch.Tensor) or _layout(source) != binding.layout:
                 self.last_invalidation_reason = f"input_layout:{binding.name}"
                 return None

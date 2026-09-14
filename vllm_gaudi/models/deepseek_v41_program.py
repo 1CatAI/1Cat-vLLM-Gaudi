@@ -347,7 +347,8 @@ class PreparedDecoderLayer(nn.Module):
         if hasattr(w, "engram"):
             if engram_rows is None:
                 raise RuntimeError("Engram layer requires its completed host gather and DMA generation")
-            rows = self.all_gather(unpack_swa(engram_rows, 256), dim=1)
+            local_rows = engram_rows if engram_rows.dtype == torch.bfloat16 else unpack_swa(engram_rows, 256)
+            rows = self.all_gather(local_rows, dim=1)
             kv = linear(rows.flatten(1), w.engram.wkv)
             residual = engram_update(residual, kv, w.engram.q_weight, w.engram.k_weight, ~image_mask, self.eps)
         target_state = residual.mean(1) if self.collect_target_state else None
@@ -622,6 +623,9 @@ class PreparedStage(nn.Module):
         candidates = self.all_gather(local_greedy_candidate(local, self.tp_rank), dim=-1)
         return select_greedy_candidate(candidates)
 
+    def sample_greedy_token(self, hidden):
+        return self.sample_greedy(hidden).to(torch.int32)
+
     def sample_greedy_commit(self, hidden, record):
         selected = self.sample_greedy(hidden).reshape(1).to(torch.int32)
         updated = torch.cat((record[:1] + 1, torch.ones_like(record[1:3]), selected))
@@ -632,7 +636,14 @@ class PreparedStage(nn.Module):
 class PreparedLayerGroup(nn.Module):
     """Bound FX dependency closure without changing the stage tensor program."""
 
-    def __init__(self, stage, start, stop, *, pp_wire_input=False, fused_text_io=False, fp8_decode=False):
+    def __init__(self,
+                 stage,
+                 start,
+                 stop,
+                 *,
+                 pp_wire_input=False,
+                 fused_text_io=False,
+                 fp8_decode=False):
         super().__init__()
         self.fp8_decode = fp8_decode
         self.pp_wire_input = pp_wire_input and start == 0
@@ -664,7 +675,12 @@ class PreparedLayerGroup(nn.Module):
         target_states = []
         for layer in self.layers:
             rows = engram_rows[0 if layer.layer == 1 else 1] if layer.layer in (1, 14) else None
-            residual, pre_mix, target = layer(residual, pre_mix, positions, image_mask, rows, fp8_decode=fp8_decode)
+            residual, pre_mix, target = layer(residual,
+                                              pre_mix,
+                                              positions,
+                                              image_mask,
+                                              rows,
+                                              fp8_decode=fp8_decode)
             if target is not None:
                 target_states.append(target)
         if gaudi_envs.VLLM_HPU_DSV41_MHC_GATES_FUSED:
@@ -709,7 +725,8 @@ def _compile_group(group, *, native, backend="hpu_backend"):
 class CompiledStage:
 
     def __init__(self, stage, *, native=False, pp_wire_input=False, fused_text_io=False, native_input=False):
-        if native_input and (not native or stage.pp_rank != 0 or stage.dspark or stage.fp8_decode):
+        legacy_fp8 = getattr(stage, "fp8_decode", False) and not getattr(stage, "expert_n256", False)
+        if native_input and (not native or stage.pp_rank != 0 or stage.dspark or legacy_fp8):
             raise ValueError("Native input capture requires ordinary BF16 PP0 decode")
         if native_input and (pp_wire_input or fused_text_io):
             raise ValueError("Native input capture has a single PP0 input owner")
@@ -725,7 +742,8 @@ class CompiledStage:
                                start + 4,
                                pp_wire_input=pp_wire_input,
                                fused_text_io=fused_text_io,
-                               fp8_decode=native and stage.fp8_decode) for start in range(0, 20, 4))
+                               fp8_decode=native and stage.fp8_decode)
+            for start in range(0, 20, 4))
         if native_input:
             self.groups[0].native_input = PreparedInput(stage.weights.embed, stage.tp_rank, stage.reduce)
         self.chunks = tuple(_compile_group(group, native=native, backend=backend) for group in self.groups)

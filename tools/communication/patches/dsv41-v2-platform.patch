@@ -1,0 +1,29 @@
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -2779,7 +2779,9 @@
+ 
+     def _validate_v2_model_runner(self) -> None:
+         """Check for features not yet supported by the V2 model runner."""
+-        if not HAS_TRITON:
++        from vllm.platforms import current_platform
++
++        if not HAS_TRITON and not current_platform.supports_v2_without_triton(self):
+             raise ValueError("Model Runner V2 requires Triton.")
+ 
+         unsupported = self._get_v2_model_runner_unsupported_features()
+diff --git a/vllm/platforms/interface.py b/vllm/platforms/interface.py
+--- a/vllm/platforms/interface.py
++++ b/vllm/platforms/interface.py
+@@ -141,6 +141,11 @@
+     def get_max_concurrent_batches(cls, vllm_config) -> int | None:
+         """Override in-flight batch capacity for a platform-owned runner."""
+         return None
++
++    @classmethod
++    def supports_v2_without_triton(cls, vllm_config) -> bool:
++        """Whether this configuration uses a native non-Triton V2 adapter."""
++        return False
+ 
+     @classmethod
+     def configure_control_process(cls, role: str) -> None:
