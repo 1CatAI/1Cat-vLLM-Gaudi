@@ -30,6 +30,17 @@ def io(node, prefix):
 
 def classify(node, kernel, inputs, outputs):
     name = node.lower()
+    if "deepseek_v41_mla_gather" in kernel:
+        return "Attention", "MLA 候选 KV 共享读取、BF16 K/FP32 V 准备及有效 mask"
+    if "deepseek_v41_mla_softmax" in kernel:
+        return "Attention", "MLA FP32 scale/softmax/sink，概率保持 FP32"
+    if "deepseek_v41_mla_mme" in name:
+        if kernel in ("GEMM", "BatchGemm"):
+            if not inputs:
+                return "Attention", "MLA 矩阵计算，操作数尚未关联"
+            return "Attention", ("MLA QK：BF16×BF16，FP32 结果" if inputs[0]["dtype"] == "bf16"
+                                 else "MLA PV：FP32 概率×FP32 V，FP32 累加")
+        return "Attention", "MLA 内部转换、矩阵输入准备及数据搬运"
     if "deepseek_v41_router_top6" in kernel:
         return "Router", "text/image bias 选择、六次最大值选择、原分数归一化"
     if "deepseek_v41_woa_stage" in kernel:
@@ -58,7 +69,7 @@ def classify(node, kernel, inputs, outputs):
         return "CSA2", "主 KV/index 精确 FP4 编码/scale/缓存写入"
     if "deepseek_v41_selected_kv" in kernel:
         return "CSA2", "按候选槽解码实际读取的 packed KV，含写入完成依赖"
-    if "mxfp4" in name or "mxfp4" in kernel:
+    if "mxfp4" in name or "mxfp4" in kernel or "expert_n256" in name or "expert_n256" in kernel:
         shape = inputs[1]["shape"] if kernel in ("GEMM", "BatchGemm") and len(inputs) > 1 else []
         stage = "W13 gate/up" if shape and 2304 in shape else "W2 down" if shape and 1152 in shape else "阶段见张量合同"
         if not shape and outputs:

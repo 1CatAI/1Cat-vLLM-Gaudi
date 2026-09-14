@@ -24,7 +24,7 @@ from vllm.distributed import (  # noqa: E402
     initialize_model_parallel,
 )
 from vllm_gaudi.distributed.tp2_fused_ar_norm import initialize_tp2_fused_ar_norm_runtime  # noqa: E402
-from vllm_gaudi.ops.tp2_model_adapter import DecoderTopology  # noqa: E402
+from vllm_gaudi.ops.tp2_model_adapter import DEEPSEEK_V41_PP1  # noqa: E402
 from vllm_gaudi.ops.tp2_prepared_plan import (  # noqa: E402
     collect_prepared_group_replays,
     prepared_group_stats,
@@ -40,11 +40,16 @@ from vllm_gaudi.models.deepseek_v41_program import PreparedStage  # noqa: E402
 class CompletionHead(torch.nn.Module):
     sample_greedy = PreparedStage.sample_greedy
     forward = PreparedStage.sample_greedy_commit
+    # The compiled completion path calls the same projection helper as the
+    # production PreparedStage.  Keep the transport harness' tiny head
+    # structurally compatible instead of falling back to an eager callback.
+    _head_projection = PreparedStage._head_projection
 
     def __init__(self, tp_rank):
         super().__init__()
         from vllm.distributed import tensor_model_parallel_all_gather
         self.pp_rank, self.tp_rank = 1, tp_rank
+        self.bf16_head = False
         self.all_gather = tensor_model_parallel_all_gather
         weights = torch.zeros(8, 5120, dtype=torch.float32)
         weights[:, 0] = torch.arange(8) + tp_rank * 8 - 4
@@ -99,8 +104,13 @@ def main():
                              backend="hpu_backend", fullgraph=True, dynamic=False)
     from vllm_gaudi.ops.deepseek_v41_inputs import PositionBank
     bank = PositionBank(512, 6, "hpu") if args.position_bank else None
-    topology = DecoderTopology("deepseek_v41_pp1", (1,), 2, False)
+    # Use the production PP1 contract so the native graph captures all five
+    # four-layer groups (and their 40 reductions), even in this transport
+    # harness.  A one-group synthetic topology is intentionally rejected by
+    # the explicit V4.1 dependency planner.
+    topology = DEEPSEEK_V41_PP1
     fixed, records, profiler = None, [], None
+    step_timings = []
     evidence = Path(os.environ["DSV41_RUN_EVIDENCE"])
     # Raw transport covers all BF16 encodings across changing C1/C6 packets,
     # non-contiguous source order and FP32 negative-zero/nonfinite payloads.
@@ -123,6 +133,7 @@ def main():
         consumed, tokens = pp.finish_single(count, 100 + generation)
         assert (consumed, tokens) == (count, [100 + generation])
     for step in range(args.steps):
+        step_started = time.perf_counter()
         if args.profile and step == 4:
             profiler = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
                                                           torch.profiler.ProfilerActivity.HPU],
@@ -205,6 +216,7 @@ def main():
             assert (consumed, actual_output) == (1, [100 + step % 32])
         pp.drain()
         pp.group.barrier()
+        step_timings.append((time.perf_counter() - step_started) * 1000.0)
     if profiler is not None:
         profiler.stop()
         profiler.export_chrome_trace(str(evidence / f"rank{rank}.trace.json.gz"))
@@ -221,6 +233,7 @@ def main():
         profile=args.profile, verify_commit=args.verify_commit,
         runtime_fingerprints="Qualified Bridge ABI manifest rechecked after execution",
         restore_tp_context=args.restore_tp_context, records=records,
+        step_timings_ms=step_timings,
         pp_sends=pp.sends, pp_receives=pp.receives, native=prepared_group_stats()), indent=2) + "\n")
     print(f"RANK {rank} shutdown native plans", flush=True)
     shutdown_prepared_group_plans()

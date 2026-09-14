@@ -67,6 +67,9 @@ def length(spans):
 
 
 def group_for(row):
+    # Charge new matrix-attention copies to its complete changed chain.
+    if row["category"] == "Attention" and row["purpose"].startswith("MLA "):
+        return 1
     if row["engine"] in ("DMA", "NIC"):
         return 5
     cat = row["category"]

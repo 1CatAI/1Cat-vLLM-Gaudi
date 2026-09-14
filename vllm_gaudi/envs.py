@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_ENGINE_CPUS: Optional[str] = None
     VLLM_HPU_DSV41_API_CPUS: Optional[str] = None
     VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR: Optional[str] = None
+    VLLM_HPU_DSV41_QKV_FUSED_INPUT: bool = False
     VLLM_HPU_DSV4_SHORT_INDEXER_SKIP: bool = True
     VLLM_HPU_DSV4_BF16_SCORE_PROJECTION: bool = False
     VLLM_HPU_DSV4_FUSED_SDPA: bool = False
@@ -313,6 +314,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_ROUTER_TOP6", "0") == "1",
     "VLLM_HPU_DSV41_BF16_LM_HEAD":
     lambda: os.environ.get("VLLM_HPU_DSV41_BF16_LM_HEAD", "0") == "1",
+    "VLLM_HPU_DSV41_EXPERT_N256_FP8":
+    lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_N256_FP8", "0") == "1",
+    "VLLM_HPU_DSV41_EXPERT_FUSED_QUANT":
+    lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_FUSED_QUANT", "0") == "1",
     "VLLM_HPU_DSV41_FP8_DECODE":
     lambda: os.environ.get("VLLM_HPU_DSV41_FP8_DECODE", "0") == "1",
     "VLLM_HPU_DSV41_FP8_SIDECAR":
@@ -329,6 +334,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_API_CPUS"),
     "VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR":
     lambda: os.environ.get("VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR"),
+    "VLLM_HPU_DSV41_QKV_FUSED_INPUT":
+    lambda: os.environ.get("VLLM_HPU_DSV41_QKV_FUSED_INPUT", "0").lower() in ("1", "true"),
 
     # Fuse the four selected-expert packed-weight copies into one Gaudi2 TPC
     # launch for DeepSeek V4 single-token decode.

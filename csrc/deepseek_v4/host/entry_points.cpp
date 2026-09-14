@@ -42,6 +42,7 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVE
 #include "deepseek_v41_control_gemv_gaudi2.hpp"
 #include "deepseek_v41_mxfp4_prepared_dequant_fp8_gaudi2.hpp"
 #include "deepseek_v41_dynamic_quant_bf16_gaudi2.hpp"
+#include "deepseek_v41_expert_n256_gaudi2.hpp"
 #include "deepseek_v41_mla_gaudi2.hpp"
 #include "deepseek_v41_woa_gaudi2.hpp"
 #include "deepseek_v41_woa_stage_gaudi2.hpp"
@@ -50,6 +51,10 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVE
 #include "deepseek_v4_fill_short_topk_i32_gaudi2.hpp"
 
 enum KernelIndex {
+    GAUDI2_KERNEL_DSV41_N256_FP8,
+    GAUDI2_KERNEL_DSV41_N256_BF16,
+    GAUDI2_KERNEL_DSV41_N256_SCALE,
+    GAUDI2_KERNEL_DSV41_N256_SILU_QUANT,
     GAUDI2_KERNEL_DEEPSEEK_V41_SWA_DECODED_WRITE,
     GAUDI2_KERNEL_DEEPSEEK_V41_FP4_DECODED_WRITE,
     GAUDI2_KERNEL_DEEPSEEK_V41_DECODED_ATTN,
@@ -208,6 +213,9 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     if (!guids || capacity == 0) return tpc_lib_api::GLUE_SUCCESS;
     if (capacity < *kernelCount) return tpc_lib_api::GLUE_FAILED;
     std::memset(guids, 0, KERNEL_COUNT * sizeof(*guids));
+    for (int mode = 0; mode < 4; ++mode)
+        DeepseekV41ExpertN256Gaudi2(static_cast<DeepseekV41ExpertN256Gaudi2::Mode>(mode))
+            .GetKernelName(guids[GAUDI2_KERNEL_DSV41_N256_FP8 + mode].name);
            DeepseekV41Mxfp4PreparedDequantFP8Gaudi2 v41fp8;
            v41fp8.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MXFP4_PREPARED_DEQUANT_FP8].name);
            std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_WOA_QUANT].name, DeepseekV41WoaGaudi2::quant_name);
@@ -858,6 +866,11 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
         DeepseekV41DecodedKVGaudi2 decoded(mode);
         decoded.GetKernelName(kernelName);
         if (strcmp(params->guid.name, kernelName) == 0) return decoded.GetGcDefinitions(params, instance);
+    }
+    for (int mode = 0; mode < 4; ++mode) {
+        DeepseekV41ExpertN256Gaudi2 op(static_cast<DeepseekV41ExpertN256Gaudi2::Mode>(mode));
+        op.GetKernelName(kernelName);
+        if (strcmp(params->guid.name, kernelName) == 0) return op.GetGcDefinitions(params, instance);
     }
     DeepseekV41Mxfp4PreparedDequantFP8Gaudi2 v41fp8;
     v41fp8.GetKernelName(kernelName);

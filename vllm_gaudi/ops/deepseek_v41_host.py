@@ -4,7 +4,10 @@
 from dataclasses import dataclass
 from contextlib import nullcontext
 import fcntl
+from functools import cache
+import importlib.util
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +23,30 @@ from vllm_gaudi.ops.deepseek_v41_engram import (
     build_compressed_token_map,
 )
 from vllm_gaudi.ops.deepseek_v41_weights import file_hash, publish_json
+
+
+@cache
+def _configured_host_native(directory):
+    root = Path(directory).resolve()
+    libraries = list(root.glob("dsv41_host_gather*.so"))
+    manifest = json.loads((root / "deepseek_v41_build.json").read_text())
+    if len(libraries) != 1 or file_hash(libraries[0]) != manifest["binaries"].get(libraries[0].name):
+        raise RuntimeError("Engram host binary differs from its configured build manifest")
+    spec = importlib.util.spec_from_file_location("dsv41_host_gather", libraries[0])
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if module.abi_version != manifest["host_gather_abi_version"] or module.c1_abi_version != manifest[
+            "host_c1_abi_version"]:
+        raise RuntimeError("Engram host ABI differs from its configured build manifest")
+    return module
+
+
+def host_native():
+    directory = os.environ.get("VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR")
+    if directory:
+        return _configured_host_native(directory)
+    from vllm_gaudi.lib import dsv41_host_gather
+    return dsv41_host_gather
 
 
 @dataclass(frozen=True)
@@ -80,8 +107,7 @@ class _C1Packet:
 class _TransferSlot:
 
     def __init__(self, max_tokens, heads, width, device):
-        from vllm_gaudi.lib.dsv41_host_gather import GatherSlot
-        self.gather = GatherSlot(max_tokens * heads, width)
+        self.gather = host_native().GatherSlot(max_tokens * heads, width)
         self.host = torch.empty((max_tokens, heads, width + width // 32), dtype=torch.uint8,
                                 device="cpu").pin_memory("hpu")
         if not self.host.is_pinned("hpu"):
@@ -133,7 +159,7 @@ class EngramHost:
                  tokenizer=None,
                  checkpoint_audit=None,
                  force_lock=False):
-        from vllm_gaudi.lib import dsv41_host_gather as native
+        native = host_native()
         if native.abi_version != 1 or torch.device(device).type != "hpu":
             raise RuntimeError("V4.1 Engram requires its native host gather and an HPU DMA runtime")
         self.native_c1 = None

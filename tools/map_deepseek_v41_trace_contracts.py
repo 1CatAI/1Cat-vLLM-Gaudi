@@ -36,6 +36,8 @@ def tensor(text):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("analysis", type=Path)
+    parser.add_argument("--rank", type=int, choices=range(4), action="append",
+                        help="Map only available ranks after an incomplete profiler export")
     args = parser.parse_args()
     manifest = json.loads((args.analysis / "graph-manifest.json").read_text())
     graphs, index = {}, collections.defaultdict(set)
@@ -48,7 +50,7 @@ def main():
         graphs[key] = {"record": record, "nodes": {(node["name"], node["op"]): node for node in nodes}}
         for pair in graphs[key]["nodes"]:
             index[pair].add(key)
-    for rank in range(4):
+    for rank in (args.rank if args.rank is not None else range(4)):
         root = args.analysis / f"rank{rank}"
         recipes = json.loads((root / "recipe-symbols.json").read_text())["recipes"]
         contracts, unresolved = [], []

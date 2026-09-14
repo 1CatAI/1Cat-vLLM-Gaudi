@@ -44,6 +44,8 @@ def symbols(inventory, recipes):
 def analyze(root, rank):
     path = root / f"rank{rank}"
     inv = json.loads((path / "inventory.json").read_text())
+    if inv.get("complete_json") is False:
+        raise ValueError("A truncated trace prefix cannot establish complete stage periods")
     recipes = json.loads((path / "recipe-symbols.json").read_text())["recipes"]
     byid = {str(recipe["recipe_id"]): recipe for recipe in recipes}
     stats = json.loads((root.parent / f"traces/rank{rank}-native-profile-stop.json").read_text())

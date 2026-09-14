@@ -145,7 +145,10 @@ def main():
                 env[f"VLLM_HPU_DSV41_{role.upper()}_CPUS"] = ",".join(map(str, group))
                 record.setdefault("control_cpus", {})[role] = group
                 control_cpus.update(group)
-        env.update(HABANA_VISIBLE_MODULES=",".join(str(item["module"]) for item in selected),
+        temporary = args.evidence / "tmp"
+        temporary.mkdir(exist_ok=True)
+        env.update(TMPDIR=str(temporary.resolve()),
+                   HABANA_VISIBLE_MODULES=",".join(str(item["module"]) for item in selected),
                    HLS_MODULE_ID=str(selected[0]["module"]), HABANA_LOGS=str(args.evidence / "habana_logs"),
                    VLLM_HPU_DSV4_WORKER_CPUS=",".join(map(str, mains)),
                    VLLM_HPU_DSV4_WORKER_HELPER_CPUS=";".join(helpers),
@@ -160,7 +163,7 @@ def main():
             (args.evidence / "graphs").mkdir(exist_ok=True)
         record["environment"] = {key: value for key, value in env.items()
                                  if key.startswith(("HABANA_", "HLS_", "PT_HPU_", "VLLM_", "HCL_", "HCCL_"))
-                                 or key in ("LD_LIBRARY_PATH", "GC_KERNEL_PATH", "RUNTIME_SCALE_PATCHING")}
+                                 or key in ("LD_LIBRARY_PATH", "GC_KERNEL_PATH", "RUNTIME_SCALE_PATCHING", "TMPDIR")}
         root = Path(__file__).resolve().parents[1]
         record["source_hashes"] = {}
         for glob in ("vllm_gaudi/**/*.py", "tools/*deepseek_v41*.py", "csrc/deepseek_v4/**/*",

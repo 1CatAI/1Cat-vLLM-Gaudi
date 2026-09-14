@@ -12,6 +12,8 @@ import ijson
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("trace", type=Path)
 parser.add_argument("--output", type=Path, required=True)
+parser.add_argument("--allow-incomplete", action="store_true",
+                    help="Retain a truncated JSON prefix for diagnosis; never qualifies a complete trace")
 args = parser.parse_args()
 args.output.mkdir(exist_ok=False)
 open_trace = gzip.open if args.trace.suffix == ".gz" else open
@@ -22,10 +24,22 @@ host_enqueues, markers, modules = [], [], set()
 metadata, examples = [], []
 total = hardware = 0
 first, last = float("inf"), float("-inf")
+parse_errors = []
+
+
+def events(source):
+    try:
+        yield from ijson.items(source, "traceEvents.item", use_float=True)
+    except ijson.common.IncompleteJSONError as error:
+        if not args.allow_incomplete:
+            raise
+        parse_errors.append(str(error))
+
+
 with (open_trace(args.trace, "rb") as src,
       gzip.open(args.output / "hardware.jsonl.gz", "wt", compresslevel=1) as dst,
       gzip.open(args.output / "host.jsonl.gz", "wt", compresslevel=1) as host):
-    for event in ijson.items(src, "traceEvents.item", use_float=True):
+    for event in events(src):
         total += 1
         name = event.get("name", "")
         a = event.get("args", {})
@@ -69,6 +83,7 @@ with (open_trace(args.trace, "rb") as src,
             examples.append(event)
 digest = hashlib.file_digest(args.trace.open("rb"), "sha256").hexdigest()
 result = {"trace": str(args.trace), "trace_sha256": digest, "events": total,
+          "complete_json": not parse_errors, "parse_errors": parse_errors,
           "hardware_events": hardware, "first_us": first, "last_us": last,
           "modules": sorted(modules), "nodes": nodes,
           "recipe_names": {key: sorted(value) for key, value in recipe_names.items()},
