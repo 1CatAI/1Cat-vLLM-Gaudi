@@ -21,4 +21,3 @@ static inline float64 ue8m0(uint64 code) {
     bits = v_u32_sel_eq_u32_b(code, 255, 0x7fffffff, bits);
     return as_float64(bits);
 }
-
