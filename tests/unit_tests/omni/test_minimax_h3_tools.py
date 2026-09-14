@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 
 import pytest
+from safetensors.torch import save_file
+import torch
 
 from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
 
@@ -25,6 +27,7 @@ def _load_tool(name: str):
 request_video = _load_tool("request_video")
 serve_single_hpu = _load_tool("serve_single_hpu")
 download_modelscope = _load_tool("download_modelscope")
+download_flashgen_modelscope = _load_tool("download_flashgen_modelscope")
 benchmark_t2va = _load_tool("benchmark_t2va")
 
 
@@ -44,6 +47,8 @@ def _request_args(**overrides):
         "audio_url": None,
         "frame_indices": None,
         "seed": 2101,
+        "flashgen_lora": None,
+        "lora_scale": 1.0,
     }
     values.update(overrides)
     return Namespace(**values)
@@ -90,8 +95,8 @@ def test_request_omits_sampling_fields_for_explicit_pinned_omni_reference():
     assert json.loads(data["extra_params"]) == {"task": "t2va", "duration": 5.0}
 
 
-def test_request_cli_resolves_to_20_forward_base_schedule():
-    assert request_video._resolve_sigma_points(None, None, False) == 21
+def test_request_cli_defaults_to_pinned_omni_base_schedule():
+    assert request_video._resolve_sigma_points(None, None, False) is None
     assert request_video._resolve_sigma_points(None, 8, False) == 9
     assert request_video._resolve_sigma_points(7, None, False) == 7
     assert request_video._resolve_sigma_points(None, None, True) is None
@@ -104,16 +109,79 @@ def _benchmark_args(**overrides):
         "timeout": 3600,
         "sigma_points": 21,
         "pinned_omni_reference": False,
+        "flashgen_lora": None,
     }
     values.update(overrides)
     return Namespace(**values)
 
 
-def test_benchmark_defaults_to_20_forward_base_schedule(tmp_path):
+def test_benchmark_can_name_an_explicit_base_grid(tmp_path):
     command = benchmark_t2va._request_command(_benchmark_args(), tmp_path)
 
     assert command[command.index("--sigma-points") + 1] == "21"
     assert "--pinned-omni-reference" not in command
+
+
+def test_flashgen_request_uses_adapter_interval_contract():
+    path = Path("/models/minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors")
+    args = _request_args(flashgen_lora=path, sigma_points=None)
+
+    request_video._validate(args, [])
+    data = request_video._request_data(args)
+    contract = request_video._sampling_contract(args)
+
+    assert data["num_inference_steps"] == "4"
+    assert json.loads(data["lora"]) == {
+        "name": "h3-flashgen-v1.0",
+        "path": str(path),
+        "scale": 1.0,
+    }
+    assert contract["resolved_sigma_points"] == 5
+    assert contract["expected_joint_dit_forwards"] == 4
+    assert contract["base_schedule"] == [1.0, 0.7, 0.4, 0.15, 0.0]
+
+
+def test_flashgen_request_rejects_non_t2va():
+    args = _request_args(
+        task="fl2va",
+        flashgen_lora=Path("minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"),
+    )
+    with pytest.raises(ValueError, match="T2VA only"):
+        request_video._validate(args, [(Path("first.png"), "image/png")])
+
+
+def test_benchmark_flashgen_command_uses_exact_preset(tmp_path):
+    path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
+    command = benchmark_t2va._request_command(_benchmark_args(sigma_points=None, flashgen_lora=path), tmp_path)
+
+    assert command[command.index("--flashgen-4step-lora") + 1] == str(path)
+    assert "--sigma-points" not in command
+
+
+def test_flashgen_modelscope_metadata_contract():
+    download_flashgen_modelscope._validate_metadata(dict(download_flashgen_modelscope.EXPECTED_METADATA))
+    invalid = dict(download_flashgen_modelscope.EXPECTED_METADATA, base_schedule="1,0")
+    with pytest.raises(ValueError, match="metadata mismatch"):
+        download_flashgen_modelscope._validate_metadata(invalid)
+
+
+def test_single_hpu_launcher_validates_and_preloads_flashgen(tmp_path):
+    lora = tmp_path / download_flashgen_modelscope.FILENAME
+    save_file(
+        {"placeholder": torch.zeros(1)},
+        lora,
+        metadata=dict(download_flashgen_modelscope.EXPECTED_METADATA),
+    )
+    resolved = serve_single_hpu._resolve_flashgen_lora(tmp_path, "fl2va")
+    args = serve_single_hpu._parse_args(["/models/h3", "--partition", "FL2VA", "--flashgen-4step-lora", str(tmp_path)])
+    args.flashgen_lora = resolved
+    command = serve_single_hpu._command(args, Path("/models/h3/FL2VA"), "fl2va")
+
+    assert resolved == lora
+    assert command[command.index("--lora-backend") + 1] == "peft"
+    assert command[command.index("--lora-path") + 1] == str(lora)
+    offload = json.loads(command[command.index("--diffusion-offload-config") + 1])
+    assert offload["components"] == ["text_encoder"]
 
 
 def test_formal_benchmark_requires_explicit_pinned_omni_reference(tmp_path):

@@ -16,6 +16,16 @@ import sys
 import time
 from typing import IO, Any
 
+_FLASHGEN_FILENAME = "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
+_FLASHGEN_METADATA = {
+    "key_format": "minimax-h3-native",
+    "qkv_layout": "grouped",
+    "lora_rank": "64",
+    "lora_alpha": "64",
+    "tasks": "t2va",
+    "base_schedule": "1.0,0.7,0.4,0.15,0.0",
+}
+
 
 def _parse_cpuset(value: str) -> set[int]:
     result: set[int] = set()
@@ -100,6 +110,34 @@ def _resolve_partition(model: Path, partition: str | None) -> tuple[Path, str]:
     return model, inferred.lower()
 
 
+def _resolve_flashgen_lora(path: Path | None, task_type: str) -> Path | None:
+    if path is None:
+        return None
+    path = path.expanduser().resolve()
+    if path.is_dir():
+        path = path / _FLASHGEN_FILENAME
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    if path.name != _FLASHGEN_FILENAME:
+        raise ValueError(f"FlashGen preset requires the published filename {_FLASHGEN_FILENAME}")
+    if task_type != "fl2va":
+        raise ValueError("FlashGen 4-step v1.0 requires the FL2VA partition")
+    from safetensors import safe_open
+
+    with safe_open(path, framework="pt", device="cpu") as checkpoint:
+        metadata = checkpoint.metadata() or {}
+    mismatches = {
+        key: {
+            "expected": expected,
+            "observed": metadata.get(key)
+        }
+        for key, expected in _FLASHGEN_METADATA.items() if metadata.get(key) != expected
+    }
+    if mismatches:
+        raise ValueError(f"FlashGen LoRA metadata mismatch: {mismatches}")
+    return path
+
+
 def _command(args: argparse.Namespace, model: Path, task_type: str) -> list[str]:
     offload = {
         "mode": "layer",
@@ -136,6 +174,8 @@ def _command(args: argparse.Namespace, model: Path, task_type: str) -> list[str]
         "--diffusion-attention-backend",
         "HPU_SDPA",
     ]
+    if args.flashgen_lora is not None:
+        command.extend(("--lora-backend", "peft", "--lora-path", str(args.flashgen_lora)))
     return command + args.vllm_args
 
 
@@ -155,6 +195,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8097)
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--kv-cache-memory-bytes", type=int, default=268435456)
+    parser.add_argument(
+        "--flashgen-4step-lora",
+        "--flashgen-lora",
+        dest="flashgen_lora",
+        type=Path,
+        help="preload the published ModelScope FlashGen four-step T2VA adapter",
+    )
     parser.add_argument(
         "--offload-component",
         action="append",
@@ -177,6 +224,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     model, task_type = _resolve_partition(args.model, args.partition)
+    args.flashgen_lora = _resolve_flashgen_lora(args.flashgen_lora, task_type)
 
     args.lock_dir.mkdir(parents=True, exist_ok=True)
     lease = _try_lease(args.lock_dir, args.module)
@@ -218,6 +266,7 @@ def main() -> int:
                 "numa": device["numa"],
                 "cpu_affinity": sorted(affinity),
                 "command": command,
+                "flashgen_lora": str(args.flashgen_lora) if args.flashgen_lora else None,
                 "huggingface_network_disabled": True,
             },
             indent=2,

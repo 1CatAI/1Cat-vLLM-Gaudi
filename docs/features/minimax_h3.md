@@ -27,11 +27,14 @@ python -m pip install -e '.[omni]'
 
 Text-only installations do not pull the audio/video stack.
 
-## ModelScope-only checkpoint handling
+## ModelScope-only artifacts
 
 The normal launcher accepts local paths only and forces Hugging Face,
-Transformers, Diffusers, and datasets offline. Download a native ModelOpt FP8
-mirror from ModelScope with the packaged helper:
+Transformers, Diffusers, and datasets offline. The pinned upstream Omni recipe
+publishes an online-FP8 mode for the official BF16 Base checkpoint; it does not
+name an official serialized ModelOpt H3 checkpoint. The native-FP8 path in this
+project accepts a local or privately mirrored ModelScope derivative and audits
+both the DiT and encoder before serving it:
 
 ```bash
 python tools/minimax_h3/download_modelscope.py \
@@ -41,11 +44,20 @@ python tools/minimax_h3/download_modelscope.py \
   --manifest /data/models/MiniMax-H3-FP8/modelscope-download-manifest.json
 ```
 
-The ModelScope repository ID is explicit because the official
-`MiniMax/MiniMax-H3` repository contains the BF16 Base checkpoint. The helper
-refuses that format and completes only when both the DiT and Qwen encoder
-declare ModelOpt `FP8_PER_CHANNEL_PER_TOKEN`. It never imports a Hugging Face
-download client.
+Replace `ORG/...` with the actual ModelScope repository ID. The official
+[`MiniMax/MiniMax-H3`](https://modelscope.cn/models/MiniMax/MiniMax-H3)
+repository contains BF16 Base weights and is intentionally rejected by this
+native-checkpoint helper. Both the DiT and Qwen encoder must declare ModelOpt
+`FP8_PER_CHANNEL_PER_TOKEN`.
+
+For the recommended four-forward T2VA schedule, download the exact FlashGen
+adapter from ModelScope. It is 1.26 GB and carries its own sampler contract:
+
+```bash
+python tools/minimax_h3/download_flashgen_modelscope.py \
+  --local-dir /data/models/Minimax-H3-4step-lora-flashgen \
+  --manifest /data/models/Minimax-H3-4step-lora-flashgen/modelscope-download-manifest.json
+```
 
 Audit an already present checkpoint without loading its large tensors:
 
@@ -67,6 +79,8 @@ VLLM_GAUDI_LOCK_DIR=/data/gaudi-locks \
 python tools/minimax_h3/serve_single_hpu.py \
   /data/models/MiniMax-H3-FP8 \
   --partition FL2VA \
+  --flashgen-4step-lora \
+  /data/models/Minimax-H3-4step-lora-flashgen/minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors \
   --module 0 \
   --port 8097
 ```
@@ -82,38 +96,37 @@ partition is loaded, and shared components are instantiated once.
 
 ## Sampling workflows
 
-H3 currently has three different public sampling contracts. Weight precision
+H3 has several public sampling contracts. Weight precision
 does not select one: INT8 or FP8 describes linear-layer storage and compute,
 while the sampler and distilled adapter determine the number of denoiser calls.
 
 | Workflow | Sampler contract | Actual joint DiT calls |
 | --- | --- | ---: |
 | [ComfyUI Base template](https://github.com/Comfy-Org/workflow_templates/blob/main/templates/video_minimax_h3_t2v.json) | `res_multistep` + `simple` | 20 |
-| [Pinned Omni Base reference](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md) | uniform `euler_eta0`, 50 sigma points | 49 |
-| [Matching Turbo LoRA](https://github.com/ModelTC/LightX2V/) | artifact-owned distilled schedule | 4 or 8 |
+| [Pinned Omni Base reference](https://github.com/vllm-project/vllm-omni/blob/767cc7977e04dc1f1ae7307e630429e9169af622/recipes/MiniMaxAI/MiniMax-H3.md) | uniform `euler_eta0`, 50 sigma points | 49 |
+| [FlashGen native LoRA](https://modelscope.cn/models/FlashGen/Minimax-H3-4step-lora-flashgen) | adapter-owned `1.0,0.7,0.4,0.15,0.0` | 4 |
+| [Matching LightX2V Turbo LoRA](https://github.com/ModelTC/LightX2V/) | artifact-owned distilled schedule | 4 or 8 |
 
-The official ComfyUI template's 20-step INT8 example and the pinned Omni
-reference therefore use the same H3 model family but not the same numerical
-solver. A Base checkpoint cannot be changed to four or eight steps by changing
-one request integer; those schedules require the matching distilled LoRA.
+The ComfyUI Base template and pinned Omni Base reference use different
+numerical solvers. A Base checkpoint cannot be turned into a four-step model by
+changing one request integer; the four-step schedule requires its matching
+distilled adapter.
 
 Video and audio latents occupy one packed sequence and are predicted in the
 same transformer call. H3 Base is CFG-distilled, so each denoising step uses one
 joint branch rather than separate video, audio, positive, and negative calls.
 The released Base shifts remain 12 for video and 3 for audio.
 
-For current native-FP8 HPU development, the request helper defaults to **20
-actual Omni Euler DiT calls**, represented by 21 sigma grid points including
-terminal zero. This matches the useful Base compute count but is not claimed to
-be numerically equivalent to ComfyUI's 20-step RES result. Add
-`--pinned-omni-reference` only to reproduce the pinned Omni 50-point/49-call
-reference. `--sigma-points` names an explicit Omni grid for a controlled
-experiment.
+The recommended single-Gaudi T2VA profile uses FlashGen and makes exactly four
+joint DiT calls. Its API field is an interval count (`num_inference_steps=4`),
+while Base and LightX2V's uniform-grid contracts count sigma points. The helper
+keeps these meanings separate. Without a distilled adapter, omission follows
+the pinned Omni Base reference (50 points, 49 calls); `--sigma-points` remains
+an expert-only Base experiment.
 
 ## Requests
 
-Generate T2VA with the normal Base schedule (21 sigma points and 20 actual
-Omni Euler DiT forwards):
+Generate 768p T2VA with the ModelScope FlashGen four-forward preset:
 
 ```bash
 python tools/minimax_h3/request_video.py \
@@ -121,12 +134,15 @@ python tools/minimax_h3/request_video.py \
   --prompt 'A fox walks through snow with synchronized footsteps and winter wind.' \
   --width 1344 --height 768 --aspect-ratio 16:9 \
   --duration 5 --seed 2101 \
+  --flashgen-4step-lora \
+  /data/models/Minimax-H3-4step-lora-flashgen/minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors \
   --output t2va-internal-124f.mp4 \
   --metadata t2va.json
 ```
 
-Add `--pinned-omni-reference` only when deliberately reproducing the pinned
-Omni Base quality baseline with 49 actual DiT forwards.
+Omit the FlashGen option to run the pinned Omni Base quality reference with 49
+actual DiT forwards. FlashGen v1.0 serves T2VA only; FL2VA and Ref2VA examples
+below use their Base partitions unless a matching task-family adapter is added.
 
 On an FL2VA server, select first frame, last frame, or both:
 
@@ -171,15 +187,17 @@ python tools/minimax_h3/benchmark_t2va.py \
   --output-dir /data/evidence/h3-t2va-gaudi2 \
   --server-log /data/evidence/h3-server/server.log \
   --server-pid "$SERVER_PID" \
-  --module 0
+  --module 0 \
+  --flashgen-4step-lora \
+  /data/models/Minimax-H3-4step-lora-flashgen/minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors
 ```
 
-The tool makes one first request followed by three measured requests. It
-defaults to the 21-point grid and 20 actual Omni Euler DiT forwards. Add
-`--pinned-omni-reference` to the benchmark command only for a deliberate
-pinned-Omni 49-forward reproduction, or set `--sigma-points` explicitly for
-another controlled schedule. Each request uses 1344x768, 24 FPS, five seconds,
-seed 2101, and validates a 124-frame internal MP4. It retains that file, trims a
+The tool makes one first request followed by three measured requests. The
+command above checks the server log for exactly four DiT forwards. Use
+`--pinned-omni-reference` only for a deliberate 49-forward Base reproduction,
+or set `--sigma-points` explicitly for another controlled Base experiment.
+Each request uses 1344x768, 24 FPS, five seconds, seed 2101, and validates a
+124-frame internal MP4. It retains that file, trims a
 separate delivery file to exactly 120 frames/five seconds, runs full video and
 audio decode through the Habana FFmpeg build, samples HBM and host memory, and
 reports the warmed median and range. Profiling is disabled for these main

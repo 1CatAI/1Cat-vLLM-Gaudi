@@ -20,7 +20,10 @@ _VIDEO_TYPES = {"video/mp4", "video/quicktime"}
 _AUDIO_TYPES = {"audio/wav", "audio/x-wav", "audio/mpeg"}
 _T2VA_RATIOS = {"21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}
 _PINNED_OMNI_REFERENCE_SIGMA_POINTS = 50
-_BASE_20_DENOISE_STEPS = 20
+_FLASHGEN_INFERENCE_STEPS = 4
+_FLASHGEN_SIGMA_POINTS = 5
+_FLASHGEN_FILENAME = "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
+_FLASHGEN_BASE_SCHEDULE = (1.0, 0.7, 0.4, 0.15, 0.0)
 
 
 def _response_metrics(headers: dict[str, str]) -> dict[str, object]:
@@ -57,13 +60,42 @@ def _resolve_sigma_points(
     denoise_steps: int | None,
     pinned_omni_reference: bool,
 ) -> int | None:
-    """Use 20 denoiser calls unless the pinned Omni reference is requested."""
+    """Resolve an explicit Base grid; omission keeps Omni's Base reference."""
 
     if pinned_omni_reference:
         return None
     if requested is not None:
         return requested
-    return (denoise_steps if denoise_steps is not None else _BASE_20_DENOISE_STEPS) + 1
+    if denoise_steps is not None:
+        return denoise_steps + 1
+    return None
+
+
+def _sampling_contract(args: argparse.Namespace) -> dict[str, object]:
+    flashgen = getattr(args, "flashgen_lora", None)
+    if flashgen is not None:
+        return {
+            "request_field": "num_inference_steps",
+            "meaning": "adapter_schedule_interval_count",
+            "field_was_omitted": False,
+            "sampler": "flashgen_dmd2_base_schedule",
+            "profile": "flashgen_4step_768p",
+            "resolved_sigma_points": _FLASHGEN_SIGMA_POINTS,
+            "base_schedule": list(_FLASHGEN_BASE_SCHEDULE),
+            "expected_joint_dit_forwards": _FLASHGEN_INFERENCE_STEPS,
+            "video_and_audio_share_each_forward": True,
+        }
+    sigma_points = args.sigma_points or _PINNED_OMNI_REFERENCE_SIGMA_POINTS
+    return {
+        "request_field": "num_inference_steps",
+        "meaning": "sigma_grid_points_including_terminal_zero",
+        "field_was_omitted": args.sigma_points is None,
+        "sampler": "omni_euler_eta0",
+        "profile": "pinned_omni_base" if args.sigma_points is None else "explicit_base_grid",
+        "resolved_sigma_points": sigma_points,
+        "expected_joint_dit_forwards": sigma_points - 1,
+        "video_and_audio_share_each_forward": True,
+    }
 
 
 def _mime_type(path: Path) -> str:
@@ -87,6 +119,14 @@ def _validate(args: argparse.Namespace, references: list[tuple[Path, str]]) -> N
         raise ValueError("flow_shift must be positive")
     if args.audio_flow_shift is not None and args.audio_flow_shift <= 0:
         raise ValueError("audio_flow_shift must be positive")
+    flashgen = getattr(args, "flashgen_lora", None)
+    if flashgen is not None:
+        if args.task != "t2va":
+            raise ValueError("FlashGen 4-step v1.0 supports T2VA only")
+        if Path(flashgen).name != _FLASHGEN_FILENAME:
+            raise ValueError(f"FlashGen preset requires the published filename {_FLASHGEN_FILENAME}")
+        if args.flow_shift is not None or args.audio_flow_shift is not None:
+            raise ValueError("FlashGen preset owns its sigma schedule; omit flow-shift overrides")
     if (args.width is not None or args.height is not None) and (args.width is None or args.height is None
                                                                 or args.width % 32 or args.height % 32):
         raise ValueError("width and height must both be present and divisible by 32")
@@ -131,10 +171,18 @@ def _request_data(args: argparse.Namespace) -> dict[str, str]:
         "seed": str(args.seed),
         "extra_params": json.dumps(extra, separators=(",", ":")),
     }
-    # The pinned Omni Base reference defines 50 sigma grid points. The terminal
-    # zero is included, so it resolves to 49 joint video/audio DiT forwards.
-    # This differs from ComfyUI's 20-step RES multistep Base workflow.
-    if args.sigma_points is not None:
+    flashgen = getattr(args, "flashgen_lora", None)
+    if flashgen is not None:
+        data["num_inference_steps"] = str(_FLASHGEN_INFERENCE_STEPS)
+        data["lora"] = json.dumps(
+            {
+                "name": "h3-flashgen-v1.0",
+                "path": str(Path(flashgen)),
+                "scale": float(getattr(args, "lora_scale", 1.0)),
+            },
+            separators=(",", ":"),
+        )
+    elif args.sigma_points is not None:
         data["num_inference_steps"] = str(args.sigma_points)
     if args.flow_shift is not None:
         data["flow_shift"] = str(args.flow_shift)
@@ -167,9 +215,16 @@ def main() -> int:
     parser.add_argument("--fps", type=int, default=24)
     schedule = parser.add_mutually_exclusive_group()
     schedule.add_argument(
+        "--flashgen-4step-lora",
+        "--flashgen-lora",
+        dest="flashgen_lora",
+        type=Path,
+        help="published ModelScope FlashGen native-layout LoRA; runs its exact four-forward schedule",
+    )
+    schedule.add_argument(
         "--denoise-steps",
         type=int,
-        help="actual Base Euler DiT calls; default: 20 (translated to 21 sigma points)",
+        help="experimental Base Euler DiT calls (translated to one more sigma grid point)",
     )
     schedule.add_argument(
         "--sigma-points",
@@ -182,8 +237,9 @@ def main() -> int:
         "--official-base-default",
         dest="pinned_omni_reference",
         action="store_true",
-        help="omit the field and reproduce pinned Omni's 50-point / 49-forward Base schedule",
+        help="reproduce pinned Omni's 50-point / 49-forward Base schedule (also the Base default)",
     )
+    parser.add_argument("--lora-scale", type=float, default=1.0)
     parser.add_argument("--flow-shift", type=float, help="omitted uses checkpoint release metadata (Base: 12)")
     parser.add_argument(
         "--audio-flow-shift",
@@ -198,6 +254,12 @@ def main() -> int:
         args.denoise_steps,
         args.pinned_omni_reference,
     )
+    if args.flashgen_lora is not None:
+        args.flashgen_lora = args.flashgen_lora.expanduser().resolve()
+        if not args.flashgen_lora.is_file():
+            raise FileNotFoundError(args.flashgen_lora)
+    if args.lora_scale <= 0:
+        raise ValueError("lora-scale must be positive")
 
     references = [(path.expanduser().resolve(), _mime_type(path)) for path in args.reference]
     for path, _ in references:
@@ -236,16 +298,7 @@ def main() -> int:
         "api_url": args.api_url,
         "task": args.task,
         "request": data,
-        "sampling_contract": {
-            "request_field": "num_inference_steps",
-            "meaning": "sigma_grid_points_including_terminal_zero",
-            "field_was_omitted": args.sigma_points is None,
-            "sampler": "omni_euler_eta0",
-            "profile": "pinned_omni_reference" if args.sigma_points is None else "explicit_base_grid",
-            "resolved_sigma_points": args.sigma_points or _PINNED_OMNI_REFERENCE_SIGMA_POINTS,
-            "expected_joint_dit_forwards": (args.sigma_points or _PINNED_OMNI_REFERENCE_SIGMA_POINTS) - 1,
-            "video_and_audio_share_each_forward": True,
-        },
+        "sampling_contract": _sampling_contract(args),
         "references": [{
             "path": str(path),
             "mime_type": mime

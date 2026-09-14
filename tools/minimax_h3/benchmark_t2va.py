@@ -25,8 +25,17 @@ DEFAULT_PROMPT = ("A red fox walks through a snowy forest while its footsteps cr
 DEFAULT_FFPROBE = Path("/opt/habanalabs/media/ffmpeg/bin/ffprobe")
 DEFAULT_VALIDATION_FFMPEG = Path("/opt/habanalabs/media/ffmpeg/bin/ffmpeg")
 DEFAULT_ENCODING_FFMPEG = Path(imageio_ffmpeg.get_ffmpeg_exe())
-BASE_20_DENOISE_STEPS = 20
 PINNED_OMNI_REFERENCE_SIGMA_POINTS = 50
+FLASHGEN_INFERENCE_STEPS = 4
+FLASHGEN_SIGMA_POINTS = 5
+
+
+def _sampling_plan(args: argparse.Namespace) -> tuple[int, int, str]:
+    if getattr(args, "flashgen_lora", None) is not None:
+        return FLASHGEN_SIGMA_POINTS, FLASHGEN_INFERENCE_STEPS, "flashgen_4step_768p"
+    if args.pinned_omni_reference:
+        return PINNED_OMNI_REFERENCE_SIGMA_POINTS, PINNED_OMNI_REFERENCE_SIGMA_POINTS - 1, "pinned_omni_base"
+    return args.sigma_points, args.sigma_points - 1, "explicit_base_grid"
 
 
 def _run(command: list[str], log_path: Path, *, timeout: float | None = None) -> None:
@@ -233,7 +242,9 @@ def _request_command(args: argparse.Namespace, run_dir: Path) -> list[str]:
         "--timeout",
         str(args.timeout),
     ]
-    if args.pinned_omni_reference:
+    if getattr(args, "flashgen_lora", None) is not None:
+        command.extend(("--flashgen-4step-lora", str(args.flashgen_lora)))
+    elif args.pinned_omni_reference:
         command.append("--pinned-omni-reference")
     else:
         command.extend(("--sigma-points", str(args.sigma_points)))
@@ -302,8 +313,7 @@ def _one_run(args: argparse.Namespace, index: int) -> dict[str, Any]:
                                           height=768,
                                           frames=120,
                                           exact_duration=5.0)
-    sigma_points = PINNED_OMNI_REFERENCE_SIGMA_POINTS if args.pinned_omni_reference else args.sigma_points
-    expected_dit_forwards = sigma_points - 1
+    sigma_points, expected_dit_forwards, sampling_profile = _sampling_plan(args)
     dit_forwards = _progress_total(args.server_log, log_offset)
     if dit_forwards != expected_dit_forwards:
         raise RuntimeError(
@@ -315,6 +325,7 @@ def _one_run(args: argparse.Namespace, index: int) -> dict[str, Any]:
         "started_at": started_at,
         "wall_seconds": wall_seconds,
         "harness_wall_seconds": harness_wall_seconds,
+        "sampling_profile": sampling_profile,
         "request_sampling_fields_omitted": args.pinned_omni_reference,
         "resolved_sigma_points": sigma_points,
         "actual_joint_dit_forwards": dit_forwards,
@@ -341,9 +352,16 @@ def main() -> int:
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     schedule = parser.add_mutually_exclusive_group()
     schedule.add_argument(
+        "--flashgen-4step-lora",
+        "--flashgen-lora",
+        dest="flashgen_lora",
+        type=Path,
+        help="benchmark the published ModelScope FlashGen four-forward 768p schedule",
+    )
+    schedule.add_argument(
         "--denoise-steps",
         type=int,
-        help="actual Base Euler DiT calls; default: 20 (translated to 21 sigma points)",
+        help="experimental Base Euler DiT calls (translated to one more sigma grid point)",
     )
     schedule.add_argument(
         "--sigma-points",
@@ -365,18 +383,26 @@ def main() -> int:
     args = parser.parse_args()
     if args.runs < 4:
         raise ValueError("the acceptance protocol needs one first request and at least three subsequent requests")
-    if args.sigma_points is None and not args.pinned_omni_reference:
-        denoise_steps = BASE_20_DENOISE_STEPS if args.denoise_steps is None else args.denoise_steps
-        if denoise_steps < 1:
+    if args.flashgen_lora is not None:
+        args.flashgen_lora = args.flashgen_lora.expanduser().resolve()
+        if not args.flashgen_lora.is_file():
+            raise FileNotFoundError(args.flashgen_lora)
+    elif args.sigma_points is None and not args.pinned_omni_reference:
+        if args.denoise_steps is None:
+            args.pinned_omni_reference = True
+        elif args.denoise_steps < 1:
             raise ValueError("MiniMax H3 needs at least one denoise step")
-        args.sigma_points = denoise_steps + 1
+        else:
+            args.sigma_points = args.denoise_steps + 1
     if args.sigma_points is not None and args.sigma_points < 2:
         raise ValueError("MiniMax H3 needs at least two sigma grid points")
     args.output_dir = args.output_dir.expanduser().resolve()
     args.server_log = args.server_log.expanduser().resolve()
     args.output_dir.mkdir(parents=True, exist_ok=False)
 
-    sigma_points = PINNED_OMNI_REFERENCE_SIGMA_POINTS if args.pinned_omni_reference else args.sigma_points
+    flashgen = args.flashgen_lora is not None
+    sigma_points, actual_forwards, sampling_profile = _sampling_plan(args)
+    sampler = "flashgen_dmd2_base_schedule" if flashgen else "omni_euler_eta0"
     results = [_one_run(args, index) for index in range(args.runs)]
     warmed = [item["wall_seconds"] for item in results[1:4]]
     summary = {
@@ -391,10 +417,11 @@ def main() -> int:
             "internal_frames": 124,
             "delivery_frames": 120,
             "seed": 2101,
+            "sampling_profile": sampling_profile,
             "sampling_fields_omitted": args.pinned_omni_reference,
-            "sampler": "omni_euler_eta0",
+            "sampler": sampler,
             "resolved_sigma_points": sigma_points,
-            "actual_joint_dit_forwards": sigma_points - 1,
+            "actual_joint_dit_forwards": actual_forwards,
             "profiler_enabled": False,
         },
         "first_request_wall_seconds": results[0]["wall_seconds"],
