@@ -25,3 +25,16 @@ For more information and detailed configuration recommendations for each backend
 ## Inference
 
 The inference stage involves executing a trained model to generate predictions or outputs from new input data. After calibration and quantization, vLLM Hardware Plugin for Intel® Gaudi® runs the optimized model on supported hardware to deliver fast and accurate inference results. For more information and examples for different quantization backends, see the [Quantization and Inference](../configuration/quantization/quantization.md) guide.
+
+### Qwen gated attention on Gaudi2
+
+Qwen3Next and Qwen3.5 gated full-attention output projections use ordinary
+rowwise dynamic FP8 scaling on Gaudi2, even when CGUID dynamic scaling is
+enabled globally. This avoids a numerical anomaly in compiled graphs combining
+the gate producer, CGUID scaling and FP8 GEMM. The projection-level policy also
+applies to partial projections in the prefill boundary pipeline; other
+projections and quantization methods keep their existing selection policy.
+
+This workaround does not make FP8 inference equivalent to a higher-precision
+model. Validate task quality and repeated execution for the model and workload
+being deployed; moving graph breaks arbitrarily is not an equivalent workaround.
