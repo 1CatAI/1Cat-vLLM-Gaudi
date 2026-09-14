@@ -24,6 +24,7 @@ from vllm_gaudi.attention.ops.hpu_paged_attn import (HPUPagedAttention, HPUPaged
                                                      HPUPagedAttentionMetadataBuilder)
 
 from vllm_gaudi.extension.logger import logger as init_logger
+from vllm_gaudi.ops.gqa_compact import load_native_gqa_matmul
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.v1.attention.backends.registry import (register_backend, AttentionBackendEnum)
 from vllm._aiter_ops import rocm_aiter_ops
@@ -477,6 +478,7 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                 'Non-contiguous PA not supported with alibi slopes!'
 
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
+        self.native_gqa_matmul = load_native_gqa_matmul()
         self.sliding_window = sliding_window
         self.prompt_position_bias = None
         self.prev_attn = None

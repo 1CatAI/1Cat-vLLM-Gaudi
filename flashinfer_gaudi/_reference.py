@@ -8,6 +8,8 @@ import math
 import torch
 import torch.nn.functional as F
 
+from vllm_gaudi.ops.gdn_recurrent_compound import gdn_recurrent_compound
+
 _QWEN38_KEY_HEADS = 16
 _QWEN38_VALUE_HEADS = 48
 _QWEN38_DIM = 128
@@ -211,6 +213,7 @@ def _direct_qwen38_single_token_packed_decode(
     scale: float,
     use_qk_l2norm: bool,
     inplace_state: bool = True,
+    recurrent_compound: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Keep the production Qwen shape static for the Gaudi graph compiler."""
     batch = packed_qkv.shape[0]
@@ -253,11 +256,21 @@ def _direct_qwen38_single_token_packed_decode(
         _QWEN38_HEAD_REPEAT,
     ).to(torch.float32).unsqueeze(-1)
 
-    decayed_state = state * decay
-    projection = torch.matmul(decayed_state, k_grouped.unsqueeze(-1)).squeeze(-1)
-    delta = (value_work - projection) * beta_work
-    updated_state = torch.addcmul(decayed_state, delta.unsqueeze(-1), k_grouped.unsqueeze(-2))
-    output = torch.matmul(updated_state, (q_work.unsqueeze(2) * scale).unsqueeze(-1)).squeeze(-1)
+    if recurrent_compound:
+        updated_state, output = gdn_recurrent_compound(
+            state,
+            decay,
+            k_grouped,
+            q_work.unsqueeze(2) * scale,
+            value_work,
+            beta_work,
+        )
+    else:
+        decayed_state = state * decay
+        projection = torch.matmul(decayed_state, k_grouped.unsqueeze(-1)).squeeze(-1)
+        delta = (value_work - projection) * beta_work
+        updated_state = torch.addcmul(decayed_state, delta.unsqueeze(-1), k_grouped.unsqueeze(-2))
+        output = torch.matmul(updated_state, (q_work.unsqueeze(2) * scale).unsqueeze(-1)).squeeze(-1)
     next_state = updated_state.reshape_as(state_pool)
     if inplace_state:
         state_pool.copy_(next_state)
@@ -352,6 +365,7 @@ def qwen38_fused_decode_step_direct(
     scale: float,
     inplace_state: bool = True,
     direct_state_update: bool = False,
+    recurrent_compound: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fuse the static Qwen3.8 direct-state decode composition.
 
@@ -395,6 +409,7 @@ def qwen38_fused_decode_step_direct(
             scale,
             True,
             inplace_state,
+            recurrent_compound,
         )
     return output, conv_state, next_state
 

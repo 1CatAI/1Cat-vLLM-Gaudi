@@ -214,12 +214,20 @@ if TYPE_CHECKING:
     VLLM_HPU_GDN_ACTIVE_STATE_VIEWS: bool = False
     VLLM_HPU_GDN_ASYNC_STATE_DMA: bool = False
     VLLM_HPU_GDN_DIRECT_STATE_UPDATE: bool = False
+    VLLM_HPU_GDN_RECURRENT_COMPOUND: bool = False
+    VLLM_HPU_GDN_RECURRENT_COMPOUND_EXTENSION: str = ""
+    VLLM_HPU_GDN_RECURRENT_COMPOUND_VARIANT: str = "plain"
     VLLM_HPU_GDN_PRECISE_DMA_EVENTS: bool = False
     VLLM_HPU_TP2_PREPARED_COMM: bool = False
     VLLM_HPU_TP2_STATIC_GROUP_PLAN: bool = False
     VLLM_HPU_TP2_PLAN_DUMP_DIR: str | None = None
     VLLM_HPU_TP2_NATIVE_JOINT_PLAN: bool = False
     VLLM_HPU_TP2_GQA_COMPACT_KV: bool = False
+    VLLM_HPU_GQA_COMPACT_KV: bool = False
+    VLLM_HPU_GQA_COMPACT_KV_MAX_BATCH: int = 1
+    VLLM_HPU_GQA_NATIVE_MATMUL: bool = False
+    VLLM_HPU_GQA_NATIVE_MATMUL_EXTENSION: str = ""
+    VLLM_HPU_PAGED_KV_DUAL_GATHER: bool = False
     VLLM_HPU_TP2_COMPILED_CONSUMER_NORM: bool = False
     VLLM_HPU_TP2_NATIVE_DYNAMIC_QUANT: bool = False
     VLLM_HPU_GDN_PADDED_DIRECT_STATE: bool = False
@@ -677,6 +685,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_GDN_ASYNC_STATE_DMA", "false").strip().lower() in ("1", "true"),
     "VLLM_HPU_GDN_DIRECT_STATE_UPDATE":
     lambda: os.environ.get("VLLM_HPU_GDN_DIRECT_STATE_UPDATE", "false").strip().lower() in ("1", "true"),
+    "VLLM_HPU_GDN_RECURRENT_COMPOUND":
+    lambda: os.environ.get("VLLM_HPU_GDN_RECURRENT_COMPOUND", "false").strip().lower() in ("1", "true"),
+    "VLLM_HPU_GDN_RECURRENT_COMPOUND_EXTENSION":
+    lambda: os.environ.get("VLLM_HPU_GDN_RECURRENT_COMPOUND_EXTENSION", ""),
+    "VLLM_HPU_GDN_RECURRENT_COMPOUND_VARIANT":
+    lambda: os.environ.get("VLLM_HPU_GDN_RECURRENT_COMPOUND_VARIANT", "plain").strip().lower(),
     "VLLM_HPU_GDN_PRECISE_DMA_EVENTS":
     lambda: os.environ.get("VLLM_HPU_GDN_PRECISE_DMA_EVENTS", "false").strip().lower() in ("1", "true"),
     "VLLM_HPU_TP2_PREPARED_COMM":
@@ -689,6 +703,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_TP2_NATIVE_JOINT_PLAN", "0") == "1",
     "VLLM_HPU_TP2_GQA_COMPACT_KV":
     lambda: os.environ.get("VLLM_HPU_TP2_GQA_COMPACT_KV", "0") == "1",
+    "VLLM_HPU_GQA_COMPACT_KV":
+    lambda: os.environ.get("VLLM_HPU_GQA_COMPACT_KV", "0") == "1",
+    "VLLM_HPU_GQA_COMPACT_KV_MAX_BATCH":
+    lambda: int(os.environ.get("VLLM_HPU_GQA_COMPACT_KV_MAX_BATCH", "1")),
+    "VLLM_HPU_GQA_NATIVE_MATMUL":
+    lambda: os.environ.get("VLLM_HPU_GQA_NATIVE_MATMUL", "0") == "1",
+    "VLLM_HPU_GQA_NATIVE_MATMUL_EXTENSION":
+    lambda: os.environ.get("VLLM_HPU_GQA_NATIVE_MATMUL_EXTENSION", ""),
+    "VLLM_HPU_PAGED_KV_DUAL_GATHER":
+    lambda: os.environ.get("VLLM_HPU_PAGED_KV_DUAL_GATHER", "0") == "1",
     "VLLM_HPU_TP2_COMPILED_CONSUMER_NORM":
     lambda: os.environ.get("VLLM_HPU_TP2_COMPILED_CONSUMER_NORM", "0") == "1",
 
