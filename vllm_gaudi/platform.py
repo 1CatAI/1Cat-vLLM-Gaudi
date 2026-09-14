@@ -291,6 +291,27 @@ class HpuPlatform(Platform):
         return total_hpu_memory
 
     @classmethod
+    def get_current_memory_usage(cls, device: torch.types.Device | None = None) -> float:
+        """Return current allocator use through the peak-reset contract.
+
+        ``DeviceMemoryProfiler`` resets the high-water mark immediately before
+        loading and subtracts this value afterwards. CUDA and XPU implement the
+        contract by resetting their peak statistics and reading the resulting
+        current allocation; HPU exposes the same allocator APIs.
+        """
+        del device
+        cls.empty_cache()
+        torch.hpu.reset_peak_memory_stats()
+        return float(torch.hpu.max_memory_allocated())
+
+    @classmethod
+    def empty_cache(cls) -> None:
+        # The Habana allocator manages reclaimed blocks internally and exposes
+        # no cache-eviction API. This explicit no-op also prevents the generic
+        # torch.accelerator shim from warning at every Omni phase boundary.
+        return
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
             from vllm_gaudi.ops.deepseek_v4_native import validate_config
@@ -586,7 +607,6 @@ class HpuPlatform(Platform):
     def configure_control_process(cls, role):
         from vllm_gaudi.ops.deepseek_v41_cpu import bind_control_process
         bind_control_process(role)
-
 
     @classmethod
     def register_custom_kv_cache_specs(cls, vllm_config):
