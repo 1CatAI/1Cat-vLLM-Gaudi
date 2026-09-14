@@ -587,6 +587,11 @@ generated outputs differ from the preceding candidate; independent quality
 qualification remains incomplete. Do not treat isolated bitwise checks as
 full-model output equivalence.
 
+`VLLM_HPU_DSV41_COMPRESSOR_FUSED_INPUT` (default `0`) concatenates the ratio-2
+CSA2 Compressor `wkv` and `wgate` FP32 weights at load time. C1 then uses one
+complete-K MME projection and splits its output before the unchanged history,
+softmax, and compressed-cache consumer chain.
+
 ### V4.1 native input capture
 
 `VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH` (default `0`) includes PP0 embedding and its

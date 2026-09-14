@@ -22,6 +22,7 @@ import torch.nn.functional as F  # noqa: E402
 from vllm_gaudi.ops.deepseek_v41_shard_loader import PreparedV41Shard  # noqa: E402
 from vllm_gaudi.ops.deepseek_v41_woa_fp8 import WoaFP8Sidecar  # noqa: E402
 from vllm_gaudi.ops.deepseek_v41_sampling import local_greedy_candidate  # noqa: E402
+from vllm_gaudi.ops.deepseek_v41_math import rms_norm  # noqa: E402
 
 
 def summarize(values):
@@ -137,8 +138,8 @@ def benchmark(name,
         for p in Path(f"/proc/{os.getpid()}/task").iterdir()
     }
     if profile_only:
-        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
-                                               torch.profiler.ProfilerActivity.HPU]) as profiler:
+        with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.HPU]) as profiler:
             for arm, replay in replays.items():
                 for sample in range(4):
                     with torch.profiler.record_function(f"chain-{arm}-{sample}"):
@@ -200,7 +201,7 @@ def main():
     parser.add_argument("sidecar", type=Path)
     parser.add_argument("--components",
                         nargs="+",
-                        choices=("woa", "woa-output", "router", "head"),
+                        choices=("woa", "woa-output", "router", "head", "compressor-input"),
                         default=["woa", "router", "head"])
     parser.add_argument("--rounds", type=int, default=3)
     arms = parser.add_mutually_exclusive_group()
@@ -314,6 +315,88 @@ def main():
 
             benchmark("head", reference, candidate, [x], [(weight.float(), )], [(weight, )], output, args.rounds,
                       recorder, args.candidate_only)
+        if "compressor-input" in args.components:
+            shard = PreparedV41Shard(args.prepared, 0, 0)
+            inputs, old, new = [], [], []
+            for layer in (2, 8, 14):
+                prefix = f"layers.{layer}.attn."
+                wkv = shard.tensor(prefix + "compressor.wkv.weight", "hpu").float()
+                wgate = shard.tensor(prefix + "compressor.wgate.weight", "hpu").float()
+                norm = shard.tensor(prefix + "compressor.norm.weight", "hpu")
+                index_weight = shard.tensor(prefix + "indexer.wk.weight", "hpu")
+                index_norm = shard.tensor(prefix + "indexer.k_norm.weight", "hpu")
+                previous_kv = torch.randn(1, wkv.shape[0], dtype=torch.float32, device="hpu")
+                previous_score = torch.randn_like(previous_kv)
+                fused = torch.cat((wkv, wgate), dim=0).contiguous()
+                common = (previous_kv, previous_score, norm, index_weight, index_norm)
+                old.append((wkv, wgate, *common))
+                new.append((fused, *common))
+                inputs.append(torch.randn(1, wkv.shape[1], dtype=torch.bfloat16, device="hpu"))
+
+            def consume(kv, score, previous_kv, previous_score, norm, index_weight, index_norm):
+                gates = torch.stack((previous_score, score), 1).softmax(1)
+                latent = (previous_kv * gates[:, 0] + kv * gates[:, 1]).to(torch.bfloat16)
+                latent = rms_norm(latent, norm, 1e-6)
+                index = rms_norm(F.linear(latent, index_weight), index_norm, 1e-6)
+                return latent, index
+
+            def reference(x, wkv, wgate, previous_kv, previous_score, norm, index_weight, index_norm):
+                value = x.float()
+                kv = F.linear(value, wkv)
+                score = F.linear(value, wgate)
+                return consume(kv, score, previous_kv, previous_score, norm, index_weight, index_norm)
+
+            def candidate(x, fused, previous_kv, previous_score, norm, index_weight, index_norm):
+                projected = F.linear(x.float(), fused)
+                kv, score = projected.chunk(2, dim=-1)
+                return consume(kv, score, previous_kv, previous_score, norm, index_weight, index_norm)
+
+            ref_projection = torch.compile(lambda x, a, b: (F.linear(x.float(), a), F.linear(x.float(), b)),
+                                           backend="hpu_backend",
+                                           fullgraph=True,
+                                           dynamic=False)
+            fused_projection = torch.compile(lambda x, w: F.linear(x.float(), w).chunk(2, dim=-1),
+                                             backend="hpu_backend",
+                                             fullgraph=True,
+                                             dynamic=False)
+            compiled_reference = torch.compile(reference, backend="hpu_backend", fullgraph=True, dynamic=False)
+            compiled_candidate = torch.compile(candidate, backend="hpu_backend", fullgraph=True, dynamic=False)
+            for x, reference_weights, candidate_weights in zip(inputs, old, new, strict=True):
+                expected = ref_projection(x, reference_weights[0], reference_weights[1])
+                actual = fused_projection(x, candidate_weights[0])
+                assert all(torch.equal(a.cpu(), b.cpu()) for a, b in zip(expected, actual, strict=True))
+                expected = reference(x, *reference_weights)
+                actual = candidate(x, *candidate_weights)
+                assert all(torch.equal(a.cpu(), b.cpu()) for a, b in zip(expected, actual, strict=True))
+                expected = compiled_reference(x, *reference_weights)
+                actual = compiled_candidate(x, *candidate_weights)
+                assert all(torch.equal(a.cpu(), b.cpu()) for a, b in zip(expected, actual, strict=True))
+
+            def validate_existing_compile_delta(arm, x, weights, compiled, ordinary):
+                del x, weights
+                deltas = []
+                for actual, expected in zip(compiled, ordinary, strict=True):
+                    delta = (actual.float() - expected.float()).abs()
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=1 / 128)
+                    deltas.append({
+                        "max_abs": delta.max().item(),
+                        "mean_abs": delta.mean().item(),
+                        "different": int(torch.count_nonzero(delta).item()),
+                        "elements": delta.numel(),
+                    })
+                return {"arm": arm, "existing_compile_eager_bf16_delta": deltas}
+
+            benchmark("compressor-input",
+                      reference,
+                      candidate,
+                      inputs,
+                      old,
+                      new,
+                      output,
+                      args.rounds,
+                      recorder,
+                      args.candidate_only,
+                      ordinary_validator=validate_existing_compile_delta)
     torch.hpu.synchronize()
     torch.distributed.destroy_process_group()
     (output / "memory.json").write_text(

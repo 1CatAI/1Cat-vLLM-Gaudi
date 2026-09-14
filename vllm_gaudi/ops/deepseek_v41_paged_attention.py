@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from vllm_gaudi import envs as gaudi_envs
-from vllm_gaudi.ops.deepseek_v41_qkv import FusedQKVInput
+from vllm_gaudi.ops.deepseek_v41_qkv import FusedCompressorInput, FusedQKVInput
 from vllm_gaudi.ops.deepseek_v41_math import (
     apply_rope,
     pack_fp4,
@@ -114,7 +114,7 @@ class PagedCSA2SharedState(nn.Module):
         return blocks * width + rows.remainder(width)
 
 
-class PagedCSA2Attention(FusedQKVInput, nn.Module):
+class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
 
     def __init__(self, weights, config, layer, shared, linear, reduce, gather, device):
         super().__init__()
@@ -122,6 +122,10 @@ class PagedCSA2Attention(FusedQKVInput, nn.Module):
         self.qkv_fused_input = gaudi_envs.VLLM_HPU_DSV41_QKV_FUSED_INPUT and layer < config["num_hidden_layers"]
         self._fused_qkv_weight = None
         self._fused_qkv_quantized = False
+        self.compressor_fused_input = (gaudi_envs.VLLM_HPU_DSV41_COMPRESSOR_FUSED_INPUT
+                                       and layer < config["num_hidden_layers"])
+        self._fused_compressor_weight = None
+        self._fused_compressor_kv_width = 0
         self.mla_mme = gaudi_envs.VLLM_HPU_DSV41_MLA_MME and layer < config["num_hidden_layers"]
         self.linear, self.reduce, self.gather = linear, reduce, gather
         self.layer, self.ratio, self.length = layer, config["compress_ratios"][layer], shared.length
@@ -160,8 +164,7 @@ class PagedCSA2Attention(FusedQKVInput, nn.Module):
     def _compress(self, value, positions):
         compressor = self.weights.compressor
         if self.ratio == 2:
-            kv = self.linear(value.float(), compressor.wkv).float()
-            score = self.linear(value.float(), compressor.wgate).float()
+            kv, score = self._project_compressor_input(value)
             self.kv_history.index_copy_(0, positions.remainder(HISTORY_ROWS).long(), kv)
             self.score_history.index_copy_(0, positions.remainder(HISTORY_ROWS).long(), score)
             first = positions - positions.remainder(2)

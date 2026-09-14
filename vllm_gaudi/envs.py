@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE: bool = False
     VLLM_HPU_DSV41_MLA_MME: bool = False
     VLLM_HPU_DSV41_QKV_FUSED_INPUT: bool = False
+    VLLM_HPU_DSV41_COMPRESSOR_FUSED_INPUT: bool = False
     VLLM_HPU_DSV41_PREPARED_SHARDS: bool = False
     VLLM_HPU_DSV41_ENGRAM_HOST_TABLE: bool = False
     VLLM_HPU_DSV41_GRAPH_REPLAY: bool = False
@@ -354,6 +355,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_MLA_MME", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_QKV_FUSED_INPUT":
     lambda: os.environ.get("VLLM_HPU_DSV41_QKV_FUSED_INPUT", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_COMPRESSOR_FUSED_INPUT":
+    lambda: os.environ.get("VLLM_HPU_DSV41_COMPRESSOR_FUSED_INPUT", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_PREPARED_SHARDS":
     lambda: os.environ.get("VLLM_HPU_DSV41_PREPARED_SHARDS", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_ENGRAM_HOST_TABLE":

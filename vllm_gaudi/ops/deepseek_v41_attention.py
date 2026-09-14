@@ -11,6 +11,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from vllm_gaudi import envs as gaudi_envs
+from vllm_gaudi.ops.deepseek_v41_qkv import FusedCompressorInput
 from vllm_gaudi.ops.deepseek_v41_math import (
     apply_rope,
     pack_fp4,
@@ -72,7 +73,7 @@ class CSA2SharedState(nn.Module):
             self.register_buffer("candidate_pool", None, False)
 
 
-class CSA2Attention(nn.Module):
+class CSA2Attention(FusedCompressorInput, nn.Module):
 
     def __init__(self, weights, config, layer, shared, linear, reduce, device):
         super().__init__()
@@ -86,6 +87,9 @@ class CSA2Attention(nn.Module):
         self.qkv_fused_input = gaudi_envs.VLLM_HPU_DSV41_QKV_FUSED_INPUT
         self._fused_qkv_weight = None
         self._fused_qkv_quantized = False
+        self.compressor_fused_input = gaudi_envs.VLLM_HPU_DSV41_COMPRESSOR_FUSED_INPUT
+        self._fused_compressor_weight = None
+        self._fused_compressor_kv_width = 0
         self.c1_indices = gaudi_envs.VLLM_HPU_DSV41_C1_INDICES
         self.selected_valid_only = gaudi_envs.VLLM_HPU_DSV41_SELECTED_VALID_ONLY
         self.selected_kv_vector = gaudi_envs.VLLM_HPU_DSV41_SELECTED_KV_VECTOR
@@ -273,8 +277,7 @@ class CSA2Attention(nn.Module):
     def _compress(self, value, positions):
         compressor = self.weights.compressor
         if self.ratio == 2:
-            kv = self.linear(value.float(), compressor.wkv)
-            score = self.linear(value.float(), compressor.wgate)
+            kv, score = self._project_compressor_input(value)
             self.kv_history.index_copy_(0, positions.long(), kv.float())
             self.score_history.index_copy_(0, positions.long(), score.float())
             first = positions - positions.remainder(2)

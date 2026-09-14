@@ -55,3 +55,43 @@ class FusedQKVInput:
         qkv = F.linear(fused_value, self._fused_qkv_weight)
         q_width = self.weights.wq_a.weight.shape[0]
         return qkv[..., :q_width], qkv[..., q_width:]
+
+
+class FusedCompressorInput:
+    """Load-time fusion for the ratio-2 CSA2 compressor projections."""
+
+    def prepare_compressor_input_weight(self):
+        if not self.compressor_fused_input or self._fused_compressor_weight is not None:
+            return
+        if not self.owns_kv or self.ratio != 2:
+            return
+        compressor = self.weights.compressor
+        kv_weight = compressor.wkv.weight
+        gate_weight = compressor.wgate.weight
+        if kv_weight.ndim != 2 or gate_weight.ndim != 2 or kv_weight.shape[1] != gate_weight.shape[1]:
+            raise ValueError("V4.1 Compressor fusion requires matching input K dimensions")
+        if kv_weight.dtype != torch.float32 or gate_weight.dtype != torch.float32:
+            raise ValueError("V4.1 ratio-2 Compressor fusion requires FP32 weights")
+        if getattr(compressor.wkv, "bias", None) is not None or getattr(compressor.wgate, "bias", None) is not None:
+            raise ValueError("V4.1 ratio-2 Compressor fusion does not support projection bias")
+        fused = torch.cat((kv_weight, gate_weight), dim=0).contiguous()
+        self.register_buffer("fused_compressor_wkv_wgate", fused, False)
+        self._fused_compressor_kv_width = kv_weight.shape[0]
+        compressor.wkv.weight = self.fused_compressor_wkv_wgate[:kv_weight.shape[0]]
+        compressor.wgate.weight = self.fused_compressor_wkv_wgate[kv_weight.shape[0]:]
+        self._fused_compressor_weight = self.fused_compressor_wkv_wgate
+
+    def invalidate_compressor_input_weight(self):
+        if "fused_compressor_wkv_wgate" in self._buffers:
+            self._buffers.pop("fused_compressor_wkv_wgate")
+        self._fused_compressor_weight = None
+        self._fused_compressor_kv_width = 0
+
+    def _project_compressor_input(self, value):
+        compressor = self.weights.compressor
+        value = value.float()
+        if self._fused_compressor_weight is None:
+            return self.linear(value, compressor.wkv).float(), self.linear(value, compressor.wgate).float()
+        projected = F.linear(value, self._fused_compressor_weight)
+        width = self._fused_compressor_kv_width
+        return projected[..., :width], projected[..., width:]

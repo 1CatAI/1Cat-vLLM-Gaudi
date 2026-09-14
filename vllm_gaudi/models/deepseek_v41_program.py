@@ -497,6 +497,7 @@ class PreparedStage(nn.Module):
             if attention is None:
                 continue
             attention.prepare_qkv_input_weight()
+            attention.prepare_compressor_input_weight()
             attention.woa_fp8 = layer.layer in self.woa_config["layers"]
             if gaudi_envs.VLLM_HPU_DSV41_PREPARED_OUTPUT:
                 attention.prepare_output_weight()
@@ -550,6 +551,9 @@ class PreparedStage(nn.Module):
         self.runtime_precision["head"] = ("BF16xBF16 MME -> FP32" if self.bf16_head else "FP32 MME")
         self.runtime_precision["attention_input"] = ("fused wq_a+wkv BF16 MME / one activation quantization" if
                                                      gaudi_envs.VLLM_HPU_DSV41_QKV_FUSED_INPUT else "separate wq_a/wkv")
+        self.runtime_precision["compressor_input"] = ("fused ratio-2 FP32 wkv+wgate MME"
+                                                      if gaudi_envs.VLLM_HPU_DSV41_COMPRESSOR_FUSED_INPUT else
+                                                      "separate ratio-2 wkv/wgate MME")
         self.runtime_precision["mla"] = ("shared-KV BF16 QK / FP32 softmax and PV / BF16 output v1"
                                          if gaudi_envs.VLLM_HPU_DSV41_MLA_MME else "TPC online softmax")
         if gaudi_envs.VLLM_HPU_DSV41_MLA_BF16_PV:
@@ -572,6 +576,7 @@ class PreparedStage(nn.Module):
             attention = getattr(layer, "attention", None)
             if attention is not None:
                 attention.invalidate_qkv_input_weight()
+                attention.invalidate_compressor_input_weight()
             moe = getattr(layer, "moe", None)
             if moe is not None:
                 moe.release_shared_gate_up_weight()
