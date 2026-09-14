@@ -72,6 +72,55 @@ def gdn_bf16():
     return _import_gdn({"VLLM_GDN_COMPUTE_FP32": "0"})
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, None), ("0", False), ("false", False), ("1", True), ("true", True)],
+)
+def test_resolve_prefill_state_precision_override(monkeypatch, gdn, value, expected):
+    if value is None:
+        monkeypatch.delenv("VLLM_GDN_PREFILL_STATE_FP32", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_GDN_PREFILL_STATE_FP32", value)
+    assert gdn.resolve_hpu_gdn_prefill_state_fp32() is expected
+
+
+def test_resolve_prefill_state_precision_override_rejects_invalid(monkeypatch, gdn):
+    monkeypatch.setenv("VLLM_GDN_PREFILL_STATE_FP32", "sometimes")
+    with pytest.raises(ValueError, match="VLLM_GDN_PREFILL_STATE_FP32"):
+        gdn.resolve_hpu_gdn_prefill_state_fp32()
+
+
+@pytest.mark.parametrize(("value", "expected"), [(None, 0), ("0", 0), ("512", 512)])
+def test_resolve_short_prefill_fp32_threshold(monkeypatch, gdn, value, expected):
+    if value is None:
+        monkeypatch.delenv("VLLM_GDN_PREFILL_STATE_FP32_MAX_TOKENS", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_GDN_PREFILL_STATE_FP32_MAX_TOKENS", value)
+    assert gdn.resolve_hpu_gdn_prefill_state_fp32_max_tokens() == expected
+
+
+@pytest.mark.parametrize("value", ["-1", "sometimes"])
+def test_resolve_short_prefill_fp32_threshold_rejects_invalid(monkeypatch, gdn, value):
+    monkeypatch.setenv("VLLM_GDN_PREFILL_STATE_FP32_MAX_TOKENS", value)
+    with pytest.raises(ValueError, match="VLLM_GDN_PREFILL_STATE_FP32_MAX_TOKENS"):
+        gdn.resolve_hpu_gdn_prefill_state_fp32_max_tokens()
+
+
+@pytest.mark.parametrize(
+    ("configured", "max_tokens", "num_tokens", "expected"),
+    [
+        (False, 512, 128, True),
+        (False, 512, 512, True),
+        (False, 512, 513, False),
+        (None, 512, 128, True),
+        (None, 0, 128, None),
+        (True, 0, 8192, True),
+    ],
+)
+def test_select_short_prefill_state_precision(gdn, configured, max_tokens, num_tokens, expected):
+    assert gdn.select_hpu_gdn_prefill_state_fp32(configured, max_tokens, num_tokens) is expected
+
+
 # ---------------------------------------------------------------------------
 # Random tensor generators (seeded for reproducibility)
 # ---------------------------------------------------------------------------

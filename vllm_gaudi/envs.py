@@ -175,6 +175,8 @@ if TYPE_CHECKING:
 
     VLLM_GDN_CHUNK_SIZE: int = 0
     VLLM_GDN_NEUMANN_ITERS: int = 14
+    VLLM_GDN_PREFILL_STATE_FP32: Optional[bool] = None
+    VLLM_GDN_PREFILL_STATE_FP32_MAX_TOKENS: int = 0
     VLLM_GDN_FUSED_STATE_MATMUL: bool = False
     VLLM_GDN_DEFERRED_OUTPUT_ADD: bool = False
     VLLM_GDN_RECURSIVE_SOLVER_BASE: int = 0
@@ -214,18 +216,39 @@ if TYPE_CHECKING:
     VLLM_HPU_GDN_ACTIVE_STATE_VIEWS: bool = False
     VLLM_HPU_GDN_ASYNC_STATE_DMA: bool = False
     VLLM_HPU_GDN_DIRECT_STATE_UPDATE: bool = False
+    VLLM_HPU_GDN_RECURRENT_COMPOUND: bool = False
+    VLLM_HPU_GDN_RECURRENT_COMPOUND_EXTENSION: str = ""
+    VLLM_HPU_GDN_RECURRENT_COMPOUND_VARIANT: str = "plain"
     VLLM_HPU_GDN_PRECISE_DMA_EVENTS: bool = False
     VLLM_HPU_TP2_PREPARED_COMM: bool = False
     VLLM_HPU_TP2_STATIC_GROUP_PLAN: bool = False
     VLLM_HPU_TP2_PLAN_DUMP_DIR: str | None = None
     VLLM_HPU_TP2_NATIVE_JOINT_PLAN: bool = False
     VLLM_HPU_TP2_GQA_COMPACT_KV: bool = False
+    VLLM_HPU_GQA_COMPACT_KV: bool = False
+    VLLM_HPU_GQA_COMPACT_KV_MAX_BATCH: int = 1
+    VLLM_HPU_GQA_NATIVE_MATMUL: bool = False
+    VLLM_HPU_GQA_NATIVE_MATMUL_EXTENSION: str = ""
+    VLLM_HPU_PAGED_KV_DUAL_GATHER: bool = False
     VLLM_HPU_TP2_COMPILED_CONSUMER_NORM: bool = False
     VLLM_HPU_TP2_NATIVE_DYNAMIC_QUANT: bool = False
     VLLM_HPU_GDN_PADDED_DIRECT_STATE: bool = False
     VLLM_HPU_CGUID_DYNAMIC_QUANT: bool = False
     VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS: int = 32
     VLLM_HPU_FUSED_GREEDY_LOGITS: bool = False
+
+
+def _optional_bool_env(name: str) -> Optional[bool]:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in ("1", "true"):
+        return True
+    if normalized in ("0", "false"):
+        return False
+    raise ValueError(f"{name} must be one of 0, 1, false or true, got {value!r}.")
+
 
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
@@ -677,6 +700,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_GDN_ASYNC_STATE_DMA", "false").strip().lower() in ("1", "true"),
     "VLLM_HPU_GDN_DIRECT_STATE_UPDATE":
     lambda: os.environ.get("VLLM_HPU_GDN_DIRECT_STATE_UPDATE", "false").strip().lower() in ("1", "true"),
+    "VLLM_HPU_GDN_RECURRENT_COMPOUND":
+    lambda: os.environ.get("VLLM_HPU_GDN_RECURRENT_COMPOUND", "false").strip().lower() in ("1", "true"),
+    "VLLM_HPU_GDN_RECURRENT_COMPOUND_EXTENSION":
+    lambda: os.environ.get("VLLM_HPU_GDN_RECURRENT_COMPOUND_EXTENSION", ""),
+    "VLLM_HPU_GDN_RECURRENT_COMPOUND_VARIANT":
+    lambda: os.environ.get("VLLM_HPU_GDN_RECURRENT_COMPOUND_VARIANT", "plain").strip().lower(),
     "VLLM_HPU_GDN_PRECISE_DMA_EVENTS":
     lambda: os.environ.get("VLLM_HPU_GDN_PRECISE_DMA_EVENTS", "false").strip().lower() in ("1", "true"),
     "VLLM_HPU_TP2_PREPARED_COMM":
@@ -689,6 +718,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_TP2_NATIVE_JOINT_PLAN", "0") == "1",
     "VLLM_HPU_TP2_GQA_COMPACT_KV":
     lambda: os.environ.get("VLLM_HPU_TP2_GQA_COMPACT_KV", "0") == "1",
+    "VLLM_HPU_GQA_COMPACT_KV":
+    lambda: os.environ.get("VLLM_HPU_GQA_COMPACT_KV", "0") == "1",
+    "VLLM_HPU_GQA_COMPACT_KV_MAX_BATCH":
+    lambda: int(os.environ.get("VLLM_HPU_GQA_COMPACT_KV_MAX_BATCH", "1")),
+    "VLLM_HPU_GQA_NATIVE_MATMUL":
+    lambda: os.environ.get("VLLM_HPU_GQA_NATIVE_MATMUL", "0") == "1",
+    "VLLM_HPU_GQA_NATIVE_MATMUL_EXTENSION":
+    lambda: os.environ.get("VLLM_HPU_GQA_NATIVE_MATMUL_EXTENSION", ""),
+    "VLLM_HPU_PAGED_KV_DUAL_GATHER":
+    lambda: os.environ.get("VLLM_HPU_PAGED_KV_DUAL_GATHER", "0") == "1",
     "VLLM_HPU_TP2_COMPILED_CONSUMER_NORM":
     lambda: os.environ.get("VLLM_HPU_TP2_COMPILED_CONSUMER_NORM", "0") == "1",
 
@@ -722,6 +761,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Iteration budget for the approximate GDN triangular solve.
     "VLLM_GDN_NEUMANN_ITERS":
     lambda: int(os.environ.get("VLLM_GDN_NEUMANN_ITERS", "14")),
+
+    # Register the optional prefill arithmetic override used by the GDN op.
+    "VLLM_GDN_PREFILL_STATE_FP32":
+    lambda: _optional_bool_env("VLLM_GDN_PREFILL_STATE_FP32"),
+
+    # Promote only short static prefill buckets to FP32 recurrence.
+    "VLLM_GDN_PREFILL_STATE_FP32_MAX_TOKENS":
+    lambda: int(os.environ.get("VLLM_GDN_PREFILL_STATE_FP32_MAX_TOKENS", "0")),
 
     # Fuse the output and recurrent-state projections in GDN phase B.
     "VLLM_GDN_FUSED_STATE_MATMUL":

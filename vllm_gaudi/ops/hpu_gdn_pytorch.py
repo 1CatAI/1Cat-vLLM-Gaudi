@@ -38,6 +38,44 @@ _GDN_COMPUTE_DTYPE = torch.float32 if os.getenv("VLLM_GDN_COMPUTE_FP32", "1") ==
 _GDN_SOLVE_FP32 = os.getenv("VLLM_GDN_SOLVE_FP32", "0") == "1"
 _GDN_STATE_FP32 = os.getenv("VLLM_GDN_STATE_FP32", "0") == "1"
 
+
+def resolve_hpu_gdn_prefill_state_fp32() -> bool | None:
+    """Return an optional prefill-only recurrent arithmetic override.
+
+    This allows an FP32 cache for fused decode while prefill performs its
+    chunk recurrence in BF16 and converts the final state once at cache write.
+    An absent setting preserves the global ``VLLM_GDN_STATE_FP32`` behavior.
+    """
+    return gaudi_envs.VLLM_GDN_PREFILL_STATE_FP32
+
+
+def resolve_hpu_gdn_prefill_state_fp32_max_tokens() -> int:
+    """Return the largest short prefill that should accumulate in FP32."""
+    value = os.getenv("VLLM_GDN_PREFILL_STATE_FP32_MAX_TOKENS", "0")
+    try:
+        max_tokens = int(value)
+    except ValueError as exc:
+        raise ValueError("VLLM_GDN_PREFILL_STATE_FP32_MAX_TOKENS must be a non-negative "
+                         f"integer, got {value!r}.") from exc
+    if max_tokens < 0:
+        raise ValueError("VLLM_GDN_PREFILL_STATE_FP32_MAX_TOKENS must be a non-negative "
+                         f"integer, got {value!r}.")
+    return max_tokens
+
+
+def select_hpu_gdn_prefill_state_fp32(
+    configured: bool | None,
+    max_tokens: int,
+    num_tokens: int,
+) -> bool | None:
+    """Promote qualified short prefill buckets to FP32 recurrence."""
+    if configured is True:
+        return True
+    if max_tokens > 0 and num_tokens <= max_tokens:
+        return True
+    return configured
+
+
 # Set VLLM_GDN_EXACT_SOLVE=1 to use exact row-by-row forward substitution
 # instead of the Neumann iterative solver.  Exact but ~2.6x slower (127
 # Python-loop iterations for chunk_size=128).  Useful for isolating

@@ -131,7 +131,8 @@ class Fp8LinearMethod(OrigFp8LinearMethod):
                                               weight_scale=weight_scale,
                                               input_scale=input_scale,
                                               bias=bias,
-                                              trans_B=False)
+                                              trans_B=False,
+                                              use_cguid=not getattr(layer, "_hpu_avoid_cguid_dynamic_quant", False))
         return output.view(*x.shape[:-1], -1)
 
     def dequant_fp8_weight(self, layer) -> torch.Tensor:

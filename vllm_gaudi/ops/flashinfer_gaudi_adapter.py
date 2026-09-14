@@ -12,6 +12,9 @@ from flashinfer_gaudi._tactics import gdn_fused_decode_tactic, gdn_prefill_tacti
 from flashinfer_gaudi.gdn_decode import gated_delta_rule_decode_packed
 from flashinfer_gaudi.gdn_prefill import _chunk_gated_delta_rule_log_gate
 from vllm_gaudi import envs
+from vllm_gaudi.ops.gdn_recurrent_compound import (
+    load_gdn_recurrent_compound,
+)
 
 _BACKEND_POLICY = get_backend_policy()
 _PUBLIC_AUTO_PROMOTED = public_gdn_auto_promoted()
@@ -25,6 +28,7 @@ _GDN_FUSED_DECODE_LOCAL_GEOMETRIES = frozenset({
     (10240, 48),
     (5120, 24),
 })
+_GDN_RECURRENT_COMPOUND_LOADED = load_gdn_recurrent_compound()
 
 
 def flashinfer_gdn_enabled() -> bool:
@@ -281,6 +285,15 @@ def maybe_run_gdn_fused_decode_step(
             or selected_ssm_state.dtype != torch.float32):
         return None
 
+    if envs.VLLM_HPU_GDN_RECURRENT_COMPOUND:
+        if not _GDN_RECURRENT_COMPOUND_LOADED:
+            raise RuntimeError("GDN recurrent compound was requested but not loaded")
+        if value_heads != 48:
+            raise RuntimeError(
+                "GDN recurrent compound is qualified only for Qwen3.8 TP1 "
+                "with 48 value heads"
+            )
+
     output, _, updated_state = qwen38_fused_decode_step_direct(
         mixed_qkv,
         a,
@@ -295,6 +308,7 @@ def maybe_run_gdn_fused_decode_step(
         inplace_state=not defer_state_writeback,
         direct_state_update=(envs.VLLM_HPU_GDN_DIRECT_STATE_UPDATE and state_is_active_view and token_rows == 1
                              and value_heads == 24 and not defer_state_writeback),
+        recurrent_compound=envs.VLLM_HPU_GDN_RECURRENT_COMPOUND,
     )
     return output.unsqueeze(0), updated_state
 

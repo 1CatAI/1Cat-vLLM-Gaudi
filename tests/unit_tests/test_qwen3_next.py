@@ -15,9 +15,55 @@ from vllm_gaudi.models.qwen3_next import (
     can_compile_hpu_qwen3_layer_groups,
     can_use_hpu_qwen3_layer_groups,
     compile_hpu_qwen3_layer_groups,
+    configure_hpu_qwen3_gated_fp8,
     enable_hpu_qwen3_tp2_fused_ar_norm,
     supports_hpu_qwen3_layer_group_compilation,
 )
+
+
+def test_configure_hpu_qwen3_gated_fp8_marks_only_gated_fp8(monkeypatch):
+
+    class FakeFp8LinearMethod:
+        pass
+
+    class FakeAttention(torch.nn.Module):
+
+        def __init__(self, gated, quant_method):
+            super().__init__()
+            self.attn_output_gate = gated
+            self.o_proj = SimpleNamespace(quant_method=quant_method)
+
+    from vllm_gaudi.extension import ops
+    from vllm_gaudi.ops import hpu_fp8
+
+    monkeypatch.setattr(ops, "is_hpu_gaudi2", True)
+    monkeypatch.setattr(hpu_fp8, "Fp8LinearMethod", FakeFp8LinearMethod)
+    monkeypatch.setattr(qwen3_next_module, "Qwen3NextAttention", FakeAttention)
+
+    gated_fp8 = FakeAttention(True, FakeFp8LinearMethod())
+    ungated_fp8 = FakeAttention(False, FakeFp8LinearMethod())
+    gated_other = FakeAttention(True, object())
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList((gated_fp8, ungated_fp8, gated_other))
+
+    assert configure_hpu_qwen3_gated_fp8(model) == 1
+    assert gated_fp8.o_proj._hpu_avoid_cguid_dynamic_quant is True
+    assert not hasattr(ungated_fp8.o_proj, "_hpu_avoid_cguid_dynamic_quant")
+    assert not hasattr(gated_other.o_proj, "_hpu_avoid_cguid_dynamic_quant")
+
+
+def test_configure_hpu_qwen3_gated_fp8_is_gaudi2_only(monkeypatch):
+
+    class UnexpectedModel:
+
+        def modules(self):
+            raise AssertionError("non-Gaudi2 path must not inspect modules")
+
+    from vllm_gaudi.extension import ops
+
+    monkeypatch.setattr(ops, "is_hpu_gaudi2", False)
+
+    assert configure_hpu_qwen3_gated_fp8(UnexpectedModel()) == 0
 
 
 class _AddLayer(torch.nn.Module):

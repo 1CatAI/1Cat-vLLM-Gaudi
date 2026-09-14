@@ -54,6 +54,8 @@ are in progress.
 | `VLLM_MINIMAX_M3_MOE_GATHER_MAX_TOKENS` | Maximum token count for the MiniMax-M3 routed-expert gather path. Larger batches use the dense expert path. | `16` |
 | `VLLM_GDN_CHUNK_SIZE` | Overrides the GDN prefill chunk size. Set to a positive multiple of 32; `0` keeps the model-provided value or the HPU default. | `0` |
 | `VLLM_GDN_NEUMANN_ITERS` | Sets the iteration budget for the approximate GDN triangular solve. Lower values can improve prefill speed but require model-level quality validation. | `14` |
+| `VLLM_GDN_PREFILL_STATE_FP32` | Optional prefill-only recurrent arithmetic override. Set to `0` to retain an FP32 cache for fused decode while performing chunked prefill recurrence in BF16 and converting its final state once at cache write. Unset preserves `VLLM_GDN_STATE_FP32`. | unset |
+| `VLLM_GDN_PREFILL_STATE_FP32_MAX_TOKENS` | Promotes GDN recurrent state arithmetic to FP32 for static prefill buckets at or below this token count while larger buckets retain `VLLM_GDN_PREFILL_STATE_FP32`. This protects short-prompt quality without moving long-prefill BMMs off their selected path. Set to `0` to disable. | `0` |
 | `VLLM_GDN_FUSED_STATE_MATMUL` | Fuses the GDN phase-B output and recurrent-state projections into one larger matrix multiplication per chunk. | `false` |
 | `VLLM_GDN_DEFERRED_OUTPUT_ADD` | Defers GDN phase-B output accumulation until after the recurrent loop, avoiding in-place writes to chunk views in compiled HPU graphs. | `false` |
 | `VLLM_GDN_RECURSIVE_SOLVER_BASE` | Enables recursive block inversion for the GDN triangular solve. Set to `0` to disable it or a power-of-two base size of which the chunk size is a power-of-two multiple. | `0` |
@@ -515,7 +517,6 @@ enables it through the aggregate bundle.
 The native projection consumes the prepared FP8 weight directly instead of imposing a TPC weight-copy pass. Compiler-selected SRAM/DRAM placement must still be verified in the actual combined model graph. Activation preparation retains the per-token/group maximum and exact power-of-two scaling contract.
 
 The codec uses bias 7, maximum magnitude 240, nearest-even rounding followed by flushing FP8 subnormals and canonicalizing zero. Original block scales are consumed during bounded channel preparation. This changes the numerical contract, including activation quantization. The dedicated ordinary-C1 entrypoint enables it through the aggregate bundle; the generic entrypoint leaves it disabled.
-
 
 `VLLM_HPU_DSV41_ROUTER_TOP6=1` retains FP32 gate scores and replaces the generic sort/gather/normalization with native repeated-max top6 selection, including text/image bias selection and smallest-ID ties. The selection uses paired score/ID comparisons and packs the six results into two vector writes. `VLLM_HPU_DSV41_BF16_ROUTER_GATE=1` keeps the checkpoint gate in BF16 and produces FP32 logits from BF16 MME operands. `VLLM_HPU_DSV41_BF16_LM_HEAD=1` retains the checkpoint BF16 head and uses BF16 MME operands with FP32 accumulation and logits. All require DSpark disabled. The dedicated ordinary-C1 entrypoint enables them through the aggregate bundle; the generic entrypoint leaves them disabled.
 

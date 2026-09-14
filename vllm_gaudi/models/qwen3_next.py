@@ -24,6 +24,30 @@ def _qwen3_inner_model(model):
     return getattr(model, "model", None)
 
 
+def configure_hpu_qwen3_gated_fp8(model) -> int:
+    """Keep Gaudi2 gated-attention projections on ordinary rowwise FP8 scaling.
+
+    Combining the gate producer, CGUID scaling and FP8 GEMM in a compiled
+    graph can corrupt outputs. Mark the projection itself so direct forward
+    and boundary-pipelined partial projections use the same quantization.
+    Other projections, quantization methods and devices are unchanged.
+    """
+    from vllm_gaudi.extension import ops
+    from vllm_gaudi.ops.hpu_fp8 import Fp8LinearMethod
+
+    if not ops.is_hpu_gaudi2:
+        return 0
+    count = 0
+    for attention in model.modules():
+        if not isinstance(attention, Qwen3NextAttention) or not attention.attn_output_gate:
+            continue
+        projection = attention.o_proj
+        if isinstance(getattr(projection, "quant_method", None), Fp8LinearMethod):
+            projection._hpu_avoid_cguid_dynamic_quant = True
+            count += 1
+    return count
+
+
 def enable_hpu_qwen3_tp2_fused_ar_norm(model) -> int:
     """Move dense Qwen3 row-parallel reductions to following RMSNorms.
 
@@ -472,6 +496,9 @@ def apply_hpu_qwen3_residual_fix(model) -> bool:
 
     if inner_model is None:
         return False
+
+    if isinstance(inner_model, (Qwen3_5Model, UpstreamQwen3NextModel)):
+        configure_hpu_qwen3_gated_fp8(inner_model)
 
     # Check if it's a Qwen3_5Model or Qwen3NextModel that needs the fix
     if isinstance(inner_model, Qwen3_5Model):
