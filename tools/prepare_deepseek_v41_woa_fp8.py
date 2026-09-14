@@ -24,8 +24,9 @@ def read_bytes(source, offset, size):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("prepared", type=Path)
-    parser.add_argument("output", type=Path)
+    parser.add_argument("output", nargs="?", type=Path)
     args = parser.parse_args()
+    args.output = args.output or args.prepared / "sidecars" / "wo_a_fp8"
     args.output.mkdir(parents=True, exist_ok=False)
     manifest = {
         "version": 1,

@@ -29,6 +29,9 @@ from vllm_gaudi.ops.deepseek_v41_weights import canonical_hash
 def linear(value, layer):
     if hasattr(layer, "scale"):
         value = quantize_activation(value)
+    if getattr(layer, "dense_fp8", False):
+        return torch.ops.custom_op.custom_deepseek_v41_dense_fp8_gaudi2(value.contiguous(), layer.weight,
+                                                                        layer.channel_scale)
     return F.linear(value, layer.weight, getattr(layer, "bias", None))
 
 
@@ -55,11 +58,34 @@ def _weight_tree(specs):
     return root
 
 
-def load_weight_tree(shard, tree, device, specs=None, *, woa_sidecar=None, woa_layers=(), expert_n256_layers=None):
+def load_weight_tree(shard,
+                     tree,
+                     device,
+                     specs=None,
+                     *,
+                     woa_sidecar=None,
+                     woa_layers=(),
+                     expert_n256_layers=None,
+                     dense_sidecar=None,
+                     dense_config=None):
     n256 = gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256 or gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8
+    dense_names = {
+        f"layers.{layer}.attn.{projection}.weight"
+        for projection, layers in (dense_config or {}).items() if projection != "version" for layer in layers
+    }
     for name, spec in (shard.specs if specs is None else specs).items():
         layer = int(name.split(".")[1]) if name.startswith("layers.") else None
         selected_n256 = n256 and layer is not None and (expert_n256_layers is None or layer in expert_n256_layers)
+        if name in dense_names:
+            module = tree.get_submodule(name.rpartition(".")[0])
+            module.weight = dense_sidecar.tensor(name, device)
+            channel = dense_sidecar.tensor(name.removesuffix("weight") + "channel_scale", device)
+            if "channel_scale" in module._buffers:
+                module.channel_scale = channel
+            else:
+                module.register_buffer("channel_scale", channel, False)
+            module.dense_fp8 = True
+            continue
         if (woa_sidecar is not None and name.endswith(".attn.wo_a.weight") and layer in woa_layers):
             module = tree.get_submodule(name.rpartition(".")[0])
             module.weight = woa_sidecar.tensor(name, device)
@@ -99,7 +125,8 @@ def load_weight_tree(shard, tree, device, specs=None, *, woa_sidecar=None, woa_l
             if value.shape[0] % 4:
                 raise ValueError(f"MLA wo_a rows are not divisible by 4: {name} {tuple(value.shape)}")
             value = value.reshape(4, value.shape[0] // 4, value.shape[1]).transpose(-1, -2).contiguous()
-        if (name.endswith("ffn.gate.weight") or name.endswith("confidence_head.proj.weight")
+        if ((name.endswith("ffn.gate.weight") and not gaudi_envs.VLLM_HPU_DSV41_BF16_ROUTER_GATE)
+                or name.endswith("confidence_head.proj.weight")
                 or (name == "head.weight" and not gaudi_envs.VLLM_HPU_DSV41_BF16_LM_HEAD)
                 or name == "mtp.2.markov_head.head.weight"
                 or (".compressor.w" in name and ".weight" in name and int(name.split(".")[1]) in (2, 8, 14))):
@@ -144,6 +171,10 @@ class PreparedMoE(nn.Module):
         self.n256 = topk == 6 and (gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256 or gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8)
         self.n256_fp8 = self.n256 and gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8
         self.n256_fused = self.n256_fp8 and gaudi_envs.VLLM_HPU_DSV41_EXPERT_FUSED_QUANT
+        self.n256_fused_reduce = self.n256_fused and gaudi_envs.VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE
+        self.router_bf16_gate = gaudi_envs.VLLM_HPU_DSV41_BF16_ROUTER_GATE
+        self.shared_gate_up = gaudi_envs.VLLM_HPU_DSV41_SHARED_GATE_UP
+        self.register_buffer("shared_gate_up_weight", None, False)
         if topk == 6 and gaudi_envs.VLLM_HPU_DSV41_EXPERT_FUSED_QUANT and not self.n256_fp8:
             raise ValueError("Fused expert quantization requires N256 FP8 experts")
         if self.n256 and (gaudi_envs.VLLM_HPU_DSV41_SHARED_C6_EXPERTS or gaudi_envs.VLLM_HPU_DSV41_INDEXED_MOE):
@@ -153,6 +184,32 @@ class PreparedMoE(nn.Module):
             raise ValueError("V4.1 expert coordinate pipeline requires the K128 BF16 decoder")
         if self.expert_k128 and gaudi_envs.VLLM_HPU_DSV41_FP8_DECODE:
             raise ValueError("V4.1 K128 BF16 and FP8 decode must be selected independently")
+
+    def release_shared_gate_up_weight(self):
+        self.shared_gate_up_weight = None
+
+    def prepare_shared_gate_up_weight(self):
+        if not self.shared_gate_up:
+            return
+        shared = self.weights.shared_experts
+        self.shared_gate_up_weight = torch.cat((shared.w1.weight, shared.w3.weight), dim=0).contiguous()
+        for projection in (shared.w1, shared.w3):
+            source = projection.weight
+            projection.weight = torch.empty(source.shape, dtype=source.dtype, device="meta")
+
+    def shared_expert(self, value):
+        shared = self.weights.shared_experts
+        if self.shared_gate_up:
+            if self.shared_gate_up_weight is None:
+                raise RuntimeError("Shared gate/up weight was not prepared before execution")
+            projected = F.linear(quantize_activation(value), self.shared_gate_up_weight).float()
+            gate, up = projected.chunk(2, dim=-1)
+            gate = gate.clamp(max=10.0)
+            up = up.clamp(-10.0, 10.0)
+        else:
+            gate = linear(value, shared.w1).float().clamp(max=10.0)
+            up = linear(value, shared.w3).float().clamp(-10.0, 10.0)
+        return linear((F.silu(gate) * up).to(value.dtype), shared.w2)
 
     def _can_use_indexed(self, value, ids, routing):
         """Static contract for the direct Q16 TPC candidate.
@@ -198,7 +255,9 @@ class PreparedMoE(nn.Module):
 
     def forward(self, value, image_mask, ready_outputs=(), *, fp8_decode=False):
         w = self.weights
-        scores = F.softplus(F.linear(value.float(), w.gate.weight)).sqrt()
+        gate_logits = (torch.ops.custom_op.custom_deepseek_v41_bf16_linear_f32_gaudi2(
+            value.contiguous(), w.gate.weight) if self.router_bf16_gate else F.linear(value.float(), w.gate.weight))
+        scores = F.softplus(gate_logits).sqrt()
         if self.router_top6:
             if self.topk != 6 or scores.shape[1] != 384:
                 raise ValueError("Native V4.1 Router requires 384 experts and top6")
@@ -216,7 +275,9 @@ class PreparedMoE(nn.Module):
             if self.n256_fp8 and fp8_decode:
                 if not 1 <= value.shape[0] <= 6:
                     raise ValueError("N256 FP8 native decode requires C1-C6")
-                op = (torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2
+                op = (torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2
+                      if self.n256_fused_reduce else
+                      torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2
                       if self.n256_fused else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fp8_gaudi2)
                 output = op(*operands, experts.w13_channel, experts.w2_channel, self.normal_scales)
             else:
@@ -250,10 +311,7 @@ class PreparedMoE(nn.Module):
                 op = torch.ops.custom_op.custom_deepseek_v41_mxfp4_n512_moe_bf16_gaudi2
             output = op(value, ids.to(torch.int32), routing.float(), experts.w13_q16, experts.w2_q16, experts.w13_s16,
                         experts.w2_s16, self.lookup, self.normal_scales)
-        shared = w.shared_experts
-        gate = linear(value, shared.w1).float().clamp(max=10.0)
-        up = linear(value, shared.w3).float().clamp(-10.0, 10.0)
-        shared_out = linear((F.silu(gate) * up).to(value.dtype), shared.w2)
+        shared_out = self.shared_expert(value)
         partial = (output.float() + shared_out.float()).to(value.dtype)
         return self.reduce(partial, ready_outputs=ready_outputs) if ready_outputs else self.reduce(partial)
 
@@ -322,9 +380,19 @@ class PreparedStage(nn.Module):
         self.reduce, self.all_gather = reduce, all_gather
         self.dspark = (gaudi_envs.VLLM_HPU_DSV41_DSPARK if dspark is None else bool(dspark))
         self.bf16_head = gaudi_envs.VLLM_HPU_DSV41_BF16_LM_HEAD
-        if self.dspark and self.bf16_head:
-            raise ValueError("BF16 output-head candidate requires ordinary C1 decode")
+        if self.dspark and (self.bf16_head or gaudi_envs.VLLM_HPU_DSV41_BF16_ROUTER_GATE):
+            raise ValueError("BF16 projection candidates require ordinary C1 decode")
+        if self.dspark and gaudi_envs.VLLM_HPU_DSV41_SHARED_GATE_UP:
+            raise ValueError("Shared gate/up candidate requires ordinary C1 decode")
+        if self.dspark and gaudi_envs.VLLM_HPU_DSV41_MHC_GATES_FUSED:
+            raise ValueError("Fused mHC gates require ordinary C1 decode")
         self.woa_config = {"version": 1, "layers": []}
+        self.dense_config = {"version": 1, "wq_b": [], "wo_b": []}
+        if gaudi_envs.VLLM_HPU_DSV41_ATTN_DENSE_FP8:
+            from vllm_gaudi.ops.deepseek_v41_dense_fp8 import precision_config
+            if self.dspark:
+                raise ValueError("Attention dense FP8 requires ordinary C1 decode")
+            self.dense_config = precision_config(gaudi_envs.VLLM_HPU_DSV41_ATTN_DENSE_FP8_CONFIG)
         if gaudi_envs.VLLM_HPU_DSV41_WO_A_FP8:
             from vllm_gaudi.ops.deepseek_v41_woa_fp8 import layer_selection
             if self.dspark:
@@ -332,8 +400,11 @@ class PreparedStage(nn.Module):
             self.woa_config = layer_selection(gaudi_envs.VLLM_HPU_DSV41_WO_A_FP8_CONFIG)
         self.expert_n256 = (gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256 or gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8)
         self.expert_fused_quant = gaudi_envs.VLLM_HPU_DSV41_EXPERT_FUSED_QUANT
+        self.expert_fused_reduce = gaudi_envs.VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE
         if self.expert_fused_quant and not gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8:
             raise ValueError("Fused expert quantization requires N256 FP8 experts")
+        if self.expert_fused_reduce and not (gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8 and self.expert_fused_quant):
+            raise ValueError("Fused expert finalize requires N256 FP8 and fused quantization")
         if self.expert_n256 and (gaudi_envs.VLLM_HPU_DSV41_FP8_DECODE
                                  or gaudi_envs.VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE):
             raise ValueError("N256 experts use their own layout and decoder")
@@ -390,7 +461,15 @@ class PreparedStage(nn.Module):
     def load_prepared(self, device):
         if self.loaded:
             self.invalidate()
+        for layer in self.layers:
+            moe = getattr(layer, "moe", None)
+            if moe is not None:
+                moe.release_shared_gate_up_weight()
         sidecar = None
+        dense_sidecar = None
+        if gaudi_envs.VLLM_HPU_DSV41_ATTN_DENSE_FP8:
+            from vllm_gaudi.ops.deepseek_v41_dense_fp8 import DenseFP8Sidecar
+            dense_sidecar = DenseFP8Sidecar(gaudi_envs.VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR, self.shard)
         if gaudi_envs.VLLM_HPU_DSV41_WO_A_FP8:
             from vllm_gaudi.ops.deepseek_v41_woa_fp8 import WoaFP8Sidecar
             sidecar = WoaFP8Sidecar(gaudi_envs.VLLM_HPU_DSV41_WO_A_FP8_SIDECAR, self.shard)
@@ -400,7 +479,18 @@ class PreparedStage(nn.Module):
                          self.weight_specs,
                          woa_sidecar=sidecar,
                          woa_layers=self.woa_config["layers"],
-                         expert_n256_layers=self.expert_n256_config["routed_experts"])
+                         expert_n256_layers=self.expert_n256_config["routed_experts"],
+                         dense_sidecar=dense_sidecar,
+                         dense_config=self.dense_config)
+        if dense_sidecar is not None:
+            self.runtime_precision["attention_dense_fp8"] = {
+                "config": self.dense_config,
+                "weight_fingerprint": dense_sidecar.fingerprint,
+            }
+        for layer in self.layers:
+            moe = getattr(layer, "moe", None)
+            if moe is not None:
+                moe.prepare_shared_gate_up_weight()
         for layer in self.layers:
             attention = getattr(layer, "attention", None)
             if attention is None:
@@ -422,6 +512,7 @@ class PreparedStage(nn.Module):
                 layer.moe.n256 = enabled
                 layer.moe.n256_fp8 = (enabled and gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8)
                 layer.moe.n256_fused = (layer.moe.n256_fp8 and self.expert_fused_quant)
+                layer.moe.n256_fused_reduce = (layer.moe.n256_fused and self.expert_fused_reduce)
             self.runtime_precision["expert_n256"] = {
                 "config": self.expert_n256_config,
                 "layout": LAYOUT,
@@ -429,6 +520,7 @@ class PreparedStage(nn.Module):
                 "c1_c6": "FP8xFP8" if gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8 else "BF16xBF16",
                 "prefill": "BF16 from retained original scales",
                 "fused_quant": gaudi_envs.VLLM_HPU_DSV41_EXPERT_FUSED_QUANT,
+                "fused_reduce": self.expert_fused_reduce,
             }
             self.runtime_precision["experts"] = ("MXFP4 -> FP8 SRAM -> FP8xFP8 MME for native C1-C6; BF16 prefill"
                                                  if gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8 else
@@ -452,11 +544,20 @@ class PreparedStage(nn.Module):
         self.runtime_precision["selected_mla_mme"] = gaudi_envs.VLLM_HPU_DSV41_MLA_MME
         self.runtime_precision["router_selection"] = ("FP32 scores / native top6 / smallest-ID ties"
                                                       if gaudi_envs.VLLM_HPU_DSV41_ROUTER_TOP6 else "torch.topk")
+        self.runtime_precision["router_gate"] = ("BF16xBF16 MME -> FP32 logits"
+                                                 if gaudi_envs.VLLM_HPU_DSV41_BF16_ROUTER_GATE else "FP32 MME")
         self.runtime_precision["head"] = ("BF16xBF16 MME -> FP32" if self.bf16_head else "FP32 MME")
         self.runtime_precision["attention_input"] = ("fused wq_a+wkv BF16 MME / one activation quantization" if
                                                      gaudi_envs.VLLM_HPU_DSV41_QKV_FUSED_INPUT else "separate wq_a/wkv")
         self.runtime_precision["mla"] = ("shared-KV BF16 QK / FP32 softmax and PV / BF16 output v1"
                                          if gaudi_envs.VLLM_HPU_DSV41_MLA_MME else "TPC online softmax")
+        if gaudi_envs.VLLM_HPU_DSV41_MLA_BF16_PV:
+            self.runtime_precision["mla"] = "shared BF16 KV / BF16 exp-PV / FP32 denominator and accumulator v1"
+        self.runtime_precision["attention_kv_first"] = gaudi_envs.VLLM_HPU_DSV41_ATTN_KV_FIRST
+        self.runtime_precision["attention_fused_norm"] = gaudi_envs.VLLM_HPU_DSV41_ATTN_FUSED_NORM
+        self.runtime_precision["q_scale_rope"] = gaudi_envs.VLLM_HPU_DSV41_Q_SCALE_ROPE
+        self.runtime_precision["shared_gate_up"] = gaudi_envs.VLLM_HPU_DSV41_SHARED_GATE_UP
+        self.runtime_precision["mhc_gates_fused"] = gaudi_envs.VLLM_HPU_DSV41_MHC_GATES_FUSED
         self.precision_fingerprint = canonical_hash(self.runtime_precision)
         self.loaded = True
         self.generation += 1
@@ -470,6 +571,9 @@ class PreparedStage(nn.Module):
             attention = getattr(layer, "attention", None)
             if attention is not None:
                 attention.invalidate_qkv_input_weight()
+            moe = getattr(layer, "moe", None)
+            if moe is not None:
+                moe.release_shared_gate_up_weight()
         self.loaded = False
         self.generation += 1
 
@@ -563,6 +667,11 @@ class PreparedLayerGroup(nn.Module):
             residual, pre_mix, target = layer(residual, pre_mix, positions, image_mask, rows, fp8_decode=fp8_decode)
             if target is not None:
                 target_states.append(target)
+        if gaudi_envs.VLLM_HPU_DSV41_MHC_GATES_FUSED:
+            # The last layer's pre gate is a narrow view into one packed
+            # kernel output. Materialize it at the recipe boundary because
+            # prepared replay cannot bind a partial-storage alias.
+            pre_mix = pre_mix.clone()
         if self.wire_output:
             from vllm_gaudi.ops.deepseek_v41_pp_wire import encode_pp_wire
             return encode_pp_wire(residual, pre_mix), None, None

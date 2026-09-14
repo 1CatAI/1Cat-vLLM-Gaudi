@@ -17,9 +17,11 @@ import torch  # noqa: E402
 
 torch.ops.load_library(os.environ["VLLM_HPU_DSV4_TPC_OP_LIBRARY"])
 OPS = torch.ops.custom_op
+BF16_PV = os.environ.get("VLLM_HPU_DSV41_MLA_BF16_PV") == "1"
+MLA_OP = OPS.custom_deepseek_v41_mla_bf16_pv_gaudi2 if BF16_PV else OPS.custom_deepseek_v41_mla_mme_gaudi2
 
 
-def reference(q, swa, main, ids, sink, scale, lengths, ready, offset, rows):
+def reference(q, swa, main, ids, sink, scale, lengths, ready, offset, rows, bf16_pv=False):
     valid = (torch.arange(ids.numel()) < max(0, lengths.item())) & (ids.flatten() >= 0)
     valid &= ids.flatten() < 512 + rows
     if not ready:
@@ -28,6 +30,11 @@ def reference(q, swa, main, ids, sink, scale, lengths, ready, offset, rows):
     selected = torch.where(valid[:, None], selected, 0).float()
     scores = q[0].float() @ selected.T * scale
     scores[:, ~valid] = -torch.inf
+    if bf16_pv:
+        full = torch.cat((scores, sink[:, None]), dim=-1)
+        exp = torch.exp(full - full.amax(-1, keepdim=True))
+        product = exp[:, :-1].bfloat16().float() @ selected
+        return (product / exp.sum(-1, keepdim=True)).unsqueeze(0).bfloat16()
     probs = torch.softmax(torch.cat((scores, sink[:, None]), dim=-1), dim=-1)[:, :-1]
     return (probs @ selected).unsqueeze(0).bfloat16()
 
@@ -47,7 +54,7 @@ def test_mask_sink_and_replay(width, offset, rows):
         torch.zeros(36, dtype=torch.int32)
     ]
     device = [x.to("hpu") for x in args]
-    fn = OPS.custom_deepseek_v41_mla_mme_gaudi2
+    fn = MLA_OP
     compiled = torch.compile(fn, backend="hpu_backend", fullgraph=True, dynamic=False)
     records = []
     for generation, length in enumerate([0, 1, 63, 128, width, width + 17, -1]):
@@ -60,7 +67,7 @@ def test_mask_sink_and_replay(width, offset, rows):
         actual = compiled(*device, offset, rows).cpu()
         ordinary = fn(*device, offset, rows).cpu()
         assert torch.equal(actual, ordinary), "ordinary / compiled algorithm differs"
-        expected = reference(*args[:7], True, offset, rows)
+        expected = reference(*args[:7], True, offset, rows, bf16_pv=BF16_PV)
         error = (actual.float() - expected.float()).abs()
         records.append({
             "generation": generation,
@@ -68,6 +75,9 @@ def test_mask_sink_and_replay(width, offset, rows):
             "max_abs": error.max().item(),
             "rmse": error.square().mean().sqrt().item()
         })
+        if BF16_PV:
+            original = reference(*args[:7], True, offset, rows)
+            records[-1]["fp32_reference_rmse"] = (actual.float() - original.float()).square().mean().sqrt().item()
         torch.testing.assert_close(actual, expected, rtol=.02, atol=.004)
     Path(os.environ["DSV41_RUN_EVIDENCE"], f"mla-{width}-{offset}-{rows}.json").write_text(json.dumps(records,
                                                                                                       indent=2))
@@ -88,8 +98,7 @@ def test_writer_and_consumer_in_one_recipe():
     def program(value, position):
         done = OPS.custom_deepseek_v41_swa_decoded_write_bf16_gaudi2(packed, value, position, decoded, 512)
         ids = position.expand(1, 128).contiguous()
-        output = OPS.custom_deepseek_v41_mla_mme_gaudi2(q, decoded, decoded, ids, sink, scale, lengths, done, done, 512,
-                                                        0)
+        output = MLA_OP(q, decoded, decoded, ids, sink, scale, lengths, done, done, 512, 0)
         return output, done
 
     compiled = torch.compile(program, backend="hpu_backend", fullgraph=True, dynamic=False)

@@ -38,20 +38,23 @@ weights; there is no second persistent FP8 dense device cache.
 
 ## Execution
 
-After setting the validated runtime library paths and native bridge variables,
-explicitly enable the five profile switches:
+The dedicated entrypoint enables the measured ordinary-C1 fast-path bundle by
+default. Prepare the two FP8 sidecars in their standard locations, then launch
+without a feature-variable list:
 
 ```bash
-export VLLM_HPU_DSV41_PREPARED_SHARDS=1
-export VLLM_HPU_DSV41_ENGRAM_HOST_TABLE=1
-export VLLM_HPU_DSV41_GRAPH_REPLAY=1
-export VLLM_HPU_DSV41_DSPARK=1
-export VLLM_HPU_DSV41_VISION=1
-export VLLM_HPU_TP2_STATIC_GROUP_PLAN=1
-export VLLM_HPU_TP2_PREPARED_COMM=1
+.venv/bin/python tools/prepare_deepseek_v41_woa_fp8.py PREPARED_DIR
+.venv/bin/python tools/prepare_deepseek_v41_dense_fp8.py PREPARED_DIR
 .venv/bin/python -m vllm_gaudi.entrypoints.deepseek_v41 PREPARED_DIR \
   --checkpoint-audit CHECKPOINT_AUDIT
 ```
+
+The standard sidecar directories are `PREPARED_DIR/sidecars/wo_a_fp8` and
+`PREPARED_DIR/sidecars/attention_dense_fp8`. The entrypoint discovers both and
+fails before model loading if a required artifact is absent. Set
+`VLLM_HPU_DSV41_DEFAULT_FASTPATHS=0` to disable the bundle, or set an individual
+feature variable to `0` before launch to override one member. The generic vLLM
+entrypoint retains the opt-in defaults from `vllm_gaudi.envs`.
 
 Reserve four free modules using the project's device lease mechanism before
 launching. `tools/run_deepseek_v41.py` provides an archived invocation wrapper
@@ -65,13 +68,14 @@ DSpark draft. Its draft embedding is part of the prepared PP1 file. Hidden
 states and previous mHC mixing coefficients cross the PP boundary together.
 Target states from layers 37–39 feed draft context insertion.
 
-For ordinary single-token decode, set `VLLM_HPU_DSV41_DSPARK=0` before
-starting the same entrypoint. It omits speculative configuration, skips all
+Ordinary single-token decode is the dedicated entrypoint's default. It omits
+speculative configuration, skips all
 `mtp.*` tensors while reading the immutable rank files, and creates no draft
 state or target-state auxiliary outputs. The normal runner commits one output
 token without proposal or verification. Native warmup captures C1 only;
 multi-token prefill retains its compiled compatibility path and tail handling.
-This mode is under separate performance and quality qualification.
+Set `VLLM_HPU_DSV41_DSPARK=1` explicitly to select the separate speculative
+profile; the ordinary-C1 bundle is not applied in that mode.
 
 ### Accelerated C1 candidates
 
@@ -94,19 +98,21 @@ Bridge, Synapse or HCL build.
 
 N256 expert preparation reuses the original prepared shard files and retains
 one compressed device allocation. Original scale encodings support BF16
-prefill on that allocation. Prepare wo_a separately using
-`tools/prepare_deepseek_v41_woa_fp8.py PREPARED_DIR SIDECAR_DIR` and set
-`VLLM_HPU_DSV41_WO_A_FP8_SIDECAR` before loading. FP8 wo_a has no resident BF16
+prefill on that allocation. Prepare wo_a using
+`tools/prepare_deepseek_v41_woa_fp8.py PREPARED_DIR`; pass an explicit output
+directory only when the sidecar cannot live below the prepared model. FP8 wo_a has no resident BF16
 weight duplicate. Precision, layout or weight changes require model reload
 and new recipes.
 
-The combined C1 candidate does not enable the separate legacy
+The default C1 bundle does not enable the separate legacy
 `VLLM_HPU_DSV41_FP8_DECODE`, coordinate-pipeline, or native PP0 input-capture
 experiments. Native PP0 input capture retains its ordinary BF16-only contract.
 Neither successful component checks nor relative decode improvements establish
 production quality: generated outputs differ from the preceding candidate,
 and full quality, prefill numerical consistency and long replay/shutdown
-qualification remain open. All new switches remain off by default.
+qualification remain open. The dedicated entrypoint is an experimental contract;
+use the aggregate opt-out for compatibility and production-reference comparisons
+until those gates are complete.
 
 The scheduler owns one complete request-state block for the bounded context.
 Null block 0 and request block 1 each have separate allocations for the actual

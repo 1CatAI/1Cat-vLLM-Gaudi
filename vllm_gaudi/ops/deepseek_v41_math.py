@@ -194,18 +194,31 @@ def hc_pre(residual, previous_pre, fn, scale, base, eps=1e-20, hc_eps=1e-6, iter
     """vLLM mhc_pre_delayed_torch's previous-sublayer mixing contract."""
     copies = residual.shape[1]
     flat = residual.flatten(1).float()
-    mixes = F.linear(flat, fn) * torch.rsqrt(flat.square().mean(-1, keepdim=True) + eps)
-    pre = torch.sigmoid(mixes[:, :copies] * scale[0] + base[:copies]) + hc_eps
-    post = torch.sigmoid(mixes[:, copies:2 * copies] * scale[1] + base[copies:2 * copies]) * 2.0
-    comb = mixes[:, 2 * copies:].reshape(-1, copies, copies) * scale[2]
-    comb = torch.softmax(comb + base[2 * copies:].reshape(1, copies, copies), -1) + hc_eps
-    if residual.device.type == "hpu" and iterations == 20 and hc_eps == 1e-6 and copies == 4:
-        comb = torch.ops.custom_op.custom_deepseek_v4_sinkhorn4_gaudi2(comb.contiguous())
+    if (gaudi_envs.VLLM_HPU_DSV41_TPC_MHC and flat.device.type == "hpu" and flat.shape == (1, 20480)
+            and fn.shape == (24, 20480)):
+        projection = torch.ops.custom_op.custom_deepseek_v41_control_gemv_f32_gaudi2(flat, fn)
     else:
-        comb = comb / (comb.sum(-2, keepdim=True) + hc_eps)
-        for _ in range(iterations - 1):
-            comb = comb / (comb.sum(-1, keepdim=True) + hc_eps)
+        projection = F.linear(flat, fn)
+    rrms = torch.rsqrt(flat.square().mean(-1, keepdim=True) + eps)
+    if (gaudi_envs.VLLM_HPU_DSV41_MHC_GATES_FUSED and residual.device.type == "hpu" and iterations == 20
+            and hc_eps == 1e-6 and copies == 4 and projection.ndim == 2 and projection.shape[-1] == 24):
+        gates = torch.ops.custom_op.custom_deepseek_v41_mhc_gates_f32_gaudi2(projection.contiguous(), rrms.contiguous(),
+                                                                             scale.contiguous(), base.contiguous())
+        pre, post = gates[:, :copies], gates[:, copies:2 * copies]
+        comb = gates[:, 2 * copies:].reshape(-1, copies, copies)
+    else:
+        mixes = projection * rrms
+        pre = torch.sigmoid(mixes[:, :copies] * scale[0] + base[:copies]) + hc_eps
+        post = torch.sigmoid(mixes[:, copies:2 * copies] * scale[1] + base[copies:2 * copies]) * 2.0
+        comb = mixes[:, 2 * copies:].reshape(-1, copies, copies) * scale[2]
+        comb = torch.softmax(comb + base[2 * copies:].reshape(1, copies, copies), -1) + hc_eps
+        if residual.device.type == "hpu" and iterations == 20 and hc_eps == 1e-6 and copies == 4:
+            comb = torch.ops.custom_op.custom_deepseek_v4_sinkhorn4_gaudi2(comb.contiguous())
+        else:
             comb = comb / (comb.sum(-2, keepdim=True) + hc_eps)
+            for _ in range(iterations - 1):
+                comb = comb / (comb.sum(-1, keepdim=True) + hc_eps)
+                comb = comb / (comb.sum(-2, keepdim=True) + hc_eps)
     collapsed = (residual.float() * previous_pre.unsqueeze(-1)).sum(1).to(residual.dtype)
     return collapsed, pre, post, comb
 

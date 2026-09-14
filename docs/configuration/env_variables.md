@@ -200,10 +200,13 @@ RMSNorm is considered.
 ## DeepSeek V4.1
 
 The experimental [prepared TP2×PP2 profile](../features/deepseek_v41.md)
-uses explicit switches and rejects unsupported execution contracts.
+rejects unsupported execution contracts. Its dedicated entrypoint enables the
+measured ordinary-C1 bundle by default; the generic vLLM entrypoint keeps the
+individual switches disabled.
 
 | Variable | Description | Default |
 |---|---|---|
+| `VLLM_HPU_DSV41_DEFAULT_FASTPATHS` | Controls the measured ordinary-C1 bundle in `vllm_gaudi.entrypoints.deepseek_v41`. Set to `0` for the compatibility profile. Individual feature variables remain valid overrides. | `true` in the dedicated entrypoint; otherwise `false` |
 | `VLLM_HPU_DSV41_PREPARED_SHARDS` | Enables the rank-local loader and bounded CSA2 runner on four Gaudi2 devices. Requires the immutable TP2×PP2 manifest. | `false` |
 | `VLLM_HPU_DSV41_ENGRAM_HOST_TABLE` | Uses shared read-only host mmap tables, native asynchronous row gather, and generation-owned HPU staging. | `false` |
 | `VLLM_HPU_DSV41_GRAPH_REPLAY` | Captures each PP stage with the ABI-locked native compute/communication plan. Requires prepared communication and the static group plan. | `false` |
@@ -500,22 +503,71 @@ fuses W13 result scaling, SwiGLU, routing and W2 activation quantization into
 the native MoE graph. Its BF16 intermediate rounding boundaries remain
 explicit. It does not enable the separate legacy FP8 decode candidate.
 
+`VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE` (default `0`) additionally reduces the six
+already scaled routed-expert rows in routing order inside one TPC consumer. It
+requires N256 FP8 and fused quantization. The dedicated ordinary-C1 entrypoint
+enables it through the aggregate bundle.
+
 ### V4.1 projection candidates
 
 `VLLM_HPU_DSV41_WO_A_FP8=1` selects prepared channel-scaled Gaudi2 E4M3 wo_a weights, dynamic per-token/group activation quantization, native FP8 BMM and a fused FP32-scale/BF16-output epilogue. Set `VLLM_HPU_DSV41_WO_A_FP8_SIDECAR` to the directory produced by `tools/prepare_deepseek_v41_woa_fp8.py PREPARED OUTPUT`. Optional `VLLM_HPU_DSV41_WO_A_FP8_CONFIG` names a JSON file with `{"version": 1, "layers": [0, 1]}`; omission selects all forty backbone layers. The candidate requires DSpark disabled. Both C1 and prefill consume the same prepared FP8 weights. Reconfigure precision only by reloading the model.
 
 The native projection consumes the prepared FP8 weight directly instead of imposing a TPC weight-copy pass. Compiler-selected SRAM/DRAM placement must still be verified in the actual combined model graph. Activation preparation retains the per-token/group maximum and exact power-of-two scaling contract.
 
-The codec uses bias 7, maximum magnitude 240, nearest-even rounding followed by flushing FP8 subnormals and canonicalizing zero. Original block scales are consumed during bounded channel preparation. This changes the numerical contract, including activation quantization, and is not enabled by default.
+The codec uses bias 7, maximum magnitude 240, nearest-even rounding followed by flushing FP8 subnormals and canonicalizing zero. Original block scales are consumed during bounded channel preparation. This changes the numerical contract, including activation quantization. The dedicated ordinary-C1 entrypoint enables it through the aggregate bundle; the generic entrypoint leaves it disabled.
 
 
-`VLLM_HPU_DSV41_ROUTER_TOP6=1` retains FP32 gate scores and replaces the generic sort/gather/normalization with native repeated-max top6 selection, including text/image bias selection and smallest-ID ties. The selection uses paired score/ID comparisons and packs the six results into two vector writes. `VLLM_HPU_DSV41_BF16_LM_HEAD=1` retains the checkpoint BF16 head and uses BF16 MME operands with FP32 accumulation and logits. Both require DSpark disabled and are off by default; quality and end-to-end qualification are required before promotion.
+`VLLM_HPU_DSV41_ROUTER_TOP6=1` retains FP32 gate scores and replaces the generic sort/gather/normalization with native repeated-max top6 selection, including text/image bias selection and smallest-ID ties. The selection uses paired score/ID comparisons and packs the six results into two vector writes. `VLLM_HPU_DSV41_BF16_ROUTER_GATE=1` keeps the checkpoint gate in BF16 and produces FP32 logits from BF16 MME operands. `VLLM_HPU_DSV41_BF16_LM_HEAD=1` retains the checkpoint BF16 head and uses BF16 MME operands with FP32 accumulation and logits. All require DSpark disabled. The dedicated ordinary-C1 entrypoint enables them through the aggregate bundle; the generic entrypoint leaves them disabled.
 
-These are independent experimental candidates. A native MME operand contract or a reduced weight footprint does not establish an end-to-end improvement. The wo_a candidate still has an unresolved ordinary/compiled numerical-consistency issue at the largest supported prefill shape. Its activation-scale implementation also needs qualification for nonfinite inputs and extremely small BF16 row maxima. Keep it disabled in production until these contracts pass. Failed candidates must not be silently substituted during an active request.
+`VLLM_HPU_DSV41_SHARED_GATE_UP=1` concatenates each shared expert's gate and up
+weights once at model load and executes one projection before the existing
+SwiGLU boundary. It releases the two source device buffers and requires model
+reload to change the selection.
+
+These are experimental candidates. A native MME operand contract or a reduced weight footprint does not establish an end-to-end improvement. The wo_a path still needs its largest prefill shape and nonfinite or extremely small activation scales qualified. Use the aggregate opt-out for production-reference comparisons until these contracts pass. Failed candidates must not be silently substituted during an active request.
 
 The prepared sidecar validates its source manifest, rank ownership, payload hash and encoding/layout fingerprint before binding weights. Model reload invalidates existing recipes; the replay binding includes the loaded precision fingerprint and weight/state generation. The existing native runtime loader continues to validate the actual Bridge/Synapse/HCL and extension artifacts independently. A precision change requires a reload, including rebuilding the sidecar when its encoding contract changes.
 
+`VLLM_HPU_DSV41_ATTN_DENSE_FP8=1` selects experimental channel-scaled Gaudi2 FP8
+`wq_b` and `wo_b` projections, including per-token quantization and a fused FP32
+scaling/BF16 output boundary. Existing block32 activation rounding remains before
+quantization. Prepare immutable weights with
+`tools/prepare_deepseek_v41_dense_fp8.py PREPARED`; pass an explicit output path
+only for a nonstandard sidecar location. An optional
+`VLLM_HPU_DSV41_ATTN_DENSE_FP8_CONFIG` JSON file selects layers independently:
+`{"version": 1, "wq_b": [0, 1], "wo_b": [0, 1]}`. Omission selects all forty
+backbone layers for both projections. DSpark must be disabled. Prefill and decode
+share the same prepared FP8 buffers without a resident BF16 copy; change the
+precision configuration only by reconstructing/reloading the model and recipes.
+
+`VLLM_HPU_DSV41_ATTN_FUSED_NORM=1` replaces C1 Q/KV RMSNorm with a TPC row kernel,
+reusing FlashInfer-Gaudi reduction primitives while keeping the V4.1 FP32 weight
+product and final BF16 boundary. Prefill retains its existing normalization.
+The dedicated ordinary-C1 entrypoint enables it through the aggregate bundle;
+the generic entrypoint leaves it disabled. Performance and model quality
+qualification remain separate gates.
+
+`VLLM_HPU_DSV41_Q_SCALE_ROPE=1` fuses C1 Q projection scaling and RoPE into the
+native consumer after channel-scaled attention projection. Prefill retains its
+existing path. It requires native RoPE and prepared attention FP8 weights.
+
+`VLLM_HPU_DSV41_MHC_GATES_FUSED=1` fuses C1 mHC sigmoid gates, softmax and
+Sinkhorn normalization after the existing FP32 control projection and RMS
+reduction. It keeps one packed output at recipe boundaries and requires DSpark
+disabled.
+
+`VLLM_HPU_DSV41_ATTN_KV_FIRST=1` delays C1 Q expansion until KV preparation in
+the Python graph construction order. This does not guarantee the compiled device
+order or overlap; the experiment remains disabled unless qualified by a complete
+chain measurement. Default off.
+
 `VLLM_HPU_DSV41_MLA_MME=1` selects the experimental C1 shared-KV MME attention path.
+`VLLM_HPU_DSV41_MLA_BF16_PV=1` additionally shares one BF16 KV tensor between QK
+and PV, storing unnormalized exponentials in BF16 while keeping the denominator,
+matrix accumulation and output normalization in FP32. This follows FlashMLA's
+exponential-weight precision boundary, adapted to Gaudi MME. It changes arithmetic
+relative to FP32 probabilities/PV; requires MLA_MME and separate model quality
+qualification. Default off.
 It requires decoded KV state, keeps FP32 softmax/PV consumption and the BF16 output
 boundary, and remains off by default. Prefill retains the existing path.
 

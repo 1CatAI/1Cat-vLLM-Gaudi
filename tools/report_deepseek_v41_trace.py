@@ -30,6 +30,28 @@ def io(node, prefix):
 
 def classify(node, kernel, inputs, outputs):
     name = node.lower()
+    if "deepseek_v41_q_scale_rope" in kernel:
+        return "Attention", "wq_b FP32 结果缩放、BF16 舍入及 Q RoPE 融合"
+    if "deepseek_v41_q_projection_rope" in name:
+        return "Attention", "wq_b 原生 FP8 投影与 RoPE；实际操作数见合同"
+    if "deepseek_v41_mla_shared_kv" in kernel:
+        return "Attention", "MLA 候选 KV 一次 BF16 准备，共用于 QK/PV"
+    if "deepseek_v41_mla_exp_bf16" in kernel:
+        return "Attention", "MLA FP32 softmax/sink 统计、BF16 指数权重及 FP32 分母"
+    if "deepseek_v41_mla_normalize_bf16" in kernel:
+        return "Attention", "MLA FP32 PV 结果归一化、BF16 输出"
+    if "deepseek_v41_mla_bf16_pv" in name:
+        if kernel in ("GEMM", "BatchGemm"):
+            output = outputs[0].get("shape", []) if outputs else []
+            ambiguous = inputs and inputs[0].get("shape", [])[-1:] == [512] and output[-1:] == [512]
+            role = ("QK/PV 尚待转置描述符关联" if ambiguous else
+                    "PV" if output and output[-1] == 512 else "QK" if output else "QK/PV 尚待形状关联")
+            return "Attention", "MLA " + role + " 矩阵计算；实际操作数见合同"
+        return "Attention", "MLA 内部准备/别名/搬运"
+    if "deepseek_v41_attention_norm" in kernel:
+        width = inputs[0]["shape"][-1] if inputs else None
+        projection = "Q" if width == 1280 else "KV" if width == 512 else "Q/KV"
+        return "Attention", projection + " RMSNorm：FP32 行归约与权重乘法，BF16 输出"
     if "deepseek_v41_mla_gather" in kernel:
         return "Attention", "MLA 候选 KV 共享读取、BF16 K/FP32 V 准备及有效 mask"
     if "deepseek_v41_mla_softmax" in kernel:
@@ -51,6 +73,18 @@ def classify(node, kernel, inputs, outputs):
         return "Attention", "wo_a FP32 结果乘通道/激活 scale 并转 BF16"
     if "deepseek_v41_woa_fp8" in name and kernel in ("GEMM", "BatchGemm"):
         return "Attention", "wo_a 分组输出 BMM"
+    if "deepseek_v41_dense_quant" in kernel:
+        k = inputs[0]["shape"][-1] if inputs else None
+        projection = "wq_b" if k == 1280 else "wo_b" if k == 4096 else "未关联投影"
+        return "Attention", projection + " 全 K 激活最大值、二次幂 scale 与 FP8 量化"
+    if "deepseek_v41_dense_scale" in kernel:
+        n = inputs[0]["shape"][-1] if inputs else None
+        projection = "wq_b" if n == 16384 else "wo_b" if n == 5120 else "未关联投影"
+        return "Attention", projection + " FP32 矩阵结果乘两类 scale、BF16 输出"
+    if "deepseek_v41_dense_fp8" in name:
+        weight = inputs[1]["shape"] if len(inputs) > 1 and kernel in ("GEMM", "BatchGemm") else []
+        projection = "wq_b" if weight == [16384, 1280] else "wo_b" if weight == [5120, 4096] else "Attention dense FP8"
+        return "Attention", projection + (" 原生矩阵计算，实际操作数见合同" if weight else " 内部准备/转换/搬运")
     if "deepseek_v41_bf16_linear_f32" in name and kernel in ("GEMM", "BatchGemm"):
         return "输出头", "BF16×BF16 TP 词表投影，FP32 logits"
     if "topk" in name or "bitonic" in kernel:
@@ -93,6 +127,7 @@ def classify(node, kernel, inputs, outputs):
                 return "Attention", "Compressor FP32 投影；wkv/wgate 绑定尚待逐节点还原"
             shapes = {
                 (1280, 5120): "wq_a 输入投影",
+                (1792, 5120): "wq_a/wkv 合并输入投影",
                 (16384, 1280): "wq_b Q 展开",
                 (512, 5120): "wkv 输入投影",
                 (5120, 4096): "wo_b 输出投影",
@@ -129,6 +164,67 @@ def bundle_key(contract):
     if bundle in (None, "N/A"):
         return None
     return contract["graph"]["path"], str(bundle)
+
+
+def attention_norm_owners(nodes):
+    """Prove fused RMSNorm ownership by tracing its inputs to one Q/KV GEMM.
+
+    A width heuristic alone is insufficient: all nonconstant leaves must reach
+    that same named Attention projection. Unknown or mixed dependencies stay
+    unresolved. The returned node set includes casts and mean reductions.
+    """
+    ins = [io(n, "inputTensor:") for n in nodes]
+    outs = [io(n, "outputTensor:") for n in nodes]
+    producers = collections.defaultdict(list)
+    for i, tensors in enumerate(outs):
+        for t in tensors:
+            producers[t["name"]].append(i)
+    owners = {}
+    for final, node in enumerate(nodes):
+        if not node["op"].startswith("fused_kernel_") or len(ins[final]) != 3 or len(outs[final]) != 1:
+            continue
+        shape = outs[final][0]["shape"]
+        if shape not in ([1, 1280], [1, 512]) or outs[final][0]["dtype"] != "bf16":
+            continue
+        width = shape[-1]
+        if sorted(t["shape"] for t in ins[final]) != sorted([[1, 1], [1, width], [width]]):
+            continue
+        visited, anchors = set(), set()
+
+        def visit(i, visited=visited, width=width, anchors=anchors):
+            if i in visited:
+                return True
+            if len(visited) >= 32:
+                return False
+            n = nodes[i]
+            if n["op"] in ("GEMM", "BatchGemm"):
+                if "/attention/" not in n["name"] or len(ins[i]) != 2 or ins[i][1]["shape"] != [width, 5120]:
+                    return False
+                anchors.add(n["name"])
+                return True
+            if not ("/attention/" in n["name"] or n["op"] in ("Reduction", "DmaMemset")
+                    or n["op"].startswith(("fused_kernel_", "cast_", "reshape"))):
+                return False
+            visited.add(i)
+            for t in ins[i]:
+                if t["shape"] == [width]:  # The final RMSNorm channel weight.
+                    continue
+                source = producers.get(t["name"], []) or producers.get(t.get("alias"), [])
+                if not source:
+                    if t["shape"] in ([1], [1, 1]) and t["name"].startswith(("f32-", "i32-")):
+                        continue
+                    return False
+                if len(source) != 1 or not visit(source[0]):
+                    return False
+            return True
+
+        if visit(final) and len(anchors) == 1:
+            role = "Q" if width == 1280 else "KV"
+            proof = {"rule": "RMSNorm dependency closure to one Attention input GEMM",
+                     "role": role, "anchor": next(iter(anchors)), "final": node["name"]}
+            for i in visited:
+                owners[nodes[i]["name"]] = proof
+    return owners
 
 
 def invocation_samples(rows, symbol, expected):
@@ -173,6 +269,8 @@ def analyze(root, rank, common):
         (str(row["recipe_id"]), row["symbol"]["device_type"], row["symbol"]["full_context_id"]): row
         for row in json.loads((path / "node-contracts.json").read_text())
     }
+    norm_owners = {path: attention_norm_owners(graph_nodes(Path(path)))
+                   for path in {c["graph"]["path"] for c in contracts.values() if c.get("matched")}}
     bundle_categories = collections.defaultdict(set)
     for contract in contracts.values():
         symbol = contract["symbol"]
@@ -272,6 +370,10 @@ def analyze(root, rank, common):
         inputs, outputs = (contract.get(part, []) if contract else [] for part in ("inputs", "outputs"))
         category, purpose = classify(source, kernel, inputs, outputs)
         origin = None
+        norm = norm_owners.get(contract.get("graph", {}).get("path"), {}).get(source) if contract else None
+        if norm:
+            category, purpose = "Attention", norm["role"] + " RMSNorm：投影后的转换、统计、归一化及权重乘法"
+            origin = norm
         if category == "融合表达式待细分" and bundle_categories.get(bundle_key(contract)) == {"路由专家"}:
             category = "路由专家"
             purpose = "同一编译 bundle 的专家激活/结果处理；内部表达式未独立计时"

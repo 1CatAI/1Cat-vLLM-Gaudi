@@ -44,7 +44,8 @@ def benchmark(name,
               rounds,
               recorder,
               candidate_only=False,
-              ordinary_validator=None):
+              ordinary_validator=None,
+              profile_only=False):
     # Each sweep visits every layer once. Distinct real matrices exceed on-chip
     # storage; weights are never copied inside the timed region. Compilation is
     # fullgraph and recipes persist across input/weight changes.
@@ -135,6 +136,20 @@ def benchmark(name,
         p.name: sorted(os.sched_getaffinity(int(p.name)))
         for p in Path(f"/proc/{os.getpid()}/task").iterdir()
     }
+    if profile_only:
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                               torch.profiler.ProfilerActivity.HPU]) as profiler:
+            for arm, replay in replays.items():
+                for sample in range(4):
+                    with torch.profiler.record_function(f"chain-{arm}-{sample}"):
+                        replay()
+                        torch.hpu.synchronize()
+        profiler.export_chrome_trace(str(output / "chain-trace.json.gz"))
+        record["profile_only"] = True
+        record["native_compute_info"] = {arm: replay.native.info() for arm, replay in replays.items()}
+        for replay in replays.values():
+            replay.close()
+        return record
     events = [(torch.hpu.Event(enable_timing=True), torch.hpu.Event(enable_timing=True)) for _ in range(32)]
     for round_id in range(rounds):
         # Alternate arm order without adding an end-to-end baseline request.

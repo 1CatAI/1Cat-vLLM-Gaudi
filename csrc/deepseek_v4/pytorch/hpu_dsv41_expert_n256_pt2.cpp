@@ -25,7 +25,10 @@ constexpr auto kDynamicQuant = "custom_deepseek_v41_dynamic_quant_bf16_gaudi2";
 constexpr auto kN256Fp8 = "custom_deepseek_v41_expert_n256_fp8_gaudi2";
 constexpr auto kN256Bf16 = "custom_deepseek_v41_expert_n256_bf16_gaudi2";
 constexpr auto kN256Scale = "custom_deepseek_v41_expert_n256_scale_gaudi2";
+constexpr auto kN256ScaleReduce = "custom_deepseek_v41_expert_n256_scale_reduce_gaudi2";
 constexpr auto kN256FusedSchema = "custom_op::custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2";
+constexpr auto kN256FusedReduceSchema =
+    "custom_op::custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2";
 constexpr auto kN256SiluQuant = "custom_deepseek_v41_expert_n256_silu_quant_gaudi2";
 constexpr auto kN256Fp8Schema = "custom_op::custom_deepseek_v41_expert_n256_moe_fp8_gaudi2";
 constexpr auto kN256Bf16Schema = "custom_op::custom_deepseek_v41_expert_n256_moe_bf16_gaudi2";
@@ -94,6 +97,7 @@ class PreparedV41 final : public habana::OpBackend {
     bool fused_;
     bool k128_;
     bool n256_;
+    bool fused_reduce_;
 
     const char* decode_guid(bool normal) const {
         if (n256_) return fp8_ ? kN256Fp8 : kN256Bf16;
@@ -241,12 +245,19 @@ class PreparedV41 final : public habana::OpBackend {
         auto sx2 = ReshapeHelper(graph, middle.at(1).get(), {slots, 1}, at::kFloat);
         auto scaled = BuildNode(this, graph, {kN256Scale, {p2.at(0).get(), ids, sx2.get(), syn_in(9)},
             {{{slots, 1, hidden}, at::kBFloat16}}});
+        if (fused_reduce_) {
+            auto reduced = BuildNode(this, graph, {kN256ScaleReduce,
+                {scaled.at(0).get()}, {{{1, 1, hidden}, at::kBFloat16}}});
+            return ReshapeHelper(graph, reduced.at(0).get(), {1, 1, hidden}, at::kBFloat16);
+        }
         return ReshapeHelper(graph, scaled.at(0).get(), {tokens, experts, hidden}, at::kBFloat16);
     }
 
  public:
-    PreparedV41(int device, c10::ScalarType dtype, bool moe, bool fp8 = false, bool k128 = false, bool n256 = false, bool fused = false)
-        : OpBackend(device, NO_TPC + std::string("dsv41_prepared_mxfp4"), dtype, {0}, {}, {}, false), moe_(moe), fp8_(fp8), fused_(fused), k128_(k128), n256_(n256) {
+    PreparedV41(int device, c10::ScalarType dtype, bool moe, bool fp8 = false, bool k128 = false,
+                bool n256 = false, bool fused = false, bool fused_reduce = false)
+        : OpBackend(device, NO_TPC + std::string("dsv41_prepared_mxfp4"), dtype, {0}, {}, {}, false), moe_(moe),
+          fp8_(fp8), fused_(fused), k128_(k128), n256_(n256), fused_reduce_(fused_reduce) {
         SetOutputMetaFn([moe, fp8, n256](const at::Stack& stack) {
             if (fp8 && moe) fp8_contract(stack, n256);
             const auto dtype = !moe && fp8 ? at::ScalarType::Float8_e4m3fn : at::kBFloat16;
@@ -268,6 +279,8 @@ class PreparedV41 final : public habana::OpBackend {
         }
         const int tokens = idsTensor.size(0), experts = idsTensor.size(1), hidden = resultShape[1];
         const int intermediate = stack.at(4).toTensor().size(2) / (n256_ ? 64 : 32);
+        TORCH_CHECK(!fused_reduce_ || (tokens == 1 && experts == 6),
+                    "Fused expert finalize requires C1 top6");
         const std::vector<int64_t> shape{tokens, experts, intermediate};
         auto down = [&]() -> Tensor {
             if (fused_) return fused_down(graph, ids.get(), tokens, experts, hidden, intermediate);
@@ -296,6 +309,10 @@ class PreparedV41 final : public habana::OpBackend {
         return linear(graph, middle.get(), ids.get(), syn_in(4), syn_in(6), syn_in(7),
                            tokens, experts, hidden, intermediate, false, normal, fp8_ ? syn_in(9) : nullptr);
         }();
+        if (fused_reduce_) {
+            syn_out(0) = ReshapeHelper(graph, down.get(), resultShape, at::kBFloat16, 0);
+            return;
+        }
         auto downF32 = cast(graph, down.get(), {tokens, experts, hidden}, true);
         auto accumulated = slice(graph, downF32.get(), tokens, experts, hidden, 0, 1, 1, at::kFloat);
         for (int expert = 1; expert < experts; ++expert) {
@@ -311,13 +328,15 @@ class PreparedV41 final : public habana::OpBackend {
 };
 
 const bool registered = [] {
-    for (int mode : {2, 3, 4, 5, 6, 7, 8, 9}) {
+    for (int mode : {2, 3, 4, 5, 6, 7, 8, 9, 10}) {
         const bool n256 = mode >= 5;
-        const bool moe = mode == 1 || mode == 2 || mode == 4 || mode == 5 || mode == 6 || mode == 9;
-        const bool fp8 = mode == 2 || mode == 5 || mode == 7 || mode == 9;
+        const bool moe = mode == 1 || mode == 2 || mode == 4 || mode == 5 || mode == 6 || mode == 9 || mode == 10;
+        const bool fp8 = mode == 2 || mode == 5 || mode == 7 || mode == 9 || mode == 10;
         const bool k128 = mode == 3 || mode == 4;
-        const bool fused = mode == 9;
-        const char* schema = fused ? kN256FusedSchema : n256 ? (moe ? (fp8 ? kN256Fp8Schema : kN256Bf16Schema)
+        const bool fused = mode == 9 || mode == 10;
+        const bool fused_reduce = mode == 10;
+        const char* schema = fused_reduce ? kN256FusedReduceSchema : fused ? kN256FusedSchema : n256 ?
+            (moe ? (fp8 ? kN256Fp8Schema : kN256Bf16Schema)
                                                         : (fp8 ? kN256DecodeFp8Schema : kN256DecodeBf16Schema))
             : k128 ? (moe ? kMoeK128Schema : kDecodeK128Schema)
             : fp8 ? kMoeFp8Schema : moe ? kMoeSchema : kDecodeSchema;
@@ -326,8 +345,9 @@ const bool registered = [] {
             const auto dtype = !moe && fp8 ? at::ScalarType::Float8_e4m3fn : at::kBFloat16;
             return habana::PartialOutputMetaDataVector{{dtype, moe ? moe_shape(stack, n256) : decode_shape(stack, n256)}};
         }, nullptr);
-        habana::KernelRegistry().add(schema, [moe, fp8, k128, n256, fused](synDeviceId device, c10::ScalarType dtype) {
-            return std::make_shared<PreparedV41>(device, dtype, moe, fp8, k128, n256, fused);
+        habana::KernelRegistry().add(schema, [moe, fp8, k128, n256, fused, fused_reduce](
+                                              synDeviceId device, c10::ScalarType dtype) {
+            return std::make_shared<PreparedV41>(device, dtype, moe, fp8, k128, n256, fused, fused_reduce);
         });
     }
     return true;
@@ -348,14 +368,16 @@ at::Tensor run(const at::Stack& stack, bool moe, bool meta, bool k128, bool n256
     return descriptor.execute(stack).at(0);
 }
 
-template<bool Meta, bool N256 = false, bool Fused = false> at::Tensor moe_fp8(const at::Tensor& x, const at::Tensor& ids, const at::Tensor& router,
+template<bool Meta, bool N256 = false, bool Fused = false, bool FusedReduce = false>
+at::Tensor moe_fp8(const at::Tensor& x, const at::Tensor& ids, const at::Tensor& router,
     const at::Tensor& q13, const at::Tensor& q2, const at::Tensor& s13, const at::Tensor& s2,
     const at::Tensor& lookup, const at::Tensor& channel13, const at::Tensor& channel2, bool normal) {
     const at::Stack stack{x, ids, router, q13, q2, s13, s2, lookup, channel13, channel2, normal};
     fp8_contract(stack, N256);
     if (Meta) return at::empty(moe_shape(stack, N256), x.options());
     TORCH_CHECK(registered && x.device().type() == at::kHPU, "V4.1 FP8 MoE requires HPU");
-    auto descriptor = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(Fused ? kN256FusedSchema : N256 ? kN256Fp8Schema : kMoeFp8Schema);
+    auto descriptor = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(
+        FusedReduce ? kN256FusedReduceSchema : Fused ? kN256FusedSchema : N256 ? kN256Fp8Schema : kMoeFp8Schema);
     return descriptor.execute(stack).at(0);
 }
 
@@ -371,6 +393,7 @@ template<bool Meta, bool K128 = false, bool N256 = false> at::Tensor moe(const a
 }
 
 TORCH_LIBRARY_FRAGMENT(custom_op, m) {
+    m.def("custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, bool normal) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, bool normal) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_moe_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, bool normal) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_moe_bf16_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, bool normal=False) -> Tensor");
@@ -381,6 +404,7 @@ TORCH_LIBRARY_FRAGMENT(custom_op, m) {
     m.def("custom_deepseek_v41_mxfp4_prepared_moe_k128_bf16_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, bool normal=False) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
+    m.impl("custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2", moe_fp8<false, true, true, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2", moe_fp8<false, true, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_fp8_gaudi2", moe_fp8<false, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_bf16_gaudi2", moe<false, false, true>);
@@ -391,6 +415,7 @@ TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
     m.impl("custom_deepseek_v41_mxfp4_prepared_moe_k128_bf16_gaudi2", moe<false, true>);
 }
 TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
+    m.impl("custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2", moe_fp8<true, true, true, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2", moe_fp8<true, true, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_fp8_gaudi2", moe_fp8<true, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_bf16_gaudi2", moe<true, false, true>);
