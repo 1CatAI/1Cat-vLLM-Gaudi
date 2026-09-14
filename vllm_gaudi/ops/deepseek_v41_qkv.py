@@ -7,6 +7,7 @@ from vllm_gaudi.ops.deepseek_v41_math import quantize_activation
 
 
 class FusedQKVInput:
+
     def prepare_qkv_input_weight(self):
         """Bind one persistent Q/KV input matrix for the attention path.
 

@@ -15,8 +15,12 @@ def graph_nodes(path):
         op = re.search(r'^  op: "([^"]+)"', block, re.M)
         if name and op:
             attrs = dict(re.findall(r'key: "([^"]+)"\s+value \{\s+s: "([^"\n]+)"', block))
-            result.append({"name": name[1], "op": op[1], "attrs": attrs,
-                           "predecessors": re.findall(r'^  input: "([^"]+)"', block, re.M)})
+            result.append({
+                "name": name[1],
+                "op": op[1],
+                "attrs": attrs,
+                "predecessors": re.findall(r'^  input: "([^"]+)"', block, re.M)
+            })
     return result
 
 
@@ -27,11 +31,16 @@ def tensor(text):
     strides = re.search(r"strides = (\[[^]]+\])", text)
     alias = re.search(r"isAliased = ([^,|]+)", text)
     fields = text.split("|")
-    return {"name": fields[0].strip(), "shape": json.loads(shape[1]) if shape else None,
-            "dtype": fields[2].strip() if len(fields) > 2 else "unknown",
-            "bytes": int(width[1]) if width else None, "location": location[1] if location else "unknown",
-            "strides": json.loads(strides[1]) if strides else None, "alias": alias[1].strip() if alias else None,
-            "description": text}
+    return {
+        "name": fields[0].strip(),
+        "shape": json.loads(shape[1]) if shape else None,
+        "dtype": fields[2].strip() if len(fields) > 2 else "unknown",
+        "bytes": int(width[1]) if width else None,
+        "location": location[1] if location else "unknown",
+        "strides": json.loads(strides[1]) if strides else None,
+        "alias": alias[1].strip() if alias else None,
+        "description": text
+    }
 
 
 def main():
@@ -55,8 +64,7 @@ def main():
         contracts, unresolved = [], []
         for recipe in recipes:
             compute = [node for node in recipe["nodes"] if node["device_type"] in (0, 1, 8)]
-            scores = collections.Counter(path for node in compute
-                                         for path in index[(node["node"], node["kernel"])])
+            scores = collections.Counter(path for node in compute for path in index[(node["node"], node["kernel"])])
             complete = [path for path, score in scores.items() if score == len(compute)]
             own_rank = [path for path in complete if f"/rank{rank}/" in path]
             if own_rank:
@@ -72,24 +80,33 @@ def main():
                     graph = graphs[ordered[0]]
             for symbol in compute:
                 node = graph["nodes"].get((symbol["node"], symbol["kernel"])) if graph else None
-                entry = {"recipe_id": recipe["recipe_id"], "symbol": symbol,
-                         "graph": graph["record"] if graph else None, "matched": node is not None}
+                entry = {
+                    "recipe_id": recipe["recipe_id"],
+                    "symbol": symbol,
+                    "graph": graph["record"] if graph else None,
+                    "matched": node is not None
+                }
                 if node:
                     attrs = node["attrs"]
-                    ordered = sorted(attrs.items(), key=lambda item: (
-                        item[0].split(":")[0], int(item[0].rsplit(":", 1)[1])
-                        if item[0].startswith(("inputTensor:", "outputTensor:")) else -1))
-                    entry.update(inputs=[tensor(value) for key, value in ordered
-                                         if key.startswith("inputTensor:")],
-                                 outputs=[tensor(value) for key, value in ordered
-                                          if key.startswith("outputTensor:")], attributes=attrs)
+                    ordered = sorted(attrs.items(),
+                                     key=lambda item: (item[0].split(":")[0], int(item[0].rsplit(":", 1)[1])
+                                                       if item[0].startswith(
+                                                           ("inputTensor:", "outputTensor:")) else -1))
+                    entry.update(inputs=[tensor(value) for key, value in ordered if key.startswith("inputTensor:")],
+                                 outputs=[tensor(value) for key, value in ordered if key.startswith("outputTensor:")],
+                                 attributes=attrs)
                 else:
                     unresolved.append([recipe["recipe_id"], symbol["full_context_id"], symbol["node"]])
                 contracts.append(entry)
         (root / "node-contracts.json").write_text(json.dumps(contracts, indent=2) + "\n")
         (root / "unresolved-contracts.json").write_text(json.dumps(unresolved, indent=2) + "\n")
-        print(json.dumps({"rank": rank, "compute_nodes": len(contracts),
-                          "matched": len(contracts) - len(unresolved), "unresolved": len(unresolved)}), flush=True)
+        print(json.dumps({
+            "rank": rank,
+            "compute_nodes": len(contracts),
+            "matched": len(contracts) - len(unresolved),
+            "unresolved": len(unresolved)
+        }),
+              flush=True)
 
 
 if __name__ == "__main__":

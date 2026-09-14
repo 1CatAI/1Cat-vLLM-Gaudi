@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 
 from vllm_gaudi.entrypoints.deepseek_v41 import prepare_environment
+
 prepare_environment()
 
 import torch  # noqa: E402
@@ -34,7 +35,10 @@ def main():
     evidence = Path(os.environ["DSV41_RUN_EVIDENCE"])
     torch.hpu.set_device(0)
     bind_worker_cpu(0)
-    init_distributed_environment(world_size=1, rank=0, local_rank=0, backend="hccl",
+    init_distributed_environment(world_size=1,
+                                 rank=0,
+                                 local_rank=0,
+                                 backend="hccl",
                                  distributed_init_method="file://" + str(evidence / "pg-init"))
     with set_current_vllm_config(VllmConfig()):
         initialize_model_parallel()
@@ -58,8 +62,10 @@ def main():
             aligner(vision(patches, 33, 47), 33, 47)
         torch.hpu.synchronize()
         print(f"Vision loaded; first profiler start after {args.warmup} warmups", flush=True)
-        profiler = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.HPU], record_shapes=True, with_stack=False)
+        profiler = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.HPU],
+            record_shapes=True,
+            with_stack=False)
         profiler.start()
         with torch.profiler.record_function("v41::isolated_vision"):
             result = aligner(vision(patches, 33, 47), 33, 47)
@@ -67,10 +73,16 @@ def main():
         profiler.stop()
         profiler.export_chrome_trace(str(evidence / "vision.trace.json.gz"))
         from vllm_gaudi.ops.tp2_runtime_profile import verify_loaded_profile_libraries
-        (evidence / "result.json").write_text(json.dumps({"status": "profile completed",
-            "scope": "isolated real ViT/aligner; random patches; no model quality/performance qualification",
-            "shape": list(result.shape), "warmup": args.warmup, "profile": verify_loaded_profile_libraries()},
-            indent=2) + "\n")
+        (evidence / "result.json").write_text(
+            json.dumps(
+                {
+                    "status": "profile completed",
+                    "scope": "isolated real ViT/aligner; random patches; no model quality/performance qualification",
+                    "shape": list(result.shape),
+                    "warmup": args.warmup,
+                    "profile": verify_loaded_profile_libraries()
+                },
+                indent=2) + "\n")
     destroy_model_parallel()
     destroy_distributed_environment()
     print("Vision profiling diagnostic complete", flush=True)

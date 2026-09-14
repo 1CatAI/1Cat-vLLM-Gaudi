@@ -54,7 +54,8 @@ def main():
             (root / "result.json").write_text(json.dumps(records, indent=2) + "\n")
             print(json.dumps(records[-1]), flush=True)
             if mismatches:
-                torch.save(dict(value=value.cpu(), expected=expected, actual=actual), root / f"mismatch-{name}-{case}.pt")
+                torch.save(dict(value=value.cpu(), expected=expected, actual=actual),
+                           root / f"mismatch-{name}-{case}.pt")
                 if not args.collect_mismatches:
                     raise RuntimeError("Native KV codec bytes differ from the compiled reference")
 
@@ -68,11 +69,10 @@ def main():
     slots = torch.arange(6, dtype=torch.int64, device="hpu")
 
     def chain(query, values, use_native):
-        packed = (ops.custom_deepseek_v41_swa_pack_bf16_gaudi2(values)
-                  if use_native else _pack_swa_torch(values))
+        packed = (ops.custom_deepseek_v41_swa_pack_bf16_gaudi2(values) if use_native else _pack_swa_torch(values))
         updated = cache.index_copy(0, slots, packed)
-        return ops.custom_deepseek_v41_paged_attention_sram_bf16_gaudi2(
-            query, updated, main_cache, rows, indices, sink, scale, lengths)
+        return ops.custom_deepseek_v41_paged_attention_sram_bf16_gaudi2(query, updated, main_cache, rows, indices, sink,
+                                                                        scale, lengths)
 
     old = torch.compile(lambda q, v: chain(q, v, False), backend="hpu_backend", fullgraph=True, dynamic=False)
     new = torch.compile(lambda q, v: chain(q, v, True), backend="hpu_backend", fullgraph=True, dynamic=False)

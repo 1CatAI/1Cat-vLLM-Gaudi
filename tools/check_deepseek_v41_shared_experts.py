@@ -65,9 +65,9 @@ def main():
         if not args.sram_kv_chain:
             return value
         q = torch.nn.functional.pad(value.reshape(6, 10, 512), (0, 0, 0, 22))
-        op = (torch.ops.custom_op.custom_deepseek_v41_paged_attention_head_vector_bf16_gaudi2
-              if use_sram and args.head_vector else torch.ops.custom_op.custom_deepseek_v41_paged_attention_sram_bf16_gaudi2 if use_sram
-              else torch.ops.custom_op.custom_deepseek_v41_paged_attention_vector_scales_bf16_gaudi2)
+        op = (torch.ops.custom_op.custom_deepseek_v41_paged_attention_head_vector_bf16_gaudi2 if use_sram
+              and args.head_vector else torch.ops.custom_op.custom_deepseek_v41_paged_attention_sram_bf16_gaudi2
+              if use_sram else torch.ops.custom_op.custom_deepseek_v41_paged_attention_vector_scales_bf16_gaudi2)
         current_swa = swa
         if args.kv_pack_chain:
             from vllm_gaudi.ops.deepseek_v41_math import _pack_swa_torch
@@ -79,21 +79,17 @@ def main():
         attended = op(q, current_swa, main_cache, row_ids, indices, sink, scale, lengths)
         return attended[:, :10, :].reshape(6, 5120).contiguous()
 
-
     def reference(value, ids, routing):
         value = attention_input(value, False)
-        return old(value, ids, routing, weights.w13_q16, weights.w2_q16,
-                   weights.w13_s16, weights.w2_s16, lookup, True)
+        return old(value, ids, routing, weights.w13_q16, weights.w2_q16, weights.w13_s16, weights.w2_s16, lookup, True)
 
     def candidate(value, ids, routing):
         value = attention_input(value, True)
         if args.implementation in ("k128", "n512"):
-            op = (torch.ops.custom_op.custom_deepseek_v41_mxfp4_n512_moe_bf16_gaudi2
-                  if args.implementation == "n512" else
-                  torch.ops.custom_op.custom_deepseek_v41_mxfp4_k128_moe_bf16_gaudi2)
-            return op(
-                value, ids, routing, weights.w13_q16, weights.w2_q16,
-                weights.w13_s16, weights.w2_s16, lookup, True)
+            op = (torch.ops.custom_op.custom_deepseek_v41_mxfp4_n512_moe_bf16_gaudi2 if args.implementation == "n512"
+                  else torch.ops.custom_op.custom_deepseek_v41_mxfp4_k128_moe_bf16_gaudi2)
+            return op(value, ids, routing, weights.w13_q16, weights.w2_q16, weights.w13_s16, weights.w2_s16, lookup,
+                      True)
         return shared_expert_moe(value, ids, routing, weights, lookup, True)
 
     reference = torch.compile(reference, backend="hpu_backend", fullgraph=True, dynamic=False)
@@ -115,10 +111,16 @@ def main():
         actual = candidate(*inputs).cpu()
         active, rows = expert_owners(ids)
         mismatches = int((actual.view(torch.int16) != expected.view(torch.int16)).sum())
-        record = {"step": step, "implementation": args.implementation, "sram_kv_chain": args.sram_kv_chain,
-                  "active_experts": int(active.sum()), "slots": 36,
-                  "unique_scatter_rows": rows.unique().numel(), "bf16_mismatches": mismatches,
-                  "max_abs_error": (actual.float() - expected.float()).abs().max().item()}
+        record = {
+            "step": step,
+            "implementation": args.implementation,
+            "sram_kv_chain": args.sram_kv_chain,
+            "active_experts": int(active.sum()),
+            "slots": 36,
+            "unique_scatter_rows": rows.unique().numel(),
+            "bf16_mismatches": mismatches,
+            "max_abs_error": (actual.float() - expected.float()).abs().max().item()
+        }
         records.append(record)
         torch.save(dict(value=value, ids=ids, routing=routing, expected=expected, actual=actual),
                    output / f"real-weight-{step}.pt")

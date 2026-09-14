@@ -37,23 +37,23 @@ def main():
 
     def reference(q, physical, selected, window):
         rows, indices = _selected_attention_layout(physical, selected, window, swa_offsets, selected_offsets)
-        return torch.ops.custom_op.custom_deepseek_v41_paged_attention_bf16_gaudi2(
-            q, swa, main_cache, rows, indices, sink, scale)
+        return torch.ops.custom_op.custom_deepseek_v41_paged_attention_bf16_gaudi2(q, swa, main_cache, rows, indices,
+                                                                                   sink, scale)
 
     def candidate(q, physical, selected, window):
         rows, indices, lengths = _shared_prefix_attention_layout(physical, selected, window, swa_offsets)
-        op = (torch.ops.custom_op.custom_deepseek_v41_paged_attention_head_vector_bf16_gaudi2
-              if args.head_vector else torch.ops.custom_op.custom_deepseek_v41_paged_attention_sram_bf16_gaudi2
-              if args.sram_kv else torch.ops.custom_op.custom_deepseek_v41_paged_attention_vector_scales_bf16_gaudi2
-              if args.vector_scales else torch.ops.custom_op.custom_deepseek_v41_paged_attention_packed_exp_bf16_gaudi2
-              if args.packed_exp else torch.ops.custom_op.custom_deepseek_v41_paged_attention_lengths_bf16_gaudi2)
-        return op(
-            q, swa, main_cache, rows, indices, sink, scale, lengths)
+        op = (torch.ops.custom_op.custom_deepseek_v41_paged_attention_head_vector_bf16_gaudi2 if args.head_vector else
+              torch.ops.custom_op.custom_deepseek_v41_paged_attention_sram_bf16_gaudi2 if args.sram_kv else
+              torch.ops.custom_op.custom_deepseek_v41_paged_attention_vector_scales_bf16_gaudi2 if args.vector_scales
+              else torch.ops.custom_op.custom_deepseek_v41_paged_attention_packed_exp_bf16_gaudi2 if args.
+              packed_exp else torch.ops.custom_op.custom_deepseek_v41_paged_attention_lengths_bf16_gaudi2)
+        return op(q, swa, main_cache, rows, indices, sink, scale, lengths)
 
     old = torch.compile(reference, backend="hpu_backend", fullgraph=True, dynamic=False)
     new = torch.compile(candidate, backend="hpu_backend", fullgraph=True, dynamic=False)
     records = []
-    for tokens, start, ratio in ((1, 0, 2), (2, 7, 2), (3, 126, 2), (4, 254, 2), (5, 127, 128), (6, 0, 2), (6, 126, 2), (6, 254, 2), (6, 1018, 2), (6, 127, 128)):
+    for tokens, start, ratio in ((1, 0, 2), (2, 7, 2), (3, 126, 2), (4, 254, 2), (5, 127, 128), (6, 0, 2), (6, 126, 2),
+                                 (6, 254, 2), (6, 1018, 2), (6, 127, 128)):
         positions = torch.arange(start, start + tokens, dtype=torch.int32)
         window = positions[:, None] - 127 + torch.arange(128, dtype=torch.int32)
         window = torch.where(window >= 0, window.remainder(256), -1)
@@ -68,8 +68,8 @@ def main():
         (output / "result.json").write_text(json.dumps(records, indent=2) + "\n")
         print(json.dumps(records[-1]), flush=True)
         if mismatch:
-            torch.save(dict(q=q, physical=physical, selected=selected, window=window,
-                            expected=expected, actual=actual), output / "mismatch.pt")
+            torch.save(dict(q=q, physical=physical, selected=selected, window=window, expected=expected, actual=actual),
+                       output / "mismatch.pt")
             raise RuntimeError("Prefix KV candidate differs from existing BF16 attention")
     torch.hpu.synchronize()
 

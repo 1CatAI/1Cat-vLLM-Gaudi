@@ -44,20 +44,36 @@ def main():
             ready = args.run / f"gdb-rank{rank}.ready"
             command = args.run / f"gdb-rank{rank}.commands"
             command.write_text("\n".join((
-                "set pagination off", "set confirm off", "set print thread-events off",
-                "handle SIGPIPE nostop noprint pass", "handle SIGSEGV stop print pass",
-                f"attach {pid}", "python", f"open({str(ready)!r}, 'w').write('attached')", "end", "continue",
-                "bt 40", "info registers", "x/32i $pc-64", "python", "import gdb",
+                "set pagination off",
+                "set confirm off",
+                "set print thread-events off",
+                "handle SIGPIPE nostop noprint pass",
+                "handle SIGSEGV stop print pass",
+                f"attach {pid}",
+                "python",
+                f"open({str(ready)!r}, 'w').write('attached')",
+                "end",
+                "continue",
+                "bt 40",
+                "info registers",
+                "x/32i $pc-64",
+                "python",
+                "import gdb",
                 "frame = gdb.newest_frame()",
                 "if 'addToDebugInfoMap' in (frame.name() or ''):",
                 "    for cmd in ['x/12gx $rbx', 'x/20gx $r12', "
                 "'set $dsv41_owner = *(void **)($rbp-0x510)', 'x/8gx (char *)$dsv41_owner+0x1318']:",
-                "        try: gdb.execute(cmd)", "        except gdb.error as exc: print(exc)",
-                "end", "thread apply all bt 7", "detach", "quit",
+                "        try: gdb.execute(cmd)",
+                "        except gdb.error as exc: print(exc)",
+                "end",
+                "thread apply all bt 7",
+                "detach",
+                "quit",
             )) + "\n")
             log = (args.run / f"gdb-rank{rank}.log").open("w")
             logs.append(log)
-            process = subprocess.Popen(["gdb", "--batch", "-nx", "-x", str(command)], stdout=log,
+            process = subprocess.Popen(["gdb", "--batch", "-nx", "-x", str(command)],
+                                       stdout=log,
                                        stderr=subprocess.STDOUT)
             jobs.append(process)
             record["workers"].append({"rank": rank, "pid": pid, "gdb_pid": process.pid})
@@ -72,9 +88,13 @@ def main():
         else:
             raise RuntimeError("Debugger attachment timed out")
         print("Both owned PP0 workers attached; starting first-image diagnostic", flush=True)
-        result = subprocess.run([sys.executable, str(Path(__file__).with_name("request_deepseek_v41.py")),
-            str(args.request_output), "--url", args.url, "--image", str(args.image), "--prompt", "Describe this image.",
-            "--tokens", "16", "--profile", "--server-process", str(args.run / "process.json")])
+        result = subprocess.run([
+            sys.executable,
+            str(Path(__file__).with_name("request_deepseek_v41.py")),
+            str(args.request_output), "--url", args.url, "--image",
+            str(args.image), "--prompt", "Describe this image.", "--tokens", "16", "--profile", "--server-process",
+            str(args.run / "process.json")
+        ])
         record["request_exit_code"] = result.returncode
     finally:
         # A successful request leaves GDB in continue. Interrupt the debugger

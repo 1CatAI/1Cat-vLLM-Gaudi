@@ -101,6 +101,15 @@ class HostRows {
             std::memcpy(scales + i * scaleStride, scales_.data() + (row - start) * groups, groups);
         }
     }
+    void gather_packed(const int32_t* ids, size_t rows, uint8_t* output) const {
+        for (size_t i = 0; i < rows; ++i)
+            require(ids[i] >= start && ids[i] < stop, "Engram hash row is outside the bound TP table");
+        for (size_t i = 0; i < rows; ++i) {
+            const size_t row = ids[i] - start;
+            std::memcpy(output + i * (width + groups), weights_.data() + row * width, width);
+            std::memcpy(output + i * (width + groups) + width, scales_.data() + row * groups, groups);
+        }
+    }
     size_t resident_pages() const { return weights_.resident_pages() + scales_.resident_pages(); }
 };
 
@@ -115,7 +124,7 @@ class GatherSlot : public std::enable_shared_from_this<GatherSlot> {
     const size_t capacity_, width_, groups_;
     std::vector<int32_t> ids_;
     std::vector<uint8_t> weights_, scales_;
-    // Hold the Python array owner until the worker is joined at destruction.
+    // Hold the Python owner until the worker has stopped using the buffer.
     py::array packed_owner_;
     uint8_t* packed_ = nullptr;
     std::shared_ptr<HostRows> table_;
@@ -147,7 +156,8 @@ class GatherSlot : public std::enable_shared_from_this<GatherSlot> {
             const auto started = profiling ? timestamp_ns() : 0;
             try {
                 if (packed_) {
-                    table->gather(ids_.data(), count, packed_, packed_ + width_, width_ + groups_, width_ + groups_);
+                    table->gather(ids_.data(), count, packed_, packed_ + width_,
+                                  width_ + groups_, width_ + groups_);
                 } else {
                     table->gather(ids_.data(), count, weights_.data(), scales_.data());
                 }
@@ -182,7 +192,8 @@ class GatherSlot : public std::enable_shared_from_this<GatherSlot> {
         const auto info = output.request();
         std::lock_guard<std::mutex> lock(mutex_);
         require(state_ == State::Idle, "Cannot rebind an owned Engram staging buffer");
-        require(output.writeable() && info.ndim == 2 && info.shape[0] == static_cast<ssize_t>(capacity_)
+        require(output.writeable() && info.ndim == 2
+                && info.shape[0] == static_cast<ssize_t>(capacity_)
                 && info.shape[1] == static_cast<ssize_t>(width_ + groups_),
                 "Engram packed output must match its fixed row capacity and weight/scale layout");
         packed_owner_ = std::move(output);
@@ -236,14 +247,154 @@ class GatherSlot : public std::enable_shared_from_this<GatherSlot> {
     }
     std::vector<uint64_t> timing() {
         std::lock_guard<std::mutex> lock(mutex_);
-        require(state_ == State::Leased && profiling_, "Engram timing requires a completed profiled gather");
-        return {generation_, started_ns_, finished_ns_, count_, static_cast<uint64_t>(worker_tid_)};
+        require(state_ == State::Leased && profiling_,
+                "Engram timing requires a completed profiled gather");
+        return {generation_, started_ns_, finished_ns_, count_,
+                static_cast<uint64_t>(worker_tid_)};
+    }
+};
+
+// C1 owns no separate history: the normal request transaction supplies its
+// committed three-token suffix. Hashing and selected-row copies run together,
+// directly into the caller's already-retired pinned staging slot.
+class NativeC1Prepare {
+    using I64 = py::array_t<int64_t, py::array::c_style>;
+    using U8 = py::array;
+    I64 token_map_, multipliers_, primes_, offsets_;
+    std::vector<std::shared_ptr<HostRows>> tables_;
+    std::vector<std::vector<U8>> targets_;
+    std::vector<uint64_t> slot_generations_;
+    int64_t first_[2], last_[2], pad_;
+    uint64_t generation_ = 0, history_generation_ = 0;
+    std::string request_;
+    bool pending_ = false, failed_ = false;
+    std::mutex mutex_;
+ public:
+    NativeC1Prepare(I64 tokenMap, I64 multipliers, I64 primes, I64 offsets,
+                    I64 first, I64 last, int64_t pad,
+                    std::vector<std::shared_ptr<HostRows>> tables,
+                    std::vector<std::vector<U8>> targets)
+        : token_map_(std::move(tokenMap)), multipliers_(std::move(multipliers)),
+          primes_(std::move(primes)), offsets_(std::move(offsets)), tables_(std::move(tables)),
+          targets_(std::move(targets)), slot_generations_(targets_.size(), 0), pad_(pad) {
+        require(token_map_.ndim() == 1 && token_map_.size() > 0 && pad_ >= 0,
+                "Invalid C1 compressed token map");
+        require(multipliers_.ndim() == 2 && multipliers_.shape(0) == 2 && multipliers_.shape(1) == 4 &&
+                primes_.ndim() == 2 && primes_.shape(0) == 2 && primes_.shape(1) == 24 &&
+                offsets_.ndim() == 2 && offsets_.shape(0) == 2 && offsets_.shape(1) == 24 &&
+                first.size() == 2 && last.size() == 2 && tables_.size() == 2 && targets_.size() >= 2,
+                "C1 Engram requires two layers, 2/3/4 grams and eight heads");
+        for (size_t layer = 0; layer < 2; ++layer) {
+            first_[layer] = first.data()[layer]; last_[layer] = last.data()[layer];
+            require(first_[layer] >= 0 && first_[layer] < last_[layer] && last_[layer] <= 24 && tables_[layer],
+                    "Invalid C1 TP head ownership");
+            for (size_t head = 0; head < 24; ++head)
+                require(primes_.data()[layer * 24 + head] > 0 && offsets_.data()[layer * 24 + head] >= 0,
+                        "Invalid C1 hash divisor or offset");
+        }
+        std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
+        for (auto& slot : targets_) {
+            require(slot.size() == 2, "C1 staging must bind both Engram layers");
+            for (size_t layer = 0; layer < 2; ++layer) {
+                auto& target = slot[layer];
+                const auto width = tables_[layer]->width + tables_[layer]->groups;
+                require(target.ndim() == 3 && target.shape(0) == 1 &&
+                        target.shape(1) == last_[layer] - first_[layer] && target.shape(2) == width && target.writeable() &&
+                        target.dtype().is(py::dtype::of<uint8_t>()) && (target.flags() & py::array::c_style),
+                        "C1 pinned destination shape, layout or writeability differs");
+                const auto begin = reinterpret_cast<uintptr_t>(target.data());
+                const auto end = begin + target.nbytes();
+                require(end >= begin, "C1 staging range overflow");
+                for (const auto& range : ranges)
+                    require(end <= range.first || range.second <= begin, "C1 staging slots alias");
+                ranges.emplace_back(begin, end);
+            }
+        }
+    }
+
+    py::tuple prepare(const std::string& request, uint64_t historyGeneration, uint64_t generation,
+                      size_t slot, int64_t token, bool image, I64 history) {
+        // No Python operation occurs while the native mutex is held without
+        // the GIL. Complete cannot race the transaction that creates its token.
+        require(history.ndim() == 1 && history.size() <= 3, "C1 history suffix exceeds three tokens");
+        require(token >= 0 && token < token_map_.size(), "C1 token is outside the frozen vocabulary");
+        require(slot < targets_.size(), "C1 staging slot is out of range");
+        py::array_t<int64_t> compressed({py::ssize_t(1)});
+        py::array_t<int32_t> hashes({py::ssize_t(1), py::ssize_t(2), py::ssize_t(24)});
+        const int64_t code = image ? -1 : token_map_.data()[token];
+        require(code >= -1, "Invalid compressed C1 token");
+        compressed.mutable_data()[0] = code;
+        auto* hash = hashes.mutable_data();
+        std::vector<uint8_t*> destinations;
+        for (auto& target : targets_[slot]) destinations.push_back(static_cast<uint8_t*>(target.mutable_data()));
+        long faults = 0;
+        {
+            py::gil_scoped_release release;
+            std::lock_guard<std::mutex> lock(mutex_);
+            require(!pending_ && !failed_, "C1 preparation has an unretired or failed generation");
+            require(generation > generation_ && generation > slot_generations_[slot], "Stale C1 staging generation");
+            try {
+                uint64_t rolling[2] = {0, 0};
+                bool blocked = false;
+                for (size_t shift = 0; shift < 4; ++shift) {
+                    int64_t value = code;
+                    if (shift) {
+                        if (shift > static_cast<size_t>(history.size())) { blocked = true; value = pad_; }
+                        else value = history.data()[history.size() - shift];
+                    }
+                    blocked = blocked || value == -1;
+                    if (blocked) value = pad_;
+                    require(value >= 0, "Invalid committed C1 history code");
+                    for (size_t layer = 0; layer < 2; ++layer) {
+                        // Defined modulo-2^64 arithmetic matches NumPy int64
+                        // multiplication/XOR, including signed-overflow cases.
+                        rolling[layer] ^= uint64_t(value) * uint64_t(multipliers_.data()[layer * 4 + shift]);
+                        if (!shift) continue;
+                        int64_t signedBits;
+                        std::memcpy(&signedBits, &rolling[layer], sizeof(signedBits));
+                        for (size_t head = (shift - 1) * 8; head < shift * 8; ++head) {
+                            const size_t index = layer * 24 + head;
+                            const int64_t divisor = primes_.data()[index];
+                            int64_t remainder = signedBits % divisor;
+                            if (remainder < 0) remainder += divisor;
+                            const int64_t offset = offsets_.data()[index];
+                            require(offset <= INT32_MAX && remainder <= INT32_MAX - offset,
+                                    "C1 hash row exceeds the int32 checkpoint contract");
+                            hash[index] = int32_t(remainder + offset);
+                        }
+                    }
+                }
+                // Validate both layers before modifying either destination.
+                for (size_t layer = 0; layer < 2; ++layer)
+                    for (int64_t head = first_[layer]; head < last_[layer]; ++head)
+                        require(hash[layer * 24 + head] >= tables_[layer]->start &&
+                                hash[layer * 24 + head] < tables_[layer]->stop, "C1 row does not belong to its TP shard");
+                struct rusage before{}, after{};
+                getrusage(RUSAGE_THREAD, &before);
+                for (size_t layer = 0; layer < 2; ++layer)
+                    tables_[layer]->gather_packed(hash + layer * 24 + first_[layer],
+                                                  last_[layer] - first_[layer], destinations[layer]);
+                getrusage(RUSAGE_THREAD, &after);
+                faults = after.ru_majflt - before.ru_majflt;
+                request_ = request; history_generation_ = historyGeneration;
+                generation_ = generation; slot_generations_[slot] = generation; pending_ = true;
+            } catch (...) { failed_ = true; throw; }
+        }
+        return py::make_tuple(compressed, hashes, faults);
+    }
+
+    void complete(const std::string& request, uint64_t historyGeneration, uint64_t generation) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        require(pending_ && !failed_ && request == request_ && historyGeneration == history_generation_ &&
+                generation == generation_, "Cannot retire a stale C1 transaction");
+        pending_ = false;
     }
 };
 }
 
 PYBIND11_MODULE(dsv41_host_gather, m) {
     m.attr("abi_version") = 1;
+    m.attr("c1_abi_version") = 1;
     m.attr("packed_output_version") = 1;
     py::class_<HostRows, std::shared_ptr<HostRows>>(m, "HostRows")
         .def(py::init<const std::string&, uint64_t, const std::string&, uint64_t, int64_t, int64_t, size_t, bool, bool>(),
@@ -262,4 +413,11 @@ PYBIND11_MODULE(dsv41_host_gather, m) {
         .def_property_readonly("weights", &GatherSlot::weights)
         .def_property_readonly("scales", &GatherSlot::scales)
         .def_property_readonly("major_faults", &GatherSlot::major_faults);
+    using I64 = py::array_t<int64_t, py::array::c_style>;
+    using U8 = py::array;
+    py::class_<NativeC1Prepare>(m, "NativeC1Prepare")
+        .def(py::init<I64, I64, I64, I64, I64, I64, int64_t,
+             std::vector<std::shared_ptr<HostRows>>, std::vector<std::vector<U8>>>())
+        .def("prepare", &NativeC1Prepare::prepare)
+        .def("complete", &NativeC1Prepare::complete);
 }

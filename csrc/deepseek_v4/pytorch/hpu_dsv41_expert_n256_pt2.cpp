@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-// Adapted from main 92c82b97 N256 compound. Only N256 registrations live here;
-// the retained DSpark BF16 registrations keep their original implementation.
+// Adapted from main 92c82b97 N256 compound. This translation unit owns the
+// N256 paths plus the legacy FP8 and prepared-K128 aliases; the retained
+// DSpark BF16 registrations keep their original implementation.
 #include <ATen/ATen.h>
 #include <torch/library.h>
 #include <limits>
@@ -76,8 +77,9 @@ std::vector<int64_t> moe_shape(const at::Stack& stack, bool n256 = false) {
 void fp8_contract(const at::Stack& stack, bool n256 = false) {
     moe_shape(stack, n256);
     const auto x = stack.at(0).toTensor(), ids = stack.at(1).toTensor();
-    TORCH_CHECK(x.size(0) >= 1 && x.size(0) <= 6 && ids.size(1) == 6 && stack.back().toBool(),
-                "V4.1 N256 FP8 MoE requires C1-C6 top6 and finite normal-scale qualification");
+    TORCH_CHECK((n256 ? x.size(0) >= 1 && x.size(0) <= 6 : x.size(0) == 1) &&
+                    ids.size(1) == 6 && stack.back().toBool(),
+                "V4.1 FP8 MoE requires top6, a supported token bucket and finite normal-scale qualification");
     for (int index : {0, 1}) {
         const auto channel = stack.at(8 + index).toTensor(), q = stack.at(3 + index).toTensor();
         contract(channel, at::kBFloat16, x.device());
@@ -139,12 +141,34 @@ class PreparedV41 final : public habana::OpBackend {
                   synTensor s, synTensor lookup, int tokens, int experts, int n, int k,
                   bool broadcast, bool normal, synTensor channel = nullptr) {
         if (fp8_) {
-            const int slots = tokens * experts;
-            auto decoded = n256_
-                ? BuildNode(this, graph, {kN256Fp8, {ids, q, s, lookup},
-                    {{{slots, k, n}, at::ScalarType::Float8_e4m3fn}}})
-                : BuildNode(this, graph, {kDecodeFp8, {ids, q, s, channel, lookup},
+            // Preserve the qualified C1 reference graph byte-for-byte. The
+            // C1-C6 route expansion below is required only by the N256 path;
+            // applying it to the legacy layout changes the scale tensor's
+            // geometry and makes Synapse reject the elementwise multiply.
+            if (!n256_) {
+                auto decoded = BuildNode(this, graph, {kDecodeFp8, {ids, q, s, channel, lookup},
                     {{{experts, k, n}, at::ScalarType::Float8_e4m3fn}, {{experts, 1, n}, at::kFloat}}});
+                const int rows = broadcast ? 1 : experts;
+                auto inputRows = ReshapeHelper(graph, input, {rows, k}, at::kBFloat16);
+                auto quant = BuildNode(this, graph, {kDynamicQuant, {inputRows.get()},
+                    {{{rows, k}, at::ScalarType::Float8_e4m3fn}, {{rows, 1}, at::kFloat}}});
+                auto activation = ReshapeHelper(graph, quant.at(0).get(), {rows, 1, k},
+                                                at::ScalarType::Float8_e4m3fn);
+                auto activationScale = ReshapeHelper(graph, quant.at(1).get(), {rows, 1, 1}, at::kFloat);
+                synGEMMParams params{false, false};
+                const std::vector<int64_t> resultShape{experts, 1, n};
+                auto product = BuildNode(this, graph, {"batch_gemm", {activation.get(), decoded.at(0).get()},
+                    {{resultShape, at::kFloat}}, &params, sizeof(params)});
+                auto weightScaled = BuildNode(this, graph, {"mult_fwd_f32",
+                    {product.at(0).get(), decoded.at(1).get()}, {{resultShape, at::kFloat}}});
+                auto scaled = BuildNode(this, graph, {"mult_fwd_f32",
+                    {weightScaled.at(0).get(), activationScale.get()}, {{resultShape, at::kFloat}}});
+                auto rounded = cast(graph, scaled.at(0).get(), resultShape, false);
+                return ReshapeHelper(graph, rounded.get(), {1, experts, n}, at::kBFloat16);
+            }
+            const int slots = tokens * experts;
+            auto decoded = BuildNode(this, graph, {kN256Fp8, {ids, q, s, lookup},
+                {{{slots, k, n}, at::ScalarType::Float8_e4m3fn}}});
             const int rows = broadcast ? tokens : slots;
             auto inputRows = ReshapeHelper(graph, input, {rows, k}, at::kBFloat16);
             auto quant = BuildNode(this, graph, {kDynamicQuant, {inputRows.get()},
@@ -157,17 +181,9 @@ class PreparedV41 final : public habana::OpBackend {
             const std::vector<int64_t> resultShape{slots, 1, n};
             auto product = BuildNode(this, graph, {"batch_gemm", {activation.get(), decoded.at(0).get()},
                 {{resultShape, at::kFloat}}, &params, sizeof(params)});
-            if (n256_) {
-                auto scaled = BuildNode(this, graph, {kN256Scale,
-                    {product.at(0).get(), ids, activationScale.get(), channel}, {{resultShape, at::kBFloat16}}});
-                return ReshapeHelper(graph, scaled.at(0).get(), {tokens, experts, n}, at::kBFloat16);
-            }
-            auto weightScaled = BuildNode(this, graph, {"mult_fwd_f32", {product.at(0).get(), decoded.at(1).get()},
-                {{resultShape, at::kFloat}}});
-            auto scaled = BuildNode(this, graph, {"mult_fwd_f32", {weightScaled.at(0).get(), activationScale.get()},
-                {{resultShape, at::kFloat}}});
-            auto rounded = cast(graph, scaled.at(0).get(), resultShape, false);
-            return ReshapeHelper(graph, rounded.get(), {1, experts, n}, at::kBFloat16);
+            auto scaled = BuildNode(this, graph, {kN256Scale,
+                {product.at(0).get(), ids, activationScale.get(), channel}, {{resultShape, at::kBFloat16}}});
+            return ReshapeHelper(graph, scaled.at(0).get(), {tokens, experts, n}, at::kBFloat16);
         }
         auto decoded = BuildNode(this, graph, {decode_guid(normal), {ids, q, s, lookup},
             {{{tokens * experts, k, n}, at::kBFloat16}}});
@@ -295,7 +311,7 @@ class PreparedV41 final : public habana::OpBackend {
 };
 
 const bool registered = [] {
-    for (int mode = 5; mode < 10; ++mode) {
+    for (int mode : {2, 3, 4, 5, 6, 7, 8, 9}) {
         const bool n256 = mode >= 5;
         const bool moe = mode == 1 || mode == 2 || mode == 4 || mode == 5 || mode == 6 || mode == 9;
         const bool fp8 = mode == 2 || mode == 5 || mode == 7 || mode == 9;
@@ -360,6 +376,9 @@ TORCH_LIBRARY_FRAGMENT(custom_op, m) {
     m.def("custom_deepseek_v41_expert_n256_moe_bf16_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, bool normal=False) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_fp8_gaudi2(Tensor ids, Tensor q16, Tensor s16, Tensor lookup, bool normal=True) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_bf16_gaudi2(Tensor ids, Tensor q16, Tensor s16, Tensor lookup, bool normal=False) -> Tensor");
+    m.def("custom_deepseek_v41_mxfp4_prepared_moe_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, bool normal) -> Tensor");
+    m.def("custom_deepseek_v41_mxfp4_prepared_dequant_k128_bf16_gaudi2(Tensor ids, Tensor q16, Tensor s16, Tensor lookup, bool normal=False) -> Tensor");
+    m.def("custom_deepseek_v41_mxfp4_prepared_moe_k128_bf16_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, bool normal=False) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
     m.impl("custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2", moe_fp8<false, true, true>);
@@ -367,6 +386,9 @@ TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
     m.impl("custom_deepseek_v41_expert_n256_moe_bf16_gaudi2", moe<false, false, true>);
     m.impl("custom_deepseek_v41_expert_n256_fp8_gaudi2", dequant<false, false, true, true>);
     m.impl("custom_deepseek_v41_expert_n256_bf16_gaudi2", dequant<false, false, true, false>);
+    m.impl("custom_deepseek_v41_mxfp4_prepared_moe_fp8_gaudi2", moe_fp8<false>);
+    m.impl("custom_deepseek_v41_mxfp4_prepared_dequant_k128_bf16_gaudi2", dequant<false, true>);
+    m.impl("custom_deepseek_v41_mxfp4_prepared_moe_k128_bf16_gaudi2", moe<false, true>);
 }
 TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
     m.impl("custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2", moe_fp8<true, true, true>);
@@ -374,4 +396,7 @@ TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
     m.impl("custom_deepseek_v41_expert_n256_moe_bf16_gaudi2", moe<true, false, true>);
     m.impl("custom_deepseek_v41_expert_n256_fp8_gaudi2", dequant<true, false, true, true>);
     m.impl("custom_deepseek_v41_expert_n256_bf16_gaudi2", dequant<true, false, true, false>);
+    m.impl("custom_deepseek_v41_mxfp4_prepared_moe_fp8_gaudi2", moe_fp8<true>);
+    m.impl("custom_deepseek_v41_mxfp4_prepared_dequant_k128_bf16_gaudi2", dequant<true, true>);
+    m.impl("custom_deepseek_v41_mxfp4_prepared_moe_k128_bf16_gaudi2", moe<true, true>);
 }

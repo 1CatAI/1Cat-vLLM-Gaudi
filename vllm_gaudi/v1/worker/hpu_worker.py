@@ -245,6 +245,10 @@ class HPUWorker(WorkerBase):
                 stats["v41"] = self.model_runner.audit
                 stats["state_bytes"] = self.model_runner.state.allocated_bytes
                 stats["pp"] = {key: getattr(self.model_runner.pp, key) for key in ("sends", "receives", "commits")}
+                if gaudi_envs.VLLM_HPU_DSV41_NATIVE_PP_COPY:
+                    from vllm_gaudi.distributed.tp2_fused_ar_norm import _resolve_runtime
+                    bridge, _, _ = _resolve_runtime()
+                    stats["pp"]["native_dma_batches_tensors_bytes"] = (bridge.gdn_state_dma_counts())
                 host = self.model_runner.model.engram_host
                 stats["engram"] = None if host is None else host.audit
                 stats["engram_residency"] = None if host is None else host.residency()
@@ -326,9 +330,11 @@ class HPUWorker(WorkerBase):
 
     def shutdown(self):
         from vllm_gaudi import envs as gaudi_envs
+
         def phase(name):
             if gaudi_envs.VLLM_HPU_DSV41_GRAPH_REPLAY:
                 logger.info("V4.1 worker shutdown: %s", name)
+
         phase("begin")
         if getattr(self, "_profiler_running", False):
             phase("stop active profiler")

@@ -2,6 +2,8 @@
 // Native Gaudi2 TP2 decoder replay. Included after tp2_prepared_plan.h.
 
 #include "tp2_native_graph_topology.h"
+#include "tp2_native_dependencies.h"
+#include <strings.h>
 
 namespace tp2_native {
 
@@ -70,6 +72,8 @@ class RuntimeApis {
   using HclBatchDestroy = hcclResult_t (*)(HclBatch);
   using SynExchangeCallback = int (*)(void*, const SyncInfo*, uint64_t, SyncInfo*);
   using SynPreparePlan = synStatus (*)(SynGraph, const uint32_t*, uint64_t, uint32_t, SynExchangeCallback, void*);
+  using SynPreparePlanV2 = synStatus (*)(SynGraph, const uint32_t*, const uint32_t*, uint64_t, uint32_t,
+                                        SynExchangeCallback, void*);
   using SynReplayPlan = synStatus (*)(SynGraph, SyncInfo*, uint64_t*, uint64_t);
 
   static RuntimeApis& get() {
@@ -120,6 +124,15 @@ class RuntimeApis {
     });
   }
 
+  void requirePlanV2() {
+    requirePlan();
+    std::call_once(plan_v2_once_, [this]() {
+      syn_prepare_plan_v2 = resolve<SynPreparePlanV2>("synNativeComputeGraphPreparePlanV2");
+    });
+  }
+
+  SynPreparePlanV2 syn_prepare_plan_v2 = nullptr;
+
   SynCreate syn_create = nullptr;
   SynBeginCapture syn_begin_capture = nullptr;
   SynEndCapture syn_end_capture = nullptr;
@@ -155,12 +168,18 @@ class RuntimeApis {
 
   std::once_flag once_;
   std::once_flag plan_once_;
+  std::once_flag plan_v2_once_;
   bool complete_ = false;
 };
 
 inline bool jointPlanEnabled() {
   const char* value = std::getenv("VLLM_HPU_TP2_NATIVE_JOINT_PLAN");
   return value && std::strcmp(value, "1") == 0;
+}
+
+inline bool mhcOverlapEnabled() {
+  const char* value = std::getenv("VLLM_HPU_DSV41_TP_MHC_OVERLAP");
+  return value && (std::strcmp(value, "1") == 0 || strcasecmp(value, "true") == 0);
 }
 
 inline int replayNicBatch(void* context, const SyncInfo* producers, uint64_t count, SyncInfo* completions) {
@@ -270,8 +289,8 @@ inline std::shared_ptr<NativeCompletion> recordNativeCompletion() {
   return ticket;
 }
 
-inline std::pair<at::Tensor, std::shared_ptr<NativeCompletion>> copySampledTokensToHost(const at::Tensor& source) {
-  TORCH_CHECK(source.device().type() == at::kHPU && source.sizes() == at::IntArrayRef({1, 1}) &&
+inline std::pair<at::Tensor, std::shared_ptr<NativeCompletion>> copyIntegerRowToHost(const at::Tensor& source, int64_t columns) {
+  TORCH_CHECK(source.device().type() == at::kHPU && source.sizes() == at::IntArrayRef({1, columns}) &&
                   (source.scalar_type() == at::kInt || source.scalar_type() == at::kLong) &&
                   source.is_contiguous() && source.storage_offset() == 0,
               "Native sampled-token copy requires a contiguous C1 integer tensor");
@@ -281,9 +300,10 @@ inline std::pair<at::Tensor, std::shared_ptr<NativeCompletion>> copySampledToken
   // The private host buffer uses that exact wire type; Python consumes integer
   // values with tolist() only after the actual copy-completion callback.
   const auto bytes = habana_helpers::GetNBytes(source);
-  TORCH_CHECK(bytes == 4 || bytes == 8, "Unsupported sampled-token wire width");
-  auto host = at::empty({1, 1}, at::TensorOptions().device(at::kCPU)
-                                  .dtype(bytes == 4 ? at::kInt : at::kLong).pinned_memory(true));
+  TORCH_CHECK((columns == 1 || columns == 4) && (bytes == 4 * columns || bytes == 8 * columns),
+              "Unsupported bounded integer row wire width");
+  auto host = at::empty({1, columns}, at::TensorOptions().device(at::kCPU)
+                                  .dtype(bytes == 4 * columns ? at::kInt : at::kLong).pinned_memory(true));
   auto ticket = std::make_shared<NativeCompletion>();
   habana::eager::PipelineTask<habana::eager::ThreadType::LOWERING>([source, host, ticket, bytes]() {
     try {
@@ -311,6 +331,14 @@ inline std::pair<at::Tensor, std::shared_ptr<NativeCompletion>> copySampledToken
     }
   });
   return {host, ticket};
+}
+
+inline std::pair<at::Tensor, std::shared_ptr<NativeCompletion>> copySampledTokensToHost(const at::Tensor& source) {
+  return copyIntegerRowToHost(source, 1);
+}
+
+inline std::pair<at::Tensor, std::shared_ptr<NativeCompletion>> copyIntegerRecordToHost(const at::Tensor& source) {
+  return copyIntegerRowToHost(source, 4);
 }
 
 class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph> {
@@ -347,6 +375,12 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
   void capture(std::vector<std::shared_ptr<PreparedGroupPlan>> plans,
                std::vector<torch::jit::Stack> inputs) {
     RuntimeApis::get().require();
+    if (mhcOverlapEnabled()) {
+      TORCH_CHECK(jointPlanEnabled() && NativeGraphTopology::supportsV41Dependencies(
+                      expected_groups_, expected_collectives_, external_prefix_),
+                  "Explicit TP dependencies require the V4.1 C1 stage topology");
+      RuntimeApis::get().requirePlanV2();
+    }
     TORCH_CHECK(state_.exchange(State::Capturing) == State::Created,
                 "Native decoder graph capture has already started");
     validateAndRememberInputs(plans, inputs);
@@ -756,6 +790,49 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
     collective_count_.store(topology.consumers.size());
     external_collective_count_.store(topology.externalCollectives);
     prepared_consumers_ = topology.consumers;
+    if (mhcOverlapEnabled()) {
+      std::vector<NativeDependencyNode> bindings;
+      for (const auto& frame : frames_)
+        for (const auto& node : frame->plan->nodes) {
+          TORCH_CHECK(!node.exchange || node.peer_only, "V4.1 overlap requires ordinary peer exchanges");
+          NativeDependencyNode binding;
+          binding.exchange = node.exchange;
+          auto ranges = [&](const std::vector<int64_t>& slots) {
+            std::vector<NativeBufferRange> result;
+            for (auto slot : slots) {
+              const auto& value = frame->values.at(slot);
+              if (!value.isTensor()) continue;
+              const auto tensor = value.toTensor();
+              if (tensor.device().type() != c10::DeviceType::HPU || !tensor.numel()) continue;
+              uint64_t elements = 1;
+              for (int64_t dim = 0; dim < tensor.dim(); ++dim) {
+                TORCH_CHECK(tensor.stride(dim) >= 0, "Explicit TP binding has a negative stride");
+                elements += (tensor.size(dim) - 1) * tensor.stride(dim);
+              }
+              result.push_back({reinterpret_cast<uint64_t>(tensor.data_ptr()), elements * tensor.element_size()});
+            }
+            return result;
+          };
+          binding.inputs = ranges(node.inputs);
+          binding.outputs = ranges(node.outputs);
+          bindings.push_back(std::move(binding));
+        }
+      prepared_dependencies_ = prepareNativeDependencies(bindings);
+      TORCH_CHECK(prepared_dependencies_.size() == topology.consumers.size(),
+                  "Explicit TP dependency coverage differs");
+      prepared_consumers_.clear();
+      size_t overlapped = 0;
+      for (size_t index = 0; index < prepared_dependencies_.size(); ++index) {
+        const auto& dep = prepared_dependencies_[index];
+        prepared_producers_.push_back(dep.producer);
+        prepared_consumers_.push_back(dep.consumer);
+        overlapped += dep.producer != UINT32_MAX && dep.consumer > dep.producer + 1;
+        std::fprintf(stderr, "NATIVE_TP_DEPENDENCY i=%zu producer=%u consumer=%u last_consumer=%u bytes=%llu\n",
+                     index, dep.producer, dep.consumer, dep.lastConsumer,
+                     static_cast<unsigned long long>(dep.input.bytes));
+      }
+      TORCH_CHECK(overlapped > 0, "V4.1 overlap graph has no independent compute between TP producer and consumer");
+    }
     hcl_graphs_.assign(topology.consumers.size(), nullptr);
 
     auto self = shared_from_this();
@@ -905,8 +982,16 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
                     "hcclTp2NativeBatchCreate(decoder) failed");
         HclGraphInfo last;
         TORCH_CHECK(api.hcl_get_info(hcl_graphs_.back(), &last) == hcclSuccess, "HCL batch completion unavailable");
-        checkSynapse(api.syn_prepare_plan(syn_graph_, prepared_consumers_.data(), prepared_consumers_.size(), last.completion.longSoIndex,
-                                          replayNicBatch, hcl_batch_), "synNativeComputeGraphPreparePlan(decoder)");
+        if (mhcOverlapEnabled()) {
+          api.requirePlanV2();
+          checkSynapse(api.syn_prepare_plan_v2(syn_graph_, prepared_producers_.data(), prepared_consumers_.data(),
+                       prepared_consumers_.size(), last.completion.longSoIndex, replayNicBatch, hcl_batch_),
+                       "synNativeComputeGraphPreparePlanV2(decoder)");
+        } else {
+          checkSynapse(api.syn_prepare_plan(syn_graph_, prepared_consumers_.data(), prepared_consumers_.size(),
+                       last.completion.longSoIndex, replayNicBatch, hcl_batch_),
+                       "synNativeComputeGraphPreparePlan(decoder)");
+        }
       }
       state_.store(State::Instantiated);
       prepareCompletionAddresses();
@@ -1078,6 +1163,8 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
   std::array<uint64_t, 12> joint_statistics_ {};
   std::array<uint64_t, 8> retirement_statistics_ {};
   std::vector<uint32_t> prepared_consumers_;
+  std::vector<uint32_t> prepared_producers_;
+  std::vector<NativeCollectiveDependency> prepared_dependencies_;
   std::vector<std::shared_ptr<PreparedGroupPlan>> plans_;
   std::vector<std::shared_ptr<PreparedFrame>> frames_;
   std::vector<std::vector<FixedInputSignature>> signatures_;

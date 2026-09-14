@@ -6,7 +6,12 @@ import weakref
 
 import torch
 
-from vllm_gaudi.ops.tp2_model_adapter import DEEPSEEK_V41_PP0, DEEPSEEK_V41_PP1
+from vllm_gaudi.ops.deepseek_v41_diagnostics import trace_phase
+from vllm_gaudi.ops.tp2_model_adapter import (
+    DEEPSEEK_V41_PP0,
+    DEEPSEEK_V41_PP0_INPUT,
+    DEEPSEEK_V41_PP1,
+)
 
 
 def stage_collectives(tp_rank, native):
@@ -31,6 +36,7 @@ def stage_collectives(tp_rank, native):
             first, second = (value, peer) if tp_rank == 0 else (peer, value)
             return torch.cat((first, second), dim=dim)
         return tensor_model_parallel_all_gather(value, dim=dim)
+
     return reduce, gather
 
 
@@ -40,6 +46,7 @@ class _Metadata:
 
 
 class _Snapshot:
+
     def __init__(self, tensors):
         self.tensors = tensors
         self.saved = tuple(value.clone() for value in tensors)
@@ -51,27 +58,46 @@ class _Snapshot:
 
 
 def stage_state_tensors(program):
-    mutable = {"swa", "main", "index", "indices", "candidate_pool", "kv_history", "score_history", "block_table"}
+    mutable = {
+        "swa", "main", "decoded_swa", "decoded_main", "index", "indices", "candidate_pool", "kv_history",
+        "score_history", "block_table"
+    }
     return tuple(value for name, value in program.named_buffers()
                  if not name.startswith("draft.") and name.rsplit(".", 1)[-1] in mutable)
 
 
 class StageVariant(torch.nn.Module):
-    def __init__(self, program, hidden, pre_mix, positions, input_ids, engram, pp_wire=None, fused_text_io=False):
+
+    def __init__(self,
+                 program,
+                 hidden,
+                 pre_mix,
+                 positions,
+                 input_ids,
+                 engram,
+                 pp_wire=None,
+                 fused_text_io=False,
+                 *,
+                 native_input=False):
         super().__init__()
         self.program = program
-        self.adapter = DEEPSEEK_V41_PP0 if program.pp_rank == 0 else DEEPSEEK_V41_PP1
+        self.native_input = native_input
+        self.adapter = (DEEPSEEK_V41_PP0_INPUT
+                        if native_input else DEEPSEEK_V41_PP0 if program.pp_rank == 0 else DEEPSEEK_V41_PP1)
         if program.length > 512:
-            extra = sum(2 for layer in program.layers if layer.attention.owns_index
-                        and layer.attention.search_length // layer.attention.ratio > 512)
+            extra = sum(2 for layer in program.layers
+                        if layer.attention.owns_index and layer.attention.search_length // layer.attention.ratio > 512)
             self.adapter = replace(self.adapter, extra_collectives=self.adapter.extra_collectives + extra)
         from vllm_gaudi.models.deepseek_v41_program import CompiledStage
         self.wire_input = pp_wire is not None
         self.fused_text_io = fused_text_io
         if fused_text_io:
             self.adapter = replace(self.adapter, extra_collectives=self.adapter.extra_collectives + 1)
-        self.compiled = CompiledStage(program, native=True, pp_wire_input=self.wire_input,
-                                      fused_text_io=fused_text_io)
+        self.compiled = CompiledStage(program,
+                                      native=True,
+                                      pp_wire_input=self.wire_input,
+                                      fused_text_io=fused_text_io,
+                                      native_input=native_input)
         self.fixed = tuple(value.clone() if value is not None else None
                            for value in (hidden, pre_mix, positions, input_ids))
         from vllm_gaudi import envs
@@ -92,14 +118,32 @@ class StageVariant(torch.nn.Module):
         self.capture_bytes = snapshot.bytes
         return snapshot
 
-    def forward(self, hidden, pre_mix, positions, input_ids, engram, pp_wire=None, fused_text_io=False):
+    @trace_phase
+    def forward(self,
+                hidden,
+                pre_mix,
+                positions,
+                input_ids,
+                engram,
+                pp_wire=None,
+                fused_text_io=False,
+                native_input=False):
         from vllm_gaudi.ops.tp2_prepared_plan import (
-            collect_prepared_group_replays, record_native_decoder_outputs, replay_native_decoder,
+            collect_prepared_group_replays,
+            record_native_decoder_outputs,
+            replay_native_decoder,
         )
-        if (pp_wire is not None) != self.wire_input or fused_text_io != self.fused_text_io:
+        if ((pp_wire is not None) != self.wire_input or fused_text_io != self.fused_text_io
+                or native_input != self.native_input):
             raise RuntimeError("V4.1 stage input contract changed without preparing its variant")
-        roots = dict(hidden_states=hidden, pre_mix=pre_mix, positions=positions, input_ids=input_ids, pp_wire=pp_wire,
-                     attention_inputs=engram, metadata=self.metadata, state_generation=self.program.generation,
+        roots = dict(hidden_states=hidden,
+                     pre_mix=pre_mix,
+                     positions=positions,
+                     input_ids=input_ids,
+                     pp_wire=pp_wire,
+                     attention_inputs=engram,
+                     metadata=self.metadata,
+                     state_generation=(self.program.generation, self.program.precision_fingerprint),
                      state_tensors=self.states)
         outputs = replay_native_decoder(self, **roots)
         if outputs is not None:
@@ -112,12 +156,17 @@ class StageVariant(torch.nn.Module):
         for destination, source in zip(self.engram, engram, strict=True):
             destination.copy_(source)
         fixed_hidden, fixed_pre, fixed_positions, fixed_ids = self.fixed
-        fixed_roots = dict(roots, hidden_states=fixed_hidden, pre_mix=fixed_pre, positions=fixed_positions,
-                           input_ids=fixed_ids, attention_inputs=self.engram, pp_wire=self.pp_wire)
+        fixed_roots = dict(roots,
+                           hidden_states=fixed_hidden,
+                           pre_mix=fixed_pre,
+                           positions=fixed_positions,
+                           input_ids=fixed_ids,
+                           attention_inputs=self.engram,
+                           pp_wire=self.pp_wire)
         if self.wire_input:
             fixed_hidden = self.pp_wire
         with collect_prepared_group_replays(owner=self, adapter=self.adapter, snapshot=self.snapshot,
-                                           **fixed_roots) as context:
+                                            **fixed_roots) as context:
             for index, chunk in enumerate(self.compiled.chunks):
                 context["group_index"] = index
                 fixed_hidden, fixed_pre, aux = chunk(fixed_hidden, fixed_pre, fixed_positions, fixed_ids, self.engram)
@@ -128,26 +177,67 @@ class StageVariant(torch.nn.Module):
 
 
 class StageReplay:
+
     def __init__(self, program):
+        from vllm_gaudi import envs
         self.program = weakref.ref(program)
         self.variants = {}
+        self.native_input_enabled = (envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH and program.pp_rank == 0)
+        self.input_seed = None
 
-    def __call__(self, hidden, pre_mix, positions, input_ids, engram, pp_wire=None, fused_text_io=False):
-        tokens = input_ids.numel()
-        if not 1 <= tokens <= 6:
-            raise ValueError("Native V4.1 verification requires between one and six real tokens")
+    def from_input_ids(self, positions, input_ids, engram):
         program = self.program()
+        if (not self.native_input_enabled or input_ids.numel() != 1 or program.dspark or program.fp8_decode):
+            raise ValueError("Native input capture requires enabled ordinary BF16 C1 PP0 decode")
+        if self.input_seed is None:
+            self.input_seed = (
+                torch.zeros(1, 4, 5120, device=input_ids.device, dtype=torch.bfloat16),
+                torch.zeros(1, 4, device=input_ids.device, dtype=torch.float32),
+            )
+        return self(*self.input_seed, positions, input_ids, engram, native_input=True)
+
+    @trace_phase
+    def __call__(self,
+                 hidden,
+                 pre_mix,
+                 positions,
+                 input_ids,
+                 engram,
+                 pp_wire=None,
+                 fused_text_io=False,
+                 native_input=False):
+        tokens = input_ids.numel()
+        program = self.program()
+        allowed = 1 <= tokens <= 6 if program.dspark else tokens == 1
+        if not allowed:
+            raise ValueError("V4.1 replay shape must match C1 decode or enabled C1-C6 DSpark verification")
+        if native_input and (not self.native_input_enabled or program.dspark or program.fp8_decode or tokens != 1):
+            raise ValueError("Native input capture requires enabled ordinary BF16 C1 PP0 decode")
         search = getattr(program, "search_length", 512)
-        key = (tokens, search, fused_text_io)
+        key = ((tokens,
+                "input") if native_input else tokens if search <= 512 and not fused_text_io and pp_wire is None else
+               (tokens, search, fused_text_io))
         if key not in self.variants:
-            self.variants[key] = StageVariant(program, hidden, pre_mix, positions, input_ids, engram, pp_wire, fused_text_io)
-        return self.variants[key](hidden, pre_mix, positions, input_ids, engram, pp_wire, fused_text_io)
+            self.variants[key] = StageVariant(program,
+                                              hidden,
+                                              pre_mix,
+                                              positions,
+                                              input_ids,
+                                              engram,
+                                              pp_wire,
+                                              fused_text_io,
+                                              native_input=native_input)
+        return self.variants[key](hidden, pre_mix, positions, input_ids, engram, pp_wire, fused_text_io, native_input)
 
     def require_ready(self, tokens, search=512):
         from vllm_gaudi.ops.tp2_prepared_plan import _native_entries
         from vllm_gaudi import envs
-        fused = self.program().pp_rank == 0 and envs.VLLM_HPU_DSV41_FUSED_STAGE_IO
-        variant = self.variants.get((tokens, search, fused))
+        program = self.program()
+        native_input = (self.native_input_enabled and tokens == 1 and not program.dspark and not program.fp8_decode)
+        fused = (program.pp_rank == 0 and envs.VLLM_HPU_DSV41_FUSED_STAGE_IO)
+        key = ((tokens, "input") if native_input else tokens if search <= 512 and not fused else
+               (tokens, search, fused))
+        variant = self.variants.get(key)
         if variant is None or variant not in _native_entries:
             raise RuntimeError("V4.1 warmup did not capture its complete native stage; serving cannot start")
 
@@ -156,10 +246,12 @@ class StageReplay:
         for variant in self.variants.values():
             invalidate_prepared_group_plans(owner=variant, reason="stage_close")
         self.variants.clear()
+        self.input_seed = None
 
 
 class _PagedSnapshot:
     """Capture saves only the rows a target invocation can overwrite."""
+
     def __init__(self, program, positions, states):
         from vllm_gaudi.ops.deepseek_v41_paged_attention import PAGE_TOKENS
         pooled = {id(getattr(cache, name)) for cache in program.shared.sources.values() for name in ("main", "index")}

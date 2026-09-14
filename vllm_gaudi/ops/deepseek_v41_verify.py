@@ -69,8 +69,7 @@ def verify_control_from_target(target, proposed, metadata):
     output = torch.where(out_lane < output_count, candidates, -1)
     anchor_index = (output_count - 1).clamp(0, 5).long()
     anchor = output.gather(0, anchor_index).clamp_min(0)
-    draft_enabled = (sample.bool() & (remaining - output_count >= 6)
-                     & (start + committed + 6 <= limit))
+    draft_enabled = (sample.bool() & (remaining - output_count >= 6) & (start + committed + 6 <= limit))
     valid = ((generation > 0) & (count >= 1) & (count <= 6)
              & (proposal_count >= 0) & (proposal_count <= 5)
              & ((proposal_count == 0) | (proposal_count + 1 == count))
@@ -86,8 +85,8 @@ def verify_control(logits, proposed, metadata):
 
 def pack_record(metadata, committed, output_count, output, draft_ids, draft_enabled, status):
     draft_count = torch.where(draft_enabled, 5, 0).long().reshape(1)
-    return torch.cat((metadata[:1], committed.long(), output_count.long(), draft_count,
-                      output.long(), torch.where(draft_enabled, draft_ids, -1).long(), status))
+    return torch.cat((metadata[:1], committed.long(), output_count.long(), draft_count, output.long(),
+                      torch.where(draft_enabled, draft_ids, -1).long(), status))
 
 
 def encode_record_wire(record):
@@ -109,8 +108,7 @@ def encode_record_wire(record):
 def decode_record_wire(wire):
     """Reconstruct the signed int64 commit record from byte-valued BF16."""
     encoded = wire.to(torch.int32).reshape(-1, 4).to(torch.int64)
-    multipliers = torch.tensor([1, 1 << 8, 1 << 16, 1 << 24],
-                               dtype=torch.int64, device=wire.device)
+    multipliers = torch.tensor([1, 1 << 8, 1 << 16, 1 << 24], dtype=torch.int64, device=wire.device)
     unsigned = (encoded * multipliers).sum(-1)
     return torch.where(unsigned >= (1 << 31), unsigned - (1 << 32), unsigned)
 
@@ -202,11 +200,13 @@ class VerifyRing:
         self.wires = ([torch.empty(RECORD_SIZE * 4, dtype=torch.bfloat16, device=device)
                        for _ in range(size)] if last_rank else [None] * size)
         self.commit_records = ([torch.empty(RECORD_SIZE, dtype=torch.int64, device=device)
-                               for _ in range(size)] if last_rank else [None] * size)
+                                for _ in range(size)] if last_rank else [None] * size)
         self.commit_wires = ([torch.empty(RECORD_SIZE * 4, dtype=torch.bfloat16, device=device)
-                             for _ in range(size)] if last_rank else [None] * size)
-        self.host = [torch.empty(RECORD_SIZE if last_rank else 8, dtype=torch.int64,
-                                 device="cpu").pin_memory("hpu") for _ in range(size)]
+                              for _ in range(size)] if last_rank else [None] * size)
+        self.host = [
+            torch.empty(RECORD_SIZE if last_rank else 8, dtype=torch.int64, device="cpu").pin_memory("hpu")
+            for _ in range(size)
+        ]
         self.events = [torch.hpu.Event() for _ in range(size)]
         self.generations, self.consumed = [0] * size, [0] * size
         self.generation, self.closed = 0, False
@@ -229,8 +229,7 @@ class VerifyRing:
             raise RuntimeError("DSpark verify slot still has an unconsumed result")
         self.generations[slot] = self.generation
         return DeviceVerifyResult(slot, self.generation, self.records[slot], self.wires[slot], self.host[slot],
-                                  self.events[slot], max_committed,
-                                  self.commit_records[slot], self.commit_wires[slot])
+                                  self.events[slot], max_committed, self.commit_records[slot], self.commit_wires[slot])
 
     def stage(self, ticket):
         self._check(ticket)
@@ -254,8 +253,7 @@ class VerifyRing:
         values = ticket.host.tolist()  # pinned CPU data; never a device read
         if self.last_rank:
             generation, committed, output_count, draft_count = values[:4]
-            if (generation != ticket.generation or values[STATUS] != 0
-                    or not 1 <= committed <= ticket.max_committed
+            if (generation != ticket.generation or values[STATUS] != 0 or not 1 <= committed <= ticket.max_committed
                     or not 0 <= output_count <= 6 or not 0 <= draft_count <= 5):
                 raise RuntimeError("Invalid DSpark device verify generation or counts")
             output, draft = values[4:4 + output_count], values[10:10 + draft_count]

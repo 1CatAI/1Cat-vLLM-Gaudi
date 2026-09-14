@@ -12,12 +12,12 @@ class Sync(C.Structure):
 
 
 class Info(C.Structure):
-    _fields_ = [("state", C.c_int), ("segments", C.c_uint64), ("replays", C.c_uint64),
-                ("completion_index", C.c_uint32), ("completion_target", C.c_uint64),
-                ("program_bytes", C.c_uint64), ("arc_bytes", C.c_uint64)]
+    _fields_ = [("state", C.c_int), ("segments", C.c_uint64), ("replays", C.c_uint64), ("completion_index", C.c_uint32),
+                ("completion_target", C.c_uint64), ("program_bytes", C.c_uint64), ("arc_bytes", C.c_uint64)]
 
 
 class ComponentReplay:
+
     def __init__(self, compiled, inputs, *, single_recipe=False, single_segment=True, prepare=None):
         if not os.environ.get("DSV41_RUN_EVIDENCE"):
             raise RuntimeError("Component capture requires an owned diagnostic run")
@@ -27,12 +27,18 @@ class ComponentReplay:
         self.accessor = probe.dsv41GroupedDiagnosticDefaultStream
         specifications = {
             "Create": [C.POINTER(C.c_void_p), C.c_void_p],
-            "BeginCapture": [C.c_void_p], "EndCapture": [C.c_void_p], "AbortCapture": [C.c_void_p],
-            "GetInfo": [C.c_void_p, C.POINTER(Info)], "Destroy": [C.c_void_p],
-            "PreparePlan": [C.c_void_p, C.POINTER(C.c_uint32), C.c_uint64, C.c_uint32, C.c_void_p, C.c_void_p],
+            "BeginCapture": [C.c_void_p],
+            "EndCapture": [C.c_void_p],
+            "AbortCapture": [C.c_void_p],
+            "GetInfo": [C.c_void_p, C.POINTER(Info)],
+            "Destroy": [C.c_void_p],
+            "PreparePlan": [C.c_void_p,
+                            C.POINTER(C.c_uint32), C.c_uint64, C.c_uint32, C.c_void_p, C.c_void_p],
             "ReplayPlan": [C.c_void_p, C.POINTER(Sync), C.POINTER(C.c_uint64), C.c_uint64],
             "BeginReplay": [C.c_void_p],
-            "ReplaySegment": [C.c_void_p, C.c_uint64, C.POINTER(Sync), C.c_uint8, C.POINTER(Sync)],
+            "ReplaySegment": [C.c_void_p, C.c_uint64,
+                              C.POINTER(Sync), C.c_uint8,
+                              C.POINTER(Sync)],
         }
         if single_recipe:
             specifications.update(PrepareOrderedReplay=[C.c_void_p], ReplayOrdered=[C.c_void_p])
@@ -56,8 +62,8 @@ class ComponentReplay:
             capturing = False
             torch.hpu.synchronize()
             captured_info = self.info()
-            (Path(os.environ["DSV41_RUN_EVIDENCE"]) / "capture-info.json").write_text(
-                json.dumps(captured_info, indent=2) + "\n")
+            (Path(os.environ["DSV41_RUN_EVIDENCE"]) /
+             "capture-info.json").write_text(json.dumps(captured_info, indent=2) + "\n")
             if prepare is not None:
                 prepare(self.runtime, self.handle, captured_info["segments"])
             if single_segment:

@@ -18,6 +18,10 @@ extern unsigned char
     _binary___deepseek_v4_sparse_attn_bf16_lengths_gaudi2_o_start;
 extern unsigned char
     _binary___deepseek_v4_sparse_attn_bf16_lengths_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_sparse_attn_pair_exp_bf16_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_sparse_attn_pair_exp_bf16_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_sparse_attn_head_pair_bf16_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_sparse_attn_head_pair_bf16_gaudi2_o_end;
 
 extern unsigned char _binary___deepseek_v41_sparse_attn_packed_exp_bf16_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_sparse_attn_packed_exp_bf16_gaudi2_o_end;
@@ -58,7 +62,11 @@ tpc_lib_api::GlueCodeReturn DeepseekV4SparseAttnBF16Gaudi2::GetKernelName(
 {
     std::strcpy(
         kernelName,
-        m_mode == PACKED_EXP_LENGTHS
+        m_mode == HEAD_PAIR_LENGTHS
+            ? "custom_deepseek_v41_sparse_attn_head_pair_bf16_gaudi2"
+            : m_mode == PAIRED_EXP_LENGTHS
+            ? "custom_deepseek_v41_sparse_attn_pair_exp_bf16_gaudi2"
+            : m_mode == PACKED_EXP_LENGTHS
             ? "custom_deepseek_v41_sparse_attn_packed_exp_bf16_gaudi2" :
         m_mode != WIDTH_ONLY
             ? "custom_deepseek_v4_sparse_attn_bf16_lengths_gaudi2"
@@ -131,6 +139,10 @@ DeepseekV4SparseAttnBF16Gaudi2::GetGcDefinitions(
     const uint64_t batchSize = q.geometry.maxSizes[2];
     const uint64_t sequenceLength = kv.geometry.maxSizes[1];
     const uint64_t topkWidth = indices.geometry.maxSizes[0];
+    const unsigned headsPerPoint = m_mode == HEAD_PAIR_LENGTHS ? 2 : 1;
+    if (headCount == 0 || headCount % headsPerPoint != 0) {
+        return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_SIZE;
+    }
     const bool inputsMatch =
         q.geometry.maxSizes[0] == kHeadDim &&
         kv.geometry.maxSizes[0] == kHeadDim && sequenceLength > 0 &&
@@ -167,24 +179,24 @@ DeepseekV4SparseAttnBF16Gaudi2::GetGcDefinitions(
 
     outDefs->indexSpaceRank = 3;
     outDefs->indexSpaceGeometry[0] = 1;
-    outDefs->indexSpaceGeometry[1] = headCount;
+    outDefs->indexSpaceGeometry[1] = headCount / headsPerPoint;
     outDefs->indexSpaceGeometry[2] = batchSize;
 
     // q/output: [D, H, B]
     MapDimension(outDefs->inputTensorAccessPattern[0], 0, 0, 512, 0, 511);
-    MapDimension(outDefs->inputTensorAccessPattern[0], 1, 1, 1, 0, 0);
+    MapDimension(outDefs->inputTensorAccessPattern[0], 1, 1, headsPerPoint, 0, headsPerPoint - 1);
     MapDimension(outDefs->inputTensorAccessPattern[0], 2, 2, 1, 0, 0);
     MapDimension(outDefs->outputTensorAccessPattern[0], 0, 0, 512, 0, 511);
-    MapDimension(outDefs->outputTensorAccessPattern[0], 1, 1, 1, 0, 0);
+    MapDimension(outDefs->outputTensorAccessPattern[0], 1, 1, headsPerPoint, 0, headsPerPoint - 1);
     MapDimension(outDefs->outputTensorAccessPattern[0], 2, 2, 1, 0, 0);
     for (unsigned statsOutput = 1; statsOutput <= 2; ++statsOutput) {
         MapDimension(
             outDefs->outputTensorAccessPattern[statsOutput],
             0,
             1,
-            1,
+            headsPerPoint,
             0,
-            0);
+            headsPerPoint - 1);
         MapDimension(
             outDefs->outputTensorAccessPattern[statsOutput],
             1,
@@ -215,7 +227,7 @@ DeepseekV4SparseAttnBF16Gaudi2::GetGcDefinitions(
     MapDimension(outDefs->inputTensorAccessPattern[2], 1, 2, 1, 0, 0);
 
     // sink: [H], scale: [1]
-    MapDimension(outDefs->inputTensorAccessPattern[3], 0, 1, 1, 0, 0);
+    MapDimension(outDefs->inputTensorAccessPattern[3], 0, 1, headsPerPoint, 0, headsPerPoint - 1);
     MapDimension(outDefs->inputTensorAccessPattern[4], 0, 0, 0, 0, 0);
     if (topkLengths != nullptr) {
         // topk_lengths: [B]
@@ -225,13 +237,21 @@ DeepseekV4SparseAttnBF16Gaudi2::GetGcDefinitions(
 
     outDefs->kernel.paramsNr = 0;
     const unsigned char* isaStart =
-        m_mode == PACKED_EXP_LENGTHS
+        m_mode == HEAD_PAIR_LENGTHS
+        ? &_binary___deepseek_v41_sparse_attn_head_pair_bf16_gaudi2_o_start
+        : m_mode == PAIRED_EXP_LENGTHS
+        ? &_binary___deepseek_v41_sparse_attn_pair_exp_bf16_gaudi2_o_start
+        : m_mode == PACKED_EXP_LENGTHS
         ? &_binary___deepseek_v41_sparse_attn_packed_exp_bf16_gaudi2_o_start :
         m_mode != WIDTH_ONLY
         ? &_binary___deepseek_v4_sparse_attn_bf16_lengths_gaudi2_o_start
         : &_binary___deepseek_v4_sparse_attn_bf16_gaudi2_o_start;
     const unsigned char* isaEnd =
-        m_mode == PACKED_EXP_LENGTHS
+        m_mode == HEAD_PAIR_LENGTHS
+        ? &_binary___deepseek_v41_sparse_attn_head_pair_bf16_gaudi2_o_end
+        : m_mode == PAIRED_EXP_LENGTHS
+        ? &_binary___deepseek_v41_sparse_attn_pair_exp_bf16_gaudi2_o_end
+        : m_mode == PACKED_EXP_LENGTHS
         ? &_binary___deepseek_v41_sparse_attn_packed_exp_bf16_gaudi2_o_end :
         m_mode != WIDTH_ONLY
         ? &_binary___deepseek_v4_sparse_attn_bf16_lengths_gaudi2_o_end

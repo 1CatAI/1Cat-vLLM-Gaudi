@@ -26,6 +26,7 @@ def test_prepared_n256_keeps_all_original_codes(n, k):
 
 
 class InputProjection(FusedQKVInput, nn.Module):
+
     def __init__(self, quantized):
         super().__init__()
         self.weights = nn.Module()
@@ -39,8 +40,7 @@ class InputProjection(FusedQKVInput, nn.Module):
         self.qkv_fused_input = True
         self._fused_qkv_weight = None
         self._fused_qkv_quantized = False
-        self.linear = lambda value, w: F.linear(quantize_activation(value) if hasattr(w, "scale") else value,
-                                                w.weight)
+        self.linear = lambda value, w: F.linear(quantize_activation(value) if hasattr(w, "scale") else value, w.weight)
 
 
 @pytest.mark.parametrize("tokens", range(1, 7))
@@ -54,7 +54,8 @@ def test_qkv_c6_rows_and_reload(tokens, quantized):
         layer.prepare_qkv_input_weight()
         actual = layer._project_qkv_input(x)
         assert all(torch.equal(a, b) for a, b in zip(actual, expected, strict=True))
-        assert layer.weights.wq_a.weight.untyped_storage().data_ptr() == layer.fused_wqa_wkv.untyped_storage().data_ptr()
+        assert layer.weights.wq_a.weight.untyped_storage().data_ptr() == layer.fused_wqa_wkv.untyped_storage().data_ptr(
+        )
         assert layer.weights.wkv.weight.untyped_storage().data_ptr() == layer.fused_wqa_wkv.untyped_storage().data_ptr()
         layer.invalidate_qkv_input_weight()
         layer.weights.wq_a.weight = torch.randn_like(layer.weights.wq_a.weight)

@@ -9,14 +9,14 @@ WIRE_ELEMENTS = HIDDEN_ELEMENTS + HIDDEN_SLOTS * 4
 
 
 def encode_pp_wire(hidden, pre_mix):
-    if (hidden.dtype != torch.bfloat16 or hidden.ndim != 3
-            or hidden.shape[1:] != (HIDDEN_SLOTS, HIDDEN_WIDTH)
+    if (hidden.dtype != torch.bfloat16 or hidden.ndim != 3 or hidden.shape[1:] != (HIDDEN_SLOTS, HIDDEN_WIDTH)
             or pre_mix.dtype != torch.float32 or pre_mix.shape != hidden.shape[:2]):
         raise ValueError("Invalid V4.1 PP stage output contract")
     bits = pre_mix.contiguous().view(torch.int32).to(torch.int64)
     lanes = torch.stack(tuple((bits >> shift) & 255 for shift in (0, 8, 16, 24)), -1)
-    return torch.cat((hidden.reshape(hidden.shape[0], HIDDEN_ELEMENTS),
-                      lanes.to(torch.bfloat16).reshape(hidden.shape[0], HIDDEN_SLOTS * 4)), dim=1)
+    return torch.cat((hidden.reshape(hidden.shape[0], HIDDEN_ELEMENTS), lanes.to(torch.bfloat16).reshape(
+        hidden.shape[0], HIDDEN_SLOTS * 4)),
+                     dim=1)
 
 
 def decode_pre_mix(wire):

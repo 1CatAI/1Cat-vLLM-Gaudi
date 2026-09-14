@@ -12,9 +12,13 @@ def tensor_info(text):
     shape = re.search(r"Sizes = (\[[^\]]+\])", text)
     size = re.search(r"sizeInBytes = (\d+)", text)
     location = re.search(r"location = in (\w+)", text)
-    return {"name": text.split("  |", 1)[0], "description": text,
-            "shape": json.loads(shape[1]) if shape else None,
-            "bytes": int(size[1]) if size else None, "location": location[1] if location else None}
+    return {
+        "name": text.split("  |", 1)[0],
+        "description": text,
+        "shape": json.loads(shape[1]) if shape else None,
+        "bytes": int(size[1]) if size else None,
+        "location": location[1] if location else None
+    }
 
 
 def audit(path):
@@ -32,24 +36,47 @@ def audit(path):
         if op[1].startswith(prefixes):
             decode.append({"node": name[1], "output": tensor_info(attrs["outputTensor:0"])})
         if "gemm" in op[1].lower():
-            matrix.append({"node": name[1], "op": op[1], "activation": tensor_info(attrs.get("inputTensor:0", "")),
-                           "weight": tensor_info(attrs.get("inputTensor:1", "")),
-                           "output": tensor_info(attrs.get("outputTensor:0", ""))})
+            matrix.append({
+                "node": name[1],
+                "op": op[1],
+                "activation": tensor_info(attrs.get("inputTensor:0", "")),
+                "weight": tensor_info(attrs.get("inputTensor:1", "")),
+                "output": tensor_info(attrs.get("outputTensor:0", ""))
+            })
     decoded_names = {node["output"]["name"] for node in decode}
     expert_matrices = [node for node in matrix if node["weight"]["name"] in decoded_names]
     if not expert_matrices:
         return None  # A standalone decoder output is not an SRAM consumption proof.
-    consumers = {name: [node["node"] for node in expert_matrices if node["weight"]["name"] == name]
-                 for name in decoded_names}
-    return {"graph": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            "decode_node_count": len(decode), "mme_node_count": len(matrix),
-            "expert_mme_node_count": len(expert_matrices),
-            "decoded_bytes": sum(node["output"]["bytes"] or 0 for node in decode),
-            "all_decoded_weights_in_sram": bool(decode) and all(node["output"]["location"] == "SRAM" for node in decode),
-            "all_mme_weights_in_sram": bool(expert_matrices) and all(
-                node["weight"]["location"] == "SRAM" for node in expert_matrices),
-            "all_decoded_weights_consumed_once": bool(consumers) and all(len(nodes) == 1 for nodes in consumers.values()),
-            "decode": decode, "matrix": matrix, "decode_consumers": consumers}
+    consumers = {
+        name: [node["node"] for node in expert_matrices if node["weight"]["name"] == name]
+        for name in decoded_names
+    }
+    return {
+        "graph":
+        str(path),
+        "sha256":
+        hashlib.sha256(path.read_bytes()).hexdigest(),
+        "decode_node_count":
+        len(decode),
+        "mme_node_count":
+        len(matrix),
+        "expert_mme_node_count":
+        len(expert_matrices),
+        "decoded_bytes":
+        sum(node["output"]["bytes"] or 0 for node in decode),
+        "all_decoded_weights_in_sram":
+        bool(decode) and all(node["output"]["location"] == "SRAM" for node in decode),
+        "all_mme_weights_in_sram":
+        bool(expert_matrices) and all(node["weight"]["location"] == "SRAM" for node in expert_matrices),
+        "all_decoded_weights_consumed_once":
+        bool(consumers) and all(len(nodes) == 1 for nodes in consumers.values()),
+        "decode":
+        decode,
+        "matrix":
+        matrix,
+        "decode_consumers":
+        consumers
+    }
 
 
 def main():
@@ -62,8 +89,11 @@ def main():
         raise RuntimeError("No compiled V4.1 MoE graphs found")
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     for entry in result:
-        print(json.dumps({key: value for key, value in entry.items()
-                          if key not in ("decode", "matrix", "decode_consumers")}))
+        print(
+            json.dumps({
+                key: value
+                for key, value in entry.items() if key not in ("decode", "matrix", "decode_consumers")
+            }))
     if not all(entry["all_decoded_weights_in_sram"] and entry["all_mme_weights_in_sram"]
                and entry["all_decoded_weights_consumed_once"] for entry in result):
         raise SystemExit("Candidate did not satisfy SRAM placement")

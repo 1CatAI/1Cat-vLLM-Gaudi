@@ -2,6 +2,13 @@
 #include "deepseek_v4_mxfp4_prepared_dequant_bf16_gaudi2.hpp"
 #include <cstring>
 
+extern unsigned char _binary___deepseek_v41_mxfp4_prepared_dequant_pipe_bf16_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_mxfp4_prepared_dequant_pipe_bf16_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_mxfp4_prepared_dequant_k128_bf16_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_mxfp4_prepared_dequant_k128_bf16_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_mxfp4_prepared_dequant_k128_normal_bf16_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_mxfp4_prepared_dequant_k128_normal_bf16_gaudi2_o_end;
+
 extern unsigned char _binary___deepseek_v41_mxfp4_n512_dequant_bf16_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_mxfp4_n512_dequant_bf16_gaudi2_o_end;
 extern unsigned char _binary___deepseek_v41_mxfp4_n512_dequant_normal_bf16_gaudi2_o_start;
@@ -33,7 +40,12 @@ extern unsigned char _binary___deepseek_v4_mxfp4_prepared_dequant_up_normal_bf16
 tpc_lib_api::GlueCodeReturn DeepseekV4Mxfp4PreparedDequantBF16Gaudi2::GetKernelName(
     char name[tpc_lib_api::MAX_NODE_NAME]) {
     const char* kernel = nullptr;
-    if (window_) {
+    if (legacy_ == 2) {
+        kernel = "custom_deepseek_v41_mxfp4_prepared_dequant_pipe_bf16_gaudi2";
+    } else if (legacy_ == 1) {
+        kernel = normal_ ? "custom_deepseek_v41_mxfp4_prepared_dequant_k128n_bf16_gaudi2"
+                         : "custom_deepseek_v41_mxfp4_prepared_dequant_k128_bf16_gaudi2";
+    } else if (window_) {
         kernel = normal_ ? "custom_deepseek_v41_mxfp4_n512_dequant_normal_bf16_gaudi2"
                          : "custom_deepseek_v41_mxfp4_n512_dequant_bf16_gaudi2";
     } else if (tiled_) {
@@ -63,6 +75,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV4Mxfp4PreparedDequantBF16Gaudi2::GetGcDefin
     tpc_lib_api::HabanaKernelParams* in, tpc_lib_api::HabanaKernelInstantiation* out) {
     using namespace tpc_lib_api;
     if (tiled_ && (!v41_ || shared_ || half_ >= 0)) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+    if (legacy_ == 2 && !normal_) return GLUE_INCOMPATIBLE_INPUT_SIZE;
     if (window_ && !tiled_) return GLUE_INCOMPATIBLE_INPUT_SIZE;
     const unsigned inputs = shared_ ? 5 : 4;
     if (in->inputTensorNr != inputs) {
@@ -167,7 +180,16 @@ tpc_lib_api::GlueCodeReturn DeepseekV4Mxfp4PreparedDequantBF16Gaudi2::GetGcDefin
     if (window_) out->kernel.scalarParams[0] = nBlockOffset;
     const unsigned char* start = nullptr;
     const unsigned char* end = nullptr;
-    if (window_ && normal_) {
+    if (legacy_ == 2) {
+        start = &_binary___deepseek_v41_mxfp4_prepared_dequant_pipe_bf16_gaudi2_o_start;
+        end = &_binary___deepseek_v41_mxfp4_prepared_dequant_pipe_bf16_gaudi2_o_end;
+    } else if (legacy_ == 1 && normal_) {
+        start = &_binary___deepseek_v41_mxfp4_prepared_dequant_k128_normal_bf16_gaudi2_o_start;
+        end = &_binary___deepseek_v41_mxfp4_prepared_dequant_k128_normal_bf16_gaudi2_o_end;
+    } else if (legacy_ == 1) {
+        start = &_binary___deepseek_v41_mxfp4_prepared_dequant_k128_bf16_gaudi2_o_start;
+        end = &_binary___deepseek_v41_mxfp4_prepared_dequant_k128_bf16_gaudi2_o_end;
+    } else if (window_ && normal_) {
         start = &_binary___deepseek_v41_mxfp4_n512_dequant_normal_bf16_gaudi2_o_start;
         end = &_binary___deepseek_v41_mxfp4_n512_dequant_normal_bf16_gaudi2_o_end;
     } else if (window_) {

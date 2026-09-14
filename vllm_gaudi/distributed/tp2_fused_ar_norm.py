@@ -121,8 +121,7 @@ def initialize_tp2_fused_ar_norm_runtime() -> None:
         # V4.1's single C6 PP wire is 122976 BF16 elements, so only that
         # explicitly opted-in PP path raises the HCL limit.  Do not change
         # the contract of existing TP-only profiles.
-        direct_max_count = ("262144" if os.environ.get("VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE") == "1"
-                            else "163840")
+        direct_max_count = ("262144" if os.environ.get("VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE") == "1" else "163840")
         required_environment.update({
             "HCCL_PRIM_COLLECTIVE_MASK": "0",
             "HCL_TP2_DIRECT_NIC_RS_AR": "0",
@@ -195,7 +194,7 @@ def initialize_tp2_fused_ar_norm_runtime() -> None:
         pp_probe = torch.ones(128, dtype=torch.bfloat16, device="hpu")
         dist.all_reduce(pp_probe, group=pp_group)
         torch.hpu.synchronize()
-        if not torch.equal(pp_probe.cpu(), torch.full((128,), 2, dtype=torch.bfloat16, device="cpu")):
+        if not torch.equal(pp_probe.cpu(), torch.full((128, ), 2, dtype=torch.bfloat16, device="cpu")):
             raise RuntimeError("V4.1 PP HCCL process-group initialization failed")
         pp_backend = pp_group._get_backend(torch.device("hpu"))
         pp_communicator_id = bridge.communicator_id(pp_backend)
@@ -223,9 +222,9 @@ def initialize_tp2_fused_ar_norm_runtime() -> None:
     if envs.VLLM_HPU_TP2_STATIC_GROUP_PLAN:
         log.info("TP2 prepared runtime: checking runtime fingerprints")
         _verify_prepared_runtime(bridge_path)
-        if not envs.VLLM_HPU_TP2_PREPARED_COMM or not (
-                envs.VLLM_HPU_GDN_DIRECT_STATE_UPDATE or envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH
-                or envs.VLLM_HPU_DSV41_GRAPH_REPLAY):
+        if not envs.VLLM_HPU_TP2_PREPARED_COMM or not (envs.VLLM_HPU_GDN_DIRECT_STATE_UPDATE
+                                                       or envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH
+                                                       or envs.VLLM_HPU_DSV41_GRAPH_REPLAY):
             raise RuntimeError("Prepared TP2 groups require direct state update and prepared communication")
         from vllm_gaudi.ops.tp2_prepared_plan import register_tp2_prepared_group_pass
 

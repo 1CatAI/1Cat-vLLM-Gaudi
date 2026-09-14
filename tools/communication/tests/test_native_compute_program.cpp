@@ -54,6 +54,28 @@ int main()
     auto shared = NativeComputeProgram::prepare({&pre, &post}, {1, 1}, wait, 16, 256);
     assert(shared.producerOffsets == std::vector<uint64_t>({2, 2}));
     assert(shared.completionDelta == program.completionDelta);
+    auto overlap = NativeComputeProgram::prepare({&pre, &pre, &post}, {2}, wait, 16, 256,
+                                                  false, false, {0});
+    assert(overlap.producerOffsets == std::vector<uint64_t>{2});
+    assert(overlap.completionDelta == 6);
+    uint64_t priorCompletion = 0;
+    for (const auto& page : overlap.pages) {
+        if (!page.patches.empty()) assert(priorCompletion >= 4);
+        if (page.endsCompletion) priorCompletion = page.completionOffset;
+    }
+    auto distinct = NativeComputeProgram::prepare({&pre, &pre, &post}, {2, 2}, wait, 16, 256,
+                                                   false, false, {0, 1});
+    assert(distinct.producerOffsets == std::vector<uint64_t>({2, 4}));
+    auto delayedExternal = NativeComputeProgram::prepare({&pre, &post}, {1}, wait, 16, 128,
+                                                          false, true, {UINT32_MAX});
+    assert(delayedExternal.externalInputCompletion && delayedExternal.producerOffsets[0] == 0);
+    for (const auto& invalid : std::vector<std::vector<uint32_t>>{{2}, {3}, {UINT32_MAX}, {0, 1}}) {
+        bool bad = false;
+        try { NativeComputeProgram::prepare({&pre, &pre, &post}, {2}, wait, 16, 256,
+                                             false, false, invalid); }
+        catch (const std::invalid_argument&) { bad = true; }
+        assert(bad);
+    }
     std::array<unsigned, 2> wait_counts{};
     const Sync independent[] = {{8, 32767}, {8, 32768}};
     for (const auto& page : shared.pages) {

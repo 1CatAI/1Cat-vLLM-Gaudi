@@ -44,11 +44,16 @@ def prepared_group_stats():
         elif os.environ.get("VLLM_HPU_TP2_NATIVE_JOINT_PLAN", "0") == "1":
             raise RuntimeError("Native joint plan counters are unavailable")
     return {
-        "native_program_generation": _native_program_generation,
-        "native_captures": _native_captures,
-        "native_invalidations": dict(_native_invalidations),
-        "hcl_shared_stream_snapshots": hcl_streams,
-        "scheduled_mhc_exchanges": sum(module.scheduled_exchanges for module in tuple(_modules)),
+        "native_program_generation":
+        _native_program_generation,
+        "native_captures":
+        _native_captures,
+        "native_invalidations":
+        dict(_native_invalidations),
+        "hcl_shared_stream_snapshots":
+        hcl_streams,
+        "scheduled_mhc_exchanges":
+        sum(module.scheduled_exchanges for module in tuple(_modules)),
         "prepares":
         sum(module.prepares for module in tuple(_modules)),
         "native_joint_replays":
@@ -173,7 +178,7 @@ def _flush():
                 if groups == full_groups and context is not None and context.get("outputs") is not None:
                     from vllm_gaudi.ops.tp2_graph_inputs import FixedDecodeInputs
 
-                    bindings = FixedDecodeInputs(context["owner"], context, inputs)
+                    bindings = FixedDecodeInputs(context["owner"], context, inputs, native_bridge=bridge)
                     graph.bind_dynamic_inputs(bindings.tensors())
                     if v4 and bindings.state_tensors:
                         if not hasattr(graph, "bind_state_tensors"):
@@ -267,13 +272,20 @@ def _release_native_graphs(owner=None):
         _native_entries.clear()
     else:
         entry = _native_entries.pop(owner, None)
-        keys = [key for key, graph in _native_graphs.items()
-                if (_native_graph_owners.get(key, lambda: None)() is owner
-                    or (entry is not None and graph is entry[0]))]
+        keys = [
+            key for key, graph in _native_graphs.items()
+            if (_native_graph_owners.get(key, lambda: None)() is owner or (entry is not None and graph is entry[0]))
+        ]
     for key in keys:
         graph = _native_graphs[key]
-        graph.reset_slots()
-        graph.close()
+        try:
+            # A rejected cold capture has no replay slots to reset. Its
+            # partially retained programs must still reach close/abort.
+            state = getattr(graph, "state", None)
+            if state is None or state() == 2:  # NativeDecodeGraph::Instantiated
+                graph.reset_slots()
+        finally:
+            graph.close()
         del _native_graphs[key]
         _native_graph_owners.pop(key, None)
     if owner is None:
@@ -385,8 +397,8 @@ def _eligible(graph):
     v4 = gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH or gaudi_envs.VLLM_HPU_DSV41_GRAPH_REPLAY
     native = None if v4 else torch.ops.custom_op.gdn_state_update_out.default
     if not v4 and not any(child.op == "call_function" and child.target == native
-               for module in graph.modules() if type(module).__name__ == "HabanaGraphModule"
-               for child in module.fx_module.graph.nodes):
+                          for module in graph.modules() if type(module).__name__ == "HabanaGraphModule"
+                          for child in module.fx_module.graph.nodes):
         return False
     for node in graph.graph.nodes:
         if node.op in ("placeholder", "output", "get_attr"):
@@ -396,8 +408,8 @@ def _eligible(graph):
             if type(module).__name__ != "HabanaGraphModule" or module.is_dynamic or module._has_randoms:
                 raise RuntimeError("Prepared TP2 groups require static deterministic compiled recipes")
             continue
-        if node.op == "call_function" and (node.target in (operator.getitem, collective, peer_exchange, scheduled, plain,
-                                                           *_view_targets()) or _is_clear(node.target)):
+        if node.op == "call_function" and (node.target in (operator.getitem, collective, peer_exchange, scheduled,
+                                                           plain, *_view_targets()) or _is_clear(node.target)):
             continue
         if _is_static_scalar(node):
             continue
@@ -526,8 +538,8 @@ class PreparedGroupModule(torch.nn.Module):
             elif node.op == "call_function" and node.target in (peer_exchange, scheduled, plain):
                 arguments = slots(resolve(node.args[:1]))
                 ready_outputs = resolve(node.args[1]) if node.target == scheduled else ()
-                if not isinstance(ready_outputs, (tuple, list)) or not all(
-                        isinstance(value, _Slot) for value in ready_outputs):
+                if not isinstance(ready_outputs,
+                                  (tuple, list)) or not all(isinstance(value, _Slot) for value in ready_outputs):
                     raise RuntimeError("Scheduled TP2 outputs require prepared tensor producers")
                 if node.target == scheduled:
                     self.scheduled_exchanges += 1
@@ -578,10 +590,12 @@ class PreparedGroupModule(torch.nn.Module):
             path.mkdir(parents=True, exist_ok=True)
             stem = f"group{group}-{id(self)}-prepare{self.prepares}"
             (path / f"{stem}.py").write_text(self.original.print_readable(print_output=False))
-            nodes = [dict(name=node.name, kind="compute", recipe=self.original.get_submodule(node.target)._recipe_id)
-                     if node.op == "call_module" else dict(name=node.name, kind="exchange")
-                     for node in self.original.graph.nodes
-                     if node.op == "call_module" or node.target in (collective, peer_exchange, scheduled, plain)]
+            nodes = [
+                dict(name=node.name, kind="compute", recipe=self.original.get_submodule(node.target)._recipe_id)
+                if node.op == "call_module" else dict(name=node.name, kind="exchange")
+                for node in self.original.graph.nodes
+                if node.op == "call_module" or node.target in (collective, peer_exchange, scheduled, plain)
+            ]
             (path / f"{stem}.json").write_text(json.dumps(nodes, indent=2) + "\n")
         return warm(results)
 
@@ -639,7 +653,7 @@ def register_tp2_prepared_group_pass():
                 # is not qualified for native replay. No mHC/norm arithmetic
                 # is replaced, and every original reduction remains present.
                 with graph.inserting_before(node):
-                    peer = graph.call_function(torch.ops.vllm_gaudi.tp2_exchange_peer.default, (partial,))
+                    peer = graph.call_function(torch.ops.vllm_gaudi.tp2_exchange_peer.default, (partial, ))
                     reduced = graph.call_function(torch.ops.aten.add.Tensor, (partial, peer))
                     peer.meta = copy.copy(node.meta)
                     reduced.meta = copy.copy(node.meta)
@@ -650,8 +664,8 @@ def register_tp2_prepared_group_pass():
             if nodes:
                 graph.lint()
                 context.graph_module.recompile()
-                from habana_frameworks.torch.dynamo.compile_backend.passes import (
-                    pass_fake_propagation, pass_mark_placement)
+                from habana_frameworks.torch.dynamo.compile_backend.passes import (pass_fake_propagation,
+                                                                                   pass_mark_placement)
                 pass_fake_propagation(context)
                 pass_mark_placement(context)
             return bool(nodes)

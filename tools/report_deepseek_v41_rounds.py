@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: E501
 """Join four worker monotonic clocks with final scheduler consumption."""
 
 import argparse
@@ -54,12 +55,21 @@ def reconcile(workers, engine):
         end = max(record["scheduler_consumed_ns"], *(row["end_ns"] for row in rows))
         if record["scheduler_consumed_ns"] < start:
             raise ValueError(f"Scheduler completion precedes input preparation for {key}")
-        result.append(dict(request_id=key[0], generation=key[1], target_count=rows[0]["target_count"],
-                           proposed_count=rows[0]["proposed_count"], committed=rows[0]["committed"],
-                           output_count=rows[0]["output_count"], start_ns=start, end_ns=end,
-                           full_round_ms=(end - start) / 1e6,
-                           scheduler_consumed_ns=record["scheduler_consumed_ns"],
-                           workers={str(rank): row for rank, row in enumerate(rows)}))
+        result.append(
+            dict(request_id=key[0],
+                 generation=key[1],
+                 target_count=rows[0]["target_count"],
+                 proposed_count=rows[0]["proposed_count"],
+                 committed=rows[0]["committed"],
+                 output_count=rows[0]["output_count"],
+                 start_ns=start,
+                 end_ns=end,
+                 full_round_ms=(end - start) / 1e6,
+                 scheduler_consumed_ns=record["scheduler_consumed_ns"],
+                 workers={
+                     str(rank): row
+                     for rank, row in enumerate(rows)
+                 }))
     return result
 
 
@@ -75,13 +85,16 @@ def summarize(rows, discard):
         proposed = sum(row["proposed_count"] for row in steady)
         accepted = sum(row["committed"] - 1 for row in steady)
         summaries[request_id] = dict(steady_c6=stats([row["full_round_ms"] for row in steady]),
-            discarded_c6=min(discard, len(complete)), total_c6=len(complete),
-            c1=stats([row["full_round_ms"] for row in c1]),
-            partial_verify=stats([row["full_round_ms"] for row in tail]),
-            prefill=stats([row["full_round_ms"] for row in prefill]),
-            accepted_drafts=accepted, proposed_drafts=proposed,
-            acceptance_rate=accepted / proposed if proposed else None,
-            full_round_speed_pass=bool(steady) and mean(row["full_round_ms"] for row in steady) < 50)
+                                     discarded_c6=min(discard, len(complete)),
+                                     total_c6=len(complete),
+                                     c1=stats([row["full_round_ms"] for row in c1]),
+                                     partial_verify=stats([row["full_round_ms"] for row in tail]),
+                                     prefill=stats([row["full_round_ms"] for row in prefill]),
+                                     accepted_drafts=accepted,
+                                     proposed_drafts=proposed,
+                                     acceptance_rate=accepted / proposed if proposed else None,
+                                     full_round_speed_pass=bool(steady)
+                                     and mean(row["full_round_ms"] for row in steady) < 50)
     return summaries
 
 
@@ -99,13 +112,17 @@ def main():
         raise ValueError("Expected one EngineCore timing ledger")
     rows = reconcile(workers, json.loads(engines[0].read_text()))
     summaries = summarize(rows, args.discard)
-    result = dict(units="ms", boundary="earliest worker input preparation through latest worker commit or scheduler consume",
-                  discard=args.discard, requests=summaries, rounds=rows)
+    result = dict(units="ms",
+                  boundary="earliest worker input preparation through latest worker commit or scheduler consume",
+                  discard=args.discard,
+                  requests=summaries,
+                  rounds=rows)
     (args.run / "full-rounds.json").write_text(json.dumps(result, indent=2) + "\n")
-    lines = ["# DSpark 完整轮次", "", "四个 rank 输入准备最早时刻至所有 worker 提交及 scheduler 消费的最晚时刻。",
-             f"同主机 perf_counter_ns；无新增设备同步。每请求丢弃前 {args.discard} 个完整 C6，C1/尾部/prefill 单列。", "",
-             "| 请求 | 稳态 C6 数 | 平均 ms | P95 ms | 最大 ms | Draft 接受率 | <50 ms |",
-             "|---|---:|---:|---:|---:|---:|---|"]
+    lines = [
+        "# DSpark 完整轮次", "", "四个 rank 输入准备最早时刻至所有 worker 提交及 scheduler 消费的最晚时刻。",
+        f"同主机 perf_counter_ns；无新增设备同步。每请求丢弃前 {args.discard} 个完整 C6，C1/尾部/prefill 单列。", "",
+        "| 请求 | 稳态 C6 数 | 平均 ms | P95 ms | 最大 ms | Draft 接受率 | <50 ms |", "|---|---:|---:|---:|---:|---:|---|"
+    ]
     for request_id, summary in summaries.items():
         timing = summary["steady_c6"]
         if not timing["count"]:

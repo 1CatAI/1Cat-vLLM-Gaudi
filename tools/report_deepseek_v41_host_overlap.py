@@ -62,31 +62,69 @@ def analyze(analysis, capture, rank):
         matched = {key: intersections(span, spans, ends[key]) for key, spans in device.items()}
         overlap.extend(matched["TPC_or_MME"])
         enclosing = [name for start, end, name in phases if start <= span[0] <= span[1] <= end]
-        rows.append({**record, "row_copy_ms": (b - a) / 1e6, "enclosing_target_phases": enclosing,
-                     "overlap_ms": {key: duration(spans) / 1000 for key, spans in matched.items()}})
+        rows.append({
+            **record, "row_copy_ms": (b - a) / 1e6,
+            "enclosing_target_phases": enclosing,
+            "overlap_ms": {
+                key: duration(spans) / 1000
+                for key, spans in matched.items()
+            }
+        })
     summary = []
     for layer in (1, 14):
         selected = [row for row in rows if row["layer"] == layer]
         times = sorted(row["row_copy_ms"] for row in selected)
-        summary.append({"layer": layer, "calls": len(selected), "mean_row_copy_ms": statistics.mean(times),
-                        "p50_row_copy_ms": statistics.median(times), "max_row_copy_ms": max(times),
-                        "sum_row_copy_ms": sum(times),
-                        "calls_overlapping_recorded_compute": sum(row["overlap_ms"]["TPC_or_MME"] > 0
-                                                                  for row in selected),
-                        "sum_recorded_compute_overlap_ms": sum(row["overlap_ms"]["TPC_or_MME"] for row in selected),
-                        "major_faults": sum(row["major_faults"] for row in selected)})
-    return {"rank": rank, "pid": profile["pid"], "trace_sha256": inventory["trace_sha256"],
-            "host_profile_sha256": hashlib.sha256(source.read_bytes()).hexdigest(), "layers": summary,
-            "row_copy_union_ms": duration(host_spans) / 1000,
-            "recorded_compute_overlap_union_ms": duration(overlap) / 1000, "records": rows,
-            "host_clock_containment_check": {"target_annotations": len(phases),
-                "gathers_inside_exactly_one_target_phase": sum(len(row["enclosing_target_phases"]) == 1
-                                                               for row in rows), "gathers": len(rows)},
-            "clock_join": "native CLOCK_REALTIME nanoseconds minus profiler baseTimeNanoseconds",
-            "limitations": ["TPC/MME overlap is measured concurrency, not an end-to-end saving.",
-                            "Hardware timestamps use profiler host-clock calibration; residual error is unknown.",
-                            "Row-copy time excludes thread queue delay, staging copies and HPU DMA.",
-                            "Compute includes all recorded TPC/MME, including vision and capture where present."]}
+        summary.append({
+            "layer":
+            layer,
+            "calls":
+            len(selected),
+            "mean_row_copy_ms":
+            statistics.mean(times),
+            "p50_row_copy_ms":
+            statistics.median(times),
+            "max_row_copy_ms":
+            max(times),
+            "sum_row_copy_ms":
+            sum(times),
+            "calls_overlapping_recorded_compute":
+            sum(row["overlap_ms"]["TPC_or_MME"] > 0 for row in selected),
+            "sum_recorded_compute_overlap_ms":
+            sum(row["overlap_ms"]["TPC_or_MME"] for row in selected),
+            "major_faults":
+            sum(row["major_faults"] for row in selected)
+        })
+    return {
+        "rank":
+        rank,
+        "pid":
+        profile["pid"],
+        "trace_sha256":
+        inventory["trace_sha256"],
+        "host_profile_sha256":
+        hashlib.sha256(source.read_bytes()).hexdigest(),
+        "layers":
+        summary,
+        "row_copy_union_ms":
+        duration(host_spans) / 1000,
+        "recorded_compute_overlap_union_ms":
+        duration(overlap) / 1000,
+        "records":
+        rows,
+        "host_clock_containment_check": {
+            "target_annotations": len(phases),
+            "gathers_inside_exactly_one_target_phase": sum(len(row["enclosing_target_phases"]) == 1 for row in rows),
+            "gathers": len(rows)
+        },
+        "clock_join":
+        "native CLOCK_REALTIME nanoseconds minus profiler baseTimeNanoseconds",
+        "limitations": [
+            "TPC/MME overlap is measured concurrency, not an end-to-end saving.",
+            "Hardware timestamps use profiler host-clock calibration; residual error is unknown.",
+            "Row-copy time excludes thread queue delay, staging copies and HPU DMA.",
+            "Compute includes all recorded TPC/MME, including vision and capture where present."
+        ]
+    }
 
 
 def main():
@@ -96,9 +134,13 @@ def main():
     args = parser.parse_args()
     rows = [analyze(args.analysis, args.capture, rank) for rank in (0, 1)]
     coverage, qualification = coverage_qualification(args.analysis)
-    result = {"report_units": "ms", "analyzer_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-              "hardware_coverage_status": coverage["status"], "coverage_qualification": qualification,
-              "ranks": rows}
+    result = {
+        "report_units": "ms",
+        "analyzer_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "hardware_coverage_status": coverage["status"],
+        "coverage_qualification": qualification,
+        "ranks": rows
+    }
     (args.analysis / "engram-host-overlap.json").write_text(json.dumps(result, indent=2) + "\n")
     for row in rows:
         print(json.dumps({key: value for key, value in row.items() if key != "records"}), flush=True)

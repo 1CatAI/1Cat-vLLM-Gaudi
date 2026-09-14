@@ -16,7 +16,10 @@ def host_class(cat, name):
         return 'compile'
     if name.startswith(('synchronize', 'scal_completion_group_wait', 'hcclSynchronize')):
         return 'wait'
-    if name.startswith(('enqueue', 'scal_stream_submit', 'hcclAll', 'eventRecord', 'streamWaitEvent')) or name in ('Launch', 'launch', 'LaunchRecipe', 'launch_recipe', 'vllm_gaudi::native_decoder_enqueue', 'vllm_gaudi::native_decoder_publish'):
+    if name.startswith(
+        ('enqueue', 'scal_stream_submit', 'hcclAll', 'eventRecord',
+         'streamWaitEvent')) or name in ('Launch', 'launch', 'LaunchRecipe', 'launch_recipe',
+                                         'vllm_gaudi::native_decoder_enqueue', 'vllm_gaudi::native_decoder_publish'):
         return 'submit'
     if cat == 'hpu_op':
         return 'runtime_other'
@@ -39,7 +42,8 @@ def intersections(a, b, spans, ends):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('run', type=Path)
-    parser.add_argument('--stable-replay', action='store_true',
+    parser.add_argument('--stable-replay',
+                        action='store_true',
                         help='Both stages use one native entry; input preparation may contain compiled tensor updates')
     args = parser.parse_args()
     root = args.run
@@ -88,16 +92,21 @@ def main():
                         classes[label].extend(clipped)
         rows = []
         for key, spans in named.items():
-            rows.append(dict(tid=key[0], cat=key[1], name=key[2],
-                             gap_overlap_ms=sum(b-a for a,b in merge(spans))/len(gens)/1000,
-                             calls=counts[key]))
+            rows.append(
+                dict(tid=key[0],
+                     cat=key[1],
+                     name=key[2],
+                     gap_overlap_ms=sum(b - a for a, b in merge(spans)) / len(gens) / 1000,
+                     calls=counts[key]))
         rows.sort(key=lambda x: -x['gap_overlap_ms'])
         boundaries = collections.defaultdict(list)
         for a, b in allgaps:
-            boundaries[a].append(('gap', 1)); boundaries[b].append(('gap', -1))
+            boundaries[a].append(('gap', 1))
+            boundaries[b].append(('gap', -1))
         for label, spans in classes.items():
             for a, b in merge(spans):
-                boundaries[a].append((label, 1)); boundaries[b].append((label, -1))
+                boundaries[a].append((label, 1))
+                boundaries[b].append((label, -1))
         active, ledger = collections.Counter(), collections.Counter()
         points = sorted(boundaries)
         blank = []
@@ -106,20 +115,21 @@ def main():
                 active[label] += delta
             if active['gap']:
                 key = '|'.join(sorted(k for k, n in active.items() if n and k != 'gap')) or 'unobserved_host'
-                ledger[key] += (b-a)/len(gens)/1000
+                ledger[key] += (b - a) / len(gens) / 1000
                 if key == 'unobserved_host':
-                    blank.append([a,b])
+                    blank.append([a, b])
         (out / f'rank{rank}-host-blank.json').write_text(json.dumps(merge(blank)))
         host_events.sort()
         phases = []
         phase_totals = collections.Counter()
         for gen, gaps_gen in gens.items():
             w = windows[rank][gen]
-            lo = w['record']['host']['round_start']/1000 + w['host_to_trace_us']
-            hi = w['record']['host']['target_submit_done']/1000 + w['host_to_trace_us']
+            lo = w['record']['host']['round_start'] / 1000 + w['host_to_trace_us']
+            hi = w['record']['host']['target_submit_done'] / 1000 + w['host_to_trace_us']
             inventory = json.loads((root / f'trace-analysis/rank{rank}/inventory.json').read_text())
-            pid = str(next(e['pid'] for e in inventory['metadata']
-                           if e['name'] == 'process_name' and e.get('args', {}).get('name', '').startswith('VLLM::Worker')))
+            pid = str(
+                next(e['pid'] for e in inventory['metadata']
+                     if e['name'] == 'process_name' and e.get('args', {}).get('name', '').startswith('VLLM::Worker')))
             es = [e for e in host_events if lo <= e[0] < hi]
             chunks = [e for e in es if e[3] == pid and e[5].startswith('Torch-Compiled Region')]
             replays = [e for e in es if e[3] == pid and e[5] == 'vllm_gaudi::native_decoder_enqueue']
@@ -142,7 +152,7 @@ def main():
                     last = chunks[-1][0] + chunks[-1][1]
                     sync = [e for e in es if e[0] >= last and e[5] == 'synchronizeStream (accel0)']
                     assert len(sync) == 1, (rank, gen, sync)
-                    sa, sb = sync[0][0], sync[0][0]+sync[0][1]
+                    sa, sb = sync[0][0], sync[0][0] + sync[0][1]
                     restores = [e for e in es if e[0] >= sb and e[3] == pid and e[5] == 'aten::copy_']
                     assert restores
                     rb = restores[0][0]
@@ -157,22 +167,34 @@ def main():
                     cursor = w['start_us']
                     for e in chunks:
                         bounds.append((cursor, e[0], 'PP1 invalidation or inter-group boundary'))
-                        bounds.append((e[0], e[0]+e[1], 'PP1 five group plan preparation and ordinary execution'))
-                        cursor = e[0]+e[1]
+                        bounds.append((e[0], e[0] + e[1], 'PP1 five group plan preparation and ordinary execution'))
+                        cursor = e[0] + e[1]
                     bounds.append((cursor, w['end_us'], 'PP1 work after last group wrapper'))
             n = 0.
-            for a,b,label in bounds:
-                clipped = list(intersections(max(a,w['start_us']), min(b,w['end_us']), gaps_gen, [x[1] for x in gaps_gen])) if min(b,w['end_us']) > max(a,w['start_us']) else []
-                ms = sum(y-x for x,y in clipped)/1000
+            for a, b, label in bounds:
+                clipped = list(
+                    intersections(max(a, w['start_us']), min(b, w['end_us']), gaps_gen,
+                                  [x[1] for x in gaps_gen])) if min(b, w['end_us']) > max(a, w['start_us']) else []
+                ms = sum(y - x for x, y in clipped) / 1000
                 n += ms
-                phase_totals[label] += ms/len(gens)
+                phase_totals[label] += ms / len(gens)
                 if clipped:
-                    phases.append(dict(generation=int(gen), phase=label, start_us=max(a,w['start_us']), end_us=min(b,w['end_us']), gap_ms=ms, gaps=clipped))
-            assert abs(n-sum(b-a for a,b in gaps_gen)/1000) < 1e-8, (rank,gen,n)
-        (out / f'rank{rank}-phase-intervals.json').write_text(json.dumps(phases,indent=2))
-        result[rank] = dict(gap_ms=sum(b-a for a,b in allgaps)/len(gens)/1000, rows=rows,
+                    phases.append(
+                        dict(generation=int(gen),
+                             phase=label,
+                             start_us=max(a, w['start_us']),
+                             end_us=min(b, w['end_us']),
+                             gap_ms=ms,
+                             gaps=clipped))
+            assert abs(n - sum(b - a for a, b in gaps_gen) / 1000) < 1e-8, (rank, gen, n)
+        (out / f'rank{rank}-phase-intervals.json').write_text(json.dumps(phases, indent=2))
+        result[rank] = dict(gap_ms=sum(b - a for a, b in allgaps) / len(gens) / 1000,
+                            rows=rows,
                             combinations=dict(ledger.most_common()),
-                            unions_ms={k:sum(b-a for a,b in merge(v))/len(gens)/1000 for k,v in classes.items()},
+                            unions_ms={
+                                k: sum(b - a for a, b in merge(v)) / len(gens) / 1000
+                                for k, v in classes.items()
+                            },
                             phase_ms=dict(phase_totals))
         print('RANK', rank, 'GAP', result[rank]['gap_ms'], flush=True)
         print('PHASES', result[rank]['phase_ms'], flush=True)

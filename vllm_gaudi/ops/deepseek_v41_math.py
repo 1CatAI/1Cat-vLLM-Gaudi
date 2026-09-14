@@ -62,18 +62,19 @@ def fp4_encode(value):
 
 def fp4_decode(code):
     magnitude = code.to(torch.int32) & 7
-    value = torch.where(magnitude < 4, magnitude.float() * 0.5,
-                        torch.where(magnitude < 6, magnitude.float() - 2.0,
+    value = torch.where(magnitude < 4,
+                        magnitude.float() * 0.5,
+                        torch.where(magnitude < 6,
+                                    magnitude.float() - 2.0,
                                     magnitude.float() * 2.0 - 8.0))
     return torch.where((code.to(torch.int32) & 8) != 0, -value, value)
 
 
 def pack_swa(value):
-    if (gaudi_envs.VLLM_HPU_DSV41_NATIVE_KV_PACK and value.device.type == "hpu"
-            and value.dtype == torch.bfloat16 and value.ndim >= 2 and value.shape[0] <= 6):
+    if (gaudi_envs.VLLM_HPU_DSV41_NATIVE_KV_PACK and value.device.type == "hpu" and value.dtype == torch.bfloat16
+            and value.ndim >= 2 and value.shape[0] <= 6):
         shape = value.shape
-        result = torch.ops.custom_op.custom_deepseek_v41_swa_pack_bf16_gaudi2(
-            value.reshape(-1, shape[-1]).contiguous())
+        result = torch.ops.custom_op.custom_deepseek_v41_swa_pack_bf16_gaudi2(value.reshape(-1, shape[-1]).contiguous())
         return result.reshape(*shape[:-1], shape[-1] * 33 // 32)
     return _pack_swa_torch(value)
 
@@ -95,8 +96,7 @@ def unpack_swa(packed, width=512):
 
 
 def quantize_activation(value):
-    if (gaudi_envs.VLLM_HPU_DSV41_QUANT_ROUNDTRIP and value.device.type == "hpu"
-            and value.dtype == torch.bfloat16):
+    if (gaudi_envs.VLLM_HPU_DSV41_QUANT_ROUNDTRIP and value.device.type == "hpu" and value.dtype == torch.bfloat16):
         shape = value.shape
         result = torch.ops.custom_op.custom_deepseek_v41_quant_roundtrip_bf16_gaudi2(
             value.reshape(-1, shape[-1]).contiguous())
@@ -105,12 +105,11 @@ def quantize_activation(value):
 
 
 def pack_fp4(value, group=16):
-    if (gaudi_envs.VLLM_HPU_DSV41_NATIVE_KV_PACK and value.device.type == "hpu"
-            and value.dtype == torch.bfloat16 and value.ndim >= 2 and value.shape[0] <= 6
-            and group in (16, 32)):
+    if (gaudi_envs.VLLM_HPU_DSV41_NATIVE_KV_PACK and value.device.type == "hpu" and value.dtype == torch.bfloat16
+            and value.ndim >= 2 and value.shape[0] <= 6 and group in (16, 32)):
         shape = value.shape
-        op = (torch.ops.custom_op.custom_deepseek_v41_fp4_pack_g16_bf16_gaudi2 if group == 16
-              else torch.ops.custom_op.custom_deepseek_v41_fp4_pack_g32_bf16_gaudi2)
+        op = (torch.ops.custom_op.custom_deepseek_v41_fp4_pack_g16_bf16_gaudi2
+              if group == 16 else torch.ops.custom_op.custom_deepseek_v41_fp4_pack_g32_bf16_gaudi2)
         result = op(value.reshape(-1, shape[-1]).contiguous())
         return result.reshape(*shape[:-1], shape[-1] // 2 + shape[-1] // group)
     return _pack_fp4_torch(value, group)
@@ -155,8 +154,10 @@ def rotary_table(width, length, base, original_length=0, factor=16, beta_fast=32
     # CPU preparation preserves the reference's adjacent-pair RoPE convention.
     freq = 1.0 / (base**(torch.arange(0, width, 2, dtype=torch.float32, device="cpu") / width))
     if original_length:
+
         def corrected(rotations):
             return width * math.log(original_length / (rotations * 2 * math.pi)) / (2 * math.log(base))
+
         low, high = max(math.floor(corrected(beta_fast)), 0), min(math.ceil(corrected(beta_slow)), width - 1)
         ramp = ((torch.arange(width // 2, device="cpu") - low) / max(high - low, 1e-3)).clamp(0, 1)
         freq = freq / factor * ramp + freq * (1 - ramp)
@@ -165,13 +166,11 @@ def rotary_table(width, length, base, original_length=0, factor=16, beta_fast=32
 
 
 def apply_rope(value, positions, table, inverse=False):
-    if (gaudi_envs.VLLM_HPU_DSV41_NATIVE_ROPE and value.device.type == "hpu"
-            and value.dtype == torch.bfloat16 and value.ndim in (2, 3)
-            and (value.ndim == 2 or 1 <= value.shape[1] <= 128)
-            and 1 <= value.shape[0] <= 6 and 128 <= value.shape[-1] <= 512
-            and value.shape[-1] % 128 == 0 and table.shape[-2:] == (32, 2)):
-        op = (torch.ops.custom_op.custom_deepseek_v41_rope_inverse_bf16_gaudi2 if inverse
-              else torch.ops.custom_op.custom_deepseek_v41_rope_bf16_gaudi2)
+    if (gaudi_envs.VLLM_HPU_DSV41_NATIVE_ROPE and value.device.type == "hpu" and value.dtype == torch.bfloat16
+            and value.ndim in (2, 3) and (value.ndim == 2 or 1 <= value.shape[1] <= 128) and 1 <= value.shape[0] <= 6
+            and 128 <= value.shape[-1] <= 512 and value.shape[-1] % 128 == 0 and table.shape[-2:] == (32, 2)):
+        op = (torch.ops.custom_op.custom_deepseek_v41_rope_inverse_bf16_gaudi2
+              if inverse else torch.ops.custom_op.custom_deepseek_v41_rope_bf16_gaudi2)
         shaped = value.reshape(value.shape[0], -1, value.shape[-1]).contiguous()
         return op(shaped, positions.to(torch.int32).contiguous(), table.reshape(-1, 64)).reshape(value.shape)
     return _apply_rope_torch(value, positions, table, inverse)

@@ -589,6 +589,11 @@ class HpuPlatform(Platform):
         return 1 if is_v41(vllm_config) else None
 
     @classmethod
+    def configure_control_process(cls, role):
+        from vllm_gaudi.ops.deepseek_v41_cpu import bind_control_process
+        bind_control_process(role)
+
+    @classmethod
     def register_custom_kv_cache_specs(cls, vllm_config):
         if gaudi_envs.VLLM_HPU_DSV41_PREPARED_SHARDS:
             from vllm_gaudi.ops.deepseek_v41_state import register_state_spec

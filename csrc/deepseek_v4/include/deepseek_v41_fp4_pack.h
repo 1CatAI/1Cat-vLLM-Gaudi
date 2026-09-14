@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Checkpoint FP4 value encoding, with E4M3FN (g16) or UE8M0 (g32) scales.
+#ifdef DSV41_DECODED_KV_WRITE
+#include "deepseek_v41_kv_decode.h"
+#endif
 static inline int64 fp4_scale_e4m3(float64 value) {
     const float64 magnitude = v_f32_min_b(value, 448.0f);
     const uint64 bits = as_uint64(magnitude);
@@ -10,7 +13,11 @@ static inline int64 fp4_scale_e4m3(float64 value) {
     return v_i32_min_b(v_i32_max_b(code, 0), 126);
 }
 static inline void fp4_pack_group(tensor value, tensor output, int group, int input_row,
-                                 int output_row, int group_size) {
+                                 int output_row, int group_size
+#ifdef DSV41_DECODED_KV_WRITE
+                                 , tensor decoded, bool write_decoded
+#endif
+                                 ) {
     const int width = get_dim_size(value, 0);
     const bfloat128 input = v_bf16_ld_tnsr_partial_b(
         (int5){group * group_size, input_row, 0, 0, 0}, value, group_size - 1, 0);
@@ -49,6 +56,30 @@ static inline void fp4_pack_group(tensor value, tensor output, int group, int in
     code = v_i32_sel_eq_f32_b(magnitude, 0.0f, 0, code);
     uint256 wide = {0};
     wide.v1 = as_uint64(code) | ((as_uint64(number) >> 28) & 8);
+#ifdef DSV41_DECODED_KV_WRITE
+    if (write_decoded) {
+        const uint64 magnitude_code = wide.v1 & 7;
+        const float64 numeric_code = convert_uint64_to_float64(
+            magnitude_code, 0);
+        float64 decoded_value = v_f32_sel_less_u32_b(
+            magnitude_code, 6, numeric_code - 2.0f,
+            numeric_code * 2.0f - 8.0f);
+        decoded_value = v_f32_sel_less_u32_b(
+            magnitude_code, 4, numeric_code * 0.5f, decoded_value);
+        decoded_value = as_float64(as_uint64(decoded_value)
+                                   | ((wide.v1 & 8) << 28));
+        decoded_value *= e4m3fn(as_uint64(scale_code));
+        decoded_value = v_f32_sel_eq_f32_b(decoded_value, 0.0f,
+                                           0.0f, decoded_value);
+        float128 converted = {0};
+        converted.v1 = decoded_value;
+        const bfloat128 decoded_bf16 = convert_float128_to_bfloat128(
+            converted, SW_RHNE | SW_LINEAR);
+        v_bf16_st_tnsr_partial(
+            (int5){group * group_size, output_row, 0, 0, 0}, decoded,
+            decoded_bf16, group_size - 1, 0);
+    }
+#endif
     const uchar256 codes = convert_uint256_to_uchar256(wide, SW_LINEAR);
     // Adjacent byte codes already form little-endian 16-bit pairs. Compress
     // their nibbles before narrowing, avoiding a byte-shuffle routing table.

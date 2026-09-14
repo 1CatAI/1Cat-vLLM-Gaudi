@@ -19,6 +19,7 @@ _SILU_AND_MUL_OP: Callable | None = None
 _SILU_MUL_QUANT_OP: Callable | None = None
 _BLOCK_FP8_DEQUANT_OP: Callable | None = None
 _BLOCK_FP8_LINEAR_OP: Callable | None = None
+_ADD_RMSNORM_QUANT_OP: Callable | None = None
 
 
 def _library_candidates() -> list[str]:
@@ -66,7 +67,7 @@ def load_native_extensions() -> tuple[str, ...]:
     Loading failures are recorded for diagnostics. They are not raised here so
     CPU-only imports and the PyTorch reference fallback remain usable.
     """
-    global _LOAD_ATTEMPTED, _SILU_AND_MUL_OP
+    global _LOAD_ATTEMPTED, _SILU_AND_MUL_OP, _ADD_RMSNORM_QUANT_OP
     if _LOAD_ATTEMPTED:
         return tuple(_LOADED_PATHS)
     with _LOAD_LOCK:
@@ -87,6 +88,10 @@ def load_native_extensions() -> tuple[str, ...]:
             _SILU_AND_MUL_OP = torch.ops.custom_op.flashinfer_gaudi_silu_and_mul
         except (AttributeError, RuntimeError):
             _SILU_AND_MUL_OP = None
+        try:
+            _ADD_RMSNORM_QUANT_OP = torch.ops.custom_op.flashinfer_gaudi_add_rmsnorm_quant
+        except (AttributeError, RuntimeError):
+            _ADD_RMSNORM_QUANT_OP = None
         # Private compound ops are published only by the verified Bridge
         # loader, not by probing an arbitrary externally registered symbol.
         _LOAD_ATTEMPTED = True
@@ -156,6 +161,7 @@ def native_diagnostics() -> dict[str, object]:
         "silu_and_mul_quant": silu_mul_quant_op() is not None,
         "block_fp8_dequant": block_fp8_dequant_op() is not None,
         "block_fp8_linear": block_fp8_linear_op() is not None,
+        "fused_add_rmsnorm_quant": add_rmsnorm_quant_op() is not None,
         "public_mtp_gdn": public_mtp_gdn_op() is not None,
         "public_mtp_prepared": public_mtp_prepared_op() is not None,
         "dflash2_grouped_conv": native_dflash2_grouped_conv_op() is not None,
@@ -168,12 +174,14 @@ def native_diagnostics() -> dict[str, object]:
 def _reset_native_state_for_tests() -> None:
     global _LOAD_ATTEMPTED, _SILU_AND_MUL_OP, _SILU_MUL_QUANT_OP
     global _BLOCK_FP8_DEQUANT_OP, _BLOCK_FP8_LINEAR_OP
+    global _ADD_RMSNORM_QUANT_OP
     with _LOAD_LOCK:
         _LOAD_ATTEMPTED = False
         _SILU_AND_MUL_OP = None
         _SILU_MUL_QUANT_OP = None
         _BLOCK_FP8_DEQUANT_OP = None
         _BLOCK_FP8_LINEAR_OP = None
+        _ADD_RMSNORM_QUANT_OP = None
         _LOADED_PATHS.clear()
         _LOAD_ERRORS.clear()
 
@@ -191,6 +199,12 @@ def block_fp8_dequant_op() -> Callable | None:
 
 def block_fp8_linear_op() -> Callable | None:
     return _BLOCK_FP8_LINEAR_OP
+
+
+def add_rmsnorm_quant_op() -> Callable | None:
+    if not _LOAD_ATTEMPTED:
+        load_native_extensions()
+    return _ADD_RMSNORM_QUANT_OP
 
 
 # SynapseAI reads GC_KERNEL_PATH when its graph compiler is initialized. Set

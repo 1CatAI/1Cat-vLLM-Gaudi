@@ -28,14 +28,22 @@ def main():
         expected = old(values, positions, table, inverse).cpu()
         actual = new(values, positions, table, inverse).cpu()
         bad = expected.view(torch.int16) != actual.view(torch.int16)
-        record = dict(case=label, shape=list(values.shape), inverse=inverse,
-                      mismatches=int(bad.sum()), prefix_mismatches=int(bad[..., :-64].sum()))
+        record = dict(case=label,
+                      shape=list(values.shape),
+                      inverse=inverse,
+                      mismatches=int(bad.sum()),
+                      prefix_mismatches=int(bad[..., :-64].sum()))
         records.append(record)
         (destination / "result.json").write_text(json.dumps(records, indent=2) + "\n")
         print(json.dumps(record), flush=True)
         if bad.any():
-            torch.save(dict(values=values.cpu(), positions=positions.cpu(), table=table.cpu(),
-                            expected=expected, actual=actual, inverse=inverse), destination / "mismatch.pt")
+            torch.save(
+                dict(values=values.cpu(),
+                     positions=positions.cpu(),
+                     table=table.cpu(),
+                     expected=expected,
+                     actual=actual,
+                     inverse=inverse), destination / "mismatch.pt")
             raise RuntimeError("Native RoPE differs from the compiled production expression")
 
     for count in range(1, 7):
@@ -57,10 +65,12 @@ def main():
     compare("index_width128", values, positions, False)
 
     weight = torch.randn(512, 64).bfloat16().to("hpu")
+
     def chain(x, positions, native):
         q = apply_rope(x, positions, table) if native else _apply_rope_torch(x, positions, table)
         q = apply_rope(q, positions, table, True) if native else _apply_rope_torch(q, positions, table, True)
         return torch.matmul(q, weight)
+
     old_chain = torch.compile(lambda x, p: chain(x, p, False), backend="hpu_backend", fullgraph=True, dynamic=False)
     new_chain = torch.compile(lambda x, p: chain(x, p, True), backend="hpu_backend", fullgraph=True, dynamic=False)
     x = torch.randn(6, 32, 512).bfloat16().to("hpu")

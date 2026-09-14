@@ -24,8 +24,10 @@ def prepare_serving_resources(settings, model, arguments):
                 handle = path.open("a")
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 _leases.append(handle)
-            devices = [p for p in Path("/sys/class/accel").glob("accel[0-9]*")
-                       if (p / "device/module_id").read_text().strip() == module]
+            devices = [
+                p for p in Path("/sys/class/accel").glob("accel[0-9]*")
+                if (p / "device/module_id").read_text().strip() == module
+            ]
             if len(devices) != 1:
                 raise RuntimeError(f"Cannot resolve HPU module {module}")
             result = subprocess.run(["fuser", f"/dev/accel/{devices[0].name}"], capture_output=True)
@@ -36,14 +38,19 @@ def prepare_serving_resources(settings, model, arguments):
     if cache_dir := settings.get("recipe_cache_dir"):
         package = Path(__file__).resolve().parents[1]
         engine = Path(importlib.util.find_spec("vllm").origin).resolve().parents[1]
-        sources = {str(p.relative_to(package)): hashlib.sha256(p.read_bytes()).hexdigest()
-                   for p in package.rglob("*.py")}
+        sources = {
+            str(p.relative_to(package)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in package.rglob("*.py")
+        }
         engine_patch = subprocess.check_output(["git", "diff", "HEAD"], cwd=engine)
-        identity = {"sources": sources, "arguments": arguments,
-                    "engine_head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=engine).decode().strip(),
-                    "engine_diff": hashlib.sha256(engine_patch).hexdigest(),
-                    "runtime": os.environ.get("DSV41_SERVING_RUNTIME"),
-                    "model": hashlib.sha256((Path(model) / "manifest.json").read_bytes()).hexdigest()}
+        identity = {
+            "sources": sources,
+            "arguments": arguments,
+            "engine_head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=engine).decode().strip(),
+            "engine_diff": hashlib.sha256(engine_patch).hexdigest(),
+            "runtime": os.environ.get("DSV41_SERVING_RUNTIME"),
+            "model": hashlib.sha256((Path(model) / "manifest.json").read_bytes()).hexdigest()
+        }
         digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
         cache = Path(cache_dir) / digest
         cache.mkdir(parents=True, exist_ok=True)

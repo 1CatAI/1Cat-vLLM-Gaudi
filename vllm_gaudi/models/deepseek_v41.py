@@ -10,8 +10,14 @@ from vllm.distributed import get_pp_group, get_tensor_model_parallel_rank
 from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
 from vllm.models.deepseek_v4.common.vision import DeepseekV4Aligner, DeepseekV4ViT
 from vllm.models.deepseek_v4_1.common.mm_preprocess import (
-    IMAGE, IMAGE_END, IMAGE_NEW_LINE, IMAGE_PLACEHOLDER, IMAGE_START,
-    DeepseekV4VLDummyInputsBuilder, DeepseekV4VLMultiModalProcessor, DeepseekV4VLProcessingInfo,
+    IMAGE,
+    IMAGE_END,
+    IMAGE_NEW_LINE,
+    IMAGE_PLACEHOLDER,
+    IMAGE_START,
+    DeepseekV4VLDummyInputsBuilder,
+    DeepseekV4VLMultiModalProcessor,
+    DeepseekV4VLProcessingInfo,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
@@ -22,8 +28,9 @@ from vllm_gaudi.ops.deepseek_v41_host import EngramHost
 from vllm_gaudi.ops.deepseek_v41_replay import StageReplay, stage_collectives
 
 
-@MULTIMODAL_REGISTRY.register_processor(
-    DeepseekV4VLMultiModalProcessor, info=DeepseekV4VLProcessingInfo, dummy_inputs=DeepseekV4VLDummyInputsBuilder)
+@MULTIMODAL_REGISTRY.register_processor(DeepseekV4VLMultiModalProcessor,
+                                        info=DeepseekV4VLProcessingInfo,
+                                        dummy_inputs=DeepseekV4VLDummyInputsBuilder)
 class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
     requires_raw_input_tokens = True
     supports_encoder_tp_data = True
@@ -49,17 +56,22 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         # may have already loaded an older extension from the site package.
         # Checking only the MoE symbol would therefore silently skip loading
         # the candidate and leave the graph with an incomplete op namespace.
-        required_op = ("custom_deepseek_v41_paged_attention_bf16_gaudi2"
-                       if envs.VLLM_HPU_DSV41_PAGED_SELECTED_KV
-                       else "custom_deepseek_v41_mxfp4_prepared_moe_bf16_gaudi2")
+        required_op = ("custom_deepseek_v41_paged_attention_bf16_gaudi2" if envs.VLLM_HPU_DSV41_PAGED_SELECTED_KV else
+                       "custom_deepseek_v41_mxfp4_prepared_moe_bf16_gaudi2")
         if not hasattr(torch.ops.custom_op, required_op):
             torch.ops.load_library(envs.VLLM_HPU_DSV4_TPC_OP_LIBRARY)
         if self.native:
             from vllm_gaudi.distributed.tp2_fused_ar_norm import initialize_tp2_fused_ar_norm_runtime
             initialize_tp2_fused_ar_norm_runtime()
         reduce, gather = stage_collectives(self.tp_rank, self.native)
-        self.program = PreparedStage(self.directory, self.pp_rank, self.tp_rank, reduce, gather, self.device,
-                                     max_length=vllm_config.model_config.max_model_len)
+        self.program = PreparedStage(self.directory,
+                                     self.pp_rank,
+                                     self.tp_rank,
+                                     reduce,
+                                     gather,
+                                     self.device,
+                                     max_length=vllm_config.model_config.max_model_len,
+                                     dspark=envs.VLLM_HPU_DSV41_DSPARK)
         self.program.replay_owner = StageReplay(self.program) if self.native else None
         self.ordinary = CompiledStage(self.program)
         self.long_context_programs = {}
@@ -80,9 +92,12 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         if self.pp_rank == 0:
             if not envs.VLLM_HPU_DSV41_ENGRAM_HOST_TABLE:
                 raise RuntimeError("V4.1 Engram must use the native host table; no HBM/eager fallback is available")
-            self.engram_host = EngramHost(self.directory, self.tp_rank, self.device, max_tokens=6,
-                                         checkpoint_audit=self.extra.get("checkpoint_audit"),
-                                         force_lock=self.extra.get("engram_force_lock", False))
+            self.engram_host = EngramHost(self.directory,
+                                          self.tp_rank,
+                                          self.device,
+                                          max_tokens=6,
+                                          checkpoint_audit=self.extra.get("checkpoint_audit"),
+                                          force_lock=self.extra.get("engram_force_lock", False))
             self._bind_vision()
 
     def _bind_vision(self):
@@ -122,14 +137,17 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         types, vit_offset, span_offset, result = kwargs["types"].to("cpu").tolist(), 0, 0, []
         for (height, width), (out_height, out_width) in zip(vit_grid, llm_grid, strict=True):
             count = height * width
-            image = self.aligner(self.vision(patches[vit_offset:vit_offset + count].to(torch.bfloat16),
-                                            height, width), height, width)
+            image = self.aligner(self.vision(patches[vit_offset:vit_offset + count].to(torch.bfloat16), height, width),
+                                 height, width)
             span_length = out_height * (out_width + 1) + 2
-            indices = image_span_indices(types[span_offset:span_offset + span_length], image=IMAGE,
-                                        start=IMAGE_START, newline=IMAGE_NEW_LINE, end=IMAGE_END,
-                                        image_rows=image.shape[0])
-            special = torch.stack((self.program.weights.image_start, self.program.weights.image_newline,
-                                   self.program.weights.image_end))
+            indices = image_span_indices(types[span_offset:span_offset + span_length],
+                                         image=IMAGE,
+                                         start=IMAGE_START,
+                                         newline=IMAGE_NEW_LINE,
+                                         end=IMAGE_END,
+                                         image_rows=image.shape[0])
+            special = torch.stack(
+                (self.program.weights.image_start, self.program.weights.image_newline, self.program.weights.image_end))
             span = assemble_image_span(image, special, indices)
             result.append(span)
             vit_offset, span_offset = vit_offset + count, span_offset + span_length
@@ -143,7 +161,8 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             from vllm.model_executor.models.utils import _merge_multimodal_embeddings
             if is_multimodal is None:
                 raise ValueError("V4.1 image embeddings require the processor's span mask")
-            values = _merge_multimodal_embeddings(inputs_embeds=values, multimodal_embeddings=multimodal_embeddings,
+            values = _merge_multimodal_embeddings(inputs_embeds=values,
+                                                  multimodal_embeddings=multimodal_embeddings,
                                                   is_multimodal=is_multimodal)
         return values
 
@@ -183,12 +202,15 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         input_ids, positions = input_ids.reshape(-1), positions.reshape(-1).to(torch.int32)
         pp_wire = None
         search = getattr(self.program, "search_length", 512)
-        fused_text_io = (self.pp_rank == 0 and envs.VLLM_HPU_DSV41_FUSED_STAGE_IO
-                         and self.native and self.step_use_replay and search <= 1024 and inputs_embeds is None)
+        fused_text_io = (self.pp_rank == 0 and envs.VLLM_HPU_DSV41_FUSED_STAGE_IO and self.native
+                         and self.step_use_replay and search <= 1024 and inputs_embeds is None)
+        native_input = (self.pp_rank == 0 and self.native and self.step_use_replay
+                        and envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH and not self.program.dspark and inputs_embeds is None
+                        and input_ids.numel() == 1 and not fused_text_io)
         if self.pp_rank == 0:
             if self.step_ticket is None:
                 raise RuntimeError("V4.1 input metadata was not prepared by its worker")
-            if fused_text_io:
+            if fused_text_io or native_input:
                 residual = pre = None
             else:
                 values = self.embed_input_ids(input_ids) if inputs_embeds is None else inputs_embeds.reshape(-1, 5120)
@@ -215,10 +237,20 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             execute = self.long_context_programs[key]
         else:
             execute = self.program.replay_owner if self.native and self.step_use_replay else self.ordinary
-        if pp_wire is not None or fused_text_io:
+        if native_input:
+            if execute is not self.program.replay_owner:
+                raise RuntimeError("Native input requires its qualified replay stage")
+            output, pre, aux = execute.from_input_ids(positions, input_ids, engram)
+        elif pp_wire is not None or fused_text_io:
             if execute is not self.program.replay_owner:
                 raise RuntimeError("PP wire input requires its qualified native stage")
-            output, pre, aux = execute(residual, pre, positions, input_ids, engram, pp_wire=pp_wire, fused_text_io=fused_text_io)
+            output, pre, aux = execute(residual,
+                                       pre,
+                                       positions,
+                                       input_ids,
+                                       engram,
+                                       pp_wire=pp_wire,
+                                       fused_text_io=fused_text_io)
         else:
             output, pre, aux = execute(residual, pre, positions, input_ids, engram)
         self.last_aux = aux

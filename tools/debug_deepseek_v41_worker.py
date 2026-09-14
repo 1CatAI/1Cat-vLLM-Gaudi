@@ -11,14 +11,27 @@ def main():
     directory = Path(os.environ["DSV41_RUN_EVIDENCE"])
     commands = directory / f"gdb-rank{rank}.commands"
     commands.write_text("\n".join((
-        "set pagination off", "set confirm off", "set print thread-events off",
-        "handle SIGPIPE nostop noprint pass", "python", "import gdb",
+        "set pagination off",
+        "set confirm off",
+        "set print thread-events off",
+        "handle SIGPIPE nostop noprint pass",
+        "python",
+        "import gdb",
         "def record_exit(event):",
         "    gdb.set_convenience_variable('dsv41_exit', getattr(event, 'exit_code', 1))",
-        "gdb.events.exited.connect(record_exit)", "end", "run", "python",
+        "gdb.events.exited.connect(record_exit)",
+        "end",
+        "run",
+        "python",
         "if not gdb.selected_inferior().pid:",
         "    gdb.execute('quit ' + str(int(gdb.parse_and_eval('$dsv41_exit'))))",
-        "end", "bt 40", "info registers", "x/24i $pc-32", "bt full 12", "thread apply all bt 6", "quit 128",
+        "end",
+        "bt 40",
+        "info registers",
+        "x/24i $pc-32",
+        "bt full 12",
+        "thread apply all bt 6",
+        "quit 128",
     )) + "\n")
     log = (directory / f"gdb-rank{rank}.log").open("w")
     os.dup2(log.fileno(), 1)

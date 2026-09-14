@@ -13,7 +13,6 @@ import json
 from pathlib import Path
 import re
 
-
 _ATTR = re.compile(r'key: "(inputTensor:\d+|outputTensor:\d+)"\s+value \{\s+s: "([^"]*)"')
 _SIZE = re.compile(r"Sizes = (\[[^\]]+\])")
 _BYTES = re.compile(r"sizeInBytes = (\d+)")
@@ -62,12 +61,15 @@ def report(graphs):
             groups[key]["count"] += 1
             groups[key]["bytes"] += row["bytes"]
             groups[key]["graphs"].add(path.name)
-    return [
-        {"op": op, "src": src, "dst": dst, "dtype": dtype, "count": value["count"],
-         "bytes": value["bytes"], "graphs": len(value["graphs"])}
-        for (op, src, dst, dtype), value in sorted(
-            groups.items(), key=lambda item: item[1]["bytes"], reverse=True)
-    ]
+    return [{
+        "op": op,
+        "src": src,
+        "dst": dst,
+        "dtype": dtype,
+        "count": value["count"],
+        "bytes": value["bytes"],
+        "graphs": len(value["graphs"])
+    } for (op, src, dst, dtype), value in sorted(groups.items(), key=lambda item: item[1]["bytes"], reverse=True)]
 
 
 def main():

@@ -32,17 +32,33 @@ def main():
         parser.error("The protocol must leave at least one complete token interval per round")
     args.output.mkdir(parents=True, exist_ok=False)
     runner = Path(__file__).with_name("request_deepseek_v41.py")
-    record = {"server_process": str(args.server_process.resolve()),
-              "protocol": {"rounds": args.rounds, "tokens": args.tokens,
-                           "discard_first_intervals": args.discard_intervals, "profiler": False},
-              "tool_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), "rounds": [],
-              "units": "ms", "note": "API token intervals include zeros when DSpark emits a prefix in one chunk. "
-              "Chunk intervals are also retained; hardware time is not inferred from API timing."}
+    record = {
+        "server_process":
+        str(args.server_process.resolve()),
+        "protocol": {
+            "rounds": args.rounds,
+            "tokens": args.tokens,
+            "discard_first_intervals": args.discard_intervals,
+            "profiler": False
+        },
+        "tool_sha256":
+        hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "rounds": [],
+        "units":
+        "ms",
+        "note":
+        "API token intervals include zeros when DSpark emits a prefix in one chunk. "
+        "Chunk intervals are also retained; hardware time is not inferred from API timing."
+    }
     for index in range(args.rounds):
         directory = args.output / f"round{index + 1}"
-        command = [sys.executable, str(runner), str(directory), "--url", args.url,
-                   "--tokens", str(args.tokens), "--prompt", args.prompt,
-                   "--server-process", str(args.server_process.resolve())]
+        command = [
+            sys.executable,
+            str(runner),
+            str(directory), "--url", args.url, "--tokens",
+            str(args.tokens), "--prompt", args.prompt, "--server-process",
+            str(args.server_process.resolve())
+        ]
         with (args.output / f"round{index + 1}.log").open("w") as log:
             result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT)
         if result.returncode:
@@ -54,13 +70,21 @@ def main():
             raise RuntimeError("Incomplete request cannot qualify an ITL round")
         intervals = timing["api_itl_ms"][args.discard_intervals:]
         chunks = timing["chunk_arrival_ms"]
-        row = {"round": index + 1, "request_ms": timing["request_ms"], "ttft_ms": timing["ttft_ms"],
-               "retained_intervals": len(intervals), "mean_itl_ms": statistics.mean(intervals),
-               "p50_itl_ms": quantile(intervals, .5), "p90_itl_ms": quantile(intervals, .9),
-               "p99_itl_ms": quantile(intervals, .99), "max_itl_ms": max(intervals),
-               "zero_intervals": sum(value == 0 for value in intervals), "output_chunks": len(chunks),
-               "chunk_intervals_ms": [right - left for left, right in zip(chunks, chunks[1:])],
-               "token_ids_sha256": hashlib.sha256((directory / "token_ids.json").read_bytes()).hexdigest()}
+        row = {
+            "round": index + 1,
+            "request_ms": timing["request_ms"],
+            "ttft_ms": timing["ttft_ms"],
+            "retained_intervals": len(intervals),
+            "mean_itl_ms": statistics.mean(intervals),
+            "p50_itl_ms": quantile(intervals, .5),
+            "p90_itl_ms": quantile(intervals, .9),
+            "p99_itl_ms": quantile(intervals, .99),
+            "max_itl_ms": max(intervals),
+            "zero_intervals": sum(value == 0 for value in intervals),
+            "output_chunks": len(chunks),
+            "chunk_intervals_ms": [right - left for left, right in zip(chunks, chunks[1:])],
+            "token_ids_sha256": hashlib.sha256((directory / "token_ids.json").read_bytes()).hexdigest()
+        }
         record["rounds"].append(row)
         (args.output / "summary.json").write_text(json.dumps(record, indent=2) + "\n")
         print(json.dumps({key: value for key, value in row.items() if not isinstance(value, list)}), flush=True)

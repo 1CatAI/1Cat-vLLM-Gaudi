@@ -41,18 +41,34 @@ def audit(analysis, requests):
             absent = first > start + timing["ttft_ms"] * 1000 or last < start
             incomplete = absent or bool(before) or bool(after)
             missing |= incomplete
-            observations.append({"request": str(request.resolve()), "target_host_phases": len(target),
-                "target_phases_before_hardware": len(before), "target_phases_after_hardware": len(after),
+            observations.append({
+                "request": str(request.resolve()),
+                "target_host_phases": len(target),
+                "target_phases_before_hardware": len(before),
+                "target_phases_after_hardware": len(after),
                 "first_output_precedes_first_hardware": first > start + timing["ttft_ms"] * 1000,
                 "hardware_first_from_request_start_ms": (first - start) / 1000,
                 "hardware_last_from_request_end_ms": (last - end) / 1000,
-                "request_ms": timing["request_ms"], "coverage_gap": incomplete})
-        ranks.append({"rank": rank, "trace_sha256": inventory["trace_sha256"],
-                      "hardware_window_ms": (last - first) / 1000, "requests": observations})
-    return {"status": "incomplete hardware coverage" if missing else "request/target bounds consistent",
-            "report_units": "ms", "ranks": ranks,
-            "limitation": "Bounds are necessary but insufficient evidence of complete packet/call coverage. "
-                          "Missing host annotations cannot establish per-target coverage."}
+                "request_ms": timing["request_ms"],
+                "coverage_gap": incomplete
+            })
+        ranks.append({
+            "rank": rank,
+            "trace_sha256": inventory["trace_sha256"],
+            "hardware_window_ms": (last - first) / 1000,
+            "requests": observations
+        })
+    return {
+        "status":
+        "incomplete hardware coverage" if missing else "request/target bounds consistent",
+        "report_units":
+        "ms",
+        "ranks":
+        ranks,
+        "limitation":
+        "Bounds are necessary but insufficient evidence of complete packet/call coverage. "
+        "Missing host annotations cannot establish per-target coverage."
+    }
 
 
 if __name__ == "__main__":

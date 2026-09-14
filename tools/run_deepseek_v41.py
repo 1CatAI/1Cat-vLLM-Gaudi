@@ -63,6 +63,26 @@ def cpuset(value):
     return result
 
 
+def active_worker_cpus():
+    reserved = set()
+    keys = (b"VLLM_HPU_DSV4_WORKER_CPUS=", b"VLLM_HPU_DSV4_WORKER_HELPER_CPUS=", b"VLLM_HPU_DSV41_ENGINE_CPUS=",
+            b"VLLM_HPU_DSV41_API_CPUS=")
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit() or int(proc.name) == os.getpid():
+            continue
+        try:
+            entries = (proc / "environ").read_bytes().split(b"\0")
+        except (OSError, ProcessLookupError):
+            continue
+        for entry in entries:
+            if entry.startswith(keys):
+                reserved.update(cpuset(entry.split(b"=", 1)[1].decode().replace(";", ",")))
+    for cpu in tuple(reserved):
+        path = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list")
+        reserved.update(cpuset(path.read_text()))
+    return reserved
+
+
 def recipe_source_hashes(source_hashes):
     """Diagnostic/report scripts are archived but are not serving dependencies."""
     return {path: digest for path, digest in source_hashes.items() if path.startswith("vllm_gaudi/")}
@@ -74,8 +94,9 @@ def acquire(lock_dir, count, requested_modules=None):
         candidates = sorted(Path("/sys/class/accel").glob("accel[0-9]*"))
         if requested_modules is not None:
             requested = {int(module) for module in requested_modules}
-            candidates = [candidate for candidate in candidates
-                          if int((candidate / "device/module_id").read_text()) in requested]
+            candidates = [
+                candidate for candidate in candidates if int((candidate / "device/module_id").read_text()) in requested
+            ]
             # Keep the caller's order so the PP/TP rank-to-module mapping is
             # stable across acquisitions.
             order = {int(module): index for index, module in enumerate(requested_modules)}
@@ -98,13 +119,17 @@ def acquire(lock_dir, count, requested_modules=None):
                 if owner.returncode != 1 or owner.stdout.strip() or owner.stderr.strip():
                     continue
                 bus = (candidate / "device").resolve().name
-                status = subprocess.check_output(["hl-smi", "-i", bus, "--query-aip=memory.used,utilization.aip",
-                                                  "--format=csv,noheader,nounits"], text=True)
+                status = subprocess.check_output(
+                    ["hl-smi", "-i", bus, "--query-aip=memory.used,utilization.aip", "--format=csv,noheader,nounits"],
+                    text=True)
                 memory, active = map(float, status.strip().split(","))
                 if memory > 1024 or active:
                     continue
-                selected.append({"module": module, "bus": bus,
-                                 "numa": int((candidate / "device/numa_node").read_text())})
+                selected.append({
+                    "module": module,
+                    "bus": bus,
+                    "numa": int((candidate / "device/numa_node").read_text())
+                })
                 held.extend(local)
                 local = []
                 if len(selected) == count:
@@ -126,14 +151,19 @@ def main():
     parser.add_argument("evidence", type=Path)
     parser.add_argument("--lock-dir", required=True, type=Path)
     parser.add_argument("--runtime-profile", required=True, type=Path)
-    parser.add_argument("--devices", type=int, choices=(1, 2, 4), default=4,
+    parser.add_argument("--devices",
+                        type=int,
+                        choices=(1, 2, 4),
+                        default=4,
                         help="Four for normal serving; fewer only for bounded component diagnostics")
-    parser.add_argument("--modules", type=str,
-                        help="Optional comma-separated physical module IDs, in rank order")
-    parser.add_argument("--recipe-cache-dir", type=Path,
+    parser.add_argument("--modules", type=str, help="Optional comma-separated physical module IDs, in rank order")
+    parser.add_argument("--recipe-cache-dir",
+                        type=Path,
                         help="Optional persistent cache root; source/runtime identities own separate namespaces")
     parser.add_argument("--dump-plans", action="store_true", help="Save preparation graphs for an explicit diagnostic")
-    parser.add_argument("--enable-profiler", action="store_true", help="Register profiler control for an explicit trace")
+    parser.add_argument("--enable-profiler",
+                        action="store_true",
+                        help="Register profiler control for an explicit trace")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
@@ -164,10 +194,17 @@ def main():
         print(f"Waiting for {target}; existing jobs remain untouched", flush=True)
         time.sleep(30)
         selected, locks = acquire(args.lock_dir, args.devices, requested_modules)
-    record = {"started_at": datetime.now(timezone.utc).isoformat(), "command": command,
-              "launcher_pid": os.getpid(), "modules": selected, "runtime_profile": str(args.runtime_profile.resolve())}
+    record = {
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "command": command,
+        "launcher_pid": os.getpid(),
+        "modules": selected,
+        "runtime_profile": str(args.runtime_profile.resolve())
+    }
     try:
-        allowed, reserved, mains, helpers = os.sched_getaffinity(0), set(), [], []
+        allowed = os.sched_getaffinity(0)
+        reserved, mains, helpers = active_worker_cpus(), [], []
+        record["excluded_active_worker_cpus"] = sorted(reserved)
         for item in selected:
             available = cpuset(Path(f"/sys/devices/system/node/node{item['numa']}/cpulist").read_text()) & allowed
             physical = [cpu for cpu in sorted(available) if cpu not in reserved]
@@ -178,12 +215,30 @@ def main():
             reserved.update(siblings)
             helper = [cpu for cpu in physical if cpu not in reserved][:4]
             for cpu in helper:
-                reserved.update(cpuset(Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read_text()))
+                reserved.update(
+                    cpuset(Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read_text()))
             mains.append(main_cpu)
             helpers.append(",".join(map(str, helper)))
             item.update(main_cpu=main_cpu, helper_cpus=helper)
+        control_cpus = set()
+        if env.get("VLLM_HPU_DSV41_ISOLATE_CONTROL", "0") == "1":
+            local = (cpuset(Path(f"/sys/devices/system/node/node{selected[0]['numa']}/cpulist").read_text()) & allowed)
+            for role, count in (("engine", 2), ("api", 1)):
+                group = []
+                for cpu in sorted(local - reserved):
+                    group.append(cpu)
+                    reserved.update(
+                        cpuset(Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read_text()))
+                    if len(group) == count:
+                        break
+                if len(group) != count:
+                    raise RuntimeError("Insufficient free NUMA-local CPUs for the V4.1 control processes")
+                env[f"VLLM_HPU_DSV41_{role.upper()}_CPUS"] = ",".join(map(str, group))
+                record.setdefault("control_cpus", {})[role] = group
+                control_cpus.update(group)
         env.update(HABANA_VISIBLE_MODULES=",".join(str(item["module"]) for item in selected),
-                   HLS_MODULE_ID=str(selected[0]["module"]), HABANA_LOGS=str(args.evidence / "habana_logs"),
+                   HLS_MODULE_ID=str(selected[0]["module"]),
+                   HABANA_LOGS=str(args.evidence / "habana_logs"),
                    VLLM_HPU_DSV4_WORKER_CPUS=",".join(map(str, mains)),
                    VLLM_HPU_DSV4_WORKER_HELPER_CPUS=";".join(helpers),
                    DSV41_RUN_EVIDENCE=str(args.evidence),
@@ -196,10 +251,13 @@ def main():
             env["VLLM_TORCH_PROFILER_DIR"] = str(args.evidence / "traces")
         if env.get("GRAPH_VISUALIZATION") == "1":
             env["GRAPH_VISUALIZATION_DIR"] = str(args.evidence / "graphs")
-        record["environment"] = {key: value for key, value in env.items()
-                                 if key.startswith(("HABANA_", "HLS_", "PT_HPU_", "VLLM_", "HCL_", "HCCL_", "DSV41_"))
-                                 or key in ("LD_LIBRARY_PATH", "LD_PRELOAD", "GC_KERNEL_PATH",
-                                            "RUNTIME_SCALE_PATCHING")}
+        record["environment"] = {
+            key: value
+            for key, value in env.items()
+            if key.startswith(("HABANA_", "HLS_", "PT_HPU_", "VLLM_", "HCL_", "HCCL_",
+                               "DSV41_")) or key in ("LD_LIBRARY_PATH", "LD_PRELOAD", "GC_KERNEL_PATH",
+                                                     "RUNTIME_SCALE_PATCHING")
+        }
         root = Path(__file__).resolve().parents[1]
         record["source_hashes"] = {}
         for glob in ("vllm_gaudi/**/*.py", "tools/*deepseek_v41*.py"):
@@ -224,11 +282,16 @@ def main():
                     model_manifests[str(candidate.resolve())] = hashlib.sha256(candidate.read_bytes()).hexdigest()
             native_dir = Path(env.get("VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR", root / "vllm_gaudi/lib"))
             native_build = native_dir / "deepseek_v4_build.json"
-            cache_identity = {"schema": 2, "source": recipe_source_hashes(record["source_hashes"]),
-                              "engine": record["engine_commit"],
-                              "engine_patch": record["engine_patch_sha256"], "runtime": profile,
-                              "command": command, "model_manifests": model_manifests,
-                              "native_build": hashlib.sha256(native_build.read_bytes()).hexdigest()}
+            cache_identity = {
+                "schema": 2,
+                "source": recipe_source_hashes(record["source_hashes"]),
+                "engine": record["engine_commit"],
+                "engine_patch": record["engine_patch_sha256"],
+                "runtime": profile,
+                "command": command,
+                "model_manifests": model_manifests,
+                "native_build": hashlib.sha256(native_build.read_bytes()).hexdigest()
+            }
             fingerprint = hashlib.sha256(json.dumps(cache_identity, sort_keys=True).encode()).hexdigest()
             cache = args.recipe_cache_dir.resolve() / fingerprint
             cache.mkdir(parents=True, exist_ok=True)
@@ -241,18 +304,25 @@ def main():
             record["recipe_cache_identity_schema"] = 2
         process = None
         launch_cpus = set(mains)
+        launch_cpus.update(control_cpus)
         for item in selected:
             launch_cpus.update(item["helper_cpus"])
         record["initial_process_cpus"] = sorted(launch_cpus)
         os.sched_setaffinity(0, launch_cpus)
+
         def stop(signum, frame):
             del frame
             if process is not None:
                 process.send_signal(signum)
+
         signal.signal(signal.SIGTERM, stop)
         signal.signal(signal.SIGINT, stop)
         with (args.evidence / "run.log").open("w") as log:
-            process = subprocess.Popen(command, cwd=root, env=env, stdout=log, stderr=subprocess.STDOUT,
+            process = subprocess.Popen(command,
+                                       cwd=root,
+                                       env=env,
+                                       stdout=log,
+                                       stderr=subprocess.STDOUT,
                                        start_new_session=True)
             record.update(pid=process.pid, pgid=process.pid)
             (args.evidence / "process.json").write_text(json.dumps(record, indent=2) + "\n")

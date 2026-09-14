@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: E501
 """Account for an entire four-rank acquisition, including capture and DSpark.
 
 Recipe/tensor joins and pre-graph slicing follow the archived V4 and V4.1
@@ -47,17 +48,34 @@ def kernel_label(name):
 
 
 def io(node, prefix):
-    return [tensor(value) for key, value in sorted(node["attrs"].items(), key=lambda item: (
-        int(item[0].rsplit(":", 1)[1]) if item[0].startswith(prefix) else -1)) if key.startswith(prefix)]
+    return [
+        tensor(value) for key, value in sorted(node["attrs"].items(),
+                                               key=lambda item: (int(item[0].rsplit(":", 1)[1])
+                                                                 if item[0].startswith(prefix) else -1))
+        if key.startswith(prefix)
+    ]
 
 
 @lru_cache(maxsize=256)
 def graph(path):
     data = graph_nodes(Path(path))
-    return {"nodes": data, "by_name": {n["name"]: n for n in data},
-            "producers": {t["name"]: n for n in data for t in io(n, "outputTensor:")},
-            "aliases": {t["name"]: t["alias"] for n in data
-                        for t in io(n, "inputTensor:") + io(n, "outputTensor:") if t["alias"]}}
+    return {
+        "nodes": data,
+        "by_name": {
+            n["name"]: n
+            for n in data
+        },
+        "producers": {
+            t["name"]: n
+            for n in data
+            for t in io(n, "outputTensor:")
+        },
+        "aliases": {
+            t["name"]: t["alias"]
+            for n in data
+            for t in io(n, "inputTensor:") + io(n, "outputTensor:") if t["alias"]
+        }
+    }
 
 
 def roots(data, name):
@@ -84,8 +102,10 @@ def expression(contract):
         return [], "pre-graph absent"
     post, before = graph(str(path)), graph(str(pre))
     incoming = set().union(*(roots(post, t["name"]) for t in contract["inputs"]))
-    pending = [name for t in contract["outputs"] for name in roots(post, t["name"])
-               if name in before["producers"] and name not in incoming]
+    pending = [
+        name for t in contract["outputs"] for name in roots(post, t["name"])
+        if name in before["producers"] and name not in incoming
+    ]
     if not pending:
         return [], "output ancestry unresolved"
     seen, found = set(), {}
@@ -97,8 +117,8 @@ def expression(contract):
         node = before["producers"].get(name)
         if node is None:
             continue
-        if (node["op"] in ("GEMM", "BatchGemm") or node["op"].startswith("custom_")
-                or "linear_fwd" in node["op"] or "batch_gemm" in node["op"]):
+        if (node["op"] in ("GEMM", "BatchGemm") or node["op"].startswith("custom_") or "linear_fwd" in node["op"]
+                or "batch_gemm" in node["op"]):
             return [], "ancestry crosses an independent matrix/custom operation"
         found[node["name"]] = node
         pending.extend(t["name"] for t in io(node, "inputTensor:") if t["name"] not in incoming)
@@ -113,8 +133,11 @@ def symbols(inventory, recipes):
             names[(str(recipe["recipe_id"]), node["device_type"], node["node"], node["kernel"])].append(node)
     result = {}
     for index, node in enumerate(inventory["nodes"]):
-        key = (node["recipe"].split(":")[0], {"TPC": 1, "MME": 0, "DMA": 8}.get(node["engine"]),
-               node["node"], node["kernel"])
+        key = (node["recipe"].split(":")[0], {
+            "TPC": 1,
+            "MME": 0,
+            "DMA": 8
+        }.get(node["engine"]), node["node"], node["kernel"])
         candidates = names.get(key, [])
         if candidates and all(c == candidates[0] for c in candidates):
             result[index] = candidates[0]
@@ -152,8 +175,7 @@ def classify(name, kernel, inputs, outputs, origins):
     shapes = [t["shape"] for t in inputs + outputs]
     if "mxfp4" in source or "mxfp4" in kernel:
         stage = "W13 gate/up" if any(s and 2304 in s for s in shapes) else "W2 down"
-        return "路由专家", stage + (" / BF16 矩阵计算" if kernel in ("GEMM", "BatchGemm")
-                                  else " / ID 寻址、解码及相关处理")
+        return "路由专家", stage + (" / BF16 矩阵计算" if kernel in ("GEMM", "BatchGemm") else " / ID 寻址、解码及相关处理")
     if "bf16_identity" in kernel:
         return "路由专家", "结果复制 / 编译块完成依赖"
     if "quant_roundtrip" in kernel:
@@ -177,18 +199,26 @@ def classify(name, kernel, inputs, outputs, origins):
             return "DSpark context", "target states 合并投影"
         if weight == [64640, 256]:
             return "DSpark Markov", "TP Markov 词表偏置投影"
-        draft_projections = {(1280, 5120): "wq_a 输入投影", (16384, 1280): "wq_b Q 展开",
-                             (512, 5120): "wkv 投影", (5120, 4096): "wo_b 输出投影"}
+        draft_projections = {
+            (1280, 5120): "wq_a 输入投影",
+            (16384, 1280): "wq_b Q 展开",
+            (512, 5120): "wkv 投影",
+            (5120, 4096): "wo_b 输出投影"
+        }
         if inputs and inputs[0]["shape"] and inputs[0]["shape"][0] == 5:
             label = draft_projections.get(tuple(weight or []))
             if label:
                 return "DSpark Attention", label + "；由 C5 与独有投影形状关联"
         if "attention" in source:
-            labels = {(1280, 5120): "wq_a 输入投影", (16384, 1280): "wq_b Q 展开",
-                      (512, 5120): "wkv 投影", (5120, 4096): "wo_b 输出投影",
-                      (128, 512): "index K 投影"}
-            return "Attention/CSA2", ("wo_a 分组输出 BMM" if kernel == "BatchGemm" else
-                                      labels.get(tuple(weight or []), "其他投影 / Compressor；见张量合同"))
+            labels = {
+                (1280, 5120): "wq_a 输入投影",
+                (16384, 1280): "wq_b Q 展开",
+                (512, 5120): "wkv 投影",
+                (5120, 4096): "wo_b 输出投影",
+                (128, 512): "index K 投影"
+            }
+            return "Attention/CSA2", ("wo_a 分组输出 BMM" if kernel == "BatchGemm" else labels.get(
+                tuple(weight or []), "其他投影 / Compressor；见张量合同"))
         if "/moe/" in source:
             return "共享专家", "down 投影" if weight == [5120, 1152] else "gate/up 投影"
         if weight and weight[0] == 64640:
@@ -219,11 +249,16 @@ def eager_contract(node, launches):
             continue
         match = graph(str(path))["by_name"].get(node["node"])
         if match and match["op"] == node["kernel"]:
-            choices.append({"inputs": io(match, "inputTensor:"), "outputs": io(match, "outputTensor:"),
-                            "attributes": match["attrs"], "graph": {"path": str(path),
-                            "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}})
-    if choices and all((c["inputs"], c["outputs"]) == (choices[0]["inputs"], choices[0]["outputs"])
-                       for c in choices):
+            choices.append({
+                "inputs": io(match, "inputTensor:"),
+                "outputs": io(match, "outputTensor:"),
+                "attributes": match["attrs"],
+                "graph": {
+                    "path": str(path),
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest()
+                }
+            })
+    if choices and all((c["inputs"], c["outputs"]) == (choices[0]["inputs"], choices[0]["outputs"]) for c in choices):
         return choices[0]
     return None
 
@@ -232,8 +267,10 @@ def write_csv(path, rows):
     with path.open("w") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
         writer.writeheader()
-        writer.writerows({k: json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v
-                         for k, v in row.items()} for row in rows)
+        writer.writerows({
+            k: json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v
+            for k, v in row.items()
+        } for row in rows)
 
 
 def analyze(root, rank, bounds):
@@ -243,8 +280,10 @@ def analyze(root, rank, bounds):
         raise ValueError("Re-extract this trace with hardware event kinds retained")
     recipes = json.loads((path / "recipe-symbols.json").read_text())["recipes"]
     mapped = symbols(inv, recipes)
-    contracts = {(str(n["recipe_id"]), n["symbol"]["device_type"], n["symbol"]["full_context_id"]): n
-                 for n in json.loads((path / "node-contracts.json").read_text())}
+    contracts = {
+        (str(n["recipe_id"]), n["symbol"]["device_type"], n["symbol"]["full_context_id"]): n
+        for n in json.loads((path / "node-contracts.json").read_text())
+    }
     launches = collections.defaultdict(list)
     for row in inv["host_enqueues"]:
         launches[row[2].split(":")[0]].append(row)
@@ -254,13 +293,13 @@ def analyze(root, rank, bounds):
         for line in stream:
             ts, dur, lane, index, kind = json.loads(line)
             groups[index].append((ts - bounds[0], ts + dur - bounds[0], lane, kind))
-    complete = {i: [r for r in rows if not timestamp_marker(kinds[r[3]])]
-                for i, rows in groups.items()}
+    complete = {i: [r for r in rows if not timestamp_marker(kinds[r[3]])] for i, rows in groups.items()}
     tpc_calls, votes = {}, collections.defaultdict(collections.Counter)
     for index, symbol in mapped.items():
         if symbol["device_type"] != 1 or index not in groups:
             continue
-        spans, reason = reconstruct(complete[index], sum(symbol["working_engines"]),
+        spans, reason = reconstruct(complete[index],
+                                    sum(symbol["working_engines"]),
                                     single_roi=len(symbol["working_engines"]) == 1)
         tpc_calls[index] = (spans, reason)
         if spans and len(complete[index]) == len(groups[index]):
@@ -273,8 +312,11 @@ def analyze(root, rank, bounds):
         # each MME additionally validates every packet group's lane/port set.
         if len(ordered) == 1 or (ordered[0][1] >= 2 and ordered[0][1] > sum(n for _, n in ordered[1:])):
             frequencies[rid] = ordered[0][0]
-        proofs[rid] = {"validated_TPC_node_frequencies": dict(counts),
-                       "selected_frequency": frequencies.get(rid), "disagreement": len(ordered) > 1}
+        proofs[rid] = {
+            "validated_TPC_node_frequencies": dict(counts),
+            "selected_frequency": frequencies.get(rid),
+            "disagreement": len(ordered) > 1
+        }
     all_rows, aggregated, engines = [], collections.defaultdict(list), collections.defaultdict(list)
     window = bounds[1] - bounds[0]
     for index, rows in groups.items():
@@ -317,19 +359,35 @@ def analyze(root, rank, bounds):
         # T=5 is the draft program's static width; target replay admits only
         # C1/C6. Other operations retain their source rather than guessing.
         phase = "DSpark draft" if any(t["shape"] and t["shape"][0] == 5 for t in inputs + outputs) else "target/other"
-        row = {"rank": rank, "node_index": index, "recipe_id": rid,
-               "context_id": symbol["full_context_id"] if symbol else None,
-               "engine": node["engine"], "category": category, "purpose": purpose, "phase_hint": phase,
-               "kernel": node["kernel"], "source_node": node["node"], "reported_dtype": node.get("reported_dtype"),
-               "inputs": inputs, "outputs": outputs, "source_operations": origin,
-               "source_recovery": origin_method, "compiler_contract": contract,
-               "activity_ms": duration(spans) / 1000, "window_pct": duration(spans) / window * 100,
-               "mean_invocation_ms": statistics.mean(values) if values else None,
-               "complete_invocation_samples": len(values), "physical_calls": len(calls) if reason is None else None,
-               "observed_lane_packets": len(rows), "start_only_packets": points,
-               "start_marker_display_ms": duration(point_spans) / 1000,
-               "count_method": count_source, "count_limitation": reason,
-               "hw_events": dict(collections.Counter(kinds[r[3]] for r in rows))}
+        row = {
+            "rank": rank,
+            "node_index": index,
+            "recipe_id": rid,
+            "context_id": symbol["full_context_id"] if symbol else None,
+            "engine": node["engine"],
+            "category": category,
+            "purpose": purpose,
+            "phase_hint": phase,
+            "kernel": node["kernel"],
+            "source_node": node["node"],
+            "reported_dtype": node.get("reported_dtype"),
+            "inputs": inputs,
+            "outputs": outputs,
+            "source_operations": origin,
+            "source_recovery": origin_method,
+            "compiler_contract": contract,
+            "activity_ms": duration(spans) / 1000,
+            "window_pct": duration(spans) / window * 100,
+            "mean_invocation_ms": statistics.mean(values) if values else None,
+            "complete_invocation_samples": len(values),
+            "physical_calls": len(calls) if reason is None else None,
+            "observed_lane_packets": len(rows),
+            "start_only_packets": points,
+            "start_marker_display_ms": duration(point_spans) / 1000,
+            "count_method": count_source,
+            "count_limitation": reason,
+            "hw_events": dict(collections.Counter(kinds[r[3]] for r in rows))
+        }
         all_rows.append(row)
         dtype_shapes = [[(t["dtype"], t["shape"]) for t in side] for side in (inputs, outputs)]
         # API/chunk IDs identify transport packets, not different kernels.
@@ -342,22 +400,33 @@ def analyze(root, rank, bounds):
         spans = [s for _, group, _ in items for s in group]
         values = [v for _, _, group in items for v in group]
         known = all(row["physical_calls"] is not None for row, _, _ in items)
-        summary.append({"rank": rank, "category": key[0], "purpose": key[1], "phase_hint": key[2],
-                        "engine": key[3], "kernel": key[4], "dtype_shapes": json.loads(key[5]),
-                        "mean_invocation_ms": statistics.mean(values) if values else None,
-                        "complete_invocation_samples": len(values),
-                        "physical_calls": sum(row["physical_calls"] for row, _, _ in items) if known else None,
-                        "observed_lane_packets": sum(row["observed_lane_packets"] for row, _, _ in items),
-                        "activity_ms": duration(spans) / 1000, "window_pct": duration(spans) / window * 100,
-                        "node_indices": [row["node_index"] for row, _, _ in items]})
+        summary.append({
+            "rank": rank,
+            "category": key[0],
+            "purpose": key[1],
+            "phase_hint": key[2],
+            "engine": key[3],
+            "kernel": key[4],
+            "dtype_shapes": json.loads(key[5]),
+            "mean_invocation_ms": statistics.mean(values) if values else None,
+            "complete_invocation_samples": len(values),
+            "physical_calls": sum(row["physical_calls"] for row, _, _ in items) if known else None,
+            "observed_lane_packets": sum(row["observed_lane_packets"] for row, _, _ in items),
+            "activity_ms": duration(spans) / 1000,
+            "window_pct": duration(spans) / window * 100,
+            "node_indices": [row["node_index"] for row, _, _ in items]
+        })
     summary.sort(key=lambda r: -r["activity_ms"])
     tpc, mme = duration(engines["TPC"]), duration(engines["MME"])
     compute = duration(engines["TPC"] + engines["MME"])
     device = duration([s for e in engines.values() for s in e])
-    partition = {"TPC_only_ms": (compute - mme) / 1000, "MME_only_ms": (compute - tpc) / 1000,
-                 "TPC_MME_overlap_ms": (tpc + mme - compute) / 1000,
-                 "other_recorded_device_only_ms": (device - compute) / 1000,
-                 "unattributed_ms": (window - device) / 1000}
+    partition = {
+        "TPC_only_ms": (compute - mme) / 1000,
+        "MME_only_ms": (compute - tpc) / 1000,
+        "TPC_MME_overlap_ms": (tpc + mme - compute) / 1000,
+        "other_recorded_device_only_ms": (device - compute) / 1000,
+        "unattributed_ms": (window - device) / 1000
+    }
     assert abs(sum(partition.values()) - window / 1000) < 1e-8
     assert sum(r["observed_lane_packets"] for r in all_rows) == inv["hardware_events"]
     host = collections.defaultdict(list)
@@ -367,10 +436,13 @@ def analyze(root, rank, bounds):
             start, end = max(ts, bounds[0]), min(ts + dur, bounds[1])
             if end > start:
                 host[(cat, name)].append((start - bounds[0], end - bounds[0]))
-    host_rows = [{"category": key[0], "name": key[1], "calls": len(spans),
-                  "activity_ms": duration(spans) / 1000,
-                  "mean_call_ms": statistics.mean(b - a for a, b in spans) / 1000}
-                 for key, spans in host.items()]
+    host_rows = [{
+        "category": key[0],
+        "name": key[1],
+        "calls": len(spans),
+        "activity_ms": duration(spans) / 1000,
+        "mean_call_ms": statistics.mean(b - a for a, b in spans) / 1000
+    } for key, spans in host.items()]
     host_rows.sort(key=lambda r: -r["activity_ms"])
     # Reconcile each GUID after functional splitting, in the same trace window.
     raw_by_guid, rebuilt_by_guid = collections.defaultdict(list), collections.defaultdict(list)
@@ -381,19 +453,43 @@ def analyze(root, rank, bounds):
         rebuilt_by_guid[(key[3], key[4])].extend(s for _, spans, _ in items for s in spans)
     for key in raw_by_guid:
         assert abs(duration(raw_by_guid[key]) - duration(rebuilt_by_guid[key])) < 1e-6, key
-    result = {"rank": rank, "pp": rank // 2, "tp": rank % 2, "trace_sha256": inv["trace_sha256"],
-              "window_ms": window / 1000, "partition": partition, "measured_nodes": len(all_rows),
-              "tensor_contract_nodes": sum(r["compiler_contract"] is not None for r in all_rows),
-              "nodes_with_known_calls": sum(r["physical_calls"] is not None for r in all_rows),
-              "fused_nodes_with_origin": sum(bool(r["source_operations"]) for r in all_rows),
-              "recorded_nic_activity": bool(engines["NIC"]),
-              "nic_message_markers": sum(r["observed_lane_packets"] for r in all_rows if r["engine"] == "NIC"),
-              "kernel_rows": summary, "host_rows": host_rows,
-              "limitations": ["Window includes native capture, prefill, target verification and draft work.",
-                              "NIC message markers do not establish complete collective durations; "
-                              "device communication time remains unmeasured unless complete intervals are present.",
-                              "Unknown physical calls and fused origins are retained explicitly.",
-                              "Start-only marker widths are excluded from measured engine activity."]}
+    result = {
+        "rank":
+        rank,
+        "pp":
+        rank // 2,
+        "tp":
+        rank % 2,
+        "trace_sha256":
+        inv["trace_sha256"],
+        "window_ms":
+        window / 1000,
+        "partition":
+        partition,
+        "measured_nodes":
+        len(all_rows),
+        "tensor_contract_nodes":
+        sum(r["compiler_contract"] is not None for r in all_rows),
+        "nodes_with_known_calls":
+        sum(r["physical_calls"] is not None for r in all_rows),
+        "fused_nodes_with_origin":
+        sum(bool(r["source_operations"]) for r in all_rows),
+        "recorded_nic_activity":
+        bool(engines["NIC"]),
+        "nic_message_markers":
+        sum(r["observed_lane_packets"] for r in all_rows if r["engine"] == "NIC"),
+        "kernel_rows":
+        summary,
+        "host_rows":
+        host_rows,
+        "limitations": [
+            "Window includes native capture, prefill, target verification and draft work.",
+            "NIC message markers do not establish complete collective durations; "
+            "device communication time remains unmeasured unless complete intervals are present.",
+            "Unknown physical calls and fused origins are retained explicitly.",
+            "Start-only marker widths are excluded from measured engine activity."
+        ]
+    }
     (path / "recipe-frequency-proofs.json").write_text(json.dumps(proofs, indent=2) + "\n")
     (path / "node-breakdown.json").write_text(json.dumps(all_rows, ensure_ascii=False) + "\n")
     (path / "acquisition-breakdown.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
@@ -418,26 +514,28 @@ def coverage_qualification(root):
 def render(root, bounds, results):
     coverage, qualification = coverage_qualification(root)
     rows = [r for result in results for r in result["kernel_rows"]]
-    text = ["# DeepSeek V4.1：已记录硬件窗口逐 kernel 拆解", "", qualification, "",
-            "单位均为 ms。每行活动统计限于已记录窗口（其中可能含捕获和 prefill）；不是稳态 ms/token。",
-            "所有 rank 使用同一硬件时钟窗口。未知调用数以 — 表示，不能把 lane 包数当作调用数。", "",
-            "| Rank | 已记录窗口 | 仅 TPC | 仅 MME | TPC/MME 重叠 | 其他设备独占 | 未归因 |",
-            "|---|---:|---:|---:|---:|---:|---:|"]
+    text = [
+        "# DeepSeek V4.1：已记录硬件窗口逐 kernel 拆解", "", qualification, "",
+        "单位均为 ms。每行活动统计限于已记录窗口（其中可能含捕获和 prefill）；不是稳态 ms/token。", "所有 rank 使用同一硬件时钟窗口。未知调用数以 — 表示，不能把 lane 包数当作调用数。",
+        "", "| Rank | 已记录窗口 | 仅 TPC | 仅 MME | TPC/MME 重叠 | 其他设备独占 | 未归因 |", "|---|---:|---:|---:|---:|---:|---:|"
+    ]
     for result in results:
         numbers = [result["window_ms"], *result["partition"].values()]
         text.append(f"| {result['rank']} | " + " | ".join(f"{n:.6f}" for n in numbers) + " |")
-    text.extend(["", "未归因包含其他 PP stage、CPU/提交/依赖等可能性，不能全部称为通信或空闲。",
-                 "NIC 消息标记的显示宽度不代表传输时长；HCCL host API 耗时与设备通信时长分别处理。", "",
-                 "完整表见 [可筛选报告](report.html)。CSV 和节点 JSON 保存张量、recipe/context 与源图关联。", ""])
+    text.extend([
+        "", "未归因包含其他 PP stage、CPU/提交/依赖等可能性，不能全部称为通信或空闲。", "NIC 消息标记的显示宽度不代表传输时长；HCCL host API 耗时与设备通信时长分别处理。", "",
+        "完整表见 [可筛选报告](report.html)。CSV 和节点 JSON 保存张量、recipe/context 与源图关联。", ""
+    ])
     for result in results:
         text.extend([f"## Rank {result['rank']}", ""])
         grouped = collections.defaultdict(list)
         for row in result["kernel_rows"]:
             grouped[row["category"]].append(row)
         for category, items in grouped.items():
-            text.extend([f"### {category}", "",
-                         "| 功能 | Kernel | 平均单次 ms | 活动 ms/采集 | 占比 % | 调用数 | 输入/输出 dtype、shape |",
-                         "|---|---|---:|---:|---:|---:|---|"])
+            text.extend([
+                f"### {category}", "", "| 功能 | Kernel | 平均单次 ms | 活动 ms/采集 | 占比 % | 调用数 | 输入/输出 dtype、shape |",
+                "|---|---|---:|---:|---:|---:|---|"
+            ])
             for row in items:
                 single = "—" if row["mean_invocation_ms"] is None else f"{row['mean_invocation_ms']:.6f}"
                 calls = "—" if row["physical_calls"] is None else str(row["physical_calls"])
@@ -476,12 +574,18 @@ body.innerHTML=rs.map(r=>`<tr><td>${r.rank} · ${esc(r.category)}<br>${esc(r.eng
 <pre>${esc(JSON.stringify(r.dtype_shapes,null,2))}</pre><p>节点索引 ${esc(r.node_indices.join(', '))}</p>
 <a href="rank${r.rank}/node-breakdown.json">完整张量、recipe、源图、计数限制</a></details></td></tr>`).join('');}
 for(const e of [rank,engine,search])e.addEventListener('input',render);render();</script>"""
-    (root / "report.html").write_text(document.replace("COVERAGE_QUALIFICATION", html.escape(qualification))
-                                    .replace("PAYLOAD", payload))
-    (root / "window.json").write_text(json.dumps({"bounds_us": bounds, "units_report": "ms",
-        "scope": "common first-to-last recorded hardware event across all four ranks; recorded events only",
-        "coverage_status": coverage["status"],
-        "analyzer_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}, indent=2) + "\n")
+    (root / "report.html").write_text(
+        document.replace("COVERAGE_QUALIFICATION", html.escape(qualification)).replace("PAYLOAD", payload))
+    (root / "window.json").write_text(
+        json.dumps(
+            {
+                "bounds_us": bounds,
+                "units_report": "ms",
+                "scope": "common first-to-last recorded hardware event across all four ranks; recorded events only",
+                "coverage_status": coverage["status"],
+                "analyzer_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+            },
+            indent=2) + "\n")
 
 
 if __name__ == "__main__":

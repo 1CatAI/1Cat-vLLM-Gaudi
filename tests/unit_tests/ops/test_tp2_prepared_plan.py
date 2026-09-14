@@ -8,10 +8,12 @@ from vllm_gaudi.ops import tp2_prepared_plan as replay
 def test_static_scalar_detection_rejects_changing_graph_inputs():
     graph = torch.fx.Graph()
     source = graph.placeholder("changing_value")
-    static = graph.call_function(torch.ops.aten.scalar_tensor.default, (1e-20,),
-                                 {"dtype": torch.float32, "device": torch.device("cpu")})
-    dynamic = graph.call_function(torch.ops.aten.scalar_tensor.default, (source,))
-    changing_device = graph.call_function(torch.ops.aten.scalar_tensor.default, (1,), {"device": source})
+    static = graph.call_function(torch.ops.aten.scalar_tensor.default, (1e-20, ), {
+        "dtype": torch.float32,
+        "device": torch.device("cpu")
+    })
+    dynamic = graph.call_function(torch.ops.aten.scalar_tensor.default, (source, ))
+    changing_device = graph.call_function(torch.ops.aten.scalar_tensor.default, (1, ), {"device": source})
     assert replay._is_static_scalar(static)
     assert not replay._is_static_scalar(dynamic)
     assert not replay._is_static_scalar(changing_device)
@@ -91,15 +93,14 @@ def test_v4_callsite_prevents_cross_group_plan_aliasing(runtime, monkeypatch):
     prepared = module(1)
     prepared.plan_owners[0] = (id(owner), 0, 7)
     cold = []
-    monkeypatch.setattr(prepared, "_prepare", lambda inputs: cold.append(inputs) or (torch.tensor(99),))
-    with replay.collect_prepared_group_replays(owner=owner, adapter=DEEPSEEK_V4,
-                                             state_generation=7) as context:
+    monkeypatch.setattr(prepared, "_prepare", lambda inputs: cold.append(inputs) or (torch.tensor(99), ))
+    with replay.collect_prepared_group_replays(owner=owner, adapter=DEEPSEEK_V4, state_generation=7) as context:
         context["group_index"] = 0
         assert prepared([1])[0].item() == 1
         context["group_index"] = 1
         assert prepared([1])[0].item() == 99
     assert cold == [[1]]
-    assert runtime == [((1,), [[1]])]
+    assert runtime == [((1, ), [[1]])]
 
 
 def test_state_mutation_failure_is_never_retried(runtime, monkeypatch):
@@ -135,10 +136,11 @@ def test_variant_invalidation_preserves_other_bucket(runtime):
     other = Plan(2, torch.tensor(2))
     instance.plans.append(other)
     instance.plan_owners[:] = [(id(left), 0, 0), (id(right), 0, 0)]
-    instance.signature_keys[:] = [(1,), (2,)]
+    instance.signature_keys[:] = [(1, ), (2, )]
     retired = []
 
     class Graph:
+
         def reset_slots(self):
             retired.append("wait")
 
@@ -152,7 +154,7 @@ def test_variant_invalidation_preserves_other_bucket(runtime):
     assert retired == ["wait", "close"]
     assert instance.plans == [other] and other.valid
     assert instance.plan_owners == [(id(right), 0, 0)]
-    assert instance.signature_keys == [(2,)]
+    assert instance.signature_keys == [(2, )]
     assert replay._native_graphs == {"right": second}
 
 
@@ -162,6 +164,10 @@ def test_profiler_recapture_waits_before_retiring_commands_and_preserves_recipes
     plan = first.plans[0]
 
     class Graph:
+
+        def state(self):
+            return 2
+
         def reset_slots(self):
             events.append("reset")
 
@@ -177,6 +183,25 @@ def test_profiler_recapture_waits_before_retiring_commands_and_preserves_recipes
     assert replay._native_program_generation == generation + 1
     with replay.collect_prepared_group_replays(), pytest.raises(RuntimeError, match="inside a decoder call"):
         replay.recapture_native_decoder_programs()
+
+
+def test_rejected_capture_closes_without_resetting_uninstantiated_slots():
+    events = []
+
+    class RejectedGraph:
+
+        def state(self):
+            return 1
+
+        def reset_slots(self):
+            raise AssertionError("A rejected capture has no instantiated replay slots")
+
+        def close(self):
+            events.append("close")
+
+    replay._native_graphs["rejected"] = RejectedGraph()
+    replay._release_native_graphs()
+    assert events == ["close"] and not replay._native_graphs
 
 
 @pytest.mark.parametrize("groups", [1, 8])

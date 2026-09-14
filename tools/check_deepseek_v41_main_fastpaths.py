@@ -32,16 +32,23 @@ def timing(native, iterations=64):
         native.replay()
     end.record()
     end.synchronize()
-    return {"replays": iterations, "synchronized_host_ms": (time.monotonic_ns() - started) / 1e6 / iterations,
-            "device_event_ms": start.elapsed_time(end) / iterations, "native_info": native.info(),
-            "native_statistics": list(native.statistics)}
+    return {
+        "replays": iterations,
+        "synchronized_host_ms": (time.monotonic_ns() - started) / 1e6 / iterations,
+        "device_event_ms": start.elapsed_time(end) / iterations,
+        "native_info": native.info(),
+        "native_statistics": list(native.statistics)
+    }
 
 
 def compare(actual, expected):
     error = (actual.float() - expected.float()).abs()
-    return {"bf16_mismatches": int((actual.view(torch.int16) != expected.view(torch.int16)).sum()),
-            "max_absolute_error": float(error.max()), "rmse": float(error.square().mean().sqrt()),
-            "finite": bool(actual.isfinite().all())}
+    return {
+        "bf16_mismatches": int((actual.view(torch.int16) != expected.view(torch.int16)).sum()),
+        "max_absolute_error": float(error.max()),
+        "rmse": float(error.square().mean().sqrt()),
+        "finite": bool(actual.isfinite().all())
+    }
 
 
 def moe(args, out):
@@ -68,15 +75,17 @@ def moe(args, out):
     (out / "weight-preparation.json").write_text(json.dumps(preparation, indent=2) + "\n")
     lookup = mxfp4_bf16_lut(torch.device("hpu"))
     normal = shard.manifest["normal_scales"]["layers.0.ffn.experts"][0]
-    name = {"bf16": "custom_deepseek_v41_expert_n256_moe_bf16_gaudi2",
-            "fp8": "custom_deepseek_v41_expert_n256_moe_fp8_gaudi2",
-            "fp8-fused": "custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2"}[args.precision]
+    name = {
+        "bf16": "custom_deepseek_v41_expert_n256_moe_bf16_gaudi2",
+        "fp8": "custom_deepseek_v41_expert_n256_moe_fp8_gaudi2",
+        "fp8-fused": "custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2"
+    }[args.precision]
     op = getattr(torch.ops.custom_op, name)
     extra = () if args.precision == "bf16" else (weights["w13_channel"], weights["w2_channel"])
 
     def complete(x, ids, routing):
-        return (op(x, ids, routing, weights["w13_q16"], weights["w2_q16"], weights["w13_s16"],
-                   weights["w2_s16"], lookup, *extra, normal),)
+        return (op(x, ids, routing, weights["w13_q16"], weights["w2_q16"], weights["w13_s16"], weights["w2_s16"],
+                   lookup, *extra, normal), )
 
     compiled = torch.compile(complete, backend="hpu_backend", fullgraph=True, dynamic=False)
     paths = sorted(args.references.glob("real-weight-*.pt"))
@@ -101,9 +110,13 @@ def moe(args, out):
             replayed = native.outputs[0].cpu()
             consistency = compare(replayed, ordinary)
             reference = compare(replayed, saved["expected"])
-            record = {"case": str(path), "precision": args.precision, "ordinary_vs_replay": consistency,
-                      "frozen_bf16_reference": reference,
-                      "scope": "Complete routed MoE; excludes other model modules and input staging, not full C6"}
+            record = {
+                "case": str(path),
+                "precision": args.precision,
+                "ordinary_vs_replay": consistency,
+                "frozen_bf16_reference": reference,
+                "scope": "Complete routed MoE; excludes other model modules and input staging, not full C6"
+            }
             if consistency["bf16_mismatches"] or not reference["finite"]:
                 records.append(record)
                 torch.save({"replay": replayed, "ordinary": ordinary, "saved": saved}, out / "moe-failure.pt")
@@ -148,7 +161,7 @@ def mla(args, out):
     host_inputs = [q, swa, main, row_ids, ids, sink, scale, lengths]
     inputs = [x.to("hpu") for x in host_inputs]
     op = torch.ops.custom_op.custom_deepseek_v41_paged_mla_mme_gaudi2
-    compiled = torch.compile(lambda *x: (op(*x),), backend="hpu_backend", fullgraph=True, dynamic=False)
+    compiled = torch.compile(lambda *x: (op(*x), ), backend="hpu_backend", fullgraph=True, dynamic=False)
     compiled(*inputs)
     torch.hpu.synchronize()
     native = ComponentReplay(compiled, inputs)
@@ -168,11 +181,21 @@ def mla(args, out):
             torch.hpu.synchronize()
             result = native.outputs[0].cpu()
             expected = mla_reference(q, cache, ids, sink, scale, lengths)
-            record = {"generation": generation, "ordinary_vs_replay": compare(result, ordinary),
-                      "fp32_reference": compare(result, expected),
-                      "scope": "Selected KV decode, gather, QK, softmax, PV and BF16 output; not full attention/C6"}
-            torch.save({"inputs": host_inputs, "q": q, "ids": ids, "lengths": lengths,
-                        "actual": result, "expected": expected}, out / f"mla-{generation}.pt")
+            record = {
+                "generation": generation,
+                "ordinary_vs_replay": compare(result, ordinary),
+                "fp32_reference": compare(result, expected),
+                "scope": "Selected KV decode, gather, QK, softmax, PV and BF16 output; not full attention/C6"
+            }
+            torch.save(
+                {
+                    "inputs": host_inputs,
+                    "q": q,
+                    "ids": ids,
+                    "lengths": lengths,
+                    "actual": result,
+                    "expected": expected
+                }, out / f"mla-{generation}.pt")
             records.append(record)
             if record["ordinary_vs_replay"]["bf16_mismatches"] or not record["fp32_reference"]["finite"]:
                 raise RuntimeError("Selected MLA changed-input replay contract failed")

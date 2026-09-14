@@ -16,15 +16,14 @@ from collect_deepseek_v41_trace import recipe_symbols
 
 class Node(ct.Structure):
     _fields_ = [("device", ct.c_uint32), ("context", ct.c_uint16), ("full_context", ct.c_uint32),
-                ("descriptors", ct.c_uint32), ("blob", ct.c_uint32), ("name", ct.c_void_p),
-                ("operation", ct.c_void_p), ("dtype", ct.c_void_p), ("rois", ct.c_uint16),
-                ("engines", ct.c_void_p)]
+                ("descriptors", ct.c_uint32), ("blob", ct.c_uint32), ("name", ct.c_void_p), ("operation", ct.c_void_p),
+                ("dtype", ct.c_void_p), ("rois", ct.c_uint16), ("engines", ct.c_void_p)]
 
 
 class Debug(ct.Structure):
-    _fields_ = [("major", ct.c_uint32), ("minor", ct.c_uint32), ("recipe", ct.c_uint16),
-                ("count", ct.c_uint32), ("nodes", ct.POINTER(Node)), ("printf_count", ct.c_uint32),
-                ("printf_address", ct.c_void_p), ("printf_section", ct.c_uint64)]
+    _fields_ = [("major", ct.c_uint32), ("minor", ct.c_uint32), ("recipe", ct.c_uint16), ("count", ct.c_uint32),
+                ("nodes", ct.POINTER(Node)), ("printf_count", ct.c_uint32), ("printf_address", ct.c_void_p),
+                ("printf_section", ct.c_uint64)]
 
 
 def main():
@@ -33,7 +32,8 @@ def main():
     parser.add_argument("output", type=Path)
     parser.add_argument("--library", type=Path, required=True)
     parser.add_argument("--sha256", required=True)
-    parser.add_argument("--virtual-chain", action="store_true",
+    parser.add_argument("--virtual-chain",
+                        action="store_true",
                         help="Exercise the exact legacy profiler getRecipeDebugInfo slot through its wrapper chain")
     args = parser.parse_args()
     with args.library.open("rb") as stream:
@@ -68,13 +68,15 @@ def main():
             try:
                 assert get_debug(instance, handle, ct.byref(pointer)) == 0
                 actual = pointer.contents
-                assert (actual.major, actual.minor, actual.recipe, actual.count) == (
-                    expected["major"], expected["minor"], expected["recipe_id"], len(expected["nodes"]))
+                assert (actual.major, actual.minor, actual.recipe,
+                        actual.count) == (expected["major"], expected["minor"], expected["recipe_id"],
+                                          len(expected["nodes"]))
                 for index, reference in enumerate(expected["nodes"]):
                     node = actual.nodes[index]
-                    assert (node.device, node.context, node.full_context, node.descriptors, node.blob) == (
-                        reference["device_type"], reference["context_id"], reference["full_context_id"],
-                        reference["descriptors"], reference["kernel_blob_index"])
+                    assert (node.device, node.context, node.full_context, node.descriptors,
+                            node.blob) == (reference["device_type"], reference["context_id"],
+                                           reference["full_context_id"], reference["descriptors"],
+                                           reference["kernel_blob_index"])
                     for address, name in ((node.name, "node"), (node.operation, "kernel"), (node.dtype, "dtype")):
                         assert address and ct.string_at(address).decode() == reference[name]
                     assert node.rois == len(reference["working_engines"])
@@ -82,11 +84,17 @@ def main():
                 records.append({"path": str(path), "sha256": expected["sha256"], "nodes": actual.count})
             finally:
                 assert release(handle) == 0
-        (args.output / "result.json").write_text(json.dumps({"library": str(args.library), "sha256": digest,
-            "virtual_chain": args.virtual_chain,
-            "status": "deserialized debug metadata matches serialized source", "recipes": records,
-            "limitation": "No device launch, live profiler registration or asynchronous lifetime is exercised"},
-            indent=2) + "\n")
+        (args.output / "result.json").write_text(
+            json.dumps(
+                {
+                    "library": str(args.library),
+                    "sha256": digest,
+                    "virtual_chain": args.virtual_chain,
+                    "status": "deserialized debug metadata matches serialized source",
+                    "recipes": records,
+                    "limitation": "No device launch, live profiler registration or asynchronous lifetime is exercised"
+                },
+                indent=2) + "\n")
     finally:
         assert destroy() == 0
 

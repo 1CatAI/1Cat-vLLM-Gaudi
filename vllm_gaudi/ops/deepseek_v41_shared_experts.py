@@ -32,8 +32,7 @@ def shared_expert_moe(value, ids, routing, weights, lookup, normal):
     active, rows = expert_owners(ids)
     ids = ids.to(torch.int32).reshape(1, -1).contiguous()
     op = torch.ops.custom_op.custom_deepseek_v41_mxfp4_shared_linear_bf16_gaudi2
-    first = op(value.unsqueeze(0), ids, active, weights.w13_q16,
-               weights.w13_s16, lookup, normal)
+    first = op(value.unsqueeze(0), ids, active, weights.w13_q16, weights.w13_s16, lookup, normal)
     # Inactive batches are unspecified internal storage. Every selected row
     # belongs to an active owner; no reduction may consume inactive batches.
     gate_up = first.flatten(0, 1).index_select(0, rows).reshape(tokens, experts, -1)
@@ -42,8 +41,7 @@ def shared_expert_moe(value, ids, routing, weights, lookup, normal):
     up = gate_up[..., width:].float().clamp(-10.0, 10.0)
     middle = (F.silu(gate) * up * routing.unsqueeze(-1)).to(torch.bfloat16)
     # Keep the explicit BF16 boundary used by the original compound op.
-    middle = torch.ops.custom_op.custom_deepseek_v41_bf16_identity_gaudi2(
-        middle.reshape(1, -1)).reshape(batches, width)
+    middle = torch.ops.custom_op.custom_deepseek_v41_bf16_identity_gaudi2(middle.reshape(1, -1)).reshape(batches, width)
     packed = torch.zeros((batches * tokens, width), dtype=value.dtype, device=value.device)
     packed = packed.index_copy(0, rows, middle).reshape(batches, tokens, width)
     down = op(packed, ids, active, weights.w2_q16, weights.w2_s16, lookup, normal)
@@ -51,5 +49,5 @@ def shared_expert_moe(value, ids, routing, weights, lookup, normal):
     result = down[:, 0]
     for expert in range(1, experts):
         result = result + down[:, expert]
-    return torch.ops.custom_op.custom_deepseek_v41_bf16_identity_gaudi2(
-        result.to(value.dtype).reshape(1, -1)).reshape_as(value)
+    return torch.ops.custom_op.custom_deepseek_v41_bf16_identity_gaudi2(result.to(value.dtype).reshape(
+        1, -1)).reshape_as(value)

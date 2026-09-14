@@ -14,7 +14,13 @@ from torch import nn
 from vllm_gaudi import envs as gaudi_envs
 from vllm_gaudi.ops.deepseek_v41_qkv import FusedQKVInput
 from vllm_gaudi.ops.deepseek_v41_math import (
-    apply_rope, pack_fp4, pack_swa, rms_norm, rotary_table, unpack_fp4, unpack_swa,
+    apply_rope,
+    pack_fp4,
+    pack_swa,
+    rms_norm,
+    rotary_table,
+    unpack_fp4,
+    unpack_swa,
 )
 
 PAGE_TOKENS = 128
@@ -59,6 +65,7 @@ def _shared_prefix_attention_layout(physical, selected, window, swa_offsets):
 
 
 class PagedCSA2SharedState(nn.Module):
+
     def __init__(self, config, layer_start, layer_stop, device, max_length):
         super().__init__()
         self.length = max_length
@@ -68,21 +75,28 @@ class PagedCSA2SharedState(nn.Module):
                 ratio = config["compress_ratios"][source]
                 cache = nn.Module()
                 cache.ratio = ratio
-                cache.register_buffer("main", torch.zeros(2 * PAGE_TOKENS // ratio, 288,
-                                                          dtype=torch.uint8, device=device), False)
-                cache.register_buffer("index", torch.zeros(2 * PAGE_TOKENS // ratio, 68,
-                                                           dtype=torch.uint8, device=device), False)
+                cache.register_buffer("main",
+                                      torch.zeros(2 * PAGE_TOKENS // ratio, 288, dtype=torch.uint8, device=device),
+                                      False)
+                cache.register_buffer("index",
+                                      torch.zeros(2 * PAGE_TOKENS // ratio, 68, dtype=torch.uint8, device=device),
+                                      False)
                 self.sources[str(source)] = cache
         for source in config["index_source_layer_ids"]:
             if layer_start <= source < layer_stop:
                 selection = nn.Module()
-                selection.register_buffer("indices", torch.full((WORK_TOKENS, 512), -1,
-                                                                 dtype=torch.int32, device=device), False)
+                selection.register_buffer("indices", torch.full((WORK_TOKENS, 512),
+                                                                -1,
+                                                                dtype=torch.int32,
+                                                                device=device), False)
                 self.topk[str(source)] = selection
-        self.register_buffer("candidate_pool", torch.full(
-            (WORK_TOKENS, config["candidate_topk_blocks"], config["candidate_block_size"]),
-            -1, dtype=torch.int32, device=device) if layer_start <= config["candidate_source_layer_id"] < layer_stop
-            else None, False)
+        self.register_buffer(
+            "candidate_pool",
+            torch.full((WORK_TOKENS, config["candidate_topk_blocks"], config["candidate_block_size"]),
+                       -1,
+                       dtype=torch.int32,
+                       device=device) if layer_start <= config["candidate_source_layer_id"] < layer_stop else None,
+            False)
         table = torch.zeros((max_length + PAGE_TOKENS - 1) // PAGE_TOKENS, dtype=torch.int32, device=device)
         table[0] = 1
         self.register_buffer("block_table", table, False)
@@ -90,8 +104,8 @@ class PagedCSA2SharedState(nn.Module):
         for name, compressed in (("swa_rotary", False), ("compressed_rotary", True)):
             table = rotary_table(config["qk_rope_head_dim"], max_length,
                                  config["compress_rope_theta"] if compressed else config["rope_theta"],
-                                 scaling["original_max_position_embeddings"] if compressed else 0,
-                                 scaling["factor"], scaling["beta_fast"], scaling["beta_slow"])
+                                 scaling["original_max_position_embeddings"] if compressed else 0, scaling["factor"],
+                                 scaling["beta_fast"], scaling["beta_slow"])
             self.register_buffer(name, table.to(device), False)
 
     def physical_rows(self, rows, ratio):
@@ -101,6 +115,7 @@ class PagedCSA2SharedState(nn.Module):
 
 
 class PagedCSA2Attention(FusedQKVInput, nn.Module):
+
     def __init__(self, weights, config, layer, shared, linear, reduce, gather, device):
         super().__init__()
         self.weights, self.shared = weights, shared
@@ -138,7 +153,8 @@ class PagedCSA2Attention(FusedQKVInput, nn.Module):
         self.register_buffer("window_offsets", torch.arange(self.window, dtype=torch.int32, device=device), False)
         self.register_buffer("compressed_offsets", torch.arange(512, dtype=torch.int32, device=device), False)
         self.register_buffer("swa_offsets", torch.arange(SWA_ROWS, dtype=torch.int32, device=device), False)
-        self.register_buffer("selected_offsets", torch.arange(WORK_TOKENS * 512, dtype=torch.int32, device=device), False)
+        self.register_buffer("selected_offsets", torch.arange(WORK_TOKENS * 512, dtype=torch.int32, device=device),
+                             False)
         self.register_buffer("scale", torch.tensor([512**-0.5], dtype=torch.float32, device=device), False)
 
     def _compress(self, value, positions):
@@ -175,8 +191,7 @@ class PagedCSA2Attention(FusedQKVInput, nn.Module):
         physical = self.shared.physical_rows(logical_rows.clamp_min(0), self.ratio)
         packed = self.cache.index.index_select(0, physical.flatten().long()).reshape(*physical.shape, 68)
         keys = unpack_fp4(packed, 128, 32)
-        scores = (torch.einsum("thd,nd->thn", q, keys) if keys.ndim == 2
-                  else torch.einsum("thd,tnd->thn", q, keys))
+        scores = (torch.einsum("thd,nd->thn", q, keys) if keys.ndim == 2 else torch.einsum("thd,tnd->thn", q, keys))
         scores = scores.relu() * weights.unsqueeze(-1)
         # Retain the two TP partial-sum BF16 boundaries of the checkpoint reference.
         scores = scores.reshape(value.shape[0], 2, self.index_heads, -1).sum(2).sum(1)
@@ -236,10 +251,10 @@ class PagedCSA2Attention(FusedQKVInput, nn.Module):
 
     def _output(self, query, cache, indices, positions, ready_outputs=()):
         if self.mla_mme and 1 <= query.shape[0] <= WORK_TOKENS:
-            lengths = torch.full((query.shape[0],), indices.shape[1], dtype=torch.int32, device=query.device)
+            lengths = torch.full((query.shape[0], ), indices.shape[1], dtype=torch.int32, device=query.device)
             output = torch.ops.custom_op.custom_deepseek_v41_selected_mla_mme_gaudi2(
-                query.contiguous(), cache.contiguous(), indices.contiguous(),
-                self.weights.attn_sink, self.scale, lengths)
+                query.contiguous(), cache.contiguous(), indices.contiguous(), self.weights.attn_sink, self.scale,
+                lengths)
             return self._finish_output(output, positions, ready_outputs)
         output, _, _ = torch.ops.custom_op.custom_deepseek_v4_sparse_attn_bf16_gaudi2(
             query.contiguous(), cache.contiguous(), indices.contiguous(), self.weights.attn_sink, self.scale)
@@ -265,50 +280,48 @@ class PagedCSA2Attention(FusedQKVInput, nn.Module):
                 self._compress(value, positions)
             selected = self._select(value, qr, positions)
             physical = None if native_prefix else self.shared.physical_rows(selected.clamp_min(0), self.ratio)
-            if (self.direct_selected_kv and value.device.type == "hpu" and
-                    selected.numel() <= self.selected_offsets.numel()):
+            if (self.direct_selected_kv and value.device.type == "hpu"
+                    and selected.numel() <= self.selected_offsets.numel()):
                 # Decode the fixed SWA prefix and all selected paged rows in
                 # one graph entry, then consume its internal BF16 value directly
                 # in sparse attention. This removes unpack_swa, cat, and the
                 # exposed selected-row temporary from the Python graph.
                 if self.shared_prefix_kv and self.search_length // self.index_ratio <= 512:
                     if native_prefix:
-                        layout = (torch.ops.custom_op.custom_deepseek_v41_prefix_layout_r1_i32_gaudi2
-                                  if self.ratio == 1 else
-                                  torch.ops.custom_op.custom_deepseek_v41_prefix_layout_r2_i32_gaudi2)
-                        row_ids, attention_indices, lengths = layout(
-                            selected.contiguous(), positions.to(torch.int32).contiguous(), self.shared.block_table)
+                        layout = (torch.ops.custom_op.custom_deepseek_v41_prefix_layout_r1_i32_gaudi2 if self.ratio == 1
+                                  else torch.ops.custom_op.custom_deepseek_v41_prefix_layout_r2_i32_gaudi2)
+                        row_ids, attention_indices, lengths = layout(selected.contiguous(),
+                                                                     positions.to(torch.int32).contiguous(),
+                                                                     self.shared.block_table)
                     else:
                         row_ids, attention_indices, lengths = _shared_prefix_attention_layout(
                             physical, selected, indices, self.swa_offsets)
                     attention_op = (
-                        torch.ops.custom_op.custom_deepseek_v41_paged_mla_mme_gaudi2
-                        if self.mla_mme else
+                        torch.ops.custom_op.custom_deepseek_v41_paged_mla_mme_gaudi2 if self.mla_mme else
                         torch.ops.custom_op.custom_deepseek_v41_paged_attention_head_vector_bf16_gaudi2
                         if self.head_vector_attn else
-                        torch.ops.custom_op.custom_deepseek_v41_paged_attention_sram_bf16_gaudi2
-                        if self.sram_kv else
-                        torch.ops.custom_op.custom_deepseek_v41_paged_attention_vector_scales_bf16_gaudi2
-                        if self.vector_kv_scales else
-                        torch.ops.custom_op.custom_deepseek_v41_paged_attention_packed_exp_bf16_gaudi2
-                        if self.packed_attn_exp else
-                        torch.ops.custom_op.custom_deepseek_v41_paged_attention_lengths_bf16_gaudi2)
-                    output = attention_op(
-                        query.contiguous(), self.swa.contiguous(), self.cache.main.contiguous(),
-                        row_ids, attention_indices, self.weights.attn_sink, self.scale, lengths)
+                        torch.ops.custom_op.custom_deepseek_v41_paged_attention_sram_bf16_gaudi2 if self.sram_kv else
+                        torch.ops.custom_op.custom_deepseek_v41_paged_attention_vector_scales_bf16_gaudi2 if self.
+                        vector_kv_scales else torch.ops.custom_op.
+                        custom_deepseek_v41_paged_attention_packed_exp_bf16_gaudi2 if self.packed_attn_exp else torch.
+                        ops.custom_op.custom_deepseek_v41_paged_attention_lengths_bf16_gaudi2)
+                    output = attention_op(query.contiguous(), self.swa.contiguous(), self.cache.main.contiguous(),
+                                          row_ids, attention_indices, self.weights.attn_sink, self.scale, lengths)
                     return self._finish_output(output, positions, ready_outputs)
-                row_ids, attention_indices = _selected_attention_layout(
-                    physical, selected, indices, self.swa_offsets, self.selected_offsets)
+                row_ids, attention_indices = _selected_attention_layout(physical, selected, indices, self.swa_offsets,
+                                                                        self.selected_offsets)
                 if self.mla_mme:
-                    lengths = torch.full((value.shape[0],), attention_indices.shape[1],
-                                         dtype=torch.int32, device=value.device)
+                    lengths = torch.full((value.shape[0], ),
+                                         attention_indices.shape[1],
+                                         dtype=torch.int32,
+                                         device=value.device)
                     output = torch.ops.custom_op.custom_deepseek_v41_paged_mla_mme_gaudi2(
-                        query.contiguous(), self.swa.contiguous(), self.cache.main.contiguous(),
-                        row_ids, attention_indices, self.weights.attn_sink, self.scale, lengths)
+                        query.contiguous(), self.swa.contiguous(), self.cache.main.contiguous(), row_ids,
+                        attention_indices, self.weights.attn_sink, self.scale, lengths)
                     return self._finish_output(output, positions, ready_outputs)
                 output = torch.ops.custom_op.custom_deepseek_v41_paged_attention_bf16_gaudi2(
-                    query.contiguous(), self.swa.contiguous(), self.cache.main.contiguous(),
-                    row_ids, attention_indices, self.weights.attn_sink, self.scale)
+                    query.contiguous(), self.swa.contiguous(), self.cache.main.contiguous(), row_ids, attention_indices,
+                    self.weights.attn_sink, self.scale)
                 return self._finish_output(output, positions, ready_outputs)
             else:
                 packed = self.cache.main.index_select(0, physical.flatten().long())

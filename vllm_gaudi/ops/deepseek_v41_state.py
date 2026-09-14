@@ -61,9 +61,13 @@ def register_state_spec(vllm_config=None):
 
 
 class StageStateBlocks:
+
     def __init__(self, program):
         self.program = program
-        mutable = {"swa", "main", "index", "indices", "candidate_pool", "kv_history", "score_history"}
+        mutable = {
+            "swa", "main", "decoded_swa", "decoded_main", "index", "indices", "candidate_pool", "kv_history",
+            "score_history"
+        }
         self.bindings, self.specs, self.allocations = {}, {}, {}
         for module_name, module in program.named_modules():
             for name, value in module.named_buffers(recurse=False):
@@ -79,8 +83,10 @@ class StageStateBlocks:
             raise ValueError("V4.1 state allocator requires at least one whole request block")
         if self.program.replay_owner is not None:
             self.program.replay_owner.close()
-        self.allocations = {name: torch.zeros((blocks, *spec.state_shape), dtype=spec.state_dtype, device=device)
-                            for name, spec in self.specs.items()}
+        self.allocations = {
+            name: torch.zeros((blocks, *spec.state_shape), dtype=spec.state_dtype, device=device)
+            for name, spec in self.specs.items()
+        }
         self.blocks, self.active = blocks, None
         self.bind(0)
 
@@ -124,9 +130,14 @@ request. Compressed history stays in its scheduler-owned HPU pages.
                 key = f"dsv41.pp{program.pp_rank}.source{source}.{name}"
                 self.bindings[key] = cache, name
                 self.specs[key] = V41StateSpec(block_size=PAGE_TOKENS,
-                    state_shape=(PAGE_TOKENS // cache.ratio, width), state_dtype=torch.uint8, paged=True)
-        self.working = {name: value for name, value in program.named_buffers()
-                        if name.rsplit(".", 1)[-1] in ("swa", "kv_history", "score_history")}
+                                               state_shape=(PAGE_TOKENS // cache.ratio, width),
+                                               state_dtype=torch.uint8,
+                                               paged=True)
+        self.working = {
+            name: value
+            for name, value in program.named_buffers()
+            if name.rsplit(".", 1)[-1] in ("swa", "kv_history", "score_history")
+        }
         self.saved, self.active, self.blocks = {}, None, 2
 
     def allocate(self, blocks, device):
@@ -134,8 +145,10 @@ request. Compressed history stays in its scheduler-owned HPU pages.
             raise ValueError("Paged V4.1 state requires a null page and at least one live page")
         if self.program.replay_owner is not None:
             self.program.replay_owner.close()
-        self.allocations = {key: torch.zeros((blocks, *spec.state_shape), dtype=spec.state_dtype, device=device)
-                            for key, spec in self.specs.items()}
+        self.allocations = {
+            key: torch.zeros((blocks, *spec.state_shape), dtype=spec.state_dtype, device=device)
+            for key, spec in self.specs.items()
+        }
         self.blocks = blocks
         self.bind(0)
 
@@ -183,6 +196,7 @@ request. Compressed history stays in its scheduler-owned HPU pages.
 
     @property
     def allocated_bytes(self):
-        return (sum(value.numel() * value.element_size() for value in self.allocations.values())
-                + sum(value.numel() * value.element_size()
-                      for state in self.saved.values() for value in state.values()))
+        return (sum(value.numel() * value.element_size()
+                    for value in self.allocations.values()) + sum(value.numel() * value.element_size()
+                                                                  for state in self.saved.values()
+                                                                  for value in state.values()))

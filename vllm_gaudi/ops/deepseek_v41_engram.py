@@ -60,18 +60,16 @@ def build_compressed_token_map(tokenizer) -> tuple[list[int], int]:
     # Strip() instead of collapsing to the empty string and merging with
     # unrelated tokens.
     sentinel = "\ue000"
-    normalizer = normalizers.Sequence(
-        [
-            normalizers.NFKC(),
-            normalizers.NFD(),
-            normalizers.StripAccents(),
-            normalizers.Lowercase(),
-            normalizers.Replace(Regex(r"[ \t\r\n]+"), " "),
-            normalizers.Replace(Regex(r"^ $"), sentinel),
-            normalizers.Strip(),
-            normalizers.Replace(sentinel, " "),
-        ]
-    )
+    normalizer = normalizers.Sequence([
+        normalizers.NFKC(),
+        normalizers.NFD(),
+        normalizers.StripAccents(),
+        normalizers.Lowercase(),
+        normalizers.Replace(Regex(r"[ \t\r\n]+"), " "),
+        normalizers.Replace(Regex(r"^ $"), sentinel),
+        normalizers.Strip(),
+        normalizers.Replace(sentinel, " "),
+    ])
 
     # The raw Rust tokenizer, matching what training decodes with
     # (no clean_up_tokenization_spaces).
@@ -131,8 +129,10 @@ class EngramHashLayout:
             raise ValueError("Engram hash buckets exceed the declared checkpoint tables")
         offsets = np.cumsum(np.pad(primes[:, :-1], ((0, 0), (1, 0))), axis=1, dtype=np.int64)
         bound = max(1, (np.iinfo(np.int64).max // vocab_size) // 2)
-        multipliers = np.stack([np.random.default_rng(10007 * layer).integers(
-            0, bound, size=(max_ngram,), dtype=np.int64) * 2 + 1 for layer in layers])
+        multipliers = np.stack([
+            np.random.default_rng(10007 * layer).integers(0, bound, size=(max_ngram, ), dtype=np.int64) * 2 + 1
+            for layer in layers
+        ])
         for array in (primes, offsets, multipliers):
             array.setflags(write=False)
         return cls(layers, rows, primes, offsets, multipliers, vocab_size, config["engram_pad_token_id"],
@@ -144,8 +144,13 @@ class EngramHashLayout:
         sizes = self.primes[self.layer_ids.index(layer)]
         heads_per_rank = (len(sizes) + tp_size - 1) // tp_size
         first, last = tp_rank * heads_per_rank, min(len(sizes), (tp_rank + 1) * heads_per_rank)
-        return {"head_start": first, "head_stop": last, "head_sizes": sizes[first:last].tolist(),
-                "row_start": int(sizes[:first].sum()), "row_stop": int(sizes[:last].sum())}
+        return {
+            "head_start": first,
+            "head_stop": last,
+            "head_sizes": sizes[first:last].tolist(),
+            "row_start": int(sizes[:first].sum()),
+            "row_stop": int(sizes[:last].sum())
+        }
 
 
 @dataclass(frozen=True)
@@ -197,7 +202,8 @@ class EngramTokenHistory:
             tokens = np.asarray(token_ids, dtype=np.int64)
             if tokens.ndim != 1 or not len(tokens) or tokens.min() < 0 or tokens.max() >= len(self.token_map):
                 raise ValueError("Invalid Engram input token IDs")
-            dead = np.zeros(len(tokens), dtype=bool) if image_mask is None else np.array(image_mask, dtype=bool, copy=True)
+            dead = np.zeros(len(tokens), dtype=bool) if image_mask is None else np.array(
+                image_mask, dtype=bool, copy=True)
             if dead.shape != tokens.shape:
                 raise ValueError("Image span mask does not match input tokens")
             compressed = self.token_map[tokens].copy()
@@ -205,8 +211,9 @@ class EngramTokenHistory:
             stream = np.concatenate((self.history, compressed))
             positions = np.arange(len(tokens), dtype=np.int64) + len(self.history)
             rolling = np.zeros((len(tokens), len(self.layout.layer_ids)), dtype=np.int64)
-            hashes = np.empty((len(tokens), len(self.layout.layer_ids), (self.layout.max_ngram - 1) * self.layout.heads),
-                              dtype=np.int32)
+            hashes = np.empty(
+                (len(tokens), len(self.layout.layer_ids), (self.layout.max_ngram - 1) * self.layout.heads),
+                dtype=np.int32)
             blocked = np.zeros(len(tokens), dtype=bool)
             for shift in range(self.layout.max_ngram):
                 lookback = positions - shift
@@ -216,8 +223,8 @@ class EngramTokenHistory:
                 rolling ^= values[:, None] * self.layout.multipliers[None, :, shift]
                 if shift:
                     first, last = (shift - 1) * self.layout.heads, shift * self.layout.heads
-                    hashes[:, :, first:last] = (rolling[:, :, None] % self.layout.primes[None, :, first:last]
-                                               + self.layout.offsets[None, :, first:last])
+                    hashes[:, :, first:last] = (rolling[:, :, None] % self.layout.primes[None, :, first:last] +
+                                                self.layout.offsets[None, :, first:last])
             active = ~dead
             for array in (compressed, hashes, active):
                 array.setflags(write=False)
@@ -235,6 +242,19 @@ class EngramTokenHistory:
             self.position += committed_input_tokens
             self.pending = None
             self.generation += 1
+
+    def prepare_c1(self, request_id, token_id, image, native, transfer_generation, slot):
+        """Native hash/gather shares the ordinary history transaction owner."""
+        with self.lock:
+            if request_id != self.request_id or self.pending is not None:
+                raise RuntimeError("Engram request changed or its previous input is still pending")
+            compressed, hashes, faults = native.prepare(request_id, self.generation, transfer_generation, slot,
+                                                        token_id, image, self.history)
+            active = np.array([not image], dtype=bool)
+            for array in (compressed, hashes, active):
+                array.setflags(write=False)
+            self.pending = EngramHashBatch(request_id, self.generation, self.position, compressed, hashes, active)
+            return self.pending, faults
 
     def discard(self, batch: EngramHashBatch):
         self.commit(batch, 0)

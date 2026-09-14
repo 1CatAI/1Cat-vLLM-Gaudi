@@ -10,22 +10,21 @@ used only as attribution windows; they are not treated as device time.
 import argparse
 import collections
 import gzip
-import hashlib
 import json
 import statistics
 from pathlib import Path
 
-
-MEASURED_KIND = {"TPC": {"TPC_SPU_START_TO_SPU_HALT"},
-                 "MME": {"MMEH_WB0_MON_TS_BIT1", "MMEH_WB1_MON_TS_BIT1"},
-                 # The DMA write-last event is the complete DMA interval in
-                 # this export.  The read-first event is a start marker.
-                 "DMA": {"DBG_DMA_TRC_WR_DATA_LAST"}}
+MEASURED_KIND = {
+    "TPC": {"TPC_SPU_START_TO_SPU_HALT"},
+    "MME": {"MMEH_WB0_MON_TS_BIT1", "MMEH_WB1_MON_TS_BIT1"},
+    # The DMA write-last event is the complete DMA interval in
+    # this export.  The read-first event is a start marker.
+    "DMA": {"DBG_DMA_TRC_WR_DATA_LAST"}
+}
 
 
 class UnionAccumulator:
-    __slots__ = ("last_start", "last_end", "activity", "segments", "packets",
-                 "raw_us", "out_of_order")
+    __slots__ = ("last_start", "last_end", "activity", "segments", "packets", "raw_us", "out_of_order")
 
     def __init__(self):
         self.last_start = None
@@ -54,11 +53,13 @@ class UnionAccumulator:
             self.last_start = start
 
     def json(self):
-        return {"activity_ms": self.activity / 1000.0,
-                "raw_packet_duration_ms": self.raw_us / 1000.0,
-                "segments": self.segments,
-                "packets": self.packets,
-                "out_of_order_packets": self.out_of_order}
+        return {
+            "activity_ms": self.activity / 1000.0,
+            "raw_packet_duration_ms": self.raw_us / 1000.0,
+            "segments": self.segments,
+            "packets": self.packets,
+            "out_of_order_packets": self.out_of_order
+        }
 
 
 def merged(spans):
@@ -113,15 +114,12 @@ def process_rank(root, rank):
     path = root / f"rank{rank}"
     inventory = json.loads((path / "inventory.json").read_text())
     phases = read_phases(path / "host.jsonl.gz")
-    phase_all = [(a, b, n) for values in phases.values() for a, b, n in values]
-    phase_order = ["draft_propose", "target_decode_C6", "target_decode_C1",
-                   "verify_and_commit"]
+    phase_order = ["draft_propose", "target_decode_C6", "target_decode_C1", "verify_and_commit"]
     phases = {name: phases.get(name, []) for name in phase_order}
     kinds = inventory["hw_event_names"]
     nodes = inventory["nodes"]
     # Per phase and kernel union.  Kernel names are kept separate from the
     # EventName/source node to match the user's kernel-level accounting.
-    by_phase = {phase: {} for phase in phases}
     by_engine = {phase: collections.defaultdict(UnionAccumulator) for phase in phases}
     by_phase_total = {phase: UnionAccumulator() for phase in phases}
     by_kernel = {phase: collections.defaultdict(UnionAccumulator) for phase in phases}
@@ -153,32 +151,39 @@ def process_rank(root, rank):
         engines = {engine: acc.json() for engine, acc in by_engine[phase].items()}
         rows = []
         for (engine, kernel, dtype), acc in by_kernel[phase].items():
-            row = {"engine": engine, "kernel": kernel, "reported_dtype": dtype,
-                   **acc.json()}
-            row["cpu_phase_share_pct"] = (row["activity_ms"] * 100000.0 / cpu_us
-                                           if cpu_us else None)
+            row = {"engine": engine, "kernel": kernel, "reported_dtype": dtype, **acc.json()}
+            row["cpu_phase_share_pct"] = (row["activity_ms"] * 100000.0 / cpu_us if cpu_us else None)
             row["device_union_share_pct"] = (row["activity_ms"] * 100000.0 /
-                                              by_phase_total[phase].activity
-                                              if by_phase_total[phase].activity else None)
+                                             by_phase_total[phase].activity if by_phase_total[phase].activity else None)
             rows.append(row)
         rows.sort(key=lambda row: (-row["activity_ms"], row["engine"], row["kernel"]))
-        phase_rows.append({"phase": phase, "calls": len(intervals),
-                           "cpu_annotation_ms": cpu_us / 1000.0,
-                           "cpu_mean_call_ms": statistics.mean((b - a) / 1000 for a, b in cpu_spans)
-                           if cpu_spans else None,
-                           "device_activity_union_ms": by_phase_total[phase].activity / 1000.0,
-                           "device_activity_raw_packet_ms": by_phase_total[phase].raw_us / 1000.0,
-                           "device_activity_by_engine": engines,
-                           "kernel_rows": rows})
-    return {"rank": rank, "pp": rank // 2, "tp": rank % 2,
-            "trace": inventory["trace"], "trace_sha256": inventory["trace_sha256"],
-            "trace_events": inventory["events"], "hardware_records": event_count,
-            "measured_records": measured_count,
-            "window_ms": (inventory["last_us"] - inventory["first_us"]) / 1000.0,
-            "phase_rows": phase_rows,
-            "device_activity_by_engine_window": {k: v.json() for k, v in all_engine.items()},
-            "phase_note": "CPU annotations delimit attribution; hardware rows are timestamp-unioned per engine/kernel."
-            }
+        phase_rows.append({
+            "phase": phase,
+            "calls": len(intervals),
+            "cpu_annotation_ms": cpu_us / 1000.0,
+            "cpu_mean_call_ms": statistics.mean((b - a) / 1000 for a, b in cpu_spans) if cpu_spans else None,
+            "device_activity_union_ms": by_phase_total[phase].activity / 1000.0,
+            "device_activity_raw_packet_ms": by_phase_total[phase].raw_us / 1000.0,
+            "device_activity_by_engine": engines,
+            "kernel_rows": rows
+        })
+    return {
+        "rank": rank,
+        "pp": rank // 2,
+        "tp": rank % 2,
+        "trace": inventory["trace"],
+        "trace_sha256": inventory["trace_sha256"],
+        "trace_events": inventory["events"],
+        "hardware_records": event_count,
+        "measured_records": measured_count,
+        "window_ms": (inventory["last_us"] - inventory["first_us"]) / 1000.0,
+        "phase_rows": phase_rows,
+        "device_activity_by_engine_window": {
+            k: v.json()
+            for k, v in all_engine.items()
+        },
+        "phase_note": "CPU annotations delimit attribution; hardware rows are timestamp-unioned per engine/kernel."
+    }
 
 
 def main():
@@ -186,18 +191,40 @@ def main():
     parser.add_argument("analysis", type=Path)
     args = parser.parse_args()
     results = [process_rank(args.analysis, rank) for rank in range(4)]
-    payload = {"schema_version": 1, "units": {"time": "ms", "raw_trace": "us"},
-               "measured_hw_kinds": {k: sorted(v) for k, v in MEASURED_KIND.items()},
-               "ranks": results}
+    payload = {
+        "schema_version": 1,
+        "units": {
+            "time": "ms",
+            "raw_trace": "us"
+        },
+        "measured_hw_kinds": {
+            k: sorted(v)
+            for k, v in MEASURED_KIND.items()
+        },
+        "ranks": results
+    }
     out = args.analysis / "dspark-verify-breakdown.json"
     out.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-    print(json.dumps({"output": str(out), "ranks": [
-        {"rank": r["rank"], "window_ms": r["window_ms"],
-         "phases": [{"phase": p["phase"], "calls": p["calls"],
-                      "cpu_annotation_ms": p["cpu_annotation_ms"],
-                      "device": p["device_activity_by_engine"]}
-                     for p in r["phase_rows"]]}
-        for r in results]}, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {
+                "output":
+                str(out),
+                "ranks": [{
+                    "rank":
+                    r["rank"],
+                    "window_ms":
+                    r["window_ms"],
+                    "phases": [{
+                        "phase": p["phase"],
+                        "calls": p["calls"],
+                        "cpu_annotation_ms": p["cpu_annotation_ms"],
+                        "device": p["device_activity_by_engine"]
+                    } for p in r["phase_rows"]]
+                } for r in results]
+            },
+            ensure_ascii=False,
+            indent=2))
 
 
 if __name__ == "__main__":

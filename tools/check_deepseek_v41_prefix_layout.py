@@ -30,8 +30,10 @@ def main():
     torch.ops.load_library(os.environ["VLLM_HPU_DSV4_TPC_OP_LIBRARY"])
     torch._dynamo.config.recompile_limit = 64
     old = torch.compile(reference, backend="hpu_backend", fullgraph=True, dynamic=False)
-    ops = [torch.ops.custom_op.custom_deepseek_v41_prefix_layout_r1_i32_gaudi2,
-           torch.ops.custom_op.custom_deepseek_v41_prefix_layout_r2_i32_gaudi2]
+    ops = [
+        torch.ops.custom_op.custom_deepseek_v41_prefix_layout_r1_i32_gaudi2,
+        torch.ops.custom_op.custom_deepseek_v41_prefix_layout_r2_i32_gaudi2
+    ]
     candidates = [torch.compile(op, backend="hpu_backend", fullgraph=True, dynamic=False) for op in ops]
     torch.manual_seed(26)
     records = []
@@ -58,8 +60,13 @@ def main():
                 (destination / "result.json").write_text(json.dumps(records, indent=2) + "\n")
                 print(json.dumps(records[-1]), flush=True)
                 if any(bad):
-                    torch.save(dict(selected=selected, positions=positions, blocks=blocks, expected=expected,
-                                    actual=actual, ratio=ratio), destination / "mismatch.pt")
+                    torch.save(
+                        dict(selected=selected,
+                             positions=positions,
+                             blocks=blocks,
+                             expected=expected,
+                             actual=actual,
+                             ratio=ratio), destination / "mismatch.pt")
                     raise RuntimeError("Fused prefix metadata differs from compiled reference")
 
 

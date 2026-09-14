@@ -43,5 +43,10 @@ def verify_loaded_profile_libraries():
         if digest != item["sha256"]:
             raise RuntimeError(f"Loaded runtime profile library fingerprint changed: {expected}")
         loaded.append({"path": str(expected), "sha256": digest})
-    return {"profile": str(profile_path), "profile_sha256": hashlib.sha256(profile_path.read_bytes()).hexdigest(),
-            "loaded": loaded, "not_loaded_at_sample": pending, "configurations": configurations}
+    return {
+        "profile": str(profile_path),
+        "profile_sha256": hashlib.sha256(profile_path.read_bytes()).hexdigest(),
+        "loaded": loaded,
+        "not_loaded_at_sample": pending,
+        "configurations": configurations
+    }

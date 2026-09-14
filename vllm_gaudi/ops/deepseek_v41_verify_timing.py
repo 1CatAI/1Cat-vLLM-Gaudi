@@ -9,9 +9,10 @@ import torch
 
 
 class VerifyPhaseTiming:
+
     def __init__(self, directory, rank, *, max_records=64):
         self.directory, self.rank = Path(directory), rank
-        self.bridge = getattr(torch, "_vllm_gaudi_tp2_fused_ar_norm_runtime")[0]
+        self.bridge = torch._vllm_gaudi_tp2_fused_ar_norm_runtime[0]
         if not hasattr(self.bridge, "verify_phase_marker"):
             raise RuntimeError("Verify timing requires the diagnostic bridge build")
         self.max_records = max_records
@@ -31,9 +32,12 @@ class VerifyPhaseTiming:
             if stamp["status"] != "complete":
                 raise RuntimeError(f"Verify clock calibration failed: {stamp}")
             device = stamp["device_timestamp_ns"]
-            self.calibrations.append(dict(host_before_ns=before, host_after_ns=after,
-                                          offset_low_ns=before - device, offset_high_ns=after - device,
-                                          marker=stamp))
+            self.calibrations.append(
+                dict(host_before_ns=before,
+                     host_after_ns=after,
+                     offset_low_ns=before - device,
+                     offset_high_ns=after - device,
+                     marker=stamp))
         self.calibration = min(self.calibrations, key=lambda x: x["offset_high_ns"] - x["offset_low_ns"])
 
     def begin(self, request_id, generation, count, proposed):
@@ -41,8 +45,12 @@ class VerifyPhaseTiming:
             raise RuntimeError("Previous verify diagnostic has not been consumed")
         if count != 6 or proposed != 5 or len(self.records) >= self.max_records:
             return
-        self.active = dict(request_id=request_id, generation=generation, count=count,
-                           proposed=proposed, host={}, markers={})
+        self.active = dict(request_id=request_id,
+                           generation=generation,
+                           count=count,
+                           proposed=proposed,
+                           host={},
+                           markers={})
         # Diagnostic only: bound Kineto's wall-clock epoch against the
         # monotonic completion markers without synchronizing the device.
         anchor = f"v41::clock_anchor::rank{self.rank}::generation{generation}"
@@ -50,8 +58,7 @@ class VerifyPhaseTiming:
         with torch.profiler.record_function(anchor):
             pass
         after = time.perf_counter_ns()
-        self.active["trace_anchor"] = dict(name=anchor, host_before_ns=before,
-                                           host_after_ns=after)
+        self.active["trace_anchor"] = dict(name=anchor, host_before_ns=before, host_after_ns=after)
         self.host("round_start")
         self.device("round_start")
 
@@ -97,9 +104,14 @@ class VerifyPhaseTiming:
         self.pending_markers = pending
         self.directory.mkdir(parents=True, exist_ok=True)
         path = self.directory / f"rank{self.rank}-verify-phases.json"
-        path.write_text(json.dumps(dict(
-            schema=1, rank=self.rank, units="ns", clock="CLOCK_MONOTONIC",
-            purpose="Diagnostic markers; not an uninstrumented performance qualification",
-            device_scope="physical compute/current stream, no inserted waits",
-            calibrations=self.calibrations, calibration=self.calibration,
-            records=self.records), indent=2) + "\n")
+        path.write_text(
+            json.dumps(dict(schema=1,
+                            rank=self.rank,
+                            units="ns",
+                            clock="CLOCK_MONOTONIC",
+                            purpose="Diagnostic markers; not an uninstrumented performance qualification",
+                            device_scope="physical compute/current stream, no inserted waits",
+                            calibrations=self.calibrations,
+                            calibration=self.calibration,
+                            records=self.records),
+                       indent=2) + "\n")

@@ -1,0 +1,133 @@
+# SPDX-License-Identifier: Apache-2.0
+import pytest
+import torch
+
+from vllm_gaudi.models.deepseek_v41_program import CompiledStage, PreparedInput, PreparedLayerGroup
+from vllm_gaudi.ops.deepseek_v41_replay import StageReplay
+from vllm_gaudi.ops.tp2_model_adapter import DEEPSEEK_V41_PP0, DEEPSEEK_V41_PP0_INPUT, DEEPSEEK_V41_PP1
+
+
+class EchoGroup(torch.nn.Module):
+    def __init__(self, native_input):
+        super().__init__()
+        self.native_input = native_input
+
+    def forward(self, hidden, pre, positions, ids, engram):
+        return hidden, pre, positions, ids, engram
+
+
+def program(pp_rank=0, dspark=False, fp8=False):
+    value = torch.nn.Module()
+    value.pp_rank, value.dspark, value.fp8_decode = pp_rank, dspark, fp8
+    return value
+
+
+def test_native_group_replaces_only_input_arguments():
+    embedding = torch.nn.Embedding(16, 5120, dtype=torch.bfloat16)
+    incoming = PreparedInput(embedding, 0, lambda value: value)
+    ids, positions, rows = torch.tensor([7]), torch.tensor([3], dtype=torch.int32), (object(), object())
+    expected = incoming(ids)
+    actual = PreparedLayerGroup.native_forward(EchoGroup(incoming), None, None, positions, ids, rows)
+    assert all(torch.equal(value, reference) for value, reference in zip(actual[:2], expected))
+    assert actual[2] is positions and actual[3] is ids and actual[4] is rows
+    assert actual[0].shape == (1, 4, 5120) and actual[1].dtype == torch.float32
+
+
+def test_ordinary_native_group_still_consumes_supplied_hidden():
+    hidden, pre, positions, ids, rows = (object() for _ in range(5))
+    actual = PreparedLayerGroup.native_forward(EchoGroup(None), hidden, pre, positions, ids, rows)
+    assert actual == (hidden, pre, positions, ids, rows)
+
+
+def test_embedding_special_token_mapping_is_preserved():
+    incoming = PreparedInput(torch.nn.Embedding(64640, 4, dtype=torch.bfloat16), 1, lambda value: value)
+    left, right = incoming(torch.tensor([129264])), incoming(torch.tensor([129265]))
+    assert all(torch.equal(a, b) for a, b in zip(left, right))
+
+
+def test_topology_adds_embedding_without_dropping_other_reductions():
+    assert DEEPSEEK_V41_PP0.collectives == 42
+    assert DEEPSEEK_V41_PP0_INPUT.collectives == 43
+    assert DEEPSEEK_V41_PP1.collectives == 40
+    assert DEEPSEEK_V41_PP0_INPUT.reductions == 40
+    assert not DEEPSEEK_V41_PP0_INPUT.external_prefix
+
+
+@pytest.mark.parametrize("kwargs", ({"pp_rank": 1}, {"dspark": True}, {"fp8": True}))
+def test_incompatible_compile_contract_is_rejected(kwargs):
+    with pytest.raises(ValueError, match="ordinary BF16 PP0"):
+        CompiledStage(program(**kwargs), native=True, native_input=True)
+
+
+def test_seeds_are_persistent_and_external_call_stays_separate(monkeypatch):
+    monkeypatch.setenv("VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH", "1")
+
+    class CaptureReplay(StageReplay):
+        def __call__(self, *args, **kwargs):
+            return args, kwargs
+
+    owner = program()
+    replay = CaptureReplay(owner)
+    ids, positions = torch.tensor([1]), torch.tensor([0], dtype=torch.int32)
+    first, mode = replay.from_input_ids(positions, ids, ())
+    second, _ = replay.from_input_ids(positions, ids + 1, ())
+    assert first[0] is second[0] and first[1] is second[1]
+    assert mode == {"native_input": True}
+    with pytest.raises(ValueError, match="C1 PP0"):
+        replay.from_input_ids(positions.expand(6), ids.expand(6), ())
+
+
+def test_native_input_is_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH", raising=False)
+    owner = program()
+    replay = StageReplay(owner)
+    assert not replay.native_input_enabled
+    with pytest.raises(ValueError, match="enabled"):
+        replay.from_input_ids(torch.tensor([0]), torch.tensor([1]), ())
+
+
+def test_input_modes_have_separate_cached_variants(monkeypatch):
+    from vllm_gaudi.ops import deepseek_v41_replay
+
+    class Variant:
+        def __init__(self, *args, native_input=False):
+            self.native_input = native_input
+
+        def __call__(self, *args):
+            return self
+
+    monkeypatch.setenv("VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH", "1")
+    monkeypatch.setattr(deepseek_v41_replay, "StageVariant", Variant)
+    owner = program()
+    replay = StageReplay(owner)
+    ids, positions = torch.tensor([1]), torch.tensor([0], dtype=torch.int32)
+    external = replay(None, None, positions, ids, ())
+    internal = replay.from_input_ids(positions, ids, ())
+    assert external is replay(None, None, positions, ids, ())
+    assert internal is replay.from_input_ids(positions, ids + 1, ())
+    assert set(replay.variants) == {1, (1, "input")}
+    assert not external.native_input and internal.native_input
+
+
+@pytest.mark.parametrize("pp_rank,native_input", ((0, False), (0, True), (1, True)))
+def test_warmup_checks_the_selected_mode(monkeypatch, pp_rank, native_input):
+    from vllm_gaudi.ops import tp2_prepared_plan
+
+    monkeypatch.setenv("VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH", "1" if native_input else "0")
+    entries = {}
+    monkeypatch.setattr(tp2_prepared_plan, "_native_entries", entries)
+    owner = program(pp_rank=pp_rank)
+    replay = StageReplay(owner)
+    external, internal = object(), object()
+    replay.variants.update({1: external, (1, "input"): internal})
+    selected = internal if native_input and pp_rank == 0 else external
+    entries[external if selected is internal else internal] = object()
+    with pytest.raises(RuntimeError, match="warmup"):
+        replay.require_ready(1)
+    entries[selected] = object()
+    replay.require_ready(1)
+
+
+def test_input_capture_requires_native_compilation():
+    with pytest.raises(ValueError, match="ordinary BF16 PP0"):
+        CompiledStage(program(), native=False, native_input=True)

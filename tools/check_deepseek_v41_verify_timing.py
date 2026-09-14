@@ -6,12 +6,13 @@ import os
 from pathlib import Path
 
 from vllm_gaudi.entrypoints.deepseek_v41 import prepare_environment
+
 prepare_environment()
 
-import torch
-import habana_frameworks.torch.core  # noqa: F401
-from vllm_gaudi.distributed.tp2_fused_ar_norm import _load_bridge
-from vllm_gaudi.ops.deepseek_v41_verify_timing import VerifyPhaseTiming
+import torch  # noqa: E402
+import habana_frameworks.torch.core  # noqa: E402, F401
+from vllm_gaudi.distributed.tp2_fused_ar_norm import _load_bridge  # noqa: E402
+from vllm_gaudi.ops.deepseek_v41_verify_timing import VerifyPhaseTiming  # noqa: E402
 
 torch.hpu.set_device(0)
 bridge = _load_bridge(Path(os.environ["VLLM_HPU_TP2_FUSED_AR_NORM_BRIDGE"]))
@@ -44,6 +45,9 @@ last_low = stamps[-1] + cal["offset_low_ns"]
 first_high = stamps[0] + cal["offset_high_ns"]
 assert last_low <= row["host"]["event_wait_done_ns"]
 assert first_high >= row["host"]["round_start"]
-print(json.dumps({"passed": True, "calibration_width_ms":
-                  (cal["offset_high_ns"] - cal["offset_low_ns"]) / 1e6,
-                  "record": row}), flush=True)
+print(json.dumps({
+    "passed": True,
+    "calibration_width_ms": (cal["offset_high_ns"] - cal["offset_low_ns"]) / 1e6,
+    "record": row
+}),
+      flush=True)

@@ -209,17 +209,31 @@ uses explicit switches and rejects unsupported execution contracts.
 | `VLLM_HPU_DSV41_GRAPH_REPLAY` | Captures each PP stage with the ABI-locked native compute/communication plan. Requires prepared communication and the static group plan. | `false` |
 | `VLLM_HPU_DSV41_DSPARK` | Runs the three-layer draft on PP1 with accepted-prefix context insertion and Engram rollback. Requires `method=dspark`, five speculative tokens. | `false` |
 | `VLLM_HPU_DSV41_VISION` | Binds the portable upstream ViT/aligner to prepared PP0 weights. Requires `mm_encoder_tp_mode=data`. | `false` |
-| `VLLM_HPU_DSV41_QUANT_ROUNDTRIP` | Fuses the existing group-32 E4M3FN activation round trip into one TPC operation. Matrix operands remain BF16. | `false` |
-| `VLLM_HPU_DSV41_DEVICE_VERIFY` | Keeps DSpark C6 verification, PP commit validation, and draft result packing on persistent HPU buffers; default-off candidate path. | `false` |
-| `VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE` | Routes the two-rank PP boundary through the current-stream low-latency BF16 peer exchange; requires a qualified HCL/Bridge build. | `false` |
-| `VLLM_HPU_DSV41_INLINE_PP_COMMIT` | Consumes the PP0 device verify control result in the owning worker, removing the executor handoff from the C6 transaction. | `false` |
-| `VLLM_HPU_DSV41_COMPILED_PP_COMMIT` | Experimental compiled PP commit exchange and validation. Requires device verification and direct PP exchange; hardware capture and performance remain unqualified. | `false` |
-| `VLLM_HPU_DSV41_VERIFY_TIMING` | Diagnostic-only device markers and host phase timestamps for C6 verification. Requires a diagnostic native bridge and evidence directory; measured runs do not qualify production latency. | `false` |
-| `VLLM_HPU_DSV41_ROUND_TIMING` | Record bounded host timestamps from per-request input preparation through worker state commit and scheduler consumption. Adds no device synchronization. Writes records at shutdown under the run evidence directory. | `false` |
-| `VLLM_HPU_DSV41_INDEXED_MOE` | Experimental Q16/S16 direct indexed TPC MoE; decodes selected experts in 128-row SRAM/register tiles and avoids full BF16 weight materialization. | `false` |
-| `VLLM_HPU_DSV41_PAGED_SELECTED_KV` | Experimental paged CSA2 selected-row TPC decode; removes the per-token packed-row HBM gather before attention. | `false` |
-| `VLLM_HPU_DSV41_PRETRANSPOSE_ATTN` | Prepares MLA `wo_a` once in `[groups,K,N]` so decode graphs do not transpose the 32 MiB BF16 weight on every replay. | `false` |
-| `VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR` | Selects an isolated combined kernel/Bridge build; its binary hashes must match the build manifest. | unset |
+| `VLLM_HPU_DSV41_QUANT_ROUNDTRIP` | Fuses BF16 activation group-32 E4M3FN quantization and restoration in TPC. Matrix operands remain BF16. Experimental. | `false` |
+| `VLLM_HPU_DSV41_PACKED_ATTENTION` | Uses a C1 native composite to decode selected packed KV rows once for all heads, then consumes them with the existing ordered attention arithmetic. Experimental; other token counts keep their existing path. | `false` |
+| `VLLM_HPU_DSV41_BOUNDED_ATTENTION` | Limits C1 packed attention to its runtime visible prefix at context lengths up to 512. Reuses the ordered V4 attention kernel and retains Full/Reindex/Reuse state publication. Requires packed attention; experimental. | `false` |
+| `VLLM_HPU_DSV41_FP8_DECODE` | Enables selected routed experts in ordinary C1 native replay to decode Q16/S16 directly into E4M3 SRAM weights for FP8 MME. Requires prepared channel sidecars; prefill keeps the existing precision. Experimental and not quality qualified. | `false` |
+| `VLLM_HPU_DSV41_FP8_SIDECAR` | Directory produced by `tools/prepare_deepseek_v41_fp8.py`, with channel scales and a manifest bound to the immutable prepared shards. | empty |
+| `VLLM_HPU_DSV41_FP8_CONFIG` | Optional JSON precision configuration with `version: 1` and selected `routed_experts` layer IDs. `attention`, `shared_experts`, and `mhc` must be empty in this candidate. | all routed expert layers |
+| `VLLM_HPU_DSV41_FIXED_POSITIONS` | Binds cached views of an immutable device position bank directly to C1 decode native staging. Prefill keeps its disjoint input buffers. Requires the single-in-flight V4.1 runner. | `false` |
+| `VLLM_HPU_DSV41_PACKED_PP` | Packs ordinary C1 BF16 hidden and FP32 pre-mix bits into one HCCL message using two generation-owned buffers. DSpark and multi-token transfers retain their existing transport. Experimental. | `false` |
+| `VLLM_HPU_DSV41_TPC_MHC` | Uses FP32 TPC GEMV for the C1 mHC control projection. Preserves FP32 operands but changes reduction order from MME; requires separate model quality qualification. Other shapes retain MME. Experimental. | `false` |
+| `VLLM_HPU_DSV41_ENGRAM_NATIVE_C1` | Performs C1 compression, integer hash, TP row lookup and final pinned staging copies in the native host extension. Requires C1 ABI version 1; retains consumer-stream DMA, request history transactions and the existing prefill path. Experimental, not performance or quality qualified. | `false` |
+| `VLLM_HPU_DSV41_ENGRAM_C1_PACKET` | Requires native C1 preparation. Packs both Engram layers into one fixed pinned C1 transfer, with one consumer completion event protecting packet reuse. Prefill keeps its existing buffers and transfers. Experimental. | `false` |
+| `VLLM_HPU_DSV41_TP_MHC_OVERLAP` | Splits proven independent C1 residual/mHC work between TP production and consumption. Requires the versioned native dependency API, BF16 ordinary decode and joint replay; rejects a capture with no independent segment. Experimental, not performance or quality qualified. | `false` |
+| `VLLM_HPU_DSV41_NATIVE_INPUT_PREFLIGHT` | Batches V4.1 C1 input and state allocation/layout guards in the native adapter before copying inputs and replaying. Requires graph replay and the version 1 preflight API; retains generation and alias checks. Experimental. | `false` |
+| `VLLM_HPU_DSV41_ATTENTION_PAIRED_EXP` | Evaluates the two broadcast scalar exponentials of ordered C1 attention together in SIMD lanes, using the existing Cephes routine. Requires bounded, selected-valid-only attention and its SWA write dependency. Experimental. | `false` |
+| `VLLM_HPU_DSV41_ATTENTION_HEAD_PAIR` | `0` | Pair two independent C1 attention heads to share selected KV loads and interleave ordered arithmetic. Requires bounded valid-only attention; exclusive with paired-exp. Experimental. |
+| `VLLM_HPU_DSV41_DECODED_KV_STATE` | Keeps an exact BF16 KV shadow updated by C1 packed writers and read directly by ordered attention. Includes prefill updates and request state ownership; requires context512, DSpark off, fused writes and C1 indices. Independent experiment, not expert weight expansion. | `false` |
+| `VLLM_HPU_DSV41_DIRECT_TOKEN_IDS` | Binds the completed int32 device token directly to C1 embedding and native stage inputs, with request/position checks. Prefill retains int64 input storage. Experimental. | `false` |
+| `VLLM_HPU_DSV41_DEVICE_COMMIT` | Builds the C1 completion record after the compiled greedy head, broadcasts it through PP, and copies the four integers to the host with a native completion ticket. Requires the matching Bridge API, graph replay, and DSpark disabled. Experimental. | `false` |
+| `VLLM_HPU_DSV41_NATIVE_PP_COPY` | Packs contiguous C1 hidden/pre-mix tensors through bounded native DMA with existing storage dependencies. Requires packed PP, graph replay and the matching Bridge API; rejects unsupported physical permutations. Experimental. | `false` |
+| `VLLM_HPU_DSV41_PREPARED_OUTPUT` | Prepares the BF16 wo_a K,N layout once after target weights load, replacing its original buffer to avoid repeated weight transposes. Reload invalidates recipes and prepares the new weights again. Experimental. | `false` |
+| `VLLM_HPU_DSV41_OUTPUT_GEMM_LAYOUT` | Requires prepared output weights. Keeps wo_a in grouped N,K order and compiles C1 as independent full-K GEMMs; other token counts consume the same grouped weight through einsum. No second resident weight copy. Experimental; validate actual MME placement and numerics before use. | `false` |
+| `VLLM_HPU_DSV41_ISOLATE_CONTROL` | Enables startup CPU isolation for the V4.1 EngineCore and API after worker processes have been spawned. The launcher reserves separate NUMA-local physical cores. Experimental. | `false` |
+| `VLLM_HPU_DSV41_ENGINE_CPUS` | EngineCore CPU set, including its I/O threads. Must be allowed by the initial launch affinity and disjoint from worker and API cores and their SMT siblings. | unset |
+| `VLLM_HPU_DSV41_API_CPUS` | API CPU set with the same ownership checks. Both control sets are recorded by the launcher. | unset |
+| `VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR` | Selects an independently built native kernel directory. Both binaries must match its build manifest; communication runtime ABI checks remain required. | unset |
 
 `VLLM_HPU_DSV4_WORKER_CPUS` and `VLLM_HPU_DSV4_WORKER_HELPER_CPUS`
 also apply to this profile, with one entry per rank. Each worker sets
@@ -450,6 +464,81 @@ internal to the Synapse recipe; this does **not** guarantee SRAM placement.
 Keep this flag disabled for production until compiled placement, correctness
 and end-to-end performance have all been qualified. See
 [the implementation and qualification contract](../features/deepseek_v4_indexed_mme.md).
+
+### V4.1 fused SWA cache writes
+
+`VLLM_HPU_DSV41_SWA_PACK_WRITE` (default `0`) enables experimental C1 group-32 checkpoint byte encoding and in-place SWA row writes. It requires bounded packed attention, which consumes the explicit write-completion tensor. Other token shapes retain their existing path. The cache encoding, row positions and state ownership are preserved; this does not enable FP8 matrix arithmetic.
+
+`VLLM_HPU_DSV41_FP4_CACHE_WRITE` (default `0`) extends the ordered C1 path to native main-KV and index-K encoding and row writes. It requires `VLLM_HPU_DSV41_SWA_PACK_WRITE=1`. Main rows retain group-16 E4M3FN scales and index rows retain group-32 UE8M0 scales. Incomplete compression groups keep their scratch-row writes. Attention explicitly waits for both cache completions; other token shapes retain the existing path.
+
+- `VLLM_HPU_DSV41_NATIVE_ROPE` (default `0`): C1 BF16 pairwise RoPE through the V4 TPC helper, with prepared FP32 cos/sin tables. Context512, SWA128, RoPE64. Other shapes keep existing execution.
+- `VLLM_HPU_DSV41_C1_INDICES` (default `0`): fuse C1 SWA/window, compressed-slot mask/offset and visible-length preparation. Requires bounded packed attention; preserves Full/Reindex/Reuse state publication.
+
+- `VLLM_HPU_DSV41_SELECTED_VALID_ONLY` (default `0`): omit BF16 stores for invalid selected slots inside ordered packed attention. The attention consumer rejects their remapped `-1` IDs before loading; the public selected-KV gather retains zero-filled invalid rows. Requires SWA pack/write.
+- `VLLM_HPU_DSV41_SELECTED_KV_VECTOR` (default `0`): use full-vector C1 selected KV decoding with row scale reuse and cyclic slot work. Requires selected-valid-only; preserves the ordered attention consumer and cache write dependencies.
+
+### V4.1 expert decoder work distribution
+
+`VLLM_HPU_DSV41_EXPERT_K128` (default `0`) selects the independent K128 TPC decoder for C1 top-6 BF16 MoE. It retains the prepared weight layout and full-K MME contract. Non-C1 calls use the existing operator. This experimental path requires matching native registrations and kernels; missing implementations fail explicitly. It does not select FP8 arithmetic. On layers explicitly selected for N256 FP8, the N256 implementation takes precedence.
+
+`VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE` (default `0`) tests rolling tensor coordinates with bounded loop expansion inside the normal-scale K128 decoder. It requires `VLLM_HPU_DSV41_EXPERT_K128`, keeps the same prepared weights and BF16 MME interface, and leaves the general-scale decoder intact. Set it before process startup and use a separate recipe cache; its native kernel must be included in the verified build manifest. It is not a qualified performance default.
+
+`VLLM_HPU_DSV41_EXPERT_N256_FP8` (default `0`) selects the experimental N256/K128
+compressed expert layout and C1 FP8 MME path. It requires DSpark disabled and
+native stage replay. Select layers with `VLLM_HPU_DSV41_FP8_CONFIG`; omitting the
+configuration selects all routed-expert layers. It cannot be combined with
+`VLLM_HPU_DSV41_FP8_DECODE` or `VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE`.
+Load-time preparation retains one compressed allocation, original scale codes
+for BF16 prefill, and channel scales with relative FP8 exponents for C1.
+Live expert IDs address the compressed tensors during replay. Decoded FP8
+weights feed full-K MME operations; SRAM placement must be checked in the
+compiled graph. Loading this layout changes the precision fingerprint and
+requires fresh recipes.
+
+`VLLM_HPU_DSV41_EXPERT_FUSED_QUANT` (default `0`) requires the N256 FP8 path and
+fuses W13 result scaling, SwiGLU, routing and W2 activation quantization into
+the native MoE graph. Its BF16 intermediate rounding boundaries remain
+explicit. It does not enable the separate legacy FP8 decode candidate.
+
+### V4.1 projection candidates
+
+`VLLM_HPU_DSV41_WO_A_FP8=1` selects prepared channel-scaled Gaudi2 E4M3 wo_a weights, dynamic per-token/group activation quantization, native FP8 BMM and a fused FP32-scale/BF16-output epilogue. Set `VLLM_HPU_DSV41_WO_A_FP8_SIDECAR` to the directory produced by `tools/prepare_deepseek_v41_woa_fp8.py PREPARED OUTPUT`. Optional `VLLM_HPU_DSV41_WO_A_FP8_CONFIG` names a JSON file with `{"version": 1, "layers": [0, 1]}`; omission selects all forty backbone layers. The candidate requires DSpark disabled. Both C1 and prefill consume the same prepared FP8 weights. Reconfigure precision only by reloading the model.
+
+The native projection consumes the prepared FP8 weight directly instead of imposing a TPC weight-copy pass. Compiler-selected SRAM/DRAM placement must still be verified in the actual combined model graph. Activation preparation retains the per-token/group maximum and exact power-of-two scaling contract.
+
+The codec uses bias 7, maximum magnitude 240, nearest-even rounding followed by flushing FP8 subnormals and canonicalizing zero. Original block scales are consumed during bounded channel preparation. This changes the numerical contract, including activation quantization, and is not enabled by default.
+
+
+`VLLM_HPU_DSV41_ROUTER_TOP6=1` retains FP32 gate scores and replaces the generic sort/gather/normalization with native repeated-max top6 selection, including text/image bias selection and smallest-ID ties. The selection uses paired score/ID comparisons and packs the six results into two vector writes. `VLLM_HPU_DSV41_BF16_LM_HEAD=1` retains the checkpoint BF16 head and uses BF16 MME operands with FP32 accumulation and logits. Both require DSpark disabled and are off by default; quality and end-to-end qualification are required before promotion.
+
+These are independent experimental candidates. A native MME operand contract or a reduced weight footprint does not establish an end-to-end improvement. The wo_a candidate still has an unresolved ordinary/compiled numerical-consistency issue at the largest supported prefill shape. Its activation-scale implementation also needs qualification for nonfinite inputs and extremely small BF16 row maxima. Keep it disabled in production until these contracts pass. Failed candidates must not be silently substituted during an active request.
+
+The prepared sidecar validates its source manifest, rank ownership, payload hash and encoding/layout fingerprint before binding weights. Model reload invalidates existing recipes; the replay binding includes the loaded precision fingerprint and weight/state generation. The existing native runtime loader continues to validate the actual Bridge/Synapse/HCL and extension artifacts independently. A precision change requires a reload, including rebuilding the sidecar when its encoding contract changes.
+
+`VLLM_HPU_DSV41_MLA_MME=1` selects the experimental C1 shared-KV MME attention path.
+It requires decoded KV state, keeps FP32 softmax/PV consumption and the BF16 output
+boundary, and remains off by default. Prefill retains the existing path.
+
+`VLLM_HPU_DSV41_QKV_FUSED_INPUT` (default `0`) prepares one concatenated BF16
+input-projection weight for Q and KV, reuses their existing activation
+quantization once, and splits the joint projection into the original outputs.
+It requires DSpark disabled. This switch adds no new FP8 conversion, but the
+wider GEMM may affect compiler scheduling and numerical results. Full-model
+generated outputs differ from the preceding candidate; independent quality
+qualification remains incomplete. Do not treat isolated bitwise checks as
+full-model output equivalence.
+
+### V4.1 native input capture
+
+`VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH` (default `0`) includes PP0 embedding and its
+TP reduction in the first native decoder group for ordinary BF16 C1 decode.
+The native PP0 plan retains its 40 layer reductions, two Engram collectives and
+one embedding reduction. It does not replace prefill, explicit input embeddings,
+PP1, or DSpark execution. Enable it only with native stage replay, before process
+startup, and use a separate recipe cache. Rebuild the native bridge from the
+matching source so its dependency validation accepts the complete PP0 topology.
+This is an unqualified experimental path; output/state equivalence and
+complete-chain latency must be validated for the selected runtime configuration.
 
 ## DeepSeek V4.1 DSpark serving candidates
 
