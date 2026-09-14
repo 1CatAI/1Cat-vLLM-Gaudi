@@ -4,18 +4,137 @@
 import json
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_gaudi.omni.minimax_h3 import (
+    _h3_ffv1_reference_video_command,
+    _h3_phase_offload_enabled,
     _h3_row_parallel_weight_loader,
+    _hpu_fused_sdpa,
+    _lightx2v_ref_output_canvas,
     _load_minimax_h3_dit_weights,
     _load_minimax_h3_encoder_weights,
     _map_dit_exclude_prefix,
+    _minimax_h3_initial_noise,
+    _minimax_h3_unpatchify_video_tokens_hpu,
     _resolve_h3_encoder_disk_quant_config,
+    _select_h3_reference_video_codec,
+    _validate_h3_output_short_edge,
+    _validate_fasth3_quant_config,
     install_minimax_h3_patches,
     map_minimax_h3_dit_weight,
     map_minimax_h3_encoder_weight,
 )
+
+
+def test_h3_reference_video_codec_prefers_x264rgb_then_habana_ffv1():
+    assert _select_h3_reference_video_codec({"ffv1", "libx264rgb"}) == "libx264rgb"
+    assert _select_h3_reference_video_codec({"ffv1"}) == "ffv1"
+    with pytest.raises(RuntimeError, match="libx264rgb or ffv1"):
+        _select_h3_reference_video_codec({"mjpeg"})
+
+
+def test_h3_habana_ffv1_reference_video_command_is_lossless_rgb(tmp_path):
+    output, command = _h3_ffv1_reference_video_command(
+        "source.mp4",
+        target_width=1344,
+        target_height=768,
+        target_frame_count=107,
+        workdir=str(tmp_path),
+        fps=24.0,
+        duration_seconds=4.458333,
+    )
+
+    assert output == str(tmp_path / "prepared.mkv")
+    assert command[command.index("-c:v") + 1] == "ffv1"
+    assert command[command.index("-pix_fmt") + 1] == "bgr0"
+    assert command[command.index("-frames:v") + 1] == "107"
+    assert command[command.index("-t") + 1] == "4.458333"
+    assert "libx264rgb" not in command
+    assert "-crf" not in command
+
+
+def test_lightx2v_ref_canvas_uses_published_544p_grid():
+    assert _lightx2v_ref_output_canvas(16 / 9) == (544, 960)
+    assert _lightx2v_ref_output_canvas(9 / 16) == (960, 544)
+    assert _lightx2v_ref_output_canvas(21 / 9) == (544, 1280)
+    assert _lightx2v_ref_output_canvas(4.0) == (512, 2016)
+
+
+def test_lightx2v_544p_canvas_is_ref2va_only():
+    _validate_h3_output_short_edge("ref2va", "ref2va", 544)
+    _validate_h3_output_short_edge("fl2va", "fl2va", 768)
+
+    with pytest.raises(ValueError, match="requires the Ref2VA partition and task"):
+        _validate_h3_output_short_edge("fl2va", "fl2va", 544)
+
+
+def test_lightx2v_canvas_patch_keeps_shared_base_preprocessing_strict():
+    install_minimax_h3_patches()
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3
+    from vllm_omni.model_executor.models.minimax_h3 import preprocessing
+
+    assert pipeline_minimax_h3._resolve_output_canvas(16 / 9, 544) == (544, 960)
+    with pytest.raises(ValueError, match="must be 768"):
+        preprocessing.resolve_minimax_h3_output_canvas(16 / 9, 544)
+
+
+def test_h3_encoder_fused_sdpa_disallows_implicit_cpu_fallback():
+    tensor = torch.empty(1, 2, 3, 4)
+    with pytest.raises(RuntimeError, match="requires HPU query, key, and value"):
+        _hpu_fused_sdpa(tensor, tensor, tensor, is_causal=False, scale=0.5)
+
+
+def test_h3_phase_offload_environment_is_strict(monkeypatch):
+    monkeypatch.delenv("VLLM_GAUDI_H3_PHASE_OFFLOAD", raising=False)
+    assert not _h3_phase_offload_enabled()
+
+    monkeypatch.setenv("VLLM_GAUDI_H3_PHASE_OFFLOAD", "yes")
+    assert _h3_phase_offload_enabled()
+
+    monkeypatch.setenv("VLLM_GAUDI_H3_PHASE_OFFLOAD", "sometimes")
+    with pytest.raises(ValueError, match="must be a boolean"):
+        _h3_phase_offload_enabled()
+
+
+def test_hpu_unpatchify_gather_matches_video_latent_layout():
+    from vllm_omni.diffusion.models.minimax_h3.packed_tokens import minimax_h3_patchify_video_latent
+
+    latent = torch.arange(2 * 3 * 4 * 6 * 8, dtype=torch.float32).reshape(2, 3, 4, 6, 8)
+    rows = minimax_h3_patchify_video_latent(latent, patch_size=(2, 2, 4))
+
+    output = _minimax_h3_unpatchify_video_tokens_hpu(
+        rows,
+        latent_shape=(2, 3, 2, 3),
+        patch_size=(2, 2, 4),
+    )
+
+    assert output.is_contiguous()
+    assert torch.equal(output, latent)
+
+
+def test_initial_noise_uses_one_generator_for_video_then_audio():
+    seed = 2101
+    latent_shape = (3, 4, 6)
+    audio_t = 5
+    video_rows, audio_rows = _minimax_h3_initial_noise(
+        None,
+        seed=seed,
+        latent_t=latent_shape[0],
+        latent_h=latent_shape[1],
+        latent_w=latent_shape[2],
+        audio_t=audio_t,
+    )
+
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    video = torch.randn(1, 24, *latent_shape, generator=generator, dtype=torch.float32)
+    expected_audio = torch.randn(audio_t * 2, 32, generator=generator, dtype=torch.float32)
+
+    from vllm_omni.diffusion.models.minimax_h3.packed_tokens import minimax_h3_patchify_video_latent
+
+    assert torch.equal(video_rows, minimax_h3_patchify_video_latent(video, patch_size=(1, 2, 2)))
+    assert torch.equal(audio_rows, expected_audio)
 
 
 def test_dit_mapping_covers_fused_projection_scales():
@@ -169,6 +288,14 @@ def test_encoder_uses_its_own_native_fp8_config(tmp_path):
         "text_encoder.text_model.layers.17.mlp.down_proj",
         "text_encoder.text_model.layers.24.self_attn.o_proj",
     ]
+
+
+def test_fasth3_rejects_serialized_transformer_but_accepts_bf16_source():
+    fusion = object()
+
+    _validate_fasth3_quant_config(fusion, SimpleNamespace(is_checkpoint_fp8_serialized=False))
+    with pytest.raises(ValueError, match="fused into a BF16"):
+        _validate_fasth3_quant_config(fusion, SimpleNamespace(is_checkpoint_fp8_serialized=True))
 
 
 def test_h3_adapter_dequantizes_an_ignored_fp8_weight():

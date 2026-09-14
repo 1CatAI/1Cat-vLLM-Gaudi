@@ -1,10 +1,10 @@
-# MiniMax H3 native FP8 on Gaudi
+# MiniMax H3 on Gaudi
 
 MiniMax H3 support is part of this `vllm_gaudi` project. The package owns the
-HPU platform, attention, ModelOpt FP8 loading, H3 weight mapping, launch tools,
-and tests under `vllm_gaudi.omni`. A pinned vLLM Omni checkout supplies the
-model-independent serving pipeline through the optional dependency group; it
-is not a separately maintained deployment.
+HPU platform, attention, BF16 and optional ModelOpt FP8 loading, H3 weight
+mapping, launch tools, and tests under `vllm_gaudi.omni`. A pinned vLLM Omni
+checkout supplies the model-independent serving pipeline through the optional
+dependency group; it is not a separately maintained deployment.
 
 ## Qualified dependency set
 
@@ -30,11 +30,57 @@ Text-only installations do not pull the audio/video stack.
 ## ModelScope-only artifacts
 
 The normal launcher accepts local paths only and forces Hugging Face,
-Transformers, Diffusers, and datasets offline. The pinned upstream Omni recipe
-publishes an online-FP8 mode for the official BF16 Base checkpoint; it does not
-name an official serialized ModelOpt H3 checkpoint. The native-FP8 path in this
-project accepts a local or privately mirrored ModelScope derivative and audits
-both the DiT and encoder before serving it:
+Transformers, Diffusers, and datasets offline. FastH3 publishes BF16
+Dense-DataFree adapter tensors for the official BF16 MiniMax H3 base. The
+qualified default therefore fuses the adapter into the BF16 DiT and leaves the
+model in BF16. To avoid downloading duplicate unchanged assets, prepare the
+official BF16 DiT and text encoder while reusing existing VAE, tokenizer, and
+processor files:
+
+```bash
+python tools/minimax_h3/prepare_fasth3_modelscope.py \
+  --local-dir /data/models/MiniMax-H3-FastH3-HPU \
+  --reuse-components-from /data/models/MiniMax-H3-FP8
+
+python tools/minimax_h3/download_fasth3_modelscope.py \
+  --local-dir /data/models/FastVideo-FastH3-4-step-Preview-v1-LoRA
+
+python tools/minimax_h3/download_lightx2v_modelscope.py \
+  --local-dir /data/models/LightX2V-Minimax-h3-Turbo
+
+python tools/minimax_h3/download_lightx2v_modelscope.py \
+  --local-dir /data/models/LightX2V-Minimax-h3-Turbo \
+  --profile ref2v-4step-544p
+
+python tools/minimax_h3/prepare_ref2va_modelscope.py \
+  --local-dir /data/models/MiniMax-H3-LightX2V-HPU \
+  --reuse-components-from /data/models/MiniMax-H3-FastH3-HPU
+```
+
+All downloads use ModelScope exclusively. The preparation helper downloads
+the official FL2VA BF16 transformer and BF16 text encoder. It reuses only the
+unchanged video/audio VAE, tokenizer, and processor files. At startup the
+Dense-DataFree adapter is fused into BF16 and model computation remains BF16 by
+default. The qualified LightX2V artifact is the exact Diffusers-layout
+`minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors`: rank 128, alpha 128,
+and BF16 throughout. Its downloader refuses renamed, truncated, wrong-layout,
+or non-BF16 files and records a SHA256 manifest.
+
+The Ref2VA preparation command first checks ModelScope's content hashes for
+every shared file. The BF16 text encoder, video/audio VAEs, tokenizer, and
+processor are byte-identical across the official FL2VA and Ref2VA partitions,
+so the command links the already verified local files and downloads only the
+66.3 GB Ref2VA transformer. The matching
+`minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors` is BF16, rank 128,
+alpha 8, trained for four forwards at 544p with video/audio shifts 12/3.
+
+Online FP8 remains available as an explicit A/B experiment. Add `--online-fp8`
+to the launch command only when testing that path. It runs after FastH3 fusion
+and quantizes eligible BF16 linears to per-output-channel weights with dynamic
+per-token activations on HPU; it is not the official FastH3 inference default.
+
+The serialized native-FP8 path still accepts a local or privately mirrored
+ModelScope derivative and audits both the DiT and encoder before serving it:
 
 ```bash
 python tools/minimax_h3/download_modelscope.py \
@@ -46,9 +92,9 @@ python tools/minimax_h3/download_modelscope.py \
 
 Replace `ORG/...` with the actual ModelScope repository ID. The official
 [`MiniMax/MiniMax-H3`](https://modelscope.cn/models/MiniMax/MiniMax-H3)
-repository contains BF16 Base weights and is intentionally rejected by this
-native-checkpoint helper. Both the DiT and Qwen encoder must declare ModelOpt
-`FP8_PER_CHANNEL_PER_TOKEN`.
+repository contains BF16 Base weights; the native-checkpoint downloader remains
+strict and accepts only derivatives where both the DiT and Qwen encoder declare
+ModelOpt `FP8_PER_CHANNEL_PER_TOKEN`.
 
 For the recommended four-forward T2VA schedule, download the exact FlashGen
 adapter from ModelScope. It is 1.26 GB and carries its own sampler contract:
@@ -77,22 +123,74 @@ server to the card's NUMA CPUs, and sets both `HABANA_VISIBLE_MODULES` and
 ```bash
 VLLM_GAUDI_LOCK_DIR=/data/gaudi-locks \
 python tools/minimax_h3/serve_single_hpu.py \
-  /data/models/MiniMax-H3-FP8 \
+  /data/models/MiniMax-H3-FastH3-HPU \
   --partition FL2VA \
-  --flashgen-4step-lora \
-  /data/models/Minimax-H3-4step-lora-flashgen/minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors \
+  --fasth3-4step-adapter \
+  /data/models/FastVideo-FastH3-4-step-Preview-v1-LoRA \
   --module 0 \
+  --temp-dir /data/tmp/vllm-h3 \
   --port 8097
 ```
 
-The default single-card placement keeps the selected DiT and both VAEs on the
-HPU and applies layerwise staged offload to the text encoder. Use
-`--offload-component dit` as well only when the resident DiT does not fit; it
-streams the 50 DiT blocks every denoising interval and is much slower. Extra
-vLLM arguments go after an explicit `--`.
+The default single-card placement applies layerwise staged offload to the text
+encoder and initializes both VAEs on the host. Before prompt and reference
+encoding it moves the selected DiT to the host, then loads that DiT once and
+keeps it resident for the complete denoise loop. After denoising it moves the
+DiT back to the host before loading the audio and video VAEs in turn. This
+first-request transition is required for Ref2VA's 2048-short-edge visual
+conditioning to fit on one Gaudi 2. Every phase transfer is included in request
+wall time. Use `--no-phase-offload` only for a resident-memory comparison. Base
+and dynamic LoRA profiles can also add `--offload-component dit`, although that
+streams the 50 DiT blocks every denoising interval and is much slower. FastH3
+rejects that layerwise DiT mode because fusion must pass through the ordinary
+DiT weight stream; the once-per-phase transfer keeps the fused weights intact.
+Extra vLLM arguments go after an explicit `--`.
+Use `--temp-dir` (or `VLLM_GAUDI_H3_TMPDIR`) to keep preprocessing scratch
+files on the data volume. The launcher exports the resolved directory through
+`TMPDIR`, `TMP`, and `TEMP` before the worker starts.
 
-Start the reference partition by changing `--partition Ref2VA`. Only one
-partition is loaded, and shared components are instantiated once.
+The launcher also validates `ffmpeg` and `ffprobe` before starting a Ref2VA
+worker. `--media-bin` defaults to `/opt/habanalabs/media/ffmpeg/bin` and is
+prepended to `PATH`; set it explicitly when the Habana media tools live
+elsewhere. For reference-video normalization, the H3 patch uses Omni's
+`libx264rgb` path when that encoder is present. Habana builds without
+`libx264rgb` automatically use lossless FFV1 in Matroska, preserving the
+reference frames without changing the pinned Omni source tree.
+
+To run the qualified LightX2V workflow instead, keep the same official BF16
+FL2VA base and replace the FastH3 option with:
+
+```bash
+python tools/minimax_h3/serve_single_hpu.py \
+  /data/models/MiniMax-H3-FastH3-HPU \
+  --partition FL2VA \
+  --lightx2v-4step-lora \
+  /data/models/LightX2V-Minimax-h3-Turbo/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors \
+  --module 0 --temp-dir /data/tmp/vllm-h3 --port 8097
+```
+
+This starts Omni's dynamic PEFT LoRA manager and keeps phase offload enabled.
+Layerwise DiT offload and online FP8 are rejected for this qualification
+profile so the executed graph stays on the published BF16 base-plus-LoRA path.
+
+Start the four-step LightX2V reference service from the assembled Ref2VA
+partition:
+
+```bash
+python tools/minimax_h3/serve_single_hpu.py \
+  /data/models/MiniMax-H3-LightX2V-HPU \
+  --partition Ref2VA \
+  --lightx2v-4step-lora \
+  /data/models/LightX2V-Minimax-h3-Turbo/minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors \
+  --module 0 --temp-dir /data/tmp/vllm-h3-ref2va --port 8097
+```
+
+Only the selected partition is loaded, and every shared component is
+instantiated once. The Gaudi integration admits the release's 544-pixel canvas
+only for the Ref2VA partition and task. Its Qwen3-VL vision and text stacks use
+Habana FusedSDPA, including one attention segment per uploaded reference, so
+the 2048-short-edge reference encoder does not materialize quadratic attention
+matrices.
 
 ## Sampling workflows
 
@@ -104,8 +202,10 @@ while the sampler and distilled adapter determine the number of denoiser calls.
 | --- | --- | ---: |
 | [ComfyUI Base template](https://github.com/Comfy-Org/workflow_templates/blob/main/templates/video_minimax_h3_t2v.json) | `res_multistep` + `simple` | 20 |
 | [Pinned Omni Base reference](https://github.com/vllm-project/vllm-omni/blob/767cc7977e04dc1f1ae7307e630429e9169af622/recipes/MiniMaxAI/MiniMax-H3.md) | uniform `euler_eta0`, 50 sigma points | 49 |
+| [FastH3 Dense-DataFree](https://modelscope.cn/models/FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA) | adapter-owned `0.999,0.749,0.5,0.25,0.0` | 4 |
 | [FlashGen native LoRA](https://modelscope.cn/models/FlashGen/Minimax-H3-4step-lora-flashgen) | adapter-owned `1.0,0.7,0.4,0.15,0.0` | 4 |
-| [Matching LightX2V Turbo LoRA](https://github.com/ModelTC/LightX2V/) | artifact-owned distilled schedule | 4 or 8 |
+| [LightX2V FL2V Turbo v1.0 768p BF16](https://modelscope.cn/models/lightx2v/Minimax-h3-Turbo) | 5 sigma points, video shift 6, audio shift 3 | 4 |
+| [LightX2V Ref2V Turbo v0.1 544p BF16](https://modelscope.cn/models/lightx2v/Minimax-h3-Turbo) | 5 sigma points, video shift 12, audio shift 3 | 4 |
 
 The ComfyUI Base template and pinned Omni Base reference use different
 numerical solvers. A Base checkpoint cannot be turned into a four-step model by
@@ -117,16 +217,35 @@ same transformer call. H3 Base is CFG-distilled, so each denoising step uses one
 joint branch rather than separate video, audio, positive, and negative calls.
 The released Base shifts remain 12 for video and 3 for audio.
 
-The recommended single-Gaudi T2VA profile uses FlashGen and makes exactly four
-joint DiT calls. Its API field is an interval count (`num_inference_steps=4`),
-while Base and LightX2V's uniform-grid contracts count sigma points. The helper
-keeps these meanings separate. Without a distilled adapter, omission follows
-the pinned Omni Base reference (50 points, 49 calls); `--sigma-points` remains
-an expert-only Base experiment.
+The first single-Gaudi qualification profile uses FastH3 Dense-DataFree and
+makes exactly four joint DiT calls. Its API field is an interval count
+(`num_inference_steps=4`). FlashGen uses the same interval count with a different
+adapter-owned schedule, while Base and LightX2V contracts use their own grid
+semantics. The helper keeps these meanings separate. Without a distilled
+adapter, omission follows the pinned Omni Base reference (50 points, 49 calls);
+`--sigma-points` remains an expert-only Base experiment.
+
+For the qualified LightX2V file, `num_inference_steps=5` means five sigma grid
+points including terminal zero, which bound exactly four DiT evaluations. This
+is an API convention of the LightX2V integration; it is not a fifth denoising
+step. The request helper owns all three values and refuses manual overrides.
 
 ## Requests
 
-Generate 768p T2VA with the ModelScope FlashGen four-forward preset:
+Generate T2VA through a server with FastH3 fused at startup:
+
+```bash
+python tools/minimax_h3/request_video.py \
+  --task t2va \
+  --prompt 'A fox walks through snow with synchronized footsteps and winter wind.' \
+  --width 1344 --height 768 --aspect-ratio 16:9 \
+  --duration 5 --seed 2101 --fasth3-4step \
+  --preencode-mp4 --preencode-batch-frames 17 \
+  --output t2va-internal-124f.mp4 \
+  --metadata t2va.json
+```
+
+The FlashGen four-forward preset remains available as a request-time LoRA:
 
 ```bash
 python tools/minimax_h3/request_video.py \
@@ -140,9 +259,28 @@ python tools/minimax_h3/request_video.py \
   --metadata t2va.json
 ```
 
-Omit the FlashGen option to run the pinned Omni Base quality reference with 49
-actual DiT forwards. FlashGen v1.0 serves T2VA only; FL2VA and Ref2VA examples
-below use their Base partitions unless a matching task-family adapter is added.
+Generate T2VA through the LightX2V server with its exact four-step contract:
+
+```bash
+python tools/minimax_h3/request_video.py \
+  --task t2va \
+  --prompt 'A fox walks through snow with synchronized footsteps and winter wind.' \
+  --width 1344 --height 768 --aspect-ratio 16:9 \
+  --duration 5 --seed 2101 \
+  --lightx2v-4step-lora \
+  /data/models/LightX2V-Minimax-h3-Turbo/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors \
+  --preencode-mp4 --preencode-batch-frames 17 \
+  --output lightx2v-t2va-internal-124f.mp4 \
+  --metadata lightx2v-t2va.json
+```
+
+The helper sends five sigma points, flow shifts 6/3, and dynamic LoRA scale 1.
+The matching LightX2V file also supports FL2VA: change `--task` to `fl2va` and
+add the first and/or last image arguments shown below.
+
+Omit all distilled options to run the pinned Omni Base quality reference with
+49 actual DiT forwards. FastH3 preview v1 and FlashGen v1.0 serve T2VA only;
+use the matching LightX2V file for distilled FL2VA or Ref2VA requests.
 
 On an FL2VA server, select first frame, last frame, or both:
 
@@ -164,13 +302,17 @@ python tools/minimax_h3/request_video.py --task fl2va \
   --duration 5 --output first-last.mp4
 ```
 
-On a Ref2VA server, upload mixed local references in their prompt order:
+On the LightX2V Ref2VA server, upload mixed local references in their prompt
+order. Its published four-step v0.1 profile uses a 544-pixel short edge:
 
 ```bash
 python tools/minimax_h3/request_video.py --task ref2va \
   --prompt 'Use <Picture 1> for the subject, <Video 1> for motion, and <Audio 1> for sound.' \
   --reference subject.png --reference motion.mp4 --reference voice.wav \
-  --aspect-ratio 16:9 --duration 5 --output ref2va.mp4
+  --aspect-ratio 16:9 --short-edge 544 --duration 5 \
+  --lightx2v-4step-lora \
+  /data/models/LightX2V-Minimax-h3-Turbo/minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors \
+  --preencode-mp4 --output ref2va.mp4 --metadata ref2va.json
 ```
 
 Ref2VA accepts at most nine images, three videos, three audio clips, and twelve
@@ -188,8 +330,14 @@ python tools/minimax_h3/benchmark_t2va.py \
   --server-log /data/evidence/h3-server/server.log \
   --server-pid "$SERVER_PID" \
   --module 0 \
-  --flashgen-4step-lora \
-  /data/models/Minimax-H3-4step-lora-flashgen/minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors
+  --fasth3-4step
+```
+
+For the matching LightX2V server, replace the final option with:
+
+```bash
+--lightx2v-4step-lora \
+/data/models/LightX2V-Minimax-h3-Turbo/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors
 ```
 
 The tool makes one first request followed by three measured requests. The
@@ -203,31 +351,68 @@ audio decode through the Habana FFmpeg build, samples HBM and host memory, and
 reports the warmed median and range. Profiling is disabled for these main
 measurements.
 
+The qualified Gaudi 2 run at 1344x768 produced the following BF16 baselines.
+Both used four actual joint DiT forwards, generated 124 internal frames, and
+delivered a separately trimmed 120-frame/five-second H.264 + stereo AAC file.
+All files passed full FFmpeg decoding.
+
+| Profile | Placement | Startup | First request | Next-three median | Range | Sampled peak HBM |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| FastH3 Dense-DataFree | resident-DiT baseline | 174.01 s | 277.02 s | 256.75 s | 250.48-276.79 s | 96,895 MiB |
+| LightX2V FL2V Turbo 768p | default phase offload | 75.49 s | 278.14 s | 301.03 s | 300.51-302.07 s | 97,421 MiB |
+
+The placement differs, so the table records usable baselines rather than an
+isolated adapter speed comparison. Start FastH3 with `--no-phase-offload` to
+reproduce its resident-DiT row exactly; the normal launcher default uses the
+safer phase placement. A separate LightX2V warmed profiler request
+measured 17.39 s prompt encoding, 236.42 s for the inclusive denoise phase
+(21.58 s DiT load, 193.91 s four-forward schedule and setup, 20.93 s DiT
+offload), 0.21 s audio VAE, 56.83 s video VAE, and 58.18 s inclusive decode and
+MP4 packaging. Profiler synchronization is excluded from the main table.
+
+The same LightX2V BF16 integrations completed the conditioning workflows below.
+These are functional qualification requests rather than the warmed T2VA
+benchmark: the FL2VA and Ref2VA release contracts generated 107 frames for a
+four-second request, and each still executed exactly four joint DiT forwards.
+
+| Task and references | Output | Wall time | Sampled peak HBM | Validation |
+| --- | --- | ---: | ---: | --- |
+| FL2VA first + last frame | 1344x768, 107 frames | 300.01 s | 97,064 MiB | endpoint SSIM 0.9425 / 0.8810; full decode |
+| Ref2VA image | 960x544, 107 frames | 243.58 s | 96,543 MiB | video + audio; full decode |
+| Ref2VA image + video + audio | 960x544, 107 frames | 699.85 s | 96,959 MiB | video + audio; full decode |
+
+The mixed Ref2VA request is slower because its 2048-short-edge reference-video
+encoding produced a much longer conditioning sequence. It remains within one
+Gaudi 2 through phase offload and segmented HPU FusedSDPA; no model-compute CPU
+fallback is used.
+
 For a separate phase diagnostic, restart the same launcher with the pinned
 Omni profiler enabled. Do not mix this request into the four-run result above:
 
 ```bash
 python tools/minimax_h3/serve_single_hpu.py \
-  /data/models/MiniMax-H3-FP8 --partition FL2VA --module 0 --port 8097 \
+  /data/models/MiniMax-H3-FastH3-HPU --partition FL2VA \
+  --fasth3-4step-adapter \
+  /data/models/FastVideo-FastH3-4-step-Preview-v1-LoRA \
+  --module 0 --port 8097 \
   -- --enable-diffusion-pipeline-profiler
 
 python tools/minimax_h3/request_video.py \
   --task t2va --prompt 'A fox walks through snow.' \
-  --width 1344 --height 768 --duration 5 --seed 2101 \
+  --width 1344 --height 768 --duration 5 --seed 2101 --fasth3-4step \
   --output profiled.mp4 --metadata profiled.json
 ```
 
 The metadata decodes the sync endpoint headers into typed server inference,
 pipeline-stage, and peak-memory fields. H3 reports prompt encoding, joint
-denoising, video VAE, and audio VAE separately. The server log reports MP4/AAC
-encoding time; the remaining server interval contains tensor transfer and
-request orchestration. Profiler synchronization changes the timing, so these
-numbers explain the phase split and do not replace the unprofiled wall-clock
-result.
+denoising, video VAE, audio VAE, MP4 completion, and each HPU phase transfer
+separately. Profiler synchronization changes the timing, so these numbers
+explain the phase split and do not replace the unprofiled wall-clock result.
 
-The HPU ModelOpt path dynamically scales each activation row, applies stored
-per-output-channel weight scales, and dispatches `hpu.fp8_gemm_v2`. Selected
-checkpoint linears therefore execute FP8 MME work; BF16/FP32 ignore layers,
-biases, norms, and VAE operations keep their declared precision. Host work is
-limited to tokenization, media preparation, request scheduling, and MP4
-encoding.
+The official FastH3 profile keeps its DiT and text-encoder model computation in
+BF16. If `--online-fp8` is selected, eligible linears dynamically scale each
+activation row, apply per-output-channel weight scales, and dispatch
+`hpu.fp8_gemm_v2`; ignored linears, biases, norms, and VAE operations keep their
+declared precision. The serialized native ModelOpt FP8 path uses the same HPU
+GEMM contract. Host work is limited to tokenization, media preparation, request
+scheduling, and MP4 encoding.

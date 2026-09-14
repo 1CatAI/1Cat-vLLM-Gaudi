@@ -4,12 +4,17 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
 
-HPU_SDPA_SOFTMAX_MODE = "None"
+HPU_SDPA_SOFTMAX_MODE = os.environ.get("VLLM_GAUDI_OMNI_SDPA_SOFTMAX_MODE", "None")
+if HPU_SDPA_SOFTMAX_MODE not in {"fp32", "None", "fast"}:
+    raise ValueError("VLLM_GAUDI_OMNI_SDPA_SOFTMAX_MODE must be one of "
+                     f"'fp32', 'None', or 'fast', got {HPU_SDPA_SOFTMAX_MODE!r}")
 
 
 class HPUSDPABackend(SDPABackend):

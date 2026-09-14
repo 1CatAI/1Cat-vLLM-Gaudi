@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import mimetypes
@@ -24,6 +25,50 @@ _FLASHGEN_INFERENCE_STEPS = 4
 _FLASHGEN_SIGMA_POINTS = 5
 _FLASHGEN_FILENAME = "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
 _FLASHGEN_BASE_SCHEDULE = (1.0, 0.7, 0.4, 0.15, 0.0)
+_FASTH3_INFERENCE_STEPS = 4
+_FASTH3_SIGMA_POINTS = 5
+_FASTH3_BASE_SCHEDULE = (0.999, 0.749, 0.5, 0.25, 0.0)
+_LIGHTX2V_INFERENCE_STEPS = 4
+_LIGHTX2V_SIGMA_POINTS = 5
+_LIGHTX2V_FILENAME = "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"
+
+
+@dataclass(frozen=True)
+class _LightX2VProfile:
+    profile: str
+    supported_tasks: frozenset[str]
+    video_flow_shift: float
+    audio_flow_shift: float
+    output_short_edge: int
+
+
+_LIGHTX2V_PROFILES = {
+    _LIGHTX2V_FILENAME:
+    _LightX2VProfile(
+        profile="lightx2v_fl2v_turbo_4step_v1.0_768p_bf16",
+        supported_tasks=frozenset({"t2va", "fl2va"}),
+        video_flow_shift=6.0,
+        audio_flow_shift=3.0,
+        output_short_edge=768,
+    ),
+    "minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors":
+    _LightX2VProfile(
+        profile="lightx2v_ref2v_turbo_4step_v0.1_544p_bf16",
+        supported_tasks=frozenset({"ref2va"}),
+        video_flow_shift=12.0,
+        audio_flow_shift=3.0,
+        output_short_edge=544,
+    ),
+}
+_LIGHTX2V_VIDEO_FLOW_SHIFT = _LIGHTX2V_PROFILES[_LIGHTX2V_FILENAME].video_flow_shift
+_LIGHTX2V_AUDIO_FLOW_SHIFT = _LIGHTX2V_PROFILES[_LIGHTX2V_FILENAME].audio_flow_shift
+
+
+def _lightx2v_profile(path: Path) -> _LightX2VProfile:
+    try:
+        return _LIGHTX2V_PROFILES[path.name]
+    except KeyError as exc:
+        raise ValueError(f"unsupported LightX2V four-step artifact: {path.name}") from exc
 
 
 def _response_metrics(headers: dict[str, str]) -> dict[str, object]:
@@ -72,6 +117,35 @@ def _resolve_sigma_points(
 
 
 def _sampling_contract(args: argparse.Namespace) -> dict[str, object]:
+    if getattr(args, "fasth3_4step", False):
+        return {
+            "request_field": "num_inference_steps",
+            "meaning": "student_schedule_interval_count",
+            "field_was_omitted": False,
+            "sampler": "fasth3_dmd2_base_schedule",
+            "profile": "fasth3_dense_datafree_4step",
+            "resolved_sigma_points": _FASTH3_SIGMA_POINTS,
+            "base_schedule": list(_FASTH3_BASE_SCHEDULE),
+            "expected_joint_dit_forwards": _FASTH3_INFERENCE_STEPS,
+            "video_and_audio_share_each_forward": True,
+        }
+    lightx2v = getattr(args, "lightx2v_lora", None)
+    if lightx2v is not None:
+        profile = _lightx2v_profile(Path(lightx2v))
+        return {
+            "request_field": "num_inference_steps",
+            "meaning": "sigma_grid_points_including_terminal_zero",
+            "field_was_omitted": False,
+            "sampler": "lightx2v_turbo_euler_eta0",
+            "profile": profile.profile,
+            "resolved_sigma_points": _LIGHTX2V_SIGMA_POINTS,
+            "expected_joint_dit_forwards": _LIGHTX2V_INFERENCE_STEPS,
+            "video_flow_shift": profile.video_flow_shift,
+            "audio_flow_shift": profile.audio_flow_shift,
+            "output_short_edge": profile.output_short_edge,
+            "precision": "bf16_base_plus_bf16_lora",
+            "video_and_audio_share_each_forward": True,
+        }
     flashgen = getattr(args, "flashgen_lora", None)
     if flashgen is not None:
         return {
@@ -127,6 +201,19 @@ def _validate(args: argparse.Namespace, references: list[tuple[Path, str]]) -> N
             raise ValueError(f"FlashGen preset requires the published filename {_FLASHGEN_FILENAME}")
         if args.flow_shift is not None or args.audio_flow_shift is not None:
             raise ValueError("FlashGen preset owns its sigma schedule; omit flow-shift overrides")
+    if getattr(args, "fasth3_4step", False):
+        if args.task != "t2va":
+            raise ValueError("FastH3 preview v1 supports T2VA only")
+        if args.flow_shift is not None or args.audio_flow_shift is not None:
+            raise ValueError("FastH3 owns its sigma schedule and shifts; omit flow-shift overrides")
+    lightx2v = getattr(args, "lightx2v_lora", None)
+    if lightx2v is not None:
+        profile = _lightx2v_profile(Path(lightx2v))
+        if args.task not in profile.supported_tasks:
+            tasks = ", ".join(sorted(task.upper() for task in profile.supported_tasks))
+            raise ValueError(f"{Path(lightx2v).name} supports {tasks} only")
+        if args.flow_shift is not None or args.audio_flow_shift is not None:
+            raise ValueError("LightX2V preset owns its exact video/audio shifts; omit flow-shift overrides")
     if (args.width is not None or args.height is not None) and (args.width is None or args.height is None
                                                                 or args.width % 32 or args.height % 32):
         raise ValueError("width and height must both be present and divisible by 32")
@@ -155,13 +242,21 @@ def _validate(args: argparse.Namespace, references: list[tuple[Path, str]]) -> N
             raise ValueError("Ref2VA requires at least one visual reference")
         if args.audio_url and audios:
             raise ValueError("use either --audio-url or uploaded audio references")
-        if args.short_edge != 768:
-            raise ValueError("Ref2VA short_edge must be 768")
+        expected_short_edge = _lightx2v_profile(Path(lightx2v)).output_short_edge if lightx2v is not None else 768
+        if args.short_edge != expected_short_edge:
+            raise ValueError(f"Ref2VA short_edge must be {expected_short_edge} for the selected profile")
 
 
 def _request_data(args: argparse.Namespace) -> dict[str, str]:
     extra = {"task": args.task, "duration": args.duration}
-    if args.audio_flow_shift is not None:
+    if getattr(args, "preencode_mp4", False):
+        extra["preencode_mp4"] = True
+        extra["preencode_batch_frames"] = getattr(args, "preencode_batch_frames", 17)
+    lightx2v = getattr(args, "lightx2v_lora", None)
+    if lightx2v is not None:
+        profile = _lightx2v_profile(Path(lightx2v))
+        extra["audio_flow_shift"] = profile.audio_flow_shift
+    elif args.audio_flow_shift is not None:
         extra["audio_flow_shift"] = args.audio_flow_shift
     if args.frame_indices is not None:
         extra["frame_indices"] = args.frame_indices
@@ -172,7 +267,21 @@ def _request_data(args: argparse.Namespace) -> dict[str, str]:
         "extra_params": json.dumps(extra, separators=(",", ":")),
     }
     flashgen = getattr(args, "flashgen_lora", None)
-    if flashgen is not None:
+    if getattr(args, "fasth3_4step", False):
+        data["num_inference_steps"] = str(_FASTH3_INFERENCE_STEPS)
+    elif lightx2v is not None:
+        profile = _lightx2v_profile(Path(lightx2v))
+        data["num_inference_steps"] = str(_LIGHTX2V_SIGMA_POINTS)
+        data["flow_shift"] = str(profile.video_flow_shift)
+        data["lora"] = json.dumps(
+            {
+                "name": Path(lightx2v).stem,
+                "path": str(Path(lightx2v)),
+                "scale": float(getattr(args, "lora_scale", 1.0)),
+            },
+            separators=(",", ":"),
+        )
+    elif flashgen is not None:
         data["num_inference_steps"] = str(_FLASHGEN_INFERENCE_STEPS)
         data["lora"] = json.dumps(
             {
@@ -213,13 +322,36 @@ def main() -> int:
     parser.add_argument("--aspect-ratio", default="16:9")
     parser.add_argument("--short-edge", type=int, default=768)
     parser.add_argument("--fps", type=int, default=24)
+    parser.add_argument(
+        "--preencode-mp4",
+        action="store_true",
+        help="decode in temporal chunks and encode MP4 in the worker",
+    )
+    parser.add_argument(
+        "--preencode-batch-frames",
+        type=int,
+        default=17,
+        help="maximum decoded frame batch handed to the worker-side encoder",
+    )
     schedule = parser.add_mutually_exclusive_group()
+    schedule.add_argument(
+        "--fasth3-4step",
+        action="store_true",
+        help="use the four-forward schedule of a server with the FastH3 student fused at startup",
+    )
     schedule.add_argument(
         "--flashgen-4step-lora",
         "--flashgen-lora",
         dest="flashgen_lora",
         type=Path,
         help="published ModelScope FlashGen native-layout LoRA; runs its exact four-forward schedule",
+    )
+    schedule.add_argument(
+        "--lightx2v-4step-lora",
+        "--lightx2v-lora",
+        dest="lightx2v_lora",
+        type=Path,
+        help="published LightX2V FL2V 768p or Ref2V 544p Turbo four-step BF16 LoRA",
     )
     schedule.add_argument(
         "--denoise-steps",
@@ -258,8 +390,14 @@ def main() -> int:
         args.flashgen_lora = args.flashgen_lora.expanduser().resolve()
         if not args.flashgen_lora.is_file():
             raise FileNotFoundError(args.flashgen_lora)
+    if args.lightx2v_lora is not None:
+        args.lightx2v_lora = args.lightx2v_lora.expanduser().resolve()
+        if not args.lightx2v_lora.is_file():
+            raise FileNotFoundError(args.lightx2v_lora)
     if args.lora_scale <= 0:
         raise ValueError("lora-scale must be positive")
+    if args.preencode_batch_frames <= 0:
+        raise ValueError("preencode-batch-frames must be positive")
 
     references = [(path.expanduser().resolve(), _mime_type(path)) for path in args.reference]
     for path, _ in references:

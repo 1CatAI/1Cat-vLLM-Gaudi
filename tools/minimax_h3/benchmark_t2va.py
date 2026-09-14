@@ -28,9 +28,18 @@ DEFAULT_ENCODING_FFMPEG = Path(imageio_ffmpeg.get_ffmpeg_exe())
 PINNED_OMNI_REFERENCE_SIGMA_POINTS = 50
 FLASHGEN_INFERENCE_STEPS = 4
 FLASHGEN_SIGMA_POINTS = 5
+FASTH3_INFERENCE_STEPS = 4
+FASTH3_SIGMA_POINTS = 5
+LIGHTX2V_INFERENCE_STEPS = 4
+LIGHTX2V_SIGMA_POINTS = 5
+LIGHTX2V_T2VA_FILENAME = "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"
 
 
 def _sampling_plan(args: argparse.Namespace) -> tuple[int, int, str]:
+    if getattr(args, "fasth3_4step", False):
+        return FASTH3_SIGMA_POINTS, FASTH3_INFERENCE_STEPS, "fasth3_dense_datafree_4step"
+    if getattr(args, "lightx2v_lora", None) is not None:
+        return LIGHTX2V_SIGMA_POINTS, LIGHTX2V_INFERENCE_STEPS, "lightx2v_fl2v_turbo_4step_v1.0_768p_bf16"
     if getattr(args, "flashgen_lora", None) is not None:
         return FLASHGEN_SIGMA_POINTS, FLASHGEN_INFERENCE_STEPS, "flashgen_4step_768p"
     if args.pinned_omni_reference:
@@ -241,8 +250,15 @@ def _request_command(args: argparse.Namespace, run_dir: Path) -> list[str]:
         "2101",
         "--timeout",
         str(args.timeout),
+        "--preencode-mp4",
+        "--preencode-batch-frames",
+        "17",
     ]
-    if getattr(args, "flashgen_lora", None) is not None:
+    if getattr(args, "fasth3_4step", False):
+        command.append("--fasth3-4step")
+    elif getattr(args, "lightx2v_lora", None) is not None:
+        command.extend(("--lightx2v-4step-lora", str(args.lightx2v_lora)))
+    elif getattr(args, "flashgen_lora", None) is not None:
         command.extend(("--flashgen-4step-lora", str(args.flashgen_lora)))
     elif args.pinned_omni_reference:
         command.append("--pinned-omni-reference")
@@ -352,11 +368,23 @@ def main() -> int:
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     schedule = parser.add_mutually_exclusive_group()
     schedule.add_argument(
+        "--fasth3-4step",
+        action="store_true",
+        help="benchmark a server with the FastH3 Dense-DataFree student fused at startup",
+    )
+    schedule.add_argument(
         "--flashgen-4step-lora",
         "--flashgen-lora",
         dest="flashgen_lora",
         type=Path,
         help="benchmark the published ModelScope FlashGen four-forward 768p schedule",
+    )
+    schedule.add_argument(
+        "--lightx2v-4step-lora",
+        "--lightx2v-lora",
+        dest="lightx2v_lora",
+        type=Path,
+        help="benchmark the published LightX2V FL2V Turbo four-forward 768p BF16 LoRA",
     )
     schedule.add_argument(
         "--denoise-steps",
@@ -387,7 +415,14 @@ def main() -> int:
         args.flashgen_lora = args.flashgen_lora.expanduser().resolve()
         if not args.flashgen_lora.is_file():
             raise FileNotFoundError(args.flashgen_lora)
-    elif args.sigma_points is None and not args.pinned_omni_reference:
+    if args.lightx2v_lora is not None:
+        args.lightx2v_lora = args.lightx2v_lora.expanduser().resolve()
+        if not args.lightx2v_lora.is_file():
+            raise FileNotFoundError(args.lightx2v_lora)
+        if args.lightx2v_lora.name != LIGHTX2V_T2VA_FILENAME:
+            raise ValueError(f"T2VA benchmark requires {LIGHTX2V_T2VA_FILENAME}")
+    elif args.flashgen_lora is None and not args.fasth3_4step and args.sigma_points is None \
+            and not args.pinned_omni_reference:
         if args.denoise_steps is None:
             args.pinned_omni_reference = True
         elif args.denoise_steps < 1:
@@ -401,8 +436,17 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=False)
 
     flashgen = args.flashgen_lora is not None
+    lightx2v = args.lightx2v_lora is not None
+    fasth3 = args.fasth3_4step
     sigma_points, actual_forwards, sampling_profile = _sampling_plan(args)
-    sampler = "flashgen_dmd2_base_schedule" if flashgen else "omni_euler_eta0"
+    if fasth3:
+        sampler = "fasth3_dmd2_base_schedule"
+    elif lightx2v:
+        sampler = "lightx2v_turbo_euler_eta0"
+    elif flashgen:
+        sampler = "flashgen_dmd2_base_schedule"
+    else:
+        sampler = "omni_euler_eta0"
     results = [_one_run(args, index) for index in range(args.runs)]
     warmed = [item["wall_seconds"] for item in results[1:4]]
     summary = {

@@ -9,6 +9,12 @@ from vllm.model_executor.layers.fused_moe.layer import FusedMoEFactory as FusedM
 from vllm.model_executor.layers.quantization import fp8
 from vllm.model_executor.layers.quantization.fp8 import (Fp8LinearMethod as OrigFp8LinearMethod, Fp8MoEMethod,
                                                          Fp8Config)
+from vllm.model_executor.layers.quantization.online import fp8 as online_fp8
+from vllm.model_executor.layers.quantization.online.fp8 import (
+    Fp8PerTensorOnlineLinearMethod as OrigFp8PerTensorOnlineLinearMethod,
+    _Fp8OnlineLinearBase,
+)
+from vllm.model_executor.utils import replace_parameter
 import vllm_gaudi.extension.ops as hpu_ops
 from vllm_gaudi.extension.ops import (VllmMixtureOfExpertsOpFP8PerChannel, VllmMixtureOfExpertsOpFP8)
 from vllm_gaudi.extension.runtime import get_config
@@ -72,12 +78,16 @@ if PlatformEnum.OOT not in _POSSIBLE_FP8_BLOCK_KERNELS:
 class Fp8LinearMethod(OrigFp8LinearMethod):
 
     def create_weights(self, *args, **kwargs) -> None:
-        if hpu_ops.is_hpu_gaudi2:
+        # The range conversion wrapper is only valid for E4M3FN tensors and
+        # their serialized inverse scales. Applying it to a BF16 checkpoint
+        # doubles source weights before online quantization.
+        if hpu_ops.is_hpu_gaudi2 and self.quant_config.is_checkpoint_fp8_serialized:
             kwargs['weight_loader'] = hpu_ops.gaudi_weight_wrapper(kwargs.get('weight_loader'))
         super().create_weights(*args, **kwargs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.quant_config = self.quant_config
+        input_scale = None
         if self.block_quant:
             layer = hpu_ops.fp8_block_linear_postprocess_weights(layer, envs.VLLM_HPU_FORCE_CHANNEL_FP8)
             return
@@ -146,6 +156,81 @@ class Fp8LinearMethod(OrigFp8LinearMethod):
             do_unpad=True,
         )
         return dequant_weight
+
+
+class HPUFp8OnlineLinearMethod(OrigFp8PerTensorOnlineLinearMethod):
+    """Load BF16 weights and quantize them to PTPC FP8 on HPU.
+
+    vLLM's generic online FP8 method dispatches CUDA custom quantization ops.
+    Gaudi uses one scale per output channel and a dynamic scale per activation
+    token, matching the serialized ModelOpt ``FP8_PER_CHANNEL_PER_TOKEN``
+    execution layout.
+    """
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        # Skip the generic CUDA/ROCm kernel selector. The HPU apply path below
+        # calls fp8_gemm_v2 directly after dynamic per-token quantization.
+        _Fp8OnlineLinearBase.create_weights(
+            self,
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            input_size,
+            output_size,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+        if layer.weight.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+            raise TypeError(f"HPU online FP8 requires floating-point source weights, got {layer.weight.dtype}")
+
+        # Gaudi2's E4M3 MME range is 240 rather than E4M3FN's software range
+        # of 448. Quantizing from BF16 directly avoids any serialized-format
+        # range conversion and preserves the reconstructed FastH3 weights.
+        amax = layer.weight.abs().amax(dim=-1, keepdim=True).float()
+        weight_scale = (amax + 1e-8) / float(hpu_ops.FP8_MAX)
+        qweight = torch.ops.hpu.cast_to_fp8_v2(
+            layer.weight,
+            weight_scale.reciprocal(),
+            False,
+            False,
+            torch.float8_e4m3fn,
+        )[0]
+
+        replace_parameter(layer, "weight", qweight.t().data)
+        replace_parameter(layer, "weight_scale", weight_scale.squeeze(-1).data)
+        layer.input_scale = None
+        layer._already_called_process_weights_after_loading = True
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        input_2d = x.reshape(-1, x.shape[-1])
+        output_shape = (*x.shape[:-1], layer.weight.shape[1])
+        output = hpu_ops.apply_fp8_linear_hpu(
+            input=input_2d,
+            weight=layer.weight,
+            weight_scale=layer.weight_scale,
+            input_scale=None,
+            bias=bias,
+            trans_B=False,
+        )
+        return output.narrow(0, 0, input_2d.shape[0]).reshape(output_shape)
 
 
 class HPUFp8MoEMethod(Fp8MoEMethod):
@@ -280,3 +365,15 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
 
 fp8.Fp8LinearMethod = Fp8LinearMethod
 fp8.Fp8MoEMethod = HPUFp8MoEMethod
+online_fp8.Fp8PerTensorOnlineLinearMethod = HPUFp8OnlineLinearMethod
+
+# OnlineQuantizationConfig stores method classes in a dispatch table at import
+# time. Keep that newer entry point aligned when it is present, while the
+# pinned Omni path continues to use Fp8Config(is_checkpoint_fp8_serialized=False).
+try:
+    from vllm.model_executor.layers.quantization.online import base as online_base
+    from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8StaticTensorSym
+
+    online_base._ONLINE_LINEAR_METHODS[kFp8StaticTensorSym] = HPUFp8OnlineLinearMethod
+except (AttributeError, ImportError):
+    pass
