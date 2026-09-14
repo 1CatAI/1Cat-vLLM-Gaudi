@@ -62,8 +62,8 @@ class StageVariant(torch.nn.Module):
     def __init__(self, program, hidden, pre_mix, positions, input_ids, engram, *, native_input=False):
         super().__init__()
         self.program = program
-        self.adapter = (DEEPSEEK_V41_PP0_INPUT if native_input else
-                        DEEPSEEK_V41_PP0 if program.pp_rank == 0 else DEEPSEEK_V41_PP1)
+        self.adapter = (DEEPSEEK_V41_PP0_INPUT
+                        if native_input else DEEPSEEK_V41_PP0 if program.pp_rank == 0 else DEEPSEEK_V41_PP1)
         from vllm_gaudi.models.deepseek_v41_program import CompiledStage
         self.compiled = CompiledStage(program, native=True, native_input=native_input)
         self.fixed = tuple(value.clone() for value in (hidden, pre_mix, positions, input_ids))
@@ -145,8 +145,13 @@ class StageReplay:
             raise ValueError("V4.1 replay shape must match C1 decode or enabled C6 DSpark verification")
         key = (tokens, "input") if native_input else tokens
         if key not in self.variants:
-            self.variants[key] = StageVariant(self.program(), hidden, pre_mix, positions, input_ids, engram,
-                                             native_input=native_input)
+            self.variants[key] = StageVariant(self.program(),
+                                              hidden,
+                                              pre_mix,
+                                              positions,
+                                              input_ids,
+                                              engram,
+                                              native_input=native_input)
         return self.variants[key](hidden, pre_mix, positions, input_ids, engram)
 
     def require_ready(self, tokens):

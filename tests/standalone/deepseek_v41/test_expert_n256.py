@@ -135,10 +135,13 @@ def test_fused_quant_clamp_and_live_experts():
         actual = compiled(*operands).cpu()
         exact = torch.equal(ordinary.view(torch.int16), actual.view(torch.int16))
         error = actual.float() - reference.float()
-        relative = (error.square().mean().sqrt() /
-                    reference.float().square().mean().sqrt().clamp_min(1e-30)).item()
-        records.append({"gain": gain, "ordinary_compiled_exact": exact,
-                        "relative_rms_error": relative, "max_absolute_error": error.abs().max().item(),
-                        "reference_exact": torch.equal(reference.view(torch.int16), actual.view(torch.int16))})
+        relative = (error.square().mean().sqrt() / reference.float().square().mean().sqrt().clamp_min(1e-30)).item()
+        records.append({
+            "gain": gain,
+            "ordinary_compiled_exact": exact,
+            "relative_rms_error": relative,
+            "max_absolute_error": error.abs().max().item(),
+            "reference_exact": torch.equal(reference.view(torch.int16), actual.view(torch.int16))
+        })
     (Path(os.environ["DSV41_RUN_EVIDENCE"]) / "fused-quant-contract.json").write_text(json.dumps(records, indent=2))
     assert all(row["ordinary_compiled_exact"] and row["relative_rms_error"] < 0.001 for row in records), records

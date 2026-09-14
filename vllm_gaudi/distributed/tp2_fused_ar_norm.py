@@ -200,9 +200,9 @@ def initialize_tp2_fused_ar_norm_runtime() -> None:
     if envs.VLLM_HPU_TP2_STATIC_GROUP_PLAN:
         log.info("TP2 prepared runtime: checking runtime fingerprints")
         _verify_prepared_runtime(bridge_path)
-        if not envs.VLLM_HPU_TP2_PREPARED_COMM or not (
-                envs.VLLM_HPU_GDN_DIRECT_STATE_UPDATE or envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH
-                or envs.VLLM_HPU_DSV41_GRAPH_REPLAY):
+        if not envs.VLLM_HPU_TP2_PREPARED_COMM or not (envs.VLLM_HPU_GDN_DIRECT_STATE_UPDATE
+                                                       or envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH
+                                                       or envs.VLLM_HPU_DSV41_GRAPH_REPLAY):
             raise RuntimeError("Prepared TP2 groups require direct state update and prepared communication")
         from vllm_gaudi.ops.tp2_prepared_plan import register_tp2_prepared_group_pass
 
@@ -216,9 +216,9 @@ def initialize_tp2_fused_ar_norm_runtime() -> None:
         if envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH or envs.VLLM_HPU_DSV41_GRAPH_REPLAY:
             required += ("record_native_completion", "copy_sampled_tokens_to_host")
         if envs.VLLM_HPU_DSV41_DEVICE_COMMIT:
-            required += ("copy_integer_record_to_host",)
+            required += ("copy_integer_record_to_host", )
         if envs.VLLM_HPU_DSV41_NATIVE_PP_COPY:
-            required += ("copy_c1_pipeline_tensors",)
+            required += ("copy_c1_pipeline_tensors", )
         if not all(hasattr(bridge, name) for name in required) or not bridge.native_decode_graph_available():
             raise RuntimeError(
                 "VLLM_HPU_NATIVE_DECODE_GRAPH requires the version-locked Synapse and HCL native replay APIs; "

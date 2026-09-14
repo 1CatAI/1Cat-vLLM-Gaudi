@@ -48,7 +48,8 @@ setup(
                 "hpu_dsv41_mxfp4_mme_pt2.cpp", "hpu_dsv41_quant_roundtrip_pt2.cpp", "hpu_dsv41_selected_kv_pt2.cpp",
                 "hpu_dsv41_control_gemv_pt2.cpp", "hpu_dsv41_fp8_operands_pt2.cpp", "hpu_dsv41_swa_pack_pt2.cpp",
                 "hpu_dsv41_fp4_pack_pt2.cpp", "hpu_dsv41_csa2_prep_pt2.cpp", "hpu_dsv41_decoded_kv_pt2.cpp",
-                "hpu_dsv41_mla_mme_pt2.cpp", "hpu_dsv41_woa_fp8_pt2.cpp", "hpu_dsv41_router_top6_pt2.cpp", "hpu_dsv41_bf16_linear_f32_pt2.cpp"
+                "hpu_dsv41_mla_mme_pt2.cpp", "hpu_dsv41_woa_fp8_pt2.cpp", "hpu_dsv41_router_top6_pt2.cpp",
+                "hpu_dsv41_bf16_linear_f32_pt2.cpp"
             ],
             include_dirs=includes,
             library_dirs=[get_lib_dir()],

@@ -40,8 +40,10 @@ def prepared_group_stats():
         elif os.environ.get("VLLM_HPU_TP2_NATIVE_JOINT_PLAN", "0") == "1":
             raise RuntimeError("Native joint plan counters are unavailable")
     return {
-        "native_program_generation": _native_program_generation,
-        "hcl_shared_stream_snapshots": hcl_streams,
+        "native_program_generation":
+        _native_program_generation,
+        "hcl_shared_stream_snapshots":
+        hcl_streams,
         "prepares":
         sum(module.prepares for module in tuple(_modules)),
         "native_joint_replays":
@@ -357,8 +359,8 @@ def _eligible(graph):
     v4 = gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH or gaudi_envs.VLLM_HPU_DSV41_GRAPH_REPLAY
     native = None if v4 else torch.ops.custom_op.gdn_state_update_out.default
     if not v4 and not any(child.op == "call_function" and child.target == native
-               for module in graph.modules() if type(module).__name__ == "HabanaGraphModule"
-               for child in module.fx_module.graph.nodes):
+                          for module in graph.modules() if type(module).__name__ == "HabanaGraphModule"
+                          for child in module.fx_module.graph.nodes):
         return False
     for node in graph.graph.nodes:
         if node.op in ("placeholder", "output", "get_attr"):
@@ -538,10 +540,12 @@ class PreparedGroupModule(torch.nn.Module):
             path.mkdir(parents=True, exist_ok=True)
             stem = f"group{group}-{id(self)}-prepare{self.prepares}"
             (path / f"{stem}.py").write_text(self.original.print_readable(print_output=False))
-            nodes = [dict(name=node.name, kind="compute", recipe=self.original.get_submodule(node.target)._recipe_id)
-                     if node.op == "call_module" else dict(name=node.name, kind="exchange")
-                     for node in self.original.graph.nodes
-                     if node.op == "call_module" or node.target in (collective, peer_exchange, plain)]
+            nodes = [
+                dict(name=node.name, kind="compute", recipe=self.original.get_submodule(node.target)._recipe_id)
+                if node.op == "call_module" else dict(name=node.name, kind="exchange")
+                for node in self.original.graph.nodes
+                if node.op == "call_module" or node.target in (collective, peer_exchange, plain)
+            ]
             (path / f"{stem}.json").write_text(json.dumps(nodes, indent=2) + "\n")
         return warm(results)
 
@@ -599,7 +603,7 @@ def register_tp2_prepared_group_pass():
                 # is not qualified for native replay. No mHC/norm arithmetic
                 # is replaced, and every original reduction remains present.
                 with graph.inserting_before(node):
-                    peer = graph.call_function(torch.ops.vllm_gaudi.tp2_exchange_peer.default, (partial,))
+                    peer = graph.call_function(torch.ops.vllm_gaudi.tp2_exchange_peer.default, (partial, ))
                     reduced = graph.call_function(torch.ops.aten.add.Tensor, (partial, peer))
                     peer.meta = copy.copy(node.meta)
                     reduced.meta = copy.copy(node.meta)
@@ -610,8 +614,8 @@ def register_tp2_prepared_group_pass():
             if nodes:
                 graph.lint()
                 context.graph_module.recompile()
-                from habana_frameworks.torch.dynamo.compile_backend.passes import (
-                    pass_fake_propagation, pass_mark_placement)
+                from habana_frameworks.torch.dynamo.compile_backend.passes import (pass_fake_propagation,
+                                                                                   pass_mark_placement)
                 pass_fake_propagation(context)
                 pass_mark_placement(context)
             return bool(nodes)

@@ -12,8 +12,14 @@ from vllm.distributed import get_pp_group, get_tensor_model_parallel_rank
 from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
 from vllm.models.deepseek_v4.common.vision import DeepseekV4Aligner, DeepseekV4ViT
 from vllm.models.deepseek_v4_1.common.mm_preprocess import (
-    IMAGE, IMAGE_END, IMAGE_NEW_LINE, IMAGE_PLACEHOLDER, IMAGE_START,
-    DeepseekV4VLDummyInputsBuilder, DeepseekV4VLMultiModalProcessor, DeepseekV4VLProcessingInfo,
+    IMAGE,
+    IMAGE_END,
+    IMAGE_NEW_LINE,
+    IMAGE_PLACEHOLDER,
+    IMAGE_START,
+    DeepseekV4VLDummyInputsBuilder,
+    DeepseekV4VLMultiModalProcessor,
+    DeepseekV4VLProcessingInfo,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
@@ -24,8 +30,9 @@ from vllm_gaudi.ops.deepseek_v41_host import EngramHost
 from vllm_gaudi.ops.deepseek_v41_replay import StageReplay, stage_collectives
 
 
-@MULTIMODAL_REGISTRY.register_processor(
-    DeepseekV4VLMultiModalProcessor, info=DeepseekV4VLProcessingInfo, dummy_inputs=DeepseekV4VLDummyInputsBuilder)
+@MULTIMODAL_REGISTRY.register_processor(DeepseekV4VLMultiModalProcessor,
+                                        info=DeepseekV4VLProcessingInfo,
+                                        dummy_inputs=DeepseekV4VLDummyInputsBuilder)
 class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
     requires_raw_input_tokens = True
     supports_encoder_tp_data = True
@@ -37,8 +44,7 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             raise RuntimeError("V4.1 HPU execution requires VLLM_HPU_DSV41_PREPARED_SHARDS=1")
         parallel = vllm_config.parallel_config
         if (parallel.tensor_parallel_size != 2 or parallel.pipeline_parallel_size != 2
-                or vllm_config.scheduler_config.max_num_seqs != 1
-                or vllm_config.model_config.max_model_len > 512):
+                or vllm_config.scheduler_config.max_num_seqs != 1 or vllm_config.model_config.max_model_len > 512):
             raise ValueError("The prepared V4.1 profile requires TP2 x PP2, one request and context <=512")
         if vllm_config.load_config.load_format != "dsv41_prepared":
             raise ValueError("V4.1 rank files require --load-format dsv41_prepared")
@@ -54,14 +60,21 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             from vllm_gaudi.distributed.tp2_fused_ar_norm import initialize_tp2_fused_ar_norm_runtime
             initialize_tp2_fused_ar_norm_runtime()
         reduce, gather = stage_collectives(self.tp_rank, self.native)
-        self.program = PreparedStage(self.directory, self.pp_rank, self.tp_rank, reduce, gather, self.device,
+        self.program = PreparedStage(self.directory,
+                                     self.pp_rank,
+                                     self.tp_rank,
+                                     reduce,
+                                     gather,
+                                     self.device,
                                      dspark=envs.VLLM_HPU_DSV41_DSPARK)
         self.program.replay_owner = StageReplay(self.program) if self.native else None
         self.ordinary = CompiledStage(self.program)
         self.input_program = None
         if self.pp_rank == 0 and self.native:
             self.input_program = torch.compile(PreparedInput(self.program.weights.embed, self.tp_rank, reduce),
-                                               backend="hpu_backend", fullgraph=True, dynamic=False)
+                                               backend="hpu_backend",
+                                               fullgraph=True,
+                                               dynamic=False)
         self.engram_host, self.step_ticket, self.last_aux = None, None, None
         self.step_is_decode = False
         self.extra = dict(vllm_config.load_config.model_loader_extra_config or {})
@@ -79,9 +92,11 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         if self.pp_rank == 0:
             if not envs.VLLM_HPU_DSV41_ENGRAM_HOST_TABLE:
                 raise RuntimeError("V4.1 Engram must use the native host table; no HBM/eager fallback is available")
-            self.engram_host = EngramHost(self.directory, self.tp_rank, self.device,
-                checkpoint_audit=self.extra.get("checkpoint_audit"),
-                force_lock=self.extra.get("engram_force_lock", False))
+            self.engram_host = EngramHost(self.directory,
+                                          self.tp_rank,
+                                          self.device,
+                                          checkpoint_audit=self.extra.get("checkpoint_audit"),
+                                          force_lock=self.extra.get("engram_force_lock", False))
             self._bind_vision()
 
     def _bind_vision(self):
@@ -120,8 +135,8 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         types, vit_offset, span_offset, result = kwargs["types"], 0, 0, []
         for (height, width), (out_height, out_width) in zip(vit_grid, llm_grid, strict=True):
             count = height * width
-            image = self.aligner(self.vision(patches[vit_offset:vit_offset + count].to(torch.bfloat16),
-                                            height, width), height, width)
+            image = self.aligner(self.vision(patches[vit_offset:vit_offset + count].to(torch.bfloat16), height, width),
+                                 height, width)
             span_length = out_height * (out_width + 1) + 2
             roles = types[span_offset:span_offset + span_length].to(image.device)
             span = image.new_empty(span_length, image.shape[-1])
@@ -141,7 +156,8 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             from vllm.model_executor.models.utils import _merge_multimodal_embeddings
             if is_multimodal is None:
                 raise ValueError("V4.1 image embeddings require the processor's span mask")
-            values = _merge_multimodal_embeddings(inputs_embeds=values, multimodal_embeddings=multimodal_embeddings,
+            values = _merge_multimodal_embeddings(inputs_embeds=values,
+                                                  multimodal_embeddings=multimodal_embeddings,
                                                   is_multimodal=is_multimodal)
         return values
 
@@ -177,15 +193,15 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             raise RuntimeError("Prepared V4.1 weights have not been loaded")
         input_ids, positions = input_ids.reshape(-1), positions.reshape(-1).to(torch.int32)
         native_input = (self.pp_rank == 0 and self.native and self.step_is_decode
-                        and envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH and not self.program.dspark
-                        and inputs_embeds is None and input_ids.numel() == 1)
+                        and envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH and not self.program.dspark and inputs_embeds is None
+                        and input_ids.numel() == 1)
         if self.pp_rank == 0:
             if self.step_ticket is None:
                 raise RuntimeError("V4.1 input metadata was not prepared by its worker")
             if native_input:
                 residual, pre = None, None
-            elif (inputs_embeds is None and self.input_program is not None
-                    and self.step_is_decode and input_ids.numel() == 1):
+            elif (inputs_embeds is None and self.input_program is not None and self.step_is_decode
+                  and input_ids.numel() == 1):
                 residual, pre = self.input_program(input_ids)
             else:
                 values = self.embed_input_ids(input_ids) if inputs_embeds is None else inputs_embeds.reshape(-1, 5120)

@@ -26,17 +26,25 @@ def tensor(text):
     strides = re.search(r"strides = (\[[^]]+\])", text)
     alias = re.search(r"isAliased = ([^,|]+)", text)
     fields = text.split("|")
-    return {"name": fields[0].strip(), "shape": json.loads(shape[1]) if shape else None,
-            "dtype": fields[2].strip() if len(fields) > 2 else "unknown",
-            "bytes": int(width[1]) if width else None, "location": location[1] if location else "unknown",
-            "strides": json.loads(strides[1]) if strides else None, "alias": alias[1].strip() if alias else None,
-            "description": text}
+    return {
+        "name": fields[0].strip(),
+        "shape": json.loads(shape[1]) if shape else None,
+        "dtype": fields[2].strip() if len(fields) > 2 else "unknown",
+        "bytes": int(width[1]) if width else None,
+        "location": location[1] if location else "unknown",
+        "strides": json.loads(strides[1]) if strides else None,
+        "alias": alias[1].strip() if alias else None,
+        "description": text
+    }
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("analysis", type=Path)
-    parser.add_argument("--rank", type=int, choices=range(4), action="append",
+    parser.add_argument("--rank",
+                        type=int,
+                        choices=range(4),
+                        action="append",
                         help="Map only available ranks after an incomplete profiler export")
     args = parser.parse_args()
     manifest = json.loads((args.analysis / "graph-manifest.json").read_text())
@@ -56,8 +64,7 @@ def main():
         contracts, unresolved = [], []
         for recipe in recipes:
             compute = [node for node in recipe["nodes"] if node["device_type"] in (0, 1, 8)]
-            scores = collections.Counter(path for node in compute
-                                         for path in index[(node["node"], node["kernel"])])
+            scores = collections.Counter(path for node in compute for path in index[(node["node"], node["kernel"])])
             complete = [path for path, score in scores.items() if score == len(compute)]
             own_rank = [path for path in complete if f"/rank{rank}/" in path]
             if own_rank:
@@ -73,21 +80,34 @@ def main():
                     graph = graphs[ordered[0]]
             for symbol in compute:
                 node = graph["nodes"].get((symbol["node"], symbol["kernel"])) if graph else None
-                entry = {"recipe_id": recipe["recipe_id"], "symbol": symbol,
-                         "graph": graph["record"] if graph else None, "matched": node is not None}
+                entry = {
+                    "recipe_id": recipe["recipe_id"],
+                    "symbol": symbol,
+                    "graph": graph["record"] if graph else None,
+                    "matched": node is not None
+                }
                 if node:
                     attrs = node["attrs"]
-                    entry.update(inputs=[tensor(value) for key, value in sorted(attrs.items())
-                                         if key.startswith("inputTensor:")],
-                                 outputs=[tensor(value) for key, value in sorted(attrs.items())
-                                          if key.startswith("outputTensor:")], attributes=attrs)
+                    entry.update(inputs=[
+                        tensor(value) for key, value in sorted(attrs.items()) if key.startswith("inputTensor:")
+                    ],
+                                 outputs=[
+                                     tensor(value) for key, value in sorted(attrs.items())
+                                     if key.startswith("outputTensor:")
+                                 ],
+                                 attributes=attrs)
                 else:
                     unresolved.append([recipe["recipe_id"], symbol["full_context_id"], symbol["node"]])
                 contracts.append(entry)
         (root / "node-contracts.json").write_text(json.dumps(contracts, indent=2) + "\n")
         (root / "unresolved-contracts.json").write_text(json.dumps(unresolved, indent=2) + "\n")
-        print(json.dumps({"rank": rank, "compute_nodes": len(contracts),
-                          "matched": len(contracts) - len(unresolved), "unresolved": len(unresolved)}), flush=True)
+        print(json.dumps({
+            "rank": rank,
+            "compute_nodes": len(contracts),
+            "matched": len(contracts) - len(unresolved),
+            "unresolved": len(unresolved)
+        }),
+              flush=True)
 
 
 if __name__ == "__main__":

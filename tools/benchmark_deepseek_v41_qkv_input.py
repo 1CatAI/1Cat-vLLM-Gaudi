@@ -38,8 +38,12 @@ def _fused(value, weight):
 
 
 def _summary(values):
-    return {"mean_ms": float(np.mean(values)), "p50_ms": float(np.median(values)),
-            "p95_ms": float(np.percentile(values, 95)), "samples": values}
+    return {
+        "mean_ms": float(np.mean(values)),
+        "p50_ms": float(np.median(values)),
+        "p95_ms": float(np.percentile(values, 95)),
+        "samples": values
+    }
 
 
 def main():
@@ -76,10 +80,16 @@ def main():
         torch.hpu.synchronize()
         events = [(torch.hpu.Event(enable_timing=True), torch.hpu.Event(enable_timing=True))
                   for _ in range(args.samples)]
-        record = {"scope": "wq_a+wkv input producer only; real prepared weights; no TP/PP",
-                  "layers": layer_ids, "layers_per_sweep": len(inputs), "rounds": [],
-                  "weight_bytes": {"separate": sum(a.numel() + b.numel() for a, b in separate_weights) * 2,
-                                   "fused": sum(w.numel() for w in fused_weights) * 2}}
+        record = {
+            "scope": "wq_a+wkv input producer only; real prepared weights; no TP/PP",
+            "layers": layer_ids,
+            "layers_per_sweep": len(inputs),
+            "rounds": [],
+            "weight_bytes": {
+                "separate": sum(a.numel() + b.numel() for a, b in separate_weights) * 2,
+                "fused": sum(w.numel() for w in fused_weights) * 2
+            }
+        }
         for round_id in range(args.rounds):
             for value in inputs:
                 value.mul_(1.001 + round_id * .001)
@@ -93,8 +103,12 @@ def main():
                     end.record()
                     end.synchronize()
                     device.append(begin.elapsed_time(end))
-                item = {"round": round_id, "arm": name, "device_sweep": _summary(device),
-                        "mean_ms_per_layer": float(np.mean(device)) / len(inputs)}
+                item = {
+                    "round": round_id,
+                    "arm": name,
+                    "device_sweep": _summary(device),
+                    "mean_ms_per_layer": float(np.mean(device)) / len(inputs)
+                }
                 record["rounds"].append(item)
                 print(name, round_id, item["mean_ms_per_layer"], "ms/layer", flush=True)
         separate_mean = np.mean([x["mean_ms_per_layer"] for x in record["rounds"] if x["arm"] == "separate"])

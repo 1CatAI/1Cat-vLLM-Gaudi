@@ -158,30 +158,48 @@ def account(root):
         per_engine = {engine: merge(spans) for engine, spans in engine_spans.items()}
         for engine, spans in per_engine.items():
             engines[engine].extend(spans)
-        rank_activity.append({"rank": rank, "period_ms": period / scale,
-                              "group_activity_ms": {GROUPS[g]: length(s) / scale for g, s in merged.items()},
-                              "engine_activity_ms": {e: length(s) / scale for e, s in per_engine.items()},
-                              "all_device_ms": length(merge([s for spans in merged.values() for s in spans])) / scale})
+        rank_activity.append({
+            "rank": rank,
+            "period_ms": period / scale,
+            "group_activity_ms": {
+                GROUPS[g]: length(s) / scale
+                for g, s in merged.items()
+            },
+            "engine_activity_ms": {
+                e: length(s) / scale
+                for e, s in per_engine.items()
+            },
+            "all_device_ms": length(merge([s for spans in merged.values() for s in spans])) / scale
+        })
         for row in details:
             row["group"] = GROUPS[group_for(row)]
             all_details.append(row)
-            kernel_members.append({k: row[k] for k in (
-                "rank", "group", "category", "purpose", "kernel", "recipe_id", "context_id", "engine",
-                "mean_invocation_ms", "observed_calls", "calls_per_token", "observed_lane_packets",
-                "activity_ms_per_token", "period_pct")})
+            kernel_members.append({
+                k: row[k]
+                for k in ("rank", "group", "category", "purpose", "kernel", "recipe_id", "context_id", "engine",
+                          "mean_invocation_ms", "observed_calls", "calls_per_token", "observed_lane_packets",
+                          "activity_ms_per_token", "period_pct")
+            })
         print(f"rank{rank}: {len(details)} node contracts retained", flush=True)
     disjoint, covered, raw_groups = [], [], {}
     for group in range(8):
         spans = merge(all_groups[group])
         raw_groups[group] = spans
         exclusive = subtract(spans, covered)
-        disjoint.append({"group": GROUPS[group], "exclusive_ms": length(exclusive) / scale,
-                         "activity_union_ms": length(spans) / scale,
-                         "share_percent": length(exclusive) / period * 100})
+        disjoint.append({
+            "group": GROUPS[group],
+            "exclusive_ms": length(exclusive) / scale,
+            "activity_union_ms": length(spans) / scale,
+            "share_percent": length(exclusive) / period * 100
+        })
         covered = merge(covered + spans)
     gap = subtract(merge(windows), covered)
-    disjoint.append({"group": GROUPS[8], "exclusive_ms": length(gap) / scale,
-                     "activity_union_ms": length(gap) / scale, "share_percent": length(gap) / period * 100})
+    disjoint.append({
+        "group": GROUPS[8],
+        "exclusive_ms": length(gap) / scale,
+        "activity_union_ms": length(gap) / scale,
+        "share_percent": length(gap) / period * 100
+    })
     assert abs(sum(row["exclusive_ms"] for row in disjoint) - period / scale) < 1e-7
     overlap = {}
     for a in range(8):
@@ -193,50 +211,69 @@ def account(root):
     for rank in range(4):
         screen = json.loads((root / f"rank{rank}/activity-screen.json").read_text())
         # Names remain explicit: this is not a substitute for the per-node union.
-        expert_decode[str(rank)] = {r["kernel"]: r["activity_ms_per_token"] for r in screen["rows"]
-                                   if "mxfp4" in r["kernel"]}
-    result = {"method": "same trace clock; global four-rank union; fixed group priority 0..7; complement 8",
-              "priority_is_not_causal_ownership": True, "anchor": common["anchor"], "tokens": tokens,
-              "period_ms": period / scale, "groups": disjoint, "per_rank": rank_activity,
-              "pairwise_overlap_ms": overlap, "pairwise_overlap_must_not_be_summed": True,
-              "expert_kernel_activity_per_rank_ms": expert_decode,
-              "unattributed_intervals_us": gap,
-              "analysis_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+        expert_decode[str(rank)] = {
+            r["kernel"]: r["activity_ms_per_token"]
+            for r in screen["rows"] if "mxfp4" in r["kernel"]
+        }
+    result = {
+        "method": "same trace clock; global four-rank union; fixed group priority 0..7; complement 8",
+        "priority_is_not_causal_ownership": True,
+        "anchor": common["anchor"],
+        "tokens": tokens,
+        "period_ms": period / scale,
+        "groups": disjoint,
+        "per_rank": rank_activity,
+        "pairwise_overlap_ms": overlap,
+        "pairwise_overlap_must_not_be_summed": True,
+        "expert_kernel_activity_per_rank_ms": expert_decode,
+        "unattributed_intervals_us": gap,
+        "analysis_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    }
     (root / "four-rank-disjoint-accounting.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
     with (root / "four-rank-kernel-members.csv").open("w") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(kernel_members[0]))
         writer.writeheader()
         writer.writerows(kernel_members)
     write_browser(root / "kernels.html", all_details)
-    lines = ["# 四 rank 完整 trace 拆解", "", f"采集：{root.parent.name}。保留 {len(tokens)} 个完整周期，"
-             f"token {min(tokens)}–{max(tokens)}；共同边界：{common['anchor']}。",
-             "", "主表为同一时钟下四 rank 活动的固定优先级互斥账本。重叠优先归入表中较前组，"
-             "此顺序不代表关键路径所有权；活动并集列允许重叠，不能直接相加。", "",
-             "| Kernel／边界组 | 互斥 ms/token | 占比 | 该组活动并集 ms/token |",
-             "| --- | ---: | ---: | ---: |"]
+    # Keep localized report fields on separate lines for display-width checks.
+    # yapf: disable
+    lines = [
+        "# 四 rank 完整 trace 拆解", "",
+        f"采集：{root.parent.name}。保留 {len(tokens)} 个完整周期，"
+        f"token {min(tokens)}–{max(tokens)}；共同边界：{common['anchor']}。", "",
+        "主表为同一时钟下四 rank 活动的固定优先级互斥账本。重叠优先归入表中较前组，"
+        "此顺序不代表关键路径所有权；活动并集列允许重叠，不能直接相加。", "",
+        "| Kernel／边界组 | 互斥 ms/token | 占比 | 该组活动并集 ms/token |",
+        "| --- | ---: | ---: | ---: |"
+    ]
     for row in disjoint:
         lines.append(f"| {row['group']} | {row['exclusive_ms']:.6f} | {row['share_percent']:.3f}% | "
                      f"{row['activity_union_ms']:.6f} |")
-    lines.extend([f"| **完整窗口** | **{period / scale:.6f}** | **100%** | — |", "",
-                  "完整精度字段严格相加等于窗口；六位小数显示可能存在末位舍入。无设备事件区间尚不能全部归因为 CPU、"
-                  "通信或可消除空闲；没有用 NIC 点事件包络构造通信耗时。Engram host hash/gather/DMA 等待可能在补集中，"
-                  "不等于表中 Engram 设备投影时间。", "",
-                  "[可搜索完整 kernel/张量报告](kernels.html) · [逐节点汇总 CSV](four-rank-kernel-members.csv) · "
-                  "[互斥区间及重叠 JSON](four-rank-disjoint-accounting.json)", "",
-                  "每个 rank 的 node-breakdown.json 保存实际 GUID、源节点、编译图、输入/输出 dtype、shape、"
-                  "SRAM/DRAM、平均完整调用延迟、活动并集、物理调用数和 lane 包数。"
-                  "无法重建的 DMA 描述符调用数及其单次延迟显式为空。", "",
-                  "| rank | TPC 并集 ms | MME 并集 ms | 全设备并集 ms |", "| --- | ---: | ---: | ---: |"])
+    lines.extend([
+        f"| **完整窗口** | **{period / scale:.6f}** | **100%** | — |", "",
+        "完整精度字段严格相加等于窗口；六位小数显示可能存在末位舍入。无设备事件区间尚不能全部归因为 CPU、"
+        "通信或可消除空闲；没有用 NIC 点事件包络构造通信耗时。Engram host hash/gather/DMA 等待可能在补集中，"
+        "不等于表中 Engram 设备投影时间。", "",
+        "[可搜索完整 kernel/张量报告](kernels.html) · [逐节点汇总 CSV](four-rank-kernel-members.csv) · "
+        "[互斥区间及重叠 JSON](four-rank-disjoint-accounting.json)", "",
+        "每个 rank 的 node-breakdown.json 保存实际 GUID、源节点、编译图、输入/输出 dtype、shape、"
+        "SRAM/DRAM、平均完整调用延迟、活动并集、物理调用数和 lane 包数。"
+        "无法重建的 DMA 描述符调用数及其单次延迟显式为空。", "",
+        "| rank | TPC 并集 ms | MME 并集 ms | 全设备并集 ms |", "| --- | ---: | ---: | ---: |"
+    ])
     for row in rank_activity:
         lines.append(f"| {row['rank']} | {row['engine_activity_ms'].get('TPC', 0):.6f} | "
                      f"{row['engine_activity_ms'].get('MME', 0):.6f} | {row['all_device_ms']:.6f} |")
     for group in range(8):
-        lines.extend(["", f"## {GROUPS[group]}", "",
-                      "下列为按 GUID、用途、dtype/shape 聚合的较大项目；完整小项在上方报告。不同 rank 分别列出，"
-                      "不能将这些活动直接相加当作整组耗时。", "",
-                      "| rank | 功能 | Kernel/GUID | 输入 dtype:shape | 输出 dtype:shape |"
-                      " 单次 ms | 次/token | 活动 ms/token | 占比 |",
-                      "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: |"])
+        lines.extend([
+            "", f"## {GROUPS[group]}", "",
+            "下列为按 GUID、用途、dtype/shape 聚合的较大项目；完整小项在上方报告。不同 rank 分别列出，"
+            "不能将这些活动直接相加当作整组耗时。", "",
+            "| rank | 功能 | Kernel/GUID | 输入 dtype:shape | 输出 dtype:shape |"
+            " 单次 ms | 次/token | 活动 ms/token | 占比 |",
+            "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: |"
+        ])
+        # yapf: enable
         top = []
         for rank in range(4):
             rows = json.loads((root / f"rank{rank}/kernel-breakdown.json").read_text())["kernel_rows"]

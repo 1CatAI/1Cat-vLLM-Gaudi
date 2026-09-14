@@ -18,20 +18,13 @@ prepare_environment()
 import torch  # noqa: E402
 from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config  # noqa: E402
 from vllm.distributed import (  # noqa: E402
-    destroy_distributed_environment,
-    destroy_model_parallel,
-    init_distributed_environment,
-    initialize_model_parallel,
+    destroy_distributed_environment, destroy_model_parallel, init_distributed_environment, initialize_model_parallel,
 )
 from vllm_gaudi.distributed.tp2_fused_ar_norm import initialize_tp2_fused_ar_norm_runtime  # noqa: E402
 from vllm_gaudi.ops.tp2_model_adapter import DEEPSEEK_V41_PP1  # noqa: E402
 from vllm_gaudi.ops.tp2_prepared_plan import (  # noqa: E402
-    collect_prepared_group_replays,
-    prepared_group_stats,
-    record_native_decoder_outputs,
-    recapture_native_decoder_programs,
-    replay_native_decoder,
-    shutdown_prepared_group_plans,
+    collect_prepared_group_replays, prepared_group_stats, record_native_decoder_outputs,
+    recapture_native_decoder_programs, replay_native_decoder, shutdown_prepared_group_plans,
 )
 from vllm_gaudi.v1.worker.deepseek_v41_runner import PPBuffers  # noqa: E402
 from vllm_gaudi.models.deepseek_v41_program import PreparedStage  # noqa: E402
@@ -74,22 +67,31 @@ def position_program(hidden, pre, positions):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--wait-receive", action="store_true")
-    parser.add_argument("--local-input", action="store_true",
+    parser.add_argument("--local-input",
+                        action="store_true",
                         help="Complete unrelated PP traffic, then use independent CPU-generated replay inputs")
-    parser.add_argument("--restore-tp-context", action="store_true",
+    parser.add_argument("--restore-tp-context",
+                        action="store_true",
                         help="Diagnostic only: insert an ordinary TP exchange after PP")
     parser.add_argument("--steps", type=int, default=34)
     parser.add_argument("--position-bank", action="store_true", help="Bind changing immutable position views directly")
-    parser.add_argument("--device-commit", action="store_true", help="Compile real greedy head and completion after native TP")
+    parser.add_argument("--device-commit",
+                        action="store_true",
+                        help="Compile real greedy head and completion after native TP")
     parser.add_argument("--native-pp-copy", action="store_true", help="Use bounded native DMA for C1 packets")
     parser.add_argument("--profile", action="store_true", help="Capture only steps after cold/capture/hot warmup")
-    parser.add_argument("--verify-commit", action="store_true", help="Deprecated: ordinary int32 completion is always exercised")
+    parser.add_argument("--verify-commit",
+                        action="store_true",
+                        help="Deprecated: ordinary int32 completion is always exercised")
     args = parser.parse_args()
     torch.hpu.set_device(rank)
     from vllm_gaudi.ops.deepseek_v4_config import bind_worker_cpu
     bind_worker_cpu(rank)
-    init_distributed_environment(world_size=4, rank=rank, distributed_init_method="env://",
-                                 local_rank=rank, backend="hccl")
+    init_distributed_environment(world_size=4,
+                                 rank=rank,
+                                 distributed_init_method="env://",
+                                 local_rank=rank,
+                                 backend="hccl")
     initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=2)
     initialize_tp2_fused_ar_norm_runtime()
     pp = PPBuffers(torch.device("hpu"), dspark=False)
@@ -101,7 +103,9 @@ def main():
         commit_head = torch.compile(CompletionHead(rank % 2), backend="hpu_backend", fullgraph=True, dynamic=False)
     owner = torch.nn.Identity()
     compiled = torch.compile(position_program if args.position_bank else program,
-                             backend="hpu_backend", fullgraph=True, dynamic=False)
+                             backend="hpu_backend",
+                             fullgraph=True,
+                             dynamic=False)
     from vllm_gaudi.ops.deepseek_v41_inputs import PositionBank
     bank = PositionBank(512, 6, "hpu") if args.position_bank else None
     # Use the production PP1 contract so the native graph captures all five
@@ -135,9 +139,10 @@ def main():
     for step in range(args.steps):
         step_started = time.perf_counter()
         if args.profile and step == 4:
-            profiler = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
-                                                          torch.profiler.ProfilerActivity.HPU],
-                                              record_shapes=True, with_stack=False)
+            profiler = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.HPU],
+                record_shapes=True,
+                with_stack=False)
             profiler.start()
             recapture_native_decoder_programs()
         value = step % 32
@@ -155,12 +160,13 @@ def main():
             if args.wait_receive or args.local_input:
                 torch.hpu.synchronize()
             if args.local_input:
-                received = dict(
-                    hidden_states=torch.full((1, 4, 5120), value + rank % 2,
-                                             dtype=torch.bfloat16, device="cpu").to("hpu"),
-                    pre_mix=torch.full((1, 4), float(value), dtype=torch.float32, device="cpu").to("hpu"))
-            positions = (bank.view(position, 1) if bank is not None else
-                         torch.tensor([value], dtype=torch.int32, device="cpu").to("hpu"))
+                received = dict(hidden_states=torch.full((1, 4, 5120),
+                                                         value + rank % 2,
+                                                         dtype=torch.bfloat16,
+                                                         device="cpu").to("hpu"),
+                                pre_mix=torch.full((1, 4), float(value), dtype=torch.float32, device="cpu").to("hpu"))
+            positions = (bank.view(position, 1)
+                         if bank is not None else torch.tensor([value], dtype=torch.int32, device="cpu").to("hpu"))
             live = received["hidden_states"], received["pre_mix"], positions
             if args.restore_tp_context:
                 probe = torch.zeros(1, 5120, dtype=torch.bfloat16, device="hpu")
@@ -168,16 +174,20 @@ def main():
                 torch.hpu.synchronize()
             if fixed is None:
                 fixed = tuple(value.clone() for value in live)
-            roots = dict(hidden_states=live[0], pre_mix=live[1], positions=live[2], residual=None,
+            roots = dict(hidden_states=live[0],
+                         pre_mix=live[1],
+                         positions=live[2],
+                         residual=None,
                          metadata=SimpleNamespace(is_prompt=False, native_completion=None))
             result = replay_native_decoder(owner, **roots)
             if result is None:
                 for destination, source in zip(fixed, live, strict=True):
                     destination.copy_(source)
                 fixed_roots = dict(roots, hidden_states=fixed[0], pre_mix=fixed[1], positions=fixed[2])
-                with collect_prepared_group_replays(
-                        owner=owner, adapter=topology,
-                        snapshot=lambda: SimpleNamespace(restore=lambda: None), **fixed_roots):
+                with collect_prepared_group_replays(owner=owner,
+                                                    adapter=topology,
+                                                    snapshot=lambda: SimpleNamespace(restore=lambda: None),
+                                                    **fixed_roots):
                     result = compiled(*fixed)
                     record_native_decoder_outputs(*result)
             print(f"RANK {rank} STEP {step} native submitted " + json.dumps(prepared_group_stats()), flush=True)
@@ -186,7 +196,9 @@ def main():
                 deadline = time.monotonic() + 15
                 while not ticket.query():
                     if time.monotonic() >= deadline:
-                        diagnostic = dict(rank=rank, step=step, status="native-completion-timeout",
+                        diagnostic = dict(rank=rank,
+                                          step=step,
+                                          status="native-completion-timeout",
                                           native=prepared_group_stats())
                         evidence = Path(os.environ["DSV41_RUN_EVIDENCE"])
                         (evidence / f"timeout-rank{rank}.json").write_text(json.dumps(diagnostic, indent=2) + "\n")
@@ -223,18 +235,27 @@ def main():
         recapture_native_decoder_programs()
     from vllm_gaudi.distributed.tp2_fused_ar_norm import _verify_prepared_runtime
     _verify_prepared_runtime(Path(os.environ["VLLM_HPU_TP2_FUSED_AR_NORM_BRIDGE"]))
-    (evidence / f"rank{rank}.json").write_text(json.dumps(dict(
-        status="exact", diagnostic="Packed C1 PP / ordinary completion / native TP dependencies; no model speed qualification",
-        packet_generations=pp.packed.generation, packet_completed=pp.packed.completed,
-        direct_position_views=args.position_bank,
-        device_completion=args.device_commit,
-        native_pp_copy=args.native_pp_copy,
-        wait_receive=args.wait_receive, local_input=args.local_input,
-        profile=args.profile, verify_commit=args.verify_commit,
-        runtime_fingerprints="Qualified Bridge ABI manifest rechecked after execution",
-        restore_tp_context=args.restore_tp_context, records=records,
-        step_timings_ms=step_timings,
-        pp_sends=pp.sends, pp_receives=pp.receives, native=prepared_group_stats()), indent=2) + "\n")
+    (evidence / f"rank{rank}.json").write_text(
+        json.dumps(dict(
+            status="exact",
+            diagnostic="Packed C1 PP / ordinary completion / native TP dependencies; no model speed qualification",
+            packet_generations=pp.packed.generation,
+            packet_completed=pp.packed.completed,
+            direct_position_views=args.position_bank,
+            device_completion=args.device_commit,
+            native_pp_copy=args.native_pp_copy,
+            wait_receive=args.wait_receive,
+            local_input=args.local_input,
+            profile=args.profile,
+            verify_commit=args.verify_commit,
+            runtime_fingerprints="Qualified Bridge ABI manifest rechecked after execution",
+            restore_tp_context=args.restore_tp_context,
+            records=records,
+            step_timings_ms=step_timings,
+            pp_sends=pp.sends,
+            pp_receives=pp.receives,
+            native=prepared_group_stats()),
+                   indent=2) + "\n")
     print(f"RANK {rank} shutdown native plans", flush=True)
     shutdown_prepared_group_plans()
     print(f"RANK {rank} shutdown model parallel groups", flush=True)
@@ -245,6 +266,6 @@ def main():
 
 
 if __name__ == "__main__":
-    with set_current_vllm_config(VllmConfig(
-            parallel_config=ParallelConfig(tensor_parallel_size=2, pipeline_parallel_size=2))):
+    with set_current_vllm_config(
+            VllmConfig(parallel_config=ParallelConfig(tensor_parallel_size=2, pipeline_parallel_size=2))):
         main()

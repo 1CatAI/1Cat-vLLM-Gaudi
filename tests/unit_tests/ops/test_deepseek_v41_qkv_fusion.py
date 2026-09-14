@@ -19,7 +19,7 @@ def _weight(rows, cols, seed):
     module.register_buffer("weight", _matrix(rows, cols, seed), False)
     # Dense prepared weights carry the scale plane as a marker for the
     # existing block-quantized activation contract.
-    module.register_buffer("scale", torch.ones((1,), dtype=torch.uint8), False)
+    module.register_buffer("scale", torch.ones((1, ), dtype=torch.uint8), False)
     return module
 
 
@@ -40,8 +40,12 @@ def _attention(weights):
         "qk_rope_head_dim": 4,
         "compress_rope_theta": 10000.0,
         "rope_theta": 10000.0,
-        "rope_scaling": {"original_max_position_embeddings": 512, "factor": 1.0,
-                         "beta_fast": 32.0, "beta_slow": 1.0},
+        "rope_scaling": {
+            "original_max_position_embeddings": 512,
+            "factor": 1.0,
+            "beta_fast": 32.0,
+            "beta_slow": 1.0
+        },
     }
     shared = nn.Module()
     shared.length = 512

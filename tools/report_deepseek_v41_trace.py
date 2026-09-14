@@ -38,8 +38,8 @@ def classify(node, kernel, inputs, outputs):
         if kernel in ("GEMM", "BatchGemm"):
             if not inputs:
                 return "Attention", "MLA 矩阵计算，操作数尚未关联"
-            return "Attention", ("MLA QK：BF16×BF16，FP32 结果" if inputs[0]["dtype"] == "bf16"
-                                 else "MLA PV：FP32 概率×FP32 V，FP32 累加")
+            return "Attention", ("MLA QK：BF16×BF16，FP32 结果"
+                                 if inputs[0]["dtype"] == "bf16" else "MLA PV：FP32 概率×FP32 V，FP32 累加")
         return "Attention", "MLA 内部转换、矩阵输入准备及数据搬运"
     if "deepseek_v41_router_top6" in kernel:
         return "Router", "text/image bias 选择、六次最大值选择、原分数归一化"

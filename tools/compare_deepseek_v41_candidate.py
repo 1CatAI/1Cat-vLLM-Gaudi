@@ -50,7 +50,7 @@ def decide(parent, candidate, checks, target_ms, minimum_gain_ms, structural_cha
     speed_pass = all(row["steady_ms"] < target_ms for row in after)
     if failed:
         decision = "archive_contract_failure"
-    elif not speed_pass and gain < minimum_gain_ms:
+    elif not speed_pass and (gain <= 0 or gain < minimum_gain_ms):
         decision = "archive_insufficient_gain"
     elif unknown:
         decision = "pending_contract_evidence"
@@ -96,12 +96,16 @@ def main():
     parser.add_argument("--checks", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--target-ms", type=float, default=15.)
-    parser.add_argument("--minimum-gain-ms", type=float, default=.5)
+    parser.add_argument("--minimum-gain-ms",
+                        type=float,
+                        default=0.,
+                        help="Optional gain floor; by default small positive gains may accumulate")
     parser.add_argument("--structural-change", action="store_true")
     args = parser.parse_args()
     if args.parent.resolve() == args.candidate.resolve():
         parser.error("Parent and candidate must be distinct preserved measurements")
-    if not math.isfinite(args.target_ms) or args.target_ms <= 0 or args.minimum_gain_ms < 0:
+    if (not math.isfinite(args.target_ms) or args.target_ms <= 0 or not math.isfinite(args.minimum_gain_ms)
+            or args.minimum_gain_ms < 0):
         parser.error("Require positive finite target and nonnegative minimum gain")
     records = {
         name: json.loads(path.read_text())

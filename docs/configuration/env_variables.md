@@ -479,9 +479,26 @@ and end-to-end performance have all been qualified. See
 
 ### V4.1 expert decoder work distribution
 
-`VLLM_HPU_DSV41_EXPERT_K128` (default `0`) selects the independent K128 TPC decoder for C1 top-6 BF16 MoE. It retains the prepared weight layout and full-K MME contract. Non-C1 calls use the existing operator. This experimental path requires matching native registrations and kernels; missing implementations fail explicitly. Do not combine it with FP8 decode.
+`VLLM_HPU_DSV41_EXPERT_K128` (default `0`) selects the independent K128 TPC decoder for C1 top-6 BF16 MoE. It retains the prepared weight layout and full-K MME contract. Non-C1 calls use the existing operator. This experimental path requires matching native registrations and kernels; missing implementations fail explicitly. It does not select FP8 arithmetic. On layers explicitly selected for N256 FP8, the N256 implementation takes precedence.
 
 `VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE` (default `0`) tests rolling tensor coordinates with bounded loop expansion inside the normal-scale K128 decoder. It requires `VLLM_HPU_DSV41_EXPERT_K128`, keeps the same prepared weights and BF16 MME interface, and leaves the general-scale decoder intact. Set it before process startup and use a separate recipe cache; its native kernel must be included in the verified build manifest. It is not a qualified performance default.
+
+`VLLM_HPU_DSV41_EXPERT_N256_FP8` (default `0`) selects the experimental N256/K128
+compressed expert layout and C1 FP8 MME path. It requires DSpark disabled and
+native stage replay. Select layers with `VLLM_HPU_DSV41_FP8_CONFIG`; omitting the
+configuration selects all routed-expert layers. It cannot be combined with
+`VLLM_HPU_DSV41_FP8_DECODE` or `VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE`.
+Load-time preparation retains one compressed allocation, original scale codes
+for BF16 prefill, and channel scales with relative FP8 exponents for C1.
+Live expert IDs address the compressed tensors during replay. Decoded FP8
+weights feed full-K MME operations; SRAM placement must be checked in the
+compiled graph. Loading this layout changes the precision fingerprint and
+requires fresh recipes.
+
+`VLLM_HPU_DSV41_EXPERT_FUSED_QUANT` (default `0`) requires the N256 FP8 path and
+fuses W13 result scaling, SwiGLU, routing and W2 activation quantization into
+the native MoE graph. Its BF16 intermediate rounding boundaries remain
+explicit. It does not enable the separate legacy FP8 decode candidate.
 
 ### V4.1 projection candidates
 
@@ -501,6 +518,15 @@ The prepared sidecar validates its source manifest, rank ownership, payload hash
 `VLLM_HPU_DSV41_MLA_MME=1` selects the experimental C1 shared-KV MME attention path.
 It requires decoded KV state, keeps FP32 softmax/PV consumption and the BF16 output
 boundary, and remains off by default. Prefill retains the existing path.
+
+`VLLM_HPU_DSV41_QKV_FUSED_INPUT` (default `0`) prepares one concatenated BF16
+input-projection weight for Q and KV, reuses their existing activation
+quantization once, and splits the joint projection into the original outputs.
+It requires DSpark disabled. This switch adds no new FP8 conversion, but the
+wider GEMM may affect compiler scheduling and numerical results. Full-model
+generated outputs differ from the preceding candidate; independent quality
+qualification remains incomplete. Do not treat isolated bitwise checks as
+full-model output equivalence.
 
 ### V4.1 native input capture
 

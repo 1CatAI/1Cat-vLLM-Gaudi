@@ -23,10 +23,8 @@ def union(spans):
 
 
 def symbols(inventory, recipes):
-    context = {(str(r["recipe_id"]), n["device_type"], n["full_context_id"]): n
-               for r in recipes for n in r["nodes"]}
-    names = {(str(r["recipe_id"]), n["device_type"], n["node"], n["kernel"]): n
-             for r in recipes for n in r["nodes"]}
+    context = {(str(r["recipe_id"]), n["device_type"], n["full_context_id"]): n for r in recipes for n in r["nodes"]}
+    names = {(str(r["recipe_id"]), n["device_type"], n["node"], n["kernel"]): n for r in recipes for n in r["nodes"]}
     result = {}
     for index, node in enumerate(inventory["nodes"]):
         rid = node["recipe"].split(":")[0]
@@ -53,13 +51,15 @@ def analyze(root, rank):
     markers = [row for row in inv["cpu_markers"] if row[2] == "vllm_gaudi::native_decoder_enqueue"]
     assert len(markers) == stats["native_replays"]
     first = min(row[0] for row in markers)
-    capture = [row for row in inv["host_enqueues"] if row[0] < first
-               and ("/graph_" in row[3] or row[3].endswith(".recipe"))][-stats["native_segments"]:]
+    capture = [
+        row for row in inv["host_enqueues"] if row[0] < first and ("/graph_" in row[3] or row[3].endswith(".recipe"))
+    ][-stats["native_segments"]:]
     assert len(capture) == stats["native_segments"]
     boundaries = {}
     for rid in {row[2].split(":")[0] for row in capture}:
-        candidates = [node for node in byid[rid]["nodes"]
-                      if node["kernel"] == "custom_deepseek_v41_bf16_identity_gaudi2"]
+        candidates = [
+            node for node in byid[rid]["nodes"] if node["kernel"] == "custom_deepseek_v41_bf16_identity_gaudi2"
+        ]
         if candidates:
             final = max(candidates, key=lambda node: node["full_context_id"])
             assert "_bundle_" not in final["node"]
@@ -91,11 +91,19 @@ def analyze(root, rank):
             groups[-1].append(row)
         workers = sum(boundaries[rid]["working_engines"])
         for group in groups:
-            calls.append({"rid": rid, "start": min(row[0] for row in group),
-                          "end": max(row[0] + row[1] for row in group),
-                          "complete": len(group) == len({row[2] for row in group}) == workers})
-        proofs[rid] = {"boundary": boundaries[rid], "observed_gap_split_us": [low, high],
-                       "threshold_us": threshold, "packets_per_call": workers}
+            calls.append({
+                "rid": rid,
+                "start": min(row[0] for row in group),
+                "end": max(row[0] + row[1] for row in group),
+                "complete": len(group) == len({row[2]
+                                               for row in group}) == workers
+            })
+        proofs[rid] = {
+            "boundary": boundaries[rid],
+            "observed_gap_split_us": [low, high],
+            "threshold_us": threshold,
+            "packets_per_call": workers
+        }
     calls.sort(key=lambda row: row["start"])
     expected = pattern * len(markers)
     assert [row["rid"] for row in calls] == expected[-len(calls):], "Device MoE sequence differs from stage plan"
@@ -103,14 +111,26 @@ def analyze(root, rank):
     for offset, call in enumerate(calls, len(expected) - len(calls)):
         call.update(token=offset // 20, layer=offset % 20)
         by_token[call["token"]].append(call)
-    ends = {token: next(call["end"] for call in rows if call["layer"] == 19)
-            for token, rows in by_token.items() if any(call["layer"] == 19 for call in rows)}
-    tokens = [token for token, rows in sorted(by_token.items()) if token >= 10 and token - 1 in ends
-              and len(rows) == 20 and all(row["complete"] for row in rows)]
+    ends = {
+        token: next(call["end"] for call in rows if call["layer"] == 19)
+        for token, rows in by_token.items() if any(call["layer"] == 19 for call in rows)
+    }
+    tokens = [
+        token for token, rows in sorted(by_token.items())
+        if token >= 10 and token - 1 in ends and len(rows) == 20 and all(row["complete"] for row in rows)
+    ]
     assert tokens
     windows = [(ends[token - 1], ends[token]) for token in tokens]
-    (path / "device-windows.json").write_text(json.dumps({"tokens": tokens, "windows_us": windows,
-        "calls": calls, "boundary_proofs": proofs, "capture_order": capture}, indent=2) + "\n")
+    (path / "device-windows.json").write_text(
+        json.dumps(
+            {
+                "tokens": tokens,
+                "windows_us": windows,
+                "calls": calls,
+                "boundary_proofs": proofs,
+                "capture_order": capture
+            },
+            indent=2) + "\n")
     period = sum(b - a for a, b in windows)
     grouped, engines = collections.defaultdict(list), collections.defaultdict(list)
     counts = collections.Counter()
@@ -137,13 +157,26 @@ def analyze(root, rank):
     scale = len(windows) * 1000
     tpc, mme = union(engines["TPC"]), union(engines["MME"])
     compute = union(engines["TPC"] + engines["MME"])
-    rows = sorted([{"engine": engine, "kernel": kernel, "activity_ms_per_token": union(spans) / scale,
-                    "period_pct": union(spans) / period * 100, "observed_lane_packets": counts[(engine, kernel)]}
-                   for (engine, kernel), spans in grouped.items()], key=lambda row: -row["activity_ms_per_token"])
-    result = {"rank": rank, "tokens": tokens, "period_ms": period / scale,
-              "tpc_ms": tpc / scale, "mme_ms": mme / scale, "compute_ms": compute / scale,
-              "overlap_ms": (tpc + mme - compute) / scale, "unattributed_or_other_ms": (period - compute) / scale,
-              "rows": rows, "status": "Activity screening; full physical-call/tensor attribution pending"}
+    rows = sorted([{
+        "engine": engine,
+        "kernel": kernel,
+        "activity_ms_per_token": union(spans) / scale,
+        "period_pct": union(spans) / period * 100,
+        "observed_lane_packets": counts[(engine, kernel)]
+    } for (engine, kernel), spans in grouped.items()],
+                  key=lambda row: -row["activity_ms_per_token"])
+    result = {
+        "rank": rank,
+        "tokens": tokens,
+        "period_ms": period / scale,
+        "tpc_ms": tpc / scale,
+        "mme_ms": mme / scale,
+        "compute_ms": compute / scale,
+        "overlap_ms": (tpc + mme - compute) / scale,
+        "unattributed_or_other_ms": (period - compute) / scale,
+        "rows": rows,
+        "status": "Activity screening; full physical-call/tensor attribution pending"
+    }
     (path / "activity-screen.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps({key: value for key, value in result.items() if key != "rows"}), flush=True)
     print(json.dumps(rows[:12]), flush=True)

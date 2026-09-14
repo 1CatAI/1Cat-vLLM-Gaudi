@@ -67,6 +67,16 @@ def test_gain_threshold_and_missing_contracts_prevent_false_retention():
     assert compare([14.] * 3, trace_mechanism=None)["decision"] == "pending_contract_evidence"
 
 
+def test_small_positive_gains_can_accumulate_without_waiving_contracts():
+    parent = recorded_rounds([23.5] * 3)
+    checks = dict.fromkeys(REQUIRED_CHECKS, True)
+    candidate = recorded_rounds([23.4] * 3)
+    assert decide(parent, candidate, checks, 15., 0., False)["decision"] == "retain_as_next_iteration_parent"
+    assert decide(parent, parent, checks, 15., 0., False)["decision"] == "archive_insufficient_gain"
+    checks["numerics"] = False
+    assert decide(parent, candidate, checks, 15., 0., False)["decision"] == "archive_contract_failure"
+
+
 def test_coalesced_events_cannot_qualify_fast_timing():
     candidate = recorded_rounds([14.] * 3)
     candidate["results"][0]["coalesced_token_events"] = 1

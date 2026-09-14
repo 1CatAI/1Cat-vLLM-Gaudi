@@ -160,9 +160,9 @@ class PreparedMoE(nn.Module):
             if fp8_decode:
                 op = (torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2
                       if self.n256_fused else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fp8_gaudi2)
-                output = op(
-                    value, ids.to(torch.int32), routing.float(), experts.w13_q16, experts.w2_q16, experts.w13_s16,
-                    experts.w2_s16, self.lookup, experts.w13_n256_channel, experts.w2_n256_channel, self.normal_scales)
+                output = op(value, ids.to(torch.int32), routing.float(), experts.w13_q16, experts.w2_q16,
+                            experts.w13_s16, experts.w2_s16, self.lookup, experts.w13_n256_channel,
+                            experts.w2_n256_channel, self.normal_scales)
             else:
                 output = torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_bf16_gaudi2(
                     value, ids.to(torch.int32), routing.float(), experts.w13_q16, experts.w2_q16, experts.w13_s16,
@@ -373,9 +373,8 @@ class PreparedStage(nn.Module):
         self.runtime_precision["router_selection"] = ("FP32 scores / native top6 / smallest-ID ties"
                                                       if gaudi_envs.VLLM_HPU_DSV41_ROUTER_TOP6 else "torch.topk")
         self.runtime_precision["head"] = "BF16xBF16 MME -> FP32" if self.bf16_head else "FP32 MME"
-        self.runtime_precision["attention_input"] = (
-            "fused wq_a+wkv BF16 MME / one activation quantization"
-            if gaudi_envs.VLLM_HPU_DSV41_QKV_FUSED_INPUT else "separate wq_a/wkv")
+        self.runtime_precision["attention_input"] = ("fused wq_a+wkv BF16 MME / one activation quantization" if
+                                                     gaudi_envs.VLLM_HPU_DSV41_QKV_FUSED_INPUT else "separate wq_a/wkv")
         self.runtime_precision["mla"] = ("shared-KV BF16 QK / FP32 softmax and PV / BF16 output v1"
                                          if gaudi_envs.VLLM_HPU_DSV41_MLA_MME else "TPC online softmax")
         self.precision_fingerprint = canonical_hash(self.runtime_precision)

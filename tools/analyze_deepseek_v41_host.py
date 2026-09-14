@@ -44,22 +44,42 @@ def main():
                 calls[(category, name)] += 1
                 groups[(category, name)].extend((begin, end) for _, begin, end in fragments)
                 if "compileGraph" in name or "native_decoder_enqueue" in name:
-                    events.append({"token": common["tokens"][fragments[0][0]],
-                                   "overlapped_tokens": [common["tokens"][i] for i, _, _ in fragments],
-                                   "pid": pid, "tid": tid,
-                                   "category": category, "name": name, "start_us": start,
-                                   "duration_ms": duration / 1000})
-        rows = [{"category": category, "name": name, "calls": calls[(category, name)],
-                 "calls_per_token": calls[(category, name)] / len(windows),
-                 "inclusive_sum_ms_per_token": sum(b-a for a, b in spans) / scale,
-                 "activity_union_ms_per_token": union(spans) / scale}
-                for (category, name), spans in groups.items()]
+                    events.append({
+                        "token": common["tokens"][fragments[0][0]],
+                        "overlapped_tokens": [common["tokens"][i] for i, _, _ in fragments],
+                        "pid": pid,
+                        "tid": tid,
+                        "category": category,
+                        "name": name,
+                        "start_us": start,
+                        "duration_ms": duration / 1000
+                    })
+        rows = [{
+            "category": category,
+            "name": name,
+            "calls": calls[(category, name)],
+            "calls_per_token": calls[(category, name)] / len(windows),
+            "inclusive_sum_ms_per_token": sum(b - a for a, b in spans) / scale,
+            "activity_union_ms_per_token": union(spans) / scale
+        } for (category, name), spans in groups.items()]
         rows.sort(key=lambda row: -row["inclusive_sum_ms_per_token"])
-        result = {"rank": rank, "tokens": common["tokens"], "rows": rows, "events": events,
-                  "semantics": "Inclusive CPU events may overlap across threads and nesting; do not add as overhead"}
+        result = {
+            "rank": rank,
+            "tokens": common["tokens"],
+            "rows": rows,
+            "events": events,
+            "semantics": "Inclusive CPU events may overlap across threads and nesting; do not add as overhead"
+        }
         (args.analysis / f"rank{rank}/host-analysis.json").write_text(json.dumps(result, indent=2) + "\n")
-        print(json.dumps({"rank": rank, "selected": [r for r in rows if any(
-            word in r["name"] for word in ("compileGraph", "native_decoder_enqueue", "syncEvent"))]}), flush=True)
+        print(json.dumps({
+            "rank":
+            rank,
+            "selected": [
+                r for r in rows
+                if any(word in r["name"] for word in ("compileGraph", "native_decoder_enqueue", "syncEvent"))
+            ]
+        }),
+              flush=True)
 
 
 if __name__ == "__main__":
