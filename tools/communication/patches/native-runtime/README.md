@@ -10,8 +10,10 @@ snapshot with compatibility backports for the tested SDK. It is **not** a source
 release of the installed SDK, and successful ABI checks do not prove compiler
 or numerical equivalence. Frozen production logprobs still differ in the full
 model, with a difference isolated to an FP8 MME accumulation. Full quality and
-performance promotion remain incomplete. Keep all candidates disabled in normal
-service profiles.
+performance promotion remain incomplete. Generic service profiles remain opt-in.
+The dedicated [DeepSeek V4.1 entrypoint](../../../../docs/features/deepseek_v41.md)
+enables its experimental C1 bundle by default; this does not promote that bundle
+to a production-qualified runtime. DSpark remains disabled by default.
 
 ## Source and build
 
@@ -76,8 +78,8 @@ TP2 GDN local-head shapes additionally require
 `VLLM_HPU_FLASHINFER_GDN_TP2=1`; enabling the parent GDN switch alone does not
 opt into them. The DeepSeek V4 adapter has its own attention and mHC state
 contract and does not require GDN. See the
-[V4 native decoder guide](../../../../docs/features/deepseek_v4_native_decode.md)
-and [environment variable reference](../../../../docs/configuration/env_variables.md).
+[V4 native decoder guide](https://github.com/1CatAI/1Cat-vLLM-Gaudi/blob/ac14567637ca1d8f3d4434e62dbab3317ebe9fbe/docs/features/deepseek_v4_native_decode.md)
+and [environment variable reference](https://github.com/1CatAI/1Cat-vLLM-Gaudi/blob/ac14567637ca1d8f3d4434e62dbab3317ebe9fbe/docs/configuration/env_variables.md).
 
 Preparation owns fixed inputs, state views, recipe metadata, compute program
 storage and communication resources. The joint plan publishes prepared command

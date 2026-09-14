@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "title": "Qwen3.8-27B-FP8: A800 / Gaudi2",
+  "recorded_at": "2026-09-15",
+  "measurement_date": null,
+  "source": {
+    "kind": "user_supplied_historical_comparison",
+    "screenshot": "../../assets/benchmarks/a800-gaudi2-source.png",
+    "user_confirmation": "Gaudi2: TP1, Qwen3.8-27B-FP8",
+    "remeasured": false,
+    "sha256": "65bc1155e3c25a47d959c500fbdd912094651cefaee85ac6268b175325093844",
+    "configuration_supplement_date": "2026-09-15"
+  },
+  "workload": {
+    "input_tokens_per_request": 2048,
+    "concurrency_values": [
+      1,
+      8,
+      16,
+      32
+    ],
+    "output_tokens_per_request": null
+  },
+  "platforms": {
+    "a800": {
+      "model": "Qwen3.8-27B-FP8",
+      "device_count": 1,
+      "tensor_parallel_size": null,
+      "ttft_statistic": "not provided"
+    },
+    "gaudi2": {
+      "model": "Qwen3.8-27B-FP8",
+      "tensor_parallel_size": 1,
+      "device_count": null,
+      "ttft_statistic": "source figure describes the prior reference table as median; raw records unavailable"
+    }
+  },
+  "limitations": [
+    "Complete software versions, output lengths, sampling settings and decode timing windows were not supplied.",
+    "The input-rate proxy is total input tokens divided by the reported TTFT; it is not separately measured prefill throughput.",
+    "The two TTFT statistic definitions are not fully aligned; relative values describe the supplied records.",
+    "The rows do not qualify the separate DeepSeek bounded-context or DSpark paths."
+  ],
+  "formulae": {
+    "input_rate_proxy_tps": "2048 * concurrency / ttft_s",
+    "ttft_reduction_pct": "100 * (1 - gaudi2_ttft_s / a800_ttft_s)",
+    "input_rate_proxy_gain_pct": "100 * (a800_ttft_s / gaudi2_ttft_s - 1)",
+    "decode_gain_pct": "100 * (gaudi2_decode_tps / a800_decode_tps - 1)"
+  },
+  "rounding": "Derive from the supplied TTFT/decode values, then round only for display; C32 input-rate proxy gain is 42.1%.",
+  "rows": [
+    {
+      "concurrency": 1,
+      "input_tokens_per_request": 2048,
+      "a800_ttft_s": 0.7739,
+      "gaudi2_ttft_s": 0.4036,
+      "a800_decode_tps": 48.64,
+      "gaudi2_decode_tps": 57.17,
+      "a800_input_rate_proxy_tps": 2646.336736012405,
+      "gaudi2_input_rate_proxy_tps": 5074.331020812686,
+      "ttft_reduction_pct": 47.84855924538054,
+      "input_rate_proxy_gain_pct": 91.74925668979188,
+      "decode_gain_pct": 17.53700657894737
+    },
+    {
+      "concurrency": 8,
+      "input_tokens_per_request": 2048,
+      "a800_ttft_s": 5.7206,
+      "gaudi2_ttft_s": 2.9354,
+      "a800_decode_tps": 342.11,
+      "gaudi2_decode_tps": 380.25,
+      "a800_input_rate_proxy_tps": 2864.03524105863,
+      "gaudi2_input_rate_proxy_tps": 5581.522109422906,
+      "ttft_reduction_pct": 48.68720064328917,
+      "input_rate_proxy_gain_pct": 94.88315050759692,
+      "decode_gain_pct": 11.148461021308936
+    },
+    {
+      "concurrency": 16,
+      "input_tokens_per_request": 2048,
+      "a800_ttft_s": 9.8716,
+      "gaudi2_ttft_s": 5.8028,
+      "a800_decode_tps": 614.62,
+      "gaudi2_decode_tps": 644.21,
+      "a800_input_rate_proxy_tps": 3319.421370395883,
+      "gaudi2_input_rate_proxy_tps": 5646.929068725442,
+      "ttft_reduction_pct": 41.21722922322623,
+      "input_rate_proxy_gain_pct": 70.11787412973048,
+      "decode_gain_pct": 4.814356838371677
+    },
+    {
+      "concurrency": 32,
+      "input_tokens_per_request": 2048,
+      "a800_ttft_s": 16.5182,
+      "gaudi2_ttft_s": 11.6282,
+      "a800_decode_tps": 991.44,
+      "gaudi2_decode_tps": 958.44,
+      "a800_input_rate_proxy_tps": 3967.5025123802834,
+      "gaudi2_input_rate_proxy_tps": 5635.953973959856,
+      "ttft_reduction_pct": 29.603709847319926,
+      "input_rate_proxy_gain_pct": 42.0529402659053,
+      "decode_gain_pct": -3.328491890583394
+    }
+  ]
+}
