@@ -46,18 +46,35 @@ def resolve_hpu_gdn_prefill_state_fp32() -> bool | None:
     chunk recurrence in BF16 and converts the final state once at cache write.
     An absent setting preserves the global ``VLLM_GDN_STATE_FP32`` behavior.
     """
-    value = os.getenv("VLLM_GDN_PREFILL_STATE_FP32")
-    if value is None:
-        return None
-    normalized = value.strip().lower()
-    if normalized in {"1", "true"}:
+    return gaudi_envs.VLLM_GDN_PREFILL_STATE_FP32
+
+
+def resolve_hpu_gdn_prefill_state_fp32_max_tokens() -> int:
+    """Return the largest short prefill that should accumulate in FP32."""
+    value = os.getenv("VLLM_GDN_PREFILL_STATE_FP32_MAX_TOKENS", "0")
+    try:
+        max_tokens = int(value)
+    except ValueError as exc:
+        raise ValueError("VLLM_GDN_PREFILL_STATE_FP32_MAX_TOKENS must be a non-negative "
+                         f"integer, got {value!r}.") from exc
+    if max_tokens < 0:
+        raise ValueError("VLLM_GDN_PREFILL_STATE_FP32_MAX_TOKENS must be a non-negative "
+                         f"integer, got {value!r}.")
+    return max_tokens
+
+
+def select_hpu_gdn_prefill_state_fp32(
+    configured: bool | None,
+    max_tokens: int,
+    num_tokens: int,
+) -> bool | None:
+    """Promote qualified short prefill buckets to FP32 recurrence."""
+    if configured is True:
         return True
-    if normalized in {"0", "false"}:
-        return False
-    raise ValueError(
-        "VLLM_GDN_PREFILL_STATE_FP32 must be one of 0, 1, false or true, "
-        f"got {value!r}."
-    )
+    if max_tokens > 0 and num_tokens <= max_tokens:
+        return True
+    return configured
+
 
 # Set VLLM_GDN_EXACT_SOLVE=1 to use exact row-by-row forward substitution
 # instead of the Neumann iterative solver.  Exact but ~2.6x slower (127

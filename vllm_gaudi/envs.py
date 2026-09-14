@@ -175,6 +175,8 @@ if TYPE_CHECKING:
 
     VLLM_GDN_CHUNK_SIZE: int = 0
     VLLM_GDN_NEUMANN_ITERS: int = 14
+    VLLM_GDN_PREFILL_STATE_FP32: Optional[bool] = None
+    VLLM_GDN_PREFILL_STATE_FP32_MAX_TOKENS: int = 0
     VLLM_GDN_FUSED_STATE_MATMUL: bool = False
     VLLM_GDN_DEFERRED_OUTPUT_ADD: bool = False
     VLLM_GDN_RECURSIVE_SOLVER_BASE: int = 0
@@ -234,6 +236,19 @@ if TYPE_CHECKING:
     VLLM_HPU_CGUID_DYNAMIC_QUANT: bool = False
     VLLM_HPU_CGUID_DYNAMIC_QUANT_MAX_ROWS: int = 32
     VLLM_HPU_FUSED_GREEDY_LOGITS: bool = False
+
+
+def _optional_bool_env(name: str) -> Optional[bool]:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in ("1", "true"):
+        return True
+    if normalized in ("0", "false"):
+        return False
+    raise ValueError(f"{name} must be one of 0, 1, false or true, got {value!r}.")
+
 
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
@@ -746,6 +761,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Iteration budget for the approximate GDN triangular solve.
     "VLLM_GDN_NEUMANN_ITERS":
     lambda: int(os.environ.get("VLLM_GDN_NEUMANN_ITERS", "14")),
+
+    # Register the optional prefill arithmetic override used by the GDN op.
+    "VLLM_GDN_PREFILL_STATE_FP32":
+    lambda: _optional_bool_env("VLLM_GDN_PREFILL_STATE_FP32"),
+
+    # Promote only short static prefill buckets to FP32 recurrence.
+    "VLLM_GDN_PREFILL_STATE_FP32_MAX_TOKENS":
+    lambda: int(os.environ.get("VLLM_GDN_PREFILL_STATE_FP32_MAX_TOKENS", "0")),
 
     # Fuse the output and recurrent-state projections in GDN phase B.
     "VLLM_GDN_FUSED_STATE_MATMUL":
