@@ -80,12 +80,12 @@ def test_prefill_transition_invalidates_decode_bindings():
 def test_state_allocation_is_held_without_copy_and_replacement_invalidates_replay():
     first = roots()
     state = torch.arange(32, dtype=torch.uint8)
-    first["state_tensors"] = (state,)
+    first["state_tensors"] = (state, )
     bindings = FixedDecodeInputs(torch.nn.Identity(), first, [[first["positions"], state]])
     assert bindings.state_tensors[0] is state
     state[4] = 19
     assert bindings.updates(first) == []
-    assert bindings.updates(dict(first, state_tensors=(state.clone(),))) is None
+    assert bindings.updates(dict(first, state_tensors=(state.clone(), ))) is None
     assert bindings.updates(dict(first, state_tensors=())) is None
     assert state[4].item() == 19
 
@@ -103,7 +103,9 @@ def test_pool_pointer_facade_cannot_skip_changed_offset(monkeypatch):
 
 def test_v4_pack_copies_once_and_updates_all_captured_metadata_views():
     first = roots()
-    first.update(metadata={}, input_ids=torch.tensor([1]), state_generation=3,
+    first.update(metadata={},
+                 input_ids=torch.tensor([1]),
+                 state_generation=3,
                  metadata_pack=torch.arange(12, dtype=torch.int32))
     first["attention_inputs"] = (first["metadata_pack"][:4], first["metadata_pack"][4:])
     captured = [[first["input_ids"], *first["attention_inputs"]]]
@@ -121,7 +123,9 @@ def test_fixed_metadata_destination_is_independent_of_h2d_ring_reuse():
     first = roots()
     ring = [torch.arange(12, dtype=torch.int32), torch.arange(12, dtype=torch.int32) + 20]
     destination = ring[0].clone()
-    first.update(metadata={}, metadata_pack=ring[0], metadata_destination=destination,
+    first.update(metadata={},
+                 metadata_pack=ring[0],
+                 metadata_destination=destination,
                  attention_inputs=(destination[:4], destination[4:]))
     captured = [[*first["attention_inputs"]]]
     bindings = FixedDecodeInputs(torch.nn.Identity(), first, captured)
@@ -133,7 +137,7 @@ def test_fixed_metadata_destination_is_independent_of_h2d_ring_reuse():
     ring[0].fill_(99)
     assert torch.equal(captured[0][1], torch.arange(4, 12, dtype=torch.int32) + 20)
     bindings.apply(bindings.updates(dict(first, metadata_pack=ring[0])))
-    assert torch.equal(destination, torch.full((12,), 99, dtype=torch.int32))
+    assert torch.equal(destination, torch.full((12, ), 99, dtype=torch.int32))
 
 
 def test_nested_v4_metadata_fields_are_dynamic():
@@ -156,6 +160,33 @@ def test_pointer_facade_copies_from_new_storage(monkeypatch):
     updated = dict(first, hidden_states=torch.full((1, 4), 8.0))
     bindings.apply(bindings.updates(updated))
     assert torch.equal(first["hidden_states"], updated["hidden_states"])
+
+
+def test_batched_engram_views_and_position_sources_keep_capture_destinations_fixed():
+    first = roots()
+    first["metadata"] = {}
+    first["input_ids"] = torch.zeros(6, dtype=torch.int64)
+    first["positions"] = torch.zeros(6, dtype=torch.int32)
+    first["attention_inputs"] = tuple(torch.zeros(6, 2, 33, dtype=torch.uint8) for _ in range(2))
+    captured = [[first["positions"], first["input_ids"], *first["attention_inputs"]]]
+    bindings = FixedDecodeInputs(torch.nn.Identity(), first, captured)
+    for generation in range(4):
+        pair = torch.full((2, 6, 2, 33), generation, dtype=torch.uint8)
+        pair[1].add_(10)
+        control = torch.arange(7, dtype=torch.int64) + generation
+        updated = dict(first,
+                       input_ids=control[:6],
+                       positions=torch.arange(6, dtype=torch.int32) + generation,
+                       attention_inputs=(pair[0], pair[1]))
+        changes = bindings.updates(updated)
+        assert len(changes) == 4
+        bindings.apply(changes)
+        assert torch.equal(first["positions"], updated["positions"])
+        assert torch.equal(first["input_ids"], control[:6])
+        for index in range(2):
+            assert torch.equal(first["attention_inputs"][index], pair[index])
+        pair.fill_(255)
+        assert not (first["attention_inputs"][0] == 255).any()
 
 
 def test_direct_entry_updates_inputs_and_returns_graph_outputs(monkeypatch):
@@ -193,7 +224,7 @@ def test_communicator_change_invalidates_before_copy_or_replay(monkeypatch):
     invalidated = []
     replay._native_entries[model] = None, bindings, (), object()
     monkeypatch.setattr(replay, "_runtime", lambda: (None, object()))
-    monkeypatch.setattr(replay, "invalidate_prepared_group_plans", lambda: invalidated.append(True))
+    monkeypatch.setattr(replay, "invalidate_prepared_group_plans", lambda **kwargs: invalidated.append(True))
     updated = dict(first, hidden_states=torch.full((1, 4), 9.0))
     assert replay.replay_native_decoder(model, **updated) is None
     assert invalidated == [True] and torch.equal(first["hidden_states"], torch.ones(1, 4))

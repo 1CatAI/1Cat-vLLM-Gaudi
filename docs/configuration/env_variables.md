@@ -539,3 +539,39 @@ startup, and use a separate recipe cache. Rebuild the native bridge from the
 matching source so its dependency validation accepts the complete PP0 topology.
 This is an unqualified experimental path; output/state equivalence and
 complete-chain latency must be validated for the selected runtime configuration.
+
+## DeepSeek V4.1 DSpark serving candidates
+
+These switches are experimental and default to `0`. Use a fingerprint-checked
+V4.1 runtime profile; tensor values change during replay while allocation,
+layout, communicator and state-generation contracts remain fixed. A failure
+after a state update terminates execution rather than retrying another path.
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `VLLM_HPU_DSV41_DEVICE_VERIFY` | `0` | Keep accepted-prefix control and PP commit on the device, with final asynchronous scheduler consumption. |
+| `VLLM_HPU_DSV41_FUSED_STAGE_IO` | `0` | Fuse text embedding and PP wire transforms into the stage graph. Use pinned packed Engram staging; requires the packed-output host extension. |
+| `VLLM_HPU_DSV41_BATCHED_INPUT_STAGING` | `0` | Batch the two Engram layers into one fixed C6 DMA allocation and consume token/position staging directly. Requires fused stage I/O; retains DMA and consumer generation checks. |
+| `VLLM_HPU_DSV41_MHC_SCHEDULE` | `0` | Materialize independent mHC controls in the compute recipe before its TP exchange. Communication payload and FP32/BF16 arithmetic are preserved. Requires native V4.1 graph replay. |
+| `VLLM_HPU_DSV41_DIRECT_PP_WIRE` | `0` | Send the compiled PP wire directly and bind the persistent receive allocation as the native stage input. Keeps strict layout checks and communication/consumer ownership. |
+| `VLLM_HPU_DSV41_ROUND_TIMING` | `0` | Record bounded host-clock round ledgers, including worker state commits and scheduler consumption. This adds no device synchronization. |
+| `VLLM_HPU_DSV41_SHARED_PREFIX_KV` | `0` | Reuse nested selected-KV prefixes in eligible context buckets and pass valid lengths to attention. Other buckets keep their existing layout. |
+| `VLLM_HPU_DSV41_TILED_EXPERT_DECODE` | `0` | Partition routed C2–C6 weight decoding across 128 K elements. The MME still consumes full-K matrices. |
+| `VLLM_HPU_DSV41_W13_N512` | `0` | Slice routed C2–C6 W13 output channels into 512-row windows inside the native compound operation. Preserve full K and the W2 layout. |
+| `VLLM_HPU_DSV41_PACKED_ATTN_EXP` | `0` | Pack the two broadcast exponent evaluations into one SIMD operation in the shared-prefix attention path. |
+| `VLLM_HPU_DSV41_VECTOR_KV_SCALES` | `0` | Load selected KV scale bytes once per row and reuse them in the shared-prefix attention path. |
+| `VLLM_HPU_DSV41_SRAM_KV` | `0` | Keep the private selected BF16 KV cache in a graph-owned SRAM section; uses vector scale loads. Candidate placement, lifecycle and complete-round validation required. |
+| `VLLM_HPU_DSV41_SHARED_C6_EXPERTS` | `0` | Development-only cross-token expert reuse candidate; it has not qualified for serving. |
+
+Performance qualification uses the complete C6 round from input preparation
+through the last required worker commit and scheduler consumption. The older
+verify-function timer is a submetric. Enabling a switch does not establish
+performance, SRAM placement, or production-quality qualification.
+
+`VLLM_HPU_DSV41_HEAD_VECTOR_ATTN` (default `0`) uses the experimental native head-vector attention compound for the V4.1 shared-prefix decode path. It preserves ordered QK/softmax/PV arithmetic, uses bounded FP32 activation intermediates, and keeps selected BF16 KV in SRAM. Other attention buckets keep their existing implementation.
+
+`VLLM_HPU_DSV41_NATIVE_KV_PACK` (default `0`) enables pure native checkpoint SWA/FP4 encoders for BF16 C1–C6 inputs. Cache writes, dependencies and existing BF16/MME attention remain unchanged. Larger prefill inputs use the original encoder.
+
+`VLLM_HPU_DSV41_NATIVE_ROPE` (default `0`) fuses the interleaved rotary-table lookup, adjacent-pair FP32 rotation and BF16 output for C1–C6 inputs. It copies the non-rotary prefix verbatim and supports the inverse output rotation. The ordinary path handles other shapes and prefill.
+
+`VLLM_HPU_DSV41_FUSED_PREFIX_LAYOUT` (default `0`) combines the SWA window, selected-page mapping, shared row list and valid lengths for C1–C6 non-ranking CSA2 calls. It consumes live selection and block-table tensors; owner-layer selection and candidate-pool writes remain in the graph. Requires selected-KV and shared-prefix paths, window 128 and compression ratio 1 or 2.

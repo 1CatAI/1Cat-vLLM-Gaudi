@@ -24,9 +24,12 @@ static inline void fp4_pack_group(tensor value, tensor output, int group, int in
     const float64 number = convert_bfloat128_to_float128(input, SW_LINEAR).v1;
     const float64 magnitude = v_f32_abs_b(number);
     const float64 nan_lanes = v_f32_sel_grt_u32_b(as_uint64(magnitude), 0x7f800000, 1.0f, 0.0f);
-    const float64 any_nan = v_f32_reduce_max(nan_lanes);
+    // Match the reference ordered amax: a NaN in the first group lane
+    // persists, while subsequent NaNs do not replace a finite accumulator.
+    const float64 first_nan = v_f32_sel_eq_u32_b(read_lane_id_4b_b(), 0, nan_lanes, 0.0f);
+    const float64 any_nan = v_f32_reduce_max(first_nan);
     const float minimum = group_size == 16 ? 0.01171875f : 0x1.8p-124f;
-    float64 maximum = v_f32_max_b(v_f32_reduce_max(magnitude), minimum);
+    float64 maximum = v_f32_max_b(v_f32_reduce_max(v_f32_sel_grt_u32_b(as_uint64(magnitude), 0x7f800000, 0.0f, magnitude)), minimum);
     maximum = v_f32_sel_grt_f32_b(any_nan, 0.0f, minimum, maximum);
     int64 scale_code;
     float64 scale;
@@ -56,18 +59,25 @@ static inline void fp4_pack_group(tensor value, tensor output, int group, int in
 #ifdef DSV41_DECODED_KV_WRITE
     if (write_decoded) {
         const uint64 magnitude_code = wide.v1 & 7;
-        const float64 numeric_code = convert_uint64_to_float64(magnitude_code, 0);
-        float64 decoded_value = v_f32_sel_less_u32_b(magnitude_code, 6, numeric_code - 2.0f,
-                                                    numeric_code * 2.0f - 8.0f);
-        decoded_value = v_f32_sel_less_u32_b(magnitude_code, 4, numeric_code * 0.5f, decoded_value);
-        decoded_value = as_float64(as_uint64(decoded_value) | ((wide.v1 & 8) << 28));
+        const float64 numeric_code = convert_uint64_to_float64(
+            magnitude_code, 0);
+        float64 decoded_value = v_f32_sel_less_u32_b(
+            magnitude_code, 6, numeric_code - 2.0f,
+            numeric_code * 2.0f - 8.0f);
+        decoded_value = v_f32_sel_less_u32_b(
+            magnitude_code, 4, numeric_code * 0.5f, decoded_value);
+        decoded_value = as_float64(as_uint64(decoded_value)
+                                   | ((wide.v1 & 8) << 28));
         decoded_value *= e4m3fn(as_uint64(scale_code));
-        decoded_value = v_f32_sel_eq_f32_b(decoded_value, 0.0f, 0.0f, decoded_value);
+        decoded_value = v_f32_sel_eq_f32_b(decoded_value, 0.0f,
+                                           0.0f, decoded_value);
         float128 converted = {0};
         converted.v1 = decoded_value;
-        const bfloat128 decoded_bf16 = convert_float128_to_bfloat128(converted, SW_RHNE | SW_LINEAR);
-        v_bf16_st_tnsr_partial((int5){group * group_size, output_row, 0, 0, 0}, decoded,
-                              decoded_bf16, group_size - 1, 0);
+        const bfloat128 decoded_bf16 = convert_float128_to_bfloat128(
+            converted, SW_RHNE | SW_LINEAR);
+        v_bf16_st_tnsr_partial(
+            (int5){group * group_size, output_row, 0, 0, 0}, decoded,
+            decoded_bf16, group_size - 1, 0);
     }
 #endif
     const uchar256 codes = convert_uint256_to_uchar256(wide, SW_LINEAR);

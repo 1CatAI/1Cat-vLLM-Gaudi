@@ -23,7 +23,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41DynamicQuantBf16Gaudi2::GetGcDefinitions(
         return GLUE_INCOMPATIBLE_DATA_TYPE;
     const auto width = output.maxSizes[0];
     const auto rows = input.maxSizes[1];
-    if (input.dims != 2 || output.dims != 2 || scale.dims != 2 || (rows != 1 && rows != 6) ||
+    if (input.dims != 2 || output.dims != 2 || scale.dims != 2 || rows < 1 || rows > 36 ||
         rows > std::numeric_limits<int32_t>::max() || width < 256 || width > 5120 || width % 128 ||
         input.maxSizes[0] != width || output.maxSizes[1] != rows ||
         scale.maxSizes[0] != 1 || scale.maxSizes[1] != rows)

@@ -4897,13 +4897,29 @@ index af75566..dd0fc9e 100644
  {
      VERIFY_NULL_GET_TENSOR_UNSAFE(tensor, permutation, synTensorPropPermutation);
 diff --git a/synapse/src/runtime/common/synapse_api_impl.cpp b/synapse/src/runtime/common/synapse_api_impl.cpp
-index bc1c1d0..4e41200 100644
+index bc1c1d0..6b4e6f0 100644
 --- a/synapse/src/runtime/common/synapse_api_impl.cpp
 +++ b/synapse/src/runtime/common/synapse_api_impl.cpp
-@@ -12,10 +12,26 @@
+@@ -1,6 +1,7 @@
+ #include <chrono>
+ #include <thread>
+ #include <sstream>
++#include <shared_mutex>
+ #include <version.h>
+ #include "defs.h"
+ #include "synapse_api.h"
+@@ -12,10 +13,34 @@
  #include "api.h"
  #include "runtime/common/recipe/recipe_handle_impl.hpp"
  
++namespace
++{
++// The legacy profiler erases recipe metadata after the wrapped destroy frees
++// its handle. Prevent a concurrent compile/deserialize from reusing that address
++// and having its new metadata erased by the older destruction.
++std::shared_mutex recipeRegistrationLifetime;
++}
++
 +const char* SYN_API_CALL synGetLastErrorMessage()
 +{
 +    return synapse::api_error::getLastErrorMessage();
@@ -4927,7 +4943,7 @@ index bc1c1d0..4e41200 100644
          return synInvalidArgument;                                                                                     \
      }
  
-@@ -70,6 +86,92 @@ synStatus SYN_API_CALL synStreamQuery(const synStreamHandle streamHandle)
+@@ -70,6 +95,92 @@ synStatus SYN_API_CALL synStreamQuery(const synStreamHandle streamHandle)
      API_EXIT_STATUS_TIMED(status, synStreamQueryP);
  }
  
@@ -5020,7 +5036,25 @@ index bc1c1d0..4e41200 100644
  synStatus SYN_API_CALL synEventCreate(synEventHandle* pEventHandle, const synDeviceId deviceId, const uint32_t flags)
  {
      API_ENTRY_STATUS_TIMED()
-@@ -756,6 +858,18 @@ synStatus SYN_API_CALL synNodeSetDeterministic(const synGraphHandle graphHandle,
+@@ -158,6 +269,8 @@ synStatus SYN_API_CALL synTensorExtExtractExecutionOrder(const synRecipeHandle r
+ synStatus SYN_API_CALL synRecipeDestroy(synRecipeHandle hRecipe)
+ {
+     API_ENTRY_STATUS_TIMED()
++    std::unique_lock<std::shared_mutex> recipeLifetimeGuard(recipeRegistrationLifetime, std::defer_lock);
++    if (_SYN_SINGLETON_ != _SYN_SINGLETON_INTERNAL) recipeLifetimeGuard.lock();
+     LOG_SYN_API("hRecipe 0x{:x}", TO64(hRecipe));
+     status = _SYN_SINGLETON_->recipeDestroy(hRecipe);
+     API_EXIT_STATUS_TIMED(status, synRecipeDestroyP);
+@@ -281,6 +394,8 @@ synStatus SYN_API_CALL synRecipeSerialize(const synRecipeHandle recipeHandle, co
+ synStatus SYN_API_CALL synRecipeDeSerialize(synRecipeHandle* pRecipeHandle, const char* recipeFileName)
+ {
+     API_ENTRY_STATUS_TIMED()
++    std::shared_lock<std::shared_mutex> recipeLifetimeGuard(recipeRegistrationLifetime, std::defer_lock);
++    if (_SYN_SINGLETON_ != _SYN_SINGLETON_INTERNAL) recipeLifetimeGuard.lock();
+     LOG_SYN_API("recipeHandle 0x{:x}", TO64(pRecipeHandle));
+     status = _SYN_SINGLETON_->recipeDeSerialize(pRecipeHandle, recipeFileName);
+     API_EXIT_STATUS_TIMED(status, synRecipeDeSerializeP);
+@@ -756,6 +871,18 @@ synStatus SYN_API_CALL synNodeSetDeterministic(const synGraphHandle graphHandle,
      API_EXIT_STATUS_TIMED(status, synNodeSetDeterministicP);
  }
  
@@ -5039,7 +5073,16 @@ index bc1c1d0..4e41200 100644
  synStatus SYN_API_CALL synNodeGetDeterministic(const synGraphHandle graphHandle,
                                                 const synNodeId      nodeId,
                                                 bool*                pUseDeterministic)
-@@ -1167,6 +1281,22 @@ synStatus SYN_API_CALL synTensorSetExternal(synTensor tensor, bool isExternal)
+@@ -792,6 +919,8 @@ synStatus SYN_API_CALL synGraphCompile(synRecipeHandle*     pRecipeHandle,
+                                        const char*          pBuildLog)
+ {
+     API_ENTRY_STATUS_TIMED()
++    std::shared_lock<std::shared_mutex> recipeLifetimeGuard(recipeRegistrationLifetime, std::defer_lock);
++    if (_SYN_SINGLETON_ != _SYN_SINGLETON_INTERNAL) recipeLifetimeGuard.lock();
+     LOG_SYN_API("graphHandle 0x{:x}", TO64(graphHandle));
+     status = _SYN_SINGLETON_->compileGraph(pRecipeHandle, graphHandle, pRecipeName, pBuildLog);
+     API_EXIT_STATUS_TIMED(status, synGraphCompileP);
+@@ -1167,6 +1296,22 @@ synStatus SYN_API_CALL synTensorSetExternal(synTensor tensor, bool isExternal)
      API_EXIT_STATUS_TIMED(status, synTensorSetExternalP);
  }
  
@@ -5062,7 +5105,7 @@ index bc1c1d0..4e41200 100644
  synStatus SYN_API_CALL synTensorSetGeometryExt(synTensor                   tensor,
                                                 const synTensorGeometryExt* geometry,
                                                 synGeometryType             geometryType)
-@@ -1183,7 +1313,11 @@ synStatus SYN_API_CALL synTensorSetGeometry(synTensor                tensor,
+@@ -1183,7 +1328,11 @@ synStatus SYN_API_CALL synTensorSetGeometry(synTensor                tensor,
  {
      API_ENTRY_STATUS_TIMED()
      LOG_SYN_API();
@@ -5075,7 +5118,7 @@ index bc1c1d0..4e41200 100644
      API_EXIT_STATUS_TIMED(status, synTensorSetGeometryP);
  }
  
-@@ -1276,7 +1410,7 @@ synStatus SYN_API_CALL synTensorGetGeometry(synTensor tensor, synTensorGeometry*
+@@ -1276,7 +1425,7 @@ synStatus SYN_API_CALL synTensorGetGeometry(synTensor tensor, synTensorGeometry*
  {
      API_ENTRY_STATUS_TIMED()
      LOG_SYN_API();
@@ -5084,7 +5127,7 @@ index bc1c1d0..4e41200 100644
      API_EXIT_STATUS_TIMED(status, synTensorGetGeometryP);
  }
  
-@@ -1304,6 +1438,14 @@ synStatus SYN_API_CALL synTensorGetExternal(const synTensor tensor, bool* isExte
+@@ -1304,6 +1453,14 @@ synStatus SYN_API_CALL synTensorGetExternal(const synTensor tensor, bool* isExte
      API_EXIT_STATUS_TIMED(status, synTensorGetExternalP);
  }
  
@@ -5099,7 +5142,7 @@ index bc1c1d0..4e41200 100644
  synStatus SYN_API_CALL synTensorGetDeviceDataType(synTensor tensor, synDataType* deviceDataType)
  {
      API_ENTRY_STATUS_TIMED()
-@@ -1451,4 +1593,26 @@ synStatus SYN_API_CALL synNodeGetUserParams(const synGraphHandle graphHandle,
+@@ -1451,4 +1608,26 @@ synStatus SYN_API_CALL synNodeGetUserParams(const synGraphHandle graphHandle,
  synStatus SYN_API_CALL synStatusGetBriefDescription(synStatus status, char* statusDescription, size_t len)
  {
      return synSingleton::convertStatusToString(status, statusDescription, len);
@@ -7782,3 +7825,115 @@ index c10255e..6567ca6 100644
  TEST_F_SYN(SynApiNoDeviceTest, section_group_semantic_checks)
  {
      synSectionHandle hSection {};
+diff --git a/synapse/src/graph_compiler/passes/tpc_fuser.cpp b/synapse/src/graph_compiler/passes/tpc_fuser.cpp
+index c2a3037..5f5721d 100644
+--- a/synapse/src/graph_compiler/passes/tpc_fuser.cpp
++++ b/synapse/src/graph_compiler/passes/tpc_fuser.cpp
+@@ -24,6 +24,7 @@
+ #include <lemon/list_graph.h>
+ #include <lemon/unionfind.h>
+ 
++#include <atomic>
+ #include <memory>
+ #include <mutex>
+ #include <string.h>
+@@ -2413,13 +2414,14 @@ optimizedGraphStatus tryNodesReplacementInGraph(HabanaGraph&
+                                                 const std::pair<NodePtr, NodeList>&       fusedNodeOrigNodePair,
+                                                 std::map<NodePtr, std::vector<unsigned>>& newNodesPerFusedNode,
+                                                 std::map<unsigned, NodePtr>&              newNodeIdMap,
++                                                NodeList&                                 nodesToAdd,
++                                                std::unordered_set<NodePtr>&              totalOriginalNodesSet,
+                                                 bool                                      isNeedToReplaceNodes = true,
+                                                 bool                                      isPartOfSubgraph     = false)
+ {
+     // Replace received nodes from fuser with their original nodes in the graph
+     // If the node belongs to subgraph send all subgraph nodes and then originals to the same call of replaceNodes
+ 
+-    static NodeList nodesToAdd;
+     const NodePtr&  fusedNode     = fusedNodeOrigNodePair.first;
+     NodeList        originalNodes = fusedNodeOrigNodePair.second;
+ 
+@@ -2461,7 +2463,6 @@ optimizedGraphStatus tryNodesReplacementInGraph(HabanaGraph&
+     if (isPartOfSubgraph)
+     {
+         // The node is part of subgraph, add it all original nodes to the total original nodes in this subgraph
+-        static std::unordered_set<NodePtr> totalOriginalNodesSet;
+         totalOriginalNodesSet.insert(originalNodes.begin(), originalNodes.end());
+ 
+         if (isNeedToReplaceNodes)
+@@ -2496,11 +2497,15 @@ optimizedGraphStatus tryNodesReplacementInGraph(HabanaGraph&
+ //     If false value returned to the caller - GC graph remains unmodified
+ optimizedGraphStatus replaceOptimizedCluster(HabanaGraph& graph, const std::shared_ptr<GCTPCFuserWrapper>& fuser)
+ {
+-    static int fusedClustersCounter = -1;
+-    int        fusedNodesCounter    = 0;
+-    int        newNodesCounter      = 0;
++    static std::atomic<int> nextClusterId {0};
++    const int fusedClustersCounter = nextClusterId.fetch_add(1, std::memory_order_relaxed);
++    int       fusedNodesCounter    = 0;
++    int       newNodesCounter      = 0;
+ 
+-    fusedClustersCounter++;
++    // Pending replacements belong to this cluster, including early failure paths.
++    // Concurrent graph compilations must never exchange node ownership.
++    NodeList                    nodesToAdd;
++    std::unordered_set<NodePtr> totalOriginalNodesSet;
+ 
+     LOG_DEBUG(GC_TPC_FUSER, "tpcFuser: fusing nodes of subgraph (cluster) {}.", fusedClustersCounter);
+ 
+@@ -2756,6 +2761,8 @@ optimizedGraphStatus replaceOptimizedCluster(HabanaGraph& graph, const std::shar
+                                                             fusedNodeOrigNodesPair,
+                                                             newNodesPerFusedNode,
+                                                             newNodeIdMap,
++                                                            nodesToAdd,
++                                                            totalOriginalNodesSet,
+                                                             isLastNodeInSubgraph,
+                                                             true);
+                         if (status != optimizedGraphSuccess) return status;
+@@ -2774,7 +2781,8 @@ optimizedGraphStatus replaceOptimizedCluster(HabanaGraph& graph, const std::shar
+                           fusedNode->getId());
+ 
+                 // this node is not part of subgraph
+-                status = tryNodesReplacementInGraph(graph, pair, newNodesPerFusedNode, newNodeIdMap, true);
++                status = tryNodesReplacementInGraph(
++                    graph, pair, newNodesPerFusedNode, newNodeIdMap, nodesToAdd, totalOriginalNodesSet, true);
+                 if (status != optimizedGraphSuccess) return status;
+             }
+         }
+@@ -2788,7 +2796,8 @@ optimizedGraphStatus replaceOptimizedCluster(HabanaGraph& graph, const std::shar
+                       fusedNode->getId());
+ 
+             // this node is not part of subgraph
+-            status = tryNodesReplacementInGraph(graph, pair, newNodesPerFusedNode, newNodeIdMap, true);
++            status = tryNodesReplacementInGraph(
++                    graph, pair, newNodesPerFusedNode, newNodeIdMap, nodesToAdd, totalOriginalNodesSet, true);
+             if (status != optimizedGraphSuccess) return status;
+         }
+     }
+
+diff --git a/synapse/src/graph_compiler/passes/sram_management/pipeline_management/pipeline_bundlizer.cpp b/synapse/src/graph_compiler/passes/sram_management/pipeline_management/pipeline_bundlizer.cpp
+index 90f1286..e613e9b 100644
+--- a/synapse/src/graph_compiler/passes/sram_management/pipeline_management/pipeline_bundlizer.cpp
++++ b/synapse/src/graph_compiler/passes/sram_management/pipeline_management/pipeline_bundlizer.cpp
+@@ -1386,6 +1386,21 @@ bool MantaRayBundlizer::canBundleSharedInputMmeNode(const MMENodePtr& candidate,
+                                                     const MMENodeSet& committedCandidates,
+                                                     const TensorPtr&  sharedInput)
+ {
++    // Each output window of this compound operator has a decoded full-K
++    // producer. Sharing its small activation across MMEs may leave one of
++    // those producers outside the SRAM bundle. Use the single-MME producer
++    // bundler for these windows; other operators keep normal shared-input
++    // bundling. No reduction dimension or arithmetic is changed.
++    if (candidate->getNumInputs() > 1)
++    {
++        const NodePtr producer = m_graph.getTensorProducer(candidate->getInput(1));
++        constexpr const char* prefix = "custom_deepseek_v41_mxfp4_n512_dequant";
++        if (producer && producer->getGUID().compare(0, std::char_traits<char>::length(prefix), prefix) == 0)
++        {
++            LOG_DEBUG(SRAM_SLICE, "Use independent SRAM producer bundle for {}", candidate->getNodeName());
++            return false;
++        }
++    }
+     // Check if the candidate node has ancestors in the candidates group
+     // Check against the full candidates group as this relation is asymmetric -
+     // no risk of loosing both nodes while we could keep one

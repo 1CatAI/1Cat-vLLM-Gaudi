@@ -132,6 +132,7 @@ class HPUWorker(WorkerBase):
         self.profiler_summary_only = getattr(profiler_config, "torch_profiler_summary_only", False)
         self.torch_profiler_dir = torch_profiler_dir
         self.profiler = None
+        self._profiler_running = False
         if torch_profiler_dir:
             if legacy_profiler_dir:
                 logger.warning("VLLM_TORCH_PROFILER_DIR is deprecated!")
@@ -168,8 +169,9 @@ class HPUWorker(WorkerBase):
         )
 
     def start_profile(self):
+        if self._profiler_running:
+            raise RuntimeError("Profiler is already running.")
         self._create_profiler()
-        self._write_native_decoder_stats("profile-start")
         high_level_profiler = self.model_runner.profiler  # type: ignore[union-attr]
         with high_level_profiler.record_event('internal', 'start_profiler'):
             # Clean up the queue
@@ -179,15 +181,38 @@ class HPUWorker(WorkerBase):
                 except queue.Empty:
                     break
             self.profiler.start()
+            # Keep ownership even if command recapture or audit fails below.
+            self._profiler_running = True
             self._refresh_native_profiler_commands()
+            from vllm_gaudi.ops.tp2_runtime_profile import verify_loaded_profile_libraries
+            logger.info("Profiler runtime libraries: %s", verify_loaded_profile_libraries())
+            if hasattr(self.model_runner, "trace_enabled"):
+                self.model_runner.trace_enabled = True
+                host = self.model_runner.model.engram_host
+                if host is not None:
+                    host.set_profiling(True)
+            # Graph-local counters belong to the newly created generation.
+            # Sampling before retirement made start/stop subtraction invalid.
+            self._write_native_decoder_stats("profile-start")
 
-    def stop_profile(self):
-        if self.profiler is None:
-            raise RuntimeError("Profiler is not enabled.")
+    def stop_profile(self, *, refresh_native=True):
+        if self.profiler is None or not self._profiler_running:
+            raise RuntimeError("Profiler is not running.")
         self.profiler.stop()
+        self._profiler_running = False
         self._write_profiler_summary()
         self._write_native_decoder_stats("profile-stop")
-        self._refresh_native_profiler_commands()
+        if hasattr(self.model_runner, "trace_enabled"):
+            self.model_runner.trace_enabled = False
+            host = self.model_runner.model.engram_host
+            if host is not None and host.profile_records is not None:
+                from pathlib import Path
+                host.export_profile(Path(self.torch_profiler_dir) / f"rank{self.rank}-engram-profile.json")
+                host.set_profiling(False)
+        if refresh_native:
+            self._refresh_native_profiler_commands()
+        # Every acquisition owns its profiler/trace sink until export ends.
+        self.profiler = None
 
     @staticmethod
     def _refresh_native_profiler_commands():
@@ -205,6 +230,8 @@ class HPUWorker(WorkerBase):
         from pathlib import Path
         torch.hpu.synchronize()
         stats = prepared_group_stats()
+        from vllm_gaudi.ops.tp2_runtime_profile import verify_loaded_profile_libraries
+        stats["profile_libraries"] = verify_loaded_profile_libraries()
         stats.update(rank=self.rank, phase=phase)
         if self.model_runner is not None:
             stats["capture_snapshot_bytes"] = sum(
@@ -220,12 +247,11 @@ class HPUWorker(WorkerBase):
                 stats["pp"] = {key: getattr(self.model_runner.pp, key) for key in ("sends", "receives", "commits")}
                 if gaudi_envs.VLLM_HPU_DSV41_NATIVE_PP_COPY:
                     from vllm_gaudi.distributed.tp2_fused_ar_norm import _resolve_runtime
-                    # This target has no GDN state copies; the reused DMA
-                    # backend counters therefore cover only its PP packets.
                     bridge, _, _ = _resolve_runtime()
-                    stats["pp"]["native_dma_batches_tensors_bytes"] = bridge.gdn_state_dma_counts()
+                    stats["pp"]["native_dma_batches_tensors_bytes"] = (bridge.gdn_state_dma_counts())
                 host = self.model_runner.model.engram_host
                 stats["engram"] = None if host is None else host.audit
+                stats["engram_residency"] = None if host is None else host.residency()
         logger.info("Native decoder statistics: %s", json.dumps(stats))
         if self.torch_profiler_dir:
             destination = Path(self.torch_profiler_dir)
@@ -263,6 +289,10 @@ class HPUWorker(WorkerBase):
         device_index = self.local_rank if self.local_rank >= 0 else 0
         from vllm_gaudi.ops.deepseek_v41_config import is_v41
         if is_v41(self.vllm_config):
+            # Spawn reimports Python modules; the parent's namespace-package
+            # search path is not inherited with the environment/config pickle.
+            from vllm_gaudi.entrypoints.deepseek_v41 import prepare_native_libraries
+            prepare_native_libraries()
             modules = os.environ["HABANA_VISIBLE_MODULES"].split(",")
             if len(modules) != 4 or device_index >= len(modules):
                 raise RuntimeError("V4.1 requires four explicitly assigned HPU modules")
@@ -280,6 +310,8 @@ class HPUWorker(WorkerBase):
         self.device = torch.device("hpu")
         # Initialize the distributed environment.
         init_worker_distributed_environment(self.vllm_config, self.rank, self.distributed_init_method, self.local_rank)
+        from vllm_gaudi.ops.tp2_runtime_profile import verify_loaded_profile_libraries
+        logger.info("Worker runtime companion libraries: %s", verify_loaded_profile_libraries())
         # Set random seed.
         set_random_seed(self.model_config.seed)
         num_ubatches = 2 if self.parallel_config.enable_dbo else 1
@@ -298,15 +330,31 @@ class HPUWorker(WorkerBase):
 
     def shutdown(self):
         from vllm_gaudi import envs as gaudi_envs
+
+        def phase(name):
+            if gaudi_envs.VLLM_HPU_DSV41_GRAPH_REPLAY:
+                logger.info("V4.1 worker shutdown: %s", name)
+
+        phase("begin")
+        if getattr(self, "_profiler_running", False):
+            phase("stop active profiler")
+            # Export the live sink before retiring recipes/communicators. A
+            # failed start_profile can leave this owner active as well.
+            self.stop_profile(refresh_native=False)
+            phase("profiler stopped")
         if gaudi_envs.VLLM_HPU_TP2_STATIC_GROUP_PLAN:
             self._write_native_decoder_stats("shutdown")
             from vllm_gaudi.ops.tp2_prepared_plan import shutdown_prepared_group_plans
 
+            phase("retire native programs")
             shutdown_prepared_group_plans()
+            phase("native programs retired")
         self._model_runner_stash.clear()
         self._model_runner_state_stash.clear()
         if self.model_runner is not None:
+            phase("close runner")
             getattr(self.model_runner, 'shutdown_inc', lambda: None)()
+        phase("complete")
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()  # type: ignore[union-attr]
@@ -607,6 +655,10 @@ class HPUWorker(WorkerBase):
         runner_kv_caches = []
         gc.collect()
         available = cache_size_bytes - dummy_block_headroom
+        if getattr(self.model_runner, "serving_workspace_reserve", 0):
+            available -= self.model_runner.serving_workspace_reserve
+            logger.info("Reserved %s for long-context CSA2 and concurrent request working state",
+                        format_bytes(self.model_runner.serving_workspace_reserve))
 
         # For hybrid models (attention + recurrent layers), the GPU
         # backend shares a single raw buffer across spec types via
@@ -731,6 +783,9 @@ class HPUWorker(WorkerBase):
         if self.model_config.hf_config.model_type in ("deepseek_v4", "deepseek_v41"):
             from vllm_gaudi.ops.deepseek_v4_config import bind_worker_helpers
             bind_worker_helpers(self.rank)
+
+        if self.model_config.hf_config.model_type == "deepseek_v41":
+            self._write_native_decoder_stats("ready")
 
         return CompilationTimes(
             language_model=self.vllm_config.compilation_config.compilation_time,

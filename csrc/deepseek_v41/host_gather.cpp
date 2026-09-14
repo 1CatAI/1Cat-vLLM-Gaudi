@@ -5,6 +5,7 @@
 #include <pybind11/stl.h>
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -16,6 +17,7 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -88,12 +90,15 @@ class HostRows {
         require(static_cast<uint64_t>(stop - start) <= SIZE_MAX / width, "Engram mmap byte count overflow");
         return static_cast<size_t>(stop - start) * width;
     }
-    void gather(const int32_t* ids, size_t rows, uint8_t* weights, uint8_t* scales) const {
+    void gather(const int32_t* ids, size_t rows, uint8_t* weights, uint8_t* scales,
+                size_t weightStride = 0, size_t scaleStride = 0) const {
+        if (!weightStride) weightStride = width;
+        if (!scaleStride) scaleStride = groups;
         for (size_t i = 0; i < rows; ++i) {
             int64_t row = ids[i];
             require(row >= start && row < stop, "Engram hash row does not belong to this TP head shard");
-            std::memcpy(weights + i * width, weights_.data() + (row - start) * width, width);
-            std::memcpy(scales + i * groups, scales_.data() + (row - start) * groups, groups);
+            std::memcpy(weights + i * weightStride, weights_.data() + (row - start) * width, width);
+            std::memcpy(scales + i * scaleStride, scales_.data() + (row - start) * groups, groups);
         }
     }
     void gather_packed(const int32_t* ids, size_t rows, uint8_t* output) const {
@@ -119,28 +124,51 @@ class GatherSlot : public std::enable_shared_from_this<GatherSlot> {
     const size_t capacity_, width_, groups_;
     std::vector<int32_t> ids_;
     std::vector<uint8_t> weights_, scales_;
+    // Hold the Python owner until the worker has stopped using the buffer.
+    py::array packed_owner_;
+    uint8_t* packed_ = nullptr;
     std::shared_ptr<HostRows> table_;
     std::string error_;
     std::thread worker_;
     long major_faults_ = 0;
+    bool profiling_ = false;
+    uint64_t started_ns_ = 0, finished_ns_ = 0;
+    long worker_tid_ = 0;
+
+    static uint64_t timestamp_ns() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
 
     void work() {
+        const auto worker_tid = syscall(SYS_gettid);
         for (;;) {
             std::unique_lock<std::mutex> lock(mutex_);
             condition_.wait(lock, [&] { return stop_ || state_ == State::Running; });
             if (stop_) return;
             auto table = table_;
             const auto count = count_;
+            const bool profiling = profiling_;
             lock.unlock();
             std::string error;
             struct rusage before{}, after{};
             getrusage(RUSAGE_THREAD, &before);
+            const auto started = profiling ? timestamp_ns() : 0;
             try {
-                table->gather(ids_.data(), count, weights_.data(), scales_.data());
+                if (packed_) {
+                    table->gather(ids_.data(), count, packed_, packed_ + width_,
+                                  width_ + groups_, width_ + groups_);
+                } else {
+                    table->gather(ids_.data(), count, weights_.data(), scales_.data());
+                }
             } catch (const std::exception& exc) { error = exc.what(); }
+            const auto finished = profiling ? timestamp_ns() : 0;
             getrusage(RUSAGE_THREAD, &after);
             lock.lock();
             major_faults_ = after.ru_majflt - before.ru_majflt;
+            started_ns_ = started;
+            finished_ns_ = finished;
+            worker_tid_ = worker_tid;
             error_ = std::move(error);
             state_ = error_.empty() ? State::Ready : State::Failed;
             condition_.notify_all();
@@ -159,6 +187,17 @@ class GatherSlot : public std::enable_shared_from_this<GatherSlot> {
     ~GatherSlot() {
         { std::lock_guard<std::mutex> lock(mutex_); stop_ = true; condition_.notify_all(); }
         if (worker_.joinable()) worker_.join();
+    }
+    void bind_packed_output(py::array_t<uint8_t, py::array::c_style> output) {
+        const auto info = output.request();
+        std::lock_guard<std::mutex> lock(mutex_);
+        require(state_ == State::Idle, "Cannot rebind an owned Engram staging buffer");
+        require(output.writeable() && info.ndim == 2
+                && info.shape[0] == static_cast<ssize_t>(capacity_)
+                && info.shape[1] == static_cast<ssize_t>(width_ + groups_),
+                "Engram packed output must match its fixed row capacity and weight/scale layout");
+        packed_owner_ = std::move(output);
+        packed_ = static_cast<uint8_t*>(info.ptr);
     }
     uint64_t submit(std::shared_ptr<HostRows> table, py::array_t<int32_t, py::array::c_style> ids) {
         auto input = ids.request();
@@ -200,6 +239,18 @@ class GatherSlot : public std::enable_shared_from_this<GatherSlot> {
         std::lock_guard<std::mutex> lock(mutex_);
         require(state_ == State::Leased, "Wait for Engram gather before reading its fault count");
         return major_faults_;
+    }
+    void set_profiling(bool enabled) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        require(state_ == State::Idle, "Cannot change profiling during a pending Engram gather");
+        profiling_ = enabled;
+    }
+    std::vector<uint64_t> timing() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        require(state_ == State::Leased && profiling_,
+                "Engram timing requires a completed profiled gather");
+        return {generation_, started_ns_, finished_ns_, count_,
+                static_cast<uint64_t>(worker_tid_)};
     }
 };
 
@@ -344,6 +395,7 @@ class NativeC1Prepare {
 PYBIND11_MODULE(dsv41_host_gather, m) {
     m.attr("abi_version") = 1;
     m.attr("c1_abi_version") = 1;
+    m.attr("packed_output_version") = 1;
     py::class_<HostRows, std::shared_ptr<HostRows>>(m, "HostRows")
         .def(py::init<const std::string&, uint64_t, const std::string&, uint64_t, int64_t, int64_t, size_t, bool, bool>(),
              py::arg("weight_file"), py::arg("weight_offset"), py::arg("scale_file"), py::arg("scale_offset"),
@@ -353,8 +405,11 @@ PYBIND11_MODULE(dsv41_host_gather, m) {
     py::class_<GatherSlot, std::shared_ptr<GatherSlot>>(m, "GatherSlot")
         .def(py::init<size_t, size_t>(), py::arg("row_capacity"), py::arg("width"))
         .def("submit", &GatherSlot::submit)
+        .def("bind_packed_output", &GatherSlot::bind_packed_output, py::arg("output").noconvert())
         .def("wait", &GatherSlot::wait, py::call_guard<py::gil_scoped_release>())
         .def("release", &GatherSlot::release)
+        .def("set_profiling", &GatherSlot::set_profiling)
+        .def_property_readonly("timing", &GatherSlot::timing)
         .def_property_readonly("weights", &GatherSlot::weights)
         .def_property_readonly("scales", &GatherSlot::scales)
         .def_property_readonly("major_faults", &GatherSlot::major_faults);

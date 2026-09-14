@@ -24,7 +24,9 @@ def main() -> None:
     parser.add_argument("--native-hccl-library", type=Path)
     parser.add_argument("--synapse-library", type=Path)
     parser.add_argument("--hcl-library", type=Path)
+    parser.add_argument("--address-sanitizer", action="store_true", help="Build a diagnostic ASan extension")
     args = parser.parse_args()
+    sanitizer_flags = ["-fsanitize=address", "-fno-omit-frame-pointer"] if args.address_sanitizer else []
 
     source = Path(__file__).with_name("tp2_fused_ar_norm_bridge.cpp")
     torch_package = Path(htorch.__file__).resolve().parent
@@ -81,6 +83,7 @@ def main() -> None:
             "/usr/include/habanalabs/hl_logger",
         ],
         extra_cflags=[
+            *sanitizer_flags,
             "-O3",
             "-std=c++17",
             "-DFMT_HEADER_ONLY=1",
@@ -89,6 +92,7 @@ def main() -> None:
             "-fpermissive",
         ],
         extra_ldflags=[
+            *sanitizer_flags,
             str(native_hccl),
             str(backend),
             *native_dependency_link,
@@ -138,6 +142,7 @@ def main() -> None:
         bridge_dependencies[name] = {"path": str(actual), "sha256": digest(actual)}
     metadata = {
         "schema": 1,
+        "address_sanitizer": args.address_sanitizer,
         "torch_version": torch.__version__,
         "binary_sha256": digest(binary),
         "adapter_sources": {

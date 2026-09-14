@@ -93,6 +93,10 @@ class CSA2Attention(nn.Module):
         self.head_pair = gaudi_envs.VLLM_HPU_DSV41_ATTENTION_HEAD_PAIR
         self.mla_mme = gaudi_envs.VLLM_HPU_DSV41_MLA_MME
         self.block_exp = gaudi_envs.VLLM_HPU_DSV41_ATTENTION_BLOCK_EXP
+        self.prepared_output = (gaudi_envs.VLLM_HPU_DSV41_PREPARED_OUTPUT and layer < config["num_hidden_layers"])
+        self.output_gemm_layout = (gaudi_envs.VLLM_HPU_DSV41_OUTPUT_GEMM_LAYOUT and layer < config["num_hidden_layers"])
+        if self.output_gemm_layout and not self.prepared_output:
+            raise ValueError("V4.1 output GEMM layout requires prepared output weights")
         self.decoded_kv_state = shared.decoded_kv_state
         if self.mla_mme and (not self.decoded_kv_state or self.block_exp):
             raise ValueError("MME MLA requires decoded KV and excludes the blocked-exponential candidate")
@@ -121,10 +125,6 @@ class CSA2Attention(nn.Module):
             raise ValueError("Fused V4.1 FP4 cache writes require ordered SWA and bounded attention")
         if self.c1_indices and not self.bounded_decode:
             raise ValueError("Native C1 index preparation requires bounded packed attention")
-        self.prepared_output = gaudi_envs.VLLM_HPU_DSV41_PREPARED_OUTPUT and layer < config["num_hidden_layers"]
-        self.output_gemm_layout = (gaudi_envs.VLLM_HPU_DSV41_OUTPUT_GEMM_LAYOUT and layer < config["num_hidden_layers"])
-        if self.output_gemm_layout and not self.prepared_output:
-            raise ValueError("V4.1 output GEMM layout requires prepared output weights")
         self.linear, self.reduce = linear, reduce
         self.layer, self.ratio, self.length = layer, config["compress_ratios"][layer], shared.length
         self.heads, self.groups = config["num_attention_heads"] // 2, config["o_groups"] // 2
@@ -308,7 +308,7 @@ class CSA2Attention(nn.Module):
             self.selection.indices.index_copy_(0, positions.long(), indices)
         return self.selection.indices.index_select(0, positions.long())
 
-    def forward(self, value, positions):
+    def forward(self, value, positions, ready_outputs=()):
         query_input, kv_input = self._project_qkv_input(value)
         query = rms_norm(query_input, self.weights.q_norm.weight, self.eps)
         query = self.linear(query, self.weights.wq_b).reshape(-1, self.heads, 512)
@@ -403,15 +403,24 @@ class CSA2Attention(nn.Module):
         output = self._rope(output, positions, inverse=True)
         output = output.reshape(-1, self.groups, self.heads // self.groups * 512)
         output = self.project_output(output)
-        return self.reduce(self.linear(output, self.weights.wo_b))
+        partial = self.linear(output, self.weights.wo_b)
+        return self.reduce(partial, ready_outputs=ready_outputs) if ready_outputs else self.reduce(partial)
 
-    def insert_context(self, main_value, positions):
+    def insert_context(self, main_value, positions, valid_count=None):
         """DSpark context-only insert, reusing vLLM #55654's projection boundary."""
         if self.ratio:
             raise RuntimeError("DSpark context insert requires an uncompressed draft SWA cache")
         kv = rms_norm(self.linear(main_value, self.weights.wkv), self.weights.kv_norm.weight, self.eps)
         kv = apply_rope(kv, positions, self.rotary)
-        self.swa.index_copy_(0, positions.long(), pack_swa(kv))
+        packed = pack_swa(kv)
+        if valid_count is not None:
+            # A C6 verification graph always materializes six rows. Preserve
+            # committed cache contents for padded lanes in C1-C5 buckets.
+            indices = positions.long()
+            old = self.swa.index_select(0, indices)
+            mask = torch.arange(indices.numel(), device=indices.device) < valid_count.reshape(1)
+            packed = torch.where(mask.reshape(-1, 1), packed, old)
+        self.swa.index_copy_(0, positions.long(), packed)
         return self.swa
 
     def draft(self, value, positions):

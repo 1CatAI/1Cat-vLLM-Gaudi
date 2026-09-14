@@ -36,8 +36,8 @@ tpc_lib_api::GlueCodeReturn silu_quant(tpc_lib_api::HabanaKernelParams* in,
     const auto& router = in->inputTensors[4].geometry;
     const uint64_t width = p.maxSizes[0] / 2, rows = p.maxSizes[2];
     if (p.dims != 3 || p.maxSizes[1] != 1 || !width || width % 128 || width > 2560 ||
-        !rows || rows > 6 || ids.dims != 2 || ids.maxSizes[0] != rows || ids.maxSizes[1] != 1 ||
-        sx.dims != 2 || sx.maxSizes[0] != 1 || sx.maxSizes[1] != 1 ||
+        !rows || rows > 36 || ids.dims != 2 || ids.maxSizes[0] != rows || ids.maxSizes[1] != 1 ||
+        sx.dims != 2 || sx.maxSizes[0] != 1 || (sx.maxSizes[1] != 1 && sx.maxSizes[1] != rows) ||
         sw.dims != 3 || sw.maxSizes[0] != 256 || sw.maxSizes[1] * 256 != width * 2 ||
         !sw.maxSizes[2] || sw.maxSizes[2] > 384 || router.dims != 2 ||
         router.maxSizes[0] != rows || router.maxSizes[1] != 1)

@@ -15,7 +15,12 @@ def graph_nodes(path):
         op = re.search(r'^  op: "([^"]+)"', block, re.M)
         if name and op:
             attrs = dict(re.findall(r'key: "([^"]+)"\s+value \{\s+s: "([^"\n]+)"', block))
-            result.append({"name": name[1], "op": op[1], "attrs": attrs})
+            result.append({
+                "name": name[1],
+                "op": op[1],
+                "attrs": attrs,
+                "predecessors": re.findall(r'^  input: "([^"]+)"', block, re.M)
+            })
     return result
 
 
@@ -41,11 +46,6 @@ def tensor(text):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("analysis", type=Path)
-    parser.add_argument("--rank",
-                        type=int,
-                        choices=range(4),
-                        action="append",
-                        help="Map only available ranks after an incomplete profiler export")
     args = parser.parse_args()
     manifest = json.loads((args.analysis / "graph-manifest.json").read_text())
     graphs, index = {}, collections.defaultdict(set)
@@ -58,7 +58,7 @@ def main():
         graphs[key] = {"record": record, "nodes": {(node["name"], node["op"]): node for node in nodes}}
         for pair in graphs[key]["nodes"]:
             index[pair].add(key)
-    for rank in (args.rank if args.rank is not None else range(4)):
+    for rank in range(4):
         root = args.analysis / f"rank{rank}"
         recipes = json.loads((root / "recipe-symbols.json").read_text())["recipes"]
         contracts, unresolved = [], []
@@ -88,13 +88,12 @@ def main():
                 }
                 if node:
                     attrs = node["attrs"]
-                    entry.update(inputs=[
-                        tensor(value) for key, value in sorted(attrs.items()) if key.startswith("inputTensor:")
-                    ],
-                                 outputs=[
-                                     tensor(value) for key, value in sorted(attrs.items())
-                                     if key.startswith("outputTensor:")
-                                 ],
+                    ordered = sorted(attrs.items(),
+                                     key=lambda item: (item[0].split(":")[0], int(item[0].rsplit(":", 1)[1])
+                                                       if item[0].startswith(
+                                                           ("inputTensor:", "outputTensor:")) else -1))
+                    entry.update(inputs=[tensor(value) for key, value in ordered if key.startswith("inputTensor:")],
+                                 outputs=[tensor(value) for key, value in ordered if key.startswith("outputTensor:")],
                                  attributes=attrs)
                 else:
                     unresolved.append([recipe["recipe_id"], symbol["full_context_id"], symbol["node"]])

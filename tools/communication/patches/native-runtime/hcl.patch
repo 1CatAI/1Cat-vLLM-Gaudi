@@ -2166,10 +2166,10 @@ index f9b76e8..2d65adf 100644
 \ No newline at end of file
 +}
 diff --git a/hcl/src/platform/gaudi2/context_manager.cpp b/hcl/src/platform/gaudi2/context_manager.cpp
-index 78c136a..0ca78a4 100644
+index 78c136a..6ab4d7b 100644
 --- a/hcl/src/platform/gaudi2/context_manager.cpp
 +++ b/hcl/src/platform/gaudi2/context_manager.cpp
-@@ -244,9 +244,11 @@ void ContextManager::updateCommonDword(unsigned                         collecti
+@@ -244,9 +244,12 @@ void ContextManager::updateCommonDword(unsigned                         collecti
          cachedCollectiveContext = &m_cachedCollectiveContextsScaleOut[collectiveContextIndex];
      }
  
@@ -2178,20 +2178,22 @@ index 78c136a..0ca78a4 100644
      if (dwordsForUpdate.DW0)
      {
 -        VERIFY(requiredContext.m_reductionOpcode.raw != cachedCollectiveContext->m_data.reduction_opcode);
-+        VERIFY(forceAll || requiredContext.m_reductionOpcode.raw != cachedCollectiveContext->m_data.reduction_opcode);
++        VERIFY(forceAll || (isScaleup && m_forceScaleupBufferAddressUpdate) ||
++               requiredContext.m_reductionOpcode.raw != cachedCollectiveContext->m_data.reduction_opcode);
  
          updateDWord(contextValues, DW0, requiredContext.m_reductionOpcode.raw);
          cachedCollectiveContext->m_data.reduction_opcode = requiredContext.m_reductionOpcode.raw;
-@@ -254,7 +256,7 @@ void ContextManager::updateCommonDword(unsigned                         collecti
+@@ -254,7 +257,8 @@ void ContextManager::updateCommonDword(unsigned                         collecti
  
      if (dwordsForUpdate.DW1)
      {
 -        VERIFY(requiredContext.m_syncObjectAddress != cachedCollectiveContext->m_data.sync_object_address_0);
-+        VERIFY(forceAll || requiredContext.m_syncObjectAddress != cachedCollectiveContext->m_data.sync_object_address_0);
++        VERIFY(forceAll || (isScaleup && m_forceScaleupBufferAddressUpdate) ||
++               requiredContext.m_syncObjectAddress != cachedCollectiveContext->m_data.sync_object_address_0);
  
          updateDWord(contextValues, DW1, requiredContext.m_syncObjectAddress);
          cachedCollectiveContext->m_data.sync_object_address_0 = requiredContext.m_syncObjectAddress;
-@@ -262,7 +264,7 @@ void ContextManager::updateCommonDword(unsigned                         collecti
+@@ -262,7 +266,7 @@ void ContextManager::updateCommonDword(unsigned                         collecti
  
      if (dwordsForUpdate.DW2)
      {
@@ -2200,7 +2202,7 @@ index 78c136a..0ca78a4 100644
  
          updateDWord(contextValues, DW2, requiredContext.m_syncObjectAddress);
          cachedCollectiveContext->m_data.sync_object_address_1 = requiredContext.m_syncObjectAddress;
-@@ -270,7 +272,8 @@ void ContextManager::updateCommonDword(unsigned                         collecti
+@@ -270,7 +274,8 @@ void ContextManager::updateCommonDword(unsigned                         collecti
  
      if (dwordsForUpdate.DW3)
      {
@@ -2210,16 +2212,17 @@ index 78c136a..0ca78a4 100644
  
          updateDWord(contextValues, DW3, requiredContext.m_addressMSB);
          cachedCollectiveContext->m_data.buffer_addr_msb = requiredContext.m_addressMSB;
-@@ -278,7 +281,7 @@ void ContextManager::updateCommonDword(unsigned                         collecti
+@@ -278,7 +283,8 @@ void ContextManager::updateCommonDword(unsigned                         collecti
  
      if (dwordsForUpdate.DW4)
      {
 -        VERIFY(requiredContext.m_stride != cachedCollectiveContext->m_data.stride);
-+        VERIFY(forceAll || requiredContext.m_stride != cachedCollectiveContext->m_data.stride);
++        VERIFY(forceAll || (isScaleup && m_forceScaleupBufferAddressUpdate) ||
++               requiredContext.m_stride != cachedCollectiveContext->m_data.stride);
  
          updateDWord(contextValues, DW4, requiredContext.m_stride);
          cachedCollectiveContext->m_data.stride = requiredContext.m_stride;
-@@ -477,6 +480,7 @@ void ContextManager::createCollectiveContexts(HclCommandsGen2Arch& commands, con
+@@ -477,6 +483,7 @@ void ContextManager::createCollectiveContexts(HclCommandsGen2Arch& commands, con
      {
          m_cachedCollectiveContextsScaleUp.push_back(
              CachedCollectiveContextScaleUp(i, m_nicEngines, m_serverConnectivity, commands));
@@ -2227,7 +2230,7 @@ index 78c136a..0ca78a4 100644
          m_cachedCollectiveContextsScaleOut.push_back(
              CachedCollectiveContextScaleOut(i, m_nicEngines, m_serverConnectivity, commands));
      }
-@@ -602,6 +606,22 @@ edwords_t ContextManager::getDwordsForUpdate(bool                             is
+@@ -602,6 +609,27 @@ edwords_t ContextManager::getDwordsForUpdate(bool                             is
  
      cachedCollectiveContext->dwordDiff(requiredContext, dwordsForUpdate);
  
@@ -2240,17 +2243,22 @@ index 78c136a..0ca78a4 100644
 +        dwordsForUpdate.DW4 = true;
 +    }
 +
-+    // Fixed-buffer decoder graphs may be entered after an ordinary collective
-+    // that left the same NIC context pointing at another HBM allocation.  A
-+    // replayable template must therefore install its own buffer MSB.  Do not
-+    // force the synchronization-address dwords: those advance with the SOB
-+    // pools and require their normal phase-specific update contract.
-+    if (isScaleup && m_forceScaleupBufferAddressUpdate) dwordsForUpdate.DW3 = true;
++    // PP send/receive uses the same physical NIC context on another HCL stream.
++    // A native template must restore its datatype, completion SOB, address and
++    // stride. The packet writer registers the encoded SOB's address bits for
++    // relocation; retaining the captured SOB would wait on another epoch.
++    if (isScaleup && m_forceScaleupBufferAddressUpdate)
++    {
++        dwordsForUpdate.DW0 = true;
++        dwordsForUpdate.DW1 = true;
++        dwordsForUpdate.DW3 = true;
++        dwordsForUpdate.DW4 = true;
++    }
 +
      if (isScaleup)
      {
          CachedCollectiveContextScaleUp* cachedCollectiveContextScaleUp =
-@@ -647,6 +667,14 @@ void ContextManager::updateCollectiveContextScaleUp(hcl::ScalStreamBase&
+@@ -647,6 +675,14 @@ void ContextManager::updateCollectiveContextScaleUp(hcl::ScalStreamBase&
  {
      edwords_t dwordsForUpdate =
          pDwordsForUpdate ? *pDwordsForUpdate : getDwordsForUpdate(true, collectiveContextIndex, comm, requiredContext);
@@ -2265,7 +2273,7 @@ index 78c136a..0ca78a4 100644
  
      if (dwordsForUpdate > 0)
      {
-@@ -691,6 +719,14 @@ void ContextManager::updateCollectiveContextScaleUp(hcl::ScalStreamBase&
+@@ -691,6 +727,14 @@ void ContextManager::updateCollectiveContextScaleUp(hcl::ScalStreamBase&
      m_cachedCollectiveContextsScaleUp[collectiveContextIndex].advanceSOB(dwordsForUpdate,
                                                                           syncObjectAddressIndex,
                                                                           requiredContext.m_syncObjectAddress);
@@ -2323,7 +2331,7 @@ index 5d0cf07..c3c52fa 100644
          baseAddress =
              m_addressGenerator.generateScaleUpRecvAddress(sliceState, sliceIter, boxNumInfo, currentOp, offset);
 diff --git a/hcl/src/platform/gaudi2/hcl_packets.cpp b/hcl/src/platform/gaudi2/hcl_packets.cpp
-index 3bf4d2d..c7581d5 100644
+index 3bf4d2d..df86739 100644
 --- a/hcl/src/platform/gaudi2/hcl_packets.cpp
 +++ b/hcl/src/platform/gaudi2/hcl_packets.cpp
 @@ -7,6 +7,7 @@
@@ -2394,7 +2402,23 @@ index 3bf4d2d..c7581d5 100644
  void SchedArcCommandsGaudi2::serializeNopCommand(hcl::ScalStreamBase& scalStream, unsigned schedIdx, uint32_t padding)
  {
      g2fw::sched_arc_cmd_nop_t* command =
-@@ -1008,6 +1062,22 @@ void SchedArcCommandsGaudi2::serializeCollectiveSendShortCommand(hcl::ScalStream
+@@ -958,6 +1012,15 @@ void SchedArcCommandsGaudi2::serializeUpdateCollectiveContextCommand(hcl::ScalSt
+                 break;
+         }
+         SET_FIELD(command->dwords[i].dword_value, contextValueUpdater.value);
++        if (scalStream.isNativeCaptureActive() && (dword == DW1 || dword == DW2))
++        {
++            // Native direct TP2 signals the external completion group. NIC
++            // context words encode the SOB in bits 0..26, with control bits
++            // above it. Capture finalization validates this semantic binding.
++            scalStream.addNativeRelocation(&command->dwords[i].dword_value,
++                                           sizeof(uint32_t), 0x07ffffffu, 0, 0,
++                                           hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS);
++        }
+         i++;
+     }
+ }
+@@ -1008,6 +1071,22 @@ void SchedArcCommandsGaudi2::serializeCollectiveSendShortCommand(hcl::ScalStream
      SET_FIELD(cmd_coll_ops_short->comm_desc_index, commDescIndex);
      SET_FIELD(cmd_coll_ops_short->buffer_addr_lsb, (address >> 4));
  
@@ -2417,7 +2441,7 @@ index 3bf4d2d..c7581d5 100644
      if (hasBufferSize)
      {
          std::memcpy(&cmd_coll_ops_short->buffer_size, &bufferSize, sizeof(uint32_t));
-@@ -1070,6 +1140,19 @@ void SchedArcCommandsGaudi2::serializeCollectiveRecvShortInOrderCommand(hcl::Sca
+@@ -1070,6 +1149,19 @@ void SchedArcCommandsGaudi2::serializeCollectiveRecvShortInOrderCommand(hcl::Sca
      SET_FIELD(cmd_coll_ops_short->notify_rndv_ack, notifyRndvAck);
      SET_FIELD(cmd_coll_ops_short->wait_for_rndv_acks, waitForRndvAcks);
  
@@ -2437,7 +2461,7 @@ index 3bf4d2d..c7581d5 100644
      /**<
       * Reduction parameters to be used when accumulating data into
       * SIB Order buffer. For the rest of the NICs it uses Reduction
-@@ -1149,6 +1232,22 @@ void SchedArcCommandsGaudi2::serializeCollectiveSendLongCommand(hcl::ScalStreamB
+@@ -1149,6 +1241,22 @@ void SchedArcCommandsGaudi2::serializeCollectiveSendLongCommand(hcl::ScalStreamB
      SET_FIELD(cmd_coll_ops_long->buffer_addr_lsb, (address & 0xffffffff));  // 32 bits
      SET_FIELD(cmd_coll_ops_long->addr_msb, ((address >> 32) & 0x1fff));     // 13 bits
  
@@ -3034,7 +3058,7 @@ index 4591b46..d9fb207 100644
      }
  }
 diff --git a/hcl/src/platform/gen2_arch_common/hcl_device_controller.cpp b/hcl/src/platform/gen2_arch_common/hcl_device_controller.cpp
-index be7ab37..18f627c 100644
+index be7ab37..2b4bd6a 100644
 --- a/hcl/src/platform/gen2_arch_common/hcl_device_controller.cpp
 +++ b/hcl/src/platform/gen2_arch_common/hcl_device_controller.cpp
 @@ -1,3 +1,4 @@
@@ -3080,7 +3104,7 @@ index be7ab37..18f627c 100644
  HclDeviceControllerGen2Arch::HclDeviceControllerGen2Arch(const unsigned numOfStreams) : m_numOfStreams(numOfStreams)
  {
      m_graphSync        = std::make_unique<std::unique_ptr<HclGraphSyncGen2Arch>[]>(m_numOfStreams);
-@@ -367,6 +399,276 @@ void HclDeviceControllerGen2Arch::submitWork(int archStreamId, bool submitToHw)
+@@ -367,6 +399,290 @@ void HclDeviceControllerGen2Arch::submitWork(int archStreamId, bool submitToHw)
      syncParams.m_signalFinalize();
  }
  
@@ -3130,6 +3154,20 @@ index be7ab37..18f627c 100644
 +    size_t internalAddressRelocations = 0;
 +    for (NativeStreamCapture& streamCapture : capture.streams)
 +    {
++        for (const auto& relocation : streamCapture.commandTemplate.relocations)
++        {
++            if (relocation.kind != hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS ||
++                relocation.mask != 0x07ffffffu)
++                continue;
++            const auto& command = streamCapture.commandTemplate.commands.at(relocation.commandIndex);
++            uint32_t encoded = 0;
++            VERIFY(relocation.byteOffset + sizeof(encoded) <= command.bytes.size(),
++                   "Native NIC SOB relocation lies outside its command");
++            std::memcpy(&encoded, command.bytes.data() + relocation.byteOffset, sizeof(encoded));
++            VERIFY((encoded & relocation.mask) == (capture.capturedExternalCompletionAddress & relocation.mask),
++                   "Native NIC SOB 0x{:x} is not external completion 0x{:x}",
++                   encoded, capture.capturedExternalCompletionAddress);
++        }
 +        externalAddressRelocations += hcl::addNativeHclCapturedWordRelocations(
 +            streamCapture.commandTemplate,
 +            capture.capturedExternalCompletionAddress,
@@ -3357,7 +3395,7 @@ index be7ab37..18f627c 100644
  void HclDeviceControllerGen2Arch::streamAddWait(hcl::ScalStream&            scalStream,
                                                  const SyncObjectDescriptor& descriptor,
                                                  bool                        useEqual)
-@@ -563,4 +865,4 @@ void HclDeviceControllerGen2Arch::setTraceMarker(int archStreamId, HclStreamInde
+@@ -563,4 +879,4 @@ void HclDeviceControllerGen2Arch::setTraceMarker(int archStreamId, HclStreamInde
      hcl::ScalStream& currentStream = getScalStream(archStreamId, streamIdx);
  
      m_commands->serializeSetTraceMarker(currentStream, currentStream.getSchedIdx(), val);
@@ -3544,10 +3582,10 @@ index 9c0bb1e..3cdac6c 100644
                        numberOfSubBuffers,
 diff --git a/hcl/tests/native_hcl_relocation_test.cpp b/hcl/tests/native_hcl_relocation_test.cpp
 new file mode 100644
-index 0000000..8664440
+index 0000000..9c69fd6
 --- /dev/null
 +++ b/hcl/tests/native_hcl_relocation_test.cpp
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,187 @@
 +#include "infra/scal/gen2_arch_common/native_hcl_relocation.h"
 +
 +#include <array>
@@ -3690,10 +3728,37 @@ index 0000000..8664440
 +    std::memcpy(&actual, commandTemplate.commands[0].bytes.data() + 4, sizeof(actual));
 +    require(actual == replayAddress, "completion-address relocation patched the wrong value");
 +}
++void testEncodedNicSobAddress()
++{
++    constexpr uint32_t addressMask = 0x07ffffffu;
++    hcl::NativeHclRelocation relocation;
++    relocation.width = sizeof(uint32_t);
++    relocation.mask = addressMask;
++    relocation.kind = hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS;
++    for (const uint32_t control : {0x48000000u, 0x68000000u})
++    {
++        std::array<uint8_t, 16> bytes {};
++        uint32_t encoded = control | 0x00123400u;
++        std::memcpy(bytes.data(), &encoded, sizeof(encoded));
++        // Cross an address carry and revisit the first slot after a full ring.
++        for (uint32_t slot = 0; slot != 2049; ++slot)
++        {
++            const uint32_t address = 0xf8000000u | (0x000ff800u + (slot % 1024) * 4);
++            hcl::NativeHclReplayState state;
++            state.values[static_cast<size_t>(relocation.kind)] = address;
++            require(hcl::patchNativeHclRelocation(bytes.data(), bytes.size(), relocation, state),
++                    "encoded NIC SOB relocation rejected");
++            const uint32_t actual = readWord(bytes, 0);
++            require((actual & addressMask) == (address & addressMask), "NIC SOB address did not follow replay epoch");
++            require((actual & ~addressMask) == control, "NIC SOB relocation changed completion control bits");
++        }
++    }
++}
 +}  // namespace
 +
 +int main()
 +{
++    testEncodedNicSobAddress();
 +    testLongSoChunks(0);
 +    testLongSoChunks((uint64_t {1} << 15) - 1);
 +    testLongSoChunks(uint64_t {1} << 15);

@@ -59,9 +59,10 @@ void main(tensor product, tensor ids, tensor activation_scale, tensor channel, t
     const int5 end = start + get_index_space_size();
     const int width = get_dim_size(output, 0);
     const int experts = get_dim_size(channel, 2);
-    const float sx = s_f32_ld_g(gen_addr((int5){0}, activation_scale));
+    const int scale_rows = get_dim_size(activation_scale, 1);
     bfloat128 activated[20];
     for (int row = start[0]; row < end[0]; ++row) {
+        const float sx = s_f32_ld_g(gen_addr((int5){0, scale_rows == 1 ? 0 : row}, activation_scale));
         const int expert = s_i32_ld_g(gen_addr((int5){row}, ids));
         const bool valid = expert >= 0 && expert < experts;
         const float route = s_f32_ld_g(gen_addr((int5){row}, router));

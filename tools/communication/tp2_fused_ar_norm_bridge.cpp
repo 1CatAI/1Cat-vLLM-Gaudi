@@ -31,7 +31,6 @@
 #include "backend/habana_device/HPUStream.h"
 #include "backend/helpers/generic_resource_holder.h"
 #include "backend/helpers/get_n_bytes.h"
-#include "backend/helpers/create_tensor.h"
 #include "backend/helpers/tensor_info.h"
 #include "backend/helpers/tensor_utils.h"
 #include "habana_eager/eager_pipeline_utils.h"
@@ -42,7 +41,7 @@
 #include "habana_serialization/deserializers.h"
 #include "habana_serialization/serializers.h"
 #include "python_packages/habana_frameworks/torch/distributed/hccl/process_group_eager_hccl.hpp"
-#include "tp2_input_preflight.h"
+#include "dsv41_verify_timing.h"
 
 namespace {
 
@@ -602,42 +601,6 @@ void copyGdnStates(c10d::ProcessGroupEagerHCCL *backend,
   }
 }
 
-void copyC1PipelineTensors(c10d::ProcessGroupEagerHCCL* backend,
-                           std::vector<at::Tensor> sources,
-                           std::vector<at::Tensor> destinations) {
-  TORCH_CHECK(GET_ENV_FLAG_NEW(PT_HPU_LAZY_MODE) == 0 &&
-                  GET_ENV_FLAG_NEW(PT_HPU_EAGER_PIPELINE_ENABLE) &&
-                  c10::hpu::getCurrentHPUStream().stream() == 0,
-              "C1 PP DMA requires the eager default producer stream");
-  TORCH_CHECK(sources.size() == 2 && destinations.size() == 2,
-              "C1 PP DMA requires hidden and pre-mix");
-  for (size_t i = 0; i < 2; ++i) {
-    const auto dtype = i == 0 ? at::kBFloat16 : at::kFloat;
-    const int64_t elements = i == 0 ? 20480 : 4;
-    TORCH_CHECK(sources[i].device().type() == at::kHPU &&
-                    sources[i].device() == destinations[i].device() &&
-                    sources[i].device() == sources[0].device() &&
-                    sources[i].scalar_type() == dtype && destinations[i].scalar_type() == dtype &&
-                    sources[i].numel() == elements && destinations[i].numel() == elements &&
-                    sources[i].is_contiguous() && destinations[i].is_contiguous(),
-                "C1 PP DMA changed the contiguous hidden/pre-mix contract");
-  }
-  auto communicator = backend->lowLatencyCommunicator();
-  TORCH_CHECK(communicator != nullptr, "C1 PP DMA requires an initialized communicator");
-  prepareGdnBackendTensors(sources, destinations);
-  habana::eager::PipelineTask<habana::eager::ThreadType::EXECUTE>(
-      [communicator, sources = std::move(sources), destinations = std::move(destinations)]() {
-        for (const auto* values : {&sources, &destinations}) {
-          for (const auto& tensor : *values) {
-            const auto permutation = std::get<0>(habana_helpers::get_tensor_memory_permutation(tensor));
-            TORCH_CHECK(std::is_sorted(permutation.begin(), permutation.end()),
-                        "C1 PP DMA cannot consume a permuted physical tensor");
-          }
-        }
-        runGdnStateCopies(communicator, sources, destinations, 0);
-      });
-}
-
 std::shared_ptr<GdnStateDMATicket> queueGdnStateCopies(
     c10d::ProcessGroupEagerHCCL *backend, std::vector<at::Tensor> sources,
     std::vector<at::Tensor> destinations, synapse_helpers::hpuStream_t copy_stream,
@@ -733,10 +696,15 @@ void queueGdnStateWaits(std::vector<std::shared_ptr<GdnStateDMATicket>> tickets,
 
 at::Tensor tp2ExchangePeer(c10d::ProcessGroupEagerHCCL *backend,
                            const at::Tensor &partial,
-                           const at::Tensor &peer, bool reduction_only = false) {
+                           const at::Tensor &peer, bool reduction_only = false,
+                           bool immediate = false) {
   TORCH_CHECK(tp2ExchangeEnabled(),
               "TP2 peer exchange requires the tp2-exchange algorithm");
-  TORCH_CHECK(partial.dim() >= 2, "partial must have at least two dimensions");
+  // The normal TP2 path uses a row-shaped activation, while the PP commit
+  // path transports a fixed 128-byte record as a one-dimensional BF16 view.
+  // Both are valid contiguous HCCL buffers; dimensionality is not part of
+  // the wire contract.
+  TORCH_CHECK(partial.dim() >= 1, "partial must have at least one dimension");
   TORCH_CHECK(partial.scalar_type() == at::kBFloat16,
               "TP2 peer exchange supports BF16 activations only");
   TORCH_CHECK(partial.is_contiguous(), "partial must be contiguous");
@@ -751,7 +719,7 @@ at::Tensor tp2ExchangePeer(c10d::ProcessGroupEagerHCCL *backend,
   const bool pipeline_enabled =
       GET_ENV_FLAG_NEW(PT_HPU_EAGER_PIPELINE_ENABLE) &&
       GET_ENV_FLAG_NEW(PT_HPU_EAGER_COLLECTIVE_PIPELINE_ENABLE);
-  if (pipeline_enabled) {
+  if (pipeline_enabled && !immediate) {
     std::array<at::Tensor, 2> backend_tensors = {
         habana::eager::HbEagerTensorPool::get_backend_tensor(partial),
         habana::eager::HbEagerTensorPool::get_backend_tensor(peer),
@@ -1203,10 +1171,7 @@ TORCH_LIBRARY_IMPL(hccl, Meta, library) {
 namespace py = pybind11;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
-  module.attr("fixed_input_preflight_api_version") = 1;
-  py::class_<tp2_input::FixedInputPreflight>(module, "FixedInputPreflight")
-      .def(py::init<const std::vector<at::Tensor>&, std::vector<at::Tensor>>())
-      .def("updates", &tp2_input::FixedInputPreflight::updates);
+  dsv41_timing::bind(module);
   module.def("set_prepared_communication", [](bool enabled) { g_prepared_comm_enabled.store(enabled); });
   py::class_<PreparedGroupPlan, std::shared_ptr<PreparedGroupPlan>>(module, "PreparedGroupPlan")
       .def(py::init<>())
@@ -1234,14 +1199,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       .def("invalidate", [](PreparedGroupPlan& self) { self.valid.store(false); });
   module.def("record_native_completion", &tp2_native::recordNativeCompletion);
   module.def("copy_sampled_tokens_to_host", &tp2_native::copySampledTokensToHost);
-  module.def("copy_integer_record_to_host", &tp2_native::copyIntegerRecordToHost);
-  module.def("copy_c1_pipeline_tensors",
-      [](const c10::intrusive_ptr<c10d::Backend>& backend, std::vector<at::Tensor> sources,
-         std::vector<at::Tensor> destinations) {
-        auto* hccl_backend = dynamic_cast<c10d::ProcessGroupEagerHCCL*>(backend.get());
-        TORCH_CHECK(hccl_backend != nullptr, "C1 PP DMA requires ProcessGroupEagerHCCL");
-        copyC1PipelineTensors(hccl_backend, std::move(sources), std::move(destinations));
-      });
   py::class_<tp2_native::NativeCompletion, std::shared_ptr<tp2_native::NativeCompletion>>(
       module, "NativeCompletion")
       .def("query", &tp2_native::NativeCompletion::query, py::call_guard<py::gil_scoped_release>())
@@ -1428,6 +1385,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         TORCH_CHECK(hccl_backend != nullptr,
                     "TP2 peer exchange requires ProcessGroupEagerHCCL");
         return tp2ExchangePeer(hccl_backend, partial, peer);
+      },
+      py::arg("backend"), py::arg("partial"), py::arg("peer"));
+  // The PP2 stage boundary has the same two-rank, BF16 peer-exchange
+  // contract as the TP2 path.  Keep a separate entry point so the Python
+  // side can bind the PP process-group communicator instead of accidentally
+  // using the TP communicator.  The implementation deliberately reuses the
+  // direct current-stream exchange and therefore retains its HCL/ABI checks.
+  module.def(
+      "pp_exchange_peer_current_stream",
+      [](const c10::intrusive_ptr<c10d::Backend> &backend,
+         const at::Tensor &partial, const at::Tensor &peer) {
+        auto *hccl_backend =
+            dynamic_cast<c10d::ProcessGroupEagerHCCL *>(backend.get());
+        TORCH_CHECK(hccl_backend != nullptr,
+                    "PP peer exchange requires ProcessGroupEagerHCCL");
+        return tp2ExchangePeer(hccl_backend, partial, peer, false, true);
       },
       py::arg("backend"), py::arg("partial"), py::arg("peer"));
   module.def(

@@ -19,6 +19,7 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 class V41StateSpec(KVCacheSpec):
     state_shape: tuple[int, ...]
     state_dtype: torch.dtype
+    paged: bool = False
 
     @property
     def prefix_cacheable(self):
@@ -41,6 +42,8 @@ class V41StateSpec(KVCacheSpec):
         return self.state_content_size_bytes
 
     def max_memory_usage_bytes(self, vllm_config):
+        if self.paged:
+            return math.ceil(vllm_config.model_config.max_model_len / self.block_size) * self.page_size_bytes
         if self.block_size != 512 or vllm_config.model_config.max_model_len > self.block_size:
             raise ValueError("V4.1 bounded state requires a complete 512-token request block")
         return self.page_size_bytes
@@ -109,3 +112,91 @@ class StageStateBlocks:
     @property
     def allocated_bytes(self):
         return sum(value.numel() * value.element_size() for value in self.allocations.values())
+
+
+class PagedStageState:
+    """Shared compressed KV pool; fixed-address working state survives replay.
+
+Only the small SWA/compressor working set is saved when scheduling another
+request. Compressed history stays in its scheduler-owned HPU pages.
+"""
+
+    def __init__(self, program):
+        from vllm_gaudi.ops.deepseek_v41_paged_attention import PAGE_TOKENS
+        self.program = program
+        self.bindings, self.specs, self.allocations = {}, {}, {}
+        for source, cache in program.shared.sources.items():
+            for name, width in (("main", 288), ("index", 68)):
+                key = f"dsv41.pp{program.pp_rank}.source{source}.{name}"
+                self.bindings[key] = cache, name
+                self.specs[key] = V41StateSpec(block_size=PAGE_TOKENS,
+                                               state_shape=(PAGE_TOKENS // cache.ratio, width),
+                                               state_dtype=torch.uint8,
+                                               paged=True)
+        self.working = {
+            name: value
+            for name, value in program.named_buffers()
+            if name.rsplit(".", 1)[-1] in ("swa", "kv_history", "score_history")
+        }
+        self.saved, self.active, self.blocks = {}, None, 2
+
+    def allocate(self, blocks, device):
+        if blocks < 2:
+            raise ValueError("Paged V4.1 state requires a null page and at least one live page")
+        if self.program.replay_owner is not None:
+            self.program.replay_owner.close()
+        self.allocations = {
+            key: torch.zeros((blocks, *spec.state_shape), dtype=spec.state_dtype, device=device)
+            for key, spec in self.specs.items()
+        }
+        self.blocks = blocks
+        self.bind(0)
+
+    def bind(self, block):
+        # Pool replacement is confined to initialization, before recipe capture.
+        del block
+        for key, (module, name) in self.bindings.items():
+            setattr(module, name, self.allocations[key].flatten(0, 1))
+        self.program.shared.block_table.zero_()
+        self.program.shared.block_table[0] = min(1, self.blocks - 1)
+        self.program.generation += 1
+
+    def activate(self, request_id, block_ids, *, reset=False):
+        if not block_ids or any(not 0 < block < self.blocks for block in block_ids):
+            raise RuntimeError("V4.1 request has invalid scheduler-owned compressed KV pages")
+        if len(block_ids) > self.program.shared.block_table.numel():
+            raise RuntimeError("V4.1 request exceeds the configured context page table")
+        if self.active != request_id:
+            if self.active is not None:
+                if self.active not in self.saved:
+                    self.saved[self.active] = {key: value.clone() for key, value in self.working.items()}
+                else:
+                    for key, value in self.working.items():
+                        self.saved[self.active][key].copy_(value)
+            if request_id in self.saved and not reset:
+                for key, value in self.working.items():
+                    value.copy_(self.saved[request_id][key])
+            else:
+                self.clear()
+            self.active = request_id
+        elif reset:
+            self.clear()
+        table = torch.zeros(self.program.shared.block_table.shape, dtype=torch.int32, device="cpu")
+        table[:len(block_ids)] = torch.tensor(block_ids, dtype=torch.int32, device="cpu")
+        self.program.shared.block_table.copy_(table)
+
+    def release(self, request_id):
+        self.saved.pop(request_id, None)
+        if self.active == request_id:
+            self.active = None
+
+    def clear(self):
+        for value in self.working.values():
+            value.zero_()
+
+    @property
+    def allocated_bytes(self):
+        return (sum(value.numel() * value.element_size()
+                    for value in self.allocations.values()) + sum(value.numel() * value.element_size()
+                                                                  for state in self.saved.values()
+                                                                  for value in state.values()))

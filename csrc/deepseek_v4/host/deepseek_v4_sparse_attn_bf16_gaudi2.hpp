@@ -18,6 +18,7 @@ public:
         EXPLICIT_LENGTHS,
         PAIRED_EXP_LENGTHS,
         HEAD_PAIR_LENGTHS,
+        PACKED_EXP_LENGTHS,
     };
 
     explicit DeepseekV4SparseAttnBF16Gaudi2(

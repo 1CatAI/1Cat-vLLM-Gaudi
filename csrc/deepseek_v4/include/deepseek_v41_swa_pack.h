@@ -4,19 +4,23 @@
 #ifdef DSV41_DECODED_KV_WRITE
 #include "deepseek_v41_kv_decode.h"
 #endif
-static inline void swa_pack_group(tensor value, tensor output, int group, int input_row, int output_row
+static inline void swa_pack_group(tensor value, tensor output, int group,
+                                  int input_row, int output_row
 #ifdef DSV41_DECODED_KV_WRITE
-                                 , tensor decoded, int decoded_row
+                                  , tensor decoded, int decoded_row
 #endif
-                                 ) {
+                                  ) {
     const int width = get_dim_size(value, 0);
     const bfloat128 input = v_bf16_ld_tnsr_partial_b((int5){32 * group, input_row, 0, 0, 0}, value, 31, 0);
     const float64 number = convert_bfloat128_to_float128(input, SW_LINEAR).v1;
     const float64 absolute = v_f32_abs_b(number);
     const uint64 bits = as_uint64(absolute);
     const float64 nan_lanes = v_f32_sel_grt_u32_b(bits, 0x7f800000, 1.0f, 0.0f);
-    const float64 any_nan = v_f32_reduce_max(nan_lanes);
-    float64 maximum = v_f32_max_b(v_f32_reduce_max(absolute), 1.0e-4f);
+    // Match the reference ordered amax: a NaN in the first group lane
+    // persists, while subsequent NaNs do not replace a finite accumulator.
+    const float64 first_nan = v_f32_sel_eq_u32_b(read_lane_id_4b_b(), 0, nan_lanes, 0.0f);
+    const float64 any_nan = v_f32_reduce_max(first_nan);
+    float64 maximum = v_f32_max_b(v_f32_reduce_max(v_f32_sel_grt_u32_b(as_uint64(absolute), 0x7f800000, 0.0f, absolute)), 1.0e-4f);
     maximum = v_f32_sel_grt_f32_b(any_nan, 0.0f, 1.0e-4f, maximum);
     const uint64 maximum_bits = as_uint64(maximum);
     const int64 exponent = convert_uint64_to_int64(maximum_bits >> 23, 0) - 135;
@@ -39,8 +43,11 @@ static inline void swa_pack_group(tensor value, tensor output, int group, int in
 #ifdef DSV41_DECODED_KV_WRITE
     float128 decoded_value = {0};
     decoded_value.v1 = e4m3fn(wide.v1) * ue8m0(as_uint64(scale_code));
-    const bfloat128 decoded_bf16 = convert_float128_to_bfloat128(decoded_value, SW_RHNE | SW_LINEAR);
-    v_bf16_st_tnsr_partial((int5){32 * group, decoded_row, 0, 0, 0}, decoded, decoded_bf16, 31, 0);
+    const bfloat128 decoded_bf16 = convert_float128_to_bfloat128(
+        decoded_value, SW_RHNE | SW_LINEAR);
+    v_bf16_st_tnsr_partial(
+        (int5){32 * group, decoded_row, 0, 0, 0}, decoded,
+        decoded_bf16, 31, 0);
 #endif
     const uchar256 encoded = convert_uint256_to_uchar256(wide, SW_LINEAR);
     v_u8_st_tnsr_partial((int5){32 * group, output_row, 0, 0, 0}, output, encoded, 31, 0);

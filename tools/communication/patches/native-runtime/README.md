@@ -115,6 +115,24 @@ logger before the profiler SDK directory in the library search path. Record
 all profiler and runtime fingerprints with the trace; a CPU-only trace does
 not validate device acquisition.
 
+The pinned legacy profiler removes its recipe registration after the wrapped
+destroy call has released the handle. A concurrent compile or deserialization
+can reuse that address and lose its new registration when the older destroy
+finishes. The Synapse API patch holds an exclusive lifetime guard for destruction
+and shared guards for compilation/deserialization when a wrapper is installed.
+The guard extends through profiler return, permits concurrent creation, and does
+not change steady native replay or skip any profiling records. CPU forced
+retirement/reuse checks and a fresh full-model acquisition are required when
+changing this contract.
+
+`tools/communication/check_profiler_recipe_lifetime.py` exercises this boundary
+without acquiring a device, using one archived serialized recipe and explicitly
+provided Synapse/profiler hashes. In `--mode reproduce` it forces address reuse
+inside the old wrapper's retirement window. In `--mode guard` it verifies that a
+concurrent registration waits and remains present afterward. This tool changes
+one virtual call only inside its diagnostic process; it is never loaded by the
+model, benchmark or serving entrypoint.
+
 ## Validation
 
 Run the plugin's TP2/GDN unit tests and the C++ tests in
@@ -130,16 +148,22 @@ same-runtime model comparison does not qualify equivalence to the frozen
 production model. Full-model quality and end-to-end qualification are separate
 gates, and remain required before enabling defaults.
 
-## Optional TPC fusion ownership repair
+## Concurrent graph fusion
 
-`synapse-tpc-fuser-state.patch` isolates replacement-node accumulation to one
-optimized cluster. The original process-static containers could retain nodes
-across early returns or concurrent graph compilations. Subgraph accumulation
-and replacement order are preserved. The triggering relationship to an observed
-compiler assertion remains under investigation; this is not a performance claim.
+TPC fusion owns pending replacement nodes per cluster invocation. Compilations
+may run concurrently, so pending node lists and original-node sets must not be
+process-static or survive failed cluster replacement. Diagnostic cluster IDs
+use an atomic counter; strict graph-trait ownership checks remain enabled.
+The CPU-only `tests/tpc_fuser_compile_concurrency.cpp` diagnostic compiles and
+destroys independent BF16 Gaudi2 graphs from four threads through public Synapse
+APIs. Link it against the isolated patched Synapse runtime and retain the loaded
+library fingerprints with its result. No device acquisition is required.
 
-Use only in an independent candidate checkout after `synapse.patch`. Verify the
-file and patch hashes in `synapse-tpc-fuser-state.json`, apply with `git apply`,
-and rebuild Synapse through the normal source build above. Rebuild the adapter
-against the new private library so its ABI sidecar verifies the loaded binary.
-Do not edit an existing sidecar or replace a shared runtime library.
+## V4.1 output-window producer bundles
+
+The experimental N512 MXFP4 decoder keeps each output window in an independent
+TPC-to-MME SRAM bundle. Its small shared activation must not cause the MantaRay
+multi-MME bundler to leave a decoded weight producer in DRAM. The exception
+matches the new decoder GUID only; all other operators retain normal bundling.
+K is not split, and the external BF16 boundary remains unchanged. Inspect the
+actual compiled graph and test complete MoE output before measuring the model.

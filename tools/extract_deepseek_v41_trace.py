@@ -6,43 +6,36 @@ import gzip
 import hashlib
 import json
 from pathlib import Path
+import re
 
 import ijson
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("trace", type=Path)
 parser.add_argument("--output", type=Path, required=True)
-parser.add_argument("--allow-incomplete",
-                    action="store_true",
-                    help="Retain a truncated JSON prefix for diagnosis; never qualifies a complete trace")
 args = parser.parse_args()
 args.output.mkdir(exist_ok=False)
 open_trace = gzip.open if args.trace.suffix == ".gz" else open
 node_ids, nodes = {}, []
+hw_ids, hw_names = {}, []
 kernel_counts = collections.Counter()
 recipe_names = collections.defaultdict(set)
 host_enqueues, markers, modules = [], [], set()
 metadata, examples = [], []
 total = hardware = 0
 first, last = float("inf"), float("-inf")
-parse_errors = []
-
-
-def events(source):
-    try:
-        yield from ijson.items(source, "traceEvents.item", use_float=True)
-    except ijson.common.IncompleteJSONError as error:
-        if not args.allow_incomplete:
-            raise
-        parse_errors.append(str(error))
-
-
+with open_trace(args.trace, "rt") as stream:
+    header = stream.read(1024)
+base = re.search(r'"baseTimeNanoseconds"\s*:\s*(\d+)', header)
 with (open_trace(args.trace, "rb") as src, gzip.open(args.output / "hardware.jsonl.gz", "wt", compresslevel=1) as
       dst, gzip.open(args.output / "host.jsonl.gz", "wt", compresslevel=1) as host):
-    for event in events(src):
+    for event in ijson.items(src, "traceEvents.item", use_float=True):
         total += 1
         name = event.get("name", "")
-        a = event.get("args", {})
+        # Hardware exports contain metadata/flow events with a null args
+        # field.  Treat those as an empty argument map; they still count in
+        # the total event inventory but cannot carry recipe or engine data.
+        a = event.get("args") or {}
         rid, handle = str(a.get("recipeId", "")), str(a.get("recipeHandle", ""))
         rkey = rid + ":" + handle
         if a.get("Module id"):
@@ -58,7 +51,8 @@ with (open_trace(args.trace, "rb") as src, gzip.open(args.output / "hardware.jso
             markers.append([event["ts"], event.get("dur", 0), name])
         if event.get("ph") != "X" or event.get("dur", 0) <= 0:
             continue
-        if event.get("cat") in ("cpu_op", "hpu_op", "user_annotation", "privateuse1_runtime"):
+        hw = a.get("HW event name", "").upper()
+        if not hw and event.get("cat") in ("cpu_op", "hpu_op", "user_annotation", "privateuse1_runtime"):
             host.write(
                 json.dumps(
                     [event['ts'], event['dur'],
@@ -66,15 +60,26 @@ with (open_trace(args.trace, "rb") as src, gzip.open(args.output / "hardware.jso
                      str(event.get('tid')),
                      event.get('cat'), name],
                     separators=(',', ':')) + '\n')
-        hw = a.get("HW event name", "").upper()
         engine = next((x for x in ("TPC", "MME", "DMA", "NIC") if x in hw), None)
+        if engine is None and re.match(r"STM_[01]_(RX|TX|QPC|QMAN)", hw):
+            engine = "NIC"
         if engine is None:
             continue
         key = (engine, name, a.get("EventName", ""), rkey, str(a.get("Original Nodes", "")))
         if key not in node_ids:
             node_ids[key] = len(nodes)
-            nodes.append({"engine": engine, "kernel": name, "node": key[2], "recipe": rkey, "original_nodes": key[4]})
-        row = [event["ts"], event["dur"], str(event.get("tid")), node_ids[key]]
+            nodes.append({
+                "engine": engine,
+                "kernel": name,
+                "node": key[2],
+                "recipe": rkey,
+                "original_nodes": key[4],
+                "reported_dtype": a.get("dataType", "")
+            })
+        if hw not in hw_ids:
+            hw_ids[hw] = len(hw_names)
+            hw_names.append(hw)
+        row = [event["ts"], event["dur"], str(event.get("tid")), node_ids[key], hw_ids[hw]]
         dst.write(json.dumps(row, separators=(",", ":")) + "\n")
         hardware += 1
         first = min(first, row[0])
@@ -90,10 +95,13 @@ result = {
     digest,
     "events":
     total,
-    "complete_json":
-    not parse_errors,
-    "parse_errors":
-    parse_errors,
+    "schema_version":
+    2,
+    "hardware_columns": ["ts_us", "dur_us", "lane", "node", "hw_kind"],
+    "hw_event_names":
+    hw_names,
+    "base_time_nanoseconds":
+    int(base[1]) if base else None,
     "hardware_events":
     hardware,
     "first_us":

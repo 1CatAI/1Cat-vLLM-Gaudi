@@ -576,6 +576,12 @@ class HpuPlatform(Platform):
         return method == "dspark" and supports_dspark(vllm_config)
 
     @classmethod
+    def validate_request(cls, processed_inputs, params):
+        if gaudi_envs.VLLM_HPU_DSV41_PREPARED_SHARDS:
+            from vllm_gaudi.ops.deepseek_v41_config import validate_sampling
+            validate_sampling(params)
+
+    @classmethod
     def get_max_concurrent_batches(cls, vllm_config):
         from vllm_gaudi.ops.deepseek_v41_config import is_v41
         # This runner owns one PP/verify transaction. The scheduler must commit
@@ -586,7 +592,6 @@ class HpuPlatform(Platform):
     def configure_control_process(cls, role):
         from vllm_gaudi.ops.deepseek_v41_cpu import bind_control_process
         bind_control_process(role)
-
 
     @classmethod
     def register_custom_kv_cache_specs(cls, vllm_config):

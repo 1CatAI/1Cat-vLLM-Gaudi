@@ -23,6 +23,9 @@ extern unsigned char _binary___deepseek_v41_sparse_attn_pair_exp_bf16_gaudi2_o_e
 extern unsigned char _binary___deepseek_v41_sparse_attn_head_pair_bf16_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_sparse_attn_head_pair_bf16_gaudi2_o_end;
 
+extern unsigned char _binary___deepseek_v41_sparse_attn_packed_exp_bf16_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_sparse_attn_packed_exp_bf16_gaudi2_o_end;
+
 namespace {
 
 constexpr uint64_t kHeadDim = 512;
@@ -63,7 +66,9 @@ tpc_lib_api::GlueCodeReturn DeepseekV4SparseAttnBF16Gaudi2::GetKernelName(
             ? "custom_deepseek_v41_sparse_attn_head_pair_bf16_gaudi2"
             : m_mode == PAIRED_EXP_LENGTHS
             ? "custom_deepseek_v41_sparse_attn_pair_exp_bf16_gaudi2"
-            : m_mode == EXPLICIT_LENGTHS
+            : m_mode == PACKED_EXP_LENGTHS
+            ? "custom_deepseek_v41_sparse_attn_packed_exp_bf16_gaudi2" :
+        m_mode != WIDTH_ONLY
             ? "custom_deepseek_v4_sparse_attn_bf16_lengths_gaudi2"
             : "custom_deepseek_v4_sparse_attn_bf16_gaudi2");
     return tpc_lib_api::GLUE_SUCCESS;
@@ -236,7 +241,9 @@ DeepseekV4SparseAttnBF16Gaudi2::GetGcDefinitions(
         ? &_binary___deepseek_v41_sparse_attn_head_pair_bf16_gaudi2_o_start
         : m_mode == PAIRED_EXP_LENGTHS
         ? &_binary___deepseek_v41_sparse_attn_pair_exp_bf16_gaudi2_o_start
-        : m_mode == EXPLICIT_LENGTHS
+        : m_mode == PACKED_EXP_LENGTHS
+        ? &_binary___deepseek_v41_sparse_attn_packed_exp_bf16_gaudi2_o_start :
+        m_mode != WIDTH_ONLY
         ? &_binary___deepseek_v4_sparse_attn_bf16_lengths_gaudi2_o_start
         : &_binary___deepseek_v4_sparse_attn_bf16_gaudi2_o_start;
     const unsigned char* isaEnd =
@@ -244,7 +251,9 @@ DeepseekV4SparseAttnBF16Gaudi2::GetGcDefinitions(
         ? &_binary___deepseek_v41_sparse_attn_head_pair_bf16_gaudi2_o_end
         : m_mode == PAIRED_EXP_LENGTHS
         ? &_binary___deepseek_v41_sparse_attn_pair_exp_bf16_gaudi2_o_end
-        : m_mode == EXPLICIT_LENGTHS
+        : m_mode == PACKED_EXP_LENGTHS
+        ? &_binary___deepseek_v41_sparse_attn_packed_exp_bf16_gaudi2_o_end :
+        m_mode != WIDTH_ONLY
         ? &_binary___deepseek_v4_sparse_attn_bf16_lengths_gaudi2_o_end
         : &_binary___deepseek_v4_sparse_attn_bf16_gaudi2_o_end;
     const unsigned isaSize = isaEnd - isaStart;

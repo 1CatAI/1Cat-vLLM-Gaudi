@@ -12,22 +12,20 @@ def tensor_info(text):
     shape = re.search(r"Sizes = (\[[^\]]+\])", text)
     size = re.search(r"sizeInBytes = (\d+)", text)
     location = re.search(r"location = in (\w+)", text)
-    dtype = re.search(r"Sizes = \[[^\]]+\]\s+\|\s+([^|]+)\|", text)
-    bias = re.search(r"expBias = (-?\d+)", text)
     return {
         "name": text.split("  |", 1)[0],
         "description": text,
         "shape": json.loads(shape[1]) if shape else None,
         "bytes": int(size[1]) if size else None,
-        "location": location[1] if location else None,
-        "dtype": dtype[1].strip() if dtype else None,
-        "exponent_bias": int(bias[1]) if bias else None
+        "location": location[1] if location else None
     }
 
 
 def audit(path):
     raw = path.read_text()
-    if not re.search(r"prepared_moe_(?:k128_)?(bf16|fp8)", raw):
+    prefixes = ("custom_deepseek_v41_mxfp4_prepared_dequant", "custom_deepseek_v41_mxfp4_k128_dequant",
+                "custom_deepseek_v41_mxfp4_n512_dequant")
+    if not any(prefix in raw for prefix in prefixes):
         return None
     decode, matrix = [], []
     for node in raw.split("\nnode {"):
@@ -35,7 +33,7 @@ def audit(path):
         if not name or not op:
             continue
         attrs = dict(re.findall(r'key: "([^"]+)"\s+value \{\s+s: "([^"]*)"', node))
-        if op[1].startswith("custom_deepseek_v41_mxfp4_prepared_dequant"):
+        if op[1].startswith(prefixes):
             decode.append({"node": name[1], "output": tensor_info(attrs["outputTensor:0"])})
         if "gemm" in op[1].lower():
             matrix.append({
@@ -47,6 +45,8 @@ def audit(path):
             })
     decoded_names = {node["output"]["name"] for node in decode}
     expert_matrices = [node for node in matrix if node["weight"]["name"] in decoded_names]
+    if not expert_matrices:
+        return None  # A standalone decoder output is not an SRAM consumption proof.
     consumers = {
         name: [node["node"] for node in expert_matrices if node["weight"]["name"] == name]
         for name in decoded_names

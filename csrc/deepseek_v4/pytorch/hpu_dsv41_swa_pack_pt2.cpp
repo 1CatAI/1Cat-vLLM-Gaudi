@@ -7,7 +7,6 @@
 #include "hpu_ops/op_backend.h"
 
 namespace {
-constexpr auto kPack = "custom_op::custom_deepseek_v41_swa_pack_bf16_gaudi2";
 constexpr auto kWrite = "custom_op::custom_deepseek_v41_swa_pack_write_bf16_gaudi2";
 constexpr auto kOrdered = "custom_op::custom_deepseek_v41_swa_pack_write_ordered_bf16_gaudi2";
 
@@ -27,11 +26,6 @@ void validate_write(const at::Tensor& cache, const at::Tensor& value, const at::
                 "V4.1 SWA row update requires C1 BF16 [1,512], U8 cache [S,528] and device I32 [1]");
 }
 const bool registered = [] {
-    habana::custom_op::registerUserCustomOp(kPack, "custom_deepseek_v41_swa_pack_bf16_gaudi2",
-        [](const at::Stack& stack) {
-            const auto value = stack.at(0).toTensor(); validate_value(value);
-            return habana::PartialOutputMetaDataVector{{at::kByte, {value.size(0), value.size(1) * 33 / 32}}};
-        }, nullptr);
     for (auto name : {kWrite, kOrdered}) {
         habana::custom_op::registerUserCustomOp(name, "custom_deepseek_v41_swa_pack_write_bf16_gaudi2",
             [](const at::Stack& stack) {
@@ -42,13 +36,6 @@ const bool registered = [] {
     return true;
 }();
 
-template<bool Meta> at::Tensor pack(const at::Tensor& value) {
-    validate_value(value);
-    if (Meta) return at::empty({value.size(0), value.size(1) * 33 / 32}, value.options().dtype(at::kByte));
-    TORCH_CHECK(registered && value.device().type() == at::kHPU);
-    auto descriptor = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(kPack);
-    return descriptor.execute({value}).at(0);
-}
 template<bool Meta, bool Ordered> at::Tensor write(
     const at::Tensor& cache, const at::Tensor& value, const at::Tensor& position) {
     validate_write(cache, value, position);
@@ -78,19 +65,16 @@ at::Tensor functionalize(const at::Tensor& cache, const at::Tensor& value, const
 }
 }
 TORCH_LIBRARY_FRAGMENT(custom_op, m) {
-    m.def("custom_deepseek_v41_swa_pack_bf16_gaudi2(Tensor value) -> Tensor");
     m.def("custom_deepseek_v41_swa_pack_write_bf16_gaudi2(Tensor(a!) cache, Tensor value, Tensor position) -> Tensor");
     // Private functionalization form. Its completion tensor must be consumed
     // by ordered attention before the mutable cache is read.
     m.def("custom_deepseek_v41_swa_pack_write_ordered_bf16_gaudi2(Tensor cache, Tensor value, Tensor position) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
-    m.impl("custom_deepseek_v41_swa_pack_bf16_gaudi2", pack<false>);
     m.impl("custom_deepseek_v41_swa_pack_write_bf16_gaudi2", write<false, false>);
     m.impl("custom_deepseek_v41_swa_pack_write_ordered_bf16_gaudi2", write<false, true>);
 }
 TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
-    m.impl("custom_deepseek_v41_swa_pack_bf16_gaudi2", pack<true>);
     m.impl("custom_deepseek_v41_swa_pack_write_bf16_gaudi2", write<true, false>);
     m.impl("custom_deepseek_v41_swa_pack_write_ordered_bf16_gaudi2", write<true, true>);
 }
