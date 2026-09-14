@@ -72,6 +72,24 @@ def gdn_bf16():
     return _import_gdn({"VLLM_GDN_COMPUTE_FP32": "0"})
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, None), ("0", False), ("false", False), ("1", True), ("true", True)],
+)
+def test_resolve_prefill_state_precision_override(monkeypatch, gdn, value, expected):
+    if value is None:
+        monkeypatch.delenv("VLLM_GDN_PREFILL_STATE_FP32", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_GDN_PREFILL_STATE_FP32", value)
+    assert gdn.resolve_hpu_gdn_prefill_state_fp32() is expected
+
+
+def test_resolve_prefill_state_precision_override_rejects_invalid(monkeypatch, gdn):
+    monkeypatch.setenv("VLLM_GDN_PREFILL_STATE_FP32", "sometimes")
+    with pytest.raises(ValueError, match="VLLM_GDN_PREFILL_STATE_FP32"):
+        gdn.resolve_hpu_gdn_prefill_state_fp32()
+
+
 # ---------------------------------------------------------------------------
 # Random tensor generators (seeded for reproducibility)
 # ---------------------------------------------------------------------------

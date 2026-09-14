@@ -38,6 +38,27 @@ _GDN_COMPUTE_DTYPE = torch.float32 if os.getenv("VLLM_GDN_COMPUTE_FP32", "1") ==
 _GDN_SOLVE_FP32 = os.getenv("VLLM_GDN_SOLVE_FP32", "0") == "1"
 _GDN_STATE_FP32 = os.getenv("VLLM_GDN_STATE_FP32", "0") == "1"
 
+
+def resolve_hpu_gdn_prefill_state_fp32() -> bool | None:
+    """Return an optional prefill-only recurrent arithmetic override.
+
+    This allows an FP32 cache for fused decode while prefill performs its
+    chunk recurrence in BF16 and converts the final state once at cache write.
+    An absent setting preserves the global ``VLLM_GDN_STATE_FP32`` behavior.
+    """
+    value = os.getenv("VLLM_GDN_PREFILL_STATE_FP32")
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"1", "true"}:
+        return True
+    if normalized in {"0", "false"}:
+        return False
+    raise ValueError(
+        "VLLM_GDN_PREFILL_STATE_FP32 must be one of 0, 1, false or true, "
+        f"got {value!r}."
+    )
+
 # Set VLLM_GDN_EXACT_SOLVE=1 to use exact row-by-row forward substitution
 # instead of the Neumann iterative solver.  Exact but ~2.6x slower (127
 # Python-loop iterations for chunk_size=128).  Useful for isolating

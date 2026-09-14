@@ -24,6 +24,7 @@ from vllm_gaudi.ops.hpu_gdn_pytorch import (
     resolve_hpu_gdn_fused_rmsnorm_gated,
     resolve_hpu_gdn_fused_state_matmul,
     resolve_hpu_gdn_neumann_iters,
+    resolve_hpu_gdn_prefill_state_fp32,
     resolve_hpu_gdn_recursive_solver_base,
 )
 from vllm_gaudi.ops.qwen38_native_qk import (
@@ -162,6 +163,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self.mamba_chunk_size, _ = resolve_hpu_gdn_chunk_size(self.model_config)
         self.gdn_fused_state_matmul = resolve_hpu_gdn_fused_state_matmul()
         self.gdn_neumann_iters = resolve_hpu_gdn_neumann_iters()
+        self.gdn_prefill_state_in_fp32 = resolve_hpu_gdn_prefill_state_fp32()
         self.gdn_recursive_solver_base = resolve_hpu_gdn_recursive_solver_base()
         self.gdn_compact_repeated_kkt = resolve_hpu_gdn_compact_repeated_kkt()
         self.gdn_compact_repeated_local_attn = (resolve_hpu_gdn_compact_repeated_local_attn())
@@ -537,6 +539,7 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     compact_repeated_local_attn=self.gdn_compact_repeated_local_attn,
                     preserve_compact_qk=self.gdn_compact_qk_input,
                     compact_qk_factor_gate=self.gdn_compact_qk_factor_gate,
+                    state_in_fp32=self.gdn_prefill_state_in_fp32,
                 )
             assert final_state is not None
             # State save in dynamo-disabled wrapper — index_copy_ is
