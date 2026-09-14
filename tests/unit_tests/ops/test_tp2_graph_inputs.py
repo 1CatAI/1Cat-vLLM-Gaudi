@@ -158,6 +158,31 @@ def test_pointer_facade_copies_from_new_storage(monkeypatch):
     assert torch.equal(first["hidden_states"], updated["hidden_states"])
 
 
+def test_batched_engram_views_and_position_sources_keep_capture_destinations_fixed():
+    first = roots()
+    first["metadata"] = {}
+    first["input_ids"] = torch.zeros(6, dtype=torch.int64)
+    first["positions"] = torch.zeros(6, dtype=torch.int32)
+    first["attention_inputs"] = tuple(torch.zeros(6, 2, 33, dtype=torch.uint8) for _ in range(2))
+    captured = [[first["positions"], first["input_ids"], *first["attention_inputs"]]]
+    bindings = FixedDecodeInputs(torch.nn.Identity(), first, captured)
+    for generation in range(4):
+        pair = torch.full((2, 6, 2, 33), generation, dtype=torch.uint8)
+        pair[1].add_(10)
+        control = torch.arange(7, dtype=torch.int64) + generation
+        updated = dict(first, input_ids=control[:6], positions=torch.arange(6, dtype=torch.int32) + generation,
+                       attention_inputs=(pair[0], pair[1]))
+        changes = bindings.updates(updated)
+        assert len(changes) == 4
+        bindings.apply(changes)
+        assert torch.equal(first["positions"], updated["positions"])
+        assert torch.equal(first["input_ids"], control[:6])
+        for index in range(2):
+            assert torch.equal(first["attention_inputs"][index], pair[index])
+        pair.fill_(255)
+        assert not (first["attention_inputs"][0] == 255).any()
+
+
 def test_direct_entry_updates_inputs_and_returns_graph_outputs(monkeypatch):
     from vllm_gaudi.ops import tp2_prepared_plan as replay
 
@@ -193,7 +218,7 @@ def test_communicator_change_invalidates_before_copy_or_replay(monkeypatch):
     invalidated = []
     replay._native_entries[model] = None, bindings, (), object()
     monkeypatch.setattr(replay, "_runtime", lambda: (None, object()))
-    monkeypatch.setattr(replay, "invalidate_prepared_group_plans", lambda: invalidated.append(True))
+    monkeypatch.setattr(replay, "invalidate_prepared_group_plans", lambda **kwargs: invalidated.append(True))
     updated = dict(first, hidden_states=torch.full((1, 4), 9.0))
     assert replay.replay_native_decoder(model, **updated) is None
     assert invalidated == [True] and torch.equal(first["hidden_states"], torch.ones(1, 4))

@@ -38,7 +38,10 @@ setup(
     ext_modules=[CppExtension(
         "hpu_dsv4_sparse_attn_pt2",
         ["hpu_dsv4_sparse_attn_pt2.cpp", "hpu_dsv4_mhc_pt2.cpp", "hpu_dsv4_router_pt2.cpp",
-         "hpu_dsv4_mxfp4_mme_pt2.cpp", "hpu_dsv4_native_attention_pt2.cpp", "hpu_dsv4_sinkhorn_pt2.cpp"],
+         "hpu_dsv4_mxfp4_mme_pt2.cpp", "hpu_dsv4_native_attention_pt2.cpp", "hpu_dsv4_sinkhorn_pt2.cpp",
+         "hpu_dsv41_mxfp4_mme_pt2.cpp", "hpu_dsv41_expert_n256_pt2.cpp", "hpu_dsv41_indexed_moe_pt2.cpp",
+         "hpu_dsv41_quant_roundtrip_pt2.cpp", "hpu_dsv41_selected_kv_pt2.cpp", "hpu_dsv41_selected_mla_pt2.cpp", "hpu_dsv41_kv_pack_pt2.cpp",
+         "hpu_dsv41_rope_pt2.cpp", "hpu_dsv41_prefix_layout_pt2.cpp"],
         include_dirs=includes,
         library_dirs=[get_lib_dir()],
         libraries=["habana_pytorch2_plugin.upstream", "habana_pytorch_backend.upstream"],

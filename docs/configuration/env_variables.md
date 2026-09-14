@@ -197,6 +197,34 @@ they remain available through the standalone diagnostic. TP2 collective/RMSNorm
 fusion retains ownership of its communication boundary before local Triton
 RMSNorm is considered.
 
+## DeepSeek V4.1
+
+The experimental [prepared TP2×PP2 profile](../features/deepseek_v41.md)
+uses explicit switches and rejects unsupported execution contracts.
+
+| Variable | Description | Default |
+|---|---|---|
+| `VLLM_HPU_DSV41_PREPARED_SHARDS` | Enables the rank-local loader and bounded CSA2 runner on four Gaudi2 devices. Requires the immutable TP2×PP2 manifest. | `false` |
+| `VLLM_HPU_DSV41_ENGRAM_HOST_TABLE` | Uses shared read-only host mmap tables, native asynchronous row gather, and generation-owned HPU staging. | `false` |
+| `VLLM_HPU_DSV41_GRAPH_REPLAY` | Captures each PP stage with the ABI-locked native compute/communication plan. Requires prepared communication and the static group plan. | `false` |
+| `VLLM_HPU_DSV41_DSPARK` | Runs the three-layer draft on PP1 with accepted-prefix context insertion and Engram rollback. Requires `method=dspark`, five speculative tokens. | `false` |
+| `VLLM_HPU_DSV41_VISION` | Binds the portable upstream ViT/aligner to prepared PP0 weights. Requires `mm_encoder_tp_mode=data`. | `false` |
+| `VLLM_HPU_DSV41_QUANT_ROUNDTRIP` | Fuses the existing group-32 E4M3FN activation round trip into one TPC operation. Matrix operands remain BF16. | `false` |
+| `VLLM_HPU_DSV41_DEVICE_VERIFY` | Keeps DSpark C6 verification, PP commit validation, and draft result packing on persistent HPU buffers; default-off candidate path. | `false` |
+| `VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE` | Routes the two-rank PP boundary through the current-stream low-latency BF16 peer exchange; requires a qualified HCL/Bridge build. | `false` |
+| `VLLM_HPU_DSV41_INLINE_PP_COMMIT` | Consumes the PP0 device verify control result in the owning worker, removing the executor handoff from the C6 transaction. | `false` |
+| `VLLM_HPU_DSV41_COMPILED_PP_COMMIT` | Experimental compiled PP commit exchange and validation. Requires device verification and direct PP exchange; hardware capture and performance remain unqualified. | `false` |
+| `VLLM_HPU_DSV41_VERIFY_TIMING` | Diagnostic-only device markers and host phase timestamps for C6 verification. Requires a diagnostic native bridge and evidence directory; measured runs do not qualify production latency. | `false` |
+| `VLLM_HPU_DSV41_ROUND_TIMING` | Record bounded host timestamps from per-request input preparation through worker state commit and scheduler consumption. Adds no device synchronization. Writes records at shutdown under the run evidence directory. | `false` |
+| `VLLM_HPU_DSV41_INDEXED_MOE` | Experimental Q16/S16 direct indexed TPC MoE; decodes selected experts in 128-row SRAM/register tiles and avoids full BF16 weight materialization. | `false` |
+| `VLLM_HPU_DSV41_PAGED_SELECTED_KV` | Experimental paged CSA2 selected-row TPC decode; removes the per-token packed-row HBM gather before attention. | `false` |
+| `VLLM_HPU_DSV41_PRETRANSPOSE_ATTN` | Prepares MLA `wo_a` once in `[groups,K,N]` so decode graphs do not transpose the 32 MiB BF16 weight on every replay. | `false` |
+| `VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR` | Selects an isolated combined kernel/Bridge build; its binary hashes must match the build manifest. | unset |
+
+`VLLM_HPU_DSV4_WORKER_CPUS` and `VLLM_HPU_DSV4_WORKER_HELPER_CPUS`
+also apply to this profile, with one entry per rank. Each worker sets
+`HLS_MODULE_ID` from its assignment in `HABANA_VISIBLE_MODULES` before allocation.
+
 ## DeepSeek V4
 
 The [source-integrated Gaudi2 TP2 profile](../features/deepseek_v4_flash.md)
@@ -422,3 +450,39 @@ internal to the Synapse recipe; this does **not** guarantee SRAM placement.
 Keep this flag disabled for production until compiled placement, correctness
 and end-to-end performance have all been qualified. See
 [the implementation and qualification contract](../features/deepseek_v4_indexed_mme.md).
+
+## DeepSeek V4.1 DSpark serving candidates
+
+These switches are experimental and default to `0`. Use a fingerprint-checked
+V4.1 runtime profile; tensor values change during replay while allocation,
+layout, communicator and state-generation contracts remain fixed. A failure
+after a state update terminates execution rather than retrying another path.
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `VLLM_HPU_DSV41_DEVICE_VERIFY` | `0` | Keep accepted-prefix control and PP commit on the device, with final asynchronous scheduler consumption. |
+| `VLLM_HPU_DSV41_FUSED_STAGE_IO` | `0` | Fuse text embedding and PP wire transforms into the stage graph. Use pinned packed Engram staging; requires the packed-output host extension. |
+| `VLLM_HPU_DSV41_BATCHED_INPUT_STAGING` | `0` | Batch the two Engram layers into one fixed C6 DMA allocation and consume token/position staging directly. Requires fused stage I/O; retains DMA and consumer generation checks. |
+| `VLLM_HPU_DSV41_MHC_SCHEDULE` | `0` | Materialize independent mHC controls in the compute recipe before its TP exchange. Communication payload and FP32/BF16 arithmetic are preserved. Requires native V4.1 graph replay. |
+| `VLLM_HPU_DSV41_DIRECT_PP_WIRE` | `0` | Send the compiled PP wire directly and bind the persistent receive allocation as the native stage input. Keeps strict layout checks and communication/consumer ownership. |
+| `VLLM_HPU_DSV41_ROUND_TIMING` | `0` | Record bounded host-clock round ledgers, including worker state commits and scheduler consumption. This adds no device synchronization. |
+| `VLLM_HPU_DSV41_SHARED_PREFIX_KV` | `0` | Reuse nested selected-KV prefixes in eligible context buckets and pass valid lengths to attention. Other buckets keep their existing layout. |
+| `VLLM_HPU_DSV41_TILED_EXPERT_DECODE` | `0` | Partition routed C2–C6 weight decoding across 128 K elements. The MME still consumes full-K matrices. |
+| `VLLM_HPU_DSV41_W13_N512` | `0` | Slice routed C2–C6 W13 output channels into 512-row windows inside the native compound operation. Preserve full K and the W2 layout. |
+| `VLLM_HPU_DSV41_PACKED_ATTN_EXP` | `0` | Pack the two broadcast exponent evaluations into one SIMD operation in the shared-prefix attention path. |
+| `VLLM_HPU_DSV41_VECTOR_KV_SCALES` | `0` | Load selected KV scale bytes once per row and reuse them in the shared-prefix attention path. |
+| `VLLM_HPU_DSV41_SRAM_KV` | `0` | Keep the private selected BF16 KV cache in a graph-owned SRAM section; uses vector scale loads. Candidate placement, lifecycle and complete-round validation required. |
+| `VLLM_HPU_DSV41_SHARED_C6_EXPERTS` | `0` | Development-only cross-token expert reuse candidate; it has not qualified for serving. |
+
+Performance qualification uses the complete C6 round from input preparation
+through the last required worker commit and scheduler consumption. The older
+verify-function timer is a submetric. Enabling a switch does not establish
+performance, SRAM placement, or production-quality qualification.
+
+`VLLM_HPU_DSV41_HEAD_VECTOR_ATTN` (default `0`) uses the experimental native head-vector attention compound for the V4.1 shared-prefix decode path. It preserves ordered QK/softmax/PV arithmetic, uses bounded FP32 activation intermediates, and keeps selected BF16 KV in SRAM. Other attention buckets keep their existing implementation.
+
+`VLLM_HPU_DSV41_NATIVE_KV_PACK` (default `0`) enables pure native checkpoint SWA/FP4 encoders for BF16 C1–C6 inputs. Cache writes, dependencies and existing BF16/MME attention remain unchanged. Larger prefill inputs use the original encoder.
+
+`VLLM_HPU_DSV41_NATIVE_ROPE` (default `0`) fuses the interleaved rotary-table lookup, adjacent-pair FP32 rotation and BF16 output for C1–C6 inputs. It copies the non-rotary prefix verbatim and supports the inverse output rotation. The ordinary path handles other shapes and prefill.
+
+`VLLM_HPU_DSV41_FUSED_PREFIX_LAYOUT` (default `0`) combines the SWA window, selected-page mapping, shared row list and valid lengths for C1–C6 non-ranking CSA2 calls. It consumes live selection and block-table tensors; owner-layer selection and candidate-pool writes remain in the graph. Requires selected-KV and shared-prefix paths, window 128 and compression ratio 1 or 2.

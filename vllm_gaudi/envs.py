@@ -23,6 +23,43 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV4_MXFP4_INDEXED_MME: bool = False
     VLLM_HPU_DSV4_MXFP4_PREPARED_MME: bool = False
     VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH: bool = False
+    VLLM_HPU_DSV41_EXPERT_N256: bool = False
+    VLLM_HPU_DSV41_EXPERT_N256_FP8: bool = False
+    VLLM_HPU_DSV41_EXPERT_FUSED_QUANT: bool = False
+    VLLM_HPU_DSV41_MLA_MME: bool = False
+    VLLM_HPU_DSV41_QKV_FUSED_INPUT: bool = False
+    VLLM_HPU_DSV41_PREPARED_SHARDS: bool = False
+    VLLM_HPU_DSV41_ENGRAM_HOST_TABLE: bool = False
+    VLLM_HPU_DSV41_GRAPH_REPLAY: bool = False
+    VLLM_HPU_DSV41_DSPARK: bool = False
+    VLLM_HPU_DSV41_VISION: bool = False
+    VLLM_HPU_DSV41_QUANT_ROUNDTRIP: bool = False
+    VLLM_HPU_DSV41_DEVICE_VERIFY: bool = False
+    # Use the TP2 low-latency current-stream exchange for the two-rank PP
+    # boundary.  This is opt-in until a four-rank trace proves the PP group
+    # communicator has the same direct-exchange contract as TP2.
+    VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE: bool = False
+    # Consume the first PP stage's tiny device verify result in the worker
+    # that owns it.  This removes the executor round trip from the measured
+    # C6 transaction; PP0 has no scheduler-visible sampled output.
+    VLLM_HPU_DSV41_INLINE_PP_COMMIT: bool = False
+    # Compile the tiny PP commit exchange/validator into a captured graph.
+    # This remains opt-in until the graph path has passed a real TP2xPP2
+    # request; the device-verify path itself continues to use the validated
+    # eager direct exchange when this is disabled.
+    VLLM_HPU_DSV41_COMPILED_PP_COMMIT: bool = False
+    VLLM_HPU_DSV41_VERIFY_TIMING: bool = False
+    VLLM_HPU_DSV41_ROUND_TIMING: bool = False
+    # Experimental direct Q16 indexed MoE.  It keeps MXFP4 decoding in TPC
+    # registers and emits only selected BF16 activations; default is off until
+    # an E2E candidate beats the prepared BF16/MME path.
+    VLLM_HPU_DSV41_INDEXED_MOE: bool = False
+    VLLM_HPU_DSV41_PAGED_SELECTED_KV: bool = False
+    # Store MLA output-projection weights in the [groups, K, N] layout
+    # consumed by the einsum/MME path.  This removes the repeated 32 MiB
+    # DRAM transpose of each [1, 4, 1024, 4096] weight seen in the C6 graph.
+    VLLM_HPU_DSV41_PRETRANSPOSE_ATTN: bool = False
+    VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR: str | None = None
     VLLM_HPU_DSV4_SHORT_INDEXER_SKIP: bool = True
     VLLM_HPU_DSV4_BF16_SCORE_PROJECTION: bool = False
     VLLM_HPU_DSV4_FUSED_SDPA: bool = False
@@ -205,6 +242,60 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Gather only routed packed experts for single-token MXFP4 decode.
     "VLLM_HPU_MXFP4_DECODE_GATHER":
     lambda: os.environ.get("VLLM_HPU_MXFP4_DECODE_GATHER", "1").lower() in ("1", "true"),
+
+    # V4.1 is a separate opt-in contract; none of the V4 defaults enable it.
+    "VLLM_HPU_DSV41_EXPERT_N256": lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_N256", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_EXPERT_N256_FP8": lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_N256_FP8", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_EXPERT_FUSED_QUANT": lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_FUSED_QUANT", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_MLA_MME": lambda: os.environ.get("VLLM_HPU_DSV41_MLA_MME", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_QKV_FUSED_INPUT": lambda: os.environ.get("VLLM_HPU_DSV41_QKV_FUSED_INPUT", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_PREPARED_SHARDS":
+    lambda: os.environ.get("VLLM_HPU_DSV41_PREPARED_SHARDS", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_ENGRAM_HOST_TABLE":
+    lambda: os.environ.get("VLLM_HPU_DSV41_ENGRAM_HOST_TABLE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_GRAPH_REPLAY":
+    lambda: os.environ.get("VLLM_HPU_DSV41_GRAPH_REPLAY", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK":
+    lambda: os.environ.get("VLLM_HPU_DSV41_DSPARK", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_VISION":
+    lambda: os.environ.get("VLLM_HPU_DSV41_VISION", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_QUANT_ROUNDTRIP":
+    lambda: os.environ.get("VLLM_HPU_DSV41_QUANT_ROUNDTRIP", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DEVICE_VERIFY":
+    lambda: os.environ.get("VLLM_HPU_DSV41_DEVICE_VERIFY", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE":
+    lambda: os.environ.get("VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_INLINE_PP_COMMIT":
+    lambda: os.environ.get("VLLM_HPU_DSV41_INLINE_PP_COMMIT", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_COMPILED_PP_COMMIT":
+    lambda: os.environ.get("VLLM_HPU_DSV41_COMPILED_PP_COMMIT", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_VERIFY_TIMING":
+    lambda: os.environ.get("VLLM_HPU_DSV41_VERIFY_TIMING", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_FUSED_STAGE_IO": lambda: os.getenv("VLLM_HPU_DSV41_FUSED_STAGE_IO", "0") == "1",
+    "VLLM_HPU_DSV41_BATCHED_INPUT_STAGING": lambda: os.getenv("VLLM_HPU_DSV41_BATCHED_INPUT_STAGING", "0") == "1",
+    "VLLM_HPU_DSV41_MHC_SCHEDULE": lambda: os.getenv("VLLM_HPU_DSV41_MHC_SCHEDULE", "0") == "1",
+    "VLLM_HPU_DSV41_DIRECT_PP_WIRE": lambda: os.getenv("VLLM_HPU_DSV41_DIRECT_PP_WIRE", "0") == "1",
+    "VLLM_HPU_DSV41_SHARED_C6_EXPERTS": lambda: os.getenv("VLLM_HPU_DSV41_SHARED_C6_EXPERTS", "0") == "1",
+    "VLLM_HPU_DSV41_SHARED_PREFIX_KV": lambda: os.getenv("VLLM_HPU_DSV41_SHARED_PREFIX_KV", "0") == "1",
+    "VLLM_HPU_DSV41_TILED_EXPERT_DECODE": lambda: os.getenv("VLLM_HPU_DSV41_TILED_EXPERT_DECODE", "0") == "1",
+    "VLLM_HPU_DSV41_W13_N512": lambda: os.getenv("VLLM_HPU_DSV41_W13_N512", "0") == "1",
+    "VLLM_HPU_DSV41_PACKED_ATTN_EXP": lambda: os.getenv("VLLM_HPU_DSV41_PACKED_ATTN_EXP", "0") == "1",
+    "VLLM_HPU_DSV41_VECTOR_KV_SCALES": lambda: os.getenv("VLLM_HPU_DSV41_VECTOR_KV_SCALES", "0") == "1",
+    "VLLM_HPU_DSV41_HEAD_VECTOR_ATTN": lambda: os.getenv("VLLM_HPU_DSV41_HEAD_VECTOR_ATTN", "0") == "1",
+    "VLLM_HPU_DSV41_NATIVE_KV_PACK": lambda: os.getenv("VLLM_HPU_DSV41_NATIVE_KV_PACK", "0") == "1",
+    "VLLM_HPU_DSV41_NATIVE_ROPE": lambda: os.getenv("VLLM_HPU_DSV41_NATIVE_ROPE", "0") == "1",
+    "VLLM_HPU_DSV41_FUSED_PREFIX_LAYOUT": lambda: os.getenv("VLLM_HPU_DSV41_FUSED_PREFIX_LAYOUT", "0") == "1",
+    "VLLM_HPU_DSV41_SRAM_KV": lambda: os.getenv("VLLM_HPU_DSV41_SRAM_KV", "0") == "1",
+    "VLLM_HPU_DSV41_ROUND_TIMING":
+    lambda: os.environ.get("VLLM_HPU_DSV41_ROUND_TIMING", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_INDEXED_MOE":
+    lambda: os.environ.get("VLLM_HPU_DSV41_INDEXED_MOE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_PAGED_SELECTED_KV":
+    lambda: os.environ.get("VLLM_HPU_DSV41_PAGED_SELECTED_KV", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_PRETRANSPOSE_ATTN":
+    lambda: os.environ.get("VLLM_HPU_DSV41_PRETRANSPOSE_ATTN", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR":
+    lambda: os.environ.get("VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR"),
 
     # Fuse the four selected-expert packed-weight copies into one Gaudi2 TPC
     # launch for DeepSeek V4 single-token decode.

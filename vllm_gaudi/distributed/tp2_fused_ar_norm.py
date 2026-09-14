@@ -13,12 +13,13 @@ import threading
 import torch
 import torch.distributed as dist
 
-from vllm.distributed import get_tp_group, tensor_model_parallel_all_reduce
+from vllm.distributed import get_pp_group, get_tp_group, tensor_model_parallel_all_reduce
 
 from vllm_gaudi.extension.kernels import rms_norm
 from vllm_gaudi.extension.runtime import get_config
 
 _RUNTIME_ATTR = "_vllm_gaudi_tp2_fused_ar_norm_runtime"
+_PP_RUNTIME_ATTR = "_vllm_gaudi_pp_direct_exchange_runtime"
 _BRIDGE_MODULE = "tp2_fused_ar_norm_bridge"
 _DIRECT_ALGORITHM_ENV = "VLLM_HPU_TP2_FUSED_AR_NORM_DIRECT_ALGORITHM"
 _TENSOR_IDS_ENV = "VLLM_HPU_TP2_FUSED_AR_NORM_TENSOR_IDS"
@@ -35,6 +36,11 @@ _library.define("tp2_allreduce_residual_rms_norm_out(Tensor partial, Tensor resi
                 "Tensor weight, Tensor(a!) reduced, Tensor(b!) normalized, "
                 "Tensor(c!) residual_out, Tensor(d!) inverse_rms, float epsilon) -> ()")
 _library.define("tp2_exchange_peer(Tensor partial) -> Tensor")
+_library.define("tp2_exchange_peer_scheduled(Tensor partial, Tensor[] ready_outputs) -> Tensor")
+_library.define("pp_exchange_peer(Tensor partial, Tensor(a!) peer) -> Tensor(a!)")
+# Functional variant owns its output and neither aliases nor mutates inputs.
+# The eager entry above retains the caller-owned in-place wire contract.
+_library.define("pp_exchange_peer_graph(Tensor partial) -> Tensor")
 _library.define("tp2_allreduce_plain(Tensor partial) -> Tensor")
 
 
@@ -94,7 +100,10 @@ def initialize_tp2_fused_ar_norm_runtime() -> None:
 
     tp_group = get_tp_group().device_group
     tp_size = dist.get_world_size(group=tp_group)
-    if tp_size != 2 or dist.get_world_size() != 2:
+    v41 = os.environ.get("VLLM_HPU_DSV41_GRAPH_REPLAY") == "1"
+    from vllm.distributed import get_pp_group
+    v41_world = v41 and dist.get_world_size() == 4 and get_pp_group().world_size == 2
+    if tp_size != 2 or (dist.get_world_size() != 2 and not v41_world):
         raise RuntimeError("TP2 fused all-reduce currently requires a two-rank, TP-only process world")
     direct_algorithm = os.environ.get(_DIRECT_ALGORITHM_ENV, "hccl").strip().lower()
     if direct_algorithm not in ("hccl", "tp2-exchange"):
@@ -108,13 +117,19 @@ def initialize_tp2_fused_ar_norm_runtime() -> None:
         "PT_HPU_EAGER_COLLECTIVE_PIPELINE_ENABLE": "1",
     }
     if direct_algorithm == "tp2-exchange":
+        # The legacy TP2 tensors fit the original 163840-element ceiling.
+        # V4.1's single C6 PP wire is 122976 BF16 elements, so only that
+        # explicitly opted-in PP path raises the HCL limit.  Do not change
+        # the contract of existing TP-only profiles.
+        direct_max_count = ("262144" if os.environ.get("VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE") == "1"
+                            else "163840")
         required_environment.update({
             "HCCL_PRIM_COLLECTIVE_MASK": "0",
             "HCL_TP2_DIRECT_NIC_RS_AR": "0",
             "HCL_TP2_DIRECT_NIC_EXCHANGE": "0",
             "HCL_TP2_DIRECT_INPLACE_STAGING": "0",
             "HCL_TP2_DEDICATED_DIRECT_API": "1",
-            "HCL_TP2_DIRECT_MAX_COUNT": "163840",
+            "HCL_TP2_DIRECT_MAX_COUNT": direct_max_count,
             "HCL_TP2_PRUNE_SCALEOUT_STREAMS": "1",
             "RUNTIME_SCALE_PATCHING": "0",
         })
@@ -157,7 +172,7 @@ def initialize_tp2_fused_ar_norm_runtime() -> None:
     log.info("TP2 prepared runtime: initializing communicator")
     dist.all_reduce(probe, group=tp_group)
     torch.hpu.synchronize()
-    if not torch.equal(probe.cpu(), torch.full((128, ), 2, dtype=torch.bfloat16)):
+    if not torch.equal(probe.cpu(), torch.full((128, ), 2, dtype=torch.bfloat16, device="cpu")):
         raise RuntimeError("TP2 HCCL process-group initialization failed")
 
     log.info("TP2 prepared runtime: loading native adapter")
@@ -167,6 +182,24 @@ def initialize_tp2_fused_ar_norm_runtime() -> None:
     communicator_id = bridge.communicator_id(backend)
     setattr(torch, _RUNTIME_ATTR, (bridge, backend, communicator_id))
     from vllm_gaudi import envs
+
+    if envs.VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE:
+        pp_group = get_pp_group().device_group
+        if not v41_world or dist.get_world_size(group=pp_group) != 2:
+            raise RuntimeError("V4.1 PP direct exchange requires TP2×PP2")
+        if not hasattr(bridge, "pp_exchange_peer_current_stream"):
+            raise RuntimeError("Rebuild the V4.1 bridge with the PP direct-exchange entry")
+        # Initialise the PP communicator once, before any request state is
+        # written.  The direct steady path does not call a generic collective
+        # or wait on a host Work object.
+        pp_probe = torch.ones(128, dtype=torch.bfloat16, device="hpu")
+        dist.all_reduce(pp_probe, group=pp_group)
+        torch.hpu.synchronize()
+        if not torch.equal(pp_probe.cpu(), torch.full((128,), 2, dtype=torch.bfloat16, device="cpu")):
+            raise RuntimeError("V4.1 PP HCCL process-group initialization failed")
+        pp_backend = pp_group._get_backend(torch.device("hpu"))
+        pp_communicator_id = bridge.communicator_id(pp_backend)
+        setattr(torch, _PP_RUNTIME_ATTR, (bridge, pp_backend, pp_group, pp_communicator_id))
 
     if envs.VLLM_HPU_TP2_NATIVE_DYNAMIC_QUANT:
         if torch.hpu.get_device_name().upper().replace(" ", "") != "GAUDI2":
@@ -191,17 +224,19 @@ def initialize_tp2_fused_ar_norm_runtime() -> None:
         log.info("TP2 prepared runtime: checking runtime fingerprints")
         _verify_prepared_runtime(bridge_path)
         if not envs.VLLM_HPU_TP2_PREPARED_COMM or not (
-                envs.VLLM_HPU_GDN_DIRECT_STATE_UPDATE or envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH):
+                envs.VLLM_HPU_GDN_DIRECT_STATE_UPDATE or envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH
+                or envs.VLLM_HPU_DSV41_GRAPH_REPLAY):
             raise RuntimeError("Prepared TP2 groups require direct state update and prepared communication")
         from vllm_gaudi.ops.tp2_prepared_plan import register_tp2_prepared_group_pass
 
         register_tp2_prepared_group_pass()
-    if envs.VLLM_HPU_NATIVE_DECODE_GRAPH or envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
-        if (envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH
+    if (envs.VLLM_HPU_NATIVE_DECODE_GRAPH or envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH
+            or envs.VLLM_HPU_DSV41_GRAPH_REPLAY):
+        if ((envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH or envs.VLLM_HPU_DSV41_GRAPH_REPLAY)
                 and torch.hpu.get_device_name().upper().replace(" ", "") != "GAUDI2"):
             raise RuntimeError("V4 native decode currently requires Gaudi2")
         required = ("NativeDecodeGraph", "native_decode_graph_available")
-        if envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
+        if envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH or envs.VLLM_HPU_DSV41_GRAPH_REPLAY:
             required += ("record_native_completion", "copy_sampled_tokens_to_host")
         if not all(hasattr(bridge, name) for name in required) or not bridge.native_decode_graph_available():
             raise RuntimeError(
@@ -461,6 +496,67 @@ def _tp2_exchange_peer_fake(partial: torch.Tensor) -> torch.Tensor:
 
 _library.impl("tp2_exchange_peer", _tp2_exchange_peer_impl, dispatch_key="HPU")
 _library._register_fake("tp2_exchange_peer", _tp2_exchange_peer_fake)
+
+
+def _tp2_exchange_peer_scheduled_impl(partial, ready_outputs):
+    # These outputs belong to the preceding compute recipe, but are consumed
+    # after the collective. They are not part of the communication payload.
+    del ready_outputs
+    return _tp2_exchange_peer_impl(partial)
+
+
+def _tp2_exchange_peer_scheduled_fake(partial, ready_outputs):
+    del ready_outputs
+    return torch.empty_like(partial)
+
+
+_library.impl("tp2_exchange_peer_scheduled", _tp2_exchange_peer_scheduled_impl, dispatch_key="HPU")
+_library._register_fake("tp2_exchange_peer_scheduled", _tp2_exchange_peer_scheduled_fake)
+
+
+def _pp_exchange_peer_impl(partial: torch.Tensor, peer: torch.Tensor) -> torch.Tensor:
+    """Exchange a fixed BF16 PP payload on the PP communicator's stream.
+
+    The existing TP2 bridge is intentionally reused, but the backend is
+    resolved from ``get_pp_group``.  This prevents a PP boundary from using
+    the TP communicator while retaining the direct HCL path and its ABI
+    validation.  ``peer`` is caller-owned so graph/replay can keep its address
+    stable and no per-token allocation is introduced.
+    """
+    runtime = getattr(torch, _PP_RUNTIME_ATTR, None)
+    if runtime is None:
+        raise RuntimeError("V4.1 PP direct exchange runtime was not prepared")
+    bridge, backend, pp_group, _ = runtime
+    if get_pp_group().device_group is not pp_group:
+        raise RuntimeError("V4.1 PP communicator changed after direct-exchange preparation")
+    if partial.dtype != torch.bfloat16 or peer.dtype != torch.bfloat16:
+        raise RuntimeError("V4.1 PP direct exchange requires BF16 payloads")
+    if partial.device.type != "hpu" or peer.device != partial.device:
+        raise RuntimeError("V4.1 PP direct exchange requires matching HPU payloads")
+    if partial.shape != peer.shape or not partial.is_contiguous() or not peer.is_contiguous():
+        raise RuntimeError("V4.1 PP direct exchange payloads must be equal contiguous tensors")
+    return bridge.pp_exchange_peer_current_stream(backend, partial, peer)
+
+
+def _pp_exchange_peer_fake(partial: torch.Tensor, peer: torch.Tensor) -> torch.Tensor:
+    return peer
+
+
+_library.impl("pp_exchange_peer", _pp_exchange_peer_impl, dispatch_key="HPU")
+_library._register_fake("pp_exchange_peer", _pp_exchange_peer_fake)
+
+
+def _pp_exchange_peer_graph_impl(partial: torch.Tensor) -> torch.Tensor:
+    peer = torch.empty_like(partial)
+    return _pp_exchange_peer_impl(partial, peer)
+
+
+def _pp_exchange_peer_graph_fake(partial: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(partial)
+
+
+_library.impl("pp_exchange_peer_graph", _pp_exchange_peer_graph_impl, dispatch_key="HPU")
+_library._register_fake("pp_exchange_peer_graph", _pp_exchange_peer_graph_fake)
 
 
 def _tp2_allreduce_plain_impl(partial: torch.Tensor) -> torch.Tensor:

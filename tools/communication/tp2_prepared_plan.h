@@ -161,7 +161,11 @@ class PreparedGroupPlan : public std::enable_shared_from_this<PreparedGroupPlan>
         if (node.peer_only) {
           const auto peer = slots.at(node.outputs[0]).toTensor();
           const int64_t hidden = partial.numel();
-          TORCH_CHECK(hidden == 4096 || (!node.reduction_only && hidden == 5120),
+          const char* v41Flag = std::getenv("VLLM_HPU_DSV41_GRAPH_REPLAY");
+          const bool v41 = v41Flag && std::strcmp(v41Flag, "1") == 0;
+          const bool v41Shape = v41 && !node.reduction_only && hidden >= 128 &&
+                                hidden <= 32768 && hidden % 128 == 0;
+          TORCH_CHECK(hidden == 4096 || (!node.reduction_only && hidden == 5120) || v41Shape,
                       "Unsupported prepared TP2 hidden width");
           TORCH_CHECK(partial.sizes() == at::IntArrayRef({1, hidden}) &&
                           partial.scalar_type() == at::kBFloat16 && partial.device().type() == at::kHPU,

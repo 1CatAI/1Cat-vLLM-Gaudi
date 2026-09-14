@@ -349,6 +349,8 @@ class HpuPlatform(Platform):
             cache_config.block_size = 128
             if cache_config.mamba_cache_mode == "align":
                 cache_config.mamba_block_size = 128
+        from vllm_gaudi.ops.deepseek_v41_config import configure as configure_v41
+        configure_v41(vllm_config)
         # Hybrid GDN/Mamba models: upstream HybridAttentionMambaModelConfig
         # already ran and computed block_size / mamba_page_size_padded for
         # GPU.  HPU overrode block_size to 128 above, so we must re-align
@@ -567,6 +569,30 @@ class HpuPlatform(Platform):
     @classmethod
     def get_device_communicator_cls(cls) -> str:
         return "vllm_gaudi.distributed.device_communicators.hpu_communicator.HpuCommunicator"  # noqa
+
+    @classmethod
+    def supports_v1_speculative_method(cls, method, vllm_config):
+        from vllm_gaudi.ops.deepseek_v41_config import supports_dspark
+        return method == "dspark" and supports_dspark(vllm_config)
+
+    @classmethod
+    def validate_request(cls, processed_inputs, params):
+        if gaudi_envs.VLLM_HPU_DSV41_PREPARED_SHARDS:
+            from vllm_gaudi.ops.deepseek_v41_config import validate_sampling
+            validate_sampling(params)
+
+    @classmethod
+    def get_max_concurrent_batches(cls, vllm_config):
+        from vllm_gaudi.ops.deepseek_v41_config import is_v41
+        # This runner owns one PP/verify transaction. The scheduler must commit
+        # its sampled anchor before submitting the following draft block.
+        return 1 if is_v41(vllm_config) else None
+
+    @classmethod
+    def register_custom_kv_cache_specs(cls, vllm_config):
+        if gaudi_envs.VLLM_HPU_DSV41_PREPARED_SHARDS:
+            from vllm_gaudi.ops.deepseek_v41_state import register_state_spec
+            register_state_spec(vllm_config)
 
     @classmethod
     def supports_structured_output(cls) -> bool:

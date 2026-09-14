@@ -63,7 +63,7 @@ class FixedDecodeInputs:
     def __init__(self, model, roots, captured_inputs):
         used = {_storage(value) for row in captured_inputs for value in row if isinstance(value, torch.Tensor)}
         candidates = []
-        for name in ("positions", "hidden_states", "residual", "input_ids", "metadata_pack"):
+        for name in ("positions", "hidden_states", "residual", "pre_mix", "input_ids", "metadata_pack", "pp_wire"):
             destination = (roots.get("metadata_destination", roots.get(name))
                            if name == "metadata_pack" else roots.get(name))
             candidates.append(("root", name, None, destination))
@@ -108,31 +108,40 @@ class FixedDecodeInputs:
         self.state_tensors = tuple(roots.get("state_tensors", ()))
         self.state_signatures = tuple((_storage(value), _address(value), _layout(value))
                                       for value in self.state_tensors)
-        self.native_staging = getattr(roots.get("adapter"), "name", None) == "deepseek_v4"
+        adapter_name = getattr(roots.get("adapter"), "name", "")
+        self.native_staging = adapter_name == "deepseek_v4" or adapter_name.startswith("deepseek_v41_")
+        self.last_invalidation_reason = None
 
     def updates(self, roots):
         """Preflight every changing binding before copying any input."""
+        self.last_invalidation_reason = None
         metadata = roots["metadata"]
         if roots.get("state_generation") != self.state_generation:
+            self.last_invalidation_reason = "state_generation"
             return None
         state = tuple(roots.get("state_tensors", ()))
         if len(state) != len(self.state_tensors) or any(
                 not isinstance(value, torch.Tensor) or (_storage(value), _address(value), _layout(value)) != signature
                 for value, signature in zip(state, self.state_signatures)):
+            self.last_invalidation_reason = "state_allocation"
             return None
         if type(metadata) is not self.metadata_type:
+            self.last_invalidation_reason = "metadata_type"
             return None
         if any(getattr(metadata, name, None) != value for name, value in self.static_metadata.items()):
+            self.last_invalidation_reason = "metadata_contract"
             return None
         pending = []
         for binding in self.bindings:
             source = binding.read(roots)
             if not isinstance(source, torch.Tensor) or _layout(source) != binding.layout:
+                self.last_invalidation_reason = f"input_layout:{binding.name}"
                 return None
             if _address(source) != _address(binding.destination):
                 if _storage(source) == _storage(binding.destination):
                     # Avoid overwriting a later input view in the same update
                     # transaction. Rebuild before any mutation instead.
+                    self.last_invalidation_reason = f"input_overlap:{binding.name}"
                     return None
                 pending.append((binding.destination, source))
         return pending

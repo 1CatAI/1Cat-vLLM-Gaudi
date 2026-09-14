@@ -41,6 +41,7 @@
 #include "habana_serialization/deserializers.h"
 #include "habana_serialization/serializers.h"
 #include "python_packages/habana_frameworks/torch/distributed/hccl/process_group_eager_hccl.hpp"
+#include "dsv41_verify_timing.h"
 
 namespace {
 
@@ -695,10 +696,15 @@ void queueGdnStateWaits(std::vector<std::shared_ptr<GdnStateDMATicket>> tickets,
 
 at::Tensor tp2ExchangePeer(c10d::ProcessGroupEagerHCCL *backend,
                            const at::Tensor &partial,
-                           const at::Tensor &peer, bool reduction_only = false) {
+                           const at::Tensor &peer, bool reduction_only = false,
+                           bool immediate = false) {
   TORCH_CHECK(tp2ExchangeEnabled(),
               "TP2 peer exchange requires the tp2-exchange algorithm");
-  TORCH_CHECK(partial.dim() >= 2, "partial must have at least two dimensions");
+  // The normal TP2 path uses a row-shaped activation, while the PP commit
+  // path transports a fixed 128-byte record as a one-dimensional BF16 view.
+  // Both are valid contiguous HCCL buffers; dimensionality is not part of
+  // the wire contract.
+  TORCH_CHECK(partial.dim() >= 1, "partial must have at least one dimension");
   TORCH_CHECK(partial.scalar_type() == at::kBFloat16,
               "TP2 peer exchange supports BF16 activations only");
   TORCH_CHECK(partial.is_contiguous(), "partial must be contiguous");
@@ -713,7 +719,7 @@ at::Tensor tp2ExchangePeer(c10d::ProcessGroupEagerHCCL *backend,
   const bool pipeline_enabled =
       GET_ENV_FLAG_NEW(PT_HPU_EAGER_PIPELINE_ENABLE) &&
       GET_ENV_FLAG_NEW(PT_HPU_EAGER_COLLECTIVE_PIPELINE_ENABLE);
-  if (pipeline_enabled) {
+  if (pipeline_enabled && !immediate) {
     std::array<at::Tensor, 2> backend_tensors = {
         habana::eager::HbEagerTensorPool::get_backend_tensor(partial),
         habana::eager::HbEagerTensorPool::get_backend_tensor(peer),
@@ -1165,6 +1171,7 @@ TORCH_LIBRARY_IMPL(hccl, Meta, library) {
 namespace py = pybind11;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  dsv41_timing::bind(module);
   module.def("set_prepared_communication", [](bool enabled) { g_prepared_comm_enabled.store(enabled); });
   py::class_<PreparedGroupPlan, std::shared_ptr<PreparedGroupPlan>>(module, "PreparedGroupPlan")
       .def(py::init<>())
@@ -1378,6 +1385,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         TORCH_CHECK(hccl_backend != nullptr,
                     "TP2 peer exchange requires ProcessGroupEagerHCCL");
         return tp2ExchangePeer(hccl_backend, partial, peer);
+      },
+      py::arg("backend"), py::arg("partial"), py::arg("peer"));
+  // The PP2 stage boundary has the same two-rank, BF16 peer-exchange
+  // contract as the TP2 path.  Keep a separate entry point so the Python
+  // side can bind the PP process-group communicator instead of accidentally
+  // using the TP communicator.  The implementation deliberately reuses the
+  // direct current-stream exchange and therefore retains its HCL/ABI checks.
+  module.def(
+      "pp_exchange_peer_current_stream",
+      [](const c10::intrusive_ptr<c10d::Backend> &backend,
+         const at::Tensor &partial, const at::Tensor &peer) {
+        auto *hccl_backend =
+            dynamic_cast<c10d::ProcessGroupEagerHCCL *>(backend.get());
+        TORCH_CHECK(hccl_backend != nullptr,
+                    "PP peer exchange requires ProcessGroupEagerHCCL");
+        return tp2ExchangePeer(hccl_backend, partial, peer, false, true);
       },
       py::arg("backend"), py::arg("partial"), py::arg("peer"));
   module.def(

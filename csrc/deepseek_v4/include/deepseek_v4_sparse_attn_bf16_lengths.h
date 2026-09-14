@@ -10,6 +10,24 @@ license are met.
 #define DSV4_BF16_VECTOR_WIDTH 128
 #define DSV4_VECTOR_COUNT (DSV4_HEAD_DIM / DSV4_BF16_VECTOR_WIDTH)
 
+#ifdef DSV41_PACKED_ATTN_EXP
+// Both inputs are broadcasts. Compute the same Cephes function once with
+// each argument in alternating lanes, then broadcast the two results within
+// each hardware shuffle group (shuffle cannot cross arbitrary vector halves).
+// Unlike exp(-abs(a-b)), this also preserves non-finite input behavior.
+static inline float128 packed_exp_pair(float64 first, float64 second)
+{
+    const uint64 parity = v_u32_and_b(read_lane_id_4b_b(), 1);
+    const bool64 odd = v_u32_cmp_eq_b(parity, 1);
+    const float64 packed = v_f32_mov_vb(second, 0, first, odd);
+    const float64 result = v_exp_cephes_f32(packed);
+    float128 pair;
+    pair.v1 = v_f32_shuffle_b(result, (uchar256)0x80, 0, result);
+    pair.v2 = v_f32_shuffle_b(result, (uchar256)0x81, 0, result);
+    return pair;
+}
+#endif
+
 // FlashMLA-style sparse prefill. The caller supplies the valid prefix length
 // for each row so aligned index padding is never scanned by the TPC program.
 void main(
@@ -85,9 +103,16 @@ void main(
                 score *= scale_value;
 
                 const float64 next_max = v_f32_max_b(running_max, score);
+#ifdef DSV41_PACKED_ATTN_EXP
+                const float128 exp_pair = packed_exp_pair(
+                    running_max - next_max, score - next_max);
+                const float64 previous_scale = exp_pair.v1;
+                const float64 weight = exp_pair.v2;
+#else
                 const float64 previous_scale =
                     v_exp_cephes_f32(running_max - next_max);
                 const float64 weight = v_exp_cephes_f32(score - next_max);
+#endif
                 running_sum = running_sum * previous_scale + weight;
 
                 #pragma unroll (DSV4_VECTOR_COUNT)
@@ -111,10 +136,17 @@ void main(
                 s_f32_ld_g(gen_addr(sink_coords, attn_sink));
             const float64 sink_score = sink_value;
             const float64 final_max = v_f32_max_b(running_max, sink_score);
+#ifdef DSV41_PACKED_ATTN_EXP
+            const float128 final_exp = packed_exp_pair(
+                running_max - final_max, sink_score - final_max);
+            const float64 data_scale = final_exp.v1;
+            const float64 sink_weight = final_exp.v2;
+#else
             const float64 data_scale =
                 v_exp_cephes_f32(running_max - final_max);
             const float64 sink_weight =
                 v_exp_cephes_f32(sink_score - final_max);
+#endif
             running_sum = running_sum * data_scale + sink_weight;
             const float64 inverse_sum = v_reciprocal_f32(running_sum);
             const float64 lse = final_max + v_log_f32(running_sum);

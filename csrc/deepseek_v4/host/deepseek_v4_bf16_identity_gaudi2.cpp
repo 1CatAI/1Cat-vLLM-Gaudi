@@ -36,7 +36,7 @@ bool HasShape2(const tpc_lib_api::Tensor& tensor,
 
 tpc_lib_api::GlueCodeReturn DeepseekV4BF16IdentityGaudi2::GetKernelName(
     char name[tpc_lib_api::MAX_NODE_NAME]) {
-    std::strcpy(name, "custom_deepseek_v4_bf16_identity_gaudi2");
+    std::strcpy(name, v41_ ? "custom_deepseek_v41_bf16_identity_gaudi2" : "custom_deepseek_v4_bf16_identity_gaudi2");
     return tpc_lib_api::GLUE_SUCCESS;
 }
 
@@ -56,18 +56,20 @@ tpc_lib_api::GlueCodeReturn DeepseekV4BF16IdentityGaudi2::GetGcDefinitions(
         !HasDataType(in->outputTensors[0], DATA_BF16)) {
         return GLUE_INCOMPATIBLE_DATA_TYPE;
     }
-    if (!HasShape2(in->inputTensors[0], kHidden, 1)) {
+    const auto width = v41_ ? in->inputTensors[0].geometry.maxSizes[0] : kHidden;
+    if (width == 0 || width % kVectorWidth || width > 512 * 6 * 5120 ||
+        !HasShape2(in->inputTensors[0], width, 1)) {
         return GLUE_INCOMPATIBLE_INPUT_SIZE;
     }
-    if (!HasShape2(in->outputTensors[0], kHidden, 1)) {
+    if (!HasShape2(in->outputTensors[0], width, 1)) {
         in->outputTensors[0].geometry.dims = 2;
-        in->outputTensors[0].geometry.maxSizes[0] = kHidden;
+        in->outputTensors[0].geometry.maxSizes[0] = width;
         in->outputTensors[0].geometry.maxSizes[1] = 1;
         return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
     }
 
     out->indexSpaceRank = 1;
-    out->indexSpaceGeometry[0] = kHidden / kVectorWidth;
+    out->indexSpaceGeometry[0] = width / kVectorWidth;
     for (unsigned tensor = 0; tensor < 2; ++tensor) {
         auto& pattern = tensor == 0
             ? out->inputTensorAccessPattern[0]

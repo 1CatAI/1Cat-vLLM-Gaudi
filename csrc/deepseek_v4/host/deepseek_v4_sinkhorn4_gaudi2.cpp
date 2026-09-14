@@ -29,7 +29,9 @@ tpc_lib_api::GlueCodeReturn DeepseekV4Sinkhorn4Gaudi2::GetGcDefinitions(
             return GLUE_INCOMPATIBLE_DATA_TYPE;
         }
         if (tensor.geometry.dims != 3 || tensor.geometry.maxSizes[0] != 4 ||
-            tensor.geometry.maxSizes[1] != 4 || tensor.geometry.maxSizes[2] != 1) {
+            tensor.geometry.maxSizes[1] != 4 || tensor.geometry.maxSizes[2] < 1 ||
+            tensor.geometry.maxSizes[2] > 512 ||
+            tensor.geometry.maxSizes[2] != in->inputTensors[0].geometry.maxSizes[2]) {
             return i == 0 ? GLUE_INCOMPATIBLE_INPUT_SIZE : GLUE_INCOMPATIBLE_OUTPUT_SIZE;
         }
         auto& access = i == 0 ? out->inputTensorAccessPattern[0] : out->outputTensorAccessPattern[0];
@@ -41,7 +43,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV4Sinkhorn4Gaudi2::GetGcDefinitions(
         }
     }
     out->indexSpaceRank = 1;
-    out->indexSpaceGeometry[0] = 1;
+    out->indexSpaceGeometry[0] = in->inputTensors[0].geometry.maxSizes[2];
     out->kernel.paramsNr = 0;
     auto* start = &_binary___deepseek_v4_sinkhorn4_gaudi2_o_start;
     auto* end = &_binary___deepseek_v4_sinkhorn4_gaudi2_o_end;

@@ -5,6 +5,18 @@ import torch
 from vllm_gaudi.ops import tp2_prepared_plan as replay
 
 
+def test_static_scalar_detection_rejects_changing_graph_inputs():
+    graph = torch.fx.Graph()
+    source = graph.placeholder("changing_value")
+    static = graph.call_function(torch.ops.aten.scalar_tensor.default, (1e-20,),
+                                 {"dtype": torch.float32, "device": torch.device("cpu")})
+    dynamic = graph.call_function(torch.ops.aten.scalar_tensor.default, (source,))
+    changing_device = graph.call_function(torch.ops.aten.scalar_tensor.default, (1,), {"device": source})
+    assert replay._is_static_scalar(static)
+    assert not replay._is_static_scalar(dynamic)
+    assert not replay._is_static_scalar(changing_device)
+
+
 class Plan:
 
     def __init__(self, key, output):
@@ -114,6 +126,34 @@ def test_invalidation_submits_pending_work_then_releases_generation(runtime):
         replay.invalidate_prepared_group_plans()
         assert runtime == [((1, ), [[1]])]
     assert not plan.valid and not first.plans
+
+
+def test_variant_invalidation_preserves_other_bucket(runtime):
+    import weakref
+    left, right = torch.nn.Identity(), torch.nn.Identity()
+    instance = module(1)
+    other = Plan(2, torch.tensor(2))
+    instance.plans.append(other)
+    instance.plan_owners[:] = [(id(left), 0, 0), (id(right), 0, 0)]
+    instance.signature_keys[:] = [(1,), (2,)]
+    retired = []
+
+    class Graph:
+        def reset_slots(self):
+            retired.append("wait")
+
+        def close(self):
+            retired.append("close")
+
+    first, second = Graph(), Graph()
+    replay._native_graphs.update(left=first, right=second)
+    replay._native_graph_owners.update(left=weakref.ref(left), right=weakref.ref(right))
+    replay.invalidate_prepared_group_plans(owner=left, reason="input_layout:pp_wire")
+    assert retired == ["wait", "close"]
+    assert instance.plans == [other] and other.valid
+    assert instance.plan_owners == [(id(right), 0, 0)]
+    assert instance.signature_keys == [(2,)]
+    assert replay._native_graphs == {"right": second}
 
 
 def test_profiler_recapture_waits_before_retiring_commands_and_preserves_recipes(runtime, monkeypatch):
