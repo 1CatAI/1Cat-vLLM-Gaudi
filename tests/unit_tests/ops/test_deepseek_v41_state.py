@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from vllm_gaudi.ops.deepseek_v41_state import StageStateBlocks, V41StateSpec
+from vllm_gaudi.ops.deepseek_v41_state import PagedStageState, StageStateBlocks, V41StateSpec
 from vllm_gaudi.v1.worker.deepseek_v41_runner import RequestState, greedy_verify
 
 
@@ -193,6 +193,50 @@ def test_scheduler_state_binding_preserves_shared_owner_and_invalidates_addresse
     spec = V41StateSpec(block_size=512, state_shape=(512, 528), state_dtype=torch.uint8)
     with pytest.raises(ValueError, match="cannot be split"):
         spec.copy_with_new_block_size(128)
+
+
+def test_paged_state_reuses_pinned_block_table_and_only_publishes_changes(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda value, *args, **kwargs: value)
+
+    class BlockTable:
+
+        def __init__(self):
+            self.shape = (8, )
+            self.values = torch.empty(self.shape, dtype=torch.int32)
+            self.copies = 0
+
+        def numel(self):
+            return self.values.numel()
+
+        def zero_(self):
+            self.values.zero_()
+
+        def __setitem__(self, index, value):
+            self.values[index] = value
+
+        def copy_(self, source, non_blocking=False):
+            assert non_blocking
+            self.values.copy_(source)
+            self.copies += 1
+
+    program = torch.nn.Module()
+    program.pp_rank, program.generation, program.replay_owner = 0, 0, None
+    program.register_buffer("swa", torch.ones(2, dtype=torch.uint8))
+    cache = SimpleNamespace(ratio=32)
+    program.shared = SimpleNamespace(sources={0: cache}, block_table=BlockTable())
+    state = PagedStageState(program)
+    state.allocate(5, "cpu")
+
+    state.activate("request", [1, 2], reset=True)
+    assert program.shared.block_table.copies == 1
+    assert program.shared.block_table.values.tolist() == [1, 2, 0, 0, 0, 0, 0, 0]
+    state.activate("request", [1, 2])
+    assert program.shared.block_table.copies == 1
+    state.activate("request", [1, 2, 3])
+    assert program.shared.block_table.copies == 2
+    assert program.shared.block_table.values.tolist() == [1, 2, 3, 0, 0, 0, 0, 0]
 
 
 def test_target_capture_does_not_claim_draft_only_state():
