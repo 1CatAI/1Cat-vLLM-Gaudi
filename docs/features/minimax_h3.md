@@ -133,21 +133,32 @@ python tools/minimax_h3/serve_single_hpu.py \
 ```
 
 The default single-card placement applies layerwise staged offload to the text
-encoder and initializes both VAEs on the host. Before prompt and reference
-encoding it moves the selected DiT to the host, then loads that DiT once and
-keeps it resident for the complete denoise loop. After denoising it moves the
-DiT back to the host before loading the audio and video VAEs in turn. This
-first-request transition is required for Ref2VA's 2048-short-edge visual
-conditioning to fit on one Gaudi 2. Every phase transfer is included in request
-wall time. Use `--no-phase-offload` only for a resident-memory comparison. Base
-and dynamic LoRA profiles can also add `--offload-component dit`, although that
-streams the 50 DiT blocks every denoising interval and is much slower. FastH3
-rejects that layerwise DiT mode because fusion must pass through the ordinary
-DiT weight stream; the once-per-phase transfer keeps the fused weights intact.
+encoder and initializes both VAEs on the host. On the first request, after any
+static LoRA has been activated, it creates an immutable pinned CPU master for
+the selected DiT. Prompt and reference encoding run with the DiT on the host;
+the denoise phase loads it once and keeps it resident for every denoising
+forward. After denoising, offload rebinds the parameters to their CPU master and
+releases device storage without copying the immutable weights back from HPU.
+This placement is required for Ref2VA's 2048-short-edge visual conditioning to
+fit on one Gaudi 2. The first CPU snapshot and every later host-to-device load
+remain included in request wall time. Use `--no-phase-offload` only for a
+resident-memory comparison. Base and dynamic LoRA profiles can also add
+`--offload-component dit`, although that streams the 50 DiT blocks every
+denoising interval and is much slower. FastH3 rejects that layerwise DiT mode
+because fusion must pass through the ordinary DiT weight stream; the
+once-per-phase transfer keeps the fused weights intact.
 Extra vLLM arguments go after an explicit `--`.
 Use `--temp-dir` (or `VLLM_GAUDI_H3_TMPDIR`) to keep preprocessing scratch
 files on the data volume. The launcher exports the resolved directory through
 `TMPDIR`, `TMP`, and `TEMP` before the worker starts.
+
+Video decode keeps the checkpoint's native temporal chunks, spatial tile size,
+overlap, and stitching order. On HPU the launcher decodes four independent
+spatial tiles per VAE call and stores decoder Linear parameters in BF16, the
+same dtype selected by HPU autocast. This avoids repeated small launches and
+weight casts while preserving the sequential decoder's output bytes. Use
+`--vae-tile-batch-size 1` to reproduce sequential tile execution, or
+`--no-vae-persist-bf16-weights` to retain FP32 parameter storage.
 
 The launcher also validates `ffmpeg` and `ffprobe` before starting a Ref2VA
 worker. `--media-bin` defaults to `/opt/habanalabs/media/ffmpeg/bin` and is
@@ -360,6 +371,7 @@ All files passed full FFmpeg decoding.
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | FastH3 Dense-DataFree | resident-DiT baseline | 174.01 s | 277.02 s | 256.75 s | 250.48-276.79 s | 96,895 MiB |
 | LightX2V FL2V Turbo 768p | default phase offload | 75.49 s | 278.14 s | 301.03 s | 300.51-302.07 s | 97,421 MiB |
+| LightX2V FL2V Turbo 768p | parameter staging + batched VAE | 74.56 s | 264.46 s | 249.10 s | 246.12-258.94 s | 97,461 MiB |
 
 The placement differs, so the table records usable baselines rather than an
 isolated adapter speed comparison. Start FastH3 with `--no-phase-offload` to
@@ -369,6 +381,51 @@ measured 17.39 s prompt encoding, 236.42 s for the inclusive denoise phase
 (21.58 s DiT load, 193.91 s four-forward schedule and setup, 20.93 s DiT
 offload), 0.21 s audio VAE, 56.83 s video VAE, and 58.18 s inclusive decode and
 MP4 packaging. Profiler synchronization is excluded from the main table.
+
+With parameter staging and the batched VAE enabled, a separate warmed phase
+diagnostic measured 5.51 s prompt encoding, 187.52 s for the inclusive denoise
+phase (2.87 s DiT load, 184.63 s for the four forwards and scheduler work, and
+0.017 s release), 0.21 s audio VAE, 41.14 s video VAE, and 1.01 s for VAE
+transfers plus MP4 completion. The corresponding total was 235.38 s. The formal
+four-request row above includes resource polling and was recorded while other
+modules on the same host were active; the component gate below provides the
+isolated causal measurement.
+
+The HPU VAE policy was selected with a production-shape component gate before
+the end-to-end run. The input latent was `[1, 24, 37, 48, 84]`; both arms
+decoded 124 frames at 1344x768 using the checkpoint's 28 spatial tiles and
+seven temporal chunks. Four-tile batching plus persistent BF16 Linear operands
+reduced synchronized decode time from 53.96 s to 42.90 s (20.5%) while keeping
+the prepared uint8 output byte-identical. Its measured allocator peak was
+25.38 GiB, leaving enough room for the single-card phase placement.
+
+A hardware trace of one decoder call explains the improvement. Moving from one
+tile to four tiles reduced the idle share from 19.45% to 2.86%, raised TPC
+active time from 58.27% to 67.47%, and raised MME active time from 18.96% to
+27.83%. The policy keeps four as the default because larger batches provided
+little latency benefit while increasing peak HBM sharply. Reproduce the
+component sweep and the two trace arms with:
+
+```bash
+HABANA_VISIBLE_MODULES=0 HLS_MODULE_ID=0 PT_HPU_LAZY_MODE=0 \
+python tools/minimax_h3/benchmark_vae_tile_batch.py \
+  /data/models/MiniMax-H3/FL2VA/video_vae \
+  --batch-sizes 1,2,4,7,14,28 \
+  --reference-raw /data/evidence/h3-vae/reference-124f.rgb \
+  --output /data/evidence/h3-vae/tile-batch-sweep.json
+
+HABANA_VISIBLE_MODULES=0 HLS_MODULE_ID=0 PT_HPU_LAZY_MODE=0 \
+python tools/minimax_h3/trace_vae_decoder_batch.py \
+  /data/models/MiniMax-H3/FL2VA/video_vae --batch-size 1 \
+  --reference-npy /data/evidence/h3-vae/first-tile.npy \
+  --output-dir /data/evidence/h3-vae/trace-batch1
+
+HABANA_VISIBLE_MODULES=0 HLS_MODULE_ID=0 PT_HPU_LAZY_MODE=0 \
+python tools/minimax_h3/trace_vae_decoder_batch.py \
+  /data/models/MiniMax-H3/FL2VA/video_vae --batch-size 4 \
+  --reference-npy /data/evidence/h3-vae/first-tile.npy \
+  --output-dir /data/evidence/h3-vae/trace-batch4
+```
 
 The same LightX2V BF16 integrations completed the conditioning workflows below.
 These are functional qualification requests rather than the warmed T2VA

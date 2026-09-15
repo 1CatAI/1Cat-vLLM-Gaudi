@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,7 @@ from vllm_gaudi.omni.minimax_h3 import (
     _h3_phase_offload_enabled,
     _h3_row_parallel_weight_loader,
     _hpu_fused_sdpa,
+    _install_h3_dit_stagers,
     _lightx2v_ref_output_canvas,
     _load_minimax_h3_dit_weights,
     _load_minimax_h3_encoder_weights,
@@ -20,12 +22,19 @@ from vllm_gaudi.omni.minimax_h3 import (
     _minimax_h3_unpatchify_video_tokens_hpu,
     _resolve_h3_encoder_disk_quant_config,
     _select_h3_reference_video_codec,
+    _stage_h3_dit_component,
     _summarize_h3_trace_value,
     _validate_h3_output_short_edge,
     _validate_fasth3_quant_config,
     install_minimax_h3_patches,
     map_minimax_h3_dit_weight,
     map_minimax_h3_encoder_weight,
+)
+from vllm_gaudi.omni.minimax_h3_vae import (
+    _h3_vae_persist_bf16_weights,
+    _h3_vae_tile_batch_size,
+    _install_h3_vae_decode_tile_batching,
+    _materialize_h3_vae_decoder_linear_weights,
 )
 
 
@@ -97,6 +106,132 @@ def test_h3_phase_offload_environment_is_strict(monkeypatch):
     monkeypatch.setenv("VLLM_GAUDI_H3_PHASE_OFFLOAD", "sometimes")
     with pytest.raises(ValueError, match="must be a boolean"):
         _h3_phase_offload_enabled()
+
+
+def test_h3_dit_stager_reuses_immutable_cpu_master(monkeypatch):
+    events = []
+
+    class FakeStager:
+
+        def __init__(self, component, device, *, pin_memory):
+            events.append(("create", component, device, pin_memory))
+
+        def load(self):
+            events.append(("load", ))
+
+        def offload(self):
+            events.append(("offload", ))
+
+    platform = SimpleNamespace(
+        synchronize=lambda: events.append(("synchronize", )),
+        empty_cache=lambda: events.append(("empty_cache", )),
+    )
+    import vllm_omni.diffusion.offloader.module_residency as module_residency
+    import vllm_omni.platforms as omni_platforms
+
+    monkeypatch.setattr(module_residency, "PinnedModuleStager", FakeStager)
+    monkeypatch.setattr(omni_platforms, "current_omni_platform", platform)
+    component = torch.nn.Linear(8, 4)
+    owner = SimpleNamespace(
+        device=torch.device("hpu"),
+        transformer=component,
+        _dit_modules=["transformer"],
+        _stage_durations={},
+        _profiler_lock=threading.Lock(),
+    )
+
+    _install_h3_dit_stagers(owner)
+    component.register_buffer("runtime_cache", torch.ones(1))
+    _install_h3_dit_stagers(owner)
+    _stage_h3_dit_component(owner, component, load=True, metric="load_dit")
+    _stage_h3_dit_component(owner, component, load=False, metric="offload_dit")
+
+    created_groups = [event for event in events if event[0] == "create"]
+    assert len(created_groups) == 1
+    _, parameter_group, device, pin_memory = created_groups[0]
+    assert device == torch.device("hpu")
+    assert pin_memory is True
+    assert tuple(parameter_group.parameters()) == tuple(component.parameters())
+    assert tuple(parameter_group.buffers()) == ()
+    assert events.count(("load", )) == 1
+    assert events.count(("offload", )) == 1
+    assert events.count(("empty_cache", )) == 1
+    assert owner._stage_durations["MiniMaxH3Pipeline.hpu_phase.load_dit"] >= 0
+    assert owner._stage_durations["MiniMaxH3Pipeline.hpu_phase.offload_dit"] >= 0
+
+
+def test_h3_vae_tile_batch_environment_is_strict(monkeypatch):
+    monkeypatch.delenv("VLLM_GAUDI_H3_VAE_TILE_BATCH_SIZE", raising=False)
+    assert _h3_vae_tile_batch_size() == 4
+
+    monkeypatch.setenv("VLLM_GAUDI_H3_VAE_TILE_BATCH_SIZE", "7")
+    assert _h3_vae_tile_batch_size() == 7
+
+    for invalid in ("0", "-1", "auto"):
+        monkeypatch.setenv("VLLM_GAUDI_H3_VAE_TILE_BATCH_SIZE", invalid)
+        with pytest.raises(ValueError, match="positive integer"):
+            _h3_vae_tile_batch_size()
+
+
+def test_h3_vae_persist_bf16_weights_environment_is_strict(monkeypatch):
+    monkeypatch.delenv("VLLM_GAUDI_H3_VAE_PERSIST_BF16_WEIGHTS", raising=False)
+    assert _h3_vae_persist_bf16_weights()
+
+    monkeypatch.setenv("VLLM_GAUDI_H3_VAE_PERSIST_BF16_WEIGHTS", "off")
+    assert not _h3_vae_persist_bf16_weights()
+
+    monkeypatch.setenv("VLLM_GAUDI_H3_VAE_PERSIST_BF16_WEIGHTS", "sometimes")
+    with pytest.raises(ValueError, match="must be a boolean"):
+        _h3_vae_persist_bf16_weights()
+
+
+def test_h3_vae_materializes_only_decoder_linears_in_bf16():
+    decoder = torch.nn.Sequential(
+        torch.nn.Linear(8, 16),
+        torch.nn.LayerNorm(16),
+        torch.nn.Sequential(torch.nn.Linear(16, 8)),
+    )
+
+    assert _materialize_h3_vae_decoder_linear_weights(decoder) == 2
+    assert decoder[0].weight.dtype == torch.bfloat16
+    assert decoder[0].bias.dtype == torch.bfloat16
+    assert decoder[1].weight.dtype == torch.float32
+    assert decoder[2][0].weight.dtype == torch.bfloat16
+
+
+class _FakeTiledVAE(torch.nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.decoder_tiling = True
+        self.stack_tiling = False
+        self.decode_batch_sizes: list[int] = []
+        self.reference_calls = 0
+
+    def decode(self, value):
+        self.decode_batch_sizes.append(int(value.shape[0]))
+        return value + 10
+
+    def _run_tile_tasks(self, tiles, tile_indices, forward_fn, stack_tiling, cls_agg=None):
+        del stack_tiling, cls_agg
+        self.reference_calls += 1
+        return [forward_fn(tiles[index]) for index in tile_indices]
+
+
+def test_h3_vae_decode_tile_batching_preserves_order_and_tail():
+    model = _FakeTiledVAE()
+    tiles = [torch.tensor([[value]]) for value in range(5)]
+
+    assert _install_h3_vae_decode_tile_batching(model, 2)
+    output = model._run_tile_tasks(tiles, list(range(5)), model.decode, False)
+
+    assert model.decode_batch_sizes == [2, 2, 1]
+    assert [int(value.item()) for value in output] == [10, 11, 12, 13, 14]
+    assert model.reference_calls == 0
+
+    passthrough = model._run_tile_tasks(tiles, [1, 3], lambda value: value * 2, False)
+    assert [int(value.item()) for value in passthrough] == [2, 6]
+    assert model.reference_calls == 1
 
 
 def test_h3_trace_summary_keeps_only_tensor_contract():

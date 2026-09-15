@@ -431,6 +431,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="stage VAEs on CPU and offload the DiT between denoise and decode (default: enabled)",
     )
     parser.add_argument(
+        "--vae-tile-batch-size",
+        type=int,
+        default=4,
+        help="number of independent video-VAE spatial tiles decoded together (default: 4)",
+    )
+    parser.add_argument(
+        "--vae-persist-bf16-weights",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="store video-VAE decoder Linear weights in their HPU autocast dtype (default: enabled)",
+    )
+    parser.add_argument(
         "--offload-component",
         action="append",
         choices=("text_encoder", "dit"),
@@ -477,6 +489,8 @@ def main() -> int:
             raise ValueError("LightX2V qualification follows the official BF16 base-plus-LoRA workflow")
     if args.online_fp8 and any(checkpoint_format != "bf16" for checkpoint_format in formats.values()):
         raise ValueError("--online-fp8 accepts only BF16 transformer and text-encoder checkpoints")
+    if args.vae_tile_batch_size <= 0:
+        raise ValueError("--vae-tile-batch-size must be positive")
 
     args.lock_dir.mkdir(parents=True, exist_ok=True)
     lease = _try_lease(args.lock_dir, args.module)
@@ -509,6 +523,8 @@ def main() -> int:
         PT_HPU_LAZY_MODE="0",
         PYTHONUNBUFFERED="1",
         VLLM_GAUDI_H3_PHASE_OFFLOAD="1" if args.phase_offload else "0",
+        VLLM_GAUDI_H3_VAE_TILE_BATCH_SIZE=str(args.vae_tile_batch_size),
+        VLLM_GAUDI_H3_VAE_PERSIST_BF16_WEIGHTS="1" if args.vae_persist_bf16_weights else "0",
     )
     if args.temp_dir is not None:
         environment.update(TMPDIR=str(args.temp_dir), TMP=str(args.temp_dir), TEMP=str(args.temp_dir))
@@ -528,6 +544,8 @@ def main() -> int:
                 "lightx2v_lora": str(args.lightx2v_lora) if args.lightx2v_lora else None,
                 "online_fp8": bool(args.online_fp8),
                 "phase_offload": bool(args.phase_offload),
+                "vae_tile_batch_size": int(args.vae_tile_batch_size),
+                "vae_persist_bf16_weights": bool(args.vae_persist_bf16_weights),
                 "temp_dir": str(args.temp_dir) if args.temp_dir else None,
                 "media_bin": str(args.media_bin),
                 "huggingface_network_disabled": True,

@@ -874,6 +874,108 @@ def _move_h3_phase_component(
         )
 
 
+class _H3ImmutableParameterGroup(nn.Module):
+    """Expose DiT parameters without treating mutable runtime buffers as weights."""
+
+    def __init__(self, parameters: Sequence[nn.Parameter]) -> None:
+        super().__init__()
+        self._staged_parameters = tuple(parameters)
+
+    def parameters(self, recurse: bool = True):
+        del recurse
+        return iter(self._staged_parameters)
+
+    def buffers(self, recurse: bool = True):
+        del recurse
+        return iter(())
+
+
+def _h3_dit_stager_signature(owner: nn.Module) -> tuple[tuple[int, tuple[int, ...]], ...]:
+    signature = []
+    for component_name in getattr(owner, "_dit_modules", ("transformer", )):
+        component = getattr(owner, component_name, None)
+        if not isinstance(component, nn.Module):
+            continue
+        signature.append((id(component), tuple(id(parameter) for parameter in component.parameters())))
+    return tuple(signature)
+
+
+def _install_h3_dit_stagers(owner: nn.Module) -> None:
+    """Keep immutable CPU masters so phase offload never copies DiT weights back."""
+
+    signature = _h3_dit_stager_signature(owner)
+    if signature == getattr(owner, "_vllm_gaudi_h3_dit_stager_signature", None):
+        return
+
+    from vllm_omni.diffusion.offloader.module_residency import PinnedModuleStager
+    from vllm_omni.platforms import current_omni_platform
+
+    started = time.perf_counter()
+    stagers: dict[int, tuple[Any, int]] = {}
+    total_bytes = 0
+    for component_name in getattr(owner, "_dit_modules", ("transformer", )):
+        component = getattr(owner, component_name, None)
+        if not isinstance(component, nn.Module):
+            continue
+        parameters = tuple(component.parameters())
+        byte_count = sum(tensor.numel() * tensor.element_size() for tensor in parameters)
+        stagers[id(component)] = (
+            PinnedModuleStager(_H3ImmutableParameterGroup(parameters), owner.device, pin_memory=True),
+            byte_count,
+        )
+        total_bytes += byte_count
+
+    if not stagers:
+        raise RuntimeError("MiniMax H3 phase offload found no DiT module to stage")
+    owner._vllm_gaudi_h3_dit_stagers = stagers
+    owner._vllm_gaudi_h3_dit_stager_signature = signature
+    current_omni_platform.synchronize()
+    current_omni_platform.empty_cache()
+    duration = time.perf_counter() - started
+    _record_h3_phase_duration(owner, "prepare_dit_stager", duration)
+    logger.info(
+        "MiniMax H3 created %d immutable DiT staging master(s), %.3f GiB, %.3f seconds",
+        len(stagers),
+        total_bytes / (1024**3),
+        duration,
+    )
+
+
+def _stage_h3_dit_component(
+    owner: nn.Module,
+    component: nn.Module,
+    *,
+    load: bool,
+    metric: str,
+) -> None:
+    """Load or release a staged DiT, falling back for partial test pipelines."""
+
+    entry = getattr(owner, "_vllm_gaudi_h3_dit_stagers", {}).get(id(component))
+    if entry is None:
+        device = owner.device if load else torch.device("cpu")
+        _move_h3_phase_component(owner, component, device, metric=metric)
+        return
+
+    from vllm_omni.platforms import current_omni_platform
+
+    stager, byte_count = entry
+    current_omni_platform.synchronize()
+    started = time.perf_counter()
+    if load:
+        stager.load()
+        current_omni_platform.synchronize()
+    else:
+        stager.offload()
+    duration = time.perf_counter() - started
+    _record_h3_phase_duration(owner, metric, duration)
+    logger.info(
+        "MiniMax H3 DiT staging %s: %.3f GiB, %.3f seconds",
+        metric,
+        byte_count / (1024**3),
+        duration,
+    )
+
+
 def _install_h3_phase_offload_hooks() -> None:
     """Keep VAEs on CPU and swap the resident DiT once per request phase."""
 
@@ -952,7 +1054,8 @@ def _install_h3_phase_offload_hooks() -> None:
         # 66 GB transformer, so establish the same CPU-resident state that all
         # later requests inherit after diffuse().
         transformer = self._transformer_for_task(task)
-        _move_h3_phase_component(self, transformer, torch.device("cpu"), metric="offload_dit_for_encode")
+        _install_h3_dit_stagers(self)
+        _stage_h3_dit_component(self, transformer, load=False, metric="offload_dit_for_encode")
         return original_encode_prompt(self, *args, **kwargs)
 
     def diffuse(self: nn.Module, *args: Any, **kwargs: Any):
@@ -960,11 +1063,11 @@ def _install_h3_phase_offload_hooks() -> None:
         if task is None:
             raise TypeError("MiniMax H3 phase-offloaded diffuse requires task as a keyword")
         transformer = self._transformer_for_task(task)
-        _move_h3_phase_component(self, transformer, self.device, metric="load_dit")
+        _stage_h3_dit_component(self, transformer, load=True, metric="load_dit")
         try:
             return original_diffuse(self, *args, **kwargs)
         finally:
-            _move_h3_phase_component(self, transformer, torch.device("cpu"), metric="offload_dit")
+            _stage_h3_dit_component(self, transformer, load=False, metric="offload_dit")
 
     video_vae_class.__init__ = video_vae_init
     audio_vae_class.__init__ = audio_vae_init
@@ -1376,6 +1479,9 @@ def install_minimax_h3_patches() -> None:
     _install_h3_reference_video_transcode_hook()
     _install_fasth3_hooks()
     _install_h3_layout_and_noise_hooks()
+    from vllm_gaudi.omni.minimax_h3_vae import install_h3_vae_patches
+
+    install_h3_vae_patches()
     _install_h3_phase_offload_hooks()
     _install_h3_trajectory_debug_hook()
     _install_h3_dit_trace_hook()

@@ -542,6 +542,23 @@ def test_single_hpu_launcher_resolves_data_volume_temp_dir(tmp_path, monkeypatch
     assert explicit.temp_dir == tmp_path / "explicit"
 
 
+def test_single_hpu_launcher_configures_bounded_vae_tile_batching():
+    default = serve_single_hpu._parse_args(["/models/h3", "--partition", "FL2VA"])
+    explicit = serve_single_hpu._parse_args([
+        "/models/h3",
+        "--partition",
+        "FL2VA",
+        "--vae-tile-batch-size",
+        "7",
+        "--no-vae-persist-bf16-weights",
+    ])
+
+    assert default.vae_tile_batch_size == 4
+    assert default.vae_persist_bf16_weights is True
+    assert explicit.vae_tile_batch_size == 7
+    assert explicit.vae_persist_bf16_weights is False
+
+
 def test_single_hpu_launcher_prepends_media_tools(tmp_path):
     media_bin = tmp_path / "habana-media"
     media_bin.mkdir()

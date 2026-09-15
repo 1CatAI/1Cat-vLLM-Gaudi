@@ -49,6 +49,8 @@ are in progress.
 | `VLLM_PROMPT_BS_BUCKET_MAX`  | Sets prefill batch size | `1` |
 | `VLLM_MULTIMODAL_BUCKETS`    | Overrides the per-model patch-count buckets used to warm up native-resolution vision towers (models where `is_batch_based=False`, e.g. Gemma4, Kimi-K2.5/K2.6, Qwen2.5/3/3.5-VL). Comma-separated list of integers. Set to `None` to disable bucketing for these models. | model-specific |
 | `VLLM_MULTIMODAL_RESOLUTIONS` | Pins explicit raw pixel resolutions (comma-separated, e.g. `1024x768,768x1024`) to warm up for native-resolution vision towers. Each entry is `WxH`, `WxHxN` (pin the count-`N` graph), or `WxHxN-M` (warm the item-count range `[N, M]`); `WxH` alone warms one graph at the `--limit-mm-per-prompt` ceiling. See [Warm-up](../features/warmup.md#multimodal-warm-up). | `None` |
+| `VLLM_GAUDI_H3_VAE_TILE_BATCH_SIZE` | Number of independent MiniMax H3 video-VAE spatial tiles decoded together. Use `1` for sequential tile execution. | `4` |
+| `VLLM_GAUDI_H3_VAE_PERSIST_BF16_WEIGHTS` | Stores MiniMax H3 video-VAE decoder Linear weights in BF16, matching HPU autocast while avoiding repeated weight casts. | `true` |
 | `VLLM_MINIMAX_M3_MOE_TOKEN_TILE` | Maximum number of tokens processed per tile by the MiniMax-M3 dense SwiGLU-OAI expert path. Non-positive values disable tiling. | `512` |
 | `VLLM_MINIMAX_M3_MOE_DECODE_GATHER` | Enables the MiniMax-M3 routed-expert gather path for low-token decode. Set to `0` or `false` to use the dense expert path. | `true` |
 | `VLLM_MINIMAX_M3_MOE_GATHER_MAX_TOKENS` | Maximum token count for the MiniMax-M3 routed-expert gather path. Larger batches use the dense expert path. | `16` |
