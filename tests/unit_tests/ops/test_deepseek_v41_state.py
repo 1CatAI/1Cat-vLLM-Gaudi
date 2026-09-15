@@ -452,6 +452,23 @@ def test_all_prefill_tails_across_five_groups_use_bounded_compile_cache(monkeypa
         torch._dynamo.reset()
 
 
+def test_long_prefill_can_reduce_compiled_layer_lifetime(monkeypatch):
+    from types import SimpleNamespace
+    from vllm_gaudi.models import deepseek_v41_program as program
+
+    stage = SimpleNamespace(layers=torch.nn.ModuleList(torch.nn.Identity() for _ in range(20)),
+                            pp_rank=0,
+                            config={"text_config": {
+                                "rms_norm_eps": 1e-20
+                            }})
+    monkeypatch.setattr(program, "_compile_group", lambda group, **_: group)
+    run = program.CompiledStage(stage, group_size=2)
+    assert len(run.groups) == 10
+    assert all(len(group.layers) == 2 for group in run.groups)
+    with pytest.raises(ValueError, match="group size"):
+        program.CompiledStage(stage, group_size=3)
+
+
 def test_decoded_kv_state_capture_clear_and_block_rebinding():
     from vllm_gaudi.ops.deepseek_v41_replay import stage_state_tensors
     program = torch.nn.Module()

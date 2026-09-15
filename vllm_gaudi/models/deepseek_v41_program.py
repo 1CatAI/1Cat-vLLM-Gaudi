@@ -732,7 +732,14 @@ def _compile_group(group, *, native, backend="hpu_backend"):
 
 class CompiledStage:
 
-    def __init__(self, stage, *, native=False, pp_wire_input=False, fused_text_io=False, native_input=False):
+    def __init__(self,
+                 stage,
+                 *,
+                 native=False,
+                 pp_wire_input=False,
+                 fused_text_io=False,
+                 native_input=False,
+                 group_size=4):
         legacy_fp8 = getattr(stage, "fp8_decode", False) and not getattr(stage, "expert_n256", False)
         if native_input and (not native or stage.pp_rank != 0 or stage.dspark or legacy_fp8):
             raise ValueError("Native input capture requires ordinary BF16 PP0 decode")
@@ -744,14 +751,16 @@ class CompiledStage:
                 raise ValueError("TP/mHC overlap requires BF16 boundaries and a qualified C1 expert layout")
             from vllm_gaudi.compilation.deepseek_v41_overlap import make_backend
             backend = make_backend()
+        if group_size < 1 or len(stage.layers) % group_size:
+            raise ValueError(f"Invalid V4.1 compiled layer group size {group_size} for {len(stage.layers)} layers")
         self.groups = tuple(
             PreparedLayerGroup(stage,
                                start,
-                               start + 4,
+                               start + group_size,
                                pp_wire_input=pp_wire_input,
                                fused_text_io=fused_text_io,
                                fp8_decode=native and stage.fp8_decode)
-            for start in range(0, 20, 4))
+            for start in range(0, len(stage.layers), group_size))
         if native_input:
             self.groups[0].native_input = PreparedInput(stage.weights.embed, stage.tp_rank, stage.reduce)
         self.chunks = tuple(_compile_group(group, native=native, backend=backend) for group in self.groups)
