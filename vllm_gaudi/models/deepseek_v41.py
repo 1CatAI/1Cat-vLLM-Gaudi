@@ -190,7 +190,12 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                                                         image_mask,
                                                         defer_wait=True,
                                                         device_layer1=device_layer1)
-            if (envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and is_decode
+            # Native C1 replay consumes the fixed device layer-1 buffer.  For
+            # decode it is normally produced directly from the sampled device
+            # token; a C1 prompt transaction instead stages the exact host
+            # lookup into that same buffer before replay.  Sampling remains
+            # disabled until the full prompt has been committed by the runner.
+            if (envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and self.step_use_replay
                     and self.engram_host.device_pending is None):
                 self.engram_host.stage_device_c1_reference(request_id, self.step_ticket.buffers[0])
 

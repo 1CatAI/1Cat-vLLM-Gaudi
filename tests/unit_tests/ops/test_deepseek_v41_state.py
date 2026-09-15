@@ -74,15 +74,17 @@ def test_single_token_prefill_keeps_disjoint_transport_buffers(monkeypatch):
     buffers.complete_packet()
 
 
-def test_direct_token_binding_consumes_updates_and_rejects_foreign_request_prefix():
+def test_native_c1_binding_consumes_prompt_updates_and_rejects_foreign_request_prefix():
     from types import SimpleNamespace
     from vllm_gaudi.v1.worker.deepseek_v41_runner import V41ModelRunner
     consumed = []
+    prepared = []
 
     class Model:
+        native = True
 
         def prepare_step(self, *args, **kwargs):
-            pass
+            prepared.append(kwargs)
 
         def __call__(self, ids, positions, **kwargs):
             consumed.append((ids.clone(), ids.dtype))
@@ -105,7 +107,8 @@ def test_direct_token_binding_consumes_updates_and_rejects_foreign_request_prefi
     runner._forward("b", [7], 0, decode=False)
     runner._forward("a", [55], 8, decode=True)
     assert [item[0].item() for item in consumed] == [42, 43, 7, 55]
-    assert [item[1] for item in consumed] == [torch.int32, torch.int32, torch.int64, torch.int32]
+    assert [item[1] for item in consumed] == [torch.int32] * 4
+    assert prepared[2]["is_decode"] and prepared[2]["use_replay"]
 
 
 def test_position_bank_reuses_one_allocation_across_request_resets_and_prefill_tails():

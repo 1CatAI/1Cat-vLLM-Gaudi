@@ -951,9 +951,17 @@ class V41ModelRunner:
     def _forward(self, request_id, tokens, start, *, decode, reset=False, request=None):
         count = len(tokens)
         ids, positions = self.input_views[count], self.position_views[count]
-        if self.direct_token_ids and decode:
+        # A scheduler may feed a normal prompt one token at a time.  The
+        # resulting model transaction has exactly the same C1 tensor geometry
+        # and cache writes as decode; only sampling/commit semantics remain
+        # prefill semantics.  Bind that token to the captured C1 input tensor
+        # instead of compiling an unqualified ordinary C1 stage on the first
+        # public chat request.
+        c1_replay = (getattr(self.model, "native", False) and count == 1 and start + count <= 1024)
+        graph_c1 = decode or c1_replay
+        if self.direct_token_ids and graph_c1:
             if count != 1:
-                raise ValueError("Direct V4.1 token binding requires ordinary C1 decode")
+                raise ValueError("Direct V4.1 token binding requires a C1 transaction")
             ids = self.decode_ids
         program = getattr(self.model, "program", None)
         if program is not None and program.length > 512:
@@ -989,7 +997,7 @@ class V41ModelRunner:
                     ids.copy_(self._next_input[2])
             else:
                 ids.copy_(torch.tensor(tokens, dtype=ids.dtype, device="cpu"))
-            if self.position_bank is not None and decode:
+            if self.position_bank is not None and graph_c1:
                 positions = self.position_bank.view(start, count)
             else:
                 positions.copy_(torch.arange(start, start + count, dtype=torch.int32, device="cpu"))
@@ -997,8 +1005,8 @@ class V41ModelRunner:
         # Choose the qualified submission path before any request state write.
         # Longer CSA2 buckets use compiled recipes until native capture is qualified.
         use_replay = (getattr(self.model, "native", False) and start + count <= 1024
-                      and (decode or (self.use_dspark and request is not None)))
-        self.model.prepare_step(request_id, tokens, is_decode=decode, reset=reset, use_replay=use_replay)
+                      and (decode or c1_replay or (self.use_dspark and request is not None)))
+        self.model.prepare_step(request_id, tokens, is_decode=graph_c1, reset=reset, use_replay=use_replay)
         self._round_phase("engram_prepared_ns")
         timing = getattr(self, "verify_timing", None)
         if self.pp.group.is_first_rank:
@@ -1009,11 +1017,11 @@ class V41ModelRunner:
             self._round_phase("stage_submitted_ns")
             if timing:
                 timing.device("stage_target_done")
-            self.pp.exchange(value, count, decode=decode)
+            self.pp.exchange(value, count, decode=graph_c1)
             self._round_phase("pp_exchanged_ns")
             output = None
         else:
-            value = self.pp.exchange(None, count, native_wire=use_replay and self.use_dspark, decode=decode)
+            value = self.pp.exchange(None, count, native_wire=use_replay and self.use_dspark, decode=graph_c1)
             self._round_phase("pp_exchanged_ns")
             if timing:
                 timing.device("stage_model_start")
