@@ -204,6 +204,7 @@ def test_paged_state_reuses_pinned_block_table_and_only_publishes_changes(monkey
 
         def __init__(self):
             self.shape = (8, )
+            self.device = torch.device("cpu")
             self.values = torch.empty(self.shape, dtype=torch.int32)
             self.copies = 0
 
@@ -231,12 +232,15 @@ def test_paged_state_reuses_pinned_block_table_and_only_publishes_changes(monkey
 
     state.activate("request", [1, 2], reset=True)
     assert program.shared.block_table.copies == 1
-    assert program.shared.block_table.values.tolist() == [1, 2, 0, 0, 0, 0, 0, 0]
+    assert program.shared.block_table.values.tolist() == [1, 2, 3, 4, 5, 6, 7, 8]
     state.activate("request", [1, 2])
     assert program.shared.block_table.copies == 1
-    state.activate("request", [1, 2, 3])
+    state.activate("request", [2, 3, 4])
     assert program.shared.block_table.copies == 2
-    assert program.shared.block_table.values.tolist() == [1, 2, 3, 0, 0, 0, 0, 0]
+    assert program.shared.block_table.values.tolist() == [2, 3, 4, 0, 0, 0, 0, 0]
+    state.activate("request", [1, 2, 3])
+    assert program.shared.block_table.copies == 3
+    assert program.shared.block_table.values.tolist() == [1, 2, 3, 4, 5, 6, 7, 8]
 
 
 def test_target_capture_does_not_claim_draft_only_state():

@@ -150,6 +150,7 @@ request. Compressed history stays in its scheduler-owned HPU pages.
                                             device="cpu").pin_memory("hpu")
         self.block_table_host_values = self.block_table_host.numpy()
         self.published_block_ids = None
+        self.identity_block_table_resident = False
 
     def allocate(self, blocks, device):
         if blocks < 2:
@@ -168,22 +169,40 @@ request. Compressed history stays in its scheduler-owned HPU pages.
         del block
         for key, (module, name) in self.bindings.items():
             setattr(module, name, self.allocations[key].flatten(0, 1))
-        self.program.shared.block_table.zero_()
-        self.program.shared.block_table[0] = min(1, self.blocks - 1)
+        # With max_num_seqs=1 the scheduler hands the sole request the first
+        # N physical pages.  Install that complete mapping before any recipe
+        # captures the destination.  Every growing prefix can then be consumed
+        # without mutating a graph-owned tensor at request time.
+        values = self.block_table_host_values
+        values[:] = range(1, len(values) + 1)
+        self.program.shared.block_table.copy_(self.block_table_host, non_blocking=True)
         self.published_block_ids = None
+        self.identity_block_table_resident = True
         self.program.generation += 1
 
     def _publish_block_table(self, block_ids):
         block_ids = tuple(block_ids)
         if block_ids == self.published_block_ids:
             return
+        identity = all(block == index for index, block in enumerate(block_ids, 1))
+        if identity and self.identity_block_table_resident:
+            self.published_block_ids = block_ids
+            return
         values = self.block_table_host_values
-        values.fill(0)
-        values[:len(block_ids)] = block_ids
+        if identity:
+            values[:] = range(1, len(values) + 1)
+        else:
+            values.fill(0)
+            values[:len(block_ids)] = block_ids
         # Pinned source plus a persistent destination gives Synapse a true
-        # asynchronous DMA and requires no per-request device allocation.
+        # asynchronous DMA and requires no per-request device allocation.  A
+        # non-identity remap is rare with single-request serving; wait for the
+        # prior captured consumer before mutating its persistent input.
+        if self.program.shared.block_table.device.type == "hpu":
+            torch.hpu.synchronize()
         self.program.shared.block_table.copy_(self.block_table_host, non_blocking=True)
         self.published_block_ids = block_ids
+        self.identity_block_table_resident = identity
 
     def activate(self, request_id, block_ids, *, reset=False):
         if not block_ids or any(not 0 < block < self.blocks for block in block_ids):
