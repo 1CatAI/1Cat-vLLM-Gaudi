@@ -63,3 +63,27 @@ def test_complete_projection_changing_inputs():
     assert not torch.equal(outputs[0], outputs[1])
     with pytest.raises(RuntimeError, match="Q projection requires"):
         fn(x.expand(2, -1).contiguous(), w, sw, pos, table)
+
+
+def test_epilogue_accepts_positions_across_full_model_window():
+    fn = torch.compile(torch.ops.custom_op.custom_deepseek_v41_q_scale_rope_gaudi2,
+                       backend="hpu_backend", fullgraph=True, dynamic=False)
+    reference = torch.compile(torch.ops.custom_op.custom_deepseek_v41_rope_bf16_gaudi2,
+                              backend="hpu_backend", fullgraph=True, dynamic=False)
+    torch.manual_seed(1048576)
+    product_cpu = torch.randn(1, 16384)
+    weight_cpu = 2. ** ((torch.arange(16384).reshape(1, -1) % 9).float() - 4.)
+    activation_cpu = torch.tensor([[.125]])
+    table_cpu = torch.zeros(1048576, 64)
+    for position, phase in ((0, 0.), (511, .1), (512, .2),
+                            (4096, .3), (1048575, .4)):
+        angles = torch.arange(32).float() * phase
+        table_cpu[position] = torch.cat((angles.cos(), angles.sin()))
+    product, weight = product_cpu.to("hpu"), weight_cpu.to("hpu")
+    activation, table = activation_cpu.to("hpu"), table_cpu.to("hpu")
+    pos = torch.tensor([0], dtype=torch.int32, device="hpu")
+    rounded = (product_cpu * weight_cpu * activation_cpu).bfloat16().reshape(1, 32, 512).to("hpu")
+    for position in (0, 511, 512, 4096, 1048575):
+        pos.copy_(torch.tensor([position], dtype=torch.int32, device="hpu"))
+        assert torch.equal(fn(product, weight, activation, pos, table).cpu(),
+                           reference(rounded, pos, table).cpu().reshape(1, -1))

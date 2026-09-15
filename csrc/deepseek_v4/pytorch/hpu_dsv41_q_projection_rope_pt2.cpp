@@ -29,8 +29,9 @@ habana::OutputMetaDataVector meta(const at::Stack& stack, bool epilogue) {
     }
     const auto pos = stack.at(3).toTensor(), table = stack.at(4).toTensor();
     TORCH_CHECK(pos.scalar_type() == at::kInt && pos.sizes() == at::IntArrayRef({1}) &&
-                table.scalar_type() == at::kFloat && table.sizes() == at::IntArrayRef({512,64}),
-                "Q RoPE requires I32 position [1] and F32 cos/sin [512,64]");
+                table.scalar_type() == at::kFloat && table.dim() == 2 && table.size(0) > 0 &&
+                table.size(0) <= 1048576 && table.size(1) == 64,
+                "Q RoPE requires I32 position [1] and F32 cos/sin [1..1048576,64]");
     return {{at::kBFloat16, {1,16384}}};
 }
 class Projection final : public habana::OpBackend {
