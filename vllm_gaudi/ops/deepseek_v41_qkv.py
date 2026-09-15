@@ -6,6 +6,26 @@ import torch.nn.functional as F
 from vllm_gaudi.ops.deepseek_v41_math import quantize_activation
 
 
+def concatenate_static_weights(*weights):
+    """Join immutable matrices without leaving a concat in an HPU recipe.
+
+    These weights are prepared once while the model is loading.  On HPU the
+    ordinary ``torch.cat`` is nevertheless submitted through the graph
+    compiler, where the V2 segmented runtime can retain it until the first
+    unrelated graph is compiled.  Materializing the small, immutable join on
+    the host and uploading it once keeps that startup operation out of every
+    captured decode graph and preserves the source FP32 bytes exactly.
+    """
+    if not weights:
+        raise ValueError("At least one static weight is required")
+    device = weights[0].device
+    if any(weight.device != device for weight in weights):
+        raise ValueError("Static projection weights must share a device")
+    if device.type == "hpu":
+        return torch.cat(tuple(weight.cpu() for weight in weights), dim=0).to(device)
+    return torch.cat(weights, dim=0)
+
+
 class FusedQKVInput:
 
     def prepare_qkv_input_weight(self):
@@ -74,7 +94,7 @@ class FusedCompressorInput:
             raise ValueError("V4.1 ratio-2 Compressor fusion requires FP32 weights")
         if getattr(compressor.wkv, "bias", None) is not None or getattr(compressor.wgate, "bias", None) is not None:
             raise ValueError("V4.1 ratio-2 Compressor fusion does not support projection bias")
-        fused = torch.cat((kv_weight, gate_weight), dim=0).contiguous()
+        fused = concatenate_static_weights(kv_weight, gate_weight).contiguous()
         self.register_buffer("fused_compressor_wkv_wgate", fused, False)
         self._fused_compressor_kv_width = kv_weight.shape[0]
         compressor.wkv.weight = self.fused_compressor_wkv_wgate[:kv_weight.shape[0]]

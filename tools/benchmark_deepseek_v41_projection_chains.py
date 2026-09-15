@@ -23,6 +23,7 @@ from vllm_gaudi.ops.deepseek_v41_shard_loader import PreparedV41Shard  # noqa: E
 from vllm_gaudi.ops.deepseek_v41_woa_fp8 import WoaFP8Sidecar  # noqa: E402
 from vllm_gaudi.ops.deepseek_v41_sampling import local_greedy_candidate  # noqa: E402
 from vllm_gaudi.ops.deepseek_v41_math import rms_norm  # noqa: E402
+from vllm_gaudi.ops.deepseek_v41_qkv import concatenate_static_weights  # noqa: E402
 
 
 def summarize(values):
@@ -327,7 +328,7 @@ def main():
                 index_norm = shard.tensor(prefix + "indexer.k_norm.weight", "hpu")
                 previous_kv = torch.randn(1, wkv.shape[0], dtype=torch.float32, device="hpu")
                 previous_score = torch.randn_like(previous_kv)
-                fused = torch.cat((wkv, wgate), dim=0).contiguous()
+                fused = concatenate_static_weights(wkv, wgate).contiguous()
                 common = (previous_kv, previous_score, norm, index_weight, index_norm)
                 old.append((wkv, wgate, *common))
                 new.append((fused, *common))

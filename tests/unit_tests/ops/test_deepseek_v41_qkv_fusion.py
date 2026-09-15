@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 from vllm_gaudi.ops.deepseek_v41_attention import CSA2Attention
 from vllm_gaudi.ops.deepseek_v41_math import quantize_activation
-from vllm_gaudi.ops.deepseek_v41_qkv import FusedCompressorInput
+from vllm_gaudi.ops.deepseek_v41_qkv import FusedCompressorInput, concatenate_static_weights
 
 
 def _matrix(rows, cols, seed):
@@ -156,3 +156,11 @@ def test_fused_compressor_skips_non_owner_and_invalidates_for_reload():
     projection.invalidate_compressor_input_weight()
     assert projection._fused_compressor_weight is None
     assert "fused_compressor_wkv_wgate" not in projection._buffers
+
+
+def test_static_weight_concatenation_preserves_source_bytes():
+    first = torch.randn(3, 5, generator=torch.Generator().manual_seed(504))
+    second = torch.randn(2, 5, generator=torch.Generator().manual_seed(505))
+    fused = concatenate_static_weights(first, second)
+    assert torch.equal(fused[:3], first)
+    assert torch.equal(fused[3:], second)
