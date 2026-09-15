@@ -433,8 +433,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--vae-tile-batch-size",
         type=int,
-        default=4,
-        help="number of independent video-VAE spatial tiles decoded together (default: 4)",
+        help=("number of independent video-VAE spatial tiles decoded together "
+              "(default: 28 with phase offload and FusedSDPA, otherwise 4)"),
     )
     parser.add_argument(
         "--vae-persist-bf16-weights",
@@ -482,6 +482,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(own_args)
     args.vllm_args = vllm_args
     args.offload_component = args.offload_component or ["text_encoder"]
+    if args.vae_tile_batch_size is None:
+        args.vae_tile_batch_size = 28 if args.phase_offload and args.vae_fused_sdpa else 4
     return args
 
 

@@ -544,6 +544,8 @@ def test_single_hpu_launcher_resolves_data_volume_temp_dir(tmp_path, monkeypatch
 
 def test_single_hpu_launcher_configures_bounded_vae_tile_batching():
     default = serve_single_hpu._parse_args(["/models/h3", "--partition", "FL2VA"])
+    resident = serve_single_hpu._parse_args(["/models/h3", "--partition", "FL2VA", "--no-phase-offload"])
+    unfused = serve_single_hpu._parse_args(["/models/h3", "--partition", "FL2VA", "--no-vae-fused-sdpa"])
     explicit = serve_single_hpu._parse_args([
         "/models/h3",
         "--partition",
@@ -553,9 +555,11 @@ def test_single_hpu_launcher_configures_bounded_vae_tile_batching():
         "--no-vae-persist-bf16-weights",
     ])
 
-    assert default.vae_tile_batch_size == 4
+    assert default.vae_tile_batch_size == 28
     assert default.vae_persist_bf16_weights is True
     assert default.vae_fused_sdpa is True
+    assert resident.vae_tile_batch_size == 4
+    assert unfused.vae_tile_batch_size == 4
     assert explicit.vae_tile_batch_size == 7
     assert explicit.vae_persist_bf16_weights is False
 

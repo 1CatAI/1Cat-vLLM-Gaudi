@@ -153,10 +153,12 @@ files on the data volume. The launcher exports the resolved directory through
 `TMPDIR`, `TMP`, and `TEMP` before the worker starts.
 
 Video decode keeps the checkpoint's native temporal chunks, spatial tile size,
-overlap, and stitching order. On HPU the launcher decodes four independent
-spatial tiles per VAE call and stores decoder Linear parameters in BF16, the
-same dtype selected by HPU autocast. This avoids repeated small launches and
-weight casts while preserving the sequential decoder's output bytes. Use
+overlap, and stitching order. With phase offload and FusedSDPA, the launcher
+decodes all 28 independent spatial tiles per VAE call. It selects four when
+either condition is disabled, keeping the resident-DiT and checkpoint-SDPA
+paths within their qualified memory bound. Decoder Linear parameters use BF16,
+the same dtype selected by HPU autocast. This avoids repeated small launches
+and weight casts while preserving each path's prepared output. Use
 `--vae-tile-batch-size 1` to reproduce sequential tile execution, or
 `--no-vae-persist-bf16-weights` to retain FP32 parameter storage.
 
@@ -438,6 +440,10 @@ checkpoint-SDPA output, the prepared 124-frame video measured 51.94 dB PSNR;
 the minimum per-frame SSIM was 0.99967 and temporal-motion magnitude changed by
 0.003%. Two candidate decodes produced the same output SHA256. Normal softmax
 mode is retained because the faster approximation failed the numerical gate.
+With FusedSDPA's bounded-memory attention active, batching all 28 spatial tiles
+measured 18.47 seconds and a 52.68 GiB allocator peak, with the same candidate
+output SHA256. The launcher selects this only when phase offload has already
+released the DiT before VAE decode.
 
 A hardware trace of one decoder call explains the improvement. Moving from one
 tile to four tiles reduced the idle share from 19.45% to 2.86%, raised TPC
