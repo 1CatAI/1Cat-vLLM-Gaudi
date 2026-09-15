@@ -13,6 +13,60 @@ from vllm_gaudi.ops.deepseek_v41_fp8 import channel_scales, precision_config
 from vllm_gaudi.ops.deepseek_v41_weights import prepare_q16, prepare_s16
 
 
+def test_n256_fused_finalize_is_c1_only(monkeypatch):
+    from vllm_gaudi import envs
+
+    flags = {
+        "VLLM_HPU_DSV41_ROUTER_TOP6": True,
+        "VLLM_HPU_DSV41_EXPERT_K128": False,
+        "VLLM_HPU_DSV41_EXPERT_N256": False,
+        "VLLM_HPU_DSV41_EXPERT_N256_FP8": True,
+        "VLLM_HPU_DSV41_EXPERT_FUSED_QUANT": True,
+        "VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE": True,
+        "VLLM_HPU_DSV41_BF16_ROUTER_GATE": False,
+        "VLLM_HPU_DSV41_SHARED_GATE_UP": False,
+        "VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE": False,
+        "VLLM_HPU_DSV41_FP8_DECODE": False,
+    }
+    for name, value in flags.items():
+        monkeypatch.setattr(envs, name, value)
+
+    calls = []
+
+    def select(scores, *_args):
+        tokens = scores.shape[0]
+        return torch.zeros(tokens, 6, dtype=torch.int32), torch.ones(tokens, 6)
+
+    def expert(kind):
+        def run(value, *_args):
+            calls.append((kind, value.shape[0]))
+            return torch.zeros_like(value)
+        return run
+
+    monkeypatch.setattr(
+        torch.ops, "custom_op",
+        SimpleNamespace(custom_deepseek_v41_router_top6_gaudi2=select,
+                        custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2=expert("finalize"),
+                        custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2=expert("body")))
+    experts = SimpleNamespace(w13_q16=None,
+                              w2_q16=None,
+                              w13_s16=None,
+                              w2_s16=None,
+                              w13_channel=None,
+                              w2_channel=None)
+    weights = SimpleNamespace(gate=SimpleNamespace(weight=torch.zeros(384, 8),
+                                                   bias=torch.zeros(384),
+                                                   bias_vl=torch.zeros(384)),
+                              experts=experts,
+                              shared_experts=SimpleNamespace())
+    moe = PreparedMoE(weights, 6, True, torch.zeros(128), lambda value: value)
+    moe.shared_expert = lambda value: torch.zeros_like(value)
+    for tokens in (1, 6):
+        value = torch.zeros(tokens, 8, dtype=torch.bfloat16)
+        assert torch.equal(moe(value, torch.zeros(tokens, dtype=torch.bool), fp8_decode=True), value)
+    assert calls == [("finalize", 1), ("body", 6)]
+
+
 def test_fp8_experts_only_run_for_enabled_native_c1(monkeypatch):
     calls = []
 

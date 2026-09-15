@@ -275,8 +275,11 @@ class PreparedMoE(nn.Module):
             if self.n256_fp8 and fp8_decode:
                 if not 1 <= value.shape[0] <= 6:
                     raise ValueError("N256 FP8 native decode requires C1-C6")
+                # The finalize kernel owns a C1-only ordered top-6 reduction.
+                # C2-C6 prompt/verify batches retain the same fused FP8 expert
+                # body and use the established reduction outside that kernel.
                 op = (torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2
-                      if self.n256_fused_reduce else
+                      if self.n256_fused_reduce and value.shape[0] == 1 else
                       torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2
                       if self.n256_fused else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fp8_gaudi2)
                 output = op(*operands, experts.w13_channel, experts.w2_channel, self.normal_scales)
