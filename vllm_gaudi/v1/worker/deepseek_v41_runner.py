@@ -40,6 +40,7 @@ logger = init_logger()
 VERIFY_METADATA_SIZE = 7
 VERIFY_PROPOSED_SIZE = 5
 VERIFY_CONTROL_SIZE = VERIFY_METADATA_SIZE + VERIFY_PROPOSED_SIZE
+PREFILL_BLOCK_TOKENS = 128
 
 
 def profile_phase(name):
@@ -102,11 +103,19 @@ def greedy_verify(target_ids, proposed_ids):
     return target_ids[:accepted + 1], accepted
 
 
-def target_chunks(tokens):
-    """Cover real inputs with the warmed C6/C1 shapes, without fake tokens."""
+def target_chunks(tokens, block_tokens=PREFILL_BLOCK_TOKENS):
+    """Cover a scheduler prefill transaction with bounded device blocks.
+
+    ``max_num_batched_tokens`` remains the scheduler admission limit.  This
+    internal tiling only bounds the per-stage working set; C6 is reserved for
+    DSpark anchor-plus-draft execution and is never used as an ordinary
+    prefill geometry.
+    """
+    if block_tokens < 1 or block_tokens > PREFILL_BLOCK_TOKENS:
+        raise ValueError("V4.1 prefill blocks must be no larger than 128")
     offset = 0
     while offset < len(tokens):
-        size = 6 if len(tokens) - offset >= 6 else 1
+        size = min(block_tokens, len(tokens) - offset)
         yield offset, tokens[offset:offset + size]
         offset += size
 
@@ -674,18 +683,19 @@ class V41ModelRunner:
         self.model_memory_usage = self.mem_margin = 0
         self.serving_workspace_reserve = (3 << 30) if self.model_config.max_model_len > 512 else 0
         self.pp = PPBuffers(self.device,
+                            capacity=PREFILL_BLOCK_TOKENS,
                             dspark=self.use_dspark,
                             device_commit=False if self.v2_completion else None)
-        self.input_ids = torch.empty(6, dtype=torch.int64, device=self.device)
-        self.positions = torch.empty(6, dtype=torch.int32, device=self.device)
-        self.input_views = {count: self.input_ids[:count] for count in range(1, 7)}
-        self.position_views = {count: self.positions[:count] for count in range(1, 7)}
+        self.input_ids = torch.empty(PREFILL_BLOCK_TOKENS, dtype=torch.int64, device=self.device)
+        self.positions = torch.empty(PREFILL_BLOCK_TOKENS, dtype=torch.int32, device=self.device)
+        self.input_views = {count: self.input_ids[:count] for count in range(1, PREFILL_BLOCK_TOKENS + 1)}
+        self.position_views = {count: self.positions[:count] for count in range(1, PREFILL_BLOCK_TOKENS + 1)}
         self.direct_token_ids = (envs.VLLM_HPU_DSV41_DIRECT_TOKEN_IDS and not self.use_dspark)
         self.decode_ids = (torch.empty(1, dtype=torch.int32, device=self.device) if self.direct_token_ids else None)
         self.position_bank = None
         if envs.VLLM_HPU_DSV41_FIXED_POSITIONS and not self.use_dspark:
             from vllm_gaudi.ops.deepseek_v41_inputs import PositionBank
-            self.position_bank = PositionBank(self.model_config.max_model_len, 6, self.device)
+            self.position_bank = PositionBank(self.model_config.max_model_len, PREFILL_BLOCK_TOKENS, self.device)
         self.input_staging = None
         self.batched_input_staging = envs.VLLM_HPU_DSV41_BATCHED_INPUT_STAGING
         if self.batched_input_staging and not envs.VLLM_HPU_DSV41_FUSED_STAGE_IO:
@@ -694,8 +704,6 @@ class V41ModelRunner:
             self.input_staging = torch.empty((2, 7), dtype=torch.int64, device="cpu").pin_memory("hpu")
             self.input_staging_values = self.input_staging.numpy()
             self.input_control = torch.empty(7, dtype=torch.int64, device=self.device)
-            if self.batched_input_staging:
-                self.input_ids = self.input_control[:6]
             self.input_dma_events = [torch.hpu.Event(), torch.hpu.Event()]
             self.input_dma_pending = [False, False]
             self.input_generation = 0
@@ -958,8 +966,6 @@ class V41ModelRunner:
         # instead of compiling an unqualified ordinary C1 stage on the first
         # public chat request.
         c1_replay = (getattr(self.model, "native", False) and count == 1 and start + count <= 1024)
-        prompt_replay = (getattr(self.model, "native", False) and not decode and count in (1, 6)
-                         and start + count <= 1024)
         graph_c1 = decode or c1_replay
         if self.direct_token_ids and graph_c1:
             if count != 1:
@@ -975,7 +981,12 @@ class V41ModelRunner:
                     attention.set_search_length(search)
                 else:
                     attention.search_length = search
-        if getattr(self, "input_staging", None) is not None:
+        # The fused seven-value control packet belongs to C1/C6 replay.  A
+        # normal prefill block has independent C128-capable input buffers and
+        # must not be truncated through that DSpark-sized packet.
+        staged_input = (getattr(self, "input_staging", None) is not None and count <= 6
+                        and (graph_c1 or self.use_dspark))
+        if staged_input:
             slot = self.input_generation % 2
             if self.input_dma_pending[slot]:
                 self.input_dma_events[slot].synchronize()
@@ -988,11 +999,15 @@ class V41ModelRunner:
             self.input_generation += 1
             positions = self.prepare_positions(self.input_control)
             if self.batched_input_staging:
-                positions = self.positions = positions
-                ids = self.input_ids[:count]
+                ids = self.input_control[:count]
+                if self.use_dspark:
+                    self.positions[:count].copy_(positions[:count])
+                    positions = self.position_views[count]
+                else:
+                    positions = positions[:count]
             else:
                 self.input_ids[:count].copy_(self.input_control[:count])
-                self.positions.copy_(positions)
+                self.positions[:count].copy_(positions[:count])
                 ids, positions = self.input_views[count], self.position_views[count]
         else:
             if (not self.use_dspark and decode and count == 1 and self._next_input is not None
@@ -1011,7 +1026,7 @@ class V41ModelRunner:
         # Choose the qualified submission path before any request state write.
         # Longer CSA2 buckets use compiled recipes until native capture is qualified.
         use_replay = (getattr(self.model, "native", False) and start + count <= 1024
-                      and (decode or prompt_replay or (self.use_dspark and request is not None)))
+                      and (decode or c1_replay or (self.use_dspark and request is not None)))
         self.model.prepare_step(request_id, tokens, is_decode=graph_c1, reset=reset, use_replay=use_replay)
         self._round_phase("engram_prepared_ns")
         timing = getattr(self, "verify_timing", None)
@@ -1541,10 +1556,10 @@ class V41ModelRunner:
 
     @torch.inference_mode()
     def warmup_model(self):
-        # Prompts are partitioned into C6 plus a C1 tail.  Warm both native
-        # variants before advertising API readiness so a user's first request
-        # cannot enter the much larger ordinary C6 compilation path.
-        for count in (1, 6):
+        # Ordinary serving keeps the qualified C1 native replay for decode.
+        # C6 is a DSpark-only anchor-plus-draft geometry. Prompt C128 recipes
+        # are compiled by real prefill qualification and persisted in cache.
+        for count in ((1, 6) if self.use_dspark else (1, )):
             for _ in range(4 if self.model.native else 1):
                 self._dummy_run(count, native=self.model.native)
             if self.model.native:

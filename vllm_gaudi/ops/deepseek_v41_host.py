@@ -329,8 +329,8 @@ class EngramHost:
         if gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM:
             self._initialize_device_c1(host, device)
         self.batches = None
-        if envs.VLLM_HPU_DSV41_BATCHED_INPUT_STAGING:
-            if max_tokens != 6 or not envs.VLLM_HPU_DSV41_FUSED_STAGE_IO:
+        if envs.VLLM_HPU_DSV41_BATCHED_INPUT_STAGING and max_tokens == 6:
+            if not envs.VLLM_HPU_DSV41_FUSED_STAGE_IO:
                 raise RuntimeError("Batched Engram staging requires fused C6 stage input preparation")
             self.batches = [
                 _TransferBatch([self.slots[layer][ring] for layer in self.layout.layer_ids], device)

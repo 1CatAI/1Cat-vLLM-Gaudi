@@ -25,7 +25,8 @@ from vllm_gaudi.ops.deepseek_v41_math import (
 )
 
 PAGE_TOKENS = 128
-WORK_TOKENS = 6
+WORK_TOKENS = 128
+NATIVE_WORK_TOKENS = 6
 SWA_ROWS = 256
 HISTORY_ROWS = 8
 
@@ -267,12 +268,42 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         compressor = self.weights.compressor
         if self.ratio == 2:
             kv, score = self._project_compressor_input(value)
-            self.kv_history.index_copy_(0, positions.remainder(HISTORY_ROWS).long(), kv)
-            self.score_history.index_copy_(0, positions.remainder(HISTORY_ROWS).long(), score)
             first = positions - positions.remainder(2)
-            a, b = first.remainder(HISTORY_ROWS).long(), (first + 1).remainder(HISTORY_ROWS).long()
-            gates = torch.stack((self.score_history[a], self.score_history[b]), 1).softmax(1)
-            latent = (self.kv_history[a] * gates[:, 0] + self.kv_history[b] * gates[:, 1]).to(value.dtype)
+            if positions.numel() <= 6:
+                # Preserve the qualified C1/C6 graph and its exact state
+                # mutation order.
+                self.kv_history.index_copy_(0, positions.remainder(HISTORY_ROWS).long(), kv)
+                self.score_history.index_copy_(0, positions.remainder(HISTORY_ROWS).long(), score)
+                a, b = first.remainder(HISTORY_ROWS).long(), (first + 1).remainder(HISTORY_ROWS).long()
+                gates = torch.stack((self.score_history[a], self.score_history[b]), 1).softmax(1)
+                latent = (self.kv_history[a] * gates[:, 0] + self.kv_history[b] * gates[:, 1]).to(value.dtype)
+            else:
+                # A C128 block is wider than the eight-row history ring. Read
+                # pairs from the current block whenever available and from the
+                # prior ring only at the leading boundary; update the ring
+                # after all reads so rows cannot alias within this transaction.
+                base, tokens = positions[0], positions.numel()
+                local_a, local_b = first - base, first + 1 - base
+                valid_a = (local_a >= 0) & (local_a < tokens)
+                valid_b = (local_b >= 0) & (local_b < tokens)
+                current_a = kv.index_select(0, local_a.clamp(0, tokens - 1).long())
+                current_b = kv.index_select(0, local_b.clamp(0, tokens - 1).long())
+                score_a = score.index_select(0, local_a.clamp(0, tokens - 1).long())
+                score_b = score.index_select(0, local_b.clamp(0, tokens - 1).long())
+                history_a = self.kv_history[first.remainder(HISTORY_ROWS).long()]
+                history_b = self.kv_history[(first + 1).remainder(HISTORY_ROWS).long()]
+                history_score_a = self.score_history[first.remainder(HISTORY_ROWS).long()]
+                history_score_b = self.score_history[(first + 1).remainder(HISTORY_ROWS).long()]
+                pair_a = torch.where(valid_a.unsqueeze(-1), current_a, history_a)
+                pair_b = torch.where(valid_b.unsqueeze(-1), current_b, history_b)
+                pair_score_a = torch.where(valid_a.unsqueeze(-1), score_a, history_score_a)
+                pair_score_b = torch.where(valid_b.unsqueeze(-1), score_b, history_score_b)
+                gates = torch.stack((pair_score_a, pair_score_b), 1).softmax(1)
+                latent = (pair_a * gates[:, 0] + pair_b * gates[:, 1]).to(value.dtype)
+                tail = min(tokens, HISTORY_ROWS)
+                tail_positions = positions[-tail:].remainder(HISTORY_ROWS).long()
+                self.kv_history.index_copy_(0, tail_positions, kv[-tail:])
+                self.score_history.index_copy_(0, tail_positions, score[-tail:])
         else:
             first, latent = positions, self.linear(value, compressor.wkv)
         latent = rms_norm(latent, compressor.norm.weight, self.eps)
@@ -349,7 +380,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         return self.reduce(partial, ready_outputs=ready_outputs) if ready_outputs else self.reduce(partial)
 
     def _output(self, query, cache, indices, positions, ready_outputs=()):
-        if self.mla_mme and 1 <= query.shape[0] <= WORK_TOKENS:
+        if self.mla_mme and 1 <= query.shape[0] <= NATIVE_WORK_TOKENS:
             lengths = torch.full((query.shape[0], ), indices.shape[1], dtype=torch.int32, device=query.device)
             output = torch.ops.custom_op.custom_deepseek_v41_selected_mla_mme_gaudi2(
                 query.contiguous(), cache.contiguous(), indices.contiguous(), self.weights.attn_sink, self.scale,
@@ -370,7 +401,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                              pack_swa(apply_rope(kv, positions, self._rotary_table())))
         native_prefix = (gaudi_envs.VLLM_HPU_DSV41_FUSED_PREFIX_LAYOUT and self.ratio in (1, 2)
                          and self.direct_selected_kv and self.shared_prefix_kv and self.window == 128
-                         and value.device.type == "hpu" and 1 <= value.shape[0] <= WORK_TOKENS
+                         and value.device.type == "hpu" and 1 <= value.shape[0] <= NATIVE_WORK_TOKENS
                          and self.search_length // self.index_ratio <= 512)
         indices = None
         if not native_prefix:
@@ -382,7 +413,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 self._compress(value, positions)
             selected = self._select(value, qr, positions)
             physical = None if native_prefix else self.shared.physical_rows(selected.clamp_min(0), self.ratio)
-            if (self.direct_selected_kv and value.device.type == "hpu"
+            if (self.direct_selected_kv and value.device.type == "hpu" and value.shape[0] <= NATIVE_WORK_TOKENS
                     and selected.numel() <= self.selected_offsets.numel()):
                 # Decode the fixed SWA prefix and all selected paged rows in
                 # one graph entry, then consume its internal BF16 value directly

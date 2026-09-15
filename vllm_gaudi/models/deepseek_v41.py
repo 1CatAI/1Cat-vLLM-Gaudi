@@ -97,7 +97,7 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             self.engram_host = EngramHost(self.directory,
                                           self.tp_rank,
                                           self.device,
-                                          max_tokens=6,
+                                          max_tokens=128,
                                           checkpoint_audit=self.extra.get("checkpoint_audit"),
                                           force_lock=self.extra.get("engram_force_lock", False))
             self._bind_vision()
