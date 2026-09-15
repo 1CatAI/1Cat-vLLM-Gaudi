@@ -968,7 +968,11 @@ class V41ModelRunner:
             search = min(program.length, max(512, 1 << (start + count - 1).bit_length()))
             program.search_length = search
             for layer in program.layers:
-                layer.attention.search_length = search
+                attention = layer.attention
+                if hasattr(attention, "set_search_length"):
+                    attention.set_search_length(search)
+                else:
+                    attention.search_length = search
         if getattr(self, "input_staging", None) is not None:
             slot = self.input_generation % 2
             if self.input_dma_pending[slot]:

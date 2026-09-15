@@ -7,7 +7,7 @@ import torch
 from vllm_gaudi import envs
 from vllm_gaudi.models.deepseek_v41_program import _weight_tree, load_weight_tree
 from vllm_gaudi.ops.deepseek_v41_attention import CSA2Attention
-from vllm_gaudi.ops.deepseek_v41_paged_attention import PagedCSA2Attention
+from vllm_gaudi.ops.deepseek_v41_paged_attention import PagedCSA2Attention, PagedCSA2SharedState
 
 
 def test_woa_load_bypasses_dense_for_selected_layers(monkeypatch):
@@ -67,16 +67,41 @@ def test_paged_output_preparation_matches_bounded_layout():
         assert torch.equal(module.weights.wo_a.weight, original.reshape(4, 1024, 1024))
 
 
-def test_paged_rotary_views_follow_active_bucket_without_copying():
+def _rotary_shared(length=8192):
+    shared = object.__new__(PagedCSA2SharedState)
+    torch.nn.Module.__init__(shared)
+    shared.length = length
+    shared._rotary_buckets = {}
+    shared.register_buffer("swa_rotary", torch.empty(length, 32, 2), False)
+    shared.register_buffer("swa_rotary_native", torch.empty(length, 64), False)
+    return shared
+
+
+def test_paged_rotary_buckets_have_independent_shared_storage():
+    shared = _rotary_shared()
+    ordinary = shared.rotary_bucket("swa_rotary", 512)
+    native = shared.rotary_bucket("swa_rotary_native", 512)
+    assert ordinary.shape == (512, 32, 2) and native.shape == (512, 64)
+    assert ordinary.untyped_storage()._cdata != shared.swa_rotary.untyped_storage()._cdata
+    assert native.untyped_storage()._cdata != shared.swa_rotary_native.untyped_storage()._cdata
+    assert shared.rotary_bucket("swa_rotary", 512) is ordinary
+    assert shared.rotary_bucket("swa_rotary_native", 512) is native
+    larger = shared.rotary_bucket("swa_rotary", 8192)
+    assert larger.shape[0] == 8192
+    assert larger.untyped_storage()._cdata != ordinary.untyped_storage()._cdata
+
+
+def test_paged_attention_rebinds_shared_rotary_bucket():
+    shared = _rotary_shared()
     attention = object.__new__(PagedCSA2Attention)
     torch.nn.Module.__init__(attention)
-    attention.register_buffer("rotary", torch.empty(1048576, 32, 2), False)
-    attention.register_buffer("rotary_native", torch.empty(1048576, 64), False)
-    attention.search_length = 512
-    ordinary, native = attention._rotary_table(), attention._rotary_native_table()
-    assert ordinary.shape == (512, 32, 2) and native.shape == (512, 64)
-    assert ordinary.untyped_storage()._cdata == attention.rotary.untyped_storage()._cdata
-    assert native.untyped_storage()._cdata == attention.rotary_native.untyped_storage()._cdata
-    attention.search_length = 8192
-    assert attention._rotary_table().shape[0] == 8192
-    assert attention._rotary_native_table().shape[0] == 8192
+    attention.shared = shared
+    attention._rotary_name = "swa_rotary"
+    attention._rotary_native_name = "swa_rotary_native"
+    attention.q_scale_rope = True
+    attention.register_buffer("rotary", shared.rotary_bucket("swa_rotary", 512), False)
+    attention.register_buffer("rotary_native", shared.rotary_bucket("swa_rotary_native", 512), False)
+    attention.set_search_length(8192)
+    assert attention.search_length == 8192
+    assert attention._rotary_table() is shared.rotary_bucket("swa_rotary", 8192)
+    assert attention._rotary_native_table() is shared.rotary_bucket("swa_rotary_native", 8192)

@@ -70,6 +70,12 @@ class PagedCSA2SharedState(nn.Module):
     def __init__(self, config, layer_start, layer_stop, device, max_length):
         super().__init__()
         self.length = max_length
+        # A view of the 1M-row source still exposes its complete backing
+        # allocation to Synapse when the native kernel declares all input rows
+        # required.  Lazily materialize independent, stage-shared page buckets
+        # instead.  Compiled recipes bind these stable tensor addresses, so the
+        # cache intentionally keeps strong references for the process lifetime.
+        self._rotary_buckets = {}
         self.sources, self.topk = nn.ModuleDict(), nn.ModuleDict()
         for source in config["kv_source_layer_ids"]:
             if layer_start <= source < layer_stop:
@@ -114,6 +120,19 @@ class PagedCSA2SharedState(nn.Module):
             if gaudi_envs.VLLM_HPU_DSV41_Q_SCALE_ROPE:
                 native = torch.cat((table[..., 0], table[..., 1]), -1).contiguous()
                 self.register_buffer(f"{name}_native", native.to(device), False)
+
+    def rotary_bucket(self, name, length):
+        """Return a stable RoPE buffer whose backing storage is bucket-sized."""
+        if length < 1 or length > self.length:
+            raise ValueError(f"invalid RoPE bucket length {length} for maximum {self.length}")
+        key = (name, int(length))
+        bucket = self._rotary_buckets.get(key)
+        if bucket is None:
+            # ``clone`` is intentional: contiguous slices still share the full
+            # table allocation and reproduce the short-request compile stall.
+            bucket = getattr(self, name)[:length].clone()
+            self._rotary_buckets[key] = bucket
+        return bucket
 
     def physical_rows(self, rows, ratio):
         width = PAGE_TOKENS // ratio
@@ -174,10 +193,12 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             self.register_buffer("kv_history", torch.zeros(HISTORY_ROWS, 512, dtype=torch.float32, device=device),
                                  False)
             self.register_buffer("score_history", torch.zeros_like(self.kv_history), False)
-        self.register_buffer("rotary", shared.compressed_rotary if self.ratio else shared.swa_rotary, False)
+        self._rotary_name = "compressed_rotary" if self.ratio else "swa_rotary"
+        self.register_buffer("rotary", shared.rotary_bucket(self._rotary_name, self.search_length), False)
         if self.q_scale_rope:
-            native_name = "compressed_rotary_native" if self.ratio else "swa_rotary_native"
-            self.register_buffer("rotary_native", getattr(shared, native_name), False)
+            self._rotary_native_name = f"{self._rotary_name}_native"
+            self.register_buffer("rotary_native",
+                                 shared.rotary_bucket(self._rotary_native_name, self.search_length), False)
         self.register_buffer("window_offsets", torch.arange(self.window, dtype=torch.int32, device=device), False)
         self.register_buffer("compressed_offsets", torch.arange(512, dtype=torch.int32, device=device), False)
         self.register_buffer("swa_offsets", torch.arange(SWA_ROWS, dtype=torch.int32, device=device), False)
@@ -204,18 +225,17 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                                         grouped.transpose(1, 2).contiguous())
 
     def _rotary_table(self):
-        """Expose only the rows owned by this compiled length bucket.
-
-        The full 1M table remains stage-owned, but passing it to every RoPE
-        node makes Synapse treat all 1M rows as graph inputs even for a short
-        prompt.  The runner always chooses ``search_length >= max(position)+1``;
-        this view therefore preserves addressing while keeping each recipe
-        proportional to the active CSA2 bucket.
-        """
-        return self.rotary[:self.search_length]
+        return self.rotary
 
     def _rotary_native_table(self):
-        return self.rotary_native[:self.search_length]
+        return self.rotary_native
+
+    def set_search_length(self, length):
+        """Bind this layer to the shared independent-storage RoPE bucket."""
+        self.search_length = int(length)
+        self.rotary = self.shared.rotary_bucket(self._rotary_name, self.search_length)
+        if self.q_scale_rope:
+            self.rotary_native = self.shared.rotary_bucket(self._rotary_native_name, self.search_length)
 
     def project_output(self, value):
         """Project MLA output without restoring a bounded-context weight path."""
