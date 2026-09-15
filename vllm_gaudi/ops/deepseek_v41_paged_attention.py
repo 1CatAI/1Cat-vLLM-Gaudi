@@ -203,6 +203,20 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             self.weights.wo_a.weight = (grouped if self.output_gemm_layout else
                                         grouped.transpose(1, 2).contiguous())
 
+    def _rotary_table(self):
+        """Expose only the rows owned by this compiled length bucket.
+
+        The full 1M table remains stage-owned, but passing it to every RoPE
+        node makes Synapse treat all 1M rows as graph inputs even for a short
+        prompt.  The runner always chooses ``search_length >= max(position)+1``;
+        this view therefore preserves addressing while keeping each recipe
+        proportional to the active CSA2 bucket.
+        """
+        return self.rotary[:self.search_length]
+
+    def _rotary_native_table(self):
+        return self.rotary_native[:self.search_length]
+
     def project_output(self, value):
         """Project MLA output without restoring a bounded-context weight path."""
         if self.woa_fp8:
@@ -224,8 +238,10 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         if self.q_scale_rope and value.shape[0] == 1 and getattr(weight, "dense_fp8", False):
             value = quantize_activation(value) if hasattr(weight, "scale") else value
             return torch.ops.custom_op.custom_deepseek_v41_q_projection_rope_gaudi2(
-                value, weight.weight, weight.channel_scale, positions, self.rotary_native).reshape(-1, self.heads, 512)
-        return apply_rope(self.linear(value, weight).reshape(-1, self.heads, 512), positions, self.rotary)
+                value, weight.weight, weight.channel_scale, positions,
+                self._rotary_native_table()).reshape(-1, self.heads, 512)
+        return apply_rope(self.linear(value, weight).reshape(-1, self.heads, 512), positions,
+                          self._rotary_table())
 
     def _compress(self, value, positions):
         compressor = self.weights.compressor
@@ -247,13 +263,14 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                             rows.remainder(PAGE_TOKENS // self.ratio))
         indexer = self.weights.indexer
         index = rms_norm(self.linear(latent, indexer.wk), indexer.k_norm.weight, self.eps)
-        self.cache.index.index_copy_(0, slots.long(), pack_fp4(apply_rope(index, first, self.rotary), 32))
-        self.cache.main.index_copy_(0, slots.long(), pack_fp4(apply_rope(latent, first, self.rotary), 16))
+        rotary = self._rotary_table()
+        self.cache.index.index_copy_(0, slots.long(), pack_fp4(apply_rope(index, first, rotary), 32))
+        self.cache.main.index_copy_(0, slots.long(), pack_fp4(apply_rope(latent, first, rotary), 16))
 
     def _scores(self, value, qr, positions, logical_rows):
         indexer = self.weights.indexer
         q = self.linear(qr, indexer.wq_b).reshape(-1, self.index_heads, 128)
-        q = unpack_fp4(pack_fp4(apply_rope(q, positions, self.rotary), 32), 128, 32)
+        q = unpack_fp4(pack_fp4(apply_rope(q, positions, self._rotary_table()), 32), 128, 32)
         weights = self.linear(value, indexer.weights_proj) * (128**-0.5 * (self.index_heads * 2)**-0.5)
         # Exchange only small query/head tensors, not one score per cached token.
         q, weights = self.gather(q, 1), self.gather(weights, 1)
@@ -305,7 +322,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
 
     def _finish_output(self, output, positions, ready_outputs=()):
         """Apply the shared output projection after either attention path."""
-        output = apply_rope(output, positions, self.rotary, inverse=True)
+        output = apply_rope(output, positions, self._rotary_table(), inverse=True)
         output = output.reshape(-1, self.groups, self.heads // self.groups * 512)
         output = self.project_output(output)
         partial = self.linear(output, self.weights.wo_b)
@@ -329,7 +346,8 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         qr = norm(query_input, self.weights.q_norm.weight, self.eps)
         query = self.project_query(qr, positions)
         kv = norm(kv_input, self.weights.kv_norm.weight, self.eps)
-        self.swa.index_copy_(0, positions.remainder(SWA_ROWS).long(), pack_swa(apply_rope(kv, positions, self.rotary)))
+        self.swa.index_copy_(0, positions.remainder(SWA_ROWS).long(),
+                             pack_swa(apply_rope(kv, positions, self._rotary_table())))
         native_prefix = (gaudi_envs.VLLM_HPU_DSV41_FUSED_PREFIX_LAYOUT and self.ratio in (1, 2)
                          and self.direct_selected_kv and self.shared_prefix_kv and self.window == 128
                          and value.device.type == "hpu" and 1 <= value.shape[0] <= WORK_TOKENS
@@ -399,7 +417,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
     def insert_context(self, value, positions, valid_count=None):
         kv = rms_norm(self.linear(value, self.weights.wkv), self.weights.kv_norm.weight, self.eps)
         indices = positions.remainder(SWA_ROWS).long()
-        packed = pack_swa(apply_rope(kv, positions, self.rotary))
+        packed = pack_swa(apply_rope(kv, positions, self._rotary_table()))
         if valid_count is not None:
             old = self.swa.index_select(0, indices)
             mask = torch.arange(indices.numel(), device=indices.device) < valid_count.reshape(1)
@@ -409,9 +427,10 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
 
     def draft(self, value, positions):
         query = rms_norm(self.linear(value, self.weights.wq_a), self.weights.q_norm.weight, self.eps)
-        query = apply_rope(self.linear(query, self.weights.wq_b).reshape(-1, self.heads, 512), positions, self.rotary)
+        rotary = self._rotary_table()
+        query = apply_rope(self.linear(query, self.weights.wq_b).reshape(-1, self.heads, 512), positions, rotary)
         kv = rms_norm(self.linear(value, self.weights.wkv), self.weights.kv_norm.weight, self.eps)
-        kv = unpack_swa(pack_swa(apply_rope(kv, positions, self.rotary)))
+        kv = unpack_swa(pack_swa(apply_rope(kv, positions, rotary)))
         cache = torch.cat((unpack_swa(self.swa), kv), 0)
         window = positions[:1] - self.window + self.window_offsets
         window = torch.where(window >= 0, window.remainder(SWA_ROWS), -1)

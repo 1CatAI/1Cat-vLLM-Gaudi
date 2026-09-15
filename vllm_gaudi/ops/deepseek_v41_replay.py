@@ -242,14 +242,18 @@ class StageReplay:
             raise ValueError("Native input capture requires enabled ordinary BF16 C1 PP0 decode")
         if self.segmented_prefix_enabled:
             from vllm_gaudi.ops.tp2_prepared_plan import _native_entries
-            variant = self.variants.get((1, "input"))
+            variant = self.variants.get(self._input_key())
             if variant is not None and variant in _native_entries:
                 self.begin_segmented_from_input_ids(positions, input_ids)
                 return self.finish_segmented(positions, input_ids, engram)
         return self(*self._input_seed(input_ids), positions, input_ids, engram, native_input=True)
 
+    def _input_key(self):
+        search = getattr(self.program(), "search_length", 512)
+        return (1, "input") if search <= 512 else (1, "input", search)
+
     def _complete_input_variant(self):
-        variant = self.variants.get((1, "input"))
+        variant = self.variants.get(self._input_key())
         if variant is None:
             raise RuntimeError("Segmented replay requires the warmed complete PP0 input graph")
         return variant
@@ -310,8 +314,8 @@ class StageReplay:
                              or tokens != 1):
             raise ValueError("Native input capture requires enabled ordinary BF16 C1 PP0 decode")
         search = getattr(program, "search_length", 512)
-        key = ((tokens,
-                "input") if native_input else tokens if search <= 512 and not fused_text_io and pp_wire is None else
+        key = (((tokens, "input") if search <= 512 else (tokens, "input", search))
+               if native_input else tokens if search <= 512 and not fused_text_io and pp_wire is None else
                (tokens, search, fused_text_io))
         if key not in self.variants:
             self.variants[key] = StageVariant(program,
@@ -331,7 +335,8 @@ class StageReplay:
         program = self.program()
         native_input = (self.native_input_enabled and tokens == 1 and _native_input_precision_compatible(program))
         fused = (program.pp_rank == 0 and envs.VLLM_HPU_DSV41_FUSED_STAGE_IO)
-        key = ((tokens, "input") if native_input else tokens if search <= 512 and not fused else
+        key = (((tokens, "input") if search <= 512 else (tokens, "input", search))
+               if native_input else tokens if search <= 512 and not fused else
                (tokens, search, fused))
         variant = self.variants.get(key)
         if variant is None or variant not in _native_entries:

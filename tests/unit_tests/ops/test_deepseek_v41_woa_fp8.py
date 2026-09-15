@@ -65,3 +65,18 @@ def test_paged_output_preparation_matches_bounded_layout():
         module.prepare_output_weight()
         assert module.weights.wo_a.weight.shape == (4, 1024, 1024)
         assert torch.equal(module.weights.wo_a.weight, original.reshape(4, 1024, 1024))
+
+
+def test_paged_rotary_views_follow_active_bucket_without_copying():
+    attention = object.__new__(PagedCSA2Attention)
+    torch.nn.Module.__init__(attention)
+    attention.register_buffer("rotary", torch.empty(1048576, 32, 2), False)
+    attention.register_buffer("rotary_native", torch.empty(1048576, 64), False)
+    attention.search_length = 512
+    ordinary, native = attention._rotary_table(), attention._rotary_native_table()
+    assert ordinary.shape == (512, 32, 2) and native.shape == (512, 64)
+    assert ordinary.untyped_storage()._cdata == attention.rotary.untyped_storage()._cdata
+    assert native.untyped_storage()._cdata == attention.rotary_native.untyped_storage()._cdata
+    attention.search_length = 8192
+    assert attention._rotary_table().shape[0] == 8192
+    assert attention._rotary_native_table().shape[0] == 8192

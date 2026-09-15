@@ -186,6 +186,16 @@ def test_input_modes_have_separate_cached_variants(monkeypatch):
     assert not external.native_input and internal.native_input
 
 
+def test_native_input_variants_are_separate_across_paged_buckets(monkeypatch):
+    monkeypatch.setenv("VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH", "1")
+    owner = program()
+    owner.search_length = 512
+    replay = StageReplay(owner)
+    assert replay._input_key() == (1, "input")
+    owner.search_length = 1024
+    assert replay._input_key() == (1, "input", 1024)
+
+
 @pytest.mark.parametrize("pp_rank,native_input", ((0, False), (0, True), (1, True)))
 def test_warmup_checks_the_selected_mode(monkeypatch, pp_rank, native_input):
     from vllm_gaudi.ops import tp2_prepared_plan
