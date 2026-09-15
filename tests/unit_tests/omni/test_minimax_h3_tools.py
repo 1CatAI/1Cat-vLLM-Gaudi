@@ -555,6 +555,7 @@ def test_single_hpu_launcher_configures_bounded_vae_tile_batching():
 
     assert default.vae_tile_batch_size == 4
     assert default.vae_persist_bf16_weights is True
+    assert default.vae_fused_sdpa is True
     assert explicit.vae_tile_batch_size == 7
     assert explicit.vae_persist_bf16_weights is False
 

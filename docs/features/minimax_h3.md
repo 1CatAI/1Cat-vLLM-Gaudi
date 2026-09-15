@@ -168,6 +168,12 @@ without changing the checkpoint's blend order. The three compiled regions can
 be isolated with `--no-vae-compile-swiglu`, `--no-vae-compile-qk-norm`, and
 `--no-vae-compile-rope` when qualifying a new software stack.
 
+Unmasked decoder self-attention uses Habana FusedSDPA at the checkpoint's BF16
+precision. The guarded path is limited to the qualified 32-head, head-size-64
+contract and falls back to the checkpoint SDPA implementation for masked,
+causal, host, or differently shaped inputs. Use `--no-vae-fused-sdpa` to
+isolate the original implementation during stack qualification.
+
 The launcher also validates `ffmpeg` and `ffprobe` before starting a Ref2VA
 worker. `--media-bin` defaults to `/opt/habanalabs/media/ffmpeg/bin` and is
 prepended to `PATH`; set it explicitly when the Habana media tools live
@@ -371,11 +377,13 @@ reports the warmed median and range. Profiling is disabled for these main
 measurements.
 
 The combined Attention, Dense, and VAE candidate is promoted only when the
-subsequent-three warmed median is at most 25 seconds. Every measured output must also
-pass full audio/video decoding and manual prompt, motion, and audio review; a
-microbenchmark or a structurally valid but degraded video does not satisfy the
-gate. The VAE-only changes below use a stricter check: all 124 prepared frames
-must remain byte-identical to the frozen reference.
+subsequent-three warmed median is at most 25 seconds. Every measured output
+must also pass full audio/video decoding and manual prompt, motion, and audio
+review; a microbenchmark or a structurally valid but degraded video does not
+satisfy the gate. Exact VAE pointwise, batching, and stitching changes require
+all 124 prepared frames to remain byte-identical to the frozen reference. The
+BF16 FusedSDPA substitution uses finite-value stress tests plus full-frame
+PSNR, SSIM, temporal-motion, end-to-end semantic, audio, and decode gates.
 
 The qualified Gaudi 2 run at 1344x768 produced the following BF16 baselines.
 Both used four actual joint DiT forwards, generated 124 internal frames, and
@@ -419,6 +427,17 @@ reduce that BF16-parameter candidate by a further 6.5%. The complete 124-frame
 comparison remains byte-identical. Each graph validates every new tensor
 contract before reuse, and its eager implementation remains the permanent
 fallback for a failed compile or equality check.
+
+The guarded BF16 FusedSDPA decoder path then reduced complete 124-frame VAE
+device time by about half relative to that exact path. Three isolated runs
+measured 19.20-20.60 seconds. Removing eager Q/K/V transpose materialization
+and the redundant finite-output scan reduced the production-shape attention
+tail by another 20.5% in the focused microbenchmark. Zero, extreme mixed-sign,
+random non-block, and real latent inputs remained finite. Against the frozen
+checkpoint-SDPA output, the prepared 124-frame video measured 51.94 dB PSNR;
+the minimum per-frame SSIM was 0.99967 and temporal-motion magnitude changed by
+0.003%. Two candidate decodes produced the same output SHA256. Normal softmax
+mode is retained because the faster approximation failed the numerical gate.
 
 A hardware trace of one decoder call explains the improvement. Moving from one
 tile to four tiles reduced the idle share from 19.45% to 2.86%, raised TPC

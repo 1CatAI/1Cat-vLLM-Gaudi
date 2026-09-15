@@ -37,12 +37,15 @@ from vllm_gaudi.omni.minimax_h3_vae import (
     _h3_vae_compile_qk_norm,
     _h3_vae_compile_swiglu,
     _h3_vae_blend_with_weights,
+    _h3_vae_fused_sdpa,
+    _h3_vae_fused_sdpa_enabled,
     _h3_vae_persist_bf16_weights,
     _h3_vae_tile_batch_size,
     _install_h3_vae_compiled_swiglu,
     _install_h3_vae_compiled_qk_rms_norm,
     _install_h3_vae_blend_weight_cache,
     _install_h3_vae_decode_tile_batching,
+    _install_h3_vae_fused_sdpa,
     _materialize_h3_vae_decoder_linear_weights,
 )
 
@@ -228,6 +231,55 @@ def test_h3_vae_compile_rope_environment_is_strict(monkeypatch):
     monkeypatch.setenv("VLLM_GAUDI_H3_VAE_COMPILE_ROPE", "sometimes")
     with pytest.raises(ValueError, match="must be a boolean"):
         _h3_vae_compile_rope()
+
+
+def test_h3_vae_fused_sdpa_environment_is_strict(monkeypatch):
+    monkeypatch.delenv("VLLM_GAUDI_H3_VAE_FUSED_SDPA", raising=False)
+    assert _h3_vae_fused_sdpa_enabled()
+
+    monkeypatch.setenv("VLLM_GAUDI_H3_VAE_FUSED_SDPA", "off")
+    assert not _h3_vae_fused_sdpa_enabled()
+
+    monkeypatch.setenv("VLLM_GAUDI_H3_VAE_FUSED_SDPA", "sometimes")
+    with pytest.raises(ValueError, match="must be a boolean"):
+        _h3_vae_fused_sdpa_enabled()
+
+
+def test_h3_vae_fused_sdpa_disallows_implicit_host_fallback():
+    value = torch.randn(2, 7, 4, 8, dtype=torch.bfloat16)
+
+    with pytest.raises(RuntimeError, match="requires HPU"):
+        _h3_vae_fused_sdpa(value, value, value)
+
+
+def test_h3_vae_fused_sdpa_installer_preserves_fallback_contract():
+
+    class Attention(torch.nn.Module):
+
+        def __init__(self):
+            super().__init__()
+            self.heads = 32
+            self.dim_head = 64
+
+        @staticmethod
+        def _perform_attention(query, key, value, pack_info):
+            del key, value, pack_info
+            return query + 1
+
+    class Block(torch.nn.Module):
+
+        def __init__(self):
+            super().__init__()
+            self.attn = Attention()
+
+    decoder = SimpleNamespace(transformer_blocks=torch.nn.ModuleList([Block(), Block()]))
+    value = torch.randn(2, 7, 32, 64, dtype=torch.bfloat16)
+
+    assert _install_h3_vae_fused_sdpa(decoder) == 2
+    assert _install_h3_vae_fused_sdpa(decoder) == 0
+    assert all(
+        torch.equal(block.attn._perform_attention(value, value, value, {}), value + 1)
+        for block in decoder.transformer_blocks)
 
 
 def test_h3_vae_compiled_rope_preserves_partial_rotation(monkeypatch):

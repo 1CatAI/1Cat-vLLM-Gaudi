@@ -21,6 +21,7 @@ _H3_VAE_PERSIST_BF16_WEIGHTS_ENV = "VLLM_GAUDI_H3_VAE_PERSIST_BF16_WEIGHTS"
 _H3_VAE_COMPILE_SWIGLU_ENV = "VLLM_GAUDI_H3_VAE_COMPILE_SWIGLU"
 _H3_VAE_COMPILE_QK_NORM_ENV = "VLLM_GAUDI_H3_VAE_COMPILE_QK_NORM"
 _H3_VAE_COMPILE_ROPE_ENV = "VLLM_GAUDI_H3_VAE_COMPILE_ROPE"
+_H3_VAE_FUSED_SDPA_ENV = "VLLM_GAUDI_H3_VAE_FUSED_SDPA"
 _DEFAULT_H3_VAE_TILE_BATCH_SIZE = 4
 
 
@@ -58,6 +59,10 @@ def _h3_vae_compile_qk_norm() -> bool:
 
 def _h3_vae_compile_rope() -> bool:
     return _boolean_environment(_H3_VAE_COMPILE_ROPE_ENV, "1")
+
+
+def _h3_vae_fused_sdpa_enabled() -> bool:
+    return _boolean_environment(_H3_VAE_FUSED_SDPA_ENV, "1")
 
 
 def _h3_vae_swiglu(projected: torch.Tensor) -> torch.Tensor:
@@ -299,6 +304,92 @@ def _install_h3_vae_compiled_rope(decoder: nn.Module) -> bool:
     return True
 
 
+def _h3_vae_fused_sdpa(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    """Run the qualified BF16 Habana SDPA path for VAE self-attention."""
+
+    if any(tensor.device.type != "hpu" for tensor in (query, key, value)):
+        raise RuntimeError("MiniMax H3 video VAE FusedSDPA requires HPU query, key, and value tensors")
+    from habana_frameworks.torch.hpex.kernels import FusedSDPA
+
+    # FusedSDPA accepts the BSHD-to-BHSD transpose views directly.  Letting the
+    # HPU operator consume those strides avoids three eager materializations
+    # for every decoder block while preserving the exact fused result.
+    query = query.transpose(1, 2)
+    key = key.transpose(1, 2)
+    value = value.transpose(1, 2)
+    output = FusedSDPA.apply(
+        query,
+        key,
+        value,
+        None,
+        0.0,
+        False,
+        None,
+        "None",
+        True,
+    )
+    # The qualified inference contract has finite Q/K/V and the fused softmax
+    # remains finite for zero, extreme, random-latent, and end-to-end model
+    # inputs.  Returning the transpose view also lets the following reshape
+    # and output projection consume it without a separate nan_to_num pass.
+    return output.transpose(1, 2)
+
+
+def _h3_vae_attention(
+    self: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    pack_info: dict[str, Any],
+) -> torch.Tensor:
+    original = self._vllm_gaudi_original_perform_attention
+    supported_pack_fields = {"cu_seqlens", "mask_mod", "block_sparse"}
+    can_fuse = (not getattr(self, "_vllm_gaudi_fused_sdpa_disabled", False) and isinstance(pack_info, dict)
+                and query.device.type == "hpu" and query.dtype == key.dtype == value.dtype == torch.bfloat16
+                and query.ndim == key.ndim == value.ndim == 4 and query.shape == key.shape == value.shape
+                and query.shape[2] == 32 and query.shape[3] == 64 and set(pack_info).issubset(supported_pack_fields)
+                and not any(pack_info.get(name) is not None for name in ("cu_seqlens", "mask_mod", "block_sparse")))
+    if not can_fuse:
+        return original(query, key, value, pack_info)
+    try:
+        return _h3_vae_fused_sdpa(query, key, value)
+    except Exception as exc:
+        self._vllm_gaudi_fused_sdpa_disabled = True
+        logger.warning_once(
+            "MiniMax H3 video VAE FusedSDPA failed (%s: %s); using the checkpoint SDPA path",
+            type(exc).__name__,
+            exc,
+        )
+        return original(query, key, value, pack_info)
+
+
+def _install_h3_vae_fused_sdpa(decoder: nn.Module) -> int:
+    """Route only the qualified unmasked decoder attention contract."""
+
+    blocks = getattr(decoder, "transformer_blocks", None)
+    if not isinstance(blocks, nn.ModuleList) or not blocks:
+        return 0
+    attentions: list[nn.Module] = []
+    for block in blocks:
+        attention = getattr(block, "attn", None)
+        if (not isinstance(attention, nn.Module) or not callable(getattr(attention, "_perform_attention", None))
+                or int(getattr(attention, "heads", 0)) != 32 or int(getattr(attention, "dim_head", 0)) != 64):
+            return 0
+        attentions.append(attention)
+
+    attentions = [
+        attention for attention in attentions if not hasattr(attention, "_vllm_gaudi_original_perform_attention")
+    ]
+    for attention in attentions:
+        attention._vllm_gaudi_original_perform_attention = attention._perform_attention
+        attention._perform_attention = MethodType(_h3_vae_attention, attention)
+    return len(attentions)
+
+
 def _materialize_h3_vae_decoder_linear_weights(decoder: nn.Module) -> int:
     """Persist the BF16 operands that HPU autocast otherwise rebuilds."""
 
@@ -331,6 +422,7 @@ def _install_h3_vae_weight_policy() -> None:
         swiglu_count = _install_h3_vae_compiled_swiglu(decoder) if _h3_vae_compile_swiglu() else 0
         qk_rms_norm_count = _install_h3_vae_compiled_qk_rms_norm(decoder) if _h3_vae_compile_qk_norm() else 0
         rope_installed = _install_h3_vae_compiled_rope(decoder) if _h3_vae_compile_rope() else False
+        fused_sdpa_count = _install_h3_vae_fused_sdpa(decoder) if _h3_vae_fused_sdpa_enabled() else 0
         if linear_count:
             logger.info_once("MiniMax H3 video VAE persisted %d decoder Linear modules in BF16", linear_count)
         if swiglu_count:
@@ -339,7 +431,10 @@ def _install_h3_vae_weight_policy() -> None:
             logger.info_once("MiniMax H3 video VAE compiled exact RMSNorm for %d decoder Q/K norms", qk_rms_norm_count)
         if rope_installed:
             logger.info_once("MiniMax H3 video VAE compiled exact rotary embedding")
-        return installed or bool(linear_count) or bool(swiglu_count) or bool(qk_rms_norm_count) or rope_installed
+        if fused_sdpa_count:
+            logger.info_once("MiniMax H3 video VAE enabled Habana FusedSDPA for %d decoder blocks", fused_sdpa_count)
+        return (installed or bool(linear_count) or bool(swiglu_count) or bool(qk_rms_norm_count) or rope_installed
+                or bool(fused_sdpa_count))
 
     vae_module.install_h3_vae_optimizations = install_optimizations
     vae_module._vllm_gaudi_h3_vae_weight_policy_installed = True

@@ -54,6 +54,7 @@ are in progress.
 | `VLLM_GAUDI_H3_VAE_COMPILE_SWIGLU` | Compiles the MiniMax H3 video-VAE SwiGLU pointwise region with the HPU backend and verifies every real tensor contract bit-for-bit before reuse. | `true` |
 | `VLLM_GAUDI_H3_VAE_COMPILE_QK_NORM` | Compiles the MiniMax H3 video-VAE Q/K RMSNorm region with the HPU backend and verifies every real tensor contract bit-for-bit before reuse. | `true` |
 | `VLLM_GAUDI_H3_VAE_COMPILE_ROPE` | Compiles the MiniMax H3 video-VAE rotary embedding region with the HPU backend and verifies every real tensor contract bit-for-bit before reuse. | `true` |
+| `VLLM_GAUDI_H3_VAE_FUSED_SDPA` | Uses Habana FusedSDPA for the qualified unmasked BF16 MiniMax H3 video-VAE decoder attention contract. | `true` |
 | `VLLM_MINIMAX_M3_MOE_TOKEN_TILE` | Maximum number of tokens processed per tile by the MiniMax-M3 dense SwiGLU-OAI expert path. Non-positive values disable tiling. | `512` |
 | `VLLM_MINIMAX_M3_MOE_DECODE_GATHER` | Enables the MiniMax-M3 routed-expert gather path for low-token decode. Set to `0` or `false` to use the dense expert path. | `true` |
 | `VLLM_MINIMAX_M3_MOE_GATHER_MAX_TOKENS` | Maximum token count for the MiniMax-M3 routed-expert gather path. Larger batches use the dense expert path. | `16` |
