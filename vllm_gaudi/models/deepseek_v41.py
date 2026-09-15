@@ -286,9 +286,11 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 # Long-context prefill carries the complete paged state pool.
                 # Compiling four layers as one graph can exhaust the remaining
                 # transient HBM before Synapse finishes graph construction.
-                # Two-layer groups preserve C64 compute tiles while halving the
-                # graph lifetime; decode keeps its four-layer replay groups.
-                self.long_context_programs[key] = CompiledStage(self.program, group_size=2)
+                # Compile one layer at a time for the paged prefill variant.
+                # Two-layer groups still fail Synapse graph construction on
+                # the final PP stage after the full state pool is resident.
+                # Decode keeps its four-layer replay groups.
+                self.long_context_programs[key] = CompiledStage(self.program, group_size=1)
             execute = self.long_context_programs[key]
         else:
             execute = self.program.replay_owner if self.native and self.step_use_replay else self.ordinary
