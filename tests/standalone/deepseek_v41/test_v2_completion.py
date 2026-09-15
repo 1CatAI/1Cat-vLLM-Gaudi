@@ -171,6 +171,8 @@ def test_v2_gate_requires_the_complete_segmented_device_contract(monkeypatch):
         config_module.validate_v2(config)
     monkeypatch.setenv("VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT", "1")
     config_module.validate_v2(config)
+    config.model_config.max_model_len = 1_048_576
+    config_module.validate_v2(config)
     monkeypatch.setenv("VLLM_HPU_TP2_NATIVE_JOINT_PLAN", "0")
     with pytest.raises(ValueError, match="segmented prefix"):
         config_module.validate_v2(config)

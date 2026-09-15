@@ -41,8 +41,10 @@ def validate_v2(config):
                      and envs.VLLM_HPU_DSV41_ENGRAM_C1_PACKET
                      and envs.VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT)):
         raise ValueError("Device Engram requires segmented PP0 replay, native C1 packets, and direct inputs")
-    if envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and config.model_config.max_model_len > 512:
-        raise ValueError("Device Engram is qualified only for the bounded context-512 profile")
+    # Device Engram is a C1 producer over the current token and a three-token
+    # rolling history.  It is independent of the paged CSA2 capacity; prompt
+    # chunks continue to use the host gather path and only decode C1 enters
+    # the segmented device producer.
 
 
 def validate_sampling(params):

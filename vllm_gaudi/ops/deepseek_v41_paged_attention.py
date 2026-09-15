@@ -17,6 +17,7 @@ from vllm_gaudi.ops.deepseek_v41_math import (
     apply_rope,
     pack_fp4,
     pack_swa,
+    quantize_activation,
     rms_norm,
     rotary_table,
     unpack_fp4,
@@ -107,6 +108,12 @@ class PagedCSA2SharedState(nn.Module):
                                  scaling["original_max_position_embeddings"] if compressed else 0, scaling["factor"],
                                  scaling["beta_fast"], scaling["beta_slow"])
             self.register_buffer(name, table.to(device), False)
+            # The fused dense-FP8 Q projection consumes the verified
+            # [cos32, sin32] table.  Keep this stage-owned rather than
+            # allocating one 1M-position copy in every attention layer.
+            if gaudi_envs.VLLM_HPU_DSV41_Q_SCALE_ROPE:
+                native = torch.cat((table[..., 0], table[..., 1]), -1).contiguous()
+                self.register_buffer(f"{name}_native", native.to(device), False)
 
     def physical_rows(self, rows, ratio):
         width = PAGE_TOKENS // ratio
@@ -119,6 +126,13 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
     def __init__(self, weights, config, layer, shared, linear, reduce, gather, device):
         super().__init__()
         self.weights, self.shared = weights, shared
+        self.woa_fp8 = False
+        self.prepared_output = (gaudi_envs.VLLM_HPU_DSV41_PREPARED_OUTPUT
+                                and layer < config["num_hidden_layers"])
+        self.output_gemm_layout = (gaudi_envs.VLLM_HPU_DSV41_OUTPUT_GEMM_LAYOUT
+                                   and layer < config["num_hidden_layers"])
+        if self.output_gemm_layout and not self.prepared_output:
+            raise ValueError("V4.1 output GEMM layout requires prepared output weights")
         self.qkv_fused_input = gaudi_envs.VLLM_HPU_DSV41_QKV_FUSED_INPUT and layer < config["num_hidden_layers"]
         self._fused_qkv_weight = None
         self._fused_qkv_quantized = False
@@ -127,6 +141,13 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         self._fused_compressor_weight = None
         self._fused_compressor_kv_width = 0
         self.mla_mme = gaudi_envs.VLLM_HPU_DSV41_MLA_MME and layer < config["num_hidden_layers"]
+        self.q_scale_rope = (gaudi_envs.VLLM_HPU_DSV41_Q_SCALE_ROPE
+                             and layer < config["num_hidden_layers"])
+        if self.q_scale_rope and not (gaudi_envs.VLLM_HPU_DSV41_NATIVE_ROPE
+                                      and gaudi_envs.VLLM_HPU_DSV41_ATTN_DENSE_FP8):
+            raise ValueError("Q scale/RoPE fusion requires native RoPE and prepared dense FP8")
+        self.fused_norm = (gaudi_envs.VLLM_HPU_DSV41_ATTN_FUSED_NORM
+                           and layer < config["num_hidden_layers"])
         self.linear, self.reduce, self.gather = linear, reduce, gather
         self.layer, self.ratio, self.length = layer, config["compress_ratios"][layer], shared.length
         self.direct_selected_kv = gaudi_envs.VLLM_HPU_DSV41_PAGED_SELECTED_KV
@@ -154,12 +175,57 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                                  False)
             self.register_buffer("score_history", torch.zeros_like(self.kv_history), False)
         self.register_buffer("rotary", shared.compressed_rotary if self.ratio else shared.swa_rotary, False)
+        if self.q_scale_rope:
+            native_name = "compressed_rotary_native" if self.ratio else "swa_rotary_native"
+            self.register_buffer("rotary_native", getattr(shared, native_name), False)
         self.register_buffer("window_offsets", torch.arange(self.window, dtype=torch.int32, device=device), False)
         self.register_buffer("compressed_offsets", torch.arange(512, dtype=torch.int32, device=device), False)
         self.register_buffer("swa_offsets", torch.arange(SWA_ROWS, dtype=torch.int32, device=device), False)
         self.register_buffer("selected_offsets", torch.arange(WORK_TOKENS * 512, dtype=torch.int32, device=device),
                              False)
         self.register_buffer("scale", torch.tensor([512**-0.5], dtype=torch.float32, device=device), False)
+
+    def prepare_output_weight(self):
+        """Bind the same persistent wo_a layouts used by bounded decode.
+
+        Paged CSA2 changes only KV ownership and candidate selection.  The
+        attention result and wo_a contract are identical, so keeping the
+        checkpoint layout here would otherwise reintroduce a per-layer
+        transpose and would make the prepared FP8 sidecar unreachable.
+        """
+        if self.woa_fp8:
+            return
+        if self.prepared_output:
+            weight = self.weights.wo_a.weight
+            if weight.dtype != torch.bfloat16 or weight.numel() != self.heads * 512 * 1024:
+                raise ValueError("V4.1 output weight contract changed")
+            grouped = weight.reshape(self.groups, 1024, -1)
+            self.weights.wo_a.weight = (grouped if self.output_gemm_layout else
+                                        grouped.transpose(1, 2).contiguous())
+
+    def project_output(self, value):
+        """Project MLA output without restoring a bounded-context weight path."""
+        if self.woa_fp8:
+            return torch.ops.custom_op.custom_deepseek_v41_woa_fp8_gaudi2(
+                value.contiguous(), self.weights.wo_a.weight, self.weights.wo_a.channel_scale)
+        if self.output_gemm_layout:
+            weight = self.weights.wo_a.weight
+            if value.shape[0] == 1:
+                return torch.cat(tuple(F.linear(value[:, group], weight[group]) for group in range(self.groups)),
+                                 dim=-1)
+            return torch.einsum("tgd,grd->tgr", value, weight).flatten(1)
+        if self.prepared_output:
+            return torch.einsum("tgd,gdr->tgr", value, self.weights.wo_a.weight).flatten(1)
+        weight = self.weights.wo_a.weight.reshape(self.groups, 1024, -1)
+        return torch.einsum("tgd,grd->tgr", value, weight).flatten(1)
+
+    def project_query(self, value, positions):
+        weight = self.weights.wq_b
+        if self.q_scale_rope and value.shape[0] == 1 and getattr(weight, "dense_fp8", False):
+            value = quantize_activation(value) if hasattr(weight, "scale") else value
+            return torch.ops.custom_op.custom_deepseek_v41_q_projection_rope_gaudi2(
+                value, weight.weight, weight.channel_scale, positions, self.rotary_native).reshape(-1, self.heads, 512)
+        return apply_rope(self.linear(value, weight).reshape(-1, self.heads, 512), positions, self.rotary)
 
     def _compress(self, value, positions):
         compressor = self.weights.compressor
@@ -241,14 +307,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         """Apply the shared output projection after either attention path."""
         output = apply_rope(output, positions, self.rotary, inverse=True)
         output = output.reshape(-1, self.groups, self.heads // self.groups * 512)
-        weight = self.weights.wo_a.weight
-        if gaudi_envs.VLLM_HPU_DSV41_PRETRANSPOSE_ATTN and weight.ndim == 3:
-            # Load-time layout is [groups, D, R]; this form has no transpose
-            # view for Synapse to materialize in every decode graph.
-            output = torch.einsum("tgd,gdr->tgr", output, weight).flatten(1)
-        else:
-            weight = weight.reshape(self.groups, 1024, -1)
-            output = torch.einsum("tgd,grd->tgr", output, weight).flatten(1)
+        output = self.project_output(output)
         partial = self.linear(output, self.weights.wo_b)
         return self.reduce(partial, ready_outputs=ready_outputs) if ready_outputs else self.reduce(partial)
 
@@ -265,9 +324,11 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
 
     def forward(self, value, positions, ready_outputs=()):
         query_input, kv_input = self._project_qkv_input(value)
-        qr = rms_norm(query_input, self.weights.q_norm.weight, self.eps)
-        query = apply_rope(self.linear(qr, self.weights.wq_b).reshape(-1, self.heads, 512), positions, self.rotary)
-        kv = rms_norm(kv_input, self.weights.kv_norm.weight, self.eps)
+        norm = (torch.ops.custom_op.custom_deepseek_v41_attention_norm_bf16_gaudi2
+                if self.fused_norm and value.shape[0] == 1 else rms_norm)
+        qr = norm(query_input, self.weights.q_norm.weight, self.eps)
+        query = self.project_query(qr, positions)
+        kv = norm(kv_input, self.weights.kv_norm.weight, self.eps)
         self.swa.index_copy_(0, positions.remainder(SWA_ROWS).long(), pack_swa(apply_rope(kv, positions, self.rotary)))
         native_prefix = (gaudi_envs.VLLM_HPU_DSV41_FUSED_PREFIX_LAYOUT and self.ratio in (1, 2)
                          and self.direct_selected_kv and self.shared_prefix_kv and self.window == 128

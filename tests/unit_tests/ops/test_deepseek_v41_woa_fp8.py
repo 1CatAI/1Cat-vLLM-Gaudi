@@ -7,6 +7,7 @@ import torch
 from vllm_gaudi import envs
 from vllm_gaudi.models.deepseek_v41_program import _weight_tree, load_weight_tree
 from vllm_gaudi.ops.deepseek_v41_attention import CSA2Attention
+from vllm_gaudi.ops.deepseek_v41_paged_attention import PagedCSA2Attention
 
 
 def test_woa_load_bypasses_dense_for_selected_layers(monkeypatch):
@@ -43,6 +44,24 @@ def test_woa_c1_and_prefill_share_prepared_weight(monkeypatch):
     monkeypatch.setattr(torch.ops, "custom_op", SimpleNamespace(custom_deepseek_v41_woa_fp8_gaudi2=operator))
     attention = SimpleNamespace(woa_fp8=True,
                                 weights=SimpleNamespace(wo_a=SimpleNamespace(weight=weight, channel_scale=scale)))
-    for tokens in (1, 3, 512):
-        assert CSA2Attention.project_output(attention, torch.zeros(tokens, 4, 4096)).shape == (tokens, 4096)
-    assert len(calls) == 3
+    for implementation in (CSA2Attention, PagedCSA2Attention):
+        for tokens in (1, 3, 512):
+            assert implementation.project_output(attention, torch.zeros(tokens, 4, 4096)).shape == (tokens, 4096)
+    assert len(calls) == 6
+
+
+def test_paged_output_preparation_matches_bounded_layout():
+    original = torch.arange(8 * 512 * 1024, dtype=torch.bfloat16).reshape(4096, 1024)
+    for implementation in (CSA2Attention, PagedCSA2Attention):
+        module = implementation.__new__(implementation)
+        torch.nn.Module.__init__(module)
+        module.woa_fp8 = False
+        module.prepared_output = True
+        module.output_gemm_layout = True
+        module.heads, module.groups = 8, 4
+        module.weights = torch.nn.Module()
+        module.weights.wo_a = torch.nn.Module()
+        module.weights.wo_a.register_buffer("weight", original.clone(), False)
+        module.prepare_output_weight()
+        assert module.weights.wo_a.weight.shape == (4, 1024, 1024)
+        assert torch.equal(module.weights.wo_a.weight, original.reshape(4, 1024, 1024))
