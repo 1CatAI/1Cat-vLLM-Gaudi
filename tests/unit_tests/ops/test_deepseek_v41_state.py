@@ -125,6 +125,18 @@ def test_position_bank_reuses_one_allocation_across_request_resets_and_prefill_t
             bank.copy_into(result[:count], start)
 
 
+def test_position_bank_uses_bounded_views_for_one_million_token_context():
+    from vllm_gaudi.ops.deepseek_v41_inputs import PositionBank
+    bank = PositionBank(1_048_576, 6, "cpu")
+    assert bank._views is None
+    result = torch.empty(6, dtype=torch.int32)
+    for start, count in ((0, 6), (1024, 1), (1_048_570, 6), (1_048_575, 1)):
+        bank.copy_into(result[:count], start)
+        assert result[:count].tolist() == list(range(start, start + count))
+    with pytest.raises(ValueError, match="range/device"):
+        bank.copy_into(result, 1_048_571)
+
+
 def test_engine_registers_opaque_state_without_worker_model_initialization(monkeypatch):
     from vllm.v1 import kv_cache_spec_registry as registry
     from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
