@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """HPU V4.1 model registration with prepared weights and explicit stage inputs."""
 
-import gc
 from pathlib import Path
 
 import torch
@@ -75,7 +74,6 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                                      dspark=envs.VLLM_HPU_DSV41_DSPARK)
         self.program.replay_owner = StageReplay(self.program) if self.native else None
         self.ordinary = CompiledStage(self.program)
-        self.long_context_programs = {}
         self.engram_host, self.step_ticket, self.last_aux = None, None, None
         self._decode_prefix = None
         self._step_request_id = None
@@ -282,30 +280,13 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             engram = ()
         search = getattr(self.program, "search_length", 512)
         if search > 1024:
-            key = (input_ids.numel(), search)
-            if key not in self.long_context_programs:
-                # Search buckets grow during a long request. Retaining a
-                # complete compiled stage for every old bucket eventually
-                # exhausts Synapse's graph objects even when HBM has headroom.
-                # Completed scheduler transactions no longer consume the old
-                # bucket; its recipe remains available in the disk cache.
-                if self.long_context_programs:
-                    torch.hpu.synchronize()
-                    self.long_context_programs.clear()
-                    gc.collect()
-                    # HPU does not expose an allocator-backed empty_cache
-                    # operation.  vLLM's platform hook is intentionally a
-                    # no-op on Gaudi, so releasing the Python graph owners and
-                    # collecting them is the complete supported cleanup here.
-                # Long-context prefill carries the complete paged state pool.
-                # Compiling four layers as one graph can exhaust the remaining
-                # transient HBM before Synapse finishes graph construction.
-                # Compile one layer at a time for the paged prefill variant.
-                # Two-layer groups still fail Synapse graph construction on
-                # the final PP stage after the full state pool is resident.
-                # Decode keeps its four-layer replay groups.
-                self.long_context_programs[key] = CompiledStage(self.program, group_size=1)
-            execute = self.long_context_programs[key]
+            # A compiled long-prefill stage retains graph objects for the full
+            # 1M paged state pool.  Even one-layer groups fail Synapse graph
+            # construction once the four rank-local weights and KV capacity
+            # are resident.  Run only this C64 prefill tile through the eager
+            # program.  C1 decode remains on the native four-layer replay, so
+            # long-context support does not perturb the measured decode path.
+            execute = self.program
         else:
             execute = self.program.replay_owner if self.native and self.step_use_replay else self.ordinary
         if self._decode_prefix is not None:
