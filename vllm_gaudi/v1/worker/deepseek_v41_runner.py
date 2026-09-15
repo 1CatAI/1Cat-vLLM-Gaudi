@@ -41,6 +41,7 @@ VERIFY_METADATA_SIZE = 7
 VERIFY_PROPOSED_SIZE = 5
 VERIFY_CONTROL_SIZE = VERIFY_METADATA_SIZE + VERIFY_PROPOSED_SIZE
 PREFILL_BLOCK_TOKENS = 128
+PREFILL_MAX_INFLIGHT_BLOCKS = 8
 
 
 def profile_phase(name):
@@ -1363,7 +1364,7 @@ class V41ModelRunner:
         if self.verify_timing:
             self.verify_timing.begin(req_id, self.pp.generation + 1, count, len(proposed))
         chunks = [(0, tokens)] if decode else target_chunks(tokens)
-        for offset, chunk in chunks:
+        for block_index, (offset, chunk) in enumerate(chunks):
             hidden = self._forward(req_id,
                                    chunk,
                                    start + offset,
@@ -1373,6 +1374,17 @@ class V41ModelRunner:
             if offset + len(chunk) < count:
                 self._insert(self.model.last_aux, self.positions[:len(chunk)])
                 self.model.complete_step(len(chunk))
+                # A scheduler transaction can contain 8192 prompt tokens,
+                # i.e. 64 C128 graphs.  Letting all of them remain in flight
+                # retains several GiB of compiled-graph temporaries and can
+                # force Synapse to defragment while buffers are still live.
+                # Bound that lifetime without changing the scheduler's 8192
+                # admission limit or the C128 model geometry.  PP work must be
+                # complete before the device drain so both stages advance the
+                # same prefix generation.
+                if (block_index + 1) % PREFILL_MAX_INFLIGHT_BLOCKS == 0:
+                    self.pp.drain()
+                    torch.hpu.synchronize()
         need_sample = start + count >= len(request.tokens)
         if self.pp.group.is_last_rank and need_sample:
             if not self.use_dspark:

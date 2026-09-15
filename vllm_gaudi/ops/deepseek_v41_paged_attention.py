@@ -115,12 +115,10 @@ class PagedCSA2SharedState(nn.Module):
                                  scaling["original_max_position_embeddings"] if compressed else 0, scaling["factor"],
                                  scaling["beta_fast"], scaling["beta_slow"])
             self.register_buffer(name, table.to(device), False)
-            # The fused dense-FP8 Q projection consumes the verified
-            # [cos32, sin32] table.  Keep this stage-owned rather than
-            # allocating one 1M-position copy in every attention layer.
-            if gaudi_envs.VLLM_HPU_DSV41_Q_SCALE_ROPE:
-                native = torch.cat((table[..., 0], table[..., 1]), -1).contiguous()
-                self.register_buffer(f"{name}_native", native.to(device), False)
+            # Native RoPE needs [cos32, sin32], but a complete 1M-position
+            # copy costs another 256 MiB for each table on every rank.  The
+            # active search bucket is at most the currently reachable prefix;
+            # materialize that correctly laid-out bucket lazily below.
 
     def rotary_bucket(self, name, length):
         """Return a stable RoPE buffer whose backing storage is bucket-sized."""
@@ -129,7 +127,7 @@ class PagedCSA2SharedState(nn.Module):
         key = (name, int(length))
         bucket = self._rotary_buckets.get(key)
         if bucket is None:
-            if name.endswith("_native") and not hasattr(self, name):
+            if name.endswith("_native"):
                 # The TPC RoPE kernel consumes [cos0..cos31,sin0..sin31].
                 # The checkpoint/reference table is adjacent-pair interleaved
                 # [cos0,sin0,...].  Build the native layout once per bucket;
