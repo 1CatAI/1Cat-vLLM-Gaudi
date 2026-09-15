@@ -91,6 +91,20 @@ def test_paged_rotary_buckets_have_independent_shared_storage():
     assert larger.untyped_storage()._cdata != ordinary.untyped_storage()._cdata
 
 
+def test_paged_native_rotary_bucket_converts_interleaved_layout_once():
+    shared = object.__new__(PagedCSA2SharedState)
+    torch.nn.Module.__init__(shared)
+    shared.length = 2
+    shared._rotary_buckets = {}
+    ordinary = torch.arange(2 * 32 * 2, dtype=torch.float32).reshape(2, 32, 2)
+    shared.register_buffer("swa_rotary", ordinary, False)
+
+    native = shared.rotary_bucket("swa_rotary_native", 2)
+    assert torch.equal(native, torch.cat((ordinary[..., 0], ordinary[..., 1]), -1))
+    assert native.untyped_storage()._cdata != ordinary.untyped_storage()._cdata
+    assert shared.rotary_bucket("swa_rotary_native", 2) is native
+
+
 def test_paged_attention_rebinds_shared_rotary_bucket():
     shared = _rotary_shared()
     attention = object.__new__(PagedCSA2Attention)
@@ -98,6 +112,7 @@ def test_paged_attention_rebinds_shared_rotary_bucket():
     attention.shared = shared
     attention._rotary_name = "swa_rotary"
     attention._rotary_native_name = "swa_rotary_native"
+    attention.native_rope = False
     attention.q_scale_rope = True
     attention.register_buffer("rotary", shared.rotary_bucket("swa_rotary", 512), False)
     attention.register_buffer("rotary_native", shared.rotary_bucket("swa_rotary_native", 512), False)

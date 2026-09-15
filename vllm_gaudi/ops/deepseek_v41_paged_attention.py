@@ -14,7 +14,7 @@ from torch import nn
 from vllm_gaudi import envs as gaudi_envs
 from vllm_gaudi.ops.deepseek_v41_qkv import FusedCompressorInput, FusedQKVInput
 from vllm_gaudi.ops.deepseek_v41_math import (
-    apply_rope,
+    _apply_rope_torch,
     pack_fp4,
     pack_swa,
     quantize_activation,
@@ -129,9 +129,18 @@ class PagedCSA2SharedState(nn.Module):
         key = (name, int(length))
         bucket = self._rotary_buckets.get(key)
         if bucket is None:
-            # ``clone`` is intentional: contiguous slices still share the full
-            # table allocation and reproduce the short-request compile stall.
-            bucket = getattr(self, name)[:length].clone()
+            if name.endswith("_native") and not hasattr(self, name):
+                # The TPC RoPE kernel consumes [cos0..cos31,sin0..sin31].
+                # The checkpoint/reference table is adjacent-pair interleaved
+                # [cos0,sin0,...].  Build the native layout once per bucket;
+                # passing a reshaped interleaved table silently rotates every
+                # pair with the wrong phase in the paged 1M path.
+                source = getattr(self, name.removesuffix("_native"))[:length]
+                bucket = torch.cat((source[..., 0], source[..., 1]), -1).contiguous()
+            else:
+                # ``clone`` is intentional: contiguous slices still share the full
+                # table allocation and reproduce the short-request compile stall.
+                bucket = getattr(self, name)[:length].clone()
             self._rotary_buckets[key] = bucket
         return bucket
 
@@ -161,6 +170,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         self._fused_compressor_weight = None
         self._fused_compressor_kv_width = 0
         self.mla_mme = gaudi_envs.VLLM_HPU_DSV41_MLA_MME and layer < config["num_hidden_layers"]
+        self.native_rope = gaudi_envs.VLLM_HPU_DSV41_NATIVE_ROPE
         self.q_scale_rope = (gaudi_envs.VLLM_HPU_DSV41_Q_SCALE_ROPE
                              and layer < config["num_hidden_layers"])
         if self.q_scale_rope and not (gaudi_envs.VLLM_HPU_DSV41_NATIVE_ROPE
@@ -196,7 +206,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             self.register_buffer("score_history", torch.zeros_like(self.kv_history), False)
         self._rotary_name = "compressed_rotary" if self.ratio else "swa_rotary"
         self.register_buffer("rotary", shared.rotary_bucket(self._rotary_name, self.search_length), False)
-        if self.q_scale_rope:
+        if self.native_rope or self.q_scale_rope:
             self._rotary_native_name = f"{self._rotary_name}_native"
             self.register_buffer("rotary_native",
                                  shared.rotary_bucket(self._rotary_native_name, self.search_length), False)
@@ -235,8 +245,19 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         """Bind this layer to the shared independent-storage RoPE bucket."""
         self.search_length = int(length)
         self.rotary = self.shared.rotary_bucket(self._rotary_name, self.search_length)
-        if self.q_scale_rope:
+        if self.native_rope or self.q_scale_rope:
             self.rotary_native = self.shared.rotary_bucket(self._rotary_native_name, self.search_length)
+
+    def _rope(self, value, positions, inverse=False):
+        if (self.native_rope and value.dtype == torch.bfloat16 and value.ndim in (2, 3)
+                and (value.ndim == 2 or 1 <= value.shape[1] <= 128) and 1 <= value.shape[0] <= NATIVE_WORK_TOKENS
+                and 128 <= value.shape[-1] <= 512 and value.shape[-1] % 128 == 0):
+            op = (torch.ops.custom_op.custom_deepseek_v41_rope_inverse_bf16_gaudi2
+                  if inverse else torch.ops.custom_op.custom_deepseek_v41_rope_bf16_gaudi2)
+            shaped = value.reshape(value.shape[0], -1, value.shape[-1]).contiguous()
+            return op(shaped, positions.to(torch.int32).contiguous(),
+                      self._rotary_native_table()).reshape(value.shape)
+        return _apply_rope_torch(value, positions, self._rotary_table(), inverse)
 
     def project_output(self, value):
         """Project MLA output without restoring a bounded-context weight path."""
@@ -261,8 +282,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             return torch.ops.custom_op.custom_deepseek_v41_q_projection_rope_gaudi2(
                 value, weight.weight, weight.channel_scale, positions,
                 self._rotary_native_table()).reshape(-1, self.heads, 512)
-        return apply_rope(self.linear(value, weight).reshape(-1, self.heads, 512), positions,
-                          self._rotary_table())
+        return self._rope(self.linear(value, weight).reshape(-1, self.heads, 512), positions)
 
     def _compress(self, value, positions):
         compressor = self.weights.compressor
@@ -314,14 +334,13 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                             rows.remainder(PAGE_TOKENS // self.ratio))
         indexer = self.weights.indexer
         index = rms_norm(self.linear(latent, indexer.wk), indexer.k_norm.weight, self.eps)
-        rotary = self._rotary_table()
-        self.cache.index.index_copy_(0, slots.long(), pack_fp4(apply_rope(index, first, rotary), 32))
-        self.cache.main.index_copy_(0, slots.long(), pack_fp4(apply_rope(latent, first, rotary), 16))
+        self.cache.index.index_copy_(0, slots.long(), pack_fp4(self._rope(index, first), 32))
+        self.cache.main.index_copy_(0, slots.long(), pack_fp4(self._rope(latent, first), 16))
 
     def _scores(self, value, qr, positions, logical_rows):
         indexer = self.weights.indexer
         q = self.linear(qr, indexer.wq_b).reshape(-1, self.index_heads, 128)
-        q = unpack_fp4(pack_fp4(apply_rope(q, positions, self._rotary_table()), 32), 128, 32)
+        q = unpack_fp4(pack_fp4(self._rope(q, positions), 32), 128, 32)
         weights = self.linear(value, indexer.weights_proj) * (128**-0.5 * (self.index_heads * 2)**-0.5)
         # Exchange only small query/head tensors, not one score per cached token.
         q, weights = self.gather(q, 1), self.gather(weights, 1)
@@ -373,7 +392,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
 
     def _finish_output(self, output, positions, ready_outputs=()):
         """Apply the shared output projection after either attention path."""
-        output = apply_rope(output, positions, self._rotary_table(), inverse=True)
+        output = self._rope(output, positions, inverse=True)
         output = output.reshape(-1, self.groups, self.heads // self.groups * 512)
         output = self.project_output(output)
         partial = self.linear(output, self.weights.wo_b)
@@ -398,7 +417,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         query = self.project_query(qr, positions)
         kv = norm(kv_input, self.weights.kv_norm.weight, self.eps)
         self.swa.index_copy_(0, positions.remainder(SWA_ROWS).long(),
-                             pack_swa(apply_rope(kv, positions, self._rotary_table())))
+                             pack_swa(self._rope(kv, positions)))
         native_prefix = (gaudi_envs.VLLM_HPU_DSV41_FUSED_PREFIX_LAYOUT and self.ratio in (1, 2)
                          and self.direct_selected_kv and self.shared_prefix_kv and self.window == 128
                          and value.device.type == "hpu" and 1 <= value.shape[0] <= NATIVE_WORK_TOKENS
@@ -468,7 +487,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
     def insert_context(self, value, positions, valid_count=None):
         kv = rms_norm(self.linear(value, self.weights.wkv), self.weights.kv_norm.weight, self.eps)
         indices = positions.remainder(SWA_ROWS).long()
-        packed = pack_swa(apply_rope(kv, positions, self._rotary_table()))
+        packed = pack_swa(self._rope(kv, positions))
         if valid_count is not None:
             old = self.swa.index_select(0, indices)
             mask = torch.arange(indices.numel(), device=indices.device) < valid_count.reshape(1)
@@ -478,10 +497,9 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
 
     def draft(self, value, positions):
         query = rms_norm(self.linear(value, self.weights.wq_a), self.weights.q_norm.weight, self.eps)
-        rotary = self._rotary_table()
-        query = apply_rope(self.linear(query, self.weights.wq_b).reshape(-1, self.heads, 512), positions, rotary)
+        query = self._rope(self.linear(query, self.weights.wq_b).reshape(-1, self.heads, 512), positions)
         kv = rms_norm(self.linear(value, self.weights.wkv), self.weights.kv_norm.weight, self.eps)
-        kv = unpack_swa(pack_swa(apply_rope(kv, positions, rotary)))
+        kv = unpack_swa(pack_swa(self._rope(kv, positions)))
         cache = torch.cat((unpack_swa(self.swa), kv), 0)
         window = positions[:1] - self.window + self.window_offsets
         window = torch.where(window >= 0, window.remainder(SWA_ROWS), -1)
