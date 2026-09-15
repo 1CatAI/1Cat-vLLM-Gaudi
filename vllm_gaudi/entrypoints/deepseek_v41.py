@@ -175,6 +175,10 @@ def main():
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--checkpoint-audit")
     parser.add_argument("--runtime-profile", default=runtime_profile or settings.get("runtime_profile"))
+    parser.add_argument("--max-model-len", type=int, default=512)
+    parser.add_argument("--max-num-seqs", type=int, default=1)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=512)
+    parser.add_argument("--block-size", type=int, default=512)
     v2 = parser.add_mutually_exclusive_group()
     v2.add_argument("--v2", dest="v2", action="store_true", help="Use the V2 HPU scheduling/completion adapter")
     v2.add_argument("--no-v2", dest="v2", action="store_false", help="Use the synchronous V4.1 model runner")
@@ -271,11 +275,12 @@ def main():
     scheduling = "--async-scheduling" if gaudi_envs.VLLM_HPU_DSV41_V2 else "--no-async-scheduling"
     sys.argv = [
         "vllm", "serve", args.model, "--host", args.host, "--port",
-        str(args.port), "--dtype", "bfloat16", "--max-model-len", "512", "--generation-config", "vllm",
-        "--tensor-parallel-size", "2", "--pipeline-parallel-size", "2", "--max-num-seqs", "1",
-        "--max-num-batched-tokens", "512", "--load-format", "dsv41_prepared", "--model-loader-extra-config",
+        str(args.port), "--dtype", "bfloat16", "--max-model-len", str(args.max_model_len),
+        "--generation-config", "vllm", "--tensor-parallel-size", "2", "--pipeline-parallel-size", "2",
+        "--max-num-seqs", str(args.max_num_seqs), "--max-num-batched-tokens",
+        str(args.max_num_batched_tokens), "--load-format", "dsv41_prepared", "--model-loader-extra-config",
         json.dumps(loader), "--mm-encoder-tp-mode", "data", "--no-enable-prefix-caching", scheduling,
-        "--block-size", "512", *speculative, *extra
+        "--block-size", str(args.block_size), *speculative, *extra
     ]
     from vllm.entrypoints.cli.main import main as serve
     serve()
