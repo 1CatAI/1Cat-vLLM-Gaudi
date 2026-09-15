@@ -443,6 +443,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="store video-VAE decoder Linear weights in their HPU autocast dtype (default: enabled)",
     )
     parser.add_argument(
+        "--vae-compile-swiglu",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="compile and bit-exactly verify video-VAE SwiGLU pointwise graphs (default: enabled)",
+    )
+    parser.add_argument(
+        "--vae-compile-qk-norm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="compile and bit-exactly verify video-VAE Q/K RMSNorm graphs (default: enabled)",
+    )
+    parser.add_argument(
+        "--vae-compile-rope",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="compile and bit-exactly verify video-VAE rotary embedding graphs (default: enabled)",
+    )
+    parser.add_argument(
         "--offload-component",
         action="append",
         choices=("text_encoder", "dit"),
@@ -525,6 +543,9 @@ def main() -> int:
         VLLM_GAUDI_H3_PHASE_OFFLOAD="1" if args.phase_offload else "0",
         VLLM_GAUDI_H3_VAE_TILE_BATCH_SIZE=str(args.vae_tile_batch_size),
         VLLM_GAUDI_H3_VAE_PERSIST_BF16_WEIGHTS="1" if args.vae_persist_bf16_weights else "0",
+        VLLM_GAUDI_H3_VAE_COMPILE_SWIGLU="1" if args.vae_compile_swiglu else "0",
+        VLLM_GAUDI_H3_VAE_COMPILE_QK_NORM="1" if args.vae_compile_qk_norm else "0",
+        VLLM_GAUDI_H3_VAE_COMPILE_ROPE="1" if args.vae_compile_rope else "0",
     )
     if args.temp_dir is not None:
         environment.update(TMPDIR=str(args.temp_dir), TMP=str(args.temp_dir), TEMP=str(args.temp_dir))
@@ -546,6 +567,9 @@ def main() -> int:
                 "phase_offload": bool(args.phase_offload),
                 "vae_tile_batch_size": int(args.vae_tile_batch_size),
                 "vae_persist_bf16_weights": bool(args.vae_persist_bf16_weights),
+                "vae_compile_swiglu": bool(args.vae_compile_swiglu),
+                "vae_compile_qk_norm": bool(args.vae_compile_qk_norm),
+                "vae_compile_rope": bool(args.vae_compile_rope),
                 "temp_dir": str(args.temp_dir) if args.temp_dir else None,
                 "media_bin": str(args.media_bin),
                 "huggingface_network_disabled": True,

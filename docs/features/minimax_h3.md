@@ -160,6 +160,14 @@ weight casts while preserving the sequential decoder's output bytes. Use
 `--vae-tile-batch-size 1` to reproduce sequential tile execution, or
 `--no-vae-persist-bf16-weights` to retain FP32 parameter storage.
 
+The default HPU VAE policy also compiles the decoder's SwiGLU, Q/K RMSNorm, and
+rotary pointwise regions. Each compiled region is checked against its eager HPU
+result on the first real tensor contract and permanently falls back if any
+value changes or compilation fails. Spatial and temporal seam ramps are cached
+without changing the checkpoint's blend order. The three compiled regions can
+be isolated with `--no-vae-compile-swiglu`, `--no-vae-compile-qk-norm`, and
+`--no-vae-compile-rope` when qualifying a new software stack.
+
 The launcher also validates `ffmpeg` and `ffprobe` before starting a Ref2VA
 worker. `--media-bin` defaults to `/opt/habanalabs/media/ffmpeg/bin` and is
 prepended to `PATH`; set it explicitly when the Habana media tools live
@@ -362,6 +370,13 @@ audio decode through the Habana FFmpeg build, samples HBM and host memory, and
 reports the warmed median and range. Profiling is disabled for these main
 measurements.
 
+The combined Attention, Dense, and VAE candidate is promoted only when the
+subsequent-three warmed median is at most 25 seconds. Every measured output must also
+pass full audio/video decoding and manual prompt, motion, and audio review; a
+microbenchmark or a structurally valid but degraded video does not satisfy the
+gate. The VAE-only changes below use a stricter check: all 124 prepared frames
+must remain byte-identical to the frozen reference.
+
 The qualified Gaudi 2 run at 1344x768 produced the following BF16 baselines.
 Both used four actual joint DiT forwards, generated 124 internal frames, and
 delivered a separately trimmed 120-frame/five-second H.264 + stereo AAC file.
@@ -398,6 +413,12 @@ seven temporal chunks. Four-tile batching plus persistent BF16 Linear operands
 reduced synchronized decode time from 53.96 s to 42.90 s (20.5%) while keeping
 the prepared uint8 output byte-identical. Its measured allocator peak was
 25.38 GiB, leaving enough room for the single-card phase placement.
+
+Exact compiled SwiGLU, Q/K RMSNorm, and rotary regions plus cached seam ramps
+reduce that BF16-parameter candidate by a further 6.5%. The complete 124-frame
+comparison remains byte-identical. Each graph validates every new tensor
+contract before reuse, and its eager implementation remains the permanent
+fallback for a failed compile or equality check.
 
 A hardware trace of one decoder call explains the improvement. Moving from one
 tile to four tiles reduced the idle share from 19.45% to 2.86%, raised TPC

@@ -51,6 +51,9 @@ are in progress.
 | `VLLM_MULTIMODAL_RESOLUTIONS` | Pins explicit raw pixel resolutions (comma-separated, e.g. `1024x768,768x1024`) to warm up for native-resolution vision towers. Each entry is `WxH`, `WxHxN` (pin the count-`N` graph), or `WxHxN-M` (warm the item-count range `[N, M]`); `WxH` alone warms one graph at the `--limit-mm-per-prompt` ceiling. See [Warm-up](../features/warmup.md#multimodal-warm-up). | `None` |
 | `VLLM_GAUDI_H3_VAE_TILE_BATCH_SIZE` | Number of independent MiniMax H3 video-VAE spatial tiles decoded together. Use `1` for sequential tile execution. | `4` |
 | `VLLM_GAUDI_H3_VAE_PERSIST_BF16_WEIGHTS` | Stores MiniMax H3 video-VAE decoder Linear weights in BF16, matching HPU autocast while avoiding repeated weight casts. | `true` |
+| `VLLM_GAUDI_H3_VAE_COMPILE_SWIGLU` | Compiles the MiniMax H3 video-VAE SwiGLU pointwise region with the HPU backend and verifies every real tensor contract bit-for-bit before reuse. | `true` |
+| `VLLM_GAUDI_H3_VAE_COMPILE_QK_NORM` | Compiles the MiniMax H3 video-VAE Q/K RMSNorm region with the HPU backend and verifies every real tensor contract bit-for-bit before reuse. | `true` |
+| `VLLM_GAUDI_H3_VAE_COMPILE_ROPE` | Compiles the MiniMax H3 video-VAE rotary embedding region with the HPU backend and verifies every real tensor contract bit-for-bit before reuse. | `true` |
 | `VLLM_MINIMAX_M3_MOE_TOKEN_TILE` | Maximum number of tokens processed per tile by the MiniMax-M3 dense SwiGLU-OAI expert path. Non-positive values disable tiling. | `512` |
 | `VLLM_MINIMAX_M3_MOE_DECODE_GATHER` | Enables the MiniMax-M3 routed-expert gather path for low-token decode. Set to `0` or `false` to use the dense expert path. | `true` |
 | `VLLM_MINIMAX_M3_MOE_GATHER_MAX_TOKENS` | Maximum token count for the MiniMax-M3 routed-expert gather path. Larger batches use the dense expert path. | `16` |

@@ -31,8 +31,17 @@ from vllm_gaudi.omni.minimax_h3 import (
     map_minimax_h3_encoder_weight,
 )
 from vllm_gaudi.omni.minimax_h3_vae import (
+    _H3VAECompiledRoPE,
+    _h3_vae_rope,
+    _h3_vae_compile_rope,
+    _h3_vae_compile_qk_norm,
+    _h3_vae_compile_swiglu,
+    _h3_vae_blend_with_weights,
     _h3_vae_persist_bf16_weights,
     _h3_vae_tile_batch_size,
+    _install_h3_vae_compiled_swiglu,
+    _install_h3_vae_compiled_qk_rms_norm,
+    _install_h3_vae_blend_weight_cache,
     _install_h3_vae_decode_tile_batching,
     _materialize_h3_vae_decoder_linear_weights,
 )
@@ -183,6 +192,143 @@ def test_h3_vae_persist_bf16_weights_environment_is_strict(monkeypatch):
     monkeypatch.setenv("VLLM_GAUDI_H3_VAE_PERSIST_BF16_WEIGHTS", "sometimes")
     with pytest.raises(ValueError, match="must be a boolean"):
         _h3_vae_persist_bf16_weights()
+
+
+def test_h3_vae_compile_swiglu_environment_is_strict(monkeypatch):
+    monkeypatch.delenv("VLLM_GAUDI_H3_VAE_COMPILE_SWIGLU", raising=False)
+    assert _h3_vae_compile_swiglu()
+
+    monkeypatch.setenv("VLLM_GAUDI_H3_VAE_COMPILE_SWIGLU", "off")
+    assert not _h3_vae_compile_swiglu()
+
+    monkeypatch.setenv("VLLM_GAUDI_H3_VAE_COMPILE_SWIGLU", "sometimes")
+    with pytest.raises(ValueError, match="must be a boolean"):
+        _h3_vae_compile_swiglu()
+
+
+def test_h3_vae_compile_qk_norm_environment_is_strict(monkeypatch):
+    monkeypatch.delenv("VLLM_GAUDI_H3_VAE_COMPILE_QK_NORM", raising=False)
+    assert _h3_vae_compile_qk_norm()
+
+    monkeypatch.setenv("VLLM_GAUDI_H3_VAE_COMPILE_QK_NORM", "off")
+    assert not _h3_vae_compile_qk_norm()
+
+    monkeypatch.setenv("VLLM_GAUDI_H3_VAE_COMPILE_QK_NORM", "sometimes")
+    with pytest.raises(ValueError, match="must be a boolean"):
+        _h3_vae_compile_qk_norm()
+
+
+def test_h3_vae_compile_rope_environment_is_strict(monkeypatch):
+    monkeypatch.delenv("VLLM_GAUDI_H3_VAE_COMPILE_ROPE", raising=False)
+    assert _h3_vae_compile_rope()
+
+    monkeypatch.setenv("VLLM_GAUDI_H3_VAE_COMPILE_ROPE", "off")
+    assert not _h3_vae_compile_rope()
+
+    monkeypatch.setenv("VLLM_GAUDI_H3_VAE_COMPILE_ROPE", "sometimes")
+    with pytest.raises(ValueError, match="must be a boolean"):
+        _h3_vae_compile_rope()
+
+
+def test_h3_vae_compiled_rope_preserves_partial_rotation(monkeypatch):
+    monkeypatch.setattr(torch, "compile", lambda function, **kwargs: function)
+    compiled = _H3VAECompiledRoPE()
+    value = torch.randn(2, 7, 4, 8, dtype=torch.bfloat16)
+    cos = torch.randn(2, 7, 1, 4)
+    sin = torch.randn_like(cos)
+
+    expected = _h3_vae_rope(value, cos, sin)
+    assert torch.equal(compiled(value, cos, sin), expected)
+    assert len(compiled._verified) == 1
+
+
+def test_h3_vae_compiled_swiglu_preserves_feed_forward(monkeypatch):
+
+    class FeedForward(torch.nn.Module):
+
+        def __init__(self):
+            super().__init__()
+            self.w1 = torch.nn.Linear(8, 32)
+            self.w2 = torch.nn.Linear(16, 8)
+            self.act_fn = torch.nn.SiLU()
+            self.use_gated = True
+
+        def forward(self, value):
+            gate, up = self.w1(value).chunk(2, dim=-1)
+            return self.w2(self.act_fn(gate) * up)
+
+    class Block(torch.nn.Module):
+
+        def __init__(self):
+            super().__init__()
+            self.ff = FeedForward()
+
+    decoder = SimpleNamespace(transformer_blocks=torch.nn.ModuleList([Block()]))
+    value = torch.randn(2, 3, 8)
+    expected = decoder.transformer_blocks[0].ff(value)
+    monkeypatch.setattr(torch, "compile", lambda function, **kwargs: function)
+
+    assert _install_h3_vae_compiled_swiglu(decoder) == 1
+    assert _install_h3_vae_compiled_swiglu(decoder) == 0
+    assert torch.equal(decoder.transformer_blocks[0].ff(value), expected)
+
+
+def test_h3_vae_compiled_qk_rms_norm_preserves_attention_modules(monkeypatch):
+
+    class Attention(torch.nn.Module):
+
+        def __init__(self):
+            super().__init__()
+            self.norm_q = torch.nn.RMSNorm(8, eps=1e-5, elementwise_affine=False)
+            self.norm_k = torch.nn.RMSNorm(8, eps=1e-5, elementwise_affine=False)
+
+    class Block(torch.nn.Module):
+
+        def __init__(self):
+            super().__init__()
+            self.attn = Attention()
+
+    decoder = SimpleNamespace(transformer_blocks=torch.nn.ModuleList([Block(), Block()]))
+    value = torch.randn(2, 3, 8)
+    expected = [norm(value) for block in decoder.transformer_blocks for norm in (block.attn.norm_q, block.attn.norm_k)]
+    monkeypatch.setattr(torch, "compile", lambda function, **kwargs: function)
+
+    assert _install_h3_vae_compiled_qk_rms_norm(decoder) == 4
+    assert _install_h3_vae_compiled_qk_rms_norm(decoder) == 0
+    actual = [norm(value) for block in decoder.transformer_blocks for norm in (block.attn.norm_q, block.attn.norm_k)]
+    assert all(torch.equal(candidate, reference) for candidate, reference in zip(actual, expected))
+
+
+def test_h3_vae_cached_blend_preserves_overlap_math():
+    a = torch.randn(1, 3, 5, 8, 9, dtype=torch.bfloat16)
+    b = torch.randn_like(a)
+    extent = 3
+    positions = torch.arange(extent, dtype=b.dtype)
+    weights = (
+        (1 - positions / extent).view(1, 1, 1, 1, extent),
+        (positions / extent).view(1, 1, 1, 1, extent),
+    )
+    expected_overlap = a[..., -extent:] * weights[0] + b[..., :extent] * weights[1]
+    expected = torch.cat((expected_overlap, b[..., extent:]), dim=-1)
+
+    assert torch.equal(_h3_vae_blend_with_weights(a, b, extent, -1, weights), expected)
+
+
+def test_h3_vae_installs_blend_weight_cache_once():
+
+    class VAE:
+
+        @staticmethod
+        def blend(a, b, blend_extent, dim):
+            del a, blend_extent, dim
+            return b
+
+    model = VAE()
+    original = model.blend
+    assert _install_h3_vae_blend_weight_cache(model)
+    assert _install_h3_vae_blend_weight_cache(model)
+    assert model._vllm_gaudi_original_blend == original
+    assert model._vllm_gaudi_blend_weights == {}
 
 
 def test_h3_vae_materializes_only_decoder_linears_in_bf16():
