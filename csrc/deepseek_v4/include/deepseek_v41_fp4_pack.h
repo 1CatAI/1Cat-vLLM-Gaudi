@@ -15,7 +15,8 @@ static inline int64 fp4_scale_e4m3(float64 value) {
 static inline void fp4_pack_group(tensor value, tensor output, int group, int input_row,
                                  int output_row, int group_size
 #ifdef DSV41_DECODED_KV_WRITE
-                                 , tensor decoded, bool write_decoded
+                                 , tensor decoded, bool write_decoded,
+                                 int decoded_row
 #endif
                                  ) {
     const int width = get_dim_size(value, 0);
@@ -76,7 +77,7 @@ static inline void fp4_pack_group(tensor value, tensor output, int group, int in
         const bfloat128 decoded_bf16 = convert_float128_to_bfloat128(
             converted, SW_RHNE | SW_LINEAR);
         v_bf16_st_tnsr_partial(
-            (int5){group * group_size, output_row, 0, 0, 0}, decoded,
+            (int5){group * group_size, decoded_row, 0, 0, 0}, decoded,
             decoded_bf16, group_size - 1, 0);
     }
 #endif

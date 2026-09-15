@@ -136,7 +136,7 @@ request. Compressed history stays in its scheduler-owned HPU pages.
         self.working = {
             name: value
             for name, value in program.named_buffers()
-            if name.rsplit(".", 1)[-1] in ("swa", "kv_history", "score_history")
+            if name.rsplit(".", 1)[-1] in ("swa", "decoded_swa", "decoded_main", "kv_history", "score_history")
         }
         self.saved, self.active, self.blocks = {}, None, 2
         # The scheduler page table is small but long-lived.  Rebuilding a

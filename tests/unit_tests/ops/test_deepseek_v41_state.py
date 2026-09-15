@@ -243,6 +243,30 @@ def test_paged_state_reuses_pinned_block_table_and_only_publishes_changes(monkey
     assert program.shared.block_table.values.tolist() == [1, 2, 3, 4, 5, 6, 7, 8]
 
 
+def test_paged_state_saves_and_clears_decoded_working_set(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda value, *args, **kwargs: value)
+    program = torch.nn.Module()
+    program.pp_rank, program.generation, program.replay_owner = 0, 0, None
+    program.register_buffer("decoded_swa", torch.zeros(2, dtype=torch.bfloat16))
+    source = torch.nn.Module()
+    source.ratio = 2
+    source.register_buffer("decoded_main", torch.zeros(2, dtype=torch.bfloat16))
+    program.add_module("source", source)
+    block_table = torch.empty(8, dtype=torch.int32)
+    program.shared = SimpleNamespace(sources={0: source}, block_table=block_table)
+    state = PagedStageState(program)
+    state.allocate(5, "cpu")
+    state.activate("a", [1], reset=True)
+    program.decoded_swa.fill_(3)
+    program.source.decoded_main.fill_(5)
+    state.activate("b", [2], reset=True)
+    assert not program.decoded_swa.any() and not program.source.decoded_main.any()
+    state.activate("a", [1])
+    assert (program.decoded_swa == 3).all() and (program.source.decoded_main == 5).all()
+
+
 def test_target_capture_does_not_claim_draft_only_state():
     from vllm_gaudi.ops.deepseek_v41_replay import stage_state_tensors
     program = torch.nn.Module()

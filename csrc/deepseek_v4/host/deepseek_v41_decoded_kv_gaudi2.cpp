@@ -6,6 +6,10 @@ extern unsigned char _binary___deepseek_v41_swa_decoded_write_bf16_gaudi2_o_star
 extern unsigned char _binary___deepseek_v41_swa_decoded_write_bf16_gaudi2_o_end;
 extern unsigned char _binary___deepseek_v41_fp4_decoded_write_bf16_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_fp4_decoded_write_bf16_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_swa_paged_decoded_write_bf16_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_swa_paged_decoded_write_bf16_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_fp4_paged_decoded_write_bf16_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_fp4_paged_decoded_write_bf16_gaudi2_o_end;
 extern unsigned char _binary___deepseek_v41_decoded_attn_bf16_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_decoded_attn_bf16_gaudi2_o_end;
 
@@ -15,6 +19,8 @@ extern unsigned char _binary___deepseek_v41_decoded_attn_block_bf16_gaudi2_o_end
 tpc_lib_api::GlueCodeReturn DeepseekV41DecodedKVGaudi2::GetKernelName(char name[tpc_lib_api::MAX_NODE_NAME]) {
     std::strcpy(name, mode_ == SWA_WRITE ? "custom_deepseek_v41_swa_decoded_write_bf16_gaudi2" :
                       mode_ == FP4_WRITE ? "custom_deepseek_v41_fp4_decoded_write_bf16_gaudi2" :
+                      mode_ == SWA_PAGED_WRITE ? "custom_deepseek_v41_swa_paged_decoded_write_bf16_gaudi2" :
+                      mode_ == FP4_PAGED_WRITE ? "custom_deepseek_v41_fp4_paged_decoded_write_bf16_gaudi2" :
                       mode_ == ATTENTION_BLOCK ? "custom_deepseek_v41_decoded_attn_block_bf16_gaudi2" :
                                            "custom_deepseek_v41_decoded_attn_bf16_gaudi2");
     return tpc_lib_api::GLUE_SUCCESS;
@@ -22,11 +28,13 @@ tpc_lib_api::GlueCodeReturn DeepseekV41DecodedKVGaudi2::GetKernelName(char name[
 tpc_lib_api::GlueCodeReturn DeepseekV41DecodedKVGaudi2::GetGcDefinitions(
     tpc_lib_api::HabanaKernelParams* in, tpc_lib_api::HabanaKernelInstantiation* out) {
     using namespace tpc_lib_api;
-    const unsigned inputs = mode_ == SWA_WRITE ? 4 : mode_ == FP4_WRITE ? 6 : 9;
+    const unsigned inputs = mode_ == SWA_WRITE ? 4 : mode_ == FP4_WRITE ? 6 :
+                            mode_ == SWA_PAGED_WRITE ? 5 : mode_ == FP4_PAGED_WRITE ? 7 : 9;
     const unsigned outputs = (mode_ == ATTENTION || mode_ == ATTENTION_BLOCK) ? 3 : 1;
     if (in->inputTensorNr != inputs) { in->inputTensorNr = inputs; return GLUE_INCOMPATIBLE_INPUT_COUNT; }
     if (in->outputTensorNr != outputs) { in->outputTensorNr = outputs; return GLUE_INCOMPATIBLE_OUTPUT_COUNT; }
-    const unsigned params = mode_ == SWA_WRITE ? 1 : (mode_ == ATTENTION || mode_ == ATTENTION_BLOCK) ? 2 : 0;
+    const unsigned params = (mode_ == SWA_WRITE || mode_ == SWA_PAGED_WRITE) ? 1 :
+                            (mode_ == ATTENTION || mode_ == ATTENTION_BLOCK) ? 2 : 0;
     if (params && (!in->nodeParams.nodeParams || in->nodeParams.nodeParamsSize != params * sizeof(int32_t)))
         return GLUE_NODE_NOT_FOUND;
     const auto* scalar = static_cast<const int32_t*>(in->nodeParams.nodeParams);
@@ -62,6 +70,32 @@ tpc_lib_api::GlueCodeReturn DeepseekV41DecodedKVGaudi2::GetGcDefinitions(
             in->inputTensors[0].geometry.maxSizes[1] != in->inputTensors[1].geometry.maxSizes[1] ||
             in->inputTensors[0].geometry.maxSizes[1] != in->inputTensors[5].geometry.maxSizes[1] ||
             in->inputTensors[2].geometry.maxSizes[1] != 1 || in->inputTensors[3].geometry.maxSizes[1] != 1)
+            return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        if (!result(0, DATA_I32, 1, 36)) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+        out->indexSpaceRank = 1; out->indexSpaceGeometry[0] = 36;
+        out->outputTensorAccessPattern[0].mapping[0] = {0, 1, 0, 0};
+    } else if (mode_ == SWA_PAGED_WRITE) {
+        if (!shape(0, DATA_U8, 2, 528) || !shape(1, DATA_BF16, 2, 512) ||
+            !shape(2, DATA_I32, 1, 1) || !shape(3, DATA_I32, 1, 1) ||
+            !shape(4, DATA_BF16, 2, 512) ||
+            in->inputTensors[0].geometry.maxSizes[1] < 256 ||
+            in->inputTensors[1].geometry.maxSizes[1] != 1 || scalar[0] < 0 ||
+            scalar[0] % 512 || uint64_t(scalar[0]) + 512 > in->inputTensors[4].geometry.maxSizes[1])
+            return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        if (!result(0, DATA_I32, 1, 16)) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+        out->indexSpaceRank = 1; out->indexSpaceGeometry[0] = 16;
+        out->inputTensorAccessPattern[1].allRequired = false;
+        out->inputTensorAccessPattern[1].mapping[0] = {0, 32, 0, 31};
+        out->inputTensorAccessPattern[1].mapping[1] = {0, 0, 0, 0};
+        out->outputTensorAccessPattern[0].mapping[0] = {0, 1, 0, 0};
+    } else if (mode_ == FP4_PAGED_WRITE) {
+        if (!shape(0, DATA_U8, 2, 288) || !shape(1, DATA_U8, 2, 68) ||
+            !shape(2, DATA_BF16, 2, 512) || !shape(3, DATA_BF16, 2, 128) ||
+            !shape(4, DATA_I32, 1, 1) || !shape(5, DATA_I32, 1, 1) ||
+            !shape(6, DATA_BF16, 2, 512) ||
+            in->inputTensors[0].geometry.maxSizes[1] != in->inputTensors[1].geometry.maxSizes[1] ||
+            in->inputTensors[2].geometry.maxSizes[1] != 1 || in->inputTensors[3].geometry.maxSizes[1] != 1 ||
+            in->inputTensors[6].geometry.maxSizes[1] != 512)
             return GLUE_INCOMPATIBLE_INPUT_SIZE;
         if (!result(0, DATA_I32, 1, 36)) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
         out->indexSpaceRank = 1; out->indexSpaceGeometry[0] = 36;
@@ -102,10 +136,14 @@ tpc_lib_api::GlueCodeReturn DeepseekV41DecodedKVGaudi2::GetGcDefinitions(
     }
     auto* start = mode_ == SWA_WRITE ? &_binary___deepseek_v41_swa_decoded_write_bf16_gaudi2_o_start :
                   mode_ == FP4_WRITE ? &_binary___deepseek_v41_fp4_decoded_write_bf16_gaudi2_o_start :
+                  mode_ == SWA_PAGED_WRITE ? &_binary___deepseek_v41_swa_paged_decoded_write_bf16_gaudi2_o_start :
+                  mode_ == FP4_PAGED_WRITE ? &_binary___deepseek_v41_fp4_paged_decoded_write_bf16_gaudi2_o_start :
                   mode_ == ATTENTION_BLOCK ? &_binary___deepseek_v41_decoded_attn_block_bf16_gaudi2_o_start :
                                        &_binary___deepseek_v41_decoded_attn_bf16_gaudi2_o_start;
     auto* end = mode_ == SWA_WRITE ? &_binary___deepseek_v41_swa_decoded_write_bf16_gaudi2_o_end :
                 mode_ == FP4_WRITE ? &_binary___deepseek_v41_fp4_decoded_write_bf16_gaudi2_o_end :
+                mode_ == SWA_PAGED_WRITE ? &_binary___deepseek_v41_swa_paged_decoded_write_bf16_gaudi2_o_end :
+                mode_ == FP4_PAGED_WRITE ? &_binary___deepseek_v41_fp4_paged_decoded_write_bf16_gaudi2_o_end :
                 mode_ == ATTENTION_BLOCK ? &_binary___deepseek_v41_decoded_attn_block_bf16_gaudi2_o_end :
                                      &_binary___deepseek_v41_decoded_attn_bf16_gaudi2_o_end;
     const unsigned capacity = out->kernel.elfSize;

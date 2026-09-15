@@ -66,6 +66,8 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_FP4_DECODED_WRITE,
     GAUDI2_KERNEL_DEEPSEEK_V41_DECODED_ATTN,
     GAUDI2_KERNEL_DEEPSEEK_V41_DECODED_ATTN_BLOCK,
+    GAUDI2_KERNEL_DEEPSEEK_V41_SWA_PAGED_DECODED_WRITE,
+    GAUDI2_KERNEL_DEEPSEEK_V41_FP4_PAGED_DECODED_WRITE,
     GAUDI2_KERNEL_DEEPSEEK_V4_SPARSE_ATTN_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V4_SPARSE_ATTN_BF16_LENGTHS,
     GAUDI2_KERNEL_DEEPSEEK_V41_SPARSE_ATTN_PAIRED_EXP,
@@ -257,7 +259,9 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     for (auto mode : {DeepseekV41DecodedKVGaudi2::SWA_WRITE,
                       DeepseekV41DecodedKVGaudi2::FP4_WRITE,
                       DeepseekV41DecodedKVGaudi2::ATTENTION,
-                      DeepseekV41DecodedKVGaudi2::ATTENTION_BLOCK}) {
+                      DeepseekV41DecodedKVGaudi2::ATTENTION_BLOCK,
+                      DeepseekV41DecodedKVGaudi2::SWA_PAGED_WRITE,
+                      DeepseekV41DecodedKVGaudi2::FP4_PAGED_WRITE}) {
         DeepseekV41DecodedKVGaudi2 decoded(mode);
         decoded.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_SWA_DECODED_WRITE + mode].name);
     }
@@ -585,7 +589,9 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     for (auto mode : {DeepseekV41DecodedKVGaudi2::SWA_WRITE,
                       DeepseekV41DecodedKVGaudi2::FP4_WRITE,
                       DeepseekV41DecodedKVGaudi2::ATTENTION,
-                      DeepseekV41DecodedKVGaudi2::ATTENTION_BLOCK}) {
+                      DeepseekV41DecodedKVGaudi2::ATTENTION_BLOCK,
+                      DeepseekV41DecodedKVGaudi2::SWA_PAGED_WRITE,
+                      DeepseekV41DecodedKVGaudi2::FP4_PAGED_WRITE}) {
         DeepseekV41DecodedKVGaudi2 decoded(mode);
         decoded.GetKernelName(kernelName);
         if (std::strcmp(params->guid.name, kernelName) == 0)

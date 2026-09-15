@@ -38,6 +38,10 @@ _C1_FASTPATH_DEFAULTS = {
     "VLLM_HPU_DSV41_SHARED_PREFIX_KV": "1",
     "VLLM_HPU_DSV41_FUSED_PREFIX_LAYOUT": "1",
     "VLLM_HPU_DSV41_NATIVE_KV_PACK": "1",
+    # Keep the scheduler-owned packed pages canonical for the full 1M
+    # lifetime, while retaining the active <=512-token prefix in the exact
+    # decoded form already produced by the same quantizing writer.
+    "VLLM_HPU_DSV41_PAGED_DECODED_KV_STATE": "1",
     "VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH": "1",
     "VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT": "1",
     "VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT": "1",

@@ -120,3 +120,34 @@ def test_paged_attention_rebinds_shared_rotary_bucket():
     assert attention.search_length == 8192
     assert attention._rotary_table() is shared.rotary_bucket("swa_rotary", 8192)
     assert attention._rotary_native_table() is shared.rotary_bucket("swa_rotary_native", 8192)
+
+
+def test_paged_shared_state_allocates_bounded_decoded_mirrors(monkeypatch):
+    from vllm_gaudi.ops import deepseek_v41_paged_attention as paged
+
+    monkeypatch.setattr(paged.gaudi_envs, "VLLM_HPU_DSV41_PAGED_DECODED_KV_STATE", True)
+    monkeypatch.setattr(
+        paged, "rotary_table",
+        lambda width, length, *args: torch.zeros(length, width // 2, 2, dtype=torch.float32))
+    ratios = [0, 0] + [2] * 18 + [1] * 20
+    config = {
+        "kv_source_layer_ids": [2, 8, 14, 20],
+        "index_source_layer_ids": [2, 8, 14, 20, 24, 28, 32, 36],
+        "compress_ratios": ratios,
+        "candidate_topk_blocks": 2048,
+        "candidate_block_size": 8,
+        "candidate_source_layer_id": 20,
+        "qk_rope_head_dim": 64,
+        "rope_scaling": {
+            "original_max_position_embeddings": 4096,
+            "factor": 1.0,
+            "beta_fast": 32.0,
+            "beta_slow": 1.0,
+        },
+        "rope_theta": 10000.0,
+        "compress_rope_theta": 10000.0,
+    }
+    shared = paged.PagedCSA2SharedState(config, 0, 20, "cpu", 1024)
+    assert shared.decoded_swa.shape == (20 * 512, 512)
+    assert set(shared.sources) == {"2", "8", "14"}
+    assert all(source.decoded_main.shape == (512, 512) for source in shared.sources.values())

@@ -11,6 +11,10 @@ constexpr auto kSwa = "custom_op::custom_deepseek_v41_swa_decoded_write_bf16_gau
 constexpr auto kSwaOrdered = "custom_op::custom_deepseek_v41_swa_decoded_ordered_bf16_gaudi2";
 constexpr auto kFp4 = "custom_op::custom_deepseek_v41_fp4_decoded_write_bf16_gaudi2";
 constexpr auto kFp4Ordered = "custom_op::custom_deepseek_v41_fp4_decoded_ordered_bf16_gaudi2";
+constexpr auto kSwaPaged = "custom_op::custom_deepseek_v41_swa_paged_decoded_write_bf16_gaudi2";
+constexpr auto kSwaPagedOrdered = "custom_op::custom_deepseek_v41_swa_paged_decoded_ordered_bf16_gaudi2";
+constexpr auto kFp4Paged = "custom_op::custom_deepseek_v41_fp4_paged_decoded_write_bf16_gaudi2";
+constexpr auto kFp4PagedOrdered = "custom_op::custom_deepseek_v41_fp4_paged_decoded_ordered_bf16_gaudi2";
 constexpr auto kAttention = "custom_op::custom_deepseek_v41_decoded_attn_bf16_gaudi2";
 constexpr auto kBlockAttention = "custom_op::custom_deepseek_v41_decoded_attn_block_bf16_gaudi2";
 using Outputs = std::tuple<at::Tensor, at::Tensor, at::Tensor>;
@@ -39,6 +43,36 @@ void fp4_contract(const at::Tensor& main, const at::Tensor& index, const at::Ten
                 decoded.sizes() == at::IntArrayRef({main.size(0),512}) &&
                 mv.sizes() == at::IntArrayRef({1,512}) && iv.sizes() == at::IntArrayRef({1,128}) &&
                 position.sizes() == at::IntArrayRef({1}), "Invalid decoded FP4 C1 row contract");
+}
+void swa_paged_contract(const at::Tensor& cache, const at::Tensor& value,
+                        const at::Tensor& packed_position, const at::Tensor& decoded_position,
+                        const at::Tensor& decoded, int64_t offset) {
+    tensor(cache, at::kByte, value.device()); tensor(value, at::kBFloat16, value.device());
+    tensor(packed_position, at::kInt, value.device()); tensor(decoded_position, at::kInt, value.device());
+    tensor(decoded, at::kBFloat16, value.device());
+    TORCH_CHECK(cache.dim() == 2 && cache.size(0) >= 256 && cache.size(1) == 528 &&
+                value.sizes() == at::IntArrayRef({1,512}) &&
+                packed_position.sizes() == at::IntArrayRef({1}) &&
+                decoded_position.sizes() == at::IntArrayRef({1}) &&
+                decoded.dim() == 2 && decoded.size(1) == 512 && decoded.size(0) <= 40 * 512 &&
+                offset >= 0 && offset % 512 == 0 && offset <= decoded.size(0) - 512,
+                "Invalid paged decoded SWA C1 row contract");
+}
+void fp4_paged_contract(const at::Tensor& main, const at::Tensor& index,
+                        const at::Tensor& mv, const at::Tensor& iv,
+                        const at::Tensor& packed_position, const at::Tensor& decoded_position,
+                        const at::Tensor& decoded) {
+    tensor(main, at::kByte, mv.device()); tensor(index, at::kByte, mv.device());
+    tensor(mv, at::kBFloat16, mv.device()); tensor(iv, at::kBFloat16, mv.device());
+    tensor(packed_position, at::kInt, mv.device()); tensor(decoded_position, at::kInt, mv.device());
+    tensor(decoded, at::kBFloat16, mv.device());
+    TORCH_CHECK(main.dim() == 2 && main.size(0) > 0 && main.size(1) == 288 &&
+                index.sizes() == at::IntArrayRef({main.size(0),68}) &&
+                mv.sizes() == at::IntArrayRef({1,512}) && iv.sizes() == at::IntArrayRef({1,128}) &&
+                packed_position.sizes() == at::IntArrayRef({1}) &&
+                decoded_position.sizes() == at::IntArrayRef({1}) &&
+                decoded.sizes() == at::IntArrayRef({512,512}),
+                "Invalid paged decoded FP4 C1 row contract");
 }
 void attention_contract(const at::Stack& stack) {
     const auto q = stack.at(0).toTensor(), swa = stack.at(1).toTensor(), main = stack.at(2).toTensor();
@@ -70,6 +104,19 @@ const bool registered = [] {
         habana::custom_op::registerUserCustomOp(name, "custom_deepseek_v41_fp4_decoded_write_bf16_gaudi2",
             [](const at::Stack&) { return habana::PartialOutputMetaDataVector{{at::kInt,{36}}}; }, nullptr);
     }
+    for (auto name : {kSwaPaged, kSwaPagedOrdered}) {
+        habana::custom_op::registerUserCustomOp(name,
+            "custom_deepseek_v41_swa_paged_decoded_write_bf16_gaudi2",
+            [](const at::Stack&) { return habana::PartialOutputMetaDataVector{{at::kInt,{16}}}; },
+            [](const at::Stack& stack, size_t& size) -> std::shared_ptr<void> {
+                size = sizeof(int32_t); return std::make_shared<int32_t>(stack.at(5).toInt());
+            });
+    }
+    for (auto name : {kFp4Paged, kFp4PagedOrdered}) {
+        habana::custom_op::registerUserCustomOp(name,
+            "custom_deepseek_v41_fp4_paged_decoded_write_bf16_gaudi2",
+            [](const at::Stack&) { return habana::PartialOutputMetaDataVector{{at::kInt,{36}}}; }, nullptr);
+    }
     for (const auto name : {kAttention, kBlockAttention}) {
     habana::custom_op::registerUserCustomOp(name, name + std::string("custom_op::").size(),
         [](const at::Stack& stack) {
@@ -99,6 +146,26 @@ template<bool Meta, bool Ordered> at::Tensor fp4_write(const at::Tensor& main, c
     TORCH_CHECK(registered && main.device().type() == at::kHPU);
     auto op = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(Ordered ? kFp4Ordered : kFp4);
     return op.execute({main,index,mv,iv,position,decoded}).at(0);
+}
+template<bool Meta, bool Ordered> at::Tensor swa_paged_write(
+    const at::Tensor& cache, const at::Tensor& value, const at::Tensor& packed_position,
+    const at::Tensor& decoded_position, const at::Tensor& decoded, int64_t offset) {
+    swa_paged_contract(cache,value,packed_position,decoded_position,decoded,offset);
+    if (Meta) return at::empty({16},packed_position.options());
+    TORCH_CHECK(registered && value.device().type() == at::kHPU);
+    auto op = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(
+        Ordered ? kSwaPagedOrdered : kSwaPaged);
+    return op.execute({cache,value,packed_position,decoded_position,decoded,offset}).at(0);
+}
+template<bool Meta, bool Ordered> at::Tensor fp4_paged_write(
+    const at::Tensor& main, const at::Tensor& index, const at::Tensor& mv, const at::Tensor& iv,
+    const at::Tensor& packed_position, const at::Tensor& decoded_position, const at::Tensor& decoded) {
+    fp4_paged_contract(main,index,mv,iv,packed_position,decoded_position,decoded);
+    if (Meta) return at::empty({36},packed_position.options());
+    TORCH_CHECK(registered && main.device().type() == at::kHPU);
+    auto op = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(
+        Ordered ? kFp4PagedOrdered : kFp4Paged);
+    return op.execute({main,index,mv,iv,packed_position,decoded_position,decoded}).at(0);
 }
 template<bool Meta, bool Block = false> Outputs attention(const at::Tensor& q, const at::Tensor& swa, const at::Tensor& main,
     const at::Tensor& ids, const at::Tensor& sink, const at::Tensor& scale, const at::Tensor& lengths,
@@ -140,12 +207,40 @@ at::Tensor fp4_functionalize(const at::Tensor& main, const at::Tensor& index, co
     { at::AutoDispatchSkipFunctionalize guard; done = handle.call(m,i,v,k,p,d); }
     update(main,m); update(index,i); update(decoded,d); return done;
 }
+at::Tensor swa_paged_functionalize(const at::Tensor& cache, const at::Tensor& value,
+    const at::Tensor& packed_position, const at::Tensor& decoded_position,
+    const at::Tensor& decoded, int64_t offset) {
+    auto c = unwrap(cache), v = unwrap(value), pp = unwrap(packed_position);
+    auto dp = unwrap(decoded_position), d = unwrap(decoded);
+    static auto handle = c10::Dispatcher::singleton().findSchemaOrThrow(kSwaPagedOrdered, "")
+        .typed<at::Tensor(const at::Tensor&,const at::Tensor&,const at::Tensor&,
+                          const at::Tensor&,const at::Tensor&,int64_t)>();
+    at::Tensor done;
+    { at::AutoDispatchSkipFunctionalize guard; done = handle.call(c,v,pp,dp,d,offset); }
+    update(cache,c); update(decoded,d); return done;
+}
+at::Tensor fp4_paged_functionalize(const at::Tensor& main, const at::Tensor& index,
+    const at::Tensor& mv, const at::Tensor& iv, const at::Tensor& packed_position,
+    const at::Tensor& decoded_position, const at::Tensor& decoded) {
+    auto m = unwrap(main), i = unwrap(index), v = unwrap(mv), k = unwrap(iv);
+    auto pp = unwrap(packed_position), dp = unwrap(decoded_position), d = unwrap(decoded);
+    static auto handle = c10::Dispatcher::singleton().findSchemaOrThrow(kFp4PagedOrdered, "")
+        .typed<at::Tensor(const at::Tensor&,const at::Tensor&,const at::Tensor&,
+                          const at::Tensor&,const at::Tensor&,const at::Tensor&,const at::Tensor&)>();
+    at::Tensor done;
+    { at::AutoDispatchSkipFunctionalize guard; done = handle.call(m,i,v,k,pp,dp,d); }
+    update(main,m); update(index,i); update(decoded,d); return done;
+}
 }
 TORCH_LIBRARY_FRAGMENT(custom_op, m) {
     m.def("custom_deepseek_v41_swa_decoded_write_bf16_gaudi2(Tensor(a!) cache, Tensor value, Tensor position, Tensor(b!) decoded, int offset) -> Tensor");
     m.def("custom_deepseek_v41_swa_decoded_ordered_bf16_gaudi2(Tensor cache, Tensor value, Tensor position, Tensor decoded, int offset) -> Tensor");
     m.def("custom_deepseek_v41_fp4_decoded_write_bf16_gaudi2(Tensor(a!) main, Tensor(b!) index, Tensor main_value, Tensor index_value, Tensor position, Tensor(c!) decoded) -> Tensor");
     m.def("custom_deepseek_v41_fp4_decoded_ordered_bf16_gaudi2(Tensor main, Tensor index, Tensor main_value, Tensor index_value, Tensor position, Tensor decoded) -> Tensor");
+    m.def("custom_deepseek_v41_swa_paged_decoded_write_bf16_gaudi2(Tensor(a!) cache, Tensor value, Tensor packed_position, Tensor decoded_position, Tensor(b!) decoded, int offset) -> Tensor");
+    m.def("custom_deepseek_v41_swa_paged_decoded_ordered_bf16_gaudi2(Tensor cache, Tensor value, Tensor packed_position, Tensor decoded_position, Tensor decoded, int offset) -> Tensor");
+    m.def("custom_deepseek_v41_fp4_paged_decoded_write_bf16_gaudi2(Tensor(a!) main, Tensor(b!) index, Tensor main_value, Tensor index_value, Tensor packed_position, Tensor decoded_position, Tensor(c!) decoded) -> Tensor");
+    m.def("custom_deepseek_v41_fp4_paged_decoded_ordered_bf16_gaudi2(Tensor main, Tensor index, Tensor main_value, Tensor index_value, Tensor packed_position, Tensor decoded_position, Tensor decoded) -> Tensor");
     m.def("custom_deepseek_v41_decoded_attn_bf16_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor indices, Tensor sink, Tensor scale, Tensor lengths, Tensor swa_completion, Tensor main_completion, int offset, int main_rows) -> (Tensor, Tensor, Tensor)");
     m.def("custom_deepseek_v41_decoded_attn_block_bf16_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor indices, Tensor sink, Tensor scale, Tensor lengths, Tensor swa_completion, Tensor main_completion, int offset, int main_rows) -> (Tensor, Tensor, Tensor)");
 }
@@ -154,6 +249,10 @@ TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
     m.impl("custom_deepseek_v41_swa_decoded_ordered_bf16_gaudi2",swa_write<false,true>);
     m.impl("custom_deepseek_v41_fp4_decoded_write_bf16_gaudi2",fp4_write<false,false>);
     m.impl("custom_deepseek_v41_fp4_decoded_ordered_bf16_gaudi2",fp4_write<false,true>);
+    m.impl("custom_deepseek_v41_swa_paged_decoded_write_bf16_gaudi2",swa_paged_write<false,false>);
+    m.impl("custom_deepseek_v41_swa_paged_decoded_ordered_bf16_gaudi2",swa_paged_write<false,true>);
+    m.impl("custom_deepseek_v41_fp4_paged_decoded_write_bf16_gaudi2",fp4_paged_write<false,false>);
+    m.impl("custom_deepseek_v41_fp4_paged_decoded_ordered_bf16_gaudi2",fp4_paged_write<false,true>);
     m.impl("custom_deepseek_v41_decoded_attn_bf16_gaudi2",attention<false>);
     m.impl("custom_deepseek_v41_decoded_attn_block_bf16_gaudi2",attention<false,true>);
 }
@@ -162,10 +261,16 @@ TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
     m.impl("custom_deepseek_v41_swa_decoded_ordered_bf16_gaudi2",swa_write<true,true>);
     m.impl("custom_deepseek_v41_fp4_decoded_write_bf16_gaudi2",fp4_write<true,false>);
     m.impl("custom_deepseek_v41_fp4_decoded_ordered_bf16_gaudi2",fp4_write<true,true>);
+    m.impl("custom_deepseek_v41_swa_paged_decoded_write_bf16_gaudi2",swa_paged_write<true,false>);
+    m.impl("custom_deepseek_v41_swa_paged_decoded_ordered_bf16_gaudi2",swa_paged_write<true,true>);
+    m.impl("custom_deepseek_v41_fp4_paged_decoded_write_bf16_gaudi2",fp4_paged_write<true,false>);
+    m.impl("custom_deepseek_v41_fp4_paged_decoded_ordered_bf16_gaudi2",fp4_paged_write<true,true>);
     m.impl("custom_deepseek_v41_decoded_attn_bf16_gaudi2",attention<true>);
     m.impl("custom_deepseek_v41_decoded_attn_block_bf16_gaudi2",attention<true,true>);
 }
 TORCH_LIBRARY_IMPL(custom_op, Functionalize, m) {
     m.impl("custom_deepseek_v41_swa_decoded_write_bf16_gaudi2",swa_functionalize);
     m.impl("custom_deepseek_v41_fp4_decoded_write_bf16_gaudi2",fp4_functionalize);
+    m.impl("custom_deepseek_v41_swa_paged_decoded_write_bf16_gaudi2",swa_paged_functionalize);
+    m.impl("custom_deepseek_v41_fp4_paged_decoded_write_bf16_gaudi2",fp4_paged_functionalize);
 }

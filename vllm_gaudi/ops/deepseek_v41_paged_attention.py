@@ -70,13 +70,14 @@ class PagedCSA2SharedState(nn.Module):
 
     def __init__(self, config, layer_start, layer_stop, device, max_length):
         super().__init__()
-        self.length = max_length
+        self.length, self.layer_start, self.layer_stop = max_length, layer_start, layer_stop
         # A view of the 1M-row source still exposes its complete backing
         # allocation to Synapse when the native kernel declares all input rows
         # required.  Lazily materialize independent, stage-shared page buckets
         # instead.  Compiled recipes bind these stable tensor addresses, so the
         # cache intentionally keeps strong references for the process lifetime.
         self._rotary_buckets = {}
+        self.decoded_kv_state = gaudi_envs.VLLM_HPU_DSV41_PAGED_DECODED_KV_STATE
         self.sources, self.topk = nn.ModuleDict(), nn.ModuleDict()
         for source in config["kv_source_layer_ids"]:
             if layer_start <= source < layer_stop:
@@ -89,6 +90,9 @@ class PagedCSA2SharedState(nn.Module):
                 cache.register_buffer("index",
                                       torch.zeros(2 * PAGE_TOKENS // ratio, 68, dtype=torch.uint8, device=device),
                                       False)
+                if self.decoded_kv_state:
+                    cache.register_buffer("decoded_main",
+                                          torch.zeros(512, 512, dtype=torch.bfloat16, device=device), False)
                 self.sources[str(source)] = cache
         for source in config["index_source_layer_ids"]:
             if layer_start <= source < layer_stop:
@@ -108,6 +112,12 @@ class PagedCSA2SharedState(nn.Module):
         table = torch.zeros((max_length + PAGE_TOKENS - 1) // PAGE_TOKENS, dtype=torch.int32, device=device)
         table[0] = 1
         self.register_buffer("block_table", table, False)
+        if self.decoded_kv_state:
+            self.register_buffer("decoded_swa",
+                                 torch.zeros((layer_stop - layer_start) * 512,
+                                             512,
+                                             dtype=torch.bfloat16,
+                                             device=device), False)
         scaling = config["rope_scaling"]
         for name, compressed in (("swa_rotary", False), ("compressed_rotary", True)):
             table = rotary_table(config["qk_rope_head_dim"], max_length,
@@ -190,6 +200,11 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         self.eps, self.window = config["rms_norm_eps"], config["sliding_window"]
         self.owns_kv = layer in config["kv_source_layer_ids"]
         self.owns_index = layer in config["index_source_layer_ids"]
+        self.decoded_kv_state = shared.decoded_kv_state
+        self.decoded_swa_offset = (layer - shared.layer_start) * 512 if self.decoded_kv_state else 0
+        if self.decoded_kv_state and not (self.mla_mme and self.direct_selected_kv
+                                          and self.shared_prefix_kv):
+            raise ValueError("Paged decoded KV requires direct selected rows, shared prefixes and MME MLA")
         self.candidate_source = config["candidate_source_layer_id"]
         if self.ratio:
             kv_source = max(source for source in config["kv_source_layer_ids"] if source <= layer)
@@ -282,7 +297,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 self._rotary_native_table()).reshape(-1, self.heads, 512)
         return self._rope(self.linear(value, weight).reshape(-1, self.heads, 512), positions)
 
-    def _compress(self, value, positions):
+    def _compress(self, value, positions, decoded=False):
         compressor = self.weights.compressor
         if self.ratio == 2:
             kv, score = self._project_compressor_input(value)
@@ -332,8 +347,18 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                             rows.remainder(PAGE_TOKENS // self.ratio))
         indexer = self.weights.indexer
         index = rms_norm(self.linear(latent, indexer.wk), indexer.k_norm.weight, self.eps)
-        self.cache.index.index_copy_(0, slots.long(), pack_fp4(self._rope(index, first), 32))
-        self.cache.main.index_copy_(0, slots.long(), pack_fp4(self._rope(latent, first), 16))
+        index, latent = self._rope(index, first), self._rope(latent, first)
+        if decoded and value.shape[0] == 1:
+            return torch.ops.custom_op.custom_deepseek_v41_fp4_paged_decoded_write_bf16_gaudi2(
+                self.cache.main, self.cache.index, latent.contiguous(), index.contiguous(),
+                slots.to(torch.int32).contiguous(), rows.to(torch.int32).contiguous(),
+                self.cache.decoded_main)
+        packed_index, packed_main = pack_fp4(index, 32), pack_fp4(latent, 16)
+        self.cache.index.index_copy_(0, slots.long(), packed_index)
+        self.cache.main.index_copy_(0, slots.long(), packed_main)
+        if decoded:
+            self.cache.decoded_main.index_copy_(0, rows.long(), unpack_fp4(packed_main))
+        return None
 
     def _scores(self, value, qr, positions, logical_rows):
         indexer = self.weights.indexer
@@ -414,8 +439,21 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         qr = norm(query_input, self.weights.q_norm.weight, self.eps)
         query = self.project_query(qr, positions)
         kv = norm(kv_input, self.weights.kv_norm.weight, self.eps)
-        self.swa.index_copy_(0, positions.remainder(SWA_ROWS).long(),
-                             pack_swa(self._rope(kv, positions)))
+        kv = self._rope(kv, positions)
+        decoded = (self.decoded_kv_state and self.ratio in (1, 2)
+                   and self.search_length <= 512)
+        completion = None
+        if decoded and value.shape[0] == 1:
+            completion = torch.ops.custom_op.custom_deepseek_v41_swa_paged_decoded_write_bf16_gaudi2(
+                self.swa, kv.contiguous(), positions.remainder(SWA_ROWS).to(torch.int32).contiguous(),
+                positions.to(torch.int32).contiguous(), self.shared.decoded_swa,
+                self.decoded_swa_offset)
+        else:
+            packed_swa = pack_swa(kv)
+            self.swa.index_copy_(0, positions.remainder(SWA_ROWS).long(), packed_swa)
+            if decoded:
+                self.shared.decoded_swa.index_copy_(
+                    0, positions.long() + self.decoded_swa_offset, unpack_swa(packed_swa))
         native_prefix = (gaudi_envs.VLLM_HPU_DSV41_FUSED_PREFIX_LAYOUT and self.ratio in (1, 2)
                          and self.direct_selected_kv and self.shared_prefix_kv and self.window == 128
                          and value.device.type == "hpu" and 1 <= value.shape[0] <= NATIVE_WORK_TOKENS
@@ -425,10 +463,20 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             window = positions.unsqueeze(-1) - self.window + 1 + self.window_offsets.unsqueeze(0)
             indices = torch.where(window >= 0, window.remainder(SWA_ROWS), -1).int()
         cache = None
+        compressed_completion = None
         if self.ratio:
             if self.owns_kv:
-                self._compress(value, positions)
+                compressed_completion = self._compress(value, positions, decoded)
             selected = self._select(value, qr, positions)
+            if decoded and value.shape[0] == 1:
+                indices, lengths = torch.ops.custom_op.custom_deepseek_v41_c1_indices_i32_gaudi2(
+                    positions.to(torch.int32).contiguous(), selected.contiguous(), self.ratio)
+                main_done = compressed_completion if compressed_completion is not None else completion
+                output = torch.ops.custom_op.custom_deepseek_v41_mla_mme_gaudi2(
+                    query.contiguous(), self.shared.decoded_swa, self.cache.decoded_main,
+                    indices.contiguous(), self.weights.attn_sink, self.scale, lengths.contiguous(),
+                    completion, main_done, self.decoded_swa_offset, 512)
+                return self._finish_output(output, positions, ready_outputs)
             physical = None if native_prefix else self.shared.physical_rows(selected.clamp_min(0), self.ratio)
             if (self.direct_selected_kv and value.device.type == "hpu" and value.shape[0] <= NATIVE_WORK_TOKENS
                     and selected.numel() <= self.selected_offsets.numel()):

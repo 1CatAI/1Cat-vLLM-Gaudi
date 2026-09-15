@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_C1_INDICES: bool = False
     VLLM_HPU_DSV41_SELECTED_VALID_ONLY: bool = False
     VLLM_HPU_DSV41_DECODED_KV_STATE: bool = False
+    VLLM_HPU_DSV41_PAGED_DECODED_KV_STATE: bool = False
     VLLM_HPU_DSV41_SELECTED_KV_VECTOR: bool = False
     VLLM_HPU_DSV41_ATTENTION_BLOCK_EXP: bool = False
     VLLM_HPU_DSV41_ATTENTION_PAIRED_EXP: bool = False
@@ -379,6 +380,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_SELECTED_VALID_ONLY", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_DECODED_KV_STATE":
     lambda: os.environ.get("VLLM_HPU_DSV41_DECODED_KV_STATE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_PAGED_DECODED_KV_STATE":
+    lambda: os.environ.get("VLLM_HPU_DSV41_PAGED_DECODED_KV_STATE", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_SELECTED_KV_VECTOR":
     lambda: os.environ.get("VLLM_HPU_DSV41_SELECTED_KV_VECTOR", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_ATTENTION_BLOCK_EXP":
