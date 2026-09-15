@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """HPU V4.1 model registration with prepared weights and explicit stage inputs."""
 
+import gc
 from pathlib import Path
 
 import torch
@@ -283,6 +284,16 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         if search > 1024:
             key = (input_ids.numel(), search)
             if key not in self.long_context_programs:
+                # Search buckets grow during a long request. Retaining a
+                # complete compiled stage for every old bucket eventually
+                # exhausts Synapse's graph objects even when HBM has headroom.
+                # Completed scheduler transactions no longer consume the old
+                # bucket; its recipe remains available in the disk cache.
+                if self.long_context_programs:
+                    torch.hpu.synchronize()
+                    self.long_context_programs.clear()
+                    gc.collect()
+                    torch.hpu.empty_cache()
                 # Long-context prefill carries the complete paged state pool.
                 # Compiling four layers as one graph can exhaust the remaining
                 # transient HBM before Synapse finishes graph construction.

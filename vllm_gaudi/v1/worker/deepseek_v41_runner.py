@@ -122,6 +122,13 @@ def target_chunks(tokens, block_tokens=PREFILL_BLOCK_TOKENS):
         offset += size
 
 
+def target_search_length(start, count, maximum):
+    """Choose one CSA2 search bucket for a complete scheduler transaction."""
+    if start < 0 or count < 1 or start + count > maximum:
+        raise ValueError("V4.1 search bucket is outside the configured context")
+    return min(maximum, max(512, 1 << (start + count - 1).bit_length()))
+
+
 def _exchange_payload_views(exchange_wire, capacity, hidden_slots=4, hidden_width=5120):
     """Return views for one native-BF16 stage-boundary payload.
 
@@ -958,7 +965,15 @@ class V41ModelRunner:
             self.encoder_cache[feature.identifier] = scatter_image_embeddings(output, feature.mm_position.is_embed)
 
     @profile_phase("target")
-    def _forward(self, request_id, tokens, start, *, decode, reset=False, request=None):
+    def _forward(self,
+                 request_id,
+                 tokens,
+                 start,
+                 *,
+                 decode,
+                 reset=False,
+                 request=None,
+                 search_length=None):
         count = len(tokens)
         ids, positions = self.input_views[count], self.position_views[count]
         # A scheduler may feed a normal prompt one token at a time.  The
@@ -975,7 +990,10 @@ class V41ModelRunner:
             ids = self.decode_ids
         program = getattr(self.model, "program", None)
         if program is not None and program.length > 512:
-            search = min(program.length, max(512, 1 << (start + count - 1).bit_length()))
+            search = (target_search_length(start, count, program.length)
+                      if search_length is None else int(search_length))
+            if search < start + count or search > program.length:
+                raise RuntimeError("V4.1 transaction search bucket does not cover its input")
             program.search_length = search
             for layer in program.layers:
                 attention = layer.attention
@@ -1373,13 +1391,17 @@ class V41ModelRunner:
         prefill_block_tokens = (LONG_CONTEXT_PREFILL_BLOCK_TOKENS
                                 if self.model_config.max_model_len > 512 else PREFILL_BLOCK_TOKENS)
         chunks = [(0, tokens)] if decode else target_chunks(tokens, prefill_block_tokens)
+        program = getattr(self.model, "program", None)
+        transaction_search = (target_search_length(start, count, program.length)
+                              if not decode and program is not None and program.length > 512 else None)
         for block_index, (offset, chunk) in enumerate(chunks):
             hidden = self._forward(req_id,
                                    chunk,
                                    start + offset,
                                    decode=decode,
                                    reset=start + offset == 0,
-                                   request=request)
+                                   request=request,
+                                   search_length=transaction_search)
             if offset + len(chunk) < count:
                 self._insert(self.model.last_aux, self.positions[:len(chunk)])
                 self.model.complete_step(len(chunk))

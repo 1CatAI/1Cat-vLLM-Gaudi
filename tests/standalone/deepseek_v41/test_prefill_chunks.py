@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-from vllm_gaudi.v1.worker.deepseek_v41_runner import PREFILL_BLOCK_TOKENS, target_chunks
+from vllm_gaudi.v1.worker.deepseek_v41_runner import (
+    PREFILL_BLOCK_TOKENS,
+    target_chunks,
+    target_search_length,
+)
 
 
 def test_scheduler_transaction_uses_c128_prefill_blocks():
@@ -16,6 +20,12 @@ def test_long_context_internal_c64_tiling_preserves_8192_scheduler_transaction()
     assert len(chunks) == 128
     assert all(len(chunk) == 64 for _, chunk in chunks)
     assert [token for _, chunk in chunks for token in chunk] == tokens
+
+
+def test_scheduler_transaction_uses_one_search_bucket_for_all_internal_tiles():
+    assert target_search_length(0, 8192, 1 << 20) == 8192
+    assert target_search_length(8192, 823, 1 << 20) == 16384
+    assert target_search_length((1 << 20) - 64, 64, 1 << 20) == 1 << 20
 
 
 def test_prefill_tail_is_exact_and_never_splits_into_dspark_c6():
