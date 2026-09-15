@@ -37,6 +37,10 @@ class HPUOmniPlatform(OmniPlatform, HpuPlatform):
         return "vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker"
 
     @classmethod
+    def get_profiler_cls(cls) -> str:
+        return "vllm_gaudi.omni.profiler.HPUOmniTorchProfilerWrapper"
+
+    @classmethod
     def get_default_stage_config_path(cls) -> str:
         return "vllm_omni/deploy"
 
@@ -49,14 +53,12 @@ class HPUOmniPlatform(OmniPlatform, HpuPlatform):
     ) -> str:
         del head_size, allow_trtllm_default
         if selected_backend is not None and selected_backend.upper() not in {
-            "TORCH_SDPA",
-            "SDPA",
-            "HPU_SDPA",
+                "TORCH_SDPA",
+                "SDPA",
+                "HPU_SDPA",
         }:
-            raise ValueError(
-                f"Diffusion attention backend {selected_backend!r} is unavailable on HPU; "
-                "select TORCH_SDPA or omit the backend to use HPU_SDPA."
-            )
+            raise ValueError(f"Diffusion attention backend {selected_backend!r} is unavailable on HPU; "
+                             "select TORCH_SDPA or omit the backend to use HPU_SDPA.")
         return "vllm_gaudi.omni.attention.HPUSDPABackend"
 
     @classmethod

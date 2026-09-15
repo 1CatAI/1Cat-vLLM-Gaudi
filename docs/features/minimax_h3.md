@@ -409,6 +409,30 @@ denoising, video VAE, audio VAE, MP4 completion, and each HPU phase transfer
 separately. Profiler synchronization changes the timing, so these numbers
 explain the phase split and do not replace the unprofiled wall-clock result.
 
+To capture hardware events without asking the Synapse profiler to retain a
+complete video request, arm the built-in one-DiT-call trace after a warmup:
+
+```bash
+HABANA_PROFILE=profile_api_light \
+VLLM_GAUDI_H3_DIT_TRACE_DIR=/data/evidence/h3-dit-trace \
+python tools/minimax_h3/serve_single_hpu.py \
+  /data/models/MiniMax-H3-FastH3-HPU --partition FL2VA \
+  --lightx2v-4step-lora \
+  /data/models/LightX2V-Minimax-h3-Turbo/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors \
+  --module 0 --port 8097
+
+# Run one unprofiled warmup, then arm exactly the next request.
+touch /data/evidence/h3-dit-trace/ARM
+```
+
+The default target is DiT step zero. Set
+`VLLM_GAUDI_H3_DIT_TRACE_STEP=1` before server startup to select another step,
+or `VLLM_GAUDI_H3_DIT_TRACE_ARM_FILE` to place the arm file elsewhere. The
+worker atomically claims the file, records CPU shapes plus HPU MME/TPC events,
+and writes the Chrome trace and a metadata sidecar. Profiling adds substantial
+synchronization and export overhead, so use the resulting request only for
+operator analysis and keep it out of latency results.
+
 The official FastH3 profile keeps its DiT and text-encoder model computation in
 BF16. If `--online-fp8` is selected, eligible linears dynamically scale each
 activation row, apply per-output-channel weight scales, and dispatch

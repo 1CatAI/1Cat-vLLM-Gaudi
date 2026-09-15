@@ -12,6 +12,7 @@ import subprocess
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,9 @@ logger = init_logger(__name__)
 
 _H3_SOURCE_PREFIXES = ("transformer.", "transformers_ref.", "text_encoder.")
 _H3_PHASE_OFFLOAD_ENV = "VLLM_GAUDI_H3_PHASE_OFFLOAD"
+_H3_DIT_TRACE_DIR_ENV = "VLLM_GAUDI_H3_DIT_TRACE_DIR"
+_H3_DIT_TRACE_ARM_FILE_ENV = "VLLM_GAUDI_H3_DIT_TRACE_ARM_FILE"
+_H3_DIT_TRACE_STEP_ENV = "VLLM_GAUDI_H3_DIT_TRACE_STEP"
 _H3_BASE_OUTPUT_SHORT_EDGE = 768
 _LIGHTX2V_REF_OUTPUT_SHORT_EDGE = 544
 _PATCHED = False
@@ -1153,6 +1157,145 @@ def _install_h3_trajectory_debug_hook() -> None:
     logger.warning("MiniMax H3 trajectory evidence is enabled at %s", output_dir)
 
 
+def _write_h3_trace_metadata(path: Path, report: Mapping[str, Any]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def _summarize_h3_trace_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return {
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+            "device": str(value.device),
+        }
+    if isinstance(value, Mapping):
+        return {str(key): _summarize_h3_trace_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_summarize_h3_trace_value(item) for item in value]
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return type(value).__name__
+
+
+def _install_h3_dit_trace_hook() -> None:
+    """Capture one armed H3 DiT call with CPU and HPU hardware events."""
+
+    output_value = os.environ.get(_H3_DIT_TRACE_DIR_ENV)
+    if not output_value:
+        return
+
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline
+
+    output_dir = Path(output_value).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    arm_value = os.environ.get(_H3_DIT_TRACE_ARM_FILE_ENV)
+    arm_file = Path(arm_value).expanduser().resolve() if arm_value else output_dir / "ARM"
+    try:
+        target_step = int(os.environ.get(_H3_DIT_TRACE_STEP_ENV, "0"))
+    except ValueError as exc:
+        raise ValueError(f"{_H3_DIT_TRACE_STEP_ENV} must be a non-negative integer") from exc
+    if target_step < 0:
+        raise ValueError(f"{_H3_DIT_TRACE_STEP_ENV} must be a non-negative integer")
+
+    original_loop = pipeline.minimax_h3_denoise_loop
+
+    def trace_loop(**kwargs: Any):
+        claim_file = output_dir / f"armed-{os.getpid()}-{time.time_ns()}"
+        try:
+            arm_file.replace(claim_file)
+        except FileNotFoundError:
+            return original_loop(**kwargs)
+
+        original_model = kwargs["model"]
+        call_index = 0
+        trace_stem = f"dit-step-{os.getpid()}-{time.time_ns()}-step{target_step}"
+        trace_path = output_dir / f"{trace_stem}.json"
+        metadata_path = output_dir / f"{trace_stem}.metadata.json"
+        report: dict[str, Any] = {
+            "schema_version": 1,
+            "status": "armed",
+            "pid": os.getpid(),
+            "target_step": target_step,
+            "trace_path": str(trace_path),
+            "arm_file": str(arm_file),
+            "claim_file": str(claim_file),
+            "claimed_at": datetime.now(timezone.utc).isoformat(),
+            "sigmas_video": list(kwargs["sigmas_video"]),
+            "sigmas_audio": list(kwargs["sigmas_audio"]),
+        }
+        _write_h3_trace_metadata(metadata_path, report)
+
+        def traced_model(**model_kwargs: Any):
+            nonlocal call_index
+            current_step = call_index
+            call_index += 1
+            if current_step != target_step:
+                return original_model(**model_kwargs)
+
+            report["status"] = "capturing"
+            report["model_inputs"] = _summarize_h3_trace_value(model_kwargs)
+            report["capture_started_at"] = datetime.now(timezone.utc).isoformat()
+            _write_h3_trace_metadata(metadata_path, report)
+            torch.hpu.synchronize()
+            try:
+                with torch.profiler.profile(
+                        activities=[
+                            torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.HPU,
+                        ],
+                        record_shapes=True,
+                        profile_memory=False,
+                        with_stack=False,
+                ) as profiler, torch.profiler.record_function(f"minimax_h3_dit_model_step_{current_step}"):
+                    started = time.perf_counter()
+                    result = original_model(**model_kwargs)
+                    torch.hpu.synchronize()
+                    report["model_wall_seconds"] = time.perf_counter() - started
+                report["status"] = "exporting"
+                report["capture_stopped_at"] = datetime.now(timezone.utc).isoformat()
+                _write_h3_trace_metadata(metadata_path, report)
+                profiler.export_chrome_trace(str(trace_path))
+                report["status"] = "pass"
+                report["trace_bytes"] = trace_path.stat().st_size
+                report["export_finished_at"] = datetime.now(timezone.utc).isoformat()
+                _write_h3_trace_metadata(metadata_path, report)
+                logger.warning("MiniMax H3 DiT hardware trace exported to %s", trace_path)
+                return result
+            except BaseException as exc:
+                report["status"] = "fail"
+                report["error"] = f"{type(exc).__name__}: {exc}"
+                report["failed_at"] = datetime.now(timezone.utc).isoformat()
+                _write_h3_trace_metadata(metadata_path, report)
+                raise
+
+        traced_kwargs = dict(kwargs)
+        traced_kwargs["model"] = traced_model
+        try:
+            result = original_loop(**traced_kwargs)
+        except BaseException as exc:
+            if report["status"] == "armed":
+                report["status"] = "fail"
+                report["error"] = f"{type(exc).__name__}: {exc}"
+                report["failed_at"] = datetime.now(timezone.utc).isoformat()
+                _write_h3_trace_metadata(metadata_path, report)
+            raise
+        if report["status"] == "armed":
+            report["status"] = "fail"
+            report["error"] = f"target step {target_step} was not executed; observed {call_index} DiT calls"
+            report["failed_at"] = datetime.now(timezone.utc).isoformat()
+            _write_h3_trace_metadata(metadata_path, report)
+        return result
+
+    pipeline.minimax_h3_denoise_loop = trace_loop
+    logger.warning(
+        "MiniMax H3 one-step hardware tracing is enabled at %s; create %s to arm the next request",
+        output_dir,
+        arm_file,
+    )
+
+
 def install_minimax_h3_patches() -> None:
     """Install idempotent H3 hooks at Omni worker startup."""
 
@@ -1235,6 +1378,7 @@ def install_minimax_h3_patches() -> None:
     _install_h3_layout_and_noise_hooks()
     _install_h3_phase_offload_hooks()
     _install_h3_trajectory_debug_hook()
+    _install_h3_dit_trace_hook()
     _PATCHED = True
     logger.info_once("Installed MiniMax H3 FP8, FastH3, and HPU operator hooks for Gaudi")
 

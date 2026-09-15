@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import sys
+from types import SimpleNamespace
 
 import torch
 
@@ -58,3 +59,38 @@ def test_omni_platform_entrypoint_defers_compat_until_class_resolution(monkeypat
 
     assert register_omni_platform() == "vllm_gaudi.omni.platform.HPUOmniPlatform"
     assert calls == []
+
+
+def test_hpu_omni_profiler_registration():
+    from vllm_gaudi.omni.platform import HPUOmniPlatform
+    from vllm_gaudi.omni.profiler import HPUOmniTorchProfilerWrapper
+
+    assert HPUOmniPlatform.get_profiler_cls() == "vllm_gaudi.omni.profiler.HPUOmniTorchProfilerWrapper"
+    assert HPUOmniTorchProfilerWrapper._get_default_activities(object()) == ["CPU", "HPU"]
+
+
+def test_hpu_omni_profiler_creates_cpu_hpu_trace(monkeypatch):
+    from vllm_gaudi.omni.profiler import HPUOmniTorchProfilerWrapper
+
+    captured = {}
+    sentinel = object()
+
+    def fake_profile(**kwargs):
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(torch.profiler, "profile", fake_profile)
+    config = SimpleNamespace(
+        torch_profiler_record_shapes=True,
+        torch_profiler_with_memory=False,
+        torch_profiler_with_stack=False,
+        torch_profiler_with_flops=False,
+    )
+    wrapper = object.__new__(HPUOmniTorchProfilerWrapper)
+
+    assert wrapper._create_profiler(config, ["CPU", "HPU"]) is sentinel
+    assert captured["activities"] == [
+        torch.profiler.ProfilerActivity.CPU,
+        torch.profiler.ProfilerActivity.HPU,
+    ]
+    assert captured["record_shapes"] is True

@@ -20,6 +20,7 @@ from vllm_gaudi.omni.minimax_h3 import (
     _minimax_h3_unpatchify_video_tokens_hpu,
     _resolve_h3_encoder_disk_quant_config,
     _select_h3_reference_video_codec,
+    _summarize_h3_trace_value,
     _validate_h3_output_short_edge,
     _validate_fasth3_quant_config,
     install_minimax_h3_patches,
@@ -96,6 +97,28 @@ def test_h3_phase_offload_environment_is_strict(monkeypatch):
     monkeypatch.setenv("VLLM_GAUDI_H3_PHASE_OFFLOAD", "sometimes")
     with pytest.raises(ValueError, match="must be a boolean"):
         _h3_phase_offload_enabled()
+
+
+def test_h3_trace_summary_keeps_only_tensor_contract():
+    value = {
+        "hidden_states": torch.empty((1, 7, 16), dtype=torch.bfloat16),
+        "nested": [torch.empty((3, ), dtype=torch.float32), None],
+        "opaque": object(),
+    }
+
+    assert _summarize_h3_trace_value(value) == {
+        "hidden_states": {
+            "shape": [1, 7, 16],
+            "dtype": "torch.bfloat16",
+            "device": "cpu",
+        },
+        "nested": [{
+            "shape": [3],
+            "dtype": "torch.float32",
+            "device": "cpu",
+        }, None],
+        "opaque": "object",
+    }
 
 
 def test_hpu_unpatchify_gather_matches_video_latent_layout():
