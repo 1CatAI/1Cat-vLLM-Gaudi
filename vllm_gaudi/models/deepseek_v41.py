@@ -293,7 +293,10 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                     torch.hpu.synchronize()
                     self.long_context_programs.clear()
                     gc.collect()
-                    torch.hpu.empty_cache()
+                    # HPU does not expose an allocator-backed empty_cache
+                    # operation.  vLLM's platform hook is intentionally a
+                    # no-op on Gaudi, so releasing the Python graph owners and
+                    # collecting them is the complete supported cleanup here.
                 # Long-context prefill carries the complete paged state pool.
                 # Compiling four layers as one graph can exhaust the remaining
                 # transient HBM before Synapse finishes graph construction.
