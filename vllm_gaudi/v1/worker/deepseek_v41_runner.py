@@ -41,7 +41,8 @@ VERIFY_METADATA_SIZE = 7
 VERIFY_PROPOSED_SIZE = 5
 VERIFY_CONTROL_SIZE = VERIFY_METADATA_SIZE + VERIFY_PROPOSED_SIZE
 PREFILL_BLOCK_TOKENS = 128
-PREFILL_MAX_INFLIGHT_BLOCKS = 8
+LONG_CONTEXT_PREFILL_BLOCK_TOKENS = 64
+PREFILL_MAX_INFLIGHT_BLOCKS = 4
 
 
 def profile_phase(name):
@@ -1363,7 +1364,15 @@ class V41ModelRunner:
             raise RuntimeError(f"Unexpected V4.1 decode shape: tokens={count}, drafts={len(proposed)}")
         if self.verify_timing:
             self.verify_timing.begin(req_id, self.pp.generation + 1, count, len(proposed))
-        chunks = [(0, tokens)] if decode else target_chunks(tokens)
+        # The 1M paged configuration leaves substantially less transient HBM
+        # than the bounded 512-token service.  C128 is valid mathematically,
+        # but its first compiled recipe can exceed that transient budget while
+        # the complete page pool is resident.  Keep the scheduler admission at
+        # 8192 and tile only the stage working set to C64.  C6 remains reserved
+        # for DSpark and is never used for ordinary prefill.
+        prefill_block_tokens = (LONG_CONTEXT_PREFILL_BLOCK_TOKENS
+                                if self.model_config.max_model_len > 512 else PREFILL_BLOCK_TOKENS)
+        chunks = [(0, tokens)] if decode else target_chunks(tokens, prefill_block_tokens)
         for block_index, (offset, chunk) in enumerate(chunks):
             hidden = self._forward(req_id,
                                    chunk,
@@ -1375,7 +1384,8 @@ class V41ModelRunner:
                 self._insert(self.model.last_aux, self.positions[:len(chunk)])
                 self.model.complete_step(len(chunk))
                 # A scheduler transaction can contain 8192 prompt tokens,
-                # i.e. 64 C128 graphs.  Letting all of them remain in flight
+                # i.e. 128 C64 graphs in the 1M configuration.  Letting all of
+                # them remain in flight
                 # retains several GiB of compiled-graph temporaries and can
                 # force Synapse to defragment while buffers are still live.
                 # Bound that lifetime without changing the scheduler's 8192
