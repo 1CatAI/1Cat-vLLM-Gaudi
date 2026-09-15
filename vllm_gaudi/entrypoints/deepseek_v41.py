@@ -31,6 +31,13 @@ _C1_FASTPATH_DEFAULTS = {
     "VLLM_HPU_DSV41_ENGRAM_NATIVE_C1": "1",
     "VLLM_HPU_DSV41_ENGRAM_C1_PACKET": "1",
     "VLLM_HPU_DSV41_DECODED_KV_STATE": "1",
+    # The long-context model keeps its canonical packed page pool.  Decode
+    # selected rows directly from that pool instead of gathering, expanding
+    # and materializing a per-layer BF16 cache before MLA.
+    "VLLM_HPU_DSV41_PAGED_SELECTED_KV": "1",
+    "VLLM_HPU_DSV41_SHARED_PREFIX_KV": "1",
+    "VLLM_HPU_DSV41_FUSED_PREFIX_LAYOUT": "1",
+    "VLLM_HPU_DSV41_NATIVE_KV_PACK": "1",
     "VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH": "1",
     "VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT": "1",
     "VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT": "1",
