@@ -195,7 +195,7 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             # token; a C1 prompt transaction instead stages the exact host
             # lookup into that same buffer before replay.  Sampling remains
             # disabled until the full prompt has been committed by the runner.
-            if (envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and self.step_use_replay
+            if (envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and self.step_use_replay and len(token_ids) == 1
                     and self.engram_host.device_pending is None):
                 self.engram_host.stage_device_c1_reference(request_id, self.step_ticket.buffers[0])
 
@@ -261,7 +261,8 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 residual = values.unsqueeze(1).expand(-1, 4, -1).contiguous()
                 pre = torch.zeros(input_ids.numel(), 4, device=values.device, dtype=torch.float32)
                 pre[:, 0] = 1
-            if envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and self.step_use_replay:
+            if (envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and self.step_use_replay
+                    and input_ids.numel() == 1):
                 layer1 = self.engram_host.consume_device_c1(self._step_request_id)
                 buffers = self.engram_host.wait(self.step_ticket)
                 engram = (layer1, buffers[1])

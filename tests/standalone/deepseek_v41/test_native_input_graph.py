@@ -179,10 +179,13 @@ def test_input_modes_have_separate_cached_variants(monkeypatch):
     replay = StageReplay(owner)
     ids, positions = torch.tensor([1]), torch.tensor([0], dtype=torch.int32)
     external = replay(None, None, positions, ids, ())
+    ids6, positions6 = torch.arange(6), torch.arange(6, dtype=torch.int32)
+    external6 = replay(None, None, positions6, ids6, ())
     internal = replay.from_input_ids(positions, ids, ())
     assert external is replay(None, None, positions, ids, ())
+    assert external6 is replay(None, None, positions6, ids6, ())
     assert internal is replay.from_input_ids(positions, ids + 1, ())
-    assert set(replay.variants) == {1, (1, "input")}
+    assert set(replay.variants) == {1, 6, (1, "input")}
     assert not external.native_input and internal.native_input
 
 

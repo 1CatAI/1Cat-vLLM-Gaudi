@@ -307,9 +307,8 @@ class StageReplay:
                  native_input=False):
         tokens = input_ids.numel()
         program = self.program()
-        allowed = 1 <= tokens <= 6 if program.dspark else tokens == 1
-        if not allowed:
-            raise ValueError("V4.1 replay shape must match C1 decode or enabled C1-C6 DSpark verification")
+        if not 1 <= tokens <= 6:
+            raise ValueError("V4.1 replay shape must be between C1 and C6")
         if native_input and (not self.native_input_enabled or not _native_input_precision_compatible(program)
                              or tokens != 1):
             raise ValueError("Native input capture requires enabled ordinary BF16 C1 PP0 decode")

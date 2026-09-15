@@ -958,6 +958,8 @@ class V41ModelRunner:
         # instead of compiling an unqualified ordinary C1 stage on the first
         # public chat request.
         c1_replay = (getattr(self.model, "native", False) and count == 1 and start + count <= 1024)
+        prompt_replay = (getattr(self.model, "native", False) and not decode and count in (1, 6)
+                         and start + count <= 1024)
         graph_c1 = decode or c1_replay
         if self.direct_token_ids and graph_c1:
             if count != 1:
@@ -1009,7 +1011,7 @@ class V41ModelRunner:
         # Choose the qualified submission path before any request state write.
         # Longer CSA2 buckets use compiled recipes until native capture is qualified.
         use_replay = (getattr(self.model, "native", False) and start + count <= 1024
-                      and (decode or c1_replay or (self.use_dspark and request is not None)))
+                      and (decode or prompt_replay or (self.use_dspark and request is not None)))
         self.model.prepare_step(request_id, tokens, is_decode=graph_c1, reset=reset, use_replay=use_replay)
         self._round_phase("engram_prepared_ns")
         timing = getattr(self, "verify_timing", None)
@@ -1477,7 +1479,7 @@ class V41ModelRunner:
         self.state.clear()
         hidden = self._forward("__v41_warmup__", [1 + index for index in range(tokens)],
                                start_position,
-                               decode=native,
+                               decode=native and (self.use_dspark or tokens == 1),
                                reset=True)
         from vllm_gaudi.ops.tp2_prepared_plan import prepared_group_stats
         stats = prepared_group_stats()
@@ -1539,7 +1541,10 @@ class V41ModelRunner:
 
     @torch.inference_mode()
     def warmup_model(self):
-        for count in ((1, 6) if self.use_dspark else (1, )):
+        # Prompts are partitioned into C6 plus a C1 tail.  Warm both native
+        # variants before advertising API readiness so a user's first request
+        # cannot enter the much larger ordinary C6 compilation path.
+        for count in (1, 6):
             for _ in range(4 if self.model.native else 1):
                 self._dummy_run(count, native=self.model.native)
             if self.model.native:
