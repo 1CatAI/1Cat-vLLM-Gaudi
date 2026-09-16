@@ -31,21 +31,28 @@ from vllm_gaudi.omni.minimax_h3 import (
     map_minimax_h3_encoder_weight,
 )
 from vllm_gaudi.omni.minimax_h3_vae import (
+    _H3AsyncVideoTransfer,
     _H3VAECompiledRoPE,
     _h3_vae_rope,
     _h3_vae_compile_rope,
+    _h3_vae_compile_blocks,
     _h3_vae_compile_qk_norm,
     _h3_vae_compile_swiglu,
+    _h3_vae_async_d2h_enabled,
+    _h3_vae_temporal_batch_size,
     _h3_vae_blend_with_weights,
     _h3_vae_fused_sdpa,
     _h3_vae_fused_sdpa_enabled,
     _h3_vae_persist_bf16_weights,
     _h3_vae_tile_batch_size,
+    _h3_decode_to_mp4_async,
+    _h3_decode_temporal_chunks_batched,
     _install_h3_vae_compiled_swiglu,
     _install_h3_vae_compiled_qk_rms_norm,
     _install_h3_vae_blend_weight_cache,
     _install_h3_vae_decode_tile_batching,
     _install_h3_vae_fused_sdpa,
+    _install_h3_vae_compiled_blocks,
     _materialize_h3_vae_decoder_linear_weights,
 )
 
@@ -233,6 +240,18 @@ def test_h3_vae_compile_rope_environment_is_strict(monkeypatch):
         _h3_vae_compile_rope()
 
 
+def test_h3_vae_compile_blocks_environment_is_strict(monkeypatch):
+    monkeypatch.delenv("VLLM_GAUDI_H3_VAE_COMPILE_BLOCKS", raising=False)
+    assert _h3_vae_compile_blocks()
+
+    monkeypatch.setenv("VLLM_GAUDI_H3_VAE_COMPILE_BLOCKS", "off")
+    assert not _h3_vae_compile_blocks()
+
+    monkeypatch.setenv("VLLM_GAUDI_H3_VAE_COMPILE_BLOCKS", "sometimes")
+    with pytest.raises(ValueError, match="must be a boolean"):
+        _h3_vae_compile_blocks()
+
+
 def test_h3_vae_fused_sdpa_environment_is_strict(monkeypatch):
     monkeypatch.delenv("VLLM_GAUDI_H3_VAE_FUSED_SDPA", raising=False)
     assert _h3_vae_fused_sdpa_enabled()
@@ -243,6 +262,130 @@ def test_h3_vae_fused_sdpa_environment_is_strict(monkeypatch):
     monkeypatch.setenv("VLLM_GAUDI_H3_VAE_FUSED_SDPA", "sometimes")
     with pytest.raises(ValueError, match="must be a boolean"):
         _h3_vae_fused_sdpa_enabled()
+
+
+def test_h3_vae_async_d2h_environment_is_strict(monkeypatch):
+    monkeypatch.delenv("VLLM_GAUDI_H3_VAE_ASYNC_D2H", raising=False)
+    assert _h3_vae_async_d2h_enabled()
+
+    monkeypatch.setenv("VLLM_GAUDI_H3_VAE_ASYNC_D2H", "off")
+    assert not _h3_vae_async_d2h_enabled()
+
+    monkeypatch.setenv("VLLM_GAUDI_H3_VAE_ASYNC_D2H", "sometimes")
+    with pytest.raises(ValueError, match="must be a boolean"):
+        _h3_vae_async_d2h_enabled()
+
+
+def test_h3_vae_temporal_batch_environment_is_strict(monkeypatch):
+    monkeypatch.delenv("VLLM_GAUDI_H3_VAE_TEMPORAL_BATCH_SIZE", raising=False)
+    assert _h3_vae_temporal_batch_size() == 2
+
+    monkeypatch.setenv("VLLM_GAUDI_H3_VAE_TEMPORAL_BATCH_SIZE", "1")
+    assert _h3_vae_temporal_batch_size() == 1
+    monkeypatch.setenv("VLLM_GAUDI_H3_VAE_TEMPORAL_BATCH_SIZE", "2")
+    assert _h3_vae_temporal_batch_size() == 2
+
+    for invalid in ("0", "3", "auto"):
+        monkeypatch.setenv("VLLM_GAUDI_H3_VAE_TEMPORAL_BATCH_SIZE", invalid)
+        with pytest.raises(ValueError, match="must be 1 or 2"):
+            _h3_vae_temporal_batch_size()
+
+
+def test_h3_vae_temporal_pair_batch_preserves_order_and_tile_budget():
+    class Model:
+
+        use_3d_conv = True
+        token_drop = 0
+        tokens_chunk_size = 2
+        token_overlap = 0
+        vae_ratio_t = 1
+        frame_pre_padding = 0
+        isolated_first_frame = False
+        isolated_last_frame = False
+        decoder_tiling = True
+        parallel_tiling = False
+        frame_overlap = 0
+
+        def __init__(self):
+            self._vllm_gaudi_decode_tile_batch_size = 28
+            self.calls = []
+
+        @staticmethod
+        def _decode_temporal_output_frame_plan(latent, z_head, z_tail, num_chunks, pad_tokens):
+            del z_head, z_tail, num_chunks, pad_tokens
+            return (int(latent.shape[2]), 0, int(latent.shape[2]))
+
+        def _adaptive_decode(self, value):
+            self.calls.append((int(value.shape[0]), int(self._vllm_gaudi_decode_tile_batch_size)))
+            return value + 100
+
+        @staticmethod
+        def blend(a, b, blend_extent, dim):
+            del a, blend_extent, dim
+            return b
+
+    model = Model()
+    latent = torch.arange(1 * 1 * 4 * 1 * 1, dtype=torch.float32).reshape(1, 1, 4, 1, 1)
+    chunks = []
+    result = _h3_decode_temporal_chunks_batched(model, latent, chunks.append, group_size=2)
+
+    assert result.numel() == 0
+    assert model.calls == [(2, 14)]
+    assert model._vllm_gaudi_decode_tile_batch_size == 28
+    assert [chunk.flatten().tolist() for chunk in chunks] == [[100.0, 101.0], [102.0, 103.0]]
+
+
+def test_h3_vae_async_transfer_preserves_order_and_finishes():
+    class Encoder:
+
+        def __init__(self):
+            self.chunks = []
+
+        def push(self, chunk):
+            self.chunks.append(chunk.copy())
+
+    encoder = Encoder()
+    transfer = _H3AsyncVideoTransfer(encoder, max_pending=1)
+    try:
+        transfer.push(torch.arange(6, dtype=torch.uint8).reshape(2, 3))
+        transfer.push(torch.arange(6, 12, dtype=torch.uint8).reshape(2, 3))
+        transfer.finish()
+        transfer.release()
+    finally:
+        transfer.abort()
+
+    assert [chunk.tolist() for chunk in encoder.chunks] == [
+        [[0, 1, 2], [3, 4, 5]],
+        [[6, 7, 8], [9, 10, 11]],
+    ]
+    assert transfer._owned_cpu_tensors == []
+    assert transfer._owned_device_tensors == []
+
+
+def test_h3_vae_async_decode_uses_upstream_on_cpu(monkeypatch):
+    calls = []
+
+    def original(*args, **kwargs):
+        calls.append((args, kwargs))
+        return b"upstream"
+
+    pipeline = SimpleNamespace(device=torch.device("cpu"))
+    monkeypatch.setenv("VLLM_GAUDI_H3_VAE_ASYNC_D2H", "on")
+    output = _h3_decode_to_mp4_async(
+        pipeline,
+        original,
+        torch.empty(1),
+        torch.empty(1),
+        height=768,
+        width=1344,
+        max_pending=2,
+        batch_frames=17,
+        video_codec_options=None,
+    )
+
+    assert output == b"upstream"
+    assert calls[0][1]["height"] == 768
+    assert calls[0][1]["width"] == 1344
 
 
 def test_h3_vae_fused_sdpa_disallows_implicit_host_fallback():
@@ -280,6 +423,32 @@ def test_h3_vae_fused_sdpa_installer_preserves_fallback_contract():
     assert all(
         torch.equal(block.attn._perform_attention(value, value, value, {}), value + 1)
         for block in decoder.transformer_blocks)
+
+
+def test_h3_vae_compiled_blocks_keep_original_and_are_idempotent(monkeypatch):
+
+    class Block(torch.nn.Module):
+
+        def forward(self, value, rotary_pos_emb=None, pack_info=None):
+            del rotary_pos_emb, pack_info
+            return value + 1
+
+    decoder = SimpleNamespace(transformer_blocks=torch.nn.ModuleList([Block(), Block()]))
+    value = torch.randn(2, 3)
+    expected = [block(value) for block in decoder.transformer_blocks]
+    compiled_calls = []
+
+    def fake_compile(function, **kwargs):
+        compiled_calls.append((function, kwargs))
+        return function
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    assert _install_h3_vae_compiled_blocks(decoder) == 2
+    assert _install_h3_vae_compiled_blocks(decoder) == 0
+    assert len(compiled_calls) == 2
+    actual = [block(value) for block in decoder.transformer_blocks]
+    assert all(torch.equal(candidate, reference) for candidate, reference in zip(actual, expected))
+    assert all(call[1]["backend"] == "hpu_backend" and call[1]["fullgraph"] for call in compiled_calls)
 
 
 def test_h3_vae_compiled_rope_preserves_partial_rotation(monkeypatch):

@@ -170,6 +170,27 @@ without changing the checkpoint's blend order. The three compiled regions can
 be isolated with `--no-vae-compile-swiglu`, `--no-vae-compile-qk-norm`, and
 `--no-vae-compile-rope` when qualifying a new software stack.
 
+After FusedSDPA is selected, the HPU path compiles each complete decoder
+TransformerBlock with `hpu_backend` and `fullgraph=True`. The block wrapper is
+limited to the unmasked single-card decode contract and falls back per block
+for unsupported layouts or a failed compilation. On the qualified 124-frame
+shape this keeps the BF16 arithmetic path (no FP8 approximation) and passes
+the full-frame quality gate (PSNR about 50.86 dB, minimum SSIM about 0.99991)
+while reducing the steady decoder to about 13.6 seconds (the first request
+includes graph build).
+Use `--no-vae-compile-blocks` to measure the uncompiled block path.
+
+The default single-card launcher also submits two adjacent equal-shaped
+temporal clips together, reducing the spatial tile batch from 28 to 14 for
+that submission. This pair value is the only qualified temporal batch size:
+larger groups change reduction order and are rejected by the launcher. Set
+`--vae-temporal-batch-size 1` to disable it. Normalized frame copies are
+queued on a bounded host worker with `--vae-async-d2h` enabled; the worker
+preserves frame order and falls back to the released synchronous path for CPU
+or distributed VAE owners. The transfer path is gated by decoded-frame
+quality and playback checks; H.264 encoder byte identity is not expected when
+its worker scheduling changes.
+
 Unmasked decoder self-attention uses Habana FusedSDPA at the checkpoint's BF16
 precision. The guarded path is limited to the qualified 32-head, head-size-64
 contract and falls back to the checkpoint SDPA implementation for masked,

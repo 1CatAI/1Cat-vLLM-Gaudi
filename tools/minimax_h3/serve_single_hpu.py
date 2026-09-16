@@ -461,10 +461,32 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="compile and bit-exactly verify video-VAE rotary embedding graphs (default: enabled)",
     )
     parser.add_argument(
+        "--vae-compile-blocks",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=("compile complete video-VAE TransformerBlocks with the HPU backend "
+              "after the exact block contract is selected (default: enabled)"),
+    )
+    parser.add_argument(
         "--vae-fused-sdpa",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="use qualified Habana FusedSDPA for unmasked video-VAE decoder attention (default: enabled)",
+    )
+    parser.add_argument(
+        "--vae-temporal-batch-size",
+        type=int,
+        default=2,
+        choices=(1, 2),
+        help=("batch adjacent equal-shaped H3 temporal decoder clips; 2 is the "
+              "qualified single-card value (default: 2)"),
+    )
+    parser.add_argument(
+        "--vae-async-d2h",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=("overlap normalized video frame device-to-host copies with VAE decode "
+              "on the single-card output owner (default: enabled)"),
     )
     parser.add_argument(
         "--offload-component",
@@ -554,7 +576,10 @@ def main() -> int:
         VLLM_GAUDI_H3_VAE_COMPILE_SWIGLU="1" if args.vae_compile_swiglu else "0",
         VLLM_GAUDI_H3_VAE_COMPILE_QK_NORM="1" if args.vae_compile_qk_norm else "0",
         VLLM_GAUDI_H3_VAE_COMPILE_ROPE="1" if args.vae_compile_rope else "0",
+        VLLM_GAUDI_H3_VAE_COMPILE_BLOCKS="1" if args.vae_compile_blocks else "0",
         VLLM_GAUDI_H3_VAE_FUSED_SDPA="1" if args.vae_fused_sdpa else "0",
+        VLLM_GAUDI_H3_VAE_TEMPORAL_BATCH_SIZE=str(args.vae_temporal_batch_size),
+        VLLM_GAUDI_H3_VAE_ASYNC_D2H="1" if args.vae_async_d2h else "0",
     )
     if args.temp_dir is not None:
         environment.update(TMPDIR=str(args.temp_dir), TMP=str(args.temp_dir), TEMP=str(args.temp_dir))
@@ -579,7 +604,10 @@ def main() -> int:
                 "vae_compile_swiglu": bool(args.vae_compile_swiglu),
                 "vae_compile_qk_norm": bool(args.vae_compile_qk_norm),
                 "vae_compile_rope": bool(args.vae_compile_rope),
+                "vae_compile_blocks": bool(args.vae_compile_blocks),
                 "vae_fused_sdpa": bool(args.vae_fused_sdpa),
+                "vae_temporal_batch_size": int(args.vae_temporal_batch_size),
+                "vae_async_d2h": bool(args.vae_async_d2h),
                 "temp_dir": str(args.temp_dir) if args.temp_dir else None,
                 "media_bin": str(args.media_bin),
                 "huggingface_network_disabled": True,
