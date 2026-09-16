@@ -132,9 +132,22 @@ setup(
     ext_modules=ext_modules,
     cmdclass={"build_py": FlashInferBuildPy},
     distclass=FlashInferDistribution,
-    extras_require={},
+    extras_require={
+        # Keep the multimodal stack opt-in so text-only vLLM deployments do
+        # not install video/audio dependencies. This commit is the H3 pipeline
+        # baseline qualified with this plugin.
+        "omni": [
+            "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@767cc7977e04dc1f1ae7307e630429e9169af622",
+            "transformers==5.14.1",
+            "diffusers==0.40.0",
+            "modelscope==1.40.0",
+            "imageio-ffmpeg==0.6.0",
+        ],
+    },
     entry_points={
         "vllm.platform_plugins": ["hpu = vllm_gaudi:register"],
+        "vllm_omni.platform_plugins": ["hpu = vllm_gaudi.omni:register_omni_platform"],
+        "vllm_omni.general_plugins": ["hpu = vllm_gaudi.omni:register_omni"],
         "vllm.general_plugins": [
             "01.hpu_custom_utils = vllm_gaudi:register_utils",
             "02.hpu_custom_ops = vllm_gaudi:register_ops",

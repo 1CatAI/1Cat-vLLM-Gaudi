@@ -112,8 +112,7 @@ def _patch_hpu_fx_stack_trace_parser() -> None:
     """Ignore missing optional source metadata in resumed Dynamo graphs."""
     try:
         from habana_frameworks.torch.dynamo._fx_to_jit_lowering import (
-            FxToJitLowering,
-        )
+            FxToJitLowering, )
     except ImportError:
         return
 
@@ -125,15 +124,13 @@ def _patch_hpu_fx_stack_trace_parser() -> None:
         try:
             return original(self, fx_node)
         except AttributeError as exc:
-            if (
-                "'NoneType' object has no attribute 'file'" in str(exc)
-                and getattr(fx_node, "stack_trace", None)
-            ):
+            if ("'NoneType' object has no attribute 'file'" in str(exc) and getattr(fx_node, "stack_trace", None)):
                 return None
             raise
 
     _safe_get_stack_trace._vllm_gaudi_safe_stack_trace = True
     FxToJitLowering._get_stack_trace = _safe_get_stack_trace
+
 
 # NOTE: neither ``vllm.platforms.current_platform`` nor
 # ``vllm.distributed.parallel_state`` is imported at module top level — both
@@ -163,7 +160,8 @@ def _hpu_accelerator_empty_cache() -> None:
     HPU's allocator does not implement the ``c10::DeviceAllocator``
     interface, so the upstream ``torch.accelerator.empty_cache()`` raises
     ``RuntimeError``.  Route through ``current_platform.empty_cache``
-    instead (which is ``None`` on HPU, making this a no-op).
+    instead (whose HPU implementation is an explicit no-op because Habana
+    manages reclaimed allocator blocks internally).
     """
     from vllm.platforms import current_platform
 

@@ -13,7 +13,7 @@ from vllm_gaudi.extension.ops import (
     apply_block_fp8_linear_hpu,
     fp8_block_linear_postprocess_weights,
 )
-from vllm_gaudi.ops.hpu_fp8 import Fp8LinearMethod, HPUFp8MoEMethod
+from vllm_gaudi.ops.hpu_fp8 import Fp8LinearMethod, HPUFp8MoEMethod, HPUFp8OnlineLinearMethod
 from vllm_gaudi.utils import HPUCompileConfig
 from vllm.forward_context import override_forward_context
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
@@ -72,6 +72,72 @@ def test_jit_dynamic_quant_guard(monkeypatch):
     assert not hpu_ops._use_jit_dynamic_quant(value)
 
 
+def test_online_fp8_loading_uses_per_channel_scale_without_serialized_adjustment(monkeypatch):
+    method = object.__new__(HPUFp8OnlineLinearMethod)
+    layer = torch.nn.Module()
+    source = torch.tensor(
+        [[-2.0, 1.0, 0.0], [0.25, -0.5, 1.0]],
+        dtype=torch.bfloat16,
+    )
+    layer.weight = torch.nn.Parameter(source.clone(), requires_grad=False)
+    observed = {}
+
+    def cast_to_fp8(weight, inv_scale, stochastic, is_amax, dtype):
+        observed.update(
+            weight=weight.clone(),
+            inv_scale=inv_scale.clone(),
+            stochastic=stochastic,
+            is_amax=is_amax,
+            dtype=dtype,
+        )
+        return weight.to(torch.float8_e4m3fn), None
+
+    monkeypatch.setattr(torch.ops.hpu, "cast_to_fp8_v2", cast_to_fp8)
+    method.process_weights_after_loading(layer)
+
+    expected_scale = (source.abs().amax(dim=-1).float() + 1e-8) / float(hpu_ops.FP8_MAX)
+    torch.testing.assert_close(layer.weight_scale, expected_scale)
+    torch.testing.assert_close(observed["inv_scale"].squeeze(-1), expected_scale.reciprocal())
+    torch.testing.assert_close(observed["weight"], source)
+    assert layer.weight.shape == (3, 2)
+    assert layer.weight.dtype == torch.float8_e4m3fn
+    assert layer.input_scale is None
+    assert layer._already_called_process_weights_after_loading
+
+
+def test_legacy_online_fp8_postprocess_initializes_dynamic_input_scale(monkeypatch):
+    method = object.__new__(Fp8LinearMethod)
+    method.quant_config = SimpleNamespace(is_checkpoint_fp8_serialized=False)
+    method.block_quant = False
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(torch.ones((2, 3), dtype=torch.bfloat16), requires_grad=False)
+    qweight = torch.ones((2, 3), dtype=torch.float8_e4m3fn)
+    weight_scale = torch.tensor([0.25], dtype=torch.float32)
+    monkeypatch.setattr(hpu_ops, "scaled_fp8_quant", lambda *_args, **_kwargs: (qweight, weight_scale))
+
+    method.process_weights_after_loading(layer)
+
+    assert layer.input_scale is None
+    assert layer.weight.shape == (3, 2)
+    torch.testing.assert_close(layer.weight_scale, weight_scale)
+
+
+def test_legacy_online_fp8_does_not_wrap_bf16_checkpoint_loader(monkeypatch):
+    method = object.__new__(Fp8LinearMethod)
+    method.quant_config = SimpleNamespace(is_checkpoint_fp8_serialized=False)
+    loader = object()
+    observed = {}
+
+    def create_weights(_self, *_args, **kwargs):
+        observed.update(kwargs)
+
+    monkeypatch.setattr(hpu_ops, "is_hpu_gaudi2", True)
+    monkeypatch.setattr(Fp8LinearMethod.__mro__[1], "create_weights", create_weights)
+    method.create_weights(weight_loader=loader)
+
+    assert observed["weight_loader"] is loader
+
+
 def test_fp8_linear_method(default_vllm_config: None, dist_init, monkeypatch):
     monkeypatch.setenv("VLLM_HPU_FORCE_CHANNEL_FP8", "0")
     config = {'activation_scheme': 'dynamic', 'fmt': 'e4m3', 'quant_method': 'fp8', 'weight_block_size': [128, 128]}
@@ -109,9 +175,7 @@ def test_fp8_linear_method(default_vllm_config: None, dist_init, monkeypatch):
 
 def test_block_fp8_linear_accepts_non_contiguous_tp_input():
     device = torch.device("hpu")
-    base = torch.arange(
-        16, dtype=torch.bfloat16, device=device
-    ).view(2, 8)
+    base = torch.arange(16, dtype=torch.bfloat16, device=device).view(2, 8)
     input_tensor = base[:, :4]
     assert not input_tensor.is_contiguous()
 
@@ -121,9 +185,7 @@ def test_block_fp8_linear_accepts_non_contiguous_tp_input():
         requires_grad=False,
     )
     layer.weight_scale_inv = torch.nn.Parameter(
-        torch.ones(
-            (1, 1), dtype=torch.bfloat16, device=device
-        ),
+        torch.ones((1, 1), dtype=torch.bfloat16, device=device),
         requires_grad=False,
     )
     layer.quant_config = SimpleNamespace(weight_block_size=[4, 4])
