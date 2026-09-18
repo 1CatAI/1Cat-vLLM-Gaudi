@@ -66,6 +66,15 @@ continues to use its compiled native path. Disabled by default.
 | `VLLM_PROMPT_BS_BUCKET_MAX`  | Sets prefill batch size | `1` |
 | `VLLM_MULTIMODAL_BUCKETS`    | Overrides the per-model patch-count buckets used to warm up native-resolution vision towers (models where `is_batch_based=False`, e.g. Gemma4, Kimi-K2.5/K2.6, Qwen2.5/3/3.5-VL). Comma-separated list of integers. Set to `None` to disable bucketing for these models. | model-specific |
 | `VLLM_MULTIMODAL_RESOLUTIONS` | Pins explicit raw pixel resolutions (comma-separated, e.g. `1024x768,768x1024`) to warm up for native-resolution vision towers. Each entry is `WxH`, `WxHxN` (pin the count-`N` graph), or `WxHxN-M` (warm the item-count range `[N, M]`); `WxH` alone warms one graph at the `--limit-mm-per-prompt` ceiling. See [Warm-up](../features/warmup.md#multimodal-warm-up). | `None` |
+| `VLLM_GAUDI_H3_VAE_TILE_BATCH_SIZE` | Number of independent MiniMax H3 video-VAE spatial tiles decoded together. Use `1` for sequential tile execution. | `4` |
+| `VLLM_GAUDI_H3_VAE_PERSIST_BF16_WEIGHTS` | Stores MiniMax H3 video-VAE decoder Linear weights in BF16, matching HPU autocast while avoiding repeated weight casts. | `true` |
+| `VLLM_GAUDI_H3_VAE_COMPILE_SWIGLU` | Compiles the MiniMax H3 video-VAE SwiGLU pointwise region with the HPU backend and verifies every real tensor contract bit-for-bit before reuse. | `true` |
+| `VLLM_GAUDI_H3_VAE_COMPILE_QK_NORM` | Compiles the MiniMax H3 video-VAE Q/K RMSNorm region with the HPU backend and verifies every real tensor contract bit-for-bit before reuse. | `true` |
+| `VLLM_GAUDI_H3_VAE_COMPILE_ROPE` | Compiles the MiniMax H3 video-VAE rotary embedding region with the HPU backend and verifies every real tensor contract bit-for-bit before reuse. | `true` |
+| `VLLM_GAUDI_H3_VAE_COMPILE_BLOCKS` | Compiles each complete MiniMax H3 video-VAE decoder TransformerBlock with the HPU backend after the exact BF16/FusedSDPA contract is selected. Unsupported layouts fall back to the original block. | `true` |
+| `VLLM_GAUDI_H3_VAE_FUSED_SDPA` | Uses Habana FusedSDPA for the qualified unmasked BF16 MiniMax H3 video-VAE decoder attention contract. | `true` |
+| `VLLM_GAUDI_H3_VAE_TEMPORAL_BATCH_SIZE` | Batches adjacent equal-shaped temporal decoder clips. `2` is the qualified single-card Gaudi 2 value; `1` disables the pair submission. | `2` |
+| `VLLM_GAUDI_H3_VAE_ASYNC_D2H` | Overlaps normalized video-frame device-to-host copies with the next H3 VAE decode tile on a single-card output owner. | `true` |
 | `VLLM_MINIMAX_M3_MOE_TOKEN_TILE` | Maximum number of tokens processed per tile by the MiniMax-M3 dense SwiGLU-OAI expert path. Non-positive values disable tiling. | `512` |
 | `VLLM_MINIMAX_M3_MOE_DECODE_GATHER` | Enables the MiniMax-M3 routed-expert gather path for low-token decode. Set to `0` or `false` to use the dense expert path. | `true` |
 | `VLLM_MINIMAX_M3_MOE_GATHER_MAX_TOKENS` | Maximum token count for the MiniMax-M3 routed-expert gather path. Larger batches use the dense expert path. | `16` |

@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Submit a validated MiniMax H3 request to vLLM Omni's synchronous video API."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import json
+import mimetypes
+from pathlib import Path
+import time
+from typing import BinaryIO
+
+import requests
+
+_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"}
+_VIDEO_TYPES = {"video/mp4", "video/quicktime"}
+_AUDIO_TYPES = {"audio/wav", "audio/x-wav", "audio/mpeg"}
+_T2VA_RATIOS = {"21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}
+_PINNED_OMNI_REFERENCE_SIGMA_POINTS = 50
+_FLASHGEN_INFERENCE_STEPS = 4
+_FLASHGEN_SIGMA_POINTS = 5
+_FLASHGEN_FILENAME = "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
+_FLASHGEN_BASE_SCHEDULE = (1.0, 0.7, 0.4, 0.15, 0.0)
+_FASTH3_INFERENCE_STEPS = 4
+_FASTH3_SIGMA_POINTS = 5
+_FASTH3_BASE_SCHEDULE = (0.999, 0.749, 0.5, 0.25, 0.0)
+_LIGHTX2V_INFERENCE_STEPS = 4
+_LIGHTX2V_SIGMA_POINTS = 5
+_LIGHTX2V_FILENAME = "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"
+
+
+@dataclass(frozen=True)
+class _LightX2VProfile:
+    profile: str
+    supported_tasks: frozenset[str]
+    video_flow_shift: float
+    audio_flow_shift: float
+    output_short_edge: int
+
+
+_LIGHTX2V_PROFILES = {
+    _LIGHTX2V_FILENAME:
+    _LightX2VProfile(
+        profile="lightx2v_fl2v_turbo_4step_v1.0_768p_bf16",
+        supported_tasks=frozenset({"t2va", "fl2va"}),
+        video_flow_shift=6.0,
+        audio_flow_shift=3.0,
+        output_short_edge=768,
+    ),
+    "minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors":
+    _LightX2VProfile(
+        profile="lightx2v_ref2v_turbo_4step_v0.1_544p_bf16",
+        supported_tasks=frozenset({"ref2va"}),
+        video_flow_shift=12.0,
+        audio_flow_shift=3.0,
+        output_short_edge=544,
+    ),
+}
+_LIGHTX2V_VIDEO_FLOW_SHIFT = _LIGHTX2V_PROFILES[_LIGHTX2V_FILENAME].video_flow_shift
+_LIGHTX2V_AUDIO_FLOW_SHIFT = _LIGHTX2V_PROFILES[_LIGHTX2V_FILENAME].audio_flow_shift
+
+
+def _lightx2v_profile(path: Path) -> _LightX2VProfile:
+    try:
+        return _LIGHTX2V_PROFILES[path.name]
+    except KeyError as exc:
+        raise ValueError(f"unsupported LightX2V four-step artifact: {path.name}") from exc
+
+
+def _response_metrics(headers: dict[str, str]) -> dict[str, object]:
+    """Decode the sync endpoint's timing headers into stable JSON fields."""
+
+    normalized = {name.lower(): value for name, value in headers.items()}
+    raw_stages = normalized.get("x-stage-durations", "{}")
+    try:
+        stages = json.loads(raw_stages)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid X-Stage-Durations response header: {raw_stages!r}") from exc
+    if not isinstance(stages, dict) or any(not isinstance(name, str) or not isinstance(value, (int, float))
+                                           for name, value in stages.items()):
+        raise ValueError(f"invalid X-Stage-Durations response header: {raw_stages!r}")
+
+    def optional_float(name: str) -> float | None:
+        value = normalized.get(name)
+        return None if value is None else float(value)
+
+    return {
+        "request_id": normalized.get("x-request-id"),
+        "model": normalized.get("x-model"),
+        "server_inference_seconds": optional_float("x-inference-time-s"),
+        "stage_durations_seconds": {
+            name: float(value)
+            for name, value in stages.items()
+        },
+        "peak_device_memory_mb": optional_float("x-peak-memory-mb"),
+    }
+
+
+def _resolve_sigma_points(
+    requested: int | None,
+    denoise_steps: int | None,
+    pinned_omni_reference: bool,
+) -> int | None:
+    """Resolve an explicit Base grid; omission keeps Omni's Base reference."""
+
+    if pinned_omni_reference:
+        return None
+    if requested is not None:
+        return requested
+    if denoise_steps is not None:
+        return denoise_steps + 1
+    return None
+
+
+def _sampling_contract(args: argparse.Namespace) -> dict[str, object]:
+    if getattr(args, "fasth3_4step", False):
+        return {
+            "request_field": "num_inference_steps",
+            "meaning": "student_schedule_interval_count",
+            "field_was_omitted": False,
+            "sampler": "fasth3_dmd2_base_schedule",
+            "profile": "fasth3_dense_datafree_4step",
+            "resolved_sigma_points": _FASTH3_SIGMA_POINTS,
+            "base_schedule": list(_FASTH3_BASE_SCHEDULE),
+            "expected_joint_dit_forwards": _FASTH3_INFERENCE_STEPS,
+            "video_and_audio_share_each_forward": True,
+        }
+    lightx2v = getattr(args, "lightx2v_lora", None)
+    if lightx2v is not None:
+        profile = _lightx2v_profile(Path(lightx2v))
+        return {
+            "request_field": "num_inference_steps",
+            "meaning": "sigma_grid_points_including_terminal_zero",
+            "field_was_omitted": False,
+            "sampler": "lightx2v_turbo_euler_eta0",
+            "profile": profile.profile,
+            "resolved_sigma_points": _LIGHTX2V_SIGMA_POINTS,
+            "expected_joint_dit_forwards": _LIGHTX2V_INFERENCE_STEPS,
+            "video_flow_shift": profile.video_flow_shift,
+            "audio_flow_shift": profile.audio_flow_shift,
+            "output_short_edge": profile.output_short_edge,
+            "precision": "bf16_base_plus_bf16_lora",
+            "video_and_audio_share_each_forward": True,
+        }
+    flashgen = getattr(args, "flashgen_lora", None)
+    if flashgen is not None:
+        return {
+            "request_field": "num_inference_steps",
+            "meaning": "adapter_schedule_interval_count",
+            "field_was_omitted": False,
+            "sampler": "flashgen_dmd2_base_schedule",
+            "profile": "flashgen_4step_768p",
+            "resolved_sigma_points": _FLASHGEN_SIGMA_POINTS,
+            "base_schedule": list(_FLASHGEN_BASE_SCHEDULE),
+            "expected_joint_dit_forwards": _FLASHGEN_INFERENCE_STEPS,
+            "video_and_audio_share_each_forward": True,
+        }
+    sigma_points = args.sigma_points or _PINNED_OMNI_REFERENCE_SIGMA_POINTS
+    return {
+        "request_field": "num_inference_steps",
+        "meaning": "sigma_grid_points_including_terminal_zero",
+        "field_was_omitted": args.sigma_points is None,
+        "sampler": "omni_euler_eta0",
+        "profile": "pinned_omni_base" if args.sigma_points is None else "explicit_base_grid",
+        "resolved_sigma_points": sigma_points,
+        "expected_joint_dit_forwards": sigma_points - 1,
+        "video_and_audio_share_each_forward": True,
+    }
+
+
+def _mime_type(path: Path) -> str:
+    overrides = {".heic": "image/heic", ".heif": "image/heif", ".wav": "audio/wav", ".mp3": "audio/mpeg"}
+    result = overrides.get(path.suffix.lower()) or mimetypes.guess_type(path.name)[0]
+    if result not in _IMAGE_TYPES | _VIDEO_TYPES | _AUDIO_TYPES:
+        raise ValueError(f"unsupported reference type for {path}: {result}")
+    return result
+
+
+def _validate(args: argparse.Namespace, references: list[tuple[Path, str]]) -> None:
+    if not args.prompt.strip():
+        raise ValueError("prompt must be non-empty")
+    if not 4.0 <= args.duration <= 15.0:
+        raise ValueError("duration must be between 4 and 15 seconds")
+    if args.fps != 24:
+        raise ValueError("MiniMax H3 output is fixed at 24 FPS")
+    if args.sigma_points is not None and args.sigma_points < 2:
+        raise ValueError("MiniMax H3 needs at least two sigma grid points")
+    if args.flow_shift is not None and args.flow_shift <= 0:
+        raise ValueError("flow_shift must be positive")
+    if args.audio_flow_shift is not None and args.audio_flow_shift <= 0:
+        raise ValueError("audio_flow_shift must be positive")
+    flashgen = getattr(args, "flashgen_lora", None)
+    if flashgen is not None:
+        if args.task != "t2va":
+            raise ValueError("FlashGen 4-step v1.0 supports T2VA only")
+        if Path(flashgen).name != _FLASHGEN_FILENAME:
+            raise ValueError(f"FlashGen preset requires the published filename {_FLASHGEN_FILENAME}")
+        if args.flow_shift is not None or args.audio_flow_shift is not None:
+            raise ValueError("FlashGen preset owns its sigma schedule; omit flow-shift overrides")
+    if getattr(args, "fasth3_4step", False):
+        if args.task != "t2va":
+            raise ValueError("FastH3 preview v1 supports T2VA only")
+        if args.flow_shift is not None or args.audio_flow_shift is not None:
+            raise ValueError("FastH3 owns its sigma schedule and shifts; omit flow-shift overrides")
+    lightx2v = getattr(args, "lightx2v_lora", None)
+    if lightx2v is not None:
+        profile = _lightx2v_profile(Path(lightx2v))
+        if args.task not in profile.supported_tasks:
+            tasks = ", ".join(sorted(task.upper() for task in profile.supported_tasks))
+            raise ValueError(f"{Path(lightx2v).name} supports {tasks} only")
+        if args.flow_shift is not None or args.audio_flow_shift is not None:
+            raise ValueError("LightX2V preset owns its exact video/audio shifts; omit flow-shift overrides")
+    if (args.width is not None or args.height is not None) and (args.width is None or args.height is None
+                                                                or args.width % 32 or args.height % 32):
+        raise ValueError("width and height must both be present and divisible by 32")
+    images = sum(mime in _IMAGE_TYPES for _, mime in references)
+    videos = sum(mime in _VIDEO_TYPES for _, mime in references)
+    audios = sum(mime in _AUDIO_TYPES for _, mime in references)
+    if args.task == "t2va":
+        if references or args.audio_url:
+            raise ValueError("T2VA is text-only")
+        if args.aspect_ratio not in _T2VA_RATIOS:
+            raise ValueError(f"T2VA aspect_ratio must be one of {sorted(_T2VA_RATIOS)}")
+    elif args.task == "fl2va":
+        if not 1 <= images <= 2 or videos or audios or args.audio_url:
+            raise ValueError("FL2VA requires one or two image references")
+        expected = [0] if images == 1 else [0, -1]
+        frame_indices = args.frame_indices if args.frame_indices is not None else expected
+        if images == 1 and frame_indices not in ([0], [-1]):
+            raise ValueError("single-image FL2VA frame_indices must be [0] or [-1]")
+        if images == 2 and frame_indices != [0, -1]:
+            raise ValueError("two-image FL2VA frame_indices must be [0, -1]")
+        args.frame_indices = frame_indices
+    else:
+        if images > 9 or videos > 3 or audios > 3 or len(references) > 12:
+            raise ValueError("Ref2VA exceeds the image/video/audio or 12-file limit")
+        if not images and not videos:
+            raise ValueError("Ref2VA requires at least one visual reference")
+        if args.audio_url and audios:
+            raise ValueError("use either --audio-url or uploaded audio references")
+        expected_short_edge = _lightx2v_profile(Path(lightx2v)).output_short_edge if lightx2v is not None else 768
+        if args.short_edge != expected_short_edge:
+            raise ValueError(f"Ref2VA short_edge must be {expected_short_edge} for the selected profile")
+
+
+def _request_data(args: argparse.Namespace) -> dict[str, str]:
+    extra = {"task": args.task, "duration": args.duration}
+    if getattr(args, "preencode_mp4", False):
+        extra["preencode_mp4"] = True
+        extra["preencode_batch_frames"] = getattr(args, "preencode_batch_frames", 17)
+    lightx2v = getattr(args, "lightx2v_lora", None)
+    if lightx2v is not None:
+        profile = _lightx2v_profile(Path(lightx2v))
+        extra["audio_flow_shift"] = profile.audio_flow_shift
+    elif args.audio_flow_shift is not None:
+        extra["audio_flow_shift"] = args.audio_flow_shift
+    if args.frame_indices is not None:
+        extra["frame_indices"] = args.frame_indices
+    data = {
+        "prompt": args.prompt,
+        "fps": str(args.fps),
+        "seed": str(args.seed),
+        "extra_params": json.dumps(extra, separators=(",", ":")),
+    }
+    flashgen = getattr(args, "flashgen_lora", None)
+    if getattr(args, "fasth3_4step", False):
+        data["num_inference_steps"] = str(_FASTH3_INFERENCE_STEPS)
+    elif lightx2v is not None:
+        profile = _lightx2v_profile(Path(lightx2v))
+        data["num_inference_steps"] = str(_LIGHTX2V_SIGMA_POINTS)
+        data["flow_shift"] = str(profile.video_flow_shift)
+        data["lora"] = json.dumps(
+            {
+                "name": Path(lightx2v).stem,
+                "path": str(Path(lightx2v)),
+                "scale": float(getattr(args, "lora_scale", 1.0)),
+            },
+            separators=(",", ":"),
+        )
+    elif flashgen is not None:
+        data["num_inference_steps"] = str(_FLASHGEN_INFERENCE_STEPS)
+        data["lora"] = json.dumps(
+            {
+                "name": "h3-flashgen-v1.0",
+                "path": str(Path(flashgen)),
+                "scale": float(getattr(args, "lora_scale", 1.0)),
+            },
+            separators=(",", ":"),
+        )
+    elif args.sigma_points is not None:
+        data["num_inference_steps"] = str(args.sigma_points)
+    if args.flow_shift is not None:
+        data["flow_shift"] = str(args.flow_shift)
+    if args.width is not None:
+        data.update(width=str(args.width), height=str(args.height))
+    if args.task != "fl2va":
+        data["aspect_ratio"] = args.aspect_ratio
+    if args.task == "ref2va":
+        data["short_edge"] = str(args.short_edge)
+    if args.audio_url:
+        data["audio_reference"] = json.dumps({"audio_url": args.audio_url}, separators=(",", ":"))
+    return data
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--api-url", default="http://127.0.0.1:8097/v1/videos/sync")
+    parser.add_argument("--task", required=True, choices=("t2va", "fl2va", "ref2va"))
+    parser.add_argument("--prompt", required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--metadata", type=Path)
+    parser.add_argument("--reference", type=Path, action="append", default=[])
+    parser.add_argument("--audio-url")
+    parser.add_argument("--frame-indices", type=int, nargs="+")
+    parser.add_argument("--duration", type=float, default=5.0)
+    parser.add_argument("--width", type=int)
+    parser.add_argument("--height", type=int)
+    parser.add_argument("--aspect-ratio", default="16:9")
+    parser.add_argument("--short-edge", type=int, default=768)
+    parser.add_argument("--fps", type=int, default=24)
+    parser.add_argument(
+        "--preencode-mp4",
+        action="store_true",
+        help="decode in temporal chunks and encode MP4 in the worker",
+    )
+    parser.add_argument(
+        "--preencode-batch-frames",
+        type=int,
+        default=17,
+        help="maximum decoded frame batch handed to the worker-side encoder",
+    )
+    schedule = parser.add_mutually_exclusive_group()
+    schedule.add_argument(
+        "--fasth3-4step",
+        action="store_true",
+        help="use the four-forward schedule of a server with the FastH3 student fused at startup",
+    )
+    schedule.add_argument(
+        "--flashgen-4step-lora",
+        "--flashgen-lora",
+        dest="flashgen_lora",
+        type=Path,
+        help="published ModelScope FlashGen native-layout LoRA; runs its exact four-forward schedule",
+    )
+    schedule.add_argument(
+        "--lightx2v-4step-lora",
+        "--lightx2v-lora",
+        dest="lightx2v_lora",
+        type=Path,
+        help="published LightX2V FL2V 768p or Ref2V 544p Turbo four-step BF16 LoRA",
+    )
+    schedule.add_argument(
+        "--denoise-steps",
+        type=int,
+        help="experimental Base Euler DiT calls (translated to one more sigma grid point)",
+    )
+    schedule.add_argument(
+        "--sigma-points",
+        dest="sigma_points",
+        type=int,
+        help="expert override: Omni sigma grid points including terminal zero",
+    )
+    schedule.add_argument(
+        "--pinned-omni-reference",
+        "--official-base-default",
+        dest="pinned_omni_reference",
+        action="store_true",
+        help="reproduce pinned Omni's 50-point / 49-forward Base schedule (also the Base default)",
+    )
+    parser.add_argument("--lora-scale", type=float, default=1.0)
+    parser.add_argument("--flow-shift", type=float, help="omitted uses checkpoint release metadata (Base: 12)")
+    parser.add_argument(
+        "--audio-flow-shift",
+        type=float,
+        help="omitted uses checkpoint release metadata (Base: 3)",
+    )
+    parser.add_argument("--seed", type=int, default=2101)
+    parser.add_argument("--timeout", type=float, default=14400.0)
+    args = parser.parse_args()
+    args.sigma_points = _resolve_sigma_points(
+        args.sigma_points,
+        args.denoise_steps,
+        args.pinned_omni_reference,
+    )
+    if args.flashgen_lora is not None:
+        args.flashgen_lora = args.flashgen_lora.expanduser().resolve()
+        if not args.flashgen_lora.is_file():
+            raise FileNotFoundError(args.flashgen_lora)
+    if args.lightx2v_lora is not None:
+        args.lightx2v_lora = args.lightx2v_lora.expanduser().resolve()
+        if not args.lightx2v_lora.is_file():
+            raise FileNotFoundError(args.lightx2v_lora)
+    if args.lora_scale <= 0:
+        raise ValueError("lora-scale must be positive")
+    if args.preencode_batch_frames <= 0:
+        raise ValueError("preencode-batch-frames must be positive")
+
+    references = [(path.expanduser().resolve(), _mime_type(path)) for path in args.reference]
+    for path, _ in references:
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    _validate(args, references)
+    data = _request_data(args)
+
+    streams: list[BinaryIO] = []
+    files = []
+    field = "input_reference" if len(references) == 1 else "input_references"
+    try:
+        for path, mime in references:
+            stream = path.open("rb")
+            streams.append(stream)
+            files.append((field, (path.name, stream, mime)))
+        started_at = datetime.now(timezone.utc).isoformat()
+        started = time.perf_counter()
+        with requests.post(args.api_url, data=data, files=files, timeout=args.timeout, stream=True) as response:
+            response.raise_for_status()
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            with args.output.open("wb") as output:
+                for chunk in response.iter_content(chunk_size=4 * 1024 * 1024):
+                    output.write(chunk)
+            headers = dict(response.headers)
+        elapsed = time.perf_counter() - started
+    finally:
+        for stream in streams:
+            stream.close()
+
+    metadata = {
+        "schema_version": 1,
+        "status": "pass",
+        "started_at": started_at,
+        "wall_seconds": elapsed,
+        "api_url": args.api_url,
+        "task": args.task,
+        "request": data,
+        "sampling_contract": _sampling_contract(args),
+        "references": [{
+            "path": str(path),
+            "mime_type": mime
+        } for path, mime in references],
+        "response_headers": headers,
+        "response_metrics": _response_metrics(headers),
+        "output": str(args.output.resolve()),
+        "output_bytes": args.output.stat().st_size,
+    }
+    encoded = json.dumps(metadata, ensure_ascii=False, indent=2) + "\n"
+    if args.metadata:
+        args.metadata.parent.mkdir(parents=True, exist_ok=True)
+        args.metadata.write_text(encoded, encoding="utf-8")
+    print(encoded, end="")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

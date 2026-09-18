@@ -38,6 +38,26 @@ def test_runner_kv_caches_allow_distinct_layers_with_same_numeric_index():
     assert HpuPlatform.check_runner_kv_caches_multi_layer() is None
 
 
+def test_current_memory_usage_resets_hpu_peak_before_reading():
+    with (
+            patch.object(HpuPlatform, "empty_cache") as empty_cache,
+            patch("vllm_gaudi.platform.torch.hpu.reset_peak_memory_stats") as reset_peak,
+            patch("vllm_gaudi.platform.torch.hpu.max_memory_allocated", return_value=1234) as maximum,
+    ):
+        assert HpuPlatform.get_current_memory_usage(torch.device("hpu")) == 1234.0
+
+    empty_cache.assert_called_once_with()
+    reset_peak.assert_called_once_with()
+    maximum.assert_called_once_with()
+
+
+def test_empty_cache_does_not_reenter_torch_accelerator():
+    with patch("vllm_gaudi.platform.torch.accelerator.empty_cache") as empty_cache:
+        HpuPlatform.empty_cache()
+
+    empty_cache.assert_not_called()
+
+
 @pytest.fixture(autouse=True)
 def _clean_env():
     """Isolate the env vars and global torch state this test touches."""
