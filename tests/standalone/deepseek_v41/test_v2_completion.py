@@ -320,6 +320,24 @@ def test_bounded_stage_does_not_need_a_paged_search_binding(monkeypatch):
     assert runner._prefix_authorized(SimpleNamespace(request_id="a", start=10), scheduled)
 
 
+@pytest.mark.parametrize("position", [510, 511, 512, 1023, 1024, 524287, 1048574])
+def test_runtime_indexer_reuses_bound_prefix_across_history_boundaries(monkeypatch, position):
+    monkeypatch.setenv("VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX", "1")
+    runner, _ = fixture()
+    runner.pp.group = SimpleNamespace(is_first_rank=True)
+    queries = []
+    runner.model = SimpleNamespace(
+        decode_prefix_ready=lambda search: queries.append(search) or True,
+        program=SimpleNamespace(length=1 << 20, search_length=1 << 20, runtime_indexer=True))
+    scheduled = SimpleNamespace(num_scheduled_tokens={"a": 1}, finished_req_ids=set(), scheduled_spec_decode_tokens={})
+    assert runner._prefix_authorized(SimpleNamespace(request_id="a", start=position), scheduled)
+    assert queries == [1 << 20]
+    # A prompt path can temporarily bind another geometry. Never run an old
+    # prefix merely because the persistent C1 recipe already exists.
+    runner.model.program.search_length = 8192
+    assert not runner._prefix_authorized(SimpleNamespace(request_id="a", start=position), scheduled)
+
+
 def test_device_engram_skips_only_matching_host_layer1(monkeypatch):
     from vllm_gaudi.models.deepseek_v41 import HpuDeepseekV41ForCausalLM
 

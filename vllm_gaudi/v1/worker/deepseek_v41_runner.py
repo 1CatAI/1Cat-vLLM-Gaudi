@@ -131,8 +131,11 @@ def target_search_length(start, count, maximum):
     return min(maximum, max(512, 1 << (start + count - 1).bit_length()))
 
 
-def decode_search_warmups(maximum):
+def decode_search_warmups(maximum, *, runtime_indexer=False):
     """Yield one valid C1 position per reachable search bucket, in order."""
+    if runtime_indexer:
+        yield 0, maximum
+        return
     start = 0
     while start < maximum:
         search = target_search_length(start, 1, maximum)
@@ -999,15 +1002,17 @@ class V41ModelRunner:
         # prefill semantics.  Bind that token to the captured C1 input tensor
         # instead of compiling an unqualified ordinary C1 stage on the first
         # public chat request.
-        c1_replay = (getattr(self.model, "native", False) and count == 1 and start + count <= 1024)
+        program = getattr(self.model, "program", None)
+        c1_replay = (getattr(self.model, "native", False) and count == 1 and
+                     (getattr(program, "runtime_indexer", False) or start + count <= 1024))
         graph_c1 = decode or c1_replay
         if self.direct_token_ids and graph_c1:
             if count != 1:
                 raise ValueError("Direct V4.1 token binding requires a C1 transaction")
             ids = self.decode_ids
-        program = getattr(self.model, "program", None)
         if program is not None and program.length > 512:
-            search = (target_search_length(start, count, program.length)
+            search = (program.length if graph_c1 and getattr(program, "runtime_indexer", False) else
+                      target_search_length(start, count, program.length)
                       if search_length is None else int(search_length))
             if search < start + count or search > program.length:
                 raise RuntimeError("V4.1 transaction search bucket does not cover its input")
@@ -1620,13 +1625,16 @@ class V41ModelRunner:
             for _ in range(4 if self.model.native else 1):
                 self._dummy_run(count, native=self.model.native)
             if self.model.native:
-                self.model.program.replay_owner.require_ready(count)
+                self.model.program.replay_owner.require_ready(
+                    count, search=self.model.program.length if getattr(self.model.program, "runtime_indexer", False)
+                    else 512)
             self.graphed_buckets.add(count)
         if not self.use_dspark and self.model.native and isinstance(self.state, PagedStageState):
             # Prepare every reachable C1 search geometry before API readiness.
             # Otherwise a healthy stream pauses for compilation at each new
             # bucket, and already-warmed buckets remain untested at startup.
-            for start, search in decode_search_warmups(self.model.program.length):
+            for start, search in decode_search_warmups(
+                    self.model.program.length, runtime_indexer=getattr(self.model.program, "runtime_indexer", False)):
                 if start == 0:
                     continue
                 logger.info("V4.1 PP%d preparing C1 search bucket %d", self.model.pp_rank, search)

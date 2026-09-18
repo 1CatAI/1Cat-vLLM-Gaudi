@@ -30,6 +30,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41QScaleRopeGaudi2::GetGcDefinitions(
             // cannot be expressed as an affine index-space mapping.  The TPC
             // kernel still issues only one 64-value row load.
             out->inputTensorAccessPattern[i].allRequired = true;
+            out->inputTensorAccessPattern[i].sparseAccess = true;
             continue;
         }
         map(out->inputTensorAccessPattern[i], 0, i < 2 ? 512 : 0, i < 2 ? 511 : i == 4 ? 63 : 0);

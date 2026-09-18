@@ -77,6 +77,7 @@ class PagedCSA2SharedState(nn.Module):
     def __init__(self, config, layer_start, layer_stop, device, max_length):
         super().__init__()
         self.length, self.layer_start, self.layer_stop = max_length, layer_start, layer_stop
+        self.runtime_indexer = gaudi_envs.VLLM_HPU_DSV41_RUNTIME_INDEXER
         # A view of the 1M-row source still exposes its complete backing
         # allocation to Synapse when the native kernel declares all input rows
         # required.  Lazily materialize independent, stage-shared page buckets
@@ -120,6 +121,11 @@ class PagedCSA2SharedState(nn.Module):
         table = torch.zeros((max_length + PAGE_TOKENS - 1) // PAGE_TOKENS, dtype=torch.int32, device=device)
         table[0] = 1
         self.register_buffer("block_table", table, False)
+        if self.runtime_indexer and self.candidate_pool is None:
+            # Full layers never read candidate IDs, but the fixed native ABI
+            # still needs a persistent, correctly shaped tensor on PP0.
+            self.register_buffer("index_candidates_unused", torch.full((1, 2048), -1,
+                                                                       dtype=torch.int32, device=device), False)
         if self.decoded_kv_state:
             self.register_buffer(
                 "decoded_swa", torch.zeros((layer_stop - layer_start) * 512, 512, dtype=torch.bfloat16, device=device),
@@ -154,7 +160,9 @@ class PagedCSA2SharedState(nn.Module):
             else:
                 # ``clone`` is intentional: contiguous slices still share the full
                 # table allocation and reproduce the short-request compile stall.
-                bucket = getattr(self, name)[:length].clone()
+                source = getattr(self, name)
+                bucket = (source if getattr(self, "runtime_indexer", False) and length == self.length else
+                          source[:length].clone())
             self._rotary_buckets[key] = bucket
         return bucket
 
@@ -190,6 +198,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         self.fused_norm = (gaudi_envs.VLLM_HPU_DSV41_ATTN_FUSED_NORM and layer < config["num_hidden_layers"])
         self.linear, self.reduce, self.gather = linear, reduce, gather
         self.layer, self.ratio, self.length = layer, config["compress_ratios"][layer], shared.length
+        self.runtime_indexer = getattr(shared, "runtime_indexer", False)
         self.direct_selected_kv = gaudi_envs.VLLM_HPU_DSV41_PAGED_SELECTED_KV
         self.shared_prefix_kv = gaudi_envs.VLLM_HPU_DSV41_SHARED_PREFIX_KV
         self.packed_attn_exp = gaudi_envs.VLLM_HPU_DSV41_PACKED_ATTN_EXP
@@ -257,9 +266,12 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
     def set_search_length(self, length):
         """Bind this layer to the shared independent-storage RoPE bucket."""
         self.search_length = int(length)
-        self.rotary = self.shared.rotary_bucket(self._rotary_name, self.search_length)
+        # Runtime-position RoPE reads a sparse row of one persistent table;
+        # prompt/decode transitions do not replace captured table addresses.
+        rotary_length = self.length if getattr(self, "runtime_indexer", False) else self.search_length
+        self.rotary = self.shared.rotary_bucket(self._rotary_name, rotary_length)
         if self.native_rope or self.q_scale_rope:
-            self.rotary_native = self.shared.rotary_bucket(self._rotary_native_name, self.search_length)
+            self.rotary_native = self.shared.rotary_bucket(self._rotary_native_name, rotary_length)
 
     def _rope(self, value, positions, inverse=False):
         if (self.native_rope and value.dtype == torch.bfloat16 and value.ndim in (2, 3)
@@ -438,6 +450,20 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         count, tokens = (positions + 1) // self.ratio, positions.numel()
         target = slice(buffer_start, buffer_start + tokens)
         if self.owns_index:
+            if getattr(self, "runtime_indexer", False) and tokens == 1:
+                from vllm_gaudi.ops.deepseek_v41_indexer import runtime_index_select
+                q, weights = self._prepare_index_queries(value, qr, positions) if prepared is None else prepared
+                pool = (self.shared.index_candidates_unused if self.shared.candidate_pool is None else
+                        self.shared.candidate_pool[target].contiguous())
+                indices, blocks = runtime_index_select(
+                    q.contiguous(), weights.contiguous(), self.cache.index, self.shared.block_table,
+                    positions.to(torch.int32).contiguous(), pool,
+                    ratio=self.ratio, capacity=self.length // self.ratio,
+                    reindex=self.layer > self.candidate_source, publish_candidates=self.layer == self.candidate_source)
+                if blocks is not None:
+                    self.shared.candidate_pool[target].copy_(blocks)
+                self.selection.indices[target].copy_(indices)
+                return self.selection.indices[target]
             if self.search_length // self.ratio <= 512:
                 indices = self.compressed_offsets.unsqueeze(0).expand(tokens, -1)
                 indices = torch.where(indices < count.unsqueeze(-1), indices, -1)

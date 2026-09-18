@@ -452,6 +452,9 @@ class PreparedStage(nn.Module):
         self.pp_rank, self.tp_rank, self.length = pp_rank, tp_rank, max_length
         self.reduce, self.all_gather = reduce, all_gather
         self.dspark = (gaudi_envs.VLLM_HPU_DSV41_DSPARK if dspark is None else bool(dspark))
+        self.runtime_indexer = gaudi_envs.VLLM_HPU_DSV41_RUNTIME_INDEXER
+        if self.runtime_indexer and (self.dspark or max_length <= 512):
+            raise ValueError("Runtime CSA2 indexer requires paged ordinary C1 decode")
         self.bf16_head = gaudi_envs.VLLM_HPU_DSV41_BF16_LM_HEAD
         if self.dspark and (self.bf16_head or gaudi_envs.VLLM_HPU_DSV41_BF16_ROUTER_GATE):
             raise ValueError("BF16 projection candidates require ordinary C1 decode")

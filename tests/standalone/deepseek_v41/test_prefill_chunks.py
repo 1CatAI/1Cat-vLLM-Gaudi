@@ -64,6 +64,35 @@ def test_scheduler_transaction_is_one_c8192_prefill_block():
     assert [token for _, chunk in chunks for token in chunk] == tokens
 
 
+def test_runtime_indexer_warms_one_metadata_driven_decode_graph(monkeypatch):
+    from vllm_gaudi.v1.worker import deepseek_v41_runner as module
+
+    monkeypatch.setenv("VLLM_HPU_DSV41_VERIFY_TIMING", "0")
+    calls, validated = [], []
+
+    class State:
+
+        def clear(self):
+            calls.append("clear")
+
+    monkeypatch.setattr(module, "PagedStageState", State)
+    runner = object.__new__(module.V41ModelRunner)
+    runner.use_dspark = False
+    runner.state, runner.graphed_buckets, runner.active_request = State(), set(), "warmup"
+    owner = SimpleNamespace(require_ready=lambda count, search: validated.append((count, search)))
+    runner.model = SimpleNamespace(native=True, pp_rank=0,
+                                   program=SimpleNamespace(length=1 << 20, runtime_indexer=True, replay_owner=owner))
+    runner.pp = SimpleNamespace(group=SimpleNamespace(barrier=lambda: calls.append("barrier")))
+    runner._dummy_run = lambda count, native, start_position=0: calls.append((count, native, start_position))
+
+    runner.warmup_model()
+
+    assert list(decode_search_warmups(1 << 20, runtime_indexer=True)) == [(0, 1 << 20)]
+    assert validated == [(1, 1 << 20)]
+    assert calls == [(1, True, 0)] * 4 + ["barrier", "clear"]
+    assert runner.active_request is None
+
+
 def test_native_kv_codec_covers_the_complete_prefill_transaction():
     assert NATIVE_KV_CODEC_TOKENS == PREFILL_BLOCK_TOKENS == 8192
 

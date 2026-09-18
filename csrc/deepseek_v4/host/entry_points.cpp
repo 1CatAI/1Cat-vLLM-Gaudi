@@ -17,6 +17,7 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVE
 #include <cstring>
 #include <dlfcn.h>
 #include <initializer_list>
+#include "deepseek_v41_index_gaudi2.hpp"
 #include "deepseek_v41_quant_roundtrip_gaudi2.hpp"
 #include "deepseek_v41_expert_n256_gaudi2.hpp"
 #include "deepseek_v41_dynamic_quant_bf16_gaudi2.hpp"
@@ -178,6 +179,9 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_MLA_GATHER,
     GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_MLA_SOFTMAX,
     GAUDI2_KERNEL_DEEPSEEK_V41_ENGRAM_HASH_GATHER_BF16,
+    GAUDI2_KERNEL_DEEPSEEK_V41_INDEX_SCORES,
+    GAUDI2_KERNEL_DEEPSEEK_V41_INDEX_THRESHOLD,
+    GAUDI2_KERNEL_DEEPSEEK_V41_INDEX_EMIT,
     KERNEL_COUNT
 };
 
@@ -325,6 +329,7 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     DeepseekV41ExpertN256Gaudi2(DeepseekV41ExpertN256Gaudi2::ScaleReduce).GetKernelName(
         guids[GAUDI2_KERNEL_DEEPSEEK_V41_N256_SCALE_REDUCE].name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_DYNAMIC_QUANT].name, DeepseekV41DynamicQuantBf16Gaudi2::name);
+    for(unsigned i=0;i<3;++i) std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_INDEX_SCORES+i].name,DeepseekV41IndexGaudi2::names[i]);
     DeepseekV41SelectedMlaGaudi2(true).GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_MLA_GATHER].name);
     DeepseekV41SelectedMlaGaudi2(false).GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_MLA_SOFTMAX].name);
 
@@ -1049,6 +1054,8 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
         return bf16IdentityInstance.GetGcDefinitions(params, instance);
     }
 
+    for(unsigned i=0;i<3;++i) if(std::strcmp(params->guid.name,DeepseekV41IndexGaudi2::names[i])==0)
+        return DeepseekV41IndexGaudi2(i).GetGcDefinitions(params,instance);
     DeepseekV4MHCPostPrepareGaudi2 mhcPostPrepareInstance;
     DeepseekV4Sinkhorn4Gaudi2 sinkhornInstance;
     sinkhornInstance.GetKernelName(kernelName);

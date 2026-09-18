@@ -37,6 +37,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41RopeGaudi2::GetGcDefinitions(
     }
     out->inputTensorAccessPattern[1].mapping[0]={2,1,0,0};
     out->inputTensorAccessPattern[2].allRequired=true;
+    out->inputTensorAccessPattern[2].sparseAccess=true;
     out->kernel.paramsNr=0;
     const auto* start=inverse_?&_binary___deepseek_v41_rope_inverse_bf16_gaudi2_o_start
                               :&_binary___deepseek_v41_rope_bf16_gaudi2_o_start;

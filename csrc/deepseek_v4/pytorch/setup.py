@@ -54,7 +54,7 @@ setup(
                 "hpu_dsv41_q_projection_rope_pt2.cpp", "hpu_dsv41_mla_mme_pt2.cpp",
                 "hpu_dsv41_router_top6_pt2.cpp",
                 "hpu_dsv41_swa_pack_pt2.cpp", "hpu_dsv41_woa_fp8_pt2.cpp",
-                "hpu_dsv41_bf16_linear_f32_pt2.cpp", "hpu_dsv41_mhc_gates_pt2.cpp"
+                "hpu_dsv41_bf16_linear_f32_pt2.cpp", "hpu_dsv41_mhc_gates_pt2.cpp", "hpu_dsv41_index_pt2.cpp"
             ],
             include_dirs=includes,
             library_dirs=[get_lib_dir()],
