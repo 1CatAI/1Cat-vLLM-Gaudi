@@ -50,7 +50,7 @@ The dedicated entrypoint enables the frozen-reference ordinary-C1 and V2
 device-continuation bundle by default. Launch without a feature-variable list:
 
 ```bash
-.venv/bin/python -m vllm_gaudi.entrypoints.deepseek_v41 PREPARED_DIR \
+VLLM_ENGINE_READY_TIMEOUT_S=3600 .venv/bin/python -m vllm_gaudi.entrypoints.deepseek_v41 PREPARED_DIR \
   --checkpoint-audit CHECKPOINT_AUDIT
 ```
 
@@ -236,6 +236,10 @@ transition enters native replay after rebinding; the following tokens resume
 early continuation. CPU prefill completion must not bind an old device completion
 token into the next C1 input. Packed KV remains canonical; only the active
 working set is decoded.
+
+The example reserves a longer engine initialization timeout for the first full
+context bucket preparation. This is an upstream startup timeout, not a request
+timeout or a context limit. Monitor bucket progress during initialization.
 
 Validation covers a prompt crossing an 8192-token chunk boundary, subsequent
 short-request reuse, eight free-generation arithmetic samples, and public
