@@ -150,3 +150,18 @@ def test_paged_shared_state_allocates_bounded_decoded_mirrors(monkeypatch):
     assert shared.decoded_swa.shape == (20 * 512, 512)
     assert set(shared.sources) == {"2", "8", "14"}
     assert all(source.decoded_main.shape == (512, 512) for source in shared.sources.values())
+
+
+def test_runtime_rotary_binding_survives_prompt_and_decode_geometry_changes():
+    shared = _rotary_shared()
+    shared.runtime_indexer = True
+    attention = object.__new__(PagedCSA2Attention)
+    torch.nn.Module.__init__(attention)
+    attention.shared, attention.length, attention.runtime_indexer = shared, shared.length, True
+    attention._rotary_name, attention._rotary_native_name = "swa_rotary", "swa_rotary_native"
+    attention.native_rope, attention.q_scale_rope = True, True
+    for search in (512, 1024, 8192, 512, 4096):
+        attention.set_search_length(search)
+        assert attention.search_length == search
+        assert attention.rotary is shared.swa_rotary
+        assert attention.rotary_native is shared.rotary_bucket("swa_rotary_native", shared.length)

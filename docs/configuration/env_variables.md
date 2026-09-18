@@ -2,6 +2,18 @@
 
 This document lists the supported diagnostic and profiling, as well as performance tuning options.
 
+`VLLM_HPU_DSV41_RUNTIME_INDEXER=1` selects the experimental metadata-driven
+CSA2 indexer for ordinary paged V4.1 C1 decode. The stage graph binds persistent
+RoPE tables, page metadata and fixed top-512 outputs. Native kernels read the
+current position and scan only visible rows (or the Reindex candidate pool),
+so increasing history does not specialize the outer decode graph. It requires
+the matching in-tree indexer and sparse-RoPE kernels, DSpark disabled and a
+paged capacity greater than 512. This does not reduce KV capacity or the
+scheduler's prefill token budget. Multi-token prefill keeps its existing
+implementation; this option alone does not qualify every prefill geometry or
+active-length performance. The option defaults to `false` pending serving
+validation.
+
 `VLLM_HPU_NATIVE_DECODE_GRAPH` selects the research native replay path for the
 Gaudi2 Qwen3.8 TP2 C1 decoder. Warmup retains eight compiled decoder groups,
 fixed tensor bindings, recipe memory, and HCL command templates. Stable decode
