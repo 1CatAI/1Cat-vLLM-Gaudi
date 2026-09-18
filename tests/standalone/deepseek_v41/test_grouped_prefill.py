@@ -55,3 +55,33 @@ def test_dedicated_entrypoint_selects_validated_grouped_prefill():
 
     assert _C1_FASTPATH_DEFAULTS["VLLM_HPU_DSV41_PREFILL_GROUPED"] == "1"
     assert "VLLM_HPU_DSV41_PREFILL_MXFP4" not in _C1_FASTPATH_DEFAULTS
+
+
+def test_prompt_lengths_do_not_exhaust_shared_dynamo_recompile_limit(monkeypatch):
+    import torch
+    from vllm_gaudi.ops import deepseek_v41_grouped_prefill as grouped
+
+    compile_calls = []
+    original_compile = torch.compile
+
+    def compile_cpu(entry, **options):
+        compile_calls.append(entry.__code__)
+        options["backend"] = "eager"
+        return original_compile(entry, **options)
+
+    grouped.compiled_reduce.cache_clear()
+    monkeypatch.setattr(torch, "compile", compile_cpu)
+    generator = torch.Generator().manual_seed(41)
+    try:
+        with torch._dynamo.config.patch(recompile_limit=2):
+            for tokens in range(7, 19):
+                signature = (tokens, 32)
+                fn = grouped.compiled_reduce(signature)
+                for _ in range(2):
+                    value = torch.randn(tokens, 6, 32, generator=generator).bfloat16()
+                    assert torch.equal(fn(value), grouped.ordered_reduce(value))
+                assert grouped.compiled_reduce(signature) is fn
+        assert len(compile_calls) == 12
+        assert len({id(code) for code in compile_calls}) == 12
+    finally:
+        grouped.compiled_reduce.cache_clear()

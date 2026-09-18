@@ -87,9 +87,13 @@ def ordered_reduce(value):
     return total.to(torch.bfloat16)
 
 
-@functools.lru_cache(maxsize=1)
-def compiled_reduce():
-    return torch.compile(ordered_reduce, backend="hpu_backend", fullgraph=True, dynamic=False)
+@functools.lru_cache(maxsize=128)
+def compiled_reduce(signature):
+    # Prompt lengths must not compete for Dynamo's per-code recompile limit.
+    # As with grouped_body, each static shape owns its compiled code object.
+    entry = FunctionType(ordered_reduce.__code__.replace(co_name=f"grouped_reduce_{signature}"),
+                         ordered_reduce.__globals__)
+    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
 
 
 def run_grouped_prefill(value, ids, routing, q13, q2, s13, s2, lookup, normal_scales):
@@ -109,4 +113,4 @@ def run_grouped_prefill(value, ids, routing, q13, q2, s13, s2, lookup, normal_sc
         local = torch.from_numpy(valid).to(value.device)
         destination = torch.from_numpy(slots.reshape(-1)[valid].copy()).to(value.device)
         routed.index_copy_(0, destination, output.index_select(0, local))
-    return compiled_reduce()(routed.reshape(value.shape[0], 6, value.shape[-1]))
+    return compiled_reduce((value.shape[0], value.shape[-1]))(routed.reshape(value.shape[0], 6, value.shape[-1]))
