@@ -92,6 +92,14 @@ class V41V2ModelRunner(V41ModelRunner):
         ready = self.model.decode_prefix_ready(next_search)
         if not ready:
             self.audit["v2_prefix_bucket_captures"] = self.audit.get("v2_prefix_bucket_captures", 0) + 1
+        if next_search != getattr(program, "search_length", min(512, program.length)):
+            # _forward owns the attention/rotary bindings. Until it switches
+            # buckets, begin_decode_prefix would start the previous variant,
+            # even when the next variant has already been captured. Run this
+            # boundary token through the complete native entry after binding;
+            # subsequent tokens resume the early segmented prefix.
+            self.audit["v2_prefix_bucket_transitions"] = self.audit.get("v2_prefix_bucket_transitions", 0) + 1
+            return False
         return ready
 
     def _consume_completion(self, scheduled=None):

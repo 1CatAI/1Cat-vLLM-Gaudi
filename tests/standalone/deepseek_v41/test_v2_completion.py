@@ -246,7 +246,7 @@ def test_device_engram_precedes_prefix_and_host_token_wait(monkeypatch):
         prepare_device_engram=lambda request, token: calls.append(("device_engram", request, token)),
         begin_decode_prefix=lambda token, position: calls.append(("prefix", token, position.tolist())),
         decode_prefix_ready=lambda search: True,
-        program=SimpleNamespace(length=1 << 20),
+        program=SimpleNamespace(length=1 << 20, search_length=512),
     )
     runner._completion = CompletionRecord("a", 2, 1, torch.tensor([[11]]), OrderedDone(), runner.pp.commit_token)
     scheduled = SimpleNamespace(num_scheduled_tokens={"a": 1}, finished_req_ids=set(), scheduled_spec_decode_tokens={})
@@ -274,7 +274,7 @@ def test_new_search_bucket_captures_complete_plan_before_segmenting(monkeypatch)
         prepare_device_engram=lambda request, token: calls.append(("device_engram", request, token)),
         begin_decode_prefix=lambda token, position: calls.append(("prefix", token, position.tolist())),
         decode_prefix_ready=lambda search: ready.append(search) or False,
-        program=SimpleNamespace(length=1 << 20),
+        program=SimpleNamespace(length=1 << 20, search_length=1024),
     )
     scheduled = SimpleNamespace(num_scheduled_tokens={"a": 1}, finished_req_ids=set(), scheduled_spec_decode_tokens={})
 
@@ -284,6 +284,40 @@ def test_new_search_bucket_captures_complete_plan_before_segmenting(monkeypatch)
     assert calls == [("model", 1), ("packet", )]
     assert runner._prefix_started is None
     assert runner.audit["v2_prefix_bucket_captures"] == 1
+
+
+@pytest.mark.parametrize("search", [512, 1024, 2048, 524288])
+def test_warmed_next_bucket_cannot_start_prefix_with_previous_bindings(monkeypatch, search):
+    monkeypatch.setenv("VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX", "1")
+    runner, _ = fixture()
+    runner.pp.group = SimpleNamespace(is_first_rank=True)
+    queries = []
+    runner.model = SimpleNamespace(
+        decode_prefix_ready=lambda value: queries.append(value) or True,
+        program=SimpleNamespace(length=1 << 20, search_length=search),
+    )
+    scheduled = SimpleNamespace(num_scheduled_tokens={"a": 1}, finished_req_ids=set(), scheduled_spec_decode_tokens={})
+    record = SimpleNamespace(request_id="a", start=search - 1)
+    assert not runner._prefix_authorized(record, scheduled)
+    assert queries == [search * 2]
+    assert runner.audit["v2_prefix_bucket_transitions"] == 1
+    assert "v2_prefix_bucket_captures" not in runner.audit
+
+    # The complete native entry binds the new attention geometry; early
+    # continuation can then resume on the following token without recapture.
+    runner.model.program.search_length = search * 2
+    record.start += 1
+    assert runner._prefix_authorized(record, scheduled)
+
+
+def test_bounded_stage_does_not_need_a_paged_search_binding(monkeypatch):
+    monkeypatch.setenv("VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX", "1")
+    runner, _ = fixture()
+    runner.pp.group = SimpleNamespace(is_first_rank=True)
+    runner.model = SimpleNamespace(decode_prefix_ready=lambda search: search == 512,
+                                   program=SimpleNamespace(length=512))
+    scheduled = SimpleNamespace(num_scheduled_tokens={"a": 1}, finished_req_ids=set(), scheduled_spec_decode_tokens={})
+    assert runner._prefix_authorized(SimpleNamespace(request_id="a", start=10), scheduled)
 
 
 def test_device_engram_skips_only_matching_host_layer1(monkeypatch):

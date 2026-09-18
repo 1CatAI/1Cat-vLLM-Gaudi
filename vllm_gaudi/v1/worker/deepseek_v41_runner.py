@@ -131,6 +131,15 @@ def target_search_length(start, count, maximum):
     return min(maximum, max(512, 1 << (start + count - 1).bit_length()))
 
 
+def decode_search_warmups(maximum):
+    """Yield one valid C1 position per reachable search bucket, in order."""
+    start = 0
+    while start < maximum:
+        search = target_search_length(start, 1, maximum)
+        yield start, search
+        start = search
+
+
 def _exchange_payload_views(exchange_wire, capacity, hidden_slots=4, hidden_width=5120):
     """Return views for one native-BF16 stage-boundary payload.
 
@@ -1613,6 +1622,17 @@ class V41ModelRunner:
             if self.model.native:
                 self.model.program.replay_owner.require_ready(count)
             self.graphed_buckets.add(count)
+        if not self.use_dspark and self.model.native and isinstance(self.state, PagedStageState):
+            # Prepare every reachable C1 search geometry before API readiness.
+            # Otherwise a healthy stream pauses for compilation at each new
+            # bucket, and already-warmed buckets remain untested at startup.
+            for start, search in decode_search_warmups(self.model.program.length):
+                if start == 0:
+                    continue
+                logger.info("V4.1 PP%d preparing C1 search bucket %d", self.model.pp_rank, search)
+                for _ in range(4):
+                    self._dummy_run(1, native=True, start_position=start)
+                self.model.program.replay_owner.require_ready(1, search=search)
         if self.use_dspark and isinstance(self.state, PagedStageState):
             # Exercise the first real indexer/head exchange before advertising
             # API readiness. This is one boundary warmup, not a length sweep.

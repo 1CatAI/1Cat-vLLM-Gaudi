@@ -271,10 +271,10 @@ class StageReplay:
         V2 starts the embedding/Engram-independent prefix before the next
         scheduler turn enters ``_forward``.  At a paged-attention bucket
         boundary, the program still names the previous bucket at that point.
-        Check the next bucket explicitly so a segmented prefix can never be
-        started on one recipe and finished on another.  The first token in a
-        new bucket will capture the complete native recipe; later tokens can
-        resume segmented replay.
+        This is a readiness query, not a binding change. The caller must also
+        verify that the next bucket equals the currently bound bucket before
+        starting an early prefix. At a transition, _forward binds the new
+        bucket before entering the complete native replay.
         """
         from vllm_gaudi.ops.tp2_prepared_plan import _native_entries
         variant = self.variants.get(self._input_key(int(search)))

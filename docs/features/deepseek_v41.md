@@ -228,8 +228,12 @@ It never reduces the scheduler's prompt admission to a single-token loop.
 it is not the validated grouped-prefill serving path.
 
 Each search bucket owns its native decode plan. Segmented PP0 replay accounts
-for CSA2 index exchanges and begins continuation only after the next bucket
-is prepared. CPU prefill completion must not bind an old device completion
+for CSA2 index exchanges. Ordinary paged native serving captures every reachable
+C1 search bucket before API readiness; this adds startup preparation rather than
+compiling new decode geometries during a streaming response. Early continuation
+requires both a prepared plan and matching current attention bindings. A bucket
+transition enters native replay after rebinding; the following tokens resume
+early continuation. CPU prefill completion must not bind an old device completion
 token into the next C1 input. Packed KV remains canonical; only the active
 working set is decoded.
 
