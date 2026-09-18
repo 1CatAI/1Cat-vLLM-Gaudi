@@ -12,7 +12,7 @@ constexpr auto kSchema = "custom_op::custom_deepseek_v41_mhc_gates_f32_gaudi2";
 void validate(const at::Tensor& mixes, const at::Tensor& rrms, const at::Tensor& scale,
               const at::Tensor& base) {
     TORCH_CHECK(mixes.scalar_type() == at::kFloat && mixes.dim() == 2 && mixes.size(0) >= 1 &&
-                mixes.size(0) <= 512 && mixes.size(1) == 24 && mixes.is_contiguous(),
+                mixes.size(0) <= 8192 && mixes.size(1) == 24 && mixes.is_contiguous(),
                 "V4.1 mHC gates require contiguous FP32 mixes [T,24]");
     TORCH_CHECK(rrms.scalar_type() == at::kFloat && rrms.sizes() == at::IntArrayRef({mixes.size(0), 1}) &&
                 rrms.is_contiguous(), "V4.1 mHC gates require contiguous FP32 rrms [T,1]");

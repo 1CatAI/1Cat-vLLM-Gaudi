@@ -91,7 +91,8 @@ def test_native_stage_retains_mhc_overlap_with_bf16_n256_boundaries(monkeypatch,
     monkeypatch.setattr(overlap, "make_backend", lambda: backend)
     calls = []
     monkeypatch.setattr(program, "_compile_group", lambda group, **kwargs: calls.append((group, kwargs)))
-    stage = SimpleNamespace(layers=[],
+    from torch import nn
+    stage = SimpleNamespace(layers=[nn.Module() for _ in range(20)],
                             fp8_decode=True,
                             expert_n256=n256,
                             dspark=dspark,

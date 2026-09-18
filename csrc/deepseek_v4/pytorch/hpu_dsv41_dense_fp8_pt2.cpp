@@ -10,7 +10,7 @@ constexpr auto kQuant = "custom_deepseek_v41_dense_quant_gaudi2";
 using Pair = std::tuple<at::Tensor, at::Tensor>;
 habana::OutputMetaDataVector meta(const at::Stack& stack, bool quant) {
     const auto x = stack.at(0).toTensor();
-    TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.dim() == 2 && x.size(0) >= 1 && x.size(0) <= 512 &&
+    TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.dim() == 2 && x.size(0) >= 1 && x.size(0) <= 8192 &&
                 (x.size(1) == 1280 || x.size(1) == 4096), "Dense FP8 requires BF16 [T,1280|4096]");
     for (const auto& item : stack) {
         const auto t = item.toTensor();

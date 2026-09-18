@@ -50,9 +50,7 @@ def test_sync_batch_output_does_not_require_engine_diagnostic_field(rounds):
     runner.draft_token_ids = None
     runner._update = lambda scheduled: None
     runner._execute_request = lambda scheduled, req_id, count: None
-    request_output = ModelRunnerOutput(req_ids=["a"],
-                                       req_id_to_index={"a": 0},
-                                       sampled_token_ids=[[11]])
+    request_output = ModelRunnerOutput(req_ids=["a"], req_id_to_index={"a": 0}, sampled_token_ids=[[11]])
     if rounds is not None:
         request_output.execution_rounds = rounds
     runner._finish_request = lambda: request_output
@@ -163,13 +161,15 @@ def test_v2_gate_requires_the_complete_segmented_device_contract(monkeypatch):
     for key, value in values.items():
         monkeypatch.setenv(key, "1" if value else "0")
     config = SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v41"),
-                                                         max_model_len=512),
+                                                          max_model_len=512),
                              use_v2_model_runner=True,
                              scheduler_config=SimpleNamespace(async_scheduling=True),
                              speculative_config=None)
     with pytest.raises(ValueError, match="Device Engram"):
         config_module.validate_v2(config)
     monkeypatch.setenv("VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT", "1")
+    config_module.validate_v2(config)
+    config.model_config.max_model_len = 1_048_576
     config_module.validate_v2(config)
     monkeypatch.setenv("VLLM_HPU_TP2_NATIVE_JOINT_PLAN", "0")
     with pytest.raises(ValueError, match="segmented prefix"):
@@ -245,6 +245,8 @@ def test_device_engram_precedes_prefix_and_host_token_wait(monkeypatch):
         complete_step=lambda count: calls.append(("model", count)),
         prepare_device_engram=lambda request, token: calls.append(("device_engram", request, token)),
         begin_decode_prefix=lambda token, position: calls.append(("prefix", token, position.tolist())),
+        decode_prefix_ready=lambda search: True,
+        program=SimpleNamespace(length=1 << 20),
     )
     runner._completion = CompletionRecord("a", 2, 1, torch.tensor([[11]]), OrderedDone(), runner.pp.commit_token)
     scheduled = SimpleNamespace(num_scheduled_tokens={"a": 1}, finished_req_ids=set(), scheduled_spec_decode_tokens={})
@@ -254,6 +256,34 @@ def test_device_engram_precedes_prefix_and_host_token_wait(monkeypatch):
     assert [entry[0] for entry in calls] == ["model", "device_engram", "prefix", "token_wait", "packet"]
     assert runner.audit["v2_device_engram_starts"] == 1
     assert runner._prefix_started == ("a", 2, 1)
+
+
+def test_new_search_bucket_captures_complete_plan_before_segmenting(monkeypatch):
+    monkeypatch.setenv("VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT", "1")
+    monkeypatch.setenv("VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX", "1")
+    monkeypatch.setenv("VLLM_HPU_DSV41_V2_DEVICE_ENGRAM", "1")
+    runner, calls = fixture()
+    runner.pp.group = SimpleNamespace(is_first_rank=True)
+    runner.position_bank = SimpleNamespace(view=lambda start, count: torch.tensor([start], dtype=torch.int32))
+    runner.requests["a"].prompt = [1] * 1024
+    runner.requests["a"].output = [10]
+    runner._completion = CompletionRecord("a", 2, 1024, torch.tensor([[11]]), Done(), runner.pp.commit_token)
+    ready = []
+    runner.model = SimpleNamespace(
+        complete_step=lambda count: calls.append(("model", count)),
+        prepare_device_engram=lambda request, token: calls.append(("device_engram", request, token)),
+        begin_decode_prefix=lambda token, position: calls.append(("prefix", token, position.tolist())),
+        decode_prefix_ready=lambda search: ready.append(search) or False,
+        program=SimpleNamespace(length=1 << 20),
+    )
+    scheduled = SimpleNamespace(num_scheduled_tokens={"a": 1}, finished_req_ids=set(), scheduled_spec_decode_tokens={})
+
+    runner._consume_completion(scheduled)
+
+    assert ready == [2048]
+    assert calls == [("model", 1), ("packet", )]
+    assert runner._prefix_started is None
+    assert runner.audit["v2_prefix_bucket_captures"] == 1
 
 
 def test_device_engram_skips_only_matching_host_layer1(monkeypatch):

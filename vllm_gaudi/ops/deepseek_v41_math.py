@@ -13,6 +13,8 @@ import torch.nn.functional as F
 
 from vllm_gaudi import envs as gaudi_envs
 
+NATIVE_KV_CODEC_TOKENS = 8192
+
 
 def rms_norm(x, weight, eps=1e-20):
     value = x.float()
@@ -72,7 +74,7 @@ def fp4_decode(code):
 
 def pack_swa(value):
     if (gaudi_envs.VLLM_HPU_DSV41_NATIVE_KV_PACK and value.device.type == "hpu" and value.dtype == torch.bfloat16
-            and value.ndim >= 2 and value.shape[0] <= 6):
+            and value.ndim >= 2 and value.shape[0] <= NATIVE_KV_CODEC_TOKENS):
         shape = value.shape
         result = torch.ops.custom_op.custom_deepseek_v41_swa_pack_bf16_gaudi2(value.reshape(-1, shape[-1]).contiguous())
         return result.reshape(*shape[:-1], shape[-1] * 33 // 32)
@@ -106,7 +108,7 @@ def quantize_activation(value):
 
 def pack_fp4(value, group=16):
     if (gaudi_envs.VLLM_HPU_DSV41_NATIVE_KV_PACK and value.device.type == "hpu" and value.dtype == torch.bfloat16
-            and value.ndim >= 2 and value.shape[0] <= 6 and group in (16, 32)):
+            and value.ndim >= 2 and value.shape[0] <= NATIVE_KV_CODEC_TOKENS and group in (16, 32)):
         shape = value.shape
         op = (torch.ops.custom_op.custom_deepseek_v41_fp4_pack_g16_bf16_gaudi2
               if group == 16 else torch.ops.custom_op.custom_deepseek_v41_fp4_pack_g32_bf16_gaudi2)
@@ -200,8 +202,13 @@ def hc_pre(residual, previous_pre, fn, scale, base, eps=1e-20, hc_eps=1e-6, iter
     else:
         projection = F.linear(flat, fn)
     rrms = torch.rsqrt(flat.square().mean(-1, keepdim=True) + eps)
+    # The fused TPC gate is a decode/small-prefill win.  At C8192 its single
+    # TPC program measures slower than the compiler's wide elementwise chain
+    # (1.200 ms versus 1.088 ms on Gaudi2), so retain the same math and native
+    # Sinkhorn while letting large-M prefill use the better scheduled graph.
     if (gaudi_envs.VLLM_HPU_DSV41_MHC_GATES_FUSED and residual.device.type == "hpu" and iterations == 20
-            and hc_eps == 1e-6 and copies == 4 and projection.ndim == 2 and projection.shape[-1] == 24):
+            and hc_eps == 1e-6 and copies == 4 and projection.ndim == 2 and projection.shape[-1] == 24
+            and projection.shape[0] <= 2048):
         gates = torch.ops.custom_op.custom_deepseek_v41_mhc_gates_f32_gaudi2(projection.contiguous(), rrms.contiguous(),
                                                                              scale.contiguous(), base.contiguous())
         pre, post = gates[:, :copies], gates[:, copies:2 * copies]

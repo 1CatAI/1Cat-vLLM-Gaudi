@@ -20,8 +20,8 @@ const bool registered = [] {
 
 void validate(const at::Tensor& input) {
     TORCH_CHECK(input.scalar_type() == at::kFloat && input.dim() == 3 &&
-                input.size(0) >= 1 && input.size(0) <= 512 && input.size(1) == 4 && input.size(2) == 4 &&
-                input.is_contiguous(), "V4 Sinkhorn requires contiguous FP32 [T,4,4], T in [1,512]");
+                input.size(0) >= 1 && input.size(0) <= 8192 && input.size(1) == 4 && input.size(2) == 4 &&
+                input.is_contiguous(), "V4 Sinkhorn requires contiguous FP32 [T,4,4], T in [1,8192]");
 }
 at::Tensor run(const at::Tensor& input) {
     validate(input);

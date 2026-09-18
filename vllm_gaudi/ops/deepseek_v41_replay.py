@@ -66,6 +66,12 @@ def stage_state_tensors(program):
         "swa", "main", "decoded_swa", "decoded_main", "index", "indices", "candidate_pool", "kv_history",
         "score_history", "block_table"
     }
+    if getattr(program, "length", 512) > 512 and getattr(program, "search_length", 512) > 512:
+        # The decoded working set belongs only to the <=512 prefix variant.
+        # Longer variants read/write the canonical packed pages. Binding an
+        # inactive decoded allocation fails native ownership validation; it
+        # is neither a producer nor a consumer of that captured program.
+        mutable.difference_update(("decoded_swa", "decoded_main"))
     return tuple(value for name, value in program.named_buffers()
                  if not name.startswith("draft.") and name.rsplit(".", 1)[-1] in mutable)
 
@@ -87,8 +93,8 @@ def capture_engram_inputs(engram, *, direct=False, device_layer1=False):
     for value in engram:
         if (value.dtype != torch.uint8 or value.ndim != 3 or value.shape[0] != 1 or not value.is_contiguous()
                 or value.device != first.device or value.shape[-1] != first.shape[-1]
-                or value.untyped_storage()._cdata != first.untyped_storage()._cdata
-                or value.storage_offset() != offset or value.numel() == 0):
+                or value.untyped_storage()._cdata != first.untyped_storage()._cdata or value.storage_offset() != offset
+                or value.numel() == 0):
             raise ValueError("Direct Engram inputs must be ordered views of one complete C1 packet")
         offset += value.numel()
     if first.untyped_storage().nbytes() != offset:
@@ -136,9 +142,7 @@ class StageVariant(torch.nn.Module):
         self.pp_wire = (pp_wire if envs.VLLM_HPU_DSV41_DIRECT_PP_WIRE else pp_wire.clone()) if self.wire_input else None
         self.direct_engram = bool(engram) and native_input and envs.VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT
         self.device_engram = bool(engram) and native_input and envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM
-        self.engram = capture_engram_inputs(engram,
-                                            direct=self.direct_engram,
-                                            device_layer1=self.device_engram)
+        self.engram = capture_engram_inputs(engram, direct=self.direct_engram, device_layer1=self.device_engram)
         self.states = stage_state_tensors(program)
         self.metadata = _Metadata()
         self.capture_bytes = 0
@@ -200,6 +204,16 @@ class StageVariant(torch.nn.Module):
                            pp_wire=self.pp_wire)
         if self.wire_input:
             fixed_hidden = self.pp_wire
+        # A normal vLLM scheduler transaction may contain thousands of
+        # prompt tokens.  Do not capture all of its bounded N256 tiles into a
+        # single native recipe: that retains every tile workspace until the
+        # four-layer group closes and can exhaust HPU memory.  The compiled
+        # stage has an eager large-M path that keeps the same layer order,
+        # state updates and 128-token resource tiles, while C1/C6 continues
+        # through the replay capture below.
+        from vllm_gaudi.models.deepseek_v41_program import PreparedMoE
+        if fixed_hidden is not None and fixed_hidden.shape[0] > PreparedMoE.N256_PREFILL_TILE:
+            return self.compiled(fixed_hidden, fixed_pre, fixed_positions, fixed_ids, self.engram)
         with collect_prepared_group_replays(owner=self, adapter=self.adapter, snapshot=self.snapshot,
                                             **fixed_roots) as context:
             for index, chunk in enumerate(self.compiled.chunks):
@@ -222,8 +236,7 @@ class StageReplay:
         if self.segmented_prefix_enabled and not self.native_input_enabled:
             raise ValueError("V2 segmented prefix requires native PP0 input replay")
         if (envs.VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT
-                and (not _native_input_precision_compatible(program)
-                     or not envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH)):
+                and (not _native_input_precision_compatible(program) or not envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH)):
             raise ValueError("Direct Engram capture requires ordinary BF16 native input replay")
         self.input_seed = None
 
@@ -237,19 +250,38 @@ class StageReplay:
 
     def from_input_ids(self, positions, input_ids, engram):
         program = self.program()
-        if (not self.native_input_enabled or input_ids.numel() != 1
-                or not _native_input_precision_compatible(program)):
+        if (not self.native_input_enabled or input_ids.numel() != 1 or not _native_input_precision_compatible(program)):
             raise ValueError("Native input capture requires enabled ordinary BF16 C1 PP0 decode")
         if self.segmented_prefix_enabled:
             from vllm_gaudi.ops.tp2_prepared_plan import _native_entries
-            variant = self.variants.get((1, "input"))
+            variant = self.variants.get(self._input_key())
             if variant is not None and variant in _native_entries:
                 self.begin_segmented_from_input_ids(positions, input_ids)
                 return self.finish_segmented(positions, input_ids, engram)
         return self(*self._input_seed(input_ids), positions, input_ids, engram, native_input=True)
 
+    def _input_key(self, search=None):
+        if search is None:
+            search = getattr(self.program(), "search_length", 512)
+        return (1, "input") if search <= 512 else (1, "input", search)
+
+    def input_variant_ready(self, search):
+        """Return whether a complete C1 input plan exists for ``search``.
+
+        V2 starts the embedding/Engram-independent prefix before the next
+        scheduler turn enters ``_forward``.  At a paged-attention bucket
+        boundary, the program still names the previous bucket at that point.
+        Check the next bucket explicitly so a segmented prefix can never be
+        started on one recipe and finished on another.  The first token in a
+        new bucket will capture the complete native recipe; later tokens can
+        resume segmented replay.
+        """
+        from vllm_gaudi.ops.tp2_prepared_plan import _native_entries
+        variant = self.variants.get(self._input_key(int(search)))
+        return variant is not None and variant in _native_entries
+
     def _complete_input_variant(self):
-        variant = self.variants.get((1, "input"))
+        variant = self.variants.get(self._input_key())
         if variant is None:
             raise RuntimeError("Segmented replay requires the warmed complete PP0 input graph")
         return variant
@@ -303,15 +335,17 @@ class StageReplay:
                  native_input=False):
         tokens = input_ids.numel()
         program = self.program()
-        allowed = 1 <= tokens <= 6 if program.dspark else tokens == 1
-        if not allowed:
-            raise ValueError("V4.1 replay shape must match C1 decode or enabled C1-C6 DSpark verification")
+        if not 1 <= tokens <= 6:
+            raise ValueError("V4.1 replay shape must be between C1 and C6")
+        if not program.dspark and tokens != 1:
+            raise ValueError("V4.1 replay shape must be C1 when DSpark is disabled")
         if native_input and (not self.native_input_enabled or not _native_input_precision_compatible(program)
                              or tokens != 1):
             raise ValueError("Native input capture requires enabled ordinary BF16 C1 PP0 decode")
         search = getattr(program, "search_length", 512)
-        key = ((tokens,
-                "input") if native_input else tokens if search <= 512 and not fused_text_io and pp_wire is None else
+        key = (((tokens, "input") if search <= 512 else
+                (tokens, "input",
+                 search)) if native_input else tokens if search <= 512 and not fused_text_io and pp_wire is None else
                (tokens, search, fused_text_io))
         if key not in self.variants:
             self.variants[key] = StageVariant(program,
@@ -331,7 +365,8 @@ class StageReplay:
         program = self.program()
         native_input = (self.native_input_enabled and tokens == 1 and _native_input_precision_compatible(program))
         fused = (program.pp_rank == 0 and envs.VLLM_HPU_DSV41_FUSED_STAGE_IO)
-        key = ((tokens, "input") if native_input else tokens if search <= 512 and not fused else
+        key = (((tokens, "input") if search <= 512 else
+                (tokens, "input", search)) if native_input else tokens if search <= 512 and not fused else
                (tokens, search, fused))
         variant = self.variants.get(key)
         if variant is None or variant not in _native_entries:

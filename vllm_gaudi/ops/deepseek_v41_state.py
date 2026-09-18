@@ -136,9 +136,21 @@ request. Compressed history stays in its scheduler-owned HPU pages.
         self.working = {
             name: value
             for name, value in program.named_buffers()
-            if name.rsplit(".", 1)[-1] in ("swa", "kv_history", "score_history")
+            if name.rsplit(".", 1)[-1] in ("swa", "decoded_swa", "decoded_main", "kv_history", "score_history",
+                                           "indices", "candidate_pool")
         }
         self.saved, self.active, self.blocks = {}, None, 2
+        # The scheduler page table is small but long-lived.  Rebuilding a
+        # pageable CPU tensor and copying it on every C1 transaction forces
+        # the bridge to allocate an implicit staging buffer while captured
+        # recipe buffers are live.  Apart from wasting one H2D submission per
+        # token, that can enter Synapse defragmentation with buffers in use.
+        # Keep one explicitly pinned source and only publish changed tables.
+        self.block_table_host = torch.empty(program.shared.block_table.shape, dtype=torch.int32,
+                                            device="cpu").pin_memory("hpu")
+        self.block_table_host_values = self.block_table_host.numpy()
+        self.published_block_ids = None
+        self.identity_block_table_resident = False
 
     def allocate(self, blocks, device):
         if blocks < 2:
@@ -157,9 +169,40 @@ request. Compressed history stays in its scheduler-owned HPU pages.
         del block
         for key, (module, name) in self.bindings.items():
             setattr(module, name, self.allocations[key].flatten(0, 1))
-        self.program.shared.block_table.zero_()
-        self.program.shared.block_table[0] = min(1, self.blocks - 1)
+        # With max_num_seqs=1 the scheduler hands the sole request the first
+        # N physical pages.  Install that complete mapping before any recipe
+        # captures the destination.  Every growing prefix can then be consumed
+        # without mutating a graph-owned tensor at request time.
+        values = self.block_table_host_values
+        values[:] = range(1, len(values) + 1)
+        self.program.shared.block_table.copy_(self.block_table_host, non_blocking=True)
+        self.published_block_ids = None
+        self.identity_block_table_resident = True
         self.program.generation += 1
+
+    def _publish_block_table(self, block_ids):
+        block_ids = tuple(block_ids)
+        if block_ids == self.published_block_ids:
+            return
+        identity = all(block == index for index, block in enumerate(block_ids, 1))
+        if identity and self.identity_block_table_resident:
+            self.published_block_ids = block_ids
+            return
+        values = self.block_table_host_values
+        if identity:
+            values[:] = range(1, len(values) + 1)
+        else:
+            values.fill(0)
+            values[:len(block_ids)] = block_ids
+        # Pinned source plus a persistent destination gives Synapse a true
+        # asynchronous DMA and requires no per-request device allocation.  A
+        # non-identity remap is rare with single-request serving; wait for the
+        # prior captured consumer before mutating its persistent input.
+        if self.program.shared.block_table.device.type == "hpu":
+            torch.hpu.synchronize()
+        self.program.shared.block_table.copy_(self.block_table_host, non_blocking=True)
+        self.published_block_ids = block_ids
+        self.identity_block_table_resident = identity
 
     def activate(self, request_id, block_ids, *, reset=False):
         if not block_ids or any(not 0 < block < self.blocks for block in block_ids):
@@ -181,9 +224,7 @@ request. Compressed history stays in its scheduler-owned HPU pages.
             self.active = request_id
         elif reset:
             self.clear()
-        table = torch.zeros(self.program.shared.block_table.shape, dtype=torch.int32, device="cpu")
-        table[:len(block_ids)] = torch.tensor(block_ids, dtype=torch.int32, device="cpu")
-        self.program.shared.block_table.copy_(table)
+        self._publish_block_table(block_ids)
 
     def release(self, request_id):
         self.saved.pop(request_id, None)
@@ -191,8 +232,8 @@ request. Compressed history stays in its scheduler-owned HPU pages.
             self.active = None
 
     def clear(self):
-        for value in self.working.values():
-            value.zero_()
+        for name, value in self.working.items():
+            value.fill_(-1 if name.rsplit(".", 1)[-1] in ("indices", "candidate_pool") else 0)
 
     @property
     def allocated_bytes(self):

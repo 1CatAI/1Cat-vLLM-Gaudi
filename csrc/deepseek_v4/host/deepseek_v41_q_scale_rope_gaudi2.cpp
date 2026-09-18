@@ -23,9 +23,17 @@ tpc_lib_api::GlueCodeReturn DeepseekV41QScaleRopeGaudi2::GetGcDefinitions(
         if (x.dataType != (i == 3 ? DATA_I32 : DATA_F32)) return GLUE_INCOMPATIBLE_DATA_TYPE;
         if (x.dims != (i == 3 ? 1u : 2u) ||
             x.maxSizes[0] != (i < 2 ? 16384u : i == 4 ? 64u : 1u) ||
-            (i != 3 && x.maxSizes[1] != (i == 4 ? 512u : 1u))) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+            (i == 4 ? (!x.maxSizes[1] || x.maxSizes[1] > 1048576u) :
+             (i != 3 && x.maxSizes[1] != 1u))) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        if (i == 4) {
+            // The selected row depends on the runtime position scalar and
+            // cannot be expressed as an affine index-space mapping.  The TPC
+            // kernel still issues only one 64-value row load.
+            out->inputTensorAccessPattern[i].allRequired = true;
+            continue;
+        }
         map(out->inputTensorAccessPattern[i], 0, i < 2 ? 512 : 0, i < 2 ? 511 : i == 4 ? 63 : 0);
-        if (i != 3) map(out->inputTensorAccessPattern[i], 1, 0, i == 4 ? 511 : 0);
+        if (i != 3) map(out->inputTensorAccessPattern[i], 1, 0, 0);
     }
     out->indexSpaceRank = 1; out->indexSpaceGeometry[0] = 32;
     map(out->outputTensorAccessPattern[0], 0, 512, 511);

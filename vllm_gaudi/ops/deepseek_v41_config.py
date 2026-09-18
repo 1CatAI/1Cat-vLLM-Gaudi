@@ -27,22 +27,20 @@ def validate_v2(config):
     if not envs.VLLM_HPU_DSV41_GRAPH_REPLAY or not envs.VLLM_HPU_DSV41_DIRECT_TOKEN_IDS:
         raise ValueError("V4.1 V2 requires native graph replay and direct device token inputs")
     if (envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX
-            and not (envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH
-                     and envs.VLLM_HPU_DSV41_FIXED_POSITIONS
-                     and envs.VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT
-                     and envs.VLLM_HPU_TP2_NATIVE_JOINT_PLAN
+            and not (envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH and envs.VLLM_HPU_DSV41_FIXED_POSITIONS
+                     and envs.VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT and envs.VLLM_HPU_TP2_NATIVE_JOINT_PLAN
                      and envs.VLLM_HPU_DSV41_TP_MHC_OVERLAP)):
         raise ValueError("V4.1 segmented prefix requires native fixed inputs, early commit, and TP dependencies")
     if envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX and envs.VLLM_HPU_DSV41_FUSED_STAGE_IO:
         raise ValueError("V4.1 segmented prefix requires the native input graph instead of fused stage I/O")
     if (envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM
-            and not (envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX
-                     and envs.VLLM_HPU_DSV41_ENGRAM_NATIVE_C1
-                     and envs.VLLM_HPU_DSV41_ENGRAM_C1_PACKET
-                     and envs.VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT)):
+            and not (envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX and envs.VLLM_HPU_DSV41_ENGRAM_NATIVE_C1
+                     and envs.VLLM_HPU_DSV41_ENGRAM_C1_PACKET and envs.VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT)):
         raise ValueError("Device Engram requires segmented PP0 replay, native C1 packets, and direct inputs")
-    if envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and config.model_config.max_model_len > 512:
-        raise ValueError("Device Engram is qualified only for the bounded context-512 profile")
+    # Device Engram is a C1 producer over the current token and a three-token
+    # rolling history.  It is independent of the paged CSA2 capacity; prompt
+    # chunks continue to use the host gather path and only decode C1 enters
+    # the segmented device producer.
 
 
 def validate_sampling(params):

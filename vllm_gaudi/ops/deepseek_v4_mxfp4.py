@@ -4,7 +4,6 @@ from dataclasses import dataclass
 
 import torch
 
-
 _MXFP4_BF16_BITS = (
     0x0000,
     0x3F00,
@@ -100,8 +99,8 @@ def prepare_mxfp4_q16(packed: torch.Tensor) -> torch.Tensor:
     feeds one BF16 shuffle directly and one 16-bit shift exposes the other.
     The byte count is unchanged.
     """
-    if packed.dtype != torch.uint8 or packed.ndim < 2 or packed.shape[-1] % 256:
-        raise ValueError("packed MXFP4 must be uint8 [...,N,K/2] with K divisible by 512")
+    if packed.dtype != torch.uint8 or packed.ndim < 2 or packed.shape[-1] % 64:
+        raise ValueError("packed MXFP4 must be uint8 [...,N,K/2] with K divisible by 128")
     if packed.shape[-2] % 128:
         raise ValueError("prepared MXFP4 output rows must be divisible by 128")
     # The low and high bytes are already the two adjacent output rows. A
@@ -130,7 +129,7 @@ def prepare_mxfp4_q16(packed: torch.Tensor) -> torch.Tensor:
 
 def restore_mxfp4_u8(q16: torch.Tensor) -> torch.Tensor:
     """Restore the checkpoint byte layout from :func:`prepare_mxfp4_q16`."""
-    if q16.dtype != torch.int16 or q16.ndim < 2 or q16.shape[-1] % 16384:
+    if q16.dtype != torch.int16 or q16.ndim < 2 or q16.shape[-1] % 64:
         raise ValueError("prepared Q16 must be int16 [...,N/128,(K/2)*64]")
     prefix = q16.shape[:-2]
     blocks, stream = q16.shape[-2:]

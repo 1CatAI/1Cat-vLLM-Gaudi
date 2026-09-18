@@ -2,8 +2,11 @@
 
 This experimental profile is under qualification. Enabling a switch is not
 evidence of completed model, numerical, memory or performance validation.
-The initial contract is Gaudi2, TP2×PP2, one request, context up to 512 tokens,
-and greedy sampling. Unsupported sampling modifiers fail explicitly.
+The serving contract is Gaudi2, TP2×PP2, one request and greedy sampling.
+Paged state supports configuring up to 1,048,576 tokens; prefill uses scheduler
+chunks of up to 8192 tokens. This is a capacity contract, not a claim that a
+full-window request has passed quality qualification. Unsupported sampling
+modifiers fail explicitly.
 
 ## Preparation
 
@@ -84,7 +87,7 @@ speculative configuration, skips all
 `mtp.*` tensors while reading the immutable rank files, and creates no draft
 state or target-state auxiliary outputs. The normal runner commits one output
 token without proposal or verification. Native warmup captures C1 only;
-multi-token prefill retains its compiled compatibility path and tail handling.
+multi-token prefill uses bounded expert-grouped BMMs and exact tail handling.
 Set `VLLM_HPU_DSV41_DSPARK=1` explicitly to select the separate speculative
 profile; the ordinary-C1 bundle is not applied in that mode.
 
@@ -125,9 +128,9 @@ establish production quality; arithmetic-changing candidates stay behind the
 experimental numerical aggregate until their full quality, prefill numerical
 consistency and long replay/shutdown gates pass.
 
-The scheduler owns one complete request-state block for the bounded context.
-Null block 0 and request block 1 each have separate allocations for the actual
-SWA, FP4 main/index, candidate, Top-512, compressor and draft arrays. Prefix
+The scheduler owns the request state. Short contexts use a bounded block;
+long contexts use physical page tables for SWA, FP4 main/index, candidates,
+Top-512 and compressor state, with null block 0 reserved separately. Prefix
 caching is disabled. Rebinding state invalidates compiled replay addresses;
 errors after state writes abort execution rather than retry another path.
 
@@ -185,3 +188,53 @@ published. Request identity, history parity, late-input storage dependencies,
 and the real scheduler authorization are checked before continuation. This is
 the performance-qualified combination; the constituent switches are not
 independent performance claims.
+
+## Prepared runtime weights and long-context serving
+
+Prepare the final N256 runtime layout once from the immutable TP2×PP2 shards:
+
+```bash
+.venv/bin/python tools/prepare_deepseek_v41_n256.py PREPARED_DIR RUNTIME_WEIGHT_DIR
+.venv/bin/python -m vllm_gaudi.entrypoints.deepseek_v41 PREPARED_DIR \
+  --runtime-profile RUNTIME_PROFILE \
+  --n256-prepared-dir RUNTIME_WEIGHT_DIR \
+  --max-model-len 1048576 --max-num-batched-tokens 8192 --max-num-seqs 1 \
+  --block-size 128 --num-gpu-blocks-override 8193
+```
+
+The runtime profile supplies the matched native libraries, ABI manifests,
+reserved devices, CPU placement and precision configuration. Rebuild both the
+V4.1 kernels and the native replay bridge from this revision; previously built
+bridges with a fixed PP0 collective count cannot replay long CSA2 buckets.
+Do not disable V2 continuation, early device-token commit, device Engram or
+segmented input replay in a wrapper around the dedicated entrypoint. Their
+existing overrides remain available for diagnostics. Arithmetic-changing
+optimizations still require the explicit precision profile.
+
+Runtime preparation writes four rank files and publishes its manifest only
+after all files pass exact inverse-layout checks. Layout, quantization, source
+manifest and rank identities are validated before loading. Reads are bounded
+and copy directly into the single resident compressed expert allocation;
+Engram and dense weights retain their existing immutable sources. Partial or
+stale prepared files fail explicitly. The cache is optional: omitting it
+retains loading-time preparation.
+
+The dedicated entrypoint enables `VLLM_HPU_DSV41_PREFILL_GROUPED`: routing is
+bucketed by expert occupancy and each decoded weight is reused across its
+selected prompt rows. The implementation preserves clamp, BF16 boundaries,
+route order and ordered accumulation, including skewed routes and chunk tails.
+It never reduces the scheduler's prompt admission to a single-token loop.
+`VLLM_HPU_DSV41_PREFILL_MXFP4` remains a default-off stock-kernel experiment;
+it is not the validated grouped-prefill serving path.
+
+Each search bucket owns its native decode plan. Segmented PP0 replay accounts
+for CSA2 index exchanges and begins continuation only after the next bucket
+is prepared. CPU prefill completion must not bind an old device completion
+token into the next C1 input. Packed KV remains canonical; only the active
+working set is decoded.
+
+Validation covers a prompt crossing an 8192-token chunk boundary, subsequent
+short-request reuse, eight free-generation arithmetic samples, and public
+streaming/non-streaming chat. It does not establish full-window quality,
+vision qualification or long-duration reliability. Preserve the model and
+runtime fingerprints with further qualification results.

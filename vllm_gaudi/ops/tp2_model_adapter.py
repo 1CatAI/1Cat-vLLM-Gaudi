@@ -23,9 +23,15 @@ class DecoderTopology:
     def collectives(self):
         return self.reductions + self.extra_collectives
 
+    @property
+    def supports_segmented_input(self):
+        # Three PP0 CSA2 index owners may each add a Q/weight exchange pair.
+        return (self.name == "deepseek_v41_pp0_input" and self.group_layers == (4, ) * 5 and not self.external_prefix
+                and self.collectives in (43, 45, 47, 49))
 
-QWEN3_NEXT = DecoderTopology("qwen3_next", (8,) * 8, 2, True)
+
+QWEN3_NEXT = DecoderTopology("qwen3_next", (8, ) * 8, 2, True)
 DEEPSEEK_V4 = DecoderTopology("deepseek_v4", (8, 8, 8, 8, 8, 3), 2, False)
-DEEPSEEK_V41_PP0 = DecoderTopology("deepseek_v41_pp0", (4,) * 5, 2, False, 2)
-DEEPSEEK_V41_PP0_INPUT = DecoderTopology("deepseek_v41_pp0_input", (4,) * 5, 2, False, 3)
-DEEPSEEK_V41_PP1 = DecoderTopology("deepseek_v41_pp1", (4,) * 5, 2, False)
+DEEPSEEK_V41_PP0 = DecoderTopology("deepseek_v41_pp0", (4, ) * 5, 2, False, 2)
+DEEPSEEK_V41_PP0_INPUT = DecoderTopology("deepseek_v41_pp0_input", (4, ) * 5, 2, False, 3)
+DEEPSEEK_V41_PP1 = DecoderTopology("deepseek_v41_pp1", (4, ) * 5, 2, False)

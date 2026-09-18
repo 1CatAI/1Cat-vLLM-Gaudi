@@ -20,7 +20,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41DenseGaudi2::GetGcDefinitions(
     const auto& a = p->inputTensors[0].geometry;
     const auto& b = p->outputTensors[0].geometry;
     const auto width = a.maxSizes[0], rows = a.maxSizes[1];
-    if (rows < 1 || rows > 512 || a.dims != 2 || b.dims != 2 ||
+    if (rows < 1 || rows > 8192 || a.dims != 2 || b.dims != 2 ||
         b.maxSizes[0] != width || b.maxSizes[1] != rows) return GLUE_INCOMPATIBLE_INPUT_SIZE;
     if (quant_) {
         const auto& s = p->outputTensors[1].geometry;

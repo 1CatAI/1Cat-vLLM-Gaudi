@@ -10,7 +10,7 @@ habana::OutputMetaDataVector metadata(const at::Stack& stack) {
     const auto scores = stack.at(0).toTensor(), text = stack.at(1).toTensor();
     const auto image = stack.at(2).toTensor(), mask = stack.at(3).toTensor();
     TORCH_CHECK(scores.scalar_type() == at::kFloat && scores.dim() == 2 && scores.size(0) > 0 &&
-                scores.size(0) <= 512 && scores.size(1) == 384 && text.scalar_type() == at::kFloat &&
+                scores.size(0) <= 8192 && scores.size(1) == 384 && text.scalar_type() == at::kFloat &&
                 image.scalar_type() == at::kFloat && text.sizes() == at::IntArrayRef({384}) &&
                 image.sizes() == text.sizes() && mask.scalar_type() == at::kBool &&
                 mask.sizes() == at::IntArrayRef({scores.size(0)}), "V4.1 router requires F32 [T,384], two F32 biases and bool [T]");

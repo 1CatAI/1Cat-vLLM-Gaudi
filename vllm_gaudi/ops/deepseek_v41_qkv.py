@@ -6,6 +6,26 @@ import torch.nn.functional as F
 from vllm_gaudi.ops.deepseek_v41_math import quantize_activation
 
 
+def concatenate_static_weights(*weights):
+    """Join immutable matrices without leaving a concat in an HPU recipe.
+
+    These weights are prepared once while the model is loading.  On HPU the
+    ordinary ``torch.cat`` is nevertheless submitted through the graph
+    compiler, where the V2 segmented runtime can retain it until the first
+    unrelated graph is compiled.  Materializing the small, immutable join on
+    the host and uploading it once keeps that startup operation out of every
+    captured decode graph and preserves the source FP32 bytes exactly.
+    """
+    if not weights:
+        raise ValueError("At least one static weight is required")
+    device = weights[0].device
+    if any(weight.device != device for weight in weights):
+        raise ValueError("Static projection weights must share a device")
+    if device.type == "hpu":
+        return torch.cat(tuple(weight.cpu() for weight in weights), dim=0).to(device)
+    return torch.cat(weights, dim=0)
+
+
 class FusedQKVInput:
 
     def prepare_qkv_input_weight(self):
@@ -55,3 +75,43 @@ class FusedQKVInput:
         qkv = F.linear(fused_value, self._fused_qkv_weight)
         q_width = self.weights.wq_a.weight.shape[0]
         return qkv[..., :q_width], qkv[..., q_width:]
+
+
+class FusedCompressorInput:
+    """Load-time fusion for the ratio-2 CSA2 compressor projections."""
+
+    def prepare_compressor_input_weight(self):
+        if not self.compressor_fused_input or self._fused_compressor_weight is not None:
+            return
+        if not self.owns_kv or self.ratio != 2:
+            return
+        compressor = self.weights.compressor
+        kv_weight = compressor.wkv.weight
+        gate_weight = compressor.wgate.weight
+        if kv_weight.ndim != 2 or gate_weight.ndim != 2 or kv_weight.shape[1] != gate_weight.shape[1]:
+            raise ValueError("V4.1 Compressor fusion requires matching input K dimensions")
+        if kv_weight.dtype != torch.float32 or gate_weight.dtype != torch.float32:
+            raise ValueError("V4.1 ratio-2 Compressor fusion requires FP32 weights")
+        if getattr(compressor.wkv, "bias", None) is not None or getattr(compressor.wgate, "bias", None) is not None:
+            raise ValueError("V4.1 ratio-2 Compressor fusion does not support projection bias")
+        fused = concatenate_static_weights(kv_weight, gate_weight).contiguous()
+        self.register_buffer("fused_compressor_wkv_wgate", fused, False)
+        self._fused_compressor_kv_width = kv_weight.shape[0]
+        compressor.wkv.weight = self.fused_compressor_wkv_wgate[:kv_weight.shape[0]]
+        compressor.wgate.weight = self.fused_compressor_wkv_wgate[kv_weight.shape[0]:]
+        self._fused_compressor_weight = self.fused_compressor_wkv_wgate
+
+    def invalidate_compressor_input_weight(self):
+        if "fused_compressor_wkv_wgate" in self._buffers:
+            self._buffers.pop("fused_compressor_wkv_wgate")
+        self._fused_compressor_weight = None
+        self._fused_compressor_kv_width = 0
+
+    def _project_compressor_input(self, value):
+        compressor = self.weights.compressor
+        value = value.float()
+        if self._fused_compressor_weight is None:
+            return self.linear(value, compressor.wkv).float(), self.linear(value, compressor.wgate).float()
+        projected = F.linear(value, self._fused_compressor_weight)
+        width = self._fused_compressor_kv_width
+        return projected[..., :width], projected[..., width:]

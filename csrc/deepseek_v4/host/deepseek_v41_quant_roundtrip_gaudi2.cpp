@@ -30,7 +30,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41QuantRoundtripGaudi2::GetGcDefinitions(
             return GLUE_INCOMPATIBLE_DATA_TYPE;
         }
         if (geometry.dims != 2 || geometry.maxSizes[0] == 0 || geometry.maxSizes[0] % 32 ||
-            geometry.maxSizes[0] > 131072 || geometry.maxSizes[1] == 0 || geometry.maxSizes[1] > 512 ||
+            geometry.maxSizes[0] > 131072 || geometry.maxSizes[1] == 0 || geometry.maxSizes[1] > 8192 ||
             geometry.maxSizes[0] != shape.maxSizes[0] || geometry.maxSizes[1] != shape.maxSizes[1]) {
             return index == 0 ? GLUE_INCOMPATIBLE_INPUT_SIZE : GLUE_INCOMPATIBLE_OUTPUT_SIZE;
         }

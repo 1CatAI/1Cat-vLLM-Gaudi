@@ -172,8 +172,7 @@ def _flush():
                     _native_graph_owners[key] = weakref.ref(context["owner"])
                 if v4:
                     graph.configure_topology(groups, adapter.collectives, adapter.external_prefix)
-                if (v41 and gaudi_envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX
-                        and adapter.collectives == 43 and not adapter.external_prefix):
+                if (v41 and gaudi_envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX and adapter.supports_segmented_input):
                     attention_inputs = list(context["attention_inputs"])
                     if gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM:
                         attention_inputs = attention_inputs[1:]
