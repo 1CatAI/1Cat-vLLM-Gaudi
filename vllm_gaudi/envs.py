@@ -24,9 +24,12 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV4_MXFP4_PREPARED_MME: bool = False
     VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH: bool = False
     VLLM_HPU_DSV41_EXPERT_N256: bool = False
+    VLLM_HPU_DSV41_N256_PREPARED_DIR: Optional[str] = None
     VLLM_HPU_DSV41_DEFAULT_FASTPATHS: bool = False
     VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS: bool = False
     VLLM_HPU_DSV41_EXPERT_N256_FP8: bool = False
+    VLLM_HPU_DSV41_PREFILL_MXFP4: bool = False
+    VLLM_HPU_DSV41_PREFILL_GROUPED: bool = False
     VLLM_HPU_DSV41_EXPERT_FUSED_QUANT: bool = False
     VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE: bool = False
     VLLM_HPU_DSV41_MLA_MME: bool = False
@@ -346,8 +349,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_EXPERT_N256":
     lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_N256", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_N256_PREPARED_DIR":
+    lambda: os.environ.get("VLLM_HPU_DSV41_N256_PREPARED_DIR"),
     "VLLM_HPU_DSV41_EXPERT_N256_FP8":
     lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_N256_FP8", "0").lower() in ("1", "true"),
+    # Keep the resident N256 allocation for C1 decode, but restore bounded
+    # expert ranges into checkpoint order for Habana's throughput-oriented
+    # large-M MXFP4 FusedMoE.  This avoids rereading/dequantizing every expert
+    # once per M128 prompt tile without keeping a second weight allocation.
+    "VLLM_HPU_DSV41_PREFILL_MXFP4":
+    lambda: os.environ.get("VLLM_HPU_DSV41_PREFILL_MXFP4", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_PREFILL_GROUPED":
+    lambda: os.environ.get("VLLM_HPU_DSV41_PREFILL_GROUPED", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_EXPERT_FUSED_QUANT":
     lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_FUSED_QUANT", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE":

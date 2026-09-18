@@ -4,22 +4,20 @@ from vllm_gaudi.v1.worker.deepseek_v41_runner import (
     target_chunks,
     target_search_length,
 )
+from vllm_gaudi.ops.deepseek_v41_math import NATIVE_KV_CODEC_TOKENS
 
 
-def test_scheduler_transaction_uses_c128_prefill_blocks():
+def test_scheduler_transaction_is_one_c8192_prefill_block():
     tokens = list(range(8192))
     chunks = list(target_chunks(tokens))
-    assert len(chunks) == 64
+    assert PREFILL_BLOCK_TOKENS == 8192
+    assert len(chunks) == 1
     assert all(len(chunk) == PREFILL_BLOCK_TOKENS for _, chunk in chunks)
     assert [token for _, chunk in chunks for token in chunk] == tokens
 
 
-def test_long_context_internal_c64_tiling_preserves_8192_scheduler_transaction():
-    tokens = list(range(8192))
-    chunks = list(target_chunks(tokens, 64))
-    assert len(chunks) == 128
-    assert all(len(chunk) == 64 for _, chunk in chunks)
-    assert [token for _, chunk in chunks for token in chunk] == tokens
+def test_native_kv_codec_covers_the_complete_prefill_transaction():
+    assert NATIVE_KV_CODEC_TOKENS == PREFILL_BLOCK_TOKENS == 8192
 
 
 def test_scheduler_transaction_uses_one_search_bucket_for_all_internal_tiles():

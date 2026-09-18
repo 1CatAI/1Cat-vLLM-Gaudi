@@ -126,9 +126,8 @@ def test_paged_shared_state_allocates_bounded_decoded_mirrors(monkeypatch):
     from vllm_gaudi.ops import deepseek_v41_paged_attention as paged
 
     monkeypatch.setattr(paged.gaudi_envs, "VLLM_HPU_DSV41_PAGED_DECODED_KV_STATE", True)
-    monkeypatch.setattr(
-        paged, "rotary_table",
-        lambda width, length, *args: torch.zeros(length, width // 2, 2, dtype=torch.float32))
+    monkeypatch.setattr(paged, "rotary_table",
+                        lambda width, length, *args: torch.zeros(length, width // 2, 2, dtype=torch.float32))
     ratios = [0, 0] + [2] * 18 + [1] * 20
     config = {
         "kv_source_layer_ids": [2, 8, 14, 20],

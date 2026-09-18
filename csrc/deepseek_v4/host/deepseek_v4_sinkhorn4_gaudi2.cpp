@@ -30,7 +30,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV4Sinkhorn4Gaudi2::GetGcDefinitions(
         }
         if (tensor.geometry.dims != 3 || tensor.geometry.maxSizes[0] != 4 ||
             tensor.geometry.maxSizes[1] != 4 || tensor.geometry.maxSizes[2] < 1 ||
-            tensor.geometry.maxSizes[2] > 512 ||
+            tensor.geometry.maxSizes[2] > 8192 ||
             tensor.geometry.maxSizes[2] != in->inputTensors[0].geometry.maxSizes[2]) {
             return i == 0 ? GLUE_INCOMPATIBLE_INPUT_SIZE : GLUE_INCOMPATIBLE_OUTPUT_SIZE;
         }

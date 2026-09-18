@@ -15,12 +15,13 @@ static std::vector<NativeNodeKind> chain(size_t groups, bool peer) {
 }
 
 int main() {
-  assert(NativeGraphTopology::supportsV41SegmentedPrefix(5, 43, false));
-  for (size_t collectives : {3, 8, 40, 42, 44})
+  for (size_t collectives : {43, 45, 47, 49})
+    assert(NativeGraphTopology::supportsV41SegmentedPrefix(5, collectives, false));
+  for (size_t collectives : {3, 8, 40, 42, 44, 46, 48, 50, 51})
     assert(!NativeGraphTopology::supportsV41SegmentedPrefix(5, collectives, false));
   assert(!NativeGraphTopology::supportsV41SegmentedPrefix(5, 43, true));
   assert(!NativeGraphTopology::supportsV41SegmentedPrefix(1, 43, false));
-  for (size_t collectives : {40, 42, 43}) {
+  for (size_t collectives : {40, 42, 43, 44, 45, 46, 47, 48, 49, 50}) {
     assert(NativeGraphTopology::supportsV41Dependencies(5, collectives, false));
     assert(!NativeGraphTopology::supportsV41Dependencies(5, collectives, true));
     std::vector<NativeNodeKind> nodes;
@@ -40,7 +41,7 @@ int main() {
   }
   assert(NativeGraphTopology::supportsV41Dependencies(1, 8, false));
   assert(!NativeGraphTopology::supportsV41Dependencies(5, 41, false));
-  assert(!NativeGraphTopology::supportsV41Dependencies(5, 44, false));
+  assert(!NativeGraphTopology::supportsV41Dependencies(5, 51, false));
   assert(!NativeGraphTopology::supportsV41Dependencies(4, 43, false));
   for (size_t groups : {1, 8}) for (bool peer : {false, true}) {
     const auto nodes = chain(groups, peer);

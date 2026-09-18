@@ -11,7 +11,7 @@ constexpr auto kScale = "custom_deepseek_v41_woa_scale_gaudi2";
 using Pair = std::tuple<at::Tensor, at::Tensor>;
 habana::OutputMetaDataVector meta(const at::Stack& stack, bool quant) {
     const auto x = stack.at(0).toTensor();
-    TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.dim() == 3 && x.size(0) >= 1 && x.size(0) <= 512 &&
+    TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.dim() == 3 && x.size(0) >= 1 && x.size(0) <= 8192 &&
                 x.size(1) == 4 && x.size(2) == 4096, "wo_a requires BF16 [T,4,4096]");
     for (const auto& item : stack) {
         const auto t = item.toTensor();

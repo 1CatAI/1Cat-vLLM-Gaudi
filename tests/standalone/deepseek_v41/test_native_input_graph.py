@@ -12,6 +12,7 @@ from vllm_gaudi.ops.tp2_model_adapter import DEEPSEEK_V41_PP0, DEEPSEEK_V41_PP0_
 
 
 class EchoGroup(torch.nn.Module):
+
     def __init__(self, native_input):
         super().__init__()
         self.native_input = native_input
@@ -58,6 +59,32 @@ def test_topology_adds_embedding_without_dropping_other_reductions():
     assert not DEEPSEEK_V41_PP0_INPUT.external_prefix
 
 
+@pytest.mark.parametrize("indexers", [0, 1, 2, 3])
+def test_segmented_input_covers_long_index_exchanges(indexers):
+    from dataclasses import replace
+    value = replace(DEEPSEEK_V41_PP0_INPUT, extra_collectives=3 + 2 * indexers)
+    assert value.supports_segmented_input
+    assert value.reductions == 40 and value.collectives == 43 + 2 * indexers
+    assert not replace(value, extra_collectives=value.extra_collectives + 1).supports_segmented_input
+    assert not replace(value, external_prefix=True).supports_segmented_input
+    assert not replace(value, name=DEEPSEEK_V41_PP1.name).supports_segmented_input
+
+
+@pytest.mark.parametrize("search", [512, 1024, 16384, 1048576])
+def test_paged_variants_bind_only_their_active_state_allocations(search):
+    from vllm_gaudi.ops.deepseek_v41_replay import stage_state_tensors
+    owner = torch.nn.Module()
+    owner.length, owner.search_length = 1048576, search
+    names = ("swa", "main", "index", "indices", "candidate_pool", "kv_history", "score_history", "block_table",
+             "decoded_swa", "decoded_main")
+    for name in names:
+        owner.register_buffer(name, torch.zeros(1))
+    bound = {id(value) for value in stage_state_tensors(owner)}
+    for name in names:
+        active = search <= 512 or not name.startswith("decoded_")
+        assert (id(getattr(owner, name)) in bound) == active
+
+
 @pytest.mark.parametrize("kwargs", ({"pp_rank": 1}, {"dspark": True}, {"fp8": True}))
 def test_incompatible_compile_contract_is_rejected(kwargs):
     with pytest.raises(ValueError, match="ordinary BF16 PP0"):
@@ -68,6 +95,7 @@ def test_seeds_are_persistent_and_external_call_stays_separate(monkeypatch):
     monkeypatch.setenv("VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH", "1")
 
     class CaptureReplay(StageReplay):
+
         def __call__(self, *args, **kwargs):
             return args, kwargs
 
@@ -90,6 +118,7 @@ def test_segmented_input_replay_keeps_the_complete_variant(monkeypatch):
     calls = []
 
     class CaptureSegmented(StageReplay):
+
         def begin_segmented_from_input_ids(self, positions, ids):
             calls.append(("prefix", positions, ids))
 
@@ -99,6 +128,7 @@ def test_segmented_input_replay_keeps_the_complete_variant(monkeypatch):
 
     owner = program()
     replay = CaptureSegmented(owner)
+
     class Variant:
         pass
 
@@ -120,8 +150,8 @@ def test_direct_engram_retains_exact_packed_views():
     assert all(a is b for a, b in zip(captured, views))
     copies = capture_engram_inputs(views)
     assert all(torch.equal(a, b) and a.data_ptr() != b.data_ptr() for a, b in zip(copies, views))
-    for invalid in ((views[0], views[0]), tuple(reversed(views)), copies, views[:1],
-                    (views[0].transpose(1, 2), views[1])):
+    for invalid in ((views[0], views[0]), tuple(reversed(views)), copies, views[:1], (views[0].transpose(1,
+                                                                                                         2), views[1])):
         with pytest.raises(ValueError, match="Engram"):
             capture_engram_inputs(invalid, direct=True)
 
@@ -131,9 +161,8 @@ def test_device_engram_retains_decoded_and_late_inputs():
     layer14 = torch.empty((1, 12, 264), dtype=torch.uint8)
     captured = capture_engram_inputs((layer1, layer14), direct=True, device_layer1=True)
     assert captured[0] is layer1 and captured[1] is layer14
-    invalid = ((layer1.to(torch.float32), layer14), (layer1[:, :, :255], layer14),
-               (layer1, layer14.to(torch.int8)), (layer1, layer14[:, :, :263]),
-               (layer1.transpose(1, 2), layer14))
+    invalid = ((layer1.to(torch.float32), layer14), (layer1[:, :, :255], layer14), (layer1, layer14.to(torch.int8)),
+               (layer1, layer14[:, :, :263]), (layer1.transpose(1, 2), layer14))
     for values in invalid:
         with pytest.raises(ValueError, match="Device Engram"):
             capture_engram_inputs(values, direct=True, device_layer1=True)
@@ -167,6 +196,7 @@ def test_input_modes_have_separate_cached_variants(monkeypatch):
     from vllm_gaudi.ops import deepseek_v41_replay
 
     class Variant:
+
         def __init__(self, *args, native_input=False):
             self.native_input = native_input
 
@@ -180,16 +210,18 @@ def test_input_modes_have_separate_cached_variants(monkeypatch):
     ids, positions = torch.tensor([1]), torch.tensor([0], dtype=torch.int32)
     external = replay(None, None, positions, ids, ())
     ids6, positions6 = torch.arange(6), torch.arange(6, dtype=torch.int32)
-    external6 = replay(None, None, positions6, ids6, ())
+    with pytest.raises(ValueError, match="C1 when DSpark is disabled"):
+        replay(None, None, positions6, ids6, ())
     internal = replay.from_input_ids(positions, ids, ())
     assert external is replay(None, None, positions, ids, ())
-    assert external6 is replay(None, None, positions6, ids6, ())
     assert internal is replay.from_input_ids(positions, ids + 1, ())
-    assert set(replay.variants) == {1, 6, (1, "input")}
+    assert set(replay.variants) == {1, (1, "input")}
     assert not external.native_input and internal.native_input
 
 
 def test_native_input_variants_are_separate_across_paged_buckets(monkeypatch):
+    from vllm_gaudi.ops import tp2_prepared_plan
+
     monkeypatch.setenv("VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH", "1")
     owner = program()
     owner.search_length = 512
@@ -197,6 +229,21 @@ def test_native_input_variants_are_separate_across_paged_buckets(monkeypatch):
     assert replay._input_key() == (1, "input")
     owner.search_length = 1024
     assert replay._input_key() == (1, "input", 1024)
+
+    class Variant:
+        pass
+
+    variant = Variant()
+    replay.variants[(1, "input", 1024)] = variant
+    assert not replay.input_variant_ready(512)
+    assert not replay.input_variant_ready(1024)
+    tp2_prepared_plan._native_entries[variant] = object()
+    try:
+        assert replay.input_variant_ready(1024)
+        assert not replay.input_variant_ready(2048)
+        assert owner.search_length == 1024
+    finally:
+        tp2_prepared_plan._native_entries.pop(variant, None)
 
 
 @pytest.mark.parametrize("pp_rank,native_input", ((0, False), (0, True), (1, True)))

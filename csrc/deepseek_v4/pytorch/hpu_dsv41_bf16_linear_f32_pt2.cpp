@@ -11,7 +11,7 @@ constexpr auto kSchema = "custom_op::custom_deepseek_v41_bf16_linear_f32_gaudi2"
 habana::OutputMetaDataVector metadata(const at::Stack& stack) {
     const auto input = stack.at(0).toTensor(), weight = stack.at(1).toTensor();
     TORCH_CHECK(input.scalar_type() == at::kBFloat16 && weight.scalar_type() == at::kBFloat16 &&
-                input.dim() == 2 && weight.dim() == 2 && input.size(0) >= 1 && input.size(0) <= 512 &&
+                input.dim() == 2 && weight.dim() == 2 && input.size(0) >= 1 && input.size(0) <= 8192 &&
                 input.size(1) == 5120 && weight.size(1) == 5120 && weight.size(0) > 0 &&
                 weight.size(0) <= 64640 && input.is_contiguous() && weight.is_contiguous() &&
                 input.device() == weight.device() && !input.requires_grad() && !weight.requires_grad(),

@@ -38,9 +38,14 @@ def test_n256_fused_finalize_is_c1_only(monkeypatch):
         return torch.zeros(tokens, 6, dtype=torch.int32), torch.ones(tokens, 6)
 
     def expert(kind):
-        def run(value, *_args):
+
+        def run(value, *operands):
+            assert operands[-3] is experts.w13_fp8_channel
+            assert operands[-2] is experts.w2_fp8_channel
+            assert operands[-1] is True
             calls.append((kind, value.shape[0]))
             return torch.zeros_like(value)
+
         return run
 
     monkeypatch.setattr(
@@ -52,8 +57,10 @@ def test_n256_fused_finalize_is_c1_only(monkeypatch):
                               w2_q16=None,
                               w13_s16=None,
                               w2_s16=None,
-                              w13_channel=None,
-                              w2_channel=None)
+                              w13_channel=True,
+                              w2_channel=True,
+                              w13_fp8_channel=torch.ones(1, dtype=torch.bfloat16),
+                              w2_fp8_channel=torch.ones(1, dtype=torch.bfloat16))
     weights = SimpleNamespace(gate=SimpleNamespace(weight=torch.zeros(384, 8),
                                                    bias=torch.zeros(384),
                                                    bias_vl=torch.zeros(384)),

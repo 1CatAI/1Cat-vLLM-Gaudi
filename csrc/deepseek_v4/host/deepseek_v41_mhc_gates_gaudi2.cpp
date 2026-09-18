@@ -39,7 +39,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41MhcGatesGaudi2::GetGcDefinitions(
         return GLUE_INCOMPATIBLE_OUTPUT_COUNT;
     }
     const unsigned tokens = in->inputTensors[0].geometry.maxSizes[1];
-    if (!matches(in->inputTensors[0], 2, {24, tokens}) || tokens < 1 || tokens > 512 ||
+    if (!matches(in->inputTensors[0], 2, {24, tokens}) || tokens < 1 || tokens > 8192 ||
         !matches(in->inputTensors[1], 2, {1, tokens}) ||
         !matches(in->inputTensors[2], 1, {3}) || !matches(in->inputTensors[3], 1, {24})) {
         return GLUE_INCOMPATIBLE_INPUT_SIZE;

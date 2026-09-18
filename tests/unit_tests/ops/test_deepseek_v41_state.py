@@ -74,6 +74,26 @@ def test_single_token_prefill_keeps_disjoint_transport_buffers(monkeypatch):
     buffers.complete_packet()
 
 
+def test_prompt_completion_uses_cpu_pp_control_record(monkeypatch):
+    from types import SimpleNamespace
+    from vllm_gaudi.v1.worker import deepseek_v41_runner as runner
+
+    cpu_group = object()
+    group = SimpleNamespace(is_last_rank=True, ranks=[0, 2], cpu_group=cpu_group)
+    monkeypatch.setattr(runner.envs, "VLLM_HPU_DSV41_PACKED_PP", False)
+    monkeypatch.setattr(runner, "get_pp_group", lambda: group)
+    broadcasts = []
+
+    def broadcast(value, *, src, group):
+        broadcasts.append((value.clone(), src, group))
+
+    monkeypatch.setattr(runner.dist, "broadcast", broadcast)
+    buffers = runner.PPBuffers("cpu", dspark=False, device_commit=False)
+    assert buffers.finish_single(13, 45) == (13, [45])
+    assert broadcasts[0][0].tolist() == [1, 13, 1, 45]
+    assert broadcasts[0][1:] == (2, cpu_group)
+
+
 def test_native_c1_binding_consumes_prompt_updates_and_rejects_foreign_request_prefix():
     from types import SimpleNamespace
     from vllm_gaudi.v1.worker.deepseek_v41_runner import V41ModelRunner
@@ -250,9 +270,11 @@ def test_paged_state_saves_and_clears_decoded_working_set(monkeypatch):
     program = torch.nn.Module()
     program.pp_rank, program.generation, program.replay_owner = 0, 0, None
     program.register_buffer("decoded_swa", torch.zeros(2, dtype=torch.bfloat16))
+    program.register_buffer("candidate_pool", torch.zeros(3, dtype=torch.int32))
     source = torch.nn.Module()
     source.ratio = 2
     source.register_buffer("decoded_main", torch.zeros(2, dtype=torch.bfloat16))
+    source.register_buffer("indices", torch.zeros(3, dtype=torch.int32))
     program.add_module("source", source)
     block_table = torch.empty(8, dtype=torch.int32)
     program.shared = SimpleNamespace(sources={0: source}, block_table=block_table)
@@ -263,6 +285,7 @@ def test_paged_state_saves_and_clears_decoded_working_set(monkeypatch):
     program.source.decoded_main.fill_(5)
     state.activate("b", [2], reset=True)
     assert not program.decoded_swa.any() and not program.source.decoded_main.any()
+    assert (program.candidate_pool == -1).all() and (program.source.indices == -1).all()
     state.activate("a", [1])
     assert (program.decoded_swa == 3).all() and (program.source.decoded_main == 5).all()
 
@@ -340,16 +363,20 @@ def test_target_only_loading_never_reads_or_allocates_draft_tensors(tmp_path, mo
     assert output.shape == (1, 2) and aux is None
 
 
-def test_non_speculative_sampling_commits_exactly_one_real_token():
+@pytest.mark.parametrize("device_commit", (False, True))
+def test_non_speculative_sampling_commits_exactly_one_real_token(device_commit):
     from types import SimpleNamespace
     from vllm_gaudi.v1.worker.deepseek_v41_runner import V41ModelRunner
     runner = V41ModelRunner.__new__(V41ModelRunner)
     runner._token_copy = None
     committed = []
-    runner.pp = SimpleNamespace(group=SimpleNamespace(is_last_rank=True),
-                                device_commit=False,
-                                finish_single=lambda consumed, token: (consumed, [token]),
-                                commit=torch.tensor([1, 1, 1, 1]))
+    runner.pp = SimpleNamespace(
+        group=SimpleNamespace(is_last_rank=True),
+        device_commit=device_commit,
+        finish_single=lambda consumed, token: (consumed, [token]),
+        finish_single_device=lambda: (1, [1]),
+        # Poison the stale device record in CPU mode.
+        commit=torch.tensor([1, 1, 1, 1 if device_commit else 5]))
     runner.pp.commit_token = runner.pp.commit[3:4]
     runner.model = SimpleNamespace(complete_step=committed.append)
     state = RequestState("c1", [10], [], None, ([1], ))
@@ -357,7 +384,10 @@ def test_non_speculative_sampling_commits_exactly_one_real_token():
     result = runner._sample_single()
     assert result.sampled_token_ids == [[1]] and state.output == [1]
     assert committed == [1] and runner.pending is None and runner.draft_token_ids is None
-    assert runner._next_input[:2] == ("c1", 2) and runner._next_input[2].tolist() == [1]
+    if device_commit:
+        assert runner._next_input[:2] == ("c1", 2) and runner._next_input[2].tolist() == [1]
+    else:
+        assert runner._next_input is None
 
 
 def test_device_completion_waits_for_copy_and_rejects_stale_generation(monkeypatch):
@@ -435,8 +465,8 @@ def test_all_prefill_tails_across_five_groups_use_bounded_compile_cache(monkeypa
             super().__init__()
             self.layer = layer
 
-        def forward(self, residual, pre, positions, image_mask, rows, *, fp8_decode=False):
-            assert not fp8_decode
+        def forward(self, residual, pre, positions, image_mask, rows, *, fp8_decode=False, decode=False):
+            assert not fp8_decode and not decode
             return residual + self.layer + positions[:, None, None], pre, None
 
     stage = SimpleNamespace(layers=torch.nn.ModuleList(Layer(i) for i in range(20)),

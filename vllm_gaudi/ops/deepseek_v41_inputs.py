@@ -5,6 +5,7 @@ import torch
 
 
 class PositionBank:
+
     def __init__(self, length, capacity, device):
         if not 1 <= capacity <= length <= 1_048_576:
             raise ValueError("V4.1 position bank requires capacity <= context <= 1048576")
@@ -16,10 +17,11 @@ class PositionBank:
         # Python/Tensor objects.  Long-context mode instead keeps the same
         # immutable 4 MiB device table and creates only the requested narrow
         # view; no position values cross PCIe per token.
-        self._views = ({(start, count): self._values[start:start + count]
-                        for count in range(1, capacity + 1)
-                        for start in range(length - count + 1)}
-                       if length <= 512 else None)
+        self._views = ({
+            (start, count): self._values[start:start + count]
+            for count in range(1, capacity + 1)
+            for start in range(length - count + 1)
+        } if length <= 512 else None)
 
     def _view(self, start, count):
         if not 0 <= start <= self.length - count or not 1 <= count <= self.capacity:

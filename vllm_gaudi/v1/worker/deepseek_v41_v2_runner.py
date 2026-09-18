@@ -10,7 +10,7 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
 from vllm_gaudi import envs
 from vllm_gaudi.ops.deepseek_v41_config import uses_v2, validate_v2
-from vllm_gaudi.v1.worker.deepseek_v41_runner import V41ModelRunner, logger
+from vllm_gaudi.v1.worker.deepseek_v41_runner import V41ModelRunner, logger, target_search_length
 
 
 @dataclass(frozen=True)
@@ -84,8 +84,15 @@ class V41V2ModelRunner(V41ModelRunner):
         return len(tokens) == 1 and tokens.get(record.request_id) == 1 and not proposed
 
     def _prefix_authorized(self, record, scheduled):
-        return (envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX and self.pp.group.is_first_rank
-                and self._continuation_authorized(record, scheduled))
+        if not (envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX and self.pp.group.is_first_rank
+                and self._continuation_authorized(record, scheduled)):
+            return False
+        program = self.model.program
+        next_search = target_search_length(record.start + 1, 1, program.length)
+        ready = self.model.decode_prefix_ready(next_search)
+        if not ready:
+            self.audit["v2_prefix_bucket_captures"] = self.audit.get("v2_prefix_bucket_captures", 0) + 1
+        return ready
 
     def _consume_completion(self, scheduled=None):
         record = self._completion

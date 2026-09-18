@@ -136,7 +136,8 @@ request. Compressed history stays in its scheduler-owned HPU pages.
         self.working = {
             name: value
             for name, value in program.named_buffers()
-            if name.rsplit(".", 1)[-1] in ("swa", "decoded_swa", "decoded_main", "kv_history", "score_history")
+            if name.rsplit(".", 1)[-1] in ("swa", "decoded_swa", "decoded_main", "kv_history", "score_history",
+                                           "indices", "candidate_pool")
         }
         self.saved, self.active, self.blocks = {}, None, 2
         # The scheduler page table is small but long-lived.  Rebuilding a
@@ -145,8 +146,7 @@ request. Compressed history stays in its scheduler-owned HPU pages.
         # recipe buffers are live.  Apart from wasting one H2D submission per
         # token, that can enter Synapse defragmentation with buffers in use.
         # Keep one explicitly pinned source and only publish changed tables.
-        self.block_table_host = torch.empty(program.shared.block_table.shape,
-                                            dtype=torch.int32,
+        self.block_table_host = torch.empty(program.shared.block_table.shape, dtype=torch.int32,
                                             device="cpu").pin_memory("hpu")
         self.block_table_host_values = self.block_table_host.numpy()
         self.published_block_ids = None
@@ -232,8 +232,8 @@ request. Compressed history stays in its scheduler-owned HPU pages.
             self.active = None
 
     def clear(self):
-        for value in self.working.values():
-            value.zero_()
+        for name, value in self.working.items():
+            value.fill_(-1 if name.rsplit(".", 1)[-1] in ("indices", "candidate_pool") else 0)
 
     @property
     def allocated_bytes(self):

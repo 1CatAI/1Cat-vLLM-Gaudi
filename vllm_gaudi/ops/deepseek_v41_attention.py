@@ -327,7 +327,8 @@ class CSA2Attention(FusedCompressorInput, nn.Module):
             self.selection.indices.index_copy_(0, positions.long(), indices)
         return self.selection.indices.index_select(0, positions.long())
 
-    def forward(self, value, positions, ready_outputs=()):
+    def forward(self, value, positions, ready_outputs=(), *, decode=False):
+        del decode
         query_input, kv_input = self._project_qkv_input(value)
         norm = (torch.ops.custom_op.custom_deepseek_v41_attention_norm_bf16_gaudi2
                 if self.fused_norm and value.shape[0] == 1 else rms_norm)
@@ -375,12 +376,12 @@ class CSA2Attention(FusedCompressorInput, nn.Module):
             # their own FP4 writer completion in this recipe.
             main_done = compressed_completion if compressed_completion is not None else completion
             if self.mla_mme:
-                mla = (torch.ops.custom_op.custom_deepseek_v41_mla_bf16_pv_gaudi2 if self.mla_bf16_pv
-                       else torch.ops.custom_op.custom_deepseek_v41_mla_mme_gaudi2)
-                output = mla(
-                    query.contiguous(), self.shared.decoded_swa, main, indices.contiguous(), self.weights.attn_sink,
-                    self.scale, lengths.contiguous(), completion, main_done, self.decoded_swa_offset,
-                    self.length // self.ratio if self.ratio else 0)
+                mla = (torch.ops.custom_op.custom_deepseek_v41_mla_bf16_pv_gaudi2
+                       if self.mla_bf16_pv else torch.ops.custom_op.custom_deepseek_v41_mla_mme_gaudi2)
+                output = mla(query.contiguous(),
+                             self.shared.decoded_swa, main, indices.contiguous(), self.weights.attn_sink, self.scale,
+                             lengths.contiguous(), completion, main_done, self.decoded_swa_offset,
+                             self.length // self.ratio if self.ratio else 0)
             else:
                 attention = (torch.ops.custom_op.custom_deepseek_v41_decoded_attn_block_bf16_gaudi2
                              if self.block_exp else torch.ops.custom_op.custom_deepseek_v41_decoded_attn_bf16_gaudi2)

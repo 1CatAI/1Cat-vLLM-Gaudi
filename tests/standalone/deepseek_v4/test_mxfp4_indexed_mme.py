@@ -15,13 +15,8 @@ prepare_environment()
 import torch  # noqa: E402
 import habana_frameworks.torch.core  # noqa: E402, F401
 from vllm_gaudi.ops.deepseek_v4_mxfp4 import (  # noqa: E402
-    PreparedMxfp4Weight,
-    mxfp4_bf16_lut,
-    normal_e8m0_scales,
-    prepare_mxfp4_q16,
-    prepare_mxfp4_s16,
-    restore_mxfp4_scale_u8,
-    restore_mxfp4_u8,
+    PreparedMxfp4Weight, mxfp4_bf16_lut, normal_e8m0_scales, prepare_mxfp4_q16, prepare_mxfp4_s16,
+    restore_mxfp4_scale_u8, restore_mxfp4_u8,
 )
 
 torch.ops.load_library(os.environ["VLLM_HPU_DSV4_TPC_OP_LIBRARY"])
@@ -48,8 +43,8 @@ def independent_compile_contracts():
 
 def decode_reference(ids, packed, scales):
     """Independent numeric E2M1/E8M0 reference; no bit construction."""
-    table = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6.,
-                          -0., -.5, -1., -1.5, -2., -3., -4., -6.], dtype=torch.float64)
+    table = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6., -0., -.5, -1., -1.5, -2., -3., -4., -6.],
+                         dtype=torch.float64)
     result = []
     for expert in ids.flatten().tolist():
         if expert < 0 or expert >= packed.shape[0]:
@@ -80,26 +75,30 @@ def assert_decode_equal(actual, expected):
 
 
 def meta_inputs():
-    return [torch.empty(1, 4096, device="meta", dtype=torch.bfloat16),
-            torch.empty(1, 6, device="meta", dtype=torch.int32),
-            torch.empty(1, 6, device="meta", dtype=torch.bfloat16),
-            torch.empty(256, 2048, 2048, device="meta", dtype=torch.uint8),
-            torch.empty(256, 4096, 512, device="meta", dtype=torch.uint8),
-            torch.empty(256, 2048, 128, device="meta", dtype=torch.uint8),
-            torch.empty(256, 4096, 32, device="meta", dtype=torch.uint8)]
+    return [
+        torch.empty(1, 4096, device="meta", dtype=torch.bfloat16),
+        torch.empty(1, 6, device="meta", dtype=torch.int32),
+        torch.empty(1, 6, device="meta", dtype=torch.bfloat16),
+        torch.empty(256, 2048, 2048, device="meta", dtype=torch.uint8),
+        torch.empty(256, 4096, 512, device="meta", dtype=torch.uint8),
+        torch.empty(256, 2048, 128, device="meta", dtype=torch.uint8),
+        torch.empty(256, 4096, 32, device="meta", dtype=torch.uint8)
+    ]
 
 
 def prepared_meta_inputs():
-    return [torch.empty(1, 4096, device="meta", dtype=torch.bfloat16),
-            torch.empty(1, 6, device="meta", dtype=torch.int32),
-            torch.empty(1, 6, device="meta", dtype=torch.bfloat16),
-            torch.empty(256, 16, 131072, device="meta", dtype=torch.int16),
-            torch.empty(256, 32, 32768, device="meta", dtype=torch.int16),
-            torch.empty(256, 16, 16384, device="meta", dtype=torch.bfloat16),
-            torch.empty(256, 32, 4096, device="meta", dtype=torch.bfloat16),
-            torch.empty(128, device="meta", dtype=torch.bfloat16),
-            torch.empty(1, 6, device="meta", dtype=torch.int32),
-            torch.empty(1, 6, device="meta", dtype=torch.int32)]
+    return [
+        torch.empty(1, 4096, device="meta", dtype=torch.bfloat16),
+        torch.empty(1, 6, device="meta", dtype=torch.int32),
+        torch.empty(1, 6, device="meta", dtype=torch.bfloat16),
+        torch.empty(256, 16, 131072, device="meta", dtype=torch.int16),
+        torch.empty(256, 32, 32768, device="meta", dtype=torch.int16),
+        torch.empty(256, 16, 16384, device="meta", dtype=torch.bfloat16),
+        torch.empty(256, 32, 4096, device="meta", dtype=torch.bfloat16),
+        torch.empty(128, device="meta", dtype=torch.bfloat16),
+        torch.empty(1, 6, device="meta", dtype=torch.int32),
+        torch.empty(1, 6, device="meta", dtype=torch.int32)
+    ]
 
 
 def test_meta_contract():
@@ -149,12 +148,21 @@ def test_prepared_layout_and_scale_roundtrip():
     assert s16.shape == (1, 2, 16384) and s16.dtype == torch.bfloat16
     assert torch.equal(restore_mxfp4_scale_u8(s16), scales)
     lookup = mxfp4_bf16_lut("cpu")
-    expected = torch.tensor([0x00, 0x30, 0x38, 0x3C, 0x40, 0x44, 0x48, 0x4C,
-                             0x80, 0xB0, 0xB8, 0xBC, 0xC0, 0xC4, 0xC8, 0xCC], dtype=torch.uint8)
+    expected = torch.tensor(
+        [0x00, 0x30, 0x38, 0x3C, 0x40, 0x44, 0x48, 0x4C, 0x80, 0xB0, 0xB8, 0xBC, 0xC0, 0xC4, 0xC8, 0xCC],
+        dtype=torch.uint8)
     for offset in range(0, 128, 16):
         start = offset * 2
         assert torch.equal(lookup.view(torch.uint8)[start:start + 16], expected)
         assert torch.equal(lookup.view(torch.uint8)[start + 16:start + 32], expected)
+
+
+@pytest.mark.parametrize("k", [128, 1152, 5120])
+def test_prepared_layout_roundtrip_accepts_k128_tiles(k):
+    packed = torch.randint(0, 256, (2, 256, k // 2), dtype=torch.uint8)
+    q16 = prepare_mxfp4_q16(packed)
+    assert q16.shape == (2, 2, (k // 2) * 64)
+    assert torch.equal(restore_mxfp4_u8(q16), packed)
 
 
 def test_prepared_route_preserves_stock_accumulation_order():
@@ -168,7 +176,8 @@ def test_prepared_route_preserves_stock_accumulation_order():
         0.00921630859375,
         -0.007781982421875,
         -0.00102996826171875,
-    ], dtype=torch.bfloat16).reshape(6, 1)
+    ],
+                                  dtype=torch.bfloat16).reshape(6, 1)
     router_weights = torch.tensor([
         0.259765625,
         0.03759765625,
@@ -176,15 +185,16 @@ def test_prepared_route_preserves_stock_accumulation_order():
         0.1826171875,
         0.271484375,
         0.049072265625,
-    ], dtype=torch.bfloat16).reshape(1, 6)
+    ],
+                                  dtype=torch.bfloat16).reshape(1, 6)
 
     output = _prepared_mxfp4_weighted_sum_fp32(expert_outputs, router_weights)
     assert output.shape == (1, 1)
     assert int(output.view(torch.int16).item()) == 12896
 
 
-@pytest.mark.parametrize("index,dtype", [(0, torch.float16), (1, torch.int64), (2, torch.float32),
-                                         (3, torch.int8), (5, torch.float32)])
+@pytest.mark.parametrize("index,dtype", [(0, torch.float16), (1, torch.int64), (2, torch.float32), (3, torch.int8),
+                                         (5, torch.float32)])
 def test_reject_dtype(index, dtype):
     args = meta_inputs()
     args[index] = args[index].to(dtype)
@@ -277,12 +287,8 @@ def test_prepared_model_dispatch_scope(monkeypatch, enabled, tp, gaudi2, tokens,
     monkeypatch.setattr(ops, "get_config", lambda: SimpleNamespace(moe_chunk=[], moe_token_boundary=[]))
     layer = ops.VllmMixtureOfExpertsOpMXFP4(256, 256, 0, 255, tensor_parallel_size=tp)
     args = prepared_meta_inputs()
-    w13 = PreparedMxfp4Weight(
-        args[3], args[5], (256, 2048, 2048), (256, 2048, 128), True, layer._weight_generation
-    )
-    w2 = PreparedMxfp4Weight(
-        args[4], args[6], (256, 4096, 512), (256, 4096, 32), True, layer._weight_generation
-    )
+    w13 = PreparedMxfp4Weight(args[3], args[5], (256, 2048, 2048), (256, 2048, 128), True, layer._weight_generation)
+    w2 = PreparedMxfp4Weight(args[4], args[6], (256, 4096, 512), (256, 4096, 32), True, layer._weight_generation)
     layer.set_prepared_weights(w13, w2, args[7])
     if tokens != 1:
         args[:3] = [value.expand(tokens, -1).contiguous() for value in args[:3]]
@@ -313,8 +319,8 @@ def test_all_codes_scales_dynamic_ids_and_replay(normal):
     assert os.environ.get("HABANA_VISIBLE_MODULES") and os.environ.get("HLS_MODULE_ID")
     codes = torch.arange(2, 255) if normal else torch.arange(256)
     rows = len(codes)
-    packed = ((torch.arange(256).view(1, 1, 256) + torch.arange(8).view(8, 1, 1) * 7)
-              % 256).expand(8, rows, 256).byte().contiguous()
+    packed = ((torch.arange(256).view(1, 1, 256) + torch.arange(8).view(8, 1, 1) * 7) % 256).expand(
+        8, rows, 256).byte().contiguous()
     scales = codes.view(1, rows, 1).expand(8, rows, 16).byte().contiguous()
     assert normal_e8m0_scales(scales) == normal
     weights_hpu, scales_hpu = packed.to("hpu"), scales.to("hpu")
@@ -345,9 +351,9 @@ def test_native_prefill_outer_compile_retains_compatible_boundary(monkeypatch):
     with mode:
         args = [FakeTensor(mode, value, torch.device("hpu")) for value in prepared_meta_inputs()]
         layer = ops.VllmMixtureOfExpertsOpMXFP4(256, 256, 0, 255, tensor_parallel_size=2)
-        layer.set_prepared_weights(
-            PreparedMxfp4Weight(args[3], args[5], (256, 2048, 2048), (256, 2048, 128), False, 0),
-            PreparedMxfp4Weight(args[4], args[6], (256, 4096, 512), (256, 4096, 32), False, 0), args[7])
+        layer.set_prepared_weights(PreparedMxfp4Weight(args[3], args[5], (256, 2048, 2048), (256, 2048, 128), False, 0),
+                                   PreparedMxfp4Weight(args[4], args[6], (256, 4096, 512), (256, 4096, 32), False, 0),
+                                   args[7])
         incoming = [value.expand(3, -1).contiguous() for value in args[:3]]
         graphs = []
 
@@ -368,8 +374,8 @@ def test_prepared_all_codes_scales_dynamic_ids_and_replay(normal):
     assert os.environ.get("HABANA_VISIBLE_MODULES") and os.environ.get("HLS_MODULE_ID")
     scale_codes = torch.cat((torch.arange(2, 255), torch.tensor([2, 3, 254]))) if normal else torch.arange(256)
     rows = len(scale_codes)
-    packed = ((torch.arange(256).view(1, 1, 256) + torch.arange(8).view(8, 1, 1) * 7)
-              % 256).expand(8, rows, 256).byte().contiguous()
+    packed = ((torch.arange(256).view(1, 1, 256) + torch.arange(8).view(8, 1, 1) * 7) % 256).expand(
+        8, rows, 256).byte().contiguous()
     scales = scale_codes.view(1, rows, 1).expand(8, rows, 16).byte().contiguous()
     q16 = prepare_mxfp4_q16(packed).to("hpu")
     s16 = prepare_mxfp4_s16(scales).to("hpu")
@@ -404,7 +410,8 @@ def test_indexed_mme_linear(batch, normal):
     changed_ids = ids.flip(1).contiguous()
     inputs[1].copy_(changed_ids)
     expected = torch.matmul(x.float().view(batch, 1, 512),
-                            decode_reference(changed_ids, packed, scales).float().transpose(1, 2)).squeeze(1).bfloat16()
+                            decode_reference(changed_ids, packed, scales).float().transpose(1,
+                                                                                            2)).squeeze(1).bfloat16()
     torch.testing.assert_close(fn(*inputs, normal).cpu(), expected, rtol=0.008, atol=2e-4)
 
 
@@ -418,8 +425,12 @@ def test_prepared_linear_matches_indexed(batch, normal):
     ids = torch.tensor([[7, 0, 4, 1, 3, 6]], dtype=torch.int32)
     x = torch.randn(batch, 512).bfloat16()
     original_inputs = [value.to("hpu") for value in (x, ids, packed, scales)]
-    prepared_inputs = [original_inputs[0], original_inputs[1], prepare_mxfp4_q16(packed).to("hpu"),
-                       prepare_mxfp4_s16(scales).to("hpu"), mxfp4_bf16_lut("hpu")]
+    prepared_inputs = [
+        original_inputs[0], original_inputs[1],
+        prepare_mxfp4_q16(packed).to("hpu"),
+        prepare_mxfp4_s16(scales).to("hpu"),
+        mxfp4_bf16_lut("hpu")
+    ]
     indexed = torch.compile(LINEAR, backend="hpu_backend", fullgraph=True, dynamic=False)
     prepared = torch.compile(PREPARED_LINEAR, backend="hpu_backend", fullgraph=True, dynamic=False)
     expected = indexed(*original_inputs, normal).cpu()

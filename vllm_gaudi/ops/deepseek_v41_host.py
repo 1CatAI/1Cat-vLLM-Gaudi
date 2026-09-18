@@ -247,8 +247,7 @@ class EngramHost:
         if (gaudi_envs.VLLM_HPU_DSV41_ENGRAM_C1_PACKET and not gaudi_envs.VLLM_HPU_DSV41_ENGRAM_NATIVE_C1):
             raise RuntimeError("Engram C1 packets require native C1 preparation")
         if (gaudi_envs.VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT
-                and not (gaudi_envs.VLLM_HPU_DSV41_ENGRAM_C1_PACKET
-                         and gaudi_envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH
+                and not (gaudi_envs.VLLM_HPU_DSV41_ENGRAM_C1_PACKET and gaudi_envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH
                          and gaudi_envs.VLLM_HPU_DSV41_GRAPH_REPLAY)):
             raise RuntimeError("Direct Engram inputs require C1 packets and native input graph replay")
         self.c1_abi = getattr(native, "c1_abi_version", None)
@@ -256,7 +255,7 @@ class EngramHost:
             raise RuntimeError("The enabled Engram C1 path requires its matching native preparation ABI")
         if gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and self.c1_abi != 2:
             raise RuntimeError("Device Engram requires native host C1 ABI 2")
-        if max_tokens not in range(1, 513) or ring_size < 2:
+        if max_tokens not in range(1, 8193) or ring_size < 2:
             raise ValueError("Invalid bounded Engram staging geometry")
         self.directory, self.tp_rank = Path(directory), tp_rank
         manifest = json.loads((self.directory / "manifest.json").read_text())
@@ -313,8 +312,10 @@ class EngramHost:
                 heads = [self.shards[layer]["head_stop"] - self.shards[layer]["head_start"] for layer in layers]
                 first = _C1Packet(heads, self.layout.head_dim, device)
                 destination = first.device if gaudi_envs.VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT else None
-                self.c1_packets = [first] + [_C1Packet(heads, self.layout.head_dim, device, destination=destination)
-                                            for _ in range(ring_size - 1)]
+                self.c1_packets = [first] + [
+                    _C1Packet(heads, self.layout.head_dim, device, destination=destination)
+                    for _ in range(ring_size - 1)
+                ]
                 targets = [packet.targets for packet in self.c1_packets]
                 self.audit["c1_packet_bytes"] = sum(packet.host.numel() for packet in self.c1_packets)
                 self.audit["direct_input"] = destination is not None

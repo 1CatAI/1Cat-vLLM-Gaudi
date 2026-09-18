@@ -1115,7 +1115,8 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
         HclGraphInfo last;
         TORCH_CHECK(api.hcl_get_info(hcl_graphs_.back(), &last) == hcclSuccess, "HCL batch completion unavailable");
         if (segmentedPrefixConfigured()) {
-          TORCH_CHECK(expected_groups_ == 5 && expected_collectives_ == 43 && !external_prefix_ &&
+          TORCH_CHECK(NativeGraphTopology::supportsV41SegmentedPrefix(
+                          expected_groups_, expected_collectives_, external_prefix_) &&
                           mhcOverlapEnabled() && prepared_producers_.size() == hcl_graphs_.size(),
                       "Segmented V4.1 replay requires the complete PP0 input graph and explicit TP dependencies");
           api.requireSegmentedPlan();

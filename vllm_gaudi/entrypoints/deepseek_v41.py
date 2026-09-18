@@ -50,6 +50,9 @@ _C1_FASTPATH_DEFAULTS = {
     "VLLM_HPU_DSV41_V2": "1",
     "VLLM_USE_V2_MODEL_RUNNER": "1",
     "VLLM_HPU_DSV41_EXPERT_K128": "1",
+    # Reuse decoded expert weights across each scheduler prompt chunk while
+    # C1 decode continues to consume the same resident N256 allocation.
+    "VLLM_HPU_DSV41_PREFILL_GROUPED": "1",
     "VLLM_HPU_TP2_NATIVE_JOINT_PLAN": "1",
     "VLLM_HPU_TP2_PREPARED_COMM": "1",
     "VLLM_HPU_TP2_STATIC_GROUP_PLAN": "1",
@@ -185,6 +188,9 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--checkpoint-audit")
+    parser.add_argument("--n256-prepared-dir",
+                        type=Path,
+                        help="Runtime-layout expert cache from prepare_deepseek_v41_n256.py")
     parser.add_argument("--runtime-profile", default=runtime_profile or settings.get("runtime_profile"))
     parser.add_argument("--max-model-len", type=int, default=512)
     parser.add_argument("--max-num-seqs", type=int, default=1)
@@ -257,6 +263,12 @@ def main():
     if settings and not leased_run:
         from vllm_gaudi.entrypoints.serving_resources import prepare_serving_resources
         prepare_serving_resources(settings, args.model, extra)
+    n256_directory = args.n256_prepared_dir or settings.get("n256_prepared_dir")
+    if n256_directory:
+        directory = Path(n256_directory).resolve()
+        if not (directory / "manifest.json").is_file():
+            raise ValueError("Runtime N256 preparation has not published a complete manifest")
+        os.environ["VLLM_HPU_DSV41_N256_PREPARED_DIR"] = str(directory)
     prepare_environment(args.model, settings.get("sidecars"))
     loader = {} if args.checkpoint_audit is None else {"checkpoint_audit": args.checkpoint_audit}
     trace_dir = os.environ.get("VLLM_TORCH_PROFILER_DIR")
@@ -286,12 +298,13 @@ def main():
     scheduling = "--async-scheduling" if gaudi_envs.VLLM_HPU_DSV41_V2 else "--no-async-scheduling"
     sys.argv = [
         "vllm", "serve", args.model, "--host", args.host, "--port",
-        str(args.port), "--dtype", "bfloat16", "--max-model-len", str(args.max_model_len),
-        "--generation-config", "vllm", "--tensor-parallel-size", "2", "--pipeline-parallel-size", "2",
-        "--max-num-seqs", str(args.max_num_seqs), "--max-num-batched-tokens",
+        str(args.port), "--dtype", "bfloat16", "--max-model-len",
+        str(args.max_model_len), "--generation-config", "vllm", "--tensor-parallel-size", "2",
+        "--pipeline-parallel-size", "2", "--max-num-seqs",
+        str(args.max_num_seqs), "--max-num-batched-tokens",
         str(args.max_num_batched_tokens), "--load-format", "dsv41_prepared", "--model-loader-extra-config",
-        json.dumps(loader), "--mm-encoder-tp-mode", "data", "--no-enable-prefix-caching", scheduling,
-        "--block-size", str(args.block_size), *speculative, *extra
+        json.dumps(loader), "--mm-encoder-tp-mode", "data", "--no-enable-prefix-caching", scheduling, "--block-size",
+        str(args.block_size), *speculative, *extra
     ]
     from vllm.entrypoints.cli.main import main as serve
     serve()

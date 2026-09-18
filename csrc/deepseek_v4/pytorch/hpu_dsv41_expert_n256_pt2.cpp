@@ -50,8 +50,14 @@ std::vector<int64_t> decode_shape(const at::Stack& stack, bool n256 = false) {
     contract(q, at::kShort, q.device());
     contract(s, n256 ? at::kShort : at::kBFloat16, q.device());
     contract(lut, at::kBFloat16, q.device());
-    TORCH_CHECK(ids.dim() == 2 && ids.numel() > 0 && ids.numel() <= 3072,
-                "V4.1 decode expects [tokens, ordered experts] IDs");
+    // 3072 was the original C1-C6 decode ceiling.  N256 is also the normal
+    // vLLM prefill implementation, where one scheduler transaction contains
+    // up to max_num_batched_tokens=8192 and top-6 routing produces 49152 ID
+    // elements.  Keep the legacy ceiling for the old layout while allowing
+    // the N256 graph to describe a regular chunked-prefill transaction.
+    const auto max_ids = n256 ? 8192 * 6 : 3072;
+    TORCH_CHECK(ids.dim() == 2 && ids.numel() > 0 && ids.numel() <= max_ids,
+                "V4.1 decode expects [tokens, ordered experts] IDs within the selected layout ceiling");
     TORCH_CHECK(q.dim() == 3 && q.size(0) > 0 && q.size(0) <= 384 && q.size(1) > 0 && q.size(1) <= (n256 ? 20 : 40) &&
                 q.size(2) > 0 && q.size(2) <= (n256 ? 327680 : 163840) && q.size(2) % (n256 ? 8192 : 4096) == 0,
                 "V4.1 Q16 expects [E,N/128,(K/2)*64], with K a multiple of 128");
@@ -80,9 +86,9 @@ std::vector<int64_t> moe_shape(const at::Stack& stack, bool n256 = false) {
 void fp8_contract(const at::Stack& stack, bool n256 = false) {
     moe_shape(stack, n256);
     const auto x = stack.at(0).toTensor(), ids = stack.at(1).toTensor();
-    TORCH_CHECK((n256 ? x.size(0) >= 1 && x.size(0) <= 6 : x.size(0) == 1) &&
+    TORCH_CHECK((n256 ? x.size(0) >= 1 && x.size(0) <= 8192 : x.size(0) == 1) &&
                     ids.size(1) == 6 && stack.back().toBool(),
-                "V4.1 FP8 MoE requires top6, a supported token bucket and finite normal-scale qualification");
+                "V4.1 FP8 MoE requires top6, a C1-C8192 N256 token bucket and finite normal-scale qualification");
     for (int index : {0, 1}) {
         const auto channel = stack.at(8 + index).toTensor(), q = stack.at(3 + index).toTensor();
         contract(channel, at::kBFloat16, x.device());

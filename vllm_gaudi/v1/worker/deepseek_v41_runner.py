@@ -40,9 +40,11 @@ logger = init_logger()
 VERIFY_METADATA_SIZE = 7
 VERIFY_PROPOSED_SIZE = 5
 VERIFY_CONTROL_SIZE = VERIFY_METADATA_SIZE + VERIFY_PROPOSED_SIZE
-PREFILL_BLOCK_TOKENS = 128
-LONG_CONTEXT_PREFILL_BLOCK_TOKENS = 64
-PREFILL_MAX_INFLIGHT_BLOCKS = 4
+PREFILL_BLOCK_TOKENS = 8192
+# Grouped prefill reuses decoded expert weights across the scheduler chunk.
+# Occupancy buckets bound temporary memory without reducing scheduler admission.
+# C6 remains DSpark-only and C1 decode is unchanged.
+PREFILL_MAX_INFLIGHT_BLOCKS = 1
 
 
 def profile_phase(name):
@@ -114,7 +116,7 @@ def target_chunks(tokens, block_tokens=PREFILL_BLOCK_TOKENS):
     prefill geometry.
     """
     if block_tokens < 1 or block_tokens > PREFILL_BLOCK_TOKENS:
-        raise ValueError("V4.1 prefill blocks must be no larger than 128")
+        raise ValueError("V4.1 prefill blocks must be no larger than max_num_batched_tokens=8192")
     offset = 0
     while offset < len(tokens):
         size = min(block_tokens, len(tokens) - offset)
@@ -184,6 +186,13 @@ class PPBuffers:
             self.hidden = torch.empty(capacity, 4, 5120, dtype=torch.bfloat16, device=device)
             self.pre = torch.empty(capacity, 4, dtype=torch.float32, device=device)
             self.commit = torch.empty(4, dtype=torch.int32, device=device)
+            # Prompt completion is four host-generated integers.  Keep that
+            # control record on the PP gloo group: lowering either pageable or
+            # pinned H2D ``copy_`` after the large prefill graph can make the
+            # eager Bridge create an invalid reinterpret-cast (dtype 524288).
+            # Decode still uses ``commit`` and the native device-completion
+            # path, so this does not add a host hand-off to steady-state C1.
+            self.commit_host = torch.empty(4, dtype=torch.int32, device="cpu")
             self.commit_token = self.commit[3:4]
             self.commit_row = self.commit.view(1, 4)
             if self.device_commit_enabled:
@@ -441,9 +450,13 @@ class PPBuffers:
         self.generation += 1
         if self.group.is_last_rank:
             record = [self.generation, consumed, int(token is not None), -1 if token is None else token]
-            self.commit.copy_(torch.tensor(record, dtype=torch.int32, device="cpu"))
-        self.group.broadcast(self.commit, src=1)
-        record = self.commit.cpu().tolist()
+            self.commit_host.copy_(torch.tensor(record, dtype=torch.int32, device="cpu"))
+        # This path runs once at the prompt/decode boundary.  A CPU collective
+        # is both smaller and more reliable than routing a 16-byte host record
+        # through HPU eager lowering while the prefill recipes still own their
+        # workspaces.  ``src`` is the global rank of local PP rank 1.
+        dist.broadcast(self.commit_host, src=self.group.ranks[1], group=self.group.cpu_group)
+        record = self.commit_host.tolist()
         if record[0] != self.generation or record[2] not in (0, 1):
             raise RuntimeError("Stale or invalid PP ordinary-token completion")
         self.commits += 1
@@ -697,8 +710,11 @@ class V41ModelRunner:
                             device_commit=False if self.v2_completion else None)
         self.input_ids = torch.empty(PREFILL_BLOCK_TOKENS, dtype=torch.int64, device=self.device)
         self.positions = torch.empty(PREFILL_BLOCK_TOKENS, dtype=torch.int32, device=self.device)
-        self.input_views = {count: self.input_ids[:count] for count in range(1, PREFILL_BLOCK_TOKENS + 1)}
-        self.position_views = {count: self.positions[:count] for count in range(1, PREFILL_BLOCK_TOKENS + 1)}
+        # Decode/DSpark reuse exact Tensor objects. Large-M prompt buckets are
+        # created on demand, avoiding sixteen thousand permanent Python Tensor
+        # wrappers merely to represent all possible lengths through C8192.
+        self.input_views = {count: self.input_ids[:count] for count in range(1, 129)}
+        self.position_views = {count: self.positions[:count] for count in range(1, 129)}
         self.direct_token_ids = (envs.VLLM_HPU_DSV41_DIRECT_TOKEN_IDS and not self.use_dspark)
         self.decode_ids = (torch.empty(1, dtype=torch.int32, device=self.device) if self.direct_token_ids else None)
         self.position_bank = None
@@ -803,10 +819,7 @@ class V41ModelRunner:
             self.verify_ring = VerifyRing(self.device, last_rank=False)
         elif self.pp.group.is_last_rank:
             sampler = self.model.program.sample_greedy_token if self.v2_completion else self.model.program.sample_greedy
-            self.sample_target = torch.compile(sampler,
-                                               backend="hpu_backend",
-                                               fullgraph=True,
-                                               dynamic=False)
+            self.sample_target = torch.compile(sampler, backend="hpu_backend", fullgraph=True, dynamic=False)
             if self.pp.device_commit_enabled:
                 self.sample_target_commit = torch.compile(self.model.program.sample_greedy_commit,
                                                           backend="hpu_backend",
@@ -965,17 +978,12 @@ class V41ModelRunner:
             self.encoder_cache[feature.identifier] = scatter_image_embeddings(output, feature.mm_position.is_embed)
 
     @profile_phase("target")
-    def _forward(self,
-                 request_id,
-                 tokens,
-                 start,
-                 *,
-                 decode,
-                 reset=False,
-                 request=None,
-                 search_length=None):
+    def _forward(self, request_id, tokens, start, *, decode, reset=False, request=None, search_length=None):
         count = len(tokens)
-        ids, positions = self.input_views[count], self.position_views[count]
+        # Avoid evaluating a fallback slice when a test or a C1-only runner
+        # intentionally owns just the persistent captured view.
+        ids = self.input_views[count] if count in self.input_views else self.input_ids[:count]
+        positions = self.position_views[count] if count in self.position_views else self.positions[:count]
         # A scheduler may feed a normal prompt one token at a time.  The
         # resulting model transaction has exactly the same C1 tensor geometry
         # and cache writes as decode; only sampling/commit semantics remain
@@ -1022,13 +1030,14 @@ class V41ModelRunner:
                 ids = self.input_control[:count]
                 if self.use_dspark:
                     self.positions[:count].copy_(positions[:count])
-                    positions = self.position_views[count]
+                    positions = self.position_views.get(count, self.positions[:count])
                 else:
                     positions = positions[:count]
             else:
                 self.input_ids[:count].copy_(self.input_control[:count])
                 self.positions[:count].copy_(positions[:count])
-                ids, positions = self.input_views[count], self.position_views[count]
+                ids = self.input_views.get(count, self.input_ids[:count])
+                positions = self.position_views.get(count, self.positions[:count])
         else:
             if (not self.use_dspark and decode and count == 1 and self._next_input is not None
                     and self._next_input[:2] == (request_id, start)):
@@ -1043,10 +1052,12 @@ class V41ModelRunner:
             else:
                 positions.copy_(torch.arange(start, start + count, dtype=torch.int32, device="cpu"))
         self._round_phase("inputs_staged_ns")
-        # Choose the qualified submission path before any request state write.
-        # Longer CSA2 buckets use compiled recipes until native capture is qualified.
-        use_replay = (getattr(self.model, "native", False) and start + count <= 1024
-                      and (decode or c1_replay or (self.use_dspark and request is not None)))
+        # Decode always uses a bucket-specific native plan, including paged
+        # CSA2 buckets above 1024. Prompt C1 capture remains bounded to the
+        # qualified prefix range so a one-token prefill tail cannot create a
+        # long-search graph variant. StageReplay keys plans by search bucket.
+        use_replay = (getattr(self.model, "native", False) and
+                      (decode or (start + count <= 1024 and (c1_replay or (self.use_dspark and request is not None)))))
         self.model.prepare_step(request_id, tokens, is_decode=graph_c1, reset=reset, use_replay=use_replay)
         self._round_phase("engram_prepared_ns")
         timing = getattr(self, "verify_timing", None)
@@ -1382,15 +1393,10 @@ class V41ModelRunner:
             raise RuntimeError(f"Unexpected V4.1 decode shape: tokens={count}, drafts={len(proposed)}")
         if self.verify_timing:
             self.verify_timing.begin(req_id, self.pp.generation + 1, count, len(proposed))
-        # The 1M paged configuration leaves substantially less transient HBM
-        # than the bounded 512-token service.  C128 is valid mathematically,
-        # but its first compiled recipe can exceed that transient budget while
-        # the complete page pool is resident.  Keep the scheduler admission at
-        # 8192 and tile only the stage working set to C64.  C6 remains reserved
-        # for DSpark and is never used for ordinary prefill.
-        prefill_block_tokens = (LONG_CONTEXT_PREFILL_BLOCK_TOKENS
-                                if self.model_config.max_model_len > 512 else PREFILL_BLOCK_TOKENS)
-        chunks = [(0, tokens)] if decode else target_chunks(tokens, prefill_block_tokens)
+        # Match vLLM chunked-prefill semantics: one scheduler transaction is a
+        # real large-M model invocation up to max_num_batched_tokens. Internal
+        # C1/C6 decode tiling would reread expert weights for every prompt row.
+        chunks = [(0, tokens)] if decode else target_chunks(tokens, PREFILL_BLOCK_TOKENS)
         program = getattr(self.model, "program", None)
         transaction_search = (target_search_length(start, count, program.length)
                               if not decode and program is not None and program.length > 512 else None)
@@ -1405,15 +1411,8 @@ class V41ModelRunner:
             if offset + len(chunk) < count:
                 self._insert(self.model.last_aux, self.positions[:len(chunk)])
                 self.model.complete_step(len(chunk))
-                # A scheduler transaction can contain 8192 prompt tokens,
-                # i.e. 128 C64 graphs in the 1M configuration.  Letting all of
-                # them remain in flight
-                # retains several GiB of compiled-graph temporaries and can
-                # force Synapse to defragment while buffers are still live.
-                # Bound that lifetime without changing the scheduler's 8192
-                # admission limit or the C128 model geometry.  PP work must be
-                # complete before the device drain so both stages advance the
-                # same prefix generation.
+                # More than one scheduler transaction may only remain in
+                # flight after its state and PP generation have committed.
                 if (block_index + 1) % PREFILL_MAX_INFLIGHT_BLOCKS == 0:
                     self.pp.drain()
                     torch.hpu.synchronize()
@@ -1518,7 +1517,12 @@ class V41ModelRunner:
             raise RuntimeError("Ordinary PP completion did not consume the complete input chunk")
         self.model.complete_step(consumed)
         request.output.extend(output)
-        self._next_input = ((request.req_id, start + count, self.pp.commit_token) if output else None)
+        # CPU completion publishes commit_host only. Its device commit tensor
+        # is uninitialized (or belongs to an older generation); binding that
+        # tensor here feeds stale IDs into otherwise correct native replay.
+        # Only device completion owns a current device token. CPU completion
+        # uses the scheduler/request token through the normal input staging.
+        self._next_input = ((request.req_id, start + count, self.pp.commit_token) if output and device_commit else None)
         self._token_copy = None
         self.pending = self.draft_token_ids = None
         if not self.pp.group.is_last_rank:

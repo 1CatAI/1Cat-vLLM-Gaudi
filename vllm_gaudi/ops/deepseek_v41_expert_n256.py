@@ -76,7 +76,15 @@ def restore_expert(q, planes):
 
 def load_projection(shard, prefix, device):
     """Load directly into the sole resident Q16/scale allocation, one expert at a time."""
+    import os
     import torch
+    prepared = os.environ.get("VLLM_HPU_DSV41_N256_PREPARED_DIR")
+    if prepared:
+        from vllm_gaudi.ops.deepseek_v41_n256_shards import N256PreparedShard
+        if not hasattr(shard, "_n256_runtime_shard"):
+            shard._n256_runtime_shard = N256PreparedShard(prepared, shard)
+        shard.check_identity()
+        return shard._n256_runtime_shard.projection(prefix, device)
     source_q = shard.catalog[prefix + "_q16"]
     source_s = shard.catalog[prefix + "_s16"]
     experts, blocks, stream = source_q.shape

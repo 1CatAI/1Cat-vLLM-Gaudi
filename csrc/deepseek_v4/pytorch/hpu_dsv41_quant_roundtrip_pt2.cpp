@@ -20,9 +20,9 @@ const bool registered = [] {
 
 void validate(const at::Tensor& input) {
     TORCH_CHECK(input.scalar_type() == at::kBFloat16 && input.dim() == 2 && input.is_contiguous() &&
-                input.size(0) >= 1 && input.size(0) <= 512 && input.size(1) >= 32 &&
+                input.size(0) >= 1 && input.size(0) <= 8192 && input.size(1) >= 32 &&
                 input.size(1) <= 131072 && input.size(1) % 32 == 0,
-                "V4.1 activation quantization requires contiguous BF16 [T,K], T<=512, K%32=0");
+                "V4.1 activation quantization requires contiguous BF16 [T,K], T<=8192, K%32=0");
 }
 at::Tensor run(const at::Tensor& input) {
     validate(input);

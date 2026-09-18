@@ -96,7 +96,7 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             self.engram_host = EngramHost(self.directory,
                                           self.tp_rank,
                                           self.device,
-                                          max_tokens=128,
+                                          max_tokens=8192,
                                           checkpoint_audit=self.extra.get("checkpoint_audit"),
                                           force_lock=self.extra.get("engram_force_lock", False))
             self._bind_vision()
@@ -225,8 +225,8 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 value.device)
 
     def begin_decode_prefix(self, input_ids, positions):
-        if (self.pp_rank != 0 or not self.native or not envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX
-                or self.program.dspark or input_ids.numel() != 1):
+        if (self.pp_rank != 0 or not self.native or not envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX or self.program.dspark
+                or input_ids.numel() != 1):
             raise RuntimeError("V4.1 decode prefix is outside the qualified PP0 C1 path")
         if self.step_ticket is not None or self._decode_prefix is not None:
             raise RuntimeError("V4.1 decode prefix overlaps an unfinished input transaction")
@@ -238,15 +238,19 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
     def decode_prefix_pending(self):
         return self._decode_prefix is not None
 
+    def decode_prefix_ready(self, search_length):
+        """Whether segmented PP0 replay is safe for the next search bucket."""
+        return (self.pp_rank == 0 and self.native and envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX
+                and not self.program.dspark and self.program.replay_owner.input_variant_ready(search_length))
+
     def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None, **kwargs):
         del kwargs
         if not self.program.loaded:
             raise RuntimeError("Prepared V4.1 weights have not been loaded")
         input_ids, positions = input_ids.reshape(-1), positions.reshape(-1).to(torch.int32)
         pp_wire = None
-        search = getattr(self.program, "search_length", 512)
         fused_text_io = (self.pp_rank == 0 and envs.VLLM_HPU_DSV41_FUSED_STAGE_IO and self.native
-                         and self.step_use_replay and search <= 1024 and inputs_embeds is None)
+                         and self.step_use_replay and inputs_embeds is None)
         native_input = (self.pp_rank == 0 and self.native and self.step_use_replay
                         and envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH and not self.program.dspark and inputs_embeds is None
                         and input_ids.numel() == 1 and not fused_text_io)
@@ -260,8 +264,7 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 residual = values.unsqueeze(1).expand(-1, 4, -1).contiguous()
                 pre = torch.zeros(input_ids.numel(), 4, device=values.device, dtype=torch.float32)
                 pre[:, 0] = 1
-            if (envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and self.step_use_replay
-                    and input_ids.numel() == 1):
+            if (envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and self.step_use_replay and input_ids.numel() == 1):
                 layer1 = self.engram_host.consume_device_c1(self._step_request_id)
                 buffers = self.engram_host.wait(self.step_ticket)
                 engram = (layer1, buffers[1])
@@ -278,14 +281,11 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             else:
                 residual = pre = None
             engram = ()
-        search = getattr(self.program, "search_length", 512)
-        if search > 1024:
-            # A compiled long-prefill stage retains graph objects for the full
-            # 1M paged state pool.  Even one-layer groups fail Synapse graph
-            # construction once the four rank-local weights and KV capacity
-            # are resident.  Run only this C64 prefill tile through the eager
-            # program.  C1 decode remains on the native four-layer replay, so
-            # long-context support does not perturb the measured decode path.
+        if self.program.length > 512 and not self.step_use_replay:
+            # Keep prompt geometries out of the shape-specialized compile
+            # cache in the 1M profile. Prefill remains one large-M C8192 model
+            # invocation; its MoE and attention implementations own the
+            # bounded internal weight/index workspaces.
             execute = self.program
         else:
             execute = self.program.replay_owner if self.native and self.step_use_replay else self.ordinary

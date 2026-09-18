@@ -32,6 +32,23 @@ are in progress.
 
 ## Performance Tuning Parameters
 
+`VLLM_HPU_DSV41_N256_PREPARED_DIR` selects immutable TP2×PP2 expert files
+created by `tools/prepare_deepseek_v41_n256.py PREPARED_CHECKPOINT OUTPUT`.
+The tool prepares the N256 layout and channel scales once, verifies exact
+recovery of every expert's original compressed bytes, and publishes the
+manifest only after all four rank files have been completed and hashed.
+The normal N256 loader then copies bounded chunks directly to the single
+resident compressed allocation, retaining the host file cache for restarts.
+Source, topology, tensor layout and quantization fingerprints must match;
+invalid or incomplete caches fail explicitly. Dense weights and Engram
+continue to use their existing sources. The variable is unset by default.
+
+The dedicated V4.1 entrypoint enables `VLLM_HPU_DSV41_PREFILL_GROUPED`
+for bounded expert grouping in V4.1
+prefill on the resident N256 compressed weights. It retains clamp, routing,
+BF16 rounding and ordered reduction boundaries, while ordinary C1 decode
+continues to use its compiled native path. Disabled by default.
+
 | Parameter name               | Description                                                   | Default value |
 | ---------------------------- | ------------------------------------------------------------- | ------------- |
 | `VLLM_GRAPH_RESERVED_MEM`    | Percentage of memory dedicated to HPUGraph capture.           | `0.1`         |

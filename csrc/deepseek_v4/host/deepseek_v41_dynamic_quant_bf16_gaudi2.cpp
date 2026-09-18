@@ -23,7 +23,13 @@ tpc_lib_api::GlueCodeReturn DeepseekV41DynamicQuantBf16Gaudi2::GetGcDefinitions(
         return GLUE_INCOMPATIBLE_DATA_TYPE;
     const auto width = output.maxSizes[0];
     const auto rows = input.maxSizes[1];
-    if (input.dims != 2 || output.dims != 2 || scale.dims != 2 || rows < 1 || rows > 36 ||
+    // The original C1 route used at most six experts and therefore exposed a
+    // 36-row contract (6 tokens x top-6).  The same quantizer is now used by
+    // the normal vLLM chunked-prefill path: the non-broadcast W2 input has
+    // ``tokens * top6`` rows, up to 8192*6.  One index-space point still owns
+    // one row, so the TPC body does not need a different algorithm; only the
+    // host shape contract must stop rejecting valid prefill tiles.
+    if (input.dims != 2 || output.dims != 2 || scale.dims != 2 || rows < 1 || rows > 49152 ||
         rows > std::numeric_limits<int32_t>::max() || width < 256 || width > 5120 || width % 128 ||
         input.maxSizes[0] != width || output.maxSizes[1] != rows ||
         scale.maxSizes[0] != 1 || scale.maxSizes[1] != rows)
