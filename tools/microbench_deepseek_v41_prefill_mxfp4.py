@@ -25,6 +25,7 @@ from vllm_gaudi.ops.deepseek_v4_mxfp4 import (
     restore_mxfp4_u8,
 )
 
+
 DTYPES = {
     "I16": torch.int16,
     "BF16": torch.bfloat16,
@@ -78,19 +79,23 @@ def main() -> None:
     weights2 = tuple(w2[index] for index in range(args.experts))
     scales13 = tuple(s13[index] for index in range(args.experts))
     scales2 = tuple(s2[index] for index in range(args.experts))
-    compiled = torch.compile(_mxfp4_fused_fwd, backend=_mxfp4_hpu_backend, fullgraph=True, dynamic=False)
+    compiled = torch.compile(_mxfp4_fused_fwd,
+                             backend=_mxfp4_hpu_backend,
+                             fullgraph=True,
+                             dynamic=False)
 
     results = []
     for tokens in args.tokens:
         torch.manual_seed(17 + tokens)
         hidden = torch.randn(tokens, 5120, dtype=torch.bfloat16, device="hpu")
-        ids = (torch.arange(tokens * 6, dtype=torch.int32, device="hpu").reshape(tokens, 6).remainder(args.experts))
+        ids = (torch.arange(tokens * 6, dtype=torch.int32, device="hpu").reshape(tokens, 6)
+               .remainder(args.experts))
         routing = torch.rand(tokens, 6, dtype=torch.bfloat16, device="hpu")
         routing /= routing.sum(-1, keepdim=True)
 
-        def invoke(hidden=hidden, ids=ids, routing=routing):
-            return compiled(hidden, ids, routing, weights13, weights2, scales13, scales2, 32, "silu", 0,
-                            args.experts - 1, 0, 0)
+        def invoke(_hidden=hidden, _ids=ids, _routing=routing):
+            return compiled(_hidden, _ids, _routing, weights13, weights2, scales13, scales2,
+                            32, "silu", 0, args.experts - 1, 0, 0)
 
         output = None
         for _ in range(args.warmup):

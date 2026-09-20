@@ -3,6 +3,9 @@
 #ifndef DSV41_N256_FP8
 #define DSV41_N256_FP8 1
 #endif
+#ifndef DSV41_N256_PREFETCH
+#define DSV41_N256_PREFETCH 8
+#endif
 
 static inline ushort128 exact_bf16(ushort128 nibble, ushort128 code)
 {
@@ -63,7 +66,8 @@ void main(tensor ids, tensor q16, tensor planes, tensor lookup, tensor output)
                 int5 source = {group * 2048, block, expert};
                 int5 destination = {row, group * 32, slot};
 #if DSV41_N256_FP8
-                // Two batches retain an explicit, bounded load look-ahead.
+                // Keep the reference eight-vector schedule available so the
+                // production consumer can compare both binaries in one graph.
                 uchar256 pending0 = v_u8_ld_tnsr_b(source, q16, SW_UNPACK | SW_UNPCK_4_TO_8);
                 source[0] += 64;
                 uchar256 pending1 = v_u8_ld_tnsr_b(source, q16, SW_UNPACK | SW_UNPCK_4_TO_8);
@@ -80,7 +84,27 @@ void main(tensor ids, tensor q16, tensor planes, tensor lookup, tensor output)
                 source[0] += 64;
                 uchar256 pending7 = v_u8_ld_tnsr_b(source, q16, SW_UNPACK | SW_UNPCK_4_TO_8);
                 source[0] += 64;
+#if DSV41_N256_PREFETCH == 16
+                uchar256 pending8 = v_u8_ld_tnsr_b(source, q16, SW_UNPACK | SW_UNPCK_4_TO_8);
+                source[0] += 64;
+                uchar256 pending9 = v_u8_ld_tnsr_b(source, q16, SW_UNPACK | SW_UNPCK_4_TO_8);
+                source[0] += 64;
+                uchar256 pending10 = v_u8_ld_tnsr_b(source, q16, SW_UNPACK | SW_UNPCK_4_TO_8);
+                source[0] += 64;
+                uchar256 pending11 = v_u8_ld_tnsr_b(source, q16, SW_UNPACK | SW_UNPCK_4_TO_8);
+                source[0] += 64;
+                uchar256 pending12 = v_u8_ld_tnsr_b(source, q16, SW_UNPACK | SW_UNPCK_4_TO_8);
+                source[0] += 64;
+                uchar256 pending13 = v_u8_ld_tnsr_b(source, q16, SW_UNPACK | SW_UNPCK_4_TO_8);
+                source[0] += 64;
+                uchar256 pending14 = v_u8_ld_tnsr_b(source, q16, SW_UNPACK | SW_UNPCK_4_TO_8);
+                source[0] += 64;
+                uchar256 pending15 = v_u8_ld_tnsr_b(source, q16, SW_UNPACK | SW_UNPCK_4_TO_8);
+                source[0] += 64;
+                for (int batch = 0; batch < 1; ++batch) {
+#else
                 for (int batch = 0; batch < 3; ++batch) {
+#endif
                     const uchar256 next0 = v_u8_ld_tnsr_b(source, q16, SW_UNPACK | SW_UNPCK_4_TO_8);
                     source[0] += 64;
                     const uchar256 next1 = v_u8_ld_tnsr_b(source, q16, SW_UNPACK | SW_UNPCK_4_TO_8);
@@ -97,6 +121,24 @@ void main(tensor ids, tensor q16, tensor planes, tensor lookup, tensor output)
                     source[0] += 64;
                     const uchar256 next7 = v_u8_ld_tnsr_b(source, q16, SW_UNPACK | SW_UNPCK_4_TO_8);
                     source[0] += 64;
+#if DSV41_N256_PREFETCH == 16
+                    const uchar256 next8 = v_u8_ld_tnsr_b(source, q16, SW_UNPACK | SW_UNPCK_4_TO_8);
+                    source[0] += 64;
+                    const uchar256 next9 = v_u8_ld_tnsr_b(source, q16, SW_UNPACK | SW_UNPCK_4_TO_8);
+                    source[0] += 64;
+                    const uchar256 next10 = v_u8_ld_tnsr_b(source, q16, SW_UNPACK | SW_UNPCK_4_TO_8);
+                    source[0] += 64;
+                    const uchar256 next11 = v_u8_ld_tnsr_b(source, q16, SW_UNPACK | SW_UNPCK_4_TO_8);
+                    source[0] += 64;
+                    const uchar256 next12 = v_u8_ld_tnsr_b(source, q16, SW_UNPACK | SW_UNPCK_4_TO_8);
+                    source[0] += 64;
+                    const uchar256 next13 = v_u8_ld_tnsr_b(source, q16, SW_UNPACK | SW_UNPCK_4_TO_8);
+                    source[0] += 64;
+                    const uchar256 next14 = v_u8_ld_tnsr_b(source, q16, SW_UNPACK | SW_UNPCK_4_TO_8);
+                    source[0] += 64;
+                    const uchar256 next15 = v_u8_ld_tnsr_b(source, q16, SW_UNPACK | SW_UNPCK_4_TO_8);
+                    source[0] += 64;
+#endif
                     DSV41_N256_STORE(pending0);
                     DSV41_N256_STORE(pending1);
                     DSV41_N256_STORE(pending2);
@@ -105,6 +147,16 @@ void main(tensor ids, tensor q16, tensor planes, tensor lookup, tensor output)
                     DSV41_N256_STORE(pending5);
                     DSV41_N256_STORE(pending6);
                     DSV41_N256_STORE(pending7);
+#if DSV41_N256_PREFETCH == 16
+                    DSV41_N256_STORE(pending8);
+                    DSV41_N256_STORE(pending9);
+                    DSV41_N256_STORE(pending10);
+                    DSV41_N256_STORE(pending11);
+                    DSV41_N256_STORE(pending12);
+                    DSV41_N256_STORE(pending13);
+                    DSV41_N256_STORE(pending14);
+                    DSV41_N256_STORE(pending15);
+#endif
                     pending0 = next0;
                     pending1 = next1;
                     pending2 = next2;
@@ -113,6 +165,16 @@ void main(tensor ids, tensor q16, tensor planes, tensor lookup, tensor output)
                     pending5 = next5;
                     pending6 = next6;
                     pending7 = next7;
+#if DSV41_N256_PREFETCH == 16
+                    pending8 = next8;
+                    pending9 = next9;
+                    pending10 = next10;
+                    pending11 = next11;
+                    pending12 = next12;
+                    pending13 = next13;
+                    pending14 = next14;
+                    pending15 = next15;
+#endif
                 }
                 DSV41_N256_STORE(pending0);
                 DSV41_N256_STORE(pending1);
@@ -122,6 +184,16 @@ void main(tensor ids, tensor q16, tensor planes, tensor lookup, tensor output)
                 DSV41_N256_STORE(pending5);
                 DSV41_N256_STORE(pending6);
                 DSV41_N256_STORE(pending7);
+#if DSV41_N256_PREFETCH == 16
+                DSV41_N256_STORE(pending8);
+                DSV41_N256_STORE(pending9);
+                DSV41_N256_STORE(pending10);
+                DSV41_N256_STORE(pending11);
+                DSV41_N256_STORE(pending12);
+                DSV41_N256_STORE(pending13);
+                DSV41_N256_STORE(pending14);
+                DSV41_N256_STORE(pending15);
+#endif
 #else
                 #pragma unroll (8)
                 for (int part = 0; part < 32; ++part) {

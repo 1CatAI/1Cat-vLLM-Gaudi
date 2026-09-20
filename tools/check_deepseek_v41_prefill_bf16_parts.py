@@ -14,6 +14,7 @@ import torch
 from vllm_gaudi.ops.deepseek_v41_shard_loader import PreparedV41Shard
 from vllm_gaudi.ops.deepseek_v4_mxfp4 import mxfp4_bf16_lut
 
+
 DTYPES = {"I16": torch.int16, "BF16": torch.bfloat16}
 
 
@@ -30,7 +31,8 @@ def read_experts(shard, name, count):
 
 
 def decode(ids, q, s, lookup):
-    return torch.ops.custom_op.custom_deepseek_v41_expert_n256_bf16_gaudi2(ids, q, s, lookup, False)
+    return torch.ops.custom_op.custom_deepseek_v41_expert_n256_bf16_gaudi2(
+        ids, q, s, lookup, False)
 
 
 def bf16_moe(x, ids, routing, w13, w2):
@@ -67,7 +69,8 @@ def main():
         from vllm_gaudi.ops.deepseek_v41_expert_n256 import prepare_expert
         q_values, s_values = [], []
         for expert in range(args.experts):
-            q, scales, _, _ = prepare_expert(q13_cpu[expert].numpy(), s13_cpu[expert].view(torch.uint16).numpy())
+            q, scales, _, _ = prepare_expert(q13_cpu[expert].numpy(),
+                                              s13_cpu[expert].view(torch.uint16).numpy())
             q_values.append(q)
             s_values.append(scales)
         q13_cpu = torch.from_numpy(np.stack(q_values))
@@ -82,7 +85,8 @@ def main():
         result = program(local_ids, q13, s13, lookup)
     else:
         x = torch.randn(args.tokens, 5120, dtype=torch.bfloat16, device="hpu")
-        ids = (torch.arange(args.tokens * 6, dtype=torch.int64, device="hpu").reshape(args.tokens, 6) % args.experts)
+        ids = (torch.arange(args.tokens * 6, dtype=torch.int64, device="hpu")
+               .reshape(args.tokens, 6) % args.experts)
         routing = torch.rand(args.tokens, 6, dtype=torch.bfloat16, device="hpu")
         routing = routing / routing.sum(-1, keepdim=True)
         # Standard fused-MoE weight contract is [N,K].

@@ -79,7 +79,9 @@ def test_prompt_completion_uses_cpu_pp_control_record(monkeypatch):
     from vllm_gaudi.v1.worker import deepseek_v41_runner as runner
 
     cpu_group = object()
-    group = SimpleNamespace(is_last_rank=True, ranks=[0, 2], cpu_group=cpu_group)
+    group = SimpleNamespace(is_last_rank=True,
+                            ranks=[0, 2],
+                            cpu_group=cpu_group)
     monkeypatch.setattr(runner.envs, "VLLM_HPU_DSV41_PACKED_PP", False)
     monkeypatch.setattr(runner, "get_pp_group", lambda: group)
     broadcasts = []
@@ -274,6 +276,7 @@ def test_paged_state_saves_and_clears_decoded_working_set(monkeypatch):
     source = torch.nn.Module()
     source.ratio = 2
     source.register_buffer("decoded_main", torch.zeros(2, dtype=torch.bfloat16))
+    source.register_buffer("decoded_index_hot", torch.zeros(4, dtype=torch.bfloat16))
     source.register_buffer("indices", torch.zeros(3, dtype=torch.int32))
     program.add_module("source", source)
     block_table = torch.empty(8, dtype=torch.int32)
@@ -283,11 +286,14 @@ def test_paged_state_saves_and_clears_decoded_working_set(monkeypatch):
     state.activate("a", [1], reset=True)
     program.decoded_swa.fill_(3)
     program.source.decoded_main.fill_(5)
+    program.source.decoded_index_hot.fill_(7)
     state.activate("b", [2], reset=True)
-    assert not program.decoded_swa.any() and not program.source.decoded_main.any()
+    assert (not program.decoded_swa.any() and not program.source.decoded_main.any()
+            and not program.source.decoded_index_hot.any())
     assert (program.candidate_pool == -1).all() and (program.source.indices == -1).all()
     state.activate("a", [1])
-    assert (program.decoded_swa == 3).all() and (program.source.decoded_main == 5).all()
+    assert ((program.decoded_swa == 3).all() and (program.source.decoded_main == 5).all()
+            and (program.source.decoded_index_hot == 7).all())
 
 
 def test_target_capture_does_not_claim_draft_only_state():
@@ -370,13 +376,12 @@ def test_non_speculative_sampling_commits_exactly_one_real_token(device_commit):
     runner = V41ModelRunner.__new__(V41ModelRunner)
     runner._token_copy = None
     committed = []
-    runner.pp = SimpleNamespace(
-        group=SimpleNamespace(is_last_rank=True),
-        device_commit=device_commit,
-        finish_single=lambda consumed, token: (consumed, [token]),
-        finish_single_device=lambda: (1, [1]),
-        # Poison the stale device record in CPU mode.
-        commit=torch.tensor([1, 1, 1, 1 if device_commit else 5]))
+    runner.pp = SimpleNamespace(group=SimpleNamespace(is_last_rank=True),
+                                device_commit=device_commit,
+                                finish_single=lambda consumed, token: (consumed, [token]),
+                                finish_single_device=lambda: (1, [1]),
+                                # Poison the stale device record in CPU mode.
+                                commit=torch.tensor([1, 1, 1, 1 if device_commit else 5]))
     runner.pp.commit_token = runner.pp.commit[3:4]
     runner.model = SimpleNamespace(complete_step=committed.append)
     state = RequestState("c1", [10], [], None, ([1], ))

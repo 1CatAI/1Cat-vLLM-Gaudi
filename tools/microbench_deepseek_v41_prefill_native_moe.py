@@ -26,12 +26,9 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeat", type=int, default=5)
     parser.add_argument("--fp8-fused", action="store_true")
-    parser.add_argument("--fp8",
-                        action="store_true",
+    parser.add_argument("--fp8", action="store_true",
                         help="use the non-fused N256 FP8 body, which supports large-M prefill")
-    parser.add_argument("--tile",
-                        type=int,
-                        default=0,
+    parser.add_argument("--tile", type=int, default=0,
                         help="split a large prefill batch into fixed token tiles before calling the native op")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -67,12 +64,10 @@ def main() -> None:
             q_rows.append(prepared_q)
             s_rows.append(prepared_s)
             channels.append(channel)
-
         def move(values, *, bf16=False):
             array = np.stack(values)
             tensor = torch.from_numpy(array.view(np.int16))
             return (tensor.view(torch.bfloat16) if bf16 else tensor).to("hpu")
-
         return move(q_rows), move(s_rows), move(channels, bf16=True)
 
     q13, s13, c13 = prepare_projection("w13")
@@ -81,17 +76,16 @@ def main() -> None:
         raise ValueError("choose --fp8-fused or --fp8")
     op = (torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2
           if args.fp8_fused else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fp8_gaudi2
-          if args.fp8 else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_bf16_gaudi2)
+          if args.fp8 else
+          torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_bf16_gaudi2)
 
     def make_fn(tokens: int):
-
         def fn(x, ids, route):
             if args.fp8_fused:
                 return op(x, ids, route, q13, q2, s13, s2, lut, c13, c2, True)
             if args.fp8:
                 return op(x, ids, route, q13, q2, s13, s2, lut, c13, c2, True)
             return op(x, ids, route, q13, q2, s13, s2, lut, True)
-
         return fn
 
     args.output.mkdir(parents=True, exist_ok=True)
@@ -119,13 +113,12 @@ def main() -> None:
                 # preserving the scheduler's single max_num_batched_tokens
                 # transaction.  It is intentionally explicit in the
                 # microbenchmark; no C1/C6 request loop is hidden here.
-                def tiled_fn(x, ids, route, tokens=tokens, raw_fn=raw_fn):
+                def tiled_fn(x, ids, route, _tokens=tokens, _raw_fn=raw_fn):
                     pieces = []
-                    for begin in range(0, tokens, args.tile):
-                        end = min(tokens, begin + args.tile)
-                        pieces.append(raw_fn(x[begin:end], ids[begin:end], route[begin:end]))
+                    for begin in range(0, _tokens, args.tile):
+                        end = min(_tokens, begin + args.tile)
+                        pieces.append(_raw_fn(x[begin:end], ids[begin:end], route[begin:end]))
                     return torch.cat(pieces, dim=0)
-
                 fn = torch.compile(tiled_fn, backend="hpu_backend", fullgraph=True, dynamic=False)
             else:
                 fn = torch.compile(raw_fn, backend="hpu_backend", fullgraph=True, dynamic=False)

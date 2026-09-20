@@ -62,13 +62,14 @@ the effective runtime configuration; see
 [configuration precedence](../1cat_gaudi_guide.md#runtime-profile). The generic
 vLLM entrypoint retains the opt-in defaults from `vllm_gaudi.envs`.
 
-Arithmetic-changing FP8, Router, MLA and fused numerical candidates are not in
-the default bundle. To test them explicitly, prepare the two FP8 sidecars in
+The qualified FP8, Router, MLA and fused numerical profile is part of the
+dedicated entrypoint's default bundle. Prepare the two FP8 sidecars in
 `PREPARED_DIR/sidecars/wo_a_fp8` and
-`PREPARED_DIR/sidecars/attention_dense_fp8`, then set
-`VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS=1`. The entrypoint validates and
-discovers both sidecars before model loading. This aggregate remains an
-experimental quality profile, not a production default.
+`PREPARED_DIR/sidecars/attention_dense_fp8`. The entrypoint validates and
+discovers both sidecars before model loading and fails before startup when a
+required artifact is absent. Set
+`VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS=0` to select the structural
+compatibility profile for diagnostics.
 
 Reserve four free modules using the project's device lease mechanism before
 launching. `tools/run_deepseek_v41.py` provides an archived invocation wrapper
@@ -95,7 +96,7 @@ profile; the ordinary-C1 bundle is not applied in that mode.
 
 The ordinary decode implementation provides individually overridable expert,
 attention and projection optimizations. The dedicated entrypoint enables its
-C1 bundle; the generic entrypoint retains opt-in environment defaults. The combined experimental
+C1 bundle; the generic entrypoint retains opt-in environment defaults. The prepared numerical
 profile uses N256 FP8 experts with fused activation preparation, channel-scaled
 FP8 wo_a, dedicated Router top-6, decoded KV with shared-KV MME attention,
 BF16 head operands with FP32 logits, and fused Q/KV input projection.
@@ -119,14 +120,13 @@ directory only when the sidecar cannot live below the prepared model. FP8 wo_a h
 weight duplicate. Precision, layout or weight changes require model reload
 and new recipes.
 
-The default C1 bundle does not enable the separate legacy
-`VLLM_HPU_DSV41_FP8_DECODE`, coordinate-pipeline, FP8 projection, N256-FP8
-expert, Router-top6, MLA-MME, or fused numerical experiments. Native PP0 input
-capture is enabled only as part of the frozen-reference V2 continuation
-contract. Successful component checks and relative decode improvements do not
-establish production quality; arithmetic-changing candidates stay behind the
-experimental numerical aggregate until their full quality, prefill numerical
-consistency and long replay/shutdown gates pass.
+The default C1 bundle keeps the separate legacy `VLLM_HPU_DSV41_FP8_DECODE`
+and coordinate-pipeline experiments disabled. It enables the deployed N256
+FP8 expert, Router-top6, MLA-MME and dense FP8 profile through the numerical
+aggregate. Native PP0 input capture remains part of the V2 continuation
+contract. The decoded SWA mirror uses the same circular row namespace as the
+packed cache, and the hot index mirror is populated before its first larger
+search bucket; these state repairs are required for long-generation quality.
 
 The scheduler owns the request state. Short contexts use a bounded block;
 long contexts use physical page tables for SWA, FP4 main/index, candidates,
@@ -149,9 +149,9 @@ device-window reconciliation and overlap handled explicitly.
 
 The complete quality gate additionally covers frozen-reference generation,
 image spans, accepted-prefix rollback, request changes, state reuse and
-shutdown. The structural V2 bundle is the dedicated entrypoint's qualified
-ordinary-C1 default; numerical candidates and DSpark remain default-off until
-their complete gates pass. The generic entrypoint retains opt-in defaults.
+shutdown. The structural V2 bundle and prepared numerical profile are the
+dedicated entrypoint's qualified ordinary-C1 defaults. DSpark remains
+default-off, and the generic entrypoint retains opt-in defaults.
 
 ## Default V2 HPU Adapter
 
@@ -208,8 +208,9 @@ V4.1 kernels and the native replay bridge from this revision; previously built
 bridges with a fixed PP0 collective count cannot replay long CSA2 buckets.
 Do not disable V2 continuation, early device-token commit, device Engram or
 segmented input replay in a wrapper around the dedicated entrypoint. Their
-existing overrides remain available for diagnostics. Arithmetic-changing
-optimizations still require the explicit precision profile.
+existing overrides remain available for diagnostics. The prepared numerical
+profile is selected automatically and remains explicitly disableable before
+startup.
 
 Runtime preparation writes four rank files and publishes its manifest only
 after all files pass exact inverse-layout checks. Layout, quantization, source

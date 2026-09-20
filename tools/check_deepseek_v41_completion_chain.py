@@ -60,12 +60,8 @@ def main():
                 raise RuntimeError(f"{mode}: stale completion/input generation {generation}")
             if generation >= 8:
                 times.append(elapsed)
-        results[mode] = {
-            "host_ms": times,
-            "mean_ms": sum(times) / len(times),
-            "consumer": "compiled BF16 embedding + HPU synchronize",
-            "correct": True
-        }
+        results[mode] = {"host_ms": times, "mean_ms": sum(times) / len(times),
+                         "consumer": "compiled BF16 embedding + HPU synchronize", "correct": True}
     root = Path(os.environ["DSV41_RUN_EVIDENCE"])
     (root / f"rank{rank}.json").write_text(json.dumps(results, indent=2))
     print(rank, {k: v["mean_ms"] for k, v in results.items()}, flush=True)

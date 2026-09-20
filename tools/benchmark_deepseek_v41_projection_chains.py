@@ -21,6 +21,7 @@ import torch.nn.functional as F  # noqa: E402
 
 from vllm_gaudi.ops.deepseek_v41_shard_loader import PreparedV41Shard  # noqa: E402
 from vllm_gaudi.ops.deepseek_v41_woa_fp8 import WoaFP8Sidecar  # noqa: E402
+from vllm_gaudi.ops.deepseek_v41_dense_fp8 import DenseFP8Sidecar  # noqa: E402
 from vllm_gaudi.ops.deepseek_v41_sampling import local_greedy_candidate  # noqa: E402
 from vllm_gaudi.ops.deepseek_v41_math import rms_norm  # noqa: E402
 from vllm_gaudi.ops.deepseek_v41_qkv import concatenate_static_weights  # noqa: E402
@@ -200,9 +201,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("prepared", type=Path)
     parser.add_argument("sidecar", type=Path)
+    parser.add_argument("--dense-sidecar", type=Path)
     parser.add_argument("--components",
                         nargs="+",
-                        choices=("woa", "woa-output", "router", "head", "compressor-input"),
+                        choices=("woa", "woa-output", "woa-roundtrip", "woa-rope",
+                                 "router", "head", "compressor-input"),
                         default=["woa", "router", "head"])
     parser.add_argument("--rounds", type=int, default=3)
     arms = parser.add_mutually_exclusive_group()
@@ -224,6 +227,81 @@ def main():
     recorder = RecipeRecorder(output)
     shard = PreparedV41Shard(args.prepared, 0, 0)
     with torch.inference_mode():
+        if "woa-roundtrip" in args.components:
+            if args.dense_sidecar is None:
+                raise ValueError("--dense-sidecar is required for woa-roundtrip")
+            from vllm_gaudi.ops.deepseek_v41_math import quantize_activation, rotary_table
+            woa_sidecar = WoaFP8Sidecar(args.sidecar, shard)
+            dense_sidecar = DenseFP8Sidecar(args.dense_sidecar, shard)
+            config = json.loads((args.prepared / "config.json").read_text())["text_config"]
+            old, new, inputs = [], [], []
+            positions = torch.tensor([127], dtype=torch.int32, device="hpu")
+            for layer in range(20):
+                prefix = f"layers.{layer}.attn."
+                ratio, scaling = config["compress_ratios"][layer], config["rope_scaling"]
+                table = rotary_table(64, 512, config["compress_rope_theta"] if ratio else config["rope_theta"],
+                                     scaling["original_max_position_embeddings"] if ratio else 0,
+                                     scaling["factor"], scaling["beta_fast"], scaling["beta_slow"])
+                inverse = torch.cat((table[..., 0], -table[..., 1]), -1).contiguous().to("hpu")
+                weights = (woa_sidecar.tensor(prefix + "wo_a.weight", "hpu"),
+                           woa_sidecar.tensor(prefix + "wo_a.channel_scale", "hpu"),
+                           dense_sidecar.tensor(prefix + "wo_b.weight", "hpu"),
+                           dense_sidecar.tensor(prefix + "wo_b.channel_scale", "hpu"), positions, inverse)
+                old.append(weights)
+                new.append(weights)
+                inputs.append(torch.randn(1, 32, 512).bfloat16().to("hpu"))
+
+            def reference(x, woa, woa_scale, wob, wob_scale, positions, inverse):
+                value = torch.ops.custom_op.custom_deepseek_v41_rope_bf16_gaudi2(x, positions, inverse)
+                value = torch.ops.custom_op.custom_deepseek_v41_woa_fp8_gaudi2(
+                    value.reshape(1, 4, 4096), woa, woa_scale)
+                value = quantize_activation(value)
+                return torch.ops.custom_op.custom_deepseek_v41_dense_fp8_gaudi2(value, wob, wob_scale)
+
+            def candidate(x, woa, woa_scale, wob, wob_scale, positions, inverse):
+                value = torch.ops.custom_op.custom_deepseek_v41_rope_bf16_gaudi2(x, positions, inverse)
+                value = torch.ops.custom_op.custom_deepseek_v41_woa_fp8_roundtrip_gaudi2(
+                    value.reshape(1, 4, 4096), woa, woa_scale)
+                return torch.ops.custom_op.custom_deepseek_v41_dense_fp8_gaudi2(value, wob, wob_scale)
+
+            benchmark("woa-roundtrip", reference, candidate, inputs, old, new, output, args.rounds, recorder,
+                      args.candidate_only)
+            del old, new, inputs
+        if "woa-rope" in args.components:
+            from vllm_gaudi.ops.deepseek_v41_math import quantize_activation, rotary_table
+            sidecar = WoaFP8Sidecar(args.sidecar, shard)
+            config = json.loads((args.prepared / "config.json").read_text())["text_config"]
+            old, new, inputs = [], [], []
+            positions = torch.tensor([2051], dtype=torch.int32, device="hpu")
+            for layer in range(20):
+                prefix = f"layers.{layer}.attn."
+                consumer = shard.dense(prefix + "wo_b.weight", "hpu")
+                ratio, scaling = config["compress_ratios"][layer], config["rope_scaling"]
+                table = rotary_table(64, 2560, config["compress_rope_theta"] if ratio else config["rope_theta"],
+                                     scaling["original_max_position_embeddings"] if ratio else 0, scaling["factor"],
+                                     scaling["beta_fast"], scaling["beta_slow"])
+                phase = table.reshape(-1, 64).contiguous().to("hpu")
+                inverse = torch.cat((table[..., 0], -table[..., 1]), -1).contiguous().to("hpu")
+                weight = sidecar.tensor(prefix + "wo_a.weight", "hpu")
+                scale = sidecar.tensor(prefix + "wo_a.channel_scale", "hpu")
+                old.append((weight, scale, consumer, positions, inverse))
+                new.append((weight, scale, consumer, positions, phase))
+                inputs.append(torch.randn(1, 32, 512).bfloat16().to("hpu"))
+
+            def separate(x, weight, scale, consumer, positions, inverse):
+                value = torch.ops.custom_op.custom_deepseek_v41_rope_bf16_gaudi2(x, positions, inverse)
+                value = torch.ops.custom_op.custom_deepseek_v41_woa_fp8_gaudi2(
+                    value.reshape(1, 4, 4096), weight, scale)
+                return F.linear(quantize_activation(value), consumer)
+
+            def fused(x, weight, scale, consumer, positions, phase):
+                value = torch.ops.custom_op.custom_deepseek_v41_rope_woa_fp8_gaudi2(
+                    x, weight, scale, positions, phase)
+                return F.linear(quantize_activation(value), consumer)
+
+            benchmark("woa-rope", separate, fused, inputs, old, new, output, args.rounds, recorder,
+                      args.candidate_only)
+            del old, new, inputs
         if "woa-output" in args.components:
             from vllm_gaudi.ops.deepseek_v41_math import quantize_activation, rotary_table
             sidecar = WoaFP8Sidecar(args.sidecar, shard)

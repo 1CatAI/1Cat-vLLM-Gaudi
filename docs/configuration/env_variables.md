@@ -43,11 +43,11 @@ Source, topology, tensor layout and quantization fingerprints must match;
 invalid or incomplete caches fail explicitly. Dense weights and Engram
 continue to use their existing sources. The variable is unset by default.
 
-The dedicated V4.1 entrypoint enables `VLLM_HPU_DSV41_PREFILL_GROUPED`
-for bounded expert grouping in V4.1
+`VLLM_HPU_DSV41_PREFILL_GROUPED` selects bounded expert grouping for V4.1
 prefill on the resident N256 compressed weights. It retains clamp, routing,
 BF16 rounding and ordered reduction boundaries, while ordinary C1 decode
-continues to use its compiled native path. Disabled by default.
+continues to use its compiled native path. It is enabled by the dedicated
+prepared-model entrypoint and disabled in the generic entrypoint.
 
 | Parameter name               | Description                                                   | Default value |
 | ---------------------------- | ------------------------------------------------------------- | ------------- |
@@ -66,15 +66,6 @@ continues to use its compiled native path. Disabled by default.
 | `VLLM_PROMPT_BS_BUCKET_MAX`  | Sets prefill batch size | `1` |
 | `VLLM_MULTIMODAL_BUCKETS`    | Overrides the per-model patch-count buckets used to warm up native-resolution vision towers (models where `is_batch_based=False`, e.g. Gemma4, Kimi-K2.5/K2.6, Qwen2.5/3/3.5-VL). Comma-separated list of integers. Set to `None` to disable bucketing for these models. | model-specific |
 | `VLLM_MULTIMODAL_RESOLUTIONS` | Pins explicit raw pixel resolutions (comma-separated, e.g. `1024x768,768x1024`) to warm up for native-resolution vision towers. Each entry is `WxH`, `WxHxN` (pin the count-`N` graph), or `WxHxN-M` (warm the item-count range `[N, M]`); `WxH` alone warms one graph at the `--limit-mm-per-prompt` ceiling. See [Warm-up](../features/warmup.md#multimodal-warm-up). | `None` |
-| `VLLM_GAUDI_H3_VAE_TILE_BATCH_SIZE` | Number of independent MiniMax H3 video-VAE spatial tiles decoded together. Use `1` for sequential tile execution. | `4` |
-| `VLLM_GAUDI_H3_VAE_PERSIST_BF16_WEIGHTS` | Stores MiniMax H3 video-VAE decoder Linear weights in BF16, matching HPU autocast while avoiding repeated weight casts. | `true` |
-| `VLLM_GAUDI_H3_VAE_COMPILE_SWIGLU` | Compiles the MiniMax H3 video-VAE SwiGLU pointwise region with the HPU backend and verifies every real tensor contract bit-for-bit before reuse. | `true` |
-| `VLLM_GAUDI_H3_VAE_COMPILE_QK_NORM` | Compiles the MiniMax H3 video-VAE Q/K RMSNorm region with the HPU backend and verifies every real tensor contract bit-for-bit before reuse. | `true` |
-| `VLLM_GAUDI_H3_VAE_COMPILE_ROPE` | Compiles the MiniMax H3 video-VAE rotary embedding region with the HPU backend and verifies every real tensor contract bit-for-bit before reuse. | `true` |
-| `VLLM_GAUDI_H3_VAE_COMPILE_BLOCKS` | Compiles each complete MiniMax H3 video-VAE decoder TransformerBlock with the HPU backend after the exact BF16/FusedSDPA contract is selected. Unsupported layouts fall back to the original block. | `true` |
-| `VLLM_GAUDI_H3_VAE_FUSED_SDPA` | Uses Habana FusedSDPA for the qualified unmasked BF16 MiniMax H3 video-VAE decoder attention contract. | `true` |
-| `VLLM_GAUDI_H3_VAE_TEMPORAL_BATCH_SIZE` | Batches adjacent equal-shaped temporal decoder clips. `2` is the qualified single-card Gaudi 2 value; `1` disables the pair submission. | `2` |
-| `VLLM_GAUDI_H3_VAE_ASYNC_D2H` | Overlaps normalized video-frame device-to-host copies with the next H3 VAE decode tile on a single-card output owner. | `true` |
 | `VLLM_MINIMAX_M3_MOE_TOKEN_TILE` | Maximum number of tokens processed per tile by the MiniMax-M3 dense SwiGLU-OAI expert path. Non-positive values disable tiling. | `512` |
 | `VLLM_MINIMAX_M3_MOE_DECODE_GATHER` | Enables the MiniMax-M3 routed-expert gather path for low-token decode. Set to `0` or `false` to use the dense expert path. | `true` |
 | `VLLM_MINIMAX_M3_MOE_GATHER_MAX_TOKENS` | Maximum token count for the MiniMax-M3 routed-expert gather path. Larger batches use the dense expert path. | `16` |
@@ -235,7 +226,13 @@ generic vLLM entrypoint keeps the individual switches disabled.
 | Variable | Description | Default |
 |---|---|---|
 | `VLLM_HPU_DSV41_DEFAULT_FASTPATHS` | Controls the frozen-reference ordinary-C1 and V2 device-continuation bundle in `vllm_gaudi.entrypoints.deepseek_v41`. Set to `0` for the compatibility profile. Individual feature variables remain valid overrides. | `true` in the dedicated entrypoint; otherwise `false` |
-| `VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS` | Enables the separate arithmetic-changing FP8, Router, MLA and fused numerical bundle in the dedicated entrypoint. These paths remain opt-in because their archived full-model outputs did not pass the frozen-reference quality gate. | `false` |
+| `VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS` | Enables the qualified FP8, Router, MLA and fused numerical bundle in the dedicated entrypoint. The prepared sidecars are discovered and fingerprinted before loading; set to `0` for the structural compatibility profile. | `true` in the dedicated entrypoint; otherwise `false` |
+| `VLLM_HPU_DSV41_PREFILL_DEVICE_ROUTES` | Keeps grouped-prefill route counts and descriptors on HPU instead of synchronizing expert occupancy to the host. | `true` in the dedicated entrypoint; otherwise `false` |
+| `VLLM_HPU_DSV41_PREFILL_ROUTE_OUTPUT` | Uses fixed-capacity compact route output for grouped prefill so recipes do not depend on the current expert distribution. | `true` in the dedicated entrypoint; otherwise `false` |
+| `VLLM_HPU_DSV41_PREFILL_EXPERT_ROWS` | Number of prompt rows in each grouped expert weight-reuse tile. | `128` in the dedicated entrypoint; otherwise `64` |
+| `VLLM_HPU_DSV41_PREFILL_COMPACT_CANDIDATES` | Keeps only valid sparse-attention candidate rows in prefill instead of materializing fixed-capacity padding. | `true` in the dedicated entrypoint; otherwise `false` |
+| `VLLM_HPU_DSV41_PREFILL_MLA_ROWS` | Bounded query-row tile used by the MME prefill attention path. | `64` in the dedicated entrypoint; otherwise `0` |
+| `VLLM_HPU_DSV41_COMPRESSOR_FUSED_INPUT` | Concatenates the ratio-2 Compressor projections at load time and executes one complete-K MME projection before the unchanged consumers. | `true` in the dedicated entrypoint; otherwise `false` |
 | `VLLM_HPU_DSV41_PREPARED_SHARDS` | Enables the rank-local loader and bounded CSA2 runner on four Gaudi2 devices. Requires the immutable TP2×PP2 manifest. | `false` |
 | `VLLM_HPU_DSV41_ENGRAM_HOST_TABLE` | Uses shared read-only host mmap tables, native asynchronous row gather, and generation-owned HPU staging. | `false` |
 | `VLLM_HPU_DSV41_GRAPH_REPLAY` | Captures each PP stage with the ABI-locked native compute/communication plan. Requires prepared communication and the static group plan. | `false` |
@@ -557,7 +554,12 @@ weights once at model load and executes one projection before the existing
 SwiGLU boundary. It releases the two source device buffers and requires model
 reload to change the selection.
 
-These are experimental candidates. A native MME operand contract or a reduced weight footprint does not establish an end-to-end improvement. The wo_a path still needs its largest prefill shape and nonfinite or extremely small activation scales qualified. Use the aggregate opt-out for production-reference comparisons until these contracts pass. Failed candidates must not be silently substituted during an active request.
+The individual operators remain independently disableable for diagnosis. A
+native MME operand contract or a reduced weight footprint alone does not
+establish an end-to-end improvement; the dedicated entrypoint selects only the
+prepared combination that passed its deployment gates. Use the aggregate
+opt-out for compatibility comparisons. Failed candidates must not be silently
+substituted during an active request.
 
 The prepared sidecar validates its source manifest, rank ownership, payload hash and encoding/layout fingerprint before binding weights. Model reload invalidates existing recipes; the replay binding includes the loaded precision fingerprint and weight/state generation. The existing native runtime loader continues to validate the actual Bridge/Synapse/HCL and extension artifacts independently. A precision change requires a reload, including rebuilding the sidecar when its encoding contract changes.
 
@@ -613,7 +615,8 @@ generated outputs differ from the preceding candidate; independent quality
 qualification remains incomplete. Do not treat isolated bitwise checks as
 full-model output equivalence.
 
-`VLLM_HPU_DSV41_COMPRESSOR_FUSED_INPUT` (default `0`) concatenates the ratio-2
+`VLLM_HPU_DSV41_COMPRESSOR_FUSED_INPUT` (enabled by the dedicated V4.1
+entrypoint and otherwise default `0`) concatenates the ratio-2
 CSA2 Compressor `wkv` and `wgate` FP32 weights at load time. C1 then uses one
 complete-K MME projection and splits its output before the unchanged history,
 softmax, and compressed-cache consumer chain.

@@ -32,13 +32,29 @@ def _clear_profile(monkeypatch):
         monkeypatch.delenv(key, raising=False)
 
 
-def test_default_c1_fastpaths_are_v2_and_do_not_require_numeric_sidecars(monkeypatch, tmp_path):
+def test_default_profile_enables_qualified_numeric_bundle(monkeypatch, tmp_path):
     _clear_profile(monkeypatch)
+    for sidecar in ("wo_a_fp8", "attention_dense_fp8"):
+        (tmp_path / "sidecars" / sidecar).mkdir(parents=True)
 
     prepare_default_fastpaths(tmp_path)
 
     assert os.environ["VLLM_HPU_DSV41_DSPARK"] == "0"
     assert all(os.environ[key] == value for key, value in _C1_FASTPATH_DEFAULTS.items())
+    assert all(os.environ[key] == value for key, value in _NUMERIC_FASTPATH_DEFAULTS.items())
+    assert os.environ["VLLM_HPU_DSV41_WO_A_FP8_SIDECAR"] == str(
+        (tmp_path / "sidecars" / "wo_a_fp8").resolve())
+    assert os.environ["VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR"] == str(
+        (tmp_path / "sidecars" / "attention_dense_fp8").resolve())
+
+
+def test_numeric_profile_can_be_disabled_without_sidecars(monkeypatch, tmp_path):
+    _clear_profile(monkeypatch)
+    monkeypatch.setenv("VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS", "0")
+
+    prepare_default_fastpaths(tmp_path)
+
+    assert os.environ["VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS"] == "0"
     assert not any(key in os.environ for key in _NUMERIC_FASTPATH_DEFAULTS)
     assert "VLLM_HPU_DSV41_WO_A_FP8_SIDECAR" not in os.environ
     assert "VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR" not in os.environ
@@ -74,6 +90,7 @@ def test_default_profile_respects_individual_override(monkeypatch, tmp_path):
 @pytest.mark.parametrize(("runner", "adapter"), (("0", None), (None, "0")))
 def test_default_profile_respects_v2_opt_out(monkeypatch, tmp_path, runner, adapter):
     _clear_profile(monkeypatch)
+    monkeypatch.setenv("VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS", "0")
     if runner is not None:
         monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", runner)
     if adapter is not None:

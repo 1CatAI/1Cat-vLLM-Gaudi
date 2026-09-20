@@ -24,6 +24,7 @@ from vllm.v1.outputs import (AsyncModelRunnerOutput, DraftTokenIds, EMPTY_MODEL_
 from vllm_gaudi import envs
 from vllm_gaudi.extension.logger import logger as init_logger
 from vllm_gaudi.extension.profiler import HabanaHighLevelProfiler
+from vllm_gaudi.ops.deepseek_v41_indexer import INDEX_MME_HOT_TOKENS
 from vllm_gaudi.ops.deepseek_v41_state import PagedStageState, StageStateBlocks, register_state_spec
 from vllm_gaudi.ops.deepseek_v41_verify import (
     AsyncDeviceOutput,
@@ -41,9 +42,17 @@ VERIFY_METADATA_SIZE = 7
 VERIFY_PROPOSED_SIZE = 5
 VERIFY_CONTROL_SIZE = VERIFY_METADATA_SIZE + VERIFY_PROPOSED_SIZE
 PREFILL_BLOCK_TOKENS = 8192
-# Grouped prefill reuses decoded expert weights across the scheduler chunk.
-# Occupancy buckets bound temporary memory without reducing scheduler admission.
-# C6 remains DSpark-only and C1 decode is unchanged.
+# Scheduler admission and device execution have different jobs.  vLLM may
+# admit a complete C8192 transaction, while the model executes it with this
+# finite set of exact (unpadded) shapes.  Powers down to C128 keep large-M
+# weight reuse; a sub-C128 tail reuses the already qualified C1 replay.  This
+# prevents request lengths from creating new Synapse recipes after the 1M KV
+# pool is resident without introducing padding writes into KV/Engram state.
+PREFILL_COMPUTE_BUCKETS = (2048, 1024, 512, 256, 128)
+# Large-M prefill uses Habana's native MXFP4 FusedMoE and reuses each streamed
+# expert range across the whole scheduler chunk.  The previous C16 limit was a
+# property of the single-token decoded-BF16 recipe and does not apply to this
+# path. C6 remains DSpark-only and C1 decode is unchanged.
 PREFILL_MAX_INFLIGHT_BLOCKS = 1
 
 
@@ -117,9 +126,11 @@ def target_chunks(tokens, block_tokens=PREFILL_BLOCK_TOKENS):
     """
     if block_tokens < 1 or block_tokens > PREFILL_BLOCK_TOKENS:
         raise ValueError("V4.1 prefill blocks must be no larger than max_num_batched_tokens=8192")
+    buckets = tuple(size for size in PREFILL_COMPUTE_BUCKETS if size <= block_tokens)
     offset = 0
     while offset < len(tokens):
-        size = min(block_tokens, len(tokens) - offset)
+        remaining = len(tokens) - offset
+        size = next((candidate for candidate in buckets if candidate <= remaining), 1)
         yield offset, tokens[offset:offset + size]
         offset += size
 
@@ -129,6 +140,39 @@ def target_search_length(start, count, maximum):
     if start < 0 or count < 1 or start + count > maximum:
         raise ValueError("V4.1 search bucket is outside the configured context")
     return min(maximum, max(512, 1 << (start + count - 1).bit_length()))
+
+
+def runtime_search_length(start, count, maximum):
+    """Select the prewarmed hot-MME or capacity-independent index recipe."""
+    if start < 0 or count < 1 or start + count > maximum:
+        raise ValueError("V4.1 runtime index range is outside the configured context")
+    # Keep the first 512 visible rows on the exact static candidate path.  The
+    # runtime indexer is needed for a larger prefix, but paying its score /
+    # threshold / emit chain while the static compressed offsets are complete
+    # was the main difference between the historical C1 replay and the current
+    # 1M-capacity build.  The next geometry is prewarmed below, so crossing
+    # this boundary cannot trigger a compile during a request.
+    if start + count <= 512:
+        return min(maximum, 512)
+    hot = min(maximum, INDEX_MME_HOT_TOKENS)
+    return hot if start + count <= hot else maximum
+
+
+def decode_search_warmups(maximum, *, runtime_indexer=False):
+    """Yield one valid position per decode graph geometry."""
+    if runtime_indexer:
+        hot = min(maximum, INDEX_MME_HOT_TOKENS)
+        yield 0, min(maximum, 512)
+        if hot > 512:
+            yield 512, hot
+        if hot < maximum:
+            yield hot, maximum
+        return
+    start = 0
+    while start < maximum:
+        search = target_search_length(start, 1, maximum)
+        yield start, search
+        start = search
 
 
 def _exchange_payload_views(exchange_wire, capacity, hidden_slots=4, hidden_width=5120):
@@ -788,6 +832,12 @@ class V41ModelRunner:
         # Compile the PP commit graph only after the bridge has registered its
         # custom op.  This keeps normal/non-direct paths unchanged.
         self.pp.prepare_commit_graph()
+        # Grouped prefill has only eight compute-body shapes once route gather
+        # is separated from the MME chain. Prepare those shapes before model
+        # loading so their first use is outside the serving request.
+        if envs.VLLM_HPU_DSV41_PREFILL_GROUPED and envs.VLLM_HPU_DSV41_PREFILL_DEVICE_ROUTES:
+            from vllm_gaudi.ops.deepseek_v41_grouped_prefill import prepare_device_grouped_prefill_recipes
+            prepare_device_grouped_prefill_recipes(normal_scales=True)
         self.model = get_model(vllm_config=self.vllm_config)
         state_type = PagedStageState if self.model_config.max_model_len > 512 else StageStateBlocks
         self.state = state_type(self.model.program)
@@ -819,7 +869,10 @@ class V41ModelRunner:
             self.verify_ring = VerifyRing(self.device, last_rank=False)
         elif self.pp.group.is_last_rank:
             sampler = self.model.program.sample_greedy_token if self.v2_completion else self.model.program.sample_greedy
-            self.sample_target = torch.compile(sampler, backend="hpu_backend", fullgraph=True, dynamic=False)
+            self.sample_target = torch.compile(sampler,
+                                               backend="hpu_backend",
+                                               fullgraph=True,
+                                               dynamic=False)
             if self.pp.device_commit_enabled:
                 self.sample_target_commit = torch.compile(self.model.program.sample_greedy_commit,
                                                           backend="hpu_backend",
@@ -847,6 +900,21 @@ class V41ModelRunner:
 
     def allocate_framework_kv_cache_layer(self, spec, num_blocks):
         return torch.zeros((num_blocks, *spec.state_shape), device=self.device, dtype=spec.state_dtype)
+
+    def profile_kv_cache_blocks(self):
+        """Return the temporary page count needed by pre-KV recipe warmup.
+
+        One null page is followed by identity-mapped live pages.  The second
+        warmup geometry starts at the runtime-indexer's cold boundary, so it
+        exercises the capacity-independent recipe used by long conversations.
+        These pages exist only during ``determine_available_memory``.
+        """
+        if not isinstance(self.state, PagedStageState):
+            return 1
+        from vllm_gaudi.ops.deepseek_v41_paged_attention import PAGE_TOKENS
+        last_position = min(self.model_config.max_model_len,
+                            INDEX_MME_HOT_TOKENS + max(PREFILL_COMPUTE_BUCKETS))
+        return 1 + (last_position + PAGE_TOKENS - 1) // PAGE_TOKENS
 
     def bind_framework_kv_caches(self, caches, runner_caches):
         logger.info("V4.1 PP%d binding profile state", self.model.pp_rank)
@@ -978,7 +1046,15 @@ class V41ModelRunner:
             self.encoder_cache[feature.identifier] = scatter_image_embeddings(output, feature.mm_position.is_embed)
 
     @profile_phase("target")
-    def _forward(self, request_id, tokens, start, *, decode, reset=False, request=None, search_length=None):
+    def _forward(self,
+                 request_id,
+                 tokens,
+                 start,
+                 *,
+                 decode,
+                 reset=False,
+        request=None,
+        search_length=None):
         count = len(tokens)
         # Avoid evaluating a fallback slice when a test or a C1-only runner
         # intentionally owns just the persistent captured view.
@@ -990,15 +1066,18 @@ class V41ModelRunner:
         # prefill semantics.  Bind that token to the captured C1 input tensor
         # instead of compiling an unqualified ordinary C1 stage on the first
         # public chat request.
-        c1_replay = (getattr(self.model, "native", False) and count == 1 and start + count <= 1024)
+        program = getattr(self.model, "program", None)
+        c1_replay = (getattr(self.model, "native", False) and count == 1 and
+                     (getattr(program, "runtime_indexer", False) or start + count <= 1024))
         graph_c1 = decode or c1_replay
         if self.direct_token_ids and graph_c1:
             if count != 1:
                 raise ValueError("Direct V4.1 token binding requires a C1 transaction")
             ids = self.decode_ids
-        program = getattr(self.model, "program", None)
         if program is not None and program.length > 512:
-            search = (target_search_length(start, count, program.length)
+            search = (runtime_search_length(start, count, program.length)
+                      if getattr(program, "runtime_indexer", False) else
+                      target_search_length(start, count, program.length)
                       if search_length is None else int(search_length))
             if search < start + count or search > program.length:
                 raise RuntimeError("V4.1 transaction search bucket does not cover its input")
@@ -1056,8 +1135,9 @@ class V41ModelRunner:
         # CSA2 buckets above 1024. Prompt C1 capture remains bounded to the
         # qualified prefix range so a one-token prefill tail cannot create a
         # long-search graph variant. StageReplay keys plans by search bucket.
-        use_replay = (getattr(self.model, "native", False) and
-                      (decode or (start + count <= 1024 and (c1_replay or (self.use_dspark and request is not None)))))
+        use_replay = (getattr(self.model, "native", False)
+                      and (decode or (start + count <= 1024
+                                     and (c1_replay or (self.use_dspark and request is not None)))))
         self.model.prepare_step(request_id, tokens, is_decode=graph_c1, reset=reset, use_replay=use_replay)
         self._round_phase("engram_prepared_ns")
         timing = getattr(self, "verify_timing", None)
@@ -1398,7 +1478,9 @@ class V41ModelRunner:
         # C1/C6 decode tiling would reread expert weights for every prompt row.
         chunks = [(0, tokens)] if decode else target_chunks(tokens, PREFILL_BLOCK_TOKENS)
         program = getattr(self.model, "program", None)
-        transaction_search = (target_search_length(start, count, program.length)
+        transaction_search = ((runtime_search_length(start, count, program.length)
+                               if getattr(program, "runtime_indexer", False) else
+                               target_search_length(start, count, program.length))
                               if not decode and program is not None and program.length > 512 else None)
         for block_index, (offset, chunk) in enumerate(chunks):
             hidden = self._forward(req_id,
@@ -1416,6 +1498,10 @@ class V41ModelRunner:
                 if (block_index + 1) % PREFILL_MAX_INFLIGHT_BLOCKS == 0:
                     self.pp.drain()
                     torch.hpu.synchronize()
+                    # Exact prefill tails can reuse the single-token packet.
+                    # Retire it after both transport and its consumer finish;
+                    # the final block remains owned by normal sampling.
+                    self.pp.complete_packet()
         need_sample = start + count >= len(request.tokens)
         if self.pp.group.is_last_rank and need_sample:
             if not self.use_dspark:
@@ -1522,7 +1608,8 @@ class V41ModelRunner:
         # tensor here feeds stale IDs into otherwise correct native replay.
         # Only device completion owns a current device token. CPU completion
         # uses the scheduler/request token through the normal input staging.
-        self._next_input = ((request.req_id, start + count, self.pp.commit_token) if output and device_commit else None)
+        self._next_input = ((request.req_id, start + count, self.pp.commit_token)
+                            if output and device_commit else None)
         self._token_copy = None
         self.pending = self.draft_token_ids = None
         if not self.pp.group.is_last_rank:
@@ -1597,6 +1684,17 @@ class V41ModelRunner:
 
     def profile_run(self, initialize_only=False):
         del initialize_only
+        if not self.use_dspark and isinstance(self.state, PagedStageState):
+            geometries = (0, min(INDEX_MME_HOT_TOKENS, self.model_config.max_model_len - 1))
+            for start_position in geometries:
+                for tokens in PREFILL_COMPUTE_BUCKETS:
+                    if start_position + tokens > self.model_config.max_model_len:
+                        continue
+                    logger.info("V4.1 PP%d starting pre-KV C%d prefill recipe warmup at position %d",
+                                self.model.pp_rank, tokens, start_position)
+                    self._dummy_run(tokens, start_position=start_position)
+                    logger.info("V4.1 PP%d completed pre-KV C%d prefill recipe warmup at position %d",
+                                self.model.pp_rank, tokens, start_position)
         tokens = 6 if self.use_dspark else 1
         logger.info("V4.1 PP%d starting C%d memory profile", self.model.pp_rank, tokens)
         self._dummy_run(tokens)
@@ -1608,10 +1706,14 @@ class V41ModelRunner:
         # C6 is a DSpark-only anchor-plus-draft geometry. Prompt C128 recipes
         # are compiled by real prefill qualification and persisted in cache.
         for count in ((1, 6) if self.use_dspark else (1, )):
-            for _ in range(4 if self.model.native else 1):
-                self._dummy_run(count, native=self.model.native)
-            if self.model.native:
-                self.model.program.replay_owner.require_ready(count)
+            runtime = count == 1 and getattr(self.model.program, "runtime_indexer", False)
+            geometries = (tuple(decode_search_warmups(self.model.program.length, runtime_indexer=True))
+                          if runtime else ((0, 512), ))
+            for start_position, search in geometries:
+                for _ in range(4 if self.model.native else 1):
+                    self._dummy_run(count, native=self.model.native, start_position=start_position)
+                if self.model.native:
+                    self.model.program.replay_owner.require_ready(count, search=search)
             self.graphed_buckets.add(count)
         if self.use_dspark and isinstance(self.state, PagedStageState):
             # Exercise the first real indexer/head exchange before advertising

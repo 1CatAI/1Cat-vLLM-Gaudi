@@ -29,7 +29,6 @@ def runtime_specs(shard):
 
 
 class N256PreparedShard:
-
     def __init__(self, directory, shard):
         directory = Path(directory)
         manifest = json.loads((directory / "manifest.json").read_text())

@@ -51,16 +51,10 @@ def prepare_rank(shard, directory):
     partial.replace(path)
     digest = file_hash(path)
     stat = path.stat()
-    record = {
-        "file": path.name,
-        "bytes": stat.st_size,
-        "sha256": digest,
-        "inode": stat.st_ino,
-        "mtime_ns": stat.st_mtime_ns,
-        "source_sha256": shard.manifest["rank_files"][rank]["sha256"],
-        "verified_expert_matrices": matrices,
-        "temporary_upper_bound_bytes": peak
-    }
+    record = {"file": path.name, "bytes": stat.st_size, "sha256": digest,
+              "inode": stat.st_ino, "mtime_ns": stat.st_mtime_ns,
+              "source_sha256": shard.manifest["rank_files"][rank]["sha256"],
+              "verified_expert_matrices": matrices, "temporary_upper_bound_bytes": peak}
     publish_json(directory / f"{rank}-record.json", record)
     return rank, record
 
@@ -79,17 +73,11 @@ def main():
     if shutil.disk_usage(args.output.parent).free < required + (8 << 30):
         raise RuntimeError(f"N256 export requires {required} bytes plus 8 GiB free headroom")
     args.output.mkdir(exist_ok=False)
-    manifest = {
-        "schema_version": 1,
-        "layout": LAYOUT,
-        "layout_fingerprint": FINGERPRINT,
-        "quantization_fingerprint": QUANTIZATION_FINGERPRINT,
-        "source_manifest_sha256": file_hash(args.prepared / "manifest.json"),
-        "tensor_parallel_size": 2,
-        "pipeline_parallel_size": 2,
-        "rank_files": {},
-        "scope": "runtime expert weights; dense/Engram use existing immutable sources"
-    }
+    manifest = {"schema_version": 1, "layout": LAYOUT, "layout_fingerprint": FINGERPRINT,
+                "quantization_fingerprint": QUANTIZATION_FINGERPRINT,
+                "source_manifest_sha256": file_hash(args.prepared / "manifest.json"),
+                "tensor_parallel_size": 2, "pipeline_parallel_size": 2,
+                "rank_files": {}, "scope": "runtime expert weights; dense/Engram use existing immutable sources"}
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         jobs = [pool.submit(prepare_rank, shard, args.output) for shard in shards]
         for future in as_completed(jobs):

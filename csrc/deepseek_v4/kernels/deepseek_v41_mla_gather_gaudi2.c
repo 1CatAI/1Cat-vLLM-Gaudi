@@ -6,7 +6,7 @@ void main(tensor swa, tensor main_kv, tensor indices, tensor lengths,
 #ifndef DSV41_MLA_SHARED_KV
           tensor values,
 #endif
-          tensor mask, int swa_offset, int main_rows) {
+          tensor mask, int swa_offset, int main_rows, int prefix_rows) {
     const int5 start = get_index_space_offset();
     const int5 end = start + get_index_space_size();
     const bool ready = s_i32_ld_g(gen_addr((int5){0}, swa_done)) >= 0 &&
@@ -14,17 +14,17 @@ void main(tensor swa, tensor main_kv, tensor indices, tensor lengths,
     const int length = s_i32_ld_g(gen_addr((int5){0}, lengths));
     for (int row = start[0]; row < end[0]; ++row) {
         const int index = s_i32_ld_g(gen_addr((int5){row, 0, 0, 0, 0}, indices));
-        const bool valid = ready && row < length && index >= 0 && index < 512 + main_rows;
+        const bool valid = ready && row < length && index >= 0 && index < prefix_rows + main_rows;
         for (int chunk = 0; chunk < 4; ++chunk) {
             const int5 at = {chunk * 128, row, 0, 0, 0};
             bfloat128 value = 0;
             if (valid) {
                 int5 source = {chunk * 128, index, 0, 0, 0};
-                if (index < 512) {
+                if (index < prefix_rows) {
                     source[1] += swa_offset;
                     value = v_bf16_ld_tnsr_b(source, swa);
                 } else {
-                    source[1] -= 512;
+                    source[1] -= prefix_rows;
                     value = v_bf16_ld_tnsr_b(source, main_kv);
                 }
             }

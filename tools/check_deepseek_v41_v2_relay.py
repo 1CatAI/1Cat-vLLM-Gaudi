@@ -1,20 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Check the actual V2 device sampler/PP relay through the next embedding."""
+# ruff: noqa: E402
 import json
 import os
 from pathlib import Path
 import time
 
-# HPU imports must follow the per-rank device selection.
 rank = int(os.environ["LOCAL_RANK"])
 os.environ["HLS_MODULE_ID"] = os.environ["HABANA_VISIBLE_MODULES"].split(",")[rank]
 
-import torch  # noqa: E402
-import habana_frameworks.torch  # noqa: E402
-import habana_frameworks.torch.distributed.hccl  # noqa: E402, F401 -- registers the HCCL backend
-from vllm_gaudi.ops.deepseek_v4_config import bind_worker_cpu, bind_worker_helpers  # noqa: E402
-from vllm_gaudi.ops.deepseek_v41_sampling import select_greedy_candidate  # noqa: E402
-from vllm_gaudi.distributed.tp2_fused_ar_norm import _load_bridge, _verify_prepared_runtime  # noqa: E402
+import torch
+import habana_frameworks.torch
+import habana_frameworks.torch.distributed.hccl  # noqa: F401
+from vllm_gaudi.ops.deepseek_v4_config import bind_worker_cpu, bind_worker_helpers
+from vllm_gaudi.ops.deepseek_v41_sampling import select_greedy_candidate
+from vllm_gaudi.distributed.tp2_fused_ar_norm import _load_bridge, _verify_prepared_runtime
 
 
 def sample(candidates):

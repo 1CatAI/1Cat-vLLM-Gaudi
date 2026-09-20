@@ -20,6 +20,7 @@ from vllm_gaudi.ops.deepseek_v4_mxfp4 import (
     restore_mxfp4_u8,
 )
 
+
 PREFILL_EXPERT_CHUNK = 64
 PREFILL_BF16_EXPERT_CHUNK = 24
 
@@ -75,8 +76,8 @@ def restore_n256_scale_u8(planes: torch.Tensor) -> torch.Tensor:
     experts, blocks, stream = planes.shape
     k = stream // 8
     original = _i16_little_endian_bytes(planes).reshape(experts, blocks, k // 32, 512)[..., :256]
-    return (original.reshape(experts, blocks, k // 32, 2,
-                             128).permute(0, 1, 3, 4, 2).reshape(experts, blocks * 256, k // 32).contiguous())
+    return (original.reshape(experts, blocks, k // 32, 2, 128)
+            .permute(0, 1, 3, 4, 2).reshape(experts, blocks * 256, k // 32).contiguous())
 
 
 def q16_chunked_mxfp4_moe(
@@ -92,8 +93,8 @@ def q16_chunked_mxfp4_moe(
 ) -> torch.Tensor:
     """Run a large-M fused MoE without a persistent second weight layout."""
     experts = w13_q16.shape[0]
-    if (experts != w2_q16.shape[0] or experts != w13_s16.shape[0] or experts != w2_s16.shape[0]
-            or experts % expert_chunk):
+    if (experts != w2_q16.shape[0] or experts != w13_s16.shape[0]
+            or experts != w2_s16.shape[0] or experts % expert_chunk):
         raise ValueError("V4.1 prefill expert tensors require equal, exactly chunked expert axes")
     if hidden_states.ndim != 2 or hidden_states.shape[0] <= 6:
         raise ValueError("The large-M V4.1 prefill path requires more than six tokens")
@@ -162,8 +163,8 @@ def q16_chunked_bf16_moe(
     calls.  This is a prompt-only compatibility path; C1 stays on N256.
     """
     experts = w13_q16.shape[0]
-    if (experts != w2_q16.shape[0] or experts != w13_s16.shape[0] or experts != w2_s16.shape[0]
-            or experts % expert_chunk):
+    if (experts != w2_q16.shape[0] or experts != w13_s16.shape[0]
+            or experts != w2_s16.shape[0] or experts % expert_chunk):
         raise ValueError("V4.1 BF16 prefill bridge requires equal, exactly chunked expert axes")
     if hidden_states.ndim != 2 or hidden_states.shape[0] <= 6:
         raise ValueError("The BF16 prefill bridge requires more than six tokens")
@@ -183,12 +184,12 @@ def q16_chunked_bf16_moe(
                                     dtype=torch.int32).reshape(1, expert_chunk)
     for start in range(0, experts, expert_chunk):
         stop = start + expert_chunk
-        w13_kn = torch.ops.custom_op.custom_deepseek_v41_expert_n256_bf16_gaudi2(local_decode_ids, w13_q16[start:stop],
-                                                                                 w13_s16[start:stop], lookup,
-                                                                                 normal_scales)
-        w2_kn = torch.ops.custom_op.custom_deepseek_v41_expert_n256_bf16_gaudi2(local_decode_ids, w2_q16[start:stop],
-                                                                                w2_s16[start:stop], lookup,
-                                                                                normal_scales)
+        w13_kn = torch.ops.custom_op.custom_deepseek_v41_expert_n256_bf16_gaudi2(
+            local_decode_ids, w13_q16[start:stop], w13_s16[start:stop], lookup,
+            normal_scales)
+        w2_kn = torch.ops.custom_op.custom_deepseek_v41_expert_n256_bf16_gaudi2(
+            local_decode_ids, w2_q16[start:stop], w2_s16[start:stop], lookup,
+            normal_scales)
         # Standard fused-MoE with permuted_weights=True consumes [N,K].
         w13_nk = w13_kn.transpose(1, 2).contiguous()
         w2_nk = w2_kn.transpose(1, 2).contiguous()

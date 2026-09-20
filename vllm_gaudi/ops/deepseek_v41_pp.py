@@ -55,7 +55,7 @@ class PackedC1Buffers:
 
     def complete(self):
         # The worker calls this only after its existing completion record has
-        # reached the host, or after the startup-only device synchronization.
+        # reached the host, or after a startup/prefill device synchronization.
         if self.active is not None:
             slot, generation = self.active
             if generation != self.owners[slot]:

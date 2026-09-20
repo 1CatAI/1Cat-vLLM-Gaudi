@@ -71,7 +71,8 @@ void fp4_paged_contract(const at::Tensor& main, const at::Tensor& index,
                 mv.sizes() == at::IntArrayRef({1,512}) && iv.sizes() == at::IntArrayRef({1,128}) &&
                 packed_position.sizes() == at::IntArrayRef({1}) &&
                 decoded_position.sizes() == at::IntArrayRef({1}) &&
-                decoded.sizes() == at::IntArrayRef({512,512}),
+                decoded.dim() == 2 && decoded.size(1) == 512 &&
+                decoded.size(0) >= 512 && decoded.size(0) <= 2560,
                 "Invalid paged decoded FP4 C1 row contract");
 }
 void attention_contract(const at::Stack& stack) {
@@ -85,7 +86,7 @@ void attention_contract(const at::Stack& stack) {
     TORCH_CHECK(q.dim() == 3 && q.size(0) > 0 && q.size(1) > 0 && q.size(1) <= 64 && q.size(2) == 512 &&
                 swa.dim() == 2 && swa.size(1) == 512 && main.dim() == 2 && main.size(1) == 512 &&
                 offset >= 0 && offset % 512 == 0 && offset <= swa.size(0) - 512 && offset <= 40 * 512 &&
-                rows >= 0 && rows <= main.size(0) && rows <= 512 &&
+                rows >= 0 && rows <= main.size(0) && rows <= 2560 &&
                 ids.dim() == 2 && ids.size(0) == q.size(0) && ids.size(1) > 0 &&
                 sink.sizes() == at::IntArrayRef({q.size(1)}) && scale.sizes() == at::IntArrayRef({1}) &&
                 lengths.sizes() == at::IntArrayRef({q.size(0)}), "Invalid decoded attention tensor contract");

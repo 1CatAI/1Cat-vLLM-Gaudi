@@ -30,6 +30,14 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_EXPERT_N256_FP8: bool = False
     VLLM_HPU_DSV41_PREFILL_MXFP4: bool = False
     VLLM_HPU_DSV41_PREFILL_GROUPED: bool = False
+    VLLM_HPU_DSV41_PREFILL_NATIVE_PLAN: bool = False
+    VLLM_HPU_DSV41_PREFILL_ROUTE_OUTPUT: bool = False
+    VLLM_HPU_DSV41_PREFILL_SKIP_EMPTY: bool = False
+    VLLM_HPU_DSV41_PREFILL_DEVICE_ROUTES: bool = False
+    VLLM_HPU_DSV41_PREFILL_EXPERT_ROWS: int = 64
+    VLLM_HPU_DSV41_PREFILL_MLA_ROWS: int = 0
+    VLLM_HPU_DSV41_PREFILL_COMPACT_CANDIDATES: bool = False
+    VLLM_HPU_DSV41_PREFILL_INDEX_MME: bool = False
     VLLM_HPU_DSV41_EXPERT_FUSED_QUANT: bool = False
     VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE: bool = False
     VLLM_HPU_DSV41_MLA_MME: bool = False
@@ -48,6 +56,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_SELECTED_VALID_ONLY: bool = False
     VLLM_HPU_DSV41_DECODED_KV_STATE: bool = False
     VLLM_HPU_DSV41_PAGED_DECODED_KV_STATE: bool = False
+    VLLM_HPU_DSV41_RUNTIME_INDEXER: bool = False
     VLLM_HPU_DSV41_SELECTED_KV_VECTOR: bool = False
     VLLM_HPU_DSV41_ATTENTION_BLOCK_EXP: bool = False
     VLLM_HPU_DSV41_ATTENTION_PAIRED_EXP: bool = False
@@ -90,6 +99,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_FP8_SIDECAR: str = ""
     VLLM_HPU_DSV41_FP8_CONFIG: str = ""
     VLLM_HPU_DSV41_WO_A_FP8: bool = False
+    VLLM_HPU_DSV41_WOA_OUTPUT_ROUNDTRIP: bool = False
     VLLM_HPU_DSV41_WO_A_FP8_SIDECAR: str = ""
     VLLM_HPU_DSV41_WO_A_FP8_CONFIG: str = ""
     VLLM_HPU_DSV41_PHASE_TRACE: bool = False
@@ -361,6 +371,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_PREFILL_MXFP4", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_PREFILL_GROUPED":
     lambda: os.environ.get("VLLM_HPU_DSV41_PREFILL_GROUPED", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_PREFILL_NATIVE_PLAN":
+    lambda: os.environ.get("VLLM_HPU_DSV41_PREFILL_NATIVE_PLAN", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_PREFILL_ROUTE_OUTPUT":
+    lambda: os.environ.get("VLLM_HPU_DSV41_PREFILL_ROUTE_OUTPUT", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_PREFILL_SKIP_EMPTY":
+    lambda: os.environ.get("VLLM_HPU_DSV41_PREFILL_SKIP_EMPTY", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_PREFILL_DEVICE_ROUTES":
+    lambda: os.environ.get("VLLM_HPU_DSV41_PREFILL_DEVICE_ROUTES", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_PREFILL_EXPERT_ROWS":
+    lambda: int(os.environ.get("VLLM_HPU_DSV41_PREFILL_EXPERT_ROWS", "64")),
+    "VLLM_HPU_DSV41_PREFILL_MLA_ROWS":
+    lambda: int(os.environ.get("VLLM_HPU_DSV41_PREFILL_MLA_ROWS", "0")),
+    "VLLM_HPU_DSV41_PREFILL_COMPACT_CANDIDATES":
+    lambda: os.environ.get("VLLM_HPU_DSV41_PREFILL_COMPACT_CANDIDATES", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_PREFILL_INDEX_MME":
+    lambda: os.environ.get("VLLM_HPU_DSV41_PREFILL_INDEX_MME", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_EXPERT_FUSED_QUANT":
     lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_FUSED_QUANT", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE":
@@ -395,6 +421,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_DECODED_KV_STATE", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_PAGED_DECODED_KV_STATE":
     lambda: os.environ.get("VLLM_HPU_DSV41_PAGED_DECODED_KV_STATE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_RUNTIME_INDEXER":
+    lambda: os.environ.get("VLLM_HPU_DSV41_RUNTIME_INDEXER", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_SELECTED_KV_VECTOR":
     lambda: os.environ.get("VLLM_HPU_DSV41_SELECTED_KV_VECTOR", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_ATTENTION_BLOCK_EXP":
@@ -479,6 +507,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_FP8_CONFIG", ""),
     "VLLM_HPU_DSV41_WO_A_FP8":
     lambda: os.environ.get("VLLM_HPU_DSV41_WO_A_FP8", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_WOA_OUTPUT_ROUNDTRIP":
+    lambda: os.environ.get("VLLM_HPU_DSV41_WOA_OUTPUT_ROUNDTRIP", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_WO_A_FP8_SIDECAR":
     lambda: os.environ.get("VLLM_HPU_DSV41_WO_A_FP8_SIDECAR", ""),
     "VLLM_HPU_DSV41_WO_A_FP8_CONFIG":

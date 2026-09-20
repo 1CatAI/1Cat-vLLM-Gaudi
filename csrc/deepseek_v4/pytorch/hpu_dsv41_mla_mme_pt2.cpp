@@ -6,7 +6,7 @@
 namespace {
 constexpr auto kSchema = "custom_op::custom_deepseek_v41_mla_mme_gaudi2";
 constexpr auto kBf16Schema = "custom_op::custom_deepseek_v41_mla_bf16_pv_gaudi2";
-struct Params { int32_t offset, rows; };
+struct Params { int32_t offset, rows, prefix_rows; };
 habana::OutputMetaDataVector meta(const at::Stack& s) {
     const auto q = s.at(0).toTensor(), swa = s.at(1).toTensor(), kv = s.at(2).toTensor();
     const auto ids = s.at(3).toTensor();
@@ -16,11 +16,12 @@ habana::OutputMetaDataVector meta(const at::Stack& s) {
         TORCH_CHECK(x.scalar_type() == type && x.device() == q.device() && x.is_contiguous() && !x.requires_grad(),
                     "MME MLA requires matching contiguous inference tensors");
     }
-    const auto offset = s.at(9).toInt(), rows = s.at(10).toInt();
+    const auto offset = s.at(9).toInt(), rows = s.at(10).toInt(), prefix_rows = s.at(11).toInt();
     TORCH_CHECK(q.dim() == 3 && q.size(0) == 1 && q.size(1) > 0 && q.size(1) <= 64 && q.size(2) == 512 &&
                 swa.dim() == 2 && swa.size(1) == 512 && kv.dim() == 2 && kv.size(1) == 512 &&
                 offset >= 0 && offset % 512 == 0 && offset <= swa.size(0) - 512 &&
-                rows >= 0 && rows <= kv.size(0) && rows <= 512 &&
+                rows >= 0 && rows <= kv.size(0) && rows <= 2560 &&
+                (prefix_rows == 256 || prefix_rows == 512) &&
                 ids.dim() == 2 && ids.size(0) == 1 && ids.size(1) > 0 && ids.size(1) <= 640 && ids.size(1) % 64 == 0 &&
                 s.at(4).toTensor().sizes() == at::IntArrayRef({q.size(1)}) &&
                 s.at(5).toTensor().sizes() == at::IntArrayRef({1}) &&
@@ -38,7 +39,7 @@ public:
     void AddNode(synapse_helpers::graph& graph, const at::Stack& s) override {
         const auto output = meta(s);
         const auto heads = s.at(0).toTensor().size(1), width = s.at(3).toTensor().size(1);
-        Params params{int32_t(s.at(9).toInt()), int32_t(s.at(10).toInt())};
+        Params params{int32_t(s.at(9).toInt()), int32_t(s.at(10).toInt()), int32_t(s.at(11).toInt())};
         auto kv = bf16_ ? BuildNode(this, graph, {"custom_deepseek_v41_mla_shared_kv_gaudi2",
             {syn_in(1),syn_in(2),syn_in(3),syn_in(6),syn_in(7),syn_in(8)},
             {{{width,512},at::kBFloat16}, {{width},at::kFloat}}, &params,sizeof(params)}) :
@@ -75,8 +76,8 @@ const bool registered = [] {
 }();
 template<bool Meta, bool Bf16 = false> at::Tensor run(const at::Tensor& q, const at::Tensor& swa, const at::Tensor& kv,
     const at::Tensor& ids, const at::Tensor& sink, const at::Tensor& scale, const at::Tensor& lengths,
-    const at::Tensor& swa_done, const at::Tensor& main_done, int64_t offset, int64_t rows) {
-    at::Stack s{q,swa,kv,ids,sink,scale,lengths,swa_done,main_done,offset,rows};
+    const at::Tensor& swa_done, const at::Tensor& main_done, int64_t offset, int64_t rows, int64_t prefix_rows) {
+    at::Stack s{q,swa,kv,ids,sink,scale,lengths,swa_done,main_done,offset,rows,prefix_rows};
     const auto m = meta(s);
     if (Meta) return at::empty(m.at(0).shape,q.options());
     TORCH_CHECK(registered && q.device().type() == at::kHPU);
@@ -86,9 +87,11 @@ template<bool Meta, bool Bf16 = false> at::Tensor run(const at::Tensor& q, const
 }
 TORCH_LIBRARY_FRAGMENT(custom_op,m) {
     m.def("custom_deepseek_v41_mla_mme_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor indices, Tensor sink, "
-          "Tensor scale, Tensor lengths, Tensor swa_completion, Tensor main_completion, int swa_offset, int main_rows) -> Tensor");
+          "Tensor scale, Tensor lengths, Tensor swa_completion, Tensor main_completion, int swa_offset, int main_rows, "
+          "int prefix_rows) -> Tensor");
     m.def("custom_deepseek_v41_mla_bf16_pv_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor indices, Tensor sink, "
-          "Tensor scale, Tensor lengths, Tensor swa_completion, Tensor main_completion, int swa_offset, int main_rows) -> Tensor");
+          "Tensor scale, Tensor lengths, Tensor swa_completion, Tensor main_completion, int swa_offset, int main_rows, "
+          "int prefix_rows) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(custom_op,HPU,m) {
     m.impl("custom_deepseek_v41_mla_mme_gaudi2",run<false>);

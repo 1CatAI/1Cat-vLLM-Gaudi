@@ -10,7 +10,12 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
 from vllm_gaudi import envs
 from vllm_gaudi.ops.deepseek_v41_config import uses_v2, validate_v2
-from vllm_gaudi.v1.worker.deepseek_v41_runner import V41ModelRunner, logger, target_search_length
+from vllm_gaudi.v1.worker.deepseek_v41_runner import (
+    V41ModelRunner,
+    logger,
+    runtime_search_length,
+    target_search_length,
+)
 
 
 @dataclass(frozen=True)
@@ -88,10 +93,18 @@ class V41V2ModelRunner(V41ModelRunner):
                 and self._continuation_authorized(record, scheduled)):
             return False
         program = self.model.program
-        next_search = target_search_length(record.start + 1, 1, program.length)
+        next_search = (runtime_search_length(record.start + 1, 1, program.length)
+                       if getattr(program, "runtime_indexer", False) else
+                       target_search_length(record.start + 1, 1, program.length))
         ready = self.model.decode_prefix_ready(next_search)
         if not ready:
             self.audit["v2_prefix_bucket_captures"] = self.audit.get("v2_prefix_bucket_captures", 0) + 1
+        if next_search != getattr(program, "search_length", min(512, program.length)):
+            # _forward owns the attention and rotary bindings.  At a geometry
+            # transition the complete native entry must switch them before a
+            # segmented prefix can be launched safely.
+            self.audit["v2_prefix_bucket_transitions"] = self.audit.get("v2_prefix_bucket_transitions", 0) + 1
+            return False
         return ready
 
     def _consume_completion(self, scheduled=None):
