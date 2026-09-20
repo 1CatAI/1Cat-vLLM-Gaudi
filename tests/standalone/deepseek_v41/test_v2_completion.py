@@ -50,7 +50,9 @@ def test_sync_batch_output_does_not_require_engine_diagnostic_field(rounds):
     runner.draft_token_ids = None
     runner._update = lambda scheduled: None
     runner._execute_request = lambda scheduled, req_id, count: None
-    request_output = ModelRunnerOutput(req_ids=["a"], req_id_to_index={"a": 0}, sampled_token_ids=[[11]])
+    request_output = ModelRunnerOutput(req_ids=["a"],
+                                       req_id_to_index={"a": 0},
+                                       sampled_token_ids=[[11]])
     if rounds is not None:
         request_output.execution_rounds = rounds
     runner._finish_request = lambda: request_output
@@ -161,7 +163,7 @@ def test_v2_gate_requires_the_complete_segmented_device_contract(monkeypatch):
     for key, value in values.items():
         monkeypatch.setenv(key, "1" if value else "0")
     config = SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v41"),
-                                                          max_model_len=512),
+                                                         max_model_len=512),
                              use_v2_model_runner=True,
                              scheduler_config=SimpleNamespace(async_scheduling=True),
                              speculative_config=None)
@@ -276,7 +278,8 @@ def test_new_search_bucket_captures_complete_plan_before_segmenting(monkeypatch)
         decode_prefix_ready=lambda search: ready.append(search) or False,
         program=SimpleNamespace(length=1 << 20),
     )
-    scheduled = SimpleNamespace(num_scheduled_tokens={"a": 1}, finished_req_ids=set(), scheduled_spec_decode_tokens={})
+    scheduled = SimpleNamespace(num_scheduled_tokens={"a": 1}, finished_req_ids=set(),
+                                scheduled_spec_decode_tokens={})
 
     runner._consume_completion(scheduled)
 

@@ -46,7 +46,7 @@ def _measure(fn, args, warmup, rounds):
 
 def _equal(actual, expected, *, rtol=0, atol=0):
     if isinstance(actual, torch.Tensor):
-        actual, expected = (actual, ), (expected, )
+        actual, expected = (actual,), (expected,)
     for lhs, rhs in zip(actual, expected, strict=True):
         torch.testing.assert_close(lhs.cpu(), rhs.cpu(), rtol=rtol, atol=atol)
 
@@ -69,9 +69,9 @@ def main():
     image = torch.randn(384, dtype=torch.float32, device="hpu")
     mask = (torch.arange(t, device="hpu") % 7 == 0)
     router = torch.ops.custom_op.custom_deepseek_v41_router_top6_gaudi2
-    router_ref = lambda s, a, b, m: (lambda ids: (ids.int(), s.gather(1, ids) / (s.gather(1, ids).sum(
-        -1, keepdim=True) + 1e-20) * 1.5))(torch.argsort(
-            s + torch.where(m[:, None], b, a), dim=-1, descending=True, stable=True)[:, :6])
+    router_ref = lambda s, a, b, m: (lambda ids: (ids.int(), s.gather(1, ids) /
+        (s.gather(1, ids).sum(-1, keepdim=True) + 1e-20) * 1.5))(
+            torch.argsort(s + torch.where(m[:, None], b, a), dim=-1, descending=True, stable=True)[:, :6])
     router_compiled, router_time = _measure(router, (scores, text, image, mask), args.warmup, args.rounds)
     actual = router_compiled(scores, text, image, mask)
     expected = router_ref(scores, text, image, mask)
@@ -81,10 +81,8 @@ def main():
     assert not torch.equal(actual[0].cpu(), router_compiled(changed, text, image, mask)[0].cpu())
     _, router_ref_time = _measure(router_ref, (scores, text, image, mask), args.warmup, args.rounds)
     report["results"]["router_top6"] = {
-        "candidate": router_time,
-        "generic_stable_sort_reference": router_ref_time,
-        "ids_and_weights_match": True,
-        "changed_input_consumed": True,
+        "candidate": router_time, "generic_stable_sort_reference": router_ref_time,
+        "ids_and_weights_match": True, "changed_input_consumed": True,
     }
 
     mixes = torch.randn(t, 24, dtype=torch.float32, device="hpu")
@@ -102,24 +100,23 @@ def main():
         return torch.cat((pre, post, sink(comb.contiguous()).flatten(1)), -1)
 
     gates_compiled, gates_time = _measure(gates, (mixes, rrms, scale, base), args.warmup, args.rounds)
-    gates_ref_compiled, gates_ref_time = _measure(gates_reference, (mixes, rrms, scale, base), args.warmup, args.rounds)
-    _equal(gates_compiled(mixes, rrms, scale, base), gates_ref_compiled(mixes, rrms, scale, base), rtol=2e-5, atol=2e-6)
+    gates_ref_compiled, gates_ref_time = _measure(gates_reference, (mixes, rrms, scale, base),
+                                                   args.warmup, args.rounds)
+    _equal(gates_compiled(mixes, rrms, scale, base), gates_ref_compiled(mixes, rrms, scale, base),
+           rtol=2e-5, atol=2e-6)
     report["results"]["mhc_gates_sinkhorn"] = {
-        "candidate": gates_time,
-        "torch_chain_reference": gates_ref_time,
-        "values_match": True,
+        "candidate": gates_time, "torch_chain_reference": gates_ref_time, "values_match": True,
     }
 
     activation = torch.randn(t, 5120, dtype=torch.bfloat16, device="hpu")
     quant = torch.ops.custom_op.custom_deepseek_v41_quant_roundtrip_bf16_gaudi2
     from vllm_gaudi.ops.deepseek_v41_math import _pack_swa_torch, unpack_swa
     quant_ref = lambda x: unpack_swa(_pack_swa_torch(x), x.shape[-1])
-    quant_compiled, quant_time = _measure(quant, (activation, ), args.warmup, args.rounds)
-    quant_ref_compiled, quant_ref_time = _measure(quant_ref, (activation, ), args.warmup, args.rounds)
+    quant_compiled, quant_time = _measure(quant, (activation,), args.warmup, args.rounds)
+    quant_ref_compiled, quant_ref_time = _measure(quant_ref, (activation,), args.warmup, args.rounds)
     _equal(quant_compiled(activation), quant_ref_compiled(activation))
     report["results"]["activation_quant_roundtrip"] = {
-        "candidate": quant_time,
-        "torch_pack_unpack_reference": quant_ref_time,
+        "candidate": quant_time, "torch_pack_unpack_reference": quant_ref_time,
         "bitwise_match": True,
     }
 
@@ -139,8 +136,8 @@ def main():
         ("fp4_g32", lambda x: pack_fp4(x, 32), lambda x: _pack_fp4_torch(x, 32)),
     )
     for name, candidate, reference in codecs:
-        candidate_compiled, candidate_time = _measure(candidate, (kv, ), args.warmup, args.rounds)
-        reference_compiled, reference_time = _measure(reference, (kv, ), args.warmup, args.rounds)
+        candidate_compiled, candidate_time = _measure(candidate, (kv,), args.warmup, args.rounds)
+        reference_compiled, reference_time = _measure(reference, (kv,), args.warmup, args.rounds)
         _equal(candidate_compiled(kv), reference_compiled(kv))
         report["results"][f"prefill_{name}_pack"] = {
             "candidate": candidate_time,

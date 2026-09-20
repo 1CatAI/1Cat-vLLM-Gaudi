@@ -4,15 +4,12 @@
 #ifdef DSV41_DECODED_KV_WRITE
 #include "deepseek_v41_kv_decode.h"
 #endif
-static inline void swa_pack_group(tensor value, tensor output, int group,
-                                  int input_row, int output_row
+static inline void swa_pack_number(float64 number, tensor output, int group,
+                                   int output_row, int width
 #ifdef DSV41_DECODED_KV_WRITE
                                   , tensor decoded, int decoded_row
 #endif
                                   ) {
-    const int width = get_dim_size(value, 0);
-    const bfloat128 input = v_bf16_ld_tnsr_partial_b((int5){32 * group, input_row, 0, 0, 0}, value, 31, 0);
-    const float64 number = convert_bfloat128_to_float128(input, SW_LINEAR).v1;
     const float64 absolute = v_f32_abs_b(number);
     const uint64 bits = as_uint64(absolute);
     const float64 nan_lanes = v_f32_sel_grt_u32_b(bits, 0x7f800000, 1.0f, 0.0f);
@@ -54,4 +51,22 @@ static inline void swa_pack_group(tensor value, tensor output, int group,
     wide.v1 = as_uint64(scale_code);
     const uchar256 scales = convert_uint256_to_uchar256(wide, SW_LINEAR);
     v_u8_st_tnsr_partial((int5){width + group, output_row, 0, 0, 0}, output, scales, 0, 0);
+}
+
+static inline void swa_pack_group(tensor value, tensor output, int group,
+                                  int input_row, int output_row
+#ifdef DSV41_DECODED_KV_WRITE
+                                  , tensor decoded, int decoded_row
+#endif
+                                  ) {
+    const int width = get_dim_size(value, 0);
+    const bfloat128 input = v_bf16_ld_tnsr_partial_b(
+        (int5){32 * group, input_row, 0, 0, 0}, value, 31, 0);
+    const float64 number =
+        convert_bfloat128_to_float128(input, SW_LINEAR).v1;
+    swa_pack_number(number, output, group, output_row, width
+#ifdef DSV41_DECODED_KV_WRITE
+                    , decoded, decoded_row
+#endif
+                    );
 }

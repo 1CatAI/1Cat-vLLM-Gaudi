@@ -27,13 +27,15 @@ tpc_lib_api::GlueCodeReturn DeepseekV41SelectedMlaGaudi2::GetGcDefinitions(
     };
     const auto& input = in->inputTensors[gather_ ? 1 : 0].geometry;
     const uint64_t width = input.maxSizes[0], tokens = input.maxSizes[gather_ ? 1 : 2];
-    if (!width || width > 640 || width % 64 || !tokens || tokens > 6) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+    // The common gather/softmax implementation also serves bounded prefill
+    // tiles. Public op metadata retains the smaller decode contract.
+    if (!width || width > 640 || width % 64 || !tokens || tokens > 64) return GLUE_INCOMPATIBLE_INPUT_SIZE;
     out->indexSpaceRank = 2;
     out->indexSpaceGeometry[1] = tokens;
     for (unsigned i = 0; i < inputs; ++i) out->inputTensorAccessPattern[i].allRequired = true;
     if (gather_) {
         if (!matches(in->inputTensors[0], DATA_BF16, 2, 512) ||
-            !in->inputTensors[0].geometry.maxSizes[1] || in->inputTensors[0].geometry.maxSizes[1] > 4096 ||
+            !in->inputTensors[0].geometry.maxSizes[1] || in->inputTensors[0].geometry.maxSizes[1] > 131072 ||
             !matches(in->inputTensors[1], DATA_I32, 2, width) ||
             !matches(in->inputTensors[2], DATA_I32, 1, tokens)) return GLUE_INCOMPATIBLE_INPUT_SIZE;
         out->indexSpaceGeometry[0] = width;

@@ -16,6 +16,7 @@ import torch
 from vllm_gaudi.ops.deepseek_v41_shard_loader import PreparedV41Shard
 from vllm_gaudi.ops.deepseek_v4_mxfp4 import restore_mxfp4_scale_u8, restore_mxfp4_u8
 
+
 DTYPES = {"I16": torch.int16, "BF16": torch.bfloat16}
 
 
@@ -38,9 +39,7 @@ def main():
     parser.add_argument("--expert-chunk", type=int, default=4)
     parser.add_argument("--tokens", type=int, default=128)
     parser.add_argument("--repeats", type=int, default=5)
-    parser.add_argument("--chain",
-                        type=int,
-                        default=1,
+    parser.add_argument("--chain", type=int, default=1,
                         help="enqueue this many dependent MoE layers before each synchronize")
     parser.add_argument("--n256", action="store_true")
     parser.add_argument("--skip-reference", action="store_true")
@@ -74,8 +73,8 @@ def main():
 
     standard = None
     if not args.skip_reference:
-        standard_cpu = (restore_mxfp4_u8(cpu_q13), restore_mxfp4_u8(cpu_q2), restore_mxfp4_scale_u8(cpu_s13),
-                        restore_mxfp4_scale_u8(cpu_s2))
+        standard_cpu = (restore_mxfp4_u8(cpu_q13), restore_mxfp4_u8(cpu_q2),
+                        restore_mxfp4_scale_u8(cpu_s13), restore_mxfp4_scale_u8(cpu_s2))
         standard = tuple(map(views, (value.to("hpu") for value in standard_cpu)))
     if args.n256:
         import numpy as np
@@ -95,15 +94,16 @@ def main():
     chunked_backend = _mxfp4_hpu_backend if args.backend == "mxfp4" else "hpu_backend"
     implementation = q16_chunked_mxfp4_moe if args.implementation == "mxfp4" else q16_chunked_bf16_moe
     chunked = torch.compile(implementation, backend=chunked_backend, fullgraph=True, dynamic=False)
-    expected = (None if standard is None else full(x, ids, routing.to(torch.bfloat16), *standard, 32, "silu", 0,
-                                                   args.experts - 1, 0, 0))
+    expected = (None if standard is None else
+                full(x, ids, routing.to(torch.bfloat16), *standard, 32, "silu", 0, args.experts - 1, 0, 0))
     if hasattr(torch.hpu, "reset_peak_memory_stats"):
         torch.hpu.reset_peak_memory_stats()
     lookup = mxfp4_bf16_lut("hpu")
     extra = () if args.implementation == "mxfp4" else (lookup, )
     actual = x
     for _ in range(args.chain):
-        actual = chunked(actual, ids, routing, q13, q2, s13, s2, *extra, expert_chunk=args.expert_chunk)
+        actual = chunked(actual, ids, routing, q13, q2, s13, s2, *extra,
+                         expert_chunk=args.expert_chunk)
     torch.hpu.synchronize()
     exact = None if expected is None else bool(torch.equal(expected.cpu(), actual.cpu()))
     maximum = None if expected is None else float((expected.float() - actual.float()).abs().max().cpu())
@@ -112,7 +112,8 @@ def main():
         begin = time.perf_counter_ns()
         actual = x
         for _ in range(args.chain):
-            actual = chunked(actual, ids, routing, q13, q2, s13, s2, *extra, expert_chunk=args.expert_chunk)
+            actual = chunked(actual, ids, routing, q13, q2, s13, s2, *extra,
+                             expert_chunk=args.expert_chunk)
         torch.hpu.synchronize()
         samples.append((time.perf_counter_ns() - begin) / 1e6)
     report = {

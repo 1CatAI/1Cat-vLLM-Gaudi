@@ -11,7 +11,8 @@ using Pair = std::tuple<at::Tensor, at::Tensor>;
 habana::OutputMetaDataVector meta(const at::Stack& stack, bool quant) {
     const auto x = stack.at(0).toTensor();
     TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.dim() == 2 && x.size(0) >= 1 && x.size(0) <= 8192 &&
-                (x.size(1) == 1280 || x.size(1) == 4096), "Dense FP8 requires BF16 [T,1280|4096]");
+                (x.size(1) == 1280 || x.size(1) == 4096 || x.size(1) == 5120),
+                "Dense FP8 requires BF16 [T,1280|4096|5120]");
     for (const auto& item : stack) {
         const auto t = item.toTensor();
         TORCH_CHECK(t.is_contiguous() && !t.requires_grad() && t.device() == x.device(),
@@ -19,7 +20,7 @@ habana::OutputMetaDataVector meta(const at::Stack& stack, bool quant) {
     }
     if (quant) return {{at::ScalarType::Float8_e4m3fn, x.sizes().vec()}, {at::kFloat, {x.size(0), 1}}};
     const auto w = stack.at(1).toTensor(), scale = stack.at(2).toTensor();
-    const auto n = x.size(1) == 1280 ? 16384 : 5120;
+    const auto n = x.size(1) == 1280 ? 16384 : (x.size(1) == 4096 ? 5120 : 1792);
     TORCH_CHECK(w.scalar_type() == at::ScalarType::Float8_e4m3fn && w.sizes() == at::IntArrayRef({n,x.size(1)}) &&
                 scale.scalar_type() == at::kFloat && scale.sizes() == at::IntArrayRef({1,n}),
                 "Dense FP8 requires prepared Gaudi2 [N,K] weights and F32 [1,N] channel scales");

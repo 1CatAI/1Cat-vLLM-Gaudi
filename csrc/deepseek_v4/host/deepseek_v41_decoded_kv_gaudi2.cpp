@@ -95,7 +95,8 @@ tpc_lib_api::GlueCodeReturn DeepseekV41DecodedKVGaudi2::GetGcDefinitions(
             !shape(6, DATA_BF16, 2, 512) ||
             in->inputTensors[0].geometry.maxSizes[1] != in->inputTensors[1].geometry.maxSizes[1] ||
             in->inputTensors[2].geometry.maxSizes[1] != 1 || in->inputTensors[3].geometry.maxSizes[1] != 1 ||
-            in->inputTensors[6].geometry.maxSizes[1] != 512)
+            in->inputTensors[6].geometry.maxSizes[1] < 512 ||
+            in->inputTensors[6].geometry.maxSizes[1] > 2560)
             return GLUE_INCOMPATIBLE_INPUT_SIZE;
         if (!result(0, DATA_I32, 1, 36)) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
         out->indexSpaceRank = 1; out->indexSpaceGeometry[0] = 36;

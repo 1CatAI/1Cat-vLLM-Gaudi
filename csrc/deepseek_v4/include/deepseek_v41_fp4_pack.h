@@ -19,7 +19,9 @@ static inline void fp4_pack_group(tensor value, tensor output, int group, int in
                                  int decoded_row
 #endif
                                  ) {
+#ifndef DSV41_FP4_DECODE_ONLY
     const int width = get_dim_size(value, 0);
+#endif
     const bfloat128 input = v_bf16_ld_tnsr_partial_b(
         (int5){group * group_size, input_row, 0, 0, 0}, value, group_size - 1, 0);
     const float64 number = convert_bfloat128_to_float128(input, SW_LINEAR).v1;
@@ -67,11 +69,26 @@ static inline void fp4_pack_group(tensor value, tensor output, int group, int in
             numeric_code * 2.0f - 8.0f);
         decoded_value = v_f32_sel_less_u32_b(
             magnitude_code, 4, numeric_code * 0.5f, decoded_value);
+#ifndef DSV41_FP4_PRESERVE_ZERO_SIGN
         decoded_value = as_float64(as_uint64(decoded_value)
                                    | ((wide.v1 & 8) << 28));
-        decoded_value *= e4m3fn(as_uint64(scale_code));
+#endif
+        // Decoded cache writes currently request only the g16 result.  The
+        // query roundtrip below also uses this helper for UE8M0 g32, where
+        // ``scale`` is the exact power-of-two value represented by the scale
+        // byte.  Keeping both paths here guarantees the encoder and decoded
+        // result share the same midpoint decisions.
+        decoded_value *= group_size == 16
+            ? e4m3fn(as_uint64(scale_code)) : scale;
+#ifdef DSV41_FP4_PRESERVE_ZERO_SIGN
+        // TPC multiplication can canonicalize -0. Apply the FP4 sign after
+        // scaling so code 0x8 is converted to BF16 negative zero exactly.
+        decoded_value = as_float64(as_uint64(decoded_value)
+                                   | ((wide.v1 & 8) << 28));
+#else
         decoded_value = v_f32_sel_eq_f32_b(decoded_value, 0.0f,
                                            0.0f, decoded_value);
+#endif
         float128 converted = {0};
         converted.v1 = decoded_value;
         const bfloat128 decoded_bf16 = convert_float128_to_bfloat128(
@@ -81,6 +98,7 @@ static inline void fp4_pack_group(tensor value, tensor output, int group, int in
             decoded_bf16, group_size - 1, 0);
     }
 #endif
+#ifndef DSV41_FP4_DECODE_ONLY
     const uchar256 codes = convert_uint256_to_uchar256(wide, SW_LINEAR);
     // Adjacent byte codes already form little-endian 16-bit pairs. Compress
     // their nibbles before narrowing, avoiding a byte-shuffle routing table.
@@ -93,4 +111,5 @@ static inline void fp4_pack_group(tensor value, tensor output, int group, int in
     wide.v1 = as_uint64(scale_code);
     const uchar256 scales = convert_uint256_to_uchar256(wide, SW_LINEAR);
     v_u8_st_tnsr_partial((int5){width / 2 + group, output_row, 0, 0, 0}, output, scales, 0, 0);
+#endif
 }

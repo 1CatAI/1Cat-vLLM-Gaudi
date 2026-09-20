@@ -18,6 +18,7 @@ from deepseek_v41_micro_replay import RecipeRecorder
 from vllm_gaudi.ops.deepseek_v4_config import bind_worker_cpu
 from vllm_gaudi.ops.deepseek_v41_dense_fp8 import DenseFP8Sidecar
 from vllm_gaudi.ops.deepseek_v41_math import quantize_activation, rms_norm, rotary_table
+from vllm_gaudi.ops.deepseek_v41_qkv import concatenate_static_weights
 from vllm_gaudi.ops.deepseek_v41_shard_loader import PreparedV41Shard
 from vllm_gaudi.ops.deepseek_v41_woa_fp8 import WoaFP8Sidecar
 
@@ -48,7 +49,7 @@ def program(fp8, diagnostics=False, kv_first=False, fused_norm=False):
             expanded = project(latent, wqb, wqb_scale).reshape(1, 32, 512)
             q = torch.ops.custom_op.custom_deepseek_v41_rope_bf16_gaudi2(expanded, position, forward)
         output = torch.ops.custom_op.custom_deepseek_v41_mla_mme_gaudi2(
-            q, swa, main, ids, sink, scale, lengths, done, done, 0, rows)
+            q, swa, main, ids, sink, scale, lengths, done, done, 0, rows, 512)
         mla = output
         output = torch.ops.custom_op.custom_deepseek_v41_rope_bf16_gaudi2(output, position, inverse)
         output = torch.ops.custom_op.custom_deepseek_v41_woa_fp8_gaudi2(output.reshape(1, 4, 4096), woa, woa_scale)
@@ -58,11 +59,76 @@ def program(fp8, diagnostics=False, kv_first=False, fused_norm=False):
     return chain
 
 
-def validate_terminal_mme(arm, value, weights, actual, ordinary, candidate_fp8=True):
-    use_fp8 = arm == "candidate" and candidate_fp8
+def production_program(fused_rope_woa=False, diagnostics=False, fused_qnorm=False,
+                       fused_kvnorm=False):
+    """Mirror the qualified paged C1 Attention projection/MLA chain.
+
+    The older comparison program intentionally keeps its historical split
+    Q/KV and projection variants.  Production has since moved to one static
+    QKV input matrix, the Q projection/RoPE compound op, the exact wo_a
+    group-32 roundtrip, and its FP8 wo_b consumer.  Keep this as a separate
+    mode so profiling the retained path does not silently measure obsolete
+    work.
+    """
+
+    def chain(value, qkv_weight, qnorm, kvnorm, wqb, wqb_scale, swa, main,
+              packed, compressed, position, sink, scale, forward, inverse,
+              woa, woa_scale, wob, wob_scale):
+        projected = F.linear(quantize_activation(value), qkv_weight)
+        query_input = projected[..., :1280].contiguous()
+        kv_input = projected[..., 1280:].contiguous()
+        norm = torch.ops.custom_op.custom_deepseek_v41_attention_norm_bf16_gaudi2
+        if fused_qnorm:
+            q = torch.ops.custom_op.custom_deepseek_v41_q_norm_projection_rope_gaudi2(
+                query_input, qnorm, wqb, wqb_scale, position, forward, 1e-20).reshape(1, 32, 512)
+        else:
+            latent = norm(query_input, qnorm, 1e-20)
+            q = torch.ops.custom_op.custom_deepseek_v41_q_projection_rope_gaudi2(
+                latent, wqb, wqb_scale, position, forward).reshape(1, 32, 512)
+        if fused_kvnorm:
+            kv = torch.ops.custom_op.custom_deepseek_v41_kv_norm_rope_bf16_gaudi2(
+                kv_input, kvnorm, position, forward, 1e-20)
+        else:
+            kv = norm(kv_input, kvnorm, 1e-20)
+            kv = torch.ops.custom_op.custom_deepseek_v41_rope_bf16_gaudi2(
+                kv.reshape(1, 1, 512), position, forward).reshape(1, 512)
+        rows = main.shape[0] if main.shape[0] > 1 else 0
+        ratio = 512 // rows if rows else 0
+        done = torch.ops.custom_op.custom_deepseek_v41_swa_decoded_write_bf16_gaudi2(
+            packed, kv, position, swa, 0)
+        ids, lengths = torch.ops.custom_op.custom_deepseek_v41_c1_indices_i32_gaudi2(
+            position, compressed, ratio)
+        output = torch.ops.custom_op.custom_deepseek_v41_mla_mme_gaudi2(
+            q, swa, main, ids, sink, scale, lengths, done, done, 0, rows, 512)
+        if fused_rope_woa:
+            output = torch.ops.custom_op.custom_deepseek_v41_rope_woa_fp8_roundtrip_gaudi2(
+                output, woa, woa_scale, position, forward)
+        else:
+            output = torch.ops.custom_op.custom_deepseek_v41_rope_bf16_gaudi2(
+                output, position, inverse)
+            output = torch.ops.custom_op.custom_deepseek_v41_woa_fp8_roundtrip_gaudi2(
+                output.reshape(1, 4, 4096), woa, woa_scale)
+        result = torch.ops.custom_op.custom_deepseek_v41_dense_fp8_gaudi2(
+            output, wob, wob_scale)
+        return (q, kv, output, result) if diagnostics else result
+
+    return chain
+
+
+def validate_terminal_mme(arm,
+                          value,
+                          weights,
+                          actual,
+                          ordinary,
+                          candidate_fp8=True,
+                          force_fp8=False,
+                          compare_kv_order=False):
+    use_fp8 = force_fp8 or (arm == "candidate" and candidate_fp8)
     fn = program(use_fp8, diagnostics=True,
-                 kv_first=arm == "candidate" and os.environ.get("VLLM_HPU_DSV41_ATTN_KV_FIRST") == "1",
-                 fused_norm=arm == "candidate" and os.environ.get("VLLM_HPU_DSV41_ATTN_FUSED_NORM") == "1")
+                 kv_first=(arm == "candidate" and
+                           (compare_kv_order or os.environ.get("VLLM_HPU_DSV41_ATTN_KV_FIRST") == "1")),
+                 fused_norm=(force_fp8 or arm == "candidate")
+                 and os.environ.get("VLLM_HPU_DSV41_ATTN_FUSED_NORM") == "1")
     compiled = torch.compile(fn, backend="hpu_backend", fullgraph=True, dynamic=False)
     eager = tuple(t.cpu() for t in fn(value, *weights))
     graph = tuple(t.cpu() for t in compiled(value, *weights))
@@ -92,13 +158,40 @@ def main():
     parser.add_argument("woa_sidecar", type=Path)
     parser.add_argument("dense_sidecar", type=Path)
     parser.add_argument("--pp-rank", type=int, choices=(0, 1), default=0)
-    parser.add_argument("--position", type=int, choices=(63, 191, 511), default=191)
+    parser.add_argument("--position", type=int, choices=(0, 63, 191, 511), default=191)
     parser.add_argument("--include-reference", action="store_true")
     parser.add_argument("--candidate-bf16", action="store_true",
                         help="Isolate normalization fusion with the retained BF16 dense projections")
+    parser.add_argument("--compare-kv-order", action="store_true",
+                        help="Compare the accepted FP8 chain with KV/cache production scheduled before Q")
+    parser.add_argument("--production-parity", action="store_true",
+                        help="Profile the retained paged C1 production chain instead of historical variants")
+    parser.add_argument("--compare-production-rope-woa", action="store_true",
+                        help="Compare the production chain with exact inverse-RoPE/wo_a fusion")
+    parser.add_argument("--compare-production-qnorm", action="store_true",
+                        help="Compare production with exact QNorm/dynamic-quant fusion")
+    parser.add_argument("--compare-production-kvnorm", action="store_true",
+                        help="Compare production with exact KVNorm/forward-RoPE fusion")
     parser.add_argument("--diagnostic-input", type=Path)
     parser.add_argument("--profile-only", action="store_true")
     args = parser.parse_args()
+    if args.production_parity and (args.include_reference or args.candidate_bf16 or args.compare_kv_order
+                                   or args.compare_production_rope_woa or args.compare_production_qnorm
+                                   or args.compare_production_kvnorm
+                                   or args.diagnostic_input):
+        parser.error("--production-parity is a candidate-only mode")
+    if args.compare_production_rope_woa and (args.include_reference or args.candidate_bf16
+                                             or args.compare_kv_order or args.compare_production_qnorm
+                                             or args.compare_production_kvnorm
+                                             or args.diagnostic_input):
+        parser.error("--compare-production-rope-woa cannot be combined with historical comparison modes")
+    if args.compare_production_qnorm and (args.include_reference or args.candidate_bf16
+                                          or args.compare_kv_order or args.compare_production_kvnorm
+                                          or args.diagnostic_input):
+        parser.error("--compare-production-qnorm cannot be combined with historical comparison modes")
+    if args.compare_production_kvnorm and (args.include_reference or args.candidate_bf16
+                                           or args.compare_kv_order or args.diagnostic_input):
+        parser.error("--compare-production-kvnorm cannot be combined with historical comparison modes")
     candidate_fp8 = not args.candidate_bf16
     output = Path(os.environ["DSV41_RUN_EVIDENCE"])
     torch.ops.load_library(os.environ["VLLM_HPU_DSV4_TPC_OP_LIBRARY"])
@@ -121,8 +214,10 @@ def main():
             table = rotary_table(64, 512, config["compress_rope_theta"] if ratio else config["rope_theta"],
                                  scaling["original_max_position_embeddings"] if ratio else 0, scaling["factor"],
                                  scaling["beta_fast"], scaling["beta_slow"])
-            before = [shard.dense(prefix + "wq_a.weight", "hpu"), shard.tensor(prefix + "q_norm.weight", "hpu")]
-            common = [shard.dense(prefix + "wkv.weight", "hpu"), shard.tensor(prefix + "kv_norm.weight", "hpu"),
+            wqa = shard.dense(prefix + "wq_a.weight", "hpu")
+            wkv = shard.dense(prefix + "wkv.weight", "hpu")
+            before = [wqa, shard.tensor(prefix + "q_norm.weight", "hpu")]
+            common = [wkv, shard.tensor(prefix + "kv_norm.weight", "hpu"),
                       torch.randn(512, 512).bfloat16().to("hpu"),
                       torch.randn(max(1, rows), 512).bfloat16().to("hpu"),
                       torch.zeros(512, 528, dtype=torch.uint8, device="hpu"), compressed.to("hpu"),
@@ -134,9 +229,26 @@ def main():
             q_scale = dense.tensor(prefix + "wq_b.channel_scale", "hpu")
             o_scale = dense.tensor(prefix + "wo_b.channel_scale", "hpu")
             candidate_weight = dense.tensor if candidate_fp8 else shard.dense
-            new.append(tuple(before + [candidate_weight(prefix + "wq_b.weight", "hpu"), q_scale] + common +
-                             [candidate_weight(prefix + "wo_b.weight", "hpu"), o_scale]))
-            if args.include_reference:
+            if (args.production_parity or args.compare_production_rope_woa or
+                    args.compare_production_qnorm or args.compare_production_kvnorm):
+                # Production prepares this immutable matrix once while loading
+                # weights.  Do not leave a concat node or duplicate source
+                # matrices in the timed recipe/weight tuple.
+                fused_qkv = concatenate_static_weights(wqa, wkv).contiguous()
+                new.append((fused_qkv, before[1], common[1],
+                            dense.tensor(prefix + "wq_b.weight", "hpu"), q_scale,
+                            *common[2:],
+                            dense.tensor(prefix + "wo_b.weight", "hpu"), o_scale))
+                old.append(new[-1])
+            else:
+                new.append(tuple(before + [candidate_weight(prefix + "wq_b.weight", "hpu"), q_scale] + common +
+                                 [candidate_weight(prefix + "wo_b.weight", "hpu"), o_scale]))
+            if (args.production_parity or args.compare_production_rope_woa or
+                    args.compare_production_qnorm or args.compare_production_kvnorm):
+                pass
+            elif args.compare_kv_order:
+                old.append(new[-1])
+            elif args.include_reference:
                 old.append(tuple(before + [shard.dense(prefix + "wq_b.weight", "hpu"), q_scale] + common +
                                  [shard.dense(prefix + "wo_b.weight", "hpu"), o_scale]))
             inputs.append(torch.randn(1, 5120).bfloat16().to("hpu"))
@@ -160,14 +272,123 @@ def main():
             print(json.dumps(audit, indent=2), flush=True)
             torch.distributed.destroy_process_group()
             return
-        candidate = program(candidate_fp8, kv_first=os.environ.get("VLLM_HPU_DSV41_ATTN_KV_FIRST") == "1",
-                            fused_norm=os.environ.get("VLLM_HPU_DSV41_ATTN_FUSED_NORM") == "1")
-        result = benchmark(f"attention-dense-p{args.pp_rank}-pos{args.position}", program(False), candidate,
-                           inputs, old, new, output, 3, recorder, not args.include_reference,
-                           ordinary_validator=partial(validate_terminal_mme, candidate_fp8=candidate_fp8),
+        fused_norm = os.environ.get("VLLM_HPU_DSV41_ATTN_FUSED_NORM") == "1"
+        cross_arm_exact = None
+        if args.production_parity:
+            reference = candidate = production_program()
+        elif args.compare_production_rope_woa:
+            reference = production_program(False)
+            candidate = production_program(True)
+            diagnostic_reference = production_program(False, True)
+            diagnostic_candidate = production_program(True, True)
+            stages = [{"stage": "q", "different": 0, "maximum_absolute_difference": 0.0},
+                      {"stage": "kv", "different": 0, "maximum_absolute_difference": 0.0},
+                      {"stage": "wo_a", "different": 0, "maximum_absolute_difference": 0.0},
+                      {"stage": "wo_b", "different": 0, "maximum_absolute_difference": 0.0}]
+            for value, old_weight, new_weight in zip(inputs, old, new, strict=True):
+                expected = tuple(x.cpu() for x in diagnostic_reference(value, *old_weight))
+                actual = tuple(x.cpu() for x in diagnostic_candidate(value, *new_weight))
+                for stage, wanted, got in zip(stages, expected, actual, strict=True):
+                    if stage["stage"] == "kv" and stage["different"] == 0:
+                        torch.save({"reference": wanted, "candidate": got}, output / "kv-first-layer.pt")
+                    delta = (got.float() - wanted.float()).abs()
+                    stage["different"] += int((got != wanted).sum())
+                    stage["maximum_absolute_difference"] = max(stage["maximum_absolute_difference"],
+                                                                  float(delta.max()))
+            cross_arm_exact = {"layers": len(inputs), "stages": stages,
+                               "bitwise_equal": all(not stage["different"] for stage in stages)}
+            (output / "cross-arm-check.json").write_text(json.dumps(cross_arm_exact, indent=2) + "\n")
+            if not cross_arm_exact["bitwise_equal"]:
+                raise AssertionError(("production inverse-RoPE/wo_a fusion changed output", stages))
+        elif args.compare_production_qnorm:
+            reference = production_program(False)
+            candidate = production_program(False, fused_qnorm=True)
+            diagnostic_reference = production_program(False, True)
+            diagnostic_candidate = production_program(False, True, True)
+            stages = [{"stage": "q", "different": 0, "maximum_absolute_difference": 0.0},
+                      {"stage": "kv", "different": 0, "maximum_absolute_difference": 0.0},
+                      {"stage": "wo_a", "different": 0, "maximum_absolute_difference": 0.0},
+                      {"stage": "wo_b", "different": 0, "maximum_absolute_difference": 0.0}]
+            for value, old_weight, new_weight in zip(inputs, old, new, strict=True):
+                expected = tuple(x.cpu() for x in diagnostic_reference(value, *old_weight))
+                actual = tuple(x.cpu() for x in diagnostic_candidate(value, *new_weight))
+                for stage, wanted, got in zip(stages, expected, actual, strict=True):
+                    delta = (got.float() - wanted.float()).abs()
+                    stage["different"] += int((got != wanted).sum())
+                    stage["maximum_absolute_difference"] = max(stage["maximum_absolute_difference"],
+                                                                  float(delta.max()))
+            cross_arm_exact = {"layers": len(inputs), "stages": stages,
+                               "bitwise_equal": all(not stage["different"] for stage in stages)}
+            (output / "cross-arm-check.json").write_text(json.dumps(cross_arm_exact, indent=2) + "\n")
+            if not cross_arm_exact["bitwise_equal"]:
+                raise AssertionError(("production QNorm/quant fusion changed output", stages))
+        elif args.compare_production_kvnorm:
+            reference = production_program(False)
+            candidate = production_program(False, fused_kvnorm=True)
+            diagnostic_reference = production_program(False, True)
+            diagnostic_candidate = production_program(False, True, False, True)
+            stages = [{"stage": "q", "different": 0, "maximum_absolute_difference": 0.0},
+                      {"stage": "kv", "different": 0, "maximum_absolute_difference": 0.0},
+                      {"stage": "wo_a", "different": 0, "maximum_absolute_difference": 0.0},
+                      {"stage": "wo_b", "different": 0, "maximum_absolute_difference": 0.0}]
+            for layer_index, (value, old_weight, new_weight) in enumerate(
+                    zip(inputs, old, new, strict=True)):
+                expected = tuple(x.cpu() for x in diagnostic_reference(value, *old_weight))
+                actual = tuple(x.cpu() for x in diagnostic_candidate(value, *new_weight))
+                if layer_index == 0:
+                    projected = F.linear(quantize_activation(value), new_weight[0])
+                    kv_input = projected[..., 1280:].contiguous()
+                    normalized = torch.ops.custom_op.custom_deepseek_v41_attention_norm_bf16_gaudi2(
+                        kv_input, new_weight[2], 1e-20)
+                    torch.save({
+                        "kv_input": kv_input.cpu(),
+                        "normalized": normalized.cpu(),
+                        "reference": expected[1],
+                        "candidate": actual[1],
+                    }, output / "kv-first-layer.pt")
+                for stage, wanted, got in zip(stages, expected, actual, strict=True):
+                    delta = (got.float() - wanted.float()).abs()
+                    stage["different"] += int((got != wanted).sum())
+                    stage["maximum_absolute_difference"] = max(stage["maximum_absolute_difference"],
+                                                                  float(delta.max()))
+            cross_arm_exact = {"layers": len(inputs), "stages": stages,
+                               "bitwise_equal": all(not stage["different"] for stage in stages)}
+            (output / "cross-arm-check.json").write_text(json.dumps(cross_arm_exact, indent=2) + "\n")
+            if not cross_arm_exact["bitwise_equal"]:
+                raise AssertionError(("production KVNorm/RoPE fusion changed output", stages))
+        elif args.compare_kv_order:
+            reference = program(True, kv_first=False, fused_norm=fused_norm)
+            candidate = program(True, kv_first=True, fused_norm=fused_norm)
+        else:
+            reference = program(False)
+            candidate = program(candidate_fp8,
+                                kv_first=os.environ.get("VLLM_HPU_DSV41_ATTN_KV_FIRST") == "1",
+                                fused_norm=fused_norm)
+        result = benchmark(f"attention-dense-p{args.pp_rank}-pos{args.position}", reference, candidate,
+                           inputs, old, new, output, 3, recorder,
+                           args.production_parity or (False if (args.compare_kv_order or
+                                                               args.compare_production_rope_woa or
+                                                               args.compare_production_qnorm or
+                                                               args.compare_production_kvnorm)
+                                                       else not args.include_reference),
+                           ordinary_validator=(None if (args.production_parity or
+                                                        args.compare_production_rope_woa or
+                                                        args.compare_production_qnorm or
+                                                        args.compare_production_kvnorm) else
+                                               partial(validate_terminal_mme,
+                                                       candidate_fp8=candidate_fp8,
+                                                       force_fp8=args.compare_kv_order,
+                                                       compare_kv_order=args.compare_kv_order)),
                            profile_only=args.profile_only)
         result["candidate_precision"] = "fp8" if candidate_fp8 else "bf16"
         result["candidate_fused_norm"] = os.environ.get("VLLM_HPU_DSV41_ATTN_FUSED_NORM") == "1"
+        result["compare_kv_order"] = args.compare_kv_order
+        result["production_parity"] = args.production_parity
+        result["compare_production_rope_woa"] = args.compare_production_rope_woa
+        result["compare_production_qnorm"] = args.compare_production_qnorm
+        result["compare_production_kvnorm"] = args.compare_production_kvnorm
+        if cross_arm_exact is not None:
+            result["cross_arm_exact"] = cross_arm_exact
         result["state_scope"] = ("real Q/KV input projections/norms, SWA writer, C1 indices, shared-KV MME MLA, "
                                  "inverse RoPE and wo_a/wo_b to persistent BF16 TP operand; "
                                  "seeded decoded history/static compressed publication; no compressor, TP or PP")

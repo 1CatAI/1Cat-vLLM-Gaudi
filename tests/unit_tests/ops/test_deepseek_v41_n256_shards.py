@@ -24,13 +24,8 @@ def prepared(tmp_path):
     base.mkdir()
     source = base / "pp0-tp0.safetensors"
     arrays = {prefix + "_q16": q, prefix + "_s16": s}
-    specs = {
-        name: {
-            "dtype": "I16" if name.endswith("_q16") else "BF16",
-            "shape": list(value.shape)
-        }
-        for name, value in arrays.items()
-    }
+    specs = {name: {"dtype": "I16" if name.endswith("_q16") else "BF16", "shape": list(value.shape)}
+             for name, value in arrays.items()}
     writer = RankWriter(source, specs, {})
     try:
         for name, value in arrays.items():
@@ -40,28 +35,17 @@ def prepared(tmp_path):
         writer.close()
     manifest = {"rank_files": {"pp0-tp0": {"sha256": file_hash(source)}}}
     publish_json(base / "manifest.json", manifest)
-    shard = SimpleNamespace(directory=base,
-                            pp_rank=0,
-                            tp_rank=0,
-                            manifest=manifest,
-                            catalog=read_header(source),
-                            check_identity=lambda: None)
+    shard = SimpleNamespace(directory=base, pp_rank=0, tp_rank=0, manifest=manifest,
+                            catalog=read_header(source), check_identity=lambda: None)
     output = tmp_path / "runtime"
     output.mkdir()
     rank, record = prepare_rank(shard, output)
-    publish_json(
-        output / "manifest.json", {
-            "schema_version": 1,
-            "layout": LAYOUT,
-            "layout_fingerprint": FINGERPRINT,
-            "quantization_fingerprint": QUANTIZATION_FINGERPRINT,
-            "source_manifest_sha256": file_hash(base / "manifest.json"),
-            "tensor_parallel_size": 2,
-            "pipeline_parallel_size": 2,
-            "rank_files": {
-                rank: record
-            }
-        })
+    publish_json(output / "manifest.json", {
+        "schema_version": 1, "layout": LAYOUT, "layout_fingerprint": FINGERPRINT,
+        "quantization_fingerprint": QUANTIZATION_FINGERPRINT,
+        "source_manifest_sha256": file_hash(base / "manifest.json"),
+        "tensor_parallel_size": 2, "pipeline_parallel_size": 2,
+        "rank_files": {rank: record}})
     return output, shard, prefix, q, s
 
 

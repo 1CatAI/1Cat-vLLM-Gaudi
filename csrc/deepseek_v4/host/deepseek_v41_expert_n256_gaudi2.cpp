@@ -6,10 +6,12 @@
 #define ELF(name) extern unsigned char _binary___deepseek_v41_expert_n256_##name##_gaudi2_o_start; \
                   extern unsigned char _binary___deepseek_v41_expert_n256_##name##_gaudi2_o_end;
 ELF(fp8)
+ELF(prefetch16_fp8)
 ELF(bf16)
 ELF(scale)
 ELF(silu_quant)
 ELF(scale_reduce)
+ELF(scale_reduce_direct)
 #undef ELF
 namespace {
 void map(tpc_lib_api::TensorAccessPattern& p, unsigned dim, unsigned axis,
@@ -78,6 +80,60 @@ tpc_lib_api::GlueCodeReturn silu_quant(tpc_lib_api::HabanaKernelParams* in,
 tpc_lib_api::GlueCodeReturn scale_reduce(tpc_lib_api::HabanaKernelParams* in,
                                         tpc_lib_api::HabanaKernelInstantiation* out) {
     using namespace tpc_lib_api;
+    if (in->inputTensorNr == 4) {
+        if (in->outputTensorNr != 1) { in->outputTensorNr = 1; return GLUE_INCOMPATIBLE_OUTPUT_COUNT; }
+        const TensorDataType types[] = {DATA_F32, DATA_I32, DATA_F32, DATA_BF16};
+        for (unsigned i = 0; i < 4; ++i) {
+            if (in->inputTensors[i].geometry.dataType != types[i]) {
+                in->inputTensors[i].geometry.dataType = types[i];
+                return GLUE_INCOMPATIBLE_DATA_TYPE;
+            }
+        }
+        const auto& product = in->inputTensors[0].geometry;
+        const auto& ids = in->inputTensors[1].geometry;
+        const auto& sx = in->inputTensors[2].geometry;
+        const auto& channel = in->inputTensors[3].geometry;
+        auto& result = in->outputTensors[0].geometry;
+        if (result.dataType != DATA_BF16) {
+            result.dataType = DATA_BF16;
+            return GLUE_INCOMPATIBLE_DATA_TYPE;
+        }
+        if (product.dims != 3 || !product.maxSizes[0] || product.maxSizes[0] % 128 ||
+            product.maxSizes[1] != 1 || product.maxSizes[2] != 6 ||
+            ids.dims != 2 || ids.maxSizes[0] != 6 || ids.maxSizes[1] != 1 ||
+            sx.dims != 2 || sx.maxSizes[0] != 1 || sx.maxSizes[1] != 6 ||
+            channel.dims != 3 || channel.maxSizes[0] != 256 ||
+            channel.maxSizes[1] * 256 != product.maxSizes[0] ||
+            !channel.maxSizes[2] || channel.maxSizes[2] > 384)
+            return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        const uint64_t n = product.maxSizes[0];
+        out->indexSpaceRank = 1;
+        out->indexSpaceGeometry[0] = n / 128;
+        map(out->inputTensorAccessPattern[0], 0, 0, 128, 0, 127);
+        map(out->inputTensorAccessPattern[0], 1, 0, 0, 0, 0);
+        map(out->inputTensorAccessPattern[0], 2, 0, 0, 0, 5);
+        for (unsigned i = 1; i < 4; ++i)
+            out->inputTensorAccessPattern[i].allRequired = true;
+        map(out->outputTensorAccessPattern[0], 0, 0, 128, 0, 127);
+        map(out->outputTensorAccessPattern[0], 1, 0, 0, 0, 0);
+        map(out->outputTensorAccessPattern[0], 2, 0, 0, 0, 0);
+        if (result.dims != 3 || result.maxSizes[0] != n || result.maxSizes[1] != 1 ||
+            result.maxSizes[2] != 1) {
+            result.dims = 3;
+            result.maxSizes[0] = n;
+            result.maxSizes[1] = 1;
+            result.maxSizes[2] = 1;
+            return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+        }
+        out->kernel.paramsNr = 0;
+        const auto* start = &_binary___deepseek_v41_expert_n256_scale_reduce_direct_gaudi2_o_start;
+        const auto* end = &_binary___deepseek_v41_expert_n256_scale_reduce_direct_gaudi2_o_end;
+        const unsigned capacity = out->kernel.elfSize;
+        out->kernel.elfSize = end - start;
+        if (capacity < out->kernel.elfSize) return GLUE_INSUFFICIENT_ELF_BUFFER;
+        std::memcpy(out->kernel.kernelElf, start, out->kernel.elfSize);
+        return GLUE_SUCCESS;
+    }
     if (in->inputTensorNr != 1) { in->inputTensorNr = 1; return GLUE_INCOMPATIBLE_INPUT_COUNT; }
     if (in->outputTensorNr != 1) { in->outputTensorNr = 1; return GLUE_INCOMPATIBLE_OUTPUT_COUNT; }
     const auto& rows = in->inputTensors[0].geometry;
@@ -222,11 +278,14 @@ tpc_lib_api::GlueCodeReturn DeepseekV41ExpertN256Gaudi2::GetGcDefinitions(
         return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
     }
     out->kernel.paramsNr = 0;
-    const unsigned char* start = mode_ == FP8 ? &_binary___deepseek_v41_expert_n256_fp8_gaudi2_o_start :
+    const bool prefetch16 = mode_ == FP8 && substitute_prefetch16_;
+    const unsigned char* start = prefetch16 ? &_binary___deepseek_v41_expert_n256_prefetch16_fp8_gaudi2_o_start :
+        mode_ == FP8 ? &_binary___deepseek_v41_expert_n256_fp8_gaudi2_o_start :
         mode_ == BF16 ? &_binary___deepseek_v41_expert_n256_bf16_gaudi2_o_start :
         mode_ == ScaleReduce ? &_binary___deepseek_v41_expert_n256_scale_reduce_gaudi2_o_start :
                                &_binary___deepseek_v41_expert_n256_scale_gaudi2_o_start;
-    const unsigned char* end = mode_ == FP8 ? &_binary___deepseek_v41_expert_n256_fp8_gaudi2_o_end :
+    const unsigned char* end = prefetch16 ? &_binary___deepseek_v41_expert_n256_prefetch16_fp8_gaudi2_o_end :
+        mode_ == FP8 ? &_binary___deepseek_v41_expert_n256_fp8_gaudi2_o_end :
         mode_ == BF16 ? &_binary___deepseek_v41_expert_n256_bf16_gaudi2_o_end :
         mode_ == ScaleReduce ? &_binary___deepseek_v41_expert_n256_scale_reduce_gaudi2_o_end :
                                &_binary___deepseek_v41_expert_n256_scale_gaudi2_o_end;

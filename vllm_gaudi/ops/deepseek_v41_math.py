@@ -152,6 +152,19 @@ def unpack_fp4(packed, width=512, group=16):
     return (values * scales.unsqueeze(-1)).flatten(-2).to(torch.bfloat16)
 
 
+def fp4_roundtrip(value, group=32):
+    """Apply the checkpoint FP4 rounding contract without a packed HBM tensor."""
+    if (gaudi_envs.VLLM_HPU_DSV41_NATIVE_KV_PACK and value.device.type == "hpu"
+            and value.dtype == torch.bfloat16 and value.ndim >= 2 and value.numel() // value.shape[-1] <= 8192
+            and group == 32
+            and hasattr(torch.ops.custom_op, "custom_deepseek_v41_fp4_roundtrip_g32_bf16_gaudi2")):
+        shape = value.shape
+        result = torch.ops.custom_op.custom_deepseek_v41_fp4_roundtrip_g32_bf16_gaudi2(
+            value.reshape(-1, shape[-1]).contiguous())
+        return result.reshape(shape)
+    return unpack_fp4(pack_fp4(value, group), value.shape[-1], group)
+
+
 def rotary_table(width, length, base, original_length=0, factor=16, beta_fast=32, beta_slow=1):
     # CPU preparation preserves the reference's adjacent-pair RoPE convention.
     freq = 1.0 / (base**(torch.arange(0, width, 2, dtype=torch.float32, device="cpu") / width))

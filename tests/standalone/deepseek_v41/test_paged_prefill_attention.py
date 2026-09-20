@@ -78,9 +78,11 @@ def test_streaming_topk_matches_one_shot_for_independent_source_rows():
         def _scores(current_positions, current_rows, q, weights):
             del q, weights
             # Unique scores avoid making this layout test depend on topk's tie ordering.
-            return (current_rows.float().unsqueeze(0) * 0.01 + current_positions.float().unsqueeze(1) * 0.000001)
+            return (current_rows.float().unsqueeze(0) * 0.01
+                    + current_positions.float().unsqueeze(1) * 0.000001)
 
-    actual, _, _ = PagedCSA2Attention._stream_topk(Scorer(), positions, rows, None, None, width=width)
+    actual, _, _ = PagedCSA2Attention._stream_topk(
+        Scorer(), positions, rows, None, None, width=width)
     scores = Scorer._scores(positions, rows, None, None)
     expected = rows.expand_as(scores).gather(1, scores.topk(width, -1, sorted=False).indices)
     assert torch.equal(actual.sort(-1).values, expected.sort(-1).values)

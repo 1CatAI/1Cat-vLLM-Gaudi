@@ -29,7 +29,7 @@ def program(matrix, diagnostics=False):
         ratio = 512 // rows if rows else 0
         done = torch.ops.custom_op.custom_deepseek_v41_swa_decoded_write_bf16_gaudi2(packed, value, position, swa, 0)
         ids, lengths = torch.ops.custom_op.custom_deepseek_v41_c1_indices_i32_gaudi2(position, compressed, ratio)
-        args = (q, swa, main, ids, sink, scale, lengths, done, done, 0, rows)
+        args = (q, swa, main, ids, sink, scale, lengths, done, done, 0, rows, 512)
         if matrix:
             output = torch.ops.custom_op.custom_deepseek_v41_mla_mme_gaudi2(*args)
         else:

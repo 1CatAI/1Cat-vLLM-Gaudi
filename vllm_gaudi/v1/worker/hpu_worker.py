@@ -291,7 +291,7 @@ class HPUWorker(WorkerBase):
         if is_v41(self.vllm_config):
             # Spawn reimports Python modules; the parent's namespace-package
             # search path is not inherited with the environment/config pickle.
-            from vllm_gaudi.entrypoints.deepseek_v41 import prepare_native_libraries
+            from vllm_gaudi.entrypoints.deepseek_v41 import load_native_operators, prepare_native_libraries
             prepare_native_libraries()
             modules = os.environ["HABANA_VISIBLE_MODULES"].split(",")
             if len(modules) != 4 or device_index >= len(modules):
@@ -306,6 +306,14 @@ class HPUWorker(WorkerBase):
                 graph_dir.mkdir(parents=True, exist_ok=True)
                 os.environ["GRAPH_VISUALIZATION_DIR"] = str(graph_dir)
                 os.environ["PT_HPU_GRAPH_DUMP_PREFIX"] = str(graph_dir)
+            required_ops = []
+            if os.environ.get("VLLM_HPU_DSV41_WOA_OUTPUT_ROUNDTRIP", "0").lower() in ("1", "true"):
+                required_ops.append("custom_deepseek_v41_woa_fp8_roundtrip_gaudi2")
+            if os.environ.get("VLLM_HPU_DSV41_RUNTIME_INDEXER", "0").lower() in ("1", "true"):
+                required_ops.extend(("custom_deepseek_v41_index_scores_gaudi2",
+                                     "custom_deepseek_v41_index_threshold_gaudi2",
+                                     "custom_deepseek_v41_index_emit_gaudi2"))
+            load_native_operators(required_ops)
         torch.hpu.set_device(device_index)
         self.device = torch.device("hpu")
         # Initialize the distributed environment.
@@ -520,12 +528,17 @@ class HPUWorker(WorkerBase):
         # of the model.
         kv_caches: dict[str, torch.Tensor] = {}
         kv_cache_spec = self.model_runner.get_kv_cache_spec()  # type: ignore[union-attr]
+        profile_blocks = int(getattr(self.model_runner, "profile_kv_cache_blocks", lambda: 1)())
+        if profile_blocks < 1:
+            raise ValueError("Model runner requested an invalid profile KV page count")
+        if profile_blocks > 1:
+            logger.info("Allocating %d temporary KV pages for pre-allocation recipe warmup", profile_blocks)
         single_kv_block_size_bytes = 0
         for layer_name, layer_spec in kv_cache_spec.items():
             if self.model_runner.uses_framework_kv_cache_layout(layer_name):
                 kv_caches[layer_name] = self.model_runner.allocate_framework_kv_cache_layer(
                     layer_spec,
-                    num_blocks=1,
+                    num_blocks=profile_blocks,
                 )
                 single_kv_block_size_bytes += layer_spec.page_size_bytes
             elif isinstance(layer_spec, FullAttentionSpec):
@@ -600,7 +613,7 @@ class HPUWorker(WorkerBase):
         # recipes we will use the extra memory for graphs/blocks
         free_hpu_memory = torch.hpu.mem_get_info()[0]
 
-        dummy_block_headroom = single_kv_block_size_bytes
+        dummy_block_headroom = single_kv_block_size_bytes * profile_blocks
         explicit_kv_cache_size = self.cache_config.kv_cache_memory_bytes
         if explicit_kv_cache_size is not None:
             if explicit_kv_cache_size > free_hpu_memory:

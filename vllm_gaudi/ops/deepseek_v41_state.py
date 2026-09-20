@@ -65,8 +65,8 @@ class StageStateBlocks:
     def __init__(self, program):
         self.program = program
         mutable = {
-            "swa", "main", "decoded_swa", "decoded_main", "index", "indices", "candidate_pool", "kv_history",
-            "score_history"
+            "swa", "main", "decoded_swa", "decoded_main", "decoded_index_hot", "index", "indices",
+            "candidate_pool", "kv_history", "score_history"
         }
         self.bindings, self.specs, self.allocations = {}, {}, {}
         for module_name, module in program.named_modules():
@@ -136,8 +136,8 @@ request. Compressed history stays in its scheduler-owned HPU pages.
         self.working = {
             name: value
             for name, value in program.named_buffers()
-            if name.rsplit(".", 1)[-1] in ("swa", "decoded_swa", "decoded_main", "kv_history", "score_history",
-                                           "indices", "candidate_pool")
+            if name.rsplit(".", 1)[-1] in ("swa", "decoded_swa", "decoded_main", "decoded_index_hot",
+                                           "kv_history", "score_history", "indices", "candidate_pool")
         }
         self.saved, self.active, self.blocks = {}, None, 2
         # The scheduler page table is small but long-lived.  Rebuilding a
@@ -146,7 +146,8 @@ request. Compressed history stays in its scheduler-owned HPU pages.
         # recipe buffers are live.  Apart from wasting one H2D submission per
         # token, that can enter Synapse defragmentation with buffers in use.
         # Keep one explicitly pinned source and only publish changed tables.
-        self.block_table_host = torch.empty(program.shared.block_table.shape, dtype=torch.int32,
+        self.block_table_host = torch.empty(program.shared.block_table.shape,
+                                            dtype=torch.int32,
                                             device="cpu").pin_memory("hpu")
         self.block_table_host_values = self.block_table_host.numpy()
         self.published_block_ids = None

@@ -79,6 +79,7 @@ class CSA2Attention(FusedCompressorInput, nn.Module):
         super().__init__()
         self.weights = weights
         self.woa_fp8 = False
+        self.woa_output_roundtrip = False
         self.packed_decode = gaudi_envs.VLLM_HPU_DSV41_PACKED_ATTENTION
         self.bounded_decode = gaudi_envs.VLLM_HPU_DSV41_BOUNDED_ATTENTION
         self.swa_pack_write = gaudi_envs.VLLM_HPU_DSV41_SWA_PACK_WRITE
@@ -243,8 +244,10 @@ class CSA2Attention(FusedCompressorInput, nn.Module):
 
     def project_output(self, value):
         if self.woa_fp8:
-            return torch.ops.custom_op.custom_deepseek_v41_woa_fp8_gaudi2(value.contiguous(), self.weights.wo_a.weight,
-                                                                          self.weights.wo_a.channel_scale)
+            operation = (torch.ops.custom_op.custom_deepseek_v41_woa_fp8_roundtrip_gaudi2
+                         if self.woa_output_roundtrip else
+                         torch.ops.custom_op.custom_deepseek_v41_woa_fp8_gaudi2)
+            return operation(value.contiguous(), self.weights.wo_a.weight, self.weights.wo_a.channel_scale)
         if self.output_gemm_layout:
             weight = self.weights.wo_a.weight
             if value.shape[0] == 1:
@@ -258,6 +261,13 @@ class CSA2Attention(FusedCompressorInput, nn.Module):
         weight = self.weights.wo_a.weight.reshape(self.groups, 1024, -1)
         return torch.einsum("tgd,grd->tgr", value, weight).flatten(1)
 
+    def project_output_consumer(self, value):
+        if self.woa_output_roundtrip:
+            weight = self.weights.wo_b
+            return torch.ops.custom_op.custom_deepseek_v41_dense_fp8_gaudi2(
+                value.contiguous(), weight.weight, weight.channel_scale)
+        return self.linear(value, self.weights.wo_b)
+
     def _rope(self, value, positions, inverse=False):
         if self.native_rope and value.shape[0] == 1:
             shape = value.shape
@@ -265,6 +275,23 @@ class CSA2Attention(FusedCompressorInput, nn.Module):
             return torch.ops.custom_op.custom_deepseek_v41_rope_bf16_gaudi2(
                 value.reshape(1, -1, shape[-1]).contiguous(), positions, table).reshape(shape)
         return apply_rope(value, positions, self.rotary, inverse=inverse)
+
+    def _norm_rope_kv(self, value, positions, norm):
+        """Preserve KV's BF16 norm boundary without a second TPC launch.
+
+        The native operation owns one complete 512-wide row per token and is
+        valid for the full bounded work range, so this is not a C1-only graph.
+        Larger prefill transactions retain the existing tensor path.
+        """
+        if (self.fused_norm and self.native_rope and value.dtype == torch.bfloat16
+                and value.ndim == 2 and 1 <= value.shape[0] <= 512
+                and value.shape[1] == 512):
+            return torch.ops.custom_op.custom_deepseek_v41_kv_norm_rope_bf16_gaudi2(
+                value.contiguous(), self.weights.kv_norm.weight,
+                positions.to(torch.int32).contiguous(), self.rotary_native,
+                self.eps)
+        return self._rope(norm(value, self.weights.kv_norm.weight, self.eps),
+                          positions)
 
     def project_query(self, value, positions):
         weight = self.weights.wq_b
@@ -336,8 +363,7 @@ class CSA2Attention(FusedCompressorInput, nn.Module):
         delay_q = self.kv_first and value.shape[0] == 1
         if not delay_q:
             query = self.project_query(query, positions)
-        kv = norm(kv_input, self.weights.kv_norm.weight, self.eps)
-        kv = self._rope(kv, positions)
+        kv = self._norm_rope_kv(kv_input, positions, norm)
         completion = None
         if self.decoded_kv_state and value.shape[0] == 1:
             completion = torch.ops.custom_op.custom_deepseek_v41_swa_decoded_write_bf16_gaudi2(
@@ -376,12 +402,12 @@ class CSA2Attention(FusedCompressorInput, nn.Module):
             # their own FP4 writer completion in this recipe.
             main_done = compressed_completion if compressed_completion is not None else completion
             if self.mla_mme:
-                mla = (torch.ops.custom_op.custom_deepseek_v41_mla_bf16_pv_gaudi2
-                       if self.mla_bf16_pv else torch.ops.custom_op.custom_deepseek_v41_mla_mme_gaudi2)
-                output = mla(query.contiguous(),
-                             self.shared.decoded_swa, main, indices.contiguous(), self.weights.attn_sink, self.scale,
-                             lengths.contiguous(), completion, main_done, self.decoded_swa_offset,
-                             self.length // self.ratio if self.ratio else 0)
+                mla = (torch.ops.custom_op.custom_deepseek_v41_mla_bf16_pv_gaudi2 if self.mla_bf16_pv
+                       else torch.ops.custom_op.custom_deepseek_v41_mla_mme_gaudi2)
+                output = mla(
+                    query.contiguous(), self.shared.decoded_swa, main, indices.contiguous(), self.weights.attn_sink,
+                    self.scale, lengths.contiguous(), completion, main_done, self.decoded_swa_offset,
+                    self.length // self.ratio if self.ratio else 0, 512)
             else:
                 attention = (torch.ops.custom_op.custom_deepseek_v41_decoded_attn_block_bf16_gaudi2
                              if self.block_exp else torch.ops.custom_op.custom_deepseek_v41_decoded_attn_bf16_gaudi2)
@@ -430,7 +456,7 @@ class CSA2Attention(FusedCompressorInput, nn.Module):
         output = self._rope(output, positions, inverse=True)
         output = output.reshape(-1, self.groups, self.heads // self.groups * 512)
         output = self.project_output(output)
-        partial = self.linear(output, self.weights.wo_b)
+        partial = self.project_output_consumer(output)
         return self.reduce(partial, ready_outputs=ready_outputs) if ready_outputs else self.reduce(partial)
 
     def insert_context(self, main_value, positions, valid_count=None):
@@ -469,4 +495,4 @@ class CSA2Attention(FusedCompressorInput, nn.Module):
         output = apply_rope(output, positions, self.rotary, inverse=True)
         output = output.reshape(-1, self.groups, self.heads // self.groups * 512)
         output = self.project_output(output)
-        return self.reduce(self.linear(output, self.weights.wo_b))
+        return self.reduce(self.project_output_consumer(output))

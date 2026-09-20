@@ -42,6 +42,10 @@ _C1_FASTPATH_DEFAULTS = {
     # lifetime, while retaining the active <=512-token prefix in the exact
     # decoded form already produced by the same quantizing writer.
     "VLLM_HPU_DSV41_PAGED_DECODED_KV_STATE": "1",
+    # Use one fixed-capacity native CSA2 graph whose device-valued position
+    # bounds the real scan.  This keeps long conversations on the same replay
+    # path and avoids the generic per-bucket PyTorch score/top-k chain.
+    "VLLM_HPU_DSV41_RUNTIME_INDEXER": "1",
     "VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH": "1",
     "VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT": "1",
     "VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT": "1",
@@ -51,8 +55,16 @@ _C1_FASTPATH_DEFAULTS = {
     "VLLM_USE_V2_MODEL_RUNNER": "1",
     "VLLM_HPU_DSV41_EXPERT_K128": "1",
     # Reuse decoded expert weights across each scheduler prompt chunk while
-    # C1 decode continues to consume the same resident N256 allocation.
+    # C1 decode continues to consume the same resident N256 allocation.  The
+    # stock packed-MXFP4 prefill operator leaks its internal packed dtype into
+    # later Synapse recipes on this runtime, so it is deliberately excluded.
     "VLLM_HPU_DSV41_PREFILL_GROUPED": "1",
+    # Keep route metadata on HPU and make the descriptor shape depend only on
+    # the scheduler tile.  Compact route output bounds the shared workspace to
+    # real top-6 rows instead of the occupancy-dependent host implementation.
+    "VLLM_HPU_DSV41_PREFILL_DEVICE_ROUTES": "1",
+    "VLLM_HPU_DSV41_PREFILL_ROUTE_OUTPUT": "1",
+    "VLLM_HPU_DSV41_PREFILL_EXPERT_ROWS": "128",
     "VLLM_HPU_TP2_NATIVE_JOINT_PLAN": "1",
     "VLLM_HPU_TP2_PREPARED_COMM": "1",
     "VLLM_HPU_TP2_STATIC_GROUP_PLAN": "1",
@@ -60,6 +72,10 @@ _C1_FASTPATH_DEFAULTS = {
 
 _NUMERIC_FASTPATH_DEFAULTS = {
     "VLLM_HPU_DSV41_WO_A_FP8": "1",
+    # Keep the exact group-32 BF16 roundtrip required by wo_b inside the
+    # wo_a scale producer.  This removes one HBM intermediate without
+    # changing any model-visible arithmetic boundary.
+    "VLLM_HPU_DSV41_WOA_OUTPUT_ROUNDTRIP": "1",
     "VLLM_HPU_DSV41_ROUTER_TOP6": "1",
     "VLLM_HPU_DSV41_BF16_LM_HEAD": "1",
     "VLLM_HPU_DSV41_MLA_MME": "1",
@@ -150,6 +166,34 @@ def prepare_native_libraries():
     os.environ["VLLM_HPU_DSV4_TPC_OP_LIBRARY"] = str(extensions[0])
 
 
+def load_native_operators(required=()):
+    """Load the fingerprinted V4.1 extension before model/Dynamo imports.
+
+    Spawned workers do not inherit PyTorch's process-local operator registry.
+    Loading on demand from the model constructor was also brittle: another
+    extension could already have populated part of ``custom_op`` and make a
+    single-symbol guard skip the selected library.  The worker therefore
+    loads the exact manifest-checked extension once after binding its HPU and
+    validates every operator needed by the selected execution profile.
+    """
+    prepare_native_libraries()
+    import torch
+
+    library = os.environ["VLLM_HPU_DSV4_TPC_OP_LIBRARY"]
+    torch.ops.load_library(library)
+    baseline = (
+        "custom_deepseek_v41_mxfp4_prepared_moe_bf16_gaudi2",
+        "custom_deepseek_v41_paged_attention_bf16_gaudi2",
+    )
+    names = tuple(dict.fromkeys((*baseline, *required)))
+    missing = [name for name in names if not hasattr(torch.ops.custom_op, name)]
+    if missing:
+        raise RuntimeError(
+            f"V4.1 native extension {library} is missing required operators: "
+            + ", ".join(missing))
+    return library
+
+
 def prepare_environment(model=None, sidecars=None):
     if model is not None:
         prepare_default_fastpaths(model, sidecars)
@@ -188,8 +232,7 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--checkpoint-audit")
-    parser.add_argument("--n256-prepared-dir",
-                        type=Path,
+    parser.add_argument("--n256-prepared-dir", type=Path,
                         help="Runtime-layout expert cache from prepare_deepseek_v41_n256.py")
     parser.add_argument("--runtime-profile", default=runtime_profile or settings.get("runtime_profile"))
     parser.add_argument("--max-model-len", type=int, default=512)
@@ -298,13 +341,12 @@ def main():
     scheduling = "--async-scheduling" if gaudi_envs.VLLM_HPU_DSV41_V2 else "--no-async-scheduling"
     sys.argv = [
         "vllm", "serve", args.model, "--host", args.host, "--port",
-        str(args.port), "--dtype", "bfloat16", "--max-model-len",
-        str(args.max_model_len), "--generation-config", "vllm", "--tensor-parallel-size", "2",
-        "--pipeline-parallel-size", "2", "--max-num-seqs",
-        str(args.max_num_seqs), "--max-num-batched-tokens",
+        str(args.port), "--dtype", "bfloat16", "--max-model-len", str(args.max_model_len),
+        "--generation-config", "vllm", "--tensor-parallel-size", "2", "--pipeline-parallel-size", "2",
+        "--max-num-seqs", str(args.max_num_seqs), "--max-num-batched-tokens",
         str(args.max_num_batched_tokens), "--load-format", "dsv41_prepared", "--model-loader-extra-config",
-        json.dumps(loader), "--mm-encoder-tp-mode", "data", "--no-enable-prefix-caching", scheduling, "--block-size",
-        str(args.block_size), *speculative, *extra
+        json.dumps(loader), "--mm-encoder-tp-mode", "data", "--no-enable-prefix-caching", scheduling,
+        "--block-size", str(args.block_size), *speculative, *extra
     ]
     from vllm.entrypoints.cli.main import main as serve
     serve()

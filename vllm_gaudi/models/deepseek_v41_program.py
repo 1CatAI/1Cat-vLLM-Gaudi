@@ -282,10 +282,16 @@ class PreparedMoE(nn.Module):
         experts = self.weights.experts
 
         def one_tile(tile_value, tile_ids, tile_routing):
-            operands = (tile_value, tile_ids.to(torch.int32), tile_routing.float(), experts.w13_q16, experts.w2_q16,
-                        experts.w13_s16, experts.w2_s16, self.lookup)
+            operands = (tile_value, tile_ids.to(torch.int32), tile_routing.float(),
+                        experts.w13_q16, experts.w2_q16, experts.w13_s16,
+                        experts.w2_s16, self.lookup)
             use_fused = self.n256_fused and tile_value.shape[0] <= 6
-            op = (torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2
+            # C1 keeps the same public scheduler/state contract as every
+            # other bucket.  Inside the expert compound node, finish W2
+            # directly from its FP32 accumulator so the six BF16 route rows
+            # are rounded and reduced in routing order without an HBM
+            # intermediate.  C2+ continues to use the normal fused body.
+            op = (torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_direct_finalize_prefetch_w2_fp8_gaudi2
                   if self.n256_fused_reduce and tile_value.shape[0] == 1 else
                   torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2
                   if use_fused else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fp8_gaudi2)
@@ -306,26 +312,41 @@ class PreparedMoE(nn.Module):
             pieces.append(one_tile(value[begin:end], ids[begin:end], routing[begin:end]))
         return torch.cat(pieces, dim=0)
 
-    def forward(self, value, image_mask, ready_outputs=(), *, fp8_decode=False):
+    def forward(self, value, image_mask, ready_outputs=(), *, fp8_decode=False, decode=False):
         w = self.weights
         gate_logits = (torch.ops.custom_op.custom_deepseek_v41_bf16_linear_f32_gaudi2(
             value.contiguous(), w.gate.weight) if self.router_bf16_gate else F.linear(value.float(), w.gate.weight))
-        scores = F.softplus(gate_logits).sqrt()
-        if self.router_top6:
-            if self.topk != 6 or scores.shape[1] != 384:
+        if self.router_top6 and decode:
+            if self.topk != 6 or gate_logits.shape[1] != 384:
                 raise ValueError("Native V4.1 Router requires 384 experts and top6")
-            ids, routing = torch.ops.custom_op.custom_deepseek_v41_router_top6_gaudi2(
-                scores, w.gate.bias, w.gate.bias_vl, image_mask)
+            # Keep the deployed Gaudi2 softplus/sqrt instruction chains and
+            # the ordered top-6 reduction in one TPC consumer.  This avoids
+            # materialising all 384 scores while preserving the stock
+            # BF16-gate -> FP32-score result bit for bit.
+            ids, routing = torch.ops.custom_op.custom_deepseek_v41_router_logits_top6_gaudi2(
+                gate_logits.contiguous(), w.gate.bias, w.gate.bias_vl,
+                image_mask.contiguous())
         else:
-            bias = torch.where(image_mask.unsqueeze(-1), w.gate.bias_vl, w.gate.bias)
-            ids = torch.topk(scores + bias, self.topk, dim=-1, sorted=True).indices
-            routing = scores.gather(1, ids)
-            routing = routing / (routing.sum(-1, keepdim=True) + 1e-20) * 1.5
+            scores = F.softplus(gate_logits).sqrt()
+            if self.router_top6:
+                # Large-M prefill retains the already-qualified native
+                # score-to-top6 path.  Falling through to torch.topk here
+                # changes the parent's tie/order contract and was the cause
+                # of the long-prompt output divergence in the decode-only
+                # fused-router candidate.
+                ids, routing = torch.ops.custom_op.custom_deepseek_v41_router_top6_gaudi2(
+                    scores, w.gate.bias, w.gate.bias_vl, image_mask)
+            else:
+                bias = torch.where(image_mask.unsqueeze(-1), w.gate.bias_vl, w.gate.bias)
+                ids = torch.topk(scores + bias, self.topk, dim=-1, sorted=True).indices
+                routing = scores.gather(1, ids)
+                routing = routing / (routing.sum(-1, keepdim=True) + 1e-20) * 1.5
         experts = w.experts
         if self.prefill_grouped and value.shape[0] > 6:
             from vllm_gaudi.ops.deepseek_v41_grouped_prefill import run_grouped_prefill
-            output = run_grouped_prefill(value, ids, routing, experts.w13_q16, experts.w2_q16, experts.w13_s16,
-                                         experts.w2_s16, self.lookup, self.normal_scales)
+            output = run_grouped_prefill(value, ids, routing, experts.w13_q16,
+                                        experts.w2_q16, experts.w13_s16,
+                                        experts.w2_s16, self.lookup, self.normal_scales)
         elif self.prefill_mxfp4 and value.shape[0] > 6:
             # Large-M prompt work has a different reuse regime from C1.  The
             # decode-oriented N256 compound kernel rereads and converts all
@@ -335,7 +356,8 @@ class PreparedMoE(nn.Module):
             # restored tensors are recipe temporaries; N256 remains the only
             # resident expert allocation and the C1 path below is unchanged.
             from vllm_gaudi.ops.deepseek_v41_prefill_moe import run_q16_prefill_moe
-            output = run_q16_prefill_moe(value, ids, routing, experts.w13_q16, experts.w2_q16, experts.w13_s16,
+            output = run_q16_prefill_moe(value, ids, routing, experts.w13_q16,
+                                         experts.w2_q16, experts.w13_s16,
                                          experts.w2_s16)
         elif self.n256:
             # The N256 FP8 compound node is the only large-M implementation
@@ -430,15 +452,16 @@ class PreparedDecoderLayer(nn.Module):
         if schedule:
             value = self.attention(value, positions, ready_outputs=(post, comb), decode=decode)
         else:
-            value = (self.attention.draft(value, positions)
-                     if self.draft else self.attention(value, positions, decode=decode))
+            value = (self.attention.draft(value, positions) if self.draft else
+                     self.attention(value, positions, decode=decode))
         residual = hc_post(value, residual, post, comb)
         value, pre_mix, post, comb = hc_pre(residual, new_pre, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base, self.eps,
                                             self.hc_eps, self.iterations)
         value = self.moe(rms_norm(value, w.ffn_norm.weight, self.eps),
                          image_mask,
                          ready_outputs=(post, comb) if schedule else (),
-                         fp8_decode=fp8_decode)
+                         fp8_decode=fp8_decode,
+                         decode=decode)
         return hc_post(value, residual, post, comb), pre_mix, target_state
 
 
@@ -452,6 +475,9 @@ class PreparedStage(nn.Module):
         self.pp_rank, self.tp_rank, self.length = pp_rank, tp_rank, max_length
         self.reduce, self.all_gather = reduce, all_gather
         self.dspark = (gaudi_envs.VLLM_HPU_DSV41_DSPARK if dspark is None else bool(dspark))
+        self.runtime_indexer = gaudi_envs.VLLM_HPU_DSV41_RUNTIME_INDEXER
+        if self.runtime_indexer and (self.dspark or max_length <= 512):
+            raise ValueError("Runtime CSA2 indexer requires paged ordinary decode")
         self.bf16_head = gaudi_envs.VLLM_HPU_DSV41_BF16_LM_HEAD
         if self.dspark and (self.bf16_head or gaudi_envs.VLLM_HPU_DSV41_BF16_ROUTER_GATE):
             raise ValueError("BF16 projection candidates require ordinary C1 decode")
@@ -471,6 +497,12 @@ class PreparedStage(nn.Module):
             if self.dspark:
                 raise ValueError("wo_a FP8 requires ordinary C1 decode")
             self.woa_config = layer_selection(gaudi_envs.VLLM_HPU_DSV41_WO_A_FP8_CONFIG)
+        self.woa_output_roundtrip = gaudi_envs.VLLM_HPU_DSV41_WOA_OUTPUT_ROUNDTRIP
+        if self.woa_output_roundtrip:
+            if self.dspark or not gaudi_envs.VLLM_HPU_DSV41_QUANT_ROUNDTRIP:
+                raise ValueError("Fused wo_a output roundtrip requires ordinary quantized execution")
+            if set(self.woa_config["layers"]) != set(self.dense_config["wo_b"]):
+                raise ValueError("Fused wo_a output roundtrip requires matching wo_a and wo_b FP8 layers")
         self.expert_n256 = (gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256 or gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8)
         self.expert_fused_quant = gaudi_envs.VLLM_HPU_DSV41_EXPERT_FUSED_QUANT
         self.expert_fused_reduce = gaudi_envs.VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE
@@ -571,6 +603,12 @@ class PreparedStage(nn.Module):
             attention.prepare_qkv_input_weight()
             attention.prepare_compressor_input_weight()
             attention.woa_fp8 = layer.layer in self.woa_config["layers"]
+            attention.woa_output_roundtrip = self.woa_output_roundtrip and attention.woa_fp8
+            if attention.woa_output_roundtrip:
+                wo_b = attention.weights.wo_b
+                if not (getattr(wo_b, "dense_fp8", False) and hasattr(wo_b, "scale")
+                        and hasattr(wo_b, "channel_scale")):
+                    raise ValueError("Fused wo_a output roundtrip requires group32 and dense FP8 wo_b")
             if gaudi_envs.VLLM_HPU_DSV41_PREPARED_OUTPUT:
                 attention.prepare_output_weight()
         if sidecar is not None:
@@ -588,24 +626,18 @@ class PreparedStage(nn.Module):
                 layer.moe.n256_fused = (layer.moe.n256_fp8 and self.expert_fused_quant)
                 layer.moe.n256_fused_reduce = (layer.moe.n256_fused and self.expert_fused_reduce)
             self.runtime_precision["expert_n256"] = {
-                "config":
-                self.expert_n256_config,
-                "layout":
-                LAYOUT,
-                "layout_fingerprint":
-                FINGERPRINT,
-                "prepared_rank_fingerprint":
-                (self.shard._n256_runtime_shard.fingerprint if hasattr(self.shard, "_n256_runtime_shard") else None),
-                "c1_c6":
-                "FP8xFP8" if gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8 else "BF16xBF16",
-                "prefill":
-                ("expert-grouped BF16 BMM over resident N256; ordered weighted SwiGLU"
-                 if gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED else "stock MXFP4 bridge"
-                 if gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4 else "FP8 N256 compound MME in bounded 128-token tiles"),
-                "fused_quant":
-                gaudi_envs.VLLM_HPU_DSV41_EXPERT_FUSED_QUANT,
-                "fused_reduce":
-                self.expert_fused_reduce,
+                "config": self.expert_n256_config,
+                "layout": LAYOUT,
+                "layout_fingerprint": FINGERPRINT,
+                "prepared_rank_fingerprint": (self.shard._n256_runtime_shard.fingerprint
+                                              if hasattr(self.shard, "_n256_runtime_shard") else None),
+                "c1_c6": "FP8xFP8" if gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8 else "BF16xBF16",
+                "prefill": ("expert-grouped BF16 BMM over resident N256; ordered weighted SwiGLU"
+                            if gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED else
+                            "stock MXFP4 bridge" if gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4 else
+                            "FP8 N256 compound MME in bounded 128-token tiles"),
+                "fused_quant": gaudi_envs.VLLM_HPU_DSV41_EXPERT_FUSED_QUANT,
+                "fused_reduce": self.expert_fused_reduce,
             }
             self.runtime_precision["experts"] = ("MXFP4 -> FP8 SRAM -> FP8xFP8 MME for C1-C6 and chunked prefill"
                                                  if gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8 else
@@ -644,6 +676,7 @@ class PreparedStage(nn.Module):
         self.runtime_precision["attention_kv_first"] = gaudi_envs.VLLM_HPU_DSV41_ATTN_KV_FIRST
         self.runtime_precision["attention_fused_norm"] = gaudi_envs.VLLM_HPU_DSV41_ATTN_FUSED_NORM
         self.runtime_precision["q_scale_rope"] = gaudi_envs.VLLM_HPU_DSV41_Q_SCALE_ROPE
+        self.runtime_precision["woa_output_roundtrip"] = self.woa_output_roundtrip
         self.runtime_precision["shared_gate_up"] = gaudi_envs.VLLM_HPU_DSV41_SHARED_GATE_UP
         self.runtime_precision["mhc_gates_fused"] = gaudi_envs.VLLM_HPU_DSV41_MHC_GATES_FUSED
         self.precision_fingerprint = canonical_hash(self.runtime_precision)
@@ -701,7 +734,8 @@ class PreparedStage(nn.Module):
         """
         tile = PreparedMoE.N256_PREFILL_TILE
         tokens = residual.shape[0]
-        if tokens > 6 and (gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED or gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4):
+        if tokens > 6 and (gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED
+                           or gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4):
             # Both implementations bound expert workspace internally and
             # reuse each weight over this complete scheduler transaction.
             # Splitting the stage into C128 first defeats that reuse. Paged
@@ -717,7 +751,8 @@ class PreparedStage(nn.Module):
         full_value = full_pre = full_target = None
         for start in range(0, tokens, tile):
             stop = min(start + tile, tokens)
-            rows = (tuple(row[start:stop] for row in engram_rows) if engram_rows else engram_rows)
+            rows = (tuple(row[start:stop] for row in engram_rows)
+                    if engram_rows else engram_rows)
             value, local_pre, target = self._forward_impl(
                 residual[start:stop],
                 pre_mix[start:stop],
@@ -726,10 +761,13 @@ class PreparedStage(nn.Module):
                 rows,
             )
             if full_value is None:
-                full_value = torch.empty((tokens, *value.shape[1:]), dtype=value.dtype, device=value.device)
-                full_pre = torch.empty((tokens, *local_pre.shape[1:]), dtype=local_pre.dtype, device=local_pre.device)
+                full_value = torch.empty((tokens, *value.shape[1:]), dtype=value.dtype,
+                                          device=value.device)
+                full_pre = torch.empty((tokens, *local_pre.shape[1:]), dtype=local_pre.dtype,
+                                        device=local_pre.device)
                 if target is not None:
-                    full_target = torch.empty((tokens, *target.shape[1:]), dtype=target.dtype, device=target.device)
+                    full_target = torch.empty((tokens, *target.shape[1:]), dtype=target.dtype,
+                                              device=target.device)
             full_value[start:stop].copy_(value)
             full_pre[start:stop].copy_(local_pre)
             if target is not None:
@@ -781,7 +819,15 @@ class PreparedStage(nn.Module):
 class PreparedLayerGroup(nn.Module):
     """Bound FX dependency closure without changing the stage tensor program."""
 
-    def __init__(self, stage, start, stop, *, pp_wire_input=False, fused_text_io=False, fp8_decode=False, decode=False):
+    def __init__(self,
+                 stage,
+                 start,
+                 stop,
+                 *,
+                 pp_wire_input=False,
+                 fused_text_io=False,
+                 fp8_decode=False,
+                 decode=False):
         super().__init__()
         self.fp8_decode = fp8_decode
         self.decode = decode
@@ -843,13 +889,8 @@ class PreparedLayerGroup(nn.Module):
         # transactions must use the normal paged prefill attention path even
         # when they enter through the native stage wrapper.
         decode = self.decode and residual.shape[0] <= 6
-        return self._forward(residual,
-                             pre_mix,
-                             positions,
-                             input_ids,
-                             engram_rows,
-                             fp8_decode=self.fp8_decode,
-                             decode=decode)
+        return self._forward(residual, pre_mix, positions, input_ids, engram_rows,
+                             fp8_decode=self.fp8_decode, decode=decode)
 
     def native_forward(self, residual, pre_mix, positions, input_ids, engram_rows):
         if self.native_input is not None:
@@ -909,14 +950,16 @@ class CompiledStage:
                                pp_wire_input=pp_wire_input,
                                fused_text_io=fused_text_io,
                                fp8_decode=native and stage.fp8_decode,
-                               decode=native) for start in range(0, len(stage.layers), group_size))
+                               decode=native)
+            for start in range(0, len(stage.layers), group_size))
         if native_input:
             self.groups[0].native_input = PreparedInput(stage.weights.embed, stage.tp_rank, stage.reduce)
         self.chunks = tuple(_compile_group(group, native=native, backend=backend) for group in self.groups)
 
     def __call__(self, hidden, pre_mix, positions, input_ids, engram):
         stock_prefill = (hidden.shape[0] > 6
-                         and (gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4 or gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED))
+                         and (gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4
+                              or gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED))
         large_prefill = hidden.shape[0] > PreparedMoE.N256_PREFILL_TILE
         if stock_prefill:
             # Preserve the normal vLLM large-M transaction so the stock MXFP4
@@ -929,7 +972,8 @@ class CompiledStage:
             aux = None
             for group in self.groups:
                 method = group.native_forward if self.native else group.forward
-                hidden, pre_mix, aux = method(hidden, pre_mix, positions, input_ids, engram)
+                hidden, pre_mix, aux = method(hidden, pre_mix, positions,
+                                              input_ids, engram)
             return hidden, pre_mix, aux
         if large_prefill:
             # A single compiled four-layer graph would retain every N256
@@ -950,20 +994,21 @@ class CompiledStage:
                 tile_pre = pre_mix[start:stop]
                 tile_positions = positions[start:stop]
                 tile_ids = input_ids[start:stop]
-                tile_engram = (tuple(row[start:stop] for row in engram) if engram else engram)
+                tile_engram = (tuple(row[start:stop] for row in engram)
+                               if engram else engram)
                 aux = None
                 for group in self.groups:
                     method = group.native_forward if self.native else group.forward
-                    tile_hidden, tile_pre, aux = method(tile_hidden, tile_pre, tile_positions, tile_ids, tile_engram)
+                    tile_hidden, tile_pre, aux = method(
+                        tile_hidden, tile_pre, tile_positions, tile_ids, tile_engram)
                 if full_hidden is None:
                     full_hidden = torch.empty((token_count, *tile_hidden.shape[1:]),
-                                              dtype=tile_hidden.dtype,
-                                              device=tile_hidden.device)
+                                               dtype=tile_hidden.dtype, device=tile_hidden.device)
                     full_pre = torch.empty((token_count, *tile_pre.shape[1:]),
-                                           dtype=tile_pre.dtype,
-                                           device=tile_pre.device)
+                                           dtype=tile_pre.dtype, device=tile_pre.device)
                     if aux is not None:
-                        full_aux = torch.empty((token_count, *aux.shape[1:]), dtype=aux.dtype, device=aux.device)
+                        full_aux = torch.empty((token_count, *aux.shape[1:]),
+                                               dtype=aux.dtype, device=aux.device)
                 full_hidden[start:stop].copy_(tile_hidden)
                 full_pre[start:stop].copy_(tile_pre)
                 if aux is not None:

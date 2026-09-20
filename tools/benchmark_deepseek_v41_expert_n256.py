@@ -30,10 +30,21 @@ def main():
     parser.add_argument("--profile-only", action="store_true")
     parser.add_argument("--fused-quant", action="store_true")
     parser.add_argument("--fused-reduce", action="store_true")
+    parser.add_argument("--direct-finalize", action="store_true")
+    parser.add_argument("--prefetch-w2", action="store_true",
+                        help="Compare early W2 decode scheduling against accepted direct-finalize")
+    parser.add_argument("--router-logits", action="store_true",
+                        help="Compare the fused logits-to-top6 kernel through the real expert consumer")
     parser.add_argument("--layers", type=int, nargs="+", default=[0, 4, 14, 19])
     args = parser.parse_args()
     if args.fused_reduce and not args.fused_quant:
         parser.error("--fused-reduce requires --fused-quant")
+    if args.direct_finalize and (args.fused_reduce or not args.fused_quant):
+        parser.error("--direct-finalize requires --fused-quant and excludes --fused-reduce")
+    if args.prefetch_w2 and not args.direct_finalize:
+        parser.error("--prefetch-w2 requires --direct-finalize")
+    if args.router_logits and not args.direct_finalize:
+        parser.error("--router-logits requires the accepted --direct-finalize consumer")
     output = Path(os.environ["DSV41_RUN_EVIDENCE"])
     torch.ops.load_library(os.environ["VLLM_HPU_DSV4_TPC_OP_LIBRARY"])
     bind_worker_cpu(0)
@@ -44,12 +55,15 @@ def main():
     lookup = mxfp4_bf16_lut("hpu")
     selected = list(range(12))
     inputs, weights = [], {"candidate": []}
-    if args.include_missing_reference or args.fused_reduce:
+    if args.include_missing_reference or args.fused_reduce or args.direct_finalize:
         weights["reference"] = []
     record = {
         "layout_fingerprint": FINGERPRINT,
         "fused_quant": args.fused_quant,
         "fused_reduce": args.fused_reduce,
+        "direct_finalize": args.direct_finalize,
+        "prefetch_w2": args.prefetch_w2,
+        "router_logits": args.router_logits,
         "layers": args.layers,
         "selected_real_experts": selected,
         "uninitialized_experts_never_addressed": True,
@@ -97,7 +111,21 @@ def main():
             shared = torch.randn(1, 5120).bfloat16().to("hpu")
             weights["candidate"].append((ids, route, new["w13"][0], new["w2"][0], new["w13"][1], new["w2"][1], lookup,
                                          new["w13"][2], new["w2"][2], shared))
-            if args.fused_reduce:
+            if args.router_logits:
+                prefix = f"layers.{layer}.ffn.gate."
+                text_bias = shard.tensor(prefix + "bias", "hpu").clone()
+                image_bias = shard.tensor(prefix + "bias_vl", "hpu").clone()
+                # The bounded diagnostic materializes only these real experts.
+                # Keep gate logits and biases real while making every measured
+                # route provably address an initialized expert tensor.
+                text_bias[len(selected):].fill_(-10000.0)
+                image_bias[len(selected):].fill_(-10000.0)
+                router = (shard.tensor(prefix + "weight", "hpu"),
+                          text_bias,
+                          image_bias,
+                          torch.tensor([layer % 3 == 0], dtype=torch.bool, device="hpu"))
+                weights["candidate"][-1] += router
+            if args.fused_reduce or args.direct_finalize:
                 # Isolate only the finalize tail. Both arms consume identical
                 # prepared N256 weights and changing IDs/activations.
                 weights["reference"].append(weights["candidate"][-1])
@@ -106,7 +134,11 @@ def main():
                     (ids, route, old["w13"][0], old["w2"][0], old["w13"][1], old["w2"][1], lookup, shared))
 
         def candidate(x, ids, route, q13, q2, s13, s2, lut, c13, c2, shared):
-            op = (torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2
+            op = (torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_direct_finalize_prefetch_w2_fp8_gaudi2
+                  if args.prefetch_w2 else
+                  torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_direct_finalize_fp8_gaudi2
+                  if args.direct_finalize else
+                  torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2
                   if args.fused_reduce else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2
                   if args.fused_quant else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fp8_gaudi2)
             value = op(x, ids, route, q13, q2, s13, s2, lut, c13, c2, True)
@@ -118,20 +150,48 @@ def main():
             return (value.float() + shared.float()).bfloat16()
 
         def fused_reference(x, ids, route, q13, q2, s13, s2, lut, c13, c2, shared):
-            value = torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2(
+            op = (torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2
+                  if args.direct_finalize else
+                  torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2)
+            value = op(
                 x, ids, route, q13, q2, s13, s2, lut, c13, c2, True)
+            return (value.float() + shared.float()).bfloat16()
+
+        def router_candidate(x, ids, route, q13, q2, s13, s2, lut, c13, c2,
+                             shared, gate, text, image, mask):
+            del ids, route
+            logits = torch.ops.custom_op.custom_deepseek_v41_bf16_linear_f32_gaudi2(
+                x.contiguous(), gate)
+            selected, routing = torch.ops.custom_op.custom_deepseek_v41_router_logits_top6_gaudi2(
+                logits, text, image, mask)
+            value = torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_direct_finalize_fp8_gaudi2(
+                x, selected, routing, q13, q2, s13, s2, lut, c13, c2, True)
+            return (value.float() + shared.float()).bfloat16()
+
+        def router_reference(x, ids, route, q13, q2, s13, s2, lut, c13, c2,
+                             shared, gate, text, image, mask):
+            del ids, route
+            logits = torch.ops.custom_op.custom_deepseek_v41_bf16_linear_f32_gaudi2(
+                x.contiguous(), gate)
+            scores = torch.nn.functional.softplus(logits).sqrt()
+            selected, routing = torch.ops.custom_op.custom_deepseek_v41_router_top6_gaudi2(
+                scores, text, image, mask)
+            value = torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_direct_finalize_fp8_gaudi2(
+                x, selected, routing, q13, q2, s13, s2, lut, c13, c2, True)
             return (value.float() + shared.float()).bfloat16()
 
         replays, compiled = {}, {}
         for arm in weights:
-            fn = candidate if arm == "candidate" else fused_reference if args.fused_reduce else reference
+            fn = ((router_candidate if arm == "candidate" else router_reference)
+                  if args.router_logits else candidate if arm == "candidate" else
+                  fused_reference if (args.fused_reduce or args.direct_finalize) else reference)
             compiled[arm] = torch.compile(fn, backend="hpu_backend", fullgraph=True, dynamic=False)
             for x, w in zip(inputs, weights[arm], strict=True):
                 ordinary = fn(x, *w).cpu()
                 actual = compiled[arm](x, *w).cpu()
                 assert torch.equal(ordinary.view(torch.int16), actual.view(torch.int16)), (arm, "ordinary/compiled")
             replays[arm] = recorder.prepare(compiled[arm], inputs, weights[arm])
-        if args.fused_reduce:
+        if args.fused_reduce or args.direct_finalize:
             for layer, (x, candidate_weights, reference_weights) in enumerate(
                     zip(inputs, weights["candidate"], weights["reference"], strict=True)):
                 actual = compiled["candidate"](x, *candidate_weights).cpu()
@@ -151,9 +211,15 @@ def main():
                     np.save(output / "finalize_candidate.npy", actual.float().numpy())
                     np.save(output / "finalize_reference.npy", expected.float().numpy())
                     np.save(output / "finalize_shared.npy", candidate_weights[-1].cpu().float().numpy())
+                    if args.router_logits:
+                        (output / "result.json").write_text(json.dumps(record, indent=2))
+                        raise AssertionError((layer, "complete MoE consumer mismatch", record["finalize_mismatch"]))
                     candidate_core = torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2(
                         x, *candidate_weights[:-1], True).cpu()
-                    reference_core = torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2(
+                    reference_op = (torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2
+                                    if args.direct_finalize else
+                                    torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2)
+                    reference_core = reference_op(
                         x, *reference_weights[:-1], True).cpu()
                     np.save(output / "finalize_candidate_core.npy", candidate_core.float().numpy())
                     np.save(output / "finalize_reference_core.npy", reference_core.float().numpy())
@@ -162,8 +228,11 @@ def main():
             record["checks"].append({
                 "candidate_reference_bitwise_equal":
                 True,
-                "comparison":
-                "same N256 W13/W2 chain; fused finalize versus materialized six-row tail",
+                "comparison": ("production score chain versus fused sqrt/top6 through identical direct-finalize MoE"
+                               if args.router_logits else
+                               "same N256 W13/W2 chain; direct FP32 scale/reduce versus two-TPC fused finalize"
+                               if args.direct_finalize else
+                               "same N256 W13/W2 chain; fused finalize versus materialized six-row tail"),
             })
         bind_worker_helpers(0)
         record["peak_hpu_allocated_bytes"] = torch.hpu.max_memory_allocated()
@@ -198,9 +267,10 @@ def main():
         for round_id in range(3):
             for x, w in zip(inputs, weights["candidate"], strict=True):
                 x.mul_(1.01 if round_id % 2 else 0.99)
-                current_ids = ((torch.arange(6) + round_id * 3) % len(selected)).int().reshape(1, 6)
-                assert set(current_ids.flatten().tolist()) <= set(selected)
-                w[0].copy_(current_ids)
+                if not args.router_logits:
+                    current_ids = ((torch.arange(6) + round_id * 3) % len(selected)).int().reshape(1, 6)
+                    assert set(current_ids.flatten().tolist()) <= set(selected)
+                    w[0].copy_(current_ids)
             torch.hpu.synchronize()
             for arm, replay in replays.items():
                 expected = [compiled[arm](x, *w).cpu() for x, w in zip(inputs, weights[arm], strict=True)]

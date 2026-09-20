@@ -23,16 +23,20 @@ tpc_lib_api::GlueCodeReturn DeepseekV41MlaGaudi2::GetGcDefinitions(
     for (unsigned i = 0; i < inputs; ++i) out->inputTensorAccessPattern[i].allRequired = true;
     out->indexSpaceRank = 1;
     if (gather_) {
-        if (!in->nodeParams.nodeParams || in->nodeParams.nodeParamsSize != 2 * sizeof(int32_t))
+        if (!in->nodeParams.nodeParams || in->nodeParams.nodeParamsSize != 3 * sizeof(int32_t))
             return GLUE_NODE_NOT_FOUND;
         const auto* p = static_cast<const int32_t*>(in->nodeParams.nodeParams);
-        out->kernel.paramsNr = 2; out->kernel.scalarParams[0] = p[0]; out->kernel.scalarParams[1] = p[1];
+        out->kernel.paramsNr = 3;
+        out->kernel.scalarParams[0] = p[0];
+        out->kernel.scalarParams[1] = p[1];
+        out->kernel.scalarParams[2] = p[2];
         const auto width = in->inputTensors[2].geometry.maxSizes[0];
         if (!matches(in->inputTensors[0], DATA_BF16, 2, 512) ||
             !matches(in->inputTensors[1], DATA_BF16, 2, 512) ||
             !matches(in->inputTensors[2], DATA_I32, 2, width) ||
             in->inputTensors[2].geometry.maxSizes[1] != 1 || !width || width > 640 || width % 64 ||
             !matches(in->inputTensors[3], DATA_I32, 1, 1) || p[0] < 0 || p[0] % 512 || p[1] < 0 ||
+            (p[2] != 256 && p[2] != 512) ||
             uint64_t(p[0]) + 512 > in->inputTensors[0].geometry.maxSizes[1] ||
             uint64_t(p[1]) > in->inputTensors[1].geometry.maxSizes[1]) return GLUE_INCOMPATIBLE_INPUT_SIZE;
         for (unsigned i = 4; i < 6; ++i)
