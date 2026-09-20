@@ -1,0 +1,36 @@
+{
+  "record_kind": "user_supplied_research_candidate",
+  "source_document": "1cat-vllm-gaudi-README-DRAFT.md",
+  "documentation_date": "2026-09-21",
+  "measurement_date": null,
+  "source_base_sha": "5fa3e08302716d458a82aa7d95d107e201b51d8c",
+  "hardware": {
+    "accelerator": "Intel Gaudi2",
+    "count": 4,
+    "tp": 2,
+    "pp": 2
+  },
+  "dspark": false,
+  "input_tokens": 2052,
+  "output_tokens": 256,
+  "itl_ms_per_token_rounds": [
+    13.6086,
+    13.6044,
+    13.6045
+  ],
+  "itl_mean_ms_per_token_reported": 13.606,
+  "decode_tokens_per_second_from_mean_itl_reported": 73.5,
+  "capacity_config": {
+    "max_model_len": 1048576,
+    "max_num_batched_tokens": 8192,
+    "max_num_seqs": 32,
+    "block_size": 128,
+    "num_gpu_blocks_override": 8193
+  },
+  "actual_request_concurrency": null,
+  "exact_candidate_patch": null,
+  "runtime_fingerprints": null,
+  "raw_timing_files": null,
+  "quality_records": null,
+  "fresh_hardware_test": false
+}
