@@ -254,7 +254,6 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             raise RuntimeError("Prepared V4.1 weights have not been loaded")
         input_ids, positions = input_ids.reshape(-1), positions.reshape(-1).to(torch.int32)
         pp_wire = None
-        search = getattr(self.program, "search_length", 512)
         fused_text_io = (self.pp_rank == 0 and envs.VLLM_HPU_DSV41_FUSED_STAGE_IO and self.native
                          and self.step_use_replay and inputs_embeds is None)
         native_input = (self.pp_rank == 0 and self.native and self.step_use_replay
@@ -288,7 +287,6 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             else:
                 residual = pre = None
             engram = ()
-        search = getattr(self.program, "search_length", 512)
         if self.program.length > 512 and not self.step_use_replay:
             # Keep prompt geometries out of the shape-specialized compile
             # cache in the 1M profile. Prefill remains one large-M C8192 model

@@ -291,7 +291,7 @@ class PreparedMoE(nn.Module):
             # directly from its FP32 accumulator so the six BF16 route rows
             # are rounded and reduced in routing order without an HBM
             # intermediate.  C2+ continues to use the normal fused body.
-            op = (torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_direct_finalize_prefetch_w2_fp8_gaudi2
+            op = (torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_direct_finalize_fp8_gaudi2
                   if self.n256_fused_reduce and tile_value.shape[0] == 1 else
                   torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2
                   if use_fused else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fp8_gaudi2)

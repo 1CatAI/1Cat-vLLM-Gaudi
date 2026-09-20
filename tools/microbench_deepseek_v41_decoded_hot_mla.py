@@ -101,7 +101,9 @@ def main() -> None:
                host_main_decoded, host_selected_cache, row_ids, packed_indices,
                decoded_indices, lengths, host_selected, position, block_table,
                sink, scale, swa_done, main_done]
-    q, swa_packed, main_packed, swa_decoded, main_decoded, selected_cache, row_ids, packed_indices, decoded_indices, lengths, selected, position, block_table, sink, scale, swa_done, main_done = [
+    (q, swa_packed, main_packed, swa_decoded, main_decoded, selected_cache,
+     row_ids, packed_indices, decoded_indices, lengths, selected, position,
+     block_table, sink, scale, swa_done, main_done) = [
         value.contiguous().to("hpu") for value in tensors
     ]
     layout = (torch.ops.custom_op.custom_deepseek_v41_prefix_layout_r1_i32_gaudi2

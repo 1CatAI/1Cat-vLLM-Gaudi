@@ -113,11 +113,11 @@ def main() -> None:
                 # preserving the scheduler's single max_num_batched_tokens
                 # transaction.  It is intentionally explicit in the
                 # microbenchmark; no C1/C6 request loop is hidden here.
-                def tiled_fn(x, ids, route):
+                def tiled_fn(x, ids, route, _tokens=tokens, _raw_fn=raw_fn):
                     pieces = []
-                    for begin in range(0, tokens, args.tile):
-                        end = min(tokens, begin + args.tile)
-                        pieces.append(raw_fn(x[begin:end], ids[begin:end], route[begin:end]))
+                    for begin in range(0, _tokens, args.tile):
+                        end = min(_tokens, begin + args.tile)
+                        pieces.append(_raw_fn(x[begin:end], ids[begin:end], route[begin:end]))
                     return torch.cat(pieces, dim=0)
                 fn = torch.compile(tiled_fn, backend="hpu_backend", fullgraph=True, dynamic=False)
             else:

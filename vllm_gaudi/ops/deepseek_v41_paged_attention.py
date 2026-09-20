@@ -347,18 +347,6 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                       self._rotary_native_table()).reshape(value.shape)
         return _apply_rope_torch(value, positions, self._rotary_table(), inverse)
 
-    def _norm_rope_kv(self, value, positions, norm):
-        """Fuse exact KV RMSNorm and forward RoPE for bounded token batches."""
-        if (self.fused_norm and self.native_rope and value.dtype == torch.bfloat16
-                and value.ndim == 2 and 1 <= value.shape[0] <= 512
-                and value.shape[1] == 512):
-            return torch.ops.custom_op.custom_deepseek_v41_kv_norm_rope_bf16_gaudi2(
-                value.contiguous(), self.weights.kv_norm.weight,
-                positions.to(torch.int32).contiguous(),
-                self._rotary_native_table(), self.eps)
-        return self._rope(norm(value, self.weights.kv_norm.weight, self.eps),
-                          positions)
-
     def project_output(self, value):
         """Project MLA output without restoring a bounded-context weight path."""
         if self.woa_fp8:
@@ -447,7 +435,10 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         index = rms_norm(self.linear(latent, indexer.wk), indexer.k_norm.weight, self.eps)
         index, latent = self._rope(index, first), self._rope(latent, first)
         if (self.runtime_indexer and self.ratio == 1
-                and self.search_length == INDEX_MME_HOT_TOKENS
+                # The <=512 static bucket is the producer for the later hot
+                # MME bucket.  Populate its prefix before the search geometry
+                # switches at token 513; otherwise rows 0..511 remain zero.
+                and self.search_length <= INDEX_MME_HOT_TOKENS
                 and hasattr(self.cache, "decoded_index_hot")):
             # The mirror must contain the same values as the packed index
             # cache.  Keeping the pre-quantization key would silently change
@@ -531,7 +522,9 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         best_scores = best_rows = None
         block_scores = block_ids = None
         for start in range(0, columns, PREFILL_INDEX_ROWS):
-            current_rows = rows[start:start + PREFILL_INDEX_ROWS] if rows.ndim == 1 else rows[:, start:start + PREFILL_INDEX_ROWS]
+            current_rows = (rows[start:start + PREFILL_INDEX_ROWS]
+                            if rows.ndim == 1 else
+                            rows[:, start:start + PREFILL_INDEX_ROWS])
             scorer = self._prefill_scores if native_scores else self._scores
             scores = scorer(positions, current_rows, q, weights)
             best_scores, best_rows = self._merge_topk(best_scores, best_rows, scores, current_rows, width)
@@ -767,16 +760,22 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         # already receives contiguous buffers and is unchanged.
         qr = norm(query_input.contiguous(), self.weights.q_norm.weight, self.eps)
         query = self.project_query(qr, positions)
-        kv = self._norm_rope_kv(kv_input.contiguous(), positions, norm)
+        kv = norm(kv_input.contiguous(), self.weights.kv_norm.weight, self.eps)
+        kv = self._rope(kv, positions)
         if not decode and value.shape[0] > NATIVE_WORK_TOKENS:
             return self._prefill_attention(value, qr, query, kv, positions, ready_outputs)
         decoded = (self.decoded_kv_state and self.ratio in (1, 2)
                    and self.search_length // self.ratio <= self.cache.decoded_main.shape[0])
         completion = None
         if decoded and value.shape[0] == 1:
+            # The decoded SWA mirror is consumed through the same 256-row
+            # circular namespace as the packed SWA cache.  Passing the logical
+            # position here leaves rows 0..255 stale after the first wrap even
+            # though prefix_layout addresses them modulo SWA_ROWS.
+            ring_position = positions.remainder(SWA_ROWS).to(torch.int32).contiguous()
             completion = torch.ops.custom_op.custom_deepseek_v41_swa_paged_decoded_write_bf16_gaudi2(
-                self.swa, kv.contiguous(), positions.remainder(SWA_ROWS).to(torch.int32).contiguous(),
-                positions.to(torch.int32).contiguous(), self.shared.decoded_swa,
+                self.swa, kv.contiguous(), ring_position,
+                ring_position, self.shared.decoded_swa,
                 self.decoded_swa_offset)
         else:
             packed_swa = pack_swa(kv)

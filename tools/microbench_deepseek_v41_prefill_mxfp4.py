@@ -93,8 +93,8 @@ def main() -> None:
         routing = torch.rand(tokens, 6, dtype=torch.bfloat16, device="hpu")
         routing /= routing.sum(-1, keepdim=True)
 
-        def invoke():
-            return compiled(hidden, ids, routing, weights13, weights2, scales13, scales2,
+        def invoke(_hidden=hidden, _ids=ids, _routing=routing):
+            return compiled(_hidden, _ids, _routing, weights13, weights2, scales13, scales2,
                             32, "silu", 0, args.experts - 1, 0, 0)
 
         output = None

@@ -52,9 +52,9 @@ class N256PreparedShard:
         # Same immutable-file policy as PreparedV41Shard: a changed identity
         # requires a full digest check; unchanged rank files avoid a second
         # full disk scan on every restart.
-        if (stat.st_ino != record["inode"] or stat.st_mtime_ns != record["mtime_ns"]):
-            if file_hash(self.path) != record["sha256"]:
-                raise ValueError("Prepared N256 file hash mismatch")
+        if ((stat.st_ino != record["inode"] or stat.st_mtime_ns != record["mtime_ns"])
+                and file_hash(self.path) != record["sha256"]):
+            raise ValueError("Prepared N256 file hash mismatch")
         self.identity = stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
         self.catalog = read_header(self.path)
         specs = runtime_specs(shard)

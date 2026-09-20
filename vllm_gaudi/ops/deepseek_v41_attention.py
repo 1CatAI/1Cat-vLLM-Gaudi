@@ -276,23 +276,6 @@ class CSA2Attention(FusedCompressorInput, nn.Module):
                 value.reshape(1, -1, shape[-1]).contiguous(), positions, table).reshape(shape)
         return apply_rope(value, positions, self.rotary, inverse=inverse)
 
-    def _norm_rope_kv(self, value, positions, norm):
-        """Preserve KV's BF16 norm boundary without a second TPC launch.
-
-        The native operation owns one complete 512-wide row per token and is
-        valid for the full bounded work range, so this is not a C1-only graph.
-        Larger prefill transactions retain the existing tensor path.
-        """
-        if (self.fused_norm and self.native_rope and value.dtype == torch.bfloat16
-                and value.ndim == 2 and 1 <= value.shape[0] <= 512
-                and value.shape[1] == 512):
-            return torch.ops.custom_op.custom_deepseek_v41_kv_norm_rope_bf16_gaudi2(
-                value.contiguous(), self.weights.kv_norm.weight,
-                positions.to(torch.int32).contiguous(), self.rotary_native,
-                self.eps)
-        return self._rope(norm(value, self.weights.kv_norm.weight, self.eps),
-                          positions)
-
     def project_query(self, value, positions):
         weight = self.weights.wq_b
         if self.q_scale_rope and value.shape[0] == 1 and getattr(weight, "dense_fp8", False):
@@ -363,7 +346,8 @@ class CSA2Attention(FusedCompressorInput, nn.Module):
         delay_q = self.kv_first and value.shape[0] == 1
         if not delay_q:
             query = self.project_query(query, positions)
-        kv = self._norm_rope_kv(kv_input, positions, norm)
+        kv = norm(kv_input, self.weights.kv_norm.weight, self.eps)
+        kv = self._rope(kv, positions)
         completion = None
         if self.decoded_kv_state and value.shape[0] == 1:
             completion = torch.ops.custom_op.custom_deepseek_v41_swa_decoded_write_bf16_gaudi2(

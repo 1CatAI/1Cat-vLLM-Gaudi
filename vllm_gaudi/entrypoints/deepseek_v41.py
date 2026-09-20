@@ -9,6 +9,10 @@ from pathlib import Path
 import sys
 
 _C1_FASTPATH_DEFAULTS = {
+    # This is the quality-qualified numerical profile used by the prepared
+    # V4.1 deployment.  Individual switches remain explicit below so a
+    # diagnostic override can disable one component before process startup.
+    "VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS": "1",
     "VLLM_HPU_DSV41_PREPARED_SHARDS": "1",
     "VLLM_HPU_DSV41_ENGRAM_HOST_TABLE": "1",
     "VLLM_HPU_DSV41_GRAPH_REPLAY": "1",
@@ -65,6 +69,9 @@ _C1_FASTPATH_DEFAULTS = {
     "VLLM_HPU_DSV41_PREFILL_DEVICE_ROUTES": "1",
     "VLLM_HPU_DSV41_PREFILL_ROUTE_OUTPUT": "1",
     "VLLM_HPU_DSV41_PREFILL_EXPERT_ROWS": "128",
+    "VLLM_HPU_DSV41_PREFILL_COMPACT_CANDIDATES": "1",
+    "VLLM_HPU_DSV41_PREFILL_MLA_ROWS": "64",
+    "VLLM_HPU_DSV41_COMPRESSOR_FUSED_INPUT": "1",
     "VLLM_HPU_TP2_NATIVE_JOINT_PLAN": "1",
     "VLLM_HPU_TP2_PREPARED_COMM": "1",
     "VLLM_HPU_TP2_STATIC_GROUP_PLAN": "1",

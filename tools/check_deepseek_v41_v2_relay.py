@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Check the actual V2 device sampler/PP relay through the next embedding."""
+# ruff: noqa: E402
 import json
 import os
 from pathlib import Path
@@ -10,7 +11,7 @@ os.environ["HLS_MODULE_ID"] = os.environ["HABANA_VISIBLE_MODULES"].split(",")[ra
 
 import torch
 import habana_frameworks.torch
-import habana_frameworks.torch.distributed.hccl
+import habana_frameworks.torch.distributed.hccl  # noqa: F401
 from vllm_gaudi.ops.deepseek_v4_config import bind_worker_cpu, bind_worker_helpers
 from vllm_gaudi.ops.deepseek_v41_sampling import select_greedy_candidate
 from vllm_gaudi.distributed.tp2_fused_ar_norm import _load_bridge, _verify_prepared_runtime
