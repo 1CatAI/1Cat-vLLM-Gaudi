@@ -30,6 +30,15 @@ def io(node, prefix):
 
 def classify(node, kernel, inputs, outputs):
     name = node.lower()
+    if "deepseek_v41_engram_hash_gather" in kernel or "device_engram_" in name:
+        return "Engram", "设备端 token history/hash、TP shard 行读取及 BF16 staging 填充"
+    if "deepseek_v41_mhc_gates" in kernel:
+        return "mHC", "mHC gate、Sinkhorn 输入及 residual mixing 系数准备"
+    if "deepseek_v41_ffn_norm_quant" in kernel:
+        return "MoE 准备", "FFN RMSNorm、动态 FP8 scale 与激活量化融合"
+    if any(part in kernel for part in ("deepseek_v41_index_scores", "deepseek_v41_index_threshold",
+                                       "deepseek_v41_index_emit")):
+        return "CSA2", "CSA2 Reindex 候选打分、阈值选择及紧凑候选槽输出"
     if "deepseek_v41_q_scale_rope" in kernel:
         return "Attention", "wq_b FP32 结果缩放、BF16 舍入及 Q RoPE 融合"
     if "deepseek_v41_q_projection_rope" in name:
@@ -86,6 +95,8 @@ def classify(node, kernel, inputs, outputs):
         projection = "wq_b" if weight == [16384, 1280] else "wo_b" if weight == [5120, 4096] else "Attention dense FP8"
         return "Attention", projection + (" 原生矩阵计算，实际操作数见合同" if weight else " 内部准备/转换/搬运")
     if "deepseek_v41_bf16_linear_f32" in name and kernel in ("GEMM", "BatchGemm"):
+        if "/moe/" in name:
+            return "Router", "BF16×BF16、FP32 输出的 384 专家路由打分"
         return "输出头", "BF16×BF16 TP 词表投影，FP32 logits"
     if "topk" in name or "bitonic" in kernel:
         return "Router", "专家 Top-k 排序；实际输入见张量合同"
@@ -122,6 +133,12 @@ def classify(node, kernel, inputs, outputs):
             return "Router", "384 专家路由打分"
         if weight == [25600, 6144]:
             return "Engram", "查询行到 key/value 投影"
+        # On a recipe-cache hit tensor contracts are absent, but these are the
+        # only two plain BF16 linear modules on PP0 and correspond to the two
+        # Engram layer projections.  Keep the source-node proof in the report.
+        if ("/linear/linear_fwd_bf16/" in name and "/moe/" not in name
+                and "/attention/" not in name):
+            return "Engram", "Engram 查询行到 key/value 投影"
         if "/attention/" in name:
             if inputs and inputs[0]["dtype"] == "float32":
                 return "Attention", "Compressor FP32 投影；wkv/wgate 绑定尚待逐节点还原"
@@ -274,7 +291,8 @@ def analyze(root, rank, common):
     bundle_categories = collections.defaultdict(set)
     for contract in contracts.values():
         symbol = contract["symbol"]
-        category, _ = classify(symbol["node"], symbol["kernel"], contract["inputs"], contract["outputs"])
+        category, _ = classify(symbol["node"], symbol["kernel"], contract.get("inputs", []),
+                               contract.get("outputs", []))
         key = bundle_key(contract)
         if key and category in ("路由专家", "Attention", "共享专家", "Engram", "mHC", "Router"):
             bundle_categories[key].add(category)
@@ -370,7 +388,7 @@ def analyze(root, rank, common):
         inputs, outputs = (contract.get(part, []) if contract else [] for part in ("inputs", "outputs"))
         category, purpose = classify(source, kernel, inputs, outputs)
         origin = None
-        norm = norm_owners.get(contract.get("graph", {}).get("path"), {}).get(source) if contract else None
+        norm = norm_owners.get((contract.get("graph") or {}).get("path"), {}).get(source) if contract else None
         if norm:
             category, purpose = "Attention", norm["role"] + " RMSNorm：投影后的转换、统计、归一化及权重乘法"
             origin = norm
@@ -487,7 +505,11 @@ if __name__ == "__main__":
     data = [json.loads((args.analysis / f"rank{r}/device-windows.json").read_text()) for r in range(4)]
     tokens = sorted(set.intersection(*(set(d["tokens"]) for d in data)))
     anchor = dict(zip(data[2]["tokens"], data[2]["windows_us"]))
-    common = {"tokens": tokens, "windows_us": [anchor[t] for t in tokens], "anchor": "rank2 final MoE to final MoE"}
+    common = {
+        "tokens": tokens,
+        "windows_us": [anchor[t] for t in tokens],
+        "anchor": "rank2 successive native_decoder_enqueue markers (full decoder replay cadence)",
+    }
     (args.analysis / "common-windows.json").write_text(json.dumps(common, indent=2) + "\n")
     for rank in range(4):
         analyze(args.analysis, rank, common)

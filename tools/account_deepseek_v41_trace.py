@@ -26,7 +26,7 @@ GROUPS = (
     "CSA2：KV/index/RoPE 与注意力状态准备",
     "已记录 DMA/NIC：数据搬运与命令发布",
     "Embedding、输出头、采样及其他入口/尾部张量",
-    "Engram 设备投影",
+    "Engram：设备 hash/gather 与查询行投影",
     "无已记录设备区间：Graph/CPU/TP/PP 待进一步归因",
 )
 
@@ -257,9 +257,9 @@ def account(root):
         "不等于表中 Engram 设备投影时间。", "",
         "[可搜索完整 kernel/张量报告](kernels.html) · [逐节点汇总 CSV](four-rank-kernel-members.csv) · "
         "[互斥区间及重叠 JSON](four-rank-disjoint-accounting.json)", "",
-        "每个 rank 的 node-breakdown.json 保存实际 GUID、源节点、编译图、输入/输出 dtype、shape、"
-        "SRAM/DRAM、平均完整调用延迟、活动并集、物理调用数和 lane 包数。"
-        "无法重建的 DMA 描述符调用数及其单次延迟显式为空。", "",
+        "每个 rank 的 node-breakdown.json 保存实际 GUID、源节点、平均完整调用延迟、活动并集、物理调用数"
+        "和 lane 包数。本次命中既有 recipe cache，运行时没有重新导出全部编译图张量合同；缺失的 dtype/shape"
+        "及无法重建的 DMA 调用数显式为空，不用静态猜测填充。", "",
         "| rank | TPC 并集 ms | MME 并集 ms | 全设备并集 ms |", "| --- | ---: | ---: | ---: |"
     ])
     for row in rank_activity:

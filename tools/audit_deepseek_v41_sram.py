@@ -24,7 +24,9 @@ def tensor_info(text):
 def audit(path):
     raw = path.read_text()
     prefixes = ("custom_deepseek_v41_mxfp4_prepared_dequant", "custom_deepseek_v41_mxfp4_k128_dequant",
-                "custom_deepseek_v41_mxfp4_n512_dequant")
+                "custom_deepseek_v41_mxfp4_n512_dequant",
+                "custom_deepseek_v41_expert_n256_fp8_gaudi2",
+                "custom_deepseek_v41_expert_n256_slots_fp8_gaudi2")
     if not any(prefix in raw for prefix in prefixes):
         return None
     decode, matrix = [], []
@@ -84,7 +86,7 @@ def main():
     parser.add_argument("graphs", type=Path)
     parser.add_argument("output", type=Path)
     args = parser.parse_args()
-    result = [entry for path in sorted(args.graphs.glob("*PostGraph*")) if (entry := audit(path))]
+    result = [entry for path in sorted(args.graphs.rglob("*PostGraph*")) if (entry := audit(path))]
     if not result:
         raise RuntimeError("No compiled V4.1 MoE graphs found")
     args.output.write_text(json.dumps(result, indent=2) + "\n")

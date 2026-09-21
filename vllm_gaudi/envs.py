@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_FIXED_POSITIONS: bool = False
     VLLM_HPU_DSV41_PACKED_PP: bool = False
     VLLM_HPU_DSV41_TPC_MHC: bool = False
+    VLLM_HPU_DSV41_MHC_CONTROL_RRMS: bool = False
     VLLM_HPU_DSV41_MHC_GATES_FUSED: bool = False
     VLLM_HPU_DSV41_ENGRAM_NATIVE_C1: bool = False
     VLLM_HPU_DSV41_ENGRAM_C1_PACKET: bool = False
@@ -89,6 +90,8 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_Q_SCALE_ROPE: bool = False
     VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR: str = ""
     VLLM_HPU_DSV41_ATTN_DENSE_FP8_CONFIG: str = ""
+    VLLM_HPU_DSV41_ENGRAM_FP8: bool = False
+    VLLM_HPU_DSV41_ENGRAM_FP8_SIDECAR: str = ""
     VLLM_HPU_DSV41_EXPERT_K128: bool = False
     VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE: bool = False
     VLLM_HPU_DSV41_ROUTER_TOP6: bool = False
@@ -441,6 +444,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_PACKED_PP", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_TPC_MHC":
     lambda: os.environ.get("VLLM_HPU_DSV41_TPC_MHC", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_MHC_CONTROL_RRMS":
+    lambda: os.environ.get("VLLM_HPU_DSV41_MHC_CONTROL_RRMS", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_GATES_FUSED":
     lambda: os.environ.get("VLLM_HPU_DSV41_MHC_GATES_FUSED", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_ENGRAM_NATIVE_C1":
@@ -487,6 +492,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR", ""),
     "VLLM_HPU_DSV41_ATTN_DENSE_FP8_CONFIG":
     lambda: os.environ.get("VLLM_HPU_DSV41_ATTN_DENSE_FP8_CONFIG", ""),
+    "VLLM_HPU_DSV41_ENGRAM_FP8":
+    lambda: os.environ.get("VLLM_HPU_DSV41_ENGRAM_FP8", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_ENGRAM_FP8_SIDECAR":
+    lambda: os.environ.get("VLLM_HPU_DSV41_ENGRAM_FP8_SIDECAR", ""),
     "VLLM_HPU_DSV41_EXPERT_K128":
     lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_K128", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE":

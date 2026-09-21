@@ -35,7 +35,17 @@ def main():
                         help="Compare early W2 decode scheduling against accepted direct-finalize")
     parser.add_argument("--router-logits", action="store_true",
                         help="Compare the fused logits-to-top6 kernel through the real expert consumer")
+    parser.add_argument("--ffn-norm-quant", action="store_true",
+                        help="Compare fused FFN RMSNorm/quant through the accepted W13/W2 consumer")
+    parser.add_argument("--slot-fused", action="store_true",
+                        help="Compare one six-slot TPC decode launch against the accepted per-slot access map")
+    parser.add_argument("--fused-shared-tail", action="store_true",
+                        help="Keep the exact prequant routed/shared finalize inside the compound graph")
+    parser.add_argument("--resident-fp8", action="store_true",
+                        help="Compare a decoded-FP8 cache hit through the complete W13/W2 consumer chain")
     parser.add_argument("--layers", type=int, nargs="+", default=[0, 4, 14, 19])
+    parser.add_argument("--tokens", type=int, choices=(1, 2), default=1,
+                        help="Decode batch used by the full consumer chain")
     args = parser.parse_args()
     if args.fused_reduce and not args.fused_quant:
         parser.error("--fused-reduce requires --fused-quant")
@@ -45,12 +55,24 @@ def main():
         parser.error("--prefetch-w2 requires --direct-finalize")
     if args.router_logits and not args.direct_finalize:
         parser.error("--router-logits requires the accepted --direct-finalize consumer")
+    if args.ffn_norm_quant and not args.prefetch_w2:
+        parser.error("--ffn-norm-quant requires the accepted direct-finalize/prefetch-W2 consumer")
+    if args.slot_fused and not args.ffn_norm_quant:
+        parser.error("--slot-fused requires --ffn-norm-quant so both arms consume identical prequantized input")
+    if args.slot_fused and args.tokens != 1:
+        parser.error("--slot-fused currently qualifies the top-6 single-token decode contract")
+    if args.fused_shared_tail and (not args.ffn_norm_quant or not args.prefetch_w2
+                                   or args.slot_fused or args.tokens != 1):
+        parser.error("--fused-shared-tail requires C1 FFN-norm/prequant and prefetch-W2, without slot fusion")
+    if args.resident_fp8 and (not args.ffn_norm_quant or args.slot_fused or args.tokens != 1):
+        parser.error("--resident-fp8 requires the C1 FFN-norm/prequant reference and excludes slot fusion")
     output = Path(os.environ["DSV41_RUN_EVIDENCE"])
     torch.ops.load_library(os.environ["VLLM_HPU_DSV4_TPC_OP_LIBRARY"])
     bind_worker_cpu(0)
     torch.manual_seed(202641)
     torch._dynamo.config.recompile_limit = 32
     shard = PreparedV41Shard(args.prepared, 0, 0)
+    epsilon = json.loads((args.prepared / "config.json").read_text())["text_config"]["rms_norm_eps"]
     recorder = RecipeRecorder(output)
     lookup = mxfp4_bf16_lut("hpu")
     selected = list(range(12))
@@ -64,6 +86,11 @@ def main():
         "direct_finalize": args.direct_finalize,
         "prefetch_w2": args.prefetch_w2,
         "router_logits": args.router_logits,
+        "ffn_norm_quant": args.ffn_norm_quant,
+        "slot_fused": args.slot_fused,
+        "fused_shared_tail": args.fused_shared_tail,
+        "resident_fp8": args.resident_fp8,
+        "tokens": args.tokens,
         "layers": args.layers,
         "selected_real_experts": selected,
         "uninitialized_experts_never_addressed": True,
@@ -105,12 +132,30 @@ def main():
                       "temporary_bound",
                       qualification["temporary_upper_bound_bytes"],
                       flush=True)
-            inputs.append(torch.randn(1, 5120).bfloat16().to("hpu"))
-            ids = torch.arange(6, dtype=torch.int32, device="hpu").reshape(1, 6)
-            route = torch.softmax(torch.randn(1, 6), -1).mul_(1.5).to("hpu")
-            shared = torch.randn(1, 5120).bfloat16().to("hpu")
-            weights["candidate"].append((ids, route, new["w13"][0], new["w2"][0], new["w13"][1], new["w2"][1], lookup,
-                                         new["w13"][2], new["w2"][2], shared))
+            inputs.append(torch.randn(args.tokens, 5120).bfloat16().to("hpu"))
+            ids = (torch.arange(args.tokens * 6, dtype=torch.int32, device="hpu")
+                   .reshape(args.tokens, 6) % len(selected))
+            route = torch.softmax(torch.randn(args.tokens, 6), -1).mul_(1.5).to("hpu")
+            shared = torch.randn(args.tokens, 5120).bfloat16().to("hpu")
+            base_weights = (ids, route, new["w13"][0], new["w2"][0],
+                            new["w13"][1], new["w2"][1], lookup,
+                            new["w13"][2], new["w2"][2], shared)
+            if args.ffn_norm_quant:
+                base_weights += (shard.tensor(f"layers.{layer}.ffn_norm.weight", "hpu"), )
+            if args.resident_fp8:
+                resident_w13 = torch.ops.custom_op.custom_deepseek_v41_expert_n256_fp8_gaudi2(
+                    ids, new["w13"][0], new["w13"][1], lookup, True)
+                resident_w2 = torch.ops.custom_op.custom_deepseek_v41_expert_n256_fp8_gaudi2(
+                    ids, new["w2"][0], new["w2"][1], lookup, True)
+                torch.hpu.synchronize()
+                candidate_weights = (ids, route, resident_w13, resident_w2,
+                                     new["w13"][2], new["w2"][2], shared,
+                                     base_weights[-1])
+                record.setdefault("resident_fp8_bytes", 0)
+                record["resident_fp8_bytes"] += resident_w13.numel() + resident_w2.numel()
+            else:
+                candidate_weights = base_weights
+            weights["candidate"].append(candidate_weights)
             if args.router_logits:
                 prefix = f"layers.{layer}.ffn.gate."
                 text_bias = shard.tensor(prefix + "bias", "hpu").clone()
@@ -123,12 +168,13 @@ def main():
                 router = (shard.tensor(prefix + "weight", "hpu"),
                           text_bias,
                           image_bias,
-                          torch.tensor([layer % 3 == 0], dtype=torch.bool, device="hpu"))
+                          torch.full((args.tokens,), layer % 3 == 0,
+                                     dtype=torch.bool, device="hpu"))
                 weights["candidate"][-1] += router
             if args.fused_reduce or args.direct_finalize:
                 # Isolate only the finalize tail. Both arms consume identical
                 # prepared N256 weights and changing IDs/activations.
-                weights["reference"].append(weights["candidate"][-1])
+                weights["reference"].append(base_weights)
             elif args.include_missing_reference:
                 weights["reference"].append(
                     (ids, route, old["w13"][0], old["w2"][0], old["w13"][1], old["w2"][1], lookup, shared))
@@ -143,6 +189,71 @@ def main():
                   if args.fused_quant else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fp8_gaudi2)
             value = op(x, ids, route, q13, q2, s13, s2, lut, c13, c2, True)
             return (value.float() + shared.float()).bfloat16()
+
+        def norm_quant_candidate(x, ids, route, q13, q2, s13, s2, lut,
+                                 c13, c2, shared, norm_weight):
+            normalized, quantized, activation_scale = (
+                torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
+                    x, norm_weight, epsilon))
+            op = (
+                torch.ops.custom_op.
+                custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_shared_prefetch_w2_fp8_gaudi2
+                if args.fused_shared_tail else torch.ops.custom_op.
+                custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_slots_fp8_gaudi2
+                if args.slot_fused else torch.ops.custom_op.
+                custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_prefetch_w2_fp8_gaudi2
+                if args.tokens == 1 else
+                torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_prequant_fused_fp8_gaudi2)
+            operands = (normalized, ids, route, q13, q2, s13, s2, lut,
+                        c13, c2, quantized, activation_scale)
+            if args.fused_shared_tail:
+                return op(*operands, shared, True)
+            value = op(*operands, True)
+            return (value.float() + shared.float()).bfloat16()
+
+        def norm_quant_reference(x, ids, route, q13, q2, s13, s2, lut,
+                                 c13, c2, shared, norm_weight):
+            if args.fused_shared_tail:
+                normalized, quantized, activation_scale = (
+                    torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
+                        x, norm_weight, epsilon))
+                routed = (
+                    torch.ops.custom_op.
+                    custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_prefetch_w2_fp8_gaudi2(
+                        normalized, ids, route, q13, q2, s13, s2, lut,
+                        c13, c2, quantized, activation_scale, True))
+                return (routed.float() + shared.float()).bfloat16()
+            if args.slot_fused:
+                normalized, quantized, activation_scale = (
+                    torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
+                        x, norm_weight, epsilon))
+                routed = (
+                    torch.ops.custom_op.
+                    custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_prefetch_w2_fp8_gaudi2(
+                        normalized, ids, route, q13, q2, s13, s2, lut,
+                        c13, c2, quantized, activation_scale, True))
+                return (routed.float() + shared.float()).bfloat16()
+            value = x.float()
+            normalized = (value * torch.rsqrt(value.square().mean(-1, keepdim=True) + epsilon)
+                          * norm_weight.float()).to(torch.bfloat16).contiguous()
+            op = (torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_direct_finalize_prefetch_w2_fp8_gaudi2
+                  if args.tokens == 1 else
+                  torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2)
+            routed = op(normalized, ids, route, q13, q2, s13, s2, lut,
+                        c13, c2, True)
+            return (routed.float() + shared.float()).bfloat16()
+
+        def resident_candidate(x, ids, route, w13, w2, c13, c2, shared,
+                               norm_weight):
+            normalized, quantized, activation_scale = (
+                torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
+                    x, norm_weight, epsilon))
+            routed = (
+                torch.ops.custom_op.
+                custom_deepseek_v41_expert_n256_moe_prequant_resident_direct_finalize_fp8_gaudi2(
+                    normalized, ids, route, w13, w2, c13, c2,
+                    quantized, activation_scale, True))
+            return (routed.float() + shared.float()).bfloat16()
 
         def reference(x, ids, route, q13, q2, s13, s2, lut, shared):
             value = torch.ops.custom_op.custom_deepseek_v41_mxfp4_prepared_moe_k128_bf16_gaudi2(
@@ -182,7 +293,11 @@ def main():
 
         replays, compiled = {}, {}
         for arm in weights:
-            fn = ((router_candidate if arm == "candidate" else router_reference)
+            fn = ((resident_candidate if arm == "candidate" else norm_quant_reference)
+                  if args.resident_fp8 else
+                  (norm_quant_candidate if arm == "candidate" else norm_quant_reference)
+                  if args.ffn_norm_quant else
+                  (router_candidate if arm == "candidate" else router_reference)
                   if args.router_logits else candidate if arm == "candidate" else
                   fused_reference if (args.fused_reduce or args.direct_finalize) else reference)
             compiled[arm] = torch.compile(fn, backend="hpu_backend", fullgraph=True, dynamic=False)
@@ -210,10 +325,20 @@ def main():
                     }
                     np.save(output / "finalize_candidate.npy", actual.float().numpy())
                     np.save(output / "finalize_reference.npy", expected.float().numpy())
-                    np.save(output / "finalize_shared.npy", candidate_weights[-1].cpu().float().numpy())
+                    shared_index = -2 if args.ffn_norm_quant else -1
+                    np.save(output / "finalize_shared.npy",
+                            candidate_weights[shared_index].cpu().float().numpy())
                     if args.router_logits:
                         (output / "result.json").write_text(json.dumps(record, indent=2))
                         raise AssertionError((layer, "complete MoE consumer mismatch", record["finalize_mismatch"]))
+                    if args.resident_fp8:
+                        (output / "result.json").write_text(json.dumps(record, indent=2))
+                        raise AssertionError((layer, "resident FP8 complete consumer mismatch",
+                                              record["finalize_mismatch"]))
+                    if args.fused_shared_tail:
+                        (output / "result.json").write_text(json.dumps(record, indent=2))
+                        raise AssertionError((layer, "prequant shared-tail mismatch",
+                                              record["finalize_mismatch"]))
                     candidate_core = torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2(
                         x, *candidate_weights[:-1], True).cpu()
                     reference_op = (torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2
@@ -228,7 +353,13 @@ def main():
             record["checks"].append({
                 "candidate_reference_bitwise_equal":
                 True,
-                "comparison": ("production score chain versus fused sqrt/top6 through identical direct-finalize MoE"
+                "comparison": ("resident decoded-FP8 cache hit versus compressed MXFP4 decode "
+                               "through identical N256 W13/W2, SwiGLU, direct-finalize and BF16 consumer"
+                               if args.resident_fp8 else
+                               "same prequant W13/W2 routed result; exact BF16/FP32 shared-expert "
+                               "finalize inside versus outside the compound graph"
+                               if args.fused_shared_tail else
+                               "production score chain versus fused sqrt/top6 through identical direct-finalize MoE"
                                if args.router_logits else
                                "same N256 W13/W2 chain; direct FP32 scale/reduce versus two-TPC fused finalize"
                                if args.direct_finalize else
@@ -267,8 +398,9 @@ def main():
         for round_id in range(3):
             for x, w in zip(inputs, weights["candidate"], strict=True):
                 x.mul_(1.01 if round_id % 2 else 0.99)
-                if not args.router_logits:
-                    current_ids = ((torch.arange(6) + round_id * 3) % len(selected)).int().reshape(1, 6)
+                if not args.router_logits and not args.resident_fp8:
+                    current_ids = ((torch.arange(args.tokens * 6).reshape(args.tokens, 6)
+                                    + round_id * 3) % len(selected)).int()
                     assert set(current_ids.flatten().tolist()) <= set(selected)
                     w[0].copy_(current_ids)
             torch.hpu.synchronize()

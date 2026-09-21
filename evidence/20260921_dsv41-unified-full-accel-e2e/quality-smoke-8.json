@@ -1,0 +1,82 @@
+[
+  {
+    "name": "arith",
+    "status": 200,
+    "latency_s": 0.3100789769086987,
+    "finish_reason": "stop",
+    "chars": 2,
+    "ok": true,
+    "text": "45",
+    "error": ""
+  },
+  {
+    "name": "capital",
+    "status": 200,
+    "latency_s": 0.2669245341094211,
+    "finish_reason": "stop",
+    "chars": 2,
+    "ok": true,
+    "text": "巴黎",
+    "error": ""
+  },
+  {
+    "name": "translate",
+    "status": 200,
+    "latency_s": 0.3418560499558225,
+    "finish_reason": "stop",
+    "chars": 7,
+    "ok": true,
+    "text": "知识就是力量。",
+    "error": ""
+  },
+  {
+    "name": "primes",
+    "status": 200,
+    "latency_s": 0.5924794779857621,
+    "finish_reason": "stop",
+    "chars": 14,
+    "ok": true,
+    "text": "11、13、17、19、23",
+    "error": ""
+  },
+  {
+    "name": "photosynthesis",
+    "status": 200,
+    "latency_s": 1.3582055399892852,
+    "finish_reason": "stop",
+    "chars": 149,
+    "ok": true,
+    "text": "1. 植物就像一座小工厂，用叶子吸收阳光当“能源”，从空气中吸进二氧化碳，从根部喝足水当“原料”。  \n2. 阳光把水和二氧化碳“加工”成葡萄糖（植物的食物）和氧气，这个过程就叫光合作用。  \n3. 植物靠它养活自己、长高结果，同时把氧气排到空气中，让我们能呼吸——所以植物是地球的“氧气制造机”。",
+    "error": ""
+  },
+  {
+    "name": "tcpudp",
+    "status": 200,
+    "latency_s": 2.1972881270339713,
+    "finish_reason": "stop",
+    "chars": 289,
+    "ok": true,
+    "text": "TCP 和 UDP 的三个主要区别如下：\n\n1. **连接方式**\n   - TCP：面向连接，通信前需要先建立连接（三次握手）。\n   - UDP：无连接，发送数据前不需要建立连接。\n\n2. **可靠性**\n   - TCP：可靠传输，提供确认、重传、排序和流量控制，尽量保证数据不丢失、不重复、按序到达。\n   - UDP：不可靠传输，不保证数据一定到达，也不保证顺序。\n\n3. **速度与开销**\n   - TCP：开销较大，机制复杂，速度相对较慢。\n   - UDP：开销小，传输效率高，速度通常更快。\n\n一句话总结：**TCP 更可靠但更慢，UDP 更快但不可靠。**",
+    "error": ""
+  },
+  {
+    "name": "fib",
+    "status": 200,
+    "latency_s": 6.568669576896355,
+    "finish_reason": "stop",
+    "chars": 987,
+    "ok": true,
+    "text": "# Python 函数：返回前 n 个斐波那契数\n\n```python\ndef fibonacci(n: int) -> list[int]:\n    \"\"\"\n    返回前 n 个斐波那契数。\n    斐波那契数列定义：F(0)=0, F(1)=1, F(k)=F(k-1)+F(k-2)\n    \n    参数:\n        n: 需要返回的斐波那契数的个数（n >= 0）\n    返回:\n        包含前 n 个斐波那契数的列表\n    \"\"\"\n    if n <= 0:\n        return []\n    if n == 1:\n        return [0]\n    \n    fibs = [0, 1]\n    for i in range(2, n):\n        fibs.append(fibs[-1] + fibs[-2])\n    return fibs\n\n\n# 示例\nif __name__ == \"__main__\":\n    print(fibonacci(10))  # [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]\n```\n\n## 复杂度分析\n\n- **时间复杂度：O(n)**\n  循环执行 `n - 2` 次，每次只做一次加法和一次 `append`，均为 O(1) 操作，因此整体是线性的。\n\n- **空间复杂度：O(n)**\n  结果列表需要存储 n 个数；除此之外只用了常数级别的额外变量。\n\n## 对比说明\n\n| 实现方式 | 时间复杂度 | 空间复杂度 | 备注 |\n|---|---|---|---|\n| 迭代（本实现） | O(n) | O(n) | 推荐，简单高效 |\n| 朴素递归 | O(2ⁿ) | O(n) | 存在大量重复计算，n 稍大就不可用 |\n| 带记忆化递归 | O(n) | O(n) | 递归深度可能触发栈溢出 |\n| 矩阵快速幂 | O(log n) | O(log n) | 适合求第 n 项，但求前 n 项仍需 O(n) 输出 |\n\n> 如果只需要**第 n 个**斐波那契数（而非前 n 个），可以用矩阵快速幂或快速倍增法把时间降到 **O(log n)**；但本题要求返回前 n 个数，输出本身就有 n 个元素，所以 O(n) 已是最优。",
+    "error": ""
+  },
+  {
+    "name": "story",
+    "status": 200,
+    "latency_s": 1.1570649440400302,
+    "finish_reason": "stop",
+    "chars": 95,
+    "ok": true,
+    "text": "雨夜，便利店门口，她没带伞，正发愁。一个男孩跑过来，把伞塞给她：“我家近，跑回去就行！”说完冲进雨里。她撑开伞，发现伞柄上贴着一张便签：“记得还我，明天老地方见。”她笑了，雨声忽然变得温柔。",
+    "error": ""
+  }
+]

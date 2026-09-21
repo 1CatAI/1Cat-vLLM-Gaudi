@@ -3,6 +3,10 @@
 #include <cstring>
 extern unsigned char _binary___deepseek_v41_mla_gather_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_mla_gather_gaudi2_o_end;
+extern unsigned char
+    _binary___deepseek_v41_mla_selected_prefix_gather_gaudi2_o_start;
+extern unsigned char
+    _binary___deepseek_v41_mla_selected_prefix_gather_gaudi2_o_end;
 extern unsigned char _binary___deepseek_v41_mla_softmax_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_mla_softmax_gaudi2_o_end;
 extern unsigned char _binary___deepseek_v41_mla_shared_kv_gaudi2_o_start;
@@ -30,13 +34,19 @@ tpc_lib_api::GlueCodeReturn DeepseekV41MlaGaudi2::GetGcDefinitions(
         out->kernel.scalarParams[0] = p[0];
         out->kernel.scalarParams[1] = p[1];
         out->kernel.scalarParams[2] = p[2];
-        const auto width = in->inputTensors[2].geometry.maxSizes[0];
+        const auto width = selected_prefix_
+                               ? uint64_t(640)
+                               : in->inputTensors[2].geometry.maxSizes[0];
         if (!matches(in->inputTensors[0], DATA_BF16, 2, 512) ||
             !matches(in->inputTensors[1], DATA_BF16, 2, 512) ||
-            !matches(in->inputTensors[2], DATA_I32, 2, width) ||
-            in->inputTensors[2].geometry.maxSizes[1] != 1 || !width || width > 640 || width % 64 ||
-            !matches(in->inputTensors[3], DATA_I32, 1, 1) || p[0] < 0 || p[0] % 512 || p[1] < 0 ||
-            (p[2] != 256 && p[2] != 512) ||
+            !matches(in->inputTensors[2], DATA_I32, 2,
+                     selected_prefix_ ? 512 : width) ||
+            in->inputTensors[2].geometry.maxSizes[1] != 1 ||
+            !matches(in->inputTensors[3], DATA_I32, 1, 1) ||
+            !width || width > 640 || width % 64 || p[0] < 0 ||
+            p[0] % 512 || p[1] < 0 ||
+            (selected_prefix_ ? p[2] != 256
+                              : (p[2] != 256 && p[2] != 512)) ||
             uint64_t(p[0]) + 512 > in->inputTensors[0].geometry.maxSizes[1] ||
             uint64_t(p[1]) > in->inputTensors[1].geometry.maxSizes[1]) return GLUE_INCOMPATIBLE_INPUT_SIZE;
         for (unsigned i = 4; i < 6; ++i)
@@ -54,9 +64,11 @@ tpc_lib_api::GlueCodeReturn DeepseekV41MlaGaudi2::GetGcDefinitions(
             out->outputTensorAccessPattern[i].mapping[1] = {0, 1, 0, 0};
         }
         out->outputTensorAccessPattern[mask_index].mapping[0] = {0, 1, 0, 0};
-        out->inputTensorAccessPattern[2].allRequired = false;
-        out->inputTensorAccessPattern[2].mapping[0] = {0, 1, 0, 0};
-        out->inputTensorAccessPattern[2].mapping[1] = {0, 0, 0, 0};
+        if (!selected_prefix_) {
+            out->inputTensorAccessPattern[2].allRequired = false;
+            out->inputTensorAccessPattern[2].mapping[0] = {0, 1, 0, 0};
+            out->inputTensorAccessPattern[2].mapping[1] = {0, 0, 0, 0};
+        }
     } else {
         const auto& g = in->inputTensors[0].geometry;
         const auto width = g.maxSizes[0], heads = g.maxSizes[1];
@@ -80,6 +92,10 @@ tpc_lib_api::GlueCodeReturn DeepseekV41MlaGaudi2::GetGcDefinitions(
     }
     auto* first = gather_ ? &_binary___deepseek_v41_mla_gather_gaudi2_o_start : &_binary___deepseek_v41_mla_softmax_gaudi2_o_start;
     auto* last = gather_ ? &_binary___deepseek_v41_mla_gather_gaudi2_o_end : &_binary___deepseek_v41_mla_softmax_gaudi2_o_end;
+    if (selected_prefix_) {
+        first = &_binary___deepseek_v41_mla_selected_prefix_gather_gaudi2_o_start;
+        last = &_binary___deepseek_v41_mla_selected_prefix_gather_gaudi2_o_end;
+    }
     if (bf16_) {
         first = gather_ ? &_binary___deepseek_v41_mla_shared_kv_gaudi2_o_start : &_binary___deepseek_v41_mla_exp_bf16_gaudi2_o_start;
         last = gather_ ? &_binary___deepseek_v41_mla_shared_kv_gaudi2_o_end : &_binary___deepseek_v41_mla_exp_bf16_gaudi2_o_end;

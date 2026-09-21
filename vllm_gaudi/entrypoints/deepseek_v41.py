@@ -93,7 +93,9 @@ _NUMERIC_FASTPATH_DEFAULTS = {
     "VLLM_HPU_DSV41_SHARED_GATE_UP": "1",
     "VLLM_HPU_DSV41_BF16_ROUTER_GATE": "1",
     "VLLM_HPU_DSV41_MHC_GATES_FUSED": "1",
+    "VLLM_HPU_DSV41_MHC_CONTROL_RRMS": "1",
     "VLLM_HPU_DSV41_ATTN_DENSE_FP8": "1",
+    "VLLM_HPU_DSV41_ENGRAM_FP8": "1",
     "VLLM_HPU_DSV41_Q_SCALE_ROPE": "1",
     "VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE": "1",
 }
@@ -101,6 +103,7 @@ _NUMERIC_FASTPATH_DEFAULTS = {
 _SIDECARS = {
     "wo_a_fp8": ("VLLM_HPU_DSV41_WO_A_FP8", "VLLM_HPU_DSV41_WO_A_FP8_SIDECAR"),
     "attention_dense_fp8": ("VLLM_HPU_DSV41_ATTN_DENSE_FP8", "VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR"),
+    "engram_fp8": ("VLLM_HPU_DSV41_ENGRAM_FP8", "VLLM_HPU_DSV41_ENGRAM_FP8_SIDECAR"),
 }
 
 
@@ -281,6 +284,15 @@ def main():
                 "HABANA_VISIBLE_MODULES",
                 "HLS_MODULE_ID",
                 "HABANA_LOGS",
+                # Candidate evidence runs build their native extension and
+                # kernel database in an isolated directory.  Keep those
+                # fingerprinted launcher selections across the runtime-profile
+                # re-exec instead of silently restoring the profile's older
+                # build.  prepare_native_libraries() validates both files
+                # against the candidate build manifest before workers start.
+                "GC_KERNEL_PATH",
+                "VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR",
+                "VLLM_HPU_DSV4_TPC_OP_LIBRARY",
                 "VLLM_HPU_DSV4_WORKER_CPUS",
                 "VLLM_HPU_DSV4_WORKER_HELPER_CPUS",
                 "VLLM_HPU_TP2_PLAN_DUMP_DIR",

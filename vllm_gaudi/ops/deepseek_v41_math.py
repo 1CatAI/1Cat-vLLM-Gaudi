@@ -21,6 +21,44 @@ def rms_norm(x, weight, eps=1e-20):
     return (value * torch.rsqrt(value.square().mean(-1, keepdim=True) + eps) * weight.float()).to(x.dtype)
 
 
+def final_rms_norm(x, weight, eps=1e-20):
+    """Use the qualified low-launch-cost row norm for the decoder tail.
+
+    The custom kernel is profitable for the B1/B2 production decode shapes,
+    while the batch-generic graph remains faster at B32.  This dispatch is an
+    internal shape choice under the same request-slot contract; it does not
+    change the server batch capacity or create a C1-only execution path.
+    """
+    if (x.device.type == "hpu" and x.dtype == torch.bfloat16 and x.ndim == 2
+            and x.shape[-1] == 5120 and x.shape[0] <= 2
+            and hasattr(torch.ops.custom_op,
+                        "custom_deepseek_v41_attention_norm_bf16_gaudi2")):
+        return torch.ops.custom_op.custom_deepseek_v41_attention_norm_bf16_gaudi2(
+            x.contiguous(), weight, eps)
+    return rms_norm(x, weight, eps)
+
+
+def final_collapse_rms_norm(residual, pre_mix, weight, eps=1e-20):
+    """Collapse the four mHC streams and normalize at the PP1 tail.
+
+    The native B1/B2 path retains the production BF16 boundary between the
+    FP32 collapse and RMSNorm. Larger batches share the same state contract
+    through the batch-generic graph.
+    """
+    if (residual.device.type == "hpu" and residual.dtype == torch.bfloat16
+            and residual.ndim == 3 and residual.shape[1:] == (4, 5120)
+            and residual.shape[0] <= 2 and pre_mix.dtype == torch.float32
+            and pre_mix.shape == residual.shape[:2]
+            and hasattr(
+                torch.ops.custom_op,
+                "custom_deepseek_v41_final_collapse_norm_bf16_gaudi2")):
+        return torch.ops.custom_op.custom_deepseek_v41_final_collapse_norm_bf16_gaudi2(
+            residual.contiguous(), pre_mix.contiguous(), weight, eps)
+    value = (residual.float() * pre_mix.unsqueeze(-1)).sum(1).to(
+        residual.dtype)
+    return final_rms_norm(value, weight, eps)
+
+
 def e4m3_decode(code):
     bits = code.to(torch.int32)
     exponent, mantissa = (bits >> 3) & 15, bits & 7
@@ -205,16 +243,37 @@ def _apply_rope_torch(value, positions, table, inverse=False):
     return torch.cat((value[..., :-width], rotated.flatten(-2).to(value.dtype)), dim=-1)
 
 
-def hc_pre(residual, previous_pre, fn, scale, base, eps=1e-20, hc_eps=1e-6, iterations=20):
+def hc_pre(residual,
+           previous_pre,
+           fn,
+           scale,
+           base,
+           eps=1e-20,
+           hc_eps=1e-6,
+           iterations=20,
+           packed_fn=None):
     """vLLM mhc_pre_delayed_torch's previous-sublayer mixing contract."""
     copies = residual.shape[1]
-    flat = residual.flatten(1).float()
-    if (gaudi_envs.VLLM_HPU_DSV41_TPC_MHC and flat.device.type == "hpu" and flat.shape == (1, 20480)
-            and fn.shape == (24, 20480)):
-        projection = torch.ops.custom_op.custom_deepseek_v41_control_gemv_f32_gaudi2(flat, fn)
+    flat_bf16 = residual.flatten(1)
+    if (gaudi_envs.VLLM_HPU_DSV41_MHC_CONTROL_RRMS and
+            packed_fn is not None and flat_bf16.device.type == "hpu" and
+            flat_bf16.dtype == torch.bfloat16 and
+            1 <= flat_bf16.shape[0] <= 2048 and
+            flat_bf16.shape[-1] == 20480 and
+            packed_fn.shape == (24, 20480)):
+        control = (
+            torch.ops.custom_op.
+            custom_deepseek_v41_control_gemv_rrms_bf16_gaudi2(
+                flat_bf16.contiguous(), packed_fn, eps))
+        projection, rrms = control[:, :24], control[:, 24:]
     else:
-        projection = F.linear(flat, fn)
-    rrms = torch.rsqrt(flat.square().mean(-1, keepdim=True) + eps)
+        flat = flat_bf16.float()
+        if (gaudi_envs.VLLM_HPU_DSV41_TPC_MHC and flat.device.type == "hpu" and flat.shape == (1, 20480)
+                and fn.shape == (24, 20480)):
+            projection = torch.ops.custom_op.custom_deepseek_v41_control_gemv_f32_gaudi2(flat, fn)
+        else:
+            projection = F.linear(flat, fn)
+        rrms = torch.rsqrt(flat.square().mean(-1, keepdim=True) + eps)
     # The fused TPC gate is a decode/small-prefill win.  At C8192 its single
     # TPC program measures slower than the compiler's wide elementwise chain
     # (1.200 ms versus 1.088 ms on Gaudi2), so retain the same math and native

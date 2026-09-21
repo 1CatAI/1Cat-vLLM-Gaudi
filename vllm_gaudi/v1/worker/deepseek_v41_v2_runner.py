@@ -63,6 +63,11 @@ class V41V2ModelRunner(V41ModelRunner):
         self._completion = None
         self._input_committed = None
         self._prefix_started = None
+        # The device-token continuation owns one request generation.  A
+        # multi-request scheduler step must use the ordinary synchronous
+        # completion path so each request retires its PP packet before the
+        # runner binds the next request slot.
+        self._v2_async_step = False
         self._relay_token = torch.empty((1, 1), dtype=torch.int32, device=self.device)
         logger.info("V4.1 V2 HPU adapter: async output, device PP token relay, native continuation")
 
@@ -148,7 +153,11 @@ class V41V2ModelRunner(V41ModelRunner):
     def execute_model(self, scheduled):
         if scheduled.num_scheduled_tokens or scheduled.finished_req_ids:
             self._consume_completion(scheduled)
-        output = super().execute_model(scheduled)
+        self._v2_async_step = len(scheduled.num_scheduled_tokens) == 1
+        try:
+            output = super().execute_model(scheduled)
+        finally:
+            self._v2_async_step = False
         if self._prefix_started is not None and self.pp.group.is_first_rank:
             if self.model.decode_prefix_pending:
                 raise RuntimeError("Authorized V2 prefix was not consumed by its suffix")
@@ -185,6 +194,8 @@ class V41V2ModelRunner(V41ModelRunner):
         super()._update(scheduled)
 
     def _sample_single(self):
+        if not getattr(self, "_v2_async_step", True):
+            return super()._sample_single()
         request, start, count, last_count, proposed, need_sample, selected = self.pending
         if start < len(request.prompt) or not need_sample:
             return super()._sample_single()

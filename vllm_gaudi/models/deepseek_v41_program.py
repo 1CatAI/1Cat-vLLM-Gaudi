@@ -18,6 +18,7 @@ from vllm_gaudi.ops.deepseek_v41_math import (
     hc_post,
     hc_pre,
     quantize_activation,
+    final_collapse_rms_norm,
     rms_norm,
     unpack_swa,
 )
@@ -67,7 +68,8 @@ def load_weight_tree(shard,
                      woa_layers=(),
                      expert_n256_layers=None,
                      dense_sidecar=None,
-                     dense_config=None):
+                     dense_config=None,
+                     engram_sidecar=None):
     n256 = gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256 or gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8
     dense_names = {
         f"layers.{layer}.attn.{projection}.weight"
@@ -76,6 +78,18 @@ def load_weight_tree(shard,
     for name, spec in (shard.specs if specs is None else specs).items():
         layer = int(name.split(".")[1]) if name.startswith("layers.") else None
         selected_n256 = n256 and layer is not None and (expert_n256_layers is None or layer in expert_n256_layers)
+        if (engram_sidecar is not None and name in {
+                "layers.1.engram.wkv.weight", "layers.14.engram.wkv.weight"
+        }):
+            module = tree.get_submodule(name.rpartition(".")[0])
+            module.weight = engram_sidecar.tensor(name, device)
+            channel = engram_sidecar.tensor(name.removesuffix("weight") + "channel_scale", device)
+            if "channel_scale" in module._buffers:
+                module.channel_scale = channel
+            else:
+                module.register_buffer("channel_scale", channel, False)
+            module.dense_fp8 = True
+            continue
         if name in dense_names:
             module = tree.get_submodule(name.rpartition(".")[0])
             module.weight = dense_sidecar.tensor(name, device)
@@ -277,11 +291,12 @@ class PreparedMoE(nn.Module):
             result = result + down.float()[:, expert]
         return result.to(value.dtype)
 
-    def _forward_n256_fp8(self, value, ids, routing):
+    def _forward_n256_fp8(self, value, ids, routing, *, prequant=None, shared=None):
         """Run the resident FP8 N256 body for decode and bounded prefill."""
         experts = self.weights.experts
 
-        def one_tile(tile_value, tile_ids, tile_routing):
+        def one_tile(tile_value, tile_ids, tile_routing, tile_prequant,
+                     tile_shared):
             operands = (tile_value, tile_ids.to(torch.int32), tile_routing.float(),
                         experts.w13_q16, experts.w2_q16, experts.w13_s16,
                         experts.w2_s16, self.lookup)
@@ -291,28 +306,63 @@ class PreparedMoE(nn.Module):
             # directly from its FP32 accumulator so the six BF16 route rows
             # are rounded and reduced in routing order without an HBM
             # intermediate.  C2+ continues to use the normal fused body.
-            op = (torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_direct_finalize_fp8_gaudi2
-                  if self.n256_fused_reduce and tile_value.shape[0] == 1 else
-                  torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2
-                  if use_fused else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fp8_gaudi2)
+            # W2 weights depend only on the selected expert IDs.  The
+            # qualified C1 plan emits their decode before the independent
+            # W13 MME so TPC preparation can overlap matrix execution.
             # Both N256 FP8 schemas consume the per-output channel scales;
             # the fused variant additionally folds the SwiGLU/quant boundary.
             channel13 = experts.w13_fp8_channel
             channel2 = experts.w2_fp8_channel
             if not isinstance(channel13, torch.Tensor) or not isinstance(channel2, torch.Tensor):
                 raise TypeError("N256 FP8 channel scales were not loaded as tensors")
+            if tile_prequant is not None:
+                if not use_fused:
+                    raise ValueError("Prequantized N256 input requires the fused expert body")
+                quantized, activation_scale = tile_prequant
+                if tile_shared is not None:
+                    if not self.n256_fused_reduce or tile_value.shape[0] != 1:
+                        raise ValueError("Shared finalize requires the C1 prequant direct-finalize path")
+                    op = (torch.ops.custom_op.
+                          custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_shared_prefetch_w2_fp8_gaudi2)
+                    return op(
+                        *operands, channel13, channel2, quantized,
+                        activation_scale, tile_shared,
+                        bool(self.normal_scales))
+                op = (
+                    torch.ops.custom_op.
+                    custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_prefetch_w2_fp8_gaudi2
+                    if self.n256_fused_reduce and tile_value.shape[0] == 1 else
+                    torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_prequant_fused_fp8_gaudi2)
+                return op(*operands, channel13, channel2, quantized,
+                          activation_scale, bool(self.normal_scales))
+            op = (torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_direct_finalize_prefetch_w2_fp8_gaudi2
+                  if self.n256_fused_reduce and tile_value.shape[0] == 1 else
+                  torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2
+                  if use_fused else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fp8_gaudi2)
             return op(*operands, channel13, channel2, bool(self.normal_scales))
 
         tokens = int(value.shape[0])
         if tokens <= self.N256_PREFILL_TILE:
-            return one_tile(value, ids, routing)
+            return one_tile(value, ids, routing, prequant, shared)
+        if shared is not None:
+            raise ValueError("Shared finalize cannot cross N256 prefill tiles")
         pieces = []
         for begin in range(0, tokens, self.N256_PREFILL_TILE):
             end = min(tokens, begin + self.N256_PREFILL_TILE)
-            pieces.append(one_tile(value[begin:end], ids[begin:end], routing[begin:end]))
+            tile_prequant = None if prequant is None else (
+                prequant[0][begin:end], prequant[1][begin:end])
+            pieces.append(one_tile(value[begin:end], ids[begin:end],
+                                   routing[begin:end], tile_prequant, None))
         return torch.cat(pieces, dim=0)
 
-    def forward(self, value, image_mask, ready_outputs=(), *, fp8_decode=False, decode=False):
+    def forward(self,
+                value,
+                image_mask,
+                ready_outputs=(),
+                *,
+                fp8_decode=False,
+                decode=False,
+                prequant=None):
         w = self.weights
         gate_logits = (torch.ops.custom_op.custom_deepseek_v41_bf16_linear_f32_gaudi2(
             value.contiguous(), w.gate.weight) if self.router_bf16_gate else F.linear(value.float(), w.gate.weight))
@@ -342,6 +392,14 @@ class PreparedMoE(nn.Module):
                 routing = scores.gather(1, ids)
                 routing = routing / (routing.sum(-1, keepdim=True) + 1e-20) * 1.5
         experts = w.experts
+        # The C1 prequant path can keep the exact BF16 routed/shared consumer
+        # in the same native graph. The shared branch still computes from the
+        # normal request-slot input and remains independently schedulable;
+        # only its final FP32 addition and BF16 rounding move into the routed
+        # compound node. Wider batches keep the common batch implementation.
+        fused_shared = (self.n256_fp8 and self.n256_fused_reduce
+                        and prequant is not None and value.shape[0] == 1)
+        shared_out = self.shared_expert(value) if fused_shared else None
         if self.prefill_grouped and value.shape[0] > 6:
             from vllm_gaudi.ops.deepseek_v41_grouped_prefill import run_grouped_prefill
             output = run_grouped_prefill(value, ids, routing, experts.w13_q16,
@@ -370,7 +428,9 @@ class PreparedMoE(nn.Module):
             # dequant node, which is not registered for the current Gaudi
             # runtime shape profile (M128 generic failure).
             if self.n256_fp8:
-                output = self._forward_n256_fp8(value, ids, routing)
+                output = self._forward_n256_fp8(value, ids, routing,
+                                                 prequant=prequant,
+                                                 shared=shared_out)
             else:
                 operands = (value, ids.to(torch.int32), routing.float(), experts.w13_q16, experts.w2_q16,
                             experts.w13_s16, experts.w2_s16, self.lookup)
@@ -404,8 +464,11 @@ class PreparedMoE(nn.Module):
                 op = torch.ops.custom_op.custom_deepseek_v41_mxfp4_n512_moe_bf16_gaudi2
             output = op(value, ids.to(torch.int32), routing.float(), experts.w13_q16, experts.w2_q16, experts.w13_s16,
                         experts.w2_s16, self.lookup, self.normal_scales)
-        shared_out = self.shared_expert(value)
-        partial = (output.float() + shared_out.float()).to(value.dtype)
+        if shared_out is None:
+            shared_out = self.shared_expert(value)
+            partial = (output.float() + shared_out.float()).to(value.dtype)
+        else:
+            partial = output
         return self.reduce(partial, ready_outputs=ready_outputs) if ready_outputs else self.reduce(partial)
 
 
@@ -427,6 +490,9 @@ class PreparedDecoderLayer(nn.Module):
         self.draft = layer >= config["num_hidden_layers"]
         self.collect_target_state = collect_target_state and layer in (37, 38, 39)
         self.eps, self.hc_eps, self.iterations = config["rms_norm_eps"], config["hc_eps"], config["hc_sinkhorn_iters"]
+        self.mhc_control_rrms = gaudi_envs.VLLM_HPU_DSV41_MHC_CONTROL_RRMS
+        self.register_buffer("hc_attn_fn_packed", None, False)
+        self.register_buffer("hc_ffn_fn_packed", None, False)
         if shared.length > 512:
             from vllm_gaudi.ops.deepseek_v41_paged_attention import PagedCSA2Attention
             self.attention = PagedCSA2Attention(weights.attn, config, layer, shared, linear, reduce, all_gather, device)
@@ -434,6 +500,29 @@ class PreparedDecoderLayer(nn.Module):
             self.attention = CSA2Attention(weights.attn, config, layer, shared, linear, reduce, device)
         self.moe = PreparedMoE(weights.ffn, config["num_experts_per_tok"], normal_scales, lookup, reduce)
         self.all_gather = all_gather
+
+    @staticmethod
+    def _pack_mhc_control_weight(weight):
+        if weight.dtype != torch.float32 or weight.shape != (24, 20480):
+            raise ValueError(
+                f"mHC control/RRMS preparation requires FP32 [24,20480], got {weight.dtype} {tuple(weight.shape)}")
+        # The fused kernel reconstructs linear BF16 lanes before its MACs, so
+        # it consumes the checkpoint's original K order and does not need a
+        # second lane-permuted resident copy.
+        return weight.contiguous()
+
+    def prepare_mhc_control_weights(self):
+        self.release_mhc_control_weights()
+        if not self.mhc_control_rrms:
+            return
+        self.hc_attn_fn_packed = self._pack_mhc_control_weight(
+            self.weights.hc_attn_fn)
+        self.hc_ffn_fn_packed = self._pack_mhc_control_weight(
+            self.weights.hc_ffn_fn)
+
+    def release_mhc_control_weights(self):
+        self.hc_attn_fn_packed = None
+        self.hc_ffn_fn_packed = None
 
     def forward(self, residual, pre_mix, positions, image_mask, engram_rows=None, *, fp8_decode=False, decode=False):
         w = self.weights
@@ -445,8 +534,10 @@ class PreparedDecoderLayer(nn.Module):
             kv = linear(rows.flatten(1), w.engram.wkv)
             residual = engram_update(residual, kv, w.engram.q_weight, w.engram.k_weight, ~image_mask, self.eps)
         target_state = residual.mean(1) if self.collect_target_state else None
-        value, new_pre, post, comb = hc_pre(residual, pre_mix, w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base, self.eps,
-                                            self.hc_eps, self.iterations)
+        value, new_pre, post, comb = hc_pre(
+            residual, pre_mix, w.hc_attn_fn, w.hc_attn_scale,
+            w.hc_attn_base, self.eps, self.hc_eps, self.iterations,
+            packed_fn=self.hc_attn_fn_packed)
         value = rms_norm(value, w.attn_norm.weight, self.eps)
         schedule = (gaudi_envs.VLLM_HPU_DSV41_MHC_SCHEDULE and not self.draft and 1 <= value.shape[0] <= 6)
         if schedule:
@@ -455,13 +546,33 @@ class PreparedDecoderLayer(nn.Module):
             value = (self.attention.draft(value, positions) if self.draft else
                      self.attention(value, positions, decode=decode))
         residual = hc_post(value, residual, post, comb)
-        value, pre_mix, post, comb = hc_pre(residual, new_pre, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base, self.eps,
-                                            self.hc_eps, self.iterations)
-        value = self.moe(rms_norm(value, w.ffn_norm.weight, self.eps),
-                         image_mask,
-                         ready_outputs=(post, comb) if schedule else (),
-                         fp8_decode=fp8_decode,
-                         decode=decode)
+        value, pre_mix, post, comb = hc_pre(
+            residual, new_pre, w.hc_ffn_fn, w.hc_ffn_scale,
+            w.hc_ffn_base, self.eps, self.hc_eps, self.iterations,
+            packed_fn=self.hc_ffn_fn_packed)
+        # Keep the normalized BF16 row in the TPC register file while forming
+        # the exact FP8 operand consumed by N256.  This is an internal B1/B2
+        # implementation choice under the normal scheduler and request-state
+        # contract; larger decode batches and prefill retain the generic path.
+        # The B1/B2 outputs were qualified bit-for-bit against the separate
+        # RMSNorm and dynamic-quant nodes before this became the default.
+        if (decode and value.shape[0] <= 2 and self.moe.n256_fp8
+                and self.moe.n256_fused):
+            normalized, quantized, activation_scale = (
+                torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
+                    value.contiguous(), w.ffn_norm.weight, self.eps))
+            value = self.moe(normalized,
+                             image_mask,
+                             ready_outputs=(post, comb) if schedule else (),
+                             fp8_decode=fp8_decode,
+                             decode=decode,
+                             prequant=(quantized, activation_scale))
+        else:
+            value = self.moe(rms_norm(value, w.ffn_norm.weight, self.eps),
+                             image_mask,
+                             ready_outputs=(post, comb) if schedule else (),
+                             fp8_decode=fp8_decode,
+                             decode=decode)
         return hc_post(value, residual, post, comb), pre_mix, target_state
 
 
@@ -487,6 +598,9 @@ class PreparedStage(nn.Module):
             raise ValueError("Fused mHC gates require ordinary C1 decode")
         self.woa_config = {"version": 1, "layers": []}
         self.dense_config = {"version": 1, "wq_b": [], "wo_b": []}
+        self.engram_fp8 = gaudi_envs.VLLM_HPU_DSV41_ENGRAM_FP8 and pp_rank == 0
+        if gaudi_envs.VLLM_HPU_DSV41_ENGRAM_FP8 and self.dspark:
+            raise ValueError("Engram FP8 requires ordinary execution")
         if gaudi_envs.VLLM_HPU_DSV41_ATTN_DENSE_FP8:
             from vllm_gaudi.ops.deepseek_v41_dense_fp8 import precision_config
             if self.dspark:
@@ -570,11 +684,16 @@ class PreparedStage(nn.Module):
             moe = getattr(layer, "moe", None)
             if moe is not None:
                 moe.release_shared_gate_up_weight()
+            layer.release_mhc_control_weights()
         sidecar = None
         dense_sidecar = None
+        engram_sidecar = None
         if gaudi_envs.VLLM_HPU_DSV41_ATTN_DENSE_FP8:
             from vllm_gaudi.ops.deepseek_v41_dense_fp8 import DenseFP8Sidecar
             dense_sidecar = DenseFP8Sidecar(gaudi_envs.VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR, self.shard)
+        if self.engram_fp8:
+            from vllm_gaudi.ops.deepseek_v41_engram_fp8 import EngramFP8Sidecar
+            engram_sidecar = EngramFP8Sidecar(gaudi_envs.VLLM_HPU_DSV41_ENGRAM_FP8_SIDECAR, self.shard)
         if gaudi_envs.VLLM_HPU_DSV41_WO_A_FP8:
             from vllm_gaudi.ops.deepseek_v41_woa_fp8 import WoaFP8Sidecar
             sidecar = WoaFP8Sidecar(gaudi_envs.VLLM_HPU_DSV41_WO_A_FP8_SIDECAR, self.shard)
@@ -586,11 +705,20 @@ class PreparedStage(nn.Module):
                          woa_layers=self.woa_config["layers"],
                          expert_n256_layers=self.expert_n256_config["routed_experts"],
                          dense_sidecar=dense_sidecar,
-                         dense_config=self.dense_config)
+                         dense_config=self.dense_config,
+                         engram_sidecar=engram_sidecar)
+        for layer in self.layers:
+            layer.prepare_mhc_control_weights()
         if dense_sidecar is not None:
             self.runtime_precision["attention_dense_fp8"] = {
                 "config": self.dense_config,
                 "weight_fingerprint": dense_sidecar.fingerprint,
+            }
+        if engram_sidecar is not None:
+            self.runtime_precision["engram_fp8"] = {
+                "layers": [1, 14],
+                "weight_fingerprint": engram_sidecar.fingerprint,
+                "max_host_chunk_bytes": engram_sidecar.max_host_chunk_bytes,
             }
         for layer in self.layers:
             moe = getattr(layer, "moe", None)
@@ -675,6 +803,10 @@ class PreparedStage(nn.Module):
             self.runtime_precision["mla"] = "shared BF16 KV / BF16 exp-PV / FP32 denominator and accumulator v1"
         self.runtime_precision["attention_kv_first"] = gaudi_envs.VLLM_HPU_DSV41_ATTN_KV_FIRST
         self.runtime_precision["attention_fused_norm"] = gaudi_envs.VLLM_HPU_DSV41_ATTN_FUSED_NORM
+        self.runtime_precision["attention_kv_norm_rope"] = (
+            "exact C1 compound TPC; batch-generic split path for B2+"
+            if (gaudi_envs.VLLM_HPU_DSV41_ATTN_FUSED_NORM and gaudi_envs.VLLM_HPU_DSV41_NATIVE_ROPE) else
+            "split RMSNorm and RoPE")
         self.runtime_precision["q_scale_rope"] = gaudi_envs.VLLM_HPU_DSV41_Q_SCALE_ROPE
         self.runtime_precision["woa_output_roundtrip"] = self.woa_output_roundtrip
         self.runtime_precision["shared_gate_up"] = gaudi_envs.VLLM_HPU_DSV41_SHARED_GATE_UP
@@ -696,6 +828,7 @@ class PreparedStage(nn.Module):
             moe = getattr(layer, "moe", None)
             if moe is not None:
                 moe.release_shared_gate_up_weight()
+            layer.release_mhc_control_weights()
         self.loaded = False
         self.generation += 1
 
@@ -717,8 +850,9 @@ class PreparedStage(nn.Module):
                 target_states.append(target)
         if self.pp_rank == 0:
             return residual, pre_mix, None
-        value = (residual.float() * pre_mix.unsqueeze(-1)).sum(1).to(residual.dtype)
-        value = rms_norm(value, self.weights.norm.weight, self.config["text_config"]["rms_norm_eps"])
+        value = final_collapse_rms_norm(
+            residual, pre_mix, self.weights.norm.weight,
+            self.config["text_config"]["rms_norm_eps"])
         return value, pre_mix, torch.cat(target_states, -1) if target_states else None
 
     def forward(self, residual, pre_mix, positions, input_ids, engram_rows):
@@ -879,8 +1013,8 @@ class PreparedLayerGroup(nn.Module):
             return encode_pp_wire(residual, pre_mix), None, None
         if not self.final:
             return residual, pre_mix, None
-        value = (residual.float() * pre_mix.unsqueeze(-1)).sum(1).to(residual.dtype)
-        value = rms_norm(value, self.norm.weight, self.eps)
+        value = final_collapse_rms_norm(residual, pre_mix, self.norm.weight,
+                                        self.eps)
         return value, pre_mix, torch.cat(target_states, -1) if target_states else None
 
     def forward(self, residual, pre_mix, positions, input_ids, engram_rows):

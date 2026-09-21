@@ -8,7 +8,10 @@ void main(tensor input, tensor weight, tensor output, float epsilon, float inver
     const int5 begin = get_index_space_offset();
     const int5 end = begin + get_index_space_size();
     const int tiles = get_dim_size(input, 0) / 128;
-    bfloat128 cached[10];
+    // 40 tiles covers the model-width final norm (5120) while retaining the
+    // existing 512/1280 attention rows.  The bound is compile-time so C1 and
+    // batched rows share one kernel contract without a batch specialization.
+    bfloat128 cached[40];
     for (int row = begin[0]; row < end[0]; ++row) {
         float128 squares = {0};
         for (int tile = 0; tile < tiles; ++tile) {

@@ -115,6 +115,15 @@ def test_completion_record_memoizes_one_real_d2h_completion():
     assert record.token() == 11 and done.calls == 1
 
 
+def test_multi_request_step_uses_synchronous_completion(monkeypatch):
+    runner = object.__new__(V41V2ModelRunner)
+    runner._v2_async_step = False
+    expected = object()
+    monkeypatch.setattr(V41ModelRunner, "_sample_single", lambda self: expected)
+
+    assert runner._sample_single() is expected
+
+
 @pytest.mark.parametrize("row", [[11, 12], [-1], []])
 def test_invalid_completion_never_mutates_history(row):
     runner, calls = fixture()

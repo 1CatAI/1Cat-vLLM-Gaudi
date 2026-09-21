@@ -4,7 +4,7 @@
 
 class DeepseekV41ExpertN256Gaudi2 {
  public:
-    enum Mode { FP8, BF16, Scale, SiluQuant, ScaleReduce };
+    enum Mode { FP8, FP8Slots, BF16, Scale, SiluQuant, ScaleReduce };
     explicit DeepseekV41ExpertN256Gaudi2(Mode mode, bool substitute_prefetch16 = false)
         : mode_(mode), substitute_prefetch16_(substitute_prefetch16) {}
     tpc_lib_api::GlueCodeReturn GetKernelName(char name[tpc_lib_api::MAX_NODE_NAME]);

@@ -43,11 +43,46 @@ def test_woa_c1_and_prefill_share_prepared_weight(monkeypatch):
 
     monkeypatch.setattr(torch.ops, "custom_op", SimpleNamespace(custom_deepseek_v41_woa_fp8_gaudi2=operator))
     attention = SimpleNamespace(woa_fp8=True,
+                                woa_output_roundtrip=False,
                                 weights=SimpleNamespace(wo_a=SimpleNamespace(weight=weight, channel_scale=scale)))
     for implementation in (CSA2Attention, PagedCSA2Attention):
         for tokens in (1, 3, 512):
             assert implementation.project_output(attention, torch.zeros(tokens, 4, 4096)).shape == (tokens, 4096)
     assert len(calls) == 6
+
+
+def test_paged_kv_norm_rope_compound_is_decode_b1_only(monkeypatch):
+    calls = []
+    expected = torch.randn(1, 512, dtype=torch.bfloat16)
+
+    def compound(value, weight, positions, table, epsilon):
+        calls.append((value.shape, positions.dtype, epsilon))
+        return expected
+
+    monkeypatch.setattr(
+        torch.ops, "custom_op",
+        SimpleNamespace(custom_deepseek_v41_kv_norm_rope_bf16_gaudi2=compound))
+    attention = SimpleNamespace(
+        fused_norm=True,
+        native_rope=True,
+        eps=1e-20,
+        weights=SimpleNamespace(kv_norm=SimpleNamespace(weight=torch.ones(512, dtype=torch.bfloat16))),
+        _rotary_native_table=lambda: torch.empty(8, 64),
+        _rope=lambda value, positions: value,
+    )
+    positions = torch.tensor([3], dtype=torch.int64)
+    actual = PagedCSA2Attention.project_kv(
+        attention, torch.randn(1, 512, dtype=torch.bfloat16), positions, decode=True)
+    assert actual is expected
+    assert calls == [((1, 512), torch.int32, 1e-20)]
+
+    # Prefill and B2+ retain the batch-generic split implementation.
+    attention.fused_norm = False
+    wider = torch.randn(2, 512, dtype=torch.bfloat16)
+    generic = PagedCSA2Attention.project_kv(
+        attention, wider, torch.tensor([3, 4], dtype=torch.int32), decode=True)
+    assert generic.shape == wider.shape
+    assert calls == [((1, 512), torch.int32, 1e-20)]
 
 
 def test_paged_output_preparation_matches_bounded_layout():
@@ -71,6 +106,7 @@ def _rotary_shared(length=8192):
     shared = object.__new__(PagedCSA2SharedState)
     torch.nn.Module.__init__(shared)
     shared.length = length
+    shared.runtime_indexer = False
     shared._rotary_buckets = {}
     shared.register_buffer("swa_rotary", torch.empty(length, 32, 2), False)
     shared.register_buffer("swa_rotary_native", torch.empty(length, 64), False)
@@ -114,6 +150,7 @@ def test_paged_attention_rebinds_shared_rotary_bucket():
     attention._rotary_native_name = "swa_rotary_native"
     attention.native_rope = False
     attention.q_scale_rope = True
+    attention.runtime_indexer = False
     attention.register_buffer("rotary", shared.rotary_bucket("swa_rotary", 512), False)
     attention.register_buffer("rotary_native", shared.rotary_bucket("swa_rotary_native", 512), False)
     attention.set_search_length(8192)

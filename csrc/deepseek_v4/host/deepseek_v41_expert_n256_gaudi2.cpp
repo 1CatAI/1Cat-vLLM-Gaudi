@@ -6,6 +6,7 @@
 #define ELF(name) extern unsigned char _binary___deepseek_v41_expert_n256_##name##_gaudi2_o_start; \
                   extern unsigned char _binary___deepseek_v41_expert_n256_##name##_gaudi2_o_end;
 ELF(fp8)
+ELF(slots_fp8)
 ELF(prefetch16_fp8)
 ELF(bf16)
 ELF(scale)
@@ -175,6 +176,7 @@ tpc_lib_api::GlueCodeReturn scale_reduce(tpc_lib_api::HabanaKernelParams* in,
 tpc_lib_api::GlueCodeReturn DeepseekV41ExpertN256Gaudi2::GetKernelName(
     char name[tpc_lib_api::MAX_NODE_NAME]) {
     std::strcpy(name, mode_ == FP8 ? "custom_deepseek_v41_expert_n256_fp8_gaudi2" :
+        mode_ == FP8Slots ? "custom_deepseek_v41_expert_n256_slots_fp8_gaudi2" :
         mode_ == BF16 ? "custom_deepseek_v41_expert_n256_bf16_gaudi2" :
         mode_ == Scale ? "custom_deepseek_v41_expert_n256_scale_gaudi2" :
         mode_ == SiluQuant ? "custom_deepseek_v41_expert_n256_silu_quant_gaudi2" :
@@ -199,7 +201,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41ExpertN256Gaudi2::GetGcDefinitions(
         }
     }
     auto& result = in->outputTensors[0].geometry;
-    const auto outputType = mode_ == FP8 ? DATA_F8_143 : DATA_BF16;
+    const auto outputType = (mode_ == FP8 || mode_ == FP8Slots) ? DATA_F8_143 : DATA_BF16;
     if (result.dataType != outputType) {
         result.dataType = outputType; return GLUE_INCOMPATIBLE_DATA_TYPE;
     }
@@ -216,21 +218,39 @@ tpc_lib_api::GlueCodeReturn DeepseekV41ExpertN256Gaudi2::GetGcDefinitions(
             s.maxSizes[2] != q.maxSizes[2] || lut.dims != 1 || lut.maxSizes[0] != 128)
             return GLUE_INCOMPATIBLE_INPUT_SIZE;
         n = q.maxSizes[1] * 256; k = q.maxSizes[0] / 64; slots = ids.maxSizes[0];
-        out->indexSpaceRank = 3;
+        const bool fuseSlots = mode_ == FP8Slots;
+        out->indexSpaceRank = fuseSlots ? 2 : 3;
         out->indexSpaceGeometry[0] = q.maxSizes[1];
-        out->indexSpaceGeometry[1] = slots;
-        out->indexSpaceGeometry[2] = k / 128;
-        map(out->inputTensorAccessPattern[0], 0, 1, 1, 0, 0);
-        map(out->inputTensorAccessPattern[0], 1, 0, 0, 0, 0);
+        out->indexSpaceGeometry[1] = fuseSlots ? k / 128 : slots;
+        if (!fuseSlots) out->indexSpaceGeometry[2] = k / 128;
+        if (fuseSlots) {
+            out->inputTensorAccessPattern[0].allRequired = true;
+        } else {
+            map(out->inputTensorAccessPattern[0], 0, 1, 1, 0, 0);
+            map(out->inputTensorAccessPattern[0], 1, 0, 0, 0, 0);
+        }
         for (unsigned i : {1u, 2u}) {
             const int words = i == 1 ? 8192 : 1024;
-            map(out->inputTensorAccessPattern[i], 0, 2, words, 0, words - 1);
+            map(out->inputTensorAccessPattern[i], 0, fuseSlots ? 1 : 2, words, 0, words - 1);
             map(out->inputTensorAccessPattern[i], 1, 0, 1, 0, 0);
-            map(out->inputTensorAccessPattern[i], 2, 1, 0, 0, q.maxSizes[2] - 1);
+            if (fuseSlots) {
+                out->inputTensorAccessPattern[i].mapping[2].indexSpaceDim = 0;
+                out->inputTensorAccessPattern[i].mapping[2].a = 0;
+                out->inputTensorAccessPattern[i].mapping[2].start_b = 0;
+                out->inputTensorAccessPattern[i].mapping[2].end_b = q.maxSizes[2] - 1;
+            } else {
+                map(out->inputTensorAccessPattern[i], 2, 1, 0, 0, q.maxSizes[2] - 1);
+            }
         }
         map(out->inputTensorAccessPattern[3], 0, 0, 0, 0, 127);
         map(out->outputTensorAccessPattern[0], 0, 0, 256, 0, 255);
-        map(out->outputTensorAccessPattern[0], 1, 2, 128, 0, 127);
+        map(out->outputTensorAccessPattern[0], 1, fuseSlots ? 1 : 2, 128, 0, 127);
+        if (fuseSlots) {
+            out->outputTensorAccessPattern[0].mapping[2].indexSpaceDim = 0;
+            out->outputTensorAccessPattern[0].mapping[2].a = 0;
+            out->outputTensorAccessPattern[0].mapping[2].start_b = 0;
+            out->outputTensorAccessPattern[0].mapping[2].end_b = slots - 1;
+        }
     } else {
         const auto& p = in->inputTensors[0].geometry;
         const auto& ids = in->inputTensors[1].geometry;
@@ -271,7 +291,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41ExpertN256Gaudi2::GetGcDefinitions(
             map(out->outputTensorAccessPattern[0], 1, 0, 0, 0, 0);
         }
     }
-    if (mode_ != ScaleReduce)
+    if (mode_ != ScaleReduce && mode_ != FP8Slots)
         map(out->outputTensorAccessPattern[0], 2, 1, 1, 0, 0);
     if (result.dims != 3 || result.maxSizes[0] != n || result.maxSizes[1] != k || result.maxSizes[2] != slots) {
         result.dims = 3; result.maxSizes[0] = n; result.maxSizes[1] = k; result.maxSizes[2] = slots;
@@ -279,12 +299,14 @@ tpc_lib_api::GlueCodeReturn DeepseekV41ExpertN256Gaudi2::GetGcDefinitions(
     }
     out->kernel.paramsNr = 0;
     const bool prefetch16 = mode_ == FP8 && substitute_prefetch16_;
-    const unsigned char* start = prefetch16 ? &_binary___deepseek_v41_expert_n256_prefetch16_fp8_gaudi2_o_start :
+    const unsigned char* start = mode_ == FP8Slots ? &_binary___deepseek_v41_expert_n256_slots_fp8_gaudi2_o_start :
+        prefetch16 ? &_binary___deepseek_v41_expert_n256_prefetch16_fp8_gaudi2_o_start :
         mode_ == FP8 ? &_binary___deepseek_v41_expert_n256_fp8_gaudi2_o_start :
         mode_ == BF16 ? &_binary___deepseek_v41_expert_n256_bf16_gaudi2_o_start :
         mode_ == ScaleReduce ? &_binary___deepseek_v41_expert_n256_scale_reduce_gaudi2_o_start :
                                &_binary___deepseek_v41_expert_n256_scale_gaudi2_o_start;
-    const unsigned char* end = prefetch16 ? &_binary___deepseek_v41_expert_n256_prefetch16_fp8_gaudi2_o_end :
+    const unsigned char* end = mode_ == FP8Slots ? &_binary___deepseek_v41_expert_n256_slots_fp8_gaudi2_o_end :
+        prefetch16 ? &_binary___deepseek_v41_expert_n256_prefetch16_fp8_gaudi2_o_end :
         mode_ == FP8 ? &_binary___deepseek_v41_expert_n256_fp8_gaudi2_o_end :
         mode_ == BF16 ? &_binary___deepseek_v41_expert_n256_bf16_gaudi2_o_end :
         mode_ == ScaleReduce ? &_binary___deepseek_v41_expert_n256_scale_reduce_gaudi2_o_end :

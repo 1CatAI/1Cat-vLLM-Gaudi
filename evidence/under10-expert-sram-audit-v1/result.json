@@ -1,0 +1,2303 @@
+[
+  {
+    "graph": "/opt/ssd960/ymzx-dsv41-exact-full-stack-v1/trace-full-13p25-02/graphs/rank2/graph_0006_GraphModule_syn_1049000_1049000_301-PostGraph-symbol.pbtxt",
+    "sha256": "2d590fcccd16f3bed1117291ce4c3f29cbf159fb81d194f39dc661344cc7c798",
+    "decode_node_count": 12,
+    "mme_node_count": 15,
+    "expert_mme_node_count": 12,
+    "decoded_bytes": 106168320,
+    "all_decoded_weights_in_sram": true,
+    "all_mme_weights_in_sram": true,
+    "all_decoded_weights_consumed_once": true,
+    "decode": [
+      {
+        "node": "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2427_bundle_143/op_0",
+        "output": {
+          "name": "80_slice_0_0_0_0_0__0__bundle_143_13975",
+          "description": "80_slice_0_0_0_0_0__0__bundle_143_13975  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffd412800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2427_bundle_143/op_1",
+        "output": {
+          "name": "80_slice_0_0_1_0_0__0__bundle_143_13977",
+          "description": "80_slice_0_0_1_0_0__0__bundle_143_13977  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffdf52800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2427_bundle_143/op_3",
+        "output": {
+          "name": "80_slice_0_0_2_0_0__0__bundle_143_13981",
+          "description": "80_slice_0_0_2_0_0__0__bundle_143_13981  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffd412800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2427_bundle_143/op_5",
+        "output": {
+          "name": "80_slice_0_0_3_0_0__0__bundle_143_13985",
+          "description": "80_slice_0_0_3_0_0__0__bundle_143_13985  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffdf52800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2427_bundle_143/op_7",
+        "output": {
+          "name": "80_slice_0_0_4_0_0__0__bundle_143_13989",
+          "description": "80_slice_0_0_4_0_0__0__bundle_143_13989  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffd412800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2427_bundle_143/op_9",
+        "output": {
+          "name": "80_slice_0_0_5_0_0__0__bundle_143_13993",
+          "description": "80_slice_0_0_5_0_0__0__bundle_143_13993  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffdf52800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2430_bundle_144/op_0",
+        "output": {
+          "name": "84_slice_0_0_0_0_0__0__bundle_144_14002",
+          "description": "84_slice_0_0_0_0_0__0__bundle_144_14002  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000fffffea92800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2430_bundle_144/op_2",
+        "output": {
+          "name": "84_slice_0_0_1_0_0__0__bundle_144_14010",
+          "description": "84_slice_0_0_1_0_0__0__bundle_144_14010  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000ffffff032800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2430_bundle_144/op_5",
+        "output": {
+          "name": "84_slice_0_0_2_0_0__0__bundle_144_14017",
+          "description": "84_slice_0_0_2_0_0__0__bundle_144_14017  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000fffffea92800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2430_bundle_144/op_8",
+        "output": {
+          "name": "84_slice_0_0_3_0_0__0__bundle_144_14024",
+          "description": "84_slice_0_0_3_0_0__0__bundle_144_14024  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000ffffff032800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2430_bundle_144/op_11",
+        "output": {
+          "name": "84_slice_0_0_4_0_0__0__bundle_144_14031",
+          "description": "84_slice_0_0_4_0_0__0__bundle_144_14031  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000fffffea92800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2430_bundle_144/op_14",
+        "output": {
+          "name": "84_slice_0_0_5_0_0__0__bundle_144_14038",
+          "description": "84_slice_0_0_5_0_0__0__bundle_144_14038  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000ffffff032800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        }
+      }
+    ],
+    "matrix": [
+      {
+        "node": "L_self/layers/0/moe/custom_deepseek_v41_bf16_linear_f32_gaudi2_default/gemm/2399_bundle_142/op_1",
+        "op": "GEMM",
+        "activation": {
+          "name": "37_slice_0_0_0_0_0__0__bundle_142_13966",
+          "description": "37_slice_0_0_0_0_0__0__bundle_142_13966  |  Sizes = [1,5120]  |  bf16  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [10240, 10240, 2]  |  data = 0, sizeInBytes = 10240  |  location = in SRAM  |  sramOffset = 0x1000fffffd410000  |  ",
+          "shape": [
+            1,
+            5120
+          ],
+          "bytes": 10240,
+          "location": "SRAM"
+        },
+        "weight": {
+          "name": "38_slice_0_0_0_0_0__0__bundle_142_13967",
+          "description": "38_slice_0_0_0_0_0__0__bundle_142_13967  |  Sizes = [384,5120]  |  bf16  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [3932160, 10240, 2]  |  data = 0, sizeInBytes = 3932160  |  location = in SRAM  |  sramOffset = 0x1000fffffd050000  |  ",
+          "shape": [
+            384,
+            5120
+          ],
+          "bytes": 3932160,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "39",
+          "description": "39  |  Sizes = [1,384]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [1536, 1536, 4]  |  data = 0, sizeInBytes = 1536  |  location = in DRAM  |  dramOffset = 0x80000000180  |  ",
+          "shape": [
+            1,
+            384
+          ],
+          "bytes": 1536,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/0/moe/linear/linear_fwd_bf16/2409_complex/gemm_0_bundle_145/op_0",
+        "op": "GEMM",
+        "activation": {
+          "name": "45",
+          "description": "45  |  Sizes = [1,5120]  |  bf16  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [10240, 10240, 2]  |  data = 0, sizeInBytes = 10240  |  location = in DRAM  |  dramOffset = 0xa0000000000  |  ",
+          "shape": [
+            1,
+            5120
+          ],
+          "bytes": 10240,
+          "location": "DRAM"
+        },
+        "weight": {
+          "name": "49",
+          "description": "49  |  Sizes = [2304,5120]  |  bf16  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [23592960, 10240, 2]  |  data = 0, sizeInBytes = 23592960  |  isPersistent  |  location = in DRAM  |  dramOffset = 0xe0000000000  |  userMemorySection(type=Persistent, id=14)  |  ",
+          "shape": [
+            2304,
+            5120
+          ],
+          "bytes": 23592960,
+          "location": "DRAM"
+        },
+        "output": {
+          "name": "52",
+          "description": "52  |  Sizes = [1,2304]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [9216, 9216, 4]  |  data = 0, sizeInBytes = 9216  |  location = in DRAM  |  dramOffset = 0xa0000002800  |  ",
+          "shape": [
+            1,
+            2304
+          ],
+          "bytes": 9216,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2428_bundle_143/op_2_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "74_slice_0_0_0_0_0__0__bundle_143_13978",
+          "description": "74_slice_0_0_0_0_0__0__bundle_143_13978  |  Sizes = [1,1,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [30720, 5120, 5120, 1]  |  data = 0, sizeInBytes = 5120  |  isAliased = 74, type = concat, offset: 0  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 5120,
+          "location": "DRAM"
+        },
+        "weight": {
+          "name": "80_slice_0_0_0_0_0__0__bundle_143_13975",
+          "description": "80_slice_0_0_0_0_0__0__bundle_143_13975  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffd412800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "81_slice_0_0_0_0_0__0__bundle_143_13979",
+          "description": "81_slice_0_0_0_0_0__0__bundle_143_13979  |  Sizes = [1,1,2304]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [55296, 9216, 9216, 4]  |  data = 0, sizeInBytes = 9216  |  isAliased = 81, type = concat, offset: 0  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            2304
+          ],
+          "bytes": 9216,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2428_bundle_143/op_4_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "74_slice_0_0_1_0_0__0__bundle_143_13982",
+          "description": "74_slice_0_0_1_0_0__0__bundle_143_13982  |  Sizes = [1,1,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [30720, 5120, 5120, 1]  |  data = 0, sizeInBytes = 5120  |  isAliased = 74, type = concat, offset: 5120  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 5120,
+          "location": "DRAM"
+        },
+        "weight": {
+          "name": "80_slice_0_0_1_0_0__0__bundle_143_13977",
+          "description": "80_slice_0_0_1_0_0__0__bundle_143_13977  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffdf52800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "81_slice_0_0_1_0_0__0__bundle_143_13983",
+          "description": "81_slice_0_0_1_0_0__0__bundle_143_13983  |  Sizes = [1,1,2304]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [55296, 9216, 9216, 4]  |  data = 0, sizeInBytes = 9216  |  isAliased = 81, type = concat, offset: 9216  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            2304
+          ],
+          "bytes": 9216,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2428_bundle_143/op_6_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "74_slice_0_0_2_0_0__0__bundle_143_13986",
+          "description": "74_slice_0_0_2_0_0__0__bundle_143_13986  |  Sizes = [1,1,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [30720, 5120, 5120, 1]  |  data = 0, sizeInBytes = 5120  |  isAliased = 74, type = concat, offset: 10240  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 5120,
+          "location": "DRAM"
+        },
+        "weight": {
+          "name": "80_slice_0_0_2_0_0__0__bundle_143_13981",
+          "description": "80_slice_0_0_2_0_0__0__bundle_143_13981  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffd412800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "81_slice_0_0_2_0_0__0__bundle_143_13987",
+          "description": "81_slice_0_0_2_0_0__0__bundle_143_13987  |  Sizes = [1,1,2304]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [55296, 9216, 9216, 4]  |  data = 0, sizeInBytes = 9216  |  isAliased = 81, type = concat, offset: 18432  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            2304
+          ],
+          "bytes": 9216,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2428_bundle_143/op_8_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "74_slice_0_0_3_0_0__0__bundle_143_13990",
+          "description": "74_slice_0_0_3_0_0__0__bundle_143_13990  |  Sizes = [1,1,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [30720, 5120, 5120, 1]  |  data = 0, sizeInBytes = 5120  |  isAliased = 74, type = concat, offset: 15360  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 5120,
+          "location": "DRAM"
+        },
+        "weight": {
+          "name": "80_slice_0_0_3_0_0__0__bundle_143_13985",
+          "description": "80_slice_0_0_3_0_0__0__bundle_143_13985  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffdf52800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "81_slice_0_0_3_0_0__0__bundle_143_13991",
+          "description": "81_slice_0_0_3_0_0__0__bundle_143_13991  |  Sizes = [1,1,2304]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [55296, 9216, 9216, 4]  |  data = 0, sizeInBytes = 9216  |  isAliased = 81, type = concat, offset: 27648  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            2304
+          ],
+          "bytes": 9216,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2428_bundle_143/op_10_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "74_slice_0_0_4_0_0__0__bundle_143_13994",
+          "description": "74_slice_0_0_4_0_0__0__bundle_143_13994  |  Sizes = [1,1,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [30720, 5120, 5120, 1]  |  data = 0, sizeInBytes = 5120  |  isAliased = 74, type = concat, offset: 20480  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 5120,
+          "location": "DRAM"
+        },
+        "weight": {
+          "name": "80_slice_0_0_4_0_0__0__bundle_143_13989",
+          "description": "80_slice_0_0_4_0_0__0__bundle_143_13989  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffd412800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "81_slice_0_0_4_0_0__0__bundle_143_13995",
+          "description": "81_slice_0_0_4_0_0__0__bundle_143_13995  |  Sizes = [1,1,2304]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [55296, 9216, 9216, 4]  |  data = 0, sizeInBytes = 9216  |  isAliased = 81, type = concat, offset: 36864  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            2304
+          ],
+          "bytes": 9216,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2428_bundle_143/op_11_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "74_slice_0_0_5_0_0__0__bundle_143_13996",
+          "description": "74_slice_0_0_5_0_0__0__bundle_143_13996  |  Sizes = [1,1,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [30720, 5120, 5120, 1]  |  data = 0, sizeInBytes = 5120  |  isAliased = 74, type = concat, offset: 25600  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 5120,
+          "location": "DRAM"
+        },
+        "weight": {
+          "name": "80_slice_0_0_5_0_0__0__bundle_143_13993",
+          "description": "80_slice_0_0_5_0_0__0__bundle_143_13993  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffdf52800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "81_slice_0_0_5_0_0__0__bundle_143_13997",
+          "description": "81_slice_0_0_5_0_0__0__bundle_143_13997  |  Sizes = [1,1,2304]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [55296, 9216, 9216, 4]  |  data = 0, sizeInBytes = 9216  |  isAliased = 81, type = concat, offset: 46080  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            2304
+          ],
+          "bytes": 9216,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2431_bundle_144/op_4_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "82_slice_0_0_0_0_0__0__bundle_144_14007",
+          "description": "82_slice_0_0_0_0_0__0__bundle_144_14007  |  Sizes = [1,1,1152]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [1152, 1152, 1152, 1]  |  data = 0, sizeInBytes = 1152  |  location = in SRAM  |  sramOffset = 0x1000ffffff5d2800  |  ",
+          "shape": [
+            1,
+            1,
+            1152
+          ],
+          "bytes": 1152,
+          "location": "SRAM"
+        },
+        "weight": {
+          "name": "84_slice_0_0_0_0_0__0__bundle_144_14002",
+          "description": "84_slice_0_0_0_0_0__0__bundle_144_14002  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000fffffea92800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "85_slice_0_0_0_0_0__0__bundle_144_14015",
+          "description": "85_slice_0_0_0_0_0__0__bundle_144_14015  |  Sizes = [1,1,5120]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [122880, 20480, 20480, 4]  |  data = 0, sizeInBytes = 20480  |  isAliased = 85, type = concat, offset: 0  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 20480,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2431_bundle_144/op_7_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "82_slice_0_0_1_0_0__0__bundle_144_14013",
+          "description": "82_slice_0_0_1_0_0__0__bundle_144_14013  |  Sizes = [1,1,1152]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [1152, 1152, 1152, 1]  |  data = 0, sizeInBytes = 1152  |  location = in SRAM  |  sramOffset = 0x1000ffffff5d2c80  |  ",
+          "shape": [
+            1,
+            1,
+            1152
+          ],
+          "bytes": 1152,
+          "location": "SRAM"
+        },
+        "weight": {
+          "name": "84_slice_0_0_1_0_0__0__bundle_144_14010",
+          "description": "84_slice_0_0_1_0_0__0__bundle_144_14010  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000ffffff032800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "85_slice_0_0_1_0_0__0__bundle_144_14022",
+          "description": "85_slice_0_0_1_0_0__0__bundle_144_14022  |  Sizes = [1,1,5120]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [122880, 20480, 20480, 4]  |  data = 0, sizeInBytes = 20480  |  isAliased = 85, type = concat, offset: 20480  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 20480,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2431_bundle_144/op_10_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "82_slice_0_0_2_0_0__0__bundle_144_14020",
+          "description": "82_slice_0_0_2_0_0__0__bundle_144_14020  |  Sizes = [1,1,1152]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [1152, 1152, 1152, 1]  |  data = 0, sizeInBytes = 1152  |  location = in SRAM  |  sramOffset = 0x1000ffffff5d2800  |  ",
+          "shape": [
+            1,
+            1,
+            1152
+          ],
+          "bytes": 1152,
+          "location": "SRAM"
+        },
+        "weight": {
+          "name": "84_slice_0_0_2_0_0__0__bundle_144_14017",
+          "description": "84_slice_0_0_2_0_0__0__bundle_144_14017  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000fffffea92800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "85_slice_0_0_2_0_0__0__bundle_144_14029",
+          "description": "85_slice_0_0_2_0_0__0__bundle_144_14029  |  Sizes = [1,1,5120]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [122880, 20480, 20480, 4]  |  data = 0, sizeInBytes = 20480  |  isAliased = 85, type = concat, offset: 40960  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 20480,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2431_bundle_144/op_13_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "82_slice_0_0_3_0_0__0__bundle_144_14027",
+          "description": "82_slice_0_0_3_0_0__0__bundle_144_14027  |  Sizes = [1,1,1152]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [1152, 1152, 1152, 1]  |  data = 0, sizeInBytes = 1152  |  location = in SRAM  |  sramOffset = 0x1000ffffff5d2c80  |  ",
+          "shape": [
+            1,
+            1,
+            1152
+          ],
+          "bytes": 1152,
+          "location": "SRAM"
+        },
+        "weight": {
+          "name": "84_slice_0_0_3_0_0__0__bundle_144_14024",
+          "description": "84_slice_0_0_3_0_0__0__bundle_144_14024  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000ffffff032800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "85_slice_0_0_3_0_0__0__bundle_144_14036",
+          "description": "85_slice_0_0_3_0_0__0__bundle_144_14036  |  Sizes = [1,1,5120]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [122880, 20480, 20480, 4]  |  data = 0, sizeInBytes = 20480  |  isAliased = 85, type = concat, offset: 61440  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 20480,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2431_bundle_144/op_16_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "82_slice_0_0_4_0_0__0__bundle_144_14034",
+          "description": "82_slice_0_0_4_0_0__0__bundle_144_14034  |  Sizes = [1,1,1152]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [1152, 1152, 1152, 1]  |  data = 0, sizeInBytes = 1152  |  location = in SRAM  |  sramOffset = 0x1000ffffff5d2800  |  ",
+          "shape": [
+            1,
+            1,
+            1152
+          ],
+          "bytes": 1152,
+          "location": "SRAM"
+        },
+        "weight": {
+          "name": "84_slice_0_0_4_0_0__0__bundle_144_14031",
+          "description": "84_slice_0_0_4_0_0__0__bundle_144_14031  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000fffffea92800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "85_slice_0_0_4_0_0__0__bundle_144_14043",
+          "description": "85_slice_0_0_4_0_0__0__bundle_144_14043  |  Sizes = [1,1,5120]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [122880, 20480, 20480, 4]  |  data = 0, sizeInBytes = 20480  |  isAliased = 85, type = concat, offset: 81920  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 20480,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2431_bundle_144/op_17_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "82_slice_0_0_5_0_0__0__bundle_144_14041",
+          "description": "82_slice_0_0_5_0_0__0__bundle_144_14041  |  Sizes = [1,1,1152]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [1152, 1152, 1152, 1]  |  data = 0, sizeInBytes = 1152  |  location = in SRAM  |  sramOffset = 0x1000ffffff5d2c80  |  ",
+          "shape": [
+            1,
+            1,
+            1152
+          ],
+          "bytes": 1152,
+          "location": "SRAM"
+        },
+        "weight": {
+          "name": "84_slice_0_0_5_0_0__0__bundle_144_14038",
+          "description": "84_slice_0_0_5_0_0__0__bundle_144_14038  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000ffffff032800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "85_slice_0_0_5_0_0__0__bundle_144_14044",
+          "description": "85_slice_0_0_5_0_0__0__bundle_144_14044  |  Sizes = [1,1,5120]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [122880, 20480, 20480, 4]  |  data = 0, sizeInBytes = 20480  |  isAliased = 85, type = concat, offset: 102400  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 20480,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/0/moe/linear_1/linear_fwd_bf16/2444_complex/gemm_0_bundle_146/op_0",
+        "op": "GEMM",
+        "activation": {
+          "name": "95",
+          "description": "95  |  Sizes = [1,1152]  |  bf16  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [2304, 2304, 2]  |  data = 0, sizeInBytes = 2304  |  location = in DRAM  |  dramOffset = 0x80000000280  |  ",
+          "shape": [
+            1,
+            1152
+          ],
+          "bytes": 2304,
+          "location": "DRAM"
+        },
+        "weight": {
+          "name": "97",
+          "description": "97  |  Sizes = [5120,1152]  |  bf16  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 2304, 2]  |  data = 0, sizeInBytes = 11796480  |  isPersistent  |  location = in DRAM  |  dramOffset = 0x180000000000  |  userMemorySection(type=Persistent, id=24)  |  ",
+          "shape": [
+            5120,
+            1152
+          ],
+          "bytes": 11796480,
+          "location": "DRAM"
+        },
+        "output": {
+          "name": "98",
+          "description": "98  |  Sizes = [1,5120]  |  bf16  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [10240, 10240, 2]  |  data = 0, sizeInBytes = 10240  |  location = in DRAM  |  dramOffset = 0xa0000002800  |  ",
+          "shape": [
+            1,
+            5120
+          ],
+          "bytes": 10240,
+          "location": "DRAM"
+        }
+      }
+    ],
+    "decode_consumers": {
+      "80_slice_0_0_1_0_0__0__bundle_143_13977": [
+        "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2428_bundle_143/op_4_gemm"
+      ],
+      "80_slice_0_0_3_0_0__0__bundle_143_13985": [
+        "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2428_bundle_143/op_8_gemm"
+      ],
+      "80_slice_0_0_4_0_0__0__bundle_143_13989": [
+        "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2428_bundle_143/op_10_gemm"
+      ],
+      "84_slice_0_0_0_0_0__0__bundle_144_14002": [
+        "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2431_bundle_144/op_4_gemm"
+      ],
+      "84_slice_0_0_2_0_0__0__bundle_144_14017": [
+        "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2431_bundle_144/op_10_gemm"
+      ],
+      "84_slice_0_0_3_0_0__0__bundle_144_14024": [
+        "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2431_bundle_144/op_13_gemm"
+      ],
+      "84_slice_0_0_5_0_0__0__bundle_144_14038": [
+        "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2431_bundle_144/op_17_gemm"
+      ],
+      "84_slice_0_0_1_0_0__0__bundle_144_14010": [
+        "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2431_bundle_144/op_7_gemm"
+      ],
+      "80_slice_0_0_5_0_0__0__bundle_143_13993": [
+        "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2428_bundle_143/op_11_gemm"
+      ],
+      "84_slice_0_0_4_0_0__0__bundle_144_14031": [
+        "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2431_bundle_144/op_16_gemm"
+      ],
+      "80_slice_0_0_2_0_0__0__bundle_143_13981": [
+        "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2428_bundle_143/op_6_gemm"
+      ],
+      "80_slice_0_0_0_0_0__0__bundle_143_13975": [
+        "L_self/layers/0/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2428_bundle_143/op_2_gemm"
+      ]
+    }
+  },
+  {
+    "graph": "/opt/ssd960/ymzx-dsv41-exact-full-stack-v1/trace-full-13p25-02/graphs/rank2/graph_0006_GraphModule_syn_1053000_1053000_304-PostGraph-symbol.pbtxt",
+    "sha256": "100649924c6e734200c585d7d355c2b8da49bcf0597a8f1709805306d8a81392",
+    "decode_node_count": 12,
+    "mme_node_count": 15,
+    "expert_mme_node_count": 12,
+    "decoded_bytes": 106168320,
+    "all_decoded_weights_in_sram": true,
+    "all_mme_weights_in_sram": true,
+    "all_decoded_weights_consumed_once": true,
+    "decode": [
+      {
+        "node": "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2588_bundle_154/op_0",
+        "output": {
+          "name": "73_slice_0_0_0_0_0__0__bundle_154_15085",
+          "description": "73_slice_0_0_0_0_0__0__bundle_154_15085  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffd412800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2588_bundle_154/op_1",
+        "output": {
+          "name": "73_slice_0_0_1_0_0__0__bundle_154_15087",
+          "description": "73_slice_0_0_1_0_0__0__bundle_154_15087  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffdf52800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2588_bundle_154/op_3",
+        "output": {
+          "name": "73_slice_0_0_2_0_0__0__bundle_154_15091",
+          "description": "73_slice_0_0_2_0_0__0__bundle_154_15091  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffd412800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2588_bundle_154/op_5",
+        "output": {
+          "name": "73_slice_0_0_3_0_0__0__bundle_154_15095",
+          "description": "73_slice_0_0_3_0_0__0__bundle_154_15095  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffdf52800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2588_bundle_154/op_7",
+        "output": {
+          "name": "73_slice_0_0_4_0_0__0__bundle_154_15099",
+          "description": "73_slice_0_0_4_0_0__0__bundle_154_15099  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffd412800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2588_bundle_154/op_9",
+        "output": {
+          "name": "73_slice_0_0_5_0_0__0__bundle_154_15103",
+          "description": "73_slice_0_0_5_0_0__0__bundle_154_15103  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffdf52800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2591_bundle_155/op_0",
+        "output": {
+          "name": "77_slice_0_0_0_0_0__0__bundle_155_15112",
+          "description": "77_slice_0_0_0_0_0__0__bundle_155_15112  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000fffffea92800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2591_bundle_155/op_2",
+        "output": {
+          "name": "77_slice_0_0_1_0_0__0__bundle_155_15120",
+          "description": "77_slice_0_0_1_0_0__0__bundle_155_15120  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000ffffff032800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2591_bundle_155/op_5",
+        "output": {
+          "name": "77_slice_0_0_2_0_0__0__bundle_155_15127",
+          "description": "77_slice_0_0_2_0_0__0__bundle_155_15127  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000fffffea92800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2591_bundle_155/op_8",
+        "output": {
+          "name": "77_slice_0_0_3_0_0__0__bundle_155_15134",
+          "description": "77_slice_0_0_3_0_0__0__bundle_155_15134  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000ffffff032800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2591_bundle_155/op_11",
+        "output": {
+          "name": "77_slice_0_0_4_0_0__0__bundle_155_15141",
+          "description": "77_slice_0_0_4_0_0__0__bundle_155_15141  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000fffffea92800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2591_bundle_155/op_14",
+        "output": {
+          "name": "77_slice_0_0_5_0_0__0__bundle_155_15148",
+          "description": "77_slice_0_0_5_0_0__0__bundle_155_15148  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000ffffff032800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        }
+      }
+    ],
+    "matrix": [
+      {
+        "node": "L_self/layers/1/moe/custom_deepseek_v41_bf16_linear_f32_gaudi2_default/gemm/2560_bundle_153/op_1",
+        "op": "GEMM",
+        "activation": {
+          "name": "29_slice_0_0_0_0_0__0__bundle_153_15076",
+          "description": "29_slice_0_0_0_0_0__0__bundle_153_15076  |  Sizes = [1,5120]  |  bf16  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [10240, 10240, 2]  |  data = 0, sizeInBytes = 10240  |  location = in SRAM  |  sramOffset = 0x1000fffffd410000  |  ",
+          "shape": [
+            1,
+            5120
+          ],
+          "bytes": 10240,
+          "location": "SRAM"
+        },
+        "weight": {
+          "name": "30_slice_0_0_0_0_0__0__bundle_153_15077",
+          "description": "30_slice_0_0_0_0_0__0__bundle_153_15077  |  Sizes = [384,5120]  |  bf16  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [3932160, 10240, 2]  |  data = 0, sizeInBytes = 3932160  |  location = in SRAM  |  sramOffset = 0x1000fffffd050000  |  ",
+          "shape": [
+            384,
+            5120
+          ],
+          "bytes": 3932160,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "31",
+          "description": "31  |  Sizes = [1,384]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [1536, 1536, 4]  |  data = 0, sizeInBytes = 1536  |  location = in DRAM  |  dramOffset = 0x60000000180  |  ",
+          "shape": [
+            1,
+            384
+          ],
+          "bytes": 1536,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/1/moe/linear/linear_fwd_bf16/2570_complex/gemm_0_bundle_156/op_0",
+        "op": "GEMM",
+        "activation": {
+          "name": "37",
+          "description": "37  |  Sizes = [1,5120]  |  bf16  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [10240, 10240, 2]  |  data = 0, sizeInBytes = 10240  |  location = in DRAM  |  dramOffset = 0x80000000000  |  ",
+          "shape": [
+            1,
+            5120
+          ],
+          "bytes": 10240,
+          "location": "DRAM"
+        },
+        "weight": {
+          "name": "41",
+          "description": "41  |  Sizes = [2304,5120]  |  bf16  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [23592960, 10240, 2]  |  data = 0, sizeInBytes = 23592960  |  isPersistent  |  location = in DRAM  |  dramOffset = 0xc0000000000  |  userMemorySection(type=Persistent, id=12)  |  ",
+          "shape": [
+            2304,
+            5120
+          ],
+          "bytes": 23592960,
+          "location": "DRAM"
+        },
+        "output": {
+          "name": "44",
+          "description": "44  |  Sizes = [1,2304]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [9216, 9216, 4]  |  data = 0, sizeInBytes = 9216  |  location = in DRAM  |  dramOffset = 0x80000002800  |  ",
+          "shape": [
+            1,
+            2304
+          ],
+          "bytes": 9216,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2589_bundle_154/op_2_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "67_slice_0_0_0_0_0__0__bundle_154_15088",
+          "description": "67_slice_0_0_0_0_0__0__bundle_154_15088  |  Sizes = [1,1,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [30720, 5120, 5120, 1]  |  data = 0, sizeInBytes = 5120  |  isAliased = 67, type = concat, offset: 0  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 5120,
+          "location": "DRAM"
+        },
+        "weight": {
+          "name": "73_slice_0_0_0_0_0__0__bundle_154_15085",
+          "description": "73_slice_0_0_0_0_0__0__bundle_154_15085  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffd412800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "74_slice_0_0_0_0_0__0__bundle_154_15089",
+          "description": "74_slice_0_0_0_0_0__0__bundle_154_15089  |  Sizes = [1,1,2304]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [55296, 9216, 9216, 4]  |  data = 0, sizeInBytes = 9216  |  isAliased = 74, type = concat, offset: 0  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            2304
+          ],
+          "bytes": 9216,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2589_bundle_154/op_4_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "67_slice_0_0_1_0_0__0__bundle_154_15092",
+          "description": "67_slice_0_0_1_0_0__0__bundle_154_15092  |  Sizes = [1,1,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [30720, 5120, 5120, 1]  |  data = 0, sizeInBytes = 5120  |  isAliased = 67, type = concat, offset: 5120  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 5120,
+          "location": "DRAM"
+        },
+        "weight": {
+          "name": "73_slice_0_0_1_0_0__0__bundle_154_15087",
+          "description": "73_slice_0_0_1_0_0__0__bundle_154_15087  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffdf52800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "74_slice_0_0_1_0_0__0__bundle_154_15093",
+          "description": "74_slice_0_0_1_0_0__0__bundle_154_15093  |  Sizes = [1,1,2304]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [55296, 9216, 9216, 4]  |  data = 0, sizeInBytes = 9216  |  isAliased = 74, type = concat, offset: 9216  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            2304
+          ],
+          "bytes": 9216,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2589_bundle_154/op_6_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "67_slice_0_0_2_0_0__0__bundle_154_15096",
+          "description": "67_slice_0_0_2_0_0__0__bundle_154_15096  |  Sizes = [1,1,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [30720, 5120, 5120, 1]  |  data = 0, sizeInBytes = 5120  |  isAliased = 67, type = concat, offset: 10240  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 5120,
+          "location": "DRAM"
+        },
+        "weight": {
+          "name": "73_slice_0_0_2_0_0__0__bundle_154_15091",
+          "description": "73_slice_0_0_2_0_0__0__bundle_154_15091  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffd412800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "74_slice_0_0_2_0_0__0__bundle_154_15097",
+          "description": "74_slice_0_0_2_0_0__0__bundle_154_15097  |  Sizes = [1,1,2304]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [55296, 9216, 9216, 4]  |  data = 0, sizeInBytes = 9216  |  isAliased = 74, type = concat, offset: 18432  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            2304
+          ],
+          "bytes": 9216,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2589_bundle_154/op_8_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "67_slice_0_0_3_0_0__0__bundle_154_15100",
+          "description": "67_slice_0_0_3_0_0__0__bundle_154_15100  |  Sizes = [1,1,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [30720, 5120, 5120, 1]  |  data = 0, sizeInBytes = 5120  |  isAliased = 67, type = concat, offset: 15360  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 5120,
+          "location": "DRAM"
+        },
+        "weight": {
+          "name": "73_slice_0_0_3_0_0__0__bundle_154_15095",
+          "description": "73_slice_0_0_3_0_0__0__bundle_154_15095  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffdf52800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "74_slice_0_0_3_0_0__0__bundle_154_15101",
+          "description": "74_slice_0_0_3_0_0__0__bundle_154_15101  |  Sizes = [1,1,2304]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [55296, 9216, 9216, 4]  |  data = 0, sizeInBytes = 9216  |  isAliased = 74, type = concat, offset: 27648  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            2304
+          ],
+          "bytes": 9216,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2589_bundle_154/op_10_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "67_slice_0_0_4_0_0__0__bundle_154_15104",
+          "description": "67_slice_0_0_4_0_0__0__bundle_154_15104  |  Sizes = [1,1,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [30720, 5120, 5120, 1]  |  data = 0, sizeInBytes = 5120  |  isAliased = 67, type = concat, offset: 20480  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 5120,
+          "location": "DRAM"
+        },
+        "weight": {
+          "name": "73_slice_0_0_4_0_0__0__bundle_154_15099",
+          "description": "73_slice_0_0_4_0_0__0__bundle_154_15099  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffd412800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "74_slice_0_0_4_0_0__0__bundle_154_15105",
+          "description": "74_slice_0_0_4_0_0__0__bundle_154_15105  |  Sizes = [1,1,2304]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [55296, 9216, 9216, 4]  |  data = 0, sizeInBytes = 9216  |  isAliased = 74, type = concat, offset: 36864  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            2304
+          ],
+          "bytes": 9216,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2589_bundle_154/op_11_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "67_slice_0_0_5_0_0__0__bundle_154_15106",
+          "description": "67_slice_0_0_5_0_0__0__bundle_154_15106  |  Sizes = [1,1,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [30720, 5120, 5120, 1]  |  data = 0, sizeInBytes = 5120  |  isAliased = 67, type = concat, offset: 25600  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 5120,
+          "location": "DRAM"
+        },
+        "weight": {
+          "name": "73_slice_0_0_5_0_0__0__bundle_154_15103",
+          "description": "73_slice_0_0_5_0_0__0__bundle_154_15103  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffdf52800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "74_slice_0_0_5_0_0__0__bundle_154_15107",
+          "description": "74_slice_0_0_5_0_0__0__bundle_154_15107  |  Sizes = [1,1,2304]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [55296, 9216, 9216, 4]  |  data = 0, sizeInBytes = 9216  |  isAliased = 74, type = concat, offset: 46080  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            2304
+          ],
+          "bytes": 9216,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2592_bundle_155/op_4_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "75_slice_0_0_0_0_0__0__bundle_155_15117",
+          "description": "75_slice_0_0_0_0_0__0__bundle_155_15117  |  Sizes = [1,1,1152]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [1152, 1152, 1152, 1]  |  data = 0, sizeInBytes = 1152  |  location = in SRAM  |  sramOffset = 0x1000ffffff5d2800  |  ",
+          "shape": [
+            1,
+            1,
+            1152
+          ],
+          "bytes": 1152,
+          "location": "SRAM"
+        },
+        "weight": {
+          "name": "77_slice_0_0_0_0_0__0__bundle_155_15112",
+          "description": "77_slice_0_0_0_0_0__0__bundle_155_15112  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000fffffea92800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "78_slice_0_0_0_0_0__0__bundle_155_15125",
+          "description": "78_slice_0_0_0_0_0__0__bundle_155_15125  |  Sizes = [1,1,5120]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [122880, 20480, 20480, 4]  |  data = 0, sizeInBytes = 20480  |  isAliased = 78, type = concat, offset: 0  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 20480,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2592_bundle_155/op_7_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "75_slice_0_0_1_0_0__0__bundle_155_15123",
+          "description": "75_slice_0_0_1_0_0__0__bundle_155_15123  |  Sizes = [1,1,1152]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [1152, 1152, 1152, 1]  |  data = 0, sizeInBytes = 1152  |  location = in SRAM  |  sramOffset = 0x1000ffffff5d2c80  |  ",
+          "shape": [
+            1,
+            1,
+            1152
+          ],
+          "bytes": 1152,
+          "location": "SRAM"
+        },
+        "weight": {
+          "name": "77_slice_0_0_1_0_0__0__bundle_155_15120",
+          "description": "77_slice_0_0_1_0_0__0__bundle_155_15120  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000ffffff032800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "78_slice_0_0_1_0_0__0__bundle_155_15132",
+          "description": "78_slice_0_0_1_0_0__0__bundle_155_15132  |  Sizes = [1,1,5120]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [122880, 20480, 20480, 4]  |  data = 0, sizeInBytes = 20480  |  isAliased = 78, type = concat, offset: 20480  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 20480,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2592_bundle_155/op_10_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "75_slice_0_0_2_0_0__0__bundle_155_15130",
+          "description": "75_slice_0_0_2_0_0__0__bundle_155_15130  |  Sizes = [1,1,1152]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [1152, 1152, 1152, 1]  |  data = 0, sizeInBytes = 1152  |  location = in SRAM  |  sramOffset = 0x1000ffffff5d2800  |  ",
+          "shape": [
+            1,
+            1,
+            1152
+          ],
+          "bytes": 1152,
+          "location": "SRAM"
+        },
+        "weight": {
+          "name": "77_slice_0_0_2_0_0__0__bundle_155_15127",
+          "description": "77_slice_0_0_2_0_0__0__bundle_155_15127  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000fffffea92800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "78_slice_0_0_2_0_0__0__bundle_155_15139",
+          "description": "78_slice_0_0_2_0_0__0__bundle_155_15139  |  Sizes = [1,1,5120]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [122880, 20480, 20480, 4]  |  data = 0, sizeInBytes = 20480  |  isAliased = 78, type = concat, offset: 40960  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 20480,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2592_bundle_155/op_13_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "75_slice_0_0_3_0_0__0__bundle_155_15137",
+          "description": "75_slice_0_0_3_0_0__0__bundle_155_15137  |  Sizes = [1,1,1152]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [1152, 1152, 1152, 1]  |  data = 0, sizeInBytes = 1152  |  location = in SRAM  |  sramOffset = 0x1000ffffff5d2c80  |  ",
+          "shape": [
+            1,
+            1,
+            1152
+          ],
+          "bytes": 1152,
+          "location": "SRAM"
+        },
+        "weight": {
+          "name": "77_slice_0_0_3_0_0__0__bundle_155_15134",
+          "description": "77_slice_0_0_3_0_0__0__bundle_155_15134  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000ffffff032800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "78_slice_0_0_3_0_0__0__bundle_155_15146",
+          "description": "78_slice_0_0_3_0_0__0__bundle_155_15146  |  Sizes = [1,1,5120]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [122880, 20480, 20480, 4]  |  data = 0, sizeInBytes = 20480  |  isAliased = 78, type = concat, offset: 61440  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 20480,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2592_bundle_155/op_16_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "75_slice_0_0_4_0_0__0__bundle_155_15144",
+          "description": "75_slice_0_0_4_0_0__0__bundle_155_15144  |  Sizes = [1,1,1152]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [1152, 1152, 1152, 1]  |  data = 0, sizeInBytes = 1152  |  location = in SRAM  |  sramOffset = 0x1000ffffff5d2800  |  ",
+          "shape": [
+            1,
+            1,
+            1152
+          ],
+          "bytes": 1152,
+          "location": "SRAM"
+        },
+        "weight": {
+          "name": "77_slice_0_0_4_0_0__0__bundle_155_15141",
+          "description": "77_slice_0_0_4_0_0__0__bundle_155_15141  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000fffffea92800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "78_slice_0_0_4_0_0__0__bundle_155_15153",
+          "description": "78_slice_0_0_4_0_0__0__bundle_155_15153  |  Sizes = [1,1,5120]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [122880, 20480, 20480, 4]  |  data = 0, sizeInBytes = 20480  |  isAliased = 78, type = concat, offset: 81920  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 20480,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2592_bundle_155/op_17_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "75_slice_0_0_5_0_0__0__bundle_155_15151",
+          "description": "75_slice_0_0_5_0_0__0__bundle_155_15151  |  Sizes = [1,1,1152]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [1152, 1152, 1152, 1]  |  data = 0, sizeInBytes = 1152  |  location = in SRAM  |  sramOffset = 0x1000ffffff5d2c80  |  ",
+          "shape": [
+            1,
+            1,
+            1152
+          ],
+          "bytes": 1152,
+          "location": "SRAM"
+        },
+        "weight": {
+          "name": "77_slice_0_0_5_0_0__0__bundle_155_15148",
+          "description": "77_slice_0_0_5_0_0__0__bundle_155_15148  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000ffffff032800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "78_slice_0_0_5_0_0__0__bundle_155_15154",
+          "description": "78_slice_0_0_5_0_0__0__bundle_155_15154  |  Sizes = [1,1,5120]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [122880, 20480, 20480, 4]  |  data = 0, sizeInBytes = 20480  |  isAliased = 78, type = concat, offset: 102400  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 20480,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/1/moe/linear_1/linear_fwd_bf16/2605_complex/gemm_0_bundle_157/op_0",
+        "op": "GEMM",
+        "activation": {
+          "name": "88",
+          "description": "88  |  Sizes = [1,1152]  |  bf16  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [2304, 2304, 2]  |  data = 0, sizeInBytes = 2304  |  location = in DRAM  |  dramOffset = 0x60000000280  |  ",
+          "shape": [
+            1,
+            1152
+          ],
+          "bytes": 2304,
+          "location": "DRAM"
+        },
+        "weight": {
+          "name": "90",
+          "description": "90  |  Sizes = [5120,1152]  |  bf16  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 2304, 2]  |  data = 0, sizeInBytes = 11796480  |  isPersistent  |  location = in DRAM  |  dramOffset = 0x170000000000  |  userMemorySection(type=Persistent, id=23)  |  ",
+          "shape": [
+            5120,
+            1152
+          ],
+          "bytes": 11796480,
+          "location": "DRAM"
+        },
+        "output": {
+          "name": "91",
+          "description": "91  |  Sizes = [1,5120]  |  bf16  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [10240, 10240, 2]  |  data = 0, sizeInBytes = 10240  |  location = in DRAM  |  dramOffset = 0x80000002800  |  ",
+          "shape": [
+            1,
+            5120
+          ],
+          "bytes": 10240,
+          "location": "DRAM"
+        }
+      }
+    ],
+    "decode_consumers": {
+      "73_slice_0_0_4_0_0__0__bundle_154_15099": [
+        "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2589_bundle_154/op_10_gemm"
+      ],
+      "77_slice_0_0_5_0_0__0__bundle_155_15148": [
+        "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2592_bundle_155/op_17_gemm"
+      ],
+      "73_slice_0_0_1_0_0__0__bundle_154_15087": [
+        "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2589_bundle_154/op_4_gemm"
+      ],
+      "73_slice_0_0_5_0_0__0__bundle_154_15103": [
+        "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2589_bundle_154/op_11_gemm"
+      ],
+      "73_slice_0_0_0_0_0__0__bundle_154_15085": [
+        "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2589_bundle_154/op_2_gemm"
+      ],
+      "77_slice_0_0_2_0_0__0__bundle_155_15127": [
+        "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2592_bundle_155/op_10_gemm"
+      ],
+      "77_slice_0_0_0_0_0__0__bundle_155_15112": [
+        "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2592_bundle_155/op_4_gemm"
+      ],
+      "77_slice_0_0_4_0_0__0__bundle_155_15141": [
+        "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2592_bundle_155/op_16_gemm"
+      ],
+      "77_slice_0_0_1_0_0__0__bundle_155_15120": [
+        "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2592_bundle_155/op_7_gemm"
+      ],
+      "77_slice_0_0_3_0_0__0__bundle_155_15134": [
+        "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2592_bundle_155/op_13_gemm"
+      ],
+      "73_slice_0_0_2_0_0__0__bundle_154_15091": [
+        "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2589_bundle_154/op_6_gemm"
+      ],
+      "73_slice_0_0_3_0_0__0__bundle_154_15095": [
+        "L_self/layers/1/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2589_bundle_154/op_8_gemm"
+      ]
+    }
+  },
+  {
+    "graph": "/opt/ssd960/ymzx-dsv41-exact-full-stack-v1/trace-full-13p25-02/graphs/rank2/graph_0006_GraphModule_syn_1061000_1061000_307-PostGraph-symbol.pbtxt",
+    "sha256": "7485d99f76c3ec7009ff0c05caa424ed37d8f4617ab9f8c339037938cb5174a3",
+    "decode_node_count": 12,
+    "mme_node_count": 15,
+    "expert_mme_node_count": 12,
+    "decoded_bytes": 106168320,
+    "all_decoded_weights_in_sram": true,
+    "all_mme_weights_in_sram": true,
+    "all_decoded_weights_consumed_once": true,
+    "decode": [
+      {
+        "node": "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2795_bundle_171/op_0",
+        "output": {
+          "name": "73_slice_0_0_0_0_0__0__bundle_171_16802",
+          "description": "73_slice_0_0_0_0_0__0__bundle_171_16802  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffd412800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2795_bundle_171/op_1",
+        "output": {
+          "name": "73_slice_0_0_1_0_0__0__bundle_171_16804",
+          "description": "73_slice_0_0_1_0_0__0__bundle_171_16804  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffdf52800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2795_bundle_171/op_3",
+        "output": {
+          "name": "73_slice_0_0_2_0_0__0__bundle_171_16808",
+          "description": "73_slice_0_0_2_0_0__0__bundle_171_16808  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffd412800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2795_bundle_171/op_5",
+        "output": {
+          "name": "73_slice_0_0_3_0_0__0__bundle_171_16812",
+          "description": "73_slice_0_0_3_0_0__0__bundle_171_16812  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffdf52800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2795_bundle_171/op_7",
+        "output": {
+          "name": "73_slice_0_0_4_0_0__0__bundle_171_16816",
+          "description": "73_slice_0_0_4_0_0__0__bundle_171_16816  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffd412800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2795_bundle_171/op_9",
+        "output": {
+          "name": "73_slice_0_0_5_0_0__0__bundle_171_16820",
+          "description": "73_slice_0_0_5_0_0__0__bundle_171_16820  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffdf52800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2798_bundle_172/op_0",
+        "output": {
+          "name": "77_slice_0_0_0_0_0__0__bundle_172_16829",
+          "description": "77_slice_0_0_0_0_0__0__bundle_172_16829  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000fffffea92800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2798_bundle_172/op_2",
+        "output": {
+          "name": "77_slice_0_0_1_0_0__0__bundle_172_16837",
+          "description": "77_slice_0_0_1_0_0__0__bundle_172_16837  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000ffffff032800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2798_bundle_172/op_5",
+        "output": {
+          "name": "77_slice_0_0_2_0_0__0__bundle_172_16844",
+          "description": "77_slice_0_0_2_0_0__0__bundle_172_16844  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000fffffea92800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2798_bundle_172/op_8",
+        "output": {
+          "name": "77_slice_0_0_3_0_0__0__bundle_172_16851",
+          "description": "77_slice_0_0_3_0_0__0__bundle_172_16851  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000ffffff032800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2798_bundle_172/op_11",
+        "output": {
+          "name": "77_slice_0_0_4_0_0__0__bundle_172_16858",
+          "description": "77_slice_0_0_4_0_0__0__bundle_172_16858  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000fffffea92800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/custom_deepseek_v41_expert_n256_fp8_gaudi2/2798_bundle_172/op_14",
+        "output": {
+          "name": "77_slice_0_0_5_0_0__0__bundle_172_16865",
+          "description": "77_slice_0_0_5_0_0__0__bundle_172_16865  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000ffffff032800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        }
+      }
+    ],
+    "matrix": [
+      {
+        "node": "L_self/layers/3/moe/custom_deepseek_v41_bf16_linear_f32_gaudi2_default/gemm/2767_bundle_170/op_1",
+        "op": "GEMM",
+        "activation": {
+          "name": "29_slice_0_0_0_0_0__0__bundle_170_16793",
+          "description": "29_slice_0_0_0_0_0__0__bundle_170_16793  |  Sizes = [1,5120]  |  bf16  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [10240, 10240, 2]  |  data = 0, sizeInBytes = 10240  |  location = in SRAM  |  sramOffset = 0x1000fffffd410000  |  ",
+          "shape": [
+            1,
+            5120
+          ],
+          "bytes": 10240,
+          "location": "SRAM"
+        },
+        "weight": {
+          "name": "30_slice_0_0_0_0_0__0__bundle_170_16794",
+          "description": "30_slice_0_0_0_0_0__0__bundle_170_16794  |  Sizes = [384,5120]  |  bf16  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [3932160, 10240, 2]  |  data = 0, sizeInBytes = 3932160  |  location = in SRAM  |  sramOffset = 0x1000fffffd050000  |  ",
+          "shape": [
+            384,
+            5120
+          ],
+          "bytes": 3932160,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "31",
+          "description": "31  |  Sizes = [1,384]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [1536, 1536, 4]  |  data = 0, sizeInBytes = 1536  |  location = in DRAM  |  dramOffset = 0x60000000180  |  ",
+          "shape": [
+            1,
+            384
+          ],
+          "bytes": 1536,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/3/moe/linear/linear_fwd_bf16/2777_complex/gemm_0_bundle_173/op_0",
+        "op": "GEMM",
+        "activation": {
+          "name": "37",
+          "description": "37  |  Sizes = [1,5120]  |  bf16  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [10240, 10240, 2]  |  data = 0, sizeInBytes = 10240  |  location = in DRAM  |  dramOffset = 0x80000000000  |  ",
+          "shape": [
+            1,
+            5120
+          ],
+          "bytes": 10240,
+          "location": "DRAM"
+        },
+        "weight": {
+          "name": "41",
+          "description": "41  |  Sizes = [2304,5120]  |  bf16  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [23592960, 10240, 2]  |  data = 0, sizeInBytes = 23592960  |  isPersistent  |  location = in DRAM  |  dramOffset = 0xc0000000000  |  userMemorySection(type=Persistent, id=12)  |  ",
+          "shape": [
+            2304,
+            5120
+          ],
+          "bytes": 23592960,
+          "location": "DRAM"
+        },
+        "output": {
+          "name": "44",
+          "description": "44  |  Sizes = [1,2304]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [9216, 9216, 4]  |  data = 0, sizeInBytes = 9216  |  location = in DRAM  |  dramOffset = 0x80000002800  |  ",
+          "shape": [
+            1,
+            2304
+          ],
+          "bytes": 9216,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2796_bundle_171/op_2_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "67_slice_0_0_0_0_0__0__bundle_171_16805",
+          "description": "67_slice_0_0_0_0_0__0__bundle_171_16805  |  Sizes = [1,1,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [30720, 5120, 5120, 1]  |  data = 0, sizeInBytes = 5120  |  isAliased = 67, type = concat, offset: 0  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 5120,
+          "location": "DRAM"
+        },
+        "weight": {
+          "name": "73_slice_0_0_0_0_0__0__bundle_171_16802",
+          "description": "73_slice_0_0_0_0_0__0__bundle_171_16802  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffd412800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "74_slice_0_0_0_0_0__0__bundle_171_16806",
+          "description": "74_slice_0_0_0_0_0__0__bundle_171_16806  |  Sizes = [1,1,2304]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [55296, 9216, 9216, 4]  |  data = 0, sizeInBytes = 9216  |  isAliased = 74, type = concat, offset: 0  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            2304
+          ],
+          "bytes": 9216,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2796_bundle_171/op_4_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "67_slice_0_0_1_0_0__0__bundle_171_16809",
+          "description": "67_slice_0_0_1_0_0__0__bundle_171_16809  |  Sizes = [1,1,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [30720, 5120, 5120, 1]  |  data = 0, sizeInBytes = 5120  |  isAliased = 67, type = concat, offset: 5120  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 5120,
+          "location": "DRAM"
+        },
+        "weight": {
+          "name": "73_slice_0_0_1_0_0__0__bundle_171_16804",
+          "description": "73_slice_0_0_1_0_0__0__bundle_171_16804  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffdf52800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "74_slice_0_0_1_0_0__0__bundle_171_16810",
+          "description": "74_slice_0_0_1_0_0__0__bundle_171_16810  |  Sizes = [1,1,2304]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [55296, 9216, 9216, 4]  |  data = 0, sizeInBytes = 9216  |  isAliased = 74, type = concat, offset: 9216  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            2304
+          ],
+          "bytes": 9216,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2796_bundle_171/op_6_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "67_slice_0_0_2_0_0__0__bundle_171_16813",
+          "description": "67_slice_0_0_2_0_0__0__bundle_171_16813  |  Sizes = [1,1,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [30720, 5120, 5120, 1]  |  data = 0, sizeInBytes = 5120  |  isAliased = 67, type = concat, offset: 10240  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 5120,
+          "location": "DRAM"
+        },
+        "weight": {
+          "name": "73_slice_0_0_2_0_0__0__bundle_171_16808",
+          "description": "73_slice_0_0_2_0_0__0__bundle_171_16808  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffd412800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "74_slice_0_0_2_0_0__0__bundle_171_16814",
+          "description": "74_slice_0_0_2_0_0__0__bundle_171_16814  |  Sizes = [1,1,2304]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [55296, 9216, 9216, 4]  |  data = 0, sizeInBytes = 9216  |  isAliased = 74, type = concat, offset: 18432  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            2304
+          ],
+          "bytes": 9216,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2796_bundle_171/op_8_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "67_slice_0_0_3_0_0__0__bundle_171_16817",
+          "description": "67_slice_0_0_3_0_0__0__bundle_171_16817  |  Sizes = [1,1,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [30720, 5120, 5120, 1]  |  data = 0, sizeInBytes = 5120  |  isAliased = 67, type = concat, offset: 15360  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 5120,
+          "location": "DRAM"
+        },
+        "weight": {
+          "name": "73_slice_0_0_3_0_0__0__bundle_171_16812",
+          "description": "73_slice_0_0_3_0_0__0__bundle_171_16812  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffdf52800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "74_slice_0_0_3_0_0__0__bundle_171_16818",
+          "description": "74_slice_0_0_3_0_0__0__bundle_171_16818  |  Sizes = [1,1,2304]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [55296, 9216, 9216, 4]  |  data = 0, sizeInBytes = 9216  |  isAliased = 74, type = concat, offset: 27648  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            2304
+          ],
+          "bytes": 9216,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2796_bundle_171/op_10_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "67_slice_0_0_4_0_0__0__bundle_171_16821",
+          "description": "67_slice_0_0_4_0_0__0__bundle_171_16821  |  Sizes = [1,1,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [30720, 5120, 5120, 1]  |  data = 0, sizeInBytes = 5120  |  isAliased = 67, type = concat, offset: 20480  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 5120,
+          "location": "DRAM"
+        },
+        "weight": {
+          "name": "73_slice_0_0_4_0_0__0__bundle_171_16816",
+          "description": "73_slice_0_0_4_0_0__0__bundle_171_16816  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffd412800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "74_slice_0_0_4_0_0__0__bundle_171_16822",
+          "description": "74_slice_0_0_4_0_0__0__bundle_171_16822  |  Sizes = [1,1,2304]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [55296, 9216, 9216, 4]  |  data = 0, sizeInBytes = 9216  |  isAliased = 74, type = concat, offset: 36864  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            2304
+          ],
+          "bytes": 9216,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2796_bundle_171/op_11_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "67_slice_0_0_5_0_0__0__bundle_171_16823",
+          "description": "67_slice_0_0_5_0_0__0__bundle_171_16823  |  Sizes = [1,1,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [30720, 5120, 5120, 1]  |  data = 0, sizeInBytes = 5120  |  isAliased = 67, type = concat, offset: 25600  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 5120,
+          "location": "DRAM"
+        },
+        "weight": {
+          "name": "73_slice_0_0_5_0_0__0__bundle_171_16820",
+          "description": "73_slice_0_0_5_0_0__0__bundle_171_16820  |  Sizes = [1,5120,2304]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 11796480, 2304, 1]  |  data = 0, sizeInBytes = 11796480  |  location = in SRAM  |  sramOffset = 0x1000fffffdf52800  |  ",
+          "shape": [
+            1,
+            5120,
+            2304
+          ],
+          "bytes": 11796480,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "74_slice_0_0_5_0_0__0__bundle_171_16824",
+          "description": "74_slice_0_0_5_0_0__0__bundle_171_16824  |  Sizes = [1,1,2304]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [55296, 9216, 9216, 4]  |  data = 0, sizeInBytes = 9216  |  isAliased = 74, type = concat, offset: 46080  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            2304
+          ],
+          "bytes": 9216,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2799_bundle_172/op_4_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "75_slice_0_0_0_0_0__0__bundle_172_16834",
+          "description": "75_slice_0_0_0_0_0__0__bundle_172_16834  |  Sizes = [1,1,1152]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [1152, 1152, 1152, 1]  |  data = 0, sizeInBytes = 1152  |  location = in SRAM  |  sramOffset = 0x1000ffffff5d2800  |  ",
+          "shape": [
+            1,
+            1,
+            1152
+          ],
+          "bytes": 1152,
+          "location": "SRAM"
+        },
+        "weight": {
+          "name": "77_slice_0_0_0_0_0__0__bundle_172_16829",
+          "description": "77_slice_0_0_0_0_0__0__bundle_172_16829  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000fffffea92800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "78_slice_0_0_0_0_0__0__bundle_172_16842",
+          "description": "78_slice_0_0_0_0_0__0__bundle_172_16842  |  Sizes = [1,1,5120]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [122880, 20480, 20480, 4]  |  data = 0, sizeInBytes = 20480  |  isAliased = 78, type = concat, offset: 0  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 20480,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2799_bundle_172/op_7_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "75_slice_0_0_1_0_0__0__bundle_172_16840",
+          "description": "75_slice_0_0_1_0_0__0__bundle_172_16840  |  Sizes = [1,1,1152]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [1152, 1152, 1152, 1]  |  data = 0, sizeInBytes = 1152  |  location = in SRAM  |  sramOffset = 0x1000ffffff5d2c80  |  ",
+          "shape": [
+            1,
+            1,
+            1152
+          ],
+          "bytes": 1152,
+          "location": "SRAM"
+        },
+        "weight": {
+          "name": "77_slice_0_0_1_0_0__0__bundle_172_16837",
+          "description": "77_slice_0_0_1_0_0__0__bundle_172_16837  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000ffffff032800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "78_slice_0_0_1_0_0__0__bundle_172_16849",
+          "description": "78_slice_0_0_1_0_0__0__bundle_172_16849  |  Sizes = [1,1,5120]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [122880, 20480, 20480, 4]  |  data = 0, sizeInBytes = 20480  |  isAliased = 78, type = concat, offset: 20480  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 20480,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2799_bundle_172/op_10_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "75_slice_0_0_2_0_0__0__bundle_172_16847",
+          "description": "75_slice_0_0_2_0_0__0__bundle_172_16847  |  Sizes = [1,1,1152]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [1152, 1152, 1152, 1]  |  data = 0, sizeInBytes = 1152  |  location = in SRAM  |  sramOffset = 0x1000ffffff5d2800  |  ",
+          "shape": [
+            1,
+            1,
+            1152
+          ],
+          "bytes": 1152,
+          "location": "SRAM"
+        },
+        "weight": {
+          "name": "77_slice_0_0_2_0_0__0__bundle_172_16844",
+          "description": "77_slice_0_0_2_0_0__0__bundle_172_16844  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000fffffea92800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "78_slice_0_0_2_0_0__0__bundle_172_16856",
+          "description": "78_slice_0_0_2_0_0__0__bundle_172_16856  |  Sizes = [1,1,5120]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [122880, 20480, 20480, 4]  |  data = 0, sizeInBytes = 20480  |  isAliased = 78, type = concat, offset: 40960  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 20480,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2799_bundle_172/op_13_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "75_slice_0_0_3_0_0__0__bundle_172_16854",
+          "description": "75_slice_0_0_3_0_0__0__bundle_172_16854  |  Sizes = [1,1,1152]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [1152, 1152, 1152, 1]  |  data = 0, sizeInBytes = 1152  |  location = in SRAM  |  sramOffset = 0x1000ffffff5d2c80  |  ",
+          "shape": [
+            1,
+            1,
+            1152
+          ],
+          "bytes": 1152,
+          "location": "SRAM"
+        },
+        "weight": {
+          "name": "77_slice_0_0_3_0_0__0__bundle_172_16851",
+          "description": "77_slice_0_0_3_0_0__0__bundle_172_16851  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000ffffff032800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "78_slice_0_0_3_0_0__0__bundle_172_16863",
+          "description": "78_slice_0_0_3_0_0__0__bundle_172_16863  |  Sizes = [1,1,5120]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [122880, 20480, 20480, 4]  |  data = 0, sizeInBytes = 20480  |  isAliased = 78, type = concat, offset: 61440  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 20480,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2799_bundle_172/op_16_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "75_slice_0_0_4_0_0__0__bundle_172_16861",
+          "description": "75_slice_0_0_4_0_0__0__bundle_172_16861  |  Sizes = [1,1,1152]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [1152, 1152, 1152, 1]  |  data = 0, sizeInBytes = 1152  |  location = in SRAM  |  sramOffset = 0x1000ffffff5d2800  |  ",
+          "shape": [
+            1,
+            1,
+            1152
+          ],
+          "bytes": 1152,
+          "location": "SRAM"
+        },
+        "weight": {
+          "name": "77_slice_0_0_4_0_0__0__bundle_172_16858",
+          "description": "77_slice_0_0_4_0_0__0__bundle_172_16858  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000fffffea92800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "78_slice_0_0_4_0_0__0__bundle_172_16870",
+          "description": "78_slice_0_0_4_0_0__0__bundle_172_16870  |  Sizes = [1,1,5120]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [122880, 20480, 20480, 4]  |  data = 0, sizeInBytes = 20480  |  isAliased = 78, type = concat, offset: 81920  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 20480,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2799_bundle_172/op_17_gemm",
+        "op": "GEMM",
+        "activation": {
+          "name": "75_slice_0_0_5_0_0__0__bundle_172_16868",
+          "description": "75_slice_0_0_5_0_0__0__bundle_172_16868  |  Sizes = [1,1,1152]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [1152, 1152, 1152, 1]  |  data = 0, sizeInBytes = 1152  |  location = in SRAM  |  sramOffset = 0x1000ffffff5d2c80  |  ",
+          "shape": [
+            1,
+            1,
+            1152
+          ],
+          "bytes": 1152,
+          "location": "SRAM"
+        },
+        "weight": {
+          "name": "77_slice_0_0_5_0_0__0__bundle_172_16865",
+          "description": "77_slice_0_0_5_0_0__0__bundle_172_16865  |  Sizes = [1,1152,5120]  |  hfloat8  |  expBias = 7, scale = 1  |    |  ModelParam = 0  |  strides = [5898240, 5898240, 5120, 1]  |  data = 0, sizeInBytes = 5898240  |  location = in SRAM  |  sramOffset = 0x1000ffffff032800  |  ",
+          "shape": [
+            1,
+            1152,
+            5120
+          ],
+          "bytes": 5898240,
+          "location": "SRAM"
+        },
+        "output": {
+          "name": "78_slice_0_0_5_0_0__0__bundle_172_16871",
+          "description": "78_slice_0_0_5_0_0__0__bundle_172_16871  |  Sizes = [1,1,5120]  |  float32  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [122880, 20480, 20480, 4]  |  data = 0, sizeInBytes = 20480  |  isAliased = 78, type = concat, offset: 102400  |  location = in DRAM  |  ",
+          "shape": [
+            1,
+            1,
+            5120
+          ],
+          "bytes": 20480,
+          "location": "DRAM"
+        }
+      },
+      {
+        "node": "L_self/layers/3/moe/linear_1/linear_fwd_bf16/2812_complex/gemm_0_bundle_174/op_0",
+        "op": "GEMM",
+        "activation": {
+          "name": "88",
+          "description": "88  |  Sizes = [1,1152]  |  bf16  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [2304, 2304, 2]  |  data = 0, sizeInBytes = 2304  |  location = in DRAM  |  dramOffset = 0x60000000280  |  ",
+          "shape": [
+            1,
+            1152
+          ],
+          "bytes": 2304,
+          "location": "DRAM"
+        },
+        "weight": {
+          "name": "90",
+          "description": "90  |  Sizes = [5120,1152]  |  bf16  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [11796480, 2304, 2]  |  data = 0, sizeInBytes = 11796480  |  isPersistent  |  location = in DRAM  |  dramOffset = 0x170000000000  |  userMemorySection(type=Persistent, id=23)  |  ",
+          "shape": [
+            5120,
+            1152
+          ],
+          "bytes": 11796480,
+          "location": "DRAM"
+        },
+        "output": {
+          "name": "91",
+          "description": "91  |  Sizes = [1,5120]  |  bf16  |  expBias = 0, scale = 1  |    |  ModelParam = 0  |  strides = [10240, 10240, 2]  |  data = 0, sizeInBytes = 10240  |  location = in DRAM  |  dramOffset = 0x80000002800  |  ",
+          "shape": [
+            1,
+            5120
+          ],
+          "bytes": 10240,
+          "location": "DRAM"
+        }
+      }
+    ],
+    "decode_consumers": {
+      "73_slice_0_0_2_0_0__0__bundle_171_16808": [
+        "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2796_bundle_171/op_6_gemm"
+      ],
+      "73_slice_0_0_3_0_0__0__bundle_171_16812": [
+        "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2796_bundle_171/op_8_gemm"
+      ],
+      "73_slice_0_0_0_0_0__0__bundle_171_16802": [
+        "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2796_bundle_171/op_2_gemm"
+      ],
+      "77_slice_0_0_0_0_0__0__bundle_172_16829": [
+        "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2799_bundle_172/op_4_gemm"
+      ],
+      "77_slice_0_0_1_0_0__0__bundle_172_16837": [
+        "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2799_bundle_172/op_7_gemm"
+      ],
+      "77_slice_0_0_4_0_0__0__bundle_172_16858": [
+        "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2799_bundle_172/op_16_gemm"
+      ],
+      "73_slice_0_0_4_0_0__0__bundle_171_16816": [
+        "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2796_bundle_171/op_10_gemm"
+      ],
+      "73_slice_0_0_1_0_0__0__bundle_171_16804": [
+        "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2796_bundle_171/op_4_gemm"
+      ],
+      "77_slice_0_0_2_0_0__0__bundle_172_16844": [
+        "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2799_bundle_172/op_10_gemm"
+      ],
+      "73_slice_0_0_5_0_0__0__bundle_171_16820": [
+        "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2796_bundle_171/op_11_gemm"
+      ],
+      "77_slice_0_0_5_0_0__0__bundle_172_16865": [
+        "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2799_bundle_172/op_17_gemm"
+      ],
+      "77_slice_0_0_3_0_0__0__bundle_172_16851": [
+        "L_self/layers/3/moe/custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2_default/batch_gemm/2799_bundle_172/op_13_gemm"
+      ]
+    }
+  }
+]

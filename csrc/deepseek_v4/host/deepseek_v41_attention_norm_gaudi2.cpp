@@ -16,8 +16,10 @@ tpc_lib_api::GlueCodeReturn DeepseekV41AttentionNormGaudi2::GetGcDefinitions(
     if (x.dataType != DATA_BF16 || w.dataType != DATA_BF16 || y.dataType != DATA_BF16)
         return GLUE_INCOMPATIBLE_DATA_TYPE;
     const auto width = x.maxSizes[0], rows = x.maxSizes[1];
-    if (x.dims != 2 || w.dims != 1 || y.dims != 2 || (width != 512 && width != 1280) ||
-        rows < 1 || rows > 512 || w.maxSizes[0] != width || y.maxSizes[0] != width || y.maxSizes[1] != rows)
+    if (x.dims != 2 || w.dims != 1 || y.dims != 2 ||
+        (width != 512 && width != 1280 && width != 5120) ||
+        rows < 1 || rows > 8192 || w.maxSizes[0] != width ||
+        y.maxSizes[0] != width || y.maxSizes[1] != rows)
         return GLUE_INCOMPATIBLE_INPUT_SIZE;
     const auto* params = static_cast<const float*>(p->nodeParams.nodeParams);
     if (!(params[0] > 0) || !std::isnormal(params[0])) return GLUE_FAILED;

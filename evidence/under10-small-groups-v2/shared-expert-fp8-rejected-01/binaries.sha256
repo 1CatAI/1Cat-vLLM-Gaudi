@@ -1,0 +1,3 @@
+e12ce94960c09cc1a4322bb00d3d3416cfed36aef43004e05a55a616fdeb6755  /dev/shm/dsv41-shared-fp8-out-01/dsv41_host_gather.cpython-312-x86_64-linux-gnu.so
+126c7847c84917a120c530a2a6e38ddf80e7f82a15bedf2ddd7e35ab33c3fd10  /dev/shm/dsv41-shared-fp8-out-01/hpu_dsv4_sparse_attn_pt2.cpython-312-x86_64-linux-gnu.so
+2463091681bc76b4dfa672f76c73a1236ae1f8d6d5eed9f747628cf8c4d9985a  /dev/shm/dsv41-shared-fp8-out-01/libdeepseek_v4_gaudi2_kernels.so
