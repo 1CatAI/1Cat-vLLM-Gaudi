@@ -1,0 +1,59 @@
+{
+  "public_models": {
+    "status": 200,
+    "models": [
+      "DeepSeek-V4.1-Flash"
+    ]
+  },
+  "local_nonstream": {
+    "status": 200,
+    "elapsed_s": 0.30319331400096416,
+    "text": "45",
+    "usage": {
+      "prompt_tokens": 14,
+      "total_tokens": 16,
+      "completion_tokens": 2,
+      "prompt_tokens_details": null,
+      "completion_tokens_details": null
+    },
+    "error": null
+  },
+  "public_stream": {
+    "status": 200,
+    "elapsed_s": 0.9863054669694975,
+    "events": 49,
+    "done": true,
+    "text": "端到端测试从真实用户视角验证整个系统链路，确保各模块集成后能协同完成核心业务流程。它能捕获单元和集成测试遗漏的跨系统问题，是上线前确认产品可用的最后一道防线。",
+    "error": null,
+    "invalid_frames": []
+  },
+  "public_b2": [
+    {
+      "status": 200,
+      "elapsed_s": 0.4514466499676928,
+      "text": "北京",
+      "usage": {
+        "prompt_tokens": 14,
+        "total_tokens": 16,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null,
+        "completion_tokens_details": null
+      },
+      "error": null
+    },
+    {
+      "status": 200,
+      "elapsed_s": 0.7252655730117112,
+      "text": "63",
+      "usage": {
+        "prompt_tokens": 14,
+        "total_tokens": 16,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null,
+        "completion_tokens_details": null
+      },
+      "error": null
+    }
+  ],
+  "ok": true
+}

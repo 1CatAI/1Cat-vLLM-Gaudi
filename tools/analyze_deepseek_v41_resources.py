@@ -14,7 +14,7 @@ from account_deepseek_v41_trace import merge, length, subtract
 def tags(row):
     k, p, cat = row['kernel'], row['purpose'], row['category']
     names = []
-    if 'mxfp4_prepared_dequant' in k:
+    if 'mxfp4_prepared_dequant' in k or 'deepseek_v41_expert_n256_fp8' in k:
         names.append('expert_decode')
     if row['engine'] == 'MME' and cat == '路由专家':
         names.append('expert_mme')
@@ -153,7 +153,11 @@ def main():
         inv = json.loads((root / 'inventory.json').read_text())
         own = json.loads((root / 'device-windows.json').read_text())
         recipe_order = [row[2].split(':')[0] for row in own['capture_order']]
-        boundary_ids = {'first': recipe_order[0], 'last': recipe_order[-1]}
+        # Reused command pages need not re-emit recipe capture order.  Token
+        # windows and engine/TPC occupancy remain measurable; only the tighter
+        # per-stage envelope is unavailable in that case.
+        boundary_ids = ({'first': recipe_order[0], 'last': recipe_order[-1]}
+                        if recipe_order else {})
         boundary_spans = collections.defaultdict(list)
         recipes = json.loads((root / 'recipe-symbols.json').read_text())['recipes']
         mapped = symbols(inv, recipes)

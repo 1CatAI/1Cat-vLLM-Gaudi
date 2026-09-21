@@ -6,6 +6,9 @@
 #ifndef DSV41_N256_PREFETCH
 #define DSV41_N256_PREFETCH 8
 #endif
+#ifndef DSV41_N256_FUSE_SLOTS
+#define DSV41_N256_FUSE_SLOTS 0
+#endif
 
 static inline ushort128 exact_bf16(ushort128 nibble, ushort128 code)
 {
@@ -39,12 +42,31 @@ void main(tensor ids, tensor q16, tensor planes, tensor lookup, tensor output)
 #if DSV41_N256_FP8
     const uchar256 table = v_u8_ld_tnsr_b((int5){0}, lookup);
 #endif
-    for (int slot = start[1]; slot < end[1]; ++slot) {
+#if DSV41_N256_FUSE_SLOTS
+    const int first_slot = 0;
+    const int last_slot = get_dim_size(ids, 0);
+    const int first_group = start[1] * 4;
+    const int last_group = end[1] * 4;
+#if DSV41_N256_FP8
+    const int first_k = start[1] * 128;
+    const int last_k = end[1] * 128;
+#endif
+#else
+    const int first_slot = start[1];
+    const int last_slot = end[1];
+    const int first_group = start[2] * 4;
+    const int last_group = end[2] * 4;
+#if DSV41_N256_FP8
+    const int first_k = start[2] * 128;
+    const int last_k = end[2] * 128;
+#endif
+#endif
+    for (int slot = first_slot; slot < last_slot; ++slot) {
         const int expert = s_i32_ld_g(gen_addr((int5){slot}, ids));
 #if DSV41_N256_FP8
         if (expert < 0 || expert >= experts) {
             for (int block = start[0]; block < end[0]; ++block) {
-                for (int k = start[2] * 128; k < end[2] * 128; ++k) {
+                for (int k = first_k; k < last_k; ++k) {
                     v_f8_st_tnsr((int5){block * 256, k, slot}, output, (minifloat256){0});
                 }
             }
@@ -53,7 +75,7 @@ void main(tensor ids, tensor q16, tensor planes, tensor lookup, tensor output)
 #endif
         for (int block = start[0]; block < end[0]; ++block) {
             const int row = block * 256;
-            for (int group = start[2] * 4; group < end[2] * 4; ++group) {
+            for (int group = first_group; group < last_group; ++group) {
 #if DSV41_N256_FP8
                 const uchar256 delta = v_u8_ld_tnsr_b(
                     (int5){group * 256 + 128, block, expert}, planes);

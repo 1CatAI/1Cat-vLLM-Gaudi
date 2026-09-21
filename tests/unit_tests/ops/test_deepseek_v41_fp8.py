@@ -13,7 +13,7 @@ from vllm_gaudi.ops.deepseek_v41_fp8 import channel_scales, precision_config
 from vllm_gaudi.ops.deepseek_v41_weights import prepare_q16, prepare_s16
 
 
-def test_n256_fused_finalize_is_c1_only(monkeypatch):
+def test_n256_prefetched_direct_finalize_is_c1_only(monkeypatch):
     from vllm_gaudi import envs
 
     flags = {
@@ -48,10 +48,38 @@ def test_n256_fused_finalize_is_c1_only(monkeypatch):
 
         return run
 
+    def prequant_expert(kind):
+
+        def run(value, *operands):
+            shared = kind == "prequant-shared-finalize"
+            channel_index = -6 if shared else -5
+            quantized_index = -4 if shared else -3
+            scale_index = -3 if shared else -2
+            assert operands[channel_index] is experts.w13_fp8_channel
+            assert operands[channel_index + 1] is experts.w2_fp8_channel
+            assert operands[quantized_index].dtype == torch.float8_e4m3fn
+            assert operands[quantized_index].shape == value.shape
+            assert operands[scale_index].dtype == torch.float32
+            assert operands[scale_index].shape == (value.shape[0], 1)
+            if shared:
+                assert operands[-2].shape == value.shape
+            assert operands[-1] is True
+            calls.append((kind, value.shape[0]))
+            return torch.zeros_like(value)
+
+        return run
+
     monkeypatch.setattr(
         torch.ops, "custom_op",
         SimpleNamespace(custom_deepseek_v41_router_top6_gaudi2=select,
-                        custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2=expert("finalize"),
+                        custom_deepseek_v41_expert_n256_moe_direct_finalize_prefetch_w2_fp8_gaudi2=expert(
+                            "prefetched-finalize"),
+                        custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_prefetch_w2_fp8_gaudi2=
+                        prequant_expert("prequant-prefetched-finalize"),
+                        custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_shared_prefetch_w2_fp8_gaudi2=
+                        prequant_expert("prequant-shared-finalize"),
+                        custom_deepseek_v41_expert_n256_moe_prequant_fused_fp8_gaudi2=prequant_expert(
+                            "prequant-body"),
                         custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2=expert("body")))
     experts = SimpleNamespace(w13_q16=None,
                               w2_q16=None,
@@ -71,7 +99,26 @@ def test_n256_fused_finalize_is_c1_only(monkeypatch):
     for tokens in (1, 6):
         value = torch.zeros(tokens, 8, dtype=torch.bfloat16)
         assert torch.equal(moe(value, torch.zeros(tokens, dtype=torch.bool), fp8_decode=True), value)
-    assert calls == [("finalize", 1), ("body", 6)]
+    for tokens in (1, 2):
+        value = torch.zeros(tokens, 8, dtype=torch.bfloat16)
+        quantized = torch.zeros_like(value, dtype=torch.float8_e4m3fn)
+        scale = torch.ones(tokens, 1, dtype=torch.float32)
+        result = moe._forward_n256_fp8(value,
+                                       torch.zeros(tokens, 6, dtype=torch.int32),
+                                       torch.ones(tokens, 6),
+                                       prequant=(quantized, scale))
+        assert torch.equal(result, value)
+        if tokens == 1:
+            result = moe._forward_n256_fp8(
+                value,
+                torch.zeros(tokens, 6, dtype=torch.int32),
+                torch.ones(tokens, 6),
+                prequant=(quantized, scale),
+                shared=torch.zeros_like(value))
+            assert torch.equal(result, value)
+    assert calls == [("prefetched-finalize", 1), ("body", 6),
+                     ("prequant-prefetched-finalize", 1),
+                     ("prequant-shared-finalize", 1), ("prequant-body", 2)]
 
 
 def test_fp8_experts_only_run_for_enabled_native_c1(monkeypatch):

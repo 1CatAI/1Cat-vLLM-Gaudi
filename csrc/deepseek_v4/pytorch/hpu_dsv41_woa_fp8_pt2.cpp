@@ -9,6 +9,7 @@ constexpr auto kRoundtripSchema = "custom_op::custom_deepseek_v41_woa_fp8_roundt
 constexpr auto kRopeSchema = "custom_op::custom_deepseek_v41_rope_woa_fp8_gaudi2";
 constexpr auto kRopeRoundtripSchema = "custom_op::custom_deepseek_v41_rope_woa_fp8_roundtrip_gaudi2";
 constexpr auto kQuantSchema = "custom_op::custom_deepseek_v41_woa_quant_gaudi2";
+constexpr auto kRopeQuantSchema = "custom_op::custom_deepseek_v41_rope_woa_quant_gaudi2";
 constexpr auto kQuant = "custom_deepseek_v41_woa_quant_gaudi2";
 constexpr auto kRopeQuant = "custom_deepseek_v41_woa_rope_quant_gaudi2";
 constexpr auto kScale = "custom_deepseek_v41_woa_scale_gaudi2";
@@ -47,6 +48,21 @@ habana::OutputMetaDataVector rope_meta(const at::Stack& stack) {
                     "rope wo_a requires matching contiguous inference tensors");
     }
     return {{at::kBFloat16, {x.size(0), 4096}}};
+}
+habana::OutputMetaDataVector rope_quant_meta(const at::Stack& stack) {
+    const auto x = stack.at(0).toTensor(), positions = stack.at(1).toTensor();
+    const auto phase = stack.at(2).toTensor();
+    TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.dim() == 3 && x.size(0) >= 1 && x.size(0) <= 8192 &&
+                x.size(1) == 32 && x.size(2) == 512, "rope wo_a quant requires BF16 [T,32,512]");
+    TORCH_CHECK(positions.scalar_type() == at::kInt && positions.dim() == 1 && positions.size(0) == x.size(0) &&
+                phase.scalar_type() == at::kFloat && phase.dim() == 2 && phase.size(1) == 64,
+                "rope wo_a quant requires I32 [T] positions and F32 [L,64] phase");
+    for (const auto& item : stack) {
+        const auto t = item.toTensor();
+        TORCH_CHECK(t.is_contiguous() && !t.requires_grad() && t.device() == x.device(),
+                    "rope wo_a quant requires matching contiguous inference tensors");
+    }
+    return {{at::ScalarType::Float8_e4m3fn, {4, x.size(0), 4096}}, {at::kFloat, {4, x.size(0), 1}}};
 }
 class Woa final : public habana::OpBackend {
     bool quant_;
@@ -87,6 +103,21 @@ public:
         syn_out(0) = ReshapeHelper(graph, scaled.at(0).get(), output.at(0).shape, at::kBFloat16, 0);
     }
 };
+class RopeQuant final : public habana::OpBackend {
+public:
+    RopeQuant(int device, c10::ScalarType dtype)
+        : OpBackend(device, NO_TPC + std::string("dsv41_rope_woa_quant"), dtype,
+                    std::vector<int>{0, 1}, {}, {}, false) {
+        SetOutputMetaFn(rope_quant_meta);
+    }
+    void AddNode(synapse_helpers::graph& graph, const at::Stack& stack) override {
+        const auto output = rope_quant_meta(stack);
+        auto result = BuildNode(this, graph, {kRopeQuant, {syn_in(0), syn_in(1), syn_in(2)},
+            {{output.at(0).shape, output.at(0).dtype, 0}, {output.at(1).shape, output.at(1).dtype, 1}}});
+        syn_out(0) = std::move(result.at(0));
+        syn_out(1) = std::move(result.at(1));
+    }
+};
 const bool registered = [] {
     for (bool quant : {false, true}) {
         const auto schema = quant ? kQuantSchema : kSchema;
@@ -121,6 +152,14 @@ const bool registered = [] {
     habana::KernelRegistry().add(kRopeRoundtripSchema, [](synDeviceId device, c10::ScalarType dtype) {
         return std::make_shared<Woa>(device, dtype, false, true, true);
     });
+    habana::custom_op::registerUserCustomOp(kRopeQuantSchema, kRopeQuant, [](const at::Stack& stack) {
+        const auto output = rope_quant_meta(stack);
+        return habana::PartialOutputMetaDataVector{{output.at(0).dtype, output.at(0).shape},
+                                                    {output.at(1).dtype, output.at(1).shape}};
+    }, nullptr);
+    habana::KernelRegistry().add(kRopeQuantSchema, [](synDeviceId device, c10::ScalarType dtype) {
+        return std::make_shared<RopeQuant>(device, dtype);
+    });
     return true;
 }();
 template<bool Meta, bool Roundtrip = false>
@@ -151,6 +190,15 @@ at::Tensor rope_run(const at::Tensor& x, const at::Tensor& w, const at::Tensor& 
         Roundtrip ? kRopeRoundtripSchema : kRopeSchema);
     return descriptor.execute({x,w,s,positions,phase}).at(0);
 }
+template<bool Meta> Pair rope_quant(const at::Tensor& x, const at::Tensor& positions, const at::Tensor& phase) {
+    const auto output = rope_quant_meta({x, positions, phase});
+    if (Meta) return {at::empty(output.at(0).shape, x.options().dtype(at::ScalarType::Float8_e4m3fn)),
+                      at::empty(output.at(1).shape, x.options().dtype(at::kFloat))};
+    TORCH_CHECK(registered && x.device().type() == at::kHPU);
+    auto descriptor = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(kRopeQuantSchema);
+    auto result = descriptor.execute({x, positions, phase});
+    return {result.at(0), result.at(1)};
+}
 }
 TORCH_LIBRARY_FRAGMENT(custom_op, m) {
     m.def("custom_deepseek_v41_woa_fp8_gaudi2(Tensor input, Tensor weight, Tensor channel_scale) -> Tensor");
@@ -158,6 +206,7 @@ TORCH_LIBRARY_FRAGMENT(custom_op, m) {
     m.def("custom_deepseek_v41_rope_woa_fp8_gaudi2(Tensor input, Tensor weight, Tensor channel_scale, Tensor positions, Tensor phase) -> Tensor");
     m.def("custom_deepseek_v41_rope_woa_fp8_roundtrip_gaudi2(Tensor input, Tensor weight, Tensor channel_scale, Tensor positions, Tensor phase) -> Tensor");
     m.def("custom_deepseek_v41_woa_quant_gaudi2(Tensor input) -> (Tensor, Tensor)");
+    m.def("custom_deepseek_v41_rope_woa_quant_gaudi2(Tensor input, Tensor positions, Tensor phase) -> (Tensor, Tensor)");
 }
 TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
     m.impl("custom_deepseek_v41_woa_fp8_gaudi2", run<false, false>);
@@ -165,6 +214,7 @@ TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
     m.impl("custom_deepseek_v41_rope_woa_fp8_gaudi2", rope_run<false, false>);
     m.impl("custom_deepseek_v41_rope_woa_fp8_roundtrip_gaudi2", rope_run<false, true>);
     m.impl("custom_deepseek_v41_woa_quant_gaudi2", quant<false>);
+    m.impl("custom_deepseek_v41_rope_woa_quant_gaudi2", rope_quant<false>);
 }
 TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
     m.impl("custom_deepseek_v41_woa_fp8_gaudi2", run<true, false>);
@@ -172,4 +222,5 @@ TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
     m.impl("custom_deepseek_v41_rope_woa_fp8_gaudi2", rope_run<true, false>);
     m.impl("custom_deepseek_v41_rope_woa_fp8_roundtrip_gaudi2", rope_run<true, true>);
     m.impl("custom_deepseek_v41_woa_quant_gaudi2", quant<true>);
+    m.impl("custom_deepseek_v41_rope_woa_quant_gaudi2", rope_quant<true>);
 }

@@ -52,6 +52,7 @@ template<bool Meta> at::Tensor run(const at::Tensor& input, const at::Tensor& we
     auto descriptor = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(kSchema);
     return descriptor.execute({input, weight}).at(0);
 }
+
 }
 
 TORCH_LIBRARY_FRAGMENT(custom_op, m) {

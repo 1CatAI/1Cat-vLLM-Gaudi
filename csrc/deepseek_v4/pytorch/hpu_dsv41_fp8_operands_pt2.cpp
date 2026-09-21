@@ -20,9 +20,9 @@ habana::OutputMetaDataVector metadata(const at::Stack& stack, bool decode) {
     }
     if (!decode) {
         TORCH_CHECK(source.scalar_type() == at::kBFloat16 && source.dim() == 2 &&
-                    (source.size(0) == 1 || source.size(0) == 6) && source.size(1) >= 256 &&
+                    source.size(0) >= 1 && source.size(0) <= 49152 && source.size(1) >= 256 &&
                     source.size(1) <= 5120 && source.size(1) % 128 == 0,
-                    "V4.1 dynamic quantization requires one or six BF16 rows and K128");
+                    "V4.1 dynamic quantization requires 1..49152 BF16 rows and K128");
         return {{at::ScalarType::Float8_e4m3fn, source.sizes().vec()}, {at::kFloat, {source.size(0), 1}}};
     }
     const auto q = stack.at(1).toTensor(), s = stack.at(2).toTensor();

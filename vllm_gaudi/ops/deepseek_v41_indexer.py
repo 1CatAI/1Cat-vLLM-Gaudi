@@ -10,15 +10,20 @@ import torch
 INDEX_MME_HOT_TOKENS = 2560
 
 
-def _mme_hot_scores(query, weights, decoded_keys, positions):
-    """Reproduce the checkpoint's two BF16 TP-shard sum boundaries on MME."""
+def _mme_hot_scores(query, weights, decoded_keys, positions, ratio):
+    """Reproduce the checkpoint's two BF16 TP-shard sum boundaries on MME.
+
+    ``decoded_keys`` follows the compressed row geometry, so ratio-2 Full
+    layers execute half as many MME columns as ratio-1 layers while retaining
+    the same token-valued visibility boundary in the native reducer.
+    """
     raw_scores = torch.einsum("bhd,nd->bhn", query, decoded_keys).contiguous()
     # Keep the large dot product on MME and fuse the following ReLU, per-head
     # weight, and the two checkpoint BF16 shard boundaries into one TPC pass.
     # The native reducer also writes -inf past the device-valued visible row,
     # avoiding all generic reduction intermediates without changing selection.
     return torch.ops.custom_op.custom_deepseek_v41_index_reduce_bf16_gaudi2(
-        raw_scores, weights, positions, 1)
+        raw_scores, weights, positions, ratio)
 
 
 def runtime_index_select(query, weights, cache, pages, positions, candidates, *, ratio, capacity,
@@ -38,13 +43,14 @@ def runtime_index_select(query, weights, cache, pages, positions, candidates, *,
         scores, block_scores = ops.custom_deepseek_v41_index_scores_gaudi2(
             query, weights, cache, pages, positions, candidates, ratio, int(reindex), columns)
     else:
-        if (ratio != 1 or decoded_hot.dtype != torch.bfloat16 or decoded_hot.ndim != 2
-                or decoded_hot.shape != (INDEX_MME_HOT_TOKENS, 128)):
-            raise ValueError("MME index hot cache requires the fixed ratio-1 BF16 geometry")
-        scores = _mme_hot_scores(query, weights, decoded_hot, positions)
+        hot_rows = INDEX_MME_HOT_TOKENS // ratio
+        if (decoded_hot.dtype != torch.bfloat16 or decoded_hot.ndim != 2
+                or decoded_hot.shape != (hot_rows, 128)):
+            raise ValueError("MME index hot cache requires the fixed ratio-aware BF16 geometry")
+        scores = _mme_hot_scores(query, weights, decoded_hot, positions, ratio)
         # Below 16K every visible block survives the candidate publication.
         # Its device-valued direct branch does not read these placeholders.
-        block_scores = torch.empty((query.shape[0], INDEX_MME_HOT_TOKENS // 8),
+        block_scores = torch.empty((query.shape[0], hot_rows // 8),
                                    dtype=torch.float32,
                                    device=query.device)
     # The decoded hot bucket is a causal prefix shorter than 16K rows.  The

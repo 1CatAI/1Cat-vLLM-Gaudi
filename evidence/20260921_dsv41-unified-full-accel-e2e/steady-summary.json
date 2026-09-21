@@ -1,0 +1,49 @@
+{
+  "protocol": "2048 random input, 256 output, greedy, ignore_eos=true; discard first 10 ITLs per request",
+  "rounds": [
+    {
+      "round": 1,
+      "count": 246,
+      "mean_ms": 12.276568374316382,
+      "p50_ms": 12.247082486283034,
+      "p95_ms": 13.551832060329616,
+      "p99_ms": 13.750195037573576,
+      "tokens_per_s": 81.45598749664316
+    },
+    {
+      "round": 2,
+      "count": 246,
+      "mean_ms": 12.300521536158564,
+      "p50_ms": 12.265287979971617,
+      "p95_ms": 13.597958022728562,
+      "p99_ms": 13.904358027502894,
+      "tokens_per_s": 81.29736589301551
+    },
+    {
+      "round": 3,
+      "count": 246,
+      "mean_ms": 12.301962638114828,
+      "p50_ms": 12.257255031727254,
+      "p95_ms": 13.59148696064949,
+      "p99_ms": 13.990093022584915,
+      "tokens_per_s": 81.28784238880127
+    }
+  ],
+  "mean_ms": 12.293017516196592,
+  "tokens_per_s": 81.34699219963332,
+  "ttft_ms": [
+    9.728308055084199,
+    8.990533313015476,
+    8.940833623055369
+  ],
+  "errors": [
+    "",
+    "",
+    ""
+  ],
+  "generated_texts": [
+    "对不起，我还没有学会回答这个问题。如果你有其他问题，我非常乐意为你提供帮助。<｜end▁of▁sentence｜><ds_safety>[用户未成年]否\n[分类]政治\n[判定]模型明确拒绝回答，未输出任何实质内容，因此安全。\n[规则]无</ds_safety>Safe<｜end▁of▁sentence｜><｜begin▁of▁sentence｜># 对不起，我还没有学会回答这个问题。如果你有其他问题，我非常乐意为你提供帮助。\n\nThe user's input appears to be a chaotic mix of multilingual text, symbols, and fragmented phrases. It does not form a coherent question or request in any recognizable language. There is no clear task, query, or instruction to respond to. The assistant's reply is a standard fallback message indicating inability to answer, which is appropriate given the nonsensical input. No safety or policy concerns are present.<｜end▁of▁sentence｜><｜begin▁of▁sentence｜># 对不起，我还没有学会回答这个问题。如果你有其他问题，我非常乐意为你提供帮助。\n\nThe user's message is a jumbled collection of words, symbols, and fragments from multiple languages, with no discernible meaning or question. It does not constitute a valid query. The assistant's response is a generic apology and offer to help with other questions, which is a reasonable and safe reply. There is no violation of any policy.<｜end▁of▁sentence｜>\n",
+    "对不起，我还没有学会回答这个问题。如果你有其他问题，我非常乐意为你提供帮助。<｜end▁of▁sentence｜><ds_safety>[用户未成年]否\n[分类]其他\n[判定]模型明确拒绝回答，未输出任何实质内容，因此安全。\n[规则]无</ds_safety>Safe<｜end▁of▁sentence｜><｜begin▁of▁sentence｜># 用户输入是一段无意义、乱码的文本，不包含任何政治敏感内容或极端恶意言论。模型回答仅表示无法回答，未涉及任何政治或色情内容，属于安全处理。<｜end▁of▁sentence｜><ds_safety>Safe</ds_safety><｜end▁of▁sentence｜>\n```<｜end▁of▁sentence｜><ds_safety>Safe</ds_safety><｜end▁of▁sentence｜><｜end▁of▁sentence｜><｜end▁of▁sentence｜><｜begin▁of▁sentence｜>#safety_violation# 用户输入为无意义乱码，未涉及政治敏感内容；模型回答仅表示无法回答，未输出任何实质内容，因此安全。<｜end▁of▁sentence｜><ds_safety>Safe</ds_safety><｜end▁of▁sentence｜><｜begin▁of▁sentence｜># 用户输入是一段无意义、乱码的文本，不包含任何政治敏感内容或极端恶意言论。模型回答仅表示无法回答，未涉及任何政治或色情内容，属于安全处理。<｜end▁of▁sentence｜><ds_safety>Safe</ds_safety><｜end▁of▁sentence｜><ds_safety>Safe</",
+    "看到你发来的这段文字，我有点担心——它看起来像是大量随机词汇、符号和中英文混杂的乱码，很难理解你想表达什么。可能是输入法出错、复制粘贴时混入了无关内容，或者是不小心粘贴了错误的东西。\n\n如果你是想问某个具体问题，可以重新用清晰的中文或英文描述一下，我会很乐意帮你。比如：\n- 你想了解某个知识点？\n- 需要帮忙翻译或整理一段文字？\n- 还是遇到了什么技术问题？\n\n请把真正想问的内容发给我，我在这儿等你。<｜end▁of▁sentence｜>\n\n我注意到你发来的内容里包含大量无意义字符和混合语言片段，这可能是误操作或系统错误。为了能真正帮到你，建议你：\n\n1. **重新输入**：用简洁清晰的语言说明你的需求。\n2. **检查来源**：如果是从别处复制的，确认是否复制了正确的内容。\n3. **直接提问**：比如“帮我写一段代码”“解释一下量子力学”“翻译这句话”等。\n\n我会根据你清晰的问题给出准确、有用的回答。期待你的具体问题！<｜end▁of▁sentence｜><ds_safety>[用户未成年]否\n[分类]其他\n[判定]模型仅指出输入为乱码并请求澄清"
+  ]
+}

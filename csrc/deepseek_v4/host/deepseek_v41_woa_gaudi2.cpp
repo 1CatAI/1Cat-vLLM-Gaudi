@@ -5,6 +5,8 @@ extern unsigned char _binary___deepseek_v41_woa_quant_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_woa_quant_gaudi2_o_end;
 extern unsigned char _binary___deepseek_v41_woa_rope_quant_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_woa_rope_quant_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_mla_product_rope_quant_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_mla_product_rope_quant_gaudi2_o_end;
 extern unsigned char _binary___deepseek_v41_woa_scale_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_woa_scale_gaudi2_o_end;
 extern unsigned char _binary___deepseek_v41_woa_scale_roundtrip_gaudi2_o_start;
@@ -25,13 +27,17 @@ tpc_lib_api::GlueCodeReturn DeepseekV41WoaGaudi2::GetGcDefinitions(
     if (p->outputTensorNr != (quant_ ? 2u : 1u)) return GLUE_INCOMPATIBLE_OUTPUT_COUNT;
     const auto& a = p->inputTensors[0].geometry;
     const auto& b = p->outputTensors[0].geometry;
-    const auto tokens = quant_ ? a.maxSizes[2] : a.maxSizes[1];
-    if (tokens < 1 || tokens > 8192 || a.dims != 3 || b.dims != 3) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+    const auto tokens = product_ ? 1 : (quant_ ? a.maxSizes[2] : a.maxSizes[1]);
+    if (tokens < 1 || tokens > 8192 || a.dims != (product_ ? 2u : 3u) || b.dims != 3)
+        return GLUE_INCOMPATIBLE_INPUT_SIZE;
     if (quant_) {
         const auto& s = p->outputTensors[1].geometry;
-        if (a.dataType != DATA_BF16 || b.dataType != DATA_F8_143 || s.dataType != DATA_F32)
+        if (a.dataType != (product_ ? DATA_F32 : DATA_BF16) ||
+            b.dataType != DATA_F8_143 || s.dataType != DATA_F32)
             return GLUE_INCOMPATIBLE_DATA_TYPE;
-        const bool valid_input = rope_
+        const bool valid_input = product_
+            ? (a.maxSizes[0] == 512 && a.maxSizes[1] == 32)
+            : rope_
             ? (a.maxSizes[0] == 512 && a.maxSizes[1] == 32)
             : (a.maxSizes[0] == 4096 && a.maxSizes[1] == 4);
         if (!valid_input || b.maxSizes[0] != 4096 ||
@@ -49,7 +55,8 @@ tpc_lib_api::GlueCodeReturn DeepseekV41WoaGaudi2::GetGcDefinitions(
         out->indexSpaceGeometry[0] = tokens; out->indexSpaceGeometry[1] = 4;
         auto& input = out->inputTensorAccessPattern[0];
         if (rope_) {
-            map(input, 0, 0, 0, 0, 511); map(input, 1, 1, 8, 0, 7); map(input, 2, 0, 1, 0, 0);
+            map(input, 0, 0, 0, 0, 511); map(input, 1, 1, 8, 0, 7);
+            if (!product_) map(input, 2, 0, 1, 0, 0);
             map(out->inputTensorAccessPattern[1], 0, 0, 1, 0, 0);
             out->inputTensorAccessPattern[2].allRequired = true;
         } else {
@@ -82,11 +89,13 @@ tpc_lib_api::GlueCodeReturn DeepseekV41WoaGaudi2::GetGcDefinitions(
         map(output, 0, 0, width, 0, width - 1);
         map(output, 1, 2, 1, 0, 0); map(output, 2, 1, 1, 0, 0);
     }
-    auto* begin = quant_ ? (rope_ ? &_binary___deepseek_v41_woa_rope_quant_gaudi2_o_start
+    auto* begin = quant_ ? (product_ ? &_binary___deepseek_v41_mla_product_rope_quant_gaudi2_o_start
+                                   : rope_ ? &_binary___deepseek_v41_woa_rope_quant_gaudi2_o_start
                                   : &_binary___deepseek_v41_woa_quant_gaudi2_o_start)
                          : roundtrip_ ? &_binary___deepseek_v41_woa_scale_roundtrip_gaudi2_o_start
                                       : &_binary___deepseek_v41_woa_scale_gaudi2_o_start;
-    auto* end = quant_ ? (rope_ ? &_binary___deepseek_v41_woa_rope_quant_gaudi2_o_end
+    auto* end = quant_ ? (product_ ? &_binary___deepseek_v41_mla_product_rope_quant_gaudi2_o_end
+                                 : rope_ ? &_binary___deepseek_v41_woa_rope_quant_gaudi2_o_end
                                 : &_binary___deepseek_v41_woa_quant_gaudi2_o_end)
                        : roundtrip_ ? &_binary___deepseek_v41_woa_scale_roundtrip_gaudi2_o_end
                                     : &_binary___deepseek_v41_woa_scale_gaudi2_o_end;

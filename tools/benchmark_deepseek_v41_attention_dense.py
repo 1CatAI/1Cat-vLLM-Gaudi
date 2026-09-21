@@ -60,7 +60,8 @@ def program(fp8, diagnostics=False, kv_first=False, fused_norm=False):
 
 
 def production_program(fused_rope_woa=False, diagnostics=False, fused_qnorm=False,
-                       fused_kvnorm=False):
+                       fused_kvnorm=False, bf16_pv=False, fused_mla_woa=False,
+                       fused_mla_woa_wob=False):
     """Mirror the qualified paged C1 Attention projection/MLA chain.
 
     The older comparison program intentionally keeps its historical split
@@ -98,9 +99,26 @@ def production_program(fused_rope_woa=False, diagnostics=False, fused_qnorm=Fals
             packed, kv, position, swa, 0)
         ids, lengths = torch.ops.custom_op.custom_deepseek_v41_c1_indices_i32_gaudi2(
             position, compressed, ratio)
-        output = torch.ops.custom_op.custom_deepseek_v41_mla_mme_gaudi2(
-            q, swa, main, ids, sink, scale, lengths, done, done, 0, rows, 512)
-        if fused_rope_woa:
+        if fused_mla_woa_wob:
+            output = torch.ops.custom_op.custom_deepseek_v41_mla_woa_wob_fp8_roundtrip_gaudi2(
+                q, swa, main, ids, sink, scale, lengths, done, done,
+                0, rows, 512, woa, woa_scale, position, forward, wob,
+                wob_scale)
+        elif fused_mla_woa:
+            output = torch.ops.custom_op.custom_deepseek_v41_mla_woa_fp8_roundtrip_gaudi2(
+                q, swa, main, ids, sink, scale, lengths, done, done,
+                0, rows, 512, woa, woa_scale, position, forward)
+        else:
+            mla = (torch.ops.custom_op.custom_deepseek_v41_mla_bf16_pv_gaudi2
+                   if bf16_pv else
+                   torch.ops.custom_op.custom_deepseek_v41_mla_mme_gaudi2)
+            output = mla(q, swa, main, ids, sink, scale, lengths, done, done,
+                         0, rows, 512)
+        if fused_mla_woa_wob:
+            return output
+        if fused_mla_woa:
+            pass
+        elif fused_rope_woa:
             output = torch.ops.custom_op.custom_deepseek_v41_rope_woa_fp8_roundtrip_gaudi2(
                 output, woa, woa_scale, position, forward)
         else:
@@ -172,26 +190,70 @@ def main():
                         help="Compare production with exact QNorm/dynamic-quant fusion")
     parser.add_argument("--compare-production-kvnorm", action="store_true",
                         help="Compare production with exact KVNorm/forward-RoPE fusion")
+    parser.add_argument("--compare-production-bf16-pv", action="store_true",
+                        help="Compare production FP32 PV against shared-KV BF16 PV through wo_b")
+    parser.add_argument("--compare-production-mla-woa", action="store_true",
+                        help="Compare production with FP32-PV/BF16-boundary/inverse-RoPE/wo_a fusion")
+    parser.add_argument("--compare-production-mla-woa-wob", action="store_true",
+                        help="Compare retained Attention compounds with an exact internal wo_a to wo_b handoff")
+    parser.add_argument("--compare-production-combined", action="store_true",
+                        help="Compare retained KVNorm production with exact QNorm and MLA/wo_a fusions")
     parser.add_argument("--diagnostic-input", type=Path)
     parser.add_argument("--profile-only", action="store_true")
     args = parser.parse_args()
     if args.production_parity and (args.include_reference or args.candidate_bf16 or args.compare_kv_order
                                    or args.compare_production_rope_woa or args.compare_production_qnorm
                                    or args.compare_production_kvnorm
+                                   or args.compare_production_bf16_pv
+                                   or args.compare_production_mla_woa
+                                   or args.compare_production_mla_woa_wob
+                                   or args.compare_production_combined
                                    or args.diagnostic_input):
         parser.error("--production-parity is a candidate-only mode")
     if args.compare_production_rope_woa and (args.include_reference or args.candidate_bf16
                                              or args.compare_kv_order or args.compare_production_qnorm
                                              or args.compare_production_kvnorm
+                                             or args.compare_production_bf16_pv
+                                             or args.compare_production_mla_woa
+                                             or args.compare_production_mla_woa_wob
+                                             or args.compare_production_combined
                                              or args.diagnostic_input):
         parser.error("--compare-production-rope-woa cannot be combined with historical comparison modes")
     if args.compare_production_qnorm and (args.include_reference or args.candidate_bf16
                                           or args.compare_kv_order or args.compare_production_kvnorm
+                                          or args.compare_production_bf16_pv
+                                          or args.compare_production_mla_woa
+                                          or args.compare_production_mla_woa_wob
+                                          or args.compare_production_combined
                                           or args.diagnostic_input):
         parser.error("--compare-production-qnorm cannot be combined with historical comparison modes")
     if args.compare_production_kvnorm and (args.include_reference or args.candidate_bf16
-                                           or args.compare_kv_order or args.diagnostic_input):
+                                           or args.compare_kv_order or args.compare_production_bf16_pv
+                                           or args.compare_production_mla_woa
+                                           or args.compare_production_mla_woa_wob
+                                           or args.compare_production_combined
+                                           or args.diagnostic_input):
         parser.error("--compare-production-kvnorm cannot be combined with historical comparison modes")
+    if args.compare_production_bf16_pv and (args.include_reference or args.candidate_bf16
+                                            or args.compare_kv_order or args.compare_production_mla_woa
+                                            or args.compare_production_mla_woa_wob
+                                            or args.compare_production_combined
+                                            or args.diagnostic_input):
+        parser.error("--compare-production-bf16-pv cannot be combined with historical comparison modes")
+    if args.compare_production_mla_woa and (args.include_reference or args.candidate_bf16
+                                             or args.compare_kv_order
+                                             or args.compare_production_mla_woa_wob
+                                             or args.compare_production_combined
+                                             or args.diagnostic_input):
+        parser.error("--compare-production-mla-woa cannot be combined with historical comparison modes")
+    if args.compare_production_mla_woa_wob and (args.include_reference or args.candidate_bf16
+                                                 or args.compare_kv_order
+                                                 or args.compare_production_combined
+                                                 or args.diagnostic_input):
+        parser.error("--compare-production-mla-woa-wob cannot be combined with historical comparison modes")
+    if args.compare_production_combined and (args.include_reference or args.candidate_bf16
+                                              or args.compare_kv_order or args.diagnostic_input):
+        parser.error("--compare-production-combined cannot be combined with historical comparison modes")
     candidate_fp8 = not args.candidate_bf16
     output = Path(os.environ["DSV41_RUN_EVIDENCE"])
     torch.ops.load_library(os.environ["VLLM_HPU_DSV4_TPC_OP_LIBRARY"])
@@ -230,7 +292,10 @@ def main():
             o_scale = dense.tensor(prefix + "wo_b.channel_scale", "hpu")
             candidate_weight = dense.tensor if candidate_fp8 else shard.dense
             if (args.production_parity or args.compare_production_rope_woa or
-                    args.compare_production_qnorm or args.compare_production_kvnorm):
+                    args.compare_production_qnorm or args.compare_production_kvnorm or
+                    args.compare_production_bf16_pv or args.compare_production_mla_woa or
+                    args.compare_production_mla_woa_wob or
+                    args.compare_production_combined):
                 # Production prepares this immutable matrix once while loading
                 # weights.  Do not leave a concat node or duplicate source
                 # matrices in the timed recipe/weight tuple.
@@ -244,7 +309,10 @@ def main():
                 new.append(tuple(before + [candidate_weight(prefix + "wq_b.weight", "hpu"), q_scale] + common +
                                  [candidate_weight(prefix + "wo_b.weight", "hpu"), o_scale]))
             if (args.production_parity or args.compare_production_rope_woa or
-                    args.compare_production_qnorm or args.compare_production_kvnorm):
+                    args.compare_production_qnorm or args.compare_production_kvnorm or
+                    args.compare_production_bf16_pv or args.compare_production_mla_woa or
+                    args.compare_production_mla_woa_wob or
+                    args.compare_production_combined):
                 pass
             elif args.compare_kv_order:
                 old.append(new[-1])
@@ -356,6 +424,124 @@ def main():
             (output / "cross-arm-check.json").write_text(json.dumps(cross_arm_exact, indent=2) + "\n")
             if not cross_arm_exact["bitwise_equal"]:
                 raise AssertionError(("production KVNorm/RoPE fusion changed output", stages))
+        elif args.compare_production_mla_woa:
+            reference = production_program()
+            candidate = production_program(fused_mla_woa=True)
+            diagnostic_reference = production_program(diagnostics=True)
+            diagnostic_candidate = production_program(diagnostics=True, fused_mla_woa=True)
+            stages = [{"stage": stage, "different": 0, "maximum_absolute_difference": 0.0}
+                      for stage in ("q", "kv", "wo_a", "wo_b")]
+            for value, old_weight, new_weight in zip(inputs, old, new, strict=True):
+                expected = tuple(x.cpu() for x in diagnostic_reference(value, *old_weight))
+                actual = tuple(x.cpu() for x in diagnostic_candidate(value, *new_weight))
+                for stage, wanted, got in zip(stages, expected, actual, strict=True):
+                    delta = (got.float() - wanted.float()).abs()
+                    stage["different"] += int((got != wanted).sum())
+                    stage["maximum_absolute_difference"] = max(
+                        stage["maximum_absolute_difference"], float(delta.max()))
+            cross_arm_exact = {"layers": len(inputs), "stages": stages,
+                               "bitwise_equal": all(not stage["different"] for stage in stages)}
+            (output / "cross-arm-check.json").write_text(json.dumps(cross_arm_exact, indent=2) + "\n")
+            if not cross_arm_exact["bitwise_equal"]:
+                raise AssertionError(("production MLA/wo_a fusion changed output", stages))
+        elif args.compare_production_mla_woa_wob:
+            # Compare against the already-qualified QNorm/KVNorm/MLA-wo_a
+            # compounds so this measurement isolates only the internal BF16
+            # wo_a -> dense quant -> wo_b handoff.
+            reference = production_program(fused_qnorm=True,
+                                           fused_kvnorm=True,
+                                           fused_mla_woa=True)
+            candidate = production_program(fused_qnorm=True,
+                                           fused_kvnorm=True,
+                                           fused_mla_woa_wob=True)
+            different = 0
+            maximum = 0.0
+            for value, old_weight, new_weight in zip(inputs, old, new,
+                                                      strict=True):
+                expected = reference(value, *old_weight).cpu()
+                actual = candidate(value, *new_weight).cpu()
+                delta = (actual.float() - expected.float()).abs()
+                different += int((actual != expected).sum())
+                maximum = max(maximum, float(delta.max()))
+            cross_arm_exact = {
+                "layers": len(inputs),
+                "stages": [{
+                    "stage": "wo_b",
+                    "different": different,
+                    "maximum_absolute_difference": maximum,
+                }],
+                "bitwise_equal": different == 0,
+            }
+            (output / "cross-arm-check.json").write_text(
+                json.dumps(cross_arm_exact, indent=2) + "\n")
+            if different:
+                raise AssertionError(("internal wo_a/wo_b handoff changed output",
+                                      cross_arm_exact))
+        elif args.compare_production_combined:
+            # KVNorm/RoPE is already part of the V2 parent. Measure the two
+            # newly connected exact producers together at their real first
+            # downstream consumer rather than adding separate micro results.
+            reference = production_program(fused_kvnorm=True)
+            candidate = production_program(fused_qnorm=True,
+                                           fused_kvnorm=True,
+                                           fused_mla_woa=True)
+            diagnostic_reference = production_program(diagnostics=True,
+                                                      fused_kvnorm=True)
+            diagnostic_candidate = production_program(diagnostics=True,
+                                                      fused_qnorm=True,
+                                                      fused_kvnorm=True,
+                                                      fused_mla_woa=True)
+            stages = [{"stage": stage, "different": 0,
+                       "maximum_absolute_difference": 0.0}
+                      for stage in ("q", "kv", "wo_a", "wo_b")]
+            for value, old_weight, new_weight in zip(inputs, old, new, strict=True):
+                expected = tuple(x.cpu() for x in diagnostic_reference(value, *old_weight))
+                actual = tuple(x.cpu() for x in diagnostic_candidate(value, *new_weight))
+                for stage, wanted, got in zip(stages, expected, actual, strict=True):
+                    delta = (got.float() - wanted.float()).abs()
+                    stage["different"] += int((got != wanted).sum())
+                    stage["maximum_absolute_difference"] = max(
+                        stage["maximum_absolute_difference"], float(delta.max()))
+            cross_arm_exact = {"layers": len(inputs), "stages": stages,
+                               "bitwise_equal": all(not stage["different"] for stage in stages)}
+            (output / "cross-arm-check.json").write_text(
+                json.dumps(cross_arm_exact, indent=2) + "\n")
+            if not cross_arm_exact["bitwise_equal"]:
+                raise AssertionError(("combined exact Attention fusions changed output", stages))
+        elif args.compare_production_bf16_pv:
+            reference = production_program()
+            candidate = production_program(bf16_pv=True)
+            diagnostic_reference = production_program(diagnostics=True)
+            diagnostic_candidate = production_program(diagnostics=True, bf16_pv=True)
+            stage_names = ("q", "kv", "wo_a", "wo_b")
+            stages = [{"stage": stage, "different": 0,
+                       "maximum_absolute_difference": 0.0,
+                       "sum_squared_error": 0.0, "elements": 0}
+                      for stage in stage_names]
+            for value, old_weight, new_weight in zip(inputs, old, new, strict=True):
+                expected = tuple(x.cpu() for x in diagnostic_reference(value, *old_weight))
+                actual = tuple(x.cpu() for x in diagnostic_candidate(value, *new_weight))
+                for stage, wanted, got in zip(stages, expected, actual, strict=True):
+                    if not bool(got.isfinite().all()):
+                        raise AssertionError(("BF16 PV produced non-finite output", stage["stage"]))
+                    delta = got.float() - wanted.float()
+                    stage["different"] += int((got != wanted).sum())
+                    stage["maximum_absolute_difference"] = max(
+                        stage["maximum_absolute_difference"], float(delta.abs().max()))
+                    stage["sum_squared_error"] += float(delta.square().sum())
+                    stage["elements"] += delta.numel()
+            for stage in stages:
+                stage["rmse"] = (stage.pop("sum_squared_error") /
+                                  stage["elements"])**0.5
+            cross_arm_exact = {
+                "layers": len(inputs),
+                "stages": stages,
+                "bitwise_equal": all(not stage["different"] for stage in stages),
+                "expected_numeric_change": True,
+                "quality_not_qualified": True,
+            }
+            (output / "cross-arm-check.json").write_text(
+                json.dumps(cross_arm_exact, indent=2) + "\n")
         elif args.compare_kv_order:
             reference = program(True, kv_first=False, fused_norm=fused_norm)
             candidate = program(True, kv_first=True, fused_norm=fused_norm)
@@ -369,12 +555,20 @@ def main():
                            args.production_parity or (False if (args.compare_kv_order or
                                                                args.compare_production_rope_woa or
                                                                args.compare_production_qnorm or
-                                                               args.compare_production_kvnorm)
+                                                               args.compare_production_kvnorm or
+                                                               args.compare_production_bf16_pv or
+                                                               args.compare_production_mla_woa or
+                                                               args.compare_production_mla_woa_wob or
+                                                               args.compare_production_combined)
                                                        else not args.include_reference),
                            ordinary_validator=(None if (args.production_parity or
                                                         args.compare_production_rope_woa or
                                                         args.compare_production_qnorm or
-                                                        args.compare_production_kvnorm) else
+                                                        args.compare_production_kvnorm or
+                                                        args.compare_production_bf16_pv or
+                                                        args.compare_production_mla_woa or
+                                                        args.compare_production_mla_woa_wob or
+                                                        args.compare_production_combined) else
                                                partial(validate_terminal_mme,
                                                        candidate_fp8=candidate_fp8,
                                                        force_fp8=args.compare_kv_order,
@@ -387,6 +581,10 @@ def main():
         result["compare_production_rope_woa"] = args.compare_production_rope_woa
         result["compare_production_qnorm"] = args.compare_production_qnorm
         result["compare_production_kvnorm"] = args.compare_production_kvnorm
+        result["compare_production_bf16_pv"] = args.compare_production_bf16_pv
+        result["compare_production_mla_woa"] = args.compare_production_mla_woa
+        result["compare_production_mla_woa_wob"] = args.compare_production_mla_woa_wob
+        result["compare_production_combined"] = args.compare_production_combined
         if cross_arm_exact is not None:
             result["cross_arm_exact"] = cross_arm_exact
         result["state_scope"] = ("real Q/KV input projections/norms, SWA writer, C1 indices, shared-KV MME MLA, "

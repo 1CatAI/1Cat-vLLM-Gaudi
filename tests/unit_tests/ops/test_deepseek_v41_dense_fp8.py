@@ -60,6 +60,41 @@ def test_precision_and_loading(monkeypatch):
     assert tree.layers.get_submodule("0").attn.wo_b.dense_fp8
 
 
+def test_engram_loading_bypasses_bf16_expansion_only_for_selected_weights(monkeypatch):
+    import torch
+    from vllm_gaudi import envs
+    from vllm_gaudi.models.deepseek_v41_program import _weight_tree, load_weight_tree
+
+    monkeypatch.setattr(envs, "VLLM_HPU_DSV41_BF16_LM_HEAD", False)
+    specs = {
+        f"layers.{layer}.engram.wkv.weight": {
+            "dtype": "F8_E4M3",
+            "shape": [8, 4]
+        }
+        for layer in (1, 14, 20)
+    }
+    calls = []
+
+    def dense(name, device):
+        calls.append(name)
+        return torch.empty(8, 4, dtype=torch.bfloat16)
+
+    def prepared(name, device):
+        if name.endswith("channel_scale"):
+            return torch.ones(1, 8)
+        return torch.empty(8, 4, dtype=torch.float8_e4m3fn)
+
+    tree = _weight_tree(specs)
+    shard = SimpleNamespace(specs=specs, dense=dense, check_identity=lambda: None)
+    load_weight_tree(shard, tree, "cpu", engram_sidecar=SimpleNamespace(tensor=prepared))
+    assert calls == ["layers.20.engram.wkv.weight"]
+    for layer in (1, 14):
+        projection = tree.layers.get_submodule(str(layer)).engram.wkv
+        assert projection.weight.dtype == torch.float8_e4m3fn
+        assert projection.channel_scale.shape == (1, 8)
+        assert projection.dense_fp8
+
+
 @pytest.mark.skipif(os.environ.get("DSV41_TEST_HPU") != "1", reason="Requires explicit HPU lease")
 @pytest.mark.parametrize("k,n", [(1280, 16384), (4096, 5120)])
 def test_device_encoding_projection_and_changing_input(k, n):

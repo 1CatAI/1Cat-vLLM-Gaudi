@@ -15,6 +15,7 @@ _PROFILE_KEYS = set(_C1_FASTPATH_DEFAULTS) | set(_NUMERIC_FASTPATH_DEFAULTS) | {
     "VLLM_HPU_DSV41_DSPARK",
     "VLLM_HPU_DSV41_WO_A_FP8_SIDECAR",
     "VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR",
+    "VLLM_HPU_DSV41_ENGRAM_FP8_SIDECAR",
 }
 
 
@@ -34,7 +35,7 @@ def _clear_profile(monkeypatch):
 
 def test_default_profile_enables_qualified_numeric_bundle(monkeypatch, tmp_path):
     _clear_profile(monkeypatch)
-    for sidecar in ("wo_a_fp8", "attention_dense_fp8"):
+    for sidecar in ("wo_a_fp8", "attention_dense_fp8", "engram_fp8"):
         (tmp_path / "sidecars" / sidecar).mkdir(parents=True)
 
     prepare_default_fastpaths(tmp_path)
@@ -46,6 +47,8 @@ def test_default_profile_enables_qualified_numeric_bundle(monkeypatch, tmp_path)
         (tmp_path / "sidecars" / "wo_a_fp8").resolve())
     assert os.environ["VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR"] == str(
         (tmp_path / "sidecars" / "attention_dense_fp8").resolve())
+    assert os.environ["VLLM_HPU_DSV41_ENGRAM_FP8_SIDECAR"] == str(
+        (tmp_path / "sidecars" / "engram_fp8").resolve())
 
 
 def test_numeric_profile_can_be_disabled_without_sidecars(monkeypatch, tmp_path):
@@ -58,13 +61,14 @@ def test_numeric_profile_can_be_disabled_without_sidecars(monkeypatch, tmp_path)
     assert not any(key in os.environ for key in _NUMERIC_FASTPATH_DEFAULTS)
     assert "VLLM_HPU_DSV41_WO_A_FP8_SIDECAR" not in os.environ
     assert "VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR" not in os.environ
+    assert "VLLM_HPU_DSV41_ENGRAM_FP8_SIDECAR" not in os.environ
 
 
 def test_experimental_numeric_bundle_discovers_sidecars(monkeypatch, tmp_path):
     _clear_profile(monkeypatch)
     monkeypatch.setenv("VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS", "1")
     model = tmp_path / "prepared"
-    for sidecar in ("wo_a_fp8", "attention_dense_fp8"):
+    for sidecar in ("wo_a_fp8", "attention_dense_fp8", "engram_fp8"):
         (model / "sidecars" / sidecar).mkdir(parents=True)
 
     prepare_default_fastpaths(model)
@@ -73,6 +77,8 @@ def test_experimental_numeric_bundle_discovers_sidecars(monkeypatch, tmp_path):
     assert os.environ["VLLM_HPU_DSV41_WO_A_FP8_SIDECAR"] == str((model / "sidecars" / "wo_a_fp8").resolve())
     assert os.environ["VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR"] == str(
         (model / "sidecars" / "attention_dense_fp8").resolve())
+    assert os.environ["VLLM_HPU_DSV41_ENGRAM_FP8_SIDECAR"] == str(
+        (model / "sidecars" / "engram_fp8").resolve())
 
 
 def test_default_profile_respects_individual_override(monkeypatch, tmp_path):
@@ -80,6 +86,7 @@ def test_default_profile_respects_individual_override(monkeypatch, tmp_path):
     monkeypatch.setenv("VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS", "1")
     monkeypatch.setenv("VLLM_HPU_DSV41_WO_A_FP8", "0")
     (tmp_path / "sidecars" / "attention_dense_fp8").mkdir(parents=True)
+    (tmp_path / "sidecars" / "engram_fp8").mkdir(parents=True)
 
     prepare_default_fastpaths(tmp_path)
 

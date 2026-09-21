@@ -183,14 +183,35 @@ class HPUWorker(WorkerBase):
             self.profiler.start()
             # Keep ownership even if command recapture or audit fails below.
             self._profiler_running = True
-            self._refresh_native_profiler_commands()
+            # Native command pages captured during warmup are executable while
+            # the hardware profiler is active.  Some Synapse builds crash when
+            # profiler start forces those recipes through a second
+            # synLaunchWithExternalEvents capture.  Reusing the immutable
+            # pages preserves the production replay while still allowing the
+            # device profiler to observe their TPC/MME/DMA activity.
+            if os.getenv("VLLM_HPU_PROFILE_REUSE_NATIVE_COMMANDS", "0").lower() \
+                    in ("1", "true"):
+                logger.info("Profiler reusing warm native command pages")
+            else:
+                self._refresh_native_profiler_commands()
             from vllm_gaudi.ops.tp2_runtime_profile import verify_loaded_profile_libraries
             logger.info("Profiler runtime libraries: %s", verify_loaded_profile_libraries())
             if hasattr(self.model_runner, "trace_enabled"):
                 self.model_runner.trace_enabled = True
                 host = self.model_runner.model.engram_host
                 if host is not None:
-                    host.set_profiling(True)
+                    # A decode-only capture may begin after the request's
+                    # prefill has committed an Engram transaction.  Toggling
+                    # the native host-gather timers at that point would mix
+                    # two generations and is intentionally rejected by the
+                    # host owner.  Keep the device/Torch capture usable and
+                    # omit only the host-gather supplement for this request.
+                    if host.pending is None:
+                        host.set_profiling(True)
+                    else:
+                        logger.info(
+                            "Engram host profiling omitted because a request "
+                            "transaction is pending; device events remain active")
             # Graph-local counters belong to the newly created generation.
             # Sampling before retirement made start/stop subtraction invalid.
             self._write_native_decoder_stats("profile-start")
@@ -307,12 +328,31 @@ class HPUWorker(WorkerBase):
                 os.environ["GRAPH_VISUALIZATION_DIR"] = str(graph_dir)
                 os.environ["PT_HPU_GRAPH_DUMP_PREFIX"] = str(graph_dir)
             required_ops = []
+            # Every V4.1 decode stage may own ratio-2 CSA2 source layers.  The
+            # C1 producer uses this exact state-transition kernel by default;
+            # fail before model allocation if a stale native bundle lacks it.
+            required_ops.append(
+                "custom_deepseek_v41_compressor_pair_bf16_gaudi2")
             if os.environ.get("VLLM_HPU_DSV41_WOA_OUTPUT_ROUNDTRIP", "0").lower() in ("1", "true"):
-                required_ops.append("custom_deepseek_v41_woa_fp8_roundtrip_gaudi2")
+                required_ops.extend((
+                    "custom_deepseek_v41_woa_fp8_roundtrip_gaudi2",
+                    "custom_deepseek_v41_mla_woa_wob_fp8_roundtrip_gaudi2",
+                    "custom_deepseek_v41_mla_selected_woa_wob_fp8_roundtrip_gaudi2",
+                ))
             if os.environ.get("VLLM_HPU_DSV41_RUNTIME_INDEXER", "0").lower() in ("1", "true"):
                 required_ops.extend(("custom_deepseek_v41_index_scores_gaudi2",
                                      "custom_deepseek_v41_index_threshold_gaudi2",
                                      "custom_deepseek_v41_index_emit_gaudi2"))
+            if (os.environ.get("VLLM_HPU_DSV41_ATTN_FUSED_NORM", "0").lower() in ("1", "true")
+                    and os.environ.get("VLLM_HPU_DSV41_NATIVE_ROPE", "0").lower() in ("1", "true")):
+                required_ops.append("custom_deepseek_v41_kv_norm_rope_bf16_gaudi2")
+            if all(os.environ.get(name, "0").lower() in ("1", "true") for name in (
+                    "VLLM_HPU_DSV41_EXPERT_N256_FP8",
+                    "VLLM_HPU_DSV41_EXPERT_FUSED_QUANT",
+                    "VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE",
+            )):
+                required_ops.append(
+                    "custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_shared_prefetch_w2_fp8_gaudi2")
             load_native_operators(required_ops)
         torch.hpu.set_device(device_index)
         self.device = torch.device("hpu")

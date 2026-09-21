@@ -131,10 +131,13 @@ class PagedCSA2SharedState(nn.Module):
                 cache.register_buffer("index",
                                       torch.zeros(2 * PAGE_TOKENS // ratio, 68, dtype=torch.uint8, device=device),
                                       False)
-                if self.runtime_indexer and ratio == 1:
+                if self.runtime_indexer and ratio in (1, 2):
                     cache.register_buffer(
                         "decoded_index_hot",
-                        torch.zeros(INDEX_MME_HOT_TOKENS, 128, dtype=torch.bfloat16, device=device),
+                        torch.zeros(INDEX_MME_HOT_TOKENS // ratio,
+                                    128,
+                                    dtype=torch.bfloat16,
+                                    device=device),
                         False)
                 if self.decoded_kv_state:
                     # Keep the exact FP4-roundtripped main rows decoded for
@@ -222,8 +225,17 @@ class PagedCSA2SharedState(nn.Module):
 
     def physical_rows(self, rows, ratio):
         width = PAGE_TOKENS // ratio
-        blocks = self.block_table.index_select(0, (rows.flatten() // width).long()).reshape(rows.shape)
-        return blocks * width + rows.remainder(width)
+        if width & (width - 1):
+            raise ValueError("V4.1 paged rows require a power-of-two page width")
+        shift = width.bit_length() - 1
+        # V4.1 uses ratio 1/2 over a 128-token page.  Division and remainder
+        # by these compile-time powers of two were nevertheless lowered to a
+        # generic div_mod TPC launch at every CSA2 source layer.  Preserve the
+        # exact non-negative row mapping with shifts/masks so the state chain
+        # does not pay integer division on each decoded token.
+        blocks = self.block_table.index_select(
+            0, torch.bitwise_right_shift(rows.flatten(), shift).long()).reshape(rows.shape)
+        return blocks * width + torch.bitwise_and(rows, width - 1)
 
 
 class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
@@ -383,17 +395,64 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 self._rotary_native_table()).reshape(-1, self.heads, 512)
         return self._rope(self.linear(value, weight).reshape(-1, self.heads, 512), positions)
 
+    def project_query_input(self, value, positions):
+        """Apply the exact C1 Q norm directly in the FP8 projection producer.
+
+        The normalized query row is otherwise written and reread solely by
+        the dynamic quantizer. Reindex owner layers still materialize it
+        because their index-query projection is a second real consumer.
+        Wider decode batches and prefill retain the batch-generic path.
+        """
+        weight = self.weights.wq_b
+        return torch.ops.custom_op.custom_deepseek_v41_q_norm_projection_rope_gaudi2(
+            value.contiguous(), self.weights.q_norm.weight, weight.weight,
+            weight.channel_scale, positions.to(torch.int32).contiguous(),
+            self._rotary_native_table(), self.eps).reshape(-1, self.heads, 512)
+
+    def project_kv(self, value, positions, *, decode=False):
+        """Normalize and rotate KV without materializing the C1 norm output."""
+        weight = self.weights.kv_norm.weight
+        if decode and self.fused_norm and self.native_rope and value.shape[0] == 1:
+            # KV has no consumer between its BF16 RMSNorm boundary and RoPE.
+            # The compound TPC kernel preserves that boundary bit-for-bit and
+            # feeds the existing cache writer directly.  Wider batches retain
+            # the batch-generic implementation used by prefill and B2+.
+            return torch.ops.custom_op.custom_deepseek_v41_kv_norm_rope_bf16_gaudi2(
+                value.contiguous(), weight, positions.to(torch.int32).contiguous(),
+                self._rotary_native_table(), self.eps)
+        norm = (torch.ops.custom_op.custom_deepseek_v41_attention_norm_bf16_gaudi2
+                if self.fused_norm and value.shape[0] == 1 else rms_norm)
+        return self._rope(norm(value.contiguous(), weight, self.eps), positions)
+
     def _compress(self, value, positions, decoded=False):
         compressor = self.weights.compressor
         if self.ratio == 2:
             kv, score = self._project_compressor_input(value)
-            first = positions - positions.remainder(2)
-            if positions.numel() <= 6:
+            # Positions and all circular capacities are non-negative powers
+            # of two.  The stock `%` expressions emitted a div_mod kernel for
+            # every occurrence, including several copies in each ratio-2
+            # source layer.  Masks are mathematically identical on the full
+            # 1M position domain and keep this preparation inexpensive for
+            # both decode and prefill.
+            first = torch.bitwise_and(positions, -2)
+            if positions.numel() == 1:
+                # The archived decode trace exposes a repeated seven-launch
+                # history/gather/softmax/reduction chain at each ratio-2
+                # source layer.  Keep the same FP32 state and BF16 boundary,
+                # but consume the two rows in registers so the temporary
+                # gathers and probability tensor never reach HBM.  Wider
+                # batches retain the request-slot-safe generic path below.
+                latent = torch.ops.custom_op.custom_deepseek_v41_compressor_pair_bf16_gaudi2(
+                    self.kv_history, self.score_history, kv.contiguous(),
+                    score.contiguous(), positions.to(torch.int32).contiguous())
+            elif positions.numel() <= 6:
                 # Preserve the qualified C1/C6 graph and its exact state
                 # mutation order.
-                self.kv_history.index_copy_(0, positions.remainder(HISTORY_ROWS).long(), kv)
-                self.score_history.index_copy_(0, positions.remainder(HISTORY_ROWS).long(), score)
-                a, b = first.remainder(HISTORY_ROWS).long(), (first + 1).remainder(HISTORY_ROWS).long()
+                ring = torch.bitwise_and(positions, HISTORY_ROWS - 1).long()
+                self.kv_history.index_copy_(0, ring, kv)
+                self.score_history.index_copy_(0, ring, score)
+                a = torch.bitwise_and(first, HISTORY_ROWS - 1).long()
+                b = torch.bitwise_and(first + 1, HISTORY_ROWS - 1).long()
                 gates = torch.stack((self.score_history[a], self.score_history[b]), 1).softmax(1)
                 latent = (self.kv_history[a] * gates[:, 0] + self.kv_history[b] * gates[:, 1]).to(value.dtype)
             else:
@@ -409,10 +468,10 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 current_b = kv.index_select(0, local_b.clamp(0, tokens - 1).long())
                 score_a = score.index_select(0, local_a.clamp(0, tokens - 1).long())
                 score_b = score.index_select(0, local_b.clamp(0, tokens - 1).long())
-                history_a = self.kv_history[first.remainder(HISTORY_ROWS).long()]
-                history_b = self.kv_history[(first + 1).remainder(HISTORY_ROWS).long()]
-                history_score_a = self.score_history[first.remainder(HISTORY_ROWS).long()]
-                history_score_b = self.score_history[(first + 1).remainder(HISTORY_ROWS).long()]
+                history_a = self.kv_history[torch.bitwise_and(first, HISTORY_ROWS - 1).long()]
+                history_b = self.kv_history[torch.bitwise_and(first + 1, HISTORY_ROWS - 1).long()]
+                history_score_a = self.score_history[torch.bitwise_and(first, HISTORY_ROWS - 1).long()]
+                history_score_b = self.score_history[torch.bitwise_and(first + 1, HISTORY_ROWS - 1).long()]
                 pair_a = torch.where(valid_a.unsqueeze(-1), current_a, history_a)
                 pair_b = torch.where(valid_b.unsqueeze(-1), current_b, history_b)
                 pair_score_a = torch.where(valid_a.unsqueeze(-1), score_a, history_score_a)
@@ -420,21 +479,26 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 gates = torch.stack((pair_score_a, pair_score_b), 1).softmax(1)
                 latent = (pair_a * gates[:, 0] + pair_b * gates[:, 1]).to(value.dtype)
                 tail = min(tokens, HISTORY_ROWS)
-                tail_positions = positions[-tail:].remainder(HISTORY_ROWS).long()
+                tail_positions = torch.bitwise_and(positions[-tail:], HISTORY_ROWS - 1).long()
                 self.kv_history.index_copy_(0, tail_positions, kv[-tail:])
                 self.score_history.index_copy_(0, tail_positions, score[-tail:])
         else:
             first, latent = positions, self.linear(value, compressor.wkv)
         latent = rms_norm(latent, compressor.norm.weight, self.eps)
-        rows = positions // self.ratio
-        visible = (positions + 1).remainder(self.ratio) == 0
+        if self.ratio & (self.ratio - 1):
+            raise ValueError("V4.1 compressor ratio must be a power of two")
+        ratio_shift = self.ratio.bit_length() - 1
+        rows = torch.bitwise_right_shift(positions, ratio_shift)
+        visible = (torch.bitwise_and(positions, self.ratio - 1) ==
+                   self.ratio - 1)
         # Incomplete groups use unique rows in the reserved null page.
         slots = torch.where(visible, self.shared.physical_rows(rows, self.ratio),
-                            rows.remainder(PAGE_TOKENS // self.ratio))
+                            torch.bitwise_and(rows,
+                                              PAGE_TOKENS // self.ratio - 1))
         indexer = self.weights.indexer
         index = rms_norm(self.linear(latent, indexer.wk), indexer.k_norm.weight, self.eps)
         index, latent = self._rope(index, first), self._rope(latent, first)
-        if (self.runtime_indexer and self.ratio == 1
+        if (self.runtime_indexer and self.ratio in (1, 2)
                 # The <=512 static bucket is the producer for the later hot
                 # MME bucket.  Populate its prefix before the search geometry
                 # switches at token 513; otherwise rows 0..511 remain zero.
@@ -562,7 +626,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 pool = (self.shared.index_candidates_unused if self.shared.candidate_pool is None else
                         self.shared.candidate_pool[target].contiguous())
                 decoded_hot = (self.cache.decoded_index_hot
-                               if (self.ratio == 1
+                               if (self.ratio in (1, 2)
                                    and self.search_length == INDEX_MME_HOT_TOKENS
                                    and hasattr(self.cache, "decoded_index_hot")) else None)
                 indices, blocks = runtime_index_select(
@@ -615,8 +679,17 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         output = self._rope(output, positions, inverse=True)
         output = output.reshape(-1, self.groups, self.heads // self.groups * 512)
         output = self.project_output(output)
+        return self._finish_projected_output(output, ready_outputs)
+
+    def _finish_projected_output(self, output, ready_outputs=()):
+        """Consume an already inverse-rotated and wo_a-projected row."""
         partial = self.project_output_consumer(output)
         return self.reduce(partial, ready_outputs=ready_outputs) if ready_outputs else self.reduce(partial)
+
+    def _can_fuse_mla_woa(self, positions):
+        """Return whether the exact MLA-product/wo_a producer is available."""
+        return (positions.numel() == 1 and self.mla_mme and self.woa_fp8
+                and self.woa_output_roundtrip and self.native_rope)
 
     def _output(self, query, cache, indices, positions, ready_outputs=(), *, decode=False):
         if decode and self.mla_mme and 1 <= query.shape[0] <= NATIVE_WORK_TOKENS:
@@ -758,24 +831,36 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         # metadata is invalid under the resident 1M graph. Materialize the
         # two bounded inputs before normalization; the qualified C1 path
         # already receives contiguous buffers and is unchanged.
-        qr = norm(query_input.contiguous(), self.weights.q_norm.weight, self.eps)
-        query = self.project_query(qr, positions)
-        kv = norm(kv_input.contiguous(), self.weights.kv_norm.weight, self.eps)
-        kv = self._rope(kv, positions)
+        # A dynamic Reindex owner consumes the normalized Q row twice: once
+        # for attention and once for candidate scoring. Other C1 layers can
+        # keep this exact BF16 boundary inside the projection compound op.
+        needs_index_query = (self.ratio and self.owns_index
+                             and self.search_length // self.ratio > 512)
+        fused_query_norm = (decode and value.shape[0] == 1 and self.fused_norm
+                            and self.q_scale_rope and self.native_rope
+                            and getattr(self.weights.wq_b, "dense_fp8", False)
+                            and not needs_index_query)
+        if fused_query_norm:
+            qr = None
+            query = self.project_query_input(query_input, positions)
+        else:
+            qr = norm(query_input.contiguous(), self.weights.q_norm.weight, self.eps)
+            query = self.project_query(qr, positions)
+        kv = self.project_kv(kv_input, positions, decode=decode)
         if not decode and value.shape[0] > NATIVE_WORK_TOKENS:
             return self._prefill_attention(value, qr, query, kv, positions, ready_outputs)
         decoded = (self.decoded_kv_state and self.ratio in (1, 2)
                    and self.search_length // self.ratio <= self.cache.decoded_main.shape[0])
         completion = None
         if decoded and value.shape[0] == 1:
-            # The decoded SWA mirror is consumed through the same 256-row
-            # circular namespace as the packed SWA cache.  Passing the logical
-            # position here leaves rows 0..255 stale after the first wrap even
-            # though prefix_layout addresses them modulo SWA_ROWS.
-            ring_position = positions.remainder(SWA_ROWS).to(torch.int32).contiguous()
+            # The native writer maps this logical position into the shared
+            # 256-row circular namespace for both packed and decoded state.
+            # Keeping the modulo inside that existing TPC pass avoids one
+            # generic div/mod launch in every decoded Attention layer.
+            logical_position = positions.to(torch.int32).contiguous()
             completion = torch.ops.custom_op.custom_deepseek_v41_swa_paged_decoded_write_bf16_gaudi2(
-                self.swa, kv.contiguous(), ring_position,
-                ring_position, self.shared.decoded_swa,
+                self.swa, kv.contiguous(), logical_position,
+                logical_position, self.shared.decoded_swa,
                 self.decoded_swa_offset)
         else:
             packed_swa = pack_swa(kv)
@@ -799,6 +884,29 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 compressed_completion = self._compress(value, positions, decoded)
             selected = self._select(value, qr, positions)
             if decoded and value.shape[0] == 1:
+                main_done = compressed_completion if compressed_completion is not None else completion
+                if self._can_fuse_mla_woa(positions):
+                    # The decoded mirror is already addressed by logical
+                    # compressed row.  Let its first real consumer derive the
+                    # fixed 128-row SWA prefix and selected-row mapping from
+                    # position/selection directly.  This removes one TPC
+                    # launch plus the [640] index and length intermediates in
+                    # every decoded Attention layer without changing the
+                    # B2+/prefill layout contract.
+                    partial = torch.ops.custom_op.custom_deepseek_v41_mla_selected_woa_wob_fp8_roundtrip_gaudi2(
+                        query.contiguous(), self.shared.decoded_swa,
+                        self.cache.decoded_main, selected.contiguous(),
+                        self.weights.attn_sink, self.scale, completion,
+                        main_done, self.decoded_swa_offset,
+                        self.cache.decoded_main.shape[0],
+                        self.weights.wo_a.weight,
+                        self.weights.wo_a.channel_scale,
+                        positions.to(torch.int32).contiguous(),
+                        self._rotary_native_table(),
+                        self.weights.wo_b.weight,
+                        self.weights.wo_b.channel_scale)
+                    return (self.reduce(partial, ready_outputs=ready_outputs)
+                            if ready_outputs else self.reduce(partial))
                 # The paged state keeps SWA as a 256-row ring and main KV as
                 # logical compressed rows.  Reuse the fixed prefix layout so
                 # the decoded mirror sees [SWA ring, logical main] rather than
@@ -809,7 +917,6 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 _, indices, lengths = layout(selected.contiguous(),
                                              positions.to(torch.int32).contiguous(),
                                              self.shared.block_table)
-                main_done = compressed_completion if compressed_completion is not None else completion
                 output = torch.ops.custom_op.custom_deepseek_v41_mla_mme_gaudi2(
                     query.contiguous(), self.shared.decoded_swa, self.cache.decoded_main,
                     indices.contiguous(), self.weights.attn_sink, self.scale, lengths.contiguous(),

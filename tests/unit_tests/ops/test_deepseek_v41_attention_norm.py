@@ -17,7 +17,7 @@ import torch  # noqa: E402
 torch.ops.load_library(os.environ["VLLM_HPU_DSV4_TPC_OP_LIBRARY"])
 
 
-@pytest.mark.parametrize("width", [512, 1280])
+@pytest.mark.parametrize("width", [512, 1280, 5120])
 @pytest.mark.parametrize("tokens", [1, 3])
 def test_norm_edges_and_compiled_inputs(width, tokens):
     fn = torch.ops.custom_op.custom_deepseek_v41_attention_norm_bf16_gaudi2

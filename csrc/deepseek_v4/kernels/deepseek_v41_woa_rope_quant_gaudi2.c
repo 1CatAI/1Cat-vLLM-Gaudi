@@ -8,11 +8,22 @@
 #define DSV4_ROPE_SECOND_TERM_FMA 1
 #include "deepseek_v4_qnorm_rope_kv_pack_bf16.h"
 
+// A 128-lane BF16 register contains four 32-lane dual groups.  The converted
+// 64-lane RoPE tail occupies groups 0/1; replace groups 2/3 of the original
+// tile so the regular wo_a conversion and FP8 packing see exactly the same
+// register layout as a standalone tensor store followed by reload.
+static inline bfloat128 woa_replace_upper_half(
+        bfloat128 original, bfloat128 replacement) {
+    original = v_bf16_mov_dual_group_b(
+        replacement, 0xFFFFFFFF, 0, 2, MkWr(1, 1), original);
+    return v_bf16_mov_dual_group_b(
+        replacement, 0xFFFFFFFF, 1, 3, MkWr(1, 1), original);
+}
+
 void main(tensor input, tensor positions, tensor phase, tensor output, tensor scales) {
     const int5 start = get_index_space_offset();
     const int5 end = start + get_index_space_size();
     bfloat128 values[32];
-    bfloat128 rotated_tails[8];
     for (int group = start[1]; group < end[1]; ++group) {
         for (int token = start[0]; token < end[0]; ++token) {
             const int position = s_i32_ld_g(gen_addr((int5){token,0,0,0,0}, positions));
@@ -31,19 +42,14 @@ void main(tensor input, tensor positions, tensor phase, tensor output, tensor sc
                     rotated.v1 = dsv4_qkv_apply_pairwise_rope_f32(
                         expanded, phase, position);
                     // Preserve the standalone inverse-RoPE BF16 rounding
-                    // boundary.  Keep the tail separate: assigning a float64
-                    // half into a float128 and converting the whole register
-                    // changes lanes in the untouched half on Gaudi2.
-                    rotated_tails[tile / 4] =
-                        convert_float128_to_bfloat128(rotated, SW_LINEAR);
+                    // boundary before dynamic FP8 quantization.
+                    values[tile] = woa_replace_upper_half(
+                        values[tile],
+                        convert_float128_to_bfloat128(rotated, SW_LINEAR));
                 }
                 const float128 wide = v_convert_bf16_to_f32_all_b(values[tile]);
                 maximum = v_f32_max_b(maximum, v_f32_abs_b(wide.v1));
-                const float64 second = ((tile & 3) == 3)
-                    ? convert_bfloat128_to_float128(
-                          rotated_tails[tile / 4], SW_LINEAR).v1
-                    : wide.v2;
-                maximum = v_f32_max_b(maximum, v_f32_abs_b(second));
+                maximum = v_f32_max_b(maximum, v_f32_abs_b(wide.v2));
             }
             maximum = v_f32_reduce_max(maximum);
             const uint64 bits = as_uint64(maximum);
@@ -57,13 +63,9 @@ void main(tensor input, tensor positions, tensor phase, tensor output, tensor sc
             #pragma loop_unroll(2)
             for (int tile = 0; tile < 32; ++tile) {
                 const float128 wide = v_convert_bf16_to_f32_all_b(values[tile]);
-                const float64 second = ((tile & 3) == 3)
-                    ? convert_bfloat128_to_float128(
-                          rotated_tails[tile / 4], SW_LINEAR).v1
-                    : wide.v2;
                 minifloat256 q = 0;
                 q = v_convert_f32_to_f8_b(wide.v1 * inverse, 0, SW_RHNE | SW_CLIP_FP, q);
-                q = v_convert_f32_to_f8_b(second * inverse, 2, SW_RHNE | SW_CLIP_FP, q);
+                q = v_convert_f32_to_f8_b(wide.v2 * inverse, 2, SW_RHNE | SW_CLIP_FP, q);
                 const minifloat256 sparse = q;
                 q = v_f8_pack_b(sparse, SW_GROUP_0 | SW_STRIDE_2, (minifloat256)0);
                 q = v_f8_pack_b(sparse, SW_GROUP_1 | SW_STRIDE_2, q);
