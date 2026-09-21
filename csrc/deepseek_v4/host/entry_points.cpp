@@ -131,6 +131,7 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_MXFP4_PREPARED_DEQUANT_PIPE_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V41_BF16_IDENTITY,
     GAUDI2_KERNEL_DEEPSEEK_V41_QUANT_ROUNDTRIP_BF16,
+    GAUDI2_KERNEL_DEEPSEEK_V41_QUANT_ROUNDTRIP_WIDE_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V41_MXFP4_INDEXED_FC1_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V41_MXFP4_INDEXED_FC1_NORMAL_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V41_MXFP4_INDEXED_FC2_BF16,
@@ -155,6 +156,7 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_MLA_PRODUCT_ROPE_QUANT,
     GAUDI2_KERNEL_DEEPSEEK_V41_WOA_SCALE,
     GAUDI2_KERNEL_DEEPSEEK_V41_WOA_SCALE_ROUNDTRIP,
+    GAUDI2_KERNEL_DEEPSEEK_V41_WOA_SCALE_ROUNDTRIP_WIDE,
     GAUDI2_KERNEL_DEEPSEEK_V41_ROUTER_TOP6,
     GAUDI2_KERNEL_DEEPSEEK_V41_ROUTER_LOGITS_TOP6,
     GAUDI2_KERNEL_DEEPSEEK_V41_WOA_STAGE,
@@ -359,6 +361,8 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_WOA_SCALE].name, DeepseekV41WoaGaudi2::scale_name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_WOA_SCALE_ROUNDTRIP].name,
                 DeepseekV41WoaGaudi2::scale_roundtrip_name);
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_WOA_SCALE_ROUNDTRIP_WIDE].name,
+                DeepseekV41WoaGaudi2::scale_roundtrip_wide_name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_ROUTER_TOP6].name, DeepseekV41RouterTop6Gaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_ROUTER_LOGITS_TOP6].name,
                 DeepseekV41RouterLogitsTop6Gaudi2::name);
@@ -584,6 +588,8 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
            v41Identity.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_BF16_IDENTITY].name);
            DeepseekV41QuantRoundtripGaudi2 v41QuantRoundtrip;
            v41QuantRoundtrip.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_QUANT_ROUNDTRIP_BF16].name);
+           DeepseekV41QuantRoundtripGaudi2 v41QuantRoundtripWide(true);
+           v41QuantRoundtripWide.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_QUANT_ROUNDTRIP_WIDE_BF16].name);
            DeepseekV41SelectedKVGaudi2 v41SelectedKV;
            v41SelectedKV.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_KV_BF16].name);
            DeepseekV41Mxfp4IndexedBF16Gaudi2 v41IndexedFc1(
@@ -752,6 +758,8 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
         return DeepseekV41WoaGaudi2(true, true, false, true).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41WoaGaudi2::scale_name) == 0)
         return DeepseekV41WoaGaudi2(false).GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name, DeepseekV41WoaGaudi2::scale_roundtrip_wide_name) == 0)
+        return DeepseekV41WoaGaudi2(false, false, true, false, true).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41WoaGaudi2::scale_roundtrip_name) == 0)
         return DeepseekV41WoaGaudi2(false, false, true).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41RouterTop6Gaudi2::name) == 0)
@@ -1116,6 +1124,10 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     v41QuantRoundtrip.GetKernelName(kernelName);
     if (std::strcmp(params->guid.name, kernelName) == 0)
         return v41QuantRoundtrip.GetGcDefinitions(params, instance);
+    DeepseekV41QuantRoundtripGaudi2 v41QuantRoundtripWide(true);
+    v41QuantRoundtripWide.GetKernelName(kernelName);
+    if (std::strcmp(params->guid.name, kernelName) == 0)
+        return v41QuantRoundtripWide.GetGcDefinitions(params, instance);
     for (auto stage : {DeepseekV41Mxfp4IndexedBF16Gaudi2::FC1,
                        DeepseekV41Mxfp4IndexedBF16Gaudi2::FC2}) {
         for (bool normal : {false, true}) {

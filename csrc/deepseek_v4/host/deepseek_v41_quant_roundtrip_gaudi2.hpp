@@ -4,7 +4,9 @@
 #include "tpc_kernel_lib_interface.h"
 
 class DeepseekV41QuantRoundtripGaudi2 {
+    bool wide_;
 public:
+    explicit DeepseekV41QuantRoundtripGaudi2(bool wide = false) : wide_(wide) {}
     tpc_lib_api::GlueCodeReturn GetKernelName(char name[tpc_lib_api::MAX_NODE_NAME]);
     tpc_lib_api::GlueCodeReturn GetGcDefinitions(tpc_lib_api::HabanaKernelParams*,
                                                 tpc_lib_api::HabanaKernelInstantiation*);

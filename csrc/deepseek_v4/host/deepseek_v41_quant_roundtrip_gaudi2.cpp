@@ -4,10 +4,13 @@
 
 extern unsigned char _binary___deepseek_v41_quant_roundtrip_bf16_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_quant_roundtrip_bf16_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_quant_roundtrip_wide_bf16_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_quant_roundtrip_wide_bf16_gaudi2_o_end;
 
 tpc_lib_api::GlueCodeReturn DeepseekV41QuantRoundtripGaudi2::GetKernelName(
     char name[tpc_lib_api::MAX_NODE_NAME]) {
-    std::strcpy(name, "custom_deepseek_v41_quant_roundtrip_bf16_gaudi2");
+    std::strcpy(name, wide_ ? "custom_deepseek_v41_quant_roundtrip_wide_bf16_gaudi2"
+                            : "custom_deepseek_v41_quant_roundtrip_bf16_gaudi2");
     return tpc_lib_api::GLUE_SUCCESS;
 }
 
@@ -23,6 +26,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41QuantRoundtripGaudi2::GetGcDefinitions(
         return GLUE_INCOMPATIBLE_OUTPUT_COUNT;
     }
     const auto& shape = in->inputTensors[0].geometry;
+    const unsigned width = wide_ ? 128 : 32;
     for (unsigned index = 0; index < 2; ++index) {
         auto& geometry = index == 0 ? in->inputTensors[0].geometry : in->outputTensors[0].geometry;
         if (geometry.dataType != DATA_BF16) {
@@ -36,20 +40,22 @@ tpc_lib_api::GlueCodeReturn DeepseekV41QuantRoundtripGaudi2::GetGcDefinitions(
         }
         auto& access = index == 0 ? out->inputTensorAccessPattern[0] : out->outputTensorAccessPattern[0];
         access.mapping[0].indexSpaceDim = 0;
-        access.mapping[0].a = 32;
+        access.mapping[0].a = width;
         access.mapping[0].start_b = 0;
-        access.mapping[0].end_b = 31;
+        access.mapping[0].end_b = width - 1;
         access.mapping[1].indexSpaceDim = 1;
         access.mapping[1].a = 1;
         access.mapping[1].start_b = 0;
         access.mapping[1].end_b = 0;
     }
     out->indexSpaceRank = 2;
-    out->indexSpaceGeometry[0] = shape.maxSizes[0] / 32;
+    out->indexSpaceGeometry[0] = (shape.maxSizes[0] + width - 1) / width;
     out->indexSpaceGeometry[1] = shape.maxSizes[1];
     out->kernel.paramsNr = 0;
-    auto* start = &_binary___deepseek_v41_quant_roundtrip_bf16_gaudi2_o_start;
-    auto* end = &_binary___deepseek_v41_quant_roundtrip_bf16_gaudi2_o_end;
+    auto* start = wide_ ? &_binary___deepseek_v41_quant_roundtrip_wide_bf16_gaudi2_o_start
+                        : &_binary___deepseek_v41_quant_roundtrip_bf16_gaudi2_o_start;
+    auto* end = wide_ ? &_binary___deepseek_v41_quant_roundtrip_wide_bf16_gaudi2_o_end
+                      : &_binary___deepseek_v41_quant_roundtrip_bf16_gaudi2_o_end;
     const unsigned capacity = out->kernel.elfSize;
     out->kernel.elfSize = end - start;
     if (capacity < out->kernel.elfSize) return GLUE_INSUFFICIENT_ELF_BUFFER;
