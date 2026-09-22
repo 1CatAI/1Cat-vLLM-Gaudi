@@ -365,6 +365,9 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             operation = (torch.ops.custom_op.custom_deepseek_v41_woa_fp8_roundtrip_gaudi2
                          if self.woa_output_roundtrip else
                          torch.ops.custom_op.custom_deepseek_v41_woa_fp8_gaudi2)
+            if (self.woa_output_roundtrip and gaudi_envs.VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT
+                    and value.shape[0] > 6):
+                operation = torch.ops.custom_op.custom_deepseek_v41_woa_fp8_roundtrip_wide_gaudi2
             return operation(value.contiguous(), self.weights.wo_a.weight,
                              self.weights.wo_a.channel_scale)
         if self.output_gemm_layout:

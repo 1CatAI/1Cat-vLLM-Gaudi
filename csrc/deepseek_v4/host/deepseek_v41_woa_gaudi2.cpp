@@ -11,6 +11,8 @@ extern unsigned char _binary___deepseek_v41_woa_scale_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_woa_scale_gaudi2_o_end;
 extern unsigned char _binary___deepseek_v41_woa_scale_roundtrip_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_woa_scale_roundtrip_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_woa_scale_roundtrip_wide_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_woa_scale_roundtrip_wide_gaudi2_o_end;
 namespace {
 void map(tpc_lib_api::TensorAccessPattern& p, int dim, int index, int a, int first, int last) {
     p.mapping[dim].indexSpaceDim = index;
@@ -77,7 +79,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41WoaGaudi2::GetGcDefinitions(
             sw.maxSizes[1] != 1 || sw.maxSizes[2] != 4 || sx.maxSizes[0] != 1 || sx.maxSizes[1] != tokens ||
             sx.maxSizes[2] != 4) return GLUE_INCOMPATIBLE_INPUT_SIZE;
         out->indexSpaceRank = 3;
-        const int width = roundtrip_ ? 32 : 128;
+        const int width = roundtrip_ && !wide_ ? 32 : 128;
         out->indexSpaceGeometry[0] = 1024 / width;
         out->indexSpaceGeometry[1] = tokens; out->indexSpaceGeometry[2] = 4;
         for (int i = 0; i < 3; ++i) {
@@ -92,11 +94,13 @@ tpc_lib_api::GlueCodeReturn DeepseekV41WoaGaudi2::GetGcDefinitions(
     auto* begin = quant_ ? (product_ ? &_binary___deepseek_v41_mla_product_rope_quant_gaudi2_o_start
                                    : rope_ ? &_binary___deepseek_v41_woa_rope_quant_gaudi2_o_start
                                   : &_binary___deepseek_v41_woa_quant_gaudi2_o_start)
+                         : wide_ ? &_binary___deepseek_v41_woa_scale_roundtrip_wide_gaudi2_o_start
                          : roundtrip_ ? &_binary___deepseek_v41_woa_scale_roundtrip_gaudi2_o_start
                                       : &_binary___deepseek_v41_woa_scale_gaudi2_o_start;
     auto* end = quant_ ? (product_ ? &_binary___deepseek_v41_mla_product_rope_quant_gaudi2_o_end
                                  : rope_ ? &_binary___deepseek_v41_woa_rope_quant_gaudi2_o_end
                                 : &_binary___deepseek_v41_woa_quant_gaudi2_o_end)
+                       : wide_ ? &_binary___deepseek_v41_woa_scale_roundtrip_wide_gaudi2_o_end
                        : roundtrip_ ? &_binary___deepseek_v41_woa_scale_roundtrip_gaudi2_o_end
                                     : &_binary___deepseek_v41_woa_scale_gaudi2_o_end;
     const unsigned capacity = out->kernel.elfSize;
