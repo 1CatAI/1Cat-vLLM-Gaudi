@@ -272,6 +272,13 @@ class CSA2Attention(FusedCompressorInput, nn.Module):
         return self.linear(value, self.weights.wo_b)
 
     def _rope(self, value, positions, inverse=False):
+        if (self.native_rope and gaudi_envs.VLLM_HPU_DSV41_PREFILL_ROPE and value.dtype == torch.bfloat16
+                and value.ndim in (2, 3) and (value.ndim == 2 or 1 <= value.shape[1] <= 128)
+                and 6 < value.shape[0] <= 8192 and 128 <= value.shape[-1] <= 512 and value.shape[-1] % 128 == 0):
+            op = (torch.ops.custom_op.custom_deepseek_v41_prefill_rope_inverse_bf16_gaudi2
+                  if inverse else torch.ops.custom_op.custom_deepseek_v41_prefill_rope_bf16_gaudi2)
+            shaped = value.reshape(value.shape[0], -1, value.shape[-1]).contiguous()
+            return op(shaped, positions.to(torch.int32).contiguous(), self.rotary_native).reshape(value.shape)
         if self.native_rope and value.shape[0] == 1:
             shape = value.shape
             table = self.rotary_native_inverse if inverse else self.rotary_native

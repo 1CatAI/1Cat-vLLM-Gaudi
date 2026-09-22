@@ -68,6 +68,9 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 required_ops.append("custom_deepseek_v41_quant_roundtrip_wide_bf16_gaudi2")
             if envs.VLLM_HPU_DSV41_WOA_OUTPUT_ROUNDTRIP:
                 required_ops.append("custom_deepseek_v41_woa_fp8_roundtrip_wide_gaudi2")
+        if envs.VLLM_HPU_DSV41_NATIVE_ROPE and envs.VLLM_HPU_DSV41_PREFILL_ROPE:
+            required_ops.extend(("custom_deepseek_v41_prefill_rope_bf16_gaudi2",
+                                 "custom_deepseek_v41_prefill_rope_inverse_bf16_gaudi2"))
         if any(not hasattr(torch.ops.custom_op, name) for name in required_ops):
             torch.ops.load_library(envs.VLLM_HPU_DSV4_TPC_OP_LIBRARY)
         missing_ops = [name for name in required_ops if not hasattr(torch.ops.custom_op, name)]
