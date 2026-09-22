@@ -64,6 +64,11 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             "custom_deepseek_v41_mxfp4_prepared_moe_bf16_gaudi2")
         if not hasattr(torch.ops.custom_op, required_op):
             torch.ops.load_library(envs.VLLM_HPU_DSV4_TPC_OP_LIBRARY)
+        if envs.VLLM_HPU_DSV41_NATIVE_ROPE and envs.VLLM_HPU_DSV41_PREFILL_ROPE:
+            for name in ("custom_deepseek_v41_prefill_rope_bf16_gaudi2",
+                         "custom_deepseek_v41_prefill_rope_inverse_bf16_gaudi2"):
+                if not hasattr(torch.ops.custom_op, name):
+                    raise RuntimeError("Rebuild the V4.1 native extension for prefill RoPE: " + name)
         if self.native:
             from vllm_gaudi.distributed.tp2_fused_ar_norm import initialize_tp2_fused_ar_norm_runtime
             initialize_tp2_fused_ar_norm_runtime()

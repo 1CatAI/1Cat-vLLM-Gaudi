@@ -668,3 +668,5 @@ performance, SRAM placement, or production-quality qualification.
 `VLLM_HPU_DSV41_NATIVE_ROPE` (default `0`) fuses the interleaved rotary-table lookup, adjacent-pair FP32 rotation and BF16 output for C1–C6 inputs. It copies the non-rotary prefix verbatim and supports the inverse output rotation. The ordinary path handles other shapes and prefill.
 
 `VLLM_HPU_DSV41_FUSED_PREFIX_LAYOUT` (default `0`) combines the SWA window, selected-page mapping, shared row list and valid lengths for C1–C6 non-ranking CSA2 calls. It consumes live selection and block-table tensors; owner-layer selection and candidate-pool writes remain in the graph. Requires selected-KV and shared-prefix paths, window 128 and compression ratio 1 or 2.
+
+`VLLM_HPU_DSV41_PREFILL_ROPE` (default `1`) uses native forward and inverse RoPE for BF16 query batches of 7–8192 rows when native V4.1 RoPE is enabled. It preserves the large-query path's separate FP32 products and final BF16 rounding; C1–C6 keep their existing arithmetic. Set it to `0` to diagnose the tensor implementation. Rebuild the native extension before enabling this path.

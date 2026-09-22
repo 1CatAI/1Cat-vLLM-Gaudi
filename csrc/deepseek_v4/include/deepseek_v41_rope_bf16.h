@@ -6,7 +6,9 @@
 #define DSV4_ROPE_INVERSE 1
 #endif
 #define DSV4_QNORM_HELPERS_ONLY 1
+#ifndef DSV41_ROPE_SEPARATE_PRODUCTS
 #define DSV4_ROPE_SECOND_TERM_FMA 1
+#endif
 #include "deepseek_v4_qnorm_rope_kv_pack_bf16.h"
 
 void main(tensor value, tensor positions, tensor phase, tensor output) {

@@ -190,6 +190,8 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_FP4_ROUNDTRIP_G32,
     GAUDI2_KERNEL_DEEPSEEK_V41_ROPE,
     GAUDI2_KERNEL_DEEPSEEK_V41_ROPE_INVERSE,
+    GAUDI2_KERNEL_DEEPSEEK_V41_PREFILL_ROPE,
+    GAUDI2_KERNEL_DEEPSEEK_V41_PREFILL_ROPE_INVERSE,
     GAUDI2_KERNEL_DEEPSEEK_V41_PREFIX_LAYOUT_R1,
     GAUDI2_KERNEL_DEEPSEEK_V41_PREFIX_LAYOUT_R2,
     GAUDI2_KERNEL_DEEPSEEK_V41_N256_FP8,
@@ -638,6 +640,8 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     for (int inverse = 0; inverse < 2; ++inverse) {
         DeepseekV41RopeGaudi2 part(inverse);
         part.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_ROPE + inverse].name);
+        DeepseekV41RopeGaudi2 prefill_part(inverse, true);
+        prefill_part.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_PREFILL_ROPE + inverse].name);
     }
     for (int ratio = 1; ratio <= 2; ++ratio) {
         DeepseekV41PrefixLayoutGaudi2 part(ratio);
@@ -783,6 +787,9 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
         DeepseekV41RopeGaudi2 part(inverse);
         part.GetKernelName(kernelName);
         if (std::strcmp(params->guid.name, kernelName) == 0) return part.GetGcDefinitions(params, instance);
+        DeepseekV41RopeGaudi2 prefill_part(inverse, true);
+        prefill_part.GetKernelName(kernelName);
+        if (std::strcmp(params->guid.name, kernelName) == 0) return prefill_part.GetGcDefinitions(params, instance);
     }
     for (unsigned mode : {0u, 16u, 32u, DeepseekV41KVPackGaudi2::FP4_ROUNDTRIP_G32}) {
         DeepseekV41KVPackGaudi2 part(mode);

@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_QUANT_ROUNDTRIP: bool = False
     VLLM_HPU_DSV41_SWA_PACK_WRITE: bool = False
     VLLM_HPU_DSV41_FP4_CACHE_WRITE: bool = False
+    VLLM_HPU_DSV41_PREFILL_ROPE: bool = True
     VLLM_HPU_DSV41_NATIVE_ROPE: bool = False
     VLLM_HPU_DSV41_C1_INDICES: bool = False
     VLLM_HPU_DSV41_SELECTED_VALID_ONLY: bool = False
@@ -564,6 +565,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.getenv("VLLM_HPU_DSV41_HEAD_VECTOR_ATTN", "0") == "1",
     "VLLM_HPU_DSV41_NATIVE_KV_PACK":
     lambda: os.getenv("VLLM_HPU_DSV41_NATIVE_KV_PACK", "0") == "1",
+    "VLLM_HPU_DSV41_PREFILL_ROPE":
+    lambda: os.getenv("VLLM_HPU_DSV41_PREFILL_ROPE", "1").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_NATIVE_ROPE":
     lambda: os.getenv("VLLM_HPU_DSV41_NATIVE_ROPE", "0") == "1",
     "VLLM_HPU_DSV41_FUSED_PREFIX_LAYOUT":
