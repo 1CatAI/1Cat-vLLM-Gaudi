@@ -6,6 +6,8 @@
 namespace {
 constexpr auto kSchema = "custom_op::custom_deepseek_v41_woa_fp8_gaudi2";
 constexpr auto kRoundtripSchema = "custom_op::custom_deepseek_v41_woa_fp8_roundtrip_gaudi2";
+constexpr auto kWideSchema = "custom_op::custom_deepseek_v41_woa_fp8_roundtrip_wide_gaudi2";
+constexpr auto kWideScale = "custom_deepseek_v41_woa_scale_roundtrip_wide_gaudi2";
 constexpr auto kRopeSchema = "custom_op::custom_deepseek_v41_rope_woa_fp8_gaudi2";
 constexpr auto kRopeRoundtripSchema = "custom_op::custom_deepseek_v41_rope_woa_fp8_roundtrip_gaudi2";
 constexpr auto kQuantSchema = "custom_op::custom_deepseek_v41_woa_quant_gaudi2";
@@ -68,11 +70,12 @@ class Woa final : public habana::OpBackend {
     bool quant_;
     bool rope_;
     bool roundtrip_;
+    bool wide_;
 public:
-    Woa(int device, c10::ScalarType dtype, bool quant, bool rope = false, bool roundtrip = false)
+    Woa(int device, c10::ScalarType dtype, bool quant, bool rope = false, bool roundtrip = false, bool wide = false)
         : OpBackend(device, NO_TPC + std::string(rope ? "dsv41_rope_woa_fp8" : "dsv41_woa_fp8"), dtype,
                     quant ? std::vector<int>{0,1} : std::vector<int>{0}, {}, {}, false),
-          quant_(quant), rope_(rope), roundtrip_(roundtrip) {
+          quant_(quant), rope_(rope), roundtrip_(roundtrip), wide_(wide) {
         SetOutputMetaFn([quant, rope](const at::Stack& stack) {
             return rope ? rope_meta(stack) : meta(stack, quant);
         });
@@ -97,7 +100,7 @@ public:
         synGEMMParams params{false, false};
         auto product = BuildNode(this, graph, {"batch_gemm", {q.at(0).get(), syn_in(1)},
             {{{4,tokens,1024}, at::kFloat}}, &params, sizeof(params)});
-        auto scaled = BuildNode(this, graph, {roundtrip_ ? kScaleRoundtrip : kScale,
+        auto scaled = BuildNode(this, graph, {wide_ ? kWideScale : (roundtrip_ ? kScaleRoundtrip : kScale),
             {product.at(0).get(), syn_in(2), q.at(1).get()},
             {{{tokens,4,1024}, at::kBFloat16}}});
         syn_out(0) = ReshapeHelper(graph, scaled.at(0).get(), output.at(0).shape, at::kBFloat16, 0);
@@ -138,6 +141,13 @@ const bool registered = [] {
     habana::KernelRegistry().add(kRoundtripSchema, [](synDeviceId device, c10::ScalarType dtype) {
         return std::make_shared<Woa>(device, dtype, false, false, true);
     });
+    habana::custom_op::registerUserCustomOp(kWideSchema, kQuant, [](const at::Stack& stack) {
+        const auto output = meta(stack, false);
+        return habana::PartialOutputMetaDataVector{{output.at(0).dtype, output.at(0).shape}};
+    }, nullptr);
+    habana::KernelRegistry().add(kWideSchema, [](synDeviceId device, c10::ScalarType dtype) {
+        return std::make_shared<Woa>(device, dtype, false, false, true, true);
+    });
     habana::custom_op::registerUserCustomOp(kRopeSchema, kRopeQuant, [](const at::Stack& stack) {
         const auto output = rope_meta(stack);
         return habana::PartialOutputMetaDataVector{{output.at(0).dtype, output.at(0).shape}};
@@ -162,13 +172,13 @@ const bool registered = [] {
     });
     return true;
 }();
-template<bool Meta, bool Roundtrip = false>
+template<bool Meta, bool Roundtrip = false, bool Wide = false>
 at::Tensor run(const at::Tensor& x, const at::Tensor& w, const at::Tensor& s) {
     const auto output = meta({x,w,s}, false);
     if (Meta) return at::empty(output.at(0).shape, x.options());
     TORCH_CHECK(registered && x.device().type() == at::kHPU);
     auto descriptor = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(
-        Roundtrip ? kRoundtripSchema : kSchema);
+        Wide ? kWideSchema : (Roundtrip ? kRoundtripSchema : kSchema));
     return descriptor.execute({x,w,s}).at(0);
 }
 template<bool Meta> Pair quant(const at::Tensor& x) {
@@ -203,6 +213,7 @@ template<bool Meta> Pair rope_quant(const at::Tensor& x, const at::Tensor& posit
 TORCH_LIBRARY_FRAGMENT(custom_op, m) {
     m.def("custom_deepseek_v41_woa_fp8_gaudi2(Tensor input, Tensor weight, Tensor channel_scale) -> Tensor");
     m.def("custom_deepseek_v41_woa_fp8_roundtrip_gaudi2(Tensor input, Tensor weight, Tensor channel_scale) -> Tensor");
+    m.def("custom_deepseek_v41_woa_fp8_roundtrip_wide_gaudi2(Tensor input, Tensor weight, Tensor channel_scale) -> Tensor");
     m.def("custom_deepseek_v41_rope_woa_fp8_gaudi2(Tensor input, Tensor weight, Tensor channel_scale, Tensor positions, Tensor phase) -> Tensor");
     m.def("custom_deepseek_v41_rope_woa_fp8_roundtrip_gaudi2(Tensor input, Tensor weight, Tensor channel_scale, Tensor positions, Tensor phase) -> Tensor");
     m.def("custom_deepseek_v41_woa_quant_gaudi2(Tensor input) -> (Tensor, Tensor)");
@@ -211,6 +222,7 @@ TORCH_LIBRARY_FRAGMENT(custom_op, m) {
 TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
     m.impl("custom_deepseek_v41_woa_fp8_gaudi2", run<false, false>);
     m.impl("custom_deepseek_v41_woa_fp8_roundtrip_gaudi2", run<false, true>);
+    m.impl("custom_deepseek_v41_woa_fp8_roundtrip_wide_gaudi2", run<false, true, true>);
     m.impl("custom_deepseek_v41_rope_woa_fp8_gaudi2", rope_run<false, false>);
     m.impl("custom_deepseek_v41_rope_woa_fp8_roundtrip_gaudi2", rope_run<false, true>);
     m.impl("custom_deepseek_v41_woa_quant_gaudi2", quant<false>);
@@ -219,6 +231,7 @@ TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
 TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
     m.impl("custom_deepseek_v41_woa_fp8_gaudi2", run<true, false>);
     m.impl("custom_deepseek_v41_woa_fp8_roundtrip_gaudi2", run<true, true>);
+    m.impl("custom_deepseek_v41_woa_fp8_roundtrip_wide_gaudi2", run<true, true, true>);
     m.impl("custom_deepseek_v41_rope_woa_fp8_gaudi2", rope_run<true, false>);
     m.impl("custom_deepseek_v41_rope_woa_fp8_roundtrip_gaudi2", rope_run<true, true>);
     m.impl("custom_deepseek_v41_woa_quant_gaudi2", quant<true>);

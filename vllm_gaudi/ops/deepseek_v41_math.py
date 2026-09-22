@@ -138,8 +138,10 @@ def unpack_swa(packed, width=512):
 def quantize_activation(value):
     if (gaudi_envs.VLLM_HPU_DSV41_QUANT_ROUNDTRIP and value.device.type == "hpu" and value.dtype == torch.bfloat16):
         shape = value.shape
-        result = torch.ops.custom_op.custom_deepseek_v41_quant_roundtrip_bf16_gaudi2(
-            value.reshape(-1, shape[-1]).contiguous())
+        operation = (torch.ops.custom_op.custom_deepseek_v41_quant_roundtrip_wide_bf16_gaudi2
+                     if gaudi_envs.VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT and value.numel() // shape[-1] > 6
+                     else torch.ops.custom_op.custom_deepseek_v41_quant_roundtrip_bf16_gaudi2)
+        result = operation(value.reshape(-1, shape[-1]).contiguous())
         return result.reshape(shape)
     return unpack_swa(pack_swa(value), value.shape[-1])
 

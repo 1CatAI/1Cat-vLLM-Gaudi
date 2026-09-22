@@ -7,14 +7,20 @@
 
 namespace {
 constexpr const char* schema = "custom_op::custom_deepseek_v41_quant_roundtrip_bf16_gaudi2";
+constexpr const char* wide_schema = "custom_op::custom_deepseek_v41_quant_roundtrip_wide_bf16_gaudi2";
 const bool registered = [] {
-    habana::custom_op::registerUserCustomOp(schema, "custom_deepseek_v41_quant_roundtrip_bf16_gaudi2",
-        [](const at::Stack& inputs) {
-            habana::PartialOutputMetaData output;
-            output.dtype = at::kBFloat16;
-            output.shape = inputs.at(0).toTensor().sizes().vec();
-            return habana::PartialOutputMetaDataVector{output};
-        }, nullptr);
+    for (bool wide : {false, true}) {
+        habana::custom_op::registerUserCustomOp(
+            wide ? wide_schema : schema,
+            wide ? "custom_deepseek_v41_quant_roundtrip_wide_bf16_gaudi2"
+                 : "custom_deepseek_v41_quant_roundtrip_bf16_gaudi2",
+            [](const at::Stack& inputs) {
+                habana::PartialOutputMetaData output;
+                output.dtype = at::kBFloat16;
+                output.shape = inputs.at(0).toTensor().sizes().vec();
+                return habana::PartialOutputMetaDataVector{output};
+            }, nullptr);
+    }
     return true;
 }();
 
@@ -24,10 +30,11 @@ void validate(const at::Tensor& input) {
                 input.size(1) <= 131072 && input.size(1) % 32 == 0,
                 "V4.1 activation quantization requires contiguous BF16 [T,K], T<=8192, K%32=0");
 }
+template <bool Wide>
 at::Tensor run(const at::Tensor& input) {
     validate(input);
     TORCH_CHECK(registered && input.device().type() == at::kHPU);
-    auto descriptor = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(schema);
+    auto descriptor = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(Wide ? wide_schema : schema);
     auto outputs = descriptor.execute({input});
     TORCH_CHECK(outputs.size() == 1);
     return outputs.at(0);
@@ -39,10 +46,13 @@ at::Tensor meta(const at::Tensor& input) {
 }
 TORCH_LIBRARY_FRAGMENT(custom_op, m) {
     m.def("custom_deepseek_v41_quant_roundtrip_bf16_gaudi2(Tensor input) -> Tensor");
+    m.def("custom_deepseek_v41_quant_roundtrip_wide_bf16_gaudi2(Tensor input) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
-    m.impl("custom_deepseek_v41_quant_roundtrip_bf16_gaudi2", run);
+    m.impl("custom_deepseek_v41_quant_roundtrip_bf16_gaudi2", run<false>);
+    m.impl("custom_deepseek_v41_quant_roundtrip_wide_bf16_gaudi2", run<true>);
 }
 TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
     m.impl("custom_deepseek_v41_quant_roundtrip_bf16_gaudi2", meta);
+    m.impl("custom_deepseek_v41_quant_roundtrip_wide_bf16_gaudi2", meta);
 }

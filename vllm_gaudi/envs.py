@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_GRAPH_REPLAY: bool = False
     VLLM_HPU_DSV41_DSPARK: bool = False
     VLLM_HPU_DSV41_VISION: bool = False
+    VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT: bool = True
     VLLM_HPU_DSV41_QUANT_ROUNDTRIP: bool = False
     VLLM_HPU_DSV41_SWA_PACK_WRITE: bool = False
     VLLM_HPU_DSV41_FP4_CACHE_WRITE: bool = False
@@ -411,6 +412,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_DSPARK", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_VISION":
     lambda: os.environ.get("VLLM_HPU_DSV41_VISION", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT":
+    lambda: os.environ.get("VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT", "1").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_QUANT_ROUNDTRIP":
     lambda: os.environ.get("VLLM_HPU_DSV41_QUANT_ROUNDTRIP", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_SWA_PACK_WRITE":

@@ -62,13 +62,21 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             "custom_deepseek_v41_paged_attention_bf16_gaudi2"
             if envs.VLLM_HPU_DSV41_PAGED_SELECTED_KV else
             "custom_deepseek_v41_mxfp4_prepared_moe_bf16_gaudi2")
-        if not hasattr(torch.ops.custom_op, required_op):
-            torch.ops.load_library(envs.VLLM_HPU_DSV4_TPC_OP_LIBRARY)
+        required_ops = [required_op]
+        if envs.VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT:
+            if envs.VLLM_HPU_DSV41_QUANT_ROUNDTRIP:
+                required_ops.append("custom_deepseek_v41_quant_roundtrip_wide_bf16_gaudi2")
+            if envs.VLLM_HPU_DSV41_WOA_OUTPUT_ROUNDTRIP:
+                required_ops.append("custom_deepseek_v41_woa_fp8_roundtrip_wide_gaudi2")
         if envs.VLLM_HPU_DSV41_NATIVE_ROPE and envs.VLLM_HPU_DSV41_PREFILL_ROPE:
-            for name in ("custom_deepseek_v41_prefill_rope_bf16_gaudi2",
-                         "custom_deepseek_v41_prefill_rope_inverse_bf16_gaudi2"):
-                if not hasattr(torch.ops.custom_op, name):
-                    raise RuntimeError("Rebuild the V4.1 native extension for prefill RoPE: " + name)
+            required_ops.extend(("custom_deepseek_v41_prefill_rope_bf16_gaudi2",
+                                 "custom_deepseek_v41_prefill_rope_inverse_bf16_gaudi2"))
+        if any(not hasattr(torch.ops.custom_op, name) for name in required_ops):
+            torch.ops.load_library(envs.VLLM_HPU_DSV4_TPC_OP_LIBRARY)
+        missing_ops = [name for name in required_ops if not hasattr(torch.ops.custom_op, name)]
+        if missing_ops:
+            raise RuntimeError("The V4.1 native extension must be rebuilt; missing operators: "
+                               + ", ".join(missing_ops))
         if self.native:
             from vllm_gaudi.distributed.tp2_fused_ar_norm import initialize_tp2_fused_ar_norm_runtime
             initialize_tp2_fused_ar_norm_runtime()
