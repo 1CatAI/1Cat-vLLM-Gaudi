@@ -10,7 +10,7 @@ void main(tensor input, tensor output) {
     const int full = width / 128;
     const int full_end = s_i32_min(end[0], full);
     for (int row = begin[1]; row < end[1]; ++row) {
-        #pragma loop_unroll(2)
+        #pragma loop_unroll(4)
         for (int tile = begin[0]; tile < full_end; ++tile) {
             const int5 at = {tile * 128, row, 0, 0, 0};
             const bfloat128 packed = v_bf16_ld_tnsr_b(at, input);
