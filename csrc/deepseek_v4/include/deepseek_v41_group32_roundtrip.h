@@ -19,15 +19,14 @@ static inline bfloat128 v41_group32_roundtrip_bf16(bfloat128 value) {
     const short128 exponent = convert_ushort128_to_short128(maximum >> 7, 0) - 135
         + v_i16_sel_grt_u16_b(maximum & 127, 96, 1, 0);
     const short128 input_exponent = convert_ushort128_to_short128(magnitude >> 7, 0);
-    // Subnormal FP8 codes are integers on the scale/512 grid. Clamp the
-    // shift for lanes outside this branch and for values rounding to zero.
-    const short128 shift = v_i16_max_b(v_i16_min_b(exponent + 125 - input_exponent, 9), 1);
-    const ushort128 significand = (magnitude & 127) | 128;
-    const ushort128 code = (significand + ((ushort128)1 << (shift - 1)) - 1
-        + ((significand >> shift) & 1)) >> shift;
-    const bfloat128 small_code = convert_ushort128_to_bfloat128(code, SW_RHNE);
-    const ushort128 grid_bits = (ushort128)((exponent + 118) << 7);
-    const bfloat128 tiny = small_code * *((bfloat128*)&grid_bits);
+    // Adding a positive BF16 offset places the subnormal grid in one
+    // normal binade. The first add rounds to that grid; subtracting the
+    // offset is exact. Both operations retain round-to-nearest-even.
+    const ushort128 magic_bits = (ushort128)((exponent + 125) << 7);
+    const bfloat128 magic = *((bfloat128*)&magic_bits);
+    const bfloat128 positive = *((bfloat128*)&magnitude);
+    const bfloat128 shifted = v_bf16_add_b(positive, magic);
+    const bfloat128 tiny = v_bf16_sub_b(shifted, magic);
     // Keep three mantissa bits with ties to even, then saturate at 448*scale.
     const ushort128 rounded = (magnitude + 7 + ((magnitude >> 4) & 1)) & 0xfff0;
     ushort128 result = v_u16_sel_less_i16_b(input_exponent, exponent + 121,

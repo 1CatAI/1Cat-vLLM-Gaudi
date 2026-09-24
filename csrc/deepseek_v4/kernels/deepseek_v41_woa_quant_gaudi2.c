@@ -22,14 +22,14 @@ void main(tensor input, tensor output, tensor scales) {
             power = v_i32_sel_eq_f32_b(maximum, 0.0f, 0, power);
             const float64 scale = as_float64((power + 127) << 23);
             const float64 inverse = as_float64((127 - power) << 23);
+            const float128 inverse_pair = {inverse, inverse};
+            const bfloat128 inverse_bf16 = v_convert_f32_to_bf16_all_b(inverse_pair);
             const int5 scale_at = {0, token, group, 0, 0};
             v_f32_st_tnsr_partial(scale_at, scales, scale, 0, 0);
             #pragma loop_unroll(2)
             for (int tile = 0; tile < 32; ++tile) {
-                const float128 wide = v_convert_bf16_to_f32_all_b(values[tile]);
-                minifloat256 q = 0;
-                q = v_convert_f32_to_f8_b(wide.v1 * inverse, 0, SW_RHNE | SW_CLIP_FP, q);
-                q = v_convert_f32_to_f8_b(wide.v2 * inverse, 2, SW_RHNE | SW_CLIP_FP, q);
+                const bfloat128 value = values[tile] * inverse_bf16;
+                minifloat256 q = v_convert_bf16_to_f8_b(value, 0, SW_RHNE | SW_CLIP_FP, (minifloat256)0);
                 const minifloat256 sparse = q;
                 q = v_f8_pack_b(sparse, SW_GROUP_0 | SW_STRIDE_2, (minifloat256)0);
                 q = v_f8_pack_b(sparse, SW_GROUP_1 | SW_STRIDE_2, q);
