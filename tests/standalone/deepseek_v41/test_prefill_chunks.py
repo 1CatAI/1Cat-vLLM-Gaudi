@@ -10,7 +10,9 @@ from vllm_gaudi.v1.worker.deepseek_v41_runner import (
     PREFILL_COMPUTE_BUCKETS,
     V41ModelRunner,
     decode_search_warmups,
+    prefill_search_length,
     runtime_search_length,
+    prefill_compute_buckets,
     target_chunks,
     target_search_length,
 )
@@ -21,8 +23,20 @@ def test_scheduler_transaction_uses_finite_exact_compute_buckets():
     tokens = list(range(8192))
     chunks = list(target_chunks(tokens))
     assert PREFILL_BLOCK_TOKENS == 8192
-    assert [len(chunk) for _, chunk in chunks] == [2048] * 4
+    assert [len(chunk) for _, chunk in chunks] == [4096] * 2
     assert [token for _, chunk in chunks for token in chunk] == tokens
+
+
+def test_larger_compute_tile_preserves_scheduler_budget_and_exact_tail(monkeypatch):
+    monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_COMPUTE_TOKENS", "8192")
+    for count in (8191, 8192, 8193, 32768):
+        tokens = list(range(count))
+        chunks = list(target_chunks(tokens))
+        assert [token for _, chunk in chunks for token in chunk] == tokens
+        assert all(len(chunk) in set(prefill_compute_buckets()) | {1} for _, chunk in chunks)
+        assert all(len(chunk) <= PREFILL_BLOCK_TOKENS for _, chunk in chunks)
+    assert [len(chunk) for _, chunk in target_chunks(range(32768))] == [8192] * 4
+    assert [len(chunk) for _, chunk in target_chunks(range(8193))] == [8192, 1]
 
 
 def test_normal_2k_chat_shape_reuses_c2048_and_c1_replay():
@@ -55,11 +69,12 @@ def test_prefill_retires_completed_tail_packets_before_reuse(monkeypatch, count)
         use_dspark=False,
         model_config=SimpleNamespace(max_model_len=1 << 20),
         verify_timing=None,
-        model=SimpleNamespace(last_aux=None, complete_step=lambda _count: None),
+        model=SimpleNamespace(last_aux=None, pp_rank=0, tp_rank=0, complete_step=lambda _count: None),
         _forward=forward,
         _insert=lambda _aux, _positions: None,
         positions=list(range(count)),
-        pp=SimpleNamespace(group=SimpleNamespace(is_last_rank=False),
+        pp=SimpleNamespace(generation=0,
+                           group=SimpleNamespace(is_last_rank=False),
                            drain=lambda: events.append("drain"),
                            complete_packet=complete_packet),
     )
@@ -96,10 +111,24 @@ def test_scheduler_transaction_uses_one_search_bucket_for_all_internal_tiles():
 
 def test_runtime_indexer_prewarms_and_reuses_one_bounded_2k_bucket():
     capacity = 1 << 20
-    assert list(decode_search_warmups(capacity, runtime_indexer=True)) == [(0, 2560), (2560, capacity)]
+    assert list(decode_search_warmups(capacity, runtime_indexer=True)) == [(0, 512), (512, 2560), (2560, capacity)]
     for start, count in ((0, 2052), (2051, 1), (2306, 254)):
         assert runtime_search_length(start, count, capacity) == 2560
     assert runtime_search_length(2560, 1, capacity) == capacity
+
+
+def test_shared_prefill_geometry_does_not_change_decode_or_long_context_capacity():
+    capacity = 1 << 20
+    for start, count in ((2560, 128), (8192, 8192), (24576, 8192)):
+        assert prefill_search_length(start, count, capacity, reuse_index_keys=True) == 32768
+        assert runtime_search_length(start, count, capacity) == capacity
+        assert prefill_search_length(start, count, capacity) == capacity
+    assert prefill_search_length(32768, 128, capacity, reuse_index_keys=True) == capacity
+    assert prefill_search_length(512, 128, capacity, reuse_index_keys=True) == 2560
+    assert prefill_search_length(0, 128, capacity, reuse_index_keys=True) == 512
+    assert prefill_search_length(8192, 8192, 16384, reuse_index_keys=True) == 16384
+    with pytest.raises(ValueError):
+        prefill_search_length(capacity - 128, 256, capacity, reuse_index_keys=True)
 
 
 def test_prefill_tail_is_exact_and_never_splits_into_dspark_c6():

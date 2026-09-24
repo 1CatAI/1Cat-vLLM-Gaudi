@@ -16,6 +16,8 @@ _PROFILE_KEYS = set(_C1_FASTPATH_DEFAULTS) | set(_NUMERIC_FASTPATH_DEFAULTS) | {
     "VLLM_HPU_DSV41_WO_A_FP8_SIDECAR",
     "VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR",
     "VLLM_HPU_DSV41_ENGRAM_FP8_SIDECAR",
+    "VLLM_HPU_DSV41_PREFILL_GROUPED_FP8",
+    "VLLM_HPU_DSV41_PREFILL_INDEX_QUERY_TP",
 }
 
 
@@ -43,12 +45,15 @@ def test_default_profile_enables_qualified_numeric_bundle(monkeypatch, tmp_path)
     assert os.environ["VLLM_HPU_DSV41_DSPARK"] == "0"
     assert all(os.environ[key] == value for key, value in _C1_FASTPATH_DEFAULTS.items())
     assert all(os.environ[key] == value for key, value in _NUMERIC_FASTPATH_DEFAULTS.items())
-    assert os.environ["VLLM_HPU_DSV41_WO_A_FP8_SIDECAR"] == str(
-        (tmp_path / "sidecars" / "wo_a_fp8").resolve())
+    assert os.environ["VLLM_HPU_DSV41_WO_A_FP8_SIDECAR"] == str((tmp_path / "sidecars" / "wo_a_fp8").resolve())
     assert os.environ["VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR"] == str(
         (tmp_path / "sidecars" / "attention_dense_fp8").resolve())
-    assert os.environ["VLLM_HPU_DSV41_ENGRAM_FP8_SIDECAR"] == str(
-        (tmp_path / "sidecars" / "engram_fp8").resolve())
+    assert os.environ["VLLM_HPU_DSV41_ENGRAM_FP8_SIDECAR"] == str((tmp_path / "sidecars" / "engram_fp8").resolve())
+    assert os.environ["VLLM_HPU_DSV41_PREFILL_COMPUTE_TOKENS"] == "8192"
+    assert os.environ["VLLM_HPU_DSV41_PREFILL_KV_REUSE"] == "1"
+    assert os.environ["VLLM_HPU_DSV41_PREFILL_PP_WAVEFRONT"] == "1"
+    assert "VLLM_HPU_DSV41_PREFILL_GROUPED_FP8" not in os.environ
+    assert os.environ["VLLM_HPU_DSV41_PREFILL_INDEX_QUERY_TP"] == "1"
 
 
 def test_numeric_profile_can_be_disabled_without_sidecars(monkeypatch, tmp_path):
@@ -77,8 +82,7 @@ def test_experimental_numeric_bundle_discovers_sidecars(monkeypatch, tmp_path):
     assert os.environ["VLLM_HPU_DSV41_WO_A_FP8_SIDECAR"] == str((model / "sidecars" / "wo_a_fp8").resolve())
     assert os.environ["VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR"] == str(
         (model / "sidecars" / "attention_dense_fp8").resolve())
-    assert os.environ["VLLM_HPU_DSV41_ENGRAM_FP8_SIDECAR"] == str(
-        (model / "sidecars" / "engram_fp8").resolve())
+    assert os.environ["VLLM_HPU_DSV41_ENGRAM_FP8_SIDECAR"] == str((model / "sidecars" / "engram_fp8").resolve())
 
 
 def test_default_profile_respects_individual_override(monkeypatch, tmp_path):

@@ -172,6 +172,49 @@ std::vector<int64_t> resident_shape(const at::Stack& stack) {
     return {1, x.size(1)};
 }
 
+constexpr auto kPrefillWeights = "custom_op::custom_deepseek_v41_prefill_weight_bf16_gaudi2";
+
+class PrefillWeights final : public habana::OpBackend {
+ public:
+    PrefillWeights(int device, c10::ScalarType dtype)
+        : OpBackend(device, NO_TPC + std::string("dsv41_prefill_weight"), dtype, {0}, {}, {}, false) {
+        SetOutputMetaFn([](const at::Stack& stack) {
+            return habana::OutputMetaDataVector{{at::kBFloat16, decode_shape(stack, true)}};
+        });
+    }
+    void AddNode(synapse_helpers::graph& graph, const at::Stack& stack) override {
+        const bool normal = stack.at(4).toBool(), discard_empty = stack.at(5).toBool();
+        const char* guid = discard_empty ?
+            (normal ? "custom_deepseek_v41_expert_n256_dead_normal_bf16_gaudi2" :
+                      "custom_deepseek_v41_expert_n256_dead_bf16_gaudi2") :
+            (normal ? "custom_deepseek_v41_expert_n256_normal_bf16_gaudi2" :
+                      "custom_deepseek_v41_expert_n256_bf16_gaudi2");
+        syn_out(0) = std::move(BuildNode(this, graph, {guid,
+            {syn_in(0), syn_in(1), syn_in(2), syn_in(3)},
+            {{decode_shape(stack, true), at::kBFloat16, 0}}}).at(0));
+    }
+};
+const bool prefill_weights_registered = [] {
+    habana::custom_op::registerUserCustomOp(kPrefillWeights, kN256Bf16, [](const at::Stack& stack) {
+        return habana::PartialOutputMetaDataVector{{at::kBFloat16, decode_shape(stack, true)}};
+    }, nullptr);
+    habana::KernelRegistry().add(kPrefillWeights, [](synDeviceId device, c10::ScalarType dtype) {
+        return std::make_shared<PrefillWeights>(device, dtype);
+    });
+    return true;
+}();
+template<bool Meta> at::Tensor prefill_weights(const at::Tensor& ids, const at::Tensor& q,
+        const at::Tensor& scales, const at::Tensor& lookup, bool normal, bool discard_empty) {
+    const at::Stack stack{ids, q, scales, lookup, normal, discard_empty};
+    const auto shape = decode_shape(stack, true);
+    TORCH_CHECK(ids.size(0) == 1 && ids.size(1) <= 32,
+                "Prefill weight blocks require at most 32 expert descriptors");
+    if (Meta) return at::empty(shape, q.options().dtype(at::kBFloat16));
+    TORCH_CHECK(prefill_weights_registered && ids.device().type() == at::kHPU);
+    auto op = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(kPrefillWeights);
+    return op.execute(stack).at(0);
+}
+
 class PreparedV41 final : public habana::OpBackend {
     bool moe_;
     bool fp8_;
@@ -661,6 +704,7 @@ template<bool Meta, bool K128 = false, bool N256 = false> at::Tensor moe(const a
 }
 
 TORCH_LIBRARY_FRAGMENT(custom_op, m) {
+    m.def("custom_deepseek_v41_prefill_weight_bf16_gaudi2(Tensor ids, Tensor q16, Tensor s16, Tensor lookup, bool normal=False, bool discard_empty=False) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_shared_prefetch_w2_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, Tensor quantized, Tensor activation_scale, Tensor shared, bool normal) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_moe_prequant_resident_direct_finalize_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor w13, Tensor w2, Tensor channel13, Tensor channel2, Tensor quantized, Tensor activation_scale, bool normal) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_slots_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, Tensor quantized, Tensor activation_scale, bool normal) -> Tensor");
@@ -679,6 +723,7 @@ TORCH_LIBRARY_FRAGMENT(custom_op, m) {
     m.def("custom_deepseek_v41_mxfp4_prepared_moe_k128_bf16_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, bool normal=False) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
+    m.impl("custom_deepseek_v41_prefill_weight_bf16_gaudi2", prefill_weights<false>);
     m.impl("custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_shared_prefetch_w2_fp8_gaudi2", moe_fp8_prequant_shared<false>);
     m.impl("custom_deepseek_v41_expert_n256_moe_prequant_resident_direct_finalize_fp8_gaudi2", moe_fp8_resident<false>);
     m.impl("custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_slots_fp8_gaudi2", moe_fp8_prequant<false, true, true>);
@@ -697,6 +742,7 @@ TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
     m.impl("custom_deepseek_v41_mxfp4_prepared_moe_k128_bf16_gaudi2", moe<false, true>);
 }
 TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
+    m.impl("custom_deepseek_v41_prefill_weight_bf16_gaudi2", prefill_weights<true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_shared_prefetch_w2_fp8_gaudi2", moe_fp8_prequant_shared<true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_prequant_resident_direct_finalize_fp8_gaudi2", moe_fp8_resident<true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_slots_fp8_gaudi2", moe_fp8_prequant<true, true, true>);
