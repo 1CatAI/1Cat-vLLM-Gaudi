@@ -70,13 +70,6 @@ _C1_FASTPATH_DEFAULTS = {
     "VLLM_HPU_DSV41_PREFILL_DEVICE_ROUTES": "1",
     "VLLM_HPU_DSV41_PREFILL_ROUTE_OUTPUT": "1",
     "VLLM_HPU_DSV41_PREFILL_EXPERT_ROWS": "128",
-    # The prepared-group bridge submits the finite expert recipe sequence as
-    # one native plan.  The exact normal-scale decoder is the qualified body
-    # used by the archived 32K parent; make both part of ordinary startup
-    # rather than relying on an evidence-profile environment override.
-    "VLLM_HPU_DSV41_PREFILL_NATIVE_PLAN": "1",
-    "VLLM_HPU_DSV41_PREFILL_FAST_DEQUANT": "1",
-    "VLLM_HPU_DSV41_PREFILL_SKIP_EMPTY": "1",
     "VLLM_HPU_DSV41_PREFILL_EXPERTS_PER_PLAN": "24",
     # One scheduler transaction already owns 8192 prompt tokens. Keep the
     # compute transaction intact so grouped experts reuse each decoded weight
@@ -120,6 +113,13 @@ _C1_FASTPATH_DEFAULTS = {
     "VLLM_HPU_TP2_NATIVE_JOINT_PLAN": "1",
     "VLLM_HPU_TP2_PREPARED_COMM": "1",
     "VLLM_HPU_TP2_STATIC_GROUP_PLAN": "1",
+}
+
+_PREFILL_MOE_DEFAULTS = {
+    "VLLM_HPU_DSV41_PREFILL_NATIVE_PLAN": "1",
+    "VLLM_HPU_DSV41_PREFILL_FAST_DEQUANT": "1",
+    "VLLM_HPU_DSV41_PREFILL_SKIP_EMPTY": "1",
+    "VLLM_HPU_DSV41_PREFILL_HYBRID_ROWS": "1",
 }
 
 _NUMERIC_FASTPATH_DEFAULTS = {
@@ -173,6 +173,13 @@ def prepare_default_fastpaths(model, sidecars=None):
         os.environ.setdefault(key, value)
     if _enabled(os.environ.get("VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS", "0")):
         for key, value in _NUMERIC_FASTPATH_DEFAULTS.items():
+            os.environ.setdefault(key, value)
+    # Prepared N256 weights select the qualified BF16 prompt implementation.
+    # Profiles without this storage layout retain their existing dispatch.
+    if any(
+            _enabled(os.environ.get(name, "0"))
+            for name in ("VLLM_HPU_DSV41_EXPERT_N256", "VLLM_HPU_DSV41_EXPERT_N256_FP8")):
+        for key, value in _PREFILL_MOE_DEFAULTS.items():
             os.environ.setdefault(key, value)
     model = Path(model).resolve()
     configured = sidecars or {}
