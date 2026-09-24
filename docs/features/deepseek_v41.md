@@ -336,5 +336,7 @@ for diagnosis.
 Grouped FP8 modes remain explicit experiments selected with
 `VLLM_HPU_DSV41_PREFILL_GROUPED_FP8`. Dual W13 modes use high and residual
 activation terms; `w13_single_prequant` uses one term and has greater
-quantization error. These modes change rounding and require workload quality
-validation. The default empty mode keeps BF16 arithmetic.
+quantization error. `w13_single_bucket` uses the same single-term arithmetic
+with occupancy buckets rounded to 32 rows, retaining BF16 W2 and ordered route
+reduction. These modes change rounding and require workload quality validation.
+The default empty mode keeps BF16 arithmetic.

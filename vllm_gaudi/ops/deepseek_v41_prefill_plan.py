@@ -24,7 +24,7 @@ _expert_audit = dict(calls=0, tokens=0, recipe_executions=0, largest_token_bucke
 
 def validate_prefill_plan_config(*, n256):
     from vllm_gaudi import envs
-    if (envs.VLLM_HPU_DSV41_PREFILL_GROUPED_FP8 in ("w13_dual_prequant", "w13_single_prequant")
+    if (envs.VLLM_HPU_DSV41_PREFILL_GROUPED_FP8 in ("w13_dual_prequant", "w13_single_prequant", "w13_single_bucket")
             and not envs.VLLM_HPU_DSV41_PREFILL_HYBRID_ROWS):
         raise ValueError("Pre-quantized W13 requires hybrid route plans")
     if envs.VLLM_HPU_DSV41_PREFILL_HYBRID_ROWS and not (
@@ -32,7 +32,7 @@ def validate_prefill_plan_config(*, n256):
             and envs.VLLM_HPU_DSV41_PREFILL_GROUPED and envs.VLLM_HPU_DSV41_PREFILL_NATIVE_PLAN
             and envs.VLLM_HPU_DSV41_PREFILL_FAST_DEQUANT and envs.VLLM_HPU_DSV41_PREFILL_SKIP_EMPTY
             and envs.VLLM_HPU_DSV41_PREFILL_EXPERT_ROWS == 128 and envs.VLLM_HPU_DSV41_PREFILL_GROUPED_FP8 in
-        ("", "w13_dual", "w13_dual_prequant", "w13_single_prequant")):
+        ("", "w13_dual", "w13_dual_prequant", "w13_single_prequant", "w13_single_bucket")):
         raise ValueError("Hybrid prefill rows require BF16 or W13 FP8 128-row native plans with device routes, "
                          "route output, fast dequant and empty-block masking")
     if not envs.VLLM_HPU_DSV41_PREFILL_NATIVE_PLAN:

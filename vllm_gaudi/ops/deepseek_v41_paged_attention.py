@@ -84,7 +84,7 @@ def flash_prefill_mla(query, cache, indices, sink):
     """Compile shared-KV gather, sink mask and Gaudi Flash Attention together."""
     from flashinfer_gaudi.mla import sparse_mla_prefill
     lengths = torch.full((query.shape[0], ), indices.shape[1], dtype=torch.int32, device=query.device)
-    return sparse_mla_prefill(query, cache, indices, sink, lengths, query_tile=512)
+    return sparse_mla_prefill(query, cache, indices, sink, lengths, query_tile=1024)
 
 
 @lru_cache(maxsize=32)

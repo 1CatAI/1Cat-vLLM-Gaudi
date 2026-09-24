@@ -4,6 +4,7 @@ import torch
 
 from vllm_gaudi.ops.deepseek_v41_route_blocks import (device_hybrid_route_blocks, device_route_blocks,
                                                       route_block_capacity)
+from vllm_gaudi.ops.deepseek_v41_prefill_buckets import device_bucketed_route_blocks
 
 
 @pytest.mark.parametrize("rows", [32, 64, 128, 512])
@@ -97,3 +98,25 @@ def test_hybrid_descriptors_reject_unsupported_shapes_and_tile_sizes():
         device_hybrid_route_blocks(ids.float())
     with pytest.raises(ValueError, match=r"128\+64"):
         device_hybrid_route_blocks(ids, tail_rows=32)
+
+
+@pytest.mark.parametrize("tokens,skew", [(73, False), (513, True)])
+@pytest.mark.parametrize("quantum", [32, 64])
+def test_occupancy_buckets_preserve_each_route_once(tokens, skew, quantum):
+    ids = torch.randint(0, 384, (tokens, 6), dtype=torch.int32)
+    if skew:
+        ids[:tokens * 3 // 4].fill_(17)
+    descriptors = device_bucketed_route_blocks(ids, quantum=quantum)
+    bucket_count = 256 // quantum
+    assert len(descriptors) == 2 * bucket_count + 1
+    occupied = descriptors[-1]
+    routes = []
+    for index in range(bucket_count):
+        owners, slots = descriptors[2 * index:2 * index + 2]
+        active = int(occupied[index])
+        assert bool((slots[active:] == -1).all())
+        valid = slots[:active] >= 0
+        routes.append(slots[:active][valid])
+        assert torch.equal(owners.flatten()[:active, None].expand_as(slots[:active])[valid],
+                           ids.flatten()[slots[:active][valid]])
+    assert torch.equal(torch.cat(routes).sort().values, torch.arange(ids.numel()))

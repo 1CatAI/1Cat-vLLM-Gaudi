@@ -24,6 +24,8 @@ def test_hybrid_rows_require_the_exact_native_bf16_or_fp8_contract(monkeypatch):
     plans.validate_prefill_plan_config(n256=True)
     monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_GROUPED_FP8", "w13_single_prequant")
     plans.validate_prefill_plan_config(n256=True)
+    monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_GROUPED_FP8", "w13_single_bucket")
+    plans.validate_prefill_plan_config(n256=True)
     monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_HYBRID_ROWS", "0")
     with pytest.raises(ValueError, match="Pre-quantized W13 requires"):
         plans.validate_prefill_plan_config(n256=True)
