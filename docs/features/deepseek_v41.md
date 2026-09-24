@@ -8,6 +8,21 @@ chunks of up to 8192 tokens. This is a capacity contract, not a claim that a
 full-window request has passed quality qualification. Unsupported sampling
 modifiers fail explicitly.
 
+With occupancy-based grouped prefill enabled, the BF16 expert path chooses
+64/128/192/256-row blocks from the current expert route counts. Larger experts
+use multiple bounded slabs. Each slab reuses one decoded weight across its
+rows, while the final route reduction preserves token/top-k order. Group width
+keeps each route write within the native operator's row limit. These buckets
+apply to arbitrary scheduler prompt lengths; they do not select a fixed-length
+prompt fast path.
+
+Sparse prefill MLA gathers directly into the KV layout consumed by SDPA.
+Invalid indices and the attention sink select a dedicated zero row, appended
+once per compiled call and shared by its bounded query tiles. This preserves
+NaN isolation and the existing BF16 KV/FP32 mask contract for arbitrary query
+lengths, including partial tiles, while avoiding a separate selected-KV
+masking and sink-concatenation pass.
+
 ## Preparation
 
 Start from a validated V4.1 engine and its matching native replay runtime.
@@ -139,6 +154,59 @@ small DMA staging buffers require HPU-pinned memory. Explicit forced table
 locking is available via `engram_force_lock` in the loader configuration.
 The default does not assume the full host tables fit the memlock quota.
 
+### Resident Engram tables
+
+`--engram-residency locked --engram-host-budget-gib 224` makes table residency
+a startup contract. Device contexts and communicators are created first; the
+table owners then prefault and lock the shared host shards before model loading
+continues. An insufficient memory budget or lock quota fails startup rather
+than silently accepting a paging-dependent performance profile.
+
+Admission credits checkpoint pages already locked in fully resident, read-only
+shared mappings, after checking file identity and byte extents. Overlapping
+mappings count once. Reclaimable file cache is already included in the OS memory
+estimate and receives no extra credit; device memfd allocations still require
+their own budget. Each service keeps independent residency owners for its lifetime.
+
+The CPU gather and device-addressed first Engram layer share one backing region
+per TP shard. On drivers that require writable host registration, the backing
+is a size-sealed shared memfd populated from the immutable checkpoint, then
+mapped read-only for consumers. This avoids private file-mapping COW during
+long-term driver pinning. The other Engram layer retains its read-only file
+mapping. Neither table is replicated per PP rank or copied to HBM. The original
+checkpoint remains unchanged, and its temporary file-cache pages are not locked
+alongside the replacement shared backing.
+
+The bridge must advertise `device_engram_shared_mapping_version=1`, and the
+normal ABI and binary fingerprint checks still apply. Startup owns the backing
+processes until shutdown, records residency, and removes readiness if a table
+owner exits. This deployment setting is independent of arithmetic fast paths.
+
+### Bounded Prefill implementation
+
+The Prefill candidates use device route descriptors, compiled BF16 expert
+bodies, native recipe replay and ordered route reduction. Descriptors and
+workspace addresses are bound explicitly; changing routing values does not
+create an occupancy-specific recipe. Full expert weights are not retained as
+BF16 tensors between calls. Workspaces are reused only after their consumers
+complete, and weight or state rebinding invalidates dependent plans.
+
+The sparse-MLA candidate reuses a bounded decoded index-key prefix across
+Reindex query tiles, restores scores to the original candidate-slot order,
+and keeps the original top-k merge boundaries. Its Gaudi FlashInfer adapter
+uses the installed Habana attention backend; it does not load CUDA kernels.
+An explicit zero-valued sink row retains the head-dependent softmax denominator.
+Invalid cache rows are zeroed before the PV product, not merely masked.
+
+The dedicated entrypoint enables the qualified C8192 expert transaction,
+bounded FlashInfer-Gaudi MLA regions, transaction-local decoded-KV reuse,
+two-slot PP wavefront and TP2 index-query partitioning. Query partitioning is
+limited to the qualified C1024-C8192 shapes; smaller graphs retain the local
+selection path. The complete 32K request and subsequent decode were qualified
+together; the generic vLLM entrypoint keeps each feature opt-in. Unqualified
+alternatives, including grouped FP8 prompt experts, remain disabled until their
+complete serving gates pass.
+
 ## Qualification
 
 First check text and image execution, accepted/rejected DSpark verification,
@@ -198,7 +266,7 @@ Prepare the final N256 runtime layout once from the immutable TP2×PP2 shards:
 .venv/bin/python -m vllm_gaudi.entrypoints.deepseek_v41 PREPARED_DIR \
   --runtime-profile RUNTIME_PROFILE \
   --n256-prepared-dir RUNTIME_WEIGHT_DIR \
-  --max-model-len 1048576 --max-num-batched-tokens 8192 --max-num-seqs 1 \
+  --max-model-len 1048576 --max-num-batched-tokens 32768 --max-num-seqs 8 \
   --block-size 128 --num-gpu-blocks-override 8193
 ```
 
@@ -239,3 +307,20 @@ short-request reuse, eight free-generation arithmetic samples, and public
 streaming/non-streaming chat. It does not establish full-window quality,
 vision qualification or long-duration reliability. Preserve the model and
 runtime fingerprints with further qualification results.
+
+### Prefill decoder column layout
+
+The occupancy-bucket path automatically selects a native decoder for
+qualified normal-scale BF16 expert weights.
+It retains the converter's even/odd column order within each N256 weight tile,
+restores W13 columns on the smaller activation tensor, and restores W2 columns
+after the original ordered six-route reduction. The prepared compressed weight
+layout and allocation are reused. Selection does not depend on prompt length.
+
+Rebuild the native kernel and PyTorch libraries when updating this code.
+Component checks cover independent decoder agreement, route bucket boundaries,
+changing inputs and the existing BF16 arithmetic boundary. Normal serving
+checks cover the frozen prefill request and two other prompt lengths. The
+decoder is not selected for optional FP8 grouped-prefill modes or non-normal
+scale encodings. Set `VLLM_HPU_DSV41_PREFILL_COLUMN_INTERLEAVE=0` to disable it
+for diagnosis.

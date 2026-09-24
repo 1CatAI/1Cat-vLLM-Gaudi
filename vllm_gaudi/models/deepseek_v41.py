@@ -56,27 +56,22 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         # may have already loaded an older extension from the site package.
         # Checking only the MoE symbol would therefore silently skip loading
         # the candidate and leave the graph with an incomplete op namespace.
-        required_op = (
-            "custom_deepseek_v41_woa_fp8_roundtrip_gaudi2"
-            if envs.VLLM_HPU_DSV41_WOA_OUTPUT_ROUNDTRIP else
-            "custom_deepseek_v41_paged_attention_bf16_gaudi2"
-            if envs.VLLM_HPU_DSV41_PAGED_SELECTED_KV else
-            "custom_deepseek_v41_mxfp4_prepared_moe_bf16_gaudi2")
-        required_ops = [required_op]
-        if envs.VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT:
-            if envs.VLLM_HPU_DSV41_QUANT_ROUNDTRIP:
-                required_ops.append("custom_deepseek_v41_quant_roundtrip_wide_bf16_gaudi2")
-            if envs.VLLM_HPU_DSV41_WOA_OUTPUT_ROUNDTRIP:
-                required_ops.append("custom_deepseek_v41_woa_fp8_roundtrip_wide_gaudi2")
-        if envs.VLLM_HPU_DSV41_NATIVE_ROPE and envs.VLLM_HPU_DSV41_PREFILL_ROPE:
-            required_ops.extend(("custom_deepseek_v41_prefill_rope_bf16_gaudi2",
-                                 "custom_deepseek_v41_prefill_rope_inverse_bf16_gaudi2"))
-        if any(not hasattr(torch.ops.custom_op, name) for name in required_ops):
+        required_op = ("custom_deepseek_v41_woa_fp8_roundtrip_gaudi2" if envs.VLLM_HPU_DSV41_WOA_OUTPUT_ROUNDTRIP else
+                       "custom_deepseek_v41_paged_attention_bf16_gaudi2" if envs.VLLM_HPU_DSV41_PAGED_SELECTED_KV else
+                       "custom_deepseek_v41_mxfp4_prepared_moe_bf16_gaudi2")
+        if not hasattr(torch.ops.custom_op, required_op):
             torch.ops.load_library(envs.VLLM_HPU_DSV4_TPC_OP_LIBRARY)
-        missing_ops = [name for name in required_ops if not hasattr(torch.ops.custom_op, name)]
-        if missing_ops:
-            raise RuntimeError("The V4.1 native extension must be rebuilt; missing operators: "
-                               + ", ".join(missing_ops))
+        if envs.VLLM_HPU_DSV41_PREFILL_ROPE:
+            for name in ("custom_deepseek_v41_prefill_rope_bf16_gaudi2",
+                         "custom_deepseek_v41_prefill_rope_inverse_bf16_gaudi2"):
+                if not hasattr(torch.ops.custom_op, name):
+                    raise RuntimeError("Rebuild the V4.1 native extension before enabling prefill RoPE: " + name)
+        if (envs.VLLM_HPU_DSV41_PREFILL_Q_PROJECTION
+                and not hasattr(torch.ops.custom_op, "custom_deepseek_v41_prefill_q_projection_rope_gaudi2")):
+            raise RuntimeError("Rebuild the V4.1 native extension before enabling compiled prefill Q projection")
+        if ((envs.VLLM_HPU_DSV41_PREFILL_INDEX_SRAM or envs.VLLM_HPU_DSV41_PREFILL_REINDEX_SRAM)
+                and not hasattr(torch.ops.custom_op, "custom_deepseek_v41_prefill_index_scores_gaudi2")):
+            raise RuntimeError("Rebuild the V4.1 native extension before enabling SRAM prefill index scoring")
         if self.native:
             from vllm_gaudi.distributed.tp2_fused_ar_norm import initialize_tp2_fused_ar_norm_runtime
             initialize_tp2_fused_ar_norm_runtime()
@@ -115,7 +110,8 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                                           self.device,
                                           max_tokens=8192,
                                           checkpoint_audit=self.extra.get("checkpoint_audit"),
-                                          force_lock=self.extra.get("engram_force_lock", False))
+                                          force_lock=self.extra.get("engram_force_lock", False),
+                                          resident_tables=self.extra.get("engram_resident_tables"))
             self._bind_vision()
 
     def _bind_vision(self):
@@ -242,8 +238,8 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 value.device)
 
     def begin_decode_prefix(self, input_ids, positions):
-        if (self.pp_rank != 0 or not self.native or not envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX
-                or self.program.dspark or input_ids.numel() != 1):
+        if (self.pp_rank != 0 or not self.native or not envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX or self.program.dspark
+                or input_ids.numel() != 1):
             raise RuntimeError("V4.1 decode prefix is outside the qualified PP0 C1 path")
         if self.step_ticket is not None or self._decode_prefix is not None:
             raise RuntimeError("V4.1 decode prefix overlaps an unfinished input transaction")
@@ -258,8 +254,7 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
     def decode_prefix_ready(self, search_length):
         """Whether segmented PP0 replay is safe for the next search bucket."""
         return (self.pp_rank == 0 and self.native and envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX
-                and not self.program.dspark
-                and self.program.replay_owner.input_variant_ready(search_length))
+                and not self.program.dspark and self.program.replay_owner.input_variant_ready(search_length))
 
     def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None, **kwargs):
         del kwargs
@@ -282,8 +277,7 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 residual = values.unsqueeze(1).expand(-1, 4, -1).contiguous()
                 pre = torch.zeros(input_ids.numel(), 4, device=values.device, dtype=torch.float32)
                 pre[:, 0] = 1
-            if (envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and self.step_use_replay
-                    and input_ids.numel() == 1):
+            if (envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and self.step_use_replay and input_ids.numel() == 1):
                 layer1 = self.engram_host.consume_device_c1(self._step_request_id)
                 buffers = self.engram_host.wait(self.step_ticket)
                 engram = (layer1, buffers[1])

@@ -90,13 +90,13 @@ def test_rejects_invalid_codec_contract(shape, dtype):
         WIDE(torch.empty(shape, dtype=dtype, device="meta"))
 
 
-def test_normal_dispatch_is_default_on_with_a_diagnostic_disable(monkeypatch):
+def test_selected_vector_dispatch_preserves_decode_with_a_diagnostic_disable(monkeypatch):
     from vllm_gaudi import envs
     from vllm_gaudi.ops.deepseek_v41_attention import CSA2Attention
     from vllm_gaudi.ops.deepseek_v41_math import quantize_activation
     from vllm_gaudi.ops.deepseek_v41_paged_attention import PagedCSA2Attention
 
-    monkeypatch.delenv("VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT", raising=False)
+    monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT", "1")
     monkeypatch.setenv("VLLM_HPU_DSV41_QUANT_ROUNDTRIP", "1")
     assert envs.VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT
     called = []

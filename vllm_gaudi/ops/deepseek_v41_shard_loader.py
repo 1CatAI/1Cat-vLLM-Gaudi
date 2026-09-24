@@ -8,11 +8,17 @@ from pathlib import Path
 import struct
 
 from vllm_gaudi.ops.deepseek_v41_weights import (
-    COPY_BYTES, ITEM_BYTES, LAYOUT_VERSION, canonical_hash, file_hash, read_header,
+    COPY_BYTES,
+    ITEM_BYTES,
+    LAYOUT_VERSION,
+    canonical_hash,
+    file_hash,
+    read_header,
 )
 
 
 class PreparedV41Shard:
+
     def __init__(self, directory, pp_rank: int, tp_rank: int, *, verify_hash=False):
         self.directory = Path(directory)
         if pp_rank not in (0, 1) or tp_rank not in (0, 1):
@@ -49,10 +55,13 @@ class PreparedV41Shard:
         self.catalog = read_header(self.path)
         with self.path.open("rb") as stream:
             header = json.loads(stream.read(struct.unpack("<Q", stream.read(8))[0]))
-        expected_metadata = {"plan_fingerprint": manifest["plan_fingerprint"],
-                             "model_revision": manifest["model_revision"],
-                             "prepared_layout_version": str(LAYOUT_VERSION), "pp_rank": str(pp_rank),
-                             "tp_rank": str(tp_rank)}
+        expected_metadata = {
+            "plan_fingerprint": manifest["plan_fingerprint"],
+            "model_revision": manifest["model_revision"],
+            "prepared_layout_version": str(LAYOUT_VERSION),
+            "pp_rank": str(pp_rank),
+            "tp_rank": str(tp_rank)
+        }
         if any(header.get("__metadata__", {}).get(key) != value for key, value in expected_metadata.items()):
             raise ValueError("Rank-local header is bound to another preparation plan")
         if set(self.catalog) != set(self.specs):
@@ -75,14 +84,25 @@ class PreparedV41Shard:
         if self.source_identity != (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns):
             raise RuntimeError("Prepared weight file changed during loading; invalidate the model and recipes")
 
-    def tensor(self, name: str, device, *, keep_file_cache=False):
+    def tensor(self, name: str, device, *, keep_file_cache=True):
         """Copy one pre-sliced tensor; no expert gather, transpose or repacking."""
         import torch
         self.check_identity()
         source = self.catalog[name]
-        dtype_names = {"BF16": "bfloat16", "F16": "float16", "F32": "float32", "F64": "float64",
-                       "I8": "int8", "U8": "uint8", "I16": "int16", "I32": "int32", "I64": "int64",
-                       "BOOL": "bool", "F8_E4M3": "float8_e4m3fn", "F8_E5M2": "float8_e5m2"}
+        dtype_names = {
+            "BF16": "bfloat16",
+            "F16": "float16",
+            "F32": "float32",
+            "F64": "float64",
+            "I8": "int8",
+            "U8": "uint8",
+            "I16": "int16",
+            "I32": "int32",
+            "I64": "int64",
+            "BOOL": "bool",
+            "F8_E4M3": "float8_e4m3fn",
+            "F8_E5M2": "float8_e5m2"
+        }
         if source.dtype not in dtype_names:
             raise ValueError(f"Prepared tensor has an unsupported runtime dtype: {source.dtype}")
         dtype = getattr(torch, dtype_names[source.dtype])
@@ -108,6 +128,11 @@ class PreparedV41Shard:
                 else:
                     destination.copy_(chunk, non_blocking=False)
                 self.max_host_chunk_bytes = max(self.max_host_chunk_bytes, len(storage))
+                # The four rank loaders read distinct 75–78 GiB files in
+                # parallel.  Synchronous DONTNEED for every copied chunk can
+                # block all workers in generic_fadvise/lru_add_drain_all;
+                # normally leave eviction to the VM.  The explicit opt-out
+                # remains for an isolated/offline loader.
                 if not keep_file_cache and hasattr(os, "posix_fadvise"):
                     os.posix_fadvise(stream.fileno(), offset, len(storage), os.POSIX_FADV_DONTNEED)
         self.check_identity()
@@ -172,7 +197,8 @@ class PreparedV41Shard:
                 destination[start:stop].copy_(value.to(torch.bfloat16))
                 temporary = len(raw) + len(raw_scale) + value.numel() * 4 + expanded.numel() * 4
                 self.max_host_chunk_bytes = max(self.max_host_chunk_bytes, temporary)
-                if hasattr(os, "posix_fadvise"):
-                    os.posix_fadvise(stream.fileno(), source.offset + start * k, len(raw), os.POSIX_FADV_DONTNEED)
+                # Do not issue per-chunk DONTNEED while TP2×PP2 workers load
+                # concurrently; natural reclaim protects the resident Engram
+                # pages without a cross-CPU LRU drain at every weight chunk.
         self.check_identity()
         return destination

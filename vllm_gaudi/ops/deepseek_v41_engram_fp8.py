@@ -2,7 +2,6 @@
 """Immutable channel-scaled Engram projection weights for Gaudi2 MME."""
 import json
 import math
-import os
 from pathlib import Path
 
 from vllm_gaudi.ops.deepseek_v41_weights import ITEM_BYTES, canonical_hash, file_hash, read_header
@@ -30,8 +29,7 @@ class EngramFP8Sidecar:
             raise ValueError("Engram FP8 sidecars belong only to PP0")
         directory = Path(directory)
         data = json.loads((directory / "manifest.json").read_text())
-        if (canonical_hash(data["quantization"]) != FINGERPRINT
-                or data["quantization_fingerprint"] != FINGERPRINT
+        if (canonical_hash(data["quantization"]) != FINGERPRINT or data["quantization_fingerprint"] != FINGERPRINT
                 or data["source_manifest_sha256"] != file_hash(shard.directory / "manifest.json")):
             raise ValueError("Engram FP8 sidecar source/quantization mismatch")
         rank_name = f"pp0-tp{shard.tp_rank}"
@@ -52,7 +50,7 @@ class EngramFP8Sidecar:
             expected[prefix + "weight"] = ("U8", SHAPE)
             expected[prefix + "channel_scale"] = ("F32", (1, SHAPE[0]))
         if set(expected) != set(self.catalog) or any(
-                (self.catalog[name].dtype, self.catalog[name].shape) != spec for name, spec in expected.items()):
+            (self.catalog[name].dtype, self.catalog[name].shape) != spec for name, spec in expected.items()):
             raise ValueError("Engram FP8 sidecar layout/ownership mismatch")
         stat = self.path.stat()
         self.identity = stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
@@ -92,7 +90,7 @@ class EngramFP8Sidecar:
                 else:
                     destination.copy_(value, non_blocking=False)
                 self.max_host_chunk_bytes = max(self.max_host_chunk_bytes, len(storage))
-                if hasattr(os, "posix_fadvise"):
-                    os.posix_fadvise(stream.fileno(), offset, len(storage), os.POSIX_FADV_DONTNEED)
+                # Let the VM reclaim sidecar cache pages.  Four rank loaders
+                # must not synchronously drain all CPU LRUs after each chunk.
         self._check_identity()
         return destination

@@ -79,9 +79,7 @@ def test_prompt_completion_uses_cpu_pp_control_record(monkeypatch):
     from vllm_gaudi.v1.worker import deepseek_v41_runner as runner
 
     cpu_group = object()
-    group = SimpleNamespace(is_last_rank=True,
-                            ranks=[0, 2],
-                            cpu_group=cpu_group)
+    group = SimpleNamespace(is_last_rank=True, ranks=[0, 2], cpu_group=cpu_group)
     monkeypatch.setattr(runner.envs, "VLLM_HPU_DSV41_PACKED_PP", False)
     monkeypatch.setattr(runner, "get_pp_group", lambda: group)
     broadcasts = []
@@ -94,6 +92,70 @@ def test_prompt_completion_uses_cpu_pp_control_record(monkeypatch):
     assert buffers.finish_single(13, 45) == (13, [45])
     assert broadcasts[0][0].tolist() == [1, 13, 1, 45]
     assert broadcasts[0][1:] == (2, cpu_group)
+
+
+def test_prefill_pp_wavefront_retires_transport_and_consumer_at_slot_reuse(monkeypatch):
+    from types import SimpleNamespace
+    from vllm_gaudi.v1.worker import deepseek_v41_runner as runner
+
+    class Work:
+
+        def __init__(self, label):
+            self.label = label
+            self.waits = 0
+
+        def wait(self):
+            self.waits += 1
+
+    class Event:
+
+        def __init__(self):
+            self.records = self.waits = 0
+
+        def record(self, _stream):
+            self.records += 1
+
+        def synchronize(self):
+            self.waits += 1
+
+    monkeypatch.setattr(runner.envs, "VLLM_HPU_DSV41_PREFILL_PP_WAVEFRONT", True)
+    monkeypatch.setattr(runner.envs, "VLLM_HPU_DSV41_PACKED_PP", False)
+    monkeypatch.setattr(runner.torch.hpu, "Event", Event)
+    monkeypatch.setattr(runner.torch.hpu, "current_stream", lambda: object())
+
+    sent = []
+    monkeypatch.setattr(
+        runner, "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=False, ranks=[0, 2], device_group=None))
+    monkeypatch.setattr(runner.dist, "isend",
+                        lambda *_args, **_kwargs: sent.append(Work(f"send-{len(sent)}")) or sent[-1])
+    producer = runner.PPBuffers("cpu", capacity=2, dspark=False, device_commit=False)
+    values = {
+        "hidden_states": torch.zeros(2, 4, 5120, dtype=torch.bfloat16),
+        "pre_mix": torch.zeros(2, 4, dtype=torch.float32),
+    }
+    producer.exchange(values, 2)
+    producer.exchange(values, 2)
+    assert all(work.waits == 0 for work in sent)
+    producer.exchange(values, 2)
+    assert [work.waits for work in sent[:2]] == [1, 1]
+    assert [work.waits for work in sent[2:]] == [0, 0, 0, 0]
+
+    received = []
+    monkeypatch.setattr(
+        runner, "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=False, is_last_rank=True, ranks=[0, 2], device_group=None))
+    monkeypatch.setattr(runner.dist, "irecv",
+                        lambda *_args, **_kwargs: received.append(Work(f"recv-{len(received)}")) or received[-1])
+    consumer = runner.PPBuffers("cpu", capacity=2, dspark=False, device_commit=False)
+    for _ in range(2):
+        consumer.exchange(None, 2)
+        consumer.mark_prefill_consumed()
+    assert [event.records for event in consumer.prefill_consumer_events] == [1, 1]
+    assert [event.waits for event in consumer.prefill_consumer_events] == [0, 0]
+    consumer.exchange(None, 2)
+    assert [event.waits for event in consumer.prefill_consumer_events] == [1, 0]
+    assert all(work.waits == 1 for work in received)
 
 
 def test_native_c1_binding_consumes_prompt_updates_and_rejects_foreign_request_prefix():
@@ -376,12 +438,13 @@ def test_non_speculative_sampling_commits_exactly_one_real_token(device_commit):
     runner = V41ModelRunner.__new__(V41ModelRunner)
     runner._token_copy = None
     committed = []
-    runner.pp = SimpleNamespace(group=SimpleNamespace(is_last_rank=True),
-                                device_commit=device_commit,
-                                finish_single=lambda consumed, token: (consumed, [token]),
-                                finish_single_device=lambda: (1, [1]),
-                                # Poison the stale device record in CPU mode.
-                                commit=torch.tensor([1, 1, 1, 1 if device_commit else 5]))
+    runner.pp = SimpleNamespace(
+        group=SimpleNamespace(is_last_rank=True),
+        device_commit=device_commit,
+        finish_single=lambda consumed, token: (consumed, [token]),
+        finish_single_device=lambda: (1, [1]),
+        # Poison the stale device record in CPU mode.
+        commit=torch.tensor([1, 1, 1, 1 if device_commit else 5]))
     runner.pp.commit_token = runner.pp.commit[3:4]
     runner.model = SimpleNamespace(complete_step=committed.append)
     state = RequestState("c1", [10], [], None, ([1], ))

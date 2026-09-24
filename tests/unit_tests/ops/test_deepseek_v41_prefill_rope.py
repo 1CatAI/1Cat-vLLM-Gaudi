@@ -23,7 +23,7 @@ torch.ops.load_library(os.environ["VLLM_HPU_DSV4_TPC_OP_LIBRARY"])
 
 @pytest.mark.parametrize("tokens", [7, 8, 127, 8191, 8192])
 def test_changed_positions_and_normal_prefill_dispatch(monkeypatch, tokens):
-    monkeypatch.delenv("VLLM_HPU_DSV41_PREFILL_ROPE", raising=False)
+    monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_ROPE", "1")
     table_cpu = rotary_table(64, 32768, 10000)
     table = table_cpu.to("hpu")
     native = torch.cat((table_cpu[..., 0], table_cpu[..., 1]), -1).contiguous().to("hpu")

@@ -142,6 +142,7 @@ def main() -> None:
         bridge_dependencies[name] = {"path": str(actual), "sha256": digest(actual)}
     metadata = {
         "schema": 1,
+        "device_engram_shared_mapping_version": getattr(module, "device_engram_shared_mapping_version", 0),
         "address_sanitizer": args.address_sanitizer,
         "torch_version": torch.__version__,
         "binary_sha256": digest(binary),
