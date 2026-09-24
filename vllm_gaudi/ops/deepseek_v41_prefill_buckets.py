@@ -7,18 +7,20 @@ from types import FunctionType
 import torch
 
 _ROW_BUCKETS = (64, 128, 192, 256)
+_FP8_ROW_BUCKETS = tuple(range(32, 257, 32))
 _executors = {}
 
 
-def expert_bucket_width(rows):
-    if rows not in _ROW_BUCKETS:
-        raise ValueError("Unsupported BF16 expert row bucket")
+def expert_bucket_width(rows, quantum=64):
+    buckets = _FP8_ROW_BUCKETS if quantum == 32 else _ROW_BUCKETS
+    if rows not in buckets:
+        raise ValueError("Unsupported expert row bucket")
     # The route-write operator accepts at most 4096 rows. These batch widths
     # also retain the qualified compiler's W13 N256 and W2 batch-two tiles.
     return 24 if rows <= 128 else 16
 
 
-def device_bucketed_route_blocks(ids, experts=384):
+def device_bucketed_route_blocks(ids, experts=384, quantum=64):
     """Describe full 256-row slabs and one rounded remainder per expert.
 
     Capacities depend on input shape; occupied prefixes depend on current IDs.
@@ -26,7 +28,7 @@ def device_bucketed_route_blocks(ids, experts=384):
     """
     if ids.ndim != 2 or ids.shape[1] != 6 or ids.numel() == 0:
         raise ValueError("Prefill routes must be nonempty [tokens,6]")
-    if ids.dtype not in (torch.int32, torch.int64) or experts <= 0:
+    if ids.dtype not in (torch.int32, torch.int64) or experts <= 0 or quantum not in (32, 64):
         raise ValueError("Prefill requires integer routes and positive expert count")
     routes = ids.numel()
     if routes * experts >= 2**31:
@@ -38,15 +40,16 @@ def device_bucketed_route_blocks(ids, experts=384):
     keys = flat * routes + torch.arange(routes, dtype=torch.int32, device=ids.device)
     order = keys.sort().values.remainder(routes).long()
     full = counts // 256
-    rounded = ((counts.remainder(256) + 63) // 64) * 64
+    rounded = ((counts.remainder(256) + quantum - 1) // quantum) * quantum
     descriptors, occupied = [], []
-    for rows in _ROW_BUCKETS:
-        width = expert_bucket_width(rows)
+    buckets = _FP8_ROW_BUCKETS if quantum == 32 else _ROW_BUCKETS
+    for rows in buckets:
+        width = expert_bucket_width(rows, quantum)
         block_counts = (rounded == rows).int()
         if rows == 256:
             block_counts = block_counts + full
-        # Every remainder has at least rows-63 routes; full slabs do as well.
-        capacity = routes // (rows - 63)
+        # Every remainder has at least rows-quantum+1 routes; full slabs do as well.
+        capacity = routes // (rows - quantum + 1)
         if rows < 256:
             capacity = min(experts, capacity)
         capacity = max(width, ((capacity + width - 1) // width) * width)
@@ -90,13 +93,21 @@ class _BucketedPrefillPlans:
         self.plans.clear()
         self.workspace = None
 
-    def __call__(self, value, ids, routing, q13, q2, s13, s2, lookup, normal_scales):
+    def __call__(self, value, ids, routing, q13, q2, s13, s2, lookup, normal_scales, channel13=None):
         import vllm_gaudi.envs as envs
-        from vllm_gaudi.ops.deepseek_v41_grouped_prefill import compiled_reduce, compiled_write_body
+        from vllm_gaudi.ops.deepseek_v41_grouped_prefill import (compiled_reduce, compiled_single_prequant,
+                                                                 compiled_write_body)
         from vllm_gaudi.ops.deepseek_v41_prefill_plan import PrefillExpertPlan, _expert_audit
 
         interleaved = envs.VLLM_HPU_DSV41_PREFILL_COLUMN_INTERLEAVE and bool(normal_scales)
-        if interleaved:
+        single_fp8 = channel13 is not None
+        if single_fp8 and not interleaved:
+            raise ValueError("Bucketed W13 FP8 requires interleaved columns and normal scale codes")
+        if single_fp8:
+            from vllm_gaudi.ops.deepseek_v41_prefill_columns import (compiled_permuted_reduce,
+                                                                     compiled_permuted_single_fp8_write_body)
+            compile_body, compile_reduce = compiled_permuted_single_fp8_write_body, compiled_permuted_reduce
+        elif interleaved:
             from vllm_gaudi.ops.deepseek_v41_prefill_columns import (compiled_permuted_reduce,
                                                                      compiled_permuted_write_body)
             compile_body, compile_reduce = compiled_permuted_write_body, compiled_permuted_reduce
@@ -110,19 +121,27 @@ class _BucketedPrefillPlans:
         if self.workspace is None or tuple(self.workspace.shape) != workspace_shape:
             self.close()
             self.workspace = value.new_empty(workspace_shape)
-        desc = _compiled_routes((ids.shape[0], q13.shape[0]))(ids, q13.shape[0])
+        if single_fp8:
+            high, high_scale = compiled_single_prequant((value.shape[0], value.shape[-1]))(value)
+        quantum = 32 if single_fp8 else 64
+        buckets = _FP8_ROW_BUCKETS if single_fp8 else _ROW_BUCKETS
+        desc = _compiled_routes((ids.shape[0], q13.shape[0], quantum))(ids, q13.shape[0], quantum)
         active = [int(count) for count in desc[-1].cpu().tolist()]
-        weight_signature = tuple((tuple(v.shape), v.stride(), v.dtype, v.device) for v in (q13, q2, s13, s2, lookup))
-        for index, rows in enumerate(_ROW_BUCKETS):
+        weights = (q13, q2, s13, s2, lookup, channel13) if single_fp8 else (q13, q2, s13, s2, lookup)
+        weight_signature = tuple((tuple(v.shape), v.stride(), v.dtype, v.device) for v in weights)
+        for index, rows in enumerate(buckets):
             if not active[index]:
                 continue
-            width = expert_bucket_width(rows)
+            width = expert_bucket_width(rows, quantum)
             experts, slots = desc[index * 2:index * 2 + 2]
             arguments = (value, routing, slots, experts, q13, q2, s13, s2, lookup, normal_scales, self.workspace)
-            signature = (rows, bool(normal_scales), interleaved, value.stride(), weight_signature)
+            if single_fp8:
+                arguments += (channel13, high, high_scale)
+            signature = (rows, bool(normal_scales), interleaved, single_fp8, value.stride(), weight_signature)
             plan = self.plans.get(signature)
             if plan is None:
-                body = compile_body(("bucketed", value.shape[0], rows, q13.shape[0], bool(normal_scales)))
+                body = compile_body(("bucketed_fp8" if single_fp8 else "bucketed", value.shape[0], rows, q13.shape[0],
+                                     bool(normal_scales)))
                 groups = [
                     torch.arange(start, start + width, dtype=torch.int32, device=value.device)
                     for start in range(0, slots.shape[0], width)
@@ -140,12 +159,12 @@ class _BucketedPrefillPlans:
             (value.shape[0], value.shape[-1]))(self.workspace[:-1].reshape(value.shape[0], 6, value.shape[-1]))
 
 
-def run_bucketed_prefill(value, ids, routing, q13, q2, s13, s2, lookup, normal_scales):
+def run_bucketed_prefill(value, ids, routing, q13, q2, s13, s2, lookup, normal_scales, channel13=None):
     executor = _executors.get(value.device)
     if executor is None:
         executor = _BucketedPrefillPlans()
         _executors[value.device] = executor
-    return executor(value, ids, routing, q13, q2, s13, s2, lookup, normal_scales)
+    return executor(value, ids, routing, q13, q2, s13, s2, lookup, normal_scales, channel13)
 
 
 def invalidate_bucketed_prefill_plans():

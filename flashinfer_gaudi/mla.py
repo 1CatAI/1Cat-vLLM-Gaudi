@@ -77,7 +77,7 @@ def sparse_mla_prefill(query,
                        lengths,
                        *,
                        sm_scale=None,
-                       query_tile=512,
+                       query_tile=1024,
                        native_inputs=False,
                        full_valid=False):
     """Return BF16 ``[T,H,512]`` sparse MLA output from a flat latent cache.
@@ -99,8 +99,8 @@ def sparse_mla_prefill(query,
             or indices.shape[0] != tokens or not 1 <= indices.shape[1] <= 640 or sink.shape != (heads, )
             or lengths.shape != (tokens, )):
         raise ValueError("Sparse MLA cache, indices, sink or lengths contract changed")
-    if query_tile not in (16, 32, 64, 128, 256, 512):
-        raise ValueError("Sparse MLA query tile must be 16,32,64,128,256 or 512")
+    if query_tile not in (16, 32, 64, 128, 256, 512, 1024):
+        raise ValueError("Sparse MLA query tile must be 16,32,64,128,256,512 or 1024")
     expected = (torch.bfloat16, torch.bfloat16, torch.int32, torch.float32, torch.int32)
     tensors = (query, cache, indices, sink, lengths)
     if any(t.dtype != dtype or t.device != query.device or t.requires_grad for t, dtype in zip(tensors, expected)):
@@ -119,10 +119,19 @@ def sparse_mla_prefill(query,
     # pass and the later sink concat while preserving the SDPA operands.
     tile_cache = cache if (full_valid or native_inputs) else _cache_with_zero_row(cache)
     prepare = _full_valid_tile_inputs if full_valid else (_native_tile_inputs if native_inputs else _final_tile_inputs)
+    # Give PV an independent gather. With one shared KV tensor the compiler
+    # spills it to DRAM after QK; the second bounded gather keeps PV's input in
+    # SRAM. Separate IDs prevent CSE from folding the two gathers together.
+    value_ids = indices.clone() if not (full_valid or native_inputs) else None
     outputs = []
     for start in range(0, tokens, query_tile):
         stop = min(start + query_tile, tokens)
         q, kv, mask = prepare(query[start:stop], tile_cache, indices[start:stop], sink, lengths[start:stop])
-        output = FusedSDPA.apply(q, kv, kv, mask, 0.0, False, factor, "fp32", True)
+        if value_ids is None:
+            values = kv
+        else:
+            _, values, _ = _final_tile_inputs(query[start:stop], tile_cache, value_ids[start:stop], sink,
+                                              lengths[start:stop])
+        output = FusedSDPA.apply(q, kv, values, mask, 0.0, False, factor, "fp32", True)
         outputs.append(output.squeeze(1))
     return torch.cat(outputs, 0)

@@ -59,6 +59,7 @@ setup(
                 "hpu_dsv41_index_pt2.cpp", "hpu_dsv41_index_keys_pt2.cpp", "hpu_dsv41_prefill_route_pt2.cpp",
                 "hpu_dsv41_prefill_mhc_pt2.cpp", "hpu_dsv41_candidate_gather_pt2.cpp",
                 "hpu_dsv41_prefill_flash_pt2.cpp", "hpu_dsv41_prefill_sparse_mla_pt2.cpp",
+                "hpu_dsv41_prefill_bmm_pt2.cpp",
                 "hpu_dsv41_prefill_paged_index_pt2.cpp", "hpu_dsv41_prefill_main_decode_pt2.cpp"
             ],
             include_dirs=includes,

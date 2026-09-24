@@ -81,10 +81,10 @@ def compiled_prefill_mla(signature):
 
 
 def flash_prefill_mla(query, cache, indices, sink):
-    """Compile shared-KV gather, sink mask and Gaudi Flash Attention together."""
-    from flashinfer_gaudi.mla import sparse_mla_prefill
+    """Compile bounded KV gathers and BF16 MLA with an FP32 sink together."""
+    from vllm_gaudi.ops.deepseek_v41_prefill_mla import sparse_prefill_mla
     lengths = torch.full((query.shape[0], ), indices.shape[1], dtype=torch.int32, device=query.device)
-    return sparse_mla_prefill(query, cache, indices, sink, lengths, query_tile=512)
+    return sparse_prefill_mla(query, cache, indices, sink, lengths, query_tile=1024)
 
 
 @lru_cache(maxsize=32)
@@ -906,16 +906,15 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
     def _prefill_sparse(self, query, cache, indices):
         if gaudi_envs.VLLM_HPU_DSV41_FLASHINFER_PREFILL:
             outputs = []
-            # Retain C512 HPU FusedSDPA tiles inside one larger compiled
-            # recipe. A complete C8192 prefill then publishes four recipes
-            # instead of sixteen without changing attention arithmetic.
+            # Keep the gathered working set bounded inside a larger compiled
+            # recipe, while the caller retains the complete query sequence.
             outer_rows = 2048
             for start in range(0, query.shape[0], outer_rows):
                 stop = min(start + outer_rows, query.shape[0])
                 signature = (stop - start, tuple(query.shape[1:]), tuple(cache.shape), indices.shape[1])
                 outputs.append(
-                    compiled_flash_prefill_mla(signature)(query[start:stop].clone(), cache, indices[start:stop].clone(),
-                                                          self.weights.attn_sink))
+                    compiled_flash_prefill_mla(signature)(query[start:stop].contiguous(), cache,
+                                                          indices[start:stop].contiguous(), self.weights.attn_sink))
             return torch.cat(outputs, 0)
         tile = gaudi_envs.VLLM_HPU_DSV41_PREFILL_MLA_ROWS
         if tile:

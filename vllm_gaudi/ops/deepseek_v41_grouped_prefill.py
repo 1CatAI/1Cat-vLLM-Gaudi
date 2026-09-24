@@ -409,10 +409,11 @@ def prepare_device_grouped_prefill_recipes(normal_scales: bool = True):
             expert_ids = torch.zeros((1, groups), dtype=torch.int32, device=device)
             mode = envs.VLLM_HPU_DSV41_PREFILL_GROUPED_FP8
             if mode:
-                if mode not in ("w13", "w13_dual", "w13_dual_prequant", "w13_single_prequant", "w2", "both"):
+                if mode not in ("w13", "w13_dual", "w13_dual_prequant", "w13_single_prequant", "w13_single_bucket",
+                                "w2", "both"):
                     raise ValueError("Grouped Prefill FP8 mode must be w13, w13_dual, w13_dual_prequant, "
-                                     "w13_single_prequant, w2 or both")
-                if mode in ("w13_dual_prequant", "w13_single_prequant"):
+                                     "w13_single_prequant, w13_single_bucket, w2 or both")
+                if mode in ("w13_dual_prequant", "w13_single_prequant", "w13_single_bucket"):
                     # This mode consumes the pre-quantized per-token operands
                     # through its own route-write recipe below.
                     continue
@@ -539,21 +540,25 @@ def run_device_grouped_prefill(value,
         raise ValueError("Prefill expert rows must be 32, 64, 128 or 512")
     mark_empty = envs.VLLM_HPU_DSV41_PREFILL_SKIP_EMPTY
     fp8_mode = envs.VLLM_HPU_DSV41_PREFILL_GROUPED_FP8
-    if fp8_mode not in ("", "w13", "w13_dual", "w13_dual_prequant", "w13_single_prequant", "w2", "both"):
+    if fp8_mode not in ("", "w13", "w13_dual", "w13_dual_prequant", "w13_single_prequant", "w13_single_bucket", "w2",
+                        "both"):
         raise ValueError("Grouped Prefill FP8 mode must be empty, w13, w13_dual, w13_dual_prequant, "
-                         "w13_single_prequant, w2 or both")
+                         "w13_single_prequant, w13_single_bucket, w2 or both")
     if fp8_mode and (not isinstance(channel13, torch.Tensor) or not isinstance(channel2, torch.Tensor)):
         raise ValueError("Grouped Prefill FP8 requires both prepared channel-scale tensors")
-    if fp8_mode in ("w13_dual_prequant", "w13_single_prequant") and not envs.VLLM_HPU_DSV41_PREFILL_HYBRID_ROWS:
+    if fp8_mode in ("w13_dual_prequant", "w13_single_prequant",
+                    "w13_single_bucket") and not envs.VLLM_HPU_DSV41_PREFILL_HYBRID_ROWS:
         raise ValueError("Pre-quantized W13 requires hybrid route plans")
     if envs.VLLM_HPU_DSV41_PREFILL_HYBRID_ROWS:
-        if (rows != 128 or fp8_mode not in ("", "w13_dual", "w13_dual_prequant", "w13_single_prequant")
+        if (rows != 128
+                or fp8_mode not in ("", "w13_dual", "w13_dual_prequant", "w13_single_prequant", "w13_single_bucket")
                 or not envs.VLLM_HPU_DSV41_PREFILL_NATIVE_PLAN or not envs.VLLM_HPU_DSV41_PREFILL_ROUTE_OUTPUT
                 or not envs.VLLM_HPU_DSV41_PREFILL_FAST_DEQUANT or not envs.VLLM_HPU_DSV41_PREFILL_SKIP_EMPTY):
             raise ValueError("Hybrid prefill rows require BF16 or W13 FP8 128-row native route-output plans")
-        if not fp8_mode:
+        if fp8_mode in ("", "w13_single_bucket"):
             from vllm_gaudi.ops.deepseek_v41_prefill_buckets import run_bucketed_prefill
-            return run_bucketed_prefill(value, ids, routing, q13, q2, s13, s2, lookup, normal_scales)
+            return run_bucketed_prefill(value, ids, routing, q13, q2, s13, s2, lookup, normal_scales,
+                                        channel13 if fp8_mode else None)
         from vllm_gaudi.ops.deepseek_v41_prefill_plan import execute_prefill_experts, routed_workspace
         base_ids, base_slots, tail_ids, tail_slots, occupied = compiled_hybrid_routes(
             (ids.shape[0], q13.shape[0], rows, 64))(ids, q13.shape[0], rows, 64)

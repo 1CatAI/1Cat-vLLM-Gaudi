@@ -56,17 +56,15 @@ void main(tensor input, tensor output, tensor scales) {
         const float64 raw_scale = round_bf16(maximum * (float)(bf16)(1.0f / 240.0f));
         const float64 scale = round_bf16(raw_scale + (float)(bf16)(1.0e-8f / 240.0f));
         const float64 inverse = round_bf16(reciprocal_without_lookup(scale));
+        const float128 inverse_pair = {inverse, inverse};
+        const bfloat128 inverse_bf16 = v_convert_f32_to_bf16_all_b(inverse_pair);
         int5 scale_coord = {0, row, 0, 0, 0};
         v_f32_st_tnsr(scale_coord, scales, scale);
         #pragma loop_unroll(2) pipelined taken
         for (int tile = 0; tile < width / 128; ++tile) {
-            const bfloat128 value = activated[tile];
-            const float64_pair_t fp32 = v_convert_bf16_to_f32_all_b(value);
-            minifloat256 packed = 0;
-            // Combine the paired conversion lanes and both source groups
-            // before compacting the dual groups into 128 contiguous FP8 bytes.
-            packed = v_convert_f32_to_f8_b(round_bf16(fp32.v1 * inverse), 0, SW_CLIP_FP, packed);
-            packed = v_convert_f32_to_f8_b(round_bf16(fp32.v2 * inverse), 2, SW_CLIP_FP, packed);
+            // The original product is rounded to BF16 before FP8 conversion.
+            const bfloat128 value = activated[tile] * inverse_bf16;
+            minifloat256 packed = v_convert_bf16_to_f8_b(value, 0, SW_CLIP_FP, (minifloat256)0);
             const minifloat256 sparse = packed;
             packed = v_f8_pack_b(sparse, SW_GROUP_0 | SW_STRIDE_2, (minifloat256)0);
             packed = v_f8_pack_b(sparse, SW_GROUP_1 | SW_STRIDE_2, packed);
