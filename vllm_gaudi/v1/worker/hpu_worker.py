@@ -363,6 +363,14 @@ class HPUWorker(WorkerBase):
                     )):
                 required_ops.append(
                     "custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_shared_prefetch_w2_fp8_gaudi2")
+            from vllm_gaudi import envs as gaudi_envs
+            if gaudi_envs.VLLM_HPU_DSV41_PREFILL_NATIVE_PLAN:
+                required_ops.append("custom_deepseek_v41_prefill_route_write_gaudi2")
+            if gaudi_envs.VLLM_HPU_DSV41_PREFILL_FAST_DEQUANT:
+                required_ops.append("custom_deepseek_v41_prefill_weight_bf16_gaudi2")
+            if (gaudi_envs.VLLM_HPU_DSV41_PREFILL_HYBRID_ROWS and gaudi_envs.VLLM_HPU_DSV41_PREFILL_COLUMN_INTERLEAVE
+                    and not gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED_FP8):
+                required_ops.append("custom_deepseek_v41_prefill_permuted_bf16_gaudi2")
             load_native_operators(required_ops)
         torch.hpu.set_device(device_index)
         logger.info("HPU worker rank=%d local_rank=%d module=%s visible=%s prepared_v41=%s", self.rank, device_index,

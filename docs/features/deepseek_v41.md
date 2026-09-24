@@ -310,6 +310,12 @@ runtime fingerprints with further qualification results.
 
 ### Prefill decoder column layout
 
+The dedicated entrypoint enables occupancy buckets automatically when N256
+expert storage is selected. Every expert uses full 256-row slabs plus a
+remainder rounded to 64, 128, 192 or 256 rows. Native replay submits only the
+occupied recipe prefix and keeps route workspaces alive through their consumers.
+Set `VLLM_HPU_DSV41_PREFILL_HYBRID_ROWS=0` to select fixed-row plans for diagnosis.
+
 The occupancy-bucket path automatically selects a native decoder for
 qualified normal-scale BF16 expert weights.
 It retains the converter's even/odd column order within each N256 weight tile,
@@ -317,10 +323,18 @@ restores W13 columns on the smaller activation tensor, and restores W2 columns
 after the original ordered six-route reduction. The prepared compressed weight
 layout and allocation are reused. Selection does not depend on prompt length.
 
-Rebuild the native kernel and PyTorch libraries when updating this code.
+Rebuild the native kernel, PyTorch libraries and TP2 Bridge when updating this
+code. The Bridge must expose `replay_prepared_groups_prefix`; workers validate
+required MoE operators before model allocation.
 Component checks cover independent decoder agreement, route bucket boundaries,
 changing inputs and the existing BF16 arithmetic boundary. Normal serving
 checks cover the frozen prefill request and two other prompt lengths. The
 decoder is not selected for optional FP8 grouped-prefill modes or non-normal
 scale encodings. Set `VLLM_HPU_DSV41_PREFILL_COLUMN_INTERLEAVE=0` to disable it
 for diagnosis.
+
+Grouped FP8 modes remain explicit experiments selected with
+`VLLM_HPU_DSV41_PREFILL_GROUPED_FP8`. Dual W13 modes use high and residual
+activation terms; `w13_single_prequant` uses one term and has greater
+quantization error. These modes change rounding and require workload quality
+validation. The default empty mode keeps BF16 arithmetic.

@@ -6,10 +6,11 @@ import pytest
 from vllm_gaudi.entrypoints.deepseek_v41 import (
     _C1_FASTPATH_DEFAULTS,
     _NUMERIC_FASTPATH_DEFAULTS,
+    _PREFILL_MOE_DEFAULTS,
     prepare_default_fastpaths,
 )
 
-_PROFILE_KEYS = set(_C1_FASTPATH_DEFAULTS) | set(_NUMERIC_FASTPATH_DEFAULTS) | {
+_PROFILE_KEYS = set(_C1_FASTPATH_DEFAULTS) | set(_NUMERIC_FASTPATH_DEFAULTS) | set(_PREFILL_MOE_DEFAULTS) | {
     "VLLM_HPU_DSV41_DEFAULT_FASTPATHS",
     "VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS",
     "VLLM_HPU_DSV41_DSPARK",
@@ -18,6 +19,7 @@ _PROFILE_KEYS = set(_C1_FASTPATH_DEFAULTS) | set(_NUMERIC_FASTPATH_DEFAULTS) | {
     "VLLM_HPU_DSV41_ENGRAM_FP8_SIDECAR",
     "VLLM_HPU_DSV41_PREFILL_GROUPED_FP8",
     "VLLM_HPU_DSV41_PREFILL_INDEX_QUERY_TP",
+    "VLLM_HPU_DSV41_EXPERT_N256",
 }
 
 
@@ -45,6 +47,7 @@ def test_default_profile_enables_qualified_numeric_bundle(monkeypatch, tmp_path)
     assert os.environ["VLLM_HPU_DSV41_DSPARK"] == "0"
     assert all(os.environ[key] == value for key, value in _C1_FASTPATH_DEFAULTS.items())
     assert all(os.environ[key] == value for key, value in _NUMERIC_FASTPATH_DEFAULTS.items())
+    assert all(os.environ[key] == value for key, value in _PREFILL_MOE_DEFAULTS.items())
     assert os.environ["VLLM_HPU_DSV41_WO_A_FP8_SIDECAR"] == str((tmp_path / "sidecars" / "wo_a_fp8").resolve())
     assert os.environ["VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR"] == str(
         (tmp_path / "sidecars" / "attention_dense_fp8").resolve())
@@ -85,10 +88,26 @@ def test_experimental_numeric_bundle_discovers_sidecars(monkeypatch, tmp_path):
     assert os.environ["VLLM_HPU_DSV41_ENGRAM_FP8_SIDECAR"] == str((model / "sidecars" / "engram_fp8").resolve())
 
 
+@pytest.mark.parametrize("n256", (False, True))
+def test_prefill_moe_defaults_require_n256_storage(monkeypatch, tmp_path, n256):
+    _clear_profile(monkeypatch)
+    monkeypatch.setenv("VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS", "0")
+    if n256:
+        monkeypatch.setenv("VLLM_HPU_DSV41_EXPERT_N256", "1")
+
+    prepare_default_fastpaths(tmp_path)
+
+    if n256:
+        assert all(os.environ[key] == value for key, value in _PREFILL_MOE_DEFAULTS.items())
+    else:
+        assert not any(key in os.environ for key in _PREFILL_MOE_DEFAULTS)
+
+
 def test_default_profile_respects_individual_override(monkeypatch, tmp_path):
     _clear_profile(monkeypatch)
     monkeypatch.setenv("VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS", "1")
     monkeypatch.setenv("VLLM_HPU_DSV41_WO_A_FP8", "0")
+    monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_HYBRID_ROWS", "0")
     (tmp_path / "sidecars" / "attention_dense_fp8").mkdir(parents=True)
     (tmp_path / "sidecars" / "engram_fp8").mkdir(parents=True)
 
@@ -96,6 +115,7 @@ def test_default_profile_respects_individual_override(monkeypatch, tmp_path):
 
     assert os.environ["VLLM_HPU_DSV41_WO_A_FP8"] == "0"
     assert "VLLM_HPU_DSV41_WO_A_FP8_SIDECAR" not in os.environ
+    assert os.environ["VLLM_HPU_DSV41_PREFILL_HYBRID_ROWS"] == "0"
 
 
 @pytest.mark.parametrize(("runner", "adapter"), (("0", None), (None, "0")))
