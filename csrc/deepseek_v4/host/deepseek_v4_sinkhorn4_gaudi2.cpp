@@ -28,22 +28,22 @@ tpc_lib_api::GlueCodeReturn DeepseekV4Sinkhorn4Gaudi2::GetGcDefinitions(
             tensor.geometry.dataType = DATA_F32;
             return GLUE_INCOMPATIBLE_DATA_TYPE;
         }
-        if (tensor.geometry.dims != 3 || tensor.geometry.maxSizes[0] != 4 ||
-            tensor.geometry.maxSizes[1] != 4 || tensor.geometry.maxSizes[2] < 1 ||
-            tensor.geometry.maxSizes[2] > 8192 ||
-            tensor.geometry.maxSizes[2] != in->inputTensors[0].geometry.maxSizes[2]) {
+        if (tensor.geometry.dims != 2 || tensor.geometry.maxSizes[1] != 1 ||
+            tensor.geometry.maxSizes[0] < 16 || tensor.geometry.maxSizes[0] > 8192 * 16 ||
+            tensor.geometry.maxSizes[0] % 16 != 0 ||
+            tensor.geometry.maxSizes[0] != in->inputTensors[0].geometry.maxSizes[0]) {
             return i == 0 ? GLUE_INCOMPATIBLE_INPUT_SIZE : GLUE_INCOMPATIBLE_OUTPUT_SIZE;
         }
         auto& access = i == 0 ? out->inputTensorAccessPattern[0] : out->outputTensorAccessPattern[0];
-        for (unsigned dim = 0; dim < 3; ++dim) {
+        for (unsigned dim = 0; dim < 2; ++dim) {
             access.mapping[dim].indexSpaceDim = 0;
-            access.mapping[dim].a = dim == 2 ? 1 : 0;
+            access.mapping[dim].a = dim == 0 ? 64 : 0;
             access.mapping[dim].start_b = 0;
-            access.mapping[dim].end_b = dim == 2 ? 0 : 3;
+            access.mapping[dim].end_b = dim == 0 ? 63 : 0;
         }
     }
     out->indexSpaceRank = 1;
-    out->indexSpaceGeometry[0] = in->inputTensors[0].geometry.maxSizes[2];
+    out->indexSpaceGeometry[0] = (in->inputTensors[0].geometry.maxSizes[0] + 63) / 64;
     out->kernel.paramsNr = 0;
     auto* start = &_binary___deepseek_v4_sinkhorn4_gaudi2_o_start;
     auto* end = &_binary___deepseek_v4_sinkhorn4_gaudi2_o_end;
