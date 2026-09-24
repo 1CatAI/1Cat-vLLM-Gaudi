@@ -1,37 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
-// Four independent checkpoint group-32 codecs share one BF16 vector load.
-// The linear conversion preserves contiguous groups in the two FP32 vectors.
-static inline float64 v41_group32_max(float64 value) {
-    value = v_f32_max_b(value, v_f32_mov_dual_group_all_b(
-        value, 0xffffffff, 1, 0, 3, 2, MkWrA(3, 3, 3, 3), 0));
-    value = v_f32_max_b(value, v_f32_mov_group_b(value, 0xffffffff, 63, 0));
-    float64 maximum = 0;
-    #pragma loop_unroll(8)
-    for (int lane = 0; lane < 8; ++lane)
-        maximum = v_f32_max_b(maximum,
-            v_f32_shuffle_b(value, (uchar256)(0x80 | lane), 0, value));
-    return maximum;
-}
-
-static inline float64 v41_group32_roundtrip(float64 value) {
-    const float64 absolute = v_f32_abs_b(value);
-    const uint64 bits = as_uint64(absolute);
-    const float64 any_nan = v41_group32_max(v_f32_sel_grt_u32_b(bits, 0x7f800000, 1.0f, 0.0f));
-    float64 maximum = v_f32_max_b(v41_group32_max(absolute), 1.0e-4f);
-    maximum = v_f32_sel_grt_f32_b(any_nan, 0.0f, 1.0e-4f, maximum);
-    const uint64 maximum_bits = as_uint64(maximum);
-    const int64 exponent = convert_uint64_to_int64(maximum_bits >> 23, 0) - 135;
-    const int64 adjustment = v_i32_sel_grt_u32_b(maximum_bits & 0x7fffff, 0x600000, 1, 0);
-    const int64 scale_exponent = exponent + adjustment;
-    const float64 scale = as_float64((scale_exponent + 127) << 23);
-    const float64 reciprocal = as_float64((127 - scale_exponent) << 23);
-    const float64 normalized = absolute * reciprocal;
-    const uint64 rounded = (bits + 0x7ffff + ((bits >> 20) & 1)) & 0xfff00000;
-    const int64 tiny_code = v_convert_f32_to_i32_b(normalized * 512.0f, 0, SW_RHNE);
-    const float64 tiny = convert_int64_to_float64(tiny_code, 0) * (scale * 0.001953125f);
-    float64 result = v_f32_sel_less_f32_b(normalized, 0.015625f, tiny, as_float64(rounded));
-    result = v_f32_min_b(result, scale * 448.0f);
-    result = as_float64(as_uint64(result) | (as_uint64(value) & 0x80000000));
-    result = v_f32_sel_eq_f32_b(result, 0.0f, 0.0f, result);
-    return v_f32_sel_grt_u32_b(bits, 0x7f800000, as_float64((uint64)0x7fffffff), result);
+// Four independent group-32 codecs share a BF16 vector. Positive BF16 bit
+// patterns preserve magnitude order, with NaNs sorting above infinity.
+static inline bfloat128 v41_group32_roundtrip_bf16(bfloat128 value) {
+    const ushort128 original = *((ushort128*)&value);
+    const ushort128 magnitude = original & 0x7fff;
+    ushort128 maximum = v_u16_max_b(magnitude, v_u16_mov_group_b(magnitude, 0xffffffff, 63, 0));
+    const uchar256 lane = read_lane_id_1b_b();
+    #pragma loop_unroll(4)
+    for (int offset = 2; offset <= 16; offset *= 2) {
+        const uchar256 selector = ((lane ^ offset) & 31) | 0x80;
+        const uchar256 shuffled = v_u8_shuffle_b(*((uchar256*)&maximum), selector, 0, (uchar256)0);
+        maximum = v_u16_max_b(maximum, *((ushort128*)&shuffled));
+    }
+    // The BF16 value below 1e-4 selects the same scale exponent as the FP32
+    // floor. A group containing NaN retains the original minimum-scale rule.
+    maximum = v_u16_max_b(maximum, 0x38d1);
+    maximum = v_u16_sel_grt_u16_b(maximum, 0x7f80, 0x38d1, maximum);
+    const short128 exponent = convert_ushort128_to_short128(maximum >> 7, 0) - 135
+        + v_i16_sel_grt_u16_b(maximum & 127, 96, 1, 0);
+    const short128 input_exponent = convert_ushort128_to_short128(magnitude >> 7, 0);
+    // Subnormal FP8 codes are integers on the scale/512 grid. Clamp the
+    // shift for lanes outside this branch and for values rounding to zero.
+    const short128 shift = v_i16_max_b(v_i16_min_b(exponent + 125 - input_exponent, 9), 1);
+    const ushort128 significand = (magnitude & 127) | 128;
+    const ushort128 code = (significand + ((ushort128)1 << (shift - 1)) - 1
+        + ((significand >> shift) & 1)) >> shift;
+    const bfloat128 small_code = convert_ushort128_to_bfloat128(code, SW_RHNE);
+    const ushort128 grid_bits = (ushort128)((exponent + 118) << 7);
+    const bfloat128 tiny = small_code * *((bfloat128*)&grid_bits);
+    // Keep three mantissa bits with ties to even, then saturate at 448*scale.
+    const ushort128 rounded = (magnitude + 7 + ((magnitude >> 4) & 1)) & 0xfff0;
+    ushort128 result = v_u16_sel_less_i16_b(input_exponent, exponent + 121,
+                                            *((ushort128*)&tiny), rounded);
+    const ushort128 cap = v_u16_min_b((ushort128)(((exponent + 135) << 7) + 96), 0x7f80);
+    result = v_u16_min_b(result, cap) | (original & 0x8000);
+    result = v_u16_sel_eq_u16_b(result & 0x7fff, 0, 0, result);
+    result = v_u16_sel_grt_u16_b(magnitude, 0x7f80, 0x7fff, result);
+    return *((bfloat128*)&result);
 }

@@ -53,10 +53,24 @@ def main():
     bits = torch.arange(65536, dtype=torch.int32).short().view(torch.bfloat16)
     cases = [("all_bf16_codes", bits.reshape(512, 128)),
              ("all_bf16_codes_permuted", bits[torch.randperm(65536)].reshape(512, 128))]
-    for width in (32, 64, 96, 128, 160, 1280, 5120):
+    for width in (32, 64, 96, 128, 160, 384, 416, 1280, 5120):
         x = torch.randn(7, width).reshape(7, -1, 32)
         scales = torch.exp2((torch.arange(width // 32) % 40 - 20).float())
         cases.append((f"tails_and_group_scale_K{width}", (x * scales[None, :, None]).reshape(7, width).bfloat16()))
+    # Exercise the exponent increment at mantissa 96/97 and the rounding
+    # midpoints on every small FP8 grid, with independent neighboring groups.
+    boundaries = []
+    for exponent in range(113, 256):
+        for mantissa in (0, 96, 97, 127):
+            if exponent == 255 and mantissa:
+                continue
+            maximum = (exponent << 7) | mantissa
+            for distance in (15, 16, 17, 18, 19):
+                fractions = (0, 15, 16, 17, 31, 32, 33, 47, 48, 49, 63, 64, 65, 95, 96, 97, 111, 112, 113, 127)
+                small = [((exponent - distance) << 7) | fraction for fraction in fractions]
+                boundaries.extend([maximum, *small, *(value | 0x8000 for value in small[:10]), 0x8000])
+    boundary_bits = torch.tensor(boundaries, dtype=torch.int32).short().view(torch.bfloat16)
+    cases.append(("scale_and_tiny_rounding_boundaries", boundary_bits.reshape(-1, 32)))
     with torch.inference_mode():
         for name, source in cases:
             x = source.to("hpu")
