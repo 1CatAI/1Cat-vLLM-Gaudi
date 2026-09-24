@@ -229,8 +229,16 @@ void runPreparedExchangeNode(const std::shared_ptr<habana::HcclCommunicator>& co
 }
 
 void replayPreparedGroups(std::vector<std::shared_ptr<PreparedGroupPlan>> plans,
-                           std::vector<torch::jit::Stack> inputs) {
+                           std::vector<torch::jit::Stack> inputs,
+                           std::vector<size_t> node_limits = {}) {
   TORCH_CHECK(plans.size() == inputs.size() && !plans.empty(), "Prepared group/input count mismatch");
+  if (node_limits.empty()) {
+    for (const auto& plan : plans) node_limits.push_back(plan->nodes.size());
+  }
+  TORCH_CHECK(node_limits.size() == plans.size(), "Prepared node-limit count mismatch");
+  for (size_t i = 0; i < plans.size(); ++i)
+    TORCH_CHECK(node_limits[i] > 0 && node_limits[i] <= plans[i]->nodes.size(),
+                "Prepared node limit must be a nonempty prefix");
   TORCH_CHECK(c10::hpu::getCurrentHPUStream().stream() == 0, "Prepared replay requires default compute stream");
   std::vector<PreparedFrame> frames;
   frames.reserve(plans.size());
@@ -253,10 +261,12 @@ void replayPreparedGroups(std::vector<std::shared_ptr<PreparedGroupPlan>> plans,
   g_prepared_batches.fetch_add(1, std::memory_order_relaxed);
   g_prepared_groups.fetch_add(frames.size(), std::memory_order_relaxed);
   habana::eager::PipelineTask<habana::eager::ThreadType::LOWERING>(
-      [frames = std::move(frames)]() mutable {
-        for (auto& frame : frames) {
+      [frames = std::move(frames), node_limits = std::move(node_limits)]() mutable {
+        for (size_t frame_index = 0; frame_index < frames.size(); ++frame_index) {
+          auto& frame = frames[frame_index];
           auto held = std::make_shared<PreparedFrame>(std::move(frame));
-          for (const auto& node : held->plan->nodes) {
+          for (size_t node_index = 0; node_index < node_limits[frame_index]; ++node_index) {
+            const auto& node = held->plan->nodes[node_index];
             if (!node.exchange) {
               torch::jit::Stack input;
               std::vector<at::Tensor> output;

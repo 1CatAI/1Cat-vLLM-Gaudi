@@ -2,7 +2,6 @@
 """Immutable channel-scaled Engram projection weights for Gaudi2 MME."""
 import json
 import math
-import os
 from pathlib import Path
 
 from vllm_gaudi.ops.deepseek_v41_weights import ITEM_BYTES, canonical_hash, file_hash, read_header
@@ -92,7 +91,7 @@ class EngramFP8Sidecar:
                 else:
                     destination.copy_(value, non_blocking=False)
                 self.max_host_chunk_bytes = max(self.max_host_chunk_bytes, len(storage))
-                if hasattr(os, "posix_fadvise"):
-                    os.posix_fadvise(stream.fileno(), offset, len(storage), os.POSIX_FADV_DONTNEED)
+                # Let the VM reclaim sidecar cache pages.  Four rank loaders
+                # must not synchronously drain all CPU LRUs after each chunk.
         self._check_identity()
         return destination

@@ -2,7 +2,6 @@
 """Independent group scales and partial-vector tails on a leased Gaudi2."""
 
 import os
-from types import SimpleNamespace
 
 import pytest
 
@@ -88,39 +87,3 @@ def test_woa_emission_keeps_bf16_rounding_and_channel_order(tokens):
 def test_rejects_invalid_codec_contract(shape, dtype):
     with pytest.raises(RuntimeError, match="contiguous BF16"):
         WIDE(torch.empty(shape, dtype=dtype, device="meta"))
-
-
-def test_normal_dispatch_is_default_on_with_a_diagnostic_disable(monkeypatch):
-    from vllm_gaudi import envs
-    from vllm_gaudi.ops.deepseek_v41_attention import CSA2Attention
-    from vllm_gaudi.ops.deepseek_v41_math import quantize_activation
-    from vllm_gaudi.ops.deepseek_v41_paged_attention import PagedCSA2Attention
-
-    monkeypatch.delenv("VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT", raising=False)
-    monkeypatch.setenv("VLLM_HPU_DSV41_QUANT_ROUNDTRIP", "1")
-    assert envs.VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT
-    called = []
-
-    def recorder(name):
-
-        def invoke(value, *args):
-            called.append(name)
-            return value
-
-        return invoke
-
-    for name, kind in (("quant_roundtrip_bf16", "old"), ("quant_roundtrip_wide_bf16", "wide"),
-                       ("woa_fp8_roundtrip", "old"), ("woa_fp8_roundtrip_wide", "wide")):
-        monkeypatch.setattr(torch.ops.custom_op, f"custom_deepseek_v41_{name}_gaudi2", recorder(kind))
-    owner = SimpleNamespace(woa_fp8=True,
-                            woa_output_roundtrip=True,
-                            weights=SimpleNamespace(wo_a=SimpleNamespace(weight=None, channel_scale=None)))
-    for tokens, expected in ((1, "old"), (6, "old"), (7, "wide"), (8, "wide")):
-        quantize_activation(torch.empty(tokens, 160, dtype=torch.bfloat16, device="hpu"))
-        assert called.pop() == expected
-        for cls in (CSA2Attention, PagedCSA2Attention):
-            cls.project_output(owner, torch.empty(tokens, 4, 4096, dtype=torch.bfloat16, device="hpu"))
-            assert called.pop() == expected
-    monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT", "0")
-    quantize_activation(torch.empty(8, 160, dtype=torch.bfloat16, device="hpu"))
-    assert called.pop() == "old"

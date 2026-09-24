@@ -85,10 +85,13 @@ def active_worker_cpus():
 
 def recipe_source_hashes(source_hashes):
     """Diagnostic/report scripts are archived but are not serving dependencies."""
-    return {path: digest for path, digest in source_hashes.items() if path.startswith("vllm_gaudi/")}
+    return {
+        path: digest
+        for path, digest in source_hashes.items() if path.startswith(("vllm_gaudi/", "flashinfer_gaudi/"))
+    }
 
 
-def acquire(lock_dir, count, requested_modules=None):
+def acquire(lock_dir, count, requested_modules=None, secondary_lock_dirs=()):
     held, selected = [], []
     try:
         candidates = sorted(Path("/sys/class/accel").glob("accel[0-9]*"))
@@ -105,7 +108,7 @@ def acquire(lock_dir, count, requested_modules=None):
             module = int((candidate / "device/module_id").read_text())
             local = []
             try:
-                namespaces = {lock_dir}
+                namespaces = {lock_dir, *secondary_lock_dirs}
                 if lock_dir.name in ("locks", "evidence"):
                     namespaces.update(path for name in ("locks", "evidence")
                                       if (path := lock_dir.parent / name).is_dir())
@@ -150,7 +153,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("evidence", type=Path)
     parser.add_argument("--lock-dir", required=True, type=Path)
+    parser.add_argument("--secondary-lock-dir",
+                        action="append",
+                        default=[],
+                        type=Path,
+                        help="Additional shared module-lease namespaces used by other workers")
     parser.add_argument("--runtime-profile", required=True, type=Path)
+    parser.add_argument("--source-snapshot", type=Path,
+                        help="Run an immutable archived Python source snapshot for a controlled comparison")
     parser.add_argument("--devices",
                         type=int,
                         choices=(1, 2, 4),
@@ -174,6 +184,8 @@ def main():
     # modules so a fresh temporary lease directory behaves like the existing
     # shared evidence lock directory.
     args.lock_dir.mkdir(parents=True, exist_ok=True)
+    for directory in args.secondary_lock_dir:
+        directory.mkdir(parents=True, exist_ok=True)
     profile = json.loads(args.runtime_profile.read_text())
     for item in profile.get("additional_libraries", []) + profile.get("configuration_files", []):
         path = Path(item["path"])
@@ -183,17 +195,19 @@ def main():
     for key in ("PYTHONPATH", "LD_PRELOAD", "HABANA_PROFILE", "VLLM_PLUGINS"):
         env.pop(key, None)
     env.update(profile["environment"])
+    if env.get("VLLM_HPU_DSV41_RAW_TRACE", "0") == "1" and not args.enable_profiler:
+        parser.error("Raw trace capture requires --enable-profiler to register the serving controls")
     requested_modules = None
     if args.modules:
         requested_modules = tuple(int(value) for value in args.modules.split(",") if value.strip())
         if len(requested_modules) != args.devices or len(set(requested_modules)) != len(requested_modules):
             raise RuntimeError("--modules must contain exactly --devices distinct module IDs")
-    selected, locks = acquire(args.lock_dir, args.devices, requested_modules)
+    selected, locks = acquire(args.lock_dir, args.devices, requested_modules, args.secondary_lock_dir)
     while selected is None:
         target = args.modules if args.modules else f"{args.devices} unowned Gaudi2 modules"
         print(f"Waiting for {target}; existing jobs remain untouched", flush=True)
         time.sleep(30)
-        selected, locks = acquire(args.lock_dir, args.devices, requested_modules)
+        selected, locks = acquire(args.lock_dir, args.devices, requested_modules, args.secondary_lock_dir)
     record = {
         "started_at": datetime.now(timezone.utc).isoformat(),
         "command": command,
@@ -259,19 +273,50 @@ def main():
                                                      "RUNTIME_SCALE_PATCHING")
         }
         root = Path(__file__).resolve().parents[1]
+        source_root = args.source_snapshot.resolve() if args.source_snapshot else root
+        if args.source_snapshot and not (source_root / "vllm_gaudi/__init__.py").is_file():
+            raise RuntimeError(f"Archived source snapshot is incomplete: {source_root}")
+        record["source_snapshot"] = str(source_root)
         record["source_hashes"] = {}
-        for glob in ("vllm_gaudi/**/*.py", "tools/*deepseek_v41*.py"):
-            for source in root.glob(glob):
-                record["source_hashes"][str(source.relative_to(root))] = hashlib.sha256(source.read_bytes()).hexdigest()
-                destination = args.evidence / "source" / source.relative_to(root)
+        for glob in ("vllm_gaudi/**/*.py", "vllm_gaudi/**/*.txt", "flashinfer_gaudi/**/*.py",
+                     "flashinfer_gaudi/**/*.json", "tools/*deepseek_v41*.py"):
+            for source in source_root.glob(glob):
+                record["source_hashes"][str(source.relative_to(source_root))] = hashlib.sha256(
+                    source.read_bytes()).hexdigest()
+                destination = args.evidence / "source" / source.relative_to(source_root)
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, destination)
+        # The compiler reads source lines while preparing new shapes. Execute
+        # the archived package so concurrent edits cannot change those lines
+        # or mix newly imported modules into an already loaded generation.
+        execution_root = (args.evidence / "source").resolve()
+        paths = [item for item in env.get("PYTHONPATH", "").split(os.pathsep) if item and Path(item).resolve() != root]
+        env["PYTHONPATH"] = os.pathsep.join((str(execution_root), *paths))
+        record["execution_source_root"] = str(execution_root)
+        record["environment"]["PYTHONPATH"] = env["PYTHONPATH"]
         (args.evidence / "runtime-profile.json").write_bytes(args.runtime_profile.read_bytes())
-        (args.evidence / "source.patch").write_bytes(subprocess.check_output(["git", "diff", "HEAD"], cwd=root))
+        if args.source_snapshot:
+            archive_patch = source_root.parent / "source.patch"
+            (args.evidence / "source.patch").write_bytes(archive_patch.read_bytes() if archive_patch.is_file() else b"")
+        else:
+            (args.evidence / "source.patch").write_bytes(subprocess.check_output(["git", "diff", "HEAD"], cwd=root))
         import importlib.util
         engine = Path(importlib.util.find_spec("vllm").origin).resolve().parents[1]
-        record["engine_commit"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=engine, text=True).strip()
-        engine_patch = subprocess.check_output(["git", "diff", "HEAD"], cwd=engine)
+        engine_revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=engine, text=True, capture_output=True)
+        record["engine_commit"] = engine_revision.stdout.strip() if engine_revision.returncode == 0 else None
+        engine_patch = (subprocess.check_output(["git", "diff", "HEAD"], cwd=engine)
+                        if record["engine_commit"] else b"")
+        # Installed wheels and frozen source snapshots need the same cache
+        # identity protection as a Git checkout. Include untracked Python
+        # and native engine modules even when a commit is available.
+        engine_sources = {}
+        for pattern in ("**/*.py", "**/*.so"):
+            for source in sorted((engine / "vllm").glob(pattern)):
+                with source.open("rb") as stream:
+                    engine_sources[str(source.relative_to(engine))] = hashlib.file_digest(stream, "sha256").hexdigest()
+        engine_identity = json.dumps(engine_sources, sort_keys=True).encode()
+        (args.evidence / "engine-sources.json").write_bytes(engine_identity)
+        record["engine_sources_sha256"] = hashlib.sha256(engine_identity).hexdigest()
         (args.evidence / "engine.patch").write_bytes(engine_patch)
         record["engine_patch_sha256"] = hashlib.sha256(engine_patch).hexdigest()
         if args.recipe_cache_dir is not None:
@@ -287,6 +332,7 @@ def main():
                 "source": recipe_source_hashes(record["source_hashes"]),
                 "engine": record["engine_commit"],
                 "engine_patch": record["engine_patch_sha256"],
+                "engine_sources": record["engine_sources_sha256"],
                 "runtime": profile,
                 "command": command,
                 "model_manifests": model_manifests,
@@ -319,7 +365,7 @@ def main():
         signal.signal(signal.SIGINT, stop)
         with (args.evidence / "run.log").open("w") as log:
             process = subprocess.Popen(command,
-                                       cwd=root,
+                                       cwd=execution_root,
                                        env=env,
                                        stdout=log,
                                        stderr=subprocess.STDOUT,

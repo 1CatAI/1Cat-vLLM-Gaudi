@@ -16,6 +16,9 @@ foreach(SOURCE IN LISTS KERNEL_SOURCES)
     set(OBJECT "${CMAKE_CURRENT_BINARY_DIR}/${NAME}.o")
     set(EMBEDDED "${CMAKE_CURRENT_BINARY_DIR}/${NAME}_embedded.o")
     set(EXTRA_HEADERS)
+    if(NAME STREQUAL "deepseek_v41_prefill_q_scale_rope_bf16_gaudi2")
+        list(APPEND EXTRA_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/deepseek_v41_prefill_q_scale_rope_gaudi2.c")
+    endif()
     if(NAME STREQUAL "deepseek_v41_attention_norm_bf16_gaudi2" OR
        NAME STREQUAL "deepseek_v41_final_collapse_norm_bf16_gaudi2" OR
        NAME STREQUAL "deepseek_v41_ffn_norm_quant_gaudi2" OR

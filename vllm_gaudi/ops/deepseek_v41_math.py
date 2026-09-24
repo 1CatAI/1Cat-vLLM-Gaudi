@@ -12,6 +12,8 @@ import torch
 import torch.nn.functional as F
 
 from vllm_gaudi import envs as gaudi_envs
+from vllm_gaudi.ops.deepseek_v41_prefill_regions import prefill_function_region
+from vllm_gaudi.ops.deepseek_v41_native_trace import prefill_span
 
 NATIVE_KV_CODEC_TOKENS = 8192
 
@@ -29,12 +31,9 @@ def final_rms_norm(x, weight, eps=1e-20):
     internal shape choice under the same request-slot contract; it does not
     change the server batch capacity or create a C1-only execution path.
     """
-    if (x.device.type == "hpu" and x.dtype == torch.bfloat16 and x.ndim == 2
-            and x.shape[-1] == 5120 and x.shape[0] <= 2
-            and hasattr(torch.ops.custom_op,
-                        "custom_deepseek_v41_attention_norm_bf16_gaudi2")):
-        return torch.ops.custom_op.custom_deepseek_v41_attention_norm_bf16_gaudi2(
-            x.contiguous(), weight, eps)
+    if (x.device.type == "hpu" and x.dtype == torch.bfloat16 and x.ndim == 2 and x.shape[-1] == 5120 and x.shape[0] <= 2
+            and hasattr(torch.ops.custom_op, "custom_deepseek_v41_attention_norm_bf16_gaudi2")):
+        return torch.ops.custom_op.custom_deepseek_v41_attention_norm_bf16_gaudi2(x.contiguous(), weight, eps)
     return rms_norm(x, weight, eps)
 
 
@@ -45,17 +44,13 @@ def final_collapse_rms_norm(residual, pre_mix, weight, eps=1e-20):
     FP32 collapse and RMSNorm. Larger batches share the same state contract
     through the batch-generic graph.
     """
-    if (residual.device.type == "hpu" and residual.dtype == torch.bfloat16
-            and residual.ndim == 3 and residual.shape[1:] == (4, 5120)
-            and residual.shape[0] <= 2 and pre_mix.dtype == torch.float32
+    if (residual.device.type == "hpu" and residual.dtype == torch.bfloat16 and residual.ndim == 3
+            and residual.shape[1:] == (4, 5120) and residual.shape[0] <= 2 and pre_mix.dtype == torch.float32
             and pre_mix.shape == residual.shape[:2]
-            and hasattr(
-                torch.ops.custom_op,
-                "custom_deepseek_v41_final_collapse_norm_bf16_gaudi2")):
+            and hasattr(torch.ops.custom_op, "custom_deepseek_v41_final_collapse_norm_bf16_gaudi2")):
         return torch.ops.custom_op.custom_deepseek_v41_final_collapse_norm_bf16_gaudi2(
             residual.contiguous(), pre_mix.contiguous(), weight, eps)
-    value = (residual.float() * pre_mix.unsqueeze(-1)).sum(1).to(
-        residual.dtype)
+    value = (residual.float() * pre_mix.unsqueeze(-1)).sum(1).to(residual.dtype)
     return final_rms_norm(value, weight, eps)
 
 
@@ -194,9 +189,8 @@ def unpack_fp4(packed, width=512, group=16):
 
 def fp4_roundtrip(value, group=32):
     """Apply the checkpoint FP4 rounding contract without a packed HBM tensor."""
-    if (gaudi_envs.VLLM_HPU_DSV41_NATIVE_KV_PACK and value.device.type == "hpu"
-            and value.dtype == torch.bfloat16 and value.ndim >= 2 and value.numel() // value.shape[-1] <= 8192
-            and group == 32
+    if (gaudi_envs.VLLM_HPU_DSV41_NATIVE_KV_PACK and value.device.type == "hpu" and value.dtype == torch.bfloat16
+            and value.ndim >= 2 and value.numel() // value.shape[-1] <= 8192 and group == 32
             and hasattr(torch.ops.custom_op, "custom_deepseek_v41_fp4_roundtrip_g32_bf16_gaudi2")):
         shape = value.shape
         result = torch.ops.custom_op.custom_deepseek_v41_fp4_roundtrip_g32_bf16_gaudi2(
@@ -245,6 +239,14 @@ def _apply_rope_torch(value, positions, table, inverse=False):
     return torch.cat((value[..., :-width], rotated.flatten(-2).to(value.dtype)), dim=-1)
 
 
+@prefill_function_region
+def _prefill_hc_collapse(residual, previous_pre):
+    """Collapse four streams without materializing the FP32 broadcast product."""
+    return torch.ops.custom_op.custom_deepseek_v41_prefill_mhc_collapse_gaudi2(residual.contiguous(),
+                                                                               previous_pre.contiguous())
+
+
+@prefill_span("mhc_pre")
 def hc_pre(residual,
            previous_pre,
            fn,
@@ -253,20 +255,16 @@ def hc_pre(residual,
            eps=1e-20,
            hc_eps=1e-6,
            iterations=20,
-           packed_fn=None):
+           packed_fn=None,
+           prefill=False):
     """vLLM mhc_pre_delayed_torch's previous-sublayer mixing contract."""
     copies = residual.shape[1]
     flat_bf16 = residual.flatten(1)
-    if (gaudi_envs.VLLM_HPU_DSV41_MHC_CONTROL_RRMS and
-            packed_fn is not None and flat_bf16.device.type == "hpu" and
-            flat_bf16.dtype == torch.bfloat16 and
-            1 <= flat_bf16.shape[0] <= 2048 and
-            flat_bf16.shape[-1] == 20480 and
-            packed_fn.shape == (24, 20480)):
-        control = (
-            torch.ops.custom_op.
-            custom_deepseek_v41_control_gemv_rrms_bf16_gaudi2(
-                flat_bf16.contiguous(), packed_fn, eps))
+    if (gaudi_envs.VLLM_HPU_DSV41_MHC_CONTROL_RRMS and packed_fn is not None and flat_bf16.device.type == "hpu"
+            and flat_bf16.dtype == torch.bfloat16 and 1 <= flat_bf16.shape[0] <= 2048 and flat_bf16.shape[-1] == 20480
+            and packed_fn.shape == (24, 20480)):
+        control = (torch.ops.custom_op.custom_deepseek_v41_control_gemv_rrms_bf16_gaudi2(
+            flat_bf16.contiguous(), packed_fn, eps))
         projection, rrms = control[:, :24], control[:, 24:]
     else:
         flat = flat_bf16.float()
@@ -277,8 +275,8 @@ def hc_pre(residual,
             projection = F.linear(flat, fn)
         rrms = torch.rsqrt(flat.square().mean(-1, keepdim=True) + eps)
     # The fused TPC gate is a decode/small-prefill win.  At C8192 its single
-    # TPC program measures slower than the compiler's wide elementwise chain
-    # (1.200 ms versus 1.088 ms on Gaudi2), so retain the same math and native
+    # TPC program measures slower than the compiler's wide elementwise chain,
+    # so retain the same math and native
     # Sinkhorn while letting large-M prefill use the better scheduled graph.
     if (gaudi_envs.VLLM_HPU_DSV41_MHC_GATES_FUSED and residual.device.type == "hpu" and iterations == 20
             and hc_eps == 1e-6 and copies == 4 and projection.ndim == 2 and projection.shape[-1] == 24
@@ -300,13 +298,39 @@ def hc_pre(residual,
             for _ in range(iterations - 1):
                 comb = comb / (comb.sum(-1, keepdim=True) + hc_eps)
                 comb = comb / (comb.sum(-2, keepdim=True) + hc_eps)
-    collapsed = (residual.float() * previous_pre.unsqueeze(-1)).sum(1).to(residual.dtype)
+    if (prefill and gaudi_envs.VLLM_HPU_DSV41_PREFILL_MHC_POST and residual.device.type == "hpu"
+            and residual.dtype == torch.bfloat16 and residual.shape[1:] == (4, 5120)
+            and 1 <= residual.shape[0] <= NATIVE_KV_CODEC_TOKENS):
+        collapsed = _prefill_hc_collapse(residual, previous_pre)
+    else:
+        collapsed = (residual.float() * previous_pre.unsqueeze(-1)).sum(1).to(residual.dtype)
     return collapsed, pre, post, comb
 
 
 def hc_post(value, residual, post, comb):
     mixed = (comb.unsqueeze(-1) * residual.float().unsqueeze(2)).sum(1)
     return (value.float().unsqueeze(1) * post.unsqueeze(-1) + mixed).to(value.dtype)
+
+
+@prefill_function_region
+def prefill_hc_input(residual, previous_pre, fn, scale, base, norm, eps, hc_eps, iterations, packed_fn):
+    """Bind all mHC input-region tensors explicitly, including layer weights.
+
+    The native collapse keeps the BF16 sublayer input boundary. FP32 control
+    and norm expressions can fuse while state writes and TP collectives remain
+    outside this bounded region.
+    """
+    value, pre, post, comb = hc_pre(residual,
+                                    previous_pre,
+                                    fn,
+                                    scale,
+                                    base,
+                                    eps,
+                                    hc_eps,
+                                    iterations,
+                                    packed_fn=packed_fn,
+                                    prefill=True)
+    return value, pre, post, comb, rms_norm(value, norm, eps)
 
 
 def engram_update(residual, kv, q_weight, k_weight, active_mask, eps=1e-20):

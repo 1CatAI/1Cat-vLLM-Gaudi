@@ -146,6 +146,12 @@ class HPUWorker(WorkerBase):
             raise RuntimeError("Profiler is not enabled.")
 
         profiler_config = self.vllm_config.profiler_config
+        if os.getenv("VLLM_HPU_DSV41_RAW_TRACE", "0") == "1":
+            from vllm_gaudi.ops.deepseek_v41_native_trace import NativeTrace
+            if self.profiler_summary_only:
+                raise ValueError("Raw Synapse capture requires offline parsing, not a Kineto summary")
+            self.profiler = NativeTrace()
+            return
         if os.getenv('VLLM_PROFILER_ENABLED') == 'full':
             fn = self.model_runner.profiler.full_trace_handler  # type: ignore[union-attr]
             with_stack = False
@@ -209,9 +215,8 @@ class HPUWorker(WorkerBase):
                     if host.pending is None:
                         host.set_profiling(True)
                     else:
-                        logger.info(
-                            "Engram host profiling omitted because a request "
-                            "transaction is pending; device events remain active")
+                        logger.info("Engram host profiling omitted because a request "
+                                    "transaction is pending; device events remain active")
             # Graph-local counters belong to the newly created generation.
             # Sampling before retirement made start/stop subtraction invalid.
             self._write_native_decoder_stats("profile-start")
@@ -261,6 +266,11 @@ class HPUWorker(WorkerBase):
             stats["allocated_bytes"] = torch.hpu.memory_allocated()
             stats["peak_allocated_bytes"] = torch.hpu.max_memory_allocated()
             if gaudi_envs.VLLM_HPU_DSV41_PREPARED_SHARDS:
+                from vllm_gaudi.ops.deepseek_v41_prefill_plan import prefill_plan_stats
+                stats["prefill_plan"] = prefill_plan_stats()
+                if (phase == "ready" and gaudi_envs.VLLM_HPU_DSV41_PREFILL_NATIVE_PLAN
+                        and stats["prefill_plan"]["executed"]["largest_token_bucket"] < 128):
+                    raise RuntimeError("Native prefill plan was selected but startup did not execute it")
                 owner = self.model_runner.model.program.replay_owner
                 stats["capture_snapshot_bytes"] = sum(variant.capture_bytes for variant in owner.variants.values())
                 stats["v41"] = self.model_runner.audit
@@ -331,8 +341,7 @@ class HPUWorker(WorkerBase):
             # Every V4.1 decode stage may own ratio-2 CSA2 source layers.  The
             # C1 producer uses this exact state-transition kernel by default;
             # fail before model allocation if a stale native bundle lacks it.
-            required_ops.append(
-                "custom_deepseek_v41_compressor_pair_bf16_gaudi2")
+            required_ops.append("custom_deepseek_v41_compressor_pair_bf16_gaudi2")
             if os.environ.get("VLLM_HPU_DSV41_WOA_OUTPUT_ROUNDTRIP", "0").lower() in ("1", "true"):
                 required_ops.extend((
                     "custom_deepseek_v41_woa_fp8_roundtrip_gaudi2",
@@ -340,24 +349,33 @@ class HPUWorker(WorkerBase):
                     "custom_deepseek_v41_mla_selected_woa_wob_fp8_roundtrip_gaudi2",
                 ))
             if os.environ.get("VLLM_HPU_DSV41_RUNTIME_INDEXER", "0").lower() in ("1", "true"):
-                required_ops.extend(("custom_deepseek_v41_index_scores_gaudi2",
-                                     "custom_deepseek_v41_index_threshold_gaudi2",
-                                     "custom_deepseek_v41_index_emit_gaudi2"))
+                required_ops.extend(
+                    ("custom_deepseek_v41_index_scores_gaudi2", "custom_deepseek_v41_index_threshold_gaudi2",
+                     "custom_deepseek_v41_index_emit_gaudi2"))
             if (os.environ.get("VLLM_HPU_DSV41_ATTN_FUSED_NORM", "0").lower() in ("1", "true")
                     and os.environ.get("VLLM_HPU_DSV41_NATIVE_ROPE", "0").lower() in ("1", "true")):
                 required_ops.append("custom_deepseek_v41_kv_norm_rope_bf16_gaudi2")
-            if all(os.environ.get(name, "0").lower() in ("1", "true") for name in (
-                    "VLLM_HPU_DSV41_EXPERT_N256_FP8",
-                    "VLLM_HPU_DSV41_EXPERT_FUSED_QUANT",
-                    "VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE",
-            )):
+            if all(
+                    os.environ.get(name, "0").lower() in ("1", "true") for name in (
+                        "VLLM_HPU_DSV41_EXPERT_N256_FP8",
+                        "VLLM_HPU_DSV41_EXPERT_FUSED_QUANT",
+                        "VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE",
+                    )):
                 required_ops.append(
                     "custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_shared_prefetch_w2_fp8_gaudi2")
             load_native_operators(required_ops)
         torch.hpu.set_device(device_index)
+        logger.info("HPU worker rank=%d local_rank=%d module=%s visible=%s prepared_v41=%s", self.rank, device_index,
+                    os.environ.get("HLS_MODULE_ID"), os.environ.get("HABANA_VISIBLE_MODULES"), is_v41(self.vllm_config))
         self.device = torch.device("hpu")
         # Initialize the distributed environment.
         init_worker_distributed_environment(self.vllm_config, self.rank, self.distributed_init_method, self.local_rank)
+        if is_v41(self.vllm_config):
+            extra = self.vllm_config.load_config.model_loader_extra_config or {}
+            if extra.get("engram_startup_directory"):
+                from vllm_gaudi.ops.deepseek_v41_residency import wait_for_resident_tables
+                extra["engram_resident_tables"] = wait_for_resident_tables(extra["engram_startup_directory"], self.rank,
+                                                                           os.environ["HLS_MODULE_ID"])
         from vllm_gaudi.ops.tp2_runtime_profile import verify_loaded_profile_libraries
         logger.info("Worker runtime companion libraries: %s", verify_loaded_profile_libraries())
         # Set random seed.

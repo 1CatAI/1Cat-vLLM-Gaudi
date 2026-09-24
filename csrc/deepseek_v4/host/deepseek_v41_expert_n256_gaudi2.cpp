@@ -9,6 +9,9 @@ ELF(fp8)
 ELF(slots_fp8)
 ELF(prefetch16_fp8)
 ELF(bf16)
+ELF(normal_bf16)
+ELF(dead_bf16)
+ELF(dead_normal_bf16)
 ELF(scale)
 ELF(silu_quant)
 ELF(scale_reduce)
@@ -178,6 +181,9 @@ tpc_lib_api::GlueCodeReturn DeepseekV41ExpertN256Gaudi2::GetKernelName(
     std::strcpy(name, mode_ == FP8 ? "custom_deepseek_v41_expert_n256_fp8_gaudi2" :
         mode_ == FP8Slots ? "custom_deepseek_v41_expert_n256_slots_fp8_gaudi2" :
         mode_ == BF16 ? "custom_deepseek_v41_expert_n256_bf16_gaudi2" :
+        mode_ == DeadNormalBF16 ? "custom_deepseek_v41_expert_n256_dead_normal_bf16_gaudi2" :
+        mode_ == DeadBF16 ? "custom_deepseek_v41_expert_n256_dead_bf16_gaudi2" :
+        mode_ == NormalBF16 ? "custom_deepseek_v41_expert_n256_normal_bf16_gaudi2" :
         mode_ == Scale ? "custom_deepseek_v41_expert_n256_scale_gaudi2" :
         mode_ == SiluQuant ? "custom_deepseek_v41_expert_n256_silu_quant_gaudi2" :
                             "custom_deepseek_v41_expert_n256_scale_reduce_gaudi2");
@@ -303,12 +309,18 @@ tpc_lib_api::GlueCodeReturn DeepseekV41ExpertN256Gaudi2::GetGcDefinitions(
         prefetch16 ? &_binary___deepseek_v41_expert_n256_prefetch16_fp8_gaudi2_o_start :
         mode_ == FP8 ? &_binary___deepseek_v41_expert_n256_fp8_gaudi2_o_start :
         mode_ == BF16 ? &_binary___deepseek_v41_expert_n256_bf16_gaudi2_o_start :
+        mode_ == DeadNormalBF16 ? &_binary___deepseek_v41_expert_n256_dead_normal_bf16_gaudi2_o_start :
+        mode_ == DeadBF16 ? &_binary___deepseek_v41_expert_n256_dead_bf16_gaudi2_o_start :
+        mode_ == NormalBF16 ? &_binary___deepseek_v41_expert_n256_normal_bf16_gaudi2_o_start :
         mode_ == ScaleReduce ? &_binary___deepseek_v41_expert_n256_scale_reduce_gaudi2_o_start :
                                &_binary___deepseek_v41_expert_n256_scale_gaudi2_o_start;
     const unsigned char* end = mode_ == FP8Slots ? &_binary___deepseek_v41_expert_n256_slots_fp8_gaudi2_o_end :
         prefetch16 ? &_binary___deepseek_v41_expert_n256_prefetch16_fp8_gaudi2_o_end :
         mode_ == FP8 ? &_binary___deepseek_v41_expert_n256_fp8_gaudi2_o_end :
         mode_ == BF16 ? &_binary___deepseek_v41_expert_n256_bf16_gaudi2_o_end :
+        mode_ == DeadNormalBF16 ? &_binary___deepseek_v41_expert_n256_dead_normal_bf16_gaudi2_o_end :
+        mode_ == DeadBF16 ? &_binary___deepseek_v41_expert_n256_dead_bf16_gaudi2_o_end :
+        mode_ == NormalBF16 ? &_binary___deepseek_v41_expert_n256_normal_bf16_gaudi2_o_end :
         mode_ == ScaleReduce ? &_binary___deepseek_v41_expert_n256_scale_reduce_gaudi2_o_end :
                                &_binary___deepseek_v41_expert_n256_scale_gaudi2_o_end;
     const unsigned capacity = out->kernel.elfSize;

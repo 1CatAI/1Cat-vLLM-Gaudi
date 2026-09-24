@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from vllm_gaudi import envs as gaudi_envs
 from vllm_gaudi.ops.deepseek_v41_qkv import FusedCompressorInput
+from vllm_gaudi.ops.deepseek_v41_native_trace import prefill_span
 from vllm_gaudi.ops.deepseek_v41_math import (
     apply_rope,
     pack_fp4,
@@ -245,10 +246,8 @@ class CSA2Attention(FusedCompressorInput, nn.Module):
     def project_output(self, value):
         if self.woa_fp8:
             operation = (torch.ops.custom_op.custom_deepseek_v41_woa_fp8_roundtrip_gaudi2
-                         if self.woa_output_roundtrip else
-                         torch.ops.custom_op.custom_deepseek_v41_woa_fp8_gaudi2)
-            if (self.woa_output_roundtrip and gaudi_envs.VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT
-                    and value.shape[0] > 6):
+                         if self.woa_output_roundtrip else torch.ops.custom_op.custom_deepseek_v41_woa_fp8_gaudi2)
+            if (self.woa_output_roundtrip and gaudi_envs.VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT and value.shape[0] > 6):
                 operation = torch.ops.custom_op.custom_deepseek_v41_woa_fp8_roundtrip_wide_gaudi2
             return operation(value.contiguous(), self.weights.wo_a.weight, self.weights.wo_a.channel_scale)
         if self.output_gemm_layout:
@@ -267,8 +266,8 @@ class CSA2Attention(FusedCompressorInput, nn.Module):
     def project_output_consumer(self, value):
         if self.woa_output_roundtrip:
             weight = self.weights.wo_b
-            return torch.ops.custom_op.custom_deepseek_v41_dense_fp8_gaudi2(
-                value.contiguous(), weight.weight, weight.channel_scale)
+            return torch.ops.custom_op.custom_deepseek_v41_dense_fp8_gaudi2(value.contiguous(), weight.weight,
+                                                                            weight.channel_scale)
         return self.linear(value, self.weights.wo_b)
 
     def _rope(self, value, positions, inverse=False):
@@ -286,8 +285,15 @@ class CSA2Attention(FusedCompressorInput, nn.Module):
                 value.reshape(1, -1, shape[-1]).contiguous(), positions, table).reshape(shape)
         return apply_rope(value, positions, self.rotary, inverse=inverse)
 
-    def project_query(self, value, positions):
+    def project_query(self, value, positions, *, decode=False):
         weight = self.weights.wq_b
+        if not decode and gaudi_envs.VLLM_HPU_DSV41_PREFILL_Q_PROJECTION and 6 < value.shape[0] <= 8192:
+            from vllm_gaudi.ops.deepseek_v41_prefill_regions import prefill_q_projection
+            if not getattr(weight, "dense_fp8", False) or self.heads != 32:
+                raise ValueError("Prefill Q projection requires prepared FP8 weights and 32 local heads")
+            value = quantize_activation(value) if hasattr(weight, "scale") else value
+            return prefill_q_projection(value.contiguous(), weight.weight, weight.channel_scale,
+                                        positions.to(torch.int32).contiguous(), self.rotary_native)
         if self.q_scale_rope and value.shape[0] == 1 and getattr(weight, "dense_fp8", False):
             value = quantize_activation(value) if hasattr(weight, "scale") else value
             return torch.ops.custom_op.custom_deepseek_v41_q_projection_rope_gaudi2(
@@ -347,15 +353,17 @@ class CSA2Attention(FusedCompressorInput, nn.Module):
             self.selection.indices.index_copy_(0, positions.long(), indices)
         return self.selection.indices.index_select(0, positions.long())
 
+    @prefill_span("attention")
     def forward(self, value, positions, ready_outputs=(), *, decode=False):
-        del decode
         query_input, kv_input = self._project_qkv_input(value)
-        norm = (torch.ops.custom_op.custom_deepseek_v41_attention_norm_bf16_gaudi2
-                if self.fused_norm and value.shape[0] == 1 else rms_norm)
+        norm = (torch.ops.custom_op.custom_deepseek_v41_attention_norm_bf16_gaudi2 if self.fused_norm and
+                (value.shape[0] == 1 or
+                 (not decode and gaudi_envs.VLLM_HPU_DSV41_PREFILL_NATIVE_NORM and 6 < value.shape[0] <= 8192)) else
+                rms_norm)
         query = norm(query_input, self.weights.q_norm.weight, self.eps)
         delay_q = self.kv_first and value.shape[0] == 1
         if not delay_q:
-            query = self.project_query(query, positions)
+            query = self.project_query(query, positions, decode=decode)
         kv = norm(kv_input, self.weights.kv_norm.weight, self.eps)
         kv = self._rope(kv, positions)
         completion = None
@@ -388,7 +396,7 @@ class CSA2Attention(FusedCompressorInput, nn.Module):
             indices, lengths = torch.ops.custom_op.custom_deepseek_v41_c1_indices_i32_gaudi2(
                 positions, compressed_indices.contiguous(), self.ratio)
         if delay_q:
-            query = self.project_query(query, positions)
+            query = self.project_query(query, positions, decode=decode)
         if self.decoded_kv_state and value.shape[0] == 1:
             main = self.cache.decoded_main if self.ratio else self.shared.decoded_swa
             # Reuse layers are downstream of their source layer's completed
@@ -396,12 +404,12 @@ class CSA2Attention(FusedCompressorInput, nn.Module):
             # their own FP4 writer completion in this recipe.
             main_done = compressed_completion if compressed_completion is not None else completion
             if self.mla_mme:
-                mla = (torch.ops.custom_op.custom_deepseek_v41_mla_bf16_pv_gaudi2 if self.mla_bf16_pv
-                       else torch.ops.custom_op.custom_deepseek_v41_mla_mme_gaudi2)
-                output = mla(
-                    query.contiguous(), self.shared.decoded_swa, main, indices.contiguous(), self.weights.attn_sink,
-                    self.scale, lengths.contiguous(), completion, main_done, self.decoded_swa_offset,
-                    self.length // self.ratio if self.ratio else 0, 512)
+                mla = (torch.ops.custom_op.custom_deepseek_v41_mla_bf16_pv_gaudi2
+                       if self.mla_bf16_pv else torch.ops.custom_op.custom_deepseek_v41_mla_mme_gaudi2)
+                output = mla(query.contiguous(),
+                             self.shared.decoded_swa, main, indices.contiguous(), self.weights.attn_sink, self.scale,
+                             lengths.contiguous(), completion, main_done, self.decoded_swa_offset,
+                             self.length // self.ratio if self.ratio else 0, 512)
             else:
                 attention = (torch.ops.custom_op.custom_deepseek_v41_decoded_attn_block_bf16_gaudi2
                              if self.block_exp else torch.ops.custom_op.custom_deepseek_v41_decoded_attn_bf16_gaudi2)
@@ -449,8 +457,16 @@ class CSA2Attention(FusedCompressorInput, nn.Module):
                 query.contiguous(), cache.contiguous(), indices.contiguous(), self.weights.attn_sink, self.scale)
         output = self._rope(output, positions, inverse=True)
         output = output.reshape(-1, self.groups, self.heads // self.groups * 512)
-        output = self.project_output(output)
-        partial = self.project_output_consumer(output)
+        if not decode and gaudi_envs.VLLM_HPU_DSV41_PREFILL_OUTPUT_PROJECTION and 6 < output.shape[0] <= 8192:
+            from vllm_gaudi.ops.deepseek_v41_prefill_regions import prefill_output_projection
+            wa, wb = self.weights.wo_a, self.weights.wo_b
+            if not (self.woa_fp8 and self.woa_output_roundtrip and getattr(wb, "dense_fp8", False)):
+                raise ValueError("Prefill output projection requires prepared FP8 weights and the group codec")
+            partial = prefill_output_projection(output.contiguous(), wa.weight, wa.channel_scale, wb.weight,
+                                                wb.channel_scale)
+        else:
+            output = self.project_output(output)
+            partial = self.project_output_consumer(output)
         return self.reduce(partial, ready_outputs=ready_outputs) if ready_outputs else self.reduce(partial)
 
     def insert_context(self, main_value, positions, valid_count=None):

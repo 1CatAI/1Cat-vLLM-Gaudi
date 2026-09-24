@@ -10,16 +10,13 @@ constexpr const char* schema = "custom_op::custom_deepseek_v41_quant_roundtrip_b
 constexpr const char* wide_schema = "custom_op::custom_deepseek_v41_quant_roundtrip_wide_bf16_gaudi2";
 const bool registered = [] {
     for (bool wide : {false, true}) {
-        habana::custom_op::registerUserCustomOp(
-            wide ? wide_schema : schema,
-            wide ? "custom_deepseek_v41_quant_roundtrip_wide_bf16_gaudi2"
-                 : "custom_deepseek_v41_quant_roundtrip_bf16_gaudi2",
-            [](const at::Stack& inputs) {
-                habana::PartialOutputMetaData output;
-                output.dtype = at::kBFloat16;
-                output.shape = inputs.at(0).toTensor().sizes().vec();
-                return habana::PartialOutputMetaDataVector{output};
-            }, nullptr);
+    habana::custom_op::registerUserCustomOp(wide ? wide_schema : schema, wide ? "custom_deepseek_v41_quant_roundtrip_wide_bf16_gaudi2" : "custom_deepseek_v41_quant_roundtrip_bf16_gaudi2",
+        [](const at::Stack& inputs) {
+            habana::PartialOutputMetaData output;
+            output.dtype = at::kBFloat16;
+            output.shape = inputs.at(0).toTensor().sizes().vec();
+            return habana::PartialOutputMetaDataVector{output};
+        }, nullptr);
     }
     return true;
 }();

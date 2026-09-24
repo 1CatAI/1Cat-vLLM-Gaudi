@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import sys
 
 _C1_FASTPATH_DEFAULTS = {
@@ -69,8 +70,55 @@ _C1_FASTPATH_DEFAULTS = {
     "VLLM_HPU_DSV41_PREFILL_DEVICE_ROUTES": "1",
     "VLLM_HPU_DSV41_PREFILL_ROUTE_OUTPUT": "1",
     "VLLM_HPU_DSV41_PREFILL_EXPERT_ROWS": "128",
+    # Route by live expert occupancy for every prompt length. The BF16 path
+    # reuses each decoded weight across bounded 64/128/192/256-row slabs.
+    "VLLM_HPU_DSV41_PREFILL_HYBRID_ROWS": "1",
+    # The prepared-group bridge submits the finite expert recipe sequence as
+    # one native plan.  The exact normal-scale decoder is the qualified body
+    # used by the archived 32K parent; make both part of ordinary startup
+    # rather than relying on an evidence-profile environment override.
+    "VLLM_HPU_DSV41_PREFILL_NATIVE_PLAN": "1",
+    "VLLM_HPU_DSV41_PREFILL_FAST_DEQUANT": "1",
+    "VLLM_HPU_DSV41_PREFILL_SKIP_EMPTY": "1",
+    "VLLM_HPU_DSV41_PREFILL_EXPERTS_PER_PLAN": "24",
+    # One scheduler transaction already owns 8192 prompt tokens. Keep the
+    # compute transaction intact so grouped experts reuse each decoded weight
+    # across twice as many rows and PP does not insert a midpoint drain.
+    "VLLM_HPU_DSV41_PREFILL_COMPUTE_TOKENS": "8192",
+    # Keep two scheduler-owned PP packets in flight.  The producer waits only
+    # when its slot is reused and PP1 waits at the real consumer.  This was
+    # qualified with the normal 1M context and max_num_seqs=8 profile; it is
+    # not a single-request-only execution path.
+    "VLLM_HPU_DSV41_PREFILL_PP_WAVEFRONT": "1",
     "VLLM_HPU_DSV41_PREFILL_COMPACT_CANDIDATES": "1",
-    "VLLM_HPU_DSV41_PREFILL_MLA_ROWS": "64",
+    # KV source layers publish immutable compressed rows for several reuse
+    # layers in the same prompt transaction. Decode each source once and keep
+    # the bounded BF16 workspace alive through its real MLA consumers instead
+    # of repeating packed-page gather and FP4 expansion in every layer.
+    "VLLM_HPU_DSV41_PREFILL_KV_REUSE": "1",
+    # These exact/qualified prompt regions remove generic materialization,
+    # repeated packed-KV expansion and Python submissions.  They remain
+    # finite-shape recipes and consume runtime request metadata.
+    "VLLM_HPU_DSV41_PREFILL_MLA_ROWS": "512",
+    "VLLM_HPU_DSV41_PREFILL_REINDEX_REUSE": "1",
+    "VLLM_HPU_DSV41_FLASHINFER_PREFILL": "1",
+    "VLLM_HPU_DSV41_PREFILL_INDEX_MME": "1",
+    "VLLM_HPU_DSV41_PREFILL_INDEX_SHARED": "1",
+    "VLLM_HPU_DSV41_PREFILL_INDEX_SRAM": "1",
+    "VLLM_HPU_DSV41_PREFILL_REINDEX_SRAM": "1",
+    # Query rows are independent after the existing head all-gather. Split
+    # C1024-C8192 selection rows across TP2 and gather only final integer
+    # choices. Smaller graph shapes retain the established local path.
+    "VLLM_HPU_DSV41_PREFILL_INDEX_QUERY_TP": "1",
+    "VLLM_HPU_DSV41_PREFILL_CANDIDATE_GATHER": "1",
+    "VLLM_HPU_DSV41_PREFILL_REGIONS": "1",
+    "VLLM_HPU_DSV41_PREFILL_MHC_INPUT": "1",
+    "VLLM_HPU_DSV41_PREFILL_MHC_POST": "1",
+    "VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT": "1",
+    "VLLM_HPU_DSV41_PREFILL_ROPE": "1",
+    "VLLM_HPU_DSV41_PREFILL_NATIVE_NORM": "1",
+    "VLLM_HPU_DSV41_PREFILL_Q_PROJECTION": "1",
+    "VLLM_HPU_DSV41_PREFILL_OUTPUT_PROJECTION": "1",
     "VLLM_HPU_DSV41_COMPRESSOR_FUSED_INPUT": "1",
     "VLLM_HPU_TP2_NATIVE_JOINT_PLAN": "1",
     "VLLM_HPU_TP2_PREPARED_COMM": "1",
@@ -198,9 +246,7 @@ def load_native_operators(required=()):
     names = tuple(dict.fromkeys((*baseline, *required)))
     missing = [name for name in names if not hasattr(torch.ops.custom_op, name)]
     if missing:
-        raise RuntimeError(
-            f"V4.1 native extension {library} is missing required operators: "
-            + ", ".join(missing))
+        raise RuntimeError(f"V4.1 native extension {library} is missing required operators: " + ", ".join(missing))
     return library
 
 
@@ -242,13 +288,19 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--checkpoint-audit")
-    parser.add_argument("--n256-prepared-dir", type=Path,
+    parser.add_argument("--n256-prepared-dir",
+                        type=Path,
                         help="Runtime-layout expert cache from prepare_deepseek_v41_n256.py")
     parser.add_argument("--runtime-profile", default=runtime_profile or settings.get("runtime_profile"))
     parser.add_argument("--max-model-len", type=int, default=512)
     parser.add_argument("--max-num-seqs", type=int, default=1)
     parser.add_argument("--max-num-batched-tokens", type=int, default=512)
     parser.add_argument("--block-size", type=int, default=512)
+    parser.add_argument("--engram-residency",
+                        choices=("prefetch", "locked"),
+                        default=settings.get("engram_residency", "prefetch"),
+                        help="Keep the shared host tables locked for the service lifetime")
+    parser.add_argument("--engram-host-budget-gib", type=int, default=224)
     v2 = parser.add_mutually_exclusive_group()
     v2.add_argument("--v2", dest="v2", action="store_true", help="Use the V2 HPU scheduling/completion adapter")
     v2.add_argument("--no-v2", dest="v2", action="store_false", help="Use the synchronous V4.1 model runner")
@@ -360,15 +412,37 @@ def main():
     scheduling = "--async-scheduling" if gaudi_envs.VLLM_HPU_DSV41_V2 else "--no-async-scheduling"
     sys.argv = [
         "vllm", "serve", args.model, "--host", args.host, "--port",
-        str(args.port), "--dtype", "bfloat16", "--max-model-len", str(args.max_model_len),
-        "--generation-config", "vllm", "--tensor-parallel-size", "2", "--pipeline-parallel-size", "2",
-        "--max-num-seqs", str(args.max_num_seqs), "--max-num-batched-tokens",
+        str(args.port), "--dtype", "bfloat16", "--max-model-len",
+        str(args.max_model_len), "--generation-config", "vllm", "--tensor-parallel-size", "2",
+        "--pipeline-parallel-size", "2", "--max-num-seqs",
+        str(args.max_num_seqs), "--max-num-batched-tokens",
         str(args.max_num_batched_tokens), "--load-format", "dsv41_prepared", "--model-loader-extra-config",
-        json.dumps(loader), "--mm-encoder-tp-mode", "data", "--no-enable-prefix-caching", scheduling,
-        "--block-size", str(args.block_size), *speculative, *extra
+        json.dumps(loader), "--mm-encoder-tp-mode", "data", "--no-enable-prefix-caching", scheduling, "--block-size",
+        str(args.block_size), *speculative, *extra
     ]
-    from vllm.entrypoints.cli.main import main as serve
-    serve()
+    residency = None
+    try:
+        if args.engram_residency == "locked":
+            from vllm_gaudi.ops.deepseek_v41_residency import EngramResidency, EngramStartup, table_regions
+            device_layers = (1, ) if gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM else ()
+            if device_layers:
+                bridge = Path(os.environ["VLLM_HPU_TP2_FUSED_AR_NORM_BRIDGE"])
+                abi = json.loads(bridge.with_suffix(".abi.json").read_text())
+                if abi.get("device_engram_shared_mapping_version") != 1:
+                    raise RuntimeError("Locked Device Engram requires a bridge with shared-host mapping support")
+            tables = EngramResidency(table_regions(args.model),
+                                     args.engram_host_budget_gib * 1024**3,
+                                     device_layers=device_layers)
+            report_path = (Path(os.environ["DSV41_RUN_EVIDENCE"]) / "engram-residency.json" if leased_run else None)
+            residency = EngramStartup(tables, os.environ["HABANA_VISIBLE_MODULES"].split(","),
+                                      report_path=report_path).start(lambda: os.kill(os.getpid(), signal.SIGTERM))
+            loader["engram_startup_directory"] = str(residency.directory)
+            sys.argv[sys.argv.index("--model-loader-extra-config") + 1] = json.dumps(loader)
+        from vllm.entrypoints.cli.main import main as serve
+        serve()
+    finally:
+        if residency is not None:
+            residency.close()
 
 
 if __name__ == "__main__":

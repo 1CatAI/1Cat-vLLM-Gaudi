@@ -22,10 +22,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <linux/magic.h>
 #include <mutex>
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <unordered_map>
 #include <unistd.h>
 #include <utility>
@@ -963,7 +965,7 @@ constexpr char kDeviceEngramGuid[] =
 class MappedCheckpointRange {
  public:
   MappedCheckpointRange(synDeviceId device, const std::string &path,
-                        uint64_t offset, uint64_t bytes)
+                        uint64_t offset, uint64_t bytes, bool shared_checkpoint)
       : device_(device), bytes_(bytes) {
     TORCH_CHECK(bytes > 0 && bytes <= SIZE_MAX,
                 "Device Engram checkpoint range is invalid");
@@ -974,7 +976,8 @@ class MappedCheckpointRange {
     TORCH_CHECK(bytes <= SIZE_MAX - delta_,
                 "Device Engram checkpoint mapping overflows size_t");
     mapped_bytes_ = static_cast<size_t>(bytes + delta_);
-    const int descriptor = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    const int descriptor = open(path.c_str(),
+                                (shared_checkpoint ? O_RDWR : O_RDONLY) | O_CLOEXEC);
     TORCH_CHECK(descriptor >= 0, "Cannot open Device Engram checkpoint range: ",
                 path, ": ", std::strerror(errno));
     struct stat info {};
@@ -985,8 +988,24 @@ class MappedCheckpointRange {
       ::close(descriptor);
       TORCH_CHECK(false, "Device Engram checkpoint range exceeds its file: ", path);
     }
+    if (shared_checkpoint) {
+      struct statfs filesystem {};
+      const int required = F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL;
+      const int seals = fcntl(descriptor, F_GET_SEALS);
+      const bool shared_valid = fstatfs(descriptor, &filesystem) == 0 &&
+          filesystem.f_type == TMPFS_MAGIC && seals >= 0 &&
+          (seals & required) == required;
+      if (!shared_valid) {
+        ::close(descriptor);
+        TORCH_CHECK(false, "Shared Device Engram requires a sealed service-owned memfd");
+      }
+    }
+    // The kernel driver pins with FOLL_WRITE. A private checkpoint mapping
+    // therefore copies the entire range. A shared memfd is the sole backing
+    // also consumed by host gather; it never opens the checkpoint writable.
     base_ = mmap(nullptr, mapped_bytes_, PROT_READ | PROT_WRITE,
-                 MAP_PRIVATE | MAP_POPULATE, descriptor, offset - delta_);
+                 (shared_checkpoint ? MAP_SHARED : MAP_PRIVATE) | MAP_POPULATE,
+                 descriptor, offset - delta_);
     ::close(descriptor);
     TORCH_CHECK(base_ != MAP_FAILED, "Cannot mmap Device Engram checkpoint range: ",
                 path, ": ", std::strerror(errno));
@@ -998,6 +1017,11 @@ class MappedCheckpointRange {
     }
     mapped_ = true;
     data_ = static_cast<uint8_t *>(base_) + delta_;
+    if (shared_checkpoint && mprotect(base_, mapped_bytes_, PROT_READ) != 0) {
+      const int error = errno;
+      release(false);
+      TORCH_CHECK(false, "Cannot protect shared Device Engram input: ", std::strerror(error));
+    }
   }
 
   MappedCheckpointRange(const MappedCheckpointRange &) = delete;
@@ -1167,7 +1191,8 @@ class DeviceEngramProducer
                        uint64_t weight_offset, uint64_t weight_bytes,
                        const std::string &scale_file, uint64_t scale_offset,
                        uint64_t scale_bytes, uint64_t rows,
-                       at::Tensor token_map, at::Tensor parameters)
+                       at::Tensor token_map, at::Tensor parameters,
+                       bool shared_checkpoint)
       : token_map_(std::move(token_map)), parameters_(std::move(parameters)) {
     auto *group = dynamic_cast<c10d::ProcessGroupEagerHCCL *>(backend.get());
     TORCH_CHECK(group != nullptr,
@@ -1187,9 +1212,9 @@ class DeviceEngramProducer
                 "Device Engram checkpoint geometry differs from the fused recipe");
     auto &device = habana::HPUDeviceContext::get_device();
     weights_ = std::make_unique<MappedCheckpointRange>(
-        device.id(), weight_file, weight_offset, weight_bytes);
+        device.id(), weight_file, weight_offset, weight_bytes, shared_checkpoint);
     scales_ = std::make_unique<MappedCheckpointRange>(
-        device.id(), scale_file, scale_offset, scale_bytes);
+        device.id(), scale_file, scale_offset, scale_bytes, shared_checkpoint);
     recipe_.compile(token_map_.numel(), rows);
   }
 
@@ -1634,17 +1659,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         TORCH_CHECK(hccl_backend != nullptr, "C1 PP DMA requires ProcessGroupEagerHCCL");
         copyC1PipelineTensors(hccl_backend, std::move(sources), std::move(destinations));
       });
+  module.attr("device_engram_shared_mapping_version") = 1;
   py::class_<DeviceEngramProducer, std::shared_ptr<DeviceEngramProducer>>(
       module, "DeviceEngramProducer")
       .def(py::init<const c10::intrusive_ptr<c10d::Backend> &,
                     const std::string &, uint64_t, uint64_t,
                     const std::string &, uint64_t, uint64_t, uint64_t,
-                    at::Tensor, at::Tensor>(),
+                    at::Tensor, at::Tensor, bool>(),
            py::arg("backend"), py::arg("weight_file"),
            py::arg("weight_offset"), py::arg("weight_bytes"),
            py::arg("scale_file"), py::arg("scale_offset"),
            py::arg("scale_bytes"), py::arg("rows"),
-           py::arg("token_map"), py::arg("parameters"))
+           py::arg("token_map"), py::arg("parameters"),
+           py::arg("shared_checkpoint") = false)
       .def("launch", &DeviceEngramProducer::launch)
       .def("mapped_bytes", &DeviceEngramProducer::mappedBytes)
       .def("workspace_bytes", &DeviceEngramProducer::workspaceBytes)
@@ -1733,6 +1760,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       stacks.push_back(std::move(stack));
     }
     replayPreparedGroups(std::move(plans), std::move(stacks));
+  });
+  module.def("replay_prepared_groups_prefix", [](std::vector<std::shared_ptr<PreparedGroupPlan>> plans, py::list inputs,
+                                                   std::vector<size_t> node_limits) {
+    std::vector<torch::jit::Stack> stacks;
+    for (const auto& row : inputs) {
+      torch::jit::Stack stack;
+      for (const auto& value : row.cast<py::list>()) stack.push_back(preparedIValue(value));
+      stacks.push_back(std::move(stack));
+    }
+    replayPreparedGroups(std::move(plans), std::move(stacks), std::move(node_limits));
   });
   module.def("prepared_plan_counts", [] {
     return std::make_tuple(g_prepared_batches.load(), g_prepared_groups.load(),

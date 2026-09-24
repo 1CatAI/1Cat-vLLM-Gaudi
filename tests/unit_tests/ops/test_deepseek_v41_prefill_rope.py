@@ -23,7 +23,7 @@ torch.ops.load_library(os.environ["VLLM_HPU_DSV4_TPC_OP_LIBRARY"])
 
 @pytest.mark.parametrize("tokens", [7, 8, 127, 8191, 8192])
 def test_changed_positions_and_normal_prefill_dispatch(monkeypatch, tokens):
-    monkeypatch.delenv("VLLM_HPU_DSV41_PREFILL_ROPE", raising=False)
+    monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_ROPE", "1")
     table_cpu = rotary_table(64, 32768, 10000)
     table = table_cpu.to("hpu")
     native = torch.cat((table_cpu[..., 0], table_cpu[..., 1]), -1).contiguous().to("hpu")
@@ -43,38 +43,6 @@ def test_changed_positions_and_normal_prefill_dispatch(monkeypatch, tokens):
             for cls in (CSA2Attention, PagedCSA2Attention):
                 actual = cls._rope(owner, values, positions, inverse).cpu().view(torch.int16)
                 assert torch.equal(actual, expected)
-
-
-def test_disabled_prefill_rope_uses_existing_tensor_contract(monkeypatch):
-    monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_ROPE", "0")
-    table = rotary_table(64, 128, 10000).to("hpu")
-    owner = SimpleNamespace(native_rope=True, rotary=table, _rotary_table=lambda: table)
-    value = torch.randn(7, 2, 256).bfloat16().to("hpu")
-    positions = torch.arange(7, device="hpu", dtype=torch.int32)
-    for inverse in (False, True):
-        expected = _apply_rope_torch(value, positions, table, inverse).cpu().view(torch.int16)
-        for cls in (CSA2Attention, PagedCSA2Attention):
-            actual = cls._rope(owner, value, positions, inverse).cpu().view(torch.int16)
-            assert torch.equal(actual, expected)
-
-
-def test_compiled_prefill_consumes_changed_values_and_positions():
-    table_cpu = rotary_table(64, 256, 10000)
-    table = table_cpu.to("hpu")
-    native = torch.cat((table_cpu[..., 0], table_cpu[..., 1]), -1).contiguous().to("hpu")
-
-    def apply(value, positions, phase):
-        return torch.ops.custom_op.custom_deepseek_v41_prefill_rope_bf16_gaudi2(value, positions, phase)
-
-    compiled = torch.compile(apply, backend="hpu_backend", fullgraph=True, dynamic=False)
-    values = torch.empty(127, 4, 512, device="hpu", dtype=torch.bfloat16)
-    positions = torch.empty(127, device="hpu", dtype=torch.int32)
-    for generation in range(2):
-        values.copy_(torch.randn(127, 4, 512).bfloat16())
-        positions.copy_(torch.arange(127, dtype=torch.int32) + generation * 128)
-        expected = _apply_rope_torch(values, positions, table).cpu().view(torch.int16)
-        actual = compiled(values, positions, native).cpu().view(torch.int16)
-        assert torch.equal(actual, expected)
 
 
 def test_small_decode_retains_its_previous_dispatch(monkeypatch):

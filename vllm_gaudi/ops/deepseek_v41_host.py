@@ -29,6 +29,28 @@ def _signed_i32_bits(value):
     return value if value < 0x80000000 else value - 0x100000000
 
 
+def resident_table_source(item, binding):
+    """Validate a service-owned shared backing against its checkpoint extent."""
+    source = dict(file=item["file"], offset=item["shard_offset"], length=item["shard_bytes"])
+    if binding.get("source") != source or binding.get("backing") != "shared_memfd":
+        raise RuntimeError("Engram resident binding differs from the checkpoint extent")
+    stat = Path(source["file"]).stat()
+    identity = dict(device=stat.st_dev, inode=stat.st_ino, size=stat.st_size, mtime_ns=stat.st_mtime_ns)
+    if binding.get("source_identity") != identity:
+        raise RuntimeError("Engram source changed after resident preparation")
+    descriptor = os.open(binding["file"], os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        target = os.fstat(descriptor)
+        seals = fcntl.fcntl(descriptor, fcntl.F_GET_SEALS)
+        required = fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+        if ((target.st_dev, target.st_ino, target.st_size) != (binding["device"], binding["inode"], source["length"])
+                or seals & required != required or binding["offset"] != 0 or binding["length"] != source["length"]):
+            raise RuntimeError("Engram resident backing identity or extent changed")
+    finally:
+        os.close(descriptor)
+    return dict(item, file=binding["file"], shard_offset=0, shared_memfd=True)
+
+
 def device_engram_parameters(layout, layer, tp_rank, pad_id):
     """Pack the split-u64 hash constants consumed by the device producer."""
     layer_index = layout.layer_ids.index(layer)
@@ -231,7 +253,8 @@ class EngramHost:
                  ring_size=3,
                  tokenizer=None,
                  checkpoint_audit=None,
-                 force_lock=False):
+                 force_lock=False,
+                 resident_tables=None):
         native = host_native()
         if native.abi_version != 1 or torch.device(device).type != "hpu":
             raise RuntimeError("V4.1 Engram requires its native host gather and an HPU DMA runtime")
@@ -278,6 +301,7 @@ class EngramHost:
         self.history = EngramTokenHistory(self.layout, token_map)
         self.histories = {}
         self.tables, self.shards, self.slots = {}, {}, {}
+        self.table_sources = {}
         self.table_page_counts = {}
         self.stream = torch.hpu.Stream()
         self.generation, self.pending, self.closed = 0, None, False
@@ -293,6 +317,13 @@ class EngramHost:
                 if any(item.get(key) != value for key, value in shard.items()):
                     raise RuntimeError("Engram offsets do not match the frozen hash-head layout")
                 self._verify_source(item, checkpoint_audit)
+            bindings = (resident_tables or {}).get(str(tp_rank), {}).get(str(layer))
+            if bindings is not None:
+                if len(bindings) != 2:
+                    raise RuntimeError("Engram resident binding must contain weight and scale")
+                weight, scale = (resident_table_source(item, binding)
+                                 for item, binding in zip((weight, scale), bindings, strict=True))
+            self.table_sources[layer] = weight, scale
             self.shards[layer] = shard
             page = os.sysconf("SC_PAGESIZE")
             rows = shard["row_stop"] - shard["row_start"]
@@ -357,8 +388,7 @@ class EngramHost:
         local_heads = shard["head_stop"] - shard["head_start"]
         if local_heads != 12 or self.layout.head_dim != 256:
             raise RuntimeError("Device Engram requires the qualified 12x256 TP-local geometry")
-        weight = host["tables"][f"layers.{layer}.engram.embed.weight"]
-        scale = host["tables"][f"layers.{layer}.engram.embed.scale"]
+        weight, scale = self.table_sources[layer]
         rows = shard["row_stop"] - shard["row_start"]
         token_map = torch.from_numpy(self.history.token_map.astype(np.int32)).to(device)
         parameters = torch.tensor(device_engram_parameters(self.layout, layer, self.tp_rank, self.history.pad_id),
@@ -372,6 +402,12 @@ class EngramHost:
         bridge, backend, _ = _resolve_runtime()
         if not hasattr(bridge, "DeviceEngramProducer"):
             raise RuntimeError("The TP2 bridge lacks the device Engram producer ABI")
+        shared = bool(weight.get("shared_memfd"))
+        if shared != bool(scale.get("shared_memfd")):
+            raise RuntimeError("Device Engram weight and scale backing disagree")
+        if shared and getattr(bridge, "device_engram_shared_mapping_version", 0) != 1:
+            raise RuntimeError("The TP2 bridge cannot share the resident Engram backing")
+        mapping_options = {"shared_checkpoint": True} if shared else {}
         self.device_c1 = bridge.DeviceEngramProducer(
             backend,
             weight["file"],
@@ -383,6 +419,7 @@ class EngramHost:
             rows,
             token_map,
             parameters,
+            **mapping_options,
         )
         self.audit["device_c1_mapped_bytes"] = self.device_c1.mapped_bytes()
         self.audit["device_c1_workspace_bytes"] = self.device_c1.workspace_bytes()

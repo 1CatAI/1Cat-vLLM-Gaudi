@@ -75,7 +75,7 @@ class PreparedV41Shard:
         if self.source_identity != (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns):
             raise RuntimeError("Prepared weight file changed during loading; invalidate the model and recipes")
 
-    def tensor(self, name: str, device, *, keep_file_cache=False):
+    def tensor(self, name: str, device, *, keep_file_cache=True):
         """Copy one pre-sliced tensor; no expert gather, transpose or repacking."""
         import torch
         self.check_identity()
@@ -108,6 +108,11 @@ class PreparedV41Shard:
                 else:
                     destination.copy_(chunk, non_blocking=False)
                 self.max_host_chunk_bytes = max(self.max_host_chunk_bytes, len(storage))
+                # The four rank loaders read distinct 75–78 GiB files in
+                # parallel.  Synchronous DONTNEED for every copied chunk can
+                # block all workers in generic_fadvise/lru_add_drain_all;
+                # normally leave eviction to the VM.  The explicit opt-out
+                # remains for an isolated/offline loader.
                 if not keep_file_cache and hasattr(os, "posix_fadvise"):
                     os.posix_fadvise(stream.fileno(), offset, len(storage), os.POSIX_FADV_DONTNEED)
         self.check_identity()
@@ -172,7 +177,8 @@ class PreparedV41Shard:
                 destination[start:stop].copy_(value.to(torch.bfloat16))
                 temporary = len(raw) + len(raw_scale) + value.numel() * 4 + expanded.numel() * 4
                 self.max_host_chunk_bytes = max(self.max_host_chunk_bytes, temporary)
-                if hasattr(os, "posix_fadvise"):
-                    os.posix_fadvise(stream.fileno(), source.offset + start * k, len(raw), os.POSIX_FADV_DONTNEED)
+                # Do not issue per-chunk DONTNEED while TP2×PP2 workers load
+                # concurrently; natural reclaim protects the resident Engram
+                # pages without a cross-CPU LRU drain at every weight chunk.
         self.check_identity()
         return destination
