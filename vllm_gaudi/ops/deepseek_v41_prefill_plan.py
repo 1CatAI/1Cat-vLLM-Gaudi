@@ -251,6 +251,8 @@ def _invalidate(collection):
 
 def invalidate_prefill_plans():
     from vllm_gaudi.ops.deepseek_v41_prefill_buckets import invalidate_bucketed_prefill_plans
+    from vllm_gaudi.ops.deepseek_v41_prefill_reindex_plan import invalidate_reindex_plans
+    invalidate_reindex_plans()
     invalidate_bucketed_prefill_plans()
     _invalidate(_plans)
     _invalidate(_attention_plans)

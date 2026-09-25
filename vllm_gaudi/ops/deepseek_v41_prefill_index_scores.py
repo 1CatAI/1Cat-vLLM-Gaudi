@@ -211,6 +211,11 @@ def prefill_reindex_selection(query,
     """Evaluate a row interval with the production bounded Reindex recipes."""
     signature = (tuple(packed.shape), tuple(table.shape), ratio, source_rows)
     keys = compiled_decode_shared_index_keys(signature)(packed, table, ratio, source_rows)
+    from vllm_gaudi import envs
+    if (query.device.type == "hpu" and native_gather and native_scores and blocks.shape[1] >= 64
+            and envs.VLLM_HPU_DSV41_PREFILL_NATIVE_PLAN):
+        from vllm_gaudi.ops.deepseek_v41_prefill_reindex_plan import prepared_reindex_selection
+        return prepared_reindex_selection(query, weights, keys, positions, blocks, ratio)
     outputs = []
     for start in range(0, query.shape[0], 128):
         stop = min(start + 128, query.shape[0])
