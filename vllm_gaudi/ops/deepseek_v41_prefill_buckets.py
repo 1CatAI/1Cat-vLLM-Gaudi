@@ -87,6 +87,7 @@ class _BucketedPrefillPlans:
         # captured intermediates alive. The limit is independent of length.
         self.plans = OrderedDict()
         self.workspace = None
+        self.indices = {}
 
     def close(self):
         if self.plans:
@@ -96,6 +97,15 @@ class _BucketedPrefillPlans:
                     plan.plan.invalidate()
         self.plans.clear()
         self.workspace = None
+        self.indices.clear()
+
+    def group_indices(self, start, width, device):
+        key = (start, width, device)
+        value = self.indices.get(key)
+        if value is None:
+            value = torch.arange(start, start + width, dtype=torch.int32, device=device)
+            self.indices[key] = value
+        return value
 
     def routed_workspace(self, value, routes):
         if (self.workspace is None or self.workspace.shape[0] < routes + 1 or self.workspace.shape[1] != value.shape[-1]
@@ -166,20 +176,35 @@ class _BucketedPrefillPlans:
             arguments = (value, routing, slots, experts, q13, q2, s13, s2, lookup, normal_scales, workspace)
             if single_fp8:
                 arguments += (channel13, high, high_scale)
-            binding_signature = (rows, tuple(layout(v) if isinstance(v, torch.Tensor) else v for v in arguments))
-            plan = family.get(binding_signature)
-            if plan is None:
-                body = compile_body(("bucketed_fp8" if single_fp8 else "bucketed", value.shape[0], rows, q13.shape[0],
-                                     bool(normal_scales)))
-                groups = [
-                    torch.arange(start, start + width, dtype=torch.int32, device=value.device)
-                    for start in range(0, slots.shape[0], width)
-                ]
-                plan = PrefillExpertPlan(body, arguments, groups, require_prefix=True)
-                family[binding_signature] = plan
-                executed = plan.recipes
+            complete, remainder = divmod(active[index], width)
+            # Match the compiler's two-expert MME tiles for the final group.
+            # Full groups keep their existing recipe and weight reuse.
+            tail_width = ((remainder + 1) // 2) * 2 if single_fp8 else width
+            compact_tail = 0 < tail_width < width
+            submissions = []
+            if compact_tail:
+                if complete:
+                    submissions.append((arguments, complete, None))
+                tail_indices = self.group_indices(complete * width, tail_width, value.device)
+                submissions.append(((*arguments, tail_indices), 1, tail_width))
             else:
-                executed = plan.replay(arguments, (active[index] + width - 1) // width)
+                submissions.append((arguments, (active[index] + width - 1) // width, None))
+            executed = 0
+            for bindings, group_count, compact_width in submissions:
+                binding_signature = (rows, tuple(layout(v) if isinstance(v, torch.Tensor) else v for v in bindings))
+                plan = family.get(binding_signature)
+                if plan is None:
+                    body = compile_body(
+                        ("bucketed_fp8" if single_fp8 else "bucketed", value.shape[0], rows, q13.shape[0],
+                         bool(normal_scales), compact_width))
+                    groups = None if compact_width else [
+                        self.group_indices(start, width, value.device) for start in range(0, slots.shape[0], width)
+                    ]
+                    plan = PrefillExpertPlan(body, bindings, groups, require_prefix=True)
+                    family[binding_signature] = plan
+                    executed += plan.recipes
+                else:
+                    executed += plan.replay(bindings, group_count)
             _expert_audit["calls"] += 1
             _expert_audit["tokens"] += value.shape[0]
             _expert_audit["recipe_executions"] += executed

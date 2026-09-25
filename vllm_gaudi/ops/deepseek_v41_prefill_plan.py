@@ -123,8 +123,14 @@ class PrefillExpertPlan:
         _local.calls = []
         self.group_node_ends = []
         try:
-            for indices in groups:
-                body(*arguments, indices)
+            for indices in groups if groups is not None else (None, ):
+                # A compact final group binds its current index tensor as an
+                # ordinary external argument, so its offset can change while
+                # the compiled shape and retained intermediates stay fixed.
+                if indices is None:
+                    body(*arguments)
+                else:
+                    body(*arguments, indices)
                 self.group_node_ends.append(len(_local.calls))
             torch.hpu.synchronize()
             calls = _local.calls
