@@ -2,6 +2,7 @@
 """Bounded BF16 expert execution grouped by current route occupancy."""
 
 import functools
+from collections import OrderedDict
 from types import FunctionType
 
 import torch
@@ -82,16 +83,41 @@ def _compiled_routes(signature):
 class _BucketedPrefillPlans:
 
     def __init__(self):
-        self.plans = {}
+        # Retain a full tile and a tail without keeping every request shape's
+        # captured intermediates alive. The limit is independent of length.
+        self.plans = OrderedDict()
         self.workspace = None
 
     def close(self):
         if self.plans:
             torch.hpu.synchronize()
-            for plan in self.plans.values():
-                plan.plan.invalidate()
+            for family in self.plans.values():
+                for plan in family.values():
+                    plan.plan.invalidate()
         self.plans.clear()
         self.workspace = None
+
+    def routed_workspace(self, value, routes):
+        if (self.workspace is None or self.workspace.shape[0] < routes + 1 or self.workspace.shape[1] != value.shape[-1]
+                or self.workspace.dtype != value.dtype or self.workspace.device != value.device):
+            # Prepared plans retain the old allocation. Drain their consumers
+            # before replacing it; smaller shapes share its capacity instead.
+            self.close()
+            self.workspace = value.new_empty((routes + 1, value.shape[-1]))
+        # The last row is the current invocation's invalid-route sentinel.
+        return self.workspace[:routes + 1]
+
+    def shape_plans(self, signature):
+        family = self.plans.get(signature)
+        if family is None:
+            if len(self.plans) == 2:
+                torch.hpu.synchronize()
+                _, expired = self.plans.popitem(last=False)
+                for plan in expired.values():
+                    plan.plan.invalidate()
+            family = self.plans[signature] = {}
+        self.plans.move_to_end(signature)
+        return family
 
     def __call__(self, value, ids, routing, q13, q2, s13, s2, lookup, normal_scales, channel13=None):
         import vllm_gaudi.envs as envs
@@ -117,10 +143,7 @@ class _BucketedPrefillPlans:
             raise RuntimeError("Bucketed prefill scratch belongs to the default model stream")
         if value.dtype != torch.bfloat16:
             raise ValueError("Bucketed expert prefill requires BF16 activations")
-        workspace_shape = (ids.numel() + 1, value.shape[-1])
-        if self.workspace is None or tuple(self.workspace.shape) != workspace_shape:
-            self.close()
-            self.workspace = value.new_empty(workspace_shape)
+        workspace = self.routed_workspace(value, ids.numel())
         if single_fp8:
             high, high_scale = compiled_single_prequant((value.shape[0], value.shape[-1]))(value)
         quantum = 32 if single_fp8 else 64
@@ -128,17 +151,23 @@ class _BucketedPrefillPlans:
         desc = _compiled_routes((ids.shape[0], q13.shape[0], quantum))(ids, q13.shape[0], quantum)
         active = [int(count) for count in desc[-1].cpu().tolist()]
         weights = (q13, q2, s13, s2, lookup, channel13) if single_fp8 else (q13, q2, s13, s2, lookup)
-        weight_signature = tuple((tuple(v.shape), v.stride(), v.dtype, v.device) for v in weights)
+
+        def layout(v):
+            return tuple(v.shape), v.stride(), v.dtype, v.device
+
+        signature = (bool(normal_scales), interleaved, single_fp8,
+                     tuple(layout(v) for v in (value, ids, routing, *weights)))
+        family = self.shape_plans(signature)
         for index, rows in enumerate(buckets):
             if not active[index]:
                 continue
             width = expert_bucket_width(rows, quantum)
             experts, slots = desc[index * 2:index * 2 + 2]
-            arguments = (value, routing, slots, experts, q13, q2, s13, s2, lookup, normal_scales, self.workspace)
+            arguments = (value, routing, slots, experts, q13, q2, s13, s2, lookup, normal_scales, workspace)
             if single_fp8:
                 arguments += (channel13, high, high_scale)
-            signature = (rows, bool(normal_scales), interleaved, single_fp8, value.stride(), weight_signature)
-            plan = self.plans.get(signature)
+            binding_signature = (rows, tuple(layout(v) if isinstance(v, torch.Tensor) else v for v in arguments))
+            plan = family.get(binding_signature)
             if plan is None:
                 body = compile_body(("bucketed_fp8" if single_fp8 else "bucketed", value.shape[0], rows, q13.shape[0],
                                      bool(normal_scales)))
@@ -147,7 +176,7 @@ class _BucketedPrefillPlans:
                     for start in range(0, slots.shape[0], width)
                 ]
                 plan = PrefillExpertPlan(body, arguments, groups, require_prefix=True)
-                self.plans[signature] = plan
+                family[binding_signature] = plan
                 executed = plan.recipes
             else:
                 executed = plan.replay(arguments, (active[index] + width - 1) // width)
@@ -156,7 +185,7 @@ class _BucketedPrefillPlans:
             _expert_audit["recipe_executions"] += executed
             _expert_audit["largest_token_bucket"] = max(_expert_audit["largest_token_bucket"], value.shape[0])
         return compile_reduce(
-            (value.shape[0], value.shape[-1]))(self.workspace[:-1].reshape(value.shape[0], 6, value.shape[-1]))
+            (value.shape[0], value.shape[-1]))(workspace[:-1].reshape(value.shape[0], 6, value.shape[-1]))
 
 
 def run_bucketed_prefill(value, ids, routing, q13, q2, s13, s2, lookup, normal_scales, channel13=None):
@@ -174,7 +203,7 @@ def invalidate_bucketed_prefill_plans():
 
 
 def bucketed_prefill_plan_stats():
-    plans = [plan for executor in _executors.values() for plan in executor.plans.values()]
+    plans = [plan for executor in _executors.values() for family in executor.plans.values() for plan in family.values()]
     return dict(plans=len(plans),
                 recipes=sum(p.recipes for p in plans),
                 replays=sum(p.replays for p in plans),
