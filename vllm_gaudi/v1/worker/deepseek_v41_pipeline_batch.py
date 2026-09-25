@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
-from vllm_gaudi.ops.deepseek_v41_batch_input import fill_request_metadata
+from vllm_gaudi.ops.deepseek_v41_batch_input import RequestInputFrame
 import torch.distributed as dist
 
 from vllm.sequence import IntermediateTensors
@@ -30,6 +30,7 @@ class Lane:
     token_host: torch.Tensor
     producer: object
     transferred: object
+    inputs: RequestInputFrame
     generation: int = 0
 
 
@@ -63,7 +64,7 @@ class TwoMicrobatchPipeline:
                 token_host = torch.zeros_like(token, device="cpu").pin_memory("hpu")
                 lanes.append(
                     Lane(host, metadata, pages, packet, hidden, pre, token, token_host, torch.hpu.Event(),
-                         torch.hpu.Event()))
+                         torch.hpu.Event(), RequestInputFrame(self.bank, host, metadata, pages)))
             self.frames[bucket] = tuple(lanes)
 
     def require_ready(self, bucket):
@@ -95,12 +96,9 @@ class TwoMicrobatchPipeline:
         offset = 0
         for half, frame in zip(halves, frames, strict=True):
             frame.generation = self.generation
-            fill_request_metadata(frame.host,
-                                  half,
-                                  owners[offset:offset + len(half)],
-                                  input_ids=(span[2][0] for span in spans[offset:offset + len(half)]))
-            frame.metadata.copy_(frame.host, non_blocking=True)
-            torch.index_select(bank.pages, 0, frame.metadata[2].clamp_min(0).long(), out=frame.pages)
+            frame.inputs.prepare(half,
+                                 owners[offset:offset + len(half)],
+                                 input_ids=(span[2][0] for span in spans[offset:offset + len(half)]))
             offset += len(half)
         pp, compute = runner.pp.group, torch.hpu.current_stream()
         if model.pp_rank == 1:
@@ -113,7 +111,7 @@ class TwoMicrobatchPipeline:
         for lane, (half, frame) in enumerate(zip(halves, frames, strict=True)):
             if frame.generation != self.generation:
                 raise RuntimeError("Stale PP microbatch generation")
-            ids, positions, slots = frame.metadata.unbind(0)
+            ids, positions, slots = frame.inputs.inputs
             arguments = (ids, positions, slots, frame.pages, spans[offset:offset + len(half)])
             if model.pp_rank == 0:
                 value = model.forward_request_batch(*arguments, lane=lane)
