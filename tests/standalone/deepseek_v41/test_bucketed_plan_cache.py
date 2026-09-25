@@ -99,3 +99,60 @@ def test_alternating_shapes_rebind_inputs_and_reduce_only_live_routes(monkeypatc
         assert torch.equal(output, expected)
     assert len(prepared) == 2 and replayed == prepared
     assert owner.workspace.shape == (43, 16)
+
+
+def test_compact_tail_owns_each_route_once_when_its_offset_and_weights_change(monkeypatch):
+    from vllm_gaudi import envs
+    from vllm_gaudi.ops import deepseek_v41_grouped_prefill as grouped
+    from vllm_gaudi.ops import deepseek_v41_prefill_columns as columns
+    from vllm_gaudi.ops import deepseek_v41_prefill_plan as plans
+
+    writes = []
+
+    class Plan:
+
+        def __init__(self, body, arguments, groups, require_prefix):
+            self.groups = groups
+            self.recipes = len(groups) if groups is not None else 1
+            self.plan = SimpleNamespace(invalidate=lambda: None)
+            self.replays = 0
+            self.write(arguments, self.recipes)
+
+        def write(self, args, count):
+            value, route, slots, experts, weight = args[:5]
+            indices = self.groups[:count] if self.groups is not None else (args[-1], )
+            for group in indices:
+                for block in group:
+                    expert = experts.flatten()[block]
+                    for slot in slots[block]:
+                        if slot >= 0:
+                            writes.append(int(slot))
+                            args[10][slot] = value[slot // 6] * route.flatten()[slot] * weight[expert]
+
+        def replay(self, args, count):
+            self.replays += 1
+            self.write(args, count)
+            return count
+
+    monkeypatch.setattr(plans, "PrefillExpertPlan", Plan)
+    monkeypatch.setattr(torch.hpu, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.hpu, "current_stream", lambda: SimpleNamespace(hpu_stream=0))
+    monkeypatch.setattr(torch.hpu, "default_stream", lambda: SimpleNamespace(hpu_stream=0))
+    monkeypatch.setattr(envs, "VLLM_HPU_DSV41_PREFILL_COLUMN_INTERLEAVE", True)
+    monkeypatch.setattr(buckets, "_compiled_routes", lambda key: buckets.device_bucketed_route_blocks)
+    monkeypatch.setattr(grouped, "compiled_single_prequant", lambda key: lambda v: (v, v.new_ones((len(v), 1))))
+    monkeypatch.setattr(columns, "compiled_permuted_single_fp8_write_body", lambda key: None)
+    monkeypatch.setattr(columns, "compiled_permuted_reduce", lambda key: lambda rows: rows.sum(1))
+    owner = buckets._BucketedPrefillPlans()
+    for generation, live in enumerate((37, 57, 29, 61) * 2):
+        value = torch.full((12, 16), generation + 1, dtype=torch.bfloat16)
+        ids = torch.arange(72, dtype=torch.int32).reshape(12, 6) % live
+        route = torch.full((12, 6), 0.5)
+        weight = ((torch.arange(64) + generation) % 4 + 1).bfloat16()
+        other = torch.zeros(64, 4)
+        writes.clear()
+        output = owner(value, ids, route, weight, other, other, other, other, True, other)
+        expected = value * (route * weight[ids.long()]).sum(1, keepdim=True)
+        assert torch.equal(output, expected)
+        if generation >= 4:
+            assert sorted(writes) == list(range(72))

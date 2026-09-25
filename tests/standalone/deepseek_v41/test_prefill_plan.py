@@ -105,6 +105,43 @@ def test_active_prefix_replay_keeps_current_bindings_and_bounded_node_count():
     assert len(observed) == 1 and plan.replays == 1
 
 
+def test_compact_group_rebinds_the_index_tensor_instead_of_capturing_its_values(monkeypatch):
+    slots, observed = [], []
+
+    class NativePlan:
+
+        def add_slot(self, value, external):
+            slots.append(value)
+            return len(slots) - 1
+
+        def add_compute(self, recipe, inputs, outputs):
+            assert recipe == 7 and len(inputs) == 2 and len(outputs) == 1
+
+        def prepare(self, backend, outputs):
+            pass
+
+        def matches(self, inputs):
+            return True
+
+    bridge = SimpleNamespace(PreparedGroupPlan=NativePlan,
+                             replay_prepared_groups_prefix=lambda p, values, limits: observed.append(values[0]))
+    monkeypatch.setattr(plans, "_runtime", lambda: (bridge, object()))
+    monkeypatch.setattr(plans, "register_prefill_plan_pass", lambda: None)
+    monkeypatch.setattr(torch.hpu, "synchronize", lambda: None)
+
+    def body(value, indices):
+        result = value.index_select(0, indices.long())
+        plans._local.calls.append((7, [value, indices], [result]))
+
+    value = torch.arange(48).reshape(12, 4)
+    first = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    plan = plans.PrefillExpertPlan(body, (value, first), None, require_prefix=True)
+    second = torch.tensor([8, 9, 10, 11], dtype=torch.int32)
+    assert plan.replay((value, second), 1) == 1
+    assert observed[0][1] is second
+    assert torch.equal(observed[0][0][observed[0][1].long()], value[8:])
+
+
 def test_model_invalidation_retires_prefill_before_releasing_weight_bindings(monkeypatch):
     from vllm_gaudi.models.deepseek_v41_program import PreparedStage
     from vllm_gaudi.ops import deepseek_v41_prefill_regions as regions
