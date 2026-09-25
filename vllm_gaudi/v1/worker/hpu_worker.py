@@ -368,6 +368,8 @@ class HPUWorker(WorkerBase):
                 required_ops.append("custom_deepseek_v41_prefill_route_write_gaudi2")
             if gaudi_envs.VLLM_HPU_DSV41_PREFILL_FAST_DEQUANT:
                 required_ops.append("custom_deepseek_v41_prefill_weight_bf16_gaudi2")
+            if (gaudi_envs.VLLM_HPU_DSV41_PREFILL_INDEX_QUERY_TP or gaudi_envs.VLLM_HPU_DSV41_PREFILL_REINDEX_REUSE):
+                required_ops.append("custom_deepseek_v41_topk_ids_gaudi2")
             if (gaudi_envs.VLLM_HPU_DSV41_PREFILL_HYBRID_ROWS and gaudi_envs.VLLM_HPU_DSV41_PREFILL_COLUMN_INTERLEAVE
                     and not gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED_FP8):
                 required_ops.append("custom_deepseek_v41_prefill_permuted_bf16_gaudi2")

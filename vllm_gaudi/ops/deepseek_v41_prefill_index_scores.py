@@ -60,6 +60,26 @@ def prefill_full_selection_step(scores, rows, positions, best_scores, best_rows,
     return best_scores, best_rows, block_scores, block_rows
 
 
+def prefill_merge_topk(best_scores, best_rows, scores, rows, width):
+    """Carry candidate IDs through stock TopK without a post-selection gather."""
+    take = min(width, scores.shape[-1])
+    if rows.ndim == 2 and scores.device.type == "hpu":
+        values, selected = torch.ops.custom_op.custom_deepseek_v41_topk_ids_gaudi2(scores.contiguous(),
+                                                                                   rows.contiguous(), take)
+    else:
+        values, offsets = scores.topk(take, dim=-1, sorted=False)
+        selected = rows.expand_as(scores).gather(1, offsets) if rows.ndim == 1 else rows.gather(1, offsets)
+    if best_scores is not None:
+        values = torch.cat((best_scores, values), -1)
+        selected = torch.cat((best_rows, selected), -1)
+        take = min(width, values.shape[-1])
+        if values.device.type == "hpu":
+            return torch.ops.custom_op.custom_deepseek_v41_topk_ids_gaudi2(values, selected, take)
+        values, offsets = values.topk(take, dim=-1, sorted=False)
+        selected = selected.gather(1, offsets)
+    return values, selected
+
+
 @lru_cache(maxsize=64)
 def compiled_prefill_full_selection_step(signature):
     entry = FunctionType(prefill_full_selection_step.__code__.replace(co_name=f"prefill_full_select_{signature}"),
@@ -120,7 +140,7 @@ def full_prefill_index_selection(query,
     from vllm_gaudi.ops.deepseek_v41_paged_attention import PagedCSA2Attention
 
     owner = SimpleNamespace(ratio=ratio)
-    owner._merge_topk = PagedCSA2Attention._merge_topk
+    owner._merge_topk = prefill_merge_topk
     owner._scores = lambda p, rows, q, w: full_prefill_sram_scores(q, w, packed, table, p, rows, ratio)
     rows = torch.arange(source_rows, device=query.device, dtype=torch.int32)
     selected, scores, blocks = PagedCSA2Attention._stream_topk(owner,
@@ -327,14 +347,7 @@ def _candidate_slot_topk(common, positions, blocks, ratio, native_gather=False):
         else:
             scores = common.gather(1, current.clamp(0, source_rows - 1).long())
             scores = scores.masked_fill((current < 0) | (current >= source_rows) | (current >= count), -torch.inf)
-        values, offsets = scores.topk(min(512, scores.shape[-1]), dim=-1, sorted=False)
-        selected = current.gather(1, offsets)
-        if best_values is not None:
-            values = torch.cat((best_values, values), -1)
-            selected = torch.cat((best_rows, selected), -1)
-            values, offsets = values.topk(min(512, values.shape[-1]), dim=-1, sorted=False)
-            selected = selected.gather(1, offsets)
-        best_values, best_rows = values, selected
+        best_values, best_rows = prefill_merge_topk(best_values, best_rows, scores, current, 512)
     selected = torch.where((best_rows >= 0) & (best_rows < count) & (best_rows < source_rows), best_rows, source_rows)
     selected = selected.sort(-1).values
     return torch.where(selected < source_rows, selected, -1).int()
