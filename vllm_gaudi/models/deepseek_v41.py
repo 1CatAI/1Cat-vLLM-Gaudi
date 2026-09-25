@@ -281,6 +281,11 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 layer1 = self.engram_host.consume_device_c1(self._step_request_id)
                 buffers = self.engram_host.wait(self.step_ticket)
                 engram = (layer1, buffers[1])
+            elif self.program.length > 512 and not self.step_use_replay and input_ids.numel() > 6:
+                # Ordinary prefill consumes Engram only at layers 1 and 14.
+                # Each lookup/DMA retains its ticket until complete_step;
+                # preceding layers can execute before the corresponding wait.
+                engram = self.engram_host.prefill_rows(self.step_ticket)
             else:
                 # Embedding and residual preparation are independent of the host
                 # lookup. The decoder still receives explicit DMA dependencies.

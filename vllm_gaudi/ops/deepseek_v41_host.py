@@ -102,6 +102,21 @@ class EngramTransfer:
     packet: bool = False
 
 
+class _PrefillRows:
+    """Queue each layer's DMA dependency at its first ordinary consumer."""
+
+    def __init__(self, owner, ticket):
+        self.owner, self.ticket = owner, ticket
+
+    def __len__(self):
+        return len(self.ticket.buffers)
+
+    def __getitem__(self, index):
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        return self.owner.wait_layer(self.ticket, index)
+
+
 class _C1Packet:
     """One ownership event covers upload and both Engram consumers."""
 
@@ -539,6 +554,7 @@ class EngramHost:
         ticket = EngramTransfer(self.generation, ring, batch, buffers)
         self.pending = ticket
         self.ready_ticket = None
+        self.ready_layers = 0
         self._submit(ticket, 0)
         if envs.VLLM_HPU_DSV41_FUSED_STAGE_IO:
             for index in range(1, len(self.layout.layer_ids)):
@@ -608,11 +624,33 @@ class EngramHost:
         if (ticket.packet or (ticket.batch.hash_ids.shape[0] == 1 and self.native_c1 is not None)):
             self.ready_ticket = ticket
             return ticket.buffers
+        self._stage_layers(ticket, len(self.layout.layer_ids))
+        return ticket.buffers
+
+    def prefill_rows(self, ticket):
+        """Defer prefill waits while retaining the existing transaction owner."""
+        if (self.pending is not ticket or ticket.generation != self.generation or self.ready_ticket is ticket
+                or ticket.batch.hash_ids.shape[0] <= 6):
+            raise RuntimeError("Deferred Engram rows require a pending prefill transaction")
+        return _PrefillRows(self, ticket)
+
+    def wait_layer(self, ticket, index):
+        if self.pending is not ticket or ticket.generation != self.generation:
+            raise RuntimeError("Stale Engram layer consumption")
+        if not 0 <= index < len(self.layout.layer_ids):
+            raise IndexError(index)
+        self._stage_layers(ticket, index + 1)
+        return ticket.buffers[index]
+
+    def _stage_layers(self, ticket, stop):
         count, ring = ticket.batch.hash_ids.shape[0], ticket.slot
         batch_owner = self.batches[ring] if getattr(self, "batches", None) is not None else None
+        if batch_owner is not None:
+            stop = len(self.layout.layer_ids)
         # Submission of layer 14 follows completion of layer 1's host lookup;
         # its worker then runs independently of the first layer's DMA.
-        for index, layer in enumerate(self.layout.layer_ids):
+        for index in range(self.ready_layers, stop):
+            layer = self.layout.layer_ids[index]
             slot = self.slots[layer][ring]
             slot.gather.wait(slot.generation)
             if not slot.direct and index + 1 < len(self.layout.layer_ids):
@@ -646,12 +684,13 @@ class EngramHost:
                     slot.dma_done.record(self.stream)
                 torch.hpu.current_stream().wait_event(slot.dma_done)
                 self.audit["dma_bytes"] += count * heads * (width + width // 32)
-        if batch_owner is not None:
+            self.ready_layers = index + 1
+        if batch_owner is not None and self.ready_ticket is not ticket:
             batch_owner.stage(self.stream, ticket.generation)
             # Fixed C6 capacity also includes the unused tail for C1-C5.
             self.audit["dma_bytes"] += batch_owner.host.numel()
-        self.ready_ticket = ticket
-        return ticket.buffers
+        if self.ready_layers == len(self.layout.layer_ids):
+            self.ready_ticket = ticket
 
     def set_profiling(self, enabled):
         if self.pending is not None:
