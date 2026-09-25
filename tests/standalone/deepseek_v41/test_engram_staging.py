@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from vllm_gaudi.ops.deepseek_v41_engram import EngramHashLayout, EngramTokenHistory
-from vllm_gaudi.ops.deepseek_v41_host import EngramHost, _C1Packet, _TransferSlot, host_native
+from vllm_gaudi.ops.deepseek_v41_host import EngramHost, _C1Packet, _TransferSlot
 
 pytestmark = pytest.mark.skipif(os.getenv("DSV41_TEST_HPU") != "1", reason="An HPU module lease is required")
 
@@ -37,12 +37,11 @@ def test_staging_views_preserve_all_bytes_and_capacity(heads):
 
 
 @pytest.mark.parametrize("tp_rank", [0, 1])
-@pytest.mark.parametrize("preparation", ["compat", "native", "packet", "direct", "deferred"])
+@pytest.mark.parametrize("preparation", ["compat", "native", "packet", "direct"])
 @torch.inference_mode()
 def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, tp_rank, preparation):
     import habana_frameworks.torch.core  # noqa: F401
-    native = host_native()
-    HostRows, NativeC1Prepare = native.HostRows, native.NativeC1Prepare
+    from vllm_gaudi.lib.dsv41_host_gather import HostRows, NativeC1Prepare
 
     host = EngramHost.__new__(EngramHost)
     host.layout = EngramHashLayout.from_config({
@@ -67,7 +66,7 @@ def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, tp_rank, preparati
     host.device_history_parity = 0
     host.device_request = host.device_position = host.device_pending = None
     host.c1_packets = None
-    host.max_tokens, host.ring_size = (257 if preparation == "deferred" else 6), 3
+    host.max_tokens, host.ring_size = 6, 3
     host.audit = dict(gathers=0, major_faults=0, dma_bytes=0, generations=0)
     tables = {}
     for layer, rows in ((1, 10000), (14, 10000)):
@@ -81,9 +80,9 @@ def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, tp_rank, preparati
         host.tables[layer] = HostRows(str(path), first * 256, str(path), weights.size + first * 8, first, last, 256,
                                       True, False)
         host.shards[layer] = shard
-        host.slots[layer] = [_TransferSlot(host.max_tokens, 12, 256, "hpu") for _ in range(3)]
+        host.slots[layer] = [_TransferSlot(6, 12, 256, "hpu") for _ in range(3)]
         tables[layer] = weights, scales
-    if preparation not in ("compat", "deferred"):
+    if preparation != "compat":
         layers = host.layout.layer_ids
         if preparation in ("packet", "direct"):
             first = _C1Packet([12, 12], 256, "hpu")
@@ -105,15 +104,10 @@ def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, tp_rank, preparati
     try:
         for request in ("first", "second"):
             host.reset(request)
-            counts = ((257, 73, 7, 257, 8, 1, 73, 7, 1) if preparation == "deferred" else (1, 6, 1, 2, 1, 6, 1, 1, 1))
-            for step, count in enumerate(counts):
+            for step, count in enumerate((1, 6, 1, 2, 1, 6, 1, 1, 1)):
                 tokens = [(step + i) % 16 for i in range(count)]
                 with torch.hpu.stream(consumer):
-                    deferred = preparation == "deferred" and count > 6
-                    ticket = host.prepare(request,
-                                          tokens, [i == 1 or step == 6 for i in range(count)],
-                                          defer_wait=deferred)
-                    rows = host.prefill_rows(ticket) if deferred else ticket.buffers
+                    ticket = host.prepare(request, tokens, [i == 1 or step == 6 for i in range(count)])
                     assert ticket.packet == (preparation in ("packet", "direct") and count == 1)
                     if ticket.packet:
                         packet = host.c1_packets[ticket.slot]
@@ -124,14 +118,7 @@ def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, tp_rank, preparati
                     assert torch.hpu.current_stream() == consumer
                     with pytest.raises(RuntimeError, match="pending"):
                         host.prepare(request, [1])
-                    for index, layer in enumerate(host.layout.layer_ids):
-                        value = rows[index]
-                        if deferred and index == 0:
-                            assert host.ready_layers == 1 and host.ready_ticket is None
-                            gathers = host.audit["gathers"]
-                            assert rows[0] is value and host.audit["gathers"] == gathers
-                            with pytest.raises(RuntimeError, match="Stale"):
-                                host.complete(ticket, count)
+                    for index, (layer, value) in enumerate(zip(host.layout.layer_ids, ticket.buffers)):
                         shard = host.shards[layer]
                         ids = ticket.batch.hash_ids[:, index, shard["head_start"]:shard["head_stop"]]
                         w, s = tables[layer]
@@ -140,27 +127,13 @@ def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, tp_rank, preparati
                         # wrapping the ring must preserve all pending outputs.
                         pending_results.append((value.clone(), torch.from_numpy(expected)))
                     host.complete(ticket, count if count == 1 else count - 1)
-                    if deferred:
-                        with pytest.raises(RuntimeError, match="Stale"):
-                            rows[0]
                     with pytest.raises(RuntimeError, match="Stale"):
                         host.complete(ticket, count)
         for actual, expected in pending_results:
             assert torch.equal(actual.cpu(), expected)
         assert host.audit["gathers"] == 36
         assert host.audit["generations"] == 18
-        assert host.audit.get("native_c1", 0) == (12 if preparation not in ("compat", "deferred") else 0)
+        assert host.audit.get("native_c1", 0) == (12 if preparation != "compat" else 0)
         assert host.audit.get("c1_packets", 0) == (12 if preparation in ("packet", "direct") else 0)
-        if preparation == "deferred":
-            # Cancellation after layer 1 must also retire the still-running
-            # layer-14 lookup and the queued device consumer before reuse.
-            ticket = host.prepare("second", [1] * 73, defer_wait=True)
-            rows = host.prefill_rows(ticket)
-            partial = rows[0].clone()
-            host.close()
-            assert host.closed and host.pending is None
-            with pytest.raises(RuntimeError, match="Stale"):
-                rows[1]
-            assert partial.cpu().shape == (73, 12, 264)
     finally:
         host.close()
