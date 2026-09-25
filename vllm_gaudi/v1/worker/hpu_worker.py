@@ -204,6 +204,8 @@ class HPUWorker(WorkerBase):
             logger.info("Profiler runtime libraries: %s", verify_loaded_profile_libraries())
             if hasattr(self.model_runner, "trace_enabled"):
                 self.model_runner.trace_enabled = True
+                from vllm_gaudi.ops.deepseek_v41_trace import enable
+                enable(True)
                 host = self.model_runner.model.engram_host
                 if host is not None:
                     # A decode-only capture may begin after the request's
@@ -230,12 +232,18 @@ class HPUWorker(WorkerBase):
         self._write_native_decoder_stats("profile-stop")
         if hasattr(self.model_runner, "trace_enabled"):
             self.model_runner.trace_enabled = False
+            from vllm_gaudi.ops.deepseek_v41_trace import enable
+            enable(False)
             host = self.model_runner.model.engram_host
             if host is not None and host.profile_records is not None:
                 from pathlib import Path
                 host.export_profile(Path(self.torch_profiler_dir) / f"rank{self.rank}-engram-profile.json")
                 host.set_profiling(False)
-        if refresh_native:
+        # A raw acquisition that reuses immutable warm command pages must
+        # retain them at both boundaries. Invalidating only at stop defeats
+        # reuse and forces later request buckets through command capture.
+        reuse_native = os.getenv("VLLM_HPU_PROFILE_REUSE_NATIVE_COMMANDS", "0").lower() in ("1", "true")
+        if refresh_native and not reuse_native:
             self._refresh_native_profiler_commands()
         # Every acquisition owns its profiler/trace sink until export ends.
         self.profiler = None
@@ -272,6 +280,10 @@ class HPUWorker(WorkerBase):
                         and stats["prefill_plan"]["executed"]["largest_token_bucket"] < 128):
                     raise RuntimeError("Native prefill plan was selected but startup did not execute it")
                 owner = self.model_runner.model.program.replay_owner
+                batch_owner = getattr(self.model_runner.model, "batch_replay", None)
+                if batch_owner is not None:
+                    owner = batch_owner
+                    stats["batch_state_bytes"] = self.model_runner.model.batch_state.allocated_bytes
                 stats["capture_snapshot_bytes"] = sum(variant.capture_bytes for variant in owner.variants.values())
                 stats["v41"] = self.model_runner.audit
                 stats["state_bytes"] = self.model_runner.state.allocated_bytes
@@ -338,6 +350,10 @@ class HPUWorker(WorkerBase):
                 os.environ["GRAPH_VISUALIZATION_DIR"] = str(graph_dir)
                 os.environ["PT_HPU_GRAPH_DUMP_PREFIX"] = str(graph_dir)
             required_ops = []
+            if os.environ.get("VLLM_HPU_DSV41_BATCH_C1_NUMERICS", "0").lower() in ("1", "true"):
+                required_ops.extend(
+                    ("custom_deepseek_v41_q_norm_projection_rope_gaudi2", "custom_deepseek_v41_ffn_norm_quant_gaudi2",
+                     "custom_deepseek_v41_expert_n256_moe_prequant_horizontal_fp8_gaudi2"))
             # Every V4.1 decode stage may own ratio-2 CSA2 source layers.  The
             # C1 producer uses this exact state-transition kernel by default;
             # fail before model allocation if a stale native bundle lacks it.
@@ -379,11 +395,8 @@ class HPUWorker(WorkerBase):
         # Initialize the distributed environment.
         init_worker_distributed_environment(self.vllm_config, self.rank, self.distributed_init_method, self.local_rank)
         if is_v41(self.vllm_config):
-            extra = self.vllm_config.load_config.model_loader_extra_config or {}
-            if extra.get("engram_startup_directory"):
-                from vllm_gaudi.ops.deepseek_v41_residency import wait_for_resident_tables
-                extra["engram_resident_tables"] = wait_for_resident_tables(extra["engram_startup_directory"], self.rank,
-                                                                           os.environ["HLS_MODULE_ID"])
+            from vllm_gaudi.ops.deepseek_v41_residency import wait_for_engram_residency
+            wait_for_engram_residency(self.rank, self.parallel_config.world_size)
         from vllm_gaudi.ops.tp2_runtime_profile import verify_loaded_profile_libraries
         logger.info("Worker runtime companion libraries: %s", verify_loaded_profile_libraries())
         # Set random seed.
@@ -876,6 +889,9 @@ class HPUWorker(WorkerBase):
         )
 
     def sample_tokens(self, grammar_output: "GrammarOutput|None") -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        if getattr(self.model_runner, "fatal_execution_errors", False):
+            from vllm_gaudi.ops.deepseek_v41_failure import execute_guarded, guard_async
+            return guard_async(execute_guarded(self.model_runner.sample_tokens, grammar_output, phase="sampling"))
         return self.model_runner.sample_tokens(grammar_output)  # type: ignore[union-attr]
 
     @torch.inference_mode()
@@ -890,7 +906,12 @@ class HPUWorker(WorkerBase):
         with track_graph_compile('HPUWorker.execute_model') \
                 if self.gc_track_recompiles \
                 else contextlib.nullcontext():
-            output = self.model_runner.execute_model(scheduler_output)  # type: ignore[union-attr]
+            if getattr(self.model_runner, "fatal_execution_errors", False):
+                from vllm_gaudi.ops.deepseek_v41_failure import execute_guarded, guard_async
+                output = guard_async(
+                    execute_guarded(self.model_runner.execute_model, scheduler_output, phase="execute_model"))
+            else:
+                output = self.model_runner.execute_model(scheduler_output)  # type: ignore[union-attr]
         # TODO(woosuk): Send the output to the engine process.
         if self.step_profiler:
             if self.step >= self.profile_steps[0]:

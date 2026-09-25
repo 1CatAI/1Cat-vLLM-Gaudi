@@ -35,7 +35,8 @@ void main(tensor cache, tensor pages, tensor rows, tensor output,
                 const int logical=s_i32_ld_g(gen_addr((int5){column,batch},rows));
                 bfloat128 key=0;
                 if(logical>=0 && logical<page_count*page_rows) {
-                    const int page=s_i32_ld_g(gen_addr((int5){logical/page_rows},pages));
+                    const int request=get_dim_size(pages,1)>1?batch:0;
+                    const int page=s_i32_ld_g(gen_addr((int5){logical/page_rows,request},pages));
                     const int physical=page*page_rows+logical%page_rows;
                     if(physical>=0 && physical<cache_rows)key=index_key(cache,physical);
                 }

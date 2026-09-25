@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "qualification": "CPU address-boundary checks pass; native service verification pending",
+  "patch": "synapse-program-window.patch",
+  "sha256": "19dc2592c3bcfcae184720012d1c56c5e86f62089a974c2056d4ad9f4e11d891",
+  "files": {
+    "synapse/src/runtime/scal/common/stream_compute_scal.cpp": {
+      "before": "ff20f0b9162681931bc193cdfadeadd590daf5aa80630e5bd11f31e6d8d5106d",
+      "after": "4b42051f79976fc05e561d9710c22705f82fcd84e7149613d9bd432937c906dc"
+    },
+    "synapse/src/runtime/scal/common/native_program_window.h": {
+      "before": null,
+      "after": "68750b1df12341ce0683556e3f99e4d4f301fcac1f1500d0a9adcab2c4fc2441"
+    }
+  },
+  "program_window_bytes": 4294967296,
+  "program_alignment_bytes": 8192,
+  "retry_allocation_bound": "2 * globalSize + 8191; at most one live program allocation"
+}

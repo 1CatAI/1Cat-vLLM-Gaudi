@@ -4,6 +4,7 @@ import os
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
+    VLLM_HPU_DSV41_STATE_AUDIT_DIR: str | None = None
     VLLM_HPU_DSV41_RAW_TRACE: bool = False
     VLLM_HPU_DSV41_PREFILL_COMPUTE_TOKENS: int = 4096
     VLLM_HPU_DSV41_PREFILL_PP_WAVEFRONT: bool = False
@@ -52,6 +53,19 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_PREFILL_MLA_ROWS: int = 0
     VLLM_HPU_DSV41_PREFILL_COMPACT_CANDIDATES: bool = False
     VLLM_HPU_DSV41_PREFILL_INDEX_MME: bool = False
+    VLLM_HPU_DSV41_BATCH_MAIN_FUSIONS: bool = False
+    VLLM_HPU_DSV41_BATCH_C1_NUMERICS: bool = False
+    VLLM_HPU_DSV41_MHC_BATCH_REUSE: bool = False
+    VLLM_HPU_DSV41_MHC_CONTROL_PREFETCH: bool = False
+    VLLM_HPU_DSV41_BATCH_COMPRESSOR_PAIR: bool = False
+    VLLM_HPU_DSV41_BATCH_COMPRESSOR_GATHER: bool = False
+    VLLM_HPU_DSV41_BATCH_EXPERT_PREFETCH_W2: bool = False
+    VLLM_HPU_DSV41_BATCH_EXPERT_REUSE: bool = False
+    VLLM_HPU_DSV41_BATCH_W13_HORIZONTAL: bool = False
+    VLLM_HPU_DSV41_BATCH_EXPERT_DIRECT_FINALIZE: bool = False
+    VLLM_HPU_DSV41_BATCH_EXPERT_TRANSPOSE_MME: bool = False
+    VLLM_HPU_DSV41_PREFILL_INDEX_SHARED: bool = False
+    VLLM_HPU_DSV41_N256_NORMAL_BF16: bool = False
     VLLM_HPU_DSV41_PREFILL_INDEX_SRAM: bool = False
     VLLM_HPU_DSV41_PREFILL_REINDEX_SRAM: bool = False
     VLLM_HPU_DSV41_PREFILL_INDEX_QUERY_TP: bool = False
@@ -64,6 +78,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_FLASHINFER_PREFILL: bool = False
     VLLM_HPU_DSV41_EXPERT_FUSED_QUANT: bool = False
     VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE: bool = False
+    VLLM_HPU_DSV41_CONCURRENT_MOE_ROWS: int = 0
     VLLM_HPU_DSV41_MLA_MME: bool = False
     VLLM_HPU_DSV41_QKV_FUSED_INPUT: bool = False
     VLLM_HPU_DSV41_COMPRESSOR_FUSED_INPUT: bool = False
@@ -155,6 +170,8 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_VERIFY_TIMING: bool = False
     VLLM_HPU_DSV41_ROUND_TIMING: bool = False
     VLLM_HPU_DSV41_FUSED_STAGE_IO: bool = False
+    VLLM_HPU_DSV41_ENGRAM_PACKED_STAGING: bool = False
+    VLLM_HPU_DSV41_BATCH_C1_PREPARE: bool = False
     VLLM_HPU_DSV41_BATCHED_INPUT_STAGING: bool = False
     VLLM_HPU_DSV41_MHC_SCHEDULE: bool = False
     VLLM_HPU_DSV41_DIRECT_PP_WIRE: bool = False
@@ -389,6 +406,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # V4.1 is a separate opt-in contract; none of the V4 defaults enable it.
     "VLLM_HPU_DSV41_DEFAULT_FASTPATHS":
     lambda: os.environ.get("VLLM_HPU_DSV41_DEFAULT_FASTPATHS", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_STATE_AUDIT_DIR":
+    lambda: os.environ.get("VLLM_HPU_DSV41_STATE_AUDIT_DIR"),
     "VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS":
     lambda: os.environ.get("VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_EXPERT_N256":
@@ -450,6 +469,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_PREFILL_COMPACT_CANDIDATES", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_PREFILL_INDEX_MME":
     lambda: os.environ.get("VLLM_HPU_DSV41_PREFILL_INDEX_MME", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_BATCH_MAIN_FUSIONS":
+    lambda: os.getenv("VLLM_HPU_DSV41_BATCH_MAIN_FUSIONS", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_BATCH_C1_NUMERICS":
+    lambda: os.getenv("VLLM_HPU_DSV41_BATCH_C1_NUMERICS", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_MHC_CONTROL_PREFETCH":
+    lambda: os.getenv("VLLM_HPU_DSV41_MHC_CONTROL_PREFETCH", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_MHC_BATCH_REUSE":
+    lambda: os.getenv("VLLM_HPU_DSV41_MHC_BATCH_REUSE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_BATCH_COMPRESSOR_PAIR":
+    lambda: os.getenv("VLLM_HPU_DSV41_BATCH_COMPRESSOR_PAIR", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_BATCH_COMPRESSOR_GATHER":
+    lambda: os.getenv("VLLM_HPU_DSV41_BATCH_COMPRESSOR_GATHER", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_BATCH_EXPERT_DIRECT_FINALIZE":
+    lambda: os.getenv("VLLM_HPU_DSV41_BATCH_EXPERT_DIRECT_FINALIZE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_BATCH_EXPERT_TRANSPOSE_MME":
+    lambda: os.getenv("VLLM_HPU_DSV41_BATCH_EXPERT_TRANSPOSE_MME", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_BATCH_W13_HORIZONTAL":
+    lambda: os.getenv("VLLM_HPU_DSV41_BATCH_W13_HORIZONTAL", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_BATCH_ROUTE_PACK":
+    lambda: os.environ.get("VLLM_HPU_DSV41_BATCH_ROUTE_PACK", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_BATCH_EXPERT_REUSE":
+    lambda: os.getenv("VLLM_HPU_DSV41_BATCH_EXPERT_REUSE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_BATCH_EXPERT_PREFETCH_W2":
+    lambda: os.getenv("VLLM_HPU_DSV41_BATCH_EXPERT_PREFETCH_W2", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_PREFILL_INDEX_SHARED":
+    lambda: os.environ.get("VLLM_HPU_DSV41_PREFILL_INDEX_SHARED", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_N256_NORMAL_BF16":
+    lambda: os.environ.get("VLLM_HPU_DSV41_N256_NORMAL_BF16", "0") == "1",
     "VLLM_HPU_DSV41_PREFILL_INDEX_SRAM":
     lambda: os.environ.get("VLLM_HPU_DSV41_PREFILL_INDEX_SRAM", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_PREFILL_REINDEX_SRAM":
@@ -474,6 +521,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_FUSED_QUANT", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE":
     lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE", "0").lower() in ("1", "true"),
+    # Experimental SRAM-bounded direct (1) or grouped (4/8/16) decode.
+    "VLLM_HPU_DSV41_CONCURRENT_MOE_ROWS":
+    lambda: int(os.environ.get("VLLM_HPU_DSV41_CONCURRENT_MOE_ROWS", "0")),
     "VLLM_HPU_DSV41_MLA_MME":
     lambda: os.environ.get("VLLM_HPU_DSV41_MLA_MME", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_QKV_FUSED_INPUT":
@@ -632,6 +682,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_VERIFY_TIMING", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_FUSED_STAGE_IO":
     lambda: os.getenv("VLLM_HPU_DSV41_FUSED_STAGE_IO", "0") == "1",
+    "VLLM_HPU_DSV41_ENGRAM_PACKED_STAGING":
+    lambda: os.getenv("VLLM_HPU_DSV41_ENGRAM_PACKED_STAGING", "0") == "1",
+    "VLLM_HPU_DSV41_BATCH_C1_PREPARE":
+    lambda: os.getenv("VLLM_HPU_DSV41_BATCH_C1_PREPARE", "0") == "1",
     "VLLM_HPU_DSV41_BATCHED_INPUT_STAGING":
     lambda: os.getenv("VLLM_HPU_DSV41_BATCHED_INPUT_STAGING", "0") == "1",
     "VLLM_HPU_DSV41_MHC_SCHEDULE":
@@ -670,6 +724,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_PRETRANSPOSE_ATTN", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR":
     lambda: os.environ.get("VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR"),
+    "VLLM_HPU_DSV41_BATCH_DECODE":
+    lambda: os.environ.get("VLLM_HPU_DSV41_BATCH_DECODE", "0") == "1",
+    "VLLM_HPU_DSV41_PP_MICROBATCHES":
+    lambda: int(os.environ.get("VLLM_HPU_DSV41_PP_MICROBATCHES", "1")),
+    "VLLM_HPU_DSV41_BATCH_REINDEX_MME":
+    lambda: os.environ.get("VLLM_HPU_DSV41_BATCH_REINDEX_MME", "0") == "1",
+    "VLLM_HPU_DSV41_BATCH_INDEX_TILED_KEYS":
+    lambda: os.environ.get("VLLM_HPU_DSV41_BATCH_INDEX_TILED_KEYS", "0") == "1",
+    "VLLM_HPU_DSV41_BATCH_PACKED_MLA":
+    lambda: os.environ.get("VLLM_HPU_DSV41_BATCH_PACKED_MLA", "0") == "1",
+    "VLLM_HPU_DSV41_BATCH_PACKED_MLA_SRAM":
+    lambda: os.environ.get("VLLM_HPU_DSV41_BATCH_PACKED_MLA_SRAM", "0") == "1",
+    "VLLM_HPU_DSV41_BATCH_PACKED_MLA_VECTOR":
+    lambda: os.environ.get("VLLM_HPU_DSV41_BATCH_PACKED_MLA_VECTOR", "0") == "1",
+    "VLLM_HPU_DSV41_BATCH_FULL_INDEX_MME":
+    lambda: os.environ.get("VLLM_HPU_DSV41_BATCH_FULL_INDEX_MME", "0") == "1",
+    "VLLM_HPU_DSV41_REINDEX_BOUNDED_PLAN":
+    lambda: os.environ.get("VLLM_HPU_DSV41_REINDEX_BOUNDED_PLAN", "0") == "1",
 
     # Fuse the four selected-expert packed-weight copies into one Gaudi2 TPC
     # launch for DeepSeek V4 single-token decode.

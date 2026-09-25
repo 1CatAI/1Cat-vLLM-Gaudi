@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_gaudi.ops.deepseek_v41_math import pack_swa, unpack_swa
@@ -8,7 +9,30 @@ from vllm_gaudi.ops.deepseek_v41_paged_attention import (
     PagedCSA2Attention,
     PREFILL_INDEX_ROWS,
     SWA_ROWS,
+    bounded_prefill_mla,
+    candidate_columns,
 )
+
+
+@pytest.mark.parametrize("tile,tokens", [(16, 33), (32, 73), (64, 129)])
+def test_mme_tiles_preserve_query_order_and_real_tail_extent(monkeypatch, tile, tokens):
+    calls = []
+
+    def operator(query, cache, indices, sink, scale, lengths):
+        calls.append((query.clone(), indices.clone(), lengths.clone()))
+        return query.clone()
+
+    monkeypatch.setattr(torch.ops.custom_op, "custom_deepseek_v41_prefill_mla_mme_gaudi2", operator, raising=False)
+    query = torch.arange(tokens, dtype=torch.bfloat16)[:, None, None].expand(tokens, 32, 512)
+    indices = torch.arange(tokens, dtype=torch.int32)[:, None].expand(tokens, 640)
+    output = bounded_prefill_mla(query, torch.empty(8192, 512, dtype=torch.bfloat16), indices, torch.zeros(32),
+                                 torch.ones(1), tile)
+    assert torch.equal(output, query)
+    assert all(q.shape == (tile, 32, 512) and i.shape == (tile, 640) for q, i, _ in calls[:-1])
+    tail = tokens % tile
+    assert calls[-1][0].shape == (tail, 32, 512)
+    assert calls[-1][1].shape == (tail, 640)
+    assert all(torch.equal(lengths, torch.full_like(lengths, 640)) for _, _, lengths in calls)
 
 
 def test_flat_prefill_swa_workspace_preserves_prior_tail_and_causal_indices():
@@ -78,11 +102,48 @@ def test_streaming_topk_matches_one_shot_for_independent_source_rows():
         def _scores(current_positions, current_rows, q, weights):
             del q, weights
             # Unique scores avoid making this layout test depend on topk's tie ordering.
-            return (current_rows.float().unsqueeze(0) * 0.01
-                    + current_positions.float().unsqueeze(1) * 0.000001)
+            return (current_rows.float().unsqueeze(0) * 0.01 + current_positions.float().unsqueeze(1) * 0.000001)
 
-    actual, _, _ = PagedCSA2Attention._stream_topk(
-        Scorer(), positions, rows, None, None, width=width)
+    actual, _, _ = PagedCSA2Attention._stream_topk(Scorer(), positions, rows, None, None, width=width)
     scores = Scorer._scores(positions, rows, None, None)
     expected = rows.expand_as(scores).gather(1, scores.topk(width, -1, sorted=False).indices)
     assert torch.equal(actual.sort(-1).values, expected.sort(-1).values)
+
+
+@pytest.mark.parametrize("rows,ratio", [(513, 1), (8191, 1), (8192, 1), (8193, 2), (16384, 1), (16385, 2)])
+def test_compact_reindex_preserves_full_produced_candidates(monkeypatch, rows, ratio):
+    tokens = 7
+    positions = (torch.linspace(0, rows - 1, tokens).int() + 1) * ratio - 1
+
+    class Scorer:
+        owns_index = True
+        runtime_indexer = True
+        layer = candidate_source = 20
+        length = 1048576
+        _merge_topk = staticmethod(PagedCSA2Attention._merge_topk)
+        _stream_topk = PagedCSA2Attention._stream_topk
+        _select = PagedCSA2Attention._select
+
+        def _scores(self, current_positions, current_rows, q, weights):
+            count = (current_positions[:, None] + 1) // self.ratio
+            # Permuted unique finite scores also exercise non-contiguous block
+            # order. Invalid entries within the candidate prefix stay in place.
+            scores = ((current_rows * 997) % 65537).float().expand(tokens, -1)
+            return scores.masked_fill((current_rows < 0) | (current_rows >= count), -torch.inf)
+
+    scorer = Scorer()
+    scorer.ratio, scorer.search_length = ratio, rows * ratio
+    scorer.shared = SimpleNamespace(candidate_pool=torch.full((tokens, 2048), -1, dtype=torch.int32))
+    scorer.selection = SimpleNamespace(indices=torch.empty(tokens, 512, dtype=torch.int32))
+    dummy = torch.empty(tokens, 1)
+    scorer._select(dummy, dummy, positions, prepared=(None, None), prefill=True)
+    source = scorer.shared.candidate_pool.clone()
+    columns = candidate_columns(rows * ratio, ratio, 2048)
+    assert (source[:, columns:] == -1).all()
+    scorer.layer = 24
+    monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_COMPACT_CANDIDATES", "0")
+    expected = scorer._select(dummy, dummy, positions, prepared=(None, None), prefill=True).clone()
+    monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_COMPACT_CANDIDATES", "1")
+    actual = scorer._select(dummy, dummy, positions, prepared=(None, None), prefill=True)
+    assert torch.equal(actual, expected)
+    assert torch.equal(scorer.shared.candidate_pool, source)

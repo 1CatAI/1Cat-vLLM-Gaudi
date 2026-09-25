@@ -52,6 +52,7 @@ struct PreparedNode {
   uint64_t recipe_id = 0;
   habana::graph::GraphExec* graph = nullptr;
   std::vector<int64_t> inputs, outputs;
+  uint32_t minimum_tile_bound = 0;
   float epsilon = 0;
   FusedRecipe* communication_recipe = nullptr;
 };
@@ -89,6 +90,12 @@ class PreparedGroupPlan : public std::enable_shared_from_this<PreparedGroupPlan>
     node.inputs = std::move(inputs);
     node.outputs = std::move(outputs);
     nodes.push_back(std::move(node));
+  }
+
+  void mark_last_optional_tile(uint32_t minimum) {
+    TORCH_CHECK(!sealed && !nodes.empty() && !nodes.back().exchange && minimum > 0 && minimum <= 9,
+                "Optional scorer requires an unsealed recipe and tag 1..8 or whole-scorer tag 9");
+    nodes.back().minimum_tile_bound = minimum;
   }
 
   int64_t add_norm_view(int64_t source, const std::vector<int64_t>& shape) {
@@ -163,8 +170,10 @@ class PreparedGroupPlan : public std::enable_shared_from_this<PreparedGroupPlan>
           const int64_t hidden = partial.numel();
           const char* v41Flag = std::getenv("VLLM_HPU_DSV41_GRAPH_REPLAY");
           const bool v41 = v41Flag && std::strcmp(v41Flag, "1") == 0;
+          const char* batchFlag = std::getenv("VLLM_HPU_DSV41_BATCH_DECODE");
+          const int64_t v41Maximum = batchFlag && std::strcmp(batchFlag, "1") == 0 ? 64 * 5120 : 32768;
           const bool v41Shape = v41 && !node.reduction_only && hidden >= 128 &&
-                                hidden <= 32768 && hidden % 128 == 0;
+                                hidden <= v41Maximum && hidden % 128 == 0;
           TORCH_CHECK(hidden == 4096 || (!node.reduction_only && hidden == 5120) || v41Shape,
                       "Unsupported prepared TP2 hidden width");
           TORCH_CHECK(partial.sizes() == at::IntArrayRef({1, hidden}) &&

@@ -20,10 +20,15 @@ class V41StateSpec(KVCacheSpec):
     state_shape: tuple[int, ...]
     state_dtype: torch.dtype
     paged: bool = False
+    auxiliary_prefix: bool = False
 
     @property
     def prefix_cacheable(self):
-        return False
+        return self.paged and self.auxiliary_prefix
+
+    @property
+    def requires_auxiliary_prefix_state(self):
+        return self.prefix_cacheable
 
     @property
     def num_heads(self):
@@ -55,9 +60,9 @@ class V41StateSpec(KVCacheSpec):
 
 
 def register_state_spec(vllm_config=None):
-    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+    from vllm_gaudi.ops.deepseek_v41_prefix_manager import V41PrefixManager
     KVCacheSpecRegistry._ensure_registered(vllm_config)
-    KVCacheSpecRegistry.register(V41StateSpec, FullAttentionManager)
+    KVCacheSpecRegistry.register(V41StateSpec, V41PrefixManager)
 
 
 class StageStateBlocks:
@@ -65,8 +70,8 @@ class StageStateBlocks:
     def __init__(self, program):
         self.program = program
         mutable = {
-            "swa", "main", "decoded_swa", "decoded_main", "decoded_index_hot", "index", "indices",
-            "candidate_pool", "kv_history", "score_history"
+            "swa", "main", "decoded_swa", "decoded_main", "decoded_index_hot", "index", "indices", "candidate_pool",
+            "kv_history", "score_history"
         }
         self.bindings, self.specs, self.allocations = {}, {}, {}
         for module_name, module in program.named_modules():
@@ -121,7 +126,7 @@ Only the small SWA/compressor working set is saved when scheduling another
 request. Compressed history stays in its scheduler-owned HPU pages.
 """
 
-    def __init__(self, program):
+    def __init__(self, program, *, auxiliary_prefix=False):
         from vllm_gaudi.ops.deepseek_v41_paged_attention import PAGE_TOKENS
         self.program = program
         self.bindings, self.specs, self.allocations = {}, {}, {}
@@ -132,12 +137,22 @@ request. Compressed history stays in its scheduler-owned HPU pages.
                 self.specs[key] = V41StateSpec(block_size=PAGE_TOKENS,
                                                state_shape=(PAGE_TOKENS // cache.ratio, width),
                                                state_dtype=torch.uint8,
-                                               paged=True)
+                                               paged=True,
+                                               auxiliary_prefix=auxiliary_prefix)
+        history_names = {"swa", "decoded_swa", "decoded_main", "decoded_index_hot", "kv_history", "score_history"}
+        selection_names = {"indices", "candidate_pool"}
+        # The runtime hot path may skip publishing unchanged selection state.
+        # Preserve that state across request switches along with its decoded
+        # mirror. The original non-runtime path republishes it every step.
+        if getattr(program, "runtime_indexer", False):
+            history_names |= selection_names
         self.working = {
             name: value
-            for name, value in program.named_buffers()
-            if name.rsplit(".", 1)[-1] in ("swa", "decoded_swa", "decoded_main", "decoded_index_hot",
-                                           "kv_history", "score_history", "indices", "candidate_pool")
+            for name, value in program.named_buffers() if name.rsplit(".", 1)[-1] in history_names
+        }
+        self.scratch = {
+            name: value
+            for name, value in program.named_buffers() if name.rsplit(".", 1)[-1] in selection_names
         }
         self.saved, self.active, self.blocks = {}, None, 2
         # The scheduler page table is small but long-lived.  Rebuilding a
@@ -146,8 +161,7 @@ request. Compressed history stays in its scheduler-owned HPU pages.
         # recipe buffers are live.  Apart from wasting one H2D submission per
         # token, that can enter Synapse defragmentation with buffers in use.
         # Keep one explicitly pinned source and only publish changed tables.
-        self.block_table_host = torch.empty(program.shared.block_table.shape,
-                                            dtype=torch.int32,
+        self.block_table_host = torch.empty(program.shared.block_table.shape, dtype=torch.int32,
                                             device="cpu").pin_memory("hpu")
         self.block_table_host_values = self.block_table_host.numpy()
         self.published_block_ids = None
@@ -233,8 +247,10 @@ request. Compressed history stays in its scheduler-owned HPU pages.
             self.active = None
 
     def clear(self):
-        for name, value in self.working.items():
-            value.fill_(-1 if name.rsplit(".", 1)[-1] in ("indices", "candidate_pool") else 0)
+        for value in self.working.values():
+            value.zero_()
+        for value in self.scratch.values():
+            value.fill_(-1)
 
     @property
     def allocated_bytes(self):

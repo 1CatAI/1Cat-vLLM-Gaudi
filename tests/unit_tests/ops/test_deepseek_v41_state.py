@@ -94,6 +94,47 @@ def test_prompt_completion_uses_cpu_pp_control_record(monkeypatch):
     assert broadcasts[0][1:] == (2, cpu_group)
 
 
+@pytest.mark.parametrize("wavefront", [False, True])
+def test_unsampled_packed_prefill_waits_for_model_before_cpu_commit(monkeypatch, wavefront):
+    from types import SimpleNamespace
+    from vllm_gaudi.v1.worker import deepseek_v41_runner as runner
+
+    order = []
+
+    class Event:
+
+        def record(self, _stream):
+            order.append("model-submitted")
+
+        def synchronize(self):
+            order.append("model-complete")
+
+    monkeypatch.setattr(runner.envs, "VLLM_HPU_DSV41_PREFILL_PP_WAVEFRONT", wavefront)
+    monkeypatch.setattr(runner.envs, "VLLM_HPU_DSV41_PACKED_PP", True)
+    monkeypatch.setattr(runner.envs, "VLLM_HPU_DSV41_NATIVE_PP_COPY", False)
+    monkeypatch.setattr(runner.torch.hpu, "Event", Event)
+    monkeypatch.setattr(runner.torch.hpu, "current_stream", lambda: None)
+    monkeypatch.setattr(
+        runner, "get_pp_group", lambda: SimpleNamespace(
+            is_first_rank=False, is_last_rank=True, ranks=[0, 2], device_group=None, cpu_group=None))
+    monkeypatch.setattr(runner.dist, "irecv", lambda *_a, **_k: SimpleNamespace(wait=lambda: None))
+
+    def broadcast(*_args, **_kwargs):
+        assert order[-1] == "model-complete"
+        order.append("cpu-commit")
+
+    monkeypatch.setattr(runner.dist, "broadcast", broadcast)
+    buffers = runner.PPBuffers("cpu", capacity=2, dspark=False, device_commit=False)
+    for _ in range(3):
+        buffers.exchange(None, 1, decode=True)
+        buffers.mark_prefill_consumed()
+        assert buffers.packed.active is not None
+        assert buffers.finish_single(1, None) == (1, [])
+        assert buffers.packed.active is None
+        assert not buffers.prefill_packed_consumer_pending
+    assert order == ["model-submitted", "model-complete", "cpu-commit"] * 3
+
+
 def test_prefill_pp_wavefront_retires_transport_and_consumer_at_slot_reuse(monkeypatch):
     from types import SimpleNamespace
     from vllm_gaudi.v1.worker import deepseek_v41_runner as runner
@@ -176,6 +217,7 @@ def test_native_c1_binding_consumes_prompt_updates_and_rejects_foreign_request_p
 
     runner = object.__new__(V41ModelRunner)
     runner.model, runner.use_dspark, runner.direct_token_ids = Model(), False, True
+    runner.request_batches = None
     runner.decode_ids = torch.empty(1, dtype=torch.int32)
     runner.input_views = {1: torch.empty(1, dtype=torch.int64)}
     runner.position_views = {1: torch.empty(1, dtype=torch.int32)}
@@ -222,13 +264,16 @@ def test_position_bank_uses_bounded_views_for_one_million_token_context():
 
 
 def test_engine_registers_opaque_state_without_worker_model_initialization(monkeypatch):
+    import vllm.platforms
+    from vllm_gaudi.platform import HpuPlatform
     from vllm.v1 import kv_cache_spec_registry as registry
-    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+    from vllm_gaudi.ops.deepseek_v41_prefix_manager import V41PrefixManager
     monkeypatch.setenv("VLLM_HPU_DSV41_PREPARED_SHARDS", "1")
+    monkeypatch.setattr(vllm.platforms, "current_platform", HpuPlatform())
     monkeypatch.setattr(registry, "_REGISTRY_KVCACHESPEC_LIST", {})
     spec = V41StateSpec(block_size=512, state_shape=(512, 528), state_dtype=torch.uint8)
     registry.KVCacheSpecRegistry.check_kv_cache_spec_registry({"state": spec})
-    assert registry.KVCacheSpecRegistry.get_manager_class(spec) is FullAttentionManager
+    assert registry.KVCacheSpecRegistry.get_manager_class(spec) is V41PrefixManager
 
 
 def test_pp_scheduler_reconciliation_does_not_append_broadcast_tokens_twice():
@@ -327,11 +372,13 @@ def test_paged_state_reuses_pinned_block_table_and_only_publishes_changes(monkey
     assert program.shared.block_table.values.tolist() == [1, 2, 3, 4, 5, 6, 7, 8]
 
 
-def test_paged_state_saves_and_clears_decoded_working_set(monkeypatch):
+@pytest.mark.parametrize("runtime_indexer", [False, True])
+def test_paged_state_saves_and_clears_decoded_working_set(monkeypatch, runtime_indexer):
     from types import SimpleNamespace
 
     monkeypatch.setattr(torch.Tensor, "pin_memory", lambda value, *args, **kwargs: value)
     program = torch.nn.Module()
+    program.runtime_indexer = runtime_indexer
     program.pp_rank, program.generation, program.replay_owner = 0, 0, None
     program.register_buffer("decoded_swa", torch.zeros(2, dtype=torch.bfloat16))
     program.register_buffer("candidate_pool", torch.zeros(3, dtype=torch.int32))
@@ -349,13 +396,26 @@ def test_paged_state_saves_and_clears_decoded_working_set(monkeypatch):
     program.decoded_swa.fill_(3)
     program.source.decoded_main.fill_(5)
     program.source.decoded_index_hot.fill_(7)
+    program.candidate_pool.copy_(torch.tensor([8, 3, -1], dtype=torch.int32))
+    program.source.indices.copy_(torch.tensor([7, 29, -1], dtype=torch.int32))
     state.activate("b", [2], reset=True)
     assert (not program.decoded_swa.any() and not program.source.decoded_main.any()
             and not program.source.decoded_index_hot.any())
     assert (program.candidate_pool == -1).all() and (program.source.indices == -1).all()
+    saved_names = {"decoded_swa", "source.decoded_main", "source.decoded_index_hot"}
+    if runtime_indexer:
+        saved_names |= {"candidate_pool", "source.indices"}
+    assert set(state.saved["a"]) == saved_names
+    assert set(state.scratch) == {"candidate_pool", "source.indices"}
     state.activate("a", [1])
     assert ((program.decoded_swa == 3).all() and (program.source.decoded_main == 5).all()
             and (program.source.decoded_index_hot == 7).all())
+
+    if runtime_indexer:
+        assert program.candidate_pool.tolist() == [8, 3, -1]
+        assert program.source.indices.tolist() == [7, 29, -1]
+    else:
+        assert (program.candidate_pool == -1).all() and (program.source.indices == -1).all()
 
 
 def test_target_capture_does_not_claim_draft_only_state():
@@ -413,6 +473,12 @@ def test_target_only_loading_never_reads_or_allocates_draft_tensors(tmp_path, mo
         def forward(self, residual, pre, *args):
             assert not self.collect_target_state
             return residual, pre, None
+
+        def prepare_mhc_control_weights(self):
+            pass
+
+        def release_mhc_control_weights(self):
+            pass
 
     def unexpected_draft(*args):
         pytest.fail("Target-only initialization constructed a draft module")

@@ -3,11 +3,33 @@
 #ifndef DSV41_N256_FP8
 #define DSV41_N256_FP8 1
 #endif
+#ifndef DSV41_N256_NORMAL_BF16
+#define DSV41_N256_NORMAL_BF16 0
+#endif
 #ifndef DSV41_N256_PREFETCH
 #define DSV41_N256_PREFETCH 8
 #endif
 #ifndef DSV41_N256_FUSE_SLOTS
 #define DSV41_N256_FUSE_SLOTS 0
+#endif
+#ifndef DSV41_N256_HORIZONTAL
+#define DSV41_N256_HORIZONTAL 0
+#endif
+#ifndef DSV41_N256_REUSE_SLOTS
+#define DSV41_N256_REUSE_SLOTS 0
+#endif
+
+#if DSV41_N256_REUSE_SLOTS
+#define DSV41_N256_WRITE(ENCODED) do { \
+    destination[2] = slot; \
+    v_f8_st_tnsr(destination, output, *((minifloat256*)&(ENCODED))); \
+    int5 duplicate = destination; \
+    duplicate[2] += 1; \
+    v_f8_st_tnsr(duplicate, output, *((minifloat256*)&(ENCODED)), 0, repeat_end > slot + 1); \
+} while (0)
+#else
+#define DSV41_N256_WRITE(ENCODED) \
+    v_f8_st_tnsr(destination, output, *((minifloat256*)&(ENCODED)))
 #endif
 
 static inline ushort128 exact_bf16(ushort128 nibble, ushort128 code)
@@ -30,7 +52,7 @@ static inline ushort128 exact_bf16(ushort128 nibble, ushort128 code)
     const uchar256 direction = (WEIGHTS) | 0x80; \
     const uchar256 base = v_u8_shuffle_b(table, direction, 0, direction); \
     const uchar256 encoded = v_u8_sel_eq_u8_b((WEIGHTS), 7, base, base + delta, SW_MASK_EQ_ZERO); \
-    v_f8_st_tnsr(destination, output, *((minifloat256*)&encoded)); \
+    DSV41_N256_WRITE(encoded); \
     destination[1] += 1; \
 } while (0)
 
@@ -39,7 +61,7 @@ void main(tensor ids, tensor q16, tensor planes, tensor lookup, tensor output)
     const int5 start = get_index_space_offset();
     const int5 end = start + get_index_space_size();
     const int experts = get_dim_size(q16, 2);
-#if DSV41_N256_FP8
+#if DSV41_N256_FP8 || DSV41_N256_NORMAL_BF16
     const uchar256 table = v_u8_ld_tnsr_b((int5){0}, lookup);
 #endif
 #if DSV41_N256_FUSE_SLOTS
@@ -52,8 +74,13 @@ void main(tensor ids, tensor q16, tensor planes, tensor lookup, tensor output)
     const int last_k = end[1] * 128;
 #endif
 #else
+#if DSV41_N256_REUSE_SLOTS
+    const int first_slot = start[1] * DSV41_N256_REUSE_SLOTS;
+    const int last_slot = s_i32_min(end[1] * DSV41_N256_REUSE_SLOTS, get_dim_size(ids, 0));
+#else
     const int first_slot = start[1];
     const int last_slot = end[1];
+#endif
     const int first_group = start[2] * 4;
     const int last_group = end[2] * 4;
 #if DSV41_N256_FP8
@@ -62,7 +89,20 @@ void main(tensor ids, tensor q16, tensor planes, tensor lookup, tensor output)
 #endif
 #endif
     for (int slot = first_slot; slot < last_slot; ++slot) {
+#if !DSV41_N256_HORIZONTAL
         const int expert = s_i32_ld_g(gen_addr((int5){slot}, ids));
+#if DSV41_N256_REUSE_SLOTS
+        // Sharing is restricted to one affine batch access tile. Synapse
+        // can slice this axis with MME while preserving SRAM ownership.
+        if (slot % DSV41_N256_REUSE_SLOTS != 0 && expert >= 0 && expert < experts &&
+            expert == s_i32_ld_g(gen_addr((int5){slot - 1}, ids)))
+            continue;
+        int repeat_end = slot + 1;
+        const int tile_end = s_i32_min(last_slot, (slot / DSV41_N256_REUSE_SLOTS + 1) * DSV41_N256_REUSE_SLOTS);
+        while (repeat_end < tile_end &&
+               expert == s_i32_ld_g(gen_addr((int5){repeat_end}, ids)))
+            ++repeat_end;
+#endif
 #if DSV41_N256_FP8
         if (expert < 0 || expert >= experts) {
             for (int block = start[0]; block < end[0]; ++block) {
@@ -73,19 +113,41 @@ void main(tensor ids, tensor q16, tensor planes, tensor lookup, tensor output)
             continue;
         }
 #endif
+#endif
         for (int block = start[0]; block < end[0]; ++block) {
+#if DSV41_N256_HORIZONTAL
+            const int blocks_per_expert = get_dim_size(q16, 1);
+            const int route = block / blocks_per_expert;
+            const int source_block = block % blocks_per_expert;
+            const int expert = s_i32_ld_g(gen_addr((int5){slot * DSV41_N256_HORIZONTAL + route}, ids));
+            if (expert < 0 || expert >= experts) {
+                for (int k = first_k; k < last_k; ++k)
+                    v_f8_st_tnsr((int5){block * 256, k, slot}, output, (minifloat256){0});
+                continue;
+            }
+#else
+            const int source_block = block;
+#endif
             const int row = block * 256;
             for (int group = first_group; group < last_group; ++group) {
 #if DSV41_N256_FP8
                 const uchar256 delta = v_u8_ld_tnsr_b(
-                    (int5){group * 256 + 128, block, expert}, planes);
+                    (int5){group * 256 + 128, source_block, expert}, planes);
 #else
                 const bool valid = expert >= 0 && expert < experts;
                 const uchar256 original = v_u8_ld_tnsr_b(
-                    (int5){group * 256, block, expert}, planes, 0, (uchar256){0}, valid);
+                    (int5){group * 256, source_block, expert}, planes, 0, (uchar256){0}, valid);
                 const ushort256 codes = convert_uchar256_to_ushort256(original, SW_LINEAR);
+#if DSV41_N256_NORMAL_BF16
+                const ushort128 scale_low_bits = codes.v1 << 7;
+                const ushort128 scale_high_bits = codes.v2 << 7;
+                const bfloat128 scale_low = *((bfloat128*)&scale_low_bits);
+                const bfloat128 scale_high = *((bfloat128*)&scale_high_bits);
+                const ushort128 negative_zero_bits = 0x8000;
+                const bfloat128 negative_zero = *((bfloat128*)&negative_zero_bits);
 #endif
-                int5 source = {group * 2048, block, expert};
+#endif
+                int5 source = {group * 2048, source_block, expert};
                 int5 destination = {row, group * 32, slot};
 #if DSV41_N256_FP8
                 // Keep the reference eight-vector schedule available so the
@@ -233,6 +295,19 @@ void main(tensor ids, tensor q16, tensor planes, tensor lookup, tensor output)
                     const uchar256 unpacked = v_u8_ld_tnsr_b(
                         source, q16,
                         SW_UNPACK | SW_UNPCK_4_TO_8, (uchar256){0}, valid);
+#if DSV41_N256_NORMAL_BF16
+                    // This GUID is selected only for qualified UE8M0 codes
+                    // 2..254. The tiny/NaN encodings retain exact_bf16 below.
+                    const uchar256 directions = unpacked | 0x80;
+                    const uchar256 bits = v_u8_shuffle_b(table, directions, 0, unpacked);
+                    const bfloat256 base = convert_minifloat256_to_bfloat256(*((minifloat256*)&bits), SW_LINEAR);
+                    const bfloat128 low = v_bf16_madd_b(base.v1, scale_low, negative_zero);
+                    const bfloat128 high = v_bf16_madd_b(base.v2, scale_high, negative_zero);
+                    v_bf16_st_tnsr(destination, output, low);
+                    int5 upper = destination;
+                    upper[0] += 128;
+                    v_bf16_st_tnsr(upper, output, high);
+#else
                     const ushort256 nibble = convert_uchar256_to_ushort256(unpacked, SW_LINEAR);
                     const ushort128 low = exact_bf16(nibble.v1, codes.v1);
                     const ushort128 high = exact_bf16(nibble.v2, codes.v2);
@@ -240,6 +315,7 @@ void main(tensor ids, tensor q16, tensor planes, tensor lookup, tensor output)
                     int5 upper = destination;
                     upper[0] += 128;
                     v_bf16_st_tnsr(upper, output, *((bfloat128*)&high));
+#endif
 #endif
                     source[0] += 64;
                     destination[1] += 1;

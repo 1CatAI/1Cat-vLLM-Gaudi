@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "qualification": "experimental; bounded short-prefix and whole-pool recipe selection; service qualification pending",
+  "requires_base_patch_sha256": "eeeb7478d958920b8d8282081ef2479d170d5c188c68932a5542f1fbe796f641",
+  "patch": "synapse-bounded-reindex.patch",
+  "sha256": "1860c18a827b446f7c583eb80661303d46b8d376de0301ce890a278dd237c1ec",
+  "files": {
+    "synapse/include/synapse_api.h": {
+      "before": "cda00ff014794a77b63d17fdc0ab59dcd6b3318789eb2f4f699441da0ad91ea2",
+      "after": "5ceb7c6a9dbe5000cb341b73535d5df89a6f6e15ba0cb8a393d954b9c65e626b"
+    },
+    "synapse/src/runtime/scal/common/native_compute_graph.hpp": {
+      "before": "3da9ff6e9fc782b04e96ca8c9a1392d2236b50b1b6548cbf925070c63cbb4b92",
+      "after": "b5449f546ee7a2e76dab96e54ab73fedfe7562e0b9ddf94e1eb9094e49f5ab96"
+    },
+    "synapse/src/runtime/scal/common/stream_compute_scal.cpp": {
+      "before": "5c1f3c8264565b77f007b343e9fd44d9746d4ded857eec92093ea56e78ff1d87",
+      "after": "ff20f0b9162681931bc193cdfadeadd590daf5aa80630e5bd11f31e6d8d5106d"
+    },
+    "synapse/src/runtime/scal/common/native_bounded_selection.h": {
+      "before": null,
+      "after": "46847d62e11964a3c9401f68fb7e4e3213fa68c646ff510a53703bae472ac344"
+    }
+  },
+  "selection_version": 2
+}

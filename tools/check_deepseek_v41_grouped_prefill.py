@@ -17,13 +17,18 @@ def main():
     parser.add_argument("--tokens", type=int, default=128)
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--changing-routes", action="store_true")
-    parser.add_argument("--eager-body", action="store_true",
-                        help="Run each grouped body as bounded eager-pipeline ops")
-    parser.add_argument("--reserve-gib", type=float, default=0.0,
+    parser.add_argument("--runtime-prepared",
+                        type=Path,
+                        help="Load existing runtime-layout experts without repeating host preparation")
+    parser.add_argument("--eager-body", action="store_true", help="Run each grouped body as bounded eager-pipeline ops")
+    parser.add_argument("--reserve-gib",
+                        type=float,
+                        default=0.0,
                         help="Reserve additional HPU memory before the candidate")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     import habana_frameworks.torch.core  # noqa: F401
+    from habana_frameworks.torch.hpu.metrics import metric_global
     from vllm_gaudi.ops.deepseek_v41_expert_n256 import prepare_expert
     from vllm_gaudi.ops.deepseek_v41_fp8 import read_expert
     from vllm_gaudi.ops.deepseek_v41_shard_loader import PreparedV41Shard
@@ -34,7 +39,14 @@ def main():
     torch.ops.load_library(os.environ["VLLM_HPU_DSV4_TPC_OP_LIBRARY"])
     torch.set_num_threads(2)
     shard = PreparedV41Shard(args.prepared, 0, 0)
+
     def load(projection):
+        if args.runtime_prepared:
+            from vllm_gaudi.ops.deepseek_v41_n256_shards import N256PreparedShard
+            if args.experts != 384:
+                raise ValueError("Runtime shard fixture loads all 384 experts")
+            runtime = N256PreparedShard(args.runtime_prepared, shard)
+            return runtime.projection(f"layers.0.ffn.experts.{projection}", "hpu")
         qs, ss, cs = [], [], []
         for index in range(args.experts):
             q = read_expert(shard.catalog[f"layers.0.ffn.experts.{projection}_q16"], index)
@@ -47,6 +59,7 @@ def main():
         s = torch.from_numpy(np.stack(ss)).to("hpu")
         c = torch.from_numpy(np.stack(cs).view(np.int16)).view(torch.bfloat16).to("hpu")
         return q, s, c
+
     q13, s13, c13 = load("w13")
     q2, s2, c2 = load("w2")
     lookup = mxfp4_bf16_lut("hpu")
@@ -63,9 +76,11 @@ def main():
     ids_cpu = torch.stack([torch.randperm(args.experts)[:6] for _ in range(args.tokens)]).int()
     ids = ids_cpu.to("hpu")
     routing = (torch.rand(args.tokens, 6).softmax(-1) * 1.5).to("hpu")
+
     def c1(value, indices, route):
         return torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2(
             value, indices, route, q13, q2, s13, s2, lookup, c13, c2, True)
+
     decode = torch.compile(c1, backend="hpu_backend", fullgraph=True, dynamic=False)
     expected_c1 = decode(x[:1], ids[:1], routing[:1]).cpu()
     print("native C1 compiled", flush=True)
@@ -75,16 +90,18 @@ def main():
         reserve.zero_()
         torch.hpu.synchronize()
         print(f"reserved {reserve.numel()} bytes; allocated={torch.hpu.memory_allocated()}", flush=True)
+
     def candidate():
         return run_grouped_prefill(x, ids, routing, q13, q2, s13, s2, lookup, True)
+
     actual = candidate()
     torch.hpu.synchronize()
     print("grouped prefill compiled", flush=True)
     # Compare the same algorithm's grouped GEMM with the existing BF16 native
     # compound at the same real inputs, preserving clamp and routed W2 input.
-    ref = torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_bf16_gaudi2(
-        x[:1].contiguous(), ids[:1].contiguous(), routing[:1].contiguous(),
-        q13, q2, s13, s2, lookup, True).cpu().float()
+    ref = torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_bf16_gaudi2(x[:1].contiguous(), ids[:1].contiguous(),
+                                                                              routing[:1].contiguous(), q13, q2, s13,
+                                                                              s2, lookup, True).cpu().float()
     test = actual[:1].cpu().float()
     error = (test - ref).abs()
     samples, devices = [], []
@@ -101,8 +118,10 @@ def main():
         devices.append(begin.elapsed_time(end))
     actual_c1 = decode(x[:1], ids[:1], routing[:1]).cpu()
     report = {
-        "experts": args.experts, "tokens": args.tokens,
-        "host_ms": samples, "device_interval_ms": devices,
+        "experts": args.experts,
+        "tokens": args.tokens,
+        "host_ms": samples,
+        "device_interval_ms": devices,
         "c1_unchanged_after_prefill": torch.equal(expected_c1, actual_c1),
         "bf16_reference_max_abs": error.max().item(),
         "bf16_reference_relative_l2": (torch.linalg.vector_norm(error) / torch.linalg.vector_norm(ref)).item(),
@@ -118,17 +137,26 @@ def main():
             next_ids = torch.zeros_like(ids) if skew else (ids + 1) % args.experts
             next_x = x * 0.75
             next_routing = routing.flip(-1).contiguous()
-            output = run_grouped_prefill(next_x, next_ids, next_routing,
-                                        q13, q2, s13, s2, lookup, True)
+            torch.hpu.synchronize()
+            before_routes = dict(metric_global("graph_compilation").stats())
+            output = run_grouped_prefill(next_x, next_ids, next_routing, q13, q2, s13, s2, lookup, True)
+            torch.hpu.synchronize()
+            after_routes = dict(metric_global("graph_compilation").stats())
             reference = torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_bf16_gaudi2(
-                next_x[:1].contiguous(), next_ids[:1].contiguous(), next_routing[:1].contiguous(),
-                q13, q2, s13, s2, lookup, True).cpu().float()
+                next_x[:1].contiguous(), next_ids[:1].contiguous(), next_routing[:1].contiguous(), q13, q2, s13, s2,
+                lookup, True).cpu().float()
             difference = output[:1].cpu().float() - reference
             relative = (torch.linalg.vector_norm(difference) / torch.linalg.vector_norm(reference)).item()
-            changed.append({"all_routes_one_expert": skew, "relative_l2": relative})
+            changed.append({
+                "all_routes_one_expert": skew,
+                "relative_l2": relative,
+                "compilation_before": before_routes,
+                "compilation_after": after_routes
+            })
             if relative > 0.01:
                 raise RuntimeError(f"Changed routing failed: {changed[-1]}")
         report["changing_routes"] = changed
+    report["compilation"] = dict(metric_global("graph_compilation").stats())
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2), flush=True)

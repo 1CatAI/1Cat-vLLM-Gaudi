@@ -2,6 +2,24 @@
 
 This document lists the supported diagnostic and profiling, as well as performance tuning options.
 
+`VLLM_HPU_DSV41_STATE_AUDIT_DIR` saves a read-only CPU snapshot when a request
+first enters native single-request decode in the concurrent service. It records
+SWA, compressor histories, reconstructed bounded KV mirrors, page ownership and
+Engram history. Unset by default. Snapshot copies and writes must be excluded
+from performance windows; use the output only to diagnose state consistency.
+
+`VLLM_HPU_DSV41_RUNTIME_INDEXER=1` selects the experimental metadata-driven
+CSA2 indexer for ordinary paged V4.1 C1 decode. The stage graph binds persistent
+RoPE tables, page metadata and fixed top-512 outputs. Native kernels read the
+current position and scan only visible rows (or the Reindex candidate pool),
+so increasing history does not specialize the outer decode graph. It requires
+the matching in-tree indexer and sparse-RoPE kernels, DSpark disabled and a
+paged capacity greater than 512. This does not reduce KV capacity or the
+scheduler's prefill token budget. Multi-token prefill keeps its existing
+implementation; this option alone does not qualify every prefill geometry or
+active-length performance. The option defaults to `false` pending serving
+validation.
+
 `VLLM_HPU_NATIVE_DECODE_GRAPH` selects the research native replay path for the
 Gaudi2 Qwen3.8 TP2 C1 decoder. Warmup retains eight compiled decoder groups,
 fixed tensor bindings, recipe memory, and HCL command templates. Stable decode
@@ -43,7 +61,72 @@ Source, topology, tensor layout and quantization fingerprints must match;
 invalid or incomplete caches fail explicitly. Dense weights and Engram
 continue to use their existing sources. The variable is unset by default.
 
-`VLLM_HPU_DSV41_PREFILL_GROUPED` selects bounded expert grouping for V4.1
+`VLLM_HPU_DSV41_MHC_BATCH_REUSE=1` tests four-request control-weight reuse in the ordinary decode batch path. It keeps FP32 operands and each request's original K accumulation and reduction order. It is disabled by default pending complete-chain and serving qualification.
+
+`VLLM_HPU_DSV41_MHC_CONTROL_PREFETCH=1` tests four-vector load lookahead for the concurrent FP32 mHC control projection. It preserves the ordered MAC and reduction sequence and leaves the fused C1 RRMS path unchanged. Disabled by default pending complete-chain and serving qualification.
+
+`VLLM_HPU_DSV41_BATCH_COMPRESSOR_PAIR=1` tests request-slot history updates and
+pair mixing in one native kernel for ratio-2 ordinary decode batches. Active
+slots must be unique; padding does not modify history. It is disabled by default
+pending complete-chain numerical, state and serving qualification.
+
+`VLLM_HPU_DSV41_BATCH_COMPRESSOR_GATHER=1` tests fused request-slot history
+writes and pair reads while retaining the existing softmax and reduction. It
+is mutually exclusive with the pair-mixing candidate and is disabled by default.
+
+`VLLM_HPU_DSV41_BATCH_EXPERT_PREFETCH_W2=1` exposes W2 weight preparation
+before W13 MME in the ordinary N256 request-batch compound operator. It retains
+the existing dynamic quantization, scaled BF16 route rows and ordered reduction;
+it does not select C1-only direct finalization. Disabled pending complete-chain
+validation of scheduling, SRAM residency and performance.
+
+`VLLM_HPU_DSV41_BATCH_MAIN_FUSIONS=1` tests the existing mHC control/RRMS
+and FFN norm/FP8-operand producers inside ordinary request-batch replay.
+It is disabled until the complete TP chain is qualified for its batch buckets;
+its value is included in the program precision fingerprint.
+
+`VLLM_HPU_DSV41_BATCH_C1_NUMERICS=1` uses the existing C1 FFN norm/quant
+producer and the fused Q norm/projection/RoPE producer for ordinary request
+rows that do not also feed an Indexer. The latter keeps per-request scales
+and rotary positions while sharing projection weights across the batch.
+It does not enable the mHC candidate. This experimental selection is off by
+default and included in the precision fingerprint; it requires the rebuilt
+native Q projection contract supporting B1 through B64. When horizontal W13
+is selected, the prequantized activation feeds that same pairwise expert
+layout without another quantizer; the native bundle must include the combined
+prequant/horizontal operator. Worker initialization rejects stale bundles.
+
+V4.1 prefill and concurrent candidates (generic defaults are off; the dedicated
+entrypoint enables its qualified production subset):
+
+- `VLLM_HPU_DSV41_PREFILL_DEVICE_ROUTES=1` uses fixed-capacity device route
+  descriptors instead of CPU occupancy grouping. `VLLM_HPU_DSV41_PREFILL_EXPERT_ROWS`
+  selects 32, 64 (default), or 128 padded rows per expert block.
+- `VLLM_HPU_DSV41_N256_NORMAL_BF16=1` selects register lookup and exact
+  power-of-two multiplication for N256 weights qualified to UE8M0 codes
+  2..254. Other encodings use the existing integer decoder. Select this
+  before compilation; changing the flag requires rebuilding recipes.
+- `VLLM_HPU_DSV41_PREFILL_MLA_ROWS=16|32|64` selects bounded MME query tiles;
+  zero retains the existing prefill attention. This preserves selected indices
+  and sink semantics but changes the matrix reduction schedule. Validate the
+  complete prefill path and memory use before serving with either candidate.
+- `VLLM_HPU_DSV41_PREFILL_COMPACT_CANDIDATES=1` omits only the appended
+  padding of Full-produced candidate lists during prefill Reindex. It keeps
+  candidate ordering and internal invalid entries. Disabled by default.
+- `VLLM_HPU_DSV41_PREFILL_INDEX_MME=1` uses native packed index-key gathering
+  followed by BF16 MME scoring and the existing rounded head reduction
+  for bounded prefill Reindex tiles. It requires a matching native extension
+  at startup. Full selection and decode keep their existing paths. Disabled
+  by default.
+- `VLLM_HPU_DSV41_PREFILL_INDEX_SHARED=1` shares packed index-key decoding
+  and scores across query rows for bounded prefill Reindex prefixes through
+  16384 compressed rows. Scores are gathered into the original candidate order
+  before compiled top-k; larger prefixes retain bounded selected-key scoring.
+  This changes neither candidate eligibility nor the decode graph. Disabled
+  by default and requires the same native packed-key extension.
+
+The dedicated V4.1 entrypoint enables `VLLM_HPU_DSV41_PREFILL_GROUPED`
+for bounded expert grouping in V4.1
 prefill on the resident N256 compressed weights. It retains clamp, routing,
 BF16 rounding and ordered reduction boundaries, while ordinary C1 decode
 continues to use its compiled native path. It is enabled by the dedicated
@@ -276,10 +359,10 @@ generic vLLM entrypoint keeps the individual switches disabled.
 | `VLLM_HPU_DSV41_TPC_MHC` | Uses FP32 TPC GEMV for the C1 mHC control projection. Preserves FP32 operands but changes reduction order from MME; requires separate model quality qualification. Other shapes retain MME. Experimental. | `false` |
 | `VLLM_HPU_DSV41_ENGRAM_NATIVE_C1` | Performs C1 compression, integer hash, TP row lookup and final pinned staging copies in the native host extension. Requires a matching native C1 ABI; device Engram requires ABI version 2. Retains consumer-stream DMA, request history transactions and the existing prefill path. Experimental, not performance or quality qualified. | `false` |
 | `VLLM_HPU_DSV41_ENGRAM_C1_PACKET` | Requires native C1 preparation. Packs both Engram layers into one fixed pinned C1 transfer, with one consumer completion event protecting packet reuse. Prefill keeps its existing buffers and transfers. Experimental. | `false` |
-| `VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT` | Experimental ordinary BF16 C1 path requiring native input replay and C1 packets. Retains the pinned host ring but shares one packed device destination with the captured graph, avoiding two intermediate D2D copies. Bridge storage dependencies and packet completion still protect old readers and host reuse. Qualified as part of the V2 device-continuation bundle. | `false` |
-| `VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT` | Experimental V2 ordinary C1 input commit before waiting for the next sampled token. Engram consumer events still protect input storage; PP retirement and sampled-token publication still wait for the true host-copy completion. Qualified as part of the V2 device-continuation bundle. | `false` |
-| `VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX` | Experimental V2 PP0 publication split within one complete compiled graph. Derives the prefix from captured late-input reads, retaining TP and input-copy dependencies. Requires native input replay, TP/mHC overlap, early input commit and the Synapse segmented-plan V3 API. Qualified as part of the V2 device-continuation bundle. | `false` |
-| `VLLM_HPU_DSV41_V2_DEVICE_ENGRAM` | Experimental PP0 C1 continuation path. Fuses exact device-token hashing, production layer-1 host-mapped gather and FP8 decode into one TPC recipe, while native host C1 prepares only the late layer-14 packet. Requires segmented replay, native C1 packets and direct graph inputs. Qualified as part of the V2 device-continuation bundle. | `false` |
+| `VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT` | Experimental ordinary BF16 C1 path requiring native input replay and C1 packets. Retains the pinned host ring but shares one packed device destination with the captured graph, avoiding two intermediate D2D copies. Bridge storage dependencies and packet completion still protect old readers and host reuse. Qualified as part of the V2 device-continuation bundle. Request-batch execution does not create this unused whole-table mapping; it retains host gather and bounded staging for B1–64. | `false` |
+| `VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT` | Experimental V2 ordinary C1 input commit before waiting for the next sampled token. Engram consumer events still protect input storage; PP retirement and sampled-token publication still wait for the true host-copy completion. Qualified as part of the V2 device-continuation bundle. Request-batch execution does not create this unused whole-table mapping; it retains host gather and bounded staging for B1–64. | `false` |
+| `VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX` | Experimental V2 PP0 publication split within one complete compiled graph. Derives the prefix from captured late-input reads, retaining TP and input-copy dependencies. Requires native input replay, TP/mHC overlap, early input commit and the Synapse segmented-plan V3 API. Qualified as part of the V2 device-continuation bundle. Request-batch execution does not create this unused whole-table mapping; it retains host gather and bounded staging for B1–64. | `false` |
+| `VLLM_HPU_DSV41_V2_DEVICE_ENGRAM` | Experimental PP0 C1 continuation path. Fuses exact device-token hashing, production layer-1 host-mapped gather and FP8 decode into one TPC recipe, while native host C1 prepares only the late layer-14 packet. Requires segmented replay, native C1 packets and direct graph inputs. Qualified as part of the V2 device-continuation bundle. Request-batch execution does not create this unused whole-table mapping; it retains host gather and bounded staging for B1–64. | `false` |
 | `VLLM_HPU_DSV41_TP_MHC_OVERLAP` | Splits proven independent C1 residual/mHC work between TP production and consumption. Requires the versioned native dependency API, BF16 ordinary decode and joint replay; rejects a capture with no independent segment. Experimental, not performance or quality qualified. | `false` |
 | `VLLM_HPU_DSV41_NATIVE_INPUT_PREFLIGHT` | Batches V4.1 C1 input and state allocation/layout guards in the native adapter before copying inputs and replaying. Requires graph replay and the version 1 preflight API; retains generation and alias checks. Experimental. | `false` |
 | `VLLM_HPU_DSV41_ATTENTION_PAIRED_EXP` | Evaluates the two broadcast scalar exponentials of ordered C1 attention together in SIMD lanes, using the existing Cephes routine. Requires bounded, selected-valid-only attention and its SWA write dependency. Experimental. | `false` |
@@ -294,6 +377,7 @@ generic vLLM entrypoint keeps the individual switches disabled.
 | `VLLM_HPU_DSV41_ENGINE_CPUS` | EngineCore CPU set, including its I/O threads. Must be allowed by the initial launch affinity and disjoint from worker and API cores and their SMT siblings. | unset |
 | `VLLM_HPU_DSV41_API_CPUS` | API CPU set with the same ownership checks. Both control sets are recorded by the launcher. | unset |
 | `VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR` | Selects an independently built native kernel directory. Both binaries must match its build manifest; communication runtime ABI checks remain required. | unset |
+| `VLLM_HPU_DSV41_BATCH_DECODE` | Experimental request-slot C1 batching with finite native graph buckets up to 64 requests. Requires paged runtime-position CSA2, TP2×PP2, DSpark off, and the matching batch-capable communication bridge (`HCL_TP2_DIRECT_MAX_COUNT=327680`). Startup must prepare every configured bucket before serving. | `0` |
 
 `VLLM_HPU_DSV4_WORKER_CPUS` and `VLLM_HPU_DSV4_WORKER_HELPER_CPUS`
 also apply to this profile, with one entry per rank. Each worker sets
@@ -670,6 +754,8 @@ after a state update terminates execution rather than retrying another path.
 | --- | --- | --- |
 | `VLLM_HPU_DSV41_DEVICE_VERIFY` | `0` | Keep accepted-prefix control and PP commit on the device, with final asynchronous scheduler consumption. |
 | `VLLM_HPU_DSV41_FUSED_STAGE_IO` | `0` | Fuse text embedding and PP wire transforms into the stage graph. Use pinned packed Engram staging; requires the packed-output host extension. |
+| `VLLM_HPU_DSV41_ENGRAM_PACKED_STAGING` | `0` | Gather Engram rows directly into the final pinned packed staging buffer, without changing stage replay or PP wire transforms. Requires packed-output host extension version 1. |
+| `VLLM_HPU_DSV41_BATCH_C1_PREPARE` | `0` | Reuse native C1 Engram preparation for a single ordinary request in the slot-based batch runner. Requires `VLLM_HPU_DSV41_ENGRAM_NATIVE_C1`; larger batches retain their packed staging path. |
 | `VLLM_HPU_DSV41_BATCHED_INPUT_STAGING` | `0` | Batch the two Engram layers into one fixed C6 DMA allocation and consume token/position staging directly. Requires fused stage I/O; retains DMA and consumer generation checks. |
 | `VLLM_HPU_DSV41_MHC_SCHEDULE` | `0` | Materialize independent mHC controls in the compute recipe before its TP exchange. Communication payload and FP32/BF16 arithmetic are preserved. Requires native V4.1 graph replay. |
 | `VLLM_HPU_DSV41_DIRECT_PP_WIRE` | `0` | Send the compiled PP wire directly and bind the persistent receive allocation as the native stage input. Keeps strict layout checks and communication/consumer ownership. |
@@ -691,16 +777,101 @@ performance, SRAM placement, or production-quality qualification.
 
 `VLLM_HPU_DSV41_NATIVE_KV_PACK` (default `0`) enables pure native checkpoint SWA/FP4 encoders for BF16 C1–C6 inputs. Cache writes, dependencies and existing BF16/MME attention remain unchanged. Larger prefill inputs use the original encoder.
 
-`VLLM_HPU_DSV41_NATIVE_ROPE` (default `0`) fuses the interleaved rotary-table lookup, adjacent-pair FP32 rotation and BF16 output for C1–C6 inputs. It copies the non-rotary prefix verbatim and supports the inverse output rotation. The ordinary path handles other shapes and prefill.
+`VLLM_HPU_DSV41_NATIVE_ROPE` (default `0`) fuses the interleaved rotary-table lookup, adjacent-pair FP32 rotation and BF16 output for C1–C6 inputs. Ordinary request batching uses the same arithmetic for up to 64 rows, including inverse output rotation, instead of changing the floating-point fusion sequence at larger batch sizes. It copies the non-rotary prefix verbatim. Prefill retains its existing dispatch; enabling request batching does not turn prefill tokens into independent requests. Rebuild both the operator extension and the TPC host adapter when enabling the expanded batch contract.
 
 `VLLM_HPU_DSV41_FUSED_PREFIX_LAYOUT` (default `0`) combines the SWA window, selected-page mapping, shared row list and valid lengths for C1–C6 non-ranking CSA2 calls. It consumes live selection and block-table tensors; owner-layer selection and candidate-pool writes remain in the graph. Requires selected-KV and shared-prefix paths, window 128 and compression ratio 1 or 2.
 
-`VLLM_HPU_DSV41_PREFILL_INDEX_QUERY_TP` (default `0`) partitions independent Full/Reindex query rows across TP2 after the existing query-head gather. It gathers final integer selections before the attention consumer and publishes the original full candidate layout. It requires the SRAM Full/Reindex paths and decoded Reindex key reuse; decode and out-of-range prefill contracts retain their existing implementation.
+`VLLM_HPU_DSV41_BATCH_REINDEX_MME` (default `0`) is an experimental ordinary
+multi-request Reindex path: bounded paged-key decoding, BF16 MME scores and
+ordered native head reduction. It retains candidate slots, BF16 boundaries and
+the existing threshold/emitter. Full/Reuse and non-batch calls keep their
+existing contracts, including the single-request batch bucket. The fixed candidate capacity can add short-context work;
+enable only in a configuration qualified for the intended workload.
 
-`VLLM_HPU_DSV41_PREFILL_INDEX_QUERY_TP` (default `0` for the generic entrypoint, enabled by the dedicated V4.1 entrypoint) partitions independent C1024-C8192 Full/Reindex query rows across TP2 after the existing head gather, then gathers final integer selections. Smaller query shapes retain the local path.
+`VLLM_HPU_DSV41_REINDEX_BOUNDED_PLAN` (default `0`) prepares fixed Reindex
+scoring tiles and native joint-plan variants that omit work beyond the
+scheduler-owned context bound. Requires batch Reindex MME, TP/mHC dependency
+partitioning, DSpark disabled and the matching bounded native runtime API.
+State writers, collectives and downstream masking remain mandatory. This
+candidate is not yet service-qualified; whole-stage and long-context costs
+must be checked before promotion.
 
-`VLLM_HPU_DSV41_PREFILL_INDEX_VISIBLE` (default `0`) omits the score producer and main Top512 merge for wholly invisible Full-index source tiles using the scheduler's absolute input bound. Candidate-block ordering for later Reindex layers remains intact, the last visible tile retains its per-query mask, and no device position readback is introduced.
+`VLLM_HPU_DSV41_CONCURRENT_MOE_ROWS` (default `0`) selects the experimental
+SRAM-bounded routed-expert compound for ordinary B64 decode. `1` keeps direct
+route order; `4`, `8`, and `16` expose fixed-capacity grouped alternatives.
+Requires the existing fused N256 FP8 numerical path and the matching native
+operator. Other batches and prefill retain the original implementation. Empty
+group descriptors do not currently skip MME work. See
+[concurrent decode candidates](../deepseek_v41_concurrent_decode.md).
 
-`VLLM_HPU_DSV41_PREFILL_DECODER_HALO` (default `0`) is an experimental text-only PP1 optimization for a complete prompt in one scheduler transaction with at least two C8192 internal blocks. It runs the global source layer on every row and retains a conservative 4096-row decoder suffix. When the final block has fewer than 4096 rows, the preceding full block also runs the decoder to rebuild its local caches. Prompt logprobs, multimodal or speculative inputs, multiple scheduled requests, and prompts split across scheduler transactions use the full decoder path. Keep it disabled until full-model output, continuation and serving performance are qualified.
+`VLLM_HPU_DSV41_PP_MICROBATCHES` (default `1`) accepts `1` for whole-batch
+execution or `2` for the experimental two-microbatch ordinary decode pipeline.
+The latter applies only to 32..64 requests and requires native request-batch
+execution without DSpark. Each lane owns its native replay scratch, metadata,
+packet and completion events. Small batches and prefill retain their existing
+paths. It does not increase executor queue depth; enable only after the real
+producer-to-consumer chain, Engram lifecycle and serving configuration qualify.
 
-`VLLM_HPU_DSV41_RAW_TRACE` (default `0`) selects diagnostic Synapse raw-file capture for V4.1 workers. It requires `--enable-profiler` in the launcher, `HABANA_PROFILE_WRITE_HLTV=1`, and a `HABANA_PROF_CONFIG` enabling HwTrace, `skipParse=true`, and per-process filenames. Stop explicitly publishes the raw bundle for offline parsing; a missing or unchanged file is an error. It is excluded from unprofiled performance qualification.
+`VLLM_HPU_DSV41_BATCH_EXPERT_REUSE=1` enables an unqualified concurrent MoE
+candidate. Device-sorted, unpadded route rows share FP8 decode register vectors
+for equal expert IDs within bounded 16-route islands. Every MME route and the
+original top-6 reduction order remain. Default is off; complete-chain performance
+and SRAM placement must pass before serving promotion.
+
+`VLLM_HPU_DSV41_BATCH_W13_HORIZONTAL=1` selects the experimental ordinary-decode
+W13 shared-input BMM. Each pair of expert outputs is contiguous along N; W2 and ordered
+route reduction retain their existing contracts. Default off; C1/prequantized
+B2 and prefill retain their qualified implementations.
+
+`VLLM_HPU_DSV41_BATCH_FULL_INDEX_MME` (default `0`) enables experimental
+request-batched Full Indexer MME scoring for the bounded prefix. The canonical
+packed scorer handles longer requests; fixed MME tiles still execute for the
+whole batch. This does not enable cross-request KV sharing or change prefill.
+
+`VLLM_HPU_DSV41_BATCH_ROUTE_PACK=1` selects an unqualified concurrent MoE
+candidate: native stable route ordering, byte-exact FP8 activation packing,
+bounded paired expert decoding, and ordered BF16 route reduction. It replaces
+the generic sort/gather intermediates; decoded weight writes and MME route count
+remain unchanged. Default off; it requires the matching native library and
+complete-chain validation before deployment.
+
+`VLLM_HPU_DSV41_BATCH_INDEX_TILED_KEYS` (default `0`) enables an experimental
+affine logical-row/output mapping for ordinary MME Reindex key decoders.
+Full scoring and the optional bounded Reindex publication plan retain their
+existing mappings.
+Packed source addresses remain
+indirect and fully required. This changes compiler slicing, not page ownership,
+key encoding, score arithmetic, or long-context selection.
+
+`VLLM_HPU_DSV41_BATCH_PACKED_MLA` (default `0`) fuses selected packed KV
+decoding with MLA key/value gathering for request batches. It preserves the
+BF16 rounding boundary, FP32 PV operand, selection mask and write dependencies,
+while removing the separate decoded-row intermediate. It requires the matching
+native library and complete-chain qualification before deployment.
+
+`VLLM_HPU_DSV41_BATCH_PACKED_MLA_SRAM` (default `0`) additionally places
+the fused decoder key, FP32 value and mask operands in recipe-owned SRAM. It
+requires `VLLM_HPU_DSV41_BATCH_PACKED_MLA` and bounds each internal query tile
+to eight requests; scheduler batch capacity is unchanged. This allocation
+candidate must pass graph and complete-consumer qualification before deployment.
+
+`VLLM_HPU_DSV41_BATCH_PACKED_MLA_VECTOR` (default `0`) reuses the full-width
+BF16 packed-KV decoder in the batched SRAM MLA compound. It requires the
+preceding fused-decoder and SRAM options and a matching native library. It
+keeps QK/PV arithmetic, masks, BF16 materialization and request ownership;
+only KV decode vector width changes. Enable only after complete-chain qualification.
+
+`VLLM_HPU_DSV41_BATCH_EXPERT_TRANSPOSE_MME=1` selects an experimental B2–64
+ordinary-decode matrix orientation. It requires horizontal W13 and fused ordered
+reduction, preserves physical weight storage and complete K, and computes the
+transpose-equivalent product using a separate native schema. It is default off,
+does not change C1 or prefill dispatch, and cannot combine with the other expert
+layout/finalization experiments until their joint contracts are qualified.
+
+`VLLM_HPU_DSV41_BATCH_EXPERT_DIRECT_FINALIZE=1` selects the experimental B2–64
+horizontal N256 W2 scale-and-ordered-reduction consumer. It preserves each
+route’s BF16 rounding before FP32 accumulation, eliminating the separate
+BF16 route-output tensor. Requires horizontal W13 and fused expert reduction;
+default off pending complete-chain and serving qualification.
+
+`VLLM_HPU_DSV41_PREFILL_ROPE` (default `1`) uses native forward and inverse RoPE for BF16 query batches of 7–8192 rows when native V4.1 RoPE is enabled. It preserves the large-query path's separate FP32 products and final BF16 rounding; C1–C6 keep their existing arithmetic. Set it to `0` to diagnose the tensor implementation. Rebuild the native extension before enabling this path.

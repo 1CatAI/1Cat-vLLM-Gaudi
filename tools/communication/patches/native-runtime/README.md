@@ -152,6 +152,27 @@ gates, and remain required before enabling defaults.
 
 ## Concurrent graph fusion
 
+### Native program address windows
+
+After the bounded-reindex patch, apply the native program-window correction
+to the isolated Synapse source:
+
+```bash
+python tools/communication/apply_native_program_window.py --source "$TP2_SYNAPSE_SOURCE" --apply
+```
+
+Native graph program storage retains the normal compute arena's 8 KiB
+alignment and single 4 GiB program-counter window. If the first allocation
+cannot satisfy both, it is released and one bounded padded allocation is
+attempted. Address selection uses the replacement's actual address, including
+when it moves. Graph-owned workspace and arithmetic are unchanged. Rebuild
+Synapse and the Bridge extension with the matching dependency fingerprint;
+do not bypass the runtime ABI check. The standalone
+`tests/unit_tests/ops/native_program_window_test.cpp` exercises address limits,
+alignment, exact-end boundaries and relocation without acquiring a device.
+
+### Compiler state
+
 TPC fusion owns pending replacement nodes per cluster invocation. Compilations
 may run concurrently, so pending node lists and original-node sets must not be
 process-static or survive failed cluster replacement. Diagnostic cluster IDs

@@ -66,9 +66,26 @@ def configure(config):
         raise ValueError("The V4.1 prepared profile requires TP2 x PP2, DP1")
     if not 1 <= config.model_config.max_model_len <= 1048576:
         raise ValueError("V4.1 supports context lengths up to the checkpoint's 1M limit")
-    if cache.enable_prefix_caching:
-        raise ValueError("V4.1 opaque request state requires --no-enable-prefix-caching")
     paged = config.model_config.max_model_len > 512
+    if cache.enable_prefix_caching:
+        from vllm.v1.core.sched.output import SchedulerOutput
+        from vllm.v1.outputs import ModelRunnerOutput
+        from vllm.v1.kv_cache_interface import KVCacheSpec, UniformTypeKVCacheSpecs
+        if (not paged or not envs.VLLM_HPU_DSV41_BATCH_DECODE or envs.VLLM_HPU_DSV41_DSPARK
+                or "auxiliary_prefix_operations" not in SchedulerOutput.__dataclass_fields__
+                or "auxiliary_prefix_acknowledgments" not in ModelRunnerOutput.__dataclass_fields__
+                or not hasattr(KVCacheSpec, "requires_auxiliary_prefix_state")
+                or "requires_auxiliary_prefix_state" not in UniformTypeKVCacheSpecs.__dict__):
+            raise ValueError("V4.1 prefix caching requires request slots and the auxiliary-checkpoint engine ABI")
+    if envs.VLLM_HPU_DSV41_BATCH_DECODE:
+        if (not paged or not envs.VLLM_HPU_DSV41_GRAPH_REPLAY or not envs.VLLM_HPU_DSV41_RUNTIME_INDEXER
+                or envs.VLLM_HPU_DSV41_DSPARK or not 1 <= config.scheduler_config.max_num_seqs <= 64):
+            raise ValueError(
+                "V4.1 request batches require paged native runtime-position decode, DSpark off, capacity1..64")
+        if uses_v2(config) and config.scheduler_config.scheduler_cls is None:
+            # Select through the normal scheduler interface, independently
+            # of whether another HPU utility happened to import first.
+            config.scheduler_config.scheduler_cls = "vllm_gaudi.v1.core.sched.hpu_async_scheduler.HPUAsyncScheduler"
     block_size = 128 if paged else 512
     if cache.user_specified_block_size and cache.block_size != block_size:
         raise ValueError(f"V4.1 requires block_size={block_size} for the selected state layout")

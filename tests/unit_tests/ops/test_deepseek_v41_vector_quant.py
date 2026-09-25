@@ -9,13 +9,17 @@ import pytest
 if os.environ.get("DSV41_TEST_HPU") != "1":
     pytest.skip("Vector codec tests require an explicit HPU lease", allow_module_level=True)
 
-from vllm_gaudi.entrypoints.deepseek_v41 import prepare_environment
+rank = int(os.environ.get("LOCAL_RANK", "0"))
+os.environ["HLS_MODULE_ID"] = os.environ["HABANA_VISIBLE_MODULES"].split(",")[rank]
+
+from vllm_gaudi.entrypoints.deepseek_v41 import prepare_environment  # noqa: E402
 
 prepare_environment()
 
 import habana_frameworks.torch.core  # noqa: E402,F401
 import torch  # noqa: E402
 
+torch.hpu.set_device(rank)
 torch.ops.load_library(os.environ["VLLM_HPU_DSV4_TPC_OP_LIBRARY"])
 OLD = torch.ops.custom_op.custom_deepseek_v41_quant_roundtrip_bf16_gaudi2
 WIDE = torch.ops.custom_op.custom_deepseek_v41_quant_roundtrip_wide_bf16_gaudi2
@@ -115,12 +119,14 @@ def test_selected_vector_dispatch_preserves_decode_with_a_diagnostic_disable(mon
     owner = SimpleNamespace(woa_fp8=True,
                             woa_output_roundtrip=True,
                             weights=SimpleNamespace(wo_a=SimpleNamespace(weight=None, channel_scale=None)))
-    for tokens, expected in ((1, "old"), (6, "old"), (7, "wide"), (8, "wide")):
+    for tokens, expected in ((1, "old"), (6, "old"), (7, "old"), (8, "old"), (16, "wide"), (32, "wide")):
         quantize_activation(torch.empty(tokens, 160, dtype=torch.bfloat16, device="hpu"))
         assert called.pop() == expected
         for cls in (CSA2Attention, PagedCSA2Attention):
             cls.project_output(owner, torch.empty(tokens, 4, 4096, dtype=torch.bfloat16, device="hpu"))
             assert called.pop() == expected
+    quantize_activation(torch.empty(8, 4, 160, dtype=torch.bfloat16, device="hpu"))
+    assert called.pop() == "old"
     monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT", "0")
     quantize_activation(torch.empty(8, 160, dtype=torch.bfloat16, device="hpu"))
     assert called.pop() == "old"

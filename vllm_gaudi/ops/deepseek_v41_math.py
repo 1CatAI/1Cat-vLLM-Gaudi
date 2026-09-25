@@ -18,9 +18,19 @@ from vllm_gaudi.ops.deepseek_v41_native_trace import prefill_span
 NATIVE_KV_CODEC_TOKENS = 8192
 
 
-def rms_norm(x, weight, eps=1e-20):
+def row_mean_square(value, *, request_batch=False):
+    # Synapse uses a two-stage 24-part reduction for C1, but a different
+    # accumulation tree for a generic batch. Keep each request's C1 shape in
+    # the compiled graph. This loop is unrolled during compilation; replay
+    # does not execute Python or copy statistics to the host.
+    if request_batch and value.shape[0] > 1:
+        return torch.cat(tuple(value[i:i + 1].square().mean(-1, keepdim=True) for i in range(value.shape[0])), dim=0)
+    return value.square().mean(-1, keepdim=True)
+
+
+def rms_norm(x, weight, eps=1e-20, *, request_batch=False):
     value = x.float()
-    return (value * torch.rsqrt(value.square().mean(-1, keepdim=True) + eps) * weight.float()).to(x.dtype)
+    return (value * torch.rsqrt(row_mean_square(value, request_batch=request_batch) + eps) * weight.float()).to(x.dtype)
 
 
 def final_rms_norm(x, weight, eps=1e-20):
@@ -133,8 +143,11 @@ def unpack_swa(packed, width=512):
 def quantize_activation(value):
     if (gaudi_envs.VLLM_HPU_DSV41_QUANT_ROUNDTRIP and value.device.type == "hpu" and value.dtype == torch.bfloat16):
         shape = value.shape
+        # Retain the lower-startup codec for small request batches. The wide
+        # path also serves the two B16 lanes of the B32 pipeline; count token
+        # rows rather than treating independent heads as extra requests.
         operation = (torch.ops.custom_op.custom_deepseek_v41_quant_roundtrip_wide_bf16_gaudi2
-                     if gaudi_envs.VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT and value.numel() // shape[-1] > 6 else
+                     if gaudi_envs.VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT and shape[0] >= 16 else
                      torch.ops.custom_op.custom_deepseek_v41_quant_roundtrip_bf16_gaudi2)
         result = operation(value.reshape(-1, shape[-1]).contiguous())
         return result.reshape(shape)
@@ -256,7 +269,11 @@ def hc_pre(residual,
            hc_eps=1e-6,
            iterations=20,
            packed_fn=None,
-           prefill=False):
+           *,
+           prefill=False,
+           request_batch=False,
+           batch_control_reuse=False,
+           batch_control_prefetch=False):
     """vLLM mhc_pre_delayed_torch's previous-sublayer mixing contract."""
     copies = residual.shape[1]
     flat_bf16 = residual.flatten(1)
@@ -268,12 +285,16 @@ def hc_pre(residual,
         projection, rrms = control[:, :24], control[:, 24:]
     else:
         flat = flat_bf16.float()
-        if (gaudi_envs.VLLM_HPU_DSV41_TPC_MHC and flat.device.type == "hpu" and flat.shape == (1, 20480)
-                and fn.shape == (24, 20480)):
-            projection = torch.ops.custom_op.custom_deepseek_v41_control_gemv_f32_gaudi2(flat, fn)
+        if (gaudi_envs.VLLM_HPU_DSV41_TPC_MHC and flat.device.type == "hpu" and flat.shape[1] == 20480
+                and (flat.shape[0] == 1 or (request_batch and flat.shape[0] <= 64)) and fn.shape == (24, 20480)):
+            op = (torch.ops.custom_op.custom_deepseek_v41_control_prefetch_f32_gaudi2
+                  if request_batch and batch_control_prefetch and flat.shape[0] >= 32 else
+                  torch.ops.custom_op.custom_deepseek_v41_control_batch4_f32_gaudi2 if request_batch and flat.shape[0]
+                  >= 4 and batch_control_reuse else torch.ops.custom_op.custom_deepseek_v41_control_gemv_f32_gaudi2)
+            projection = op(flat, fn)
         else:
             projection = F.linear(flat, fn)
-        rrms = torch.rsqrt(flat.square().mean(-1, keepdim=True) + eps)
+        rrms = torch.rsqrt(row_mean_square(flat, request_batch=request_batch) + eps)
     # The fused TPC gate is a decode/small-prefill win.  At C8192 its single
     # TPC program measures slower than the compiler's wide elementwise chain,
     # so retain the same math and native

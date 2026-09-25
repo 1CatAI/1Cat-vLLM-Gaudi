@@ -36,6 +36,11 @@ def _decode_compact(packed, table, logical, ratio):
     return torch.ops.custom_op.custom_deepseek_v41_prefill_main_decode_gaudi2(compressed_rows, table, logical, 0)
 
 
+def _decode_paged(packed, table, logical, ratio):
+    """Keep runtime page lookup inside the codec instead of a large gather graph."""
+    return torch.ops.custom_op.custom_deepseek_v41_prefill_main_decode_gaudi2(packed, table, logical, ratio)
+
+
 def _assemble(main, swa, indices, selected):
     offset = swa.shape[0]
     return (torch.cat((swa, main), 0), torch.cat((indices, torch.where(selected >= 0, selected + offset, -1)),
@@ -90,8 +95,8 @@ class PrefillMainWorkspace:
                 native = getattr(torch.ops.custom_op, "custom_deepseek_v41_prefill_main_decode_gaudi2", None)
                 if native is None:
                     raise RuntimeError("Prefill main-KV decode requested without the Gaudi2 native codec")
-                value = _compiled(_decode_compact, _signature(packed, table, logical, ratio))(packed, table, logical,
-                                                                                              ratio)
+                value = _compiled(_decode_paged, _signature(packed, table, logical, ratio))(packed, table, logical,
+                                                                                            ratio)
             else:
                 value = _compiled(_decode, _signature(packed, table, logical, ratio))(packed, table, logical, ratio)
             self.entries[ratio] = (key, value)
