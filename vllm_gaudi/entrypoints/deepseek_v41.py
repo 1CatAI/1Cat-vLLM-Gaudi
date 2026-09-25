@@ -414,6 +414,13 @@ def main():
     speculative = (["--speculative-config", '{"method":"dspark","num_speculative_tokens":5}']
                    if gaudi_envs.VLLM_HPU_DSV41_DSPARK else [])
     scheduling = "--async-scheduling" if gaudi_envs.VLLM_HPU_DSV41_V2 else "--no-async-scheduling"
+    prefix_caching = ([] if any(
+        value.split("=")[0] in ("--enable-prefix-caching", "--no-enable-prefix-caching")
+        for value in extra) else ["--no-enable-prefix-caching"])
+    if ("--enable-prefix-caching" in extra and not any(
+            value.split("=")[0] in ("--enable-prompt-tokens-details", "--no-enable-prompt-tokens-details")
+            for value in extra)):
+        extra += ["--enable-prompt-tokens-details"]
     sys.argv = [
         "vllm", "serve", args.model, "--host", args.host, "--port",
         str(args.port), "--dtype", "bfloat16", "--max-model-len",
@@ -421,27 +428,24 @@ def main():
         "--pipeline-parallel-size", "2", "--max-num-seqs",
         str(args.max_num_seqs), "--max-num-batched-tokens",
         str(args.max_num_batched_tokens), "--load-format", "dsv41_prepared", "--model-loader-extra-config",
-        json.dumps(loader), "--mm-encoder-tp-mode", "data", "--no-enable-prefix-caching", scheduling, "--block-size",
+        json.dumps(loader), "--mm-encoder-tp-mode", "data", *prefix_caching, scheduling, "--block-size",
         str(args.block_size), *speculative, *extra
     ]
     residency = None
     try:
         if args.engram_residency == "locked":
-            from vllm_gaudi.ops.deepseek_v41_residency import EngramResidency, EngramStartup, table_regions
-            device_layers = (1, ) if gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM else ()
-            if device_layers:
-                bridge = Path(os.environ["VLLM_HPU_TP2_FUSED_AR_NORM_BRIDGE"])
-                abi = json.loads(bridge.with_suffix(".abi.json").read_text())
-                if abi.get("device_engram_shared_mapping_version") != 1:
-                    raise RuntimeError("Locked Device Engram requires a bridge with shared-host mapping support")
-            tables = EngramResidency(table_regions(args.model),
-                                     args.engram_host_budget_gib * 1024**3,
-                                     device_layers=device_layers)
-            report_path = (Path(os.environ["DSV41_RUN_EVIDENCE"]) / "engram-residency.json" if leased_run else None)
-            residency = EngramStartup(tables, os.environ["HABANA_VISIBLE_MODULES"].split(","),
-                                      report_path=report_path).start(lambda: os.kill(os.getpid(), signal.SIGTERM))
-            loader["engram_startup_directory"] = str(residency.directory)
-            sys.argv[sys.argv.index("--model-loader-extra-config") + 1] = json.dumps(loader)
+            from vllm_gaudi.ops.deepseek_v41_residency import EngramDeviceGate, EngramResidency, table_regions
+
+            def report_ready(report):
+                if leased_run:
+                    (Path(os.environ["DSV41_RUN_EVIDENCE"]) / "engram-residency.json").write_text(
+                        json.dumps(report, indent=2))
+                print("Engram residency ready: " + json.dumps(report), flush=True)
+
+            residency = EngramDeviceGate(EngramResidency(table_regions(args.model),
+                                                         args.engram_host_budget_gib * 1024**3),
+                                         on_ready=report_ready,
+                                         on_failure=lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
         from vllm.entrypoints.cli.main import main as serve
         serve()
     finally:

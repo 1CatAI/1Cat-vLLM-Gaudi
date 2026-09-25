@@ -26,7 +26,7 @@ struct NativeGraphTopology {
     const bool stageCollectives = collectives == 40 || (collectives >= 42 && collectives <= 50);
     return !externalPrefix &&
         ((groups == 5 && stageCollectives) ||
-         (groups == 1 && collectives == 8));
+         (groups == 1 && collectives >= 8 && collectives <= 16 && collectives % 2 == 0));
   }
 
   size_t prefixNodes = 0;

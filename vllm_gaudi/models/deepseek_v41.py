@@ -59,7 +59,20 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         required_op = ("custom_deepseek_v41_woa_fp8_roundtrip_gaudi2" if envs.VLLM_HPU_DSV41_WOA_OUTPUT_ROUNDTRIP else
                        "custom_deepseek_v41_paged_attention_bf16_gaudi2" if envs.VLLM_HPU_DSV41_PAGED_SELECTED_KV else
                        "custom_deepseek_v41_mxfp4_prepared_moe_bf16_gaudi2")
-        if not hasattr(torch.ops.custom_op, required_op):
+        required_ops = [required_op]
+        if envs.VLLM_HPU_DSV41_BATCH_C1_NUMERICS:
+            required_ops.extend(
+                ("custom_deepseek_v41_q_norm_projection_rope_gaudi2", "custom_deepseek_v41_ffn_norm_quant_gaudi2",
+                 "custom_deepseek_v41_expert_n256_moe_prequant_horizontal_fp8_gaudi2"))
+        if envs.VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT:
+            if envs.VLLM_HPU_DSV41_QUANT_ROUNDTRIP:
+                required_ops.append("custom_deepseek_v41_quant_roundtrip_wide_bf16_gaudi2")
+            if envs.VLLM_HPU_DSV41_WOA_OUTPUT_ROUNDTRIP:
+                required_ops.append("custom_deepseek_v41_woa_fp8_roundtrip_wide_gaudi2")
+        if envs.VLLM_HPU_DSV41_NATIVE_ROPE and envs.VLLM_HPU_DSV41_PREFILL_ROPE:
+            required_ops.extend(("custom_deepseek_v41_prefill_rope_bf16_gaudi2",
+                                 "custom_deepseek_v41_prefill_rope_inverse_bf16_gaudi2"))
+        if any(not hasattr(torch.ops.custom_op, name) for name in required_ops):
             torch.ops.load_library(envs.VLLM_HPU_DSV4_TPC_OP_LIBRARY)
         if envs.VLLM_HPU_DSV41_PREFILL_ROPE:
             for name in ("custom_deepseek_v41_prefill_rope_bf16_gaudi2",
@@ -232,6 +245,58 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             raise RuntimeError("complete_step_device expects the consumed committed scalar")
         self.complete_step(int(committed_inputs))
 
+    def initialize_request_batches(self, capacity):
+        if not envs.VLLM_HPU_DSV41_BATCH_DECODE or self.program.dspark or not self.native:
+            raise RuntimeError("Request batches require the explicit ordinary native replay configuration")
+        from vllm_gaudi.ops.deepseek_v41_batch_replay import BatchStageReplay
+        from vllm_gaudi.ops.deepseek_v41_batch_state import BatchStageState
+        self.batch_state = BatchStageState(self.program, capacity)
+        self.batch_replay = BatchStageReplay(self.program)
+        lanes = envs.VLLM_HPU_DSV41_PP_MICROBATCHES
+        if lanes not in (1, 2):
+            raise ValueError("Ordinary PP decode supports one batch or two owned microbatches")
+        self.batch_replay_lanes = (self.batch_replay, ) + tuple(
+            BatchStageReplay(self.program) for _ in range(lanes - 1))
+        self.batch_input_seeds = {
+            bucket: (torch.zeros(bucket, 4, 5120, dtype=torch.bfloat16, device=self.device),
+                     torch.zeros(bucket, 4, dtype=torch.float32, device=self.device))
+            for bucket in (1, 2, 4, 8, 16, 32, 64) if bucket <= 1 << (capacity - 1).bit_length()
+        } if self.pp_rank == 0 else {}
+
+    def forward_request_batch(self, input_ids, positions, slots, pages, spans, intermediate_tensors=None, *, lane=0):
+        """Run one C1 per request through one native stage entry."""
+        if self.step_ticket is not None or self._decode_prefix is not None:
+            raise RuntimeError("Request batch overlaps an unfinished model transaction")
+        if not 0 <= lane < len(self.batch_replay_lanes):
+            raise ValueError("Invalid request-batch scratch lane")
+        if self.pp_rank == 0:
+            self.step_ticket = self.engram_host.prepare_batch(spans, capacity=input_ids.numel(), defer_wait=True)
+            engram = self.engram_host.wait(self.step_ticket)
+            # Embedding is captured in the first four-layer group.
+            hidden, pre = self.batch_input_seeds[input_ids.numel()]
+        else:
+            if intermediate_tensors is None:
+                raise RuntimeError("Request batch lacks its PP producer")
+            hidden, pre = intermediate_tensors["hidden_states"], intermediate_tensors["pre_mix"]
+            engram = ()
+        host_positions = tuple(span[1] for span in spans) + (-1, ) * (input_ids.numel() - len(spans))
+        hidden, pre, _ = self.batch_replay_lanes[lane](hidden,
+                                                       pre,
+                                                       positions,
+                                                       input_ids,
+                                                       engram,
+                                                       slots,
+                                                       pages,
+                                                       host_positions=host_positions)
+        if self.pp_rank == 0:
+            return IntermediateTensors({"hidden_states": hidden, "pre_mix": pre})
+        return hidden
+
+    def complete_request_batch(self, counts):
+        if self.pp_rank == 0:
+            self.engram_host.complete_batch(self.step_ticket, counts)
+            self.step_ticket = None
+
     @staticmethod
     def _input_signature(value):
         return (value.untyped_storage()._cdata, value.storage_offset(), tuple(value.shape), value.stride(), value.dtype,
@@ -343,6 +408,8 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
     def close(self):
         self._decode_prefix = None
         self._step_request_id = None
+        for replay in getattr(self, "batch_replay_lanes", ()):
+            replay.close()
         self.program.invalidate()
         if self.engram_host is not None:
             self.engram_host.close()

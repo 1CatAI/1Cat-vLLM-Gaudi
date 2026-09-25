@@ -26,8 +26,8 @@ from vllm_gaudi.ops.deepseek_v41_math import (
 from vllm_gaudi.ops.deepseek_v41_shard_loader import PreparedV41Shard
 from vllm_gaudi.ops.deepseek_v41_shared_experts import shared_expert_moe
 from vllm_gaudi.ops.deepseek_v41_weights import canonical_hash
+from vllm_gaudi.ops.deepseek_v41_trace import prefill_scope
 from vllm_gaudi.ops.deepseek_v41_native_trace import prefill_span
-
 from vllm_gaudi.ops.deepseek_v41_prefill_regions import (
     clear_prefill_function_regions,
     clear_prefill_regions,
@@ -232,6 +232,34 @@ class PreparedMoE(nn.Module):
         validate_prefill_plan_config(n256=self.n256)
         self.n256_fused = self.n256_fp8 and gaudi_envs.VLLM_HPU_DSV41_EXPERT_FUSED_QUANT
         self.n256_fused_reduce = self.n256_fused and gaudi_envs.VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE
+        self.concurrent_moe_rows = gaudi_envs.VLLM_HPU_DSV41_CONCURRENT_MOE_ROWS
+        self.batch_prefetch_w2 = gaudi_envs.VLLM_HPU_DSV41_BATCH_EXPERT_PREFETCH_W2
+        self.batch_route_pack = gaudi_envs.VLLM_HPU_DSV41_BATCH_ROUTE_PACK
+        self.batch_expert_reuse = gaudi_envs.VLLM_HPU_DSV41_BATCH_EXPERT_REUSE
+        self.batch_w13_horizontal = gaudi_envs.VLLM_HPU_DSV41_BATCH_W13_HORIZONTAL
+        self.batch_expert_direct_finalize = gaudi_envs.VLLM_HPU_DSV41_BATCH_EXPERT_DIRECT_FINALIZE
+        self.batch_expert_transpose_mme = gaudi_envs.VLLM_HPU_DSV41_BATCH_EXPERT_TRANSPOSE_MME
+        if self.batch_expert_transpose_mme:
+            if (not self.batch_w13_horizontal or not self.n256_fused_reduce or self.batch_expert_direct_finalize
+                    or self.batch_prefetch_w2 or self.batch_expert_reuse or self.batch_route_pack
+                    or self.concurrent_moe_rows):
+                raise ValueError("Transposed expert MME requires the unchanged horizontal fused-reduce parent")
+            if not hasattr(torch.ops.custom_op, "custom_deepseek_v41_expert_n256_moe_horizontal_transpose_fp8_gaudi2"):
+                raise RuntimeError("Transposed expert MME native operator is unavailable")
+        if self.batch_expert_direct_finalize and not (self.batch_w13_horizontal and self.n256_fused_reduce):
+            raise ValueError("Batch direct finalize requires horizontal N256 and ordered fused reduction")
+        if self.batch_expert_direct_finalize and not hasattr(
+                torch.ops.custom_op, "custom_deepseek_v41_expert_n256_moe_horizontal_finalize_fp8_gaudi2"):
+            raise RuntimeError("Batch expert finalize native operator is unavailable")
+        if self.batch_prefetch_w2 and not self.n256_fused_reduce:
+            raise ValueError("Batch W2 prefetch requires the N256 fused expert reduction")
+        if self.concurrent_moe_rows not in (0, 1, 4, 8, 16):
+            raise ValueError("Concurrent MoE rows must be disabled, direct 1, or grouped 4/8/16")
+        if self.concurrent_moe_rows:
+            if not self.n256_fused_reduce or not self.normal_scales or gaudi_envs.VLLM_HPU_DSV41_DSPARK:
+                raise ValueError("Concurrent MoE requires ordinary qualified N256 fused FP8 decode")
+            if not hasattr(torch.ops.custom_op, "custom_deepseek_v41_grouped_n256_fp8_gaudi2"):
+                raise RuntimeError("Concurrent MoE native operator is unavailable; no fallback was executed")
         self.router_bf16_gate = gaudi_envs.VLLM_HPU_DSV41_BF16_ROUTER_GATE
         self.shared_gate_up = gaudi_envs.VLLM_HPU_DSV41_SHARED_GATE_UP
         self.register_buffer("shared_gate_up_weight", None, False)
@@ -313,14 +341,44 @@ class PreparedMoE(nn.Module):
             result = result + down.float()[:, expert]
         return result.to(value.dtype)
 
-    def _forward_n256_fp8(self, value, ids, routing, *, prequant=None, shared=None):
+    def _forward_n256_fp8(self, value, ids, routing, *, ordinary_decode=False, prequant=None, shared=None):
         """Run the resident FP8 N256 body for decode and bounded prefill."""
         experts = self.weights.experts
+        if ordinary_decode and (self.batch_expert_reuse or self.batch_route_pack) and value.shape[0] > 1:
+            if prequant is not None or shared is not None:
+                raise ValueError("Batch expert reuse has an independent quantization/finalization contract")
+            from vllm_gaudi.ops.deepseek_v41_grouped_decode import grouped_decode
+            return grouped_decode(value,
+                                  ids.to(torch.int32),
+                                  routing.float(),
+                                  experts.w13_q16,
+                                  experts.w2_q16,
+                                  experts.w13_s16,
+                                  experts.w2_s16,
+                                  self.lookup,
+                                  experts.w13_fp8_channel,
+                                  experts.w2_fp8_channel,
+                                  rows=1,
+                                  reuse_weights=True,
+                                  native_pack=self.batch_route_pack)
+        if ordinary_decode and self.concurrent_moe_rows and value.shape[0] == 64:
+            from vllm_gaudi.ops.deepseek_v41_grouped_decode import grouped_decode
+            return grouped_decode(value,
+                                  ids.to(torch.int32),
+                                  routing.float(),
+                                  experts.w13_q16,
+                                  experts.w2_q16,
+                                  experts.w13_s16,
+                                  experts.w2_s16,
+                                  self.lookup,
+                                  experts.w13_fp8_channel,
+                                  experts.w2_fp8_channel,
+                                  rows=self.concurrent_moe_rows)
 
         def one_tile(tile_value, tile_ids, tile_routing, tile_prequant, tile_shared):
             operands = (tile_value, tile_ids.to(torch.int32), tile_routing.float(), experts.w13_q16, experts.w2_q16,
                         experts.w13_s16, experts.w2_s16, self.lookup)
-            use_fused = self.n256_fused and tile_value.shape[0] <= 6
+            use_fused = self.n256_fused and (tile_value.shape[0] <= 6 or ordinary_decode)
             # C1 keeps the same public scheduler/state contract as every
             # other bucket.  Inside the expert compound node, finish W2
             # directly from its FP32 accumulator so the six BF16 route rows
@@ -349,12 +407,25 @@ class PreparedMoE(nn.Module):
                 op = (torch.ops.custom_op.
                       custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_prefetch_w2_fp8_gaudi2
                       if self.n256_fused_reduce and tile_value.shape[0] == 1 else
+                      torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_prequant_horizontal_fp8_gaudi2
+                      if self.n256_fused_reduce and ordinary_decode and self.batch_w13_horizontal else
+                      torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_prequant_fused_reduce_fp8_gaudi2
+                      if self.n256_fused_reduce and ordinary_decode else
                       torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_prequant_fused_fp8_gaudi2)
                 return op(*operands, channel13, channel2, quantized, activation_scale, bool(self.normal_scales))
             op = (torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_direct_finalize_prefetch_w2_fp8_gaudi2
                   if self.n256_fused_reduce and tile_value.shape[0] == 1 else
-                  torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2
-                  if use_fused else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fp8_gaudi2)
+                  torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_horizontal_transpose_fp8_gaudi2
+                  if ordinary_decode and self.batch_expert_transpose_mme else
+                  torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_horizontal_finalize_fp8_gaudi2
+                  if ordinary_decode and self.batch_expert_direct_finalize else
+                  torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_horizontal_fp8_gaudi2
+                  if ordinary_decode and self.batch_w13_horizontal and self.n256_fused_reduce else torch.ops.custom_op.
+                  custom_deepseek_v41_expert_n256_moe_batch_prefetch_w2_fp8_gaudi2 if ordinary_decode and self.
+                  batch_prefetch_w2 else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2
+                  if self.n256_fused_reduce and ordinary_decode else torch.ops.custom_op.
+                  custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2 if use_fused else torch.ops.custom_op.
+                  custom_deepseek_v41_expert_n256_moe_fp8_gaudi2)
             return op(*operands, channel13, channel2, bool(self.normal_scales))
 
         tokens = int(value.shape[0])
@@ -369,8 +440,17 @@ class PreparedMoE(nn.Module):
             pieces.append(one_tile(value[begin:end], ids[begin:end], routing[begin:end], tile_prequant, None))
         return torch.cat(pieces, dim=0)
 
-    @prefill_span("moe")
-    def forward(self, value, image_mask, ready_outputs=(), *, fp8_decode=False, decode=False, prequant=None):
+    @prefill_scope("moe")
+    def forward(self,
+                value,
+                image_mask,
+                ready_outputs=(),
+                *,
+                fp8_decode=False,
+                ordinary_decode=False,
+                decode=False,
+                prequant=None):
+        decode = decode or ordinary_decode
         w = self.weights
         gate_logits = (torch.ops.custom_op.custom_deepseek_v41_bf16_linear_f32_gaudi2(
             value.contiguous(), w.gate.weight) if self.router_bf16_gate else F.linear(value.float(), w.gate.weight))
@@ -406,12 +486,11 @@ class PreparedMoE(nn.Module):
         # compound node. Wider batches keep the common batch implementation.
         fused_shared = (self.n256_fp8 and self.n256_fused_reduce and prequant is not None and value.shape[0] == 1)
         shared_out = self.shared_expert(value) if fused_shared else None
-        if self.prefill_grouped and value.shape[0] > 6:
+        if self.prefill_grouped and value.shape[0] > 6 and not ordinary_decode:
             from vllm_gaudi.ops.deepseek_v41_grouped_prefill import run_grouped_prefill
             output = run_grouped_prefill(value, ids, routing, experts.w13_q16, experts.w2_q16, experts.w13_s16,
-                                         experts.w2_s16, self.lookup, self.normal_scales, experts.w13_fp8_channel,
-                                         experts.w2_fp8_channel)
-        elif self.prefill_mxfp4 and value.shape[0] > 6:
+                                         experts.w2_s16, self.lookup, self.normal_scales)
+        elif self.prefill_mxfp4 and value.shape[0] > 6 and not ordinary_decode:
             # Large-M prompt work has a different reuse regime from C1.  The
             # decode-oriented N256 compound kernel rereads and converts all
             # routed weights once per small token tile.  Restore one bounded
@@ -433,7 +512,12 @@ class PreparedMoE(nn.Module):
             # dequant node, which is not registered for the current Gaudi
             # runtime shape profile (M128 generic failure).
             if self.n256_fp8:
-                output = self._forward_n256_fp8(value, ids, routing, prequant=prequant, shared=shared_out)
+                output = self._forward_n256_fp8(value,
+                                                ids,
+                                                routing,
+                                                ordinary_decode=ordinary_decode,
+                                                prequant=prequant,
+                                                shared=shared_out)
             else:
                 operands = (value, ids.to(torch.int32), routing.float(), experts.w13_q16, experts.w2_q16,
                             experts.w13_s16, experts.w2_s16, self.lookup)
@@ -494,6 +578,11 @@ class PreparedDecoderLayer(nn.Module):
         self.draft = layer >= config["num_hidden_layers"]
         self.collect_target_state = collect_target_state and layer in (37, 38, 39)
         self.eps, self.hc_eps, self.iterations = config["rms_norm_eps"], config["hc_eps"], config["hc_sinkhorn_iters"]
+        self.batch_main_fusions = gaudi_envs.VLLM_HPU_DSV41_BATCH_MAIN_FUSIONS
+        self.batch_mhc_fusion = self.batch_main_fusions
+        self.batch_ffn_fusion = self.batch_main_fusions or gaudi_envs.VLLM_HPU_DSV41_BATCH_C1_NUMERICS
+        self.batch_control_reuse = gaudi_envs.VLLM_HPU_DSV41_MHC_BATCH_REUSE
+        self.batch_control_prefetch = gaudi_envs.VLLM_HPU_DSV41_MHC_CONTROL_PREFETCH
         self.mhc_control_rrms = gaudi_envs.VLLM_HPU_DSV41_MHC_CONTROL_RRMS
         self.register_buffer("hc_attn_fn_packed", None, False)
         self.register_buffer("hc_ffn_fn_packed", None, False)
@@ -503,6 +592,7 @@ class PreparedDecoderLayer(nn.Module):
         else:
             self.attention = CSA2Attention(weights.attn, config, layer, shared, linear, reduce, device)
         self.moe = PreparedMoE(weights.ffn, config["num_experts_per_tok"], normal_scales, lookup, reduce)
+        self.moe.layer = layer
         self.all_gather = all_gather
 
     @staticmethod
@@ -605,6 +695,77 @@ class PreparedDecoderLayer(nn.Module):
                              fp8_decode=fp8_decode,
                              decode=decode)
         return post_update(value, residual, post, comb), pre_mix, target_state
+
+    def forward_batch(self, residual, pre_mix, positions, image_mask, engram_rows, slots, pages, selected, candidates,
+                      main_ready, index_ready):
+        """One ordinary decode input per request, with explicit state owners."""
+        if self.draft or self.collect_target_state:
+            raise RuntimeError("Request batching excludes speculative state collection")
+        w = self.weights
+        active = (slots >= 0) & (positions >= 0)
+        if hasattr(w, "engram"):
+            if engram_rows is None:
+                raise RuntimeError("Batched Engram requires a completed request-owned packet")
+            local = engram_rows if engram_rows.dtype == torch.bfloat16 else unpack_swa(engram_rows, 256)
+            rows = self.all_gather(local, dim=1)
+            kv = linear(rows.flatten(1), w.engram.wkv)
+            residual = engram_update(residual, kv, w.engram.q_weight, w.engram.k_weight, active & ~image_mask, self.eps)
+        value, new_pre, post, comb = hc_pre(residual,
+                                            pre_mix,
+                                            w.hc_attn_fn,
+                                            w.hc_attn_scale,
+                                            w.hc_attn_base,
+                                            self.eps,
+                                            self.hc_eps,
+                                            self.iterations,
+                                            request_batch=True,
+                                            batch_control_reuse=self.batch_control_reuse,
+                                            batch_control_prefetch=self.batch_control_prefetch,
+                                            packed_fn=self.hc_attn_fn_packed if self.batch_mhc_fusion else None)
+        schedule = gaudi_envs.VLLM_HPU_DSV41_MHC_SCHEDULE
+        result = self.attention.forward_batch(rms_norm(value, w.attn_norm.weight, self.eps, request_batch=True),
+                                              positions,
+                                              slots,
+                                              pages,
+                                              selected,
+                                              candidates,
+                                              main_ready,
+                                              index_ready,
+                                              ready_outputs=(post, comb) if schedule else ())
+        value, selected, candidates, main_ready, index_ready = result
+        residual = hc_post(value, residual, post, comb)
+        value, pre_mix, post, comb = hc_pre(residual,
+                                            new_pre,
+                                            w.hc_ffn_fn,
+                                            w.hc_ffn_scale,
+                                            w.hc_ffn_base,
+                                            self.eps,
+                                            self.hc_eps,
+                                            self.iterations,
+                                            request_batch=True,
+                                            batch_control_reuse=self.batch_control_reuse,
+                                            batch_control_prefetch=self.batch_control_prefetch,
+                                            packed_fn=self.hc_ffn_fn_packed if self.batch_mhc_fusion else None)
+        # Reuse the production norm/quant producer for ordinary request rows.
+        # The grouped B64 specialization owns its own activation preparation;
+        # do not compute an unused FP8 operand on that path.
+        prequant = None
+        if (self.batch_ffn_fusion and self.moe.n256_fused
+                and not (value.shape[0] == 64 and self.moe.concurrent_moe_rows)):
+            value, quantized, scale = torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
+                value.contiguous(), w.ffn_norm.weight, self.eps)
+            prequant = quantized, scale
+        else:
+            value = rms_norm(value, w.ffn_norm.weight, self.eps, request_batch=True)
+        value = self.moe(value,
+                         image_mask,
+                         ready_outputs=(post, comb) if schedule else (),
+                         ordinary_decode=True,
+                         prequant=prequant)
+        residual = hc_post(value, residual, post, comb)
+        residual = residual.masked_fill(~active[:, None, None], 0)
+        pre_mix = pre_mix.masked_fill(~active[:, None], 0)
+        return residual, pre_mix, selected, candidates, main_ready, index_ready
 
 
 class PreparedStage(nn.Module):
@@ -812,9 +973,7 @@ class PreparedStage(nn.Module):
                 "c1_c6":
                 "FP8xFP8" if gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8 else "BF16xBF16",
                 "prefill":
-                (("expert-grouped " + ("mixed " + gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED_FP8.upper()
-                                       if gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED_FP8 else "BF16") +
-                  " BMM over resident N256; ordered weighted SwiGLU")
+                ("expert-grouped BF16 BMM over resident N256; ordered weighted SwiGLU"
                  if gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED else "stock MXFP4 bridge"
                  if gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4 else "FP8 N256 compound MME in bounded 128-token tiles"),
                 "fused_quant":
@@ -863,9 +1022,47 @@ class PreparedStage(nn.Module):
                                                              and gaudi_envs.VLLM_HPU_DSV41_NATIVE_ROPE) else
                                                             "split RMSNorm and RoPE")
         self.runtime_precision["q_scale_rope"] = gaudi_envs.VLLM_HPU_DSV41_Q_SCALE_ROPE
+        self.runtime_precision["native_rope"] = {
+            "enabled": gaudi_envs.VLLM_HPU_DSV41_NATIVE_ROPE,
+            "request_batch_rows": 64,
+            "other_rows": 6,
+            "arithmetic": "fp32-multiply-second-term-fma-bf16",
+        }
         self.runtime_precision["woa_output_roundtrip"] = self.woa_output_roundtrip
+        self.runtime_precision["batch_full_index_mme"] = gaudi_envs.VLLM_HPU_DSV41_BATCH_FULL_INDEX_MME
+        self.runtime_precision["batch_index_tiled_keys"] = gaudi_envs.VLLM_HPU_DSV41_BATCH_INDEX_TILED_KEYS
+        self.runtime_precision["batch_packed_mla"] = gaudi_envs.VLLM_HPU_DSV41_BATCH_PACKED_MLA
+        self.runtime_precision["batch_packed_mla_sram"] = gaudi_envs.VLLM_HPU_DSV41_BATCH_PACKED_MLA_SRAM
+        self.runtime_precision["batch_packed_mla_vector"] = gaudi_envs.VLLM_HPU_DSV41_BATCH_PACKED_MLA_VECTOR
+        self.runtime_precision["batch_kernel_policy_version"] = 1
+        self.runtime_precision["batch_main_fusions"] = gaudi_envs.VLLM_HPU_DSV41_BATCH_MAIN_FUSIONS
+        self.runtime_precision["batch_c1_numerics"] = gaudi_envs.VLLM_HPU_DSV41_BATCH_C1_NUMERICS
+        self.runtime_precision["mhc_batch_reuse"] = gaudi_envs.VLLM_HPU_DSV41_MHC_BATCH_REUSE
+        self.runtime_precision["mhc_control_prefetch"] = gaudi_envs.VLLM_HPU_DSV41_MHC_CONTROL_PREFETCH
+        self.runtime_precision["batch_compressor_pair"] = gaudi_envs.VLLM_HPU_DSV41_BATCH_COMPRESSOR_PAIR
+        self.runtime_precision["batch_compressor_gather"] = gaudi_envs.VLLM_HPU_DSV41_BATCH_COMPRESSOR_GATHER
+        self.runtime_precision["batch_expert_prefetch_w2"] = gaudi_envs.VLLM_HPU_DSV41_BATCH_EXPERT_PREFETCH_W2
+        self.runtime_precision["batch_route_pack"] = gaudi_envs.VLLM_HPU_DSV41_BATCH_ROUTE_PACK
+        self.runtime_precision["batch_expert_reuse"] = gaudi_envs.VLLM_HPU_DSV41_BATCH_EXPERT_REUSE
+        self.runtime_precision["batch_w13_horizontal"] = gaudi_envs.VLLM_HPU_DSV41_BATCH_W13_HORIZONTAL
+        self.runtime_precision["batch_expert_direct_finalize"] = gaudi_envs.VLLM_HPU_DSV41_BATCH_EXPERT_DIRECT_FINALIZE
+        self.runtime_precision["batch_expert_transpose_mme"] = gaudi_envs.VLLM_HPU_DSV41_BATCH_EXPERT_TRANSPOSE_MME
         self.runtime_precision["shared_gate_up"] = gaudi_envs.VLLM_HPU_DSV41_SHARED_GATE_UP
+        self.runtime_precision["concurrent_moe"] = {
+            "rows": gaudi_envs.VLLM_HPU_DSV41_CONCURRENT_MOE_ROWS,
+            "version": 1,
+            "groups_per_island": 16,
+            "batches": [64],
+        }
         self.runtime_precision["mhc_gates_fused"] = gaudi_envs.VLLM_HPU_DSV41_MHC_GATES_FUSED
+        self.runtime_precision["reindex_bounded_plan"] = {
+            "enabled": gaudi_envs.VLLM_HPU_DSV41_REINDEX_BOUNDED_PLAN,
+            "version": 2,
+            "tile_rows": 2048,
+            "maximum_tiles": 8,
+            "whole_pool_after_tiles": 4,
+            "whole_pool_tag": 9,
+        }
         self.precision_fingerprint = canonical_hash(self.runtime_precision)
         self.loaded = True
         self.generation += 1
@@ -995,9 +1192,6 @@ class PreparedStage(nn.Module):
         """
         tile = PreparedMoE.N256_PREFILL_TILE
         tokens = residual.shape[0]
-        if (gaudi_envs.VLLM_HPU_DSV41_PREFILL_DECODER_HALO and self.pp_rank == 1 and tokens > 6
-                and self.prefill_halo_mode != "full"):
-            return self._forward_prefill_halo(residual, pre_mix, positions, input_ids, self.prefill_halo_mode)
         if tokens > 6 and (gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED or gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4):
             # Both implementations bound expert workspace internally and
             # reuse each weight over this complete scheduler transaction.
@@ -1059,8 +1253,9 @@ class PreparedStage(nn.Module):
             local_greedy_candidate,
             select_greedy_candidate,
         )
-        if self.pp_rank != 1 or hidden.shape[0] != 1:
-            raise ValueError("Ordinary greedy head requires one token on PP1")
+        maximum = 64 if gaudi_envs.VLLM_HPU_DSV41_BATCH_DECODE else 1
+        if self.pp_rank != 1 or not 1 <= hidden.shape[0] <= maximum:
+            raise ValueError("Ordinary greedy head exceeds the configured PP1 request batch")
         local = self._head_projection(hidden)
         candidates = self.all_gather(local_greedy_candidate(local, self.tp_rank), dim=-1)
         return select_greedy_candidate(candidates)

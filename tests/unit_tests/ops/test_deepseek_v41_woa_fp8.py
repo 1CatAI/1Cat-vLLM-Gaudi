@@ -59,9 +59,7 @@ def test_paged_kv_norm_rope_compound_is_decode_b1_only(monkeypatch):
         calls.append((value.shape, positions.dtype, epsilon))
         return expected
 
-    monkeypatch.setattr(
-        torch.ops, "custom_op",
-        SimpleNamespace(custom_deepseek_v41_kv_norm_rope_bf16_gaudi2=compound))
+    monkeypatch.setattr(torch.ops, "custom_op", SimpleNamespace(custom_deepseek_v41_kv_norm_rope_bf16_gaudi2=compound))
     attention = SimpleNamespace(
         fused_norm=True,
         native_rope=True,
@@ -71,16 +69,14 @@ def test_paged_kv_norm_rope_compound_is_decode_b1_only(monkeypatch):
         _rope=lambda value, positions: value,
     )
     positions = torch.tensor([3], dtype=torch.int64)
-    actual = PagedCSA2Attention.project_kv(
-        attention, torch.randn(1, 512, dtype=torch.bfloat16), positions, decode=True)
+    actual = PagedCSA2Attention.project_kv(attention, torch.randn(1, 512, dtype=torch.bfloat16), positions, decode=True)
     assert actual is expected
     assert calls == [((1, 512), torch.int32, 1e-20)]
 
     # Prefill and B2+ retain the batch-generic split implementation.
     attention.fused_norm = False
     wider = torch.randn(2, 512, dtype=torch.bfloat16)
-    generic = PagedCSA2Attention.project_kv(
-        attention, wider, torch.tensor([3, 4], dtype=torch.int32), decode=True)
+    generic = PagedCSA2Attention.project_kv(attention, wider, torch.tensor([3, 4], dtype=torch.int32), decode=True)
     assert generic.shape == wider.shape
     assert calls == [((1, 512), torch.int32, 1e-20)]
 
@@ -187,3 +183,18 @@ def test_paged_shared_state_allocates_bounded_decoded_mirrors(monkeypatch):
     assert shared.decoded_swa.shape == (20 * 512, 512)
     assert set(shared.sources) == {"2", "8", "14"}
     assert all(source.decoded_main.shape == (512, 512) for source in shared.sources.values())
+
+
+def test_runtime_rotary_binding_survives_prompt_and_decode_geometry_changes():
+    shared = _rotary_shared()
+    shared.runtime_indexer = True
+    attention = object.__new__(PagedCSA2Attention)
+    torch.nn.Module.__init__(attention)
+    attention.shared, attention.length, attention.runtime_indexer = shared, shared.length, True
+    attention._rotary_name, attention._rotary_native_name = "swa_rotary", "swa_rotary_native"
+    attention.native_rope, attention.q_scale_rope = True, True
+    for search in (512, 1024, 8192, 512, 4096):
+        attention.set_search_length(search)
+        assert attention.search_length == search
+        assert attention.rotary is shared.swa_rotary
+        assert attention.rotary_native is shared.rotary_bucket("swa_rotary_native", shared.length)

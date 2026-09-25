@@ -23,17 +23,29 @@ constexpr auto kMoeFp8Schema = "custom_op::custom_deepseek_v41_mxfp4_prepared_mo
 constexpr auto kDecodeFp8 = "custom_deepseek_v41_mxfp4_prepared_dequant_fp8_gaudi2";
 constexpr auto kDynamicQuant = "custom_deepseek_v41_dynamic_quant_bf16_gaudi2";
 constexpr auto kN256Fp8 = "custom_deepseek_v41_expert_n256_fp8_gaudi2";
+constexpr auto kN256HorizontalFp8 = "custom_deepseek_v41_expert_n256_horizontal_fp8_gaudi2";
+constexpr auto kN256HorizontalSchema = "custom_op::custom_deepseek_v41_expert_n256_moe_horizontal_fp8_gaudi2";
+constexpr auto kN256PrequantHorizontalSchema =
+    "custom_op::custom_deepseek_v41_expert_n256_moe_prequant_horizontal_fp8_gaudi2";
+constexpr auto kN256HorizontalTransposeSchema =
+    "custom_op::custom_deepseek_v41_expert_n256_moe_horizontal_transpose_fp8_gaudi2";
+constexpr auto kN256HorizontalFinalizeSchema =
+    "custom_op::custom_deepseek_v41_expert_n256_moe_horizontal_finalize_fp8_gaudi2";
 constexpr auto kN256SlotsFp8 = "custom_deepseek_v41_expert_n256_slots_fp8_gaudi2";
 constexpr auto kN256Bf16 = "custom_deepseek_v41_expert_n256_bf16_gaudi2";
 constexpr auto kN256Scale = "custom_deepseek_v41_expert_n256_scale_gaudi2";
 constexpr auto kN256ScaleReduce = "custom_deepseek_v41_expert_n256_scale_reduce_gaudi2";
 constexpr auto kN256FusedSchema = "custom_op::custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2";
+constexpr auto kN256BatchPrefetchSchema =
+    "custom_op::custom_deepseek_v41_expert_n256_moe_batch_prefetch_w2_fp8_gaudi2";
 constexpr auto kN256FusedReduceSchema =
     "custom_op::custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2";
 constexpr auto kN256DirectFinalizeSchema =
     "custom_op::custom_deepseek_v41_expert_n256_moe_direct_finalize_fp8_gaudi2";
 constexpr auto kN256DirectFinalizePrefetchW2Schema =
     "custom_op::custom_deepseek_v41_expert_n256_moe_direct_finalize_prefetch_w2_fp8_gaudi2";
+constexpr auto kN256PrequantFusedReduceSchema =
+    "custom_op::custom_deepseek_v41_expert_n256_moe_prequant_fused_reduce_fp8_gaudi2";
 constexpr auto kN256PrequantFusedSchema =
     "custom_op::custom_deepseek_v41_expert_n256_moe_prequant_fused_fp8_gaudi2";
 constexpr auto kN256PrequantDirectFinalizePrefetchW2Schema =
@@ -228,9 +240,16 @@ class PreparedV41 final : public habana::OpBackend {
     bool fused_slots_;
     bool fuse_shared_;
     bool resident_;
+    bool horizontal_;
+    bool transpose_mme_;
 
     const char* decode_guid(bool normal) const {
-        if (n256_) return fp8_ ? kN256Fp8 : kN256Bf16;
+        if (n256_) {
+            const char* qualified = std::getenv("VLLM_HPU_DSV41_N256_NORMAL_BF16");
+            if (!fp8_ && normal && qualified && std::strcmp(qualified, "1") == 0)
+                return "custom_deepseek_v41_expert_n256_normal_bf16_gaudi2";
+            return fp8_ ? kN256Fp8 : kN256Bf16;
+        }
         // Read only while building the recipe; the immutable launch profile
         // and native binary fingerprint own this experimental selection.
         const char* pipeline = std::getenv("VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE");
@@ -351,6 +370,25 @@ class PreparedV41 final : public habana::OpBackend {
         return ReshapeHelper(graph, input, {tokens * experts, 1, width}, dtype);
     }
 
+    std::vector<Tensor> expert_product(synapse_helpers::graph& graph, synTensor activation,
+                                      synTensor weights, const std::vector<int64_t>& shape) {
+        if (!transpose_mme_) {
+            synGEMMParams params{false, false};
+            return BuildNode(this, graph, {"batch_gemm", {activation, weights},
+                {{shape, at::kFloat}}, &params, sizeof(params)});
+        }
+        TORCH_CHECK(shape.size() == 3 && shape[1] == 1,
+                    "Transposed expert products require one row per routed matrix");
+        // Keep the full K and physical operands: (x W)^T = W^T x^T.
+        // The singleton output axis allows a view, with no weight transpose.
+        synGEMMParams params{true, true};
+        auto product = BuildNode(this, graph, {"batch_gemm", {weights, activation},
+            {{{shape[0], shape[2], 1}, at::kFloat}}, &params, sizeof(params)});
+        std::vector<Tensor> result;
+        result.emplace_back(ReshapeHelper(graph, product.at(0).get(), shape, at::kFloat));
+        return result;
+    }
+
     Tensor fused_down(synapse_helpers::graph& graph, synTensor ids, int tokens, int experts,
                       int hidden, int intermediate) {
         const int slots = tokens * experts;
@@ -364,13 +402,17 @@ class PreparedV41 final : public habana::OpBackend {
             quant = BuildNode(this, graph, {kDynamicQuant, {syn_in(0)},
                 {{{tokens, hidden}, at::ScalarType::Float8_e4m3fn}, {{tokens, 1}, at::kFloat}}});
         }
-        auto x = expand_routes(graph, quant.at(0).get(), tokens, experts, hidden,
-                               at::ScalarType::Float8_e4m3fn);
+        auto x = horizontal_
+            ? expand_routes(graph, quant.at(0).get(), tokens, experts / 2, hidden, at::ScalarType::Float8_e4m3fn)
+            : expand_routes(graph, quant.at(0).get(), tokens, experts, hidden, at::ScalarType::Float8_e4m3fn);
         auto scaleRows = expand_routes(graph, quant.at(1).get(), tokens, experts, 1, at::kFloat);
         auto sx = ReshapeHelper(graph, scaleRows.get(), {slots, 1}, at::kFloat);
         auto router = ReshapeHelper(graph, syn_in(2), {1, slots}, at::kFloat);
-        auto w13 = BuildNode(this, graph, {weightDecode, {ids, syn_in(3), syn_in(5), syn_in(7)},
-            {{{slots, hidden, intermediate * 2}, at::ScalarType::Float8_e4m3fn}}});
+        const std::vector<int64_t> w13Shape = horizontal_
+            ? std::vector<int64_t>{slots / 2, hidden, intermediate * 4}
+            : std::vector<int64_t>{slots, hidden, intermediate * 2};
+        auto w13 = BuildNode(this, graph, {horizontal_ ? kN256HorizontalFp8 : weightDecode,
+            {ids, syn_in(3), syn_in(5), syn_in(7)}, {{w13Shape, at::ScalarType::Float8_e4m3fn}}});
         // W2 decode depends only on the selected expert IDs and immutable
         // prepared weights.  Emit it before W13 MME so Synapse can schedule
         // this TPC work while the independent W13 matrix multiply is active.
@@ -379,23 +421,24 @@ class PreparedV41 final : public habana::OpBackend {
             w2 = BuildNode(this, graph, {weightDecode, {ids, syn_in(4), syn_in(6), syn_in(7)},
                 {{{slots, intermediate, hidden}, at::ScalarType::Float8_e4m3fn}}});
         }
-        synGEMMParams params{false, false};
-        auto p13 = BuildNode(this, graph, {"batch_gemm", {x.get(), w13.at(0).get()},
-            {{{slots, 1, intermediate * 2}, at::kFloat}}, &params, sizeof(params)});
+        const std::vector<int64_t> productShape = horizontal_
+            ? std::vector<int64_t>{slots / 2, 1, intermediate * 4}
+            : std::vector<int64_t>{slots, 1, intermediate * 2};
+        auto p13 = expert_product(graph, x.get(), w13.at(0).get(), productShape);
+        auto routeProduct = ReshapeHelper(graph, p13.at(0).get(), {slots, 1, intermediate * 2}, at::kFloat);
         auto middle = BuildNode(this, graph, {kN256SiluQuant,
-            {p13.at(0).get(), ids, sx.get(), syn_in(8), router.get()},
+            {routeProduct.get(), ids, sx.get(), syn_in(8), router.get()},
             {{{slots, 1, intermediate}, at::ScalarType::Float8_e4m3fn}, {{slots, 1, 1}, at::kFloat}}});
         if (!prefetch_w2_) {
             w2 = BuildNode(this, graph, {weightDecode, {ids, syn_in(4), syn_in(6), syn_in(7)},
                 {{{slots, intermediate, hidden}, at::ScalarType::Float8_e4m3fn}}});
         }
-        auto p2 = BuildNode(this, graph, {"batch_gemm", {middle.at(0).get(), w2.at(0).get()},
-            {{{slots, 1, hidden}, at::kFloat}}, &params, sizeof(params)});
+        auto p2 = expert_product(graph, middle.at(0).get(), w2.at(0).get(), {slots, 1, hidden});
         auto sx2 = ReshapeHelper(graph, middle.at(1).get(), {slots, 1}, at::kFloat);
         if (direct_finalize_) {
             auto reduced = BuildNode(this, graph, {kN256ScaleReduce,
                 {p2.at(0).get(), ids, sx2.get(), syn_in(9)},
-                {{{1, 1, hidden}, at::kBFloat16}}});
+                {{{tokens, 1, hidden}, at::kBFloat16}}});
             if (fuse_shared_) {
                 // Preserve the public model boundary exactly: the ordered
                 // routed sum is rounded to BF16, both BF16 rows are promoted
@@ -409,14 +452,14 @@ class PreparedV41 final : public habana::OpBackend {
                     {routedF32.get(), sharedF32.get()}, {{{1, 1, hidden}, at::kFloat}}});
                 return cast(graph, combined.at(0).get(), {1, 1, hidden}, false);
             }
-            return ReshapeHelper(graph, reduced.at(0).get(), {1, 1, hidden}, at::kBFloat16);
+            return ReshapeHelper(graph, reduced.at(0).get(), {tokens, 1, hidden}, at::kBFloat16);
         }
         auto scaled = BuildNode(this, graph, {kN256Scale, {p2.at(0).get(), ids, sx2.get(), syn_in(9)},
             {{{slots, 1, hidden}, at::kBFloat16}}});
         if (fused_reduce_) {
             auto reduced = BuildNode(this, graph, {kN256ScaleReduce,
-                {scaled.at(0).get()}, {{{1, 1, hidden}, at::kBFloat16}}});
-            return ReshapeHelper(graph, reduced.at(0).get(), {1, 1, hidden}, at::kBFloat16);
+                {scaled.at(0).get()}, {{{tokens, 1, hidden}, at::kBFloat16}}});
+            return ReshapeHelper(graph, reduced.at(0).get(), {tokens, 1, hidden}, at::kBFloat16);
         }
         return ReshapeHelper(graph, scaled.at(0).get(), {tokens, experts, hidden}, at::kBFloat16);
     }
@@ -457,11 +500,13 @@ class PreparedV41 final : public habana::OpBackend {
                 bool n256 = false, bool fused = false, bool fused_reduce = false,
                 bool direct_finalize = false, bool prefetch_w2 = false,
                 bool prequant = false, bool fused_slots = false,
-                bool fuse_shared = false, bool resident = false)
+                bool fuse_shared = false, bool resident = false, bool horizontal = false,
+                bool transpose_mme = false)
         : OpBackend(device, NO_TPC + std::string("dsv41_prepared_mxfp4"), dtype, {0}, {}, {}, false), moe_(moe),
           fp8_(fp8), fused_(fused), k128_(k128), n256_(n256), fused_reduce_(fused_reduce),
           direct_finalize_(direct_finalize), prefetch_w2_(prefetch_w2), prequant_(prequant),
-          fused_slots_(fused_slots), fuse_shared_(fuse_shared), resident_(resident) {
+          fused_slots_(fused_slots), fuse_shared_(fuse_shared), resident_(resident), horizontal_(horizontal),
+          transpose_mme_(transpose_mme) {
         SetOutputMetaFn([moe, fp8, n256, prequant, fuse_shared, resident](const at::Stack& stack) {
             if (resident)
                 return habana::OutputMetaDataVector{{at::kBFloat16, resident_shape(stack)}};
@@ -500,8 +545,10 @@ class PreparedV41 final : public habana::OpBackend {
         }
         const int tokens = idsTensor.size(0), experts = idsTensor.size(1), hidden = resultShape[1];
         const int intermediate = stack.at(4).toTensor().size(2) / (n256_ ? 64 : 32);
-        TORCH_CHECK(!(fused_reduce_ || direct_finalize_) || (tokens == 1 && experts == 6),
-                    "Fused expert finalize requires C1 top6");
+        TORCH_CHECK(!fused_reduce_ || (tokens >= 1 && tokens <= 64 && experts == 6),
+                    "Fused expert finalize requires B1..B64 top6");
+        TORCH_CHECK(!direct_finalize_ || (tokens >= 1 && tokens <= 64 && experts == 6),
+                    "Direct expert finalize requires B1..B64 top6");
         const std::vector<int64_t> shape{tokens, experts, intermediate};
         auto down = [&]() -> Tensor {
             if (fused_) return fused_down(graph, ids.get(), tokens, experts, hidden, intermediate);
@@ -549,19 +596,20 @@ class PreparedV41 final : public habana::OpBackend {
 };
 
 const bool registered = [] {
-    for (int mode : {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}) {
+    for (int mode : {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}) {
         const bool n256 = mode >= 5;
-        const bool moe = mode == 1 || mode == 2 || mode == 4 || mode == 5 || mode == 6 || mode == 9 || mode == 10 || mode == 11 || mode == 12 || mode == 13 || mode == 14 || mode == 15 || mode == 16;
-        const bool fp8 = mode == 2 || mode == 5 || mode == 7 || mode == 9 || mode == 10 || mode == 11 || mode == 12 || mode == 13 || mode == 14 || mode == 15 || mode == 16;
+        const bool moe = mode == 1 || mode == 2 || mode == 4 || mode == 5 || mode == 6 || mode == 9 || mode == 10 || mode == 11 || mode == 12 || mode == 13 || mode == 14 || mode == 15 || mode == 16 || mode == 17 || mode == 18 || mode == 19 || mode == 20 || mode == 21 || mode == 22;
+        const bool fp8 = mode == 2 || mode == 5 || mode == 7 || mode == 9 || mode == 10 || mode == 11 || mode == 12 || mode == 13 || mode == 14 || mode == 15 || mode == 16 || mode == 17 || mode == 18 || mode == 19 || mode == 20 || mode == 21 || mode == 22;
         const bool k128 = mode == 3 || mode == 4;
-        const bool fused = mode == 9 || mode == 10 || mode == 11 || mode == 12 || mode == 13 || mode == 14 || mode == 15 || mode == 16;
-        const bool fused_reduce = mode == 10;
-        const bool direct_finalize = mode == 11 || mode == 12 || mode == 14 || mode == 15 || mode == 16;
-        const bool prefetch_w2 = mode == 12 || mode == 14 || mode == 15 || mode == 16;
-        const bool prequant = mode == 13 || mode == 14 || mode == 15 || mode == 16;
+        const bool fused = mode == 9 || mode == 10 || mode == 11 || mode == 12 || mode == 13 || mode == 14 || mode == 15 || mode == 16 || mode == 17 || mode == 18 || mode == 19 || mode == 20 || mode == 21 || mode == 22;
+        const bool fused_reduce = mode == 10 || mode == 17 || mode == 18 || mode == 19 || mode == 20 || mode == 21 || mode == 22;
+        const bool direct_finalize = mode == 11 || mode == 12 || mode == 14 || mode == 15 || mode == 16 || mode == 20;
+        const bool prefetch_w2 = mode == 12 || mode == 14 || mode == 15 || mode == 16 || mode == 18;
+        const bool prequant = mode == 13 || mode == 14 || mode == 15 || mode == 16 || mode == 17 || mode == 22;
         const bool fused_slots = mode == 15;
         const bool fuse_shared = mode == 16;
-        const char* schema = fuse_shared ? kN256PrequantDirectFinalizeSharedPrefetchW2Schema :
+        const bool horizontal = mode == 19 || mode == 20 || mode == 21 || mode == 22;
+        const char* schema = mode == 22 ? kN256PrequantHorizontalSchema : mode == 21 ? kN256HorizontalTransposeSchema : mode == 20 ? kN256HorizontalFinalizeSchema : horizontal ? kN256HorizontalSchema : mode == 18 ? kN256BatchPrefetchSchema : mode == 17 ? kN256PrequantFusedReduceSchema : fuse_shared ? kN256PrequantDirectFinalizeSharedPrefetchW2Schema :
             fused_slots ? kN256PrequantDirectFinalizeSlotsSchema :
             prequant ? (direct_finalize ? kN256PrequantDirectFinalizePrefetchW2Schema
                                                         : kN256PrequantFusedSchema) :
@@ -579,11 +627,11 @@ const bool registered = [] {
             const auto dtype = !moe && fp8 ? at::ScalarType::Float8_e4m3fn : at::kBFloat16;
             return habana::PartialOutputMetaDataVector{{dtype, moe ? moe_shape(stack, n256) : decode_shape(stack, n256)}};
         }, nullptr);
-        habana::KernelRegistry().add(schema, [moe, fp8, k128, n256, fused, fused_reduce, direct_finalize, prefetch_w2, prequant, fused_slots, fuse_shared](
+        habana::KernelRegistry().add(schema, [moe, fp8, k128, n256, fused, fused_reduce, direct_finalize, prefetch_w2, prequant, fused_slots, fuse_shared, horizontal, mode](
                                               synDeviceId device, c10::ScalarType dtype) {
             return std::make_shared<PreparedV41>(device, dtype, moe, fp8, k128, n256, fused, fused_reduce,
                                                 direct_finalize, prefetch_w2, prequant, fused_slots,
-                                                fuse_shared);
+                                                fuse_shared, false, horizontal, mode == 21);
         });
     }
     habana::custom_op::registerUserCustomOp(
@@ -616,22 +664,27 @@ at::Tensor run(const at::Stack& stack, bool moe, bool meta, bool k128, bool n256
 }
 
 template<bool Meta, bool N256 = false, bool Fused = false, bool FusedReduce = false,
-         bool DirectFinalize = false, bool PrefetchW2 = false>
+         bool DirectFinalize = false, bool PrefetchW2 = false, bool Horizontal = false, bool TransposeMME = false>
 at::Tensor moe_fp8(const at::Tensor& x, const at::Tensor& ids, const at::Tensor& router,
     const at::Tensor& q13, const at::Tensor& q2, const at::Tensor& s13, const at::Tensor& s2,
     const at::Tensor& lookup, const at::Tensor& channel13, const at::Tensor& channel2, bool normal) {
     const at::Stack stack{x, ids, router, q13, q2, s13, s2, lookup, channel13, channel2, normal};
     fp8_contract(stack, N256);
+    TORCH_CHECK(!Horizontal || (ids.dim() == 2 && ids.size(1) == 6 && x.size(0) <= 64),
+                "Horizontal W13 requires B1..B64 top6");
     if (Meta) return at::empty(moe_shape(stack, N256), x.options());
     TORCH_CHECK(registered && x.device().type() == at::kHPU, "V4.1 FP8 MoE requires HPU");
     auto descriptor = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(
+        TransposeMME ? kN256HorizontalTransposeSchema : Horizontal ? (DirectFinalize ? kN256HorizontalFinalizeSchema : kN256HorizontalSchema) :
+        PrefetchW2 && FusedReduce && !DirectFinalize ? kN256BatchPrefetchSchema :
         PrefetchW2 ? kN256DirectFinalizePrefetchW2Schema :
         DirectFinalize ? kN256DirectFinalizeSchema : FusedReduce ? kN256FusedReduceSchema :
         Fused ? kN256FusedSchema : N256 ? kN256Fp8Schema : kMoeFp8Schema);
     return descriptor.execute(stack).at(0);
 }
 
-template<bool Meta, bool DirectFinalize = false, bool FusedSlots = false>
+template<bool Meta, bool DirectFinalize = false, bool FusedSlots = false, bool FusedReduce = false,
+         bool Horizontal = false>
 at::Tensor moe_fp8_prequant(
     const at::Tensor& x, const at::Tensor& ids, const at::Tensor& router,
     const at::Tensor& q13, const at::Tensor& q2, const at::Tensor& s13,
@@ -648,6 +701,7 @@ at::Tensor moe_fp8_prequant(
                 "V4.1 prequant FP8 MoE requires HPU");
     auto descriptor = habana::custom_op::UserCustomOpDescriptor::
         getUserCustomOpDescriptor(
+            Horizontal ? kN256PrequantHorizontalSchema : FusedReduce ? kN256PrequantFusedReduceSchema :
             FusedSlots ? kN256PrequantDirectFinalizeSlotsSchema :
             DirectFinalize ? kN256PrequantDirectFinalizePrefetchW2Schema
                            : kN256PrequantFusedSchema);
@@ -705,14 +759,20 @@ template<bool Meta, bool K128 = false, bool N256 = false> at::Tensor moe(const a
 
 TORCH_LIBRARY_FRAGMENT(custom_op, m) {
     m.def("custom_deepseek_v41_prefill_weight_bf16_gaudi2(Tensor ids, Tensor q16, Tensor s16, Tensor lookup, bool normal=False, bool discard_empty=False) -> Tensor");
+    m.def("custom_deepseek_v41_expert_n256_moe_prequant_horizontal_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, Tensor quantized, Tensor activation_scale, bool normal) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_shared_prefetch_w2_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, Tensor quantized, Tensor activation_scale, Tensor shared, bool normal) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_moe_prequant_resident_direct_finalize_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor w13, Tensor w2, Tensor channel13, Tensor channel2, Tensor quantized, Tensor activation_scale, bool normal) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_slots_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, Tensor quantized, Tensor activation_scale, bool normal) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_prefetch_w2_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, Tensor quantized, Tensor activation_scale, bool normal) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_moe_prequant_fused_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, Tensor quantized, Tensor activation_scale, bool normal) -> Tensor");
+    m.def("custom_deepseek_v41_expert_n256_moe_prequant_fused_reduce_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, Tensor quantized, Tensor activation_scale, bool normal) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_moe_direct_finalize_prefetch_w2_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, bool normal) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_moe_direct_finalize_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, bool normal) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, bool normal) -> Tensor");
+    m.def("custom_deepseek_v41_expert_n256_moe_batch_prefetch_w2_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, bool normal) -> Tensor");
+    m.def("custom_deepseek_v41_expert_n256_moe_horizontal_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, bool normal) -> Tensor");
+    m.def("custom_deepseek_v41_expert_n256_moe_horizontal_transpose_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, bool normal) -> Tensor");
+    m.def("custom_deepseek_v41_expert_n256_moe_horizontal_finalize_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, bool normal) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, bool normal) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_moe_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, bool normal) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_moe_bf16_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, bool normal=False) -> Tensor");
@@ -724,14 +784,22 @@ TORCH_LIBRARY_FRAGMENT(custom_op, m) {
 }
 TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
     m.impl("custom_deepseek_v41_prefill_weight_bf16_gaudi2", prefill_weights<false>);
+    m.impl("custom_deepseek_v41_expert_n256_moe_prequant_horizontal_fp8_gaudi2",
+           moe_fp8_prequant<false, false, false, true, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_shared_prefetch_w2_fp8_gaudi2", moe_fp8_prequant_shared<false>);
     m.impl("custom_deepseek_v41_expert_n256_moe_prequant_resident_direct_finalize_fp8_gaudi2", moe_fp8_resident<false>);
     m.impl("custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_slots_fp8_gaudi2", moe_fp8_prequant<false, true, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_prefetch_w2_fp8_gaudi2", moe_fp8_prequant<false, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_prequant_fused_fp8_gaudi2", moe_fp8_prequant<false>);
+    m.impl("custom_deepseek_v41_expert_n256_moe_prequant_fused_reduce_fp8_gaudi2",
+           moe_fp8_prequant<false, false, false, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_direct_finalize_prefetch_w2_fp8_gaudi2", moe_fp8<false, true, true, false, true, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_direct_finalize_fp8_gaudi2", moe_fp8<false, true, true, false, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2", moe_fp8<false, true, true, true>);
+    m.impl("custom_deepseek_v41_expert_n256_moe_batch_prefetch_w2_fp8_gaudi2", moe_fp8<false, true, true, true, false, true>);
+    m.impl("custom_deepseek_v41_expert_n256_moe_horizontal_fp8_gaudi2", moe_fp8<false, true, true, true, false, false, true>);
+    m.impl("custom_deepseek_v41_expert_n256_moe_horizontal_transpose_fp8_gaudi2", moe_fp8<false, true, true, true, false, false, true, true>);
+    m.impl("custom_deepseek_v41_expert_n256_moe_horizontal_finalize_fp8_gaudi2", moe_fp8<false, true, true, false, true, false, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2", moe_fp8<false, true, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_fp8_gaudi2", moe_fp8<false, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_bf16_gaudi2", moe<false, false, true>);
@@ -743,14 +811,22 @@ TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
 }
 TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
     m.impl("custom_deepseek_v41_prefill_weight_bf16_gaudi2", prefill_weights<true>);
+    m.impl("custom_deepseek_v41_expert_n256_moe_prequant_horizontal_fp8_gaudi2",
+           moe_fp8_prequant<true, false, false, true, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_shared_prefetch_w2_fp8_gaudi2", moe_fp8_prequant_shared<true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_prequant_resident_direct_finalize_fp8_gaudi2", moe_fp8_resident<true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_slots_fp8_gaudi2", moe_fp8_prequant<true, true, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_prefetch_w2_fp8_gaudi2", moe_fp8_prequant<true, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_prequant_fused_fp8_gaudi2", moe_fp8_prequant<true>);
+    m.impl("custom_deepseek_v41_expert_n256_moe_prequant_fused_reduce_fp8_gaudi2",
+           moe_fp8_prequant<true, false, false, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_direct_finalize_prefetch_w2_fp8_gaudi2", moe_fp8<true, true, true, false, true, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_direct_finalize_fp8_gaudi2", moe_fp8<true, true, true, false, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2", moe_fp8<true, true, true, true>);
+    m.impl("custom_deepseek_v41_expert_n256_moe_batch_prefetch_w2_fp8_gaudi2", moe_fp8<true, true, true, true, false, true>);
+    m.impl("custom_deepseek_v41_expert_n256_moe_horizontal_fp8_gaudi2", moe_fp8<true, true, true, true, false, false, true>);
+    m.impl("custom_deepseek_v41_expert_n256_moe_horizontal_transpose_fp8_gaudi2", moe_fp8<true, true, true, true, false, false, true, true>);
+    m.impl("custom_deepseek_v41_expert_n256_moe_horizontal_finalize_fp8_gaudi2", moe_fp8<true, true, true, false, true, false, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2", moe_fp8<true, true, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_fp8_gaudi2", moe_fp8<true, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_bf16_gaudi2", moe<true, false, true>);

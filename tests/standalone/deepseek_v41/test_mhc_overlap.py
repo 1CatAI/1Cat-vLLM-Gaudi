@@ -3,11 +3,14 @@
 import copy
 import operator
 
+import pytest
 import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 
 from vllm_gaudi.compilation.deepseek_v41_overlap import (
-    deduplicate_float_casts, independent_mhc_nodes, split_mhc_consumers,
+    deduplicate_float_casts,
+    independent_mhc_nodes,
+    split_mhc_consumers,
 )
 
 
@@ -17,6 +20,26 @@ def control(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 
 @control.register_fake
+def _(value, weight):
+    return value.new_empty(value.shape[0], weight.shape[0])
+
+
+@torch.library.custom_op("dsv41_overlap_test::deepseek_v41_control_batch4_f32", mutates_args=())
+def control_batch4(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.linear(value, weight)
+
+
+@control_batch4.register_fake
+def _(value, weight):
+    return value.new_empty(value.shape[0], weight.shape[0])
+
+
+@torch.library.custom_op("dsv41_overlap_test::deepseek_v41_control_prefetch_f32", mutates_args=())
+def control_prefetch(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.linear(value, weight)
+
+
+@control_prefetch.register_fake
 def _(value, weight):
     return value.new_empty(value.shape[0], weight.shape[0])
 
@@ -55,7 +78,7 @@ def _graph():
     graph = torch.fx.Graph()
     r, w, p = (graph.placeholder(name) for name in ("residual", "weight", "partial"))
     for index in range(2):
-        peer = graph.call_function(torch.ops.dsv41_overlap_test.exchange.default, (p,))
+        peer = graph.call_function(torch.ops.dsv41_overlap_test.exchange.default, (p, ))
         result = graph.call_module(f"consumer{index}", (r, w, p, peer))
         r = graph.call_function(operator.getitem, (result, 0))
     graph.output(r)
@@ -86,6 +109,22 @@ def test_dependent_control_cannot_be_hoisted():
     assert not independent_mhc_nodes(child, [0, 3])
 
 
+@pytest.mark.parametrize("name", ["control_batch4", "control_prefetch"])
+def test_batch_control_keeps_independent_work_before_peer_consumer(name):
+    source = _graph()
+    for child in (source.consumer0, source.consumer1):
+        for node in child.graph.nodes:
+            if node.target == torch.ops.dsv41_overlap_test.deepseek_v41_control_gemv.default:
+                node.target = getattr(torch.ops.dsv41_overlap_test, f"deepseek_v41_{name}_f32").default
+        child.recompile()
+    candidate = copy.deepcopy(source)
+    audit = split_mhc_consumers(candidate, torch.ops.dsv41_overlap_test.exchange.default)
+    assert len(audit) == 2
+    assert all(any(name in op for op in item["operators"]) for item in audit)
+    assert torch.equal(source(*_example()), candidate(*_example()))
+    assert not independent_mhc_nodes(source.consumer0, [0, 3])
+
+
 def test_mutating_partition_is_not_reordered():
     candidate = _graph()
     child = candidate.consumer0
@@ -108,8 +147,8 @@ def test_private_reinplaced_adds_move_but_peer_sum_stays_after_wait():
         projected.replace_all_uses_with(adjusted)
         adjusted.args = (projected, 0.125)
         partial = [n for n in child.graph.nodes if n.op == "placeholder"][2]
-        peer_sum = next(n for n in child.graph.nodes if n.target == torch.ops.aten.add.Tensor
-                        and partial in n.all_input_nodes)
+        peer_sum = next(n for n in child.graph.nodes
+                        if n.target == torch.ops.aten.add.Tensor and partial in n.all_input_nodes)
         peer_sum.target = torch.ops.aten.add_.Tensor
         child.recompile()
         r, w, p = _example()
@@ -123,6 +162,7 @@ def test_private_reinplaced_adds_move_but_peer_sum_stays_after_wait():
 
 
 def test_residual_and_flat_control_share_exact_float_conversion():
+
     def casts(residual):
         mixed = residual.float()
         flat = residual.view(1, 32).float()

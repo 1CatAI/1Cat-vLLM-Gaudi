@@ -17,7 +17,7 @@ from torch import nn
 
 class RecipeRecorder:
 
-    def __init__(self, evidence):
+    def __init__(self, evidence, *, backend=None):
         from habana_frameworks.torch.dynamo.compile_backend.passes import (OptimizationPassPlacement,
                                                                            register_pass_at_optimization_pass)
         from vllm_gaudi.distributed.tp2_fused_ar_norm import _load_bridge, _verify_prepared_runtime
@@ -25,10 +25,11 @@ class RecipeRecorder:
         self.calls = None
         path = Path(os.environ["VLLM_HPU_TP2_FUSED_AR_NORM_BRIDGE"])
         self.bridge = _load_bridge(path)
-        torch.distributed.init_process_group("hccl",
-                                             init_method=f"file://{evidence / 'micro-rendezvous'}",
-                                             rank=0,
-                                             world_size=1)
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group("hccl",
+                                                 init_method=f"file://{evidence / 'micro-rendezvous'}",
+                                                 rank=0,
+                                                 world_size=1)
         _verify_prepared_runtime(path)
         # Production imports expose the runtime globally. The standalone HCCL
         # communicator can leave it RTLD_LOCAL; promote the already verified
@@ -50,13 +51,15 @@ class RecipeRecorder:
                     "bridge_abi_manifest": str(path.with_suffix(".abi.json"))
                 },
                 indent=2))
-        self.backend = torch.distributed.distributed_c10d._get_default_group()._get_backend(torch.device("hpu"))
+        self.backend = (backend if backend is not None else
+                        torch.distributed.distributed_c10d._get_default_group()._get_backend(torch.device("hpu")))
         library = Path(os.environ["DSV41_MICRO_COMPUTE_LIBRARY"])
         if hashlib.sha256(library.read_bytes()).hexdigest() != os.environ["DSV41_MICRO_COMPUTE_SHA256"]:
             raise RuntimeError("Native micro diagnostic binary fingerprint differs")
         spec = importlib.util.spec_from_file_location("dsv41_micro_compute", library)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        self.module = module
         self.Compute = module.Compute
 
         owner = self

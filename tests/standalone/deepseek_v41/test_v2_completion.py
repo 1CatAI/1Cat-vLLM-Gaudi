@@ -23,8 +23,26 @@ class Done:
             raise RuntimeError("not ready")
 
 
+@pytest.mark.parametrize("batch_enabled", [False, True])
+def test_device_engram_abi_is_required_even_with_batch_capacity(monkeypatch, batch_enabled, tmp_path):
+    from vllm_gaudi.ops import deepseek_v41_host as host
+    monkeypatch.setattr(host, "host_native", lambda: SimpleNamespace(abi_version=1, c1_abi_version=1))
+    flags = dict(VLLM_HPU_DSV41_BATCH_DECODE=batch_enabled,
+                 VLLM_HPU_DSV41_V2_DEVICE_ENGRAM=True,
+                 VLLM_HPU_DSV41_ENGRAM_NATIVE_C1=True,
+                 VLLM_HPU_DSV41_ENGRAM_C1_PACKET=True,
+                 VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT=True,
+                 VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH=True,
+                 VLLM_HPU_DSV41_GRAPH_REPLAY=True)
+    for key, value in flags.items():
+        monkeypatch.setenv(key, "1" if value else "0")
+    with pytest.raises(RuntimeError, match="Device Engram requires native host C1 ABI 2"):
+        host.EngramHost(tmp_path, 0, "hpu")
+
+
 def fixture():
     runner = object.__new__(V41V2ModelRunner)
+    runner.prefix_checkpoints = None
     runner.requests = {"a": RequestState("a", [1], [], None, ([1], ), output=[10], num_computed_tokens=1)}
     runner.active_request = "a"
     calls = []
@@ -45,14 +63,14 @@ def fixture():
 @pytest.mark.parametrize("rounds", [None, [("a", 2, 1)]])
 def test_sync_batch_output_does_not_require_engine_diagnostic_field(rounds):
     runner = object.__new__(V41ModelRunner)
+    runner.prefix_checkpoints = None
     runner.pending = None
+    runner.request_batches = None
     runner.pp = SimpleNamespace(group=SimpleNamespace(is_last_rank=True))
     runner.draft_token_ids = None
     runner._update = lambda scheduled: None
     runner._execute_request = lambda scheduled, req_id, count: None
-    request_output = ModelRunnerOutput(req_ids=["a"],
-                                       req_id_to_index={"a": 0},
-                                       sampled_token_ids=[[11]])
+    request_output = ModelRunnerOutput(req_ids=["a"], req_id_to_index={"a": 0}, sampled_token_ids=[[11]])
     if rounds is not None:
         request_output.execution_rounds = rounds
     runner._finish_request = lambda: request_output
@@ -172,7 +190,7 @@ def test_v2_gate_requires_the_complete_segmented_device_contract(monkeypatch):
     for key, value in values.items():
         monkeypatch.setenv(key, "1" if value else "0")
     config = SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v41"),
-                                                         max_model_len=512),
+                                                          max_model_len=512),
                              use_v2_model_runner=True,
                              scheduler_config=SimpleNamespace(async_scheduling=True),
                              speculative_config=None)
@@ -257,7 +275,7 @@ def test_device_engram_precedes_prefix_and_host_token_wait(monkeypatch):
         prepare_device_engram=lambda request, token: calls.append(("device_engram", request, token)),
         begin_decode_prefix=lambda token, position: calls.append(("prefix", token, position.tolist())),
         decode_prefix_ready=lambda search: True,
-        program=SimpleNamespace(length=1 << 20),
+        program=SimpleNamespace(length=1 << 20, search_length=512),
     )
     runner._completion = CompletionRecord("a", 2, 1, torch.tensor([[11]]), OrderedDone(), runner.pp.commit_token)
     scheduled = SimpleNamespace(num_scheduled_tokens={"a": 1}, finished_req_ids=set(), scheduled_spec_decode_tokens={})
@@ -285,10 +303,9 @@ def test_new_search_bucket_captures_complete_plan_before_segmenting(monkeypatch)
         prepare_device_engram=lambda request, token: calls.append(("device_engram", request, token)),
         begin_decode_prefix=lambda token, position: calls.append(("prefix", token, position.tolist())),
         decode_prefix_ready=lambda search: ready.append(search) or False,
-        program=SimpleNamespace(length=1 << 20),
+        program=SimpleNamespace(length=1 << 20, search_length=1024),
     )
-    scheduled = SimpleNamespace(num_scheduled_tokens={"a": 1}, finished_req_ids=set(),
-                                scheduled_spec_decode_tokens={})
+    scheduled = SimpleNamespace(num_scheduled_tokens={"a": 1}, finished_req_ids=set(), scheduled_spec_decode_tokens={})
 
     runner._consume_completion(scheduled)
 
@@ -296,6 +313,59 @@ def test_new_search_bucket_captures_complete_plan_before_segmenting(monkeypatch)
     assert calls == [("model", 1), ("packet", )]
     assert runner._prefix_started is None
     assert runner.audit["v2_prefix_bucket_captures"] == 1
+
+
+@pytest.mark.parametrize("search", [512, 1024, 2048, 524288])
+def test_warmed_next_bucket_cannot_start_prefix_with_previous_bindings(monkeypatch, search):
+    monkeypatch.setenv("VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX", "1")
+    runner, _ = fixture()
+    runner.pp.group = SimpleNamespace(is_first_rank=True)
+    queries = []
+    runner.model = SimpleNamespace(
+        decode_prefix_ready=lambda value: queries.append(value) or True,
+        program=SimpleNamespace(length=1 << 20, search_length=search),
+    )
+    scheduled = SimpleNamespace(num_scheduled_tokens={"a": 1}, finished_req_ids=set(), scheduled_spec_decode_tokens={})
+    record = SimpleNamespace(request_id="a", start=search - 1)
+    assert not runner._prefix_authorized(record, scheduled)
+    assert queries == [search * 2]
+    assert runner.audit["v2_prefix_bucket_transitions"] == 1
+    assert "v2_prefix_bucket_captures" not in runner.audit
+
+    # The complete native entry binds the new attention geometry; early
+    # continuation can then resume on the following token without recapture.
+    runner.model.program.search_length = search * 2
+    record.start += 1
+    assert runner._prefix_authorized(record, scheduled)
+
+
+def test_bounded_stage_does_not_need_a_paged_search_binding(monkeypatch):
+    monkeypatch.setenv("VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX", "1")
+    runner, _ = fixture()
+    runner.pp.group = SimpleNamespace(is_first_rank=True)
+    runner.model = SimpleNamespace(decode_prefix_ready=lambda search: search == 512,
+                                   program=SimpleNamespace(length=512))
+    scheduled = SimpleNamespace(num_scheduled_tokens={"a": 1}, finished_req_ids=set(), scheduled_spec_decode_tokens={})
+    assert runner._prefix_authorized(SimpleNamespace(request_id="a", start=10), scheduled)
+
+
+@pytest.mark.parametrize("position", [510, 511, 512, 1023, 1024, 2558, 2559, 2560, 524287, 1048574])
+def test_runtime_indexer_reuses_bound_prefix_across_history_boundaries(monkeypatch, position):
+    monkeypatch.setenv("VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX", "1")
+    runner, _ = fixture()
+    runner.pp.group = SimpleNamespace(is_first_rank=True)
+    from vllm_gaudi.v1.worker.deepseek_v41_runner import runtime_search_length
+    queries = []
+    bound = runtime_search_length(position + 1, 1, 1 << 20)
+    runner.model = SimpleNamespace(decode_prefix_ready=lambda search: queries.append(search) or True,
+                                   program=SimpleNamespace(length=1 << 20, search_length=bound, runtime_indexer=True))
+    scheduled = SimpleNamespace(num_scheduled_tokens={"a": 1}, finished_req_ids=set(), scheduled_spec_decode_tokens={})
+    assert runner._prefix_authorized(SimpleNamespace(request_id="a", start=position), scheduled)
+    assert queries == [bound]
+    # A prompt path can temporarily bind another geometry. Never run an old
+    # prefix merely because the persistent C1 recipe already exists.
+    runner.model.program.search_length = 8192
+    assert not runner._prefix_authorized(SimpleNamespace(request_id="a", start=position), scheduled)
 
 
 def test_device_engram_skips_only_matching_host_layer1(monkeypatch):

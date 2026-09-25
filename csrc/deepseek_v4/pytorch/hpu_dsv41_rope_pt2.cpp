@@ -8,7 +8,7 @@ const char* names[]={"custom_op::custom_deepseek_v41_rope_bf16_gaudi2",
                     "custom_op::custom_deepseek_v41_prefill_rope_bf16_gaudi2",
                     "custom_op::custom_deepseek_v41_prefill_rope_inverse_bf16_gaudi2"};
 std::vector<int64_t> shape(const at::Tensor& x,const at::Tensor& p,const at::Tensor& t, bool prefill) {
-    TORCH_CHECK(x.scalar_type()==at::kBFloat16 && x.dim()==3 && x.size(0)>0 && x.size(0)<=(prefill ? 8192 : 6) &&
+    TORCH_CHECK(x.scalar_type()==at::kBFloat16 && x.dim()==3 && x.size(0)>0 && x.size(0)<=(prefill ? 8192 : 64) &&
         x.size(1)>0 && x.size(1)<=128 && x.size(2)>0 && x.size(2)<=512 && x.size(2)%128==0 &&
         p.scalar_type()==at::kInt && p.dim()==1 && p.size(0)==x.size(0) &&
         t.scalar_type()==at::kFloat && t.dim()==2 && t.size(0)>0 && t.size(1)==64 &&

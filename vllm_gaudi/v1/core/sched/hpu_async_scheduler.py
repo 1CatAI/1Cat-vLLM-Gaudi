@@ -7,6 +7,18 @@ from vllm.v1.request import Request, RequestStatus
 
 class HPUAsyncScheduler(AsyncScheduler):
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from vllm_gaudi import envs
+        from vllm_gaudi.ops.deepseek_v41_config import is_v41, uses_v2
+        config = self.vllm_config
+        # BatchExecution returns only after both PP stages, sampling and the
+        # request-state consumer finish. Its one-transaction engine has no
+        # worker broadcast-ring slots that require an extra PP cadence gap.
+        # Keep upstream cadence until the output is actually committed.
+        self._completed_batch_reentry = (is_v41(config) and uses_v2(config) and envs.VLLM_HPU_DSV41_BATCH_DECODE
+                                         and config.speculative_config is None and config.max_concurrent_batches == 1)
+
     def schedule(self, throttle_prefills: bool = False):
         """HPU override: fix stale cached-token accounting after preemption.
 
@@ -180,4 +192,12 @@ class HPUAsyncScheduler(AsyncScheduler):
                 request.discard_latest_async_tokens = False
             return [], False
 
-        return super()._update_request_with_output(request, new_token_ids, **kwargs)
+        result = super()._update_request_with_output(request, new_token_ids, **kwargs)
+        if (getattr(self, "_completed_batch_reentry", False) and not kwargs.get("is_stale", False) and not result[1]
+                and request.status == RequestStatus.RUNNING and request.num_output_placeholders == 0):
+            # At this point the sampled input and the previous generation's
+            # complete state have been committed. The next normal schedule
+            # can include this request; do not split ready requests into
+            # alternating PP cohorts or enqueue more work on shared scratch.
+            request.next_decode_eligible_step = min(request.next_decode_eligible_step, self.current_step)
+        return result

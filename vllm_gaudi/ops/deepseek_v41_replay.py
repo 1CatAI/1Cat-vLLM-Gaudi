@@ -20,9 +20,11 @@ def _native_input_precision_compatible(program):
 
 def stage_collectives(tp_rank, native):
     from vllm.distributed import tensor_model_parallel_all_gather, tensor_model_parallel_all_reduce
+    from vllm_gaudi import envs
+    maximum = 64 * 5120 if envs.VLLM_HPU_DSV41_BATCH_DECODE else 32768
 
     def reduce(value, *, ready_outputs=()):
-        if native and value.dtype == torch.bfloat16 and value.numel() <= 32768:
+        if native and value.dtype == torch.bfloat16 and value.numel() <= maximum:
             flat = value.reshape(1, -1).contiguous()
             peer = (torch.ops.vllm_gaudi.tp2_exchange_peer_scheduled(flat, list(ready_outputs))
                     if ready_outputs else torch.ops.vllm_gaudi.tp2_exchange_peer(flat))
@@ -30,7 +32,7 @@ def stage_collectives(tp_rank, native):
         return tensor_model_parallel_all_reduce(value)
 
     def gather(value, dim):
-        if native and dim == 1 and value.dtype == torch.bfloat16 and value.numel() <= 32768:
+        if native and dim == 1 and value.dtype == torch.bfloat16 and value.numel() <= maximum:
             flat = value.reshape(1, -1).contiguous()
             # The native command path transfers 128 BF16 elements per unit.
             # Indexer head weights can contain only 16..96 elements.
@@ -63,22 +65,34 @@ class _Snapshot:
 
 def stage_state_tensors(program):
     mutable = {
-        "swa", "main", "decoded_swa", "decoded_main", "decoded_index_hot", "index", "indices",
-        "candidate_pool", "kv_history", "score_history", "block_table"
+        "swa", "main", "decoded_swa", "decoded_main", "decoded_index_hot", "index", "indices", "candidate_pool",
+        "kv_history", "score_history", "block_table"
     }
+    active_decoded = None
     if getattr(program, "length", 512) > 512 and getattr(program, "search_length", 512) > 512:
-        # The decoded working set belongs only to the <=512 prefix variant.
-        # Longer variants read/write the canonical packed pages. Binding an
-        # inactive decoded allocation fails native ownership validation; it
-        # is neither a producer nor a consumer of that captured program.
-        mutable.difference_update(("decoded_swa", "decoded_main"))
+        # Hot paged variants also consume decoded mirrors. Bind only the
+        # mirrors selected by PagedAttention's capacity check: the long-context
+        # packed variant has no producer/consumer for inactive allocations.
+        active_decoded = set()
+        shared = program.shared
+        if getattr(shared, "decoded_kv_state", False):
+            for cache in shared.sources.values():
+                value = getattr(cache, "decoded_main", None)
+                if (cache.ratio in (1, 2) and value is not None
+                        and program.search_length // cache.ratio <= value.shape[0]):
+                    active_decoded.add(id(value))
+            if active_decoded:
+                active_decoded.add(id(shared.decoded_swa))
     from vllm_gaudi.ops.deepseek_v41_indexer import INDEX_MME_HOT_TOKENS
     if getattr(program, "search_length", 512) != INDEX_MME_HOT_TOKENS:
         # The capacity-independent packed recipe neither reads nor updates the
         # bounded mirror.  Do not bind inactive state into its native plan.
         mutable.discard("decoded_index_hot")
-    return tuple(value for name, value in program.named_buffers()
-                 if not name.startswith("draft.") and name.rsplit(".", 1)[-1] in mutable)
+    return tuple(
+        value for name, value in program.named_buffers()
+        if not name.startswith("draft.") and ".batch_state." not in name and name.rsplit(".", 1)[-1] in mutable and (
+            active_decoded is None or name.rsplit(".", 1)[-1] not in ("decoded_swa",
+                                                                      "decoded_main") or id(value) in active_decoded))
 
 
 def capture_engram_inputs(engram, *, direct=False, device_layer1=False):
@@ -98,8 +112,8 @@ def capture_engram_inputs(engram, *, direct=False, device_layer1=False):
     for value in engram:
         if (value.dtype != torch.uint8 or value.ndim != 3 or value.shape[0] != 1 or not value.is_contiguous()
                 or value.device != first.device or value.shape[-1] != first.shape[-1]
-                or value.untyped_storage()._cdata != first.untyped_storage()._cdata
-                or value.storage_offset() != offset or value.numel() == 0):
+                or value.untyped_storage()._cdata != first.untyped_storage()._cdata or value.storage_offset() != offset
+                or value.numel() == 0):
             raise ValueError("Direct Engram inputs must be ordered views of one complete C1 packet")
         offset += value.numel()
     if first.untyped_storage().nbytes() != offset:
@@ -147,9 +161,7 @@ class StageVariant(torch.nn.Module):
         self.pp_wire = (pp_wire if envs.VLLM_HPU_DSV41_DIRECT_PP_WIRE else pp_wire.clone()) if self.wire_input else None
         self.direct_engram = bool(engram) and native_input and envs.VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT
         self.device_engram = bool(engram) and native_input and envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM
-        self.engram = capture_engram_inputs(engram,
-                                            direct=self.direct_engram,
-                                            device_layer1=self.device_engram)
+        self.engram = capture_engram_inputs(engram, direct=self.direct_engram, device_layer1=self.device_engram)
         self.states = stage_state_tensors(program)
         self.metadata = _Metadata()
         self.capture_bytes = 0
@@ -243,8 +255,7 @@ class StageReplay:
         if self.segmented_prefix_enabled and not self.native_input_enabled:
             raise ValueError("V2 segmented prefix requires native PP0 input replay")
         if (envs.VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT
-                and (not _native_input_precision_compatible(program)
-                     or not envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH)):
+                and (not _native_input_precision_compatible(program) or not envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH)):
             raise ValueError("Direct Engram capture requires ordinary BF16 native input replay")
         self.input_seed = None
 
@@ -258,8 +269,7 @@ class StageReplay:
 
     def from_input_ids(self, positions, input_ids, engram):
         program = self.program()
-        if (not self.native_input_enabled or input_ids.numel() != 1
-                or not _native_input_precision_compatible(program)):
+        if (not self.native_input_enabled or input_ids.numel() != 1 or not _native_input_precision_compatible(program)):
             raise ValueError("Native input capture requires enabled ordinary BF16 C1 PP0 decode")
         if self.segmented_prefix_enabled:
             from vllm_gaudi.ops.tp2_prepared_plan import _native_entries
@@ -280,10 +290,10 @@ class StageReplay:
         V2 starts the embedding/Engram-independent prefix before the next
         scheduler turn enters ``_forward``.  At a paged-attention bucket
         boundary, the program still names the previous bucket at that point.
-        Check the next bucket explicitly so a segmented prefix can never be
-        started on one recipe and finished on another.  The first token in a
-        new bucket will capture the complete native recipe; later tokens can
-        resume segmented replay.
+        This is a readiness query, not a binding change. The caller must also
+        verify that the next bucket equals the currently bound bucket before
+        starting an early prefix. At a transition, _forward binds the new
+        bucket before entering the complete native replay.
         """
         from vllm_gaudi.ops.tp2_prepared_plan import _native_entries
         variant = self.variants.get(self._input_key(int(search)))
@@ -352,8 +362,9 @@ class StageReplay:
                              or tokens != 1):
             raise ValueError("Native input capture requires enabled ordinary BF16 C1 PP0 decode")
         search = getattr(program, "search_length", 512)
-        key = (((tokens, "input") if search <= 512 else (tokens, "input", search))
-               if native_input else tokens if search <= 512 and not fused_text_io and pp_wire is None else
+        key = (((tokens, "input") if search <= 512 else
+                (tokens, "input",
+                 search)) if native_input else tokens if search <= 512 and not fused_text_io and pp_wire is None else
                (tokens, search, fused_text_io))
         if key not in self.variants:
             self.variants[key] = StageVariant(program,
@@ -373,8 +384,8 @@ class StageReplay:
         program = self.program()
         native_input = (self.native_input_enabled and tokens == 1 and _native_input_precision_compatible(program))
         fused = (program.pp_rank == 0 and envs.VLLM_HPU_DSV41_FUSED_STAGE_IO)
-        key = (((tokens, "input") if search <= 512 else (tokens, "input", search))
-               if native_input else tokens if search <= 512 and not fused else
+        key = (((tokens, "input") if search <= 512 else
+                (tokens, "input", search)) if native_input else tokens if search <= 512 and not fused else
                (tokens, search, fused))
         variant = self.variants.get(key)
         if variant is None or variant not in _native_entries:

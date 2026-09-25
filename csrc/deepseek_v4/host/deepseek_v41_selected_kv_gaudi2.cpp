@@ -53,10 +53,10 @@ tpc_lib_api::GlueCodeReturn DeepseekV41SelectedKVGaudi2::GetGcDefinitions(
             auto& g = i < 3 ? in->inputTensors[i].geometry : in->outputTensors[i - 3].geometry;
             if (g.dataType != types[i]) { g.dataType = types[i]; return GLUE_INCOMPATIBLE_DATA_TYPE; }
             bool size = g.dims == 2;
-            if (i == 0) size &= g.maxSizes[0] == 528 && g.maxSizes[1] > 0 && g.maxSizes[1] <= 512;
+            if (i == 0) size &= g.maxSizes[0] == 528 && g.maxSizes[1] > 0 && g.maxSizes[1] <= 64 * 256;
             if (i == 1) size &= g.maxSizes[0] == 288 && g.maxSizes[1] > 0 &&
-                               g.maxSizes[1] <= 0x7fffffffULL - 512;
-            if (i == 2 || i == 4) size &= slots > 0 && slots <= 4096 &&
+                               g.maxSizes[1] <= 0x7fffffffULL - 64 * 256;
+            if (i == 2 || i == 4) size &= slots > 0 && slots <= 64 * 640 &&
                                          g.maxSizes[0] == slots && g.maxSizes[1] == 1;
             if (i == 3) size &= g.maxSizes[0] == 512 && g.maxSizes[1] == slots;
             if (!size) return i < 3 ? GLUE_INCOMPATIBLE_INPUT_SIZE : GLUE_INCOMPATIBLE_OUTPUT_SIZE;

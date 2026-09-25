@@ -122,6 +122,8 @@ def initialize_tp2_fused_ar_norm_runtime() -> None:
         # explicitly opted-in PP path raises the HCL limit.  Do not change
         # the contract of existing TP-only profiles.
         direct_max_count = ("262144" if os.environ.get("VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE") == "1" else "163840")
+        if v41 and os.environ.get("VLLM_HPU_DSV41_BATCH_DECODE") == "1":
+            direct_max_count = "327680"
         required_environment.update({
             "HCCL_PRIM_COLLECTIVE_MASK": "0",
             "HCL_TP2_DIRECT_NIC_RS_AR": "0",
@@ -238,11 +240,11 @@ def initialize_tp2_fused_ar_norm_runtime() -> None:
         if envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH or envs.VLLM_HPU_DSV41_GRAPH_REPLAY:
             required += ("record_native_completion", "copy_sampled_tokens_to_host")
         if envs.VLLM_HPU_DSV41_DEVICE_COMMIT:
-            required += ("copy_integer_record_to_host",)
+            required += ("copy_integer_record_to_host", )
         if envs.VLLM_HPU_DSV41_NATIVE_PP_COPY:
-            required += ("copy_c1_pipeline_tensors",)
+            required += ("copy_c1_pipeline_tensors", )
         if envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM:
-            required += ("DeviceEngramProducer",)
+            required += ("DeviceEngramProducer", )
         if not all(hasattr(bridge, name) for name in required) or not bridge.native_decode_graph_available():
             raise RuntimeError(
                 "VLLM_HPU_NATIVE_DECODE_GRAPH requires the version-locked Synapse and HCL native replay APIs; "

@@ -46,8 +46,9 @@ with (open_trace(args.trace, "rb") as src, gzip.open(args.output / "hardware.jso
             metadata.append(event)
         if "enqueue" in name.lower() and a.get("recipeName"):
             host_enqueues.append([event["ts"], event.get("dur", 0), rkey, a["recipeName"]])
-        if event.get("cat") == "cpu_op" and ("Compiled Region" in name or "execute_model" in name
-                                             or "prepared_moe" in name or "native_decoder" in name):
+        if ((event.get("cat") == "cpu_op" and ("Compiled Region" in name or "execute_model" in name
+                                               or "prepared_moe" in name or "native_decoder" in name))
+                or name.startswith(("v41::request_batch::", "v41::batch_slots::", "v41::batch_members::"))):
             markers.append([event["ts"], event.get("dur", 0), name])
         if event.get("ph") != "X" or event.get("dur", 0) <= 0:
             continue

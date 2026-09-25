@@ -91,10 +91,29 @@ class RequestState:
     block_ids: tuple[list[int], ...]
     num_computed_tokens: int = 0
     output: list[int] = field(default_factory=list)
+    recompute_until: int = 0
 
     @property
     def tokens(self):
         return self.prompt + self.output
+
+    @property
+    def token_count(self):
+        return len(self.prompt) + len(self.output)
+
+    def token_at(self, position):
+        """Read one committed input without copying the complete prefix."""
+        if position < 0:
+            position += self.token_count
+        if not 0 <= position < self.token_count:
+            raise IndexError("Request token position is outside its committed prefix")
+        prompt_count = len(self.prompt)
+        return self.prompt[position] if position < prompt_count else self.output[position - prompt_count]
+
+    @property
+    def decode_start(self):
+        # A preempted request must replay its generated prefix as prefill too.
+        return max(len(self.prompt), self.recompute_until)
 
     def reconcile(self, output_count, new_tokens, all_tokens=None):
         if all_tokens is not None:
@@ -136,7 +155,7 @@ def target_chunks(tokens, block_tokens=PREFILL_BLOCK_TOKENS):
     prefill geometry.
     """
     if block_tokens < 1 or block_tokens > PREFILL_BLOCK_TOKENS:
-        raise ValueError("V4.1 prefill blocks must be no larger than max_num_batched_tokens=8192")
+        raise ValueError("V4.1 device working blocks must be <=8192 tokens; scheduler budget is independent")
     buckets = tuple(size for size in prefill_compute_buckets() if size <= block_tokens)
     offset = 0
     while offset < len(tokens):
@@ -269,6 +288,8 @@ class PPBuffers:
             self.prefill_consumer_events = ([torch.hpu.Event()
                                              for _ in range(slot_count)] if self.prefill_wavefront else [None])
             self.prefill_consumer_pending = [False] * slot_count
+            self.prefill_packed_consumer = None
+            self.prefill_packed_consumer_pending = False
             self.commit = torch.empty(4, dtype=torch.int32, device=device)
             # Prompt completion is four host-generated integers.  Keep that
             # control record on the PP gloo group: lowering either pageable or
@@ -405,6 +426,9 @@ class PPBuffers:
                 if pending:
                     self.prefill_consumer_events[slot].synchronize()
                     self.prefill_consumer_pending[slot] = False
+            if getattr(self, "prefill_packed_consumer_pending", False):
+                self.prefill_packed_consumer.synchronize()
+                self.prefill_packed_consumer_pending = False
             self.prefill_active_slot = None
             return
         if include_commit and self.commit_work is not None:
@@ -541,7 +565,18 @@ class PPBuffers:
 
     def mark_prefill_consumed(self):
         """Publish the last real reader of the active PP receive slot."""
-        if self.dspark or not self.prefill_wavefront or self.group.is_first_rank:
+        if self.dspark or self.group.is_first_rank:
+            return
+        if self.packed is not None and self.packed.active is not None:
+            # A prompt tail can use C1 packet geometry without sampling a
+            # token. Its CPU commit must still wait for the PP1 model reader
+            # before releasing that packet or submitting native batch replay.
+            if self.prefill_packed_consumer is None:
+                self.prefill_packed_consumer = torch.hpu.Event()
+            self.prefill_packed_consumer.record(torch.hpu.current_stream())
+            self.prefill_packed_consumer_pending = True
+            return
+        if not self.prefill_wavefront:
             return
         slot = self.prefill_active_slot
         if slot is None:
@@ -811,6 +846,7 @@ class PPBuffers:
 
 
 class V41ModelRunner:
+    fatal_execution_errors = True
     _PAD_BLOCK_ID, _PAD_SLOT_ID = 0, 0
     v2_completion = False
 
@@ -821,6 +857,8 @@ class V41ModelRunner:
         self.device = vllm_config.device_config.device
         self.requests, self.encoder_cache = {}, {}
         self.model = self.state = None
+        self.request_batches = None
+        self.prefix_checkpoints = None
         self.kv_caches, self.graphed_buckets = [], set()
         self.pending = self.draft_token_ids = None
         self.use_dspark = envs.VLLM_HPU_DSV41_DSPARK
@@ -925,7 +963,16 @@ class V41ModelRunner:
             prepare_device_grouped_prefill_recipes(normal_scales=True)
         self.model = get_model(vllm_config=self.vllm_config)
         state_type = PagedStageState if self.model_config.max_model_len > 512 else StageStateBlocks
-        self.state = state_type(self.model.program)
+        self.state = (state_type(self.model.program,
+                                 auxiliary_prefix=self.vllm_config.cache_config.enable_prefix_caching)
+                      if state_type is PagedStageState else state_type(self.model.program))
+        if envs.VLLM_HPU_DSV41_BATCH_DECODE:
+            self.model.initialize_request_batches(self.vllm_config.scheduler_config.max_num_seqs)
+            from vllm_gaudi.v1.worker.deepseek_v41_batch_runner import BatchExecution
+            self.request_batches = BatchExecution(self, self.vllm_config.scheduler_config.max_num_seqs)
+            if self.vllm_config.cache_config.enable_prefix_caching:
+                from vllm_gaudi.v1.worker.deepseek_v41_prefix import PrefixCheckpoints
+                self.prefix_checkpoints = PrefixCheckpoints(self)
         register_state_spec(self.vllm_config)
         self.model_memory_usage = torch.hpu.memory_allocated() - before
         if self.pp.group.is_last_rank and envs.VLLM_HPU_DSV41_DSPARK:
@@ -1020,6 +1067,27 @@ class V41ModelRunner:
         self.kv_cache_config = config
 
     def _bind_request(self, request):
+        if self.request_batches is not None:
+            bank = self.model.batch_state
+            owner = bank.acquire(request.req_id)
+            bank.publish_pages(owner, request.block_ids[0], self.state.blocks)
+            if request.num_computed_tokens >= request.decode_start:
+                bank.bind_single(owner, request.num_computed_tokens)
+            else:
+                bank.bind_prefill(owner)
+            if self.model.engram_host is not None:
+                self.model.engram_host.activate(request.req_id, reset=request.num_computed_tokens == 0)
+            if (request.num_computed_tokens == request.decode_start and envs.VLLM_HPU_DSV41_STATE_AUDIT_DIR):
+                from vllm_gaudi.ops.deepseek_v41_state_audit import save_single_handoff
+                host = self.model.engram_host
+                save_single_handoff(bank,
+                                    owner,
+                                    request.num_computed_tokens,
+                                    request.req_id,
+                                    envs.VLLM_HPU_DSV41_STATE_AUDIT_DIR,
+                                    engram_history=host.history.history.tolist() if host is not None else None)
+            self.active_request = request.req_id
+            return
         if isinstance(self.state, PagedStageState):
             if len(request.block_ids) != 1:
                 raise RuntimeError("V4.1 compressed state expects one scheduler page group")
@@ -1044,7 +1112,20 @@ class V41ModelRunner:
             self.active_request = request.req_id
             self.audit["requests"] += 1
 
+    def _release_batch_state(self, req_id):
+        self.model.batch_state.release(req_id)
+        if isinstance(self.state, PagedStageState):
+            self.state.release(req_id)
+        if self.model.engram_host is not None:
+            self.model.engram_host.release_request(req_id)
+        if self.active_request == req_id:
+            self.active_request = None
+
     def _update(self, scheduled):
+        if self.request_batches is not None:
+            for req_id in getattr(scheduled, "preempted_req_ids", None) or ():
+                self._release_batch_state(req_id)
+                self.audit["batch_preemptions"] = self.audit.get("batch_preemptions", 0) + 1
         for req_id in scheduled.finished_req_ids:
             if self.verify_timing:
                 self.verify_timing.flush()
@@ -1057,7 +1138,9 @@ class V41ModelRunner:
                                 "transactions": records
                             }))
             self.requests.pop(req_id, None)
-            if isinstance(self.state, PagedStageState):
+            if self.request_batches is not None:
+                self._release_batch_state(req_id)
+            elif isinstance(self.state, PagedStageState):
                 self.state.release(req_id)
                 if self.model.engram_host is not None:
                     self.model.engram_host.release_request(req_id)
@@ -1071,11 +1154,31 @@ class V41ModelRunner:
             self._validate_sampling(new.sampling_params)
             self.requests[new.req_id] = RequestState(new.req_id, list(new.prompt_token_ids), new.mm_features,
                                                      new.sampling_params, new.block_ids, new.num_computed_tokens)
+            prefix = getattr(new, "prefill_token_ids", None)
+            if self.request_batches is not None and prefix is not None:
+                request = self.requests[new.req_id]
+                restores = getattr(scheduled, "auxiliary_prefix_operations", None)
+                checkpoint = restores.restores.get(new.req_id) if restores is not None else None
+                cached_prefix = checkpoint is not None and checkpoint.num_tokens == new.num_computed_tokens
+                if prefix[:len(request.prompt)] != request.prompt or (new.num_computed_tokens and not cached_prefix):
+                    raise ValueError("Request batch recomputation needs a full committed prefix from position zero")
+                request.output = list(prefix[len(request.prompt):])
+                request.recompute_until = len(prefix)
         cached = scheduled.scheduled_cached_reqs
         for index, req_id in enumerate(cached.req_ids):
             request = self.requests[req_id]
             new_blocks = cached.new_block_ids[index]
             if req_id in cached.resumed_req_ids:
+                if self.request_batches is not None:
+                    operations = getattr(scheduled, "auxiliary_prefix_operations", None)
+                    checkpoint = operations.restores.get(req_id) if operations is not None else None
+                    cached_prefix = (checkpoint is not None
+                                     and checkpoint.num_tokens == cached.num_computed_tokens[index])
+                    if (cached.num_computed_tokens[index] and not cached_prefix) or new_blocks is None:
+                        raise ValueError("Request batch resumption requires recomputation and new scheduler pages")
+                    # Also handles forced reset without a preceding preemption
+                    # notification: stale SWA/Engram owners cannot survive it.
+                    self._release_batch_state(req_id)
                 request.block_ids = new_blocks
                 self.active_request = None
             elif new_blocks is not None:
@@ -1083,6 +1186,8 @@ class V41ModelRunner:
             request.num_computed_tokens = cached.num_computed_tokens[index]
             new_tokens = cached.new_token_ids[index] if cached.new_token_ids else []
             request.reconcile(cached.num_output_tokens[index], new_tokens, cached.all_token_ids.get(req_id))
+            if self.request_batches is not None and req_id in cached.resumed_req_ids:
+                request.recompute_until = len(request.tokens)
 
     @staticmethod
     def _validate_sampling(params):
@@ -1221,6 +1326,10 @@ class V41ModelRunner:
         # long-search graph variant. StageReplay keys plans by search bucket.
         use_replay = (getattr(self.model, "native", False) and
                       (decode or (start + count <= 1024 and (c1_replay or (self.use_dspark and request is not None)))))
+        if self.request_batches is not None and request is not None and not decode:
+            # Prompt/tail transactions keep their request-slot aliases.
+            # B1 decode binds the original working addresses before replay.
+            use_replay = False
         self.model.prepare_step(request_id, tokens, is_decode=graph_c1, reset=reset, use_replay=use_replay)
         self._round_phase("engram_prepared_ns")
         timing = getattr(self, "verify_timing", None)
@@ -1241,7 +1350,7 @@ class V41ModelRunner:
             if timing:
                 timing.device("stage_model_start")
             output = self.model(ids, positions, intermediate_tensors=value)
-            if not graph_c1:
+            if not decode:
                 self.pp.mark_prefill_consumed()
             self._round_phase("stage_submitted_ns")
             if timing:
@@ -1496,14 +1605,43 @@ class V41ModelRunner:
         if self.pending is not None:
             raise RuntimeError("Previous V4.1 execution has not completed sampling/verify")
         self._update(scheduled)
+        operations = getattr(scheduled, "auxiliary_prefix_operations", None)
+        if self.prefix_checkpoints is not None:
+            if operations is not None:
+                self.model.batch_state.leave_single()
+            self.prefix_checkpoints.begin(operations)
+        elif operations is not None:
+            raise RuntimeError("Auxiliary prefix operations reached a worker without checkpoint support")
         if not scheduled.num_scheduled_tokens:
             return EMPTY_MODEL_RUNNER_OUTPUT
         outputs, drafts, ids, async_result = [], [], [], None
         execution_rounds = []
         batch_size = len(scheduled.num_scheduled_tokens)
+        batched_ids = set()
+        if self.request_batches is not None:
+            batch_requests = [
+                self.requests[name] for name, count in scheduled.num_scheduled_tokens.items()
+                if count == 1 and self.requests[name].num_computed_tokens >= self.requests[name].decode_start
+            ]
+            if batch_requests and (len(scheduled.num_scheduled_tokens) > 1 or operations is not None):
+                self._next_input = None
+                result = self.request_batches.execute(batch_requests)
+                batched_ids = {request.req_id for request in batch_requests}
+                ids.extend(request.req_id for request in batch_requests)
+                if self.pp.group.is_last_rank:
+                    outputs.extend(result.sampled_token_ids)
         for req_id, count in scheduled.num_scheduled_tokens.items():
-            self._execute_request(scheduled, req_id, count)
-            result = self._finish_request()
+            if req_id in batched_ids:
+                continue
+            request = self.requests.get(req_id) if self.request_batches is not None else None
+            single_trace = (self.request_batches.trace_single(request)
+                            if self.request_batches is not None and request is not None
+                            and request.num_computed_tokens >= request.decode_start else nullcontext())
+            with single_trace:
+                self._execute_request(scheduled, req_id, count)
+                result = self._finish_request()
+            if self.prefix_checkpoints is not None:
+                self.prefix_checkpoints.capture_at(req_id, self.requests[req_id].num_computed_tokens + count)
             ids.append(req_id)
             if isinstance(result, AsyncModelRunnerOutput) and batch_size > 1:
                 # Request switches must consume the previous Engram generation
@@ -1519,6 +1657,9 @@ class V41ModelRunner:
                 execution_rounds.extend(getattr(result, "execution_rounds", None) or ())
                 if self.draft_token_ids is not None:
                     drafts.extend(self.draft_token_ids.draft_token_ids)
+        acknowledgments = self.prefix_checkpoints.finish() if self.prefix_checkpoints is not None else []
+        if operations is not None and async_result is not None:
+            raise RuntimeError("Auxiliary prefix completion must precede asynchronous decode")
         if async_result is None and self.pp.group.is_last_rank:
             self.draft_token_ids = DraftTokenIds(ids, drafts)
         if async_result is not None:
@@ -1530,6 +1671,8 @@ class V41ModelRunner:
                                                       for index, key in enumerate(ids)
                                                   },
                                                   sampled_token_ids=outputs)
+            if acknowledgments:
+                self.batch_result.auxiliary_prefix_acknowledgments = acknowledgments
             if execution_rounds:
                 self.batch_result.execution_rounds = execution_rounds
         else:
@@ -1552,7 +1695,7 @@ class V41ModelRunner:
         tokens = request.tokens[start:start + count - len(proposed)] + proposed
         if len(tokens) != count or start + count > self.model_config.max_model_len:
             raise RuntimeError("Scheduled V4.1 inputs do not match the committed prefix and context budget")
-        decode = start >= len(request.prompt)
+        decode = start >= request.decode_start
         from vllm_gaudi.ops import deepseek_v41_prefill_event_trace as prefill_events
         tracing_prefill = (not decode and prefill_events.begin(req_id, self.pp.generation + 1, count,
                                                                self.model.pp_rank, self.model.tp_rank))
@@ -1565,6 +1708,9 @@ class V41ModelRunner:
         # real large-M model invocation up to max_num_batched_tokens. Internal
         # C1/C6 decode tiling would reread expert weights for every prompt row.
         chunks = [(0, tokens)] if decode else target_chunks(tokens, PREFILL_BLOCK_TOKENS)
+        prefix_checkpoints = getattr(self, "prefix_checkpoints", None)
+        if prefix_checkpoints is not None:
+            chunks = prefix_checkpoints.chunks(req_id, start, chunks)
         program = getattr(self.model, "program", None)
         transaction_search = ((prefill_search_length(
             start, count, program.length, reuse_index_keys=envs.VLLM_HPU_DSV41_PREFILL_REINDEX_REUSE) if getattr(
@@ -1599,9 +1745,9 @@ class V41ModelRunner:
             if offset + len(chunk) < count:
                 self._insert(self.model.last_aux, self.positions[:len(chunk)])
                 self.model.complete_step(len(chunk))
-                # The exact two-slot PP ring owns large prompt boundaries and
-                # retires a slot only at its real consumer.  Compatibility and
-                # C1-tail packets retain the conservative global retirement.
+                if prefix_checkpoints is not None:
+                    prefix_checkpoints.capture_at(req_id, start + offset + len(chunk))
+                # Keep the exact two-slot PP ring owned through its consumer.
                 if not getattr(self.pp, "prefill_wavefront", False) or len(chunk) == 1:
                     self.pp.drain()
                     torch.hpu.synchronize()
@@ -1697,7 +1843,7 @@ class V41ModelRunner:
         if proposed:
             raise RuntimeError("Ordinary sampling cannot consume a draft prefix")
         device_commit_enabled = getattr(self.pp, "device_commit_enabled", getattr(self.pp, "device_commit", False))
-        device_commit = (device_commit_enabled and need_sample and start >= len(request.prompt))
+        device_commit = (device_commit_enabled and need_sample and start >= request.decode_start)
         token = None
         if self.pp.group.is_last_rank and need_sample and not device_commit:
             if self._token_copy is not None:
@@ -1810,6 +1956,9 @@ class V41ModelRunner:
 
     @torch.inference_mode()
     def warmup_model(self):
+        if self.request_batches is not None:
+            self.request_batches.warmup()
+            self.model.batch_state.restore_single_bindings()
         # Ordinary serving keeps the qualified C1 native replay for decode.
         # C6 is a DSpark-only anchor-plus-draft geometry. Prompt C128 recipes
         # are compiled by real prefill qualification and persisted in cache.
@@ -1823,6 +1972,20 @@ class V41ModelRunner:
                 if self.model.native:
                     self.model.program.replay_owner.require_ready(count, search=search)
             self.graphed_buckets.add(count)
+        if (not self.use_dspark and self.model.native and isinstance(self.state, PagedStageState)
+                and not getattr(self.model.program, "runtime_indexer", False)):
+            # Prepare every reachable C1 search geometry before API readiness.
+            # Otherwise a healthy stream pauses for compilation at each new
+            # bucket, and already-warmed buckets remain untested at startup.
+            for start, search in decode_search_warmups(self.model.program.length,
+                                                       runtime_indexer=getattr(self.model.program, "runtime_indexer",
+                                                                               False)):
+                if start == 0:
+                    continue
+                logger.info("V4.1 PP%d preparing C1 search bucket %d", self.model.pp_rank, search)
+                for _ in range(4):
+                    self._dummy_run(1, native=True, start_position=start)
+                self.model.program.replay_owner.require_ready(1, search=search)
         if self.use_dspark and isinstance(self.state, PagedStageState):
             # Exercise the first real indexer/head exchange before advertising
             # API readiness. This is one boundary warmup, not a length sweep.
@@ -1855,6 +2018,8 @@ class V41ModelRunner:
         if isinstance(getattr(self, "batch_result", None), AsyncModelRunnerOutput):
             self.batch_result.get_output()
         self.pp.drain()
+        if self.prefix_checkpoints is not None:
+            self.prefix_checkpoints.close()
         if self.verify_ring is not None:
             self.verify_ring.close()
         if self.verify_timing:

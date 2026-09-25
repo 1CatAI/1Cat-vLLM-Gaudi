@@ -19,6 +19,52 @@ from vllm_gaudi.v1.worker.deepseek_v41_runner import (
 from vllm_gaudi.ops.deepseek_v41_math import NATIVE_KV_CODEC_TOKENS
 
 
+def test_decode_warmup_covers_all_context_buckets_without_scanning_tokens():
+    for maximum in (128, 512, 513, 8192, 10000, 1 << 20):
+        warmups = list(decode_search_warmups(maximum))
+        assert warmups[0] == (0, min(512, maximum))
+        assert warmups[-1][1] == maximum
+        assert len(warmups) <= 12
+        for index, (position, search) in enumerate(warmups):
+            assert target_search_length(position, 1, maximum) == search
+            if index:
+                assert position == warmups[index - 1][1]
+                assert search > position
+
+
+def test_native_readiness_requires_every_bucket_and_clears_warmup_state(monkeypatch):
+    from vllm_gaudi.v1.worker import deepseek_v41_runner as module
+
+    monkeypatch.setenv("VLLM_HPU_DSV41_DSPARK", "0")
+    monkeypatch.setenv("VLLM_HPU_DSV41_VERIFY_TIMING", "0")
+    calls, validated = [], []
+
+    class State:
+
+        def clear(self):
+            calls.append("clear")
+
+    monkeypatch.setattr(module, "PagedStageState", State)
+    runner = object.__new__(module.V41ModelRunner)
+    runner.use_dspark = False
+    runner.request_batches = None
+    runner.state = State()
+    runner.graphed_buckets = set()
+    runner.active_request = "warmup"
+    owner = SimpleNamespace(require_ready=lambda count, search=512: validated.append((count, search)))
+    runner.model = SimpleNamespace(native=True, pp_rank=0, program=SimpleNamespace(length=10000, replay_owner=owner))
+    runner.pp = SimpleNamespace(group=SimpleNamespace(barrier=lambda: calls.append("barrier")))
+    runner._dummy_run = lambda count, native, start_position=0: calls.append((count, native, start_position))
+
+    runner.warmup_model()
+
+    assert validated == [(1, length) for length in (512, 1024, 2048, 4096, 8192, 10000)]
+    for position, _ in decode_search_warmups(10000):
+        assert calls.count((1, True, position)) == 4
+    assert calls[-2:] == ["barrier", "clear"]
+    assert runner.active_request is None
+
+
 def test_scheduler_transaction_uses_finite_exact_compute_buckets():
     tokens = list(range(8192))
     chunks = list(target_chunks(tokens))
@@ -61,7 +107,10 @@ def test_prefill_retires_completed_tail_packets_before_reuse(monkeypatch, count)
         events.append("retire")
 
     monkeypatch.setattr(torch.hpu, "synchronize", lambda: events.append("synchronize"))
-    request = SimpleNamespace(num_computed_tokens=0, tokens=list(range(count)), prompt=list(range(count)))
+    request = SimpleNamespace(num_computed_tokens=0,
+                              tokens=list(range(count)),
+                              prompt=list(range(count)),
+                              decode_start=count)
     runner = SimpleNamespace(
         round_timing_enabled=False,
         requests={"request": request},

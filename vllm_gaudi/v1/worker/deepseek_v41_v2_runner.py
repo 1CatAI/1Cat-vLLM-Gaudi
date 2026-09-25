@@ -3,6 +3,7 @@
 
 from dataclasses import dataclass, field
 import threading
+import time
 
 import torch
 
@@ -89,6 +90,10 @@ class V41V2ModelRunner(V41ModelRunner):
     def _continuation_authorized(record, scheduled):
         if scheduled is None or record.request_id in scheduled.finished_req_ids:
             return False
+        if getattr(scheduled, "auxiliary_prefix_operations", None) is not None:
+            return False
+        if record.request_id in (getattr(scheduled, "preempted_req_ids", None) or ()):
+            return False
         tokens = scheduled.num_scheduled_tokens
         proposed = getattr(scheduled, "scheduled_spec_decode_tokens", {}).get(record.request_id, ())
         return len(tokens) == 1 and tokens.get(record.request_id) == 1 and not proposed
@@ -98,9 +103,8 @@ class V41V2ModelRunner(V41ModelRunner):
                 and self._continuation_authorized(record, scheduled)):
             return False
         program = self.model.program
-        next_search = (runtime_search_length(record.start + 1, 1, program.length)
-                       if getattr(program, "runtime_indexer", False) else
-                       target_search_length(record.start + 1, 1, program.length))
+        next_search = (runtime_search_length(record.start + 1, 1, program.length) if getattr(
+            program, "runtime_indexer", False) else target_search_length(record.start + 1, 1, program.length))
         ready = self.model.decode_prefix_ready(next_search)
         if not ready:
             self.audit["v2_prefix_bucket_captures"] = self.audit.get("v2_prefix_bucket_captures", 0) + 1
@@ -151,9 +155,13 @@ class V41V2ModelRunner(V41ModelRunner):
 
     @torch.inference_mode()
     def execute_model(self, scheduled):
-        if scheduled.num_scheduled_tokens or scheduled.finished_req_ids:
+        if getattr(self, "trace_enabled", False):
+            self._step_trace_start = time.perf_counter_ns(), time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+        if (scheduled.num_scheduled_tokens or scheduled.finished_req_ids
+                or getattr(scheduled, "preempted_req_ids", None)):
             self._consume_completion(scheduled)
-        self._v2_async_step = len(scheduled.num_scheduled_tokens) == 1
+        self._v2_async_step = (len(scheduled.num_scheduled_tokens) == 1
+                               and getattr(scheduled, "auxiliary_prefix_operations", None) is None)
         try:
             output = super().execute_model(scheduled)
         finally:
@@ -177,16 +185,21 @@ class V41V2ModelRunner(V41ModelRunner):
         return result
 
     def _update(self, scheduled):
+        request_batches = getattr(self, "request_batches", None) is not None
         for new in scheduled.scheduled_new_reqs:
-            if new.num_computed_tokens:
+            operations = getattr(scheduled, "auxiliary_prefix_operations", None)
+            checkpoint = operations.restores.get(new.req_id) if operations is not None else None
+            cached_prefix = (request_batches and checkpoint is not None
+                             and checkpoint.num_tokens == new.num_computed_tokens)
+            if new.num_computed_tokens and not cached_prefix:
                 raise ValueError("V2 HPU request resumption requires full recomputation from position zero")
             if new.req_id in self.requests and new.req_id not in scheduled.finished_req_ids:
                 raise ValueError("V2 HPU cannot replace a live request without a finish event")
             prefill = getattr(new, "prefill_token_ids", None)
-            if prefill is not None and prefill != new.prompt_token_ids:
+            if prefill is not None and prefill != new.prompt_token_ids and not request_batches:
                 raise ValueError("V2 HPU replay of a generated prefix is not qualified")
         cached = scheduled.scheduled_cached_reqs
-        if cached.resumed_req_ids:
+        if cached.resumed_req_ids and not request_batches:
             raise ValueError("V2 HPU cached request resumption is not qualified")
         for index, req_id in enumerate(cached.req_ids):
             if cached.num_output_tokens[index] != len(self.requests[req_id].output):
@@ -197,7 +210,7 @@ class V41V2ModelRunner(V41ModelRunner):
         if not getattr(self, "_v2_async_step", True):
             return super()._sample_single()
         request, start, count, last_count, proposed, need_sample, selected = self.pending
-        if start < len(request.prompt) or not need_sample:
+        if start < request.decode_start or not need_sample:
             return super()._sample_single()
         if proposed or count != 1 or last_count != 1 or self._completion is not None:
             raise RuntimeError("V2 token relay requires one unmatched ordinary decode completion")

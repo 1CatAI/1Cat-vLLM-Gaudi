@@ -9,8 +9,8 @@ import torch
 
 
 def route_block_capacity(routes: int, experts: int, rows: int) -> int:
-    if routes <= 0 or experts <= 0 or rows not in (32, 64, 128, 512):
-        raise ValueError("Route blocks require positive dimensions and 32/64/128/512 rows")
+    if routes <= 0 or experts <= 0 or rows not in (4, 8, 16, 32, 64, 128, 512):
+        raise ValueError("Route blocks require positive dimensions and 4/8/16/32/64/128/512 rows")
     return min(routes, (routes + experts * (rows - 1)) // rows)
 
 

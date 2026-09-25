@@ -14,7 +14,8 @@ GlueCodeReturn DeepseekV41IndexKeysGaudi2::GetGcDefinitions(HabanaKernelParams* 
     const auto& pages=p->inputTensors[1].geometry;
     const auto& rows=p->inputTensors[2].geometry;
     if((params[0]!=1&&params[0]!=2)||cache.dims!=2||cache.maxSizes[0]!=68||cache.dataType!=DATA_U8||
-       pages.dims!=1||pages.dataType!=DATA_I32||rows.dims!=2||rows.dataType!=DATA_I32||
+       (pages.dims!=1&&pages.dims!=2)||pages.dataType!=DATA_I32||rows.dims!=2||rows.dataType!=DATA_I32||
+       (pages.dims==2&&pages.maxSizes[1]!=rows.maxSizes[1])||
        rows.maxSizes[0]<1||rows.maxSizes[0]>2048||rows.maxSizes[1]<1||rows.maxSizes[1]>128)
         return GLUE_INCOMPATIBLE_INPUT_SIZE;
     const auto& output=p->outputTensors[0].geometry;
@@ -27,15 +28,34 @@ GlueCodeReturn DeepseekV41IndexKeysGaudi2::GetGcDefinitions(HabanaKernelParams* 
     out->indexSpaceRank=rows.maxSizes[1]==1?1:2;
     out->indexSpaceGeometry[0]=rows.maxSizes[0];
     if(rows.maxSizes[1]>1)out->indexSpaceGeometry[1]=rows.maxSizes[1];
-    // Physical page indirection is runtime-valued.  Synapse 1.24 rejects the
-    // mixed affine/sparse mapping previously used here, so describe the true
-    // conservative dependency just like the decode scorer: every source can
-    // be addressed and every output row is produced by this node.
-    for(unsigned i=0;i<p->inputTensorNr;++i){
-        out->inputTensorAccessPattern[i].allRequired=true;
-        out->inputTensorAccessPattern[i].sparseAccess=true;
+    if(tiled_) {
+        // Indirect source addresses remain conservative. Logical row reads
+        // and decoded outputs are affine and can be sliced with the MME.
+        // allRequired sources intentionally do not also claim sparseAccess:
+        // that combination prevents mixed affine output inference in Synapse.
+        out->inputTensorAccessPattern[0].allRequired=true;
+        out->inputTensorAccessPattern[1].allRequired=true;
+        auto map=[](TensorAccessPattern& access,unsigned dim,unsigned axis,
+                    int coefficient,int first,int last) {
+            access.mapping[dim].indexSpaceDim=axis;
+            access.mapping[dim].a=coefficient;
+            access.mapping[dim].start_b=first;
+            access.mapping[dim].end_b=last;
+        };
+        const bool batched=rows.maxSizes[1]>1;
+        map(out->inputTensorAccessPattern[2],0,0,1,0,0);
+        map(out->inputTensorAccessPattern[2],1,batched?1:0,batched?1:0,0,0);
+        map(out->outputTensorAccessPattern[0],0,0,0,0,127);
+        map(out->outputTensorAccessPattern[0],1,0,1,0,0);
+        map(out->outputTensorAccessPattern[0],2,batched?1:0,batched?1:0,0,0);
+    } else {
+        // Preserve the original conservative mapping and binary entry.
+        for(unsigned i=0;i<p->inputTensorNr;++i){
+            out->inputTensorAccessPattern[i].allRequired=true;
+            out->inputTensorAccessPattern[i].sparseAccess=true;
+        }
+        out->outputTensorAccessPattern[0].allRequired=true;
     }
-    out->outputTensorAccessPattern[0].allRequired=true;
     out->kernel.paramsNr=1;std::memcpy(out->kernel.scalarParams,params,sizeof(int));
     const auto size=&_binary___deepseek_v41_index_keys_gaudi2_o_end-&_binary___deepseek_v41_index_keys_gaudi2_o_start;
     const auto capacity=out->kernel.elfSize;out->kernel.elfSize=size;
