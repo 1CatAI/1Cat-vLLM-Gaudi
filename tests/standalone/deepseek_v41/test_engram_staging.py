@@ -39,13 +39,19 @@ def test_staging_views_preserve_all_bytes_and_capacity(heads):
 @pytest.mark.parametrize("tp_size,tp_rank", [(2, 0), (2, 1), (4, 0), (4, 1), (4, 2), (4, 3)])
 @pytest.mark.parametrize("preparation", ["compat", "native", "packet", "direct"])
 @torch.inference_mode()
-def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, tp_size, tp_rank, preparation, capacity=6):
+def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path,
+                                                    tp_size,
+                                                    tp_rank,
+                                                    preparation,
+                                                    capacity=6,
+                                                    deferred=False):
     import habana_frameworks.torch.core  # noqa: F401
     native = host_native()
     HostRows, NativeC1Prepare = native.HostRows, native.NativeC1Prepare
     heads = 24 // tp_size
 
     host = EngramHost.__new__(EngramHost)
+    host.tensor_parallel_size = tp_size
     host.layout = EngramHashLayout.from_config({
         "engram_layer_ids": [1, 14],
         "engram_num_embeddings": [10000, 10000],
@@ -107,10 +113,13 @@ def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, tp_size, tp_rank, 
     try:
         for request in ("first", "second"):
             host.reset(request)
-            for step, count in enumerate((1, capacity, 1, 2, 1, capacity, 1, 1, 1)):
+            for step, count in enumerate((1, capacity, 1, 6 if deferred else 2, 1, capacity, 1, 1, 1)):
                 tokens = [(step + i) % 16 for i in range(count)]
                 with torch.hpu.stream(consumer):
-                    ticket = host.prepare(request, tokens, [i == 1 or step == 6 for i in range(count)])
+                    ticket = host.prepare(request,
+                                          tokens, [i == 1 or step == 6 for i in range(count)],
+                                          defer_wait=deferred and count == 16384)
+                    inputs = host.defer_prefill(ticket) if deferred and count == 16384 else ticket.buffers
                     assert ticket.packet == (preparation in ("packet", "direct") and count == 1)
                     if ticket.packet:
                         packet = host.c1_packets[ticket.slot]
@@ -121,7 +130,8 @@ def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, tp_size, tp_rank, 
                     assert torch.hpu.current_stream() == consumer
                     with pytest.raises(RuntimeError, match="pending"):
                         host.prepare(request, [1])
-                    for index, (layer, value) in enumerate(zip(host.layout.layer_ids, ticket.buffers)):
+                    for index, layer in enumerate(host.layout.layer_ids):
+                        value = inputs[index]
                         shard = host.shards[layer]
                         ids = ticket.batch.hash_ids[:, index, shard["head_start"]:shard["head_stop"]]
                         w, s = tables[layer]
@@ -146,3 +156,9 @@ def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, tp_size, tp_rank, 
 @torch.inference_mode()
 def test_16k_tp4_engram_staging_transition_and_request_reuse(tmp_path, tp_rank):
     test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, 4, tp_rank, "packet", capacity=16384)
+
+
+@pytest.mark.parametrize("tp_rank", [0, 3])
+@torch.inference_mode()
+def test_deferred_16k_ring_reuse_then_c1_and_c6(tmp_path, tp_rank):
+    test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, 4, tp_rank, "packet", capacity=16384, deferred=True)

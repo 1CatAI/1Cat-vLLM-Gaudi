@@ -173,32 +173,41 @@ def tp_full_prefill_index_selection(query,
                                     tp_rank,
                                     all_gather,
                                     visible_rows=None,
-                                    tensor_parallel_size=2):
+                                    tensor_parallel_size=2,
+                                    *,
+                                    query_partitioned=False):
     """Partition replicated index work; restore row order before consumption.
 
     Query heads have already been gathered. Each rank evaluates complete head
     reductions for its query rows, then exchanges only final integer choices.
     Padding is local to selection and never reaches a KV or history writer.
     """
-    tokens = query.shape[0]
+    tokens = positions.numel()
     if (not 0 <= tp_rank < tensor_parallel_size or tokens < 1 or positions.shape != (tokens, )
             or not 512 <= source_rows <= SHARED_INDEX_MAX_ROWS):
         raise ValueError("Index query partition requires TP2/TP4 and a complete query interval")
     local_tokens = (tokens + tensor_parallel_size - 1) // tensor_parallel_size
-    start, stop = tp_rank * local_tokens, min((tp_rank + 1) * local_tokens, tokens)
-    local_q = query[start:stop].clone()
-    local_w = weights[start:stop].clone()
+    start, stop = min(tp_rank * local_tokens, tokens), min((tp_rank + 1) * local_tokens, tokens)
+    expected_rows = local_tokens if query_partitioned else tokens
+    if (query.shape != (expected_rows, 32, 128) or weights.shape != (expected_rows, 32)
+            or (query_partitioned and tensor_parallel_size != 4)):
+        raise ValueError("Full prefill index query partition shape changed")
+    local_q = query if query_partitioned else query[start:stop].clone()
+    local_w = weights if query_partitioned else weights[start:stop].clone()
     local_p = positions[start:stop].clone()
     padding = local_tokens - (stop - start)
     if padding:
-        local_q = torch.nn.functional.pad(local_q, (0, 0, 0, 0, 0, padding))
-        local_w = torch.nn.functional.pad(local_w, (0, 0, 0, padding))
+        if not query_partitioned:
+            local_q = torch.nn.functional.pad(local_q, (0, 0, 0, 0, 0, padding))
+            local_w = torch.nn.functional.pad(local_w, (0, 0, 0, padding))
         local_p = torch.nn.functional.pad(local_p, (0, padding), value=-1)
     selected, blocks = full_prefill_index_selection(local_q, local_w, packed, table, local_p, ratio, source_rows,
                                                     publish_candidates, visible_rows, tensor_parallel_size)
     packet = torch.cat((selected, blocks), -1) if publish_candidates else selected
     _record_query_partition("full", tokens, local_tokens, packet)
-    gathered = all_gather(packet.contiguous(), 0)[:tokens]
+    from vllm_gaudi.ops.deepseek_v41_prefill_event_trace import span
+    with span("index_selection_exchange", rows=tokens):
+        gathered = all_gather(packet.contiguous(), 0)[:tokens]
     return gathered[:, :512], gathered[:, 512:] if publish_candidates else None
 
 
@@ -246,24 +255,37 @@ def tp_prefill_reindex_selection(query,
                                  all_gather,
                                  native_gather=True,
                                  native_scores=True,
-                                 tensor_parallel_size=2):
+                                 tensor_parallel_size=2,
+                                 *,
+                                 query_partitioned=False):
     """Split independent candidate-slot selection and gather only final IDs."""
-    tokens = query.shape[0]
-    if not 0 <= tp_rank < tensor_parallel_size or tokens < 1 or blocks.shape[0] != tokens:
+    tokens = positions.numel()
+    if (not 0 <= tp_rank < tensor_parallel_size or tokens < 1 or positions.shape != (tokens, )
+            or blocks.shape[0] != tokens):
         raise ValueError("Reindex query partition requires TP2/TP4 and matching candidate rows")
     local_tokens = (tokens + tensor_parallel_size - 1) // tensor_parallel_size
-    start, stop = tp_rank * local_tokens, min((tp_rank + 1) * local_tokens, tokens)
-    local_q, local_w, local_p, local_b = (value[start:stop].clone() for value in (query, weights, positions, blocks))
+    start, stop = min(tp_rank * local_tokens, tokens), min((tp_rank + 1) * local_tokens, tokens)
+    expected_rows = local_tokens if query_partitioned else tokens
+    if (query.shape != (expected_rows, 32, 128) or weights.shape != (expected_rows, 32)
+            or (query_partitioned and tensor_parallel_size != 4)):
+        raise ValueError("Reindex query partition shape changed")
+    local_q = query if query_partitioned else query[start:stop].clone()
+    local_w = weights if query_partitioned else weights[start:stop].clone()
+    local_p, local_b = (value[start:stop].clone() for value in (positions, blocks))
     padding = local_tokens - (stop - start)
     if padding:
-        local_q = torch.nn.functional.pad(local_q, (0, 0, 0, 0, 0, padding))
-        local_w = torch.nn.functional.pad(local_w, (0, 0, 0, padding))
+        if not query_partitioned:
+            local_q = torch.nn.functional.pad(local_q, (0, 0, 0, 0, 0, padding))
+            local_w = torch.nn.functional.pad(local_w, (0, 0, 0, padding))
         local_p = torch.nn.functional.pad(local_p, (0, padding), value=-1)
         local_b = torch.nn.functional.pad(local_b, (0, 0, 0, padding), value=-1)
-    selected = prefill_reindex_selection(local_q, local_w, packed, table, local_p, local_b, ratio, source_rows,
-                                         native_gather, native_scores, tensor_parallel_size)
+    from vllm_gaudi.ops.deepseek_v41_prefill_event_trace import span
+    with span("index_reindex_local", rows=local_tokens):
+        selected = prefill_reindex_selection(local_q, local_w, packed, table, local_p, local_b, ratio, source_rows,
+                                             native_gather, native_scores, tensor_parallel_size)
     _record_query_partition("reindex", tokens, local_tokens, selected)
-    return all_gather(selected.contiguous(), 0)[:tokens]
+    with span("index_selection_exchange", rows=tokens):
+        return all_gather(selected.contiguous(), 0)[:tokens]
 
 
 def decode_shared_index_keys(packed, table, ratio, source_rows):

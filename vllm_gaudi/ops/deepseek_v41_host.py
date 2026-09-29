@@ -102,6 +102,29 @@ class EngramTransfer:
     packet: bool = False
 
 
+class EngramLayerInputs:
+    """Resolve each prompt DMA at its consumer while retaining one ticket."""
+
+    def __init__(self, host, ticket):
+        self.host, self.ticket, self.completed = host, ticket, 0
+
+    def __len__(self):
+        return len(self.ticket.buffers)
+
+    def __getitem__(self, index):
+        host, ticket = self.host, self.ticket
+        if host.pending is not ticket or ticket.generation != host.generation:
+            raise RuntimeError("Stale deferred Engram input")
+        if not isinstance(index, int) or not 0 <= index < len(self) or index > self.completed:
+            raise RuntimeError("Deferred Engram consumers must preserve layer order")
+        if index == self.completed:
+            host._wait_layer(ticket, index)
+            self.completed += 1
+            if self.completed == len(self):
+                host.ready_ticket = ticket
+        return ticket.buffers[index]
+
+
 class _C1Packet:
     """One ownership event covers upload and both Engram consumers."""
 
@@ -283,6 +306,7 @@ class EngramHost:
         self.directory, self.tp_rank = Path(directory), tp_rank
         manifest = json.loads((self.directory / "manifest.json").read_text())
         self.tensor_parallel_size = manifest.get("tensor_parallel_size", 2)
+        self.prefill_hash_local = self.tensor_parallel_size == 4
         if self.tensor_parallel_size not in (2, 4):
             raise RuntimeError("Prepared Engram manifest has an unsupported tensor parallel size")
         if not 0 <= tp_rank < self.tensor_parallel_size:
@@ -313,6 +337,7 @@ class EngramHost:
         self.stream = torch.hpu.Stream()
         self.generation, self.pending, self.closed = 0, None, False
         self.ready_ticket = None
+        self._deferred_input = None
         self.max_tokens, self.ring_size = max_tokens, ring_size
         self.audit = {"gathers": 0, "major_faults": 0, "dma_bytes": 0, "generations": 0}
         self.profile_records = None
@@ -538,7 +563,13 @@ class EngramHost:
             if not defer_wait:
                 self.wait(ticket)
             return ticket
-        batch = self.history.prepare(request_id, token_ids, image_mask)
+        head_range = None
+        if count == 16384 and getattr(self, "prefill_hash_local", False):
+            bounds = {(item["head_start"], item["head_stop"]) for item in self.shards.values()}
+            if self.tensor_parallel_size != 4 or len(bounds) != 1:
+                raise RuntimeError("Local prompt hashing requires matching TP4 head ownership")
+            head_range = bounds.pop()
+        batch = self.history.prepare(request_id, token_ids, image_mask, head_range=head_range)
         self.generation += 1
         ring = (self.generation - 1) % self.ring_size
         if getattr(self, "batches", None) is not None:
@@ -549,6 +580,7 @@ class EngramHost:
         ticket = EngramTransfer(self.generation, ring, batch, buffers)
         self.pending = ticket
         self.ready_ticket = None
+        self._deferred_input = None
         self._submit(ticket, 0)
         if envs.VLLM_HPU_DSV41_FUSED_STAGE_IO:
             for index in range(1, len(self.layout.layer_ids)):
@@ -598,14 +630,67 @@ class EngramHost:
         ticket = EngramTransfer(self.generation, ring, batch, tuple(buffers), packet is not None)
         self.pending = ticket
         self.ready_ticket = None
+        self._deferred_input = None
         return ticket
 
     def _submit(self, ticket, index):
         layer = self.layout.layer_ids[index]
         slot, shard = self.slots[layer][ticket.slot], self.shards[layer]
         slot.reuse()
-        ids = np.ascontiguousarray(ticket.batch.hash_ids[:, index, shard["head_start"]:shard["head_stop"]])
+        first, last = (shard[key] - ticket.batch.head_start for key in ("head_start", "head_stop"))
+        if not 0 <= first < last <= ticket.batch.hash_ids.shape[-1]:
+            raise RuntimeError("Engram hash batch does not contain this rank's complete heads")
+        ids = np.ascontiguousarray(ticket.batch.hash_ids[:, index, first:last])
         slot.generation = slot.gather.submit(self.tables[layer], ids)
+
+    def defer_prefill(self, ticket):
+        """Keep host lookups asynchronous until the two full-prompt consumers."""
+        if (self.pending is not ticket or ticket.generation != self.generation or self.ready_ticket is ticket
+                or getattr(self, "_deferred_input", None) is not None):
+            raise RuntimeError("Stale or already bound deferred Engram preparation")
+        if (self.tensor_parallel_size != 4 or ticket.packet or ticket.batch.hash_ids.shape[0] != 16384
+                or getattr(self, "batches", None) is not None):
+            raise ValueError("Deferred Engram requires ordinary TP4 full16K staging")
+        self._deferred_input = EngramLayerInputs(self, ticket)
+        return self._deferred_input
+
+    def _wait_layer(self, ticket, index):
+        count, ring = ticket.batch.hash_ids.shape[0], ticket.slot
+        layer = self.layout.layer_ids[index]
+        batch_owner = self.batches[ring] if getattr(self, "batches", None) is not None else None
+        slot = self.slots[layer][ring]
+        slot.gather.wait(slot.generation)
+        if not slot.direct and index + 1 < len(self.layout.layer_ids):
+            self._submit(ticket, index + 1)
+        heads = slot.host.shape[1]
+        rows, width = count * heads, self.layout.head_dim
+        if not slot.direct:
+            slot.host[:count, :, :width].copy_(slot.weight_view[:rows].reshape(count, heads, width))
+            slot.host[:count, :, width:].copy_(slot.scale_view[:rows].reshape(count, heads, width // 32))
+        self.audit["major_faults"] += slot.gather.major_faults
+        self.audit["gathers"] += 1
+        if self.profile_records is not None:
+            generation, started, finished, row_count, tid = slot.gather.timing
+            if generation != slot.generation or finished < started or len(self.profile_records) >= 65536:
+                raise RuntimeError("Invalid or overflowing Engram profiling record")
+            self.profile_records.append({
+                "generation": self.generation,
+                "slot_generation": generation,
+                "layer": layer,
+                "ring": ring,
+                "start_unix_ns": started,
+                "end_unix_ns": finished,
+                "rows": row_count,
+                "worker_tid": tid,
+                "major_faults": slot.gather.major_faults
+            })
+        slot.gather.release(slot.generation)
+        if batch_owner is None:
+            with torch.hpu.stream(self.stream):
+                slot.device[:count].copy_(slot.host[:count], non_blocking=True)
+                slot.dma_done.record(self.stream)
+            torch.hpu.current_stream().wait_event(slot.dma_done)
+            self.audit["dma_bytes"] += count * heads * (width + width // 32)
 
     def wait(self, ticket):
         """Bind both DMA completions after independent embedding submission.
@@ -618,44 +703,12 @@ class EngramHost:
         if (ticket.packet or (ticket.batch.hash_ids.shape[0] == 1 and self.native_c1 is not None)):
             self.ready_ticket = ticket
             return ticket.buffers
-        count, ring = ticket.batch.hash_ids.shape[0], ticket.slot
+        if getattr(self, "_deferred_input", None) is not None:
+            raise RuntimeError("Deferred Engram preparation already has a consumer owner")
+        ring = ticket.slot
         batch_owner = self.batches[ring] if getattr(self, "batches", None) is not None else None
-        # Submission of layer 14 follows completion of layer 1's host lookup;
-        # its worker then runs independently of the first layer's DMA.
-        for index, layer in enumerate(self.layout.layer_ids):
-            slot = self.slots[layer][ring]
-            slot.gather.wait(slot.generation)
-            if not slot.direct and index + 1 < len(self.layout.layer_ids):
-                self._submit(ticket, index + 1)
-            heads = slot.host.shape[1]
-            rows, width = count * heads, self.layout.head_dim
-            if not slot.direct:
-                slot.host[:count, :, :width].copy_(slot.weight_view[:rows].reshape(count, heads, width))
-                slot.host[:count, :, width:].copy_(slot.scale_view[:rows].reshape(count, heads, width // 32))
-            self.audit["major_faults"] += slot.gather.major_faults
-            self.audit["gathers"] += 1
-            if self.profile_records is not None:
-                generation, started, finished, row_count, tid = slot.gather.timing
-                if generation != slot.generation or finished < started or len(self.profile_records) >= 65536:
-                    raise RuntimeError("Invalid or overflowing Engram profiling record")
-                self.profile_records.append({
-                    "generation": self.generation,
-                    "slot_generation": generation,
-                    "layer": layer,
-                    "ring": ring,
-                    "start_unix_ns": started,
-                    "end_unix_ns": finished,
-                    "rows": row_count,
-                    "worker_tid": tid,
-                    "major_faults": slot.gather.major_faults
-                })
-            slot.gather.release(slot.generation)
-            if batch_owner is None:
-                with torch.hpu.stream(self.stream):
-                    slot.device[:count].copy_(slot.host[:count], non_blocking=True)
-                    slot.dma_done.record(self.stream)
-                torch.hpu.current_stream().wait_event(slot.dma_done)
-                self.audit["dma_bytes"] += count * heads * (width + width // 32)
+        for index in range(len(self.layout.layer_ids)):
+            self._wait_layer(ticket, index)
         if batch_owner is not None:
             batch_owner.stage(self.stream, ticket.generation)
             # Fixed C6 capacity also includes the unused tail for C1-C5.
@@ -704,6 +757,7 @@ class EngramHost:
             self.native_c1.complete(ticket.batch.request_id, ticket.batch.generation, ticket.generation)
         self.pending = None
         self.ready_ticket = None
+        self._deferred_input = None
 
     def complete_device(self, ticket, committed_inputs):
         """Complete a device verify transaction after one scalar handoff.
@@ -729,6 +783,7 @@ class EngramHost:
             self.history.discard(self.pending.batch)
             self.pending = None
         self.ready_ticket = None
+        self._deferred_input = None
         self.native_c1 = None
         if self.device_c1 is not None:
             self.device_c1.close()

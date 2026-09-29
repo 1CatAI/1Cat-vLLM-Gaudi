@@ -434,7 +434,8 @@ class PreparedMoE(nn.Module):
                 fp8_decode=False,
                 decode=False,
                 prequant=None,
-                prefill_router_tokens=0):
+                prefill_router_tokens=0,
+                prefill_sequence=False):
         if decode and prefill_router_tokens:
             raise ValueError("Decoder halo router padding is confined to prefill")
         w = self.weights
@@ -540,6 +541,11 @@ class PreparedMoE(nn.Module):
                        and value.shape[0] > 6 else (output.float() + shared_out.float()).to(value.dtype))
         else:
             partial = output
+        if prefill_sequence:
+            if decode or ready_outputs or self.tensor_parallel_size != 4:
+                raise ValueError("Token-owned MoE output is restricted to TP4 prefill")
+            from vllm_gaudi.ops.deepseek_v41_prefill_sequence_state import reduce_owned_tokens
+            return reduce_owned_tokens(partial, self.reduce)
         return self.reduce(partial, ready_outputs=ready_outputs) if ready_outputs else self.reduce(partial)
 
 
@@ -563,6 +569,9 @@ class PreparedDecoderLayer(nn.Module):
         self.collect_target_state = collect_target_state and layer in (37, 38, 39)
         self.eps, self.hc_eps, self.iterations = config["rms_norm_eps"], config["hc_eps"], config["hc_sinkhorn_iters"]
         self.mhc_control_rrms = gaudi_envs.VLLM_HPU_DSV41_MHC_CONTROL_RRMS
+        # Full prompt state already owns token rows. Reuse that ownership for
+        # replicated Q/KV inputs on layers without a full hidden-state consumer.
+        self.sequence_qkv_input = tensor_parallel_size == 4
         self.register_buffer("hc_attn_fn_packed", None, False)
         self.register_buffer("hc_ffn_fn_packed", None, False)
         if shared.length > 512:
@@ -624,7 +633,8 @@ class PreparedDecoderLayer(nn.Module):
                 *,
                 fp8_decode=False,
                 decode=False,
-                prefill_router_tokens=0):
+                prefill_router_tokens=0,
+                prefill_sequence=False):
         w = self.weights
         prefill = (gaudi_envs.VLLM_HPU_DSV41_PREFILL_REGIONS and not decode and not self.draft and residual.shape[0] > 6
                    and hasattr(self.attention, "_prefill_attention"))
@@ -633,18 +643,50 @@ class PreparedDecoderLayer(nn.Module):
         # the eager broadcast otherwise materializes [T,4,4,5120] FP32.
         fused_post = prefill or (self.moe.tensor_parallel_size == 4 and residual.shape[0] > 6)
         post_update = _prefill_hc_post if fused_post else hc_post
+        if prefill_sequence:
+            if not prefill or self.moe.tensor_parallel_size != 4 or residual.shape[0] * 4 != positions.numel():
+                raise ValueError("TP4 prompt layer requires matching token-owned residuals and full positions")
+            from vllm.distributed import get_tp_group
+            from vllm_gaudi.ops.deepseek_v41_prefill_sequence_state import (exchange_engram_tokens, gather_tokens,
+                                                                            sequence_hc_input, token_owner)
+            group = get_tp_group()
+            owned = token_owner(positions.numel(), group.rank_in_group)
         if hasattr(w, "engram"):
             if engram_rows is None:
                 raise RuntimeError("Engram layer requires its completed host gather and DMA generation")
-            local_rows = engram_rows if engram_rows.dtype == torch.bfloat16 else unpack_swa(engram_rows, 256)
-            rows = self.all_gather(local_rows, dim=1)
+            if prefill_sequence:
+                packet = exchange_engram_tokens(engram_rows, group=group.device_group)
+                rows = packet if packet.dtype == torch.bfloat16 else unpack_swa(packet, 256)
+                local_rows = None
+            else:
+                local_rows = engram_rows if engram_rows.dtype == torch.bfloat16 else unpack_swa(engram_rows, 256)
+                rows = self.all_gather(local_rows, dim=1)
             kv = linear(rows.flatten(1), w.engram.wkv)
             update = prefill_engram_update if prefill else engram_update
-            residual = update(residual, kv, w.engram.q_weight, w.engram.k_weight, ~image_mask, self.eps)
+            active_mask = ~image_mask[owned] if prefill_sequence else ~image_mask
+            residual = update(residual, kv, w.engram.q_weight, w.engram.k_weight, active_mask, self.eps)
             del kv, rows, local_rows
         target_state = residual.mean(1) if self.collect_target_state else None
+        if target_state is not None and prefill_sequence:
+            target_state = gather_tokens(target_state.contiguous(), group=group.device_group)
         compiled_input = prefill and gaudi_envs.VLLM_HPU_DSV41_PREFILL_MHC_INPUT
-        if compiled_input:
+        requires_full_input = self.attention.owns_kv or self.attention.owns_index if prefill_sequence else False
+        sequence_qkv = (prefill_sequence and getattr(self, "sequence_qkv_input", False) and not requires_full_input
+                        and self.attention._fused_qkv_weight is not None)
+        if prefill_sequence:
+            new_pre, post, comb, value = sequence_hc_input(residual,
+                                                           pre_mix,
+                                                           w.hc_attn_fn,
+                                                           w.hc_attn_scale,
+                                                           w.hc_attn_base,
+                                                           w.attn_norm.weight,
+                                                           self.eps,
+                                                           self.hc_eps,
+                                                           self.iterations,
+                                                           self.hc_attn_fn_packed,
+                                                           group=group.device_group,
+                                                           gather=requires_full_input or not sequence_qkv)
+        elif compiled_input:
             collapsed, new_pre, post, comb, value = prefill_hc_input(residual, pre_mix, w.hc_attn_fn, w.hc_attn_scale,
                                                                      w.hc_attn_base, w.attn_norm.weight, self.eps,
                                                                      self.hc_eps, self.iterations,
@@ -663,14 +705,32 @@ class PreparedDecoderLayer(nn.Module):
                                                 prefill=fused_post)
             value = rms_norm(value, w.attn_norm.weight, self.eps)
         schedule = (gaudi_envs.VLLM_HPU_DSV41_MHC_SCHEDULE and not self.draft and 1 <= value.shape[0] <= 6)
-        if schedule:
+        if prefill_sequence:
+            value = self.attention(value,
+                                   positions,
+                                   decode=False,
+                                   prefill_sequence=True,
+                                   prefill_qkv_sequence=sequence_qkv)
+        elif schedule:
             value = self.attention(value, positions, ready_outputs=(post, comb), decode=decode)
         else:
             value = (self.attention.draft(value, positions)
                      if self.draft else self.attention(value, positions, decode=decode))
         residual = post_update(value, residual, post, comb)
         del value, post, comb
-        if compiled_input:
+        if prefill_sequence:
+            pre_mix, post, comb, value = sequence_hc_input(residual,
+                                                           new_pre,
+                                                           w.hc_ffn_fn,
+                                                           w.hc_ffn_scale,
+                                                           w.hc_ffn_base,
+                                                           w.ffn_norm.weight,
+                                                           self.eps,
+                                                           self.hc_eps,
+                                                           self.iterations,
+                                                           self.hc_ffn_fn_packed,
+                                                           group=group.device_group)
+        elif compiled_input:
             collapsed, pre_mix, post, comb, value = prefill_hc_input(residual, new_pre, w.hc_ffn_fn, w.hc_ffn_scale,
                                                                      w.hc_ffn_base, w.ffn_norm.weight, self.eps,
                                                                      self.hc_eps, self.iterations,
@@ -708,7 +768,8 @@ class PreparedDecoderLayer(nn.Module):
                              ready_outputs=(post, comb) if schedule else (),
                              fp8_decode=fp8_decode,
                              decode=decode,
-                             prefill_router_tokens=prefill_router_tokens)
+                             prefill_router_tokens=prefill_router_tokens,
+                             prefill_sequence=prefill_sequence)
         return post_update(value, residual, post, comb), pre_mix, target_state
 
 
@@ -1063,6 +1124,15 @@ class PreparedStage(nn.Module):
             residual, pre_mix = residual.take()
         retire = (torch.hpu.Event() if getattr(self, "tensor_parallel_size", 2) == 4 and residual.device.type == "hpu"
                   and residual.shape[0] > 8192 else None)
+        from vllm_gaudi.ops.deepseek_v41_prefill_sequence_state import (can_sequence_prefill_state, gather_tokens,
+                                                                        retire_prefill_layer, token_owner)
+        sequence_state = can_sequence_prefill_state(self, positions.numel())
+        layer_options = {"prefill_sequence": True} if sequence_state else {}
+        if sequence_state:
+            from vllm.distributed import get_tp_group
+            group = get_tp_group()
+            owned = token_owner(positions.numel(), group.rank_in_group)
+            residual, pre_mix = residual[owned].clone(), pre_mix[owned].clone()
         workspace = getattr(self.shared, "prefill_main_workspace", None)
         if workspace is not None and positions.numel() > 6:
             self.shared.prefill_kv_generation += 1
@@ -1071,16 +1141,13 @@ class PreparedStage(nn.Module):
         target_states = []
         for layer in self.layers:
             rows = engram_rows[0 if layer.layer == 1 else 1] if layer.layer in (1, 14) else None
-            residual, pre_mix, target = layer(residual, pre_mix, positions, image_mask, rows)
+            residual, pre_mix, target = layer(residual, pre_mix, positions, image_mask, rows, **layer_options)
             if target is not None:
                 target_states.append(target)
-            if retire is not None:
-                # Keep the complete large-M layer, but retire its queued
-                # temporaries before admitting the next layer's workspace.
-                # A stream event covers the actual downstream mHC consumer;
-                # it does not synchronize unrelated device work.
-                retire.record()
-                retire.synchronize()
+            retire_prefill_layer(retire)
+        if sequence_state:
+            residual = gather_tokens(residual, group=group.device_group)
+            pre_mix = gather_tokens(pre_mix.contiguous(), group=group.device_group)
         if not self.is_last_stage:
             return residual, pre_mix, None
         value = final_collapse_rms_norm(residual, pre_mix, self.weights.norm.weight,
@@ -1107,6 +1174,16 @@ class PreparedStage(nn.Module):
         if isinstance(residual, PrefillInput):
             residual, pre_mix = residual.take()
         retire = torch.hpu.Event() if tp4 and residual.device.type == "hpu" and positions.numel() > 8192 else None
+        from vllm_gaudi.ops.deepseek_v41_prefill_sequence_state import (can_sequence_prefill_state, gather_tokens,
+                                                                        replicate_owned_tail, retire_prefill_layer,
+                                                                        token_owner)
+        sequence_state = can_sequence_prefill_state(self, positions.numel())
+        layer_options = {"prefill_sequence": True} if sequence_state else {}
+        if sequence_state:
+            from vllm.distributed import get_tp_group
+            group = get_tp_group()
+            owned = token_owner(positions.numel(), group.rank_in_group)
+            residual, pre_mix = residual[owned].clone(), pre_mix[owned].clone()
         workspace = getattr(self.shared, "prefill_main_workspace", None)
         if workspace is not None:
             self.shared.prefill_kv_generation += 1
@@ -1117,17 +1194,18 @@ class PreparedStage(nn.Module):
             layer_id = getattr(layer, "layer", -1)
             if layer_id in (1, 14):
                 rows = engram_rows[0 if layer_id == 1 else 1] if engram_rows else None
-                residual, pre_mix, target = layer(residual, pre_mix, positions, image_mask, rows)
+                residual, pre_mix, target = layer(residual, pre_mix, positions, image_mask, rows, **layer_options)
             else:
-                residual, pre_mix, target = layer(residual, pre_mix, positions, image_mask)
+                residual, pre_mix, target = layer(residual, pre_mix, positions, image_mask, **layer_options)
             if target is not None:
                 raise RuntimeError("Decoder halo cannot suppress DSpark target-state rows")
-            if retire is not None:
-                retire.record()
-                retire.synchronize()
+            retire_prefill_layer(retire)
         if mode == "prefix_only":
             # The runner neither samples nor requests logits for this prompt
             # chunk. Return a defined tensor for its existing stage contract.
+            if sequence_state:
+                return (gather_tokens(residual[:, 0, :].contiguous(), group=group.device_group),
+                        gather_tokens(pre_mix.contiguous(), group=group.device_group), None)
             return residual[:, 0, :].contiguous(), pre_mix, None
 
         from vllm_gaudi.ops.deepseek_v41_decoder_halo import decoder_halo_rows
@@ -1144,7 +1222,15 @@ class PreparedStage(nn.Module):
             if selection.shape[0] < positions.numel():
                 raise RuntimeError("Decoder halo has no complete layer-20 selection rows")
             selection[:retained].copy_(selection[cut:cut + retained].clone())
-            residual, pre_mix, positions, image_mask = (v[cut:] for v in (residual, pre_mix, positions, image_mask))
+            if sequence_state:
+                residual = replicate_owned_tail(residual, retained, group=group.device_group)
+                pre_mix = replicate_owned_tail(pre_mix, retained, group=group.device_group)
+                positions, image_mask = positions[cut:], image_mask[cut:]
+            else:
+                residual, pre_mix, positions, image_mask = (v[cut:] for v in (residual, pre_mix, positions, image_mask))
+        elif sequence_state:
+            residual = gather_tokens(residual, group=group.device_group)
+            pre_mix = gather_tokens(pre_mix.contiguous(), group=group.device_group)
         for layer in self.layers[source_index + 1:]:
             if tp4 and cut:
                 residual, pre_mix, target = layer(residual,

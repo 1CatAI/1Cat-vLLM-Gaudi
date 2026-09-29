@@ -19,7 +19,7 @@ _completed = 0
 
 def begin(request_id, generation, tokens, pp_rank, tp_rank):
     global _active
-    if not os.environ.get("VLLM_HPU_DSV41_PREFILL_EVENT_TRACE") or tokens < 8192:
+    if os.environ.get("VLLM_HPU_DSV41_PREFILL_EVENT_TRACE", "0") in ("", "0") or tokens < 8192:
         return False
     prefixes = tuple(prefix.strip()
                      for prefix in os.environ.get("VLLM_HPU_DSV41_PREFILL_EVENT_TRACE_REQUEST_PREFIX", "").split(",")
@@ -40,6 +40,7 @@ def begin(request_id, generation, tokens, pp_rank, tp_rank):
                    tokens=tokens,
                    pp_rank=pp_rank,
                    tp_rank=tp_rank,
+                   host_only=os.environ.get("VLLM_HPU_DSV41_PREFILL_HOST_ONLY") == "1",
                    anchor=anchor,
                    anchor_host_before_ns=anchor_host_before,
                    anchor_host_after_ns=anchor_host_after,
@@ -58,6 +59,23 @@ def span(name, layer=None, rows=None):
     trace = _active
     if trace is None or (trace["labels"] and name not in trace["labels"]):
         yield
+        return
+    if trace.get("host_only"):
+        item = dict(name=name,
+                    layer=layer,
+                    rows=rows,
+                    start=None,
+                    end=None,
+                    host_start_ns=time.perf_counter_ns(),
+                    thread_cpu_start_ns=time.thread_time_ns(),
+                    process_cpu_start_ns=time.process_time_ns())
+        trace["spans"].append(item)
+        try:
+            yield
+        finally:
+            item.update(host_end_ns=time.perf_counter_ns(),
+                        thread_cpu_end_ns=time.thread_time_ns(),
+                        process_cpu_end_ns=time.process_time_ns())
         return
     start = torch.hpu.Event(enable_timing=True)
     end = torch.hpu.Event(enable_timing=True)
@@ -89,6 +107,9 @@ def finish():
                                "CLOCK_MONOTONIC. Cross-rank device clocks are not assumed synchronized.")
     trace["scope"] = ("Diagnostic current-stream Prefill spans; not hardware kernels or a "
                       "non-profiled throughput qualification")
+    if trace.get("host_only"):
+        trace["scope"] = ("Host-only scopes with main-thread/process CPU clocks; device events bound only the "
+                          "complete capture. Host waits are not hardware-kernel or bandwidth measurements.")
     # Read counters after the timed enclosure; ordinary requests never enter
     # this diagnostic. The worker resets the high-water mark after readiness.
     trace["memory"] = dict(allocated_bytes=torch.hpu.memory_allocated(),
@@ -98,13 +119,14 @@ def finish():
     for item in rows:
         start = item.pop("start")
         stop = item.pop("end")
-        item["device_start_ms"] = anchor.elapsed_time(start)
-        item["device_end_ms"] = anchor.elapsed_time(stop)
-        item["device_duration_ms"] = item["device_end_ms"] - item["device_start_ms"]
+        if start is not None:
+            item["device_start_ms"] = anchor.elapsed_time(start)
+            item["device_end_ms"] = anchor.elapsed_time(stop)
+            item["device_duration_ms"] = item["device_end_ms"] - item["device_start_ms"]
         trace["spans"].append(item)
     destination = os.environ["VLLM_HPU_DSV41_PREFILL_EVENT_TRACE"]
-    directory = (Path(os.environ["DSV41_RUN_EVIDENCE"]) /
-                 "prefill-event-trace" if destination == "1" else Path(destination))
+    kind = "prefill-host-trace" if trace.get("host_only") else "prefill-event-trace"
+    directory = Path(os.environ["DSV41_RUN_EVIDENCE"]) / kind if destination == "1" else Path(destination)
     path = (directory / f"prefill-events-pp{trace['pp_rank']}-tp{trace['tp_rank']}-g{trace['generation']}.json")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(trace, ensure_ascii=False, indent=2) + "\n")

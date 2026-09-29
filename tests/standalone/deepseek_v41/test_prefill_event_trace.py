@@ -54,3 +54,17 @@ def test_request_and_label_selection_preserves_quota(monkeypatch, tmp_path):
     assert len(events) == 6 and trace._completed == 1
     assert not trace.begin("chatcmpl-phase-2", 3, 16384, 0, 0)
     assert len(events) == 6
+
+
+def test_zero_disables_trace_even_for_a_matching_request(monkeypatch):
+    monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_EVENT_TRACE", "0")
+    monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_EVENT_TRACE_REQUEST_PREFIX", "chatcmpl-phase-")
+    monkeypatch.setattr(trace, "_active", None)
+    monkeypatch.setattr(trace, "_completed", 0)
+
+    def unexpected_event(**kwargs):
+        raise AssertionError("Disabled tracing must not allocate an HPU event")
+
+    monkeypatch.setattr(trace.torch.hpu, "Event", unexpected_event)
+    assert not trace.begin("chatcmpl-phase-disabled", 1, 16384, 0, 0)
+    assert trace._completed == 0 and trace._active is None

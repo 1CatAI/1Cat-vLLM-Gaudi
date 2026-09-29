@@ -161,6 +161,7 @@ class EngramHashBatch:
     compressed_ids: np.ndarray
     hash_ids: np.ndarray
     active_mask: np.ndarray
+    head_start: int = 0
 
 
 class EngramTokenHistory:
@@ -195,10 +196,14 @@ class EngramTokenHistory:
             self.pending = None
             self.generation += 1
 
-    def prepare(self, request_id: str, token_ids, image_mask=None) -> EngramHashBatch:
+    def prepare(self, request_id: str, token_ids, image_mask=None, *, head_range=None) -> EngramHashBatch:
         with self.lock:
             if request_id != self.request_id or self.pending is not None:
                 raise RuntimeError("Engram request changed without reset, or verification is still pending")
+            total_heads = (self.layout.max_ngram - 1) * self.layout.heads
+            head_start, head_stop = (0, total_heads) if head_range is None else head_range
+            if not 0 <= head_start < head_stop <= total_heads:
+                raise ValueError("Engram hash head range must be a nonempty checkpoint interval")
             tokens = np.asarray(token_ids, dtype=np.int64)
             if tokens.ndim != 1 or not len(tokens) or tokens.min() < 0 or tokens.max() >= len(self.token_map):
                 raise ValueError("Invalid Engram input token IDs")
@@ -211,24 +216,26 @@ class EngramTokenHistory:
             stream = np.concatenate((self.history, compressed))
             positions = np.arange(len(tokens), dtype=np.int64) + len(self.history)
             rolling = np.zeros((len(tokens), len(self.layout.layer_ids)), dtype=np.int64)
-            hashes = np.empty(
-                (len(tokens), len(self.layout.layer_ids), (self.layout.max_ngram - 1) * self.layout.heads),
-                dtype=np.int32)
+            hashes = np.empty((len(tokens), len(self.layout.layer_ids), head_stop - head_start), dtype=np.int32)
             blocked = np.zeros(len(tokens), dtype=bool)
-            for shift in range(self.layout.max_ngram):
+            for shift in range(1 + (head_stop + self.layout.heads - 1) // self.layout.heads):
                 lookback = positions - shift
                 source = stream[np.maximum(lookback, 0)]
                 blocked |= (lookback < 0) | (source == -1)
                 values = np.where(blocked, self.pad_id, source)
                 rolling ^= values[:, None] * self.layout.multipliers[None, :, shift]
                 if shift:
-                    first, last = (shift - 1) * self.layout.heads, shift * self.layout.heads
-                    hashes[:, :, first:last] = (rolling[:, :, None] % self.layout.primes[None, :, first:last] +
-                                                self.layout.offsets[None, :, first:last])
+                    first = max(head_start, (shift - 1) * self.layout.heads)
+                    last = min(head_stop, shift * self.layout.heads)
+                    if first < last:
+                        hashes[:, :, first - head_start:last -
+                               head_start] = (rolling[:, :, None] % self.layout.primes[None, :, first:last] +
+                                              self.layout.offsets[None, :, first:last])
             active = ~dead
             for array in (compressed, hashes, active):
                 array.setflags(write=False)
-            self.pending = EngramHashBatch(request_id, self.generation, self.position, compressed, hashes, active)
+            self.pending = EngramHashBatch(request_id, self.generation, self.position, compressed, hashes, active,
+                                           head_start)
             return self.pending
 
     def commit(self, batch: EngramHashBatch, committed_input_tokens: int):

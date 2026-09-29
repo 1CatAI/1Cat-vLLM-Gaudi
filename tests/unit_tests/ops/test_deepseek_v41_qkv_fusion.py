@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 from vllm_gaudi.ops.deepseek_v41_attention import CSA2Attention
 from vllm_gaudi.ops.deepseek_v41_math import quantize_activation
-from vllm_gaudi.ops.deepseek_v41_qkv import FusedCompressorInput, concatenate_static_weights
+from vllm_gaudi.ops.deepseek_v41_qkv import FusedCompressorInput, FusedQKVInput, concatenate_static_weights
 
 
 def _matrix(rows, cols, seed):
@@ -108,6 +108,39 @@ def test_fused_qkv_can_be_invalidated_for_reload():
     attention.invalidate_qkv_input_weight()
     assert attention._fused_qkv_weight is None
     assert "fused_wqa_wkv" not in attention._buffers
+
+
+def test_owned_qkv_gathers_projected_rows_before_query_kv_split(monkeypatch):
+    from vllm_gaudi.ops import deepseek_v41_prefill_sequence_state as sequence
+
+    class Projection(FusedQKVInput, nn.Module):
+
+        def __init__(self):
+            super().__init__()
+            self.weights = _weights()
+            self.qkv_fused_input = True
+            self._fused_qkv_weight = None
+            self._fused_qkv_quantized = False
+            self.linear = _linear
+
+    projection = Projection()
+    projection.prepare_qkv_input_weight()
+    value = _matrix(16, 32, 602)
+    expected = projection._project_qkv_input(value)
+    packed = torch.cat(expected, -1)
+    group = object()
+    for rank in range(4):
+        owned = slice(rank * 4, (rank + 1) * 4)
+
+        def gather(local, *, group, owned=owned, wanted_group=group):
+            assert group is wanted_group
+            assert local.shape == (4, 12) and local.is_contiguous()
+            torch.testing.assert_close(local, packed[owned], rtol=0, atol=0)
+            return packed.clone()
+
+        monkeypatch.setattr(sequence, "gather_tokens", gather)
+        actual = projection._project_qkv_input(value[owned], token_group=group)
+        assert all(torch.equal(a, b) for a, b in zip(actual, expected, strict=True))
 
 
 class _CompressorProjection(FusedCompressorInput, nn.Module):

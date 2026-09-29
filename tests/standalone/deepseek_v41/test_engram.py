@@ -10,9 +10,16 @@ from vllm_gaudi.ops.deepseek_v41_engram import EngramHashLayout, EngramTokenHist
 
 
 def layout():
-    return EngramHashLayout.from_config({"engram_layer_ids": [1, 14], "engram_num_embeddings": [72, 204],
-        "engram_max_ngram_size": 4, "engram_n_heads": 2, "engram_compressed_vocab_size": 8,
-        "engram_vocab_size": 5, "engram_pad_token_id": 2, "engram_head_dim": 32})
+    return EngramHashLayout.from_config({
+        "engram_layer_ids": [1, 14],
+        "engram_num_embeddings": [72, 204],
+        "engram_max_ngram_size": 4,
+        "engram_n_heads": 2,
+        "engram_compressed_vocab_size": 8,
+        "engram_vocab_size": 5,
+        "engram_pad_token_id": 2,
+        "engram_head_dim": 32
+    })
 
 
 def reference_hashes(parameters, tokens, dead):
@@ -116,3 +123,64 @@ def test_native_gather_rejects_wrong_head_rows(tmp_path):
     generation = slot.submit(table, np.array([7], dtype=np.int32))
     with pytest.raises(RuntimeError, match="TP head shard"):
         slot.wait(generation)
+
+
+def test_deferred_engram_waits_once_at_ordered_consumers_and_rejects_stale_ticket():
+    from types import SimpleNamespace
+    from vllm_gaudi.ops.deepseek_v41_host import EngramHost, EngramTransfer
+    host = EngramHost.__new__(EngramHost)
+    host.tensor_parallel_size, host.generation = 4, 7
+    host.ready_ticket, host.native_c1, host.batches = None, None, None
+    ticket = EngramTransfer(7, 0, SimpleNamespace(hash_ids=SimpleNamespace(shape=(16384, 2, 24))), (object(), object()))
+    host.pending = ticket
+    calls = []
+    host._wait_layer = lambda value, index: calls.append((value.generation, index))
+    rows = host.defer_prefill(ticket)
+    assert len(rows) == 2 and not calls
+    with pytest.raises(RuntimeError, match="layer order"):
+        rows[1]
+    with pytest.raises(RuntimeError, match="already bound"):
+        host.defer_prefill(ticket)
+    with pytest.raises(RuntimeError, match="consumer owner"):
+        host.wait(ticket)
+    assert rows[0] is ticket.buffers[0] and rows[0] is ticket.buffers[0]
+    assert calls == [(7, 0)] and host.ready_ticket is None
+    with pytest.raises(RuntimeError, match="Stale"):
+        host.complete(ticket, 16384)
+    assert rows[1] is ticket.buffers[1] and host.ready_ticket is ticket
+    assert calls == [(7, 0), (7, 1)]
+    host.pending = None
+    with pytest.raises(RuntimeError, match="Stale"):
+        rows[0]
+
+
+@pytest.mark.parametrize("rank", range(4))
+def test_local_hash_heads_match_complete_hashes_through_history_and_image_boundaries(rank):
+    parameters = EngramHashLayout.from_config({
+        "engram_layer_ids": [1, 14],
+        "engram_num_embeddings": [10000, 10000],
+        "engram_max_ngram_size": 4,
+        "engram_n_heads": 8,
+        "engram_compressed_vocab_size": 8,
+        "engram_vocab_size": 5,
+        "engram_pad_token_id": 2,
+        "engram_head_dim": 256
+    })
+    full = EngramTokenHistory(parameters, np.arange(16) % 8)
+    local = EngramTokenHistory(parameters, np.arange(16) % 8)
+    shard = parameters.head_shard(1, rank, 4)
+    start, stop = shard["head_start"], shard["head_stop"]
+    for request in ("first", "second"):
+        full.reset(request)
+        local.reset(request)
+        for count, accepted in ((2, 2), (16384, 16384), (6, 3), (16384, 16381), (1, 0), (1, 1)):
+            tokens = np.arange(count) % 16
+            mask = np.arange(count) % 11 == 3
+            expected = full.prepare(request, tokens, mask)
+            actual = local.prepare(request, tokens, mask, head_range=(start, stop))
+            assert actual.head_start == start and actual.hash_ids.shape == (count, 2, 6)
+            assert np.array_equal(actual.hash_ids, expected.hash_ids[:, :, start:stop])
+            assert np.array_equal(actual.compressed_ids, expected.compressed_ids)
+            full.commit(expected, accepted)
+            local.commit(actual, accepted)
+            assert np.array_equal(local.history, full.history) and local.position == full.position

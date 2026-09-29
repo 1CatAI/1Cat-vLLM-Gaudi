@@ -117,7 +117,7 @@ def fp4_decode(code):
 
 def pack_swa(value):
     if (gaudi_envs.VLLM_HPU_DSV41_NATIVE_KV_PACK and value.device.type == "hpu" and value.dtype == torch.bfloat16
-            and value.ndim >= 2 and value.shape[0] <= NATIVE_KV_CODEC_TOKENS):
+            and value.ndim >= 2 and value.numel() // value.shape[-1] <= NATIVE_KV_CODEC_TOKENS):
         shape = value.shape
         result = torch.ops.custom_op.custom_deepseek_v41_swa_pack_bf16_gaudi2(value.reshape(-1, shape[-1]).contiguous())
         return result.reshape(*shape[:-1], shape[-1] * 33 // 32)
@@ -153,7 +153,7 @@ def quantize_activation(value):
 
 def pack_fp4(value, group=16):
     if (gaudi_envs.VLLM_HPU_DSV41_NATIVE_KV_PACK and value.device.type == "hpu" and value.dtype == torch.bfloat16
-            and value.ndim >= 2 and value.shape[0] <= NATIVE_KV_CODEC_TOKENS and group in (16, 32)):
+            and value.ndim >= 2 and value.numel() // value.shape[-1] <= NATIVE_KV_CODEC_TOKENS and group in (16, 32)):
         shape = value.shape
         op = (torch.ops.custom_op.custom_deepseek_v41_fp4_pack_g16_bf16_gaudi2
               if group == 16 else torch.ops.custom_op.custom_deepseek_v41_fp4_pack_g32_bf16_gaudi2)
@@ -266,12 +266,16 @@ def hc_pre(residual,
            hc_eps=1e-6,
            iterations=20,
            packed_fn=None,
-           prefill=False):
+           prefill=False,
+           logical_tokens=None):
     """vLLM mhc_pre_delayed_torch's previous-sublayer mixing contract."""
     copies = residual.shape[1]
     flat_bf16 = residual.flatten(1)
+    gate_tokens = residual.shape[0] if logical_tokens is None else logical_tokens
+    if not isinstance(gate_tokens, int) or gate_tokens < residual.shape[0]:
+        raise ValueError("mHC logical token count must cover the owned rows")
     if (gaudi_envs.VLLM_HPU_DSV41_MHC_CONTROL_RRMS and packed_fn is not None and flat_bf16.device.type == "hpu"
-            and flat_bf16.dtype == torch.bfloat16 and 1 <= flat_bf16.shape[0] <= 2048 and flat_bf16.shape[-1] == 20480
+            and flat_bf16.dtype == torch.bfloat16 and 1 <= gate_tokens <= 2048 and flat_bf16.shape[-1] == 20480
             and packed_fn.shape == (24, 20480)):
         control = (torch.ops.custom_op.custom_deepseek_v41_control_gemv_rrms_bf16_gaudi2(
             flat_bf16.contiguous(), packed_fn, eps))
@@ -290,7 +294,7 @@ def hc_pre(residual,
     # Sinkhorn while letting large-M prefill use the better scheduled graph.
     if (gaudi_envs.VLLM_HPU_DSV41_MHC_GATES_FUSED and residual.device.type == "hpu" and iterations == 20
             and hc_eps == 1e-6 and copies == 4 and projection.ndim == 2 and projection.shape[-1] == 24
-            and projection.shape[0] <= 2048):
+            and gate_tokens <= 2048):
         gates = torch.ops.custom_op.custom_deepseek_v41_mhc_gates_f32_gaudi2(projection.contiguous(), rrms.contiguous(),
                                                                              scale.contiguous(), base.contiguous())
         pre, post = gates[:, :copies], gates[:, copies:2 * copies]
@@ -324,7 +328,17 @@ def hc_post(value, residual, post, comb):
 
 @prefill_span("mhc_input")
 @prefill_function_region
-def prefill_hc_input(residual, previous_pre, fn, scale, base, norm, eps, hc_eps, iterations, packed_fn):
+def prefill_hc_input(residual,
+                     previous_pre,
+                     fn,
+                     scale,
+                     base,
+                     norm,
+                     eps,
+                     hc_eps,
+                     iterations,
+                     packed_fn,
+                     logical_tokens=None):
     """Bind all mHC input-region tensors explicitly, including layer weights.
 
     The native collapse keeps the BF16 sublayer input boundary. FP32 control
@@ -340,7 +354,8 @@ def prefill_hc_input(residual, previous_pre, fn, scale, base, norm, eps, hc_eps,
                                     hc_eps,
                                     iterations,
                                     packed_fn=packed_fn,
-                                    prefill=True)
+                                    prefill=True,
+                                    logical_tokens=logical_tokens)
     return value, pre, post, comb, rms_norm(value, norm, eps)
 
 

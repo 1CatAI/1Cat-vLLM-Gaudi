@@ -11,7 +11,9 @@ from vllm_gaudi.ops import deepseek_v41_prefill_sequence as sequence
 @pytest.mark.parametrize("chunk", (8, 16))
 @pytest.mark.parametrize("fused_layout", (False, True))
 @pytest.mark.parametrize("retire_chunks", (False, True))
-def test_exchange_preserves_query_head_and_sink_ownership(monkeypatch, rank, chunk, fused_layout, retire_chunks):
+@pytest.mark.parametrize("indices_partitioned", (False, True))
+def test_exchange_preserves_query_head_and_sink_ownership(monkeypatch, rank, chunk, fused_layout, retire_chunks,
+                                                          indices_partitioned):
     group = object()
     tokens, heads, width = 16, 16, 512
     rows = chunk // 4
@@ -24,7 +26,7 @@ def test_exchange_preserves_query_head_and_sink_ownership(monkeypatch, rank, chu
         (q.float() + sinks[p * heads:(p + 1) * heads][None, :, None] + indices[:, :1, None].float() / 16).bfloat16()
         for p, q in enumerate(queries)
     ]
-    calls, destinations = [], []
+    calls, destinations, caches = [], [], []
     drained = []
     monkeypatch.setattr(sequence, "_retire_stream", lambda: drained.append(len(calls)))
 
@@ -54,7 +56,8 @@ def test_exchange_preserves_query_head_and_sink_ownership(monkeypatch, rank, chu
         calls.append(value.shape)
 
     def consumer(query, cache, selected, sink):
-        del cache
+        assert cache.shape == (1, 512)
+        caches.append(cache.data_ptr())
         begin = len(calls) // 2 * chunk
         assert torch.equal(selected, indices[begin + rank * rows:begin + (rank + 1) * rows])
         return (query.float() + sink[None, :, None] + selected[:, :1, None].float() / 16).bfloat16()
@@ -80,15 +83,29 @@ def test_exchange_preserves_query_head_and_sink_ownership(monkeypatch, rank, chu
                                           retire_chunks=False)
         assert not calls and not drained
         return
+    supplied = indices[rank * tokens // 4:(rank + 1) * tokens // 4] if indices_partitioned else indices
+    if indices_partitioned and tokens > chunk:
+        with pytest.raises(ValueError, match="one exchange chunk"):
+            sequence.sequence_prefill_mla(queries[rank],
+                                          torch.zeros(1, 512).bfloat16(),
+                                          supplied,
+                                          sinks,
+                                          rank,
+                                          group=group,
+                                          retire_chunks=True,
+                                          indices_partitioned=True)
+        return
     result = sequence.sequence_prefill_mla(queries[rank],
                                            torch.zeros(1, 512).bfloat16(),
-                                           indices,
+                                           supplied,
                                            sinks,
                                            rank,
                                            group=group,
                                            fused_layout=fused_layout,
-                                           retire_chunks=retire_chunks)
+                                           retire_chunks=retire_chunks,
+                                           indices_partitioned=indices_partitioned)
     assert len(calls) == 2 * (tokens // chunk) and torch.equal(result, expected[rank])
+    assert len(set(caches)) == 1
     assert drained == (list(range(2, len(calls) + 1, 2)) if retire_chunks else [])
     assert destinations == [(result.untyped_storage().data_ptr(), start * heads * width)
                             for start in range(0, tokens, chunk)]
@@ -166,3 +183,51 @@ def test_unqualified_shapes_keep_ordinary_mla(monkeypatch, tokens, heads, column
     ids = torch.zeros(tokens, columns, device="meta", dtype=torch.int32)
     result = attention.PagedCSA2Attention._prefill_sparse(owner, q, cache, ids)
     assert result.shape == q.shape and sum(called) == tokens
+
+
+@pytest.mark.parametrize("rank", range(4))
+def test_prefill_assembles_only_owned_ids_without_mutating_shared_selection(monkeypatch, rank):
+    import vllm.distributed
+    from vllm_gaudi.ops.deepseek_v41_paged_attention import PagedCSA2Attention
+    monkeypatch.setenv("VLLM_HPU_DSV41_FLASHINFER_PREFILL", "1")
+    monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_MLA_SEQUENCE", "1")
+    monkeypatch.setattr(vllm.distributed, "get_tp_group", lambda: SimpleNamespace(rank_in_group=rank))
+    tokens, rows = 4096, 1024
+    swa_ids = torch.arange(tokens * 128, dtype=torch.int32).reshape(tokens, 128)
+    selected = torch.arange(tokens * 512, dtype=torch.int32).reshape(tokens, 512)
+    saved = selected.clone()
+    cache = torch.empty(20607, 512, device="meta", dtype=torch.bfloat16)
+    owner_rows = slice(rank * rows, (rank + 1) * rows)
+    calls = []
+
+    def assemble(kv, ids, main_ids, logical):
+        assert kv is cache and logical.shape == (16384, )
+        assert torch.equal(ids, swa_ids[owner_rows]) and torch.equal(main_ids, selected[owner_rows])
+        assert main_ids.untyped_storage().data_ptr() == selected.untyped_storage().data_ptr()
+        calls.append("assembly")
+        return kv, torch.cat((ids, main_ids), -1)
+
+    def mla(q, kv, ids, *, indices_partitioned):
+        assert indices_partitioned and q.shape == (tokens, 16, 512) and kv is cache
+        assert ids.shape == (rows, 640)
+        calls.append("mla")
+        return q
+
+    owner = SimpleNamespace(shared=SimpleNamespace(prefill_tokens=16384),
+                            layer=21,
+                            decoded_kv_state=False,
+                            ratio=1,
+                            owns_kv=False,
+                            owns_index=False,
+                            search_length=16384,
+                            tensor_parallel_size=4,
+                            prefill_tp_rank=rank,
+                            _prefill_selections=lambda *args: selected,
+                            _prefill_swa_workspace=lambda *args, **kwargs: (cache, swa_ids),
+                            _prefill_main_workspace=assemble,
+                            _prefill_sparse=mla,
+                            _finish_output=lambda output, *args, **kwargs: output)
+    q = torch.empty(tokens, 16, 512, device="meta", dtype=torch.bfloat16)
+    result = PagedCSA2Attention._prefill_attention(owner, torch.empty(tokens, 5120, device="meta"), None, q, None,
+                                                   torch.arange(tokens))
+    assert result is q and calls == ["assembly", "mla"] and torch.equal(selected, saved)

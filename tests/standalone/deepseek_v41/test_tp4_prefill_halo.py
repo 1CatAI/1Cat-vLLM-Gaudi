@@ -28,6 +28,8 @@ def test_tp4_scheduler_chunks_and_short_tail(prompt, chunks, expected):
 
 def make_stage(monkeypatch):
     from vllm_gaudi.models import deepseek_v41_program as program
+    from vllm_gaudi.ops import deepseek_v41_prefill_sequence_state as sequence
+    monkeypatch.setattr(sequence, "can_sequence_prefill_state", lambda stage, tokens: False)
 
     shared = SimpleNamespace(candidate_pool=torch.full((16384, 1), -1, dtype=torch.int32),
                              topk={"20": SimpleNamespace(indices=torch.full((16384, 1), -1, dtype=torch.int32))},
@@ -40,9 +42,21 @@ def make_stage(monkeypatch):
             super().__init__()
             self.layer = index
 
-        def forward(self, residual, pre, positions, image_mask, engram=None, *, prefill_router_tokens=0):
+        def forward(self,
+                    residual,
+                    pre,
+                    positions,
+                    image_mask,
+                    engram=None,
+                    *,
+                    prefill_router_tokens=0,
+                    prefill_sequence=False):
             self.router_tokens = prefill_router_tokens
             count = positions.numel()
+            if prefill_sequence:
+                assert residual.shape[0] * 4 == count
+            else:
+                assert residual.shape[0] == count
             calls.append((self.layer, count, engram))
             if self.layer == 20:
                 shared.candidate_pool[:count, 0].copy_(positions)
@@ -97,6 +111,36 @@ def test_tp4_prefix_publishes_all_source_rows_before_skipping_suffix(monkeypatch
     assert torch.equal(stage.shared.candidate_pool[:, 0], positions)
     assert torch.equal(stage.shared.topk["20"].indices[:, 0], positions)
     assert output.shape == (16384, 1) and target is None
+
+
+def test_token_owned_final_preserves_full_positions_and_replicates_tail(monkeypatch):
+    from vllm import distributed
+    from vllm_gaudi.ops import deepseek_v41_prefill_sequence_state as sequence
+    # Device collective ordering/content is covered by the four-rank state
+    # fixture; here compare the normal stage transition against replicated B.
+    stage, calls = make_stage(monkeypatch)
+    positions = torch.arange(16384, dtype=torch.int32)
+    residual = positions.float().reshape(-1, 1, 1).expand(-1, 4, 1).clone()
+    previous = torch.ones(16384, 4)
+    monkeypatch.setattr(sequence, "can_sequence_prefill_state", lambda stage, count: False)
+    expected = stage._forward_prefill_halo(residual, previous, positions, positions, "final", (None, None))
+    calls.clear()
+    group = SimpleNamespace(rank_in_group=3, device_group=object())
+    monkeypatch.setattr(distributed, "get_tp_group", lambda: group)
+    monkeypatch.setattr(sequence, "can_sequence_prefill_state", lambda stage, count: count == 16384)
+    transfers = []
+
+    def replicate(local, retained, *, group):
+        transfers.append((local.shape, retained))
+        return local[-retained:].clone()
+
+    monkeypatch.setattr(sequence, "replicate_owned_tail", replicate)
+    actual = stage._forward_prefill_halo(residual, previous, positions, positions, "final", (None, None))
+    assert len(transfers) == 2 and all(retained == 4096 for _, retained in transfers)
+    assert [(layer, count) for layer, count, _ in calls] == [(layer, 16384 if layer <= 20 else 4096)
+                                                             for layer in range(40)]
+    assert torch.equal(actual[0], expected[0]) and torch.equal(actual[1], expected[1])
+    assert actual[2] is None
 
 
 @pytest.mark.parametrize("batch,multimodal,logprobs,capacity,expected", [

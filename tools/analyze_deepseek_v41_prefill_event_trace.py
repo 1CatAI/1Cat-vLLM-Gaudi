@@ -278,18 +278,16 @@ def main():
         "Current-stream HPU event intervals use each rank's own anchor. Rows are mutually exclusive "
         "within that rank; do not add or align device offsets across ranks. This diagnostic does "
         "not provide hardware-kernel calls, FLOP counters, or HBM byte counters. mHC is included "
-        "in Layer other; it has no separate event in this serving path. " + ingress_note, "",
+        "in Layer other; selected mHC subspans are shown separately below when present. " + ingress_note, "",
         f"| Rank | Window ms | {attention_header} | MoE | Layer other | Chunk ingress | "
         "Inter-layer gap | Chunk egress | Outside |",
         f"| --- | ---: | {attention_rule} | ---: | ---: | ---: | ---: | ---: | ---: |"
     ]
     for record in records:
         groups = record["groups_ms"]
-        attention_values = (
-            " | ".join(f"{groups[name]:.3f}" for name in ("Attention sparse MLA", "Attention index selection",
-                                                          "Attention other")) if detailed_attention else
-            f"{sum(groups[name] for name in ('Attention sparse MLA', 'Attention index selection', 'Attention other')):.3f}"  # noqa: E501
-        )
+        attention_names = ("Attention sparse MLA", "Attention index selection", "Attention other")
+        attention_values = (" | ".join(f"{groups[name]:.3f}" for name in attention_names)
+                            if detailed_attention else f"{sum(groups[name] for name in attention_names):.3f}")
         lines.append("| PP{pp_rank}/TP{tp_rank}/G{generation} | {device_ms:.3f} | {attention_values} | "
                      "{moe:.3f} | {other:.3f} | "
                      "{ingress:.3f} | {between:.3f} | {egress:.3f} | {outside:.3f} |".format(
@@ -329,6 +327,16 @@ def main():
         ])
         for name in records[0]["attention_components_ms"]:
             values = [record["attention_components_ms"][name] for record in records]
+            lines.append("| {} | {} |".format(name, " | ".join(f"{value:.3f}" for value in values)))
+    if any(item.get("name") in ("mhc_input", "mhc_post") for record in records for item in record["spans"]):
+        lines.extend([
+            "", "## Layer-other internal phases (same diagnostic request)", "",
+            "These rows partition Layer other; they are not added again to the outer ledger.", "",
+            "| Phase | " + " | ".join(f"PP{r['pp_rank']}/TP{r['tp_rank']}/G{r['generation']} ms"
+                                      for r in records) + " |", "| --- | " + " | ".join("---:" for _ in records) + " |"
+        ])
+        for name in records[0]["layer_other_components_ms"]:
+            values = [record["layer_other_components_ms"][name] for record in records]
             lines.append("| {} | {} |".format(name, " | ".join(f"{value:.3f}" for value in values)))
     lines.extend([
         "", "Per-rank, per-transaction raw spans and host times remain in the source JSON files. "

@@ -305,9 +305,15 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 buffers = self.engram_host.wait(self.step_ticket)
                 engram = (layer1, buffers[1])
             else:
-                # Embedding and residual preparation are independent of the host
-                # lookup. The decoder still receives explicit DMA dependencies.
-                engram = self.engram_host.wait(self.step_ticket)
+                # The full TP4 prompt consumes the two tables at layers 1/14.
+                # Each consumer binds its own DMA dependency, allowing earlier
+                # layers to execute while the later host lookup is outstanding.
+                from vllm_gaudi.ops.deepseek_v41_prefill_sequence_state import can_sequence_prefill_state
+                if (self.tensor_parallel_size == 4 and input_ids.numel() == 16384 and not self.step_use_replay
+                        and self.program.start == 0 and can_sequence_prefill_state(self.program, 16384)):
+                    engram = self.engram_host.defer_prefill(self.step_ticket)
+                else:
+                    engram = self.engram_host.wait(self.step_ticket)
         else:
             if intermediate_tensors is None:
                 raise RuntimeError("PP1 has no matching PP0 hidden/pre-mix generation")
