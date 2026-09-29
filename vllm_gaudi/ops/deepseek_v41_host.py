@@ -16,6 +16,7 @@ from vllm_gaudi import envs as gaudi_envs
 from vllm_gaudi.ops.deepseek_v41_diagnostics import trace_phase
 from vllm_gaudi.ops.deepseek_v41_engram import (
     EngramHashLayout,
+    EngramHistoryBatch,
     EngramTokenHistory,
     build_compressed_token_map,
 )
@@ -197,7 +198,7 @@ class _TransferSlot:
         self.decode_scales = packed[:, :, width:]
         self.decode_gather_weights = self.gather.weights[:heads].reshape(1, heads, width)
         self.decode_gather_scales = self.gather.scales[:heads].reshape(1, heads, width // 32)
-        self.direct = envs.VLLM_HPU_DSV41_FUSED_STAGE_IO
+        self.direct = envs.VLLM_HPU_DSV41_FUSED_STAGE_IO or envs.VLLM_HPU_DSV41_ENGRAM_PACKED_STAGING
         if self.direct:
             if getattr(native, "packed_output_version", None) != 1:
                 raise RuntimeError("Fused Engram staging requires native packed-output capability version 1")
@@ -290,6 +291,10 @@ class EngramHost:
         self.device_position = None
         self.device_pending = None
         self.c1_packets = None
+        # The normal scheduler selects native B1 even when B2+ is supported.
+        # Keep its device-token producer alongside request-batch host staging;
+        # both consume the same resident checkpoint backing and request history.
+        device_c1_enabled = gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM
         if (gaudi_envs.VLLM_HPU_DSV41_ENGRAM_C1_PACKET and not gaudi_envs.VLLM_HPU_DSV41_ENGRAM_NATIVE_C1):
             raise RuntimeError("Engram C1 packets require native C1 preparation")
         if (gaudi_envs.VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT
@@ -299,7 +304,7 @@ class EngramHost:
         self.c1_abi = getattr(native, "c1_abi_version", None)
         if gaudi_envs.VLLM_HPU_DSV41_ENGRAM_NATIVE_C1 and self.c1_abi not in (1, 2):
             raise RuntimeError("The enabled Engram C1 path requires its matching native preparation ABI")
-        if gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and self.c1_abi != 2:
+        if device_c1_enabled and self.c1_abi != 2:
             raise RuntimeError("Device Engram requires native host C1 ABI 2")
         if max_tokens not in range(1, 16385) or ring_size < 2:
             raise ValueError("Invalid bounded Engram staging geometry")
@@ -340,6 +345,7 @@ class EngramHost:
         self._deferred_input = None
         self.max_tokens, self.ring_size = max_tokens, ring_size
         self.audit = {"gathers": 0, "major_faults": 0, "dma_bytes": 0, "generations": 0}
+        self.audit["device_c1_enabled"] = bool(device_c1_enabled)
         self.profile_records = None
         for layer in self.layout.layer_ids:
             weight = host["tables"][f"layers.{layer}.engram.embed.weight"]
@@ -390,7 +396,7 @@ class EngramHost:
                 np.array([self.shards[layer]["head_start"] for layer in layers], dtype=np.int64),
                 np.array([self.shards[layer]["head_stop"] for layer in layers], dtype=np.int64), self.history.pad_id,
                 [self.tables[layer] for layer in layers], targets)
-        if gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and self.tensor_parallel_size == 2:
+        if device_c1_enabled and self.tensor_parallel_size == 2:
             self._initialize_device_c1(host, device)
         elif gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM:
             raise RuntimeError("Device Engram is currently qualified only for TP2; disable it for TP4")
@@ -550,6 +556,42 @@ class EngramHost:
     def release_request(self, request_id):
         self.histories.pop(request_id, None)
 
+    def restore_prefix(self, request_id, token_ids, image_mask=None):
+        """Reconstruct a newly admitted cache-hit request without table reads.
+
+        The runner must first validate its scheduler KV pages and all auxiliary
+        stage checkpoints. This only publishes Engram history, never a cache
+        hit or an accepted input transaction.
+        """
+        if self.closed or self.pending is not None or self.device_pending is not None:
+            raise RuntimeError("Cannot restore a prefix into a live Engram transaction")
+        if request_id in self.histories:
+            raise RuntimeError("Cached Engram prefix requires a new request owner")
+        history = EngramTokenHistory(self.layout, self.history.token_map)
+        history.reset(request_id)
+        history.restore_prefix(request_id, token_ids, image_mask)
+        # Invalid tokens/masks leave both the existing owner and dictionary
+        # unchanged. Normal activate()/prepare_batch() can now select this
+        # history using its absolute prefix position.
+        self.histories[request_id] = history
+        return history.position
+
+    def snapshot_prefix(self, request_id):
+        if self.closed or self.pending is not None or self.device_pending is not None:
+            raise RuntimeError("Cannot checkpoint a live Engram transaction")
+        return self.histories[request_id].snapshot_prefix(request_id)
+
+    def restore_checkpoint(self, request_id, checkpoint):
+        if self.closed or self.pending is not None or self.device_pending is not None:
+            raise RuntimeError("Cannot restore a checkpoint into a live Engram transaction")
+        if request_id in self.histories:
+            raise RuntimeError("Cached Engram checkpoint requires a new request owner")
+        history = EngramTokenHistory(self.layout, self.history.token_map)
+        history.reset(request_id)
+        history.restore_checkpoint(request_id, checkpoint)
+        self.histories[request_id] = history
+        return history.position
+
     def prepare(self, request_id, token_ids, image_mask=None, *, defer_wait=False, device_layer1=False):
         if self.closed or self.pending is not None:
             raise RuntimeError("Engram is closed or its preceding input transaction is still pending")
@@ -582,13 +624,75 @@ class EngramHost:
         self.ready_ticket = None
         self._deferred_input = None
         self._submit(ticket, 0)
-        if envs.VLLM_HPU_DSV41_FUSED_STAGE_IO:
+        if self.slots[self.layout.layer_ids[0]][ring].direct:
             for index in range(1, len(self.layout.layer_ids)):
                 self._submit(ticket, index)
         self.audit["generations"] += 1
         if not defer_wait:
             self.wait(ticket)
         return ticket
+
+    def prepare_batch(self, spans, *, capacity, defer_wait=False):
+        """Prepare one flat packet without activating a single global history."""
+        if self.closed or self.pending is not None or getattr(self, "batches", None) is not None:
+            raise RuntimeError("Batched Engram requires an idle ordinary staging owner")
+        if not 1 <= capacity <= self.max_tokens:
+            raise ValueError("Engram batch exceeds fixed staging capacity")
+        spans = tuple(spans)
+        if envs.VLLM_HPU_DSV41_BATCH_C1_PREPARE and capacity == 1:
+            if len(spans) != 1 or len(spans[0][2]) != 1:
+                raise ValueError("Native batch C1 requires exactly one request input")
+            if self.native_c1 is None:
+                raise RuntimeError("Native batch C1 requires the native C1 host extension")
+            request_id, start, tokens, image = spans[0]
+            if request_id not in self.histories and start != 0:
+                raise RuntimeError("Engram request has no committed prefix at its absolute start")
+            self.activate(request_id)
+            if self.history.position != start:
+                raise RuntimeError("Native batch C1 position disagrees with committed history")
+            ticket = self.prepare(request_id, tokens, image, defer_wait=defer_wait)
+            self.audit["request_batches"] = self.audit.get("request_batches", 0) + 1
+            self.audit["native_request_c1"] = self.audit.get("native_request_c1", 0) + 1
+            return ticket
+        for request_id, start, _, _ in spans:
+            if request_id not in self.histories:
+                if start != 0:
+                    raise RuntimeError("Engram request has no committed prefix at its absolute start")
+                history = EngramTokenHistory(self.layout, self.history.token_map)
+                history.reset(request_id)
+                self.histories[request_id] = history
+        batch = EngramHistoryBatch.prepare(self.histories, spans, capacity)
+        self.generation += 1
+        ring = (self.generation - 1) % self.ring_size
+        buffers = tuple(self.slots[layer][ring].device[:capacity] for layer in self.layout.layer_ids)
+        ticket = EngramTransfer(self.generation, ring, batch, buffers)
+        self.pending, self.ready_ticket = ticket, None
+        self._submit(ticket, 0)
+        if self.slots[self.layout.layer_ids[0]][ring].direct:
+            for index in range(1, len(self.layout.layer_ids)):
+                self._submit(ticket, index)
+        self.audit["generations"] += 1
+        self.audit["request_batches"] = self.audit.get("request_batches", 0) + 1
+        if not defer_wait:
+            self.wait(ticket)
+        return ticket
+
+    def complete_batch(self, ticket, committed_inputs):
+        if not isinstance(ticket.batch, EngramHistoryBatch):
+            if (not envs.VLLM_HPU_DSV41_BATCH_C1_PREPARE or len(committed_inputs) != 1
+                    or len(ticket.batch.compressed_ids) != 1):
+                raise RuntimeError("Invalid native request C1 completion")
+            self.complete(ticket, committed_inputs[0])
+            return
+        if (self.pending is not ticket or ticket.generation != self.generation or self.ready_ticket is not ticket
+                or not isinstance(ticket.batch, EngramHistoryBatch)):
+            raise RuntimeError("Stale Engram request-batch completion")
+        ticket.batch.commit(committed_inputs)
+        for layer in self.layout.layer_ids:
+            slot = self.slots[layer][ticket.slot]
+            slot.consumer_done.record(torch.hpu.current_stream())
+            slot.inflight = True
+        self.pending = self.ready_ticket = None
 
     def _prepare_native_c1(self, request_id, token_ids, image_mask, *, device_layer1=False):
         if image_mask is not None and len(image_mask) != 1:
@@ -637,7 +741,7 @@ class EngramHost:
         layer = self.layout.layer_ids[index]
         slot, shard = self.slots[layer][ticket.slot], self.shards[layer]
         slot.reuse()
-        first, last = (shard[key] - ticket.batch.head_start for key in ("head_start", "head_stop"))
+        first, last = (shard[key] - getattr(ticket.batch, "head_start", 0) for key in ("head_start", "head_stop"))
         if not 0 <= first < last <= ticket.batch.hash_ids.shape[-1]:
             raise RuntimeError("Engram hash batch does not contain this rank's complete heads")
         ids = np.ascontiguousarray(ticket.batch.hash_ids[:, index, first:last])
@@ -656,6 +760,7 @@ class EngramHost:
 
     def _wait_layer(self, ticket, index):
         count, ring = ticket.batch.hash_ids.shape[0], ticket.slot
+        transfer_count = ticket.batch.capacity if isinstance(ticket.batch, EngramHistoryBatch) else count
         layer = self.layout.layer_ids[index]
         batch_owner = self.batches[ring] if getattr(self, "batches", None) is not None else None
         slot = self.slots[layer][ring]
@@ -687,10 +792,12 @@ class EngramHost:
         slot.gather.release(slot.generation)
         if batch_owner is None:
             with torch.hpu.stream(self.stream):
-                slot.device[:count].copy_(slot.host[:count], non_blocking=True)
+                if transfer_count > count:
+                    slot.host[count:transfer_count].zero_()
+                slot.device[:transfer_count].copy_(slot.host[:transfer_count], non_blocking=True)
                 slot.dma_done.record(self.stream)
             torch.hpu.current_stream().wait_event(slot.dma_done)
-            self.audit["dma_bytes"] += count * heads * (width + width // 32)
+            self.audit["dma_bytes"] += transfer_count * heads * (width + width // 32)
 
     def wait(self, ticket):
         """Bind both DMA completions after independent embedding submission.
@@ -700,7 +807,8 @@ class EngramHost:
         """
         if self.pending is not ticket or ticket.generation != self.generation or self.ready_ticket is ticket:
             raise RuntimeError("Stale or already completed Engram preparation")
-        if (ticket.packet or (ticket.batch.hash_ids.shape[0] == 1 and self.native_c1 is not None)):
+        if (ticket.packet or (not isinstance(ticket.batch, EngramHistoryBatch) and ticket.batch.hash_ids.shape[0] == 1
+                              and self.native_c1 is not None)):
             self.ready_ticket = ticket
             return ticket.buffers
         if getattr(self, "_deferred_input", None) is not None:
@@ -777,10 +885,13 @@ class EngramHost:
         # this owner's transfers/consumers before releasing mmap and staging.
         torch.hpu.synchronize()
         if self.pending is not None:
-            if self.c1_abi == 2 and self.native_c1 is not None and len(self.pending.batch.compressed_ids) == 1:
-                self.native_c1.complete(self.pending.batch.request_id, self.pending.batch.generation,
-                                        self.pending.generation)
-            self.history.discard(self.pending.batch)
+            if isinstance(self.pending.batch, EngramHistoryBatch):
+                self.pending.batch.commit([0] * len(self.pending.batch.members))
+            else:
+                if self.c1_abi == 2 and self.native_c1 is not None and len(self.pending.batch.compressed_ids) == 1:
+                    self.native_c1.complete(self.pending.batch.request_id, self.pending.batch.generation,
+                                            self.pending.generation)
+                self.history.discard(self.pending.batch)
             self.pending = None
         self.ready_ticket = None
         self._deferred_input = None

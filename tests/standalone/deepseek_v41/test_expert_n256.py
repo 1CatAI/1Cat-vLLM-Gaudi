@@ -67,6 +67,27 @@ def test_decode_order_live_ids_and_exact_bytes(k):
 
 
 @HPU
+def test_normal_scale_lookup_all_encodings_and_invalid_experts():
+    if os.environ.get("VLLM_HPU_DSV41_N256_NORMAL_BF16") != "1":
+        pytest.skip("Select the normal-scale candidate before loading its native extension")
+    # Every nibble paired with all 253 normal scale codes. The second plane
+    # belongs to FP8 and must have no influence on BF16 decode.
+    codes = 2 + np.arange(256, dtype=np.uint16) % 253
+    raw = np.stack([np.full((128, 128), nibble | (nibble << 4), dtype=np.uint8) for nibble in range(16)])
+    q = torch.from_numpy(raw.view(np.int16).reshape(16, 1, 8192)).to("hpu")
+    planes = np.zeros((16, 4, 512), dtype=np.uint8)
+    planes[..., :256] = codes.astype(np.uint8)
+    planes[..., 256:] = np.arange(256, dtype=np.uint8)
+    s = torch.from_numpy(planes.view(np.int16).reshape(16, 1, 1024)).to("hpu")
+    ids = torch.tensor([list(range(16)) + [-1, 16]], dtype=torch.int32, device="hpu")
+    lut = mxfp4_bf16_lut("hpu")
+    expected = NDECODE(ids, q, s, lut, False).cpu()
+    actual = NDECODE(ids, q, s, lut, True).cpu()
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+    assert torch.count_nonzero(actual[-2:]) == 0
+
+
+@HPU
 def test_complete_moe_rounding_and_bf16_prefill():
     torch._dynamo.reset()
     torch._dynamo.config.recompile_limit = 32

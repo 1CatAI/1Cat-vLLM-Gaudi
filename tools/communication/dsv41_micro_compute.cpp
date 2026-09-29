@@ -68,10 +68,40 @@ class Compute : public std::enable_shared_from_this<Compute> {
       });
     });
   }
+  static void replay_bounded_tiles(const std::vector<std::shared_ptr<Compute>>& chain, uint64_t tiles) {
+    // Diagnostic capability gate: init/compact, eight fixed tile programs,
+    // then the real consumer. All bindings and recipes are prepared once.
+    // The bound comes from scheduler-owned lengths, never a device readback.
+    TORCH_CHECK(chain.size() == 10 && tiles <= 8, "Expected init + eight tiles + consumer");
+    for (const auto& part : chain)
+      TORCH_CHECK(part && part->ready_ && part->stream_ == chain.front()->stream_,
+                  "Bounded tile chain must retain ready programs on one stream");
+    habana::eager::PipelineTask<habana::eager::ThreadType::LOWERING>([chain, tiles]() {
+      habana::HPUDeviceContext::execute_thread().enqueue([chain, tiles]() {
+        for (size_t p = 0; p < chain.size(); ++p) {
+          if (p > tiles && p < 9) continue;
+          const auto& part = chain[p];
+          check(part->start_(part->graph_));
+          Sync completion;
+          for (uint64_t s = 0; s < part->info_.segments; ++s)
+            check(part->segment_(part->graph_, s, nullptr,
+                                s + 1 == part->info_.segments, &completion));
+        }
+      });
+    });
+  }
   std::vector<uint64_t> info() {
     habana::eager::JoinPendingPipelineThreads();
     check(get_(graph_, &info_));
     return {info_.segments, info_.replays, info_.global_bytes, info_.arc_bytes};
+  }
+  uint64_t workspace_bytes() {
+    habana::eager::JoinPendingPipelineThreads();
+    TORCH_CHECK(ready_ && graph_, "Workspace query requires a retained compute graph");
+    using GetWorkspace = synStatus(*)(void*, uint64_t*);
+    uint64_t bytes = 0;
+    check(symbol<GetWorkspace>("synNativeComputeGraphGetWorkspaceBytes")(graph_, &bytes));
+    return bytes;
   }
   void close() {
     habana::eager::JoinPendingPipelineThreads();
@@ -85,7 +115,9 @@ class Compute : public std::enable_shared_from_this<Compute> {
 };
 }
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("replay_bounded_tiles", &Compute::replay_bounded_tiles);
   pybind11::class_<Compute, std::shared_ptr<Compute>>(m, "Compute")
     .def(pybind11::init<>()).def("begin", &Compute::begin).def("end", &Compute::end)
-    .def("replay", &Compute::replay).def("info", &Compute::info).def("close", &Compute::close);
+    .def("replay", &Compute::replay).def("info", &Compute::info)
+    .def("workspace_bytes", &Compute::workspace_bytes).def("close", &Compute::close);
 }

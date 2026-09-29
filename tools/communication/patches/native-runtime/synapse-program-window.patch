@@ -1,0 +1,100 @@
+--- a/synapse/src/runtime/scal/common/stream_compute_scal.cpp
++++ b/synapse/src/runtime/scal/common/stream_compute_scal.cpp
+@@ -1,4 +1,5 @@
+ #include "native_bounded_selection.h"
++#include "native_program_window.h"
+ #include "stream_compute_scal.hpp"
+ #include "synapse_api.h"
+ 
+@@ -69,13 +70,12 @@
+     // but a standalone native allocation must preserve the stronger recipe
+     // arena base contract or a zero-offset dynamic ECB list is rejected.
+     constexpr uint64_t arcAlignment    = 256;
+-    if (globalSize > std::numeric_limits<uint64_t>::max() - (globalAlignment - 1) ||
++    if (!NativeProgramWindow::allocationSize(globalSize, false, m_globalAllocationBytes) ||
+         arcSize > std::numeric_limits<uint64_t>::max() - (arcAlignment - 1) ||
+         workspaceSize > std::numeric_limits<uint64_t>::max() - (globalAlignment - 1))
+     {
+         return synInvalidArgument;
+     }
+-    m_globalAllocationBytes = globalSize + globalAlignment - 1;
+     m_arcAllocationBytes    = arcSize + arcAlignment - 1;
+ 
+     synStatus status = m_globalPool.allocateDeviceMemory(m_globalAllocationBytes, m_globalBuffer);
+@@ -95,7 +95,36 @@
+         return status;
+     }
+ 
+-    m_globalDeviceAddress = (rawGlobalDeviceAddress + globalAlignment - 1) & ~(globalAlignment - 1);
++    if (!NativeProgramWindow::selectAddress(
++            rawGlobalDeviceAddress, m_globalAllocationBytes, globalSize, m_globalDeviceAddress))
++    {
++        // Native plans own program storage outside DeviceScal's normal
++        // compute-stream arena. Preserve that arena's 4 GiB TPC-PC window
++        // contract as well as PROGRAM_DATA alignment. Do not assume that
++        // the replacement allocation will have the same raw address.
++        status = m_globalPool.releaseDeviceMemory(m_globalBuffer);
++        if (status != synSuccess) return status;
++        m_globalBuffer = nullptr;
++        NativeProgramWindow::allocationSize(globalSize, true, m_globalAllocationBytes);
++        status = m_globalPool.allocateDeviceMemory(m_globalAllocationBytes, m_globalBuffer);
++        if (status != synSuccess) return status;
++        status = m_globalPool.getDeviceMemoryAddress(
++            m_globalBuffer, unusedGlobalCoreAddress, rawGlobalDeviceAddress);
++        if (status == synSuccess && !NativeProgramWindow::selectAddress(
++                rawGlobalDeviceAddress, m_globalAllocationBytes, globalSize, m_globalDeviceAddress))
++        {
++            status = synInvalidArgument;
++        }
++        if (status != synSuccess)
++        {
++            m_globalPool.releaseDeviceMemory(m_globalBuffer);
++            m_globalBuffer = nullptr;
++            return status;
++        }
++        LOG_INFO(SYN_MEM_ALLOC,
++                 "Native recipe program window padded: raw 0x{:x}, selected 0x{:x}, payload {}, allocation {}",
++                 rawGlobalDeviceAddress, m_globalDeviceAddress, globalSize, m_globalAllocationBytes);
++    }
+ 
+     status = m_hbmSharedPool.allocateDeviceMemory(m_arcAllocationBytes, m_arcBuffer);
+     if (status != synSuccess)
+--- /dev/null
++++ b/synapse/src/runtime/scal/common/native_program_window.h
+@@ -0,0 +1,36 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++
++#include <cstdint>
++#include <limits>
++
++namespace NativeProgramWindow
++{
++constexpr uint64_t alignment = 1ULL << 13;
++constexpr uint64_t window = 1ULL << 32;
++
++inline bool allocationSize(uint64_t payload, bool padded, uint64_t& bytes)
++{
++    if (payload == 0 || payload >= window) return false;
++    // If an aligned payload crosses a window, the distance to the next
++    // window is at most the payload. Twice its size plus alignment
++    // therefore suffices even when a replacement allocation moves.
++    bytes = (padded ? 2 * payload : payload) + alignment - 1;
++    return true;
++}
++
++inline bool selectAddress(uint64_t raw, uint64_t bytes, uint64_t payload, uint64_t& address)
++{
++    if (payload == 0 || payload >= window || bytes < payload ||
++        raw > std::numeric_limits<uint64_t>::max() - (bytes - 1)) return false;
++    uint64_t shift = (alignment - (raw & (alignment - 1))) & (alignment - 1);
++    if (shift > bytes - payload) return false;
++    const uint64_t remaining = window - ((raw + shift) & (window - 1));
++    // Match the normal compute arena's exclusive-end check, including
++    // a final instruction whose subsequent PC could wrap at the boundary.
++    if (payload >= remaining) shift += remaining;
++    if (shift > bytes - payload) return false;
++    address = raw + shift;
++    return true;
++}
++}  // namespace NativeProgramWindow

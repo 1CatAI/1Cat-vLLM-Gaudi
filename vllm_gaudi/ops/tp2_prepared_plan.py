@@ -172,8 +172,7 @@ def _flush():
                     _native_graph_owners[key] = weakref.ref(context["owner"])
                 if v4:
                     graph.configure_topology(groups, adapter.collectives, adapter.external_prefix)
-                if (v41 and gaudi_envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX
-                        and adapter.supports_segmented_input):
+                if (v41 and gaudi_envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX and adapter.supports_segmented_input):
                     attention_inputs = list(context["attention_inputs"])
                     if gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM:
                         attention_inputs = attention_inputs[1:]
@@ -195,7 +194,7 @@ def _flush():
                 if snapshot is not None:
                     torch.hpu.synchronize()
                     snapshot.restore()
-                    context["metadata"].native_completion = graph.replay_fixed_with_completion()
+                    context["metadata"].native_completion = _replay_completion(graph, context)
             else:
                 graph.update_inputs(native_plans, native_inputs)
                 graph.replay()
@@ -212,6 +211,15 @@ def record_native_decoder_outputs(hidden_states, residual=None, *extra_outputs):
     context = getattr(_local, "native_context", None)
     if context is not None:
         context["outputs"] = hidden_states, residual, *extra_outputs
+
+
+def _replay_completion(graph, roots):
+    bound = roots.get("reindex_tile_bound")
+    if bound is None:
+        return graph.replay_fixed_with_completion()
+    if type(bound) is not int or not 0 <= bound <= 8 or not hasattr(graph, "replay_bounded_fixed_with_completion"):
+        raise RuntimeError("Bounded Reindex requires a qualified tile bound and matching native runtime")
+    return graph.replay_bounded_fixed_with_completion(bound)
 
 
 def replay_native_decoder(owner, **roots):
@@ -234,8 +242,10 @@ def replay_native_decoder(owner, **roots):
     try:
         bindings.apply(updates, graph)
         if bindings.native_staging:
-            roots["metadata"].native_completion = graph.replay_fixed_with_completion()
+            roots["metadata"].native_completion = _replay_completion(graph, roots)
         else:
+            if roots.get("reindex_tile_bound") is not None:
+                raise RuntimeError("Bounded Reindex requires native input ownership")
             graph.replay_fixed()
     except BaseException:
         _native_entries.pop(owner, None)
@@ -573,6 +583,10 @@ class PreparedGroupModule(torch.nn.Module):
                 env[node] = source
             elif node.op == "call_module":
                 child = self.original.get_submodule(node.target)
+                from vllm_gaudi.compilation.deepseek_v41_reindex import optional_tile_bound
+                tile_bound = optional_tile_bound(child.fx_module)
+                if tile_bound and not hasattr(native, "mark_last_optional_tile"):
+                    raise RuntimeError("Native runtime lacks the optional recipe contract")
                 arguments = slots(resolve(node.args))
                 if node.kwargs:
                     raise RuntimeError("Prepared compute expects positional tensor/scalar bindings")
@@ -589,6 +603,8 @@ class PreparedGroupModule(torch.nn.Module):
                         allocated_slots.append(current.index)
                     visible_slots.append(current)
                 native.add_compute(child._recipe_id, [x.index for x in arguments], allocated_slots)
+                if tile_bound:
+                    native.mark_last_optional_tile(tile_bound)
                 env[node] = tuple(visible_slots) if isinstance(
                     observed, tuple) else (visible_slots if isinstance(observed, list) else visible_slots[0])
             elif node.op == "call_function" and node.target in (peer_exchange, scheduled, plain):

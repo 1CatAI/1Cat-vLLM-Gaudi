@@ -184,3 +184,39 @@ def test_local_hash_heads_match_complete_hashes_through_history_and_image_bounda
             full.commit(expected, accepted)
             local.commit(actual, accepted)
             assert np.array_equal(local.history, full.history) and local.position == full.position
+
+
+def test_request_batch_hashes_keep_absolute_histories_and_commit_each_request():
+    from vllm_gaudi.ops.deepseek_v41_engram import EngramHistoryBatch
+    parameters = layout()
+    histories = {name: EngramTokenHistory(parameters, np.arange(16) % 8) for name in ("a", "b", "c")}
+    prefixes = {"a": [3, 4, 5], "b": [7], "c": [2, 1, 9, 11, 3]}
+    for name, history in histories.items():
+        history.reset(name)
+        prefix = history.prepare(name, prefixes[name])
+        history.commit(prefix, len(prefixes[name]))
+    spans = (("c", 5, [12], [False]), ("a", 3, [6, 7], [True, False]), ("b", 1, [8], [False]))
+    packet = EngramHistoryBatch.prepare(histories, spans, capacity=8)
+    expected = []
+    for name, start, tokens, dead in spans:
+        expected.append(reference_hashes(parameters, prefixes[name] + tokens, [False] * start + dead)[-len(tokens):])
+    assert np.array_equal(packet.hash_ids, np.concatenate(expected))
+    assert [histories[name].position for name in ("a", "b", "c")] == [3, 1, 5]
+    with pytest.raises(ValueError):
+        packet.commit((1, 3, 1))
+    assert all(history.pending is not None for history in histories.values())
+    packet.commit((1, 2, 0))  # one cancelled request consumes no input
+    assert [histories[name].position for name in ("a", "b", "c")] == [5, 1, 6]
+    assert all(history.pending is None for history in histories.values())
+    with pytest.raises(RuntimeError, match="stale"):
+        packet.commit((1, 2, 0))
+
+
+def test_invalid_request_batch_rolls_back_only_unsubmitted_preparations():
+    from vllm_gaudi.ops.deepseek_v41_engram import EngramHistoryBatch
+    histories = {name: EngramTokenHistory(layout(), np.arange(16) % 8) for name in ("a", "b")}
+    for name, history in histories.items():
+        history.reset(name)
+    with pytest.raises(RuntimeError, match="absolute position"):
+        EngramHistoryBatch.prepare(histories, (("a", 0, [3], None), ("b", 1, [4], None)), 2)
+    assert all(history.pending is None and history.position == 0 for history in histories.values())

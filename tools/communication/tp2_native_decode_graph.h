@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Native Gaudi2 TP2 decoder replay. Included after tp2_prepared_plan.h.
+#include <unordered_set>
 
 #include "tp2_native_graph_topology.h"
 #include "tp2_native_dependencies.h"
@@ -78,6 +79,10 @@ class RuntimeApis {
                                         SynExchangeCallback, void*);
   using SynPrepareSegmentedPlanV3 = synStatus (*)(SynGraph, const uint32_t*, const uint32_t*, uint64_t,
                                                   uint64_t, uint32_t, uint32_t, SynExchangeCallback, void*);
+  using SynPrepareBounded = synStatus (*)(SynGraph, const uint32_t*, const uint32_t*, uint64_t,
+                                         const uint32_t*, uint64_t, uint32_t, uint32_t,
+                                         SynExchangeCallback, void*);
+  using SynReplayBounded = synStatus (*)(SynGraph, uint32_t, SyncInfo*, uint64_t*, uint64_t);
   using SynReplayPlan = synStatus (*)(SynGraph, SyncInfo*, uint64_t*, uint64_t);
 
   static RuntimeApis& get() {
@@ -135,6 +140,14 @@ class RuntimeApis {
     });
   }
 
+  void requireBoundedPlan() {
+    requirePlanV2();
+    std::call_once(bounded_once_, [this]() {
+      syn_prepare_bounded = resolve<SynPrepareBounded>("synNativeComputeGraphPrepareBoundedPlanV1");
+      syn_replay_bounded = resolve<SynReplayBounded>("synNativeComputeGraphReplayBoundedPlanV1");
+    });
+  }
+
   void requireSegmentedPlan() {
     requirePlanV2();
     std::call_once(segmented_once_, [this]() {
@@ -151,6 +164,8 @@ class RuntimeApis {
     });
   }
 
+  SynPrepareBounded syn_prepare_bounded = nullptr;
+  SynReplayBounded syn_replay_bounded = nullptr;
   SynPreparePlanV2 syn_prepare_plan_v2 = nullptr;
   SynPrepareSegmentedPlanV3 syn_prepare_segmented_plan_v3 = nullptr;
   SynReplayPlan syn_replay_plan_prefix = nullptr;
@@ -195,6 +210,7 @@ class RuntimeApis {
   std::once_flag plan_once_;
   std::once_flag plan_v2_once_;
   std::once_flag segmented_once_;
+  std::once_flag bounded_once_;
   bool complete_ = false;
 };
 
@@ -410,7 +426,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
   }
 
   void configureLateInputs(std::vector<at::Tensor> inputs) {
-    TORCH_CHECK(state_.load() == State::Created && segmentedPrefixConfigured() && !inputs.empty(),
+    TORCH_CHECK(state_.load() == State::Created && segmentedPrefixAvailable() && !inputs.empty(),
                 "Late inputs must be configured before segmented PP0 capture");
     for (const auto& input : inputs)
       TORCH_CHECK(input.device().type() == at::kHPU && input.numel() && input.is_contiguous(),
@@ -640,7 +656,14 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
     return ticket;
   }
 
-  void scheduleFixed(const std::shared_ptr<NativeCompletion>& ticket) {
+  std::shared_ptr<NativeCompletion> replayBoundedFixedWithCompletion(uint32_t bound) {
+    TORCH_CHECK(bounded_tiles_ && bound <= 8, "Graph has no bounded tile contract");
+    auto ticket = std::make_shared<NativeCompletion>();
+    scheduleFixed(ticket, bound);
+    return ticket;
+  }
+
+  void scheduleFixed(const std::shared_ptr<NativeCompletion>& ticket, uint32_t bound = 8) {
     RECORD_FUNCTION("vllm_gaudi::native_decoder_enqueue", std::vector<c10::IValue>());
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -651,14 +674,14 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
       const uint64_t epoch = input_epoch_.fetch_add(1) + 1;
       TORCH_CHECK(epoch == scheduled_epoch_.load() + 1, "Native fixed replay input epoch changed");
     }
-    replayImpl(ticket);
+    replayImpl(ticket, bound);
   }
 
   void replay() {
     replayImpl(nullptr);
   }
 
-  void replayImpl(const std::shared_ptr<NativeCompletion>& ticket) {
+  void replayImpl(const std::shared_ptr<NativeCompletion>& ticket, uint32_t bound = 8) {
     std::lock_guard<std::mutex> lock(mutex_);
     TORCH_CHECK(state_.load() == State::Instantiated,
                 "Native decoder graph is not instantiated; no fallback was executed");
@@ -673,13 +696,13 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
     auto self = shared_from_this();
     if (ticket) {
       habana::eager::PipelineTask<habana::eager::ThreadType::LOWERING>(
-          [self, epoch, ticket, copies = std::move(copies), dependencies = std::move(dependencies)]() mutable {
+          [self, epoch, bound, ticket, copies = std::move(copies), dependencies = std::move(dependencies)]() mutable {
         habana::HPUDeviceContext::execute_thread().enqueue(
-            [self, epoch, ticket, copies = std::move(copies), dependencies = std::move(dependencies)]() {
+            [self, epoch, bound, ticket, copies = std::move(copies), dependencies = std::move(dependencies)]() {
           try {
             if (!copies.empty()) self->stageInputCopiesOnExecute(copies);
             self->prepareInputDependenciesOnExecute(dependencies);
-            self->replayOnExecute(epoch);
+            self->replayOnExecute(epoch, bound);
             ticket->record(habana::HPUDeviceContext::get_device().get_stream(0));
           } catch (...) {
             self->state_.store(State::Invalid);
@@ -691,7 +714,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
       return;
     }
     habana::eager::PipelineTask<habana::eager::ThreadType::LOWERING>(
-        [self, epoch, copies = std::move(copies), dependencies = std::move(dependencies)]() mutable {
+        [self, epoch, bound, copies = std::move(copies), dependencies = std::move(dependencies)]() mutable {
       if (!copies.empty())
         habana::HPUDeviceContext::execute_thread().enqueue(
             [self, copies = std::move(copies)]() { self->stageInputCopiesOnExecute(copies); });
@@ -699,7 +722,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
           [self, dependencies = std::move(dependencies)]() { self->prepareInputDependenciesOnExecute(dependencies); });
       self->scheduleExternalPrefix();
       habana::HPUDeviceContext::execute_thread().enqueue(
-          [self, epoch]() { self->replayOnExecute(epoch); });
+          [self, epoch, bound]() { self->replayOnExecute(epoch, bound); });
     });
   }
 
@@ -907,6 +930,19 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
                        std::vector<torch::jit::Stack> inputs) {
     frames_ = buildFrames(plans, std::move(inputs));
     segment_count_.store(0);
+    minimum_tile_bounds_.clear();
+    bounded_tiles_ = false;
+    for (const auto& plan : plans)
+      for (const auto& node : plan->nodes) {
+        if (node.exchange) continue;
+        minimum_tile_bounds_.push_back(node.minimum_tile_bound);
+        bounded_tiles_ |= node.minimum_tile_bound != 0;
+      }
+    if (bounded_tiles_) {
+      TORCH_CHECK(jointPlanEnabled() && mhcOverlapEnabled() && !external_prefix_ && !segmentedPrefixConfigured(),
+                  "Bounded tiles require a complete joint dependency plan without external prefix");
+      RuntimeApis::get().requireBoundedPlan();
+    }
     std::vector<NativeNodeKind> node_kinds;
     for (const auto& plan : plans)
       for (const auto& node : plan->nodes) {
@@ -1006,6 +1042,21 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
     TORCH_CHECK(state_.load() == State::Capturing, "Native decoder capture state changed before execution");
     auto& api = RuntimeApis::get();
     auto& device = habana::HPUDeviceContext::get_device();
+    // Captured commands contain physical addresses. Retain their storages and
+    // mark only those allocations immovable; holding a device_ptr_lock for a
+    // graph's lifetime prevents *all* allocator defragmentation, including
+    // unrelated prefill workspaces after the device has become idle.
+    std::unordered_set<void*> fixed;
+    for (const auto& frame : frames_) {
+      for (const auto& value : frame->values) {
+        if (!value.isTensor()) continue;
+        const auto tensor = value.toTensor();
+        if (tensor.device().type() != c10::DeviceType::HPU || !tensor.numel()) continue;
+        const auto backend = habana::eager::HbEagerTensorPool::get_backend_tensor(tensor);
+        void* base = backend.storage().data_ptr().get();
+        if (fixed.insert(base).second) device.get_fixed_address(base);
+      }
+    }
     synStreamHandle stream = device.get_stream(0);
     checkSynapse(api.syn_create(&syn_graph_, stream), "synNativeComputeGraphCreate");
     checkSynapse(api.syn_begin_capture(syn_graph_), "synNativeComputeGraphBeginCapture");
@@ -1023,15 +1074,14 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
       std::vector<at::Tensor> tensors(values.size());
       for (size_t i = 0; i < tensors.size(); ++i) tensors[i] = values[i].toTensor();
       auto holder = std::make_shared<GenericResourceHolder>();
-      std::vector<void*> addresses;
+      std::vector<synapse_helpers::device_ptr> locked;
+      auto& device = habana::HPUDeviceContext::get_device();
       for (const auto& tensor : tensors) {
         holder->add_tensor(tensor);
-        addresses.push_back(tensor.data_ptr());
+        // fix_address requires the storage base, not an offset view handle.
+        const auto base = device.get_fixed_address(tensor.storage().data_ptr().get());
+        locked.push_back(base + tensor.storage_offset() * tensor.element_size());
       }
-      auto context = communicator_->getDeviceCtxt();
-      context->lock_address(addresses, holder->get_address_lock());
-      const auto& locked = *holder->get_address_lock();
-      auto& device = habana::HPUDeviceContext::get_device();
       synStreamHandle stream = device.get_stream(0);
       auto& api = RuntimeApis::get();
       const int exchange_mode = node.reduction_only ? 0 : 1;
@@ -1114,7 +1164,15 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
                     "hcclTp2NativeBatchCreate(decoder) failed");
         HclGraphInfo last;
         TORCH_CHECK(api.hcl_get_info(hcl_graphs_.back(), &last) == hcclSuccess, "HCL batch completion unavailable");
-        if (segmentedPrefixConfigured()) {
+        if (bounded_tiles_) {
+          TORCH_CHECK(minimum_tile_bounds_.size() == segment_count_.load() &&
+                      prepared_producers_.size() == hcl_graphs_.size(),
+                      "Bounded plan compute/collective coverage differs");
+          checkSynapse(api.syn_prepare_bounded(
+              syn_graph_, prepared_producers_.data(), prepared_consumers_.data(), prepared_consumers_.size(),
+              minimum_tile_bounds_.data(), minimum_tile_bounds_.size(), 8, last.completion.longSoIndex,
+              replayNicBatch, hcl_batch_), "synNativeComputeGraphPrepareBoundedPlanV1(decoder)");
+        } else if (segmentedPrefixConfigured()) {
           TORCH_CHECK(NativeGraphTopology::supportsV41SegmentedPrefix(
                           expected_groups_, expected_collectives_, external_prefix_) &&
                           mhcOverlapEnabled() && prepared_producers_.size() == hcl_graphs_.size(),
@@ -1208,7 +1266,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
       device.add_wait_events_on_stream(staged_dependencies, device.get_stream(0));
   }
 
-  void replayOnExecute(uint64_t epoch) {
+  void replayOnExecute(uint64_t epoch, uint32_t bound = 8) {
     RECORD_FUNCTION("vllm_gaudi::native_decoder_publish", std::vector<c10::IValue>());
     std::lock_guard<std::mutex> lock(mutex_);
     TORCH_CHECK(state_.load() == State::Instantiated,
@@ -1220,8 +1278,11 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
       auto& device = habana::HPUDeviceContext::get_device();
       if (hcl_batch_ != nullptr) {
         SyncInfo completion;
-        checkSynapse(api.syn_replay_plan(syn_graph_, &completion, joint_statistics_.data(), joint_statistics_.size()),
-                     "synNativeComputeGraphReplayPlan(decoder)");
+        const auto status = bounded_tiles_
+            ? api.syn_replay_bounded(syn_graph_, bound, &completion, joint_statistics_.data(), joint_statistics_.size())
+            : api.syn_replay_plan(syn_graph_, &completion, joint_statistics_.data(), joint_statistics_.size());
+        checkSynapse(status, bounded_tiles_ ? "synNativeComputeGraphReplayBoundedPlanV1(decoder)"
+                                          : "synNativeComputeGraphReplayPlan(decoder)");
       } else {
       checkSynapse(api.syn_begin_replay(syn_graph_), "synNativeComputeGraphBeginReplay");
       SyncInfo compute_completion;
@@ -1330,9 +1391,16 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
     }
   }
 
-  bool segmentedPrefixConfigured() const {
+  bool segmentedPrefixAvailable() const {
     return segmentedPrefixEnabled() && NativeGraphTopology::supportsV41SegmentedPrefix(
         expected_groups_, expected_collectives_, external_prefix_);
+  }
+
+  bool segmentedPrefixConfigured() const {
+    // Topology alone is not a request to split input publication. Ordinary
+    // request batches can share PP0's collective counts, but bind every input
+    // before submission. Only configureLateInputs opts a graph into splitting.
+    return segmentedPrefixAvailable() && !late_inputs_.empty();
   }
 
   void prepareCompletionAddresses() {
@@ -1373,6 +1441,8 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
   RuntimeApis::HclBatch hcl_batch_ = nullptr;
   std::array<uint64_t, 12> joint_statistics_ {};
   std::array<uint64_t, 8> retirement_statistics_ {};
+  bool bounded_tiles_ = false;
+  std::vector<uint32_t> minimum_tile_bounds_;
   std::vector<uint32_t> prepared_consumers_;
   std::vector<uint32_t> prepared_producers_;
   std::vector<NativeCollectiveDependency> prepared_dependencies_;

@@ -605,6 +605,13 @@ class HpuPlatform(Platform):
     @classmethod
     def get_max_concurrent_batches(cls, vllm_config):
         from vllm_gaudi.ops.deepseek_v41_config import is_v41, uses_v2
+        if is_v41(vllm_config) and gaudi_envs.VLLM_HPU_DSV41_BATCH_DECODE:
+            # BatchExecution owns one synchronous PP transaction and one
+            # candidate scratch generation. Advertising PP+1 in-flight
+            # batches splits available requests across queued transactions
+            # without overlapping their device work. Publish more capacity
+            # only with independent, event-owned PP microbatch scratch.
+            return 1
         if uses_v2(vllm_config):
             return vllm_config.parallel_config.pipeline_parallel_size + 1
         # This runner owns one PP/verify transaction. The scheduler must commit

@@ -158,6 +158,7 @@ def test_normal_runner_transactions_and_ineligible_requests(monkeypatch, batch, 
     monkeypatch.delenv("VLLM_HPU_DSV41_PREFILL_COMPUTE_TOKENS", raising=False)
     program = SimpleNamespace(tensor_parallel_size=4, runtime_indexer=False, length=524288, prefill_halo_mode="full")
     request = SimpleNamespace(num_computed_tokens=0,
+                              decode_start=32768,
                               tokens=list(range(32768)),
                               prompt=list(range(32768)),
                               mm_features=[object()] if multimodal else [],

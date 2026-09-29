@@ -26,7 +26,7 @@ def test_query_region_uses_execution_phase_not_decode_batch_size(monkeypatch, cl
                             q_scale_rope=False,
                             heads=32,
                             linear=linear,
-                            _rope=lambda x, p: x)
+                            _rope=lambda x, p, **kwargs: x)
     value = torch.zeros(tokens, 1280, dtype=torch.bfloat16)
     result = cls.project_query(owner, value, torch.arange(tokens, dtype=torch.int32), decode=decode)
     assert result.shape == (tokens, 32, 512)
@@ -41,7 +41,7 @@ def test_output_region_does_not_replace_decode_or_small_tail(monkeypatch, tokens
     owner = SimpleNamespace(layer=0,
                             groups=4,
                             heads=32,
-                            _rope=lambda x, p, inverse: x,
+                            _rope=lambda x, p, inverse, **kwargs: x,
                             project_output=lambda x: x,
                             project_output_consumer=lambda x: x,
                             reduce=lambda x, ready_outputs: (seen.append(ready_outputs), result)[1],

@@ -32,6 +32,22 @@ static inline bfloat128 selected_fp4(ushort128 code) {
     return *((bfloat128*)&bits);
 }
 
+#ifdef DSV41_DIRECT_MLA_KV
+// Materialize the same rounded BF16 values for QK and widened FP32 values
+// for PV. Both operands are owned by the compound's SRAM section.
+static inline void selected_store(int chunk, int slot, int token, tensor rows,
+                                  tensor values, bfloat128 value) {
+    const int offset = chunk * 128;
+    v_bf16_st_tnsr((int5){offset, slot, token}, rows, value);
+    const float128 rounded = convert_bfloat128_to_float128(value, SW_LINEAR);
+    v_f32_st_tnsr((int5){offset, slot, token}, values, rounded.v1);
+    v_f32_st_tnsr((int5){offset + 64, slot, token}, values, rounded.v2);
+}
+#define STORE_SELECTED(chunk, value) selected_store(chunk, slot, token, rows, values, value)
+void main(tensor swa, tensor main_cache, tensor indices, tensor selected,
+          tensor lengths, tensor rows, tensor values, tensor mask) {
+#else
+#define STORE_SELECTED(chunk, value) v_bf16_st_tnsr((int5){chunk * 128, slot, 0, 0, 0}, rows, value)
 void main(tensor swa, tensor main_cache, tensor indices,
 #ifdef DSV41_KV_WRITE_DEPENDENCY
           tensor completion,
@@ -40,6 +56,7 @@ void main(tensor swa, tensor main_cache, tensor indices,
           tensor compressed_completion,
 #endif
           tensor rows, tensor local_indices) {
+#endif
 #ifdef DSV41_KV_WRITE_DEPENDENCY
     const bool swa_ready = s_i32_ld_g(gen_addr((int5){0}, completion)) >= 0;
 #else
@@ -52,23 +69,39 @@ void main(tensor swa, tensor main_cache, tensor indices,
 #endif
     const int5 begin = get_index_space_offset();
     const int5 end = begin + get_index_space_size();
+#ifndef DSV41_DIRECT_MLA_KV
     const int slots = get_dim_size(indices, 0);
+#endif
     const int swa_length = get_dim_size(swa, 1);
     const int main_length = get_dim_size(main_cache, 0) == 288 ? get_dim_size(main_cache, 1) : 0;
     const uchar256 lanes = V_LANE_ID_8;
     const uchar256 fp4_directions = (lanes >> 1) | 0x80;
     const ushort128 nibble_shifts = ((ushort128)V_LANE_ID_16 & 1) << 2;
+#ifdef DSV41_DIRECT_MLA_KV
+    for (int token = begin[1]; token < end[1]; ++token) {
+        const int length = s_i32_ld_g(gen_addr((int5){token}, lengths));
+        for (int slot = begin[0]; slot < end[0]; ++slot) {
+            const int local = s_i32_ld_g(gen_addr((int5){slot, token}, selected));
+            const bool selected_valid = slot < length && local >= 0 && local < get_dim_size(indices, 0);
+            const int index = selected_valid ? s_i32_ld_g(gen_addr((int5){local, 0}, indices)) : -1;
+            // Invalid physical addresses still contribute a zero KV row when
+            // the local selection is valid, matching the two-gather contract.
+            s_f32_st_g(gen_addr((int5){slot, token}, mask), selected_valid ? 1.0f : 0.0f);
+#else
     for (int point = begin[0]; point < end[0]; ++point) {
         for (int slot = point; slot < slots; slot += 128) {
             const int index = s_i32_ld_g(gen_addr((int5){slot, 0, 0, 0, 0}, indices));
+#endif
             const bool valid = ready && index >= 0 && index < swa_length + main_length;
+#ifndef DSV41_DIRECT_MLA_KV
             s_i32_st_g(gen_addr((int5){slot, 0, 0, 0, 0}, local_indices), valid ? slot : -1);
+#endif
 #ifdef DSV41_SELECTED_VALID_ONLY
             if (!valid) continue;
 #endif
             if (!valid) {
                 for (int chunk = 0; chunk < 4; ++chunk)
-                    v_bf16_st_tnsr((int5){chunk * 128, slot, 0, 0, 0}, rows, (bfloat128){0});
+                    STORE_SELECTED(chunk, (bfloat128){0});
             } else if (index < swa_length) {
                 const uchar256 raw_scales = v_u8_ld_tnsr_partial_b((int5){512, index, 0, 0, 0}, swa, 15, 0);
                 const uchar256 row_scales = v_u8_mov_dual_group_all_b(
@@ -80,7 +113,7 @@ void main(tensor swa, tensor main_cache, tensor indices,
                     const uchar256 scale_bytes = v_u8_shuffle_b(row_scales, directions, 0, (uchar256){0});
                     const ushort128 scales = convert_uchar256_to_ushort256(scale_bytes, SW_LINEAR).v1;
                     const bfloat128 value = v_bf16_mul_b(selected_e4m3fn(code), selected_ue8m0(scales));
-                    v_bf16_st_tnsr((int5){chunk * 128, slot, 0, 0, 0}, rows, value);
+                    STORE_SELECTED(chunk, value);
                 }
             } else {
                 const int row = index - swa_length;
@@ -98,9 +131,10 @@ void main(tensor swa, tensor main_cache, tensor indices,
                     const ushort128 scales = convert_uchar256_to_ushort256(scale_bytes, SW_LINEAR).v1;
                     bfloat128 value = v_bf16_mul_b(selected_fp4(code), selected_e4m3fn(scales));
                     value = v_bf16_sel_eq_bf16_b(value, (bfloat)0, (bfloat)0, value);
-                    v_bf16_st_tnsr((int5){chunk * 128, slot, 0, 0, 0}, rows, value);
+                    STORE_SELECTED(chunk, value);
                 }
             }
         }
     }
 }
+#undef STORE_SELECTED

@@ -1,0 +1,78 @@
+diff --git a/tests/distributed/test_shm_broadcast.py b/tests/distributed/test_shm_broadcast.py
+index c3833b6b9f..59192e08fd 100644
+--- a/tests/distributed/test_shm_broadcast.py
++++ b/tests/distributed/test_shm_broadcast.py
+@@ -28,6 +28,44 @@ from vllm.utils.network_utils import get_open_port
+ from vllm.utils.system_utils import update_environment_variables
+
+
++def test_spin_condition_concurrent_cancel_wakes_reader_once():
++    """Parent death and worker cleanup must not share a concurrent socket send."""
++    from concurrent.futures import ThreadPoolExecutor
++
++    import zmq
++
++    from vllm.utils.network_utils import get_open_zmq_inproc_path
++
++    with zmq.Context() as context:
++        reader = shm_broadcast.SpinCondition(
++            True, context, get_open_zmq_inproc_path(), busy_loop_s=0
++        )
++        socket = reader.write_cancel_socket
++        wire_lock = threading.Lock()
++        barrier = threading.Barrier(16)
++
++        def send(value):
++            # Keep the regression test safe on the broken implementation:
++            # duplicate sends must fail an assertion, not abort libzmq.
++            with wire_lock:
++                time.sleep(0.001)
++                socket.send(value)
++
++        spy = mock.Mock(side_effect=send)
++        reader.write_cancel_socket = SimpleNamespace(send=spy)
++
++        def cancel(_):
++            barrier.wait(timeout=5)
++            reader.cancel()
++
++        with ThreadPoolExecutor(max_workers=16) as pool:
++            list(pool.map(cancel, range(16)))
++        reader.cancel()
++        spy.assert_called_once_with(b"\x00")
++        assert reader.read_cancel_socket.poll(timeout=1000) & zmq.POLLIN
++        reader.wait(timeout_ms=1000)
++
++
+ def get_arrays(n: int, seed: int = 0) -> list[np.ndarray]:
+     np.random.seed(seed)
+     sizes = np.random.randint(1, 10_000, n)
+diff --git a/vllm/distributed/device_communicators/shm_broadcast.py b/vllm/distributed/device_communicators/shm_broadcast.py
+index 6caacea6ec..3bf1884e44 100644
+--- a/vllm/distributed/device_communicators/shm_broadcast.py
++++ b/vllm/distributed/device_communicators/shm_broadcast.py
+@@ -134,6 +134,8 @@ class SpinCondition:
+         busy_loop_s: float = 1,
+     ):
+         self.is_reader = is_reader
++        self._cancel_lock = threading.Lock()
++        self._cancelled = False
+
+         if is_reader:
+             # Time of last shm buffer read
+@@ -185,8 +187,13 @@ class SpinCondition:
+         # Sends cancellation ping that will cause the reader to wake up.
+         # This is done from a monitor thread in the same process as the reader.
+         if self.is_reader:
+-            logger.debug("Canceling waiting reads on SHM Buffer")
+-            self.write_cancel_socket.send(b"\x00")
++            # Worker cleanup and parent-death monitoring may race. PAIR
++            # sockets cannot be used concurrently; cancellation is sticky.
++            with self._cancel_lock:
++                if not self._cancelled:
++                    logger.debug("Canceling waiting reads on SHM Buffer")
++                    self.write_cancel_socket.send(b"\x00")
++                    self._cancelled = True
+
+     def wait(self, timeout_ms: int | None = None) -> None:
+         """Wait for data on the shared memory buffer.

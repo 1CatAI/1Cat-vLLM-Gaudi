@@ -1631,6 +1631,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         return self.add_slot(preparedIValue(value), input);
       })
       .def("add_compute", &PreparedGroupPlan::add_compute)
+      .def("mark_last_optional_tile", &PreparedGroupPlan::mark_last_optional_tile)
       .def("add_norm_view", &PreparedGroupPlan::add_norm_view)
       .def("add_reshape_view", &PreparedGroupPlan::add_reshape_view)
       .def("add_exchange", &PreparedGroupPlan::add_exchange)
@@ -1704,6 +1705,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       .def("stage_fixed_inputs", &tp2_native::NativeDecodeGraph::stageFixedInputs)
       .def("replay_fixed", &tp2_native::NativeDecodeGraph::replayFixed)
       .def("replay_fixed_with_completion", &tp2_native::NativeDecodeGraph::replayFixedWithCompletion)
+      .def("replay_bounded_fixed_with_completion", &tp2_native::NativeDecodeGraph::replayBoundedFixedWithCompletion)
       .def("replay_fixed_prefix", &tp2_native::NativeDecodeGraph::replayFixedPrefix)
       .def("replay_fixed_finish_with_completion",
            &tp2_native::NativeDecodeGraph::replayFixedFinishWithCompletion)

@@ -3,20 +3,17 @@
 
 One owner per TP shard and layer fits a bounded per-process RLIMIT_MEMLOCK.
 Owners map the original files read-only; workers map those same physical pages.
-Device-readable tables use one shared memfd backing instead: the driver pins
-with FOLL_WRITE, which otherwise creates a private copy of every checkpoint page.
 This module deliberately does not import torch or initialize an HPU context.
 """
 import contextlib
 import ctypes
-import fcntl
 import hashlib
 import json
 import multiprocessing
 import os
 from pathlib import Path
-import re
 import resource
+import re
 import signal
 import tempfile
 import threading
@@ -57,141 +54,62 @@ def aligned_region(region):
     return offset - delta, ((length + delta + page - 1) // page) * page
 
 
-def _interval_union(intervals):
-    merged = []
-    for start, stop in sorted(intervals):
-        if merged and start <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(stop, merged[-1][1]))
-        else:
-            merged.append((start, stop))
-    return merged
+def locked_shared_bytes(owners, proc=Path("/proc")):
+    """Credit only identical file extents already fully locked by live owners.
 
-
-def locked_file_reuse(owners, *, proc_root=Path("/proc")):
-    """Audit source pages already locked by another read-only shared mapping.
-
-    MemAvailable already includes reclaimable file cache, so only fully resident,
-    locked mappings earn admission credit. New device memfds are distinct physical
-    allocations and receive no credit for their checkpoint's file pages.
+    Ordinary page-cache residency is reclaimable and receives no credit. Each
+    inode range is counted once even when several processes lock the same pages.
+    Our new owners still take their own locks and verify mincore before readiness.
     """
-    wanted, identities = {}, {}
+    wanted, covered = {}, {}
     for owner in owners:
-        if owner.get("shared_memory", False):
-            continue
         for region in owner["regions"]:
-            stat = os.stat(region["file"])
-            if region["offset"] + region["length"] > stat.st_size:
-                raise ValueError("Engram mapping exceeds the frozen file")
-            key = (os.major(stat.st_dev), os.minor(stat.st_dev), stat.st_ino)
-            offset, length = aligned_region(region)
-            wanted.setdefault(key, []).append((offset, offset + length))
-            identities[region["file"]] = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
-    wanted = {key: _interval_union(extents) for key, extents in wanted.items()}
-    header = re.compile(r"^([0-9a-f]+)-([0-9a-f]+) ([-rwxps]{4}) ([0-9a-f]+) "
-                        r"([0-9a-f]+):([0-9a-f]+) ([0-9]+)(?: |$)")
-    credited, records = {}, []
-    if wanted:
-        for process in proc_root.glob("[0-9]*"):
-            try:
-                # Avoid expanding smaps for processes with no matching tables.
-                matches = [header.match(line) for line in (process / "maps").read_text().splitlines()]
-                if not any(match and (int(match[5], 16), int(match[6], 16), int(match[7])) in wanted
-                           for match in matches):
-                    continue
-                smaps = (process / "smaps").read_text()
-            except (FileNotFoundError, ProcessLookupError, PermissionError):
+            stat = Path(region["file"]).stat()
+            key = os.major(stat.st_dev), os.minor(stat.st_dev), stat.st_ino
+            offset, size = aligned_region(region)
+            wanted.setdefault(key, []).append((offset, offset + size))
+    header = re.compile(r"^([0-9a-f]+)-([0-9a-f]+) (\S+) ([0-9a-f]+) ([0-9a-f]+):([0-9a-f]+) (\d+)(?: |$)")
+    for process in proc.iterdir():
+        if not process.name.isdigit():
+            continue
+        try:
+            # Residency helpers use spawn and small address spaces. Workers'
+            # unlocked mappings cannot establish this credit.
+            if b"multiprocessing.spawn" not in (process / "cmdline").read_bytes():
                 continue
-            current = None
-            for line in smaps.splitlines():
+            current, resident, locked = None, 0, 0
+            for line in (process / "smaps").read_text().splitlines():
                 match = header.match(line)
                 if match:
-                    key = (int(match[5], 16), int(match[6], 16), int(match[7]))
+                    start, end, perms, offset, major, minor, inode = match.groups()
+                    key = int(major, 16), int(minor, 16), int(inode)
+                    current = (key, int(offset, 16),
+                               int(end, 16) - int(start, 16)) if (key in wanted and perms.endswith("s")) else None
+                    resident = locked = 0
+                elif current is not None and line.startswith("Rss:"):
+                    resident = int(line.split()[1]) * 1024
+                elif current is not None and line.startswith("Locked:"):
+                    locked = int(line.split()[1]) * 1024
+                elif current is not None and line.startswith("VmFlags:"):
+                    key, offset, size = current
+                    # Locked is proportionally charged for shared mappings;
+                    # VmFlags lo plus full RSS proves this entire VMA is locked.
+                    if "lo" in line.split()[1:] and resident >= size and locked > 0:
+                        for start, end in wanted[key]:
+                            lo, hi = max(start, offset), min(end, offset + size)
+                            if lo < hi:
+                                covered.setdefault(key, []).append((lo, hi))
                     current = None
-                    if key in wanted and match[3] == "r--s":
-                        current = dict(key=key,
-                                       offset=int(match[4], 16),
-                                       length=int(match[2], 16) - int(match[1], 16),
-                                       rss=0)
-                elif current and line.startswith("Rss:"):
-                    current["rss"] = int(line.split()[1]) * 1024
-                elif current and line.startswith("VmFlags:"):
-                    if "lo" in line.split()[1:] and current["rss"] == current["length"]:
-                        low, high = current["offset"], current["offset"] + current["length"]
-                        for start, stop in wanted[current["key"]]:
-                            overlap = (max(low, start), min(high, stop))
-                            if overlap[1] > overlap[0]:
-                                credited.setdefault(current["key"], []).append(overlap)
-                                records.append(
-                                    dict(pid=int(process.name),
-                                         device_inode=current["key"],
-                                         offset=overlap[0],
-                                         length=overlap[1] - overlap[0]))
-                    current = None
-    for file, identity in identities.items():
-        stat = os.stat(file)
-        if identity != (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns):
-            raise RuntimeError("Engram source changed during resident-page audit")
-    reused = sum(stop - start for intervals in credited.values() for start, stop in _interval_union(intervals))
-    return dict(reused_bytes=reused,
-                mappings=records,
-                source_identities={
-                    file: dict(zip(("device", "inode", "size", "mtime_ns"), identity))
-                    for file, identity in identities.items()
-                })
-
-
-def shared_host_region(region):
-    """Copy one source extent into the sole shared, device-pinnable backing.
-
-    Only a bounded transfer chunk is temporary. Both CPU gather and the device
-    producer must bind this backing, never keep a second resident table. The
-    checkpoint is opened read-only and its identity is checked across the copy.
-    """
-    descriptor = os.memfd_create("dsv41-engram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
-    try:
-        with open(region["file"], "rb", buffering=0) as source:
-            before = os.fstat(source.fileno())
-            if region["offset"] < 0 or region["offset"] + region["length"] > before.st_size:
-                raise ValueError("Shared Engram extent exceeds its source")
-            os.ftruncate(descriptor, region["length"])
-            source.seek(region["offset"])
-            remaining, digest = region["length"], hashlib.sha256()
-            while remaining:
-                data = source.read(min(16 * 1024**2, remaining))
-                if not data:
-                    raise ValueError("Truncated shared Engram source")
-                digest.update(data)
-                view = memoryview(data)
-                while view:
-                    written = os.write(descriptor, view)
-                    if written <= 0:
-                        raise OSError("Short shared Engram write")
-                    view = view[written:]
-                remaining -= len(data)
-            after = os.fstat(source.fileno())
-            if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino,
-                                                                                      after.st_size, after.st_mtime_ns):
-                raise RuntimeError("Engram source changed during shared preparation")
-        # A writable registration is required by the driver. Seal its extent;
-        # the native producer makes its CPU mapping read-only after pinning.
-        fcntl.fcntl(descriptor, fcntl.F_ADD_SEALS, fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
-        target = os.fstat(descriptor)
-        binding = dict(file=f"/proc/{os.getpid()}/fd/{descriptor}",
-                       offset=0,
-                       length=region["length"],
-                       source=dict(region),
-                       source_identity=dict(device=before.st_dev,
-                                            inode=before.st_ino,
-                                            size=before.st_size,
-                                            mtime_ns=before.st_mtime_ns),
-                       device=target.st_dev,
-                       inode=target.st_ino,
-                       sha256=digest.hexdigest(),
-                       backing="shared_memfd")
-        return descriptor, binding
-    except BaseException:
-        os.close(descriptor)
-        raise
+        except (OSError, ValueError):
+            # An owner may exit during inspection; missing evidence gives no credit.
+            continue
+    total = 0
+    for intervals in covered.values():
+        end = -1
+        for lo, hi in sorted(intervals):
+            total += max(0, hi - max(lo, end))
+            end = max(end, hi)
+    return total
 
 
 class LockedMapping:
@@ -244,7 +162,7 @@ class LockedMapping:
 
 
 def _owner(connection, owner, parent_pid):
-    mappings, descriptors, bindings = [], [], []
+    mappings = []
     try:
         # Release only our mappings if the API owner exits without Python cleanup.
         lib = ctypes.CDLL(None, use_errno=True)
@@ -256,15 +174,7 @@ def _owner(connection, owner, parent_pid):
             raise RuntimeError(f"Engram owner needs {requested} locked bytes; hard limit is {hard}")
         if soft != resource.RLIM_INFINITY and requested > soft:
             resource.setrlimit(resource.RLIMIT_MEMLOCK, (requested, hard))
-        regions = owner["regions"]
-        if owner.get("shared_memory", False):
-            for region in regions:
-                descriptor, binding = shared_host_region(region)
-                descriptors.append(descriptor)
-                bindings.append(binding)
-            regions = bindings
-        requested = sum(aligned_region(r)[1] for r in regions)
-        for region in regions:
+        for region in owner["regions"]:
             mappings.append(LockedMapping(region))
         page = os.sysconf("SC_PAGESIZE")
         resident = sum(mapping.resident_pages() for mapping in mappings)
@@ -277,7 +187,6 @@ def _owner(connection, owner, parent_pid):
                  layer=owner["layer"],
                  locked_bytes=requested,
                  resident_pages=resident,
-                 bindings=bindings,
                  files=[mapping.identity for mapping in mappings]))
         # EOF also releases the mappings when the controller vanishes.
         connection.recv()
@@ -289,46 +198,37 @@ def _owner(connection, owner, parent_pid):
     finally:
         for mapping in mappings:
             mapping.close()
-        for descriptor in descriptors:
-            os.close(descriptor)
         connection.close()
 
 
 class EngramResidency:
     """Start before model loading; release after all consumers have stopped."""
 
-    def __init__(self, owners, budget_bytes=224 * 1024**3, *, device_layers=()):
-        self.owners = [dict(owner, shared_memory=owner["layer"] in device_layers) for owner in owners]
-        self.budget_bytes = budget_bytes
+    def __init__(self, owners, budget_bytes=224 * 1024**3):
+        self.owners, self.budget_bytes = owners, budget_bytes
         self.processes, self.connections, self.reports = [], [], []
         self.stopped = threading.Event()
         self.monitor = None
-        self.admission = None
-        self.close_lock = threading.Lock()
+        self.shared_locked_bytes = 0
 
-    def start(self, *, timeout=600, check_available=True):
+    def start(self, *, timeout=600, check_available=True, cancel=None):
         requested = sum(aligned_region(r)[1] for owner in self.owners for r in owner["regions"])
         if requested > self.budget_bytes or not self.owners:
             raise RuntimeError("Engram mappings exceed the configured host budget")
         if check_available:
             fields = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
             available = int(fields["MemAvailable"].split()[0]) * 1024
-            audit = locked_file_reuse(self.owners) if available < self.budget_bytes else dict(reused_bytes=0)
-            required = max(0, self.budget_bytes - audit["reused_bytes"])
-            self.admission = dict(audit,
-                                  available_bytes=available,
-                                  required_available_bytes=required,
-                                  budget_bytes=self.budget_bytes,
-                                  mapped_bytes=requested)
-            if available < required:
-                raise RuntimeError(f"Engram host budget unavailable after locked-page reuse: {available} < {required}; "
-                                   f"reused {audit['reused_bytes']} bytes; wait for resources")
+            self.shared_locked_bytes = locked_shared_bytes(self.owners) if available < self.budget_bytes else 0
+            additional = self.budget_bytes - self.shared_locked_bytes
+            if available < additional:
+                raise RuntimeError(f"Engram host budget unavailable: {available} < {additional} additional bytes "
+                                   f"({self.shared_locked_bytes} already locked shared bytes); wait for resources")
         context = multiprocessing.get_context("spawn")
         deadline = time.monotonic() + timeout
         try:
             for owner in self.owners:
-                if self.stopped.is_set():
-                    raise RuntimeError("Engram residency stopped during preparation")
+                if cancel is not None and cancel.is_set():
+                    raise RuntimeError("Engram residency preparation cancelled")
                 parent, child = context.Pipe()
                 process = context.Process(target=_owner,
                                           args=(child, owner, os.getpid()),
@@ -338,9 +238,9 @@ class EngramResidency:
                 self.processes.append(process)
                 self.connections.append(parent)
             for connection in self.connections:
-                while not connection.poll(.2):
-                    if self.stopped.is_set():
-                        raise RuntimeError("Engram residency stopped during preparation")
+                while not connection.poll(.05):
+                    if cancel is not None and cancel.is_set():
+                        raise RuntimeError("Engram residency preparation cancelled")
                     if time.monotonic() >= deadline:
                         raise TimeoutError("Engram residency preparation timed out")
                 report = connection.recv()
@@ -352,14 +252,6 @@ class EngramResidency:
             self.close()
             raise
         return self
-
-    def worker_bindings(self):
-        self.check()
-        result = {}
-        for report in self.reports:
-            if report["bindings"]:
-                result.setdefault(str(report["tp"]), {})[str(report["layer"])] = report["bindings"]
-        return result
 
     def check(self):
         if self.stopped.is_set() or len(self.reports) != len(self.owners) or any(not process.is_alive()
@@ -381,114 +273,115 @@ class EngramResidency:
 
     def close(self):
         self.stopped.set()
-        # Startup cancellation and the controller can retire the same lease
-        # concurrently. Serialize closing descriptors and joining children.
-        with self.close_lock:
-            for connection in self.connections:
-                connection.close()
-            for process in self.processes:
+        for connection in self.connections:
+            connection.close()
+        for process in self.processes:
+            process.join(timeout=2)
+            if process.is_alive():
+                process.terminate()
                 process.join(timeout=2)
-                if process.is_alive():
-                    process.terminate()
-                    process.join(timeout=2)
-            if self.monitor is not None:
-                self.monitor.join(timeout=2)
+        if self.monitor is not None:
+            self.monitor.join(timeout=2)
 
 
-def _publish(path, value):
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(value))
-    temporary.replace(path)
-
-
-def wait_for_resident_tables(directory, rank, module, *, timeout=900):
-    """A worker calls this after device/communication initialization."""
+def wait_for_engram_residency(rank, world_size, *, timeout=900):
+    """Announce initialized device/collectives before pinning the host table."""
+    directory = os.environ.get("DSV41_ENGRAM_DEVICE_GATE")
+    if directory is None:
+        return
     directory = Path(directory)
-    controller = json.loads((directory / "controller.json").read_text())
-    if not 0 <= rank < len(controller["modules"]) or str(module) != controller["modules"][rank]:
-        raise RuntimeError("Engram startup worker/module ownership mismatch")
-    _publish(directory / f"worker-{rank}.json", dict(pid=os.getpid(), module=str(module)))
+    contract = json.loads((directory / "contract.json").read_text())
+    if world_size != contract["world_size"] or not 0 <= rank < world_size:
+        raise RuntimeError("Engram device/residency world mismatch")
+    marker = directory / f"rank{rank}.json"
+    with marker.open("x") as stream:
+        json.dump(dict(rank=rank, pid=os.getpid()), stream)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if (directory / "error.json").exists():
             raise RuntimeError(json.loads((directory / "error.json").read_text())["error"])
         if (directory / "ready.json").exists():
-            return json.loads((directory / "ready.json").read_text())["bindings"]
-        os.kill(controller["pid"], 0)
-        time.sleep(.1)
-    raise TimeoutError("Engram residency did not complete after device initialization")
+            return
+        try:
+            os.kill(contract["parent_pid"], 0)
+        except ProcessLookupError as error:
+            raise RuntimeError("Engram residency controller disappeared") from error
+        time.sleep(.05)
+    raise TimeoutError("Device initialized but Engram residency is not ready")
 
 
-class EngramStartup:
-    """Initialize device contexts before locking the large host table.
+class EngramDeviceGate:
+    """Initialize HPU DMA contexts before mlock makes table pages unmovable.
 
-    Gaudi context creation needs physically contiguous host DMA pages. Filling
-    and locking a large table first can make that allocation fail even while
-    MemAvailable remains high. Workers rendezvous before any model allocation;
-    all subsequently bind the same controller-owned table pages.
+    Workers stop at this gate before model allocation. The private directory
+    belongs to one service generation; it is not a reusable readiness cache.
     """
 
-    def __init__(self, residency, modules, *, report_path=None, timeout=900):
+    def __init__(self, residency, *, world_size=4, timeout=900, on_ready=None, on_failure=None):
         self.residency = residency
-        self.modules = tuple(str(module) for module in modules)
-        self.report_path = None if report_path is None else Path(report_path)
-        self.timeout = timeout
-        self.temporary = tempfile.TemporaryDirectory(prefix="engram-start-")
-        self.directory = Path(self.temporary.name)
-        self.stopped = threading.Event()
+        self.world_size, self.timeout = world_size, timeout
+        self.on_ready, self.on_failure = on_ready, on_failure
+        self.stop = threading.Event()
+        self.directory = tempfile.TemporaryDirectory(prefix="dsv41-engram-device-")
+        self.path = Path(self.directory.name)
+        (self.path / "contract.json").write_text(json.dumps(dict(world_size=world_size, parent_pid=os.getpid())))
         self.thread = None
-        _publish(self.directory / "controller.json", dict(pid=os.getpid(), modules=self.modules))
 
-    def start(self, on_failure):
-
-        def prepare():
-            try:
-                deadline = time.monotonic() + self.timeout
-                while not self.stopped.is_set():
-                    workers = [self.directory / f"worker-{rank}.json" for rank in range(len(self.modules))]
-                    if all(path.exists() for path in workers):
-                        for path, module in zip(workers, self.modules):
-                            worker = json.loads(path.read_text())
-                            if worker["module"] != module:
-                                raise RuntimeError("Engram startup received a foreign device binding")
-                            os.kill(worker["pid"], 0)
-                        break
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError("Devices did not initialize before Engram preparation")
-                    self.stopped.wait(.1)
-                if self.stopped.is_set():
-                    return
-                self.residency.start(timeout=self.timeout)
-                if self.stopped.is_set():
-                    return
-                report = dict(policy="locked-shared-host-pages",
-                              budget_bytes=self.residency.budget_bytes,
-                              admission=self.residency.admission,
-                              owners=self.residency.reports)
-                if self.report_path is not None:
-                    _publish(self.report_path, report)
-                self.residency.watch(on_failure)
-                _publish(self.directory / "ready.json", dict(bindings=self.residency.worker_bindings()))
-                print("Engram residency ready: " + json.dumps(report), flush=True)
-                # PR_SET_PDEATHSIG follows the creating Linux thread, not
-                # merely its process. Keep that thread alive with its owners.
-                self.stopped.wait()
-            except BaseException as error:
-                if not self.stopped.is_set():
-                    _publish(self.directory / "error.json", dict(error=repr(error)))
-            finally:
-                if self.stopped.is_set():
-                    self.residency.close()
-
-        self.thread = threading.Thread(target=prepare, name="engram-startup", daemon=True)
+    def start(self):
+        if "DSV41_ENGRAM_DEVICE_GATE" in os.environ:
+            raise RuntimeError("Engram device gate already belongs to a service")
+        os.environ["DSV41_ENGRAM_DEVICE_GATE"] = str(self.path)
+        self.thread = threading.Thread(target=self._run, name="engram-device-gate", daemon=True)
         self.thread.start()
         return self
 
+    def _run(self):
+        try:
+            deadline = time.monotonic() + self.timeout
+            while not self.stop.wait(.05):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Not all HPU workers reached the Engram residency gate")
+                records = []
+                for rank in range(self.world_size):
+                    try:
+                        record = json.loads((self.path / f"rank{rank}.json").read_text())
+                    except (FileNotFoundError, json.JSONDecodeError):
+                        break
+                    if record["rank"] != rank:
+                        raise RuntimeError("Engram device gate rank mismatch")
+                    os.kill(record["pid"], 0)
+                    records.append(record)
+                if len(records) == self.world_size:
+                    break
+            if self.stop.is_set():
+                return
+            self.residency.start(timeout=max(0, deadline - time.monotonic()), cancel=self.stop)
+            report = dict(policy="locked-shared-file-pages-after-device-init",
+                          budget_bytes=self.residency.budget_bytes,
+                          owners=self.residency.reports,
+                          initialized_workers=records)
+            if self.on_ready is not None:
+                self.on_ready(report)
+            temporary = self.path / "ready.tmp"
+            temporary.write_text(json.dumps(report))
+            temporary.replace(self.path / "ready.json")
+            while not self.stop.wait(.5):
+                self.residency.check()
+        except Exception as error:
+            temporary = self.path / "error.tmp"
+            temporary.write_text(json.dumps(dict(error=repr(error))))
+            temporary.replace(self.path / "error.json")
+            if not self.stop.is_set() and self.on_failure is not None:
+                self.on_failure()
+        finally:
+            self.residency.close()
+
     def close(self):
-        self.stopped.set()
-        self.residency.close()
+        self.stop.set()
         if self.thread is not None:
-            self.thread.join(timeout=30)
-            if self.thread.is_alive():
-                raise RuntimeError("Engram preparation did not retire on shutdown")
-        self.temporary.cleanup()
+            # Owners are spawned and retired only by the controller thread.
+            # Do not race its mlock/connection startup from API cleanup.
+            self.thread.join()
+        if os.environ.get("DSV41_ENGRAM_DEVICE_GATE") == str(self.path):
+            os.environ.pop("DSV41_ENGRAM_DEVICE_GATE")
+        self.directory.cleanup()

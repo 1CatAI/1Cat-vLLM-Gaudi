@@ -2,14 +2,19 @@
 import json
 import os
 import hashlib
-import fcntl
+from concurrent.futures import ThreadPoolExecutor
 import threading
 
 import pytest
 
-from vllm_gaudi.ops.deepseek_v41_host import resident_table_source
-from vllm_gaudi.ops.deepseek_v41_residency import (EngramResidency, EngramStartup, LockedMapping, locked_file_reuse,
-                                                   shared_host_region, table_regions, wait_for_resident_tables)
+from vllm_gaudi.ops.deepseek_v41_residency import (
+    EngramDeviceGate,
+    EngramResidency,
+    LockedMapping,
+    locked_shared_bytes,
+    table_regions,
+    wait_for_engram_residency,
+)
 
 
 def owner(path):
@@ -26,51 +31,6 @@ def test_locked_pages_and_mapping_bounds(tmp_path):
         mapping.close()
     with pytest.raises(ValueError, match="exceeds"):
         LockedMapping(dict(file=str(path), offset=16000, length=8192))
-
-
-def test_reuse_credits_real_locked_pages_once_and_excludes_device_copies(tmp_path):
-    path = tmp_path / "table.bin"
-    path.write_bytes(b"a" * 16384)
-    region = owner(path)["regions"][0]
-    first, second = LockedMapping(region), LockedMapping(region)
-    try:
-        audit = locked_file_reuse([owner(path), owner(path)])
-        assert audit["reused_bytes"] == 12288
-        assert len([item for item in audit["mappings"] if item["pid"] == os.getpid()]) == 2
-        assert locked_file_reuse([dict(owner(path), shared_memory=True)])["reused_bytes"] == 0
-    finally:
-        first.close()
-        second.close()
-    assert locked_file_reuse([owner(path)])["reused_bytes"] == 0
-
-
-@pytest.mark.parametrize("permissions,rss_kib,flags,expected", [
-    ("r--s", 16, "rd sh lo", 12288),
-    ("r--s", 16, "rd sh", 0),
-    ("r--s", 12, "rd sh lo", 0),
-    ("r--p", 16, "rd lo", 0),
-    ("rw-s", 16, "rd wr sh lo", 0),
-])
-def test_reuse_requires_shared_readonly_fully_resident_locked_extent(tmp_path, permissions, rss_kib, flags, expected):
-    path = tmp_path / "table.bin"
-    path.write_bytes(b"a" * 16384)
-    stat = path.stat()
-    proc = tmp_path / "proc"
-    entry = proc / "123"
-    entry.mkdir(parents=True)
-    header = (f"10000-14000 {permissions} 00000000 {os.major(stat.st_dev):x}:{os.minor(stat.st_dev):x} "
-              f"{stat.st_ino} {path}\n")
-    (entry / "maps").write_text(header)
-    (entry / "smaps").write_text(header + f"Rss: {rss_kib} kB\nVmFlags: {flags}\n")
-    audit = locked_file_reuse([owner(path)], proc_root=proc)
-    assert audit["reused_bytes"] == expected
-    if expected:
-        assert audit["mappings"] == [
-            dict(pid=123,
-                 device_inode=(os.major(stat.st_dev), os.minor(stat.st_dev), stat.st_ino),
-                 offset=0,
-                 length=12288)
-        ]
 
 
 def test_residency_owners_release_and_failure_is_visible(tmp_path):
@@ -123,86 +83,105 @@ def test_regions_use_original_offsets_and_validate_manifest(tmp_path):
         table_regions(tmp_path)
 
 
-def test_device_backing_preserves_extent_and_checkpoint(tmp_path):
+def test_shared_locked_extents_are_counted_once(tmp_path):
     path = tmp_path / "table.bin"
-    contents = bytes(range(256)) * 70
-    path.write_bytes(contents)
-    original = path.stat()
-    region = dict(file=str(path), offset=13, length=16387)
-    descriptor, binding = shared_host_region(region)
-    try:
-        assert os.pread(descriptor, region["length"], 0) == contents[13:16400]
-        assert binding["sha256"] == hashlib.sha256(contents[13:16400]).hexdigest()
-        item = dict(file=str(path), shard_offset=13, shard_bytes=16387, row_bytes=1)
-        replacement = resident_table_source(item, binding)
-        assert replacement["file"] == binding["file"]
-        assert replacement["shard_offset"] == 0
-        assert replacement["shared_memfd"]
-        assert replacement["row_bytes"] == 1
-        assert fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) & fcntl.F_SEAL_SHRINK
-        with pytest.raises(OSError):
-            os.ftruncate(descriptor, region["length"] - 1)
-        with pytest.raises(RuntimeError, match="identity or extent"):
-            resident_table_source(item, dict(binding, inode=binding["inode"] + 1))
-        with pytest.raises(RuntimeError, match="checkpoint extent"):
-            resident_table_source(dict(item, shard_offset=14), binding)
-        assert path.read_bytes() == contents
-        assert path.stat().st_mtime_ns == original.st_mtime_ns
-        path.write_bytes(contents[:-1])
-        with pytest.raises(RuntimeError, match="source changed"):
-            resident_table_source(item, binding)
-    finally:
-        os.close(descriptor)
+    path.write_bytes(b"a" * 32768)
+    stat = path.stat()
+    proc = tmp_path / "proc"
+    proc.mkdir()
+
+    def mapping(pid, offset, size, *, shared=True, resident=True, locked=True):
+        process = proc / str(pid)
+        process.mkdir()
+        (process / "cmdline").write_bytes(b"python\0multiprocessing.spawn\0")
+        header = (f"100000-{0x100000 + size:x} r--{'s' if shared else 'p'} {offset:08x} "
+                  f"{os.major(stat.st_dev):02x}:{os.minor(stat.st_dev):02x} {stat.st_ino} {path}\n")
+        (process / "smaps").write_text(header + f"Rss: {size // 1024 if resident else 0} kB\n" +
+                                       f"Locked: {size // 2048 if locked else 0} kB\n" +
+                                       f"VmFlags: rd mr me ms {'lo' if locked else ''}\n")
+
+    mapping(100, 0, 8192)
+    mapping(101, 4096, 8192)
+    mapping(102, 8192, 8192, locked=False)
+    mapping(103, 8192, 8192, shared=False)
+    mapping(104, 8192, 8192, resident=False)
+    # Requested offset is not page aligned; partial overlaps and duplicate
+    # proportional Locked accounting must still charge each physical page once.
+    owners = [dict(regions=[dict(file=str(path), offset=4097, length=12287)])]
+    assert locked_shared_bytes(owners, proc) == 8192
 
 
-def test_device_residency_shares_one_backing_and_releases_it(tmp_path):
+def test_disappeared_or_unlocked_owner_gets_no_credit(tmp_path):
     path = tmp_path / "table.bin"
-    path.write_bytes(bytes(range(256)) * 64)
-    lease = EngramResidency([owner(path)], budget_bytes=1 << 20, device_layers=(1, ))
-    lease.start(check_available=False)
+    path.write_bytes(b"a" * 8192)
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    process = proc / "100"
+    process.mkdir()
+    (process / "cmdline").write_bytes(b"python\0multiprocessing.spawn\0")
+    assert locked_shared_bytes([dict(regions=[dict(file=str(path), offset=0, length=8192)])], proc) == 0
+
+
+class _Residency:
+    budget_bytes = 123
+    reports = []
+
+    def __init__(self, fail=False):
+        self.started = threading.Event()
+        self.closed = False
+        self.fail = fail
+
+    def start(self, **kwargs):
+        self.started.set()
+        if self.fail:
+            raise RuntimeError("test lock budget unavailable")
+        return self
+
+    def check(self):
+        assert not self.closed
+
+    def close(self):
+        self.closed = True
+
+
+def test_device_gate_waits_for_all_workers_before_locking(monkeypatch):
+    monkeypatch.delenv("DSV41_ENGRAM_DEVICE_GATE", raising=False)
+    lease = _Residency()
+    gate = EngramDeviceGate(lease, world_size=2, timeout=5).start()
     try:
-        binding = lease.worker_bindings()["0"]["1"][0]
-        assert lease.reports[0]["locked_bytes"] == 8192
-        with open(binding["file"], "rb") as table:
-            assert table.read() == path.read_bytes()[7:8199]
-        assert lease.reports[0]["files"][0]["inode"] == binding["inode"]
+        with ThreadPoolExecutor(2) as workers:
+            first = workers.submit(wait_for_engram_residency, 0, 2, timeout=5)
+            assert not lease.started.wait(.15)
+            assert not first.done()
+            second = workers.submit(wait_for_engram_residency, 1, 2, timeout=5)
+            first.result(timeout=5)
+            second.result(timeout=5)
+        assert lease.started.is_set()
+        assert len(json.loads((gate.path / "ready.json").read_text())["initialized_workers"]) == 2
     finally:
-        lease.close()
-    assert not os.path.exists(binding["file"])
-    assert not any(process.is_alive() for process in lease.processes)
+        gate.close()
+    assert lease.closed and not gate.path.exists()
+    assert "DSV41_ENGRAM_DEVICE_GATE" not in os.environ
 
 
-def test_residency_starts_only_after_all_devices_are_ready(tmp_path):
-    path = tmp_path / "table.bin"
-    path.write_bytes(b"a" * 16384)
-    lease = EngramResidency([owner(path)], budget_bytes=1 << 20, device_layers=(1, ))
-    failures, results = [], []
-    startup = EngramStartup(lease, [6, 3], timeout=10).start(lambda: failures.append("lost"))
-    waiter = threading.Thread(target=lambda: results.append(wait_for_resident_tables(startup.directory, 0, 6)))
+def test_device_gate_propagates_lock_failure_and_preserves_world_contract(monkeypatch):
+    monkeypatch.delenv("DSV41_ENGRAM_DEVICE_GATE", raising=False)
+    lease = _Residency(fail=True)
+    gate = EngramDeviceGate(lease, world_size=1, timeout=5).start()
     try:
-        waiter.start()
-        assert not lease.processes
-        with pytest.raises(RuntimeError, match="ownership mismatch"):
-            wait_for_resident_tables(startup.directory, 1, 7)
-        ready = wait_for_resident_tables(startup.directory, 1, 3, timeout=10)
-        waiter.join(timeout=5)
-        assert len(results) == 1 and results[0] == ready
-        assert ready["0"]["1"][0]["backing"] == "shared_memfd"
-        assert lease.reports[0]["ready"]
-        assert not startup.stopped.wait(.5)
-        lease.check()
-        assert startup.thread.is_alive()
+        with pytest.raises(RuntimeError, match="world mismatch"):
+            wait_for_engram_residency(0, 2)
+        with pytest.raises(RuntimeError, match="lock budget"):
+            wait_for_engram_residency(0, 1, timeout=5)
+        assert not (gate.path / "ready.json").exists()
     finally:
-        startup.close()
-        waiter.join(timeout=5)
-    assert not failures
-    assert not startup.directory.exists()
-    assert not any(process.is_alive() for process in lease.processes)
+        gate.close()
+    assert lease.closed
 
 
-def test_residency_startup_cancellation_before_device_registration(tmp_path):
-    lease = EngramResidency([owner(tmp_path / "unused")], budget_bytes=1 << 20)
-    startup = EngramStartup(lease, [6]).start(lambda: None)
-    startup.close()
-    assert not startup.thread.is_alive()
-    assert not lease.processes
+def test_cancel_before_devices_does_not_pin_tables(monkeypatch):
+    monkeypatch.delenv("DSV41_ENGRAM_DEVICE_GATE", raising=False)
+    lease = _Residency()
+    gate = EngramDeviceGate(lease, timeout=5).start()
+    gate.close()
+    assert not lease.started.is_set() and lease.closed

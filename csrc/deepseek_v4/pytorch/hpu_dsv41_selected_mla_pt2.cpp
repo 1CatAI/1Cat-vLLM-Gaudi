@@ -10,11 +10,15 @@
 namespace {
 constexpr auto kPaged = "custom_op::custom_deepseek_v41_paged_mla_mme_gaudi2";
 constexpr auto kSelected = "custom_op::custom_deepseek_v41_selected_mla_mme_gaudi2";
+constexpr auto kBatchPaged = "custom_op::custom_deepseek_v41_batch_paged_mla_mme_gaudi2";
+constexpr auto kBatchPacked = "custom_op::custom_deepseek_v41_batch_packed_mla_mme_gaudi2";
+constexpr auto kBatchPackedSram = "custom_op::custom_deepseek_v41_batch_packed_sram_mla_mme_gaudi2";
+constexpr auto kBatchPackedVector = "custom_op::custom_deepseek_v41_batch_packed_vector_mla_mme_gaudi2";
 constexpr auto kPrefill = "custom_op::custom_deepseek_v41_prefill_mla_mme_gaudi2";
 
-habana::OutputMetaDataVector meta(const at::Stack& s, bool paged, bool prefill = false) {
+habana::OutputMetaDataVector meta(const at::Stack& s, bool paged, bool prefill = false, bool sram = false) {
     const auto q = s.at(0).toTensor();
-    TORCH_CHECK(q.dim() == 3 && q.size(0) >= 1 && q.size(0) <= (prefill ? 64 : 6) &&
+    TORCH_CHECK(q.dim() == 3 && q.size(0) >= 1 && q.size(0) <= (sram ? 8 : (prefill ? 64 : 6)) &&
                 q.size(1) >= 1 && q.size(1) <= 64 && q.size(2) == 512,
                 "Selected MLA query exceeds its bounded [T,H,512] tile");
     const int index = paged ? 4 : 2;
@@ -37,9 +41,9 @@ habana::OutputMetaDataVector meta(const at::Stack& s, bool paged, bool prefill =
     const auto cache = s.at(1).toTensor();
     if (paged) {
         const auto main = s.at(2).toTensor(), rows = s.at(3).toTensor();
-        TORCH_CHECK(cache.dim() == 2 && cache.size(0) > 0 && cache.size(0) <= 512 && cache.size(1) == 528 &&
-                    main.dim() == 2 && main.size(0) > 0 && main.size(0) <= 0x7ffffdffLL && main.size(1) == 288 &&
-                    rows.dim() == 2 && rows.size(0) == 1 && rows.size(1) > 0 && rows.size(1) <= 4096,
+        TORCH_CHECK(cache.dim() == 2 && cache.size(0) > 0 && cache.size(0) <= (prefill ? 64 * 256 : 512) && cache.size(1) == 528 &&
+                    main.dim() == 2 && main.size(0) > 0 && main.size(0) <= 0x7fffbfffLL && main.size(1) == 288 &&
+                    rows.dim() == 2 && rows.size(0) == 1 && rows.size(1) > 0 && rows.size(1) <= (prefill ? 64 * 640 : 4096),
                     "Paged MLA requires SWA528, FP4 main288 and bounded selected row IDs");
     } else {
         TORCH_CHECK(cache.dim() == 2 && cache.size(0) > 0 &&
@@ -52,20 +56,26 @@ habana::OutputMetaDataVector meta(const at::Stack& s, bool paged, bool prefill =
 class SelectedMla final : public habana::OpBackend {
     bool paged_;
     bool prefill_;
+    bool direct_packed_;
+    bool sram_;
+    bool vector_;
 public:
-    SelectedMla(int device, c10::ScalarType dtype, bool paged, bool prefill = false)
+    SelectedMla(int device, c10::ScalarType dtype, bool paged, bool prefill = false,
+                bool direct_packed = false, bool sram = false, bool vector = false)
         : OpBackend(device, NO_TPC + std::string("dsv41_selected_mla_mme"), dtype, {0}, {}, {}, false),
-          paged_(paged), prefill_(prefill) {
-        SetOutputMetaFn([paged, prefill](const at::Stack& s) { return meta(s, paged, prefill); });
+          paged_(paged), prefill_(prefill), direct_packed_(direct_packed), sram_(sram), vector_(vector) {
+        SetOutputMetaFn([paged, prefill, sram](const at::Stack& s) { return meta(s, paged, prefill, sram); });
     }
     void AddNode(synapse_helpers::graph& graph, const at::Stack& s) override {
-        const auto output = meta(s, paged_, prefill_);
+        const auto output = meta(s, paged_, prefill_, sram_);
         const auto q = s.at(0).toTensor();
         const int index = paged_ ? 4 : 2;
         const int64_t tokens = q.size(0), heads = q.size(1), width = s.at(index).toTensor().size(1);
+        const char* packed_guid = vector_ ? "custom_deepseek_v41_selected_packed_mla_vector_gaudi2"
+                                          : "custom_deepseek_v41_selected_packed_mla_gather_gaudi2";
         std::vector<synapse_helpers::tensor> selected;
         synTensor cache = syn_in(1);
-        if (paged_) {
+        if (paged_ && !direct_packed_) {
             const int64_t rows = s.at(3).toTensor().size(1);
             if (!graph.is_dry_run() && !isOutputInfMode()) {
                 const int device = SynInput(1).ref().device_id();
@@ -89,10 +99,44 @@ public:
             }
             cache = selected.at(0).get();
         }
-        auto kv = BuildNode(this, graph, {"custom_deepseek_v41_selected_mla_gather_gaudi2",
-            {cache, syn_in(index), syn_in(index + 3)},
-            {{{tokens, width, 512}, at::kBFloat16}, {{tokens, width, 512}, at::kFloat},
-             {{tokens, width}, at::kFloat}}});
+        std::vector<synapse_helpers::tensor> kv;
+        if (sram_ && !graph.is_dry_run() && !isOutputInfMode()) {
+            const int device = SynInput(1).ref().device_id();
+            // Synapse requires all RMW operands of one node to share a
+            // section. An eight-query tile uses less than the 16 MiB cap.
+            synSectionHandle section = nullptr;
+            TORCH_CHECK(synSectionCreate(&section, 0, graph.get_graph_handle()) == synSuccess &&
+                        synSectionSetPersistent(section, false) == synSuccess &&
+                        synSectionSetRMW(section, true) == synSuccess,
+                        "Could not create packed MLA SRAM section");
+            uint64_t offset = 0;
+            for (int i = 0; i < 3; ++i) {
+                const auto shape = i < 2 ? std::vector<int64_t>{tokens, width, 512}
+                                         : std::vector<int64_t>{tokens, width};
+                const auto stride = i < 2 ? std::vector<int64_t>{width * 512, 512, 1}
+                                          : std::vector<int64_t>{width, 1};
+                kv.emplace_back(habana_helpers::create_tensor(
+                    shape, stride, graph, false, false, device, i == 0 ? at::kBFloat16 : at::kFloat));
+                TORCH_CHECK(synTensorAssignToSection(kv.back().get(), section, offset) == synSuccess,
+                            "Could not bind packed MLA operands to recipe-owned SRAM");
+                const uint64_t bytes = tokens * width * (i < 2 ? 512 : 1) * (i == 0 ? 2 : 4);
+                offset += (bytes + 127) & ~uint64_t(127);
+            }
+            graph.add_node({syn_in(1), syn_in(2), syn_in(3), syn_in(index), syn_in(index + 3)},
+                {kv.at(0).get(), kv.at(1).get(), kv.at(2).get()}, nullptr, 0,
+                packed_guid,
+                nullptr, nullptr, nullptr, deterministic, getContextHints());
+        } else {
+            kv = direct_packed_
+            ? BuildNode(this, graph, {packed_guid,
+                {syn_in(1), syn_in(2), syn_in(3), syn_in(index), syn_in(index + 3)},
+                {{{tokens, width, 512}, at::kBFloat16}, {{tokens, width, 512}, at::kFloat},
+                 {{tokens, width}, at::kFloat}}})
+            : BuildNode(this, graph, {"custom_deepseek_v41_selected_mla_gather_gaudi2",
+                {cache, syn_in(index), syn_in(index + 3)},
+                {{{tokens, width, 512}, at::kBFloat16}, {{tokens, width, 512}, at::kFloat},
+                 {{tokens, width}, at::kFloat}}});
+        }
         synGEMMParams qk{false, true}, pv{false, false};
         auto scores = BuildNode(this, graph, {"batch_gemm", {syn_in(0), kv.at(0).get()},
             {{{tokens, heads, width}, at::kFloat}}, &qk, sizeof(qk)});
@@ -107,31 +151,47 @@ public:
 };
 
 const bool registered = [] {
-    for (int kind : {0, 1, 2}) {
-        const bool paged = kind == 1, prefill = kind == 2;
-        const auto schema = prefill ? kPrefill : (paged ? kPaged : kSelected);
-        habana::custom_op::registerUserCustomOp(schema, "batch_gemm", [paged, prefill](const at::Stack& s) {
-            const auto out = meta(s, paged, prefill);
+    for (int kind : {0, 1, 2, 3, 4, 5, 6}) {
+        const bool direct_packed = kind >= 4, sram = kind >= 5, vector = kind == 6;
+        const bool paged = kind == 1 || kind == 3 || direct_packed, prefill = kind >= 2;
+        const auto schema = vector ? kBatchPackedVector : sram ? kBatchPackedSram : direct_packed ? kBatchPacked :
+            (paged && prefill ? kBatchPaged : (prefill ? kPrefill : (paged ? kPaged : kSelected)));
+        habana::custom_op::registerUserCustomOp(schema, "batch_gemm", [paged, prefill, sram](const at::Stack& s) {
+            const auto out = meta(s, paged, prefill, sram);
             return habana::PartialOutputMetaDataVector{{out.at(0).dtype, out.at(0).shape}};
         }, nullptr);
-        habana::KernelRegistry().add(schema, [paged, prefill](synDeviceId d, c10::ScalarType t) {
-            return std::make_shared<SelectedMla>(d, t, paged, prefill);
+        habana::KernelRegistry().add(schema, [paged, prefill, direct_packed, sram, vector](synDeviceId d, c10::ScalarType t) {
+            return std::make_shared<SelectedMla>(d, t, paged, prefill, direct_packed, sram, vector);
         });
     }
     return true;
 }();
 
-template<bool Meta> at::Tensor execute(const at::Stack& s, bool paged, bool prefill = false) {
-    const auto output = meta(s, paged, prefill);
+template<bool Meta> at::Tensor execute(const at::Stack& s, bool paged, bool prefill = false,
+                                      bool direct_packed = false, bool sram = false, bool vector = false) {
+    const auto output = meta(s, paged, prefill, sram);
     if (Meta) return at::empty(output.at(0).shape, s.at(0).toTensor().options());
     TORCH_CHECK(registered && s.at(0).toTensor().device().type() == at::kHPU);
     auto descriptor = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(
-        prefill ? kPrefill : (paged ? kPaged : kSelected));
+        vector ? kBatchPackedVector : sram ? kBatchPackedSram : direct_packed ? kBatchPacked :
+            (paged && prefill ? kBatchPaged : (prefill ? kPrefill : (paged ? kPaged : kSelected))));
     return descriptor.execute(s).at(0);
 }
 template<bool Meta> at::Tensor paged(const at::Tensor& q, const at::Tensor& swa, const at::Tensor& main,
     const at::Tensor& rows, const at::Tensor& ids, const at::Tensor& sink, const at::Tensor& scale,
     const at::Tensor& lengths) { return execute<Meta>({q, swa, main, rows, ids, sink, scale, lengths}, true); }
+template<bool Meta> at::Tensor batch_paged(const at::Tensor& q, const at::Tensor& swa, const at::Tensor& main,
+    const at::Tensor& rows, const at::Tensor& ids, const at::Tensor& sink, const at::Tensor& scale,
+    const at::Tensor& lengths) { return execute<Meta>({q, swa, main, rows, ids, sink, scale, lengths}, true, true); }
+template<bool Meta> at::Tensor batch_packed(const at::Tensor& q, const at::Tensor& swa, const at::Tensor& main,
+    const at::Tensor& rows, const at::Tensor& ids, const at::Tensor& sink, const at::Tensor& scale,
+    const at::Tensor& lengths) { return execute<Meta>({q, swa, main, rows, ids, sink, scale, lengths}, true, true, true); }
+template<bool Meta> at::Tensor batch_packed_sram(const at::Tensor& q, const at::Tensor& swa, const at::Tensor& main,
+    const at::Tensor& rows, const at::Tensor& ids, const at::Tensor& sink, const at::Tensor& scale,
+    const at::Tensor& lengths) { return execute<Meta>({q, swa, main, rows, ids, sink, scale, lengths}, true, true, true, true); }
+template<bool Meta> at::Tensor batch_packed_vector(const at::Tensor& q, const at::Tensor& swa, const at::Tensor& main,
+    const at::Tensor& rows, const at::Tensor& ids, const at::Tensor& sink, const at::Tensor& scale,
+    const at::Tensor& lengths) { return execute<Meta>({q, swa, main, rows, ids, sink, scale, lengths}, true, true, true, true, true); }
 template<bool Meta> at::Tensor selected(const at::Tensor& q, const at::Tensor& cache, const at::Tensor& ids,
     const at::Tensor& sink, const at::Tensor& scale, const at::Tensor& lengths) {
     return execute<Meta>({q, cache, ids, sink, scale, lengths}, false);
@@ -142,16 +202,28 @@ template<bool Meta> at::Tensor prefill(const at::Tensor& q, const at::Tensor& ca
 }
 }
 TORCH_LIBRARY_FRAGMENT(custom_op, m) {
+    m.def("custom_deepseek_v41_batch_packed_vector_mla_mme_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor row_ids, Tensor indices, Tensor sink, Tensor scale, Tensor lengths) -> Tensor");
+    m.def("custom_deepseek_v41_batch_packed_sram_mla_mme_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor row_ids, Tensor indices, Tensor sink, Tensor scale, Tensor lengths) -> Tensor");
+    m.def("custom_deepseek_v41_batch_packed_mla_mme_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor row_ids, Tensor indices, Tensor sink, Tensor scale, Tensor lengths) -> Tensor");
+    m.def("custom_deepseek_v41_batch_paged_mla_mme_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor row_ids, Tensor indices, Tensor sink, Tensor scale, Tensor lengths) -> Tensor");
     m.def("custom_deepseek_v41_prefill_mla_mme_gaudi2(Tensor q, Tensor cache, Tensor indices, Tensor sink, Tensor scale, Tensor lengths) -> Tensor");
     m.def("custom_deepseek_v41_paged_mla_mme_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor row_ids, Tensor indices, Tensor sink, Tensor scale, Tensor lengths) -> Tensor");
     m.def("custom_deepseek_v41_selected_mla_mme_gaudi2(Tensor q, Tensor cache, Tensor indices, Tensor sink, Tensor scale, Tensor lengths) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
+    m.impl("custom_deepseek_v41_batch_packed_vector_mla_mme_gaudi2", batch_packed_vector<false>);
+    m.impl("custom_deepseek_v41_batch_packed_sram_mla_mme_gaudi2", batch_packed_sram<false>);
+    m.impl("custom_deepseek_v41_batch_packed_mla_mme_gaudi2", batch_packed<false>);
+    m.impl("custom_deepseek_v41_batch_paged_mla_mme_gaudi2", batch_paged<false>);
     m.impl("custom_deepseek_v41_prefill_mla_mme_gaudi2", prefill<false>);
     m.impl("custom_deepseek_v41_paged_mla_mme_gaudi2", paged<false>);
     m.impl("custom_deepseek_v41_selected_mla_mme_gaudi2", selected<false>);
 }
 TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
+    m.impl("custom_deepseek_v41_batch_packed_vector_mla_mme_gaudi2", batch_packed_vector<true>);
+    m.impl("custom_deepseek_v41_batch_packed_sram_mla_mme_gaudi2", batch_packed_sram<true>);
+    m.impl("custom_deepseek_v41_batch_packed_mla_mme_gaudi2", batch_packed<true>);
+    m.impl("custom_deepseek_v41_batch_paged_mla_mme_gaudi2", batch_paged<true>);
     m.impl("custom_deepseek_v41_prefill_mla_mme_gaudi2", prefill<true>);
     m.impl("custom_deepseek_v41_paged_mla_mme_gaudi2", paged<true>);
     m.impl("custom_deepseek_v41_selected_mla_mme_gaudi2", selected<true>);

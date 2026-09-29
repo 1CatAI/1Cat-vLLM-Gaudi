@@ -61,7 +61,7 @@ def test_index_query_scale_uses_global_head_count(monkeypatch, tp_size):
         tensor_parallel_size=tp_size,
         weights=SimpleNamespace(indexer=SimpleNamespace(wq_b=projection, weights_proj=weight_projection)),
         linear=lambda value, weight: torch.ones(2, local_heads * 128 if weight is projection else local_heads),
-        _rope=lambda value, positions: value,
+        _rope=lambda value, positions, request_batch=False: value,
         gather=lambda value, dim: torch.cat([value] * tp_size, dim),
     )
     monkeypatch.setattr(attention_module, "fp4_roundtrip", lambda value, group: value)
@@ -99,6 +99,7 @@ def test_pp1_forward_preserves_final_output_and_completion_never_uses_peer(monke
 
     runner = object.__new__(runner_module.V41ModelRunner)
     runner.model, runner.use_dspark, runner.direct_token_ids = Model(), False, False
+    runner.request_batches = None
     runner.input_views = {1: torch.empty(1, dtype=torch.int64)}
     runner.position_views = {1: torch.empty(1, dtype=torch.int32)}
     runner.position_bank = runner._next_input = None
@@ -116,7 +117,9 @@ def test_pp1_final_collapse_and_four_way_greedy_ties():
     from vllm_gaudi.models.deepseek_v41_program import PreparedStage
     residual = torch.arange(32).reshape(2, 4, 4).float().bfloat16()
     pre = torch.ones(2, 4) / 4
-    stage = SimpleNamespace(shared=SimpleNamespace(),
+    stage = SimpleNamespace(tensor_parallel_size=4,
+                            dspark=False,
+                            shared=SimpleNamespace(),
                             layers=[],
                             is_last_stage=True,
                             weights=SimpleNamespace(norm=SimpleNamespace(weight=torch.ones(4))),
@@ -150,6 +153,7 @@ def test_tp4_model_forward_reaches_compiled_decode_without_tp2_replay(monkeypatc
 
     class Stage:
         loaded, length = True, 1048576
+        start, tensor_parallel_size, dspark = 0, 4, False
 
         def __call__(self, residual, pre, positions, ids, engram):
             calls.append("prefill")
@@ -204,6 +208,7 @@ def test_owned_prefill_releases_initial_activation_after_first_layer(monkeypatch
             return residual + 1, pre, None
 
     stage = SimpleNamespace(tensor_parallel_size=4,
+                            dspark=False,
                             is_last_stage=False,
                             shared=SimpleNamespace(prefill_main_workspace=None),
                             layers=[Layer(0), Layer(2)])

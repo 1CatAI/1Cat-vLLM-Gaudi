@@ -24,9 +24,10 @@ def tensor_info(text):
 def audit(path):
     raw = path.read_text()
     prefixes = ("custom_deepseek_v41_mxfp4_prepared_dequant", "custom_deepseek_v41_mxfp4_k128_dequant",
-                "custom_deepseek_v41_mxfp4_n512_dequant",
-                "custom_deepseek_v41_expert_n256_fp8_gaudi2",
-                "custom_deepseek_v41_expert_n256_slots_fp8_gaudi2")
+                "custom_deepseek_v41_mxfp4_n512_dequant", "custom_deepseek_v41_expert_n256_fp8",
+                "custom_deepseek_v41_expert_n256_bf16", "custom_deepseek_v41_expert_n256_normal_bf16",
+                "custom_deepseek_v41_expert_n256_slots_fp8_gaudi2", "custom_deepseek_v41_expert_n256_reuse_fp8_gaudi2",
+                "custom_deepseek_v41_expert_n256_horizontal_fp8_gaudi2")
     if not any(prefix in raw for prefix in prefixes):
         return None
     decode, matrix = [], []
@@ -46,9 +47,21 @@ def audit(path):
                 "output": tensor_info(attrs.get("outputTensor:0", ""))
             })
     decoded_names = {node["output"]["name"] for node in decode}
-    expert_matrices = [node for node in matrix if node["weight"]["name"] in decoded_names]
-    if not expert_matrices:
+    expert_matrices = []
+    for node in matrix:
+        if node["weight"]["name"] in decoded_names:
+            node["decoded_operand_index"] = 1
+            expert_matrices.append(node)
+        elif node["activation"]["name"] in decoded_names:
+            # W^T x^T reverses operand roles without moving either tensor.
+            # Follow the actual decoded producer, not a fixed operand index.
+            node["activation"], node["weight"] = node["weight"], node["activation"]
+            node["decoded_operand_index"] = 0
+            expert_matrices.append(node)
+    if not matrix:
         return None  # A standalone decoder output is not an SRAM consumption proof.
+    # A weight DMA may hide direct producer names. Keep the failing allocation
+    # evidence rather than silently dropping a graph with decoded DRAM weights.
     consumers = {
         name: [node["node"] for node in expert_matrices if node["weight"]["name"] == name]
         for name in decoded_names

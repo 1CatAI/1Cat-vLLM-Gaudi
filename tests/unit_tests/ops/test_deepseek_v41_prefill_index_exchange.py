@@ -171,7 +171,7 @@ def test_normal_prefill_entry_routes_queries_without_all_gather(monkeypatch):
                             prefill_tp_rank=2,
                             weights=SimpleNamespace(indexer=SimpleNamespace(wq_b=q_weight, weights_proj=w_weight)),
                             linear=lambda x, w: torch.ones(tokens, 1024 if w is q_weight else 8).bfloat16(),
-                            _rope=lambda q, p: q)
+                            _rope=lambda q, p, request_batch=False: q)
     owner.gather = lambda *args: pytest.fail("Partitioned prefill must not all-gather index Q")
     group = SimpleNamespace(rank_in_group=2, device_group=object())
     monkeypatch.setattr(vllm.distributed, "get_tp_group", lambda: group)

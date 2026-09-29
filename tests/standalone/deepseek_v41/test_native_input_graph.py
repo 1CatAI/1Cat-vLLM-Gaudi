@@ -12,6 +12,7 @@ from vllm_gaudi.ops.tp2_model_adapter import DEEPSEEK_V41_PP0, DEEPSEEK_V41_PP0_
 
 
 class EchoGroup(torch.nn.Module):
+
     def __init__(self, native_input):
         super().__init__()
         self.native_input = native_input
@@ -74,16 +75,23 @@ def test_paged_variants_bind_only_their_active_state_allocations(search):
     from vllm_gaudi.ops.deepseek_v41_replay import stage_state_tensors
     owner = torch.nn.Module()
     owner.length, owner.search_length = 1048576, search
-    names = ("swa", "main", "index", "indices", "candidate_pool", "kv_history", "score_history", "block_table",
-             "decoded_swa", "decoded_main", "decoded_index_hot")
+    names = ("swa", "main", "index", "indices", "candidate_pool", "kv_history", "score_history", "block_table")
     for name in names:
         owner.register_buffer(name, torch.zeros(1))
+    owner.shared = shared = torch.nn.Module()
+    shared.decoded_kv_state = True
+    shared.register_buffer("decoded_swa", torch.zeros(512, 512, dtype=torch.bfloat16))
+    cache = torch.nn.Module()
+    cache.ratio = 2
+    cache.register_buffer("decoded_main", torch.zeros(1280, 512, dtype=torch.bfloat16))
+    cache.register_buffer("decoded_index_hot", torch.zeros(1280, 128, dtype=torch.bfloat16))
+    shared.sources = torch.nn.ModuleDict({"2": cache})
     bound = {id(value) for value in stage_state_tensors(owner)}
     for name in names:
-        active = (not name.startswith("decoded_")
-                  or (name in ("decoded_swa", "decoded_main") and search <= 512)
-                  or (name == "decoded_index_hot" and search == 2560))
-        assert (id(getattr(owner, name)) in bound) == active
+        assert id(getattr(owner, name)) in bound
+    assert (id(shared.decoded_swa) in bound) == (search <= 2560)
+    assert (id(cache.decoded_main) in bound) == (search <= 2560)
+    assert (id(cache.decoded_index_hot) in bound) == (search == 2560)
 
 
 @pytest.mark.parametrize("kwargs", ({"pp_rank": 1}, {"dspark": True}, {"fp8": True}))
@@ -96,6 +104,7 @@ def test_seeds_are_persistent_and_external_call_stays_separate(monkeypatch):
     monkeypatch.setenv("VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH", "1")
 
     class CaptureReplay(StageReplay):
+
         def __call__(self, *args, **kwargs):
             return args, kwargs
 
@@ -118,6 +127,7 @@ def test_segmented_input_replay_keeps_the_complete_variant(monkeypatch):
     calls = []
 
     class CaptureSegmented(StageReplay):
+
         def begin_segmented_from_input_ids(self, positions, ids):
             calls.append(("prefix", positions, ids))
 
@@ -127,6 +137,7 @@ def test_segmented_input_replay_keeps_the_complete_variant(monkeypatch):
 
     owner = program()
     replay = CaptureSegmented(owner)
+
     class Variant:
         pass
 
@@ -148,8 +159,8 @@ def test_direct_engram_retains_exact_packed_views():
     assert all(a is b for a, b in zip(captured, views))
     copies = capture_engram_inputs(views)
     assert all(torch.equal(a, b) and a.data_ptr() != b.data_ptr() for a, b in zip(copies, views))
-    for invalid in ((views[0], views[0]), tuple(reversed(views)), copies, views[:1],
-                    (views[0].transpose(1, 2), views[1])):
+    for invalid in ((views[0], views[0]), tuple(reversed(views)), copies, views[:1], (views[0].transpose(1,
+                                                                                                         2), views[1])):
         with pytest.raises(ValueError, match="Engram"):
             capture_engram_inputs(invalid, direct=True)
 
@@ -159,9 +170,8 @@ def test_device_engram_retains_decoded_and_late_inputs():
     layer14 = torch.empty((1, 12, 264), dtype=torch.uint8)
     captured = capture_engram_inputs((layer1, layer14), direct=True, device_layer1=True)
     assert captured[0] is layer1 and captured[1] is layer14
-    invalid = ((layer1.to(torch.float32), layer14), (layer1[:, :, :255], layer14),
-               (layer1, layer14.to(torch.int8)), (layer1, layer14[:, :, :263]),
-               (layer1.transpose(1, 2), layer14))
+    invalid = ((layer1.to(torch.float32), layer14), (layer1[:, :, :255], layer14), (layer1, layer14.to(torch.int8)),
+               (layer1, layer14[:, :, :263]), (layer1.transpose(1, 2), layer14))
     for values in invalid:
         with pytest.raises(ValueError, match="Device Engram"):
             capture_engram_inputs(values, direct=True, device_layer1=True)
@@ -195,6 +205,7 @@ def test_input_modes_have_separate_cached_variants(monkeypatch):
     from vllm_gaudi.ops import deepseek_v41_replay
 
     class Variant:
+
         def __init__(self, *args, native_input=False):
             self.native_input = native_input
 
@@ -227,6 +238,7 @@ def test_native_input_variants_are_separate_across_paged_buckets(monkeypatch):
     assert replay._input_key() == (1, "input")
     owner.search_length = 1024
     assert replay._input_key() == (1, "input", 1024)
+
     class Variant:
         pass
 

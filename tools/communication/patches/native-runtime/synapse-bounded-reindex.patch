@@ -1,0 +1,245 @@
+diff --git a/synapse/include/synapse_api.h b/synapse/include/synapse_api.h
+--- a/synapse/include/synapse_api.h
++++ b/synapse/include/synapse_api.h
+@@ -153,6 +153,14 @@
+     uint32_t nicLongSoIndex, synNativeGraphExchangeReplay exchangeReplay, void* context);
+ // V3 separates the compute boundary from NIC consumers. The caller verifies
+ // that prefixComputes excludes every recipe reading a late input binding.
++synStatus SYN_API_CALL synNativeComputeGraphPrepareBoundedPlanV1(
++    synNativeComputeGraphHandle handle, const uint32_t* producerSegments, const uint32_t* consumerSegments,
++    uint64_t collectiveCount, const uint32_t* minimumTileBound, uint64_t segmentCount, uint32_t maximumTileBound,
++    uint32_t nicLongSoIndex, synNativeGraphExchangeReplay callback, void* context);
++synStatus SYN_API_CALL synNativeComputeGraphReplayBoundedPlanV1(
++    synNativeComputeGraphHandle handle, uint32_t tileBound, synNativeGraphSyncInfo* completion,
++    uint64_t* statistics, uint64_t statisticCount);
++
+ synStatus SYN_API_CALL synNativeComputeGraphPrepareSegmentedPlanV3(
+     synNativeComputeGraphHandle graphHandle, const uint32_t* producerSegments,
+     const uint32_t* consumerSegments, uint64_t count, uint64_t prefixCollectives,
+diff --git a/synapse/src/runtime/scal/common/native_compute_graph.hpp b/synapse/src/runtime/scal/common/native_compute_graph.hpp
+--- a/synapse/src/runtime/scal/common/native_compute_graph.hpp
++++ b/synapse/src/runtime/scal/common/native_compute_graph.hpp
+@@ -65,6 +65,10 @@
+                                    uint64_t count, uint64_t prefixCollectives, uint32_t prefixComputes,
+                                    uint32_t nicLongSoIndex,
+                                    synNativeGraphExchangeReplay callback, void* context);
++    synStatus prepareBoundedVariants(const uint32_t* minimum, uint64_t segments,
++                                     const uint32_t* producers, const uint32_t* consumers,
++                                     uint64_t collectives, uint32_t limit);
++    synStatus selectBoundedVariant(uint32_t bound);
+     synStatus replayPlan(synNativeGraphSyncInfo& completion, uint64_t* statistics, uint64_t count);
+     synStatus replayPlanPrefix(synNativeGraphSyncInfo& completion, uint64_t* statistics, uint64_t count);
+     synStatus replayPlanFinish(synNativeGraphSyncInfo& completion, uint64_t* statistics, uint64_t count);
+@@ -92,6 +96,8 @@
+     struct JointPlan
+     {
+         NativeComputeProgram program;
++        std::vector<NativeComputeProgram> boundedPrograms;
++        uint32_t selectedBound = UINT32_MAX;
+         NativeComputeProgram prefixProgram;
+         NativeComputeProgram suffixProgram;
+         uint32_t nicLongSoIndex = 0;
+diff --git a/synapse/src/runtime/scal/common/stream_compute_scal.cpp b/synapse/src/runtime/scal/common/stream_compute_scal.cpp
+--- a/synapse/src/runtime/scal/common/stream_compute_scal.cpp
++++ b/synapse/src/runtime/scal/common/stream_compute_scal.cpp
+@@ -1,3 +1,4 @@
++#include "native_bounded_selection.h"
+ #include "stream_compute_scal.hpp"
+ #include "synapse_api.h"
+ 
+@@ -455,17 +456,67 @@
+     }
+ }
+ 
++synStatus NativeComputeGraph::prepareBoundedVariants(
++    const uint32_t* minimum, uint64_t segments, const uint32_t* producers,
++    const uint32_t* consumers, uint64_t collectives, uint32_t limit)
++{
++    if (m_state != State::INSTANTIATED || m_replayActive || m_replayCount || !m_jointPlan ||
++        !minimum || !producers || !consumers || segments != m_segments.size() ||
++        collectives != m_jointPlan->producers.size() || !limit || limit > 8 ||
++        !m_jointPlan->boundedPrograms.empty() || m_jointPlan->collectiveSplit)
++        return synInvalidArgument;
++    try {
++        std::vector<NativeComputeProgram> variants;
++        for (uint32_t bound = 0; bound <= limit; ++bound) {
++            const auto selection = NativeBoundedSelection::prepare(
++                {minimum, minimum + segments}, {producers, producers + collectives},
++                {consumers, consumers + collectives}, bound, limit);
++            std::vector<const NativeScalCommandBuffer*> buffers;
++            for (auto index : selection.segments) buffers.push_back(&m_segments[index].commands);
++            const bool terminalRelease = m_streamBase.nativeTerminalRelease(*buffers.back());
++            variants.push_back(NativeComputeProgram::prepare(
++                buffers, selection.consumers, m_streamBase.prepareNativeWaitPackets(m_jointPlan->nicLongSoIndex),
++                m_streamBase.nativeCommandAlignment(), m_streamBase.nativeAvailableBytes(), terminalRelease,
++                std::find(producers, producers + collectives, UINT32_MAX) != producers + collectives,
++                selection.producers));
++        }
++        m_jointPlan->boundedPrograms = std::move(variants);
++        return synSuccess;
++    } catch (const std::exception& error) {
++        std::fprintf(stderr, "NATIVE_BOUNDED_PLAN_REJECT reason=%s\n", error.what());
++        return synInvalidArgument;
++    }
++}
++
++synStatus NativeComputeGraph::selectBoundedVariant(uint32_t bound)
++{
++    if (m_state != State::INSTANTIATED || m_replayActive || !m_jointPlan ||
++        bound >= m_jointPlan->boundedPrograms.size() || m_jointPlan->selectedBound != UINT32_MAX)
++        return synInvalidArgument;
++    m_jointPlan->selectedBound = bound;
++    return synSuccess;
++}
++
+ synStatus NativeComputeGraph::replayPlan(synNativeGraphSyncInfo& completion, uint64_t* statistics, uint64_t count)
+ {
+     if (m_state != State::INSTANTIATED || m_replayActive || !m_jointPlan || !statistics || count != 12)
+         return synInvalidArgument;
+     auto& plan = *m_jointPlan;
+-    if (!plan.program.canReplayAt(m_streamBase.getTargetLongSo(0).m_targetValue)) return synInvalidArgument;
++    if (!plan.boundedPrograms.empty() && plan.selectedBound >= plan.boundedPrograms.size())
++        return synInvalidArgument;
++    const auto& program = plan.boundedPrograms.empty() ? plan.program : plan.boundedPrograms[plan.selectedBound];
++    plan.selectedBound = UINT32_MAX;
++    plan.statistics[1] = program.pages.size();
++    plan.statistics[2] = program.sourcePacketCount;
++    plan.statistics[3] = program.byteCount;
++    plan.statistics[4] = program.completionDelta;
++    plan.statistics[5] = program.maximumPendingBytes;
++    if (!program.canReplayAt(m_streamBase.getTargetLongSo(0).m_targetValue)) return synInvalidArgument;
+     m_replayActive = true;
+     auto fail = [&]() { m_state = State::INVALID; m_replayActive = false; return synFail; };
+     try
+     {
+-        if (plan.program.externalInputCompletion && m_streamBase.prevCmdIsWait())
++        if (program.externalInputCompletion && m_streamBase.prevCmdIsWait())
+         {
+             // A partial decoder graph can begin with NIC, using a projection
+             // from its preceding group. A bare input wait does not advance the
+@@ -478,13 +529,13 @@
+                 static_cast<unsigned long long>(inputReady.m_targetValue));
+         }
+         const ScalLongSyncObject base = m_streamBase.getTargetLongSo(0);
+-        if (!base.m_targetValue || !plan.program.canReplayAt(base.m_targetValue)) return fail();
++        if (!base.m_targetValue || !program.canReplayAt(base.m_targetValue)) return fail();
+         // QueueComputeScal holds the compute queue lock across reservation,
+         // NIC publication and compute publication. No other launch can consume
+         // these offsets between the three operations.
+-        const ScalLongSyncObject final = m_streamBase.getIncrementedLongSo(true, plan.program.completionDelta);
++        const ScalLongSyncObject final = m_streamBase.getIncrementedLongSo(true, program.completionDelta);
+         for (size_t n = 0; n < plan.producers.size(); ++n)
+-            plan.producers[n] = {uint32_t(base.m_index), base.m_targetValue + plan.program.producerOffsets[n]};
++            plan.producers[n] = {uint32_t(base.m_index), base.m_targetValue + program.producerOffsets[n]};
+         ++plan.statistics[11];
+         if (plan.callback(plan.context, plan.producers.data(), plan.producers.size(), plan.completions.data()) != 0)
+             return fail();
+@@ -493,7 +544,7 @@
+                 plan.completions[n].targetValue >= (uint64_t(1) << 60) ||
+                 (n && plan.completions[n].targetValue != plan.completions[n - 1].targetValue + 1)) return fail();
+         uint64_t submissions = 0;
+-        if (m_streamBase.publishNativeComputeProgram(plan.program, plan.completions.data(), base,
++        if (m_streamBase.publishNativeComputeProgram(program, plan.completions.data(), base,
+                                                      plan.submissionScratch, submissions) != synSuccess) return fail();
+         if (!plan.statistics[0]) plan.statistics[9] = final.m_targetValue;
+         plan.statistics[10] = final.m_targetValue;
+@@ -996,6 +1047,18 @@
+     return synSuccess;
+ }
+ 
++extern "C" synStatus SYN_API_CALL synNativeComputeGraphPrepareBoundedPlanV1(
++    synNativeComputeGraphHandle handle, const uint32_t* producers, const uint32_t* consumers,
++    uint64_t collectives, const uint32_t* minimum, uint64_t segments, uint32_t limit,
++    uint32_t nicIndex, synNativeGraphExchangeReplay callback, void* context)
++{
++    const auto status = synNativeComputeGraphPreparePlanV2(
++        handle, producers, consumers, collectives, nicIndex, callback, context);
++    if (status != synSuccess) return status;
++    std::lock_guard<std::mutex> lock(handle->replayMutex);
++    return handle->graph->prepareBoundedVariants(minimum, segments, producers, consumers, collectives, limit);
++}
++
+ extern "C" synStatus SYN_API_CALL synNativeComputeGraphGetWorkspaceBytes(synNativeComputeGraphHandle handle,
+                                                                         uint64_t* bytes)
+ {
+@@ -1030,11 +1093,13 @@
+ 
+ static synStatus replayNativeComputeGraphPart(
+     synNativeComputeGraphHandle handle, std::unique_ptr<StreamJob>& job,
+-    synNativeGraphSyncInfo* completion, uint64_t* statistics, uint64_t count)
++    synNativeGraphSyncInfo* completion, uint64_t* statistics, uint64_t count, uint32_t bound = UINT32_MAX)
+ {
+     if (!handle || !handle->queue || !handle->graph || !handle->stream || !job ||
+         !completion || !statistics || count != 12) return synInvalidArgument;
+     std::lock_guard<std::mutex> lock(handle->replayMutex);
++    if (bound != UINT32_MAX && handle->graph->selectBoundedVariant(bound) != synSuccess)
++        return synInvalidArgument;
+     handle->replayCompletion = completion;
+     handle->replayStatistics = statistics;
+     handle->replayStatisticCount = count;
+@@ -1046,6 +1111,14 @@
+     handle->replayStatisticCount = 0;
+     if (status != synSuccess) handle->graph->invalidate();
+     return status;
++}
++
++extern "C" synStatus SYN_API_CALL synNativeComputeGraphReplayBoundedPlanV1(
++    synNativeComputeGraphHandle handle, uint32_t bound, synNativeGraphSyncInfo* completion,
++    uint64_t* statistics, uint64_t count)
++{
++    if (!handle || bound > 8) return synInvalidArgument;
++    return replayNativeComputeGraphPart(handle, handle->preparedReplayJob, completion, statistics, count, bound);
+ }
+ 
+ extern "C" synStatus SYN_API_CALL synNativeComputeGraphReplayPlanPrefix(
+diff --git a/synapse/src/runtime/scal/common/native_bounded_selection.h b/synapse/src/runtime/scal/common/native_bounded_selection.h
+new file mode 100644
+--- /dev/null
++++ b/synapse/src/runtime/scal/common/native_bounded_selection.h
+@@ -0,0 +1,46 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++
++#include <algorithm>
++#include <cstdint>
++#include <stdexcept>
++#include <vector>
++
++// Cold-only selection and dependency remapping. Zero marks mandatory work;
++// 1..limit mark independent tile recipes. Optional tag 9 selects the complete
++// scorer instead of the prefix when bound > 4. Consumers mask unused outputs.
++// State writers, collective endpoints and the terminal recipe are mandatory.
++struct NativeBoundedSelection {
++  std::vector<uint32_t> segments, producers, consumers;
++
++  static NativeBoundedSelection prepare(const std::vector<uint32_t>& minimum,
++                                       const std::vector<uint32_t>& producers,
++                                       const std::vector<uint32_t>& consumers,
++                                       uint32_t bound, uint32_t limit) {
++    if (minimum.empty() || minimum.size() >= UINT32_MAX || !limit || limit > 8 || bound > limit ||
++        minimum.front() || minimum.back() || producers.size() != consumers.size())
++      throw std::invalid_argument("Invalid bounded segment contract");
++    NativeBoundedSelection result;
++    const bool hasWhole = std::find(minimum.begin(), minimum.end(), 9) != minimum.end();
++    if (hasWhole && limit != 8) throw std::invalid_argument("Whole scorer requires eight-tile capacity");
++    std::vector<uint32_t> inverse(minimum.size(), UINT32_MAX);
++    for (uint32_t i = 0; i < minimum.size(); ++i) {
++      const auto tag = minimum[i];
++      if (tag > limit && tag != 9) throw std::invalid_argument("Tile bound exceeds prepared capacity");
++      const bool selected = !tag || (hasWhole && bound > 4 ? tag == 9 : tag <= bound);
++      if (selected) {
++        inverse[i] = result.segments.size();
++        result.segments.push_back(i);
++      }
++    }
++    for (size_t i = 0; i < consumers.size(); ++i) {
++      const auto producer = producers[i], consumer = consumers[i];
++      if (consumer >= minimum.size() || minimum[consumer] || (i && consumer < consumers[i - 1]) ||
++          (producer != UINT32_MAX && (producer >= consumer || minimum[producer])))
++        throw std::invalid_argument("Collective endpoint cannot be omitted or reordered");
++      result.producers.push_back(producer == UINT32_MAX ? UINT32_MAX : inverse[producer]);
++      result.consumers.push_back(inverse[consumer]);
++    }
++    return result;
++  }
++};
