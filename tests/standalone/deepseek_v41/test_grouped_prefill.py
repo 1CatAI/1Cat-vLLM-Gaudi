@@ -57,6 +57,59 @@ def test_dedicated_entrypoint_selects_validated_grouped_prefill():
     assert "VLLM_HPU_DSV41_PREFILL_MXFP4" not in _C1_FASTPATH_DEFAULTS
 
 
+@pytest.mark.parametrize("tp_size", [2, 4])
+@pytest.mark.parametrize("tokens", [8, 128, 16384])
+def test_fp8_prompt_dispatch_keeps_scales_and_batch_decode_separate(monkeypatch, tp_size, tokens):
+    from types import SimpleNamespace
+    import torch
+    from vllm_gaudi.entrypoints.deepseek_v41 import _TP4_FASTPATH_DEFAULTS, _TP4_FORCE_DISABLED
+    from vllm_gaudi.models.deepseek_v41_program import PreparedMoE
+    from vllm_gaudi.ops import deepseek_v41_prefill_buckets as buckets
+
+    for name, value in _TP4_FASTPATH_DEFAULTS.items():
+        monkeypatch.setenv(name, value)
+    for name in _TP4_FORCE_DISABLED:
+        monkeypatch.setenv(name, "0")
+    monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_REGIONS", "0")
+    experts = SimpleNamespace(
+        **{
+            name: torch.ones(1, dtype=torch.bfloat16)
+            for name in ("w13_q16", "w2_q16", "w13_s16", "w2_s16", "w13_fp8_channel", "w2_fp8_channel")
+        })
+    weights = SimpleNamespace(experts=experts,
+                              gate=SimpleNamespace(weight=torch.arange(32).reshape(8, 4).float(),
+                                                   bias=torch.zeros(8),
+                                                   bias_vl=torch.zeros(8)))
+    model = PreparedMoE(weights, 6, True, torch.ones(1), lambda value: value, tensor_parallel_size=tp_size)
+    model.router_top6 = model.router_bf16_gate = False
+    monkeypatch.setattr(model, "shared_expert", lambda value: torch.ones_like(value))
+    calls = []
+
+    def bucket_consumer(value, ids, routing, q13, q2, s13, s2, lookup, normal_scales, channel):
+        # Keep both real grouped dispatchers and their FP8 scale validation.
+        # Only the terminal hardware plan is replaced for this CPU contract.
+        assert channel is experts.w13_fp8_channel
+        assert ids.shape == routing.shape == (tokens, 6)
+        calls.append("prefill")
+        return value * channel
+
+    def decode_consumer(value, ids, routing, *, ordinary_decode, **kwargs):
+        assert ordinary_decode
+        calls.append("decode")
+        return value * 7
+
+    monkeypatch.setattr(buckets, "run_bucketed_prefill", bucket_consumer)
+    monkeypatch.setattr(model, "_forward_n256_fp8", decode_consumer)
+    value = torch.ones(tokens, 4, dtype=torch.bfloat16)
+    mask = torch.zeros(tokens, dtype=torch.bool)
+    for scale in (2, 3):
+        experts.w13_fp8_channel.fill_(scale)
+        assert torch.equal(model(value, mask), torch.full_like(value, scale + 1))
+    assert calls == ["prefill", "prefill"]
+    assert torch.equal(model(value[:8], mask[:8], ordinary_decode=True), torch.full_like(value[:8], 8))
+    assert calls == ["prefill", "prefill", "decode"]
+
+
 def test_prompt_lengths_do_not_exhaust_shared_dynamo_recompile_limit(monkeypatch):
     import torch
     from vllm_gaudi.ops import deepseek_v41_grouped_prefill as grouped

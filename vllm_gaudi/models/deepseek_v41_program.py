@@ -551,7 +551,8 @@ class PreparedMoE(nn.Module):
         if self.prefill_grouped and value.shape[0] > 6 and not ordinary_decode:
             from vllm_gaudi.ops.deepseek_v41_grouped_prefill import run_grouped_prefill
             output = run_grouped_prefill(value, ids, routing, experts.w13_q16, experts.w2_q16, experts.w13_s16,
-                                         experts.w2_s16, self.lookup, self.normal_scales)
+                                         experts.w2_s16, self.lookup, self.normal_scales, experts.w13_fp8_channel,
+                                         experts.w2_fp8_channel)
         elif self.prefill_mxfp4 and value.shape[0] > 6 and not ordinary_decode:
             # Large-M prompt work has a different reuse regime from C1.  The
             # decode-oriented N256 compound kernel rereads and converts all
