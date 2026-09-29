@@ -18,7 +18,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41AttentionNormGaudi2::GetGcDefinitions(
     const auto width = x.maxSizes[0], rows = x.maxSizes[1];
     if (x.dims != 2 || w.dims != 1 || y.dims != 2 ||
         (width != 512 && width != 1280 && width != 5120) ||
-        rows < 1 || rows > 8192 || w.maxSizes[0] != width ||
+        rows < 1 || rows > 16384 || w.maxSizes[0] != width ||
         y.maxSizes[0] != width || y.maxSizes[1] != rows)
         return GLUE_INCOMPATIBLE_INPUT_SIZE;
     const auto* params = static_cast<const float*>(p->nodeParams.nodeParams);

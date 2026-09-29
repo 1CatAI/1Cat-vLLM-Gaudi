@@ -16,7 +16,7 @@ DeepseekV41RouterLogitsTop6Gaudi2::GetGcDefinitions(
     const auto& x = p->inputTensors[0].geometry;
     const auto tokens = x.maxSizes[1];
     if (x.dataType != DATA_F32 || x.dims != 2 ||
-        x.maxSizes[0] != 384 || tokens < 1 || tokens > 8192)
+        x.maxSizes[0] != 384 || tokens < 1 || tokens > 16384)
         return GLUE_INCOMPATIBLE_INPUT_SIZE;
     for (int i = 1; i < 4; ++i) {
         const auto& t = p->inputTensors[i].geometry;

@@ -25,7 +25,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41FfnNormQuantGaudi2::GetGcDefinitions(
         s.dataType != DATA_F32)
         return GLUE_INCOMPATIBLE_DATA_TYPE;
     const auto width = x.maxSizes[0], rows = x.maxSizes[1];
-    if (x.dims != 2 || width != 5120 || rows < 1 || rows > 8192 ||
+    if (x.dims != 2 || width != 5120 || rows < 1 || rows > 16384 ||
         w.dims != 1 || w.maxSizes[0] != width ||
         y.dims != 2 || y.maxSizes[0] != width || y.maxSizes[1] != rows ||
         q.dims != 2 || q.maxSizes[0] != width || q.maxSizes[1] != rows ||

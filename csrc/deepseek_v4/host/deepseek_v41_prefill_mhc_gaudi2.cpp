@@ -24,7 +24,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41PrefillMhcGaudi2::GetGcDefinitions(
         const auto dtype = i==2 || i==3 ? DATA_F32 : DATA_BF16;
         if (g.dataType != dtype) { g.dataType=dtype; return GLUE_INCOMPATIBLE_DATA_TYPE; }
     }
-    if (x.dims!=2 || x.maxSizes[0]!=5120 || x.maxSizes[1]<1 || x.maxSizes[1]>8192 ||
+    if (x.dims!=2 || x.maxSizes[0]!=5120 || x.maxSizes[1]<1 || x.maxSizes[1]>16384 ||
         r.dims!=3 || r.maxSizes[0]!=5120 || r.maxSizes[1]!=4 || r.maxSizes[2]!=x.maxSizes[1] ||
         p.dims!=2 || p.maxSizes[0]!=4 || p.maxSizes[1]!=x.maxSizes[1] ||
         c.dims!=3 || c.maxSizes[0]!=4 || c.maxSizes[1]!=4 || c.maxSizes[2]!=x.maxSizes[1])
@@ -67,7 +67,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41PrefillMhcCollapseGaudi2::GetGcDefinition
     if (p.dataType != DATA_F32) { p.dataType=DATA_F32; return GLUE_INCOMPATIBLE_DATA_TYPE; }
     if (y.dataType != DATA_BF16) { y.dataType=DATA_BF16; return GLUE_INCOMPATIBLE_DATA_TYPE; }
     if (r.dims!=3 || r.maxSizes[0]!=5120 || r.maxSizes[1]!=4 ||
-        r.maxSizes[2]<1 || r.maxSizes[2]>8192 ||
+        r.maxSizes[2]<1 || r.maxSizes[2]>16384 ||
         p.dims!=2 || p.maxSizes[0]!=4 || p.maxSizes[1]!=r.maxSizes[2])
         return GLUE_INCOMPATIBLE_INPUT_SIZE;
     if (y.dims!=2 || y.maxSizes[0]!=5120 || y.maxSizes[1]!=r.maxSizes[2])
@@ -106,7 +106,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41PrefillMhcRrmsGaudi2::GetGcDefinitions(
     if (r.dataType != DATA_BF16) { r.dataType=DATA_BF16; return GLUE_INCOMPATIBLE_DATA_TYPE; }
     if (y.dataType != DATA_F32) { y.dataType=DATA_F32; return GLUE_INCOMPATIBLE_DATA_TYPE; }
     if (r.dims!=3 || r.maxSizes[0]!=5120 || r.maxSizes[1]!=4 ||
-        r.maxSizes[2]<1 || r.maxSizes[2]>8192)
+        r.maxSizes[2]<1 || r.maxSizes[2]>16384)
         return GLUE_INCOMPATIBLE_INPUT_SIZE;
     if (y.dims!=2 || y.maxSizes[0]!=1 || y.maxSizes[1]!=r.maxSizes[2])
         return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
@@ -153,7 +153,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41PrefillMhcPostPrepareGaudi2::GetGcDefinit
             in->outputTensors[i].geometry.dataType=output_types[i]; return GLUE_INCOMPATIBLE_DATA_TYPE;
         }
     const unsigned tokens=x.maxSizes[1];
-    if (x.dims!=2 || x.maxSizes[0]!=5120 || tokens<1 || tokens>8192 ||
+    if (x.dims!=2 || x.maxSizes[0]!=5120 || tokens<1 || tokens>16384 ||
         r.dims!=3 || r.maxSizes[0]!=5120 || r.maxSizes[1]!=4 || r.maxSizes[2]!=tokens ||
         p.dims!=2 || p.maxSizes[0]!=4 || p.maxSizes[1]!=tokens ||
         c.dims!=3 || c.maxSizes[0]!=4 || c.maxSizes[1]!=4 || c.maxSizes[2]!=tokens ||

@@ -3,11 +3,13 @@
 
 import argparse
 import collections
+from functools import lru_cache
 import json
 from pathlib import Path
 import re
 
 
+@lru_cache(maxsize=64)
 def graph_nodes(path):
     result = []
     for block in re.split(r"\n(?=node \{)", path.read_text()):
@@ -47,10 +49,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("analysis", type=Path)
     args = parser.parse_args()
+    collection_path = args.analysis / "collection.json"
+    collection = json.loads(collection_path.read_text()) if collection_path.exists() else {}
+    if collection.get("format") == "raw_hltv_cpu":
+        for rank in range(4):
+            contracts = json.loads((args.analysis / f"rank{rank}/node-contracts.json").read_text())
+            assert contracts and all(row["matched"] for row in contracts)
+        print("Raw HLTV node contracts already joined by recipe name/debug ID and Unique Node ID", flush=True)
+        return
     manifest = json.loads((args.analysis / "graph-manifest.json").read_text())
     graphs, index = {}, collections.defaultdict(set)
     for record in manifest:
-        if "PostGraph" not in record["path"]:
+        if not any(stage in record["path"] for stage in ("PostGraph", "eager_final_graph", "eager-finalgraph")):
             continue
         path = Path(record["path"])
         nodes = graph_nodes(path)

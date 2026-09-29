@@ -46,7 +46,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41Fp4PackGaudi2::GetGcDefinitions(
         const auto& value = in->inputTensors[0].geometry;
         const auto width = value.maxSizes[0], rows = value.maxSizes[1];
         if (value.dataType != DATA_BF16 || result.dataType != DATA_U8) return GLUE_INCOMPATIBLE_DATA_TYPE;
-        if (value.dims != 2 || width == 0 || width > 16384 || width % mode_ || rows == 0 || rows > 8192)
+        if (value.dims != 2 || width == 0 || width > 16384 || width % mode_ || rows == 0 || rows > 16384)
             return GLUE_INCOMPATIBLE_INPUT_SIZE;
         if (result.dims != 2 || result.maxSizes[0] != width / 2 + width / mode_ || result.maxSizes[1] != rows)
             return GLUE_INCOMPATIBLE_OUTPUT_SIZE;

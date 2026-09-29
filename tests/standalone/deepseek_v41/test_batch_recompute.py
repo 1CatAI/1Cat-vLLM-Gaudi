@@ -13,6 +13,7 @@ from vllm_gaudi.v1.worker.deepseek_v41_v2_runner import V41V2ModelRunner
 def fixture():
     runner = object.__new__(V41V2ModelRunner)
     runner.prefix_checkpoints = None
+    runner.prefill_capacity = 8192
     bank = object.__new__(BatchStageState)
     bank.single_owner = None
     bank.slots = RequestSlots(1)

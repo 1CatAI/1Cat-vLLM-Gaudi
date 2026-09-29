@@ -20,17 +20,19 @@ habana::OutputMetaDataVector meta(const at::Stack& stack, bool epilogue) {
                     "Q projection/RoPE requires contiguous matching inference tensors");
     }
     const auto w = stack.at(1).toTensor(), s = stack.at(2).toTensor();
+    const auto width = epilogue ? (x.dim() == 2 ? x.size(1) : 0) : (w.dim() == 2 ? w.size(0) : 0);
+    TORCH_CHECK(width == 8192 || width == 16384, "Q projection requires TP2/TP4 width");
     const auto rows = x.dim() == 2 ? x.size(0) : 0;
     TORCH_CHECK(rows >= 1 && rows <= 64, "Q projection requires 1..64 request rows");
     if (epilogue) {
-        TORCH_CHECK(x.scalar_type() == at::kFloat && x.sizes() == at::IntArrayRef({rows,16384}) &&
-                    w.scalar_type() == at::kFloat && w.sizes() == at::IntArrayRef({1,16384}) &&
+        TORCH_CHECK(x.scalar_type() == at::kFloat && x.sizes() == at::IntArrayRef({rows,width}) &&
+                    w.scalar_type() == at::kFloat && w.sizes() == at::IntArrayRef({1,width}) &&
                     s.scalar_type() == at::kFloat && s.sizes() == at::IntArrayRef({rows,1}),
                     "Q epilogue requires F32 product [B,16384], channel scales [1,16384] and activation scale [B,1]");
     } else {
         TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.sizes() == at::IntArrayRef({rows,1280}) &&
-                    w.scalar_type() == at::ScalarType::Float8_e4m3fn && w.sizes() == at::IntArrayRef({16384,1280}) &&
-                    s.scalar_type() == at::kFloat && s.sizes() == at::IntArrayRef({1,16384}),
+                    w.scalar_type() == at::ScalarType::Float8_e4m3fn && w.sizes() == at::IntArrayRef({width,1280}) &&
+                    s.scalar_type() == at::kFloat && s.sizes() == at::IntArrayRef({1,width}),
                     "Q projection requires BF16 [B,1280], prepared FP8 [16384,1280], F32 scales [1,16384]");
     }
     const auto pos = stack.at(3).toTensor(), table = stack.at(4).toTensor();
@@ -38,12 +40,14 @@ habana::OutputMetaDataVector meta(const at::Stack& stack, bool epilogue) {
                 table.scalar_type() == at::kFloat && table.dim() == 2 && table.size(0) > 0 &&
                 table.size(0) <= 1048576 && table.size(1) == 64,
                 "Q RoPE requires I32 position [B] and F32 cos/sin [1..1048576,64]");
-    return {{at::kBFloat16, {rows,16384}}};
+    return {{at::kBFloat16, {rows,width}}};
 }
 habana::OutputMetaDataVector norm_meta(const at::Stack& stack) {
     TORCH_CHECK(stack.size() == 7, "Q norm/projection/RoPE requires six tensors and epsilon");
     const auto x = stack.at(0).toTensor(), norm = stack.at(1).toTensor();
     const auto w = stack.at(2).toTensor(), s = stack.at(3).toTensor();
+    const auto width = w.size(0);
+    TORCH_CHECK(width == 8192 || width == 16384, "Q projection requires TP2/TP4 width");
     const auto pos = stack.at(4).toTensor(), table = stack.at(5).toTensor();
     const auto epsilon = stack.at(6).toDouble();
     const auto rows = x.dim() == 2 ? x.size(0) : 0;
@@ -56,15 +60,15 @@ habana::OutputMetaDataVector norm_meta(const at::Stack& stack) {
     TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.sizes() == at::IntArrayRef({rows,1280}) &&
                 norm.scalar_type() == at::kBFloat16 && norm.sizes() == at::IntArrayRef({1280}) &&
                 w.scalar_type() == at::ScalarType::Float8_e4m3fn &&
-                w.sizes() == at::IntArrayRef({16384,1280}) &&
-                s.scalar_type() == at::kFloat && s.sizes() == at::IntArrayRef({1,16384}) &&
+                w.sizes() == at::IntArrayRef({width,1280}) &&
+                s.scalar_type() == at::kFloat && s.sizes() == at::IntArrayRef({1,width}) &&
                 pos.scalar_type() == at::kInt && pos.sizes() == at::IntArrayRef({rows}) &&
                 table.scalar_type() == at::kFloat && table.dim() == 2 && table.size(0) > 0 &&
                 table.size(0) <= 1048576 && table.size(1) == 64 &&
                 std::isnormal(static_cast<float>(epsilon)) && epsilon > 0,
                 "Q norm projection requires BF16 [B,1280]/[1280], FP8 [16384,1280], "
                 "F32 [1,16384], I32 [B], F32 [L,64], positive normal epsilon");
-    return {{at::kBFloat16, {rows,16384}}};
+    return {{at::kBFloat16, {rows,width}}};
 }
 class Projection final : public habana::OpBackend {
     bool epilogue_;

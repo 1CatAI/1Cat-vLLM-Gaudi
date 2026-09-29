@@ -17,9 +17,19 @@ def uses_v2(config):
     return is_v41(config) and envs.VLLM_HPU_DSV41_V2
 
 
+def tensor_parallel_size(config):
+    return config.parallel_config.tensor_parallel_size if is_v41(config) else 1
+
+
+def is_tp4(config):
+    return tensor_parallel_size(config) == 4
+
+
 def validate_v2(config):
     if not uses_v2(config):
         return
+    if is_tp4(config):
+        raise ValueError("V4.1 TP4 bring-up uses the synchronous prepared runner; V2 is TP2-only")
     if not config.use_v2_model_runner or not config.scheduler_config.async_scheduling:
         raise ValueError("V4.1 V2 requires VLLM_USE_V2_MODEL_RUNNER=1 and async scheduling")
     if envs.VLLM_HPU_DSV41_DSPARK or config.speculative_config is not None:
@@ -62,8 +72,9 @@ def configure(config):
     from vllm_gaudi.entrypoints.deepseek_v41 import prepare_native_libraries
     prepare_native_libraries()
     parallel, cache = config.parallel_config, config.cache_config
-    if (parallel.tensor_parallel_size, parallel.pipeline_parallel_size, parallel.data_parallel_size) != (2, 2, 1):
-        raise ValueError("The V4.1 prepared profile requires TP2 x PP2, DP1")
+    if parallel.data_parallel_size != 1 or (parallel.tensor_parallel_size,
+                                            parallel.pipeline_parallel_size) not in ((2, 2), (4, 1)):
+        raise ValueError("The V4.1 prepared profile requires TP2 x PP2 or TP4 x PP1, DP1")
     if not 1 <= config.model_config.max_model_len <= 1048576:
         raise ValueError("V4.1 supports context lengths up to the checkpoint's 1M limit")
     paged = config.model_config.max_model_len > 512
@@ -105,6 +116,15 @@ def configure(config):
     elif spec is not None:
         raise ValueError("Enable VLLM_HPU_DSV41_DSPARK for the integrated draft")
     validate_v2(config)
+    if is_tp4(config):
+        from vllm_gaudi.entrypoints.deepseek_v41 import _TP4_FORCE_DISABLED
+        if envs.VLLM_HPU_DSV41_DSPARK or spec is not None:
+            raise ValueError("V4.1 TP4 does not yet support DSpark")
+        enabled = next((name for name in _TP4_FORCE_DISABLED if getattr(envs, name, False)), None)
+        if enabled is not None:
+            raise ValueError(f"V4.1 TP4 bring-up does not support {enabled}; use the default TP4 prepared profile")
+        if envs.VLLM_HPU_DSV41_PREFILL_GROUPED_FP8 not in ("", "w13_single_bucket"):
+            raise ValueError("V4.1 TP4 supports BF16 or W13 single-FP8 bucketed prefill")
     if config.scheduler_config.async_scheduling and not uses_v2(config):
         raise ValueError("V4.1 PP verify commits currently require --no-async-scheduling")
     if config.use_v2_model_runner and not uses_v2(config):

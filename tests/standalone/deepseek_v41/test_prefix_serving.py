@@ -5,12 +5,15 @@ import pickle
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 from transformers import OPTConfig
 
 from vllm.config import CacheConfig, ModelConfig, ParallelConfig, SchedulerConfig, VllmConfig
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
+
+pytest.importorskip("vllm.v1.core.auxiliary_prefix_cache", reason="Requires the auxiliary-prefix engine ABI")
 from vllm.v1.core.auxiliary_prefix_cache import AuxiliaryPrefixAck, AuxiliaryPrefixDescriptor, AuxiliaryPrefixOperations
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, UniformTypeKVCacheSpecs

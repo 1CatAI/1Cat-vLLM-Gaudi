@@ -36,23 +36,29 @@ from vllm_gaudi.ops.deepseek_v41_verify import (
     validate_commit_wire,
 )
 
+from vllm_gaudi.ops.deepseek_v41_prefill_capacity import (
+    DEFAULT_PREFILL_TOKENS,
+    MAX_PREFILL_TOKENS,
+    PREFILL_COMPUTE_BUCKETS,  # noqa: F401 - compatibility export for existing callers.
+    prefill_capacity,
+    prefill_compute_buckets,
+)
+
 logger = init_logger()
 
 VERIFY_METADATA_SIZE = 7
 VERIFY_PROPOSED_SIZE = 5
 VERIFY_CONTROL_SIZE = VERIFY_METADATA_SIZE + VERIFY_PROPOSED_SIZE
-PREFILL_BLOCK_TOKENS = 8192
+PREFILL_BLOCK_TOKENS = DEFAULT_PREFILL_TOKENS
 # Scheduler admission and device execution have different jobs.  vLLM may
 # admit a complete C8192 transaction, while the model executes it with this
 # finite set of exact (unpadded) shapes.  Powers down to C128 keep large-M
 # weight reuse; a sub-C128 tail reuses the already qualified C1 replay.  This
 # prevents request lengths from creating new Synapse recipes after the 1M KV
 # pool is resident without introducing padding writes into KV/Engram state.
-PREFILL_COMPUTE_BUCKETS = (8192, 4096, 2048, 1024, 512, 256, 128)
-# Large-M prefill uses Habana's native MXFP4 FusedMoE and reuses each streamed
-# expert range across the whole scheduler chunk.  The previous C16 limit was a
-# property of the single-token decoded-BF16 recipe and does not apply to this
-# path. C6 remains DSpark-only and C1 decode is unchanged.
+# TP4 large-M prefill uses the prepared N256 hybrid expert plans. Expert
+# workspaces remain bounded while the route/output contract covers the whole
+# configured chunk. C6 decode and C1 sampling retain their existing contracts.
 PREFILL_WAVEFRONT_SLOTS = 2
 
 
@@ -68,6 +74,10 @@ def profile_phase(name):
             label = f"v41::{name}::PP{self.model.pp_rank}"
             if name == "target":
                 label += f"::{'decode' if kwargs['decode'] else 'prefill'}::C{len(args[1])}"
+            elif name == "verify_and_commit" and self.pending is not None:
+                request, start, count, _, _, need_sample, _ = self.pending
+                phase = "decode" if start >= len(request.prompt) else "prefill"
+                label += f"::{phase}::P{start}::C{count}::emit{int(need_sample)}"
             elif name == "insert_context":
                 label += f"::C{args[1].numel()}"
             if os.getenv("VLLM_HPU_DSV41_RAW_TRACE", "0") == "1":
@@ -139,13 +149,6 @@ def greedy_verify(target_ids, proposed_ids):
     return target_ids[:accepted + 1], accepted
 
 
-def prefill_compute_buckets():
-    maximum = envs.VLLM_HPU_DSV41_PREFILL_COMPUTE_TOKENS
-    if maximum not in (4096, 8192):
-        raise ValueError("V4.1 Prefill compute capacity must be 4096 or 8192 tokens")
-    return tuple(size for size in PREFILL_COMPUTE_BUCKETS if size <= maximum)
-
-
 def target_chunks(tokens, block_tokens=PREFILL_BLOCK_TOKENS):
     """Cover a scheduler prefill transaction with bounded device blocks.
 
@@ -154,9 +157,9 @@ def target_chunks(tokens, block_tokens=PREFILL_BLOCK_TOKENS):
     DSpark anchor-plus-draft execution and is never used as an ordinary
     prefill geometry.
     """
-    if block_tokens < 1 or block_tokens > PREFILL_BLOCK_TOKENS:
-        raise ValueError("V4.1 device working blocks must be <=8192 tokens; scheduler budget is independent")
-    buckets = tuple(size for size in prefill_compute_buckets() if size <= block_tokens)
+    if block_tokens < 1 or block_tokens > MAX_PREFILL_TOKENS:
+        raise ValueError("V4.1 prefill blocks must be no larger than 16384 tokens")
+    buckets = tuple(size for size in prefill_compute_buckets(block_tokens) if size <= block_tokens)
     offset = 0
     while offset < len(tokens):
         remaining = len(tokens) - offset
@@ -264,6 +267,13 @@ class PPBuffers:
     def __init__(self, device, capacity=6, *, dspark=True, device_commit=None):
         self.group = get_pp_group()
         self.dspark = bool(dspark)
+        self.single_stage = (getattr(self.group, "is_first_rank", False) and getattr(self.group, "is_last_rank", False))
+        if self.single_stage:
+            if self.dspark:
+                raise ValueError("Single-stage V4.1 does not yet support DSpark")
+            # No pipeline peer consumes hidden/pre buffers in TP4 x PP1.
+            # Avoid reserving a full prompt-sized transport allocation.
+            capacity = 0
         if not self.dspark:
             self.device_commit_enabled = (envs.VLLM_HPU_DSV41_DEVICE_COMMIT
                                           if device_commit is None else bool(device_commit))
@@ -459,6 +469,8 @@ class PPBuffers:
             event.synchronize()
 
     def exchange(self, values, count, *, native_wire=False, decode=False):
+        if self.single_stage:
+            raise RuntimeError("Single-stage V4.1 has no pipeline exchange")
         if not self.dspark:
             return self._exchange_ordinary(values, count, decode=decode)
         # PP0 reuses its receive/commit buffers only after its prior result was
@@ -612,6 +624,9 @@ class PPBuffers:
             raise RuntimeError("Ordinary token completion cannot commit DSpark verification")
         self.drain()
         self.generation += 1
+        if self.group.is_first_rank and self.group.is_last_rank:
+            self.commits += 1
+            return consumed, [] if token is None else [token]
         if self.group.is_last_rank:
             record = [self.generation, consumed, int(token is not None), -1 if token is None else token]
             self.commit_host.copy_(torch.tensor(record, dtype=torch.int32, device="cpu"))
@@ -871,12 +886,14 @@ class V41ModelRunner:
         self.profiler = HabanaHighLevelProfiler()
         self.model_memory_usage = self.mem_margin = 0
         self.serving_workspace_reserve = (3 << 30) if self.model_config.max_model_len > 512 else 0
+        self.prefill_capacity = prefill_capacity(vllm_config.scheduler_config.max_num_batched_tokens,
+                                                 vllm_config.parallel_config.tensor_parallel_size)
         self.pp = PPBuffers(self.device,
-                            capacity=PREFILL_BLOCK_TOKENS,
+                            capacity=self.prefill_capacity,
                             dspark=self.use_dspark,
                             device_commit=False if self.v2_completion else None)
-        self.input_ids = torch.empty(PREFILL_BLOCK_TOKENS, dtype=torch.int64, device=self.device)
-        self.positions = torch.empty(PREFILL_BLOCK_TOKENS, dtype=torch.int32, device=self.device)
+        self.input_ids = torch.empty(self.prefill_capacity, dtype=torch.int64, device=self.device)
+        self.positions = torch.empty(self.prefill_capacity, dtype=torch.int32, device=self.device)
         # Decode/DSpark reuse exact Tensor objects. Large-M prompt buckets are
         # created on demand, avoiding sixteen thousand permanent Python Tensor
         # wrappers merely to represent all possible lengths through C8192.
@@ -887,7 +904,7 @@ class V41ModelRunner:
         self.position_bank = None
         if envs.VLLM_HPU_DSV41_FIXED_POSITIONS and not self.use_dspark:
             from vllm_gaudi.ops.deepseek_v41_inputs import PositionBank
-            self.position_bank = PositionBank(self.model_config.max_model_len, PREFILL_BLOCK_TOKENS, self.device)
+            self.position_bank = PositionBank(self.model_config.max_model_len, self.prefill_capacity, self.device)
         self.input_staging = None
         self.batched_input_staging = envs.VLLM_HPU_DSV41_BATCHED_INPUT_STAGING
         if self.batched_input_staging and not envs.VLLM_HPU_DSV41_FUSED_STAGE_IO:
@@ -960,7 +977,10 @@ class V41ModelRunner:
         # loading so their first use is outside the serving request.
         if envs.VLLM_HPU_DSV41_PREFILL_GROUPED and envs.VLLM_HPU_DSV41_PREFILL_DEVICE_ROUTES:
             from vllm_gaudi.ops.deepseek_v41_grouped_prefill import prepare_device_grouped_prefill_recipes
-            prepare_device_grouped_prefill_recipes(normal_scales=True)
+            prepare_device_grouped_prefill_recipes(
+                normal_scales=True,
+                tensor_parallel_size=self.vllm_config.parallel_config.tensor_parallel_size,
+                prefill_tokens=self.prefill_capacity)
         self.model = get_model(vllm_config=self.vllm_config)
         state_type = PagedStageState if self.model_config.max_model_len > 512 else StageStateBlocks
         self.state = (state_type(self.model.program,
@@ -1001,7 +1021,11 @@ class V41ModelRunner:
             self.verify_ring = VerifyRing(self.device, last_rank=False)
         elif self.pp.group.is_last_rank:
             sampler = self.model.program.sample_greedy_token if self.v2_completion else self.model.program.sample_greedy
-            self.sample_target = torch.compile(sampler, backend="hpu_backend", fullgraph=True, dynamic=False)
+            sampler_backend = "hpu_backend"
+            if getattr(self.model, "tensor_parallel_size", 2) == 4:
+                from vllm_gaudi.compilation.deepseek_v41_tp4 import make_backend
+                sampler_backend = make_backend()
+            self.sample_target = torch.compile(sampler, backend=sampler_backend, fullgraph=True, dynamic=False)
             if self.pp.device_commit_enabled:
                 self.sample_target_commit = torch.compile(self.model.program.sample_greedy_commit,
                                                           backend="hpu_backend",
@@ -1041,7 +1065,8 @@ class V41ModelRunner:
         if not isinstance(self.state, PagedStageState):
             return 1
         from vllm_gaudi.ops.deepseek_v41_paged_attention import PAGE_TOKENS
-        last_position = min(self.model_config.max_model_len, INDEX_MME_HOT_TOKENS + max(prefill_compute_buckets()))
+        compute_tokens = max(prefill_compute_buckets(self.prefill_capacity), default=1)
+        last_position = min(self.model_config.max_model_len, INDEX_MME_HOT_TOKENS + compute_tokens)
         return 1 + (last_position + PAGE_TOKENS - 1) // PAGE_TOKENS
 
     def bind_framework_kv_caches(self, caches, runner_caches):
@@ -1341,9 +1366,16 @@ class V41ModelRunner:
             self._round_phase("stage_submitted_ns")
             if timing:
                 timing.device("stage_target_done")
-            self.pp.exchange(value, count, decode=graph_c1)
+            # TP4 is a single PP stage.  The model owns the final norm and
+            # head on this rank, so keep its output instead of sending it to
+            # the nonexistent PP1 peer.  TP2xPP2 retains the ordinary
+            # boundary exchange below.
+            if getattr(self.pp.group, "is_last_rank", False):
+                output = value
+            else:
+                self.pp.exchange(value, count, decode=graph_c1)
+                output = None
             self._round_phase("pp_exchanged_ns")
-            output = None
         else:
             value = self.pp.exchange(None, count, native_wire=use_replay and self.use_dspark, decode=graph_c1)
             self._round_phase("pp_exchanged_ns")
@@ -1707,7 +1739,7 @@ class V41ModelRunner:
         # Match vLLM chunked-prefill semantics: one scheduler transaction is a
         # real large-M model invocation up to max_num_batched_tokens. Internal
         # C1/C6 decode tiling would reread expert weights for every prompt row.
-        chunks = [(0, tokens)] if decode else target_chunks(tokens, PREFILL_BLOCK_TOKENS)
+        chunks = [(0, tokens)] if decode else target_chunks(tokens, self.prefill_capacity)
         prefix_checkpoints = getattr(self, "prefix_checkpoints", None)
         if prefix_checkpoints is not None:
             chunks = prefix_checkpoints.chunks(req_id, start, chunks)
@@ -1720,14 +1752,20 @@ class V41ModelRunner:
             halo_mode = "full"
             if not decode:
                 from vllm_gaudi.ops.deepseek_v41_decoder_halo import decoder_halo_mode
+                tp4_halo = getattr(program, "tensor_parallel_size", 2) == 4
+                halo_block = self.prefill_capacity if tp4_halo else PREFILL_BLOCK_TOKENS
                 halo_mode = decoder_halo_mode(
                     start + offset,
                     len(chunk),
                     len(request.prompt),
-                    eligible=(envs.VLLM_HPU_DSV41_PREFILL_DECODER_HALO and not self.use_dspark and start == 0
-                              and count == len(request.prompt) and prefill_compute_buckets()[0] == PREFILL_BLOCK_TOKENS
+                    eligible=(envs.VLLM_HPU_DSV41_PREFILL_DECODER_HALO and not self.use_dspark
+                              and (not tp4_halo or self.prefill_capacity == 16384)
+                              and (tp4_halo or (start == 0 and count == len(request.prompt)))
+                              and max(prefill_compute_buckets(self.prefill_capacity), default=1) == halo_block
                               and len(scheduled.num_scheduled_tokens) == 1 and not request.mm_features
-                              and getattr(request.sampling_params, "prompt_logprobs", None) is None))
+                              and getattr(request.sampling_params, "prompt_logprobs", None) is None),
+                    block_tokens=halo_block,
+                    allow_single_block=tp4_halo)
             if program is not None:
                 program.prefill_halo_mode = halo_mode
             try:
@@ -1883,7 +1921,8 @@ class V41ModelRunner:
         self.state.clear()
         hidden = self._forward("__v41_warmup__", [1 + index for index in range(tokens)],
                                start_position,
-                               decode=native and (self.use_dspark or tokens == 1),
+                               decode=(native or getattr(self.model, "tensor_parallel_size", 2) == 4)
+                               and (self.use_dspark or tokens == 1),
                                reset=True)
         from vllm_gaudi.ops.tp2_prepared_plan import prepared_group_stats
         stats = prepared_group_stats()
@@ -1938,20 +1977,36 @@ class V41ModelRunner:
 
     def profile_run(self, initialize_only=False):
         del initialize_only
+        self.profile_memory_steps = []
+
+        def record_memory(tokens, position):
+            # _dummy_run already drains the device and crosses the PP/TP
+            # barrier. Read counters here without adding a synchronization or
+            # resetting the cumulative peak used by cache admission.
+            record = dict(tokens=tokens,
+                          position=position,
+                          allocated_bytes=torch.hpu.memory_allocated(),
+                          cumulative_peak_bytes=torch.hpu.max_memory_allocated())
+            self.profile_memory_steps.append(record)
+            logger.info("V4.1 initialization memory step: %s", record)
+
+        record_memory(0, 0)
         if not self.use_dspark and isinstance(self.state, PagedStageState):
             geometries = (0, min(INDEX_MME_HOT_TOKENS, self.model_config.max_model_len - 1))
             for start_position in geometries:
-                for tokens in prefill_compute_buckets():
+                for tokens in prefill_compute_buckets(self.prefill_capacity):
                     if start_position + tokens > self.model_config.max_model_len:
                         continue
                     logger.info("V4.1 PP%d starting pre-KV C%d prefill recipe warmup at position %d",
                                 self.model.pp_rank, tokens, start_position)
                     self._dummy_run(tokens, start_position=start_position)
+                    record_memory(tokens, start_position)
                     logger.info("V4.1 PP%d completed pre-KV C%d prefill recipe warmup at position %d",
                                 self.model.pp_rank, tokens, start_position)
         tokens = 6 if self.use_dspark else 1
         logger.info("V4.1 PP%d starting C%d memory profile", self.model.pp_rank, tokens)
         self._dummy_run(tokens)
+        record_memory(tokens, 0)
         logger.info("V4.1 PP%d completed C%d memory profile", self.model.pp_rank, tokens)
 
     @torch.inference_mode()

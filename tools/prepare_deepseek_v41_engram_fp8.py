@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prepare bounded PP0 Engram FP8 sidecars from immutable rank files."""
 import argparse
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,6 +19,8 @@ def main():
     args = parser.parse_args()
     args.output = args.output or args.prepared / "sidecars" / "engram_fp8"
     args.output.mkdir(parents=True, exist_ok=False)
+    topology = json.loads((args.prepared / "manifest.json").read_text())
+    tp_size = topology["tensor_parallel_size"]
     manifest = {
         "version": 1,
         "quantization": QUANTIZATION,
@@ -26,7 +29,7 @@ def main():
         "rank_files": {},
     }
     n, k = SHAPE
-    for tp in range(2):
+    for tp in range(tp_size):
         shard = PreparedV41Shard(args.prepared, 0, tp)
         rank = f"pp0-tp{tp}"
         specs = {}
@@ -49,8 +52,8 @@ def main():
                 for row in range(0, n, 256):
                     count = min(256, n - row)
                     codes = read_bytes(weight, row * k, count * k).reshape(count, k)
-                    powers = read_bytes(scale, row // 32 * (k // 32), ((count + 31) // 32) *
-                                       (k // 32)).reshape((count + 31) // 32, k // 32)
+                    powers = read_bytes(scale, row // 32 * (k // 32), ((count + 31) // 32) * (k // 32)).reshape(
+                        (count + 31) // 32, k // 32)
                     q, channel, record = prepare_block32_rows(codes, powers)
                     if record["temporary_upper_bound_bytes"] > 2 * 2**30:
                         raise RuntimeError("Engram preparation exceeds temporary budget")
@@ -66,8 +69,8 @@ def main():
                              blocks=records,
                              temporary_upper_bound_bytes=max(record["temporary_upper_bound_bytes"]
                                                              for record in records))
-                total["relative_l2"] = ((total["error_energy"] / total["source_energy"])**.5
-                                        if total["source_energy"] else 0)
+                total["relative_l2"] = ((total["error_energy"] /
+                                         total["source_energy"])**.5 if total["source_energy"] else 0)
                 audit.append(total)
                 shard.check_identity()
                 print(f"{rank} layer={layer} relative_l2={total['relative_l2']:.9g}", flush=True)

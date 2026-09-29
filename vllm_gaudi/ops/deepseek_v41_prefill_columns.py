@@ -78,6 +78,14 @@ def permuted_ordered_reduce(value):
     return restore_expert_columns(ordered_reduce(value))
 
 
+def permuted_body_single_fp8_pair_tail(value, routing, slots, expert_ids, q13, q2, s13, s2, lookup, normal_scales,
+                                       routed, channel13, high, high_scale, tail_indices, pair_indices):
+    """Replay any occupied tail as a prefix of one fixed two-expert geometry."""
+    indices = tail_indices.index_select(0, pair_indices.long())
+    return permuted_body_single_fp8_write(value, routing, slots, expert_ids, q13, q2, s13, s2, lookup, normal_scales,
+                                          routed, channel13, high, high_scale, indices)
+
+
 @functools.lru_cache(maxsize=32)
 def compiled_permuted_write_body(signature):
     entry = FunctionType(permuted_body_write.__code__.replace(co_name=f"permuted_expert_write_{signature}"),
@@ -89,6 +97,13 @@ def compiled_permuted_write_body(signature):
 def compiled_permuted_single_fp8_write_body(signature):
     entry = FunctionType(permuted_body_single_fp8_write.__code__.replace(co_name=f"permuted_single_fp8_{signature}"),
                          permuted_body_single_fp8_write.__globals__)
+    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+
+
+@functools.lru_cache(maxsize=32)
+def compiled_permuted_single_fp8_pair_tail(signature):
+    entry = FunctionType(permuted_body_single_fp8_pair_tail.__code__.replace(co_name=f"fp8_pair_tail_{signature}"),
+                         permuted_body_single_fp8_pair_tail.__globals__)
     return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
 
 

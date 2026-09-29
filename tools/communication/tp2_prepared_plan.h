@@ -152,15 +152,20 @@ class PreparedGroupPlan : public std::enable_shared_from_this<PreparedGroupPlan>
   }
 
   void prepare(c10d::ProcessGroupEagerHCCL* backend, std::vector<int64_t> results) {
-    TORCH_CHECK(!sealed && !nodes.empty() && tp2ExchangeEnabled(), "Prepared plans require dedicated TP2 exchange");
+    TORCH_CHECK(!sealed && !nodes.empty(), "Prepared plans require unsealed nodes");
+    const bool has_exchange = std::any_of(nodes.begin(), nodes.end(),
+                                        [](const PreparedNode& node) { return node.exchange; });
+    TORCH_CHECK(!has_exchange || tp2ExchangeEnabled(), "Exchange plans require dedicated TP2 exchange");
     TORCH_CHECK(GET_ENV_FLAG_NEW(PT_HPU_LAZY_MODE) == 0 &&
                     GET_ENV_FLAG_NEW(PT_HPU_EAGER_PIPELINE_ENABLE), "Prepared plans require the eager pipeline");
     TORCH_CHECK(c10::hpu::getCurrentHPUStream().stream() == 0, "Prepared v1 supports the default compute stream");
     // Preparation is the only point that joins host queues. All recipes must
     // have completed their first normal lowering before retaining executors.
     habana::eager::JoinPendingPipelineThreads();
-    communicator = backend->lowLatencyCommunicator();
-    TORCH_CHECK(communicator, "Prepared communicator is not initialized");
+    if (has_exchange) {
+      communicator = backend->lowLatencyCommunicator();
+      TORCH_CHECK(communicator, "Prepared communicator is not initialized");
+    }
     result_slots = std::move(results);
     for (auto& node : nodes) {
       if (node.exchange) {

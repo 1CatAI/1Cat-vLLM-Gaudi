@@ -6,10 +6,12 @@ extern unsigned char _binary___deepseek_v41_batch_mla_metadata_gaudi2_o_end;
 using namespace tpc_lib_api;
 GlueCodeReturn DeepseekV41BatchMlaMetadataGaudi2::GetGcDefinitions(
         HabanaKernelParams* p, HabanaKernelInstantiation* out) {
-    if (!p || !out || !p->nodeParams) return GLUE_FAILED;
+    if (!p || !out) return GLUE_FAILED;
+    if (!p->nodeParams.nodeParams || p->nodeParams.nodeParamsSize != sizeof(Dsv41BatchMlaMetadataParams))
+        return GLUE_INCOMPATIBLE_INPUT_SIZE;
     if (p->inputTensorNr != 6) return GLUE_INCOMPATIBLE_INPUT_COUNT;
     if (p->outputTensorNr != 3) return GLUE_INCOMPATIBLE_OUTPUT_COUNT;
-    const auto params = *static_cast<Dsv41BatchMlaMetadataParams*>(p->nodeParams);
+    const auto params = *static_cast<const Dsv41BatchMlaMetadataParams*>(p->nodeParams.nodeParams);
     const auto& selected = p->inputTensors[0].geometry;
     const auto& pages = p->inputTensors[1].geometry;
     const auto batch = selected.maxSizes[1];

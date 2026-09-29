@@ -12,8 +12,8 @@ tpc_lib_api::GlueCodeReturn DeepseekV41PrefillQScaleRopeGaudi2::GetGcDefinitions
     if (p->inputTensorNr != 5) return GLUE_INCOMPATIBLE_INPUT_COUNT;
     if (p->outputTensorNr != 1) return GLUE_INCOMPATIBLE_OUTPUT_COUNT;
     const auto& y = p->outputTensors[0].geometry;
-    if (y.dims != 2 || y.dataType != DATA_BF16 || y.maxSizes[0] != 16384 ||
-        y.maxSizes[1] < 1 || y.maxSizes[1] > 8192) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+    if (y.dims != 2 || y.dataType != DATA_BF16 || (y.maxSizes[0] != 8192 && y.maxSizes[0] != 16384) ||
+        y.maxSizes[1] < 1 || y.maxSizes[1] > 16384) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
     const unsigned tokens = y.maxSizes[1];
     for (unsigned i = 0; i < 5; ++i) {
         const auto& x = p->inputTensors[i].geometry;
@@ -27,14 +27,14 @@ tpc_lib_api::GlueCodeReturn DeepseekV41PrefillQScaleRopeGaudi2::GetGcDefinitions
                 return GLUE_INCOMPATIBLE_INPUT_SIZE;
             out->inputTensorAccessPattern[i].allRequired = true;
         } else {
-            if (x.dims != 2 || x.maxSizes[0] != (i == 2 ? 1u : 16384u) ||
+            if (x.dims != 2 || x.maxSizes[0] != (i == 2 ? 1u : y.maxSizes[0]) ||
                 x.maxSizes[1] != (i == 1 ? 1u : tokens)) return GLUE_INCOMPATIBLE_INPUT_SIZE;
             out->inputTensorAccessPattern[i].mapping[0] = {0, i == 2 ? 0 : 512, 0, i == 2 ? 0 : 511};
             out->inputTensorAccessPattern[i].mapping[1] = {1, i == 1 ? 0 : 1, 0, 0};
         }
     }
     out->indexSpaceRank = 2;
-    out->indexSpaceGeometry[0] = 32;
+    out->indexSpaceGeometry[0] = y.maxSizes[0] / 512;
     out->indexSpaceGeometry[1] = tokens;
     out->outputTensorAccessPattern[0].mapping[0] = {0, 512, 0, 511};
     out->outputTensorAccessPattern[0].mapping[1] = {1, 1, 0, 0};

@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prepare bounded Attention dense FP8 sidecars from immutable rank files."""
 import argparse
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
 from prepare_deepseek_v41_woa_fp8 import read_bytes
-from vllm_gaudi.ops.deepseek_v41_dense_fp8 import FINGERPRINT, QUANTIZATION, SHAPES
+from vllm_gaudi.ops.deepseek_v41_dense_fp8 import quantization_for_tp, shapes_for_tp
 from vllm_gaudi.ops.deepseek_v41_shard_loader import PreparedV41Shard
-from vllm_gaudi.ops.deepseek_v41_weights import RankWriter, file_hash, publish_json
+from vllm_gaudi.ops.deepseek_v41_weights import RankWriter, canonical_hash, file_hash, publish_json
 from vllm_gaudi.ops.deepseek_v41_woa_fp8 import prepare_block32_rows
 
 
@@ -18,29 +19,34 @@ def main():
     args = parser.parse_args()
     args.output = args.output or args.prepared / "sidecars" / "attention_dense_fp8"
     args.output.mkdir(parents=True, exist_ok=False)
+    topology = json.loads((args.prepared / "manifest.json").read_text())
+    tp_size = topology["tensor_parallel_size"]
+    pp_size = topology["pipeline_parallel_size"]
+    quantization = quantization_for_tp(tp_size)
+    fingerprint = canonical_hash(quantization)
     manifest = {
         "version": 1,
-        "quantization": QUANTIZATION,
-        "quantization_fingerprint": FINGERPRINT,
+        "quantization": quantization,
+        "quantization_fingerprint": fingerprint,
         "source_manifest_sha256": file_hash(args.prepared / "manifest.json"),
         "rank_files": {}
     }
-    for pp in range(2):
-        for tp in range(2):
+    for pp in range(pp_size):
+        for tp in range(tp_size):
             shard = PreparedV41Shard(args.prepared, pp, tp)
             rank, specs = f"pp{pp}-tp{tp}", {}
-            for layer in range(pp * 20, pp * 20 + 20):
-                for projection, shape in SHAPES.items():
+            for layer in range(*topology["pp_layer_ranges"][pp]):
+                for projection, shape in shapes_for_tp(tp_size).items():
                     prefix = f"layers.{layer}.attn.{projection}."
                     specs[prefix + "weight"] = {"dtype": "U8", "shape": shape}
                     specs[prefix + "channel_scale"] = {"dtype": "F32", "shape": [1, shape[0]]}
             path = args.output / f"{rank}.safetensors"
             partial = path.with_suffix(".partial")
-            writer = RankWriter(partial, specs, {"quantization_fingerprint": FINGERPRINT, "source_rank": rank})
+            writer = RankWriter(partial, specs, {"quantization_fingerprint": fingerprint, "source_rank": rank})
             audit = []
             try:
-                for layer in range(pp * 20, pp * 20 + 20):
-                    for projection, (n, k) in SHAPES.items():
+                for layer in range(*topology["pp_layer_ranges"][pp]):
+                    for projection, (n, k) in shapes_for_tp(tp_size).items():
                         prefix = f"layers.{layer}.attn.{projection}."
                         weight, scale = shard.catalog[prefix + "weight"], shard.catalog[prefix + "scale"]
                         if weight.shape != (n, k) or weight.dtype != "F8_E4M3" or scale.shape != (n // 32, k // 32):

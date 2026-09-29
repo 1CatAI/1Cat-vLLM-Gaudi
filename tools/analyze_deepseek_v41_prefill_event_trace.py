@@ -44,9 +44,12 @@ def intersection(left, right):
     return [(max(a, c), min(b, d)) for a, b in merged(left) for c, d in merged(right) if a < d and c < b]
 
 
-def summarize(path):
+def summarize(path, *, stage_layers=None, allow_decoder_halo=False):
     raw = json.loads(path.read_text())
     spans = raw["spans"]
+    if stage_layers is None:
+        stage_layers = list(range(raw["pp_rank"] * 20, (raw["pp_rank"] + 1) * 20))
+    stage_layers = list(stage_layers)
 
     def intervals(name):
         return [(item["device_start_ms"], item["device_end_ms"]) for item in spans if item["name"] == name]
@@ -96,6 +99,13 @@ def summarize(path):
     if abs(sum(attention_components.values()) - duration(attention_in_layers)) > 0.2:
         raise ValueError(f"{path}: Attention subspans do not reconcile")
     mhc_in_layers = difference(intersection(mhc, layers), attention_in_layers + moe_in_layers)
+    other_remaining = difference(layers, attention_in_layers + moe_in_layers)
+    other_components = {}
+    for name in ("mhc_input", "mhc_post"):
+        claimed = intersection(intervals(name), other_remaining)
+        other_components[name] = duration(claimed)
+        other_remaining = difference(other_remaining, claimed)
+    other_components["layer_other_unattributed"] = duration(other_remaining)
     ingress, between, egress = [], [], []
     for chunk in merged(chunks):
         owned_layers = intersection([chunk], layers)
@@ -146,6 +156,7 @@ def summarize(path):
                  layer_ms=duration(clip(layers))))
     raw["groups_ms"] = grouped
     raw["attention_components_ms"] = attention_components
+    raw["layer_other_components_ms"] = other_components
     by_layer = {}
     for layer in sorted(
         {item["layer"]
@@ -165,59 +176,134 @@ def summarize(path):
         by_layer[str(layer)] = phases
     raw["attention_per_layer_ms"] = by_layer
     raw["per_block"] = per_block
+    coverage = []
+    for chunk in (item for item in spans if item["name"] == "transaction_chunk"):
+        owned = [
+            item for item in spans
+            if chunk["host_start_ns"] <= item["host_start_ns"] and item["host_end_ns"] <= chunk["host_end_ns"]
+        ]
+        actual = [item.get("layer") for item in owned if item["name"] == "layer"]
+        expected = stage_layers
+        prefix = [layer for layer in stage_layers if layer <= 20]
+        prefix_only = allow_decoder_halo and 20 in stage_layers and actual == prefix
+        if prefix_only:
+            expected = prefix
+        attention_ids = [item.get("layer") for item in owned if item["name"] == "attention"]
+        coverage.append(
+            dict(layer_ids=actual,
+                 expected_layer_ids=expected,
+                 policy="prefix_only" if prefix_only else "full",
+                 attention_ids=attention_ids,
+                 complete=actual == expected and attention_ids == expected))
+    raw["layer_coverage"] = coverage
     raw["python_attention_span_count"] = sum(item["name"] == "attention" for item in spans)
-    raw["nominal_attention_span_count"] = len(chunks) * 20
-    raw["python_attention_complete"] = (raw["python_attention_span_count"] == raw["nominal_attention_span_count"])
+    raw["nominal_attention_span_count"] = sum(len(item["expected_layer_ids"]) for item in coverage)
+    raw["python_attention_complete"] = bool(coverage) and all(item["complete"] for item in coverage)
+    raw["attention_subphases_captured"] = any(item["name"] in (*detail_names, "attention_mla", "index_selection")
+                                              for item in spans)
     return raw
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
+    parser.add_argument("--request-id", help="Select one request from a retained service's diagnostic directory")
+    parser.add_argument("--expected-prompt-tokens",
+                        type=int,
+                        help="Require complete prompt capture, including a full final decoder transaction")
+    parser.add_argument("--allow-decoder-halo",
+                        action="store_true",
+                        help="Admit complete source-through-layer20 prefix transactions in the coverage audit")
+    parser.add_argument("--output", type=Path, help="Keep each selected request's analysis in its own directory")
     args = parser.parse_args()
     paths = sorted(args.directory.glob("prefill-events-pp*-tp*-g*.json"))
-    if len(paths) != 4:
-        raise ValueError(f"Expected four rank traces, found {len(paths)} in {args.directory}")
-    records = [summarize(path) for path in paths]
-    if {(r["pp_rank"], r["tp_rank"]) for r in records} != {(0, 0), (0, 1), (1, 0), (1, 1)}:
-        raise ValueError("Trace does not cover TP2xPP2 exactly")
-    if len({r["tokens"] for r in records}) != 1 or len({r["request_id"] for r in records}) != 1:
-        raise ValueError("Ranks did not record the same request and prompt length")
+    headers = {path: json.loads(path.read_text()) for path in paths}
+    if args.request_id:
+        headers = {path: raw for path, raw in headers.items() if raw["request_id"] == args.request_id}
+    if not headers or len({raw["request_id"] for raw in headers.values()}) != 1:
+        raise ValueError("Select exactly one captured request with --request-id")
+    ranks = {(raw["pp_rank"], raw["tp_rank"]) for raw in headers.values()}
+    tp4 = ranks == {(0, rank) for rank in range(4)}
+    if not tp4 and ranks != {(0, 0), (0, 1), (1, 0), (1, 1)}:
+        raise ValueError("Trace must cover all four ranks of TP4xPP1 or TP2xPP2")
+    records = [
+        summarize(path, stage_layers=range(40) if tp4 else None, allow_decoder_halo=args.allow_decoder_halo)
+        for path in headers
+    ]
+    records.sort(key=lambda raw: (raw["pp_rank"], raw["tp_rank"], raw["started_ns"]))
+    rank_records = {rank: [raw for raw in records if (raw["pp_rank"], raw["tp_rank"]) == rank] for rank in ranks}
+    if len({tuple(raw["tokens"] for raw in group) for group in rank_records.values()}) != 1:
+        raise ValueError("Ranks did not record the same scheduler transaction lengths")
+    if args.expected_prompt_tokens:
+        for group in rank_records.values():
+            if sum(raw["tokens"] for raw in group) != args.expected_prompt_tokens:
+                raise ValueError("Capture does not cover the complete requested prompt")
+            if group[-1]["layer_coverage"][-1]["policy"] == "prefix_only":
+                raise ValueError("Complete prompt capture cannot end at a source-only transaction")
+    output = args.output or args.directory
+    output.mkdir(parents=True, exist_ok=True)
     summary = {
-        "schema": 1,
-        "scope": "four-rank diagnostic Prefill span timeline, not a hardware kernel trace",
+        "schema":
+        1,
+        "scope":
+        "four-rank diagnostic Prefill span timeline, not a hardware kernel trace",
+        "topology":
+        dict(tensor_parallel_size=4 if tp4 else 2, pipeline_parallel_size=1 if tp4 else 2),
+        "rank_totals": [
+            dict(pp_rank=rank[0],
+                 tp_rank=rank[1],
+                 transactions=len(group),
+                 prompt_tokens=sum(raw["tokens"] for raw in group),
+                 device_windows_ms=sum(raw["device_ms"] for raw in group),
+                 host_between_transactions_ms=sum((right["started_ns"] - left["finished_ns"]) / 1e6
+                                                  for left, right in zip(group, group[1:])),
+                 groups_ms={name: sum(raw["groups_ms"][name] for raw in group)
+                            for name in group[0]["groups_ms"]}) for rank, group in sorted(rank_records.items())
+        ],
         "records": [{
             k: v
             for k, v in record.items() if k != "spans"
         } for record in records]
     }
-    (args.directory / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
+    (output / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
+    detailed_attention = all(record["attention_subphases_captured"] for record in records)
+    attention_header = "MLA | Index | Attention other" if detailed_attention else "Attention envelope"
+    attention_rule = "---: | ---: | ---:" if detailed_attention else "---:"
+    ingress_note = ("For TP4xPP1 there is no pipeline-stage receive; chunk ingress contains input preparation "
+                    "and dependencies whose finer attribution is not recorded."
+                    if tp4 else "On pipeline stage 1, chunk ingress may include PP receive/dependency time; "
+                    "the envelope is not a communication measurement.")
     lines = [
         "# Four-rank Prefill event trace", "",
         "Current-stream HPU event intervals use each rank's own anchor. Rows are mutually exclusive "
         "within that rank; do not add or align device offsets across ranks. This diagnostic does "
         "not provide hardware-kernel calls, FLOP counters, or HBM byte counters. mHC is included "
-        "in Layer other; it has no separate event in this serving path. Chunk ingress on PP1 "
-        "includes PP receive/dependency time but is not synonymous with communication duration.", "",
-        "| Rank | Window ms | MLA | Index | Attention other | MoE | Layer other | Chunk ingress | "
+        "in Layer other; selected mHC subspans are shown separately below when present. " + ingress_note, "",
+        f"| Rank | Window ms | {attention_header} | MoE | Layer other | Chunk ingress | "
         "Inter-layer gap | Chunk egress | Outside |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+        f"| --- | ---: | {attention_rule} | ---: | ---: | ---: | ---: | ---: | ---: |"
     ]
     for record in records:
         groups = record["groups_ms"]
-        lines.append("| PP{pp_rank}/TP{tp_rank} | {device_ms:.3f} | {mla:.3f} | {selection:.3f} | "
-                     "{attention:.3f} | {moe:.3f} | {other:.3f} | "
+        attention_names = ("Attention sparse MLA", "Attention index selection", "Attention other")
+        attention_values = (" | ".join(f"{groups[name]:.3f}" for name in attention_names)
+                            if detailed_attention else f"{sum(groups[name] for name in attention_names):.3f}")
+        lines.append("| PP{pp_rank}/TP{tp_rank}/G{generation} | {device_ms:.3f} | {attention_values} | "
+                     "{moe:.3f} | {other:.3f} | "
                      "{ingress:.3f} | {between:.3f} | {egress:.3f} | {outside:.3f} |".format(
                          **record,
-                         mla=groups["Attention sparse MLA"],
-                         selection=groups["Attention index selection"],
-                         attention=groups["Attention other"],
+                         attention_values=attention_values,
                          moe=groups["Routed expert MoE"],
                          other=groups["Layer other"],
                          ingress=groups["Chunk ingress before first layer"],
                          between=groups["Gaps between layers"],
                          egress=groups["Chunk egress after last layer"],
                          outside=groups["Request work outside chunks"]))
+    if not detailed_attention:
+        lines.extend([
+            "", "The selected coarse capture records the whole Attention envelope. Its internal "
+            "MLA/index subdivisions were not requested and are not separately reported."
+        ])
     if not all(record["python_attention_complete"] for record in records):
         lines.extend([
             "", "**Python span coverage is incomplete on at least one stage.** Compiled/replayed layer "
@@ -236,17 +322,28 @@ def main():
             "", "## Attention internal phases (same diagnostic request)", "",
             "These rows partition each rank's outer Attention span. The remaining time is kept "
             "explicit; no component activity is added to the outer ledger.", "",
-            "| Phase | PP0/TP0 ms | PP0/TP1 ms | PP1/TP0 ms | PP1/TP1 ms |", "| --- | ---: | ---: | ---: | ---: |"
+            "| Phase | " + " | ".join(f"PP{r['pp_rank']}/TP{r['tp_rank']}/G{r['generation']} ms"
+                                      for r in records) + " |", "| --- | " + " | ".join("---:" for _ in records) + " |"
         ])
         for name in records[0]["attention_components_ms"]:
             values = [record["attention_components_ms"][name] for record in records]
             lines.append("| {} | {} |".format(name, " | ".join(f"{value:.3f}" for value in values)))
+    if any(item.get("name") in ("mhc_input", "mhc_post") for record in records for item in record["spans"]):
+        lines.extend([
+            "", "## Layer-other internal phases (same diagnostic request)", "",
+            "These rows partition Layer other; they are not added again to the outer ledger.", "",
+            "| Phase | " + " | ".join(f"PP{r['pp_rank']}/TP{r['tp_rank']}/G{r['generation']} ms"
+                                      for r in records) + " |", "| --- | " + " | ".join("---:" for _ in records) + " |"
+        ])
+        for name in records[0]["layer_other_components_ms"]:
+            values = [record["layer_other_components_ms"][name] for record in records]
+            lines.append("| {} | {} |".format(name, " | ".join(f"{value:.3f}" for value in values)))
     lines.extend([
-        "", "Per-rank, per-block raw spans and host times are in the four JSON files. "
-        "Hardware kernels must be attributed using a valid Synapse trace; the previous "
-        "four-rank HwTrace attempt crashed before publishing data.", ""
+        "", "Per-rank, per-transaction raw spans and host times remain in the source JSON files. "
+        "Hardware kernels require a separately validated Synapse capture. This ledger includes stream "
+        "dependencies and must not be interpreted as engine occupancy.", ""
     ])
-    (args.directory / "REPORT.md").write_text("\n".join(lines))
+    (output / "REPORT.md").write_text("\n".join(lines))
 
 
 if __name__ == "__main__":

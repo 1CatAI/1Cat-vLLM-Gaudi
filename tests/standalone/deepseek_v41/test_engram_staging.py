@@ -7,12 +7,12 @@ import pytest
 import torch
 
 from vllm_gaudi.ops.deepseek_v41_engram import EngramHashLayout, EngramTokenHistory
-from vllm_gaudi.ops.deepseek_v41_host import EngramHost, _C1Packet, _TransferSlot
+from vllm_gaudi.ops.deepseek_v41_host import EngramHost, _C1Packet, _TransferSlot, host_native
 
 pytestmark = pytest.mark.skipif(os.getenv("DSV41_TEST_HPU") != "1", reason="An HPU module lease is required")
 
 
-@pytest.mark.parametrize("heads", [3, 12])
+@pytest.mark.parametrize("heads", [3, 6, 12])
 @torch.inference_mode()
 def test_staging_views_preserve_all_bytes_and_capacity(heads):
     import habana_frameworks.torch.core  # noqa: F401
@@ -36,14 +36,22 @@ def test_staging_views_preserve_all_bytes_and_capacity(heads):
             assert (host.data_ptr(), device.data_ptr()) == pointers
 
 
-@pytest.mark.parametrize("tp_rank", [0, 1])
+@pytest.mark.parametrize("tp_size,tp_rank", [(2, 0), (2, 1), (4, 0), (4, 1), (4, 2), (4, 3)])
 @pytest.mark.parametrize("preparation", ["compat", "native", "packet", "direct"])
 @torch.inference_mode()
-def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, tp_rank, preparation):
+def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path,
+                                                    tp_size,
+                                                    tp_rank,
+                                                    preparation,
+                                                    capacity=6,
+                                                    deferred=False):
     import habana_frameworks.torch.core  # noqa: F401
-    from vllm_gaudi.lib.dsv41_host_gather import HostRows, NativeC1Prepare
+    native = host_native()
+    HostRows, NativeC1Prepare = native.HostRows, native.NativeC1Prepare
+    heads = 24 // tp_size
 
     host = EngramHost.__new__(EngramHost)
+    host.tensor_parallel_size = tp_size
     host.layout = EngramHashLayout.from_config({
         "engram_layer_ids": [1, 14],
         "engram_num_embeddings": [10000, 10000],
@@ -66,7 +74,7 @@ def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, tp_rank, preparati
     host.device_history_parity = 0
     host.device_request = host.device_position = host.device_pending = None
     host.c1_packets = None
-    host.max_tokens, host.ring_size = 6, 3
+    host.max_tokens, host.ring_size = capacity, 3
     host.audit = dict(gathers=0, major_faults=0, dma_bytes=0, generations=0)
     tables = {}
     for layer, rows in ((1, 10000), (14, 10000)):
@@ -75,19 +83,20 @@ def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, tp_rank, preparati
         scales = np.arange(rows * 8, dtype=np.uint8).reshape(rows, 8)
         path = tmp_path / f"layer-{layer}.bin"
         path.write_bytes(weights.tobytes() + scales.tobytes())
-        shard = host.layout.head_shard(layer, tp_rank)
+        shard = host.layout.head_shard(layer, tp_rank, tp_size)
         first, last = shard["row_start"], shard["row_stop"]
         host.tables[layer] = HostRows(str(path), first * 256, str(path), weights.size + first * 8, first, last, 256,
                                       True, False)
         host.shards[layer] = shard
-        host.slots[layer] = [_TransferSlot(6, 12, 256, "hpu") for _ in range(3)]
+        host.slots[layer] = [_TransferSlot(capacity, heads, 256, "hpu") for _ in range(3)]
         tables[layer] = weights, scales
     if preparation != "compat":
         layers = host.layout.layer_ids
         if preparation in ("packet", "direct"):
-            first = _C1Packet([12, 12], 256, "hpu")
+            first = _C1Packet([heads, heads], 256, "hpu")
             destination = first.device if preparation == "direct" else None
-            host.c1_packets = [first] + [_C1Packet([12, 12], 256, "hpu", destination=destination) for _ in range(2)]
+            host.c1_packets = [first
+                               ] + [_C1Packet([heads, heads], 256, "hpu", destination=destination) for _ in range(2)]
             targets = [packet.targets for packet in host.c1_packets]
             for packet in host.c1_packets:
                 assert packet.host.is_pinned("hpu")
@@ -104,10 +113,13 @@ def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, tp_rank, preparati
     try:
         for request in ("first", "second"):
             host.reset(request)
-            for step, count in enumerate((1, 6, 1, 2, 1, 6, 1, 1, 1)):
+            for step, count in enumerate((1, capacity, 1, 6 if deferred else 2, 1, capacity, 1, 1, 1)):
                 tokens = [(step + i) % 16 for i in range(count)]
                 with torch.hpu.stream(consumer):
-                    ticket = host.prepare(request, tokens, [i == 1 or step == 6 for i in range(count)])
+                    ticket = host.prepare(request,
+                                          tokens, [i == 1 or step == 6 for i in range(count)],
+                                          defer_wait=deferred and count == 16384)
+                    inputs = host.defer_prefill(ticket) if deferred and count == 16384 else ticket.buffers
                     assert ticket.packet == (preparation in ("packet", "direct") and count == 1)
                     if ticket.packet:
                         packet = host.c1_packets[ticket.slot]
@@ -118,7 +130,8 @@ def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, tp_rank, preparati
                     assert torch.hpu.current_stream() == consumer
                     with pytest.raises(RuntimeError, match="pending"):
                         host.prepare(request, [1])
-                    for index, (layer, value) in enumerate(zip(host.layout.layer_ids, ticket.buffers)):
+                    for index, layer in enumerate(host.layout.layer_ids):
+                        value = inputs[index]
                         shard = host.shards[layer]
                         ids = ticket.batch.hash_ids[:, index, shard["head_start"]:shard["head_stop"]]
                         w, s = tables[layer]
@@ -137,3 +150,15 @@ def test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, tp_rank, preparati
         assert host.audit.get("c1_packets", 0) == (12 if preparation in ("packet", "direct") else 0)
     finally:
         host.close()
+
+
+@pytest.mark.parametrize("tp_rank", [0, 3])
+@torch.inference_mode()
+def test_16k_tp4_engram_staging_transition_and_request_reuse(tmp_path, tp_rank):
+    test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, 4, tp_rank, "packet", capacity=16384)
+
+
+@pytest.mark.parametrize("tp_rank", [0, 3])
+@torch.inference_mode()
+def test_deferred_16k_ring_reuse_then_c1_and_c6(tmp_path, tp_rank):
+    test_two_layer_dma_ring_reuse_and_request_reset(tmp_path, 4, tp_rank, "packet", capacity=16384, deferred=True)

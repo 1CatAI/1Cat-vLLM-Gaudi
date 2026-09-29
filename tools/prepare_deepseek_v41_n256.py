@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Freeze N256 weights/scales into four bounded-memory TP2 x PP2 files."""
+"""Freeze N256 weights/scales for TP4 x PP1 or legacy TP2 x PP2."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import math
+import json
 from pathlib import Path
 import shutil
 
@@ -51,10 +52,16 @@ def prepare_rank(shard, directory):
     partial.replace(path)
     digest = file_hash(path)
     stat = path.stat()
-    record = {"file": path.name, "bytes": stat.st_size, "sha256": digest,
-              "inode": stat.st_ino, "mtime_ns": stat.st_mtime_ns,
-              "source_sha256": shard.manifest["rank_files"][rank]["sha256"],
-              "verified_expert_matrices": matrices, "temporary_upper_bound_bytes": peak}
+    record = {
+        "file": path.name,
+        "bytes": stat.st_size,
+        "sha256": digest,
+        "inode": stat.st_ino,
+        "mtime_ns": stat.st_mtime_ns,
+        "source_sha256": shard.manifest["rank_files"][rank]["sha256"],
+        "verified_expert_matrices": matrices,
+        "temporary_upper_bound_bytes": peak
+    }
     publish_json(directory / f"{rank}-record.json", record)
     return rank, record
 
@@ -67,17 +74,27 @@ def main():
     args = parser.parse_args()
     if not 1 <= args.workers <= 4:
         parser.error("--workers must be between 1 and 4")
-    shards = [PreparedV41Shard(args.prepared, pp, tp) for pp in range(2) for tp in range(2)]
+    source_manifest = json.loads((args.prepared / "manifest.json").read_text())
+    tp_size, pp_size = source_manifest["tensor_parallel_size"], source_manifest["pipeline_parallel_size"]
+    if (tp_size, pp_size) not in ((4, 1), (2, 2)):
+        parser.error("N256 preparation requires TP4 x PP1 or TP2 x PP2")
+    shards = [PreparedV41Shard(args.prepared, pp, tp) for pp in range(pp_size) for tp in range(tp_size)]
     required = sum(math.prod(spec["shape"]) * 2 for shard in shards for spec in runtime_specs(shard).values())
     args.output.parent.mkdir(parents=True, exist_ok=True)
     if shutil.disk_usage(args.output.parent).free < required + (8 << 30):
         raise RuntimeError(f"N256 export requires {required} bytes plus 8 GiB free headroom")
     args.output.mkdir(exist_ok=False)
-    manifest = {"schema_version": 1, "layout": LAYOUT, "layout_fingerprint": FINGERPRINT,
-                "quantization_fingerprint": QUANTIZATION_FINGERPRINT,
-                "source_manifest_sha256": file_hash(args.prepared / "manifest.json"),
-                "tensor_parallel_size": 2, "pipeline_parallel_size": 2,
-                "rank_files": {}, "scope": "runtime expert weights; dense/Engram use existing immutable sources"}
+    manifest = {
+        "schema_version": 1,
+        "layout": LAYOUT,
+        "layout_fingerprint": FINGERPRINT,
+        "quantization_fingerprint": QUANTIZATION_FINGERPRINT,
+        "source_manifest_sha256": file_hash(args.prepared / "manifest.json"),
+        "tensor_parallel_size": tp_size,
+        "pipeline_parallel_size": pp_size,
+        "rank_files": {},
+        "scope": "runtime expert weights; dense/Engram use existing immutable sources"
+    }
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         jobs = [pool.submit(prepare_rank, shard, args.output) for shard in shards]
         for future in as_completed(jobs):

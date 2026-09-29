@@ -12,7 +12,7 @@ constexpr auto kOrdered = "custom_op::custom_deepseek_v41_swa_pack_write_ordered
 
 void validate_value(const at::Tensor& value) {
     TORCH_CHECK(value.scalar_type() == at::kBFloat16 && value.dim() == 2 && value.is_contiguous() &&
-                !value.requires_grad() && value.size(0) > 0 && value.size(0) <= 8192 &&
+                !value.requires_grad() && value.size(0) > 0 && value.size(0) <= 16384 &&
                 value.size(1) > 0 && value.size(1) <= 16384 && value.size(1) % 32 == 0,
                 "V4.1 SWA packing requires contiguous inference BF16 [T,K], K divisible by 32");
 }

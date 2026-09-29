@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <cstdint>
+// Physical KV pool rows are independent of the per-request logical context bound.
 #include <ATen/ATen.h>
 #include <torch/library.h>
 #include "hpu_ops/op_backend.h"
@@ -10,7 +12,7 @@ habana::PartialOutputMetaDataVector metadata(const at::Stack& s) {
     const auto cache=s.at(0).toTensor(),pages=s.at(1).toTensor(),rows=s.at(2).toTensor();
     const auto ratio=s.at(3).toInt();
     TORCH_CHECK((ratio==1||ratio==2)&&cache.scalar_type()==at::kByte&&cache.dim()==2&&cache.size(1)==68&&
-                cache.size(0)>0&&cache.size(0)<=1048704&&pages.scalar_type()==at::kInt&&
+                cache.size(0)>0&&cache.size(0)<=INT32_MAX&&pages.scalar_type()==at::kInt&&
                 (pages.dim()==1||pages.dim()==2)&&pages.size(-1)>0&&pages.size(-1)<=8192&&
                 rows.scalar_type()==at::kInt&&rows.dim()==2&&
                 rows.size(0)>=1&&rows.size(0)<=128&&rows.size(1)>=1&&rows.size(1)<=2048,

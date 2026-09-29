@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "deepseek_v41_index_keys_gaudi2.hpp"
 #include <cstring>
+#include <cstdint>
 extern unsigned char _binary___deepseek_v41_index_keys_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_index_keys_gaudi2_o_end;
 using namespace tpc_lib_api;
@@ -14,6 +15,7 @@ GlueCodeReturn DeepseekV41IndexKeysGaudi2::GetGcDefinitions(HabanaKernelParams* 
     const auto& pages=p->inputTensors[1].geometry;
     const auto& rows=p->inputTensors[2].geometry;
     if((params[0]!=1&&params[0]!=2)||cache.dims!=2||cache.maxSizes[0]!=68||cache.dataType!=DATA_U8||
+       !cache.maxSizes[1]||cache.maxSizes[1]>INT32_MAX||
        (pages.dims!=1&&pages.dims!=2)||pages.dataType!=DATA_I32||rows.dims!=2||rows.dataType!=DATA_I32||
        (pages.dims==2&&pages.maxSizes[1]!=rows.maxSizes[1])||
        rows.maxSizes[0]<1||rows.maxSizes[0]>2048||rows.maxSizes[1]<1||rows.maxSizes[1]>128)

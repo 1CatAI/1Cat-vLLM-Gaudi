@@ -66,13 +66,18 @@ class FusedQKVInput:
         self._fused_qkv_weight = None
         self._fused_qkv_quantized = False
 
-    def _project_qkv_input(self, value):
+    def _project_qkv_input(self, value, *, token_group=None):
         if self._fused_qkv_weight is None:
+            if token_group is not None:
+                raise ValueError("Token-owned QKV requires a prepared replicated fused input weight")
             query = self.linear(value, self.weights.wq_a)
             kv = self.linear(value, self.weights.wkv)
             return query, kv
         fused_value = quantize_activation(value) if self._fused_qkv_quantized else value
         qkv = F.linear(fused_value, self._fused_qkv_weight)
+        if token_group is not None:
+            from vllm_gaudi.ops.deepseek_v41_prefill_sequence_state import gather_tokens
+            qkv = gather_tokens(qkv.contiguous(), group=token_group)
         q_width = self.weights.wq_a.weight.shape[0]
         return qkv[..., :q_width], qkv[..., q_width:]
 

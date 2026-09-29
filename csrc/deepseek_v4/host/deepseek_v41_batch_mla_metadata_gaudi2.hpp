@@ -2,7 +2,7 @@
 #pragma once
 #include "gc_interface.h"
 #include "tpc_kernel_lib_interface.h"
-struct Dsv41BatchMlaMetadataParams { int ratio, swa_rows, tile; };
+#include "../include/deepseek_v41_batch_mla_metadata.h"
 class DeepseekV41BatchMlaMetadataGaudi2 {
 public:
     static constexpr const char* name = "custom_deepseek_v41_batch_mla_metadata_gaudi2";

@@ -15,7 +15,7 @@ from vllm_gaudi import envs as gaudi_envs
 from vllm_gaudi.ops.deepseek_v41_prefill_regions import prefill_function_region
 from vllm_gaudi.ops.deepseek_v41_native_trace import prefill_span
 
-NATIVE_KV_CODEC_TOKENS = 8192
+NATIVE_KV_CODEC_TOKENS = 16384
 
 
 def row_mean_square(value, *, request_batch=False):
@@ -60,6 +60,16 @@ def final_collapse_rms_norm(residual, pre_mix, weight, eps=1e-20):
             and hasattr(torch.ops.custom_op, "custom_deepseek_v41_final_collapse_norm_bf16_gaudi2")):
         return torch.ops.custom_op.custom_deepseek_v41_final_collapse_norm_bf16_gaudi2(
             residual.contiguous(), pre_mix.contiguous(), weight, eps)
+    if (residual.device.type == "hpu" and residual.dtype == torch.bfloat16 and residual.ndim == 3
+            and residual.shape[1:] == (4, 5120) and 6 < residual.shape[0] <= NATIVE_KV_CODEC_TOKENS
+            and pre_mix.dtype == torch.float32 and pre_mix.shape == residual.shape[:2]
+            and hasattr(torch.ops.custom_op, "custom_deepseek_v41_prefill_mhc_collapse_gaudi2")):
+        # Preserve the FP32 four-stream reduction and its BF16 boundary
+        # without expanding the complete residual into FP32 temporaries.
+        # The following norm keeps the same large-batch reduction as before.
+        value = torch.ops.custom_op.custom_deepseek_v41_prefill_mhc_collapse_gaudi2(residual.contiguous(),
+                                                                                    pre_mix.contiguous())
+        return final_rms_norm(value, weight, eps)
     value = (residual.float() * pre_mix.unsqueeze(-1)).sum(1).to(residual.dtype)
     return final_rms_norm(value, weight, eps)
 
@@ -117,7 +127,7 @@ def fp4_decode(code):
 
 def pack_swa(value):
     if (gaudi_envs.VLLM_HPU_DSV41_NATIVE_KV_PACK and value.device.type == "hpu" and value.dtype == torch.bfloat16
-            and value.ndim >= 2 and value.shape[0] <= NATIVE_KV_CODEC_TOKENS):
+            and value.ndim >= 2 and value.numel() // value.shape[-1] <= NATIVE_KV_CODEC_TOKENS):
         shape = value.shape
         result = torch.ops.custom_op.custom_deepseek_v41_swa_pack_bf16_gaudi2(value.reshape(-1, shape[-1]).contiguous())
         return result.reshape(*shape[:-1], shape[-1] * 33 // 32)
@@ -156,7 +166,7 @@ def quantize_activation(value):
 
 def pack_fp4(value, group=16):
     if (gaudi_envs.VLLM_HPU_DSV41_NATIVE_KV_PACK and value.device.type == "hpu" and value.dtype == torch.bfloat16
-            and value.ndim >= 2 and value.shape[0] <= NATIVE_KV_CODEC_TOKENS and group in (16, 32)):
+            and value.ndim >= 2 and value.numel() // value.shape[-1] <= NATIVE_KV_CODEC_TOKENS and group in (16, 32)):
         shape = value.shape
         op = (torch.ops.custom_op.custom_deepseek_v41_fp4_pack_g16_bf16_gaudi2
               if group == 16 else torch.ops.custom_op.custom_deepseek_v41_fp4_pack_g32_bf16_gaudi2)
@@ -203,7 +213,7 @@ def unpack_fp4(packed, width=512, group=16):
 def fp4_roundtrip(value, group=32):
     """Apply the checkpoint FP4 rounding contract without a packed HBM tensor."""
     if (gaudi_envs.VLLM_HPU_DSV41_NATIVE_KV_PACK and value.device.type == "hpu" and value.dtype == torch.bfloat16
-            and value.ndim >= 2 and value.numel() // value.shape[-1] <= 8192 and group == 32
+            and value.ndim >= 2 and value.numel() // value.shape[-1] <= 16384 and group == 32
             and hasattr(torch.ops.custom_op, "custom_deepseek_v41_fp4_roundtrip_g32_bf16_gaudi2")):
         shape = value.shape
         result = torch.ops.custom_op.custom_deepseek_v41_fp4_roundtrip_g32_bf16_gaudi2(
@@ -271,14 +281,18 @@ def hc_pre(residual,
            packed_fn=None,
            *,
            prefill=False,
+           logical_tokens=None,
            request_batch=False,
            batch_control_reuse=False,
            batch_control_prefetch=False):
     """vLLM mhc_pre_delayed_torch's previous-sublayer mixing contract."""
     copies = residual.shape[1]
     flat_bf16 = residual.flatten(1)
+    gate_tokens = residual.shape[0] if logical_tokens is None else logical_tokens
+    if not isinstance(gate_tokens, int) or gate_tokens < residual.shape[0]:
+        raise ValueError("mHC logical token count must cover the owned rows")
     if (gaudi_envs.VLLM_HPU_DSV41_MHC_CONTROL_RRMS and packed_fn is not None and flat_bf16.device.type == "hpu"
-            and flat_bf16.dtype == torch.bfloat16 and 1 <= flat_bf16.shape[0] <= 2048 and flat_bf16.shape[-1] == 20480
+            and flat_bf16.dtype == torch.bfloat16 and 1 <= gate_tokens <= 2048 and flat_bf16.shape[-1] == 20480
             and packed_fn.shape == (24, 20480)):
         control = (torch.ops.custom_op.custom_deepseek_v41_control_gemv_rrms_bf16_gaudi2(
             flat_bf16.contiguous(), packed_fn, eps))
@@ -301,7 +315,7 @@ def hc_pre(residual,
     # Sinkhorn while letting large-M prefill use the better scheduled graph.
     if (gaudi_envs.VLLM_HPU_DSV41_MHC_GATES_FUSED and residual.device.type == "hpu" and iterations == 20
             and hc_eps == 1e-6 and copies == 4 and projection.ndim == 2 and projection.shape[-1] == 24
-            and projection.shape[0] <= 2048):
+            and gate_tokens <= 2048):
         gates = torch.ops.custom_op.custom_deepseek_v41_mhc_gates_f32_gaudi2(projection.contiguous(), rrms.contiguous(),
                                                                              scale.contiguous(), base.contiguous())
         pre, post = gates[:, :copies], gates[:, copies:2 * copies]
@@ -333,8 +347,19 @@ def hc_post(value, residual, post, comb):
     return (value.float().unsqueeze(1) * post.unsqueeze(-1) + mixed).to(value.dtype)
 
 
+@prefill_span("mhc_input")
 @prefill_function_region
-def prefill_hc_input(residual, previous_pre, fn, scale, base, norm, eps, hc_eps, iterations, packed_fn):
+def prefill_hc_input(residual,
+                     previous_pre,
+                     fn,
+                     scale,
+                     base,
+                     norm,
+                     eps,
+                     hc_eps,
+                     iterations,
+                     packed_fn,
+                     logical_tokens=None):
     """Bind all mHC input-region tensors explicitly, including layer weights.
 
     The native collapse keeps the BF16 sublayer input boundary. FP32 control
@@ -350,8 +375,36 @@ def prefill_hc_input(residual, previous_pre, fn, scale, base, norm, eps, hc_eps,
                                     hc_eps,
                                     iterations,
                                     packed_fn=packed_fn,
-                                    prefill=True)
+                                    prefill=True,
+                                    logical_tokens=logical_tokens)
     return value, pre, post, comb, rms_norm(value, norm, eps)
+
+
+def bounded_prefill_hc_input(residual, previous_pre, fn, scale, base, norm, eps, hc_eps, iterations, packed_fn):
+    """Research helper; complete-chain tests rejected production dispatch.
+
+    This did not lower the peak of the already-compiled full-row region.
+    Keep it isolated to the archived comparison tool, not the serving path.
+
+    Each token's control projection/RRMS and collapse is independent. Reuse
+    the existing C8192 FP32 region (never the small-token GEMV branch) for the
+    C16384 bucket. The caller needs the four controls/normalized outputs, not
+    the intermediate collapsed row, so no full-chunk copy of it is allocated.
+    """
+    tile, count = 8192, residual.shape[0]
+    if count <= tile:
+        return prefill_hc_input(residual, previous_pre, fn, scale, base, norm, eps, hc_eps, iterations, packed_fn)[1:]
+    outputs = None
+    for start in range(0, count, tile):
+        stop = min(start + tile, count)
+        block = prefill_hc_input(residual[start:stop], previous_pre[start:stop], fn, scale, base, norm, eps, hc_eps,
+                                 iterations, packed_fn)[1:]
+        if outputs is None:
+            outputs = tuple(value.new_empty((count, *value.shape[1:])) for value in block)
+        for destination, source in zip(outputs, block, strict=True):
+            destination[start:stop].copy_(source)
+        del block, source
+    return outputs
 
 
 def engram_update(residual, kv, q_weight, k_weight, active_mask, eps=1e-20):
@@ -363,3 +416,26 @@ def engram_update(residual, kv, q_weight, k_weight, active_mask, eps=1e-20):
     gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
     gate = gate.masked_fill(~active_mask.unsqueeze(-1), 0)
     return (h + gate.unsqueeze(-1) * value.unsqueeze(1)).to(residual.dtype)
+
+
+@prefill_function_region
+def _prefill_engram_tile(residual, kv, q_weight, k_weight, active_mask, eps):
+    return engram_update(residual, kv, q_weight, k_weight, active_mask, eps)
+
+
+def prefill_engram_update(residual, kv, q_weight, k_weight, active_mask, eps=1e-20):
+    """Bound row-independent gate/update intermediates after the full GEMM.
+
+    Preserve every FP32 reduction and the final BF16 boundary. Token rows do
+    not interact here; the scheduler and projection still own the full chunk.
+    """
+    tile = 512
+    if residual.shape[0] <= tile:
+        return _prefill_engram_tile(residual, kv, q_weight, k_weight, active_mask, eps)
+    output = torch.empty_like(residual)
+    for start in range(0, residual.shape[0], tile):
+        stop = min(start + tile, residual.shape[0])
+        output[start:stop].copy_(
+            _prefill_engram_tile(residual[start:stop], kv[start:stop], q_weight, k_weight, active_mask[start:stop],
+                                 eps))
+    return output

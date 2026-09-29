@@ -6,7 +6,9 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 if TYPE_CHECKING:
     VLLM_HPU_DSV41_STATE_AUDIT_DIR: str | None = None
     VLLM_HPU_DSV41_RAW_TRACE: bool = False
-    VLLM_HPU_DSV41_PREFILL_COMPUTE_TOKENS: int = 4096
+    VLLM_HPU_DSV41_PREFILL_EVENT_TRACE_REQUEST_PREFIX: str = ""
+    VLLM_HPU_DSV41_PREFILL_EVENT_TRACE_LABELS: str = ""
+    VLLM_HPU_DSV41_PREFILL_COMPUTE_TOKENS: int = 0
     VLLM_HPU_DSV41_PREFILL_PP_WAVEFRONT: bool = False
     VLLM_HPU_DSV41_PREFILL_FAST_DEQUANT: bool = False
     VLLM_HPU_DSV41_PREFILL_COLUMN_INTERLEAVE: bool = True
@@ -51,6 +53,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_PREFILL_DEVICE_ROUTES: bool = False
     VLLM_HPU_DSV41_PREFILL_EXPERT_ROWS: int = 64
     VLLM_HPU_DSV41_PREFILL_MLA_ROWS: int = 0
+    VLLM_HPU_DSV41_PREFILL_MLA_SEQUENCE: bool = False
     VLLM_HPU_DSV41_PREFILL_COMPACT_CANDIDATES: bool = False
     VLLM_HPU_DSV41_PREFILL_INDEX_MME: bool = False
     VLLM_HPU_DSV41_BATCH_MAIN_FUSIONS: bool = False
@@ -327,6 +330,10 @@ def _optional_bool_env(name: str) -> Optional[bool]:
 environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HPU_DSV41_RAW_TRACE":
     lambda: os.getenv("VLLM_HPU_DSV41_RAW_TRACE", "0") == "1",
+    "VLLM_HPU_DSV41_PREFILL_EVENT_TRACE_REQUEST_PREFIX":
+    lambda: os.getenv("VLLM_HPU_DSV41_PREFILL_EVENT_TRACE_REQUEST_PREFIX", ""),
+    "VLLM_HPU_DSV41_PREFILL_EVENT_TRACE_LABELS":
+    lambda: os.getenv("VLLM_HPU_DSV41_PREFILL_EVENT_TRACE_LABELS", ""),
     "VLLM_HPU_DSV4_EARLY_OUTPUT_LOWERING":
     lambda: os.environ.get("VLLM_HPU_DSV4_EARLY_OUTPUT_LOWERING", "0").lower() in ("1", "true"),
     "VLLM_HPU_TP2_NATIVE_DYNAMIC_QUANT":
@@ -440,7 +447,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HPU_DSV41_PREFILL_EXPERTS_PER_PLAN":
     lambda: int(os.environ.get("VLLM_HPU_DSV41_PREFILL_EXPERTS_PER_PLAN", "24")),
     "VLLM_HPU_DSV41_PREFILL_COMPUTE_TOKENS":
-    lambda: int(os.environ.get("VLLM_HPU_DSV41_PREFILL_COMPUTE_TOKENS", "4096")),
+    lambda: int(os.environ.get("VLLM_HPU_DSV41_PREFILL_COMPUTE_TOKENS", "0")),
     "VLLM_HPU_DSV41_PREFILL_PP_WAVEFRONT":
     lambda: os.environ.get("VLLM_HPU_DSV41_PREFILL_PP_WAVEFRONT", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_PREFILL_FAST_DEQUANT":
@@ -507,6 +514,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_PREFILL_INDEX_VISIBLE", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_PREFILL_DECODER_HALO":
     lambda: os.environ.get("VLLM_HPU_DSV41_PREFILL_DECODER_HALO", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_PREFILL_MLA_SEQUENCE":
+    lambda: os.environ.get("VLLM_HPU_DSV41_PREFILL_MLA_SEQUENCE", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_PREFILL_REINDEX_REUSE":
     lambda: os.environ.get("VLLM_HPU_DSV41_PREFILL_REINDEX_REUSE", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_PREFILL_KV_REUSE":

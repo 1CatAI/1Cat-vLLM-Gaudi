@@ -7,6 +7,8 @@ Original scales are retained for BF16 prefill on the same compressed weights.
 """
 
 import numpy as np
+from functools import lru_cache
+from types import FunctionType
 
 from vllm_gaudi.ops.deepseek_v41_fp8 import channel_scales, read_expert
 from vllm_gaudi.ops.deepseek_v41_weights import canonical_hash
@@ -20,6 +22,34 @@ LAYOUT = {
     "scale": "minimum-covering-channel-power-of-two",
 }
 FINGERPRINT = canonical_hash(LAYOUT)
+
+
+def _fused_decode(value, ids, routing, q13, q2, s13, s2, lookup, channel13, channel2, normal, direct_finalize):
+    import torch
+    namespace = torch.ops.custom_op
+    operation = (namespace.custom_deepseek_v41_expert_n256_moe_direct_finalize_prefetch_w2_fp8_gaudi2 if direct_finalize
+                 and value.shape[0] == 1 else namespace.custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2)
+    return operation(value, ids, routing, q13, q2, s13, s2, lookup, channel13, channel2, normal)
+
+
+@lru_cache(maxsize=32)
+def _compiled_fused_decode(signature):
+    import torch
+    entry = FunctionType(_fused_decode.__code__.replace(co_name=f"n256_fused_decode_{signature}"),
+                         _fused_decode.__globals__)
+    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+
+
+def run_fused_decode(value, ids, routing, q13, q2, s13, s2, lookup, channel13, channel2, normal, direct_finalize=True):
+    """Reuse one compiled N256 body across layer weights and TP4 requests."""
+    import torch
+    if not 1 <= value.shape[0] <= 6:
+        raise ValueError("Fused N256 decode requires a C1-C6 bucket")
+    arguments = (value, ids, routing, q13, q2, s13, s2, lookup, channel13, channel2, normal, direct_finalize)
+    if torch.compiler.is_compiling():
+        return _fused_decode(*arguments)
+    signature = (value.shape[0], tuple(q13.shape), tuple(q2.shape), normal, direct_finalize)
+    return _compiled_fused_decode(signature)(*arguments)
 
 
 def prepare_expert(q16, s16):

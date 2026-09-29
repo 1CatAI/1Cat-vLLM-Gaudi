@@ -2,10 +2,11 @@
 #include <ATen/ATen.h>
 #include <torch/library.h>
 #include "hpu_ops/op_backend.h"
-#include "../host/deepseek_v41_batch_mla_metadata_gaudi2.hpp"
+#include "../include/deepseek_v41_batch_mla_metadata.h"
 
 namespace {
 constexpr auto kSchema = "custom_op::custom_deepseek_v41_batch_mla_metadata_gaudi2";
+constexpr auto kGuid = kSchema + 11;
 habana::PartialOutputMetaDataVector metadata(const at::Stack& s) {
     const auto selected = s.at(0).toTensor(), pages = s.at(1).toTensor();
     const int64_t ratio = s.at(6).toInt(), swa_rows = s.at(7).toInt(), tile = s.at(8).toInt();
@@ -39,7 +40,7 @@ public:
     void AddNode(synapse_helpers::graph& graph, const at::Stack& s) override {
         const auto m = metadata(s);
         Dsv41BatchMlaMetadataParams params{int(s.at(6).toInt()), int(s.at(7).toInt()), int(s.at(8).toInt())};
-        auto outputs = BuildNode(this, graph, {DeepseekV41BatchMlaMetadataGaudi2::name,
+        auto outputs = BuildNode(this, graph, {kGuid,
             {syn_in(0), syn_in(1), syn_in(2), syn_in(3), syn_in(4), syn_in(5)},
             {{m[0].shape, at::kInt, 0}, {m[1].shape, at::kInt, 1}, {m[2].shape, at::kInt, 2}},
             &params, sizeof(params)});
@@ -47,7 +48,7 @@ public:
     }
 };
 const bool registered = [] {
-    habana::custom_op::registerUserCustomOp(kSchema, DeepseekV41BatchMlaMetadataGaudi2::name, metadata, nullptr);
+    habana::custom_op::registerUserCustomOp(kSchema, kGuid, metadata, nullptr);
     habana::KernelRegistry().add(kSchema, [](synDeviceId d, c10::ScalarType t) {
         return std::make_shared<BatchMlaMetadata>(d, t);
     });

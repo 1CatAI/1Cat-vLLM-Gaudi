@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 import torch
+import pytest
 
 from vllm_gaudi import envs
 from vllm_gaudi.models.deepseek_v41_program import _weight_tree, load_weight_tree
@@ -155,7 +156,8 @@ def test_paged_attention_rebinds_shared_rotary_bucket():
     assert attention._rotary_native_table() is shared.rotary_bucket("swa_rotary_native", 8192)
 
 
-def test_paged_shared_state_allocates_bounded_decoded_mirrors(monkeypatch):
+@pytest.mark.parametrize("tensor_parallel_size", [2, 4])
+def test_paged_shared_state_allocates_bounded_decoded_mirrors(monkeypatch, tensor_parallel_size):
     from vllm_gaudi.ops import deepseek_v41_paged_attention as paged
 
     monkeypatch.setattr(paged.gaudi_envs, "VLLM_HPU_DSV41_PAGED_DECODED_KV_STATE", True)
@@ -179,10 +181,24 @@ def test_paged_shared_state_allocates_bounded_decoded_mirrors(monkeypatch):
         "rope_theta": 10000.0,
         "compress_rope_theta": 10000.0,
     }
-    shared = paged.PagedCSA2SharedState(config, 0, 20, "cpu", 1024)
+    shared = paged.PagedCSA2SharedState(config, 0, 20, "cpu", 1024, tensor_parallel_size=tensor_parallel_size)
     assert shared.decoded_swa.shape == (20 * 512, 512)
     assert set(shared.sources) == {"2", "8", "14"}
     assert all(source.decoded_main.shape == (512, 512) for source in shared.sources.values())
+    pointers = {selection.indices.data_ptr() for selection in shared.topk.values()}
+    assert len(pointers) == (1 if tensor_parallel_size == 4 else 3)
+    if tensor_parallel_size == 4:
+        assert "swa_rotary" not in shared._buffers and "compressed_rotary" not in shared._buffers
+        initial = shared.rotary_bucket("swa_rotary_native", 512)
+        assert shared.rotary_bucket("swa_rotary_native", 512) is initial
+        shared.to(dtype=torch.bfloat16)
+        assert shared.swa_rotary.dtype == shared.compressed_rotary.dtype == torch.float32
+        assert not shared._rotary_buckets
+        assert shared.rotary_bucket("swa_rotary_native", 512).dtype == torch.float32
+        master = shared.swa_rotary
+        shared._apply(lambda tensor: tensor.clone())
+        assert shared.swa_rotary is master
+        assert len({id(selection.indices) for selection in shared.topk.values()}) == 1
 
 
 def test_runtime_rotary_binding_survives_prompt_and_decode_geometry_changes():

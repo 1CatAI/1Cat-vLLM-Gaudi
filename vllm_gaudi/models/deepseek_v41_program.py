@@ -15,6 +15,7 @@ from vllm_gaudi.ops.deepseek_v4_mxfp4 import mxfp4_bf16_lut
 from vllm_gaudi.ops.deepseek_v41_attention import CSA2Attention, CSA2SharedState
 from vllm_gaudi.ops.deepseek_v41_math import (
     engram_update,
+    prefill_engram_update,
     hc_post,
     hc_pre,
     prefill_hc_input,
@@ -35,6 +36,7 @@ from vllm_gaudi.ops.deepseek_v41_prefill_regions import (
 )
 
 
+@prefill_span("mhc_post")
 @prefill_function_region
 def _prefill_hc_post(value, residual, post, comb):
     if gaudi_envs.VLLM_HPU_DSV41_PREFILL_MHC_POST and value.device.type == "hpu":
@@ -47,6 +49,28 @@ def _prefill_hc_post(value, residual, post, comb):
 @prefill_function_region
 def _prefill_combine(output, shared_out):
     return (output.float() + shared_out.float()).to(output.dtype)
+
+
+@prefill_function_region
+def _prefill_router(value, weight, bias, image_bias, image_mask):
+    logits = torch.ops.custom_op.custom_deepseek_v41_bf16_linear_f32_gaudi2(value.contiguous(), weight)
+    return torch.ops.custom_op.custom_deepseek_v41_router_logits_top6_gaudi2(logits.contiguous(), bias, image_bias,
+                                                                             image_mask.contiguous())
+
+
+@prefill_function_region
+def _prefill_shared_expert(value, gate_up_weight, down_weight, down_bias, quantize_down):
+    # Keep both BF16 boundaries explicit when the compiler combines the
+    # projection, activation and downstream projection into one region.
+    projected = F.linear(quantize_activation(value), gate_up_weight)
+    projected = torch.ops.custom_op.custom_deepseek_v41_bf16_identity_gaudi2(projected.reshape(1, -1)).reshape(
+        projected.shape).float()
+    gate, up = projected.chunk(2, dim=-1)
+    middle = (F.silu(gate.clamp(max=10.0)) * up.clamp(-10.0, 10.0)).to(value.dtype)
+    middle = torch.ops.custom_op.custom_deepseek_v41_bf16_identity_gaudi2(middle.reshape(1, -1)).reshape(middle.shape)
+    if quantize_down:
+        middle = quantize_activation(middle)
+    return F.linear(middle, down_weight, down_bias)
 
 
 def linear(value, layer):
@@ -214,9 +238,10 @@ class PreparedMoE(nn.Module):
     # The scheduler transaction itself remains the normal C8192 chunk.
     N256_PREFILL_TILE = 128
 
-    def __init__(self, weights, topk, normal_scales, lookup, reduce):
+    def __init__(self, weights, topk, normal_scales, lookup, reduce, tensor_parallel_size=2):
         super().__init__()
         self.weights, self.topk = weights, topk
+        self.tensor_parallel_size = tensor_parallel_size
         self.normal_scales, self.reduce = normal_scales, reduce
         self.register_buffer("lookup", lookup, False)
         self.router_top6 = gaudi_envs.VLLM_HPU_DSV41_ROUTER_TOP6
@@ -226,6 +251,10 @@ class PreparedMoE(nn.Module):
         self.register_buffer("fp8_w2_scale", None, False)
         self.n256 = topk == 6 and (gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256 or gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8)
         self.n256_fp8 = self.n256 and gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8
+        if tensor_parallel_size == 4 and not self.n256_fp8:
+            raise ValueError("TP4 requires the optimized N256 FP8 MoE; generic MoE is not a serving fallback")
+        if tensor_parallel_size == 4 and gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4:
+            raise ValueError("TP4 prefill requires the V4.1 clipped, FP32-routed prepared MoE path")
         self.prefill_mxfp4 = self.n256 and gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4
         self.prefill_grouped = self.n256 and gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED
         from vllm_gaudi.ops.deepseek_v41_prefill_plan import validate_prefill_plan_config
@@ -393,6 +422,13 @@ class PreparedMoE(nn.Module):
             channel2 = experts.w2_fp8_channel
             if not isinstance(channel13, torch.Tensor) or not isinstance(channel2, torch.Tensor):
                 raise TypeError("N256 FP8 channel scales were not loaded as tensors")
+            if self.tensor_parallel_size == 4 and use_fused and tile_prequant is None:
+                from vllm_gaudi.ops.deepseek_v41_expert_n256 import run_fused_decode
+                return run_fused_decode(*operands,
+                                        channel13,
+                                        channel2,
+                                        bool(self.normal_scales),
+                                        direct_finalize=self.n256_fused_reduce)
             if tile_prequant is not None:
                 if not use_fused:
                     raise ValueError("Prequantized N256 input requires the fused expert body")
@@ -440,6 +476,27 @@ class PreparedMoE(nn.Module):
             pieces.append(one_tile(value[begin:end], ids[begin:end], routing[begin:end], tile_prequant, None))
         return torch.cat(pieces, dim=0)
 
+    def _router_logits(self, value, prefill_tokens=0):
+        tokens = value.shape[0]
+        if prefill_tokens:
+            from vllm_gaudi.ops.deepseek_v41_prefill_capacity import MAX_PREFILL_TOKENS
+            if not tokens <= prefill_tokens <= MAX_PREFILL_TOKENS:
+                raise ValueError("Halo router requires the original bounded prefill row count")
+        if prefill_tokens > tokens:
+            # A changed M shape can alter the MME's FP32 accumulation order.
+            # Keep the original router geometry and suffix row placement;
+            # tiny gate differences otherwise change FP32 routing weights and
+            # amplify through the remaining decoder layers. Other prompt rows
+            # have no dependency on these row-independent gate projections.
+            original = value.new_zeros((prefill_tokens, value.shape[-1]))
+            original[-tokens:].copy_(value)
+            value = original
+        logits = (torch.ops.custom_op.custom_deepseek_v41_bf16_linear_f32_gaudi2(
+            value.contiguous(), self.weights.gate.weight) if self.router_bf16_gate else F.linear(
+                value.float(), self.weights.gate.weight))
+        return logits[-tokens:] if prefill_tokens > tokens else logits
+
+    @prefill_span("moe")
     @prefill_scope("moe")
     def forward(self,
                 value,
@@ -449,11 +506,14 @@ class PreparedMoE(nn.Module):
                 fp8_decode=False,
                 ordinary_decode=False,
                 decode=False,
-                prequant=None):
+                prequant=None,
+                prefill_router_tokens=0,
+                prefill_sequence=False):
         decode = decode or ordinary_decode
+        if decode and prefill_router_tokens:
+            raise ValueError("Decoder halo router padding is confined to prefill")
         w = self.weights
-        gate_logits = (torch.ops.custom_op.custom_deepseek_v41_bf16_linear_f32_gaudi2(
-            value.contiguous(), w.gate.weight) if self.router_bf16_gate else F.linear(value.float(), w.gate.weight))
+        gate_logits = self._router_logits(value, prefill_router_tokens)
         if self.router_top6 and decode:
             if self.topk != 6 or gate_logits.shape[1] != 384:
                 raise ValueError("Native V4.1 Router requires 384 experts and top6")
@@ -478,6 +538,8 @@ class PreparedMoE(nn.Module):
                 ids = torch.topk(scores + bias, self.topk, dim=-1, sorted=True).indices
                 routing = scores.gather(1, ids)
                 routing = routing / (routing.sum(-1, keepdim=True) + 1e-20) * 1.5
+            del scores
+        del gate_logits
         experts = w.experts
         # The C1 prequant path can keep the exact BF16 routed/shared consumer
         # in the same native graph. The shared branch still computes from the
@@ -489,7 +551,8 @@ class PreparedMoE(nn.Module):
         if self.prefill_grouped and value.shape[0] > 6 and not ordinary_decode:
             from vllm_gaudi.ops.deepseek_v41_grouped_prefill import run_grouped_prefill
             output = run_grouped_prefill(value, ids, routing, experts.w13_q16, experts.w2_q16, experts.w13_s16,
-                                         experts.w2_s16, self.lookup, self.normal_scales)
+                                         experts.w2_s16, self.lookup, self.normal_scales, experts.w13_fp8_channel,
+                                         experts.w2_fp8_channel)
         elif self.prefill_mxfp4 and value.shape[0] > 6 and not ordinary_decode:
             # Large-M prompt work has a different reuse regime from C1.  The
             # decode-oriented N256 compound kernel rereads and converts all
@@ -557,6 +620,11 @@ class PreparedMoE(nn.Module):
                        and value.shape[0] > 6 else (output.float() + shared_out.float()).to(value.dtype))
         else:
             partial = output
+        if prefill_sequence:
+            if decode or ready_outputs or self.tensor_parallel_size != 4:
+                raise ValueError("Token-owned MoE output is restricted to TP4 prefill")
+            from vllm_gaudi.ops.deepseek_v41_prefill_sequence_state import reduce_owned_tokens
+            return reduce_owned_tokens(partial, self.reduce)
         return self.reduce(partial, ready_outputs=ready_outputs) if ready_outputs else self.reduce(partial)
 
 
@@ -572,6 +640,7 @@ class PreparedDecoderLayer(nn.Module):
                  reduce,
                  all_gather,
                  device,
+                 tensor_parallel_size=2,
                  collect_target_state=False):
         super().__init__()
         self.weights, self.layer = weights, layer
@@ -584,14 +653,37 @@ class PreparedDecoderLayer(nn.Module):
         self.batch_control_reuse = gaudi_envs.VLLM_HPU_DSV41_MHC_BATCH_REUSE
         self.batch_control_prefetch = gaudi_envs.VLLM_HPU_DSV41_MHC_CONTROL_PREFETCH
         self.mhc_control_rrms = gaudi_envs.VLLM_HPU_DSV41_MHC_CONTROL_RRMS
+        # Full prompt state already owns token rows. Reuse that ownership for
+        # replicated Q/KV inputs on layers without a full hidden-state consumer.
+        self.sequence_qkv_input = tensor_parallel_size == 4
         self.register_buffer("hc_attn_fn_packed", None, False)
         self.register_buffer("hc_ffn_fn_packed", None, False)
         if shared.length > 512:
             from vllm_gaudi.ops.deepseek_v41_paged_attention import PagedCSA2Attention
-            self.attention = PagedCSA2Attention(weights.attn, config, layer, shared, linear, reduce, all_gather, device)
+            self.attention = PagedCSA2Attention(weights.attn,
+                                                config,
+                                                layer,
+                                                shared,
+                                                linear,
+                                                reduce,
+                                                all_gather,
+                                                device,
+                                                tensor_parallel_size=tensor_parallel_size)
         else:
-            self.attention = CSA2Attention(weights.attn, config, layer, shared, linear, reduce, device)
-        self.moe = PreparedMoE(weights.ffn, config["num_experts_per_tok"], normal_scales, lookup, reduce)
+            self.attention = CSA2Attention(weights.attn,
+                                           config,
+                                           layer,
+                                           shared,
+                                           linear,
+                                           reduce,
+                                           device,
+                                           tensor_parallel_size=tensor_parallel_size)
+        self.moe = PreparedMoE(weights.ffn,
+                               config["num_experts_per_tok"],
+                               normal_scales,
+                               lookup,
+                               reduce,
+                               tensor_parallel_size=tensor_parallel_size)
         self.moe.layer = layer
         self.all_gather = all_gather
 
@@ -617,21 +709,69 @@ class PreparedDecoderLayer(nn.Module):
         self.hc_ffn_fn_packed = None
 
     @prefill_span("layer")
-    def forward(self, residual, pre_mix, positions, image_mask, engram_rows=None, *, fp8_decode=False, decode=False):
+    def forward(self,
+                residual,
+                pre_mix,
+                positions,
+                image_mask,
+                engram_rows=None,
+                *,
+                fp8_decode=False,
+                decode=False,
+                prefill_router_tokens=0,
+                prefill_sequence=False):
         w = self.weights
         prefill = (gaudi_envs.VLLM_HPU_DSV41_PREFILL_REGIONS and not decode and not self.draft and residual.shape[0] > 6
                    and hasattr(self.attention, "_prefill_attention"))
-        post_update = _prefill_hc_post if prefill else hc_post
+        # The fused update depends on the four mHC streams, not TP heads.
+        # TP4 needs it even before the other prefill regions are enabled:
+        # the eager broadcast otherwise materializes [T,4,4,5120] FP32.
+        fused_post = prefill or (self.moe.tensor_parallel_size == 4 and residual.shape[0] > 6)
+        post_update = _prefill_hc_post if fused_post else hc_post
+        if prefill_sequence:
+            if not prefill or self.moe.tensor_parallel_size != 4 or residual.shape[0] * 4 != positions.numel():
+                raise ValueError("TP4 prompt layer requires matching token-owned residuals and full positions")
+            from vllm.distributed import get_tp_group
+            from vllm_gaudi.ops.deepseek_v41_prefill_sequence_state import (exchange_engram_tokens, gather_tokens,
+                                                                            sequence_hc_input, token_owner)
+            group = get_tp_group()
+            owned = token_owner(positions.numel(), group.rank_in_group)
         if hasattr(w, "engram"):
             if engram_rows is None:
                 raise RuntimeError("Engram layer requires its completed host gather and DMA generation")
-            local_rows = engram_rows if engram_rows.dtype == torch.bfloat16 else unpack_swa(engram_rows, 256)
-            rows = self.all_gather(local_rows, dim=1)
+            if prefill_sequence:
+                packet = exchange_engram_tokens(engram_rows, group=group.device_group)
+                rows = packet if packet.dtype == torch.bfloat16 else unpack_swa(packet, 256)
+                local_rows = None
+            else:
+                local_rows = engram_rows if engram_rows.dtype == torch.bfloat16 else unpack_swa(engram_rows, 256)
+                rows = self.all_gather(local_rows, dim=1)
             kv = linear(rows.flatten(1), w.engram.wkv)
-            residual = engram_update(residual, kv, w.engram.q_weight, w.engram.k_weight, ~image_mask, self.eps)
+            update = prefill_engram_update if prefill else engram_update
+            active_mask = ~image_mask[owned] if prefill_sequence else ~image_mask
+            residual = update(residual, kv, w.engram.q_weight, w.engram.k_weight, active_mask, self.eps)
+            del kv, rows, local_rows
         target_state = residual.mean(1) if self.collect_target_state else None
+        if target_state is not None and prefill_sequence:
+            target_state = gather_tokens(target_state.contiguous(), group=group.device_group)
         compiled_input = prefill and gaudi_envs.VLLM_HPU_DSV41_PREFILL_MHC_INPUT
-        if compiled_input:
+        requires_full_input = self.attention.owns_kv or self.attention.owns_index if prefill_sequence else False
+        sequence_qkv = (prefill_sequence and getattr(self, "sequence_qkv_input", False) and not requires_full_input
+                        and self.attention._fused_qkv_weight is not None)
+        if prefill_sequence:
+            new_pre, post, comb, value = sequence_hc_input(residual,
+                                                           pre_mix,
+                                                           w.hc_attn_fn,
+                                                           w.hc_attn_scale,
+                                                           w.hc_attn_base,
+                                                           w.attn_norm.weight,
+                                                           self.eps,
+                                                           self.hc_eps,
+                                                           self.iterations,
+                                                           self.hc_attn_fn_packed,
+                                                           group=group.device_group,
+                                                           gather=requires_full_input or not sequence_qkv)
+        elif compiled_input:
             collapsed, new_pre, post, comb, value = prefill_hc_input(residual, pre_mix, w.hc_attn_fn, w.hc_attn_scale,
                                                                      w.hc_attn_base, w.attn_norm.weight, self.eps,
                                                                      self.hc_eps, self.iterations,
@@ -647,16 +787,35 @@ class PreparedDecoderLayer(nn.Module):
                                                 self.hc_eps,
                                                 self.iterations,
                                                 packed_fn=self.hc_attn_fn_packed,
-                                                prefill=prefill)
+                                                prefill=fused_post)
             value = rms_norm(value, w.attn_norm.weight, self.eps)
         schedule = (gaudi_envs.VLLM_HPU_DSV41_MHC_SCHEDULE and not self.draft and 1 <= value.shape[0] <= 6)
-        if schedule:
+        if prefill_sequence:
+            value = self.attention(value,
+                                   positions,
+                                   decode=False,
+                                   prefill_sequence=True,
+                                   prefill_qkv_sequence=sequence_qkv)
+        elif schedule:
             value = self.attention(value, positions, ready_outputs=(post, comb), decode=decode)
         else:
             value = (self.attention.draft(value, positions)
                      if self.draft else self.attention(value, positions, decode=decode))
         residual = post_update(value, residual, post, comb)
-        if compiled_input:
+        del value, post, comb
+        if prefill_sequence:
+            pre_mix, post, comb, value = sequence_hc_input(residual,
+                                                           new_pre,
+                                                           w.hc_ffn_fn,
+                                                           w.hc_ffn_scale,
+                                                           w.hc_ffn_base,
+                                                           w.ffn_norm.weight,
+                                                           self.eps,
+                                                           self.hc_eps,
+                                                           self.iterations,
+                                                           self.hc_ffn_fn_packed,
+                                                           group=group.device_group)
+        elif compiled_input:
             collapsed, pre_mix, post, comb, value = prefill_hc_input(residual, new_pre, w.hc_ffn_fn, w.hc_ffn_scale,
                                                                      w.hc_ffn_base, w.ffn_norm.weight, self.eps,
                                                                      self.hc_eps, self.iterations,
@@ -672,7 +831,7 @@ class PreparedDecoderLayer(nn.Module):
                                                 self.hc_eps,
                                                 self.iterations,
                                                 packed_fn=self.hc_ffn_fn_packed,
-                                                prefill=prefill)
+                                                prefill=fused_post)
         # Keep the normalized BF16 row in the TPC register file while forming
         # the exact FP8 operand consumed by N256.  This is an internal B1/B2
         # implementation choice under the normal scheduler and request-state
@@ -693,7 +852,9 @@ class PreparedDecoderLayer(nn.Module):
                              image_mask,
                              ready_outputs=(post, comb) if schedule else (),
                              fp8_decode=fp8_decode,
-                             decode=decode)
+                             decode=decode,
+                             prefill_router_tokens=prefill_router_tokens,
+                             prefill_sequence=prefill_sequence)
         return post_update(value, residual, post, comb), pre_mix, target_state
 
     def forward_batch(self, residual, pre_mix, positions, image_mask, engram_rows, slots, pages, selected, candidates,
@@ -768,21 +929,60 @@ class PreparedDecoderLayer(nn.Module):
         return residual, pre_mix, selected, candidates, main_ready, index_ready
 
 
+class PrefillInput:
+    """Transfer a prompt's initial residual into the layer loop exactly once.
+
+    Outer Python/module call frames retain the empty owner, so they do not
+    keep the initial four-stream activation alive after layer zero consumes
+    it. This changes tensor lifetime only; embedding and Engram overlap, the
+    complete scheduler chunk, and each layer's BF16 boundaries are preserved.
+    """
+
+    def __init__(self, residual, pre_mix):
+        self.residual, self.pre_mix = residual, pre_mix
+
+    def take(self):
+        if self.residual is None:
+            raise RuntimeError("Prefill input has already been consumed")
+        result = self.residual, self.pre_mix
+        self.residual = self.pre_mix = None
+        return result
+
+
 class PreparedStage(nn.Module):
 
-    def __init__(self, directory, pp_rank, tp_rank, reduce, all_gather, device, max_length=512, *, dspark=None):
+    def __init__(self,
+                 directory,
+                 pp_rank,
+                 tp_rank,
+                 reduce,
+                 all_gather,
+                 device,
+                 max_length=512,
+                 *,
+                 tensor_parallel_size=2,
+                 pipeline_parallel_size=2,
+                 dspark=None,
+                 prefill_tokens=8192):
         super().__init__()
         from vllm_gaudi.ops.deepseek_v41_prefill_regions import validate_prefill_region_config
         validate_prefill_region_config()
         self.shard = PreparedV41Shard(directory, pp_rank, tp_rank)
+        if (getattr(self.shard, "tensor_parallel_size", tensor_parallel_size) != tensor_parallel_size
+                or getattr(self.shard, "pipeline_parallel_size", pipeline_parallel_size) != pipeline_parallel_size):
+            raise ValueError("Prepared shard topology differs from the runtime topology")
         self.config = json.loads((Path(directory) / "config.json").read_text())
         config = self.config["text_config"]
         self.pp_rank, self.tp_rank, self.length = pp_rank, tp_rank, max_length
+        self.pipeline_parallel_size = pipeline_parallel_size
+        self.is_last_stage = pp_rank == pipeline_parallel_size - 1
         # Set for each request chunk by the worker. The experimental suffix
         # path must never infer finality from a static graph shape.
         self.prefill_halo_mode = "full"
         self.reduce, self.all_gather = reduce, all_gather
         self.dspark = (gaudi_envs.VLLM_HPU_DSV41_DSPARK if dspark is None else bool(dspark))
+        if tensor_parallel_size == 4 and self.dspark:
+            raise ValueError("V4.1 TP4 does not yet support DSpark")
         self.runtime_indexer = gaudi_envs.VLLM_HPU_DSV41_RUNTIME_INDEXER
         if self.runtime_indexer and (self.dspark or max_length <= 512):
             raise ValueError("Runtime CSA2 indexer requires paged ordinary decode")
@@ -838,10 +1038,18 @@ class PreparedStage(nn.Module):
             for name, spec in self.shard.specs.items() if self.dspark or not name.startswith("mtp.")
         }
         self.weights = _weight_tree(self.weight_specs)
-        self.start, self.stop = (0, 20) if pp_rank == 0 else (20, 40)
+        self.tensor_parallel_size = tensor_parallel_size
+        ranges = self.shard.manifest.get("pp_layer_ranges", [[0, 20], [20, 40]])
+        self.start, self.stop = ranges[pp_rank]
         if max_length > 512:
             from vllm_gaudi.ops.deepseek_v41_paged_attention import PagedCSA2SharedState
-            self.shared = PagedCSA2SharedState(config, self.start, self.stop, device, max_length)
+            self.shared = PagedCSA2SharedState(config,
+                                               self.start,
+                                               self.stop,
+                                               device,
+                                               max_length,
+                                               prefill_tokens=prefill_tokens,
+                                               tensor_parallel_size=tensor_parallel_size)
         else:
             self.shared = CSA2SharedState(config, self.start, self.stop, device, max_length)
         lookup = mxfp4_bf16_lut(torch.device(device))
@@ -858,6 +1066,7 @@ class PreparedStage(nn.Module):
                                      reduce,
                                      all_gather,
                                      device,
+                                     tensor_parallel_size,
                                      collect_target_state=self.dspark))
             # Lightweight loader/ownership tests replace the decoder layer
             # with a shell that deliberately has no attention module.
@@ -866,14 +1075,14 @@ class PreparedStage(nn.Module):
                 attention.prefill_tp_rank = tp_rank
         self.generation, self.loaded = 0, False
         self.runtime_precision = {
-            "experts":
-            "MXFP4 -> BF16 SRAM -> BF16 MME",
+            "experts": ("MXFP4/N256 -> FP8 decode MME; grouped BF16 prefill MME"
+                        if self.expert_n256 and self.fp8_decode else "MXFP4 -> BF16 SRAM -> BF16 MME"),
             "dense":
             "E4M3FN/block32 -> prepared BF16; block32 activation quantization",
             "mla_wo_a": ("pretransposed [groups,K,N] BF16"
                          if gaudi_envs.VLLM_HPU_DSV41_PRETRANSPOSE_ATTN else "checkpoint [groups,N,K] BF16"),
-            "mHC_router":
-            "FP32",
+            "mHC_router": ("FP32 mHC; BF16 router operands with FP32 logits"
+                           if gaudi_envs.VLLM_HPU_DSV41_BF16_ROUTER_GATE else "FP32"),
             "communication":
             "BF16"
         }
@@ -981,9 +1190,8 @@ class PreparedStage(nn.Module):
                 "fused_reduce":
                 self.expert_fused_reduce,
             }
-            self.runtime_precision["experts"] = ("MXFP4 -> FP8 SRAM -> FP8xFP8 MME for C1-C6 and chunked prefill"
-                                                 if gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8 else
-                                                 "N256 MXFP4 -> BF16 SRAM -> BF16 MME")
+            self.runtime_precision["experts"] = ("N256 MXFP4; C1-C6 " + self.runtime_precision["expert_n256"]["c1_c6"] +
+                                                 " MME; prefill: " + self.runtime_precision["expert_n256"]["prefill"])
         elif gaudi_envs.VLLM_HPU_DSV41_FP8_DECODE:
             from vllm_gaudi.ops.deepseek_v41_fp8 import FP8Sidecar, precision_config
             config = precision_config(gaudi_envs.VLLM_HPU_DSV41_FP8_CONFIG)
@@ -1104,6 +1312,19 @@ class PreparedStage(nn.Module):
         return self.reduce(values.masked_fill(~valid.unsqueeze(-1), 0))
 
     def _forward_impl(self, residual, pre_mix, positions, input_ids, engram_rows):
+        if isinstance(residual, PrefillInput):
+            residual, pre_mix = residual.take()
+        retire = (torch.hpu.Event() if getattr(self, "tensor_parallel_size", 2) == 4 and residual.device.type == "hpu"
+                  and residual.shape[0] > 8192 else None)
+        from vllm_gaudi.ops.deepseek_v41_prefill_sequence_state import (can_sequence_prefill_state, gather_tokens,
+                                                                        retire_prefill_layer, token_owner)
+        sequence_state = can_sequence_prefill_state(self, positions.numel())
+        layer_options = {"prefill_sequence": True} if sequence_state else {}
+        if sequence_state:
+            from vllm.distributed import get_tp_group
+            group = get_tp_group()
+            owned = token_owner(positions.numel(), group.rank_in_group)
+            residual, pre_mix = residual[owned].clone(), pre_mix[owned].clone()
         workspace = getattr(self.shared, "prefill_main_workspace", None)
         if workspace is not None and positions.numel() > 6:
             self.shared.prefill_kv_generation += 1
@@ -1112,44 +1333,75 @@ class PreparedStage(nn.Module):
         target_states = []
         for layer in self.layers:
             rows = engram_rows[0 if layer.layer == 1 else 1] if layer.layer in (1, 14) else None
-            residual, pre_mix, target = layer(residual, pre_mix, positions, image_mask, rows)
+            residual, pre_mix, target = layer(residual, pre_mix, positions, image_mask, rows, **layer_options)
             if target is not None:
                 target_states.append(target)
-        if self.pp_rank == 0:
+            retire_prefill_layer(retire)
+        if sequence_state:
+            residual = gather_tokens(residual, group=group.device_group)
+            pre_mix = gather_tokens(pre_mix.contiguous(), group=group.device_group)
+        if not self.is_last_stage:
             return residual, pre_mix, None
         value = final_collapse_rms_norm(residual, pre_mix, self.weights.norm.weight,
                                         self.config["text_config"]["rms_norm_eps"])
         return value, pre_mix, torch.cat(target_states, -1) if target_states else None
 
-    def _forward_prefill_halo(self, residual, pre_mix, positions, input_ids, mode):
-        """Keep PP1's global source complete and bound the decoder query rows.
+    def _forward_prefill_halo(self, residual, pre_mix, positions, input_ids, mode, engram_rows=()):
+        """Keep layers through the global source complete and bound decoder rows.
 
         Prefix-only chunks publish layer-20 global KV. A full chunk before a
         short final block rebuilds the local caches. The final chunk retains
         the full dependency halo for the last output and for
         every decoder layer's trailing SWA cache. The source's candidate rows
         are compacted after its last consumer, before the suffix Reindex layers.
-        This is intentionally opt-in until real PP2 output and state checks pass.
+        The scheduler selects this only for the qualified text-prompt geometry.
         """
-        if self.pp_rank != 1 or self.dspark or self.start != 20 or self.stop != 40 or len(self.layers) != 20:
-            raise RuntimeError("Decoder prefill halo requires ordinary PP1 layers 20-39")
+        tp4 = getattr(self, "tensor_parallel_size", 2) == 4
+        supported = ((tp4 and self.pp_rank == 0 and self.start in (0, 20))
+                     or (not tp4 and self.pp_rank == 1 and self.start == 20))
+        if not supported or self.dspark or self.stop != 40 or len(self.layers) != 40 - self.start:
+            raise RuntimeError("Decoder prefill halo requires complete layers through source20 and decoder39")
         if mode not in ("prefix_only", "final"):
             raise RuntimeError("Decoder prefill halo requires an explicit request phase")
+        if isinstance(residual, PrefillInput):
+            residual, pre_mix = residual.take()
+        retire = torch.hpu.Event() if tp4 and residual.device.type == "hpu" and positions.numel() > 8192 else None
+        from vllm_gaudi.ops.deepseek_v41_prefill_sequence_state import (can_sequence_prefill_state, gather_tokens,
+                                                                        replicate_owned_tail, retire_prefill_layer,
+                                                                        token_owner)
+        sequence_state = can_sequence_prefill_state(self, positions.numel())
+        layer_options = {"prefill_sequence": True} if sequence_state else {}
+        if sequence_state:
+            from vllm.distributed import get_tp_group
+            group = get_tp_group()
+            owned = token_owner(positions.numel(), group.rank_in_group)
+            residual, pre_mix = residual[owned].clone(), pre_mix[owned].clone()
         workspace = getattr(self.shared, "prefill_main_workspace", None)
         if workspace is not None:
             self.shared.prefill_kv_generation += 1
             workspace.begin(self.shared.prefill_kv_generation)
         image_mask = (input_ids == 129264) | (input_ids == 129265)
-        residual, pre_mix, target = self.layers[0](residual, pre_mix, positions, image_mask)
-        if target is not None:
-            raise RuntimeError("Decoder halo cannot suppress DSpark target-state rows")
+        source_index = 20 - self.start
+        for layer in self.layers[:source_index + 1]:
+            layer_id = getattr(layer, "layer", -1)
+            if layer_id in (1, 14):
+                rows = engram_rows[0 if layer_id == 1 else 1] if engram_rows else None
+                residual, pre_mix, target = layer(residual, pre_mix, positions, image_mask, rows, **layer_options)
+            else:
+                residual, pre_mix, target = layer(residual, pre_mix, positions, image_mask, **layer_options)
+            if target is not None:
+                raise RuntimeError("Decoder halo cannot suppress DSpark target-state rows")
+            retire_prefill_layer(retire)
         if mode == "prefix_only":
             # The runner neither samples nor requests logits for this prompt
             # chunk. Return a defined tensor for its existing stage contract.
+            if sequence_state:
+                return (gather_tokens(residual[:, 0, :].contiguous(), group=group.device_group),
+                        gather_tokens(pre_mix.contiguous(), group=group.device_group), None)
             return residual[:, 0, :].contiguous(), pre_mix, None
 
         from vllm_gaudi.ops.deepseek_v41_decoder_halo import decoder_halo_rows
-        retained = decoder_halo_rows(len(self.layers) - 1)
+        retained = decoder_halo_rows(len(self.layers) - source_index - 1)
         cut = max(0, positions.numel() - retained)
         if cut:
             pool = self.shared.candidate_pool
@@ -1158,13 +1410,28 @@ class PreparedStage(nn.Module):
             # Layer 20 published [0,T) in transaction-local row order. The
             # Reindex consumer takes its own [0,retained) row interval.
             pool[:retained].copy_(pool[cut:cut + retained].clone())
-            selection = self.shared.topk[str(self.start)].indices
+            selection = self.shared.topk["20"].indices
             if selection.shape[0] < positions.numel():
                 raise RuntimeError("Decoder halo has no complete layer-20 selection rows")
             selection[:retained].copy_(selection[cut:cut + retained].clone())
-            residual, pre_mix, positions, image_mask = (v[cut:] for v in (residual, pre_mix, positions, image_mask))
-        for layer in self.layers[1:]:
-            residual, pre_mix, target = layer(residual, pre_mix, positions, image_mask)
+            if sequence_state:
+                residual = replicate_owned_tail(residual, retained, group=group.device_group)
+                pre_mix = replicate_owned_tail(pre_mix, retained, group=group.device_group)
+                positions, image_mask = positions[cut:], image_mask[cut:]
+            else:
+                residual, pre_mix, positions, image_mask = (v[cut:] for v in (residual, pre_mix, positions, image_mask))
+        elif sequence_state:
+            residual = gather_tokens(residual, group=group.device_group)
+            pre_mix = gather_tokens(pre_mix.contiguous(), group=group.device_group)
+        for layer in self.layers[source_index + 1:]:
+            if tp4 and cut:
+                residual, pre_mix, target = layer(residual,
+                                                  pre_mix,
+                                                  positions,
+                                                  image_mask,
+                                                  prefill_router_tokens=cut + retained)
+            else:
+                residual, pre_mix, target = layer(residual, pre_mix, positions, image_mask)
             if target is not None:
                 raise RuntimeError("Decoder halo cannot suppress DSpark target-state rows")
         value = final_collapse_rms_norm(residual, pre_mix, self.weights.norm.weight,
@@ -1190,8 +1457,22 @@ class PreparedStage(nn.Module):
         the causal prefix visible to the following tile, so this preserves the
         normal prefill ordering and does not turn the request into C1/C6.
         """
+        if isinstance(residual, PrefillInput):
+            if self.tensor_parallel_size != 4 or not (gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED
+                                                      or gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4):
+                raise RuntimeError("Owned prefill requires the full-chunk TP4 expert path")
+            if (gaudi_envs.VLLM_HPU_DSV41_PREFILL_DECODER_HALO and positions.numel() > 6
+                    and self.prefill_halo_mode != "full"):
+                return self._forward_prefill_halo(residual, None, positions, input_ids, self.prefill_halo_mode,
+                                                  engram_rows)
+            return self._forward_impl(residual, None, positions, input_ids, engram_rows)
         tile = PreparedMoE.N256_PREFILL_TILE
         tokens = residual.shape[0]
+        if (gaudi_envs.VLLM_HPU_DSV41_PREFILL_DECODER_HALO
+                and (self.pp_rank == 1 or getattr(self, "tensor_parallel_size", 2) == 4) and tokens > 6
+                and self.prefill_halo_mode != "full"):
+            return self._forward_prefill_halo(residual, pre_mix, positions, input_ids, self.prefill_halo_mode,
+                                              engram_rows)
         if tokens > 6 and (gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED or gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4):
             # Both implementations bound expert workspace internally and
             # reuse each weight over this complete scheduler transaction.
@@ -1243,7 +1524,7 @@ class PreparedStage(nn.Module):
         return F.linear(hidden.float(), self.weights.head.weight)
 
     def logits(self, hidden):
-        if self.pp_rank != 1:
+        if not self.is_last_stage:
             raise RuntimeError("Only the final PP stage owns the output head")
         local = self._head_projection(hidden)
         return self.all_gather(local, dim=-1)
@@ -1254,8 +1535,8 @@ class PreparedStage(nn.Module):
             select_greedy_candidate,
         )
         maximum = 64 if gaudi_envs.VLLM_HPU_DSV41_BATCH_DECODE else 1
-        if self.pp_rank != 1 or not 1 <= hidden.shape[0] <= maximum:
-            raise ValueError("Ordinary greedy head exceeds the configured PP1 request batch")
+        if not self.is_last_stage or not 1 <= hidden.shape[0] <= maximum:
+            raise ValueError("Ordinary greedy head exceeds the configured final-stage request batch")
         local = self._head_projection(hidden)
         candidates = self.all_gather(local_greedy_candidate(local, self.tp_rank), dim=-1)
         return select_greedy_candidate(candidates)
@@ -1277,14 +1558,16 @@ class PreparedLayerGroup(nn.Module):
         super().__init__()
         self.fp8_decode = fp8_decode
         self.decode = decode
+        self.preserve_layer_rounding = getattr(stage, "tensor_parallel_size", 2) == 4
         self.pp_wire_input = pp_wire_input and start == 0
         self.text_input = fused_text_io and stage.pp_rank == 0 and start == 0
-        self.wire_output = fused_text_io and stage.pp_rank == 0 and stop == len(stage.layers)
+        is_last_stage = getattr(stage, "is_last_stage", stage.pp_rank == 1)
+        self.wire_output = fused_text_io and stage.pp_rank == 0 and not is_last_stage and stop == len(stage.layers)
         self.embedding = stage.weights.embed if self.text_input else None
         self.tp_rank = getattr(stage, "tp_rank", 0)
         self.reduce = getattr(stage, "reduce", None)
         self.layers = nn.ModuleList(list(stage.layers[start:stop]))
-        self.final = stage.pp_rank == 1 and stop == len(stage.layers)
+        self.final = is_last_stage and stop == len(stage.layers)
         self.norm = stage.weights.norm if self.final else None
         self.eps = stage.config["text_config"]["rms_norm_eps"]
         self.native_input = None
@@ -1315,6 +1598,12 @@ class PreparedLayerGroup(nn.Module):
                                               decode=decode)
             if target is not None:
                 target_states.append(target)
+            if self.preserve_layer_rounding and decode and layer is not self.layers[-1]:
+                # Preserve the same BF16 residual boundary as separate layer
+                # recipes; cross-layer fusion otherwise changes cached KV.
+                shape = residual.shape
+                residual = torch.ops.custom_op.custom_deepseek_v41_bf16_identity_gaudi2(
+                    residual.reshape(1, -1).contiguous()).reshape(shape)
         if gaudi_envs.VLLM_HPU_DSV41_MHC_GATES_FUSED:
             # The last layer's pre gate is a narrow view into one packed
             # kernel output. Materialize it at the recipe boundary because
@@ -1380,12 +1669,16 @@ class CompiledStage:
         if native_input and (pp_wire_input or fused_text_io):
             raise ValueError("Native input capture has a single PP0 input owner")
         backend = "hpu_backend"
+        if getattr(stage, "tensor_parallel_size", 2) == 4:
+            from vllm_gaudi.compilation.deepseek_v41_tp4 import make_backend
+            backend = make_backend()
         # Keep the scheduler transaction large (normal vLLM chunked prefill),
         # but remember whether this stage owns compiled entries.  Very large
         # M inputs are dispatched through the eager group method below so
         # each bounded N256 tile can release its workspace before the next
         # tile.  C1/decode and <=512-token prefill retain the compiled graph.
         self.native = bool(native)
+        self.audit = {"calls": 0, "tokens": 0, "groups": 0}
         if native and gaudi_envs.VLLM_HPU_DSV41_TP_MHC_OVERLAP:
             if stage.dspark or (stage.fp8_decode and not stage.expert_n256):
                 raise ValueError("TP/mHC overlap requires BF16 boundaries and a qualified C1 expert layout")
@@ -1399,8 +1692,9 @@ class CompiledStage:
                                start + group_size,
                                pp_wire_input=pp_wire_input,
                                fused_text_io=fused_text_io,
-                               fp8_decode=native and stage.fp8_decode,
-                               decode=native) for start in range(0, len(stage.layers), group_size))
+                               fp8_decode=getattr(stage, "fp8_decode", False),
+                               decode=native or getattr(stage, "tensor_parallel_size", 2) == 4)
+            for start in range(0, len(stage.layers), group_size))
         if native_input:
             self.groups[0].native_input = PreparedInput(stage.weights.embed, stage.tp_rank, stage.reduce)
         self.chunks = tuple(_compile_group(group, native=native, backend=backend) for group in self.groups)
@@ -1410,13 +1704,10 @@ class CompiledStage:
                          and (gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4 or gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED))
         large_prefill = hidden.shape[0] > PreparedMoE.N256_PREFILL_TILE
         if stock_prefill:
-            # Preserve the normal vLLM large-M transaction so the stock MXFP4
-            # kernel can amortize each restored expert range across all prompt
-            # rows.  This branch also covers short ordinary prompts above the
-            # C1-C6 decode geometry: keeping it outside the four-layer compiled
-            # graph is required because the generic HPU backend lowers the
-            # N256 uint8 restore views to an invalid reinterpret-cast.  Only
-            # the inner MXFP4 backend owns a reusable compiled recipe.
+            # Preserve the complete scheduler chunk through the stage. TP4
+            # dispatches bounded prepared N256 plans inside each MoE layer;
+            # their temporary expert buffers retire before the next layer.
+            # Keep prefill outside the compiled decode layer groups.
             aux = None
             for group in self.groups:
                 method = group.native_forward if self.native else group.forward
@@ -1469,8 +1760,18 @@ class CompiledStage:
                 # synchronizing here can trigger defragmentation while this
                 # tile's producer graph is still referenced by the stream.
             return full_hidden, full_pre, full_aux
-        for chunk in self.chunks:
-            hidden, pre_mix, aux = chunk(hidden, pre_mix, positions, input_ids, engram)
+        self.audit["calls"] += 1
+        self.audit["tokens"] += hidden.shape[0]
+        self.audit["groups"] += len(self.chunks)
+        from vllm_gaudi.ops.deepseek_v41_native_trace import annotations_enabled, scope
+        if annotations_enabled():
+            for group, chunk in zip(self.groups, self.chunks, strict=True):
+                first, last = group.layers[0].layer, group.layers[-1].layer
+                with scope(f"v41::compiled::layers{first}-{last}::C{hidden.shape[0]}"):
+                    hidden, pre_mix, aux = chunk(hidden, pre_mix, positions, input_ids, engram)
+        else:
+            for chunk in self.chunks:
+                hidden, pre_mix, aux = chunk(hidden, pre_mix, positions, input_ids, engram)
         return hidden, pre_mix, aux
 
 

@@ -36,7 +36,7 @@ DeepseekV41DensePairScaleGaudi2::GetGcDefinitions(
         activation.dataType != DATA_F32 || output.dataType != DATA_BF16)
         return GLUE_INCOMPATIBLE_DATA_TYPE;
     if (product.dims != 3 || output.dims != 3 || width != 25600 ||
-        rows < 1 || rows > 8192 || batches != 2 ||
+        rows < 1 || rows > 16384 || batches != 2 ||
         output.maxSizes[0] != width || output.maxSizes[1] != rows ||
         output.maxSizes[2] != batches || weight.dims != 3 ||
         weight.maxSizes[0] != width || weight.maxSizes[1] != 1 ||

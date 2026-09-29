@@ -79,7 +79,7 @@ def test_prompt_completion_uses_cpu_pp_control_record(monkeypatch):
     from vllm_gaudi.v1.worker import deepseek_v41_runner as runner
 
     cpu_group = object()
-    group = SimpleNamespace(is_last_rank=True, ranks=[0, 2], cpu_group=cpu_group)
+    group = SimpleNamespace(is_first_rank=False, is_last_rank=True, ranks=[0, 2], cpu_group=cpu_group)
     monkeypatch.setattr(runner.envs, "VLLM_HPU_DSV41_PACKED_PP", False)
     monkeypatch.setattr(runner, "get_pp_group", lambda: group)
     broadcasts = []

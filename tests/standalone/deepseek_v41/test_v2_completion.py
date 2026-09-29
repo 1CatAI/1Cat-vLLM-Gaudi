@@ -191,6 +191,7 @@ def test_v2_gate_requires_the_complete_segmented_device_contract(monkeypatch):
         monkeypatch.setenv(key, "1" if value else "0")
     config = SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v41"),
                                                           max_model_len=512),
+                             parallel_config=SimpleNamespace(tensor_parallel_size=2, pipeline_parallel_size=2),
                              use_v2_model_runner=True,
                              scheduler_config=SimpleNamespace(async_scheduling=True),
                              speculative_config=None)
@@ -394,6 +395,7 @@ def test_device_engram_skips_only_matching_host_layer1(monkeypatch):
     def model(host):
         value = object.__new__(HpuDeepseekV41ForCausalLM)
         value.pp_rank = 0
+        value.is_first_stage, value.is_last_stage, value.tensor_parallel_size = True, False, 2
         value.step_ticket = None
         value.step_is_decode = False
         value._decode_prefix = None

@@ -368,7 +368,7 @@ def compiled_gather(signature):
     return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
 
 
-def prepare_device_grouped_prefill_recipes(normal_scales: bool = True):
+def prepare_device_grouped_prefill_recipes(normal_scales: bool = True, *, tensor_parallel_size=2, prefill_tokens=8192):
     """Compile the finite expert bodies before model and KV residency.
 
     This runs once per serving rank from ``load_model``.  Temporary tensors
@@ -387,11 +387,15 @@ def prepare_device_grouped_prefill_recipes(normal_scales: bool = True):
     if rows != 128:
         return
     device = torch.device("hpu")
-    q13 = torch.empty((experts, 9, 327680), dtype=torch.int16, device=device)
-    q2 = torch.empty((experts, 20, 73728), dtype=torch.int16, device=device)
-    s13 = torch.empty((experts, 9, 40960), dtype=torch.int16, device=device)
-    s2 = torch.empty((experts, 20, 9216), dtype=torch.int16, device=device)
-    channel13 = torch.empty((experts, 9, 256), dtype=torch.bfloat16, device=device)
+    if tensor_parallel_size not in (2, 4):
+        raise ValueError("Grouped prefill requires TP2 or TP4")
+    intermediate = ((2304 // tensor_parallel_size + 127) // 128) * 128
+    blocks13 = intermediate * 2 // 256
+    q13 = torch.empty((experts, blocks13, 327680), dtype=torch.int16, device=device)
+    q2 = torch.empty((experts, 20, intermediate * 64), dtype=torch.int16, device=device)
+    s13 = torch.empty((experts, blocks13, 40960), dtype=torch.int16, device=device)
+    s2 = torch.empty((experts, 20, intermediate * 8), dtype=torch.int16, device=device)
+    channel13 = torch.empty((experts, blocks13, 256), dtype=torch.bfloat16, device=device)
     channel2 = torch.empty((experts, 20, 256), dtype=torch.bfloat16, device=device)
     from vllm_gaudi.ops.deepseek_v4_mxfp4 import mxfp4_bf16_lut
     lookup = mxfp4_bf16_lut(device)
@@ -432,15 +436,17 @@ def prepare_device_grouped_prefill_recipes(normal_scales: bool = True):
         # shape before model loading so the live request reuses prepared
         # recipes. Operator-contract failures must still be diagnosed from
         # the compiler log, not inferred from resident-memory size.
-        for tokens in (2048, 1024, 512, 256, 128):
+        from vllm_gaudi.ops.deepseek_v41_prefill_capacity import prefill_compute_buckets
+        for tokens in prefill_compute_buckets(prefill_tokens):
             ids = (torch.arange(tokens * 6, dtype=torch.int32, device=device).remainder(experts).reshape(tokens, 6))
             routing = torch.full((tokens, 6), 1.0 / 6.0, dtype=torch.float32, device=device)
             value = torch.empty((tokens, hidden), dtype=torch.bfloat16, device=device)
             expert_ids, slots, _, _ = compiled_routes((tokens, experts, rows, False))(ids, experts, rows, False)
             torch.hpu.synchronize()
-            for start in range(0, slots.shape[0], 8):
-                groups = min(8, slots.shape[0] - start)
-                group_slots = slots[start:start + groups].clone()
+            # Occupancy can leave any one-through-eight group tail. Prepare
+            # each signature once instead of repeating the full route plan.
+            for groups in range(1, 9):
+                group_slots = slots[:groups].clone()
                 selected, route = compiled_gather((tokens, groups, rows, hidden))(value, routing, group_slots)
                 destinations = compiled_destinations((groups, rows, tokens * 6))(group_slots, tokens * 6)
                 padded = torch.empty((tokens * 6 + 1, hidden), dtype=torch.bfloat16, device=device)
@@ -630,12 +636,18 @@ def run_device_grouped_prefill(value,
     # decoded weight blocks or a second complete copy of the routed outputs.
     compact = envs.VLLM_HPU_DSV41_PREFILL_ROUTE_OUTPUT
     padded = value.new_empty((ids.numel() + 1 if compact else slots.numel(), value.shape[-1]))
+    active_blocks = slots.shape[0]
+    if envs.VLLM_HPU_DSV41_PREFILL_ACTIVE_PLAN:
+        # Sorted descriptors put occupied blocks first. TP4 uses the same
+        # compiled grouped bodies with its HCCL communicator; read only the
+        # small occupancy vector and omit empty expert groups entirely.
+        active_blocks = sum((int(count) + rows - 1) // rows for count in counts.cpu().tolist())
     # Each body is bounded to at most eight experts x ``rows`` routes.  The
     # production recipe bundle prepares these shapes before model loading.
     # Reuse the compiled entry, including its input layout, so serving does
     # not create a separate eager recipe for the same expert computation.
-    for start in range(0, slots.shape[0], 8):
-        stop = min(start + 8, slots.shape[0])
+    for start in range(0, active_blocks, 8):
+        stop = min(start + 8, active_blocks)
         groups = stop - start
         # A contiguous view may still have a nonzero storage offset. Bridge
         # specializes those offsets into distinct recipes; materialize only

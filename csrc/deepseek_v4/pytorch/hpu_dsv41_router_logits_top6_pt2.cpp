@@ -14,7 +14,7 @@ habana::OutputMetaDataVector metadata(const at::Stack& stack) {
     const auto image = stack.at(2).toTensor();
     const auto mask = stack.at(3).toTensor();
     TORCH_CHECK(logits.scalar_type() == at::kFloat && logits.dim() == 2 &&
-                logits.size(0) > 0 && logits.size(0) <= 8192 &&
+                logits.size(0) > 0 && logits.size(0) <= 16384 &&
                 logits.size(1) == 384 && text.scalar_type() == at::kFloat &&
                 image.scalar_type() == at::kFloat &&
                 text.sizes() == at::IntArrayRef({384}) &&
