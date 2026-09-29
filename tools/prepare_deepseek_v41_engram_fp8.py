@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prepare bounded PP0 Engram FP8 sidecars from immutable rank files."""
 import argparse
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,6 +19,9 @@ def main():
     args = parser.parse_args()
     args.output = args.output or args.prepared / "sidecars" / "engram_fp8"
     args.output.mkdir(parents=True, exist_ok=False)
+    topology = json.loads((args.prepared / "manifest.json").read_text())
+    tp_size = topology["tensor_parallel_size"]
+    pp_size = topology["pipeline_parallel_size"]
     manifest = {
         "version": 1,
         "quantization": QUANTIZATION,
@@ -26,7 +30,7 @@ def main():
         "rank_files": {},
     }
     n, k = SHAPE
-    for tp in range(2):
+    for tp in range(tp_size):
         shard = PreparedV41Shard(args.prepared, 0, tp)
         rank = f"pp0-tp{tp}"
         specs = {}

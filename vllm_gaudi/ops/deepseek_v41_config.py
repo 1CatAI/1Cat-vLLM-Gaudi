@@ -4,6 +4,15 @@
 from vllm_gaudi import envs
 
 
+def decode_source_prefix_bound(token_end, search_length, tensor_parallel_size, *, runtime_indexer=False):
+    """Bound contiguous Full-source work without reading device positions."""
+    if tensor_parallel_size != 4 or runtime_indexer or search_length > 32768:
+        return None
+    if not 0 < token_end <= search_length:
+        raise ValueError("Decode visible prefix is outside the search bucket")
+    return min(search_length, ((token_end + 4095) // 4096) * 4096)
+
+
 def is_v41(config):
     model = getattr(config, "model_config", None) or getattr(config, "target_model_config", None)
     return getattr(getattr(model, "hf_config", None), "model_type", None) == "deepseek_v41"
@@ -17,6 +26,14 @@ def uses_v2(config):
     return is_v41(config) and envs.VLLM_HPU_DSV41_V2
 
 
+def tensor_parallel_size(config):
+    return config.parallel_config.tensor_parallel_size if is_v41(config) else 1
+
+
+def is_tp4(config):
+    return tensor_parallel_size(config) == 4
+
+
 def validate_v2(config):
     if not uses_v2(config):
         return
@@ -24,6 +41,15 @@ def validate_v2(config):
         raise ValueError("V4.1 V2 requires VLLM_USE_V2_MODEL_RUNNER=1 and async scheduling")
     if envs.VLLM_HPU_DSV41_DSPARK or config.speculative_config is not None:
         raise ValueError("V4.1 V2 supports ordinary C1 without DSpark")
+    if is_tp4(config):
+        required = ("VLLM_HPU_DSV41_DIRECT_TOKEN_IDS", "VLLM_HPU_DSV41_FIXED_POSITIONS",
+                    "VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT", "VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX",
+                    "VLLM_HPU_DSV41_V2_DEVICE_ENGRAM", "VLLM_HPU_DSV41_ENGRAM_NATIVE_C1",
+                    "VLLM_HPU_DSV41_ENGRAM_C1_PACKET")
+        if config.parallel_config.pipeline_parallel_size != 1 or any(not getattr(envs, key) for key in required):
+            raise ValueError(
+                "TP4 continuation requires fixed device inputs, device Engram and the complete prefix contract")
+        return
     if not envs.VLLM_HPU_DSV41_GRAPH_REPLAY or not envs.VLLM_HPU_DSV41_DIRECT_TOKEN_IDS:
         raise ValueError("V4.1 V2 requires native graph replay and direct device token inputs")
     if (envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX
@@ -62,8 +88,9 @@ def configure(config):
     from vllm_gaudi.entrypoints.deepseek_v41 import prepare_native_libraries
     prepare_native_libraries()
     parallel, cache = config.parallel_config, config.cache_config
-    if (parallel.tensor_parallel_size, parallel.pipeline_parallel_size, parallel.data_parallel_size) != (2, 2, 1):
-        raise ValueError("The V4.1 prepared profile requires TP2 x PP2, DP1")
+    if (parallel.data_parallel_size != 1
+            or (parallel.tensor_parallel_size, parallel.pipeline_parallel_size) not in ((2, 2), (4, 1))):
+        raise ValueError("The V4.1 prepared profile requires TP2 x PP2 or TP4 x PP1, DP1")
     if not 1 <= config.model_config.max_model_len <= 1048576:
         raise ValueError("V4.1 supports context lengths up to the checkpoint's 1M limit")
     if cache.enable_prefix_caching:
@@ -88,6 +115,15 @@ def configure(config):
     elif spec is not None:
         raise ValueError("Enable VLLM_HPU_DSV41_DSPARK for the integrated draft")
     validate_v2(config)
+    if is_tp4(config):
+        from vllm_gaudi.entrypoints.deepseek_v41 import _TP4_FORCE_DISABLED
+        if envs.VLLM_HPU_DSV41_DSPARK or spec is not None:
+            raise ValueError("V4.1 TP4 does not yet support DSpark")
+        enabled = next((name for name in _TP4_FORCE_DISABLED if getattr(envs, name, False)), None)
+        if enabled is not None:
+            raise ValueError(f"V4.1 TP4 bring-up does not support {enabled}; use the default TP4 prepared profile")
+        if envs.VLLM_HPU_DSV41_PREFILL_GROUPED_FP8:
+            raise ValueError("V4.1 TP4 does not yet support grouped FP8 prefill")
     if config.scheduler_config.async_scheduling and not uses_v2(config):
         raise ValueError("V4.1 PP verify commits currently require --no-async-scheduling")
     if config.use_v2_model_runner and not uses_v2(config):

@@ -342,3 +342,25 @@ def engram_update(residual, kv, q_weight, k_weight, active_mask, eps=1e-20):
     gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
     gate = gate.masked_fill(~active_mask.unsqueeze(-1), 0)
     return (h + gate.unsqueeze(-1) * value.unsqueeze(1)).to(residual.dtype)
+
+
+@prefill_function_region
+def _prefill_engram_tile(residual, kv, q_weight, k_weight, active_mask, eps):
+    return engram_update(residual, kv, q_weight, k_weight, active_mask, eps)
+
+
+def prefill_engram_update(residual, kv, q_weight, k_weight, active_mask, eps=1e-20):
+    """Bound row-independent gate/update intermediates after the full GEMM.
+
+    Preserve every FP32 reduction and the final BF16 boundary. Token rows do
+    not interact here; the scheduler and projection still own the full chunk.
+    """
+    tile = 512
+    if residual.shape[0] <= tile:
+        return _prefill_engram_tile(residual, kv, q_weight, k_weight, active_mask, eps)
+    output = torch.empty_like(residual)
+    for start in range(0, residual.shape[0], tile):
+        stop = min(start + tile, residual.shape[0])
+        output[start:stop].copy_(_prefill_engram_tile(residual[start:stop], kv[start:stop], q_weight, k_weight,
+                                                    active_mask[start:stop], eps))
+    return output

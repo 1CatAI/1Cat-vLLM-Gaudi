@@ -4,12 +4,20 @@ import json
 import math
 from pathlib import Path
 
-from vllm_gaudi.ops.deepseek_v41_expert_n256 import FINGERPRINT, LAYOUT
+from vllm_gaudi.ops.deepseek_v41_expert_n256 import COMPACT_FINGERPRINT, COMPACT_LAYOUT, FINGERPRINT, LAYOUT
 from vllm_gaudi.ops.deepseek_v41_fp8 import FINGERPRINT as QUANTIZATION_FINGERPRINT
 from vllm_gaudi.ops.deepseek_v41_weights import canonical_hash, file_hash, read_header
 
 
-def runtime_specs(shard):
+def runtime_layout(shard, *, compact_scales=None):
+    if compact_scales is None:
+        compact_scales = shard.manifest.get("tensor_parallel_size", 2) == 4
+    return (COMPACT_LAYOUT, COMPACT_FINGERPRINT) if compact_scales else (LAYOUT, FINGERPRINT)
+
+
+def runtime_specs(shard, *, compact_scales=None):
+    layout, _ = runtime_layout(shard, compact_scales=compact_scales)
+    compact_scales = layout == COMPACT_LAYOUT
     specs = {}
     for name, source in shard.catalog.items():
         if not name.startswith("layers.") or ".ffn.experts." not in name or not name.endswith("_q16"):
@@ -21,7 +29,8 @@ def runtime_specs(shard):
                 or scale.shape != (experts, blocks, stream // 8)):
             raise ValueError("Runtime N256 shard requires the original K128 expert layout")
         specs[name] = {"dtype": "I16", "shape": [experts, blocks // 2, stream * 2]}
-        specs[prefix + "_s16"] = {"dtype": "I16", "shape": [experts, blocks // 2, stream // 4]}
+        scale_words = stream // 8 + 128 if compact_scales else stream // 4
+        specs[prefix + "_s16"] = {"dtype": "I16", "shape": [experts, blocks // 2, scale_words]}
         specs[prefix + "_fp8_channel"] = {"dtype": "BF16", "shape": [experts, blocks // 2, 256]}
     if not specs:
         raise ValueError("No mainline experts in the prepared source shard")
@@ -32,9 +41,12 @@ class N256PreparedShard:
     def __init__(self, directory, shard):
         directory = Path(directory)
         manifest = json.loads((directory / "manifest.json").read_text())
-        if (manifest.get("schema_version") != 1 or manifest.get("layout") != LAYOUT
-                or manifest.get("tensor_parallel_size") != 2 or manifest.get("pipeline_parallel_size") != 2
-                or manifest.get("layout_fingerprint") != FINGERPRINT
+        self.layout = manifest.get("layout")
+        self.layout_fingerprint = canonical_hash(self.layout)
+        if (manifest.get("schema_version") != 1 or self.layout not in (LAYOUT, COMPACT_LAYOUT)
+                or manifest.get("tensor_parallel_size") != shard.manifest.get("tensor_parallel_size", 2)
+                or manifest.get("pipeline_parallel_size") != shard.manifest.get("pipeline_parallel_size", 2)
+                or manifest.get("layout_fingerprint") != self.layout_fingerprint
                 or manifest.get("quantization_fingerprint") != QUANTIZATION_FINGERPRINT
                 or manifest.get("source_manifest_sha256") != file_hash(shard.directory / "manifest.json")):
             raise ValueError("Prepared N256 source/layout/quantization fingerprint mismatch")
@@ -57,12 +69,12 @@ class N256PreparedShard:
             raise ValueError("Prepared N256 file hash mismatch")
         self.identity = stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
         self.catalog = read_header(self.path)
-        specs = runtime_specs(shard)
+        specs = runtime_specs(shard, compact_scales=self.layout == COMPACT_LAYOUT)
         if set(specs) != set(self.catalog) or any(
                 src.dtype != specs[name]["dtype"] or src.shape != tuple(specs[name]["shape"])
                 for name, src in self.catalog.items()):
             raise ValueError("Prepared N256 tensor shape/dtype/ownership mismatch")
-        self.fingerprint = canonical_hash({"layout": FINGERPRINT, "rank_sha256": record["sha256"]})
+        self.fingerprint = canonical_hash({"layout": self.layout_fingerprint, "rank_sha256": record["sha256"]})
 
     def check_identity(self):
         stat = self.path.stat()

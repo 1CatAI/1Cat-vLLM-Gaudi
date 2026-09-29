@@ -7,9 +7,11 @@ extern unsigned char _binary___deepseek_v41_prefill_index_reduce_gaudi2_o_end;
 tpc_lib_api::GlueCodeReturn DeepseekV41PrefillIndexReduceGaudi2::GetGcDefinitions(
     tpc_lib_api::HabanaKernelParams* p, tpc_lib_api::HabanaKernelInstantiation* out) {
     using namespace tpc_lib_api;
-    if (!p || !out || !p->nodeParams.nodeParams || p->nodeParams.nodeParamsSize != sizeof(int))
+    if (!p || !out || !p->nodeParams.nodeParams || p->nodeParams.nodeParamsSize != 2 * sizeof(int))
         return GLUE_FAILED;
-    const int ratio = *static_cast<const int*>(p->nodeParams.nodeParams);
+    const auto* parameters = static_cast<const int*>(p->nodeParams.nodeParams);
+    const int ratio = parameters[0], local_heads = parameters[1];
+    if (local_heads != 8 && local_heads != 16) return GLUE_INCOMPATIBLE_INPUT_SIZE;
     if (ratio != 1 && ratio != 2) return GLUE_INCOMPATIBLE_INPUT_SIZE;
     if (p->inputTensorNr != 4) return GLUE_INCOMPATIBLE_INPUT_COUNT;
     if (p->outputTensorNr != 1) return GLUE_INCOMPATIBLE_OUTPUT_COUNT;
@@ -47,8 +49,8 @@ tpc_lib_api::GlueCodeReturn DeepseekV41PrefillIndexReduceGaudi2::GetGcDefinition
     out->outputTensorAccessPattern[0].allRequired = false;
     out->outputTensorAccessPattern[0].mapping[0] = {0, 128, 0, 127};
     out->outputTensorAccessPattern[0].mapping[1] = {1, 1, 0, 0};
-    out->kernel.paramsNr = 1;
-    std::memcpy(out->kernel.scalarParams, p->nodeParams.nodeParams, sizeof(int));
+    out->kernel.paramsNr = 2;
+    std::memcpy(out->kernel.scalarParams, p->nodeParams.nodeParams, 2 * sizeof(int));
     const auto* begin = &_binary___deepseek_v41_prefill_index_reduce_gaudi2_o_start;
     const auto* end = &_binary___deepseek_v41_prefill_index_reduce_gaudi2_o_end;
     const unsigned capacity = out->kernel.elfSize;

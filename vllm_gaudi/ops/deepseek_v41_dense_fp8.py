@@ -16,6 +16,16 @@ QUANTIZATION = {
 FINGERPRINT = canonical_hash(QUANTIZATION)
 
 
+def shapes_for_tp(tp_size):
+    if tp_size not in (2, 4):
+        raise ValueError("Dense FP8 preparation requires TP2 or TP4")
+    return {"wq_b": (32768 // tp_size, 1280), "wo_b": (5120, 8192 // tp_size)}
+
+
+def quantization_for_tp(tp_size):
+    return {**QUANTIZATION, "projections": shapes_for_tp(tp_size)}
+
+
 def precision_config(path):
     data = {"version": 1, **{p: list(range(40)) for p in SHAPES}} if not path else json.loads(Path(path).read_text())
     if set(data) != {"version", *SHAPES} or data["version"] != 1:
@@ -34,7 +44,8 @@ class DenseFP8Sidecar:
     def __init__(self, directory, shard):
         directory = Path(directory)
         data = json.loads((directory / "manifest.json").read_text())
-        if (canonical_hash(data["quantization"]) != FINGERPRINT or data["quantization_fingerprint"] != FINGERPRINT
+        fingerprint = canonical_hash(quantization_for_tp(shard.tensor_parallel_size))
+        if (canonical_hash(data["quantization"]) != fingerprint or data["quantization_fingerprint"] != fingerprint
                 or data["source_manifest_sha256"] != file_hash(shard.directory / "manifest.json")):
             raise ValueError("Dense FP8 sidecar source/quantization mismatch")
         record = data["rank_files"][f"pp{shard.pp_rank}-tp{shard.tp_rank}"]
@@ -49,8 +60,8 @@ class DenseFP8Sidecar:
             raise ValueError("Dense FP8 sidecar rank ownership mismatch")
         self.catalog = read_header(self.path)
         expected = {}
-        for layer in range(shard.pp_rank * 20, shard.pp_rank * 20 + 20):
-            for projection, shape in SHAPES.items():
+        for layer in range(*shard.manifest["pp_layer_ranges"][shard.pp_rank]):
+            for projection, shape in shapes_for_tp(shard.tensor_parallel_size).items():
                 prefix = f"layers.{layer}.attn.{projection}."
                 expected[prefix + "weight"] = ("U8", shape)
                 expected[prefix + "channel_scale"] = ("F32", (1, shape[0]))
@@ -59,7 +70,7 @@ class DenseFP8Sidecar:
             raise ValueError("Dense FP8 sidecar layout/ownership mismatch")
         st = self.path.stat()
         self.identity = st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns
-        self.fingerprint = canonical_hash({"quantization": FINGERPRINT, "rank_sha256": record["sha256"]})
+        self.fingerprint = canonical_hash({"quantization": fingerprint, "rank_sha256": record["sha256"]})
 
     def tensor(self, name, device):
         import torch

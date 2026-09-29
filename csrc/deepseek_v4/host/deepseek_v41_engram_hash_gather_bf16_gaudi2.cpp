@@ -139,15 +139,17 @@ DeepseekV41EngramHashGatherBf16Gaudi2::GetGcDefinitions(
             weights.geometry.maxSizes[1])) {
         return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_SIZE;
     }
-    if (!HasShape2(inDefs->outputTensors[0], kWeightWidth, kHeads) ||
+    const auto localHeads = inDefs->outputTensors[0].geometry.maxSizes[1];
+    const auto heads = localHeads == 6 ? 6 : kHeads;
+    if (!HasShape2(inDefs->outputTensors[0], kWeightWidth, heads) ||
         !HasShape2(inDefs->outputTensors[1], kHistory, 1)) {
-        SetShape2(inDefs->outputTensors[0], kWeightWidth, kHeads);
+        SetShape2(inDefs->outputTensors[0], kWeightWidth, heads);
         SetShape2(inDefs->outputTensors[1], kHistory, 1);
         return tpc_lib_api::GLUE_INCOMPATIBLE_OUTPUT_SIZE;
     }
 
     outDefs->indexSpaceRank = 1;
-    outDefs->indexSpaceGeometry[0] = kHeads;
+    outDefs->indexSpaceGeometry[0] = heads;
     MapAll(outDefs->inputTensorAccessPattern[0], 0, 0);
     MapAll(outDefs->inputTensorAccessPattern[0], 1, 0);
     MapAll(outDefs->inputTensorAccessPattern[1], 0, kHistory - 1);

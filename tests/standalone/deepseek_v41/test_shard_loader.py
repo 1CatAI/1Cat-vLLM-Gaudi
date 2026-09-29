@@ -64,3 +64,24 @@ def test_loader_rejects_weight_changes_and_wrong_manifests(tmp_path):
         PreparedV41Shard(tmp_path, 0, 0, verify_hash=True)
     with pytest.raises(ValueError, match="TP2"):
         PreparedV41Shard(tmp_path, 0, 2)
+
+
+@pytest.mark.parametrize("tp,pp,ranges", ((4, 2, [[0, 20], [20, 40]]), (2, 1, [[0, 40]])))
+def test_loader_rejects_unimplemented_topologies(tmp_path, tp, pp, ranges):
+    make_checkpoint(tmp_path)
+    path = tmp_path / "manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest.update(tensor_parallel_size=tp, pipeline_parallel_size=pp, pp_layer_ranges=ranges)
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="topology"):
+        PreparedV41Shard(tmp_path, 0, 0)
+
+
+def test_loader_rejects_tp4_manifest_bound_to_tp2_plan(tmp_path):
+    make_checkpoint(tmp_path)
+    path = tmp_path / "manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest.update(tensor_parallel_size=4, pipeline_parallel_size=1, pp_layer_ranges=[[0, 40]])
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="tensor_parallel_size mismatch"):
+        PreparedV41Shard(tmp_path, 0, 0)

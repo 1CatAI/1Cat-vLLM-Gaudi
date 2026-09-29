@@ -70,12 +70,18 @@ def restore_n256_mxfp4_u8(q16: torch.Tensor) -> torch.Tensor:
 
 
 def restore_n256_scale_u8(planes: torch.Tensor) -> torch.Tensor:
-    """Extract the original E8M0 plane retained beside N256 FP8 offsets."""
-    if planes.dtype != torch.int16 or planes.ndim != 3 or planes.shape[-1] % 1024:
-        raise ValueError("N256 scale planes must be I16 [E,N/256,K*8]")
+    """Extract the original E8M0 bytes from either supported N256 scale format."""
+    if planes.dtype != torch.int16 or planes.ndim != 3:
+        raise ValueError("N256 scale planes must be rank-three I16")
     experts, blocks, stream = planes.shape
-    k = stream // 8
-    original = _i16_little_endian_bytes(planes).reshape(experts, blocks, k // 32, 512)[..., :256]
+    if stream > 128 and stream % 512 == 128:
+        k = (stream - 128) // 4
+        original = _i16_little_endian_bytes(planes).reshape(experts, blocks, k // 32 + 1, 256)[..., :-1, :]
+    elif stream > 0 and stream % 1024 == 0:
+        k = stream // 8
+        original = _i16_little_endian_bytes(planes).reshape(experts, blocks, k // 32, 512)[..., :256]
+    else:
+        raise ValueError("N256 scale planes must preserve complete K128 groups")
     return (original.reshape(experts, blocks, k // 32, 2, 128)
             .permute(0, 1, 3, 4, 2).reshape(experts, blocks * 256, k // 32).contiguous())
 

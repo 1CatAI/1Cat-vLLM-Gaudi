@@ -91,6 +91,66 @@ def recipe_source_hashes(source_hashes):
     }
 
 
+def configure_trace_artifacts(environment, evidence, *, dump_plans, enable_profiler):
+    """Generate symbols at compilation time, before any profiler acquisition."""
+    if dump_plans:
+        environment["VLLM_HPU_TP2_PLAN_DUMP_DIR"] = str(evidence / "plans")
+        environment["GRAPH_VISUALIZATION"] = "1"
+        environment["GRAPH_VISUALIZATION_DIR"] = str(evidence / "graphs")
+    if enable_profiler:
+        environment["VLLM_TORCH_PROFILER_DIR"] = str(evidence / "traces")
+        # Synapse omits recipe debug nodes when this is false during compile.
+        # Starting the profiler later cannot recover them from cached recipes.
+        environment["ENABLE_PROFILER"] = "true"
+        # Kineto's HPU source rejects HABANA_PROFILE=0. Enable the SDK in
+        # API-controlled mode before importing the bridge; start_disabled
+        # keeps startup and speed requests outside the acquisition.
+        environment["HABANA_PROFILE"] = "1"
+        if not environment.get("HABANA_PROF_CONFIG"):
+            config = {
+                "Plugins": [
+                    {"enable": True, "lib": "libhost_profiler.so", "name": "HostProfiler", "values": {
+                        "api_group": {name: {"value": True} for name in ("HCCL", "HLTHUNK", "SYNAPSE")},
+                        "start_disabled": {"value": True}}},
+                    {"enable": True, "lib": "libhw_trace.so", "name": "HwTrace", "values": {
+                        "generalOptions": {"profilePhase": {"value": "profileApi"},
+                                           "traceBufferSize": {"value": "0x80000000"}},
+                        "parseOptions": {"addFuserMetadata": {"value": False},
+                                         "showNullDescs": {"value": False}}}},
+                ]
+            }
+            if environment.get("VLLM_HPU_DSV41_RAW_TRACE") == "1":
+                environment["HABANA_PROFILE_WRITE_HLTV"] = "1"
+                config["GeneralSettings"] = {"values": {
+                    "addPid": {"value": True}, "outdir": {"value": str(evidence / "raw")},
+                    "session": {"value": "v41_tp4"}}}
+                host = config["Plugins"][0]["values"]
+                host["api_group"]["HLTHUNK"]["value"] = False
+                host["api_group"]["SCAL"] = {"value": True}
+                if environment.get("VLLM_HPU_DSV41_RAW_SCOPE_ONLY") == "1":
+                    # Preserve collective API boundaries; the previous capture
+                    # already contains full Synapse/SCAL and CPU operator logs.
+                    host["api_group"]["SCAL"]["value"] = False
+                    host["api_group"]["SYNAPSE"]["value"] = False
+                host["performance_mode"] = {"value": True}
+                host["output"] = {name: {"value": name == "hltv"} for name in ("hltv", "json", "csv")}
+                hardware = config["Plugins"][1]["values"]
+                hardware["generalOptions"].update(arch={"value": "gaudi2"}, traceBufferLocation={"value": "host"})
+                hardware["parseOptions"].update(
+                    skipParse={"value": True},
+                    outputPerInvocation={name: {"value": name in ("hltv", "hltvWithHost")}
+                                         for name in ("binary", "csv", "dbgInfo", "hltv", "hltvWithHost", "json", "text")})
+            config_path = evidence / "profiler-config.json"
+            config_path.write_text(json.dumps(config, indent=2) + "\n")
+            environment["HABANA_PROF_CONFIG"] = str(config_path)
+    identity = {key: environment.get(key, "0") for key in
+                ("ENABLE_PROFILER", "GRAPH_VISUALIZATION", "HABANA_PROFILE")}
+    if enable_profiler:
+        identity["profiler_config_sha256"] = hashlib.sha256(
+            Path(environment["HABANA_PROF_CONFIG"]).read_bytes()).hexdigest()
+    return identity
+
+
 def acquire(lock_dir, count, requested_modules=None, secondary_lock_dirs=()):
     held, selected = [], []
     try:
@@ -159,6 +219,8 @@ def main():
                         type=Path,
                         help="Additional shared module-lease namespaces used by other workers")
     parser.add_argument("--runtime-profile", required=True, type=Path)
+    parser.add_argument("--engine-source", type=Path,
+                        help="Use and fingerprint an isolated normal vLLM engine checkout")
     parser.add_argument("--source-snapshot",
                         type=Path,
                         help="Run an immutable archived Python source snapshot for a controlled comparison")
@@ -177,6 +239,12 @@ def main():
                         help="Register profiler control for an explicit trace")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    # The child runs inside the immutable source snapshot, so environment
+    # and artifact paths must not depend on the caller's working directory.
+    args.evidence = args.evidence.resolve()
+    args.runtime_profile = args.runtime_profile.resolve()
+    args.lock_dir = args.lock_dir.resolve()
+    args.secondary_lock_dir = [path.resolve() for path in args.secondary_lock_dir]
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("A normal model/check command is required after --")
@@ -260,10 +328,8 @@ def main():
                    DSV41_RUNTIME_PROFILE=str(args.evidence / "runtime-profile.json"))
         env.pop("VLLM_HPU_TP2_PLAN_DUMP_DIR", None)
         env.pop("VLLM_TORCH_PROFILER_DIR", None)
-        if args.dump_plans:
-            env["VLLM_HPU_TP2_PLAN_DUMP_DIR"] = str(args.evidence / "plans")
-        if args.enable_profiler:
-            env["VLLM_TORCH_PROFILER_DIR"] = str(args.evidence / "traces")
+        instrumentation = configure_trace_artifacts(env, args.evidence, dump_plans=args.dump_plans,
+                                                    enable_profiler=args.enable_profiler)
         if env.get("GRAPH_VISUALIZATION") == "1":
             env["GRAPH_VISUALIZATION_DIR"] = str(args.evidence / "graphs")
         record["environment"] = {
@@ -271,7 +337,8 @@ def main():
             for key, value in env.items()
             if key.startswith(("HABANA_", "HLS_", "PT_HPU_", "VLLM_", "HCL_", "HCCL_",
                                "DSV41_")) or key in ("LD_LIBRARY_PATH", "LD_PRELOAD", "GC_KERNEL_PATH",
-                                                     "RUNTIME_SCALE_PATCHING")
+                                                     "RUNTIME_SCALE_PATCHING", "ENABLE_PROFILER",
+                                                     "GRAPH_VISUALIZATION", "GRAPH_VISUALIZATION_DIR")
         }
         root = Path(__file__).resolve().parents[1]
         source_root = args.source_snapshot.resolve() if args.source_snapshot else root
@@ -292,6 +359,11 @@ def main():
         # or mix newly imported modules into an already loaded generation.
         execution_root = (args.evidence / "source").resolve()
         paths = [item for item in env.get("PYTHONPATH", "").split(os.pathsep) if item and Path(item).resolve() != root]
+        if args.engine_source:
+            engine_source = args.engine_source.resolve()
+            if not (engine_source / "vllm/__init__.py").is_file():
+                raise RuntimeError("The selected engine checkout is incomplete")
+            paths.insert(0, str(engine_source))
         env["PYTHONPATH"] = os.pathsep.join((str(execution_root), *paths))
         record["execution_source_root"] = str(execution_root)
         record["environment"]["PYTHONPATH"] = env["PYTHONPATH"]
@@ -302,7 +374,9 @@ def main():
         else:
             (args.evidence / "source.patch").write_bytes(subprocess.check_output(["git", "diff", "HEAD"], cwd=root))
         import importlib.util
-        engine = Path(importlib.util.find_spec("vllm").origin).resolve().parents[1]
+        engine = (args.engine_source.resolve() if args.engine_source else
+                  Path(importlib.util.find_spec("vllm").origin).resolve().parents[1])
+        record["engine_source_root"] = str(engine)
         engine_revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=engine, text=True, capture_output=True)
         record["engine_commit"] = engine_revision.stdout.strip() if engine_revision.returncode == 0 else None
         engine_patch = (subprocess.check_output(["git", "diff", "HEAD"], cwd=engine)
@@ -329,12 +403,13 @@ def main():
             native_dir = Path(env.get("VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR", root / "vllm_gaudi/lib"))
             native_build = native_dir / "deepseek_v4_build.json"
             cache_identity = {
-                "schema": 2,
+                "schema": 4,
                 "source": recipe_source_hashes(record["source_hashes"]),
                 "engine": record["engine_commit"],
                 "engine_patch": record["engine_patch_sha256"],
                 "engine_sources": record["engine_sources_sha256"],
                 "runtime": profile,
+                "instrumentation": instrumentation,
                 "command": command,
                 "model_manifests": model_manifests,
                 "native_build": hashlib.sha256(native_build.read_bytes()).hexdigest()
@@ -348,7 +423,7 @@ def main():
             env["PT_HPU_RECIPE_CACHE_CONFIG"] = f"{cache / cache_rank},false,8192,false"
             record["environment"]["PT_HPU_RECIPE_CACHE_CONFIG"] = env["PT_HPU_RECIPE_CACHE_CONFIG"]
             record["recipe_cache_identity"] = fingerprint
-            record["recipe_cache_identity_schema"] = 2
+            record["recipe_cache_identity_schema"] = 4
         process = None
         launch_cpus = set(mains)
         launch_cpus.update(control_cpus)

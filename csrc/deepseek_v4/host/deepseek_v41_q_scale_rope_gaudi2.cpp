@@ -17,12 +17,12 @@ tpc_lib_api::GlueCodeReturn DeepseekV41QScaleRopeGaudi2::GetGcDefinitions(
     if (p->outputTensorNr != 1) return GLUE_INCOMPATIBLE_OUTPUT_COUNT;
     const auto& y = p->outputTensors[0].geometry;
     if (y.dataType != DATA_BF16) return GLUE_INCOMPATIBLE_DATA_TYPE;
-    if (y.dims != 2 || y.maxSizes[0] != 16384 || y.maxSizes[1] != 1) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+    if (y.dims != 2 || (y.maxSizes[0] != 8192 && y.maxSizes[0] != 16384) || y.maxSizes[1] != 1) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
     for (int i = 0; i < 5; ++i) {
         const auto& x = p->inputTensors[i].geometry;
         if (x.dataType != (i == 3 ? DATA_I32 : DATA_F32)) return GLUE_INCOMPATIBLE_DATA_TYPE;
         if (x.dims != (i == 3 ? 1u : 2u) ||
-            x.maxSizes[0] != (i < 2 ? 16384u : i == 4 ? 64u : 1u) ||
+            x.maxSizes[0] != (i < 2 ? y.maxSizes[0] : i == 4 ? 64u : 1u) ||
             (i == 4 ? (!x.maxSizes[1] || x.maxSizes[1] > 1048576u) :
              (i != 3 && x.maxSizes[1] != 1u))) return GLUE_INCOMPATIBLE_INPUT_SIZE;
         if (i == 4) {
@@ -35,7 +35,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41QScaleRopeGaudi2::GetGcDefinitions(
         map(out->inputTensorAccessPattern[i], 0, i < 2 ? 512 : 0, i < 2 ? 511 : i == 4 ? 63 : 0);
         if (i != 3) map(out->inputTensorAccessPattern[i], 1, 0, 0);
     }
-    out->indexSpaceRank = 1; out->indexSpaceGeometry[0] = 32;
+    out->indexSpaceRank = 1; out->indexSpaceGeometry[0] = y.maxSizes[0] / 512;
     map(out->outputTensorAccessPattern[0], 0, 512, 511);
     map(out->outputTensorAccessPattern[0], 1, 0, 0);
     const unsigned capacity = out->kernel.elfSize;

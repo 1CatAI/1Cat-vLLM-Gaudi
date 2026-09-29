@@ -14,7 +14,7 @@ HostRows = native.HostRows
 NativeC1Prepare = native.NativeC1Prepare
 
 
-def fixture(tmp_path, tp, width=256, overflow=False):
+def fixture(tmp_path, tp, width=256, overflow=False, tp_size=2):
     layout = EngramHashLayout.from_config({
         "engram_layer_ids": [1, 14], "engram_num_embeddings": [10000, 10000],
         "engram_max_ngram_size": 4, "engram_n_heads": 8, "engram_compressed_vocab_size": 8,
@@ -25,7 +25,7 @@ def fixture(tmp_path, tp, width=256, overflow=False):
     state = EngramTokenHistory(layout, np.arange(16) % 8)
     tables, sources, first, last = [], [], [], []
     for index, layer in enumerate(layout.layer_ids):
-        shard = layout.head_shard(layer, tp)
+        shard = layout.head_shard(layer, tp, tp_size)
         start, stop = shard["row_start"], shard["row_stop"]
         rows = stop
         weights = np.arange(rows * width, dtype=np.uint8).reshape(rows, width)
@@ -38,16 +38,17 @@ def fixture(tmp_path, tp, width=256, overflow=False):
         sources.append((weights, scales))
         first.append(shard["head_start"])
         last.append(shard["head_stop"])
-    targets = [[np.full((1, 12, width + width // 32), 197, dtype=np.uint8) for _ in range(2)] for _ in range(3)]
+    targets = [[np.full((1, 24 // tp_size, width + width // 32), 197, dtype=np.uint8)
+                for _ in range(2)] for _ in range(3)]
     args = (state.token_map, layout.multipliers, layout.primes, layout.offsets,
             np.array(first, dtype=np.int64), np.array(last, dtype=np.int64), state.pad_id, tables, targets)
     return state, NativeC1Prepare(*args), targets, sources, args
 
 
-@pytest.mark.parametrize("tp", [0, 1])
+@pytest.mark.parametrize("tp_size,tp", [(2, 0), (2, 1), (4, 0), (4, 1), (4, 2), (4, 3)])
 @pytest.mark.parametrize("width,overflow", [(32, False), (256, True)])
-def test_exact_native_hash_bytes_requests_images_and_prefill(tmp_path, tp, width, overflow):
-    state, native, targets, sources, args = fixture(tmp_path, tp, width, overflow)
+def test_exact_native_hash_bytes_requests_images_and_prefill(tmp_path, tp_size, tp, width, overflow):
+    state, native, targets, sources, args = fixture(tmp_path, tp, width, overflow, tp_size)
     reference = EngramTokenHistory(state.layout, state.token_map)
     generation = 0
     # C1 and ordinary prefill share one committed history. Rejected prefill

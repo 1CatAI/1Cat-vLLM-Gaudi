@@ -2,14 +2,14 @@
 // Retain BF16 head products and both TP partial-sum boundaries while keeping
 // the relu, products and head accumulators in registers.
 static inline float128 sum_heads(tensor scores, bfloat128 weights, int token,
-                                 int tile, int first_head) {
+                                 int tile, int first_head, int local_heads) {
     float128 total;
     total.v1 = 0;
     total.v2 = 0;
     // Fixed head groups remove per-head predication. Unrolling exposes the
     // independent SRAM loads while preserving the ordered FP32 recurrence.
     #pragma unroll (4)
-    for (int offset = 0; offset < 16; ++offset) {
+    for (int offset = 0; offset < local_heads; ++offset) {
         const int head = first_head + offset;
         const int5 score_at = {tile * 128, head, token, 0, 0};
         // SHUFFLE directions select bytes within each replicated dual group.
@@ -27,7 +27,7 @@ static inline float128 sum_heads(tensor scores, bfloat128 weights, int token,
 }
 
 void main(tensor scores, tensor weights, tensor positions, tensor rows,
-          tensor output, int ratio) {
+          tensor output, int ratio, int local_heads) {
     const int5 begin = get_index_space_offset();
     const int5 end = begin + get_index_space_size();
     for (int token = begin[1]; token < end[1]; ++token) {
@@ -38,11 +38,18 @@ void main(tensor scores, tensor weights, tensor positions, tensor rows,
         gains = v_bf16_mov_dual_group_all_b(gains, 0xffffffff, 0, 0, 0, 0,
                                            MkWrA(3, 3, 3, 3), gains);
         for (int tile = begin[0]; tile < end[0]; ++tile) {
-            const bfloat128 a = convert_float128_to_bfloat128(
-                sum_heads(scores, gains, token, tile, 0), SW_RHNE);
-            const bfloat128 b = convert_float128_to_bfloat128(
-                sum_heads(scores, gains, token, tile, 16), SW_RHNE);
-            const float128 reduced = convert_bfloat128_to_float128(v_bf16_add_b(a, b), SW_LINEAR);
+            float128 total = {0};
+            for (int head = 0; head < 32; head += local_heads) {
+                const bfloat128 partial = convert_float128_to_bfloat128(
+                    sum_heads(scores, gains, token, tile, head, local_heads), SW_RHNE);
+                // Invert the packed BF16 conversion in the same lane layout.
+                // Linearize only once, when storing the final F32 tensor.
+                const float128 rounded = convert_bfloat128_to_float128(partial, 0);
+                total.v1 = v_f32_add_b(total.v1, rounded.v1);
+                total.v2 = v_f32_add_b(total.v2, rounded.v2);
+            }
+            const bfloat128 combined = convert_float128_to_bfloat128(total, SW_RHNE);
+            const float128 reduced = convert_bfloat128_to_float128(combined, SW_LINEAR);
             const int5 low_row = {tile * 128, 0, 0, 0, 0};
             const int5 high_row = {tile * 128 + 64, 0, 0, 0, 0};
             const int64 lo = v_i32_ld_tnsr_b(low_row, rows);

@@ -36,8 +36,12 @@ void main(tensor cache, tensor pages, tensor rows, tensor output,
                 bfloat128 key=0;
                 if(logical>=0 && logical<page_count*page_rows) {
                     const int page=s_i32_ld_g(gen_addr((int5){logical/page_rows},pages));
-                    const int physical=page*page_rows+logical%page_rows;
-                    if(physical>=0 && physical<cache_rows)key=index_key(cache,physical);
+                    const int offset=logical%page_rows;
+                    // Reject invalid page IDs before multiplying signed row coordinates.
+                    if(page>=0 && offset<cache_rows && page<=(cache_rows-1-offset)/page_rows) {
+                        const int physical=page*page_rows+offset;
+                        key=index_key(cache,physical);
+                    }
                 }
                 v_bf16_st_tnsr((int5){0,column,batch},output,key);
         }

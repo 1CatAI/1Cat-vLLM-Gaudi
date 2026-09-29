@@ -10,7 +10,7 @@ from vllm_gaudi.ops.deepseek_v41_expert_n256 import prepare_expert, restore_expe
 from vllm_gaudi.ops.deepseek_v41_weights import prepare_q16, prepare_s16
 
 
-@pytest.mark.parametrize("n,k", [(256, 128), (2304, 5120), (5120, 1152)])
+@pytest.mark.parametrize("n,k", [(256, 128), (2304, 5120), (5120, 1152), (1280, 5120), (5120, 640)])
 def test_repack_preserves_nibbles_scales_and_storage(n, k):
     rng = np.random.default_rng(410)
     packed = rng.integers(0, 256, (n, k // 2), dtype=np.uint8)

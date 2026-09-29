@@ -87,7 +87,7 @@ def compiled_prefill_full_selection_step(signature):
     return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
 
 
-def native_prefill_index_scores(query, weights, packed, table, positions, rows, ratio):
+def native_prefill_index_scores(query, weights, packed, table, positions, rows, ratio, local_heads=16):
     """Score one large-M shared-source tile without materialized head products.
 
     The native epilogue adapts the existing decode index reducer to explicit
@@ -96,7 +96,7 @@ def native_prefill_index_scores(query, weights, packed, table, positions, rows, 
     """
     keys = torch.ops.custom_op.custom_deepseek_v41_index_keys_gaudi2(packed, table, rows.reshape(1, -1), ratio)[0]
     return torch.ops.custom_op.custom_deepseek_v41_prefill_index_scores_gaudi2(query, weights, keys, positions, rows,
-                                                                               ratio)
+                                                                               ratio, local_heads)
 
 
 @lru_cache(maxsize=64)
@@ -106,7 +106,7 @@ def compiled_native_prefill_index_scores(signature):
     return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
 
 
-def full_prefill_sram_scores(query, weights, packed, table, positions, rows, ratio):
+def full_prefill_sram_scores(query, weights, packed, table, positions, rows, ratio, local_heads=16):
     """Bind explicit runtime data to a bounded source-tile scoring region.
 
     Tail rows carry invalid IDs, so native key loads and score masking do not
@@ -115,14 +115,14 @@ def full_prefill_sram_scores(query, weights, packed, table, positions, rows, rat
     if (query.ndim != 3 or query.shape[1:] != (32, 128) or not 1 <= query.shape[0] <= 8192
             or query.dtype != torch.bfloat16 or weights.dtype != torch.bfloat16 or rows.ndim != 1
             or not 1 <= rows.numel() <= INDEX_KEY_TILE or ratio not in (1, 2)):
-        raise ValueError("Full prefill SRAM scoring requires TP2 BF16 queries and a bounded source tile")
+        raise ValueError("Full prefill SRAM scoring requires gathered BF16 queries and a bounded source tile")
     columns = rows.numel()
     rows = rows.to(torch.int32)
     rows = (torch.nn.functional.pad(rows, (0, (-columns) % 128), value=-1) if columns % 128 else rows.clone())
     query, weights = query.contiguous(), weights.contiguous()
     positions = positions.to(torch.int32).contiguous()
-    signature = (tuple(query.shape), tuple(rows.shape), tuple(packed.shape), tuple(table.shape), ratio)
-    output = compiled_native_prefill_index_scores(signature)(query, weights, packed, table, positions, rows, ratio)
+    signature = (tuple(query.shape), tuple(rows.shape), tuple(packed.shape), tuple(table.shape), ratio, local_heads)
+    output = compiled_native_prefill_index_scores(signature)(query, weights, packed, table, positions, rows, ratio, local_heads)
     return output[:, :columns]
 
 
@@ -134,14 +134,15 @@ def full_prefill_index_selection(query,
                                  ratio,
                                  source_rows,
                                  publish_candidates,
-                                 visible_rows=None):
+                                 visible_rows=None,
+                                 tensor_parallel_size=2):
     """Select independent query rows with the existing streamed tie order."""
     from types import SimpleNamespace
     from vllm_gaudi.ops.deepseek_v41_paged_attention import PagedCSA2Attention
 
     owner = SimpleNamespace(ratio=ratio)
     owner._merge_topk = prefill_merge_topk
-    owner._scores = lambda p, rows, q, w: full_prefill_sram_scores(q, w, packed, table, p, rows, ratio)
+    owner._scores = lambda p, rows, q, w: full_prefill_sram_scores(q, w, packed, table, p, rows, ratio, 32 // tensor_parallel_size)
     rows = torch.arange(source_rows, device=query.device, dtype=torch.int32)
     selected, scores, blocks = PagedCSA2Attention._stream_topk(owner,
                                                                positions,
@@ -169,7 +170,8 @@ def tp_full_prefill_index_selection(query,
                                     publish_candidates,
                                     tp_rank,
                                     all_gather,
-                                    visible_rows=None):
+                                    visible_rows=None,
+                                 tensor_parallel_size=2):
     """Partition replicated index work; restore row order before consumption.
 
     Query heads have already been gathered. Each rank evaluates complete head
@@ -177,10 +179,10 @@ def tp_full_prefill_index_selection(query,
     Padding is local to selection and never reaches a KV or history writer.
     """
     tokens = query.shape[0]
-    if (tp_rank not in (0, 1) or tokens < 1 or positions.shape != (tokens, )
+    if (not 0 <= tp_rank < tensor_parallel_size or tokens < 1 or positions.shape != (tokens, )
             or not 512 <= source_rows <= SHARED_INDEX_MAX_ROWS):
-        raise ValueError("Index query partition requires TP2 and a complete query interval")
-    local_tokens = (tokens + 1) // 2
+        raise ValueError("Index query partition requires TP2/TP4 and a complete query interval")
+    local_tokens = (tokens + tensor_parallel_size - 1) // tensor_parallel_size
     start, stop = tp_rank * local_tokens, min((tp_rank + 1) * local_tokens, tokens)
     local_q = query[start:stop].clone()
     local_w = weights[start:stop].clone()
@@ -191,7 +193,7 @@ def tp_full_prefill_index_selection(query,
         local_w = torch.nn.functional.pad(local_w, (0, 0, 0, padding))
         local_p = torch.nn.functional.pad(local_p, (0, padding), value=-1)
     selected, blocks = full_prefill_index_selection(local_q, local_w, packed, table, local_p, ratio, source_rows,
-                                                    publish_candidates, visible_rows)
+                                                    publish_candidates, visible_rows, tensor_parallel_size)
     packet = torch.cat((selected, blocks), -1) if publish_candidates else selected
     _record_query_partition("full", tokens, local_tokens, packet)
     gathered = all_gather(packet.contiguous(), 0)[:tokens]
@@ -207,23 +209,24 @@ def prefill_reindex_selection(query,
                               ratio,
                               source_rows,
                               native_gather=True,
-                              native_scores=True):
+                              native_scores=True,
+                              tensor_parallel_size=2):
     """Evaluate a row interval with the production bounded Reindex recipes."""
     signature = (tuple(packed.shape), tuple(table.shape), ratio, source_rows)
     keys = compiled_decode_shared_index_keys(signature)(packed, table, ratio, source_rows)
     from vllm_gaudi import envs
     if (query.device.type == "hpu" and native_gather and native_scores and blocks.shape[1] >= 64
-            and envs.VLLM_HPU_DSV41_PREFILL_NATIVE_PLAN):
+            and envs.VLLM_HPU_DSV41_PREFILL_NATIVE_PLAN and tensor_parallel_size == 2):
         from vllm_gaudi.ops.deepseek_v41_prefill_reindex_plan import prepared_reindex_selection
         return prepared_reindex_selection(query, weights, keys, positions, blocks, ratio)
     outputs = []
     for start in range(0, query.shape[0], 128):
         stop = min(start + 128, query.shape[0])
         current = blocks[start:stop].clone()
-        signature = (stop - start, tuple(current.shape), source_rows, ratio, 16, native_gather, native_scores)
+        signature = (stop - start, tuple(current.shape), source_rows, ratio, 32 // tensor_parallel_size, native_gather, native_scores)
         outputs.append(
             compiled_decoded_reindex(signature)(query[start:stop].clone(), weights[start:stop].clone(), keys,
-                                                positions[start:stop].clone(), current, ratio, 16, native_gather,
+                                                positions[start:stop].clone(), current, ratio, 32 // tensor_parallel_size, native_gather,
                                                 native_scores))
     return torch.cat(outputs, 0)
 
@@ -239,12 +242,13 @@ def tp_prefill_reindex_selection(query,
                                  tp_rank,
                                  all_gather,
                                  native_gather=True,
-                                 native_scores=True):
+                                 native_scores=True,
+                              tensor_parallel_size=2):
     """Split independent candidate-slot selection and gather only final IDs."""
     tokens = query.shape[0]
-    if tp_rank not in (0, 1) or tokens < 1 or blocks.shape[0] != tokens:
-        raise ValueError("Reindex query partition requires TP2 and matching candidate rows")
-    local_tokens = (tokens + 1) // 2
+    if not 0 <= tp_rank < tensor_parallel_size or tokens < 1 or blocks.shape[0] != tokens:
+        raise ValueError("Reindex query partition requires TP2/TP4 and matching candidate rows")
+    local_tokens = (tokens + tensor_parallel_size - 1) // tensor_parallel_size
     start, stop = tp_rank * local_tokens, min((tp_rank + 1) * local_tokens, tokens)
     local_q, local_w, local_p, local_b = (value[start:stop].clone() for value in (query, weights, positions, blocks))
     padding = local_tokens - (stop - start)
@@ -254,7 +258,7 @@ def tp_prefill_reindex_selection(query,
         local_p = torch.nn.functional.pad(local_p, (0, padding), value=-1)
         local_b = torch.nn.functional.pad(local_b, (0, 0, 0, padding), value=-1)
     selected = prefill_reindex_selection(local_q, local_w, packed, table, local_p, local_b, ratio, source_rows,
-                                         native_gather, native_scores)
+                                         native_gather, native_scores, tensor_parallel_size)
     _record_query_partition("reindex", tokens, local_tokens, selected)
     return all_gather(selected.contiguous(), 0)[:tokens]
 
@@ -293,7 +297,8 @@ def _weighted_index_scores(query, weights, keys, local_heads, preserve_rounding)
 
     scores = boundary(scores)
     scores = boundary(scores.relu() * weights.unsqueeze(-1))
-    partial = boundary(scores.reshape(query.shape[0], 2, local_heads, -1).sum(2))
+    tp_size = query.shape[1] // local_heads
+    partial = boundary(scores.reshape(query.shape[0], tp_size, local_heads, -1).sum(2))
     return boundary(partial.sum(1)).float()
 
 
@@ -323,11 +328,11 @@ def decoded_reindex(query,
         if count % 128:
             current = torch.cat((current, current.new_zeros((128 - count % 128, 128))), 0)
         if native_scores:
-            if local_heads != 16 or query.shape[1:] != (32, 128):
-                raise ValueError("Native Reindex scoring requires the TP2 head contract")
+            if local_heads not in (8, 16) or query.shape[1:] != (32, 128):
+                raise ValueError("Native Reindex scoring requires the TP2/TP4 head contract")
             rows = torch.arange(start, start + current.shape[0], device=query.device, dtype=torch.int32)
             scores = torch.ops.custom_op.custom_deepseek_v41_prefill_index_scores_gaudi2(
-                query, weights, current, positions, rows, ratio)
+                query, weights, current, positions, rows, ratio, local_heads)
         else:
             scores = _weighted_index_scores(query, weights, current, local_heads, True)
         common.append(scores[:, :count])
@@ -403,7 +408,8 @@ def index_scores(query,
 
     scores = boundary(scores)
     scores = boundary(scores.relu() * weights.unsqueeze(-1))
-    partial = boundary(scores.reshape(query.shape[0], 2, local_heads, -1).sum(2))
+    tp_size = query.shape[1] // local_heads
+    partial = boundary(scores.reshape(query.shape[0], tp_size, local_heads, -1).sum(2))
     reduced = boundary(partial.sum(1)).float()
     visible = ((positions + 1) // ratio).unsqueeze(-1)
     valid = (rows >= 0) & (rows < visible)

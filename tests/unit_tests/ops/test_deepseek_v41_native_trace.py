@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """A successful stop API must not be reported as a successful empty capture."""
 import json
+import gzip
 import os
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -42,6 +44,7 @@ def configure(monkeypatch, tmp_path, *, skip_parse=True):
     monkeypatch.setenv("HABANA_PROFILE_WRITE_HLTV", "1")
     monkeypatch.setattr(trace, "_active", False)
     monkeypatch.setattr(trace, "_annotations_supported", None)
+    monkeypatch.setattr(trace, "_scope_recorder", None)
     monkeypatch.setattr(trace.torch.hpu, "synchronize", lambda: None)
     return tmp_path / f"test_{os.getpid()}.hltv"
 
@@ -126,3 +129,96 @@ def test_unsupported_custom_measurement_does_not_abort_kernel_capture(monkeypatc
         calls.append("second kernel")
     assert calls == ["first kernel", "annotation", "second kernel"]
     assert trace._annotations_supported is False
+
+
+def test_raw_capture_retains_cpu_scopes_and_clock_alignment_without_hpu_expansion(monkeypatch, tmp_path):
+    output = configure(monkeypatch, tmp_path)
+    monkeypatch.setattr(trace, "_torch_active", False)
+    calls = []
+
+    def publish(*_):
+        output.write_bytes(b"raw fixture")
+        calls.append("publish")
+        return 0
+
+    api = SimpleNamespace(synProfilerQueryRequiredMemory=lambda *_: 0,
+                          synProfilerStart=lambda *_: 0, synProfilerStop=lambda *_: calls.append("stop") or 0,
+                          synProfilerGetTrace=publish, synProfilerGetCurrentTimeNS=lambda *_: 0)
+    monkeypatch.setattr(trace, "_api", lambda: api)
+    captured = {}
+    profiler = SimpleNamespace(start=lambda: calls.append("cpu_start"), stop=lambda: calls.append("cpu_stop"))
+    monkeypatch.setattr(trace.torch.profiler, "profile", lambda **kw: captured.update(kw) or profiler)
+    monkeypatch.setattr(trace.torch.profiler, "tensorboard_trace_handler", lambda *a, **kw: None)
+
+    @contextmanager
+    def record(label):
+        calls.append(label)
+        yield
+
+    monkeypatch.setattr(trace.torch.profiler, "record_function", record)
+    recorder = trace.NativeTrace(cpu_trace_dir=tmp_path / "cpu")
+    recorder.start()
+    with trace.scope("complete consumer"):
+        pass
+    recorder.stop()
+    assert captured["activities"] == [trace.torch.profiler.ProfilerActivity.CPU]
+    assert calls == ["cpu_start", "complete consumer", "stop", "publish", "cpu_stop"]
+    assert len(recorder.metadata["clock_samples"]) == 2
+    assert list((tmp_path / "cpu").glob("raw-capture-*.json"))
+    assert not trace._torch_active and not trace._active
+
+
+@pytest.mark.parametrize("wall_step_ns", [0, -500_000_000, 700_000_000])
+def test_scope_only_capture_preserves_nested_consumer_boundaries_without_cpu_profiler(monkeypatch, tmp_path,
+                                                                                     wall_step_ns):
+    output = configure(monkeypatch, tmp_path)
+    monkeypatch.setattr(trace, "_torch_active", False)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Scope-only mode must not enable CPU operator profiling")
+
+    monkeypatch.setattr(trace.torch.profiler, "profile", forbidden)
+    monkeypatch.setattr(trace.torch.profiler, "record_function", forbidden)
+
+    def publish(*args):
+        output.write_bytes(b"raw scope fixture")
+        return 0
+
+    api = SimpleNamespace(synProfilerQueryRequiredMemory=lambda *_: 0,
+                          synProfilerStart=lambda *_: 0, synProfilerStop=lambda *_: 0,
+                          synProfilerGetTrace=publish)
+    monkeypatch.setattr(trace, "_api", lambda: api)
+    raw0, wall0 = 10_000_000, 1_790_000_000_123_000_000
+
+    def calibration(self, label):
+        delta = 1_000_000 if label == "stop" else 0
+        wall_delta = delta + (wall_step_ns if label == "stop" else 0)
+        self.clock_samples.append(dict(label=label, monotonic_raw_before_ns=raw0 + delta,
+            monotonic_raw_after_ns=raw0 + delta, wall_before_ns=wall0 + wall_delta,
+            wall_after_ns=wall0 + wall_delta, synapse_clock_ns=2 * (raw0 + delta)))
+
+    monkeypatch.setattr(trace.NativeTrace, "_clock_sample", calibration)
+    stamps = iter([raw0 + value for value in (1, 100, 200, 301)])
+    monkeypatch.setattr(trace.time, "clock_gettime_ns", lambda *_: next(stamps))
+    recorder = trace.NativeTrace(cpu_trace_dir=tmp_path / "cpu", scope_only=True)
+    recorder.start()
+    with trace.scope("producer-to-consumer"), pytest.raises(ValueError), trace.scope("failing inner"):
+        raise ValueError("test boundary")
+    recorder.stop()
+    path, = (tmp_path / "cpu").glob("*.pt.trace.json.gz")
+    with gzip.open(path, "rt") as stream:
+        saved = json.load(stream)
+    events = {row["name"]: row for row in saved["traceEvents"]}
+    assert events["producer-to-consumer"]["ts"] == 10000.001
+    assert events["producer-to-consumer"]["dur"] == .3
+    assert events["failing inner"]["dur"] == .1
+    assert recorder.metadata["cpu_trace_mode"] == "scopes_only"
+    assert saved["clockDomain"] == recorder.metadata["scope_clock_domain"] == "CLOCK_MONOTONIC_RAW"
+    assert events["NativeTrace scope-only capture"]["dur"] == 1000.
+    assert recorder.metadata["explicit_scope_count"] == 2
+    assert not trace._active and not trace._torch_active and trace._scope_recorder is None
+
+
+def test_scope_only_capture_requires_output_directory():
+    with pytest.raises(ValueError, match="output directory"):
+        trace.NativeTrace(scope_only=True)

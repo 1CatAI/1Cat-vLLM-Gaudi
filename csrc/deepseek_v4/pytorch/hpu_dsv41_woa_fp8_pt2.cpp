@@ -19,27 +19,29 @@ constexpr auto kScaleRoundtrip = "custom_deepseek_v41_woa_scale_roundtrip_gaudi2
 using Pair = std::tuple<at::Tensor, at::Tensor>;
 habana::OutputMetaDataVector meta(const at::Stack& stack, bool quant) {
     const auto x = stack.at(0).toTensor();
+    const auto groups = x.size(1);
     TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.dim() == 3 && x.size(0) >= 1 && x.size(0) <= 8192 &&
-                x.size(1) == 4 && x.size(2) == 4096, "wo_a requires BF16 [T,4,4096]");
+                (x.size(1) == 2 || x.size(1) == 4) && x.size(2) == 4096, "wo_a requires BF16 [T,G2|4,4096]");
     for (const auto& item : stack) {
         const auto t = item.toTensor();
         TORCH_CHECK(t.is_contiguous() && !t.requires_grad() && t.device() == x.device(),
                     "wo_a requires matching contiguous inference tensors");
     }
-    if (quant) return {{at::ScalarType::Float8_e4m3fn, {4, x.size(0), 4096}}, {at::kFloat, {4, x.size(0), 1}}};
+    if (quant) return {{at::ScalarType::Float8_e4m3fn, {groups, x.size(0), 4096}}, {at::kFloat, {groups, x.size(0), 1}}};
     const auto w = stack.at(1).toTensor(), scale = stack.at(2).toTensor();
-    TORCH_CHECK(w.scalar_type() == at::ScalarType::Float8_e4m3fn && w.sizes() == at::IntArrayRef({4,4096,1024}) &&
-                scale.scalar_type() == at::kFloat && scale.sizes() == at::IntArrayRef({4,1,1024}),
-                "wo_a requires prepared Gaudi2 FP8 [4,4096,1024] and F32 [4,1,1024] channel scales");
-    return {{at::kBFloat16, {x.size(0), 4096}}};
+    TORCH_CHECK(w.scalar_type() == at::ScalarType::Float8_e4m3fn && w.sizes() == at::IntArrayRef({groups,4096,1024}) &&
+                scale.scalar_type() == at::kFloat && scale.sizes() == at::IntArrayRef({groups,1,1024}),
+                "wo_a requires prepared Gaudi2 FP8 [G,4096,1024] and F32 [G,1,1024] channel scales");
+    return {{at::kBFloat16, {x.size(0), groups * 1024}}};
 }
 habana::OutputMetaDataVector rope_meta(const at::Stack& stack) {
     const auto x = stack.at(0).toTensor(), w = stack.at(1).toTensor(), scale = stack.at(2).toTensor();
+    const auto groups = x.size(1) / 8;
     const auto positions = stack.at(3).toTensor(), phase = stack.at(4).toTensor();
     TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.dim() == 3 && x.size(0) >= 1 && x.size(0) <= 8192 &&
-                x.size(1) == 32 && x.size(2) == 512, "rope wo_a requires BF16 [T,32,512]");
-    TORCH_CHECK(w.scalar_type() == at::ScalarType::Float8_e4m3fn && w.sizes() == at::IntArrayRef({4,4096,1024}) &&
-                scale.scalar_type() == at::kFloat && scale.sizes() == at::IntArrayRef({4,1,1024}),
+                (x.size(1) == 16 || x.size(1) == 32) && x.size(2) == 512, "rope wo_a requires BF16 [T,H16|32,512]");
+    TORCH_CHECK(w.scalar_type() == at::ScalarType::Float8_e4m3fn && w.sizes() == at::IntArrayRef({groups,4096,1024}) &&
+                scale.scalar_type() == at::kFloat && scale.sizes() == at::IntArrayRef({groups,1,1024}),
                 "rope wo_a requires prepared Gaudi2 FP8 weights and channel scales");
     TORCH_CHECK(positions.scalar_type() == at::kInt && positions.dim() == 1 && positions.size(0) == x.size(0) &&
                 phase.scalar_type() == at::kFloat && phase.dim() == 2 && phase.size(1) == 64,
@@ -49,13 +51,14 @@ habana::OutputMetaDataVector rope_meta(const at::Stack& stack) {
         TORCH_CHECK(t.is_contiguous() && !t.requires_grad() && t.device() == x.device(),
                     "rope wo_a requires matching contiguous inference tensors");
     }
-    return {{at::kBFloat16, {x.size(0), 4096}}};
+    return {{at::kBFloat16, {x.size(0), groups * 1024}}};
 }
 habana::OutputMetaDataVector rope_quant_meta(const at::Stack& stack) {
     const auto x = stack.at(0).toTensor(), positions = stack.at(1).toTensor();
+    const auto groups = x.size(1) / 8;
     const auto phase = stack.at(2).toTensor();
     TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.dim() == 3 && x.size(0) >= 1 && x.size(0) <= 8192 &&
-                x.size(1) == 32 && x.size(2) == 512, "rope wo_a quant requires BF16 [T,32,512]");
+                (x.size(1) == 16 || x.size(1) == 32) && x.size(2) == 512, "rope wo_a quant requires BF16 [T,H16|32,512]");
     TORCH_CHECK(positions.scalar_type() == at::kInt && positions.dim() == 1 && positions.size(0) == x.size(0) &&
                 phase.scalar_type() == at::kFloat && phase.dim() == 2 && phase.size(1) == 64,
                 "rope wo_a quant requires I32 [T] positions and F32 [L,64] phase");
@@ -64,7 +67,7 @@ habana::OutputMetaDataVector rope_quant_meta(const at::Stack& stack) {
         TORCH_CHECK(t.is_contiguous() && !t.requires_grad() && t.device() == x.device(),
                     "rope wo_a quant requires matching contiguous inference tensors");
     }
-    return {{at::ScalarType::Float8_e4m3fn, {4, x.size(0), 4096}}, {at::kFloat, {4, x.size(0), 1}}};
+    return {{at::ScalarType::Float8_e4m3fn, {groups, x.size(0), 4096}}, {at::kFloat, {groups, x.size(0), 1}}};
 }
 class Woa final : public habana::OpBackend {
     bool quant_;
@@ -83,26 +86,27 @@ public:
     void AddNode(synapse_helpers::graph& graph, const at::Stack& stack) override {
         const auto output = rope_ ? rope_meta(stack) : meta(stack, quant_);
         const auto tokens = stack.at(0).toTensor().size(0);
+        const auto groups = stack.at(0).toTensor().size(1) / (rope_ ? 8 : 1);
         if (quant_) {
             auto result = BuildNode(this, graph, {kQuant, {syn_in(0)},
-                {{{4,tokens,4096}, at::ScalarType::Float8_e4m3fn, 0}, {{4,tokens,1}, at::kFloat, 1}}});
+                {{{groups,tokens,4096}, at::ScalarType::Float8_e4m3fn, 0}, {{groups,tokens,1}, at::kFloat, 1}}});
             syn_out(0) = std::move(result.at(0)); syn_out(1) = std::move(result.at(1));
             return;
         }
         auto q = rope_
             ? BuildNode(this, graph, {kRopeQuant, {syn_in(0), syn_in(3), syn_in(4)},
-                {{{4,tokens,4096}, at::ScalarType::Float8_e4m3fn}, {{4,tokens,1}, at::kFloat}}})
+                {{{groups,tokens,4096}, at::ScalarType::Float8_e4m3fn}, {{groups,tokens,1}, at::kFloat}}})
             : BuildNode(this, graph, {kQuant, {syn_in(0)},
-                {{{4,tokens,4096}, at::ScalarType::Float8_e4m3fn}, {{4,tokens,1}, at::kFloat}}});
+                {{{groups,tokens,4096}, at::ScalarType::Float8_e4m3fn}, {{groups,tokens,1}, at::kFloat}}});
         // Prepared FP8 is already the final MME weight representation. Let
         // the compiler supply this persistent operand directly; an explicit
         // TPC byte-copy adds a second pass without changing its representation.
         synGEMMParams params{false, false};
         auto product = BuildNode(this, graph, {"batch_gemm", {q.at(0).get(), syn_in(1)},
-            {{{4,tokens,1024}, at::kFloat}}, &params, sizeof(params)});
+            {{{groups,tokens,1024}, at::kFloat}}, &params, sizeof(params)});
         auto scaled = BuildNode(this, graph, {wide_ ? kWideScale : (roundtrip_ ? kScaleRoundtrip : kScale),
             {product.at(0).get(), syn_in(2), q.at(1).get()},
-            {{{tokens,4,1024}, at::kBFloat16}}});
+            {{{tokens,groups,1024}, at::kBFloat16}}});
         syn_out(0) = ReshapeHelper(graph, scaled.at(0).get(), output.at(0).shape, at::kBFloat16, 0);
     }
 };

@@ -23,17 +23,35 @@ def union(spans):
 
 
 def symbols(inventory, recipes):
-    context = {(str(r["recipe_id"]), n["device_type"], n["full_context_id"]): n for r in recipes for n in r["nodes"]}
-    names = {(str(r["recipe_id"]), n["device_type"], n["node"], n["kernel"]): n for r in recipes for n in r["nodes"]}
+    # IDs are finite-width runtime values. Never let a colliding archived
+    # recipe silently overwrite another node contract.
+    contexts, named = collections.defaultdict(list), collections.defaultdict(list)
+    for recipe in recipes:
+        for node in recipe["nodes"]:
+            prefix = (str(recipe["recipe_id"]), node["device_type"])
+            contexts[(*prefix, node["full_context_id"])].append(node)
+            named[(*prefix, node["node"], node["kernel"].lower().replace("_", ""))].append(node)
+
+    def unambiguous(candidates):
+        return {key: values[0] for key, values in candidates.items()
+                if all(value == values[0] for value in values)}
+
+    context, names = unambiguous(contexts), unambiguous(named)
     result = {}
     for index, node in enumerate(inventory["nodes"]):
         rid = node["recipe"].split(":")[0]
         device = {"TPC": 1, "MME": 0, "DMA": 8}.get(node["engine"])
-        symbol = names.get((rid, device, node["node"], node["kernel"]))
-        if symbol is None and node["kernel"].startswith(("TPC_SPU_", "MMEH_", "DMA_")):
+        symbol = names.get((rid, device, node["node"], node["kernel"].lower().replace("_", "")))
+        if symbol is None and rid.isdigit() and node["kernel"].startswith(("TPC_SPU_", "MMEH_", "DMA_")):
             match = re.search(r" (\d+)$", node["kernel"])
             identity = int(match[1]) if match else 0
             symbol = context.get((rid, device, 0 if identity == int(rid) else identity))
+        if symbol is None and not node.get("raw_unique_node_id") and node.get("raw_context_id", "").isdigit():
+            raw_rid = rid.partition("@")[0]
+            identity = int(node["raw_context_id"])
+            if raw_rid.isdigit():
+                # Single-node recipes may encode the recipe ID as context0.
+                symbol = context.get((rid, device, 0 if identity == int(raw_rid) else identity))
         if symbol is not None:
             result[index] = symbol
     return result
@@ -67,14 +85,121 @@ def logical_replay_markers(inventory, expected):
     }
 
 
-def analyze(root, rank):
+def tp4_windows(inventory, phase, request_start_ns=None):
+    """Use real sampled-token consumers, including host submission/wait time.
+
+    Async workers publish their real completion-consumption marker separately
+    from the early sampling return. Their cadence may contain the current
+    suffix and next token's prefix; it is a throughput cycle, not a per-token
+    isolated-forward latency or a pure CPU execution span.
+    """
+    commits = []
+    asynchronous = phase == "decode" and any(row[2].startswith("v41::worker_commit::PP0::")
+                                              for row in inventory["cpu_markers"])
+    commit_name = "worker_commit" if asynchronous else "verify_and_commit"
+    for start, duration, name in inventory["cpu_markers"]:
+        match = re.fullmatch(rf"v41::{commit_name}::PP0::(prefill|decode)::P(\d+)::C(\d+)::emit([01])", name)
+        if match:
+            kind, position, count, emit = match.groups()
+            commits.append(dict(start=start, end=start + duration, phase=kind, position=int(position),
+                                count=int(count), emit=bool(int(emit))))
+    commits.sort(key=lambda item: item["start"])
+    if phase == "prefill":
+        targets = sorted(row for row in inventory["cpu_markers"] if row[2].startswith("v41::target::PP0::prefill::"))
+        completed = [item for item in commits if item["phase"] == "prefill" and item["emit"]]
+        if len(completed) != 1 or not targets:
+            raise ValueError("Prefill capture must contain one complete request through its first-token consumer")
+        prefill_commits = [item for item in commits if item["phase"] == "prefill"]
+        cursor = 0
+        for commit in prefill_commits:
+            if commit["position"] != cursor:
+                raise ValueError("Prefill commits omit or repeat a logical prompt interval")
+            cursor += commit["count"]
+        target_counts = [int(re.search(r"::C(\d+)$", row[2])[1]) for row in targets]
+        if target_counts != [item["count"] for item in prefill_commits]:
+            raise ValueError("Prefill targets and completed prompt intervals differ")
+        low, high = targets[0][0], completed[0]["end"]
+        target_start = low
+        if request_start_ns is not None:
+            base = inventory.get("base_time_nanoseconds")
+            if base is None:
+                raise ValueError("Request/trace alignment requires the Kineto clock base")
+            low = (request_start_ns - base) / 1000
+            if not inventory["all_activity_start_us"] <= low <= target_start:
+                raise ValueError("Request timestamp lies outside the capture or after its first model target")
+        layer_rows = [row for row in inventory["cpu_markers"] if low <= row[0] < high
+                      and re.fullmatch(r"v41::prefill::layer::layer\d+::C\d+", row[2])]
+        counts = collections.Counter(int(re.search(r"::layer(\d+)::", row[2])[1]) for row in layer_rows)
+        if set(counts) != set(range(40)) or set(counts.values()) != {len(targets)}:
+            raise ValueError(f"Incomplete forty-layer prefill coverage: {dict(counts)}")
+        units, windows, proof = [0], [(low, high)], dict(chunks=targets, prompt_tokens=cursor, layer_counts=dict(counts),
+                                                      first_target_start_us=target_start,
+                                                      request_start_ns=request_start_ns,
+                                                      before_first_target_ms=(target_start - low) / 1000)
+    else:
+        units, windows, proof = [], [], []
+        for previous, current in zip(commits, commits[1:]):
+            if current["phase"] != "decode" or not current["emit"] or current["count"] != 1:
+                continue
+            if current["position"] != previous["position"] + previous["count"]:
+                continue
+            low, high = previous["end"], current["end"]
+            groups = []
+            for begin, duration, name in inventory["cpu_markers"]:
+                match = re.fullmatch(r"v41::compiled::layers(\d+)-(\d+)::C1", name)
+                if match and low <= begin and begin + duration <= high:
+                    groups.append(tuple(map(int, match.groups())))
+            if sorted(groups) != [(start, start + 3) for start in range(0, 40, 4)]:
+                continue
+            units.append(current["position"])
+            windows.append((low, high))
+            proof.append(dict(position=current["position"], groups=groups, consumer=current))
+        if not windows:
+            raise ValueError("No complete TP4 forty-layer decode cycle and sampled-token consumer")
+        if units != list(range(units[0], units[-1] + 1)):
+            raise ValueError("Missing an interior TP4 decode cycle; trace coverage is incomplete")
+    return dict(topology={"tensor_parallel_size": 4, "pipeline_parallel_size": 1}, phase=phase,
+                unit="request" if phase == "prefill" else "token", tokens=units, windows_us=windows,
+                capture_order=[], coverage_proof=proof, base_time_nanoseconds=inventory.get("base_time_nanoseconds"),
+                asynchronous_completion=asynchronous,
+                boundary=("recorded client request dispatch to first-token consumer; includes initial state setup"
+                          if request_start_ns is not None else "first prefill submission to first-token consumer")
+                         if phase == "prefill" else
+                         ("successive async worker token commits; includes overlapping next-token prefix, "
+                          "scheduler and device waits" if asynchronous else
+                          "successive sampled-token commit completions; includes scheduler, CPU and device waits"))
+
+
+def analyze(root, rank, phase=None, request_result=None):
     path = root / f"rank{rank}"
     inv = json.loads((path / "inventory.json").read_text())
     if inv.get("complete_json") is False:
         raise ValueError("A truncated trace prefix cannot establish complete stage periods")
     recipes = json.loads((path / "recipe-symbols.json").read_text())["recipes"]
     byid = {str(recipe["recipe_id"]): recipe for recipe in recipes}
-    stats = json.loads((root.parent / f"traces/rank{rank}-native-profile-stop.json").read_text())
+    collection = root / "collection.json"
+    if collection.exists():
+        record = next(row for row in json.loads(collection.read_text())["ranks"] if row["rank"] == rank)
+        stats = record["stats"]
+    else:
+        stats = json.loads((root.parent / f"traces/rank{rank}-native-profile-stop.json").read_text())
+    if stats.get("topology", {}).get("tensor_parallel_size", 2) == 4:
+        if phase not in ("prefill", "decode"):
+            raise ValueError("TP4 trace analysis requires --phase prefill or decode")
+        request_start_ns = None
+        if request_result is not None:
+            request = json.loads(request_result.read_text())
+            if request["status"] != "passed" or request["profile"] != phase:
+                raise ValueError("Trace request does not have a matching successful phase")
+            if phase == "prefill":
+                request_start_ns = request["request_start_ns"]
+        result = tp4_windows(inv, phase, request_start_ns)
+        if request_result is not None and phase == "prefill":
+            if result["coverage_proof"]["prompt_tokens"] != request["usage"]["prompt_tokens"]:
+                raise ValueError("Prefill trace does not cover the complete measured prompt")
+        (path / "device-windows.json").write_text(json.dumps(result, indent=2) + "\n")
+        print(json.dumps({key: value for key, value in result.items() if key != "coverage_proof"}), flush=True)
+        return
     mapped = symbols(inv, recipes)
     markers, marker_proof = logical_replay_markers(inv, stats["native_replays"])
     first = min(row[0] for row in markers)
@@ -214,5 +339,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("analysis", type=Path)
     parser.add_argument("--rank", type=int, required=True)
+    parser.add_argument("--phase", choices=("prefill", "decode"))
+    parser.add_argument("--request-result", type=Path,
+                        help="Same profiled request's result.json, including its wall-clock dispatch timestamp")
     args = parser.parse_args()
-    analyze(args.analysis, args.rank)
+    analyze(args.analysis, args.rank, args.phase, args.request_result)

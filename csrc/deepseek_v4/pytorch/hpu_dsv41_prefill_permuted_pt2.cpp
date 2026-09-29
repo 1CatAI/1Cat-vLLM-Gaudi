@@ -21,7 +21,9 @@ std::vector<int64_t> output_shape(const at::Stack& stack) {
                 q.size(1) > 0 && q.size(1) <= 20 && q.size(2) > 0 && q.size(2) <= 327680 &&
                 q.size(2) % 8192 == 0, "Expected prepared N256 expert weights with K divisible by 128");
     TORCH_CHECK(scales.scalar_type() == at::kShort && scales.dim() == 3 && scales.size(0) == q.size(0) &&
-                scales.size(1) == q.size(1) && scales.size(2) * 8 == q.size(2),
+                scales.size(1) == q.size(1) &&
+                (scales.size(2) * 8 == q.size(2) ||
+                 (scales.size(2) > 128 && (scales.size(2) - 128) * 16 == q.size(2))),
                 "Expected prepared group-32 exponent planes");
     TORCH_CHECK(lookup.scalar_type() == at::kBFloat16 && lookup.sizes() == at::IntArrayRef({128}),
                 "Expected the prepared MXFP4 lookup table");

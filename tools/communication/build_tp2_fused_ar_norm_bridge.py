@@ -159,6 +159,7 @@ def main() -> None:
                 source.with_name("tp2_native_graph_topology.h"),
                 source.with_name("tp2_native_graph_probe.h"),
                 source.with_name("dsv41_verify_timing.h"),
+                source.with_name("dsv41_control_inputs.h"),
             )
         },
         "eager_runtime": [{

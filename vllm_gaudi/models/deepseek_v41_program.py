@@ -15,6 +15,7 @@ from vllm_gaudi.ops.deepseek_v4_mxfp4 import mxfp4_bf16_lut
 from vllm_gaudi.ops.deepseek_v41_attention import CSA2Attention, CSA2SharedState
 from vllm_gaudi.ops.deepseek_v41_math import (
     engram_update,
+    prefill_engram_update,
     hc_post,
     hc_pre,
     prefill_hc_input,
@@ -198,6 +199,7 @@ class PreparedInput(nn.Module):
         return residual, pre
 
 
+
 class PreparedMoE(nn.Module):
 
     # Keep ordinary vLLM prompt transactions large (the scheduler still uses
@@ -214,9 +216,10 @@ class PreparedMoE(nn.Module):
     # The scheduler transaction itself remains the normal C8192 chunk.
     N256_PREFILL_TILE = 128
 
-    def __init__(self, weights, topk, normal_scales, lookup, reduce):
+    def __init__(self, weights, topk, normal_scales, lookup, reduce, tensor_parallel_size=2):
         super().__init__()
         self.weights, self.topk = weights, topk
+        self.tensor_parallel_size = tensor_parallel_size
         self.normal_scales, self.reduce = normal_scales, reduce
         self.register_buffer("lookup", lookup, False)
         self.router_top6 = gaudi_envs.VLLM_HPU_DSV41_ROUTER_TOP6
@@ -226,6 +229,10 @@ class PreparedMoE(nn.Module):
         self.register_buffer("fp8_w2_scale", None, False)
         self.n256 = topk == 6 and (gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256 or gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8)
         self.n256_fp8 = self.n256 and gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8
+        if tensor_parallel_size == 4 and not self.n256_fp8:
+            raise ValueError("TP4 requires the optimized N256 FP8 MoE; generic MoE is not a serving fallback")
+        if tensor_parallel_size == 4 and gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4:
+            raise ValueError("TP4 prefill requires the V4.1 clipped, FP32-routed prepared MoE path")
         self.prefill_mxfp4 = self.n256 and gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4
         self.prefill_grouped = self.n256 and gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED
         from vllm_gaudi.ops.deepseek_v41_prefill_plan import validate_prefill_plan_config
@@ -335,6 +342,10 @@ class PreparedMoE(nn.Module):
             channel2 = experts.w2_fp8_channel
             if not isinstance(channel13, torch.Tensor) or not isinstance(channel2, torch.Tensor):
                 raise TypeError("N256 FP8 channel scales were not loaded as tensors")
+            if self.tensor_parallel_size == 4 and use_fused and tile_prequant is None:
+                from vllm_gaudi.ops.deepseek_v41_expert_n256 import run_fused_decode
+                return run_fused_decode(*operands, channel13, channel2, bool(self.normal_scales),
+                                         direct_finalize=self.n256_fused_reduce)
             if tile_prequant is not None:
                 if not use_fused:
                     raise ValueError("Prequantized N256 input requires the fused expert body")
@@ -488,6 +499,7 @@ class PreparedDecoderLayer(nn.Module):
                  reduce,
                  all_gather,
                  device,
+                 tensor_parallel_size=2,
                  collect_target_state=False):
         super().__init__()
         self.weights, self.layer = weights, layer
@@ -499,10 +511,13 @@ class PreparedDecoderLayer(nn.Module):
         self.register_buffer("hc_ffn_fn_packed", None, False)
         if shared.length > 512:
             from vllm_gaudi.ops.deepseek_v41_paged_attention import PagedCSA2Attention
-            self.attention = PagedCSA2Attention(weights.attn, config, layer, shared, linear, reduce, all_gather, device)
+            self.attention = PagedCSA2Attention(weights.attn, config, layer, shared, linear, reduce, all_gather, device,
+                                                 tensor_parallel_size=tensor_parallel_size)
         else:
-            self.attention = CSA2Attention(weights.attn, config, layer, shared, linear, reduce, device)
-        self.moe = PreparedMoE(weights.ffn, config["num_experts_per_tok"], normal_scales, lookup, reduce)
+            self.attention = CSA2Attention(weights.attn, config, layer, shared, linear, reduce, device,
+                                            tensor_parallel_size=tensor_parallel_size)
+        self.moe = PreparedMoE(weights.ffn, config["num_experts_per_tok"], normal_scales, lookup, reduce,
+                               tensor_parallel_size=tensor_parallel_size)
         self.all_gather = all_gather
 
     @staticmethod
@@ -531,14 +546,19 @@ class PreparedDecoderLayer(nn.Module):
         w = self.weights
         prefill = (gaudi_envs.VLLM_HPU_DSV41_PREFILL_REGIONS and not decode and not self.draft and residual.shape[0] > 6
                    and hasattr(self.attention, "_prefill_attention"))
-        post_update = _prefill_hc_post if prefill else hc_post
+        # The fused update depends on the four mHC streams, not TP heads.
+        # TP4 needs it even before the other prefill regions are enabled:
+        # the eager broadcast otherwise materializes [T,4,4,5120] FP32.
+        fused_post = prefill or (self.moe.tensor_parallel_size == 4 and residual.shape[0] > 6)
+        post_update = _prefill_hc_post if fused_post else hc_post
         if hasattr(w, "engram"):
             if engram_rows is None:
                 raise RuntimeError("Engram layer requires its completed host gather and DMA generation")
             local_rows = engram_rows if engram_rows.dtype == torch.bfloat16 else unpack_swa(engram_rows, 256)
             rows = self.all_gather(local_rows, dim=1)
             kv = linear(rows.flatten(1), w.engram.wkv)
-            residual = engram_update(residual, kv, w.engram.q_weight, w.engram.k_weight, ~image_mask, self.eps)
+            update = prefill_engram_update if prefill else engram_update
+            residual = update(residual, kv, w.engram.q_weight, w.engram.k_weight, ~image_mask, self.eps)
         target_state = residual.mean(1) if self.collect_target_state else None
         compiled_input = prefill and gaudi_envs.VLLM_HPU_DSV41_PREFILL_MHC_INPUT
         if compiled_input:
@@ -557,7 +577,7 @@ class PreparedDecoderLayer(nn.Module):
                                                 self.hc_eps,
                                                 self.iterations,
                                                 packed_fn=self.hc_attn_fn_packed,
-                                                prefill=prefill)
+                                                prefill=fused_post)
             value = rms_norm(value, w.attn_norm.weight, self.eps)
         schedule = (gaudi_envs.VLLM_HPU_DSV41_MHC_SCHEDULE and not self.draft and 1 <= value.shape[0] <= 6)
         if schedule:
@@ -582,7 +602,7 @@ class PreparedDecoderLayer(nn.Module):
                                                 self.hc_eps,
                                                 self.iterations,
                                                 packed_fn=self.hc_ffn_fn_packed,
-                                                prefill=prefill)
+                                                prefill=fused_post)
         # Keep the normalized BF16 row in the TPC register file while forming
         # the exact FP8 operand consumed by N256.  This is an internal B1/B2
         # implementation choice under the normal scheduler and request-state
@@ -609,19 +629,27 @@ class PreparedDecoderLayer(nn.Module):
 
 class PreparedStage(nn.Module):
 
-    def __init__(self, directory, pp_rank, tp_rank, reduce, all_gather, device, max_length=512, *, dspark=None):
+    def __init__(self, directory, pp_rank, tp_rank, reduce, all_gather, device, max_length=512, *,
+                 tensor_parallel_size=2, pipeline_parallel_size=2, dspark=None):
         super().__init__()
         from vllm_gaudi.ops.deepseek_v41_prefill_regions import validate_prefill_region_config
         validate_prefill_region_config()
         self.shard = PreparedV41Shard(directory, pp_rank, tp_rank)
+        if (getattr(self.shard, "tensor_parallel_size", tensor_parallel_size) != tensor_parallel_size
+                or getattr(self.shard, "pipeline_parallel_size", pipeline_parallel_size) != pipeline_parallel_size):
+            raise ValueError("Prepared shard topology differs from the runtime topology")
         self.config = json.loads((Path(directory) / "config.json").read_text())
         config = self.config["text_config"]
         self.pp_rank, self.tp_rank, self.length = pp_rank, tp_rank, max_length
+        self.pipeline_parallel_size = pipeline_parallel_size
+        self.is_last_stage = pp_rank == pipeline_parallel_size - 1
         # Set for each request chunk by the worker. The experimental suffix
         # path must never infer finality from a static graph shape.
         self.prefill_halo_mode = "full"
         self.reduce, self.all_gather = reduce, all_gather
         self.dspark = (gaudi_envs.VLLM_HPU_DSV41_DSPARK if dspark is None else bool(dspark))
+        if tensor_parallel_size == 4 and self.dspark:
+            raise ValueError("V4.1 TP4 does not yet support DSpark")
         self.runtime_indexer = gaudi_envs.VLLM_HPU_DSV41_RUNTIME_INDEXER
         if self.runtime_indexer and (self.dspark or max_length <= 512):
             raise ValueError("Runtime CSA2 indexer requires paged ordinary decode")
@@ -677,7 +705,9 @@ class PreparedStage(nn.Module):
             for name, spec in self.shard.specs.items() if self.dspark or not name.startswith("mtp.")
         }
         self.weights = _weight_tree(self.weight_specs)
-        self.start, self.stop = (0, 20) if pp_rank == 0 else (20, 40)
+        self.tensor_parallel_size = tensor_parallel_size
+        ranges = self.shard.manifest.get("pp_layer_ranges", [[0, 20], [20, 40]])
+        self.start, self.stop = ranges[pp_rank]
         if max_length > 512:
             from vllm_gaudi.ops.deepseek_v41_paged_attention import PagedCSA2SharedState
             self.shared = PagedCSA2SharedState(config, self.start, self.stop, device, max_length)
@@ -697,6 +727,7 @@ class PreparedStage(nn.Module):
                                      reduce,
                                      all_gather,
                                      device,
+                                     tensor_parallel_size,
                                      collect_target_state=self.dspark))
             # Lightweight loader/ownership tests replace the decoder layer
             # with a shell that deliberately has no attention module.
@@ -706,13 +737,14 @@ class PreparedStage(nn.Module):
         self.generation, self.loaded = 0, False
         self.runtime_precision = {
             "experts":
-            "MXFP4 -> BF16 SRAM -> BF16 MME",
+            ("MXFP4/N256 -> FP8 decode MME; grouped BF16 prefill MME"
+             if self.expert_n256 and self.fp8_decode else "MXFP4 -> BF16 SRAM -> BF16 MME"),
             "dense":
             "E4M3FN/block32 -> prepared BF16; block32 activation quantization",
             "mla_wo_a": ("pretransposed [groups,K,N] BF16"
                          if gaudi_envs.VLLM_HPU_DSV41_PRETRANSPOSE_ATTN else "checkpoint [groups,N,K] BF16"),
-            "mHC_router":
-            "FP32",
+            "mHC_router": ("FP32 mHC; BF16 router operands with FP32 logits"
+                           if gaudi_envs.VLLM_HPU_DSV41_BF16_ROUTER_GATE else "FP32"),
             "communication":
             "BF16"
         }
@@ -792,7 +824,11 @@ class PreparedStage(nn.Module):
                 "weight_fingerprint": sidecar.fingerprint,
             }
         if self.expert_n256:
-            from vllm_gaudi.ops.deepseek_v41_expert_n256 import FINGERPRINT, LAYOUT
+            from vllm_gaudi.ops.deepseek_v41_expert_n256 import (
+                COMPACT_FINGERPRINT, COMPACT_LAYOUT, FINGERPRINT, LAYOUT)
+            runtime_shard = getattr(self.shard, "_n256_runtime_shard", None)
+            compact_expert_scales = (runtime_shard.layout == COMPACT_LAYOUT if runtime_shard is not None
+                                     else self.tensor_parallel_size == 4)
             enabled_layers = set(self.expert_n256_config["routed_experts"])
             for layer in self.layers:
                 enabled = layer.layer in enabled_layers
@@ -804,9 +840,9 @@ class PreparedStage(nn.Module):
                 "config":
                 self.expert_n256_config,
                 "layout":
-                LAYOUT,
+                COMPACT_LAYOUT if compact_expert_scales else LAYOUT,
                 "layout_fingerprint":
-                FINGERPRINT,
+                COMPACT_FINGERPRINT if compact_expert_scales else FINGERPRINT,
                 "prepared_rank_fingerprint":
                 (self.shard._n256_runtime_shard.fingerprint if hasattr(self.shard, "_n256_runtime_shard") else None),
                 "c1_c6":
@@ -918,7 +954,7 @@ class PreparedStage(nn.Module):
             residual, pre_mix, target = layer(residual, pre_mix, positions, image_mask, rows)
             if target is not None:
                 target_states.append(target)
-        if self.pp_rank == 0:
+        if not self.is_last_stage:
             return residual, pre_mix, None
         value = final_collapse_rms_norm(residual, pre_mix, self.weights.norm.weight,
                                         self.config["text_config"]["rms_norm_eps"])
@@ -1049,7 +1085,7 @@ class PreparedStage(nn.Module):
         return F.linear(hidden.float(), self.weights.head.weight)
 
     def logits(self, hidden):
-        if self.pp_rank != 1:
+        if not self.is_last_stage:
             raise RuntimeError("Only the final PP stage owns the output head")
         local = self._head_projection(hidden)
         return self.all_gather(local, dim=-1)
@@ -1059,8 +1095,8 @@ class PreparedStage(nn.Module):
             local_greedy_candidate,
             select_greedy_candidate,
         )
-        if self.pp_rank != 1 or hidden.shape[0] != 1:
-            raise ValueError("Ordinary greedy head requires one token on PP1")
+        if not self.is_last_stage or hidden.shape[0] != 1:
+            raise ValueError("Ordinary greedy head requires one token on the final PP stage")
         local = self._head_projection(hidden)
         candidates = self.all_gather(local_greedy_candidate(local, self.tp_rank), dim=-1)
         return select_greedy_candidate(candidates)
@@ -1082,14 +1118,16 @@ class PreparedLayerGroup(nn.Module):
         super().__init__()
         self.fp8_decode = fp8_decode
         self.decode = decode
+        self.preserve_layer_rounding = getattr(stage, "tensor_parallel_size", 2) == 4
         self.pp_wire_input = pp_wire_input and start == 0
         self.text_input = fused_text_io and stage.pp_rank == 0 and start == 0
-        self.wire_output = fused_text_io and stage.pp_rank == 0 and stop == len(stage.layers)
+        is_last_stage = getattr(stage, "is_last_stage", stage.pp_rank == 1)
+        self.wire_output = fused_text_io and stage.pp_rank == 0 and not is_last_stage and stop == len(stage.layers)
         self.embedding = stage.weights.embed if self.text_input else None
         self.tp_rank = getattr(stage, "tp_rank", 0)
         self.reduce = getattr(stage, "reduce", None)
         self.layers = nn.ModuleList(list(stage.layers[start:stop]))
-        self.final = stage.pp_rank == 1 and stop == len(stage.layers)
+        self.final = is_last_stage and stop == len(stage.layers)
         self.norm = stage.weights.norm if self.final else None
         self.eps = stage.config["text_config"]["rms_norm_eps"]
         self.native_input = None
@@ -1120,6 +1158,12 @@ class PreparedLayerGroup(nn.Module):
                                               decode=decode)
             if target is not None:
                 target_states.append(target)
+            if self.preserve_layer_rounding and decode and layer is not self.layers[-1]:
+                # Preserve the same BF16 residual boundary as separate layer
+                # recipes; cross-layer fusion otherwise changes cached KV.
+                shape = residual.shape
+                residual = torch.ops.custom_op.custom_deepseek_v41_bf16_identity_gaudi2(
+                    residual.reshape(1, -1).contiguous()).reshape(shape)
         if gaudi_envs.VLLM_HPU_DSV41_MHC_GATES_FUSED:
             # The last layer's pre gate is a narrow view into one packed
             # kernel output. Materialize it at the recipe boundary because
@@ -1156,7 +1200,12 @@ class PreparedLayerGroup(nn.Module):
 _compile_entry_ids = count()
 
 
-def _compile_group(group, *, native, backend="hpu_backend"):
+def _compile_group(group, *, native, backend="hpu_backend", tp4_owner=None):
+    if tp4_owner is not None:
+        if native:
+            raise ValueError("Prepared TP4 export does not use the TP2 native peer path")
+        from vllm_gaudi.compilation.deepseek_v41_prepared import PreparedTP4Group
+        return PreparedTP4Group(group, tp4_owner, backend)
     # Dynamo caches variants by code object. Each static layer group/bucket
     # owns its entry so legitimate preparations cannot exhaust another group.
     method = group.native_forward if native else group.forward
@@ -1178,19 +1227,24 @@ class CompiledStage:
                  pp_wire_input=False,
                  fused_text_io=False,
                  native_input=False,
-                 group_size=4):
+                 group_size=4,
+                 prepared_tp4=False):
         legacy_fp8 = getattr(stage, "fp8_decode", False) and not getattr(stage, "expert_n256", False)
         if native_input and (not native or stage.pp_rank != 0 or stage.dspark or legacy_fp8):
             raise ValueError("Native input capture requires ordinary BF16 PP0 decode")
         if native_input and (pp_wire_input or fused_text_io):
             raise ValueError("Native input capture has a single PP0 input owner")
         backend = "hpu_backend"
+        if getattr(stage, "tensor_parallel_size", 2) == 4:
+            from vllm_gaudi.compilation.deepseek_v41_tp4 import make_backend
+            backend = make_backend()
         # Keep the scheduler transaction large (normal vLLM chunked prefill),
         # but remember whether this stage owns compiled entries.  Very large
         # M inputs are dispatched through the eager group method below so
         # each bounded N256 tile can release its workspace before the next
         # tile.  C1/decode and <=512-token prefill retain the compiled graph.
         self.native = bool(native)
+        self.audit = {"calls": 0, "tokens": 0, "groups": 0}
         if native and gaudi_envs.VLLM_HPU_DSV41_TP_MHC_OVERLAP:
             if stage.dspark or (stage.fp8_decode and not stage.expert_n256):
                 raise ValueError("TP/mHC overlap requires BF16 boundaries and a qualified C1 expert layout")
@@ -1204,11 +1258,57 @@ class CompiledStage:
                                start + group_size,
                                pp_wire_input=pp_wire_input,
                                fused_text_io=fused_text_io,
-                               fp8_decode=native and stage.fp8_decode,
-                               decode=native) for start in range(0, len(stage.layers), group_size))
+                               fp8_decode=getattr(stage, "fp8_decode", False),
+                               decode=native or getattr(stage, "tensor_parallel_size", 2) == 4)
+            for start in range(0, len(stage.layers), group_size))
         if native_input:
             self.groups[0].native_input = PreparedInput(stage.weights.embed, stage.tp_rank, stage.reduce)
-        self.chunks = tuple(_compile_group(group, native=native, backend=backend) for group in self.groups)
+        tp4_owner = stage if prepared_tp4 and getattr(stage, "tensor_parallel_size", 2) == 4 else None
+        compile_options = {"native": native, "backend": backend}
+        if tp4_owner is not None:
+            compile_options["tp4_owner"] = tp4_owner
+        self.chunks = tuple(_compile_group(group, **compile_options) for group in self.groups)
+        self.owner = stage
+        self.prefix_groups = (next((index for index, group in enumerate(self.groups)
+                                    if any(layer.layer == 14 for layer in group.layers)), 0)
+                              if getattr(stage, "tensor_parallel_size", 2) == 4 else 0)
+        self.prefix_generation = None
+
+    def prefix_ready(self, search_length):
+        return (self.prefix_groups > 0 and self.prefix_generation ==
+                self._prefix_key(search_length))
+
+    def _prefix_key(self, search_length):
+        return (self.owner.generation, getattr(self.owner, "precision_fingerprint", None), search_length,
+                getattr(self.owner, "decode_token_bound", None))
+
+    def prefix(self, hidden, pre_mix, positions, input_ids, engram):
+        if not self.prefix_ready(self.owner.search_length) or hidden.shape[0] != 1:
+            raise RuntimeError("TP4 prefix requires a prepared C1 generation and search geometry")
+        hidden, pre_mix, _ = self._run_group_range(0, self.prefix_groups, hidden, pre_mix, positions, input_ids, engram)
+        return hidden, pre_mix
+
+    def suffix(self, hidden, pre_mix, positions, input_ids, engram):
+        if not self.prefix_ready(self.owner.search_length):
+            raise RuntimeError("TP4 prefix generation changed before its consumer")
+        hidden, pre_mix, aux = self._run_group_range(self.prefix_groups, len(self.chunks), hidden, pre_mix,
+                                                    positions, input_ids, engram)
+        self.audit["calls"] += 1
+        self.audit["tokens"] += 1
+        self.audit["groups"] += len(self.chunks)
+        return hidden, pre_mix, aux
+
+    def _run_group_range(self, start, stop, hidden, pre_mix, positions, input_ids, engram):
+        from vllm_gaudi.ops.deepseek_v41_native_trace import annotations_enabled, scope
+        for index in range(start, stop):
+            group, chunk = self.groups[index], self.chunks[index]
+            if annotations_enabled():
+                first, last = group.layers[0].layer, group.layers[-1].layer
+                with scope(f"v41::compiled::layers{first}-{last}::C{hidden.shape[0]}"):
+                    hidden, pre_mix, aux = chunk(hidden, pre_mix, positions, input_ids, engram)
+            else:
+                hidden, pre_mix, aux = chunk(hidden, pre_mix, positions, input_ids, engram)
+        return hidden, pre_mix, aux
 
     def __call__(self, hidden, pre_mix, positions, input_ids, engram):
         stock_prefill = (hidden.shape[0] > 6
@@ -1274,8 +1374,21 @@ class CompiledStage:
                 # synchronizing here can trigger defragmentation while this
                 # tile's producer graph is still referenced by the stream.
             return full_hidden, full_pre, full_aux
-        for chunk in self.chunks:
-            hidden, pre_mix, aux = chunk(hidden, pre_mix, positions, input_ids, engram)
+        self.audit["calls"] += 1
+        self.audit["tokens"] += hidden.shape[0]
+        self.audit["groups"] += len(self.chunks)
+        from vllm_gaudi.ops.deepseek_v41_native_trace import annotations_enabled, scope
+        if annotations_enabled():
+            for group, chunk in zip(self.groups, self.chunks, strict=True):
+                first, last = group.layers[0].layer, group.layers[-1].layer
+                with scope(f"v41::compiled::layers{first}-{last}::C{hidden.shape[0]}"):
+                    hidden, pre_mix, aux = chunk(hidden, pre_mix, positions, input_ids, engram)
+        else:
+            for chunk in self.chunks:
+                hidden, pre_mix, aux = chunk(hidden, pre_mix, positions, input_ids, engram)
+        if (input_ids.numel() == 1 and input_ids.dtype == torch.int32 and len(engram) == 2
+                and engram[0].dtype == torch.bfloat16 and getattr(self.owner, "tensor_parallel_size", 2) == 4):
+            self.prefix_generation = self._prefix_key(self.owner.search_length)
         return hidden, pre_mix, aux
 
 

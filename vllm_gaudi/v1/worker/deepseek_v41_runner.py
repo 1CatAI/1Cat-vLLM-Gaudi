@@ -24,6 +24,7 @@ from vllm.v1.outputs import (AsyncModelRunnerOutput, DraftTokenIds, EMPTY_MODEL_
 from vllm_gaudi import envs
 from vllm_gaudi.extension.logger import logger as init_logger
 from vllm_gaudi.extension.profiler import HabanaHighLevelProfiler
+from vllm_gaudi.ops.deepseek_v41_config import decode_source_prefix_bound
 from vllm_gaudi.ops.deepseek_v41_indexer import INDEX_MME_HOT_TOKENS
 from vllm_gaudi.ops.deepseek_v41_state import PagedStageState, StageStateBlocks, register_state_spec
 from vllm_gaudi.ops.deepseek_v41_verify import (
@@ -68,6 +69,10 @@ def profile_phase(name):
             label = f"v41::{name}::PP{self.model.pp_rank}"
             if name == "target":
                 label += f"::{'decode' if kwargs['decode'] else 'prefill'}::C{len(args[1])}"
+            elif name == "verify_and_commit" and self.pending is not None:
+                request, start, count, _, _, need_sample, _ = self.pending
+                phase = "decode" if start >= len(request.prompt) else "prefill"
+                label += f"::{phase}::P{start}::C{count}::emit{int(need_sample)}"
             elif name == "insert_context":
                 label += f"::C{args[1].numel()}"
             if os.getenv("VLLM_HPU_DSV41_RAW_TRACE", "0") == "1":
@@ -95,6 +100,17 @@ class RequestState:
     @property
     def tokens(self):
         return self.prompt + self.output
+
+    def token_slice(self, start, stop):
+        """Select the scheduled prefix without materializing the full history."""
+        if not 0 <= start <= stop:
+            raise ValueError("Scheduled token range must be nonnegative and ordered")
+        boundary = len(self.prompt)
+        if start >= boundary:
+            return self.output[start - boundary:stop - boundary]
+        if stop <= boundary:
+            return self.prompt[start:stop]
+        return self.prompt[start:] + self.output[:stop - boundary]
 
     def reconcile(self, output_count, new_tokens, all_tokens=None):
         if all_tokens is not None:
@@ -245,6 +261,14 @@ class PPBuffers:
     def __init__(self, device, capacity=6, *, dspark=True, device_commit=None):
         self.group = get_pp_group()
         self.dspark = bool(dspark)
+        self.single_stage = (getattr(self.group, "is_first_rank", False)
+                             and getattr(self.group, "is_last_rank", False))
+        if self.single_stage:
+            if self.dspark:
+                raise ValueError("Single-stage V4.1 does not yet support DSpark")
+            # No pipeline peer consumes hidden/pre buffers in TP4 x PP1.
+            # Avoid reserving a full prompt-sized transport allocation.
+            capacity = 0
         if not self.dspark:
             self.device_commit_enabled = (envs.VLLM_HPU_DSV41_DEVICE_COMMIT
                                           if device_commit is None else bool(device_commit))
@@ -435,6 +459,8 @@ class PPBuffers:
             event.synchronize()
 
     def exchange(self, values, count, *, native_wire=False, decode=False):
+        if self.single_stage:
+            raise RuntimeError("Single-stage V4.1 has no pipeline exchange")
         if not self.dspark:
             return self._exchange_ordinary(values, count, decode=decode)
         # PP0 reuses its receive/commit buffers only after its prior result was
@@ -577,6 +603,9 @@ class PPBuffers:
             raise RuntimeError("Ordinary token completion cannot commit DSpark verification")
         self.drain()
         self.generation += 1
+        if self.group.is_first_rank and self.group.is_last_rank:
+            self.commits += 1
+            return consumed, [] if token is None else [token]
         if self.group.is_last_rank:
             record = [self.generation, consumed, int(token is not None), -1 if token is None else token]
             self.commit_host.copy_(torch.tensor(record, dtype=torch.int32, device="cpu"))
@@ -825,6 +854,7 @@ class V41ModelRunner:
         self.pending = self.draft_token_ids = None
         self.use_dspark = envs.VLLM_HPU_DSV41_DSPARK
         self._token_copy = self._next_input = None
+        self.tp4_token_readback = None
         self.active_request = None
         self.trace_enabled = False
         # Generic multimodal batching uses the platform's pageable path;
@@ -851,6 +881,8 @@ class V41ModelRunner:
             from vllm_gaudi.ops.deepseek_v41_inputs import PositionBank
             self.position_bank = PositionBank(self.model_config.max_model_len, PREFILL_BLOCK_TOKENS, self.device)
         self.input_staging = None
+        self.tp4_control_inputs = {}
+        self._decode_geometry_key = None
         self.batched_input_staging = envs.VLLM_HPU_DSV41_BATCHED_INPUT_STAGING
         if self.batched_input_staging and not envs.VLLM_HPU_DSV41_FUSED_STAGE_IO:
             raise RuntimeError("Batched input staging requires fused stage I/O")
@@ -922,8 +954,16 @@ class V41ModelRunner:
         # loading so their first use is outside the serving request.
         if envs.VLLM_HPU_DSV41_PREFILL_GROUPED and envs.VLLM_HPU_DSV41_PREFILL_DEVICE_ROUTES:
             from vllm_gaudi.ops.deepseek_v41_grouped_prefill import prepare_device_grouped_prefill_recipes
-            prepare_device_grouped_prefill_recipes(normal_scales=True)
+            prepare_device_grouped_prefill_recipes(
+                normal_scales=True, tensor_parallel_size=self.vllm_config.parallel_config.tensor_parallel_size)
         self.model = get_model(vllm_config=self.vllm_config)
+        if getattr(self.model, "tensor_parallel_size", 2) == 4 and not self.use_dspark:
+            from vllm_gaudi.ops.deepseek_v41_completion import prepare_decode_control
+            self.tp4_control_inputs, self.tp4_token_readback = prepare_decode_control(
+                self.input_views, self.position_views)
+            if self.position_bank is not None:
+                self.position_bank.prepare_compiled_copies(
+                    {count: self.position_views[count] for count in range(1, 7)})
         state_type = PagedStageState if self.model_config.max_model_len > 512 else StageStateBlocks
         self.state = state_type(self.model.program)
         register_state_spec(self.vllm_config)
@@ -954,7 +994,11 @@ class V41ModelRunner:
             self.verify_ring = VerifyRing(self.device, last_rank=False)
         elif self.pp.group.is_last_rank:
             sampler = self.model.program.sample_greedy_token if self.v2_completion else self.model.program.sample_greedy
-            self.sample_target = torch.compile(sampler, backend="hpu_backend", fullgraph=True, dynamic=False)
+            sampler_backend = "hpu_backend"
+            if getattr(self.model, "tensor_parallel_size", 2) == 4:
+                from vllm_gaudi.compilation.deepseek_v41_tp4 import make_backend
+                sampler_backend = make_backend()
+            self.sample_target = torch.compile(sampler, backend=sampler_backend, fullgraph=True, dynamic=False)
             if self.pp.device_commit_enabled:
                 self.sample_target_commit = torch.compile(self.model.program.sample_greedy_commit,
                                                           backend="hpu_backend",
@@ -1089,12 +1133,19 @@ class V41ModelRunner:
         from vllm_gaudi.ops.deepseek_v41_config import validate_sampling
         validate_sampling(params)
 
-    def _image_embeddings(self, request, start, count):
+    def _image_embeddings(self, request, start, count, input_ids):
         if not request.mm_features or not self.pp.group.is_first_rank:
             return None
+        active = [feature for feature in request.mm_features
+                  if feature.mm_position.offset < start + count
+                  and start < feature.mm_position.offset + feature.mm_position.length]
+        if not active:
+            return None
         self._execute_mm_encoder(request)
-        values = self.model.embed_input_ids(self.input_ids[:count])
-        for feature in request.mm_features:
+        # Device continuation may bind a sampled tensor instead of the host
+        # staging buffer. Preserve those actual IDs for non-image rows.
+        values = self.model.embed_input_ids(input_ids)
+        for feature in active:
             position = feature.mm_position
             low, high = max(start, position.offset), min(start + count, position.offset + position.length)
             if low >= high:
@@ -1161,23 +1212,40 @@ class V41ModelRunner:
                                                reuse_index_keys=envs.VLLM_HPU_DSV41_PREFILL_REINDEX_REUSE)
             if search < start + count or search > program.length:
                 raise RuntimeError("V4.1 transaction search bucket does not cover its input")
-            program.search_length = search
-            for layer in program.layers:
-                attention = layer.attention
-                # This is scheduler metadata, not a device tensor readback.
-                # It bounds invisible prefill score tiles without changing
-                # the shared fixed search geometry or decode capture.
-                attention.prefill_token_end = None if graph_c1 else start + count
-                if hasattr(attention, "set_search_length"):
-                    attention.set_search_length(search)
-                else:
-                    attention.search_length = search
+            decode_bound = (decode_source_prefix_bound(
+                start + count, search, getattr(program, "tensor_parallel_size", 2),
+                runtime_indexer=getattr(program, "runtime_indexer", False)) if graph_c1 else None)
+            geometry_key = (id(program), getattr(program, "generation", None), search, decode_bound)
+            reuse_geometry = graph_c1 and getattr(program, "tensor_parallel_size", 2) == 4
+            if not reuse_geometry or geometry_key != getattr(self, "_decode_geometry_key", None):
+                program.search_length = search
+                program.decode_token_bound = decode_bound
+                for layer in program.layers:
+                    attention = layer.attention
+                    # This is scheduler metadata, not a device tensor readback.
+                    # Prefill changes the visible end on every transaction;
+                    # decode reuses its static geometry until the bucket or
+                    # physical-state generation changes.
+                    attention.prefill_token_end = None if graph_c1 else start + count
+                    if hasattr(attention, "set_search_length"):
+                        attention.set_search_length(search)
+                    else:
+                        attention.search_length = search
+                    if hasattr(attention, "set_decode_visible_tokens"):
+                        attention.set_decode_visible_tokens(decode_bound)
+                self._decode_geometry_key = geometry_key if reuse_geometry else None
         # The fused seven-value control packet belongs to C1/C6 replay.  A
         # normal prefill block has independent C128-capable input buffers and
         # must not be truncated through that DSpark-sized packet.
         staged_input = (getattr(self, "input_staging", None) is not None and count <= 6
                         and (graph_c1 or self.use_dspark))
-        if staged_input:
+        tp4_control = (getattr(self, "tp4_control_inputs", {}).get(count)
+                       if graph_c1 and not (count == 1 and self.direct_token_ids) else None)
+        if tp4_control is not None:
+            if ids is not self.input_views[count] or positions is not self.position_views[count]:
+                raise RuntimeError("Prepared TP4 control input was rebound without preparation")
+            tp4_control.upload(tokens, start)
+        elif staged_input:
             slot = self.input_generation % 2
             if self.input_dma_pending[slot]:
                 self.input_dma_events[slot].synchronize()
@@ -1211,7 +1279,11 @@ class V41ModelRunner:
             else:
                 ids.copy_(torch.tensor(tokens, dtype=ids.dtype, device="cpu"))
             if self.position_bank is not None and graph_c1:
-                positions = self.position_bank.view(start, count)
+                if getattr(self.model, "tensor_parallel_size", 2) == 4:
+                    if not self.model.decode_prefix_pending:
+                        self.position_bank.copy_into(positions, start)
+                else:
+                    positions = self.position_bank.view(start, count)
             else:
                 positions.copy_(torch.arange(start, start + count, dtype=torch.int32, device="cpu"))
         self._round_phase("inputs_staged_ns")
@@ -1219,22 +1291,30 @@ class V41ModelRunner:
         # CSA2 buckets above 1024. Prompt C1 capture remains bounded to the
         # qualified prefix range so a one-token prefill tail cannot create a
         # long-search graph variant. StageReplay keys plans by search bucket.
-        use_replay = (getattr(self.model, "native", False) and
+        use_replay = ((getattr(self.model, "native", False) or
+                       (self.v2_completion and getattr(self.model, "tensor_parallel_size", 2) == 4)) and
                       (decode or (start + count <= 1024 and (c1_replay or (self.use_dspark and request is not None)))))
         self.model.prepare_step(request_id, tokens, is_decode=graph_c1, reset=reset, use_replay=use_replay)
         self._round_phase("engram_prepared_ns")
         timing = getattr(self, "verify_timing", None)
         if self.pp.group.is_first_rank:
-            embeddings = self._image_embeddings(request, start, count) if request is not None else None
+            embeddings = self._image_embeddings(request, start, count, ids) if request is not None else None
             if timing:
                 timing.device("stage_model_start")
             value = self.model(ids, positions, inputs_embeds=embeddings)
             self._round_phase("stage_submitted_ns")
             if timing:
                 timing.device("stage_target_done")
-            self.pp.exchange(value, count, decode=graph_c1)
+            # TP4 is a single PP stage.  The model owns the final norm and
+            # head on this rank, so keep its output instead of sending it to
+            # the nonexistent PP1 peer.  TP2xPP2 retains the ordinary
+            # boundary exchange below.
+            if getattr(self.pp.group, "is_last_rank", False):
+                output = value
+            else:
+                self.pp.exchange(value, count, decode=graph_c1)
+                output = None
             self._round_phase("pp_exchanged_ns")
-            output = None
         else:
             value = self.pp.exchange(None, count, native_wire=use_replay and self.use_dspark, decode=graph_c1)
             self._round_phase("pp_exchanged_ns")
@@ -1549,7 +1629,7 @@ class V41ModelRunner:
         proposed = scheduled.scheduled_spec_decode_tokens.get(req_id, [])
         if proposed and not self.use_dspark:
             raise RuntimeError("Speculative tokens reached a non-speculative V4.1 runner")
-        tokens = request.tokens[start:start + count - len(proposed)] + proposed
+        tokens = request.token_slice(start, start + count - len(proposed)) + proposed
         if len(tokens) != count or start + count > self.model_config.max_model_len:
             raise RuntimeError("Scheduled V4.1 inputs do not match the committed prefix and context budget")
         decode = start >= len(request.prompt)
@@ -1609,7 +1689,7 @@ class V41ModelRunner:
                     # Retire it after both transport and its consumer finish;
                     # the final block remains owned by normal sampling.
                     self.pp.complete_packet()
-        need_sample = start + count >= len(request.tokens)
+        need_sample = start + count >= len(request.prompt) + len(request.output)
         if self.pp.group.is_last_rank and need_sample:
             if not self.use_dspark:
                 if decode and self.pp.device_commit_enabled:
@@ -1620,6 +1700,8 @@ class V41ModelRunner:
                     from vllm_gaudi.distributed.tp2_fused_ar_norm import _resolve_runtime
                     bridge, _, _ = _resolve_runtime()
                     self._token_copy = bridge.copy_sampled_tokens_to_host(sample_input)
+                elif getattr(self, "tp4_token_readback", None) is not None and not (decode and self.v2_completion):
+                    self._token_copy = self.tp4_token_readback(sample_input)
             else:
                 # Device verification owns projection, argmax and the small
                 # TP candidate exchange, so it consumes target hidden state.
@@ -1737,7 +1819,8 @@ class V41ModelRunner:
         self.state.clear()
         hidden = self._forward("__v41_warmup__", [1 + index for index in range(tokens)],
                                start_position,
-                               decode=native and (self.use_dspark or tokens == 1),
+                               decode=(native or getattr(self.model, "tensor_parallel_size", 2) == 4)
+                               and (self.use_dspark or tokens == 1),
                                reset=True)
         from vllm_gaudi.ops.tp2_prepared_plan import prepared_group_stats
         stats = prepared_group_stats()

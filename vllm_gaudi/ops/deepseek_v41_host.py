@@ -19,6 +19,7 @@ from vllm_gaudi.ops.deepseek_v41_engram import (
     EngramTokenHistory,
     build_compressed_token_map,
 )
+from vllm_gaudi.ops.deepseek_v41_native_trace import annotations_enabled, scope
 from vllm_gaudi.ops.deepseek_v41_weights import file_hash, publish_json
 
 envs = gaudi_envs
@@ -51,19 +52,24 @@ def resident_table_source(item, binding):
     return dict(item, file=binding["file"], shard_offset=0, shared_memfd=True)
 
 
-def device_engram_parameters(layout, layer, tp_rank, pad_id):
+def device_engram_parameters(layout, layer, tp_rank, pad_id, tensor_parallel_size=2):
     """Pack the split-u64 hash constants consumed by the device producer."""
     layer_index = layout.layer_ids.index(layer)
-    shard = layout.head_shard(layer, tp_rank)
+    shard = layout.head_shard(layer, tp_rank, tensor_parallel_size)
     result = [int(pad_id), shard["head_start"], shard["row_start"]]
     for multiplier in layout.multipliers[layer_index]:
         bits = int(multiplier) & 0xffffffffffffffff
         result.extend((_signed_i32_bits(bits), _signed_i32_bits(bits >> 32)))
     first, last = shard["head_start"], shard["head_stop"]
     primes = [int(value) for value in layout.primes[layer_index, first:last]]
-    result.extend(primes)
-    result.extend(int(value) for value in layout.offsets[layer_index, first:last])
-    result.extend(pow(2, 64, prime) for prime in primes)
+    if len(primes) not in (6, 12):
+        raise ValueError("Device Engram supports TP2/TP4 head shards")
+    # Keep the existing TPC parameter offsets. The index space runs only the
+    # actual local heads; padding has no table accesses or arithmetic work.
+    padding = 12 - len(primes)
+    result.extend(primes + [1] * padding)
+    result.extend([int(value) for value in layout.offsets[layer_index, first:last]] + [0] * padding)
+    result.extend([pow(2, 64, prime) for prime in primes] + [0] * padding)
     if len(result) != 47:
         raise RuntimeError("Device Engram parameter ABI requires exactly 47 I32 values")
     return result
@@ -102,6 +108,14 @@ class EngramTransfer:
     packet: bool = False
 
 
+def stage_device_engram_rows(packed_rows, destination):
+    """Preserve the checkpoint decoder and the persistent consumer address."""
+    from vllm_gaudi.ops.deepseek_v41_math import unpack_swa
+
+    destination.copy_(unpack_swa(packed_rows, destination.shape[-1]))
+    return destination
+
+
 class _C1Packet:
     """One ownership event covers upload and both Engram consumers."""
 
@@ -125,8 +139,14 @@ class _C1Packet:
         self.targets = [value.numpy() for value in host_views]
         self.buffers = tuple(device_views)
         self.consumer_done = torch.hpu.Event()
+        self.native_completion = None
         self.inflight = False
         self.generation = self.pending_generation = 0
+
+    def prepare_native_completion(self, record):
+        if self.generation or self.pending_generation or self.inflight or not callable(record):
+            raise RuntimeError("Native packet completion must be bound before the first transaction")
+        self.native_completion = record
 
     @trace_phase
     def reuse(self):
@@ -148,7 +168,16 @@ class _C1Packet:
     def complete(self, generation, stream):
         if self.pending_generation != generation:
             raise RuntimeError("Stale Engram packet completion")
-        self.consumer_done.record(stream)
+        if self.native_completion is not None:
+            if stream.stream_id != 0:
+                raise RuntimeError("Native Engram packet completion requires its prepared default stream")
+            # HPUEvent.record joins all eager threads before recording. The
+            # continuation must only enqueue retirement here; ring reuse owns
+            # the actual wait for the prior device consumer. The native ticket
+            # passes through the same lowering/execute FIFO as that consumer.
+            self.consumer_done = self.native_completion()
+        else:
+            self.consumer_done.record(stream)
         self.inflight = True
         self.generation, self.pending_generation = generation, 0
 
@@ -261,6 +290,7 @@ class EngramHost:
         self.native_c1 = None
         self.device_c1 = None
         self.device_rows = None
+        self.device_reference = None
         self.device_history = None
         self.device_history_parity = 0
         self.device_request = None
@@ -282,12 +312,19 @@ class EngramHost:
             raise ValueError("Invalid bounded Engram staging geometry")
         self.directory, self.tp_rank = Path(directory), tp_rank
         manifest = json.loads((self.directory / "manifest.json").read_text())
+        self.tensor_parallel_size = manifest.get("tensor_parallel_size", 2)
+        if self.tensor_parallel_size not in (2, 4):
+            raise RuntimeError("Prepared Engram manifest has an unsupported tensor parallel size")
+        if not 0 <= tp_rank < self.tensor_parallel_size:
+            raise ValueError("Invalid Engram TP rank for the prepared manifest")
         record = manifest["engram_host_shards"][str(tp_rank)]
         path = self.directory / record["file"]
         if file_hash(path) != record["sha256"]:
             raise RuntimeError("Engram host shard manifest changed")
         host = json.loads(path.read_text())
-        if (host["tp_rank"] != tp_rank or host["pp_owner"] != 0 or host["sharding"] != "complete_hash_heads"
+        if (host["tp_rank"] != tp_rank
+                or host.get("tensor_parallel_size", self.tensor_parallel_size) != self.tensor_parallel_size
+                or host["pp_owner"] != 0 or host["sharding"] != "complete_hash_heads"
                 or host["model_revision"] != manifest["model_revision"] or not host["shared_read_only"]):
             raise RuntimeError("Engram host shard ownership or revision mismatch")
         config = json.loads((self.directory / "config.json").read_text())["text_config"]
@@ -312,7 +349,7 @@ class EngramHost:
         for layer in self.layout.layer_ids:
             weight = host["tables"][f"layers.{layer}.engram.embed.weight"]
             scale = host["tables"][f"layers.{layer}.engram.embed.scale"]
-            shard = self.layout.head_shard(layer, tp_rank)
+            shard = self.layout.head_shard(layer, tp_rank, self.tensor_parallel_size)
             for item in (weight, scale):
                 if any(item.get(key) != value for key, value in shard.items()):
                     raise RuntimeError("Engram offsets do not match the frozen hash-head layout")
@@ -358,8 +395,10 @@ class EngramHost:
                 np.array([self.shards[layer]["head_start"] for layer in layers], dtype=np.int64),
                 np.array([self.shards[layer]["head_stop"] for layer in layers], dtype=np.int64), self.history.pad_id,
                 [self.tables[layer] for layer in layers], targets)
-        if gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM:
+        if gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and self.tensor_parallel_size in (2, 4):
             self._initialize_device_c1(host, device)
+        elif gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM:
+            raise RuntimeError("Device Engram requires a TP2 or TP4 head shard")
         self.batches = None
         if envs.VLLM_HPU_DSV41_BATCHED_INPUT_STAGING and max_tokens == 6:
             if not envs.VLLM_HPU_DSV41_FUSED_STAGE_IO:
@@ -379,27 +418,36 @@ class EngramHost:
         }
 
     def _initialize_device_c1(self, host, device):
-        from vllm_gaudi.distributed.tp2_fused_ar_norm import _resolve_runtime
+        from vllm_gaudi.ops.deepseek_v41_completion import resolve_device_runtime
 
         layer = self.layout.layer_ids[0]
         if layer != 1:
             raise RuntimeError("Device Engram currently owns the layer-1 table only")
         shard = self.shards[layer]
         local_heads = shard["head_stop"] - shard["head_start"]
-        if local_heads != 12 or self.layout.head_dim != 256:
-            raise RuntimeError("Device Engram requires the qualified 12x256 TP-local geometry")
+        if local_heads != 24 // self.tensor_parallel_size or self.layout.head_dim != 256:
+            raise RuntimeError("Device Engram requires the configured TP-local 256-wide geometry")
         weight, scale = self.table_sources[layer]
         rows = shard["row_stop"] - shard["row_start"]
         token_map = torch.from_numpy(self.history.token_map.astype(np.int32)).to(device)
-        parameters = torch.tensor(device_engram_parameters(self.layout, layer, self.tp_rank, self.history.pad_id),
+        parameters = torch.tensor(device_engram_parameters(self.layout, layer, self.tp_rank, self.history.pad_id,
+                                                           self.tensor_parallel_size),
                                   dtype=torch.int32,
                                   device=device)
         self.device_rows = torch.empty((1, local_heads, self.layout.head_dim), dtype=torch.bfloat16, device=device)
+        # C1 warmup and scheduler page transitions use the host-produced rows.
+        # Keep their decode/copy in one prepared graph as well: an eager codec
+        # otherwise submits dozens of recipes with eager caching disabled.
+        from vllm_gaudi.compilation.deepseek_v41_tp4 import make_backend
+        self.device_reference = (torch.compile(stage_device_engram_rows,
+                                               backend=make_backend(), fullgraph=True, dynamic=False)
+                                 if self.tensor_parallel_size == 4 else stage_device_engram_rows)
+        self.prefix_late_placeholder = self.c1_packets[0].buffers[1]
         self.device_history = (
             torch.empty(3, dtype=torch.int32, device=device),
             torch.empty(3, dtype=torch.int32, device=device),
         )
-        bridge, backend, _ = _resolve_runtime()
+        bridge, backend = resolve_device_runtime(self.tensor_parallel_size)
         if not hasattr(bridge, "DeviceEngramProducer"):
             raise RuntimeError("The TP2 bridge lacks the device Engram producer ABI")
         shared = bool(weight.get("shared_memfd"))
@@ -408,6 +456,15 @@ class EngramHost:
         if shared and getattr(bridge, "device_engram_shared_mapping_version", 0) != 1:
             raise RuntimeError("The TP2 bridge cannot share the resident Engram backing")
         mapping_options = {"shared_checkpoint": True} if shared else {}
+        if self.tensor_parallel_size == 4:
+            if getattr(bridge, "device_engram_tp4_version", 0) != 3:
+                raise RuntimeError("Rebuild the device Engram producer with the TP4 static-table "
+                                   "and mapped-launch contract")
+            if not hasattr(bridge, "record_native_completion"):
+                raise RuntimeError("Device Engram continuation requires producer-ordered native completion")
+            for packet in self.c1_packets:
+                packet.prepare_native_completion(bridge.record_native_completion)
+            mapping_options["local_heads"] = local_heads
         self.device_c1 = bridge.DeviceEngramProducer(
             backend,
             weight["file"],
@@ -450,9 +507,7 @@ class EngramHost:
     def stage_device_c1_reference(self, request_id, packed_rows):
         if self.device_c1 is None or self.device_pending is not None:
             raise RuntimeError("Device Engram warmup staging overlaps another layer-1 generation")
-        from vllm_gaudi.ops.deepseek_v41_math import unpack_swa
-
-        self.device_rows.copy_(unpack_swa(packed_rows, self.layout.head_dim))
+        self.device_reference(packed_rows, self.device_rows)
         self.device_pending = request_id
         return self.device_rows
 
@@ -555,20 +610,32 @@ class EngramHost:
         self.generation += 1
         ring = (self.generation - 1) % self.ring_size
         packet = self.c1_packets[ring] if self.c1_packets is not None else None
+        trace = annotations_enabled()
         if packet is not None:
-            packet.reuse()
+            if trace:
+                with scope(f"v41::engram_packet_reuse::G{self.generation}::slot{ring}"):
+                    packet.reuse()
+            else:
+                packet.reuse()
         else:
             for layer in self.layout.layer_ids:
                 self.slots[layer][ring].reuse()
         arguments = (request_id, int(token_ids[0]), image, self.native_c1, self.generation, ring)
         if self.c1_abi == 2:
-            batch, faults = self.history.prepare_c1(*arguments, device_layer1)
+            arguments += (device_layer1,)
+        elif device_layer1:
+            raise RuntimeError("Layer-14-only preparation requires native C1 ABI 2")
+        if trace:
+            with scope(f"v41::engram_native_gather::G{self.generation}::slot{ring}"):
+                batch, faults = self.history.prepare_c1(*arguments)
         else:
-            if device_layer1:
-                raise RuntimeError("Layer-14-only preparation requires native C1 ABI 2")
             batch, faults = self.history.prepare_c1(*arguments)
         if packet is not None:
-            packet.upload(self.generation, late_only=device_layer1)
+            if trace:
+                with scope(f"v41::engram_packet_upload::G{self.generation}::slot{ring}"):
+                    packet.upload(self.generation, late_only=device_layer1)
+            else:
+                packet.upload(self.generation, late_only=device_layer1)
             buffers = packet.buffers
             self.audit["dma_bytes"] += packet.host_buffers[1].numel() if device_layer1 else packet.host.numel()
             self.audit["c1_packets"] = self.audit.get("c1_packets", 0) + 1
@@ -654,8 +721,12 @@ class EngramHost:
         return ticket.buffers
 
     def set_profiling(self, enabled):
-        if self.pending is not None:
-            raise RuntimeError("Engram profiling cannot change during a pending request transaction")
+        # wait() releases every native gather before publishing ready_ticket.
+        # The transaction can then remain owned by an asynchronous device
+        # consumer; changing host timers must not retire that consumer or wait
+        # for it. A gather that has not been drained still owns its timer mode.
+        if self.pending is not None and self.ready_ticket is not self.pending:
+            raise RuntimeError("Engram profiling cannot change during a pending host gather")
         for slots in self.slots.values():
             for slot in slots:
                 slot.gather.set_profiling(enabled)
@@ -680,7 +751,10 @@ class EngramHost:
         if self.pending is not ticket or ticket.generation != self.generation or self.ready_ticket is not ticket:
             raise RuntimeError("Stale Engram transfer/verify completion")
         if ticket.packet:
-            self.c1_packets[ticket.slot].complete(ticket.generation, torch.hpu.current_stream())
+            packet = self.c1_packets[ticket.slot]
+            packet.complete(ticket.generation, torch.hpu.current_stream())
+            if packet.native_completion is not None:
+                self.audit["native_packet_completions"] = self.audit.get("native_packet_completions", 0) + 1
         elif (getattr(self, "batches", None) is not None
               and not (self.native_c1 is not None and ticket.batch.hash_ids.shape[0] == 1)):
             self.batches[ticket.slot].complete(ticket.generation)
@@ -724,6 +798,7 @@ class EngramHost:
             self.device_c1.close()
         self.device_c1 = None
         self.device_rows = None
+        self.device_reference = None
         self.device_history = None
         self.slots.clear()
         if self.c1_packets is not None:

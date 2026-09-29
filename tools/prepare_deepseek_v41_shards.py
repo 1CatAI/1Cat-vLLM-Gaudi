@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Prepare four immutable TP2/PP2 files, with Engram retained in its source mmap."""
+"""Prepare immutable TP4/PP1 (or legacy TP2/PP2) files, with Engram in its source mmap."""
 
 import argparse
 from datetime import datetime, timezone
@@ -31,6 +31,10 @@ def main():
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--stage-ready-shards", action="store_true",
                         help="Prepare verified backbone files while Engram downloads; publish only after all hashes pass")
+    parser.add_argument("--tensor-parallel-size", type=int, choices=(2, 4), default=4,
+                        help="Tensor parallel degree for prepared rank files (default: 4)")
+    parser.add_argument("--pipeline-parallel-size", type=int, choices=(1, 2), default=1,
+                        help="Pipeline parallel degree (TP4 defaults to PP1)")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     with (args.output / ".prepare.lock").open("a") as lock:
@@ -69,7 +73,8 @@ def prepare(args):
     if not upstream.get("pull_requests"):
         raise ValueError("Missing upstream PR lock")
     catalog = checkpoint_catalog(args.model, allow_download_headers=args.stage_ready_shards)
-    ranks, groups, tables = build_plan(catalog)
+    tp_size, pp_size = args.tensor_parallel_size, args.pipeline_parallel_size
+    ranks, groups, tables = build_plan(catalog, tensor_parallel_size=tp_size, pipeline_parallel_size=pp_size)
     if len(groups) != 43 or len(tables) != 4:
         raise ValueError("Expected 40 backbone MoEs, 3 draft MoEs and two Engram tables with scales")
     for source in catalog.values():
@@ -80,8 +85,9 @@ def prepare(args):
                     "q16_row_block": 128, "q16_k_block": 128, "scale_group": 32,
                     "s16_encoding": "raw_e8m0_bits_shift_left_7", "dense_scale_encoding": "raw_u8",
                     "expert_tp": "intermediate", "w13_order": ["gate", "up"]}
-    plan = {"format_version": 1, "model_revision": checkpoint["revision"], "tensor_parallel_size": 2,
-            "pipeline_parallel_size": 2, "pp_layer_ranges": [[0, 20], [20, 40]],
+    pp_ranges = [[0, 40]] if pp_size == 1 else [[0, 20], [20, 40]]
+    plan = {"format_version": 1, "model_revision": checkpoint["revision"], "tensor_parallel_size": tp_size,
+            "pipeline_parallel_size": pp_size, "pp_layer_ranges": pp_ranges,
             "source_tensor_count": len(catalog), "source_shard_count": len({s.file for s in catalog.values()}),
             "metadata_sha256": {name: sources[name] for name in metadata_files},
             "encoding_sha256": {name: value for name, value in sources.items() if name.startswith("encoding/")},
@@ -160,7 +166,7 @@ def prepare(args):
                 if "source" in spec:
                     source = catalog[spec["source"]]
                     if verified_source(source):
-                        copy_plain(source, writer, name, tp)
+                        copy_plain(source, writer, name, tp, tp_size)
                     else:
                         pending = True
             if not pending:
@@ -169,11 +175,11 @@ def prepare(args):
         for prefix, experts in sorted(groups.items()):
             if prefix in completed:
                 continue
-            pp = stage_for(prefix)
+            pp = stage_for(prefix, pipeline_parallel_size=pp_size)
             if not all(verified_source(source) for matrices in experts.values() for source in matrices.values()):
                 raise RuntimeError(f"Backbone shard verification is still pending for {prefix}")
-            selected = [writers[pp, tp] for tp in range(2)]
-            progress["normal_scales"][prefix] = copy_experts(prefix, experts, selected)
+            selected = [writers[pp, tp] for tp in range(tp_size)]
+            progress["normal_scales"][prefix] = copy_experts(prefix, experts, selected, tp_size)
             save_progress(prefix, selected)
             print(json.dumps({"stage": prefix, "elapsed_s": time.monotonic() - started,
                               "max_rss_mib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024}), flush=True)
@@ -198,7 +204,7 @@ def prepare(args):
                         source = final_catalog[spec["source"]]
                         if not verified_source(source):
                             raise RuntimeError("Checkpoint audit is complete but a source file has changed")
-                        copy_plain(source, writers[pp, tp], name, tp)
+                        copy_plain(source, writers[pp, tp], name, tp, tp_size)
                 save_progress(key, [writers[pp, tp]])
     finally:
         for writer in writers.values():
@@ -210,9 +216,10 @@ def prepare(args):
                                          "bytes": path.stat().st_size, "tensors": len(writer.specs),
                                          "inode": path.stat().st_ino, "mtime_ns": path.stat().st_mtime_ns}
     host_files = {}
-    for tp in range(2):
+    for tp in range(tp_size):
         path = args.output / f"engram-tp{tp}.json"
-        publish_json(path, host_manifest(tables, tp, checkpoint["revision"], sources, hash_layout=hash_layout))
+        publish_json(path, host_manifest(tables, tp, checkpoint["revision"], sources, hash_layout=hash_layout,
+                                         tensor_parallel_size=tp_size))
         host_files[str(tp)] = {"file": path.name, "sha256": file_hash(path)}
     for relative in sources:
         if relative.endswith(".safetensors") or relative.startswith("inference/"):

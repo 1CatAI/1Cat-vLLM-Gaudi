@@ -19,8 +19,9 @@ def native():
     torch.ops.load_library(os.environ["VLLM_HPU_DSV4_TPC_OP_LIBRARY"])
 
 
+@pytest.mark.parametrize("local_heads", [8, 16])
 @pytest.mark.parametrize("tokens,columns,ratio", [(7, 1, 1), (7, 127, 2), (127, 129, 1), (7, 2047, 2)])
-def test_padded_source_rows_and_changed_positions(native, monkeypatch, tokens, columns, ratio):
+def test_padded_source_rows_and_changed_positions(native, monkeypatch, tokens, columns, ratio, local_heads):
     monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_INDEX_SRAM", "1")
     monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_INDEX_MME", "1")
     torch.manual_seed(5117)
@@ -33,7 +34,7 @@ def test_padded_source_rows_and_changed_positions(native, monkeypatch, tokens, c
     row_owner = torch.arange(columns + 17, dtype=torch.int64, device="hpu") + 512
     rows = row_owner[17:]
     positions = (torch.arange(tokens, dtype=torch.int64) * 53 + 512) * ratio
-    owner = SimpleNamespace(ratio=ratio, index_heads=16, cache=SimpleNamespace(index=packed))
+    owner = SimpleNamespace(ratio=ratio, index_heads=local_heads, tensor_parallel_size=32 // local_heads, cache=SimpleNamespace(index=packed))
     page_rows = 128 // ratio
     owner.shared = SimpleNamespace(block_table=table,
                                    physical_rows=lambda r, _: table[
@@ -54,8 +55,9 @@ def test_incomplete_sram_dispatch_fails_before_execution(monkeypatch):
         validate_prefill_region_config()
 
 
+@pytest.mark.parametrize("local_heads", [8, 16])
 @pytest.mark.parametrize("tokens,source,ratio", [(7, 512, 2), (127, 2056, 1), (128, 32768, 1)])
-def test_reindex_candidate_order_and_visibility(native, tokens, source, ratio):
+def test_reindex_candidate_order_and_visibility(native, tokens, source, ratio, local_heads):
     from vllm_gaudi.ops.deepseek_v41_prefill_index_scores import compiled_decoded_reindex
     torch.manual_seed(6147)
     query = torch.randn(tokens, 32, 128).bfloat16().to("hpu")
@@ -74,7 +76,7 @@ def test_reindex_candidate_order_and_visibility(native, tokens, source, ratio):
             query.neg_()
             weights.neg_()
             blocks.copy_(blocks_cpu.roll(1, 1))
-        arguments = (query, weights, keys, positions, blocks, ratio, 16, True)
+        arguments = (query, weights, keys, positions, blocks, ratio, local_heads, True)
         expected = old(*arguments, False).cpu()
         actual = new(*arguments, True).cpu()
         assert torch.equal(expected, actual)

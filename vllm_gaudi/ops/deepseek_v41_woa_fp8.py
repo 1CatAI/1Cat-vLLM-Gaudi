@@ -22,6 +22,12 @@ QUANTIZATION = {
 FINGERPRINT = canonical_hash(QUANTIZATION)
 
 
+def quantization_for_tp(tp_size):
+    if tp_size not in (2, 4):
+        raise ValueError("wo_a preparation requires TP2 or TP4")
+    return {**QUANTIZATION, "layout": f"G{8 // tp_size}-K4096-N1024"}
+
+
 def layer_selection(path):
     data = {"version": 1, "layers": list(range(40))} if not path else json.loads(Path(path).read_text())
     if set(data) != {"version", "layers"} or data["version"] != 1 or not isinstance(data["layers"], list):
@@ -119,7 +125,9 @@ class WoaFP8Sidecar:
     def __init__(self, directory, shard):
         directory = Path(directory)
         data = json.loads((directory / "manifest.json").read_text())
-        if (data["quantization"] != QUANTIZATION or data["quantization_fingerprint"] != FINGERPRINT
+        quantization = quantization_for_tp(shard.tensor_parallel_size)
+        fingerprint = canonical_hash(quantization)
+        if (data["quantization"] != quantization or data["quantization_fingerprint"] != fingerprint
                 or data["source_manifest_sha256"] != file_hash(shard.directory / "manifest.json")):
             raise ValueError("wo_a sidecar source/quantization mismatch")
         record = data["rank_files"][f"pp{shard.pp_rank}-tp{shard.tp_rank}"]
@@ -134,15 +142,16 @@ class WoaFP8Sidecar:
             raise ValueError("wo_a sidecar rank ownership mismatch")
         self.catalog = read_header(self.path)
         expected = {}
-        for layer in range(shard.pp_rank * 20, shard.pp_rank * 20 + 20):
-            expected[f"layers.{layer}.attn.wo_a.weight"] = ("U8", (4, 4096, 1024))
-            expected[f"layers.{layer}.attn.wo_a.channel_scale"] = ("F32", (4, 1, 1024))
+        groups = 8 // shard.tensor_parallel_size
+        for layer in range(*shard.manifest["pp_layer_ranges"][shard.pp_rank]):
+            expected[f"layers.{layer}.attn.wo_a.weight"] = ("U8", (groups, 4096, 1024))
+            expected[f"layers.{layer}.attn.wo_a.channel_scale"] = ("F32", (groups, 1, 1024))
         if set(expected) != set(self.catalog) or any(
             (self.catalog[k].dtype, self.catalog[k].shape) != v for k, v in expected.items()):
             raise ValueError("wo_a sidecar layout/ownership mismatch")
         st = self.path.stat()
         self.identity = st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns
-        self.fingerprint = canonical_hash({"quantization": FINGERPRINT, "rank_sha256": record["sha256"]})
+        self.fingerprint = canonical_hash({"quantization": fingerprint, "rank_sha256": record["sha256"]})
 
     def tensor(self, name, device):
         import torch

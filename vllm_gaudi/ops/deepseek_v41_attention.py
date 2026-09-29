@@ -76,7 +76,7 @@ class CSA2SharedState(nn.Module):
 
 class CSA2Attention(FusedCompressorInput, nn.Module):
 
-    def __init__(self, weights, config, layer, shared, linear, reduce, device):
+    def __init__(self, weights, config, layer, shared, linear, reduce, device, tensor_parallel_size=2):
         super().__init__()
         self.weights = weights
         self.woa_fp8 = False
@@ -140,8 +140,13 @@ class CSA2Attention(FusedCompressorInput, nn.Module):
         if self.c1_indices and not self.bounded_decode:
             raise ValueError("Native C1 index preparation requires bounded packed attention")
         self.linear, self.reduce = linear, reduce
+        if tensor_parallel_size < 1 or config["num_attention_heads"] % tensor_parallel_size \
+                or config["o_groups"] % tensor_parallel_size:
+            raise ValueError("V4.1 attention head geometry is not divisible by the runtime TP size")
+        self.tensor_parallel_size = tensor_parallel_size
         self.layer, self.ratio, self.length = layer, config["compress_ratios"][layer], shared.length
-        self.heads, self.groups = config["num_attention_heads"] // 2, config["o_groups"] // 2
+        self.heads, self.groups = (config["num_attention_heads"] // tensor_parallel_size,
+                                   config["o_groups"] // tensor_parallel_size)
         self.eps, self.window = config["rms_norm_eps"], config["sliding_window"]
         if (self.c1_indices or self.native_rope) and (self.length != 512 or self.window != 128
                                                       or config["qk_rope_head_dim"] != 64):

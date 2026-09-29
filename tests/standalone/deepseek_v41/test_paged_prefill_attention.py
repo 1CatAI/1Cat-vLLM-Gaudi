@@ -86,3 +86,25 @@ def test_streaming_topk_matches_one_shot_for_independent_source_rows():
     scores = Scorer._scores(positions, rows, None, None)
     expected = rows.expand_as(scores).gather(1, scores.topk(width, -1, sorted=False).indices)
     assert torch.equal(actual.sort(-1).values, expected.sort(-1).values)
+
+
+def test_prefill_swa_current_and_prior_rows_share_packed_cache_precision():
+    # Values deliberately lie between FP8 levels. Integer-valued fixtures can
+    # hide a chunk-boundary change from raw BF16 to packed-cache precision.
+    torch.manual_seed(742)
+    current = (torch.randn(256, 512) * .137).bfloat16()
+    expected = unpack_swa(pack_swa(current))
+    assert not torch.equal(current, expected)
+
+    def owner():
+        return SimpleNamespace(window=128, window_offsets=torch.arange(128, dtype=torch.int32),
+                               swa=torch.zeros(SWA_ROWS, 528, dtype=torch.uint8))
+
+    whole, split = owner(), owner()
+    positions = torch.arange(256, dtype=torch.int32)
+    full, full_ids = PagedCSA2Attention._prefill_swa_workspace(whole, current, positions)
+    PagedCSA2Attention._prefill_swa_workspace(split, current[:128], positions[:128])
+    tail, tail_ids = PagedCSA2Attention._prefill_swa_workspace(split, current[128:], positions[128:])
+    assert torch.equal(full[127:], expected)
+    assert torch.equal(full[full_ids[128:].long()], tail[tail_ids.long()])
+    assert torch.equal(whole.swa, split.swa)

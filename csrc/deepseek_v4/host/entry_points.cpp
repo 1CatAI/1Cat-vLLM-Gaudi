@@ -31,6 +31,7 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVE
 #include "deepseek_v41_dynamic_quant_bf16_gaudi2.hpp"
 #include "deepseek_v41_ffn_norm_quant_gaudi2.hpp"
 #include "deepseek_v41_selected_mla_gaudi2.hpp"
+#include "deepseek_v41_paged_mla_gather_gaudi2.hpp"
 #include "deepseek_v41_prefill_sparse_mla_gaudi2.hpp"
 #include "deepseek_v41_selected_kv_gaudi2.hpp"
 #include "deepseek_v41_head_attention_gaudi2.hpp"
@@ -236,6 +237,7 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_DYNAMIC_QUANT,
     GAUDI2_KERNEL_DEEPSEEK_V41_FFN_NORM_QUANT,
     GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_MLA_GATHER,
+    GAUDI2_KERNEL_DEEPSEEK_V41_PAGED_MLA_GATHER,
     GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_MLA_SOFTMAX,
     GAUDI2_KERNEL_DEEPSEEK_V41_ENGRAM_HASH_GATHER_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V41_INDEX_SCORES,
@@ -462,6 +464,7 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_CANDIDATE_GATHER].name,
                 DeepseekV41CandidateGatherGaudi2::name);
     DeepseekV41SelectedMlaGaudi2(true).GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_MLA_GATHER].name);
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_PAGED_MLA_GATHER].name, DeepseekV41PagedMlaGatherGaudi2::name);
     DeepseekV41SelectedMlaGaudi2(false).GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_MLA_SOFTMAX].name);
     DeepseekV41PrefillSparseMlaGaudi2(DeepseekV41PrefillSparseMlaGaudi2::Gather).GetKernelName(
         guids[GAUDI2_KERNEL_DEEPSEEK_V41_PREFILL_SPARSE_KV_BF16].name);
@@ -927,6 +930,8 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
         return mainFastDynamicQuant.GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41FfnNormQuantGaudi2::name) == 0)
         return DeepseekV41FfnNormQuantGaudi2().GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name, DeepseekV41PagedMlaGatherGaudi2::name) == 0)
+        return DeepseekV41PagedMlaGatherGaudi2().GetGcDefinitions(params, instance);
     auto mainFast5 = DeepseekV41SelectedMlaGaudi2(true);
     mainFast5.GetKernelName(kernelName);
     if (std::strcmp(params->guid.name, kernelName) == 0)

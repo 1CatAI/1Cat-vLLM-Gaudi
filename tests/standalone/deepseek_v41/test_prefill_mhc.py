@@ -59,3 +59,21 @@ def test_native_prompt_collapse_preserves_every_bf16_bit(tokens):
         expected = (residual.float() * previous_pre.unsqueeze(-1)).sum(1).bfloat16()
         actual = op(residual, previous_pre)
         assert torch.equal(actual.cpu().view(torch.int16), expected.cpu().view(torch.int16))
+
+
+@pytest.mark.parametrize("tokens", [128, 16384])
+def test_bounded_control_keeps_row_order_and_original_fp32_math(monkeypatch, tokens):
+    from vllm_gaudi.ops.deepseek_v41_math import bounded_prefill_hc_input, prefill_hc_input
+    monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_REGIONS", "0")
+    torch.manual_seed(822)
+    residual = torch.randn(tokens, 4, 64).bfloat16()
+    before = residual.clone()
+    previous = torch.rand(tokens, 4)
+    fn, scale, base = torch.randn(24, 256) * .01, torch.ones(3), torch.randn(24) * .02
+    norm = torch.ones(64, dtype=torch.bfloat16)
+    arguments = residual, previous, fn, scale, base, norm, 1e-20, 1e-6, 20, fn
+    expected = prefill_hc_input(*arguments)[1:]
+    actual = bounded_prefill_hc_input(*arguments)
+    for value, wanted in zip(actual, expected, strict=True):
+        torch.testing.assert_close(value, wanted, rtol=0, atol=0)
+    assert torch.equal(residual, before)

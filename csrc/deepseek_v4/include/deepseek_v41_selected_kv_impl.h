@@ -21,13 +21,21 @@ static inline float64 ue8m0(uint64 code) {
 }
 
 void main(tensor swa, tensor main_cache, tensor indices,
+#ifdef DSV41_PACKED_MLA_GATHER
+          tensor attention_indices, tensor lengths,
+#endif
 #ifdef DSV41_KV_WRITE_DEPENDENCY
           tensor completion,
 #endif
 #ifdef DSV41_COMPRESS_WRITE_DEPENDENCY
           tensor compressed_completion,
 #endif
-          tensor rows, tensor local_indices) {
+          tensor rows,
+#ifdef DSV41_PACKED_MLA_GATHER
+          tensor values, tensor mask) {
+#else
+          tensor local_indices) {
+#endif
 #ifdef DSV41_KV_WRITE_DEPENDENCY
     const bool swa_ready = s_i32_ld_g(gen_addr((int5){0}, completion)) >= 0;
 #else
@@ -53,10 +61,32 @@ void main(tensor swa, tensor main_cache, tensor indices,
     scale_directions.v1 = (lanes >> 4) | 0x80;
     const uchar256 main_scale_directions = convert_uint256_to_uchar256(scale_directions, SW_LINEAR);
 #endif
-    for (int slot = begin[0]; slot < end[0]; ++slot) {
+#ifdef DSV41_PACKED_MLA_GATHER
+    const int first_token = begin[1], token_end = end[1];
+#else
+    const int first_token = 0, token_end = 1;
+#endif
+    for (int token = first_token; token < token_end; ++token) {
+#ifdef DSV41_PACKED_MLA_GATHER
+        const int length = s_i32_ld_g(gen_addr((int5){token}, lengths));
+        const int selected_rows = get_dim_size(indices, 0);
+#endif
+        for (int slot = begin[0]; slot < end[0]; ++slot) {
+#ifdef DSV41_PACKED_MLA_GATHER
+        const int selected = s_i32_ld_g(gen_addr((int5){slot, token}, attention_indices));
+        const bool consumed = slot < length && selected >= 0 && selected < selected_rows;
+        int index = -1;
+        if (consumed) index = s_i32_ld_g(gen_addr((int5){selected}, indices));
+        // The original gather accepts an in-range selected row even when its
+        // physical source was invalid and the decoder filled it with zeros.
+        s_f32_st_g(gen_addr((int5){slot, token}, mask), consumed ? 1.0f : 0.0f);
+#else
         const int index = s_i32_ld_g(gen_addr((int5){slot, 0, 0, 0, 0}, indices));
+#endif
         const bool valid = ready && index >= 0 && index < swa_length + main_length;
+#ifndef DSV41_PACKED_MLA_GATHER
         s_i32_st_g(gen_addr((int5){slot, 0, 0, 0, 0}, local_indices), valid ? slot : -1);
+#endif
 #ifdef DSV41_SELECTED_VALID_ONLY
         // The only consumer rejects -1 before loading a row. Invalid rows are
         // internal unspecified storage; the public gather still writes zeros.
@@ -117,7 +147,14 @@ void main(tensor swa, tensor main_cache, tensor indices,
             float128 wide = {0};
             wide.v1 = value;
             const bfloat128 output = convert_float128_to_bfloat128(wide, SW_RHNE | SW_LINEAR);
-            v_bf16_st_tnsr_partial((int5){chunk * 64, slot, 0, 0, 0}, rows, output, 63, 0);
+            v_bf16_st_tnsr_partial((int5){chunk * 64, slot, token, 0, 0}, rows, output, 63, 0);
+#ifdef DSV41_PACKED_MLA_GATHER
+            // PV must consume the rounded BF16 key, exactly as the separate
+            // gather did, including signed zeros and nonfinite values.
+            const float128 restored = convert_bfloat128_to_float128(output, SW_LINEAR);
+            v_f32_st_tnsr((int5){chunk * 64, slot, token, 0, 0}, values, restored.v1);
+#endif
+        }
         }
     }
 }

@@ -74,39 +74,44 @@ def test_tp_rules_preserve_pp_and_draft_embedding():
         stage_for("layers.40.attn.wq_a.weight")
 
 
-def test_streamed_tp_experts_reconstruct_all_source_bytes(tmp_path):
+@pytest.mark.parametrize("tp_size,pp_size,intermediate", [(2, 2, 256), (4, 1, 256), (4, 1, 2304)])
+def test_streamed_tp_experts_reconstruct_all_source_bytes(tmp_path, tp_size, pp_size, intermediate):
     rng = np.random.default_rng(0)
     tensors = {}
     prefix = "layers.0.ffn.experts"
     for expert in range(2):
         for projection in ("w1", "w2", "w3"):
-            for kind, columns in (("weight", 128), ("scale", 8)):
+            n, k = (256, intermediate) if projection == "w2" else (intermediate, 256)
+            for kind, columns in (("weight", k // 2), ("scale", k // 32)):
                 tensors[f"{prefix}.{expert}.{projection}.{kind}"] = (
                     "I8" if kind == "weight" else "F8_E8M0",
-                    rng.integers(0, 256, (256, columns), dtype=np.uint8))
+                    rng.integers(0, 256, (n, columns), dtype=np.uint8))
     tensors["embed.weight"] = ("BF16", np.arange(64, dtype=np.uint16).reshape(8, 8))
     tensors["layers.0.attn.wo_b.scale"] = ("F8_E8M0", np.arange(32, dtype=np.uint8).reshape(4, 8))
     catalog = write_source(tmp_path / "source.safetensors", tensors)
-    plans, groups, tables = build_plan(catalog)
+    plans, groups, tables = build_plan(catalog, tensor_parallel_size=tp_size, pipeline_parallel_size=pp_size)
     assert not tables
-    assert plans[1, 0]["mtp.embed.weight"]["source"] == "embed.weight"
-    writers = [RankWriter(tmp_path / f"tp{tp}.safetensors", plans[0, tp], {}) for tp in range(2)]
+    assert len(plans) == 4
+    assert plans[pp_size - 1, 0]["mtp.embed.weight"]["source"] == "embed.weight"
+    writers = [RankWriter(tmp_path / f"tp{tp}.safetensors", plans[0, tp], {}) for tp in range(tp_size)]
     try:
-        copy_experts(prefix, groups[prefix], writers)
+        copy_experts(prefix, groups[prefix], writers, tp_size)
         for tp, writer in enumerate(writers):
             for name, spec in writer.specs.items():
                 if "source" in spec:
-                    copy_plain(catalog[spec["source"]], writer, name, tp)
+                    copy_plain(catalog[spec["source"]], writer, name, tp, tp_size)
             writer.sync()
     finally:
         for writer in writers:
             writer.close()
-    for tp in range(2):
+    local = intermediate // tp_size
+    padded = (local + 127) // 128 * 128
+    for tp in range(tp_size):
         result = read_header(tmp_path / f"tp{tp}.safetensors")
         for expert in range(2):
             for projection in ("w1", "w3", "w2"):
                 prepared_projection = "w2" if projection == "w2" else "w13"
-                logical = (256, 128) if projection == "w2" else (256, 256)
+                logical = (256, padded) if projection == "w2" else (padded * 2, 256)
                 for kind, prepared_kind, restore, dtype in (("weight", "q16", restore_q16, np.int16),
                                                            ("scale", "s16", restore_s16, np.uint16)):
                     name = f"{prefix}.{prepared_projection}_{prepared_kind}"
@@ -115,15 +120,35 @@ def test_streamed_tp_experts_reconstruct_all_source_bytes(tmp_path):
                     restored = restore(value, logical)
                     expected = tensors[f"{prefix}.{expert}.{projection}.{kind}"][1]
                     if projection == "w2":
-                        half = expected.shape[1] // 2
-                        expected = expected[:, tp * half:(tp + 1) * half]
+                        width = expected.shape[1] // tp_size
+                        expected = expected[:, tp * width:(tp + 1) * width]
+                        padding = restored[:, width:]
+                        assert np.all(padding == (0 if kind == "weight" else 127))
+                        restored = restored[:, :width]
                     else:
-                        restored = restored[:128] if projection == "w1" else restored[128:]
-                        expected = expected[tp * 128:(tp + 1) * 128]
+                        restored = restored[:padded] if projection == "w1" else restored[padded:]
+                        assert np.all(restored[local:] == (0 if kind == "weight" else 127))
+                        restored = restored[:local]
+                        expected = expected[tp * local:(tp + 1) * local]
                     assert np.array_equal(restored, expected)
         assert result["layers.0.attn.wo_b.scale"].dtype == "U8"
         assert np.array_equal(result["layers.0.attn.wo_b.scale"].raw_rows(),
-                              tensors["layers.0.attn.wo_b.scale"][1][:, tp * 4:(tp + 1) * 4])
+                              tensors["layers.0.attn.wo_b.scale"][1][:, tp * (8 // tp_size):(tp + 1) * (8 // tp_size)])
+
+
+def test_tp4_single_stage_owns_all_layers_and_output(tmp_path):
+    names = ("embed.weight", "head.weight", "norm.weight", "layers.0.attn.wq_a.weight",
+             "layers.20.attn.wq_a.weight", "layers.39.attn.wq_a.weight", "mtp.0.main_proj.weight")
+    catalog = write_source(tmp_path / "source.safetensors",
+                           {name: ("BF16", np.zeros((8, 8), dtype=np.uint16)) for name in names})
+    plans, _, _ = build_plan(catalog, tensor_parallel_size=4, pipeline_parallel_size=1)
+    assert set(plans) == {(0, rank) for rank in range(4)}
+    for specs in plans.values():
+        assert set(names).issubset(specs)
+        assert specs["embed.weight"]["shape"] == [2, 8]
+        assert specs["head.weight"]["shape"] == [2, 8]
+    with pytest.raises(ValueError, match="Layer is outside"):
+        stage_for("layers.40.attn.wq_a.weight", pipeline_parallel_size=1)
 
 
 def test_host_shards_reference_disjoint_source_rows(tmp_path):

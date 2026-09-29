@@ -23,7 +23,8 @@ _qualified_regions = frozenset(
     ("_prefill_swa_workspace", "_prefill_main_workspace", "_prefill_engram_unpack", "_prefill_combine"))
 _qualified_function_regions = frozenset(("_prefill_hc_post", "_prefill_hc_collapse", "_prefill_hc_control_bf16",
                                          "_prefill_combine", "prefill_main_workspace", "prefill_hc_input",
-                                         "prefill_q_projection", "prefill_output_projection", "prefill_swa_workspace"))
+                                         "prefill_q_projection", "prefill_output_projection", "prefill_swa_workspace",
+                                         "_prefill_engram_tile"))
 
 
 def validate_prefill_region_config():
@@ -208,7 +209,7 @@ def prefill_q_projection(value, weight, channel_scale, positions, table):
     """
     return torch.ops.custom_op.custom_deepseek_v41_prefill_q_projection_rope_gaudi2(value, weight, channel_scale,
                                                                                     positions, table).reshape(
-                                                                                        value.shape[0], 32, 512)
+                                                                                        value.shape[0], weight.shape[0] // 512, 512)
 
 
 @prefill_function_region

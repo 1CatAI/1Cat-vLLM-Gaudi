@@ -24,16 +24,18 @@ habana::OutputMetaDataVector metadata(const at::Stack& stack, bool scale_only, b
                 "Prefill Q projection requires T1..8192");
     const auto tokens = x.size(0);
     const auto w = stack.at(1).toTensor(), s = stack.at(2).toTensor();
+    const auto width = scale_only ? x.size(1) : w.size(0);
+    TORCH_CHECK(width == 8192 || width == 16384, "Q projection requires TP2/TP4 width");
     if (scale_only) {
-        TORCH_CHECK(x.scalar_type() == (bf16_product ? at::kBFloat16 : at::kFloat) && x.size(1) == 16384 &&
-                    w.scalar_type() == at::kFloat && w.sizes() == at::IntArrayRef({1, 16384}) &&
+        TORCH_CHECK(x.scalar_type() == (bf16_product ? at::kBFloat16 : at::kFloat) && x.size(1) == width &&
+                    w.scalar_type() == at::kFloat && w.sizes() == at::IntArrayRef({1, width}) &&
                     s.scalar_type() == at::kFloat && s.sizes() == at::IntArrayRef({tokens, 1}),
                     "Prefill Q epilogue product dtype must match the selected operator; scales are F32");
     } else {
         TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.size(1) == 1280 &&
                     w.scalar_type() == at::ScalarType::Float8_e4m3fn &&
-                    w.sizes() == at::IntArrayRef({16384, 1280}) &&
-                    s.scalar_type() == at::kFloat && s.sizes() == at::IntArrayRef({1, 16384}),
+                    w.sizes() == at::IntArrayRef({width, 1280}) &&
+                    s.scalar_type() == at::kFloat && s.sizes() == at::IntArrayRef({1, width}),
                     "Prefill Q projection requires BF16 [T,1280], FP8 [16384,1280], F32 [1,16384]");
     }
     const auto pos = stack.at(3).toTensor(), table = stack.at(4).toTensor();
@@ -41,7 +43,7 @@ habana::OutputMetaDataVector metadata(const at::Stack& stack, bool scale_only, b
                 table.scalar_type() == at::kFloat && table.dim() == 2 && table.size(0) > 0 &&
                 table.size(0) <= 1048576 && table.size(1) == 64,
                 "Prefill Q RoPE requires I32 [T] and F32 concatenated cos/sin [L,64]");
-    return {{at::kBFloat16, {tokens, 16384}}};
+    return {{at::kBFloat16, {tokens, width}}};
 }
 
 class Projection final : public habana::OpBackend {
@@ -58,7 +60,7 @@ public:
     void AddNode(synapse_helpers::graph& graph, const at::Stack& stack) override {
         const auto output = metadata(stack, scale_only_, bf16_product_);
         const auto epilogue_guid = bf16_product_ ? bf16_guid : guid;
-        const auto tokens = output[0].shape[0];
+        const auto tokens = output[0].shape[0], width = output[0].shape[1];
         if (scale_only_) {
             auto result = BuildNode(this, graph, {epilogue_guid, {syn_in(0), syn_in(1), syn_in(2), syn_in(3), syn_in(4)},
                 {{output[0].shape, at::kBFloat16, 0}}});

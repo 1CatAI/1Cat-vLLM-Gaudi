@@ -122,6 +122,7 @@ def test_head_greedy_and_logprob_share_fp32_projection(monkeypatch):
     stage = object.__new__(program.PreparedStage)
     torch.nn.Module.__init__(stage)
     stage.bf16_head, stage.pp_rank, stage.tp_rank = True, 1, 0
+    stage.is_last_stage = True
     stage.weights = SimpleNamespace(head=SimpleNamespace(weight=weight))
     stage.all_gather = lambda x, dim: torch.cat((x, x), dim=dim)
     for _ in range(2):

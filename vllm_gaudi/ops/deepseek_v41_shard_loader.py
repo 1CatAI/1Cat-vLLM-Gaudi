@@ -21,18 +21,20 @@ class PreparedV41Shard:
 
     def __init__(self, directory, pp_rank: int, tp_rank: int, *, verify_hash=False):
         self.directory = Path(directory)
-        if pp_rank not in (0, 1) or tp_rank not in (0, 1):
-            raise ValueError("Prepared V4.1 files require TP2 x PP2")
         self.manifest = json.loads((self.directory / "manifest.json").read_text())
         self.plan = json.loads((self.directory / "preparation-plan.json").read_text())
         manifest = self.manifest
-        if (manifest["tensor_parallel_size"] != 2 or manifest["pipeline_parallel_size"] != 2
-                or manifest["pp_layer_ranges"] != [[0, 20], [20, 40]]
+        tp_size = manifest.get("tensor_parallel_size")
+        pp_size = manifest.get("pipeline_parallel_size")
+        expected_ranges = [[0, 40]] if pp_size == 1 else [[0, 20], [20, 40]] if pp_size == 2 else None
+        if ((tp_size, pp_size) not in ((2, 2), (4, 1)) or not 0 <= pp_rank < pp_size or not 0 <= tp_rank < tp_size
+                or manifest["pp_layer_ranges"] != expected_ranges
                 or manifest["prepared_layout_version"] != LAYOUT_VERSION):
-            raise ValueError("Prepared V4.1 topology or layout version mismatch")
+            raise ValueError("Prepared V4.1 topology or layout version mismatch (expected TP4 x PP1; TP2 x PP2 legacy)")
         if canonical_hash(self.plan) != manifest["plan_fingerprint"]:
             raise ValueError("Prepared plan differs from the published manifest")
-        for key in ("model_revision", "quantization_fingerprint", "upstream_lock_sha256"):
+        for key in ("model_revision", "quantization_fingerprint", "upstream_lock_sha256",
+                    "tensor_parallel_size", "pipeline_parallel_size", "pp_layer_ranges"):
             if self.plan[key] != manifest[key]:
                 raise ValueError(f"Prepared manifest {key} mismatch")
         for name, expected in manifest["metadata_sha256"].items():
@@ -71,6 +73,7 @@ class PreparedV41Shard:
             if source.dtype != spec["dtype"] or source.shape != tuple(spec["shape"]):
                 raise ValueError(f"Prepared tensor shape or dtype mismatch: {name}")
         self.pp_rank, self.tp_rank = pp_rank, tp_rank
+        self.tensor_parallel_size, self.pipeline_parallel_size = tp_size, pp_size
         self.max_host_chunk_bytes = 0
 
     def _local_path(self, name):

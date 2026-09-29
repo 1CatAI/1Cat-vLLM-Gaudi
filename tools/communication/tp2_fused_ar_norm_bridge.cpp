@@ -1106,10 +1106,17 @@ struct DeviceEngramRecipe {
     return result;
   }
 
-  void compile(uint64_t vocab_size, uint64_t rows) {
+  void compile(uint64_t vocab_size, uint64_t rows, uint64_t local_heads) {
     checkSynapse(synGraphCreate(&graph, synDeviceGaudi2),
                  "synGraphCreate(device Engram)");
     std::array<uint8_t, 1> compile_byte{};
+    // Table geometry is static data. Address-space translation belongs to
+    // the launch descriptor; making the graph tensor H2D triggers the 1.24
+    // mount/shape pipeline, which is unrelated to this mapped read.
+    const bool static_table = local_heads == 6;
+    const auto table_type = static_table ? DATA_TENSOR : HOST_TO_DEVICE_TENSOR;
+    void* compile_data = static_table ? nullptr : compile_byte.data();
+    const uint64_t compile_bytes = static_table ? 0 : compile_byte.size();
     synTensor inputs[6] = {
         tensor(DATA_TENSOR, "raw_token", {1, 1}, syn_type_int32),
         tensor(DATA_TENSOR, "history", {kDeviceEngramHistory, 1},
@@ -1117,14 +1124,14 @@ struct DeviceEngramRecipe {
         tensor(DATA_TENSOR, "token_map", {vocab_size, 1}, syn_type_int32),
         tensor(DATA_TENSOR, "parameters", {kDeviceEngramParameters, 1},
                syn_type_int32),
-        tensor(HOST_TO_DEVICE_TENSOR, "weights", {kDeviceEngramWidth, rows},
-               syn_type_uint8, compile_byte.data(), compile_byte.size()),
-        tensor(HOST_TO_DEVICE_TENSOR, "scales", {kDeviceEngramScales, rows},
-               syn_type_uint8, compile_byte.data(), compile_byte.size()),
+        tensor(table_type, "weights", {kDeviceEngramWidth, rows},
+               syn_type_uint8, compile_data, compile_bytes),
+        tensor(table_type, "scales", {kDeviceEngramScales, rows},
+               syn_type_uint8, compile_data, compile_bytes),
     };
     synTensor outputs[2] = {
         tensor(DATA_TENSOR, "decoded_rows",
-               {kDeviceEngramWidth, kDeviceEngramHeads}, syn_type_bf16),
+               {kDeviceEngramWidth, local_heads}, syn_type_bf16),
         tensor(DATA_TENSOR, "next_history", {kDeviceEngramHistory, 1},
                syn_type_int32),
     };
@@ -1192,8 +1199,10 @@ class DeviceEngramProducer
                        const std::string &scale_file, uint64_t scale_offset,
                        uint64_t scale_bytes, uint64_t rows,
                        at::Tensor token_map, at::Tensor parameters,
-                       bool shared_checkpoint)
-      : token_map_(std::move(token_map)), parameters_(std::move(parameters)) {
+                       bool shared_checkpoint, uint64_t local_heads = kDeviceEngramHeads)
+      : token_map_(std::move(token_map)), parameters_(std::move(parameters)), local_heads_(local_heads) {
+    TORCH_CHECK(local_heads_ == 6 || local_heads_ == 12,
+                "Device Engram requires 6 or 12 local heads");
     auto *group = dynamic_cast<c10d::ProcessGroupEagerHCCL *>(backend.get());
     TORCH_CHECK(group != nullptr,
                 "Device Engram requires ProcessGroupEagerHCCL");
@@ -1215,7 +1224,7 @@ class DeviceEngramProducer
         device.id(), weight_file, weight_offset, weight_bytes, shared_checkpoint);
     scales_ = std::make_unique<MappedCheckpointRange>(
         device.id(), scale_file, scale_offset, scale_bytes, shared_checkpoint);
-    recipe_.compile(token_map_.numel(), rows);
+    recipe_.compile(token_map_.numel(), rows, local_heads_);
   }
 
   ~DeviceEngramProducer() {
@@ -1239,9 +1248,9 @@ class DeviceEngramProducer
     TORCH_CHECK(decoded_rows.device().type() == at::kHPU &&
                     decoded_rows.scalar_type() == at::kBFloat16 &&
                     decoded_rows.numel() ==
-                        kDeviceEngramHeads * kDeviceEngramWidth &&
+                        local_heads_ * kDeviceEngramWidth &&
                     decoded_rows.is_contiguous(),
-                "Device Engram decoded_rows must be contiguous 12x256 BF16 on HPU");
+                "Device Engram decoded_rows must match the prepared local head count");
     TORCH_CHECK(raw_token.device() == history.device() &&
                     history.device() == next_history.device() &&
                     next_history.device() == decoded_rows.device() &&
@@ -1350,6 +1359,7 @@ class DeviceEngramProducer
   std::shared_ptr<habana::HcclCommunicator> communicator_;
   at::Tensor token_map_;
   at::Tensor parameters_;
+  uint64_t local_heads_;
   std::unique_ptr<MappedCheckpointRange> weights_;
   std::unique_ptr<MappedCheckpointRange> scales_;
   DeviceEngramRecipe recipe_;
@@ -1361,6 +1371,7 @@ class DeviceEngramProducer
 #include "tp2_prepared_plan.h"
 #include "tp2_native_decode_graph.h"
 #include "tp2_native_graph_probe.h"
+#include "dsv41_control_inputs.h"
 
 class Tp2FusedAllReduceRmsNormOperator : public habana::CollectiveOperator {
 public:
@@ -1619,6 +1630,14 @@ TORCH_LIBRARY_IMPL(hccl, Meta, library) {
 namespace py = pybind11;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.attr("prepared_control_input_version") = 1;
+  py::class_<dsv41_control::PreparedInputs, std::shared_ptr<dsv41_control::PreparedInputs>>(
+      module, "PreparedControlInputs")
+      .def(py::init<const at::Tensor&, const at::Tensor&>())
+      .def("upload", &dsv41_control::PreparedInputs::upload)
+      .def_property_readonly("count", &dsv41_control::PreparedInputs::count)
+      .def_property_readonly("uploads", &dsv41_control::PreparedInputs::uploads)
+      .def_property_readonly("payload_bytes", &dsv41_control::PreparedInputs::payload_bytes);
   dsv41_timing::bind(module);
   module.attr("fixed_input_preflight_api_version") = 1;
   py::class_<tp2_input::FixedInputPreflight>(module, "FixedInputPreflight")
@@ -1660,18 +1679,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         copyC1PipelineTensors(hccl_backend, std::move(sources), std::move(destinations));
       });
   module.attr("device_engram_shared_mapping_version") = 1;
+  module.attr("device_engram_tp4_version") = 3;
   py::class_<DeviceEngramProducer, std::shared_ptr<DeviceEngramProducer>>(
       module, "DeviceEngramProducer")
       .def(py::init<const c10::intrusive_ptr<c10d::Backend> &,
                     const std::string &, uint64_t, uint64_t,
                     const std::string &, uint64_t, uint64_t, uint64_t,
-                    at::Tensor, at::Tensor, bool>(),
+                    at::Tensor, at::Tensor, bool, uint64_t>(),
            py::arg("backend"), py::arg("weight_file"),
            py::arg("weight_offset"), py::arg("weight_bytes"),
            py::arg("scale_file"), py::arg("scale_offset"),
            py::arg("scale_bytes"), py::arg("rows"),
            py::arg("token_map"), py::arg("parameters"),
-           py::arg("shared_checkpoint") = false)
+           py::arg("shared_checkpoint") = false,
+           py::arg("local_heads") = kDeviceEngramHeads)
       .def("launch", &DeviceEngramProducer::launch)
       .def("mapped_bytes", &DeviceEngramProducer::mappedBytes)
       .def("workspace_bytes", &DeviceEngramProducer::workspaceBytes)
