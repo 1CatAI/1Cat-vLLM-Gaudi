@@ -15,8 +15,8 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from vllm_gaudi.ops.deepseek_v41_weights import (  # noqa: E402
-    LAYOUT_VERSION, MAX_TEMPORARY_BYTES, RankWriter, build_plan, canonical_hash, checkpoint_catalog,
-    copy_experts, copy_plain, file_hash, host_manifest, publish_json, stage_for,
+    LAYOUT_VERSION, MAX_TEMPORARY_BYTES, RankWriter, build_plan, canonical_hash, checkpoint_catalog, copy_experts,
+    copy_plain, file_hash, host_manifest, publish_json, stage_for,
 )
 from vllm_gaudi.ops.deepseek_v41_engram import EngramHashLayout  # noqa: E402
 
@@ -29,11 +29,19 @@ def main():
     parser.add_argument("--upstream-lock", required=True, type=Path)
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--stage-ready-shards", action="store_true",
-                        help="Prepare verified backbone files while Engram downloads; publish only after all hashes pass")
-    parser.add_argument("--tensor-parallel-size", type=int, choices=(2, 4), default=4,
+    parser.add_argument(
+        "--stage-ready-shards",
+        action="store_true",
+        help="Prepare verified backbone files while Engram downloads; publish only after all hashes pass")
+    parser.add_argument("--tensor-parallel-size",
+                        type=int,
+                        choices=(2, 4),
+                        default=4,
                         help="Tensor parallel degree for prepared rank files (default: 4)")
-    parser.add_argument("--pipeline-parallel-size", type=int, choices=(1, 2), default=1,
+    parser.add_argument("--pipeline-parallel-size",
+                        type=int,
+                        choices=(1, 2),
+                        default=1,
                         help="Pipeline parallel degree (TP4 defaults to PP1)")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
@@ -81,22 +89,47 @@ def prepare(args):
         if source.file.name not in sources:
             raise ValueError(f"Unverified source shard: {source.file.name}")
     hash_layout = EngramHashLayout.from_config(config["text_config"])
-    quantization = {"checkpoint": config["quantization_config"], "prepared_layout_version": LAYOUT_VERSION,
-                    "q16_row_block": 128, "q16_k_block": 128, "scale_group": 32,
-                    "s16_encoding": "raw_e8m0_bits_shift_left_7", "dense_scale_encoding": "raw_u8",
-                    "expert_tp": "intermediate", "w13_order": ["gate", "up"]}
+    quantization = {
+        "checkpoint": config["quantization_config"],
+        "prepared_layout_version": LAYOUT_VERSION,
+        "q16_row_block": 128,
+        "q16_k_block": 128,
+        "scale_group": 32,
+        "s16_encoding": "raw_e8m0_bits_shift_left_7",
+        "dense_scale_encoding": "raw_u8",
+        "expert_tp": "intermediate",
+        "w13_order": ["gate", "up"]
+    }
     pp_ranges = [[0, 40]] if pp_size == 1 else [[0, 20], [20, 40]]
-    plan = {"format_version": 1, "model_revision": checkpoint["revision"], "tensor_parallel_size": tp_size,
-            "pipeline_parallel_size": pp_size, "pp_layer_ranges": pp_ranges,
-            "source_tensor_count": len(catalog), "source_shard_count": len({s.file for s in catalog.values()}),
-            "metadata_sha256": {name: sources[name] for name in metadata_files},
-            "encoding_sha256": {name: value for name, value in sources.items() if name.startswith("encoding/")},
-            "prepared_layout_version": LAYOUT_VERSION, "engram_sharding": "complete_hash_heads",
-            "quantization": quantization,
-            "quantization_fingerprint": canonical_hash(quantization), "upstream_pr_lock": upstream,
-            "upstream_lock_sha256": file_hash(args.upstream_lock),
-            "source_file_sha256": sources,
-            "ranks": {f"pp{pp}-tp{tp}": specs for (pp, tp), specs in ranks.items()}}
+    plan = {
+        "format_version": 1,
+        "model_revision": checkpoint["revision"],
+        "tensor_parallel_size": tp_size,
+        "pipeline_parallel_size": pp_size,
+        "pp_layer_ranges": pp_ranges,
+        "source_tensor_count": len(catalog),
+        "source_shard_count": len({s.file
+                                   for s in catalog.values()}),
+        "metadata_sha256": {
+            name: sources[name]
+            for name in metadata_files
+        },
+        "encoding_sha256": {
+            name: value
+            for name, value in sources.items() if name.startswith("encoding/")
+        },
+        "prepared_layout_version": LAYOUT_VERSION,
+        "engram_sharding": "complete_hash_heads",
+        "quantization": quantization,
+        "quantization_fingerprint": canonical_hash(quantization),
+        "upstream_pr_lock": upstream,
+        "upstream_lock_sha256": file_hash(args.upstream_lock),
+        "source_file_sha256": sources,
+        "ranks": {
+            f"pp{pp}-tp{tp}": specs
+            for (pp, tp), specs in ranks.items()
+        }
+    }
     fingerprint = canonical_hash(plan)
     plan_path = args.output / "preparation-plan.json"
     if plan_path.exists() and json.loads(plan_path.read_text()) != plan:
@@ -104,10 +137,15 @@ def prepare(args):
     publish_json(plan_path, plan)
     from vllm_gaudi.ops.deepseek_v41_weights import ITEM_BYTES
     import math
-    payload_bytes = sum(math.prod(spec["shape"]) * ITEM_BYTES[spec["dtype"]]
-                        for specs in ranks.values() for spec in specs.values())
-    print(json.dumps({"stage": "planned", "output_payload_gib": payload_bytes / 2**30,
-                      "temporary_limit_gib": MAX_TEMPORARY_BYTES / 2**30, "plan_fingerprint": fingerprint}), flush=True)
+    payload_bytes = sum(
+        math.prod(spec["shape"]) * ITEM_BYTES[spec["dtype"]] for specs in ranks.values() for spec in specs.values())
+    print(json.dumps({
+        "stage": "planned",
+        "output_payload_gib": payload_bytes / 2**30,
+        "temporary_limit_gib": MAX_TEMPORARY_BYTES / 2**30,
+        "plan_fingerprint": fingerprint
+    }),
+          flush=True)
     if args.plan_only:
         return
     # Existing partial files are sparse. Count allocated blocks when resuming,
@@ -115,15 +153,24 @@ def prepare(args):
     allocated = sum(path.stat().st_blocks * 512 for path in args.output.glob("pp*-tp*.safetensors*"))
     if shutil.disk_usage(args.output).free < max(0, payload_bytes - allocated) + 8 * 2**30:
         raise RuntimeError("Prepared checkpoint destination lacks payload space plus an 8 GiB reserve")
-    publish_json(args.output / "owned-process.json", {"pid": os.getpid(), "pgid": os.getpgrp(),
-                 "started_at": datetime.now(timezone.utc).isoformat(), "plan_fingerprint": fingerprint})
+    publish_json(
+        args.output / "owned-process.json", {
+            "pid": os.getpid(),
+            "pgid": os.getpgrp(),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "plan_fingerprint": fingerprint
+        })
     progress_path = args.output / "preparation-progress.json"
     progress = json.loads(progress_path.read_text()) if args.resume and progress_path.exists() else {
-        "plan_fingerprint": fingerprint, "complete": [], "normal_scales": {}}
+        "plan_fingerprint": fingerprint,
+        "complete": [],
+        "normal_scales": {}
+    }
     if progress["plan_fingerprint"] != fingerprint:
         raise ValueError("Resume progress belongs to another plan")
     completed = set(progress["complete"])
     writers = {}
+
     def verified_source(source):
         if not source.file.exists():
             return False
@@ -138,6 +185,7 @@ def prepare(args):
                 or record.get("mtime_ns") != stat.st_mtime_ns):
             raise ValueError(f"Source file changed after verification: {source.file.name}")
         return True
+
     try:
         for (pp, tp), specs in ranks.items():
             path = args.output / f"pp{pp}-tp{tp}.safetensors.partial"
@@ -146,9 +194,17 @@ def prepare(args):
                 if path.exists():
                     raise ValueError("Both partial and final rank files exist; refusing ambiguous recovery")
                 path = final
-            writers[pp, tp] = RankWriter(path, specs, {"format": "pt", "plan_fingerprint": fingerprint,
-                "model_revision": checkpoint["revision"], "prepared_layout_version": str(LAYOUT_VERSION),
-                "tp_rank": str(tp), "pp_rank": str(pp)}, resume=args.resume)
+            writers[pp, tp] = RankWriter(path,
+                                         specs, {
+                                             "format": "pt",
+                                             "plan_fingerprint": fingerprint,
+                                             "model_revision": checkpoint["revision"],
+                                             "prepared_layout_version": str(LAYOUT_VERSION),
+                                             "tp_rank": str(tp),
+                                             "pp_rank": str(pp)
+                                         },
+                                         resume=args.resume)
+
         def save_progress(key, selected):
             for writer in selected:
                 writer.sync()
@@ -181,8 +237,12 @@ def prepare(args):
             selected = [writers[pp, tp] for tp in range(tp_size)]
             progress["normal_scales"][prefix] = copy_experts(prefix, experts, selected, tp_size)
             save_progress(prefix, selected)
-            print(json.dumps({"stage": prefix, "elapsed_s": time.monotonic() - started,
-                              "max_rss_mib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024}), flush=True)
+            print(json.dumps({
+                "stage": prefix,
+                "elapsed_s": time.monotonic() - started,
+                "max_rss_mib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+            }),
+                  flush=True)
         if args.stage_ready_shards:
             complete_path = args.checkpoint_audit / "complete.json"
             print(json.dumps({"stage": "waiting_for_complete_checkpoint_audit"}), flush=True)
@@ -190,7 +250,9 @@ def prepare(args):
                 time.sleep(10)
             verified = json.loads(complete_path.read_text())
             if verified["revision"] != checkpoint["revision"] or {
-                    item["file"]: item["sha256"] for item in verified["files"]} != sources:
+                    item["file"]: item["sha256"]
+                    for item in verified["files"]
+            } != sources:
                 raise ValueError("Final checkpoint audit differs from the preparation plan")
             final_catalog = checkpoint_catalog(args.model)
             if final_catalog != catalog:
@@ -212,14 +274,25 @@ def prepare(args):
     rank_files = {}
     for (pp, tp), writer in writers.items():
         path = writer.path
-        rank_files[f"pp{pp}-tp{tp}"] = {"file": path.name.removesuffix(".partial"), "sha256": file_hash(path),
-                                         "bytes": path.stat().st_size, "tensors": len(writer.specs),
-                                         "inode": path.stat().st_ino, "mtime_ns": path.stat().st_mtime_ns}
+        rank_files[f"pp{pp}-tp{tp}"] = {
+            "file": path.name.removesuffix(".partial"),
+            "sha256": file_hash(path),
+            "bytes": path.stat().st_size,
+            "tensors": len(writer.specs),
+            "inode": path.stat().st_ino,
+            "mtime_ns": path.stat().st_mtime_ns
+        }
     host_files = {}
     for tp in range(tp_size):
         path = args.output / f"engram-tp{tp}.json"
-        publish_json(path, host_manifest(tables, tp, checkpoint["revision"], sources, hash_layout=hash_layout,
-                                         tensor_parallel_size=tp_size))
+        publish_json(
+            path,
+            host_manifest(tables,
+                          tp,
+                          checkpoint["revision"],
+                          sources,
+                          hash_layout=hash_layout,
+                          tensor_parallel_size=tp_size))
         host_files[str(tp)] = {"file": path.name, "sha256": file_hash(path)}
     for relative in sources:
         if relative.endswith(".safetensors") or relative.startswith("inference/"):
@@ -231,10 +304,16 @@ def prepare(args):
         if writer.path.suffix == ".partial":
             writer.path.replace(writer.path.with_suffix(""))
     manifest = {key: value for key, value in plan.items() if key != "ranks"}
-    manifest.update({"plan_fingerprint": fingerprint, "rank_files": rank_files, "engram_host_shards": host_files,
-                     "normal_scales": progress["normal_scales"], "temporary_limit_bytes": MAX_TEMPORARY_BYTES,
-                     "preparation_max_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
-                     "elapsed_s": time.monotonic() - started, "created_at": datetime.now(timezone.utc).isoformat()})
+    manifest.update({
+        "plan_fingerprint": fingerprint,
+        "rank_files": rank_files,
+        "engram_host_shards": host_files,
+        "normal_scales": progress["normal_scales"],
+        "temporary_limit_bytes": MAX_TEMPORARY_BYTES,
+        "preparation_max_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
+        "elapsed_s": time.monotonic() - started,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    })
     publish_json(args.output / "manifest.json", manifest)
     print(json.dumps({"stage": "published", "manifest": str(args.output / "manifest.json")}), flush=True)
 

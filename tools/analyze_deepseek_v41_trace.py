@@ -33,8 +33,7 @@ def symbols(inventory, recipes):
             named[(*prefix, node["node"], node["kernel"].lower().replace("_", ""))].append(node)
 
     def unambiguous(candidates):
-        return {key: values[0] for key, values in candidates.items()
-                if all(value == values[0] for value in values)}
+        return {key: values[0] for key, values in candidates.items() if all(value == values[0] for value in values)}
 
     context, names = unambiguous(contexts), unambiguous(named)
     result = {}
@@ -58,15 +57,12 @@ def symbols(inventory, recipes):
 
 
 def logical_replay_markers(inventory, expected):
-    legacy = sorted(row for row in inventory["cpu_markers"]
-                    if row[2] == "vllm_gaudi::native_decoder_enqueue")
+    legacy = sorted(row for row in inventory["cpu_markers"] if row[2] == "vllm_gaudi::native_decoder_enqueue")
     if len(legacy) == expected:
         return legacy, {"mode": "single", "single": len(legacy)}
 
-    prefixes = sorted(row for row in inventory["cpu_markers"]
-                      if row[2] == "vllm_gaudi::native_decoder_prefix_enqueue")
-    finishes = sorted(row for row in inventory["cpu_markers"]
-                      if row[2] == "vllm_gaudi::native_decoder_finish_enqueue")
+    prefixes = sorted(row for row in inventory["cpu_markers"] if row[2] == "vllm_gaudi::native_decoder_prefix_enqueue")
+    finishes = sorted(row for row in inventory["cpu_markers"] if row[2] == "vllm_gaudi::native_decoder_finish_enqueue")
     if len(legacy) + len(prefixes) != expected or len(prefixes) != len(finishes):
         raise AssertionError({
             "expected": expected,
@@ -95,14 +91,19 @@ def tp4_windows(inventory, phase, request_start_ns=None):
     """
     commits = []
     asynchronous = phase == "decode" and any(row[2].startswith("v41::worker_commit::PP0::")
-                                              for row in inventory["cpu_markers"])
+                                             for row in inventory["cpu_markers"])
     commit_name = "worker_commit" if asynchronous else "verify_and_commit"
     for start, duration, name in inventory["cpu_markers"]:
         match = re.fullmatch(rf"v41::{commit_name}::PP0::(prefill|decode)::P(\d+)::C(\d+)::emit([01])", name)
         if match:
             kind, position, count, emit = match.groups()
-            commits.append(dict(start=start, end=start + duration, phase=kind, position=int(position),
-                                count=int(count), emit=bool(int(emit))))
+            commits.append(
+                dict(start=start,
+                     end=start + duration,
+                     phase=kind,
+                     position=int(position),
+                     count=int(count),
+                     emit=bool(int(emit))))
     commits.sort(key=lambda item: item["start"])
     if phase == "prefill":
         targets = sorted(row for row in inventory["cpu_markers"] if row[2].startswith("v41::target::PP0::prefill::"))
@@ -127,15 +128,19 @@ def tp4_windows(inventory, phase, request_start_ns=None):
             low = (request_start_ns - base) / 1000
             if not inventory["all_activity_start_us"] <= low <= target_start:
                 raise ValueError("Request timestamp lies outside the capture or after its first model target")
-        layer_rows = [row for row in inventory["cpu_markers"] if low <= row[0] < high
-                      and re.fullmatch(r"v41::prefill::layer::layer\d+::C\d+", row[2])]
+        layer_rows = [
+            row for row in inventory["cpu_markers"]
+            if low <= row[0] < high and re.fullmatch(r"v41::prefill::layer::layer\d+::C\d+", row[2])
+        ]
         counts = collections.Counter(int(re.search(r"::layer(\d+)::", row[2])[1]) for row in layer_rows)
         if set(counts) != set(range(40)) or set(counts.values()) != {len(targets)}:
             raise ValueError(f"Incomplete forty-layer prefill coverage: {dict(counts)}")
-        units, windows, proof = [0], [(low, high)], dict(chunks=targets, prompt_tokens=cursor, layer_counts=dict(counts),
-                                                      first_target_start_us=target_start,
-                                                      request_start_ns=request_start_ns,
-                                                      before_first_target_ms=(target_start - low) / 1000)
+        units, windows, proof = [0], [(low, high)], dict(chunks=targets,
+                                                         prompt_tokens=cursor,
+                                                         layer_counts=dict(counts),
+                                                         first_target_start_us=target_start,
+                                                         request_start_ns=request_start_ns,
+                                                         before_first_target_ms=(target_start - low) / 1000)
     else:
         units, windows, proof = [], [], []
         for previous, current in zip(commits, commits[1:]):
@@ -158,16 +163,24 @@ def tp4_windows(inventory, phase, request_start_ns=None):
             raise ValueError("No complete TP4 forty-layer decode cycle and sampled-token consumer")
         if units != list(range(units[0], units[-1] + 1)):
             raise ValueError("Missing an interior TP4 decode cycle; trace coverage is incomplete")
-    return dict(topology={"tensor_parallel_size": 4, "pipeline_parallel_size": 1}, phase=phase,
-                unit="request" if phase == "prefill" else "token", tokens=units, windows_us=windows,
-                capture_order=[], coverage_proof=proof, base_time_nanoseconds=inventory.get("base_time_nanoseconds"),
+    return dict(topology={
+        "tensor_parallel_size": 4,
+        "pipeline_parallel_size": 1
+    },
+                phase=phase,
+                unit="request" if phase == "prefill" else "token",
+                tokens=units,
+                windows_us=windows,
+                capture_order=[],
+                coverage_proof=proof,
+                base_time_nanoseconds=inventory.get("base_time_nanoseconds"),
                 asynchronous_completion=asynchronous,
                 boundary=("recorded client request dispatch to first-token consumer; includes initial state setup"
                           if request_start_ns is not None else "first prefill submission to first-token consumer")
-                         if phase == "prefill" else
-                         ("successive async worker token commits; includes overlapping next-token prefix, "
-                          "scheduler and device waits" if asynchronous else
-                          "successive sampled-token commit completions; includes scheduler, CPU and device waits"))
+                if phase == "prefill" else
+                ("successive async worker token commits; includes overlapping next-token prefix, "
+                 "scheduler and device waits" if asynchronous else
+                 "successive sampled-token commit completions; includes scheduler, CPU and device waits"))
 
 
 def analyze(root, rank, phase=None, request_result=None):
@@ -194,9 +207,9 @@ def analyze(root, rank, phase=None, request_result=None):
             if phase == "prefill":
                 request_start_ns = request["request_start_ns"]
         result = tp4_windows(inv, phase, request_start_ns)
-        if request_result is not None and phase == "prefill":
-            if result["coverage_proof"]["prompt_tokens"] != request["usage"]["prompt_tokens"]:
-                raise ValueError("Prefill trace does not cover the complete measured prompt")
+        if (request_result is not None and phase == "prefill"
+                and result["coverage_proof"]["prompt_tokens"] != request["usage"]["prompt_tokens"]):
+            raise ValueError("Prefill trace does not cover the complete measured prompt")
         (path / "device-windows.json").write_text(json.dumps(result, indent=2) + "\n")
         print(json.dumps({key: value for key, value in result.items() if key != "coverage_proof"}), flush=True)
         return
@@ -340,7 +353,8 @@ if __name__ == "__main__":
     parser.add_argument("analysis", type=Path)
     parser.add_argument("--rank", type=int, required=True)
     parser.add_argument("--phase", choices=("prefill", "decode"))
-    parser.add_argument("--request-result", type=Path,
+    parser.add_argument("--request-result",
+                        type=Path,
                         help="Same profiled request's result.json, including its wall-clock dispatch timestamp")
     args = parser.parse_args()
     analyze(args.analysis, args.rank, args.phase, args.request_result)

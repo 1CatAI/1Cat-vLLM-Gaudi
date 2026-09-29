@@ -59,7 +59,8 @@ def main():
                 for layer in range(*topology["pp_layer_ranges"][pp]):
                     prefix = f"layers.{layer}.attn.wo_a."
                     weight, scale = shard.catalog[prefix + "weight"], shard.catalog[prefix + "scale"]
-                    if weight.shape != (groups * 1024, 4096) or weight.dtype != "F8_E4M3" or scale.shape != (groups * 32, 128):
+                    if weight.shape != (groups * 1024,
+                                        4096) or weight.dtype != "F8_E4M3" or scale.shape != (groups * 32, 128):
                         raise ValueError("wo_a checkpoint dimensions changed")
                     packed = np.empty((groups, 4096, 1024), dtype=np.uint8)
                     channels = np.empty((groups, 1, 1024), dtype=np.float32)

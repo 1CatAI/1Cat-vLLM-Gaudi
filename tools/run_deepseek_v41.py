@@ -109,21 +109,62 @@ def configure_trace_artifacts(environment, evidence, *, dump_plans, enable_profi
         if not environment.get("HABANA_PROF_CONFIG"):
             config = {
                 "Plugins": [
-                    {"enable": True, "lib": "libhost_profiler.so", "name": "HostProfiler", "values": {
-                        "api_group": {name: {"value": True} for name in ("HCCL", "HLTHUNK", "SYNAPSE")},
-                        "start_disabled": {"value": True}}},
-                    {"enable": True, "lib": "libhw_trace.so", "name": "HwTrace", "values": {
-                        "generalOptions": {"profilePhase": {"value": "profileApi"},
-                                           "traceBufferSize": {"value": "0x80000000"}},
-                        "parseOptions": {"addFuserMetadata": {"value": False},
-                                         "showNullDescs": {"value": False}}}},
+                    {
+                        "enable": True,
+                        "lib": "libhost_profiler.so",
+                        "name": "HostProfiler",
+                        "values": {
+                            "api_group": {
+                                name: {
+                                    "value": True
+                                }
+                                for name in ("HCCL", "HLTHUNK", "SYNAPSE")
+                            },
+                            "start_disabled": {
+                                "value": True
+                            }
+                        }
+                    },
+                    {
+                        "enable": True,
+                        "lib": "libhw_trace.so",
+                        "name": "HwTrace",
+                        "values": {
+                            "generalOptions": {
+                                "profilePhase": {
+                                    "value": "profileApi"
+                                },
+                                "traceBufferSize": {
+                                    "value": "0x80000000"
+                                }
+                            },
+                            "parseOptions": {
+                                "addFuserMetadata": {
+                                    "value": False
+                                },
+                                "showNullDescs": {
+                                    "value": False
+                                }
+                            }
+                        }
+                    },
                 ]
             }
             if environment.get("VLLM_HPU_DSV41_RAW_TRACE") == "1":
                 environment["HABANA_PROFILE_WRITE_HLTV"] = "1"
-                config["GeneralSettings"] = {"values": {
-                    "addPid": {"value": True}, "outdir": {"value": str(evidence / "raw")},
-                    "session": {"value": "v41_tp4"}}}
+                config["GeneralSettings"] = {
+                    "values": {
+                        "addPid": {
+                            "value": True
+                        },
+                        "outdir": {
+                            "value": str(evidence / "raw")
+                        },
+                        "session": {
+                            "value": "v41_tp4"
+                        }
+                    }
+                }
                 host = config["Plugins"][0]["values"]
                 host["api_group"]["HLTHUNK"]["value"] = False
                 host["api_group"]["SCAL"] = {"value": True}
@@ -136,18 +177,21 @@ def configure_trace_artifacts(environment, evidence, *, dump_plans, enable_profi
                 host["output"] = {name: {"value": name == "hltv"} for name in ("hltv", "json", "csv")}
                 hardware = config["Plugins"][1]["values"]
                 hardware["generalOptions"].update(arch={"value": "gaudi2"}, traceBufferLocation={"value": "host"})
-                hardware["parseOptions"].update(
-                    skipParse={"value": True},
-                    outputPerInvocation={name: {"value": name in ("hltv", "hltvWithHost")}
-                                         for name in ("binary", "csv", "dbgInfo", "hltv", "hltvWithHost", "json", "text")})
+                hardware["parseOptions"].update(skipParse={"value": True},
+                                                outputPerInvocation={
+                                                    name: {
+                                                        "value": name in ("hltv", "hltvWithHost")
+                                                    }
+                                                    for name in ("binary", "csv", "dbgInfo", "hltv", "hltvWithHost",
+                                                                 "json", "text")
+                                                })
             config_path = evidence / "profiler-config.json"
             config_path.write_text(json.dumps(config, indent=2) + "\n")
             environment["HABANA_PROF_CONFIG"] = str(config_path)
-    identity = {key: environment.get(key, "0") for key in
-                ("ENABLE_PROFILER", "GRAPH_VISUALIZATION", "HABANA_PROFILE")}
+    identity = {key: environment.get(key, "0") for key in ("ENABLE_PROFILER", "GRAPH_VISUALIZATION", "HABANA_PROFILE")}
     if enable_profiler:
-        identity["profiler_config_sha256"] = hashlib.sha256(
-            Path(environment["HABANA_PROF_CONFIG"]).read_bytes()).hexdigest()
+        identity["profiler_config_sha256"] = hashlib.sha256(Path(
+            environment["HABANA_PROF_CONFIG"]).read_bytes()).hexdigest()
     return identity
 
 
@@ -219,7 +263,8 @@ def main():
                         type=Path,
                         help="Additional shared module-lease namespaces used by other workers")
     parser.add_argument("--runtime-profile", required=True, type=Path)
-    parser.add_argument("--engine-source", type=Path,
+    parser.add_argument("--engine-source",
+                        type=Path,
                         help="Use and fingerprint an isolated normal vLLM engine checkout")
     parser.add_argument("--source-snapshot",
                         type=Path,
@@ -328,7 +373,9 @@ def main():
                    DSV41_RUNTIME_PROFILE=str(args.evidence / "runtime-profile.json"))
         env.pop("VLLM_HPU_TP2_PLAN_DUMP_DIR", None)
         env.pop("VLLM_TORCH_PROFILER_DIR", None)
-        instrumentation = configure_trace_artifacts(env, args.evidence, dump_plans=args.dump_plans,
+        instrumentation = configure_trace_artifacts(env,
+                                                    args.evidence,
+                                                    dump_plans=args.dump_plans,
                                                     enable_profiler=args.enable_profiler)
         if env.get("GRAPH_VISUALIZATION") == "1":
             env["GRAPH_VISUALIZATION_DIR"] = str(args.evidence / "graphs")
@@ -337,8 +384,8 @@ def main():
             for key, value in env.items()
             if key.startswith(("HABANA_", "HLS_", "PT_HPU_", "VLLM_", "HCL_", "HCCL_",
                                "DSV41_")) or key in ("LD_LIBRARY_PATH", "LD_PRELOAD", "GC_KERNEL_PATH",
-                                                     "RUNTIME_SCALE_PATCHING", "ENABLE_PROFILER",
-                                                     "GRAPH_VISUALIZATION", "GRAPH_VISUALIZATION_DIR")
+                                                     "RUNTIME_SCALE_PATCHING", "ENABLE_PROFILER", "GRAPH_VISUALIZATION",
+                                                     "GRAPH_VISUALIZATION_DIR")
         }
         root = Path(__file__).resolve().parents[1]
         source_root = args.source_snapshot.resolve() if args.source_snapshot else root
@@ -374,8 +421,8 @@ def main():
         else:
             (args.evidence / "source.patch").write_bytes(subprocess.check_output(["git", "diff", "HEAD"], cwd=root))
         import importlib.util
-        engine = (args.engine_source.resolve() if args.engine_source else
-                  Path(importlib.util.find_spec("vllm").origin).resolve().parents[1])
+        engine = (args.engine_source.resolve()
+                  if args.engine_source else Path(importlib.util.find_spec("vllm").origin).resolve().parents[1])
         record["engine_source_root"] = str(engine)
         engine_revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=engine, text=True, capture_output=True)
         record["engine_commit"] = engine_revision.stdout.strip() if engine_revision.returncode == 0 else None

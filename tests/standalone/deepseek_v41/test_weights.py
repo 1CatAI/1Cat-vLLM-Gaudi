@@ -11,8 +11,18 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from vllm_gaudi.ops.deepseek_v41_weights import (
-    RankWriter, build_plan, copy_experts, copy_plain, host_manifest, prepare_q16, prepare_s16,
-    read_header, restore_q16, restore_s16, stage_for, tp_axis,
+    RankWriter,
+    build_plan,
+    copy_experts,
+    copy_plain,
+    host_manifest,
+    prepare_q16,
+    prepare_s16,
+    read_header,
+    restore_q16,
+    restore_s16,
+    stage_for,
+    tp_axis,
 )
 
 
@@ -46,7 +56,8 @@ def test_q16_lane_contract_independent_of_roundtrip():
     q16, _ = prepare_q16(packed)
     words = q16.view(np.uint16).reshape(1, 64, 64)
     for row in range(0, 128, 2):
-        assert np.array_equal(words[0, :, row // 2], packed[row].astype(np.uint16) | (packed[row + 1].astype(np.uint16) << 8))
+        assert np.array_equal(words[0, :, row // 2],
+                              packed[row].astype(np.uint16) | (packed[row + 1].astype(np.uint16) << 8))
 
 
 def test_every_scale_encoding_is_reversible():
@@ -83,9 +94,8 @@ def test_streamed_tp_experts_reconstruct_all_source_bytes(tmp_path, tp_size, pp_
         for projection in ("w1", "w2", "w3"):
             n, k = (256, intermediate) if projection == "w2" else (intermediate, 256)
             for kind, columns in (("weight", k // 2), ("scale", k // 32)):
-                tensors[f"{prefix}.{expert}.{projection}.{kind}"] = (
-                    "I8" if kind == "weight" else "F8_E8M0",
-                    rng.integers(0, 256, (n, columns), dtype=np.uint8))
+                tensors[f"{prefix}.{expert}.{projection}.{kind}"] = ("I8" if kind == "weight" else "F8_E8M0",
+                                                                     rng.integers(0, 256, (n, columns), dtype=np.uint8))
     tensors["embed.weight"] = ("BF16", np.arange(64, dtype=np.uint16).reshape(8, 8))
     tensors["layers.0.attn.wo_b.scale"] = ("F8_E8M0", np.arange(32, dtype=np.uint8).reshape(4, 8))
     catalog = write_source(tmp_path / "source.safetensors", tensors)
@@ -113,7 +123,7 @@ def test_streamed_tp_experts_reconstruct_all_source_bytes(tmp_path, tp_size, pp_
                 prepared_projection = "w2" if projection == "w2" else "w13"
                 logical = (256, padded) if projection == "w2" else (padded * 2, 256)
                 for kind, prepared_kind, restore, dtype in (("weight", "q16", restore_q16, np.int16),
-                                                           ("scale", "s16", restore_s16, np.uint16)):
+                                                            ("scale", "s16", restore_s16, np.uint16)):
                     name = f"{prefix}.{prepared_projection}_{prepared_kind}"
                     spec = result[name]
                     value = spec.raw_rows(expert, expert + 1).view(dtype).reshape(spec.shape[1:])
@@ -137,10 +147,11 @@ def test_streamed_tp_experts_reconstruct_all_source_bytes(tmp_path, tp_size, pp_
 
 
 def test_tp4_single_stage_owns_all_layers_and_output(tmp_path):
-    names = ("embed.weight", "head.weight", "norm.weight", "layers.0.attn.wq_a.weight",
-             "layers.20.attn.wq_a.weight", "layers.39.attn.wq_a.weight", "mtp.0.main_proj.weight")
+    names = ("embed.weight", "head.weight", "norm.weight", "layers.0.attn.wq_a.weight", "layers.20.attn.wq_a.weight",
+             "layers.39.attn.wq_a.weight", "mtp.0.main_proj.weight")
     catalog = write_source(tmp_path / "source.safetensors",
-                           {name: ("BF16", np.zeros((8, 8), dtype=np.uint16)) for name in names})
+                           {name: ("BF16", np.zeros((8, 8), dtype=np.uint16))
+                            for name in names})
     plans, _, _ = build_plan(catalog, tensor_parallel_size=4, pipeline_parallel_size=1)
     assert set(plans) == {(0, rank) for rank in range(4)}
     for specs in plans.values():
@@ -152,8 +163,10 @@ def test_tp4_single_stage_owns_all_layers_and_output(tmp_path):
 
 
 def test_host_shards_reference_disjoint_source_rows(tmp_path):
-    tensors = {"layers.1.engram.embed.weight": ("F8_E4M3", np.arange(15, dtype=np.uint8).reshape(5, 3)),
-               "layers.1.engram.embed.scale": ("F8_E8M0", np.arange(5, dtype=np.uint8).reshape(5, 1))}
+    tensors = {
+        "layers.1.engram.embed.weight": ("F8_E4M3", np.arange(15, dtype=np.uint8).reshape(5, 3)),
+        "layers.1.engram.embed.scale": ("F8_E8M0", np.arange(5, dtype=np.uint8).reshape(5, 1))
+    }
     path = tmp_path / "source.safetensors"
     catalog = write_source(path, tensors)
     manifests = [host_manifest(catalog, tp, "revision", {path.name: "sha256"}) for tp in range(2)]

@@ -15,8 +15,10 @@ def number(value):
 
 def node_details(row, details):
     # Each device engine has its own context namespace in the same recipe.
-    by_node = (details if isinstance(details, dict) else
-               {(item["recipe_id"], item["engine"], item["context_id"]): item for item in details})
+    by_node = (details if isinstance(details, dict) else {
+        (item["recipe_id"], item["engine"], item["context_id"]): item
+        for item in details
+    })
     assert len(by_node) == len(details), "Ambiguous recipe/engine/context identity"
     keys = [tuple(key) if len(key) == 3 else (key[0], row["engine"], key[1]) for key in row["node_keys"]]
     return [by_node[key] for key in keys]
@@ -26,8 +28,7 @@ def render(analyses, output):
     output.mkdir(parents=True, exist_ok=True)
     reports, rows, links = [], [], []
     node_fields = ("recipe_id", "engine", "context_id", "source_node", "mean_invocation_ms",
-                   "complete_invocation_samples", "observed_calls", "count_limitations",
-                   "classification_provenance")
+                   "complete_invocation_samples", "observed_calls", "count_limitations", "classification_provenance")
     tensor_fields = ("name", "shape", "dtype", "bytes", "location", "strides", "alias")
     # Keep complete records in a compressed export; the standalone browser
     # view needs only compact tensor/layout details and links to full sources.
@@ -59,10 +60,13 @@ def render(analyses, output):
                         compact.append(entry)
                     rows.append({**row, "nodes": compact})
         complete.write("\n]\n")
-    md = ["# TP4 prefill / decode 完整 kernel 拆解", "",
-          "计时使用同次采集、相同完整消费周期。每行是活动并集，占比可能因重叠而相加超过 100%。"
-          "未归因时间保留；平均单次时长与调用数只使用可重建的完整物理调用。",
-          "", "| 阶段 | Rank | 单位 | 完整周期 ms | 样本数 | 未知调用数的节点 |", "|---|---:|---|---:|---:|---:|"]
+    md = [
+        "# TP4 prefill / decode 完整 kernel 拆解", "",
+        "计时使用同次采集、相同完整消费周期。每行是活动并集，占比可能因重叠而相加超过 100%。"
+        "未归因时间保留；平均单次时长与调用数只使用可重建的完整物理调用。", "",
+        "| 阶段 | Rank | 单位 | 完整周期 ms | 样本数 | 未知调用数的节点 |",
+        "|---|---:|---|---:|---:|---:|"
+    ]
     for report in reports:
         md.append(f"| {report.get('phase', 'decode')} | {report['rank']} | {report.get('unit', 'token')} | "
                   f"{number(report['period_ms'])} | {len(report['tokens'])} | {report['nodes_with_unknown_calls']} |")
@@ -71,10 +75,14 @@ def render(analyses, output):
         md += ["", f"## {phase} / Rank {rank}", "", "互斥时间分区（ms/" + unit + "）：", ""]
         md += [f"- {name}: {number(value)}" for name, value in report["partition"].items()]
         md += ["", "全部设备引擎互斥分区（含 NIC/DMA，ms/" + unit + "）：", ""]
-        md += [f"- {name}: {number(value)}" for name, value in
-               report.get("device_engine_presence_partition_ms", {}).items()]
-        md += ["", "设备事件可见性：" + "; ".join(f"{name}: {status}" for name, status in
-                                                report.get("device_observability", {}).items()), ""]
+        md += [
+            f"- {name}: {number(value)}"
+            for name, value in report.get("device_engine_presence_partition_ms", {}).items()
+        ]
+        md += [
+            "", "设备事件可见性：" + "; ".join(f"{name}: {status}"
+                                       for name, status in report.get("device_observability", {}).items()), ""
+        ]
         md += ["", "CPU/运行时观测活动（各行可嵌套；不能相加或当作因果归因）：", "",
                "| 类型 | 活动 ms | 与计算重叠 ms | 计算之外 ms |", "|---|---:|---:|---:|"]
         for name, item in report.get("host_observed_activity", {}).items():
@@ -82,20 +90,25 @@ def render(analyses, output):
                       f"{number(item['outside_compute_ms'])} |")
         categories = sorted({row["category"] for row in report["kernel_rows"]})
         for category in categories:
-            md += ["", f"### {category}", "", f"| 功能 | Kernel | A/B/输出 dtype 与形状 | 平均单次 ms | 次/{unit} | ms/{unit} | 周期占比 |",
-                   "|---|---|---|---:|---:|---:|---:|"]
+            md += [
+                "", f"### {category}", "",
+                f"| 功能 | Kernel | A/B/输出 dtype 与形状 | 平均单次 ms | 次/{unit} | ms/{unit} | 周期占比 |",
+                "|---|---|---|---:|---:|---:|---:|"
+            ]
             for row in report["kernel_rows"]:
                 if row["category"] != category:
                     continue
+
                 def safe(value):
                     return str(value).replace("|", "\\|").replace("\n", " ")
+
                 shapes = safe(json.dumps(row["dtype_shapes"], ensure_ascii=False))
                 md.append(f"| {safe(row['purpose'])} | {safe(row['kernel'])} | {shapes} | "
                           f"{number(row['mean_invocation_ms'])} | {number(row['calls_per_' + unit])} | "
                           f"{number(row['activity_ms_per_' + unit])} | {row['period_pct']:.3f}% |")
     (output / "REPORT.md").write_text("\n".join(md) + "\n")
-    data = base64.b64encode(gzip.compress(json.dumps(rows, ensure_ascii=False,
-                                                   separators=(",", ":")).encode(), compresslevel=6)).decode()
+    data = base64.b64encode(
+        gzip.compress(json.dumps(rows, ensure_ascii=False, separators=(",", ":")).encode(), compresslevel=6)).decode()
     export_links = " ".join(f'<a href="{html.escape(path, quote=True)}">{html.escape(label)}</a>'
                             for label, path in links)
     colors = ["#2878b5", "#dc7d29", "#7660b5", "#489c82", "#c5cbd3"]
@@ -109,8 +122,8 @@ def render(analyses, output):
             pieces.append(f'<span title="{title}" style="width:{fraction:.6f}%;background:{color}"></span>')
         overview.append(f'<tr><td>{report["phase"]} / {report["rank"]}</td><td>{report["period_ms"]:.6f} '
                         f'ms/{report["unit"]}</td><td><div class="bar">' + "".join(pieces) + '</div></td></tr>')
-    overview.append('</tbody></table><p>' + ' · '.join(
-        f'<span style="color:{color}">{label}</span>' for color, label in zip(colors, labels, strict=True)) + '</p>')
+    overview.append('</tbody></table><p>' + ' · '.join(f'<span style="color:{color}">{label}</span>'
+                                                       for color, label in zip(colors, labels, strict=True)) + '</p>')
     overview = "".join(overview)
     page = '''<!doctype html><html lang="zh"><meta charset="utf-8"><title>TP4 kernel trace</title>
 <style>body{font:14px system-ui;margin:24px;color:#18202a}h1{font-size:22px}input,select{padding:8px;margin-right:10px}
@@ -144,8 +157,9 @@ function draw(){const q=document.getElementById('search').value.toLowerCase();co
  cells.forEach((value,i)=>{const td=document.createElement('td');if(i===1){const d=document.createElement('details');const s=document.createElement('summary');s.textContent=r.category+'：'+r.purpose;d.append(s);d.addEventListener('toggle',()=>{if(d.open&&!d.querySelector('pre')){const pre=document.createElement('pre');pre.textContent=JSON.stringify({dtype_shapes:r.dtype_shapes,nodes:r.nodes},null,2);d.append(pre);}});td.append(d);}else{td.textContent=value;if(i>=3)td.className='num';}tr.append(td);});body.append(tr);}}
 for(const id of ['search','phase','rank','engine','category'])document.getElementById(id).addEventListener('input',()=>{page=0;draw();});
 document.getElementById('previous').onclick=()=>{page=Math.max(0,page-1);draw();};
-document.getElementById('next').onclick=()=>{page++;draw();};draw();})().catch(e=>{document.getElementById('count').textContent='加载失败：'+e;});</script></html>'''
-    (output / "index.html").write_text(page.replace("DATA", data).replace("EXPORT_LINKS", export_links).replace("OVERVIEW", overview))
+document.getElementById('next').onclick=()=>{page++;draw();};draw();})().catch(e=>{document.getElementById('count').textContent='加载失败：'+e;});</script></html>'''  # noqa: E501 - embedded HTML/CSS/JavaScript template
+    (output / "index.html").write_text(
+        page.replace("DATA", data).replace("EXPORT_LINKS", export_links).replace("OVERVIEW", overview))
     print(json.dumps({"reports": len(reports), "kernel_rows": len(rows), "output": str(output.resolve())}))
 
 

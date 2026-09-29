@@ -14,14 +14,28 @@ from vllm_gaudi.ops.deepseek_v41_weights import RankWriter, canonical_hash, file
 def make_checkpoint(tmp_path):
     (tmp_path / "config.json").write_text("{}")
     specs = {"weight": {"dtype": "BF16", "shape": [4, 8]}, "scale": {"dtype": "U8", "shape": [4, 8]}}
-    fields = {"tensor_parallel_size": 2, "pipeline_parallel_size": 2, "pp_layer_ranges": [[0, 20], [20, 40]],
-              "prepared_layout_version": 2, "model_revision": "test", "quantization_fingerprint": "quant",
-              "upstream_lock_sha256": "upstream", "metadata_sha256": {"config.json": file_hash(tmp_path / "config.json")},
-              "encoding_sha256": {}}
+    fields = {
+        "tensor_parallel_size": 2,
+        "pipeline_parallel_size": 2,
+        "pp_layer_ranges": [[0, 20], [20, 40]],
+        "prepared_layout_version": 2,
+        "model_revision": "test",
+        "quantization_fingerprint": "quant",
+        "upstream_lock_sha256": "upstream",
+        "metadata_sha256": {
+            "config.json": file_hash(tmp_path / "config.json")
+        },
+        "encoding_sha256": {}
+    }
     plan = {**fields, "ranks": {"pp0-tp0": specs}}
     fingerprint = canonical_hash(plan)
-    metadata = {"model_revision": "test", "plan_fingerprint": fingerprint, "prepared_layout_version": "2",
-                "pp_rank": "0", "tp_rank": "0"}
+    metadata = {
+        "model_revision": "test",
+        "plan_fingerprint": fingerprint,
+        "prepared_layout_version": "2",
+        "pp_rank": "0",
+        "tp_rank": "0"
+    }
     path = tmp_path / "pp0-tp0.safetensors"
     writer = RankWriter(path, specs, metadata)
     bits = np.array([0, 0x8000, 0x3f80, 0x7fc0, 0x7f80, 0xff80, 1, 0x8001] * 4, dtype=np.uint16).reshape(4, 8)
@@ -31,11 +45,21 @@ def make_checkpoint(tmp_path):
     writer.sync()
     writer.close()
     stat = path.stat()
-    record = {"file": path.name, "bytes": stat.st_size, "sha256": file_hash(path), "inode": stat.st_ino,
-              "mtime_ns": stat.st_mtime_ns}
+    record = {
+        "file": path.name,
+        "bytes": stat.st_size,
+        "sha256": file_hash(path),
+        "inode": stat.st_ino,
+        "mtime_ns": stat.st_mtime_ns
+    }
     (tmp_path / "preparation-plan.json").write_text(json.dumps(plan))
-    (tmp_path / "manifest.json").write_text(json.dumps({**fields, "plan_fingerprint": fingerprint,
-                                                       "rank_files": {"pp0-tp0": record}}))
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({
+            **fields, "plan_fingerprint": fingerprint,
+            "rank_files": {
+                "pp0-tp0": record
+            }
+        }))
     return bits, codes
 
 

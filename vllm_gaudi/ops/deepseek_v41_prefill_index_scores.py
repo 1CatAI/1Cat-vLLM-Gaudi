@@ -122,7 +122,8 @@ def full_prefill_sram_scores(query, weights, packed, table, positions, rows, rat
     query, weights = query.contiguous(), weights.contiguous()
     positions = positions.to(torch.int32).contiguous()
     signature = (tuple(query.shape), tuple(rows.shape), tuple(packed.shape), tuple(table.shape), ratio, local_heads)
-    output = compiled_native_prefill_index_scores(signature)(query, weights, packed, table, positions, rows, ratio, local_heads)
+    output = compiled_native_prefill_index_scores(signature)(query, weights, packed, table, positions, rows, ratio,
+                                                             local_heads)
     return output[:, :columns]
 
 
@@ -142,7 +143,8 @@ def full_prefill_index_selection(query,
 
     owner = SimpleNamespace(ratio=ratio)
     owner._merge_topk = prefill_merge_topk
-    owner._scores = lambda p, rows, q, w: full_prefill_sram_scores(q, w, packed, table, p, rows, ratio, 32 // tensor_parallel_size)
+    owner._scores = lambda p, rows, q, w: full_prefill_sram_scores(q, w, packed, table, p, rows, ratio, 32 //
+                                                                   tensor_parallel_size)
     rows = torch.arange(source_rows, device=query.device, dtype=torch.int32)
     selected, scores, blocks = PagedCSA2Attention._stream_topk(owner,
                                                                positions,
@@ -171,7 +173,7 @@ def tp_full_prefill_index_selection(query,
                                     tp_rank,
                                     all_gather,
                                     visible_rows=None,
-                                 tensor_parallel_size=2):
+                                    tensor_parallel_size=2):
     """Partition replicated index work; restore row order before consumption.
 
     Query heads have already been gathered. Each rank evaluates complete head
@@ -223,11 +225,12 @@ def prefill_reindex_selection(query,
     for start in range(0, query.shape[0], 128):
         stop = min(start + 128, query.shape[0])
         current = blocks[start:stop].clone()
-        signature = (stop - start, tuple(current.shape), source_rows, ratio, 32 // tensor_parallel_size, native_gather, native_scores)
+        signature = (stop - start, tuple(current.shape), source_rows, ratio, 32 // tensor_parallel_size, native_gather,
+                     native_scores)
         outputs.append(
             compiled_decoded_reindex(signature)(query[start:stop].clone(), weights[start:stop].clone(), keys,
-                                                positions[start:stop].clone(), current, ratio, 32 // tensor_parallel_size, native_gather,
-                                                native_scores))
+                                                positions[start:stop].clone(), current, ratio,
+                                                32 // tensor_parallel_size, native_gather, native_scores))
     return torch.cat(outputs, 0)
 
 
@@ -243,7 +246,7 @@ def tp_prefill_reindex_selection(query,
                                  all_gather,
                                  native_gather=True,
                                  native_scores=True,
-                              tensor_parallel_size=2):
+                                 tensor_parallel_size=2):
     """Split independent candidate-slot selection and gather only final IDs."""
     tokens = query.shape[0]
     if not 0 <= tp_rank < tensor_parallel_size or tokens < 1 or blocks.shape[0] != tokens:

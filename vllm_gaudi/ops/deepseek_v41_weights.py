@@ -20,16 +20,30 @@ import struct
 
 import numpy as np
 
-
 LAYOUT_VERSION = 2
 ROW_BLOCK = 128
 K_BLOCK = 128
 SCALE_GROUP = 32
 MAX_TEMPORARY_BYTES = 2 * 2**30
 COPY_BYTES = 16 * 2**20
-ITEM_BYTES = {"BOOL": 1, "U8": 1, "I8": 1, "F8_E4M3": 1, "F8_E5M2": 1, "F8_E8M0": 1,
-              "I16": 2, "U16": 2, "BF16": 2, "F16": 2, "F32": 4, "I32": 4, "U32": 4,
-              "F64": 8, "I64": 8, "U64": 8}
+ITEM_BYTES = {
+    "BOOL": 1,
+    "U8": 1,
+    "I8": 1,
+    "F8_E4M3": 1,
+    "F8_E5M2": 1,
+    "F8_E8M0": 1,
+    "I16": 2,
+    "U16": 2,
+    "BF16": 2,
+    "F16": 2,
+    "F32": 4,
+    "I32": 4,
+    "U32": 4,
+    "F64": 8,
+    "I64": 8,
+    "U64": 8
+}
 EXPERT = re.compile(r"^((?:layers|mtp)\.\d+\.ffn\.experts)\.(\d+)\.(w[123])\.(weight|scale)$")
 ENGRAM_TABLE = re.compile(r"^layers\.(\d+)\.engram\.embed\.(weight|scale)$")
 
@@ -220,8 +234,9 @@ def tp_axis(name: str):
         return None
     if ".shared_experts." in name:
         return 1 if ".w2." in name else 0
-    if any(part in name for part in (".wq_b.", ".wo_a.", ".weights_proj.", ".markov_head.embed.",
-                                     ".markov_head.head.")) or name in ("embed.weight", "head.weight", "mtp.embed.weight"):
+    if any(part in name
+           for part in (".wq_b.", ".wo_a.", ".weights_proj.", ".markov_head.embed.",
+                        ".markov_head.head.")) or name in ("embed.weight", "head.weight", "mtp.embed.weight"):
         return 0
     if ".wo_b." in name:
         return 1
@@ -241,7 +256,11 @@ class RankWriter:
         position = 0
         for name, spec in sorted(specs.items()):
             count = math.prod(spec["shape"]) * ITEM_BYTES[spec["dtype"]]
-            header[name] = {"dtype": spec["dtype"], "shape": spec["shape"], "data_offsets": [position, position + count]}
+            header[name] = {
+                "dtype": spec["dtype"],
+                "shape": spec["shape"],
+                "data_offsets": [position, position + count]
+            }
             self.offsets[name] = (position, count)
             position += count
         encoded = json.dumps(header, separators=(",", ":")).encode()
@@ -281,7 +300,10 @@ class RankWriter:
         self.stream.close()
 
 
-def build_plan(catalog: dict[str, TensorSource], *, layers_per_stage=20, tensor_parallel_size=2,
+def build_plan(catalog: dict[str, TensorSource],
+               *,
+               layers_per_stage=20,
+               tensor_parallel_size=2,
                pipeline_parallel_size=2):
     if (tensor_parallel_size, pipeline_parallel_size) not in ((2, 2), (4, 1)):
         raise ValueError("The prepared V4.1 path supports TP4 x PP1 or legacy TP2 x PP2")
@@ -306,8 +328,13 @@ def build_plan(catalog: dict[str, TensorSource], *, layers_per_stage=20, tensor_
             shape[axis] //= tensor_parallel_size
         # E8M0 is an encoding, not an integer conversion. Byte storage also
         # permits loading with Bridge versions without a torch E8M0 dtype.
-        spec = {"dtype": "U8" if source.dtype == "F8_E8M0" else source.dtype,
-                "shape": shape, "source": name, "source_dtype": source.dtype, "tp_axis": axis}
+        spec = {
+            "dtype": "U8" if source.dtype == "F8_E8M0" else source.dtype,
+            "shape": shape,
+            "source": name,
+            "source_dtype": source.dtype,
+            "tp_axis": axis
+        }
         for tp in range(tensor_parallel_size):
             ranks[pp, tp][name] = spec.copy()
             if name == "embed.weight":
@@ -342,12 +369,16 @@ def build_plan(catalog: dict[str, TensorSource], *, layers_per_stage=20, tensor_
             # 576 logical channels stored as 640 channels per projection.
             blocks = (2 * math.ceil(local_rows / ROW_BLOCK) if projection == "w13" else math.ceil(n / ROW_BLOCK))
             padded_k = math.ceil(k / K_BLOCK) * K_BLOCK
-            for kind, dtype, stream in (("q16", "I16", (padded_k // 2) * 64),
-                                         ("s16", "BF16", (padded_k // SCALE_GROUP) * 128)):
+            for kind, dtype, stream in (("q16", "I16", (padded_k // 2) * 64), ("s16", "BF16",
+                                                                               (padded_k // SCALE_GROUP) * 128)):
                 name = f"{prefix}.{projection}_{kind}"
-                spec = {"dtype": dtype, "shape": [count, blocks, stream],
-                        "original_shape": [count, n, k],
-                        "source_pattern": prefix + ".{expert}.{projection}.{kind}", "layout_version": LAYOUT_VERSION}
+                spec = {
+                    "dtype": dtype,
+                    "shape": [count, blocks, stream],
+                    "original_shape": [count, n, k],
+                    "source_pattern": prefix + ".{expert}.{projection}.{kind}",
+                    "layout_version": LAYOUT_VERSION
+                }
                 if projection == "w13" and local_rows % ROW_BLOCK:
                     spec["projection_rows"] = local_rows
                     spec["padded_projection_rows"] = blocks * ROW_BLOCK // 2
@@ -363,8 +394,8 @@ def copy_plain(source: TensorSource, writer: RankWriter, name: str, tp: int, ten
     rows = source.shape[0] if source.shape else 1
     row_bytes = source.nbytes // rows
     chunk_rows = max(1, COPY_BYTES // row_bytes)
-    start, stop = ((tp * (rows // tensor_parallel_size), (tp + 1) * (rows // tensor_parallel_size))
-                   if axis == 0 else (0, rows))
+    start, stop = ((tp * (rows // tensor_parallel_size), (tp + 1) * (rows // tensor_parallel_size)) if axis == 0 else
+                   (0, rows))
     target_offset = 0
     for begin in range(start, stop, chunk_rows):
         data = source.raw_rows(begin, min(stop, begin + chunk_rows))
@@ -413,7 +444,12 @@ def copy_experts(prefix: str, experts: dict, writers: list[RankWriter], tensor_p
     return normal
 
 
-def host_manifest(tables: dict[str, TensorSource], tp: int, revision: str, source_hashes: dict, *, hash_layout=None,
+def host_manifest(tables: dict[str, TensorSource],
+                  tp: int,
+                  revision: str,
+                  source_hashes: dict,
+                  *,
+                  hash_layout=None,
                   tensor_parallel_size=2):
     if not 0 <= tp < tensor_parallel_size:
         raise ValueError("Invalid Engram TP rank")
@@ -433,12 +469,28 @@ def host_manifest(tables: dict[str, TensorSource], tp: int, revision: str, sourc
             if not 0 <= begin <= end <= rows:
                 raise ValueError("Engram head shard is outside the original table")
         row_bytes = source.nbytes // rows
-        records[name] = {"file": str(source.file.resolve()), "source_sha256": source_hashes[source.file.name],
-                         "dtype": source.dtype, "shape": list(source.shape), "tensor_offset": source.offset,
-                         "row_start": begin, "row_stop": end, "padded_rows": shard_rows,
-                         "shard_offset": source.offset + begin * row_bytes, "row_bytes": row_bytes,
-                         "shard_bytes": (end - begin) * row_bytes, **head}
-    return {"format_version": 1, "model_revision": revision, "tensor_parallel_size": tensor_parallel_size,
-            "tp_rank": tp, "pp_owner": 0,
-            "shared_read_only": True, "storage": "original_safetensors_mmap", "tables": records,
-            "sharding": "complete_hash_heads" if hash_layout is not None else "ceil_rows"}
+        records[name] = {
+            "file": str(source.file.resolve()),
+            "source_sha256": source_hashes[source.file.name],
+            "dtype": source.dtype,
+            "shape": list(source.shape),
+            "tensor_offset": source.offset,
+            "row_start": begin,
+            "row_stop": end,
+            "padded_rows": shard_rows,
+            "shard_offset": source.offset + begin * row_bytes,
+            "row_bytes": row_bytes,
+            "shard_bytes": (end - begin) * row_bytes,
+            **head
+        }
+    return {
+        "format_version": 1,
+        "model_revision": revision,
+        "tensor_parallel_size": tensor_parallel_size,
+        "tp_rank": tp,
+        "pp_owner": 0,
+        "shared_read_only": True,
+        "storage": "original_safetensors_mmap",
+        "tables": records,
+        "sharding": "complete_hash_heads" if hash_layout is not None else "ceil_rows"
+    }

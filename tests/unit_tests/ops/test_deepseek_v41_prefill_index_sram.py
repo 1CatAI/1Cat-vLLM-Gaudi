@@ -34,7 +34,10 @@ def test_padded_source_rows_and_changed_positions(native, monkeypatch, tokens, c
     row_owner = torch.arange(columns + 17, dtype=torch.int64, device="hpu") + 512
     rows = row_owner[17:]
     positions = (torch.arange(tokens, dtype=torch.int64) * 53 + 512) * ratio
-    owner = SimpleNamespace(ratio=ratio, index_heads=local_heads, tensor_parallel_size=32 // local_heads, cache=SimpleNamespace(index=packed))
+    owner = SimpleNamespace(ratio=ratio,
+                            index_heads=local_heads,
+                            tensor_parallel_size=32 // local_heads,
+                            cache=SimpleNamespace(index=packed))
     page_rows = 128 // ratio
     owner.shared = SimpleNamespace(block_table=table,
                                    physical_rows=lambda r, _: table[
