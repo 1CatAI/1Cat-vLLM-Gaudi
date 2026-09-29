@@ -21,6 +21,11 @@ def begin(request_id, generation, tokens, pp_rank, tp_rank):
     global _active
     if not os.environ.get("VLLM_HPU_DSV41_PREFILL_EVENT_TRACE") or tokens < 8192:
         return False
+    prefixes = tuple(prefix.strip()
+                     for prefix in os.environ.get("VLLM_HPU_DSV41_PREFILL_EVENT_TRACE_REQUEST_PREFIX", "").split(",")
+                     if prefix.strip())
+    if prefixes and not request_id.startswith(prefixes):
+        return False
     if _active is not None:
         raise RuntimeError("A Prefill event trace already owns this worker")
     limit = int(os.environ.get("VLLM_HPU_DSV41_PREFILL_EVENT_TRACE_LIMIT", "1"))
@@ -38,6 +43,11 @@ def begin(request_id, generation, tokens, pp_rank, tp_rank):
                    anchor=anchor,
                    anchor_host_before_ns=anchor_host_before,
                    anchor_host_after_ns=anchor_host_after,
+                   labels=[
+                       label.strip()
+                       for label in os.environ.get("VLLM_HPU_DSV41_PREFILL_EVENT_TRACE_LABELS", "").split(",")
+                       if label.strip()
+                   ],
                    spans=[],
                    started_ns=anchor_host_before)
     return True
@@ -46,7 +56,7 @@ def begin(request_id, generation, tokens, pp_rank, tp_rank):
 @contextmanager
 def span(name, layer=None, rows=None):
     trace = _active
-    if trace is None:
+    if trace is None or (trace["labels"] and name not in trace["labels"]):
         yield
         return
     start = torch.hpu.Event(enable_timing=True)
@@ -79,6 +89,11 @@ def finish():
                                "CLOCK_MONOTONIC. Cross-rank device clocks are not assumed synchronized.")
     trace["scope"] = ("Diagnostic current-stream Prefill spans; not hardware kernels or a "
                       "non-profiled throughput qualification")
+    # Read counters after the timed enclosure; ordinary requests never enter
+    # this diagnostic. The worker resets the high-water mark after readiness.
+    trace["memory"] = dict(allocated_bytes=torch.hpu.memory_allocated(),
+                           peak_allocated_bytes=torch.hpu.max_memory_allocated(),
+                           scope="since_last_ready_including_request_warmup; not request-isolated")
     trace["spans"] = []
     for item in rows:
         start = item.pop("start")

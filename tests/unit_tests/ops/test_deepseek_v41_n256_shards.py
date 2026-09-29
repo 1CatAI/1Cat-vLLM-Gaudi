@@ -14,8 +14,9 @@ from vllm_gaudi.ops.deepseek_v41_n256_shards import N256PreparedShard
 from vllm_gaudi.ops.deepseek_v41_weights import RankWriter, file_hash, publish_json, read_header
 
 
-@pytest.fixture
-def prepared(tmp_path):
+@pytest.fixture(params=[(2, 2), (4, 1)])
+def prepared(tmp_path, request):
+    tp, pp = request.param
     prefix = "layers.0.ffn.experts.w13"
     rng = np.random.default_rng(31)
     q = rng.integers(-32768, 32768, (3, 4, 4096), dtype=np.int16)
@@ -24,8 +25,13 @@ def prepared(tmp_path):
     base.mkdir()
     source = base / "pp0-tp0.safetensors"
     arrays = {prefix + "_q16": q, prefix + "_s16": s}
-    specs = {name: {"dtype": "I16" if name.endswith("_q16") else "BF16", "shape": list(value.shape)}
-             for name, value in arrays.items()}
+    specs = {
+        name: {
+            "dtype": "I16" if name.endswith("_q16") else "BF16",
+            "shape": list(value.shape)
+        }
+        for name, value in arrays.items()
+    }
     writer = RankWriter(source, specs, {})
     try:
         for name, value in arrays.items():
@@ -33,19 +39,38 @@ def prepared(tmp_path):
         writer.sync()
     finally:
         writer.close()
-    manifest = {"rank_files": {"pp0-tp0": {"sha256": file_hash(source)}}}
+    manifest = {
+        "tensor_parallel_size": tp,
+        "pipeline_parallel_size": pp,
+        "rank_files": {
+            "pp0-tp0": {
+                "sha256": file_hash(source)
+            }
+        }
+    }
     publish_json(base / "manifest.json", manifest)
-    shard = SimpleNamespace(directory=base, pp_rank=0, tp_rank=0, manifest=manifest,
-                            catalog=read_header(source), check_identity=lambda: None)
+    shard = SimpleNamespace(directory=base,
+                            pp_rank=0,
+                            tp_rank=0,
+                            manifest=manifest,
+                            catalog=read_header(source),
+                            check_identity=lambda: None)
     output = tmp_path / "runtime"
     output.mkdir()
     rank, record = prepare_rank(shard, output)
-    publish_json(output / "manifest.json", {
-        "schema_version": 1, "layout": LAYOUT, "layout_fingerprint": FINGERPRINT,
-        "quantization_fingerprint": QUANTIZATION_FINGERPRINT,
-        "source_manifest_sha256": file_hash(base / "manifest.json"),
-        "tensor_parallel_size": 2, "pipeline_parallel_size": 2,
-        "rank_files": {rank: record}})
+    publish_json(
+        output / "manifest.json", {
+            "schema_version": 1,
+            "layout": LAYOUT,
+            "layout_fingerprint": FINGERPRINT,
+            "quantization_fingerprint": QUANTIZATION_FINGERPRINT,
+            "source_manifest_sha256": file_hash(base / "manifest.json"),
+            "tensor_parallel_size": tp,
+            "pipeline_parallel_size": pp,
+            "rank_files": {
+                rank: record
+            }
+        })
     return output, shard, prefix, q, s
 
 
@@ -65,7 +90,7 @@ def test_runtime_loader_is_exact_and_skips_preparation(prepared, monkeypatch):
         assert np.array_equal(bits, wanted)
 
 
-@pytest.mark.parametrize("fault", ["layout", "quantization", "source", "rank", "truncated", "modified"])
+@pytest.mark.parametrize("fault", ["layout", "quantization", "source", "rank", "truncated", "modified", "topology"])
 def test_invalid_runtime_files_fail_explicitly(prepared, fault):
     output, shard, _, _, _ = prepared
     path = output / "manifest.json"
@@ -73,6 +98,8 @@ def test_invalid_runtime_files_fail_explicitly(prepared, fault):
     rank = manifest["rank_files"]["pp0-tp0"]
     if fault in ("layout", "quantization"):
         manifest[fault + "_fingerprint"] = "wrong"
+    elif fault == "topology":
+        manifest["tensor_parallel_size"] = 8
     elif fault == "source":
         manifest["source_manifest_sha256"] = "wrong"
     elif fault == "rank":

@@ -12,7 +12,7 @@ habana::OutputMetaDataVector metadata(const at::Stack& stack) {
     const auto scores = stack[0].toTensor(), rows = stack[1].toTensor();
     const auto width = stack[2].toInt();
     TORCH_CHECK(scores.scalar_type() == at::kFloat && scores.dim() == 2 &&
-                scores.size(0) >= 1 && scores.size(0) <= 8192 &&
+                scores.size(0) >= 1 && scores.size(0) <= 16384 &&
                 scores.size(1) >= 1 && scores.size(1) <= 4096,
                 "Index TopK requires bounded F32 score rows");
     TORCH_CHECK(rows.scalar_type() == at::kInt && rows.sizes() == scores.sizes() &&

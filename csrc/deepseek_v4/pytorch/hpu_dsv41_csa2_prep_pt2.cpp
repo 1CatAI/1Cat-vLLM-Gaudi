@@ -12,7 +12,7 @@ constexpr auto kFinalCollapseNorm =
     "custom_op::custom_deepseek_v41_final_collapse_norm_bf16_gaudi2";
 struct NormParams { float epsilon; };
 void norm_contract(const at::Tensor& x, const at::Tensor& weight, double epsilon) {
-    TORCH_CHECK(x.dim() == 2 && x.size(0) >= 1 && x.size(0) <= 8192 &&
+    TORCH_CHECK(x.dim() == 2 && x.size(0) >= 1 && x.size(0) <= 16384 &&
                 (x.size(1) == 512 || x.size(1) == 1280 || x.size(1) == 5120) &&
                 weight.sizes() == at::IntArrayRef({x.size(1)}) &&
                 std::isnormal(static_cast<float>(epsilon)) && epsilon > 0,

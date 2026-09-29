@@ -51,10 +51,10 @@ def resident_table_source(item, binding):
     return dict(item, file=binding["file"], shard_offset=0, shared_memfd=True)
 
 
-def device_engram_parameters(layout, layer, tp_rank, pad_id):
+def device_engram_parameters(layout, layer, tp_rank, pad_id, tensor_parallel_size=2):
     """Pack the split-u64 hash constants consumed by the device producer."""
     layer_index = layout.layer_ids.index(layer)
-    shard = layout.head_shard(layer, tp_rank)
+    shard = layout.head_shard(layer, tp_rank, tensor_parallel_size)
     result = [int(pad_id), shard["head_start"], shard["row_start"]]
     for multiplier in layout.multipliers[layer_index]:
         bits = int(multiplier) & 0xffffffffffffffff
@@ -278,16 +278,23 @@ class EngramHost:
             raise RuntimeError("The enabled Engram C1 path requires its matching native preparation ABI")
         if gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and self.c1_abi != 2:
             raise RuntimeError("Device Engram requires native host C1 ABI 2")
-        if max_tokens not in range(1, 8193) or ring_size < 2:
+        if max_tokens not in range(1, 16385) or ring_size < 2:
             raise ValueError("Invalid bounded Engram staging geometry")
         self.directory, self.tp_rank = Path(directory), tp_rank
         manifest = json.loads((self.directory / "manifest.json").read_text())
+        self.tensor_parallel_size = manifest.get("tensor_parallel_size", 2)
+        if self.tensor_parallel_size not in (2, 4):
+            raise RuntimeError("Prepared Engram manifest has an unsupported tensor parallel size")
+        if not 0 <= tp_rank < self.tensor_parallel_size:
+            raise ValueError("Invalid Engram TP rank for the prepared manifest")
         record = manifest["engram_host_shards"][str(tp_rank)]
         path = self.directory / record["file"]
         if file_hash(path) != record["sha256"]:
             raise RuntimeError("Engram host shard manifest changed")
         host = json.loads(path.read_text())
-        if (host["tp_rank"] != tp_rank or host["pp_owner"] != 0 or host["sharding"] != "complete_hash_heads"
+        if (host["tp_rank"] != tp_rank
+                or host.get("tensor_parallel_size", self.tensor_parallel_size) != self.tensor_parallel_size
+                or host["pp_owner"] != 0 or host["sharding"] != "complete_hash_heads"
                 or host["model_revision"] != manifest["model_revision"] or not host["shared_read_only"]):
             raise RuntimeError("Engram host shard ownership or revision mismatch")
         config = json.loads((self.directory / "config.json").read_text())["text_config"]
@@ -312,7 +319,7 @@ class EngramHost:
         for layer in self.layout.layer_ids:
             weight = host["tables"][f"layers.{layer}.engram.embed.weight"]
             scale = host["tables"][f"layers.{layer}.engram.embed.scale"]
-            shard = self.layout.head_shard(layer, tp_rank)
+            shard = self.layout.head_shard(layer, tp_rank, self.tensor_parallel_size)
             for item in (weight, scale):
                 if any(item.get(key) != value for key, value in shard.items()):
                     raise RuntimeError("Engram offsets do not match the frozen hash-head layout")
@@ -358,8 +365,10 @@ class EngramHost:
                 np.array([self.shards[layer]["head_start"] for layer in layers], dtype=np.int64),
                 np.array([self.shards[layer]["head_stop"] for layer in layers], dtype=np.int64), self.history.pad_id,
                 [self.tables[layer] for layer in layers], targets)
-        if gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM:
+        if gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and self.tensor_parallel_size == 2:
             self._initialize_device_c1(host, device)
+        elif gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM:
+            raise RuntimeError("Device Engram is currently qualified only for TP2; disable it for TP4")
         self.batches = None
         if envs.VLLM_HPU_DSV41_BATCHED_INPUT_STAGING and max_tokens == 6:
             if not envs.VLLM_HPU_DSV41_FUSED_STAGE_IO:
@@ -391,7 +400,8 @@ class EngramHost:
         weight, scale = self.table_sources[layer]
         rows = shard["row_stop"] - shard["row_start"]
         token_map = torch.from_numpy(self.history.token_map.astype(np.int32)).to(device)
-        parameters = torch.tensor(device_engram_parameters(self.layout, layer, self.tp_rank, self.history.pad_id),
+        parameters = torch.tensor(device_engram_parameters(self.layout, layer, self.tp_rank, self.history.pad_id,
+                                                           self.tensor_parallel_size),
                                   dtype=torch.int32,
                                   device=device)
         self.device_rows = torch.empty((1, local_heads, self.layout.head_dim), dtype=torch.bfloat16, device=device)

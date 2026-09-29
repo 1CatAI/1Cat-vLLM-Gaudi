@@ -28,7 +28,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41RopeGaudi2::GetGcDefinitions(
     if(x.dataType!=DATA_BF16 || p.dataType!=DATA_I32 || t.dataType!=DATA_F32 || y.dataType!=DATA_BF16)
         return GLUE_INCOMPATIBLE_DATA_TYPE;
     if(x.dims!=3 || x.maxSizes[0]%128 || !x.maxSizes[0] || x.maxSizes[0]>512 ||
-       !x.maxSizes[1] || x.maxSizes[1]>128 || !x.maxSizes[2] || x.maxSizes[2]>(prefill_ ? 8192 : 6) ||
+       !x.maxSizes[1] || x.maxSizes[1]>128 || !x.maxSizes[2] || x.maxSizes[2]>(prefill_ ? 16384 : 6) ||
        p.dims!=1 || p.maxSizes[0]!=x.maxSizes[2] || t.dims!=2 || t.maxSizes[0]!=64 || !t.maxSizes[1])
         return GLUE_INCOMPATIBLE_INPUT_SIZE;
     if(y.dims!=3 || y.maxSizes[0]!=x.maxSizes[0] || y.maxSizes[1]!=x.maxSizes[1] || y.maxSizes[2]!=x.maxSizes[2])

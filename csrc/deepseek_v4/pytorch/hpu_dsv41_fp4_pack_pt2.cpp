@@ -10,7 +10,7 @@ constexpr auto kWrite = "custom_op::custom_deepseek_v41_fp4_cache_write_bf16_gau
 constexpr auto kOrdered = "custom_op::custom_deepseek_v41_fp4_cache_write_ordered_bf16_gaudi2";
 void value_contract(const at::Tensor& value, unsigned group) {
     TORCH_CHECK(value.scalar_type() == at::kBFloat16 && value.dim() == 2 && value.is_contiguous() &&
-                !value.requires_grad() && value.size(0) > 0 && value.size(0) <= 8192 && value.size(1) > 0 &&
+                !value.requires_grad() && value.size(0) > 0 && value.size(0) <= 16384 && value.size(1) > 0 &&
                 value.size(1) <= 16384 && value.size(1) % group == 0, "Invalid V4.1 FP4 packing input");
 }
 void write_contract(const at::Stack& stack) {

@@ -29,8 +29,10 @@ tpc_lib_api::GlueCodeReturn DeepseekV41WoaGaudi2::GetGcDefinitions(
     if (p->outputTensorNr != (quant_ ? 2u : 1u)) return GLUE_INCOMPATIBLE_OUTPUT_COUNT;
     const auto& a = p->inputTensors[0].geometry;
     const auto& b = p->outputTensors[0].geometry;
+    const auto groups = quant_ ? b.maxSizes[2] : a.maxSizes[2];
+    if (groups != 2 && groups != 4) return GLUE_INCOMPATIBLE_INPUT_SIZE;
     const auto tokens = product_ ? 1 : (quant_ ? a.maxSizes[2] : a.maxSizes[1]);
-    if (tokens < 1 || tokens > 8192 || a.dims != (product_ ? 2u : 3u) || b.dims != 3)
+    if (tokens < 1 || tokens > 16384 || a.dims != (product_ ? 2u : 3u) || b.dims != 3)
         return GLUE_INCOMPATIBLE_INPUT_SIZE;
     if (quant_) {
         const auto& s = p->outputTensors[1].geometry;
@@ -38,13 +40,13 @@ tpc_lib_api::GlueCodeReturn DeepseekV41WoaGaudi2::GetGcDefinitions(
             b.dataType != DATA_F8_143 || s.dataType != DATA_F32)
             return GLUE_INCOMPATIBLE_DATA_TYPE;
         const bool valid_input = product_
-            ? (a.maxSizes[0] == 512 && a.maxSizes[1] == 32)
+            ? (a.maxSizes[0] == 512 && a.maxSizes[1] == groups * 8)
             : rope_
-            ? (a.maxSizes[0] == 512 && a.maxSizes[1] == 32)
-            : (a.maxSizes[0] == 4096 && a.maxSizes[1] == 4);
+            ? (a.maxSizes[0] == 512 && a.maxSizes[1] == groups * 8)
+            : (a.maxSizes[0] == 4096 && a.maxSizes[1] == groups);
         if (!valid_input || b.maxSizes[0] != 4096 ||
-            b.maxSizes[1] != tokens || b.maxSizes[2] != 4 || s.dims != 3 ||
-            s.maxSizes[0] != 1 || s.maxSizes[1] != tokens || s.maxSizes[2] != 4)
+            b.maxSizes[1] != tokens || b.maxSizes[2] != groups || s.dims != 3 ||
+            s.maxSizes[0] != 1 || s.maxSizes[1] != tokens || s.maxSizes[2] != groups)
             return GLUE_INCOMPATIBLE_INPUT_SIZE;
         if (rope_) {
             const auto& positions = p->inputTensors[1].geometry;
@@ -54,7 +56,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41WoaGaudi2::GetGcDefinitions(
                 return GLUE_INCOMPATIBLE_INPUT_SIZE;
         }
         out->indexSpaceRank = 2;
-        out->indexSpaceGeometry[0] = tokens; out->indexSpaceGeometry[1] = 4;
+        out->indexSpaceGeometry[0] = tokens; out->indexSpaceGeometry[1] = groups;
         auto& input = out->inputTensorAccessPattern[0];
         if (rope_) {
             map(input, 0, 0, 0, 0, 511); map(input, 1, 1, 8, 0, 7);
@@ -74,14 +76,14 @@ tpc_lib_api::GlueCodeReturn DeepseekV41WoaGaudi2::GetGcDefinitions(
         const auto& sx = p->inputTensors[2].geometry;
         if (a.dataType != DATA_F32 || sw.dataType != DATA_F32 || sx.dataType != DATA_F32 || b.dataType != DATA_BF16)
             return GLUE_INCOMPATIBLE_DATA_TYPE;
-        if (a.maxSizes[0] != 1024 || a.maxSizes[2] != 4 || b.maxSizes[0] != 1024 || b.maxSizes[1] != 4 ||
+        if (a.maxSizes[0] != 1024 || a.maxSizes[2] != groups || b.maxSizes[0] != 1024 || b.maxSizes[1] != groups ||
             b.maxSizes[2] != tokens || sw.dims != 3 || sx.dims != 3 || sw.maxSizes[0] != 1024 ||
-            sw.maxSizes[1] != 1 || sw.maxSizes[2] != 4 || sx.maxSizes[0] != 1 || sx.maxSizes[1] != tokens ||
-            sx.maxSizes[2] != 4) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+            sw.maxSizes[1] != 1 || sw.maxSizes[2] != groups || sx.maxSizes[0] != 1 || sx.maxSizes[1] != tokens ||
+            sx.maxSizes[2] != groups) return GLUE_INCOMPATIBLE_INPUT_SIZE;
         out->indexSpaceRank = 3;
         const int width = roundtrip_ && !wide_ ? 32 : 128;
         out->indexSpaceGeometry[0] = 1024 / width;
-        out->indexSpaceGeometry[1] = tokens; out->indexSpaceGeometry[2] = 4;
+        out->indexSpaceGeometry[1] = tokens; out->indexSpaceGeometry[2] = groups;
         for (int i = 0; i < 3; ++i) {
             auto& input = out->inputTensorAccessPattern[i];
             map(input, 0, 0, i == 2 ? 0 : width, 0, i == 2 ? 0 : width - 1);

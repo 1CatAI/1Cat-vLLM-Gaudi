@@ -12,10 +12,10 @@ constexpr const char* post_prepare_schema="custom_op::custom_deepseek_v41_prefil
 void validate(const at::Tensor& x, const at::Tensor& r, const at::Tensor& p, const at::Tensor& c) {
     TORCH_CHECK(x.scalar_type()==at::kBFloat16 && r.scalar_type()==at::kBFloat16 &&
                 p.scalar_type()==at::kFloat && c.scalar_type()==at::kFloat &&
-                x.dim()==2 && x.size(0)>=1 && x.size(0)<=8192 && x.size(1)==5120 &&
+                x.dim()==2 && x.size(0)>=1 && x.size(0)<=16384 && x.size(1)==5120 &&
                 r.sizes()==at::IntArrayRef({x.size(0),4,5120}) &&
                 p.sizes()==at::IntArrayRef({x.size(0),4}) && c.sizes()==at::IntArrayRef({x.size(0),4,4}),
-                "Prefill mHC requires BF16 [T1..8192,5120]/[T,4,5120], FP32 [T,4]/[T,4,4]");
+                "Prefill mHC requires BF16 [T1..16384,5120]/[T,4,5120], FP32 [T,4]/[T,4,4]");
     for (const auto& t:{x,r,p,c})
         TORCH_CHECK(t.is_contiguous() && t.device()==x.device(), "Prefill mHC requires contiguous same-device tensors");
 }
@@ -32,9 +32,9 @@ const bool registered=[] {
 }();
 void validate_collapse(const at::Tensor& r, const at::Tensor& p) {
     TORCH_CHECK(r.scalar_type()==at::kBFloat16 && p.scalar_type()==at::kFloat &&
-                r.dim()==3 && r.size(0)>=1 && r.size(0)<=8192 && r.size(1)==4 && r.size(2)==5120 &&
+                r.dim()==3 && r.size(0)>=1 && r.size(0)<=16384 && r.size(1)==4 && r.size(2)==5120 &&
                 p.sizes()==at::IntArrayRef({r.size(0),4}),
-                "Prefill mHC collapse requires BF16 [T1..8192,4,5120] and FP32 [T,4]");
+                "Prefill mHC collapse requires BF16 [T1..16384,4,5120] and FP32 [T,4]");
     TORCH_CHECK(r.is_contiguous() && p.is_contiguous() && r.device()==p.device(),
                 "Prefill mHC collapse requires contiguous same-device tensors");
 }
@@ -51,9 +51,9 @@ const bool collapse_registered=[] {
 }();
 void validate_rrms(const at::Tensor& r) {
     TORCH_CHECK(r.scalar_type()==at::kBFloat16 && r.dim()==3 &&
-                r.size(0)>=1 && r.size(0)<=8192 && r.size(1)==4 && r.size(2)==5120 &&
+                r.size(0)>=1 && r.size(0)<=16384 && r.size(1)==4 && r.size(2)==5120 &&
                 r.is_contiguous(),
-                "Prefill mHC RRMS requires contiguous BF16 [T1..8192,4,5120]");
+                "Prefill mHC RRMS requires contiguous BF16 [T1..16384,4,5120]");
 }
 const bool rrms_registered=[] {
     habana::custom_op::registerUserCustomOp(rrms_schema,"custom_deepseek_v41_prefill_mhc_rrms_bf16_gaudi2",

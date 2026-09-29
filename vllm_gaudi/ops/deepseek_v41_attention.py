@@ -76,7 +76,7 @@ class CSA2SharedState(nn.Module):
 
 class CSA2Attention(FusedCompressorInput, nn.Module):
 
-    def __init__(self, weights, config, layer, shared, linear, reduce, device):
+    def __init__(self, weights, config, layer, shared, linear, reduce, device, tensor_parallel_size=2):
         super().__init__()
         self.weights = weights
         self.woa_fp8 = False
@@ -140,8 +140,13 @@ class CSA2Attention(FusedCompressorInput, nn.Module):
         if self.c1_indices and not self.bounded_decode:
             raise ValueError("Native C1 index preparation requires bounded packed attention")
         self.linear, self.reduce = linear, reduce
+        if tensor_parallel_size < 1 or config["num_attention_heads"] % tensor_parallel_size \
+                or config["o_groups"] % tensor_parallel_size:
+            raise ValueError("V4.1 attention head geometry is not divisible by the runtime TP size")
+        self.tensor_parallel_size = tensor_parallel_size
         self.layer, self.ratio, self.length = layer, config["compress_ratios"][layer], shared.length
-        self.heads, self.groups = config["num_attention_heads"] // 2, config["o_groups"] // 2
+        self.heads, self.groups = (config["num_attention_heads"] // tensor_parallel_size,
+                                   config["o_groups"] // tensor_parallel_size)
         self.eps, self.window = config["rms_norm_eps"], config["sliding_window"]
         if (self.c1_indices or self.native_rope) and (self.length != 512 or self.window != 128
                                                       or config["qk_rope_head_dim"] != 64):
@@ -273,7 +278,7 @@ class CSA2Attention(FusedCompressorInput, nn.Module):
     def _rope(self, value, positions, inverse=False):
         if (self.native_rope and gaudi_envs.VLLM_HPU_DSV41_PREFILL_ROPE and value.dtype == torch.bfloat16
                 and value.ndim in (2, 3) and (value.ndim == 2 or 1 <= value.shape[1] <= 128)
-                and 6 < value.shape[0] <= 8192 and 128 <= value.shape[-1] <= 512 and value.shape[-1] % 128 == 0):
+                and 6 < value.shape[0] <= 16384 and 128 <= value.shape[-1] <= 512 and value.shape[-1] % 128 == 0):
             op = (torch.ops.custom_op.custom_deepseek_v41_prefill_rope_inverse_bf16_gaudi2
                   if inverse else torch.ops.custom_op.custom_deepseek_v41_prefill_rope_bf16_gaudi2)
             shaped = value.reshape(value.shape[0], -1, value.shape[-1]).contiguous()
@@ -287,7 +292,7 @@ class CSA2Attention(FusedCompressorInput, nn.Module):
 
     def project_query(self, value, positions, *, decode=False):
         weight = self.weights.wq_b
-        if not decode and gaudi_envs.VLLM_HPU_DSV41_PREFILL_Q_PROJECTION and 6 < value.shape[0] <= 8192:
+        if not decode and gaudi_envs.VLLM_HPU_DSV41_PREFILL_Q_PROJECTION and 6 < value.shape[0] <= 16384:
             from vllm_gaudi.ops.deepseek_v41_prefill_regions import prefill_q_projection
             if not getattr(weight, "dense_fp8", False) or self.heads != 32:
                 raise ValueError("Prefill Q projection requires prepared FP8 weights and 32 local heads")
@@ -358,7 +363,7 @@ class CSA2Attention(FusedCompressorInput, nn.Module):
         query_input, kv_input = self._project_qkv_input(value)
         norm = (torch.ops.custom_op.custom_deepseek_v41_attention_norm_bf16_gaudi2 if self.fused_norm and
                 (value.shape[0] == 1 or
-                 (not decode and gaudi_envs.VLLM_HPU_DSV41_PREFILL_NATIVE_NORM and 6 < value.shape[0] <= 8192)) else
+                 (not decode and gaudi_envs.VLLM_HPU_DSV41_PREFILL_NATIVE_NORM and 6 < value.shape[0] <= 16384)) else
                 rms_norm)
         query = norm(query_input, self.weights.q_norm.weight, self.eps)
         delay_q = self.kv_first and value.shape[0] == 1
@@ -457,7 +462,7 @@ class CSA2Attention(FusedCompressorInput, nn.Module):
                 query.contiguous(), cache.contiguous(), indices.contiguous(), self.weights.attn_sink, self.scale)
         output = self._rope(output, positions, inverse=True)
         output = output.reshape(-1, self.groups, self.heads // self.groups * 512)
-        if not decode and gaudi_envs.VLLM_HPU_DSV41_PREFILL_OUTPUT_PROJECTION and 6 < output.shape[0] <= 8192:
+        if not decode and gaudi_envs.VLLM_HPU_DSV41_PREFILL_OUTPUT_PROJECTION and 6 < output.shape[0] <= 16384:
             from vllm_gaudi.ops.deepseek_v41_prefill_regions import prefill_output_projection
             wa, wb = self.weights.wo_a, self.weights.wo_b
             if not (self.woa_fp8 and self.woa_output_roundtrip and getattr(wb, "dense_fp8", False)):

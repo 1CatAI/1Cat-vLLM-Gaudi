@@ -2,8 +2,9 @@
 """Bounded BF16 expert execution grouped by current route occupancy."""
 
 import functools
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from types import FunctionType
+import time
 
 import torch
 
@@ -88,6 +89,9 @@ class _BucketedPrefillPlans:
         self.plans = OrderedDict()
         self.workspace = None
         self.indices = {}
+        self.preparations = deque(maxlen=128)
+        self.preparation_count = 0
+        self.preparation_ms = 0.0
 
     def close(self):
         if self.plans:
@@ -137,6 +141,10 @@ class _BucketedPrefillPlans:
 
         interleaved = envs.VLLM_HPU_DSV41_PREFILL_COLUMN_INTERLEAVE and bool(normal_scales)
         single_fp8 = channel13 is not None
+        # The four-way prepared shard pads I576 to I640. Preserve compact
+        # two-expert work without compiling a new batch width whenever a
+        # changing route count selects another even-sized tail.
+        fixed_pair_tail = single_fp8 and tuple(channel13.shape[1:]) == (5, 256)
         if single_fp8 and not interleaved:
             raise ValueError("Bucketed W13 FP8 requires interleaved columns and normal scale codes")
         if single_fp8:
@@ -156,8 +164,10 @@ class _BucketedPrefillPlans:
         workspace = self.routed_workspace(value, ids.numel())
         if single_fp8:
             high, high_scale = compiled_single_prequant((value.shape[0], value.shape[-1]))(value)
-        quantum = 32 if single_fp8 else 64
-        buckets = _FP8_ROW_BUCKETS if single_fp8 else _ROW_BUCKETS
+        # The narrower four-way shard amortizes less matrix work per bucket.
+        # Reuse the four BF16 occupancy families while retaining FP8 W13.
+        quantum = 32 if single_fp8 and not fixed_pair_tail else 64
+        buckets = _FP8_ROW_BUCKETS if quantum == 32 else _ROW_BUCKETS
         desc = _compiled_routes((ids.shape[0], q13.shape[0], quantum))(ids, q13.shape[0], quantum)
         active = [int(count) for count in desc[-1].cpu().tolist()]
         weights = (q13, q2, s13, s2, lookup, channel13) if single_fp8 else (q13, q2, s13, s2, lookup)
@@ -179,10 +189,15 @@ class _BucketedPrefillPlans:
             complete, remainder = divmod(active[index], width)
             # Match the compiler's two-expert MME tiles for the final group.
             # Full groups keep their existing recipe and weight reuse.
-            tail_width = ((remainder + 1) // 2) * 2 if single_fp8 else width
+            tail_width = (2 if fixed_pair_tail else ((remainder + 1) // 2) * 2) if single_fp8 else width
             compact_tail = 0 < tail_width < width
             submissions = []
-            if compact_tail:
+            if fixed_pair_tail and remainder:
+                if complete:
+                    submissions.append((arguments, complete, None))
+                tail_indices = self.group_indices(complete * width, width, value.device)
+                submissions.append(((*arguments, tail_indices), (remainder + 1) // 2, 2))
+            elif compact_tail and remainder:
                 if complete:
                     submissions.append((arguments, complete, None))
                 tail_indices = self.group_indices(complete * width, tail_width, value.device)
@@ -194,14 +209,31 @@ class _BucketedPrefillPlans:
                 binding_signature = (rows, tuple(layout(v) if isinstance(v, torch.Tensor) else v for v in bindings))
                 plan = family.get(binding_signature)
                 if plan is None:
-                    body = compile_body(
-                        ("bucketed_fp8" if single_fp8 else "bucketed", value.shape[0], rows, q13.shape[0],
-                         bool(normal_scales), compact_width))
-                    groups = None if compact_width else [
-                        self.group_indices(start, width, value.device) for start in range(0, slots.shape[0], width)
-                    ]
+                    prepared_at = time.perf_counter_ns()
+                    if fixed_pair_tail and compact_width:
+                        from vllm_gaudi.ops.deepseek_v41_prefill_columns import compiled_permuted_single_fp8_pair_tail
+                        body = compiled_permuted_single_fp8_pair_tail(
+                            (value.shape[0], rows, q13.shape[0], bool(normal_scales)))
+                        groups = [self.group_indices(start, 2, value.device) for start in range(0, width, 2)]
+                    else:
+                        body = compile_body(
+                            ("bucketed_fp8" if single_fp8 else "bucketed", value.shape[0], rows, q13.shape[0],
+                             bool(normal_scales), compact_width))
+                        groups = None if compact_width else [
+                            self.group_indices(start, width, value.device) for start in range(0, slots.shape[0], width)
+                        ]
                     plan = PrefillExpertPlan(body, bindings, groups, require_prefix=True)
                     family[binding_signature] = plan
+                    preparation_ms = (time.perf_counter_ns() - prepared_at) / 1e6
+                    self.preparations.append(
+                        dict(tokens=value.shape[0],
+                             rows=rows,
+                             compact_width=compact_width,
+                             fp8=single_fp8,
+                             recipes=plan.recipes,
+                             elapsed_ms=preparation_ms))
+                    self.preparation_count += 1
+                    self.preparation_ms += preparation_ms
                     executed += plan.recipes
                 else:
                     executed += plan.replay(bindings, group_count)
@@ -232,5 +264,8 @@ def bucketed_prefill_plan_stats():
     return dict(plans=len(plans),
                 recipes=sum(p.recipes for p in plans),
                 replays=sum(p.replays for p in plans),
+                preparations=[row for executor in _executors.values() for row in executor.preparations],
+                preparation_count=sum(executor.preparation_count for executor in _executors.values()),
+                preparation_ms=sum(executor.preparation_ms for executor in _executors.values()),
                 workspace_bytes=sum(e.workspace.numel() * e.workspace.element_size() for e in _executors.values()
                                     if e.workspace is not None))

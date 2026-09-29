@@ -27,7 +27,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41KVPackGaudi2::GetGcDefinitions(
     const uint64_t width = value.maxSizes[0], rows = value.maxSizes[1];
     if (value.dataType != DATA_BF16 || result.dataType != (roundtrip ? DATA_BF16 : DATA_U8))
         return GLUE_INCOMPATIBLE_DATA_TYPE;
-    if (value.dims != 2 || width == 0 || width % group || width > 16384 || rows == 0 || rows > 8192)
+    if (value.dims != 2 || width == 0 || width % group || width > 16384 || rows == 0 || rows > 16384)
         return GLUE_INCOMPATIBLE_INPUT_SIZE;
     const uint64_t codes = group_ ? width / 2 : width;
     const uint64_t result_width = roundtrip ? width : codes + width / group;

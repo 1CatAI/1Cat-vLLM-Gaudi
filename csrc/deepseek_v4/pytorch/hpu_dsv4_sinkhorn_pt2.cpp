@@ -9,8 +9,8 @@ namespace {
 constexpr const char* schema = "custom_op::custom_deepseek_v4_sinkhorn4_gaudi2";
 void validate(const at::Tensor& input) {
     TORCH_CHECK(input.scalar_type() == at::kFloat && input.dim() == 3 &&
-                input.size(0) >= 1 && input.size(0) <= 8192 && input.size(1) == 4 && input.size(2) == 4 &&
-                input.is_contiguous(), "V4 Sinkhorn requires contiguous FP32 [T,4,4], T in [1,8192]");
+                input.size(0) >= 1 && input.size(0) <= 16384 && input.size(1) == 4 && input.size(2) == 4 &&
+                input.is_contiguous(), "V4 Sinkhorn requires contiguous FP32 [T,4,4], T in [1,16384]");
 }
 habana::OutputMetaDataVector metadata(const at::Stack& stack) {
     const auto input = stack.at(0).toTensor();

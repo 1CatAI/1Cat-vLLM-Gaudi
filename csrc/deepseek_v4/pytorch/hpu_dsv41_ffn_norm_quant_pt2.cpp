@@ -13,11 +13,11 @@ using Outputs = std::tuple<at::Tensor, at::Tensor, at::Tensor>;
 struct Params { float epsilon; float inverse_width; };
 
 void contract(const at::Tensor& x, const at::Tensor& weight, double epsilon) {
-    TORCH_CHECK(x.dim() == 2 && x.size(0) >= 1 && x.size(0) <= 8192 &&
+    TORCH_CHECK(x.dim() == 2 && x.size(0) >= 1 && x.size(0) <= 16384 &&
                 x.size(1) == 5120 &&
                 weight.sizes() == at::IntArrayRef({5120}) &&
                 std::isnormal(static_cast<float>(epsilon)) && epsilon > 0,
-                "V4.1 FFN norm/quant requires [1..8192,5120], weight [5120], positive normal epsilon");
+                "V4.1 FFN norm/quant requires [1..16384,5120], weight [5120], positive normal epsilon");
     for (const auto& value : {x, weight})
         TORCH_CHECK(value.is_contiguous() && !value.requires_grad() &&
                     value.device() == x.device() &&

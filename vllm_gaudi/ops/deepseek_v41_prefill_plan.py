@@ -91,13 +91,19 @@ def register_prefill_plan_pass():
 
 def _runtime():
     from vllm_gaudi.distributed.tp2_fused_ar_norm import _load_bridge, _verify_prepared_runtime, _resolve_runtime
-    # A standalone complete-chain test uses one HCCL rank. Serving always
-    # resolves the actual TP communicator, never the four-rank default group.
-    if torch.distributed.is_initialized() and torch.distributed.get_world_size() == 1:
+    # Compute-only plans do not execute TP2 exchange. Keep serving bound to
+    # its actual TP group while the existing stage owns standard HCCL calls.
+    world = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 0
+    if world in (1, 4):
+        from vllm.distributed import get_tp_group
+        group = (torch.distributed.distributed_c10d._get_default_group() if world == 1 else get_tp_group().device_group)
+        if world == 4 and torch.distributed.get_world_size(group) != 4:
+            bridge, backend, _ = _resolve_runtime()
+            return bridge, backend
         path = Path(os.environ["VLLM_HPU_TP2_FUSED_AR_NORM_BRIDGE"])
         bridge = _load_bridge(path)
         _verify_prepared_runtime(path)
-        backend = torch.distributed.distributed_c10d._get_default_group()._get_backend(torch.device("hpu"))
+        backend = group._get_backend(torch.device("hpu"))
         return bridge, backend
     bridge, backend, _ = _resolve_runtime()
     return bridge, backend
@@ -267,6 +273,9 @@ def prefill_plan_stats():
     workspace_bytes = bucketed["workspace_bytes"] + sum(
         t.numel() * t.element_size() for t in (*_workspaces.values(), *_attention_workspaces.values()))
     return dict(executed=dict(_expert_audit),
+                bucketed_preparations=bucketed["preparations"],
+                bucketed_preparation_count=bucketed["preparation_count"],
+                bucketed_preparation_ms=bucketed["preparation_ms"],
                 index_query_tp=prefill_index_stats(),
                 plans=len(_plans) + bucketed["plans"],
                 recipes=sum(p.recipes for p in _plans.values()) + bucketed["recipes"],

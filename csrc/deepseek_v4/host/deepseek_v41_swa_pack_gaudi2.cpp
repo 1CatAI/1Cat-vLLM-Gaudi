@@ -20,7 +20,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41SwaPackGaudi2::GetGcDefinitions(
     const auto& value = in->inputTensors[write_ ? 1 : 0].geometry;
     const auto width = value.maxSizes[0], rows = value.maxSizes[1];
     if (value.dataType != DATA_BF16) return GLUE_INCOMPATIBLE_DATA_TYPE;
-    if (value.dims != 2 || width == 0 || width % 32 || width > 16384 || rows == 0 || rows > 8192 ||
+    if (value.dims != 2 || width == 0 || width % 32 || width > 16384 || rows == 0 || rows > 16384 ||
         (write_ && (rows != 1 || width != 512))) return GLUE_INCOMPATIBLE_INPUT_SIZE;
     auto& input_access = out->inputTensorAccessPattern[write_ ? 1 : 0];
     input_access.mapping[0] = {0, 32, 0, 31};

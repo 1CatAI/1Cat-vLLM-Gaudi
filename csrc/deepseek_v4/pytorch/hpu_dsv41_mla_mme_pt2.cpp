@@ -44,12 +44,12 @@ habana::OutputMetaDataVector mla_woa_meta(const at::Stack& s) {
     const auto q = s.at(0).toTensor(), w = s.at(12).toTensor();
     const auto channel_scale = s.at(13).toTensor();
     const auto positions = s.at(14).toTensor(), phase = s.at(15).toTensor();
-    TORCH_CHECK(q.size(0) == 1,
+    TORCH_CHECK(q.size(0) == 1 && (q.size(1) == 16 || q.size(1) == 32),
                 "Fused MLA/wo_a is currently the C1 production contract");
     TORCH_CHECK(w.scalar_type() == at::ScalarType::Float8_e4m3fn &&
-                w.sizes() == at::IntArrayRef({4,4096,1024}) &&
+                w.sizes() == at::IntArrayRef({q.size(1) / 8,4096,1024}) &&
                 channel_scale.scalar_type() == at::kFloat &&
-                channel_scale.sizes() == at::IntArrayRef({4,1,1024}),
+                channel_scale.sizes() == at::IntArrayRef({q.size(1) / 8,1,1024}),
                 "Fused MLA/wo_a requires prepared FP8 wo_a weights and channel scales");
     TORCH_CHECK(positions.scalar_type() == at::kInt &&
                 positions.sizes() == at::IntArrayRef({1}) &&
@@ -61,7 +61,7 @@ habana::OutputMetaDataVector mla_woa_meta(const at::Stack& s) {
         TORCH_CHECK(x.device() == q.device() && x.is_contiguous() && !x.requires_grad(),
                     "Fused MLA/wo_a requires matching contiguous inference tensors");
     }
-    return {{at::kBFloat16, {1,4096}}};
+    return {{at::kBFloat16, {1,s.at(0).toTensor().size(1) * 128}}};
 }
 habana::OutputMetaDataVector mla_woa_wob_meta(const at::Stack& s) {
     (void)mla_woa_meta(s);
@@ -69,7 +69,7 @@ habana::OutputMetaDataVector mla_woa_wob_meta(const at::Stack& s) {
     const auto scale = s.at(17).toTensor();
     const auto q = s.at(0).toTensor();
     TORCH_CHECK(w.scalar_type() == at::ScalarType::Float8_e4m3fn &&
-                w.sizes() == at::IntArrayRef({5120,4096}) &&
+                w.sizes() == at::IntArrayRef({5120,s.at(0).toTensor().size(1) * 128}) &&
                 scale.scalar_type() == at::kFloat &&
                 scale.sizes() == at::IntArrayRef({1,5120}) &&
                 w.device() == q.device() && scale.device() == q.device() &&
@@ -121,15 +121,15 @@ habana::OutputMetaDataVector selected_mla_woa_wob_meta(
     const auto wob_scale = s.at(15).toTensor();
     TORCH_CHECK(
         woa.scalar_type() == at::ScalarType::Float8_e4m3fn &&
-        woa.sizes() == at::IntArrayRef({4,4096,1024}) &&
+        woa.sizes() == at::IntArrayRef({q.size(1) / 8,4096,1024}) &&
         woa_scale.scalar_type() == at::kFloat &&
-        woa_scale.sizes() == at::IntArrayRef({4,1,1024}) &&
+        woa_scale.sizes() == at::IntArrayRef({q.size(1) / 8,1,1024}) &&
         positions.scalar_type() == at::kInt &&
         positions.sizes() == at::IntArrayRef({1}) &&
         phase.scalar_type() == at::kFloat && phase.dim() == 2 &&
         phase.size(1) == 64 &&
         wob.scalar_type() == at::ScalarType::Float8_e4m3fn &&
-        wob.sizes() == at::IntArrayRef({5120,4096}) &&
+        wob.sizes() == at::IntArrayRef({5120,s.at(0).toTensor().size(1) * 128}) &&
         wob_scale.scalar_type() == at::kFloat &&
         wob_scale.sizes() == at::IntArrayRef({1,5120}),
         "Selected-prefix MLA requires prepared FP8 output projections");
@@ -200,6 +200,7 @@ public:
                                              : (wob_ ? mla_woa_wob_meta(s)
                                                      : mla_woa_meta(s));
         const auto heads = s.at(0).toTensor().size(1);
+        const auto groups = heads / 8;
         const int64_t width = selected_prefix_ ? 640 : s.at(3).toTensor().size(1);
         Params params{int32_t(s.at(selected_prefix_ ? 8 : 9).toInt()),
                       int32_t(s.at(selected_prefix_ ? 9 : 10).toInt()),
@@ -245,15 +246,15 @@ public:
         // arguments at stack positions 9..11 are not represented there.
         auto quantized = BuildNode(this, graph, {kProductRopeQuant,
             {pv.at(0).get(),syn_in(position_input),syn_in(phase_input)},
-            {{{4,1,4096},at::ScalarType::Float8_e4m3fn},
-             {{4,1,1},at::kFloat}}});
+            {{{groups,1,4096},at::ScalarType::Float8_e4m3fn},
+             {{groups,1,1},at::kFloat}}});
         synGEMMParams woa_params{false,false};
         auto product = BuildNode(this, graph, {"batch_gemm",
             {quantized.at(0).get(),syn_in(woa_input)},
-            {{{4,1,1024},at::kFloat}}, &woa_params,sizeof(woa_params)});
+            {{{groups,1,1024},at::kFloat}}, &woa_params,sizeof(woa_params)});
         auto scaled = BuildNode(this, graph, {kWoaScaleRoundtrip,
             {product.at(0).get(),syn_in(woa_scale_input),quantized.at(1).get()},
-            {{{1,4,1024},at::kBFloat16}}});
+            {{{1,groups,1024},at::kBFloat16}}});
         if (!wob_) {
             syn_out(0) = ReshapeHelper(graph, scaled.at(0).get(),
                                        output.at(0).shape, at::kBFloat16, 0);
@@ -264,10 +265,10 @@ public:
         // quantizer still observes the same BF16 values and scale selection;
         // wo_b receives the same FP8 operand without forcing the 8 KiB row
         // through a graph output between the two native compound operators.
-        auto woa = ReshapeHelper(graph, scaled.at(0).get(), {1,4096},
+        auto woa = ReshapeHelper(graph, scaled.at(0).get(), {1,s.at(0).toTensor().size(1) * 128},
                                  at::kBFloat16);
         auto dense_q = BuildNode(this, graph, {kDenseQuant, {woa.get()},
-            {{{1,4096},at::ScalarType::Float8_e4m3fn},
+            {{{1,s.at(0).toTensor().size(1) * 128},at::ScalarType::Float8_e4m3fn},
              {{1,1},at::kFloat}}});
         synGEMMParams wob_params{false,true};
         auto wob_product = BuildNode(this, graph, {"gemm",

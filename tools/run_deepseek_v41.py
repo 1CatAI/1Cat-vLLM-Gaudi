@@ -91,7 +91,127 @@ def recipe_source_hashes(source_hashes):
     }
 
 
+def configure_trace_artifacts(environment, evidence, *, dump_plans, enable_profiler, raw_profiler=False):
+    """Generate symbols at compilation time, before any profiler acquisition."""
+    if dump_plans:
+        environment["VLLM_HPU_TP2_PLAN_DUMP_DIR"] = str(evidence / "plans")
+        environment["GRAPH_VISUALIZATION"] = "1"
+        environment["GRAPH_VISUALIZATION_DIR"] = str(evidence / "graphs")
+    if enable_profiler or raw_profiler:
+        if raw_profiler:
+            environment["VLLM_HPU_DSV41_RAW_TRACE"] = "1"
+            environment["VLLM_HPU_DSV41_RAW_SCOPE_ONLY"] = "1"
+        environment["VLLM_TORCH_PROFILER_DIR"] = str(evidence / "traces")
+        # Legacy symbol exports enable compiler debug instrumentation. Raw SDK
+        # capture publishes its own post-graphs with that extra mode disabled.
+        environment["ENABLE_PROFILER"] = "false" if raw_profiler else "true"
+        # Kineto's HPU source rejects HABANA_PROFILE=0. Enable the SDK in
+        # API-controlled mode before importing the bridge; start_disabled
+        # keeps startup and speed requests outside the acquisition.
+        environment["HABANA_PROFILE"] = "1"
+        if not environment.get("HABANA_PROF_CONFIG"):
+            config = {
+                "Plugins": [
+                    {
+                        "enable": True,
+                        "lib": "libhost_profiler.so",
+                        "name": "HostProfiler",
+                        "values": {
+                            "api_group": {
+                                name: {
+                                    "value": True
+                                }
+                                for name in ("HCCL", "HLTHUNK", "SYNAPSE")
+                            },
+                            "start_disabled": {
+                                "value": True
+                            }
+                        }
+                    },
+                    {
+                        "enable": True,
+                        "lib": "libhw_trace.so",
+                        "name": "HwTrace",
+                        "values": {
+                            "generalOptions": {
+                                "profilePhase": {
+                                    "value": "profileApi"
+                                },
+                                "traceBufferSize": {
+                                    "value": "0x80000000"
+                                }
+                            },
+                            "parseOptions": {
+                                "addFuserMetadata": {
+                                    "value": False
+                                },
+                                "showNullDescs": {
+                                    "value": False
+                                }
+                            }
+                        }
+                    },
+                ]
+            }
+            if environment.get("VLLM_HPU_DSV41_RAW_TRACE") == "1":
+                environment["HABANA_PROFILE_WRITE_HLTV"] = "1"
+                config["GeneralSettings"] = {
+                    "values": {
+                        "addPid": {
+                            "value": True
+                        },
+                        "outdir": {
+                            "value": str(evidence / "raw")
+                        },
+                        "session": {
+                            "value": "v41_tp4"
+                        }
+                    }
+                }
+                host = config["Plugins"][0]["values"]
+                host["api_group"]["HLTHUNK"]["value"] = False
+                host["api_group"]["SCAL"] = {"value": True}
+                if environment.get("VLLM_HPU_DSV41_RAW_SCOPE_ONLY") == "1":
+                    # Preserve collective API boundaries; the previous capture
+                    # already contains full Synapse/SCAL and CPU operator logs.
+                    host["api_group"]["SCAL"]["value"] = False
+                    host["api_group"]["SYNAPSE"]["value"] = False
+                host["performance_mode"] = {"value": True}
+                host["output"] = {name: {"value": name == "hltv"} for name in ("hltv", "json", "csv")}
+                hardware = config["Plugins"][1]["values"]
+                hardware["generalOptions"].update(arch={"value": "gaudi2"}, traceBufferLocation={"value": "host"})
+                hardware["parseOptions"].update(skipParse={"value": True},
+                                                outputPerInvocation={
+                                                    name: {
+                                                        "value": name in ("hltv", "hltvWithHost")
+                                                    }
+                                                    for name in ("binary", "csv", "dbgInfo", "hltv", "hltvWithHost",
+                                                                 "json", "text")
+                                                })
+            config_path = evidence / "profiler-config.json"
+            config_path.write_text(json.dumps(config, indent=2) + "\n")
+            environment["HABANA_PROF_CONFIG"] = str(config_path)
+    identity = {key: environment.get(key, "0") for key in ("ENABLE_PROFILER", "GRAPH_VISUALIZATION", "HABANA_PROFILE")}
+    if enable_profiler or raw_profiler:
+        identity["profiler_config_sha256"] = hashlib.sha256(Path(
+            environment["HABANA_PROF_CONFIG"]).read_bytes()).hexdigest()
+    return identity
+
+
 def acquire(lock_dir, count, requested_modules=None, secondary_lock_dirs=()):
+    # Two selectors can repeatedly split a free four-card set into partial
+    # reservations, release it, then collide again after the same retry delay.
+    # Serialize only discovery/acquisition, never the lifetime of an active job.
+    allocation_root = lock_dir.parent if lock_dir.name in ("locks", "evidence") else lock_dir
+    with (allocation_root / "gaudi-device-allocation.lock").open("a") as allocation:
+        try:
+            fcntl.flock(allocation, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return None, []
+        return _acquire_modules(lock_dir, count, requested_modules, secondary_lock_dirs)
+
+
+def _acquire_modules(lock_dir, count, requested_modules=None, secondary_lock_dirs=()):
     held, selected = [], []
     try:
         candidates = sorted(Path("/sys/class/accel").glob("accel[0-9]*"))
@@ -172,11 +292,21 @@ def main():
                         type=Path,
                         help="Optional persistent cache root; source/runtime identities own separate namespaces")
     parser.add_argument("--dump-plans", action="store_true", help="Save preparation graphs for an explicit diagnostic")
-    parser.add_argument("--enable-profiler",
-                        action="store_true",
-                        help="Register profiler control for an explicit trace")
+    profiler = parser.add_mutually_exclusive_group()
+    profiler.add_argument("--enable-profiler",
+                          action="store_true",
+                          help="Register profiler control with compiler debug instrumentation")
+    profiler.add_argument("--raw-profiler",
+                          action="store_true",
+                          help="Register scope-only raw SDK capture with compiler profiling disabled")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    # The child runs inside the immutable source snapshot, so environment
+    # and artifact paths must not depend on the caller's working directory.
+    args.evidence = args.evidence.resolve()
+    args.runtime_profile = args.runtime_profile.resolve()
+    args.lock_dir = args.lock_dir.resolve()
+    args.secondary_lock_dir = [path.resolve() for path in args.secondary_lock_dir]
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("A normal model/check command is required after --")
@@ -196,8 +326,8 @@ def main():
     for key in ("PYTHONPATH", "LD_PRELOAD", "HABANA_PROFILE", "VLLM_PLUGINS"):
         env.pop(key, None)
     env.update(profile["environment"])
-    if env.get("VLLM_HPU_DSV41_RAW_TRACE", "0") == "1" and not args.enable_profiler:
-        parser.error("Raw trace capture requires --enable-profiler to register the serving controls")
+    if env.get("VLLM_HPU_DSV41_RAW_TRACE", "0") == "1" and not (args.enable_profiler or args.raw_profiler):
+        parser.error("Raw trace capture requires --enable-profiler or --raw-profiler")
     requested_modules = None
     if args.modules:
         requested_modules = tuple(int(value) for value in args.modules.split(",") if value.strip())
@@ -260,10 +390,11 @@ def main():
                    DSV41_RUNTIME_PROFILE=str(args.evidence / "runtime-profile.json"))
         env.pop("VLLM_HPU_TP2_PLAN_DUMP_DIR", None)
         env.pop("VLLM_TORCH_PROFILER_DIR", None)
-        if args.dump_plans:
-            env["VLLM_HPU_TP2_PLAN_DUMP_DIR"] = str(args.evidence / "plans")
-        if args.enable_profiler:
-            env["VLLM_TORCH_PROFILER_DIR"] = str(args.evidence / "traces")
+        instrumentation = configure_trace_artifacts(env,
+                                                    args.evidence,
+                                                    dump_plans=args.dump_plans,
+                                                    enable_profiler=args.enable_profiler,
+                                                    raw_profiler=args.raw_profiler)
         if env.get("GRAPH_VISUALIZATION") == "1":
             env["GRAPH_VISUALIZATION_DIR"] = str(args.evidence / "graphs")
         record["environment"] = {
@@ -271,7 +402,8 @@ def main():
             for key, value in env.items()
             if key.startswith(("HABANA_", "HLS_", "PT_HPU_", "VLLM_", "HCL_", "HCCL_",
                                "DSV41_")) or key in ("LD_LIBRARY_PATH", "LD_PRELOAD", "GC_KERNEL_PATH",
-                                                     "RUNTIME_SCALE_PATCHING")
+                                                     "RUNTIME_SCALE_PATCHING", "ENABLE_PROFILER", "GRAPH_VISUALIZATION",
+                                                     "GRAPH_VISUALIZATION_DIR")
         }
         root = Path(__file__).resolve().parents[1]
         source_root = args.source_snapshot.resolve() if args.source_snapshot else root
@@ -280,7 +412,8 @@ def main():
         record["source_snapshot"] = str(source_root)
         record["source_hashes"] = {}
         for glob in ("vllm_gaudi/**/*.py", "vllm_gaudi/**/*.txt", "flashinfer_gaudi/**/*.py",
-                     "flashinfer_gaudi/**/*.json", "tools/*deepseek_v41*.py"):
+                     "flashinfer_gaudi/**/*.json", "tools/*deepseek_v41*.py",
+                     "tests/standalone/deepseek_v41/test_engram_staging.py"):
             for source in source_root.glob(glob):
                 record["source_hashes"][str(source.relative_to(source_root))] = hashlib.sha256(
                     source.read_bytes()).hexdigest()
@@ -329,12 +462,13 @@ def main():
             native_dir = Path(env.get("VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR", root / "vllm_gaudi/lib"))
             native_build = native_dir / "deepseek_v4_build.json"
             cache_identity = {
-                "schema": 2,
+                "schema": 4,
                 "source": recipe_source_hashes(record["source_hashes"]),
                 "engine": record["engine_commit"],
                 "engine_patch": record["engine_patch_sha256"],
                 "engine_sources": record["engine_sources_sha256"],
                 "runtime": profile,
+                "instrumentation": instrumentation,
                 "command": command,
                 "model_manifests": model_manifests,
                 "native_build": hashlib.sha256(native_build.read_bytes()).hexdigest()
@@ -348,7 +482,7 @@ def main():
             env["PT_HPU_RECIPE_CACHE_CONFIG"] = f"{cache / cache_rank},false,8192,false"
             record["environment"]["PT_HPU_RECIPE_CACHE_CONFIG"] = env["PT_HPU_RECIPE_CACHE_CONFIG"]
             record["recipe_cache_identity"] = fingerprint
-            record["recipe_cache_identity_schema"] = 2
+            record["recipe_cache_identity_schema"] = 4
         process = None
         launch_cpus = set(mains)
         launch_cpus.update(control_cpus)

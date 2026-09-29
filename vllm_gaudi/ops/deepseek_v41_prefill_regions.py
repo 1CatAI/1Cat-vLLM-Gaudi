@@ -21,9 +21,10 @@ _function_regions = OrderedDict()
 # separate qualification because compiler reduction choices can affect routing.
 _qualified_regions = frozenset(
     ("_prefill_swa_workspace", "_prefill_main_workspace", "_prefill_engram_unpack", "_prefill_combine"))
-_qualified_function_regions = frozenset(("_prefill_hc_post", "_prefill_hc_collapse", "_prefill_hc_control_bf16",
-                                         "_prefill_combine", "prefill_main_workspace", "prefill_hc_input",
-                                         "prefill_q_projection", "prefill_output_projection", "prefill_swa_workspace"))
+_qualified_function_regions = frozenset(
+    ("_prefill_hc_post", "_prefill_hc_collapse", "_prefill_hc_control_bf16", "_prefill_combine",
+     "prefill_main_workspace", "prefill_hc_input", "prefill_q_projection", "prefill_output_projection",
+     "prefill_swa_workspace", "_prefill_engram_tile", "_prefill_router", "_prefill_shared_expert"))
 
 
 def validate_prefill_region_config():
@@ -206,9 +207,8 @@ def prefill_q_projection(value, weight, channel_scale, positions, table):
     epilogue preserves the BF16 projection boundary and separate FP32 rotary
     products used by large prefill, independently of the C1 decoder contract.
     """
-    return torch.ops.custom_op.custom_deepseek_v41_prefill_q_projection_rope_gaudi2(value, weight, channel_scale,
-                                                                                    positions, table).reshape(
-                                                                                        value.shape[0], 32, 512)
+    return torch.ops.custom_op.custom_deepseek_v41_prefill_q_projection_rope_gaudi2(
+        value, weight, channel_scale, positions, table).reshape(value.shape[0], weight.shape[0] // 512, 512)
 
 
 @prefill_function_region
@@ -233,11 +233,15 @@ def prefill_swa_workspace(kv, positions, swa, window_offsets, decoded_swa, decod
     a layer owner's mutable request bindings. Read the prefix before updating
     the ring; both packed and decoded state keep the same last-row ownership.
     """
-    from vllm_gaudi.ops.deepseek_v41_math import pack_swa, unpack_swa
+    from vllm_gaudi.ops.deepseek_v41_math import pack_swa, quantize_activation, unpack_swa
     window, ring_rows = window_offsets.numel(), swa.shape[0]
     prefix_positions = positions[:1].to(torch.int32) - (window - 1) + window_offsets[:-1]
     prefix_packed = swa.index_select(0, prefix_positions.remainder(ring_rows).long())
-    cache = torch.cat((unpack_swa(prefix_packed), kv), 0)
+    # Attention consumes the same FP8 cache precision for current and prior
+    # rows. Raw current BF16 rows made an otherwise identical prompt change
+    # values at every scheduler chunk boundary.
+    current = quantize_activation(kv)
+    cache = torch.cat((unpack_swa(prefix_packed), current), 0)
     local = (torch.arange(positions.numel(), device=positions.device, dtype=torch.int32).unsqueeze(-1) +
              window_offsets.unsqueeze(0))
     logical = positions.unsqueeze(-1) - window + 1 + window_offsets.unsqueeze(0)

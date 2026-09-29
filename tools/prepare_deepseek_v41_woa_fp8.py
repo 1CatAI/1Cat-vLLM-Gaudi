@@ -2,14 +2,15 @@
 """Prepare all wo_a FP8 sidecars directly from immutable rank-local files."""
 
 import argparse
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 
 from vllm_gaudi.ops.deepseek_v41_shard_loader import PreparedV41Shard
-from vllm_gaudi.ops.deepseek_v41_weights import RankWriter, file_hash, publish_json
-from vllm_gaudi.ops.deepseek_v41_woa_fp8 import FINGERPRINT, QUANTIZATION, prepare_rows
+from vllm_gaudi.ops.deepseek_v41_weights import RankWriter, canonical_hash, file_hash, publish_json
+from vllm_gaudi.ops.deepseek_v41_woa_fp8 import quantization_for_tp, prepare_rows
 
 
 def read_bytes(source, offset, size):
@@ -28,36 +29,43 @@ def main():
     args = parser.parse_args()
     args.output = args.output or args.prepared / "sidecars" / "wo_a_fp8"
     args.output.mkdir(parents=True, exist_ok=False)
+    topology = json.loads((args.prepared / "manifest.json").read_text())
+    tp_size = topology["tensor_parallel_size"]
+    pp_size = topology["pipeline_parallel_size"]
+    groups = 8 // tp_size
+    quantization = quantization_for_tp(tp_size)
+    fingerprint = canonical_hash(quantization)
     manifest = {
         "version": 1,
-        "quantization": QUANTIZATION,
-        "quantization_fingerprint": FINGERPRINT,
+        "quantization": quantization,
+        "quantization_fingerprint": fingerprint,
         "source_manifest_sha256": file_hash(args.prepared / "manifest.json"),
         "rank_files": {}
     }
-    for pp in range(2):
-        for tp in range(2):
+    for pp in range(pp_size):
+        for tp in range(tp_size):
             shard = PreparedV41Shard(args.prepared, pp, tp)
             rank = f"pp{pp}-tp{tp}"
             specs = {}
-            for layer in range(pp * 20, pp * 20 + 20):
+            for layer in range(*topology["pp_layer_ranges"][pp]):
                 prefix = f"layers.{layer}.attn.wo_a."
-                specs[prefix + "weight"] = {"dtype": "U8", "shape": [4, 4096, 1024]}
-                specs[prefix + "channel_scale"] = {"dtype": "F32", "shape": [4, 1, 1024]}
+                specs[prefix + "weight"] = {"dtype": "U8", "shape": [groups, 4096, 1024]}
+                specs[prefix + "channel_scale"] = {"dtype": "F32", "shape": [groups, 1, 1024]}
             path = args.output / f"{rank}.safetensors"
             partial = path.with_suffix(".partial")
-            writer = RankWriter(partial, specs, {"quantization_fingerprint": FINGERPRINT, "source_rank": rank})
+            writer = RankWriter(partial, specs, {"quantization_fingerprint": fingerprint, "source_rank": rank})
             audit = []
             try:
-                for layer in range(pp * 20, pp * 20 + 20):
+                for layer in range(*topology["pp_layer_ranges"][pp]):
                     prefix = f"layers.{layer}.attn.wo_a."
                     weight, scale = shard.catalog[prefix + "weight"], shard.catalog[prefix + "scale"]
-                    if weight.shape != (4096, 4096) or weight.dtype != "F8_E4M3" or scale.shape != (128, 128):
+                    if weight.shape != (groups * 1024,
+                                        4096) or weight.dtype != "F8_E4M3" or scale.shape != (groups * 32, 128):
                         raise ValueError("wo_a checkpoint dimensions changed")
-                    packed = np.empty((4, 4096, 1024), dtype=np.uint8)
-                    channels = np.empty((4, 1, 1024), dtype=np.float32)
+                    packed = np.empty((groups, 4096, 1024), dtype=np.uint8)
+                    channels = np.empty((groups, 1, 1024), dtype=np.float32)
                     records = []
-                    for row in range(0, 4096, 256):
+                    for row in range(0, groups * 1024, 256):
                         codes = read_bytes(weight, row * 4096, 256 * 4096).reshape(256, 4096)
                         powers = read_bytes(scale, row // 32 * 128, 8 * 128).reshape(8, 128)
                         q, s, record = prepare_rows(codes, powers)

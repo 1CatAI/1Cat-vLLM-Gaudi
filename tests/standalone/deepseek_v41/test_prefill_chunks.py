@@ -19,11 +19,12 @@ from vllm_gaudi.v1.worker.deepseek_v41_runner import (
 from vllm_gaudi.ops.deepseek_v41_math import NATIVE_KV_CODEC_TOKENS
 
 
-def test_scheduler_transaction_uses_finite_exact_compute_buckets():
+def test_scheduler_transaction_uses_finite_exact_compute_buckets(monkeypatch):
+    monkeypatch.delenv("VLLM_HPU_DSV41_PREFILL_COMPUTE_TOKENS", raising=False)
     tokens = list(range(8192))
     chunks = list(target_chunks(tokens))
     assert PREFILL_BLOCK_TOKENS == 8192
-    assert [len(chunk) for _, chunk in chunks] == [4096] * 2
+    assert [len(chunk) for _, chunk in chunks] == [8192]
     assert [token for _, chunk in chunks for token in chunk] == tokens
 
 
@@ -64,6 +65,7 @@ def test_prefill_retires_completed_tail_packets_before_reuse(monkeypatch, count)
     request = SimpleNamespace(num_computed_tokens=0, tokens=list(range(count)), prompt=list(range(count)))
     runner = SimpleNamespace(
         round_timing_enabled=False,
+        prefill_capacity=8192,
         requests={"request": request},
         _bind_request=lambda _request: None,
         use_dspark=False,
@@ -100,7 +102,8 @@ def test_every_scheduler_length_uses_only_prepared_shapes():
 
 
 def test_native_kv_codec_covers_the_complete_prefill_transaction():
-    assert NATIVE_KV_CODEC_TOKENS == PREFILL_BLOCK_TOKENS == 8192
+    assert NATIVE_KV_CODEC_TOKENS == 16384
+    assert PREFILL_BLOCK_TOKENS == 8192
 
 
 def test_scheduler_transaction_uses_one_search_bucket_for_all_internal_tiles():
@@ -141,3 +144,23 @@ def test_prefill_tail_is_exact_and_never_splits_into_dspark_c6():
             assert not (len(chunks) > 1 and any(len(chunk) == 6 for _, chunk in chunks))
         assert all(offset == sum(len(previous) for _, previous in chunks[:index])
                    for index, (offset, _) in enumerate(chunks))
+
+
+def test_tp4_16k_chunk_and_exact_tail_follow_scheduler_capacity(monkeypatch):
+    from vllm_gaudi.ops.deepseek_v41_prefill_capacity import prefill_capacity
+    monkeypatch.delenv("VLLM_HPU_DSV41_PREFILL_COMPUTE_TOKENS", raising=False)
+    assert prefill_capacity(16384, 4) == 16384
+    assert prefill_capacity(8192, 4) == 8192
+    assert prefill_capacity(16384, 2) == 8192
+    for count, expected in ((16384, [16384]), (16385, [16384, 1]), (32768, [16384, 16384])):
+        chunks = list(target_chunks(range(count), prefill_capacity(16384, 4)))
+        assert [len(chunk) for _, chunk in chunks] == expected
+        assert [token for _, chunk in chunks for token in chunk] == list(range(count))
+    assert [len(c) for _, c in target_chunks(range(16384), 8192)] == [8192, 8192]
+    monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_COMPUTE_TOKENS", "8192")
+    assert [len(c) for _, c in target_chunks(range(16384), 16384)] == [8192, 8192]
+    monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_COMPUTE_TOKENS", "16384")
+    assert max(prefill_compute_buckets(8192)) == 8192
+    assert [len(c) for _, c in target_chunks(range(16384), 16384)] == [16384]
+    with pytest.raises(ValueError):
+        list(target_chunks(range(32768), 32768))

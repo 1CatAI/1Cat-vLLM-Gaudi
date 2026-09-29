@@ -176,11 +176,11 @@ class GatherSlot : public std::enable_shared_from_this<GatherSlot> {
     }
  public:
     static size_t checked_capacity(size_t capacity, size_t width) {
-        // A normal vLLM prefill transaction contains as many as 8192 tokens.
-        // Capacity counts token/head rows, so a TP2 shard needs C8192 x 12.
+        // A normal vLLM prefill transaction contains as many as 16384 tokens.
+        // Capacity counts token/head rows, so a TP2 shard needs C16384 x 12.
         // Keep a hard upper bound and validate all following products rather
         // than retaining the historical context-512 ceiling.
-        require(capacity > 0 && capacity <= 8192 * 24 && width > 0 && width <= 512 && width % 32 == 0
+        require(capacity > 0 && capacity <= 16384 * 24 && width > 0 && width <= 512 && width % 32 == 0
                     && capacity <= SIZE_MAX / width && capacity <= SIZE_MAX / (width / 32),
                 "Invalid fixed Engram staging capacity");
         return capacity;

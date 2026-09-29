@@ -20,7 +20,13 @@ def decoder_halo_rows(decoder_layers: int, window: int = 128, alignment: int = 2
     return ((required + alignment - 1) // alignment) * alignment
 
 
-def decoder_halo_mode(start: int, count: int, prompt_tokens: int, *, eligible: bool, block_tokens: int = 8192) -> str:
+def decoder_halo_mode(start: int,
+                      count: int,
+                      prompt_tokens: int,
+                      *,
+                      eligible: bool,
+                      block_tokens: int = 8192,
+                      allow_single_block: bool = False) -> str:
     """Choose a request phase without consulting device state or tensor data."""
     if not eligible:
         return "full"
@@ -31,7 +37,8 @@ def decoder_halo_mode(start: int, count: int, prompt_tokens: int, *, eligible: b
     # The final block may be short. If it contains fewer than the retained
     # rows, execute the preceding full block to rebuild its trailing local
     # caches; all earlier complete blocks can still publish only global KV.
-    if block_tokens <= retained or prompt_tokens <= block_tokens or start % block_tokens:
+    if (block_tokens <= retained or start % block_tokens
+            or prompt_tokens <= (retained if allow_single_block else block_tokens)):
         return "full"
     tail = (prompt_tokens - 1) % block_tokens + 1
     final_start = prompt_tokens - tail

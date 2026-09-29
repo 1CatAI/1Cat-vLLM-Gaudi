@@ -20,7 +20,7 @@ GlueCodeReturn DeepseekV41PrefillTopkGaudi2::GetGcDefinitions(HabanaKernelParams
     auto shape = [batch](const TensorGeometry& g, unsigned n, TensorDataType dtype) {
         return g.dims == 2 && g.maxSizes[0] == n && g.maxSizes[1] == batch && g.dataType == dtype;
     };
-    if (!shape(score, columns, DATA_F32) || batch < 1 || batch > 8192)
+    if (!shape(score, columns, DATA_F32) || batch < 1 || batch > 16384)
         return GLUE_INCOMPATIBLE_INPUT_SIZE;
     if (emit_) {
         if (!shape(p->inputTensors[1].geometry, 18, DATA_I32)) return GLUE_INCOMPATIBLE_INPUT_SIZE;

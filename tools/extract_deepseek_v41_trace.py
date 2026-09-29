@@ -24,6 +24,7 @@ host_enqueues, markers, modules = [], [], set()
 metadata, examples = [], []
 total = hardware = 0
 first, last = float("inf"), float("-inf")
+trace_first, trace_last = float("inf"), float("-inf")
 with open_trace(args.trace, "rt") as stream:
     header = stream.read(1024)
 base = re.search(r'"baseTimeNanoseconds"\s*:\s*(\d+)', header)
@@ -46,20 +47,24 @@ with (open_trace(args.trace, "rb") as src, gzip.open(args.output / "hardware.jso
             metadata.append(event)
         if "enqueue" in name.lower() and a.get("recipeName"):
             host_enqueues.append([event["ts"], event.get("dur", 0), rkey, a["recipeName"]])
-        if event.get("cat") == "cpu_op" and ("Compiled Region" in name or "execute_model" in name
-                                             or "prepared_moe" in name or "native_decoder" in name):
+        if event.get("cat") in ("cpu_op", "user_annotation") and (name.startswith("v41::") or "Compiled Region" in name
+                                                                  or "execute_model" in name or "prepared_moe" in name
+                                                                  or "native_decoder" in name):
             markers.append([event["ts"], event.get("dur", 0), name])
         if event.get("ph") != "X" or event.get("dur", 0) <= 0:
             continue
+        trace_first = min(trace_first, event["ts"])
+        trace_last = max(trace_last, event["ts"] + event["dur"])
         hw = a.get("HW event name", "").upper()
-        if not hw and event.get("cat") in ("cpu_op", "hpu_op", "user_annotation", "privateuse1_runtime"):
+        if not hw:
             host.write(
-                json.dumps(
-                    [event['ts'], event['dur'],
-                     str(event.get('pid')),
-                     str(event.get('tid')),
-                     event.get('cat'), name],
-                    separators=(',', ':')) + '\n')
+                json.dumps([
+                    event['ts'], event['dur'],
+                    str(event.get('pid')),
+                    str(event.get('tid')),
+                    event.get('cat'), name, a
+                ],
+                           separators=(',', ':')) + '\n')
         engine = next((x for x in ("TPC", "MME", "DMA", "NIC") if x in hw), None)
         if engine is None and re.match(r"STM_[01]_(RX|TX|QPC|QMAN)", hw):
             engine = "NIC"
@@ -79,7 +84,7 @@ with (open_trace(args.trace, "rb") as src, gzip.open(args.output / "hardware.jso
         if hw not in hw_ids:
             hw_ids[hw] = len(hw_names)
             hw_names.append(hw)
-        row = [event["ts"], event["dur"], str(event.get("tid")), node_ids[key], hw_ids[hw]]
+        row = [event["ts"], event["dur"], str(event.get("tid")), node_ids[key], hw_ids[hw], str(a.get("API_ID", ""))]
         dst.write(json.dumps(row, separators=(",", ":")) + "\n")
         hardware += 1
         first = min(first, row[0])
@@ -89,6 +94,12 @@ with (open_trace(args.trace, "rb") as src, gzip.open(args.output / "hardware.jso
             examples.append(event)
 digest = hashlib.file_digest(args.trace.open("rb"), "sha256").hexdigest()
 result = {
+    "complete_json":
+    True,
+    "all_activity_start_us":
+    trace_first,
+    "all_activity_end_us":
+    trace_last,
     "trace":
     str(args.trace),
     "trace_sha256":
@@ -96,8 +107,8 @@ result = {
     "events":
     total,
     "schema_version":
-    2,
-    "hardware_columns": ["ts_us", "dur_us", "lane", "node", "hw_kind"],
+    3,
+    "hardware_columns": ["ts_us", "dur_us", "lane", "node", "hw_kind", "api_id"],
     "hw_event_names":
     hw_names,
     "base_time_nanoseconds":

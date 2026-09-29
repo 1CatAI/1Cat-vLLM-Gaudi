@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <cstdint>
+// Physical KV pool rows are independent of the per-request logical context bound.
 #include "deepseek_v41_prefill_main_decode_gaudi2.hpp"
 #include <cstring>
 extern unsigned char _binary___deepseek_v41_prefill_main_decode_gaudi2_o_start;
@@ -17,7 +19,7 @@ GlueCodeReturn DeepseekV41PrefillMainDecodeGaudi2::GetGcDefinitions(
     const auto& rows = p->inputTensors[2].geometry;
     const auto& result = p->outputTensors[0].geometry;
     if ((ratio != 0 && ratio != 1 && ratio != 2) || cache.dims != 2 || cache.maxSizes[0] != 288 ||
-        cache.dataType != DATA_U8 || !cache.maxSizes[1] || cache.maxSizes[1] > 1048704 ||
+        cache.dataType != DATA_U8 || !cache.maxSizes[1] || cache.maxSizes[1] > INT32_MAX ||
         pages.dims != 1 || pages.dataType != DATA_I32 || !pages.maxSizes[0] ||
         pages.maxSizes[0] > 8193 || rows.dims != 1 || rows.dataType != DATA_I32 ||
         !rows.maxSizes[0] || rows.maxSizes[0] > 65536 || result.dims != 2 ||

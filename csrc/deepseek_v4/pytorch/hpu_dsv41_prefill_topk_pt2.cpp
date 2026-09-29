@@ -11,10 +11,10 @@ habana::OutputMetaDataVector metadata(const at::Stack& stack) {
     const auto score = stack[0].toTensor();
     const auto width = stack[1].toInt();
     TORCH_CHECK(score.scalar_type() == at::kFloat && score.dim() == 2 && score.is_contiguous() &&
-                score.storage_offset() == 0 && !score.requires_grad() && score.size(0) >= 1 && score.size(0) <= 8192 &&
+                score.storage_offset() == 0 && !score.requires_grad() && score.size(0) >= 1 && score.size(0) <= 16384 &&
                 score.size(1) >= 64 && score.size(1) <= 4096 && score.size(1) % 64 == 0 &&
                 width >= 1 && width <= score.size(1) && width <= 2048,
-                "Prefill top-k requires contiguous BF16-valued F32[T1..8192,N64..4096] and K1..2048");
+                "Prefill top-k requires contiguous BF16-valued F32[T1..16384,N64..4096] and K1..2048");
     return {{at::kFloat, {score.size(0), width}}, {at::kInt, {score.size(0), width}}};
 }
 class Topk final : public habana::OpBackend {

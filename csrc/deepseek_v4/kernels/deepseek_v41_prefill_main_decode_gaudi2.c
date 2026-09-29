@@ -18,8 +18,9 @@ void main(tensor packed, tensor pages, tensor logical_rows, tensor output, int r
             physical = 0;
             if (valid) {
                 const int page = s_i32_ld_g(gen_addr((int5){logical / page_rows}, pages));
-                physical = page * page_rows + logical % page_rows;
-                valid = physical >= 0 && physical < cache_rows;
+                const int offset = logical % page_rows;
+                valid = page >= 0 && offset < cache_rows && page <= (cache_rows - 1 - offset) / page_rows;
+                if (valid) physical = page * page_rows + offset;
             }
         }
         for (int chunk = 0; chunk < 4; ++chunk) {
