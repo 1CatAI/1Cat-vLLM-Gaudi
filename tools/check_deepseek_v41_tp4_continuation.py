@@ -186,6 +186,8 @@ def main():
             stage.fp8_decode, stage.expert_n256, stage.bf16_head = True, True, True
             stage.tensor_parallel_size, stage.pp_rank, stage.tp_rank = 4, 0, rank
             stage.dspark, stage.is_last_stage, stage.generation = False, True, 1
+            # This fixture ends at layer 15, before the layer-20 decoder halo.
+            stage.prefill_halo_mode = 'full'
             stage.precision_fingerprint = ('fp8_decode', 'n256', 'woa_fp8', 'bf16_head')
             stage.reduce, stage.all_gather = reduce, gather
             stage.shared = PagedCSA2SharedState(text, 0, 16, 'hpu', stage.length, tensor_parallel_size=4)
