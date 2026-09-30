@@ -65,7 +65,8 @@ def test_segmented_input_covers_long_index_exchanges(indexers):
     value = replace(DEEPSEEK_V41_PP0_INPUT, extra_collectives=3 + 2 * indexers)
     assert value.supports_segmented_input
     assert value.reductions == 40 and value.collectives == 43 + 2 * indexers
-    assert not replace(value, extra_collectives=value.extra_collectives + 1).supports_segmented_input
+    assert replace(value, extra_collectives=value.extra_collectives + 1).supports_segmented_input
+    assert not replace(value, extra_collectives=value.groups * 2 + 5).supports_segmented_input
     assert not replace(value, external_prefix=True).supports_segmented_input
     assert not replace(value, name=DEEPSEEK_V41_PP1.name).supports_segmented_input
 
@@ -208,8 +209,10 @@ def test_input_modes_have_separate_cached_variants(monkeypatch):
 
     class Variant:
 
-        def __init__(self, *args, native_input=False):
+        def __init__(self, *args, native_input=False, replay_tail=False):
             self.native_input = native_input
+            self.replay_tail = replay_tail
+            self.tail_values = None
 
         def __call__(self, *args):
             return self

@@ -28,7 +28,7 @@ class DecoderTopology:
         return (self.name == "deepseek_v41_pp0_input" and self.groups > 0
                 and all(layers == 4 for layers in self.group_layers)
                 and not self.external_prefix and self.extra_collectives >= 3
-                and self.extra_collectives % 2 == 1)
+                and self.extra_collectives <= self.groups * 2 + 4)
 
 
 QWEN3_NEXT = DecoderTopology("qwen3_next", (8,) * 8, 2, True)

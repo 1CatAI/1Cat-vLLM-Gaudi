@@ -14,7 +14,7 @@ def _native_input_precision_compatible(program):
     return not program.dspark and not (program.fp8_decode and not getattr(program, "expert_n256", False))
 
 
-def stage_collectives(tp_rank, native, tp_size=2):
+def stage_collectives(tp_rank, native, tp_size=2, *, native_fp32_gather=False):
     from vllm.distributed import tensor_model_parallel_all_gather, tensor_model_parallel_all_reduce
     from vllm_gaudi import envs
 
@@ -43,19 +43,30 @@ def stage_collectives(tp_rank, native, tp_size=2):
         return tensor_model_parallel_all_reduce(value)
 
     def gather(value, dim):
-        if native and dim == 1 and value.dtype == torch.bfloat16 and value.numel() <= maximum:
+        axis = dim % value.ndim if -value.ndim <= dim < value.ndim else dim
+        native_dtype = value.dtype == torch.bfloat16 or (native_fp32_gather and value.dtype == torch.float32)
+        wire_elements = value.numel() * (value.element_size() // 2)
+        if native and axis == 1 and native_dtype and wire_elements <= maximum:
+            # Exact bytes on the established BF16 peer wire. Reinterpretation
+            # preserves FP32 argmax scores and token IDs, including NaN payloads.
             flat = value.reshape(1, -1).contiguous()
+            if value.dtype == torch.float32:
+                flat = flat.view(torch.bfloat16)
             # The native command path transfers 128 BF16 elements per unit.
-            # Indexer head weights can contain only 16..96 elements.
-            if value.numel() % 128:
-                flat = torch.nn.functional.pad(flat, (0, -value.numel() % 128))
+            if wire_elements % 128:
+                flat = torch.nn.functional.pad(flat, (0, -wire_elements % 128))
             if tp_size == 2:
-                peer = torch.ops.vllm_gaudi.tp2_exchange_peer(flat)[:, : value.numel()].reshape(value.shape)
+                peer = torch.ops.vllm_gaudi.tp2_exchange_peer(flat)[:, :wire_elements]
+                if value.dtype == torch.float32:
+                    peer = peer.view(value.dtype)
+                peer = peer.reshape(value.shape)
                 first, second = (value, peer) if tp_rank == 0 else (peer, value)
-                return torch.cat((first, second), dim=dim)
+                return torch.cat((first, second), dim=axis)
             shards = torch.ops.vllm_gaudi.tp_peer_allgather(flat, tp_size).reshape(tp_size, flat.numel())
             return torch.cat(
-                tuple(shards[rank, : value.numel()].reshape(value.shape) for rank in range(tp_size)), dim=dim
+                tuple((shards[rank, :wire_elements].view(value.dtype)
+                       if value.dtype == torch.float32 else shards[rank, :wire_elements]).reshape(value.shape)
+                      for rank in range(tp_size)), dim=axis
             )
         return tensor_model_parallel_all_gather(value, dim=dim)
 
@@ -187,10 +198,14 @@ class StageVariant(torch.nn.Module):
         fused_text_io=False,
         *,
         native_input=False,
+        replay_tail=False,
     ):
         super().__init__()
         self.program = program
         self.native_input = native_input
+        self.tail_enabled = (replay_tail and native_input and getattr(program, "is_last_stage", False)
+                             and not program.dspark)
+        self.tail_values = None
         layers = len(program.layers)
         if layers % 4:
             raise ValueError("Native V4.1 stage requires complete four-layer groups")
@@ -216,8 +231,11 @@ class StageVariant(torch.nn.Module):
         self.fused_text_io = fused_text_io
         if fused_text_io:
             self.adapter = replace(self.adapter, extra_collectives=self.adapter.extra_collectives + 1)
+        if self.tail_enabled:
+            self.adapter = replace(self.adapter, extra_collectives=self.adapter.extra_collectives + 1)
         self.compiled = CompiledStage(
-            program, native=True, pp_wire_input=self.wire_input, fused_text_io=fused_text_io, native_input=native_input
+            program, native=True, pp_wire_input=self.wire_input, fused_text_io=fused_text_io,
+            native_input=native_input, replay_tail=self.tail_enabled,
         )
         self.fixed = tuple(
             value.clone() if value is not None else None for value in (hidden, pre_mix, positions, input_ids)
@@ -277,7 +295,7 @@ class StageVariant(torch.nn.Module):
         )
         outputs = replay_native_decoder(self, **roots)
         if outputs is not None:
-            return outputs
+            return self.publish_outputs(outputs)
         for destination, source in zip(self.fixed, (hidden, pre_mix, positions, input_ids), strict=True):
             if destination is not None:
                 destination.copy_(source)
@@ -314,15 +332,20 @@ class StageVariant(torch.nn.Module):
         ) as context:
             for index, chunk in enumerate(self.compiled.chunks):
                 context["group_index"] = index
-                fixed_hidden, fixed_pre, aux = chunk(fixed_hidden, fixed_pre, fixed_positions, fixed_ids, self.engram)
-            outputs = fixed_hidden, fixed_pre, aux
+                values = chunk(fixed_hidden, fixed_pre, fixed_positions, fixed_ids, self.engram)
+                fixed_hidden, fixed_pre, aux = values[:3]
+            outputs = values if self.tail_enabled else (fixed_hidden, fixed_pre, aux)
             record_native_decoder_outputs(*outputs)
         self.warm_calls += 1
-        return outputs
+        return self.publish_outputs(outputs)
+
+    def publish_outputs(self, outputs):
+        self.tail_values = outputs[3:] if self.tail_enabled else None
+        return outputs[:3]
 
 
 class StageReplay:
-    def __init__(self, program):
+    def __init__(self, program, *, greedy_tail=False):
         from vllm_gaudi import envs
 
         self.program = weakref.ref(program)
@@ -336,6 +359,27 @@ class StageReplay:
         ):
             raise ValueError("Direct Engram capture requires ordinary BF16 native input replay")
         self.input_seed = None
+        self.latest_tail = None
+        self.greedy_tail_enabled = bool(greedy_tail)
+
+    def greedy_tail_token(self, hidden):
+        """Return the token produced by this completed C1 hidden allocation."""
+        if self.latest_tail is None:
+            return None
+        generation, source, token = self.latest_tail
+        program = self.program()
+        if generation != program.generation or hidden.dtype != source.dtype or hidden.shape != source.shape:
+            return None
+        if hidden.data_ptr() != source.data_ptr():
+            return None
+        return token
+
+    def _publish_tail(self, variant, outputs):
+        if variant.tail_values is None:
+            self.latest_tail = None
+        else:
+            self.latest_tail = self.program().generation, outputs[0], variant.tail_values[0]
+        return outputs
 
     def _input_seed(self, input_ids):
         if self.input_seed is None:
@@ -440,7 +484,8 @@ class StageReplay:
             state_generation=(program.generation, program.precision_fingerprint),
             state_tensors=variant.states,
         )
-        return finish_segmented_native_decoder(variant, **roots)
+        outputs = variant.publish_outputs(finish_segmented_native_decoder(variant, **roots))
+        return self._publish_tail(variant, outputs)
 
     @trace_phase
     def __call__(
@@ -476,8 +521,11 @@ class StageReplay:
                 pp_wire,
                 fused_text_io,
                 native_input=native_input,
+                replay_tail=self.greedy_tail_enabled,
             )
-        return self.variants[key](hidden, pre_mix, positions, input_ids, engram, pp_wire, fused_text_io, native_input)
+        variant = self.variants[key]
+        outputs = variant(hidden, pre_mix, positions, input_ids, engram, pp_wire, fused_text_io, native_input)
+        return self._publish_tail(variant, outputs)
 
     def require_ready(self, tokens, search=512):
         from vllm_gaudi.ops.tp2_prepared_plan import _native_entries
@@ -505,6 +553,7 @@ class StageReplay:
             invalidate_prepared_group_plans(owner=variant, reason="stage_close")
         self.variants.clear()
         self.input_seed = None
+        self.latest_tail = None
 
 
 class _PagedSnapshot:

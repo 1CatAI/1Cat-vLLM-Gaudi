@@ -1987,7 +1987,9 @@ class V41ModelRunner:
                 if decode and self.pp.device_commit_enabled:
                     sample_input = self.sample_target_commit(hidden[-1:], self.pp.commit)
                 else:
-                    sample_input = self.sample_target(hidden[-1:])
+                    replay = getattr(getattr(self.model, "program", None), "replay_owner", None) if decode else None
+                    cached = replay.greedy_tail_token(hidden[-1:]) if replay is not None else None
+                    sample_input = self.sample_target(hidden[-1:]) if cached is None else cached
                 if self.model.native and not (decode and (self.pp.device_commit_enabled or self.v2_completion)):
                     from vllm_gaudi.distributed.tp2_fused_ar_norm import _resolve_runtime
 

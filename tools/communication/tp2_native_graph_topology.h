@@ -13,16 +13,17 @@ struct NativeNodeKind {
 struct NativeGraphTopology {
   static bool supportsV41SegmentedPrefix(size_t groups, size_t collectives, bool externalPrefix) {
     // Four layers per group, two exchanges per layer, embedding and both
-    // Engram layers. Each index owner contributes a further exchange pair.
+    // Engram layers. Index owners add exchange pairs; an optional terminal
+    // head adds one exchange without changing the verified input prefix.
     return groups > 0 && collectives >= groups * 8 + 3 &&
-        collectives <= groups * 10 + 3 && (collectives - groups * 8) % 2 == 1 && !externalPrefix;
+        collectives <= groups * 10 + 4 && !externalPrefix;
   }
 
   static bool supportsV41Dependencies(size_t groups, size_t collectives, bool externalPrefix) {
     // The adapter supplies exact owner counts and prepare checks every node.
     // Retain the single-group diagnostic family and parameterize full stages.
     return !externalPrefix && groups > 0 &&
-        ((collectives >= groups * 8 && collectives <= groups * 10 + 3) ||
+        ((collectives >= groups * 8 && collectives <= groups * 10 + 4) ||
          (groups == 1 && collectives >= 8 && collectives <= 16 && collectives % 2 == 0));
   }
 

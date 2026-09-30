@@ -27,6 +27,13 @@ def main():
     parser.add_argument('--shared-stage-replay', action='store_true')
     parser.add_argument('--tp2-ordered-selection', action='store_true')
     parser.add_argument('--selection-trace-only', action='store_true')
+    parser.add_argument('--trace-entry-phases', action='store_true')
+    parser.add_argument('--trace-host-operators', action='store_true')
+    parser.add_argument('--queue-marker-only', action='store_true')
+    parser.add_argument('--resident-ab', action='store_true')
+    parser.add_argument('--resident-control-dir', type=Path)
+    parser.add_argument('--ab-dense-sidecar', type=Path)
+    parser.add_argument('--ab-dense-config', type=Path)
     parser.add_argument('--state-reference-decode-metadata', action='store_true')
     parser.add_argument('--state-reference-post-collapse', action='store_true')
     parser.add_argument('--state-reference-interlayer-collapse', action='store_true')
@@ -89,6 +96,17 @@ def main():
             command.append('--tp2-ordered-selection')
         if args.selection_trace_only:
             command.append('--selection-trace-only')
+        if args.trace_entry_phases:
+            command.append('--trace-entry-phases')
+        if args.trace_host_operators:
+            command.append('--trace-host-operators')
+        if args.queue_marker_only:
+            command.append('--queue-marker-only')
+        if args.resident_ab:
+            command.append('--resident-ab')
+        for option in ('resident_control_dir', 'ab_dense_sidecar', 'ab_dense_config'):
+            if getattr(args, option) is not None:
+                command.extend(['--'+option.replace('_', '-'), str(getattr(args, option).resolve())])
         if args.state_reference_shared_main:
             command.append('--state-reference-shared-main')
         if args.production_visible_prefix:

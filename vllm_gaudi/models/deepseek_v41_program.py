@@ -1948,10 +1948,35 @@ class PreparedStage(nn.Module):
         return record
 
 
+class PreparedGreedyTail(nn.Module):
+    """Reuse the ordinary greedy head inside the decoder replay."""
+
+    _head_projection = PreparedStage._head_projection
+    sample_greedy = PreparedStage.sample_greedy
+    sample_greedy_token = PreparedStage.sample_greedy_token
+
+    def __init__(self, stage):
+        super().__init__()
+        self.weights = nn.Module()
+        self.weights.head = stage.weights.head
+        self.bf16_head = stage.bf16_head
+        from vllm_gaudi.ops.deepseek_v41_replay import stage_collectives
+
+        self.tp_rank = stage.tp_rank
+        _, self.all_gather = stage_collectives(stage.tp_rank, True,
+                                              getattr(stage, "tensor_parallel_size", 2),
+                                              native_fp32_gather=True)
+        self.is_last_stage = True
+
+    def forward(self, hidden):
+        return self.sample_greedy_token(hidden)
+
+
 class PreparedLayerGroup(nn.Module):
     """Bound FX dependency closure without changing the stage tensor program."""
 
-    def __init__(self, stage, start, stop, *, pp_wire_input=False, fused_text_io=False, fp8_decode=False, decode=False):
+    def __init__(self, stage, start, stop, *, pp_wire_input=False, fused_text_io=False,
+                 fp8_decode=False, decode=False, replay_tail=False):
         super().__init__()
         self.fp8_decode = fp8_decode
         self.decode = decode
@@ -1966,6 +1991,7 @@ class PreparedLayerGroup(nn.Module):
         self.layers = nn.ModuleList(list(stage.layers[start:stop]))
         self.final = is_last_stage and stop == len(stage.layers)
         self.norm = stage.weights.norm if self.final else None
+        self.greedy_tail = PreparedGreedyTail(stage) if self.final and replay_tail else None
         self.eps = stage.config["text_config"]["rms_norm_eps"]
         self.native_input = None
 
@@ -2050,7 +2076,10 @@ class PreparedLayerGroup(nn.Module):
         if not self.final:
             return residual, pre_mix, None
         value = final_collapse_rms_norm(residual, pre_mix, self.norm.weight, self.eps)
-        return value, pre_mix, torch.cat(target_states, -1) if target_states else None
+        aux = torch.cat(target_states, -1) if target_states else None
+        if self.greedy_tail is not None and decode and value.shape[0] == 1:
+            return value, pre_mix, aux, self.greedy_tail(value)
+        return value, pre_mix, aux
 
     def forward(self, residual, pre_mix, positions, input_ids, engram_rows):
         # ``native`` describes the compiled/replay-capable stage, not the
@@ -2103,6 +2132,7 @@ class CompiledStage:
         group_size=4,
         prepared_tp4=False,
         native_tp4=False,
+        replay_tail=False,
     ):
         legacy_fp8 = getattr(stage, "fp8_decode", False) and not getattr(stage, "expert_n256", False)
         if native_input and (not native or stage.pp_rank != 0 or stage.dspark or legacy_fp8):
@@ -2138,6 +2168,7 @@ class CompiledStage:
                 fused_text_io=fused_text_io,
                 fp8_decode=getattr(stage, "fp8_decode", False),
                 decode=native or getattr(stage, "tensor_parallel_size", 2) == 4,
+                replay_tail=replay_tail,
             )
             for start in range(0, len(stage.layers), group_size)
         )
