@@ -44,3 +44,6 @@ C2–C6/DSpark入口保持原有采样合同。未验收的尾部默认关闭。
 
 
 编译器隔离最小验证工具`tools/check_deepseek_v41_compiler_isolation.py`要求启动前打开诊断用graph-name hash，比较同精度专家完整消费链及冷post-graph。硬件验证已证明两臂recipe不同，且变更输入/专家顺序后的结果精确相同。关闭全部SRAM切分减少节点，却把原有SRAM切片中间权重放到DRAM；小链没有收益，未进入16层。此开关不改变正式服务默认。
+
+
+`dense_fp8_swa_packed`只改变没有压缩KV的两层decode派发，复用现有packed MLA及静态SWA行/长度输入。它先通过KV pack/写环→MLA的TP4/TP2、C1/C2/C6硬件契约，再在真实16层独立两臂验证；不修改prefill入口。此项仍待正式验收，默认关闭。它和I32通用解码删减重叠，不叠加未经门槛确认的I32差值。

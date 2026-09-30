@@ -494,6 +494,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         # Both selection variants are retained for diagnosis, not enabled:
         # carried-ID sorting regressed; score-only batching has no resolved gain.
         self.decode_batched_selection = False
+        self.decode_swa_packed = False
         if self.ratio:
             kv_source = max(source for source in config["kv_source_layer_ids"] if source <= layer)
             self.kv_source = kv_source
@@ -519,6 +520,15 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         self.register_buffer("window_offsets", torch.arange(self.window, dtype=torch.int32, device=device), False)
         self.register_buffer("compressed_offsets", torch.arange(512, dtype=torch.int32, device=device), False)
         self.register_buffer("swa_offsets", torch.arange(SWA_ROWS, dtype=torch.int32, device=device), False)
+        if not self.ratio:
+            # The packed consumer never reads main rows for a SWA-only layer.
+            # Retain the ordinary nonempty main operand contract without
+            # allocating a compressed cache or building constants per token.
+            self.register_buffer("swa_only_main", torch.zeros(1, 288, dtype=torch.uint8, device=device), False)
+            self.register_buffer(
+                "swa_only_lengths", torch.full((NATIVE_WORK_TOKENS,), self.window,
+                                               dtype=torch.int32, device=device), False
+            )
         self.register_buffer(
             "selected_offsets", torch.arange(NATIVE_WORK_TOKENS * 512, dtype=torch.int32, device=device), False
         )
@@ -1981,6 +1991,16 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             offset = torch.arange(selected.numel(), device=value.device, dtype=torch.int32).reshape(selected.shape)
             indices = torch.cat((indices, torch.where(selected >= 0, offset + SWA_ROWS, -1)), -1)
         if cache is None:
+            if (
+                decode and self.decode_swa_packed and not self.ratio and self.mla_mme
+                and self.direct_selected_kv and 1 <= value.shape[0] <= NATIVE_WORK_TOKENS
+            ):
+                output = self._paged_mla_operation(value.shape[0])(
+                    query.contiguous(), self.swa, self.swa_only_main,
+                    self.swa_offsets.reshape(1, -1), indices.contiguous(),
+                    self.weights.attn_sink, self.scale, self.swa_only_lengths[:value.shape[0]],
+                )
+                return self._finish_output(output, positions, ready_outputs)
             cache = unpack_swa(self.swa)
         return self._output(query, cache, indices, positions, ready_outputs, decode=decode)
 

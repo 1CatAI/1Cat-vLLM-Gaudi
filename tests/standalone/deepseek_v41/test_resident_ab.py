@@ -46,6 +46,23 @@ def test_clones_own_modules_but_share_immutable_storage():
     assert torch.equal(clone(), torch.ones(8))
 
 
+def test_swa_candidate_never_changes_reference_dispatch_or_allocations():
+    stage = torch.nn.Module()
+    stage.layers = torch.nn.ModuleList([torch.nn.Module(), torch.nn.Module()])
+    for block, ratio in zip(stage.layers, (0, 2)):
+        block.attention = torch.nn.Module()
+        block.attention.ratio = ratio
+        block.attention.decode_swa_packed = False
+        block.attention.register_buffer('swa', torch.zeros(256, 528, dtype=torch.uint8))
+    candidate = ab.make_swa_stage(stage)
+    assert candidate.layers[0].attention.decode_swa_packed
+    assert not candidate.layers[1].attention.decode_swa_packed
+    for original, cloned in zip(stage.layers, candidate.layers):
+        assert not original.attention.decode_swa_packed
+        assert original.attention is not cloned.attention
+        assert original.attention.swa is cloned.attention.swa
+
+
 def test_only_monotonic_foreign_weight_growth_blocks_timing():
     def sample(own, foreign):
         return dict(modules=[dict(module=0, memory_mib=own), dict(module=2, memory_mib=foreign)])

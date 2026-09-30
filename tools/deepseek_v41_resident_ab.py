@@ -136,6 +136,18 @@ def graph_info(replay):
                 joint_info=[list(g.joint_info()) for g in graphs])
 
 
+def make_swa_stage(stage):
+    """Keep candidate dispatch independent while retaining the same allocations."""
+    import torch
+
+    result = clone_module(stage)
+    result.layers = torch.nn.ModuleList([clone_module(block) for block in stage.layers])
+    for block in result.layers:
+        block.attention = clone_module(block.attention)
+        block.attention.decode_swa_packed = not block.attention.ratio
+    return result
+
+
 def device_load():
     result = subprocess.run(['hl-smi', '-Q', 'module_id,utilization.aip,memory.used', '--format=csv,noheader'],
                             capture_output=True, text=True, check=True)
@@ -197,10 +209,12 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
 
     def arm(name):
         if name not in arms:
-            if name in ('dense_fp8', 'dense_fp8_tail', 'dense_fp8_static_int32', *COMPILER_CANDIDATES):
+            if name in ('dense_fp8', 'dense_fp8_tail', 'dense_fp8_static_int32',
+                        'dense_fp8_swa_packed', *COMPILER_CANDIDATES):
                 if 'dense_fp8' not in stages:
                     stages['dense_fp8'] = make_dense_stage(stage, shard, args.ab_dense_sidecar, args.ab_dense_config)
-                program = clone_module(stages['dense_fp8'])
+                program = (make_swa_stage(stages['dense_fp8']) if name == 'dense_fp8_swa_packed'
+                           else clone_module(stages['dense_fp8']))
             elif name == 'tail':
                 program = clone_module(stage)
             else:
@@ -222,7 +236,8 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
 
     if rank == 0:
         ready = dict(pid=os.getpid(), source=os.environ['DSV41_RUN_EVIDENCE'],
-                     candidates=['dense_fp8', 'tail', 'dense_fp8_tail', 'dense_fp8_static_int32', *COMPILER_CANDIDATES])
+                     candidates=['dense_fp8', 'tail', 'dense_fp8_tail', 'dense_fp8_static_int32',
+                                 'dense_fp8_swa_packed', *COMPILER_CANDIDATES])
         (control / 'ready.json').write_text(json.dumps(ready, indent=2)+'\n')
     print(f'TP{rank}: real16 fixture resident; control {control}', flush=True)
     try:
@@ -305,7 +320,8 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                     # cache key. A/B timing alone cannot establish distinct arms.
                     result['status'] = 'compiler_cache_isolation_unverified'
                     result['comparison']['effective'] = False
-                if name in (*COMPILER_CANDIDATES, 'dense_fp8_static_int32') and reference_name == 'dense_fp8':
+                if name in (*COMPILER_CANDIDATES, 'dense_fp8_static_int32', 'dense_fp8_swa_packed') \
+                        and reference_name == 'dense_fp8':
                     result['compiler_token_exact'] = all(p['ranks'][0]['tokens'] == periods[0]['ranks'][0]['tokens']
                                                          for p in periods)
                     if not result['compiler_token_exact']:
@@ -328,7 +344,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--control-dir', type=Path, required=True)
     parser.add_argument('--candidate', choices=('dense_fp8', 'tail', 'dense_fp8_tail',
-                                              'dense_fp8_static_int32', *COMPILER_CANDIDATES))
+                                              'dense_fp8_static_int32', 'dense_fp8_swa_packed', *COMPILER_CANDIDATES))
     parser.add_argument('--baseline', choices=('baseline', 'dense_fp8'), default='baseline')
     parser.add_argument('--steps', type=int, default=200)
     parser.add_argument('--stop', action='store_true')
