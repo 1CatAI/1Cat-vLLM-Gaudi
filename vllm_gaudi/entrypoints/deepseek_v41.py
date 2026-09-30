@@ -71,10 +71,8 @@ _C1_FASTPATH_DEFAULTS = {
     "VLLM_HPU_DSV41_PREFILL_ROUTE_OUTPUT": "1",
     "VLLM_HPU_DSV41_PREFILL_EXPERT_ROWS": "128",
     "VLLM_HPU_DSV41_PREFILL_EXPERTS_PER_PLAN": "24",
-    # One scheduler transaction already owns 8192 prompt tokens. Keep the
-    # compute transaction intact so grouped experts reuse each decoded weight
-    # across twice as many rows and PP does not insert a midpoint drain.
-    "VLLM_HPU_DSV41_PREFILL_COMPUTE_TOKENS": "8192",
+    # Prefill compute capacity follows the scheduler and topology. Keep the
+    # normal transaction intact; an explicit diagnostic cap remains supported.
     # Keep two scheduler-owned PP packets in flight.  The producer waits only
     # when its slot is reused and PP1 waits at the real consumer.  This was
     # qualified with the normal 1M context and max_num_seqs=8 profile; it is

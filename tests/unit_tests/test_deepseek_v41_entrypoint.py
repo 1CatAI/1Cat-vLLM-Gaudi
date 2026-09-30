@@ -31,6 +31,7 @@ _PROFILE_KEYS = set().union(
     "VLLM_HPU_DSV41_PREFILL_GROUPED_FP8",
     "VLLM_HPU_DSV41_PREFILL_INDEX_QUERY_TP",
     "VLLM_HPU_DSV41_EXPERT_N256",
+    "VLLM_HPU_DSV41_PREFILL_COMPUTE_TOKENS",
 }
 
 
@@ -64,7 +65,7 @@ def test_default_profile_enables_qualified_numeric_bundle(monkeypatch, tmp_path)
         (tmp_path / "sidecars" / "attention_dense_fp8").resolve()
     )
     assert os.environ["VLLM_HPU_DSV41_ENGRAM_FP8_SIDECAR"] == str((tmp_path / "sidecars" / "engram_fp8").resolve())
-    assert os.environ["VLLM_HPU_DSV41_PREFILL_COMPUTE_TOKENS"] == "8192"
+    assert "VLLM_HPU_DSV41_PREFILL_COMPUTE_TOKENS" not in os.environ
     assert os.environ["VLLM_HPU_DSV41_PREFILL_KV_REUSE"] == "1"
     assert os.environ["VLLM_HPU_DSV41_PREFILL_PP_WAVEFRONT"] == "1"
     assert "VLLM_HPU_DSV41_PREFILL_GROUPED_FP8" not in os.environ
@@ -218,6 +219,28 @@ def test_tp4_prefill_diagnostic_disable_controls(monkeypatch, tmp_path):
     assert os.environ["VLLM_HPU_DSV41_PREFILL_GROUPED_FP8"] == ""
     assert os.environ["VLLM_HPU_DSV41_PREFILL_DECODER_HALO"] == "0"
     assert os.environ["VLLM_HPU_DSV41_PREFILL_MLA_SEQUENCE"] == "0"
+
+
+@pytest.mark.parametrize("tp,pp,expected_tile", ((2, 2, 8192), (4, 1, 16384)))
+def test_c1_defaults_preserve_scheduler_prefill_tile_and_halo(monkeypatch, tmp_path, tp, pp, expected_tile):
+    from vllm_gaudi.ops.deepseek_v41_decoder_halo import decoder_halo_mode
+    from vllm_gaudi.ops.deepseek_v41_prefill_capacity import prefill_capacity, prefill_compute_buckets
+
+    _clear_profile(monkeypatch)
+    for sidecar in ("wo_a_fp8", "attention_dense_fp8", "engram_fp8"):
+        (tmp_path / "sidecars" / sidecar).mkdir(parents=True)
+    prepare_default_fastpaths(tmp_path, tensor_parallel_size=tp, pipeline_parallel_size=pp)
+    capacity = prefill_capacity(16384, tp)
+    assert capacity == expected_tile
+    assert max(prefill_compute_buckets(capacity)) == expected_tile
+    mode = decoder_halo_mode(0, 16384, 16384, eligible=True, block_tokens=capacity, allow_single_block=pp == 1)
+    assert mode == ("final" if pp == 1 else "full")
+
+    # A deliberate smaller diagnostic tile still disables the full-transaction
+    # halo in the runner; inheritance must never supply that cap implicitly.
+    monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_COMPUTE_TOKENS", "8192")
+    prepare_default_fastpaths(tmp_path, tensor_parallel_size=tp, pipeline_parallel_size=pp)
+    assert max(prefill_compute_buckets(capacity)) == 8192
 
 
 def test_tp4_rejects_generic_moe_instead_of_silent_fallback(monkeypatch, tmp_path):
