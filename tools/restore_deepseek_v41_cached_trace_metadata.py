@@ -14,6 +14,7 @@ import re
 import shutil
 
 from normalize_deepseek_v41_raw_trace import engine, tensor_contract
+from collect_deepseek_v41_trace import recipe_symbols
 
 
 def physical_nodes(graph):
@@ -22,7 +23,7 @@ def physical_nodes(graph):
              if not node.get('is_logical') and engine(node['engine']) in ('TPC', 'MME', 'DMA') }
 
 
-def restore(run, analysis, post_base, ranks=None):
+def restore(run, analysis, post_base, ranks=None, recipe_cache=None):
     collection_path = analysis / 'collection.json'
     if collection_path.exists():
         collection = json.loads(collection_path.read_text())
@@ -52,15 +53,24 @@ def restore(run, analysis, post_base, ranks=None):
                 pair = (node['engine'], int(context))
                 needed[int(raw_id)].add(pair)
                 pending.append((index, int(raw_id), pair))
-        root = post_base / str(pid) / str(run / 'graphs' / f'rank{rank}').lstrip('/')
+        root = (recipe_cache / f'rank{rank}' if recipe_cache is not None else
+                post_base / str(pid) / str(run / 'graphs' / f'rank{rank}').lstrip('/'))
         candidates = collections.defaultdict(list)
-        for cold in root.glob('graph_*_syn_*.post.json'):
+        pattern = '*.recipe_debug_files/graph.post.json' if recipe_cache is not None else 'graph_*_syn_*.post.json'
+        cache_proofs = {}
+        for cold in root.glob(pattern):
             if f'.{pid}.' in cold.name:
                 continue
             data = cold.read_bytes()
             match = re.search(rb'"recipe_debug_id"\s*:\s*(\d+)', data)
             if match is None or int(match[1]) not in needed:
                 continue
+            if recipe_cache is not None:
+                binary = cold.parent.with_name(cold.parent.name.removesuffix('_debug_files'))
+                symbol_table = recipe_symbols(binary)
+                if symbol_table['recipe_id'] != int(match[1]):
+                    raise ValueError(f'Cached binary/graph recipe identity differs: {binary}')
+                cache_proofs[str(cold)] = dict(path=str(binary.resolve()), sha256=symbol_table['sha256'])
             for graph in json.loads(data)['graphs']:
                 raw_id = graph['recipe_debug_id']
                 nodes = physical_nodes(graph)
@@ -85,11 +95,15 @@ def restore(run, analysis, post_base, ranks=None):
         evidence = []
         for raw_id, (cold, graph, nodes) in selected.items():
             data = cold.read_bytes()
-            destination = output / cold.name
+            destination = output / (f'recipe-{raw_id}.post.json' if recipe_cache is not None else cold.name)
             destination.write_bytes(data)
             record = dict(path=str(destination.resolve()), sha256=hashlib.sha256(data).hexdigest(),
                           format='Synapse cold post-graph JSON', original_path=str(cold), owned_pid=pid,
-                          provenance='same-worker cold compiled graph; unique recipeID/engine/context match')
+                          provenance=('cached binary debug table and graph; unique recipeID/engine/context match'
+                                      if recipe_cache is not None else
+                                      'same-worker cold compiled graph; unique recipeID/engine/context match'))
+            if recipe_cache is not None:
+                record['cached_binary'] = cache_proofs[str(cold)]
             graphs.append(record)
             identity = f"{raw_id}@{graph['name']}"
             tensors = {tensor['name']: tensor_contract(tensor) for tensor in graph['tensors']}
@@ -117,7 +131,7 @@ def restore(run, analysis, post_base, ranks=None):
             node['cached_original'] = dict(node)
             node.update(recipe=f"{raw_id}@{graph['name']}:", node=symbol['node'], kernel=symbol['kernel'],
                         raw_unique_node_id=str(symbol['unique_node_id']),
-                        metadata_provenance='unique same-worker cold recipeID/engine/context match')
+                          metadata_provenance=record['provenance'])
         inventory['kernel_counts_before_cached_metadata'] = inventory.pop('kernel_counts', [])
         inventory['cached_native_metadata'] = dict(restored_nodes=len(pending), restored_recipes=len(selected),
                                                    timestamps_unchanged=True, node_indices_unchanged=True)
@@ -140,7 +154,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('run', type=Path)
     parser.add_argument('analysis', type=Path)
-    parser.add_argument('--post-base', type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument('--post-base', type=Path)
+    source.add_argument('--recipe-cache', type=Path, help='Exact archived per-rank recipe binaries and debug graphs')
     parser.add_argument('--rank', type=int, action='append')
     args = parser.parse_args()
-    restore(args.run.resolve(), args.analysis.resolve(), args.post_base.resolve(), args.rank)
+    restore(args.run.resolve(), args.analysis.resolve(), args.post_base.resolve() if args.post_base else None,
+            args.rank, args.recipe_cache.resolve() if args.recipe_cache else None)
