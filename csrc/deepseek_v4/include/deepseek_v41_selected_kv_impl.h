@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
+
+#if defined(DSV41_DIRECT_MLA_KV) && !defined(DSV41_PACKED_MLA_GATHER)
+#define DSV41_PACKED_MLA_GATHER 1
+#endif
 // Decode selected SWA/CSA2 rows once, preserving selection order and duplicates.
 static inline float64 e4m3fn(uint64 code) {
     const uint64 exponent = (code >> 3) & 15;
@@ -20,18 +24,30 @@ static inline float64 ue8m0(uint64 code) {
     return as_float64(bits);
 }
 
-#ifdef DSV41_DIRECT_MLA_KV
-void main(tensor swa, tensor main_cache, tensor indices, tensor selected,
-          tensor lengths, tensor rows, tensor values, tensor mask) {
+#ifdef DSV41_LOGICAL_MLA_OPERANDS
+void main(tensor swa, tensor main_cache, tensor selection, tensor positions, tensor pages,
+          tensor lengths, tensor rows, tensor values, tensor mask,
+#ifdef DSV41_LOGICAL_MLA_EXPORT_MAIN
+          tensor shared_rows,
+#endif
+          int ratio) {
 #else
 void main(tensor swa, tensor main_cache, tensor indices,
+#ifdef DSV41_PACKED_MLA_GATHER
+          tensor attention_indices, tensor lengths,
+#endif
 #ifdef DSV41_KV_WRITE_DEPENDENCY
           tensor completion,
 #endif
 #ifdef DSV41_COMPRESS_WRITE_DEPENDENCY
           tensor compressed_completion,
 #endif
-          tensor rows, tensor local_indices) {
+          tensor rows,
+#ifdef DSV41_PACKED_MLA_GATHER
+          tensor values, tensor mask) {
+#else
+          tensor local_indices) {
+#endif
 #endif
 #ifdef DSV41_KV_WRITE_DEPENDENCY
     const bool swa_ready = s_i32_ld_g(gen_addr((int5){0}, completion)) >= 0;
@@ -58,22 +74,56 @@ void main(tensor swa, tensor main_cache, tensor indices,
     scale_directions.v1 = (lanes >> 4) | 0x80;
     const uchar256 main_scale_directions = convert_uint256_to_uchar256(scale_directions, SW_LINEAR);
 #endif
-#ifdef DSV41_DIRECT_MLA_KV
-    for (int token = begin[1]; token < end[1]; ++token) {
-        const int length = s_i32_ld_g(gen_addr((int5){token}, lengths));
-        for (int slot = begin[0]; slot < end[0]; ++slot) {
-            const int local = s_i32_ld_g(gen_addr((int5){slot, token}, selected));
-            const bool selected_valid = slot < length && local >= 0 && local < get_dim_size(indices, 0);
-            const int index = selected_valid ? s_i32_ld_g(gen_addr((int5){local, 0}, indices)) : -1;
-            // Preserve the original second gather mask, including zero rows
-            // produced by an invalid packed physical address.
-            s_f32_st_g(gen_addr((int5){slot, token}, mask), selected_valid ? 1.0f : 0.0f);
+#if defined(DSV41_PACKED_MLA_GATHER) || defined(DSV41_LOGICAL_MLA_OPERANDS)
+    const int first_token = begin[1], token_end = end[1];
 #else
-    for (int slot = begin[0]; slot < end[0]; ++slot) {
+    const int first_token = 0, token_end = 1;
+#endif
+#ifdef DSV41_LOGICAL_MLA_OPERANDS
+    const int page_width = 128 / ratio;
+    const int page_count = get_dim_size(pages, 0);
+#endif
+    for (int token = first_token; token < token_end; ++token) {
+#if defined(DSV41_PACKED_MLA_GATHER) || defined(DSV41_LOGICAL_MLA_OPERANDS)
+        const int length = s_i32_ld_g(gen_addr((int5){token}, lengths));
+#endif
+#ifdef DSV41_PACKED_MLA_GATHER
+        const int selected_rows = get_dim_size(indices, 0);
+#endif
+        for (int slot = begin[0]; slot < end[0]; ++slot) {
+#ifdef DSV41_LOGICAL_MLA_OPERANDS
+        bool local_valid = slot < length;
+        int index = -1;
+        if (slot < 128) {
+            const int position = s_i32_ld_g(gen_addr((int5){token}, positions));
+            const int absolute = position - 127 + slot;
+            local_valid = local_valid && absolute >= 0;
+            if (local_valid) index = absolute & 255;
+        } else {
+            const int logical = s_i32_ld_g(gen_addr((int5){slot - 128, token}, selection));
+            local_valid = local_valid && logical >= 0;
+            if (local_valid && logical / page_width < page_count) {
+                const int page = s_i32_ld_g(gen_addr((int5){logical / page_width}, pages));
+                const int physical = page * page_width + (logical & (page_width - 1));
+                // Preserve the parent physical clamp and its independent
+                // local validity mask, including a negative page mapping.
+                index = (physical < 0 ? 0 : physical) + swa_length;
+            }
+        }
+        s_f32_st_g(gen_addr((int5){slot, token}, mask), local_valid ? 1.0f : 0.0f);
+#elif defined(DSV41_PACKED_MLA_GATHER)
+        const int selected = s_i32_ld_g(gen_addr((int5){slot, token}, attention_indices));
+        const bool consumed = slot < length && selected >= 0 && selected < selected_rows;
+        int index = -1;
+        if (consumed) index = s_i32_ld_g(gen_addr((int5){selected}, indices));
+        // The original gather accepts an in-range selected row even when its
+        // physical source was invalid and the decoder filled it with zeros.
+        s_f32_st_g(gen_addr((int5){slot, token}, mask), consumed ? 1.0f : 0.0f);
+#else
         const int index = s_i32_ld_g(gen_addr((int5){slot, 0, 0, 0, 0}, indices));
 #endif
         const bool valid = ready && index >= 0 && index < swa_length + main_length;
-#ifndef DSV41_DIRECT_MLA_KV
+#if !defined(DSV41_PACKED_MLA_GATHER) && !defined(DSV41_LOGICAL_MLA_OPERANDS)
         s_i32_st_g(gen_addr((int5){slot, 0, 0, 0, 0}, local_indices), valid ? slot : -1);
 #endif
 #ifdef DSV41_SELECTED_VALID_ONLY
@@ -136,18 +186,19 @@ void main(tensor swa, tensor main_cache, tensor indices,
             float128 wide = {0};
             wide.v1 = value;
             const bfloat128 output = convert_float128_to_bfloat128(wide, SW_RHNE | SW_LINEAR);
-#ifdef DSV41_DIRECT_MLA_KV
-            v_bf16_st_tnsr_partial((int5){chunk * 64, slot, token}, rows, output, 63, 0);
-            // Keep the BF16 materialization boundary before the FP32 PV
-            // operand. Widening the unrounded decoder result is not equivalent.
-            const float128 rounded = convert_bfloat128_to_float128(output, SW_LINEAR);
-            v_f32_st_tnsr((int5){chunk * 64, slot, token}, values, rounded.v1);
-#else
-            v_bf16_st_tnsr_partial((int5){chunk * 64, slot, 0, 0, 0}, rows, output, 63, 0);
+            v_bf16_st_tnsr_partial((int5){chunk * 64, slot, token, 0, 0}, rows, output, 63, 0);
+#ifdef DSV41_LOGICAL_MLA_EXPORT_MAIN
+            // A separate output preserves the QK operand's internal SRAM
+            // placement. Later layers consume only slots 128..639.
+            v_bf16_st_tnsr_partial((int5){chunk * 64, slot, token, 0, 0}, shared_rows, output, 63, 0);
+#endif
+#if defined(DSV41_PACKED_MLA_GATHER) || defined(DSV41_LOGICAL_MLA_OPERANDS)
+            // PV must consume the rounded BF16 key, exactly as the separate
+            // gather did, including signed zeros and nonfinite values.
+            const float128 restored = convert_bfloat128_to_float128(output, SW_LINEAR);
+            v_f32_st_tnsr((int5){chunk * 64, slot, token, 0, 0}, values, restored.v1);
 #endif
         }
+        }
     }
-#ifdef DSV41_DIRECT_MLA_KV
-    }
-#endif
 }

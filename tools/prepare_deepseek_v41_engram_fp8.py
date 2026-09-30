@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prepare bounded PP0 Engram FP8 sidecars from immutable rank files."""
+
 import argparse
 import json
 from datetime import datetime, timezone
@@ -21,6 +22,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     topology = json.loads((args.prepared / "manifest.json").read_text())
     tp_size = topology["tensor_parallel_size"]
+    pp_size = topology["pipeline_parallel_size"]
     manifest = {
         "version": 1,
         "quantization": QUANTIZATION,
@@ -53,7 +55,8 @@ def main():
                     count = min(256, n - row)
                     codes = read_bytes(weight, row * k, count * k).reshape(count, k)
                     powers = read_bytes(scale, row // 32 * (k // 32), ((count + 31) // 32) * (k // 32)).reshape(
-                        (count + 31) // 32, k // 32)
+                        (count + 31) // 32, k // 32
+                    )
                     q, channel, record = prepare_block32_rows(codes, powers)
                     if record["temporary_upper_bound_bytes"] > 2 * 2**30:
                         raise RuntimeError("Engram preparation exceeds temporary budget")
@@ -65,12 +68,14 @@ def main():
                     key: sum(record[key] for record in records)
                     for key in ("values", "changed", "new_zero", "source_energy", "error_energy")
                 }
-                total.update(layer=layer,
-                             blocks=records,
-                             temporary_upper_bound_bytes=max(record["temporary_upper_bound_bytes"]
-                                                             for record in records))
-                total["relative_l2"] = ((total["error_energy"] /
-                                         total["source_energy"])**.5 if total["source_energy"] else 0)
+                total.update(
+                    layer=layer,
+                    blocks=records,
+                    temporary_upper_bound_bytes=max(record["temporary_upper_bound_bytes"] for record in records),
+                )
+                total["relative_l2"] = (
+                    (total["error_energy"] / total["source_energy"]) ** 0.5 if total["source_energy"] else 0
+                )
                 audit.append(total)
                 shard.check_identity()
                 print(f"{rank} layer={layer} relative_l2={total['relative_l2']:.9g}", flush=True)

@@ -6,6 +6,7 @@ layer group: doing so retains every expert workspace until the group ends.
 These regions own only their local intermediates. Communication and bounded
 expert/attention execution remain explicit consumers outside the region.
 """
+
 from collections import OrderedDict
 from functools import wraps
 from itertools import count
@@ -20,11 +21,24 @@ _function_regions = OrderedDict()
 # Compile only explicit tensor contracts. Broader projection regions need
 # separate qualification because compiler reduction choices can affect routing.
 _qualified_regions = frozenset(
-    ("_prefill_swa_workspace", "_prefill_main_workspace", "_prefill_engram_unpack", "_prefill_combine"))
+    ("_prefill_swa_workspace", "_prefill_main_workspace", "_prefill_engram_unpack", "_prefill_combine")
+)
 _qualified_function_regions = frozenset(
-    ("_prefill_hc_post", "_prefill_hc_collapse", "_prefill_hc_control_bf16", "_prefill_combine",
-     "prefill_main_workspace", "prefill_hc_input", "prefill_q_projection", "prefill_output_projection",
-     "prefill_swa_workspace", "_prefill_engram_tile", "_prefill_router", "_prefill_shared_expert"))
+    (
+        "_prefill_hc_post",
+        "_prefill_hc_collapse",
+        "_prefill_hc_control_bf16",
+        "_prefill_combine",
+        "prefill_main_workspace",
+        "prefill_hc_input",
+        "prefill_q_projection",
+        "prefill_output_projection",
+        "prefill_swa_workspace",
+        "_prefill_engram_tile",
+        "_prefill_router",
+        "_prefill_shared_expert",
+    )
+)
 
 
 def validate_prefill_region_config():
@@ -38,8 +52,9 @@ def validate_prefill_region_config():
         missing = [name for name, enabled in requirements.items() if not enabled]
         if missing:
             raise ValueError("TP-partitioned prefill index requires: " + ", ".join(missing))
-    if envs.VLLM_HPU_DSV41_PREFILL_INDEX_VISIBLE and not (envs.VLLM_HPU_DSV41_PREFILL_INDEX_SRAM
-                                                          and envs.VLLM_HPU_DSV41_PREFILL_INDEX_QUERY_TP):
+    if envs.VLLM_HPU_DSV41_PREFILL_INDEX_VISIBLE and not (
+        envs.VLLM_HPU_DSV41_PREFILL_INDEX_SRAM and envs.VLLM_HPU_DSV41_PREFILL_INDEX_QUERY_TP
+    ):
         raise ValueError("Visible prefill index tiles require TP query partition and Full-index SRAM scores")
     if envs.VLLM_HPU_DSV41_PREFILL_INDEX_SRAM and not envs.VLLM_HPU_DSV41_PREFILL_INDEX_MME:
         raise ValueError("Full prefill SRAM index scoring requires the explicit prefill MME dispatch")
@@ -114,6 +129,7 @@ def clear_prefill_function_regions():
     """
     _function_regions.clear()
     from vllm_gaudi.ops.deepseek_v41_prefill_index_scores import compiled_native_prefill_index_scores
+
     compiled_native_prefill_index_scores.cache_clear()
 
 
@@ -127,21 +143,37 @@ def prefill_function_region(function):
 
     @wraps(function)
     def invoke(*args, **kwargs):
-        if (torch.compiler.is_compiling() or not envs.VLLM_HPU_DSV41_PREFILL_REGIONS
-                or (_qualified_function_regions is not None and function.__name__ not in _qualified_function_regions)):
+        if (
+            torch.compiler.is_compiling()
+            or not envs.VLLM_HPU_DSV41_PREFILL_REGIONS
+            or (_qualified_function_regions is not None and function.__name__ not in _qualified_function_regions)
+        ):
             return function(*args, **kwargs)
         # The mHC function bodies select their exact native contract before
         # Dynamo tracing.  Keep diagnostic A/B executors disjoint when that
         # process-local switch changes; production processes keep one value.
-        compile_mode = (envs.VLLM_HPU_DSV41_PREFILL_MHC_POST, envs.VLLM_HPU_DSV41_PREFILL_MHC_CONTROL_BF16,
-                        envs.VLLM_HPU_DSV41_PREFILL_MHC_POST_PREPARE)
-        key = (function.__module__, function.__qualname__, compile_mode, _signature(args),
-               tuple((k, _signature(v)) for k, v in sorted(kwargs.items())))
+        compile_mode = (
+            envs.VLLM_HPU_DSV41_PREFILL_MHC_POST,
+            envs.VLLM_HPU_DSV41_PREFILL_MHC_CONTROL_BF16,
+            envs.VLLM_HPU_DSV41_PREFILL_MHC_POST_PREPARE,
+        )
+        key = (
+            function.__module__,
+            function.__qualname__,
+            compile_mode,
+            _signature(args),
+            tuple((k, _signature(v)) for k, v in sorted(kwargs.items())),
+        )
         entry = _function_regions.get(key)
         if entry is None:
             name = f"v41_prefill_function_{function.__name__}_{next(_entries)}"
-            cloned = FunctionType(function.__code__.replace(co_name=name), function.__globals__, name,
-                                  function.__defaults__, function.__closure__)
+            cloned = FunctionType(
+                function.__code__.replace(co_name=name),
+                function.__globals__,
+                name,
+                function.__defaults__,
+                function.__closure__,
+            )
             cloned.__kwdefaults__ = function.__kwdefaults__
             entry = torch.compile(cloned, backend="hpu_backend", fullgraph=True, dynamic=False)
             _function_regions[key] = entry
@@ -168,16 +200,24 @@ def prefill_region(function):
 
     @wraps(function)
     def invoke(owner, *args, **kwargs):
-        if (torch.compiler.is_compiling() or not envs.VLLM_HPU_DSV41_PREFILL_REGIONS
-                or (_qualified_regions is not None and function.__name__ not in _qualified_regions)):
+        if (
+            torch.compiler.is_compiling()
+            or not envs.VLLM_HPU_DSV41_PREFILL_REGIONS
+            or (_qualified_regions is not None and function.__name__ not in _qualified_regions)
+        ):
             return function(owner, *args, **kwargs)
         cache = owner.__dict__.setdefault("_prefill_tensor_regions", OrderedDict())
         key = (function.__name__, _signature(args), tuple((k, _signature(v)) for k, v in sorted(kwargs.items())))
         entry = cache.get(key)
         if entry is None:
             name = f"v41_prefill_{function.__name__}_{next(_entries)}"
-            cloned = FunctionType(function.__code__.replace(co_name=name), function.__globals__, name,
-                                  function.__defaults__, function.__closure__)
+            cloned = FunctionType(
+                function.__code__.replace(co_name=name),
+                function.__globals__,
+                name,
+                function.__defaults__,
+                function.__closure__,
+            )
             cloned.__kwdefaults__ = function.__kwdefaults__
             entry = torch.compile(MethodType(cloned, owner), backend="hpu_backend", fullgraph=True, dynamic=False)
             cache[key] = entry
@@ -208,21 +248,25 @@ def prefill_q_projection(value, weight, channel_scale, positions, table):
     products used by large prefill, independently of the C1 decoder contract.
     """
     return torch.ops.custom_op.custom_deepseek_v41_prefill_q_projection_rope_gaudi2(
-        value, weight, channel_scale, positions, table).reshape(value.shape[0], weight.shape[0] // 512, 512)
+        value, weight, channel_scale, positions, table
+    ).reshape(value.shape[0], weight.shape[0] // 512, 512)
 
 
 @prefill_function_region
 def prefill_main_workspace(packed, table, cache, indices, selected, logical, ratio):
     """Bind paged state explicitly, sharing one cache-assembly recipe per shape."""
     from vllm_gaudi.ops.deepseek_v41_math import unpack_fp4
+
     width = 128 // ratio
     shift = width.bit_length() - 1
     blocks = table.index_select(0, torch.bitwise_right_shift(logical, shift).long())
     physical = blocks * width + torch.bitwise_and(logical, width - 1)
     main = unpack_fp4(packed.index_select(0, physical.long()))
     offset = cache.shape[0]
-    return (torch.cat((cache, main), 0), torch.cat((indices, torch.where(selected >= 0, selected + offset, -1)),
-                                                   -1).int())
+    return (
+        torch.cat((cache, main), 0),
+        torch.cat((indices, torch.where(selected >= 0, selected + offset, -1)), -1).int(),
+    )
 
 
 @prefill_function_region
@@ -234,6 +278,7 @@ def prefill_swa_workspace(kv, positions, swa, window_offsets, decoded_swa, decod
     the ring; both packed and decoded state keep the same last-row ownership.
     """
     from vllm_gaudi.ops.deepseek_v41_math import pack_swa, quantize_activation, unpack_swa
+
     window, ring_rows = window_offsets.numel(), swa.shape[0]
     prefix_positions = positions[:1].to(torch.int32) - (window - 1) + window_offsets[:-1]
     prefix_packed = swa.index_select(0, prefix_positions.remainder(ring_rows).long())
@@ -242,8 +287,9 @@ def prefill_swa_workspace(kv, positions, swa, window_offsets, decoded_swa, decod
     # values at every scheduler chunk boundary.
     current = quantize_activation(kv)
     cache = torch.cat((unpack_swa(prefix_packed), current), 0)
-    local = (torch.arange(positions.numel(), device=positions.device, dtype=torch.int32).unsqueeze(-1) +
-             window_offsets.unsqueeze(0))
+    local = torch.arange(positions.numel(), device=positions.device, dtype=torch.int32).unsqueeze(
+        -1
+    ) + window_offsets.unsqueeze(0)
     logical = positions.unsqueeze(-1) - window + 1 + window_offsets.unsqueeze(0)
     indices = torch.where(logical >= 0, local, -1).int()
     tail = min(positions.numel(), ring_rows)

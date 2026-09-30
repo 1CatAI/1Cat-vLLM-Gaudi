@@ -12,10 +12,11 @@ GlueCodeReturn DeepseekV41IndexGaudi2::GetGcDefinitions(HabanaKernelParams* p,Ha
     const bool score_mode=mode_==0||mode_==3;
     if(p->inputTensorNr!=(score_mode?6u:mode_==1?2u:4u)) return GLUE_INCOMPATIBLE_INPUT_COUNT;
     if(p->outputTensorNr!=(score_mode?2u:1u)) return GLUE_INCOMPATIBLE_OUTPUT_COUNT;
-    if(!p->nodeParams.nodeParams || p->nodeParams.nodeParamsSize!=3*sizeof(int)) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+    if(!p->nodeParams.nodeParams || p->nodeParams.nodeParamsSize!=(score_mode?4:3)*sizeof(int)) return GLUE_INCOMPATIBLE_INPUT_SIZE;
     const auto* param=static_cast<const int*>(p->nodeParams.nodeParams);
     if((param[0]!=1&&param[0]!=2)||param[1]<0||param[1]>1||param[2]<0||param[2]>1)
         return GLUE_INCOMPATIBLE_INPUT_SIZE;
+    if(score_mode && (param[3]<1 || 32%param[3])) return GLUE_INCOMPATIBLE_INPUT_SIZE;
     const auto match=[](const TensorGeometry& t, unsigned dim, unsigned width, TensorDataType type) {
         return t.dims==dim && t.maxSizes[0]==width && t.dataType==type;
     };
@@ -47,13 +48,14 @@ GlueCodeReturn DeepseekV41IndexGaudi2::GetGcDefinitions(HabanaKernelParams* p,Ha
         const bool vector=score.dims==1;
         if(!rows(score,score.maxSizes[0],DATA_F32,vector)||score.maxSizes[0]%64)
             return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        const unsigned stats_width=50+((score.maxSizes[0]+127)/128)*8;
         if(mode_==1) {
-            if(!rows(p->outputTensors[0].geometry,50,DATA_I32,vector))return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+            if(!rows(p->outputTensors[0].geometry,stats_width,DATA_I32,vector))return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
         } else {
             if(!rows(p->inputTensors[2].geometry,2048,DATA_I32) ||
                !rows(p->outputTensors[0].geometry,param[2]?2048:512,DATA_I32))
                 return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
-            if(mode_==2 && !rows(p->inputTensors[3].geometry,50,DATA_I32,vector))
+            if(mode_==2 && !rows(p->inputTensors[3].geometry,stats_width,DATA_I32,vector))
                 return GLUE_INCOMPATIBLE_INPUT_SIZE;
         }
     }
@@ -70,8 +72,9 @@ GlueCodeReturn DeepseekV41IndexGaudi2::GetGcDefinitions(HabanaKernelParams* p,Ha
     }
     // Runtime partitions are disjoint but are not affine functions of capacity.
     for(unsigned i=0;i<p->outputTensorNr;++i)out->outputTensorAccessPattern[i].allRequired=true;
-    out->kernel.paramsNr=score_mode?2:3;
-    std::memcpy(out->kernel.scalarParams,param,out->kernel.paramsNr*sizeof(int));
+    out->kernel.paramsNr=3;
+    const int scalars[]={param[0],param[1],score_mode?param[3]:param[2]};
+    std::memcpy(out->kernel.scalarParams,scalars,sizeof(scalars));
     unsigned char* starts[]={&_binary___deepseek_v41_index_scores_gaudi2_o_start,
         &_binary___deepseek_v41_index_threshold_gaudi2_o_start,&_binary___deepseek_v41_index_emit_gaudi2_o_start,
         &_binary___deepseek_v41_index_scores_decoded_gaudi2_o_start};

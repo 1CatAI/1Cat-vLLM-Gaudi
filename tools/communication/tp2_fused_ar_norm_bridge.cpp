@@ -50,6 +50,7 @@
 #include "python_packages/habana_frameworks/torch/distributed/hccl/process_group_eager_hccl.hpp"
 #include "dsv41_verify_timing.h"
 #include "tp2_input_preflight.h"
+#include "dsv41_index_gather_pair.h"
 
 namespace {
 
@@ -420,12 +421,23 @@ void validateTensor(const at::Tensor &tensor, const at::Tensor &reference,
 void runTp2ExchangePeer(
     const std::shared_ptr<habana::HcclCommunicator> &communicator,
     at::Tensor partial, at::Tensor peer,
-    synapse_helpers::hpuStream_t hpu_stream, bool reduction_only = false) {
+    synapse_helpers::hpuStream_t hpu_stream, bool reduction_only = false,
+    bool stock_collective_stream = false, bool all_gather = false) {
   g_collective_launch_count.fetch_add(1, std::memory_order_relaxed);
   auto device_context = communicator->getDeviceCtxt();
   auto &device = habana::HPUDeviceContext::get_device();
   auto &compute_stream = device.get_stream(hpu_stream);
-  const synStreamHandle stream = compute_stream;
+  const synStreamHandle stream = stock_collective_stream
+      ? communicator->getCommStream() : compute_stream;
+
+  if (stock_collective_stream) {
+    // Preserve stock TP4's separate communication stream and dependency
+    // generations. Independent compute must not queue behind its reduction.
+    device_context->prepare_stream(stream, reinterpret_cast<synapse_helpers::device_ptr>(
+        partial.storage().data_ptr().get()));
+    device_context->prepare_stream(stream, reinterpret_cast<synapse_helpers::device_ptr>(
+        peer.storage().data_ptr().get()));
+  }
 
   auto resources = std::make_shared<GenericResourceHolder>();
   std::array<at::Tensor, 2> tensors = {partial, peer};
@@ -438,7 +450,12 @@ void runTp2ExchangePeer(
   device_context->lock_address(tensor_addresses,
                                resources->get_address_lock());
   const auto &locked = *resources->get_address_lock();
-  const hcclResult_t result = reduction_only
+  const hcclResult_t result = all_gather
+      ? hcclAllGather(reinterpret_cast<const void *>(locked.at(0)),
+                      reinterpret_cast<void *>(locked.at(1)),
+                      static_cast<size_t>(partial.numel()), hcclBfloat16,
+                      *(communicator->GetHcclHandle()), stream)
+      : reduction_only
       ? hcclAllReduce(reinterpret_cast<const void *>(locked.at(0)),
                       reinterpret_cast<void *>(locked.at(1)),
                       static_cast<size_t>(partial.numel()), hcclBfloat16, hcclSum,
@@ -452,10 +469,20 @@ void runTp2ExchangePeer(
 
   auto peer_storage = reinterpret_cast<synapse_helpers::device_ptr>(
       peer.storage().data_ptr().get());
-  device.register_producer_on_stream(
-      {peer_storage}, compute_stream, [resources]() mutable {
-        resources.reset();
-      });
+  if (stock_collective_stream) {
+    auto &recipe_counter = device_context->get_active_recipe_counter();
+    recipe_counter.increase();
+    device_context->submit_events(stream, peer_storage,
+        [resources, &recipe_counter]() mutable {
+          resources.reset();
+          recipe_counter.decrease_and_notify();
+        });
+  } else {
+    device.register_producer_on_stream(
+        {peer_storage}, compute_stream, [resources]() mutable {
+          resources.reset();
+        });
+  }
 }
 
 struct GdnStateDMATicket {
@@ -741,9 +768,20 @@ void queueGdnStateWaits(std::vector<std::shared_ptr<GdnStateDMATicket>> tickets,
 at::Tensor tp2ExchangePeer(c10d::ProcessGroupEagerHCCL *backend,
                            const at::Tensor &partial,
                            const at::Tensor &peer, bool reduction_only = false,
-                           bool immediate = false) {
-  TORCH_CHECK(tp2ExchangeEnabled(),
+                           bool immediate = false, bool tp4 = false, bool all_gather = false) {
+  TORCH_CHECK(tp4 || tp2ExchangeEnabled(),
               "TP2 peer exchange requires the tp2-exchange algorithm");
+  if (tp4) {
+    TORCH_CHECK((reduction_only != all_gather) && !immediate && backend->getSize() == 4,
+                "TP4 requires queued stock AllReduce or AllGather on a four-rank communicator");
+    TORCH_CHECK(GET_ENV_FLAG_NEW(PT_HPU_LAZY_MODE) == 0 &&
+                    GET_ENV_FLAG_NEW(PT_HPU_EAGER_PIPELINE_ENABLE) &&
+                    GET_ENV_FLAG_NEW(PT_HPU_EAGER_COLLECTIVE_PIPELINE_ENABLE),
+                "TP4 reduction requires the eager compute and collective pipelines");
+    TORCH_CHECK(partial.device().type() == at::kHPU && partial.numel() <= 32768 &&
+                    partial.storage().data_ptr().get() != peer.storage().data_ptr().get(),
+                "TP4 reduction requires bounded activations with distinct storage");
+  }
   // The normal TP2 path uses a row-shaped activation, while the PP commit
   // path transports a fixed 128-byte record as a one-dimensional BF16 view.
   // Both are valid contiguous HCCL buffers; dimensionality is not part of
@@ -753,7 +791,12 @@ at::Tensor tp2ExchangePeer(c10d::ProcessGroupEagerHCCL *backend,
               "TP2 peer exchange supports BF16 activations only");
   TORCH_CHECK(partial.is_contiguous(), "partial must be contiguous");
   TORCH_CHECK(partial.numel() > 0, "partial must not be empty");
-  validateTensor(peer, partial, "peer", at::kBFloat16);
+  TORCH_CHECK(!all_gather || tp4, "AllGather requires the TP4 contract");
+  if (all_gather) {
+    TORCH_CHECK(peer.device() == partial.device() && peer.scalar_type() == at::kBFloat16 &&
+                    peer.is_contiguous() && peer.numel() == partial.numel() * backend->getSize(),
+                "AllGather output must hold the contiguous inputs of the bound TP group");
+  } else validateTensor(peer, partial, "peer", at::kBFloat16);
   TORCH_CHECK(partial.data_ptr() != peer.data_ptr(),
               "partial and peer must use distinct storage");
 
@@ -773,9 +816,9 @@ at::Tensor tp2ExchangePeer(c10d::ProcessGroupEagerHCCL *backend,
     }
     habana::eager::PipelineTask<habana::eager::ThreadType::EXECUTE>(
         [communicator, backend_tensors = std::move(backend_tensors),
-         hpu_stream, reduction_only]() mutable {
+         hpu_stream, reduction_only, tp4, all_gather]() mutable {
           runTp2ExchangePeer(communicator, std::move(backend_tensors[0]),
-                             std::move(backend_tensors[1]), hpu_stream, reduction_only);
+                             std::move(backend_tensors[1]), hpu_stream, reduction_only, tp4, all_gather);
         });
   } else {
     habana::eager::JoinPendingPipelineThreads();
@@ -1106,10 +1149,17 @@ struct DeviceEngramRecipe {
     return result;
   }
 
-  void compile(uint64_t vocab_size, uint64_t rows) {
+  void compile(uint64_t vocab_size, uint64_t rows, uint64_t local_heads) {
     checkSynapse(synGraphCreate(&graph, synDeviceGaudi2),
                  "synGraphCreate(device Engram)");
     std::array<uint8_t, 1> compile_byte{};
+    // Table geometry is static data. Address-space translation belongs to
+    // the launch descriptor; making the graph tensor H2D triggers the 1.24
+    // mount/shape pipeline, which is unrelated to this mapped read.
+    const bool static_table = local_heads == 6;
+    const auto table_type = static_table ? DATA_TENSOR : HOST_TO_DEVICE_TENSOR;
+    void* compile_data = static_table ? nullptr : compile_byte.data();
+    const uint64_t compile_bytes = static_table ? 0 : compile_byte.size();
     synTensor inputs[6] = {
         tensor(DATA_TENSOR, "raw_token", {1, 1}, syn_type_int32),
         tensor(DATA_TENSOR, "history", {kDeviceEngramHistory, 1},
@@ -1117,14 +1167,14 @@ struct DeviceEngramRecipe {
         tensor(DATA_TENSOR, "token_map", {vocab_size, 1}, syn_type_int32),
         tensor(DATA_TENSOR, "parameters", {kDeviceEngramParameters, 1},
                syn_type_int32),
-        tensor(HOST_TO_DEVICE_TENSOR, "weights", {kDeviceEngramWidth, rows},
-               syn_type_uint8, compile_byte.data(), compile_byte.size()),
-        tensor(HOST_TO_DEVICE_TENSOR, "scales", {kDeviceEngramScales, rows},
-               syn_type_uint8, compile_byte.data(), compile_byte.size()),
+        tensor(table_type, "weights", {kDeviceEngramWidth, rows},
+               syn_type_uint8, compile_data, compile_bytes),
+        tensor(table_type, "scales", {kDeviceEngramScales, rows},
+               syn_type_uint8, compile_data, compile_bytes),
     };
     synTensor outputs[2] = {
         tensor(DATA_TENSOR, "decoded_rows",
-               {kDeviceEngramWidth, kDeviceEngramHeads}, syn_type_bf16),
+               {kDeviceEngramWidth, local_heads}, syn_type_bf16),
         tensor(DATA_TENSOR, "next_history", {kDeviceEngramHistory, 1},
                syn_type_int32),
     };
@@ -1192,8 +1242,10 @@ class DeviceEngramProducer
                        const std::string &scale_file, uint64_t scale_offset,
                        uint64_t scale_bytes, uint64_t rows,
                        at::Tensor token_map, at::Tensor parameters,
-                       bool shared_checkpoint)
-      : token_map_(std::move(token_map)), parameters_(std::move(parameters)) {
+                       bool shared_checkpoint, uint64_t local_heads = kDeviceEngramHeads)
+      : token_map_(std::move(token_map)), parameters_(std::move(parameters)), local_heads_(local_heads) {
+    TORCH_CHECK(local_heads_ == 6 || local_heads_ == 12,
+                "Device Engram requires 6 or 12 local heads");
     auto *group = dynamic_cast<c10d::ProcessGroupEagerHCCL *>(backend.get());
     TORCH_CHECK(group != nullptr,
                 "Device Engram requires ProcessGroupEagerHCCL");
@@ -1215,7 +1267,7 @@ class DeviceEngramProducer
         device.id(), weight_file, weight_offset, weight_bytes, shared_checkpoint);
     scales_ = std::make_unique<MappedCheckpointRange>(
         device.id(), scale_file, scale_offset, scale_bytes, shared_checkpoint);
-    recipe_.compile(token_map_.numel(), rows);
+    recipe_.compile(token_map_.numel(), rows, local_heads_);
   }
 
   ~DeviceEngramProducer() {
@@ -1239,9 +1291,9 @@ class DeviceEngramProducer
     TORCH_CHECK(decoded_rows.device().type() == at::kHPU &&
                     decoded_rows.scalar_type() == at::kBFloat16 &&
                     decoded_rows.numel() ==
-                        kDeviceEngramHeads * kDeviceEngramWidth &&
+                        local_heads_ * kDeviceEngramWidth &&
                     decoded_rows.is_contiguous(),
-                "Device Engram decoded_rows must be contiguous 12x256 BF16 on HPU");
+                "Device Engram decoded_rows must match the prepared local head count");
     TORCH_CHECK(raw_token.device() == history.device() &&
                     history.device() == next_history.device() &&
                     next_history.device() == decoded_rows.device() &&
@@ -1350,6 +1402,7 @@ class DeviceEngramProducer
   std::shared_ptr<habana::HcclCommunicator> communicator_;
   at::Tensor token_map_;
   at::Tensor parameters_;
+  uint64_t local_heads_;
   std::unique_ptr<MappedCheckpointRange> weights_;
   std::unique_ptr<MappedCheckpointRange> scales_;
   DeviceEngramRecipe recipe_;
@@ -1361,6 +1414,7 @@ class DeviceEngramProducer
 #include "tp2_prepared_plan.h"
 #include "tp2_native_decode_graph.h"
 #include "tp2_native_graph_probe.h"
+#include "dsv41_control_inputs.h"
 
 class Tp2FusedAllReduceRmsNormOperator : public habana::CollectiveOperator {
 public:
@@ -1619,6 +1673,49 @@ TORCH_LIBRARY_IMPL(hccl, Meta, library) {
 namespace py = pybind11;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.attr("tp4_index_gather_pair_version") = 1;
+  module.def("tp4_index_gather_pair", &dsv41_index_pair::enqueue);
+  module.def("tp4_index_gather_pair_launches", []() {
+    return dsv41_index_pair::launches.load(std::memory_order_relaxed);
+  });
+  module.attr("tp4_prepared_group_version") = 1;
+  module.attr("prepared_control_input_version") = 1;
+  module.attr("prepared_position_bank_version") = 3;
+  py::class_<dsv41_control::PreparedInputs, std::shared_ptr<dsv41_control::PreparedInputs>>(
+      module, "PreparedControlInputs")
+      .def(py::init<const at::Tensor&, const at::Tensor&>())
+      .def("upload", &dsv41_control::PreparedInputs::upload)
+      .def("bind_position_bank", &dsv41_control::PreparedInputs::bind_position_bank)
+      .def("copy_positions", &dsv41_control::PreparedInputs::copy_positions)
+      .def_property_readonly("count", &dsv41_control::PreparedInputs::count)
+      .def_property_readonly("uploads", &dsv41_control::PreparedInputs::uploads)
+      .def_property_readonly("position_copies", &dsv41_control::PreparedInputs::position_copies)
+      .def_property_readonly("payload_bytes", &dsv41_control::PreparedInputs::payload_bytes);
+  module.def("native_tp4_decode_graph_available", []() {
+    try {
+      tp2_native::RuntimeApis::get().requireTp4();
+      tp2_native::RuntimeApis::get().requirePlanV2();
+      return true;
+    } catch (...) { return false; }
+  });
+  module.def("tp4_allgather_current_stream",
+      [](const c10::intrusive_ptr<c10d::Backend>& backend, const at::Tensor& input, const at::Tensor& output) {
+        auto* group = dynamic_cast<c10d::ProcessGroupEagerHCCL*>(backend.get());
+        TORCH_CHECK(group, "TP4 AllGather requires ProcessGroupEagerHCCL");
+        return tp2ExchangePeer(group, input, output, false, false, true, true);
+      });
+  module.def("tp_peer_allgather_current_stream",
+      [](const c10::intrusive_ptr<c10d::Backend>& backend, const at::Tensor& input, const at::Tensor& output) {
+        auto* group = dynamic_cast<c10d::ProcessGroupEagerHCCL*>(backend.get());
+        TORCH_CHECK(group, "Peer exchange requires ProcessGroupEagerHCCL");
+        return tp2ExchangePeer(group, input, output, false, false, group->getSize() > 2, true);
+      });
+  module.def("tp4_allreduce_current_stream",
+      [](const c10::intrusive_ptr<c10d::Backend>& backend, const at::Tensor& partial, const at::Tensor& output) {
+        auto* group = dynamic_cast<c10d::ProcessGroupEagerHCCL*>(backend.get());
+        TORCH_CHECK(group, "TP4 reduction requires ProcessGroupEagerHCCL");
+        return tp2ExchangePeer(group, partial, output, true, false, true);
+      }, py::arg("backend"), py::arg("partial"), py::arg("output"));
   dsv41_timing::bind(module);
   module.attr("fixed_input_preflight_api_version") = 1;
   py::class_<tp2_input::FixedInputPreflight>(module, "FixedInputPreflight")
@@ -1637,6 +1734,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       .def("add_exchange", &PreparedGroupPlan::add_exchange)
       .def("add_peer_exchange", &PreparedGroupPlan::add_peer_exchange)
       .def("add_all_reduce", &PreparedGroupPlan::add_all_reduce)
+      .def("add_all_gather", &PreparedGroupPlan::add_all_gather)
       .def("prepare", [](PreparedGroupPlan& self, const c10::intrusive_ptr<c10d::Backend>& backend,
                           std::vector<int64_t> outputs) {
         auto* group = dynamic_cast<c10d::ProcessGroupEagerHCCL*>(backend.get());
@@ -1661,18 +1759,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         copyC1PipelineTensors(hccl_backend, std::move(sources), std::move(destinations));
       });
   module.attr("device_engram_shared_mapping_version") = 1;
+  module.attr("device_engram_tp4_version") = 3;
   py::class_<DeviceEngramProducer, std::shared_ptr<DeviceEngramProducer>>(
       module, "DeviceEngramProducer")
       .def(py::init<const c10::intrusive_ptr<c10d::Backend> &,
                     const std::string &, uint64_t, uint64_t,
                     const std::string &, uint64_t, uint64_t, uint64_t,
-                    at::Tensor, at::Tensor, bool>(),
+                    at::Tensor, at::Tensor, bool, uint64_t>(),
            py::arg("backend"), py::arg("weight_file"),
            py::arg("weight_offset"), py::arg("weight_bytes"),
            py::arg("scale_file"), py::arg("scale_offset"),
            py::arg("scale_bytes"), py::arg("rows"),
            py::arg("token_map"), py::arg("parameters"),
-           py::arg("shared_checkpoint") = false)
+           py::arg("shared_checkpoint") = false,
+           py::arg("local_heads") = kDeviceEngramHeads)
       .def("launch", &DeviceEngramProducer::launch)
       .def("mapped_bytes", &DeviceEngramProducer::mappedBytes)
       .def("workspace_bytes", &DeviceEngramProducer::workspaceBytes)

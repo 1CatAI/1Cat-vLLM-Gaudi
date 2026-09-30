@@ -10,6 +10,7 @@ ELF(slots_fp8)
 ELF(reuse_fp8)
 ELF(horizontal_fp8)
 ELF(prefetch16_fp8)
+ELF(pair2_fp8)
 ELF(bf16)
 ELF(normal_bf16)
 ELF(dead_bf16)
@@ -219,6 +220,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41ExpertN256Gaudi2::GetGcDefinitions(
         result.dataType = outputType; return GLUE_INCOMPATIBLE_DATA_TYPE;
     }
     uint64_t n, k, slots;
+    bool pairedSlots = false;
     if (!scaling) {
         const auto& ids = in->inputTensors[0].geometry;
         const auto& q = in->inputTensors[1].geometry;
@@ -227,14 +229,20 @@ tpc_lib_api::GlueCodeReturn DeepseekV41ExpertN256Gaudi2::GetGcDefinitions(
         if (ids.dims != 2 || ids.maxSizes[1] != 1 || !ids.maxSizes[0] || ids.maxSizes[0] > 3072 ||
             q.dims != 3 || !q.maxSizes[0] || q.maxSizes[0] % 8192 || q.maxSizes[0] > 327680 ||
             !q.maxSizes[1] || q.maxSizes[1] > 20 || !q.maxSizes[2] || q.maxSizes[2] > 384 ||
-            s.dims != 3 || s.maxSizes[0] * 8 != q.maxSizes[0] || s.maxSizes[1] != q.maxSizes[1] ||
+            s.dims != 3 ||
+            (s.maxSizes[0] * 8 != q.maxSizes[0] &&
+             !(s.maxSizes[0] > 128 && (s.maxSizes[0] - 128) * 16 == q.maxSizes[0])) ||
+            s.maxSizes[1] != q.maxSizes[1] ||
             s.maxSizes[2] != q.maxSizes[2] || lut.dims != 1 || lut.maxSizes[0] != 128)
             return GLUE_INCOMPATIBLE_INPUT_SIZE;
         n = q.maxSizes[1] * 256; k = q.maxSizes[0] / 64; slots = ids.maxSizes[0];
         const bool horizontal = mode_ == FP8Horizontal;
         if (horizontal && (slots % 2 || slots > 384)) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+        const bool compactScales = s.maxSizes[0] == k * 4 + 128;
+        pairedSlots = mode_ == FP8 && substitute_prefetch16_ && slots % 2 == 0 &&
+                      ((n == 1280 && k == 5120) || (n == 5120 && k == 640));
         const bool fuseSlots = mode_ == FP8Slots;
-        const int routeTile = mode_ == FP8Reuse ? 2 : 1;
+        const int routeTile = mode_ == FP8Reuse || pairedSlots ? 2 : 1;
         if (mode_ == FP8Reuse && slots > 16) return GLUE_INCOMPATIBLE_INPUT_SIZE;
         out->indexSpaceRank = fuseSlots ? 2 : 3;
         out->indexSpaceGeometry[0] = q.maxSizes[1] * (horizontal ? 2 : 1);
@@ -249,6 +257,9 @@ tpc_lib_api::GlueCodeReturn DeepseekV41ExpertN256Gaudi2::GetGcDefinitions(
         for (unsigned i : {1u, 2u}) {
             const int words = i == 1 ? 8192 : 1024;
             map(out->inputTensorAccessPattern[i], 0, fuseSlots ? 1 : 2, words, 0, words - 1);
+            // Compact scale planes carry one channel code per output block.
+            if (i == 2 && compactScales)
+                map(out->inputTensorAccessPattern[i], 0, fuseSlots ? 1 : 2, 0, 0, s.maxSizes[0] - 1);
             // Runtime expert/channel selection is non-affine in the input;
             // the decoded output remains affine and sliceable along N.
             map(out->inputTensorAccessPattern[i], 1, 0, horizontal ? 0 : 1,
@@ -312,7 +323,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41ExpertN256Gaudi2::GetGcDefinitions(
         }
     }
     if (mode_ != ScaleReduce && mode_ != FP8Slots) {
-        const int routeTile = mode_ == FP8Reuse ? 2 : 1;
+        const int routeTile = mode_ == FP8Reuse || pairedSlots ? 2 : 1;
         map(out->outputTensorAccessPattern[0], 2, 1, routeTile, 0, routeTile - 1);
     }
     if (mode_ == FP8Horizontal) { n *= 2; slots /= 2; }
@@ -324,6 +335,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41ExpertN256Gaudi2::GetGcDefinitions(
     const bool prefetch16 = mode_ == FP8 && substitute_prefetch16_;
     const unsigned char* start = mode_ == FP8Horizontal ? &_binary___deepseek_v41_expert_n256_horizontal_fp8_gaudi2_o_start :
         mode_ == FP8Reuse ? &_binary___deepseek_v41_expert_n256_reuse_fp8_gaudi2_o_start :
+        pairedSlots ? &_binary___deepseek_v41_expert_n256_pair2_fp8_gaudi2_o_start :
         mode_ == FP8Slots ? &_binary___deepseek_v41_expert_n256_slots_fp8_gaudi2_o_start :
         prefetch16 ? &_binary___deepseek_v41_expert_n256_prefetch16_fp8_gaudi2_o_start :
         mode_ == FP8 ? &_binary___deepseek_v41_expert_n256_fp8_gaudi2_o_start :
@@ -335,6 +347,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41ExpertN256Gaudi2::GetGcDefinitions(
                                &_binary___deepseek_v41_expert_n256_scale_gaudi2_o_start;
     const unsigned char* end = mode_ == FP8Horizontal ? &_binary___deepseek_v41_expert_n256_horizontal_fp8_gaudi2_o_end :
         mode_ == FP8Reuse ? &_binary___deepseek_v41_expert_n256_reuse_fp8_gaudi2_o_end :
+        pairedSlots ? &_binary___deepseek_v41_expert_n256_pair2_fp8_gaudi2_o_end :
         mode_ == FP8Slots ? &_binary___deepseek_v41_expert_n256_slots_fp8_gaudi2_o_end :
         prefetch16 ? &_binary___deepseek_v41_expert_n256_prefetch16_fp8_gaudi2_o_end :
         mode_ == FP8 ? &_binary___deepseek_v41_expert_n256_fp8_gaudi2_o_end :

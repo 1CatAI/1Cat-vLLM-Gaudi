@@ -7,14 +7,14 @@ constexpr const char* names[]={"custom_op::custom_deepseek_v41_index_scores_gaud
     "custom_op::custom_deepseek_v41_index_threshold_gaudi2", "custom_op::custom_deepseek_v41_index_emit_gaudi2",
     "custom_op::custom_deepseek_v41_index_scores_decoded_gaudi2"};
 using Meta=habana::PartialOutputMetaDataVector;
-struct Params {int ratio,reindex,blocks;};
+struct Params {int ratio,reindex,blocks,local_heads;};
 constexpr auto reduce_schema = "custom_op::custom_deepseek_v41_index_reduce_bf16_gaudi2";
-struct ReduceParams {int ratio;};
+struct ReduceParams {int ratio,local_heads;};
 Meta reduce_metadata(const at::Stack& s) {
     const auto raw=s.at(0).toTensor(),weights=s.at(1).toTensor(),positions=s.at(2).toTensor();
-    const int64_t ratio=s.at(3).toInt(),batch=raw.size(0),rows=raw.size(2);
+    const int64_t ratio=s.at(3).toInt(),local_heads=s.at(4).toInt(),batch=raw.size(0),rows=raw.size(2);
     TORCH_CHECK((ratio==1||ratio==2)&&raw.scalar_type()==at::kBFloat16&&raw.dim()==3&&
-        batch>=1&&batch<=64&&raw.size(1)==32&&rows>=512&&rows<=16384&&rows%64==0&&
+        batch>=1&&batch<=64&&raw.size(1)==32&&local_heads>0&&32%local_heads==0&&rows>=512&&rows<=16384&&rows%64==0&&
         weights.scalar_type()==at::kBFloat16&&weights.sizes()==at::IntArrayRef({batch,32})&&
         positions.scalar_type()==at::kInt&&positions.sizes()==at::IntArrayRef({batch}),
         "Invalid index MME reduction contract");
@@ -37,6 +37,8 @@ Meta metadata(unsigned mode,const at::Stack& s) {
         const auto w=s.at(1).toTensor(),cache=s.at(2).toTensor(),pages=s.at(3).toTensor();
         const auto position=s.at(4).toTensor(),candidates=s.at(5).toTensor();
         const int64_t capacity=s.at(8).toInt();
+        const int64_t local_heads=s.at(9).toInt();
+        TORCH_CHECK(local_heads>0&&32%local_heads==0,"Invalid per-shard index head count");
         const int64_t batch=position.numel();
         const bool batched=pages.dim()==2;
         TORCH_CHECK(batch>=1&&batch<=64&&(!batched?batch==1:pages.size(0)==batch),"Invalid indexer request batch");
@@ -60,14 +62,15 @@ Meta metadata(unsigned mode,const at::Stack& s) {
         first.scalar_type()==at::kFloat&&(first.dim()==1||batched)&&first.size(-1)%64==0 &&
         position.scalar_type()==at::kInt&&position.sizes()==at::IntArrayRef({batch})&&
         (blocks==0||blocks==1),"Invalid index selection score/length contract");
-    if(mode==1)return {{at::kInt,batched?std::vector<int64_t>{batch,50}:std::vector<int64_t>{50}}};
+    const int64_t stats_width=50+((first.size(-1)+127)/128)*8;
+    if(mode==1)return {{at::kInt,batched?std::vector<int64_t>{batch,stats_width}:std::vector<int64_t>{stats_width}}};
     const auto candidates=s.at(2).toTensor();
     TORCH_CHECK(candidates.scalar_type()==at::kInt&&candidates.sizes()==at::IntArrayRef({batch,2048}),
                 "Invalid index selection candidates");
     if(mode==2) {
         const auto stats=s.at(3).toTensor();
         TORCH_CHECK(stats.scalar_type()==at::kInt&&
-            stats.sizes()==(batched?std::vector<int64_t>{batch,50}:std::vector<int64_t>{50}),
+            stats.sizes()==(batched?std::vector<int64_t>{batch,stats_width}:std::vector<int64_t>{stats_width}),
             "Invalid index selection metadata");
     }
     return {{at::kInt,{batch,blocks?2048:512}}};
@@ -76,13 +79,15 @@ const bool registered=[] {
     for(unsigned mode=0;mode<4;++mode)habana::custom_op::registerUserCustomOp(names[mode],names[mode]+11,
         [mode](const at::Stack& s){return metadata(mode,s);},
         [mode](const at::Stack& s,size_t& bytes)->std::shared_ptr<void> {
-            const unsigned base=(mode==0||mode==3)?6:mode==1?2:4;bytes=sizeof(Params);
+            const bool score_mode=mode==0||mode==3;
+            const unsigned base=score_mode?6:mode==1?2:4;
+            bytes=score_mode?sizeof(Params):3*sizeof(int);
             return std::make_shared<Params>(Params{int(s.at(base).toInt()),int(s.at(base+1).toInt()),
-                (mode==0||mode==3)?0:int(s.at(base+2).toInt())});
+                score_mode?0:int(s.at(base+2).toInt()),score_mode?int(s.at(9).toInt()):16});
         });
     habana::custom_op::registerUserCustomOp(reduce_schema,reduce_schema+11,reduce_metadata,
         [](const at::Stack& s,size_t& bytes)->std::shared_ptr<void> {
-            bytes=sizeof(ReduceParams);return std::make_shared<ReduceParams>(ReduceParams{int(s.at(3).toInt())});
+            bytes=sizeof(ReduceParams);return std::make_shared<ReduceParams>(ReduceParams{int(s.at(3).toInt()),int(s.at(4).toInt())});
         });
     return true;
 }();
@@ -95,12 +100,12 @@ template<bool Fake,unsigned Mode> std::vector<at::Tensor> execute(const at::Stac
     return descriptor.execute(s);
 }
 template<bool Fake> std::tuple<at::Tensor,at::Tensor> score(const at::Tensor& q,const at::Tensor& w,const at::Tensor& cache,
-    const at::Tensor& pages,const at::Tensor& pos,const at::Tensor& candidates,int64_t ratio,int64_t reindex,int64_t capacity) {
-    auto out=execute<Fake,0>({q,w,cache,pages,pos,candidates,ratio,reindex,capacity});return {out[0],out[1]};
+    const at::Tensor& pages,const at::Tensor& pos,const at::Tensor& candidates,int64_t ratio,int64_t reindex,int64_t capacity,int64_t local_heads) {
+    auto out=execute<Fake,0>({q,w,cache,pages,pos,candidates,ratio,reindex,capacity,local_heads});return {out[0],out[1]};
 }
 template<bool Fake> std::tuple<at::Tensor,at::Tensor> score_decoded(const at::Tensor& q,const at::Tensor& w,const at::Tensor& cache,
-    const at::Tensor& pages,const at::Tensor& pos,const at::Tensor& candidates,int64_t ratio,int64_t reindex,int64_t capacity) {
-    auto out=execute<Fake,3>({q,w,cache,pages,pos,candidates,ratio,reindex,capacity});return {out[0],out[1]};
+    const at::Tensor& pages,const at::Tensor& pos,const at::Tensor& candidates,int64_t ratio,int64_t reindex,int64_t capacity,int64_t local_heads) {
+    auto out=execute<Fake,3>({q,w,cache,pages,pos,candidates,ratio,reindex,capacity,local_heads});return {out[0],out[1]};
 }
 template<bool Fake> at::Tensor threshold(const at::Tensor& scores,const at::Tensor& pos,int64_t ratio,int64_t reindex,int64_t blocks) {
     return execute<Fake,1>({scores,pos,ratio,reindex,blocks})[0];
@@ -110,20 +115,20 @@ template<bool Fake> at::Tensor emit(const at::Tensor& scores,const at::Tensor& p
     return execute<Fake,2>({scores,pos,candidates,stats,ratio,reindex,blocks})[0];
 }
 template<bool Fake> at::Tensor reduce(const at::Tensor& raw,const at::Tensor& weights,
-                                      const at::Tensor& positions,int64_t ratio) {
-    const auto meta=reduce_metadata({raw,weights,positions,ratio});
+                                      const at::Tensor& positions,int64_t ratio,int64_t local_heads) {
+    const auto meta=reduce_metadata({raw,weights,positions,ratio,local_heads});
     if(Fake)return at::empty(meta[0].shape,raw.options().dtype(at::kFloat));
     TORCH_CHECK(registered&&raw.device().type()==at::kHPU);
     auto descriptor=habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(reduce_schema);
-    return descriptor.execute({raw,weights,positions,ratio}).at(0);
+    return descriptor.execute({raw,weights,positions,ratio,local_heads}).at(0);
 }
 }
 TORCH_LIBRARY_FRAGMENT(custom_op,m) {
-    m.def("custom_deepseek_v41_index_scores_gaudi2(Tensor query, Tensor weights, Tensor cache, Tensor pages, Tensor position, Tensor candidates, int ratio, int reindex, int capacity) -> (Tensor, Tensor)");
-    m.def("custom_deepseek_v41_index_scores_decoded_gaudi2(Tensor query, Tensor weights, Tensor cache, Tensor pages, Tensor position, Tensor candidates, int ratio, int reindex, int capacity) -> (Tensor, Tensor)");
+    m.def("custom_deepseek_v41_index_scores_gaudi2(Tensor query, Tensor weights, Tensor cache, Tensor pages, Tensor position, Tensor candidates, int ratio, int reindex, int capacity, int local_heads=16) -> (Tensor, Tensor)");
+    m.def("custom_deepseek_v41_index_scores_decoded_gaudi2(Tensor query, Tensor weights, Tensor cache, Tensor pages, Tensor position, Tensor candidates, int ratio, int reindex, int capacity, int local_heads=16) -> (Tensor, Tensor)");
     m.def("custom_deepseek_v41_index_threshold_gaudi2(Tensor scores, Tensor position, int ratio, int reindex, int blocks) -> Tensor");
     m.def("custom_deepseek_v41_index_emit_gaudi2(Tensor scores, Tensor position, Tensor candidates, Tensor metadata, int ratio, int reindex, int blocks) -> Tensor");
-    m.def("custom_deepseek_v41_index_reduce_bf16_gaudi2(Tensor raw_scores, Tensor weights, Tensor positions, int ratio) -> Tensor");
+    m.def("custom_deepseek_v41_index_reduce_bf16_gaudi2(Tensor raw_scores, Tensor weights, Tensor positions, int ratio, int local_heads=16) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(custom_op,HPU,m) {
     m.impl("custom_deepseek_v41_index_scores_gaudi2",score<false>);

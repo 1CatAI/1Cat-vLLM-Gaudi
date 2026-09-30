@@ -39,7 +39,10 @@ class NativeTp2GraphProbe : public std::enable_shared_from_this<NativeTp2GraphPr
     TORCH_CHECK(weight_.numel() == 5120 && weight_.scalar_type() == at::kBFloat16 &&
                     weight_.is_contiguous() && weight_.device() == input_.device(),
                 "Native TP2 graph probe weight mismatch");
-    TORCH_CHECK(tp2ExchangeEnabled(), "Native TP2 graph probe requires the dedicated TP2 exchange algorithm");
+    tp4_ = group->getSize() == 4;
+    TORCH_CHECK(tp4_ || group->getSize() == 2, "Native graph probe requires two or four ranks");
+    if (tp4_) RuntimeApis::get().requireTp4();
+    else TORCH_CHECK(tp2ExchangeEnabled(), "Native TP2 graph probe requires the dedicated TP2 exchange algorithm");
 
     communicator_ = group->lowLatencyCommunicator();
     TORCH_CHECK(communicator_, "Native TP2 graph probe communicator is not initialized");
@@ -88,12 +91,19 @@ class NativeTp2GraphProbe : public std::enable_shared_from_this<NativeTp2GraphPr
     device.add_wait_events_on_stream(input_storage_, stream);
     const auto& address = *resources_->get_address_lock();
     pre_recipe_ = fusedRecipeCache().get(input_.numel(), input_.size(-1), epsilon_, false);
-    post_recipe_ = fusedRecipeCache().get(input_.numel(), input_.size(-1), epsilon_, true);
+    post_recipe_ = fusedRecipeCache().get(input_.numel(), input_.size(-1), epsilon_, !tp4_);
     launchFusedRecipe(stream_, 0,
                       {address.at(0), address.at(1), address.at(2), address.at(3), address.at(4), address.at(5)},
                       input_.numel(), input_.size(-1), epsilon_, false, pre_recipe_);
-    runFusedAllReduceNorm(communicator_, pre_normalized_, residual_, weight_, peer_,
-                         output_normalized_, output_residual_, output_inverse_, epsilon_, 0, post_recipe_);
+    if (tp4_) {
+      runTp2ExchangePeer(communicator_, pre_normalized_, peer_, 0, true, false);
+      launchFusedRecipe(stream_, 0,
+                        {address.at(6), address.at(1), address.at(2), address.at(7), address.at(8), address.at(9)},
+                        input_.numel(), input_.size(-1), epsilon_, false, post_recipe_);
+    } else {
+      runFusedAllReduceNorm(communicator_, pre_normalized_, residual_, weight_, peer_,
+                           output_normalized_, output_residual_, output_inverse_, epsilon_, 0, post_recipe_);
+    }
     checkSynapse(synStreamSynchronize(stream_), "synStreamSynchronize(unscored reference)");
   }
 
@@ -115,16 +125,26 @@ class NativeTp2GraphProbe : public std::enable_shared_from_this<NativeTp2GraphPr
                         input_.numel(), input_.size(-1), epsilon_, false, pre_recipe_);
 
       constexpr int exchange_mode = 1;
-      const hcclResult_t create = api.hcl_create(
+      const hcclResult_t create = (tp4_ ? api.hcl_tp4_create : api.hcl_create)(
           reinterpret_cast<const void*>(address.at(4)), reinterpret_cast<void*>(address.at(6)), input_.numel(),
-          hcclBfloat16, hcclSum, *(communicator_->GetHcclHandle()), stream_, exchange_mode, &hcl_graph_);
+          hcclBfloat16, hcclSum, *(communicator_->GetHcclHandle()), stream_, tp4_ ? 0 : exchange_mode, &hcl_graph_);
       TORCH_CHECK(create == hcclSuccess, "hcclTp2NativeGraphCreate(probe) failed: ", create);
       TORCH_CHECK(api.hcl_capture(hcl_graph_) == hcclSuccess, "hcclTp2NativeGraphCapture(probe) failed");
 
-      post_recipe_ = fusedRecipeCache().get(input_.numel(), input_.size(-1), epsilon_, true);
-      launchFusedRecipe(stream_, address.at(4),
+      if (tp4_) {
+        hcl_rs_graph_ = hcl_graph_;
+        hcl_graph_ = nullptr;
+        TORCH_CHECK(api.hcl_tp4_create(
+            reinterpret_cast<const void*>(address.at(6)), reinterpret_cast<void*>(address.at(6)), input_.numel(),
+            hcclBfloat16, hcclSum, *(communicator_->GetHcclHandle()), stream_, 1, &hcl_graph_) == hcclSuccess,
+            "hcclTp4NativeGraphCreate(AllGather probe) failed");
+        TORCH_CHECK(api.hcl_capture(hcl_graph_) == hcclSuccess, "hcclTp4NativeGraphCapture(AllGather probe) failed");
+      }
+
+      post_recipe_ = fusedRecipeCache().get(input_.numel(), input_.size(-1), epsilon_, !tp4_);
+      launchFusedRecipe(stream_, tp4_ ? 0 : address.at(4),
                         {address.at(6), address.at(1), address.at(2), address.at(7), address.at(8), address.at(9)},
-                        input_.numel(), input_.size(-1), epsilon_, true, post_recipe_);
+                        input_.numel(), input_.size(-1), epsilon_, !tp4_, post_recipe_);
       checkSynapse(api.syn_end_capture(syn_graph_), "synNativeComputeGraphEndCapture(probe)");
       syn_capture_active_ = false;
 
@@ -152,14 +172,15 @@ class NativeTp2GraphProbe : public std::enable_shared_from_this<NativeTp2GraphPr
       hcl_stream_ccb_bytes_ = hcl_info.streamCcbBytes;
       checkSynapse(synStreamSynchronize(stream_), "synStreamSynchronize(probe capture)");
       const char* batch_mode = std::getenv("HCL_TP2_NATIVE_BATCH");
-      if (jointPlanEnabled() || (batch_mode && std::strcmp(batch_mode, "1") == 0)) {
-        TORCH_CHECK(api.hcl_batch_create(&hcl_graph_, 1, &hcl_batch_) == hcclSuccess,
+      if (tp4_ || jointPlanEnabled() || (batch_mode && std::strcmp(batch_mode, "1") == 0)) {
+        const RuntimeApis::HclGraph phases[] = {hcl_rs_graph_, hcl_graph_};
+        TORCH_CHECK(api.hcl_batch_create(tp4_ ? phases : &hcl_graph_, tp4_ ? 2 : 1, &hcl_batch_) == hcclSuccess,
                     "hcclTp2NativeBatchCreate(probe) failed");
       }
       if (jointPlanEnabled()) {
         api.requirePlan();
-        const uint32_t consumer = 1;
-        checkSynapse(api.syn_prepare_plan(syn_graph_, &consumer, 1, hcl_info.completion.longSoIndex,
+        const uint32_t consumers[] = {1, 1};
+        checkSynapse(api.syn_prepare_plan(syn_graph_, consumers, tp4_ ? 2 : 1, hcl_info.completion.longSoIndex,
                                           replayNicBatch, hcl_batch_),
                      "synNativeComputeGraphPreparePlan(probe)");
         joint_plan_ = true;
@@ -178,6 +199,10 @@ class NativeTp2GraphProbe : public std::enable_shared_from_this<NativeTp2GraphPr
       if (hcl_graph_ != nullptr) {
         api.hcl_destroy(hcl_graph_);
         hcl_graph_ = nullptr;
+      }
+      if (hcl_rs_graph_ != nullptr) {
+        api.hcl_destroy(hcl_rs_graph_);
+        hcl_rs_graph_ = nullptr;
       }
       if (syn_graph_ != nullptr) {
         api.syn_destroy(syn_graph_);
@@ -218,14 +243,17 @@ class NativeTp2GraphProbe : public std::enable_shared_from_this<NativeTp2GraphPr
       const char* compare_prepared = std::getenv("HCL_TP2_NATIVE_COMPARE_PREPARED");
       const bool use_prepared = compare_prepared != nullptr && std::strcmp(compare_prepared, "1") == 0;
       TORCH_CHECK(!use_prepared || !hcl_batch_, "Prepared control cannot share a native batch communicator");
+      const SyncInfo dependencies[] = {first_compute, first_compute};
+      SyncInfo completions[2];
       const hcclResult_t hcl_status = hcl_batch_
-          ? api.hcl_batch_replay(hcl_batch_, &first_compute, 1, &collective)
+          ? api.hcl_batch_replay(hcl_batch_, dependencies, tp4_ ? 2 : 1, completions)
           : use_prepared
           ? api.hcl_replay_prepared(hcl_graph_, &first_compute, &collective)
           : api.hcl_stage(hcl_graph_, &first_compute, &collective);
       TORCH_CHECK(hcl_status == hcclSuccess,
                   use_prepared ? "hcclTp2NativeGraphReplayPrepared(probe) failed"
                                : "hcclTp2NativeGraphStage(probe) failed");
+      if (hcl_batch_) collective = completions[tp4_ ? 1 : 0];
       checkSynapse(api.syn_replay_segment(syn_graph_, 1, &collective, true, &final_compute),
                    "synNativeComputeGraphReplaySegment(probe post)");
       if (!use_prepared && !hcl_batch_) {
@@ -296,6 +324,11 @@ class NativeTp2GraphProbe : public std::enable_shared_from_this<NativeTp2GraphPr
       hcl_status = api.hcl_destroy(hcl_graph_);
       hcl_graph_ = nullptr;
     }
+    if (hcl_rs_graph_ != nullptr) {
+      const auto rs_status = api.hcl_destroy(hcl_rs_graph_);
+      if (hcl_status == hcclSuccess) hcl_status = rs_status;
+      hcl_rs_graph_ = nullptr;
+    }
     synStatus syn_status = synSuccess;
     if (syn_graph_ != nullptr) {
       syn_status = api.syn_destroy(syn_graph_);
@@ -317,10 +350,12 @@ class NativeTp2GraphProbe : public std::enable_shared_from_this<NativeTp2GraphPr
   std::shared_ptr<habana::HcclCommunicator> communicator_;
   RuntimeApis::SynGraph syn_graph_ = nullptr;
   RuntimeApis::HclGraph hcl_graph_ = nullptr;
+  RuntimeApis::HclGraph hcl_rs_graph_ = nullptr;
   RuntimeApis::HclBatch hcl_batch_ = nullptr;
   std::array<uint64_t, 2> last_execution_timing_{};
   std::array<uint64_t, 12> joint_statistics_{};
   bool joint_plan_ = false;
+  bool tp4_ = false;
   uint64_t batch_replay_count_ = 0;
   uint64_t first_compute_target_ = 0, last_compute_target_ = 0;
   bool syn_capture_active_ = false;

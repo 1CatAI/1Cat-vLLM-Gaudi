@@ -151,9 +151,8 @@ _SIDECARS = {
     "engram_fp8": ("VLLM_HPU_DSV41_ENGRAM_FP8", "VLLM_HPU_DSV41_ENGRAM_FP8_SIDECAR"),
 }
 
-# TP4 uses compressed N256 experts, fused FP8 decode and bounded grouped
-# prefill. Compute-only plans and host staging use the four-rank geometry;
-# TP2 peer replay and PP transport remain separate topology-specific paths.
+# Prepared N256 storage retains its qualified prefill and expert defaults.
+# Decode computation and replay inherit the shared C1 profile below.
 _TP4_FASTPATH_DEFAULTS = {
     "VLLM_HPU_DSV41_PREPARED_SHARDS": "1",
     "VLLM_HPU_DSV41_ENGRAM_HOST_TABLE": "1",
@@ -188,137 +187,65 @@ _TP4_FASTPATH_DEFAULTS = {
 }
 
 # Shape-aware computation shared by TP2 and TP4. Communication stays HCCL.
-_TP4_FASTPATH_DEFAULTS.update({
-    "VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS": "1",
-    "VLLM_HPU_DSV41_ROUTER_TOP6": "1",
-    "VLLM_HPU_DSV41_TPC_MHC": "1",
-    "VLLM_HPU_DSV41_MHC_GATES_FUSED": "1",
-    "VLLM_HPU_DSV41_MHC_CONTROL_RRMS": "1",
-    "VLLM_HPU_DSV41_SHARED_GATE_UP": "1",
-    "VLLM_HPU_DSV41_WO_A_FP8": "1",
-    "VLLM_HPU_DSV41_WOA_OUTPUT_ROUNDTRIP": "1",
-    "VLLM_HPU_DSV41_ATTN_DENSE_FP8": "1",
-    "VLLM_HPU_DSV41_ENGRAM_FP8": "1",
-    "VLLM_HPU_DSV41_NATIVE_ROPE": "1",
-    "VLLM_HPU_DSV41_Q_SCALE_ROPE": "1",
-    "VLLM_HPU_DSV41_QKV_FUSED_INPUT": "1",
-    "VLLM_HPU_DSV41_ATTN_FUSED_NORM": "1",
-    "VLLM_HPU_DSV41_COMPRESSOR_FUSED_INPUT": "1",
-    "VLLM_HPU_DSV41_MLA_MME": "1",
-    "VLLM_HPU_DSV41_PAGED_SELECTED_KV": "1",
-    "VLLM_HPU_DSV41_SHARED_PREFIX_KV": "1",
-    "VLLM_HPU_DSV41_FUSED_PREFIX_LAYOUT": "1",
-    "VLLM_HPU_DSV41_NATIVE_KV_PACK": "1",
-    "VLLM_HPU_DSV41_PAGED_DECODED_KV_STATE": "1",
-    "VLLM_HPU_DSV41_PREFILL_COMPACT_CANDIDATES": "1",
-    "VLLM_HPU_DSV41_PREFILL_KV_REUSE": "1",
-    "VLLM_HPU_DSV41_PREFILL_REINDEX_REUSE": "1",
-    "VLLM_HPU_DSV41_FLASHINFER_PREFILL": "1",
-    "VLLM_HPU_DSV41_PREFILL_INDEX_MME": "1",
-    "VLLM_HPU_DSV41_PREFILL_INDEX_SHARED": "1",
-    "VLLM_HPU_DSV41_PREFILL_INDEX_SRAM": "1",
-    "VLLM_HPU_DSV41_PREFILL_REINDEX_SRAM": "1",
-    "VLLM_HPU_DSV41_PREFILL_INDEX_QUERY_TP": "1",
-    "VLLM_HPU_DSV41_PREFILL_CANDIDATE_GATHER": "1",
-    "VLLM_HPU_DSV41_PREFILL_REGIONS": "1",
-    "VLLM_HPU_DSV41_PREFILL_MHC_INPUT": "1",
-    "VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT": "1",
-    "VLLM_HPU_DSV41_PREFILL_ROPE": "1",
-    "VLLM_HPU_DSV41_PREFILL_NATIVE_NORM": "1",
-    "VLLM_HPU_DSV41_PREFILL_Q_PROJECTION": "1",
-    "VLLM_HPU_DSV41_PREFILL_OUTPUT_PROJECTION": "1",
-    "VLLM_HPU_DSV41_PREFILL_MLA_ROWS": "512",
-})
-
-_TP4_FORCE_DISABLED = (
-    "VLLM_HPU_DSV41_PREFILL_MXFP4",
-    "VLLM_HPU_DSV41_FP8_DECODE",
-    "VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE",
-    "VLLM_HPU_DSV41_SHARED_C6_EXPERTS",
-    "VLLM_HPU_DSV41_Q_SCALE_ROPE",
-    "VLLM_HPU_DSV41_OUTPUT_GEMM_LAYOUT",
-    "VLLM_HPU_DSV41_PRETRANSPOSE_ATTN",
-    "VLLM_HPU_DSV41_MHC_SCHEDULE",
-    "VLLM_HPU_DSV41_TILED_EXPERT_DECODE",
-    "VLLM_HPU_DSV41_W13_N512",
-    "VLLM_HPU_DSV41_PACKED_PP",
-    "VLLM_HPU_DSV41_NATIVE_PP_COPY",
-    "VLLM_HPU_DSV41_DEVICE_COMMIT",
-    "VLLM_HPU_DSV41_PREFILL_PP_WAVEFRONT",
-    "VLLM_HPU_DSV41_FUSED_STAGE_IO",
-    "VLLM_HPU_DSV41_BATCHED_INPUT_STAGING",
-    "VLLM_HPU_DSV41_TP_MHC_OVERLAP",
-    "VLLM_HPU_DSV41_GRAPH_REPLAY",
-    "VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH",
-    "VLLM_HPU_DSV41_V2",
-    "VLLM_USE_V2_MODEL_RUNNER",
-    "VLLM_HPU_TP2_NATIVE_JOINT_PLAN",
-    "VLLM_HPU_TP2_PREPARED_COMM",
-    "VLLM_HPU_TP2_STATIC_GROUP_PLAN",
-    "VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX",
-    "VLLM_HPU_DSV41_V2_DEVICE_ENGRAM",
-    "VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT",
-    "VLLM_HPU_DSV41_ENGRAM_NATIVE_C1",
-    "VLLM_HPU_DSV41_ENGRAM_C1_PACKET",
-    "VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT",
-    "VLLM_HPU_DSV41_EXPERT_N256",
-    "VLLM_HPU_DSV41_EXPERT_N256_FP8",
-    "VLLM_HPU_DSV41_EXPERT_K128",
-    "VLLM_HPU_DSV41_EXPERT_FUSED_QUANT",
-    "VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE",
-    "VLLM_HPU_DSV41_INDEXED_MOE",
-    "VLLM_HPU_DSV41_RUNTIME_INDEXER",
-    "VLLM_HPU_DSV41_PAGED_SELECTED_KV",
-    "VLLM_HPU_DSV41_SHARED_PREFIX_KV",
-    "VLLM_HPU_DSV41_FUSED_PREFIX_LAYOUT",
-    "VLLM_HPU_DSV41_NATIVE_KV_PACK",
-    "VLLM_HPU_DSV41_PAGED_DECODED_KV_STATE",
-    "VLLM_HPU_DSV41_DECODED_KV_STATE",
-    "VLLM_HPU_DSV41_C1_INDICES",
-    "VLLM_HPU_DSV41_SELECTED_VALID_ONLY",
-    "VLLM_HPU_DSV41_PACKED_ATTENTION",
-    "VLLM_HPU_DSV41_BOUNDED_ATTENTION",
-    "VLLM_HPU_DSV41_SWA_PACK_WRITE",
-    "VLLM_HPU_DSV41_FP4_CACHE_WRITE",
-    "VLLM_HPU_DSV41_NATIVE_ROPE",
-    "VLLM_HPU_DSV41_PREFILL_GROUPED",
-    "VLLM_HPU_DSV41_PREFILL_NATIVE_PLAN",
-    "VLLM_HPU_DSV41_PREFILL_INDEX_MME",
-    "VLLM_HPU_DSV41_PREFILL_INDEX_SHARED",
-    "VLLM_HPU_DSV41_PREFILL_INDEX_SRAM",
-    "VLLM_HPU_DSV41_PREFILL_REINDEX_SRAM",
-    "VLLM_HPU_DSV41_PREFILL_INDEX_QUERY_TP",
-    "VLLM_HPU_DSV41_PREFILL_Q_PROJECTION",
-    "VLLM_HPU_DSV41_PREFILL_OUTPUT_PROJECTION",
-    "VLLM_HPU_DSV41_PREFILL_ROPE",
-    "VLLM_HPU_DSV41_PREFILL_NATIVE_NORM",
-    "VLLM_HPU_DSV41_PREFILL_DEVICE_ROUTES",
-    "VLLM_HPU_DSV41_PREFILL_ROUTE_OUTPUT",
-    "VLLM_HPU_DSV41_PREFILL_MHC_INPUT",
-    "VLLM_HPU_DSV41_PREFILL_MHC_POST",
-    "VLLM_HPU_DSV41_COMPRESSOR_FUSED_INPUT",
-    "VLLM_HPU_DSV41_QKV_FUSED_INPUT",
-    "VLLM_HPU_DSV41_ATTN_FUSED_NORM",
-    "VLLM_HPU_DSV41_MLA_MME",
-    "VLLM_HPU_DSV41_MLA_BF16_PV",
-    "VLLM_HPU_DSV41_WO_A_FP8",
-    "VLLM_HPU_DSV41_ATTN_DENSE_FP8",
-    "VLLM_HPU_DSV41_ENGRAM_FP8",
-    "VLLM_HPU_DSV41_WOA_OUTPUT_ROUNDTRIP",
-    "VLLM_HPU_DSV41_PREPARED_OUTPUT",
-    "VLLM_HPU_DSV41_SHARED_GATE_UP",
-    "VLLM_HPU_DSV41_MHC_GATES_FUSED",
+_TP4_FASTPATH_DEFAULTS.update(
+    {
+        "VLLM_HPU_DSV41_V2": "1",
+        "VLLM_USE_V2_MODEL_RUNNER": "1",
+        "VLLM_HPU_DSV41_DIRECT_TOKEN_IDS": "1",
+        "VLLM_HPU_DSV41_FIXED_POSITIONS": "1",
+        "VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT": "1",
+        "VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX": "1",
+        "VLLM_HPU_DSV41_V2_DEVICE_ENGRAM": "1",
+        "VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS": "1",
+        "VLLM_HPU_DSV41_ROUTER_TOP6": "1",
+        "VLLM_HPU_DSV41_TPC_MHC": "1",
+        "VLLM_HPU_DSV41_MHC_GATES_FUSED": "1",
+        "VLLM_HPU_DSV41_MHC_CONTROL_RRMS": "1",
+        "VLLM_HPU_DSV41_SHARED_GATE_UP": "1",
+        "VLLM_HPU_DSV41_WO_A_FP8": "1",
+        "VLLM_HPU_DSV41_WOA_OUTPUT_ROUNDTRIP": "1",
+        "VLLM_HPU_DSV41_ATTN_DENSE_FP8": "1",
+        "VLLM_HPU_DSV41_ENGRAM_FP8": "1",
+        "VLLM_HPU_DSV41_NATIVE_ROPE": "1",
+        "VLLM_HPU_DSV41_Q_SCALE_ROPE": "1",
+        "VLLM_HPU_DSV41_QKV_FUSED_INPUT": "1",
+        "VLLM_HPU_DSV41_ATTN_FUSED_NORM": "1",
+        "VLLM_HPU_DSV41_COMPRESSOR_FUSED_INPUT": "1",
+        "VLLM_HPU_DSV41_MLA_MME": "1",
+        "VLLM_HPU_DSV41_PAGED_SELECTED_KV": "1",
+        "VLLM_HPU_DSV41_SHARED_PREFIX_KV": "1",
+        "VLLM_HPU_DSV41_FUSED_PREFIX_LAYOUT": "1",
+        "VLLM_HPU_DSV41_NATIVE_KV_PACK": "1",
+        "VLLM_HPU_DSV41_PAGED_DECODED_KV_STATE": "1",
+        "VLLM_HPU_DSV41_PREFILL_COMPACT_CANDIDATES": "1",
+        "VLLM_HPU_DSV41_PREFILL_KV_REUSE": "1",
+        "VLLM_HPU_DSV41_PREFILL_REINDEX_REUSE": "1",
+        "VLLM_HPU_DSV41_FLASHINFER_PREFILL": "1",
+        "VLLM_HPU_DSV41_PREFILL_INDEX_MME": "1",
+        "VLLM_HPU_DSV41_PREFILL_INDEX_SHARED": "1",
+        "VLLM_HPU_DSV41_PREFILL_INDEX_SRAM": "1",
+        "VLLM_HPU_DSV41_PREFILL_REINDEX_SRAM": "1",
+        "VLLM_HPU_DSV41_PREFILL_INDEX_QUERY_TP": "1",
+        "VLLM_HPU_DSV41_PREFILL_CANDIDATE_GATHER": "1",
+        "VLLM_HPU_DSV41_PREFILL_REGIONS": "1",
+        "VLLM_HPU_DSV41_PREFILL_MHC_INPUT": "1",
+        "VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT": "1",
+        "VLLM_HPU_DSV41_PREFILL_ROPE": "1",
+        "VLLM_HPU_DSV41_PREFILL_NATIVE_NORM": "1",
+        "VLLM_HPU_DSV41_PREFILL_Q_PROJECTION": "1",
+        "VLLM_HPU_DSV41_PREFILL_OUTPUT_PROJECTION": "1",
+        "VLLM_HPU_DSV41_PREFILL_MLA_ROWS": "512",
+    }
 )
 
-# An inherited TP2 launch environment must not activate dependent fragments
-# of that profile after their parent path has been disabled for TP4.
-_TP4_FORCE_DISABLED = tuple(
-    sorted((set(_TP4_FORCE_DISABLED) | {
-        key
-        for profile in (_C1_FASTPATH_DEFAULTS, _NUMERIC_FASTPATH_DEFAULTS, _PREFILL_MOE_DEFAULTS)
-        for key, value in profile.items() if value == "1" and key not in _TP4_FASTPATH_DEFAULTS
-    }) - {key
-          for key, value in _TP4_FASTPATH_DEFAULTS.items() if value == "1"}))
+# A TP-only stage inherits the qualified C1 compute and replay defaults.
+# The three exclusions require a pipeline peer, absent when PP has one rank.
+_TP4_FASTPATH_DEFAULTS = {**_C1_FASTPATH_DEFAULTS, **_NUMERIC_FASTPATH_DEFAULTS, **_TP4_FASTPATH_DEFAULTS}
+_PIPELINE_ONLY_FASTPATHS = (
+    "VLLM_HPU_DSV41_PACKED_PP",
+    "VLLM_HPU_DSV41_NATIVE_PP_COPY",
+    "VLLM_HPU_DSV41_PREFILL_PP_WAVEFRONT",
+)
 
 
 def _enabled(value):
@@ -345,19 +272,20 @@ def prepare_default_fastpaths(model, sidecars=None, tensor_parallel_size=4, pipe
     if (tensor_parallel_size, pipeline_parallel_size) == (4, 1):
         for key, value in _TP4_FASTPATH_DEFAULTS.items():
             os.environ.setdefault(key, value)
-        for key in _TP4_FORCE_DISABLED:
-            os.environ[key] = "0"
     else:
         for key, value in _C1_FASTPATH_DEFAULTS.items():
             os.environ.setdefault(key, value)
         if _enabled(os.environ.get("VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS", "0")):
             for key, value in _NUMERIC_FASTPATH_DEFAULTS.items():
                 os.environ.setdefault(key, value)
+    if pipeline_parallel_size == 1:
+        for key in _PIPELINE_ONLY_FASTPATHS:
+            os.environ[key] = "0"
     # Prepared N256 weights select the qualified BF16 prompt implementation.
     # Profiles without this storage layout retain their existing dispatch.
     if any(
-            _enabled(os.environ.get(name, "0"))
-            for name in ("VLLM_HPU_DSV41_EXPERT_N256", "VLLM_HPU_DSV41_EXPERT_N256_FP8")):
+        _enabled(os.environ.get(name, "0")) for name in ("VLLM_HPU_DSV41_EXPERT_N256", "VLLM_HPU_DSV41_EXPERT_N256_FP8")
+    ):
         for key, value in _PREFILL_MOE_DEFAULTS.items():
             os.environ.setdefault(key, value)
     model = Path(model).resolve()
@@ -373,14 +301,16 @@ def prepare_default_fastpaths(model, sidecars=None, tensor_parallel_size=4, pipe
         if directory is None:
             raise RuntimeError(
                 f"Default V4.1 fast paths require the {name} sidecar; prepare {model / 'sidecars' / name} "
-                f"or disable {enabled_key}")
+                f"or disable {enabled_key}"
+            )
         os.environ[path_key] = str(directory)
 
 
 def prepare_native_libraries():
     configured_library = os.environ.get("VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR")
-    library_dir = (Path(configured_library).resolve() if configured_library else Path(__file__).resolve().parents[1] /
-                   "lib")
+    library_dir = (
+        Path(configured_library).resolve() if configured_library else Path(__file__).resolve().parents[1] / "lib"
+    )
     kernel = library_dir / "libdeepseek_v4_gaudi2_kernels.so"
     extensions = list(library_dir.glob("hpu_dsv4_sparse_attn_pt2*.so"))
     if not kernel.is_file() or len(extensions) != 1:
@@ -392,11 +322,14 @@ def prepare_native_libraries():
                 raise RuntimeError(f"V4.1 native binary differs from its build manifest: {library.name}")
         host_manifest = json.loads((library_dir / "deepseek_v41_build.json").read_text())
         hosts = list(library_dir.glob("dsv41_host_gather*.so"))
-        if (len(hosts) != 1 or host_manifest.get("host_gather_abi_version") != 1
-                or host_manifest.get("host_c1_abi_version") != 2
-                or host_manifest.get("host_gather_packed_output_version") != 1
-                or host_manifest.get("host_gather_profiling_version") != 1
-                or hashlib.sha256(hosts[0].read_bytes()).hexdigest() != host_manifest["binaries"].get(hosts[0].name)):
+        if (
+            len(hosts) != 1
+            or host_manifest.get("host_gather_abi_version") != 1
+            or host_manifest.get("host_c1_abi_version") != 2
+            or host_manifest.get("host_gather_packed_output_version") != 1
+            or host_manifest.get("host_gather_profiling_version") != 1
+            or hashlib.sha256(hosts[0].read_bytes()).hexdigest() != host_manifest["binaries"].get(hosts[0].name)
+        ):
             raise RuntimeError("V4.1 host gather differs from its isolated build manifest")
         # The worker imports this exact file through deepseek_v41_host after
         # the HPU environment is initialized and validates the live ABI there.
@@ -467,15 +400,15 @@ def main():
     settings_path = Path.home() / ".config/1cat-vllm/deepseek-v41.json"
     settings = json.loads(settings_path.read_text()) if settings_path.is_file() else {}
     leased_run = bool(os.environ.get("DSV41_RUN_EVIDENCE"))
-    runtime_profile = (os.environ.get("DSV41_RUNTIME_PROFILE") if leased_run else None)
+    runtime_profile = os.environ.get("DSV41_RUNTIME_PROFILE") if leased_run else None
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", nargs="?", default=settings.get("model"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--checkpoint-audit")
-    parser.add_argument("--n256-prepared-dir",
-                        type=Path,
-                        help="Runtime-layout expert cache from prepare_deepseek_v41_n256.py")
+    parser.add_argument(
+        "--n256-prepared-dir", type=Path, help="Runtime-layout expert cache from prepare_deepseek_v41_n256.py"
+    )
     parser.add_argument("--runtime-profile", default=runtime_profile or settings.get("runtime_profile"))
     parser.add_argument("--max-model-len", type=int, default=1048576)
     parser.add_argument("--max-num-seqs", type=int, default=32)
@@ -483,10 +416,12 @@ def main():
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--tensor-parallel-size", type=int, choices=(2, 4), default=4)
     parser.add_argument("--pipeline-parallel-size", type=int, choices=(1, 2), default=1)
-    parser.add_argument("--engram-residency",
-                        choices=("prefetch", "locked"),
-                        default=settings.get("engram_residency", "prefetch"),
-                        help="Keep the shared host tables locked for the service lifetime")
+    parser.add_argument(
+        "--engram-residency",
+        choices=("prefetch", "locked"),
+        default=settings.get("engram_residency", "prefetch"),
+        help="Keep the shared host tables locked for the service lifetime",
+    )
     parser.add_argument("--engram-host-budget-gib", type=int, default=224)
     v2 = parser.add_mutually_exclusive_group()
     v2.add_argument("--v2", dest="v2", action="store_true", help="Use the V2 HPU scheduling/completion adapter")
@@ -550,10 +485,7 @@ def main():
                 "DSV41_RUNTIME_PROFILE",
                 "PT_HPU_RECIPE_CACHE_CONFIG",
             )
-            launcher_values = ({
-                key: os.environ[key]
-                for key in launcher_keys if key in os.environ
-            } if leased_run else {})
+            launcher_values = {key: os.environ[key] for key in launcher_keys if key in os.environ} if leased_run else {}
             environment.update(settings.get("environment", {}))
             # A leased evidence run must use the exact profile it was
             # fingerprinted against.  The persistent user runtime file may
@@ -566,13 +498,17 @@ def main():
             environment.update(launcher_values)
             environment["DSV41_RUNTIME_PROFILE"] = str(profile_path)
             environment["DSV41_SERVING_RUNTIME"] = identity
-            os.execve(sys.executable, [sys.executable, "-m", "vllm_gaudi.entrypoints.deepseek_v41", *sys.argv[1:]],
-                      environment)
+            os.execve(
+                sys.executable,
+                [sys.executable, "-m", "vllm_gaudi.entrypoints.deepseek_v41", *sys.argv[1:]],
+                environment,
+            )
     # The evidence launcher already owns the module leases, NUMA affinity and
     # optional recipe cache. Acquiring them again here would either deadlock
     # on its locks or replace them with the ordinary installation defaults.
     if settings and not leased_run:
         from vllm_gaudi.entrypoints.serving_resources import prepare_serving_resources
+
         prepare_serving_resources(settings, args.model, extra)
     n256_directory = args.n256_prepared_dir or settings.get("n256_prepared_dir")
     if n256_directory:
@@ -588,12 +524,14 @@ def main():
         # legacy directory variable alone configures workers, not the API.
         extra += [
             "--profiler-config",
-            json.dumps({
-                "profiler": "torch",
-                "torch_profiler_dir": trace_dir,
-                "torch_profiler_with_stack": False,
-                "torch_profiler_record_shapes": True
-            })
+            json.dumps(
+                {
+                    "profiler": "torch",
+                    "torch_profiler_dir": trace_dir,
+                    "torch_profiler_with_stack": False,
+                    "torch_profiler_record_shapes": True,
+                }
+            ),
         ]
     if not any(value.startswith("--shutdown-timeout") for value in extra):
         # Native programs and host staging need normal worker teardown. The
@@ -604,26 +542,57 @@ def main():
     if not any(value.startswith("--served-model-name") for value in extra):
         extra += ["--served-model-name", "DeepSeek-V4.1-Flash"]
     from vllm_gaudi import envs as gaudi_envs
-    speculative = (["--speculative-config", '{"method":"dspark","num_speculative_tokens":5}']
-                   if gaudi_envs.VLLM_HPU_DSV41_DSPARK else [])
+
+    speculative = (
+        ["--speculative-config", '{"method":"dspark","num_speculative_tokens":5}']
+        if gaudi_envs.VLLM_HPU_DSV41_DSPARK
+        else []
+    )
     scheduling = "--async-scheduling" if gaudi_envs.VLLM_HPU_DSV41_V2 else "--no-async-scheduling"
-    prefix_caching = ([] if any(
-        value.split("=")[0] in ("--enable-prefix-caching", "--no-enable-prefix-caching")
-        for value in extra) else ["--no-enable-prefix-caching"])
-    if ("--enable-prefix-caching" in extra and not any(
-            value.split("=")[0] in ("--enable-prompt-tokens-details", "--no-enable-prompt-tokens-details")
-            for value in extra)):
+    prefix_caching = (
+        []
+        if any(value.split("=")[0] in ("--enable-prefix-caching", "--no-enable-prefix-caching") for value in extra)
+        else ["--no-enable-prefix-caching"]
+    )
+    if "--enable-prefix-caching" in extra and not any(
+        value.split("=")[0] in ("--enable-prompt-tokens-details", "--no-enable-prompt-tokens-details")
+        for value in extra
+    ):
         extra += ["--enable-prompt-tokens-details"]
     sys.argv = [
-        "vllm", "serve", args.model, "--host", args.host, "--port",
-        str(args.port), "--dtype", "bfloat16", "--max-model-len",
-        str(args.max_model_len), "--generation-config", "vllm", "--tensor-parallel-size",
-        str(args.tensor_parallel_size), "--pipeline-parallel-size",
-        str(args.pipeline_parallel_size), "--max-num-seqs",
-        str(args.max_num_seqs), "--max-num-batched-tokens",
-        str(args.max_num_batched_tokens), "--load-format", "dsv41_prepared", "--model-loader-extra-config",
-        json.dumps(loader), "--mm-encoder-tp-mode", "data", *prefix_caching, scheduling, "--block-size",
-        str(args.block_size), *speculative, *extra
+        "vllm",
+        "serve",
+        args.model,
+        "--host",
+        args.host,
+        "--port",
+        str(args.port),
+        "--dtype",
+        "bfloat16",
+        "--max-model-len",
+        str(args.max_model_len),
+        "--generation-config",
+        "vllm",
+        "--tensor-parallel-size",
+        str(args.tensor_parallel_size),
+        "--pipeline-parallel-size",
+        str(args.pipeline_parallel_size),
+        "--max-num-seqs",
+        str(args.max_num_seqs),
+        "--max-num-batched-tokens",
+        str(args.max_num_batched_tokens),
+        "--load-format",
+        "dsv41_prepared",
+        "--model-loader-extra-config",
+        json.dumps(loader),
+        "--mm-encoder-tp-mode",
+        "data",
+        *prefix_caching,
+        scheduling,
+        "--block-size",
+        str(args.block_size),
+        *speculative,
+        *extra,
     ]
     residency = None
     try:
@@ -633,14 +602,17 @@ def main():
             def report_ready(report):
                 if leased_run:
                     (Path(os.environ["DSV41_RUN_EVIDENCE"]) / "engram-residency.json").write_text(
-                        json.dumps(report, indent=2))
+                        json.dumps(report, indent=2)
+                    )
                 print("Engram residency ready: " + json.dumps(report), flush=True)
 
-            residency = EngramDeviceGate(EngramResidency(table_regions(args.model),
-                                                         args.engram_host_budget_gib * 1024**3),
-                                         on_ready=report_ready,
-                                         on_failure=lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
+            residency = EngramDeviceGate(
+                EngramResidency(table_regions(args.model), args.engram_host_budget_gib * 1024**3),
+                on_ready=report_ready,
+                on_failure=lambda: os.kill(os.getpid(), signal.SIGTERM),
+            ).start()
         from vllm.entrypoints.cli.main import main as serve
+
         serve()
     finally:
         if residency is not None:

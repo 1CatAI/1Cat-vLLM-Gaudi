@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU lifecycle tests; these do not qualify HPU event ordering or latency."""
+
 from types import SimpleNamespace
 
 import pytest
@@ -12,7 +13,6 @@ from vllm_gaudi.v1.worker.deepseek_v41_v2_runner import CompletionRecord, V41Asy
 
 
 class Done:
-
     def __init__(self):
         self.calls = 0
         self.ready = True
@@ -26,14 +26,17 @@ class Done:
 @pytest.mark.parametrize("batch_enabled", [False, True])
 def test_device_engram_abi_is_required_even_with_batch_capacity(monkeypatch, batch_enabled, tmp_path):
     from vllm_gaudi.ops import deepseek_v41_host as host
+
     monkeypatch.setattr(host, "host_native", lambda: SimpleNamespace(abi_version=1, c1_abi_version=1))
-    flags = dict(VLLM_HPU_DSV41_BATCH_DECODE=batch_enabled,
-                 VLLM_HPU_DSV41_V2_DEVICE_ENGRAM=True,
-                 VLLM_HPU_DSV41_ENGRAM_NATIVE_C1=True,
-                 VLLM_HPU_DSV41_ENGRAM_C1_PACKET=True,
-                 VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT=True,
-                 VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH=True,
-                 VLLM_HPU_DSV41_GRAPH_REPLAY=True)
+    flags = dict(
+        VLLM_HPU_DSV41_BATCH_DECODE=batch_enabled,
+        VLLM_HPU_DSV41_V2_DEVICE_ENGRAM=True,
+        VLLM_HPU_DSV41_ENGRAM_NATIVE_C1=True,
+        VLLM_HPU_DSV41_ENGRAM_C1_PACKET=True,
+        VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT=True,
+        VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH=True,
+        VLLM_HPU_DSV41_GRAPH_REPLAY=True,
+    )
     for key, value in flags.items():
         monkeypatch.setenv(key, "1" if value else "0")
     with pytest.raises(RuntimeError, match="Device Engram requires native host C1 ABI 2"):
@@ -43,15 +46,14 @@ def test_device_engram_abi_is_required_even_with_batch_capacity(monkeypatch, bat
 def fixture():
     runner = object.__new__(V41V2ModelRunner)
     runner.prefix_checkpoints = None
-    runner.requests = {"a": RequestState("a", [1], [], None, ([1], ), output=[10], num_computed_tokens=1)}
+    runner.requests = {"a": RequestState("a", [1], [], None, ([1],), output=[10], num_computed_tokens=1)}
     runner.active_request = "a"
     calls = []
     runner.model = SimpleNamespace(complete_step=lambda count: calls.append(("model", count)))
     token = torch.tensor([11], dtype=torch.int32)
-    runner.pp = SimpleNamespace(generation=2,
-                                commits=0,
-                                commit_token=token,
-                                complete_packet=lambda: calls.append(("packet", )))
+    runner.pp = SimpleNamespace(
+        generation=2, commits=0, commit_token=token, complete_packet=lambda: calls.append(("packet",))
+    )
     runner._next_input = None
     runner._input_committed = None
     runner._prefix_started = None
@@ -115,7 +117,7 @@ def test_output_thread_does_not_commit_worker_state():
 
     runner._consume_completion()
 
-    assert calls == [("packet", ), ("model", 1)]
+    assert calls == [("packet",), ("model", 1)]
     assert runner.requests["a"].output == [10, 11]
     assert runner.pp.commits == 1 and runner._completion is None
     assert runner._next_input[:2] == ("a", 2)
@@ -189,12 +191,13 @@ def test_v2_gate_requires_the_complete_segmented_device_contract(monkeypatch):
     }
     for key, value in values.items():
         monkeypatch.setenv(key, "1" if value else "0")
-    config = SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v41"),
-                                                          max_model_len=512),
-                             parallel_config=SimpleNamespace(tensor_parallel_size=2, pipeline_parallel_size=2),
-                             use_v2_model_runner=True,
-                             scheduler_config=SimpleNamespace(async_scheduling=True),
-                             speculative_config=None)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v41"), max_model_len=512),
+        parallel_config=SimpleNamespace(tensor_parallel_size=2, pipeline_parallel_size=2),
+        use_v2_model_runner=True,
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+        speculative_config=None,
+    )
     with pytest.raises(ValueError, match="Device Engram"):
         config_module.validate_v2(config)
     monkeypatch.setenv("VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT", "1")
@@ -223,8 +226,9 @@ def test_sample_submits_device_broadcast_and_copy_without_waiting(monkeypatch, l
         calls.append("copy")
         return value.clone(), done
 
-    monkeypatch.setattr(tp2_fused_ar_norm, "_resolve_runtime", lambda:
-                        (SimpleNamespace(copy_sampled_tokens_to_host=copy), None, None))
+    monkeypatch.setattr(
+        tp2_fused_ar_norm, "_resolve_runtime", lambda: (SimpleNamespace(copy_sampled_tokens_to_host=copy), None, None)
+    )
     selected = torch.tensor([[11]], dtype=torch.int32) if last else None
     runner.pending = (runner.requests["a"], 1, 1, 1, [], True, selected)
 
@@ -253,7 +257,7 @@ def test_early_input_commit_keeps_token_ownership_until_ready(monkeypatch):
         assert runner.pp.commits == 0 and runner._completion is record
     record.done.ready = True
     runner._consume_completion()
-    assert calls == [("model", 1), ("packet", )]
+    assert calls == [("model", 1), ("packet",)]
     assert runner.requests["a"].output == [10, 11]
     assert runner.audit["v2_early_input_commits"] == 1
 
@@ -267,9 +271,8 @@ def test_device_engram_precedes_prefix_and_host_token_wait(monkeypatch):
     runner.position_bank = SimpleNamespace(view=lambda start, count: torch.tensor([start], dtype=torch.int32))
 
     class OrderedDone:
-
         def synchronize(self):
-            calls.append(("token_wait", ))
+            calls.append(("token_wait",))
 
     runner.model = SimpleNamespace(
         complete_step=lambda count: calls.append(("model", count)),
@@ -311,7 +314,7 @@ def test_new_search_bucket_captures_complete_plan_before_segmenting(monkeypatch)
     runner._consume_completion(scheduled)
 
     assert ready == [2048]
-    assert calls == [("model", 1), ("packet", )]
+    assert calls == [("model", 1), ("packet",)]
     assert runner._prefix_started is None
     assert runner.audit["v2_prefix_bucket_captures"] == 1
 
@@ -344,8 +347,9 @@ def test_bounded_stage_does_not_need_a_paged_search_binding(monkeypatch):
     monkeypatch.setenv("VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX", "1")
     runner, _ = fixture()
     runner.pp.group = SimpleNamespace(is_first_rank=True)
-    runner.model = SimpleNamespace(decode_prefix_ready=lambda search: search == 512,
-                                   program=SimpleNamespace(length=512))
+    runner.model = SimpleNamespace(
+        decode_prefix_ready=lambda search: search == 512, program=SimpleNamespace(length=512)
+    )
     scheduled = SimpleNamespace(num_scheduled_tokens={"a": 1}, finished_req_ids=set(), scheduled_spec_decode_tokens={})
     assert runner._prefix_authorized(SimpleNamespace(request_id="a", start=10), scheduled)
 
@@ -356,10 +360,13 @@ def test_runtime_indexer_reuses_bound_prefix_across_history_boundaries(monkeypat
     runner, _ = fixture()
     runner.pp.group = SimpleNamespace(is_first_rank=True)
     from vllm_gaudi.v1.worker.deepseek_v41_runner import runtime_search_length
+
     queries = []
     bound = runtime_search_length(position + 1, 1, 1 << 20)
-    runner.model = SimpleNamespace(decode_prefix_ready=lambda search: queries.append(search) or True,
-                                   program=SimpleNamespace(length=1 << 20, search_length=bound, runtime_indexer=True))
+    runner.model = SimpleNamespace(
+        decode_prefix_ready=lambda search: queries.append(search) or True,
+        program=SimpleNamespace(length=1 << 20, search_length=bound, runtime_indexer=True),
+    )
     scheduled = SimpleNamespace(num_scheduled_tokens={"a": 1}, finished_req_ids=set(), scheduled_spec_decode_tokens={})
     assert runner._prefix_authorized(SimpleNamespace(request_id="a", start=position), scheduled)
     assert queries == [bound]
@@ -375,7 +382,6 @@ def test_device_engram_skips_only_matching_host_layer1(monkeypatch):
     monkeypatch.setenv("VLLM_HPU_DSV41_V2_DEVICE_ENGRAM", "1")
 
     class Host:
-
         def __init__(self, pending=None):
             self.pending = None
             self.device_pending = pending

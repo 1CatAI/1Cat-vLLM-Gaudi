@@ -18,6 +18,7 @@ struct NativeBufferRange {
 struct NativeDependencyNode {
   bool exchange = false;
   std::vector<NativeBufferRange> inputs, outputs;
+  uint32_t outputCopies = 1;
 };
 
 struct NativeCollectiveDependency {
@@ -86,7 +87,9 @@ inline std::vector<NativeCollectiveDependency> prepareNativeDependencies(
     const auto& node = nodes[i];
     if (!node.exchange) continue;
     if (node.inputs.size() != 1 || node.outputs.size() != 1 || !node.inputs[0].bytes ||
-        node.inputs[0].bytes != node.outputs[0].bytes || node.inputs[0].overlaps(node.outputs[0]))
+        !node.outputCopies || node.inputs[0].bytes > UINT64_MAX / node.outputCopies ||
+        node.inputs[0].bytes * node.outputCopies != node.outputs[0].bytes ||
+        node.inputs[0].overlaps(node.outputs[0]))
       throw std::invalid_argument("Native explicit dependency requires disjoint peer bindings");
     NativeCollectiveDependency dep;
     dep.input = node.inputs[0]; dep.output = node.outputs[0];

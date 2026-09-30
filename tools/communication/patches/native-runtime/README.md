@@ -1,4 +1,4 @@
-# Experimental native TP2 runtime
+# Experimental native TP2 and TP4 runtime
 
 These patches supply the native APIs required by the opt-in TP2 decoder graph.
 They include the matching compute program ownership, stream handoff, HCL command
@@ -31,6 +31,18 @@ Omit `--apply` to check only. The tool rejects a different base commit, patch
 fingerprint or dirty source checkout. The patch application does not build,
 install or replace any library.
 
+The HCL patch also contains the experimental four-rank ReduceScatter/AllGather
+replay stages. Each template restores the relative-rank NIC context: standalone
+AllGather sends from its input base, while the AllReduce AllGather phase sends
+its rank-owned slice. Completion-address validation includes relocations emitted
+by packet serializers, and short-monitor relocations follow their completion
+SOB across ring reuse. A TP4 phase's wrap template may contain fewer
+commands only when both complete templates independently validate and preserve
+their completion target deltas. The dedicated C1 entrypoint uses the shared
+stage-native replay for both supported TP geometries. The earlier TP4
+per-group replay remains a diagnostic path. Primitive correctness and timing
+alone do not establish whole-model performance.
+
 Build HCL with its bundled dependencies and SDK development libraries. Set
 `HCL_SRC_PKG_DIR` to its checkout and `HCL_LIB_DIR` to the SDK library directory;
 configure `hcl/src` into a separate CMake build directory. The patch makes
@@ -51,6 +63,23 @@ provide implemented APIs and layout corrections, not successful no-op stubs.
 Build Bridge using its upstream build instructions for the same PyTorch and
 Python installation. Keep its backend and HCCL Python binding together. With
 those private libraries selected for the new process, build the plugin extension:
+
+The Bridge patch also retains `aten::cat`'s axis in the eager operator cache
+key. Synapse constructs different node classes for FCD and non-FCD concat;
+changing parameters on a reused graph cannot change that class. Shape changes
+on the same axis still reuse the shape-agnostic graph. Do not disable the
+global shape-agnostic cache to work around this issue.
+
+For an existing, ABI-qualified frontend, build the isolated adapter with
+`tools/communication/build_eager_concat_cache_key.py`, passing the matching
+Bridge source, compilation database and frontend library. Select its private
+library using `LD_PRELOAD` in the runtime installation profile and retain the
+generated `build.json` alongside the profile's library fingerprints. This
+adapter forwards the original cache-key calculation and applies the same axis
+hash as the source patch. Omit it when rebuilding the patched frontend.
+Validate alternating concat axes and shapes with
+`tools/check_deepseek_v41_eager_concat.py`, then qualify the service with every
+prefill warmup bucket enabled.
 
 ```bash
 python tools/communication/build_tp2_fused_ar_norm_bridge.py \
@@ -94,9 +123,11 @@ before releasing resources. An error after state mutation terminates that
 execution without retrying another implementation. Counter rollover, queue
 wraparound and producer/consumer visibility are part of correctness.
 
-Ordinary V4 AllReduce nodes use a peer transfer followed by the original BF16
-addition in the compiled consumer. They do not use the Qwen residual/norm
-formula. Multiple independent transfers may share a compute consumer; every
+Ordinary V4 AllReduce nodes use peer transfers followed by addition in the
+compiled consumer. The two-rank path retains its original BF16 addition. Wider
+tensor-parallel groups sum the gathered shards in fixed rank order using FP32
+accumulation and restore the BF16 boundary. They do not use the Qwen
+residual/norm formula. Multiple independent transfers may share a compute consumer; every
 transfer retains its own completion wait and counter relocation. Contiguous
 reshape aliases retain their source storage range and are refreshed when
 external inputs are rebound.

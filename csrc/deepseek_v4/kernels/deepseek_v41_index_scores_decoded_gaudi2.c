@@ -11,7 +11,7 @@ static inline float64 round_bf16(float64 x) {
 }
 
 void main(tensor q, tensor weights, tensor cache, tensor pages, tensor positions,
-          tensor candidates, tensor scores, tensor block_scores, int ratio, int reindex) {
+          tensor candidates, tensor scores, tensor block_scores, int ratio, int reindex, int local_heads) {
     const int5 begin = get_index_space_offset(), end = begin + get_index_space_size();
     for (int request = begin[1]; request < end[1]; ++request) {
     const int visible = (s_i32_ld_g(gen_addr((int5){request}, positions)) + 1) / ratio;
@@ -38,21 +38,22 @@ void main(tensor q, tensor weights, tensor cache, tensor pages, tensor positions
                     const int page = s_i32_ld_g(gen_addr((int5){logical / page_rows,request},pages));
                     const int row = page * page_rows + logical % page_rows;
                     const bfloat128 key = index_key(cache, row);
-                    float64 partial[2] = {0,0};
-                    for (int shard = 0; shard < 2; ++shard) {
-                        for (int head = 0; head < 16; ++head) {
-                            const int h = shard * 16 + head;
+                    float64 reduced = 0;
+                    for (int first_head = 0; first_head < 32; first_head += local_heads) {
+                        float64 partial = 0;
+                        for (int head = 0; head < local_heads; ++head) {
+                            const int h = first_head + head;
                             const bfloat128 query = v_bf16_ld_tnsr_b((int5){0,h,request}, q);
                             const float128 product = v_bf16_mac_acc32_b(query,key,(float128){0},0);
                             float64 sum = v_f32_reduce_add(product.v1 + product.v2);
                             const float64 dot = round_bf16(v_f32_shuffle_b(sum,(uchar256)0x80,0,sum));
                             const bfloat w = s_bf16_ld_g(gen_addr((int5){h,request},weights));
                             const float wf = s_convert_bf16_to_f32(w,0);
-                            partial[shard] += round_bf16(v_f32_max_b(dot,0.0f) * wf);
+                            partial += round_bf16(v_f32_max_b(dot,0.0f) * wf);
                         }
-                        partial[shard] = round_bf16(partial[shard]);
+                        reduced += round_bf16(partial);
                     }
-                    score = round_bf16(partial[0] + partial[1]);
+                    score = round_bf16(reduced);
                 }
                 v_f32_st_tnsr_partial((int5){block*8+offset,request},scores,score,0,0);
                 maximum = v_f32_max_b(maximum,score);

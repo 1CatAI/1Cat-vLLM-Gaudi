@@ -165,16 +165,18 @@ def test_direct_engram_retains_exact_packed_views():
             capture_engram_inputs(invalid, direct=True)
 
 
-def test_device_engram_retains_decoded_and_late_inputs():
-    layer1 = torch.empty((1, 12, 256), dtype=torch.bfloat16)
-    layer14 = torch.empty((1, 12, 264), dtype=torch.uint8)
-    captured = capture_engram_inputs((layer1, layer14), direct=True, device_layer1=True)
+@pytest.mark.parametrize("tp_size", (2, 4))
+def test_device_engram_retains_decoded_and_late_inputs(tp_size):
+    heads = 24 // tp_size
+    layer1 = torch.empty((1, heads, 256), dtype=torch.bfloat16)
+    layer14 = torch.empty((1, heads, 264), dtype=torch.uint8)
+    captured = capture_engram_inputs((layer1, layer14), direct=True, device_layer1=True, local_heads=heads)
     assert captured[0] is layer1 and captured[1] is layer14
     invalid = ((layer1.to(torch.float32), layer14), (layer1[:, :, :255], layer14), (layer1, layer14.to(torch.int8)),
                (layer1, layer14[:, :, :263]), (layer1.transpose(1, 2), layer14))
     for values in invalid:
         with pytest.raises(ValueError, match="Device Engram"):
-            capture_engram_inputs(values, direct=True, device_layer1=True)
+            capture_engram_inputs(values, direct=True, device_layer1=True, local_heads=heads)
 
 
 def test_native_input_is_disabled_by_default(monkeypatch):

@@ -25,9 +25,10 @@ class DecoderTopology:
 
     @property
     def supports_segmented_input(self):
-        # Three PP0 CSA2 index owners may each add a Q/weight exchange pair.
-        return (self.name == "deepseek_v41_pp0_input" and self.group_layers == (4,) * 5
-                and not self.external_prefix and self.collectives in (43, 45, 47, 49))
+        return (self.name == "deepseek_v41_pp0_input" and self.groups > 0
+                and all(layers == 4 for layers in self.group_layers)
+                and not self.external_prefix and self.extra_collectives >= 3
+                and self.extra_collectives % 2 == 1)
 
 
 QWEN3_NEXT = DecoderTopology("qwen3_next", (8,) * 8, 2, True)

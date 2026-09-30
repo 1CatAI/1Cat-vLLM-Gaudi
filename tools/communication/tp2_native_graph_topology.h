@@ -12,20 +12,17 @@ struct NativeNodeKind {
 
 struct NativeGraphTopology {
   static bool supportsV41SegmentedPrefix(size_t groups, size_t collectives, bool externalPrefix) {
-    // PP0 keeps embedding + 40 layer exchanges + two Engram exchanges.
-    // Its three long-context indexers each add two real exchanges; the
-    // producer/consumer analysis still discovers and checks the exact cut.
-    return groups == 5 && (collectives == 43 || collectives == 45 ||
-                           collectives == 47 || collectives == 49) && !externalPrefix;
+    // Four layers per group, two exchanges per layer, embedding and both
+    // Engram layers. Each index owner contributes a further exchange pair.
+    return groups > 0 && collectives >= groups * 8 + 3 &&
+        collectives <= groups * 10 + 3 && (collectives - groups * 8) % 2 == 1 && !externalPrefix;
   }
 
   static bool supportsV41Dependencies(size_t groups, size_t collectives, bool externalPrefix) {
-    // Each long-context indexer contributes two real AllGathers. PP0 has
-    // three indexers plus two Engram exchanges (and optionally embedding);
-    // PP1 has five indexers. Exact coverage is still checked by prepare().
-    const bool stageCollectives = collectives == 40 || (collectives >= 42 && collectives <= 50);
-    return !externalPrefix &&
-        ((groups == 5 && stageCollectives) ||
+    // The adapter supplies exact owner counts and prepare checks every node.
+    // Retain the single-group diagnostic family and parameterize full stages.
+    return !externalPrefix && groups > 0 &&
+        ((collectives >= groups * 8 && collectives <= groups * 10 + 3) ||
          (groups == 1 && collectives >= 8 && collectives <= 16 && collectives % 2 == 0));
   }
 

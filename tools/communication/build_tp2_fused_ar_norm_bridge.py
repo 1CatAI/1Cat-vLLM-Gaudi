@@ -143,6 +143,8 @@ def main() -> None:
     metadata = {
         "schema": 1,
         "device_engram_shared_mapping_version": getattr(module, "device_engram_shared_mapping_version", 0),
+        "prepared_position_bank_version": getattr(module, "prepared_position_bank_version", 0),
+        "tp4_index_gather_pair_version": getattr(module, "tp4_index_gather_pair_version", 0),
         "address_sanitizer": args.address_sanitizer,
         "torch_version": torch.__version__,
         "binary_sha256": digest(binary),
@@ -157,8 +159,11 @@ def main() -> None:
                 source.with_name("tp2_native_decode_graph.h"),
                 source.with_name("tp2_native_dependencies.h"),
                 source.with_name("tp2_native_graph_topology.h"),
+                source.with_name("tp2_native_segmented_epochs.h"),
                 source.with_name("tp2_native_graph_probe.h"),
                 source.with_name("dsv41_verify_timing.h"),
+                source.with_name("dsv41_control_inputs.h"),
+                source.with_name("dsv41_index_gather_pair.h"),
             )
         },
         "eager_runtime": [{

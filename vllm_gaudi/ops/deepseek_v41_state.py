@@ -61,17 +61,25 @@ class V41StateSpec(KVCacheSpec):
 
 def register_state_spec(vllm_config=None):
     from vllm_gaudi.ops.deepseek_v41_prefix_manager import V41PrefixManager
+
     KVCacheSpecRegistry._ensure_registered(vllm_config)
     KVCacheSpecRegistry.register(V41StateSpec, V41PrefixManager)
 
 
 class StageStateBlocks:
-
     def __init__(self, program):
         self.program = program
         mutable = {
-            "swa", "main", "decoded_swa", "decoded_main", "decoded_index_hot", "index", "indices", "candidate_pool",
-            "kv_history", "score_history"
+            "swa",
+            "main",
+            "decoded_swa",
+            "decoded_main",
+            "decoded_index_hot",
+            "index",
+            "indices",
+            "candidate_pool",
+            "kv_history",
+            "score_history",
         }
         self.bindings, self.specs, self.allocations = {}, {}, {}
         for module_name, module in program.named_modules():
@@ -122,23 +130,26 @@ class StageStateBlocks:
 class PagedStageState:
     """Shared compressed KV pool; fixed-address working state survives replay.
 
-Only the small SWA/compressor working set is saved when scheduling another
-request. Compressed history stays in its scheduler-owned HPU pages.
-"""
+    Only the small SWA/compressor working set is saved when scheduling another
+    request. Compressed history stays in its scheduler-owned HPU pages.
+    """
 
     def __init__(self, program, *, auxiliary_prefix=False):
         from vllm_gaudi.ops.deepseek_v41_paged_attention import PAGE_TOKENS
+
         self.program = program
         self.bindings, self.specs, self.allocations = {}, {}, {}
         for source, cache in program.shared.sources.items():
             for name, width in (("main", 288), ("index", 68)):
                 key = f"dsv41.pp{program.pp_rank}.source{source}.{name}"
                 self.bindings[key] = cache, name
-                self.specs[key] = V41StateSpec(block_size=PAGE_TOKENS,
-                                               state_shape=(PAGE_TOKENS // cache.ratio, width),
-                                               state_dtype=torch.uint8,
-                                               paged=True,
-                                               auxiliary_prefix=auxiliary_prefix)
+                self.specs[key] = V41StateSpec(
+                    block_size=PAGE_TOKENS,
+                    state_shape=(PAGE_TOKENS // cache.ratio, width),
+                    state_dtype=torch.uint8,
+                    paged=True,
+                    auxiliary_prefix=auxiliary_prefix,
+                )
         history_names = {"swa", "decoded_swa", "decoded_main", "decoded_index_hot", "kv_history", "score_history"}
         selection_names = {"indices", "candidate_pool"}
         # The runtime hot path may skip publishing unchanged selection state.
@@ -147,12 +158,10 @@ request. Compressed history stays in its scheduler-owned HPU pages.
         if getattr(program, "runtime_indexer", False):
             history_names |= selection_names
         self.working = {
-            name: value
-            for name, value in program.named_buffers() if name.rsplit(".", 1)[-1] in history_names
+            name: value for name, value in program.named_buffers() if name.rsplit(".", 1)[-1] in history_names
         }
         self.scratch = {
-            name: value
-            for name, value in program.named_buffers() if name.rsplit(".", 1)[-1] in selection_names
+            name: value for name, value in program.named_buffers() if name.rsplit(".", 1)[-1] in selection_names
         }
         self.saved, self.active, self.blocks = {}, None, 2
         # The scheduler page table is small but long-lived.  Rebuilding a
@@ -161,8 +170,9 @@ request. Compressed history stays in its scheduler-owned HPU pages.
         # recipe buffers are live.  Apart from wasting one H2D submission per
         # token, that can enter Synapse defragmentation with buffers in use.
         # Keep one explicitly pinned source and only publish changed tables.
-        self.block_table_host = torch.empty(program.shared.block_table.shape, dtype=torch.int32,
-                                            device="cpu").pin_memory("hpu")
+        self.block_table_host = torch.empty(
+            program.shared.block_table.shape, dtype=torch.int32, device="cpu"
+        ).pin_memory("hpu")
         self.block_table_host_values = self.block_table_host.numpy()
         self.published_block_ids = None
         self.identity_block_table_resident = False
@@ -182,6 +192,7 @@ request. Compressed history stays in its scheduler-owned HPU pages.
     def bind(self, block):
         # Pool replacement is confined to initialization, before recipe capture.
         del block
+        self._invalidate_index_mirror()
         for key, (module, name) in self.bindings.items():
             setattr(module, name, self.allocations[key].flatten(0, 1))
         # With max_num_seqs=1 the scheduler hands the sole request the first
@@ -195,6 +206,11 @@ request. Compressed history stays in its scheduler-owned HPU pages.
         self.identity_block_table_resident = True
         self.program.generation += 1
 
+    def _invalidate_index_mirror(self):
+        invalidate = getattr(self.program.shared, "invalidate_index_mirror", None)
+        if invalidate is not None:
+            invalidate()
+
     def _publish_block_table(self, block_ids):
         block_ids = tuple(block_ids)
         if block_ids == self.published_block_ids:
@@ -203,12 +219,13 @@ request. Compressed history stays in its scheduler-owned HPU pages.
         if identity and self.identity_block_table_resident:
             self.published_block_ids = block_ids
             return
+        self._invalidate_index_mirror()
         values = self.block_table_host_values
         if identity:
             values[:] = range(1, len(values) + 1)
         else:
             values.fill(0)
-            values[:len(block_ids)] = block_ids
+            values[: len(block_ids)] = block_ids
         # Pinned source plus a persistent destination gives Synapse a true
         # asynchronous DMA and requires no per-request device allocation.  A
         # non-identity remap is rare with single-request serving; wait for the
@@ -225,6 +242,7 @@ request. Compressed history stays in its scheduler-owned HPU pages.
         if len(block_ids) > self.program.shared.block_table.numel():
             raise RuntimeError("V4.1 request exceeds the configured context page table")
         if self.active != request_id:
+            self._invalidate_index_mirror()
             if self.active is not None:
                 if self.active not in self.saved:
                     self.saved[self.active] = {key: value.clone() for key, value in self.working.items()}
@@ -244,17 +262,18 @@ request. Compressed history stays in its scheduler-owned HPU pages.
     def release(self, request_id):
         self.saved.pop(request_id, None)
         if self.active == request_id:
+            self._invalidate_index_mirror()
             self.active = None
 
     def clear(self):
-        for value in self.working.values():
-            value.zero_()
+        self._invalidate_index_mirror()
+        for name, value in self.working.items():
+            value.fill_(-1 if name.rsplit(".", 1)[-1] in ("indices", "candidate_pool") else 0)
         for value in self.scratch.values():
             value.fill_(-1)
 
     @property
     def allocated_bytes(self):
-        return (sum(value.numel() * value.element_size()
-                    for value in self.allocations.values()) + sum(value.numel() * value.element_size()
-                                                                  for state in self.saved.values()
-                                                                  for value in state.values()))
+        return sum(value.numel() * value.element_size() for value in self.allocations.values()) + sum(
+            value.numel() * value.element_size() for state in self.saved.values() for value in state.values()
+        )

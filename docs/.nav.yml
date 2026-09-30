@@ -46,6 +46,7 @@ nav:
   - Developer Guides:
     - dev_guide/plugin_system.md
     - dev_guide/ci-failures.md
+    - dev_guide/deepseek_v41_tp4_optimization_ledger.md
     - Profiling:
       - dev_guide/profiling/profiling.md
       - dev_guide/profiling/e2e-profiling.md

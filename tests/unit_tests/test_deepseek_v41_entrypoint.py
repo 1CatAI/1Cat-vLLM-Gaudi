@@ -10,23 +10,28 @@ from vllm_gaudi.entrypoints.deepseek_v41 import (
     _C1_FASTPATH_DEFAULTS,
     _NUMERIC_FASTPATH_DEFAULTS,
     _PREFILL_MOE_DEFAULTS,
-    _TP4_FORCE_DISABLED,
+    _PIPELINE_ONLY_FASTPATHS,
     _TP4_FASTPATH_DEFAULTS,
     prepare_default_fastpaths,
 )
 
-_PROFILE_KEYS = set().union(_TP4_FORCE_DISABLED, _TP4_FASTPATH_DEFAULTS, _C1_FASTPATH_DEFAULTS,
-                            _NUMERIC_FASTPATH_DEFAULTS, _PREFILL_MOE_DEFAULTS) | {
-                                "VLLM_HPU_DSV41_DEFAULT_FASTPATHS",
-                                "VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS",
-                                "VLLM_HPU_DSV41_DSPARK",
-                                "VLLM_HPU_DSV41_WO_A_FP8_SIDECAR",
-                                "VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR",
-                                "VLLM_HPU_DSV41_ENGRAM_FP8_SIDECAR",
-                                "VLLM_HPU_DSV41_PREFILL_GROUPED_FP8",
-                                "VLLM_HPU_DSV41_PREFILL_INDEX_QUERY_TP",
-                                "VLLM_HPU_DSV41_EXPERT_N256",
-                            }
+_PROFILE_KEYS = set().union(
+    _PIPELINE_ONLY_FASTPATHS,
+    _TP4_FASTPATH_DEFAULTS,
+    _C1_FASTPATH_DEFAULTS,
+    _NUMERIC_FASTPATH_DEFAULTS,
+    _PREFILL_MOE_DEFAULTS,
+) | {
+    "VLLM_HPU_DSV41_DEFAULT_FASTPATHS",
+    "VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS",
+    "VLLM_HPU_DSV41_DSPARK",
+    "VLLM_HPU_DSV41_WO_A_FP8_SIDECAR",
+    "VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR",
+    "VLLM_HPU_DSV41_ENGRAM_FP8_SIDECAR",
+    "VLLM_HPU_DSV41_PREFILL_GROUPED_FP8",
+    "VLLM_HPU_DSV41_PREFILL_INDEX_QUERY_TP",
+    "VLLM_HPU_DSV41_EXPERT_N256",
+}
 
 
 @pytest.fixture(autouse=True)
@@ -56,7 +61,8 @@ def test_default_profile_enables_qualified_numeric_bundle(monkeypatch, tmp_path)
     assert all(os.environ[key] == value for key, value in _PREFILL_MOE_DEFAULTS.items())
     assert os.environ["VLLM_HPU_DSV41_WO_A_FP8_SIDECAR"] == str((tmp_path / "sidecars" / "wo_a_fp8").resolve())
     assert os.environ["VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR"] == str(
-        (tmp_path / "sidecars" / "attention_dense_fp8").resolve())
+        (tmp_path / "sidecars" / "attention_dense_fp8").resolve()
+    )
     assert os.environ["VLLM_HPU_DSV41_ENGRAM_FP8_SIDECAR"] == str((tmp_path / "sidecars" / "engram_fp8").resolve())
     assert os.environ["VLLM_HPU_DSV41_PREFILL_COMPUTE_TOKENS"] == "8192"
     assert os.environ["VLLM_HPU_DSV41_PREFILL_KV_REUSE"] == "1"
@@ -90,7 +96,8 @@ def test_experimental_numeric_bundle_discovers_sidecars(monkeypatch, tmp_path):
     assert all(os.environ[key] == value for key, value in _NUMERIC_FASTPATH_DEFAULTS.items())
     assert os.environ["VLLM_HPU_DSV41_WO_A_FP8_SIDECAR"] == str((model / "sidecars" / "wo_a_fp8").resolve())
     assert os.environ["VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR"] == str(
-        (model / "sidecars" / "attention_dense_fp8").resolve())
+        (model / "sidecars" / "attention_dense_fp8").resolve()
+    )
     assert os.environ["VLLM_HPU_DSV41_ENGRAM_FP8_SIDECAR"] == str((model / "sidecars" / "engram_fp8").resolve())
 
 
@@ -149,7 +156,7 @@ def test_aggregate_opt_out_leaves_environment_unchanged(monkeypatch, tmp_path):
     assert not any(key in os.environ for key in _C1_FASTPATH_DEFAULTS)
 
 
-def test_tp4_does_not_inherit_fragments_of_the_tp2_profile(monkeypatch, tmp_path):
+def test_tp_only_stage_inherits_c1_except_pipeline_transport(monkeypatch, tmp_path):
     _clear_profile(monkeypatch)
     for profile in (_C1_FASTPATH_DEFAULTS, _NUMERIC_FASTPATH_DEFAULTS, _PREFILL_MOE_DEFAULTS):
         for key, value in profile.items():
@@ -159,11 +166,13 @@ def test_tp4_does_not_inherit_fragments_of_the_tp2_profile(monkeypatch, tmp_path
     for sidecar in ("wo_a_fp8", "attention_dense_fp8", "engram_fp8"):
         (tmp_path / "sidecars" / sidecar).mkdir(parents=True)
     prepare_default_fastpaths(tmp_path)
-    assert all(os.environ[key] == "0" for key in _TP4_FORCE_DISABLED)
+    assert all(os.environ[key] == "0" for key in _PIPELINE_ONLY_FASTPATHS)
     assert os.environ["VLLM_HPU_DSV41_DSPARK"] == "0"
     assert os.environ["VLLM_HPU_DSV41_PREFILL_GROUPED_FP8"] == "w13_single_bucket"
     assert os.environ["VLLM_HPU_DSV41_VISION"] == "1"
-    assert os.environ["VLLM_HPU_DSV41_PREFILL_MXFP4"] == "0"
+    assert os.environ.get("VLLM_HPU_DSV41_PREFILL_MXFP4", "0") == "0"
+    for key in ("GRAPH_REPLAY", "NATIVE_INPUT_GRAPH", "RUNTIME_INDEXER", "ENGRAM_DIRECT_INPUT"):
+        assert os.environ["VLLM_HPU_DSV41_" + key] == "1"
 
 
 @pytest.mark.parametrize("tp,pp", ((4, 2), (2, 1)))
@@ -180,9 +189,18 @@ def test_tp4_defaults_select_optimized_moe_without_opt_in(monkeypatch, tmp_path)
     for sidecar in ("wo_a_fp8", "attention_dense_fp8", "engram_fp8"):
         (tmp_path / "sidecars" / sidecar).mkdir(parents=True)
     prepare_default_fastpaths(tmp_path)
-    assert all(os.environ[key] == value for key, value in _TP4_FASTPATH_DEFAULTS.items())
-    for key in ("EXPERT_N256_FP8", "EXPERT_FUSED_QUANT", "EXPERT_FUSED_REDUCE", "PREFILL_GROUPED",
-                "PREFILL_DEVICE_ROUTES", "PREFILL_ROUTE_OUTPUT", "PREFILL_ACTIVE_PLAN"):
+    assert all(
+        os.environ[key] == value for key, value in _TP4_FASTPATH_DEFAULTS.items() if key not in _PIPELINE_ONLY_FASTPATHS
+    )
+    for key in (
+        "EXPERT_N256_FP8",
+        "EXPERT_FUSED_QUANT",
+        "EXPERT_FUSED_REDUCE",
+        "PREFILL_GROUPED",
+        "PREFILL_DEVICE_ROUTES",
+        "PREFILL_ROUTE_OUTPUT",
+        "PREFILL_ACTIVE_PLAN",
+    ):
         assert os.environ["VLLM_HPU_DSV41_" + key] == "1"
     assert os.environ["VLLM_HPU_DSV41_PREFILL_GROUPED_FP8"] == "w13_single_bucket"
     assert os.environ["VLLM_HPU_DSV41_PREFILL_DECODER_HALO"] == "1"
@@ -205,6 +223,7 @@ def test_tp4_prefill_diagnostic_disable_controls(monkeypatch, tmp_path):
 def test_tp4_rejects_generic_moe_instead_of_silent_fallback(monkeypatch, tmp_path):
     import torch
     from vllm_gaudi.models.deepseek_v41_program import PreparedMoE
+
     _clear_profile(monkeypatch)
     for sidecar in ("wo_a_fp8", "attention_dense_fp8", "engram_fp8"):
         (tmp_path / "sidecars" / sidecar).mkdir(parents=True)
@@ -216,14 +235,17 @@ def test_tp4_rejects_generic_moe_instead_of_silent_fallback(monkeypatch, tmp_pat
 
 def test_runtime_reexec_preserves_complete_launcher_capture_contract(monkeypatch, tmp_path):
     from vllm_gaudi.entrypoints.deepseek_v41 import main
+
     profile = tmp_path / "runtime.json"
-    expected = dict(HABANA_PROFILE="1",
-                    HABANA_PROF_CONFIG=str(tmp_path / "capture.json"),
-                    VLLM_HPU_DSV41_RAW_TRACE="1",
-                    VLLM_HPU_DSV41_RAW_SCOPE_ONLY="1",
-                    ENABLE_PROFILER="true",
-                    GRAPH_VISUALIZATION="1",
-                    GRAPH_VISUALIZATION_DIR=str(tmp_path / "graphs"))
+    expected = dict(
+        HABANA_PROFILE="1",
+        HABANA_PROF_CONFIG=str(tmp_path / "capture.json"),
+        VLLM_HPU_DSV41_RAW_TRACE="1",
+        VLLM_HPU_DSV41_RAW_SCOPE_ONLY="1",
+        ENABLE_PROFILER="true",
+        GRAPH_VISUALIZATION="1",
+        GRAPH_VISUALIZATION_DIR=str(tmp_path / "graphs"),
+    )
     profile.write_text(json.dumps({"environment": {name: "0" for name in expected}}))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(sys, "argv", ["deepseek_v41", "prepared", "--runtime-profile", str(profile)])
@@ -245,10 +267,11 @@ def test_runtime_reexec_preserves_complete_launcher_capture_contract(monkeypatch
 
 def test_graph_reservation_follows_tp4_capture_policy(monkeypatch):
     import vllm_gaudi.entrypoints.deepseek_v41 as entry
+
     monkeypatch.setattr(entry, "prepare_native_libraries", lambda: None)
     monkeypatch.delenv("VLLM_GRAPH_RESERVED_MEM", raising=False)
     entry.prepare_environment(tensor_parallel_size=4, pipeline_parallel_size=1)
-    assert os.environ["VLLM_GRAPH_RESERVED_MEM"] == "0"
+    assert os.environ["VLLM_GRAPH_RESERVED_MEM"] == "0.1"
     monkeypatch.delenv("VLLM_GRAPH_RESERVED_MEM")
     entry.prepare_environment(tensor_parallel_size=2, pipeline_parallel_size=2)
     assert os.environ["VLLM_GRAPH_RESERVED_MEM"] == "0.1"

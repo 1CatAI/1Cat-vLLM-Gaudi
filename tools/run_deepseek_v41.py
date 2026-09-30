@@ -65,8 +65,12 @@ def cpuset(value):
 
 def active_worker_cpus():
     reserved = set()
-    keys = (b"VLLM_HPU_DSV4_WORKER_CPUS=", b"VLLM_HPU_DSV4_WORKER_HELPER_CPUS=", b"VLLM_HPU_DSV41_ENGINE_CPUS=",
-            b"VLLM_HPU_DSV41_API_CPUS=")
+    keys = (
+        b"VLLM_HPU_DSV4_WORKER_CPUS=",
+        b"VLLM_HPU_DSV4_WORKER_HELPER_CPUS=",
+        b"VLLM_HPU_DSV41_ENGINE_CPUS=",
+        b"VLLM_HPU_DSV41_API_CPUS=",
+    )
     for proc in Path("/proc").iterdir():
         if not proc.name.isdigit() or int(proc.name) == os.getpid():
             continue
@@ -86,8 +90,7 @@ def active_worker_cpus():
 def recipe_source_hashes(source_hashes):
     """Diagnostic/report scripts are archived but are not serving dependencies."""
     return {
-        path: digest
-        for path, digest in source_hashes.items() if path.startswith(("vllm_gaudi/", "flashinfer_gaudi/"))
+        path: digest for path, digest in source_hashes.items() if path.startswith(("vllm_gaudi/", "flashinfer_gaudi/"))
     }
 
 
@@ -117,16 +120,9 @@ def configure_trace_artifacts(environment, evidence, *, dump_plans, enable_profi
                         "lib": "libhost_profiler.so",
                         "name": "HostProfiler",
                         "values": {
-                            "api_group": {
-                                name: {
-                                    "value": True
-                                }
-                                for name in ("HCCL", "HLTHUNK", "SYNAPSE")
-                            },
-                            "start_disabled": {
-                                "value": True
-                            }
-                        }
+                            "api_group": {name: {"value": True} for name in ("HCCL", "HLTHUNK", "SYNAPSE")},
+                            "start_disabled": {"value": True},
+                        },
                     },
                     {
                         "enable": True,
@@ -134,22 +130,11 @@ def configure_trace_artifacts(environment, evidence, *, dump_plans, enable_profi
                         "name": "HwTrace",
                         "values": {
                             "generalOptions": {
-                                "profilePhase": {
-                                    "value": "profileApi"
-                                },
-                                "traceBufferSize": {
-                                    "value": "0x80000000"
-                                }
+                                "profilePhase": {"value": "profileApi"},
+                                "traceBufferSize": {"value": "0x80000000"},
                             },
-                            "parseOptions": {
-                                "addFuserMetadata": {
-                                    "value": False
-                                },
-                                "showNullDescs": {
-                                    "value": False
-                                }
-                            }
-                        }
+                            "parseOptions": {"addFuserMetadata": {"value": False}, "showNullDescs": {"value": False}},
+                        },
                     },
                 ]
             }
@@ -157,15 +142,9 @@ def configure_trace_artifacts(environment, evidence, *, dump_plans, enable_profi
                 environment["HABANA_PROFILE_WRITE_HLTV"] = "1"
                 config["GeneralSettings"] = {
                     "values": {
-                        "addPid": {
-                            "value": True
-                        },
-                        "outdir": {
-                            "value": str(evidence / "raw")
-                        },
-                        "session": {
-                            "value": "v41_tp4"
-                        }
+                        "addPid": {"value": True},
+                        "outdir": {"value": str(evidence / "raw")},
+                        "session": {"value": "v41_tp4"},
                     }
                 }
                 host = config["Plugins"][0]["values"]
@@ -180,21 +159,21 @@ def configure_trace_artifacts(environment, evidence, *, dump_plans, enable_profi
                 host["output"] = {name: {"value": name == "hltv"} for name in ("hltv", "json", "csv")}
                 hardware = config["Plugins"][1]["values"]
                 hardware["generalOptions"].update(arch={"value": "gaudi2"}, traceBufferLocation={"value": "host"})
-                hardware["parseOptions"].update(skipParse={"value": True},
-                                                outputPerInvocation={
-                                                    name: {
-                                                        "value": name in ("hltv", "hltvWithHost")
-                                                    }
-                                                    for name in ("binary", "csv", "dbgInfo", "hltv", "hltvWithHost",
-                                                                 "json", "text")
-                                                })
+                hardware["parseOptions"].update(
+                    skipParse={"value": True},
+                    outputPerInvocation={
+                        name: {"value": name in ("hltv", "hltvWithHost")}
+                        for name in ("binary", "csv", "dbgInfo", "hltv", "hltvWithHost", "json", "text")
+                    },
+                )
             config_path = evidence / "profiler-config.json"
             config_path.write_text(json.dumps(config, indent=2) + "\n")
             environment["HABANA_PROF_CONFIG"] = str(config_path)
     identity = {key: environment.get(key, "0") for key in ("ENABLE_PROFILER", "GRAPH_VISUALIZATION", "HABANA_PROFILE")}
     if enable_profiler or raw_profiler:
-        identity["profiler_config_sha256"] = hashlib.sha256(Path(
-            environment["HABANA_PROF_CONFIG"]).read_bytes()).hexdigest()
+        identity["profiler_config_sha256"] = hashlib.sha256(
+            Path(environment["HABANA_PROF_CONFIG"]).read_bytes()
+        ).hexdigest()
     return identity
 
 
@@ -230,8 +209,9 @@ def _acquire_modules(lock_dir, count, requested_modules=None, secondary_lock_dir
             try:
                 namespaces = {lock_dir, *secondary_lock_dirs}
                 if lock_dir.name in ("locks", "evidence"):
-                    namespaces.update(path for name in ("locks", "evidence")
-                                      if (path := lock_dir.parent / name).is_dir())
+                    namespaces.update(
+                        path for name in ("locks", "evidence") if (path := lock_dir.parent / name).is_dir()
+                    )
                 paths = {path for directory in namespaces for path in directory.glob(f"*module{module}.lock")}
                 paths.update(directory / f"gaudi-module{module}.lock" for directory in namespaces)
                 for path in sorted(paths):
@@ -244,15 +224,14 @@ def _acquire_modules(lock_dir, count, requested_modules=None, secondary_lock_dir
                 bus = (candidate / "device").resolve().name
                 status = subprocess.check_output(
                     ["hl-smi", "-i", bus, "--query-aip=memory.used,utilization.aip", "--format=csv,noheader,nounits"],
-                    text=True)
+                    text=True,
+                )
                 memory, active = map(float, status.strip().split(","))
                 if memory > 1024 or active:
                     continue
-                selected.append({
-                    "module": module,
-                    "bus": bus,
-                    "numa": int((candidate / "device/numa_node").read_text())
-                })
+                selected.append(
+                    {"module": module, "bus": bus, "numa": int((candidate / "device/numa_node").read_text())}
+                )
                 held.extend(local)
                 local = []
                 if len(selected) == count:
@@ -273,32 +252,45 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("evidence", type=Path)
     parser.add_argument("--lock-dir", required=True, type=Path)
-    parser.add_argument("--secondary-lock-dir",
-                        action="append",
-                        default=[],
-                        type=Path,
-                        help="Additional shared module-lease namespaces used by other workers")
+    parser.add_argument(
+        "--secondary-lock-dir",
+        action="append",
+        default=[],
+        type=Path,
+        help="Additional shared module-lease namespaces used by other workers",
+    )
     parser.add_argument("--runtime-profile", required=True, type=Path)
-    parser.add_argument("--source-snapshot",
-                        type=Path,
-                        help="Run an immutable archived Python source snapshot for a controlled comparison")
-    parser.add_argument("--devices",
-                        type=int,
-                        choices=(1, 2, 4),
-                        default=4,
-                        help="Four for normal serving; fewer only for bounded component diagnostics")
+    parser.add_argument(
+        "--engine-source", type=Path, help="Use and fingerprint an isolated normal vLLM engine checkout"
+    )
+    parser.add_argument(
+        "--source-snapshot",
+        type=Path,
+        help="Run an immutable archived Python source snapshot for a controlled comparison",
+    )
+    parser.add_argument(
+        "--devices",
+        type=int,
+        choices=(1, 2, 4),
+        default=4,
+        help="Four for normal serving; fewer only for bounded component diagnostics",
+    )
     parser.add_argument("--modules", type=str, help="Optional comma-separated physical module IDs, in rank order")
-    parser.add_argument("--recipe-cache-dir",
-                        type=Path,
-                        help="Optional persistent cache root; source/runtime identities own separate namespaces")
+    parser.add_argument(
+        "--recipe-cache-dir",
+        type=Path,
+        help="Optional persistent cache root; source/runtime identities own separate namespaces",
+    )
     parser.add_argument("--dump-plans", action="store_true", help="Save preparation graphs for an explicit diagnostic")
     profiler = parser.add_mutually_exclusive_group()
-    profiler.add_argument("--enable-profiler",
-                          action="store_true",
-                          help="Register profiler control with compiler debug instrumentation")
-    profiler.add_argument("--raw-profiler",
-                          action="store_true",
-                          help="Register scope-only raw SDK capture with compiler profiling disabled")
+    profiler.add_argument(
+        "--enable-profiler", action="store_true", help="Register profiler control with compiler debug instrumentation"
+    )
+    profiler.add_argument(
+        "--raw-profiler",
+        action="store_true",
+        help="Register scope-only raw SDK capture with compiler profiling disabled",
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     # The child runs inside the immutable source snapshot, so environment
@@ -344,7 +336,7 @@ def main():
         "command": command,
         "launcher_pid": os.getpid(),
         "modules": selected,
-        "runtime_profile": str(args.runtime_profile.resolve())
+        "runtime_profile": str(args.runtime_profile.resolve()),
     }
     try:
         allowed = os.sched_getaffinity(0)
@@ -361,19 +353,21 @@ def main():
             helper = [cpu for cpu in physical if cpu not in reserved][:4]
             for cpu in helper:
                 reserved.update(
-                    cpuset(Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read_text()))
+                    cpuset(Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read_text())
+                )
             mains.append(main_cpu)
             helpers.append(",".join(map(str, helper)))
             item.update(main_cpu=main_cpu, helper_cpus=helper)
         control_cpus = set()
         if env.get("VLLM_HPU_DSV41_ISOLATE_CONTROL", "0") == "1":
-            local = (cpuset(Path(f"/sys/devices/system/node/node{selected[0]['numa']}/cpulist").read_text()) & allowed)
+            local = cpuset(Path(f"/sys/devices/system/node/node{selected[0]['numa']}/cpulist").read_text()) & allowed
             for role, count in (("engine", 2), ("api", 1)):
                 group = []
                 for cpu in sorted(local - reserved):
                     group.append(cpu)
                     reserved.update(
-                        cpuset(Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read_text()))
+                        cpuset(Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read_text())
+                    )
                     if len(group) == count:
                         break
                 if len(group) != count:
@@ -381,29 +375,40 @@ def main():
                 env[f"VLLM_HPU_DSV41_{role.upper()}_CPUS"] = ",".join(map(str, group))
                 record.setdefault("control_cpus", {})[role] = group
                 control_cpus.update(group)
-        env.update(HABANA_VISIBLE_MODULES=",".join(str(item["module"]) for item in selected),
-                   HLS_MODULE_ID=str(selected[0]["module"]),
-                   HABANA_LOGS=str(args.evidence / "habana_logs"),
-                   VLLM_HPU_DSV4_WORKER_CPUS=",".join(map(str, mains)),
-                   VLLM_HPU_DSV4_WORKER_HELPER_CPUS=";".join(helpers),
-                   DSV41_RUN_EVIDENCE=str(args.evidence),
-                   DSV41_RUNTIME_PROFILE=str(args.evidence / "runtime-profile.json"))
+        env.update(
+            HABANA_VISIBLE_MODULES=",".join(str(item["module"]) for item in selected),
+            HLS_MODULE_ID=str(selected[0]["module"]),
+            HABANA_LOGS=str(args.evidence / "habana_logs"),
+            VLLM_HPU_DSV4_WORKER_CPUS=",".join(map(str, mains)),
+            VLLM_HPU_DSV4_WORKER_HELPER_CPUS=";".join(helpers),
+            DSV41_RUN_EVIDENCE=str(args.evidence),
+            DSV41_RUNTIME_PROFILE=str(args.evidence / "runtime-profile.json"),
+        )
         env.pop("VLLM_HPU_TP2_PLAN_DUMP_DIR", None)
         env.pop("VLLM_TORCH_PROFILER_DIR", None)
-        instrumentation = configure_trace_artifacts(env,
-                                                    args.evidence,
-                                                    dump_plans=args.dump_plans,
-                                                    enable_profiler=args.enable_profiler,
-                                                    raw_profiler=args.raw_profiler)
+        instrumentation = configure_trace_artifacts(
+            env,
+            args.evidence,
+            dump_plans=args.dump_plans,
+            enable_profiler=args.enable_profiler,
+            raw_profiler=args.raw_profiler,
+        )
         if env.get("GRAPH_VISUALIZATION") == "1":
             env["GRAPH_VISUALIZATION_DIR"] = str(args.evidence / "graphs")
         record["environment"] = {
             key: value
             for key, value in env.items()
-            if key.startswith(("HABANA_", "HLS_", "PT_HPU_", "VLLM_", "HCL_", "HCCL_",
-                               "DSV41_")) or key in ("LD_LIBRARY_PATH", "LD_PRELOAD", "GC_KERNEL_PATH",
-                                                     "RUNTIME_SCALE_PATCHING", "ENABLE_PROFILER", "GRAPH_VISUALIZATION",
-                                                     "GRAPH_VISUALIZATION_DIR")
+            if key.startswith(("HABANA_", "HLS_", "PT_HPU_", "VLLM_", "HCL_", "HCCL_", "DSV41_"))
+            or key
+            in (
+                "LD_LIBRARY_PATH",
+                "LD_PRELOAD",
+                "GC_KERNEL_PATH",
+                "RUNTIME_SCALE_PATCHING",
+                "ENABLE_PROFILER",
+                "GRAPH_VISUALIZATION",
+                "GRAPH_VISUALIZATION_DIR",
+            )
         }
         root = Path(__file__).resolve().parents[1]
         source_root = args.source_snapshot.resolve() if args.source_snapshot else root
@@ -411,12 +416,18 @@ def main():
             raise RuntimeError(f"Archived source snapshot is incomplete: {source_root}")
         record["source_snapshot"] = str(source_root)
         record["source_hashes"] = {}
-        for glob in ("vllm_gaudi/**/*.py", "vllm_gaudi/**/*.txt", "flashinfer_gaudi/**/*.py",
-                     "flashinfer_gaudi/**/*.json", "tools/*deepseek_v41*.py",
-                     "tests/standalone/deepseek_v41/test_engram_staging.py"):
+        for glob in (
+            "vllm_gaudi/**/*.py",
+            "vllm_gaudi/**/*.txt",
+            "flashinfer_gaudi/**/*.py",
+            "flashinfer_gaudi/**/*.json",
+            "tools/*deepseek_v41*.py",
+            "tests/standalone/deepseek_v41/test_engram_staging.py",
+        ):
             for source in source_root.glob(glob):
                 record["source_hashes"][str(source.relative_to(source_root))] = hashlib.sha256(
-                    source.read_bytes()).hexdigest()
+                    source.read_bytes()
+                ).hexdigest()
                 destination = args.evidence / "source" / source.relative_to(source_root)
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, destination)
@@ -425,6 +436,11 @@ def main():
         # or mix newly imported modules into an already loaded generation.
         execution_root = (args.evidence / "source").resolve()
         paths = [item for item in env.get("PYTHONPATH", "").split(os.pathsep) if item and Path(item).resolve() != root]
+        if args.engine_source:
+            engine_source = args.engine_source.resolve()
+            if not (engine_source / "vllm/__init__.py").is_file():
+                raise RuntimeError("The selected engine checkout is incomplete")
+            paths.insert(0, str(engine_source))
         env["PYTHONPATH"] = os.pathsep.join((str(execution_root), *paths))
         record["execution_source_root"] = str(execution_root)
         record["environment"]["PYTHONPATH"] = env["PYTHONPATH"]
@@ -435,11 +451,16 @@ def main():
         else:
             (args.evidence / "source.patch").write_bytes(subprocess.check_output(["git", "diff", "HEAD"], cwd=root))
         import importlib.util
-        engine = Path(importlib.util.find_spec("vllm").origin).resolve().parents[1]
+
+        engine = (
+            args.engine_source.resolve()
+            if args.engine_source
+            else Path(importlib.util.find_spec("vllm").origin).resolve().parents[1]
+        )
+        record["engine_source_root"] = str(engine)
         engine_revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=engine, text=True, capture_output=True)
         record["engine_commit"] = engine_revision.stdout.strip() if engine_revision.returncode == 0 else None
-        engine_patch = (subprocess.check_output(["git", "diff", "HEAD"], cwd=engine)
-                        if record["engine_commit"] else b"")
+        engine_patch = subprocess.check_output(["git", "diff", "HEAD"], cwd=engine) if record["engine_commit"] else b""
         # Installed wheels and frozen source snapshots need the same cache
         # identity protection as a Git checkout. Include untracked Python
         # and native engine modules even when a commit is available.
@@ -471,7 +492,7 @@ def main():
                 "instrumentation": instrumentation,
                 "command": command,
                 "model_manifests": model_manifests,
-                "native_build": hashlib.sha256(native_build.read_bytes()).hexdigest()
+                "native_build": hashlib.sha256(native_build.read_bytes()).hexdigest(),
             }
             fingerprint = hashlib.sha256(json.dumps(cache_identity, sort_keys=True).encode()).hexdigest()
             cache = args.recipe_cache_dir.resolve() / fingerprint
@@ -499,16 +520,15 @@ def main():
         signal.signal(signal.SIGTERM, stop)
         signal.signal(signal.SIGINT, stop)
         with (args.evidence / "run.log").open("w") as log:
-            process = subprocess.Popen(command,
-                                       cwd=execution_root,
-                                       env=env,
-                                       stdout=log,
-                                       stderr=subprocess.STDOUT,
-                                       start_new_session=True)
+            process = subprocess.Popen(
+                command, cwd=execution_root, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+            )
             record.update(pid=process.pid, pgid=process.pid)
             (args.evidence / "process.json").write_text(json.dumps(record, indent=2) + "\n")
-            print(f"V4.1 process {process.pid}, modules {env['HABANA_VISIBLE_MODULES']}; {args.evidence / 'run.log'}",
-                  flush=True)
+            print(
+                f"V4.1 process {process.pid}, modules {env['HABANA_VISIBLE_MODULES']}; {args.evidence / 'run.log'}",
+                flush=True,
+            )
             record["exit_code"] = process.wait()
         record["parent_exit_code"] = record["exit_code"]
         record["process_group_retirement"] = retire_process_group(process.pid)

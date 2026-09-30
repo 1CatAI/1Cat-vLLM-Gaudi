@@ -6,6 +6,7 @@ Subsequent invocations bind current device route descriptors and submit the
 whole bounded expert sequence in C++. No graph or numerical code is injected
 into a running model, and expert occupancy never becomes a host scalar.
 """
+
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -24,17 +25,27 @@ _expert_audit = dict(calls=0, tokens=0, recipe_executions=0, largest_token_bucke
 
 def validate_prefill_plan_config(*, n256):
     from vllm_gaudi import envs
-    if (envs.VLLM_HPU_DSV41_PREFILL_GROUPED_FP8 in ("w13_dual_prequant", "w13_single_prequant", "w13_single_bucket")
-            and not envs.VLLM_HPU_DSV41_PREFILL_HYBRID_ROWS):
+
+    if (
+        envs.VLLM_HPU_DSV41_PREFILL_GROUPED_FP8 in ("w13_dual_prequant", "w13_single_prequant", "w13_single_bucket")
+        and not envs.VLLM_HPU_DSV41_PREFILL_HYBRID_ROWS
+    ):
         raise ValueError("Pre-quantized W13 requires hybrid route plans")
     if envs.VLLM_HPU_DSV41_PREFILL_HYBRID_ROWS and not (
-            envs.VLLM_HPU_DSV41_PREFILL_DEVICE_ROUTES and envs.VLLM_HPU_DSV41_PREFILL_ROUTE_OUTPUT
-            and envs.VLLM_HPU_DSV41_PREFILL_GROUPED and envs.VLLM_HPU_DSV41_PREFILL_NATIVE_PLAN
-            and envs.VLLM_HPU_DSV41_PREFILL_FAST_DEQUANT and envs.VLLM_HPU_DSV41_PREFILL_SKIP_EMPTY
-            and envs.VLLM_HPU_DSV41_PREFILL_EXPERT_ROWS == 128 and envs.VLLM_HPU_DSV41_PREFILL_GROUPED_FP8 in
-        ("", "w13_dual", "w13_dual_prequant", "w13_single_prequant", "w13_single_bucket")):
-        raise ValueError("Hybrid prefill rows require BF16 or W13 FP8 128-row native plans with device routes, "
-                         "route output, fast dequant and empty-block masking")
+        envs.VLLM_HPU_DSV41_PREFILL_DEVICE_ROUTES
+        and envs.VLLM_HPU_DSV41_PREFILL_ROUTE_OUTPUT
+        and envs.VLLM_HPU_DSV41_PREFILL_GROUPED
+        and envs.VLLM_HPU_DSV41_PREFILL_NATIVE_PLAN
+        and envs.VLLM_HPU_DSV41_PREFILL_FAST_DEQUANT
+        and envs.VLLM_HPU_DSV41_PREFILL_SKIP_EMPTY
+        and envs.VLLM_HPU_DSV41_PREFILL_EXPERT_ROWS == 128
+        and envs.VLLM_HPU_DSV41_PREFILL_GROUPED_FP8
+        in ("", "w13_dual", "w13_dual_prequant", "w13_single_prequant", "w13_single_bucket")
+    ):
+        raise ValueError(
+            "Hybrid prefill rows require BF16 or W13 FP8 128-row native plans with device routes, "
+            "route output, fast dequant and empty-block masking"
+        )
     if not envs.VLLM_HPU_DSV41_PREFILL_NATIVE_PLAN:
         return
     if envs.VLLM_HPU_DSV41_PREFILL_ACTIVE_PLAN and not envs.VLLM_HPU_DSV41_PREFILL_DEVICE_ROUTES:
@@ -54,11 +65,12 @@ def register_prefill_plan_pass():
     global _registered
     if _registered:
         return
-    from habana_frameworks.torch.dynamo.compile_backend.passes import (OptimizationPassPlacement,
-                                                                       register_pass_at_optimization_pass)
+    from habana_frameworks.torch.dynamo.compile_backend.passes import (
+        OptimizationPassPlacement,
+        register_pass_at_optimization_pass,
+    )
 
     class Observe(torch.nn.Module):
-
         def __init__(self, recipe):
             super().__init__()
             self.recipe = recipe
@@ -70,7 +82,8 @@ def register_prefill_plan_pass():
                 outputs = list(result) if isinstance(result, (tuple, list)) else [result]
                 aliases = set((self.recipe._in_to_out_dups or {}).values())
                 calls.append(
-                    (self.recipe._recipe_id, list(inputs), [v for i, v in enumerate(outputs) if i not in aliases]))
+                    (self.recipe._recipe_id, list(inputs), [v for i, v in enumerate(outputs) if i not in aliases])
+                )
             return result
 
     def wrap(context):
@@ -91,12 +104,14 @@ def register_prefill_plan_pass():
 
 def _runtime():
     from vllm_gaudi.distributed.tp2_fused_ar_norm import _load_bridge, _verify_prepared_runtime, _resolve_runtime
+
     # Compute-only plans do not execute TP2 exchange. Keep serving bound to
     # its actual TP group while the existing stage owns standard HCCL calls.
     world = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 0
     if world in (1, 4):
         from vllm.distributed import get_tp_group
-        group = (torch.distributed.distributed_c10d._get_default_group() if world == 1 else get_tp_group().device_group)
+
+        group = torch.distributed.distributed_c10d._get_default_group() if world == 1 else get_tp_group().device_group
         if world == 4 and torch.distributed.get_world_size(group) != 4:
             bridge, backend, _ = _resolve_runtime()
             return bridge, backend
@@ -116,7 +131,6 @@ def _key(value):
 
 
 class PrefillExpertPlan:
-
     def __init__(self, body, arguments, groups, require_prefix=False):
         self.bridge, backend = _runtime()
         if not hasattr(self.bridge, "PreparedGroupPlan"):
@@ -129,7 +143,7 @@ class PrefillExpertPlan:
         _local.calls = []
         self.group_node_ends = []
         try:
-            for indices in groups if groups is not None else (None, ):
+            for indices in groups if groups is not None else (None,):
                 # A compact final group binds its current index tensor as an
                 # ordinary external argument, so its offset can change while
                 # the compiled shape and retained intermediates stay fixed.
@@ -154,8 +168,12 @@ class PrefillExpertPlan:
             if identity not in slots:
                 if isinstance(value, torch.Tensor) and value.is_contiguous():
                     for known, tensor in tensors.items():
-                        if (tensor.data_ptr() == value.data_ptr() and tensor.dtype == value.dtype
-                                and tensor.numel() == value.numel() and tensor.is_contiguous()):
+                        if (
+                            tensor.data_ptr() == value.data_ptr()
+                            and tensor.dtype == value.dtype
+                            and tensor.numel() == value.numel()
+                            and tensor.is_contiguous()
+                        ):
                             slots[identity] = plan.add_reshape_view(slots[known], list(value.shape))
                             return slots[identity]
                 slots[identity] = plan.add_slot(value, is_input)
@@ -202,13 +220,19 @@ def execute_prefill_experts(body, arguments, blocks, active_blocks=None):
     # Reuse a single sequence across equal-shaped layers rather than retaining
     # one prompt activation and workspace for every layer.
     from vllm_gaudi import envs
+
     experts_per_plan = envs.VLLM_HPU_DSV41_PREFILL_EXPERTS_PER_PLAN
     if experts_per_plan not in (8, 16, 24, 32):
         raise ValueError("Prefill expert plans support 8, 16, 24 or 32 experts per submission")
     if active_blocks is not None and not 1 <= active_blocks <= blocks:
         raise ValueError("Active expert blocks must be a nonempty descriptor prefix")
-    signature = tuple((tuple(v.shape), v.stride(), v.dtype, v.device) for v in arguments[4:9]) + (tuple(
-        arguments[0].shape), tuple(arguments[2].shape), bool(arguments[9]), experts_per_plan, body)
+    signature = tuple((tuple(v.shape), v.stride(), v.dtype, v.device) for v in arguments[4:9]) + (
+        tuple(arguments[0].shape),
+        tuple(arguments[2].shape),
+        bool(arguments[9]),
+        experts_per_plan,
+        body,
+    )
     plan = _plans.get(signature)
     if plan is None:
         groups = [
@@ -244,7 +268,7 @@ def routed_workspace(value, routes):
         _workspaces.clear()
         capacity = value.new_empty((routes + 1, value.shape[-1]))
         _workspaces[key] = capacity
-    return capacity[:routes + 1]
+    return capacity[: routes + 1]
 
 
 def _invalidate(collection):
@@ -258,6 +282,7 @@ def _invalidate(collection):
 def invalidate_prefill_plans():
     from vllm_gaudi.ops.deepseek_v41_prefill_buckets import invalidate_bucketed_prefill_plans
     from vllm_gaudi.ops.deepseek_v41_prefill_reindex_plan import invalidate_reindex_plans
+
     invalidate_reindex_plans()
     invalidate_bucketed_prefill_plans()
     _invalidate(_plans)
@@ -269,18 +294,22 @@ def invalidate_prefill_plans():
 def prefill_plan_stats():
     from vllm_gaudi.ops.deepseek_v41_prefill_buckets import bucketed_prefill_plan_stats
     from vllm_gaudi.ops.deepseek_v41_prefill_index_scores import prefill_index_stats
+
     bucketed = bucketed_prefill_plan_stats()
     workspace_bytes = bucketed["workspace_bytes"] + sum(
-        t.numel() * t.element_size() for t in (*_workspaces.values(), *_attention_workspaces.values()))
-    return dict(executed=dict(_expert_audit),
-                bucketed_preparations=bucketed["preparations"],
-                bucketed_preparation_count=bucketed["preparation_count"],
-                bucketed_preparation_ms=bucketed["preparation_ms"],
-                index_query_tp=prefill_index_stats(),
-                plans=len(_plans) + bucketed["plans"],
-                recipes=sum(p.recipes for p in _plans.values()) + bucketed["recipes"],
-                replays=sum(p.replays for p in _plans.values()) + bucketed["replays"],
-                attention_plans=len(_attention_plans),
-                attention_recipes=sum(p.recipes for p in _attention_plans.values()),
-                attention_replays=sum(p.replays for p in _attention_plans.values()),
-                workspace_bytes=workspace_bytes)
+        t.numel() * t.element_size() for t in (*_workspaces.values(), *_attention_workspaces.values())
+    )
+    return dict(
+        executed=dict(_expert_audit),
+        bucketed_preparations=bucketed["preparations"],
+        bucketed_preparation_count=bucketed["preparation_count"],
+        bucketed_preparation_ms=bucketed["preparation_ms"],
+        index_query_tp=prefill_index_stats(),
+        plans=len(_plans) + bucketed["plans"],
+        recipes=sum(p.recipes for p in _plans.values()) + bucketed["recipes"],
+        replays=sum(p.replays for p in _plans.values()) + bucketed["replays"],
+        attention_plans=len(_attention_plans),
+        attention_recipes=sum(p.recipes for p in _attention_plans.values()),
+        attention_replays=sum(p.replays for p in _attention_plans.values()),
+        workspace_bytes=workspace_bytes,
+    )

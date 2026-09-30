@@ -54,6 +54,7 @@ def test_index_scores_cover_all_heads_and_keep_source_width(tp_size, token_rows)
 @pytest.mark.parametrize("tp_size", (2, 4))
 def test_index_query_scale_uses_global_head_count(monkeypatch, tp_size):
     from vllm_gaudi.ops import deepseek_v41_paged_attention as attention_module
+
     local_heads = 32 // tp_size
     projection, weight_projection = object(), object()
     attention = SimpleNamespace(
@@ -65,14 +66,16 @@ def test_index_query_scale_uses_global_head_count(monkeypatch, tp_size):
         gather=lambda value, dim: torch.cat([value] * tp_size, dim),
     )
     monkeypatch.setattr(attention_module, "fp4_roundtrip", lambda value, group: value)
-    query, weights = PagedCSA2Attention._prepare_index_queries(attention, torch.ones(2, 5), torch.ones(2, 5),
-                                                               torch.arange(2))
+    query, weights = PagedCSA2Attention._prepare_index_queries(
+        attention, torch.ones(2, 5), torch.ones(2, 5), torch.arange(2)
+    )
     assert query.shape == (2, 32, 128)
     torch.testing.assert_close(weights, torch.full((2, 32), 1 / 64), rtol=0, atol=0)
 
 
 def test_pp1_forward_preserves_final_output_and_completion_never_uses_peer(monkeypatch):
     from vllm_gaudi.v1.worker import deepseek_v41_runner as runner_module
+
     group = SimpleNamespace(is_first_rank=True, is_last_rank=True, ranks=[0])
     monkeypatch.setattr(runner_module, "get_pp_group", lambda: group)
     for name in ("PACKED_PP", "DEVICE_COMMIT", "PREFILL_PP_WAVEFRONT"):
@@ -115,27 +118,29 @@ def test_pp1_forward_preserves_final_output_and_completion_never_uses_peer(monke
 
 def test_pp1_final_collapse_and_four_way_greedy_ties():
     from vllm_gaudi.models.deepseek_v41_program import PreparedStage
+
     residual = torch.arange(32).reshape(2, 4, 4).float().bfloat16()
     pre = torch.ones(2, 4) / 4
-    stage = SimpleNamespace(tensor_parallel_size=4,
-                            dspark=False,
-                            shared=SimpleNamespace(),
-                            layers=[],
-                            is_last_stage=True,
-                            weights=SimpleNamespace(norm=SimpleNamespace(weight=torch.ones(4))),
-                            config={"text_config": {
-                                "rms_norm_eps": 1e-6
-                            }})
+    stage = SimpleNamespace(
+        tensor_parallel_size=4,
+        dspark=False,
+        shared=SimpleNamespace(),
+        layers=[],
+        is_last_stage=True,
+        weights=SimpleNamespace(norm=SimpleNamespace(weight=torch.ones(4))),
+        config={"text_config": {"rms_norm_eps": 1e-6}},
+    )
     value, _, aux = PreparedStage._forward_impl(stage, residual, pre, torch.arange(2), torch.ones(2), ())
     assert value.shape == (2, 4) and aux is None
     # TP2 and TP3 have the same maximum; the smaller global token ID wins.
-    logits = torch.tensor([[0., 1., 0., 3., 7., 1., 7., 2.]])
+    logits = torch.tensor([[0.0, 1.0, 0.0, 3.0, 7.0, 1.0, 7.0, 2.0]])
     candidates = [local_greedy_candidate(chunk, rank) for rank, chunk in enumerate(logits.chunk(4, -1))]
     assert select_greedy_candidate(torch.cat(candidates, -1)).item() == 4
 
 
 def test_trace_worker_coordinates_use_recorded_topology():
     from tools.collect_deepseek_v41_trace import worker_coordinates
+
     tp4 = {"topology": {"tensor_parallel_size": 4, "pipeline_parallel_size": 1}}
     assert [worker_coordinates(rank, tp4) for rank in range(4)] == [(0, rank) for rank in range(4)]
     assert [worker_coordinates(rank, {}) for rank in range(4)] == [(0, 0), (0, 1), (1, 0), (1, 1)]
@@ -143,11 +148,13 @@ def test_trace_worker_coordinates_use_recorded_topology():
         worker_coordinates(4, tp4)
 
 
-@pytest.mark.parametrize("tokens,expected", [(1, "compiled"), (6, "compiled"), (128, "prefill"), (8192, "prefill"),
-                                             (16384, "prefill")])
+@pytest.mark.parametrize(
+    "tokens,expected", [(1, "compiled"), (6, "compiled"), (128, "prefill"), (8192, "prefill"), (16384, "prefill")]
+)
 def test_tp4_model_forward_reaches_compiled_decode_without_tp2_replay(monkeypatch, tokens, expected):
     from vllm_gaudi.models.deepseek_v41 import HpuDeepseekV41ForCausalLM
     from vllm_gaudi.models.deepseek_v41_program import PrefillInput
+
     monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_GROUPED", "1")
     calls = []
 
@@ -165,21 +172,22 @@ def test_tp4_model_forward_reaches_compiled_decode_without_tp2_replay(monkeypatc
         calls.append("compiled")
         return residual[:, 0], pre, None
 
-    model = SimpleNamespace(program=Stage(),
-                            tensor_parallel_size=4,
-                            pp_rank=0,
-                            native=False,
-                            step_use_replay=False,
-                            step_ticket=object(),
-                            _decode_prefix=None,
-                            is_first_stage=True,
-                            is_last_stage=True,
-                            ordinary=compiled,
-                            engram_host=SimpleNamespace(wait=lambda ticket: ()),
-                            compiled_input_calls=0,
-                            compiled_input=lambda ids:
-                            (torch.ones(ids.numel(), 4, 5120).bfloat16(), torch.ones(ids.numel(), 4)),
-                            embed_input_ids=lambda ids: torch.ones(ids.numel(), 5120, dtype=torch.bfloat16))
+    model = SimpleNamespace(
+        program=Stage(),
+        tensor_parallel_size=4,
+        pp_rank=0,
+        native=False,
+        step_use_replay=False,
+        step_ticket=object(),
+        _decode_prefix=None,
+        is_first_stage=True,
+        is_last_stage=True,
+        ordinary=compiled,
+        engram_host=SimpleNamespace(wait=lambda ticket: ()),
+        compiled_input_calls=0,
+        compiled_input=lambda ids: (torch.ones(ids.numel(), 4, 5120).bfloat16(), torch.ones(ids.numel(), 4)),
+        embed_input_ids=lambda ids: torch.ones(ids.numel(), 5120, dtype=torch.bfloat16),
+    )
     ids = torch.arange(tokens)
     output = HpuDeepseekV41ForCausalLM.forward(model, ids, ids.int())
     assert calls == [expected]
@@ -191,12 +199,12 @@ def test_owned_prefill_releases_initial_activation_after_first_layer(monkeypatch
     import weakref
     from types import MethodType
     from vllm_gaudi.models.deepseek_v41_program import PrefillInput, PreparedStage
+
     monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_GROUPED", "1")
     owner = PrefillInput(torch.ones(128, 4, 64, dtype=torch.bfloat16), torch.ones(128, 4))
     original = weakref.ref(owner.residual)
 
     class Layer:
-
         def __init__(self, layer):
             self.layer = layer
 
@@ -207,11 +215,13 @@ def test_owned_prefill_releases_initial_activation_after_first_layer(monkeypatch
                 assert original() is None, "Outer call frames retain the consumed initial residual"
             return residual + 1, pre, None
 
-    stage = SimpleNamespace(tensor_parallel_size=4,
-                            dspark=False,
-                            is_last_stage=False,
-                            shared=SimpleNamespace(prefill_main_workspace=None),
-                            layers=[Layer(0), Layer(2)])
+    stage = SimpleNamespace(
+        tensor_parallel_size=4,
+        dspark=False,
+        is_last_stage=False,
+        shared=SimpleNamespace(prefill_main_workspace=None),
+        layers=[Layer(0), Layer(2)],
+    )
     stage._forward_impl = MethodType(PreparedStage._forward_impl, stage)
     ids = torch.arange(128)
     output, _, _ = PreparedStage.forward(stage, owner, None, ids, ids, ())

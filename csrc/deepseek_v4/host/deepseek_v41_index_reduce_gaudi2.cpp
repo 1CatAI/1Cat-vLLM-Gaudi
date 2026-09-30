@@ -9,9 +9,11 @@ GlueCodeReturn DeepseekV41IndexReduceGaudi2::GetGcDefinitions(
     if (!p || !out) return GLUE_FAILED;
     if (p->inputTensorNr != 3) return GLUE_INCOMPATIBLE_INPUT_COUNT;
     if (p->outputTensorNr != 1) return GLUE_INCOMPATIBLE_OUTPUT_COUNT;
-    if (!p->nodeParams.nodeParams || p->nodeParams.nodeParamsSize != sizeof(int))
+    if (!p->nodeParams.nodeParams || p->nodeParams.nodeParamsSize != 2*sizeof(int))
         return GLUE_INCOMPATIBLE_INPUT_SIZE;
-    const int ratio = *static_cast<const int*>(p->nodeParams.nodeParams);
+    const auto* params = static_cast<const int*>(p->nodeParams.nodeParams);
+    const int ratio = params[0], local_heads = params[1];
+    if(local_heads<1 || 32%local_heads) return GLUE_INCOMPATIBLE_INPUT_SIZE;
     const auto& raw = p->inputTensors[0].geometry;
     const auto& weights = p->inputTensors[1].geometry;
     const auto& positions = p->inputTensors[2].geometry;
@@ -35,8 +37,8 @@ GlueCodeReturn DeepseekV41IndexReduceGaudi2::GetGcDefinitions(
         out->inputTensorAccessPattern[i].sparseAccess = true;
     }
     out->outputTensorAccessPattern[0].allRequired = true;
-    out->kernel.paramsNr = 1;
-    std::memcpy(out->kernel.scalarParams, &ratio, sizeof(ratio));
+    out->kernel.paramsNr = 2;
+    std::memcpy(out->kernel.scalarParams, params, 2*sizeof(int));
     const auto size = &_binary___deepseek_v41_index_reduce_bf16_gaudi2_o_end -
                       &_binary___deepseek_v41_index_reduce_bf16_gaudi2_o_start;
     const auto capacity = out->kernel.elfSize;

@@ -20,13 +20,15 @@ def _result_metadata(node):
     meta = dict(node.meta)
     value = meta.get("val")
     if isinstance(value, torch.Tensor):
-        defaults = dict(output_device=value.device,
-                        output_dtypes=[value.dtype],
-                        output_layouts=[value.layout],
-                        output_shapes=[list(value.shape)],
-                        output_strides=[list(value.stride())],
-                        output_offset=[value.storage_offset()],
-                        output_contiguous=[value.is_contiguous()])
+        defaults = dict(
+            output_device=value.device,
+            output_dtypes=[value.dtype],
+            output_layouts=[value.layout],
+            output_shapes=[list(value.shape)],
+            output_strides=[list(value.stride())],
+            output_offset=[value.storage_offset()],
+            output_contiguous=[value.is_contiguous()],
+        )
         for key, default in defaults.items():
             meta.setdefault(key, default)
     return meta
@@ -42,8 +44,14 @@ def _partition_metadata(child):
     meta = {"val": tuple(item.get("val") for item in items), "_mhc_result_meta": items}
     if items:
         meta["output_device"] = items[0].get("output_device")
-        for key in ("output_dtypes", "output_layouts", "output_shapes", "output_strides", "output_offset",
-                    "output_contiguous"):
+        for key in (
+            "output_dtypes",
+            "output_layouts",
+            "output_shapes",
+            "output_strides",
+            "output_offset",
+            "output_contiguous",
+        ):
             meta[key] = [value for item in items for value in item.get(key, [])]
     return meta
 
@@ -65,9 +73,12 @@ def deduplicate_float_casts(module, selected):
             removed += 1
         else:
             source = node.args[0]
-            base = (source.args[0]
-                    if isinstance(source, torch.fx.Node) and source.target == torch.ops.aten.view.default else None)
-            base_key = ((base, ), key[1])
+            base = (
+                source.args[0]
+                if isinstance(source, torch.fx.Node) and source.target == torch.ops.aten.view.default
+                else None
+            )
+            base_key = ((base,), key[1])
             if base is not None and base_key in seen:
                 # Casting the residual once and viewing the FP32 result keeps
                 # element order and every later reduction/rounding boundary.
@@ -109,8 +120,12 @@ def _private_add(node):
     if not isinstance(value, torch.fx.Node) or not _pure(value) or value.op != "call_function":
         return False
     schema = value.target._schema
-    return (len(value.users) == 1 and node in value.users and len(schema.returns) == 1
-            and schema.returns[0].alias_info is None)
+    return (
+        len(value.users) == 1
+        and node in value.users
+        and len(schema.returns) == 1
+        and schema.returns[0].alias_info is None
+    )
 
 
 def independent_mhc_nodes(module, dependent_inputs):
@@ -123,7 +138,8 @@ def independent_mhc_nodes(module, dependent_inputs):
             tainted.add(node)
     controls = ("deepseek_v41_control_gemv", "deepseek_v41_control_batch4_f32", "deepseek_v41_control_prefetch_f32")
     seeds = [
-        node for node in nodes
+        node
+        for node in nodes
         if node not in tainted and any(name in str(node.target) for name in (*controls, "deepseek_v4_sinkhorn4"))
     ]
     # A sinkhorn-free/quantized/draft graph is not this candidate's contract.
@@ -148,8 +164,11 @@ def independent_mhc_nodes(module, dependent_inputs):
     # Retain the residual mixing branch through the last independent arithmetic
     # node. A dependent merge is deliberately left in the consumer partition.
     for node in nodes:
-        if (node not in tainted and any(argument in selected for argument in node.all_input_nodes)
-                and (_pure(node) or _private_add(node))):
+        if (
+            node not in tainted
+            and any(argument in selected for argument in node.all_input_nodes)
+            and (_pure(node) or _private_add(node))
+        ):
             include(node)
     return selected
 
@@ -179,11 +198,12 @@ def crosses_mutable_storage(module, selected):
 
 def split_mhc_consumers(module, exchange):
     graph = module.graph
+    exchanges = exchange if isinstance(exchange, tuple) else (exchange,)
 
     def peer_value(node):
         if not isinstance(node, torch.fx.Node) or node.op != "call_function":
             return False
-        return node.target == exchange or any(peer_value(argument) for argument in node.all_input_nodes)
+        return node.target in exchanges or any(peer_value(argument) for argument in node.all_input_nodes)
 
     audit = []
     for call in list(graph.nodes):
@@ -221,6 +241,7 @@ def split_mhc_consumers(module, exchange):
                         # every original getitem user without allocating data.
                         for user in list(call.users):
                             import operator
+
                             if user.op != "call_function" or user.target != operator.getitem:
                                 raise RuntimeError("mHC split requires explicit tuple-output consumers")
                             user.replace_all_uses_with(result[user.args[1]])
@@ -232,8 +253,9 @@ def split_mhc_consumers(module, exchange):
                     target = f"{call.target}_mhc_{node.target}"
                     partition = wrapper.get_submodule(node.target)
                     module.add_submodule(target, partition)
-                    copied = graph.call_module(target, map_arg(node.args, env.__getitem__),
-                                               map_arg(node.kwargs, env.__getitem__))
+                    copied = graph.call_module(
+                        target, map_arg(node.args, env.__getitem__), map_arg(node.kwargs, env.__getitem__)
+                    )
                     copied.meta = {
                         key: value
                         for key, value in call.meta.items()
@@ -245,19 +267,22 @@ def split_mhc_consumers(module, exchange):
                 else:
                     copied = graph.node_copy(node, env.__getitem__)
                     import operator
+
                     if node.target != operator.getitem or "_mhc_result_meta" not in copied.args[0].meta:
                         raise RuntimeError("Unexpected mHC partition wrapper operation")
                     copied.meta = dict(copied.args[0].meta["_mhc_result_meta"][copied.args[1]])
                     copied.meta["placement"] = "eager"
                 env[node] = copied
         graph.erase_node(call)
-        audit.append({
-            "partition": call.target,
-            "independent_nodes": len(selected),
-            "casts_removed": casts_removed,
-            "private_adds_restored": len(private_adds),
-            "operators": [str(node.target) for node in child.graph.nodes if node in selected]
-        })
+        audit.append(
+            {
+                "partition": call.target,
+                "independent_nodes": len(selected),
+                "casts_removed": casts_removed,
+                "private_adds_restored": len(private_adds),
+                "operators": [str(node.target) for node in child.graph.nodes if node in selected],
+            }
+        )
     if audit:
         graph.lint()
         module.recompile()
@@ -272,20 +297,34 @@ def make_backend():
     def transform(ctx):
         import os
         from pathlib import Path
+
         directory = os.environ.get("VLLM_HPU_TP2_PLAN_DUMP_DIR")
         if directory:
             root = Path(directory) / f"rank{os.environ.get('LOCAL_RANK', '0')}"
             root.mkdir(parents=True, exist_ok=True)
             (root / f"overlap-input-{id(ctx.graph_module)}.py").write_text(
-                ctx.graph_module.print_readable(print_output=False))
-        audit = split_mhc_consumers(ctx.graph_module, torch.ops.vllm_gaudi.tp2_exchange_peer.default)
+                ctx.graph_module.print_readable(print_output=False)
+            )
+        audit = split_mhc_consumers(
+            ctx.graph_module,
+            (
+                torch.ops.vllm_gaudi.tp2_exchange_peer.default,
+                torch.ops.vllm_gaudi.tp_peer_allgather.default,
+                torch.ops.vllm_gaudi.tp_peer_allgather_scheduled.default,
+            ),
+        )
         from vllm_gaudi import envs
+
         tile_partitions = 0
         if envs.VLLM_HPU_DSV41_REINDEX_BOUNDED_PLAN:
             from vllm_gaudi.compilation.deepseek_v41_reindex import split_reindex_tiles
+
             tile_partitions = split_reindex_tiles(ctx.graph_module)
-        logger().info("V4.1 TP/mHC partition transform examined %d modules, split %d",
-                      sum(node.op == "call_module" for node in ctx.graph_module.graph.nodes), len(audit))
+        logger().info(
+            "V4.1 TP/mHC partition transform examined %d modules, split %d",
+            sum(node.op == "call_module" for node in ctx.graph_module.graph.nodes),
+            len(audit),
+        )
         if audit or tile_partitions:
             # Full fake propagation after Bridge partitioning replays already
             # canonicalized views and rejects their saved storage offsets.

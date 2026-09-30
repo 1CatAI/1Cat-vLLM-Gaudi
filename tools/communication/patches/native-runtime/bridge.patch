@@ -121,3 +121,21 @@ index a1cead7e4..0b4933318 100644
   protected:
    void groupStart() override;
  
+diff --git a/habana_eager/eager_exec.cpp b/habana_eager/eager_exec.cpp
+index c6333a976..11382f9dc 100644
+--- a/habana_eager/eager_exec.cpp
++++ b/habana_eager/eager_exec.cpp
+@@ -725,6 +725,13 @@ size_t EagerExec::calculate_operator_key(
+               update_key_for_tensor(tensor, optimized_key);
+             }
+           }});
++  // Concat's axis selects the Synapse node class (FCD or logical concat).
++  // Shape-agnostic graph reuse may patch params, but cannot change that class.
++  // Keep the axis in the cache key while retaining reuse across input shapes.
++  if (m_symbol == c10::Symbol::fromQualString("aten::cat")) {
++    optimized_key =
++        at::hash_combine(optimized_key, at::IValue::hash(stack.at(1)));
++  }
+   return optimized_key;
+ }
+ 

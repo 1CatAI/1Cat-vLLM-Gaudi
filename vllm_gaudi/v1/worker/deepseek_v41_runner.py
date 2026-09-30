@@ -19,11 +19,12 @@ import torch.distributed as dist
 from vllm.distributed import get_pp_group
 from vllm.model_executor.model_loader import get_model
 from vllm.sequence import IntermediateTensors
-from vllm.v1.outputs import (AsyncModelRunnerOutput, DraftTokenIds, EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput)
+from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 
 from vllm_gaudi import envs
 from vllm_gaudi.extension.logger import logger as init_logger
 from vllm_gaudi.extension.profiler import HabanaHighLevelProfiler
+from vllm_gaudi.ops.deepseek_v41_config import decode_source_prefix_bound
 from vllm_gaudi.ops.deepseek_v41_indexer import INDEX_MME_HOT_TOKENS
 from vllm_gaudi.ops.deepseek_v41_state import PagedStageState, StageStateBlocks, register_state_spec
 from vllm_gaudi.ops.deepseek_v41_verify import (
@@ -66,7 +67,6 @@ def profile_phase(name):
     """Annotate host phases only during an explicitly requested acquisition."""
 
     def decorate(function):
-
         @wraps(function)
         def wrapped(self, *args, **kwargs):
             if not getattr(self, "trace_enabled", False):
@@ -82,6 +82,7 @@ def profile_phase(name):
                 label += f"::C{args[1].numel()}"
             if os.getenv("VLLM_HPU_DSV41_RAW_TRACE", "0") == "1":
                 from vllm_gaudi.ops.deepseek_v41_native_trace import scope
+
                 with scope(label):
                     return function(self, *args, **kwargs)
             with torch.profiler.record_function(label):
@@ -124,10 +125,20 @@ class RequestState:
     def decode_start(self):
         # A preempted request must replay its generated prefix as prefill too.
         return max(len(self.prompt), self.recompute_until)
+    def token_slice(self, start, stop):
+        """Select the scheduled prefix without materializing the full history."""
+        if not 0 <= start <= stop:
+            raise ValueError("Scheduled token range must be nonnegative and ordered")
+        boundary = len(self.prompt)
+        if start >= boundary:
+            return self.output[start - boundary : stop - boundary]
+        if stop <= boundary:
+            return self.prompt[start:stop]
+        return self.prompt[start:] + self.output[: stop - boundary]
 
     def reconcile(self, output_count, new_tokens, all_tokens=None):
         if all_tokens is not None:
-            self.output = list(all_tokens[len(self.prompt):len(self.prompt) + output_count])
+            self.output = list(all_tokens[len(self.prompt) : len(self.prompt) + output_count])
         elif output_count > len(self.output):
             missing = output_count - len(self.output)
             if len(new_tokens) < missing:
@@ -146,7 +157,7 @@ def greedy_verify(target_ids, proposed_ids):
         if predicted != proposed:
             break
         accepted += 1
-    return target_ids[:accepted + 1], accepted
+    return target_ids[: accepted + 1], accepted
 
 
 def target_chunks(tokens, block_tokens=PREFILL_BLOCK_TOKENS):
@@ -164,7 +175,7 @@ def target_chunks(tokens, block_tokens=PREFILL_BLOCK_TOKENS):
     while offset < len(tokens):
         remaining = len(tokens) - offset
         size = next((candidate for candidate in buckets if candidate <= remaining), 1)
-        yield offset, tokens[offset:offset + size]
+        yield offset, tokens[offset : offset + size]
         offset += size
 
 
@@ -188,7 +199,12 @@ def runtime_search_length(start, count, maximum):
     if start + count <= 512:
         return min(maximum, 512)
     hot = min(maximum, INDEX_MME_HOT_TOKENS)
-    return hot if start + count <= hot else maximum
+    if start + count <= hot:
+        return hot
+    # Both TP geometries reuse the same bounded derived key cache and MME
+    # scorer. Larger requests retain the canonical capacity-independent scan.
+    bounded = min(maximum, 32768)
+    return bounded if start + count <= bounded else maximum
 
 
 def prefill_search_length(start, count, maximum, *, reuse_index_keys=False):
@@ -201,6 +217,8 @@ def prefill_search_length(start, count, maximum, *, reuse_index_keys=False):
     search = runtime_search_length(start, count, maximum)
     if reuse_index_keys and INDEX_MME_HOT_TOKENS < start + count <= 32768:
         return min(maximum, 32768)
+    if not reuse_index_keys and start + count > INDEX_MME_HOT_TOKENS:
+        return maximum
     return search
 
 
@@ -212,7 +230,13 @@ def decode_search_warmups(maximum, *, runtime_indexer=False):
         if hot > 512:
             yield 512, hot
         if hot < maximum:
-            yield hot, maximum
+            bounded = min(maximum, 32768)
+            # Native recipes specialize their visible rows in 4K buckets.
+            # Prepare each finite geometry before accepting decode requests.
+            for start in range(hot, bounded, 4096):
+                yield start, bounded
+            if bounded < maximum:
+                yield bounded, maximum
         return
     start = 0
     while start < maximum:
@@ -234,8 +258,10 @@ def _exchange_payload_views(exchange_wire, capacity, hidden_slots=4, hidden_widt
     pre_elements = hidden_slots * 4
     expected = (capacity, hidden_elements + pre_elements)
     if exchange_wire.dtype != torch.bfloat16 or tuple(exchange_wire.shape) != expected:
-        raise ValueError(f"invalid V4.1 PP BF16 exchange wire: dtype={exchange_wire.dtype}, "
-                         f"shape={tuple(exchange_wire.shape)} != {expected}")
+        raise ValueError(
+            f"invalid V4.1 PP BF16 exchange wire: dtype={exchange_wire.dtype}, "
+            f"shape={tuple(exchange_wire.shape)} != {expected}"
+        )
     hidden = exchange_wire[:, :hidden_elements].reshape(capacity, hidden_slots, hidden_width)
     pre = torch.empty((capacity, hidden_slots), dtype=torch.float32, device=exchange_wire.device)
     return hidden, pre
@@ -263,11 +289,10 @@ def _decode_exchange_pre(wire, pre):
 
 
 class PPBuffers:
-
     def __init__(self, device, capacity=6, *, dspark=True, device_commit=None):
         self.group = get_pp_group()
         self.dspark = bool(dspark)
-        self.single_stage = (getattr(self.group, "is_first_rank", False) and getattr(self.group, "is_last_rank", False))
+        self.single_stage = getattr(self.group, "is_first_rank", False) and getattr(self.group, "is_last_rank", False)
         if self.single_stage:
             if self.dspark:
                 raise ValueError("Single-stage V4.1 does not yet support DSpark")
@@ -275,10 +300,11 @@ class PPBuffers:
             # Avoid reserving a full prompt-sized transport allocation.
             capacity = 0
         if not self.dspark:
-            self.device_commit_enabled = (envs.VLLM_HPU_DSV41_DEVICE_COMMIT
-                                          if device_commit is None else bool(device_commit))
+            self.device_commit_enabled = (
+                envs.VLLM_HPU_DSV41_DEVICE_COMMIT if device_commit is None else bool(device_commit)
+            )
             self.device_commit = self.device_commit_enabled
-            if (self.device_commit_enabled and not envs.VLLM_HPU_DSV41_GRAPH_REPLAY):
+            if self.device_commit_enabled and not envs.VLLM_HPU_DSV41_GRAPH_REPLAY:
                 raise ValueError("Device completion requires ordinary V4.1 native decode")
             self.prefill_wavefront = bool(envs.VLLM_HPU_DSV41_PREFILL_PP_WAVEFRONT)
             slot_count = PREFILL_WAVEFRONT_SLOTS if self.prefill_wavefront else 1
@@ -295,8 +321,9 @@ class PPBuffers:
             self.prefill_generation = 0
             self.prefill_active_slot = None
             self.prefill_send_works = [[] for _ in range(slot_count)]
-            self.prefill_consumer_events = ([torch.hpu.Event()
-                                             for _ in range(slot_count)] if self.prefill_wavefront else [None])
+            self.prefill_consumer_events = (
+                [torch.hpu.Event() for _ in range(slot_count)] if self.prefill_wavefront else [None]
+            )
             self.prefill_consumer_pending = [False] * slot_count
             self.prefill_packed_consumer = None
             self.prefill_packed_consumer_pending = False
@@ -316,17 +343,20 @@ class PPBuffers:
             self.pending = []
             self.sends = self.receives = self.commits = 0
             self.packed = None
-            if (envs.VLLM_HPU_DSV41_NATIVE_PP_COPY
-                    and (not envs.VLLM_HPU_DSV41_PACKED_PP or not envs.VLLM_HPU_DSV41_GRAPH_REPLAY)):
+            if envs.VLLM_HPU_DSV41_NATIVE_PP_COPY and (
+                not envs.VLLM_HPU_DSV41_PACKED_PP or not envs.VLLM_HPU_DSV41_GRAPH_REPLAY
+            ):
                 raise ValueError("Native PP copy requires ordinary packed C1 graph replay")
             if envs.VLLM_HPU_DSV41_PACKED_PP:
                 from vllm_gaudi.ops.deepseek_v41_pp import PackedC1Buffers
+
                 self.packed = PackedC1Buffers(device, native_copy=envs.VLLM_HPU_DSV41_NATIVE_PP_COPY)
             return
         if envs.VLLM_HPU_DSV41_MHC_SCHEDULE and not envs.VLLM_HPU_DSV41_GRAPH_REPLAY:
             raise RuntimeError("mHC scheduling requires V4.1 native graph replay")
-        if envs.VLLM_HPU_DSV41_DIRECT_PP_WIRE and not (envs.VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE
-                                                       and envs.VLLM_HPU_DSV41_GRAPH_REPLAY):
+        if envs.VLLM_HPU_DSV41_DIRECT_PP_WIRE and not (
+            envs.VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE and envs.VLLM_HPU_DSV41_GRAPH_REPLAY
+        ):
             raise RuntimeError("Direct PP wire requires native stage replay and direct PP exchange")
         # A stage boundary used to enqueue one transfer for hidden and a
         # second transfer for pre_mix. Keep aligned typed views in one BF16
@@ -342,9 +372,9 @@ class PPBuffers:
         # [C,4,5120] stage boundary.
         # Keep the payload flat and use BF16 so HCCL/HCL does not insert a
         # uint8 compatibility conversion.
-        self.exchange_wire = torch.empty((capacity, hidden_elements + pre_elements),
-                                         dtype=torch.bfloat16,
-                                         device=device)
+        self.exchange_wire = torch.empty(
+            (capacity, hidden_elements + pre_elements), dtype=torch.bfloat16, device=device
+        )
         self.hidden, self.pre = _exchange_payload_views(self.exchange_wire, capacity, hidden_slots, hidden_width)
         self.pre_wire = self.exchange_wire[:, hidden_elements:].reshape(capacity, hidden_slots, 4)
         # The direct peer API is implemented by the version-locked TP2 HCL
@@ -372,11 +402,16 @@ class PPBuffers:
         self.device_limit = torch.empty(1, dtype=torch.int64, device=device)
         self.device_host = torch.empty(8, dtype=torch.int64, device="cpu").pin_memory("hpu")
         self.device_event = torch.hpu.Event()
-        self.device_validate = (torch.compile(validate_commit, backend="hpu_backend", fullgraph=True, dynamic=False)
-                                if envs.VLLM_HPU_DSV41_DEVICE_VERIFY else None)
-        self.device_validate_wire = (torch.compile(
-            validate_commit_wire, backend="hpu_backend", fullgraph=True,
-            dynamic=False) if envs.VLLM_HPU_DSV41_DEVICE_VERIFY and envs.VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE else None)
+        self.device_validate = (
+            torch.compile(validate_commit, backend="hpu_backend", fullgraph=True, dynamic=False)
+            if envs.VLLM_HPU_DSV41_DEVICE_VERIFY
+            else None
+        )
+        self.device_validate_wire = (
+            torch.compile(validate_commit_wire, backend="hpu_backend", fullgraph=True, dynamic=False)
+            if envs.VLLM_HPU_DSV41_DEVICE_VERIFY and envs.VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE
+            else None
+        )
         # The direct PP commit is compiled after the HPU bridge has been
         # registered in ``load_model``.  Keeping the exchange and wire
         # validator in one fixed graph makes the reverse handoff visible to
@@ -402,8 +437,9 @@ class PPBuffers:
         # event on PP1; PP0 has no local producer dependency.  This lets the
         # two stages submit the small commit exchange while their compute
         # streams drain independently.
-        self.commit_stream = (torch.hpu.Stream() if
-                              (envs.VLLM_HPU_DSV41_DEVICE_VERIFY and envs.VLLM_HPU_DSV41_INLINE_PP_COMMIT) else None)
+        self.commit_stream = (
+            torch.hpu.Stream() if (envs.VLLM_HPU_DSV41_DEVICE_VERIFY and envs.VLLM_HPU_DSV41_INLINE_PP_COMMIT) else None
+        )
         self.commit_record_events = {}
         # PP1 can overlap the next stage-boundary exchange with a prior commit
         # broadcast.  Keep the work handle by source-ring address so a record
@@ -413,17 +449,21 @@ class PPBuffers:
 
     def prepare_commit_graph(self):
         """Compile the fixed direct PP commit exchange once per worker."""
-        if (not self.dspark or not envs.VLLM_HPU_DSV41_DEVICE_VERIFY or not envs.VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE
-                or not envs.VLLM_HPU_DSV41_COMPILED_PP_COMMIT):
+        if (
+            not self.dspark
+            or not envs.VLLM_HPU_DSV41_DEVICE_VERIFY
+            or not envs.VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE
+            or not envs.VLLM_HPU_DSV41_COMPILED_PP_COMMIT
+        ):
             return
         from vllm_gaudi.ops.deepseek_v41_verify import pp_commit_receive, pp_commit_send
+
         if self.group.is_last_rank:
             self.commit_send_graph = torch.compile(pp_commit_send, backend="hpu_backend", fullgraph=True, dynamic=False)
         else:
-            self.commit_receive_graph = torch.compile(pp_commit_receive,
-                                                      backend="hpu_backend",
-                                                      fullgraph=True,
-                                                      dynamic=False)
+            self.commit_receive_graph = torch.compile(
+                pp_commit_receive, backend="hpu_backend", fullgraph=True, dynamic=False
+            )
 
     def drain(self, *, include_commit=True):
         if not self.dspark:
@@ -481,8 +521,11 @@ class PPBuffers:
             transfer_wire = self.exchange_wire[:count]
             if "pp_wire" in values.tensors:
                 wire = values["pp_wire"]
-                if (wire.shape != self.exchange_wire[:count].shape or wire.dtype != torch.bfloat16
-                        or not wire.is_contiguous()):
+                if (
+                    wire.shape != self.exchange_wire[:count].shape
+                    or wire.dtype != torch.bfloat16
+                    or not wire.is_contiguous()
+                ):
                     raise RuntimeError("Compiled PP output violates the contiguous BF16 wire contract")
                 if envs.VLLM_HPU_DSV41_DIRECT_PP_WIRE and envs.VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE:
                     # Native stage outputs are held through communication
@@ -500,21 +543,25 @@ class PPBuffers:
                 # keep the direct-boundary contract explicit for callers
                 # constructing PPBuffers in isolation.
                 from vllm_gaudi.distributed import tp2_fused_ar_norm  # noqa: F401
+
                 torch.ops.vllm_gaudi.pp_exchange_peer(transfer_wire, self.exchange_peer[:count])
             else:
                 self.pending.append(
-                    dist.isend(self.exchange_wire[:count], dst=self.group.ranks[1], group=self.group.device_group))
+                    dist.isend(self.exchange_wire[:count], dst=self.group.ranks[1], group=self.group.device_group)
+                )
             self.sends += 1
             return None
         if envs.VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE:
             from vllm_gaudi.distributed import tp2_fused_ar_norm  # noqa: F401
+
             # The direct API is collective on the two-rank PP communicator;
             # receive PP0's wire in place and contribute the persistent zero
             # source to its SUM reduction.
             torch.ops.vllm_gaudi.pp_exchange_peer(self.exchange_zero[:count], self.exchange_wire[:count])
         else:
             self.pending.append(
-                dist.irecv(self.exchange_wire[:count], src=self.group.ranks[0], group=self.group.device_group))
+                dist.irecv(self.exchange_wire[:count], src=self.group.ranks[0], group=self.group.device_group)
+            )
             self.drain(include_commit=self.group.is_first_rank)
         self.receives += 1
         if native_wire:
@@ -613,7 +660,7 @@ class PPBuffers:
             raise RuntimeError("Stale or invalid PP verify commit generation")
         self.commit_consumed_generation = self.generation
         self.commits += 1
-        return record[1], record[4:4 + record[2]], record[10:10 + record[3]]
+        return record[1], record[4 : 4 + record[2]], record[10 : 10 + record[3]]
 
     def complete_packet(self):
         if not self.dspark and self.packed is not None:
@@ -647,6 +694,7 @@ class PPBuffers:
         if self.dspark or not enabled:
             raise RuntimeError("Device completion is not enabled for ordinary C1")
         from vllm_gaudi.distributed.tp2_fused_ar_norm import _resolve_runtime
+
         self.drain()
         self.generation += 1
         self.group.broadcast(self.commit, src=1)
@@ -670,7 +718,7 @@ class PPBuffers:
         PP0 validates and reads it only from the returned async result at the
         scheduler's actual consume point.
         """
-        if (self.group.is_first_rank and self.generation != self.commit_consumed_generation):
+        if self.group.is_first_rank and self.generation != self.commit_consumed_generation:
             raise RuntimeError("PP device commit still has an unconsumed result")
         # PP0 must not reuse its receive/validation buffer before the prior
         # commit has been consumed.  PP1's source is a verify-ring slot,
@@ -697,8 +745,12 @@ class PPBuffers:
                     raise RuntimeError("PP1 did not produce a complete device verify record")
                 if record.dtype != self.device_commit.dtype or record.device != self.device_commit.device:
                     raise RuntimeError("PP1 device verify record has an incompatible wire type")
-                if (wire_record is None or wire_record.dtype != torch.bfloat16 or wire_record.numel() != RECORD_SIZE * 4
-                        or wire_record.device != self.commit_wire.device):
+                if (
+                    wire_record is None
+                    or wire_record.dtype != torch.bfloat16
+                    or wire_record.numel() != RECORD_SIZE * 4
+                    or wire_record.device != self.commit_wire.device
+                ):
                     raise RuntimeError("PP1 did not produce a complete BF16 commit wire")
                 wire = wire_record
                 peer = self.commit_peer
@@ -719,7 +771,7 @@ class PPBuffers:
         if self.group.is_last_rank and commit_stream is not None:
             input_event = torch.hpu.Event()
             input_event.record(torch.hpu.current_stream())
-        stream_context = (torch.hpu.stream(commit_stream) if commit_stream is not None else nullcontext())
+        stream_context = torch.hpu.stream(commit_stream) if commit_stream is not None else nullcontext()
         device_result = None
         timing = getattr(self, "timing", None)
         if timing:
@@ -734,6 +786,7 @@ class PPBuffers:
             with torch.profiler.record_function("v41::pp_commit::device_broadcast"):
                 if direct:
                     from vllm_gaudi.distributed import tp2_fused_ar_norm  # noqa: F401
+
                     if envs.VLLM_HPU_DSV41_COMPILED_PP_COMMIT:
                         if self.group.is_first_rank:
                             if self.commit_receive_graph is None:
@@ -788,12 +841,12 @@ class PPBuffers:
             timing.host("consume_start")
         if not isinstance(result, DevicePPCommit):
             raise RuntimeError("Invalid PP device commit result")
-        if (result.generation != self.generation or result.generation == self.commit_consumed_generation):
+        if result.generation != self.generation or result.generation == self.commit_consumed_generation:
             raise RuntimeError("Stale PP device verify generation")
         if self.device_validate is None:
             raise RuntimeError("Device verify validator was not compiled")
         commit_stream = getattr(self, "commit_stream", None)
-        stream_context = (torch.hpu.stream(commit_stream) if commit_stream is not None else nullcontext())
+        stream_context = torch.hpu.stream(commit_stream) if commit_stream is not None else nullcontext()
         with stream_context:
             with torch.profiler.record_function("v41::pp_commit::validate"):
                 # The broadcast and validator share the active HPU stream.  The
@@ -857,7 +910,7 @@ class PPBuffers:
         self.commit_consumed_generation = result.generation
         if timing:
             timing.host("consume_done")
-        return committed, values[2:2 + output_count]
+        return committed, values[2 : 2 + output_count]
 
 
 class V41ModelRunner:
@@ -878,6 +931,7 @@ class V41ModelRunner:
         self.pending = self.draft_token_ids = None
         self.use_dspark = envs.VLLM_HPU_DSV41_DSPARK
         self._token_copy = self._next_input = None
+        self.tp4_token_readback = None
         self.active_request = None
         self.trace_enabled = False
         # Generic multimodal batching uses the platform's pageable path;
@@ -886,12 +940,15 @@ class V41ModelRunner:
         self.profiler = HabanaHighLevelProfiler()
         self.model_memory_usage = self.mem_margin = 0
         self.serving_workspace_reserve = (3 << 30) if self.model_config.max_model_len > 512 else 0
-        self.prefill_capacity = prefill_capacity(vllm_config.scheduler_config.max_num_batched_tokens,
-                                                 vllm_config.parallel_config.tensor_parallel_size)
-        self.pp = PPBuffers(self.device,
-                            capacity=self.prefill_capacity,
-                            dspark=self.use_dspark,
-                            device_commit=False if self.v2_completion else None)
+        self.prefill_capacity = prefill_capacity(
+            vllm_config.scheduler_config.max_num_batched_tokens, vllm_config.parallel_config.tensor_parallel_size
+        )
+        self.pp = PPBuffers(
+            self.device,
+            capacity=self.prefill_capacity,
+            dspark=self.use_dspark,
+            device_commit=False if self.v2_completion else None,
+        )
         self.input_ids = torch.empty(self.prefill_capacity, dtype=torch.int64, device=self.device)
         self.positions = torch.empty(self.prefill_capacity, dtype=torch.int32, device=self.device)
         # Decode/DSpark reuse exact Tensor objects. Large-M prompt buckets are
@@ -899,13 +956,16 @@ class V41ModelRunner:
         # wrappers merely to represent all possible lengths through C8192.
         self.input_views = {count: self.input_ids[:count] for count in range(1, 129)}
         self.position_views = {count: self.positions[:count] for count in range(1, 129)}
-        self.direct_token_ids = (envs.VLLM_HPU_DSV41_DIRECT_TOKEN_IDS and not self.use_dspark)
-        self.decode_ids = (torch.empty(1, dtype=torch.int32, device=self.device) if self.direct_token_ids else None)
+        self.direct_token_ids = envs.VLLM_HPU_DSV41_DIRECT_TOKEN_IDS and not self.use_dspark
+        self.decode_ids = torch.empty(1, dtype=torch.int32, device=self.device) if self.direct_token_ids else None
         self.position_bank = None
         if envs.VLLM_HPU_DSV41_FIXED_POSITIONS and not self.use_dspark:
             from vllm_gaudi.ops.deepseek_v41_inputs import PositionBank
+
             self.position_bank = PositionBank(self.model_config.max_model_len, self.prefill_capacity, self.device)
         self.input_staging = None
+        self.tp4_control_inputs = {}
+        self._decode_geometry_key = None
         self.batched_input_staging = envs.VLLM_HPU_DSV41_BATCHED_INPUT_STAGING
         if self.batched_input_staging and not envs.VLLM_HPU_DSV41_FUSED_STAGE_IO:
             raise RuntimeError("Batched input staging requires fused stage I/O")
@@ -917,10 +977,12 @@ class V41ModelRunner:
             self.input_dma_pending = [False, False]
             self.input_generation = 0
             offsets = torch.arange(6, device=self.device, dtype=torch.int32)
-            self.prepare_positions = torch.compile(lambda control: control[6].to(torch.int32) + offsets,
-                                                   backend="hpu_backend",
-                                                   fullgraph=True,
-                                                   dynamic=False)
+            self.prepare_positions = torch.compile(
+                lambda control: control[6].to(torch.int32) + offsets,
+                backend="hpu_backend",
+                fullgraph=True,
+                dynamic=False,
+            )
         self.verify_ring = None
         self.verify_records = {}
         self.round_records = []
@@ -946,12 +1008,12 @@ class V41ModelRunner:
         self.verify_control_host = torch.empty(VERIFY_CONTROL_SIZE, dtype=torch.int64, device="cpu").pin_memory("hpu")
         self.verify_metadata_host = self.verify_control_host[:VERIFY_METADATA_SIZE]
         self.verify_proposed_host = self.verify_control_host[VERIFY_METADATA_SIZE:]
-        self.verify_hidden = torch.empty((6, getattr(self.model_config.hf_config, "hidden_size", 5120)),
-                                         dtype=torch.bfloat16,
-                                         device=self.device)
-        self.verify_aux = torch.empty((6, 3 * getattr(self.model_config.hf_config, "hidden_size", 5120)),
-                                      dtype=torch.bfloat16,
-                                      device=self.device)
+        self.verify_hidden = torch.empty(
+            (6, getattr(self.model_config.hf_config, "hidden_size", 5120)), dtype=torch.bfloat16, device=self.device
+        )
+        self.verify_aux = torch.empty(
+            (6, 3 * getattr(self.model_config.hf_config, "hidden_size", 5120)), dtype=torch.bfloat16, device=self.device
+        )
         self.audit = {
             "target_steps": 0,
             "target_tokens": 0,
@@ -961,13 +1023,14 @@ class V41ModelRunner:
             "requests": 0,
             "prefill_steps": 0,
             "decode_steps": 0,
-            "image_encodes": 0
+            "image_encodes": 0,
         }
 
     def load_model(self):
         before = torch.hpu.memory_allocated()
         if envs.VLLM_HPU_DSV41_GRAPH_REPLAY:
             from vllm_gaudi.distributed.tp2_fused_ar_norm import initialize_tp2_fused_ar_norm_runtime
+
             initialize_tp2_fused_ar_norm_runtime()
         # Compile the PP commit graph only after the bridge has registered its
         # custom op.  This keeps normal/non-direct paths unchanged.
@@ -977,30 +1040,43 @@ class V41ModelRunner:
         # loading so their first use is outside the serving request.
         if envs.VLLM_HPU_DSV41_PREFILL_GROUPED and envs.VLLM_HPU_DSV41_PREFILL_DEVICE_ROUTES:
             from vllm_gaudi.ops.deepseek_v41_grouped_prefill import prepare_device_grouped_prefill_recipes
+
             prepare_device_grouped_prefill_recipes(
                 normal_scales=True,
                 tensor_parallel_size=self.vllm_config.parallel_config.tensor_parallel_size,
-                prefill_tokens=self.prefill_capacity)
+                prefill_tokens=self.prefill_capacity,
+            )
         self.model = get_model(vllm_config=self.vllm_config)
+        if getattr(self.model, "tensor_parallel_size", 2) == 4 and not self.use_dspark:
+            from vllm_gaudi.ops.deepseek_v41_completion import prepare_decode_control
+
+            self.tp4_control_inputs, self.tp4_token_readback = prepare_decode_control(
+                self.input_views, self.position_views
+            )
+            if self.position_bank is not None:
+                self.position_bank.prepare_compiled_copies({count: self.position_views[count] for count in range(1, 7)})
         state_type = PagedStageState if self.model_config.max_model_len > 512 else StageStateBlocks
-        self.state = (state_type(self.model.program,
-                                 auxiliary_prefix=self.vllm_config.cache_config.enable_prefix_caching)
-                      if state_type is PagedStageState else state_type(self.model.program))
+        self.state = (
+            state_type(self.model.program, auxiliary_prefix=self.vllm_config.cache_config.enable_prefix_caching)
+            if state_type is PagedStageState
+            else state_type(self.model.program)
+        )
         if envs.VLLM_HPU_DSV41_BATCH_DECODE:
             self.model.initialize_request_batches(self.vllm_config.scheduler_config.max_num_seqs)
             from vllm_gaudi.v1.worker.deepseek_v41_batch_runner import BatchExecution
+
             self.request_batches = BatchExecution(self, self.vllm_config.scheduler_config.max_num_seqs)
             if self.vllm_config.cache_config.enable_prefix_caching:
                 from vllm_gaudi.v1.worker.deepseek_v41_prefix import PrefixCheckpoints
+
                 self.prefix_checkpoints = PrefixCheckpoints(self)
         register_state_spec(self.vllm_config)
         self.model_memory_usage = torch.hpu.memory_allocated() - before
         if self.pp.group.is_last_rank and envs.VLLM_HPU_DSV41_DSPARK:
             draft = self.model.program.draft
-            self.insert_context = torch.compile(draft.insert_context,
-                                                backend="hpu_backend",
-                                                fullgraph=True,
-                                                dynamic=False)
+            self.insert_context = torch.compile(
+                draft.insert_context, backend="hpu_backend", fullgraph=True, dynamic=False
+            )
             self.run_draft = torch.compile(draft, backend="hpu_backend", fullgraph=True, dynamic=False)
             self.sample_draft = torch.compile(draft.sample_greedy, backend="hpu_backend", fullgraph=True, dynamic=False)
             if envs.VLLM_HPU_DSV41_DEVICE_VERIFY:
@@ -1008,14 +1084,12 @@ class V41ModelRunner:
                 # entries.  The former can publish PP commit as soon as the
                 # accepted prefix is known; the latter runs concurrently on
                 # the normal compute stream and fills the scheduler record.
-                self.verify_prefix = torch.compile(draft.verify_prefix,
-                                                   backend="hpu_backend",
-                                                   fullgraph=True,
-                                                   dynamic=False)
-                self.draft_from_prefix = torch.compile(draft.draft_from_prefix,
-                                                       backend="hpu_backend",
-                                                       fullgraph=True,
-                                                       dynamic=False)
+                self.verify_prefix = torch.compile(
+                    draft.verify_prefix, backend="hpu_backend", fullgraph=True, dynamic=False
+                )
+                self.draft_from_prefix = torch.compile(
+                    draft.draft_from_prefix, backend="hpu_backend", fullgraph=True, dynamic=False
+                )
                 self.verify_ring = VerifyRing(self.device, last_rank=True)
         elif envs.VLLM_HPU_DSV41_DEVICE_VERIFY and envs.VLLM_HPU_DSV41_DSPARK:
             self.verify_ring = VerifyRing(self.device, last_rank=False)
@@ -1024,28 +1098,33 @@ class V41ModelRunner:
             sampler_backend = "hpu_backend"
             if getattr(self.model, "tensor_parallel_size", 2) == 4:
                 from vllm_gaudi.compilation.deepseek_v41_tp4 import make_backend
+
                 sampler_backend = make_backend()
             self.sample_target = torch.compile(sampler, backend=sampler_backend, fullgraph=True, dynamic=False)
             if self.pp.device_commit_enabled:
-                self.sample_target_commit = torch.compile(self.model.program.sample_greedy_commit,
-                                                          backend="hpu_backend",
-                                                          fullgraph=True,
-                                                          dynamic=False)
-        logger.info("V4.1 PP%d prepared weights loaded; allocated %d bytes", self.model.pp_rank,
-                    self.model_memory_usage)
+                self.sample_target_commit = torch.compile(
+                    self.model.program.sample_greedy_commit, backend="hpu_backend", fullgraph=True, dynamic=False
+                )
+        logger.info(
+            "V4.1 PP%d prepared weights loaded; allocated %d bytes", self.model.pp_rank, self.model_memory_usage
+        )
 
     def get_model(self):
         return self.model
 
     def get_supported_tasks(self):
-        return ("generate", )
+        return ("generate",)
 
     def reset_encoder_cache(self):
         self.encoder_cache.clear()
 
     def get_kv_cache_spec(self):
-        logger.info("V4.1 PP%d exposes %d scheduler state arrays (%d bytes/page)", self.model.pp_rank,
-                    len(self.state.specs), sum(spec.page_size_bytes for spec in self.state.specs.values()))
+        logger.info(
+            "V4.1 PP%d exposes %d scheduler state arrays (%d bytes/page)",
+            self.model.pp_rank,
+            len(self.state.specs),
+            sum(spec.page_size_bytes for spec in self.state.specs.values()),
+        )
         return self.state.specs
 
     def uses_framework_kv_cache_layout(self, name):
@@ -1065,6 +1144,7 @@ class V41ModelRunner:
         if not isinstance(self.state, PagedStageState):
             return 1
         from vllm_gaudi.ops.deepseek_v41_paged_attention import PAGE_TOKENS
+
         compute_tokens = max(prefill_compute_buckets(self.prefill_capacity), default=1)
         last_position = min(self.model_config.max_model_len, INDEX_MME_HOT_TOKENS + compute_tokens)
         return 1 + (last_position + PAGE_TOKENS - 1) // PAGE_TOKENS
@@ -1079,7 +1159,7 @@ class V41ModelRunner:
             raise ValueError("V4.1 state arrays must share scheduler block ownership")
         self.state.blocks, self.state.active = counts.pop(), None
         self.state.bind(0)
-        runner_caches.extend((value, ) for value in caches.values())
+        runner_caches.extend((value,) for value in caches.values())
 
     def initialize_kv_cache(self, config):
         names = {name for group in config.kv_cache_groups for name in group.layer_names}
@@ -1088,7 +1168,7 @@ class V41ModelRunner:
         self.state.allocate(config.num_blocks, self.device)
         self.state.bind(1)
         self.state.clear()
-        self.kv_caches = [(value, ) for value in self.state.allocations.values()]
+        self.kv_caches = [(value,) for value in self.state.allocations.values()]
         self.kv_cache_config = config
 
     def _bind_request(self, request):
@@ -1102,15 +1182,18 @@ class V41ModelRunner:
                 bank.bind_prefill(owner)
             if self.model.engram_host is not None:
                 self.model.engram_host.activate(request.req_id, reset=request.num_computed_tokens == 0)
-            if (request.num_computed_tokens == request.decode_start and envs.VLLM_HPU_DSV41_STATE_AUDIT_DIR):
+            if request.num_computed_tokens == request.decode_start and envs.VLLM_HPU_DSV41_STATE_AUDIT_DIR:
                 from vllm_gaudi.ops.deepseek_v41_state_audit import save_single_handoff
+
                 host = self.model.engram_host
-                save_single_handoff(bank,
-                                    owner,
-                                    request.num_computed_tokens,
-                                    request.req_id,
-                                    envs.VLLM_HPU_DSV41_STATE_AUDIT_DIR,
-                                    engram_history=host.history.history.tolist() if host is not None else None)
+                save_single_handoff(
+                    bank,
+                    owner,
+                    request.num_computed_tokens,
+                    request.req_id,
+                    envs.VLLM_HPU_DSV41_STATE_AUDIT_DIR,
+                    engram_history=host.history.history.tolist() if host is not None else None,
+                )
             self.active_request = request.req_id
             return
         if isinstance(self.state, PagedStageState):
@@ -1156,12 +1239,12 @@ class V41ModelRunner:
                 self.verify_timing.flush()
             records = self.verify_records.pop(req_id, None)
             if records:
-                logger.info("V4.1 device verify transactions PP%d TP%d: %s", self.model.pp_rank, self.model.tp_rank,
-                            json.dumps({
-                                "request_id": req_id,
-                                "units": "ms",
-                                "transactions": records
-                            }))
+                logger.info(
+                    "V4.1 device verify transactions PP%d TP%d: %s",
+                    self.model.pp_rank,
+                    self.model.tp_rank,
+                    json.dumps({"request_id": req_id, "units": "ms", "transactions": records}),
+                )
             self.requests.pop(req_id, None)
             if self.request_batches is not None:
                 self._release_batch_state(req_id)
@@ -1177,17 +1260,23 @@ class V41ModelRunner:
             if new.prompt_token_ids is None or new.prompt_embeds is not None or new.lora_request is not None:
                 raise ValueError("V4.1 prepared execution requires processor-owned token/image inputs")
             self._validate_sampling(new.sampling_params)
-            self.requests[new.req_id] = RequestState(new.req_id, list(new.prompt_token_ids), new.mm_features,
-                                                     new.sampling_params, new.block_ids, new.num_computed_tokens)
+            self.requests[new.req_id] = RequestState(
+                new.req_id,
+                list(new.prompt_token_ids),
+                new.mm_features,
+                new.sampling_params,
+                new.block_ids,
+                new.num_computed_tokens,
+            )
             prefix = getattr(new, "prefill_token_ids", None)
             if self.request_batches is not None and prefix is not None:
                 request = self.requests[new.req_id]
                 restores = getattr(scheduled, "auxiliary_prefix_operations", None)
                 checkpoint = restores.restores.get(new.req_id) if restores is not None else None
                 cached_prefix = checkpoint is not None and checkpoint.num_tokens == new.num_computed_tokens
-                if prefix[:len(request.prompt)] != request.prompt or (new.num_computed_tokens and not cached_prefix):
+                if prefix[: len(request.prompt)] != request.prompt or (new.num_computed_tokens and not cached_prefix):
                     raise ValueError("Request batch recomputation needs a full committed prefix from position zero")
-                request.output = list(prefix[len(request.prompt):])
+                request.output = list(prefix[len(request.prompt) :])
                 request.recompute_until = len(prefix)
         cached = scheduled.scheduled_cached_reqs
         for index, req_id in enumerate(cached.req_ids):
@@ -1197,8 +1286,9 @@ class V41ModelRunner:
                 if self.request_batches is not None:
                     operations = getattr(scheduled, "auxiliary_prefix_operations", None)
                     checkpoint = operations.restores.get(req_id) if operations is not None else None
-                    cached_prefix = (checkpoint is not None
-                                     and checkpoint.num_tokens == cached.num_computed_tokens[index])
+                    cached_prefix = (
+                        checkpoint is not None and checkpoint.num_tokens == cached.num_computed_tokens[index]
+                    )
                     if (cached.num_computed_tokens[index] and not cached_prefix) or new_blocks is None:
                         raise ValueError("Request batch resumption requires recomputation and new scheduler pages")
                     # Also handles forced reset without a preceding preemption
@@ -1217,24 +1307,35 @@ class V41ModelRunner:
     @staticmethod
     def _validate_sampling(params):
         from vllm_gaudi.ops.deepseek_v41_config import validate_sampling
+
         validate_sampling(params)
 
-    def _image_embeddings(self, request, start, count):
+    def _image_embeddings(self, request, start, count, input_ids):
         if not request.mm_features or not self.pp.group.is_first_rank:
             return None
+        active = [
+            feature
+            for feature in request.mm_features
+            if feature.mm_position.offset < start + count
+            and start < feature.mm_position.offset + feature.mm_position.length
+        ]
+        if not active:
+            return None
         self._execute_mm_encoder(request)
-        values = self.model.embed_input_ids(self.input_ids[:count])
-        for feature in request.mm_features:
+        # Device continuation may bind a sampled tensor instead of the host
+        # staging buffer. Preserve those actual IDs for non-image rows.
+        values = self.model.embed_input_ids(input_ids)
+        for feature in active:
             position = feature.mm_position
             low, high = max(start, position.offset), min(start + count, position.offset + position.length)
             if low >= high:
                 continue
-            source = self.encoder_cache[feature.identifier][low - position.offset:high - position.offset]
+            source = self.encoder_cache[feature.identifier][low - position.offset : high - position.offset]
             if position.is_embed is None:
-                values[low - start:high - start].copy_(source)
+                values[low - start : high - start].copy_(source)
             else:
-                mask = position.is_embed[low - position.offset:high - position.offset].to(self.device)
-                destination = values[low - start:high - start]
+                mask = position.is_embed[low - position.offset : high - position.offset].to(self.device)
+                destination = values[low - start : high - start]
                 destination.copy_(torch.where(mask.unsqueeze(-1), source, destination))
         return values
 
@@ -1245,6 +1346,7 @@ class V41ModelRunner:
         from vllm.multimodal.utils import group_and_batch_mm_kwargs
         from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
         from vllm_gaudi.ops.deepseek_v41_vision import scatter_image_embeddings
+
         features = [feature for feature in request.mm_features if feature.identifier not in self.encoder_cache]
         kwargs = [(feature.modality, feature.data) for feature in features]
         outputs = []
@@ -1270,8 +1372,11 @@ class V41ModelRunner:
         # instead of compiling an unqualified ordinary C1 stage on the first
         # public chat request.
         program = getattr(self.model, "program", None)
-        c1_replay = (getattr(self.model, "native", False) and count == 1
-                     and (getattr(program, "runtime_indexer", False) or start + count <= 1024))
+        c1_replay = (
+            getattr(self.model, "native", False)
+            and count == 1
+            and (getattr(program, "runtime_indexer", False) or start + count <= 1024)
+        )
         graph_c1 = decode or c1_replay
         if self.direct_token_ids and graph_c1:
             if count != 1:
@@ -1285,29 +1390,64 @@ class V41ModelRunner:
             elif graph_c1:
                 search = runtime_search_length(start, count, program.length)
             else:
-                search = prefill_search_length(start,
-                                               count,
-                                               program.length,
-                                               reuse_index_keys=envs.VLLM_HPU_DSV41_PREFILL_REINDEX_REUSE)
+                search = prefill_search_length(
+                    start, count, program.length, reuse_index_keys=envs.VLLM_HPU_DSV41_PREFILL_REINDEX_REUSE
+                )
             if search < start + count or search > program.length:
                 raise RuntimeError("V4.1 transaction search bucket does not cover its input")
-            program.search_length = search
-            for layer in program.layers:
-                attention = layer.attention
-                # This is scheduler metadata, not a device tensor readback.
-                # It bounds invisible prefill score tiles without changing
-                # the shared fixed search geometry or decode capture.
-                attention.prefill_token_end = None if graph_c1 else start + count
-                if hasattr(attention, "set_search_length"):
-                    attention.set_search_length(search)
+            decode_bound = (
+                decode_source_prefix_bound(
+                    start + count,
+                    search,
+                    getattr(program, "tensor_parallel_size", 2),
+                    runtime_indexer=getattr(program, "runtime_indexer", False),
+                )
+                if graph_c1
+                else None
+            )
+            geometry_key = (id(program), getattr(program, "generation", None), search, decode_bound)
+            reuse_geometry = graph_c1 and getattr(program, "tensor_parallel_size", 2) == 4
+            if not reuse_geometry or geometry_key != getattr(self, "_decode_geometry_key", None):
+                program.search_length = search
+                program.decode_token_bound = decode_bound
+                for layer in program.layers:
+                    attention = layer.attention
+                    # This is scheduler metadata, not a device tensor readback.
+                    # Prefill changes the visible end on every transaction;
+                    # decode reuses its static geometry until the bucket or
+                    # physical-state generation changes.
+                    attention.prefill_token_end = None if graph_c1 else start + count
+                    if hasattr(attention, "set_search_length"):
+                        attention.set_search_length(search)
+                    else:
+                        attention.search_length = search
+                    if hasattr(attention, "set_decode_visible_tokens"):
+                        attention.set_decode_visible_tokens(decode_bound)
+                self._decode_geometry_key = geometry_key if reuse_geometry else None
+            shared = getattr(program, "shared", None)
+            mirror_capacity = getattr(shared, "index_mirror_tokens", 0)
+            if mirror_capacity:
+                # _bind_request has already installed canonical pages. Rebuild
+                # only at an ownership/prefill transition, before any compiled
+                # consumer; ordinary decode only maintains newly written rows.
+                if graph_c1 and count <= 6 and 512 < search <= mirror_capacity:
+                    shared.prepare_index_mirror(start)
                 else:
-                    attention.search_length = search
+                    shared.invalidate_index_mirror()
         # The fused seven-value control packet belongs to C1/C6 replay.  A
         # normal prefill block has independent C128-capable input buffers and
         # must not be truncated through that DSpark-sized packet.
-        staged_input = (getattr(self, "input_staging", None) is not None and count <= 6
-                        and (graph_c1 or self.use_dspark))
-        if staged_input:
+        staged_input = getattr(self, "input_staging", None) is not None and count <= 6 and (graph_c1 or self.use_dspark)
+        tp4_control = (
+            getattr(self, "tp4_control_inputs", {}).get(count)
+            if graph_c1 and not (count == 1 and self.direct_token_ids)
+            else None
+        )
+        if tp4_control is not None:
+            if ids is not self.input_views[count] or positions is not self.position_views[count]:
+                raise RuntimeError("Prepared TP4 control input was rebound without preparation")
+            tp4_control.upload(tokens, start)
+        elif staged_input:
             slot = self.input_generation % 2
             if self.input_dma_pending[slot]:
                 self.input_dma_events[slot].synchronize()
@@ -1332,8 +1472,13 @@ class V41ModelRunner:
                 ids = self.input_views.get(count, self.input_ids[:count])
                 positions = self.position_views.get(count, self.positions[:count])
         else:
-            if (not self.use_dspark and decode and count == 1 and self._next_input is not None
-                    and self._next_input[:2] == (request_id, start)):
+            if (
+                not self.use_dspark
+                and decode
+                and count == 1
+                and self._next_input is not None
+                and self._next_input[:2] == (request_id, start)
+            ):
                 if self.direct_token_ids:
                     ids = self._next_input[2]
                 else:
@@ -1341,7 +1486,11 @@ class V41ModelRunner:
             else:
                 ids.copy_(torch.tensor(tokens, dtype=ids.dtype, device="cpu"))
             if self.position_bank is not None and graph_c1:
-                positions = self.position_bank.view(start, count)
+                if getattr(self.model, "tensor_parallel_size", 2) == 4:
+                    if not self.model.decode_prefix_pending:
+                        self.position_bank.copy_into(positions, start)
+                else:
+                    positions = self.position_bank.view(start, count)
             else:
                 positions.copy_(torch.arange(start, start + count, dtype=torch.int32, device="cpu"))
         self._round_phase("inputs_staged_ns")
@@ -1349,8 +1498,10 @@ class V41ModelRunner:
         # CSA2 buckets above 1024. Prompt C1 capture remains bounded to the
         # qualified prefix range so a one-token prefill tail cannot create a
         # long-search graph variant. StageReplay keys plans by search bucket.
-        use_replay = (getattr(self.model, "native", False) and
-                      (decode or (start + count <= 1024 and (c1_replay or (self.use_dspark and request is not None)))))
+        use_replay = (
+            getattr(self.model, "native", False)
+            or (self.v2_completion and getattr(self.model, "tensor_parallel_size", 2) == 4)
+        ) and (decode or (start + count <= 1024 and (c1_replay or (self.use_dspark and request is not None))))
         if self.request_batches is not None and request is not None and not decode:
             # Prompt/tail transactions keep their request-slot aliases.
             # B1 decode binds the original working addresses before replay.
@@ -1359,7 +1510,7 @@ class V41ModelRunner:
         self._round_phase("engram_prepared_ns")
         timing = getattr(self, "verify_timing", None)
         if self.pp.group.is_first_rank:
-            embeddings = self._image_embeddings(request, start, count) if request is not None else None
+            embeddings = self._image_embeddings(request, start, count, ids) if request is not None else None
             if timing:
                 timing.device("stage_model_start")
             value = self.model(ids, positions, inputs_embeds=embeddings)
@@ -1418,8 +1569,13 @@ class V41ModelRunner:
         return result
 
     def _use_direct_verify_inputs(self, hidden, count):
-        return (count == 6 and hidden.shape == self.verify_hidden.shape and self.model.last_aux is not None
-                and self.model.last_aux.shape[0] == 6 and self.positions.shape[0] >= 6)
+        return (
+            count == 6
+            and hidden.shape == self.verify_hidden.shape
+            and self.model.last_aux is not None
+            and self.model.last_aux.shape[0] == 6
+            and self.positions.shape[0] >= 6
+        )
 
     def _finish_request_device(self, request, start, count, last_count, proposed, target_hidden):
         """Run one fixed C6 verify transaction and defer its sole host read."""
@@ -1430,7 +1586,7 @@ class V41ModelRunner:
         phase_ms = {}
         ticket = None
         if self.pp.group.is_last_rank:
-            if (self.verify_ring is None or self.verify_prefix is None or self.draft_from_prefix is None):
+            if self.verify_ring is None or self.verify_prefix is None or self.draft_from_prefix is None:
                 raise RuntimeError("Device DSpark verify was not warmed and compiled")
             ticket = self.verify_ring.acquire(last_count, generation=self.pp.generation + 1)
             # A previous PP broadcast may still be consuming the alternate
@@ -1456,7 +1612,7 @@ class V41ModelRunner:
             verify_positions = self.positions if direct_c6 else self.verify_positions
             if not direct_c6:
                 self.verify_hidden.zero_()
-                self.verify_hidden[:target_hidden.shape[0]].copy_(target_hidden)
+                self.verify_hidden[: target_hidden.shape[0]].copy_(target_hidden)
             # Fill the pinned control staging in one host copy.  Indexed
             # scalar writes used to emit an individual aten::to/copy_ pair;
             # the first of those writes could wait behind the active HPU
@@ -1483,9 +1639,9 @@ class V41ModelRunner:
             if self.model.last_aux is None or self.model.last_aux.shape[0] < last_count:
                 raise RuntimeError("DSpark verify is missing target auxiliary states")
             if not direct_c6 and self.verify_aux.shape[1] != self.model.last_aux.shape[1]:
-                self.verify_aux = torch.empty((6, self.model.last_aux.shape[1]),
-                                              dtype=self.model.last_aux.dtype,
-                                              device=self.device)
+                self.verify_aux = torch.empty(
+                    (6, self.model.last_aux.shape[1]), dtype=self.model.last_aux.dtype, device=self.device
+                )
             if not direct_c6:
                 self.verify_aux.zero_()
                 self.verify_aux[:last_count].copy_(self.model.last_aux[:last_count])
@@ -1493,9 +1649,17 @@ class V41ModelRunner:
             if timing:
                 timing.host("prefix_submit_start")
                 timing.device("prefix_start")
-            (_, prefix_output, prefix_committed, prefix_output_count, anchor, draft_enabled, status, commit_record,
-             commit_wire) = self.verify_prefix(verify_hidden, self.verify_proposed, metadata, verify_aux,
-                                               verify_positions)
+            (
+                _,
+                prefix_output,
+                prefix_committed,
+                prefix_output_count,
+                anchor,
+                draft_enabled,
+                status,
+                commit_record,
+                commit_wire,
+            ) = self.verify_prefix(verify_hidden, self.verify_proposed, metadata, verify_aux, verify_positions)
             if timing:
                 timing.device("prefix_done")
                 timing.host("prefix_submit_done")
@@ -1512,19 +1676,28 @@ class V41ModelRunner:
             if timing:
                 timing.device("commit_source_ready")
         phase_started = time.perf_counter_ns()
-        commit_record = None if ticket is None else (
-            ticket.commit_record if ticket.commit_record is not None else ticket.record)
-        commit_wire = None if ticket is None else (
-            ticket.commit_wire if ticket.commit_wire is not None else ticket.wire)
+        commit_record = (
+            None if ticket is None else (ticket.commit_record if ticket.commit_record is not None else ticket.record)
+        )
+        commit_wire = (
+            None if ticket is None else (ticket.commit_wire if ticket.commit_wire is not None else ticket.wire)
+        )
         pp_result = self.pp.finish_device(commit_record, last_count, commit_wire)
         phase_ms["pp_finish_device_ms"] = (time.perf_counter_ns() - phase_started) / 1e6
         if self.pp.group.is_last_rank:
             # Continue draft control on the normal compute stream only after
             # the commit source has been snapshotted. PP0 can now validate the
             # prefix while these three layers execute on PP1.
-            record, wire_record, confidence = self.draft_from_prefix(metadata, verify_positions, prefix_output,
-                                                                     prefix_committed, prefix_output_count, anchor,
-                                                                     draft_enabled, status)
+            record, wire_record, confidence = self.draft_from_prefix(
+                metadata,
+                verify_positions,
+                prefix_output,
+                prefix_committed,
+                prefix_output_count,
+                anchor,
+                draft_enabled,
+                status,
+            )
             ticket.record.copy_(record)
             if ticket.wire is not None:
                 ticket.wire.copy_(wire_record)
@@ -1549,19 +1722,17 @@ class V41ModelRunner:
             if timing:
                 timing.host("engram_complete_done")
                 timing.finish(committed_value, len(output))
-            self.verify_records.setdefault(request.req_id, []).append({
-                "target_count":
-                last_count,
-                "proposed_count":
-                len(proposed),
-                "committed":
-                committed_value,
-                "output_count":
-                len(output),
-                "elapsed_ms": (time.perf_counter_ns() - started) / 1e6,
-                **phase_ms, "inline_pp_commit":
-                True
-            })
+            self.verify_records.setdefault(request.req_id, []).append(
+                {
+                    "target_count": last_count,
+                    "proposed_count": len(proposed),
+                    "committed": committed_value,
+                    "output_count": len(output),
+                    "elapsed_ms": (time.perf_counter_ns() - started) / 1e6,
+                    **phase_ms,
+                    "inline_pp_commit": True,
+                }
+            )
             self._record_round_completion(request, proposed, committed_value, output)
             self.pending = None
             return None
@@ -1576,18 +1747,16 @@ class V41ModelRunner:
                 request.output.extend(output)
                 if timing:
                     timing.finish(committed, len(output))
-                self.verify_records.setdefault(request.req_id, []).append({
-                    "target_count":
-                    last_count,
-                    "proposed_count":
-                    len(proposed),
-                    "committed":
-                    committed,
-                    "output_count":
-                    len(output),
-                    "elapsed_ms": (time.perf_counter_ns() - started) / 1e6,
-                    **phase_ms
-                })
+                self.verify_records.setdefault(request.req_id, []).append(
+                    {
+                        "target_count": last_count,
+                        "proposed_count": len(proposed),
+                        "committed": committed,
+                        "output_count": len(output),
+                        "elapsed_ms": (time.perf_counter_ns() - started) / 1e6,
+                        **phase_ms,
+                    }
+                )
                 self._record_round_completion(request, proposed, committed, output)
                 self.pending = None
                 return None
@@ -1609,28 +1778,26 @@ class V41ModelRunner:
             if timing:
                 timing.finish(committed_value, len(output))
             self.pending = None
-            result = ModelRunnerOutput(req_ids=[request.req_id],
-                                       req_id_to_index={request.req_id: 0},
-                                       sampled_token_ids=[output])
-            self.verify_records.setdefault(request.req_id, []).append({
-                "target_count":
-                last_count,
-                "proposed_count":
-                len(proposed),
-                "committed":
-                committed_value,
-                "output_count":
-                len(output),
-                "draft_count":
-                len(draft),
-                "elapsed_ms": (time.perf_counter_ns() - started) / 1e6,
-                **phase_ms
-            })
+            result = ModelRunnerOutput(
+                req_ids=[request.req_id], req_id_to_index={request.req_id: 0}, sampled_token_ids=[output]
+            )
+            self.verify_records.setdefault(request.req_id, []).append(
+                {
+                    "target_count": last_count,
+                    "proposed_count": len(proposed),
+                    "committed": committed_value,
+                    "output_count": len(output),
+                    "draft_count": len(draft),
+                    "elapsed_ms": (time.perf_counter_ns() - started) / 1e6,
+                    **phase_ms,
+                }
+            )
             result.execution_rounds = self._record_round_completion(request, proposed, committed_value, output)
             return result
 
-        return AsyncDSparkOutput(self.verify_ring, ticket, consume,
-                                 self._record_round_released if self.round_timing_enabled else None)
+        return AsyncDSparkOutput(
+            self.verify_ring, ticket, consume, self._record_round_released if self.round_timing_enabled else None
+        )
 
     @torch.inference_mode()
     def execute_model(self, scheduled):
@@ -1652,7 +1819,8 @@ class V41ModelRunner:
         batched_ids = set()
         if self.request_batches is not None:
             batch_requests = [
-                self.requests[name] for name, count in scheduled.num_scheduled_tokens.items()
+                self.requests[name]
+                for name, count in scheduled.num_scheduled_tokens.items()
                 if count == 1 and self.requests[name].num_computed_tokens >= self.requests[name].decode_start
             ]
             if batch_requests and (len(scheduled.num_scheduled_tokens) > 1 or operations is not None):
@@ -1666,9 +1834,13 @@ class V41ModelRunner:
             if req_id in batched_ids:
                 continue
             request = self.requests.get(req_id) if self.request_batches is not None else None
-            single_trace = (self.request_batches.trace_single(request)
-                            if self.request_batches is not None and request is not None
-                            and request.num_computed_tokens >= request.decode_start else nullcontext())
+            single_trace = (
+                self.request_batches.trace_single(request)
+                if self.request_batches is not None
+                and request is not None
+                and request.num_computed_tokens >= request.decode_start
+                else nullcontext()
+            )
             with single_trace:
                 self._execute_request(scheduled, req_id, count)
                 result = self._finish_request()
@@ -1697,12 +1869,9 @@ class V41ModelRunner:
         if async_result is not None:
             self.batch_result = async_result
         elif self.pp.group.is_last_rank:
-            self.batch_result = ModelRunnerOutput(req_ids=ids,
-                                                  req_id_to_index={
-                                                      key: index
-                                                      for index, key in enumerate(ids)
-                                                  },
-                                                  sampled_token_ids=outputs)
+            self.batch_result = ModelRunnerOutput(
+                req_ids=ids, req_id_to_index={key: index for index, key in enumerate(ids)}, sampled_token_ids=outputs
+            )
             if acknowledgments:
                 self.batch_result.auxiliary_prefix_acknowledgments = acknowledgments
             if execution_rounds:
@@ -1714,23 +1883,27 @@ class V41ModelRunner:
 
     def _execute_request(self, scheduled, req_id, count):
         if self.round_timing_enabled:
-            self.round_context = dict(request_id=req_id,
-                                      generation=self.pp.generation + 1,
-                                      target_count=count,
-                                      start_ns=time.perf_counter_ns())
+            self.round_context = dict(
+                request_id=req_id,
+                generation=self.pp.generation + 1,
+                target_count=count,
+                start_ns=time.perf_counter_ns(),
+            )
         request = self.requests[req_id]
         self._bind_request(request)
         start = request.num_computed_tokens
         proposed = scheduled.scheduled_spec_decode_tokens.get(req_id, [])
         if proposed and not self.use_dspark:
             raise RuntimeError("Speculative tokens reached a non-speculative V4.1 runner")
-        tokens = request.tokens[start:start + count - len(proposed)] + proposed
+        tokens = request.token_slice(start, start + count - len(proposed)) + proposed
         if len(tokens) != count or start + count > self.model_config.max_model_len:
             raise RuntimeError("Scheduled V4.1 inputs do not match the committed prefix and context budget")
         decode = start >= request.decode_start
         from vllm_gaudi.ops import deepseek_v41_prefill_event_trace as prefill_events
-        tracing_prefill = (not decode and prefill_events.begin(req_id, self.pp.generation + 1, count,
-                                                               self.model.pp_rank, self.model.tp_rank))
+
+        tracing_prefill = not decode and prefill_events.begin(
+            req_id, self.pp.generation + 1, count, self.model.pp_rank, self.model.tp_rank
+        )
         valid_decode = 1 <= count <= 6 if self.use_dspark else count == 1
         if decode and not valid_decode:
             raise RuntimeError(f"Unexpected V4.1 decode shape: tokens={count}, drafts={len(proposed)}")
@@ -1744,44 +1917,59 @@ class V41ModelRunner:
         if prefix_checkpoints is not None:
             chunks = prefix_checkpoints.chunks(req_id, start, chunks)
         program = getattr(self.model, "program", None)
-        transaction_search = ((prefill_search_length(
-            start, count, program.length, reuse_index_keys=envs.VLLM_HPU_DSV41_PREFILL_REINDEX_REUSE) if getattr(
-                program, "runtime_indexer", False) else target_search_length(start, count, program.length))
-                              if not decode and program is not None and program.length > 512 else None)
+        transaction_search = (
+            (
+                prefill_search_length(
+                    start, count, program.length, reuse_index_keys=envs.VLLM_HPU_DSV41_PREFILL_REINDEX_REUSE
+                )
+                if getattr(program, "runtime_indexer", False)
+                else target_search_length(start, count, program.length)
+            )
+            if not decode and program is not None and program.length > 512
+            else None
+        )
         for block_index, (offset, chunk) in enumerate(chunks):
             halo_mode = "full"
             if not decode:
                 from vllm_gaudi.ops.deepseek_v41_decoder_halo import decoder_halo_mode
+
                 tp4_halo = getattr(program, "tensor_parallel_size", 2) == 4
                 halo_block = self.prefill_capacity if tp4_halo else PREFILL_BLOCK_TOKENS
                 halo_mode = decoder_halo_mode(
                     start + offset,
                     len(chunk),
                     len(request.prompt),
-                    eligible=(envs.VLLM_HPU_DSV41_PREFILL_DECODER_HALO and not self.use_dspark
-                              and (not tp4_halo or self.prefill_capacity == 16384)
-                              and (tp4_halo or (start == 0 and count == len(request.prompt)))
-                              and max(prefill_compute_buckets(self.prefill_capacity), default=1) == halo_block
-                              and len(scheduled.num_scheduled_tokens) == 1 and not request.mm_features
-                              and getattr(request.sampling_params, "prompt_logprobs", None) is None),
+                    eligible=(
+                        envs.VLLM_HPU_DSV41_PREFILL_DECODER_HALO
+                        and not self.use_dspark
+                        and (not tp4_halo or self.prefill_capacity == 16384)
+                        and (tp4_halo or (start == 0 and count == len(request.prompt)))
+                        and max(prefill_compute_buckets(self.prefill_capacity), default=1) == halo_block
+                        and len(scheduled.num_scheduled_tokens) == 1
+                        and not request.mm_features
+                        and getattr(request.sampling_params, "prompt_logprobs", None) is None
+                    ),
                     block_tokens=halo_block,
-                    allow_single_block=tp4_halo)
+                    allow_single_block=tp4_halo,
+                )
             if program is not None:
                 program.prefill_halo_mode = halo_mode
             try:
                 with prefill_events.span("transaction_chunk", rows=len(chunk)):
-                    hidden = self._forward(req_id,
-                                           chunk,
-                                           start + offset,
-                                           decode=decode,
-                                           reset=start + offset == 0,
-                                           request=request,
-                                           search_length=transaction_search)
+                    hidden = self._forward(
+                        req_id,
+                        chunk,
+                        start + offset,
+                        decode=decode,
+                        reset=start + offset == 0,
+                        request=request,
+                        search_length=transaction_search,
+                    )
             finally:
                 if program is not None:
                     program.prefill_halo_mode = "full"
             if offset + len(chunk) < count:
-                self._insert(self.model.last_aux, self.positions[:len(chunk)])
+                self._insert(self.model.last_aux, self.positions[: len(chunk)])
                 self.model.complete_step(len(chunk))
                 if prefix_checkpoints is not None:
                     prefix_checkpoints.capture_at(req_id, start + offset + len(chunk))
@@ -1793,7 +1981,7 @@ class V41ModelRunner:
                     # Retire it after both transport and its consumer finish;
                     # the final block remains owned by normal sampling.
                     self.pp.complete_packet()
-        need_sample = start + count >= len(request.tokens)
+        need_sample = start + count >= len(request.prompt) + len(request.output)
         if self.pp.group.is_last_rank and need_sample:
             if not self.use_dspark:
                 if decode and self.pp.device_commit_enabled:
@@ -1802,12 +1990,15 @@ class V41ModelRunner:
                     sample_input = self.sample_target(hidden[-1:])
                 if self.model.native and not (decode and (self.pp.device_commit_enabled or self.v2_completion)):
                     from vllm_gaudi.distributed.tp2_fused_ar_norm import _resolve_runtime
+
                     bridge, _, _ = _resolve_runtime()
                     self._token_copy = bridge.copy_sampled_tokens_to_host(sample_input)
+                elif getattr(self, "tp4_token_readback", None) is not None and not (decode and self.v2_completion):
+                    self._token_copy = self.tp4_token_readback(sample_input)
             else:
                 # Device verification owns projection, argmax and the small
                 # TP candidate exchange, so it consumes target hidden state.
-                sample_input = (hidden if envs.VLLM_HPU_DSV41_DEVICE_VERIFY else self.model.compute_logits(hidden))
+                sample_input = hidden if envs.VLLM_HPU_DSV41_DEVICE_VERIFY else self.model.compute_logits(hidden)
         else:
             sample_input = None
         self.pending = (request, start, count, len(chunk), proposed, need_sample, sample_input)
@@ -1828,7 +2019,7 @@ class V41ModelRunner:
                 # rank.  PP0 never serializes a result at all, so it must
                 # consume its local commit here as well; otherwise its
                 # Engram ticket and pending request would remain in-flight.
-                if (not self.pp.group.is_last_rank or getattr(self.model, "tp_rank", 0) != 0):
+                if not self.pp.group.is_last_rank or getattr(self.model, "tp_rank", 0) != 0:
                     return result.get_output()
                 return result
             self.pending = None
@@ -1843,8 +2034,12 @@ class V41ModelRunner:
         request, start, count, last_count, proposed, need_sample, sample_input = self.pending
         if not self.use_dspark:
             return self._sample_single()
-        if (envs.VLLM_HPU_DSV41_DEVICE_VERIFY and envs.VLLM_HPU_DSV41_DSPARK and need_sample
-                and (self.verify_prefix is not None or self.pp.group.is_first_rank)):
+        if (
+            envs.VLLM_HPU_DSV41_DEVICE_VERIFY
+            and envs.VLLM_HPU_DSV41_DSPARK
+            and need_sample
+            and (self.verify_prefix is not None or self.pp.group.is_first_rank)
+        ):
             return self._finish_request_device(request, start, count, last_count, proposed, sample_input)
         output, draft, committed = [], [], last_count
         if self.pp.group.is_last_rank:
@@ -1860,8 +2055,12 @@ class V41ModelRunner:
             self._insert(self.model.last_aux[:committed], self.positions[:committed])
             next_position = start + count - last_count + committed
             remaining = request.sampling_params.max_tokens - len(request.output) - len(output)
-            if (output and envs.VLLM_HPU_DSV41_DSPARK and remaining >= 6
-                    and next_position + 6 <= self.model_config.max_model_len):
+            if (
+                output
+                and envs.VLLM_HPU_DSV41_DSPARK
+                and remaining >= 6
+                and next_position + 6 <= self.model_config.max_model_len
+            ):
                 draft = self._propose(output[-1], next_position)
         committed, output, draft = self.pp.finish(committed, output, draft)
         if not 1 <= committed <= last_count:
@@ -1872,16 +2071,16 @@ class V41ModelRunner:
         self.pending = None
         if not self.pp.group.is_last_rank:
             return None
-        return ModelRunnerOutput(req_ids=[request.req_id],
-                                 req_id_to_index={request.req_id: 0},
-                                 sampled_token_ids=[output])
+        return ModelRunnerOutput(
+            req_ids=[request.req_id], req_id_to_index={request.req_id: 0}, sampled_token_ids=[output]
+        )
 
     def _sample_single(self):
         request, start, count, last_count, proposed, need_sample, selected = self.pending
         if proposed:
             raise RuntimeError("Ordinary sampling cannot consume a draft prefix")
         device_commit_enabled = getattr(self.pp, "device_commit_enabled", getattr(self.pp, "device_commit", False))
-        device_commit = (device_commit_enabled and need_sample and start >= request.decode_start)
+        device_commit = device_commit_enabled and need_sample and start >= request.decode_start
         token = None
         if self.pp.group.is_last_rank and need_sample and not device_commit:
             if self._token_copy is not None:
@@ -1890,8 +2089,7 @@ class V41ModelRunner:
                 token = int(host[0, 0])
             else:
                 token = int(selected.cpu()[0, 0])
-        consumed, output = (self.pp.finish_single_device() if device_commit else self.pp.finish_single(
-            last_count, token))
+        consumed, output = self.pp.finish_single_device() if device_commit else self.pp.finish_single(last_count, token)
         if consumed != last_count:
             raise RuntimeError("Ordinary PP completion did not consume the complete input chunk")
         self.model.complete_step(consumed)
@@ -1901,14 +2099,14 @@ class V41ModelRunner:
         # tensor here feeds stale IDs into otherwise correct native replay.
         # Only device completion owns a current device token. CPU completion
         # uses the scheduler/request token through the normal input staging.
-        self._next_input = ((request.req_id, start + count, self.pp.commit_token) if output and device_commit else None)
+        self._next_input = (request.req_id, start + count, self.pp.commit_token) if output and device_commit else None
         self._token_copy = None
         self.pending = self.draft_token_ids = None
         if not self.pp.group.is_last_rank:
             return None
-        return ModelRunnerOutput(req_ids=[request.req_id],
-                                 req_id_to_index={request.req_id: 0},
-                                 sampled_token_ids=[output])
+        return ModelRunnerOutput(
+            req_ids=[request.req_id], req_id_to_index={request.req_id: 0}, sampled_token_ids=[output]
+        )
 
     def take_draft_token_ids(self):
         value, self.draft_token_ids = self.draft_token_ids, None
@@ -1916,36 +2114,51 @@ class V41ModelRunner:
 
     @torch.inference_mode()
     def _dummy_run(self, tokens, *, native=False, start_position=0):
-        logger.info("V4.1 PP%d C%d warmup target start (native=%s, preceding steps=%d)", self.model.pp_rank, tokens,
-                    bool(native), self.audit["target_steps"])
+        logger.info(
+            "V4.1 PP%d C%d warmup target start (native=%s, preceding steps=%d)",
+            self.model.pp_rank,
+            tokens,
+            bool(native),
+            self.audit["target_steps"],
+        )
         self.state.clear()
-        hidden = self._forward("__v41_warmup__", [1 + index for index in range(tokens)],
-                               start_position,
-                               decode=(native or getattr(self.model, "tensor_parallel_size", 2) == 4)
-                               and (self.use_dspark or tokens == 1),
-                               reset=True)
+        hidden = self._forward(
+            "__v41_warmup__",
+            [1 + index for index in range(tokens)],
+            start_position,
+            decode=(native or getattr(self.model, "tensor_parallel_size", 2) == 4) and (self.use_dspark or tokens == 1),
+            reset=True,
+        )
         from vllm_gaudi.ops.tp2_prepared_plan import prepared_group_stats
+
         stats = prepared_group_stats()
-        logger.info("V4.1 PP%d target submitted (native graphs=%d, replays=%d, entries=%d)", self.model.pp_rank,
-                    stats["native_graphs"], stats["native_replays"], stats["native_entry_replays"])
+        logger.info(
+            "V4.1 PP%d target submitted (native graphs=%d, replays=%d, entries=%d)",
+            self.model.pp_rank,
+            stats["native_graphs"],
+            stats["native_replays"],
+            stats["native_entry_replays"],
+        )
         if self.pp.group.is_last_rank:
-            if (envs.VLLM_HPU_DSV41_DEVICE_VERIFY and self.verify_prefix is not None and envs.VLLM_HPU_DSV41_DSPARK):
+            if envs.VLLM_HPU_DSV41_DEVICE_VERIFY and self.verify_prefix is not None and envs.VLLM_HPU_DSV41_DSPARK:
                 # Compile and exercise the fixed control graph during warmup;
                 # this invocation is discarded with the warmup state.
                 self.verify_hidden.zero_()
                 self.verify_hidden[:tokens].copy_(hidden)
                 if self.verify_aux.shape[1] != self.model.last_aux.shape[1]:
-                    self.verify_aux = torch.empty((6, self.model.last_aux.shape[1]),
-                                                  dtype=self.model.last_aux.dtype,
-                                                  device=self.device)
+                    self.verify_aux = torch.empty(
+                        (6, self.model.last_aux.shape[1]), dtype=self.model.last_aux.dtype, device=self.device
+                    )
                 self.verify_aux.zero_()
                 self.verify_aux[:tokens].copy_(self.model.last_aux[:tokens])
                 self.verify_positions.copy_(self.positions[0].to(torch.int32) + self.verify_offsets)
                 self.verify_proposed.fill_(-1)
                 self.verify_control_host.fill_(0)
                 self.verify_metadata_host.copy_(
-                    torch.as_tensor((1, tokens, 0, 64, start_position, self.model_config.max_model_len, 1),
-                                    dtype=torch.int64))
+                    torch.as_tensor(
+                        (1, tokens, 0, 64, start_position, self.model_config.max_model_len, 1), dtype=torch.int64
+                    )
+                )
                 self.verify_control.copy_(self.verify_control_host, non_blocking=True)
                 # Exercise the same producer tensors as serving. Padded
                 # buffers have different alias/inference contracts from
@@ -1954,10 +2167,19 @@ class V41ModelRunner:
                 verify_hidden = hidden if direct_c6 else self.verify_hidden
                 verify_aux = self.model.last_aux if direct_c6 else self.verify_aux
                 verify_positions = self.positions if direct_c6 else self.verify_positions
-                prefix = self.verify_prefix(verify_hidden, self.verify_proposed, self.verify_metadata, verify_aux,
-                                            verify_positions)
-                self.draft_from_prefix(self.verify_metadata, verify_positions, prefix[1], prefix[2], prefix[3],
-                                       prefix[4], prefix[5], prefix[6])
+                prefix = self.verify_prefix(
+                    verify_hidden, self.verify_proposed, self.verify_metadata, verify_aux, verify_positions
+                )
+                self.draft_from_prefix(
+                    self.verify_metadata,
+                    verify_positions,
+                    prefix[1],
+                    prefix[2],
+                    prefix[3],
+                    prefix[4],
+                    prefix[5],
+                    prefix[6],
+                )
             else:
                 if self.use_dspark:
                     self.model.compute_logits(hidden)
@@ -1983,26 +2205,37 @@ class V41ModelRunner:
             # _dummy_run already drains the device and crosses the PP/TP
             # barrier. Read counters here without adding a synchronization or
             # resetting the cumulative peak used by cache admission.
-            record = dict(tokens=tokens,
-                          position=position,
-                          allocated_bytes=torch.hpu.memory_allocated(),
-                          cumulative_peak_bytes=torch.hpu.max_memory_allocated())
+            record = dict(
+                tokens=tokens,
+                position=position,
+                allocated_bytes=torch.hpu.memory_allocated(),
+                cumulative_peak_bytes=torch.hpu.max_memory_allocated(),
+            )
             self.profile_memory_steps.append(record)
             logger.info("V4.1 initialization memory step: %s", record)
 
         record_memory(0, 0)
         if not self.use_dspark and isinstance(self.state, PagedStageState):
+            warmup_buckets = prefill_compute_buckets()
             geometries = (0, min(INDEX_MME_HOT_TOKENS, self.model_config.max_model_len - 1))
             for start_position in geometries:
                 for tokens in prefill_compute_buckets(self.prefill_capacity):
                     if start_position + tokens > self.model_config.max_model_len:
                         continue
-                    logger.info("V4.1 PP%d starting pre-KV C%d prefill recipe warmup at position %d",
-                                self.model.pp_rank, tokens, start_position)
+                    logger.info(
+                        "V4.1 PP%d starting pre-KV C%d prefill recipe warmup at position %d",
+                        self.model.pp_rank,
+                        tokens,
+                        start_position,
+                    )
                     self._dummy_run(tokens, start_position=start_position)
                     record_memory(tokens, start_position)
-                    logger.info("V4.1 PP%d completed pre-KV C%d prefill recipe warmup at position %d",
-                                self.model.pp_rank, tokens, start_position)
+                    logger.info(
+                        "V4.1 PP%d completed pre-KV C%d prefill recipe warmup at position %d",
+                        self.model.pp_rank,
+                        tokens,
+                        start_position,
+                    )
         tokens = 6 if self.use_dspark else 1
         logger.info("V4.1 PP%d starting C%d memory profile", self.model.pp_rank, tokens)
         self._dummy_run(tokens)
@@ -2017,24 +2250,31 @@ class V41ModelRunner:
         # Ordinary serving keeps the qualified C1 native replay for decode.
         # C6 is a DSpark-only anchor-plus-draft geometry. Prompt C128 recipes
         # are compiled by real prefill qualification and persisted in cache.
-        for count in ((1, 6) if self.use_dspark else (1, )):
+        for count in (1, 6) if self.use_dspark else (1,):
             runtime = count == 1 and getattr(self.model.program, "runtime_indexer", False)
-            geometries = (tuple(decode_search_warmups(self.model.program.length, runtime_indexer=True)) if runtime else
-                          ((0, 512), ))
+            geometries = (
+                tuple(decode_search_warmups(self.model.program.length, runtime_indexer=True))
+                if runtime
+                else ((0, 512),)
+            )
             for start_position, search in geometries:
                 for _ in range(4 if self.model.native else 1):
                     self._dummy_run(count, native=self.model.native, start_position=start_position)
                 if self.model.native:
                     self.model.program.replay_owner.require_ready(count, search=search)
             self.graphed_buckets.add(count)
-        if (not self.use_dspark and self.model.native and isinstance(self.state, PagedStageState)
-                and not getattr(self.model.program, "runtime_indexer", False)):
+        if (
+            not self.use_dspark
+            and self.model.native
+            and isinstance(self.state, PagedStageState)
+            and not getattr(self.model.program, "runtime_indexer", False)
+        ):
             # Prepare every reachable C1 search geometry before API readiness.
             # Otherwise a healthy stream pauses for compilation at each new
             # bucket, and already-warmed buckets remain untested at startup.
-            for start, search in decode_search_warmups(self.model.program.length,
-                                                       runtime_indexer=getattr(self.model.program, "runtime_indexer",
-                                                                               False)):
+            for start, search in decode_search_warmups(
+                self.model.program.length, runtime_indexer=getattr(self.model.program, "runtime_indexer", False)
+            ):
                 if start == 0:
                     continue
                 logger.info("V4.1 PP%d preparing C1 search bucket %d", self.model.pp_rank, search)
@@ -2059,13 +2299,19 @@ class V41ModelRunner:
         self.state.clear()
         self.active_request = None
         if envs.VLLM_HPU_DSV41_VERIFY_TIMING:
-            if (not envs.VLLM_HPU_DSV41_DEVICE_VERIFY or not envs.VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE
-                    or not envs.VLLM_HPU_DSV41_INLINE_PP_COMMIT or envs.VLLM_HPU_DSV41_COMPILED_PP_COMMIT):
+            if (
+                not envs.VLLM_HPU_DSV41_DEVICE_VERIFY
+                or not envs.VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE
+                or not envs.VLLM_HPU_DSV41_INLINE_PP_COMMIT
+                or envs.VLLM_HPU_DSV41_COMPILED_PP_COMMIT
+            ):
                 raise RuntimeError("Verify timing requires the qualified eager direct commit path")
             from vllm_gaudi.ops.deepseek_v41_verify_timing import VerifyPhaseTiming
             from pathlib import Path
+
             self.verify_timing = VerifyPhaseTiming(
-                Path(os.environ["DSV41_RUN_EVIDENCE"]) / "verify-phases", self.model.pp_rank * 2 + self.model.tp_rank)
+                Path(os.environ["DSV41_RUN_EVIDENCE"]) / "verify-phases", self.model.pp_rank * 2 + self.model.tp_rank
+            )
             self.pp.timing = self.verify_timing
             self.verify_timing.calibrate()
 
@@ -2093,12 +2339,9 @@ class V41ModelRunner:
         directory = Path(os.environ["DSV41_RUN_EVIDENCE"]) / "round-timing"
         directory.mkdir(exist_ok=True)
         rank = self.model.pp_rank * 2 + self.model.tp_rank
-        (directory / f"rank{rank}.json"
-         ).write_text(json.dumps({
-             "rank": rank,
-             "clock": "perf_counter_ns",
-             "records": self.round_records
-         }) + "\n")
+        (directory / f"rank{rank}.json").write_text(
+            json.dumps({"rank": rank, "clock": "perf_counter_ns", "records": self.round_records}) + "\n"
+        )
 
     def _round_phase(self, name):
         if getattr(self, "round_context", None) is not None:
@@ -2120,12 +2363,14 @@ class V41ModelRunner:
             raise RuntimeError("V4.1 round completion does not match its input generation")
         if len(self.round_records) >= 65536:
             raise RuntimeError("V4.1 round timing capacity exceeded")
-        row = dict(context,
-                   end_ns=time.perf_counter_ns(),
-                   proposed_count=len(proposed),
-                   committed=committed,
-                   output_count=len(output),
-                   output=list(output))
+        row = dict(
+            context,
+            end_ns=time.perf_counter_ns(),
+            proposed_count=len(proposed),
+            committed=committed,
+            output_count=len(output),
+            output=list(output),
+        )
         self.round_records.append(row)
         self.round_context = None
         return [(row["request_id"], row["generation"], row["target_count"])]

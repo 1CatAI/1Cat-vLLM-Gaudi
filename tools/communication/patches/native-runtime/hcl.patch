@@ -1,6 +1,5 @@
 diff --git a/hcl/include/internal/hccl_tp2_native_graph.h b/hcl/include/internal/hccl_tp2_native_graph.h
 new file mode 100644
-index 0000000..f96e033
 --- /dev/null
 +++ b/hcl/include/internal/hccl_tp2_native_graph.h
 @@ -0,0 +1,111 @@
@@ -116,10 +115,9 @@ index 0000000..f96e033
 +}
 +#endif
 diff --git a/hcl/src/CMakeLists.txt b/hcl/src/CMakeLists.txt
-index dc831ca..ed649eb 100644
 --- a/hcl/src/CMakeLists.txt
 +++ b/hcl/src/CMakeLists.txt
-@@ -100,11 +100,16 @@ endforeach()
+@@ -100,11 +100,16 @@
  
  add_library(${TARGET_NAME_SO} SHARED ${SRCS})
  
@@ -139,7 +137,7 @@ index dc831ca..ed649eb 100644
  )
  
  target_link_libraries(
-@@ -112,7 +117,10 @@ target_link_libraries(
+@@ -112,7 +117,10 @@
      $ENV{HCL_LIB_DIR}/libhl_logger.so
      $ENV{HCL_LIB_DIR}/libhl_gcfg.so
      $ENV{HCL_LIB_DIR}/libhwloc_embedded.a
@@ -154,7 +152,6 @@ index dc831ca..ed649eb 100644
 +
 +separate_debug_symbols(${TARGET_NAME_SO})
 diff --git a/hcl/src/collective_interface/collectives/all_reduce.cpp b/hcl/src/collective_interface/collectives/all_reduce.cpp
-index 4a013e0..35b50f8 100644
 --- a/hcl/src/collective_interface/collectives/all_reduce.cpp
 +++ b/hcl/src/collective_interface/collectives/all_reduce.cpp
 @@ -4,6 +4,46 @@
@@ -204,10 +201,11 @@ index 4a013e0..35b50f8 100644
  
  hcclResult_t ar_runPairwise(IHcclGraphEngine* engine, HclCollectiveParams& params)
  {
-@@ -15,6 +55,31 @@ hcclResult_t ar_runPairwise(IHcclGraphEngine* engine, HclCollectiveParams& param
+@@ -14,6 +54,31 @@
+     const uint32_t boxesCount       = commSize / scaleupGroupSize;
      const uint64_t countPerRank     = params.m_count / commSize;
      const uint64_t rankAddrOffset   = countPerRank * dataTypeSizeInBytes(params.m_dataType);
- 
++
 +    const bool dedicatedDirectRequested = HclGen2::isTp2DedicatedDirectCall();
 +    const bool dedicatedExchangeRequested = HclGen2::isTp2DedicatedExchangeCall();
 +    const bool directNicExchangeRequested =
@@ -232,22 +230,52 @@ index 4a013e0..35b50f8 100644
 +        return ar_runTp2ReplicatedReduceScatter(
 +            engine, params, useDirectNicTransfer, useDirectNicReduction);
 +    }
-+
+ 
      {
          params.m_currentOp = eHCLReduceScatter;
-         HcclGraph graph(engine, &params);
-@@ -105,4 +170,4 @@ hcclResult_t ar_runPairwise(IHcclGraphEngine* engine, HclCollectiveParams& param
+@@ -105,4 +170,36 @@
          }
          return graph.submit();
      }
 -}
 \ No newline at end of file
 +}
++
++// Retain the ordinary four-rank AllReduce arithmetic: ReduceScatter followed
++// by in-place AllGather. Each graph owns one HCL completion, so it can reuse
++// the existing native capture/relocation and completion-ring machinery.
++std::unique_ptr<HcclGraph> ar_createTp4NativePhaseGraph(IHcclGraphEngine* engine,
++                                                      HclCollectiveParams& params, int phase)
++{
++    const auto& comm = params.m_dynamicComm;
++    if (comm.getCommSize() != 4 || comm.getScaleupGroupSize() != 4 || phase < 0 || phase > 2 ||
++        params.m_count == 0 || (phase != 2 && params.m_count % 4 != 0)) return nullptr;
++    params.m_directScaleupNicTransfer = false;
++    params.m_directScaleupNicReduction = false;
++    params.m_currentOp = phase == 0 ? eHCLReduceScatter : eHCLAllGather;
++    params.m_collectiveOp = phase == 2 ? eHCLAllGather : eHCLAllReduce;
++    if (phase == 2) params.m_reduceOp = hcclOpNone;
++    auto graph = std::make_unique<HcclGraph>(engine, &params);
++    if (phase == 0)
++    {
++        const uint64_t perRank = params.m_count / 4;
++        const uint64_t offset = comm.getRankInScaleupGroup() * perRank * dataTypeSizeInBytes(params.m_dataType);
++        graph->createPrim<HcclPrimReduceScatter>(ReduceScatterPrimArgs {
++            {params.m_sendBufferAddr, params.m_recvBufferAddr + offset, {}, params.m_count}, false});
++    }
++    else
++    {
++        graph->startStrongOrder = phase == 1;
++        graph->createPrim<HcclPrimAllGather>(params.m_sendBufferAddr, params.m_recvBufferAddr,
++                                            phase == 1 ? params.m_count / 4 : params.m_count);
++    }
++    graph->instantiate();
++    return graph;
++}
 diff --git a/hcl/src/collective_interface/collectives/all_reduce.h b/hcl/src/collective_interface/collectives/all_reduce.h
-index 441e693..617d152 100644
 --- a/hcl/src/collective_interface/collectives/all_reduce.h
 +++ b/hcl/src/collective_interface/collectives/all_reduce.h
-@@ -2,6 +2,12 @@
+@@ -2,6 +2,16 @@
  #include "hccl_types.h"
  #include "hcl_collective_params.h"
  
@@ -262,11 +290,14 @@ index 441e693..617d152 100644
 +std::unique_ptr<HcclGraph> ar_createTp2DirectGraph(IHcclGraphEngine* engine,
 +                                                  HclCollectiveParams& params,
 +                                                  bool directNicReduction);
++
++// One existing stock phase per native completion; phases: RS, AR-AG, standalone AG.
++std::unique_ptr<HcclGraph> ar_createTp4NativePhaseGraph(IHcclGraphEngine* engine,
++                                                      HclCollectiveParams& params, int phase);
 diff --git a/hcl/src/collective_interface/hccl_graph.cpp b/hcl/src/collective_interface/hccl_graph.cpp
-index dca4b01..29b47f7 100644
 --- a/hcl/src/collective_interface/hccl_graph.cpp
 +++ b/hcl/src/collective_interface/hccl_graph.cpp
-@@ -74,7 +74,7 @@ void HcclGraph::setupExecSets()
+@@ -74,7 +74,7 @@
  
  hcclResult_t HcclGraph::submit()
  {
@@ -275,10 +306,12 @@ index dca4b01..29b47f7 100644
      uint64_t startVal = m_graphEngine->initGraph(this);
      for (size_t j = 0; j < m_completionSets.size(); j++)
      {
-@@ -91,6 +91,16 @@ hcclResult_t HcclGraph::submit()
+@@ -89,6 +89,16 @@
+     }
+     m_graphEngine->finalizeGraph(this, startVal);
      return hcclSuccess;
- }
- 
++}
++
 +void HcclGraph::instantiate()
 +{
 +    if (m_instantiated)
@@ -287,12 +320,10 @@ index dca4b01..29b47f7 100644
 +    }
 +    setupExecSets();
 +    m_instantiated = true;
-+}
-+
+ }
+ 
  int HcclGraph::getWaits(bool incRequests)
- {
-     int oldVal = m_requestedWaits;
-@@ -111,4 +121,4 @@ bool HcclGraph::checkTypeAllocation(BufferType type)
+@@ -111,4 +121,4 @@
  void HcclGraph::verifyHandle(const BufferToken& handle)
  {
      return bufferGenerator.verifyHandle(handle);
@@ -300,10 +331,9 @@ index dca4b01..29b47f7 100644
 \ No newline at end of file
 +}
 diff --git a/hcl/src/collective_interface/hccl_graph.h b/hcl/src/collective_interface/hccl_graph.h
-index dcff4f6..9abb315 100644
 --- a/hcl/src/collective_interface/hccl_graph.h
 +++ b/hcl/src/collective_interface/hccl_graph.h
-@@ -72,6 +72,8 @@ public:
+@@ -72,6 +72,8 @@
       * @return hcclResult_t enum type for submission result
       */
      hcclResult_t submit();
@@ -312,7 +342,7 @@ index dcff4f6..9abb315 100644
  
      /**
       * @brief Create primitive of generic type
-@@ -142,4 +144,5 @@ private:
+@@ -142,4 +144,5 @@
  
      int m_primCtr        = 0;
      int m_requestedWaits = 0;
@@ -321,10 +351,9 @@ index dcff4f6..9abb315 100644
 +    bool m_instantiated  = false;
 +};
 diff --git a/hcl/src/collective_interface/prims/scaleup_prims.cpp b/hcl/src/collective_interface/prims/scaleup_prims.cpp
-index 424c6c2..4d96187 100644
 --- a/hcl/src/collective_interface/prims/scaleup_prims.cpp
 +++ b/hcl/src/collective_interface/prims/scaleup_prims.cpp
-@@ -109,12 +109,20 @@ void HcclPrimBroadcast::updateCounts()
+@@ -109,12 +109,20 @@
  }
  
  HcclPrimReduceScatter::HcclPrimReduceScatter(ReduceScatterPrimArgs& args)
@@ -347,7 +376,7 @@ index 424c6c2..4d96187 100644
  {
  }
  
-@@ -125,19 +133,33 @@ hcclResult_t HcclPrimReduceScatter::process(IHcclGraphEngine* engine)
+@@ -125,19 +133,33 @@
  
  signalEvents_t HcclPrimReduceScatter::getSignalEvents()
  {
@@ -385,10 +414,9 @@ index 424c6c2..4d96187 100644
 +        m_replicateInput ? inputCount() * m_scaleupGroupSize : inputCount();
  }
 diff --git a/hcl/src/collective_interface/prims/scaleup_prims.h b/hcl/src/collective_interface/prims/scaleup_prims.h
-index b3e2481..4f5e80b 100644
 --- a/hcl/src/collective_interface/prims/scaleup_prims.h
 +++ b/hcl/src/collective_interface/prims/scaleup_prims.h
-@@ -102,6 +102,9 @@ struct ReduceScatterPrimArgs
+@@ -102,6 +102,9 @@
  {
      ScaleupPrimArgs scaleupArg;
      bool            castUp = false;
@@ -398,7 +426,7 @@ index b3e2481..4f5e80b 100644
  };
  
  class HcclPrimReduceScatter : public HcclScaleupPrim
-@@ -122,8 +125,14 @@ public:
+@@ -122,8 +125,14 @@
  
      inline uint64_t getCountPerRank() { return m_scaleupCountPerRank; }
      inline bool     castUp() const { return m_castUp; }
@@ -416,7 +444,6 @@ index b3e2481..4f5e80b 100644
 +    bool     m_directNicReduction  = false;
 +};
 diff --git a/hcl/src/hccl/hccl.cpp b/hcl/src/hccl/hccl.cpp
-index cb2a6ef..47cb476 100644
 --- a/hcl/src/hccl/hccl.cpp
 +++ b/hcl/src/hccl/hccl.cpp
 @@ -15,6 +15,7 @@
@@ -435,7 +462,7 @@ index cb2a6ef..47cb476 100644
  
  #include "common/shim_types.h"       // for SHIM_API_HCCL, SHIM...
  #include "dfa_defines.hpp"           // for DfaErrorCode, DfaEr...
-@@ -36,13 +38,231 @@
+@@ -36,12 +38,231 @@
  #include "hcl_utils.h"               // for HCL_API_LOG_ENTRY
  #include "hccl_api_inc.h"            // for HCCL_* macros
  #include "internal/hccl_internal.h"  // for hcclDFA, hcclDestro...
@@ -451,7 +478,7 @@ index cb2a6ef..47cb476 100644
 +#include <mutex>
  
  struct HCL_Request;
- 
++
 +struct InternalHcclTp2NativeGraph
 +{
 +    enum class ReplayPath
@@ -497,6 +524,7 @@ index cb2a6ef..47cb476 100644
 +    HclDeviceControllerGen2Arch::NativeGraphCapture wrapCapture;
 +    void*                                           streamHandle = nullptr;
 +    hcclTp2NativeMode                               mode = hcclTp2NativeReduction;
++    int                                             tp4Phase = -1;
 +    hcclTp2NativeGraphState                         state = hcclTp2NativeGraphCreated;
 +    uint64_t                                        preparedReplayCount = 0;
 +    uint64_t                                        nativeReplayCount = 0;
@@ -663,11 +691,10 @@ index cb2a6ef..47cb476 100644
 +    std::fprintf(stderr, "NATIVE_HCL_DIFF total_changed_words=%zu\n", differences);
 +    std::fflush(stderr);
 +}
-+
+ 
  // ------------------------------------------------------------------------------------------------
  // Global context singleton objects.
- //
-@@ -523,6 +743,45 @@ static void HCCL_StopShim(void)
+@@ -523,6 +744,45 @@
  namespace HclGen2
  {
  
@@ -713,7 +740,7 @@ index cb2a6ef..47cb476 100644
  hcclResult_t HCCL_API_CALL hcclGetVersion_impl(int* version)
  {
      HCL_API_LOG_ENTRY("(&version={:p})", (void*)version);
-@@ -723,6 +982,52 @@ hcclResult_t HCCL_API_CALL hcclAllReduce_impl(const void*     sendbuff,
+@@ -723,6 +983,52 @@
                   ->pfn_hcclAllReduce)(sendbuff, recvbuff, count, datatype, reduceOp, comm, stream_handle);
  }
  
@@ -766,7 +793,7 @@ index cb2a6ef..47cb476 100644
  hcclResult_t HCCL_API_CALL hcclReduce_impl(const void*     sendbuff,
                                             void*           recvbuff,
                                             size_t          count,
-@@ -1109,3 +1414,694 @@ hcclResult_t HCCL_API_CALL hcclDeviceInit_impl(void* device, void* context)
+@@ -1109,3 +1415,780 @@
  }
  
  }  // namespace HclGen2
@@ -864,6 +891,39 @@ index cb2a6ef..47cb476 100644
 +    }
 +}
 +
++// Capability is an artifact property, not a serving optimization switch.
++extern "C" uint32_t HCCL_API_CALL hcclTp4NativeGraphVersion() { return 1; }
++
++extern "C" hcclResult_t HCCL_API_CALL hcclTp4NativeGraphCreate(
++    const void* sendbuff, void* recvbuff, size_t count, hcclDataType_t datatype,
++    hcclRedOp_t reduceOp, hcclComm_t comm, void* streamHandle, int phase,
++    hcclTp2NativeGraphHandle* graphHandle)
++{
++    if (!graphHandle || !sendbuff || !recvbuff || !streamHandle || datatype != hcclBfloat16 ||
++        reduceOp != hcclSum || count == 0 || count > 32768 || phase < 0 || phase > 2 ||
++        (phase != 2 && count % 4 != 0) || (phase == 1 ? sendbuff != recvbuff : sendbuff == recvbuff))
++        return hcclInvalidArgument;
++    *graphHandle = nullptr;
++    auto* communicator = hccl_ctx.communicator(comm);
++    if (!communicator || !communicator->getDynamicComm() || communicator->getCommSize() != 4 ||
++        communicator->getDynamicComm()->getScaleupGroupSize() != 4) return hcclInvalidArgument;
++    try
++    {
++        const uint32_t streamId = hccl_device().nativeStreamId(streamHandle);
++        auto* routines = hccl_device().nativeCollectiveRoutines(streamId);
++        if (!routines) return hcclInvalidUsage;
++        auto handle = std::make_unique<InternalHcclTp2NativeGraph>(communicator, routines,
++            *communicator->getDynamicComm(), sendbuff, recvbuff, count, datatype, reduceOp,
++            streamHandle, hcclTp2NativeReduction, hccl_ctx.generateApiId());
++        handle->tp4Phase = phase;
++        handle->graph = ar_createTp4NativePhaseGraph(routines, handle->params, phase);
++        if (!handle->graph || !handle->graph->instantiated()) return hcclInternalError;
++        *graphHandle = handle.release();
++        return hcclSuccess;
++    }
++    catch (...) { return hcclInternalError; }
++}
++
 +extern "C" hcclResult_t HCCL_API_CALL hcclTp2NativeGraphCapture(hcclTp2NativeGraphHandle graphHandle)
 +{
 +    if (graphHandle == nullptr)
@@ -885,6 +945,12 @@ index cb2a6ef..47cb476 100644
 +        return syncStatus;
 +    }
 +
++    auto reject = [&](const char* reason) {
++        std::fprintf(stderr, "NATIVE_HCL_CAPTURE_RETURN phase=%d count=%zu reason=%s\n",
++                     graphHandle->tp4Phase, size_t(graphHandle->params.m_count), reason);
++        graphHandle->state = hcclTp2NativeGraphInvalid;
++        return hcclInternalError;
++    };
 +    bool forcedBufferAddressRefresh = false;
 +    try
 +    {
@@ -897,6 +963,7 @@ index cb2a6ef..47cb476 100644
 +        if (warmupStatus != hcclSuccess)
 +        {
 +            graphHandle->state = hcclTp2NativeGraphInvalid;
++            std::fprintf(stderr, "NATIVE_HCL_SUBMIT phase=%d count=%zu stage=warmup status=%d\n", graphHandle->tp4Phase, size_t(graphHandle->params.m_count), int(warmupStatus));
 +            return warmupStatus;
 +        }
 +        // A second Synapse stream sync does not create a new dependency when
@@ -921,13 +988,14 @@ index cb2a6ef..47cb476 100644
 +        {
 +            graphHandle->routines->cancelNativeCapture();
 +            graphHandle->state = hcclTp2NativeGraphInvalid;
++            std::fprintf(stderr, "NATIVE_HCL_SUBMIT phase=%d count=%zu stage=capture_submit status=%d\n", graphHandle->tp4Phase, size_t(graphHandle->params.m_count), int(status));
 +            return status;
 +        }
 +        graphHandle->capture = graphHandle->routines->endNativeCapture();
++        graphHandle->capture.tp4Phase = graphHandle->tp4Phase;
 +        if (graphHandle->capture.commandCount() == 0)
 +        {
-+            graphHandle->state = hcclTp2NativeGraphInvalid;
-+            return hcclInternalError;
++            return reject("empty_commands");
 +        }
 +
 +        // Reusing the first completion-SO slot requires a transient NIC
@@ -939,8 +1007,7 @@ index cb2a6ef..47cb476 100644
 +        const uint64_t currentTarget = graphHandle->routines->nativeCompletion().targetValue;
 +        if (graphHandle->completionRingSize < 2 || currentTarget == 0)
 +        {
-+            graphHandle->state = hcclTp2NativeGraphInvalid;
-+            return hcclInternalError;
++            return reject("completion_ring_or_target");
 +        }
 +        const uint64_t position = (currentTarget - 1) % graphHandle->completionRingSize;
 +        const uint64_t executionsToWrap = graphHandle->completionRingSize - position;
@@ -969,20 +1036,41 @@ index cb2a6ef..47cb476 100644
 +                    graphHandle->routines->cancelNativeCapture();
 +                }
 +                graphHandle->state = hcclTp2NativeGraphInvalid;
-+                return wrapStatus;
++                std::fprintf(stderr, "NATIVE_HCL_SUBMIT phase=%d count=%zu stage=wrap_submit status=%d\n", graphHandle->tp4Phase, size_t(graphHandle->params.m_count), int(wrapStatus));
++            return wrapStatus;
 +            }
 +            if (captureWrap)
 +            {
 +                graphHandle->wrapCapture = graphHandle->routines->endNativeCapture();
++                graphHandle->wrapCapture.tp4Phase = graphHandle->tp4Phase;
 +            }
 +        }
 +        if (!graphHandle->wrapCapture.validate() ||
-+            graphHandle->wrapCapture.commandCount() < graphHandle->capture.commandCount() ||
++            graphHandle->wrapCapture.commandCount() == 0 ||
++            (graphHandle->tp4Phase < 0 &&
++             graphHandle->wrapCapture.commandCount() < graphHandle->capture.commandCount()) ||
 +            graphHandle->wrapCapture.externalTargetDelta != graphHandle->capture.externalTargetDelta ||
 +            graphHandle->wrapCapture.internalTargetDelta != graphHandle->capture.internalTargetDelta)
 +        {
-+            graphHandle->state = hcclTp2NativeGraphInvalid;
-+            return hcclInternalError;
++            std::fprintf(stderr, "NATIVE_HCL_WRAP valid=%d commands=%zu/%zu delta=%llu/%llu internal=%llu/%llu\n",
++                int(graphHandle->wrapCapture.validate()),
++                graphHandle->capture.commandCount(), graphHandle->wrapCapture.commandCount(),
++                static_cast<unsigned long long>(graphHandle->capture.externalTargetDelta),
++                static_cast<unsigned long long>(graphHandle->wrapCapture.externalTargetDelta),
++                static_cast<unsigned long long>(graphHandle->capture.internalTargetDelta),
++                static_cast<unsigned long long>(graphHandle->wrapCapture.internalTargetDelta));
++            return reject("wrap_contract");
++        }
++
++        // Every TP4 physical phase owns two independently validated complete
++        // templates. Context elision may make its wrap template shorter; an
++        // opcode-count ordering is not a dependency/completion invariant.
++        // Keep each template's command/relocation validation and both target
++        // deltas, and retain the historical check for TP2.
++        if (graphHandle->tp4Phase >= 0 &&
++            graphHandle->wrapCapture.commandCount() < graphHandle->capture.commandCount())
++        {
++            dumpNativeCaptureDiff(graphHandle->capture, graphHandle->wrapCapture, 0, executionsToWrap);
 +        }
 +
 +        for (const auto* candidate : {&graphHandle->capture, &graphHandle->wrapCapture})
@@ -994,8 +1082,9 @@ index cb2a6ef..47cb476 100644
 +            if (!candidate->executableValidated || targets == 0 || targets % 4 != 0 ||
 +                indexes * 4 != targets || notify == 0 || notify != wait)
 +            {
-+                graphHandle->state = hcclTp2NativeGraphInvalid;
-+                return hcclInternalError;
++                std::fprintf(stderr, "NATIVE_HCL_FIELDS validated=%d targets=%zu indexes=%zu notify=%zu wait=%zu\n",
++                             int(candidate->executableValidated), targets, indexes, notify, wait);
++                return reject("dependency_relocations");
 +            }
 +        }
 +        graphHandle->nativeRelocationsValidated = true;
@@ -1026,6 +1115,11 @@ index cb2a6ef..47cb476 100644
 +    }
 +    catch (...)
 +    {
++        try { throw; }
++        catch (const std::exception& error) {
++            std::fprintf(stderr, "NATIVE_HCL_CAPTURE_REJECT phase=%d count=%zu reason=%s\n",
++                         graphHandle->tp4Phase, size_t(graphHandle->params.m_count), error.what());
++        } catch (...) {}
 +        if (forcedBufferAddressRefresh)
 +        {
 +            graphHandle->routines->setNativeScaleupBufferAddressRefresh(false);
@@ -1299,7 +1393,7 @@ index cb2a6ef..47cb476 100644
 +extern "C" hcclResult_t HCCL_API_CALL hcclTp2NativeBatchCreate(
 +    const hcclTp2NativeGraphHandle* graphs, size_t count, hcclTp2NativeBatchHandle* result)
 +{
-+    if (!graphs || !result || count == 0 || count > 128) return hcclInvalidArgument;
++    if (!graphs || !result || count == 0 || count > 256) return hcclInvalidArgument;
 +    *result = nullptr;
 +    auto batch = std::make_unique<InternalHcclTp2NativeBatch>();
 +    // Roll back leases on preparation failure; no commands have been submitted.
@@ -1318,6 +1412,14 @@ index cb2a6ef..47cb476 100644
 +                VERIFY(graph->communicator == graphs[0]->communicator && graph->routines == graphs[0]->routines &&
 +                       graph->streamHandle == graphs[0]->streamHandle,
 +                       "Native batch topology or communicator differs");
++            if (graph->tp4Phase == 1)
++            {
++                VERIFY(index > 0 && graphs[index - 1]->tp4Phase == 0 &&
++                       graphs[index - 1]->params.m_count == graph->params.m_count &&
++                       graphs[index - 1]->params.m_recvBufferAddr == graph->params.m_sendBufferAddr &&
++                       graph->params.m_sendBufferAddr == graph->params.m_recvBufferAddr,
++                       "TP4 AllGather requires its immediately preceding ReduceScatter output");
++            }
 +            batch->graphs.push_back(graph);
 +            graph->batchOwned = true;
 +        }
@@ -1360,6 +1462,17 @@ index cb2a6ef..47cb476 100644
 +    const uint64_t target = first->routines->nativeCompletion().targetValue;
 +    if (first->routines->nativeCompletion().long_so_index > std::numeric_limits<uint32_t>::max() ||
 +        !target || target >= (uint64_t(1) << 60) - count) return hcclInvalidUsage;
++    // AllGather must wait for the preceding ReduceScatter completion, not
++    // merely its earlier compute producer. The existing unit-completion
++    // contract makes that native HCL epoch known before packet publication.
++    for (size_t node = 0; node < count; ++node)
++    {
++        if (batch.graphs[offset + node]->tp4Phase == 1)
++        {
++            if (node == 0 || batch.graphs[offset + node - 1]->tp4Phase != 0) return hcclInvalidArgument;
++            batch.dependencies[offset + node] = {first->routines->nativeCompletion().long_so_index, target + node};
++        }
++    }
 +    const auto& phase = phases[target % phases.size()];
 +    try
 +    {
@@ -1463,7 +1576,6 @@ index cb2a6ef..47cb476 100644
 +}
 diff --git a/hcl/src/hccl/tp2_direct_api_context.h b/hcl/src/hccl/tp2_direct_api_context.h
 new file mode 100644
-index 0000000..7cf1701
 --- /dev/null
 +++ b/hcl/src/hccl/tp2_direct_api_context.h
 @@ -0,0 +1,7 @@
@@ -1475,10 +1587,9 @@ index 0000000..7cf1701
 +bool isTp2DedicatedExchangeCall();
 +}
 diff --git a/hcl/src/hcl_collective_params.h b/hcl/src/hcl_collective_params.h
-index 2d3ce4e..b95a813 100644
 --- a/hcl/src/hcl_collective_params.h
 +++ b/hcl/src/hcl_collective_params.h
-@@ -74,6 +74,8 @@ struct HclCollectiveParams
+@@ -74,6 +74,8 @@
      hcclRedOp_t      m_reduceOp        = hcclOpNone;
      HCL_Rank         m_root            = HCL_INVALID_RANK;
      uint64_t         m_remainder_count = 0;
@@ -1488,10 +1599,9 @@ index 2d3ce4e..b95a813 100644
      HclDynamicCommunicator& m_dynamicComm;
  };
 diff --git a/hcl/src/hcl_global_conf.cpp b/hcl/src/hcl_global_conf.cpp
-index ce717f7..93eda71 100644
 --- a/hcl/src/hcl_global_conf.cpp
 +++ b/hcl/src/hcl_global_conf.cpp
-@@ -372,6 +372,48 @@ GlobalConfUint64 GCFG_HCCL_PRIM_COLLECTIVE_MASK(
+@@ -372,6 +372,48 @@
          DfltUint64(DEFAULT_PRIM_COLLECTIVE_MASK) ,
          MakePublic);
  
@@ -1541,10 +1651,9 @@ index ce717f7..93eda71 100644
          "HCL_COLLECTIVE_LOG",
          "Collect HCL collective logs from all ranks to coordinator",
 diff --git a/hcl/src/hcl_global_conf.h b/hcl/src/hcl_global_conf.h
-index b20f2bb..68fd863 100644
 --- a/hcl/src/hcl_global_conf.h
 +++ b/hcl/src/hcl_global_conf.h
-@@ -74,6 +74,13 @@ extern GlobalConfBool   GCFG_HCL_USE_NIC_COMPRESSION;
+@@ -74,6 +74,13 @@
  
  extern GlobalConfBool   GCFG_HCL_NULL_SUBMIT;
  extern GlobalConfUint64 GCFG_HCCL_PRIM_COLLECTIVE_MASK;
@@ -1559,10 +1668,9 @@ index b20f2bb..68fd863 100644
  extern GlobalConfBool   GCFG_HCL_COLLECTIVE_LOG;
  extern GlobalConfInt64  GCFG_OP_DRIFT_THRESHOLD_MS;
 diff --git a/hcl/src/infra/scal/gen2_arch_common/cyclic_buffer_manager.cpp b/hcl/src/infra/scal/gen2_arch_common/cyclic_buffer_manager.cpp
-index a7a6a5f..ab5140b 100644
 --- a/hcl/src/infra/scal/gen2_arch_common/cyclic_buffer_manager.cpp
 +++ b/hcl/src/infra/scal/gen2_arch_common/cyclic_buffer_manager.cpp
-@@ -74,7 +74,9 @@ void CyclicBufferManager::advanceAlignment(size_t size)
+@@ -74,7 +74,9 @@
      {
          uint64_t alignSize = m_streamInfo.command_alignment - (startAddress & commandAlignmentMask);
  
@@ -1572,7 +1680,7 @@ index a7a6a5f..ab5140b 100644
          incPi(alignSize);
  
          startAddress = getPi();
-@@ -219,6 +221,7 @@ void CyclicBufferManager::submit(bool force)
+@@ -219,6 +221,7 @@
      {
          incPi(m_sizeSinceAlignment);
          m_scalWrapper.sendStream(m_streamHandle, getPi(), m_streamInfo.submission_alignment);
@@ -1580,7 +1688,7 @@ index a7a6a5f..ab5140b 100644
      }
  }
  
-@@ -329,4 +332,4 @@ void CyclicBufferManager::dfaLog(hl_logger::LoggerSPtr synDevFailLog)
+@@ -329,4 +332,4 @@
      }
  
      HLLOG_UNTYPED(synDevFailLog, HLLOG_LEVEL_INFO, "{}", out);
@@ -1588,10 +1696,9 @@ index a7a6a5f..ab5140b 100644
 \ No newline at end of file
 +}
 diff --git a/hcl/src/infra/scal/gen2_arch_common/cyclic_buffer_manager.h b/hcl/src/infra/scal/gen2_arch_common/cyclic_buffer_manager.h
-index c70a9d3..d33c0db 100644
 --- a/hcl/src/infra/scal/gen2_arch_common/cyclic_buffer_manager.h
 +++ b/hcl/src/infra/scal/gen2_arch_common/cyclic_buffer_manager.h
-@@ -55,6 +55,9 @@ public:
+@@ -55,6 +55,9 @@
      void        updateCcbHalfFullMechanism();
  
      virtual uint64_t getPi() = 0;
@@ -1601,7 +1708,7 @@ index c70a9d3..d33c0db 100644
      void             disableCcb(bool disable) { m_disableCcb = disable; }
      void             dfaLog(hl_logger::LoggerSPtr synDevFailLog);
  
-@@ -96,5 +99,7 @@ protected:
+@@ -96,5 +99,7 @@
      bool           m_disableCcb = false;  // used for null submission
      const uint64_t m_logOfBufferSize;     // Cyclic buffer size
      const uint64_t m_pi_mask;
@@ -1611,7 +1718,6 @@ index c70a9d3..d33c0db 100644
  }  // namespace hcl
 diff --git a/hcl/src/infra/scal/gen2_arch_common/native_hcl_program.h b/hcl/src/infra/scal/gen2_arch_common/native_hcl_program.h
 new file mode 100644
-index 0000000..0e27bd2
 --- /dev/null
 +++ b/hcl/src/infra/scal/gen2_arch_common/native_hcl_program.h
 @@ -0,0 +1,102 @@
@@ -1719,10 +1825,9 @@ index 0000000..0e27bd2
 +} // namespace hcl
 diff --git a/hcl/src/infra/scal/gen2_arch_common/native_hcl_relocation.h b/hcl/src/infra/scal/gen2_arch_common/native_hcl_relocation.h
 new file mode 100644
-index 0000000..57554bb
 --- /dev/null
 +++ b/hcl/src/infra/scal/gen2_arch_common/native_hcl_relocation.h
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,263 @@
 +#pragma once
 +
 +#include <cstddef>
@@ -1731,6 +1836,7 @@ index 0000000..57554bb
 +#include <algorithm>
 +#include <limits>
 +#include <vector>
++#include <stdexcept>
 +
 +namespace hcl
 +{
@@ -1756,8 +1862,42 @@ index 0000000..57554bb
 +    WQE_COUNTER,
 +    WQE_NOTIFY,
 +    WQE_WAIT,
++    EXTERNAL_COMPLETION_INDEX,
++    INTERNAL_COMPLETION_INDEX,
++    GPSO_0_INDEX,
++    GPSO_1_INDEX,
++    PENDING_COMPLETION_ADDRESS,
++    PENDING_COMPLETION_INDEX,
++    EXTERNAL_SHORT_MONITOR,
++    INTERNAL_SHORT_MONITOR,
++    GPSO_0_SHORT_MONITOR,
++    GPSO_1_SHORT_MONITOR,
++    PENDING_SHORT_MONITOR,
 +    COUNT
 +};
++
++// Short monitors select one SOB within an eight-object group. The monitor's
++// configured quarter is fixed for the retained command; only SID/mask move.
++inline uint32_t nativeHclShortMonitorIndex(uint32_t arm)
++{
++    const uint32_t selected = (~(arm >> 8)) & 0xffu;
++    if (selected == 0 || (selected & (selected - 1)) != 0)
++        throw std::invalid_argument("Native short monitor must track exactly one SOB");
++    unsigned lane = 0;
++    while ((selected & (1u << lane)) == 0) ++lane;
++    return (arm & 0xffu) * 8 + lane;
++}
++
++inline uint32_t nativeHclShortMonitorBits(uint32_t capturedIndex,
++                                        uint32_t capturedAddress,
++                                        uint32_t currentAddress)
++{
++    const int64_t delta = int64_t(currentAddress) - int64_t(capturedAddress);
++    const int64_t index = int64_t(capturedIndex) + delta / 4;
++    if (capturedIndex >= 2048 || delta % 4 != 0 || index < 0 || index >= 2048)
++        throw std::invalid_argument("Native short monitor moved outside its captured quarter");
++    return (uint32_t(index) >> 3) | ((~(1u << (index & 7)) & 0xffu) << 8);
++}
 +
 +struct NativeHclRelocation
 +{
@@ -1768,7 +1908,42 @@ index 0000000..57554bb
 +    uint8_t                 destinationShift = 0;
 +    uint8_t                 sourceShift      = 0;
 +    NativeHclRelocationKind kind             = NativeHclRelocationKind::DEPENDENCY_TARGET;
++    uint32_t                capturedAddress  = 0;
 +};
++
++// Capture a packed firmware bitfield without guessing its ABI bit offsets.
++// The original command is restored before returning; replay patches only
++// these field bits, leaving adjacent flags and reduction settings untouched.
++template<class Setter>
++std::vector<NativeHclRelocation> nativeHclBitfieldSites(
++    void* packet, size_t size, uint32_t capturedValue, Setter&& setter,
++    NativeHclRelocationKind kind, uint32_t capturedAddress)
++{
++    auto* bytes = static_cast<uint8_t*>(packet);
++    setter(0);
++    const std::vector<uint8_t> zero(bytes, bytes + size);
++    setter(UINT32_MAX);
++    const std::vector<uint8_t> ones(bytes, bytes + size);
++    setter(capturedValue);
++    std::vector<NativeHclRelocation> result;
++    uint8_t sourceShift = 0;
++    for (size_t index = 0; index < size; ++index)
++    {
++        const uint8_t mask = zero[index] ^ ones[index];
++        if (!mask) continue;
++        uint8_t destinationShift = 0;
++        while (!(mask & (1u << destinationShift))) ++destinationShift;
++        const unsigned field = mask >> destinationShift;
++        if ((field & (field + 1)) != 0) throw std::invalid_argument("Noncontiguous native bitfield");
++        uint8_t bits = 0;
++        for (unsigned value = field; value; value >>= 1) ++bits;
++        result.push_back({0, static_cast<uint32_t>(index), 1, mask, destinationShift, sourceShift,
++                          kind, capturedAddress});
++        sourceShift += bits;
++    }
++    if (!sourceShift || sourceShift > 32) throw std::invalid_argument("Invalid native bitfield width");
++    return result;
++}
 +
 +struct NativeHclCommand
 +{
@@ -1917,20 +2092,19 @@ index 0000000..57554bb
 +}
 +}  // namespace hcl
 diff --git a/hcl/src/infra/scal/gen2_arch_common/scal_stream.cpp b/hcl/src/infra/scal/gen2_arch_common/scal_stream.cpp
-index 951a746..61ffeec 100644
 --- a/hcl/src/infra/scal/gen2_arch_common/scal_stream.cpp
 +++ b/hcl/src/infra/scal/gen2_arch_common/scal_stream.cpp
-@@ -7,6 +7,9 @@
+@@ -6,6 +6,9 @@
+ #include "hcl_utils.h"              // for LOG_HCL_TRACE, UNUSED, VERIFY
  #include "hcl_log_manager.h"        // for LOG*
  #include "scal_wrapper.h"           // for Gen2ArchScalWrapper
- 
++
 +#include <algorithm>
 +#include <cstring>
-+
+ 
  using namespace hcl;
  
- void* ScalStreamBase::getNextPtr(size_t size)
-@@ -64,11 +67,21 @@ ScalStream::ScalStream(ScalJsonNames&       scalNames,
+@@ -64,11 +67,21 @@
  void ScalStream::setTargetValue(uint64_t targetValue)
  {
      m_cyclicBuffer->setTargetValue(targetValue);
@@ -1953,7 +2127,7 @@ index 951a746..61ffeec 100644
  }
  
  bool ScalStream::requiresSubmission()
-@@ -78,9 +91,175 @@ bool ScalStream::requiresSubmission()
+@@ -78,9 +91,179 @@
  
  void ScalStream::submit()
  {
@@ -2015,7 +2189,8 @@ index 951a746..61ffeec 100644
 +                                     uint64_t                mask,
 +                                     uint8_t                 destinationShift,
 +                                     uint8_t                 sourceShift,
-+                                     NativeHclRelocationKind kind)
++                                     NativeHclRelocationKind kind,
++                                     uint32_t capturedAddress)
 +{
 +    if (!m_nativeCaptureActive)
 +    {
@@ -2037,7 +2212,8 @@ index 951a746..61ffeec 100644
 +                                                  .mask = mask,
 +                                                  .destinationShift = destinationShift,
 +                                                  .sourceShift = sourceShift,
-+                                                  .kind = kind});
++                                                  .kind = kind,
++                                                  .capturedAddress = capturedAddress});
 +            return;
 +        }
 +    }
@@ -2049,7 +2225,8 @@ index 951a746..61ffeec 100644
 +                                                      uint64_t                mask,
 +                                                      uint8_t                 destinationShift,
 +                                                      uint8_t                 sourceShift,
-+                                                      NativeHclRelocationKind kind)
++                                                      NativeHclRelocationKind kind,
++                                                      uint32_t capturedAddress)
 +{
 +    if (!m_nativeCaptureActive)
 +    {
@@ -2067,7 +2244,8 @@ index 951a746..61ffeec 100644
 +                        mask,
 +                        destinationShift,
 +                        sourceShift,
-+                        kind);
++                        kind,
++                        capturedAddress);
 +}
 +
 +void ScalStream::replayNativeTemplate(const NativeHclStreamTemplate& commandTemplate,
@@ -2130,7 +2308,6 @@ index 951a746..61ffeec 100644
  {
      return CyclicBufferManager::isACcbHalfFullForDeviceBenchMark();
 diff --git a/hcl/src/infra/scal/gen2_arch_common/scal_stream.h b/hcl/src/infra/scal/gen2_arch_common/scal_stream.h
-index 216e279..73c5583 100644
 --- a/hcl/src/infra/scal/gen2_arch_common/scal_stream.h
 +++ b/hcl/src/infra/scal/gen2_arch_common/scal_stream.h
 @@ -8,6 +8,8 @@
@@ -2142,7 +2319,7 @@ index 216e279..73c5583 100644
  #include "factory_types.h"                                      // for CyclicBufferType
  
  namespace hcl
-@@ -36,6 +38,15 @@ public:
+@@ -36,6 +38,16 @@
  
      virtual void*        getNextPtr(size_t size);
      virtual std::string* getStreamName() { return &m_defaultStream; };
@@ -2152,13 +2329,14 @@ index 216e279..73c5583 100644
 +                                     uint64_t,
 +                                     uint8_t,
 +                                     uint8_t,
-+                                     NativeHclRelocationKind)
++                                     NativeHclRelocationKind,
++                                     uint32_t = 0)
 +    {
 +    }
  
      std::vector<uint32_t> m_buffer;
      std::string           m_defaultStream = "unknown_stream";
-@@ -74,6 +85,32 @@ public:
+@@ -74,6 +86,34 @@
      void        disableCcb(bool disable);
      void        dfaLog(hl_logger::LoggerSPtr synDevFailLog);
  
@@ -2170,13 +2348,15 @@ index 216e279..73c5583 100644
 +                             uint64_t                mask,
 +                             uint8_t                 destinationShift,
 +                             uint8_t                 sourceShift,
-+                             NativeHclRelocationKind kind) override;
++                             NativeHclRelocationKind kind,
++                             uint32_t capturedAddress = 0) override;
 +    void addNativeRelocationToLastCommandTail(uint32_t                bytesFromEnd,
 +                                              uint8_t                 width,
 +                                              uint64_t                mask,
 +                                              uint8_t                 destinationShift,
 +                                              uint8_t                 sourceShift,
-+                                              NativeHclRelocationKind kind);
++                                              NativeHclRelocationKind kind,
++                                              uint32_t capturedAddress = 0);
 +    void replayNativeTemplate(const NativeHclStreamTemplate& commandTemplate,
 +                              const NativeHclReplayState&    replayState,
 +                              bool                           preserveSubmissions,
@@ -2191,7 +2371,7 @@ index 216e279..73c5583 100644
      inline unsigned        getUarchStreamIndex() { return m_internalStreamIdx; };
      inline unsigned        getSchedIdx() { return m_schedIdx; };
      inline unsigned        getArchStreamIndex() { return m_archStreamIndex; }
-@@ -100,5 +137,17 @@ protected:
+@@ -100,5 +140,17 @@
      static const uint64_t m_hostCyclicBufferSize = m_core_counter_max_value * piQuant;
  
      std::unique_ptr<CyclicBufferManager> m_cyclicBuffer;
@@ -2210,10 +2390,9 @@ index 216e279..73c5583 100644
  };
  }  // namespace hcl
 diff --git a/hcl/src/platform/gaudi2/commands/hcl_commands.cpp b/hcl/src/platform/gaudi2/commands/hcl_commands.cpp
-index f9b76e8..2d65adf 100644
 --- a/hcl/src/platform/gaudi2/commands/hcl_commands.cpp
 +++ b/hcl/src/platform/gaudi2/commands/hcl_commands.cpp
-@@ -302,7 +302,9 @@ void HclCommandsGaudi2::serializeScaleUpCollectiveOp(hcl::ScalStreamBase&   scal
+@@ -302,7 +302,9 @@
      }
  
      // here we create the collective context which we would like to have in the FW
@@ -2224,7 +2403,7 @@ index f9b76e8..2d65adf 100644
      RequiredCollectiveContext requiredContext(scaleupCollectiveOp.m_collectiveOp,
                                                effectiveReductionOp,
                                                scaleupCollectiveOp.m_soAddress,
-@@ -310,6 +312,11 @@ void HclCommandsGaudi2::serializeScaleUpCollectiveOp(hcl::ScalStreamBase&   scal
+@@ -310,6 +312,11 @@
                                                scaleupCollectiveOp.m_baseAddress >> 32,
                                                scaleupCollectiveOp.m_dataType,
                                                scaleupCollectiveOp.m_strideCount);
@@ -2236,7 +2415,7 @@ index f9b76e8..2d65adf 100644
  
      std::array<UniqueCollectiveContext, HLS2_BOX_SIZE> uniqueContexts;
      int                                                numberOfEnabledConnections = 0;
-@@ -325,7 +332,8 @@ void HclCommandsGaudi2::serializeScaleUpCollectiveOp(hcl::ScalStreamBase&   scal
+@@ -325,7 +332,8 @@
                                                            scaleupCollectiveOp.m_isSend,
                                                            scaleupCollectiveOp.m_isComplexCollective,
                                                            scaleupCollectiveOp.m_isReductionInIMB,
@@ -2246,7 +2425,7 @@ index f9b76e8..2d65adf 100644
                                                            scaleupCollectiveOp.m_isHierarchical,
                                                            scaleupCollectiveOp.m_count,
                                                            scaleupCollectiveOp.m_cellCount,
-@@ -793,4 +801,4 @@ void HclCommandsGaudi2::serializeSetTraceMarker(hcl::ScalStreamBase& scalStream,
+@@ -793,4 +801,4 @@
          schedIdx,
          GAUDI2_SCHED_INSTANT_STM_ADDR(g2fw::CPU_ID_SCHED_ARC3, SCHED_INSTANT_EVENT_TYPE_ID),
          val << 16 | g2fw::SCHED_INST_EVENT_COLLECT_TIMESTAMP);
@@ -2254,10 +2433,9 @@ index f9b76e8..2d65adf 100644
 \ No newline at end of file
 +}
 diff --git a/hcl/src/platform/gaudi2/context_manager.cpp b/hcl/src/platform/gaudi2/context_manager.cpp
-index 78c136a..6ab4d7b 100644
 --- a/hcl/src/platform/gaudi2/context_manager.cpp
 +++ b/hcl/src/platform/gaudi2/context_manager.cpp
-@@ -244,9 +244,12 @@ void ContextManager::updateCommonDword(unsigned                         collecti
+@@ -244,9 +244,12 @@
          cachedCollectiveContext = &m_cachedCollectiveContextsScaleOut[collectiveContextIndex];
      }
  
@@ -2271,7 +2449,7 @@ index 78c136a..6ab4d7b 100644
  
          updateDWord(contextValues, DW0, requiredContext.m_reductionOpcode.raw);
          cachedCollectiveContext->m_data.reduction_opcode = requiredContext.m_reductionOpcode.raw;
-@@ -254,7 +257,8 @@ void ContextManager::updateCommonDword(unsigned                         collecti
+@@ -254,7 +257,8 @@
  
      if (dwordsForUpdate.DW1)
      {
@@ -2281,7 +2459,7 @@ index 78c136a..6ab4d7b 100644
  
          updateDWord(contextValues, DW1, requiredContext.m_syncObjectAddress);
          cachedCollectiveContext->m_data.sync_object_address_0 = requiredContext.m_syncObjectAddress;
-@@ -262,7 +266,7 @@ void ContextManager::updateCommonDword(unsigned                         collecti
+@@ -262,7 +266,7 @@
  
      if (dwordsForUpdate.DW2)
      {
@@ -2290,7 +2468,7 @@ index 78c136a..6ab4d7b 100644
  
          updateDWord(contextValues, DW2, requiredContext.m_syncObjectAddress);
          cachedCollectiveContext->m_data.sync_object_address_1 = requiredContext.m_syncObjectAddress;
-@@ -270,7 +274,8 @@ void ContextManager::updateCommonDword(unsigned                         collecti
+@@ -270,7 +274,8 @@
  
      if (dwordsForUpdate.DW3)
      {
@@ -2300,7 +2478,7 @@ index 78c136a..6ab4d7b 100644
  
          updateDWord(contextValues, DW3, requiredContext.m_addressMSB);
          cachedCollectiveContext->m_data.buffer_addr_msb = requiredContext.m_addressMSB;
-@@ -278,7 +283,8 @@ void ContextManager::updateCommonDword(unsigned                         collecti
+@@ -278,7 +283,8 @@
  
      if (dwordsForUpdate.DW4)
      {
@@ -2310,7 +2488,7 @@ index 78c136a..6ab4d7b 100644
  
          updateDWord(contextValues, DW4, requiredContext.m_stride);
          cachedCollectiveContext->m_data.stride = requiredContext.m_stride;
-@@ -477,6 +483,7 @@ void ContextManager::createCollectiveContexts(HclCommandsGen2Arch& commands, con
+@@ -477,6 +483,7 @@
      {
          m_cachedCollectiveContextsScaleUp.push_back(
              CachedCollectiveContextScaleUp(i, m_nicEngines, m_serverConnectivity, commands));
@@ -2318,7 +2496,7 @@ index 78c136a..6ab4d7b 100644
          m_cachedCollectiveContextsScaleOut.push_back(
              CachedCollectiveContextScaleOut(i, m_nicEngines, m_serverConnectivity, commands));
      }
-@@ -602,6 +609,27 @@ edwords_t ContextManager::getDwordsForUpdate(bool                             is
+@@ -602,6 +609,35 @@
  
      cachedCollectiveContext->dwordDiff(requiredContext, dwordsForUpdate);
  
@@ -2341,12 +2519,20 @@ index 78c136a..6ab4d7b 100644
 +        dwordsForUpdate.DW1 = true;
 +        dwordsForUpdate.DW3 = true;
 +        dwordsForUpdate.DW4 = true;
++        // Standalone AllGather sends from offset zero, whereas the
++        // AllReduce AllGather phase sends its rank-owned receive slice.
++        // Native replay bypasses the host cache: every TP4 template must
++        // restore its own relative-rank descriptor along with its stride.
++        if (m_device.getComm(comm).getCommSize() == 4)
++        {
++            dwordsForUpdate.DW_REMOTE_RANK = true;
++        }
 +    }
 +
      if (isScaleup)
      {
          CachedCollectiveContextScaleUp* cachedCollectiveContextScaleUp =
-@@ -647,6 +675,14 @@ void ContextManager::updateCollectiveContextScaleUp(hcl::ScalStreamBase&
+@@ -647,6 +683,14 @@
  {
      edwords_t dwordsForUpdate =
          pDwordsForUpdate ? *pDwordsForUpdate : getDwordsForUpdate(true, collectiveContextIndex, comm, requiredContext);
@@ -2361,7 +2547,7 @@ index 78c136a..6ab4d7b 100644
  
      if (dwordsForUpdate > 0)
      {
-@@ -691,6 +727,14 @@ void ContextManager::updateCollectiveContextScaleUp(hcl::ScalStreamBase&
+@@ -691,6 +735,14 @@
      m_cachedCollectiveContextsScaleUp[collectiveContextIndex].advanceSOB(dwordsForUpdate,
                                                                           syncObjectAddressIndex,
                                                                           requiredContext.m_syncObjectAddress);
@@ -2377,20 +2563,19 @@ index 78c136a..6ab4d7b 100644
  
  void ContextManager::updateCollectiveContextScaleOut(unsigned                         collectiveContextIndex,
 diff --git a/hcl/src/platform/gaudi2/context_manager.h b/hcl/src/platform/gaudi2/context_manager.h
-index b29205f..86a0bbf 100644
 --- a/hcl/src/platform/gaudi2/context_manager.h
 +++ b/hcl/src/platform/gaudi2/context_manager.h
-@@ -46,6 +46,9 @@ public:
+@@ -45,6 +45,9 @@
+     createRemoteDescriptor(const std::array<UniqueCollectiveContext, HLS2_BOX_SIZE>& uniqueContexts);
      static std::array<UniqueCollectiveContext, HLS2_BOX_SIZE>
      createUniqueContexts(const RequiredCollectiveContext& context);
- 
++
 +    void forceScaleupBufferAddressUpdate(bool enabled) { m_forceScaleupBufferAddressUpdate = enabled; }
 +    void invalidateScaleupContextCache();
-+
+ 
      edwords_t getDwordsForUpdate(bool                             isScaleup,
                                   unsigned                         collectiveContextIndex,
-                                  HCL_Comm                         comm,
-@@ -123,6 +126,7 @@ private:
+@@ -123,6 +126,7 @@
      std::vector<g2fw::nic_glbl_ctxt_t>           m_scaleoutGlobalContexts;            // one per EARC
      std::vector<CachedCollectiveContextScaleUp>  m_cachedCollectiveContextsScaleUp;   // one per Collective Context
      std::vector<CachedCollectiveContextScaleOut> m_cachedCollectiveContextsScaleOut;  // one per Collective Context
@@ -2398,17 +2583,16 @@ index b29205f..86a0bbf 100644
  
      std::array<bool, MAX_NICS_GEN2ARCH> m_activeNics;
  
-@@ -130,4 +134,5 @@ private:
+@@ -130,4 +134,5 @@
      int                               m_maxCollectiveContexts = -1;
      HclDeviceGaudi2&                  m_device;
      const Gen2ArchServerConnectivity& m_serverConnectivity;
 +    bool                              m_forceScaleupBufferAddressUpdate = false;
  };
 diff --git a/hcl/src/platform/gaudi2/hcl_mem_handler.cpp b/hcl/src/platform/gaudi2/hcl_mem_handler.cpp
-index 5d0cf07..c3c52fa 100644
 --- a/hcl/src/platform/gaudi2/hcl_mem_handler.cpp
 +++ b/hcl/src/platform/gaudi2/hcl_mem_handler.cpp
-@@ -20,7 +20,8 @@ void HclCollectiveMemHandlerGaudi2::generateBaseAddressOrSubBuffIdx(SliceState&
+@@ -20,7 +20,8 @@
                                                                      uint64_t&         baseAddress,
                                                                      uint32_t&         subBuffIndex)
  {
@@ -2419,7 +2603,6 @@ index 5d0cf07..c3c52fa 100644
          baseAddress =
              m_addressGenerator.generateScaleUpRecvAddress(sliceState, sliceIter, boxNumInfo, currentOp, offset);
 diff --git a/hcl/src/platform/gaudi2/hcl_packets.cpp b/hcl/src/platform/gaudi2/hcl_packets.cpp
-index 3bf4d2d..df86739 100644
 --- a/hcl/src/platform/gaudi2/hcl_packets.cpp
 +++ b/hcl/src/platform/gaudi2/hcl_packets.cpp
 @@ -7,6 +7,7 @@
@@ -2430,12 +2613,25 @@ index 3bf4d2d..df86739 100644
  
  #include "hcl_utils.h"                                // for VERIFY
  #include "infra/scal/gen2_arch_common/scal_names.h"   // for SchedulersIndex
-@@ -29,6 +30,59 @@ static const unsigned edmaOpCodesPerSched[(unsigned)hcl::SchedulersIndex::count]
+@@ -28,6 +29,71 @@
+     INVALID_SCHED,
      INVALID_SCHED,
      g2fw::SCHED_SCALEOUT_RECV_ARC_CMD_NIC_EDMA_OPS};
- 
++
 +namespace
 +{
++template<typename Setter>
++void registerNativeCompletionField(hcl::ScalStreamBase& scalStream, void* packet, size_t packetSize,
++                                   uint32_t address, uint32_t encoded, bool indexed, Setter&& setter)
++{
++    if (!scalStream.isNativeCaptureActive() || !address) return;
++    const auto kind = indexed ? hcl::NativeHclRelocationKind::PENDING_COMPLETION_INDEX :
++                                hcl::NativeHclRelocationKind::PENDING_COMPLETION_ADDRESS;
++    for (const auto& field : hcl::nativeHclBitfieldSites(packet, packetSize, encoded, setter, kind, address))
++        scalStream.addNativeRelocation(static_cast<const uint8_t*>(packet) + field.byteOffset,
++            field.width, field.mask, field.destinationShift, field.sourceShift, field.kind, field.capturedAddress);
++}
++
 +template<typename Packet, typename Setter>
 +void registerNativeBooleanRelocation(hcl::ScalStreamBase&    scalStream,
 +                                     Packet*                  packet,
@@ -2486,11 +2682,59 @@ index 3bf4d2d..df86739 100644
 +                                   kind);
 +}
 +}  // namespace
-+
+ 
  void SchedArcCommandsGaudi2::serializeNopCommand(hcl::ScalStreamBase& scalStream, unsigned schedIdx, uint32_t padding)
  {
-     g2fw::sched_arc_cmd_nop_t* command =
-@@ -958,6 +1012,15 @@ void SchedArcCommandsGaudi2::serializeUpdateCollectiveContextCommand(hcl::ScalSt
+@@ -385,8 +451,12 @@
+         SET_FIELD(edma_ops->signal_second, (secondSoAddress != 0));
+         SET_FIELD(edma_ops->sob_base, (firstSoIdxBaseIdx.baseIdx & 0x7));
+         SET_FIELD(edma_ops->sob_index, (firstSoIdxBaseIdx.soIdx & 0x3ff));
++        registerNativeCompletionField(scalStream, command, sizeInBytes, soAddressLSB, firstSoIdxBaseIdx.soIdx, true,
++            [&](uint32_t value) { edma_ops->sob_index = value; });
+         SET_FIELD(edma_ops->second_sob_base, (secondSoIdxBaseIdx.baseIdx & 0x7));
+         SET_FIELD(edma_ops->second_sob_index, (secondSoIdxBaseIdx.soIdx & 0x3ff));
++        registerNativeCompletionField(scalStream, command, sizeInBytes, secondSoAddress, secondSoIdxBaseIdx.soIdx, true,
++            [&](uint32_t value) { edma_ops->second_sob_index = value; });
+         SET_FIELD(edma_ops->dst_addr_hi, (destAddress >> 32));
+         SET_FIELD(edma_ops->src_addr_lo, (srcAddress & 0xffffffff));
+         SET_FIELD(edma_ops->src_addr_hi, ((srcAddress >> 32) & 0xffffff));
+@@ -454,6 +524,8 @@
+         auto reductionOpCode = getReductionOp(reduceOp);
+         SET_FIELD(edma_ops->reduction_op, reductionOpCode);
+         SET_FIELD(edma_ops->sob_address, (soAddressLSB & 0x7ffffff));
++        registerNativeCompletionField(scalStream, command, sizeInBytes, soAddressLSB, soAddressLSB & 0x7ffffff, false,
++            [&](uint32_t value) { edma_ops->sob_address = value; });
+         SET_FIELD(edma_ops->opcode, dmaType);
+         SET_FIELD(edma_ops->transfer_size, size);
+         SET_FIELD(edma_ops->dst_addr_lo, (destAddress & 0xffffffff));
+@@ -507,6 +579,8 @@
+             (struct g2fw::arc_cmd_nic_edma_sibo_memset_v3_t*)&command->sibo_memset_v3;
+ 
+         SET_FIELD(edma_ops->sob_address, (soAddressLSB & 0x7ffffff));
++        registerNativeCompletionField(scalStream, command, sizeInBytes, soAddressLSB, soAddressLSB & 0x7ffffff, false,
++            [&](uint32_t value) { edma_ops->sob_address = value; });
+         SET_FIELD(edma_ops->opcode, dmaType);
+         SET_FIELD(edma_ops->transfer_size, size);
+         SET_FIELD(edma_ops->sibo_index, (indexOfSubBuffer * numberOfSubBuffers));
+@@ -551,6 +625,8 @@
+ 
+         SET_FIELD(edma_ops->sob_base, (firstSoIdxBaseIdx.baseIdx & 0x7));
+         SET_FIELD(edma_ops->sob_index, (firstSoIdxBaseIdx.soIdx & 0x3ff));
++        registerNativeCompletionField(scalStream, command, sizeInBytes, soAddressLSB, firstSoIdxBaseIdx.soIdx, true,
++            [&](uint32_t value) { edma_ops->sob_index = value; });
+         SET_FIELD(edma_ops->opcode, dmaType);
+         SET_FIELD(edma_ops->transfer_size, size);
+         SET_FIELD(edma_ops->dst_addr_lo, (destAddress & 0xffffffff));
+@@ -693,6 +769,8 @@
+     SET_FIELD(edma_ops->update_bitmap, activateAllDwordsMap);
+     SET_FIELD(edma_ops->num_dwords, numDwords);
+     SET_FIELD(edma_ops->sob_address, (soAddressLSB & 0x7ffffff));
++        registerNativeCompletionField(scalStream, command, sizeInBytes, soAddressLSB, soAddressLSB & 0x7ffffff, false,
++            [&](uint32_t value) { edma_ops->sob_address = value; });
+ 
+     struct g2fw::edma_nic_glbl_ctxt_v3_t* edma_ctxt = (struct g2fw::edma_nic_glbl_ctxt_v3_t*)&edma_ops->data;
+ 
+@@ -958,6 +1036,15 @@
                  break;
          }
          SET_FIELD(command->dwords[i].dword_value, contextValueUpdater.value);
@@ -2506,10 +2750,11 @@ index 3bf4d2d..df86739 100644
          i++;
      }
  }
-@@ -1008,6 +1071,22 @@ void SchedArcCommandsGaudi2::serializeCollectiveSendShortCommand(hcl::ScalStream
+@@ -1007,6 +1094,22 @@
+     SET_FIELD(cmd_coll_ops_short->nic_opcode, 1);
      SET_FIELD(cmd_coll_ops_short->comm_desc_index, commDescIndex);
      SET_FIELD(cmd_coll_ops_short->buffer_addr_lsb, (address >> 4));
- 
++
 +    if (!isSend)
 +    {
 +        registerNativeBooleanRelocation(scalStream,
@@ -2525,11 +2770,10 @@ index 3bf4d2d..df86739 100644
 +                                        hcl::NativeHclRelocationKind::WQE_WAIT,
 +                                        [&](bool value) { cmd_coll_ops_short->wait_for_rndv_acks = value; });
 +    }
-+
+ 
      if (hasBufferSize)
      {
-         std::memcpy(&cmd_coll_ops_short->buffer_size, &bufferSize, sizeof(uint32_t));
-@@ -1070,6 +1149,19 @@ void SchedArcCommandsGaudi2::serializeCollectiveRecvShortInOrderCommand(hcl::Sca
+@@ -1070,6 +1173,19 @@
      SET_FIELD(cmd_coll_ops_short->notify_rndv_ack, notifyRndvAck);
      SET_FIELD(cmd_coll_ops_short->wait_for_rndv_acks, waitForRndvAcks);
  
@@ -2549,10 +2793,11 @@ index 3bf4d2d..df86739 100644
      /**<
       * Reduction parameters to be used when accumulating data into
       * SIB Order buffer. For the rest of the NICs it uses Reduction
-@@ -1149,6 +1241,22 @@ void SchedArcCommandsGaudi2::serializeCollectiveSendLongCommand(hcl::ScalStreamB
+@@ -1148,6 +1264,22 @@
+     SET_FIELD(cmd_coll_ops_long->comm_desc_index, commDescIndex);
      SET_FIELD(cmd_coll_ops_long->buffer_addr_lsb, (address & 0xffffffff));  // 32 bits
      SET_FIELD(cmd_coll_ops_long->addr_msb, ((address >> 32) & 0x1fff));     // 13 bits
- 
++
 +    if (!isSend)
 +    {
 +        registerNativeBooleanRelocation(scalStream,
@@ -2568,15 +2813,13 @@ index 3bf4d2d..df86739 100644
 +                                        hcl::NativeHclRelocationKind::WQE_WAIT,
 +                                        [&](bool value) { cmd_coll_ops_long->wait_for_rndv_acks = value; });
 +    }
-+
+ 
      if (hasBufferSize)
      {
-         std::memcpy(&cmd_coll_ops_long->buffer_size, &bufferSize, sizeof(uint32_t));
 diff --git a/hcl/src/platform/gaudi2/simb_pool_container_allocator.cpp b/hcl/src/platform/gaudi2/simb_pool_container_allocator.cpp
-index 37aae12..825c01b 100644
 --- a/hcl/src/platform/gaudi2/simb_pool_container_allocator.cpp
 +++ b/hcl/src/platform/gaudi2/simb_pool_container_allocator.cpp
-@@ -40,7 +40,7 @@ void SimbPoolContainerAllocatorGaudi2::init()
+@@ -40,7 +40,7 @@
      poolTypes[SIBO_STANDARD_SIMB_SIZE].push_back(REDUCE_POOL);
      poolTypes[SIBO_STANDARD_SIMB_SIZE].push_back(SCALEUP_AND_ALL2ALL_POOL);
  
@@ -2586,13 +2829,13 @@ index 37aae12..825c01b 100644
          poolTypes[SIBO_DOUBLE_SIMB_SIZE].push_back(PRIMITIVE_POOL);
      }
 diff --git a/hcl/src/platform/gaudi2/wqe_tracker.cpp b/hcl/src/platform/gaudi2/wqe_tracker.cpp
-index db7a19c..424efd4 100644
 --- a/hcl/src/platform/gaudi2/wqe_tracker.cpp
 +++ b/hcl/src/platform/gaudi2/wqe_tracker.cpp
-@@ -4,6 +4,19 @@
+@@ -3,6 +3,19 @@
+ #include "hcl_types.h"
  #include "hcl_dynamic_communicator.h"  // for HclDynamicCommunicator
  #include "hcl_utils.h"                 // for VERIFY
- 
++
 +#include <cstdio>
 +#include <cstdlib>
 +#include <cstring>
@@ -2605,11 +2848,10 @@ index db7a19c..424efd4 100644
 +    return value != nullptr && std::strcmp(value, "1") == 0;
 +}
 +}  // namespace
-+
+ 
  WqeTrackerGaudi2::WqeTrackerGaudi2(unsigned cgSize) : WqeTracker(cgSize)
  {
-     VERIFY(m_recvWqeEntriesNum == cgSize >> 1,
-@@ -28,7 +41,8 @@ void WqeTrackerGaudi2::incWqe(const HCL_Comm commId, const unsigned rank, const
+@@ -28,7 +41,8 @@
      VERIFY(qpTypeIdx < (unsigned)QpType::QPTypeSize);
      VERIFY((int)qpType >= (int)QpType::ScaleOutAllGather || rank < DEFAULT_BOX_SIZE);
  
@@ -2619,10 +2861,11 @@ index db7a19c..424efd4 100644
      {
          switch (qpType)
          {
-@@ -44,6 +58,21 @@ void WqeTrackerGaudi2::incWqe(const HCL_Comm commId, const unsigned rank, const
+@@ -43,6 +57,21 @@
+             default:
                  assert(false);
          }
-     }
++    }
 +    if (nativeWqeDiagnosticsEnabled() && counter >= m_recvWqeEntriesNum - 4 &&
 +        counter <= m_recvWqeEntriesNum + 4)
 +    {
@@ -2637,11 +2880,10 @@ index db7a19c..424efd4 100644
 +                     static_cast<unsigned>(bits.notify_rndv_ack),
 +                     static_cast<unsigned>(bits.wait_for_rndv_acks));
 +        std::fflush(stderr);
-+    }
+     }
  }
  
- /**
-@@ -102,6 +131,18 @@ WqeWraparoundBits WqeTrackerGaudi2::getWqeWraparoundBits(HCL_Comm commId, unsign
+@@ -102,6 +131,18 @@
  
      auto bitsToReturn = m_wqeWraparoundBits[qpTypeIdx][commId][rank];
  
@@ -2661,10 +2903,9 @@ index db7a19c..424efd4 100644
      ptr.wait_for_rndv_acks = ptr.notify_rndv_ack;
      ptr.notify_rndv_ack    = false;
 diff --git a/hcl/src/platform/gen2_arch_common/active_stream_manager.cpp b/hcl/src/platform/gen2_arch_common/active_stream_manager.cpp
-index 06b7a3f..bc2460f 100644
 --- a/hcl/src/platform/gen2_arch_common/active_stream_manager.cpp
 +++ b/hcl/src/platform/gen2_arch_common/active_stream_manager.cpp
-@@ -47,8 +47,13 @@ void ActiveStreamManagerGen2Arch::initializeActiveStreams(CommonState& commonSta
+@@ -47,8 +47,13 @@
          auto& streamList = m_activeStreamsPerScheduler[static_cast<int>(sched)];
          std::fill(streamList.begin(), streamList.end(), nullptr);
  
@@ -2680,7 +2921,7 @@ index 06b7a3f..bc2460f 100644
          {
              addCollectiveStreamToActiveStreamList((hcl::SchedulersIndex)sched);
          }
-@@ -158,6 +163,10 @@ hcl::ScalStream& ActiveStreamManagerGen2Arch::getArbitratorStream(const hcl::Sch
+@@ -158,6 +163,10 @@
  
  bool ActiveStreamManagerGen2Arch::isReductionStreamActive(bool reductionRS)
  {
@@ -2691,7 +2932,7 @@ index 06b7a3f..bc2460f 100644
      return ((m_commonState->m_16BitReduction || (!m_commonState->m_inPlace && !m_commonState->m_isMultiScaleupGroup)) &&
              reductionRS && m_commonState->m_dynamicComm.getScaleupGroupSize() != 1) ||
             (m_commonState->m_currentOp == eHCLReduceScatter && m_commonState->m_dynamicComm.getScaleupGroupSize() != 1);
-@@ -202,4 +211,4 @@ bool ActiveStreamManagerGen2Arch::isGdrStreamActive(bool isFirstBox)
+@@ -202,4 +211,4 @@
  {
      return m_scaleoutProvider->isGaudiDirect() && m_commonState->m_isMultiScaleupGroup &&
             m_commonState->m_currentOp == eHCLReduceScatter && !isFirstBox && !m_commonState->isRSContReduction();
@@ -2699,7 +2940,6 @@ index 06b7a3f..bc2460f 100644
 \ No newline at end of file
 +}
 diff --git a/hcl/src/platform/gen2_arch_common/api_aggregator.cpp b/hcl/src/platform/gen2_arch_common/api_aggregator.cpp
-index 5deb756..1db42ff 100644
 --- a/hcl/src/platform/gen2_arch_common/api_aggregator.cpp
 +++ b/hcl/src/platform/gen2_arch_common/api_aggregator.cpp
 @@ -13,6 +13,7 @@
@@ -2719,7 +2959,7 @@ index 5deb756..1db42ff 100644
      {
          HcclPrimitives::initPrimitiveImpl();
      }
-@@ -269,7 +270,15 @@ hcclResult_t ApiAggregatorGen2Arch::addCollectiveApiCall(HclCollectiveParams& pa
+@@ -269,7 +270,15 @@
  {
      if (m_counter == 0)  // no group mode
      {
@@ -2737,10 +2977,9 @@ index 5deb756..1db42ff 100644
              return HcclPrimitives::run(m_collectiveRoutines, params);
          }
 diff --git a/hcl/src/platform/gen2_arch_common/collective_states.cpp b/hcl/src/platform/gen2_arch_common/collective_states.cpp
-index a645bbe..a7a7704 100644
 --- a/hcl/src/platform/gen2_arch_common/collective_states.cpp
 +++ b/hcl/src/platform/gen2_arch_common/collective_states.cpp
-@@ -879,6 +879,10 @@ uint64_t CommonState::getChunkCountToClear()
+@@ -879,6 +879,10 @@
  
  uint64_t CommonState::getStrideCount()
  {
@@ -2752,10 +2991,9 @@ index a645bbe..a7a7704 100644
      {
          return m_rankScaleUpCount;
 diff --git a/hcl/src/platform/gen2_arch_common/collective_states.h b/hcl/src/platform/gen2_arch_common/collective_states.h
-index dd47f42..6b98b73 100644
 --- a/hcl/src/platform/gen2_arch_common/collective_states.h
 +++ b/hcl/src/platform/gen2_arch_common/collective_states.h
-@@ -339,6 +339,12 @@ struct SliceExecutionOutput
+@@ -339,6 +339,12 @@
      // flag requests reduction execution of data within slice
      bool m_doReduction = false;
  
@@ -2769,10 +3007,9 @@ index dd47f42..6b98b73 100644
      castFlag casts;
  };
 diff --git a/hcl/src/platform/gen2_arch_common/commands/hcl_commands_types.h b/hcl/src/platform/gen2_arch_common/commands/hcl_commands_types.h
-index a45d799..3d3fe0f 100644
 --- a/hcl/src/platform/gen2_arch_common/commands/hcl_commands_types.h
 +++ b/hcl/src/platform/gen2_arch_common/commands/hcl_commands_types.h
-@@ -162,7 +162,9 @@ struct ScaleUpCollectiveOp
+@@ -162,7 +162,9 @@
      uint64_t                m_strideCount;
      bool                    m_notifyRndvAck;
      bool                    m_waitForRndvAcks;
@@ -2784,10 +3021,9 @@ index a45d799..3d3fe0f 100644
      HCL_CollectiveOp        m_complexCollective = eHCLNoCollective;
      bool                    m_isRoot            = false;
 diff --git a/hcl/src/platform/gen2_arch_common/hccl_device.h b/hcl/src/platform/gen2_arch_common/hccl_device.h
-index bc73b4e..8265bc9 100644
 --- a/hcl/src/platform/gen2_arch_common/hccl_device.h
 +++ b/hcl/src/platform/gen2_arch_common/hccl_device.h
-@@ -59,6 +59,12 @@ public:
+@@ -59,6 +59,12 @@
      virtual hcclResult_t send_recv_call(int myRank, const SendRecvApiEntry& entry);
      virtual hcclResult_t collective_call(HclCollectiveParams& params);
  
@@ -2801,7 +3037,6 @@ index bc73b4e..8265bc9 100644
      virtual              operator hcl_device_t() { return device_; }
  
 diff --git a/hcl/src/platform/gen2_arch_common/hcl_collective_routines.cpp b/hcl/src/platform/gen2_arch_common/hcl_collective_routines.cpp
-index c7fa9f3..91fcd55 100644
 --- a/hcl/src/platform/gen2_arch_common/hcl_collective_routines.cpp
 +++ b/hcl/src/platform/gen2_arch_common/hcl_collective_routines.cpp
 @@ -14,6 +14,7 @@
@@ -2812,10 +3047,12 @@ index c7fa9f3..91fcd55 100644
  #include "platform/gen2_arch_common/collective_states.h"
  #include "hcl_utils.h"  // for VERIFY
  #include "platform/gen2_arch_common/device_simb_pool_manager.h"
-@@ -70,6 +71,92 @@ HclCollectiveRoutinesGen2Arch::~HclCollectiveRoutinesGen2Arch()
+@@ -68,6 +69,99 @@
+     {
+         delete m_signalsManager;
      }
- }
- 
++}
++
 +void HclCollectiveRoutinesGen2Arch::setNativeScaleupBufferAddressRefresh(bool enabled)
 +{
 +    auto* gaudi2 = dynamic_cast<HclDeviceGaudi2*>(m_device);
@@ -2874,13 +3111,20 @@ index c7fa9f3..91fcd55 100644
 +    HclDynamicCommunicator& dynamicComm, const hcl::syncInfo* dependencies,
 +    hcl::NativeHclReplayState* states, hcl::syncInfo* completions)
 +{
-+    VERIFY(!m_nullSubmit && dynamicComm.getScaleupGroupSize() == 2, "Invalid native TP2 batch runtime");
-+    // Batch owner holds the stream lock across phase selection and publication.
-+    const unsigned peer = dynamicComm.getRankInScaleupGroup() ^ 1u;
++    const unsigned ranks = dynamicComm.getScaleupGroupSize();
++    VERIFY(!m_nullSubmit && (ranks == 2 || ranks == 4), "Invalid native scale-up batch runtime");
++    for (const auto* capture : captures)
++        VERIFY(ranks == 4 ? capture->tp4Phase >= 0 && capture->tp4Phase <= 2 : capture->tp4Phase == -1,
++               "Native phase contract does not match communicator size");
++    // Match ordinary collective accounting: one receive WQE from every
++    // remote scale-up rank, on the actual RS or AG queue of this phase.
++    // Batch owner holds the stream lock across phase selection/publication.
 +    for (size_t node = 0; node < captures.size(); ++node)
 +    {
-+        m_wqeTracker->incWqe(dynamicComm, peer, QpType::ScaleUpReduceScatter);
-+        const auto bits = m_wqeTracker->getWqeWraparoundBits(dynamicComm, 0, QpType::ScaleUpReduceScatter);
++        const auto qp = captures[node]->tp4Phase > 0 ? QpType::ScaleUpAllGather : QpType::ScaleUpReduceScatter;
++        for (unsigned peer = 0; peer < ranks; ++peer)
++            if (peer != dynamicComm.getRankInScaleupGroup()) m_wqeTracker->incWqe(dynamicComm, peer, qp);
++        const auto bits = m_wqeTracker->getWqeWraparoundBits(dynamicComm, 0, qp);
 +        auto& state = states[node];
 +        state.values[static_cast<size_t>(hcl::NativeHclRelocationKind::DEPENDENCY_TARGET)] = dependencies[node].targetValue;
 +        state.values[static_cast<size_t>(hcl::NativeHclRelocationKind::DEPENDENCY_LONG_SO_INDEX)] = dependencies[node].long_so_index;
@@ -2900,12 +3144,10 @@ index c7fa9f3..91fcd55 100644
 +    std::lock_guard<std::mutex> streamLock(m_deviceController.getStreamLock(m_streamId));
 +    m_deviceController.submitNativeReplay(m_streamId);
 +    invalidateNativeScaleupContextCache();
-+}
-+
+ }
+ 
  /**
-  * @brief initialize data related per new communicator should be called on hcclCommInitRank
-  *
-@@ -677,8 +764,22 @@ void HclCollectiveRoutinesGen2Arch::finalizeExec(HcclGraph* graph, int exec)
+@@ -677,8 +771,22 @@
                             requiredCredits,
                             commonState->m_currentOp);
  
@@ -2930,19 +3172,20 @@ index c7fa9f3..91fcd55 100644
  
      createGeneralPurposeProgs(requiredCredits);
  
-@@ -1005,10 +1106,32 @@ hcclResult_t HclCollectiveRoutinesGen2Arch::processRsPrim(HcclGraph* graph, Hccl
+@@ -1005,10 +1113,32 @@
      m_requestStrongOrderIter |= rsPrim->isStrongOrderRequired();
      auto& commonState = *(graph->graphState());
  
 -    graph->completionSets()[rsPrim->execSet()].requiredResources.tempBuff |= true;
+-
+-    m_addressGenerator->addressContainer().setScaleupSendAddr(rsPrim->sendAddr());
+-    if (rsPrim->useBuffer())
 +    const bool directNicTransfer = rsPrim->directNicTransfer();
 +    const bool directNicReduction = rsPrim->directNicReduction();
 +    const bool stagedInPlaceDirect = directNicTransfer && rsPrim->sendAddr() == rsPrim->recvAddr();
 +    graph->completionSets()[rsPrim->execSet()].requiredResources.tempBuff |=
 +        !directNicTransfer || stagedInPlaceDirect;
- 
--    m_addressGenerator->addressContainer().setScaleupSendAddr(rsPrim->sendAddr());
--    if (rsPrim->useBuffer())
++
 +    if (stagedInPlaceDirect)
 +    {
 +        m_addressGenerator->addressContainer().setScaleupMemcpySrcAddr(rsPrim->sendAddr());
@@ -2966,7 +3209,7 @@ index c7fa9f3..91fcd55 100644
      {
          m_addressGenerator->addressContainer().setScaleupMemcpyDstPool(
              DeviceSimbPoolManagerBase::fetchPool(rsPrim->getBuffer()));
-@@ -1020,14 +1143,19 @@ hcclResult_t HclCollectiveRoutinesGen2Arch::processRsPrim(HcclGraph* graph, Hccl
+@@ -1020,14 +1150,19 @@
  
      graph->sendSlice().m_execution.casts.scaleupSendCastUp = rsPrim->castUp();
  
@@ -2994,7 +3237,7 @@ index c7fa9f3..91fcd55 100644
  
      LOG_HCL_CONTEXT_INFO(HCL, "processing RS primitive, inputCount={}", rsPrim->inputCount());
  
-@@ -1039,14 +1167,28 @@ hcclResult_t HclCollectiveRoutinesGen2Arch::processRsPrim(HcclGraph* graph, Hccl
+@@ -1039,14 +1174,28 @@
      }
  
      WaitMethod waitMethod = rsPrim->getWaitResource(true);
@@ -3028,7 +3271,7 @@ index c7fa9f3..91fcd55 100644
  
      rsPrim->updateCounts();
  
-@@ -1563,4 +1705,4 @@ void HclCollectiveRoutinesGen2Arch::dfaLogAddress(uint64_t address, uint64_t siz
+@@ -1563,4 +1712,4 @@
          m_dfaUsedAddresses[m_dfaUsedAddressesHead].size    = size;
          m_dfaUsedAddressesHead                             = (m_dfaUsedAddressesHead + 1) % m_dfaUsedAddresses.size();
      }
@@ -3036,10 +3279,9 @@ index c7fa9f3..91fcd55 100644
 \ No newline at end of file
 +}
 diff --git a/hcl/src/platform/gen2_arch_common/hcl_collective_routines.h b/hcl/src/platform/gen2_arch_common/hcl_collective_routines.h
-index 7c30ae3..2d2c150 100644
 --- a/hcl/src/platform/gen2_arch_common/hcl_collective_routines.h
 +++ b/hcl/src/platform/gen2_arch_common/hcl_collective_routines.h
-@@ -72,6 +72,44 @@ public:
+@@ -72,6 +72,44 @@
  
      int enqueueWaitsForPrim(HcclPrim* prim, WaitMethod waitMethod, signalEvents_t&& signalEvents);
  
@@ -3085,20 +3327,19 @@ index 7c30ae3..2d2c150 100644
      LBWBurstData_t getLbwDataForExternalSoCompletion(unsigned numSignals);
  
 diff --git a/hcl/src/platform/gen2_arch_common/hcl_collective_routines_progs.cpp b/hcl/src/platform/gen2_arch_common/hcl_collective_routines_progs.cpp
-index 4591b46..d9fb207 100644
 --- a/hcl/src/platform/gen2_arch_common/hcl_collective_routines_progs.cpp
 +++ b/hcl/src/platform/gen2_arch_common/hcl_collective_routines_progs.cpp
-@@ -680,6 +680,9 @@ void HclCollectiveRoutinesGen2Arch::createScaleUpSendProgs(SliceState&      send
+@@ -679,6 +679,9 @@
+                                 0,
                                  sendSliceState.m_collectiveOp,
                                  sendSliceState.isRoot()};
- 
++
 +        op.m_directNicTransfer = sendSliceState.m_execution.m_directScaleupNicTransfer;
 +        op.m_directNicReduction = sendSliceState.m_execution.m_directScaleupNicReduction;
-+
+ 
          this->createScaleUpCollectiveOp(currentStream, op);
      }
- }
-@@ -1358,6 +1361,11 @@ void HclCollectiveRoutinesGen2Arch::createScaleUpRecvProgs(SliceState&      slic
+@@ -1358,6 +1361,11 @@
  
      LOG_HCL_CONTEXT_TRACE(HCL, "Serializing scaleup recv scheduler command");
  
@@ -3110,7 +3351,7 @@ index 4591b46..d9fb207 100644
      if (m_signalsManager->isEventRegistered(SignalEvent::SCALEUP_RECV))
      {
          box_devices_t deviceToRemoteIndex;
-@@ -1406,6 +1414,8 @@ void HclCollectiveRoutinesGen2Arch::createScaleUpRecvProgs(SliceState&      slic
+@@ -1406,6 +1414,8 @@
  
          syncWithLtuIfNeeded(sliceState, currentStream);
  
@@ -3119,7 +3360,7 @@ index 4591b46..d9fb207 100644
          ScaleUpCollectiveOp op {
              deviceToRemoteIndex,
              sliceState.m_dynamicComm.m_rankInfo.header.hwModuleID,
-@@ -1416,7 +1426,7 @@ void HclCollectiveRoutinesGen2Arch::createScaleUpRecvProgs(SliceState&      slic
+@@ -1416,7 +1426,7 @@
              m_signalsManager->dequeueSoAddress(SignalEvent::SCALEUP_RECV),
              false /*receive*/,
              sliceState.isComplexImplementation(),
@@ -3128,7 +3369,7 @@ index 4591b46..d9fb207 100644
              sliceState.m_isMultiScaleupGroup && !(sliceState.m_collectiveOp == eHCLReduce &&
                                                    boxNumInfo.m_boxNum == sliceState.m_dynamicComm.getMyScaleupGroup()),
              baseAddress,
-@@ -1427,11 +1437,15 @@ void HclCollectiveRoutinesGen2Arch::createScaleUpRecvProgs(SliceState&      slic
+@@ -1427,10 +1437,14 @@
              strideCount,
              wraparoundBits.notify_rndv_ack,
              wraparoundBits.wait_for_rndv_acks,
@@ -3138,15 +3379,13 @@ index 4591b46..d9fb207 100644
              subBuffIndex,
              sliceState.m_collectiveOp,
              sliceState.isRoot()};
- 
++
 +        op.m_directNicTransfer = directNicTransfer;
 +        op.m_directNicReduction = directNicReduction;
-+
+ 
          this->createScaleUpCollectiveOp(currentStream, op);
      }
- }
 diff --git a/hcl/src/platform/gen2_arch_common/hcl_device_controller.cpp b/hcl/src/platform/gen2_arch_common/hcl_device_controller.cpp
-index be7ab37..2b4bd6a 100644
 --- a/hcl/src/platform/gen2_arch_common/hcl_device_controller.cpp
 +++ b/hcl/src/platform/gen2_arch_common/hcl_device_controller.cpp
 @@ -1,3 +1,4 @@
@@ -3154,10 +3393,11 @@ index be7ab37..2b4bd6a 100644
  #include "platform/gen2_arch_common/hcl_device_controller.h"
  #include "infra/scal/gen2_arch_common/scal_manager.h"         // for Gen2Arc...
  #include "platform/gen2_arch_common/commands/hcl_commands.h"  // for HclComm...
-@@ -6,6 +7,37 @@
+@@ -5,6 +6,37 @@
+ #include "platform/gen2_arch_common/hcl_packets_utils.h"      // for SoBaseAndSize, getCompCfg
  #include "infra/scal/gen2_arch_common/scal_names.h"
  #include "infra/scal/gen2_arch_common/scal_utils.h"
- 
++
 +#include <cstdlib>
 +#include <cstdio>
 +#include <cstring>
@@ -3188,14 +3428,15 @@ index be7ab37..2b4bd6a 100644
 +    }
 +    return true;
 +}
-+
+ 
  HclDeviceControllerGen2Arch::HclDeviceControllerGen2Arch(const unsigned numOfStreams) : m_numOfStreams(numOfStreams)
  {
-     m_graphSync        = std::make_unique<std::unique_ptr<HclGraphSyncGen2Arch>[]>(m_numOfStreams);
-@@ -367,6 +399,290 @@ void HclDeviceControllerGen2Arch::submitWork(int archStreamId, bool submitToHw)
-     syncParams.m_signalFinalize();
- }
+@@ -365,6 +397,378 @@
+     }
  
+     syncParams.m_signalFinalize();
++}
++
 +void HclDeviceControllerGen2Arch::beginNativeCapture(int archStreamId)
 +{
 +    auto& syncParams = getSyncParams(archStreamId);
@@ -3242,8 +3483,48 @@ index be7ab37..2b4bd6a 100644
 +    size_t internalAddressRelocations = 0;
 +    for (NativeStreamCapture& streamCapture : capture.streams)
 +    {
-+        for (const auto& relocation : streamCapture.commandTemplate.relocations)
++        for (auto& relocation : streamCapture.commandTemplate.relocations)
 +        {
++            if (relocation.kind == hcl::NativeHclRelocationKind::PENDING_COMPLETION_ADDRESS ||
++                relocation.kind == hcl::NativeHclRelocationKind::PENDING_COMPLETION_INDEX ||
++                relocation.kind == hcl::NativeHclRelocationKind::PENDING_SHORT_MONITOR)
++            {
++                const bool indexed = relocation.kind == hcl::NativeHclRelocationKind::PENDING_COMPLETION_INDEX;
++                const bool shortMonitor = relocation.kind == hcl::NativeHclRelocationKind::PENDING_SHORT_MONITOR;
++                const uint32_t addresses[] = {capture.capturedExternalCompletionAddress,
++                    capture.capturedInternalCompletionAddress, capture.capturedGpso0Address, capture.capturedGpso1Address};
++                const hcl::NativeHclRelocationKind addressKinds[] = {
++                    hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS,
++                    hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_ADDRESS,
++                    hcl::NativeHclRelocationKind::GPSO_0_ADDRESS, hcl::NativeHclRelocationKind::GPSO_1_ADDRESS};
++                const hcl::NativeHclRelocationKind indexKinds[] = {
++                    hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_INDEX,
++                    hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_INDEX,
++                    hcl::NativeHclRelocationKind::GPSO_0_INDEX, hcl::NativeHclRelocationKind::GPSO_1_INDEX};
++                const hcl::NativeHclRelocationKind monitorKinds[] = {
++                    hcl::NativeHclRelocationKind::EXTERNAL_SHORT_MONITOR,
++                    hcl::NativeHclRelocationKind::INTERNAL_SHORT_MONITOR,
++                    hcl::NativeHclRelocationKind::GPSO_0_SHORT_MONITOR,
++                    hcl::NativeHclRelocationKind::GPSO_1_SHORT_MONITOR};
++                size_t pool = 0;
++                while (pool < 4 && relocation.capturedAddress != addresses[pool]) ++pool;
++                VERIFY(pool < 4, "Untracked native completion or short-monitor address 0x{:x}", relocation.capturedAddress);
++                relocation.kind = shortMonitor ? monitorKinds[pool] : indexed ? indexKinds[pool] : addressKinds[pool];
++                if (indexed) capture.capturedEdmaBases[pool] = getSoIdxBaseIdx(addresses[pool]).baseIdx;
++                if (shortMonitor)
++                {
++                    const auto& command = streamCapture.commandTemplate.commands.at(relocation.commandIndex);
++                    uint32_t encoded = 0;
++                    VERIFY(relocation.byteOffset + sizeof(encoded) <= command.bytes.size(),
++                           "Native short-monitor relocation lies outside its command");
++                    std::memcpy(&encoded, command.bytes.data() + relocation.byteOffset, sizeof(encoded));
++                    const uint32_t index = hcl::nativeHclShortMonitorIndex(encoded);
++                    auto& captured = capture.capturedShortMonitorIndexes[pool];
++                    VERIFY(captured == UINT32_MAX || captured == index, "Native short-monitor pool index changed");
++                    captured = index;
++                }
++                continue;
++            }
 +            if (relocation.kind != hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS ||
 +                relocation.mask != 0x07ffffffu)
 +                continue;
@@ -3252,9 +3533,25 @@ index be7ab37..2b4bd6a 100644
 +            VERIFY(relocation.byteOffset + sizeof(encoded) <= command.bytes.size(),
 +                   "Native NIC SOB relocation lies outside its command");
 +            std::memcpy(&encoded, command.bytes.data() + relocation.byteOffset, sizeof(encoded));
-+            VERIFY((encoded & relocation.mask) == (capture.capturedExternalCompletionAddress & relocation.mask),
-+                   "Native NIC SOB 0x{:x} is not external completion 0x{:x}",
-+                   encoded, capture.capturedExternalCompletionAddress);
++            // RS signals its internal reduction GPSO before the external
++            // completion. Classify the same tracked SOB pools used by LBW
++            // relocations; never reinterpret an unknown NIC destination.
++            const std::pair<uint32_t, hcl::NativeHclRelocationKind> pools[] = {
++                {capture.capturedExternalCompletionAddress, hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS},
++                {capture.capturedInternalCompletionAddress, hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_ADDRESS},
++                {capture.capturedGpso0Address, hcl::NativeHclRelocationKind::GPSO_0_ADDRESS},
++                {capture.capturedGpso1Address, hcl::NativeHclRelocationKind::GPSO_1_ADDRESS}};
++            bool found = false;
++            for (const auto& pool : pools)
++            {
++                if ((encoded & relocation.mask) != (pool.first & relocation.mask)) continue;
++                VERIFY(!found, "Native NIC SOB matches multiple completion pools");
++                relocation.kind = pool.second;
++                found = true;
++            }
++            VERIFY(found, "Untracked native NIC SOB 0x{:x}: external=0x{:x} internal=0x{:x} gpso0=0x{:x} gpso1=0x{:x}",
++                   encoded, capture.capturedExternalCompletionAddress, capture.capturedInternalCompletionAddress,
++                   capture.capturedGpso0Address, capture.capturedGpso1Address);
 +        }
 +        externalAddressRelocations += hcl::addNativeHclCapturedWordRelocations(
 +            streamCapture.commandTemplate,
@@ -3280,6 +3577,10 @@ index be7ab37..2b4bd6a 100644
 +            getScalStream(archStreamId, streamCapture.streamIndex).nativeCommandAlignment());
 +    }
 +    syncParams.m_nativeCaptureActive = false;
++    // Count relocations emitted by the packet serializers too. An AllGather
++    // may signal only a packed NIC/EDMA SOB rather than an extra full LBW word.
++    externalAddressRelocations = capture.relocationCount(hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS);
++    internalAddressRelocations = capture.relocationCount(hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_ADDRESS);
 +    VERIFY(externalAddressRelocations != 0,
 +           "Native HCL graph did not capture its external completion SOB address 0x{:x}",
 +           capture.capturedExternalCompletionAddress);
@@ -3331,6 +3632,34 @@ index be7ab37..2b4bd6a 100644
 +        m_graphSync[archStreamId]->getCurrentGpsoAddr(WaitMethod::GPSO_0);
 +    patchedState.values[static_cast<size_t>(hcl::NativeHclRelocationKind::GPSO_1_ADDRESS)] =
 +        m_graphSync[archStreamId]->getCurrentGpsoAddr(WaitMethod::GPSO_1);
++    const hcl::NativeHclRelocationKind addressKinds[] = {
++        hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_ADDRESS,
++        hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_ADDRESS,
++        hcl::NativeHclRelocationKind::GPSO_0_ADDRESS, hcl::NativeHclRelocationKind::GPSO_1_ADDRESS};
++    const hcl::NativeHclRelocationKind indexKinds[] = {
++        hcl::NativeHclRelocationKind::EXTERNAL_COMPLETION_INDEX,
++        hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_INDEX,
++        hcl::NativeHclRelocationKind::GPSO_0_INDEX, hcl::NativeHclRelocationKind::GPSO_1_INDEX};
++    const hcl::NativeHclRelocationKind monitorKinds[] = {
++        hcl::NativeHclRelocationKind::EXTERNAL_SHORT_MONITOR,
++        hcl::NativeHclRelocationKind::INTERNAL_SHORT_MONITOR,
++        hcl::NativeHclRelocationKind::GPSO_0_SHORT_MONITOR,
++        hcl::NativeHclRelocationKind::GPSO_1_SHORT_MONITOR};
++    const uint32_t capturedAddresses[] = {
++        capture.capturedExternalCompletionAddress, capture.capturedInternalCompletionAddress,
++        capture.capturedGpso0Address, capture.capturedGpso1Address};
++    for (size_t pool = 0; pool < 4; ++pool)
++    {
++        if (capture.capturedShortMonitorIndexes[pool] != UINT32_MAX)
++            patchedState.values[static_cast<size_t>(monitorKinds[pool])] = hcl::nativeHclShortMonitorBits(
++                capture.capturedShortMonitorIndexes[pool], capturedAddresses[pool],
++                static_cast<uint32_t>(patchedState.get(addressKinds[pool])));
++        if (capture.capturedEdmaBases[pool] == UINT32_MAX) continue;
++        const auto location = getSoIdxBaseIdx(static_cast<uint32_t>(patchedState.get(addressKinds[pool])));
++        VERIFY(location.baseIdx == capture.capturedEdmaBases[pool] && location.soIdx <= 0x3ff,
++               "Native EDMA completion moved outside its captured base/index range");
++        patchedState.values[static_cast<size_t>(indexKinds[pool])] = location.soIdx;
++    }
 +
 +    const char* diagnostics = std::getenv("HCL_TP2_NATIVE_REPLAY_DIAGNOSTICS");
 +    if (diagnostics != nullptr && std::strcmp(diagnostics, "1") == 0)
@@ -3402,7 +3731,7 @@ index be7ab37..2b4bd6a 100644
 +HclDeviceControllerGen2Arch::NativeBatchProgram HclDeviceControllerGen2Arch::prepareNativeBatch(
 +    int archStreamId, const std::vector<const NativeGraphCapture*>& captures)
 +{
-+    VERIFY(!captures.empty() && captures.size() <= 128, "Invalid native NIC batch size");
++    VERIFY(!captures.empty() && captures.size() <= 256, "Invalid native NIC batch size");
 +    std::map<HclStreamIndex, std::vector<hcl::NativeHclProgram::Input>> byStream;
 +    for (size_t node = 0; node < captures.size(); ++node)
 +    {
@@ -3478,12 +3807,10 @@ index be7ab37..2b4bd6a 100644
 +        counters.submissions += stream.getSubmissionCount();
 +    }
 +    return counters;
-+}
-+
+ }
+ 
  void HclDeviceControllerGen2Arch::streamAddWait(hcl::ScalStream&            scalStream,
-                                                 const SyncObjectDescriptor& descriptor,
-                                                 bool                        useEqual)
-@@ -563,4 +879,4 @@ void HclDeviceControllerGen2Arch::setTraceMarker(int archStreamId, HclStreamInde
+@@ -563,4 +967,4 @@
      hcl::ScalStream& currentStream = getScalStream(archStreamId, streamIdx);
  
      m_commands->serializeSetTraceMarker(currentStream, currentStream.getSchedIdx(), val);
@@ -3491,10 +3818,17 @@ index be7ab37..2b4bd6a 100644
 \ No newline at end of file
 +}
 diff --git a/hcl/src/platform/gen2_arch_common/hcl_device_controller.h b/hcl/src/platform/gen2_arch_common/hcl_device_controller.h
-index 18d73a3..f294454 100644
 --- a/hcl/src/platform/gen2_arch_common/hcl_device_controller.h
 +++ b/hcl/src/platform/gen2_arch_common/hcl_device_controller.h
-@@ -9,6 +9,7 @@
+@@ -2,6 +2,7 @@
+ 
+ #include <map>     // for map
+ #include <vector>  // for vector
++#include <array>
+ 
+ #include "infra/scal/gen2_arch_common/scal_manager.h"  // for Gen2Arc...
+ #include "platform/gen2_arch_common/hcl_graph_sync.h"  // for HclGraphSyncGen2Arch
+@@ -9,6 +10,7 @@
  #include "device_simb_pool_manager.h"
  #include "llvm/small_vector.h"  // for SmallVector
  #include "infra/scal/gen2_arch_common/stream_layout.h"
@@ -3502,7 +3836,7 @@ index 18d73a3..f294454 100644
  
  class HclDeviceGen2Arch;
  class HclCommandsGen2Arch;
-@@ -39,6 +40,9 @@ struct ArchStreamSyncParams
+@@ -39,6 +41,9 @@
      uint64_t m_InternalCgTargetValue          = 0;
      unsigned m_requestedExtraCredits          = 0;
      bool     m_isPrevWaitEvent                = false;
@@ -3512,7 +3846,7 @@ index 18d73a3..f294454 100644
  
      hcl::syncInfo* m_longSo           = nullptr;
      hcl::syncInfo* m_longSoNullSubmit = nullptr;
-@@ -60,6 +64,55 @@ class ScalStream;
+@@ -60,6 +65,58 @@
  class HclDeviceControllerGen2Arch
  {
  public:
@@ -3534,6 +3868,9 @@ index 18d73a3..f294454 100644
 +        uint32_t capturedGpso0Address = 0;
 +        uint32_t capturedGpso1Address = 0;
 +        bool executableValidated = false;
++        int tp4Phase = -1; // Explicit RS / AR-AG / standalone AG contract.
++        std::array<uint32_t, 4> capturedEdmaBases = {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
++        std::array<uint32_t, 4> capturedShortMonitorIndexes = {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
 +
 +        size_t commandCount() const
 +        {
@@ -3568,7 +3905,7 @@ index 18d73a3..f294454 100644
      HclDeviceControllerGen2Arch(const unsigned numOfStreams);
      virtual ~HclDeviceControllerGen2Arch();
      HclDeviceControllerGen2Arch(const HclDeviceControllerGen2Arch&)            = delete;
-@@ -91,6 +144,27 @@ public:
+@@ -91,6 +148,27 @@
       */
      void setupHFCMonitors(int archStreamId, ArchStreamSyncParams& syncParams);
      void submitWork(int archStreamId, bool submitToHw = true);
@@ -3597,10 +3934,21 @@ index 18d73a3..f294454 100644
      /**
       * @brief
 diff --git a/hcl/src/platform/gen2_arch_common/hcl_graph_sync.cpp b/hcl/src/platform/gen2_arch_common/hcl_graph_sync.cpp
-index 1cd99d6..278f6a5 100644
 --- a/hcl/src/platform/gen2_arch_common/hcl_graph_sync.cpp
 +++ b/hcl/src/platform/gen2_arch_common/hcl_graph_sync.cpp
-@@ -193,16 +193,18 @@ void HclGraphSyncGen2Arch::createArmLongMonMessages(hcl::ScalStream& scalStream,
+@@ -122,6 +122,11 @@
+     uint32_t value = createMonArm(soValue, false, mask, soIdxNoMask, 0, useEqual);
+ 
+     m_commands.serializeLbwWriteWithFenceDecCommand(scalStream, scalStream.getSchedIdx(), addr, value, fenceIdx);
++    // The corresponding NIC/EDMA producer rotates its completion SOB on every
++    // replay. Keep this consumer on that same SOB, preserving SOD/SOP/fence.
++    scalStream.addNativeRelocationToLastCommandTail(
++        sizeof(uint32_t), sizeof(uint32_t), 0x0000ffffu, 0, 0,
++        hcl::NativeHclRelocationKind::PENDING_SHORT_MONITOR, getAddrSobObj(smBase, soIdx));
+ }
+ 
+ void HclGraphSyncGen2Arch::createArmHFCMonMessages(hcl::ScalStream& scalStream,
+@@ -193,16 +198,18 @@
      const uint32_t monArmSize   = getArmMonSize();
      const uint32_t baseAddrInSm = getOffsetMonArm(monitorIdx);
      LBWBurstData_t destData;
@@ -3620,7 +3968,7 @@ index 1cd99d6..278f6a5 100644
              if (!m_nullSubmit)
              {
                  m_longMonitorStatus[addr] = value;
-@@ -210,6 +212,33 @@ void HclGraphSyncGen2Arch::createArmLongMonMessages(hcl::ScalStream& scalStream,
+@@ -210,6 +217,33 @@
          }
      }
      m_commands.serializeLbwBurstWriteCommand(scalStream, scalStream.getSchedIdx(), destData);
@@ -3655,10 +4003,9 @@ index 1cd99d6..278f6a5 100644
  }
  
 diff --git a/hcl/src/platform/gen2_arch_common/hcl_mem_handler.cpp b/hcl/src/platform/gen2_arch_common/hcl_mem_handler.cpp
-index 9c0bb1e..3cdac6c 100644
 --- a/hcl/src/platform/gen2_arch_common/hcl_mem_handler.cpp
 +++ b/hcl/src/platform/gen2_arch_common/hcl_mem_handler.cpp
-@@ -166,7 +166,8 @@ void HclCollectiveMemHandlerGen2Arch::createMemCopyCommands(SimbPoolContainerAll
+@@ -166,7 +166,8 @@
                        dstAddr,
                        srcAddr,
                        dataTypeForDma,
@@ -3670,7 +4017,6 @@ index 9c0bb1e..3cdac6c 100644
                        numberOfSubBuffers,
 diff --git a/hcl/tests/native_hcl_relocation_test.cpp b/hcl/tests/native_hcl_relocation_test.cpp
 new file mode 100644
-index 0000000..84952ce
 --- /dev/null
 +++ b/hcl/tests/native_hcl_relocation_test.cpp
 @@ -0,0 +1,206 @@

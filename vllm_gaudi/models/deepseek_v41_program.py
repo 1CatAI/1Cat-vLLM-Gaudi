@@ -40,9 +40,9 @@ from vllm_gaudi.ops.deepseek_v41_prefill_regions import (
 @prefill_function_region
 def _prefill_hc_post(value, residual, post, comb):
     if gaudi_envs.VLLM_HPU_DSV41_PREFILL_MHC_POST and value.device.type == "hpu":
-        return torch.ops.custom_op.custom_deepseek_v41_prefill_mhc_post_gaudi2(value.contiguous(),
-                                                                               residual.contiguous(), post.contiguous(),
-                                                                               comb.contiguous())
+        return torch.ops.custom_op.custom_deepseek_v41_prefill_mhc_post_gaudi2(
+            value.contiguous(), residual.contiguous(), post.contiguous(), comb.contiguous()
+        )
     return hc_post(value, residual, post, comb)
 
 
@@ -54,8 +54,9 @@ def _prefill_combine(output, shared_out):
 @prefill_function_region
 def _prefill_router(value, weight, bias, image_bias, image_mask):
     logits = torch.ops.custom_op.custom_deepseek_v41_bf16_linear_f32_gaudi2(value.contiguous(), weight)
-    return torch.ops.custom_op.custom_deepseek_v41_router_logits_top6_gaudi2(logits.contiguous(), bias, image_bias,
-                                                                             image_mask.contiguous())
+    return torch.ops.custom_op.custom_deepseek_v41_router_logits_top6_gaudi2(
+        logits.contiguous(), bias, image_bias, image_mask.contiguous()
+    )
 
 
 @prefill_function_region
@@ -63,8 +64,11 @@ def _prefill_shared_expert(value, gate_up_weight, down_weight, down_bias, quanti
     # Keep both BF16 boundaries explicit when the compiler combines the
     # projection, activation and downstream projection into one region.
     projected = F.linear(quantize_activation(value), gate_up_weight)
-    projected = torch.ops.custom_op.custom_deepseek_v41_bf16_identity_gaudi2(projected.reshape(1, -1)).reshape(
-        projected.shape).float()
+    projected = (
+        torch.ops.custom_op.custom_deepseek_v41_bf16_identity_gaudi2(projected.reshape(1, -1))
+        .reshape(projected.shape)
+        .float()
+    )
     gate, up = projected.chunk(2, dim=-1)
     middle = (F.silu(gate.clamp(max=10.0)) * up.clamp(-10.0, 10.0)).to(value.dtype)
     middle = torch.ops.custom_op.custom_deepseek_v41_bf16_identity_gaudi2(middle.reshape(1, -1)).reshape(middle.shape)
@@ -77,8 +81,9 @@ def linear(value, layer):
     if hasattr(layer, "scale"):
         value = quantize_activation(value)
     if getattr(layer, "dense_fp8", False):
-        return torch.ops.custom_op.custom_deepseek_v41_dense_fp8_gaudi2(value.contiguous(), layer.weight,
-                                                                        layer.channel_scale)
+        return torch.ops.custom_op.custom_deepseek_v41_dense_fp8_gaudi2(
+            value.contiguous(), layer.weight, layer.channel_scale
+        )
     return F.linear(value, layer.weight, getattr(layer, "bias", None))
 
 
@@ -92,7 +97,7 @@ def _weight_tree(specs):
         "I16": torch.int16,
         "I32": torch.int32,
         "I64": torch.int64,
-        "F8_E4M3": torch.bfloat16
+        "F8_E4M3": torch.bfloat16,
     }
     for name, spec in specs.items():
         fields = name.split(".")
@@ -105,26 +110,30 @@ def _weight_tree(specs):
     return root
 
 
-def load_weight_tree(shard,
-                     tree,
-                     device,
-                     specs=None,
-                     *,
-                     woa_sidecar=None,
-                     woa_layers=(),
-                     expert_n256_layers=None,
-                     dense_sidecar=None,
-                     dense_config=None,
-                     engram_sidecar=None):
+def load_weight_tree(
+    shard,
+    tree,
+    device,
+    specs=None,
+    *,
+    woa_sidecar=None,
+    woa_layers=(),
+    expert_n256_layers=None,
+    dense_sidecar=None,
+    dense_config=None,
+    engram_sidecar=None,
+):
     n256 = gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256 or gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8
     dense_names = {
         f"layers.{layer}.attn.{projection}.weight"
-        for projection, layers in (dense_config or {}).items() if projection != "version" for layer in layers
+        for projection, layers in (dense_config or {}).items()
+        if projection != "version"
+        for layer in layers
     }
     for name, spec in (shard.specs if specs is None else specs).items():
         layer = int(name.split(".")[1]) if name.startswith("layers.") else None
         selected_n256 = n256 and layer is not None and (expert_n256_layers is None or layer in expert_n256_layers)
-        if (engram_sidecar is not None and name in {"layers.1.engram.wkv.weight", "layers.14.engram.wkv.weight"}):
+        if engram_sidecar is not None and name in {"layers.1.engram.wkv.weight", "layers.14.engram.wkv.weight"}:
             module = tree.get_submodule(name.rpartition(".")[0])
             module.weight = engram_sidecar.tensor(name, device)
             channel = engram_sidecar.tensor(name.removesuffix("weight") + "channel_scale", device)
@@ -144,7 +153,7 @@ def load_weight_tree(shard,
                 module.register_buffer("channel_scale", channel, False)
             module.dense_fp8 = True
             continue
-        if (woa_sidecar is not None and name.endswith(".attn.wo_a.weight") and layer in woa_layers):
+        if woa_sidecar is not None and name.endswith(".attn.wo_a.weight") and layer in woa_layers:
             module = tree.get_submodule(name.rpartition(".")[0])
             module.weight = woa_sidecar.tensor(name, device)
             channel = woa_sidecar.tensor(name.removesuffix("weight") + "channel_scale", device)
@@ -158,6 +167,7 @@ def load_weight_tree(shard,
                 continue
             if name.endswith("_q16"):
                 from vllm_gaudi.ops.deepseek_v41_expert_n256 import load_projection
+
                 module_name, _, attribute = name.rpartition(".")
                 module = tree.get_submodule(module_name)
                 projection = attribute.removesuffix("_q16")
@@ -187,15 +197,17 @@ def load_weight_tree(shard,
         # once at load time so the steady graph can feed MME in its native
         # layout. Keep the switch opt-in because old manifests and ordinary
         # prefill graphs still use the checkpoint layout.
-        if (gaudi_envs.VLLM_HPU_DSV41_PRETRANSPOSE_ATTN and name.endswith(".wo_a.weight") and value.ndim == 2):
+        if gaudi_envs.VLLM_HPU_DSV41_PRETRANSPOSE_ATTN and name.endswith(".wo_a.weight") and value.ndim == 2:
             if value.shape[0] % 4:
                 raise ValueError(f"MLA wo_a rows are not divisible by 4: {name} {tuple(value.shape)}")
             value = value.reshape(4, value.shape[0] // 4, value.shape[1]).transpose(-1, -2).contiguous()
-        if ((name.endswith("ffn.gate.weight") and not gaudi_envs.VLLM_HPU_DSV41_BF16_ROUTER_GATE)
-                or name.endswith("confidence_head.proj.weight")
-                or (name == "head.weight" and not gaudi_envs.VLLM_HPU_DSV41_BF16_LM_HEAD)
-                or name == "mtp.2.markov_head.head.weight"
-                or (".compressor.w" in name and ".weight" in name and int(name.split(".")[1]) in (2, 8, 14))):
+        if (
+            (name.endswith("ffn.gate.weight") and not gaudi_envs.VLLM_HPU_DSV41_BF16_ROUTER_GATE)
+            or name.endswith("confidence_head.proj.weight")
+            or (name == "head.weight" and not gaudi_envs.VLLM_HPU_DSV41_BF16_LM_HEAD)
+            or name == "mtp.2.markov_head.head.weight"
+            or (".compressor.w" in name and ".weight" in name and int(name.split(".")[1]) in (2, 8, 14))
+        ):
             value = value.float()
         module_name, _, attribute = name.rpartition(".")
         setattr(tree.get_submodule(module_name), attribute, value)
@@ -223,7 +235,6 @@ class PreparedInput(nn.Module):
 
 
 class PreparedMoE(nn.Module):
-
     # Keep ordinary vLLM prompt transactions large (the scheduler still uses
     # max_num_batched_tokens=8192), but cap each HPU N256/attention working
     # tile at 128 tokens.  This is a graph/resource tile, not a C1/C6 decode
@@ -258,6 +269,7 @@ class PreparedMoE(nn.Module):
         self.prefill_mxfp4 = self.n256 and gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4
         self.prefill_grouped = self.n256 and gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED
         from vllm_gaudi.ops.deepseek_v41_prefill_plan import validate_prefill_plan_config
+
         validate_prefill_plan_config(n256=self.n256)
         self.n256_fused = self.n256_fp8 and gaudi_envs.VLLM_HPU_DSV41_EXPERT_FUSED_QUANT
         self.n256_fused_reduce = self.n256_fused and gaudi_envs.VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE
@@ -269,16 +281,23 @@ class PreparedMoE(nn.Module):
         self.batch_expert_direct_finalize = gaudi_envs.VLLM_HPU_DSV41_BATCH_EXPERT_DIRECT_FINALIZE
         self.batch_expert_transpose_mme = gaudi_envs.VLLM_HPU_DSV41_BATCH_EXPERT_TRANSPOSE_MME
         if self.batch_expert_transpose_mme:
-            if (not self.batch_w13_horizontal or not self.n256_fused_reduce or self.batch_expert_direct_finalize
-                    or self.batch_prefetch_w2 or self.batch_expert_reuse or self.batch_route_pack
-                    or self.concurrent_moe_rows):
+            if (
+                not self.batch_w13_horizontal
+                or not self.n256_fused_reduce
+                or self.batch_expert_direct_finalize
+                or self.batch_prefetch_w2
+                or self.batch_expert_reuse
+                or self.batch_route_pack
+                or self.concurrent_moe_rows
+            ):
                 raise ValueError("Transposed expert MME requires the unchanged horizontal fused-reduce parent")
             if not hasattr(torch.ops.custom_op, "custom_deepseek_v41_expert_n256_moe_horizontal_transpose_fp8_gaudi2"):
                 raise RuntimeError("Transposed expert MME native operator is unavailable")
         if self.batch_expert_direct_finalize and not (self.batch_w13_horizontal and self.n256_fused_reduce):
             raise ValueError("Batch direct finalize requires horizontal N256 and ordered fused reduction")
         if self.batch_expert_direct_finalize and not hasattr(
-                torch.ops.custom_op, "custom_deepseek_v41_expert_n256_moe_horizontal_finalize_fp8_gaudi2"):
+            torch.ops.custom_op, "custom_deepseek_v41_expert_n256_moe_horizontal_finalize_fp8_gaudi2"
+        ):
             raise RuntimeError("Batch expert finalize native operator is unavailable")
         if self.batch_prefetch_w2 and not self.n256_fused_reduce:
             raise ValueError("Batch W2 prefetch requires the N256 fused expert reduction")
@@ -289,6 +308,8 @@ class PreparedMoE(nn.Module):
                 raise ValueError("Concurrent MoE requires ordinary qualified N256 fused FP8 decode")
             if not hasattr(torch.ops.custom_op, "custom_deepseek_v41_grouped_n256_fp8_gaudi2"):
                 raise RuntimeError("Concurrent MoE native operator is unavailable; no fallback was executed")
+        # Feature-tiled activation/quantization increased complete-chain latency.
+        self.feature_silu = False
         self.router_bf16_gate = gaudi_envs.VLLM_HPU_DSV41_BF16_ROUTER_GATE
         self.shared_gate_up = gaudi_envs.VLLM_HPU_DSV41_SHARED_GATE_UP
         self.register_buffer("shared_gate_up_weight", None, False)
@@ -296,8 +317,9 @@ class PreparedMoE(nn.Module):
             raise ValueError("Fused expert quantization requires N256 FP8 experts")
         if self.n256 and (gaudi_envs.VLLM_HPU_DSV41_SHARED_C6_EXPERTS or gaudi_envs.VLLM_HPU_DSV41_INDEXED_MOE):
             raise ValueError("N256 prepared storage excludes the old shared/indexed expert layouts")
-        if (gaudi_envs.VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE
-                and (not self.expert_k128 or gaudi_envs.VLLM_HPU_DSV41_FP8_DECODE)):
+        if gaudi_envs.VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE and (
+            not self.expert_k128 or gaudi_envs.VLLM_HPU_DSV41_FP8_DECODE
+        ):
             raise ValueError("V4.1 expert coordinate pipeline requires the K128 BF16 decoder")
         if self.expert_k128 and gaudi_envs.VLLM_HPU_DSV41_FP8_DECODE:
             raise ValueError("V4.1 K128 BF16 and FP8 decode must be selected independently")
@@ -336,13 +358,26 @@ class PreparedMoE(nn.Module):
         use the prepared BF16/MME compound op until it gets its own kernel.
         """
         experts = self.weights.experts
-        return (gaudi_envs.VLLM_HPU_DSV41_INDEXED_MOE and self.topk == 6 and value.device.type == "hpu"
-                and value.dtype == torch.bfloat16 and value.ndim == 2 and 1 <= value.shape[0] <= 6
-                and value.shape[-1] == 5120 and ids.device == value.device and ids.dtype == torch.int64
-                and ids.ndim == 2 and ids.shape[-1] == 6 and routing.device == value.device
-                and routing.dtype == torch.float32 and routing.shape == ids.shape
-                and experts.w13_q16.shape == (384, 18, 163840) and experts.w2_q16.shape == (384, 40, 36864)
-                and experts.w13_s16.shape == (384, 18, 20480) and experts.w2_s16.shape == (384, 40, 4608))
+        return (
+            gaudi_envs.VLLM_HPU_DSV41_INDEXED_MOE
+            and self.topk == 6
+            and value.device.type == "hpu"
+            and value.dtype == torch.bfloat16
+            and value.ndim == 2
+            and 1 <= value.shape[0] <= 6
+            and value.shape[-1] == 5120
+            and ids.device == value.device
+            and ids.dtype == torch.int64
+            and ids.ndim == 2
+            and ids.shape[-1] == 6
+            and routing.device == value.device
+            and routing.dtype == torch.float32
+            and routing.shape == ids.shape
+            and experts.w13_q16.shape == (384, 18, 163840)
+            and experts.w2_q16.shape == (384, 40, 36864)
+            and experts.w13_s16.shape == (384, 18, 20480)
+            and experts.w2_s16.shape == (384, 40, 4608)
+        )
 
     def _forward_indexed(self, value, ids, routing):
         """Compute six routed experts without a decoded-weight tensor.
@@ -354,7 +389,8 @@ class PreparedMoE(nn.Module):
         """
         experts = self.weights.experts
         gate_up = torch.ops.custom_op.custom_deepseek_v41_mxfp4_indexed_fc1_bf16_gaudi2(
-            value, ids.to(torch.int32), experts.w13_q16, experts.w13_s16, self.lookup, self.normal_scales)
+            value, ids.to(torch.int32), experts.w13_q16, experts.w13_s16, self.lookup, self.normal_scales
+        )
         intermediate = gate_up.shape[-1] // 2
         gate = gate_up[..., :intermediate].float().clamp(max=10.0)
         up = gate_up[..., intermediate:].float().clamp(-10.0, 10.0)
@@ -364,7 +400,8 @@ class PreparedMoE(nn.Module):
         routed_input = F.silu(gate) * up * routing.float().unsqueeze(-1)
         routed_input = routed_input.to(value.dtype)
         down = torch.ops.custom_op.custom_deepseek_v41_mxfp4_indexed_fc2_bf16_gaudi2(
-            routed_input, ids.to(torch.int32), experts.w2_q16, experts.w2_s16, self.lookup, self.normal_scales)
+            routed_input, ids.to(torch.int32), experts.w2_q16, experts.w2_s16, self.lookup, self.normal_scales
+        )
         result = down.float()[:, 0]
         for expert in range(1, 6):
             result = result + down.float()[:, expert]
@@ -377,36 +414,50 @@ class PreparedMoE(nn.Module):
             if prequant is not None or shared is not None:
                 raise ValueError("Batch expert reuse has an independent quantization/finalization contract")
             from vllm_gaudi.ops.deepseek_v41_grouped_decode import grouped_decode
-            return grouped_decode(value,
-                                  ids.to(torch.int32),
-                                  routing.float(),
-                                  experts.w13_q16,
-                                  experts.w2_q16,
-                                  experts.w13_s16,
-                                  experts.w2_s16,
-                                  self.lookup,
-                                  experts.w13_fp8_channel,
-                                  experts.w2_fp8_channel,
-                                  rows=1,
-                                  reuse_weights=True,
-                                  native_pack=self.batch_route_pack)
+
+            return grouped_decode(
+                value,
+                ids.to(torch.int32),
+                routing.float(),
+                experts.w13_q16,
+                experts.w2_q16,
+                experts.w13_s16,
+                experts.w2_s16,
+                self.lookup,
+                experts.w13_fp8_channel,
+                experts.w2_fp8_channel,
+                rows=1,
+                reuse_weights=True,
+                native_pack=self.batch_route_pack,
+            )
         if ordinary_decode and self.concurrent_moe_rows and value.shape[0] == 64:
             from vllm_gaudi.ops.deepseek_v41_grouped_decode import grouped_decode
-            return grouped_decode(value,
-                                  ids.to(torch.int32),
-                                  routing.float(),
-                                  experts.w13_q16,
-                                  experts.w2_q16,
-                                  experts.w13_s16,
-                                  experts.w2_s16,
-                                  self.lookup,
-                                  experts.w13_fp8_channel,
-                                  experts.w2_fp8_channel,
-                                  rows=self.concurrent_moe_rows)
+
+            return grouped_decode(
+                value,
+                ids.to(torch.int32),
+                routing.float(),
+                experts.w13_q16,
+                experts.w2_q16,
+                experts.w13_s16,
+                experts.w2_s16,
+                self.lookup,
+                experts.w13_fp8_channel,
+                experts.w2_fp8_channel,
+                rows=self.concurrent_moe_rows,
+            )
 
         def one_tile(tile_value, tile_ids, tile_routing, tile_prequant, tile_shared):
-            operands = (tile_value, tile_ids.to(torch.int32), tile_routing.float(), experts.w13_q16, experts.w2_q16,
-                        experts.w13_s16, experts.w2_s16, self.lookup)
+            operands = (
+                tile_value,
+                tile_ids.to(torch.int32),
+                tile_routing.float(),
+                experts.w13_q16,
+                experts.w2_q16,
+                experts.w13_s16,
+                experts.w2_s16,
+                self.lookup,
+            )
             use_fused = self.n256_fused and (tile_value.shape[0] <= 6 or ordinary_decode)
             # C1 keeps the same public scheduler/state contract as every
             # other bucket.  Inside the expert compound node, finish W2
@@ -424,11 +475,10 @@ class PreparedMoE(nn.Module):
                 raise TypeError("N256 FP8 channel scales were not loaded as tensors")
             if self.tensor_parallel_size == 4 and use_fused and tile_prequant is None:
                 from vllm_gaudi.ops.deepseek_v41_expert_n256 import run_fused_decode
-                return run_fused_decode(*operands,
-                                        channel13,
-                                        channel2,
-                                        bool(self.normal_scales),
-                                        direct_finalize=self.n256_fused_reduce)
+
+                return run_fused_decode(
+                    *operands, channel13, channel2, bool(self.normal_scales), direct_finalize=self.n256_fused_reduce
+                )
             if tile_prequant is not None:
                 if not use_fused:
                     raise ValueError("Prequantized N256 input requires the fused expert body")
@@ -436,32 +486,45 @@ class PreparedMoE(nn.Module):
                 if tile_shared is not None:
                     if not self.n256_fused_reduce or tile_value.shape[0] != 1:
                         raise ValueError("Shared finalize requires the C1 prequant direct-finalize path")
-                    op = (torch.ops.custom_op.
-                          custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_shared_prefetch_w2_fp8_gaudi2)
-                    return op(*operands, channel13, channel2, quantized, activation_scale, tile_shared,
-                              bool(self.normal_scales))
-                op = (torch.ops.custom_op.
-                      custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_prefetch_w2_fp8_gaudi2
-                      if self.n256_fused_reduce and tile_value.shape[0] == 1 else
-                      torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_prequant_horizontal_fp8_gaudi2
-                      if self.n256_fused_reduce and ordinary_decode and self.batch_w13_horizontal else
-                      torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_prequant_fused_reduce_fp8_gaudi2
-                      if self.n256_fused_reduce and ordinary_decode else
-                      torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_prequant_fused_fp8_gaudi2)
+                    op = torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_shared_prefetch_w2_fp8_gaudi2
+                    if self.feature_silu:
+                        op = torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_prequant_shared_feature_silu_fp8_gaudi2
+                    return op(
+                        *operands,
+                        channel13,
+                        channel2,
+                        quantized,
+                        activation_scale,
+                        tile_shared,
+                        bool(self.normal_scales),
+                    )
+                op = (
+                    torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_prefetch_w2_fp8_gaudi2
+                    if self.n256_fused_reduce and tile_value.shape[0] == 1
+                    else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_prequant_horizontal_fp8_gaudi2
+                    if self.n256_fused_reduce and ordinary_decode and self.batch_w13_horizontal
+                    else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_prequant_fused_reduce_fp8_gaudi2
+                    if self.n256_fused_reduce and ordinary_decode
+                    else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_prequant_fused_fp8_gaudi2
+                )
                 return op(*operands, channel13, channel2, quantized, activation_scale, bool(self.normal_scales))
-            op = (torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_direct_finalize_prefetch_w2_fp8_gaudi2
-                  if self.n256_fused_reduce and tile_value.shape[0] == 1 else
-                  torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_horizontal_transpose_fp8_gaudi2
-                  if ordinary_decode and self.batch_expert_transpose_mme else
-                  torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_horizontal_finalize_fp8_gaudi2
-                  if ordinary_decode and self.batch_expert_direct_finalize else
-                  torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_horizontal_fp8_gaudi2
-                  if ordinary_decode and self.batch_w13_horizontal and self.n256_fused_reduce else torch.ops.custom_op.
-                  custom_deepseek_v41_expert_n256_moe_batch_prefetch_w2_fp8_gaudi2 if ordinary_decode and self.
-                  batch_prefetch_w2 else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2
-                  if self.n256_fused_reduce and ordinary_decode else torch.ops.custom_op.
-                  custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2 if use_fused else torch.ops.custom_op.
-                  custom_deepseek_v41_expert_n256_moe_fp8_gaudi2)
+            op = (
+                torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_direct_finalize_prefetch_w2_fp8_gaudi2
+                if self.n256_fused_reduce and tile_value.shape[0] == 1
+                else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_horizontal_transpose_fp8_gaudi2
+                if ordinary_decode and self.batch_expert_transpose_mme
+                else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_horizontal_finalize_fp8_gaudi2
+                if ordinary_decode and self.batch_expert_direct_finalize
+                else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_horizontal_fp8_gaudi2
+                if ordinary_decode and self.batch_w13_horizontal and self.n256_fused_reduce
+                else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_batch_prefetch_w2_fp8_gaudi2
+                if ordinary_decode and self.batch_prefetch_w2
+                else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_reduce_fp8_gaudi2
+                if self.n256_fused_reduce and ordinary_decode
+                else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fused_fp8_gaudi2
+                if use_fused
+                else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_fp8_gaudi2
+            )
             return op(*operands, channel13, channel2, bool(self.normal_scales))
 
         tokens = int(value.shape[0])
@@ -480,6 +543,7 @@ class PreparedMoE(nn.Module):
         tokens = value.shape[0]
         if prefill_tokens:
             from vllm_gaudi.ops.deepseek_v41_prefill_capacity import MAX_PREFILL_TOKENS
+
             if not tokens <= prefill_tokens <= MAX_PREFILL_TOKENS:
                 raise ValueError("Halo router requires the original bounded prefill row count")
         if prefill_tokens > tokens:
@@ -491,24 +555,28 @@ class PreparedMoE(nn.Module):
             original = value.new_zeros((prefill_tokens, value.shape[-1]))
             original[-tokens:].copy_(value)
             value = original
-        logits = (torch.ops.custom_op.custom_deepseek_v41_bf16_linear_f32_gaudi2(
-            value.contiguous(), self.weights.gate.weight) if self.router_bf16_gate else F.linear(
-                value.float(), self.weights.gate.weight))
+        logits = (
+            torch.ops.custom_op.custom_deepseek_v41_bf16_linear_f32_gaudi2(value.contiguous(), self.weights.gate.weight)
+            if self.router_bf16_gate
+            else F.linear(value.float(), self.weights.gate.weight)
+        )
         return logits[-tokens:] if prefill_tokens > tokens else logits
 
     @prefill_span("moe")
     @prefill_scope("moe")
-    def forward(self,
-                value,
-                image_mask,
-                ready_outputs=(),
-                *,
-                fp8_decode=False,
-                ordinary_decode=False,
-                decode=False,
-                prequant=None,
-                prefill_router_tokens=0,
-                prefill_sequence=False):
+    def forward(
+        self,
+        value,
+        image_mask,
+        ready_outputs=(),
+        *,
+        fp8_decode=False,
+        ordinary_decode=False,
+        decode=False,
+        prequant=None,
+        prefill_router_tokens=0,
+        prefill_sequence=False,
+    ):
         decode = decode or ordinary_decode
         if decode and prefill_router_tokens:
             raise ValueError("Decoder halo router padding is confined to prefill")
@@ -522,7 +590,8 @@ class PreparedMoE(nn.Module):
             # materialising all 384 scores while preserving the stock
             # BF16-gate -> FP32-score result bit for bit.
             ids, routing = torch.ops.custom_op.custom_deepseek_v41_router_logits_top6_gaudi2(
-                gate_logits.contiguous(), w.gate.bias, w.gate.bias_vl, image_mask.contiguous())
+                gate_logits.contiguous(), w.gate.bias, w.gate.bias_vl, image_mask.contiguous()
+            )
         else:
             scores = F.softplus(gate_logits).sqrt()
             if self.router_top6:
@@ -532,7 +601,8 @@ class PreparedMoE(nn.Module):
                 # of the long-prompt output divergence in the decode-only
                 # fused-router candidate.
                 ids, routing = torch.ops.custom_op.custom_deepseek_v41_router_top6_gaudi2(
-                    scores, w.gate.bias, w.gate.bias_vl, image_mask)
+                    scores, w.gate.bias, w.gate.bias_vl, image_mask
+                )
             else:
                 bias = torch.where(image_mask.unsqueeze(-1), w.gate.bias_vl, w.gate.bias)
                 ids = torch.topk(scores + bias, self.topk, dim=-1, sorted=True).indices
@@ -546,13 +616,24 @@ class PreparedMoE(nn.Module):
         # normal request-slot input and remains independently schedulable;
         # only its final FP32 addition and BF16 rounding move into the routed
         # compound node. Wider batches keep the common batch implementation.
-        fused_shared = (self.n256_fp8 and self.n256_fused_reduce and prequant is not None and value.shape[0] == 1)
+        fused_shared = self.n256_fp8 and self.n256_fused_reduce and prequant is not None and value.shape[0] == 1
         shared_out = self.shared_expert(value) if fused_shared else None
         if self.prefill_grouped and value.shape[0] > 6 and not ordinary_decode:
             from vllm_gaudi.ops.deepseek_v41_grouped_prefill import run_grouped_prefill
-            output = run_grouped_prefill(value, ids, routing, experts.w13_q16, experts.w2_q16, experts.w13_s16,
-                                         experts.w2_s16, self.lookup, self.normal_scales, experts.w13_fp8_channel,
-                                         experts.w2_fp8_channel)
+
+            output = run_grouped_prefill(
+                value,
+                ids,
+                routing,
+                experts.w13_q16,
+                experts.w2_q16,
+                experts.w13_s16,
+                experts.w2_s16,
+                self.lookup,
+                self.normal_scales,
+                experts.w13_fp8_channel,
+                experts.w2_fp8_channel,
+            )
         elif self.prefill_mxfp4 and value.shape[0] > 6 and not ordinary_decode:
             # Large-M prompt work has a different reuse regime from C1.  The
             # decode-oriented N256 compound kernel rereads and converts all
@@ -562,8 +643,10 @@ class PreparedMoE(nn.Module):
             # restored tensors are recipe temporaries; N256 remains the only
             # resident expert allocation and the C1 path below is unchanged.
             from vllm_gaudi.ops.deepseek_v41_prefill_moe import run_q16_prefill_moe
-            output = run_q16_prefill_moe(value, ids, routing, experts.w13_q16, experts.w2_q16, experts.w13_s16,
-                                         experts.w2_s16)
+
+            output = run_q16_prefill_moe(
+                value, ids, routing, experts.w13_q16, experts.w2_q16, experts.w13_s16, experts.w2_s16
+            )
         elif self.n256:
             # The N256 FP8 compound node is the only large-M implementation
             # qualified on this prepared layout.  It accepts C1..C8192; the
@@ -575,73 +658,127 @@ class PreparedMoE(nn.Module):
             # dequant node, which is not registered for the current Gaudi
             # runtime shape profile (M128 generic failure).
             if self.n256_fp8:
-                output = self._forward_n256_fp8(value,
-                                                ids,
-                                                routing,
-                                                ordinary_decode=ordinary_decode,
-                                                prequant=prequant,
-                                                shared=shared_out)
+                output = self._forward_n256_fp8(
+                    value, ids, routing, ordinary_decode=ordinary_decode, prequant=prequant, shared=shared_out
+                )
             else:
-                operands = (value, ids.to(torch.int32), routing.float(), experts.w13_q16, experts.w2_q16,
-                            experts.w13_s16, experts.w2_s16, self.lookup)
+                operands = (
+                    value,
+                    ids.to(torch.int32),
+                    routing.float(),
+                    experts.w13_q16,
+                    experts.w2_q16,
+                    experts.w13_s16,
+                    experts.w2_s16,
+                    self.lookup,
+                )
                 output = torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_bf16_gaudi2(
-                    *operands, self.normal_scales)
+                    *operands, self.normal_scales
+                )
         elif self.fp8 and fp8_decode:
             if value.shape[0] != 1:
                 raise ValueError("The legacy FP8 expert path requires C1")
             output = torch.ops.custom_op.custom_deepseek_v41_mxfp4_prepared_moe_fp8_gaudi2(
-                value, ids.to(torch.int32), routing.float(), experts.w13_q16, experts.w2_q16, experts.w13_s16,
-                experts.w2_s16, self.lookup, self.fp8_w13_scale, self.fp8_w2_scale, self.normal_scales)
+                value,
+                ids.to(torch.int32),
+                routing.float(),
+                experts.w13_q16,
+                experts.w2_q16,
+                experts.w13_s16,
+                experts.w2_s16,
+                self.lookup,
+                self.fp8_w13_scale,
+                self.fp8_w2_scale,
+                self.normal_scales,
+            )
         elif self.expert_k128 and self.topk == 6 and value.shape[0] == 1:
             namespace = torch.ops.custom_op
             name = "custom_deepseek_v41_mxfp4_prepared_moe_k128_bf16_gaudi2"
-            op = (getattr(namespace, name)
-                  if hasattr(namespace, name) else namespace.custom_deepseek_v41_mxfp4_k128_moe_bf16_gaudi2)
-            output = op(value, ids.to(torch.int32), routing.float(), experts.w13_q16, experts.w2_q16, experts.w13_s16,
-                        experts.w2_s16, self.lookup, self.normal_scales)
-        elif (gaudi_envs.VLLM_HPU_DSV41_SHARED_C6_EXPERTS and self.topk == 6 and value.device.type == "hpu"
-              and 2 <= value.shape[0] <= 6):
+            op = (
+                getattr(namespace, name)
+                if hasattr(namespace, name)
+                else namespace.custom_deepseek_v41_mxfp4_k128_moe_bf16_gaudi2
+            )
+            output = op(
+                value,
+                ids.to(torch.int32),
+                routing.float(),
+                experts.w13_q16,
+                experts.w2_q16,
+                experts.w13_s16,
+                experts.w2_s16,
+                self.lookup,
+                self.normal_scales,
+            )
+        elif (
+            gaudi_envs.VLLM_HPU_DSV41_SHARED_C6_EXPERTS
+            and self.topk == 6
+            and value.device.type == "hpu"
+            and 2 <= value.shape[0] <= 6
+        ):
             output = shared_expert_moe(value, ids, routing.float(), experts, self.lookup, self.normal_scales)
         elif self._can_use_indexed(value, ids, routing):
             output = self._forward_indexed(value, ids, routing)
         else:
             op = torch.ops.custom_op.custom_deepseek_v41_mxfp4_prepared_moe_bf16_gaudi2
-            if (gaudi_envs.VLLM_HPU_DSV41_TILED_EXPERT_DECODE and self.topk == 6 and value.device.type == "hpu"
-                    and 2 <= value.shape[0] <= 6):
+            if (
+                gaudi_envs.VLLM_HPU_DSV41_TILED_EXPERT_DECODE
+                and self.topk == 6
+                and value.device.type == "hpu"
+                and 2 <= value.shape[0] <= 6
+            ):
                 op = torch.ops.custom_op.custom_deepseek_v41_mxfp4_k128_moe_bf16_gaudi2
-            if (gaudi_envs.VLLM_HPU_DSV41_W13_N512 and self.topk == 6 and value.device.type == "hpu"
-                    and 2 <= value.shape[0] <= 6):
+            if (
+                gaudi_envs.VLLM_HPU_DSV41_W13_N512
+                and self.topk == 6
+                and value.device.type == "hpu"
+                and 2 <= value.shape[0] <= 6
+            ):
                 op = torch.ops.custom_op.custom_deepseek_v41_mxfp4_n512_moe_bf16_gaudi2
-            output = op(value, ids.to(torch.int32), routing.float(), experts.w13_q16, experts.w2_q16, experts.w13_s16,
-                        experts.w2_s16, self.lookup, self.normal_scales)
+            output = op(
+                value,
+                ids.to(torch.int32),
+                routing.float(),
+                experts.w13_q16,
+                experts.w2_q16,
+                experts.w13_s16,
+                experts.w2_s16,
+                self.lookup,
+                self.normal_scales,
+            )
         if shared_out is None:
             shared_out = self.shared_expert(value)
-            partial = (_prefill_combine(output, shared_out) if gaudi_envs.VLLM_HPU_DSV41_PREFILL_REGIONS and not decode
-                       and value.shape[0] > 6 else (output.float() + shared_out.float()).to(value.dtype))
+            partial = (
+                _prefill_combine(output, shared_out)
+                if gaudi_envs.VLLM_HPU_DSV41_PREFILL_REGIONS and not decode and value.shape[0] > 6
+                else (output.float() + shared_out.float()).to(value.dtype)
+            )
         else:
             partial = output
         if prefill_sequence:
             if decode or ready_outputs or self.tensor_parallel_size != 4:
                 raise ValueError("Token-owned MoE output is restricted to TP4 prefill")
             from vllm_gaudi.ops.deepseek_v41_prefill_sequence_state import reduce_owned_tokens
+
             return reduce_owned_tokens(partial, self.reduce)
         return self.reduce(partial, ready_outputs=ready_outputs) if ready_outputs else self.reduce(partial)
 
 
 class PreparedDecoderLayer(nn.Module):
-
-    def __init__(self,
-                 weights,
-                 config,
-                 layer,
-                 shared,
-                 normal_scales,
-                 lookup,
-                 reduce,
-                 all_gather,
-                 device,
-                 tensor_parallel_size=2,
-                 collect_target_state=False):
+    def __init__(
+        self,
+        weights,
+        config,
+        layer,
+        shared,
+        normal_scales,
+        lookup,
+        reduce,
+        all_gather,
+        device,
+        tensor_parallel_size=2,
+        collect_target_state=False,
+    ):
         super().__init__()
         self.weights, self.layer = weights, layer
         self.draft = layer >= config["num_hidden_layers"]
@@ -656,34 +793,40 @@ class PreparedDecoderLayer(nn.Module):
         # Full prompt state already owns token rows. Reuse that ownership for
         # replicated Q/KV inputs on layers without a full hidden-state consumer.
         self.sequence_qkv_input = tensor_parallel_size == 4
+        self.mhc_post_collapse = tensor_parallel_size == 4 and hasattr(
+            torch.ops.custom_op, "custom_deepseek_v41_mhc_post_collapse_gaudi2"
+        )
+        # Retained for diagnosis: the complete TP4 chain regresses with the
+        # inter-layer handoff even when every numerical gate is exact.
+        self.mhc_interlayer_collapse = False
         self.register_buffer("hc_attn_fn_packed", None, False)
         self.register_buffer("hc_ffn_fn_packed", None, False)
         if shared.length > 512:
             from vllm_gaudi.ops.deepseek_v41_paged_attention import PagedCSA2Attention
-            self.attention = PagedCSA2Attention(weights.attn,
-                                                config,
-                                                layer,
-                                                shared,
-                                                linear,
-                                                reduce,
-                                                all_gather,
-                                                device,
-                                                tensor_parallel_size=tensor_parallel_size)
+
+            self.attention = PagedCSA2Attention(
+                weights.attn,
+                config,
+                layer,
+                shared,
+                linear,
+                reduce,
+                all_gather,
+                device,
+                tensor_parallel_size=tensor_parallel_size,
+            )
         else:
-            self.attention = CSA2Attention(weights.attn,
-                                           config,
-                                           layer,
-                                           shared,
-                                           linear,
-                                           reduce,
-                                           device,
-                                           tensor_parallel_size=tensor_parallel_size)
-        self.moe = PreparedMoE(weights.ffn,
-                               config["num_experts_per_tok"],
-                               normal_scales,
-                               lookup,
-                               reduce,
-                               tensor_parallel_size=tensor_parallel_size)
+            self.attention = CSA2Attention(
+                weights.attn, config, layer, shared, linear, reduce, device, tensor_parallel_size=tensor_parallel_size
+            )
+        self.moe = PreparedMoE(
+            weights.ffn,
+            config["num_experts_per_tok"],
+            normal_scales,
+            lookup,
+            reduce,
+            tensor_parallel_size=tensor_parallel_size,
+        )
         self.moe.layer = layer
         self.all_gather = all_gather
 
@@ -691,7 +834,8 @@ class PreparedDecoderLayer(nn.Module):
     def _pack_mhc_control_weight(weight):
         if weight.dtype != torch.float32 or weight.shape != (24, 20480):
             raise ValueError(
-                f"mHC control/RRMS preparation requires FP32 [24,20480], got {weight.dtype} {tuple(weight.shape)}")
+                f"mHC control/RRMS preparation requires FP32 [24,20480], got {weight.dtype} {tuple(weight.shape)}"
+            )
         # The fused kernel reconstructs linear BF16 lanes before its MACs, so
         # it consumes the checkpoint's original K order and does not need a
         # second lane-permuted resident copy.
@@ -709,20 +853,34 @@ class PreparedDecoderLayer(nn.Module):
         self.hc_ffn_fn_packed = None
 
     @prefill_span("layer")
-    def forward(self,
-                residual,
-                pre_mix,
-                positions,
-                image_mask,
-                engram_rows=None,
-                *,
-                fp8_decode=False,
-                decode=False,
-                prefill_router_tokens=0,
-                prefill_sequence=False):
+    def forward(
+        self,
+        residual,
+        pre_mix,
+        positions,
+        image_mask,
+        engram_rows=None,
+        *,
+        fp8_decode=False,
+        decode=False,
+        prefill_router_tokens=0,
+        prefill_sequence=False,
+        selected_main=None,
+        decode_metadata=None,
+        collapse_handoff=None,
+        publish_collapse=False,
+    ):
         w = self.weights
-        prefill = (gaudi_envs.VLLM_HPU_DSV41_PREFILL_REGIONS and not decode and not self.draft and residual.shape[0] > 6
-                   and hasattr(self.attention, "_prefill_attention"))
+        collapsed_attention = None if collapse_handoff is None else collapse_handoff.pop(self.layer, None)
+        if hasattr(w, "engram") and collapsed_attention is not None:
+            raise RuntimeError("An Engram update invalidates a preceding residual collapse")
+        prefill = (
+            gaudi_envs.VLLM_HPU_DSV41_PREFILL_REGIONS
+            and not decode
+            and not self.draft
+            and residual.shape[0] > 6
+            and hasattr(self.attention, "_prefill_attention")
+        )
         # The fused update depends on the four mHC streams, not TP heads.
         # TP4 needs it even before the other prefill regions are enabled:
         # the eager broadcast otherwise materializes [T,4,4,5120] FP32.
@@ -732,8 +890,13 @@ class PreparedDecoderLayer(nn.Module):
             if not prefill or self.moe.tensor_parallel_size != 4 or residual.shape[0] * 4 != positions.numel():
                 raise ValueError("TP4 prompt layer requires matching token-owned residuals and full positions")
             from vllm.distributed import get_tp_group
-            from vllm_gaudi.ops.deepseek_v41_prefill_sequence_state import (exchange_engram_tokens, gather_tokens,
-                                                                            sequence_hc_input, token_owner)
+            from vllm_gaudi.ops.deepseek_v41_prefill_sequence_state import (
+                exchange_engram_tokens,
+                gather_tokens,
+                sequence_hc_input,
+                token_owner,
+            )
+
             group = get_tp_group()
             owned = token_owner(positions.numel(), group.rank_in_group)
         if hasattr(w, "engram"):
@@ -756,109 +919,193 @@ class PreparedDecoderLayer(nn.Module):
             target_state = gather_tokens(target_state.contiguous(), group=group.device_group)
         compiled_input = prefill and gaudi_envs.VLLM_HPU_DSV41_PREFILL_MHC_INPUT
         requires_full_input = self.attention.owns_kv or self.attention.owns_index if prefill_sequence else False
-        sequence_qkv = (prefill_sequence and getattr(self, "sequence_qkv_input", False) and not requires_full_input
-                        and self.attention._fused_qkv_weight is not None)
+        sequence_qkv = (
+            prefill_sequence
+            and getattr(self, "sequence_qkv_input", False)
+            and not requires_full_input
+            and self.attention._fused_qkv_weight is not None
+        )
         if prefill_sequence:
-            new_pre, post, comb, value = sequence_hc_input(residual,
-                                                           pre_mix,
-                                                           w.hc_attn_fn,
-                                                           w.hc_attn_scale,
-                                                           w.hc_attn_base,
-                                                           w.attn_norm.weight,
-                                                           self.eps,
-                                                           self.hc_eps,
-                                                           self.iterations,
-                                                           self.hc_attn_fn_packed,
-                                                           group=group.device_group,
-                                                           gather=requires_full_input or not sequence_qkv)
+            new_pre, post, comb, value = sequence_hc_input(
+                residual,
+                pre_mix,
+                w.hc_attn_fn,
+                w.hc_attn_scale,
+                w.hc_attn_base,
+                w.attn_norm.weight,
+                self.eps,
+                self.hc_eps,
+                self.iterations,
+                self.hc_attn_fn_packed,
+                group=group.device_group,
+                gather=requires_full_input or not sequence_qkv,
+            )
         elif compiled_input:
-            collapsed, new_pre, post, comb, value = prefill_hc_input(residual, pre_mix, w.hc_attn_fn, w.hc_attn_scale,
-                                                                     w.hc_attn_base, w.attn_norm.weight, self.eps,
-                                                                     self.hc_eps, self.iterations,
-                                                                     self.hc_attn_fn_packed)
+            collapsed, new_pre, post, comb, value = prefill_hc_input(
+                residual,
+                pre_mix,
+                w.hc_attn_fn,
+                w.hc_attn_scale,
+                w.hc_attn_base,
+                w.attn_norm.weight,
+                self.eps,
+                self.hc_eps,
+                self.iterations,
+                self.hc_attn_fn_packed,
+            )
             del collapsed
         else:
-            value, new_pre, post, comb = hc_pre(residual,
-                                                pre_mix,
-                                                w.hc_attn_fn,
-                                                w.hc_attn_scale,
-                                                w.hc_attn_base,
-                                                self.eps,
-                                                self.hc_eps,
-                                                self.iterations,
-                                                packed_fn=self.hc_attn_fn_packed,
-                                                prefill=fused_post)
+            value, new_pre, post, comb = hc_pre(
+                residual,
+                pre_mix,
+                w.hc_attn_fn,
+                w.hc_attn_scale,
+                w.hc_attn_base,
+                self.eps,
+                self.hc_eps,
+                self.iterations,
+                packed_fn=self.hc_attn_fn_packed,
+                prefill=fused_post,
+                collapsed_input=collapsed_attention,
+            )
             value = rms_norm(value, w.attn_norm.weight, self.eps)
-        schedule = (gaudi_envs.VLLM_HPU_DSV41_MHC_SCHEDULE and not self.draft and 1 <= value.shape[0] <= 6)
+            if collapsed_attention is not None:
+                # The generic attention graph consumes an FP32 collapse,
+                # then rounds the normalized row before block quantization.
+                value = value.to(residual.dtype)
+        schedule = gaudi_envs.VLLM_HPU_DSV41_MHC_SCHEDULE and not self.draft and 1 <= value.shape[0] <= 6
+        attention_kwargs = {"decode": decode}
+        if selected_main is not None and getattr(self.attention, "shared_main_mla", False):
+            attention_kwargs["selected_main"] = selected_main
+        if decode_metadata is not None and getattr(self.attention, "shared_decode_metadata", False):
+            attention_kwargs["decode_metadata"] = decode_metadata
         if prefill_sequence:
-            value = self.attention(value,
-                                   positions,
-                                   decode=False,
-                                   prefill_sequence=True,
-                                   prefill_qkv_sequence=sequence_qkv)
+            value = self.attention(
+                value, positions, decode=False, prefill_sequence=True, prefill_qkv_sequence=sequence_qkv
+            )
         elif schedule:
-            value = self.attention(value, positions, ready_outputs=(post, comb), decode=decode)
+            value = self.attention(value, positions, ready_outputs=(post, comb), **attention_kwargs)
         else:
-            value = (self.attention.draft(value, positions)
-                     if self.draft else self.attention(value, positions, decode=decode))
-        residual = post_update(value, residual, post, comb)
+            value = (
+                self.attention.draft(value, positions)
+                if self.draft
+                else self.attention(value, positions, **attention_kwargs)
+            )
+        collapsed_ffn = None
+        if self.mhc_post_collapse and decode and not self.draft and value.shape[0] <= 2 and value.device.type == "hpu":
+            # Keep forty independently scheduled feature tiles. The residual
+            # BF16 boundary is retained inside the fused producer; the next
+            # control/RRMS and FFN norm/quant remain independent consumers.
+            residual, collapsed_ffn = torch.ops.custom_op.custom_deepseek_v41_mhc_post_collapse_gaudi2(
+                value.contiguous(), residual.contiguous(), post.contiguous(), comb.contiguous(), new_pre.contiguous()
+            )
+        else:
+            residual = post_update(value, residual, post, comb)
         del value, post, comb
         if prefill_sequence:
-            pre_mix, post, comb, value = sequence_hc_input(residual,
-                                                           new_pre,
-                                                           w.hc_ffn_fn,
-                                                           w.hc_ffn_scale,
-                                                           w.hc_ffn_base,
-                                                           w.ffn_norm.weight,
-                                                           self.eps,
-                                                           self.hc_eps,
-                                                           self.iterations,
-                                                           self.hc_ffn_fn_packed,
-                                                           group=group.device_group)
+            pre_mix, post, comb, value = sequence_hc_input(
+                residual,
+                new_pre,
+                w.hc_ffn_fn,
+                w.hc_ffn_scale,
+                w.hc_ffn_base,
+                w.ffn_norm.weight,
+                self.eps,
+                self.hc_eps,
+                self.iterations,
+                self.hc_ffn_fn_packed,
+                group=group.device_group,
+            )
         elif compiled_input:
-            collapsed, pre_mix, post, comb, value = prefill_hc_input(residual, new_pre, w.hc_ffn_fn, w.hc_ffn_scale,
-                                                                     w.hc_ffn_base, w.ffn_norm.weight, self.eps,
-                                                                     self.hc_eps, self.iterations,
-                                                                     self.hc_ffn_fn_packed)
+            collapsed, pre_mix, post, comb, value = prefill_hc_input(
+                residual,
+                new_pre,
+                w.hc_ffn_fn,
+                w.hc_ffn_scale,
+                w.hc_ffn_base,
+                w.ffn_norm.weight,
+                self.eps,
+                self.hc_eps,
+                self.iterations,
+                self.hc_ffn_fn_packed,
+            )
             del collapsed
         else:
-            value, pre_mix, post, comb = hc_pre(residual,
-                                                new_pre,
-                                                w.hc_ffn_fn,
-                                                w.hc_ffn_scale,
-                                                w.hc_ffn_base,
-                                                self.eps,
-                                                self.hc_eps,
-                                                self.iterations,
-                                                packed_fn=self.hc_ffn_fn_packed,
-                                                prefill=fused_post)
+            value, pre_mix, post, comb = hc_pre(
+                residual,
+                new_pre,
+                w.hc_ffn_fn,
+                w.hc_ffn_scale,
+                w.hc_ffn_base,
+                self.eps,
+                self.hc_eps,
+                self.iterations,
+                packed_fn=self.hc_ffn_fn_packed,
+                prefill=fused_post,
+                collapsed_input=collapsed_ffn,
+            )
         # Keep the normalized BF16 row in the TPC register file while forming
         # the exact FP8 operand consumed by N256.  This is an internal B1/B2
         # implementation choice under the normal scheduler and request-state
         # contract; larger decode batches and prefill retain the generic path.
         # The B1/B2 outputs were qualified bit-for-bit against the separate
         # RMSNorm and dynamic-quant nodes before this became the default.
-        if (decode and value.shape[0] <= 2 and self.moe.n256_fp8 and self.moe.n256_fused):
-            normalized, quantized, activation_scale = (torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
-                value.contiguous(), w.ffn_norm.weight, self.eps))
-            value = self.moe(normalized,
-                             image_mask,
-                             ready_outputs=(post, comb) if schedule else (),
-                             fp8_decode=fp8_decode,
-                             decode=decode,
-                             prequant=(quantized, activation_scale))
+        if decode and value.shape[0] <= 2 and self.moe.n256_fp8 and self.moe.n256_fused:
+            normalized, quantized, activation_scale = torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
+                value.contiguous(), w.ffn_norm.weight, self.eps
+            )
+            value = self.moe(
+                normalized,
+                image_mask,
+                ready_outputs=(post, comb) if schedule else (),
+                fp8_decode=fp8_decode,
+                decode=decode,
+                prequant=(quantized, activation_scale),
+            )
         else:
-            value = self.moe(value if compiled_input else rms_norm(value, w.ffn_norm.weight, self.eps),
-                             image_mask,
-                             ready_outputs=(post, comb) if schedule else (),
-                             fp8_decode=fp8_decode,
-                             decode=decode,
-                             prefill_router_tokens=prefill_router_tokens,
-                             prefill_sequence=prefill_sequence)
-        return post_update(value, residual, post, comb), pre_mix, target_state
+            value = self.moe(
+                value if compiled_input else rms_norm(value, w.ffn_norm.weight, self.eps),
+                image_mask,
+                ready_outputs=(post, comb) if schedule else (),
+                fp8_decode=fp8_decode,
+                decode=decode,
+                prefill_router_tokens=prefill_router_tokens,
+                prefill_sequence=prefill_sequence,
+            )
+        if (
+            publish_collapse
+            and collapse_handoff is not None
+            and self.mhc_interlayer_collapse
+            and decode
+            and not self.draft
+            and value.shape[0] <= 2
+            and value.device.type == "hpu"
+        ):
+            # The group only publishes to the immediately following layer,
+            # without an intervening Engram update. Both consumers receive
+            # the same BF16 residual and FP32 collapse as separate layer recipes.
+            residual, collapsed = torch.ops.custom_op.custom_deepseek_v41_mhc_post_collapse_f32_gaudi2(
+                value.contiguous(), residual.contiguous(), post.contiguous(), comb.contiguous(), pre_mix.contiguous()
+            )
+            collapse_handoff[self.layer + 1] = collapsed
+        else:
+            residual = post_update(value, residual, post, comb)
+        return residual, pre_mix, target_state
 
-    def forward_batch(self, residual, pre_mix, positions, image_mask, engram_rows, slots, pages, selected, candidates,
-                      main_ready, index_ready):
+    def forward_batch(
+        self,
+        residual,
+        pre_mix,
+        positions,
+        image_mask,
+        engram_rows,
+        slots,
+        pages,
+        selected,
+        candidates,
+        main_ready,
+        index_ready,
+    ):
         """One ordinary decode input per request, with explicit state owners."""
         if self.draft or self.collect_target_state:
             raise RuntimeError("Request batching excludes speculative state collection")
@@ -871,58 +1118,66 @@ class PreparedDecoderLayer(nn.Module):
             rows = self.all_gather(local, dim=1)
             kv = linear(rows.flatten(1), w.engram.wkv)
             residual = engram_update(residual, kv, w.engram.q_weight, w.engram.k_weight, active & ~image_mask, self.eps)
-        value, new_pre, post, comb = hc_pre(residual,
-                                            pre_mix,
-                                            w.hc_attn_fn,
-                                            w.hc_attn_scale,
-                                            w.hc_attn_base,
-                                            self.eps,
-                                            self.hc_eps,
-                                            self.iterations,
-                                            request_batch=True,
-                                            batch_control_reuse=self.batch_control_reuse,
-                                            batch_control_prefetch=self.batch_control_prefetch,
-                                            packed_fn=self.hc_attn_fn_packed if self.batch_mhc_fusion else None)
+        value, new_pre, post, comb = hc_pre(
+            residual,
+            pre_mix,
+            w.hc_attn_fn,
+            w.hc_attn_scale,
+            w.hc_attn_base,
+            self.eps,
+            self.hc_eps,
+            self.iterations,
+            request_batch=True,
+            batch_control_reuse=self.batch_control_reuse,
+            batch_control_prefetch=self.batch_control_prefetch,
+            packed_fn=self.hc_attn_fn_packed if self.batch_mhc_fusion else None,
+        )
         schedule = gaudi_envs.VLLM_HPU_DSV41_MHC_SCHEDULE
-        result = self.attention.forward_batch(rms_norm(value, w.attn_norm.weight, self.eps, request_batch=True),
-                                              positions,
-                                              slots,
-                                              pages,
-                                              selected,
-                                              candidates,
-                                              main_ready,
-                                              index_ready,
-                                              ready_outputs=(post, comb) if schedule else ())
+        result = self.attention.forward_batch(
+            rms_norm(value, w.attn_norm.weight, self.eps, request_batch=True),
+            positions,
+            slots,
+            pages,
+            selected,
+            candidates,
+            main_ready,
+            index_ready,
+            ready_outputs=(post, comb) if schedule else (),
+        )
         value, selected, candidates, main_ready, index_ready = result
         residual = hc_post(value, residual, post, comb)
-        value, pre_mix, post, comb = hc_pre(residual,
-                                            new_pre,
-                                            w.hc_ffn_fn,
-                                            w.hc_ffn_scale,
-                                            w.hc_ffn_base,
-                                            self.eps,
-                                            self.hc_eps,
-                                            self.iterations,
-                                            request_batch=True,
-                                            batch_control_reuse=self.batch_control_reuse,
-                                            batch_control_prefetch=self.batch_control_prefetch,
-                                            packed_fn=self.hc_ffn_fn_packed if self.batch_mhc_fusion else None)
+        value, pre_mix, post, comb = hc_pre(
+            residual,
+            new_pre,
+            w.hc_ffn_fn,
+            w.hc_ffn_scale,
+            w.hc_ffn_base,
+            self.eps,
+            self.hc_eps,
+            self.iterations,
+            request_batch=True,
+            batch_control_reuse=self.batch_control_reuse,
+            batch_control_prefetch=self.batch_control_prefetch,
+            packed_fn=self.hc_ffn_fn_packed if self.batch_mhc_fusion else None,
+        )
         # Reuse the production norm/quant producer for ordinary request rows.
         # The grouped B64 specialization owns its own activation preparation;
         # do not compute an unused FP8 operand on that path.
         prequant = None
-        if (self.batch_ffn_fusion and self.moe.n256_fused
-                and not (value.shape[0] == 64 and self.moe.concurrent_moe_rows)):
+        if (
+            self.batch_ffn_fusion
+            and self.moe.n256_fused
+            and not (value.shape[0] == 64 and self.moe.concurrent_moe_rows)
+        ):
             value, quantized, scale = torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
-                value.contiguous(), w.ffn_norm.weight, self.eps)
+                value.contiguous(), w.ffn_norm.weight, self.eps
+            )
             prequant = quantized, scale
         else:
             value = rms_norm(value, w.ffn_norm.weight, self.eps, request_batch=True)
-        value = self.moe(value,
-                         image_mask,
-                         ready_outputs=(post, comb) if schedule else (),
-                         ordinary_decode=True,
-                         prequant=prequant)
+        value = self.moe(
+            value, image_mask, ready_outputs=(post, comb) if schedule else (), ordinary_decode=True, prequant=prequant
+        )
         residual = hc_post(value, residual, post, comb)
         residual = residual.masked_fill(~active[:, None, None], 0)
         pre_mix = pre_mix.masked_fill(~active[:, None], 0)
@@ -950,26 +1205,30 @@ class PrefillInput:
 
 
 class PreparedStage(nn.Module):
-
-    def __init__(self,
-                 directory,
-                 pp_rank,
-                 tp_rank,
-                 reduce,
-                 all_gather,
-                 device,
-                 max_length=512,
-                 *,
-                 tensor_parallel_size=2,
-                 pipeline_parallel_size=2,
-                 dspark=None,
-                 prefill_tokens=8192):
+    def __init__(
+        self,
+        directory,
+        pp_rank,
+        tp_rank,
+        reduce,
+        all_gather,
+        device,
+        max_length=512,
+        *,
+        tensor_parallel_size=2,
+        pipeline_parallel_size=2,
+        dspark=None,
+        prefill_tokens=8192,
+    ):
         super().__init__()
         from vllm_gaudi.ops.deepseek_v41_prefill_regions import validate_prefill_region_config
+
         validate_prefill_region_config()
         self.shard = PreparedV41Shard(directory, pp_rank, tp_rank)
-        if (getattr(self.shard, "tensor_parallel_size", tensor_parallel_size) != tensor_parallel_size
-                or getattr(self.shard, "pipeline_parallel_size", pipeline_parallel_size) != pipeline_parallel_size):
+        if (
+            getattr(self.shard, "tensor_parallel_size", tensor_parallel_size) != tensor_parallel_size
+            or getattr(self.shard, "pipeline_parallel_size", pipeline_parallel_size) != pipeline_parallel_size
+        ):
             raise ValueError("Prepared shard topology differs from the runtime topology")
         self.config = json.loads((Path(directory) / "config.json").read_text())
         config = self.config["text_config"]
@@ -980,7 +1239,7 @@ class PreparedStage(nn.Module):
         # path must never infer finality from a static graph shape.
         self.prefill_halo_mode = "full"
         self.reduce, self.all_gather = reduce, all_gather
-        self.dspark = (gaudi_envs.VLLM_HPU_DSV41_DSPARK if dspark is None else bool(dspark))
+        self.dspark = gaudi_envs.VLLM_HPU_DSV41_DSPARK if dspark is None else bool(dspark)
         if tensor_parallel_size == 4 and self.dspark:
             raise ValueError("V4.1 TP4 does not yet support DSpark")
         self.runtime_indexer = gaudi_envs.VLLM_HPU_DSV41_RUNTIME_INDEXER
@@ -1000,11 +1259,13 @@ class PreparedStage(nn.Module):
             raise ValueError("Engram FP8 requires ordinary execution")
         if gaudi_envs.VLLM_HPU_DSV41_ATTN_DENSE_FP8:
             from vllm_gaudi.ops.deepseek_v41_dense_fp8 import precision_config
+
             if self.dspark:
                 raise ValueError("Attention dense FP8 requires ordinary C1 decode")
             self.dense_config = precision_config(gaudi_envs.VLLM_HPU_DSV41_ATTN_DENSE_FP8_CONFIG)
         if gaudi_envs.VLLM_HPU_DSV41_WO_A_FP8:
             from vllm_gaudi.ops.deepseek_v41_woa_fp8 import layer_selection
+
             if self.dspark:
                 raise ValueError("wo_a FP8 requires ordinary C1 decode")
             self.woa_config = layer_selection(gaudi_envs.VLLM_HPU_DSV41_WO_A_FP8_CONFIG)
@@ -1014,28 +1275,29 @@ class PreparedStage(nn.Module):
                 raise ValueError("Fused wo_a output roundtrip requires ordinary quantized execution")
             if set(self.woa_config["layers"]) != set(self.dense_config["wo_b"]):
                 raise ValueError("Fused wo_a output roundtrip requires matching wo_a and wo_b FP8 layers")
-        self.expert_n256 = (gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256 or gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8)
+        self.expert_n256 = gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256 or gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8
         self.expert_fused_quant = gaudi_envs.VLLM_HPU_DSV41_EXPERT_FUSED_QUANT
         self.expert_fused_reduce = gaudi_envs.VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE
         if self.expert_fused_quant and not gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8:
             raise ValueError("Fused expert quantization requires N256 FP8 experts")
         if self.expert_fused_reduce and not (gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8 and self.expert_fused_quant):
             raise ValueError("Fused expert finalize requires N256 FP8 and fused quantization")
-        if self.expert_n256 and (gaudi_envs.VLLM_HPU_DSV41_FP8_DECODE
-                                 or gaudi_envs.VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE):
+        if self.expert_n256 and (
+            gaudi_envs.VLLM_HPU_DSV41_FP8_DECODE or gaudi_envs.VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE
+        ):
             raise ValueError("N256 experts use their own layout and decoder")
         self.expert_n256_config = {"routed_experts": []}
         if self.expert_n256:
             from vllm_gaudi.ops.deepseek_v41_fp8 import precision_config
+
             self.expert_n256_config = precision_config(gaudi_envs.VLLM_HPU_DSV41_FP8_CONFIG)
             if not self.expert_n256_config["routed_experts"]:
                 self.expert_n256_config["routed_experts"] = list(range(40))
-        self.fp8_decode = (gaudi_envs.VLLM_HPU_DSV41_FP8_DECODE or gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8)
-        if (gaudi_envs.VLLM_HPU_DSV41_FP8_DECODE and (self.dspark or not gaudi_envs.VLLM_HPU_DSV41_GRAPH_REPLAY)):
+        self.fp8_decode = gaudi_envs.VLLM_HPU_DSV41_FP8_DECODE or gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8
+        if gaudi_envs.VLLM_HPU_DSV41_FP8_DECODE and (self.dspark or not gaudi_envs.VLLM_HPU_DSV41_GRAPH_REPLAY):
             raise ValueError("Legacy V4.1 FP8 decode requires ordinary C1 replay")
         self.weight_specs = {
-            name: spec
-            for name, spec in self.shard.specs.items() if self.dspark or not name.startswith("mtp.")
+            name: spec for name, spec in self.shard.specs.items() if self.dspark or not name.startswith("mtp.")
         }
         self.weights = _weight_tree(self.weight_specs)
         self.tensor_parallel_size = tensor_parallel_size
@@ -1043,13 +1305,16 @@ class PreparedStage(nn.Module):
         self.start, self.stop = ranges[pp_rank]
         if max_length > 512:
             from vllm_gaudi.ops.deepseek_v41_paged_attention import PagedCSA2SharedState
-            self.shared = PagedCSA2SharedState(config,
-                                               self.start,
-                                               self.stop,
-                                               device,
-                                               max_length,
-                                               prefill_tokens=prefill_tokens,
-                                               tensor_parallel_size=tensor_parallel_size)
+
+            self.shared = PagedCSA2SharedState(
+                config,
+                self.start,
+                self.stop,
+                device,
+                max_length,
+                prefill_tokens=prefill_tokens,
+                tensor_parallel_size=tensor_parallel_size,
+            )
         else:
             self.shared = CSA2SharedState(config, self.start, self.stop, device, max_length)
         lookup = mxfp4_bf16_lut(torch.device(device))
@@ -1057,17 +1322,20 @@ class PreparedStage(nn.Module):
         for layer in range(self.start, self.stop):
             normal = self.shard.manifest["normal_scales"][f"layers.{layer}.ffn.experts"][tp_rank]
             self.layers.append(
-                PreparedDecoderLayer(self.weights.layers.get_submodule(str(layer)),
-                                     config,
-                                     layer,
-                                     self.shared,
-                                     normal,
-                                     lookup,
-                                     reduce,
-                                     all_gather,
-                                     device,
-                                     tensor_parallel_size,
-                                     collect_target_state=self.dspark))
+                PreparedDecoderLayer(
+                    self.weights.layers.get_submodule(str(layer)),
+                    config,
+                    layer,
+                    self.shared,
+                    normal,
+                    lookup,
+                    reduce,
+                    all_gather,
+                    device,
+                    tensor_parallel_size,
+                    collect_target_state=self.dspark,
+                )
+            )
             # Lightweight loader/ownership tests replace the decoder layer
             # with a shell that deliberately has no attention module.
             attention = getattr(self.layers[-1], "attention", None)
@@ -1075,16 +1343,23 @@ class PreparedStage(nn.Module):
                 attention.prefill_tp_rank = tp_rank
         self.generation, self.loaded = 0, False
         self.runtime_precision = {
-            "experts": ("MXFP4/N256 -> FP8 decode MME; grouped BF16 prefill MME"
-                        if self.expert_n256 and self.fp8_decode else "MXFP4 -> BF16 SRAM -> BF16 MME"),
-            "dense":
-            "E4M3FN/block32 -> prepared BF16; block32 activation quantization",
-            "mla_wo_a": ("pretransposed [groups,K,N] BF16"
-                         if gaudi_envs.VLLM_HPU_DSV41_PRETRANSPOSE_ATTN else "checkpoint [groups,N,K] BF16"),
-            "mHC_router": ("FP32 mHC; BF16 router operands with FP32 logits"
-                           if gaudi_envs.VLLM_HPU_DSV41_BF16_ROUTER_GATE else "FP32"),
-            "communication":
-            "BF16"
+            "experts": (
+                "MXFP4/N256 -> FP8 decode MME; grouped BF16 prefill MME"
+                if self.expert_n256 and self.fp8_decode
+                else "MXFP4 -> BF16 SRAM -> BF16 MME"
+            ),
+            "dense": "E4M3FN/block32 -> prepared BF16; block32 activation quantization",
+            "mla_wo_a": (
+                "pretransposed [groups,K,N] BF16"
+                if gaudi_envs.VLLM_HPU_DSV41_PRETRANSPOSE_ATTN
+                else "checkpoint [groups,N,K] BF16"
+            ),
+            "mHC_router": (
+                "FP32 mHC; BF16 router operands with FP32 logits"
+                if gaudi_envs.VLLM_HPU_DSV41_BF16_ROUTER_GATE
+                else "FP32"
+            ),
+            "communication": "BF16",
         }
         self.draft = PreparedDraft(self, lookup, device) if self.dspark and pp_rank == 1 else None
 
@@ -1105,23 +1380,28 @@ class PreparedStage(nn.Module):
         engram_sidecar = None
         if gaudi_envs.VLLM_HPU_DSV41_ATTN_DENSE_FP8:
             from vllm_gaudi.ops.deepseek_v41_dense_fp8 import DenseFP8Sidecar
+
             dense_sidecar = DenseFP8Sidecar(gaudi_envs.VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR, self.shard)
         if self.engram_fp8:
             from vllm_gaudi.ops.deepseek_v41_engram_fp8 import EngramFP8Sidecar
+
             engram_sidecar = EngramFP8Sidecar(gaudi_envs.VLLM_HPU_DSV41_ENGRAM_FP8_SIDECAR, self.shard)
         if gaudi_envs.VLLM_HPU_DSV41_WO_A_FP8:
             from vllm_gaudi.ops.deepseek_v41_woa_fp8 import WoaFP8Sidecar
+
             sidecar = WoaFP8Sidecar(gaudi_envs.VLLM_HPU_DSV41_WO_A_FP8_SIDECAR, self.shard)
-        load_weight_tree(self.shard,
-                         self.weights,
-                         device,
-                         self.weight_specs,
-                         woa_sidecar=sidecar,
-                         woa_layers=self.woa_config["layers"],
-                         expert_n256_layers=self.expert_n256_config["routed_experts"],
-                         dense_sidecar=dense_sidecar,
-                         dense_config=self.dense_config,
-                         engram_sidecar=engram_sidecar)
+        load_weight_tree(
+            self.shard,
+            self.weights,
+            device,
+            self.weight_specs,
+            woa_sidecar=sidecar,
+            woa_layers=self.woa_config["layers"],
+            expert_n256_layers=self.expert_n256_config["routed_experts"],
+            dense_sidecar=dense_sidecar,
+            dense_config=self.dense_config,
+            engram_sidecar=engram_sidecar,
+        )
         for layer in self.layers:
             prepare = getattr(layer, "prepare_mhc_control_weights", None)
             if prepare is not None:
@@ -1151,8 +1431,9 @@ class PreparedStage(nn.Module):
             attention.woa_output_roundtrip = self.woa_output_roundtrip and attention.woa_fp8
             if attention.woa_output_roundtrip:
                 wo_b = attention.weights.wo_b
-                if not (getattr(wo_b, "dense_fp8", False) and hasattr(wo_b, "scale")
-                        and hasattr(wo_b, "channel_scale")):
+                if not (
+                    getattr(wo_b, "dense_fp8", False) and hasattr(wo_b, "scale") and hasattr(wo_b, "channel_scale")
+                ):
                     raise ValueError("Fused wo_a output roundtrip requires group32 and dense FP8 wo_b")
             if gaudi_envs.VLLM_HPU_DSV41_PREPARED_OUTPUT:
                 attention.prepare_output_weight()
@@ -1162,46 +1443,59 @@ class PreparedStage(nn.Module):
                 "weight_fingerprint": sidecar.fingerprint,
             }
         if self.expert_n256:
-            from vllm_gaudi.ops.deepseek_v41_expert_n256 import FINGERPRINT, LAYOUT
+            from vllm_gaudi.ops.deepseek_v41_expert_n256 import COMPACT_FINGERPRINT, COMPACT_LAYOUT, FINGERPRINT, LAYOUT
+
+            runtime_shard = getattr(self.shard, "_n256_runtime_shard", None)
+            compact_expert_scales = (
+                runtime_shard.layout == COMPACT_LAYOUT if runtime_shard is not None else self.tensor_parallel_size == 4
+            )
             enabled_layers = set(self.expert_n256_config["routed_experts"])
             for layer in self.layers:
                 enabled = layer.layer in enabled_layers
                 layer.moe.n256 = enabled
-                layer.moe.n256_fp8 = (enabled and gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8)
-                layer.moe.n256_fused = (layer.moe.n256_fp8 and self.expert_fused_quant)
-                layer.moe.n256_fused_reduce = (layer.moe.n256_fused and self.expert_fused_reduce)
+                layer.moe.n256_fp8 = enabled and gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8
+                layer.moe.n256_fused = layer.moe.n256_fp8 and self.expert_fused_quant
+                layer.moe.n256_fused_reduce = layer.moe.n256_fused and self.expert_fused_reduce
             self.runtime_precision["expert_n256"] = {
-                "config":
-                self.expert_n256_config,
-                "layout":
-                LAYOUT,
-                "layout_fingerprint":
-                FINGERPRINT,
-                "prepared_rank_fingerprint":
-                (self.shard._n256_runtime_shard.fingerprint if hasattr(self.shard, "_n256_runtime_shard") else None),
-                "c1_c6":
-                "FP8xFP8" if gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8 else "BF16xBF16",
-                "prefill":
-                ("expert-grouped BF16 BMM over resident N256; ordered weighted SwiGLU"
-                 if gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED else "stock MXFP4 bridge"
-                 if gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4 else "FP8 N256 compound MME in bounded 128-token tiles"),
-                "fused_quant":
-                gaudi_envs.VLLM_HPU_DSV41_EXPERT_FUSED_QUANT,
-                "fused_reduce":
-                self.expert_fused_reduce,
+                "config": self.expert_n256_config,
+                "layout": COMPACT_LAYOUT if compact_expert_scales else LAYOUT,
+                "layout_fingerprint": COMPACT_FINGERPRINT if compact_expert_scales else FINGERPRINT,
+                "prepared_rank_fingerprint": (
+                    self.shard._n256_runtime_shard.fingerprint if hasattr(self.shard, "_n256_runtime_shard") else None
+                ),
+                "c1_c6": "FP8xFP8" if gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8 else "BF16xBF16",
+                "prefill": (
+                    "expert-grouped BF16 BMM over resident N256; ordered weighted SwiGLU"
+                    if gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED
+                    else "stock MXFP4 bridge"
+                    if gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4
+                    else "FP8 N256 compound MME in bounded 128-token tiles"
+                ),
+                "fused_quant": gaudi_envs.VLLM_HPU_DSV41_EXPERT_FUSED_QUANT,
+                "fused_reduce": self.expert_fused_reduce,
             }
-            self.runtime_precision["experts"] = ("N256 MXFP4; C1-C6 " + self.runtime_precision["expert_n256"]["c1_c6"] +
-                                                 " MME; prefill: " + self.runtime_precision["expert_n256"]["prefill"])
+            self.runtime_precision["experts"] = (
+                "N256 MXFP4; C1-C6 "
+                + self.runtime_precision["expert_n256"]["c1_c6"]
+                + " MME; prefill: "
+                + self.runtime_precision["expert_n256"]["prefill"]
+            )
         elif gaudi_envs.VLLM_HPU_DSV41_FP8_DECODE:
             from vllm_gaudi.ops.deepseek_v41_fp8 import FP8Sidecar, precision_config
+
             config = precision_config(gaudi_envs.VLLM_HPU_DSV41_FP8_CONFIG)
             expert_sidecar = FP8Sidecar(gaudi_envs.VLLM_HPU_DSV41_FP8_SIDECAR, self.shard)
             for layer in self.layers:
                 enabled = layer.layer in config["routed_experts"]
                 layer.moe.fp8 = enabled
                 for projection in ("w13", "w2"):
-                    value = expert_sidecar.tensor(f"layers.{layer.layer}.ffn.experts.{projection}_fp8_channel_scale",
-                                                  device) if enabled else None
+                    value = (
+                        expert_sidecar.tensor(
+                            f"layers.{layer.layer}.ffn.experts.{projection}_fp8_channel_scale", device
+                        )
+                        if enabled
+                        else None
+                    )
                     setattr(layer.moe, f"fp8_{projection}_scale", value)
             self.runtime_precision["fp8"] = {
                 "config": config,
@@ -1209,26 +1503,37 @@ class PreparedStage(nn.Module):
                 "route": "MXFP4 -> E4M3 SRAM -> FP8xFP8 MME -> FP32 scale -> BF16",
             }
         self.runtime_precision["selected_mla_mme"] = gaudi_envs.VLLM_HPU_DSV41_MLA_MME
-        self.runtime_precision["router_selection"] = ("FP32 scores / native top6 / smallest-ID ties"
-                                                      if gaudi_envs.VLLM_HPU_DSV41_ROUTER_TOP6 else "torch.topk")
-        self.runtime_precision["router_gate"] = ("BF16xBF16 MME -> FP32 logits"
-                                                 if gaudi_envs.VLLM_HPU_DSV41_BF16_ROUTER_GATE else "FP32 MME")
-        self.runtime_precision["head"] = ("BF16xBF16 MME -> FP32" if self.bf16_head else "FP32 MME")
-        self.runtime_precision["attention_input"] = ("fused wq_a+wkv BF16 MME / one activation quantization" if
-                                                     gaudi_envs.VLLM_HPU_DSV41_QKV_FUSED_INPUT else "separate wq_a/wkv")
-        self.runtime_precision["compressor_input"] = ("fused ratio-2 FP32 wkv+wgate MME"
-                                                      if gaudi_envs.VLLM_HPU_DSV41_COMPRESSOR_FUSED_INPUT else
-                                                      "separate ratio-2 wkv/wgate MME")
-        self.runtime_precision["mla"] = ("shared-KV BF16 QK / FP32 softmax and PV / BF16 output v1"
-                                         if gaudi_envs.VLLM_HPU_DSV41_MLA_MME else "TPC online softmax")
+        self.runtime_precision["router_selection"] = (
+            "FP32 scores / native top6 / smallest-ID ties" if gaudi_envs.VLLM_HPU_DSV41_ROUTER_TOP6 else "torch.topk"
+        )
+        self.runtime_precision["router_gate"] = (
+            "BF16xBF16 MME -> FP32 logits" if gaudi_envs.VLLM_HPU_DSV41_BF16_ROUTER_GATE else "FP32 MME"
+        )
+        self.runtime_precision["head"] = "BF16xBF16 MME -> FP32" if self.bf16_head else "FP32 MME"
+        self.runtime_precision["attention_input"] = (
+            "fused wq_a+wkv BF16 MME / one activation quantization"
+            if gaudi_envs.VLLM_HPU_DSV41_QKV_FUSED_INPUT
+            else "separate wq_a/wkv"
+        )
+        self.runtime_precision["compressor_input"] = (
+            "fused ratio-2 FP32 wkv+wgate MME"
+            if gaudi_envs.VLLM_HPU_DSV41_COMPRESSOR_FUSED_INPUT
+            else "separate ratio-2 wkv/wgate MME"
+        )
+        self.runtime_precision["mla"] = (
+            "shared-KV BF16 QK / FP32 softmax and PV / BF16 output v1"
+            if gaudi_envs.VLLM_HPU_DSV41_MLA_MME
+            else "TPC online softmax"
+        )
         if gaudi_envs.VLLM_HPU_DSV41_MLA_BF16_PV:
             self.runtime_precision["mla"] = "shared BF16 KV / BF16 exp-PV / FP32 denominator and accumulator v1"
         self.runtime_precision["attention_kv_first"] = gaudi_envs.VLLM_HPU_DSV41_ATTN_KV_FIRST
         self.runtime_precision["attention_fused_norm"] = gaudi_envs.VLLM_HPU_DSV41_ATTN_FUSED_NORM
-        self.runtime_precision["attention_kv_norm_rope"] = ("exact C1 compound TPC; batch-generic split path for B2+" if
-                                                            (gaudi_envs.VLLM_HPU_DSV41_ATTN_FUSED_NORM
-                                                             and gaudi_envs.VLLM_HPU_DSV41_NATIVE_ROPE) else
-                                                            "split RMSNorm and RoPE")
+        self.runtime_precision["attention_kv_norm_rope"] = (
+            "exact C1 compound TPC; batch-generic split path for B2+"
+            if (gaudi_envs.VLLM_HPU_DSV41_ATTN_FUSED_NORM and gaudi_envs.VLLM_HPU_DSV41_NATIVE_ROPE)
+            else "split RMSNorm and RoPE"
+        )
         self.runtime_precision["q_scale_rope"] = gaudi_envs.VLLM_HPU_DSV41_Q_SCALE_ROPE
         self.runtime_precision["native_rope"] = {
             "enabled": gaudi_envs.VLLM_HPU_DSV41_NATIVE_ROPE,
@@ -1236,6 +1541,11 @@ class PreparedStage(nn.Module):
             "other_rows": 6,
             "arithmetic": "fp32-multiply-second-term-fma-bf16",
         }
+        self.runtime_precision["local_index_query_layers"] = [
+            layer.layer
+            for layer in self.layers
+            if getattr(getattr(layer, "attention", None), "tp4_local_index_queries", False)
+        ]
         self.runtime_precision["woa_output_roundtrip"] = self.woa_output_roundtrip
         self.runtime_precision["batch_full_index_mme"] = gaudi_envs.VLLM_HPU_DSV41_BATCH_FULL_INDEX_MME
         self.runtime_precision["batch_index_tiled_keys"] = gaudi_envs.VLLM_HPU_DSV41_BATCH_INDEX_TILED_KEYS
@@ -1277,6 +1587,7 @@ class PreparedStage(nn.Module):
 
     def _invalidate_prefill_regions(self):
         from vllm_gaudi.ops.deepseek_v41_prefill_plan import invalidate_prefill_plans
+
         invalidate_prefill_plans()
         clear_prefill_function_regions()
         for layer in self.layers:
@@ -1290,12 +1601,18 @@ class PreparedStage(nn.Module):
         # migrating buffers. A live plan cannot retain addresses from this tree.
         if getattr(self, "replay_owner", None) is not None:
             self.replay_owner.close()
+        invalidate_index_mirror = getattr(self.shared, "invalidate_index_mirror", None)
+        if invalidate_index_mirror is not None:
+            invalidate_index_mirror()
         self._invalidate_prefill_regions()
         for layer in self.layers:
             attention = getattr(layer, "attention", None)
             if attention is not None:
                 attention.invalidate_qkv_input_weight()
                 attention.invalidate_compressor_input_weight()
+                invalidate_queries = getattr(attention, "invalidate_tp4_index_query_weights", None)
+                if invalidate_queries is not None:
+                    invalidate_queries()
             moe = getattr(layer, "moe", None)
             if moe is not None:
                 moe.release_shared_gate_up_weight()
@@ -1314,14 +1631,25 @@ class PreparedStage(nn.Module):
     def _forward_impl(self, residual, pre_mix, positions, input_ids, engram_rows):
         if isinstance(residual, PrefillInput):
             residual, pre_mix = residual.take()
-        retire = (torch.hpu.Event() if getattr(self, "tensor_parallel_size", 2) == 4 and residual.device.type == "hpu"
-                  and residual.shape[0] > 8192 else None)
-        from vllm_gaudi.ops.deepseek_v41_prefill_sequence_state import (can_sequence_prefill_state, gather_tokens,
-                                                                        retire_prefill_layer, token_owner)
+        retire = (
+            torch.hpu.Event()
+            if getattr(self, "tensor_parallel_size", 2) == 4
+            and residual.device.type == "hpu"
+            and residual.shape[0] > 8192
+            else None
+        )
+        from vllm_gaudi.ops.deepseek_v41_prefill_sequence_state import (
+            can_sequence_prefill_state,
+            gather_tokens,
+            retire_prefill_layer,
+            token_owner,
+        )
+
         sequence_state = can_sequence_prefill_state(self, positions.numel())
         layer_options = {"prefill_sequence": True} if sequence_state else {}
         if sequence_state:
             from vllm.distributed import get_tp_group
+
             group = get_tp_group()
             owned = token_owner(positions.numel(), group.rank_in_group)
             residual, pre_mix = residual[owned].clone(), pre_mix[owned].clone()
@@ -1342,8 +1670,9 @@ class PreparedStage(nn.Module):
             pre_mix = gather_tokens(pre_mix.contiguous(), group=group.device_group)
         if not self.is_last_stage:
             return residual, pre_mix, None
-        value = final_collapse_rms_norm(residual, pre_mix, self.weights.norm.weight,
-                                        self.config["text_config"]["rms_norm_eps"])
+        value = final_collapse_rms_norm(
+            residual, pre_mix, self.weights.norm.weight, self.config["text_config"]["rms_norm_eps"]
+        )
         return value, pre_mix, torch.cat(target_states, -1) if target_states else None
 
     def _forward_prefill_halo(self, residual, pre_mix, positions, input_ids, mode, engram_rows=()):
@@ -1357,8 +1686,9 @@ class PreparedStage(nn.Module):
         The scheduler selects this only for the qualified text-prompt geometry.
         """
         tp4 = getattr(self, "tensor_parallel_size", 2) == 4
-        supported = ((tp4 and self.pp_rank == 0 and self.start in (0, 20))
-                     or (not tp4 and self.pp_rank == 1 and self.start == 20))
+        supported = (tp4 and self.pp_rank == 0 and self.start in (0, 20)) or (
+            not tp4 and self.pp_rank == 1 and self.start == 20
+        )
         if not supported or self.dspark or self.stop != 40 or len(self.layers) != 40 - self.start:
             raise RuntimeError("Decoder prefill halo requires complete layers through source20 and decoder39")
         if mode not in ("prefix_only", "final"):
@@ -1366,13 +1696,19 @@ class PreparedStage(nn.Module):
         if isinstance(residual, PrefillInput):
             residual, pre_mix = residual.take()
         retire = torch.hpu.Event() if tp4 and residual.device.type == "hpu" and positions.numel() > 8192 else None
-        from vllm_gaudi.ops.deepseek_v41_prefill_sequence_state import (can_sequence_prefill_state, gather_tokens,
-                                                                        replicate_owned_tail, retire_prefill_layer,
-                                                                        token_owner)
+        from vllm_gaudi.ops.deepseek_v41_prefill_sequence_state import (
+            can_sequence_prefill_state,
+            gather_tokens,
+            replicate_owned_tail,
+            retire_prefill_layer,
+            token_owner,
+        )
+
         sequence_state = can_sequence_prefill_state(self, positions.numel())
         layer_options = {"prefill_sequence": True} if sequence_state else {}
         if sequence_state:
             from vllm.distributed import get_tp_group
+
             group = get_tp_group()
             owned = token_owner(positions.numel(), group.rank_in_group)
             residual, pre_mix = residual[owned].clone(), pre_mix[owned].clone()
@@ -1382,7 +1718,7 @@ class PreparedStage(nn.Module):
             workspace.begin(self.shared.prefill_kv_generation)
         image_mask = (input_ids == 129264) | (input_ids == 129265)
         source_index = 20 - self.start
-        for layer in self.layers[:source_index + 1]:
+        for layer in self.layers[: source_index + 1]:
             layer_id = getattr(layer, "layer", -1)
             if layer_id in (1, 14):
                 rows = engram_rows[0 if layer_id == 1 else 1] if engram_rows else None
@@ -1396,11 +1732,15 @@ class PreparedStage(nn.Module):
             # The runner neither samples nor requests logits for this prompt
             # chunk. Return a defined tensor for its existing stage contract.
             if sequence_state:
-                return (gather_tokens(residual[:, 0, :].contiguous(), group=group.device_group),
-                        gather_tokens(pre_mix.contiguous(), group=group.device_group), None)
+                return (
+                    gather_tokens(residual[:, 0, :].contiguous(), group=group.device_group),
+                    gather_tokens(pre_mix.contiguous(), group=group.device_group),
+                    None,
+                )
             return residual[:, 0, :].contiguous(), pre_mix, None
 
         from vllm_gaudi.ops.deepseek_v41_decoder_halo import decoder_halo_rows
+
         retained = decoder_halo_rows(len(self.layers) - source_index - 1)
         cut = max(0, positions.numel() - retained)
         if cut:
@@ -1409,11 +1749,11 @@ class PreparedStage(nn.Module):
                 raise RuntimeError("Decoder halo has no complete layer-20 candidate rows")
             # Layer 20 published [0,T) in transaction-local row order. The
             # Reindex consumer takes its own [0,retained) row interval.
-            pool[:retained].copy_(pool[cut:cut + retained].clone())
+            pool[:retained].copy_(pool[cut : cut + retained].clone())
             selection = self.shared.topk["20"].indices
             if selection.shape[0] < positions.numel():
                 raise RuntimeError("Decoder halo has no complete layer-20 selection rows")
-            selection[:retained].copy_(selection[cut:cut + retained].clone())
+            selection[:retained].copy_(selection[cut : cut + retained].clone())
             if sequence_state:
                 residual = replicate_owned_tail(residual, retained, group=group.device_group)
                 pre_mix = replicate_owned_tail(pre_mix, retained, group=group.device_group)
@@ -1423,19 +1763,18 @@ class PreparedStage(nn.Module):
         elif sequence_state:
             residual = gather_tokens(residual, group=group.device_group)
             pre_mix = gather_tokens(pre_mix.contiguous(), group=group.device_group)
-        for layer in self.layers[source_index + 1:]:
+        for layer in self.layers[source_index + 1 :]:
             if tp4 and cut:
-                residual, pre_mix, target = layer(residual,
-                                                  pre_mix,
-                                                  positions,
-                                                  image_mask,
-                                                  prefill_router_tokens=cut + retained)
+                residual, pre_mix, target = layer(
+                    residual, pre_mix, positions, image_mask, prefill_router_tokens=cut + retained
+                )
             else:
                 residual, pre_mix, target = layer(residual, pre_mix, positions, image_mask)
             if target is not None:
                 raise RuntimeError("Decoder halo cannot suppress DSpark target-state rows")
-        value = final_collapse_rms_norm(residual, pre_mix, self.weights.norm.weight,
-                                        self.config["text_config"]["rms_norm_eps"])
+        value = final_collapse_rms_norm(
+            residual, pre_mix, self.weights.norm.weight, self.config["text_config"]["rms_norm_eps"]
+        )
         if cut:
             # The vLLM sampler still indexes the last row of the original
             # scheduler transaction. Prefix rows are deliberately invalid.
@@ -1458,21 +1797,30 @@ class PreparedStage(nn.Module):
         normal prefill ordering and does not turn the request into C1/C6.
         """
         if isinstance(residual, PrefillInput):
-            if self.tensor_parallel_size != 4 or not (gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED
-                                                      or gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4):
+            if self.tensor_parallel_size != 4 or not (
+                gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED or gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4
+            ):
                 raise RuntimeError("Owned prefill requires the full-chunk TP4 expert path")
-            if (gaudi_envs.VLLM_HPU_DSV41_PREFILL_DECODER_HALO and positions.numel() > 6
-                    and self.prefill_halo_mode != "full"):
-                return self._forward_prefill_halo(residual, None, positions, input_ids, self.prefill_halo_mode,
-                                                  engram_rows)
+            if (
+                gaudi_envs.VLLM_HPU_DSV41_PREFILL_DECODER_HALO
+                and positions.numel() > 6
+                and self.prefill_halo_mode != "full"
+            ):
+                return self._forward_prefill_halo(
+                    residual, None, positions, input_ids, self.prefill_halo_mode, engram_rows
+                )
             return self._forward_impl(residual, None, positions, input_ids, engram_rows)
         tile = PreparedMoE.N256_PREFILL_TILE
         tokens = residual.shape[0]
-        if (gaudi_envs.VLLM_HPU_DSV41_PREFILL_DECODER_HALO
-                and (self.pp_rank == 1 or getattr(self, "tensor_parallel_size", 2) == 4) and tokens > 6
-                and self.prefill_halo_mode != "full"):
-            return self._forward_prefill_halo(residual, pre_mix, positions, input_ids, self.prefill_halo_mode,
-                                              engram_rows)
+        if (
+            gaudi_envs.VLLM_HPU_DSV41_PREFILL_DECODER_HALO
+            and (self.pp_rank == 1 or getattr(self, "tensor_parallel_size", 2) == 4)
+            and tokens > 6
+            and self.prefill_halo_mode != "full"
+        ):
+            return self._forward_prefill_halo(
+                residual, pre_mix, positions, input_ids, self.prefill_halo_mode, engram_rows
+            )
         if tokens > 6 and (gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED or gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4):
             # Both implementations bound expert workspace internally and
             # reuse each weight over this complete scheduler transaction.
@@ -1489,7 +1837,7 @@ class PreparedStage(nn.Module):
         full_value = full_pre = full_target = None
         for start in range(0, tokens, tile):
             stop = min(start + tile, tokens)
-            rows = (tuple(row[start:stop] for row in engram_rows) if engram_rows else engram_rows)
+            rows = tuple(row[start:stop] for row in engram_rows) if engram_rows else engram_rows
             value, local_pre, target = self._forward_impl(
                 residual[start:stop],
                 pre_mix[start:stop],
@@ -1519,8 +1867,9 @@ class PreparedStage(nn.Module):
 
     def _head_projection(self, hidden):
         if self.bf16_head:
-            return torch.ops.custom_op.custom_deepseek_v41_bf16_linear_f32_gaudi2(hidden.contiguous(),
-                                                                                  self.weights.head.weight)
+            return torch.ops.custom_op.custom_deepseek_v41_bf16_linear_f32_gaudi2(
+                hidden.contiguous(), self.weights.head.weight
+            )
         return F.linear(hidden.float(), self.weights.head.weight)
 
     def logits(self, hidden):
@@ -1534,6 +1883,7 @@ class PreparedStage(nn.Module):
             local_greedy_candidate,
             select_greedy_candidate,
         )
+
         maximum = 64 if gaudi_envs.VLLM_HPU_DSV41_BATCH_DECODE else 1
         if not self.is_last_stage or not 1 <= hidden.shape[0] <= maximum:
             raise ValueError("Ordinary greedy head exceeds the configured final-stage request batch")
@@ -1581,29 +1931,66 @@ class PreparedLayerGroup(nn.Module):
             values = F.embedding(local.masked_fill(~valid, 0), self.embedding.weight)
             values = self.reduce(values.masked_fill(~valid.unsqueeze(-1), 0))
             residual = values.unsqueeze(1).expand(-1, 4, -1).contiguous()
-            pre_mix = torch.tensor([1., 0., 0., 0.], device=values.device).expand(values.shape[0], 4)
+            pre_mix = torch.tensor([1.0, 0.0, 0.0, 0.0], device=values.device).expand(values.shape[0], 4)
         if self.pp_wire_input:
             from vllm_gaudi.ops.deepseek_v41_pp_wire import decode_pp_wire
+
             residual, pre_mix = decode_pp_wire(residual)
         image_mask = (input_ids == 129264) | (input_ids == 129265)
         target_states = []
-        for layer in self.layers:
+        # Purely local graph values: no cross-token cache or request state.
+        selected_main = {} if self.preserve_layer_rounding and decode and residual.shape[0] == 1 else None
+        decode_metadata = None
+        if (
+            self.preserve_layer_rounding
+            and decode
+            and any(
+                getattr(getattr(layer, "attention", None), "shared_decode_metadata", False) for layer in self.layers
+            )
+        ):
+            from vllm_gaudi.ops.deepseek_v41_decode_metadata import prepare_decode_metadata
+
+            decode_metadata = prepare_decode_metadata(positions)
+        collapse_handoff = {} if self.preserve_layer_rounding and decode and residual.shape[0] <= 2 else None
+        for index, layer in enumerate(self.layers):
             rows = engram_rows[0 if layer.layer == 1 else 1] if layer.layer in (1, 14) else None
-            residual, pre_mix, target = layer(residual,
-                                              pre_mix,
-                                              positions,
-                                              image_mask,
-                                              rows,
-                                              fp8_decode=fp8_decode,
-                                              decode=decode)
+            collapse_kwargs = {}
+            if collapse_handoff is not None and getattr(layer, "mhc_interlayer_collapse", False):
+                following = self.layers[index + 1] if index + 1 < len(self.layers) else None
+                publish = (
+                    following is not None
+                    and following.layer == layer.layer + 1
+                    and getattr(following, "mhc_interlayer_collapse", False)
+                    and not getattr(layer, "draft", False)
+                    and not getattr(following, "draft", False)
+                    and not hasattr(following.weights, "engram")
+                )
+                collapse_kwargs = {"collapse_handoff": collapse_handoff, "publish_collapse": publish}
+            residual, pre_mix, target = layer(
+                residual,
+                pre_mix,
+                positions,
+                image_mask,
+                rows,
+                fp8_decode=fp8_decode,
+                decode=decode,
+                selected_main=selected_main,
+                decode_metadata=decode_metadata,
+                **collapse_kwargs,
+            )
             if target is not None:
                 target_states.append(target)
             if self.preserve_layer_rounding and decode and layer is not self.layers[-1]:
+                if collapse_handoff is not None and layer.layer + 1 in collapse_handoff:
+                    # The opaque native producer has already materialized
+                    # the exact BF16 boundary, including its collapse.
+                    continue
                 # Preserve the same BF16 residual boundary as separate layer
                 # recipes; cross-layer fusion otherwise changes cached KV.
                 shape = residual.shape
                 residual = torch.ops.custom_op.custom_deepseek_v41_bf16_identity_gaudi2(
-                    residual.reshape(1, -1).contiguous()).reshape(shape)
+                    residual.reshape(1, -1).contiguous()
+                ).reshape(shape)
         if gaudi_envs.VLLM_HPU_DSV41_MHC_GATES_FUSED:
             # The last layer's pre gate is a narrow view into one packed
             # kernel output. Materialize it at the recipe boundary because
@@ -1611,6 +1998,7 @@ class PreparedLayerGroup(nn.Module):
             pre_mix = pre_mix.clone()
         if self.wire_output:
             from vllm_gaudi.ops.deepseek_v41_pp_wire import encode_pp_wire
+
             return encode_pp_wire(residual, pre_mix), None, None
         if not self.final:
             return residual, pre_mix, None
@@ -1623,13 +2011,9 @@ class PreparedLayerGroup(nn.Module):
         # transactions must use the normal paged prefill attention path even
         # when they enter through the native stage wrapper.
         decode = self.decode and residual.shape[0] <= 6
-        return self._forward(residual,
-                             pre_mix,
-                             positions,
-                             input_ids,
-                             engram_rows,
-                             fp8_decode=self.fp8_decode,
-                             decode=decode)
+        return self._forward(
+            residual, pre_mix, positions, input_ids, engram_rows, fp8_decode=self.fp8_decode, decode=decode
+        )
 
     def native_forward(self, residual, pre_mix, positions, input_ids, engram_rows):
         if self.native_input is not None:
@@ -1640,38 +2024,49 @@ class PreparedLayerGroup(nn.Module):
 _compile_entry_ids = count()
 
 
-def _compile_group(group, *, native, backend="hpu_backend"):
+def _compile_group(group, *, native, backend="hpu_backend", tp4_owner=None):
+    if tp4_owner is not None:
+        if native:
+            raise ValueError("Prepared TP4 export does not use the TP2 native peer path")
+        from vllm_gaudi.compilation.deepseek_v41_prepared import PreparedTP4Group
+
+        return PreparedTP4Group(group, tp4_owner, backend)
     # Dynamo caches variants by code object. Each static layer group/bucket
     # owns its entry so legitimate preparations cannot exhaust another group.
     method = group.native_forward if native else group.forward
     function = method.__func__
     name = f"{function.__name__}_v41_{next(_compile_entry_ids)}"
-    entry = FunctionType(function.__code__.replace(co_name=name), function.__globals__, name, function.__defaults__,
-                         function.__closure__)
+    entry = FunctionType(
+        function.__code__.replace(co_name=name), function.__globals__, name, function.__defaults__, function.__closure__
+    )
     entry.__kwdefaults__ = function.__kwdefaults__
     entry.__module__ = function.__module__
     return torch.compile(MethodType(entry, group), backend=backend, fullgraph=True, dynamic=False)
 
 
 class CompiledStage:
-
-    def __init__(self,
-                 stage,
-                 *,
-                 native=False,
-                 pp_wire_input=False,
-                 fused_text_io=False,
-                 native_input=False,
-                 group_size=4):
+    def __init__(
+        self,
+        stage,
+        *,
+        native=False,
+        pp_wire_input=False,
+        fused_text_io=False,
+        native_input=False,
+        group_size=4,
+        prepared_tp4=False,
+        native_tp4=False,
+    ):
         legacy_fp8 = getattr(stage, "fp8_decode", False) and not getattr(stage, "expert_n256", False)
         if native_input and (not native or stage.pp_rank != 0 or stage.dspark or legacy_fp8):
             raise ValueError("Native input capture requires ordinary BF16 PP0 decode")
         if native_input and (pp_wire_input or fused_text_io):
             raise ValueError("Native input capture has a single PP0 input owner")
         backend = "hpu_backend"
-        if getattr(stage, "tensor_parallel_size", 2) == 4:
+        if not native and getattr(stage, "tensor_parallel_size", 2) == 4:
             from vllm_gaudi.compilation.deepseek_v41_tp4 import make_backend
-            backend = make_backend()
+
+            backend = make_backend(native_group_owner=stage if prepared_tp4 and native_tp4 else None)
         # Keep the scheduler transaction large (normal vLLM chunked prefill),
         # but remember whether this stage owns compiled entries.  Very large
         # M inputs are dispatched through the eager group method below so
@@ -1683,25 +2078,88 @@ class CompiledStage:
             if stage.dspark or (stage.fp8_decode and not stage.expert_n256):
                 raise ValueError("TP/mHC overlap requires BF16 boundaries and a qualified C1 expert layout")
             from vllm_gaudi.compilation.deepseek_v41_overlap import make_backend
+
             backend = make_backend()
         if group_size < 1 or len(stage.layers) % group_size:
             raise ValueError(f"Invalid V4.1 compiled layer group size {group_size} for {len(stage.layers)} layers")
         self.groups = tuple(
-            PreparedLayerGroup(stage,
-                               start,
-                               start + group_size,
-                               pp_wire_input=pp_wire_input,
-                               fused_text_io=fused_text_io,
-                               fp8_decode=getattr(stage, "fp8_decode", False),
-                               decode=native or getattr(stage, "tensor_parallel_size", 2) == 4)
-            for start in range(0, len(stage.layers), group_size))
+            PreparedLayerGroup(
+                stage,
+                start,
+                start + group_size,
+                pp_wire_input=pp_wire_input,
+                fused_text_io=fused_text_io,
+                fp8_decode=getattr(stage, "fp8_decode", False),
+                decode=native or getattr(stage, "tensor_parallel_size", 2) == 4,
+            )
+            for start in range(0, len(stage.layers), group_size)
+        )
         if native_input:
             self.groups[0].native_input = PreparedInput(stage.weights.embed, stage.tp_rank, stage.reduce)
-        self.chunks = tuple(_compile_group(group, native=native, backend=backend) for group in self.groups)
+        tp4_owner = stage if not native and prepared_tp4 and getattr(stage, "tensor_parallel_size", 2) == 4 else None
+        compile_options = {"native": native, "backend": backend}
+        if tp4_owner is not None:
+            compile_options["tp4_owner"] = tp4_owner
+        self.chunks = tuple(_compile_group(group, **compile_options) for group in self.groups)
+        self.owner = stage
+        self.prefix_groups = (
+            next(
+                (index for index, group in enumerate(self.groups) if any(layer.layer == 14 for layer in group.layers)),
+                0,
+            )
+            if getattr(stage, "tensor_parallel_size", 2) == 4
+            else 0
+        )
+        self.prefix_generation = None
+
+    def prefix_ready(self, search_length):
+        return self.prefix_groups > 0 and self.prefix_generation == self._prefix_key(search_length)
+
+    def _prefix_key(self, search_length):
+        from vllm_gaudi.ops.deepseek_v41_index_mirror import index_mirror_execution_mode
+
+        return (
+            self.owner.generation,
+            getattr(self.owner, "precision_fingerprint", None),
+            search_length,
+            getattr(self.owner, "decode_token_bound", None),
+            index_mirror_execution_mode(self.owner, search_length),
+        )
+
+    def prefix(self, hidden, pre_mix, positions, input_ids, engram):
+        if not self.prefix_ready(self.owner.search_length) or hidden.shape[0] != 1:
+            raise RuntimeError("TP4 prefix requires a prepared C1 generation and search geometry")
+        hidden, pre_mix, _ = self._run_group_range(0, self.prefix_groups, hidden, pre_mix, positions, input_ids, engram)
+        return hidden, pre_mix
+
+    def suffix(self, hidden, pre_mix, positions, input_ids, engram):
+        if not self.prefix_ready(self.owner.search_length):
+            raise RuntimeError("TP4 prefix generation changed before its consumer")
+        hidden, pre_mix, aux = self._run_group_range(
+            self.prefix_groups, len(self.chunks), hidden, pre_mix, positions, input_ids, engram
+        )
+        self.audit["calls"] += 1
+        self.audit["tokens"] += 1
+        self.audit["groups"] += len(self.chunks)
+        return hidden, pre_mix, aux
+
+    def _run_group_range(self, start, stop, hidden, pre_mix, positions, input_ids, engram):
+        from vllm_gaudi.ops.deepseek_v41_native_trace import annotations_enabled, scope
+
+        for index in range(start, stop):
+            group, chunk = self.groups[index], self.chunks[index]
+            if annotations_enabled():
+                first, last = group.layers[0].layer, group.layers[-1].layer
+                with scope(f"v41::compiled::layers{first}-{last}::C{hidden.shape[0]}"):
+                    hidden, pre_mix, aux = chunk(hidden, pre_mix, positions, input_ids, engram)
+            else:
+                hidden, pre_mix, aux = chunk(hidden, pre_mix, positions, input_ids, engram)
+        return hidden, pre_mix, aux
 
     def __call__(self, hidden, pre_mix, positions, input_ids, engram):
-        stock_prefill = (hidden.shape[0] > 6
-                         and (gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4 or gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED))
+        stock_prefill = hidden.shape[0] > 6 and (
+            gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4 or gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED
+        )
         large_prefill = hidden.shape[0] > PreparedMoE.N256_PREFILL_TILE
         if stock_prefill:
             # Preserve the complete scheduler chunk through the stage. TP4
@@ -1732,18 +2190,18 @@ class CompiledStage:
                 tile_pre = pre_mix[start:stop]
                 tile_positions = positions[start:stop]
                 tile_ids = input_ids[start:stop]
-                tile_engram = (tuple(row[start:stop] for row in engram) if engram else engram)
+                tile_engram = tuple(row[start:stop] for row in engram) if engram else engram
                 aux = None
                 for group in self.groups:
                     method = group.native_forward if self.native else group.forward
                     tile_hidden, tile_pre, aux = method(tile_hidden, tile_pre, tile_positions, tile_ids, tile_engram)
                 if full_hidden is None:
-                    full_hidden = torch.empty((token_count, *tile_hidden.shape[1:]),
-                                              dtype=tile_hidden.dtype,
-                                              device=tile_hidden.device)
-                    full_pre = torch.empty((token_count, *tile_pre.shape[1:]),
-                                           dtype=tile_pre.dtype,
-                                           device=tile_pre.device)
+                    full_hidden = torch.empty(
+                        (token_count, *tile_hidden.shape[1:]), dtype=tile_hidden.dtype, device=tile_hidden.device
+                    )
+                    full_pre = torch.empty(
+                        (token_count, *tile_pre.shape[1:]), dtype=tile_pre.dtype, device=tile_pre.device
+                    )
                     if aux is not None:
                         full_aux = torch.empty((token_count, *aux.shape[1:]), dtype=aux.dtype, device=aux.device)
                 full_hidden[start:stop].copy_(tile_hidden)
@@ -1764,6 +2222,7 @@ class CompiledStage:
         self.audit["tokens"] += hidden.shape[0]
         self.audit["groups"] += len(self.chunks)
         from vllm_gaudi.ops.deepseek_v41_native_trace import annotations_enabled, scope
+
         if annotations_enabled():
             for group, chunk in zip(self.groups, self.chunks, strict=True):
                 first, last = group.layers[0].layer, group.layers[-1].layer
@@ -1772,6 +2231,14 @@ class CompiledStage:
         else:
             for chunk in self.chunks:
                 hidden, pre_mix, aux = chunk(hidden, pre_mix, positions, input_ids, engram)
+        if (
+            input_ids.numel() == 1
+            and input_ids.dtype == torch.int32
+            and len(engram) == 2
+            and engram[0].dtype == torch.bfloat16
+            and getattr(self.owner, "tensor_parallel_size", 2) == 4
+        ):
+            self.prefix_generation = self._prefix_key(self.owner.search_length)
         return hidden, pre_mix, aux
 
 
@@ -1795,8 +2262,18 @@ class PreparedDraft(nn.Module):
         for index in range(3):
             normal = stage.shard.manifest["normal_scales"][f"mtp.{index}.ffn.experts"][self.tp_rank]
             self.layers.append(
-                PreparedDecoderLayer(self.weights.get_submodule(str(index)), config, index + 40, stage.shared, normal,
-                                     lookup, self.reduce, self.all_gather, device))
+                PreparedDecoderLayer(
+                    self.weights.get_submodule(str(index)),
+                    config,
+                    index + 40,
+                    stage.shared,
+                    normal,
+                    lookup,
+                    self.reduce,
+                    self.all_gather,
+                    device,
+                )
+            )
         self.register_buffer("offsets", torch.arange(5, device=device, dtype=torch.int32), False)
 
     def _embed(self, token_ids, embedding):
@@ -1851,6 +2328,7 @@ class PreparedDraft(nn.Module):
         FP32 and this path must also work before native replay is enabled.
         """
         from vllm_gaudi.ops.deepseek_v41_verify import vocab_parallel_argmax
+
         return vocab_parallel_argmax(local_logits, self.tp_rank, self.all_gather)
 
     def sample_greedy(self, first_token, hidden, logits):
@@ -1872,9 +2350,9 @@ class PreparedDraft(nn.Module):
                 # Keep the compatibility path bit-for-bit equivalent: its
                 # caller owns full-vocabulary base logits.
                 bias = self.all_gather(bias, dim=-1)
-            scores_logits = logits[index:index + 1] + bias
-            previous = (self._global_argmax(scores_logits) if local else scores_logits.argmax(dim=-1))
-            confidence_input = torch.cat((hidden[index:index + 1], markov), dim=-1).float()
+            scores_logits = logits[index : index + 1] + bias
+            previous = self._global_argmax(scores_logits) if local else scores_logits.argmax(dim=-1)
+            confidence_input = torch.cat((hidden[index : index + 1], markov), dim=-1).float()
             scores.append(linear(confidence_input, last.confidence_head.proj).reshape(1))
             token_ids.append(previous)
         return torch.cat(token_ids), torch.cat(scores)
@@ -1892,20 +2370,34 @@ class PreparedDraft(nn.Module):
             pack_record,
             verify_control_from_target,
         )
+
         target = self._global_argmax(F.linear(target_hidden.float(), self.output_head.weight))
         target, output, committed, output_count, anchor, draft_enabled, status = verify_control_from_target(
-            target, proposed_ids, metadata)
+            target, proposed_ids, metadata
+        )
         self.insert_context(target_states, target_positions, committed)
         placeholder = torch.full_like(proposed_ids, -1)
-        commit_record = pack_record(metadata, committed, output_count, output, placeholder,
-                                    torch.zeros_like(draft_enabled), status)
-        return (target, output, committed, output_count, anchor, draft_enabled, status, commit_record,
-                encode_record_wire(commit_record))
+        commit_record = pack_record(
+            metadata, committed, output_count, output, placeholder, torch.zeros_like(draft_enabled), status
+        )
+        return (
+            target,
+            output,
+            committed,
+            output_count,
+            anchor,
+            draft_enabled,
+            status,
+            commit_record,
+            encode_record_wire(commit_record),
+        )
 
-    def draft_from_prefix(self, metadata, target_positions, output, committed, output_count, anchor, draft_enabled,
-                          status):
+    def draft_from_prefix(
+        self, metadata, target_positions, output, committed, output_count, anchor, draft_enabled, status
+    ):
         """Run draft layers after the prefix commit has been enqueued."""
         from vllm_gaudi.ops.deepseek_v41_verify import encode_record_wire, pack_record
+
         next_position = target_positions[0].to(torch.int32) + committed.to(torch.int32)
         draft_positions = next_position + self.offsets
         hidden, logits = self.forward_local(anchor.reshape(1), draft_positions)
@@ -1926,12 +2418,14 @@ class PreparedDraft(nn.Module):
             pack_record,
             verify_control_from_target,
         )
+
         # Keep the head projection and its reduction in the control graph.
         # Copying [C6, hidden] is sufficient; a full target logits tensor never
         # leaves this compiled entry.
         target = self._global_argmax(F.linear(target_hidden.float(), self.output_head.weight))
         target, output, committed, output_count, anchor, draft_enabled, status = verify_control_from_target(
-            target, proposed_ids, metadata)
+            target, proposed_ids, metadata
+        )
         self.insert_context(target_states, target_positions, committed)
         next_position = target_positions[0].to(torch.int32) + committed.to(torch.int32)
         draft_positions = next_position + self.offsets
