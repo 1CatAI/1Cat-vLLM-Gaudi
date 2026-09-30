@@ -494,7 +494,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         # Both selection variants are retained for diagnosis, not enabled:
         # carried-ID sorting regressed; score-only batching has no resolved gain.
         self.decode_batched_selection = False
-        self.decode_swa_packed = False
+        self.decode_swa_packed = not self.ratio
         if self.ratio:
             kv_source = max(source for source in config["kv_source_layer_ids"] if source <= layer)
             self.kv_source = kv_source

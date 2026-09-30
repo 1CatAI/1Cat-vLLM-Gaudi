@@ -156,6 +156,15 @@ def make_attention_norm_stage(stage):
     return result
 
 
+def make_handoff_stage(stage):
+    result = make_attention_norm_stage(stage)
+    for block in result.layers:
+        block.decode_engram_update = True
+        block.mhc_interlayer_collapse = True
+        block.mhc_interlayer_bf16 = True
+    return result
+
+
 def device_load():
     result = subprocess.run(['hl-smi', '-Q', 'module_id,utilization.aip,memory.used', '--format=csv,noheader'],
                             capture_output=True, text=True, check=True)
@@ -218,10 +227,11 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
     def arm(name):
         if name not in arms:
             if name in ('dense_fp8', 'dense_fp8_tail', 'dense_fp8_static_int32',
-                        'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant', *COMPILER_CANDIDATES):
+                        'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff', *COMPILER_CANDIDATES):
                 if 'dense_fp8' not in stages:
                     stages['dense_fp8'] = make_dense_stage(stage, shard, args.ab_dense_sidecar, args.ab_dense_config)
-                program = (make_attention_norm_stage(stages['dense_fp8']) if name == 'dense_fp8_swa_norm_quant'
+                program = (make_handoff_stage(stages['dense_fp8']) if name == 'dense_fp8_swa_norm_handoff'
+                           else make_attention_norm_stage(stages['dense_fp8']) if name == 'dense_fp8_swa_norm_quant'
                            else make_swa_stage(stages['dense_fp8']) if name == 'dense_fp8_swa_packed'
                            else clone_module(stages['dense_fp8']))
             elif name == 'tail':
@@ -246,7 +256,7 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
     if rank == 0:
         ready = dict(pid=os.getpid(), source=os.environ['DSV41_RUN_EVIDENCE'],
                      candidates=['dense_fp8', 'tail', 'dense_fp8_tail', 'dense_fp8_static_int32',
-                                 'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant', *COMPILER_CANDIDATES])
+                                 'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff', *COMPILER_CANDIDATES])
         (control / 'ready.json').write_text(json.dumps(ready, indent=2)+'\n')
     print(f'TP{rank}: real16 fixture resident; control {control}', flush=True)
     try:
@@ -324,13 +334,23 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                               - min(p['summary']['median_ms'] for p in periods if p['arm']=='A'),
                               formal_quality_pending=True, periods_file='periods.json')
                 result['cold_compiler_settings'] = COMPILER_CANDIDATES.get(name, {})
+                result['within_arm_feedback_stable'] = all(
+                    all(p['ranks'][0]['tokens'] == next(q for q in periods if q['arm'] == label)['ranks'][0]['tokens']
+                        for p in periods if p['arm'] == label) for label in ('A', 'B'))
+                if not result['within_arm_feedback_stable']:
+                    result['comparison']['effective'] = False
+                    result['status'] = 'unstable_feedback'
+                if name in ('dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff'):
+                    result['cross_arm_feedback_exact'] = all(
+                        p['ranks'][0]['tokens'] == periods[0]['ranks'][0]['tokens'] for p in periods)
+                    result['numerical_reference_pending'] = True
+                    result['gain_ledger_eligible'] = False
                 if name in COMPILER_CANDIDATES:
                     # Runtime compiler settings are absent from Bridge's recipe
                     # cache key. A/B timing alone cannot establish distinct arms.
                     result['status'] = 'compiler_cache_isolation_unverified'
                     result['comparison']['effective'] = False
-                if name in (*COMPILER_CANDIDATES, 'dense_fp8_static_int32', 'dense_fp8_swa_packed',
-                            'dense_fp8_swa_norm_quant') \
+                if name in (*COMPILER_CANDIDATES, 'dense_fp8_static_int32', 'dense_fp8_swa_packed') \
                         and reference_name in ('dense_fp8', 'dense_fp8_swa_packed'):
                     result['compiler_token_exact'] = all(p['ranks'][0]['tokens'] == periods[0]['ranks'][0]['tokens']
                                                          for p in periods)
@@ -354,8 +374,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--control-dir', type=Path, required=True)
     parser.add_argument('--candidate', choices=('dense_fp8', 'tail', 'dense_fp8_tail',
-                                              'dense_fp8_static_int32', 'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant', *COMPILER_CANDIDATES))
-    parser.add_argument('--baseline', choices=('baseline', 'dense_fp8', 'dense_fp8_swa_packed'), default='baseline')
+                                              'dense_fp8_static_int32', 'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff', *COMPILER_CANDIDATES))
+    parser.add_argument('--baseline', choices=('baseline', 'dense_fp8', 'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant'), default='baseline')
     parser.add_argument('--steps', type=int, default=200)
     parser.add_argument('--stop', action='store_true')
     args = parser.parse_args()

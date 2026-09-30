@@ -234,6 +234,13 @@ def main():
                 normal = shard.manifest['normal_scales'][f'layers.{layer}.ffn.experts'][rank]
                 block = PreparedDecoderLayer(tree.layers.get_submodule(str(layer)), text, layer, stage.shared,
                                              normal, lookup, reduce, gather, 'hpu', tensor_parallel_size=4)
+                if args.resident_ab:
+                    # Keep the archived formal parent explicit after production
+                    # defaults advance; each candidate owns separate dispatch.
+                    block.decode_attention_norm_quant = False
+                    block.decode_engram_update = False
+                    block.mhc_interlayer_collapse = False
+                    block.attention.decode_swa_packed = False
                 block.moe.prepare_shared_gate_up_weight()
                 block.prepare_mhc_control_weights()
                 block.attention.prefill_tp_rank = rank

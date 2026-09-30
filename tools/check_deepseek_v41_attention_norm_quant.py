@@ -2,6 +2,7 @@
 """Screen shared attention norm + exact dense quantization through an FP8 MME consumer."""
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 
@@ -14,16 +15,24 @@ from vllm_gaudi.compilation.deepseek_v41_overlap import make_backend
 from vllm_gaudi.ops.deepseek_v41_math import rms_norm
 
 
-def separate(x, norm, weight, channel):
-    normalized = rms_norm(x, norm, 1e-6)
+def separate(x, norm, weight, channel, epsilon):
+    normalized = rms_norm(x, norm, epsilon)
     quantized, scale = torch.ops.custom_op.custom_deepseek_v41_dense_quant_gaudi2(normalized)
     product = torch.ops.hpu.fp8_gemm_v2(quantized, False, weight, True, None, torch.bfloat16, scale, channel, None,
                                         False)
     return normalized, quantized, scale, product
 
 
-def fused(x, norm, weight, channel):
-    normalized, quantized, scale = torch.ops.custom_op.custom_deepseek_v41_attention_norm_quant_gaudi2(x, norm, 1e-6)
+def separate_native(x, norm, weight, channel, epsilon):
+    normalized = torch.ops.custom_op.custom_deepseek_v41_attention_norm_bf16_gaudi2(x, norm, epsilon)
+    quantized, scale = torch.ops.custom_op.custom_deepseek_v41_dense_quant_gaudi2(normalized)
+    product = torch.ops.hpu.fp8_gemm_v2(quantized, False, weight, True, None, torch.bfloat16, scale, channel, None,
+                                     False)
+    return normalized, quantized, scale, product
+
+
+def fused(x, norm, weight, channel, epsilon):
+    normalized, quantized, scale = torch.ops.custom_op.custom_deepseek_v41_attention_norm_quant_gaudi2(x, norm, epsilon)
     product = torch.ops.hpu.fp8_gemm_v2(quantized, False, weight, True, None, torch.bfloat16, scale, channel, None,
                                         False)
     return normalized, quantized, scale, product
@@ -42,6 +51,10 @@ def errors(a, b):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--epsilon', type=float, default=1e-20)
+    parser.add_argument('--native-reference', action='store_true',
+                        help='Compare to the existing TP2 native norm plus dense quantization')
+    parser.add_argument('--numerical-only', action='store_true', help='Check consumers without collecting new timings')
     parser.add_argument('--prepared-replay', action='store_true')
     parser.add_argument('--native-replay', action='store_true')
     parser.add_argument('--synchronize-each-interval', action='store_true')
@@ -50,6 +63,8 @@ def main():
                         default=1,
                         help='Queue this many actual prepared compute frames per event interval')
     options = parser.parse_args()
+    if not math.isfinite(options.epsilon) or options.epsilon <= 0:
+        parser.error('--epsilon must be positive and finite')
     if options.repeat < 1 or (options.repeat != 1 and not (options.prepared_replay or options.native_replay)):
         parser.error('Repeats require prepared replay and a positive frame count')
     torch.ops.load_library(os.environ['VLLM_HPU_DSV4_TPC_OP_LIBRARY'])
@@ -103,9 +118,10 @@ def main():
     for count in (1, 2, 6):
         cpu_x = torch.randn(count, 5120).to(torch.bfloat16)
         x = cpu_x.to('hpu')
-        args = (x, norm, weight, channel)
+        args = (x, norm, weight, channel, options.epsilon)
         arms = {}
-        for name, fn in (('separate', separate), ('fused', fused)):
+        reference = separate_native if options.native_reference else separate
+        for name, fn in (('separate', reference), ('fused', fused)):
             directory = root / 'compiler' / f'{name}-c{count}'
             directory.mkdir(parents=True, exist_ok=True)
             compiled = torch.compile(fn, backend=make_backend(), fullgraph=True, dynamic=False)
@@ -143,9 +159,11 @@ def main():
             report['passed'] = (report['outputs']['normalized']['relative_l2'] <= .002
                                 and report['outputs']['MME']['relative_l2'] <= .005
                                 and report['outputs']['scale']['exact'])
+            if options.native_reference:
+                report['passed'] = all(output['exact'] for output in report['outputs'].values())
             cases.append(report)
         x.copy_(cpu_x.to('hpu'))
-        if count == 1:
+        if count == 1 and not options.numerical_only:
             if recorder is not None:
                 plans = {
                     name: recorder.prepare(fn, [x] * options.repeat, [args[1:]] * options.repeat)
@@ -159,6 +177,8 @@ def main():
                 timed = arms, args
     report = dict(status='passed' if all(r['passed'] for r in cases) else 'failed',
                   cases=cases,
+                  epsilon=options.epsilon,
+                  reference='existing_native_norm_and_quant' if options.native_reference else 'generic_rms_norm',
                   scope='BF16 norm -> power-of-two FP8 operand -> actual FP8 MME, C1/C2/C6',
                   formal_quality_pending=True,
                   gain_ledger_eligible=False)
@@ -166,6 +186,13 @@ def main():
     print(json.dumps(report), flush=True)
     if report['status'] != 'passed':
         raise RuntimeError('Attention norm/quant consumer contract failed')
+    if options.numerical_only:
+        if options.native_replay:
+            torch.distributed.destroy_process_group()
+        if options.prepared_replay:
+            prepared.shutdown_prepared_group_plans()
+            dist.destroy_process_group()
+        return
     arms, args = timed
     periods = []
     for label in 'ABABAB':

@@ -50,6 +50,28 @@ int main() {
     assert(custom_count >= 52);
     assert(selected_kv_seen);
     assert(device_engram_seen);
+    for (unsigned rows : {1u, 2u, 6u}) {
+        HabanaKernelParams p{}; HabanaKernelInstantiation out{};
+        Tensor inputs[5]{}, outputs[1]{};
+        TensorAccessPattern ia[5]{}, oa[1]{};
+        p.inputTensors=inputs;p.inputTensorNr=5;p.outputTensors=outputs;p.outputTensorNr=1;
+        out.inputTensorAccessPattern=ia;out.outputTensorAccessPattern=oa;
+        std::strcpy(p.guid.name,"custom_deepseek_v41_engram_update_bf16_gaudi2");
+        float eps=1e-20f;p.nodeParams.nodeParams=&eps;p.nodeParams.nodeParamsSize=sizeof(eps);
+        auto set=[](Tensor& t,TensorDataType type,std::initializer_list<uint64_t> dims) {
+            t.geometry.dataType=type;t.geometry.dims=dims.size();unsigned i=0;
+            for (auto size:dims)t.geometry.maxSizes[i++]=size;
+        };
+        set(inputs[0],DATA_BF16,{5120,4,rows});set(inputs[1],DATA_BF16,{25600,rows});
+        set(inputs[2],DATA_BF16,{5120,4});set(inputs[3],DATA_BF16,{5120,4});
+        set(inputs[4],DATA_I8,{rows});set(outputs[0],DATA_BF16,{5120,4,rows});
+        assert(InstantiateTpcKernel(&p,&out)==GLUE_INSUFFICIENT_ELF_BUFFER);
+        assert(out.indexSpaceGeometry[0]==4 && out.indexSpaceGeometry[1]==rows);
+        float emitted=0;std::memcpy(&emitted,out.kernel.scalarParams,sizeof(emitted));assert(emitted==eps);
+        eps=0;assert(InstantiateTpcKernel(&p,&out)==GLUE_FAILED);eps=1e-20f;
+        inputs[4].geometry.dataType=DATA_I32;
+        assert(InstantiateTpcKernel(&p,&out)==GLUE_INCOMPATIBLE_DATA_TYPE);
+    }
     for (bool publish : {false, true}) for (unsigned rows : {1u, 2u, 6u}) {
         HabanaKernelParams p{};
         HabanaKernelInstantiation q{};

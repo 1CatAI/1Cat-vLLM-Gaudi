@@ -127,3 +127,27 @@ def test_norm_candidate_does_not_enable_the_reference_block():
     assert candidate.layers[0].attention.decode_swa_packed
     assert not stage.layers[0].decode_attention_norm_quant
     assert not stage.layers[0].attention.decode_swa_packed
+
+
+def test_handoff_candidate_keeps_all_reference_dispatch_independent():
+    block = torch.nn.Module()
+    block.attention = torch.nn.Module()
+    block.attention.ratio = 0
+    block.attention.decode_swa_packed = False
+    block.decode_attention_norm_quant = False
+    block.decode_engram_update = False
+    block.mhc_interlayer_collapse = False
+    block.mhc_interlayer_bf16 = False
+    block.register_buffer('residual', torch.zeros(1, 4, 5120))
+    stage = torch.nn.Module()
+    stage.layers = torch.nn.ModuleList([block])
+    candidate = ab.make_handoff_stage(stage)
+    cloned = candidate.layers[0]
+    for name in ('decode_attention_norm_quant', 'decode_engram_update', 'mhc_interlayer_collapse',
+                 'mhc_interlayer_bf16'):
+        assert getattr(cloned, name)
+        assert not getattr(block, name)
+    assert cloned.residual is block.residual
+    assert cloned.attention is not block.attention
+    assert cloned.attention.decode_swa_packed
+    assert not block.attention.decode_swa_packed

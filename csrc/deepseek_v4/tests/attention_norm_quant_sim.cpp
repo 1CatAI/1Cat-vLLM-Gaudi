@@ -57,7 +57,9 @@ uint16_t bf16(float value) {
     return (bits + 0x7fff + ((bits >> 16) & 1)) >> 16;
 }
 int main(int argc, char** argv) {
-    if (argc != 2) throw std::runtime_error("kernel library required");
+    if (argc != 2 && argc != 3) throw std::runtime_error("kernel library and optional epsilon required");
+    const float epsilon = argc == 3 ? std::stof(argv[2]) : 1e-20f;
+    if (!std::isfinite(epsilon) || epsilon <= 0) throw std::runtime_error("positive finite epsilon required");
     auto library = dlopen(argv[1], RTLD_NOW);
     if (!library) throw std::runtime_error(dlerror());
     auto instantiate = reinterpret_cast<Instantiate>(dlsym(library, "InstantiateTpcKernel"));
@@ -75,7 +77,7 @@ int main(int argc, char** argv) {
             const float factor = pattern == 1 ? 0 : pattern == 2 ? .0001f : pattern == 3 ? 1024 : 1;
             for (auto& value : x) value = bf16(normal(random)*factor);
             const auto norm = run(instantiate, "custom_deepseek_v41_attention_norm_bf16_gaudi2",
-                {x_shape, w_shape}, {x_shape}, {x.data(),weight.data(),reference.data()}, {1e-6f});
+                {x_shape, w_shape}, {x_shape}, {x.data(),weight.data(),reference.data()}, {epsilon});
             const auto quant = run(instantiate, "custom_deepseek_v41_dense_quant_gaudi2",
                 {x_shape}, {q_shape,s_shape}, {reference.data(),q_reference.data(),s_reference.data()});
             const bool publish = width == 5120;
@@ -83,10 +85,10 @@ int main(int argc, char** argv) {
                 "custom_deepseek_v41_qnorm_quant_gaudi2", {x_shape,w_shape},
                 publish ? std::vector<Tensor>{q_shape,s_shape,x_shape} : std::vector<Tensor>{q_shape,s_shape},
                 publish ? std::vector<void*>{x.data(),weight.data(),q_candidate.data(),s_candidate.data(),candidate.data()} :
-                std::vector<void*>{x.data(),weight.data(),q_candidate.data(),s_candidate.data()}, {1e-6f,1.f/width});
+                std::vector<void*>{x.data(),weight.data(),q_candidate.data(),s_candidate.data()}, {epsilon,1.f/width});
             const bool exact = (!publish || reference == candidate) && q_reference == q_candidate && s_reference == s_candidate;
             failures += !exact;
-            std::cout << "{\"rows\":" << rows << ",\"width\":" << width << ",\"pattern\":" << pattern << ",\"exact\":" << exact
+            std::cout << "{\"epsilon\":" << epsilon << ",\"rows\":" << rows << ",\"width\":" << width << ",\"pattern\":" << pattern << ",\"exact\":" << exact
                       << ",\"separate_vliw\":" << norm.instructionsExecuted+quant.instructionsExecuted
                       << ",\"fused_vliw\":" << fused.instructionsExecuted << "}\n";
         }

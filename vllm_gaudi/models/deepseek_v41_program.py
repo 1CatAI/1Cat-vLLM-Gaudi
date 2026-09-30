@@ -837,16 +837,20 @@ class PreparedDecoderLayer(nn.Module):
         self.batch_control_reuse = gaudi_envs.VLLM_HPU_DSV41_MHC_BATCH_REUSE
         self.batch_control_prefetch = gaudi_envs.VLLM_HPU_DSV41_MHC_CONTROL_PREFETCH
         self.mhc_control_rrms = gaudi_envs.VLLM_HPU_DSV41_MHC_CONTROL_RRMS
-        self.decode_attention_norm_quant = False
+        self.decode_attention_norm_quant = hasattr(
+            torch.ops.custom_op, "custom_deepseek_v41_attention_norm_quant_gaudi2"
+        )
+        self.decode_engram_update = hasattr(torch.ops.custom_op, "custom_deepseek_v41_engram_update_bf16_gaudi2")
         # Full prompt state already owns token rows. Reuse that ownership for
         # replicated Q/KV inputs on layers without a full hidden-state consumer.
         self.sequence_qkv_input = tensor_parallel_size == 4
         self.mhc_post_collapse = tensor_parallel_size == 4 and hasattr(
             torch.ops.custom_op, "custom_deepseek_v41_mhc_post_collapse_gaudi2"
         )
-        # Retained for diagnosis: the complete TP4 chain regresses with the
-        # inter-layer handoff even when every numerical gate is exact.
-        self.mhc_interlayer_collapse = False
+        # Preserve the BF16 collapse boundary used by the next attention norm.
+        # The older F32 handoff remains available only as an explicit diagnostic.
+        self.mhc_interlayer_collapse = hasattr(torch.ops.custom_op, "custom_deepseek_v41_mhc_post_collapse_gaudi2")
+        self.mhc_interlayer_bf16 = True
         self.register_buffer("hc_attn_fn_packed", None, False)
         self.register_buffer("hc_ffn_fn_packed", None, False)
         if shared.length > 512:
@@ -958,7 +962,10 @@ class PreparedDecoderLayer(nn.Module):
                 local_rows = engram_rows if engram_rows.dtype == torch.bfloat16 else unpack_swa(engram_rows, 256)
                 rows = self.all_gather(local_rows, dim=1)
             kv = linear(rows.flatten(1), w.engram.wkv)
-            update = prefill_engram_update if prefill else engram_update
+            update = (torch.ops.custom_op.custom_deepseek_v41_engram_update_bf16_gaudi2
+                      if getattr(self, "decode_engram_update", False) and decode
+                      and residual.device.type == "hpu" and 1 <= residual.shape[0] <= 6
+                      else prefill_engram_update if prefill else engram_update)
             active_mask = ~image_mask[owned] if prefill_sequence else ~image_mask
             residual = update(residual, kv, w.engram.q_weight, w.engram.k_weight, active_mask, self.eps)
             del kv, rows, local_rows
@@ -1146,8 +1153,11 @@ class PreparedDecoderLayer(nn.Module):
         ):
             # The group only publishes to the immediately following layer,
             # without an intervening Engram update. Both consumers receive
-            # the same BF16 residual and FP32 collapse as separate layer recipes.
-            residual, collapsed = torch.ops.custom_op.custom_deepseek_v41_mhc_post_collapse_f32_gaudi2(
+            # the same BF16 residual and the selected collapse boundary.
+            operation = (torch.ops.custom_op.custom_deepseek_v41_mhc_post_collapse_gaudi2
+                         if getattr(self, "mhc_interlayer_bf16", False)
+                         else torch.ops.custom_op.custom_deepseek_v41_mhc_post_collapse_f32_gaudi2)
+            residual, collapsed = operation(
                 value.contiguous(), residual.contiguous(), post.contiguous(), comb.contiguous(), pre_mix.contiguous()
             )
             collapse_handoff[self.layer + 1] = collapsed

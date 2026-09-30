@@ -31,6 +31,7 @@ foreach(SOURCE IN LISTS KERNEL_SOURCES)
        NAME STREQUAL "deepseek_v41_control_gemv_rrms_bf16_gaudi2" OR
        NAME STREQUAL "deepseek_v41_qnorm_quant_gaudi2" OR
        NAME STREQUAL "deepseek_v41_attention_norm_quant_gaudi2" OR
+       NAME STREQUAL "deepseek_v41_engram_update_bf16_gaudi2" OR
        NAME STREQUAL "deepseek_v41_kv_norm_rope_bf16_gaudi2")
         list(APPEND EXTRA_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/../flashinfer_gaudi/kernels/norm_math_gaudi2.h")
     elseif(NAME STREQUAL "deepseek_v41_mla_shared_kv_gaudi2")

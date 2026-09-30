@@ -29,6 +29,137 @@ def duration(spans):
     return sum(end-start for start, end in spans)
 
 
+def recipe_occurrences(frames, slots):
+    """Join each device recipe start to its ordered stage slot, never its name.
+
+    A cached recipe can occur in several layers/groups. The trace's recipe ID
+    and invocation time choose the occurrence; the stage slot chooses its
+    group. Cold template recipe IDs are deliberately not used as trace IDs.
+    """
+    occurrences = defaultdict(list)
+    for token, frame in enumerate(frames):
+        if len(frame) != len(slots):
+            raise ValueError('Native frame and stage slot count differ')
+        for slot, (entry, (group, node)) in enumerate(zip(frame, slots)):
+            occurrences[entry[1]].append(dict(start_us=entry[0], token=token, slot=slot,
+                                              group=group, stage_node=node['name']))
+    for entries in occurrences.values():
+        entries.sort(key=lambda entry: entry['start_us'])
+        if any(a['start_us'] >= b['start_us'] for a, b in zip(entries, entries[1:])):
+            raise ValueError('Recipe starts are not unique and increasing')
+    return occurrences
+
+
+def packet_occurrence(start, end, entries, starts):
+    index = bisect.bisect_right(starts, start)-1
+    if index < 0:
+        return None
+    if index+1 < len(entries) and end > starts[index+1]:
+        # Do not silently split a hardware execution between two invocations.
+        return None
+    return entries[index]
+
+
+def layer_call_audit(root, output, rank, rows, inventory, frames, slots, windows, peer_points):
+    """Attribute raw lane packets per invocation without prorating averages.
+
+    One observed physical node execution means a serialized compiler node in
+    one recipe occurrence. ROI slices and connected activity bouts are counted
+    separately. Neither lane packets nor active-time sums are kernel counts or
+    additive critical-path latency.
+    """
+    occurrences = recipe_occurrences(frames, slots)
+    starts = {recipe: [entry['start_us'] for entry in entries]
+              for recipe, entries in occurrences.items()}
+    keys = {}
+    for index, row in enumerate(rows):
+        key = row['recipe'], row['engine'], row['source_node']
+        if key in keys:
+            raise ValueError('Ambiguous serialized physical node identity')
+        keys[key] = index
+    node_rows = {index: keys.get((node['recipe'].rstrip(':'), node['engine'], node['node']))
+                 for index, node in enumerate(inventory['nodes'])}
+    spans, packets, ignored = defaultdict(list), Counter(), Counter()
+    window_starts = [start for start, _ in windows]
+    with gzip.open(root / 'hardware.jsonl.gz', 'rt') as stream:
+        for line in stream:
+            stamp, length, lane, node_id, *_ = json.loads(line)
+            index = node_rows.get(node_id)
+            if index is None:
+                continue
+            row = rows[index]
+            if row['engine'] not in ('TPC', 'MME') or row['kernel'] == 'null':
+                continue
+            wi = bisect.bisect_right(window_starts, stamp)-1
+            if wi < 0 or stamp+length > windows[wi][1]:
+                ignored['window_boundary_packets'] += 1
+                continue
+            recipe = row['recipe']
+            if recipe not in occurrences:
+                ignored['outside_native_stage_packets'] += 1
+                continue
+            entry = packet_occurrence(stamp, stamp+length, occurrences[recipe], starts[recipe])
+            if entry is None:
+                ignored['ambiguous_recipe_boundary_packets'] += 1
+                continue
+            key = entry['token'], entry['slot'], index
+            spans[key].append((stamp, stamp+length))
+            packets[key] += 1
+    reductions = sorted(point['producer'] for point in peer_points if point['bytes'] == 10240)
+    if len(reductions) != 81 or reductions[0] != 0:
+        raise ValueError('Expected embedding plus two 5120-BF16 reductions per layer')
+    # A cached compiler name can retain layer0 even when bound to layer2.
+    # Preserve it as a source candidate; attach the runtime reduction context
+    # separately. This context does not prove ownership of cross-layer fusions.
+    output_producers = reductions[1:]
+    totals = defaultdict(lambda: dict(calls=0, active_us=0., bouts=0, packets=0))
+    for (token, slot, index), intervals in spans.items():
+        key = slot, index
+        merged_intervals = merged(intervals)
+        total = totals[key]
+        total['calls'] += 1
+        total['active_us'] += duration(merged_intervals)
+        total['bouts'] += len(merged_intervals)
+        total['packets'] += packets[token, slot, index]
+    result = []
+    for (slot, index), total in sorted(totals.items()):
+        group = slots[slot][0]
+        source = rows[index]
+        origins = [source['source_node'], *(node['name'] for node in source['fused_operations'])]
+        local = sorted({int(layer) for name in origins for layer in re.findall(r'/layers/(\d+)/', name)})
+        if any(layer >= 4 for layer in local):
+            raise ValueError('Stage-local layer exceeds four-layer group')
+        layers = [4*group+layer for layer in local]
+        phase_index = bisect.bisect_left(output_producers, slot)
+        next_layer = phase_index//2 if phase_index < len(output_producers) else None
+        next_phase = ('attention' if phase_index % 2 == 0 else 'ffn') if next_layer is not None else 'tail'
+        result.append(dict(rank=rank, group=group, compute_slot=slot,
+                           next_reduction_layer=next_layer, next_reduction_phase=next_phase,
+                           cached_source_layer_candidates=layers,
+                           ownership='Runtime reduction context; cached source scope alone cannot establish layer ownership',
+                           kernel=source['kernel'], engine=source['engine'], category=source['category'],
+                           recipe=source['recipe'], source_node=source['source_node'],
+                           physical_node_executions_per_token=total['calls']/len(frames),
+                           connected_activity_bouts_per_token=total['bouts']/len(frames),
+                           active_ms_per_token=total['active_us']/len(frames)/1000,
+                           mean_observed_execution_us=total['active_us']/total['calls'],
+                           observed_lane_packets=total['packets'],
+                           predecessors=source['predecessors'], successors=source['successors'],
+                           python_origins=source['python_saved_fx_origins'],
+                           native_call_sites=source['python_lexical_calls']))
+    (output / f'rank{rank}-layer-calls.json').write_text(json.dumps(result, ensure_ascii=False, indent=2)+'\n')
+    with (output / f'rank{rank}-layer-calls.csv').open('w') as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(result[0]))
+        writer.writeheader()
+        writer.writerows({key: json.dumps(value, ensure_ascii=False) if isinstance(value, (list, dict)) else value
+                         for key, value in row.items()} for row in result)
+    return dict(rows=len(result), source_single_layer_rows=sum(len(row['cached_source_layer_candidates']) == 1 for row in result),
+                physical_node_executions_per_token=sum(row['physical_node_executions_per_token'] for row in result),
+                connected_activity_bouts_per_token=sum(row['connected_activity_bouts_per_token'] for row in result),
+                excluded_packets=dict(ignored),
+                source_limit='FX names reused across saved graphs; all ambiguous Python lines remain candidates')
+
+
 def python_calls(source):
     """Exact lexical custom-op call sites; fused arithmetic remains explicit."""
     calls = defaultdict(list)
@@ -69,7 +200,7 @@ def fx_sources(directory):
     return sources
 
 
-def audit(capture, output, ranks):
+def audit(capture, output, ranks, *, calls_by_layer=False):
     output.mkdir(parents=True, exist_ok=True)
     template = json.loads((capture / 'FULL_STAGE_PLAN_TEMPLATE.json').read_text())
     slots = [(group['group'], node) for group in template for node in group['nodes'] if node['kind'] == 'compute']
@@ -166,6 +297,8 @@ def audit(capture, output, ranks):
             writer.writeheader()
             writer.writerows({k: json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v
                               for k, v in row.items()} for row in rows)
+        peer_points = json.loads((capture / 'NATIVE_POINT_SKEW.json').read_text())['per_point'] if calls_by_layer else []
+        layer_calls = layer_call_audit(root, output, rank, rows, inv, frames, slots, windows, peer_points) if calls_by_layer else None
         # Keep expert overlap distinct from total compute overlap.
         expert = {e: merged(s for g in activity['groups'] if g['category'] == '路由专家' and g['engine'] == e
                             for s in g['intervals_us']) for e in ('TPC', 'MME')}
@@ -182,6 +315,7 @@ def audit(capture, output, ranks):
                             expert_mme_ms=duration(expert['MME'])/scale/1000,
                             expert_overlap_ms=overlap/scale/1000,
                             recipe_count_per_token=len(slots),
+                            layer_call_audit=layer_calls,
                             source_identity=str(root), base_time_nanoseconds=inv['base_time_nanoseconds']))
     report = dict(capture=str(capture), status='offline audit; no performance gain credited', ranks=results,
                   count_contract='Connected activity bouts exclude null; distinct from kernel invocations and recipes',
@@ -195,8 +329,9 @@ if __name__ == '__main__':
     parser.add_argument('capture', type=Path)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--ranks', type=int, nargs='+', default=[0, 1, 2, 3])
+    parser.add_argument('--calls-by-layer', action='store_true', help='Join raw lane packets to native stage occurrences')
     args = parser.parse_args()
-    result = audit(args.capture, args.output, args.ranks)
+    result = audit(args.capture, args.output, args.ranks, calls_by_layer=args.calls_by_layer)
     print(json.dumps([dict(rank=r['rank'], bouts=r['nonnull_compute_bouts_per_token'],
                            active_ms=r['nonnull_compute_active_ms_per_token'], gaps=r['internal_compute_gaps'],
                            expert_overlap_ms=r['expert_overlap_ms']) for r in result['ranks']], ensure_ascii=False))

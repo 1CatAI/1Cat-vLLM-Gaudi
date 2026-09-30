@@ -72,6 +72,8 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             else "custom_deepseek_v41_mxfp4_prepared_moe_bf16_gaudi2"
         )
         required_ops = [required_op]
+        required_ops.extend(("custom_deepseek_v41_attention_norm_quant_gaudi2",
+                             "custom_deepseek_v41_engram_update_bf16_gaudi2"))
         if envs.VLLM_HPU_DSV41_BATCH_C1_NUMERICS:
             required_ops.extend(
                 (
@@ -124,7 +126,7 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             pipeline_parallel_size=self.pipeline_parallel_size,
             dspark=envs.VLLM_HPU_DSV41_DSPARK,
         )
-        self.program.replay_owner = StageReplay(self.program) if self.native else None
+        self.program.replay_owner = StageReplay(self.program, greedy_tail=not self.program.dspark) if self.native else None
         self.ordinary = CompiledStage(self.program, prepared_tp4=not self.native and self.tensor_parallel_size == 4)
         self.compiled_input = None
         self.compiled_input_calls = 0

@@ -59,6 +59,7 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVE
 #include "deepseek_v41_control_gemv_gaudi2.hpp"
 #include "deepseek_v41_control_gemv_rrms_gaudi2.hpp"
 #include "deepseek_v41_engram_hash_gather_bf16_gaudi2.hpp"
+#include "deepseek_v41_engram_update_gaudi2.hpp"
 #include "deepseek_v41_mxfp4_prepared_dequant_fp8_gaudi2.hpp"
 #include "deepseek_v41_mla_gaudi2.hpp"
 #include "deepseek_v41_woa_gaudi2.hpp"
@@ -288,6 +289,7 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_SILU_ACTIVATE_TILE,
     GAUDI2_KERNEL_DEEPSEEK_V41_SILU_QUANT_TILE,
     GAUDI2_KERNEL_DEEPSEEK_V41_SHARED_SILU_QUANT,
+    GAUDI2_KERNEL_DEEPSEEK_V41_ENGRAM_UPDATE,
     KERNEL_COUNT
 };
 
@@ -451,6 +453,7 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     DeepseekV41Mxfp4PreparedDequantFP8Gaudi2 preparedFp8;
     preparedFp8.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MXFP4_PREPARED_DEQUANT_FP8].name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_ATTENTION_NORM].name, DeepseekV41AttentionNormGaudi2::name);
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_ENGRAM_UPDATE].name, DeepseekV41EngramUpdateGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_FINAL_COLLAPSE_NORM].name,
                 DeepseekV41FinalCollapseNormGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_Q_SCALE_ROPE].name, DeepseekV41QScaleRopeGaudi2::name);
@@ -915,6 +918,8 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     preparedFp8.GetKernelName(kernelName);
     if (std::strcmp(params->guid.name, kernelName) == 0)
         return preparedFp8.GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name, DeepseekV41EngramUpdateGaudi2::name) == 0)
+        return DeepseekV41EngramUpdateGaudi2().GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41AttentionNormGaudi2::name) == 0)
         return DeepseekV41AttentionNormGaudi2().GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name,
