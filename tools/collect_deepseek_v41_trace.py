@@ -90,6 +90,8 @@ def main():
                         help="Assemble an existing complete normalization after verifying every raw/CPU identity")
     parser.add_argument("--raw-workers", type=int, choices=(1, 2, 4), default=4)
     parser.add_argument("--raw-chunk-ms", type=float, default=200)
+    parser.add_argument("--decode-roi-padding-ms", type=float,
+                        help="Optional raw-clock decode ROI for offline parsing; complete cycles remain mandatory")
     parser.add_argument("--capture-dir",
                         type=Path,
                         help="One archived acquisition with its own worker traces and start/stop counters")
@@ -154,7 +156,8 @@ def main():
             with ProcessPoolExecutor(max_workers=args.raw_workers) as pool:
                 futures = [
                     pool.submit(normalize, trace_dir / row["bundle"], trace_dir / row["cpu_trace"], row["metadata"],
-                                output / f"rank{rank}", run / "profiler-config.json", args.raw_chunk_ms)
+                                output / f"rank{rank}", run / "profiler-config.json", args.raw_chunk_ms,
+                                decode_roi_padding_ms=args.decode_roi_padding_ms)
                     for rank, row in sorted(raw_ranks.items())
                 ]
                 for future in futures:

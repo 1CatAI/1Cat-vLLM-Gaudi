@@ -24,6 +24,28 @@ def digest(path):
 NORMALIZER_SHA256 = digest(Path(__file__))
 
 
+def decode_parser_window(cpu, metadata, low, high, padding_ms):
+    """Bound offline parsing around captured decode scopes, leaving clock calibration intact."""
+    if not math.isfinite(padding_ms) or padding_ms < 0:
+        raise ValueError("Decode parser padding must be finite and nonnegative")
+    if (metadata.get("scope_clock_domain") != "CLOCK_MONOTONIC_RAW"
+            or cpu.get("clockDomain") != "CLOCK_MONOTONIC_RAW"):
+        raise ValueError("Decode parser ROI requires explicitly captured raw-clock scopes")
+    scopes = [event for event in cpu["traceEvents"]
+              if event.get("ph") == "X" and "::decode::" in event.get("name", "")
+              and event.get("dur", 0) > 0]
+    if not scopes:
+        raise ValueError("Decode parser ROI has no captured decode scopes")
+    base = cpu["baseTimeNanoseconds"]
+    padding = int(padding_ms * 1e6)
+    begin = base + math.floor(min(event["ts"] for event in scopes) * 1000) - padding
+    end = base + math.ceil(max(event["ts"] + event["dur"] for event in scopes) * 1000) + padding
+    begin, end = max(low, begin), min(high, end)
+    if begin >= end:
+        raise ValueError("Captured decode scopes do not overlap the SDK calibration range")
+    return begin, end
+
+
 class Clock:
     def __init__(self, metadata, base):
         first, last = metadata["clock_samples"]
@@ -133,7 +155,7 @@ def resolve_recipe_starts(pending, names, recipe_ids_at_start, observed_recipe_i
 
 
 def normalize(bundle, cpu_trace, metadata, output, config, chunk_ms=200, overlap_ms=50, csv_source=None,
-              *, required_engines=("TPC", "MME")):
+              *, required_engines=("TPC", "MME"), decode_roi_padding_ms=None):
     if not required_engines or not set(required_engines) <= {"TPC", "MME", "DMA"}:
         raise ValueError("Declare at least one supported engine required by this capture")
     subprocess.run([sys.executable, str(Path(__file__).with_name("extract_deepseek_v41_trace.py")),
@@ -222,6 +244,11 @@ def normalize(bundle, cpu_trace, metadata, output, config, chunk_ms=200, overlap
     calibrations = [die for item in state["host_device_time_diff"] for die in item["die"]]
     low = min(item["first"]["host"] for item in calibrations)
     high = max(item["second"]["host"] for item in calibrations)
+    calibration_range = [low, high]
+    if decode_roi_padding_ms is not None:
+        with gzip.open(cpu_trace, "rt") as stream:
+            cpu = json.load(stream)
+        low, high = decode_parser_window(cpu, metadata, low, high, decode_roi_padding_ms)
     step = max(1, int(chunk_ms * 1e6)) if chunk_ms > 0 else high - low + 1
     padding = int(overlap_ms * 1e6)
     parts = []
@@ -231,6 +258,8 @@ def normalize(bundle, cpu_trace, metadata, output, config, chunk_ms=200, overlap
         assert saved["chunk_ms"] == chunk_ms and saved["overlap_ms"] == overlap_ms
         assert saved["binary_sha256"] == digest(binaries[0])
         assert saved["profile_state"] == state and saved["parser_config"] == parse_config
+        if decode_roi_padding_ms is not None:
+            assert saved.get("parser_window_ns") == [low, high], "CSV ROI ownership changed"
     commands, files = [], []
     for index, begin in enumerate(range(low, high, step)):
         directory = parser_dir / f"chunk{index:04d}"
@@ -349,6 +378,8 @@ def normalize(bundle, cpu_trace, metadata, output, config, chunk_ms=200, overlap
                     parser_csv_files=[dict(path=str(path), sha256=digest(path)) for path in files],
                     normalization_sha256=NORMALIZER_SHA256, chunk_ms=chunk_ms, overlap_ms=overlap_ms,
                     required_engines=list(required_engines),
+                    calibration_range_ns=calibration_range, parser_window_ns=[low, high],
+                    decode_roi_padding_ms=decode_roi_padding_ms,
                     reused_csv_source=str(csv_source) if csv_source else None,
                     chunk_ownership="BEGIN in half-open core; complete pair in independently padded CSV")
     (output / "raw-provenance.json").write_text(json.dumps(identity, indent=2) + "\n")
@@ -382,9 +413,12 @@ if __name__ == "__main__":
     parser.add_argument("--chunk-ms", type=float, default=200)
     parser.add_argument("--overlap-ms", type=float, default=50)
     parser.add_argument("--csv-source", type=Path)
+    parser.add_argument("--decode-roi-padding-ms", type=float,
+                        help="Parse around raw-clock decode scopes plus padding; validate complete-cycle coverage")
     parser.add_argument("--required-engine", action="append", choices=("TPC", "MME", "DMA"),
                         help="Explicit engine contract for a component trace; default requires both TPC and MME")
     args = parser.parse_args()
     normalize(args.bundle, args.cpu_trace, json.loads(args.metadata.read_text()), args.output,
               args.config, args.chunk_ms, args.overlap_ms, args.csv_source,
-              required_engines=args.required_engine or ("TPC", "MME"))
+              required_engines=args.required_engine or ("TPC", "MME"),
+              decode_roi_padding_ms=args.decode_roi_padding_ms)
