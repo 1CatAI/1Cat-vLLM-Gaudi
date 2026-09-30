@@ -62,8 +62,12 @@ def main():
                         help="Let initial decode compilation finish before opening the requested capture")
     parser.add_argument("--expected-prompt-tokens", type=int, default=16384)
     parser.add_argument("--eos-token-id", type=int, default=1)
+    parser.add_argument("--prefill-only", action="store_true",
+                        help="Measure a max_tokens=1 request; does not qualify natural EOS or semantics")
     args = parser.parse_args()
     body = json.loads(args.request.read_text())
+    if args.prefill_only and (body.get("max_tokens") != 1 or args.profile == "decode"):
+        raise ValueError("Prefill-only timing requires max_tokens=1 and excludes decode capture")
     if body.get("ignore_eos") or not body.get("stream") or not body.get("return_token_ids"):
         raise ValueError("Qualification requires natural EOS, streaming and returned token IDs")
     if body.get("stop") or body.get("stop_token_ids"):
@@ -91,6 +95,7 @@ def main():
     if args.profile == "prefill":
         profile("start")
     report = {"started_at": datetime.now(timezone.utc).isoformat(), "status": "running",
+              "qualification": "prefill_only" if args.prefill_only else "natural_eos",
               "profile": args.profile, "request_sha256": hashlib.sha256(args.request.read_bytes()).hexdigest(),
               "client_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               "stream_chunk_size": 65536,
@@ -197,20 +202,27 @@ def main():
             assert returned_prompt == json.loads(expected_ids_path.read_text()), "server prompt IDs differ from frozen input"
 
         assert usage and usage["completion_tokens"] == len(ids), ("token accounting", usage, len(ids))
-        assert finish_reason == "stop", ("did not finish naturally", finish_reason, stop_reason)
-        assert stop_reason in (None, args.eos_token_id), ("unexpected stop", stop_reason)
+        if args.prefill_only:
+            assert len(ids) == 1 and finish_reason in ("length", "stop"), (len(ids), finish_reason)
+        else:
+            assert finish_reason == "stop", ("did not finish naturally", finish_reason, stop_reason)
+            assert stop_reason in (None, args.eos_token_id), ("unexpected stop", stop_reason)
         # vLLM may remove the EOS itself from streamed token IDs. With no
         # custom stop condition, finish=stop plus the configured EOS suffices;
         # distinguish that proof from directly observing EOS in returned IDs.
-        report["eos_proof"] = ("returned EOS token" if ids and ids[-1] == args.eos_token_id else
-                               "engine stop with ignore_eos=false and no custom stop conditions")
-        for name in ("request_prefill_time_seconds", "request_decode_time_seconds"):
+        report["eos_proof"] = (None
+                               if args.prefill_only else "returned EOS token" if ids and ids[-1] == args.eos_token_id
+                               else "engine stop with ignore_eos=false and no custom stop conditions")
+        measured = (("request_prefill_time_seconds", ) if args.prefill_only else
+                    ("request_prefill_time_seconds", "request_decode_time_seconds"))
+        for name in measured:
             assert durations[name]["samples"] == 1, ("non-isolated or absent engine timing", name, durations[name])
         prefill_s = durations["request_prefill_time_seconds"]["seconds"]
         decode_s = durations["request_decode_time_seconds"]["seconds"]
         report.update(prefill_tokens_per_s=prompt_count / prefill_s,
-                      decode_tokens_per_s=(len(ids) - 1) / decode_s,
-                      decode_ms_per_token=1000 * decode_s / (len(ids) - 1), status="passed")
+                      decode_tokens_per_s=(len(ids) - 1) / decode_s if len(ids) > 1 and decode_s > 0 else None,
+                      decode_ms_per_token=1000 * decode_s / (len(ids) - 1) if len(ids) > 1 else None,
+                      status="passed")
     except BaseException as exc:
         error = exc
         report.update(status="failed", error=repr(exc), finish_reason=finish_reason, stop_reason=stop_reason,

@@ -23,6 +23,31 @@ class Done:
             raise RuntimeError("not ready")
 
 
+@pytest.mark.parametrize("tp_size,pp_size", [(2, 2), (4, 1)])
+def test_shared_v2_configuration_accepts_complete_native_dependencies(monkeypatch, tp_size, pp_size):
+    from vllm_gaudi.ops.deepseek_v41_config import validate_v2
+
+    for name in (
+        "V2", "GRAPH_REPLAY", "DIRECT_TOKEN_IDS", "FIXED_POSITIONS", "NATIVE_INPUT_GRAPH",
+        "V2_EARLY_INPUT_COMMIT", "V2_SEGMENTED_PREFIX", "V2_DEVICE_ENGRAM", "TP_MHC_OVERLAP",
+        "ENGRAM_NATIVE_C1", "ENGRAM_C1_PACKET", "ENGRAM_DIRECT_INPUT",
+    ):
+        monkeypatch.setenv("VLLM_HPU_DSV41_" + name, "1")
+    monkeypatch.setenv("VLLM_HPU_TP2_NATIVE_JOINT_PLAN", "1")
+    monkeypatch.setenv("VLLM_HPU_DSV41_FUSED_STAGE_IO", "0")
+    monkeypatch.setenv("VLLM_HPU_DSV41_DSPARK", "0")
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v41")),
+        parallel_config=SimpleNamespace(tensor_parallel_size=tp_size, pipeline_parallel_size=pp_size),
+        use_v2_model_runner=True, scheduler_config=SimpleNamespace(async_scheduling=True),
+        speculative_config=None,
+    )
+    validate_v2(config)
+    config.scheduler_config.async_scheduling = False
+    with pytest.raises(ValueError, match="V2 requires"):
+        validate_v2(config)
+
+
 @pytest.mark.parametrize("batch_enabled", [False, True])
 def test_device_engram_abi_is_required_even_with_batch_capacity(monkeypatch, batch_enabled, tmp_path):
     from vllm_gaudi.ops import deepseek_v41_host as host

@@ -37,8 +37,6 @@ def is_tp4(config):
 def validate_v2(config):
     if not uses_v2(config):
         return
-    if is_tp4(config):
-        raise ValueError("V4.1 TP4 bring-up uses the synchronous prepared runner; V2 is TP2-only")
     if not config.use_v2_model_runner or not config.scheduler_config.async_scheduling:
         raise ValueError("V4.1 V2 requires VLLM_USE_V2_MODEL_RUNNER=1 and async scheduling")
     if envs.VLLM_HPU_DSV41_DSPARK or config.speculative_config is not None:
