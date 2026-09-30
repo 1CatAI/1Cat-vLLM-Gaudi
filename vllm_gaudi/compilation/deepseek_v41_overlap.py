@@ -289,10 +289,23 @@ def split_mhc_consumers(module, exchange):
     return audit
 
 
-def make_backend():
+def make_backend(*, static_int32=False):
     from habana_frameworks.torch.dynamo.compile_backend import passes
     from habana_frameworks.torch.dynamo.compile_backend.backends import hpu_backend
     from vllm_gaudi.extension.logger import logger
+
+    def integer_constants(ctx):
+        from vllm_gaudi.compilation.deepseek_v41_integer_constants import (
+            propagate_with_resident_buffers, retain_integer_constants)
+
+        audit = retain_integer_constants(ctx.graph_module)
+        if audit['replaced_operands']:
+            # This runs before partitioning; propagate canonical metadata after
+            # changing Scalar overloads to equivalent Tensor overloads.
+            propagate_with_resident_buffers(ctx.graph_module, ctx.example_inputs,
+                                            lambda: passes.pass_fake_propagation(ctx))
+            logger().info('V4.1 resident I32 operand audit: %s', audit)
+        return bool(audit['replaced_operands'])
 
     def transform(ctx):
         import os
@@ -338,9 +351,13 @@ def make_backend():
     def backend(graph, inputs, **kwargs):
         with _lock:
             passes.custom_pass_at_fuse_partition.append(transform)
+            if static_int32:
+                passes.custom_pass_at_pre_partition.append(integer_constants)
             try:
                 return hpu_backend(graph, inputs, **kwargs)
             finally:
+                if static_int32:
+                    passes.custom_pass_at_pre_partition.remove(integer_constants)
                 passes.custom_pass_at_fuse_partition.remove(transform)
 
     return backend

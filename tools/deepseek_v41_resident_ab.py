@@ -2,6 +2,8 @@
 """Resident real-16 measurement control; model arithmetic remains in the shared implementation."""
 import argparse
 import copy
+from contextlib import contextmanager
+import ctypes
 import json
 import os
 from pathlib import Path
@@ -11,6 +13,49 @@ import threading
 import time
 from types import MethodType
 import uuid
+
+
+COMPILER_CANDIDATES = {
+    'dense_fp8_unsliced': {'SRAM_SLICER_MAX_CAPACITY_BYTES': '0'},
+    'dense_fp8_legacy_slicer': {'ENABLE_PIPELINE_MANAGEMENT': '0'},
+}
+
+
+@contextmanager
+def compiler_settings(settings, library=None):
+    """Supported Synapse settings apply only to cold candidate compilation.
+
+    Restore them before timing: all arms run their own already captured plans.
+    This is diagnostic configuration, not a promoted serving implementation.
+    """
+    if not settings:
+        yield
+        return
+    if library is None:
+        library = ctypes.CDLL('libSynapse.so')
+        library.synConfigurationGet.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint64]
+        library.synConfigurationSet.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+    previous = {}
+    try:
+        for key, value in settings.items():
+            old = ctypes.create_string_buffer(256)
+            status = library.synConfigurationGet(key.encode(), old, len(old))
+            if status:
+                raise RuntimeError(f'Synapse configuration read {key} failed: {status}')
+            previous[key] = old.value
+            status = library.synConfigurationSet(key.encode(), value.encode())
+            if status:
+                raise RuntimeError(f'Synapse configuration set {key} failed: {status}')
+            check = ctypes.create_string_buffer(256)
+            status = library.synConfigurationGet(key.encode(), check, len(check))
+            if status or check.value.lower() != value.encode().lower():
+                raise RuntimeError(f'Synapse did not apply {key}={value}: {status}, {check.value!r}')
+        yield
+    finally:
+        for key, value in reversed(list(previous.items())):
+            status = library.synConfigurationSet(key.encode(), value)
+            if status:
+                raise RuntimeError(f'Synapse configuration restore {key} failed: {status}')
 
 
 def summarize(values):
@@ -152,7 +197,7 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
 
     def arm(name):
         if name not in arms:
-            if name in ('dense_fp8', 'dense_fp8_tail'):
+            if name in ('dense_fp8', 'dense_fp8_tail', 'dense_fp8_static_int32', *COMPILER_CANDIDATES):
                 if 'dense_fp8' not in stages:
                     stages['dense_fp8'] = make_dense_stage(stage, shard, args.ab_dense_sidecar, args.ab_dense_config)
                 program = clone_module(stages['dense_fp8'])
@@ -160,17 +205,24 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                 program = clone_module(stage)
             else:
                 raise ValueError(f'Unknown resident candidate {name}')
+            program.decode_static_int32 = name == 'dense_fp8_static_int32'
             replay = StageReplay(program, greedy_tail=name in ('tail', 'dense_fp8_tail'))
             program.replay_owner = replay
             stages[name], arms[name] = program, replay
-            chain(True, 2, measure=False, engine=replay, warm_steps=6)
+            # Preserve actual compiler output for kernel-count changes. This
+            # public diagnostic setting does not acquire another trace.
+            graph_directory = control / 'compiler-graphs' / name / f'rank{rank}'
+            graph_directory.mkdir(parents=True, exist_ok=True)
+            settings = dict(COMPILER_CANDIDATES.get(name, {}), DUMP_POST_GRAPHS=str(graph_directory))
+            with compiler_settings(settings):
+                chain(True, 2, measure=False, engine=replay, warm_steps=6)
             if not replay.input_variant_ready(program.search_length):
                 raise RuntimeError('Candidate did not capture its own complete native input replay')
         return arms[name]
 
     if rank == 0:
         ready = dict(pid=os.getpid(), source=os.environ['DSV41_RUN_EVIDENCE'],
-                     candidates=['dense_fp8', 'tail', 'dense_fp8_tail'])
+                     candidates=['dense_fp8', 'tail', 'dense_fp8_tail', 'dense_fp8_static_int32', *COMPILER_CANDIDATES])
         (control / 'ready.json').write_text(json.dumps(ready, indent=2)+'\n')
     print(f'TP{rank}: real16 fixture resident; control {control}', flush=True)
     try:
@@ -210,9 +262,11 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                 deadline.daemon = True
                 deadline.start()
             wait_for_loading(directory, rank, dist)
+            reference_name = job.get('baseline', 'baseline')
+            reference = arm(reference_name)
             candidate = arm(name)
             # Resolve both warmed contracts before the no-hot-compilation gate.
-            chain(True, 2, measure=False, engine=baseline, warm_steps=6)
+            chain(True, 2, measure=False, engine=reference, warm_steps=6)
             counts = preparation_counts()
             periods = []
             for label in ('A', 'B', 'A', 'B', 'A', 'B'):
@@ -220,7 +274,7 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                     raise TimeoutError('Candidate reached the 45-minute limit')
                 wait_for_loading(directory, rank, dist)
                 dist.barrier()
-                tokens, host_ms, device_ms = chain(True, steps, engine=baseline if label == 'A' else candidate,
+                tokens, host_ms, device_ms = chain(True, steps, engine=reference if label == 'A' else candidate,
                                                    warm_steps=32)
                 assert counts == preparation_counts(), 'Hot recompilation invalidates the A/B measurement'
                 local = dict(rank=rank, tokens=tokens, delivery_ns=report['token_delivery_ns'],
@@ -236,15 +290,27 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                     (directory / 'periods.json').write_text(json.dumps(periods, indent=2)+'\n')
                     print(f"{name} {label}: {period['summary']['median_ms']:.6f} ms, "
                           f"IQR {period['summary']['iqr_ms']:.6f}", flush=True)
-            infos = [graph_info(baseline), graph_info(candidate)]
+            infos = [graph_info(reference), graph_info(candidate)]
             if rank == 0:
-                result = dict(status='completed', candidate=name, steps=steps, order='ABABAB',
+                result = dict(status='completed', baseline=reference_name, candidate=name, steps=steps, order='ABABAB',
                               elapsed_s=time.monotonic()-begun, graphs=infos, comparison=compare_periods(periods),
                               no_profiler=True, no_hot_compilation=True, four_rank_tokens_equal=True,
                               statistic_unit='Four-rank latest token delivery interval, milliseconds',
                               baseline_drift_ms=max(p['summary']['median_ms'] for p in periods if p['arm']=='A')
                               - min(p['summary']['median_ms'] for p in periods if p['arm']=='A'),
                               formal_quality_pending=True, periods_file='periods.json')
+                result['cold_compiler_settings'] = COMPILER_CANDIDATES.get(name, {})
+                if name in COMPILER_CANDIDATES:
+                    # Runtime compiler settings are absent from Bridge's recipe
+                    # cache key. A/B timing alone cannot establish distinct arms.
+                    result['status'] = 'compiler_cache_isolation_unverified'
+                    result['comparison']['effective'] = False
+                if name in (*COMPILER_CANDIDATES, 'dense_fp8_static_int32') and reference_name == 'dense_fp8':
+                    result['compiler_token_exact'] = all(p['ranks'][0]['tokens'] == periods[0]['ranks'][0]['tokens']
+                                                         for p in periods)
+                    if not result['compiler_token_exact']:
+                        result['comparison']['effective'] = False
+                        result['status'] = 'numerical_contract_failed'
                 (directory / 'result.json').write_text(json.dumps(result, indent=2)+'\n')
                 Path(job['request_path']).rename(Path(job['request_path']).with_suffix('.consumed'))
                 print(json.dumps(result), flush=True)
@@ -261,7 +327,9 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--control-dir', type=Path, required=True)
-    parser.add_argument('--candidate', choices=('dense_fp8', 'tail', 'dense_fp8_tail'))
+    parser.add_argument('--candidate', choices=('dense_fp8', 'tail', 'dense_fp8_tail',
+                                              'dense_fp8_static_int32', *COMPILER_CANDIDATES))
+    parser.add_argument('--baseline', choices=('baseline', 'dense_fp8'), default='baseline')
     parser.add_argument('--steps', type=int, default=200)
     parser.add_argument('--stop', action='store_true')
     args = parser.parse_args()
@@ -271,7 +339,8 @@ def main():
         parser.error('--steps must be at least 200')
     args.control_dir.mkdir(parents=True, exist_ok=True)
     job_id = f'{time.time_ns()}-{uuid.uuid4().hex[:8]}'
-    job = dict(id=job_id, command='stop' if args.stop else 'measure', candidate=args.candidate, steps=args.steps)
+    job = dict(id=job_id, command='stop' if args.stop else 'measure', candidate=args.candidate,
+               baseline=args.baseline, steps=args.steps)
     target = args.control_dir / f'{job_id}.request.json'
     temporary = target.with_suffix('.tmp')
     temporary.write_text(json.dumps(job, indent=2)+'\n')

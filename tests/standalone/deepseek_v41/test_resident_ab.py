@@ -60,3 +60,29 @@ def test_loading_pool_reset_must_settle_before_measurement():
         return dict(modules=[dict(module=2, memory_mib=memory)])
     assert ab.settling_modules([sample(768), sample(98304), sample(773)]) == [2]
     assert ab.settling_modules([sample(35000), sample(35005), sample(35009)]) == []
+
+
+def test_cold_compiler_settings_restore_on_success_and_failure():
+    class Library:
+        def __init__(self):
+            self.values = {b'SRAM_SLICER_MAX_CAPACITY_BYTES': b'18446744073709551615',
+                           b'ENABLE_PIPELINE_MANAGEMENT': b'true'}
+
+        def synConfigurationGet(self, key, value, size):
+            value.value = self.values[key]
+            return 0
+
+        def synConfigurationSet(self, key, value):
+            self.values[key] = value
+            return 0
+
+    lib = Library()
+    before = dict(lib.values)
+    with ab.compiler_settings({'SRAM_SLICER_MAX_CAPACITY_BYTES': '0'}, lib):
+        assert lib.values[b'SRAM_SLICER_MAX_CAPACITY_BYTES'] == b'0'
+    assert lib.values == before
+    with pytest.raises(ValueError, match='compile failure'):
+        with ab.compiler_settings({'ENABLE_PIPELINE_MANAGEMENT': 'false'}, lib):
+            assert lib.values[b'ENABLE_PIPELINE_MANAGEMENT'] == b'false'
+            raise ValueError('compile failure')
+    assert lib.values == before
