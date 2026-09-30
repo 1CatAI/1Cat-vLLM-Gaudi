@@ -64,8 +64,10 @@ def test_swa_candidate_never_changes_reference_dispatch_or_allocations():
 
 
 def test_only_monotonic_foreign_weight_growth_blocks_timing():
+
     def sample(own, foreign):
         return dict(modules=[dict(module=0, memory_mib=own), dict(module=2, memory_mib=foreign)])
+
     assert ab.loading_modules([sample(100, 100), sample(200, 180), sample(300, 260)]) == [2]
     assert ab.loading_modules([sample(100, 100), sample(200, 260), sample(300, 260)]) == [2]
     assert ab.loading_modules([sample(100, 100), sample(200, 80), sample(300, 260)]) == []
@@ -73,17 +75,23 @@ def test_only_monotonic_foreign_weight_growth_blocks_timing():
 
 
 def test_loading_pool_reset_must_settle_before_measurement():
+
     def sample(memory):
         return dict(modules=[dict(module=2, memory_mib=memory)])
+
     assert ab.settling_modules([sample(768), sample(98304), sample(773)]) == [2]
     assert ab.settling_modules([sample(35000), sample(35005), sample(35009)]) == []
 
 
 def test_cold_compiler_settings_restore_on_success_and_failure():
+
     class Library:
+
         def __init__(self):
-            self.values = {b'SRAM_SLICER_MAX_CAPACITY_BYTES': b'18446744073709551615',
-                           b'ENABLE_PIPELINE_MANAGEMENT': b'true'}
+            self.values = {
+                b'SRAM_SLICER_MAX_CAPACITY_BYTES': b'18446744073709551615',
+                b'ENABLE_PIPELINE_MANAGEMENT': b'true'
+            }
 
         def synConfigurationGet(self, key, value, size):
             value.value = self.values[key]
@@ -103,3 +111,19 @@ def test_cold_compiler_settings_restore_on_success_and_failure():
             assert lib.values[b'ENABLE_PIPELINE_MANAGEMENT'] == b'false'
             raise ValueError('compile failure')
     assert lib.values == before
+
+
+def test_norm_candidate_does_not_enable_the_reference_block():
+    attention = torch.nn.Module()
+    attention.ratio = 0
+    attention.decode_swa_packed = False
+    block = torch.nn.Module()
+    block.attention = attention
+    block.decode_attention_norm_quant = False
+    stage = torch.nn.Module()
+    stage.layers = torch.nn.ModuleList([block])
+    candidate = ab.make_attention_norm_stage(stage)
+    assert candidate.layers[0].decode_attention_norm_quant
+    assert candidate.layers[0].attention.decode_swa_packed
+    assert not stage.layers[0].decode_attention_norm_quant
+    assert not stage.layers[0].attention.decode_swa_packed

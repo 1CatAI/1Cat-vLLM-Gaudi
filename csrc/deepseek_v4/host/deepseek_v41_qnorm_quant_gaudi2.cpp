@@ -5,6 +5,8 @@
 
 extern unsigned char _binary___deepseek_v41_qnorm_quant_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_qnorm_quant_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_attention_norm_quant_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_attention_norm_quant_gaudi2_o_end;
 
 tpc_lib_api::GlueCodeReturn DeepseekV41QNormQuantGaudi2::GetGcDefinitions(
     tpc_lib_api::HabanaKernelParams* p, tpc_lib_api::HabanaKernelInstantiation* out) {
@@ -12,7 +14,8 @@ tpc_lib_api::GlueCodeReturn DeepseekV41QNormQuantGaudi2::GetGcDefinitions(
     if (!p || !out || !p->nodeParams.nodeParams || p->nodeParams.nodeParamsSize != 2 * sizeof(float))
         return GLUE_FAILED;
     if (p->inputTensorNr != 2) return GLUE_INCOMPATIBLE_INPUT_COUNT;
-    if (p->outputTensorNr != 2) return GLUE_INCOMPATIBLE_OUTPUT_COUNT;
+    const bool publish = std::strcmp(p->guid.name, attention_name) == 0;
+    if (p->outputTensorNr != (publish ? 3u : 2u)) return GLUE_INCOMPATIBLE_OUTPUT_COUNT;
     const auto& x = p->inputTensors[0].geometry;
     const auto& w = p->inputTensors[1].geometry;
     const auto& q = p->outputTensors[0].geometry;
@@ -20,10 +23,16 @@ tpc_lib_api::GlueCodeReturn DeepseekV41QNormQuantGaudi2::GetGcDefinitions(
     if (x.dataType != DATA_BF16 || w.dataType != DATA_BF16 || q.dataType != DATA_F8_143 || s.dataType != DATA_F32)
         return GLUE_INCOMPATIBLE_DATA_TYPE;
     const auto width = x.maxSizes[0], rows = x.maxSizes[1];
-    if (x.dims != 2 || width != 1280 || rows < 1 || rows > 512 ||
+    if (x.dims != 2 || width != (publish ? 5120u : 1280u) || rows < 1 || rows > 512 ||
         w.dims != 1 || w.maxSizes[0] != width || q.dims != 2 || q.maxSizes[0] != width ||
         q.maxSizes[1] != rows || s.dims != 2 || s.maxSizes[0] != 1 || s.maxSizes[1] != rows)
         return GLUE_INCOMPATIBLE_INPUT_SIZE;
+    if (publish) {
+        const auto& normalized = p->outputTensors[2].geometry;
+        if (normalized.dataType != DATA_BF16 || normalized.dims != 2 ||
+            normalized.maxSizes[0] != width || normalized.maxSizes[1] != rows)
+            return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+    }
     const auto* scalar = static_cast<const float*>(p->nodeParams.nodeParams);
     if (!(scalar[0] > 0) || !std::isnormal(scalar[0]) || scalar[1] != 1.0f / float(width))
         return GLUE_FAILED;
@@ -44,10 +53,15 @@ tpc_lib_api::GlueCodeReturn DeepseekV41QNormQuantGaudi2::GetGcDefinitions(
     map(out->inputTensorAccessPattern[1], width, false);
     map(out->outputTensorAccessPattern[0], width, true);
     map(out->outputTensorAccessPattern[1], 1, true);
+    if (publish) map(out->outputTensorAccessPattern[2], width, true);
     out->kernel.paramsNr = 2;
     std::memcpy(out->kernel.scalarParams, scalar, 2 * sizeof(float));
     auto* begin = &_binary___deepseek_v41_qnorm_quant_gaudi2_o_start;
     auto* end = &_binary___deepseek_v41_qnorm_quant_gaudi2_o_end;
+    if (publish) {
+        begin = &_binary___deepseek_v41_attention_norm_quant_gaudi2_o_start;
+        end = &_binary___deepseek_v41_attention_norm_quant_gaudi2_o_end;
+    }
     const unsigned capacity = out->kernel.elfSize;
     out->kernel.elfSize = end - begin;
     if (capacity < out->kernel.elfSize) return GLUE_INSUFFICIENT_ELF_BUFFER;

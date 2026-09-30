@@ -1695,13 +1695,15 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
     @prefill_scope("attention")
     def forward(
         self, value, positions, ready_outputs=(), *, decode=False, prefill_sequence=False,
-        prefill_qkv_sequence=False, selected_main=None, decode_metadata=None
+        prefill_qkv_sequence=False, selected_main=None, decode_metadata=None, input_prequant=None
     ):
         metadata = decode_metadata if decode and self.shared_decode_metadata else None
         prefill = not decode and value.shape[0] > NATIVE_WORK_TOKENS
         if prefill_sequence and not prefill:
             raise ValueError("Token ownership is confined to the prompt path")
         token_group = None
+        if input_prequant is not None and (not decode or prefill_sequence or prefill_qkv_sequence):
+            raise ValueError("Attention input prequantization is confined to ordinary decode")
         projection_value = value
         if prefill_qkv_sequence:
             if (
@@ -1723,7 +1725,8 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             with prefill_event_span("attention_input_projection", self.layer, projection_value.shape[0]):
                 query_input, kv_input = self._project_qkv_input(projection_value, token_group=token_group)
         else:
-            query_input, kv_input = self._project_qkv_input(value)
+            query_input, kv_input = (self._project_qkv_input(value) if input_prequant is None
+                                     else self._project_qkv_input(value, prequant=input_prequant))
         norm = (
             torch.ops.custom_op.custom_deepseek_v41_attention_norm_bf16_gaudi2
             if self.fused_norm

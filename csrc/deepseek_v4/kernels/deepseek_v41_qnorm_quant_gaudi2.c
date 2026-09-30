@@ -7,12 +7,21 @@
 #define FLASHINFER_NORM_USE_LOOKUP_RSQRT
 #include "../../flashinfer_gaudi/kernels/norm_math_gaudi2.h"
 
+#ifndef DSV41_QNORM_PUBLISH
+#define DSV41_QNORM_PUBLISH 0
+#endif
+#ifndef DSV41_QNORM_TILES
+#define DSV41_QNORM_TILES 10
+#endif
 void main(tensor input, tensor weight, tensor quantized, tensor scales,
+#if DSV41_QNORM_PUBLISH
+          tensor normalized,
+#endif
           float epsilon, float inverse_width) {
     const int5 begin = get_index_space_offset();
     const int5 end = begin + get_index_space_size();
     const int tiles = get_dim_size(input, 0) / 128;
-    bfloat128 cached[10];
+    bfloat128 cached[DSV41_QNORM_TILES];
     for (int row = begin[0]; row < end[0]; ++row) {
         float128 squares = {0};
         for (int tile = 0; tile < tiles; ++tile) {
@@ -34,6 +43,10 @@ void main(tensor input, tensor weight, tensor quantized, tensor scales,
             value.v2 = (value.v2 * rrms) * w.v2;
             const bfloat128 rounded = v_convert_f32_to_bf16_all_b(value);
             cached[tile] = rounded;
+#if DSV41_QNORM_PUBLISH
+            const int5 output_at = {tile * 128, row, 0, 0, 0};
+            v_bf16_st_tnsr(output_at, normalized, rounded);
+#endif
             const float128 expanded = v_convert_bf16_to_f32_all_b(rounded);
             maximum = v_f32_max_b(maximum, v_f32_abs_b(expanded.v1));
             maximum = v_f32_max_b(maximum, v_f32_abs_b(expanded.v2));
@@ -47,15 +60,26 @@ void main(tensor input, tensor weight, tensor quantized, tensor scales,
         power = v_i32_sel_eq_f32_b(maximum, 0.0f, 0, power);
         const float64 scale = as_float64((power + 127) << 23);
         const float64 inverse = as_float64((127 - power) << 23);
+#if DSV41_QNORM_PUBLISH
+        // Dense quantization already uses this exact BF16 power-of-two
+        // reciprocal. Avoid expanding each rounded row into two FP32 vectors.
+        const float128 inverse_pair = {inverse, inverse};
+        const bfloat128 inverse_bf16 = v_convert_f32_to_bf16_all_b(inverse_pair);
+#endif
         const int5 scale_at = {0, row, 0, 0, 0};
         v_f32_st_tnsr_partial(scale_at, scales, scale, 0, 0);
 
         for (int tile = 0; tile < tiles; ++tile) {
             const int5 at = {tile * 128, row, 0, 0, 0};
+#if DSV41_QNORM_PUBLISH
+            const bfloat128 value = cached[tile] * inverse_bf16;
+            minifloat256 q = v_convert_bf16_to_f8_b(value, 0, SW_RHNE | SW_CLIP_FP, (minifloat256)0);
+#else
             const float128 value = v_convert_bf16_to_f32_all_b(cached[tile]);
             minifloat256 q = 0;
             q = v_convert_f32_to_f8_b(value.v1 * inverse, 0, SW_RHNE | SW_CLIP_FP, q);
             q = v_convert_f32_to_f8_b(value.v2 * inverse, 2, SW_RHNE | SW_CLIP_FP, q);
+#endif
             const minifloat256 sparse = q;
             q = v_f8_pack_b(sparse, SW_GROUP_0 | SW_STRIDE_2, (minifloat256)0);
             q = v_f8_pack_b(sparse, SW_GROUP_1 | SW_STRIDE_2, q);

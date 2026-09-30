@@ -26,10 +26,10 @@ def concatenate_static_weights(*weights):
     return torch.cat(weights, dim=0)
 
 
-def direct_dense_fp8(value, weight, channel):
-    q, scale = torch.ops.custom_op.custom_deepseek_v41_dense_quant_gaudi2(value.contiguous())
-    return torch.ops.hpu.fp8_gemm_v2(q, False, weight, True, None, torch.bfloat16,
-                                   scale, channel, None, False)
+def direct_dense_fp8(value, weight, channel, *, prequant=None):
+    q, scale = (torch.ops.custom_op.custom_deepseek_v41_dense_quant_gaudi2(value.contiguous())
+                if prequant is None else prequant)
+    return torch.ops.hpu.fp8_gemm_v2(q, False, weight, True, None, torch.bfloat16, scale, channel, None, False)
 
 
 class FusedQKVInput:
@@ -80,7 +80,9 @@ class FusedQKVInput:
         self._fused_qkv_weight = None
         self._fused_qkv_quantized = False
 
-    def _project_qkv_input(self, value, *, token_group=None):
+    def _project_qkv_input(self, value, *, token_group=None, prequant=None):
+        if prequant is not None and (self._fused_qkv_weight is None or "fused_qkv_channel" not in self._buffers):
+            raise ValueError("Prequantized QKV requires a prepared FP8 fused input weight")
         if self._fused_qkv_weight is None:
             if token_group is not None:
                 raise ValueError("Token-owned QKV requires a prepared replicated fused input weight")
@@ -88,7 +90,8 @@ class FusedQKVInput:
             kv = self.linear(value, self.weights.wkv)
             return query, kv
         if "fused_qkv_channel" in self._buffers:
-            qkv = direct_dense_fp8(value, self._fused_qkv_weight, self.fused_qkv_channel)
+            qkv = (direct_dense_fp8(value, self._fused_qkv_weight, self.fused_qkv_channel) if prequant is None else
+                   direct_dense_fp8(value, self._fused_qkv_weight, self.fused_qkv_channel, prequant=prequant))
         else:
             fused_value = quantize_activation(value) if self._fused_qkv_quantized else value
             qkv = F.linear(fused_value, self._fused_qkv_weight)

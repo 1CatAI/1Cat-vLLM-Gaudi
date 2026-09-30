@@ -224,6 +224,7 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_Q_SCALE_ROPE,
     GAUDI2_KERNEL_DEEPSEEK_V41_PREFILL_Q_SCALE_ROPE,
     GAUDI2_KERNEL_DEEPSEEK_V41_QNORM_QUANT,
+    GAUDI2_KERNEL_DEEPSEEK_V41_ATTENTION_NORM_QUANT,
     GAUDI2_KERNEL_DEEPSEEK_V41_KV_NORM_ROPE,
     GAUDI2_KERNEL_DEEPSEEK_V41_MHC_GATES,
     GAUDI2_KERNEL_DEEPSEEK_V41_MXFP4_SHARED_DEQUANT_BF16,
@@ -464,6 +465,8 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_PREFILL_Q_SCALE_ROPE_BF16].name,
                 DeepseekV41PrefillQScaleRopeGaudi2::bf16_name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_QNORM_QUANT].name, DeepseekV41QNormQuantGaudi2::name);
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_ATTENTION_NORM_QUANT].name,
+                DeepseekV41QNormQuantGaudi2::attention_name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_KV_NORM_ROPE].name,
                 DeepseekV41KVNormRopeGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MHC_GATES].name, DeepseekV41MhcGatesGaudi2::name);
@@ -930,7 +933,8 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
         return DeepseekV41PrefillQScaleRopeGaudi2().GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41PrefillQScaleRopeGaudi2::bf16_name) == 0)
         return DeepseekV41PrefillQScaleRopeGaudi2(true).GetGcDefinitions(params, instance);
-    if (std::strcmp(params->guid.name, DeepseekV41QNormQuantGaudi2::name) == 0)
+    if (std::strcmp(params->guid.name, DeepseekV41QNormQuantGaudi2::name) == 0 ||
+        std::strcmp(params->guid.name, DeepseekV41QNormQuantGaudi2::attention_name) == 0)
         return DeepseekV41QNormQuantGaudi2().GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41KVNormRopeGaudi2::name) == 0)
         return DeepseekV41KVNormRopeGaudi2().GetGcDefinitions(params, instance);

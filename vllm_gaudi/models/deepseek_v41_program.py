@@ -837,6 +837,7 @@ class PreparedDecoderLayer(nn.Module):
         self.batch_control_reuse = gaudi_envs.VLLM_HPU_DSV41_MHC_BATCH_REUSE
         self.batch_control_prefetch = gaudi_envs.VLLM_HPU_DSV41_MHC_CONTROL_PREFETCH
         self.mhc_control_rrms = gaudi_envs.VLLM_HPU_DSV41_MHC_CONTROL_RRMS
+        self.decode_attention_norm_quant = False
         # Full prompt state already owns token rows. Reuse that ownership for
         # replicated Q/KV inputs on layers without a full hidden-state consumer.
         self.sequence_qkv_input = tensor_parallel_size == 4
@@ -972,6 +973,7 @@ class PreparedDecoderLayer(nn.Module):
             and not requires_full_input
             and self.attention._fused_qkv_weight is not None
         )
+        input_prequant = None
         if prefill_sequence:
             new_pre, post, comb, value = sequence_hc_input(
                 residual,
@@ -1015,13 +1017,27 @@ class PreparedDecoderLayer(nn.Module):
                 prefill=fused_post,
                 collapsed_input=collapsed_attention,
             )
-            value = rms_norm(value, w.attn_norm.weight, self.eps)
-            if collapsed_attention is not None:
+            if (
+                self.decode_attention_norm_quant and decode and not self.draft
+                and value.dtype == torch.bfloat16 and 1 <= value.shape[0] <= 6
+                and "fused_qkv_channel" in self.attention._buffers
+            ):
+                value, quantized, activation_scale = (
+                    torch.ops.custom_op.custom_deepseek_v41_attention_norm_quant_gaudi2(
+                        value.contiguous(), w.attn_norm.weight, self.eps
+                    )
+                )
+                input_prequant = quantized, activation_scale
+            else:
+                value = rms_norm(value, w.attn_norm.weight, self.eps)
+            if collapsed_attention is not None and input_prequant is None:
                 # The generic attention graph consumes an FP32 collapse,
                 # then rounds the normalized row before block quantization.
                 value = value.to(residual.dtype)
         schedule = gaudi_envs.VLLM_HPU_DSV41_MHC_SCHEDULE and not self.draft and 1 <= value.shape[0] <= 6
         attention_kwargs = {"decode": decode}
+        if input_prequant is not None:
+            attention_kwargs["input_prequant"] = input_prequant
         if selected_main is not None and getattr(self.attention, "shared_main_mla", False):
             attention_kwargs["selected_main"] = selected_main
         if decode_metadata is not None and getattr(self.attention, "shared_decode_metadata", False):
