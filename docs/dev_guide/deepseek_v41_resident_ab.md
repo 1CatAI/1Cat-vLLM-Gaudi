@@ -41,3 +41,6 @@ C2–C6/DSpark入口保持原有采样合同。未验收的尾部默认关闭。
 未验收的整数常量候选`dense_fp8_static_int32`复用同一份stage源码，只把I32表达式里的不可变标量变成常驻recipe输入；动态位置、I64输入和请求状态保持动态。默认关闭。小链覆盖C1/C2/C6和重排后的gather消费者，完整链还要求A/B反馈token精确相同。
 
 编译器配置候选必须证明两臂实际recipe不同。Synapse配置在冷捕获后恢复，但仅恢复开关不足以隔离Bridge缓存；`compiler_cache_isolation_unverified`结果不能入台账。离线保存post-graph及native plan，用相同输入精度对比真实节点数。默认先捕获参考臂。
+
+
+编译器隔离最小验证工具`tools/check_deepseek_v41_compiler_isolation.py`要求启动前打开诊断用graph-name hash，比较同精度专家完整消费链及冷post-graph。硬件验证已证明两臂recipe不同，且变更输入/专家顺序后的结果精确相同。关闭全部SRAM切分减少节点，却把原有SRAM切片中间权重放到DRAM；小链没有收益，未进入16层。此开关不改变正式服务默认。
