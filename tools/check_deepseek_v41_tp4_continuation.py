@@ -663,7 +663,15 @@ def main():
                 finally:
                     if trace.running:
                         trace.stop()
-                assert traced == expected[:len(traced)]
+                if stage.runtime_indexer:
+                    all_tokens = [None] * dist.get_world_size()
+                    dist.all_gather_object(all_tokens, traced)
+                    assert all(tokens == traced for tokens in all_tokens), "TP ranks disagree on traced tokens"
+                    report.update(selection_reference='TP2 C1 ordered threshold/emit; actual local head geometry',
+                                  generic_tp4_tokens_equal=traced == expected[:len(traced)],
+                                  four_rank_tokens_equal=True)
+                else:
+                    assert traced == expected[:len(traced)]
                 assert before == preparation_counts()
                 report.update(status='real_chain_selection_trace_complete', trace_steps=8,
                               trace_metadata=trace.metadata, no_timing_collected=True,
