@@ -38,19 +38,19 @@ def main():
     parser.add_argument('--continuous-warm-steps', type=int, default=0)
     parser.add_argument('--measure-continuous-reference', action='store_true')
     args = parser.parse_args()
-    from vllm_gaudi.ops.deepseek_v41_residency import EngramResidency, table_regions
+    from vllm_gaudi.ops.deepseek_v41_residency import EngramResidency, EngramStartup, table_regions
     root = Path(os.environ['DSV41_RUN_EVIDENCE'])
     owner = EngramResidency(table_regions(args.prepared), 224 * 1024**3, device_layers=(1,))
     process = None
+    startup = EngramStartup(owner, os.environ['HABANA_VISIBLE_MODULES'].split(','),
+                            report_path=root / 'engram-residency.json')
     try:
-        owner.start()
+        startup.start(lambda: process.terminate() if process is not None else None)
         path = root / 'engram-bindings.json'
-        path.write_text(json.dumps(owner.worker_bindings(), indent=2)+'\n')
-        (root / 'engram-residency.json').write_text(json.dumps(dict(admission=owner.admission,
-                                                                   owners=owner.reports), indent=2)+'\n')
         command = [sys.executable, '-m', 'torch.distributed.run', '--standalone', '--nproc_per_node=4',
                    str(Path(__file__).with_name('check_deepseek_v41_tp4_continuation.py')),
-                   str(args.prepared), '--bindings', str(path)]
+                   str(args.prepared), '--bindings', str(path),
+                   '--engram-startup-directory', str(startup.directory)]
         if args.speed_probe:
             command.append('--speed-probe')
         if args.qualify_positive:
@@ -102,15 +102,16 @@ def main():
         if args.measure_continuous_reference:
             command.append('--measure-continuous-reference')
         process = subprocess.Popen(command)
-        owner.watch(lambda: process.terminate())
         result = process.wait()
-        owner.check()
+        if result == 0:
+            owner.check()
+            path.write_text(json.dumps(owner.worker_bindings(), indent=2)+'\n')
         raise SystemExit(result)
     finally:
         if process is not None and process.poll() is None:
             process.terminate()
             process.wait()
-        owner.close()
+        startup.close()
 
 
 if __name__ == '__main__':

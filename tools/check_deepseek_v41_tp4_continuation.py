@@ -19,6 +19,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('prepared', type=Path)
     parser.add_argument('--bindings', type=Path, required=True)
+    parser.add_argument('--engram-startup-directory', type=Path)
     parser.add_argument('--steps', type=int, default=32)
     parser.add_argument('--speed-probe', action='store_true',
                         help='Candidate timing screen with exact saved tokens; broader state/lifecycle gate deferred')
@@ -164,8 +165,14 @@ def main():
                     output.with_name(f'feature-silu-difference-rank{rank}.pt'))
                 output.write_text(json.dumps(report, indent=2) + '\n')
             bridge, _ = resolve_device_runtime(4)
+            if args.engram_startup_directory:
+                from vllm_gaudi.ops.deepseek_v41_residency import wait_for_resident_tables
+                resident_tables = wait_for_resident_tables(args.engram_startup_directory, rank,
+                                                           os.environ['HLS_MODULE_ID'])
+            else:
+                resident_tables = json.loads(args.bindings.read_text())
             host = EngramHost(args.prepared, rank, 'hpu', max_tokens=8192,
-                               resident_tables=json.loads(args.bindings.read_text()))
+                               resident_tables=resident_tables)
             host.activate('chain', reset=True)
             shard = PreparedV41Shard(args.prepared, 0, rank)
             text = json.loads((args.prepared / 'config.json').read_text())['text_config']
