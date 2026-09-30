@@ -626,6 +626,12 @@ class HPUWorker(WorkerBase):
             from vllm_gaudi.ops.deepseek_v41_residency import wait_for_engram_residency
 
             wait_for_engram_residency(self.rank, self.parallel_config.world_size)
+            extra = self.vllm_config.load_config.model_loader_extra_config or {}
+            if extra.get("engram_startup_directory"):
+                from vllm_gaudi.ops.deepseek_v41_residency import wait_for_resident_tables
+                extra["engram_resident_tables"] = wait_for_resident_tables(
+                    extra["engram_startup_directory"], self.rank, os.environ["HLS_MODULE_ID"]
+                )
         from vllm_gaudi.ops.tp2_runtime_profile import verify_loaded_profile_libraries
 
         logger.info("Worker runtime companion libraries: %s", verify_loaded_profile_libraries())
