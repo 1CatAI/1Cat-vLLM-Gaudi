@@ -11,17 +11,22 @@
 历史同卡0/1/4/5、CPU10/15/38/43的真实16层父值为**4.875365906 ms/步**。
 新测量采用常驻同进程ABABAB，每段≥200步；主统计是四卡最晚token回读间隔，
 中位数差值必须超过基线IQR的2倍。跨进程旧值不再用于新候选判定。
-本轮10ms目标的5个固定质量样本仍待候选验收，不沿用历史样本作为新精度改动的质量结果。
+本轮10ms目标的5个固定质量样本已在最新组合中重新验收，语义全部通过。
 
-当前具有完整链收益且待端到端验收的新增项：**3项，兼容16层中位数差值累计0.522960 ms；
-按用户约定×2.5的机械端到端预估1.307400 ms**。P07只覆盖前两层，分层保守累计预估1.142128 ms；两种预估都未端到端验收。正式基线仍为11.105891782 ms；未宣称正式收益。
-正式候选仅在兼容改动累计整模预估≥1.2 ms（真实16层收益×2.5，即≥0.48 ms）后运行；只有正式≤10.0 ms且5个样本通过才完成。
+最新组合正式测量：**11.021114593 ms/token**，16K→2784token→自然EOS，完整56/56预热，
+一次无profiler请求，5个固定样本语义全部通过。**未达到≤10.0 ms目标**。
+相对11.105891782 ms父版本的单次观测差值为0.084777 ms，不能将预估1.307400 ms写成实际收益。
+P06＋P07＋组合P08已进行端到端测试，移出“未端到端”累计；保留各微基准与预测快照，
+最新未端到端累计为**0 ms**。本次不是新的10ms验收基线；下一步由同代码trace定位收益未兑现。
+
 单算子改善、失败或回退不入收益台账，见[实验INDEX](../../evidence/20260928_tp4-decode-gap-1p5/INDEX.md)。
 
 - [当前正式基线](../../evidence/20260928_tp4-decode-gap-1p5/pr52-rebased-decode-01/SEMANTIC_REFERENCE_CHECK.json)
 - [同卡16层基线](../../evidence/20260928_tp4-decode-gap-1p5/pr52-rebased-real16-05/continuation-rank0.json)
 
-### P06：输入投影与共享专家FP8（仅16层A/B通过，正式/5样本待验收）
+以下P06–P08的数据是验收前微基准与预测快照；最新正式结果覆盖它们的待验收状态，不再纳入未端到端累计。
+
+### P06：输入投影与共享专家FP8（组合正式已测，10ms未达标）
 
 已恢复正式14afd2dc父臂的BF16/v1精度与重放外FP32 head HCCL；两个臂使用同一native库。
 候选仅替换wq_a/wkv/shared_w1/shared_w3/shared_w2，TP4切分保持32×32对齐，
@@ -55,7 +60,7 @@ resident03最后稳态复测前另做十秒负载检查，记录另一组卡重�
 [逐段逐卡时间与token](../../evidence/20260928_tp4-decode-gap-1p5/resident-ab-control-03/1790760366569493903-0806fbf7/periods.json)，
 [组合、尾部、负载与判定汇总](../../evidence/20260928_tp4-decode-gap-1p5/RESIDENT_AB_FORMAL_PARENT_SUMMARY.json)。
 
-### P07：SWA-only packed MLA（仅16层A/B通过，正式待验收）
+### P07：SWA-only packed MLA（组合正式已测，10ms未达标）
 
 父臂是P06输入/共享专家FP8，使用相同源、库、0/1/4/5卡位、10/15/38/43CPU和重放外HCCL head。
 只对没有压缩KV的第0/1层复用现有paged packed MLA；避免每token用通用浮点/位操作展开整块256行SWA。
@@ -82,7 +87,7 @@ P06＋P07按连续父臂累计0.275869 ms/16层，机械预估0.689673 ms，保�
 [逐段/逐卡/负载](../../evidence/20260928_tp4-decode-gap-1p5/resident-ab-control-07/swa-packed-01/periods.json)，
 [层数与外推汇总](../../evidence/20260928_tp4-decode-gap-1p5/SWA_PACKED_QUALIFICATION.json)。
 
-### P08：Attention norm/quant＋BF16跨层handoff＋Engram update（组合16层通过，正式待验收）
+### P08：Attention norm/quant＋BF16跨层handoff＋Engram update（组合正式已测，10ms未达标）
 
 本组合替换原纯norm条目0.165042 ms，不能与它叠加。父臂仍为P06＋P07。
 resident09同进程ABABAB，各臂600步，同卡0/1/4/5、CPU10/15/38/43：
@@ -105,6 +110,20 @@ P07仅两层适用的保守外推合计1.142128 ms。预估达到用户1.2 ms正
 [组合原始A/B](../../evidence/20260928_tp4-decode-gap-1p5/resident-ab-control-09/1790783707003021473-1609d95a/result.json)，
 [组合数值、噪声与累计判定](../../evidence/20260928_tp4-decode-gap-1p5/NORM_HANDOFF_QUALIFICATION.json)，
 [原纯norm参考](../../evidence/20260928_tp4-decode-gap-1p5/ATTENTION_NORM_QUANT_QUALIFICATION.json)。
+
+### 2026-10-01组合正式结果（预测未兑现，保留记录）
+
+P06/P07/P08兼容真实16层预估1.307400 ms，尾部不计入组件累计。
+默认服务一次正式实测 **11.021114593 ms/token（90.734924 tokens/s）**；自然EOS2784token，
+5个固定样本全部语义通过。实际单次观测差值仅0.084777 ms；预估比实测多省1.222623 ms。
+不能给三个组件分别归因整模收益。计时前另一组四卡空闲、每卡768MiB，卡位/CPU保持一致。
+正式服务保留上下文1048576、prefill8192、32槽；shape-agnostic缓存启用，concat完整预热通过。
+同版64步decode采集四卡prepare120→120、capture11→11，无热编译；硬件时间线正在解析。
+已测组合不再属于“未端到端”台账，微基准数字作为历史保存，后续必须以trace解决剩余差距。
+
+[正式测量](../../evidence/20260928_tp4-decode-gap-1p5/kernel-fusion-serving-01/speed-01/result.json)，
+[五样本检查](../../evidence/20260928_tp4-decode-gap-1p5/kernel-fusion-serving-01/quality/QUALITY_REPORT.json)，
+[验收状态](../../evidence/20260928_tp4-decode-gap-1p5/kernel-fusion-serving-01/QUALIFICATION.json)。
 
 ### Rebase前已验收历史（已关账）
 
