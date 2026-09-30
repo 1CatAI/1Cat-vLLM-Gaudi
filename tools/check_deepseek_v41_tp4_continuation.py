@@ -181,11 +181,14 @@ def main():
                      if name in ('norm.weight', 'embed.weight', 'head.weight')
                      or name.startswith(tuple(f'layers.{i}.' for i in layers))}
             tree = _weight_tree(specs)
+            from vllm_gaudi.ops.deepseek_v41_dense_fp8 import precision_config
+            dense_path = os.environ.get('VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR') or str(args.prepared / 'sidecars/attention_dense_fp8')
+            dense_config = precision_config(os.environ.get('VLLM_HPU_DSV41_ATTN_DENSE_FP8_CONFIG'))
             load_weight_tree(shard, tree, 'hpu', specs,
                              woa_sidecar=WoaFP8Sidecar(args.prepared / 'sidecars/wo_a_fp8', shard),
                              woa_layers=layers,
-                             dense_sidecar=DenseFP8Sidecar(args.prepared / 'sidecars/attention_dense_fp8', shard),
-                             dense_config={'wq_b': layers, 'wo_b': layers},
+                             dense_sidecar=DenseFP8Sidecar(dense_path, shard),
+                             dense_config=dense_config,
                              engram_sidecar=EngramFP8Sidecar(args.prepared / 'sidecars/engram_fp8', shard))
             stage = torch.nn.Module()
             stage.weights, stage.config = tree, {'text_config': text}

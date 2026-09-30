@@ -197,3 +197,22 @@ def test_static_weight_concatenation_preserves_source_bytes():
     fused = concatenate_static_weights(first, second)
     assert torch.equal(fused[:3], first)
     assert torch.equal(fused[3:], second)
+
+
+def test_fp8_qkv_reload_retires_channel_binding():
+    weights = _weights()
+    for projection in (weights.wq_a, weights.wkv):
+        projection.weight = projection.weight.to(torch.float8_e4m3fn)
+        projection.dense_fp8_direct_input = True
+        scale = torch.arange(1, projection.weight.shape[0] + 1).float().reshape(1, -1)
+        projection.register_buffer("channel_scale", scale)
+    attention = _attention(weights)
+    attention.qkv_fused_input = True
+    attention.prepare_qkv_input_weight()
+    assert attention.fused_wqa_wkv.dtype == torch.float8_e4m3fn
+    assert attention.fused_wqa_wkv.untyped_storage().data_ptr() == weights.wkv.weight.untyped_storage().data_ptr()
+    expected_scale = torch.cat((weights.wq_a.channel_scale, weights.wkv.channel_scale), dim=1)
+    torch.testing.assert_close(attention.fused_qkv_channel, expected_scale)
+    attention.invalidate_qkv_input_weight()
+    assert "fused_qkv_channel" not in attention._buffers
+    assert attention._fused_qkv_weight is None

@@ -20,6 +20,8 @@ ELF(silu_quant)
 ELF(scale_reduce)
 ELF(scale_reduce_direct)
 #undef ELF
+extern unsigned char _binary___deepseek_v41_shared_silu_quant_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_shared_silu_quant_gaudi2_o_end;
 namespace {
 void map(tpc_lib_api::TensorAccessPattern& p, unsigned dim, unsigned axis,
          int coefficient, int first, int last) {
@@ -29,7 +31,7 @@ void map(tpc_lib_api::TensorAccessPattern& p, unsigned dim, unsigned axis,
     p.mapping[dim].end_b = last;
 }
 tpc_lib_api::GlueCodeReturn silu_quant(tpc_lib_api::HabanaKernelParams* in,
-                                      tpc_lib_api::HabanaKernelInstantiation* out) {
+                                      tpc_lib_api::HabanaKernelInstantiation* out, bool shared_rne = false) {
     using namespace tpc_lib_api;
     if (in->inputTensorNr != 5) { in->inputTensorNr = 5; return GLUE_INCOMPATIBLE_INPUT_COUNT; }
     if (in->outputTensorNr != 2) { in->outputTensorNr = 2; return GLUE_INCOMPATIBLE_OUTPUT_COUNT; }
@@ -46,7 +48,7 @@ tpc_lib_api::GlueCodeReturn silu_quant(tpc_lib_api::HabanaKernelParams* in,
     const auto& router = in->inputTensors[4].geometry;
     const uint64_t width = p.maxSizes[0] / 2, rows = p.maxSizes[2];
     if (p.dims != 3 || p.maxSizes[1] != 1 || !width || width % 128 || width > 2560 ||
-        !rows || rows > 384 || ids.dims != 2 || ids.maxSizes[0] != rows || ids.maxSizes[1] != 1 ||
+        !rows || rows > (shared_rne ? 16384u : 384u) || ids.dims != 2 || ids.maxSizes[0] != rows || ids.maxSizes[1] != 1 ||
         sx.dims != 2 || sx.maxSizes[0] != 1 || (sx.maxSizes[1] != 1 && sx.maxSizes[1] != rows) ||
         sw.dims != 3 || sw.maxSizes[0] != 256 || sw.maxSizes[1] * 256 != width * 2 ||
         !sw.maxSizes[2] || sw.maxSizes[2] > 384 || router.dims != 2 ||
@@ -76,8 +78,10 @@ tpc_lib_api::GlueCodeReturn silu_quant(tpc_lib_api::HabanaKernelParams* in,
         map(out->outputTensorAccessPattern[i], 2, 0, 1, 0, 0);
     }
     out->kernel.paramsNr = 0;
-    const auto* start = &_binary___deepseek_v41_expert_n256_silu_quant_gaudi2_o_start;
-    const auto* end = &_binary___deepseek_v41_expert_n256_silu_quant_gaudi2_o_end;
+    const auto* start = shared_rne ? &_binary___deepseek_v41_shared_silu_quant_gaudi2_o_start :
+                                   &_binary___deepseek_v41_expert_n256_silu_quant_gaudi2_o_start;
+    const auto* end = shared_rne ? &_binary___deepseek_v41_shared_silu_quant_gaudi2_o_end :
+                                 &_binary___deepseek_v41_expert_n256_silu_quant_gaudi2_o_end;
     const unsigned capacity = out->kernel.elfSize;
     out->kernel.elfSize = end - start;
     if (capacity < out->kernel.elfSize) return GLUE_INSUFFICIENT_ELF_BUFFER;
@@ -194,13 +198,15 @@ tpc_lib_api::GlueCodeReturn DeepseekV41ExpertN256Gaudi2::GetKernelName(
         mode_ == NormalBF16 ? "custom_deepseek_v41_expert_n256_normal_bf16_gaudi2" :
         mode_ == Scale ? "custom_deepseek_v41_expert_n256_scale_gaudi2" :
         mode_ == SiluQuant ? "custom_deepseek_v41_expert_n256_silu_quant_gaudi2" :
+        mode_ == SharedSiluQuant ? "custom_deepseek_v41_shared_silu_quant_gaudi2" :
                             "custom_deepseek_v41_expert_n256_scale_reduce_gaudi2");
     return tpc_lib_api::GLUE_SUCCESS;
 }
 tpc_lib_api::GlueCodeReturn DeepseekV41ExpertN256Gaudi2::GetGcDefinitions(
     tpc_lib_api::HabanaKernelParams* in, tpc_lib_api::HabanaKernelInstantiation* out) {
     using namespace tpc_lib_api;
-    if (mode_ == SiluQuant) return silu_quant(in, out);
+    if (mode_ == SiluQuant || mode_ == SharedSiluQuant)
+        return silu_quant(in, out, mode_ == SharedSiluQuant);
     if (mode_ == ScaleReduce) return scale_reduce(in, out);
     if (in->inputTensorNr != 4) { in->inputTensorNr = 4; return GLUE_INCOMPATIBLE_INPUT_COUNT; }
     if (in->outputTensorNr != 1) { in->outputTensorNr = 1; return GLUE_INCOMPATIBLE_OUTPUT_COUNT; }

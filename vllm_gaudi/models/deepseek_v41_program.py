@@ -78,6 +78,9 @@ def _prefill_shared_expert(value, gate_up_weight, down_weight, down_bias, quanti
 
 
 def linear(value, layer):
+    if getattr(layer, "dense_fp8_direct_input", False):
+        from vllm_gaudi.ops.deepseek_v41_qkv import direct_dense_fp8
+        return direct_dense_fp8(value, layer.weight, layer.channel_scale)
     if hasattr(layer, "scale"):
         value = quantize_activation(value)
     if getattr(layer, "dense_fp8", False):
@@ -124,8 +127,10 @@ def load_weight_tree(
     engram_sidecar=None,
 ):
     n256 = gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256 or gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8
+    from vllm_gaudi.ops.deepseek_v41_dense_fp8 import projection_prefix, INPUT_PROJECTIONS
+
     dense_names = {
-        f"layers.{layer}.attn.{projection}.weight"
+        projection_prefix(layer, projection) + "weight"
         for projection, layers in (dense_config or {}).items()
         if projection != "version"
         for layer in layers
@@ -152,6 +157,9 @@ def load_weight_tree(
             else:
                 module.register_buffer("channel_scale", channel, False)
             module.dense_fp8 = True
+            module.dense_fp8_direct_input = any(
+                name == projection_prefix(layer, p) + "weight" for p in INPUT_PROJECTIONS
+            )
             continue
         if woa_sidecar is not None and name.endswith(".attn.wo_a.weight") and layer in woa_layers:
             module = tree.get_submodule(name.rpartition(".")[0])
@@ -313,6 +321,8 @@ class PreparedMoE(nn.Module):
         self.router_bf16_gate = gaudi_envs.VLLM_HPU_DSV41_BF16_ROUTER_GATE
         self.shared_gate_up = gaudi_envs.VLLM_HPU_DSV41_SHARED_GATE_UP
         self.register_buffer("shared_gate_up_weight", None, False)
+        self.register_buffer("shared_gate_up_channel", None, False)
+        self.register_buffer("shared_down_weight", None, False)
         if topk == 6 and gaudi_envs.VLLM_HPU_DSV41_EXPERT_FUSED_QUANT and not self.n256_fp8:
             raise ValueError("Fused expert quantization requires N256 FP8 experts")
         if self.n256 and (gaudi_envs.VLLM_HPU_DSV41_SHARED_C6_EXPERTS or gaudi_envs.VLLM_HPU_DSV41_INDEXED_MOE):
@@ -326,18 +336,55 @@ class PreparedMoE(nn.Module):
 
     def release_shared_gate_up_weight(self):
         self.shared_gate_up_weight = None
+        self.shared_gate_up_channel = None
+        self.shared_down_weight = None
 
     def prepare_shared_gate_up_weight(self):
         if not self.shared_gate_up:
             return
         shared = self.weights.shared_experts
-        self.shared_gate_up_weight = torch.cat((shared.w1.weight, shared.w3.weight), dim=0).contiguous()
+        from vllm_gaudi.ops.deepseek_v41_qkv import concatenate_static_weights
+
+        fp8 = [getattr(p, "dense_fp8_direct_input", False) for p in (shared.w1, shared.w3, shared.w2)]
+        if any(fp8) and not all(fp8):
+            raise ValueError("Shared FP8 requires all three projections")
+        if all(fp8):
+            width = shared.w1.weight.shape[0]
+            padded = (width + 127) // 128 * 128
+            device = shared.w1.weight.device
+
+            def pad_gate(projection):
+                weight = projection.weight.cpu()
+                return torch.cat((weight, torch.zeros(padded - width, weight.shape[1], dtype=weight.dtype)))
+
+            self.shared_gate_up_weight = concatenate_static_weights(pad_gate(shared.w1), pad_gate(shared.w3)).to(device)
+            scales = torch.cat((F.pad(shared.w1.channel_scale.cpu(), (0, padded - width), value=1),
+                                F.pad(shared.w3.channel_scale.cpu(), (0, padded - width), value=1)), dim=1)
+            self.shared_gate_up_channel = scales.bfloat16().reshape(1, padded * 2 // 256, 256).to(device)
+            down = shared.w2.weight.cpu()
+            down_padding = torch.zeros(down.shape[0], padded - width, dtype=down.dtype)
+            self.shared_down_weight = torch.cat((down, down_padding), dim=1).to(device)
+            shared.w2.weight = torch.empty(down.shape, dtype=down.dtype, device="meta")
+        else:
+            self.shared_gate_up_weight = concatenate_static_weights(shared.w1.weight, shared.w3.weight).contiguous()
         for projection in (shared.w1, shared.w3):
             source = projection.weight
             projection.weight = torch.empty(source.shape, dtype=source.dtype, device="meta")
 
     def shared_expert(self, value):
         shared = self.weights.shared_experts
+        if self.shared_gate_up_channel is not None:
+            q, sx = torch.ops.custom_op.custom_deepseek_v41_dense_quant_gaudi2(value.contiguous())
+            product = torch.ops.hpu.fp8_gemm_v2(q, False, self.shared_gate_up_weight, True, None,
+                                               torch.float32, None, None, None, False)
+            rows = value.shape[0]
+            ids = torch.zeros((1, rows), dtype=torch.int32, device=value.device)
+            route = torch.ones((1, rows), dtype=torch.float32, device=value.device)
+            middle, scale = torch.ops.custom_op.custom_deepseek_v41_shared_silu_quant_gaudi2(
+                product.reshape(rows, 1, -1), ids, sx, self.shared_gate_up_channel, route)
+            return torch.ops.hpu.fp8_gemm_v2(middle.reshape(rows, -1), False, self.shared_down_weight, True,
+                                           None, torch.bfloat16, scale.reshape(rows, 1), shared.w2.channel_scale,
+                                           None, False)
         if self.shared_gate_up:
             if self.shared_gate_up_weight is None:
                 raise RuntimeError("Shared gate/up weight was not prepared before execution")

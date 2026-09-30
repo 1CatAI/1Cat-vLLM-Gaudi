@@ -286,6 +286,7 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_MHC_POST_COLLAPSE_F32,
     GAUDI2_KERNEL_DEEPSEEK_V41_SILU_ACTIVATE_TILE,
     GAUDI2_KERNEL_DEEPSEEK_V41_SILU_QUANT_TILE,
+    GAUDI2_KERNEL_DEEPSEEK_V41_SHARED_SILU_QUANT,
     KERNEL_COUNT
 };
 
@@ -504,6 +505,8 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
         guids[GAUDI2_KERNEL_DEEPSEEK_V41_N256_NORMAL_BF16].name);
     DeepseekV41ExpertN256Gaudi2(DeepseekV41ExpertN256Gaudi2::Scale).GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_N256_SCALE].name);
     DeepseekV41ExpertN256Gaudi2(DeepseekV41ExpertN256Gaudi2::SiluQuant).GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_N256_SILU_QUANT].name);
+    DeepseekV41ExpertN256Gaudi2(DeepseekV41ExpertN256Gaudi2::SharedSiluQuant).GetKernelName(
+        guids[GAUDI2_KERNEL_DEEPSEEK_V41_SHARED_SILU_QUANT].name);
     DeepseekV41ExpertN256Gaudi2(DeepseekV41ExpertN256Gaudi2::ScaleReduce).GetKernelName(
         guids[GAUDI2_KERNEL_DEEPSEEK_V41_N256_SCALE_REDUCE].name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_DYNAMIC_QUANT].name, DeepseekV41DynamicQuantBf16Gaudi2::name);
@@ -1030,6 +1033,10 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     mainFast3.GetKernelName(kernelName);
     if (std::strcmp(params->guid.name, kernelName) == 0)
         return mainFast3.GetGcDefinitions(params, instance);
+    auto sharedSilu = DeepseekV41ExpertN256Gaudi2(DeepseekV41ExpertN256Gaudi2::SharedSiluQuant);
+    sharedSilu.GetKernelName(kernelName);
+    if (std::strcmp(params->guid.name, kernelName) == 0)
+        return sharedSilu.GetGcDefinitions(params, instance);
     auto mainFast4 = DeepseekV41ExpertN256Gaudi2(DeepseekV41ExpertN256Gaudi2::ScaleReduce);
     mainFast4.GetKernelName(kernelName);
     if (std::strcmp(params->guid.name, kernelName) == 0)
