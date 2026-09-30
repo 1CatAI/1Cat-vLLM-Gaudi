@@ -23,7 +23,9 @@ def scope_kind(name):
     return None
 
 
-def sweep(device, host, windows):
+def sweep(device, host, windows, *,
+          stages=("compiled分组入口内", "target输入/分组衔接入口内", "采样/结果消费与状态提交入口内"),
+          fallback="上述入口之外的step衔接"):
     """Partition elapsed wall time; labels describe observations, not causes."""
     events = collections.defaultdict(list)
     ends = [end for _, end in windows]
@@ -45,9 +47,7 @@ def sweep(device, host, windows):
     for stamp, changes in sorted(events.items()):
         if previous is not None and active[("window",)]:
             elapsed = stamp - previous
-            owner = next((name for name in ("compiled分组入口内", "target输入/分组衔接入口内",
-                                            "采样/结果消费与状态提交入口内")
-                          if active[("host", name)]), "上述入口之外的step衔接")
+            owner = next((name for name in stages if active[("host", name)]), fallback)
             devices = [key for key, count in active.items() if count and key[0] == "device"]
             compute = {key[3] for key in devices if key[2] in ("TPC", "MME") and key[3] != "设备调度"}
             if compute:

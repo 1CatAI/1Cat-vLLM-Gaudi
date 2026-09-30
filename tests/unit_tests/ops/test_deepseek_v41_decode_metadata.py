@@ -23,7 +23,8 @@ def test_changing_positions_and_ring_wrap_match_original_writes(dtype, tokens):
         assert lengths.shape == (tokens,) and torch.equal(lengths, torch.full((tokens,), 640, dtype=torch.int32))
 
 
-def test_compiled_metadata_reads_new_tensor_contents_each_call():
+def test_compiled_metadata_reads_new_tensor_contents_each_call(monkeypatch):
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
     compiled = torch.compile(prepare_decode_metadata, backend='eager', fullgraph=True, dynamic=False)
     positions = torch.tensor([255, 256], dtype=torch.int32)
     for offset in (0, 2, 32768, 1000000):

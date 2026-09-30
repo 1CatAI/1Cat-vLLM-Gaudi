@@ -14,6 +14,8 @@ def test_runtime_selector_publishes_current_state_without_rebinding(monkeypatch,
     attention = object.__new__(PagedCSA2Attention)
     torch.nn.Module.__init__(attention)
     attention.layer, attention.ratio, attention.length = layer, ratio, 1 << 20
+    attention.index_heads, attention.tensor_parallel_size = 16, 2
+    attention.decode_visible_rows, attention.index_mirror_scores = None, False
     attention.search_length = attention.length
     attention.runtime_indexer, attention.owns_index, attention.candidate_source = True, True, 20
     pool = None if layer < 20 else torch.full((8192, 2048), -1, dtype=torch.int32)
@@ -37,7 +39,7 @@ def test_runtime_selector_publishes_current_state_without_rebinding(monkeypatch,
                                reindex=layer > 20,
                                publish_candidates=layer == 20,
                                decoded_hot=None,
-                               ordered_candidates=True)
+                               ordered_candidates=True, local_heads=16, search_rows=None, decoded_keys=None)
         calls.append(positions.item())
         selected = torch.full((1, 512), positions.item() // ratio, dtype=torch.int32)
         blocks = torch.full((1, 2048), positions.item() // 8, dtype=torch.int32) if layer == 20 else None
@@ -91,8 +93,8 @@ def test_external_reindex_pool_preserves_logical_output_order(monkeypatch):
                           custom_deepseek_v41_index_emit_gaudi2=lambda *args: raw)
     monkeypatch.setattr(native.torch.ops, "custom_op", ops)
     dummy = torch.empty(1)
-    actual, published = native.runtime_index_select(dummy,
-                                                    dummy,
+    actual, published = native.runtime_index_select(torch.empty(1, 32, 128, dtype=torch.bfloat16),
+                                                    torch.empty(1, 32, dtype=torch.bfloat16),
                                                     dummy,
                                                     dummy,
                                                     dummy,

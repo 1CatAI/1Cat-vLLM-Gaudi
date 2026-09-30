@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Compatibility exports for tools using the shared native runtime indexer."""
-from vllm_gaudi.ops.deepseek_v41_indexer import ordered_index_ids, runtime_index_select
+from vllm_gaudi.ops.deepseek_v41_indexer import ordered_index_ids as ordered_index_ids, runtime_index_select
 
 
 def ordered_index_select(owner, positions, q, weights, candidates):

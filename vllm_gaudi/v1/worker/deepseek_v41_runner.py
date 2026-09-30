@@ -2216,7 +2216,6 @@ class V41ModelRunner:
 
         record_memory(0, 0)
         if not self.use_dspark and isinstance(self.state, PagedStageState):
-            warmup_buckets = prefill_compute_buckets()
             geometries = (0, min(INDEX_MME_HOT_TOKENS, self.model_config.max_model_len - 1))
             for start_position in geometries:
                 for tokens in prefill_compute_buckets(self.prefill_capacity):

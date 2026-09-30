@@ -857,7 +857,10 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
 
     def _prepare_index_queries(self, value, qr, positions, *, prefill=False, request_batch=False):
         indexer = self.weights.indexer
-        local_queries = self.tp4_local_index_queries and value.shape[0] == 1 and self.search_length <= 32768
+        local_queries = (
+            not prefill and getattr(self, "tp4_local_index_queries", False)
+            and value.shape[0] == 1 and self.search_length <= 32768
+        )
         if local_queries:
             from vllm_gaudi.ops.deepseek_v41_tp4_selection import local_index_query_projections
 
@@ -892,7 +895,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             return exchange_prefill_index_queries(q, weights, rank, group=group.device_group)
         # Exchange only small query/head tensors, not one score per cached token.
         if not local_queries:
-            if self.tp4_packed_index_queries:
+            if getattr(self, "tp4_packed_index_queries", False):
                 from vllm_gaudi.ops.deepseek_v41_index_packet import gather_index_query_packet
 
                 q, weights = gather_index_query_packet(q, weights, self.gather, self.tensor_parallel_size)
@@ -1224,7 +1227,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                     collect_blocks=self.layer == self.candidate_source,
                     native_scores=prefill and gaudi_envs.VLLM_HPU_DSV41_PREFILL_INDEX_MME,
                     visible_rows=None if prefill else self.decode_visible_rows,
-                    partition_tiles=self.tp4_tile_selection and not prefill and tokens == 1,
+                    partition_tiles=not prefill and tokens == 1 and getattr(self, "tp4_tile_selection", False),
                     partition_mirror=getattr(self, "tp4_mirror_selection", False) and not prefill and tokens == 1,
                 )
                 if self.layer == self.candidate_source:

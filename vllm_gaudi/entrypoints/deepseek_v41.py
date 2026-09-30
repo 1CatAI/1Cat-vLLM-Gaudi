@@ -383,9 +383,8 @@ def prepare_environment(model=None, sidecars=None, tensor_parallel_size=4, pipel
         "VLLM_USE_V2_MODEL_RUNNER": "0",
         "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
         "VLLM_USE_BREAKABLE_CUDAGRAPH": "0",
-        # TP4 uses compiled recipes and compute-only native plans; it does
-        # not capture HPU Graphs. Their real scratch is profiled separately.
-        "VLLM_GRAPH_RESERVED_MEM": "0" if tensor_parallel_size == 4 else "0.1",
+        # Reserve scratch for the shared native graph path on every TP size.
+        "VLLM_GRAPH_RESERVED_MEM": "0.1",
         "VLLM_HPU_FORCE_CHANNEL_FP8": "0",
         "OMP_NUM_THREADS": "1",
         # This is distinct from the API/engine drain timeout. Workers must be

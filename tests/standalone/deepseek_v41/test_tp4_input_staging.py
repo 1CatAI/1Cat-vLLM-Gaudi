@@ -66,6 +66,7 @@ def test_decode_geometry_rebinds_after_prefill_generation_and_search_changes():
             return torch.zeros(1, 8)
 
     runner = object.__new__(V41ModelRunner)
+    runner.request_batches = None
     runner.model = Model()
     runner.model.program = program
     runner.use_dspark = runner.direct_token_ids = False

@@ -1601,7 +1601,7 @@ class PreparedStage(nn.Module):
         # migrating buffers. A live plan cannot retain addresses from this tree.
         if getattr(self, "replay_owner", None) is not None:
             self.replay_owner.close()
-        invalidate_index_mirror = getattr(self.shared, "invalidate_index_mirror", None)
+        invalidate_index_mirror = getattr(getattr(self, "shared", None), "invalidate_index_mirror", None)
         if invalidate_index_mirror is not None:
             invalidate_index_mirror()
         self._invalidate_prefill_regions()

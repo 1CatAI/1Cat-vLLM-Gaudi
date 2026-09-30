@@ -120,7 +120,7 @@ def test_tp4_sampling_keeps_device_token_without_pp_broadcast(monkeypatch):
     runner.pp = SimpleNamespace(group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
                                 drain=lambda: calls.append("drain"), generation=4)
     runner._v2_async_step, runner._completion, runner.audit = True, None, {}
-    request = SimpleNamespace(req_id="a", prompt=[1])
+    request = SimpleNamespace(req_id="a", prompt=[1], decode_start=1)
     selected = torch.tensor([[17]], dtype=torch.int32)
     runner.pending = request, 2, 1, 1, [], True, selected
     runner.tp4_token_readback = lambda token: (token.clone(), NotReady())

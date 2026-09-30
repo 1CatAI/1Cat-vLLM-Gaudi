@@ -149,7 +149,7 @@ class V41V2ModelRunner(V41ModelRunner):
             getattr(self.model, "tensor_parallel_size", 2),
             runtime_indexer=getattr(program, "runtime_indexer", False),
         )
-        if next_bound != getattr(program, "decode_token_bound", None):
+        if hasattr(program, "decode_token_bound") and next_bound != program.decode_token_bound:
             # The scheduler's next full entry must rebind this bounded
             # selection geometry before a prefix may consume the new token.
             self.audit["v2_prefix_visible_transitions"] = self.audit.get("v2_prefix_visible_transitions", 0) + 1

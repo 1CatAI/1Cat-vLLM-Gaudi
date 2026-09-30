@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 import torch
-import habana_frameworks.torch
+import habana_frameworks.torch  # noqa: F401 - register the HPU backend
 from habana_frameworks.torch.internal import bridge_config
 
 root = Path(os.environ['DSV41_RUN_EVIDENCE'])

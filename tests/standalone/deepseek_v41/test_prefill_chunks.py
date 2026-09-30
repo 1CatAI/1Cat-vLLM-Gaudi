@@ -110,6 +110,8 @@ def test_prefill_retires_completed_tail_packets_before_reuse(monkeypatch, count)
     request = SimpleNamespace(
         num_computed_tokens=0, tokens=list(range(count)), prompt=list(range(count)), decode_start=count
     )
+    request.output = []
+    request.token_slice = lambda start, stop: request.tokens[start:stop]
     runner = SimpleNamespace(
         round_timing_enabled=False,
         prefill_capacity=8192,

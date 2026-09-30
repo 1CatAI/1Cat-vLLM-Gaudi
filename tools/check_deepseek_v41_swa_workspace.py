@@ -10,7 +10,7 @@ from vllm_gaudi.entrypoints.deepseek_v41 import prepare_environment
 prepare_environment(Path('/opt/optane/prepared/DeepSeek-V4.1-Flash-dba1be0-tp4-pp1-q16v2'),
                     tensor_parallel_size=4, pipeline_parallel_size=1)
 import torch
-import habana_frameworks.torch as htorch
+import habana_frameworks.torch  # noqa: F401 - register the HPU backend
 from vllm_gaudi.ops.deepseek_v41_prefill_regions import prefill_swa_workspace
 from vllm_gaudi.ops.deepseek_v41_math import unpack_swa
 

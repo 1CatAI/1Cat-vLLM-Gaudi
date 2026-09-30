@@ -22,7 +22,6 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     topology = json.loads((args.prepared / "manifest.json").read_text())
     tp_size = topology["tensor_parallel_size"]
-    pp_size = topology["pipeline_parallel_size"]
     manifest = {
         "version": 1,
         "quantization": QUANTIZATION,

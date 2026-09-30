@@ -84,6 +84,7 @@ def test_final_halo_rebinds_source_selection_for_every_reuse_layer(monkeypatch):
     stage = program.PreparedStage.__new__(program.PreparedStage)
     nn.Module.__init__(stage)
     stage.pp_rank, stage.dspark, stage.start, stage.stop = 1, False, 20, 40
+    stage.tensor_parallel_size = 2
     stage.shared = shared
     stage.layers = nn.ModuleList([Source(shared)] + [Consumer(shared) for _ in range(19)])
     stage.config = {"text_config": {"rms_norm_eps": 1e-6}}
