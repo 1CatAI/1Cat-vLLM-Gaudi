@@ -27,6 +27,7 @@ _PROFILE_KEYS = set().union(
     "VLLM_HPU_DSV41_DSPARK",
     "VLLM_HPU_DSV41_WO_A_FP8_SIDECAR",
     "VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR",
+    "VLLM_HPU_DSV41_ATTN_DENSE_FP8_CONFIG",
     "VLLM_HPU_DSV41_ENGRAM_FP8_SIDECAR",
     "VLLM_HPU_DSV41_PREFILL_GROUPED_FP8",
     "VLLM_HPU_DSV41_PREFILL_INDEX_QUERY_TP",
@@ -203,7 +204,7 @@ def test_tp4_defaults_select_optimized_moe_without_opt_in(monkeypatch, tmp_path)
         "PREFILL_ACTIVE_PLAN",
     ):
         assert os.environ["VLLM_HPU_DSV41_" + key] == "1"
-    assert os.environ["VLLM_HPU_DSV41_PREFILL_GROUPED_FP8"] == "w13_single_bucket"
+    assert os.environ["VLLM_HPU_DSV41_PREFILL_GROUPED_FP8"] == ""
     assert os.environ["VLLM_HPU_DSV41_PREFILL_DECODER_HALO"] == "1"
     assert os.environ["VLLM_HPU_DSV41_PREFILL_MLA_SEQUENCE"] == "1"
 
@@ -301,3 +302,16 @@ def test_graph_reservation_follows_tp4_capture_policy(monkeypatch):
     monkeypatch.setenv("VLLM_GRAPH_RESERVED_MEM", "0.07")
     entry.prepare_environment(tensor_parallel_size=4, pipeline_parallel_size=1)
     assert os.environ["VLLM_GRAPH_RESERVED_MEM"] == "0.07"
+
+
+def test_installed_dense_precision_is_discovered_without_opt_in(monkeypatch, tmp_path):
+    _clear_profile(monkeypatch)
+    for name in ("wo_a_fp8", "attention_dense_fp8", "engram_fp8"):
+        (tmp_path / "sidecars" / name).mkdir(parents=True)
+    precision = tmp_path / "sidecars/attention_dense_fp8/precision.json"
+    precision.write_text('{}')
+    prepare_default_fastpaths(tmp_path)
+    assert os.environ["VLLM_HPU_DSV41_ATTN_DENSE_FP8_CONFIG"] == str(precision)
+    monkeypatch.setenv("VLLM_HPU_DSV41_ATTN_DENSE_FP8_CONFIG", "diagnostic.json")
+    prepare_default_fastpaths(tmp_path)
+    assert os.environ["VLLM_HPU_DSV41_ATTN_DENSE_FP8_CONFIG"] == "diagnostic.json"

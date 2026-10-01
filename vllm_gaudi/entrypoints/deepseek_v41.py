@@ -179,7 +179,9 @@ _TP4_FASTPATH_DEFAULTS = {
     "VLLM_HPU_DSV41_ENGRAM_NATIVE_C1": "1",
     "VLLM_HPU_DSV41_ENGRAM_C1_PACKET": "1",
     "VLLM_HPU_DSV41_PREFILL_EXPERT_ROWS": "128",
-    "VLLM_HPU_DSV41_PREFILL_GROUPED_FP8": "w13_single_bucket",
+    # Ordinary C1 qualification uses the BF16 grouped prompt path. The FP8
+    # prompt experiment remains available through an explicit override.
+    "VLLM_HPU_DSV41_PREFILL_GROUPED_FP8": "",
     "VLLM_HPU_DSV41_PREFILL_DECODER_HALO": "1",
     "VLLM_HPU_DSV41_PREFILL_MLA_SEQUENCE": "1",
 }
@@ -302,6 +304,11 @@ def prepare_default_fastpaths(model, sidecars=None, tensor_parallel_size=4, pipe
                 f"or disable {enabled_key}"
             )
         os.environ[path_key] = str(directory)
+    dense_dir = os.environ.get("VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR")
+    if dense_dir and not os.environ.get("VLLM_HPU_DSV41_ATTN_DENSE_FP8_CONFIG"):
+        precision = Path(dense_dir) / "precision.json"
+        if precision.is_file():
+            os.environ["VLLM_HPU_DSV41_ATTN_DENSE_FP8_CONFIG"] = str(precision)
 
 
 def prepare_native_libraries():
@@ -394,11 +401,15 @@ def prepare_environment(model=None, sidecars=None, tensor_parallel_size=4, pipel
 
 
 def main():
-    settings_path = Path.home() / ".config/1cat-vllm/deepseek-v41.json"
+    bootstrap = argparse.ArgumentParser(add_help=False)
+    bootstrap.add_argument("--settings", type=Path)
+    installation, _ = bootstrap.parse_known_args()
+    settings_path = installation.settings or Path.home() / ".config/1cat-vllm/deepseek-v41.json"
     settings = json.loads(settings_path.read_text()) if settings_path.is_file() else {}
     leased_run = bool(os.environ.get("DSV41_RUN_EVIDENCE"))
     runtime_profile = os.environ.get("DSV41_RUNTIME_PROFILE") if leased_run else None
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--settings", type=Path, help="Use this installation instead of the user's default settings")
     parser.add_argument("model", nargs="?", default=settings.get("model"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)

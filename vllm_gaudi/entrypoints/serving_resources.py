@@ -15,6 +15,7 @@ _leases = []
 def prepare_serving_resources(settings, model, arguments):
     lock_dir = settings.get("device_lock_dir")
     if lock_dir and not _leases:
+        Path(lock_dir).mkdir(parents=True, exist_ok=True)
         for module in os.environ.get("HABANA_VISIBLE_MODULES", "").split(","):
             if not module.isdecimal():
                 raise ValueError("Serving installation must select physical HPU module IDs")

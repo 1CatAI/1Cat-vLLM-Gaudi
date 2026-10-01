@@ -56,6 +56,7 @@ def main():
     parser.add_argument("request", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--url", default="http://127.0.0.1:18444")
+    parser.add_argument("--api-key-file", type=Path, help="Authenticate without putting a key on the command line")
     parser.add_argument("--profile", choices=("prefill", "decode"))
     parser.add_argument("--decode-trace-tokens", type=int, default=128)
     parser.add_argument("--decode-trace-skip-tokens", type=int, default=0,
@@ -75,11 +76,13 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     (args.output / "request.json").write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n")
     session = requests.Session()
+    if args.api_key_file:
+        session.headers["Authorization"] = "Bearer " + args.api_key_file.read_text().strip()
     profile_records = []
 
     def profile(action):
         stamp = {"action": action, "start_ns": time.time_ns()}
-        response = requests.post(args.url + "/" + action + "_profile", timeout=(10, 1800))
+        response = session.post(args.url + "/" + action + "_profile", timeout=(10, 1800))
         response.raise_for_status()
         stamp.update(end_ns=time.time_ns(), status=response.status_code)
         profile_records.append(stamp)
@@ -199,7 +202,8 @@ def main():
         assert not cached, ("prefix reuse invalidates the prefill timing", cached)
         expected_ids_path = args.request.with_name(args.request.name.replace(".request.json", ".token_ids.json"))
         if expected_ids_path != args.request and expected_ids_path.exists() and returned_prompt is not None:
-            assert returned_prompt == json.loads(expected_ids_path.read_text()), "server prompt IDs differ from frozen input"
+            assert returned_prompt == json.loads(expected_ids_path.read_text()), (
+                "server prompt IDs differ from frozen input")
 
         assert usage and usage["completion_tokens"] == len(ids), ("token accounting", usage, len(ids))
         if args.prefill_only:

@@ -2,7 +2,8 @@
 
 This experimental profile is under qualification. Enabling a switch is not
 evidence of completed model, numerical, memory or performance validation.
-The serving contract is Gaudi2, TP2×PP2, one request and greedy sampling.
+The qualified ordinary decode contract is Gaudi2, TP4×PP1, one request and greedy sampling.
+The shared implementation also accepts TP2×PP2; this change does not qualify its performance again.
 Paged state supports configuring up to 1,048,576 tokens; prefill uses scheduler
 chunks of up to 8192 tokens. This is a capacity contract, not a claim that a
 full-window request has passed quality qualification. Unsupported sampling
@@ -26,10 +27,11 @@ masking and sink-concatenation pass.
 ## Preparation
 
 Start from a validated V4.1 engine and its matching native replay runtime.
-The repository does not yet publish a complete installable V4.1 engine lock;
-the upstream PR audit is evidence collection, not an engine installer or a
-qualified compatibility lock. Preserve the actual engine revision, patches and
-runtime binary fingerprints with the prepared manifest. See the
+The complete serving engine source delta is pinned in
+`tools/communication/patches/dsv41-serving-engine.json`. Apply it to the pinned
+clean vLLM checkout with `tools/prepare_deepseek_v41_engine.py` before building
+the engine. Preserve the actual engine source and runtime binary fingerprints
+with the prepared manifest. See the
 [engineering guide](../1cat_gaudi_guide.md#deepseek-v41) for prerequisites,
 profile recording, and explicit device selection. The original Hugging Face checkpoint is the recovery source;
 the four prepared files are immutable derived artifacts.
@@ -348,3 +350,75 @@ quantization error. `w13_single_bucket` uses the same single-term arithmetic
 with occupancy buckets rounded to 32 rows, retaining BF16 W2 and ordered route
 reduction. These modes change rounding and require workload quality validation.
 The default empty mode keeps BF16 arithmetic.
+
+
+## Independent C1 installation
+
+The dedicated entrypoint selects the qualified shared C1 stage replay, native
+greedy tail, numerical preparation fusions and packed SWA automatically. Only
+pipeline-specific operations are excluded for PP1. Router and LM head retain
+BF16. The ordinary grouped prompt path retains BF16; grouped FP8 prompt modes
+remain explicit diagnostics. This does not enable a DSpark configuration.
+
+The input/shared-expert FP8 sidecar contains every selected projection and a
+`precision.json` file. The entrypoint discovers that file alongside the sidecar,
+so the accepted dense precision does not require an optimization environment
+variable. An explicit precision override remains available for diagnosis.
+
+Build the matching native kernel extension, host gather, peer bridge and pinned
+Bridge/Synapse/HCL runtime using the maintained build tools. The concat-axis
+cache-key patch or its fingerprinted adapter is required; do not globally disable
+shape-agnostic compilation. Every native source in the build manifest must match
+this plugin revision. Apply the complete serving engine delta first:
+
+```bash
+python tools/prepare_deepseek_v41_engine.py ENGINE_CHECKOUT --check
+python tools/prepare_deepseek_v41_engine.py ENGINE_CHECKOUT
+```
+
+Materialize the deployment using the matching Python environment. The runtime
+profile identifies SDK options and installed artifacts, rather than a list of
+performance opt-ins. The installer verifies the engine delta, native source and
+input library fingerprints, copies Python dependencies, engine and all plugin
+packages, removes editable import hooks, and relocates library/ABI paths.
+Model checkpoints and the installed system Gaudi driver/SDK remain prerequisites.
+
+```bash
+SERVING_PYTHON tools/install_deepseek_v41_runtime.py \
+  --runtime-profile QUALIFIED_ARTIFACT_PROFILE.json \
+  --engine-source ENGINE_CHECKOUT --prepared PREPARED_MODEL \
+  --machine-settings MACHINE.json --output INSTALLATION
+python tools/serve_deepseek_v41.py INSTALLATION --port 18552
+```
+
+Use a new installation directory. `--asset-output STABLE_ASSET_DIRECTORY` can
+place immutable sidecars on their source filesystem. Independent hard links
+avoid duplicating their data and survive removal of the original build directory;
+never modify installed asset files in place. Other files are materialized without
+workspace symlinks. Retain `installation.json` and the library ABI manifests.
+
+Machine settings contain `cpus`, `device_lock_dir`, `environment` with physical
+modules and worker CPU pools, and `cpu_allocation` with `worker_main`,
+`worker_helpers`, `engine_main`, `api_main`, and `control_helpers`. They describe
+resources, not model optimizations. Include one main and one helper pool per
+rank. The supervisor waits for full startup before maintaining per-thread
+allocation, including threads created after the first request. Its records are
+written atomically. The service keeps normal 1M context capacity, 32 request
+slots, 8192-token prompt chunks and all warmup buckets.
+
+Optional `isolate_user_processes` moves same-user background threads off the
+reserved physical cores and records their original masks. Processes owned by
+other users require machine administration. Qualification uses CPU PSI and
+actual process/card ownership; driver D-state threads make load average unsuitable
+as a CPU-contention gate. Record competing card and CPU activity during acceptance.
+An optional `api_key_file` supplies `VLLM_API_KEY` without exposing the key in
+process arguments. Keep that file private; expose a separate authenticated API
+port so other services keep their existing routes.
+
+`--settings INSTALLATION/settings.json` on the normal model entrypoint bypasses
+the user's historical installation config. Startup, module leases, native ABI
+checks, full warmup and normal Chat API execution therefore work without the
+checkout's environment variables, temporary graph dumps, manual thread binding,
+or an editable source directory. Validate a new installation with one unprofiled
+16K-to-natural-EOS request and the fixed semantic cohort before replacing the
+running release. Profiled timing and component estimates do not qualify it.

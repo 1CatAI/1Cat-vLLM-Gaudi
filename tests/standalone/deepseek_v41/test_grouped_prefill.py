@@ -71,6 +71,7 @@ def test_fp8_prompt_dispatch_keeps_scales_and_batch_decode_separate(monkeypatch,
     for name in _PIPELINE_ONLY_FASTPATHS:
         monkeypatch.setenv(name, "0")
     monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_REGIONS", "0")
+    monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_GROUPED_FP8", "w13_single_bucket")
     experts = SimpleNamespace(
         **{
             name: torch.ones(1, dtype=torch.bfloat16)
