@@ -397,6 +397,12 @@ avoid duplicating their data and survive removal of the original build directory
 never modify installed asset files in place. Other files are materialized without
 workspace symlinks. Retain `installation.json` and the library ABI manifests.
 
+Use `docs/configuration/examples/deepseek_v41_tp4_machine.json` as the machine
+settings template; adapt its NUMA allocation to the actual host. Relative lock
+paths resolve beside the release directories so successive installations share
+their leases. The installer creates a private API key unless a key file is
+already configured.
+
 Machine settings contain `cpus`, `device_lock_dir`, `environment` with physical
 modules and worker CPU pools, and `cpu_allocation` with `worker_main`,
 `worker_helpers`, `engine_main`, `api_main`, and `control_helpers`. They describe

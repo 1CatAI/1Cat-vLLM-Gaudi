@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import secrets
 import subprocess
 import sys
 import venv
@@ -181,6 +182,15 @@ def main():
     dump(output / "runtime.json", {"schema": 1, "environment": installed_env,
                                   "additional_libraries": records, "configuration_files": configurations})
     settings = json.loads(args.machine_settings.read_text())
+    lock_path = Path(settings["device_lock_dir"])
+    if not lock_path.is_absolute():
+        settings["device_lock_dir"] = str(output.parent / lock_path)
+    if not settings.get("api_key_file"):
+        key = output / "api-key"
+        descriptor = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write("sk-" + secrets.token_hex(24) + "\n")
+        settings["api_key_file"] = str(key)
     settings.update(model=str(args.prepared.resolve()), runtime_profile=str(output / "runtime.json"), sidecars=sidecars)
     dump(output / "settings.json", settings)
     copy_tree(root / "tools", output / "tools")

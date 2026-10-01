@@ -1,0 +1,94 @@
+{
+  "device_lock_dir": "locks",
+  "cpus": [
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    38,
+    39,
+    40,
+    41,
+    42,
+    43,
+    44,
+    45,
+    46,
+    47,
+    48,
+    49,
+    50,
+    51,
+    52,
+    53,
+    54,
+    55
+  ],
+  "cpu_allocation": {
+    "worker_main": [
+      10,
+      15,
+      38,
+      43
+    ],
+    "worker_helpers": [
+      [
+        11,
+        12,
+        13,
+        14
+      ],
+      [
+        16,
+        17,
+        18,
+        19
+      ],
+      [
+        39,
+        40,
+        41,
+        42
+      ],
+      [
+        44,
+        45,
+        46,
+        47
+      ]
+    ],
+    "engine_main": [
+      20
+    ],
+    "api_main": [
+      21
+    ],
+    "control_helpers": [
+      22,
+      23,
+      24,
+      25
+    ]
+  },
+  "isolate_user_processes": false,
+  "environment": {
+    "HABANA_VISIBLE_MODULES": "0,1,4,5",
+    "HLS_MODULE_ID": "0",
+    "VLLM_HPU_DSV4_WORKER_CPUS": "10,15,38,43",
+    "VLLM_HPU_DSV4_WORKER_HELPER_CPUS": "11,12,13,14;16,17,18,19;39,40,41,42;44,45,46,47"
+  }
+}
