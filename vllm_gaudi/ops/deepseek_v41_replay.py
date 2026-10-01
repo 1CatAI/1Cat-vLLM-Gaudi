@@ -366,19 +366,24 @@ class StageReplay:
         """Return the token produced by this completed C1 hidden allocation."""
         if self.latest_tail is None:
             return None
-        generation, source, token = self.latest_tail
+        generation, source, values = self.latest_tail
         program = self.program()
         if generation != program.generation or hidden.dtype != source.dtype or hidden.shape != source.shape:
             return None
         if hidden.data_ptr() != source.data_ptr():
             return None
-        return token
+        return values[0]
+
+    def tail_local_logits(self, hidden):
+        if self.greedy_tail_token(hidden) is None or len(self.latest_tail[2]) < 2:
+            return None
+        return self.latest_tail[2][1]
 
     def _publish_tail(self, variant, outputs):
         if variant.tail_values is None:
             self.latest_tail = None
         else:
-            self.latest_tail = self.program().generation, outputs[0], variant.tail_values[0]
+            self.latest_tail = self.program().generation, outputs[0], variant.tail_values
         return outputs
 
     def _input_seed(self, input_ids):
