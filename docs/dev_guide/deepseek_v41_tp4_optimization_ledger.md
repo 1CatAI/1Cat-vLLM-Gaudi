@@ -390,3 +390,37 @@ Evidence: `evidence/20260928_tp4-decode-gap-1p5/sampling-validation.json`,
 `sampling-greedy-acceptance-01`, `sampling-official-acceptance-01`,
 `sampling-quality-report.json`; host/card snapshots accompany both formal runs.
 No pending component gains are added by this change.
+
+### First-token cache retention correction (2026-10-01)
+
+This is a serving reliability correction, not a decode gain-ledger item.
+On parent e58f21a0, a 16K request followed by the same warmed 273-token
+prompt reproduced first-token latency of **16.812 s**, while its immediate
+repeat took **0.594 s**. A diagnostic stack sample attributed 18.20 of
+19.16 request seconds to Dynamo compilation, predominantly the per-layer
+SWA workspace. The profiled request is diagnostic only, not a latency result.
+The global 64-contract pure-function cache mixed independent functions,
+lengths and forty SWA layer-offset contracts, evicting warmed short shapes.
+
+Retain executors by function and primary token geometry, with bounded
+geometry and per-geometry contract counts. All tensor/scalar/precision guards,
+model-generation invalidation and native expert workspace limits remain.
+The independently installed candidate 5ff4ac31 completed full warmup:
+after a 16K request, the same short prompt took **0.597 s**, then **0.585 s**
+on repeat; first short request after startup took **1.892 s**. A warmed public
+temperature1/top-p0.95 streaming diagnostic returned its first text in
+**0.679 s**. These short probes generate one token and are not natural-EOS
+decode qualification. KV prefix caching remains disabled.
+
+One unprofiled full-warmup 16K→natural-EOS formal regression took
+**9.973275 ms/token**, **100.267962 tokens/s**, with all **2,784 tokens**
+exactly matching the accepted greedy reference. The code changes no sampling
+math; official-sampling decode performance retains its prior qualification,
+and no new stochastic performance claim is made. CPU regression:
+**979 passed /114 skipped**. Pending component gains remain **0 ms**.
+Evidence: `evidence/20260928_tp4-decode-gap-1p5/prefill-cache-conditioning.json`,
+`prefill-cold-stack-summary.json`, `prefill-compile-caller-summary.json`,
+`ttft-cache-serving-results.json`, `ttft-cache-public-probe.json`,
+`ttft-cache-formal-01`, and its host/environment records. The other four
+cards held a small idle allocation at the formal preflight; continuous
+foreign-card load telemetry was not collected.
