@@ -219,6 +219,18 @@ class PagedStageState:
         if identity and self.identity_block_table_resident:
             self.published_block_ids = block_ids
             return
+        previous = self.published_block_ids
+        if previous is not None and len(block_ids) > len(previous) and block_ids[:len(previous)] == previous:
+            # Existing logical rows keep their physical mapping. A new page
+            # must not invalidate the index mirror of the unchanged prefix.
+            # Touch only unread entries of both the pinned source and fixed
+            # destination, ordered on the replay's current device stream.
+            start, end = len(previous), len(block_ids)
+            self.block_table_host_values[start:end] = block_ids[start:]
+            self.program.shared.block_table[start:end].copy_(self.block_table_host[start:end], non_blocking=True)
+            self.published_block_ids = block_ids
+            self.identity_block_table_resident = False
+            return
         self._invalidate_index_mirror()
         values = self.block_table_host_values
         if identity:
@@ -235,6 +247,18 @@ class PagedStageState:
         self.program.shared.block_table.copy_(self.block_table_host, non_blocking=True)
         self.published_block_ids = block_ids
         self.identity_block_table_resident = identity
+
+    def append_single_pages(self, request_id, current_blocks, added_blocks, pool_blocks):
+        """Publish only a same-owner scheduler append ahead of token readback."""
+        current, added = tuple(current_blocks), tuple(added_blocks)
+        if (self.active != request_id or self.published_block_ids != current or not added
+                or pool_blocks != self.blocks):
+            return False
+        values = (*current, *added)
+        if len(values) > self.program.shared.block_table.numel() or any(not 0 < b < self.blocks for b in values):
+            raise RuntimeError("V4.1 request has invalid scheduler-owned compressed KV pages")
+        self._publish_block_table(values)
+        return True
 
     def activate(self, request_id, block_ids, *, reset=False):
         if not block_ids or any(not 0 < block < self.blocks for block in block_ids):

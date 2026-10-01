@@ -30,10 +30,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run", type=Path)
     parser.add_argument("request", type=Path)
+    parser.add_argument("--allow-truncated-diagnostic", action="store_true",
+                        help="Archive a length-limited decode diagnostic without changing its failed EOS gate")
     args = parser.parse_args()
     result = json.loads((args.request / "result.json").read_text())
     profile = json.loads((args.request / "profile.json").read_text())
-    assert result["status"] == "passed" and result["profile"] in ("prefill", "decode")
+    truncated = (args.allow_truncated_diagnostic and result["status"] == "failed"
+                 and result["profile"] == "decode" and result.get("finish_reason") == "length")
+    assert (result["status"] == "passed" or truncated) and result["profile"] in ("prefill", "decode")
     assert [event["action"] for event in profile] == ["start", "stop"]
     assert all(event["status"] == 200 for event in profile)
     start_ns = profile[0]["start_ns"]
@@ -42,6 +46,9 @@ def main():
     output.mkdir(exist_ok=False)
     log = (args.run / "run.log").read_text(errors="replace")
     manifest = dict(phase=result["profile"], request=str(args.request.resolve()), files=[], hardware=[])
+    manifest["diagnostic_only"] = truncated
+    manifest["natural_eos_qualified"] = (result["status"] == "passed"
+                                          and result.get("qualification") == "natural_eos")
     for rank in range(4):
         pids = set(re.findall(rf"Worker_(?:PP0_)?TP{rank} pid=(\d+)", log))
         assert len(pids) == 1, (rank, pids)

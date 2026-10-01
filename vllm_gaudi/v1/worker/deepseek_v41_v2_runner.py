@@ -121,28 +121,22 @@ class V41V2ModelRunner(V41ModelRunner):
         return len(tokens) == 1 and tokens.get(record.request_id) == 1 and not proposed
 
     def _prefix_authorized(self, record, scheduled):
-        if not (
-            envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX
-            and self.pp.group.is_first_rank
-            and self._continuation_authorized(record, scheduled)
-        ):
+        added_pages = None
+        if not (envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX and self.pp.group.is_first_rank
+                and self._continuation_authorized(record, scheduled)):
             return False
         if getattr(self.model, "tensor_parallel_size", 2) == 4:
             cached = scheduled.scheduled_cached_reqs
             if record.request_id not in cached.req_ids or record.request_id in cached.resumed_req_ids:
                 return False
             index = cached.req_ids.index(record.request_id)
-            if cached.num_computed_tokens[index] != record.start + 1 or cached.new_block_ids[index] is not None:
-                # The next prefix must not touch a new KV page before _update
-                # and _bind_request install the scheduler's physical mapping.
+            if cached.num_computed_tokens[index] != record.start + 1:
                 self.audit["v2_prefix_state_transitions"] = self.audit.get("v2_prefix_state_transitions", 0) + 1
                 return False
+            added_pages = cached.new_block_ids[index]
         program = self.model.program
-        next_search = (
-            runtime_search_length(record.start + 1, 1, program.length)
-            if getattr(program, "runtime_indexer", False)
-            else target_search_length(record.start + 1, 1, program.length)
-        )
+        next_search = (runtime_search_length(record.start + 1, 1, program.length) if getattr(
+            program, "runtime_indexer", False) else target_search_length(record.start + 1, 1, program.length))
         next_bound = decode_source_prefix_bound(
             record.start + 2,
             next_search,
@@ -169,6 +163,17 @@ class V41V2ModelRunner(V41ModelRunner):
             # segmented prefix can be launched safely.
             self.audit["v2_prefix_bucket_transitions"] = self.audit.get("v2_prefix_bucket_transitions", 0) + 1
             return False
+        if ready and added_pages is not None:
+            state = getattr(self, "state", None)
+            if not hasattr(state, "append_single_pages") or getattr(self.model, "batch_state", None) is not None:
+                self.audit["v2_prefix_state_transitions"] = self.audit.get("v2_prefix_state_transitions", 0) + 1
+                return False
+            request = self.requests[record.request_id]
+            if (len(request.block_ids) != 1 or len(added_pages) != 1 or not state.append_single_pages(
+                    record.request_id, request.block_ids[0], added_pages[0], self.state.blocks)):
+                self.audit["v2_prefix_state_transitions"] = self.audit.get("v2_prefix_state_transitions", 0) + 1
+                return False
+            self.audit["v2_prefix_page_appends"] = self.audit.get("v2_prefix_page_appends", 0) + 1
         return ready
 
     def _consume_completion(self, scheduled=None):

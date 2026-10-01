@@ -300,6 +300,8 @@ class HPUWorker(WorkerBase):
 
         stats["profile_libraries"] = verify_loaded_profile_libraries()
         stats.update(rank=self.rank, phase=phase)
+        stats["worker_gc"] = dict(enabled=gc.isenabled(), frozen_objects=gc.get_freeze_count(),
+                                  generation_counts=gc.get_count(), thresholds=gc.get_threshold())
         if getattr(self.profiler, "metadata", None) is not None:
             stats["raw_trace"] = self.profiler.metadata
         stats["profiler_environment"] = {

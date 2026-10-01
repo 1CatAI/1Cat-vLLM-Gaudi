@@ -379,6 +379,35 @@ def test_bounded_stage_does_not_need_a_paged_search_binding(monkeypatch):
     assert runner._prefix_authorized(SimpleNamespace(request_id="a", start=10), scheduled)
 
 
+@pytest.mark.parametrize("append_safe", [False, True])
+def test_next_prefix_publishes_new_page_before_readback_only_for_same_owner(monkeypatch, append_safe):
+    monkeypatch.setenv("VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX", "1")
+    runner, _ = fixture()
+    runner.pp.group = SimpleNamespace(is_first_rank=True)
+    calls = []
+    runner.state = SimpleNamespace(blocks=32,
+                                   append_single_pages=lambda *args: calls.append(args) or append_safe)
+    runner.requests["a"].block_ids = ([5, 3], )
+    runner.model = SimpleNamespace(
+        tensor_parallel_size=4,
+        decode_prefix_ready=lambda search: search == 512,
+        program=SimpleNamespace(length=512),
+    )
+    scheduled = SimpleNamespace(
+        num_scheduled_tokens={"a": 1},
+        finished_req_ids=set(),
+        scheduled_spec_decode_tokens={},
+        scheduled_cached_reqs=SimpleNamespace(req_ids=["a"],
+                                              resumed_req_ids=set(),
+                                              num_computed_tokens=[256],
+                                              new_block_ids=[([7], )]),
+    )
+    assert runner._prefix_authorized(SimpleNamespace(request_id="a", start=255), scheduled) == append_safe
+    assert calls == [("a", [5, 3], [7], 32)]
+    assert runner.requests["a"].block_ids == ([5, 3], )
+    assert runner.audit.get("v2_prefix_page_appends", 0) == int(append_safe)
+
+
 @pytest.mark.parametrize("position", [510, 511, 512, 1023, 1024, 2558, 2559, 2560, 524287, 1048574])
 def test_runtime_indexer_reuses_bound_prefix_across_history_boundaries(monkeypatch, position):
     monkeypatch.setenv("VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX", "1")
