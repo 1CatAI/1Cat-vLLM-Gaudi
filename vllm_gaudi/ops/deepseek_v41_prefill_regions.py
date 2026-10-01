@@ -18,6 +18,7 @@ from vllm_gaudi import envs
 
 _entries = count()
 _function_regions = OrderedDict()
+_regions_frozen = False
 # Compile only explicit tensor contracts. Broader projection regions need
 # separate qualification because compiler reduction choices can affect routing.
 _qualified_regions = frozenset(
@@ -127,10 +128,23 @@ def clear_prefill_function_regions():
     still clears the executors on reload so a runtime/library generation never
     inherits an old compiled program.
     """
+    global _regions_frozen
+    _regions_frozen = False
     _function_regions.clear()
     from vllm_gaudi.ops.deepseek_v41_prefill_index_scores import compiled_native_prefill_index_scores
 
     compiled_native_prefill_index_scores.cache_clear()
+
+
+def freeze_prefill_regions():
+    """Keep warmed executors; run novel contracts eagerly during serving.
+
+    Auxiliary checkpoints split prompts at arbitrary page boundaries. Those
+    residual shapes must not trigger synchronous Dynamo compilation inside a
+    request. Existing executors retain every guard; no cache key is relaxed.
+    """
+    global _regions_frozen
+    _regions_frozen = True
 
 
 def prefill_function_region(function):
@@ -167,6 +181,8 @@ def prefill_function_region(function):
         rows = args[0].shape[0] if args and isinstance(args[0], torch.Tensor) and args[0].ndim else None
         cache = geometries.get(rows)
         if cache is None:
+            if _regions_frozen:
+                return function(*args, **kwargs)
             from vllm_gaudi.ops.deepseek_v41_prefill_capacity import PREFILL_COMPUTE_BUCKETS
 
             cache = geometries[rows] = OrderedDict()
@@ -176,6 +192,8 @@ def prefill_function_region(function):
         key = (compile_mode, _signature(args), tuple((k, _signature(v)) for k, v in sorted(kwargs.items())))
         entry = cache.get(key)
         if entry is None:
+            if _regions_frozen:
+                return function(*args, **kwargs)
             name = f"v41_prefill_function_{function.__name__}_{next(_entries)}"
             cloned = FunctionType(
                 function.__code__.replace(co_name=name),
@@ -220,6 +238,8 @@ def prefill_region(function):
         key = (function.__name__, _signature(args), tuple((k, _signature(v)) for k, v in sorted(kwargs.items())))
         entry = cache.get(key)
         if entry is None:
+            if _regions_frozen:
+                return function(owner, *args, **kwargs)
             name = f"v41_prefill_{function.__name__}_{next(_entries)}"
             cloned = FunctionType(
                 function.__code__.replace(co_name=name),

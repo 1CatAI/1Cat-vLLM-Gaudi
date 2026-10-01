@@ -125,6 +125,31 @@ def test_continuous_b1_never_recopies_working_state(bank, monkeypatch):
     assert bank.program.shared.block_table[5] == 8
 
 
+def test_index_mirror_follows_slot_owner_and_prefill_but_survives_page_append(bank):
+    shared = bank.program.shared
+    shared.index_mirror_valid = True
+    shared.invalidate_index_mirror = lambda: setattr(shared, "index_mirror_valid", False)
+    a, b = bank.acquire("a"), bank.acquire("b")
+    populate(bank, a, [1, 2, 3, 4, 5], 7)
+    populate(bank, b, [6, 7, 8, 9, 10], 11)
+    shared.index_mirror_valid = True
+    bank.bind_single(a, 513)
+    assert not shared.index_mirror_valid
+    shared.index_mirror_valid = True
+    bank.bind_single(a, 514)
+    bank.publish_pages(a, [1, 2, 3, 4, 5, 8], 32)
+    bank.bind_single(a, 515)
+    assert shared.index_mirror_valid
+    bank.bind_single(b, 513)
+    assert not shared.index_mirror_valid
+    shared.index_mirror_valid = True
+    bank.bind_prefill(a)
+    assert not shared.index_mirror_valid
+    shared.index_mirror_valid = True
+    bank.publish_pages(a, [11, 12, 13], 32)
+    assert not shared.index_mirror_valid
+
+
 def test_handoff_audit_preserves_state_and_owns_cpu_snapshot(bank, tmp_path):
     import json
     from vllm_gaudi.ops.deepseek_v41_state_audit import save_single_handoff

@@ -100,14 +100,22 @@ class BatchStageState:
         if not values or len(values) > self.pages.shape[1] or any(not 0 < block < pool_blocks for block in values):
             raise ValueError("Batch request page table exceeds scheduler allocation")
         identity = (slot.generation, values)
-        if self.page_versions.get(slot.index) == identity:
+        previous = self.page_versions.get(slot.index)
+        if previous == identity:
             return
         if self.pending is not None:
             raise RuntimeError("Cannot replace batch page metadata while a consumer is in flight")
+        if previous is None or previous[0] != slot.generation or values[:len(previous[1])] != previous[1]:
+            self._invalidate_index_mirror()
         self.page_host[slot.index].zero_()
         self.page_host[slot.index, :len(values)] = torch.tensor(values, dtype=torch.int32)
         self.pages[slot.index].copy_(self.page_host[slot.index], non_blocking=True)
         self.page_versions[slot.index] = identity
+
+    def _invalidate_index_mirror(self):
+        invalidate = getattr(self.program.shared, "invalidate_index_mirror", None)
+        if invalidate is not None:
+            invalidate()
 
     def bind_prefill(self, slot):
         """Alias the selected slot; never save/restore a whole working set."""
@@ -115,6 +123,7 @@ class BatchStageState:
         if self.pending is not None:
             raise RuntimeError("Prefill cannot replace the owner of in-flight batch scratch")
         self.leave_single()
+        self._invalidate_index_mirror()
         self.program.shared.block_table = self.pages[slot.index]
         for layer in self.program.layers:
             state = self.layers[layer.layer]
@@ -158,6 +167,7 @@ class BatchStageState:
         changed_owner = self.single_owner != slot
         if changed_owner:
             self.leave_single()
+            self._invalidate_index_mirror()
             self.restore_single_bindings()
             for working, stored in self._single_rows(slot):
                 working.copy_(stored)

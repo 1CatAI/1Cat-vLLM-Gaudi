@@ -2366,6 +2366,10 @@ class V41ModelRunner:
         self.pp.group.barrier()
         self.state.clear()
         self.active_request = None
+        if getattr(self, "prefix_checkpoints", None) is not None:
+            from vllm_gaudi.ops.deepseek_v41_prefill_regions import freeze_prefill_regions
+
+            freeze_prefill_regions()
         if envs.VLLM_HPU_DSV41_VERIFY_TIMING:
             if (
                 not envs.VLLM_HPU_DSV41_DEVICE_VERIFY
