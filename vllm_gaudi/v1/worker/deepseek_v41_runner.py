@@ -1066,10 +1066,12 @@ class V41ModelRunner:
             from vllm_gaudi.v1.worker.deepseek_v41_batch_runner import BatchExecution
 
             self.request_batches = BatchExecution(self, self.vllm_config.scheduler_config.max_num_seqs)
-            if self.vllm_config.cache_config.enable_prefix_caching:
-                from vllm_gaudi.v1.worker.deepseek_v41_prefix import PrefixCheckpoints
+        if self.vllm_config.cache_config.enable_prefix_caching:
+            from vllm_gaudi.v1.worker.deepseek_v41_prefix import PrefixCheckpoints
 
-                self.prefix_checkpoints = PrefixCheckpoints(self)
+            if self.request_batches is None:
+                self.model.initialize_request_state(self.vllm_config.scheduler_config.max_num_seqs)
+            self.prefix_checkpoints = PrefixCheckpoints(self)
         register_state_spec(self.vllm_config)
         self.model_memory_usage = torch.hpu.memory_allocated() - before
         if self.pp.group.is_last_rank and envs.VLLM_HPU_DSV41_DSPARK:
@@ -1227,8 +1229,12 @@ class V41ModelRunner:
         self.kv_caches = [(value,) for value in self.state.allocations.values()]
         self.kv_cache_config = config
 
+    @property
+    def request_slots_enabled(self):
+        return getattr(self, "request_batches", None) is not None or getattr(self, "prefix_checkpoints", None) is not None
+
     def _bind_request(self, request):
-        if self.request_batches is not None:
+        if self.request_slots_enabled:
             bank = self.model.batch_state
             owner = bank.acquire(request.req_id)
             bank.publish_pages(owner, request.block_ids[0], self.state.blocks)
@@ -1286,7 +1292,7 @@ class V41ModelRunner:
             self.active_request = None
 
     def _update(self, scheduled):
-        if self.request_batches is not None:
+        if self.request_slots_enabled:
             for req_id in getattr(scheduled, "preempted_req_ids", None) or ():
                 self._release_batch_state(req_id)
                 self.audit["batch_preemptions"] = self.audit.get("batch_preemptions", 0) + 1
@@ -1302,7 +1308,7 @@ class V41ModelRunner:
                     json.dumps({"request_id": req_id, "units": "ms", "transactions": records}),
                 )
             self.requests.pop(req_id, None)
-            if self.request_batches is not None:
+            if self.request_slots_enabled:
                 self._release_batch_state(req_id)
             elif isinstance(self.state, PagedStageState):
                 self.state.release(req_id)
@@ -1325,7 +1331,7 @@ class V41ModelRunner:
                 new.num_computed_tokens,
             )
             prefix = getattr(new, "prefill_token_ids", None)
-            if self.request_batches is not None and prefix is not None:
+            if self.request_slots_enabled and prefix is not None:
                 request = self.requests[new.req_id]
                 restores = getattr(scheduled, "auxiliary_prefix_operations", None)
                 checkpoint = restores.restores.get(new.req_id) if restores is not None else None
@@ -1339,7 +1345,7 @@ class V41ModelRunner:
             request = self.requests[req_id]
             new_blocks = cached.new_block_ids[index]
             if req_id in cached.resumed_req_ids:
-                if self.request_batches is not None:
+                if self.request_slots_enabled:
                     operations = getattr(scheduled, "auxiliary_prefix_operations", None)
                     checkpoint = operations.restores.get(req_id) if operations is not None else None
                     cached_prefix = (
@@ -1357,7 +1363,7 @@ class V41ModelRunner:
             request.num_computed_tokens = cached.num_computed_tokens[index]
             new_tokens = cached.new_token_ids[index] if cached.new_token_ids else []
             request.reconcile(cached.num_output_tokens[index], new_tokens, cached.all_token_ids.get(req_id))
-            if self.request_batches is not None and req_id in cached.resumed_req_ids:
+            if self.request_slots_enabled and req_id in cached.resumed_req_ids:
                 request.recompute_until = len(request.tokens)
 
     @staticmethod
@@ -1434,6 +1440,13 @@ class V41ModelRunner:
             and (getattr(program, "runtime_indexer", False) or start + count <= 1024)
         )
         graph_c1 = decode or c1_replay
+        if self.request_slots_enabled and request is not None and not decode and c1_replay:
+            # Scalar prompt tails own the same native addresses as decode.
+            # Publish the prefill slot before replay; larger prompt tiles keep
+            # their slot aliases. Forcing this tail through ordinary compiled
+            # groups instead creates a new graph inside each cold request.
+            bank = self.model.batch_state
+            bank.bind_single(bank.acquire(request_id), start)
         if self.direct_token_ids and graph_c1:
             if count != 1:
                 raise ValueError("Direct V4.1 token binding requires a C1 transaction")
@@ -1550,15 +1563,18 @@ class V41ModelRunner:
             else:
                 positions.copy_(torch.arange(start, start + count, dtype=torch.int32, device="cpu"))
         self._round_phase("inputs_staged_ns")
-        # Decode always uses a bucket-specific native plan, including paged
-        # CSA2 buckets above 1024. Prompt C1 capture remains bounded to the
-        # qualified prefix range so a one-token prefill tail cannot create a
-        # long-search graph variant. StageReplay keys plans by search bucket.
+        # Slot-owned scalar C1 tails have already published their state to
+        # the fixed replay addresses. They use the same warmed search buckets
+        # as decode; the legacy prompt/DSpark path keeps its bounded capture.
         use_replay = (
             getattr(self.model, "native", False)
             or (self.v2_completion and getattr(self.model, "tensor_parallel_size", 2) == 4)
-        ) and (decode or (start + count <= 1024 and (c1_replay or (self.use_dspark and request is not None))))
-        if self.request_batches is not None and request is not None and not decode:
+        ) and (
+            decode
+            or (c1_replay and (self.request_slots_enabled or start + count <= 1024))
+            or (start + count <= 1024 and self.use_dspark and request is not None)
+        )
+        if self.request_slots_enabled and request is not None and not decode and not c1_replay:
             # Prompt/tail transactions keep their request-slot aliases.
             # B1 decode binds the original working addresses before replay.
             use_replay = False
@@ -2360,6 +2376,18 @@ class V41ModelRunner:
         self.pp.group.barrier()
         self.state.clear()
         self.active_request = None
+        if getattr(self, "prefix_checkpoints", None) is not None:
+            from vllm_gaudi.ops.deepseek_v41_prefill_regions import freeze_prefill_regions
+
+            freeze_prefill_regions()
+            # Checkpoint cuts add page-boundary shapes to the ordinary compute
+            # buckets. Prime their bounded expert/index helpers against the
+            # real KV pool before API readiness; pure region misses stay eager.
+            for bucket in prefill_compute_buckets(self.prefill_capacity):
+                if bucket > 256:
+                    self._dummy_run(bucket - 128)
+            self.pp.group.barrier()
+            self.state.clear()
         if envs.VLLM_HPU_DSV41_VERIFY_TIMING:
             if (
                 not envs.VLLM_HPU_DSV41_DEVICE_VERIFY

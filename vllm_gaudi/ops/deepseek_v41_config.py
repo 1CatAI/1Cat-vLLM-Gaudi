@@ -132,7 +132,8 @@ def configure(config):
 
         if (
             not paged
-            or not envs.VLLM_HPU_DSV41_BATCH_DECODE
+            or not envs.VLLM_HPU_DSV41_GRAPH_REPLAY
+            or not envs.VLLM_HPU_DSV41_RUNTIME_INDEXER
             or envs.VLLM_HPU_DSV41_DSPARK
             or "auxiliary_prefix_operations" not in SchedulerOutput.__dataclass_fields__
             or "auxiliary_prefix_acknowledgments" not in ModelRunnerOutput.__dataclass_fields__

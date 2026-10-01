@@ -50,8 +50,12 @@ def scheduled(*, preempted=(), resumed=False, computed=0, blocks=([9], ), output
                            preempted_req_ids=set(preempted))
 
 
-def test_preempt_resume_retires_slot_history_and_retains_generated_prefix():
+@pytest.mark.parametrize("batch_execution", [True, False])
+def test_preempt_resume_retires_slot_history_and_retains_generated_prefix(batch_execution):
     runner, bank, released = fixture()
+    if not batch_execution:
+        runner.request_batches = None
+        runner.prefix_checkpoints = object()
     old = bank.slots.owners["a"]
     runner._update(scheduled(preempted=("a", )))
     assert not bank.slots.owners and released == ["a"] and runner.active_request is None
@@ -69,8 +73,12 @@ def test_preempt_resume_retires_slot_history_and_retains_generated_prefix():
 
 
 @pytest.mark.parametrize("computed,blocks", [(1, ([9], )), (0, None)])
-def test_resume_rejects_unrestored_partial_state_before_retirement(computed, blocks):
+@pytest.mark.parametrize("batch_execution", [True, False])
+def test_resume_rejects_unrestored_partial_state_before_retirement(computed, blocks, batch_execution):
     runner, bank, released = fixture()
+    if not batch_execution:
+        runner.request_batches = None
+        runner.prefix_checkpoints = object()
     old = bank.slots.owners["a"]
     with pytest.raises(ValueError, match="recomputation"):
         runner._update(scheduled(resumed=True, computed=computed, blocks=blocks))

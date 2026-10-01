@@ -63,6 +63,24 @@ dense device cache. The C1 FP8 sidecars below have their own storage contract.
 
 ## Execution
 
+### Prefix caching
+
+Ordinary paged serving can opt into prefix caching with
+`--enable-prefix-caching`, or `"enable_prefix_caching": true` in the installation
+settings. Explicit CLI flags take precedence. The matching pinned engine delta
+is required; workers reject an older engine before loading model state.
+Prompt usage exposes `prompt_tokens_details.cached_tokens` when enabled.
+
+A hit requires retained compressed KV pages and a checkpoint of SWA,
+compressor and Engram history acknowledged by every TP/PP rank. Checkpoints
+use complete 128-token page boundaries, retain a final uncached prompt page,
+and have bounded slot/byte budgets. Request-slot reuse reconstructs decoded
+mirrors before native replay consumes them. Equal text alone does not imply a
+hit: the token prefix must match. Checkpoints currently capture the prompt
+boundary; generated tokens do not automatically extend that auxiliary
+checkpoint for the next chat turn. Speculative execution does not support this
+checkpoint contract. The option remains off unless requested.
+
 The dedicated entrypoint enables the frozen-reference ordinary-C1 and V2
 device-continuation bundle by default. Launch without a feature-variable list:
 
