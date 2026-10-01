@@ -47,3 +47,41 @@ def test_cpu_supervisor_pins_new_threads_and_skips_unowned_roles(monkeypatch):
     current[1102] = {0}
     module.maintain_affinity(100, settings)
     assert current[1102] == {1, 2}
+
+
+
+def test_public_adapter_forwards_inference_and_hides_internal_routes():
+    import http.client
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+    module = tool("serve_deepseek_v41_api")
+    class Upstream(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+        def do_GET(self):
+            assert self.headers["Authorization"] == "Bearer test-key"
+            body = b'{"data": [{"id": "model"}]}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+    proxy = ThreadingHTTPServer(("127.0.0.1", 0), module.handler(
+        f"http://127.0.0.1:{upstream.server_port}", "test-key"))
+    for server in (upstream, proxy):
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        for route, authorized, expected in (("/v1/models", False, 401), ("/start_profile", True, 404),
+                                            ("/collective_rpc", True, 404), ("/v1/models", True, 200)):
+            connection = http.client.HTTPConnection("127.0.0.1", proxy.server_port, timeout=2)
+            connection.request("GET", route, headers={"Authorization": "Bearer test-key"} if authorized else {})
+            response = connection.getresponse()
+            body = response.read()
+            assert response.status == expected
+            if expected == 200:
+                assert body == b'{"data": [{"id": "model"}]}'
+            connection.close()
+    finally:
+        for server in (proxy, upstream):
+            server.shutdown()
+            server.server_close()

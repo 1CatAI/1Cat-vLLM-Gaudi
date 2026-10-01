@@ -428,3 +428,11 @@ checkout's environment variables, temporary graph dumps, manual thread binding,
 or an editable source directory. Validate a new installation with one unprofiled
 16K-to-natural-EOS request and the fixed semantic cohort before replacing the
 running release. Profiled timing and component estimates do not qualify it.
+
+
+For a public tunnel, run `tools/serve_deepseek_v41_api.py --api-key-file KEY_FILE`
+on a separate loopback port and expose that port. This streaming adapter allows
+only model queries, Chat/Completion generation and health; it rejects internal
+RPC, metrics and profiler routes even with a valid key. The backend remains
+loopback-only. Use the published model name and `temperature: 0` for the qualified
+ordinary greedy path. Requests with unsupported sampling modifiers fail explicitly.
