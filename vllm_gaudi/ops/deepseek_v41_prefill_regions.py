@@ -157,14 +157,24 @@ def prefill_function_region(function):
             envs.VLLM_HPU_DSV41_PREFILL_MHC_CONTROL_BF16,
             envs.VLLM_HPU_DSV41_PREFILL_MHC_POST_PREPARE,
         )
-        key = (
-            function.__module__,
-            function.__qualname__,
-            compile_mode,
-            _signature(args),
-            tuple((k, _signature(v)) for k, v in sorted(kwargs.items())),
-        )
-        entry = _function_regions.get(key)
+        family_key = function.__module__, function.__qualname__
+        # SWA has a distinct contract for every layer's decoded-cache offset.
+        # Keep each finite token geometry warm across all layers, instead of
+        # letting a long prompt evict the short prompt's compiled functions.
+        # These executors bind state/weights at runtime; native expert plans
+        # retain their separate workspace limit.
+        geometries = _function_regions.setdefault(family_key, OrderedDict())
+        rows = args[0].shape[0] if args and isinstance(args[0], torch.Tensor) and args[0].ndim else None
+        cache = geometries.get(rows)
+        if cache is None:
+            from vllm_gaudi.ops.deepseek_v41_prefill_capacity import PREFILL_COMPUTE_BUCKETS
+
+            cache = geometries[rows] = OrderedDict()
+            if len(geometries) > len(PREFILL_COMPUTE_BUCKETS):
+                geometries.popitem(last=False)
+        geometries.move_to_end(rows)
+        key = (compile_mode, _signature(args), tuple((k, _signature(v)) for k, v in sorted(kwargs.items())))
+        entry = cache.get(key)
         if entry is None:
             name = f"v41_prefill_function_{function.__name__}_{next(_entries)}"
             cloned = FunctionType(
@@ -176,11 +186,11 @@ def prefill_function_region(function):
             )
             cloned.__kwdefaults__ = function.__kwdefaults__
             entry = torch.compile(cloned, backend="hpu_backend", fullgraph=True, dynamic=False)
-            _function_regions[key] = entry
-            if len(_function_regions) > 64:
-                _function_regions.popitem(last=False)
+            cache[key] = entry
+            if len(cache) > 64:
+                cache.popitem(last=False)
         else:
-            _function_regions.move_to_end(key)
+            cache.move_to_end(key)
         try:
             return entry(*args, **kwargs)
         except RuntimeError as error:
