@@ -158,10 +158,21 @@ def prefill_function_region(function):
             envs.VLLM_HPU_DSV41_PREFILL_MHC_POST_PREPARE,
         )
         family_key = function.__module__, function.__qualname__
-        # Independent tensor functions must not evict each other's warmed
-        # contracts. These executors take weights/state as runtime arguments;
-        # native expert plans retain their separate, smaller workspace budget.
-        cache = _function_regions.setdefault(family_key, OrderedDict())
+        # SWA has a distinct contract for every layer's decoded-cache offset.
+        # Keep each finite token geometry warm across all layers, instead of
+        # letting a long prompt evict the short prompt's compiled functions.
+        # These executors bind state/weights at runtime; native expert plans
+        # retain their separate workspace limit.
+        geometries = _function_regions.setdefault(family_key, OrderedDict())
+        rows = args[0].shape[0] if args and isinstance(args[0], torch.Tensor) and args[0].ndim else None
+        cache = geometries.get(rows)
+        if cache is None:
+            from vllm_gaudi.ops.deepseek_v41_prefill_capacity import PREFILL_COMPUTE_BUCKETS
+
+            cache = geometries[rows] = OrderedDict()
+            if len(geometries) > len(PREFILL_COMPUTE_BUCKETS):
+                geometries.popitem(last=False)
+        geometries.move_to_end(rows)
         key = (compile_mode, _signature(args), tuple((k, _signature(v)) for k, v in sorted(kwargs.items())))
         entry = cache.get(key)
         if entry is None:

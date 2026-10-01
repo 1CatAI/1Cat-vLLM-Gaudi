@@ -43,22 +43,47 @@ def test_long_function_contracts_keep_short_function_warm_and_inputs_mutable(mon
     assert len(regions._function_regions) == 2
 
 
-def test_each_function_remains_bounded_and_preserves_layout_contract(monkeypatch):
+def test_long_geometry_preserves_all_short_swa_layer_contracts(monkeypatch):
     compiled = setup_cache(monkeypatch)
 
     @regions.prefill_function_region
-    def function(value):
-        return value + 1
+    def swa(value, offset):
+        return value + offset
 
-    for rows in range(1, 66):
+    short = torch.ones(256, 1)
+    long = torch.ones(8192, 1)
+    for layer in range(40):
+        swa(short, layer * 512)
+    for layer in range(40):
+        swa(long, layer * 512)
+    short.fill_(2)
+    for layer in range(40):
+        assert torch.equal(swa(short, layer * 512), short + layer * 512)
+    assert len(compiled) == 80
+
+
+def test_geometry_and_layer_contract_caches_remain_bounded(monkeypatch):
+    compiled = setup_cache(monkeypatch)
+
+    @regions.prefill_function_region
+    def function(value, offset=0):
+        return value + offset
+
+    for rows in range(1, 10):
         function(torch.zeros(rows))
-    assert len(next(iter(regions._function_regions.values()))) == 64
+    geometries = next(iter(regions._function_regions.values()))
+    assert len(geometries) == 8
     function(torch.zeros(1))
-    assert len(compiled) == 66
+    assert len(compiled) == 10
+    for offset in range(65):
+        function(torch.zeros(1), offset)
+    assert len(geometries[1]) == 64
+    count = len(compiled)
+    function(torch.zeros(1), 0)
+    assert len(compiled) == count + 1
     function(torch.zeros(1, dtype=torch.float64))
-    assert len(compiled) == 67
-    assert len(next(iter(regions._function_regions.values()))) == 64
+    assert len(geometries[1]) == 64
     regions.clear_prefill_function_regions()
     assert not regions._function_regions
     function(torch.zeros(1))
-    assert len(compiled) == 68
+    assert len(compiled) == count + 3
