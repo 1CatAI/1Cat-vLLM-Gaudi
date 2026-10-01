@@ -23,6 +23,17 @@ def handler(upstream, key):
             self.connection.settimeout(30)
         def log_message(self, format, *args):
             pass
+        def end_headers(self):
+            self.send_header("Access-Control-Allow-Origin", "*")
+            super().end_headers()
+        def do_OPTIONS(self):
+            if urlsplit(self.path).path not in ROUTES["GET"] | ROUTES["POST"]:
+                self.send_error(404)
+                return
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+            self.end_headers()
         def do_GET(self):
             self.forward()
         def do_POST(self):

@@ -81,6 +81,14 @@ def test_public_adapter_forwards_inference_and_hides_internal_routes():
             if expected == 200:
                 assert body == b'{"data": [{"id": "model"}]}'
             connection.close()
+        for route, expected in (("/v1/chat/completions", 204), ("/collective_rpc", 404)):
+            connection = http.client.HTTPConnection("127.0.0.1", proxy.server_port, timeout=2)
+            connection.request("OPTIONS", route)
+            response = connection.getresponse()
+            assert response.status == expected
+            assert response.getheader("Access-Control-Allow-Origin") == "*"
+            response.read()
+            connection.close()
     finally:
         for server in (proxy, upstream):
             server.shutdown()
