@@ -342,3 +342,29 @@ native使用mhc-post-collapse-native-02/source/csrc，配置runtime-profile-mhc-
 5. 累积兼容优化后统一验收：必要预热、一次正式自然EOS、输出语义及token检查；复用已测正式基线。
 6. 通过后更新正式基线并清零已接受项的待验收累计；失败时保留原基线，先用已有数据和组件定位。
 7. 任何后续整模或trace动作遵循用户最新范围；本轮不再继续prefill分析，不因分析元数据问题补测。
+
+
+### Independent default installation acceptance (2026-10-01)
+
+The ordinary installed C1 path passed one unprofiled 16K→natural-EOS formal
+request: **9.992734 ms/token (100.0727 tokens/s)**, 2,784 output tokens. All five
+fixed semantic samples exactly match the accepted reference tokens and final
+text. Complete warmup, 1M context and 32 request slots are retained. This
+acceptance validates relocation/default dispatch; it is not a new component gain.
+Pending microbenchmark gain remains **0 ms**.
+
+The runtime installation materializes Python dependencies, engine/plugin code,
+selected native libraries and relocated ABI records outside the editable
+workspace. It discovers dense precision from the installed sidecar. A machine
+allocation template and supervisor replace manual worker/control thread binding;
+model assets and the system SDK remain prerequisites. Native manifests match
+all maintained source fingerprints, and workers map no old-workspace libraries.
+CPU regression: 969 passed /114 skipped; three installation/API checks passed.
+
+The preflight initially rejected the SDK's automatic `profile_api_light` mode
+and sent no formal request. The corrected audit confirms no configured or active
+profiler. Observable ITL median9.915, P90 10.457, P99 12.271ms; >15ms0.252%,
+positive-tail excess0.235ms. One formal request is retained; no repeat cohort.
+CPU/card conditions and the continuous-foreign-card telemetry limitation are
+recorded in `evidence/20260928_tp4-decode-gap-1p5/portable-serving-acceptance-02`.
+The separate public streaming adapter restricts exposure to inference routes.
