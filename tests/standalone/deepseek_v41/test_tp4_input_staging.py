@@ -97,7 +97,8 @@ def test_decode_geometry_rebinds_after_prefill_generation_and_search_changes():
     assert len(uploads) == 5
 
 
-def test_scalar_prefill_slot_handoff_precedes_native_replay():
+@pytest.mark.parametrize("position,search", [(384, 512), (2048, 2560), (16384, 32768)])
+def test_scalar_prefill_slot_handoff_precedes_native_replay(position, search):
     from vllm_gaudi.v1.worker.deepseek_v41_runner import V41ModelRunner
 
     calls = []
@@ -134,8 +135,8 @@ def test_scalar_prefill_slot_handoff_precedes_native_replay():
     runner.pp = SimpleNamespace(group=SimpleNamespace(is_first_rank=True, is_last_rank=True))
     runner.audit = {"target_steps": 0, "target_tokens": 0, "prefill_steps": 0}
     runner._image_embeddings = lambda *_: None
-    runner._forward("cached", [42], 384, decode=False, request=object(), search_length=512)
-    assert calls == [(owner, 384), "replay"]
+    runner._forward("cached", [42], position, decode=False, request=object(), search_length=search)
+    assert calls == [(owner, position), "replay"]
 
 
 @pytest.mark.parametrize("start,stop", [(0, 0), (0, 2), (2, 5), (4, 5), (4, 9), (9, 12)])

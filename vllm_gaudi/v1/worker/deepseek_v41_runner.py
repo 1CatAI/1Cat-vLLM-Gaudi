@@ -1563,14 +1563,17 @@ class V41ModelRunner:
             else:
                 positions.copy_(torch.arange(start, start + count, dtype=torch.int32, device="cpu"))
         self._round_phase("inputs_staged_ns")
-        # Decode always uses a bucket-specific native plan, including paged
-        # CSA2 buckets above 1024. Prompt C1 capture remains bounded to the
-        # qualified prefix range so a one-token prefill tail cannot create a
-        # long-search graph variant. StageReplay keys plans by search bucket.
+        # Slot-owned scalar C1 tails have already published their state to
+        # the fixed replay addresses. They use the same warmed search buckets
+        # as decode; the legacy prompt/DSpark path keeps its bounded capture.
         use_replay = (
             getattr(self.model, "native", False)
             or (self.v2_completion and getattr(self.model, "tensor_parallel_size", 2) == 4)
-        ) and (decode or (start + count <= 1024 and (c1_replay or (self.use_dspark and request is not None))))
+        ) and (
+            decode
+            or (c1_replay and (self.request_slots_enabled or start + count <= 1024))
+            or (start + count <= 1024 and self.use_dspark and request is not None)
+        )
         if self.request_slots_enabled and request is not None and not decode and not c1_replay:
             # Prompt/tail transactions keep their request-slot aliases.
             # B1 decode binds the original working addresses before replay.
