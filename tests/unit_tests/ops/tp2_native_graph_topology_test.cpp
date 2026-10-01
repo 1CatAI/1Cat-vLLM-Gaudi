@@ -15,9 +15,9 @@ static std::vector<NativeNodeKind> chain(size_t groups, bool peer) {
 }
 
 int main() {
-  for (size_t collectives : {43, 45, 47, 49})
+  for (size_t collectives : {43, 44, 45, 46, 47, 48, 49, 50})
     assert(NativeGraphTopology::supportsV41SegmentedPrefix(5, collectives, false));
-  for (size_t collectives : {3, 8, 40, 42, 44, 46, 48, 50, 51})
+  for (size_t collectives : {3, 8, 40, 42, 55})
     assert(!NativeGraphTopology::supportsV41SegmentedPrefix(5, collectives, false));
   assert(!NativeGraphTopology::supportsV41SegmentedPrefix(5, 43, true));
   assert(!NativeGraphTopology::supportsV41SegmentedPrefix(1, 43, false));
@@ -40,9 +40,24 @@ int main() {
     assert(rejected);
   }
   assert(NativeGraphTopology::supportsV41Dependencies(1, 8, false));
-  assert(!NativeGraphTopology::supportsV41Dependencies(5, 41, false));
-  assert(!NativeGraphTopology::supportsV41Dependencies(5, 51, false));
-  assert(!NativeGraphTopology::supportsV41Dependencies(4, 43, false));
+  for (auto [groups, collectives] : std::vector<std::pair<size_t, size_t>>{{4, 41}, {4, 42}, {10, 99}, {10, 100}}) {
+    assert(NativeGraphTopology::supportsV41Dependencies(groups, collectives, false));
+    assert(NativeGraphTopology::supportsV41SegmentedPrefix(groups, collectives, false));
+    std::vector<NativeNodeKind> nodes;
+    for (size_t index = 0; index < collectives; ++index) {
+      nodes.push_back({false, false});
+      nodes.push_back({true, true});
+    }
+    nodes.push_back({false, false});
+    assert(NativeGraphTopology::prepare(nodes, groups, true, collectives, false).consumers.size() == collectives);
+    nodes.erase(nodes.begin() + 1);
+    bool rejected = false;
+    try { NativeGraphTopology::prepare(nodes, groups, true, collectives, false); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    assert(rejected);
+  }
+  assert(!NativeGraphTopology::supportsV41Dependencies(4, 45, false));
+  assert(!NativeGraphTopology::supportsV41Dependencies(10, 105, false));
   for (size_t groups : {1, 8}) for (bool peer : {false, true}) {
     const auto nodes = chain(groups, peer);
     const auto layout = NativeGraphTopology::prepare(nodes, groups);

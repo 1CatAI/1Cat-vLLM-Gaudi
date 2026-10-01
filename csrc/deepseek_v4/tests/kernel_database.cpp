@@ -50,6 +50,125 @@ int main() {
     assert(custom_count >= 52);
     assert(selected_kv_seen);
     assert(device_engram_seen);
+    for (unsigned rows : {1u, 2u, 6u}) {
+        HabanaKernelParams p{}; HabanaKernelInstantiation out{};
+        Tensor inputs[5]{}, outputs[1]{};
+        TensorAccessPattern ia[5]{}, oa[1]{};
+        p.inputTensors=inputs;p.inputTensorNr=5;p.outputTensors=outputs;p.outputTensorNr=1;
+        out.inputTensorAccessPattern=ia;out.outputTensorAccessPattern=oa;
+        std::strcpy(p.guid.name,"custom_deepseek_v41_engram_update_bf16_gaudi2");
+        float eps=1e-20f;p.nodeParams.nodeParams=&eps;p.nodeParams.nodeParamsSize=sizeof(eps);
+        auto set=[](Tensor& t,TensorDataType type,std::initializer_list<uint64_t> dims) {
+            t.geometry.dataType=type;t.geometry.dims=dims.size();unsigned i=0;
+            for (auto size:dims)t.geometry.maxSizes[i++]=size;
+        };
+        set(inputs[0],DATA_BF16,{5120,4,rows});set(inputs[1],DATA_BF16,{25600,rows});
+        set(inputs[2],DATA_BF16,{5120,4});set(inputs[3],DATA_BF16,{5120,4});
+        set(inputs[4],DATA_I8,{rows});set(outputs[0],DATA_BF16,{5120,4,rows});
+        assert(InstantiateTpcKernel(&p,&out)==GLUE_INSUFFICIENT_ELF_BUFFER);
+        assert(out.indexSpaceGeometry[0]==4 && out.indexSpaceGeometry[1]==rows);
+        float emitted=0;std::memcpy(&emitted,out.kernel.scalarParams,sizeof(emitted));assert(emitted==eps);
+        eps=0;assert(InstantiateTpcKernel(&p,&out)==GLUE_FAILED);eps=1e-20f;
+        inputs[4].geometry.dataType=DATA_I32;
+        assert(InstantiateTpcKernel(&p,&out)==GLUE_INCOMPATIBLE_DATA_TYPE);
+    }
+    for (bool publish : {false, true}) for (unsigned rows : {1u, 2u, 6u}) {
+        HabanaKernelParams p{};
+        HabanaKernelInstantiation q{};
+        Tensor inputs[2]{}, outputs[3]{};
+        TensorAccessPattern ia[2]{}, oa[3]{};
+        p.inputTensors = inputs; p.inputTensorNr = 2;
+        p.outputTensors = outputs; p.outputTensorNr = publish ? 3 : 2;
+        q.inputTensorAccessPattern = ia; q.outputTensorAccessPattern = oa;
+        const unsigned width = publish ? 5120 : 1280;
+        float scalar[] = {1e-6f, 1.f/width};
+        p.nodeParams.nodeParams = scalar; p.nodeParams.nodeParamsSize = sizeof(scalar);
+        std::strcpy(p.guid.name, publish ? "custom_deepseek_v41_attention_norm_quant_gaudi2" :
+                                        "custom_deepseek_v41_qnorm_quant_gaudi2");
+        auto set = [](Tensor& t, TensorDataType type, std::initializer_list<uint64_t> dimensions) {
+            t.geometry.dataType = type; t.geometry.dims = dimensions.size(); unsigned index = 0;
+            for (auto size : dimensions) t.geometry.maxSizes[index++] = size;
+        };
+        set(inputs[0], DATA_BF16, {width, rows}); set(inputs[1], DATA_BF16, {width});
+        set(outputs[0], DATA_F8_143, {width, rows}); set(outputs[1], DATA_F32, {1, rows});
+        set(outputs[2], DATA_BF16, {width, rows});
+        assert(InstantiateTpcKernel(&p, &q) == GLUE_INSUFFICIENT_ELF_BUFFER);
+        assert(q.indexSpaceGeometry[0] == rows && q.kernel.paramsNr == 2);
+        scalar[1] *= 2;
+        assert(InstantiateTpcKernel(&p, &q) == GLUE_FAILED);
+        scalar[1] *= .5f;
+        if (publish) {
+            outputs[2].geometry.maxSizes[1]++;
+            assert(InstantiateTpcKernel(&p, &q) == GLUE_INCOMPATIBLE_OUTPUT_SIZE);
+        }
+    }
+    for (unsigned tokens : {1u, 2u, 6u}) {
+        for (int ratio : {1, 2}) {
+            HabanaKernelParams p{};
+            HabanaKernelInstantiation q{};
+            Tensor inputs[6]{}, outputs[3]{};
+            TensorAccessPattern ia[6]{}, oa[3]{};
+            p.inputTensors = inputs; p.inputTensorNr = 6;
+            p.outputTensors = outputs; p.outputTensorNr = 3;
+            p.nodeParams.nodeParams = &ratio; p.nodeParams.nodeParamsSize = sizeof(ratio);
+            q.inputTensorAccessPattern = ia; q.outputTensorAccessPattern = oa;
+            std::strcpy(p.guid.name, "custom_deepseek_v41_logical_mla_gather_gaudi2");
+            auto set = [](Tensor& t, TensorDataType type, std::initializer_list<uint64_t> dims) {
+                t.geometry.dataType = type; t.geometry.dims = dims.size();
+                unsigned d = 0;
+                for (auto value : dims) t.geometry.maxSizes[d++] = value;
+            };
+            set(inputs[0], DATA_U8, {528, 256});
+            set(inputs[1], DATA_U8, {288, 6178944u / unsigned(ratio)});
+            set(inputs[2], DATA_I32, {512, tokens});
+            set(inputs[3], DATA_I32, {tokens});
+            set(inputs[4], DATA_I32, {8192});
+            set(inputs[5], DATA_I32, {tokens});
+            set(outputs[0], DATA_BF16, {512, 640, tokens});
+            set(outputs[1], DATA_F32, {512, 640, tokens});
+            set(outputs[2], DATA_F32, {640, tokens});
+            assert(InstantiateTpcKernel(&p, &q) == GLUE_INSUFFICIENT_ELF_BUFFER);
+            assert(q.indexSpaceGeometry[0] == 640 && q.indexSpaceGeometry[1] == tokens);
+            assert(ia[0].sparseAccess && ia[1].sparseAccess && ia[4].sparseAccess);
+            inputs[4].geometry.maxSizes[0] = 0;
+            assert(InstantiateTpcKernel(&p, &q) == GLUE_INCOMPATIBLE_INPUT_SIZE);
+            inputs[4].geometry.maxSizes[0] = 8192;
+            outputs[1].geometry.dataType = DATA_BF16;
+            assert(InstantiateTpcKernel(&p, &q) == GLUE_INCOMPATIBLE_OUTPUT_SIZE);
+        }
+    }
+    {
+        HabanaKernelParams p{};
+        HabanaKernelInstantiation q{};
+        Tensor inputs[5]{}, outputs[3]{};
+        TensorAccessPattern ia[5]{}, oa[3]{};
+        p.inputTensors = inputs; p.inputTensorNr = 5;
+        p.outputTensors = outputs; p.outputTensorNr = 3;
+        q.inputTensorAccessPattern = ia; q.outputTensorAccessPattern = oa;
+        std::strcpy(p.guid.name, "custom_deepseek_v41_paged_mla_gather_gaudi2");
+        auto set = [](Tensor& t, TensorDataType type, std::initializer_list<uint64_t> dims) {
+            t.geometry.dataType = type; t.geometry.dims = dims.size();
+            unsigned d = 0;
+            for (auto value : dims) t.geometry.maxSizes[d++] = value;
+        };
+        set(inputs[0], DATA_U8, {528, 256});
+        set(inputs[1], DATA_U8, {288, 6179072});
+        set(inputs[2], DATA_I32, {768, 1});
+        set(inputs[3], DATA_I32, {640, 1});
+        set(inputs[4], DATA_I32, {1});
+        set(outputs[0], DATA_BF16, {512, 640, 1});
+        set(outputs[1], DATA_F32, {512, 640, 1});
+        set(outputs[2], DATA_F32, {640, 1});
+        assert(InstantiateTpcKernel(&p, &q) == GLUE_INSUFFICIENT_ELF_BUFFER);
+        assert(q.indexSpaceGeometry[0] == 640 && q.indexSpaceGeometry[1] == 1);
+        assert(ia[2].allRequired && !ia[3].allRequired);
+        assert(oa[0].mapping[0].end_b == 511 && oa[1].mapping[1].a == 1);
+        inputs[3].geometry.maxSizes[1] = 2;
+        assert(InstantiateTpcKernel(&p, &q) == GLUE_INCOMPATIBLE_INPUT_SIZE);
+        inputs[3].geometry.maxSizes[1] = 1;
+        outputs[1].geometry.dataType = DATA_BF16;
+        assert(InstantiateTpcKernel(&p, &q) == GLUE_INCOMPATIBLE_OUTPUT_SIZE);
+    }
     HabanaKernelParams params{};
     HabanaKernelInstantiation instance{};
     std::strcpy(
@@ -128,4 +247,57 @@ int main() {
     assert(instance.indexSpaceGeometry[0] == 64 && instance.indexSpaceGeometry[2] == 6);
     assert(headIA[0].sparseAccess && headOA[0].mapping[1].a == 8);
 
+    // Compact TP4 scales must cover both original group bytes and the final
+    // channel-code row, including when Synapse slices the K index space.
+    for (const auto& test : std::vector<std::vector<uint64_t>>{
+             {1280, 5120, 6}, {5120, 640, 6}, {1280, 5120, 1}}) {
+        const auto n = test[0], k = test[1], slots = test[2];
+        for (const auto* guid : {"custom_deepseek_v41_expert_n256_fp8_gaudi2",
+                                 "custom_deepseek_v41_expert_n256_bf16_gaudi2"}) {
+            Tensor expertInputs[4]{}, expertOutputs[1]{};
+            TensorAccessPattern expertIA[4]{}, expertOA[1]{};
+            params = {}; instance = {};
+            params.inputTensors = expertInputs; params.inputTensorNr = 4;
+            params.outputTensors = expertOutputs; params.outputTensorNr = 1;
+            instance.inputTensorAccessPattern = expertIA; instance.outputTensorAccessPattern = expertOA;
+            std::strcpy(params.guid.name, guid);
+            shape(expertInputs[0], DATA_I32, {slots, 1});
+            shape(expertInputs[1], DATA_I16, {k * 64, n / 256, 384});
+            shape(expertInputs[2], DATA_I16, {k * 4 + 128, n / 256, 384});
+            shape(expertInputs[3], DATA_BF16, {128});
+            shape(expertOutputs[0], std::strstr(guid, "_fp8_") ? DATA_F8_143 : DATA_BF16, {n, k, slots});
+            assert(InstantiateTpcKernel(&params, &instance) == GLUE_INSUFFICIENT_ELF_BUFFER);
+            assert(expertIA[2].mapping[0].a == 0 && expertIA[2].mapping[0].end_b == k * 4 + 127);
+            const unsigned tile = std::strstr(guid, "_fp8_") && slots % 2 == 0 ? 2 : 1;
+            assert(expertOA[0].mapping[1].a == 128 && expertOA[0].mapping[2].a == tile);
+            expertInputs[2].geometry.maxSizes[0] -= 1;
+            assert(InstantiateTpcKernel(&params, &instance) == GLUE_INCOMPATIBLE_INPUT_SIZE);
+        }
+    }
+
+    // Keep routed expert identity explicit when the TP4 decoder processes a
+    // bounded pair. Odd slot counts and the TP2 shapes retain their old map.
+    for (const auto& test : std::vector<std::vector<uint64_t>>{
+             {1280, 5120, 6, 2}, {5120, 640, 6, 2}, {1280, 5120, 12, 2},
+             {5120, 640, 36, 2}, {1280, 5120, 1, 1}, {1280, 5120, 3, 1},
+             {2560, 5120, 6, 1}, {5120, 1280, 6, 1}}) {
+        const auto n = test[0], k = test[1], slots = test[2], tile = test[3];
+        Tensor expertInputs[4]{}, expertOutputs[1]{};
+        TensorAccessPattern expertIA[4]{}, expertOA[1]{};
+        params = {}; instance = {};
+        params.inputTensors = expertInputs; params.inputTensorNr = 4;
+        params.outputTensors = expertOutputs; params.outputTensorNr = 1;
+        instance.inputTensorAccessPattern = expertIA; instance.outputTensorAccessPattern = expertOA;
+        std::strcpy(params.guid.name, "custom_deepseek_v41_expert_n256_fp8_gaudi2");
+        shape(expertInputs[0], DATA_I32, {slots, 1});
+        shape(expertInputs[1], DATA_I16, {k * 64, n / 256, 384});
+        shape(expertInputs[2], DATA_I16, {k * 8, n / 256, 384});
+        shape(expertInputs[3], DATA_BF16, {128});
+        shape(expertOutputs[0], DATA_F8_143, {n, k, slots});
+        assert(InstantiateTpcKernel(&params, &instance) == GLUE_INSUFFICIENT_ELF_BUFFER);
+        assert(instance.indexSpaceRank == 3 && instance.indexSpaceGeometry[1] == slots / tile);
+        assert(expertIA[0].mapping[0].a == tile && expertIA[0].mapping[0].end_b == tile - 1);
+        assert(expertOA[0].mapping[2].a == tile && expertOA[0].mapping[2].end_b == tile - 1);
+        assert(expertIA[1].mapping[2].end_b == 383 && expertIA[2].mapping[2].end_b == 383);
+    }
 }

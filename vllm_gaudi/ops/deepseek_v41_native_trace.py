@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """On-demand Synapse raw capture; offline parsing avoids concurrent Kineto expansion."""
+
 import ctypes
 import logging
 from contextlib import contextmanager
@@ -37,7 +38,7 @@ def _local_accel_name():
             target = os.readlink(descriptor)
         except OSError:
             continue
-        if target.startswith("/dev/accel/accel") and target[len("/dev/accel/accel"):].isdigit():
+        if target.startswith("/dev/accel/accel") and target[len("/dev/accel/accel") :].isdigit():
             names.add(Path(target).name)
     return next(iter(names)) if len(names) == 1 else None
 
@@ -46,7 +47,6 @@ def prefill_span(name):
     """Mark host submission scope without synchronizing or altering a graph."""
 
     def decorate(function):
-
         @wraps(function)
         def invoke(*args, **kwargs):
             if torch.compiler.is_compiling():
@@ -56,6 +56,7 @@ def prefill_span(name):
                 return function(*args, **kwargs)
             layer = getattr(args[0], "layer", "unknown")
             from vllm_gaudi.ops.deepseek_v41_prefill_event_trace import span
+
             with span(name, layer, first.shape[0]), scope(f"v41::prefill::{name}::layer{layer}::C{first.shape[0]}"):
                 return function(*args, **kwargs)
 
@@ -100,7 +101,6 @@ def _check(status, name):
 
 
 class NativeTrace:
-
     def __init__(self, cpu_trace_dir=None, *, scope_only=False):
         if scope_only and cpu_trace_dir is None:
             raise ValueError("Scope-only capture requires a trace output directory")
@@ -122,36 +122,45 @@ class NativeTrace:
         first, last = self.clock_samples
         raw0 = (first["monotonic_raw_before_ns"] + first["monotonic_raw_after_ns"]) // 2
         raw1 = (last["monotonic_raw_before_ns"] + last["monotonic_raw_after_ns"]) // 2
-        wall0 = (first["wall_before_ns"] + first["wall_after_ns"]) // 2
-        wall1 = (last["wall_before_ns"] + last["wall_after_ns"]) // 2
-        scale = (wall1 - wall0) / (raw1 - raw0)
-        if not .999 < scale < 1.001:
-            raise RuntimeError("Scope/device clock calibration changed rate unexpectedly")
-        base = wall0 // 1_000_000_000 * 1_000_000_000
+        # Explicit scopes and the SDK's calibrated device events already use
+        # MONOTONIC_RAW. Keep that common clock instead of stretching durations
+        # to a wall clock that may step during NTP correction.
+        base = raw0 // 1_000_000_000 * 1_000_000_000
         events = [
-            dict(name=label,
-                 ph="X",
-                 cat="user_annotation",
-                 pid=os.getpid(),
-                 tid=tid,
-                 ts=((start - raw0) * scale + (wall0 - base)) / 1000,
-                 dur=(end - start) * scale / 1000) for start, end, tid, label in self.scope_events
+            dict(
+                name=label,
+                ph="X",
+                cat="user_annotation",
+                pid=os.getpid(),
+                tid=tid,
+                ts=(start - base) / 1000,
+                dur=(end - start) / 1000,
+            )
+            for start, end, tid, label in self.scope_events
         ]
         events.append(
-            dict(name="NativeTrace scope-only capture",
-                 ph="X",
-                 cat="trace_boundary",
-                 pid=os.getpid(),
-                 tid=0,
-                 ts=(wall0 - base) / 1000,
-                 dur=(wall1 - wall0) / 1000))
+            dict(
+                name="NativeTrace scope-only capture",
+                ph="X",
+                cat="trace_boundary",
+                pid=os.getpid(),
+                tid=0,
+                ts=(raw0 - base) / 1000,
+                dur=(raw1 - raw0) / 1000,
+            )
+        )
         path = self.cpu_trace_dir / f"native_{os.getpid()}.{time.time_ns()}.pt.trace.json.gz"
         with gzip.open(path, "wt") as stream:
             json.dump(
-                dict(schemaVersion=1,
-                     baseTimeNanoseconds=base,
-                     traceEvents=events,
-                     recorder="explicit scopes only; no torch CPU operator profiling"), stream)
+                dict(
+                    schemaVersion=1,
+                    baseTimeNanoseconds=base,
+                    traceEvents=events,
+                    clockDomain="CLOCK_MONOTONIC_RAW",
+                    recorder="explicit scopes only; no torch CPU operator profiling",
+                ),
+                stream,
+            )
 
     def _clock_sample(self, label):
         clock = ctypes.c_uint64()
@@ -161,12 +170,15 @@ class NativeTrace:
         raw_after = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
         after = time.time_ns()
         self.clock_samples.append(
-            dict(label=label,
-                 synapse_clock_ns=clock.value,
-                 monotonic_raw_before_ns=raw_before,
-                 monotonic_raw_after_ns=raw_after,
-                 wall_before_ns=before,
-                 wall_after_ns=after))
+            dict(
+                label=label,
+                synapse_clock_ns=clock.value,
+                monotonic_raw_before_ns=raw_before,
+                monotonic_raw_after_ns=raw_after,
+                wall_before_ns=before,
+                wall_after_ns=after,
+            )
+        )
 
     def _published_files(self):
         paths = [self._directory / f"{self._session}_{os.getpid()}.hltv"]
@@ -203,11 +215,12 @@ class NativeTrace:
         if self.capture_cpu:
             self.cpu_trace_dir.mkdir(parents=True, exist_ok=True)
         if self.capture_cpu and not self.scope_only:
-            self.cpu_profiler = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU],
-                                                       record_shapes=False,
-                                                       with_stack=False,
-                                                       on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                                                           str(self.cpu_trace_dir), use_gzip=True))
+            self.cpu_profiler = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU],
+                record_shapes=False,
+                with_stack=False,
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(str(self.cpu_trace_dir), use_gzip=True),
+            )
             self.cpu_profiler.start()
             set_torch_annotations(True)
         api = _api()
@@ -240,7 +253,8 @@ class NativeTrace:
         # Stop alone does not publish a bundle with every supported SDK.
         _check(api.synProfilerGetTrace(1, 0, 1, None, None, None), "trace file publication")
         published = [
-            path for path, state in self._published_files().items()
+            path
+            for path, state in self._published_files().items()
             if state[0] > 0 and state != self._output_before.get(path)
         ]
         if not published or (len(published) != 1 and not self.capture_cpu):
@@ -251,15 +265,18 @@ class NativeTrace:
             set_torch_annotations(False)
         if self.scope_only:
             self._export_scopes()
-        self.metadata = dict(pid=os.getpid(),
-                             raw_files=[str(path) for path in published],
-                             raw_directory=str(self._directory),
-                             session=self._session,
-                             clock_samples=self.clock_samples,
-                             capture_cpu=self.capture_cpu,
-                             cpu_trace_mode="scopes_only" if self.scope_only else "torch_cpu",
-                             explicit_scope_count=len(self.scope_events),
-                             stop_complete_wall_ns=time.time_ns())
+        self.metadata = dict(
+            pid=os.getpid(),
+            raw_files=[str(path) for path in published],
+            raw_directory=str(self._directory),
+            session=self._session,
+            clock_samples=self.clock_samples,
+            capture_cpu=self.capture_cpu,
+            cpu_trace_mode="scopes_only" if self.scope_only else "torch_cpu",
+            scope_clock_domain="CLOCK_MONOTONIC_RAW" if self.scope_only else "wall",
+            explicit_scope_count=len(self.scope_events),
+            stop_complete_wall_ns=time.time_ns(),
+        )
         if self.cpu_trace_dir is not None:
             destination = self.cpu_trace_dir / f"raw-capture-{os.getpid()}-{time.time_ns()}.json"
             destination.write_text(json.dumps(self.metadata, indent=2) + "\n")
@@ -296,7 +313,8 @@ def scope(label):
             if status == 18:  # synUnsupported: raw kernel events remain usable.
                 _annotations_supported = False
                 logging.getLogger(__name__).warning(
-                    "Synapse custom measurements are unsupported; continuing raw kernel capture without annotations")
+                    "Synapse custom measurements are unsupported; continuing raw kernel capture without annotations"
+                )
             else:
                 _check(status, "scope annotation")
                 _annotations_supported = True

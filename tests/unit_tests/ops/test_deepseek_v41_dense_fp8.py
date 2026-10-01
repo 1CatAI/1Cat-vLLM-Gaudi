@@ -15,7 +15,7 @@ from vllm_gaudi.ops.deepseek_v41_woa_fp8 import (covering_scale, decode_gaudi2, 
 
 def test_block32_k_scales_and_woa_compatibility():
     rng = np.random.default_rng(371)
-    for k in (1280, 4096):
+    for k in (576, 1152, 1280, 4096):
         codes = rng.integers(0, 120, (64, k), dtype=np.uint8)
         scales = rng.integers(120, 133, (2, k // 32), dtype=np.uint8)
         q, s, _ = prepare_block32_rows(codes, scales)
@@ -160,3 +160,21 @@ def test_device_encoding_projection_and_changing_input(k, n):
                             "rmse": error.square().mean().sqrt().item(), "eager_compiled_equal": equal,
                             "runtime_mme_difference_isolated": not equal})
     Path(os.environ["DSV41_RUN_EVIDENCE"], f"dense-{k}-{n}.json").write_text(json.dumps(records, indent=2))
+
+
+def test_input_shared_tp_block_alignment_and_pair_selection(tmp_path):
+    from vllm_gaudi.ops.deepseek_v41_dense_fp8 import INPUT_PROJECTIONS, shapes_for_tp, projection_prefix
+    for tp in (2, 4):
+        shapes = shapes_for_tp(tp, INPUT_PROJECTIONS)
+        assert shapes["shared_w1"][0] * tp == 2304
+        assert shapes["shared_w2"][1] * tp == 2304
+        assert all(n % 32 == k % 32 == 0 for n, k in shapes.values())
+    config = {"version": 2, "wq_b": [], "wo_b": [], **{p: [0, 4] for p in INPUT_PROJECTIONS}}
+    path = tmp_path / "precision.json"
+    path.write_text(json.dumps(config))
+    assert precision_config(path) == config
+    assert projection_prefix(4, "shared_w2") == "layers.4.ffn.shared_experts.w2."
+    config["wkv"] = [0]
+    path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="identical layers"):
+        precision_config(path)

@@ -23,8 +23,9 @@ from deepseek_v41_trace_accounting import device_partition, host_accounting, mer
 def io(node, prefix):
     return [
         tensor(v)
-        for k, v in sorted(node["attrs"].items(),
-                           key=lambda pair: (int(pair[0].split(":")[-1]) if pair[0].startswith(prefix) else -1))
+        for k, v in sorted(
+            node["attrs"].items(), key=lambda pair: (int(pair[0].split(":")[-1]) if pair[0].startswith(prefix) else -1)
+        )
         if k.startswith(prefix)
     ]
 
@@ -42,6 +43,11 @@ def classify(node, kernel, inputs, outputs):
             return "路由专家", "W2 结果缩放、逐路 BF16 舍入与六路有序归约，直接写最终 BF16 输出"
         return "路由专家", "六路已缩放 BF16 专家结果按路由顺序作 FP32 归约，再舍入 BF16"
     native_roles = {
+        "deepseek_v41_mhc_post_collapse": ("mHC", "四流 residual 更新、BF16 舍入和下一 FFN collapse 融合"),
+        "deepseek_v41_main_publish_gather": ("Attention", "发布组内共享的主 KV，并准备当前层 K/V 与 mask"),
+        "deepseek_v41_main_reuse_gather": ("Attention", "复用组内主 KV，合并当前层滑动窗口 K/V 与 mask"),
+        "deepseek_v41_silu_activate_tile": ("路由专家", "按特征块执行 W13 缩放、SwiGLU、路由加权和局部最大值"),
+        "deepseek_v41_silu_quant_tile": ("路由专家", "合并行最大值并按特征块量化 W2 的 FP8 输入"),
         "deepseek_v41_compressor_pair": ("CSA2", "双帧压缩、门控合并及历史状态更新"),
         "deepseek_v41_final_collapse_norm": ("输出头", "最终四流 residual collapse 与 RMSNorm"),
         "deepseek_v41_fp4_pack_g16": ("量化", "主 KV 的 FP4 编码与 group16 E4M3 scale"),
@@ -52,6 +58,14 @@ def classify(node, kernel, inputs, outputs):
         "deepseek_v41_qnorm_quant": ("Attention", "Q 输入 RMSNorm 与 FP8 激活量化"),
         "deepseek_v41_router_logits_top6": ("Router", "FP32 logits 的 softplus/sqrt、偏置选择及 top6 路由归一化"),
         "deepseek_v41_selected_mla_gather": ("Attention", "选中 MLA 行的 KV 读取与实际矩阵输入准备"),
+        "deepseek_v41_paged_mla_gather": (
+            "Attention",
+            "按选中行直接解码 FP8/FP4 KV，生成 BF16 QK 输入、BF16 舍入后的 FP32 PV 输入和 mask",
+        ),
+        "deepseek_v41_logical_mla_gather": (
+            "Attention",
+            "融合逻辑索引、页表和滑动窗口寻址，直接生成 BF16 K、经过 BF16 舍入的 FP32 V 和有效 mask",
+        ),
         "deepseek_v41_selected_mla_softmax": ("Attention", "选中 MLA 行的 softmax/sink 与概率准备"),
         "deepseek_v41_index_keys": ("CSA2", "物理 page 查找与 FP4 index key 解码，供多头 MME 复用"),
         "deepseek_v41_prefill_main_decode": ("CSA2", "prefill 主 KV page 查找与 FP4 解码，共享 BF16 工作区"),
@@ -78,13 +92,16 @@ def classify(node, kernel, inputs, outputs):
         return "mHC", "mHC gate、Sinkhorn 输入及 residual mixing 系数准备"
     if "deepseek_v41_ffn_norm_quant" in kernel:
         return "MoE 准备", "FFN RMSNorm、动态 FP8 scale 与激活量化融合"
-    if any(part in kernel
-           for part in ("deepseek_v41_index_scores", "deepseek_v41_index_threshold", "deepseek_v41_index_emit")):
+    if any(
+        part in kernel
+        for part in ("deepseek_v41_index_scores", "deepseek_v41_index_threshold", "deepseek_v41_index_emit")
+    ):
         return "CSA2", "CSA2 Reindex 候选打分、阈值选择及紧凑候选槽输出"
     if "deepseek_v41_q_scale_rope" in kernel:
         return "Attention", "wq_b FP32 结果缩放、BF16 舍入及 Q RoPE 融合"
-    if any(part in name
-           for part in ("deepseek_v41_q_projection_rope", "prefill_q_projection", "q_norm_projection_rope")):
+    if any(
+        part in name for part in ("deepseek_v41_q_projection_rope", "prefill_q_projection", "q_norm_projection_rope")
+    ):
         return "Attention", "wq_b 原生 FP8 投影与 RoPE；实际操作数见合同"
     if "deepseek_v41_mla_shared_kv" in kernel:
         return "Attention", "MLA 候选 KV 一次 BF16 准备，共用于 QK/PV"
@@ -92,7 +109,17 @@ def classify(node, kernel, inputs, outputs):
         return "Attention", "MLA FP32 softmax/sink 统计、BF16 指数权重及 FP32 分母"
     if "deepseek_v41_mla_normalize_bf16" in kernel:
         return "Attention", "MLA FP32 PV 结果归一化、BF16 输出"
-    if any(part in name for part in ("deepseek_v41_selected_mla_mme", "deepseek_v41_paged_mla_mme")):
+    if any(
+        part in name
+        for part in (
+            "deepseek_v41_selected_mla_mme",
+            "deepseek_v41_paged_mla_mme",
+            "deepseek_v41_paged_mla_direct_mme",
+            "deepseek_v41_logical_mla_gaudi2",
+            "deepseek_v41_main_publish_mla",
+            "deepseek_v41_main_reuse_mla",
+        )
+    ):
         if kernel.lower().replace("_", "") in ("gemm", "batchgemm") and inputs:
             # hpu_dsv41_selected_mla_pt2.cpp builds BF16 QK, then an
             # FP32 probability x FP32 V product. PostGraph may fuse the final
@@ -104,8 +131,15 @@ def classify(node, kernel, inputs, outputs):
         if kernel in ("GEMM", "BatchGemm", "gemm", "batch_gemm"):
             output = outputs[0].get("shape", []) if outputs else []
             ambiguous = inputs and inputs[0].get("shape", [])[-1:] == [512] and output[-1:] == [512]
-            role = ("QK/PV 尚待转置描述符关联" if ambiguous else
-                    "PV" if output and output[-1] == 512 else "QK" if output else "QK/PV 尚待形状关联")  # noqa: E501
+            role = (
+                "QK/PV 尚待转置描述符关联"
+                if ambiguous
+                else "PV"
+                if output and output[-1] == 512
+                else "QK"
+                if output
+                else "QK/PV 尚待形状关联"
+            )  # noqa: E501
             return "Attention", "MLA " + role + " 矩阵计算；实际操作数见合同"
         return "Attention", "MLA 内部准备/别名/搬运"
     if "deepseek_v41_attention_norm" in kernel:
@@ -120,8 +154,11 @@ def classify(node, kernel, inputs, outputs):
         if kernel in ("GEMM", "BatchGemm", "gemm", "batch_gemm"):
             if not inputs:
                 return "Attention", "MLA 矩阵计算，操作数尚未关联"
-            return "Attention", ("MLA QK：BF16×BF16，FP32 结果"
-                                 if inputs[0]["dtype"] == "bf16" else "MLA PV：FP32 概率×FP32 V，FP32 累加")
+            return "Attention", (
+                "MLA QK：BF16×BF16，FP32 结果"
+                if inputs[0]["dtype"] == "bf16"
+                else "MLA PV：FP32 概率×FP32 V，FP32 累加"
+            )
         return "Attention", "MLA 内部转换、矩阵输入准备及数据搬运"
     if "deepseek_v41_router_top6" in kernel:
         return "Router", "text/image bias 选择、六次最大值选择、原分数归一化"
@@ -149,8 +186,13 @@ def classify(node, kernel, inputs, outputs):
         weight = inputs[1]["shape"] if len(inputs) > 1 and kernel in ("GEMM", "BatchGemm", "gemm", "batch_gemm") else []
         if weight == [25600, 6144]:
             return "Engram", "查询行到 key/value 的 FP8 wkv 投影，实际操作数见合同"
-        projection = ("wq_b" if weight in ([16384, 1280], [8192, 1280]) else
-                      "wo_b" if weight in ([5120, 4096], [5120, 2048]) else "Attention dense FP8")
+        projection = (
+            "wq_b"
+            if weight in ([16384, 1280], [8192, 1280])
+            else "wo_b"
+            if weight in ([5120, 4096], [5120, 2048])
+            else "Attention dense FP8"
+        )
         return "Attention", projection + (" 原生矩阵计算，实际操作数见合同" if weight else " 内部准备/转换/搬运")
     if "deepseek_v41_bf16_linear_f32" in name and kernel in ("GEMM", "BatchGemm", "gemm", "batch_gemm"):
         if "router" in name or "/moe/" in name or (len(inputs) > 1 and inputs[1]["shape"] == [384, 5120]):
@@ -177,8 +219,13 @@ def classify(node, kernel, inputs, outputs):
         if not kernel:
             return "路由专家", "专家内部张量准备/广播；实际操作来源见节点与张量合同"
         shape = inputs[1]["shape"] if kernel in ("GEMM", "BatchGemm", "gemm", "batch_gemm") and len(inputs) > 1 else []
-        stage = ("W13 gate/up" if shape and any(width in shape for width in (2304, 1280)) else
-                 "W2 down" if shape and any(width in shape for width in (1152, 640)) else "阶段见张量合同")
+        stage = (
+            "W13 gate/up"
+            if shape and any(width in shape for width in (2304, 1280))
+            else "W2 down"
+            if shape and any(width in shape for width in (1152, 640))
+            else "阶段见张量合同"
+        )
         if not shape and outputs:
             if outputs[0]["shape"][-2:] in ([5120, 2304], [5120, 1280]):
                 stage = "W13 gate/up"
@@ -223,8 +270,13 @@ def classify(node, kernel, inputs, outputs):
                 return "CSA2", "index Q 展开投影：TP4 8 heads 或 TP2 16 heads，每 head 128 维"
             if weight in ([8, 5120], [16, 5120]):
                 return "CSA2", "index head 权重投影；后续缩放并四路 gather"
-            if ("/mm_" in name and len(inputs) == 2 and inputs[0]["shape"] == [32, 128] and len(weight) == 2
-                    and weight[-1] == 128):
+            if (
+                "/mm_" in name
+                and len(inputs) == 2
+                and inputs[0]["shape"] == [32, 128]
+                and len(weight) == 2
+                and weight[-1] == 128
+            ):
                 return "CSA2", "32-head index QK 候选打分的实际编译矩阵分块"
             if inputs and inputs[0]["dtype"] == "float32":
                 return "Attention", "Compressor FP32 投影；wkv/wgate 绑定尚待逐节点还原"
@@ -237,7 +289,7 @@ def classify(node, kernel, inputs, outputs):
                 (5120, 4096): "wo_b 输出投影",
                 (5120, 2048): "wo_b 输出投影",
                 (128, 512): "index K 投影",
-                (1024, 4096): "wo_a 分组输出 GEMM"
+                (1024, 4096): "wo_a 分组输出 GEMM",
             }
             if "/bmm" in name:
                 return "Attention", "wo_a 分组输出 BMM"
@@ -307,8 +359,11 @@ def attention_norm_owners(nodes):
                     return False
                 anchors.add(n["name"])
                 return True
-            if not ("/attention/" in n["name"] or n["op"] in ("Reduction", "DmaMemset") or n["op"].startswith(
-                ("fused_kernel_", "cast_", "reshape"))):
+            if not (
+                "/attention/" in n["name"]
+                or n["op"] in ("Reduction", "DmaMemset")
+                or n["op"].startswith(("fused_kernel_", "cast_", "reshape"))
+            ):
                 return False
             visited.add(i)
             for t in ins[i]:
@@ -329,7 +384,7 @@ def attention_norm_owners(nodes):
                 "rule": "RMSNorm dependency closure to one Attention input GEMM",
                 "role": role,
                 "anchor": next(iter(anchors)),
-                "final": node["name"]
+                "final": node["name"],
             }
             for i in visited:
                 owners[nodes[i]["name"]] = proof
@@ -366,9 +421,11 @@ def expert_mme_owners(contracts):
         visit(contract["inputs"][1])
         roles = {row["role"] for row in anchors.values()}
         if len(roles) == 1:
-            owners[key] = dict(rule="same-capture PostGraph dependency from MME B to N256 weight decoder",
-                               role=roles.pop(),
-                               producers=anchors)
+            owners[key] = dict(
+                rule="same-capture PostGraph dependency from MME B to N256 weight decoder",
+                role=roles.pop(),
+                producers=anchors,
+            )
     return owners
 
 
@@ -387,7 +444,7 @@ def invocation_samples(rows, symbol, expected):
         return [], None, "EDMA descriptor-to-invocation boundary not reconstructed"
     if not packets or len(rows) % packets:
         return [], None, "missing packet count or incomplete lane packet group"
-    groups = [rows[i:i + packets] for i in range(0, len(rows), packets)]
+    groups = [rows[i : i + packets] for i in range(0, len(rows), packets)]
     if expected is not None and len(groups) != expected:
         return [], None, "packet count differs from captured recipe frequency"
     if symbol["device_type"] == 0 and any(len({row[2] for row in group}) != packets for group in groups):
@@ -409,7 +466,7 @@ def eager_invocation_samples(rows, launches):
         return [], None, "no exact enqueue count or unequal packets per static invocation"
     ordered = sorted(rows)
     width = len(ordered) // launches
-    groups = [ordered[i:i + width] for i in range(0, len(ordered), width)]
+    groups = [ordered[i : i + width] for i in range(0, len(ordered), width)]
     lanes = [collections.Counter(row[2] for row in group) for group in groups]
     if any(value != lanes[0] for value in lanes):
         return [], None, "eager static invocation lane ownership changed"
@@ -424,10 +481,10 @@ def write_csv(path, rows):
     with path.open("w") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
         writer.writeheader()
-        writer.writerows({
-            k: json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v
-            for k, v in row.items()
-        } for row in rows)
+        writer.writerows(
+            {k: json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v for k, v in row.items()}
+            for row in rows
+        )
 
 
 def analyze(root, rank, common):
@@ -443,14 +500,15 @@ def analyze(root, rank, common):
     activity_groups = collections.defaultdict(list)
     norm_owners = {
         path: attention_norm_owners(graph_nodes(Path(path)))
-        for path in {c["graph"]["path"]
-                     for c in contracts.values() if c.get("matched")} if Path(path).suffix == ".pbtxt"
+        for path in {c["graph"]["path"] for c in contracts.values() if c.get("matched")}
+        if Path(path).suffix == ".pbtxt"
     }
     bundle_categories = collections.defaultdict(set)
     for contract in contracts.values():
         symbol = contract["symbol"]
-        category, _ = classify(symbol["node"], symbol["kernel"], contract.get("inputs", []),
-                               contract.get("outputs", []))
+        category, _ = classify(
+            symbol["node"], symbol["kernel"], contract.get("inputs", []), contract.get("outputs", [])
+        )
         key = bundle_key(contract)
         if key and category in ("路由专家", "Attention", "共享专家", "Engram", "mHC", "Router"):
             bundle_categories[key].add(category)
@@ -484,8 +542,9 @@ def analyze(root, rank, common):
                 raise RuntimeError("mHC capture order differs from actual compiler symbols")
             mhc_recipes.add(rid)
             provenance.append(dict(program=entry, synapse_recipe=rid, enqueue=enqueue))
-    (path / "mhc-partition-provenance.json"
-     ).write_text(json.dumps(dict(plans=plan_sources, bindings=provenance), indent=2) + "\n")
+    (path / "mhc-partition-provenance.json").write_text(
+        json.dumps(dict(plans=plan_sources, bindings=provenance), indent=2) + "\n"
+    )
     frequency = collections.Counter(row[2].split(":")[0] for row in own["capture_order"])
     windows, tokens = common["windows_us"], common["tokens"]
     ends = [w[1] for w in windows]
@@ -511,8 +570,11 @@ def analyze(root, rank, common):
             if win >= len(windows):
                 continue
             node, symbol = inv["nodes"][index], mapped.get(index)
-            key = ((node["recipe"].split(":")[0], symbol["device_type"], symbol["full_context_id"]) if symbol else
-                   (node["recipe"], -1, index))
+            key = (
+                (node["recipe"].split(":")[0], symbol["device_type"], symbol["full_context_id"])
+                if symbol
+                else (node["recipe"], -1, index)
+            )
             kernel = symbol["kernel"] if symbol else node["kernel"]
             counted = False
             while win < len(windows) and windows[win][0] < start + duration:
@@ -539,14 +601,21 @@ def analyze(root, rank, common):
             launches = [r for r in inv["host_enqueues"] if r[2] == node["recipe"]]
             options = []
             for launch in launches:
-                for suffix in ("-eager_final_graph-symbol.pbtxt", "-eager-finalgraph-symbol.pbtxt",
-                               "-PostGraph-symbol.pbtxt"):
+                for suffix in (
+                    "-eager_final_graph-symbol.pbtxt",
+                    "-eager-finalgraph-symbol.pbtxt",
+                    "-PostGraph-symbol.pbtxt",
+                ):
                     basename = Path(launch[3]).name + suffix
                     records = graph_files.get(basename, [])
                     for record in records:
                         graph = Path(record["path"])
-                        options.extend((record, n) for n in graph_nodes(graph) if n["name"] == node["node"]
-                                       and n["op"].lower().replace("_", "") == node["kernel"].lower().replace("_", ""))
+                        options.extend(
+                            (record, n)
+                            for n in graph_nodes(graph)
+                            if n["name"] == node["node"]
+                            and n["op"].lower().replace("_", "") == node["kernel"].lower().replace("_", "")
+                        )
             unique = {record["path"]: (record, match) for record, match in options}
             if len(unique) == 1:
                 record, match = next(iter(unique.values()))
@@ -556,7 +625,7 @@ def analyze(root, rank, common):
                     "outputs": io(match, "outputTensor:"),
                     "graph": record,
                     "attributes": match["attrs"],
-                    "provenance": "exact recipeHandle enqueue name -> rank-owned final compiler graph"
+                    "provenance": "exact recipeHandle enqueue name -> rank-owned final compiler graph",
                 }
         kernel = symbol["kernel"] if symbol else node["kernel"]
         source = symbol["node"] if symbol else node["node"]
@@ -588,8 +657,13 @@ def analyze(root, rank, common):
                 for begin, end, lane, _api in rows:
                     group = category
                     if node["engine"] == "DMA":
-                        group = ("通信相关DMA" if "HCL dedicated" in lane else
-                                 "命令搬运" if "pdma_tx_commands" in kernel else "其他DMA")  # noqa: E501
+                        group = (
+                            "通信相关DMA"
+                            if "HCL dedicated" in lane
+                            else "命令搬运"
+                            if "pdma_tx_commands" in kernel
+                            else "其他DMA"
+                        )  # noqa: E501
                     activity_groups[(node["engine"], group)].append((begin, end))
         samples, count, missing, methods = [], 0, [], set()
         for win, rows in by_window.items():
@@ -599,14 +673,20 @@ def analyze(root, rank, common):
                 expected = frequency.get(key[0])
                 if is_tp4:
                     expected = launch_counts[(key[0], win)]
-                    methods.add("exact device recipe-start markers within this TP4 window" if "device_recipe_starts" in
-                                inv else "exact static recipe enqueue count")
+                    methods.add(
+                        "exact device recipe-start markers within this TP4 window"
+                        if "device_recipe_starts" in inv
+                        else "exact static recipe enqueue count"
+                    )
                 values, n, reason = invocation_samples(rows, symbol, expected)
                 methods.add("serialized working-engine/ROI contract and ordered lane packets")
             elif contract and contract.get("matched") and node["engine"] in ("TPC", "MME"):
                 low, high = windows[win]
-                launches = sum(low <= launch[0] and launch[0] + launch[1] <= high for launch in inv["host_enqueues"]
-                               if launch[2] == node["recipe"])
+                launches = sum(
+                    low <= launch[0] and launch[0] + launch[1] <= high
+                    for launch in inv["host_enqueues"]
+                    if launch[2] == node["recipe"]
+                )
                 values, n, reason = eager_invocation_samples(rows, launches)
                 methods.add("exact recipe-handle enqueues and final static node; validated packet ownership")
             else:
@@ -638,7 +718,7 @@ def analyze(root, rank, common):
             "period_pct": duration / period * 100,
             "inputs": inputs,
             "outputs": outputs,
-            "compiler_contract": contract
+            "compiler_contract": contract,
         }
         row["classification_provenance"] = origin
         details.append(row)
@@ -655,21 +735,23 @@ def analyze(root, rank, common):
         unknown = any(row["observed_calls"] is None for row, _, _ in items)
         count = None if unknown else sum(row["observed_calls"] for row, _, _ in items)
         duration = union(spans)
-        summary.append({
-            "rank": rank,
-            "category": key[0],
-            "purpose": key[1],
-            "engine": key[2],
-            "kernel": key[3],
-            "dtype_shapes": json.loads(key[4]),
-            "mean_invocation_ms": statistics.mean(samples) if samples else None,
-            "complete_invocation_samples": len(samples),
-            "observed_calls": count,
-            "calls_per_" + common.get("unit", "token"): count / len(tokens) if count is not None else None,
-            "activity_ms_per_" + common.get("unit", "token"): duration / len(tokens) / 1000,
-            "period_pct": duration / period * 100,
-            "node_keys": [[r["recipe_id"], r["engine"], r["context_id"]] for r, _, _ in items]
-        })
+        summary.append(
+            {
+                "rank": rank,
+                "category": key[0],
+                "purpose": key[1],
+                "engine": key[2],
+                "kernel": key[3],
+                "dtype_shapes": json.loads(key[4]),
+                "mean_invocation_ms": statistics.mean(samples) if samples else None,
+                "complete_invocation_samples": len(samples),
+                "observed_calls": count,
+                "calls_per_" + common.get("unit", "token"): count / len(tokens) if count is not None else None,
+                "activity_ms_per_" + common.get("unit", "token"): duration / len(tokens) / 1000,
+                "period_pct": duration / period * 100,
+                "node_keys": [[r["recipe_id"], r["engine"], r["context_id"]] for r, _, _ in items],
+            }
+        )
     scale = len(tokens) * 1000
     tpc, mme = union(engines["TPC"]), union(engines["MME"])
     compute = union(engines["TPC"] + engines["MME"])
@@ -679,7 +761,7 @@ def analyze(root, rank, common):
         "MME_only_ms": (compute - tpc) / scale,
         "TPC_MME_overlap_ms": (tpc + mme - compute) / scale,
         "other_recorded_device_only_ms": (all_device - compute) / scale,
-        "unattributed_or_other_stage_ms": (period - all_device) / scale
+        "unattributed_or_other_stage_ms": (period - all_device) / scale,
     }
     assert abs(sum(partition.values()) - period / scale) < 1e-8
     details.sort(key=lambda r: -r["activity_ms_per_" + common.get("unit", "token")])
@@ -687,56 +769,49 @@ def analyze(root, rank, common):
     write_csv(path / "kernel-breakdown.csv", summary)
     (path / "node-breakdown.json").write_text(json.dumps(details, ensure_ascii=False, indent=2) + "\n")
     result = {
-        "rank":
-        rank,
-        "unit":
-        common.get("unit", "token"),
-        "phase":
-        common.get("phase", "decode"),
-        "tokens":
-        tokens,
-        "period_ms":
-        period / scale,
-        "partition":
-        partition,
-        "device_engine_presence_partition_ms":
-        device_partition(engines, windows, scale),
-        "host_observed_activity":
-        host_accounting(path,
-                        windows,
-                        engines["TPC"] + engines["MME"],
-                        scale,
-                        export_intervals=common.get("export_activity_intervals", False)),
-        "trace_sha256":
-        inv["trace_sha256"],
+        "rank": rank,
+        "unit": common.get("unit", "token"),
+        "phase": common.get("phase", "decode"),
+        "tokens": tokens,
+        "period_ms": period / scale,
+        "partition": partition,
+        "device_engine_presence_partition_ms": device_partition(engines, windows, scale),
+        "host_observed_activity": host_accounting(
+            path,
+            windows,
+            engines["TPC"] + engines["MME"],
+            scale,
+            export_intervals=common.get("export_activity_intervals", False),
+        ),
+        "trace_sha256": inv["trace_sha256"],
         "device_observability": {
-            engine: ("positive intervals captured"
-                     if engines[engine] else "no intervals exposed; zero hardware time is not established")
+            engine: (
+                "positive intervals captured"
+                if engines[engine]
+                else "no intervals exposed; zero hardware time is not established"
+            )
             for engine in ("TPC", "MME", "DMA", "NIC")
         },
-        "measured_nodes":
-        len(details),
-        "unmatched_nodes":
-        sum(not (r["compiler_contract"] or {}).get("matched") for r in details),
-        "nodes_with_unknown_calls":
-        sum(r["observed_calls"] is None for r in details),
-        "status":
-        "all activity retained; unknown invocation boundaries and fused origins remain explicit",
-        "kernel_rows":
-        summary
+        "measured_nodes": len(details),
+        "unmatched_nodes": sum(not (r["compiler_contract"] or {}).get("matched") for r in details),
+        "nodes_with_unknown_calls": sum(r["observed_calls"] is None for r in details),
+        "status": "all activity retained; unknown invocation boundaries and fused origins remain explicit",
+        "kernel_rows": summary,
     }
     (path / "kernel-breakdown.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
     if common.get("export_activity_intervals"):
-        activity = dict(rank=rank,
-                        base_time_nanoseconds=inv["base_time_nanoseconds"],
-                        windows_us=windows,
-                        tokens=tokens,
-                        trace_sha256=inv["trace_sha256"],
-                        groups=[
-                            dict(engine=engine, category=category, intervals_us=merged(spans))
-                            for (engine, category), spans in activity_groups.items()
-                        ],
-                        host_markers=inv["cpu_markers"])
+        activity = dict(
+            rank=rank,
+            base_time_nanoseconds=inv["base_time_nanoseconds"],
+            windows_us=windows,
+            tokens=tokens,
+            trace_sha256=inv["trace_sha256"],
+            groups=[
+                dict(engine=engine, category=category, intervals_us=merged(spans))
+                for (engine, category), spans in activity_groups.items()
+            ],
+            host_markers=inv["cpu_markers"],
+        )
         with gzip.open(path / "activity-intervals.json.gz", "wt", compresslevel=1) as stream:
             json.dump(activity, stream)
     print(json.dumps({k: v for k, v in result.items() if k != "kernel_rows"}), flush=True)
@@ -747,13 +822,17 @@ if __name__ == "__main__":
     parser.add_argument("analysis", type=Path)
     parser.add_argument("--ranks", nargs="+", type=int, choices=range(4), default=list(range(4)))
     parser.add_argument("--workers", type=int, choices=range(1, 5), default=4)
-    parser.add_argument("--activity-intervals",
-                        action="store_true",
-                        help="Export merged module intervals for aligned four-rank latency accounting")
-    parser.add_argument("--tokens",
-                        nargs="+",
-                        type=int,
-                        help="Explicit actual cycles for a labeled diagnostic example; never rescale their time")
+    parser.add_argument(
+        "--activity-intervals",
+        action="store_true",
+        help="Export merged module intervals for aligned four-rank latency accounting",
+    )
+    parser.add_argument(
+        "--tokens",
+        nargs="+",
+        type=int,
+        help="Explicit actual cycles for a labeled diagnostic example; never rescale their time",
+    )
     args = parser.parse_args()
     # The same global trace clock and PP1-final-MoE boundary is used for all
     # ranks. Keep token IDs present in every rank's complete stage sequence.

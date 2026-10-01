@@ -12,8 +12,11 @@ from types import FunctionType
 import os
 
 import torch
-from vllm_gaudi.ops.deepseek_v41_prefill_regions import (prefill_main_workspace, prefill_q_projection,
-                                                         prefill_output_projection)
+from vllm_gaudi.ops.deepseek_v41_prefill_regions import (
+    prefill_main_workspace,
+    prefill_q_projection,
+    prefill_output_projection,
+)
 from vllm_gaudi.ops.deepseek_v41_native_trace import prefill_span
 from vllm_gaudi.ops.deepseek_v41_prefill_event_trace import span as prefill_event_span
 from vllm_gaudi.ops.deepseek_v41_prefill_sequence import can_partition_prefill_mla
@@ -76,9 +79,9 @@ def bounded_prefill_mla(query, cache, indices, sink, scale, tile):
         # one-row slice to a full tile lets Synapse propagate an invalid
         # 16-row bundle slice back into the one-row producer. Preserve the
         # real extent instead; no padded query can write request state.
-        q = query[start:start + count].contiguous()
-        ids = indices[start:start + count].contiguous()
-        lengths = torch.full((count, ), indices.shape[-1], dtype=torch.int32, device=query.device)
+        q = query[start : start + count].contiguous()
+        ids = indices[start : start + count].contiguous()
+        lengths = torch.full((count,), indices.shape[-1], dtype=torch.int32, device=query.device)
         output = torch.ops.custom_op.custom_deepseek_v41_prefill_mla_mme_gaudi2(q, cache, ids, sink, scale, lengths)
         outputs.append(output)
     return torch.cat(outputs, 0)
@@ -86,22 +89,25 @@ def bounded_prefill_mla(query, cache, indices, sink, scale, tile):
 
 @lru_cache(maxsize=32)
 def compiled_prefill_mla(signature):
-    entry = FunctionType(bounded_prefill_mla.__code__.replace(co_name=f"prefill_mla_{signature}"),
-                         bounded_prefill_mla.__globals__)
+    entry = FunctionType(
+        bounded_prefill_mla.__code__.replace(co_name=f"prefill_mla_{signature}"), bounded_prefill_mla.__globals__
+    )
     return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
 
 
 def flash_prefill_mla(query, cache, indices, sink):
     """Compile bounded KV gathers and BF16 MLA with an FP32 sink together."""
     from vllm_gaudi.ops.deepseek_v41_prefill_mla import sparse_prefill_mla
-    lengths = torch.full((query.shape[0], ), indices.shape[1], dtype=torch.int32, device=query.device)
+
+    lengths = torch.full((query.shape[0],), indices.shape[1], dtype=torch.int32, device=query.device)
     return sparse_prefill_mla(query, cache, indices, sink, lengths, query_tile=1024)
 
 
 @lru_cache(maxsize=32)
 def compiled_flash_prefill_mla(signature):
-    entry = FunctionType(flash_prefill_mla.__code__.replace(co_name=f"flash_prefill_mla_{signature}"),
-                         flash_prefill_mla.__globals__)
+    entry = FunctionType(
+        flash_prefill_mla.__code__.replace(co_name=f"flash_prefill_mla_{signature}"), flash_prefill_mla.__globals__
+    )
     return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
 
 
@@ -112,15 +118,25 @@ def _selected_attention_layout(physical, selected, window, swa_offsets, selected
     main rows. Attention indices point into this list and preserve ``-1`` for
     invalid windows/selections.
     """
-    row_ids = torch.cat((
-        swa_offsets,
-        physical.reshape(-1).clamp_min(0).to(torch.int32) + swa_offsets.numel(),
-    ), 0).reshape(1, -1).contiguous()
-    offset = selected_offsets[:selected.numel()].reshape(selected.shape)
-    attention_indices = torch.cat((
-        window,
-        torch.where(selected >= 0, offset + swa_offsets.numel(), -1),
-    ), -1).contiguous()
+    row_ids = (
+        torch.cat(
+            (
+                swa_offsets,
+                physical.reshape(-1).clamp_min(0).to(torch.int32) + swa_offsets.numel(),
+            ),
+            0,
+        )
+        .reshape(1, -1)
+        .contiguous()
+    )
+    offset = selected_offsets[: selected.numel()].reshape(selected.shape)
+    attention_indices = torch.cat(
+        (
+            window,
+            torch.where(selected >= 0, offset + swa_offsets.numel(), -1),
+        ),
+        -1,
+    ).contiguous()
     return row_ids, attention_indices
 
 
@@ -141,18 +157,12 @@ def _shared_prefix_attention_layout(physical, selected, window, swa_offsets):
 
 
 class PagedCSA2SharedState(nn.Module):
-
-    def __init__(self,
-                 config,
-                 layer_start,
-                 layer_stop,
-                 device,
-                 max_length,
-                 *,
-                 prefill_tokens=WORK_TOKENS,
-                 tensor_parallel_size=2):
+    def __init__(
+        self, config, layer_start, layer_stop, device, max_length, *, prefill_tokens=WORK_TOKENS, tensor_parallel_size=2
+    ):
         super().__init__()
         from vllm_gaudi.ops.deepseek_v41_prefill_capacity import MAX_PREFILL_TOKENS
+
         if not 1 <= prefill_tokens <= MAX_PREFILL_TOKENS:
             raise ValueError("Paged prefill capacity must be between 1 and 16384")
         self.prefill_tokens = prefill_tokens
@@ -173,31 +183,35 @@ class PagedCSA2SharedState(nn.Module):
         self.prefill_main_workspace = None
         if gaudi_envs.VLLM_HPU_DSV41_PREFILL_KV_REUSE:
             from vllm_gaudi.ops.deepseek_v41_prefill_kv_reuse import PrefillMainWorkspace
+
             self.prefill_main_workspace = PrefillMainWorkspace()
         for source in config["kv_source_layer_ids"]:
             if layer_start <= source < layer_stop:
                 ratio = config["compress_ratios"][source]
                 cache = nn.Module()
                 cache.ratio = ratio
-                cache.register_buffer("main",
-                                      torch.zeros(2 * PAGE_TOKENS // ratio, 288, dtype=torch.uint8, device=device),
-                                      False)
-                cache.register_buffer("index",
-                                      torch.zeros(2 * PAGE_TOKENS // ratio, 68, dtype=torch.uint8, device=device),
-                                      False)
+                cache.register_buffer(
+                    "main", torch.zeros(2 * PAGE_TOKENS // ratio, 288, dtype=torch.uint8, device=device), False
+                )
+                cache.register_buffer(
+                    "index", torch.zeros(2 * PAGE_TOKENS // ratio, 68, dtype=torch.uint8, device=device), False
+                )
                 if self.runtime_indexer and ratio in (1, 2):
                     cache.register_buffer(
                         "decoded_index_hot",
-                        torch.zeros(INDEX_MME_HOT_TOKENS // ratio, 128, dtype=torch.bfloat16, device=device), False)
+                        torch.zeros(INDEX_MME_HOT_TOKENS // ratio, 128, dtype=torch.bfloat16, device=device),
+                        False,
+                    )
                 if self.decoded_kv_state:
                     # Keep the exact FP4-roundtripped main rows decoded for
                     # the bounded C1 hot bucket.  The packed paged cache
                     # remains authoritative for the complete 1M context;
                     # this small mirror only extends the proven decoded-MLA
                     # path beyond the old 512-row special case.
-                    decoded_rows = (INDEX_MME_HOT_TOKENS // ratio if self.runtime_indexer else 512)
-                    cache.register_buffer("decoded_main",
-                                          torch.zeros(decoded_rows, 512, dtype=torch.bfloat16, device=device), False)
+                    decoded_rows = INDEX_MME_HOT_TOKENS // ratio if self.runtime_indexer else 512
+                    cache.register_buffer(
+                        "decoded_main", torch.zeros(decoded_rows, 512, dtype=torch.bfloat16, device=device), False
+                    )
                 self.sources[str(source)] = cache
         shared_selection = None
         for source in config["index_source_layer_ids"]:
@@ -218,27 +232,38 @@ class PagedCSA2SharedState(nn.Module):
             # This is equivalent to the upstream candidate-slot contract and
             # cuts the persistent C8192 workspace from 512 MiB to 64 MiB.
             torch.full((self.prefill_tokens, config["candidate_topk_blocks"]), -1, dtype=torch.int32, device=device)
-            if layer_start <= config["candidate_source_layer_id"] < layer_stop else None,
-            False)
+            if layer_start <= config["candidate_source_layer_id"] < layer_stop
+            else None,
+            False,
+        )
         table = torch.zeros((max_length + PAGE_TOKENS - 1) // PAGE_TOKENS, dtype=torch.int32, device=device)
         table[0] = 1
         self.register_buffer("block_table", table, False)
         if self.runtime_indexer and self.candidate_pool is None:
             # Full layers do not consume candidate IDs, but the fixed native
             # ABI still requires one persistent correctly shaped input.
-            self.register_buffer("index_candidates_unused",
-                                 torch.full((1, config["candidate_topk_blocks"]), -1, dtype=torch.int32, device=device),
-                                 False)
+            self.register_buffer(
+                "index_candidates_unused",
+                torch.full((NATIVE_WORK_TOKENS, config["candidate_topk_blocks"]), -1, dtype=torch.int32, device=device),
+                False,
+            )
         if self.decoded_kv_state:
             self.register_buffer(
-                "decoded_swa", torch.zeros((layer_stop - layer_start) * 512, 512, dtype=torch.bfloat16, device=device),
-                False)
+                "decoded_swa",
+                torch.zeros((layer_stop - layer_start) * 512, 512, dtype=torch.bfloat16, device=device),
+                False,
+            )
         scaling = config["rope_scaling"]
         for name, compressed in (("swa_rotary", False), ("compressed_rotary", True)):
-            table = rotary_table(config["qk_rope_head_dim"], max_length,
-                                 config["compress_rope_theta"] if compressed else config["rope_theta"],
-                                 scaling["original_max_position_embeddings"] if compressed else 0, scaling["factor"],
-                                 scaling["beta_fast"], scaling["beta_slow"])
+            table = rotary_table(
+                config["qk_rope_head_dim"],
+                max_length,
+                config["compress_rope_theta"] if compressed else config["rope_theta"],
+                scaling["original_max_position_embeddings"] if compressed else 0,
+                scaling["factor"],
+                scaling["beta_fast"],
+                scaling["beta_slow"],
+            )
             if self.rotary_on_host:
                 # Immutable full-context masters are ordinary CPU attributes,
                 # so module migration cannot upload them accidentally. Active
@@ -250,6 +275,18 @@ class PagedCSA2SharedState(nn.Module):
             # copy costs another 256 MiB for each table on every rank.  The
             # active search bucket is at most the currently reachable prefix;
             # materialize that correctly laid-out bucket lazily below.
+
+        from vllm_gaudi.ops.deepseek_v41_index_mirror import initialize_index_mirror
+
+        initialize_index_mirror(self, tensor_parallel_size, device)
+
+    def invalidate_index_mirror(self):
+        self.index_mirror_valid = False
+
+    def prepare_index_mirror(self, visible_tokens):
+        from vllm_gaudi.ops.deepseek_v41_index_mirror import prepare_index_mirror
+
+        prepare_index_mirror(self, visible_tokens)
 
     def rotary_bucket(self, name, length):
         """Return a stable RoPE buffer whose backing storage is bucket-sized."""
@@ -275,7 +312,7 @@ class PagedCSA2SharedState(nn.Module):
                 if getattr(self, "rotary_on_host", False):
                     bucket = source[:length].to(self.block_table.device, copy=True)
                 else:
-                    bucket = (source if self.runtime_indexer and length == self.length else source[:length].clone())
+                    bucket = source if self.runtime_indexer and length == self.length else source[:length].clone()
             self._rotary_buckets[key] = bucket
         return bucket
 
@@ -304,19 +341,19 @@ class PagedCSA2SharedState(nn.Module):
         # generic div_mod TPC launch at every CSA2 source layer.  Preserve the
         # exact non-negative row mapping with shifts/masks so the state chain
         # does not pay integer division on each decoded token.
-        blocks = self.block_table.index_select(0,
-                                               torch.bitwise_right_shift(rows.flatten(),
-                                                                         shift).long()).reshape(rows.shape)
+        blocks = self.block_table.index_select(0, torch.bitwise_right_shift(rows.flatten(), shift).long()).reshape(
+            rows.shape
+        )
         return blocks * width + torch.bitwise_and(rows, width - 1)
 
 
 class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
-
     def __init__(self, weights, config, layer, shared, linear, reduce, gather, device, tensor_parallel_size=2):
         super().__init__()
         self.weights, self.shared = weights, shared
-        if ((gaudi_envs.VLLM_HPU_DSV41_PREFILL_INDEX_MME or gaudi_envs.VLLM_HPU_DSV41_PREFILL_INDEX_SHARED)
-                and not hasattr(torch.ops.custom_op, "custom_deepseek_v41_index_keys_gaudi2")):
+        if (
+            gaudi_envs.VLLM_HPU_DSV41_PREFILL_INDEX_MME or gaudi_envs.VLLM_HPU_DSV41_PREFILL_INDEX_SHARED
+        ) and not hasattr(torch.ops.custom_op, "custom_deepseek_v41_index_keys_gaudi2"):
             raise RuntimeError("Prefill index MME requires the native index-key decoder at model initialization")
         self.woa_fp8 = False
         # Bound by PreparedStage after the FP8 sidecars have been loaded.  The
@@ -324,25 +361,27 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         # output contract, so long-context decode must retain the qualified
         # wo_a -> group32 BF16 boundary -> FP8 wo_b chain as well.
         self.woa_output_roundtrip = False
-        self.prepared_output = (gaudi_envs.VLLM_HPU_DSV41_PREPARED_OUTPUT and layer < config["num_hidden_layers"])
-        self.output_gemm_layout = (gaudi_envs.VLLM_HPU_DSV41_OUTPUT_GEMM_LAYOUT and layer < config["num_hidden_layers"])
+        self.prepared_output = gaudi_envs.VLLM_HPU_DSV41_PREPARED_OUTPUT and layer < config["num_hidden_layers"]
+        self.output_gemm_layout = gaudi_envs.VLLM_HPU_DSV41_OUTPUT_GEMM_LAYOUT and layer < config["num_hidden_layers"]
         if self.output_gemm_layout and not self.prepared_output:
             raise ValueError("V4.1 output GEMM layout requires prepared output weights")
         self.qkv_fused_input = gaudi_envs.VLLM_HPU_DSV41_QKV_FUSED_INPUT and layer < config["num_hidden_layers"]
         self._fused_qkv_weight = None
         self._fused_qkv_quantized = False
-        self.compressor_fused_input = (gaudi_envs.VLLM_HPU_DSV41_COMPRESSOR_FUSED_INPUT
-                                       and layer < config["num_hidden_layers"])
+        self.compressor_fused_input = (
+            gaudi_envs.VLLM_HPU_DSV41_COMPRESSOR_FUSED_INPUT and layer < config["num_hidden_layers"]
+        )
         self._fused_compressor_weight = None
         self._fused_compressor_kv_width = 0
         self.mla_mme = gaudi_envs.VLLM_HPU_DSV41_MLA_MME and layer < config["num_hidden_layers"]
         self.native_rope = gaudi_envs.VLLM_HPU_DSV41_NATIVE_ROPE
-        self.q_scale_rope = (gaudi_envs.VLLM_HPU_DSV41_Q_SCALE_ROPE and layer < config["num_hidden_layers"])
+        self.q_scale_rope = gaudi_envs.VLLM_HPU_DSV41_Q_SCALE_ROPE and layer < config["num_hidden_layers"]
         self.batch_c1_numerics = gaudi_envs.VLLM_HPU_DSV41_BATCH_C1_NUMERICS
-        if self.q_scale_rope and not (gaudi_envs.VLLM_HPU_DSV41_NATIVE_ROPE
-                                      and gaudi_envs.VLLM_HPU_DSV41_ATTN_DENSE_FP8):
+        if self.q_scale_rope and not (
+            gaudi_envs.VLLM_HPU_DSV41_NATIVE_ROPE and gaudi_envs.VLLM_HPU_DSV41_ATTN_DENSE_FP8
+        ):
             raise ValueError("Q scale/RoPE fusion requires native RoPE and prepared dense FP8")
-        self.fused_norm = (gaudi_envs.VLLM_HPU_DSV41_ATTN_FUSED_NORM and layer < config["num_hidden_layers"])
+        self.fused_norm = gaudi_envs.VLLM_HPU_DSV41_ATTN_FUSED_NORM and layer < config["num_hidden_layers"]
         self.linear, self.reduce, self.gather = linear, reduce, gather
         self.layer, self.ratio, self.length = layer, config["compress_ratios"][layer], shared.length
         self.runtime_indexer = getattr(shared, "runtime_indexer", False)
@@ -352,20 +391,50 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         self.vector_kv_scales = gaudi_envs.VLLM_HPU_DSV41_VECTOR_KV_SCALES
         self.head_vector_attn = gaudi_envs.VLLM_HPU_DSV41_HEAD_VECTOR_ATTN
         self.sram_kv = gaudi_envs.VLLM_HPU_DSV41_SRAM_KV
-        if (tensor_parallel_size < 1 or config["num_attention_heads"] % tensor_parallel_size
-                or config["o_groups"] % tensor_parallel_size or config["index_n_heads"] % tensor_parallel_size):
+        if (
+            tensor_parallel_size < 1
+            or config["num_attention_heads"] % tensor_parallel_size
+            or config["o_groups"] % tensor_parallel_size
+            or config["index_n_heads"] % tensor_parallel_size
+        ):
             raise ValueError("V4.1 paged attention head geometry is not divisible by the runtime TP size")
         self.tensor_parallel_size = tensor_parallel_size
+        self.shared_decode_metadata = tensor_parallel_size == 4
+        self.paged_mla_direct = tensor_parallel_size == 4 and hasattr(
+            torch.ops.custom_op, "custom_deepseek_v41_paged_mla_direct_mme_gaudi2"
+        )
+        self.paged_mla_logical = tensor_parallel_size == 4 and hasattr(
+            torch.ops.custom_op, "custom_deepseek_v41_logical_mla_gaudi2"
+        )
+        self.shared_main_mla = tensor_parallel_size == 4 and all(
+            hasattr(torch.ops.custom_op, name)
+            for name in ("custom_deepseek_v41_main_publish_mla_gaudi2", "custom_deepseek_v41_main_reuse_mla_gaudi2")
+        )
+        self.index_mirror_scores = bool(getattr(shared, "index_mirror_tokens", 0))
+        # Kept unselected until the distributed selection consumer gate passes.
+        self.tp4_tile_selection = False
+        # Distributed mirror selection regresses the complete decode chain.
+        self.tp4_mirror_selection = False
+        self.tp4_local_index_queries = False
+        self.tp4_packed_index_queries = False
+        for shard in range(4):
+            self.register_buffer(f"_tp4_index_query_shard_{shard}", None, False)
+            self.register_buffer(f"_tp4_index_score_shard_{shard}", None, False)
         self.search_length = 512
-        self.heads, self.groups = (config["num_attention_heads"] // tensor_parallel_size,
-                                   config["o_groups"] // tensor_parallel_size)
+        self.decode_visible_rows = None
+        self.heads, self.groups = (
+            config["num_attention_heads"] // tensor_parallel_size,
+            config["o_groups"] // tensor_parallel_size,
+        )
         self.index_heads = config["index_n_heads"] // tensor_parallel_size
         self.eps, self.window = config["rms_norm_eps"], config["sliding_window"]
         self.owns_kv = layer in config["kv_source_layer_ids"]
         self.owns_index = layer in config["index_source_layer_ids"]
         self.candidate_source = config["candidate_source_layer_id"]
-        self.batch_reindex_group = (bool(self.ratio) and max(
-            source for source in config["index_source_layer_ids"] if source <= layer) > self.candidate_source)
+        self.batch_reindex_group = (
+            bool(self.ratio)
+            and max(source for source in config["index_source_layer_ids"] if source <= layer) > self.candidate_source
+        )
         self.batch_reindex_mme = gaudi_envs.VLLM_HPU_DSV41_BATCH_REINDEX_MME
         self.batch_full_index_mme = gaudi_envs.VLLM_HPU_DSV41_BATCH_FULL_INDEX_MME
         self.batch_packed_mla = gaudi_envs.VLLM_HPU_DSV41_BATCH_PACKED_MLA
@@ -373,35 +442,47 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         self.batch_packed_mla_vector = gaudi_envs.VLLM_HPU_DSV41_BATCH_PACKED_MLA_VECTOR
         if self.batch_packed_mla_vector and not self.batch_packed_mla_sram:
             raise ValueError("Vector packed MLA requires SRAM placement")
-        if self.batch_packed_mla_vector and not hasattr(torch.ops.custom_op,
-                                                        "custom_deepseek_v41_batch_packed_vector_mla_mme_gaudi2"):
+        if self.batch_packed_mla_vector and not hasattr(
+            torch.ops.custom_op, "custom_deepseek_v41_batch_packed_vector_mla_mme_gaudi2"
+        ):
             raise RuntimeError("Vector packed MLA requires the matching native library")
         if self.batch_packed_mla_sram and not self.batch_packed_mla:
             raise ValueError("SRAM packed MLA requires its fused decoder")
-        if self.batch_packed_mla_sram and not hasattr(torch.ops.custom_op,
-                                                      "custom_deepseek_v41_batch_packed_sram_mla_mme_gaudi2"):
+        if self.batch_packed_mla_sram and not hasattr(
+            torch.ops.custom_op, "custom_deepseek_v41_batch_packed_sram_mla_mme_gaudi2"
+        ):
             raise RuntimeError("SRAM packed MLA requires the matching native library")
-        if self.batch_packed_mla and not hasattr(torch.ops.custom_op,
-                                                 "custom_deepseek_v41_batch_packed_mla_mme_gaudi2"):
+        if self.batch_packed_mla and not hasattr(
+            torch.ops.custom_op, "custom_deepseek_v41_batch_packed_mla_mme_gaudi2"
+        ):
             raise RuntimeError("Batch packed MLA requires the fused native decoder library")
-        self.batch_index_tiled_keys = (gaudi_envs.VLLM_HPU_DSV41_BATCH_INDEX_TILED_KEYS
-                                       and self.layer > self.candidate_source)
+        self.batch_index_tiled_keys = (
+            gaudi_envs.VLLM_HPU_DSV41_BATCH_INDEX_TILED_KEYS and self.layer > self.candidate_source
+        )
         self.batch_compressor_pair = gaudi_envs.VLLM_HPU_DSV41_BATCH_COMPRESSOR_PAIR
         self.batch_compressor_gather = gaudi_envs.VLLM_HPU_DSV41_BATCH_COMPRESSOR_GATHER
         if self.batch_compressor_pair and self.batch_compressor_gather:
             raise ValueError("Select only one request-slot compressor candidate")
-        if self.batch_compressor_gather and not hasattr(torch.ops.custom_op,
-                                                        "custom_deepseek_v41_compressor_batch_gather_f32_gaudi2"):
+        if self.batch_compressor_gather and not hasattr(
+            torch.ops.custom_op, "custom_deepseek_v41_compressor_batch_gather_f32_gaudi2"
+        ):
             raise RuntimeError("Batch compressor gather requires the request-slot native library")
-        if self.batch_compressor_pair and not hasattr(torch.ops.custom_op,
-                                                      "custom_deepseek_v41_compressor_batch_bf16_gaudi2"):
+        if self.batch_compressor_pair and not hasattr(
+            torch.ops.custom_op, "custom_deepseek_v41_compressor_batch_bf16_gaudi2"
+        ):
             raise RuntimeError("Batch compressor fusion requires the request-slot native pair kernel")
         self.bounded_reindex = gaudi_envs.VLLM_HPU_DSV41_REINDEX_BOUNDED_PLAN
-        if self.bounded_reindex and (not self.batch_reindex_mme or not gaudi_envs.VLLM_HPU_DSV41_TP_MHC_OVERLAP
-                                     or gaudi_envs.VLLM_HPU_DSV41_DSPARK):
+        if self.bounded_reindex and (
+            not self.batch_reindex_mme
+            or not gaudi_envs.VLLM_HPU_DSV41_TP_MHC_OVERLAP
+            or gaudi_envs.VLLM_HPU_DSV41_DSPARK
+        ):
             raise ValueError("Bounded Reindex requires ordinary batch MME and explicit native TP dependencies")
-        if (self.bounded_reindex and self.batch_index_tiled_keys
-                and not hasattr(torch.ops.custom_op, "custom_deepseek_v41_reindex_tiled_gaudi2")):
+        if (
+            self.bounded_reindex
+            and self.batch_index_tiled_keys
+            and not hasattr(torch.ops.custom_op, "custom_deepseek_v41_reindex_tiled_gaudi2")
+        ):
             raise RuntimeError("Bounded Reindex SRAM keys require the matching native compound library")
         if self.batch_reindex_mme and not hasattr(torch.ops.custom_op, "custom_deepseek_v41_index_reduce_gaudi2"):
             raise RuntimeError("Batch Reindex MME requires the native ordered index head reducer")
@@ -409,31 +490,48 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         self.decoded_swa_offset = (layer - shared.layer_start) * 512 if self.decoded_kv_state else 0
         if self.decoded_kv_state and not (self.mla_mme and self.direct_selected_kv and self.shared_prefix_kv):
             raise ValueError("Paged decoded KV requires direct selected rows, shared prefixes and MME MLA")
+        self.candidate_source = config["candidate_source_layer_id"]
+        # Both selection variants are retained for diagnosis, not enabled:
+        # carried-ID sorting regressed; score-only batching has no resolved gain.
+        self.decode_batched_selection = False
+        self.decode_swa_packed = not self.ratio
         if self.ratio:
             kv_source = max(source for source in config["kv_source_layer_ids"] if source <= layer)
             self.kv_source = kv_source
             index_source = max(source for source in config["index_source_layer_ids"] if source <= layer)
+            self.index_source = index_source
             self.index_ratio = config["compress_ratios"][index_source]
             self.cache = shared.sources[str(kv_source)]
             self.selection = shared.topk[str(index_source)]
         self.register_buffer("swa", torch.zeros(SWA_ROWS, 528, dtype=torch.uint8, device=device), False)
         self.register_buffer("_prefill_sequence_sink", None, persistent=False)
         if self.owns_kv and self.ratio == 2:
-            self.register_buffer("kv_history", torch.zeros(HISTORY_ROWS, 512, dtype=torch.float32, device=device),
-                                 False)
+            self.register_buffer(
+                "kv_history", torch.zeros(HISTORY_ROWS, 512, dtype=torch.float32, device=device), False
+            )
             self.register_buffer("score_history", torch.zeros_like(self.kv_history), False)
         self._rotary_name = "compressed_rotary" if self.ratio else "swa_rotary"
         self.register_buffer("rotary", shared.rotary_bucket(self._rotary_name, self.search_length), False)
         if self.native_rope or self.q_scale_rope:
             self._rotary_native_name = f"{self._rotary_name}_native"
-            self.register_buffer("rotary_native", shared.rotary_bucket(self._rotary_native_name, self.search_length),
-                                 False)
+            self.register_buffer(
+                "rotary_native", shared.rotary_bucket(self._rotary_native_name, self.search_length), False
+            )
         self.register_buffer("window_offsets", torch.arange(self.window, dtype=torch.int32, device=device), False)
         self.register_buffer("compressed_offsets", torch.arange(512, dtype=torch.int32, device=device), False)
         self.register_buffer("swa_offsets", torch.arange(SWA_ROWS, dtype=torch.int32, device=device), False)
-        self.register_buffer("selected_offsets", torch.arange(NATIVE_WORK_TOKENS * 512,
-                                                              dtype=torch.int32,
-                                                              device=device), False)
+        if not self.ratio:
+            # The packed consumer never reads main rows for a SWA-only layer.
+            # Retain the ordinary nonempty main operand contract without
+            # allocating a compressed cache or building constants per token.
+            self.register_buffer("swa_only_main", torch.zeros(1, 288, dtype=torch.uint8, device=device), False)
+            self.register_buffer(
+                "swa_only_lengths", torch.full((NATIVE_WORK_TOKENS,), self.window,
+                                               dtype=torch.int32, device=device), False
+            )
+        self.register_buffer(
+            "selected_offsets", torch.arange(NATIVE_WORK_TOKENS * 512, dtype=torch.int32, device=device), False
+        )
         self.register_buffer("scale", torch.tensor([512**-0.5], dtype=torch.float32, device=device), False)
 
     def prepare_output_weight(self):
@@ -451,7 +549,19 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             if weight.dtype != torch.bfloat16 or weight.numel() != self.heads * 512 * 1024:
                 raise ValueError("V4.1 output weight contract changed")
             grouped = weight.reshape(self.groups, 1024, -1)
-            self.weights.wo_a.weight = (grouped if self.output_gemm_layout else grouped.transpose(1, 2).contiguous())
+            self.weights.wo_a.weight = grouped if self.output_gemm_layout else grouped.transpose(1, 2).contiguous()
+
+    def prepare_tp4_index_query_weights(self):
+        """Keep small immutable query shards local across normal TP4 decode."""
+        if self.tensor_parallel_size == 4 and self.owns_index:
+            from vllm_gaudi.ops.deepseek_v41_tp4_selection import prepare_local_index_queries
+
+            prepare_local_index_queries(self, release_local=True)
+
+    def invalidate_tp4_index_query_weights(self):
+        from vllm_gaudi.ops.deepseek_v41_tp4_selection import invalidate_local_index_queries
+
+        invalidate_local_index_queries(self)
 
     def _rotary_table(self):
         return self.rotary
@@ -469,25 +579,56 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         if self.native_rope or self.q_scale_rope:
             self.rotary_native = self.shared.rotary_bucket(self._rotary_native_name, rotary_length)
 
+    def set_decode_visible_tokens(self, token_end):
+        """Prune future source tiles while retaining candidate-block merge order."""
+        from vllm_gaudi.ops.deepseek_v41_config import decode_source_prefix_bound
+
+        self.decode_visible_rows = None
+        if token_end is not None and self.ratio and self.layer <= self.candidate_source:
+            bound = decode_source_prefix_bound(
+                token_end, self.search_length, self.tensor_parallel_size, runtime_indexer=self.runtime_indexer
+            )
+            if bound is not None:
+                self.decode_visible_rows = bound // self.ratio
+
     def _rope(self, value, positions, inverse=False, *, request_batch=False):
         # Ordinary concurrent decode must keep the C1 FP32 multiply/FMA
         # sequence before BF16 rounding, including inverse RoPE before WO.
         maximum_rows = 64 if request_batch else NATIVE_WORK_TOKENS
-        if (not request_batch and self.native_rope and gaudi_envs.VLLM_HPU_DSV41_PREFILL_ROPE
-                and value.dtype == torch.bfloat16 and value.ndim in (2, 3)
-                and (value.ndim == 2 or 1 <= value.shape[1] <= 128) and NATIVE_WORK_TOKENS < value.shape[0] <= 16384
-                and 128 <= value.shape[-1] <= 512 and value.shape[-1] % 128 == 0):
+        if (
+            not request_batch
+            and self.native_rope
+            and gaudi_envs.VLLM_HPU_DSV41_PREFILL_ROPE
+            and value.dtype == torch.bfloat16
+            and value.ndim in (2, 3)
+            and (value.ndim == 2 or 1 <= value.shape[1] <= 128)
+            and NATIVE_WORK_TOKENS < value.shape[0] <= 16384
+            and 128 <= value.shape[-1] <= 512
+            and value.shape[-1] % 128 == 0
+        ):
             # Large-query eager RoPE rounds separate FP32 products. The small
             # compiled path has a different FMA boundary and keeps its GUID.
-            op = (torch.ops.custom_op.custom_deepseek_v41_prefill_rope_inverse_bf16_gaudi2
-                  if inverse else torch.ops.custom_op.custom_deepseek_v41_prefill_rope_bf16_gaudi2)
+            op = (
+                torch.ops.custom_op.custom_deepseek_v41_prefill_rope_inverse_bf16_gaudi2
+                if inverse
+                else torch.ops.custom_op.custom_deepseek_v41_prefill_rope_bf16_gaudi2
+            )
             shaped = value.reshape(value.shape[0], -1, value.shape[-1]).contiguous()
             return op(shaped, positions.to(torch.int32).contiguous(), self._rotary_native_table()).reshape(value.shape)
-        if (self.native_rope and value.dtype == torch.bfloat16 and value.ndim in (2, 3)
-                and (value.ndim == 2 or 1 <= value.shape[1] <= 128) and 1 <= value.shape[0] <= maximum_rows
-                and 128 <= value.shape[-1] <= 512 and value.shape[-1] % 128 == 0):
-            op = (torch.ops.custom_op.custom_deepseek_v41_rope_inverse_bf16_gaudi2
-                  if inverse else torch.ops.custom_op.custom_deepseek_v41_rope_bf16_gaudi2)
+        if (
+            self.native_rope
+            and value.dtype == torch.bfloat16
+            and value.ndim in (2, 3)
+            and (value.ndim == 2 or 1 <= value.shape[1] <= 128)
+            and 1 <= value.shape[0] <= maximum_rows
+            and 128 <= value.shape[-1] <= 512
+            and value.shape[-1] % 128 == 0
+        ):
+            op = (
+                torch.ops.custom_op.custom_deepseek_v41_rope_inverse_bf16_gaudi2
+                if inverse
+                else torch.ops.custom_op.custom_deepseek_v41_rope_bf16_gaudi2
+            )
             shaped = value.reshape(value.shape[0], -1, value.shape[-1]).contiguous()
             return op(shaped, positions.to(torch.int32).contiguous(), self._rotary_native_table()).reshape(value.shape)
         return _apply_rope_torch(value, positions, self._rotary_table(), inverse)
@@ -495,16 +636,20 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
     def project_output(self, value):
         """Project MLA output without restoring a bounded-context weight path."""
         if self.woa_fp8:
-            operation = (torch.ops.custom_op.custom_deepseek_v41_woa_fp8_roundtrip_gaudi2
-                         if self.woa_output_roundtrip else torch.ops.custom_op.custom_deepseek_v41_woa_fp8_gaudi2)
-            if (self.woa_output_roundtrip and gaudi_envs.VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT and value.shape[0] >= 16):
+            operation = (
+                torch.ops.custom_op.custom_deepseek_v41_woa_fp8_roundtrip_gaudi2
+                if self.woa_output_roundtrip
+                else torch.ops.custom_op.custom_deepseek_v41_woa_fp8_gaudi2
+            )
+            if self.woa_output_roundtrip and gaudi_envs.VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT and value.shape[0] >= 16:
                 operation = torch.ops.custom_op.custom_deepseek_v41_woa_fp8_roundtrip_wide_gaudi2
             return operation(value.contiguous(), self.weights.wo_a.weight, self.weights.wo_a.channel_scale)
         if self.output_gemm_layout:
             weight = self.weights.wo_a.weight
             if value.shape[0] == 1:
-                return torch.cat(tuple(F.linear(value[:, group], weight[group]) for group in range(self.groups)),
-                                 dim=-1)
+                return torch.cat(
+                    tuple(F.linear(value[:, group], weight[group]) for group in range(self.groups)), dim=-1
+                )
             return torch.einsum("tgd,grd->tgr", value, weight).flatten(1)
         if self.prepared_output:
             return torch.einsum("tgd,gdr->tgr", value, self.weights.wo_a.weight).flatten(1)
@@ -515,8 +660,9 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         """Consume the qualified wo_a roundtrip without a BF16 HBM detour."""
         if self.woa_output_roundtrip:
             weight = self.weights.wo_b
-            return torch.ops.custom_op.custom_deepseek_v41_dense_fp8_gaudi2(value.contiguous(), weight.weight,
-                                                                            weight.channel_scale)
+            return torch.ops.custom_op.custom_deepseek_v41_dense_fp8_gaudi2(
+                value.contiguous(), weight.weight, weight.channel_scale
+            )
         return self.linear(value, self.weights.wo_b)
 
     def project_query(self, value, positions, *, decode=False, request_batch=False):
@@ -527,16 +673,21 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             with prefill_event_span("attention_query_quantization", self.layer, value.shape[0]):
                 value = quantize_activation(value) if hasattr(weight, "scale") else value
             with prefill_event_span("attention_query_projection_rope", self.layer, value.shape[0]):
-                return prefill_q_projection(value.contiguous(), weight.weight, weight.channel_scale,
-                                            positions.to(torch.int32).contiguous(), self._rotary_native_table())
+                return prefill_q_projection(
+                    value.contiguous(),
+                    weight.weight,
+                    weight.channel_scale,
+                    positions.to(torch.int32).contiguous(),
+                    self._rotary_native_table(),
+                )
         if self.q_scale_rope and value.shape[0] == 1 and getattr(weight, "dense_fp8", False):
             value = quantize_activation(value) if hasattr(weight, "scale") else value
             return torch.ops.custom_op.custom_deepseek_v41_q_projection_rope_gaudi2(
-                value, weight.weight, weight.channel_scale, positions,
-                self._rotary_native_table()).reshape(-1, self.heads, 512)
-        return self._rope(self.linear(value, weight).reshape(-1, self.heads, 512),
-                          positions,
-                          request_batch=request_batch)
+                value, weight.weight, weight.channel_scale, positions, self._rotary_native_table()
+            ).reshape(-1, self.heads, 512)
+        return self._rope(
+            self.linear(value, weight).reshape(-1, self.heads, 512), positions, request_batch=request_batch
+        )
 
     def project_query_input(self, value, positions):
         """Apply Q norm directly in the FP8 projection producer.
@@ -549,8 +700,14 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         """
         weight = self.weights.wq_b
         return torch.ops.custom_op.custom_deepseek_v41_q_norm_projection_rope_gaudi2(
-            value.contiguous(), self.weights.q_norm.weight, weight.weight, weight.channel_scale,
-            positions.to(torch.int32).contiguous(), self._rotary_native_table(), self.eps).reshape(-1, self.heads, 512)
+            value.contiguous(),
+            self.weights.q_norm.weight,
+            weight.weight,
+            weight.channel_scale,
+            positions.to(torch.int32).contiguous(),
+            self._rotary_native_table(),
+            self.eps,
+        ).reshape(-1, self.heads, 512)
 
     def project_kv(self, value, positions, *, decode=False):
         """Normalize and rotate KV without materializing the C1 norm output."""
@@ -561,16 +718,41 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             # feeds the existing cache writer directly.  Wider batches retain
             # the batch-generic implementation used by prefill and B2+.
             return torch.ops.custom_op.custom_deepseek_v41_kv_norm_rope_bf16_gaudi2(
-                value.contiguous(), weight,
-                positions.to(torch.int32).contiguous(), self._rotary_native_table(), self.eps)
-        norm = (torch.ops.custom_op.custom_deepseek_v41_attention_norm_bf16_gaudi2 if self.fused_norm and
-                (value.shape[0] == 1 or (not decode and gaudi_envs.VLLM_HPU_DSV41_PREFILL_NATIVE_NORM
-                                         and NATIVE_WORK_TOKENS < value.shape[0] <= 16384)) else rms_norm)
+                value.contiguous(),
+                weight,
+                positions.to(torch.int32).contiguous(),
+                self._rotary_native_table(),
+                self.eps,
+            )
+        norm = (
+            torch.ops.custom_op.custom_deepseek_v41_attention_norm_bf16_gaudi2
+            if self.fused_norm
+            and (
+                value.shape[0] == 1
+                or (
+                    not decode
+                    and gaudi_envs.VLLM_HPU_DSV41_PREFILL_NATIVE_NORM
+                    and NATIVE_WORK_TOKENS < value.shape[0] <= 16384
+                )
+            )
+            else rms_norm
+        )
         return self._rope(norm(value.contiguous(), weight, self.eps), positions)
 
     def _compress(self, value, positions, decoded=False):
         compressor = self.weights.compressor
         if self.ratio == 2:
+            if (
+                self.tp4_local_index_queries
+                and value.shape[0] == 1
+                and self.search_length // self.ratio > 512
+                and self.search_length <= 32768
+            ):
+                # Removing the query collectives joins this FP32 projection
+                # to its BF16 producer. Synapse otherwise cancels the adjacent
+                # FP32 -> BF16 -> FP32 casts and changes compressor history.
+                # Keep the original BF16 input boundary inside one opaque TPC.
+                value = torch.ops.custom_op.custom_deepseek_v41_bf16_identity_gaudi2(value.contiguous())
             kv, score = self._project_compressor_input(value)
             # Positions and all circular capacities are non-negative powers
             # of two.  The stock `%` expressions emitted a div_mod kernel for
@@ -587,8 +769,12 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 # gathers and probability tensor never reach HBM.  Wider
                 # batches retain the request-slot-safe generic path below.
                 latent = torch.ops.custom_op.custom_deepseek_v41_compressor_pair_bf16_gaudi2(
-                    self.kv_history, self.score_history, kv.contiguous(), score.contiguous(),
-                    positions.to(torch.int32).contiguous())
+                    self.kv_history,
+                    self.score_history,
+                    kv.contiguous(),
+                    score.contiguous(),
+                    positions.to(torch.int32).contiguous(),
+                )
             elif positions.numel() <= 6:
                 # Preserve the qualified C1/C6 graph and its exact state
                 # mutation order.
@@ -633,27 +819,45 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             raise ValueError("V4.1 compressor ratio must be a power of two")
         ratio_shift = self.ratio.bit_length() - 1
         rows = torch.bitwise_right_shift(positions, ratio_shift)
-        visible = (torch.bitwise_and(positions, self.ratio - 1) == self.ratio - 1)
+        visible = torch.bitwise_and(positions, self.ratio - 1) == self.ratio - 1
         # Incomplete groups use unique rows in the reserved null page.
-        slots = torch.where(visible, self.shared.physical_rows(rows, self.ratio),
-                            torch.bitwise_and(rows, PAGE_TOKENS // self.ratio - 1))
+        slots = torch.where(
+            visible, self.shared.physical_rows(rows, self.ratio), torch.bitwise_and(rows, PAGE_TOKENS // self.ratio - 1)
+        )
         indexer = self.weights.indexer
         index = rms_norm(self.linear(latent, indexer.wk), indexer.k_norm.weight, self.eps)
         index, latent = self._rope(index, first), self._rope(latent, first)
-        if (self.runtime_indexer and self.ratio in (1, 2)
-                # The <=512 static bucket is the producer for the later hot
-                # MME bucket.  Populate its prefix before the search geometry
-                # switches at token 513; otherwise rows 0..511 remain zero.
-                and self.search_length <= INDEX_MME_HOT_TOKENS and hasattr(self.cache, "decoded_index_hot")):
+        if (
+            getattr(self.shared, "index_mirror_valid", False)
+            and positions.numel() <= NATIVE_WORK_TOKENS
+            and self.search_length <= self.shared.index_mirror_tokens
+        ):
+            # Maintain the exact packed-key value, including its BF16 FP4
+            # roundtrip. The derived buffer is never request-snapshotted.
+            self.cache.index_mirror.index_copy_(0, rows.long(), fp4_roundtrip(index, 32))
+        if (
+            self.runtime_indexer
+            and self.ratio in (1, 2)
+            # The <=512 static bucket is the producer for the later hot
+            # MME bucket.  Populate its prefix before the search geometry
+            # switches at token 513; otherwise rows 0..511 remain zero.
+            and self.search_length <= INDEX_MME_HOT_TOKENS
+            and hasattr(self.cache, "decoded_index_hot")
+        ):
             # The mirror must contain the same values as the packed index
             # cache.  Keeping the pre-quantization key would silently change
             # candidate selection when this MME path replaces packed scoring.
             self.cache.decoded_index_hot.index_copy_(0, rows.long(), fp4_roundtrip(index, 32))
         if decoded and value.shape[0] == 1:
             return torch.ops.custom_op.custom_deepseek_v41_fp4_paged_decoded_write_bf16_gaudi2(
-                self.cache.main, self.cache.index, latent.contiguous(), index.contiguous(),
+                self.cache.main,
+                self.cache.index,
+                latent.contiguous(),
+                index.contiguous(),
                 slots.to(torch.int32).contiguous(),
-                rows.to(torch.int32).contiguous(), self.cache.decoded_main)
+                rows.to(torch.int32).contiguous(),
+                self.cache.decoded_main,
+            )
         packed_index, packed_main = pack_fp4(index, 32), pack_fp4(latent, 16)
         self.cache.index.index_copy_(0, slots.long(), packed_index)
         self.cache.main.index_copy_(0, slots.long(), packed_main)
@@ -663,31 +867,81 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
 
     def _prepare_index_queries(self, value, qr, positions, *, prefill=False, request_batch=False):
         indexer = self.weights.indexer
-        q = self.linear(qr, indexer.wq_b).reshape(-1, self.index_heads, 128)
+        local_queries = (
+            not prefill and getattr(self, "tp4_local_index_queries", False)
+            and value.shape[0] == 1 and self.search_length <= 32768
+        )
+        if local_queries:
+            from vllm_gaudi.ops.deepseek_v41_tp4_selection import local_index_query_projections
+
+            q, weights = local_index_query_projections(self, value, qr)
+        else:
+            q = self.linear(qr, indexer.wq_b).reshape(-1, self.index_heads, 128)
         q = self._rope(q, positions, request_batch=request_batch)
         # Quantize and restore in one TPC pass.  The codec keeps packed FP4
         # codes and UE8M0 scales in registers, so prefill does not materialize
         # a packed query in HBM or compile a generic bit-unpack graph.  Tile by
         # the native flattened-row contract; for TP2's 16 heads this is C512.
-        codec_tokens = max(1, 8192 // self.index_heads)
-        pieces = [fp4_roundtrip(q[start:start + codec_tokens], 32) for start in range(0, q.shape[0], codec_tokens)]
+        codec_tokens = max(1, 8192 // q.shape[1])
+        pieces = [fp4_roundtrip(q[start : start + codec_tokens], 32) for start in range(0, q.shape[0], codec_tokens)]
         q = pieces[0] if len(pieces) == 1 else torch.cat(pieces, 0)
         global_heads = self.index_heads * self.tensor_parallel_size
-        weights = self.linear(value, indexer.weights_proj) * (128**-0.5 * global_heads**-0.5)
-        if (prefill and self.tensor_parallel_size == 4 and gaudi_envs.VLLM_HPU_DSV41_PREFILL_INDEX_QUERY_TP
-                and can_partition_prefill_index(positions.numel(), self.search_length // self.ratio)):
+        if not local_queries:
+            weights = self.linear(value, indexer.weights_proj)
+        weights = weights * (128**-0.5 * global_heads**-0.5)
+        if (
+            prefill
+            and self.tensor_parallel_size == 4
+            and gaudi_envs.VLLM_HPU_DSV41_PREFILL_INDEX_QUERY_TP
+            and can_partition_prefill_index(positions.numel(), self.search_length // self.ratio)
+        ):
             from vllm.distributed import get_tp_group
             from vllm_gaudi.ops.deepseek_v41_prefill_index_exchange import exchange_prefill_index_queries
+
             group = get_tp_group()
             rank = getattr(self, "prefill_tp_rank", None)
             if rank != group.rank_in_group:
                 raise RuntimeError("Prefill index query exchange has no matching TP owner")
             return exchange_prefill_index_queries(q, weights, rank, group=group.device_group)
         # Exchange only small query/head tensors, not one score per cached token.
-        q, weights = self.gather(q, 1), self.gather(weights, 1)
+        if not local_queries:
+            if getattr(self, "tp4_packed_index_queries", False):
+                from vllm_gaudi.ops.deepseek_v41_index_packet import gather_index_query_packet
+
+                q, weights = gather_index_query_packet(q, weights, self.gather, self.tensor_parallel_size)
+            else:
+                q, weights = self.gather(q, 1), self.gather(weights, 1)
         return q, weights
 
+    def _uses_index_mirror(self, q):
+        return (
+            getattr(self, "index_mirror_scores", False)
+            and q.shape[0] == 1
+            and self.shared.index_mirror_valid
+            and self.search_length <= self.shared.index_mirror_tokens
+        )
+
     def _scores(self, positions, logical_rows, q, weights):
+        if self.tensor_parallel_size == 4 and q.shape[0] <= NATIVE_WORK_TOKENS:
+            from vllm_gaudi.ops.deepseek_v41_decode_index import native_index_tile, supports_native_index_tile
+
+            if supports_native_index_tile(q, logical_rows):
+                if self._uses_index_mirror(q):
+                    from vllm_gaudi.ops.deepseek_v41_index_mirror import mirror_index_tile
+
+                    return mirror_index_tile(
+                        q, weights, self.cache.index_mirror, positions, logical_rows, self.ratio, self.index_heads
+                    )
+                return native_index_tile(
+                    q,
+                    weights,
+                    self.cache.index,
+                    self.shared.block_table,
+                    positions,
+                    logical_rows,
+                    self.ratio,
+                    self.index_heads,
+                )
         physical = self.shared.physical_rows(logical_rows.clamp_min(0), self.ratio)
         packed = self.cache.index.index_select(0, physical.flatten().long()).reshape(*physical.shape, 68)
         keys = unpack_fp4(packed, 128, 32)
@@ -695,10 +949,11 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         # query/key views and could require a new, much larger recipe beside
         # the 1M-context resident set.  These forms produce bitwise-identical
         # BF16 scores while giving Bridge the final MME geometry directly.
-        scores = (torch.matmul(q.contiguous(),
-                               keys.transpose(0, 1).contiguous()) if keys.ndim == 2 else torch.bmm(
-                                   q.contiguous(),
-                                   keys.transpose(1, 2).contiguous()))
+        scores = (
+            torch.matmul(q.contiguous(), keys.transpose(0, 1).contiguous())
+            if keys.ndim == 2
+            else torch.bmm(q.contiguous(), keys.transpose(1, 2).contiguous())
+        )
         scores = scores.relu() * weights.unsqueeze(-1)
         # Preserve the local-head BF16 sums before reducing across all TP
         # ranks. The gathered head axis includes four shards for TP4.
@@ -710,8 +965,10 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
     def _prefill_scores(self, positions, rows, q, weights):
         if gaudi_envs.VLLM_HPU_DSV41_PREFILL_INDEX_SRAM and rows.ndim == 1:
             from vllm_gaudi.ops.deepseek_v41_prefill_index_scores import full_prefill_sram_scores
-            return full_prefill_sram_scores(q, weights, self.cache.index, self.shared.block_table, positions, rows,
-                                            self.ratio, self.index_heads)
+
+            return full_prefill_sram_scores(
+                q, weights, self.cache.index, self.shared.block_table, positions, rows, self.ratio, self.index_heads
+            )
         if rows.ndim != 2 or q.shape[0] > PREFILL_ATTN_TOKENS:
             return self._scores(positions, rows, q, weights)
         # The compiled MME helper flattens every BF16 rounding boundary into
@@ -736,25 +993,81 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             selected = selected.gather(1, offsets)
         return values, selected
 
-    def _stream_topk(self,
-                     positions,
-                     rows,
-                     q,
-                     weights,
-                     width=512,
-                     collect_blocks=False,
-                     native_scores=False,
-                     visible_rows=None):
+    def _stream_topk(
+        self,
+        positions,
+        rows,
+        q,
+        weights,
+        width=512,
+        collect_blocks=False,
+        native_scores=False,
+        visible_rows=None,
+        partition_tiles=False,
+        partition_mirror=False,
+    ):
         """Exact bounded-memory index selection for a large prompt block."""
         columns = rows.shape[-1]
         if visible_rows is not None and (rows.ndim != 1 or not 0 <= visible_rows <= columns):
             raise ValueError("Visible source prefix requires contiguous logical source rows")
+        active_columns = columns if visible_rows is None else visible_rows
+        if partition_mirror and not native_scores:
+            from vllm_gaudi.ops.deepseek_v41_tp4_selection import supports_mirror_partition, tp4_mirror_stream_topk
+
+            if supports_mirror_partition(self, rows, q, active_columns, width):
+                return tp4_mirror_stream_topk(
+                    self,
+                    positions,
+                    rows,
+                    q,
+                    weights,
+                    width=width,
+                    collect_blocks=collect_blocks,
+                    visible_rows=visible_rows,
+                )
+        if (
+            partition_tiles
+            and self.tensor_parallel_size == 4
+            and q.shape[0] == 1
+            and 4 * PREFILL_INDEX_ROWS <= active_columns <= columns <= 32768
+            and columns % PREFILL_INDEX_ROWS == 0
+        ):
+            from vllm_gaudi.ops.deepseek_v41_tp4_selection import tp4_stream_topk
+
+            return tp4_stream_topk(
+                self, positions, rows, q, weights, width=width, collect_blocks=collect_blocks, visible_rows=visible_rows
+            )
         best_scores = best_rows = None
         block_scores = block_ids = None
         invalid_scores = None
+        prefix_scores = None
+        if (
+            not native_scores
+            and rows.ndim == 1
+            and getattr(self, "index_mirror_scores", False)
+            and self._uses_index_mirror(q)
+            and 128 <= active_columns <= self.cache.index_mirror.shape[0]
+            and active_columns % 128 == 0
+        ):
+            prefix_scores = torch.ops.custom_op.custom_deepseek_v41_prefill_index_scores_gaudi2(
+                q.contiguous(),
+                weights.contiguous(),
+                self.cache.index_mirror[:active_columns].contiguous(),
+                positions.to(torch.int32).contiguous(),
+                rows[:active_columns].contiguous(),
+                self.ratio,
+                self.index_heads,
+            )
+        from vllm_gaudi.ops.deepseek_v41_decode_selection import can_batch_full_r1
+
+        batched_selection = can_batch_full_r1(self, q, rows, prefix_scores, native_scores, active_columns)
+        selection_scores = []
         for start in range(0, columns, PREFILL_INDEX_ROWS):
-            current_rows = (rows[start:start + PREFILL_INDEX_ROWS] if rows.ndim == 1 else rows[:, start:start +
-                                                                                               PREFILL_INDEX_ROWS])
+            current_rows = (
+                rows[start : start + PREFILL_INDEX_ROWS]
+                if rows.ndim == 1
+                else rows[:, start : start + PREFILL_INDEX_ROWS]
+            )
             scorer = self._prefill_scores if native_scores else self._scores
             invisible_tile = visible_rows is not None and start >= visible_rows
             if invisible_tile:
@@ -768,7 +1081,14 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 scores = invalid_scores
             else:
                 with prefill_event_span("index_scores", getattr(self, "layer", None), positions.numel()):
-                    scores = scorer(positions, current_rows, q, weights)
+                    scores = (
+                        scorer(positions, current_rows, q, weights)
+                        if prefix_scores is None
+                        else prefix_scores[:, start : start + current_rows.shape[-1]]
+                    )
+            if batched_selection:
+                selection_scores.append(scores)
+                continue
             # An all-invalid tile cannot change valid Top512 rows. Omitting the
             # large merge is exact after invalid rows are normalized to -1,
             # while retaining candidate-block merges preserves their tie order.
@@ -780,36 +1100,67 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                     pad = 8 - scores.shape[-1] % 8
                     scores = F.pad(scores, (0, pad), value=-torch.inf)
                 grouped = scores.reshape(scores.shape[0], -1, 8).amax(-1)
-                ids = torch.arange(start // 8,
-                                   start // 8 + grouped.shape[-1],
-                                   device=positions.device,
-                                   dtype=torch.int32)
+                ids = torch.arange(
+                    start // 8, start // 8 + grouped.shape[-1], device=positions.device, dtype=torch.int32
+                )
                 count = ((positions + 1) // self.ratio).unsqueeze(-1)
                 # Match the reference: keep the block containing the newest
                 # visible token so its causal prefix cannot be dropped.
                 grouped = grouped.masked_fill(ids == ((count - 1) // 8), torch.inf)
                 with prefill_event_span("index_candidates", getattr(self, "layer", None), positions.numel()):
                     block_scores, block_ids = self._merge_topk(block_scores, block_ids, grouped, ids, 2048)
+
+        if batched_selection:
+            from vllm_gaudi.ops.deepseek_v41_decode_selection import batched_decode_selection
+
+            return batched_decode_selection(
+                selection_scores,
+                rows,
+                positions,
+                self.ratio,
+                width=width,
+                collect_blocks=collect_blocks,
+                selected_tiles=active_columns // PREFILL_INDEX_ROWS,
+            )
         return best_rows, block_scores, block_ids
 
     def _select(self, value, qr, positions, *, buffer_start=0, prepared=None, prefill=False):
         count, tokens = (positions + 1) // self.ratio, positions.numel()
         target = slice(buffer_start, buffer_start + tokens)
         if self.owns_index:
-            if (prefill and gaudi_envs.VLLM_HPU_DSV41_PREFILL_INDEX_SHARED and self.layer > self.candidate_source
-                    and 512 < self.search_length // self.ratio <= 16384):
+            if (
+                prefill
+                and gaudi_envs.VLLM_HPU_DSV41_PREFILL_INDEX_SHARED
+                and self.layer > self.candidate_source
+                and 512 < self.search_length // self.ratio <= 16384
+            ):
                 from vllm_gaudi.ops.deepseek_v41_prefill_index_scores import compiled_shared_reindex
+
                 q, weights = self._prepare_index_queries(value, qr, positions) if prepared is None else prepared
                 pool = self.shared.candidate_pool[target]
                 columns = candidate_columns(self.search_length, self.ratio, pool.shape[-1])
                 pool = pool[:, :columns].contiguous()
                 source_rows = self.search_length // self.ratio
-                signature = (q.shape, pool.shape, self.cache.index.shape, self.shared.block_table.shape, self.ratio,
-                             self.index_heads, source_rows)
-                indices = compiled_shared_reindex(signature)(q.clone(),
-                                                             weights.clone(), self.cache.index, self.shared.block_table,
-                                                             positions.clone(), pool, self.ratio, self.index_heads,
-                                                             source_rows)
+                signature = (
+                    q.shape,
+                    pool.shape,
+                    self.cache.index.shape,
+                    self.shared.block_table.shape,
+                    self.ratio,
+                    self.index_heads,
+                    source_rows,
+                )
+                indices = compiled_shared_reindex(signature)(
+                    q.clone(),
+                    weights.clone(),
+                    self.cache.index,
+                    self.shared.block_table,
+                    positions.clone(),
+                    pool,
+                    self.ratio,
+                    self.index_heads,
+                    source_rows,
+                )
                 self.selection.indices[target].copy_(indices)
                 return self.selection.indices[target]
             # The dynamic indexer is required once the visible prefix exceeds
@@ -819,26 +1170,45 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             # per owning layer and regresses the historical C1 replay.  Keep
             # this fast path valid for the long-context runtime-indexer build;
             # only the >512-row case needs dynamic selection.
-            if (self.runtime_indexer and tokens == 1 and not prefill and self.search_length // self.ratio > 512):
+            if self.runtime_indexer and tokens == 1 and not prefill and self.search_length // self.ratio > 512:
                 from vllm_gaudi.ops.deepseek_v41_indexer import runtime_index_select
+
                 q, weights = self._prepare_index_queries(value, qr, positions) if prepared is None else prepared
-                pool = (self.shared.index_candidates_unused
-                        if self.shared.candidate_pool is None else self.shared.candidate_pool[target].contiguous())
-                decoded_hot = (self.cache.decoded_index_hot if
-                               (self.ratio in (1, 2) and self.search_length == INDEX_MME_HOT_TOKENS
-                                and hasattr(self.cache, "decoded_index_hot")) else None)
-                indices, blocks = runtime_index_select(q.contiguous(),
-                                                       weights.contiguous(),
-                                                       self.cache.index,
-                                                       self.shared.block_table,
-                                                       positions.to(torch.int32).contiguous(),
-                                                       pool,
-                                                       ratio=self.ratio,
-                                                       capacity=self.length // self.ratio,
-                                                       reindex=self.layer > self.candidate_source,
-                                                       publish_candidates=self.layer == self.candidate_source,
-                                                       decoded_hot=decoded_hot,
-                                                       ordered_candidates=True)
+                pool = (
+                    self.shared.index_candidates_unused[:tokens]
+                    if self.shared.candidate_pool is None
+                    else self.shared.candidate_pool[target].contiguous()
+                )
+                decoded_hot = (
+                    self.cache.decoded_index_hot
+                    if (
+                        self.ratio in (1, 2)
+                        and self.search_length == INDEX_MME_HOT_TOKENS
+                        and hasattr(self.cache, "decoded_index_hot")
+                    )
+                    else None
+                )
+                indices, blocks = runtime_index_select(
+                    q.contiguous(),
+                    weights.contiguous(),
+                    self.cache.index,
+                    self.shared.block_table,
+                    positions.to(torch.int32).contiguous(),
+                    pool,
+                    ratio=self.ratio,
+                    capacity=self.length // self.ratio,
+                    reindex=self.layer > self.candidate_source,
+                    publish_candidates=self.layer == self.candidate_source,
+                    decoded_hot=decoded_hot,
+                    ordered_candidates=True,
+                    local_heads=self.index_heads,
+                    search_rows=(
+                        (self.decode_visible_rows or self.search_length // self.ratio)
+                        if self.search_length <= 32768 and decoded_hot is None
+                        else None
+                    ),
+                    decoded_keys=(self.cache.index_mirror if self._uses_index_mirror(q) else None),
+                )
                 if blocks is not None:
                     self.shared.candidate_pool[target].copy_(blocks)
                 self.selection.indices[target].copy_(indices)
@@ -853,7 +1223,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 if self.layer > self.candidate_source:
                     blocks = self.shared.candidate_pool[target]
                     if gaudi_envs.VLLM_HPU_DSV41_PREFILL_COMPACT_CANDIDATES and prefill:
-                        blocks = blocks[:, :candidate_columns(self.search_length, self.ratio, blocks.shape[-1])]
+                        blocks = blocks[:, : candidate_columns(self.search_length, self.ratio, blocks.shape[-1])]
                     rows = blocks.unsqueeze(-1) * 8 + torch.arange(8, device=positions.device, dtype=torch.int32)
                     rows = torch.where(blocks.unsqueeze(-1) >= 0, rows, -1).flatten(1)
                 else:
@@ -865,13 +1235,19 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                     q,
                     weights,
                     collect_blocks=self.layer == self.candidate_source,
-                    native_scores=prefill and gaudi_envs.VLLM_HPU_DSV41_PREFILL_INDEX_MME)
+                    native_scores=prefill and gaudi_envs.VLLM_HPU_DSV41_PREFILL_INDEX_MME,
+                    visible_rows=None if prefill else self.decode_visible_rows,
+                    partition_tiles=not prefill and tokens == 1 and getattr(self, "tp4_tile_selection", False),
+                    partition_mirror=getattr(self, "tp4_mirror_selection", False) and not prefill and tokens == 1,
+                )
                 if self.layer == self.candidate_source:
                     valid = candidate_scores > -torch.inf
                     candidate_blocks = torch.where(valid, candidate_blocks, -1).to(torch.int32)
-                    candidate_blocks = F.pad(candidate_blocks,
-                                             (0, self.shared.candidate_pool.shape[-1] - candidate_blocks.shape[-1]),
-                                             value=-1)
+                    candidate_blocks = F.pad(
+                        candidate_blocks,
+                        (0, self.shared.candidate_pool.shape[-1] - candidate_blocks.shape[-1]),
+                        value=-1,
+                    )
                     self.shared.candidate_pool[target].copy_(candidate_blocks)
                 # Sort logical positions, with invalid picks after reachable ones.
                 indices = torch.where((indices >= 0) & (indices < count.unsqueeze(-1)), indices, self.length)
@@ -885,17 +1261,13 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             if self.tensor_parallel_size != 4 or ready_outputs:
                 raise ValueError("Token-owned attention output requires ordinary TP4 prefill")
             from vllm_gaudi.ops.deepseek_v41_prefill_sequence_state import reduce_owned_tokens
+
             return reduce_owned_tokens(partial, self.reduce)
         return self.reduce(partial, ready_outputs=ready_outputs) if ready_outputs else self.reduce(partial)
 
-    def _finish_output(self,
-                       output,
-                       positions,
-                       ready_outputs=(),
-                       *,
-                       prefill=False,
-                       prefill_sequence=False,
-                       request_batch=False):
+    def _finish_output(
+        self, output, positions, ready_outputs=(), *, prefill=False, prefill_sequence=False, request_batch=False
+    ):
         """Apply the shared output projection after either attention path."""
         if prefill:
             with prefill_event_span("attention_output_inverse_rope", self.layer, output.shape[0]):
@@ -908,8 +1280,9 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             if not (self.woa_fp8 and self.woa_output_roundtrip and getattr(wb, "dense_fp8", False)):
                 raise ValueError("Prefill output projection requires prepared FP8 weights and the group codec")
             with prefill_event_span("attention_output_projection", self.layer, output.shape[0]):
-                partial = prefill_output_projection(output.contiguous(), wa.weight, wa.channel_scale, wb.weight,
-                                                    wb.channel_scale)
+                partial = prefill_output_projection(
+                    output.contiguous(), wa.weight, wa.channel_scale, wb.weight, wb.channel_scale
+                )
             with prefill_event_span("attention_output_reduce", self.layer, output.shape[0]):
                 return self._reduce_prefill_output(partial, ready_outputs, prefill_sequence)
         if prefill:
@@ -928,18 +1301,30 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
 
     def _can_fuse_mla_woa(self, positions):
         """Return whether the exact MLA-product/wo_a producer is available."""
-        return (positions.numel() == 1 and self.mla_mme and self.woa_fp8 and self.woa_output_roundtrip
-                and self.native_rope)
+        return (
+            positions.numel() == 1 and self.mla_mme and self.woa_fp8 and self.woa_output_roundtrip and self.native_rope
+        )
+
+    def _paged_mla_operation(self, tokens):
+        if self.paged_mla_direct and tokens == 1:
+            return torch.ops.custom_op.custom_deepseek_v41_paged_mla_direct_mme_gaudi2
+        return torch.ops.custom_op.custom_deepseek_v41_paged_mla_mme_gaudi2
 
     def _output(self, query, cache, indices, positions, ready_outputs=(), *, decode=False):
         if decode and self.mla_mme and 1 <= query.shape[0] <= NATIVE_WORK_TOKENS:
-            lengths = torch.full((query.shape[0], ), indices.shape[1], dtype=torch.int32, device=query.device)
+            lengths = torch.full((query.shape[0],), indices.shape[1], dtype=torch.int32, device=query.device)
             output = torch.ops.custom_op.custom_deepseek_v41_selected_mla_mme_gaudi2(
-                query.contiguous(), cache.contiguous(), indices.contiguous(), self.weights.attn_sink, self.scale,
-                lengths)
+                query.contiguous(),
+                cache.contiguous(),
+                indices.contiguous(),
+                self.weights.attn_sink,
+                self.scale,
+                lengths,
+            )
             return self._finish_output(output, positions, ready_outputs)
         output, _, _ = torch.ops.custom_op.custom_deepseek_v4_sparse_attn_bf16_gaudi2(
-            query.contiguous(), cache.contiguous(), indices.contiguous(), self.weights.attn_sink, self.scale)
+            query.contiguous(), cache.contiguous(), indices.contiguous(), self.weights.attn_sink, self.scale
+        )
         return self._finish_output(output, positions, ready_outputs)
 
     @prefill_scope("indexer")
@@ -953,14 +1338,21 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         # after splitting C512 into C256 per rank.  Keep the established local
         # path for C512 and smaller buckets; production C1024-C8192 buckets
         # still split cleanly and carry the useful work reduction.
-        if (self.owns_index and gaudi_envs.VLLM_HPU_DSV41_PREFILL_INDEX_QUERY_TP
-                and can_partition_prefill_index(positions.numel(), source_rows)):
-            from vllm_gaudi.ops.deepseek_v41_prefill_index_scores import (tp_full_prefill_index_selection,
-                                                                          tp_prefill_reindex_selection)
+        if (
+            self.owns_index
+            and gaudi_envs.VLLM_HPU_DSV41_PREFILL_INDEX_QUERY_TP
+            and can_partition_prefill_index(positions.numel(), source_rows)
+        ):
+            from vllm_gaudi.ops.deepseek_v41_prefill_index_scores import (
+                tp_full_prefill_index_selection,
+                tp_prefill_reindex_selection,
+            )
+
             rank = getattr(self, "prefill_tp_rank", None)
             if rank is None or not 0 <= rank < self.tensor_parallel_size:
                 raise RuntimeError("Prefill index query partition has no prepared TP rank")
             from vllm_gaudi.ops.deepseek_v41_prefill_index_exchange import PrefillIndexQueryPartition
+
             prepared = self._prepare_index_queries(value, qr, positions, prefill=True) if prepared is None else prepared
             partitioned = isinstance(prepared, PrefillIndexQueryPartition)
             if partitioned:
@@ -975,39 +1367,43 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                     if token_end is None or not positions.numel() <= token_end <= self.search_length:
                         raise RuntimeError("Prefill source visibility has no valid scheduler interval")
                     visible = token_end // self.ratio
-                selected, blocks = tp_full_prefill_index_selection(q,
-                                                                   weights,
-                                                                   self.cache.index,
-                                                                   self.shared.block_table,
-                                                                   positions.to(torch.int32),
-                                                                   self.ratio,
-                                                                   source_rows,
-                                                                   self.layer == self.candidate_source,
-                                                                   rank,
-                                                                   self.gather,
-                                                                   visible,
-                                                                   self.tensor_parallel_size,
-                                                                   query_partitioned=partitioned)
+                selected, blocks = tp_full_prefill_index_selection(
+                    q,
+                    weights,
+                    self.cache.index,
+                    self.shared.block_table,
+                    positions.to(torch.int32),
+                    self.ratio,
+                    source_rows,
+                    self.layer == self.candidate_source,
+                    rank,
+                    self.gather,
+                    visible,
+                    self.tensor_parallel_size,
+                    query_partitioned=partitioned,
+                )
                 if blocks is not None:
-                    self.shared.candidate_pool[:positions.numel()].copy_(blocks)
+                    self.shared.candidate_pool[: positions.numel()].copy_(blocks)
             else:
-                pool = self.shared.candidate_pool[:positions.numel()]
+                pool = self.shared.candidate_pool[: positions.numel()]
                 if gaudi_envs.VLLM_HPU_DSV41_PREFILL_COMPACT_CANDIDATES:
-                    pool = pool[:, :candidate_columns(self.search_length, self.ratio, pool.shape[-1])]
-                selected = tp_prefill_reindex_selection(q,
-                                                        weights,
-                                                        self.cache.index,
-                                                        self.shared.block_table,
-                                                        positions.to(torch.int32),
-                                                        pool,
-                                                        self.ratio,
-                                                        source_rows,
-                                                        rank,
-                                                        self.gather,
-                                                        tensor_parallel_size=self.tensor_parallel_size,
-                                                        query_partitioned=partitioned)
-            self.selection.indices[:positions.numel()].copy_(selected)
-            return self.selection.indices[:positions.numel()]
+                    pool = pool[:, : candidate_columns(self.search_length, self.ratio, pool.shape[-1])]
+                selected = tp_prefill_reindex_selection(
+                    q,
+                    weights,
+                    self.cache.index,
+                    self.shared.block_table,
+                    positions.to(torch.int32),
+                    pool,
+                    self.ratio,
+                    source_rows,
+                    rank,
+                    self.gather,
+                    tensor_parallel_size=self.tensor_parallel_size,
+                    query_partitioned=partitioned,
+                )
+            self.selection.indices[: positions.numel()].copy_(selected)
+            return self.selection.indices[: positions.numel()]
         # Full layers score the same one-dimensional source row range for all
         # query rows.  Streaming source rows while keeping all 8192 queries
         # removes 64 repeated Python submissions. The reduced score tile is
@@ -1017,51 +1413,81 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         if not self.owns_index or self.layer <= self.candidate_source:
             return self._select(value, qr, positions, prepared=prepared, prefill=True)
         if gaudi_envs.VLLM_HPU_DSV41_PREFILL_REINDEX_REUSE:
-            from vllm_gaudi.ops.deepseek_v41_prefill_index_scores import (SHARED_INDEX_MAX_ROWS,
-                                                                          compiled_decode_shared_index_keys,
-                                                                          compiled_decoded_reindex)
+            from vllm_gaudi.ops.deepseek_v41_prefill_index_scores import (
+                SHARED_INDEX_MAX_ROWS,
+                compiled_decode_shared_index_keys,
+                compiled_decoded_reindex,
+            )
+
             source_rows = self.search_length // self.ratio
             if 512 < source_rows <= SHARED_INDEX_MAX_ROWS:
                 q, weights = self._prepare_index_queries(value, qr, positions) if prepared is None else prepared
-                signature = (tuple(self.cache.index.shape), tuple(self.shared.block_table.shape), self.ratio,
-                             source_rows)
-                keys = compiled_decode_shared_index_keys(signature)(self.cache.index, self.shared.block_table,
-                                                                    self.ratio, source_rows)
+                signature = (
+                    tuple(self.cache.index.shape),
+                    tuple(self.shared.block_table.shape),
+                    self.ratio,
+                    source_rows,
+                )
+                keys = compiled_decode_shared_index_keys(signature)(
+                    self.cache.index, self.shared.block_table, self.ratio, source_rows
+                )
                 for start in range(0, positions.numel(), PREFILL_ATTN_TOKENS):
                     stop = min(start + PREFILL_ATTN_TOKENS, positions.numel())
                     pool = self.shared.candidate_pool[start:stop]
                     if gaudi_envs.VLLM_HPU_DSV41_PREFILL_COMPACT_CANDIDATES:
-                        pool = pool[:, :candidate_columns(self.search_length, self.ratio, pool.shape[-1])]
+                        pool = pool[:, : candidate_columns(self.search_length, self.ratio, pool.shape[-1])]
                     native_gather = gaudi_envs.VLLM_HPU_DSV41_PREFILL_CANDIDATE_GATHER
                     native_scores = gaudi_envs.VLLM_HPU_DSV41_PREFILL_REINDEX_SRAM
-                    signature = (stop - start, tuple(pool.shape), source_rows, self.ratio, self.index_heads,
-                                 native_gather, native_scores)
-                    selected = compiled_decoded_reindex(signature)(q[start:stop].clone(), weights[start:stop].clone(),
-                                                                   keys, positions[start:stop].clone(), pool.clone(),
-                                                                   self.ratio, self.index_heads, native_gather,
-                                                                   native_scores)
+                    signature = (
+                        stop - start,
+                        tuple(pool.shape),
+                        source_rows,
+                        self.ratio,
+                        self.index_heads,
+                        native_gather,
+                        native_scores,
+                    )
+                    selected = compiled_decoded_reindex(signature)(
+                        q[start:stop].clone(),
+                        weights[start:stop].clone(),
+                        keys,
+                        positions[start:stop].clone(),
+                        pool.clone(),
+                        self.ratio,
+                        self.index_heads,
+                        native_gather,
+                        native_scores,
+                    )
                     self.selection.indices[start:stop].copy_(selected)
                 # Each tile already publishes to the transaction's persistent
                 # selection buffer. Consume that buffer directly instead of
                 # concatenating outputs after mutating their published views.
-                return self.selection.indices[:positions.numel()]
+                return self.selection.indices[: positions.numel()]
         for start in range(0, positions.numel(), PREFILL_ATTN_TOKENS):
             stop = min(start + PREFILL_ATTN_TOKENS, positions.numel())
-            current_prepared = ((prepared[0][start:stop], prepared[1][start:stop]) if prepared is not None else None)
-            self._select(value[start:stop],
-                         qr[start:stop],
-                         positions[start:stop],
-                         buffer_start=start,
-                         prepared=current_prepared,
-                         prefill=True)
-        return self.selection.indices[:positions.numel()]
+            current_prepared = (prepared[0][start:stop], prepared[1][start:stop]) if prepared is not None else None
+            self._select(
+                value[start:stop],
+                qr[start:stop],
+                positions[start:stop],
+                buffer_start=start,
+                prepared=current_prepared,
+                prefill=True,
+            )
+        return self.selection.indices[: positions.numel()]
 
     def _prefill_swa_workspace(self, kv, positions, *, decoded=False):
         """Bind request state explicitly to the reusable SWA tensor region."""
         from vllm_gaudi.ops.deepseek_v41_prefill_regions import prefill_swa_workspace
-        return prefill_swa_workspace(kv, positions, self.swa, self.window_offsets,
-                                     self.shared.decoded_swa if decoded else None,
-                                     self.decoded_swa_offset if decoded else 0)
+
+        return prefill_swa_workspace(
+            kv,
+            positions,
+            self.swa,
+            self.window_offsets,
+            self.shared.decoded_swa if decoded else None,
+            self.decoded_swa_offset if decoded else 0,
+        )
 
     def _prefill_attention_tiled(self, value, query, kv, positions, selected, ready_outputs=(), prefill_sequence=False):
         """Bound BF16 selected-row storage for prefixes above the dense-cache cap."""
@@ -1079,37 +1505,40 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 physical = self.shared.physical_rows(current_selected.clamp_min(0), self.ratio)
                 packed = self.cache.main.index_select(0, physical.flatten().long())
                 cache = torch.cat((unpack_swa(self.swa), unpack_fp4(packed)), 0)
-                offset = torch.arange(current_selected.numel(), device=value.device,
-                                      dtype=torch.int32).reshape(current_selected.shape)
+                offset = torch.arange(current_selected.numel(), device=value.device, dtype=torch.int32).reshape(
+                    current_selected.shape
+                )
                 indices = torch.cat((indices, torch.where(current_selected >= 0, offset + SWA_ROWS, -1)), -1)
             if cache is None:
                 cache = unpack_swa(self.swa)
             output = self._prefill_sparse(query[start:stop], cache, indices)
             outputs.append(output)
-        return self._finish_output(torch.cat(outputs, 0),
-                                   positions,
-                                   ready_outputs,
-                                   prefill=True,
-                                   prefill_sequence=prefill_sequence)
+        return self._finish_output(
+            torch.cat(outputs, 0), positions, ready_outputs, prefill=True, prefill_sequence=prefill_sequence
+        )
 
     @prefill_span("attention_mla")
     def _prefill_sparse(self, query, cache, indices, *, indices_partitioned=False):
         if gaudi_envs.VLLM_HPU_DSV41_FLASHINFER_PREFILL:
-            if (gaudi_envs.VLLM_HPU_DSV41_PREFILL_MLA_SEQUENCE and can_partition_prefill_mla(
-                    query.shape, indices.shape[1], self.tensor_parallel_size, self.search_length)):
+            if gaudi_envs.VLLM_HPU_DSV41_PREFILL_MLA_SEQUENCE and can_partition_prefill_mla(
+                query.shape, indices.shape[1], self.tensor_parallel_size, self.search_length
+            ):
                 from vllm.distributed import get_tp_group
                 from vllm_gaudi.ops.deepseek_v41_prefill_sequence import sequence_prefill_mla
+
                 group = get_tp_group()
                 if self._prefill_sequence_sink is None:
                     self._prefill_sequence_sink = self.gather(self.weights.attn_sink, 0).contiguous()
-                return sequence_prefill_mla(query,
-                                            cache,
-                                            indices,
-                                            self._prefill_sequence_sink,
-                                            group.rank_in_group,
-                                            group=group.device_group,
-                                            retire_chunks=False,
-                                            indices_partitioned=indices_partitioned)
+                return sequence_prefill_mla(
+                    query,
+                    cache,
+                    indices,
+                    self._prefill_sequence_sink,
+                    group.rank_in_group,
+                    group=group.device_group,
+                    retire_chunks=False,
+                    indices_partitioned=indices_partitioned,
+                )
             if indices_partitioned:
                 raise ValueError("Query-owned MLA indices cannot fall back to a replicated consumer")
             outputs = []
@@ -1121,8 +1550,13 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                     stop = min(start + outer_rows, query.shape[0])
                     signature = (stop - start, tuple(query.shape[1:]), tuple(cache.shape), indices.shape[1])
                     outputs.append(
-                        compiled_flash_prefill_mla(signature)(query[start:stop].contiguous(), cache,
-                                                              indices[start:stop].contiguous(), self.weights.attn_sink))
+                        compiled_flash_prefill_mla(signature)(
+                            query[start:stop].contiguous(),
+                            cache,
+                            indices[start:stop].contiguous(),
+                            self.weights.attn_sink,
+                        )
+                    )
             return torch.cat(outputs, 0)
         if indices_partitioned:
             raise ValueError("Query-owned MLA indices require the sequence prefill path")
@@ -1135,21 +1569,19 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             # the bounded C64 tiles directly.  This affects prefill only; C1
             # decode still uses the captured native joint-replay program below.
             return bounded_prefill_mla(query, cache, indices, self.weights.attn_sink, self.scale, tile)
-        return torch.ops.custom_op.custom_deepseek_v4_sparse_attn_bf16_gaudi2(query.contiguous(), cache.contiguous(),
-                                                                              indices.contiguous(),
-                                                                              self.weights.attn_sink, self.scale)[0]
+        return torch.ops.custom_op.custom_deepseek_v4_sparse_attn_bf16_gaudi2(
+            query.contiguous(), cache.contiguous(), indices.contiguous(), self.weights.attn_sink, self.scale
+        )[0]
 
     def _prefill_main_workspace(self, cache, indices, selected, logical):
         workspace = self.shared.prefill_main_workspace
         if workspace is None:
-            return prefill_main_workspace(self.cache.main, self.shared.block_table, cache, indices, selected, logical,
-                                          self.ratio)
-        main = workspace.get(self.kv_source,
-                             self.cache.main,
-                             self.shared.block_table,
-                             logical,
-                             self.ratio,
-                             producer=self.owns_kv)
+            return prefill_main_workspace(
+                self.cache.main, self.shared.block_table, cache, indices, selected, logical, self.ratio
+            )
+        main = workspace.get(
+            self.kv_source, self.cache.main, self.shared.block_table, logical, self.ratio, producer=self.owns_kv
+        )
         return workspace.assemble(main, cache, indices, selected)
 
     def _prefill_attention(self, value, qr, query, kv, positions, ready_outputs=(), prefill_sequence=False):
@@ -1163,8 +1595,11 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         """
         if positions.numel() > self.shared.prefill_tokens:
             raise ValueError(f"V4.1 prefill transaction exceeds C{self.shared.prefill_tokens}")
-        diagnostic = (os.getenv("VLLM_HPU_DSV41_PREFILL_DIAG_BOUNDARIES", "0") == "1" and positions.numel() == 256
-                      and self.search_length == 32768)
+        diagnostic = (
+            os.getenv("VLLM_HPU_DSV41_PREFILL_DIAG_BOUNDARIES", "0") == "1"
+            and positions.numel() == 256
+            and self.search_length == 32768
+        )
 
         def boundary(name):
             if diagnostic:
@@ -1173,33 +1608,40 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 print(f"PREFILL_DIAG layer={self.layer} boundary={name} complete", flush=True)
 
         boundary("input")
-        decoded = (self.decoded_kv_state and self.ratio in (1, 2)
-                   and self.search_length // self.ratio <= self.cache.decoded_main.shape[0])
+        decoded = (
+            self.decoded_kv_state
+            and self.ratio in (1, 2)
+            and self.search_length // self.ratio <= self.cache.decoded_main.shape[0]
+        )
         if self.ratio and self.owns_kv:
             with prefill_event_span("attention_compress_kv", self.layer, value.shape[0]):
                 self._compress(value, positions, decoded=decoded)
         boundary("compress")
         with prefill_event_span("attention_index_query", self.layer, value.shape[0]):
-            prepared = (self._prepare_index_queries(value, qr, positions, prefill=True)
-                        if self.ratio and self.owns_index else None)
+            prepared = (
+                self._prepare_index_queries(value, qr, positions, prefill=True)
+                if self.ratio and self.owns_index
+                else None
+            )
         boundary("index_query")
         # Selection is shared by the attention workspace tiles. Full layers
         # can stream each index-K source tile once for all query rows; Reindex
         # layers retain their bounded query tiling in _prefill_selections.
         selected = self._prefill_selections(value, qr, positions, prepared)
         selected_dump = os.getenv("VLLM_HPU_DSV41_DUMP_SELECTED")
-        if (selected_dump and self.layer == 2 and selected is not None and getattr(self, "prefill_tp_rank", 0) == 0):
+        if selected_dump and self.layer == 2 and selected is not None and getattr(self, "prefill_tp_rank", 0) == 0:
             # Diagnostic only: a real selected-ID distribution is needed to
             # decide whether nearby queries can share one compact KV union.
             # The host synchronization here must never enter a timed run.
             from pathlib import Path
+
             destination = Path(selected_dump)
             destination.mkdir(parents=True, exist_ok=True)
             first_position = int(positions[0].item())
-            torch.save({
-                "positions": positions.detach().cpu(),
-                "selected": selected.detach().cpu()
-            }, destination / f"layer2-start{first_position}-pid{os.getpid()}.pt")
+            torch.save(
+                {"positions": positions.detach().cpu(), "selected": selected.detach().cpu()},
+                destination / f"layer2-start{first_position}-pid{os.getpid()}.pt",
+            )
         boundary("selection")
         main_rows = self.search_length // self.ratio if self.ratio else 0
         if main_rows > PREFILL_MAIN_CACHE_ROWS:
@@ -1209,11 +1651,14 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             cache, indices = self._prefill_swa_workspace(kv, positions, decoded=decoded)
         boundary("swa")
         columns = indices.shape[1] + (selected.shape[1] if self.ratio else 0)
-        indices_partitioned = (gaudi_envs.VLLM_HPU_DSV41_FLASHINFER_PREFILL
-                               and gaudi_envs.VLLM_HPU_DSV41_PREFILL_MLA_SEQUENCE and can_partition_prefill_mla(
-                                   query.shape, columns, self.tensor_parallel_size, self.search_length))
+        indices_partitioned = (
+            gaudi_envs.VLLM_HPU_DSV41_FLASHINFER_PREFILL
+            and gaudi_envs.VLLM_HPU_DSV41_PREFILL_MLA_SEQUENCE
+            and can_partition_prefill_mla(query.shape, columns, self.tensor_parallel_size, self.search_length)
+        )
         if indices_partitioned:
             from vllm.distributed import get_tp_group
+
             group = get_tp_group()
             rank = getattr(self, "prefill_tp_rank", None)
             if rank != group.rank_in_group:
@@ -1233,29 +1678,45 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         boundary("mla")
         return self._finish_output(output, positions, ready_outputs, prefill=True, prefill_sequence=prefill_sequence)
 
+    def _uses_logical_mla(self, value, decoded):
+        return (
+            self.paged_mla_logical
+            and self.ratio in (1, 2)
+            and not decoded
+            and self.mla_mme
+            and self.direct_selected_kv
+            and self.window == 128
+            and value.device.type == "hpu"
+            and 1 <= value.shape[0] <= NATIVE_WORK_TOKENS
+            and not (self.shared_prefix_kv and self.search_length // self.index_ratio <= 512)
+        )
+
     @prefill_span("attention")
     @prefill_scope("attention")
-    def forward(self,
-                value,
-                positions,
-                ready_outputs=(),
-                *,
-                decode=False,
-                prefill_sequence=False,
-                prefill_qkv_sequence=False):
+    def forward(
+        self, value, positions, ready_outputs=(), *, decode=False, prefill_sequence=False,
+        prefill_qkv_sequence=False, selected_main=None, decode_metadata=None, input_prequant=None
+    ):
+        metadata = decode_metadata if decode and self.shared_decode_metadata else None
         prefill = not decode and value.shape[0] > NATIVE_WORK_TOKENS
         if prefill_sequence and not prefill:
             raise ValueError("Token ownership is confined to the prompt path")
         token_group = None
+        if input_prequant is not None and (not decode or prefill_sequence or prefill_qkv_sequence):
+            raise ValueError("Attention input prequantization is confined to ordinary decode")
         projection_value = value
         if prefill_qkv_sequence:
-            if (not prefill_sequence or self.tensor_parallel_size != 4
-                    or value.shape[0] not in (positions.numel(), positions.numel() // 4)):
+            if (
+                not prefill_sequence
+                or self.tensor_parallel_size != 4
+                or value.shape[0] not in (positions.numel(), positions.numel() // 4)
+            ):
                 raise ValueError("Owned QKV requires matching full or token-owned TP4 prompt input")
             if (self.owns_kv or self.owns_index) and value.shape[0] != positions.numel():
                 raise ValueError("KV/index producers require full normalized hidden rows")
             from vllm.distributed import get_tp_group
             from vllm_gaudi.ops.deepseek_v41_prefill_sequence_state import token_owner
+
             group = get_tp_group()
             token_group = group.device_group
             if value.shape[0] == positions.numel():
@@ -1264,10 +1725,21 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             with prefill_event_span("attention_input_projection", self.layer, projection_value.shape[0]):
                 query_input, kv_input = self._project_qkv_input(projection_value, token_group=token_group)
         else:
-            query_input, kv_input = self._project_qkv_input(value)
-        norm = (torch.ops.custom_op.custom_deepseek_v41_attention_norm_bf16_gaudi2 if self.fused_norm and
-                (value.shape[0] == 1 or (not decode and gaudi_envs.VLLM_HPU_DSV41_PREFILL_NATIVE_NORM
-                                         and NATIVE_WORK_TOKENS < value.shape[0] <= 16384)) else rms_norm)
+            query_input, kv_input = (self._project_qkv_input(value) if input_prequant is None
+                                     else self._project_qkv_input(value, prequant=input_prequant))
+        norm = (
+            torch.ops.custom_op.custom_deepseek_v41_attention_norm_bf16_gaudi2
+            if self.fused_norm
+            and (
+                value.shape[0] == 1
+                or (
+                    not decode
+                    and gaudi_envs.VLLM_HPU_DSV41_PREFILL_NATIVE_NORM
+                    and NATIVE_WORK_TOKENS < value.shape[0] <= 16384
+                )
+            )
+            else rms_norm
+        )
         # The Q/KV split returns offset views. Bridge lowers large-prefill
         # float casts from those views to reinterpret_cast nodes whose dtype
         # metadata is invalid under the resident 1M graph. Materialize the
@@ -1276,10 +1748,16 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         # A dynamic Reindex owner consumes the normalized Q row twice: once
         # for attention and once for candidate scoring. Other C1 layers can
         # keep this exact BF16 boundary inside the projection compound op.
-        needs_index_query = (self.ratio and self.owns_index and self.search_length // self.ratio > 512)
-        fused_query_norm = (decode and value.shape[0] == 1 and self.fused_norm and self.q_scale_rope
-                            and self.native_rope and getattr(self.weights.wq_b, "dense_fp8", False)
-                            and not needs_index_query)
+        needs_index_query = self.ratio and self.owns_index and self.search_length // self.ratio > 512
+        fused_query_norm = (
+            decode
+            and value.shape[0] == 1
+            and self.fused_norm
+            and self.q_scale_rope
+            and self.native_rope
+            and getattr(self.weights.wq_b, "dense_fp8", False)
+            and not needs_index_query
+        )
         if fused_query_norm:
             qr = None
             query = self.project_query_input(query_input, positions)
@@ -1300,8 +1778,11 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         if not decode and value.shape[0] > NATIVE_WORK_TOKENS:
             del query_input, kv_input
             return self._prefill_attention(value, qr, query, kv, positions, ready_outputs, prefill_sequence)
-        decoded = (self.decoded_kv_state and self.ratio in (1, 2)
-                   and self.search_length // self.ratio <= self.cache.decoded_main.shape[0])
+        decoded = (
+            self.decoded_kv_state
+            and self.ratio in (1, 2)
+            and self.search_length // self.ratio <= self.cache.decoded_main.shape[0]
+        )
         completion = None
         if decoded and value.shape[0] == 1:
             # The native writer maps this logical position into the shared
@@ -1310,21 +1791,35 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             # generic div/mod launch in every decoded Attention layer.
             logical_position = positions.to(torch.int32).contiguous()
             completion = torch.ops.custom_op.custom_deepseek_v41_swa_paged_decoded_write_bf16_gaudi2(
-                self.swa, kv.contiguous(), logical_position, logical_position, self.shared.decoded_swa,
-                self.decoded_swa_offset)
+                self.swa,
+                kv.contiguous(),
+                logical_position,
+                logical_position,
+                self.shared.decoded_swa,
+                self.decoded_swa_offset,
+            )
         else:
             packed_swa = pack_swa(kv)
-            self.swa.index_copy_(0, positions.remainder(SWA_ROWS).long(), packed_swa)
+            ring_rows = positions.remainder(SWA_ROWS).long() if metadata is None else metadata[0]
+            self.swa.index_copy_(0, ring_rows, packed_swa)
             if decoded:
-                self.shared.decoded_swa.index_copy_(0,
-                                                    positions.remainder(SWA_ROWS).long() + self.decoded_swa_offset,
-                                                    unpack_swa(packed_swa))
-        native_prefix = (decode and gaudi_envs.VLLM_HPU_DSV41_FUSED_PREFIX_LAYOUT and self.ratio in (1, 2)
-                         and self.direct_selected_kv and self.shared_prefix_kv and self.window == 128
-                         and value.device.type == "hpu" and 1 <= value.shape[0] <= NATIVE_WORK_TOKENS
-                         and self.search_length // self.index_ratio <= 512)
+                self.shared.decoded_swa.index_copy_(
+                    0, positions.remainder(SWA_ROWS).long() + self.decoded_swa_offset, unpack_swa(packed_swa)
+                )
+        native_prefix = (
+            decode
+            and gaudi_envs.VLLM_HPU_DSV41_FUSED_PREFIX_LAYOUT
+            and self.ratio in (1, 2)
+            and self.direct_selected_kv
+            and self.shared_prefix_kv
+            and self.window == 128
+            and value.device.type == "hpu"
+            and 1 <= value.shape[0] <= NATIVE_WORK_TOKENS
+            and self.search_length // self.index_ratio <= 512
+        )
+        native_logical = decode and self._uses_logical_mla(value, decoded)
         indices = None
-        if not native_prefix:
+        if not native_prefix and not native_logical:
             window = positions.unsqueeze(-1) - self.window + 1 + self.window_offsets.unsqueeze(0)
             indices = torch.where(window >= 0, window.remainder(SWA_ROWS), -1).int()
         cache = None
@@ -1344,70 +1839,154 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                     # every decoded Attention layer without changing the
                     # B2+/prefill layout contract.
                     partial = torch.ops.custom_op.custom_deepseek_v41_mla_selected_woa_wob_fp8_roundtrip_gaudi2(
-                        query.contiguous(), self.shared.decoded_swa, self.cache.decoded_main, selected.contiguous(),
-                        self.weights.attn_sink, self.scale, completion, main_done, self.decoded_swa_offset,
-                        self.cache.decoded_main.shape[0], self.weights.wo_a.weight, self.weights.wo_a.channel_scale,
-                        positions.to(torch.int32).contiguous(), self._rotary_native_table(), self.weights.wo_b.weight,
-                        self.weights.wo_b.channel_scale)
-                    return (self.reduce(partial, ready_outputs=ready_outputs)
-                            if ready_outputs else self.reduce(partial))
+                        query.contiguous(),
+                        self.shared.decoded_swa,
+                        self.cache.decoded_main,
+                        selected.contiguous(),
+                        self.weights.attn_sink,
+                        self.scale,
+                        completion,
+                        main_done,
+                        self.decoded_swa_offset,
+                        self.cache.decoded_main.shape[0],
+                        self.weights.wo_a.weight,
+                        self.weights.wo_a.channel_scale,
+                        positions.to(torch.int32).contiguous(),
+                        self._rotary_native_table(),
+                        self.weights.wo_b.weight,
+                        self.weights.wo_b.channel_scale,
+                    )
+                    return self.reduce(partial, ready_outputs=ready_outputs) if ready_outputs else self.reduce(partial)
                 # The paged state keeps SWA as a 256-row ring and main KV as
                 # logical compressed rows.  Reuse the fixed prefix layout so
                 # the decoded mirror sees [SWA ring, logical main] rather than
                 # the legacy non-paged [512 absolute SWA, main] namespace.
-                layout = (torch.ops.custom_op.custom_deepseek_v41_prefix_layout_r1_i32_gaudi2
-                          if self.ratio == 1 else torch.ops.custom_op.custom_deepseek_v41_prefix_layout_r2_i32_gaudi2)
-                _, indices, lengths = layout(selected.contiguous(),
-                                             positions.to(torch.int32).contiguous(), self.shared.block_table)
+                layout = (
+                    torch.ops.custom_op.custom_deepseek_v41_prefix_layout_r1_i32_gaudi2
+                    if self.ratio == 1
+                    else torch.ops.custom_op.custom_deepseek_v41_prefix_layout_r2_i32_gaudi2
+                )
+                _, indices, lengths = layout(
+                    selected.contiguous(), positions.to(torch.int32).contiguous(), self.shared.block_table
+                )
                 output = torch.ops.custom_op.custom_deepseek_v41_mla_mme_gaudi2(
-                    query.contiguous(), self.shared.decoded_swa,
-                    self.cache.decoded_main, indices.contiguous(), self.weights.attn_sink, self.scale,
-                    lengths.contiguous(), completion, main_done, self.decoded_swa_offset,
-                    self.cache.decoded_main.shape[0], SWA_ROWS)
+                    query.contiguous(),
+                    self.shared.decoded_swa,
+                    self.cache.decoded_main,
+                    indices.contiguous(),
+                    self.weights.attn_sink,
+                    self.scale,
+                    lengths.contiguous(),
+                    completion,
+                    main_done,
+                    self.decoded_swa_offset,
+                    self.cache.decoded_main.shape[0],
+                    SWA_ROWS,
+                )
+                return self._finish_output(output, positions, ready_outputs)
+            if native_logical:
+                # Keep page lookup and the sliding-window mapping inside the
+                # first packed-KV consumer, alongside its exact BF16 codec.
+                lengths = (
+                    torch.full((value.shape[0],), 640, dtype=torch.int32, device=value.device)
+                    if metadata is None
+                    else metadata[1]
+                )
+                if self.shared_main_mla and value.shape[0] == 1 and selected_main is not None:
+                    from vllm_gaudi.ops.deepseek_v41_shared_main import shared_main_attention
+
+                    output = shared_main_attention(self, query, positions, selected, lengths, selected_main)
+                    return self._finish_output(output, positions, ready_outputs)
+                output = torch.ops.custom_op.custom_deepseek_v41_logical_mla_gaudi2(
+                    query.contiguous(),
+                    self.swa,
+                    self.cache.main,
+                    selected.contiguous(),
+                    positions.to(torch.int32).contiguous(),
+                    self.shared.block_table,
+                    self.weights.attn_sink,
+                    self.scale,
+                    lengths,
+                    self.ratio,
+                )
                 return self._finish_output(output, positions, ready_outputs)
             physical = None if native_prefix else self.shared.physical_rows(selected.clamp_min(0), self.ratio)
-            if (decode and self.direct_selected_kv and value.device.type == "hpu"
-                    and value.shape[0] <= NATIVE_WORK_TOKENS and selected.numel() <= self.selected_offsets.numel()):
+            if (
+                decode
+                and self.direct_selected_kv
+                and value.device.type == "hpu"
+                and value.shape[0] <= NATIVE_WORK_TOKENS
+                and selected.numel() <= self.selected_offsets.numel()
+            ):
                 # Decode the fixed SWA prefix and all selected paged rows in
                 # one graph entry, then consume its internal BF16 value directly
                 # in sparse attention. This removes unpack_swa, cat, and the
                 # exposed selected-row temporary from the Python graph.
                 if self.shared_prefix_kv and self.search_length // self.index_ratio <= 512:
                     if native_prefix:
-                        layout = (torch.ops.custom_op.custom_deepseek_v41_prefix_layout_r1_i32_gaudi2 if self.ratio == 1
-                                  else torch.ops.custom_op.custom_deepseek_v41_prefix_layout_r2_i32_gaudi2)
-                        row_ids, attention_indices, lengths = layout(selected.contiguous(),
-                                                                     positions.to(torch.int32).contiguous(),
-                                                                     self.shared.block_table)
+                        layout = (
+                            torch.ops.custom_op.custom_deepseek_v41_prefix_layout_r1_i32_gaudi2
+                            if self.ratio == 1
+                            else torch.ops.custom_op.custom_deepseek_v41_prefix_layout_r2_i32_gaudi2
+                        )
+                        row_ids, attention_indices, lengths = layout(
+                            selected.contiguous(), positions.to(torch.int32).contiguous(), self.shared.block_table
+                        )
                     else:
                         row_ids, attention_indices, lengths = _shared_prefix_attention_layout(
-                            physical, selected, indices, self.swa_offsets)
+                            physical, selected, indices, self.swa_offsets
+                        )
                     attention_op = (
-                        torch.ops.custom_op.custom_deepseek_v41_paged_mla_mme_gaudi2 if self.mla_mme else
-                        torch.ops.custom_op.custom_deepseek_v41_paged_attention_head_vector_bf16_gaudi2
-                        if self.head_vector_attn else
-                        torch.ops.custom_op.custom_deepseek_v41_paged_attention_sram_bf16_gaudi2 if self.sram_kv else
-                        torch.ops.custom_op.custom_deepseek_v41_paged_attention_vector_scales_bf16_gaudi2 if self.
-                        vector_kv_scales else torch.ops.custom_op.
-                        custom_deepseek_v41_paged_attention_packed_exp_bf16_gaudi2 if self.packed_attn_exp else torch.
-                        ops.custom_op.custom_deepseek_v41_paged_attention_lengths_bf16_gaudi2)
-                    output = attention_op(query.contiguous(), self.swa.contiguous(), self.cache.main.contiguous(),
-                                          row_ids, attention_indices, self.weights.attn_sink, self.scale, lengths)
+                        self._paged_mla_operation(value.shape[0])
+                        if self.mla_mme
+                        else torch.ops.custom_op.custom_deepseek_v41_paged_attention_head_vector_bf16_gaudi2
+                        if self.head_vector_attn
+                        else torch.ops.custom_op.custom_deepseek_v41_paged_attention_sram_bf16_gaudi2
+                        if self.sram_kv
+                        else torch.ops.custom_op.custom_deepseek_v41_paged_attention_vector_scales_bf16_gaudi2
+                        if self.vector_kv_scales
+                        else torch.ops.custom_op.custom_deepseek_v41_paged_attention_packed_exp_bf16_gaudi2
+                        if self.packed_attn_exp
+                        else torch.ops.custom_op.custom_deepseek_v41_paged_attention_lengths_bf16_gaudi2
+                    )
+                    output = attention_op(
+                        query.contiguous(),
+                        self.swa.contiguous(),
+                        self.cache.main.contiguous(),
+                        row_ids,
+                        attention_indices,
+                        self.weights.attn_sink,
+                        self.scale,
+                        lengths,
+                    )
                     return self._finish_output(output, positions, ready_outputs)
-                row_ids, attention_indices = _selected_attention_layout(physical, selected, indices, self.swa_offsets,
-                                                                        self.selected_offsets)
+                row_ids, attention_indices = _selected_attention_layout(
+                    physical, selected, indices, self.swa_offsets, self.selected_offsets
+                )
                 if self.mla_mme:
-                    lengths = torch.full((value.shape[0], ),
-                                         attention_indices.shape[1],
-                                         dtype=torch.int32,
-                                         device=value.device)
-                    output = torch.ops.custom_op.custom_deepseek_v41_paged_mla_mme_gaudi2(
-                        query.contiguous(), self.swa.contiguous(), self.cache.main.contiguous(), row_ids,
-                        attention_indices, self.weights.attn_sink, self.scale, lengths)
+                    lengths = torch.full(
+                        (value.shape[0],), attention_indices.shape[1], dtype=torch.int32, device=value.device
+                    )
+                    output = self._paged_mla_operation(value.shape[0])(
+                        query.contiguous(),
+                        self.swa.contiguous(),
+                        self.cache.main.contiguous(),
+                        row_ids,
+                        attention_indices,
+                        self.weights.attn_sink,
+                        self.scale,
+                        lengths,
+                    )
                     return self._finish_output(output, positions, ready_outputs)
                 output = torch.ops.custom_op.custom_deepseek_v41_paged_attention_bf16_gaudi2(
-                    query.contiguous(), self.swa.contiguous(), self.cache.main.contiguous(), row_ids, attention_indices,
-                    self.weights.attn_sink, self.scale)
+                    query.contiguous(),
+                    self.swa.contiguous(),
+                    self.cache.main.contiguous(),
+                    row_ids,
+                    attention_indices,
+                    self.weights.attn_sink,
+                    self.scale,
+                )
                 return self._finish_output(output, positions, ready_outputs)
             else:
                 packed = self.cache.main.index_select(0, physical.flatten().long())
@@ -1415,11 +1994,22 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             offset = torch.arange(selected.numel(), device=value.device, dtype=torch.int32).reshape(selected.shape)
             indices = torch.cat((indices, torch.where(selected >= 0, offset + SWA_ROWS, -1)), -1)
         if cache is None:
+            if (
+                decode and self.decode_swa_packed and not self.ratio and self.mla_mme
+                and self.direct_selected_kv and 1 <= value.shape[0] <= NATIVE_WORK_TOKENS
+            ):
+                output = self._paged_mla_operation(value.shape[0])(
+                    query.contiguous(), self.swa, self.swa_only_main,
+                    self.swa_offsets.reshape(1, -1), indices.contiguous(),
+                    self.weights.attn_sink, self.scale, self.swa_only_lengths[:value.shape[0]],
+                )
+                return self._finish_output(output, positions, ready_outputs)
             cache = unpack_swa(self.swa)
         return self._output(query, cache, indices, positions, ready_outputs, decode=decode)
 
     def _compress_batch(self, value, positions, slots, pages):
         from vllm_gaudi.ops.deepseek_v41_batch_attention import batch_physical_rows, read_state_rows, write_state_rows
+
         state, compressor = self.batch_state, self.weights.compressor
         active = (slots >= 0) & (positions >= 0)
         first = positions - positions.remainder(self.ratio)
@@ -1427,12 +2017,22 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             kv, score = self._project_compressor_input(value)
             if self.batch_compressor_pair:
                 latent = torch.ops.custom_op.custom_deepseek_v41_compressor_batch_bf16_gaudi2(
-                    state.kv_history, state.score_history, kv.contiguous(), score.contiguous(), positions.contiguous(),
-                    slots.contiguous())
+                    state.kv_history,
+                    state.score_history,
+                    kv.contiguous(),
+                    score.contiguous(),
+                    positions.contiguous(),
+                    slots.contiguous(),
+                )
             elif self.batch_compressor_gather:
                 pair = torch.ops.custom_op.custom_deepseek_v41_compressor_batch_gather_f32_gaudi2(
-                    state.kv_history, state.score_history, kv.contiguous(), score.contiguous(), positions.contiguous(),
-                    slots.contiguous())
+                    state.kv_history,
+                    state.score_history,
+                    kv.contiguous(),
+                    score.contiguous(),
+                    positions.contiguous(),
+                    slots.contiguous(),
+                )
                 gates = torch.stack((pair[:, 2], pair[:, 3]), 1).softmax(1)
                 latent = (pair[:, 0] * gates[:, 0] + pair[:, 1] * gates[:, 1]).to(value.dtype)
             else:
@@ -1461,33 +2061,33 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         index_done = write_state_rows(self.cache.index, pack_fp4(index, 32), rows)
         return main_done, index_done
 
-    def forward_batch(self,
-                      value,
-                      positions,
-                      slots,
-                      pages,
-                      selected,
-                      candidates,
-                      main_done,
-                      index_done,
-                      ready_outputs=()):
+    def forward_batch(
+        self, value, positions, slots, pages, selected, candidates, main_done, index_done, ready_outputs=()
+    ):
         """Ordinary C1 per request; query rows are not speculative positions."""
         from vllm_gaudi.ops.deepseek_v41_batch_attention import batch_packed_mla, read_state_rows, write_state_rows
         from vllm_gaudi.ops.deepseek_v41_indexer import runtime_index_select
+
         safe_positions = positions.clamp_min(0)
         query_input, kv_input = self._project_qkv_input(value)
         norm = torch.ops.custom_op.custom_deepseek_v41_attention_norm_bf16_gaudi2 if self.fused_norm else rms_norm
         needs_index_query = self.ratio and self.owns_index
-        if (self.batch_c1_numerics and self.fused_norm and self.q_scale_rope and self.native_rope
-                and getattr(self.weights.wq_b, "dense_fp8", False) and not needs_index_query):
+        if (
+            self.batch_c1_numerics
+            and self.fused_norm
+            and self.q_scale_rope
+            and self.native_rope
+            and getattr(self.weights.wq_b, "dense_fp8", False)
+            and not needs_index_query
+        ):
             qr = None
             query = self.project_query_input(query_input, safe_positions)
         else:
             qr = norm(query_input.contiguous(), self.weights.q_norm.weight, self.eps)
             query = self.project_query(qr, safe_positions, request_batch=True)
-        kv = self._rope(norm(kv_input.contiguous(), self.weights.kv_norm.weight, self.eps),
-                        safe_positions,
-                        request_batch=True)
+        kv = self._rope(
+            norm(kv_input.contiguous(), self.weights.kv_norm.weight, self.eps), safe_positions, request_batch=True
+        )
         active = (slots >= 0) & (positions >= 0)
         rows = torch.where(active, slots * SWA_ROWS + positions.remainder(SWA_ROWS), -1).int()
         swa_done = write_state_rows(self.batch_state.swa, pack_swa(kv), rows)
@@ -1501,55 +2101,66 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 # incomplete pair is a completed no-write; prior KV stays
                 # visible and the current query must still be scored.
                 q = read_state_rows(
-                    q.reshape(q.shape[0], -1).contiguous(), torch.arange(q.shape[0],
-                                                                         device=q.device, dtype=torch.int32),
-                    index_done.clamp_min(0)).reshape(q.shape)
+                    q.reshape(q.shape[0], -1).contiguous(),
+                    torch.arange(q.shape[0], device=q.device, dtype=torch.int32),
+                    index_done.clamp_min(0),
+                ).reshape(q.shape)
                 if self.batch_full_index_mme and q.shape[0] > 1 and self.layer <= self.candidate_source:
                     from vllm_gaudi.ops.deepseek_v41_full_index_mme import full_index_mme_select
-                    selected, updated = full_index_mme_select(q.contiguous(),
-                                                              weights.contiguous(),
-                                                              self.cache.index,
-                                                              pages,
-                                                              positions.contiguous(),
-                                                              candidates,
-                                                              ratio=self.ratio,
-                                                              capacity=self.length // self.ratio,
-                                                              publish_candidates=self.layer == self.candidate_source,
-                                                              key_ready=index_done,
-                                                              tiled_keys=self.batch_index_tiled_keys
-                                                              and q.shape[0] in (8, 32))
+
+                    selected, updated = full_index_mme_select(
+                        q.contiguous(),
+                        weights.contiguous(),
+                        self.cache.index,
+                        pages,
+                        positions.contiguous(),
+                        candidates,
+                        ratio=self.ratio,
+                        capacity=self.length // self.ratio,
+                        publish_candidates=self.layer == self.candidate_source,
+                        key_ready=index_done,
+                        tiled_keys=self.batch_index_tiled_keys and q.shape[0] in (8, 32),
+                    )
                 elif self.batch_reindex_mme and q.shape[0] > 1 and self.layer > self.candidate_source:
                     from vllm_gaudi.ops.deepseek_v41_reindex_mme import (
                         bounded_reindex_mme_select,
                         reindex_mme_select,
                     )
                     from vllm_gaudi.ops.deepseek_v41_reindex_compact import bounded_reindex_bucket
+
                     # Only B8 has qualified a complete-chain benefit from the
                     # optional tile plan. Larger buckets keep the retained
                     # scorer; the same graph retains long-context support.
-                    select = (bounded_reindex_mme_select
-                              if self.bounded_reindex and bounded_reindex_bucket(q.shape[0]) else reindex_mme_select)
+                    select = (
+                        bounded_reindex_mme_select
+                        if self.bounded_reindex and bounded_reindex_bucket(q.shape[0])
+                        else reindex_mme_select
+                    )
                     options = {"tiled_keys": self.batch_index_tiled_keys and q.shape[0] in (8, 32)}
-                    selected = select(q.contiguous(),
-                                      weights.contiguous(),
-                                      self.cache.index,
-                                      pages,
-                                      positions.contiguous(),
-                                      candidates,
-                                      ratio=self.ratio,
-                                      **options)
+                    selected = select(
+                        q.contiguous(),
+                        weights.contiguous(),
+                        self.cache.index,
+                        pages,
+                        positions.contiguous(),
+                        candidates,
+                        ratio=self.ratio,
+                        **options,
+                    )
                     updated = None
                 else:
-                    selected, updated = runtime_index_select(q.contiguous(),
-                                                             weights.contiguous(),
-                                                             self.cache.index,
-                                                             pages,
-                                                             positions.contiguous(),
-                                                             candidates,
-                                                             ratio=self.ratio,
-                                                             capacity=self.length // self.ratio,
-                                                             reindex=self.layer > self.candidate_source,
-                                                             publish_candidates=self.layer == self.candidate_source)
+                    selected, updated = runtime_index_select(
+                        q.contiguous(),
+                        weights.contiguous(),
+                        self.cache.index,
+                        pages,
+                        positions.contiguous(),
+                        candidates,
+                        ratio=self.ratio,
+                        capacity=self.length // self.ratio,
+                        reindex=self.layer > self.candidate_source,
+                        publish_candidates=self.layer == self.candidate_source,
+                    )
                 if updated is not None:
                     blocks = updated
             # Reuse may consume an index source with another compression
@@ -1560,24 +2171,30 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             main_cache = self.batch_main_unused
         # Keep only complete-chain qualified combinations. Reindex B8 and
         # both B16 chains did not improve; Full/Reuse B8 and both B32 did.
-        packed_gather = (self.batch_packed_mla and bool(self.ratio) and query.shape[0] in (8, 32)
-                         and (query.shape[0] == 32 or not self.batch_reindex_group))
-        output = batch_packed_mla(query.contiguous(),
-                                  self.batch_state.swa,
-                                  main_cache,
-                                  selected,
-                                  pages,
-                                  positions,
-                                  slots,
-                                  self.weights.attn_sink,
-                                  self.scale,
-                                  swa_done,
-                                  main_done,
-                                  ratio=self.ratio,
-                                  window=self.window,
-                                  fused_gather=packed_gather,
-                                  sram_gather=packed_gather and self.batch_packed_mla_sram,
-                                  vector_gather=packed_gather and self.batch_packed_mla_vector)
+        packed_gather = (
+            self.batch_packed_mla
+            and bool(self.ratio)
+            and query.shape[0] in (8, 32)
+            and (query.shape[0] == 32 or not self.batch_reindex_group)
+        )
+        output = batch_packed_mla(
+            query.contiguous(),
+            self.batch_state.swa,
+            main_cache,
+            selected,
+            pages,
+            positions,
+            slots,
+            self.weights.attn_sink,
+            self.scale,
+            swa_done,
+            main_done,
+            ratio=self.ratio,
+            window=self.window,
+            fused_gather=packed_gather,
+            sram_gather=packed_gather and self.batch_packed_mla_sram,
+            vector_gather=packed_gather and self.batch_packed_mla_vector,
+        )
         result = self._finish_output(output, safe_positions, ready_outputs, request_batch=True)
         result = torch.where(active[:, None], result, 0)
         return result, selected, blocks, main_done, index_done

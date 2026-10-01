@@ -17,7 +17,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41PrefillIndexReduceGaudi2::GetGcDefinition
     if (p->outputTensorNr != 1) return GLUE_INCOMPATIBLE_OUTPUT_COUNT;
     const auto& y = p->outputTensors[0].geometry;
     if (y.dims != 2 || y.dataType != DATA_F32 || y.maxSizes[0] < 128 ||
-        y.maxSizes[0] > 2048 || y.maxSizes[0] % 128 ||
+        y.maxSizes[0] > (y.maxSizes[1] <= 6 ? 32768 : 2048) || y.maxSizes[0] % 128 ||
         y.maxSizes[1] < 1 || y.maxSizes[1] > 16384) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
     const unsigned columns = y.maxSizes[0], tokens = y.maxSizes[1];
     for (unsigned i = 0; i < 4; ++i) {

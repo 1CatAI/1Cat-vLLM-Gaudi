@@ -14,28 +14,54 @@ QUANTIZATION = {
     "projections": SHAPES,
 }
 FINGERPRINT = canonical_hash(QUANTIZATION)
+INPUT_PROJECTIONS = ("wq_a", "wkv", "shared_w1", "shared_w3", "shared_w2")
 
 
-def shapes_for_tp(tp_size):
+def projection_prefix(layer, projection):
+    if projection.startswith("shared_"):
+        return f"layers.{layer}.ffn.shared_experts.{projection.removeprefix('shared_')}."
+    return f"layers.{layer}.attn.{projection}."
+
+
+
+def shapes_for_tp(tp_size, projections=None):
     if tp_size not in (2, 4):
         raise ValueError("Dense FP8 preparation requires TP2 or TP4")
-    return {"wq_b": (32768 // tp_size, 1280), "wo_b": (5120, 8192 // tp_size)}
+    shapes = {"wq_b": (32768 // tp_size, 1280), "wo_b": (5120, 8192 // tp_size),
+              "wq_a": (1280, 5120), "wkv": (512, 5120),
+              "shared_w1": (2304 // tp_size, 5120), "shared_w3": (2304 // tp_size, 5120),
+              "shared_w2": (5120, 2304 // tp_size)}
+    selected = tuple(SHAPES) if projections is None else tuple(projections)
+    if not selected or len(set(selected)) != len(selected) or any(p not in shapes for p in selected):
+        raise ValueError("Invalid dense FP8 projections")
+    return {p: shapes[p] for p in selected}
 
 
-def quantization_for_tp(tp_size):
-    return {**QUANTIZATION, "projections": shapes_for_tp(tp_size)}
+def quantization_for_tp(tp_size, projections=None):
+    shapes = shapes_for_tp(tp_size, projections)
+    result = {**QUANTIZATION, "projections": shapes}
+    if any(p in shapes for p in INPUT_PROJECTIONS):
+        result["input_activation_scale"] = "per-token-power-of-two-f32-rne"
+        result["shared_activation"] = "BF16-projection-clamp-SiLU-BF16-power-of-two-rne"
+    return result
 
 
 def precision_config(path):
     data = {"version": 1, **{p: list(range(40)) for p in SHAPES}} if not path else json.loads(Path(path).read_text())
-    if set(data) != {"version", *SHAPES} or data["version"] != 1:
+    version = data.get("version")
+    allowed = set(SHAPES) | (set(INPUT_PROJECTIONS) if version == 2 else set())
+    if version not in (1, 2) or set(data) != {"version", *allowed}:
         raise ValueError("Invalid dense FP8 precision configuration")
-    for projection in SHAPES:
+    for projection in allowed:
         layers = data[projection]
         if (not isinstance(layers, list) or any(type(x) is not int or not 0 <= x < 40 for x in layers)
                 or len(set(layers)) != len(layers)):
             raise ValueError("Dense FP8 layers must be unique backbone layer indices")
         data[projection] = sorted(layers)
+    if version == 2:
+        for pair in (("wq_a", "wkv"), ("shared_w1", "shared_w3", "shared_w2")):
+            if any(data[p] != data[pair[0]] for p in pair):
+                raise ValueError("Fused dense FP8 projections must select identical layers")
     return data
 
 
@@ -44,7 +70,8 @@ class DenseFP8Sidecar:
     def __init__(self, directory, shard):
         directory = Path(directory)
         data = json.loads((directory / "manifest.json").read_text())
-        fingerprint = canonical_hash(quantization_for_tp(shard.tensor_parallel_size))
+        projections = tuple(data["quantization"]["projections"])
+        fingerprint = canonical_hash(quantization_for_tp(shard.tensor_parallel_size, projections))
         if (canonical_hash(data["quantization"]) != fingerprint or data["quantization_fingerprint"] != fingerprint
                 or data["source_manifest_sha256"] != file_hash(shard.directory / "manifest.json")):
             raise ValueError("Dense FP8 sidecar source/quantization mismatch")
@@ -61,8 +88,8 @@ class DenseFP8Sidecar:
         self.catalog = read_header(self.path)
         expected = {}
         for layer in range(*shard.manifest["pp_layer_ranges"][shard.pp_rank]):
-            for projection, shape in shapes_for_tp(shard.tensor_parallel_size).items():
-                prefix = f"layers.{layer}.attn.{projection}."
+            for projection, shape in shapes_for_tp(shard.tensor_parallel_size, projections).items():
+                prefix = projection_prefix(layer, projection)
                 expected[prefix + "weight"] = ("U8", shape)
                 expected[prefix + "channel_scale"] = ("F32", (1, shape[0]))
         if set(expected) != set(self.catalog) or any(

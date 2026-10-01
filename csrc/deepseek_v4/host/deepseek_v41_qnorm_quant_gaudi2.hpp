@@ -5,6 +5,7 @@
 class DeepseekV41QNormQuantGaudi2 {
 public:
     static constexpr const char* name = "custom_deepseek_v41_qnorm_quant_gaudi2";
+    static constexpr const char* attention_name = "custom_deepseek_v41_attention_norm_quant_gaudi2";
     tpc_lib_api::GlueCodeReturn GetGcDefinitions(tpc_lib_api::HabanaKernelParams*,
                                                   tpc_lib_api::HabanaKernelInstantiation*);
 };

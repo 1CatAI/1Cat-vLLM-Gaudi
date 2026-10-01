@@ -163,6 +163,8 @@ def test_normal_runner_transactions_and_ineligible_requests(monkeypatch, batch, 
                               prompt=list(range(32768)),
                               mm_features=[object()] if multimodal else [],
                               sampling_params=SimpleNamespace(prompt_logprobs=logprobs))
+    request.output = []
+    request.token_slice = lambda start, stop: request.tokens[start:stop]
     calls = []
 
     def forward(req_id, chunk, start, **kwargs):

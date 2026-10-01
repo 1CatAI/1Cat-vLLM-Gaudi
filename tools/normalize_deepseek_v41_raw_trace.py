@@ -24,27 +24,52 @@ def digest(path):
 NORMALIZER_SHA256 = digest(Path(__file__))
 
 
-class Clock:
+def decode_parser_window(cpu, metadata, low, high, padding_ms):
+    """Bound offline parsing around captured decode scopes, leaving clock calibration intact."""
+    if not math.isfinite(padding_ms) or padding_ms < 0:
+        raise ValueError("Decode parser padding must be finite and nonnegative")
+    if (metadata.get("scope_clock_domain") != "CLOCK_MONOTONIC_RAW"
+            or cpu.get("clockDomain") != "CLOCK_MONOTONIC_RAW"):
+        raise ValueError("Decode parser ROI requires explicitly captured raw-clock scopes")
+    scopes = [event for event in cpu["traceEvents"]
+              if event.get("ph") == "X" and "::decode::" in event.get("name", "")
+              and event.get("dur", 0) > 0]
+    if not scopes:
+        raise ValueError("Decode parser ROI has no captured decode scopes")
+    base = cpu["baseTimeNanoseconds"]
+    padding = int(padding_ms * 1e6)
+    begin = base + math.floor(min(event["ts"] for event in scopes) * 1000) - padding
+    end = base + math.ceil(max(event["ts"] + event["dur"] for event in scopes) * 1000) + padding
+    begin, end = max(low, begin), min(high, end)
+    if begin >= end:
+        raise ValueError("Captured decode scopes do not overlap the SDK calibration range")
+    return begin, end
 
+
+class Clock:
     def __init__(self, metadata, base):
         first, last = metadata["clock_samples"]
         self.raw0 = (first["monotonic_raw_before_ns"] + first["monotonic_raw_after_ns"]) // 2
         raw1 = (last["monotonic_raw_before_ns"] + last["monotonic_raw_after_ns"]) // 2
         wall0 = (first["wall_before_ns"] + first["wall_after_ns"]) // 2
         wall1 = (last["wall_before_ns"] + last["wall_after_ns"]) // 2
-        self.scale = (wall1 - wall0) / (raw1 - self.raw0)
-        if not .999 < self.scale < 1.001:
+        wall_scale = (wall1 - wall0) / (raw1 - self.raw0)
+        raw_scopes = metadata.get("scope_clock_domain") == "CLOCK_MONOTONIC_RAW"
+        self.scale = 1. if raw_scopes else wall_scale
+        if not raw_scopes and not .999 < self.scale < 1.001:
             raise ValueError("Raw device/CPU clock calibration changed rate unexpectedly")
-        self.relative0 = wall0 - base
+        self.relative0 = (self.raw0 if raw_scopes else wall0) - base
         self.synapse0 = first["synapse_clock_ns"]
-        self.synapse_scale = (wall1 - wall0) / (last["synapse_clock_ns"] - self.synapse0)
-        self.proof = dict(raw_to_wall_scale=self.scale,
-                          synapse_to_wall_scale=self.synapse_scale,
-                          samples=metadata["clock_samples"],
-                          base_time_nanoseconds=base,
-                          bracket_uncertainty_ns=max(
-                              (row["wall_after_ns"] - row["wall_before_ns"] + row["monotonic_raw_after_ns"] -
-                               row["monotonic_raw_before_ns"]) / 2 for row in metadata["clock_samples"]))
+        span = raw1 - self.raw0 if raw_scopes else wall1 - wall0
+        self.synapse_scale = span / (last["synapse_clock_ns"] - self.synapse0)
+        self.proof = dict(output_clock_domain="CLOCK_MONOTONIC_RAW" if raw_scopes else "wall",
+                          raw_to_output_scale=self.scale, synapse_to_output_scale=self.synapse_scale,
+                          observed_raw_to_wall_scale=wall_scale,
+                          samples=metadata["clock_samples"], base_time_nanoseconds=base,
+                          bracket_uncertainty_ns=max((row["wall_after_ns"] - row["wall_before_ns"] +
+                                                      row["monotonic_raw_after_ns"] -
+                                                      row["monotonic_raw_before_ns"]) / 2
+                                                     for row in metadata["clock_samples"]))
 
     def raw(self, microseconds):
         return ((float(microseconds) * 1000 - self.raw0) * self.scale + self.relative0) / 1000
@@ -68,14 +93,10 @@ def engine(name):
 def tensor_contract(value):
     # Synapse stores dimensions in fastest-to-slowest order. Preserve that
     # original layout alongside the conventional row-major presentation.
-    return dict(name=value["name"],
-                shape=list(reversed(value["max_shape"])),
-                dtype=value["dtype"],
+    return dict(name=value["name"], shape=list(reversed(value["max_shape"])), dtype=value["dtype"],
                 bytes=math.prod(value["max_shape"]) * value.get("dtype_bit_size", 0) // 8,
-                location=value.get("allocation", "unknown"),
-                strides=value.get("strides"),
-                alias=value.get("alias"),
-                raw_synapse_tensor=value)
+                location=value.get("allocation", "unknown"), strides=value.get("strides"),
+                alias=value.get("alias"), raw_synapse_tensor=value)
 
 
 def owned_csv_rows(parts):
@@ -128,20 +149,17 @@ def resolve_recipe_starts(pending, names, recipe_ids_at_start, observed_recipe_i
             rid = next(iter(candidates))
             recipe_starts.append([stamp, 0, f"{rid}@{name}:", name])
         else:
-            unresolved_recipe_starts.append(
-                dict(stamp_us=stamp, raw_stamp=raw_stamp, graph_name=name, candidate_ids=sorted(candidates)))
+            unresolved_recipe_starts.append(dict(stamp_us=stamp, raw_stamp=raw_stamp,
+                                                graph_name=name, candidate_ids=sorted(candidates)))
     return recipe_starts, unresolved_recipe_starts
 
 
-def normalize(bundle, cpu_trace, metadata, output, config, chunk_ms=200, overlap_ms=50, csv_source=None):
-    subprocess.run([
-        sys.executable,
-        str(Path(__file__).with_name("extract_deepseek_v41_trace.py")),
-        str(cpu_trace), "--output",
-        str(output)
-    ],
-                   check=True,
-                   stdout=subprocess.DEVNULL)
+def normalize(bundle, cpu_trace, metadata, output, config, chunk_ms=200, overlap_ms=50, csv_source=None,
+              *, required_engines=("TPC", "MME"), decode_roi_padding_ms=None):
+    if not required_engines or not set(required_engines) <= {"TPC", "MME", "DMA"}:
+        raise ValueError("Declare at least one supported engine required by this capture")
+    subprocess.run([sys.executable, str(Path(__file__).with_name("extract_deepseek_v41_trace.py")),
+                    str(cpu_trace), "--output", str(output)], check=True, stdout=subprocess.DEVNULL)
     inventory_path = output / "inventory.json"
     inv = json.loads(inventory_path.read_text())
     clock = Clock(metadata, inv["base_time_nanoseconds"])
@@ -186,42 +204,24 @@ def normalize(bundle, cpu_trace, metadata, output, config, chunk_ms=200, overlap
                     kind = engine(node["engine"])
                     if node.get("is_logical") or kind not in ("TPC", "MME", "DMA"):
                         continue
-                    symbol = dict(device_type={
-                        "TPC": 1,
-                        "MME": 0,
-                        "DMA": 8
-                    }[kind],
-                                  context_id=node["context_id"],
-                                  full_context_id=node["context_id"],
-                                  node=node["name"],
-                                  kernel=node["guid"],
+                    symbol = dict(device_type={"TPC": 1, "MME": 0, "DMA": 8}[kind],
+                                  context_id=node["context_id"], full_context_id=node["context_id"],
+                                  node=node["name"], kernel=node["guid"],
                                   working_engines=node.get("tpc_working_engines", []),
-                                  roi_count=node.get("num_of_ROIs"),
-                                  unique_node_id=node["id"])
+                                  roi_count=node.get("num_of_ROIs"), unique_node_id=node["id"])
                     inputs = [tensors[name] for name in node["input_tensors"] if name in tensors]
                     outputs = [tensors[name] for name in node["output_tensors"] if name in tensors]
-                    contracts.append(
-                        dict(recipe_id=identity,
-                             raw_recipe_id=rid,
-                             symbol=symbol,
-                             graph=record,
-                             matched=True,
-                             inputs=inputs,
-                             outputs=outputs,
-                             attributes={},
-                             raw_node=node,
-                             provenance="same HLTV recipe_debug_id and Unique Node ID"))
+                    contracts.append(dict(recipe_id=identity, raw_recipe_id=rid, symbol=symbol,
+                                          graph=record, matched=True,
+                                          inputs=inputs, outputs=outputs, attributes={}, raw_node=node,
+                                          provenance="same HLTV recipe_debug_id and Unique Node ID"))
                     key = (str(rid), graph["name"], str(node["id"]))
                     if key in by_unique and by_unique[key] != symbol:
                         raise ValueError(f"Ambiguous raw recipe/node identity: {key}")
                     by_unique[key] = symbol
                     nodes.append(symbol)
-                recipes.append(
-                    dict(recipe_id=identity,
-                         raw_recipe_id=rid,
-                         path=str(path.resolve()),
-                         sha256=record["sha256"],
-                         nodes=nodes))
+                recipes.append(dict(recipe_id=identity, raw_recipe_id=rid, path=str(path.resolve()),
+                                    sha256=record["sha256"], nodes=nodes))
     if state is None or len(binaries) != 1:
         raise ValueError("Raw capture requires one binary and its exact profile_state")
     (output / "recipe-symbols.json").write_text(json.dumps(dict(recipes=recipes), indent=2) + "\n")
@@ -233,23 +233,10 @@ def normalize(bundle, cpu_trace, metadata, output, config, chunk_ms=200, overlap
     parse_config = json.loads(config.read_text())
     hardware_config = next(plugin["values"] for plugin in parse_config["Plugins"] if plugin["name"] == "HwTrace")
     options = hardware_config["parseOptions"]
-    options.update(skipParse={"value": False},
-                   mergeWithHost={"value": False},
-                   addEnqueuesFlow={"value": False},
-                   traceAnalyzer={
-                       "enable": {
-                           "value": False
-                       },
-                       "traceAnalyzerJson": {
-                           "value": False
-                       }
-                   })
-    options["outputPerInvocation"] = {
-        name: {
-            "value": name == "csv"
-        }
-        for name in ("csv", "binary", "dbgInfo", "hltv", "hltvWithHost", "json", "text", "log")
-    }
+    options.update(skipParse={"value": False}, mergeWithHost={"value": False}, addEnqueuesFlow={"value": False},
+                   traceAnalyzer={"enable": {"value": False}, "traceAnalyzerJson": {"value": False}})
+    options["outputPerInvocation"] = {name: {"value": name == "csv"} for name in
+                                      ("csv", "binary", "dbgInfo", "hltv", "hltvWithHost", "json", "text", "log")}
     parse_config_path = output / "offline-parser-config.json"
     parse_config_path.write_text(json.dumps(parse_config, indent=2) + "\n")
     environment = dict(os.environ)
@@ -257,6 +244,11 @@ def normalize(bundle, cpu_trace, metadata, output, config, chunk_ms=200, overlap
     calibrations = [die for item in state["host_device_time_diff"] for die in item["die"]]
     low = min(item["first"]["host"] for item in calibrations)
     high = max(item["second"]["host"] for item in calibrations)
+    calibration_range = [low, high]
+    if decode_roi_padding_ms is not None:
+        with gzip.open(cpu_trace, "rt") as stream:
+            cpu = json.load(stream)
+        low, high = decode_parser_window(cpu, metadata, low, high, decode_roi_padding_ms)
     step = max(1, int(chunk_ms * 1e6)) if chunk_ms > 0 else high - low + 1
     padding = int(overlap_ms * 1e6)
     parts = []
@@ -266,21 +258,19 @@ def normalize(bundle, cpu_trace, metadata, output, config, chunk_ms=200, overlap
         assert saved["chunk_ms"] == chunk_ms and saved["overlap_ms"] == overlap_ms
         assert saved["binary_sha256"] == digest(binaries[0])
         assert saved["profile_state"] == state and saved["parser_config"] == parse_config
+        if decode_roi_padding_ms is not None:
+            assert saved.get("parser_window_ns") == [low, high], "CSV ROI ownership changed"
     commands, files = [], []
     for index, begin in enumerate(range(low, high, step)):
         directory = parser_dir / f"chunk{index:04d}"
         directory.mkdir()
         end = min(high, begin + step)
         parse_low, parse_high = max(low, begin - padding), min(high, end + padding)
-        command = [
-            "/opt/habanalabs/bin/synprof_parser",
-            str(binaries[0]), "--gaudi2", "--csv", "--conf",
-            str(parse_config_path), "--outdir",
-            str(directory), "--dbg_dir",
-            str(debug_dir), "--post_graph_dir",
-            str(graphs_dir), "--profile_state",
-            str(output / "raw-profile-state.json"), "--time-ranges", f"{parse_low}-{parse_high}"
-        ]
+        command = ["/opt/habanalabs/bin/synprof_parser", str(binaries[0]), "--gaudi2", "--csv",
+                   "--conf", str(parse_config_path), "--outdir", str(directory),
+                   "--dbg_dir", str(debug_dir), "--post_graph_dir", str(graphs_dir),
+                   "--profile_state", str(output / "raw-profile-state.json"),
+                   "--time-ranges", f"{parse_low}-{parse_high}"]
         commands.append(command)
         if csv_source is not None:
             cached = list((csv_source / directory.name).glob("*.csv.gz"))
@@ -345,24 +335,17 @@ def normalize(bundle, cpu_trace, metadata, output, config, chunk_ms=200, overlap
             identity = (kind, recipe, name, kernel)
             if identity not in node_ids:
                 node_ids[identity] = len(nodes)
-                nodes.append(
-                    dict(engine=kind,
-                         kernel=kernel,
-                         node=name,
-                         recipe=recipe,
-                         original_nodes="",
-                         reported_dtype=row["Data Type"],
-                         raw_unique_node_id=row["Unique Node ID"],
-                         raw_context_id=row["Context ID"],
-                         raw_event_name=row["Name"]))
-            out.write(
-                json.dumps([begin, stamp - begin, row["Engine"], node_ids[identity], 0, ""], separators=(",", ":")) +
-                "\n")
+                nodes.append(dict(engine=kind, kernel=kernel, node=name, recipe=recipe,
+                                  original_nodes="", reported_dtype=row["Data Type"],
+                                  raw_unique_node_id=row["Unique Node ID"], raw_context_id=row["Context ID"],
+                                  raw_event_name=row["Name"]))
+            out.write(json.dumps([begin, stamp - begin, row["Engine"], node_ids[identity], 0, ""],
+                                 separators=(",", ":")) + "\n")
             hardware += 1
             counts[(kind, kernel)] += 1
             first, last = min(first, begin), max(last, stamp)
-    recipe_starts, unresolved_recipe_starts = resolve_recipe_starts(pending_recipe_starts, names, recipe_ids_at_start,
-                                                                    observed_recipe_ids)
+    recipe_starts, unresolved_recipe_starts = resolve_recipe_starts(
+        pending_recipe_starts, names, recipe_ids_at_start, observed_recipe_ids)
     (output / "raw-recipe-start-ambiguities.json").write_text(json.dumps(unresolved_recipe_starts, indent=2) + "\n")
     host_events = 0
     host_domain = None
@@ -381,30 +364,22 @@ def normalize(bundle, cpu_trace, metadata, output, config, chunk_ms=200, overlap
             for event in events:
                 start, duration = convert(event["ts"]), event["dur"] * scale
                 args = event.get("args") or {}
-                stream.write(
-                    json.dumps([
-                        start, duration,
-                        str(event.get("pid")),
-                        str(event.get("tid")),
-                        event.get("cat"), event["name"], args
-                    ],
-                               separators=(",", ":")) + "\n")
+                stream.write(json.dumps([start, duration, str(event.get("pid")), str(event.get("tid")),
+                                         event.get("cat"), event["name"], args], separators=(",", ":")) + "\n")
                 host_events += 1
                 if "enqueue" in event["name"].lower() and args.get("recipeName") and args.get("recipeId"):
-                    inv["host_enqueues"].append(
-                        [start, duration, f"{args['recipeId']}@{args['recipeName']}:", args["recipeName"]])
-    if not hardware or not any(key[0] == "MME" for key in counts) or not any(key[0] == "TPC" for key in counts):
-        raise ValueError("Raw normalization did not recover complete TPC and MME intervals")
-    identity = dict(raw_bundle=str(bundle.resolve()),
-                    raw_sha256=digest(bundle),
-                    cpu_trace=str(cpu_trace.resolve()),
-                    cpu_sha256=digest(cpu_trace),
-                    metadata=metadata,
-                    parser_commands=commands,
+                    inv["host_enqueues"].append([start, duration, f"{args['recipeId']}@{args['recipeName']}:",
+                                                 args["recipeName"]])
+    missing = set(required_engines) - {key[0] for key in counts}
+    if not hardware or missing:
+        raise ValueError(f"Raw normalization did not recover required engine intervals: {sorted(missing)}")
+    identity = dict(raw_bundle=str(bundle.resolve()), raw_sha256=digest(bundle), cpu_trace=str(cpu_trace.resolve()),
+                    cpu_sha256=digest(cpu_trace), metadata=metadata, parser_commands=commands,
                     parser_csv_files=[dict(path=str(path), sha256=digest(path)) for path in files],
-                    normalization_sha256=NORMALIZER_SHA256,
-                    chunk_ms=chunk_ms,
-                    overlap_ms=overlap_ms,
+                    normalization_sha256=NORMALIZER_SHA256, chunk_ms=chunk_ms, overlap_ms=overlap_ms,
+                    required_engines=list(required_engines),
+                    calibration_range_ns=calibration_range, parser_window_ns=[low, high],
+                    decode_roi_padding_ms=decode_roi_padding_ms,
                     reused_csv_source=str(csv_source) if csv_source else None,
                     chunk_ownership="BEGIN in half-open core; complete pair in independently padded CSV")
     (output / "raw-provenance.json").write_text(json.dumps(identity, indent=2) + "\n")
@@ -412,32 +387,18 @@ def normalize(bundle, cpu_trace, metadata, output, config, chunk_ms=200, overlap
     clock.proof.update(host_event_clock_domain=host_domain, hardware_clock_domain="CLOCK_MONOTONIC_RAW")
     (output / "clock-alignment.json").write_text(json.dumps(clock.proof, indent=2) + "\n")
     inv.update(trace_sha256=hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest(),
-               format="raw_hltv_cpu",
-               nodes=nodes,
-               hardware_events=hardware,
-               first_us=first,
-               last_us=last,
-               raw_owned_csv_rows=all_rows,
-               raw_zero_duration_pairs=zero_intervals,
-               raw_unmatched_events=len(unmatched),
-               raw_host_events=host_events,
-               device_recipe_starts=sorted(recipe_starts),
-               raw_unresolved_recipe_starts=len(unresolved_recipe_starts),
+               format="raw_hltv_cpu", nodes=nodes, hardware_events=hardware, first_us=first, last_us=last,
+               raw_owned_csv_rows=all_rows, raw_zero_duration_pairs=zero_intervals,
+               raw_unmatched_events=len(unmatched), raw_host_events=host_events,
+               device_recipe_starts=sorted(recipe_starts), raw_unresolved_recipe_starts=len(unresolved_recipe_starts),
                modules=[state.get("Module id")],
-               kernel_counts=[
-                   dict(engine=kind, kernel=kernel, lane_events=count)
-                   for (kind, kernel), count in counts.most_common()
-               ],
+               kernel_counts=[dict(engine=kind, kernel=kernel, lane_events=count)
+                              for (kind, kernel), count in counts.most_common()],
                hw_event_names=["paired SDK raw CSV BEGIN/END; includes hidden MME START_EVENT"])
     inventory_path.write_text(json.dumps(inv, indent=2) + "\n")
-    summary = dict(status="passed",
-                   hardware_events=hardware,
-                   recipe_starts=len(recipe_starts),
-                   unmatched=len(unmatched),
-                   host_events=host_events,
-                   kernels=len(nodes),
-                   clock_alignment=clock.proof,
-                   output=str(output.resolve()))
+    summary = dict(status="passed", hardware_events=hardware, recipe_starts=len(recipe_starts),
+                   unmatched=len(unmatched), host_events=host_events, kernels=len(nodes),
+                   clock_alignment=clock.proof, output=str(output.resolve()))
     print(json.dumps(summary), flush=True)
     return summary
 
@@ -452,6 +413,12 @@ if __name__ == "__main__":
     parser.add_argument("--chunk-ms", type=float, default=200)
     parser.add_argument("--overlap-ms", type=float, default=50)
     parser.add_argument("--csv-source", type=Path)
+    parser.add_argument("--decode-roi-padding-ms", type=float,
+                        help="Parse around raw-clock decode scopes plus padding; validate complete-cycle coverage")
+    parser.add_argument("--required-engine", action="append", choices=("TPC", "MME", "DMA"),
+                        help="Explicit engine contract for a component trace; default requires both TPC and MME")
     args = parser.parse_args()
-    normalize(args.bundle, args.cpu_trace, json.loads(args.metadata.read_text()), args.output, args.config,
-              args.chunk_ms, args.overlap_ms, args.csv_source)
+    normalize(args.bundle, args.cpu_trace, json.loads(args.metadata.read_text()), args.output,
+              args.config, args.chunk_ms, args.overlap_ms, args.csv_source,
+              required_engines=args.required_engine or ("TPC", "MME"),
+              decode_roi_padding_ms=args.decode_roi_padding_ms)

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Check the frozen four-rank serving run before sending its first request."""
+
 import argparse
 import json
 from pathlib import Path
@@ -11,6 +12,14 @@ import requests
 from collect_deepseek_v41_trace import recipe_symbols
 
 
+def process_identity(pid):
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
+    except FileNotFoundError:
+        return None
+    return None if fields[0] == "Z" else int(fields[19])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run", type=Path)
@@ -18,12 +27,16 @@ def main():
     parser.add_argument("--wait-seconds", type=int, default=1800)
     parser.add_argument("--prefill-tokens", type=int, choices=(8192, 16384), default=8192)
     parser.add_argument("--max-model-len", type=int, default=1048576)
-    parser.add_argument("--require-trace-artifacts",
-                        action="store_true",
-                        help="Require profiler registration and IR only for a dedicated trace run")
-    parser.add_argument("--trace-capture",
-                        action="store_true",
-                        help="Admit an explicit raw trace with profiler enabled and IR export disabled")
+    parser.add_argument(
+        "--require-trace-artifacts",
+        action="store_true",
+        help="Require profiler registration and IR only for a dedicated trace run",
+    )
+    parser.add_argument(
+        "--trace-capture",
+        action="store_true",
+        help="Admit an explicit raw trace with profiler enabled and IR export disabled",
+    )
     args = parser.parse_args()
     run = args.run.resolve()
     process = json.loads((run / "process.json").read_text())
@@ -42,13 +55,15 @@ def main():
         if time.monotonic() >= deadline:
             raise TimeoutError("Serving admission deadline exceeded")
         time.sleep(3)
-    result = dict(status="passed",
-                  time_ns=time.time_ns(),
-                  run=str(run),
-                  ranks=[],
-                  modules=process["modules"],
-                  pid=process["pid"],
-                  checks=[])
+    result = dict(
+        status="passed",
+        time_ns=time.time_ns(),
+        run=str(run),
+        ranks=[],
+        modules=process["modules"],
+        pid=process["pid"],
+        checks=[],
+    )
     for rank in range(4):
         ready = run / f"audit/rank{rank}-native-ready.json"
         if not ready.is_file():
@@ -73,8 +88,17 @@ def main():
         assert stats["compiled_literals"]["graphs"] > 0 and stats["compiled_literals"]["scalars"] > 0
         assert stats["compiled_stage"]["groups"] == 10 * stats["compiled_stage"]["calls"]
         assert stats["pp"]["sends"] == stats["pp"]["receives"] == 0
-        assert all(stats["moe"][name] for name in ("n256_fp8_decode", "fused_quant", "fused_reduce", "grouped_prefill",
-                                                   "occupied_groups_only", "fused_mhc_post"))
+        assert all(
+            stats["moe"][name]
+            for name in (
+                "n256_fp8_decode",
+                "fused_quant",
+                "fused_reduce",
+                "grouped_prefill",
+                "occupied_groups_only",
+                "fused_mhc_post",
+            )
+        )
         assert stats["prefill_plan"]["executed"]["largest_token_bucket"] == args.prefill_tokens
         assert stats["prefill_plan"]["replays"] > 0
         assert stats["engram"]["native_c1"] > 0 and stats["engram"]["c1_packets"] > 0
@@ -87,12 +111,19 @@ def main():
         if args.require_trace_artifacts:
             assert graphs, f"No saved tensor contracts for rank {rank}"
         result["ranks"].append(
-            dict(rank=rank, ready=stats, serialized_recipes=len(files), graph_files=len(graphs), symbol_sample=sample))
+            dict(rank=rank, ready=stats, serialized_recipes=len(files), graph_files=len(graphs), symbol_sample=sample)
+        )
     result["checks"] = [
-        "TP4/PP1", "no PP transport", "N256 fused decode and native hybrid prefill",
-        f"C{args.prefill_tokens} prepared-plan execution", "native C1 Engram packets",
-        "trace artifacts" if args.require_trace_artifacts else
-        "raw trace enabled, IR export disabled" if args.trace_capture else "profiler and IR export disabled"
+        "TP4/PP1",
+        "no PP transport",
+        "N256 fused decode and native hybrid prefill",
+        f"C{args.prefill_tokens} prepared-plan execution",
+        "native C1 Engram packets",
+        "trace artifacts"
+        if args.require_trace_artifacts
+        else "raw trace enabled, IR export disabled"
+        if args.trace_capture
+        else "profiler and IR export disabled",
     ]
     models = requests.get(args.url + "/v1/models", timeout=10)
     models.raise_for_status()

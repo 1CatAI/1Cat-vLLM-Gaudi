@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Retain compact, named hardware intervals without loading full trace JSON."""
+
 import argparse
 import collections
 import gzip
@@ -28,8 +29,11 @@ trace_first, trace_last = float("inf"), float("-inf")
 with open_trace(args.trace, "rt") as stream:
     header = stream.read(1024)
 base = re.search(r'"baseTimeNanoseconds"\s*:\s*(\d+)', header)
-with (open_trace(args.trace, "rb") as src, gzip.open(args.output / "hardware.jsonl.gz", "wt", compresslevel=1) as
-      dst, gzip.open(args.output / "host.jsonl.gz", "wt", compresslevel=1) as host):
+with (
+    open_trace(args.trace, "rb") as src,
+    gzip.open(args.output / "hardware.jsonl.gz", "wt", compresslevel=1) as dst,
+    gzip.open(args.output / "host.jsonl.gz", "wt", compresslevel=1) as host,
+):
     for event in ijson.items(src, "traceEvents.item", use_float=True):
         total += 1
         name = event.get("name", "")
@@ -47,10 +51,16 @@ with (open_trace(args.trace, "rb") as src, gzip.open(args.output / "hardware.jso
             metadata.append(event)
         if "enqueue" in name.lower() and a.get("recipeName"):
             host_enqueues.append([event["ts"], event.get("dur", 0), rkey, a["recipeName"]])
-        if ((event.get("cat") in ("cpu_op", "user_annotation") and
-             (name.startswith("v41::") or "Compiled Region" in name or "execute_model" in name or "prepared_moe" in name
-              or "native_decoder" in name)) or name.startswith(
-                  ("v41::request_batch::", "v41::batch_slots::", "v41::batch_members::"))):
+        if (
+            event.get("cat") in ("cpu_op", "user_annotation")
+            and (
+                name.startswith("v41::")
+                or "Compiled Region" in name
+                or "execute_model" in name
+                or "prepared_moe" in name
+                or "native_decoder" in name
+            )
+        ) or name.startswith(("v41::request_batch::", "v41::batch_slots::", "v41::batch_members::")):
             markers.append([event["ts"], event.get("dur", 0), name])
         if event.get("ph") != "X" or event.get("dur", 0) <= 0:
             continue
@@ -59,13 +69,20 @@ with (open_trace(args.trace, "rb") as src, gzip.open(args.output / "hardware.jso
         hw = a.get("HW event name", "").upper()
         if not hw:
             host.write(
-                json.dumps([
-                    event['ts'], event['dur'],
-                    str(event.get('pid')),
-                    str(event.get('tid')),
-                    event.get('cat'), name, a
-                ],
-                           separators=(',', ':')) + '\n')
+                json.dumps(
+                    [
+                        event["ts"],
+                        event["dur"],
+                        str(event.get("pid")),
+                        str(event.get("tid")),
+                        event.get("cat"),
+                        name,
+                        a,
+                    ],
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
         engine = next((x for x in ("TPC", "MME", "DMA", "NIC") if x in hw), None)
         if engine is None and re.match(r"STM_[01]_(RX|TX|QPC|QMAN)", hw):
             engine = "NIC"
@@ -74,14 +91,16 @@ with (open_trace(args.trace, "rb") as src, gzip.open(args.output / "hardware.jso
         key = (engine, name, a.get("EventName", ""), rkey, str(a.get("Original Nodes", "")))
         if key not in node_ids:
             node_ids[key] = len(nodes)
-            nodes.append({
-                "engine": engine,
-                "kernel": name,
-                "node": key[2],
-                "recipe": rkey,
-                "original_nodes": key[4],
-                "reported_dtype": a.get("dataType", "")
-            })
+            nodes.append(
+                {
+                    "engine": engine,
+                    "kernel": name,
+                    "node": key[2],
+                    "recipe": rkey,
+                    "original_nodes": key[4],
+                    "reported_dtype": a.get("dataType", ""),
+                }
+            )
         if hw not in hw_ids:
             hw_ids[hw] = len(hw_names)
             hw_names.append(hw)
@@ -95,52 +114,29 @@ with (open_trace(args.trace, "rb") as src, gzip.open(args.output / "hardware.jso
             examples.append(event)
 digest = hashlib.file_digest(args.trace.open("rb"), "sha256").hexdigest()
 result = {
-    "complete_json":
-    True,
-    "all_activity_start_us":
-    trace_first,
-    "all_activity_end_us":
-    trace_last,
-    "trace":
-    str(args.trace),
-    "trace_sha256":
-    digest,
-    "events":
-    total,
-    "schema_version":
-    3,
+    "complete_json": True,
+    "all_activity_start_us": trace_first,
+    "all_activity_end_us": trace_last,
+    "trace": str(args.trace),
+    "trace_sha256": digest,
+    "events": total,
+    "schema_version": 3,
     "hardware_columns": ["ts_us", "dur_us", "lane", "node", "hw_kind", "api_id"],
-    "hw_event_names":
-    hw_names,
-    "base_time_nanoseconds":
-    int(base[1]) if base else None,
-    "hardware_events":
-    hardware,
-    "first_us":
-    first,
-    "last_us":
-    last,
-    "modules":
-    sorted(modules),
-    "nodes":
-    nodes,
-    "recipe_names": {
-        key: sorted(value)
-        for key, value in recipe_names.items()
-    },
-    "host_enqueues":
-    host_enqueues,
-    "cpu_markers":
-    markers,
-    "metadata":
-    metadata,
-    "decoder_examples":
-    examples,
-    "kernel_counts": [{
-        "engine": key[0],
-        "kernel": key[1],
-        "lane_events": count
-    } for key, count in kernel_counts.most_common()]
+    "hw_event_names": hw_names,
+    "base_time_nanoseconds": int(base[1]) if base else None,
+    "hardware_events": hardware,
+    "first_us": first,
+    "last_us": last,
+    "modules": sorted(modules),
+    "nodes": nodes,
+    "recipe_names": {key: sorted(value) for key, value in recipe_names.items()},
+    "host_enqueues": host_enqueues,
+    "cpu_markers": markers,
+    "metadata": metadata,
+    "decoder_examples": examples,
+    "kernel_counts": [
+        {"engine": key[0], "kernel": key[1], "lane_events": count} for key, count in kernel_counts.most_common()
+    ],
 }
 (args.output / "inventory.json").write_text(json.dumps(result, indent=2) + "\n")
 print(json.dumps({key: result[key] for key in ("trace", "hardware_events", "modules", "decoder_examples")}, indent=2))

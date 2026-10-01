@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prepared decoder segments and native compute/collective graph replay."""
+
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -22,6 +23,7 @@ _native_graphs = {}
 _native_entries = weakref.WeakKeyDictionary()
 _segmented_native_entries = weakref.WeakKeyDictionary()
 _native_entry_replays = 0
+_tp4_direct_group_replays = 0
 _native_program_generation = 0
 _native_graph_owners = {}
 _native_captures = 0
@@ -45,69 +47,63 @@ def prepared_group_stats():
         elif os.environ.get("VLLM_HPU_TP2_NATIVE_JOINT_PLAN", "0") == "1":
             raise RuntimeError("Native joint plan counters are unavailable")
     return {
-        "native_program_generation":
-        _native_program_generation,
-        "native_captures":
-        _native_captures,
-        "native_invalidations":
-        dict(_native_invalidations),
-        "hcl_shared_stream_snapshots":
-        hcl_streams,
-        "scheduled_mhc_exchanges":
-        sum(module.scheduled_exchanges for module in tuple(_modules)),
-        "prepares":
-        sum(module.prepares for module in tuple(_modules)),
-        "native_joint_replays":
-        sum(info[0] for info in joint),
-        "native_joint_compute_pages":
-        sum(info[1] for info in joint),
-        "native_joint_compute_submissions":
-        sum(info[6] for info in joint),
-        "native_joint_hcl_callbacks":
-        sum(info[11] for info in joint),
-        "native_entry_replays":
-        _native_entry_replays,
-        "replays":
-        sum(module.replays for module in tuple(_modules)),
-        "native_graphs":
-        len(_native_graphs),
-        "native_replays":
-        sum(graph.replay_count() for graph in _native_graphs.values()),
-        "native_segments":
-        sum(graph.segment_count() for graph in _native_graphs.values()),
-        "native_collectives":
-        sum(graph.collective_count() for graph in _native_graphs.values()),
-        "external_collectives":
-        sum(graph.external_collective_count() for graph in _native_graphs.values()),
-        "native_commands":
-        sum(graph.captured_command_count() for graph in _native_graphs.values()),
-        "native_relocations":
-        sum(graph.captured_relocation_count() for graph in _native_graphs.values()),
-        "native_global_program_bytes":
-        sum(graph.global_program_bytes() for graph in _native_graphs.values()),
-        "native_workspace_bytes":
-        sum(graph.workspace_bytes() for graph in _native_graphs.values() if hasattr(graph, "workspace_bytes")),
-        "native_arc_program_bytes":
-        sum(graph.arc_program_bytes() for graph in _native_graphs.values()),
-        "native_hcl_command_bytes_per_replay":
-        sum(graph.hcl_command_bytes_per_replay() for graph in _native_graphs.values()),
-        "native_hcl_stream_ccb_bytes":
-        sum(graph.hcl_stream_ccb_bytes() for graph in _native_graphs.values()),
-        "native_hcl_replay_bytes":
-        sum(graph.hcl_replay_bytes() for graph in _native_graphs.values()),
-        "native_hcl_ccb_wraps":
-        sum(graph.hcl_ccb_wrap_count() for graph in _native_graphs.values()),
-        "native_hcl_submissions":
-        sum(graph.hcl_submission_count() for graph in _native_graphs.values())
+        "native_program_generation": _native_program_generation,
+        "native_captures": _native_captures,
+        "native_invalidations": dict(_native_invalidations),
+        "hcl_shared_stream_snapshots": hcl_streams,
+        "scheduled_mhc_exchanges": sum(module.scheduled_exchanges for module in tuple(_modules)),
+        "prepares": sum(module.prepares for module in tuple(_modules)),
+        "native_joint_replays": sum(info[0] for info in joint),
+        "native_joint_compute_pages": sum(info[1] for info in joint),
+        "native_joint_compute_submissions": sum(info[6] for info in joint),
+        "native_joint_hcl_callbacks": sum(info[11] for info in joint),
+        "native_entry_replays": _native_entry_replays,
+        "tp4_direct_group_replays": _tp4_direct_group_replays,
+        "tp4_group_bindings": [
+            module.binding_info[id(plan)]
+            for module in tuple(_modules)
+            if hasattr(module, "binding_info")
+            for plan in module.plans
+            if id(plan) in module.binding_info
+        ],
+        "replays": sum(module.replays for module in tuple(_modules)),
+        "native_graphs": len(_native_graphs),
+        "native_replays": sum(graph.replay_count() for graph in _native_graphs.values()),
+        "native_segments": sum(graph.segment_count() for graph in _native_graphs.values()),
+        "native_collectives": sum(graph.collective_count() for graph in _native_graphs.values()),
+        "external_collectives": sum(graph.external_collective_count() for graph in _native_graphs.values()),
+        "native_commands": sum(graph.captured_command_count() for graph in _native_graphs.values()),
+        "native_relocations": sum(graph.captured_relocation_count() for graph in _native_graphs.values()),
+        "native_global_program_bytes": sum(graph.global_program_bytes() for graph in _native_graphs.values()),
+        "native_workspace_bytes": sum(
+            graph.workspace_bytes() for graph in _native_graphs.values() if hasattr(graph, "workspace_bytes")
+        ),
+        "native_arc_program_bytes": sum(graph.arc_program_bytes() for graph in _native_graphs.values()),
+        "native_hcl_command_bytes_per_replay": sum(
+            graph.hcl_command_bytes_per_replay() for graph in _native_graphs.values()
+        ),
+        "native_hcl_stream_ccb_bytes": sum(graph.hcl_stream_ccb_bytes() for graph in _native_graphs.values()),
+        "native_hcl_replay_bytes": sum(graph.hcl_replay_bytes() for graph in _native_graphs.values()),
+        "native_hcl_ccb_wraps": sum(graph.hcl_ccb_wrap_count() for graph in _native_graphs.values()),
+        "native_hcl_submissions": sum(graph.hcl_submission_count() for graph in _native_graphs.values()),
     }
 
 
 def _signature_key(value):
     if isinstance(value, torch.Tensor):
-        address = (value.untyped_storage().data_ptr() + value.storage_offset() * value.element_size()
-                   if value.dtype == torch.float32 and value.numel() >= 393216 else None)
-        return (str(value.device), str(value.dtype), tuple(value.shape), value.stride(), value.storage_offset(),
-                address)
+        address = (
+            value.untyped_storage().data_ptr() + value.storage_offset() * value.element_size()
+            if value.dtype == torch.float32 and value.numel() >= 393216
+            else None
+        )
+        return (
+            str(value.device),
+            str(value.dtype),
+            tuple(value.shape),
+            value.stride(),
+            value.storage_offset(),
+            address,
+        )
     return (type(value).__name__, value)
 
 
@@ -118,6 +114,12 @@ def _runtime():
     if not hasattr(bridge, "PreparedGroupPlan"):
         raise RuntimeError("The TP2 bridge lacks the version-locked prepared replay API")
     return bridge, backend
+
+
+def _tp4_runtime():
+    from vllm_gaudi.ops.deepseek_v41_completion import resolve_device_runtime
+
+    return resolve_device_runtime(4)
 
 
 def native_decode_graph_qualification_groups():
@@ -151,8 +153,13 @@ def _flush():
         v41 = adapter is not None and adapter.name.startswith("deepseek_v41_")
         v4 = adapter is not None and (adapter.name == "deepseek_v4" or v41)
         full_groups = adapter.groups if adapter is not None else 8
-        enabled = (gaudi_envs.VLLM_HPU_DSV41_GRAPH_REPLAY if v41 else
-                   gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH if v4 else gaudi_envs.VLLM_HPU_NATIVE_DECODE_GRAPH)
+        enabled = (
+            gaudi_envs.VLLM_HPU_DSV41_GRAPH_REPLAY
+            if v41
+            else gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH
+            if v4
+            else gaudi_envs.VLLM_HPU_NATIVE_DECODE_GRAPH
+        )
         diagnostic_host = v4 and context.get("diagnostic_host_replay", False)
         if enabled and len(plans) == full_groups and not diagnostic_host:
             groups = full_groups if v4 else native_decode_graph_qualification_groups()
@@ -172,7 +179,7 @@ def _flush():
                     _native_graph_owners[key] = weakref.ref(context["owner"])
                 if v4:
                     graph.configure_topology(groups, adapter.collectives, adapter.external_prefix)
-                if (v41 and gaudi_envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX and adapter.supports_segmented_input):
+                if v41 and gaudi_envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX and adapter.supports_segmented_input:
                     attention_inputs = list(context["attention_inputs"])
                     if gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM:
                         attention_inputs = attention_inputs[1:]
@@ -319,8 +326,11 @@ def collect_prepared_group_replays(**native_context):
         context = _local.native_context
         if context and getattr(context.get("adapter"), "name", None) == "deepseek_v4":
             from vllm_gaudi import envs as gaudi_envs
-            if (gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH
-                    and getattr(context["metadata"], "native_completion", None) is None):
+
+            if (
+                gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH
+                and getattr(context["metadata"], "native_completion", None) is None
+            ):
                 # Initial cold discovery may execute prepared prefixes before a
                 # whole-decoder plan exists. Still retain its actual final
                 # consumer; this does not repeat any computation or mutation.
@@ -339,7 +349,8 @@ def _release_native_graphs(owner=None):
         entry = _native_entries.pop(owner, None)
         _segmented_native_entries.pop(owner, None)
         keys = [
-            key for key, graph in _native_graphs.items()
+            key
+            for key, graph in _native_graphs.items()
             if (_native_graph_owners.get(key, lambda: None)() is owner or (entry is not None and graph is entry[0]))
         ]
     for key in keys:
@@ -382,6 +393,8 @@ def invalidate_prepared_group_plans(owner=None, *, reason="explicit"):
             indices = [i for i, key in enumerate(module.plan_owners) if key is not None and key[0] == id(owner)]
             for i in reversed(indices):
                 module.plans[i].invalidate()
+                if hasattr(module, "captured"):
+                    module.captured.pop(id(module.plans[i]), None)
                 del module.plans[i]
                 del module.signature_keys[i]
                 del module.plan_owners[i]
@@ -392,6 +405,8 @@ def invalidate_prepared_group_plans(owner=None, *, reason="explicit"):
         module.signature_keys.clear()
         module.plan_owners.clear()
         module.communicator_backend = None
+        if hasattr(module, "captured"):
+            module.captured.clear()
 
 
 def shutdown_prepared_group_plans():
@@ -404,9 +419,10 @@ def shutdown_prepared_group_plans():
 
 
 def _is_clear(target):
-    return (getattr(target, "__name__", "") == "list_clear"
-            or (getattr(target, "__qualname__", "") == "pass_make_boxed_graph.<locals>.<lambda>"
-                and getattr(target, "__module__", "") == "habana_frameworks.torch.dynamo.compile_backend.passes"))
+    return getattr(target, "__name__", "") == "list_clear" or (
+        getattr(target, "__qualname__", "") == "pass_make_boxed_graph.<locals>.<lambda>"
+        and getattr(target, "__module__", "") == "habana_frameworks.torch.dynamo.compile_backend.passes"
+    )
 
 
 def _view_targets():
@@ -414,39 +430,59 @@ def _view_targets():
 
 
 def _verify_identity_view(source, result):
-    if (tuple(source.shape) != tuple(result.shape) or source.stride() != result.stride()
-            or source.storage_offset() != result.storage_offset() or source.dtype != result.dtype
-            or source.untyped_storage()._cdata != result.untyped_storage()._cdata):
-        raise RuntimeError(f"Prepared view changes layout: {tuple(source.shape)}/{source.stride()}/"
-                           f"{source.storage_offset()} -> {tuple(result.shape)}/{result.stride()}/"
-                           f"{result.storage_offset()}")
+    if (
+        tuple(source.shape) != tuple(result.shape)
+        or source.stride() != result.stride()
+        or source.storage_offset() != result.storage_offset()
+        or source.dtype != result.dtype
+        or source.untyped_storage()._cdata != result.untyped_storage()._cdata
+    ):
+        raise RuntimeError(
+            f"Prepared view changes layout: {tuple(source.shape)}/{source.stride()}/"
+            f"{source.storage_offset()} -> {tuple(result.shape)}/{result.stride()}/"
+            f"{result.storage_offset()}"
+        )
 
 
 def _is_norm_singleton_view(source, result):
     shapes = {(1, 5120), (1, 1, 5120)}
-    return (tuple(source.shape) in shapes and tuple(result.shape) in shapes
-            and source.dtype == result.dtype == torch.bfloat16 and source.is_contiguous() and result.is_contiguous()
-            and source.storage_offset() == result.storage_offset()
-            and source.untyped_storage()._cdata == result.untyped_storage()._cdata)
+    return (
+        tuple(source.shape) in shapes
+        and tuple(result.shape) in shapes
+        and source.dtype == result.dtype == torch.bfloat16
+        and source.is_contiguous()
+        and result.is_contiguous()
+        and source.storage_offset() == result.storage_offset()
+        and source.untyped_storage()._cdata == result.untyped_storage()._cdata
+    )
 
 
 def _is_contiguous_reshape(source, result):
-    return (source.is_contiguous() and result.is_contiguous() and source.dtype == result.dtype
-            and source.numel() == result.numel() and source.storage_offset() == result.storage_offset()
-            and source.untyped_storage()._cdata == result.untyped_storage()._cdata)
+    return (
+        source.is_contiguous()
+        and result.is_contiguous()
+        and source.dtype == result.dtype
+        and source.numel() == result.numel()
+        and source.storage_offset() == result.storage_offset()
+        and source.untyped_storage()._cdata == result.untyped_storage()._cdata
+    )
 
 
 def _is_static_scalar(node):
     if node.op != "call_function" or node.target != torch.ops.aten.scalar_tensor.default:
         return False
-    return (len(node.args) == 1 and type(node.args[0]) in (bool, int, float)
-            and set(node.kwargs) <= {"dtype", "layout", "device", "pin_memory"}
-            and all(not isinstance(value, torch.fx.Node) for value in node.kwargs.values()))
+    return (
+        len(node.args) == 1
+        and type(node.args[0]) in (bool, int, float)
+        and set(node.kwargs) <= {"dtype", "layout", "device", "pin_memory"}
+        and all(not isinstance(value, torch.fx.Node) for value in node.kwargs.values())
+    )
 
 
-def _eligible(graph):
+def _eligible(graph, *, tp4=False):
     from vllm_gaudi import envs as gaudi_envs
-    if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH or gaudi_envs.VLLM_HPU_DSV41_GRAPH_REPLAY:
+
+    if not tp4 and (gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH or gaudi_envs.VLLM_HPU_DSV41_GRAPH_REPLAY):
         context = getattr(_local, "native_context", None)
         if context is None or context.get("adapter", None) is None:
             # Profile/prefill compilation has no decoder state contract.
@@ -454,17 +490,55 @@ def _eligible(graph):
     collective = torch.ops.vllm_gaudi.tp2_allreduce_residual_rms_norm.default
     peer_exchange = torch.ops.vllm_gaudi.tp2_exchange_peer.default
     scheduled = torch.ops.vllm_gaudi.tp2_exchange_peer_scheduled.default
-    plain = torch.ops.vllm_gaudi.tp2_allreduce_plain.default
-    count = sum(node.target in (collective, peer_exchange, scheduled, plain) for node in graph.graph.nodes)
-    if count < 2:
+    peers = torch.ops.vllm_gaudi.tp_peer_allgather.default
+    peers_scheduled = torch.ops.vllm_gaudi.tp_peer_allgather_scheduled.default
+    plain = (
+        torch.ops.vllm_gaudi.tp4_allreduce_plain.default if tp4 else torch.ops.vllm_gaudi.tp2_allreduce_plain.default
+    )
+    gather = torch.ops.vllm_gaudi.tp4_allgather_plain.default
+    targets = (
+        (plain, gather)
+        if tp4
+        else (
+            collective,
+            peer_exchange,
+            scheduled,
+            peers,
+            peers_scheduled,
+            plain,
+            torch.ops.vllm_gaudi.tp4_allreduce_plain.default,
+            gather,
+        )
+    )
+    count = sum(node.target in targets for node in graph.graph.nodes)
+    if count < (1 if tp4 else 2):
         return False
+    if tp4:
+        # Wider buckets remain ordinary compiled execution until their
+        # ownership and scheduling contract is qualified separately.
+        for node in graph.graph.nodes:
+            if node.target in (plain, gather):
+                value = node.args[0].meta.get("val")
+                if (
+                    not isinstance(value, torch.Tensor)
+                    or value.ndim != 2
+                    or value.shape[0] != 1
+                    or value.dtype != torch.bfloat16
+                    or not 0 < value.numel() <= 32768
+                    or node.target == plain
+                    and value.numel() % 4
+                ):
+                    return False
     # V1 only captures groups already qualified for destination-bound GDN.
     # Ordinary/reference groups retain the normal compiler execution path.
-    v4 = gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH or gaudi_envs.VLLM_HPU_DSV41_GRAPH_REPLAY
+    v4 = tp4 or gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH or gaudi_envs.VLLM_HPU_DSV41_GRAPH_REPLAY
     native = None if v4 else torch.ops.custom_op.gdn_state_update_out.default
-    if not v4 and not any(child.op == "call_function" and child.target == native
-                          for module in graph.modules() if type(module).__name__ == "HabanaGraphModule"
-                          for child in module.fx_module.graph.nodes):
+    if not v4 and not any(
+        child.op == "call_function" and child.target == native
+        for module in graph.modules()
+        if type(module).__name__ == "HabanaGraphModule"
+        for child in module.fx_module.graph.nodes
+    ):
         return False
     for node in graph.graph.nodes:
         if node.op in ("placeholder", "output", "get_attr"):
@@ -474,8 +548,9 @@ def _eligible(graph):
             if type(module).__name__ != "HabanaGraphModule" or module.is_dynamic or module._has_randoms:
                 raise RuntimeError("Prepared TP2 groups require static deterministic compiled recipes")
             continue
-        if node.op == "call_function" and (node.target in (operator.getitem, collective, peer_exchange, scheduled,
-                                                           plain, *_view_targets()) or _is_clear(node.target)):
+        if node.op == "call_function" and (
+            node.target in (operator.getitem, *targets, *_view_targets()) or _is_clear(node.target)
+        ):
             continue
         if _is_static_scalar(node):
             continue
@@ -484,10 +559,10 @@ def _eligible(graph):
 
 
 class PreparedGroupModule(torch.nn.Module):
-
-    def __init__(self, original):
+    def __init__(self, original, *, tp4=False):
         super().__init__()
         self.original = original
+        self.tp4 = tp4
         self.plans = []
         self.signature_keys = []
         self.plan_owners = []
@@ -496,6 +571,9 @@ class PreparedGroupModule(torch.nn.Module):
         self.scheduled_exchanges = 0
         self.replays = 0
         _modules.add(self)
+
+    def _runtime(self):
+        return _tp4_runtime() if self.tp4 else _runtime()
 
     def _prepare(self, inputs):
         from habana_frameworks.torch.dynamo.compile_backend._recipe_compiler_C import batch_empty
@@ -510,14 +588,16 @@ class PreparedGroupModule(torch.nn.Module):
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
             path = Path(directory) / f"rank{rank}"
             path.mkdir(parents=True, exist_ok=True)
-            changes = [[{
-                "input": index,
-                "expected": old,
-                "actual": new
-            } for index, (old, new) in enumerate(zip(previous, signature, strict=True)) if old != new]
-                       for previous in self.signature_keys]
+            changes = [
+                [
+                    {"input": index, "expected": old, "actual": new}
+                    for index, (old, new) in enumerate(zip(previous, signature, strict=True))
+                    if old != new
+                ]
+                for previous in self.signature_keys
+            ]
             (path / f"plan-miss-{id(self)}-{self.prepares}.json").write_text(json.dumps(changes, indent=2))
-        bridge, backend = _runtime()
+        bridge, backend = self._runtime()
         self.communicator_backend = backend
         native = bridge.PreparedGroupPlan()
         env = {}
@@ -545,7 +625,15 @@ class PreparedGroupModule(torch.nn.Module):
         collective = torch.ops.vllm_gaudi.tp2_allreduce_residual_rms_norm.default
         peer_exchange = torch.ops.vllm_gaudi.tp2_exchange_peer.default
         scheduled = torch.ops.vllm_gaudi.tp2_exchange_peer_scheduled.default
-        plain = torch.ops.vllm_gaudi.tp2_allreduce_plain.default
+        peers = torch.ops.vllm_gaudi.tp_peer_allgather.default
+        peers_scheduled = torch.ops.vllm_gaudi.tp_peer_allgather_scheduled.default
+        plain = (
+            torch.ops.vllm_gaudi.tp4_allreduce_plain.default
+            if self.tp4
+            else torch.ops.vllm_gaudi.tp2_allreduce_plain.default
+        )
+        gather = torch.ops.vllm_gaudi.tp4_allgather_plain.default
+        wide_plain = torch.ops.vllm_gaudi.tp4_allreduce_plain.default
         results = None
         for node in self.original.graph.nodes:
             if node.op == "placeholder":
@@ -567,7 +655,7 @@ class PreparedGroupModule(torch.nn.Module):
                 arguments = resolve(node.args)
                 source = arguments[0]
                 actual = node.target(*warm(arguments), **node.kwargs)
-                if self._owner_key() is not None and _is_contiguous_reshape(source.warm, actual):
+                if (self.tp4 or self._owner_key() is not None) and _is_contiguous_reshape(source.warm, actual):
                     index = native.add_reshape_view(source.index, list(actual.shape))
                     env[node] = _Slot(index, actual)
                     continue
@@ -584,6 +672,7 @@ class PreparedGroupModule(torch.nn.Module):
             elif node.op == "call_module":
                 child = self.original.get_submodule(node.target)
                 from vllm_gaudi.compilation.deepseek_v41_reindex import optional_tile_bound
+
                 tile_bound = optional_tile_bound(child.fx_module)
                 if tile_bound and not hasattr(native, "mark_last_optional_tile"):
                     raise RuntimeError("Native runtime lacks the optional recipe contract")
@@ -591,9 +680,22 @@ class PreparedGroupModule(torch.nn.Module):
                 if node.kwargs:
                     raise RuntimeError("Prepared compute expects positional tensor/scalar bindings")
                 observed = child(*warm(arguments))
-                visible = list(observed) if isinstance(observed, (list, tuple)) else [observed]
-                allocations = iter(batch_empty(child._outputs_batch_data))
+                visible = (
+                    [] if observed is None else list(observed) if isinstance(observed, (list, tuple)) else [observed]
+                )
+                allocated = batch_empty(child._outputs_batch_data)
+                allocations = iter(allocated)
                 duplicates = {out: inp for inp, out in (child._in_to_out_dups or {}).items()}
+                if len(visible) - len(duplicates) != len(allocated):
+                    layout = [
+                        (type(value).__name__, tuple(value.shape) if isinstance(value, torch.Tensor) else value)
+                        for value in visible
+                    ]
+                    raise RuntimeError(
+                        f"Prepared recipe output contract: {node.target}, visible={layout}, "
+                        f"allocated={len(allocated)}, aliases={duplicates}, "
+                        f"recipe={child._fx_module.code}"
+                    )
                 visible_slots, allocated_slots = [], []
                 for index, actual in enumerate(visible):
                     if index in duplicates:
@@ -605,25 +707,52 @@ class PreparedGroupModule(torch.nn.Module):
                 native.add_compute(child._recipe_id, [x.index for x in arguments], allocated_slots)
                 if tile_bound:
                     native.mark_last_optional_tile(tile_bound)
-                env[node] = tuple(visible_slots) if isinstance(
-                    observed, tuple) else (visible_slots if isinstance(observed, list) else visible_slots[0])
-            elif node.op == "call_function" and node.target in (peer_exchange, scheduled, plain):
+                env[node] = (
+                    None
+                    if observed is None
+                    else tuple(visible_slots)
+                    if isinstance(observed, tuple)
+                    else visible_slots
+                    if isinstance(observed, list)
+                    else visible_slots[0]
+                )
+            elif node.op == "call_function" and node.target in (
+                peer_exchange,
+                scheduled,
+                peers,
+                peers_scheduled,
+                plain,
+                wide_plain,
+                gather,
+            ):
                 arguments = slots(resolve(node.args[:1]))
-                ready_outputs = resolve(node.args[1]) if node.target == scheduled else ()
-                if not isinstance(ready_outputs,
-                                  (tuple, list)) or not all(isinstance(value, _Slot) for value in ready_outputs):
+                ready_outputs = (
+                    resolve(node.args[1])
+                    if node.target == scheduled
+                    else resolve(node.args[2])
+                    if node.target == peers_scheduled
+                    else ()
+                )
+                if not isinstance(ready_outputs, (tuple, list)) or not all(
+                    isinstance(value, _Slot) for value in ready_outputs
+                ):
                     raise RuntimeError("Scheduled TP2 outputs require prepared tensor producers")
-                if node.target == scheduled:
+                if node.target in (scheduled, peers_scheduled):
                     self.scheduled_exchanges += 1
                 if len(arguments) != 1 or not hasattr(native, "add_peer_exchange"):
                     raise RuntimeError("Prepared TP2 runtime lacks the exchange-only node")
-                actual = (node.target(*warm(arguments), warm(ready_outputs))
-                          if node.target == scheduled else node.target(*warm(arguments)))
+                actual = node.target(*warm(resolve(node.args)), **node.kwargs)
                 # The graph partitioner materializes these independent outputs
                 # in the producer recipe. Native HCL still transfers only the
                 # partial; downstream compute slots retain their real values.
                 result = slot(actual, planned=torch.empty_like(actual))
-                add_collective = native.add_all_reduce if node.target == plain else native.add_peer_exchange
+                add_collective = (
+                    native.add_all_gather
+                    if node.target in (gather, peers, peers_scheduled)
+                    else native.add_all_reduce
+                    if node.target in (plain, wide_plain)
+                    else native.add_peer_exchange
+                )
                 add_collective(arguments[0].index, result.index)
                 env[node] = result
             elif node.op == "call_function" and node.target == collective:
@@ -643,7 +772,8 @@ class PreparedGroupModule(torch.nn.Module):
             else:
                 raise RuntimeError(f"Invalid prepared node {node}")
         if not isinstance(results, tuple) or not all(
-                isinstance(x, _Slot) and isinstance(x.warm, torch.Tensor) for x in results):
+            isinstance(x, _Slot) and isinstance(x.warm, torch.Tensor) for x in results
+        ):
             raise RuntimeError("Prepared decoder output must be a flat tuple of tensors")
         native.prepare(backend, [x.index for x in results])
         self.plans.append(native)
@@ -662,12 +792,39 @@ class PreparedGroupModule(torch.nn.Module):
             path.mkdir(parents=True, exist_ok=True)
             stem = f"group{group}-{id(self)}-prepare{self.prepares}"
             (path / f"{stem}.py").write_text(self.original.print_readable(print_output=False))
-            nodes = [
-                dict(name=node.name, kind="compute", recipe=self.original.get_submodule(node.target)._recipe_id)
-                if node.op == "call_module" else dict(name=node.name, kind="exchange")
-                for node in self.original.graph.nodes
-                if node.op == "call_module" or node.target in (collective, peer_exchange, scheduled, plain)
-            ]
+
+            def input_names(value):
+                if isinstance(value, torch.fx.Node):
+                    return [value.name]
+                if isinstance(value, (tuple, list)):
+                    return [name for item in value for name in input_names(item)]
+                if isinstance(value, dict):
+                    return [name for item in value.values() for name in input_names(item)]
+                return []
+
+            nodes = []
+            for node in self.original.graph.nodes:
+                if node.op != "call_module" and node.target not in (
+                    collective,
+                    peer_exchange,
+                    scheduled,
+                    peers,
+                    peers_scheduled,
+                    plain,
+                    wide_plain,
+                    gather,
+                ):
+                    continue
+                record = dict(
+                    name=node.name,
+                    kind="compute" if node.op == "call_module" else "exchange",
+                    inputs=input_names((node.args, node.kwargs)),
+                )
+                if node.op == "call_module":
+                    record["recipe"] = self.original.get_submodule(node.target)._recipe_id
+                else:
+                    record["operator"] = str(node.target)
+                nodes.append(record)
             (path / f"{stem}.json").write_text(json.dumps(nodes, indent=2) + "\n")
         return warm(results)
 
@@ -683,14 +840,19 @@ class PreparedGroupModule(torch.nn.Module):
     def forward(self, input_list):
         inputs = list(input_list)
         input_list.clear()
-        if self.plans and _runtime()[1] is not self.communicator_backend:
+        if self.plans and self._runtime()[1] is not self.communicator_backend:
             invalidate_prepared_group_plans()
         owner_key = self._owner_key()
         for plan, plan_owner in zip(self.plans, self.plan_owners, strict=True):
             if plan_owner == owner_key and plan.matches(inputs):
                 pending = getattr(_local, "pending", None)
+                if self.tp4 and pending is not None:
+                    context = getattr(_local, "native_context", None)
+                    adapter = context.get("adapter") if context else None
+                    if adapter is None or not adapter.name.startswith("deepseek_v41_tp4"):
+                        raise RuntimeError("TP4 plans cannot join a capture without the TP4 native topology")
                 if pending is None:
-                    _runtime()[0].replay_prepared_groups([plan], [inputs])
+                    self._runtime()[0].replay_prepared_groups([plan], [inputs])
                 else:
                     pending.append((plan, inputs))
                 self.replays += 1
@@ -699,6 +861,23 @@ class PreparedGroupModule(torch.nn.Module):
         # Capture is ordinary execution once; a failed mutation is not retried.
         _flush()
         return self._prepare(inputs)
+
+
+def prepare_group_module(graph, *, tp4=False):
+    """Reuse fixed recipe bindings and retirement for a supported host graph."""
+    if not _eligible(graph, tp4=tp4):
+        return False
+    original = torch.fx.GraphModule(graph, copy.deepcopy(graph.graph))
+    name = "_tp4_prepared_group" if tp4 else "_tp2_prepared_group"
+    graph.add_module(name, PreparedGroupModule(original, tp4=tp4))
+    replacement = torch.fx.Graph()
+    inputs = replacement.placeholder("input_list")
+    result = replacement.call_module(name, (inputs,))
+    replacement.output(result)
+    graph.graph = replacement
+    graph.delete_all_unused_submodules()
+    graph.recompile()
+    return True
 
 
 def register_tp2_prepared_group_pass():
@@ -713,6 +892,7 @@ def register_tp2_prepared_group_pass():
 
         def lower_v4_allreduce(context):
             from vllm_gaudi import envs as gaudi_envs
+
             if not gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
                 return False
             plain = torch.ops.vllm_gaudi.tp2_allreduce_plain.default
@@ -725,7 +905,7 @@ def register_tp2_prepared_group_pass():
                 # is not qualified for native replay. No mHC/norm arithmetic
                 # is replaced, and every original reduction remains present.
                 with graph.inserting_before(node):
-                    peer = graph.call_function(torch.ops.vllm_gaudi.tp2_exchange_peer.default, (partial, ))
+                    peer = graph.call_function(torch.ops.vllm_gaudi.tp2_exchange_peer.default, (partial,))
                     reduced = graph.call_function(torch.ops.aten.add.Tensor, (partial, peer))
                     peer.meta = copy.copy(node.meta)
                     reduced.meta = copy.copy(node.meta)
@@ -736,8 +916,11 @@ def register_tp2_prepared_group_pass():
             if nodes:
                 graph.lint()
                 context.graph_module.recompile()
-                from habana_frameworks.torch.dynamo.compile_backend.passes import (pass_fake_propagation,
-                                                                                   pass_mark_placement)
+                from habana_frameworks.torch.dynamo.compile_backend.passes import (
+                    pass_fake_propagation,
+                    pass_mark_placement,
+                )
+
                 pass_fake_propagation(context)
                 pass_mark_placement(context)
             return bool(nodes)
@@ -750,6 +933,7 @@ def register_tp2_prepared_group_pass():
                 directory = os.environ.get("VLLM_HPU_TP2_PLAN_DUMP_DIR")
                 if directory:
                     from pathlib import Path
+
                     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
                     path = Path(directory) / f"rank{rank}"
                     path.mkdir(parents=True, exist_ok=True)
@@ -762,7 +946,7 @@ def register_tp2_prepared_group_pass():
             graph.add_module("_tp2_prepared_group", prepared)
             replacement = torch.fx.Graph()
             inputs = replacement.placeholder("input_list")
-            result = replacement.call_module("_tp2_prepared_group", (inputs, ))
+            result = replacement.call_module("_tp2_prepared_group", (inputs,))
             replacement.output(result)
             graph.graph = replacement
             graph.delete_all_unused_submodules()

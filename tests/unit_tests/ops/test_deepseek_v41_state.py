@@ -599,8 +599,10 @@ def test_all_prefill_tails_across_five_groups_use_bounded_compile_cache(monkeypa
             super().__init__()
             self.layer = layer
 
-        def forward(self, residual, pre, positions, image_mask, rows, *, fp8_decode=False, decode=False):
+        def forward(self, residual, pre, positions, image_mask, rows, *, fp8_decode=False, decode=False,
+                    selected_main=None, decode_metadata=None):
             assert not fp8_decode and not decode
+            assert selected_main is None and decode_metadata is None
             return residual + self.layer + positions[:, None, None], pre, None
 
     stage = SimpleNamespace(layers=torch.nn.ModuleList(Layer(i) for i in range(20)),

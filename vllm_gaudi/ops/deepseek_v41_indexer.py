@@ -15,8 +15,8 @@ import torch
 INDEX_MME_HOT_TOKENS = 2560
 
 
-def _mme_hot_scores(query, weights, decoded_keys, positions, ratio):
-    """Reproduce the checkpoint's two BF16 TP-shard sum boundaries on MME.
+def _mme_hot_scores(query, weights, decoded_keys, positions, ratio, local_heads):
+    """Retain the BF16 boundary of each TP shard's head sum on MME.
 
     ``decoded_keys`` follows the compressed row geometry, so ratio-2 Full
     layers execute half as many MME columns as ratio-1 layers while retaining
@@ -27,22 +27,73 @@ def _mme_hot_scores(query, weights, decoded_keys, positions, ratio):
     # weight, and the two checkpoint BF16 shard boundaries into one TPC pass.
     # The native reducer also writes -inf past the device-valued visible row,
     # avoiding all generic reduction intermediates without changing selection.
-    return torch.ops.custom_op.custom_deepseek_v41_index_reduce_bf16_gaudi2(raw_scores, weights, positions, ratio)
+    return torch.ops.custom_op.custom_deepseek_v41_index_reduce_bf16_gaudi2(
+        raw_scores, weights, positions, ratio, local_heads
+    )
 
 
-def runtime_index_select(query,
-                         weights,
-                         cache,
-                         pages,
-                         positions,
-                         candidates,
-                         *,
-                         ratio,
-                         capacity,
-                         reindex=False,
-                         publish_candidates=False,
-                         decoded_hot=None,
-                         ordered_candidates=False):
+def ordered_index_ids(scores, positions, candidates, ratio, *, reindex=False, blocks=False):
+    """Shared threshold/bitmap emission with TP2 C1's ordered tie rule."""
+    ops = torch.ops.custom_op
+    scores = scores.contiguous()
+    metadata = ops.custom_deepseek_v41_index_threshold_gaudi2(scores, positions, ratio, int(reindex), int(blocks))
+    return ops.custom_deepseek_v41_index_emit_gaudi2(
+        scores, positions, candidates, metadata, ratio, int(reindex), int(blocks)
+    )
+
+
+def _bounded_mme_scores(
+    query, weights, cache, pages, positions, candidates, ratio, local_heads, search_rows, reindex, decoded_keys
+):
+    """Use the same paged-key/MME producer for any TP shard geometry."""
+    if reindex:
+        rows = candidates.unsqueeze(-1) * 8 + torch.arange(8, dtype=torch.int32, device=positions.device)
+        rows = torch.where(candidates.unsqueeze(-1) >= 0, rows, -1).flatten(1)
+    else:
+        rows = torch.arange(search_rows, dtype=torch.int32, device=positions.device)
+    if not reindex and decoded_keys is not None:
+        scores = torch.ops.custom_op.custom_deepseek_v41_prefill_index_scores_gaudi2(
+            query, weights, decoded_keys[:search_rows].contiguous(), positions, rows, ratio, local_heads
+        )
+    else:
+        from vllm_gaudi.ops.deepseek_v41_decode_index import native_index_tile
+        from vllm_gaudi.ops.deepseek_v41_index_mirror import mirror_index_tile
+
+        score = native_index_tile if decoded_keys is None else mirror_index_tile
+        scores = torch.cat(
+            [
+                (
+                    score(query, weights, cache, pages, positions, rows[..., first : first + 2048], ratio, local_heads)
+                    if decoded_keys is None
+                    else score(
+                        query, weights, decoded_keys, positions, rows[..., first : first + 2048], ratio, local_heads
+                    )
+                )
+                for first in range(0, rows.shape[-1], 2048)
+            ],
+            -1,
+        ).contiguous()
+    return scores
+
+
+def runtime_index_select(
+    query,
+    weights,
+    cache,
+    pages,
+    positions,
+    candidates,
+    *,
+    ratio,
+    capacity,
+    reindex=False,
+    publish_candidates=False,
+    decoded_hot=None,
+    ordered_candidates=False,
+    local_heads=16,
+    search_rows=None,
+    decoded_keys=None,
+):
     """Return ordered top-512 rows and, for a Full layer, top-2048 blocks.
 
     Tensor shapes remain fixed while the native kernels derive useful work
@@ -52,18 +103,31 @@ def runtime_index_select(query,
         raise ValueError("Runtime indexer requires ratio 1/2 and a bounded aligned capacity")
     if reindex and publish_candidates:
         raise ValueError("A candidate consumer cannot publish a new candidate pool")
+    if local_heads < 1 or query.shape[1] % local_heads:
+        raise ValueError("Index heads must divide into complete TP shards")
     ops = torch.ops.custom_op
     columns = 16384 if reindex else capacity
-    if decoded_hot is None:
-        scores, block_scores = ops.custom_deepseek_v41_index_scores_gaudi2(query, weights, cache, pages, positions,
-                                                                           candidates, ratio, int(reindex), columns)
+    if search_rows is not None:
+        scores = _bounded_mme_scores(
+            query, weights, cache, pages, positions, candidates, ratio, local_heads, search_rows, reindex, decoded_keys
+        )
+        block_scores = None
+        if publish_candidates:
+            block_scores = scores.reshape(scores.shape[0], -1, 8).amax(-1)
+            block_ids = torch.arange(block_scores.shape[-1], dtype=torch.int32, device=positions.device)
+            newest = (((positions + 1) // ratio - 1) // 8).unsqueeze(-1)
+            block_scores = block_scores.masked_fill(block_ids == newest, torch.inf)
+    elif decoded_hot is None:
+        scores, block_scores = ops.custom_deepseek_v41_index_scores_gaudi2(
+            query, weights, cache, pages, positions, candidates, ratio, int(reindex), columns, local_heads
+        )
     else:
         if query.shape[0] != 1 or pages.ndim != 1:
             raise ValueError("Decoded index hot mirror belongs to one request; batch decode requires paged state")
         hot_rows = INDEX_MME_HOT_TOKENS // ratio
-        if (decoded_hot.dtype != torch.bfloat16 or decoded_hot.ndim != 2 or decoded_hot.shape != (hot_rows, 128)):
+        if decoded_hot.dtype != torch.bfloat16 or decoded_hot.ndim != 2 or decoded_hot.shape != (hot_rows, 128):
             raise ValueError("MME index hot cache requires the fixed ratio-aware BF16 geometry")
-        scores = _mme_hot_scores(query, weights, decoded_hot, positions, ratio)
+        scores = _mme_hot_scores(query, weights, decoded_hot, positions, ratio, local_heads)
         # Below 16K every visible block survives the candidate publication.
         # Its device-valued direct branch does not read these placeholders.
         block_scores = torch.empty((query.shape[0], hot_rows // 8), dtype=torch.float32, device=query.device)
@@ -74,13 +138,14 @@ def runtime_index_select(query,
     # the badly imbalanced 16K worker partition.  Once the request leaves the
     # hot bucket ``decoded_hot`` is absent and the normal Reindex contract is
     # restored before the first consumer runs.
-    select_reindex = int(reindex and decoded_hot is None)
-    stats = ops.custom_deepseek_v41_index_threshold_gaudi2(scores, positions, ratio, select_reindex, 0)
-    selected = ops.custom_deepseek_v41_index_emit_gaudi2(scores, positions, candidates, stats, ratio, select_reindex, 0)
-    # Full output is in logical-row order. A production Reindex pool can
-    # carry the same guarantee from its Full publisher; external/preserved
-    # pools may be permuted. Preserve their public logical ordering unless
-    # the caller supplies the stronger producer contract.
+    select_reindex = reindex and (search_rows is not None or decoded_hot is None)
+    selected = ordered_index_ids(scores, positions, candidates, ratio, reindex=select_reindex)
+    # The emitter partitions the score vector by increasing source offset and
+    # starts every worker at the exact prefix count of retained entries.  Full
+    # output is therefore already in increasing logical-row order.  Reindex
+    # candidate blocks are also published in increasing logical order, so its
+    # mapped rows retain that order.  Sorting either result repeats work and
+    # adds a bitonic-sort kernel to every selection layer.
     if select_reindex and not ordered_candidates:
         selected = torch.where(selected >= 0, selected, 2147483647).sort(-1).values
         selected = torch.where(selected < 2147483647, selected, -1)
@@ -89,7 +154,6 @@ def runtime_index_select(query,
     # equivalent direct prefix above.  Skip both publication kernels.  At the
     # first non-hot token the source layer runs before Reindex layers and
     # refreshes candidate_pool for the same generation.
-    if publish_candidates and decoded_hot is None:
-        stats = ops.custom_deepseek_v41_index_threshold_gaudi2(block_scores, positions, ratio, 0, 1)
-        blocks = ops.custom_deepseek_v41_index_emit_gaudi2(block_scores, positions, candidates, stats, ratio, 0, 1)
+    if publish_candidates and (search_rows is not None or decoded_hot is None):
+        blocks = ordered_index_ids(block_scores, positions, candidates, ratio, blocks=True)
     return selected, blocks

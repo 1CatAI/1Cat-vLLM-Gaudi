@@ -3,6 +3,7 @@
 #include <unordered_set>
 
 #include "tp2_native_graph_topology.h"
+#include "tp2_native_segmented_epochs.h"
 #include "tp2_native_dependencies.h"
 #include <strings.h>
 
@@ -133,6 +134,15 @@ class RuntimeApis {
     });
   }
 
+  void requireTp4() {
+    require();
+    std::call_once(tp4_once_, [this]() {
+      const auto version = resolve<uint32_t (*)()>("hcclTp4NativeGraphVersion");
+      TORCH_CHECK(version() == 1, "Unsupported TP4 native collective ABI");
+      hcl_tp4_create = resolve<HclCreate>("hcclTp4NativeGraphCreate");
+    });
+  }
+
   void requirePlanV2() {
     requirePlan();
     std::call_once(plan_v2_once_, [this]() {
@@ -181,6 +191,7 @@ class RuntimeApis {
   SynGetWorkspaceBytes syn_get_workspace_bytes = nullptr;
   SynDestroy syn_destroy = nullptr;
   HclCreate hcl_create = nullptr;
+  HclCreate hcl_tp4_create = nullptr;
   HclCapture hcl_capture = nullptr;
   HclReplayPrepared hcl_replay_prepared = nullptr;
   HclStage hcl_stage = nullptr;
@@ -207,6 +218,7 @@ class RuntimeApis {
   }
 
   std::once_flag once_;
+  std::once_flag tp4_once_;
   std::once_flag plan_once_;
   std::once_flag plan_v2_once_;
   std::once_flag segmented_once_;
@@ -437,8 +449,19 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
   void capture(std::vector<std::shared_ptr<PreparedGroupPlan>> plans,
                std::vector<torch::jit::Stack> inputs) {
     RuntimeApis::get().require();
+    TORCH_CHECK(!plans.empty(), "Native capture requires compiled groups");
+    tp4_ = plans.front()->world_size == 4;
+    has_reduction_phases_ = false;
+    for (const auto& plan : plans)
+      for (const auto& node : plan->nodes) has_reduction_phases_ |= node.reduction_only;
+    for (const auto& plan : plans)
+      TORCH_CHECK((plan->world_size == 4) == tp4_, "Native groups use different communicator sizes");
+    if (tp4_) {
+      RuntimeApis::get().requireTp4();
+      TORCH_CHECK(!external_prefix_, "TP4 native input must belong to the complete command graph");
+    }
     if (mhcOverlapEnabled()) {
-      TORCH_CHECK(jointPlanEnabled() && NativeGraphTopology::supportsV41Dependencies(
+      TORCH_CHECK(usesJointPlan() && NativeGraphTopology::supportsV41Dependencies(
                       expected_groups_, expected_collectives_, external_prefix_),
                   "Explicit TP dependencies require the V4.1 C1 stage topology");
       RuntimeApis::get().requirePlanV2();
@@ -594,13 +617,13 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
     {
       std::lock_guard<std::mutex> lock(mutex_);
       TORCH_CHECK(segmentedPrefixConfigured() && state_.load() == State::Instantiated && fixed_inputs_ready_ &&
-                      segmented_scheduled_epoch_.load() == 0,
+                      segmented_epochs_.scheduled() == 0,
                   "Native segmented prefix requires an idle prepared PP0 input graph");
       epoch = input_epoch_.fetch_add(1) + 1;
       TORCH_CHECK(epoch == scheduled_epoch_.load() + 1,
                   "Native segmented prefix input epoch changed");
       scheduled_epoch_.store(epoch);
-      segmented_scheduled_epoch_.store(epoch);
+      segmented_epochs_.beginScheduled(epoch);
       copies = std::move(pending_input_copies_);
       dependencies = std::move(pending_input_dependencies_);
     }
@@ -629,12 +652,13 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
     std::vector<synapse_helpers::device_ptr> dependencies;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      epoch = segmented_scheduled_epoch_.load();
+      epoch = segmented_epochs_.scheduled();
       TORCH_CHECK(segmentedPrefixConfigured() && state_.load() == State::Instantiated && fixed_inputs_ready_ &&
                       epoch != 0 && epoch == scheduled_epoch_.load(),
                   "Native segmented suffix has no matching prefix epoch");
       copies = std::move(pending_input_copies_);
       dependencies = std::move(pending_input_dependencies_);
+      segmented_epochs_.finishScheduled(epoch);
     }
     auto self = shared_from_this();
     habana::eager::PipelineTask<habana::eager::ThreadType::LOWERING>(
@@ -669,7 +693,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
       std::lock_guard<std::mutex> lock(mutex_);
       TORCH_CHECK(state_.load() == State::Instantiated && fixed_inputs_ready_,
                   "Native fixed replay requires prepared input ownership");
-      TORCH_CHECK(segmented_scheduled_epoch_.load() == 0,
+      TORCH_CHECK(segmented_epochs_.scheduled() == 0,
                   "Whole replay cannot overtake an active segmented prefix");
       const uint64_t epoch = input_epoch_.fetch_add(1) + 1;
       TORCH_CHECK(epoch == scheduled_epoch_.load() + 1, "Native fixed replay input epoch changed");
@@ -946,10 +970,10 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
     std::vector<NativeNodeKind> node_kinds;
     for (const auto& plan : plans)
       for (const auto& node : plan->nodes) {
-        TORCH_CHECK(!node.peer_only || jointPlanEnabled(), "Exchange-only capture requires the unified command plan");
+        TORCH_CHECK(!node.peer_only || usesJointPlan(), "Exchange-only capture requires the unified command plan");
         node_kinds.push_back({node.exchange, node.peer_only});
       }
-    const auto topology = NativeGraphTopology::prepare(node_kinds, plans.size(), jointPlanEnabled(),
+    const auto topology = NativeGraphTopology::prepare(node_kinds, plans.size(), usesJointPlan(),
                                                       expected_collectives_, external_prefix_);
     prefix_node_count_ = topology.prefixNodes;
     segment_count_.store(topology.computeCount);
@@ -963,6 +987,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
           TORCH_CHECK(!node.exchange || node.peer_only, "V4.1 overlap requires ordinary peer exchanges");
           NativeDependencyNode binding;
           binding.exchange = node.exchange;
+          binding.outputCopies = node.all_gather ? frame->plan->world_size : 1;
           auto ranges = [&](const std::vector<int64_t>& slots) {
             std::vector<NativeBufferRange> result;
             for (auto slot : slots) {
@@ -1001,7 +1026,29 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
       }
       TORCH_CHECK(overlapped > 0, "V4.1 overlap graph has no independent compute between TP producer and consumer");
     }
-    hcl_graphs_.assign(topology.consumers.size(), nullptr);
+    if (tp4_) {
+      // Each logical AllReduce keeps the stock RS -> AG sequence. Both
+      // phases feed the same compiled consumer; HCL makes AG wait for RS.
+      const auto logical_consumers = prepared_consumers_;
+      const auto logical_producers = prepared_producers_;
+      prepared_consumers_.clear();
+      prepared_producers_.clear();
+      size_t logical = 0;
+      for (const auto& plan : plans)
+        for (const auto& node : plan->nodes) {
+          if (!node.exchange) continue;
+          TORCH_CHECK(node.peer_only && (node.reduction_only != node.all_gather),
+                      "TP4 native graph requires stock RS/AG collectives");
+          const size_t phases = node.reduction_only ? 2 : 1;
+          for (size_t phase = 0; phase < phases; ++phase) {
+            prepared_consumers_.push_back(logical_consumers.at(logical));
+            if (!logical_producers.empty()) prepared_producers_.push_back(logical_producers.at(logical));
+          }
+          ++logical;
+        }
+      TORCH_CHECK(logical == topology.consumers.size(), "TP4 physical phase coverage differs");
+    }
+    hcl_graphs_.assign(prepared_consumers_.size(), nullptr);
 
     auto self = shared_from_this();
     scheduleExternalPrefix();
@@ -1026,7 +1073,8 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
           for (auto index : node.inputs) bindings.push_back(frame->values.at(index));
           for (auto index : node.outputs) bindings.push_back(frame->values.at(index));
           auto backend = habana::eager::convert_ivalues_to_backend_tensors(bindings);
-          const size_t index = collective_index++;
+          const size_t index = collective_index;
+          collective_index += tp4_ && node.reduction_only ? 2 : 1;
           habana::HPUDeviceContext::execute_thread().enqueue(
               [self, node, index, values = std::move(backend)]() mutable {
                 self->captureExchangeOnExecute(index, node, std::move(values));
@@ -1066,7 +1114,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
   void captureExchangeOnExecute(size_t index, const PreparedNode& node, torch::jit::Stack values) {
     try {
       TORCH_CHECK(state_.load() == State::Capturing, "Native decoder capture was invalidated");
-      TORCH_CHECK(!node.reduction_only,
+      TORCH_CHECK(tp4_ || !node.reduction_only,
                   "Native plain AllReduce requires peer transfer and a compiled BF16 sum");
       TORCH_CHECK(index < hcl_graphs_.size() &&
                       (node.peer_only ? values.size() == 2 : values.size() == 7 && node.communication_recipe),
@@ -1086,13 +1134,24 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
       auto& api = RuntimeApis::get();
       const int exchange_mode = node.reduction_only ? 0 : 1;
       const size_t peer_index = node.peer_only ? 1 : 3;
-      const hcclResult_t create = api.hcl_create(
+      const hcclResult_t create = (tp4_ ? api.hcl_tp4_create : api.hcl_create)(
           reinterpret_cast<const void*>(locked.at(0)), reinterpret_cast<void*>(locked.at(peer_index)),
           static_cast<size_t>(tensors[0].numel()), hcclBfloat16, hcclSum,
-          *(communicator_->GetHcclHandle()), stream, exchange_mode, &hcl_graphs_[index]);
+          *(communicator_->GetHcclHandle()), stream,
+          tp4_ ? (node.all_gather ? 2 : 0) : exchange_mode, &hcl_graphs_[index]);
       TORCH_CHECK(create == hcclSuccess, "hcclTp2NativeGraphCreate failed: ", create);
       const hcclResult_t capture = api.hcl_capture(hcl_graphs_[index]);
       TORCH_CHECK(capture == hcclSuccess, "hcclTp2NativeGraphCapture failed: ", capture);
+      if (tp4_ && node.reduction_only) {
+        TORCH_CHECK(index + 1 < hcl_graphs_.size(), "TP4 AllReduce has no AllGather phase");
+        TORCH_CHECK(api.hcl_tp4_create(
+            reinterpret_cast<const void*>(locked.at(peer_index)), reinterpret_cast<void*>(locked.at(peer_index)),
+            static_cast<size_t>(tensors[0].numel()), hcclBfloat16, hcclSum,
+            *(communicator_->GetHcclHandle()), stream, 1, &hcl_graphs_[index + 1]) == hcclSuccess,
+            "hcclTp4NativeGraphCreate(AllReduce AllGather) failed");
+        TORCH_CHECK(api.hcl_capture(hcl_graphs_[index + 1]) == hcclSuccess,
+                    "hcclTp4NativeGraphCapture(AllReduce AllGather) failed");
+      }
       if (!node.peer_only) launchFusedRecipe(stream, locked.at(0),
                         {locked.at(3), locked.at(1), locked.at(2), locked.at(5), locked.at(4), locked.at(6)},
                         static_cast<uint64_t>(tensors[0].numel()),
@@ -1100,6 +1159,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
                         node.communication_recipe);
       resources_.push_back(std::move(holder));
     } catch (...) {
+      if (!capture_failure_) capture_failure_ = std::current_exception();
       state_.store(State::Invalid);
       if (syn_graph_ != nullptr && syn_capture_active_) {
         RuntimeApis::get().syn_abort_capture(syn_graph_);
@@ -1111,6 +1171,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
 
   void endCaptureOnExecute() {
     try {
+      if (capture_failure_) std::rethrow_exception(capture_failure_);
       auto& api = RuntimeApis::get();
       checkSynapse(api.syn_end_capture(syn_graph_), "synNativeComputeGraphEndCapture");
       syn_capture_active_ = false;
@@ -1154,7 +1215,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
       captured_relocation_count_.store(relocations);
       hcl_command_bytes_per_replay_.store(hcl_command_bytes);
       hcl_stream_ccb_bytes_.store(hcl_ccb_bytes);
-      if (jointPlanEnabled()) {
+      if (usesJointPlan()) {
         api.requirePlan();
         TORCH_CHECK(prepared_consumers_.size() == hcl_graphs_.size(),
                     "Native joint plan dependency coverage mismatch");
@@ -1201,6 +1262,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
       prepareCompletionAddresses();
       registerOutputs();
     } catch (...) {
+      if (!capture_failure_) capture_failure_ = std::current_exception();
       state_.store(State::Invalid);
       if (syn_graph_ != nullptr && syn_capture_active_) {
         RuntimeApis::get().syn_abort_capture(syn_graph_);
@@ -1271,7 +1333,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
     std::lock_guard<std::mutex> lock(mutex_);
     TORCH_CHECK(state_.load() == State::Instantiated,
                 "Native decoder graph is not instantiated; no fallback was executed");
-    TORCH_CHECK(segmented_scheduled_epoch_.load() == 0,
+    TORCH_CHECK(segmented_epochs_.executing() == 0,
                 "Whole native replay cannot execute during a segmented replay");
     try {
       auto& api = RuntimeApis::get();
@@ -1337,10 +1399,10 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
     RECORD_FUNCTION("vllm_gaudi::native_decoder_prefix_publish", std::vector<c10::IValue>());
     std::lock_guard<std::mutex> lock(mutex_);
     TORCH_CHECK(segmentedPrefixConfigured() && state_.load() == State::Instantiated &&
-                    hcl_batch_ != nullptr && segmented_scheduled_epoch_.load() == epoch &&
-                    epoch == scheduled_epoch_.load() && epoch == executed_epoch_.load() + 1,
+                    hcl_batch_ != nullptr,
                 "Native segmented prefix epoch or graph state changed before publication");
     try {
+      segmented_epochs_.beginExecuting(epoch, executed_epoch_.load(), scheduled_epoch_.load());
       SyncInfo completion;
       auto& api = RuntimeApis::get();
       api.requireSegmentedPlan();
@@ -1359,8 +1421,8 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
     RECORD_FUNCTION("vllm_gaudi::native_decoder_finish_publish", std::vector<c10::IValue>());
     std::lock_guard<std::mutex> lock(mutex_);
     TORCH_CHECK(segmentedPrefixConfigured() && state_.load() == State::Instantiated &&
-                    hcl_batch_ != nullptr && segmented_scheduled_epoch_.load() == epoch &&
-                    epoch == scheduled_epoch_.load() && epoch == executed_epoch_.load() + 1,
+                    hcl_batch_ != nullptr && segmented_epochs_.executing() == epoch &&
+                    epoch <= scheduled_epoch_.load() && epoch == executed_epoch_.load() + 1,
                 "Native segmented suffix epoch or graph state changed before publication");
     try {
       SyncInfo completion;
@@ -1381,8 +1443,8 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
         hcl_ccb_wrap_count_.store(replay_info.nativeCcbWrapCount);
         hcl_submission_count_.store(replay_info.nativeSubmissionCount);
       }
+      segmented_epochs_.finishExecuting(epoch, executed_epoch_.load(), scheduled_epoch_.load());
       executed_epoch_.store(epoch);
-      segmented_scheduled_epoch_.store(0);
       ++replay_count_;
       registerOutputs();
     } catch (...) {
@@ -1392,7 +1454,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
   }
 
   bool segmentedPrefixAvailable() const {
-    return segmentedPrefixEnabled() && NativeGraphTopology::supportsV41SegmentedPrefix(
+    return !has_reduction_phases_ && segmentedPrefixEnabled() && NativeGraphTopology::supportsV41SegmentedPrefix(
         expected_groups_, expected_collectives_, external_prefix_);
   }
 
@@ -1402,6 +1464,10 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
     // before submission. Only configureLateInputs opts a graph into splitting.
     return segmentedPrefixAvailable() && !late_inputs_.empty();
   }
+
+  bool usesJointPlan() const { return tp4_ || jointPlanEnabled(); }
+  bool tp4_ = false;
+  bool has_reduction_phases_ = false;
 
   void prepareCompletionAddresses() {
     auto& outputs = completion_addresses_;
@@ -1437,6 +1503,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
   mutable std::mutex mutex_;
   RuntimeApis::SynGraph syn_graph_ = nullptr;
   bool syn_capture_active_ = false;
+  std::exception_ptr capture_failure_;
   std::vector<RuntimeApis::HclGraph> hcl_graphs_;
   RuntimeApis::HclBatch hcl_batch_ = nullptr;
   std::array<uint64_t, 12> joint_statistics_ {};
@@ -1475,7 +1542,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
   std::atomic<uint64_t> input_update_bytes_{0};
   std::atomic<uint64_t> scheduled_epoch_{0};
   std::atomic<uint64_t> executed_epoch_{0};
-  std::atomic<uint64_t> segmented_scheduled_epoch_{0};
+  NativeSegmentedEpochs segmented_epochs_;
   size_t prefix_node_count_ = 0;
   std::atomic<uint64_t> replay_count_{0};
 };

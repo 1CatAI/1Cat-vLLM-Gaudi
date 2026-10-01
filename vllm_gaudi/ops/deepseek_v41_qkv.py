@@ -26,6 +26,12 @@ def concatenate_static_weights(*weights):
     return torch.cat(weights, dim=0)
 
 
+def direct_dense_fp8(value, weight, channel, *, prequant=None):
+    q, scale = (torch.ops.custom_op.custom_deepseek_v41_dense_quant_gaudi2(value.contiguous())
+                if prequant is None else prequant)
+    return torch.ops.hpu.fp8_gemm_v2(q, False, weight, True, None, torch.bfloat16, scale, channel, None, False)
+
+
 class FusedQKVInput:
 
     def prepare_qkv_input_weight(self):
@@ -44,13 +50,17 @@ class FusedQKVInput:
         q_weight, kv_weight = q_module.weight, kv_module.weight
         if q_weight.ndim != 2 or kv_weight.ndim != 2 or q_weight.shape[1] != kv_weight.shape[1]:
             raise ValueError("V4.1 QKV fusion requires matching input K dimensions")
-        if q_weight.dtype != torch.bfloat16 or kv_weight.dtype != torch.bfloat16:
-            raise ValueError("V4.1 QKV fusion requires prepared BF16 input weights")
+        fp8 = getattr(q_module, "dense_fp8_direct_input", False)
+        if fp8 != getattr(kv_module, "dense_fp8_direct_input", False):
+            raise ValueError("V4.1 QKV fusion requires identical FP8 activation contracts")
+        expected = torch.float8_e4m3fn if fp8 else torch.bfloat16
+        if q_weight.dtype != expected or kv_weight.dtype != expected:
+            raise ValueError("V4.1 QKV fusion requires matching prepared weight dtypes")
         q_quantized = hasattr(q_module, "scale")
         kv_quantized = hasattr(kv_module, "scale")
         if q_quantized != kv_quantized:
             raise ValueError("V4.1 QKV fusion cannot combine mismatched activation contracts")
-        fused = torch.cat((q_weight, kv_weight), dim=0).contiguous()
+        fused = concatenate_static_weights(q_weight, kv_weight).contiguous()
         self.register_buffer("fused_wqa_wkv", fused, False)
         # Keep compatibility with code which introspects the individual
         # matrices, while making both views point at the single allocation.
@@ -58,23 +68,33 @@ class FusedQKVInput:
         kv_module.weight = self.fused_wqa_wkv[q_weight.shape[0]:]
         self._fused_qkv_weight = self.fused_wqa_wkv
         self._fused_qkv_quantized = q_quantized
+        if fp8:
+            channel = torch.cat((q_module.channel_scale.cpu(), kv_module.channel_scale.cpu()), dim=1).to(fused.device)
+            self.register_buffer("fused_qkv_channel", channel, False)
 
     def invalidate_qkv_input_weight(self):
         """Drop a fused view before a prepared weight reload or migration."""
         if "fused_wqa_wkv" in self._buffers:
             self._buffers.pop("fused_wqa_wkv")
+        self._buffers.pop("fused_qkv_channel", None)
         self._fused_qkv_weight = None
         self._fused_qkv_quantized = False
 
-    def _project_qkv_input(self, value, *, token_group=None):
+    def _project_qkv_input(self, value, *, token_group=None, prequant=None):
+        if prequant is not None and (self._fused_qkv_weight is None or "fused_qkv_channel" not in self._buffers):
+            raise ValueError("Prequantized QKV requires a prepared FP8 fused input weight")
         if self._fused_qkv_weight is None:
             if token_group is not None:
                 raise ValueError("Token-owned QKV requires a prepared replicated fused input weight")
             query = self.linear(value, self.weights.wq_a)
             kv = self.linear(value, self.weights.wkv)
             return query, kv
-        fused_value = quantize_activation(value) if self._fused_qkv_quantized else value
-        qkv = F.linear(fused_value, self._fused_qkv_weight)
+        if "fused_qkv_channel" in self._buffers:
+            qkv = (direct_dense_fp8(value, self._fused_qkv_weight, self.fused_qkv_channel) if prequant is None else
+                   direct_dense_fp8(value, self._fused_qkv_weight, self.fused_qkv_channel, prequant=prequant))
+        else:
+            fused_value = quantize_activation(value) if self._fused_qkv_quantized else value
+            qkv = F.linear(fused_value, self._fused_qkv_weight)
         if token_group is not None:
             from vllm_gaudi.ops.deepseek_v41_prefill_sequence_state import gather_tokens
             qkv = gather_tokens(qkv.contiguous(), group=token_group)

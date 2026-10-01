@@ -40,7 +40,6 @@ def test_native_readiness_requires_every_bucket_and_clears_warmup_state(monkeypa
     calls, validated = [], []
 
     class State:
-
         def clear(self):
             calls.append("clear")
 
@@ -108,10 +107,11 @@ def test_prefill_retires_completed_tail_packets_before_reuse(monkeypatch, count)
         events.append("retire")
 
     monkeypatch.setattr(torch.hpu, "synchronize", lambda: events.append("synchronize"))
-    request = SimpleNamespace(num_computed_tokens=0,
-                              tokens=list(range(count)),
-                              prompt=list(range(count)),
-                              decode_start=count)
+    request = SimpleNamespace(
+        num_computed_tokens=0, tokens=list(range(count)), prompt=list(range(count)), decode_start=count
+    )
+    request.output = []
+    request.token_slice = lambda start, stop: request.tokens[start:stop]
     runner = SimpleNamespace(
         round_timing_enabled=False,
         prefill_capacity=8192,
@@ -124,10 +124,12 @@ def test_prefill_retires_completed_tail_packets_before_reuse(monkeypatch, count)
         _forward=forward,
         _insert=lambda _aux, _positions: None,
         positions=list(range(count)),
-        pp=SimpleNamespace(generation=0,
-                           group=SimpleNamespace(is_last_rank=False),
-                           drain=lambda: events.append("drain"),
-                           complete_packet=complete_packet),
+        pp=SimpleNamespace(
+            generation=0,
+            group=SimpleNamespace(is_last_rank=False),
+            drain=lambda: events.append("drain"),
+            complete_packet=complete_packet,
+        ),
     )
     V41ModelRunner._execute_request(runner, SimpleNamespace(scheduled_spec_decode_tokens={}), "request", count)
     chunks = list(target_chunks(request.tokens))
@@ -163,17 +165,23 @@ def test_scheduler_transaction_uses_one_search_bucket_for_all_internal_tiles():
 
 def test_runtime_indexer_prewarms_and_reuses_one_bounded_2k_bucket():
     capacity = 1 << 20
-    assert list(decode_search_warmups(capacity, runtime_indexer=True)) == [(0, 512), (512, 2560), (2560, capacity)]
+    assert list(decode_search_warmups(capacity, runtime_indexer=True)) == [
+        (0, 512),
+        (512, 2560),
+        *[(start, 32768) for start in range(2560, 32768, 4096)],
+        (32768, capacity),
+    ]
     for start, count in ((0, 2052), (2051, 1), (2306, 254)):
         assert runtime_search_length(start, count, capacity) == 2560
-    assert runtime_search_length(2560, 1, capacity) == capacity
+    assert runtime_search_length(2560, 1, capacity) == 32768
+    assert runtime_search_length(32768, 1, capacity) == capacity
 
 
 def test_shared_prefill_geometry_does_not_change_decode_or_long_context_capacity():
     capacity = 1 << 20
     for start, count in ((2560, 128), (8192, 8192), (24576, 8192)):
         assert prefill_search_length(start, count, capacity, reuse_index_keys=True) == 32768
-        assert runtime_search_length(start, count, capacity) == capacity
+        assert runtime_search_length(start, count, capacity) == 32768
         assert prefill_search_length(start, count, capacity) == capacity
     assert prefill_search_length(32768, 128, capacity, reuse_index_keys=True) == capacity
     assert prefill_search_length(512, 128, capacity, reuse_index_keys=True) == 2560
@@ -191,12 +199,14 @@ def test_prefill_tail_is_exact_and_never_splits_into_dspark_c6():
         assert all(len(chunk) in set(PREFILL_COMPUTE_BUCKETS) | {1} for _, chunk in chunks)
         if count != 6:
             assert not (len(chunks) > 1 and any(len(chunk) == 6 for _, chunk in chunks))
-        assert all(offset == sum(len(previous) for _, previous in chunks[:index])
-                   for index, (offset, _) in enumerate(chunks))
+        assert all(
+            offset == sum(len(previous) for _, previous in chunks[:index]) for index, (offset, _) in enumerate(chunks)
+        )
 
 
 def test_tp4_16k_chunk_and_exact_tail_follow_scheduler_capacity(monkeypatch):
     from vllm_gaudi.ops.deepseek_v41_prefill_capacity import prefill_capacity
+
     monkeypatch.delenv("VLLM_HPU_DSV41_PREFILL_COMPUTE_TOKENS", raising=False)
     assert prefill_capacity(16384, 4) == 16384
     assert prefill_capacity(8192, 4) == 8192

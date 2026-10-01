@@ -14,7 +14,9 @@ void main(tensor product, tensor weight_scale, tensor activation_scale, tensor o
             at[0] += 64; sw[0] += 64;
             result.v2 = v_f32_ld_tnsr_b(at, product) * v_f32_ld_tnsr_b(sw, weight_scale) * sx;
             at[0] -= 64;
-            v_bf16_st_tnsr(at, output, convert_float128_to_bfloat128(result, SW_RHNE | SW_LINEAR));
+            const int remaining = get_dim_size(output, 0) - block * 128;
+            v_bf16_st_tnsr_partial(at, output, convert_float128_to_bfloat128(result, SW_RHNE | SW_LINEAR),
+                                  remaining < 128 ? remaining - 1 : 127, 0);
         }
     }
 }

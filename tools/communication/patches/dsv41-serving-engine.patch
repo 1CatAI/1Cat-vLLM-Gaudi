@@ -1,0 +1,519 @@
+--- a/vllm/config/profiler.py
++++ b/vllm/config/profiler.py
+@@ -95,6 +95,10 @@
+ 
+     torch_profiler_with_memory: bool = False
+     """If `True`, enables memory profiling in the torch profiler.
++    Disabled by default."""
++
++    torch_profiler_summary_only: bool = False
++    """If `True`, writes aggregated operator tables instead of a trace.
+     Disabled by default."""
+ 
+     capture_torch_profiler: bool = False
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -1526,9 +1526,16 @@
+                     )
+                 )
+ 
++                from vllm.platforms import current_platform
++
++                last_stage_draft = self.use_dspark_last_stage_drafter() and (
++                    current_platform.supports_v1_speculative_method("dspark", self)
++                )
+                 self.draft_parallel_config = (
+                     SpeculativeConfig.create_draft_parallel_config(
+-                        self.target_parallel_config, self.draft_tensor_parallel_size
++                        self.target_parallel_config,
++                        self.draft_tensor_parallel_size,
++                        pipeline_parallel_size=1 if last_stage_draft else None,
+                     )
+                 )
+ 
+@@ -1718,13 +1725,19 @@
+     def create_draft_parallel_config(
+         target_parallel_config: ParallelConfig,
+         speculative_draft_tensor_parallel_size: int,
++        *,
++        pipeline_parallel_size: int | None = None,
+     ) -> ParallelConfig:
+         """Create a parallel config for use by the draft worker.
+ 
+         This is mostly a copy of the target parallel config, except the tp_size.
+         """
+         draft_parallel_config = ParallelConfig(
+-            pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
++            pipeline_parallel_size=(
++                target_parallel_config.pipeline_parallel_size
++                if pipeline_parallel_size is None
++                else pipeline_parallel_size
++            ),
+             tensor_parallel_size=speculative_draft_tensor_parallel_size,
+             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
+             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
+@@ -1734,6 +1747,14 @@
+         )
+ 
+         return draft_parallel_config
++
++    def use_dspark_last_stage_drafter(self) -> bool:
++        # vLLM #53577: the draft runs wholly on the target's final PP stage.
++        return (
++            self.method == "dspark"
++            and self.target_parallel_config is not None
++            and self.target_parallel_config.pipeline_parallel_size > 1
++        )
+ 
+     @field_validator("attention_backend", mode="before")
+     @classmethod
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -575,6 +575,13 @@
+ 
+     @property
+     def max_concurrent_batches(self) -> int:
++        from vllm.platforms import current_platform
++
++        capacity = current_platform.get_max_concurrent_batches(self)
++        if capacity is not None:
++            if capacity < 1:
++                raise ValueError("Platform batch capacity must be positive")
++            return capacity
+         # PP requires PP-size concurrent batches to fill the pipeline.
+         # Async scheduling requires 2 concurrent batches to overlap.
+         pp_size = self.parallel_config.pipeline_parallel_size
+@@ -2656,9 +2663,13 @@
+         if self.parallel_config.prefill_context_parallel_size > 1:
+             unsupported.append("prefill context parallel")
+ 
+-        # DSpark is implemented only by the V2 GPU model runner.
++        # Device plugins can provide their own maintained V1 speculator.
+         if self.speculative_config:
+-            if self.speculative_config.method == "dspark":
++            from vllm.platforms import current_platform
++
++            if self.speculative_config.method == "dspark" and not (
++                current_platform.supports_v1_speculative_method("dspark", self)
++            ):
+                 unsupported.append("dspark speculative decoding")
+             if self.speculative_config.enable_adaptive_verification:
+                 unsupported.append("adaptive draft verification")
+@@ -2768,7 +2779,9 @@
+ 
+     def _validate_v2_model_runner(self) -> None:
+         """Check for features not yet supported by the V2 model runner."""
+-        if not HAS_TRITON:
++        from vllm.platforms import current_platform
++
++        if not HAS_TRITON and not current_platform.supports_v2_without_triton(self):
+             raise ValueError("Model Runner V2 requires Triton.")
+ 
+         unsupported = self._get_v2_model_runner_unsupported_features()
+--- a/vllm/model_executor/hw_agnostic/layers/activation.py
++++ b/vllm/model_executor/hw_agnostic/layers/activation.py
+@@ -4,6 +4,7 @@
+ import torch.nn.functional as F
+ 
+ from vllm.model_executor.hw_agnostic.custom_op import CustomOp
++from vllm.triton_utils import tl, triton
+ 
+ 
+ @CustomOp.register("silu_and_mul")
+@@ -15,13 +16,68 @@
+         return F.silu(x[..., :d]) * x[..., d:]
+ 
+ 
+-# Activation-and-mul ops keyed by HF activation name.
+-_ACTIVATION_AND_MUL_REGISTRY = {
+-    "silu": SiluAndMul,
+-    "swish": SiluAndMul,
+-}
++@CustomOp.register("silu_and_mul_with_clamp")
++class SiluAndMulWithClamp(CustomOp):
++    """SwiGLU with input clamping. ``d = x.shape[-1] // 2``;
++    ``out = silu(clamp(x[:d], max=L)) * clamp(x[d:], min=-L, max=L)``."""
++
++    def __init__(self, swiglu_limit: float):
++        super().__init__()
++        self.swiglu_limit = float(swiglu_limit)
++
++    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
++        d = x.shape[-1] // 2
++        gate = torch.clamp(x[..., :d], max=self.swiglu_limit)
++        up = torch.clamp(x[..., d:], min=-self.swiglu_limit, max=self.swiglu_limit)
++        return F.silu(gate) * up
+ 
+ 
+-def get_act_and_mul_fn(act_fn_name: str) -> CustomOp:
+-    """Build the hw-agnostic activation-and-mul op named `act_fn_name`."""
+-    return _ACTIVATION_AND_MUL_REGISTRY[act_fn_name.lower()]()
++@triton.jit
++def _swiglustep_and_mul_kernel(
++    o_ptr,
++    o_stride,
++    x_ptr,
++    x_stride,
++    limit: tl.constexpr,
++    d: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,
++) -> None:
++    i = tl.program_id(axis=0).to(tl.int64)
++    j = tl.program_id(axis=1)
++    o_row_ptr = o_ptr + o_stride * i
++    x_row_ptr = x_ptr + x_stride * i
++    offsets = j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
++    mask = offsets < d
++
++    gate = tl.load(x_row_ptr + offsets, mask=mask).to(tl.float32)
++    up = tl.load(x_row_ptr + offsets + d, mask=mask).to(tl.float32)
++
++    gate_silu = tl.sigmoid(gate) * gate
++    gate_clamped = tl.minimum(gate_silu, limit)
++    up_clamped = tl.minimum(tl.maximum(up, -limit), limit)
++
++    result = gate_clamped * up_clamped
++    result = result.to(x_ptr.dtype.element_ty)
++    tl.store(o_row_ptr + offsets, result, mask=mask)
++
++
++def swiglustep_and_mul_triton(
++    output: torch.Tensor, input: torch.Tensor, limit: float = 7.0
++):
++    b, n = input.shape
++    assert input.ndim == 2
++    assert n % 2 == 0
++    d = n // 2
++
++    def grid(meta):
++        return (b, triton.cdiv(d, meta["BLOCK_SIZE"]))
++
++    _swiglustep_and_mul_kernel[grid](
++        output,
++        output.stride(0),
++        input,
++        input.stride(0),
++        limit=limit,
++        d=d,
++        BLOCK_SIZE=1024,
++    )
+--- a/vllm/model_executor/hw_agnostic/layers/layernorm.py
++++ b/vllm/model_executor/hw_agnostic/layers/layernorm.py
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import torch
+ import torch.nn as nn
+-from torch import Tensor
++import torch.nn.functional as F
+ 
+ from vllm.model_executor.hw_agnostic.custom_op import CustomOp
+ 
+@@ -34,57 +34,43 @@
+         else:
+             self.register_buffer("weight", weight, persistent=False)
+ 
+-    def _rms_norm(
+-        self,
+-        x: Tensor,
+-        weight: Tensor | None,
+-        epsilon: float,
+-        variance_size: int | None = None,
+-    ) -> Tensor:
+-        """Weighted root-mean-square layer normalization"""
++    def _rms_norm(self, x: torch.Tensor) -> torch.Tensor:
+         orig_dtype = x.dtype
+-        x = x.to(torch.float32)
+-        x_var = x if variance_size is None else x[..., :variance_size]
+-        variance = x_var.pow(2).mean(dim=-1, keepdim=True)
+-        x = x * torch.rsqrt(variance + epsilon)
+-        if weight is not None:
+-            x = x.to(weight.dtype) * weight
+-        return x.to(orig_dtype)
+-
+-    def _fused_add_rms_norm(
+-        self,
+-        x: Tensor,
+-        x_residual: Tensor,
+-        weight: Tensor | None,
+-        epsilon: float,
+-        variance_size: int | None = None,
+-    ) -> tuple[Tensor, Tensor]:
+-        """Fused add and weighted root-mean-square layer normalization"""
+-        orig_dtype = x.dtype
+-        x = x.to(torch.float32)
+-        x = x + x_residual.to(torch.float32)
+-        x_residual = x.to(orig_dtype)
+-
+-        x_var = x if variance_size is None else x[..., :variance_size]
+-        variance = x_var.pow(2).mean(dim=-1, keepdim=True)
+-        x = x * torch.rsqrt(variance + epsilon)
+-        if weight is not None:
+-            x = x.to(weight.dtype) * weight
+-        return x.to(orig_dtype), x_residual
++        x_fp32 = x.to(torch.float32)
++        if self.variance_size_override is None:
++            variance = x_fp32.pow(2).mean(dim=-1, keepdim=True)
++        else:
++            head = x_fp32[..., : self.variance_size_override]
++            variance = head.pow(2).mean(dim=-1, keepdim=True)
++        x_fp32 = x_fp32 * torch.rsqrt(variance + self.variance_epsilon)
++        out = x_fp32.to(orig_dtype)
++        if self.has_weight:
++            out = out * self.weight
++        return out
+ 
+     def forward_native(
+         self,
+         x: torch.Tensor,
+         residual: torch.Tensor | None = None,
+     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+-        weight = self.weight if self.has_weight else None
+-        epsilon = self.variance_epsilon
+-        variance_size = self.variance_size_override
+-
+         if residual is None:
+-            return self._rms_norm(x, weight, epsilon, variance_size)
+-        else:
+-            return self._fused_add_rms_norm(x, residual, weight, epsilon, variance_size)
++            return self._rms_norm(x)
++        residual = residual + x.to(residual.dtype)
++        return self._rms_norm(residual), residual
+ 
+     def extra_repr(self) -> str:
+         return f"hidden_size={self.hidden_size}, eps={self.variance_epsilon}"
++
++
++class LayerNorm(nn.Module):
++    def __init__(self, dim: int, eps: float = 1e-6):
++        super().__init__()
++        self.dim = dim
++        self.eps = eps
++        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
++        self.bias = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return F.layer_norm(
++            x.float(), (self.dim,), self.weight, self.bias, self.eps
++        ).type_as(x)
+--- a/vllm/models/deepseek_v4/__init__.py
++++ b/vllm/models/deepseek_v4/__init__.py
+@@ -1,20 +1,32 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""DeepSeek V4 model — hardware-isolated entry point.
++"""DeepSeek V4 model — entry point.
+ 
+-The actual implementation lives under ``nvidia/`` and ``amd/``; this module
+-picks the right one for the current platform and re-exports the public
+-classes used by the model registry and quantization config lookup.
++The actual implementation lives under ``nvidia/``, ``amd/``, etc. ;
++this module picks the right one for the current platform and
++re-exports the public classes used by the model registry and
++quantization config lookup.
+ """
++
++from pathlib import Path
+ 
+ from vllm.platforms import current_platform
+ 
+-from .quant_config import DeepseekV4FP8Config
++_has_hw_agnostic = (Path(__file__).parent / "hw_agnostic").is_dir()
++
++if current_platform.is_out_of_tree() and _has_hw_agnostic:
++    from .hw_agnostic.quantization.quant_config import DeepseekV4FP8Config
++else:
++    from .quant_config import DeepseekV4FP8Config  # type: ignore[assignment]
+ 
+ # Pick the per-platform implementation. The NVIDIA branch is the static
+ # default that mypy sees; the ROCm/XPU branches override at runtime and are
+ # kept type-compatible via ``# type: ignore[assignment]``.
+-if current_platform.is_rocm():
++if current_platform.is_out_of_tree():
++    if _has_hw_agnostic:
++        from .hw_agnostic.model import DeepseekV4ForCausalLM  # type: ignore[assignment]
++        from .hw_agnostic.mtp import DeepSeekV4MTP  # type: ignore[assignment]
++elif current_platform.is_rocm():
+     from .amd.dspark import (  # type: ignore[assignment]
+         DSparkDeepseekV4ForCausalLM,
+     )
+--- a/vllm/models/deepseek_v4_1/__init__.py
++++ b/vllm/models/deepseek_v4_1/__init__.py
+@@ -6,7 +6,11 @@
+ 
+ from .quant_config import DeepseekV4FP8Config
+ 
+-if current_platform.is_rocm():
++if current_platform.is_out_of_tree():
++    # Import common config/processor utilities without eagerly loading a
++    # CUDA backend. The hardware plugin owns its model registration.
++    pass
++elif current_platform.is_rocm():
+     from .amd.dspark import DSparkDeepseekV4ForCausalLM
+     from .amd.vl_model import DeepseekV41ForCausalLM
+ else:
+--- a/vllm/platforms/interface.py
++++ b/vllm/platforms/interface.py
+@@ -132,6 +132,21 @@
+ 
+ 
+ class Platform:
++    @classmethod
++    def supports_v1_speculative_method(cls, method: str, vllm_config) -> bool:
++        """Whether an out-of-tree V1 runner implements a V2-only method."""
++        return False
++
++    @classmethod
++    def get_max_concurrent_batches(cls, vllm_config) -> int | None:
++        """Override in-flight batch capacity for a platform-owned runner."""
++        return None
++
++    @classmethod
++    def supports_v2_without_triton(cls, vllm_config) -> bool:
++        """Whether this configuration uses a native non-Triton V2 adapter."""
++        return False
++
+     _enum: PlatformEnum
+     device_name: str
+     device_type: str
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -190,6 +190,7 @@
+         except RuntimeError:
+             pass
+ 
++        self.profiler = None
+         if (
+             vllm_config.profiler_config.profiler == "torch"
+             and not vllm_config.profiler_config.ignore_frontend
+@@ -271,12 +272,12 @@
+         if renderer := getattr(self, "renderer", None):
+             renderer.shutdown()
+ 
+-        if engine_core := getattr(self, "engine_core", None):
+-            engine_core.shutdown(timeout=timeout)
+-
+         handler = getattr(self, "output_handler", None)
+         if handler is not None:
+             cancel_task_threadsafe(handler)
++
++        if engine_core := getattr(self, "engine_core", None):
++            engine_core.shutdown(timeout=timeout)
+ 
+     def get_num_unfinished_requests(self) -> int:
+         return self.output_processor.get_num_unfinished_requests()
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -605,6 +605,19 @@
+         Overridden by the DP engine core; never throttles otherwise."""
+         return False
+ 
++    def _record_execution_round_consumption(self, model_output):
++        rounds = getattr(model_output, "execution_rounds", None)
++        if not rounds:
++            return
++        consumed_ns = time.perf_counter_ns()
++        records = getattr(self, "_execution_round_records", None)
++        if records is None:
++            records = self._execution_round_records = []
++        if len(records) + len(rounds) > 65536:
++            raise RuntimeError("Execution round timing capacity exceeded")
++        records.extend({"request_id": req, "generation": generation, "target_count": count,
++                        "scheduler_consumed_ns": consumed_ns} for req, generation, count in rounds)
++
+     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
+         """Schedule, execute, and make output.
+ 
+@@ -633,6 +646,7 @@
+         engine_core_outputs = self.scheduler.update_from_output(
+             scheduler_output, model_output
+         )
++        self._record_execution_round_consumption(model_output)
+         self._attach_iteration_details(engine_core_outputs, iteration_details)
+ 
+         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+@@ -735,6 +749,7 @@
+         engine_core_outputs = self.scheduler.update_from_output(
+             scheduler_output, model_output
+         )
++        self._record_execution_round_consumption(model_output)
+         self._attach_iteration_details(engine_core_outputs, iteration_details)
+ 
+         # NOTE(nick): We can either handle the deferred tasks here or save
+@@ -772,8 +787,24 @@
+             # More efficient to abort all as a single batch.
+             self.abort_requests(request_ids)
+ 
++    def _flush_execution_round_timing(self):
++        if getattr(self, "_execution_round_records", None):
++            import json
++            from pathlib import Path
++            directory = os.environ.get("DSV41_RUN_EVIDENCE")
++            if not directory:
++                raise RuntimeError("Execution round timing requires its evidence directory")
++            output = Path(directory) / "round-timing"
++            output.mkdir(exist_ok=True)
++            destination = output / f"engine-{os.getpid()}.json"
++            temporary = destination.with_suffix(".json.tmp")
++            temporary.write_text(
++                json.dumps({"clock": "perf_counter_ns", "records": self._execution_round_records}) + "\n")
++            temporary.replace(destination)
++
+     def shutdown(self):
+         logger.debug_once("[shutdown] EngineCore: tearing down local resources")
++        self._flush_execution_round_timing()
+         self.structured_output_manager.clear_backend()
+         if self.model_executor:
+             self.model_executor.shutdown()
+@@ -791,6 +822,9 @@
+         logger.debug_once("[shutdown] EngineCore: local resource teardown complete")
+ 
+     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
++        # A profiler export failure must not erase completed, unprofiled
++        # scheduler consumption records. This runs at the API boundary only.
++        self._flush_execution_round_timing()
+         self.model_executor.profile(is_start, profile_prefix)
+ 
+     def reset_mm_cache(self):
+--- a/vllm/v1/outputs.py
++++ b/vllm/v1/outputs.py
+@@ -369,6 +369,10 @@
+     # ``None`` when ``return_sampling_mask`` is off.
+     sampling_masks: SamplingMaskLists | None = None
+ 
++    # Optional host-only correlation keys (request, generation, target count).
++    # The worker retains timestamps; EngineCore records final consumption.
++    execution_rounds: list[tuple[str, int, int]] | None = None
++
+     @staticmethod
+     def with_kv_conn_output_only(
+         kv_connector_output: KVConnectorOutput | None,
+--- a/vllm/v1/utils.py
++++ b/vllm/v1/utils.py
+@@ -123,7 +123,13 @@
+             self.cpu = torch.zeros(
+                 *size, dtype=dtype, device="cpu", pin_memory=pin_memory
+             )
+-            self.gpu = torch.zeros_like(self.cpu, device=device)
++            target_device = torch.device(device)
++            if target_device.type == "hpu":
++                # The CPU mirror already contains the required zero values.
++                # Copy it instead of compiling a separate HPU zero-fill graph.
++                self.gpu = self.cpu.to(device=target_device, non_blocking=True)
++            else:
++                self.gpu = torch.zeros_like(self.cpu, device=target_device)
+         self.np: np.ndarray
+         # To keep type hints simple (avoiding generics and subclasses), we
+         # only conditionally create the numpy array attribute. This can cause
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -659,6 +659,10 @@
+             continue
+         kv_cache = layer.kv_cache
+         layer.kv_cache = torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
++        if hasattr(layer, "kv_cache_storage"):
++            layer.kv_cache_storage = torch.tensor([], dtype=torch.uint8)
++        if hasattr(layer, "kv_cache_geometry"):
++            layer.kv_cache_geometry = torch.tensor([], dtype=torch.int32)
+         # Clean up quantized KV cache scale views
+         # (int8_per_token_head, fp8_per_token_head)
+         if hasattr(layer, "impl"):

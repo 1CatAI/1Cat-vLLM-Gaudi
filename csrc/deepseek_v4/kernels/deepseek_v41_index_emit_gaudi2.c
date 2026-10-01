@@ -26,28 +26,45 @@ void main(tensor scores,tensor positions,tensor candidates,tensor metadata,tenso
         valid_count=(valid_count+7)/8;
         partition_count=(partition_count+7)/8;
     }
-    const unsigned threshold=s_u32_ld_g(gen_addr((int5){0,request},metadata));
+    const int word_capacity=(get_dim_size(scores,0)+127)/128*4;
     const int total_greater=s_i32_ld_g(gen_addr((int5){1,request},metadata));
     const int equal_budget=width-total_greater;
     for(int worker=begin[0];worker<end[0];++worker) {
         int greater=s_i32_ld_g(gen_addr((int5){2+worker*2,request},metadata));
         int equal=s_i32_ld_g(gen_addr((int5){3+worker*2,request},metadata));
         int written=greater+(equal<equal_budget?equal:equal_budget);
+        int buffered=0;
+        int64 rows=0;
         const int first=partition_count*worker/24,last=partition_count*(worker+1)/24;
         const int scan_last=last<valid_count?last:valid_count;
-        for(int offset=first;offset<scan_last;++offset) {
-            const float score=s_f32_ld_g(gen_addr((int5){offset,request},scores));
-            const unsigned bits=*((unsigned*)&score)>>16;
-            const unsigned key=bits>32767 ? (~bits)&65535 : bits^32768;
-            if(bits==0xff80)continue;
-            const bool keep=key>threshold || (key==threshold && equal++<equal_budget);
-            if(keep && written<width) {
+        for(int word=first/32;word*32<scan_last;++word) {
+            unsigned greater_bits=s_u32_ld_g(gen_addr((int5){50+word,request},metadata));
+            unsigned equal_bits=s_u32_ld_g(gen_addr((int5){50+word_capacity+word,request},metadata));
+            unsigned active=0xffffffff;
+            if(word==first/32)active<<=first%32;
+            if((word+1)*32>scan_last)active&=0xffffffffu>>(32-scan_last%32);
+            unsigned keep=greater_bits&active;
+            equal_bits&=active;
+            while(equal_bits && equal<equal_budget) {
+                keep|=equal_bits & -equal_bits;
+                equal_bits&=equal_bits-1;
+                ++equal;
+            }
+            while(keep && written<width) {
+                const int offset=word*32+s_u32_find_first(keep,SW_FIND_ONE|SW_LSB);
                 int logical=offset;
                 if(reindex && !blocks_mode)logical=s_i32_ld_g(gen_addr((int5){offset/8,request},candidates))*8+offset%8;
-                s_i32_st_g(gen_addr((int5){written++,request},output),logical);
+                rows=v_i32_mov_vb(logical,0,rows,v_i32_cmp_eq_b(lanes,buffered),0);
+                ++written;
+                if(++buffered==64) {
+                    v_i32_st_tnsr((int5){written-64,request},output,rows);
+                    buffered=0;
+                }
+                keep&=keep-1;
             }
         }
-        if(worker==23)for(;written<width;++written)s_i32_st_g(gen_addr((int5){written,request},output),-1);
+        if(buffered)v_i32_st_tnsr_partial((int5){written-buffered,request},output,rows,buffered-1,0);
+        if(worker==23)for(;written<width;written+=64)v_i32_st_tnsr((int5){written,request},output,(int64)-1);
     }
     }
 }

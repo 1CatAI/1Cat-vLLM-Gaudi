@@ -30,6 +30,18 @@ int main() {
   overwritten = nodes; overwritten[2].outputs.push_back(peer); rejects(overwritten);
   auto missing = nodes; missing.resize(3); rejects(missing);
   auto same = nodes; same[1].outputs[0] = x; rejects(same);
+  for (uint32_t ranks : {2, 4}) {
+    auto gather = nodes;
+    gather[1].outputCopies = ranks;
+    gather[1].outputs[0].bytes = x.bytes * ranks;
+    gather[3].inputs[1] = {peer.address + x.bytes * (ranks - 1), x.bytes};
+    const auto wide = prepareNativeDependencies(gather);
+    assert(wide.size() == 1 && wide[0].producer == 0 && wide[0].consumer == 2);
+    assert(wide[0].output.bytes == x.bytes * ranks);
+    auto wrong = gather; wrong[1].outputs[0].bytes -= 1; rejects(wrong);
+    auto overwrite = gather; overwrite[2].outputs.push_back(gather[3].inputs[1]); rejects(overwrite);
+    wrong = gather; wrong[1].outputCopies = 0; rejects(wrong);
+  }
   NativeBufferRange token{1000, 4}, embed{1100, 32}, embedPeer{1200, 32}, attention{1300, 32};
   NativeBufferRange attentionPeer{1400, 32}, mhc{1500, 32}, late{1600, 64}, ffn{1700, 32};
   NativeBufferRange unpacked{1800, 32}, ffnPeer{1900, 32}, engramPeer{2000, 32};

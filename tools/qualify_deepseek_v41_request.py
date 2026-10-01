@@ -12,6 +12,7 @@ import time
 
 import requests
 
+
 METRICS = ("request_prefill_time_seconds", "request_decode_time_seconds", "request_queue_time_seconds",
            "request_inference_time_seconds", "time_to_first_token_seconds", "e2e_request_latency_seconds")
 
@@ -30,7 +31,8 @@ def streaming_intervals(events):
     """Only individual token arrivals establish client inter-token latency."""
     if len(events) < 2 or any(event["count"] != 1 for event in events):
         return {"valid": False, "reason": "coalesced token chunks or fewer than two arrivals"}
-    values = [(right["arrival_s"] - left["arrival_s"]) * 1000 for left, right in zip(events, events[1:])]
+    values = [(right["arrival_s"] - left["arrival_s"]) * 1000
+              for left, right in zip(events, events[1:])]
 
     def summarize(samples):
         ordered = sorted(samples)
@@ -41,18 +43,12 @@ def streaming_intervals(events):
             high = min(low + 1, len(ordered) - 1)
             return ordered[low] + (ordered[high] - ordered[low]) * (at - low)
 
-        return dict(count=len(samples),
-                    mean_ms=statistics.mean(samples),
-                    p50_ms=quantile(.5),
-                    p95_ms=quantile(.95),
-                    p99_ms=quantile(.99))
+        return dict(count=len(samples), mean_ms=statistics.mean(samples), p50_ms=quantile(.5),
+                    p95_ms=quantile(.95), p99_ms=quantile(.99))
 
-    return {
-        "valid": True,
-        "all": summarize(values),
-        "after_first_10_intervals": summarize(values[10:]) if len(values) > 10 else None,
-        "samples_ms": values
-    }
+    return {"valid": True, "all": summarize(values),
+            "after_first_10_intervals": summarize(values[10:]) if len(values) > 10 else None,
+            "samples_ms": values}
 
 
 def main():
@@ -60,16 +56,14 @@ def main():
     parser.add_argument("request", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--url", default="http://127.0.0.1:18444")
+    parser.add_argument("--api-key-file", type=Path, help="Authenticate without putting a key on the command line")
     parser.add_argument("--profile", choices=("prefill", "decode"))
     parser.add_argument("--decode-trace-tokens", type=int, default=128)
-    parser.add_argument("--decode-trace-skip-tokens",
-                        type=int,
-                        default=0,
+    parser.add_argument("--decode-trace-skip-tokens", type=int, default=0,
                         help="Let initial decode compilation finish before opening the requested capture")
     parser.add_argument("--expected-prompt-tokens", type=int, default=16384)
     parser.add_argument("--eos-token-id", type=int, default=1)
-    parser.add_argument("--prefill-only",
-                        action="store_true",
+    parser.add_argument("--prefill-only", action="store_true",
                         help="Measure a max_tokens=1 request; does not qualify natural EOS or semantics")
     args = parser.parse_args()
     body = json.loads(args.request.read_text())
@@ -82,11 +76,13 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     (args.output / "request.json").write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n")
     session = requests.Session()
+    if args.api_key_file:
+        session.headers["Authorization"] = "Bearer " + args.api_key_file.read_text().strip()
     profile_records = []
 
     def profile(action):
         stamp = {"action": action, "start_ns": time.time_ns()}
-        response = requests.post(args.url + "/" + action + "_profile", timeout=(10, 1800))
+        response = session.post(args.url + "/" + action + "_profile", timeout=(10, 1800))
         response.raise_for_status()
         stamp.update(end_ns=time.time_ns(), status=response.status_code)
         profile_records.append(stamp)
@@ -101,18 +97,14 @@ def main():
     before = metrics("before")
     if args.profile == "prefill":
         profile("start")
-    report = {
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "status": "running",
-        "qualification": "prefill_only" if args.prefill_only else "natural_eos",
-        "profile": args.profile,
-        "request_sha256": hashlib.sha256(args.request.read_bytes()).hexdigest(),
-        "client_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        "stream_chunk_size": 65536,
-        "decode_trace_skip_tokens": args.decode_trace_skip_tokens,
-        "decode_trace_tokens": args.decode_trace_tokens,
-        "timer": "engine histograms are scheduling-to-first-token and first-to-last-token; SSE is client arrival"
-    }
+    report = {"started_at": datetime.now(timezone.utc).isoformat(), "status": "running",
+              "qualification": "prefill_only" if args.prefill_only else "natural_eos",
+              "profile": args.profile, "request_sha256": hashlib.sha256(args.request.read_bytes()).hexdigest(),
+              "client_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+              "stream_chunk_size": 65536,
+              "decode_trace_skip_tokens": args.decode_trace_skip_tokens,
+              "decode_trace_tokens": args.decode_trace_tokens,
+              "timer": "engine histograms are scheduling-to-first-token and first-to-last-token; SSE is client arrival"}
     events, ids, content, reasoning, usage = [], [], [], [], None
     returned_prompt = None
     finish_reason = stop_reason = error = None
@@ -167,8 +159,9 @@ def main():
                             pending = controller.submit(profile, "start")
                             jobs.append(pending)
                             start_submitted = True
-                        stop_now = (args.profile == "prefill" or args.profile == "decode"
-                                    and len(ids) >= args.decode_trace_skip_tokens + args.decode_trace_tokens + 1)
+                        stop_now = (args.profile == "prefill" or
+                                    args.profile == "decode" and
+                                    len(ids) >= args.decode_trace_skip_tokens + args.decode_trace_tokens + 1)
                         if args.profile and stop_now and not stop_submitted:
                             # One controller preserves start-before-stop order;
                             # streaming continues during profiler export.
@@ -187,8 +180,7 @@ def main():
         # Engine statistics export periodically. Wait for this B1 request's
         # completion sample, without sending any additional generation.
         deadline = time.monotonic() + 30
-        key = ("vllm:request_prefill_time_seconds_count"
-               if args.prefill_only else "vllm:request_decode_time_seconds_count")
+        key = "vllm:request_decode_time_seconds_count"
         while after.get(key, 0) - before.get(key, 0) < 1 and time.monotonic() < deadline:
             time.sleep(1)
             after = metrics("after")
@@ -196,21 +188,13 @@ def main():
         for name in METRICS:
             prefix = "vllm:" + name
             count = after.get(prefix + "_count", 0) - before.get(prefix + "_count", 0)
-            durations[name] = {
-                "samples": count,
-                "seconds": after.get(prefix + "_sum", 0) - before.get(prefix + "_sum", 0)
-            }
-        report.update(usage=usage,
-                      finish_reason=finish_reason,
-                      stop_reason=stop_reason,
-                      tokens=len(ids),
-                      client_ttft_s=first_token_s,
-                      client_last_token_s=last_token_s,
-                      client_first_content_s=first_content_s,
-                      client_total_s=response_end_s,
+            durations[name] = {"samples": count,
+                               "seconds": after.get(prefix + "_sum", 0) - before.get(prefix + "_sum", 0)}
+        report.update(usage=usage, finish_reason=finish_reason, stop_reason=stop_reason, tokens=len(ids),
+                      client_ttft_s=first_token_s, client_last_token_s=last_token_s,
+                      client_first_content_s=first_content_s, client_total_s=response_end_s,
                       client_inter_token_latency=streaming_intervals(events),
-                      engine=durations,
-                      request_start_ns=start_ns)
+                      engine=durations, request_start_ns=start_ns)
         assert saw_done, "stream ended without the completion sentinel"
         prompt_count = usage["prompt_tokens"] if usage else len(returned_prompt or [])
         assert prompt_count == args.expected_prompt_tokens, ("prompt length", prompt_count)
@@ -218,8 +202,8 @@ def main():
         assert not cached, ("prefix reuse invalidates the prefill timing", cached)
         expected_ids_path = args.request.with_name(args.request.name.replace(".request.json", ".token_ids.json"))
         if expected_ids_path != args.request and expected_ids_path.exists() and returned_prompt is not None:
-            assert returned_prompt == json.loads(
-                expected_ids_path.read_text()), "server prompt IDs differ from frozen input"
+            assert returned_prompt == json.loads(expected_ids_path.read_text()), (
+                "server prompt IDs differ from frozen input")
 
         assert usage and usage["completion_tokens"] == len(ids), ("token accounting", usage, len(ids))
         if args.prefill_only:
@@ -245,12 +229,8 @@ def main():
                       status="passed")
     except BaseException as exc:
         error = exc
-        report.update(status="failed",
-                      error=repr(exc),
-                      finish_reason=finish_reason,
-                      stop_reason=stop_reason,
-                      usage=usage,
-                      tokens=len(ids))
+        report.update(status="failed", error=repr(exc), finish_reason=finish_reason, stop_reason=stop_reason,
+                      usage=usage, tokens=len(ids))
     finally:
         if args.profile and start_submitted and not stop_submitted:
             try:

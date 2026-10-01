@@ -45,7 +45,8 @@ def test_output_region_does_not_replace_decode_or_small_tail(monkeypatch, tokens
                             project_output=lambda x: x,
                             project_output_consumer=lambda x: x,
                             reduce=lambda x, ready_outputs: (seen.append(ready_outputs), result)[1],
-                            _finish_projected_output=lambda x, ready: (seen.append(ready), result)[1])
+                            _finish_projected_output=lambda x, ready: (seen.append(ready), result)[1],
+                            _reduce_prefill_output=lambda x, ready, sequence: (seen.append(ready), result)[1])
     value = torch.zeros(tokens, 32, 512, dtype=torch.bfloat16)
     ready = (torch.ones(1), )
     observed = PagedCSA2Attention._finish_output(owner,

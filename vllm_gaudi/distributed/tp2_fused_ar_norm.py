@@ -19,6 +19,7 @@ from vllm_gaudi.extension.kernels import rms_norm
 from vllm_gaudi.extension.runtime import get_config
 
 _RUNTIME_ATTR = "_vllm_gaudi_tp2_fused_ar_norm_runtime"
+_TP4_RUNTIME_ATTR = "_vllm_gaudi_tp4_allreduce_runtime"
 _PP_RUNTIME_ATTR = "_vllm_gaudi_pp_direct_exchange_runtime"
 _BRIDGE_MODULE = "tp2_fused_ar_norm_bridge"
 _DIRECT_ALGORITHM_ENV = "VLLM_HPU_TP2_FUSED_AR_NORM_DIRECT_ALGORITHM"
@@ -37,11 +38,35 @@ _library.define("tp2_allreduce_residual_rms_norm_out(Tensor partial, Tensor resi
                 "Tensor(c!) residual_out, Tensor(d!) inverse_rms, float epsilon) -> ()")
 _library.define("tp2_exchange_peer(Tensor partial) -> Tensor")
 _library.define("tp2_exchange_peer_scheduled(Tensor partial, Tensor[] ready_outputs) -> Tensor")
+_library.define("tp_peer_allgather(Tensor partial, int tp_size) -> Tensor")
+_library.define("tp_peer_allgather_scheduled(Tensor partial, int tp_size, Tensor[] ready_outputs) -> Tensor")
 _library.define("pp_exchange_peer(Tensor partial, Tensor(a!) peer) -> Tensor(a!)")
 # Functional variant owns its output and neither aliases nor mutates inputs.
 # The eager entry above retains the caller-owned in-place wire contract.
 _library.define("pp_exchange_peer_graph(Tensor partial) -> Tensor")
 _library.define("tp2_allreduce_plain(Tensor partial) -> Tensor")
+_library.define("tp4_allreduce_plain(Tensor partial) -> Tensor")
+_library.define("tp4_allgather_plain(Tensor partial) -> Tensor")
+
+
+def initialize_tp4_allreduce_runtime():
+    """Bind the existing queued adapter to a verified four-rank communicator."""
+    if getattr(torch, _TP4_RUNTIME_ATTR, None) is not None:
+        return
+    group = get_tp_group().device_group
+    if dist.get_world_size(group) != 4:
+        raise RuntimeError("TP4 native AllReduce requires a four-rank tensor group")
+    path = Path(os.environ["VLLM_HPU_TP2_FUSED_AR_NORM_BRIDGE"]).resolve()
+    bridge = _load_bridge(path)
+    _verify_prepared_runtime(path)
+    if not hasattr(bridge, "tp4_allreduce_current_stream"):
+        raise RuntimeError("Rebuild the queued adapter with the TP4 AllReduce entry")
+    probe = torch.ones(128, dtype=torch.bfloat16, device="hpu")
+    dist.all_reduce(probe, group=group)
+    if not torch.equal(probe.cpu(), torch.full((128,), 4, dtype=torch.bfloat16)):
+        raise RuntimeError("TP4 native communicator initialization failed")
+    backend = group._get_backend(torch.device("hpu"))
+    setattr(torch, _TP4_RUNTIME_ATTR, (bridge, backend, bridge.communicator_id(backend)))
 
 
 def _exceeds_fused_decode_token_limit(partial: torch.Tensor, weight: torch.Tensor) -> bool:
@@ -102,9 +127,9 @@ def initialize_tp2_fused_ar_norm_runtime() -> None:
     tp_size = dist.get_world_size(group=tp_group)
     v41 = os.environ.get("VLLM_HPU_DSV41_GRAPH_REPLAY") == "1"
     from vllm.distributed import get_pp_group
-    v41_world = v41 and dist.get_world_size() == 4 and get_pp_group().world_size == 2
-    if tp_size != 2 or (dist.get_world_size() != 2 and not v41_world):
-        raise RuntimeError("TP2 fused all-reduce currently requires a two-rank, TP-only process world")
+    v41_world = v41 and dist.get_world_size() == tp_size * get_pp_group().world_size
+    if tp_size < 2 or (not v41_world and (tp_size != 2 or dist.get_world_size() != 2)):
+        raise RuntimeError("Native exchange requires a V4.1 TP group or a two-rank TP-only world")
     direct_algorithm = os.environ.get(_DIRECT_ALGORITHM_ENV, "hccl").strip().lower()
     if direct_algorithm not in ("hccl", "tp2-exchange"):
         raise RuntimeError(f"{_DIRECT_ALGORITHM_ENV} must be 'hccl' or 'tp2-exchange'")
@@ -116,7 +141,7 @@ def initialize_tp2_fused_ar_norm_runtime() -> None:
         "PT_HPU_EAGER_PIPELINE_ENABLE": "1",
         "PT_HPU_EAGER_COLLECTIVE_PIPELINE_ENABLE": "1",
     }
-    if direct_algorithm == "tp2-exchange":
+    if direct_algorithm == "tp2-exchange" and tp_size == 2:
         # The legacy TP2 tensors fit the original 163840-element ceiling.
         # V4.1's single C6 PP wire is 122976 BF16 elements, so only that
         # explicitly opted-in PP path raises the HCL limit.  Do not change
@@ -146,7 +171,7 @@ def initialize_tp2_fused_ar_norm_runtime() -> None:
     if invalid:
         raise RuntimeError("TP2 fused all-reduce requires eager current-stream execution: " + ", ".join(invalid))
 
-    if direct_algorithm == "tp2-exchange":
+    if direct_algorithm == "tp2-exchange" and tp_size == 2:
         expected_hcl_value = os.environ.get("VLLM_HPU_TP2_EXPECT_HCL_LIBRARY")
         if not expected_hcl_value:
             raise RuntimeError("VLLM_HPU_TP2_EXPECT_HCL_LIBRARY is required for TP2 exchange")
@@ -173,7 +198,7 @@ def initialize_tp2_fused_ar_norm_runtime() -> None:
     log.info("TP2 prepared runtime: initializing communicator")
     dist.all_reduce(probe, group=tp_group)
     torch.hpu.synchronize()
-    if not torch.equal(probe.cpu(), torch.full((128, ), 2, dtype=torch.bfloat16, device="cpu")):
+    if not torch.equal(probe.cpu(), torch.full((128, ), tp_size, dtype=torch.bfloat16, device="cpu")):
         raise RuntimeError("TP2 HCCL process-group initialization failed")
 
     log.info("TP2 prepared runtime: loading native adapter")
@@ -182,9 +207,12 @@ def initialize_tp2_fused_ar_norm_runtime() -> None:
     backend = tp_group._get_backend(torch.device("hpu"))
     communicator_id = bridge.communicator_id(backend)
     setattr(torch, _RUNTIME_ATTR, (bridge, backend, communicator_id))
+    if tp_size > 2:
+        # Retain the old queued-op aliases for diagnostic/reference programs.
+        setattr(torch, _TP4_RUNTIME_ATTR, (bridge, backend, communicator_id))
     from vllm_gaudi import envs
 
-    if envs.VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE:
+    if envs.VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE and get_pp_group().world_size > 1:
         pp_group = get_pp_group().device_group
         if not v41_world or dist.get_world_size(group=pp_group) != 2:
             raise RuntimeError("V4.1 PP direct exchange requires TP2×PP2")
@@ -521,6 +549,35 @@ _library.impl("tp2_exchange_peer_scheduled", _tp2_exchange_peer_scheduled_impl, 
 _library._register_fake("tp2_exchange_peer_scheduled", _tp2_exchange_peer_scheduled_fake)
 
 
+def _tp_peer_allgather_fake(partial, tp_size):
+    return torch.empty((1, partial.numel() * tp_size), dtype=partial.dtype, device=partial.device)
+
+
+def _tp_peer_allgather_impl(partial, tp_size):
+    bridge, backend, _ = _resolve_runtime()
+    if (partial.ndim != 2 or partial.shape[0] != 1 or not 0 < partial.numel() <= 32768
+            or partial.dtype != torch.bfloat16 or not partial.is_contiguous()
+            or backend.size() != tp_size):
+        raise RuntimeError("Peer exchange requires a bounded BF16 row and the bound TP group size")
+    return bridge.tp_peer_allgather_current_stream(backend, partial, _tp_peer_allgather_fake(partial, tp_size))
+
+
+def _tp_peer_allgather_scheduled_impl(partial, tp_size, ready_outputs):
+    del ready_outputs
+    return _tp_peer_allgather_impl(partial, tp_size)
+
+
+def _tp_peer_allgather_scheduled_fake(partial, tp_size, ready_outputs):
+    del ready_outputs
+    return _tp_peer_allgather_fake(partial, tp_size)
+
+
+_library.impl("tp_peer_allgather", _tp_peer_allgather_impl, dispatch_key="HPU")
+_library._register_fake("tp_peer_allgather", _tp_peer_allgather_fake)
+_library.impl("tp_peer_allgather_scheduled", _tp_peer_allgather_scheduled_impl, dispatch_key="HPU")
+_library._register_fake("tp_peer_allgather_scheduled", _tp_peer_allgather_scheduled_fake)
+
+
 def _pp_exchange_peer_impl(partial: torch.Tensor, peer: torch.Tensor) -> torch.Tensor:
     """Exchange a fixed BF16 PP payload on the PP communicator's stream.
 
@@ -576,6 +633,42 @@ def _tp2_allreduce_plain_impl(partial: torch.Tensor) -> torch.Tensor:
 
 _library.impl("tp2_allreduce_plain", _tp2_allreduce_plain_impl, dispatch_key="HPU")
 _library._register_fake("tp2_allreduce_plain", _tp2_exchange_peer_fake)
+
+
+def _tp4_allreduce_plain_impl(partial: torch.Tensor) -> torch.Tensor:
+    runtime = getattr(torch, _TP4_RUNTIME_ATTR, None)
+    if runtime is None:
+        raise RuntimeError("Initialize the TP4 queued adapter before compiling its consumer")
+    if (partial.ndim != 2 or not (partial.shape[0] == 1 and 0 < partial.numel() <= 32768
+                                 and partial.numel() % 4 == 0
+                                 or partial.shape[1] == 5120 and 1 <= partial.shape[0] <= 6)
+            or partial.dtype != torch.bfloat16 or not partial.is_contiguous()):
+        raise RuntimeError("TP4 native AllReduce requires contiguous BF16 [C1..C6, 5120]")
+    bridge, backend, _ = runtime
+    return bridge.tp4_allreduce_current_stream(backend, partial, torch.empty_like(partial))
+
+
+_library.impl("tp4_allreduce_plain", _tp4_allreduce_plain_impl, dispatch_key="HPU")
+_library._register_fake("tp4_allreduce_plain", _tp2_exchange_peer_fake)
+
+
+def _tp4_allgather_plain_fake(partial):
+    return torch.empty((1, partial.numel() * 4), dtype=partial.dtype, device=partial.device)
+
+
+def _tp4_allgather_plain_impl(partial):
+    runtime = getattr(torch, _TP4_RUNTIME_ATTR, None)
+    if runtime is None or not hasattr(runtime[0], "tp4_allgather_current_stream"):
+        raise RuntimeError("Initialize the TP4 native collective adapter before compiling AllGather")
+    if (partial.ndim != 2 or partial.shape[0] != 1 or not 0 < partial.numel() <= 32768
+            or partial.dtype != torch.bfloat16 or not partial.is_contiguous()):
+        raise RuntimeError("TP4 AllGather requires a bounded contiguous BF16 row")
+    bridge, backend, _ = runtime
+    return bridge.tp4_allgather_current_stream(backend, partial, _tp4_allgather_plain_fake(partial))
+
+
+_library.impl("tp4_allgather_plain", _tp4_allgather_plain_impl, dispatch_key="HPU")
+_library._register_fake("tp4_allgather_plain", _tp4_allgather_plain_fake)
 
 
 def _tp2_exchange_residual_rms_norm(

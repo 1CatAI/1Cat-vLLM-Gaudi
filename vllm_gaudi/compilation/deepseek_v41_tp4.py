@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Keep literal scalar recipe inputs resident in the TP4 compiled decoder."""
+
+from itertools import count
+import json
+import os
+from pathlib import Path
+
 import torch
 
 from vllm_gaudi.compilation.deepseek_v4 import _compile_lock
@@ -7,10 +13,42 @@ from vllm_gaudi.extension.logger import logger as init_logger
 
 logger = init_logger()
 _audit = {"graphs": 0, "scalars": 0}
+_diagnostic_graphs = count()
 
 
 def scalar_stats():
     return dict(_audit)
+
+
+def _archive_submission_graph(gm):
+    """Archive the actual cold-path host graph alongside requested recipe plans."""
+    directory = os.environ.get("VLLM_HPU_TP2_PLAN_DUMP_DIR")
+    if not directory:
+        return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    root = Path(directory) / f"rank{rank}"
+    root.mkdir(parents=True, exist_ok=True)
+    records = []
+    for node in gm.graph.nodes:
+        record = dict(
+            name=node.name, op=node.op, target=str(node.target), inputs=[value.name for value in node.all_input_nodes]
+        )
+        value = node.meta.get("val")
+        if isinstance(value, torch.Tensor):
+            record["tensor"] = dict(
+                shape=[str(size) for size in value.shape], dtype=str(value.dtype), stride=list(value.stride())
+            )
+        if node.op == "call_module":
+            child = gm.get_submodule(node.target)
+            record.update(
+                module_type=type(child).__name__,
+                recipe_id=getattr(child, "_recipe_id", None),
+                input_output_aliases=getattr(child, "_in_to_out_dups", None),
+            )
+        records.append(record)
+    stem = root / f"tp4-submission-{next(_diagnostic_graphs):04d}"
+    stem.with_suffix(".py.txt").write_text(gm.code)
+    stem.with_suffix(".json").write_text(json.dumps(dict(nodes=records), indent=2, default=str) + "\n")
 
 
 def hoist_recipe_scalars(gm, *, device_type="hpu"):
@@ -47,11 +85,13 @@ def hoist_recipe_scalars(gm, *, device_type="hpu"):
         if not supported:
             continue
         from torch._subclasses.fake_tensor import unset_fake_temporarily
+
         with unset_fake_temporarily(), torch.inference_mode():
             # Copy a host literal once; no eager fill or process-wide cache
             # setting is required by the subsequent decoder invocations.
-            value = torch.tensor(node.args[0], dtype=node.kwargs.get("dtype", torch.get_default_dtype()),
-                                 device="cpu").to(device)
+            value = torch.tensor(
+                node.args[0], dtype=node.kwargs.get("dtype", torch.get_default_dtype()), device="cpu"
+            ).to(device)
         name = f"_tp4_recipe_scalar_{count}"
         while hasattr(gm, name):
             name += "_"
@@ -68,7 +108,7 @@ def hoist_recipe_scalars(gm, *, device_type="hpu"):
     return count
 
 
-def make_backend():
+def make_backend(*, native_group_owner=None):
     from habana_frameworks.torch.dynamo.compile_backend import passes
     from habana_frameworks.torch.dynamo.compile_backend.backends import hpu_backend
 
@@ -78,7 +118,13 @@ def make_backend():
             _audit["graphs"] += 1
             _audit["scalars"] += count
             logger.info("TP4 compiler retained %d immutable scalar recipe inputs", count)
-        return bool(count)
+        _archive_submission_graph(context.graph_module)
+        native = False
+        if native_group_owner is not None:
+            from vllm_gaudi.compilation.deepseek_v41_native_groups import prepare_native_group
+
+            native = prepare_native_group(context.graph_module, native_group_owner)
+        return bool(count) or native
 
     def backend(gm, inputs, **kwargs):
         with _compile_lock:
@@ -88,4 +134,5 @@ def make_backend():
             finally:
                 passes.custom_pass_at_post_partition.remove(resident_scalars)
 
+    backend.native_group_owner = native_group_owner
     return backend

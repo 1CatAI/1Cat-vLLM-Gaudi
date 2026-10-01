@@ -1,0 +1,72 @@
+{
+  "base_commit": "e47aa780bccf59f59dfa2cbb18e17a10b4fe69ba",
+  "repository": "https://github.com/vllm-project/vllm.git",
+  "files": [
+    {
+      "path": "vllm/config/profiler.py",
+      "parent_sha256": "78af917ec2ea2ba3bacda15f58fda9782b8ff82c0b810fd5c9563f4203aa5ba8",
+      "candidate_sha256": "823e25446ac8c9e8ba0c8f10bfda692d0f08561aed1f640d3954fdab5ff2d0c5"
+    },
+    {
+      "path": "vllm/config/speculative.py",
+      "parent_sha256": "537622adc72d954a8ffe9076bc09c231d008f0cc89e6786d0d40300e70775a5d",
+      "candidate_sha256": "f17ec0254da04c5b45217e249d23f0232acc536bd8458f7d2c331beb26a1129c"
+    },
+    {
+      "path": "vllm/config/vllm.py",
+      "parent_sha256": "75b2edf1efa7d5d5bef32cbefde0d4dd56e20fe47ef91227c1795eeece088137",
+      "candidate_sha256": "3f280c3f59fd2e91207509d1b65317bcb2b3a8455c9c90fa59ded7d46bd939ca"
+    },
+    {
+      "path": "vllm/model_executor/hw_agnostic/layers/activation.py",
+      "parent_sha256": "de42c9e93aa9e1f881f3978e52a02014467a42475036df68191578c6fa54e733",
+      "candidate_sha256": "8446ab1c93578e333edbb8a08753a0d3aa0570cd911ad479892cff6d531e19eb"
+    },
+    {
+      "path": "vllm/model_executor/hw_agnostic/layers/layernorm.py",
+      "parent_sha256": "f2aa57d009308799a5261ef2116fa208f8124285467f0189c7a2318790f5ff77",
+      "candidate_sha256": "7fc245da19171cc4abd903b1de4c04b3f5bb69fecbc5da1709197a589e8028f0"
+    },
+    {
+      "path": "vllm/models/deepseek_v4/__init__.py",
+      "parent_sha256": "8db131ae41307e26fd539053a15664f0670b39b44bfc5522e3c706375d678dc6",
+      "candidate_sha256": "cb44764e4a478b898d37c6905050d5c17adccdec8d35028a39311b15a6ca76e9"
+    },
+    {
+      "path": "vllm/models/deepseek_v4_1/__init__.py",
+      "parent_sha256": "6b928f07c6f67f4fd1b599a143cd15a1309a177c877f7f08b29d5fa30db659fe",
+      "candidate_sha256": "05592ccf1e17eca944ccfc34063a90f34b508d81ae0cdce88c46999ff4094acf"
+    },
+    {
+      "path": "vllm/platforms/interface.py",
+      "parent_sha256": "377522c3d6e9c71a69fe74db5137ccc1dbd254f4c486d4342544af06b998b45a",
+      "candidate_sha256": "f90811803c7a8cf61a1ee24c6340c0bd44a8d856d1dadb3da1fb704500fb9358"
+    },
+    {
+      "path": "vllm/v1/engine/async_llm.py",
+      "parent_sha256": "2395dcf299cc015e0e69476fe8d986ccc8b96a69a83b9fc51a9a8bc62d9a8b26",
+      "candidate_sha256": "d3292c211943ef90813020c3202ccf3fd3063b6561864e308a646937e70e20ed"
+    },
+    {
+      "path": "vllm/v1/engine/core.py",
+      "parent_sha256": "ef709a037077f48db65d381305a0427c25749bd5dc7997f3dec5b5539f1f0dc4",
+      "candidate_sha256": "af8854ac90fb128c9fc5197be0f8fa566b68119184a9e8abff2318e7a2ab01f9"
+    },
+    {
+      "path": "vllm/v1/outputs.py",
+      "parent_sha256": "fae981c1f2e2b7d8a106d183468428d26b0467477e0427c06d4346c1888bee68",
+      "candidate_sha256": "b8e010fec9b123017625610141afe23146431f0f3fa63e782815bf063aeda399"
+    },
+    {
+      "path": "vllm/v1/utils.py",
+      "parent_sha256": "4093f1c040a5f3def599bb044b72109301b970f70a5e5b622fd03a450a11e36a",
+      "candidate_sha256": "97c11051c84fc55796789de4ad4dbf0bcda8b8f601be80a9ade6d952f67b97c7"
+    },
+    {
+      "path": "vllm/v1/worker/utils.py",
+      "parent_sha256": "5ed6caaf5797c214398be2a28fe7b6b24a4e9eb7b9b72fa6f17afec4a495875c",
+      "candidate_sha256": "3f3a425d084707922cfe27dd8e096d9622f2098d4b1600a88abc05cc057fc08a"
+    }
+  ],
+  "patch_sha256": "440df9630039b46d947d05d5a3966c812a361f07f0863cec4726bd648abc488f"
+}

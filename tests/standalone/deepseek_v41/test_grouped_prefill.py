@@ -62,15 +62,16 @@ def test_dedicated_entrypoint_selects_validated_grouped_prefill():
 def test_fp8_prompt_dispatch_keeps_scales_and_batch_decode_separate(monkeypatch, tp_size, tokens):
     from types import SimpleNamespace
     import torch
-    from vllm_gaudi.entrypoints.deepseek_v41 import _TP4_FASTPATH_DEFAULTS, _TP4_FORCE_DISABLED
+    from vllm_gaudi.entrypoints.deepseek_v41 import _TP4_FASTPATH_DEFAULTS, _PIPELINE_ONLY_FASTPATHS
     from vllm_gaudi.models.deepseek_v41_program import PreparedMoE
     from vllm_gaudi.ops import deepseek_v41_prefill_buckets as buckets
 
     for name, value in _TP4_FASTPATH_DEFAULTS.items():
         monkeypatch.setenv(name, value)
-    for name in _TP4_FORCE_DISABLED:
+    for name in _PIPELINE_ONLY_FASTPATHS:
         monkeypatch.setenv(name, "0")
     monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_REGIONS", "0")
+    monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_GROUPED_FP8", "w13_single_bucket")
     experts = SimpleNamespace(
         **{
             name: torch.ones(1, dtype=torch.bfloat16)
@@ -114,6 +115,7 @@ def test_prompt_lengths_do_not_exhaust_shared_dynamo_recompile_limit(monkeypatch
     import torch
     from vllm_gaudi.ops import deepseek_v41_grouped_prefill as grouped
 
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
     compile_calls = []
     original_compile = torch.compile
 

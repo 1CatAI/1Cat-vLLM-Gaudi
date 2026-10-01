@@ -25,7 +25,8 @@ habana::OutputMetaDataVector metadata(const at::Stack& stack, bool reduce_only) 
                 weights.sizes() == at::IntArrayRef({tokens, 32}) &&
                 positions.scalar_type() == at::kInt && positions.sizes() == at::IntArrayRef({tokens}) &&
                 rows.scalar_type() == at::kInt && rows.dim() == 1 &&
-                columns >= 128 && columns <= 2048 && columns % 128 == 0 && (ratio == 1 || ratio == 2),
+                columns >= 128 && columns <= (tokens <= 6 ? 32768 : 2048) && columns % 128 == 0 &&
+                (ratio == 1 || ratio == 2),
                 "Invalid prefill index weights, positions or source tile");
     if (reduce_only) {
         TORCH_CHECK(x.size(2) == columns, "Index reduction requires one score per source row");
@@ -105,6 +106,7 @@ template<bool Fake> at::Tensor reduce(const at::Tensor& s, const at::Tensor& w, 
 }
 }
 TORCH_LIBRARY_FRAGMENT(custom_op, m) {
+    m.def("deepseek_v41_decoded_index_capacity() -> int", []() -> int64_t { return 32768; });
     m.def("custom_deepseek_v41_prefill_index_scores_gaudi2(Tensor query, Tensor weights, Tensor keys, Tensor positions, Tensor rows, int ratio, int local_heads=16) -> Tensor");
     m.def("custom_deepseek_v41_prefill_index_reduce_gaudi2(Tensor scores, Tensor weights, Tensor positions, Tensor rows, int ratio, int local_heads=16) -> Tensor");
 }

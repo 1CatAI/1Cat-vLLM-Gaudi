@@ -49,6 +49,8 @@ struct PreparedNode {
   bool exchange = false;
   bool peer_only = false;
   bool reduction_only = false;
+  bool all_gather = false;
+  bool stock_collective_stream = false;
   uint64_t recipe_id = 0;
   habana::graph::GraphExec* graph = nullptr;
   std::vector<int64_t> inputs, outputs;
@@ -70,6 +72,8 @@ class PreparedGroupPlan : public std::enable_shared_from_this<PreparedGroupPlan>
   std::vector<ReshapeView> reshape_views;
   std::shared_ptr<habana::HcclCommunicator> communicator;
   bool sealed = false;
+  bool reject_output_alias = false;
+  int world_size = 0;
   std::atomic<bool> valid{true};
 
   int64_t add_slot(c10::IValue value, bool input) {
@@ -84,7 +88,8 @@ class PreparedGroupPlan : public std::enable_shared_from_this<PreparedGroupPlan>
   }
 
   void add_compute(uint64_t recipe_id, std::vector<int64_t> inputs, std::vector<int64_t> outputs) {
-    TORCH_CHECK(!sealed && !outputs.empty(), "Prepared compute requires preallocated outputs");
+    TORCH_CHECK(!sealed && (!outputs.empty() || !inputs.empty()),
+                "Prepared compute requires bound inputs or preallocated outputs");
     PreparedNode node;
     node.recipe_id = recipe_id;
     node.inputs = std::move(inputs);
@@ -151,11 +156,21 @@ class PreparedGroupPlan : public std::enable_shared_from_this<PreparedGroupPlan>
     nodes.back().reduction_only = true;
   }
 
+  void add_all_gather(int64_t input, int64_t output) {
+    add_peer_exchange(input, output);
+    nodes.back().all_gather = true;
+  }
+
   void prepare(c10d::ProcessGroupEagerHCCL* backend, std::vector<int64_t> results) {
     TORCH_CHECK(!sealed && !nodes.empty(), "Prepared plans require unsealed nodes");
     const bool has_exchange = std::any_of(nodes.begin(), nodes.end(),
                                         [](const PreparedNode& node) { return node.exchange; });
-    TORCH_CHECK(!has_exchange || tp2ExchangeEnabled(), "Exchange plans require dedicated TP2 exchange");
+    const bool tp4 = has_exchange && backend->getSize() == 4;
+    world_size = backend->getSize();
+    reject_output_alias = tp4;
+    TORCH_CHECK(!has_exchange || tp4 || tp2ExchangeEnabled(), "Exchange plans require a supported communicator");
+    TORCH_CHECK(!tp4 || GET_ENV_FLAG_NEW(PT_HPU_EAGER_COLLECTIVE_PIPELINE_ENABLE),
+                "Prepared TP4 requires the eager collective pipeline");
     TORCH_CHECK(GET_ENV_FLAG_NEW(PT_HPU_LAZY_MODE) == 0 &&
                     GET_ENV_FLAG_NEW(PT_HPU_EAGER_PIPELINE_ENABLE), "Prepared plans require the eager pipeline");
     TORCH_CHECK(c10::hpu::getCurrentHPUStream().stream() == 0, "Prepared v1 supports the default compute stream");
@@ -169,6 +184,10 @@ class PreparedGroupPlan : public std::enable_shared_from_this<PreparedGroupPlan>
     result_slots = std::move(results);
     for (auto& node : nodes) {
       if (node.exchange) {
+        TORCH_CHECK(!tp4 || (node.peer_only && (node.reduction_only != node.all_gather)),
+                    "Prepared TP4 requires stock AllReduce or AllGather nodes");
+        TORCH_CHECK(!node.all_gather || tp4, "Prepared AllGather requires four ranks");
+        node.stock_collective_stream = tp4;
         const auto partial = slots.at(node.inputs[0]).toTensor();
         if (node.peer_only) {
           const auto peer = slots.at(node.outputs[0]).toTensor();
@@ -179,12 +198,17 @@ class PreparedGroupPlan : public std::enable_shared_from_this<PreparedGroupPlan>
           const int64_t v41Maximum = batchFlag && std::strcmp(batchFlag, "1") == 0 ? 64 * 5120 : 32768;
           const bool v41Shape = v41 && !node.reduction_only && hidden >= 128 &&
                                 hidden <= v41Maximum && hidden % 128 == 0;
-          TORCH_CHECK(hidden == 4096 || (!node.reduction_only && hidden == 5120) || v41Shape,
+          TORCH_CHECK(tp4 ? (hidden > 0 && hidden <= v41Maximum && (node.all_gather || hidden % 4 == 0)) :
+                      (hidden == 4096 || (!node.reduction_only && hidden == 5120) || v41Shape),
                       "Unsupported prepared TP2 hidden width");
           TORCH_CHECK(partial.sizes() == at::IntArrayRef({1, hidden}) &&
                           partial.scalar_type() == at::kBFloat16 && partial.device().type() == at::kHPU,
                       "Prepared peer exchange requires TP2 C1 BF16 hidden states");
-          validateTensor(peer, partial, "prepared peer", at::kBFloat16);
+          if (node.all_gather) {
+            TORCH_CHECK(peer.sizes() == at::IntArrayRef({1, hidden * world_size}) &&
+                            peer.device() == partial.device() && peer.scalar_type() == at::kBFloat16 &&
+                            peer.is_contiguous(), "Prepared TP4 AllGather output geometry differs");
+          } else validateTensor(peer, partial, "prepared peer", at::kBFloat16);
           TORCH_CHECK(partial.is_contiguous() && partial.storage().data_ptr().get() != peer.storage().data_ptr().get(),
                       "Prepared peer exchange buffers must be contiguous and distinct");
           continue;
@@ -201,6 +225,8 @@ class PreparedGroupPlan : public std::enable_shared_from_this<PreparedGroupPlan>
           TORCH_CHECK(slots.at(index).toTensor().is_contiguous(), "Noncontiguous prepared exchange output");
         node.communication_recipe = fusedRecipeCache().get(5120, 5120, node.epsilon, true);
       } else {
+        // State-only TP4 recipes retain their mutable input bindings.
+        TORCH_CHECK(tp4 || !node.outputs.empty(), "Output-free prepared compute requires TP4");
         torch::jit::Stack inputs;
         for (auto index : node.inputs) inputs.push_back(slots.at(index));
         node.graph = habana::graph::GraphStorage::get().prepared_static_exec(node.recipe_id, inputs);
@@ -213,6 +239,22 @@ class PreparedGroupPlan : public std::enable_shared_from_this<PreparedGroupPlan>
     if (!sealed || !valid.load() || inputs.size() != signatures.size()) return false;
     for (size_t i = 0; i < inputs.size(); ++i)
       if (!signatures[i].matches(inputs[i])) return false;
+    if (reject_output_alias) {
+      // A feedback consumer can pass this plan's own previous result back
+      // as a new input. Recipes were compiled with distinct input/output
+      // sections, so select another retained frame instead of rebinding two
+      // sections to one address. Shared mutable input/output slots are not
+      // in node.outputs and keep their intentional alias contract.
+      for (const auto& input : inputs) {
+        if (!input.isTensor() || input.toTensor().device().type() != at::kHPU) continue;
+        const auto address = input.toTensor().storage().data_ptr().get();
+        for (const auto& node : nodes) {
+          for (const auto output : node.outputs) {
+            if (address == slots.at(output).toTensor().storage().data_ptr().get()) return false;
+          }
+        }
+      }
+    }
     return true;
   }
 
@@ -232,7 +274,8 @@ void runPreparedExchangeNode(const std::shared_ptr<habana::HcclCommunicator>& co
                              const PreparedNode& node, const torch::jit::Stack& values) {
   if (node.peer_only) {
     TORCH_CHECK(values.size() == 2, "Invalid prepared peer bindings");
-    runTp2ExchangePeer(communicator, values[0].toTensor(), values[1].toTensor(), 0, node.reduction_only);
+    runTp2ExchangePeer(communicator, values[0].toTensor(), values[1].toTensor(), 0,
+                       node.reduction_only, node.stock_collective_stream, node.all_gather);
   } else {
     TORCH_CHECK(values.size() == 7, "Invalid prepared fused norm bindings");
     runFusedAllReduceNorm(communicator,

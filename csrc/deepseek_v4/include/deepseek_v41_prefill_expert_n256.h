@@ -39,6 +39,8 @@ void main(tensor ids, tensor q16, tensor planes, tensor lookup, tensor output)
     const int5 start = get_index_space_offset();
     const int5 end = start + get_index_space_size();
     const int experts = get_dim_size(q16, 2);
+    const bool compact_scales = get_dim_size(planes, 0) == get_dim_size(q16, 0) / 16 + 128;
+    const int scale_stride = compact_scales ? 128 : 256;
 #if DSV41_N256_FP8 || DSV41_N256_NORMAL_BF16
     const uchar256 table = v_u8_ld_tnsr_b((int5){0}, lookup);
 #endif
@@ -61,14 +63,20 @@ void main(tensor ids, tensor q16, tensor planes, tensor lookup, tensor output)
         }
         for (int block = start[0]; block < end[0]; ++block) {
             const int row = block * 256;
+#if DSV41_N256_FP8
+            const uchar256 channel_code = v_u8_ld_tnsr_b(
+                (int5){get_dim_size(planes, 0) - 128, block, expert}, planes,
+                0, (uchar256){0}, compact_scales);
+#endif
             for (int group = start[2] * 4; group < end[2] * 4; ++group) {
 #if DSV41_N256_FP8
-                const uchar256 delta = v_u8_ld_tnsr_b(
-                    (int5){group * 256 + 128, block, expert}, planes);
+                const int scale_offset = group * scale_stride + (compact_scales ? 0 : 128);
+                const uchar256 stored = v_u8_ld_tnsr_b((int5){scale_offset, block, expert}, planes);
+                const uchar256 delta = compact_scales ? (stored - channel_code) << 3 : stored;
 #else
                 const bool valid = expert >= 0 && expert < experts;
                 const uchar256 original = v_u8_ld_tnsr_b(
-                    (int5){group * 256, block, expert}, planes, 0, (uchar256){0}, valid);
+                    (int5){group * scale_stride, block, expert}, planes, 0, (uchar256){0}, valid);
                 const ushort256 codes = convert_uchar256_to_ushort256(
                     original, DSV41_N256_COLUMN_INTERLEAVE ? 0 : SW_LINEAR);
 #if DSV41_N256_NORMAL_BF16

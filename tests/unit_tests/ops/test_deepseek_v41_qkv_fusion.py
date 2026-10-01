@@ -197,3 +197,58 @@ def test_static_weight_concatenation_preserves_source_bytes():
     fused = concatenate_static_weights(first, second)
     assert torch.equal(fused[:3], first)
     assert torch.equal(fused[3:], second)
+
+
+def test_fp8_qkv_reload_retires_channel_binding():
+    weights = _weights()
+    for projection in (weights.wq_a, weights.wkv):
+        projection.weight = projection.weight.to(torch.float8_e4m3fn)
+        projection.dense_fp8_direct_input = True
+        scale = torch.arange(1, projection.weight.shape[0] + 1).float().reshape(1, -1)
+        projection.register_buffer("channel_scale", scale)
+    attention = _attention(weights)
+    attention.qkv_fused_input = True
+    attention.prepare_qkv_input_weight()
+    assert attention.fused_wqa_wkv.dtype == torch.float8_e4m3fn
+    assert attention.fused_wqa_wkv.untyped_storage().data_ptr() == weights.wkv.weight.untyped_storage().data_ptr()
+    expected_scale = torch.cat((weights.wq_a.channel_scale, weights.wkv.channel_scale), dim=1)
+    torch.testing.assert_close(attention.fused_qkv_channel, expected_scale)
+    attention.invalidate_qkv_input_weight()
+    assert "fused_qkv_channel" not in attention._buffers
+    assert attention._fused_qkv_weight is None
+
+
+def test_prequantized_dense_input_reuses_the_published_operand(monkeypatch):
+    from vllm_gaudi.ops.deepseek_v41_qkv import direct_dense_fp8
+
+    value = torch.ones(2, 32, dtype=torch.bfloat16)
+    quantized = value.to(torch.float8_e4m3fn)
+    scale = torch.ones(2, 1)
+    weight = torch.ones(8, 32).to(torch.float8_e4m3fn)
+    channel = torch.ones(1, 8)
+    output = torch.ones(2, 8, dtype=torch.bfloat16)
+
+    def quantize_again(*args):
+        raise AssertionError('The normalized producer already quantized this row')
+
+    def gemm(q, trans_a, w, trans_b, bias, dtype, sx, sw, output_scale, accumulate):
+        assert q is quantized and sx is scale and w is weight and sw is channel
+        assert not trans_a and trans_b and bias is None and not accumulate
+        assert dtype == torch.bfloat16 and output_scale is None
+        return output
+
+    monkeypatch.setattr(torch.ops.custom_op, 'custom_deepseek_v41_dense_quant_gaudi2', quantize_again, raising=False)
+    monkeypatch.setattr(torch.ops.hpu, 'fp8_gemm_v2', gemm, raising=False)
+    assert direct_dense_fp8(value, weight, channel, prequant=(quantized, scale)) is output
+
+
+def test_prequantized_qkv_rejects_a_bf16_projection():
+    attention = _attention(_weights())
+    attention.qkv_fused_input = True
+    attention.prepare_qkv_input_weight()
+    try:
+        attention._project_qkv_input(_matrix(1, 32, 300), prequant=(None, None))
+    except ValueError as exc:
+        assert 'prepared FP8' in str(exc)
+    else:
+        raise AssertionError('A prequantized operand must not be silently ignored')

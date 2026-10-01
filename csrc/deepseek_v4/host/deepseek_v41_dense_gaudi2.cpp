@@ -26,7 +26,8 @@ tpc_lib_api::GlueCodeReturn DeepseekV41DenseGaudi2::GetGcDefinitions(
         const auto& s = p->outputTensors[1].geometry;
         if (a.dataType != DATA_BF16 || b.dataType != DATA_F8_143 || s.dataType != DATA_F32)
             return GLUE_INCOMPATIBLE_DATA_TYPE;
-        if ((width != 2048 && width != 1280 && width != 4096 && width != 5120 && width != 6144) || s.dims != 2 ||
+        if ((width != 576 && width != 1152 && width != 2048 && width != 1280 && width != 4096 &&
+             width != 5120 && width != 6144) || s.dims != 2 ||
             s.maxSizes[0] != 1 ||
             s.maxSizes[1] != rows)
             return GLUE_INCOMPATIBLE_INPUT_SIZE;
@@ -42,10 +43,11 @@ tpc_lib_api::GlueCodeReturn DeepseekV41DenseGaudi2::GetGcDefinitions(
         const auto& sx = p->inputTensors[2].geometry;
         if (a.dataType != DATA_F32 || sw.dataType != DATA_F32 || sx.dataType != DATA_F32 || b.dataType != DATA_BF16)
             return GLUE_INCOMPATIBLE_DATA_TYPE;
-        if ((width != 1792 && width != 5120 && width != 8192 && width != 16384 && width != 25600) || sw.dims != 2 ||
+        if ((width != 512 && width != 576 && width != 1152 && width != 1280 && width != 1792 &&
+             width != 2304 && width != 5120 && width != 8192 && width != 16384 && width != 25600) || sw.dims != 2 ||
             sw.maxSizes[0] != width || sw.maxSizes[1] != 1 || sx.dims != 2 || sx.maxSizes[0] != 1 ||
             sx.maxSizes[1] != rows) return GLUE_INCOMPATIBLE_INPUT_SIZE;
-        out->indexSpaceRank = 2; out->indexSpaceGeometry[0] = width / 128; out->indexSpaceGeometry[1] = rows;
+        out->indexSpaceRank = 2; out->indexSpaceGeometry[0] = (width + 127) / 128; out->indexSpaceGeometry[1] = rows;
         for (int i = 0; i < 3; ++i) {
             map(out->inputTensorAccessPattern[i], 0, 0, i == 2 ? 0 : 128, 0, i == 2 ? 0 : 127);
             map(out->inputTensorAccessPattern[i], 1, 1, i == 1 ? 0 : 1, 0, 0);

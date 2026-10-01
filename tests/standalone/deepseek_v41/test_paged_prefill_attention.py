@@ -25,8 +25,9 @@ def test_mme_tiles_preserve_query_order_and_real_tail_extent(monkeypatch, tile, 
     monkeypatch.setattr(torch.ops.custom_op, "custom_deepseek_v41_prefill_mla_mme_gaudi2", operator, raising=False)
     query = torch.arange(tokens, dtype=torch.bfloat16)[:, None, None].expand(tokens, 32, 512)
     indices = torch.arange(tokens, dtype=torch.int32)[:, None].expand(tokens, 640)
-    output = bounded_prefill_mla(query, torch.empty(8192, 512, dtype=torch.bfloat16), indices, torch.zeros(32),
-                                 torch.ones(1), tile)
+    output = bounded_prefill_mla(
+        query, torch.empty(8192, 512, dtype=torch.bfloat16), indices, torch.zeros(32), torch.ones(1), tile
+    )
     assert torch.equal(output, query)
     assert all(q.shape == (tile, 32, 512) and i.shape == (tile, 640) for q, i, _ in calls[:-1])
     tail = tokens % tile
@@ -86,7 +87,7 @@ def test_prefill_publishes_the_same_rows_to_the_decoded_c1_shadow():
     PagedCSA2Attention._prefill_swa_workspace(attention, current, positions, decoded=True)
 
     expected = unpack_swa(pack_swa(current))
-    assert torch.equal(attention.shared.decoded_swa[offset + positions[0]:offset + positions[-1] + 1], expected)
+    assert torch.equal(attention.shared.decoded_swa[offset + positions[0] : offset + positions[-1] + 1], expected)
 
 
 def test_streaming_topk_matches_one_shot_for_independent_source_rows():
@@ -95,14 +96,13 @@ def test_streaming_topk_matches_one_shot_for_independent_source_rows():
     rows = torch.arange(columns, dtype=torch.int32)
 
     class Scorer:
-
         _merge_topk = staticmethod(PagedCSA2Attention._merge_topk)
 
         @staticmethod
         def _scores(current_positions, current_rows, q, weights):
             del q, weights
             # Unique scores avoid making this layout test depend on topk's tie ordering.
-            return (current_rows.float().unsqueeze(0) * 0.01 + current_positions.float().unsqueeze(1) * 0.000001)
+            return current_rows.float().unsqueeze(0) * 0.01 + current_positions.float().unsqueeze(1) * 0.000001
 
     actual, _, _ = PagedCSA2Attention._stream_topk(Scorer(), positions, rows, None, None, width=width)
     scores = Scorer._scores(positions, rows, None, None)
@@ -114,14 +114,16 @@ def test_prefill_swa_current_and_prior_rows_share_packed_cache_precision():
     # Values deliberately lie between FP8 levels. Integer-valued fixtures can
     # hide a chunk-boundary change from raw BF16 to packed-cache precision.
     torch.manual_seed(742)
-    current = (torch.randn(256, 512) * .137).bfloat16()
+    current = (torch.randn(256, 512) * 0.137).bfloat16()
     expected = unpack_swa(pack_swa(current))
     assert not torch.equal(current, expected)
 
     def owner():
-        return SimpleNamespace(window=128,
-                               window_offsets=torch.arange(128, dtype=torch.int32),
-                               swa=torch.zeros(SWA_ROWS, 528, dtype=torch.uint8))
+        return SimpleNamespace(
+            window=128,
+            window_offsets=torch.arange(128, dtype=torch.int32),
+            swa=torch.zeros(SWA_ROWS, 528, dtype=torch.uint8),
+        )
 
     whole, split = owner(), owner()
     positions = torch.arange(256, dtype=torch.int32)
