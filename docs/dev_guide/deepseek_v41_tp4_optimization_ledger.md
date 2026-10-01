@@ -424,3 +424,65 @@ Evidence: `evidence/20260928_tp4-decode-gap-1p5/prefill-cache-conditioning.json`
 `ttft-cache-formal-01`, and its host/environment records. The other four
 cards held a small idle allocation at the formal preflight; continuous
 foreign-card load telemetry was not collected.
+
+### Ordinary C1 prefix checkpoint activation (2026-10-01)
+
+Functional state/TTFT correction; no component gain and no new pending savings.
+The independent public installation enables prefix caching, retains full warmup,
+1M context and 32 request slots, and includes the pinned engine's bounded
+all-rank auxiliary-checkpoint ABI. Request-slot ownership no longer requires
+the optional batch executor. Native replay/communication interfaces are unchanged.
+
+Failed candidates are retained in `prefix-cache-01` through `prefix-cache-03`.
+An intervening long request exposed stale derived index mirrors at a scalar
+2049-token prefill tail; owner/page-remap invalidation fixes cached/fresh token
+equivalence. New page-boundary region contracts use the existing eager bodies
+after startup instead of evicting warmed guarded executors. Scalar C1 tails
+publish the canonical slot before replay. The legacy 1024-position replay
+bound still sent long scalar tails through synchronous group compilation: a
+cached 2048→2064 continuation took 39.717 s before its first token. CPU tests
+reproduced false replay admission at positions2048 and16384. Removing that
+bound for slot-owned C1 tails reduces the same continuation to **0.904 s**,
+with all32 output tokens exact against its forced-miss counterpart.
+
+Fresh candidate65f0c231, independently installed and fully warmed:
+
+| State/TTFT probe | First uncached request | Cached after slot reuse | Reused tokens |
+| --- | ---: | ---: | ---: |
+| 273-token greedy prompt | 4.216 s | 0.385 s | 256 |
+| 2048-token recommended-sampling prompt | 5.064 s | 0.446 s | 1920 |
+| 2049-token greedy prompt, intervening4K/decode request | 1.952 s | 0.343 s | 2048 |
+
+All cached/fresh state and appended-suffix comparisons pass token equality.
+The public recommended-sampling2K cached probe takes **0.609 s**, with1920
+reported cached tokens. A16K cached64-token state probe reuses16256 tokens
+and matches its uncached formal output prefix. These length-limited probes
+qualify state/TTFT only; they do not qualify natural-EOS decode performance.
+
+One unprofiled full-warmup16K→natural-EOS request: **10.069162 ms/token**,
+**99.313134 tokens/s**,2904 output tokens; uncached TTFT11.633 s. All2904
+tokens exactly match prefix-cache-03. They differ from the prefix-disabled
+2784-token reference at token37; factual semantics pass, and no reference-exact
+claim is made for enabling checkpoint splits. Four additional frozen tasks
+at temperature1/top-p0.95/seed42 reach natural EOS and pass every expected
+semantic field: five tasks total including the greedy formal factual task.
+No new stochastic decode performance claim; the≤10ms target remains unmet
+for this prefix-enabled formal result. CPU967 passed/111 skipped;257 plugin
+Python files and18 locked engine files match maintained candidate source.
+
+Formal preflight CPU PSI some avg10=0.95%; per-second CPU/core/context-switch
+and desktop-process telemetry is retained. The other four modules2/3/6/7
+hold768MiB each at0% utilization at preflight and throughout periodic startup
+checks; no foreign weight load was observed. Continuous foreign-card telemetry
+was not collected during the formal request. Candidate and parent use modules
+0/1/4/5 and CPUs10/15/38/43.
+
+Cache hits require the same token prefix plus retained pages and all-rank
+SWA/compressor/Engram checkpoint acknowledgment. Current checkpoints stop at
+the prompt boundary; generated tokens do not extend them automatically for
+the next chat turn. Cache capacity/eviction and restart can cause misses;
+uncached prompt processing remains necessary. Evidence: existing
+`evidence/20260928_tp4-decode-gap-1p5/prefix-cache-04`, including
+`transitions.json`, `formal`, `formal-host.jsonl`, `environment.json`,
+`reference-comparison.json`, `parent-reference-comparison.json` and
+`quality-results.json`. Pending microbenchmark gains remain **0 ms**.

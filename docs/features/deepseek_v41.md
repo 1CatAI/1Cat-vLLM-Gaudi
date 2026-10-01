@@ -76,7 +76,9 @@ compressor and Engram history acknowledged by every TP/PP rank. Checkpoints
 use complete 128-token page boundaries, retain a final uncached prompt page,
 and have bounded slot/byte budgets. Request-slot reuse reconstructs decoded
 mirrors before native replay consumes them. Equal text alone does not imply a
-hit: the token prefix must match. Speculative execution does not support this
+hit: the token prefix must match. Checkpoints currently capture the prompt
+boundary; generated tokens do not automatically extend that auxiliary
+checkpoint for the next chat turn. Speculative execution does not support this
 checkpoint contract. The option remains off unless requested.
 
 The dedicated entrypoint enables the frozen-reference ordinary-C1 and V2
