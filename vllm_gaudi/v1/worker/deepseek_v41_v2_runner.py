@@ -292,7 +292,7 @@ class V41V2ModelRunner(V41ModelRunner):
         return result
 
     def _update(self, scheduled):
-        request_batches = getattr(self, "request_batches", None) is not None
+        request_batches = self.request_slots_enabled
         for new in scheduled.scheduled_new_reqs:
             operations = getattr(scheduled, "auxiliary_prefix_operations", None)
             checkpoint = operations.restores.get(new.req_id) if operations is not None else None

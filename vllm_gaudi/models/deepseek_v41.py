@@ -298,13 +298,20 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             raise RuntimeError("complete_step_device expects the consumed committed scalar")
         self.complete_step(int(committed_inputs))
 
-    def initialize_request_batches(self, capacity):
-        if not envs.VLLM_HPU_DSV41_BATCH_DECODE or self.program.dspark or not self.native:
-            raise RuntimeError("Request batches require the explicit ordinary native replay configuration")
-        from vllm_gaudi.ops.deepseek_v41_batch_replay import BatchStageReplay
+    def initialize_request_state(self, capacity):
+        """Request-owned state shared by native C1 and optional batch replay."""
+        if self.program.dspark or not self.native:
+            raise RuntimeError("Request slots require ordinary native replay")
         from vllm_gaudi.ops.deepseek_v41_batch_state import BatchStageState
 
         self.batch_state = BatchStageState(self.program, capacity)
+
+    def initialize_request_batches(self, capacity):
+        if not envs.VLLM_HPU_DSV41_BATCH_DECODE:
+            raise RuntimeError("Request batches require the explicit ordinary native replay configuration")
+        from vllm_gaudi.ops.deepseek_v41_batch_replay import BatchStageReplay
+
+        self.initialize_request_state(capacity)
         self.batch_replay = BatchStageReplay(self.program)
         lanes = envs.VLLM_HPU_DSV41_PP_MICROBATCHES
         if lanes not in (1, 2):
