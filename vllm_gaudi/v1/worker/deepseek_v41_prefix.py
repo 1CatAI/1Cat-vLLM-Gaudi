@@ -86,6 +86,9 @@ class PrefixCheckpoints:
             raise RuntimeError("Auxiliary capture differs from scheduler-owned pages")
         runner.pp.drain()
         torch.hpu.synchronize()
+        leave_single = getattr(bank, "leave_single", None)
+        if leave_single is not None:
+            leave_single()
         host = runner.model.engram_host
         history = host.snapshot_prefix(request_id) if host is not None else None
         if history is not None and history[0] != position:

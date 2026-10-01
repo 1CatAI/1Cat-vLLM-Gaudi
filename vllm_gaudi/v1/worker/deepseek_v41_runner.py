@@ -1440,6 +1440,13 @@ class V41ModelRunner:
             and (getattr(program, "runtime_indexer", False) or start + count <= 1024)
         )
         graph_c1 = decode or c1_replay
+        if self.request_slots_enabled and request is not None and not decode and c1_replay:
+            # Scalar prompt tails own the same native addresses as decode.
+            # Publish the prefill slot before replay; larger prompt tiles keep
+            # their slot aliases. Forcing this tail through ordinary compiled
+            # groups instead creates a new graph inside each cold request.
+            bank = self.model.batch_state
+            bank.bind_single(bank.acquire(request_id), start)
         if self.direct_token_ids and graph_c1:
             if count != 1:
                 raise ValueError("Direct V4.1 token binding requires a C1 transaction")
@@ -1564,7 +1571,7 @@ class V41ModelRunner:
             getattr(self.model, "native", False)
             or (self.v2_completion and getattr(self.model, "tensor_parallel_size", 2) == 4)
         ) and (decode or (start + count <= 1024 and (c1_replay or (self.use_dspark and request is not None))))
-        if self.request_slots_enabled and request is not None and not decode:
+        if self.request_slots_enabled and request is not None and not decode and not c1_replay:
             # Prompt/tail transactions keep their request-slot aliases.
             # B1 decode binds the original working addresses before replay.
             use_replay = False
@@ -2370,6 +2377,14 @@ class V41ModelRunner:
             from vllm_gaudi.ops.deepseek_v41_prefill_regions import freeze_prefill_regions
 
             freeze_prefill_regions()
+            # Checkpoint cuts add page-boundary shapes to the ordinary compute
+            # buckets. Prime their bounded expert/index helpers against the
+            # real KV pool before API readiness; pure region misses stay eager.
+            for bucket in prefill_compute_buckets(self.prefill_capacity):
+                if bucket > 256:
+                    self._dummy_run(bucket - 128)
+            self.pp.group.barrier()
+            self.state.clear()
         if envs.VLLM_HPU_DSV41_VERIFY_TIMING:
             if (
                 not envs.VLLM_HPU_DSV41_DEVICE_VERIFY

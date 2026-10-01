@@ -97,6 +97,47 @@ def test_decode_geometry_rebinds_after_prefill_generation_and_search_changes():
     assert len(uploads) == 5
 
 
+def test_scalar_prefill_slot_handoff_precedes_native_replay():
+    from vllm_gaudi.v1.worker.deepseek_v41_runner import V41ModelRunner
+
+    calls = []
+
+    class Model:
+        native = True
+
+        def prepare_step(self, *args, **kwargs):
+            assert kwargs["use_replay"] and kwargs["is_decode"]
+            calls.append("replay")
+
+        def __call__(self, *args, **kwargs):
+            return torch.zeros(1, 8)
+
+    runner = object.__new__(V41ModelRunner)
+    runner.request_batches = None
+    runner.prefix_checkpoints = object()
+    runner.model = Model()
+    runner.model.program = SimpleNamespace(length=1048576, generation=1, tensor_parallel_size=4,
+                                           runtime_indexer=True, layers=[])
+    owner = object()
+    runner.model.batch_state = SimpleNamespace(acquire=lambda name: owner,
+                                               bind_single=lambda slot, position: calls.append((slot, position)))
+    runner.use_dspark = runner.direct_token_ids = False
+    runner.input_views = {1: torch.empty(1, dtype=torch.int64)}
+    runner.position_views = {1: torch.empty(1, dtype=torch.int32)}
+    runner.position_bank = runner._next_input = None
+
+    def upload(tokens, start):
+        runner.input_views[1].copy_(torch.tensor(tokens))
+        runner.position_views[1].fill_(start)
+
+    runner.tp4_control_inputs = {1: SimpleNamespace(upload=upload)}
+    runner.pp = SimpleNamespace(group=SimpleNamespace(is_first_rank=True, is_last_rank=True))
+    runner.audit = {"target_steps": 0, "target_tokens": 0, "prefill_steps": 0}
+    runner._image_embeddings = lambda *_: None
+    runner._forward("cached", [42], 384, decode=False, request=object(), search_length=512)
+    assert calls == [(owner, 384), "replay"]
+
+
 @pytest.mark.parametrize("start,stop", [(0, 0), (0, 2), (2, 5), (4, 5), (4, 9), (9, 12)])
 def test_scheduled_token_slice_matches_full_history_without_concatenating(start, stop):
     from vllm_gaudi.v1.worker.deepseek_v41_runner import RequestState
