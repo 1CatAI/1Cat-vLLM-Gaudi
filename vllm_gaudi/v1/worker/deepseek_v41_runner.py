@@ -1100,6 +1100,18 @@ class V41ModelRunner:
                 from vllm_gaudi.compilation.deepseek_v41_tp4 import make_backend
 
                 sampler_backend = make_backend()
+            self.sampling_backend = sampler_backend
+            self.stochastic_samplers = {}
+            self.sampling_buffers = {}
+            self.sample_local_head = torch.compile(
+                self.model.program._head_projection, backend=sampler_backend, fullgraph=True, dynamic=False
+            )
+            from vllm_gaudi.ops.deepseek_v41_sampling import commit_sampled_token
+
+            self.sample_commit = torch.compile(
+                commit_sampled_token,
+                backend=sampler_backend, fullgraph=True, dynamic=False
+            )
             self.sample_target = torch.compile(sampler, backend=sampler_backend, fullgraph=True, dynamic=False)
             if self.pp.device_commit_enabled:
                 self.sample_target_commit = torch.compile(
@@ -1108,6 +1120,50 @@ class V41ModelRunner:
         logger.info(
             "V4.1 PP%d prepared weights loaded; allocated %d bytes", self.model.pp_rank, self.model_memory_usage
         )
+
+    def _sample_requests(self, hidden, requests, *, replay=None):
+        from functools import partial
+        from vllm_gaudi.ops.deepseek_v41_sampling import request_uniform, sample_probabilities
+
+        batch = hidden.shape[0]
+        filtered = any(req.sampling_params.top_p < 1 or req.sampling_params.top_k > 0 for req in requests)
+        if batch not in self.sampling_buffers:
+            host = torch.zeros(batch, 4, dtype=torch.float32).pin_memory("hpu")
+            device = torch.empty_like(host, device=self.device)
+            self.sampling_buffers[batch] = host, device
+        host, controls = self.sampling_buffers[batch]
+        # A previous asynchronous transfer may still read the pinned buffer.
+        # Retain ownership through the transfer event before filling it again.
+        pending = getattr(self, "sampling_copy_events", {}).get(batch)
+        if pending is not None:
+            pending.synchronize()
+        host[:, 0] = 0
+        host[:, 1] = 1
+        host[:, 2] = 0.5
+        host[:, 3] = -1
+        for row, req in enumerate(requests):
+            params = req.sampling_params
+            host[row, 0] = params.temperature
+            host[row, 1] = params.top_p
+            host[row, 2] = request_uniform(req.req_id, params.seed, len(req.output))
+            host[row, 3] = params.top_k
+        controls.copy_(host, non_blocking=True)
+        event = torch.hpu.Event()
+        event.record()
+        if not hasattr(self, "sampling_copy_events"):
+            self.sampling_copy_events = {}
+        self.sampling_copy_events[batch] = event
+        local = replay.tail_local_logits(hidden) if replay is not None else None
+        if local is None:
+            local = self.sample_local_head(hidden)
+        logits = self.model.program.all_gather(local, dim=-1)
+        key = batch, filtered
+        if key not in self.stochastic_samplers:
+            self.stochastic_samplers[key] = torch.compile(
+                partial(sample_probabilities, filtered=filtered), backend=self.sampling_backend,
+                fullgraph=True, dynamic=False
+            )
+        return self.stochastic_samplers[key](logits, controls)
 
     def get_model(self):
         return self.model
@@ -1984,7 +2040,12 @@ class V41ModelRunner:
         need_sample = start + count >= len(request.prompt) + len(request.output)
         if self.pp.group.is_last_rank and need_sample:
             if not self.use_dspark:
-                if decode and self.pp.device_commit_enabled:
+                if request.sampling_params.temperature != 0:
+                    replay = getattr(getattr(self.model, "program", None), "replay_owner", None) if decode else None
+                    sample_input = self._sample_requests(hidden[-1:], (request,), replay=replay)
+                    if decode and self.pp.device_commit_enabled:
+                        sample_input = self.sample_commit(sample_input, self.pp.commit)
+                elif decode and self.pp.device_commit_enabled:
                     sample_input = self.sample_target_commit(hidden[-1:], self.pp.commit)
                 else:
                     replay = getattr(getattr(self.model, "program", None), "replay_owner", None) if decode else None

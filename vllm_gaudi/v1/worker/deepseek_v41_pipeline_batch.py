@@ -137,7 +137,10 @@ class TwoMicrobatchPipeline:
                                                         "pre_mix": frame.pre
                                                     }),
                                                     lane=lane)
-                frame.token.copy_(execution.samplers[bucket](value))
+                if any(req.sampling_params.temperature != 0 for req in half):
+                    frame.token.copy_(runner._sample_requests(value, half))
+                else:
+                    frame.token.copy_(execution.samplers[bucket](value))
                 model.complete_request_batch([1] * len(half))
             offset += len(half)
         self.sampled.record(compute)

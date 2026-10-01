@@ -151,7 +151,10 @@ class BatchExecution:
                                                           "hidden_states": hidden,
                                                           "pre_mix": pre
                                                       }))
-            token.copy_(self.samplers[b](values))
+            if any(req.sampling_params.temperature != 0 for req in requests):
+                token.copy_(self.runner._sample_requests(values, requests))
+            else:
+                token.copy_(self.samplers[b](values))
         pp.broadcast(token, src=1)
         token_host.copy_(token, non_blocking=True)
         done = torch.hpu.Event()

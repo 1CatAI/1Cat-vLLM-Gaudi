@@ -81,14 +81,17 @@ def validate_v2(config):
     # the segmented device producer.
 
 
-def validate_sampling(params):
+def validate_sampling(params, *, dspark=None):
     from vllm.exceptions import VLLMValidationError
 
     if params is None:
         raise VLLMValidationError("V4.1 runner requires sampling parameters")
+    if dspark is None:
+        dspark = envs.VLLM_HPU_DSV41_DSPARK
+    if dspark and params.temperature != 0:
+        raise VLLMValidationError("V4.1 DSpark requires greedy sampling (temperature=0)")
     if (
-        params.temperature != 0
-        or params.logprobs is not None
+        params.logprobs is not None
         or params.prompt_logprobs is not None
         or params.presence_penalty != 0
         or params.frequency_penalty != 0
@@ -99,7 +102,10 @@ def validate_sampling(params):
         or params.structured_outputs is not None
         or params.min_tokens
     ):
-        raise VLLMValidationError("V4.1 DSpark currently supports unmodified greedy sampling (temperature=0)")
+        raise VLLMValidationError(
+            "V4.1 supports temperature, top_p, top_k and seed; penalties, logprobs and constrained sampling "
+            "are not supported"
+        )
 
 
 def configure(config):

@@ -14,7 +14,8 @@ def test_tail_keeps_three_public_outputs_and_generation_guard():
     variant.tail_enabled = True
     hidden = torch.ones(1, 8, dtype=torch.bfloat16)
     token = torch.tensor([[27]], dtype=torch.int32)
-    values = hidden, None, None, token
+    logits = torch.randn(1, 16)
+    values = hidden, None, None, token, logits
     outputs = variant.publish_outputs(values)
     assert len(outputs) == 3 and variant.tail_values[0] is token
     program = torch.nn.Module()
@@ -24,10 +25,13 @@ def test_tail_keeps_three_public_outputs_and_generation_guard():
     replay.latest_tail = None
     replay._publish_tail(variant, outputs)
     assert replay.greedy_tail_token(hidden[:]) is token
+    assert replay.tail_local_logits(hidden[:]) is logits
+    assert replay.tail_local_logits(hidden.clone()) is None
     assert replay.greedy_tail_token(hidden.clone()) is None
     assert replay.greedy_tail_token(hidden.float()) is None
     program.generation += 1
     assert replay.greedy_tail_token(hidden) is None
+    assert replay.tail_local_logits(hidden) is None
 
 
 def test_non_tail_decode_clears_prior_sample():

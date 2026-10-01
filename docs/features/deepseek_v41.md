@@ -239,8 +239,9 @@ prepared V4.1 engine, not a stock checkout; the adjacent JSON manifest records
 the pinned revision and required parent file hashes. Other platforms still
 require Triton, and all remaining V2 feature checks stay enabled.
 
-Only ordinary C1 decode is supported. DSpark, inline completion, resumed
-generated-prefix replay, and non-greedy sampling are rejected. Prefill keeps the
+Only ordinary C1 decode is supported. DSpark, inline completion and resumed
+generated-prefix replay are rejected. Ordinary sampling supports temperature,
+top-p, top-k and seed; speculative verification still requires greedy sampling. Prefill keeps the
 synchronous completion path. The full V2 device-continuation bundle passed an
 exact three-run end-to-end cohort with a 10.4% median latency improvement; its
 trace-localized turnover residual fell by about 60%. Unsupported sampling,
@@ -435,4 +436,9 @@ on a separate loopback port and expose that port. This streaming adapter allows
 only model queries, Chat/Completion generation and health; it rejects internal
 RPC, metrics and profiler routes even with a valid key. The backend remains
 loopback-only. Use the published model name and `temperature: 0` for the qualified
-ordinary greedy path. Requests with unsupported sampling modifiers fail explicitly.
+ordinary greedy path. Ordinary decode also supports the model-recommended
+`temperature: 1.0` with `top_p: 0.95` or `1.0`; probability filtering runs on the
+device and request-owned random draws agree across TP ranks. These settings can
+change output length and incur sampling overhead, so greedy performance results
+do not qualify stochastic sampling. Requests with unsupported penalties,
+logprobs or constrained sampling fail explicitly.

@@ -1995,7 +1995,11 @@ class PreparedGreedyTail(nn.Module):
         self.is_last_stage = True
 
     def forward(self, hidden):
-        return self.sample_greedy_token(hidden)
+        from vllm_gaudi.ops.deepseek_v41_sampling import local_greedy_candidate, select_greedy_candidate
+
+        local = self._head_projection(hidden)
+        candidates = self.all_gather(local_greedy_candidate(local, self.tp_rank), dim=-1)
+        return select_greedy_candidate(candidates).to(torch.int32), local
 
 
 class PreparedLayerGroup(nn.Module):
@@ -2104,7 +2108,7 @@ class PreparedLayerGroup(nn.Module):
         value = final_collapse_rms_norm(residual, pre_mix, self.norm.weight, self.eps)
         aux = torch.cat(target_states, -1) if target_states else None
         if self.greedy_tail is not None and decode and value.shape[0] == 1:
-            return value, pre_mix, aux, self.greedy_tail(value)
+            return value, pre_mix, aux, *self.greedy_tail(value)
         return value, pre_mix, aux
 
     def forward(self, residual, pre_mix, positions, input_ids, engram_rows):
