@@ -157,14 +157,13 @@ def prefill_function_region(function):
             envs.VLLM_HPU_DSV41_PREFILL_MHC_CONTROL_BF16,
             envs.VLLM_HPU_DSV41_PREFILL_MHC_POST_PREPARE,
         )
-        key = (
-            function.__module__,
-            function.__qualname__,
-            compile_mode,
-            _signature(args),
-            tuple((k, _signature(v)) for k, v in sorted(kwargs.items())),
-        )
-        entry = _function_regions.get(key)
+        family_key = function.__module__, function.__qualname__
+        # Independent tensor functions must not evict each other's warmed
+        # contracts. These executors take weights/state as runtime arguments;
+        # native expert plans retain their separate, smaller workspace budget.
+        cache = _function_regions.setdefault(family_key, OrderedDict())
+        key = (compile_mode, _signature(args), tuple((k, _signature(v)) for k, v in sorted(kwargs.items())))
+        entry = cache.get(key)
         if entry is None:
             name = f"v41_prefill_function_{function.__name__}_{next(_entries)}"
             cloned = FunctionType(
@@ -176,11 +175,11 @@ def prefill_function_region(function):
             )
             cloned.__kwdefaults__ = function.__kwdefaults__
             entry = torch.compile(cloned, backend="hpu_backend", fullgraph=True, dynamic=False)
-            _function_regions[key] = entry
-            if len(_function_regions) > 64:
-                _function_regions.popitem(last=False)
+            cache[key] = entry
+            if len(cache) > 64:
+                cache.popitem(last=False)
         else:
-            _function_regions.move_to_end(key)
+            cache.move_to_end(key)
         try:
             return entry(*args, **kwargs)
         except RuntimeError as error:
