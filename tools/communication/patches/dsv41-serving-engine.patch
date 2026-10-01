@@ -476,13 +476,23 @@
      def reset_mm_cache(self):
 --- a/vllm/v1/outputs.py
 +++ b/vllm/v1/outputs.py
-@@ -369,6 +369,10 @@
+@@ -12,6 +12,7 @@
+ 
+ from vllm.compilation.cuda_graph import CUDAGraphStat
+ from vllm.utils.torch_utils import PIN_MEMORY
++from vllm.v1.core.auxiliary_prefix_cache import AuxiliaryPrefixAck
+ from vllm.v1.core.sched.output import SchedulerOutput
+ 
+ if TYPE_CHECKING:
+@@ -369,6 +370,12 @@
      # ``None`` when ``return_sampling_mask`` is off.
      sampling_masks: SamplingMaskLists | None = None
  
 +    # Optional host-only correlation keys (request, generation, target count).
 +    # The worker retains timestamps; EngineCore records final consumption.
 +    execution_rounds: list[tuple[str, int, int]] | None = None
++
++    auxiliary_prefix_acknowledgments: list[AuxiliaryPrefixAck] | None = None
 +
      @staticmethod
      def with_kv_conn_output_only(
@@ -517,3 +527,436 @@
          # Clean up quantized KV cache scale views
          # (int8_per_token_head, fp8_per_token_head)
          if hasattr(layer, "impl"):
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -9,6 +9,11 @@
+ from vllm.distributed.kv_events import BlockStored, KVCacheEvent
+ from vllm.logger import init_logger
+ from vllm.utils.math_utils import cdiv
++from vllm.v1.core.auxiliary_prefix_cache import (
++    AuxiliaryPrefixCache,
++    AuxiliaryPrefixDescriptor,
++    AuxiliaryPrefixOperations,
++)
+ from vllm.v1.core.kv_cache_coordinator import (
+     HybridKVCacheCoordinator,
+     get_kv_cache_coordinator,
+@@ -132,6 +137,7 @@
+         pcp_world_size: int = 1,
+         metrics_collector: KVCacheMetricsCollector | None = None,
+         watermark: float = 0.0,
++        auxiliary_prefix_cache: AuxiliaryPrefixCache | None = None,
+     ) -> None:
+         self.max_model_len = max_model_len
+         # When unset, fall back to `max_model_len` so the recycling-aware cap
+@@ -141,6 +147,8 @@
+             max_in_flight_tokens = max_model_len
+ 
+         self.enable_caching = enable_caching
++        self.auxiliary_prefix_cache = auxiliary_prefix_cache
++        self.auxiliary_prefix_hits: dict[str, AuxiliaryPrefixDescriptor] = {}
+         self.enable_kv_cache_events = enable_kv_cache_events
+         self.use_eagle = use_eagle
+         self.log_stats = log_stats
+@@ -246,6 +254,7 @@
+         # disabled or the request is marked as skipping kv cache read
+         # (which happens when the request requires prompt logprobs
+         # or calls a pooling model with all pooling).
++        self.auxiliary_prefix_hits.pop(request.request_id, None)
+         if not self.prefix_cache_lookup_enabled(request):
+             return self.empty_kv_cache_blocks, 0, 0
+ 
+@@ -261,6 +270,22 @@
+                 request.block_hashes, max_cache_hit_length
+             )
+         )
++
++        if self.auxiliary_prefix_cache is not None:
++            descriptor = self.auxiliary_prefix_cache.find(
++                request.block_hashes,
++                num_new_computed_tokens,
++                tuple(
++                    tuple(block.block_id for block in group)
++                    for group in computed_blocks
++                ),
++            )
++            if descriptor is None:
++                return self.empty_kv_cache_blocks, 0, 0
++            num_new_computed_tokens, num_uncached = descriptor.num_tokens, 0
++            count = descriptor.num_tokens // self.auxiliary_prefix_cache.block_size
++            computed_blocks = tuple(group[:count] for group in computed_blocks)
++            self.auxiliary_prefix_hits[request.request_id] = descriptor
+ 
+         # When kv_cache_report_mode is "full", emit BlockStored events
+         # for the reused prefix cache blocks so that external consumers
+@@ -622,12 +647,59 @@
+             bool: True if the prefix cache is successfully reset,
+             False otherwise.
+         """
++        if (
++            self.auxiliary_prefix_cache is not None
++            and not self.auxiliary_prefix_cache.can_reset
++        ):
++            return False
+         if not self.block_pool.reset_prefix_cache():
+             return False
++        if self.auxiliary_prefix_cache is not None:
++            self.auxiliary_prefix_cache.reset()
++            self.auxiliary_prefix_hits.clear()
+         if self.log_stats:
+             assert self.prefix_cache_stats is not None
+             self.prefix_cache_stats.reset = True
+         return True
++
++    def prepare_auxiliary_prefixes(
++        self,
++        new_request_ids: Sequence[str],
++        requests: dict[str, Request],
++        num_scheduled_tokens: dict[str, int],
++    ) -> AuxiliaryPrefixOperations | None:
++        cache = self.auxiliary_prefix_cache
++        if cache is None:
++            return None
++        operations = AuxiliaryPrefixOperations()
++        # Lease every admitted hit before reserving any replacement slot.
++        for request_id in new_request_ids:
++            if requests[request_id].num_computed_tokens == 0:
++                continue
++            descriptor = self.auxiliary_prefix_hits.get(request_id)
++            if descriptor is None:
++                raise RuntimeError("Computed prefix has no auxiliary state checkpoint")
++            cache.lease(request_id, descriptor)
++            operations.restores[request_id] = descriptor
++        self.auxiliary_prefix_hits.clear()
++        for request_id, count in num_scheduled_tokens.items():
++            request = requests[request_id]
++            start = request.num_computed_tokens
++            boundary = (
++                (request.num_prompt_tokens - 1) // cache.block_size * cache.block_size
++            )
++            if not start < boundary <= start + count:
++                continue
++            pages = boundary // cache.block_size
++            block_ids = self.get_blocks(request_id).get_block_ids()
++            descriptor = cache.reserve_capture(
++                boundary,
++                request.block_hashes[pages - 1],
++                tuple(tuple(group[:pages]) for group in block_ids),
++            )
++            if descriptor is not None:
++                operations.captures[request_id] = descriptor
++        return operations if operations.captures or operations.restores else None
+ 
+     def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
+         """Calculate the number of common prefix blocks for each kv cache group.
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -7,6 +7,7 @@
+ 
+ from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
+ from vllm.multimodal.utils import strip_covered_mm_data
++from vllm.v1.core.auxiliary_prefix_cache import AuxiliaryPrefixOperations
+ 
+ if TYPE_CHECKING:
+     import numpy as np
+@@ -295,6 +296,8 @@
+     # Number of spec tokens to schedule for the next step.
+     num_spec_tokens_to_schedule: int = 0
+ 
++    auxiliary_prefix_operations: AuxiliaryPrefixOperations | None = None
++
+     @classmethod
+     def make_empty(cls) -> "SchedulerOutput":
+         return cls(
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -31,6 +31,7 @@
+ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
+ from vllm.multimodal.encoder_budget import MultiModalBudget
+ from vllm.multimodal.utils import get_mm_features_in_window
++from vllm.v1.core.auxiliary_prefix_cache import AuxiliaryPrefixCache
+ from vllm.v1.core.encoder_cache_manager import (
+     EncoderCacheManager,
+     EncoderDecoderCacheManager,
+@@ -292,6 +293,30 @@
+         if hash_block_size is None:
+             hash_block_size = block_size
+         self.hash_block_size = hash_block_size
++        auxiliary_prefix_cache = None
++        if self.cache_config.enable_prefix_caching and any(
++            group.kv_cache_spec.requires_auxiliary_prefix_state
++            for group in kv_cache_config.kv_cache_groups
++        ):
++            if (
++                len(kv_cache_config.kv_cache_groups) != 1
++                or hash_block_size != block_size
++                or self.dcp_world_size != 1
++                or self.connector is not None
++                or vllm_config.speculative_config is not None
++            ):
++                raise ValueError(
++                    "Auxiliary prefix checkpoints require one uniform local page group "
++                    "without context parallelism or speculative execution"
++                )
++            auxiliary_prefix_cache = AuxiliaryPrefixCache(
++                capacity=min(128, 2 * self.max_num_running_reqs),
++                world_size=(
++                    self.parallel_config.tensor_parallel_size
++                    * self.parallel_config.pipeline_parallel_size
++                ),
++                block_size=block_size,
++            )
+         self.kv_cache_manager = KVCacheManager(
+             kv_cache_config=kv_cache_config,
+             max_model_len=self.max_model_len,
+@@ -307,6 +332,7 @@
+             hash_block_size=hash_block_size,
+             metrics_collector=self.kv_metrics_collector,
+             watermark=self.scheduler_config.watermark,
++            auxiliary_prefix_cache=auxiliary_prefix_cache,
+         )
+         # Bind GPU block pool to the KV connector. This must happen after
+         # kv_cache_manager is constructed so block_pool is available.
+@@ -1363,6 +1389,11 @@
+             kv_connector_block_state=kv_connector_block_state,
+             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
++            auxiliary_prefix_operations=self.kv_cache_manager.prepare_auxiliary_prefixes(
++                [req.request_id for req in scheduled_new_reqs + scheduled_resumed_reqs],
++                self.requests,
++                num_scheduled_tokens,
++            ),
+         )
+ 
+         # NOTE(Kuntai): this function is designed for multiple purposes:
+@@ -1813,6 +1844,15 @@
+         scheduler_output: SchedulerOutput,
+         model_runner_output: ModelRunnerOutput,
+     ) -> dict[int, EngineCoreOutputs]:
++        auxiliary = scheduler_output.auxiliary_prefix_operations
++        if auxiliary is not None:
++            cache = self.kv_cache_manager.auxiliary_prefix_cache
++            assert cache is not None
++            cache.complete(
++                auxiliary, model_runner_output.auxiliary_prefix_acknowledgments or []
++            )
++        elif model_runner_output.auxiliary_prefix_acknowledgments:
++            raise RuntimeError("Unexpected auxiliary prefix acknowledgment")
+         sampled_token_ids = model_runner_output.sampled_token_ids
+         logprobs = model_runner_output.logprobs
+         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -160,6 +160,11 @@
+     def prefix_cacheable(self) -> bool:
+         """Whether this spec's group participates in prefix caching."""
+         return True
++
++    @property
++    def requires_auxiliary_prefix_state(self) -> bool:
++        """Whether a token-page hit also needs an all-worker state checkpoint."""
++        return False
+ 
+     @property
+     def num_heads(self) -> int:
+@@ -1046,6 +1051,12 @@
+     @property
+     def prefix_cacheable(self) -> bool:
+         return all(spec.prefix_cacheable for spec in self.kv_cache_specs.values())
++
++    @property
++    def requires_auxiliary_prefix_state(self) -> bool:
++        return any(
++            spec.requires_auxiliary_prefix_state for spec in self.kv_cache_specs.values()
++        )
+ 
+     @property
+     def first_spec(self) -> KVCacheSpec:
+--- /dev/null
++++ b/vllm/v1/core/auxiliary_prefix_cache.py
+@@ -0,0 +1,185 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Publication and leases for prefix state outside the token-page pool.
++
++Token-page hashes alone cannot authorize a hit for recurrent auxiliary state.
++The scheduler owns replacement; workers acknowledge a checkpoint only after
++all state copies finish. This ledger does not own or pin token pages: lookup
++must also validate the current scheduler block IDs.
++"""
++
++from collections import OrderedDict
++from collections.abc import Sequence
++from dataclasses import dataclass, field
++
++
++@dataclass(frozen=True)
++class AuxiliaryPrefixDescriptor:
++    slot: int
++    generation: int
++    num_tokens: int
++    block_hash: bytes
++    block_ids: tuple[tuple[int, ...], ...]
++
++    @property
++    def ticket(self) -> tuple[int, int]:
++        return self.slot, self.generation
++
++
++@dataclass(frozen=True)
++class AuxiliaryPrefixAck:
++    ticket: tuple[int, int]
++    rank: int
++
++
++@dataclass
++class AuxiliaryPrefixOperations:
++    captures: dict[str, AuxiliaryPrefixDescriptor] = field(default_factory=dict)
++    restores: dict[str, AuxiliaryPrefixDescriptor] = field(default_factory=dict)
++
++
++@dataclass
++class _Entry:
++    descriptor: AuxiliaryPrefixDescriptor
++    ready: bool = False
++    leases: set[str] = field(default_factory=set)
++
++
++class AuxiliaryPrefixCache:
++    """One bounded, scheduler-owned checkpoint table shared by all workers."""
++
++    def __init__(self, capacity: int, world_size: int, block_size: int):
++        if capacity <= 0 or world_size <= 0 or block_size <= 0:
++            raise ValueError("Auxiliary prefix dimensions must be positive")
++        self.capacity = capacity
++        self.world_size = world_size
++        self.block_size = block_size
++        self.entries: OrderedDict[int, _Entry] = OrderedDict()
++        self.generations = [0] * capacity
++
++    def _entry(self, descriptor: AuxiliaryPrefixDescriptor) -> _Entry:
++        entry = self.entries.get(descriptor.slot)
++        if entry is None or entry.descriptor != descriptor:
++            raise RuntimeError("Stale auxiliary prefix descriptor")
++        return entry
++
++    def reserve_capture(
++        self,
++        num_tokens: int,
++        block_hash: bytes,
++        block_ids: tuple[tuple[int, ...], ...],
++    ) -> AuxiliaryPrefixDescriptor | None:
++        """Reserve a worker slot; no hit is possible before acknowledgment.
++
++        A full table with pending copies/leases is a cache miss, not permission
++        to overwrite them. The worker replaces the same slot on every rank.
++        """
++        if num_tokens <= 0 or num_tokens % self.block_size:
++            raise ValueError("Checkpoint must end at a complete token page")
++        if not isinstance(block_hash, bytes) or not block_hash:
++            raise ValueError("Checkpoint requires an immutable block hash")
++        pages = num_tokens // self.block_size
++        if not block_ids or any(
++            len(group) != pages or any(block <= 0 for block in group)
++            for group in block_ids
++        ):
++            raise ValueError("Checkpoint must cover all prefix pages")
++        # Duplicates may use different physical pages after concurrent cold
++        # requests. Preserve each descriptor's exact source allocation.
++        slot = next((i for i in range(self.capacity) if i not in self.entries), None)
++        if slot is None:
++            slot = next(
++                (
++                    i
++                    for i, entry in self.entries.items()
++                    if entry.ready and not entry.leases
++                ),
++                None,
++            )
++        if slot is None:
++            return None
++        self.generations[slot] += 1
++        descriptor = AuxiliaryPrefixDescriptor(
++            slot, self.generations[slot], num_tokens, block_hash, block_ids
++        )
++        self.entries[slot] = _Entry(descriptor)
++        self.entries.move_to_end(slot)
++        return descriptor
++
++    def find(
++        self,
++        block_hashes: Sequence[bytes],
++        max_length: int,
++        block_ids: tuple[Sequence[int], ...],
++    ) -> AuxiliaryPrefixDescriptor | None:
++        """Clamp a real token-page hit to an acknowledged state boundary."""
++        matches = []
++        for entry in self.entries.values():
++            descriptor = entry.descriptor
++            pages = descriptor.num_tokens // self.block_size
++            if (
++                entry.ready
++                and descriptor.num_tokens <= max_length
++                and pages <= len(block_hashes)
++                and block_hashes[pages - 1] == descriptor.block_hash
++                and tuple(tuple(group[:pages]) for group in block_ids)
++                == descriptor.block_ids
++            ):
++                matches.append(descriptor)
++        if not matches:
++            return None
++        selected = max(matches, key=lambda descriptor: descriptor.num_tokens)
++        self.entries.move_to_end(selected.slot)
++        return selected
++
++    def lease(self, request_id: str, descriptor: AuxiliaryPrefixDescriptor) -> None:
++        """Protect a scheduled restore until its worker result is consumed."""
++        entry = self._entry(descriptor)
++        if not entry.ready:
++            raise RuntimeError("Cannot lease an unpublished auxiliary prefix")
++        if request_id in entry.leases:
++            raise RuntimeError("Duplicate auxiliary prefix restore lease")
++        entry.leases.add(request_id)
++
++    def complete(
++        self,
++        operations: AuxiliaryPrefixOperations,
++        acknowledgments: Sequence[AuxiliaryPrefixAck],
++    ) -> None:
++        """Publish only the exact all-rank checkpoint set of this step.
++
++        Validate the whole result before mutating the ledger. A canceled
++        request's in-flight restore still retains its lease until this call.
++        """
++        captures = [self._entry(item) for item in operations.captures.values()]
++        restores = {
++            request_id: self._entry(item)
++            for request_id, item in operations.restores.items()
++        }
++        expected = {
++            (entry.descriptor.ticket, rank)
++            for entry in captures
++            for rank in range(self.world_size)
++        }
++        actual = [(ack.ticket, ack.rank) for ack in acknowledgments]
++        if len(actual) != len(expected) or set(actual) != expected:
++            raise RuntimeError("Auxiliary prefix acknowledgment is incomplete or stale")
++        if any(entry.ready for entry in captures):
++            raise RuntimeError("Auxiliary prefix capture was already published")
++        if any(
++            request_id not in entry.leases for request_id, entry in restores.items()
++        ):
++            raise RuntimeError("Auxiliary prefix restore has no live lease")
++        for entry in captures:
++            entry.ready = True
++        for request_id, entry in restores.items():
++            entry.leases.remove(request_id)
++
++    def reset(self) -> None:
++        if not self.can_reset:
++            raise RuntimeError("Cannot reset auxiliary prefixes with in-flight owners")
++        self.entries.clear()
++
++    @property
++    def can_reset(self) -> bool:
++        return all(entry.ready and not entry.leases for entry in self.entries.values())

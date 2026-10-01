@@ -560,9 +560,9 @@ def main():
     prefix_caching = (
         []
         if any(value.split("=")[0] in ("--enable-prefix-caching", "--no-enable-prefix-caching") for value in extra)
-        else ["--no-enable-prefix-caching"]
+        else ["--enable-prefix-caching" if settings.get("enable_prefix_caching", False) else "--no-enable-prefix-caching"]
     )
-    if "--enable-prefix-caching" in extra and not any(
+    if "--enable-prefix-caching" in extra + prefix_caching and not any(
         value.split("=")[0] in ("--enable-prompt-tokens-details", "--no-enable-prompt-tokens-details")
         for value in extra
     ):

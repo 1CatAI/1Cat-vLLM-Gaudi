@@ -55,7 +55,7 @@
     {
       "path": "vllm/v1/outputs.py",
       "parent_sha256": "fae981c1f2e2b7d8a106d183468428d26b0467477e0427c06d4346c1888bee68",
-      "candidate_sha256": "b8e010fec9b123017625610141afe23146431f0f3fa63e782815bf063aeda399"
+      "candidate_sha256": "b9e94a88c552bb956071da4dff29bb44169c5f9c071979e3854c12eb909d79e3"
     },
     {
       "path": "vllm/v1/utils.py",
@@ -66,7 +66,32 @@
       "path": "vllm/v1/worker/utils.py",
       "parent_sha256": "5ed6caaf5797c214398be2a28fe7b6b24a4e9eb7b9b72fa6f17afec4a495875c",
       "candidate_sha256": "3f3a425d084707922cfe27dd8e096d9622f2098d4b1600a88abc05cc057fc08a"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_manager.py",
+      "parent_sha256": "44a097c5fafaab70b952434b90f57ddacb224e208f19ecc719fcb441af39290e",
+      "candidate_sha256": "2f52a22e28bf6b0c574b4463397c398e30a0eab8b6a2587f91e56f8c9da62215"
+    },
+    {
+      "path": "vllm/v1/core/sched/output.py",
+      "parent_sha256": "41cf5780a013a0c731a0409836ad635d1c84a6aad706ad4e68e189d4a6eaf525",
+      "candidate_sha256": "f5d91f5dce3d23f3097fedac4fc8d33d2b35046954626ffae92f7f2c8b6ecb1f"
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "parent_sha256": "e5e1c18b1d7a6ea73adbb4921f64a35b00a96abe673691bf6a7f57281a524519",
+      "candidate_sha256": "543f7a059df9a6e243293921f1fb84f65b7b82d39dfcc896204b845ce3aa08f8"
+    },
+    {
+      "path": "vllm/v1/kv_cache_interface.py",
+      "parent_sha256": "f1a63db8d1404d8e8998e70f3a373e8e93d159e62be6dc108d0840a9ce0accf3",
+      "candidate_sha256": "3bd5c0d9859fa5ab9007e300b8e37adf56783571363529dddf9a2c7a6fd0a4d3"
+    },
+    {
+      "path": "vllm/v1/core/auxiliary_prefix_cache.py",
+      "parent_sha256": null,
+      "candidate_sha256": "c3e2b136c94fcf1b6194e2c2a6ecc54559c895bdf12e040c4995d997011a3bc7"
     }
   ],
-  "patch_sha256": "440df9630039b46d947d05d5a3966c812a361f07f0863cec4726bd648abc488f"
+  "patch_sha256": "4a35e7221ac47e1a88137d8a38ff9093b7c5bbd7fab01ba385055ff734198f52"
 }
