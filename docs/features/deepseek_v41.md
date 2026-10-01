@@ -440,5 +440,8 @@ ordinary greedy path. Ordinary decode also supports the model-recommended
 `temperature: 1.0` with `top_p: 0.95` or `1.0`; probability filtering runs on the
 device and request-owned random draws agree across TP ranks. These settings can
 change output length and incur sampling overhead, so greedy performance results
-do not qualify stochastic sampling. Requests with unsupported penalties,
+do not qualify stochastic sampling. The recommended temperature/top-p pair
+passed natural-EOS checks and a fixed semantic cohort separately; stochastic
+sampling is not yet qualified against the greedy latency target.
+Requests with unsupported penalties,
 logprobs or constrained sampling fail explicitly.

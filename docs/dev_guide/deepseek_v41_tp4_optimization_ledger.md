@@ -368,3 +368,25 @@ positive-tail excess0.235ms. One formal request is retained; no repeat cohort.
 CPU/card conditions and the continuous-foreign-card telemetry limitation are
 recorded in `evidence/20260928_tp4-decode-gap-1p5/portable-serving-acceptance-02`.
 The separate public streaming adapter restricts exposure to inference routes.
+
+### Ordinary sampling qualification (2026-10-01)
+
+This is a functional correction, not a gain-ledger item. Ordinary decode
+incorrectly shared DSpark's greedy-only validator and argmax tail. It now
+supports temperature, top-p, top-k and seed while retaining shared stage replay
+and reusing local head logits. DSpark still requires greedy verification.
+
+Independent installed source, full warmup and unprofiled 16K→natural EOS:
+greedy 9.975 ms/token, 2,784 output tokens, exact match to the accepted reference;
+model-recommended temperature1/top-p0.95/seed42: 10.426 ms/token, 2,130 output
+tokens, 95.91 tokens/s. Five fixed official-sampling quality samples passed
+semantic checks; categorical frequencies, TP seed ownership and replayed
+changing controls passed CPU/HPU tests. CPU suite: 976 passed/114 skipped.
+The requests share their input but generate different output histories; their
+0.451 ms average difference is not a token-matched causal ablation. Existing
+greedy results do not qualify stochastic sampling, which remains above the
+10 ms target. No speculative decoding or performance profiler was active.
+Evidence: `evidence/20260928_tp4-decode-gap-1p5/sampling-validation.json`,
+`sampling-greedy-acceptance-01`, `sampling-official-acceptance-01`,
+`sampling-quality-report.json`; host/card snapshots accompany both formal runs.
+No pending component gains are added by this change.
