@@ -2,20 +2,47 @@
 """An interior checkpoint must survive later rows without rewinding live state."""
 import pytest
 import torch
+from types import SimpleNamespace
 
 from vllm_gaudi.ops.deepseek_v41_math import pack_swa
 from vllm_gaudi.ops.deepseek_v41_prefix_state import BatchPrefixSnapshot, InlinePrefixCapture
 from test_prefix_state import Event, make_bank, slot_values
+from vllm_gaudi.v1.worker.deepseek_v41_prefix import PrefixCheckpoints
 
 
-@pytest.mark.parametrize("start,end,boundary", [(0, 16384, 16256), (16384, 32768, 32640)])
+@pytest.mark.parametrize("start,sizes,boundary", [(0, [1024], 896),
+                                                (16384, [4096, 1024], 21376),
+                                                (32768, [8192, 1024], 41856)])
+def test_checkpoint_keeps_finite_tail_and_activates_only_its_producer(start, sizes, boundary):
+    bank, _, _, _ = make_bank()
+    bank.program.shared = SimpleNamespace(inline_prefix_capture=None)
+    runner = SimpleNamespace(vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=2)),
+                             model=SimpleNamespace(batch_state=bank), prefill_capacity=16384)
+    runtime = PrefixCheckpoints(runner)
+    runtime.operations = SimpleNamespace(captures={"source": SimpleNamespace(num_tokens=boundary)})
+    chunks, offset = [], 0
+    for size in sizes:
+        chunks.append((offset, list(range(start + offset, start + offset + size))))
+        offset += size
+    assert runtime.chunks("source", start, chunks, inline_eligible=True) == chunks
+    capture = runtime.inline["source"]
+    for offset, values in chunks:
+        runtime.activate_chunk("source", start + offset, len(values))
+        active = bank.program.shared.inline_prefix_capture
+        assert (active is capture) == (start + offset <= boundary < start + offset + len(values))
+    runtime.activate_chunk("source", start + sum(sizes), 1)
+    assert bank.program.shared.inline_prefix_capture is None
+
+
+@pytest.mark.parametrize("start,end,boundary", [(0, 16384, 16256), (16384, 32768, 32640),
+                                              (0, 1024, 896), (20480, 21504, 21376)])
 def test_full_prompt_and_decoder_halo_checkpoint_matches_causal_ring(start, end, boundary):
     bank, source, target, neighbour = make_bank()
     live, untouched = slot_values(bank, source), slot_values(bank, neighbour)
     capture = InlinePrefixCapture(bank, source, start, end, boundary)
     expected = {}
     for layer, state in bank.layers.items():
-        base = end - 4096 if layer == 1 else start
+        base = max(start, end - 4096) if layer == 1 else start
         positions = torch.arange(base, end)
         values = (positions[:, None].remainder(31) + torch.arange(512)[None, :].remainder(7)).float() / 16
         for name, _ in state.named_buffers(recurse=False):

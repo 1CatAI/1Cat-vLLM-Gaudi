@@ -411,6 +411,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             for name in ("custom_deepseek_v41_main_publish_mla_gaudi2", "custom_deepseek_v41_main_reuse_mla_gaudi2")
         )
         self.index_mirror_scores = bool(getattr(shared, "index_mirror_tokens", 0))
+        self.runtime_index_mme = hasattr(torch.ops.custom_op, "custom_deepseek_v41_prefill_paged_index_scores_gaudi2")
         # Kept unselected until the distributed selection consumer gate passes.
         self.tp4_tile_selection = False
         # Distributed mirror selection regresses the complete decode chain.
@@ -1200,17 +1201,20 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                     positions.to(torch.int32).contiguous(),
                     pool,
                     ratio=self.ratio,
-                    capacity=self.length // self.ratio,
+                    # Packed scoring beyond the decoded mirror must scan the
+                    # same bounded geometry as this stage, not every reserved
+                    # context row. Device positions still mask future rows.
+                    capacity=(self.search_length if self.runtime_index_mme else self.length) // self.ratio,
                     reindex=self.layer > self.candidate_source,
                     publish_candidates=self.layer == self.candidate_source,
                     decoded_hot=decoded_hot,
                     ordered_candidates=True,
                     local_heads=self.index_heads,
-                    search_rows=(
-                        (self.decode_visible_rows or self.search_length // self.ratio)
-                        if self.search_length <= 32768 and decoded_hot is None
-                        else None
-                    ),
+                    # The paged-key/MME tile consumer already supports long
+                    # source ranges. Crossing the mirror capacity changes the
+                    # key producer, not the score arithmetic or selection.
+                    search_rows=(self.decode_visible_rows or self.search_length // self.ratio)
+                    if decoded_hot is None and self.runtime_index_mme else None,
                     decoded_keys=(self.cache.index_mirror if self._uses_index_mirror(q) else None),
                 )
                 if blocks is not None:

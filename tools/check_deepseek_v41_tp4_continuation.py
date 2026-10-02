@@ -23,6 +23,8 @@ def main():
     parser.add_argument('--bindings', type=Path, required=True)
     parser.add_argument('--engram-startup-directory', type=Path)
     parser.add_argument('--steps', type=int, default=32)
+    parser.add_argument('--context-tokens', type=int, default=16384)
+    parser.add_argument('--max-model-len', type=int, default=1048576)
     parser.add_argument('--speed-probe', action='store_true',
                         help='Candidate timing screen with exact saved tokens; broader state/lifecycle gate deferred')
     parser.add_argument('--qualify-positive', action='store_true',
@@ -108,6 +110,13 @@ def main():
         parser.error('Selection trace requires the ordered selection speed-screen fixture')
     if args.qualify_positive and not (args.speed_probe and args.state_reference_native_groups):
         parser.error('Conditional qualification requires the native-groups speed probe')
+    if args.context_tokens != 16384 and not args.resident_ab:
+        parser.error('Nonhistorical contexts require the isolated resident comparison')
+    if not 16384 <= args.context_tokens < args.max_model_len - 512 or args.context_tokens % 128:
+        parser.error('Context must be page aligned and leave room for the decode measurement')
+    context_tokens = args.context_tokens
+    from vllm_gaudi.v1.worker.deepseek_v41_runner import runtime_search_length, prefill_search_length
+    decode_search = runtime_search_length(context_tokens, 1, args.max_model_len)
     rank = int(os.environ['LOCAL_RANK'])
     os.environ['HLS_MODULE_ID'] = os.environ['HABANA_VISIBLE_MODULES'].split(',')[rank]
     for name in ('PT_HPU_RECIPE_CACHE_CONFIG',):
@@ -142,7 +151,7 @@ def main():
     init_distributed_environment(world_size=4, rank=rank, distributed_init_method='env://', local_rank=rank,
                                  backend='hccl')
     config = EngineArgs(model=str(args.prepared), dtype='bfloat16', tensor_parallel_size=4,
-                         pipeline_parallel_size=1, load_format='dsv41_prepared', max_model_len=1048576,
+                         pipeline_parallel_size=1, load_format='dsv41_prepared', max_model_len=args.max_model_len,
                          max_num_seqs=32, max_num_batched_tokens=8192, block_size=128,
                          enable_prefix_caching=False, async_scheduling=True).create_engine_config()
     output = Path(os.environ['DSV41_RUN_EVIDENCE']) / f'continuation-rank{rank}.json'
@@ -214,7 +223,7 @@ def main():
                              engram_sidecar=EngramFP8Sidecar(args.prepared / 'sidecars/engram_fp8', shard))
             stage = torch.nn.Module()
             stage.weights, stage.config = tree, {'text_config': text}
-            stage.length, stage.search_length = 1048576, 32768
+            stage.length, stage.search_length = args.max_model_len, decode_search
             stage.fp8_decode, stage.expert_n256, stage.bf16_head = True, True, True
             stage.tensor_parallel_size, stage.pp_rank, stage.tp_rank = 4, 0, rank
             stage.dspark, stage.is_last_stage, stage.generation = False, True, 1
@@ -295,7 +304,8 @@ def main():
             # Include the descending C8192 -> C1024 startup boundary that
             # the first complete model exposed. The final two chunks retain
             # the same exact 16K state used for the continuation comparison.
-            prefill_cases = ((0, 8192), (8192, 8192)) if args.speed_probe else (
+            prefill_cases = tuple((start, min(8192, context_tokens - start))
+                                  for start in range(0, context_tokens, 8192)) if args.speed_probe else (
                 (0, 8192), (0, 1024), (0, 8192), (8192, 8192))
             for start, count in prefill_cases:
                 if start == 0:
@@ -311,7 +321,8 @@ def main():
                 rows = host.wait(ticket)
                 pos = torch.arange(start, start + count, dtype=torch.int32, device='hpu')
                 for block in stage.layers:
-                    block.attention.set_search_length(start + count)
+                    block.attention.set_search_length(prefill_search_length(
+                        start, count, stage.length, reuse_index_keys=True))
                     block.attention.prefill_token_end = start + count
                 hidden = stage(residual, pre, pos, torch.tensor(tokens, device='hpu'), rows)[0]
                 host.complete(ticket, len(tokens))
@@ -319,15 +330,15 @@ def main():
                 print(f'TP{rank}: real 16-layer prefill {start}+{count} complete', flush=True)
             seed_hidden = hidden[-1:].clone()
             del hidden, residual, pre, rows, ticket, pos
-            if stage.shared.index_mirror_tokens:
-                stage.shared.prepare_index_mirror(16384)
+            if stage.shared.index_mirror_tokens and context_tokens <= stage.shared.index_mirror_tokens:
+                stage.shared.prepare_index_mirror(context_tokens)
                 report['index_mirror_capacity'] = stage.shared.index_mirror_tokens
                 report['index_mirror_rebuilds'] = stage.shared.index_mirror_rebuilds
             if args.state_reference_visible_prefix or args.production_visible_prefix:
-                stage.decode_token_bound = decode_source_prefix_bound(16385, stage.search_length, 4)
+                stage.decode_token_bound = decode_source_prefix_bound(context_tokens + 1, stage.search_length, 4)
                 report['decode_token_bound'] = stage.decode_token_bound
             for block in stage.layers:
-                block.attention.set_search_length(32768)
+                block.attention.set_search_length(decode_search)
                 block.attention.prefill_token_end = None
                 if args.state_reference_visible_prefix or args.production_visible_prefix:
                     block.attention.set_decode_visible_tokens(stage.decode_token_bound)
@@ -339,7 +350,7 @@ def main():
                 state.restore()
                 host.reset('chain')
                 host.history.history = initial_history.copy()
-                host.history.position = 16384
+                host.history.position = context_tokens
                 torch.hpu.synchronize()
 
             # Warm both stable argument contracts and prove device hash/decode
@@ -349,7 +360,7 @@ def main():
                 reset()
                 selected = sampler(seed_hidden)
                 value = int(selected.cpu()[0, 0])
-                controls.upload([value], 16384)
+                controls.upload([value], context_tokens)
                 if device:
                     host.prepare_device_c1('chain', selected.view(1))
                 ticket = host.prepare('chain', [value], defer_wait=True)
@@ -366,7 +377,7 @@ def main():
                 if args.shared_stage_replay:
                     for _ in range(4):
                         warmed = decoder.from_input_ids(positions, token_input, rows)[0].cpu()
-                        if decoder.input_variant_ready(32768):
+                        if decoder.input_variant_ready(decode_search):
                             break
                 else:
                     residual, pre = embedding(token_input)
@@ -379,9 +390,9 @@ def main():
                     torch.testing.assert_close(warmed, warm_reference, rtol=0, atol=0)
                 host.complete(ticket, 1)
             if args.shared_stage_replay:
-                assert decoder.input_variant_ready(32768)
+                assert decoder.input_variant_ready(decode_search)
             else:
-                assert decoder.prefix_groups == 3 and decoder.prefix_ready(32768)
+                assert decoder.prefix_groups == 3 and decoder.prefix_ready(decode_search)
             bind_worker_helpers(rank)
 
             original_projection = None
@@ -598,7 +609,10 @@ def main():
                 return [chunk.preparations for chunk in decoder.chunks]
 
             if args.resident_ab:
-                from deepseek_v41_resident_ab import serve
+                if __package__:
+                    from tools.deepseek_v41_resident_ab import serve
+                else:
+                    from deepseek_v41_resident_ab import serve
                 serve(stage, decoder, shard, chain, report, args, preparation_counts)
                 report.update(status='resident_ab_stopped', formal_gain_credit=False)
                 return

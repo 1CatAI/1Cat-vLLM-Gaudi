@@ -11,6 +11,7 @@ from vllm_gaudi.v1.worker.deepseek_v41_runner import (
     V41ModelRunner,
     decode_search_warmups,
     prefill_search_length,
+    prefill_search_warmups,
     runtime_search_length,
     prefill_compute_buckets,
     target_chunks,
@@ -169,12 +170,12 @@ def test_runtime_indexer_prewarms_and_reuses_one_bounded_2k_bucket():
         (0, 512),
         (512, 2560),
         *[(start, 32768) for start in range(2560, 32768, 4096)],
-        (32768, capacity),
+        *[(start, start * 2) for start in (32768, 65536, 131072, 262144, 524288)],
     ]
     for start, count in ((0, 2052), (2051, 1), (2306, 254)):
         assert runtime_search_length(start, count, capacity) == 2560
     assert runtime_search_length(2560, 1, capacity) == 32768
-    assert runtime_search_length(32768, 1, capacity) == capacity
+    assert runtime_search_length(32768, 1, capacity) == 65536
 
 
 def test_shared_prefill_geometry_does_not_change_decode_or_long_context_capacity():
@@ -184,12 +185,42 @@ def test_shared_prefill_geometry_does_not_change_decode_or_long_context_capacity
         assert prefill_search_length(start, count, capacity, reuse_index_keys=True) == expected
         assert runtime_search_length(start, count, capacity) == 32768
         assert prefill_search_length(start, count, capacity) == capacity
-    assert prefill_search_length(32768, 128, capacity, reuse_index_keys=True) == capacity
+    assert prefill_search_length(32768, 128, capacity, reuse_index_keys=True) == 65536
     assert prefill_search_length(512, 128, capacity, reuse_index_keys=True) == 2560
     assert prefill_search_length(0, 128, capacity, reuse_index_keys=True) == 512
     assert prefill_search_length(8192, 8192, 16384, reuse_index_keys=True) == 16384
     with pytest.raises(ValueError):
         prefill_search_length(capacity - 128, 256, capacity, reuse_index_keys=True)
+
+
+@pytest.mark.parametrize("capacity", [65536, 100000, 524288, 1048576])
+def test_long_runtime_geometry_covers_crossings_and_is_prepared_before_readiness(capacity):
+    warmups = list(decode_search_warmups(capacity, runtime_indexer=True))
+    long_buckets = {search for _, search in warmups if search > 32768}
+    for end in [32768, 32769, 41983, 62463, 65536, 65537, capacity]:
+        if end > capacity:
+            continue
+        search = runtime_search_length(end - 1, 1, capacity)
+        assert end <= search <= capacity
+        if end > 32768:
+            assert search < 2 * end
+            assert search in long_buckets
+            assert prefill_search_length(end - 128, 128, capacity, reuse_index_keys=True) == search
+    assert len(long_buckets) <= 5
+
+
+def test_prefill_warmup_covers_residual_tiles_in_each_reachable_search_bucket():
+    capacity = 524288
+    warmed = {(count, prefill_search_length(start, count, capacity, reuse_index_keys=True))
+              for start, count in prefill_search_warmups(capacity, 16384)}
+    assert len(warmed) <= 8 * 8
+    for prompt in [1024, 16384, 21504, 41983, 62463, 65537, 131073, 262145, capacity]:
+        for start in range(0, prompt, 16384):
+            count = min(16384, prompt - start)
+            search = prefill_search_length(start, count, capacity, reuse_index_keys=True)
+            for _, chunk in target_chunks(range(count), 16384):
+                if len(chunk) > 1:
+                    assert (len(chunk), search) in warmed
 
 
 def test_complete_prompt_search_retains_decoder_halo_mla_admission():

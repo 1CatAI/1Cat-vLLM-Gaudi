@@ -192,6 +192,7 @@ def settling_modules(samples, own_modules=(0, 1, 4, 5), maximum_variation_mib=16
 
 def wait_for_loading(directory, rank, dist):
     history = []
+    own_modules = tuple(int(module) for module in os.environ.get('HABANA_VISIBLE_MODULES', '0,1,4,5').split(','))
     while True:
         decision = [None]
         if rank == 0:
@@ -199,7 +200,7 @@ def wait_for_loading(directory, rank, dist):
             for _ in range(11):
                 samples.append(device_load())
                 time.sleep(1)
-            growing = settling_modules(samples)
+            growing = settling_modules(samples, own_modules=own_modules)
             history.append(dict(samples=samples, loading_modules=growing))
             decision[0] = not growing
             if growing:
@@ -227,10 +228,12 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
     def arm(name):
         if name not in arms:
             if name in ('dense_fp8', 'dense_fp8_tail', 'dense_fp8_static_int32',
-                        'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff', *COMPILER_CANDIDATES):
+                        'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff',
+                        'long_index_packed', 'long_index_mme', *COMPILER_CANDIDATES):
                 if 'dense_fp8' not in stages:
                     stages['dense_fp8'] = make_dense_stage(stage, shard, args.ab_dense_sidecar, args.ab_dense_config)
-                program = (make_handoff_stage(stages['dense_fp8']) if name == 'dense_fp8_swa_norm_handoff'
+                program = (make_handoff_stage(stages['dense_fp8'])
+                           if name in ('dense_fp8_swa_norm_handoff', 'long_index_packed', 'long_index_mme')
                            else make_attention_norm_stage(stages['dense_fp8']) if name == 'dense_fp8_swa_norm_quant'
                            else make_swa_stage(stages['dense_fp8']) if name == 'dense_fp8_swa_packed'
                            else clone_module(stages['dense_fp8']))
@@ -239,6 +242,9 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
             else:
                 raise ValueError(f'Unknown resident candidate {name}')
             program.decode_static_int32 = name == 'dense_fp8_static_int32'
+            if name in ('long_index_packed', 'long_index_mme'):
+                for block in program.layers:
+                    block.attention.runtime_index_mme = name == 'long_index_mme'
             replay = StageReplay(program, greedy_tail=name in ('tail', 'dense_fp8_tail'))
             program.replay_owner = replay
             stages[name], arms[name] = program, replay
@@ -246,7 +252,9 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
             # public diagnostic setting does not acquire another trace.
             graph_directory = control / 'compiler-graphs' / name / f'rank{rank}'
             graph_directory.mkdir(parents=True, exist_ok=True)
-            settings = dict(COMPILER_CANDIDATES.get(name, {}), DUMP_POST_GRAPHS=str(graph_directory))
+            settings = dict(COMPILER_CANDIDATES.get(name, {}))
+            if name not in ('long_index_packed', 'long_index_mme'):
+                settings['DUMP_POST_GRAPHS'] = str(graph_directory)
             with compiler_settings(settings):
                 chain(True, 2, measure=False, engine=replay, warm_steps=6)
             if not replay.input_variant_ready(program.search_length):
@@ -256,7 +264,7 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
     if rank == 0:
         ready = dict(pid=os.getpid(), source=os.environ['DSV41_RUN_EVIDENCE'],
                      candidates=['dense_fp8', 'tail', 'dense_fp8_tail', 'dense_fp8_static_int32',
-                                 'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff', *COMPILER_CANDIDATES])
+                                 'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff', 'long_index_packed', 'long_index_mme', *COMPILER_CANDIDATES])
         (control / 'ready.json').write_text(json.dumps(ready, indent=2)+'\n')
     print(f'TP{rank}: real16 fixture resident; control {control}', flush=True)
     try:
@@ -374,8 +382,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--control-dir', type=Path, required=True)
     parser.add_argument('--candidate', choices=('dense_fp8', 'tail', 'dense_fp8_tail',
-                                              'dense_fp8_static_int32', 'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff', *COMPILER_CANDIDATES))
-    parser.add_argument('--baseline', choices=('baseline', 'dense_fp8', 'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant'), default='baseline')
+                                              'dense_fp8_static_int32', 'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff', 'long_index_packed', 'long_index_mme', *COMPILER_CANDIDATES))
+    parser.add_argument('--baseline', choices=('baseline', 'dense_fp8', 'dense_fp8_swa_packed',
+                                               'dense_fp8_swa_norm_quant', 'long_index_packed'), default='baseline')
     parser.add_argument('--steps', type=int, default=200)
     parser.add_argument('--stop', action='store_true')
     args = parser.parse_args()
