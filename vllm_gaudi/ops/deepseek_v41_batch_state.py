@@ -82,6 +82,7 @@ class BatchStageState:
         self.generation = 0
         self.single_owner = None
         self.single_page_version = None
+        self.prefill_owner = None
 
     def acquire(self, request_id):
         existed = request_id in self.slots.owners
@@ -118,19 +119,23 @@ class BatchStageState:
             invalidate()
 
     def bind_prefill(self, slot):
-        """Alias the selected slot; never save/restore a whole working set."""
+        """Stage only auxiliary rings at the warmed, fixed tensor addresses.
+
+        Request slots stay authoritative. Binding their nonzero-offset views
+        directly changes the guarded prefill contracts on every slot handoff.
+        The bounded rings share the existing B1 working allocation; paged KV
+        and token-owned residuals are neither copied nor duplicated.
+        """
         self.slots.validate(slot)
         if self.pending is not None:
             raise RuntimeError("Prefill cannot replace the owner of in-flight batch scratch")
         self.leave_single()
         self._invalidate_index_mirror()
-        self.program.shared.block_table = self.pages[slot.index]
-        for layer in self.program.layers:
-            state = self.layers[layer.layer]
-            layer.attention.swa = state.swa[slot.index * 256:(slot.index + 1) * 256]
-            if hasattr(state, "kv_history"):
-                layer.attention.kv_history = state.kv_history[slot.index * 8:(slot.index + 1) * 8]
-                layer.attention.score_history = state.score_history[slot.index * 8:(slot.index + 1) * 8]
+        self.restore_single_bindings()
+        self.program.shared.block_table.copy_(self.pages[slot.index])
+        for working, stored in self._single_rows(slot):
+            working.copy_(stored)
+        self.prefill_owner = slot
 
     def restore_single_bindings(self):
         for module, name, value in self.single_bindings:
@@ -146,6 +151,14 @@ class BatchStageState:
 
     def leave_single(self):
         """Publish a completed B1 owner before another path consumes its slot."""
+        prefill = getattr(self, "prefill_owner", None)
+        if prefill is not None:
+            self.slots.validate(prefill)
+            if self.pages.device.type == "hpu":
+                torch.hpu.synchronize()
+            for working, stored in self._single_rows(prefill):
+                stored.copy_(working)
+            self.prefill_owner = None
         if self.single_owner is None:
             return
         self.slots.validate(self.single_owner)
@@ -255,7 +268,7 @@ class BatchStageState:
     def release(self, request_id):
         slot = self.slots.owners.get(request_id)
         if slot is not None:
-            if self.single_owner == slot:
+            if self.single_owner == slot or getattr(self, "prefill_owner", None) == slot:
                 self.leave_single()
             self.slots.release(slot)
 
