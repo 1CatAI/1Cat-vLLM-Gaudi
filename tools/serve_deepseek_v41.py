@@ -136,6 +136,9 @@ def main():
             environment.pop(key)
     environment["VLLM_ENGINE_READY_TIMEOUT_S"] = "3600"
     environment["PYTHONUNBUFFERED"] = "1"
+    # This launcher owns one machine's devices. CPU control collectives must
+    # not advertise a transient routable address for local worker peers.
+    environment["GLOO_SOCKET_IFNAME"] = settings.get("environment", {}).get("GLOO_SOCKET_IFNAME", "lo")
     if settings.get("api_key_file"):
         environment["VLLM_API_KEY"] = Path(settings["api_key_file"]).read_text().strip()
     command = [str(root / "venv/bin/python"), "-m", "vllm_gaudi.entrypoints.deepseek_v41",
