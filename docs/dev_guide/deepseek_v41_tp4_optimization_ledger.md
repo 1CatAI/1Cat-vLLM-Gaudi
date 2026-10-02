@@ -580,3 +580,34 @@ The installed service defaults now require a fresh official formal request.
 Evidence: `evidence/20260928_tp4-decode-gap-1p5/official-512k-serving-01`,
 `official-512k-prefill-diagnostic-01`, `nucleus-component-01`/`02`,
 `nucleus-real16-01` through `04`.
+
+
+### Serving integration repair — not formally qualified (2026-10-03)
+
+The installed d5c9979f official 512K/C16384/prefix-enabled request finishes
+2128 tokens at natural EOS and passes all14 frozen factual checks. Prefill is
+9038.992651 tokens/s; decode is18.535273340 ms/token. Both speed gates fail.
+ITL median18.483940ms shows a sustained regression. The three non-output rank
+shutdown audits record2128 asynchronous completions,2111 prefix starts and no
+sampling fallback counter. Worker main-thread aggregate runqueue waits are
+19–48ms across the entire request, too small to explain the regression.
+The new synchronous marker readback on every submitting worker is removed
+from that thread. Each rank now owns an asynchronous resolver; both output
+exposure and the next input consumer wait for resolution, including fallback
+collectives. The original token storage is corrected before continuation.
+
+Same-card real16 ABABAB200 tests that resolver and the next input consumer.
+A median6.133360ms, IQR0.065325ms; B median5.939088ms; median difference
+0.194273ms exceeds2×IQR0.130649ms. All four ranks and repeated trajectories
+agree; no hot compilation. Mean A6.137662ms versus B6.305911ms is slower.
+This replaces, rather than adds to, the earlier sampler component estimate.
+Median×1.5 predicts0.291409ms; mean timing does not predict a formal gain.
+No end-to-end speedup is credited. Production acceptance remains pending.
+
+The ordinary first-token bounded sampler is rejected before serving: rank0
+period medians A1.282/1.070/0.999ms versus B1.498/1.165/1.289ms. Four-rank
+correctness passes but there is no comparable speed improvement; the source
+change is withdrawn. Archived rejected source and results are preserved.
+
+Evidence: `evidence/20260928_tp4-decode-gap-1p5/official-512k-serving-02`,
+`nucleus-real16-05`, `nucleus-prefill-component-01`.

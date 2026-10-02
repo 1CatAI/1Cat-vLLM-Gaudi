@@ -503,6 +503,20 @@ def main():
                     prepare_sampling(engine, 0)
                 selected = sampler(seed_hidden, engine)
                 readback = bridge.copy_sampled_tokens_to_host(selected)
+                resolution = None
+                resolver = None
+                if sampling and getattr(engine.program(), 'sampling_async', False):
+                    from concurrent.futures import ThreadPoolExecutor
+                    from types import SimpleNamespace
+                    from vllm_gaudi.v1.worker.deepseek_v41_v2_runner import V41V2ModelRunner
+                    resolver = object.__new__(V41V2ModelRunner)
+                    resolver.model = SimpleNamespace(program=engine.program())
+                    resolver.audit = report
+                    resolver.tp4_token_readback = bridge.copy_sampled_tokens_to_host
+                    resolver._sample_requests = lambda hidden, requests, **kwargs: sampler(
+                        hidden, engine, force_full=kwargs.get('force_full', False))
+                    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='v41-sampling')
+                    request = SimpleNamespace(sampling_params=SimpleNamespace(temperature=1.))
                 torch.hpu.synchronize()
                 output_tokens = []
                 device_start = torch.hpu.Event(enable_timing=True) if measure else None
@@ -531,6 +545,8 @@ def main():
                             # The serving scheduler consumes the previous token
                             # before the next native input transaction. Resolve
                             # any incomplete nucleus before input/Engram staging.
+                            if resolution is not None:
+                                resolution.result()
                             cpu, done = readback
                             done.synchronize()
                             vocabulary = stage.weights.head.weight.shape[0] * 4
@@ -597,6 +613,9 @@ def main():
                         if args.trace_entry_phases or args.queue_marker_only:
                             mark('stage_and_sampler_enqueued', index)
                         readback = bridge.copy_sampled_tokens_to_host(selected)
+                        if resolver is not None:
+                            resolution = executor.submit(resolver._resolve_sampling_completion, request,
+                                                         selected, *readback, torch.hpu.current_stream())
                         if args.trace_entry_phases or args.queue_marker_only:
                             mark('token_readback_enqueued', index)
                         host.complete(ticket, 1)
@@ -604,6 +623,10 @@ def main():
                             mark('end', index)
                     if measure and index >= warm_steps:
                         iteration_marks.append(time.perf_counter_ns())
+                if resolution is not None:
+                    resolution.result()
+                if resolver is not None:
+                    executor.shutdown(wait=True)
                 cpu, done = readback
                 done.synchronize()
                 if sampling and int(cpu[0, 0]) >= stage.weights.head.weight.shape[0] * 4:

@@ -228,7 +228,7 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
     def arm(name):
         if name not in arms:
             if name in ('official_sampling', 'nucleus_sampling', 'nucleus_sampling_unsorted',
-                        'nucleus_sampling64', 'nucleus_sampling256'):
+                        'nucleus_sampling64', 'nucleus_sampling256', 'nucleus_sampling_async'):
                 import torch
                 if 'dense_fp8' not in stages:
                     stages['dense_fp8'] = make_dense_stage(stage, shard, args.ab_dense_sidecar, args.ab_dense_config)
@@ -236,6 +236,7 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                 program.register_buffer('sampling_controls', torch.tensor([[1., .95, .5, -1.]], device='hpu'))
                 program.sampling_tail = name != 'official_sampling'
                 program.sampling_sorted = name == 'nucleus_sampling'
+                program.sampling_async = name == 'nucleus_sampling_async'
                 program.sampling_candidates = (64 if name.endswith('64') else 256 if name.endswith('256') else 128)
             elif name in ('dense_fp8', 'dense_fp8_tail', 'dense_fp8_static_int32',
                         'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff', *COMPILER_CANDIDATES):
@@ -253,7 +254,7 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
             replay = StageReplay(program, greedy_tail=name in ('tail', 'dense_fp8_tail',
                                                               'official_sampling', 'nucleus_sampling',
                                                               'nucleus_sampling_unsorted', 'nucleus_sampling64',
-                                                              'nucleus_sampling256'))
+                                                              'nucleus_sampling256', 'nucleus_sampling_async'))
             program.replay_owner = replay
             stages[name], arms[name] = program, replay
             # Preserve actual compiler output for kernel-count changes. This
@@ -270,7 +271,7 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
     if rank == 0:
         ready = dict(pid=os.getpid(), source=os.environ['DSV41_RUN_EVIDENCE'],
                      candidates=['dense_fp8', 'tail', 'dense_fp8_tail', 'official_sampling', 'nucleus_sampling',
-                                 'nucleus_sampling_unsorted', 'nucleus_sampling64', 'nucleus_sampling256',
+                                 'nucleus_sampling_unsorted', 'nucleus_sampling64', 'nucleus_sampling256', 'nucleus_sampling_async',
                                  'dense_fp8_static_int32',
                                  'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff', *COMPILER_CANDIDATES])
         (control / 'ready.json').write_text(json.dumps(ready, indent=2)+'\n')

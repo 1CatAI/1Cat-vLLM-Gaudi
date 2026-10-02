@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 from types import SimpleNamespace
+from concurrent.futures import Future
+from contextlib import nullcontext
 from unittest.mock import Mock
 
 import pytest
 import torch
 
 from vllm_gaudi.v1.worker.deepseek_v41_runner import V41ModelRunner
+from vllm_gaudi.v1.worker.deepseek_v41_v2_runner import CompletionRecord, V41V2ModelRunner
 
 
 def runner():
@@ -55,3 +58,39 @@ def test_invalid_marker_cannot_escape_as_a_token(marker):
     request = SimpleNamespace(sampling_params=SimpleNamespace(temperature=1.))
     with pytest.raises(RuntimeError, match='completion marker'):
         value._resolve_sampled_marker(request, selected, selected, Mock())
+
+
+def test_async_completion_waits_for_resolution_before_exposing_host_token():
+    future = Future()
+    host = torch.tensor([[10]], dtype=torch.int32)
+    done = Mock()
+    record = CompletionRecord('a', 1, 3, host, done, torch.tensor([2]), future)
+    host.fill_(2)
+    future.set_result(None)
+    assert record.token() == 2
+    done.synchronize.assert_called_once()
+
+
+def test_async_resolution_error_cannot_expose_an_encoded_marker():
+    future = Future()
+    future.set_exception(RuntimeError('fallback collective failed'))
+    done = Mock()
+    record = CompletionRecord('a', 1, 3, torch.tensor([[10]]), done, torch.tensor([10]), future)
+    with pytest.raises(RuntimeError, match='fallback collective failed'):
+        record.token()
+    done.synchronize.assert_not_called()
+
+
+def test_background_fallback_updates_existing_device_and_host_storage(monkeypatch):
+    value = runner()
+    original = torch.tensor([[10]], dtype=torch.int32)
+    host = original.clone()
+    done = Mock()
+    stream = Mock()
+    monkeypatch.setattr(torch.hpu, 'stream', lambda _: nullcontext())
+    monkeypatch.setattr(torch.hpu, 'current_stream', lambda: stream)
+    request = SimpleNamespace(sampling_params=SimpleNamespace(temperature=1.), output=[])
+    V41V2ModelRunner._resolve_sampling_completion(value, request, original, host, done, stream)
+    assert original.item() == host.item() == 3
+    assert request.output == []
+    stream.synchronize.assert_called_once()
