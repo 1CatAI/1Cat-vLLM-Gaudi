@@ -54,3 +54,35 @@ def test_sampling_validation_distinguishes_dspark():
         validate_sampling(params, dspark=True)
     with pytest.raises(VLLMValidationError, match="penalties"):
         validate_sampling(SamplingParams(temperature=1, presence_penalty=0.1), dspark=False)
+
+
+def test_sampling_controls_reuse_upload_and_wait_before_replacement(monkeypatch):
+    from types import SimpleNamespace
+    from vllm_gaudi.v1.worker.deepseek_v41_runner import V41ModelRunner
+
+    calls = []
+
+    class Event:
+        def record(self):
+            calls.append('record')
+
+        def synchronize(self):
+            calls.append('wait')
+
+    monkeypatch.setattr(torch.hpu, 'Event', Event)
+    runner = object.__new__(V41ModelRunner)
+    runner.model = SimpleNamespace(program=SimpleNamespace(sampling_tail=True))
+    runner.device = torch.device('cpu')
+    runner.audit = {}
+    runner.sampling_buffers = {1: (torch.zeros(1, 4), torch.zeros(1, 4))}
+    request = SimpleNamespace(req_id='request', output=[],
+                              sampling_params=SimpleNamespace(temperature=1., top_p=.95, top_k=-1, seed=42))
+    controls = runner._prepare_sample_controls(1, (request,))
+    assert torch.equal(controls, torch.tensor([[1., .95, request_uniform('request', 42, 0), -1.]]))
+    assert runner._prepare_sample_controls(1, (request,)) is controls
+    assert calls == ['record'] and runner.audit['sampling_control_uploads'] == 1
+    request.output.append(7)
+    assert runner._prepare_sample_controls(1, (request,)) is controls
+    assert calls == ['record', 'wait', 'record'] and runner.audit['sampling_control_uploads'] == 2
+    assert torch.equal(controls, torch.tensor([[1., .95, request_uniform('request', 42, 1), -1.]]))
+    assert runner.audit['sampling_copy_wait_ns'] >= 0

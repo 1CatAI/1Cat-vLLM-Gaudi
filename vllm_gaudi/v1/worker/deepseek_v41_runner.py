@@ -1153,11 +1153,17 @@ class V41ModelRunner:
             device = torch.empty_like(host, device=self.device)
             self.sampling_buffers[batch] = host, device
         host, controls = self.sampling_buffers[batch]
+        upload_started = time.perf_counter_ns()
+        audit = getattr(self, 'audit', None)
         # A previous asynchronous transfer may still read the pinned buffer.
         # Retain ownership through the transfer event before filling it again.
         pending = getattr(self, "sampling_copy_events", {}).get(batch)
         if pending is not None:
+            wait_started = time.perf_counter_ns()
             pending.synchronize()
+            if audit is not None:
+                audit['sampling_copy_wait_ns'] = audit.get('sampling_copy_wait_ns', 0) + (
+                    time.perf_counter_ns() - wait_started)
         host[:, 0] = 0
         host[:, 1] = 1
         host[:, 2] = 0.5
@@ -1177,6 +1183,10 @@ class V41ModelRunner:
         if not hasattr(self, 'sampling_keys'):
             self.sampling_keys = {}
         self.sampling_keys[batch] = key
+        if audit is not None:
+            audit['sampling_control_uploads'] = audit.get('sampling_control_uploads', 0) + 1
+            audit['sampling_control_ns'] = audit.get('sampling_control_ns', 0) + (
+                time.perf_counter_ns() - upload_started)
         return controls
 
     def _sample_requests(self, hidden, requests, *, replay=None, force_full=False):
@@ -2525,6 +2535,7 @@ class V41ModelRunner:
         if isinstance(getattr(self, "batch_result", None), AsyncModelRunnerOutput):
             self.batch_result.get_output()
         self.pp.drain()
+        logger.info("V4.1 worker completion audit: %s", self.audit)
         if self.prefix_checkpoints is not None:
             self.prefix_checkpoints.close()
         if self.verify_ring is not None:

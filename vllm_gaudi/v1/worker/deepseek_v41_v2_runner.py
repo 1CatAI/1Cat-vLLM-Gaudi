@@ -204,7 +204,10 @@ class V41V2ModelRunner(V41ModelRunner):
             # All ranks own a resolver, including ranks which never serialize
             # an output. A fallback collective must finish before its token
             # reaches the embedding or Engram consumer.
+            started = time.perf_counter_ns()
             record.resolution.result()
+            self.audit['sampling_resolution_ns'] = self.audit.get('sampling_resolution_ns', 0) + (
+                time.perf_counter_ns() - started)
         early = envs.VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT
         identity = self._identity(record)
         if early:
@@ -241,7 +244,10 @@ class V41V2ModelRunner(V41ModelRunner):
                     self.audit["v2_device_engram_starts"] = self.audit.get("v2_device_engram_starts", 0) + 1
                 if getattr(self.model.program, 'sampling_tail', False):
                     self._prepare_sample_controls(1, (request,), ordinal_offset=1)
+                started = time.perf_counter_ns()
                 self.model.begin_decode_prefix(record.device_token, position)
+                self.audit['sampling_prefix_enqueue_ns'] = self.audit.get('sampling_prefix_enqueue_ns', 0) + (
+                    time.perf_counter_ns() - started)
                 self._prefix_started = identity
                 self.audit["v2_prefix_starts"] = self.audit.get("v2_prefix_starts", 0) + 1
         token = record.token()
