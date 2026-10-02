@@ -87,6 +87,9 @@ def test_sampling_controls_reuse_upload_and_wait_before_replacement(monkeypatch)
     assert torch.equal(controls, torch.tensor([[1., .95, request_uniform('request', 42, 1), -1.]]))
     assert runner.audit['sampling_copy_wait_ns'] >= 0
     assert runner.audit['sampling_decode_uploads'] == 1
+    assert runner._prepare_sample_controls(1, (request,)) is controls
+    assert runner.audit['sampling_control_uploads'] == 2
+    assert calls == ['record', 'wait', 'record']
     for phase in ('fill', 'copy', 'event'):
         assert runner.audit[f'sampling_decode_{phase}_ns'] >= 0
         assert runner.audit[f'sampling_decode_{phase}_cpu_ns'] >= 0

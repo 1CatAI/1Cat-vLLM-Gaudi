@@ -1197,10 +1197,10 @@ class V41ModelRunner:
                     ('copy', recorded - copied, cpu_recorded - cpu_copied),
                     ('event', finished - recorded, cpu_finished - cpu_recorded),
                 ):
-                    key = f'sampling_decode_{phase}'
-                    audit[key + '_ns'] = audit.get(key + '_ns', 0) + wall
-                    audit[key + '_cpu_ns'] = audit.get(key + '_cpu_ns', 0) + cpu
-                    audit[key + '_max_ns'] = max(audit.get(key + '_max_ns', 0), wall)
+                    phase_key = f'sampling_decode_{phase}'
+                    audit[phase_key + '_ns'] = audit.get(phase_key + '_ns', 0) + wall
+                    audit[phase_key + '_cpu_ns'] = audit.get(phase_key + '_cpu_ns', 0) + cpu
+                    audit[phase_key + '_max_ns'] = max(audit.get(phase_key + '_max_ns', 0), wall)
         if not hasattr(self, "sampling_copy_events"):
             self.sampling_copy_events = {}
         self.sampling_copy_events[batch] = event
