@@ -30,7 +30,7 @@ def test_capacity_reuse_preserves_the_current_sentinel_and_drains_before_growth(
 def test_shape_lru_retires_all_buckets_after_their_consumers(monkeypatch):
     events = []
     monkeypatch.setattr(torch.hpu, "synchronize", lambda: events.append("drain"))
-    owner = buckets._BucketedPrefillPlans()
+    owner = buckets._BucketedPrefillPlans(maximum_shapes=2)
     for shape in (7, 3):
         for row in (32, 64):
             owner.shape_plans(shape)[row] = SimpleNamespace(plan=SimpleNamespace(
@@ -41,6 +41,30 @@ def test_shape_lru_retires_all_buckets_after_their_consumers(monkeypatch):
     assert events == ["drain", (3, 32), (3, 64)]
     owner.close()
     assert events[3:] == ["drain", (7, 32), (7, 64)] and not owner.plans
+
+
+def test_prepared_bucket_plans_survive_long_short_request_reordering(monkeypatch):
+    from vllm_gaudi.ops.deepseek_v41_prefill_capacity import PREFILL_COMPUTE_BUCKETS
+
+    events = []
+    monkeypatch.setattr(torch.hpu, "synchronize", lambda: events.append("drain"))
+    owner = buckets._BucketedPrefillPlans()
+    saved = {}
+    for rows in reversed(PREFILL_COMPUTE_BUCKETS):
+        saved[rows] = owner.shape_plans(rows)
+        saved[rows][64] = SimpleNamespace(plan=SimpleNamespace(invalidate=lambda: events.append("invalidate")))
+    for rows in PREFILL_COMPUTE_BUCKETS:
+        assert owner.shape_plans(rows) is saved[rows]
+    assert not events
+    assert len(owner.plans) == len(PREFILL_COMPUTE_BUCKETS)
+    owner.close()
+    assert events == ["drain"] + ["invalidate"] * len(PREFILL_COMPUTE_BUCKETS)
+
+
+@pytest.mark.parametrize("maximum", (0, -1, 9, 1.5))
+def test_plan_retention_rejects_unbounded_or_empty_capacity(maximum):
+    with pytest.raises(ValueError, match="finite compute buckets"):
+        buckets._BucketedPrefillPlans(maximum_shapes=maximum)
 
 
 @pytest.mark.parametrize("interleaved", [False, True])

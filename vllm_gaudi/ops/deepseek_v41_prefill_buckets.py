@@ -83,9 +83,16 @@ def _compiled_routes(signature):
 
 class _BucketedPrefillPlans:
 
-    def __init__(self):
-        # Retain a full tile and a tail without keeping every request shape's
-        # captured intermediates alive. The limit is independent of length.
+    def __init__(self, *, maximum_shapes=None):
+        from vllm_gaudi.ops.deepseek_v41_prefill_capacity import PREFILL_COMPUTE_BUCKETS
+
+        # Keep the finite warmed geometries across long/short requests. A
+        # two-shape LRU evicts startup's prepared plans before their users
+        # arrive and forces request-time capture. Each plan still owns its
+        # bounded scratch and is retired only after its consumers drain.
+        self.maximum_shapes = len(PREFILL_COMPUTE_BUCKETS) if maximum_shapes is None else maximum_shapes
+        if not isinstance(self.maximum_shapes, int) or not 1 <= self.maximum_shapes <= len(PREFILL_COMPUTE_BUCKETS):
+            raise ValueError("Prefill plan retention must fit the finite compute buckets")
         self.plans = OrderedDict()
         self.workspace = None
         self.indices = {}
@@ -124,7 +131,7 @@ class _BucketedPrefillPlans:
     def shape_plans(self, signature):
         family = self.plans.get(signature)
         if family is None:
-            if len(self.plans) == 2:
+            if len(self.plans) == self.maximum_shapes:
                 torch.hpu.synchronize()
                 _, expired = self.plans.popitem(last=False)
                 for plan in expired.values():
