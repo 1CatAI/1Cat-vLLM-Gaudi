@@ -210,13 +210,18 @@ def runtime_search_length(start, count, maximum):
 def prefill_search_length(start, count, maximum, *, reuse_index_keys=False):
     """Use a bounded shared-key geometry without changing decode capture.
 
-    The hot geometry is shared with decode. Beyond it, one fixed prefill
-    geometry covers the shared-key workspace; longer prefixes retain the
-    capacity-independent path. Query positions still mask every future row.
+    The hot geometry is shared with decode. Beyond it, the two complete
+    prompt geometries retain the qualified decoder-halo MLA admission and
+    bounded shared-key workspace. Longer prefixes retain the capacity-
+    independent path. Query positions still mask every future row.
     """
     search = runtime_search_length(start, count, maximum)
     if reuse_index_keys and INDEX_MME_HOT_TOKENS < start + count <= 32768:
-        return min(maximum, 32768)
+        # A complete 16K prompt leaves 4K halo queries in the last decoder
+        # layers. Padding its search to 32K rejects the existing query-owned
+        # MLA path and also scans unused source tiles. Decode keeps its own
+        # fixed 32K geometry; prompt admission depends on this transaction.
+        return min(maximum, 16384 if start + count <= 16384 else 32768)
     if not reuse_index_keys and start + count > INDEX_MME_HOT_TOKENS:
         return maximum
     return search

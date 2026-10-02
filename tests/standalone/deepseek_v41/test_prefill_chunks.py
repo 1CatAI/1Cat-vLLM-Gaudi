@@ -179,8 +179,9 @@ def test_runtime_indexer_prewarms_and_reuses_one_bounded_2k_bucket():
 
 def test_shared_prefill_geometry_does_not_change_decode_or_long_context_capacity():
     capacity = 1 << 20
-    for start, count in ((2560, 128), (8192, 8192), (24576, 8192)):
-        assert prefill_search_length(start, count, capacity, reuse_index_keys=True) == 32768
+    for start, count in ((2560, 128), (8192, 8192), (16384, 1), (24576, 8192)):
+        expected = 16384 if start + count <= 16384 else 32768
+        assert prefill_search_length(start, count, capacity, reuse_index_keys=True) == expected
         assert runtime_search_length(start, count, capacity) == 32768
         assert prefill_search_length(start, count, capacity) == capacity
     assert prefill_search_length(32768, 128, capacity, reuse_index_keys=True) == capacity
@@ -189,6 +190,16 @@ def test_shared_prefill_geometry_does_not_change_decode_or_long_context_capacity
     assert prefill_search_length(8192, 8192, 16384, reuse_index_keys=True) == 16384
     with pytest.raises(ValueError):
         prefill_search_length(capacity - 128, 256, capacity, reuse_index_keys=True)
+
+
+def test_complete_prompt_search_retains_decoder_halo_mla_admission():
+    from vllm_gaudi.ops.deepseek_v41_prefill_sequence import can_partition_prefill_mla
+
+    for capacity in (16384, 524288, 1048576):
+        search = prefill_search_length(0, 16384, capacity, reuse_index_keys=True)
+        assert can_partition_prefill_mla((16384, 16, 512), 640, 4, search)
+        assert can_partition_prefill_mla((4096, 16, 512), 640, 4, search)
+    assert not can_partition_prefill_mla((4096, 16, 512), 640, 4, 32768)
 
 
 def test_prefill_tail_is_exact_and_never_splits_into_dspark_c6():
