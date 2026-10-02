@@ -544,89 +544,6 @@ through`unified-prefill-decode-07`;06 includes formal, cache probes, corrected
 chat continuation, fixed quality outputs, host telemetry and source manifests.
 Other modules2/3/6/7 remain768MiB and0% utilization at sampled preflights;
 CPU PSI and bound-core/context-switch data accompany the formal result.
-
-
-### Official sampling replay component — formal qualification pending (2026-10-02)
-
-Parent d85ebce5, 512K/C16384/prefix-enabled official formal: **6663.756222 tokens/s**,
-**10.718316047 ms/token**,2128 natural-EOS tokens; all frozen factual checks pass.
-Both speed gates fail. No achieved speed claim. Startup omits official probability
-sampling warmup; diagnostic suffix query exchange is active in19 layers.
-Diagnostic post-chunk gaps617–694ms include sampling/checkpoint work and capture
-overhead; overlapping fixture loading makes these timings diagnostic only.
-
-Bounded sampling keeps each shard's complete FP32 probability mass, exchanges
-candidates and uses the same request-owned uniform. Coverage/tie rejection resolves
-through full sampling before the next input. Sampler controls are separate mutable
-state; the mHC pre-mix buffer is preserved. The shared native replay/API is retained.
-
-Same-card real16 resident ABABAB200 on0/1/4/5 and CPU10/15/38/43:
-A median **6.134799ms**, IQR **0.053408ms**; B median **5.818252ms**.
-Difference **0.316548ms** exceeds2×A IQR **0.106815ms**. All four ranks and
-all six233-token trajectories agree; no hot compilation. Mean A **6.188704ms**
-versus B **6.106943ms**, difference **0.081761ms**. Median×1.5 estimates
-**0.474821ms/token**, but mean×1.5 estimates **0.122641ms/token**; formal TPOT
-remains unresolved and these estimates are not additive achieved gains.
-Pending admitted median component savings **0.316548ms**; estimated formal savings
-are the range above, with no formal gain credited. The16-layer intermediate head
-does not establish complete-model fallback frequency.
-
-Attempts01/02 fail before sampling qualification; real16-01/02 fail or are
-interrupted before readiness. Real16-03 completes but firstA drift invalidates
-its noise gate; the final unconsumed sample was an unresolved fallback marker.
-Real16-04 fixes input ownership, terminal resolution and trajectory warmup.
-The installed service defaults now require a fresh official formal request.
-
-Evidence: `evidence/20260928_tp4-decode-gap-1p5/official-512k-serving-01`,
-`official-512k-prefill-diagnostic-01`, `nucleus-component-01`/`02`,
-`nucleus-real16-01` through `04`.
-
-
-### Serving integration repair — not formally qualified (2026-10-03)
-
-The installed d5c9979f official 512K/C16384/prefix-enabled request finishes
-2128 tokens at natural EOS and passes all14 frozen factual checks. Prefill is
-9038.992651 tokens/s; decode is18.535273340 ms/token. Both speed gates fail.
-ITL median18.483940ms shows a sustained regression. The three non-output rank
-shutdown audits record2128 asynchronous completions,2111 prefix starts and no
-sampling fallback counter. Worker main-thread aggregate runqueue waits are
-19–48ms across the entire request, too small to explain the regression.
-The new synchronous marker readback on every submitting worker is removed
-from that thread. Each rank now owns an asynchronous resolver; both output
-exposure and the next input consumer wait for resolution, including fallback
-collectives. The original token storage is corrected before continuation.
-
-Same-card real16 ABABAB200 tests that resolver and the next input consumer.
-A median6.133360ms, IQR0.065325ms; B median5.939088ms; median difference
-0.194273ms exceeds2×IQR0.130649ms. All four ranks and repeated trajectories
-agree; no hot compilation. Mean A6.137662ms versus B6.305911ms is slower.
-This replaces, rather than adds to, the earlier sampler component estimate.
-Median×1.5 predicts0.291409ms; mean timing does not predict a formal gain.
-No end-to-end speedup is credited. Production acceptance remains pending.
-
-The ordinary first-token bounded sampler is rejected before serving: rank0
-period medians A1.282/1.070/0.999ms versus B1.498/1.165/1.289ms. Four-rank
-correctness passes but there is no comparable speed improvement; the source
-change is withdrawn. Archived rejected source and results are preserved.
-
-Evidence: `evidence/20260928_tp4-decode-gap-1p5/official-512k-serving-02`,
-`nucleus-real16-05`, `nucleus-prefill-component-01`.
-
-
-The8f6a8b17 installed official request still fails: prefill8957.475039 tokens/s,
-decode17.674718167ms/token,2128 natural-EOS tokens and all14 factual checks
-passing. ITL median17.452656ms remains high. Shutdown audits on the output and
-two non-output ranks show no full-sampling fallback counter. Asynchronous marker
-resolution therefore does not explain or repair the main serving regression.
-No formal gain is credited. A fresh diagnostic is required before another
-sampling candidate. The prefill event enclosure previously stopped before
-sample completion and checkpoint publication; diagnostic-only scopes now include
-sample completion, snapshot publication and all-rank acknowledgment. Diagnostic
-enabling remains explicit and off by default. CPU regressions:1003 passed,
-112 skipped. Evidence: `official-512k-serving-03`; subsequent diagnostic retained
-separately from formal acceptance.
-
-
 ### 2026-10-03 prefix transition component (formal pending)
 
 Parent33ef72c8. Preserve inline checkpoint tensors and the live working-ring
@@ -649,12 +566,7 @@ Formal serving remains pending. CPU1005passed112skipped. The earlier
 owner-only fixture was noisy:60.285510→54.907627ms, below its7.209410ms
 threshold; it is not a separately counted gain.
 
-The installed6820431e formal request does not improve the serving gates:
-prefill8860.171914tps,decode17.584649ms,TTFT1.949121s;2128naturalEOS
-and14/14facts pass. No serving gain is credited and no baseline advances.
-This closes the prefix-transition estimate as component-only: the optimized
-transition does not establish the requested uncached-prefill throughput.
-Worker audits identify parameter updates at4.929–5.074ms/upload, previous
-copy-event wait0.038–0.040ms, prefixenqueue0.705–0.721ms and resolver wait
-8.530–8.830ms. Uploads2131 versus2128commits show no per-step duplicate
-upload. Evidence: `official-512k-serving-04/worker-submit-audit.json`.
+
+### 2026-10-03 release rollback, formal pending
+
+User withdrew the native bounded-sampling integration and its diagnostic variants. Restore d85ebce5 generic official sampler; retain efbbd824/prefill/cache repairs and warm official sampling graphs before readiness. The withdrawn sampling component is outside all pending gain totals; its failed serving and diagnostic evidence remains in the local experiment index. The current release gate is one official-seed uncached16K natural-EOS request at512K/C16384/prefix enabled, with approximately10.7ms decode and at least9000tps prefill. The10ms device-RNG/once-per-request-controls sampler will use a separate branch and PR after release.

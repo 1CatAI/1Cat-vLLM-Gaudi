@@ -1110,17 +1110,6 @@ class V41ModelRunner:
             self.sampling_backend = sampler_backend
             self.stochastic_samplers = {}
             self.sampling_buffers = {}
-            program = self.model.program
-            if (envs.VLLM_HPU_DSV41_SAMPLING_REPLAY and self.v2_completion and self.model.native
-                    and program.pp_rank == 0 and program.is_last_stage
-                    and envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH):
-                host = torch.tensor([[0., .95, .5, -1.]], dtype=torch.float32)
-                controls = host.to(self.device)
-                program.register_buffer('sampling_controls', controls)
-                program.sampling_tail = True
-                program.sampling_candidates = 128
-                program.sampling_sorted = False
-                self.sampling_buffers[1] = host, controls
             self.sample_local_head = torch.compile(
                 self.model.program._head_projection, backend=sampler_backend, fullgraph=True, dynamic=False
             )
@@ -1139,35 +1128,22 @@ class V41ModelRunner:
             "V4.1 PP%d prepared weights loaded; allocated %d bytes", self.model.pp_rank, self.model_memory_usage
         )
 
-    def _prepare_sample_controls(self, batch, requests, *, ordinal_offset=0):
-        from vllm_gaudi.ops.deepseek_v41_sampling import request_uniform
+    def _sample_requests(self, hidden, requests, *, replay=None):
+        from functools import partial
+        from vllm_gaudi.ops.deepseek_v41_sampling import request_uniform, sample_probabilities
 
-        key = tuple((req.req_id, req.sampling_params.temperature, req.sampling_params.top_p,
-                     req.sampling_params.top_k, req.sampling_params.seed, len(req.output) + ordinal_offset)
-                    for req in requests)
-        keys = getattr(self, 'sampling_keys', {})
-        if keys.get(batch) == key and getattr(self.model.program, 'sampling_tail', False):
-            return self.sampling_buffers[batch][1]
+        batch = hidden.shape[0]
+        filtered = any(req.sampling_params.top_p < 1 or req.sampling_params.top_k > 0 for req in requests)
         if batch not in self.sampling_buffers:
-            # Eager Bridge snapshots pageable inputs into its own transfer
-            # storage. A pinned source instead forces a pipeline join even
-            # with non_blocking=True, delaying the next native submission.
-            host = torch.zeros(batch, 4, dtype=torch.float32)
+            host = torch.zeros(batch, 4, dtype=torch.float32).pin_memory("hpu")
             device = torch.empty_like(host, device=self.device)
             self.sampling_buffers[batch] = host, device
         host, controls = self.sampling_buffers[batch]
-        upload_started = time.perf_counter_ns()
-        audit = getattr(self, 'audit', None)
-        # Retain the previous transfer event before reusing this control frame.
+        # A previous asynchronous transfer may still read the pinned buffer.
+        # Retain ownership through the transfer event before filling it again.
         pending = getattr(self, "sampling_copy_events", {}).get(batch)
         if pending is not None:
-            wait_started = time.perf_counter_ns()
             pending.synchronize()
-            if audit is not None:
-                audit['sampling_copy_wait_ns'] = audit.get('sampling_copy_wait_ns', 0) + (
-                    time.perf_counter_ns() - wait_started)
-        started = time.perf_counter_ns()
-        cpu_started = time.thread_time_ns()
         host[:, 0] = 0
         host[:, 1] = 1
         host[:, 2] = 0.5
@@ -1176,57 +1152,14 @@ class V41ModelRunner:
             params = req.sampling_params
             host[row, 0] = params.temperature
             host[row, 1] = params.top_p
-            host[row, 2] = request_uniform(req.req_id, params.seed, len(req.output) + ordinal_offset)
+            host[row, 2] = request_uniform(req.req_id, params.seed, len(req.output))
             host[row, 3] = params.top_k
-        copied = time.perf_counter_ns()
-        cpu_copied = time.thread_time_ns()
         controls.copy_(host, non_blocking=True)
-        recorded = time.perf_counter_ns()
-        cpu_recorded = time.thread_time_ns()
         event = torch.hpu.Event()
         event.record()
-        finished = time.perf_counter_ns()
-        cpu_finished = time.thread_time_ns()
-        if audit is not None:
-            audit['sampling_control_fill_ns'] = audit.get('sampling_control_fill_ns', 0) + copied - started
-            audit['sampling_control_copy_ns'] = audit.get('sampling_control_copy_ns', 0) + recorded - copied
-            audit['sampling_control_event_ns'] = audit.get('sampling_control_event_ns', 0) + (
-                finished - recorded)
-            if all(len(req.output) + ordinal_offset > 0 for req in requests):
-                audit['sampling_decode_uploads'] = audit.get('sampling_decode_uploads', 0) + 1
-                for phase, wall, cpu in (
-                    ('fill', copied - started, cpu_copied - cpu_started),
-                    ('copy', recorded - copied, cpu_recorded - cpu_copied),
-                    ('event', finished - recorded, cpu_finished - cpu_recorded),
-                ):
-                    phase_key = f'sampling_decode_{phase}'
-                    audit[phase_key + '_ns'] = audit.get(phase_key + '_ns', 0) + wall
-                    audit[phase_key + '_cpu_ns'] = audit.get(phase_key + '_cpu_ns', 0) + cpu
-                    audit[phase_key + '_max_ns'] = max(audit.get(phase_key + '_max_ns', 0), wall)
         if not hasattr(self, "sampling_copy_events"):
             self.sampling_copy_events = {}
         self.sampling_copy_events[batch] = event
-        if not hasattr(self, 'sampling_keys'):
-            self.sampling_keys = {}
-        self.sampling_keys[batch] = key
-        if audit is not None:
-            audit['sampling_control_uploads'] = audit.get('sampling_control_uploads', 0) + 1
-            audit['sampling_control_ns'] = audit.get('sampling_control_ns', 0) + (
-                time.perf_counter_ns() - upload_started)
-        return controls
-
-    def _sample_requests(self, hidden, requests, *, replay=None, force_full=False):
-        from functools import partial
-        from vllm_gaudi.ops.deepseek_v41_sampling import sample_probabilities
-
-        batch = hidden.shape[0]
-        controls = self._prepare_sample_controls(batch, requests)
-        filtered = any(req.sampling_params.top_p < 1 or req.sampling_params.top_k > 0 for req in requests)
-        if (replay is not None and getattr(self.model.program, 'sampling_tail', False)
-                and getattr(self, '_v2_async_step', False) and not force_full):
-            selected = replay.greedy_tail_token(hidden)
-            if selected is not None:
-                return selected
         local = replay.tail_local_logits(hidden) if replay is not None else None
         if local is None:
             local = self.sample_local_head(hidden)
@@ -1238,25 +1171,6 @@ class V41ModelRunner:
                 fullgraph=True, dynamic=False
             )
         return self.stochastic_samplers[key](logits, controls)
-
-    def _resolve_sampled_marker(self, request, selected, host, done):
-        """Resolve an incomplete nucleus on every rank before any continuation."""
-        if (not getattr(getattr(self.model, 'program', None), 'sampling_tail', False)
-                or request.sampling_params.temperature == 0):
-            return selected, host, done
-        done.synchronize()
-        vocabulary = self.model.program.weights.head.weight.shape[0] * self.model.program.tensor_parallel_size
-        value = int(host[0, 0])
-        if not 0 <= value < 2 * vocabulary:
-            raise RuntimeError('Invalid native sampling completion marker')
-        if value < vocabulary:
-            return selected, host, done
-        replay = self.model.program.replay_owner
-        hidden = replay.latest_tail[1]
-        selected = self._sample_requests(hidden, (request,), replay=replay, force_full=True)
-        host, done = self.tp4_token_readback(selected)
-        self.audit['sampling_fallbacks'] = self.audit.get('sampling_fallbacks', 0) + 1
-        return selected, host, done
 
     def get_model(self):
         return self.model
@@ -2006,21 +1920,9 @@ class V41ModelRunner:
             )
             with single_trace:
                 self._execute_request(scheduled, req_id, count)
-                if getattr(self, '_prefill_event_trace_pending', False):
-                    from vllm_gaudi.ops import deepseek_v41_prefill_event_trace as prefill_events
-                    with prefill_events.span('sample_completion', rows=count):
-                        result = self._finish_request()
-                else:
-                    result = self._finish_request()
+                result = self._finish_request()
             if self.prefix_checkpoints is not None:
-                if getattr(self, '_prefill_event_trace_pending', False):
-                    with prefill_events.span('prefix_checkpoint', rows=count):
-                        self.prefix_checkpoints.capture_at(req_id, self.requests[req_id].num_computed_tokens + count)
-                else:
-                    self.prefix_checkpoints.capture_at(req_id, self.requests[req_id].num_computed_tokens + count)
-            if getattr(self, '_prefill_event_trace_pending', False) and batch_size > 1:
-                prefill_events.finish()
-                self._prefill_event_trace_pending = False
+                self.prefix_checkpoints.capture_at(req_id, self.requests[req_id].num_computed_tokens + count)
             ids.append(req_id)
             if isinstance(result, AsyncModelRunnerOutput) and batch_size > 1:
                 # Request switches must consume the previous Engram generation
@@ -2036,13 +1938,7 @@ class V41ModelRunner:
                 execution_rounds.extend(getattr(result, "execution_rounds", None) or ())
                 if self.draft_token_ids is not None:
                     drafts.extend(self.draft_token_ids.draft_token_ids)
-        if getattr(self, '_prefill_event_trace_pending', False):
-            with prefill_events.span('prefix_acknowledgment'):
-                acknowledgments = self.prefix_checkpoints.finish() if self.prefix_checkpoints is not None else []
-            prefill_events.finish()
-            self._prefill_event_trace_pending = False
-        else:
-            acknowledgments = self.prefix_checkpoints.finish() if self.prefix_checkpoints is not None else []
+        acknowledgments = self.prefix_checkpoints.finish() if self.prefix_checkpoints is not None else []
         if operations is not None and async_result is not None:
             raise RuntimeError("Auxiliary prefix completion must precede asynchronous decode")
         if async_result is None and self.pp.group.is_last_rank:
@@ -2080,14 +1976,11 @@ class V41ModelRunner:
         if len(tokens) != count or start + count > self.model_config.max_model_len:
             raise RuntimeError("Scheduled V4.1 inputs do not match the committed prefix and context budget")
         decode = start >= request.decode_start
-        if count == 1 and getattr(self.model.program, 'sampling_tail', False):
-            self._prepare_sample_controls(1, (request,))
         from vllm_gaudi.ops import deepseek_v41_prefill_event_trace as prefill_events
 
         tracing_prefill = not decode and prefill_events.begin(
             req_id, self.pp.generation + 1, count, self.model.pp_rank, self.model.tp_rank
         )
-        self._prefill_event_trace_pending = tracing_prefill
         valid_decode = 1 <= count <= 6 if self.use_dspark else count == 1
         if decode and not valid_decode:
             raise RuntimeError(f"Unexpected V4.1 decode shape: tokens={count}, drafts={len(proposed)}")
@@ -2206,6 +2099,8 @@ class V41ModelRunner:
         else:
             sample_input = None
         self.pending = (request, start, count, len(chunk), proposed, need_sample, sample_input)
+        if tracing_prefill:
+            prefill_events.finish()
         return None
 
     @torch.inference_mode()
@@ -2561,7 +2456,6 @@ class V41ModelRunner:
         if isinstance(getattr(self, "batch_result", None), AsyncModelRunnerOutput):
             self.batch_result.get_output()
         self.pp.drain()
-        logger.info("V4.1 worker completion audit: %s", self.audit)
         if self.prefix_checkpoints is not None:
             self.prefix_checkpoints.close()
         if self.verify_ring is not None:

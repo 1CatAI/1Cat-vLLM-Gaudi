@@ -1981,14 +1981,11 @@ class PreparedGreedyTail(nn.Module):
     sample_greedy = PreparedStage.sample_greedy
     sample_greedy_token = PreparedStage.sample_greedy_token
 
-    def __init__(self, stage, *, sampling_controls=None):
+    def __init__(self, stage):
         super().__init__()
         self.weights = nn.Module()
         self.weights.head = stage.weights.head
         self.bf16_head = stage.bf16_head
-        self.sampling_controls = sampling_controls
-        self.sampling_candidates = getattr(stage, 'sampling_candidates', 128)
-        self.sampling_sorted = getattr(stage, 'sampling_sorted', True)
         from vllm_gaudi.ops.deepseek_v41_replay import stage_collectives
 
         self.tp_rank = stage.tp_rank
@@ -2001,12 +1998,6 @@ class PreparedGreedyTail(nn.Module):
         from vllm_gaudi.ops.deepseek_v41_sampling import local_greedy_candidate, select_greedy_candidate
 
         local = self._head_projection(hidden)
-        if self.sampling_controls is not None:
-            from vllm_gaudi.ops.deepseek_v41_sampling import sample_replay_candidates
-
-            return sample_replay_candidates(local, self.sampling_controls, self.tp_rank,
-                                             self.all_gather, candidates=self.sampling_candidates,
-                                             sorted_candidates=self.sampling_sorted), local
         candidates = self.all_gather(local_greedy_candidate(local, self.tp_rank), dim=-1)
         return select_greedy_candidate(candidates).to(torch.int32), local
 
@@ -2015,7 +2006,7 @@ class PreparedLayerGroup(nn.Module):
     """Bound FX dependency closure without changing the stage tensor program."""
 
     def __init__(self, stage, start, stop, *, pp_wire_input=False, fused_text_io=False,
-                 fp8_decode=False, decode=False, replay_tail=False, sampling_controls=None):
+                 fp8_decode=False, decode=False, replay_tail=False):
         super().__init__()
         self.fp8_decode = fp8_decode
         self.decode = decode
@@ -2030,8 +2021,7 @@ class PreparedLayerGroup(nn.Module):
         self.layers = nn.ModuleList(list(stage.layers[start:stop]))
         self.final = is_last_stage and stop == len(stage.layers)
         self.norm = stage.weights.norm if self.final else None
-        self.greedy_tail = (PreparedGreedyTail(stage, sampling_controls=sampling_controls)
-                           if self.final and replay_tail else None)
+        self.greedy_tail = PreparedGreedyTail(stage) if self.final and replay_tail else None
         self.eps = stage.config["text_config"]["rms_norm_eps"]
         self.native_input = None
 
@@ -2173,7 +2163,6 @@ class CompiledStage:
         prepared_tp4=False,
         native_tp4=False,
         replay_tail=False,
-        sampling_controls=None,
     ):
         legacy_fp8 = getattr(stage, "fp8_decode", False) and not getattr(stage, "expert_n256", False)
         if native_input and (not native or stage.pp_rank != 0 or stage.dspark or legacy_fp8):
@@ -2211,7 +2200,6 @@ class CompiledStage:
                 fp8_decode=getattr(stage, "fp8_decode", False),
                 decode=native or getattr(stage, "tensor_parallel_size", 2) == 4,
                 replay_tail=replay_tail,
-                sampling_controls=sampling_controls,
             )
             for start in range(0, len(stage.layers), group_size)
         )

@@ -277,27 +277,9 @@ def main():
                                        fullgraph=True, dynamic=False)
             compiled_sampler = torch.compile(stage.sample_greedy_token, backend='hpu_backend',
                                              fullgraph=True, dynamic=False)
-            from functools import partial
-            from vllm_gaudi.ops.deepseek_v41_sampling import request_uniform, sample_probabilities
-            sampled_probability = torch.compile(partial(sample_probabilities, filtered=True),
-                                                 backend='hpu_backend', fullgraph=True, dynamic=False)
-            def prepare_sampling(engine, ordinal):
-                settings = getattr(engine.program(), 'sampling_controls', None)
-                if settings is not None:
-                    settings.copy_(torch.tensor([[1., .95, request_uniform('chain', 42, ordinal), -1.]]))
-            def sampler(hidden, engine=None, *, force_full=False):
+            def sampler(hidden, engine=None):
                 owner = decoder if engine is None else engine
                 cached = owner.greedy_tail_token(hidden) if args.shared_stage_replay else None
-                program = owner.program() if args.shared_stage_replay else stage
-                settings = getattr(program, 'sampling_controls', None)
-                if settings is not None:
-                    program.sampling_last_hidden = hidden
-                    if getattr(program, 'sampling_tail', False) and cached is not None and not force_full:
-                        return cached
-                    local = owner.tail_local_logits(hidden)
-                    if local is None:
-                        local = program._head_projection(hidden)
-                    return sampled_probability(program.all_gather(local, -1), settings)
                 if cached is not None:
                     report['native_tail_sampler_hits'] = report.get('native_tail_sampler_hits', 0) + 1
                 return compiled_sampler(hidden) if cached is None else cached
@@ -497,26 +479,8 @@ def main():
 
                 engine = decoder if engine is None else engine
                 reset()
-                sampling = (args.shared_stage_replay
-                            and getattr(engine.program(), 'sampling_controls', None) is not None)
-                if sampling:
-                    prepare_sampling(engine, 0)
                 selected = sampler(seed_hidden, engine)
                 readback = bridge.copy_sampled_tokens_to_host(selected)
-                resolution = None
-                resolver = None
-                if sampling and getattr(engine.program(), 'sampling_async', False):
-                    from concurrent.futures import ThreadPoolExecutor
-                    from types import SimpleNamespace
-                    from vllm_gaudi.v1.worker.deepseek_v41_v2_runner import V41V2ModelRunner
-                    resolver = object.__new__(V41V2ModelRunner)
-                    resolver.model = SimpleNamespace(program=engine.program())
-                    resolver.audit = report
-                    resolver.tp4_token_readback = bridge.copy_sampled_tokens_to_host
-                    resolver._sample_requests = lambda hidden, requests, **kwargs: sampler(
-                        hidden, engine, force_full=kwargs.get('force_full', False))
-                    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='v41-sampling')
-                    request = SimpleNamespace(sampling_params=SimpleNamespace(temperature=1.))
                 torch.hpu.synchronize()
                 output_tokens = []
                 device_start = torch.hpu.Event(enable_timing=True) if measure else None
@@ -541,22 +505,6 @@ def main():
                     with context:
                         if args.trace_entry_phases or args.queue_marker_only:
                             mark('begin', index)
-                        if sampling:
-                            # The serving scheduler consumes the previous token
-                            # before the next native input transaction. Resolve
-                            # any incomplete nucleus before input/Engram staging.
-                            if resolution is not None:
-                                resolution.result()
-                            cpu, done = readback
-                            done.synchronize()
-                            vocabulary = stage.weights.head.weight.shape[0] * 4
-                            if int(cpu[0, 0]) >= vocabulary:
-                                selected = sampler(engine.program().sampling_last_hidden, engine, force_full=True)
-                                readback = bridge.copy_sampled_tokens_to_host(selected)
-                                readback[1].synchronize()
-                                report['sampling_fallbacks'] = report.get('sampling_fallbacks', 0) + 1
-                            report['sampling_draws'] = report.get('sampling_draws', 0) + 1
-                            prepare_sampling(engine, index + 1)
                         position = 16384 + index
                         if device:
                             if native_positions:
@@ -601,21 +549,9 @@ def main():
                             residual, pre = embedding(ids)
                             hidden = engine(residual, pre, positions, ids, packed)[0]
                         selected = sampler(hidden, engine)
-                        if sampling and index < warm_steps:
-                            expected_controls = torch.tensor([[1., .95, request_uniform('chain', 42, index + 1), -1.]])
-                            torch.testing.assert_close(engine.program().sampling_controls.cpu(), expected_controls,
-                                                       rtol=0, atol=0)
-                            if getattr(engine.program(), 'sampling_tail', False):
-                                expected = sampler(hidden, engine, force_full=True).cpu()
-                                actual = selected.cpu()
-                                if int(actual[0, 0]) < stage.weights.head.weight.shape[0] * 4:
-                                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                         if args.trace_entry_phases or args.queue_marker_only:
                             mark('stage_and_sampler_enqueued', index)
                         readback = bridge.copy_sampled_tokens_to_host(selected)
-                        if resolver is not None:
-                            resolution = executor.submit(resolver._resolve_sampling_completion, request,
-                                                         selected, *readback, torch.hpu.current_stream())
                         if args.trace_entry_phases or args.queue_marker_only:
                             mark('token_readback_enqueued', index)
                         host.complete(ticket, 1)
@@ -623,19 +559,10 @@ def main():
                             mark('end', index)
                     if measure and index >= warm_steps:
                         iteration_marks.append(time.perf_counter_ns())
-                if resolution is not None:
-                    resolution.result()
-                if resolver is not None:
-                    executor.shutdown(wait=True)
-                cpu, done = readback
-                done.synchronize()
-                if sampling and int(cpu[0, 0]) >= stage.weights.head.weight.shape[0] * 4:
-                    selected = sampler(engine.program().sampling_last_hidden, engine, force_full=True)
-                    cpu, done = bridge.copy_sampled_tokens_to_host(selected)
-                    done.synchronize()
-                    report['sampling_fallbacks'] = report.get('sampling_fallbacks', 0) + 1
                 if measure:
                     device_end.record()
+                cpu, done = readback
+                done.synchronize()
                 if measure:
                     delivery_marks.append(time.perf_counter_ns())
                 output_tokens.append(int(cpu[0, 0]))
@@ -671,10 +598,7 @@ def main():
                 return [chunk.preparations for chunk in decoder.chunks]
 
             if args.resident_ab:
-                if __package__:
-                    from tools.deepseek_v41_resident_ab import serve
-                else:
-                    from deepseek_v41_resident_ab import serve
+                from deepseek_v41_resident_ab import serve
                 serve(stage, decoder, shard, chain, report, args, preparation_counts)
                 report.update(status='resident_ab_stopped', formal_gain_credit=False)
                 return

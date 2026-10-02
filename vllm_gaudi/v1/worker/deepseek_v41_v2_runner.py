@@ -2,7 +2,6 @@
 """V4.1 adapter for vLLM V2 scheduling and asynchronous token ownership."""
 
 from dataclasses import dataclass, field
-from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
 
@@ -29,7 +28,6 @@ class CompletionRecord:
     host: object
     done: object
     device_token: object
-    resolution: object | None = None
     _token_lock: object = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
     _token: int | None = field(default=None, init=False, repr=False, compare=False)
 
@@ -42,8 +40,6 @@ class CompletionRecord:
     def _consume_token(self) -> int:
         with self._token_lock:
             if self._token is None:
-                if self.resolution is not None:
-                    self.resolution.result()
                 if annotations_enabled():
                     with scope(f"v41::completion_wait::P{self.start}"):
                         self.done.synchronize()
@@ -200,14 +196,6 @@ class V41V2ModelRunner(V41ModelRunner):
             raise RuntimeError("V2 completion outlived its request generation")
         if record.generation != self.pp.generation or len(request.tokens) != record.start + 1:
             raise RuntimeError("V2 completion does not extend the worker's exact token prefix")
-        if record.resolution is not None:
-            # All ranks own a resolver, including ranks which never serialize
-            # an output. A fallback collective must finish before its token
-            # reaches the embedding or Engram consumer.
-            started = time.perf_counter_ns()
-            record.resolution.result()
-            self.audit['sampling_resolution_ns'] = self.audit.get('sampling_resolution_ns', 0) + (
-                time.perf_counter_ns() - started)
         early = envs.VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT
         identity = self._identity(record)
         if early:
@@ -242,12 +230,7 @@ class V41V2ModelRunner(V41ModelRunner):
                     else:
                         self.model.prepare_device_engram(record.request_id, record.device_token)
                     self.audit["v2_device_engram_starts"] = self.audit.get("v2_device_engram_starts", 0) + 1
-                if getattr(self.model.program, 'sampling_tail', False):
-                    self._prepare_sample_controls(1, (request,), ordinal_offset=1)
-                started = time.perf_counter_ns()
                 self.model.begin_decode_prefix(record.device_token, position)
-                self.audit['sampling_prefix_enqueue_ns'] = self.audit.get('sampling_prefix_enqueue_ns', 0) + (
-                    time.perf_counter_ns() - started)
                 self._prefix_started = identity
                 self.audit["v2_prefix_starts"] = self.audit.get("v2_prefix_starts", 0) + 1
         token = record.token()
@@ -354,42 +337,11 @@ class V41V2ModelRunner(V41ModelRunner):
             # producer. Resolving again would hash runtime libraries and scan
             # /proc/self/maps on every token, serializing the serving loop.
             host, done = self.tp4_token_readback(token)
-            resolution = None
-            if (getattr(getattr(self.model, 'program', None), 'sampling_tail', False)
-                    and request.sampling_params.temperature != 0):
-                if not hasattr(self, '_sampling_resolver'):
-                    self._sampling_resolver = ThreadPoolExecutor(max_workers=1,
-                                                                 thread_name_prefix='v41-sampling')
-                stream = torch.hpu.current_stream()
-                resolution = self._sampling_resolver.submit(
-                    self._resolve_sampling_completion, request, token, host, done, stream)
         else:
             bridge, _ = resolve_device_runtime(tp_size)
             host, done = bridge.copy_sampled_tokens_to_host(token)
-            resolution = None
-        record = CompletionRecord(request.req_id, self.pp.generation, start, host, done, token.view(1), resolution)
+        record = CompletionRecord(request.req_id, self.pp.generation, start, host, done, token.view(1))
         self._completion = record
         self.pending = self.draft_token_ids = self._token_copy = None
         self.audit["v2_async_completions"] = self.audit.get("v2_async_completions", 0) + 1
         return V41AsyncOutput(record) if self.pp.group.is_last_rank else None
-
-    @torch.inference_mode()
-    def _resolve_sampling_completion(self, request, token, host, done, stream):
-        # Preserve the submitting stream's native dependencies in the helper
-        # thread. The next worker entry waits for this future before updating
-        # request controls or reusing the current tail buffers.
-        with torch.hpu.stream(stream):
-            resolved, resolved_host, resolved_done = self._resolve_sampled_marker(request, token, host, done)
-            if resolved is not token:
-                token.copy_(resolved)
-                resolved_done.synchronize()
-                host.copy_(resolved_host)
-                torch.hpu.current_stream().synchronize()
-
-    def close(self):
-        resolver = getattr(self, '_sampling_resolver', None)
-        if resolver is not None:
-            resolver.shutdown(wait=True)
-        super().close()
-
-    shutdown_inc = close
