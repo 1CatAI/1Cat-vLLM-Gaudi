@@ -1114,7 +1114,7 @@ class V41ModelRunner:
             if (envs.VLLM_HPU_DSV41_SAMPLING_REPLAY and self.v2_completion and self.model.native
                     and program.pp_rank == 0 and program.is_last_stage
                     and envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH):
-                host = torch.tensor([[0., .95, .5, -1.]], dtype=torch.float32).pin_memory('hpu')
+                host = torch.tensor([[0., .95, .5, -1.]], dtype=torch.float32)
                 controls = host.to(self.device)
                 program.register_buffer('sampling_controls', controls)
                 program.sampling_tail = True
@@ -1149,14 +1149,16 @@ class V41ModelRunner:
         if keys.get(batch) == key and getattr(self.model.program, 'sampling_tail', False):
             return self.sampling_buffers[batch][1]
         if batch not in self.sampling_buffers:
-            host = torch.zeros(batch, 4, dtype=torch.float32).pin_memory("hpu")
+            # Eager Bridge snapshots pageable inputs into its own transfer
+            # storage. A pinned source instead forces a pipeline join even
+            # with non_blocking=True, delaying the next native submission.
+            host = torch.zeros(batch, 4, dtype=torch.float32)
             device = torch.empty_like(host, device=self.device)
             self.sampling_buffers[batch] = host, device
         host, controls = self.sampling_buffers[batch]
         upload_started = time.perf_counter_ns()
         audit = getattr(self, 'audit', None)
-        # A previous asynchronous transfer may still read the pinned buffer.
-        # Retain ownership through the transfer event before filling it again.
+        # Retain the previous transfer event before reusing this control frame.
         pending = getattr(self, "sampling_copy_events", {}).get(batch)
         if pending is not None:
             wait_started = time.perf_counter_ns()
