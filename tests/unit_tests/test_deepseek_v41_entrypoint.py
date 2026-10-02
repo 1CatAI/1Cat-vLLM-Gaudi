@@ -204,7 +204,7 @@ def test_tp4_defaults_select_optimized_moe_without_opt_in(monkeypatch, tmp_path)
         "PREFILL_ACTIVE_PLAN",
     ):
         assert os.environ["VLLM_HPU_DSV41_" + key] == "1"
-    assert os.environ["VLLM_HPU_DSV41_PREFILL_GROUPED_FP8"] == ""
+    assert os.environ["VLLM_HPU_DSV41_PREFILL_GROUPED_FP8"] == "w13_single_bucket"
     assert os.environ["VLLM_HPU_DSV41_PREFILL_DECODER_HALO"] == "1"
     assert os.environ["VLLM_HPU_DSV41_PREFILL_MLA_SEQUENCE"] == "1"
 

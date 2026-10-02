@@ -179,9 +179,9 @@ _TP4_FASTPATH_DEFAULTS = {
     "VLLM_HPU_DSV41_ENGRAM_NATIVE_C1": "1",
     "VLLM_HPU_DSV41_ENGRAM_C1_PACKET": "1",
     "VLLM_HPU_DSV41_PREFILL_EXPERT_ROWS": "128",
-    # Ordinary C1 qualification uses the BF16 grouped prompt path. The FP8
-    # prompt experiment remains available through an explicit override.
-    "VLLM_HPU_DSV41_PREFILL_GROUPED_FP8": "",
+    # Preserve the qualified complete-prefill W13 path. This mode leaves
+    # routed W2 and the native C1 decode program unchanged.
+    "VLLM_HPU_DSV41_PREFILL_GROUPED_FP8": "w13_single_bucket",
     "VLLM_HPU_DSV41_PREFILL_DECODER_HALO": "1",
     "VLLM_HPU_DSV41_PREFILL_MLA_SEQUENCE": "1",
 }
