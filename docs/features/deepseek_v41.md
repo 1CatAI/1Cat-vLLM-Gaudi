@@ -465,6 +465,11 @@ or an editable source directory. Validate a new installation with one unprofiled
 running release. Profiled timing and component estimates do not qualify it.
 
 
+The single-host supervisor uses loopback for CPU control collectives by default,
+so local prefix acknowledgments do not advertise transient routable addresses.
+An explicit `GLOO_SOCKET_IFNAME` in the installation settings retains the machine
+interface override. Device communication and native replay are unchanged.
+
 For a public tunnel, run `tools/serve_deepseek_v41_api.py --api-key-file KEY_FILE`
 on a separate loopback port and expose that port. This streaming adapter allows
 only model queries, Chat/Completion generation and health; it rejects internal

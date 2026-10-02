@@ -486,3 +486,61 @@ uncached prompt processing remains necessary. Evidence: existing
 `transitions.json`, `formal`, `formal-host.jsonl`, `environment.json`,
 `reference-comparison.json`, `parent-reference-comparison.json` and
 `quality-results.json`. Pending microbenchmark gains remain **0 ms**.
+
+
+### Complete-prefill and prefix integration — serving qualification pending
+
+PR51 qualified complete prompt execution at **9857.756805 tokens/s** from
+16384 input tokens. The installed prefix-enabled release processed smaller
+scheduler tiles and split the checkpoint boundary; PR52 also reset the existing
+`w13_single_bucket` grouped W13 FP8 prefill default to BF16. The maintained
+candidate restores the scheduler budget and W13 mode, captures interior rings
+from live full/decoder-halo producers, retile-checkpoints shorter transactions,
+and stages bounded request rings through fixed warmed working addresses.
+After checkpoint publication the continuing prefill owner is rebound, so later
+prompt writes publish independently of the immutable saved boundary.
+
+Candidate816ff598, independently installed with complete warmup, modules
+0/1/4/5 and CPUs10/15/38/43: one uncached16384→natural-EOS formal request
+returns3024 tokens at **10.137485 ms/token**; prefill **8290.594339 tokens/s**,
+engine prefill1.976215 s and client TTFT2.100969 s. Decode remains near the
+prefix-enabled formal parent10.069162 ms, but complete-prefill throughput does
+**not** restore PR51. Four additional recommended-sampling tasks pass every
+frozen semantic field, making five samples including the formal factual task.
+Their prefill rates are3535,8364,8246 and8404 tokens/s; these are different
+prompts, not repeat formal benchmark measurements. Their sampling decode rates
+are separately recorded and do not qualify the greedy target.
+
+Cache probes: full16K repeat after another request reuses16256 tokens with
+client TTFT0.702 s; appended16K continuation reuses16256 with TTFT0.906 s
+versus4.650 s for its forced miss. Recommended-sampling2K repeats reuse1920
+with TTFT0.371 s locally and0.493 s publicly. Short cached/fresh sampled tokens
+match. Long cached/fresh token sequences differ; restored grouped FP8 and
+changed prompt geometry do not promise token equality. A cached long chat and
+valid appended-user chat both reach natural EOS and pass all factual checks.
+The original raw-completion semantic probe appended arbitrary archive tokens
+after the assistant opening, continued the archive to the length limit, and
+is retained as an invalid chat-semantic test; the valid chat probe replaces it.
+
+CPU994 passed/111 skipped. HPU checkpoint→tail publication→native unpack/MME
+handoff passes changing inputs and slot reorder/reuse, and real W13 FP8 through
+routed W2 consumes outputs with finite values (BF16 relative L2 **0.035350**;
+this component tolerance is not the model quality gate). C1 before/after that
+prefill component is exact. No new component gain is admitted; pending gains
+remain **0 ms**. PR56 remains draft pending prefill performance qualification.
+
+Interrupted/failed attempts are retained:01 near-full unowned residual OOM;
+03 stopped before readiness after finding tail ownership;04 stopped during
+loading after finding the precision-default reset. In05 every rank completed
+prefill but CPU/Gloo acknowledgment attempted an obsolete non-local public IPv6
+and timed out. The single-host supervisor now selects loopback by default;
+the unchanged all-rank protocol passes36 transactions per rank in a four-rank
+HPU-producer→acknowledgment component.06 completes real serving qualification
+for state and quality.07 captures diagnostic prefill spans to locate the
+remaining throughput difference; diagnostic timers do not advance the baseline.
+
+Evidence: `evidence/20260928_tp4-decode-gap-1p5/unified-prefill-decode-01`
+through`unified-prefill-decode-07`;06 includes formal, cache probes, corrected
+chat continuation, fixed quality outputs, host telemetry and source manifests.
+Other modules2/3/6/7 remain768MiB and0% utilization at sampled preflights;
+CPU PSI and bound-core/context-switch data accompany the formal result.
