@@ -585,3 +585,27 @@ version for publication and authorized merging PR56. Publish the measured
 8914.621782 tokens/s and10.599712 ms/token without claiming the original
 >=9000 prefill gate passed or the later10ms sampling target was achieved.
 No additional formal request is required for this unchanged runtime.
+
+
+### 2026-10-03 long-context index path — real-stage qualified, serving pending
+
+Parent main ea017d60; maintained source b51026b5 (measurement checks9056543d).
+The published C1 path falls back from decoded-key MME to serial packed TPC
+dot products past32K. Reuse the existing paged-key/MME producer and ordered
+selection/reindex consumer in the shared runtime; no sampling or native ABI change.
+Capacity clipping alone was rejected and is not credited.
+
+`visible-index-real16-05`: actual41984 prompt,512Kcapacity, modules2/3/6/7,
+CPU64/69/92/97; separate captures and ABABAB200. Four-rank first device
+positions are41984. Latest-token-delivery medians10.0259465→5.0995845ms,
+measured saving4.926362ms;2×baselineIQR0.1233685ms. Baseline drift0.002920ms.
+All200feedbacktokens agree across six periods and four ranks; no hot compile.
+Full/Reindex/packed-row consumer tests at32K/42K/62K/64K boundaries are exact.
+The owned other-group loader was temporarily frozen and automatically thawed;
+interrupted and wrong-position fixtures01–04 remain outside gain totals.
+
+This is a42Kstage comparison. It is excluded from the16Kbaseline cumulative
+savings; the1.5×heuristic from the16Kfusion campaign is not used to predict
+this different workload. End-to-end long-request saving is not yet known.
+One fixed official16K EOS request and short arbitrary-length/cache diagnostics
+are pending on the ordinary installed service. No API improvement is claimed yet.
