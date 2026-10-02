@@ -567,6 +567,15 @@ owner-only fixture was noisy:60.285510→54.907627ms, below its7.209410ms
 threshold; it is not a separately counted gain.
 
 
-### 2026-10-03 release rollback, formal pending
+### 2026-10-03 release rollback, formal release gate not passed
 
 User withdrew the native bounded-sampling integration and its diagnostic variants. Restore d85ebce5 generic official sampler; retain efbbd824/prefill/cache repairs and warm official sampling graphs before readiness. The withdrawn sampling component is outside all pending gain totals; its failed serving and diagnostic evidence remains in the local experiment index. The current release gate is one official-seed uncached16K natural-EOS request at512K/C16384/prefix enabled, with approximately10.7ms decode and at least9000tps prefill. The10ms device-RNG/once-per-request-controls sampler will use a separate branch and PR after release.
+
+`release-rollback-01`, source `5a787dbe`: complete warmup, official sampling
+temperature=1.0/top_p=0.95/seed=42, uncached16384 input, 2128 natural-EOS tokens.
+Measured prefill **8914.621782 tokens/s**, decode **10.599712 ms/token**;
+14/14 fixed facts/constraints passed. CPU977 passed/112 skipped. Decode recovered,
+but prefill missed the >=9000 release gate by0.95%. PR56 remains draft and main
+has not been changed. This failed combined release acceptance does not advance
+the accepted baseline or add any pending component savings. See the local
+`release-rollback-01/OUTCOME.md` and raw `formal/result.json` for the result.
