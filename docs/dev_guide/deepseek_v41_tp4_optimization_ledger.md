@@ -611,3 +611,17 @@ change is withdrawn. Archived rejected source and results are preserved.
 
 Evidence: `evidence/20260928_tp4-decode-gap-1p5/official-512k-serving-02`,
 `nucleus-real16-05`, `nucleus-prefill-component-01`.
+
+
+The8f6a8b17 installed official request still fails: prefill8957.475039 tokens/s,
+decode17.674718167ms/token,2128 natural-EOS tokens and all14 factual checks
+passing. ITL median17.452656ms remains high. Shutdown audits on the output and
+two non-output ranks show no full-sampling fallback counter. Asynchronous marker
+resolution therefore does not explain or repair the main serving regression.
+No formal gain is credited. A fresh diagnostic is required before another
+sampling candidate. The prefill event enclosure previously stopped before
+sample completion and checkpoint publication; diagnostic-only scopes now include
+sample completion, snapshot publication and all-rank acknowledgment. Diagnostic
+enabling remains explicit and off by default. CPU regressions:1003 passed,
+112 skipped. Evidence: `official-512k-serving-03`; subsequent diagnostic retained
+separately from formal acceptance.

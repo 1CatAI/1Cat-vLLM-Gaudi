@@ -1970,9 +1970,21 @@ class V41ModelRunner:
             )
             with single_trace:
                 self._execute_request(scheduled, req_id, count)
-                result = self._finish_request()
+                if getattr(self, '_prefill_event_trace_pending', False):
+                    from vllm_gaudi.ops import deepseek_v41_prefill_event_trace as prefill_events
+                    with prefill_events.span('sample_completion', rows=count):
+                        result = self._finish_request()
+                else:
+                    result = self._finish_request()
             if self.prefix_checkpoints is not None:
-                self.prefix_checkpoints.capture_at(req_id, self.requests[req_id].num_computed_tokens + count)
+                if getattr(self, '_prefill_event_trace_pending', False):
+                    with prefill_events.span('prefix_checkpoint', rows=count):
+                        self.prefix_checkpoints.capture_at(req_id, self.requests[req_id].num_computed_tokens + count)
+                else:
+                    self.prefix_checkpoints.capture_at(req_id, self.requests[req_id].num_computed_tokens + count)
+            if getattr(self, '_prefill_event_trace_pending', False) and batch_size > 1:
+                prefill_events.finish()
+                self._prefill_event_trace_pending = False
             ids.append(req_id)
             if isinstance(result, AsyncModelRunnerOutput) and batch_size > 1:
                 # Request switches must consume the previous Engram generation
@@ -1988,7 +2000,13 @@ class V41ModelRunner:
                 execution_rounds.extend(getattr(result, "execution_rounds", None) or ())
                 if self.draft_token_ids is not None:
                     drafts.extend(self.draft_token_ids.draft_token_ids)
-        acknowledgments = self.prefix_checkpoints.finish() if self.prefix_checkpoints is not None else []
+        if getattr(self, '_prefill_event_trace_pending', False):
+            with prefill_events.span('prefix_acknowledgment'):
+                acknowledgments = self.prefix_checkpoints.finish() if self.prefix_checkpoints is not None else []
+            prefill_events.finish()
+            self._prefill_event_trace_pending = False
+        else:
+            acknowledgments = self.prefix_checkpoints.finish() if self.prefix_checkpoints is not None else []
         if operations is not None and async_result is not None:
             raise RuntimeError("Auxiliary prefix completion must precede asynchronous decode")
         if async_result is None and self.pp.group.is_last_rank:
@@ -2033,6 +2051,7 @@ class V41ModelRunner:
         tracing_prefill = not decode and prefill_events.begin(
             req_id, self.pp.generation + 1, count, self.model.pp_rank, self.model.tp_rank
         )
+        self._prefill_event_trace_pending = tracing_prefill
         valid_decode = 1 <= count <= 6 if self.use_dspark else count == 1
         if decode and not valid_decode:
             raise RuntimeError(f"Unexpected V4.1 decode shape: tokens={count}, drafts={len(proposed)}")
@@ -2151,8 +2170,6 @@ class V41ModelRunner:
         else:
             sample_input = None
         self.pending = (request, start, count, len(chunk), proposed, need_sample, sample_input)
-        if tracing_prefill:
-            prefill_events.finish()
         return None
 
     @torch.inference_mode()
