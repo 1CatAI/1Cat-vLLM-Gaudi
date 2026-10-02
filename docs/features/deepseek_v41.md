@@ -81,6 +81,18 @@ boundary; generated tokens do not automatically extend that auxiliary
 checkpoint for the next chat turn. Speculative execution does not support this
 checkpoint contract. The option remains off unless requested.
 
+For complete long-prompt tiles, the worker saves the checkpoint's small ring
+states directly from the live producers, including a trailing decoder halo.
+It preserves the complete prefill invocation and the request's final state;
+publication still requires every state, retained page and rank acknowledgment.
+Other prompt transactions retain the split-checkpoint path. Full slot-owned
+prefill and checkpoint producer coverage warm before API readiness.
+
+Installation settings may set `"max_num_batched_tokens": 16384` to retain the
+qualified complete TP4 prompt tile. Explicit CLI flags take precedence. This
+changes the scheduler token budget; the context and request-slot limits remain
+independent settings.
+
 The dedicated entrypoint enables the frozen-reference ordinary-C1 and V2
 device-continuation bundle by default. Launch without a feature-variable list:
 
