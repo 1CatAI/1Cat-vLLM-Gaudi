@@ -665,10 +665,18 @@ class EngramHost:
         self.histories[request_id] = history
         return history.position
 
-    def snapshot_prefix(self, request_id):
+    def snapshot_prefix(self, request_id, *, token_ids=None, image_mask=None):
         if self.closed or self.pending is not None or self.device_pending is not None:
             raise RuntimeError("Cannot checkpoint a live Engram transaction")
-        return self.histories[request_id].snapshot_prefix(request_id)
+        checkpoint = self.histories[request_id].snapshot_prefix(request_id)
+        if token_ids is None:
+            return checkpoint
+        if len(token_ids) > checkpoint[0]:
+            raise ValueError("Engram checkpoint cannot include uncommitted tokens")
+        history = EngramTokenHistory(self.layout, self.history.token_map)
+        history.reset(request_id)
+        history.restore_prefix(request_id, token_ids, image_mask)
+        return history.snapshot_prefix(request_id)
 
     def restore_checkpoint(self, request_id, checkpoint):
         if self.closed or self.pending is not None or self.device_pending is not None:

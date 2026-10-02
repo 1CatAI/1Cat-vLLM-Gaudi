@@ -210,13 +210,18 @@ def runtime_search_length(start, count, maximum):
 def prefill_search_length(start, count, maximum, *, reuse_index_keys=False):
     """Use a bounded shared-key geometry without changing decode capture.
 
-    The hot geometry is shared with decode. Beyond it, one fixed prefill
-    geometry covers the shared-key workspace; longer prefixes retain the
-    capacity-independent path. Query positions still mask every future row.
+    The hot geometry is shared with decode. Beyond it, the two complete
+    prompt geometries retain the qualified decoder-halo MLA admission and
+    bounded shared-key workspace. Longer prefixes retain the capacity-
+    independent path. Query positions still mask every future row.
     """
     search = runtime_search_length(start, count, maximum)
     if reuse_index_keys and INDEX_MME_HOT_TOKENS < start + count <= 32768:
-        return min(maximum, 32768)
+        # A complete 16K prompt leaves 4K halo queries in the last decoder
+        # layers. Padding its search to 32K rejects the existing query-owned
+        # MLA path and also scans unused source tiles. Decode keeps its own
+        # fixed 32K geometry; prompt admission depends on this transaction.
+        return min(maximum, 16384 if start + count <= 16384 else 32768)
     if not reuse_index_keys and start + count > INDEX_MME_HOT_TOKENS:
         return maximum
     return search
@@ -1987,7 +1992,17 @@ class V41ModelRunner:
         chunks = [(0, tokens)] if decode else target_chunks(tokens, self.prefill_capacity)
         prefix_checkpoints = getattr(self, "prefix_checkpoints", None)
         if prefix_checkpoints is not None:
-            chunks = prefix_checkpoints.chunks(req_id, start, chunks)
+            chunks = prefix_checkpoints.chunks(
+                req_id, start, chunks,
+                inline_eligible=(
+                    count == self.prefill_capacity
+                    and max(prefill_compute_buckets(self.prefill_capacity), default=1) == count
+                    and len(scheduled.num_scheduled_tokens) == 1
+                    and not request.mm_features
+                    and getattr(request.sampling_params, "prompt_logprobs", None) is None
+                    and not self.use_dspark
+                ),
+            )
         program = getattr(self.model, "program", None)
         transaction_search = (
             (
@@ -2040,6 +2055,9 @@ class V41ModelRunner:
             finally:
                 if program is not None:
                     program.prefill_halo_mode = "full"
+                    shared = getattr(program, "shared", None)
+                    if shared is not None:
+                        shared.inline_prefix_capture = None
             if offset + len(chunk) < count:
                 self._insert(self.model.last_aux, self.positions[: len(chunk)])
                 self.model.complete_step(len(chunk))
@@ -2266,6 +2284,17 @@ class V41ModelRunner:
                     self._propose(1, start_position + tokens, diagnostic=True)
                 else:
                     self.sample_target(hidden[-1:])
+                    if (1, True) not in self.stochastic_samplers:
+                        # Sampling is part of first-token latency. Warm the
+                        # ordinary request path before readiness, independently
+                        # of the discarded greedy startup tokens.
+                        from types import SimpleNamespace
+
+                        for top_p in (.95, 1.):
+                            params = SimpleNamespace(temperature=1., top_p=top_p, top_k=-1, seed=42)
+                            request = SimpleNamespace(req_id='__v41_sampling_warmup__',
+                                                      sampling_params=params, output=[])
+                            self._sample_requests(hidden[-1:], (request,))
         self.pp.drain()
         self.model.complete_step(tokens)
         torch.hpu.synchronize()
@@ -2325,6 +2354,30 @@ class V41ModelRunner:
         if self.request_batches is not None:
             self.request_batches.warmup()
             self.model.batch_state.restore_single_bindings()
+        if getattr(self, "prefix_checkpoints", None) is not None and self.prefill_capacity > 8192:
+            from vllm_gaudi.ops.deepseek_v41_prefix_state import InlinePrefixCapture
+
+            bank, program = self.model.batch_state, self.model.program
+            count = max(prefill_compute_buckets(self.prefill_capacity))
+            owner = "__v41_prefix_warmup__"
+            slot = bank.acquire(owner)
+            bank.publish_pages(slot, range(1, count // 128 + 1), self.state.blocks)
+            bank.bind_prefill(slot)
+            capture = InlinePrefixCapture(bank, slot, 0, count, count - 128)
+            program.shared.inline_prefix_capture = capture
+            program.prefill_halo_mode = "final" if program.stop == 40 else "full"
+            try:
+                self._dummy_run(count)
+                capture.require_complete()
+                bank.bind_single(slot, count)
+                logger.info("V4.1 PP%d warmed slot-owned prefill and %d inline prefix states",
+                            self.model.pp_rank, len(capture.tensors))
+            finally:
+                program.shared.inline_prefix_capture = None
+                program.prefill_halo_mode = "full"
+                bank.restore_single_bindings()
+                bank.release(owner)
+            self.state.clear()
         # Ordinary serving keeps the qualified C1 native replay for decode.
         # C6 is a DSpark-only anchor-plus-draft geometry. Prompt C128 recipes
         # are compiled by real prefill qualification and persisted in cache.
@@ -2380,14 +2433,8 @@ class V41ModelRunner:
             from vllm_gaudi.ops.deepseek_v41_prefill_regions import freeze_prefill_regions
 
             freeze_prefill_regions()
-            # Checkpoint cuts add page-boundary shapes to the ordinary compute
-            # buckets. Prime their bounded expert/index helpers against the
-            # real KV pool before API readiness; pure region misses stay eager.
-            for bucket in prefill_compute_buckets(self.prefill_capacity):
-                if bucket > 256:
-                    self._dummy_run(bucket - 128)
-            self.pp.group.barrier()
-            self.state.clear()
+            # Inline capture preserves complete tiles; other checkpoint cuts
+            # reuse the finite prefill buckets already warmed above.
         if envs.VLLM_HPU_DSV41_VERIFY_TIMING:
             if (
                 not envs.VLLM_HPU_DSV41_DEVICE_VERIFY

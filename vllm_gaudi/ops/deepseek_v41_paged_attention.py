@@ -790,6 +790,10 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 # pairs from the current block whenever available and from the
                 # prior ring only at the leading boundary; update the ring
                 # after all reads so rows cannot alias within this transaction.
+                capture = getattr(self.shared, "inline_prefix_capture", None)
+                if capture is not None:
+                    capture.record(self.layer, "kv_history", kv)
+                    capture.record(self.layer, "score_history", score)
                 base, tokens = positions[0], positions.numel()
                 local_a, local_b = first - base, first + 1 - base
                 valid_a = (local_a >= 0) & (local_a < tokens)
@@ -1643,6 +1647,12 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 destination / f"layer2-start{first_position}-pid{os.getpid()}.pt",
             )
         boundary("selection")
+        # Both the flat-cache path and its bounded long-prefix fallback use
+        # the same normalized chronological KV producer. Save its boundary
+        # rows before either path commits the final sliding-window tail.
+        capture = getattr(getattr(self, "shared", None), "inline_prefix_capture", None)
+        if capture is not None:
+            capture.record(self.layer, "swa", kv, pack=pack_swa)
         main_rows = self.search_length // self.ratio if self.ratio else 0
         if main_rows > PREFILL_MAIN_CACHE_ROWS:
             return self._prefill_attention_tiled(value, query, kv, positions, selected, ready_outputs, prefill_sequence)

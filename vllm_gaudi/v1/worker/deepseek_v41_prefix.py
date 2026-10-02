@@ -26,6 +26,7 @@ class PrefixCheckpoints:
         self.histories = {}
         self.operations = None
         self.captured = set()
+        self.inline = {}
 
     @staticmethod
     def _done():
@@ -70,36 +71,84 @@ class PrefixCheckpoints:
                 runner.model.engram_host.restore_checkpoint(request_id, history)
             runner.audit["prefix_restores"] = runner.audit.get("prefix_restores", 0) + 1
 
-    def chunks(self, request_id, start, chunks):
+    def chunks(self, request_id, start, chunks, *, inline_eligible=False):
         descriptor = self.operations.captures.get(request_id) if self.operations is not None else None
-        return chunks if descriptor is None else split_at_checkpoint(chunks, start, descriptor.num_tokens)
+        if descriptor is not None and inline_eligible:
+            chunks = list(chunks)
+            if len(chunks) == 1:
+                offset, chunk = chunks[0]
+                begin, end = start + offset, start + offset + len(chunk)
+                if begin + 4096 < descriptor.num_tokens < end:
+                    from vllm_gaudi.ops.deepseek_v41_prefix_state import InlinePrefixCapture
+
+                    bank = self.runner.model.batch_state
+                    slot = bank.slots.owners[request_id]
+                    capture = InlinePrefixCapture(bank, slot, begin, end, descriptor.num_tokens)
+                    self.inline[request_id] = capture
+                    bank.program.shared.inline_prefix_capture = capture
+                    return chunks
+        if descriptor is None:
+            return chunks
+        # Interior cuts must not create an unprepared near-full prompt shape.
+        # In particular, a large residual loses token ownership and allocates
+        # the full FP32 mHC working set on every rank. Reuse the ordinary finite
+        # buckets while preserving the exact checkpoint boundary and tokens.
+        from vllm_gaudi.v1.worker.deepseek_v41_runner import target_chunks
+
+        result = []
+        for offset, values in split_at_checkpoint(chunks, start, descriptor.num_tokens):
+            result.extend((offset + inner, part)
+                          for inner, part in target_chunks(values, self.runner.prefill_capacity))
+        return result
 
     def capture_at(self, request_id, position):
         if self.operations is None or request_id in self.captured:
             return
         descriptor = self.operations.captures.get(request_id)
-        if descriptor is None or descriptor.num_tokens != position:
+        inline = self.inline.get(request_id)
+        if descriptor is None or (inline is None and descriptor.num_tokens != position):
+            return
+        if inline is not None and position != inline.end:
             return
         runner, bank = self.runner, self.runner.model.batch_state
         slot = bank.slots.owners[request_id]
-        if tuple(runner.requests[request_id].block_ids[0][:position // 128]) != descriptor.block_ids[0]:
+        boundary = descriptor.num_tokens
+        if tuple(runner.requests[request_id].block_ids[0][:boundary // 128]) != descriptor.block_ids[0]:
             raise RuntimeError("Auxiliary capture differs from scheduler-owned pages")
         runner.pp.drain()
         torch.hpu.synchronize()
+        continuing_prefill = getattr(bank, "prefill_owner", None) == slot
         leave_single = getattr(bank, "leave_single", None)
-        if leave_single is not None:
+        # Inline producers already own a separate boundary snapshot. Keep the
+        # live end-of-chunk working rings with their request instead of
+        # publishing and immediately importing them for the same owner.
+        if inline is None and leave_single is not None:
             leave_single()
         host = runner.model.engram_host
-        history = host.snapshot_prefix(request_id) if host is not None else None
-        if history is not None and history[0] != position:
+        if host is not None and inline is not None:
+            tokens = runner.requests[request_id].token_slice(0, boundary)
+            history = host.snapshot_prefix(request_id, token_ids=tokens,
+                                           image_mask=[token in (129264, 129265) for token in tokens])
+        else:
+            history = host.snapshot_prefix(request_id) if host is not None else None
+        if history is not None and history[0] != boundary:
             raise RuntimeError("Engram history did not commit the exact checkpoint boundary")
         ticket = PrefixStateTicket(descriptor.slot, descriptor.generation)
-        self.store.capture(ticket, bank, slot, position, descriptor.block_hash, self._done(), record_done=self._done)
+        options = {"state_tensors": inline.require_complete()} if inline is not None else {}
+        self.store.capture(ticket, bank, slot, boundary, descriptor.block_hash, self._done(),
+                           record_done=self._done, **options)
         self.store.publish(ticket)
         self.histories = {key: value for key, value in self.histories.items() if key.index != ticket.index}
         if history is not None:
             self.histories[ticket] = history
         self.captured.add(request_id)
+        self.inline.pop(request_id, None)
+        if continuing_prefill and inline is None:
+            # Snapshot publication retires the working owner. Any remaining
+            # prompt chunks still write those fixed addresses, so rebind them
+            # before the next producer; decode/batch/release must publish the
+            # completed tail rather than restore the checkpoint boundary.
+            bank.bind_prefill(slot)
         runner.audit["prefix_captures"] = runner.audit.get("prefix_captures", 0) + 1
 
     def finish(self):

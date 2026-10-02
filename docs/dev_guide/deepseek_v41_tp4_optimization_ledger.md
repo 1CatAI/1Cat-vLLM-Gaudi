@@ -486,3 +486,102 @@ uncached prompt processing remains necessary. Evidence: existing
 `transitions.json`, `formal`, `formal-host.jsonl`, `environment.json`,
 `reference-comparison.json`, `parent-reference-comparison.json` and
 `quality-results.json`. Pending microbenchmark gains remain **0 ms**.
+
+
+### Complete-prefill and prefix integration — serving qualification pending
+
+PR51 qualified complete prompt execution at **9857.756805 tokens/s** from
+16384 input tokens. The installed prefix-enabled release processed smaller
+scheduler tiles and split the checkpoint boundary; PR52 also reset the existing
+`w13_single_bucket` grouped W13 FP8 prefill default to BF16. The maintained
+candidate restores the scheduler budget and W13 mode, captures interior rings
+from live full/decoder-halo producers, retile-checkpoints shorter transactions,
+and stages bounded request rings through fixed warmed working addresses.
+After checkpoint publication the continuing prefill owner is rebound, so later
+prompt writes publish independently of the immutable saved boundary.
+
+Candidate816ff598, independently installed with complete warmup, modules
+0/1/4/5 and CPUs10/15/38/43: one uncached16384→natural-EOS formal request
+returns3024 tokens at **10.137485 ms/token**; prefill **8290.594339 tokens/s**,
+engine prefill1.976215 s and client TTFT2.100969 s. Decode remains near the
+prefix-enabled formal parent10.069162 ms, but complete-prefill throughput does
+**not** restore PR51. Four additional recommended-sampling tasks pass every
+frozen semantic field, making five samples including the formal factual task.
+Their prefill rates are3535,8364,8246 and8404 tokens/s; these are different
+prompts, not repeat formal benchmark measurements. Their sampling decode rates
+are separately recorded and do not qualify the greedy target.
+
+Cache probes: full16K repeat after another request reuses16256 tokens with
+client TTFT0.702 s; appended16K continuation reuses16256 with TTFT0.906 s
+versus4.650 s for its forced miss. Recommended-sampling2K repeats reuse1920
+with TTFT0.371 s locally and0.493 s publicly. Short cached/fresh sampled tokens
+match. Long cached/fresh token sequences differ; restored grouped FP8 and
+changed prompt geometry do not promise token equality. A cached long chat and
+valid appended-user chat both reach natural EOS and pass all factual checks.
+The original raw-completion semantic probe appended arbitrary archive tokens
+after the assistant opening, continued the archive to the length limit, and
+is retained as an invalid chat-semantic test; the valid chat probe replaces it.
+
+CPU994 passed/111 skipped. HPU checkpoint→tail publication→native unpack/MME
+handoff passes changing inputs and slot reorder/reuse, and real W13 FP8 through
+routed W2 consumes outputs with finite values (BF16 relative L2 **0.035350**;
+this component tolerance is not the model quality gate). C1 before/after that
+prefill component is exact. No new component gain is admitted; pending gains
+remain **0 ms**. PR56 remains draft pending prefill performance qualification.
+
+Interrupted/failed attempts are retained:01 near-full unowned residual OOM;
+03 stopped before readiness after finding tail ownership;04 stopped during
+loading after finding the precision-default reset. In05 every rank completed
+prefill but CPU/Gloo acknowledgment attempted an obsolete non-local public IPv6
+and timed out. The single-host supervisor now selects loopback by default;
+the unchanged all-rank protocol passes36 transactions per rank in a four-rank
+HPU-producer→acknowledgment component.06 completes real serving qualification
+for state and quality.07 captures diagnostic prefill spans to locate the
+remaining throughput difference; diagnostic timers do not advance the baseline.
+
+Evidence: `evidence/20260928_tp4-decode-gap-1p5/unified-prefill-decode-01`
+through`unified-prefill-decode-07`;06 includes formal, cache probes, corrected
+chat continuation, fixed quality outputs, host telemetry and source manifests.
+Other modules2/3/6/7 remain768MiB and0% utilization at sampled preflights;
+CPU PSI and bound-core/context-switch data accompany the formal result.
+### 2026-10-03 prefix transition component (formal pending)
+
+Parent33ef72c8. Preserve inline checkpoint tensors and the live working-ring
+owner across capture; promote the same owner to B1 without export/import.
+Compile the existing SWA reader once instead of eagerly expanding its
+bit/scale operations on every restored layer. Warm the reader and owner
+transition before admitting requests. No new state format or native ABI.
+
+`prefix-owner-codec-02`: module0,CPU10–14; ABABAB200. The measured
+producer/checkpoint/promotion/SWA-score chain covers40layers,46rings and
+three changing packed inputs. Baseline wall median54.309955ms; candidate
+8.748552ms; difference45.561403ms exceeds2×baselineIQR8.100912ms.
+Device-event timing agrees. Checkpoint boundary histories, latest live
+histories, BF16 score outputs and B2 publication agree. Compressed-cache
+mirror reconstruction is unchanged and excluded from this fixture.
+
+This is a per-request transition gain, not per-token decode gain. It does
+not enter the decode cumulative total or establish the9.5k prefill gate.
+Formal serving remains pending. CPU1005passed112skipped. The earlier
+owner-only fixture was noisy:60.285510→54.907627ms, below its7.209410ms
+threshold; it is not a separately counted gain.
+
+
+### 2026-10-03 release rollback, formal release gate not passed
+
+User withdrew the native bounded-sampling integration and its diagnostic variants. Restore d85ebce5 generic official sampler; retain efbbd824/prefill/cache repairs and warm official sampling graphs before readiness. The withdrawn sampling component is outside all pending gain totals; its failed serving and diagnostic evidence remains in the local experiment index. The current release gate is one official-seed uncached16K natural-EOS request at512K/C16384/prefix enabled, with approximately10.7ms decode and at least9000tps prefill. The10ms device-RNG/once-per-request-controls sampler will use a separate branch and PR after release.
+
+`release-rollback-01`, source `5a787dbe`: complete warmup, official sampling
+temperature=1.0/top_p=0.95/seed=42, uncached16384 input, 2128 natural-EOS tokens.
+Measured prefill **8914.621782 tokens/s**, decode **10.599712 ms/token**;
+14/14 fixed facts/constraints passed. CPU977 passed/112 skipped. Decode recovered,
+but prefill missed the >=9000 release gate by0.95%. PR56 remains draft and main
+has not been changed. This failed combined release acceptance does not advance
+the accepted baseline or add any pending component savings. See the local
+`release-rollback-01/OUTCOME.md` and raw `formal/result.json` for the result.
+
+Release decision update: the user explicitly accepted the measured rollback
+version for publication and authorized merging PR56. Publish the measured
+8914.621782 tokens/s and10.599712 ms/token without claiming the original
+>=9000 prefill gate passed or the later10ms sampling target was achieved.
+No additional formal request is required for this unchanged runtime.

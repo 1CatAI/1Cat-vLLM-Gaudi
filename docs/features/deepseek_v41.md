@@ -81,6 +81,22 @@ boundary; generated tokens do not automatically extend that auxiliary
 checkpoint for the next chat turn. Speculative execution does not support this
 checkpoint contract. The option remains off unless requested.
 
+For complete long-prompt tiles, the worker saves the checkpoint's small ring
+states directly from the live producers, including a trailing decoder halo.
+It preserves the complete prefill invocation and the request's final state;
+publication still requires every state, retained page and rank acknowledgment.
+Other prompt transactions retain the split-checkpoint path, retiled into the
+existing prepared buckets. Prefill stages only the selected request’s bounded
+auxiliary rings into the warmed fixed working addresses. It publishes those
+rings before checkpoint capture, decode, batch entry or slot release; paged KV
+and token-owned residuals remain in place. Complete-prefill contracts and
+checkpoint producer coverage warm before API readiness.
+
+Installation settings may set `"max_num_batched_tokens": 16384` to retain the
+qualified complete TP4 prompt tile. Explicit CLI flags take precedence. This
+changes the scheduler token budget; the context and request-slot limits remain
+independent settings.
+
 The dedicated entrypoint enables the frozen-reference ordinary-C1 and V2
 device-continuation bundle by default. Launch without a feature-variable list:
 
@@ -448,6 +464,11 @@ or an editable source directory. Validate a new installation with one unprofiled
 16K-to-natural-EOS request and the fixed semantic cohort before replacing the
 running release. Profiled timing and component estimates do not qualify it.
 
+
+The single-host supervisor uses loopback for CPU control collectives by default,
+so local prefix acknowledgments do not advertise transient routable addresses.
+An explicit `GLOO_SOCKET_IFNAME` in the installation settings retains the machine
+interface override. Device communication and native replay are unchanged.
 
 For a public tunnel, run `tools/serve_deepseek_v41_api.py --api-key-file KEY_FILE`
 on a separate loopback port and expose that port. This streaming adapter allows

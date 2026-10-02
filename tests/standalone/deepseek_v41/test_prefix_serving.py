@@ -161,3 +161,110 @@ def test_prefill_checkpoint_split_preserves_all_tokens_and_absolute_offsets():
     result = split_at_checkpoint(chunks, 0, 1920)
     assert [(offset, len(values)) for offset, values in result] == [(0, 1024), (1024, 896), (1920, 128)]
     assert [value for _, values in result for value in values] == list(range(2048))
+
+
+def test_inline_worker_keeps_full_transaction_and_restores_interior_history(monkeypatch):
+    bank, source, target, _ = make_bank()
+    bank.program.shared = SimpleNamespace()
+    host = EngramHost.__new__(EngramHost)
+    host.layout = layout()
+    host.history = EngramTokenHistory(host.layout, np.arange(16) % 8)
+    host.history.reset("source")
+    tokens = [i % 16 for i in range(16384)]
+    prepared = host.history.prepare("source", tokens)
+    host.history.commit(prepared, len(tokens))
+    host.histories = {"source": host.history}
+    host.closed, host.pending, host.device_pending = False, None, None
+    requests = {name: SimpleNamespace(num_computed_tokens=16256, block_ids=(list(range(1, 8193)),),
+                                      token_slice=lambda begin, end: tokens[begin:end])
+                for name in ("source", "target")}
+    runner = SimpleNamespace(vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=3)),
+                             model=SimpleNamespace(batch_state=bank, engram_host=host),
+                             state=SimpleNamespace(blocks=8193), pp=SimpleNamespace(drain=lambda: None),
+                             audit={}, requests=requests)
+    bank.acquire = bank.slots.acquire
+    bank.publish_pages = lambda *_: None
+    monkeypatch.setattr(torch.hpu, "synchronize", lambda: None)
+    monkeypatch.setattr(PrefixCheckpoints, "_done", staticmethod(Event))
+    monkeypatch.setattr(Event, "synchronize", lambda self: None, raising=False)
+    runtime = PrefixCheckpoints(runner)
+    descriptor = AuxiliaryPrefixDescriptor(0, 1, 16256, b"prefix", (tuple(range(1, 128)),))
+    runtime.begin(AuxiliaryPrefixOperations(captures={"source": descriptor}))
+    chunks = [(0, tokens)]
+    assert runtime.chunks("source", 0, chunks, inline_eligible=True) == chunks
+    capture = bank.program.shared.inline_prefix_capture
+    for layer, state in bank.layers.items():
+        for name, value in state.named_buffers(recurse=False):
+            capture.record(layer, name, torch.full((16384, value.shape[1]), layer + 7, dtype=value.dtype))
+    expected = {key: value.clone() for key, value in capture.require_complete().items()}
+    live = slot_values(bank, source)
+    bank.prefill_owner = source
+    bank.leave_single = lambda: pytest.fail("Inline snapshot unnecessarily published live rings")
+    bank.bind_prefill = lambda _: pytest.fail("Inline snapshot unnecessarily imported live rings")
+    runtime.capture_at("source", 16384)
+    assert bank.prefill_owner == source
+    assert all(torch.equal(a, b) for a, b in zip(live, slot_values(bank, source), strict=True))
+    assert host.histories["source"].position == 16384
+    runtime.operations = None
+    runtime.begin(AuxiliaryPrefixOperations(restores={"target": descriptor}))
+    restored = host.histories["target"]
+    assert restored.position == 16256
+    fresh = EngramTokenHistory(host.layout, np.arange(16) % 8)
+    fresh.reset("fresh")
+    fresh.restore_prefix("fresh", tokens[:16256])
+    assert np.array_equal(restored.prepare("target", [3, 4]).hash_ids, fresh.prepare("fresh", [3, 4]).hash_ids)
+    for (layer, name), values in expected.items():
+        rows = values.shape[0]
+        assert torch.equal(getattr(bank.layers[layer], name)[target.index * rows:(target.index + 1) * rows], values)
+
+
+def test_fallback_checkpoint_retains_boundary_using_only_prepared_buckets(monkeypatch):
+    from vllm_gaudi.v1.worker.deepseek_v41_runner import PREFILL_COMPUTE_BUCKETS
+    runtime = object.__new__(PrefixCheckpoints)
+    runtime.runner = SimpleNamespace(prefill_capacity=16384)
+    descriptor = AuxiliaryPrefixDescriptor(0, 1, 16256, b"prefix", (tuple(range(1, 128)),))
+    runtime.operations = AuxiliaryPrefixOperations(captures={"source": descriptor})
+    tokens = list(range(16384))
+    chunks = runtime.chunks("source", 0, [(0, tokens)])
+    assert [value for _, values in chunks for value in values] == tokens
+    assert all(len(values) in set(PREFILL_COMPUTE_BUCKETS) | {1} for _, values in chunks)
+    assert any(offset + len(values) == 16256 for offset, values in chunks)
+    assert not any(offset < 16256 < offset + len(values) for offset, values in chunks)
+    assert max(len(values) for _, values in chunks) == 8192
+
+
+def test_checkpoint_publication_preserves_owner_for_remaining_prompt_tail(monkeypatch):
+    from test_single_batch_state import program
+    from vllm_gaudi.ops.deepseek_v41_batch_state import BatchStageState
+
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda self, *_a, **_k: self)
+    monkeypatch.setattr(torch.hpu, "synchronize", lambda: None)
+    monkeypatch.setattr(PrefixCheckpoints, "_done", staticmethod(Event))
+    model = program()
+    model.pp_rank, model.tp_rank, model.generation, model.precision_fingerprint = 0, 0, 1, "test"
+    bank = BatchStageState(model, 2)
+    source, other = bank.acquire("source"), bank.acquire("other")
+    bank.publish_pages(source, [1, 2, 3, 4], 32)
+    runner = SimpleNamespace(vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=2)),
+                             model=SimpleNamespace(batch_state=bank, engram_host=None),
+                             state=SimpleNamespace(blocks=32), pp=SimpleNamespace(drain=lambda: None), audit={},
+                             requests={"source": SimpleNamespace(block_ids=([1, 2, 3, 4],))})
+    runtime = PrefixCheckpoints(runner)
+    descriptor = AuxiliaryPrefixDescriptor(0, 1, 256, b"prefix", ((1, 2),))
+    runtime.begin(AuxiliaryPrefixOperations(captures={"source": descriptor}))
+    bank.bind_prefill(source)
+    attention = model.layers[0].attention
+    attention.swa.fill_(91)
+    attention.kv_history.fill_(29)
+    runtime.capture_at("source", 256)
+    assert bank.prefill_owner == source
+    checkpoint = runtime.store.entries[0]
+    assert torch.all(checkpoint.tensors[2, "swa"] == 91)
+    attention.swa.fill_(73)
+    attention.kv_history.fill_(47)
+    bank.begin([other, source])
+    assert bank.prefill_owner is None
+    assert torch.all(bank.layers[2].swa[:256] == 73)
+    assert torch.all(bank.layers[2].kv_history[:8] == 47)
+    assert torch.all(checkpoint.tensors[2, "swa"] == 91)
+    assert torch.all(checkpoint.tensors[2, "kv_history"] == 29)

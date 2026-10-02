@@ -81,7 +81,7 @@ def test_prefill_b1_b2_survivor_and_reused_slot(bank):
     populate(bank, b, [6, 4, 10, 7, 11], 17)
     fixed_swa = bank.single_bindings[1][2]
     bank.bind_prefill(a)
-    assert bank.program.layers[0].attention.swa is not fixed_swa
+    assert bank.program.layers[0].attention.swa is fixed_swa
     bank.bind_single(a, 513)
     assert bank.program.layers[0].attention.swa is fixed_swa
     check_mirror(bank, a, 513)
@@ -123,6 +123,56 @@ def test_continuous_b1_never_recopies_working_state(bank, monkeypatch):
     bank.publish_pages(a, [1, 2, 3, 4, 5, 8], 32)
     bank.bind_single(a, 520)
     assert bank.program.shared.block_table[5] == 8
+
+
+def test_prefill_promotion_keeps_live_writes_until_the_next_owner(bank, monkeypatch):
+    a = bank.acquire('a')
+    populate(bank, a, [1, 2, 3, 4, 5], 7)
+    bank.bind_prefill(a)
+    attention = bank.program.layers[0].attention
+    attention.swa[3].fill_(13)
+    attention.kv_history[4].fill_(31)
+    with monkeypatch.context() as context:
+        context.setattr(bank, '_single_rows', lambda *_: pytest.fail('same owner recopied its working rings'))
+        bank.bind_single(a, 513)
+    assert bank.prefill_owner is None and bank.single_owner == a
+    assert torch.all(attention.swa[3] == 13)
+    assert torch.all(attention.kv_history[4] == 31)
+    assert torch.equal(bank.program.shared.decoded_swa[:256], unpack_swa(attention.swa))
+    # The next batch must see the live prompt/decode state, not the older slot.
+    generation = bank.begin([a])
+    assert torch.all(bank.layers[2].swa[3] == 13)
+    assert torch.all(bank.layers[2].kv_history[4] == 31)
+    bank.finish(generation, SimpleNamespace(synchronize=lambda: None, query=lambda: True))
+
+
+def test_prefill_slot_handoffs_keep_warm_addresses_and_publish_each_ring(bank):
+    a, b = bank.acquire("a"), bank.acquire("b")
+    populate(bank, a, [1, 2, 3, 4, 5], 7)
+    populate(bank, b, [6, 7, 8, 9, 10], 11)
+    attention = bank.program.layers[0].attention
+    addresses = [(value.data_ptr(), value.storage_offset()) for _, _, value in bank.single_bindings]
+    bank.bind_prefill(a)
+    attention.swa[3].fill_(91)
+    attention.kv_history[4].fill_(29)
+    bank.bind_prefill(b)
+    assert torch.all(bank.layers[2].swa[3] == 91)
+    assert torch.all(bank.layers[2].kv_history[4] == 29)
+    assert torch.all(attention.kv_history == 11)
+    assert [(getattr(module, name).data_ptr(), getattr(module, name).storage_offset())
+            for module, name, _ in bank.single_bindings] == addresses
+    attention.swa[9].fill_(73)
+    generation = bank.begin([a, b])
+    assert bank.prefill_owner is None
+    assert torch.all(bank.layers[2].swa[256 + 9] == 73)
+    bank.finish(generation, SimpleNamespace(synchronize=lambda: None, query=lambda: True))
+    bank.bind_single(b, 513)
+    check_mirror(bank, b, 513)
+    bank.bind_prefill(a)
+    attention.score_history[5].fill_(41)
+    bank.release("a")
+    assert bank.prefill_owner is None
+    assert torch.all(bank.layers[2].score_history[5] == 41)
 
 
 def test_index_mirror_follows_slot_owner_and_prefill_but_survives_page_append(bank):
