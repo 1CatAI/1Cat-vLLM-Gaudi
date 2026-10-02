@@ -85,8 +85,12 @@ For complete long-prompt tiles, the worker saves the checkpoint's small ring
 states directly from the live producers, including a trailing decoder halo.
 It preserves the complete prefill invocation and the request's final state;
 publication still requires every state, retained page and rank acknowledgment.
-Other prompt transactions retain the split-checkpoint path. Full slot-owned
-prefill and checkpoint producer coverage warm before API readiness.
+Other prompt transactions retain the split-checkpoint path, retiled into the
+existing prepared buckets. Prefill stages only the selected request’s bounded
+auxiliary rings into the warmed fixed working addresses. It publishes those
+rings before checkpoint capture, decode, batch entry or slot release; paged KV
+and token-owned residuals remain in place. Complete-prefill contracts and
+checkpoint producer coverage warm before API readiness.
 
 Installation settings may set `"max_num_batched_tokens": 16384` to retain the
 qualified complete TP4 prompt tile. Explicit CLI flags take precedence. This

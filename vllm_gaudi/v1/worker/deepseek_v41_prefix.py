@@ -117,6 +117,7 @@ class PrefixCheckpoints:
             raise RuntimeError("Auxiliary capture differs from scheduler-owned pages")
         runner.pp.drain()
         torch.hpu.synchronize()
+        continuing_prefill = getattr(bank, "prefill_owner", None) == slot
         leave_single = getattr(bank, "leave_single", None)
         if leave_single is not None:
             leave_single()
@@ -139,6 +140,12 @@ class PrefixCheckpoints:
             self.histories[ticket] = history
         self.captured.add(request_id)
         self.inline.pop(request_id, None)
+        if continuing_prefill:
+            # Snapshot publication retires the working owner. Any remaining
+            # prompt chunks still write those fixed addresses, so rebind them
+            # before the next producer; decode/batch/release must publish the
+            # completed tail rather than restore the checkpoint boundary.
+            bank.bind_prefill(slot)
         runner.audit["prefix_captures"] = runner.audit.get("prefix_captures", 0) + 1
 
     def finish(self):

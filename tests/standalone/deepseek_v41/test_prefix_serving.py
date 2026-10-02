@@ -227,3 +227,40 @@ def test_fallback_checkpoint_retains_boundary_using_only_prepared_buckets(monkey
     assert any(offset + len(values) == 16256 for offset, values in chunks)
     assert not any(offset < 16256 < offset + len(values) for offset, values in chunks)
     assert max(len(values) for _, values in chunks) == 8192
+
+
+def test_checkpoint_publication_preserves_owner_for_remaining_prompt_tail(monkeypatch):
+    from test_single_batch_state import program
+    from vllm_gaudi.ops.deepseek_v41_batch_state import BatchStageState
+
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda self, *_a, **_k: self)
+    monkeypatch.setattr(torch.hpu, "synchronize", lambda: None)
+    monkeypatch.setattr(PrefixCheckpoints, "_done", staticmethod(Event))
+    model = program()
+    model.pp_rank, model.tp_rank, model.generation, model.precision_fingerprint = 0, 0, 1, "test"
+    bank = BatchStageState(model, 2)
+    source, other = bank.acquire("source"), bank.acquire("other")
+    bank.publish_pages(source, [1, 2, 3, 4], 32)
+    runner = SimpleNamespace(vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=2)),
+                             model=SimpleNamespace(batch_state=bank, engram_host=None),
+                             state=SimpleNamespace(blocks=32), pp=SimpleNamespace(drain=lambda: None), audit={},
+                             requests={"source": SimpleNamespace(block_ids=([1, 2, 3, 4],))})
+    runtime = PrefixCheckpoints(runner)
+    descriptor = AuxiliaryPrefixDescriptor(0, 1, 256, b"prefix", ((1, 2),))
+    runtime.begin(AuxiliaryPrefixOperations(captures={"source": descriptor}))
+    bank.bind_prefill(source)
+    attention = model.layers[0].attention
+    attention.swa.fill_(91)
+    attention.kv_history.fill_(29)
+    runtime.capture_at("source", 256)
+    assert bank.prefill_owner == source
+    checkpoint = runtime.store.entries[0]
+    assert torch.all(checkpoint.tensors[2, "swa"] == 91)
+    attention.swa.fill_(73)
+    attention.kv_history.fill_(47)
+    bank.begin([other, source])
+    assert bank.prefill_owner is None
+    assert torch.all(bank.layers[2].swa[:256] == 73)
+    assert torch.all(bank.layers[2].kv_history[:8] == 47)
+    assert torch.all(checkpoint.tensors[2, "swa"] == 91)
+    assert torch.all(checkpoint.tensors[2, "kv_history"] == 29)
