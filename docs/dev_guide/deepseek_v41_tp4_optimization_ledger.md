@@ -579,3 +579,9 @@ but prefill missed the >=9000 release gate by0.95%. PR56 remains draft and main
 has not been changed. This failed combined release acceptance does not advance
 the accepted baseline or add any pending component savings. See the local
 `release-rollback-01/OUTCOME.md` and raw `formal/result.json` for the result.
+
+Release decision update: the user explicitly accepted the measured rollback
+version for publication and authorized merging PR56. Publish the measured
+8914.621782 tokens/s and10.599712 ms/token without claiming the original
+>=9000 prefill gate passed or the later10ms sampling target was achieved.
+No additional formal request is required for this unchanged runtime.
