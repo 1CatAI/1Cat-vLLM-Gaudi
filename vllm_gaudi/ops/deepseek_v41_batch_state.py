@@ -28,6 +28,13 @@ def _decoded_row_reader(width, group):
     return torch.compile(read, backend="hpu_backend", fullgraph=True, dynamic=False)
 
 
+@lru_cache(maxsize=1)
+def _decoded_swa_reader():
+    from vllm_gaudi.ops.deepseek_v41_math import unpack_swa
+
+    return torch.compile(unpack_swa, backend="hpu_backend", fullgraph=True, dynamic=False)
+
+
 class BatchLayerState(torch.nn.Module):
 
     def __init__(self, capacity, device, *, compressor):
@@ -179,11 +186,18 @@ class BatchStageState:
             raise RuntimeError("B1 cannot replace in-flight batch scratch")
         changed_owner = self.single_owner != slot
         if changed_owner:
-            self.leave_single()
+            promoting_prefill = getattr(self, 'prefill_owner', None) == slot
+            if promoting_prefill:
+                if self.single_owner is not None:
+                    raise RuntimeError('Prefill and decode cannot own different working rings')
+                self.prefill_owner = None
+            else:
+                self.leave_single()
             self._invalidate_index_mirror()
             self.restore_single_bindings()
-            for working, stored in self._single_rows(slot):
-                working.copy_(stored)
+            if not promoting_prefill:
+                for working, stored in self._single_rows(slot):
+                    working.copy_(stored)
             self._restore_decoded(slot, position)
             self.single_owner = slot
         version = self.page_versions.get(slot.index)
@@ -207,10 +221,11 @@ class BatchStageState:
         from vllm_gaudi.ops.deepseek_v41_math import unpack_swa
         shared = self.program.shared
         if hasattr(shared, "decoded_swa"):
+            read_swa = _decoded_swa_reader() if self.pages.device.type == "hpu" else unpack_swa
             shared.decoded_swa.zero_()
             for layer in self.program.layers:
                 offset = layer.attention.decoded_swa_offset
-                shared.decoded_swa[offset:offset + 256].copy_(unpack_swa(layer.attention.swa))
+                shared.decoded_swa[offset:offset + 256].copy_(read_swa(layer.attention.swa))
         # Selection is recomputed by its owning layer before reuse layers.
         for selection in shared.topk.values():
             selection.indices.fill_(-1)

@@ -625,3 +625,26 @@ sample completion, snapshot publication and all-rank acknowledgment. Diagnostic
 enabling remains explicit and off by default. CPU regressions:1003 passed,
 112 skipped. Evidence: `official-512k-serving-03`; subsequent diagnostic retained
 separately from formal acceptance.
+
+
+### 2026-10-03 prefix transition component (formal pending)
+
+Parent33ef72c8. Preserve inline checkpoint tensors and the live working-ring
+owner across capture; promote the same owner to B1 without export/import.
+Compile the existing SWA reader once instead of eagerly expanding its
+bit/scale operations on every restored layer. Warm the reader and owner
+transition before admitting requests. No new state format or native ABI.
+
+`prefix-owner-codec-02`: module0,CPU10–14; ABABAB200. The measured
+producer/checkpoint/promotion/SWA-score chain covers40layers,46rings and
+three changing packed inputs. Baseline wall median54.309955ms; candidate
+8.748552ms; difference45.561403ms exceeds2×baselineIQR8.100912ms.
+Device-event timing agrees. Checkpoint boundary histories, latest live
+histories, BF16 score outputs and B2 publication agree. Compressed-cache
+mirror reconstruction is unchanged and excluded from this fixture.
+
+This is a per-request transition gain, not per-token decode gain. It does
+not enter the decode cumulative total or establish the9.5k prefill gate.
+Formal serving remains pending. CPU1005passed112skipped. The earlier
+owner-only fixture was noisy:60.285510→54.907627ms, below its7.209410ms
+threshold; it is not a separately counted gain.

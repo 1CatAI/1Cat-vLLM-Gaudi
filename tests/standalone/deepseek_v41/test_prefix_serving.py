@@ -198,7 +198,11 @@ def test_inline_worker_keeps_full_transaction_and_restores_interior_history(monk
             capture.record(layer, name, torch.full((16384, value.shape[1]), layer + 7, dtype=value.dtype))
     expected = {key: value.clone() for key, value in capture.require_complete().items()}
     live = slot_values(bank, source)
+    bank.prefill_owner = source
+    bank.leave_single = lambda: pytest.fail("Inline snapshot unnecessarily published live rings")
+    bank.bind_prefill = lambda _: pytest.fail("Inline snapshot unnecessarily imported live rings")
     runtime.capture_at("source", 16384)
+    assert bank.prefill_owner == source
     assert all(torch.equal(a, b) for a, b in zip(live, slot_values(bank, source), strict=True))
     assert host.histories["source"].position == 16384
     runtime.operations = None

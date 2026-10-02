@@ -2438,6 +2438,7 @@ class V41ModelRunner:
             try:
                 self._dummy_run(count)
                 capture.require_complete()
+                bank.bind_single(slot, count)
                 logger.info("V4.1 PP%d warmed slot-owned prefill and %d inline prefix states",
                             self.model.pp_rank, len(capture.tensors))
             finally:

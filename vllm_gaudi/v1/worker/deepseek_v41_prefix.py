@@ -119,7 +119,10 @@ class PrefixCheckpoints:
         torch.hpu.synchronize()
         continuing_prefill = getattr(bank, "prefill_owner", None) == slot
         leave_single = getattr(bank, "leave_single", None)
-        if leave_single is not None:
+        # Inline producers already own a separate boundary snapshot. Keep the
+        # live end-of-chunk working rings with their request instead of
+        # publishing and immediately importing them for the same owner.
+        if inline is None and leave_single is not None:
             leave_single()
         host = runner.model.engram_host
         if host is not None and inline is not None:
@@ -140,7 +143,7 @@ class PrefixCheckpoints:
             self.histories[ticket] = history
         self.captured.add(request_id)
         self.inline.pop(request_id, None)
-        if continuing_prefill:
+        if continuing_prefill and inline is None:
             # Snapshot publication retires the working owner. Any remaining
             # prompt chunks still write those fixed addresses, so rebind them
             # before the next producer; decode/batch/release must publish the

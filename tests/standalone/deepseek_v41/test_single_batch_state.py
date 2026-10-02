@@ -125,6 +125,27 @@ def test_continuous_b1_never_recopies_working_state(bank, monkeypatch):
     assert bank.program.shared.block_table[5] == 8
 
 
+def test_prefill_promotion_keeps_live_writes_until_the_next_owner(bank, monkeypatch):
+    a = bank.acquire('a')
+    populate(bank, a, [1, 2, 3, 4, 5], 7)
+    bank.bind_prefill(a)
+    attention = bank.program.layers[0].attention
+    attention.swa[3].fill_(13)
+    attention.kv_history[4].fill_(31)
+    with monkeypatch.context() as context:
+        context.setattr(bank, '_single_rows', lambda *_: pytest.fail('same owner recopied its working rings'))
+        bank.bind_single(a, 513)
+    assert bank.prefill_owner is None and bank.single_owner == a
+    assert torch.all(attention.swa[3] == 13)
+    assert torch.all(attention.kv_history[4] == 31)
+    assert torch.equal(bank.program.shared.decoded_swa[:256], unpack_swa(attention.swa))
+    # The next batch must see the live prompt/decode state, not the older slot.
+    generation = bank.begin([a])
+    assert torch.all(bank.layers[2].swa[3] == 13)
+    assert torch.all(bank.layers[2].kv_history[4] == 31)
+    bank.finish(generation, SimpleNamespace(synchronize=lambda: None, query=lambda: True))
+
+
 def test_prefill_slot_handoffs_keep_warm_addresses_and_publish_each_ring(bank):
     a, b = bank.acquire("a"), bank.acquire("b")
     populate(bank, a, [1, 2, 3, 4, 5], 7)
