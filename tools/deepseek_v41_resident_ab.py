@@ -192,6 +192,7 @@ def settling_modules(samples, own_modules=(0, 1, 4, 5), maximum_variation_mib=16
 
 def wait_for_loading(directory, rank, dist):
     history = []
+    own_modules = tuple(int(module) for module in os.environ.get('HABANA_VISIBLE_MODULES', '0,1,4,5').split(','))
     while True:
         decision = [None]
         if rank == 0:
@@ -199,7 +200,7 @@ def wait_for_loading(directory, rank, dist):
             for _ in range(11):
                 samples.append(device_load())
                 time.sleep(1)
-            growing = settling_modules(samples)
+            growing = settling_modules(samples, own_modules=own_modules)
             history.append(dict(samples=samples, loading_modules=growing))
             decision[0] = not growing
             if growing:
@@ -226,7 +227,17 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
 
     def arm(name):
         if name not in arms:
-            if name in ('dense_fp8', 'dense_fp8_tail', 'dense_fp8_static_int32',
+            if name in ('official_sampling', 'nucleus_sampling', 'nucleus_sampling_unsorted',
+                        'nucleus_sampling64', 'nucleus_sampling256'):
+                import torch
+                if 'dense_fp8' not in stages:
+                    stages['dense_fp8'] = make_dense_stage(stage, shard, args.ab_dense_sidecar, args.ab_dense_config)
+                program = make_handoff_stage(stages['dense_fp8'])
+                program.register_buffer('sampling_controls', torch.tensor([[1., .95, .5, -1.]], device='hpu'))
+                program.sampling_tail = name != 'official_sampling'
+                program.sampling_sorted = name == 'nucleus_sampling'
+                program.sampling_candidates = (64 if name.endswith('64') else 256 if name.endswith('256') else 128)
+            elif name in ('dense_fp8', 'dense_fp8_tail', 'dense_fp8_static_int32',
                         'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff', *COMPILER_CANDIDATES):
                 if 'dense_fp8' not in stages:
                     stages['dense_fp8'] = make_dense_stage(stage, shard, args.ab_dense_sidecar, args.ab_dense_config)
@@ -239,7 +250,10 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
             else:
                 raise ValueError(f'Unknown resident candidate {name}')
             program.decode_static_int32 = name == 'dense_fp8_static_int32'
-            replay = StageReplay(program, greedy_tail=name in ('tail', 'dense_fp8_tail'))
+            replay = StageReplay(program, greedy_tail=name in ('tail', 'dense_fp8_tail',
+                                                              'official_sampling', 'nucleus_sampling',
+                                                              'nucleus_sampling_unsorted', 'nucleus_sampling64',
+                                                              'nucleus_sampling256'))
             program.replay_owner = replay
             stages[name], arms[name] = program, replay
             # Preserve actual compiler output for kernel-count changes. This
@@ -255,7 +269,9 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
 
     if rank == 0:
         ready = dict(pid=os.getpid(), source=os.environ['DSV41_RUN_EVIDENCE'],
-                     candidates=['dense_fp8', 'tail', 'dense_fp8_tail', 'dense_fp8_static_int32',
+                     candidates=['dense_fp8', 'tail', 'dense_fp8_tail', 'official_sampling', 'nucleus_sampling',
+                                 'nucleus_sampling_unsorted', 'nucleus_sampling64', 'nucleus_sampling256',
+                                 'dense_fp8_static_int32',
                                  'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff', *COMPILER_CANDIDATES])
         (control / 'ready.json').write_text(json.dumps(ready, indent=2)+'\n')
     print(f'TP{rank}: real16 fixture resident; control {control}', flush=True)
@@ -299,6 +315,12 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
             reference_name = job.get('baseline', 'baseline')
             reference = arm(reference_name)
             candidate = arm(name)
+            if name.startswith('nucleus_sampling'):
+                # A new fixed-seed trajectory can fault untouched host Engram
+                # rows after model loading. Warm the whole timed trajectory,
+                # not just the first few tokens, before alternating periods.
+                for replay in (reference, candidate):
+                    chain(True, 2, measure=False, engine=replay, warm_steps=steps + 32)
             # Resolve both warmed contracts before the no-hot-compilation gate.
             chain(True, 2, measure=False, engine=reference, warm_steps=6)
             counts = preparation_counts()

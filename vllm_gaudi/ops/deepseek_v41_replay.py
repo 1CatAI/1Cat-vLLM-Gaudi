@@ -233,12 +233,14 @@ class StageVariant(torch.nn.Module):
             self.adapter = replace(self.adapter, extra_collectives=self.adapter.extra_collectives + 1)
         if self.tail_enabled:
             self.adapter = replace(self.adapter, extra_collectives=self.adapter.extra_collectives + 1)
+        self.fixed = tuple(
+            value.clone() if value is not None else None for value in (hidden, pre_mix, positions, input_ids)
+        )
         self.compiled = CompiledStage(
             program, native=True, pp_wire_input=self.wire_input, fused_text_io=fused_text_io,
             native_input=native_input, replay_tail=self.tail_enabled,
-        )
-        self.fixed = tuple(
-            value.clone() if value is not None else None for value in (hidden, pre_mix, positions, input_ids)
+            sampling_controls=(getattr(program, 'sampling_controls', None) if self.tail_enabled
+                               and getattr(program, 'sampling_tail', False) else None),
         )
         from vllm_gaudi import envs
 
@@ -254,6 +256,8 @@ class StageVariant(torch.nn.Module):
             local_heads=24 // getattr(program, "tensor_parallel_size", 2),
         )
         self.states = stage_state_tensors(program)
+        if self.tail_enabled and getattr(program, 'sampling_tail', False):
+            self.states = (*self.states, program.sampling_controls)
         self.metadata = _Metadata()
         self.capture_bytes = 0
         self.warm_calls = 0

@@ -230,6 +230,8 @@ class V41V2ModelRunner(V41ModelRunner):
                     else:
                         self.model.prepare_device_engram(record.request_id, record.device_token)
                     self.audit["v2_device_engram_starts"] = self.audit.get("v2_device_engram_starts", 0) + 1
+                if getattr(self.model.program, 'sampling_tail', False):
+                    self._prepare_sample_controls(1, (request,), ordinal_offset=1)
                 self.model.begin_decode_prefix(record.device_token, position)
                 self._prefix_started = identity
                 self.audit["v2_prefix_starts"] = self.audit.get("v2_prefix_starts", 0) + 1
@@ -337,6 +339,7 @@ class V41V2ModelRunner(V41ModelRunner):
             # producer. Resolving again would hash runtime libraries and scan
             # /proc/self/maps on every token, serializing the serving loop.
             host, done = self.tp4_token_readback(token)
+            token, host, done = self._resolve_sampled_marker(request, token, host, done)
         else:
             bridge, _ = resolve_device_runtime(tp_size)
             host, done = bridge.copy_sampled_tokens_to_host(token)

@@ -544,3 +544,39 @@ through`unified-prefill-decode-07`;06 includes formal, cache probes, corrected
 chat continuation, fixed quality outputs, host telemetry and source manifests.
 Other modules2/3/6/7 remain768MiB and0% utilization at sampled preflights;
 CPU PSI and bound-core/context-switch data accompany the formal result.
+
+
+### Official sampling replay component — formal qualification pending (2026-10-02)
+
+Parent d85ebce5, 512K/C16384/prefix-enabled official formal: **6663.756222 tokens/s**,
+**10.718316047 ms/token**,2128 natural-EOS tokens; all frozen factual checks pass.
+Both speed gates fail. No achieved speed claim. Startup omits official probability
+sampling warmup; diagnostic suffix query exchange is active in19 layers.
+Diagnostic post-chunk gaps617–694ms include sampling/checkpoint work and capture
+overhead; overlapping fixture loading makes these timings diagnostic only.
+
+Bounded sampling keeps each shard's complete FP32 probability mass, exchanges
+candidates and uses the same request-owned uniform. Coverage/tie rejection resolves
+through full sampling before the next input. Sampler controls are separate mutable
+state; the mHC pre-mix buffer is preserved. The shared native replay/API is retained.
+
+Same-card real16 resident ABABAB200 on0/1/4/5 and CPU10/15/38/43:
+A median **6.134799ms**, IQR **0.053408ms**; B median **5.818252ms**.
+Difference **0.316548ms** exceeds2×A IQR **0.106815ms**. All four ranks and
+all six233-token trajectories agree; no hot compilation. Mean A **6.188704ms**
+versus B **6.106943ms**, difference **0.081761ms**. Median×1.5 estimates
+**0.474821ms/token**, but mean×1.5 estimates **0.122641ms/token**; formal TPOT
+remains unresolved and these estimates are not additive achieved gains.
+Pending admitted median component savings **0.316548ms**; estimated formal savings
+are the range above, with no formal gain credited. The16-layer intermediate head
+does not establish complete-model fallback frequency.
+
+Attempts01/02 fail before sampling qualification; real16-01/02 fail or are
+interrupted before readiness. Real16-03 completes but firstA drift invalidates
+its noise gate; the final unconsumed sample was an unresolved fallback marker.
+Real16-04 fixes input ownership, terminal resolution and trajectory warmup.
+The installed service defaults now require a fresh official formal request.
+
+Evidence: `evidence/20260928_tp4-decode-gap-1p5/official-512k-serving-01`,
+`official-512k-prefill-diagnostic-01`, `nucleus-component-01`/`02`,
+`nucleus-real16-01` through `04`.

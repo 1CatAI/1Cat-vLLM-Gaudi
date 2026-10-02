@@ -4,6 +4,7 @@ import os
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
+    VLLM_HPU_DSV41_SAMPLING_REPLAY: bool = True
     VLLM_HPU_DSV41_STATE_AUDIT_DIR: str | None = None
     VLLM_HPU_DSV41_RAW_TRACE: bool = False
     VLLM_HPU_DSV41_PREFILL_EVENT_TRACE_REQUEST_PREFIX: str = ""
@@ -328,6 +329,8 @@ def _optional_bool_env(name: str) -> Optional[bool]:
 
 # begin-env-vars-definition
 environment_variables: dict[str, Callable[[], Any]] = {
+    "VLLM_HPU_DSV41_SAMPLING_REPLAY":
+    lambda: os.getenv("VLLM_HPU_DSV41_SAMPLING_REPLAY", "1") == "1",
     "VLLM_HPU_DSV41_RAW_TRACE":
     lambda: os.getenv("VLLM_HPU_DSV41_RAW_TRACE", "0") == "1",
     "VLLM_HPU_DSV41_PREFILL_EVENT_TRACE_REQUEST_PREFIX":
