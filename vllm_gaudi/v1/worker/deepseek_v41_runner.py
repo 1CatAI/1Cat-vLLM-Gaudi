@@ -1164,6 +1164,8 @@ class V41ModelRunner:
             if audit is not None:
                 audit['sampling_copy_wait_ns'] = audit.get('sampling_copy_wait_ns', 0) + (
                     time.perf_counter_ns() - wait_started)
+        started = time.perf_counter_ns()
+        cpu_started = time.thread_time_ns()
         host[:, 0] = 0
         host[:, 1] = 1
         host[:, 2] = 0.5
@@ -1174,9 +1176,31 @@ class V41ModelRunner:
             host[row, 1] = params.top_p
             host[row, 2] = request_uniform(req.req_id, params.seed, len(req.output) + ordinal_offset)
             host[row, 3] = params.top_k
+        copied = time.perf_counter_ns()
+        cpu_copied = time.thread_time_ns()
         controls.copy_(host, non_blocking=True)
+        recorded = time.perf_counter_ns()
+        cpu_recorded = time.thread_time_ns()
         event = torch.hpu.Event()
         event.record()
+        finished = time.perf_counter_ns()
+        cpu_finished = time.thread_time_ns()
+        if audit is not None:
+            audit['sampling_control_fill_ns'] = audit.get('sampling_control_fill_ns', 0) + copied - started
+            audit['sampling_control_copy_ns'] = audit.get('sampling_control_copy_ns', 0) + recorded - copied
+            audit['sampling_control_event_ns'] = audit.get('sampling_control_event_ns', 0) + (
+                finished - recorded)
+            if all(len(req.output) + ordinal_offset > 0 for req in requests):
+                audit['sampling_decode_uploads'] = audit.get('sampling_decode_uploads', 0) + 1
+                for phase, wall, cpu in (
+                    ('fill', copied - started, cpu_copied - cpu_started),
+                    ('copy', recorded - copied, cpu_recorded - cpu_copied),
+                    ('event', finished - recorded, cpu_finished - cpu_recorded),
+                ):
+                    key = f'sampling_decode_{phase}'
+                    audit[key + '_ns'] = audit.get(key + '_ns', 0) + wall
+                    audit[key + '_cpu_ns'] = audit.get(key + '_cpu_ns', 0) + cpu
+                    audit[key + '_max_ns'] = max(audit.get(key + '_max_ns', 0), wall)
         if not hasattr(self, "sampling_copy_events"):
             self.sampling_copy_events = {}
         self.sampling_copy_events[batch] = event

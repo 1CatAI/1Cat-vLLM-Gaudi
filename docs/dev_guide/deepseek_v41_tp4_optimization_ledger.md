@@ -648,3 +648,13 @@ not enter the decode cumulative total or establish the9.5k prefill gate.
 Formal serving remains pending. CPU1005passed112skipped. The earlier
 owner-only fixture was noisy:60.285510→54.907627ms, below its7.209410ms
 threshold; it is not a separately counted gain.
+
+The installed6820431e formal request does not improve the serving gates:
+prefill8860.171914tps,decode17.584649ms,TTFT1.949121s;2128naturalEOS
+and14/14facts pass. No serving gain is credited and no baseline advances.
+This closes the prefix-transition estimate as component-only: the optimized
+transition does not establish the requested uncached-prefill throughput.
+Worker audits identify parameter updates at4.929–5.074ms/upload, previous
+copy-event wait0.038–0.040ms, prefixenqueue0.705–0.721ms and resolver wait
+8.530–8.830ms. Uploads2131 versus2128commits show no per-step duplicate
+upload. Evidence: `official-512k-serving-04/worker-submit-audit.json`.
