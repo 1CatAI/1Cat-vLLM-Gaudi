@@ -790,6 +790,10 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 # pairs from the current block whenever available and from the
                 # prior ring only at the leading boundary; update the ring
                 # after all reads so rows cannot alias within this transaction.
+                capture = getattr(self.shared, "inline_prefix_capture", None)
+                if capture is not None:
+                    capture.record(self.layer, "kv_history", kv)
+                    capture.record(self.layer, "score_history", score)
                 base, tokens = positions[0], positions.numel()
                 local_a, local_b = first - base, first + 1 - base
                 valid_a = (local_a >= 0) & (local_a < tokens)
@@ -1479,6 +1483,10 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
     def _prefill_swa_workspace(self, kv, positions, *, decoded=False):
         """Bind request state explicitly to the reusable SWA tensor region."""
         from vllm_gaudi.ops.deepseek_v41_prefill_regions import prefill_swa_workspace
+
+        capture = getattr(getattr(self, "shared", None), "inline_prefix_capture", None)
+        if capture is not None:
+            capture.record(self.layer, "swa", kv, pack=pack_swa)
 
         return prefill_swa_workspace(
             kv,

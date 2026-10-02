@@ -48,6 +48,46 @@ def _views(bank, slot):
     return result
 
 
+class InlinePrefixCapture:
+    """Save an interior boundary while full prompt producers remain live.
+
+    Producers cover a contiguous chunk or its trailing decoder halo. Keep
+    only each ring's boundary rows; never retain a full projection workspace
+    or rewind the live request's final state.
+    """
+
+    def __init__(self, bank, slot, start, end, boundary):
+        if not start < boundary < end or boundary % 128:
+            raise ValueError("Inline prefix capture requires an interior page boundary")
+        self.start, self.end, self.boundary = start, end, boundary
+        self.expected = _views(bank, slot)
+        self.tensors = {}
+
+    def record(self, layer, name, values, *, pack=None):
+        key = layer, name
+        if key not in self.expected or key in self.tensors:
+            raise RuntimeError("Inline prefix producer is missing or duplicated")
+        target = self.expected[key]
+        rows = target.shape[0]
+        base = self.end - values.shape[0]
+        offset = self.boundary - base - rows
+        if base < self.start or offset < 0 or offset + rows > values.shape[0]:
+            raise ValueError("Inline prefix producer does not cover the complete boundary ring")
+        selected = values[offset:offset + rows]
+        selected = pack(selected) if pack is not None else selected.clone()
+        shift = (self.boundary - rows) % rows
+        if shift:
+            selected = torch.cat((selected[-shift:], selected[:-shift]), 0)
+        if selected.shape != target.shape or selected.dtype != target.dtype or selected.device != target.device:
+            raise ValueError("Inline prefix producer has an incompatible state layout")
+        self.tensors[key] = selected
+
+    def require_complete(self):
+        if self.tensors.keys() != self.expected.keys():
+            raise RuntimeError("Inline prefix capture does not cover the complete stage")
+        return self.tensors
+
+
 @dataclass(frozen=True)
 class BatchPrefixSnapshot:
     identity: tuple
@@ -58,7 +98,8 @@ class BatchPrefixSnapshot:
     ready: object
 
     @classmethod
-    def capture(cls, bank, slot, num_tokens, block_hash, producer_done, *, record_done, maximum_bytes=2 << 30):
+    def capture(cls, bank, slot, num_tokens, block_hash, producer_done, *, record_done, maximum_bytes=2 << 30,
+                state_tensors=None):
         """Copy after the complete stage producer, before the next state write.
 
         ``record_done`` records an event on the copy stream after all copies.
@@ -71,6 +112,14 @@ class BatchPrefixSnapshot:
             raise ValueError("Prefix state requires the scheduler's immutable block hash")
         pages = _pages(bank, slot, num_tokens)
         views = _views(bank, slot)
+        if state_tensors is not None:
+            if state_tensors.keys() != views.keys():
+                raise ValueError("Inline checkpoint does not cover the complete stage")
+            for key, value in state_tensors.items():
+                target = views[key]
+                if value.shape != target.shape or value.dtype != target.dtype or value.device != target.device:
+                    raise ValueError("Inline checkpoint tensor layout changed")
+            views = state_tensors
         size = sum(value.numel() * value.element_size() for value in views.values())
         if size > maximum_bytes:
             raise ValueError("Auxiliary prefix checkpoint exceeds its memory budget")
@@ -161,7 +210,7 @@ class BatchPrefixStore:
         if pending:
             raise RuntimeError("Prefix checkpoint still has unfinished restore copies")
 
-    def capture(self, ticket, bank, slot, num_tokens, block_hash, producer_done, *, record_done):
+    def capture(self, ticket, bank, slot, num_tokens, block_hash, producer_done, *, record_done, state_tensors=None):
         self._index(ticket)
         if ticket.generation <= self.generations[ticket.index]:
             raise RuntimeError("Prefix capture must advance its publication generation")
@@ -175,7 +224,8 @@ class BatchPrefixStore:
                                                block_hash,
                                                producer_done,
                                                record_done=record_done,
-                                               maximum_bytes=remaining)
+                                               maximum_bytes=remaining,
+                                               state_tensors=state_tensors)
         self.entries[ticket.index] = snapshot
         self.generations[ticket.index] = ticket.generation
         self.published.discard(ticket.index)

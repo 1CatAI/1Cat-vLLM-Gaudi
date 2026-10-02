@@ -161,3 +161,53 @@ def test_prefill_checkpoint_split_preserves_all_tokens_and_absolute_offsets():
     result = split_at_checkpoint(chunks, 0, 1920)
     assert [(offset, len(values)) for offset, values in result] == [(0, 1024), (1024, 896), (1920, 128)]
     assert [value for _, values in result for value in values] == list(range(2048))
+
+
+def test_inline_worker_keeps_full_transaction_and_restores_interior_history(monkeypatch):
+    bank, source, target, _ = make_bank()
+    bank.program.shared = SimpleNamespace()
+    host = EngramHost.__new__(EngramHost)
+    host.layout = layout()
+    host.history = EngramTokenHistory(host.layout, np.arange(16) % 8)
+    host.history.reset("source")
+    tokens = [i % 16 for i in range(16384)]
+    prepared = host.history.prepare("source", tokens)
+    host.history.commit(prepared, len(tokens))
+    host.histories = {"source": host.history}
+    host.closed, host.pending, host.device_pending = False, None, None
+    requests = {name: SimpleNamespace(num_computed_tokens=16256, block_ids=(list(range(1, 8193)),),
+                                      token_slice=lambda begin, end: tokens[begin:end]) for name in ("source", "target")}
+    runner = SimpleNamespace(vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=3)),
+                             model=SimpleNamespace(batch_state=bank, engram_host=host),
+                             state=SimpleNamespace(blocks=8193), pp=SimpleNamespace(drain=lambda: None),
+                             audit={}, requests=requests)
+    bank.acquire = bank.slots.acquire
+    bank.publish_pages = lambda *_: None
+    monkeypatch.setattr(torch.hpu, "synchronize", lambda: None)
+    monkeypatch.setattr(PrefixCheckpoints, "_done", staticmethod(Event))
+    monkeypatch.setattr(Event, "synchronize", lambda self: None, raising=False)
+    runtime = PrefixCheckpoints(runner)
+    descriptor = AuxiliaryPrefixDescriptor(0, 1, 16256, b"prefix", (tuple(range(1, 128)),))
+    runtime.begin(AuxiliaryPrefixOperations(captures={"source": descriptor}))
+    chunks = [(0, tokens)]
+    assert runtime.chunks("source", 0, chunks, inline_eligible=True) == chunks
+    capture = bank.program.shared.inline_prefix_capture
+    for layer, state in bank.layers.items():
+        for name, value in state.named_buffers(recurse=False):
+            capture.record(layer, name, torch.full((16384, value.shape[1]), layer + 7, dtype=value.dtype))
+    expected = {key: value.clone() for key, value in capture.require_complete().items()}
+    live = slot_values(bank, source)
+    runtime.capture_at("source", 16384)
+    assert all(torch.equal(a, b) for a, b in zip(live, slot_values(bank, source), strict=True))
+    assert host.histories["source"].position == 16384
+    runtime.operations = None
+    runtime.begin(AuxiliaryPrefixOperations(restores={"target": descriptor}))
+    restored = host.histories["target"]
+    assert restored.position == 16256
+    fresh = EngramTokenHistory(host.layout, np.arange(16) % 8)
+    fresh.reset("fresh")
+    fresh.restore_prefix("fresh", tokens[:16256])
+    assert np.array_equal(restored.prepare("target", [3, 4]).hash_ids, fresh.prepare("fresh", [3, 4]).hash_ids)
+    for (layer, name), values in expected.items():
+        rows = values.shape[0]
+        assert torch.equal(getattr(bank.layers[layer], name)[target.index * rows:(target.index + 1) * rows], values)

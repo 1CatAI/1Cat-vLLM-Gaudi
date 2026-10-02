@@ -26,6 +26,7 @@ class PrefixCheckpoints:
         self.histories = {}
         self.operations = None
         self.captured = set()
+        self.inline = {}
 
     @staticmethod
     def _done():
@@ -70,19 +71,37 @@ class PrefixCheckpoints:
                 runner.model.engram_host.restore_checkpoint(request_id, history)
             runner.audit["prefix_restores"] = runner.audit.get("prefix_restores", 0) + 1
 
-    def chunks(self, request_id, start, chunks):
+    def chunks(self, request_id, start, chunks, *, inline_eligible=False):
         descriptor = self.operations.captures.get(request_id) if self.operations is not None else None
+        if descriptor is not None and inline_eligible:
+            chunks = list(chunks)
+            if len(chunks) == 1:
+                offset, chunk = chunks[0]
+                begin, end = start + offset, start + offset + len(chunk)
+                if begin + 4096 < descriptor.num_tokens < end:
+                    from vllm_gaudi.ops.deepseek_v41_prefix_state import InlinePrefixCapture
+
+                    bank = self.runner.model.batch_state
+                    slot = bank.slots.owners[request_id]
+                    capture = InlinePrefixCapture(bank, slot, begin, end, descriptor.num_tokens)
+                    self.inline[request_id] = capture
+                    bank.program.shared.inline_prefix_capture = capture
+                    return chunks
         return chunks if descriptor is None else split_at_checkpoint(chunks, start, descriptor.num_tokens)
 
     def capture_at(self, request_id, position):
         if self.operations is None or request_id in self.captured:
             return
         descriptor = self.operations.captures.get(request_id)
-        if descriptor is None or descriptor.num_tokens != position:
+        inline = self.inline.get(request_id)
+        if descriptor is None or (inline is None and descriptor.num_tokens != position):
+            return
+        if inline is not None and position != inline.end:
             return
         runner, bank = self.runner, self.runner.model.batch_state
         slot = bank.slots.owners[request_id]
-        if tuple(runner.requests[request_id].block_ids[0][:position // 128]) != descriptor.block_ids[0]:
+        boundary = descriptor.num_tokens
+        if tuple(runner.requests[request_id].block_ids[0][:boundary // 128]) != descriptor.block_ids[0]:
             raise RuntimeError("Auxiliary capture differs from scheduler-owned pages")
         runner.pp.drain()
         torch.hpu.synchronize()
@@ -90,16 +109,24 @@ class PrefixCheckpoints:
         if leave_single is not None:
             leave_single()
         host = runner.model.engram_host
-        history = host.snapshot_prefix(request_id) if host is not None else None
-        if history is not None and history[0] != position:
+        if host is not None and inline is not None:
+            tokens = runner.requests[request_id].token_slice(0, boundary)
+            history = host.snapshot_prefix(request_id, token_ids=tokens,
+                                           image_mask=[token in (129264, 129265) for token in tokens])
+        else:
+            history = host.snapshot_prefix(request_id) if host is not None else None
+        if history is not None and history[0] != boundary:
             raise RuntimeError("Engram history did not commit the exact checkpoint boundary")
         ticket = PrefixStateTicket(descriptor.slot, descriptor.generation)
-        self.store.capture(ticket, bank, slot, position, descriptor.block_hash, self._done(), record_done=self._done)
+        options = {"state_tensors": inline.require_complete()} if inline is not None else {}
+        self.store.capture(ticket, bank, slot, boundary, descriptor.block_hash, self._done(),
+                           record_done=self._done, **options)
         self.store.publish(ticket)
         self.histories = {key: value for key, value in self.histories.items() if key.index != ticket.index}
         if history is not None:
             self.histories[ticket] = history
         self.captured.add(request_id)
+        self.inline.pop(request_id, None)
         runner.audit["prefix_captures"] = runner.audit.get("prefix_captures", 0) + 1
 
     def finish(self):

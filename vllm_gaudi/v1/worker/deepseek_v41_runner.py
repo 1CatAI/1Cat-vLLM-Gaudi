@@ -1987,7 +1987,17 @@ class V41ModelRunner:
         chunks = [(0, tokens)] if decode else target_chunks(tokens, self.prefill_capacity)
         prefix_checkpoints = getattr(self, "prefix_checkpoints", None)
         if prefix_checkpoints is not None:
-            chunks = prefix_checkpoints.chunks(req_id, start, chunks)
+            chunks = prefix_checkpoints.chunks(
+                req_id, start, chunks,
+                inline_eligible=(
+                    count == self.prefill_capacity
+                    and max(prefill_compute_buckets(self.prefill_capacity), default=1) == count
+                    and len(scheduled.num_scheduled_tokens) == 1
+                    and not request.mm_features
+                    and getattr(request.sampling_params, "prompt_logprobs", None) is None
+                    and not self.use_dspark
+                ),
+            )
         program = getattr(self.model, "program", None)
         transaction_search = (
             (
@@ -2040,6 +2050,9 @@ class V41ModelRunner:
             finally:
                 if program is not None:
                     program.prefill_halo_mode = "full"
+                    shared = getattr(program, "shared", None)
+                    if shared is not None:
+                        shared.inline_prefix_capture = None
             if offset + len(chunk) < count:
                 self._insert(self.model.last_aux, self.positions[: len(chunk)])
                 self.model.complete_step(len(chunk))
@@ -2325,6 +2338,29 @@ class V41ModelRunner:
         if self.request_batches is not None:
             self.request_batches.warmup()
             self.model.batch_state.restore_single_bindings()
+        if getattr(self, "prefix_checkpoints", None) is not None and self.prefill_capacity > 8192:
+            from vllm_gaudi.ops.deepseek_v41_prefix_state import InlinePrefixCapture
+
+            bank, program = self.model.batch_state, self.model.program
+            count = max(prefill_compute_buckets(self.prefill_capacity))
+            owner = "__v41_prefix_warmup__"
+            slot = bank.acquire(owner)
+            bank.publish_pages(slot, range(1, count // 128 + 1), self.state.blocks)
+            bank.bind_prefill(slot)
+            capture = InlinePrefixCapture(bank, slot, 0, count, count - 128)
+            program.shared.inline_prefix_capture = capture
+            program.prefill_halo_mode = "final" if program.stop == 40 else "full"
+            try:
+                self._dummy_run(count)
+                capture.require_complete()
+                logger.info("V4.1 PP%d warmed slot-owned prefill and %d inline prefix states",
+                            self.model.pp_rank, len(capture.tensors))
+            finally:
+                program.shared.inline_prefix_capture = None
+                program.prefill_halo_mode = "full"
+                bank.restore_single_bindings()
+                bank.release(owner)
+            self.state.clear()
         # Ordinary serving keeps the qualified C1 native replay for decode.
         # C6 is a DSpark-only anchor-plus-draft geometry. Prompt C128 recipes
         # are compiled by real prefill qualification and persisted in cache.

@@ -420,7 +420,7 @@ def main():
     parser.add_argument("--runtime-profile", default=runtime_profile or settings.get("runtime_profile"))
     parser.add_argument("--max-model-len", type=int, default=1048576)
     parser.add_argument("--max-num-seqs", type=int, default=32)
-    parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=settings.get("max_num_batched_tokens", 8192))
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--tensor-parallel-size", type=int, choices=(2, 4), default=4)
     parser.add_argument("--pipeline-parallel-size", type=int, choices=(1, 2), default=1)
