@@ -320,7 +320,8 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                                                    warm_steps=32)
                 assert counts == preparation_counts(), 'Hot recompilation invalidates the A/B measurement'
                 local = dict(rank=rank, tokens=tokens, delivery_ns=report['token_delivery_ns'],
-                             host_ms=host_ms, device_ms=device_ms)
+                             host_ms=host_ms, device_ms=device_ms,
+                             checked_first_device_position=report.get('checked_first_device_position'))
                 ranks = [None] * dist.get_world_size()
                 dist.all_gather_object(ranks, local)
                 assert all(row['tokens'] == tokens for row in ranks), 'Ranks disagree on generated tokens'
@@ -336,6 +337,8 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
             if rank == 0:
                 result = dict(status='completed', baseline=reference_name, candidate=name, steps=steps, order='ABABAB',
                               elapsed_s=time.monotonic()-begun, graphs=infos, comparison=compare_periods(periods),
+                              context_tokens=args.context_tokens,
+                              checked_first_device_positions=[row['checked_first_device_position'] for row in ranks],
                               no_profiler=True, no_hot_compilation=True, four_rank_tokens_equal=True,
                               statistic_unit='Four-rank latest token delivery interval, milliseconds',
                               baseline_drift_ms=max(p['summary']['median_ms'] for p in periods if p['arm']=='A')

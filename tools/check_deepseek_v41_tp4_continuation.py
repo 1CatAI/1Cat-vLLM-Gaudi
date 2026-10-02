@@ -17,6 +17,13 @@ import time
 from types import MethodType
 
 
+def continuation_position(context_tokens, index):
+    """Use the committed prompt boundary for every warm and measured step."""
+    if context_tokens < 0 or index < 0:
+        raise ValueError('Continuation context and index must be nonnegative')
+    return context_tokens + index
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('prepared', type=Path)
@@ -516,12 +523,17 @@ def main():
                     with context:
                         if args.trace_entry_phases or args.queue_marker_only:
                             mark('begin', index)
-                        position = 16384 + index
+                        position = continuation_position(context_tokens, index)
                         if device:
                             if native_positions:
                                 bank.copy_into(positions, position)
                             else:
                                 positions.copy_(bank.view(position, 1))
+                            if index == 0:
+                                actual = int(positions.cpu()[0])
+                                if actual != context_tokens:
+                                    raise RuntimeError(f'Continuation device position {actual} != {context_tokens}')
+                                report['checked_first_device_position'] = actual
                             host.prepare_device_c1('chain', selected.view(1))
                             if args.trace_entry_phases or args.queue_marker_only:
                                 mark('device_engram_enqueued', index)
