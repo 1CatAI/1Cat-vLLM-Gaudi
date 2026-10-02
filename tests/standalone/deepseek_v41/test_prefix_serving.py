@@ -212,3 +212,18 @@ def test_inline_worker_keeps_full_transaction_and_restores_interior_history(monk
     for (layer, name), values in expected.items():
         rows = values.shape[0]
         assert torch.equal(getattr(bank.layers[layer], name)[target.index * rows:(target.index + 1) * rows], values)
+
+
+def test_fallback_checkpoint_retains_boundary_using_only_prepared_buckets(monkeypatch):
+    from vllm_gaudi.v1.worker.deepseek_v41_runner import PREFILL_COMPUTE_BUCKETS
+    runtime = object.__new__(PrefixCheckpoints)
+    runtime.runner = SimpleNamespace(prefill_capacity=16384)
+    descriptor = AuxiliaryPrefixDescriptor(0, 1, 16256, b"prefix", (tuple(range(1, 128)),))
+    runtime.operations = AuxiliaryPrefixOperations(captures={"source": descriptor})
+    tokens = list(range(16384))
+    chunks = runtime.chunks("source", 0, [(0, tokens)])
+    assert [value for _, values in chunks for value in values] == tokens
+    assert all(len(values) in set(PREFILL_COMPUTE_BUCKETS) | {1} for _, values in chunks)
+    assert any(offset + len(values) == 16256 for offset, values in chunks)
+    assert not any(offset < 16256 < offset + len(values) for offset, values in chunks)
+    assert max(len(values) for _, values in chunks) == 8192

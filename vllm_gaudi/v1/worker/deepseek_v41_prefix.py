@@ -87,7 +87,19 @@ class PrefixCheckpoints:
                     self.inline[request_id] = capture
                     bank.program.shared.inline_prefix_capture = capture
                     return chunks
-        return chunks if descriptor is None else split_at_checkpoint(chunks, start, descriptor.num_tokens)
+        if descriptor is None:
+            return chunks
+        # Interior cuts must not create an unprepared near-full prompt shape.
+        # In particular, a large residual loses token ownership and allocates
+        # the full FP32 mHC working set on every rank. Reuse the ordinary finite
+        # buckets while preserving the exact checkpoint boundary and tokens.
+        from vllm_gaudi.v1.worker.deepseek_v41_runner import target_chunks
+
+        result = []
+        for offset, values in split_at_checkpoint(chunks, start, descriptor.num_tokens):
+            result.extend((offset + inner, part)
+                          for inner, part in target_chunks(values, self.runner.prefill_capacity))
+        return result
 
     def capture_at(self, request_id, position):
         if self.operations is None or request_id in self.captured:

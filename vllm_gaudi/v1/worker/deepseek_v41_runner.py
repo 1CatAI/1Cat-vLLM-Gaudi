@@ -2416,14 +2416,8 @@ class V41ModelRunner:
             from vllm_gaudi.ops.deepseek_v41_prefill_regions import freeze_prefill_regions
 
             freeze_prefill_regions()
-            # Checkpoint cuts add page-boundary shapes to the ordinary compute
-            # buckets. Prime their bounded expert/index helpers against the
-            # real KV pool before API readiness; pure region misses stay eager.
-            for bucket in prefill_compute_buckets(self.prefill_capacity):
-                if bucket > 256:
-                    self._dummy_run(bucket - 128)
-            self.pp.group.barrier()
-            self.state.clear()
+            # Inline capture preserves complete tiles; other checkpoint cuts
+            # reuse the finite prefill buckets already warmed above.
         if envs.VLLM_HPU_DSV41_VERIFY_TIMING:
             if (
                 not envs.VLLM_HPU_DSV41_DEVICE_VERIFY
