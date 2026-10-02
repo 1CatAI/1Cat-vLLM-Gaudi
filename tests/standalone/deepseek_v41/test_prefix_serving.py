@@ -176,7 +176,8 @@ def test_inline_worker_keeps_full_transaction_and_restores_interior_history(monk
     host.histories = {"source": host.history}
     host.closed, host.pending, host.device_pending = False, None, None
     requests = {name: SimpleNamespace(num_computed_tokens=16256, block_ids=(list(range(1, 8193)),),
-                                      token_slice=lambda begin, end: tokens[begin:end]) for name in ("source", "target")}
+                                      token_slice=lambda begin, end: tokens[begin:end])
+                for name in ("source", "target")}
     runner = SimpleNamespace(vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=3)),
                              model=SimpleNamespace(batch_state=bank, engram_host=host),
                              state=SimpleNamespace(blocks=8193), pp=SimpleNamespace(drain=lambda: None),
