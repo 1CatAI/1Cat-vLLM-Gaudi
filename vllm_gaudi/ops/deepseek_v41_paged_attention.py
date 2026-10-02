@@ -1484,10 +1484,6 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         """Bind request state explicitly to the reusable SWA tensor region."""
         from vllm_gaudi.ops.deepseek_v41_prefill_regions import prefill_swa_workspace
 
-        capture = getattr(getattr(self, "shared", None), "inline_prefix_capture", None)
-        if capture is not None:
-            capture.record(self.layer, "swa", kv, pack=pack_swa)
-
         return prefill_swa_workspace(
             kv,
             positions,
@@ -1651,6 +1647,12 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 destination / f"layer2-start{first_position}-pid{os.getpid()}.pt",
             )
         boundary("selection")
+        # Both the flat-cache path and its bounded long-prefix fallback use
+        # the same normalized chronological KV producer. Save its boundary
+        # rows before either path commits the final sliding-window tail.
+        capture = getattr(getattr(self, "shared", None), "inline_prefix_capture", None)
+        if capture is not None:
+            capture.record(self.layer, "swa", kv, pack=pack_swa)
         main_rows = self.search_length // self.ratio if self.ratio else 0
         if main_rows > PREFILL_MAIN_CACHE_ROWS:
             return self._prefill_attention_tiled(value, query, kv, positions, selected, ready_outputs, prefill_sequence)
