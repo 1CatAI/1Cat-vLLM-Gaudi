@@ -627,3 +627,12 @@ Parent97bd46b1. Preserve existing TP query-owner exchange, FlashInferMLA and rev
 `prefill64k-mla-chain-01/02`, normal0/1/4/5 and10/15/38/43, ABABAB200 with three changing inputs. Four-rank maximum wall:4Kqueries7.564369→6.009738ms (saving1.554632ms,2×IQR1.144491ms);16Kqueries23.228257→16.706033ms (saving6.522224ms,2×IQR1.227978ms). Device timing agrees,24comparisons exact. Other-group warmup is recorded. Query/head/cache tensor contracts match actual MLA production consumer.
 
 This is a long-prefill component improvement, separate from the preceding Full/Reindex chain whose MLA consumer was unchanged. No16Kdecode savings credited; request-level estimate is not quantified before combined serving. Official16KEOS and arbitrary-length/cache diagnostics are the next gates.
+
+
+### 2026-10-03 combined arbitrary-prefix service result — partial acceptance
+
+`visible-prefix-serving-05`, installedb7553683,512K/C16384/prefixON, default paths, officialtemperature1/top_p.95/seed42. Complete warmup, one uncached16384→2128naturalEOS request:8851.110164tps,10.565244ms/token,TTFT1.939030s;14facts/constraints pass and token IDs exactly match prior04. The9.5ktps/10ms goals are NOT achieved; no claim of completing the global target.
+
+Changed-boundary80token diagnostics:41983prefill9.104279s (4611.348tps),decode12.539508ms;62463prefill11.803032s (5292.115tps),decode12.738289ms. Prior04 same-input engine times52.733681/75.946818s were substantially higher; competing-load conditions differed, so retain both records without a pure isolated end-to-end attribution. These close the64Kprefill component entries as service-observed improvements, outside16Kdecode cumulative totals. Larger-than64Kshared prefill still falls back and is unqualified for speed.
+
+Short1024cold official diagnostic:prefill1.728926s,decode10.527486ms,TTFT1.765307s. Cachehit896rows:prefill1.125010s,decode10.257645ms,TTFT1.148419s. Initial short decode regression is removed after startup handoff-reader warmup. Cachetrajectories are coherent but token-exactness remains unproven;80token diagnostics are not naturalEOS quality acceptance. Public adapter restored to independently installed branch source;main unchanged andPR57draft. Remaining~2mslongdecode gap and short-request fixed prefill latency stay open. Static mirror/direct-score32Kbound is recorded outside gain totals pending measurement.
