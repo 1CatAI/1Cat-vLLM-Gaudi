@@ -229,11 +229,12 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
         if name not in arms:
             if name in ('dense_fp8', 'dense_fp8_tail', 'dense_fp8_static_int32',
                         'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff',
-                        'long_index_packed', 'long_index_mme', *COMPILER_CANDIDATES):
+                        'long_index_packed', 'long_index_mme', 'long_index_paged_mme', *COMPILER_CANDIDATES):
                 if 'dense_fp8' not in stages:
                     stages['dense_fp8'] = make_dense_stage(stage, shard, args.ab_dense_sidecar, args.ab_dense_config)
                 program = (make_handoff_stage(stages['dense_fp8'])
-                           if name in ('dense_fp8_swa_norm_handoff', 'long_index_packed', 'long_index_mme')
+                           if name in ('dense_fp8_swa_norm_handoff', 'long_index_packed',
+                                       'long_index_mme', 'long_index_paged_mme')
                            else make_attention_norm_stage(stages['dense_fp8']) if name == 'dense_fp8_swa_norm_quant'
                            else make_swa_stage(stages['dense_fp8']) if name == 'dense_fp8_swa_packed'
                            else clone_module(stages['dense_fp8']))
@@ -242,9 +243,11 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
             else:
                 raise ValueError(f'Unknown resident candidate {name}')
             program.decode_static_int32 = name == 'dense_fp8_static_int32'
-            if name in ('long_index_packed', 'long_index_mme'):
+            if name in ('long_index_packed', 'long_index_mme', 'long_index_paged_mme'):
                 for block in program.layers:
-                    block.attention.runtime_index_mme = name == 'long_index_mme'
+                    block.attention.runtime_index_mme = name != 'long_index_packed'
+                    if name == 'long_index_paged_mme':
+                        block.attention.index_mirror_scores = False
             replay = StageReplay(program, greedy_tail=name in ('tail', 'dense_fp8_tail'))
             program.replay_owner = replay
             stages[name], arms[name] = program, replay
@@ -253,7 +256,7 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
             graph_directory = control / 'compiler-graphs' / name / f'rank{rank}'
             graph_directory.mkdir(parents=True, exist_ok=True)
             settings = dict(COMPILER_CANDIDATES.get(name, {}))
-            if name not in ('long_index_packed', 'long_index_mme'):
+            if name not in ('long_index_packed', 'long_index_mme', 'long_index_paged_mme'):
                 settings['DUMP_POST_GRAPHS'] = str(graph_directory)
             with compiler_settings(settings):
                 chain(True, 2, measure=False, engine=replay, warm_steps=6)
@@ -265,7 +268,7 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
         ready = dict(pid=os.getpid(), source=os.environ['DSV41_RUN_EVIDENCE'],
                      candidates=['dense_fp8', 'tail', 'dense_fp8_tail', 'dense_fp8_static_int32',
                                  'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff',
-                                 'long_index_packed', 'long_index_mme', *COMPILER_CANDIDATES])
+                                 'long_index_packed', 'long_index_mme', 'long_index_paged_mme', *COMPILER_CANDIDATES])
         (control / 'ready.json').write_text(json.dumps(ready, indent=2)+'\n')
     print(f'TP{rank}: real16 fixture resident; control {control}', flush=True)
     try:
@@ -331,7 +334,11 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                     ranks = [None] * dist.get_world_size()
                     dist.all_gather_object(ranks, local)
                     assert all(row['tokens'] == tokens for row in ranks), 'Ranks disagree on tokens'
-                    assert tokens == expected, 'Candidate differs from saved feedback tokens'
+                    if tokens != expected:
+                        if rank == 0:
+                            (directory / 'feedback-mismatch.json').write_text(json.dumps(
+                                dict(expected=expected, observed=ranks, formal_gain_credit=False), indent=2) + '\n')
+                        raise AssertionError('Candidate differs from saved feedback tokens')
                     if rank == 0:
                         delivery = [max(row['delivery_ns'][i] for row in ranks) for i in range(steps + 1)]
                         intervals = [(b - a) / 1e6 for a, b in zip(delivery, delivery[1:])]
@@ -410,6 +417,12 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                         p['ranks'][0]['tokens'] == periods[0]['ranks'][0]['tokens'] for p in periods)
                     result['numerical_reference_pending'] = True
                     result['gain_ledger_eligible'] = False
+                if reference_name == 'long_index_paged_mme':
+                    result['cross_arm_feedback_exact'] = all(
+                        p['ranks'][0]['tokens'] == periods[0]['ranks'][0]['tokens'] for p in periods)
+                    if not result['cross_arm_feedback_exact']:
+                        result['comparison']['effective'] = False
+                        result['status'] = 'numerical_contract_failed'
                 if name in COMPILER_CANDIDATES:
                     # Runtime compiler settings are absent from Bridge's recipe
                     # cache key. A/B timing alone cannot establish distinct arms.
@@ -441,9 +454,11 @@ def main():
     parser.add_argument('--candidate', choices=('dense_fp8', 'tail', 'dense_fp8_tail',
                                               'dense_fp8_static_int32', 'dense_fp8_swa_packed',
                                               'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff',
-                                              'long_index_packed', 'long_index_mme', *COMPILER_CANDIDATES))
+                                              'long_index_packed', 'long_index_mme', 'long_index_paged_mme',
+                                              *COMPILER_CANDIDATES))
     parser.add_argument('--baseline', choices=('baseline', 'dense_fp8', 'dense_fp8_swa_packed',
-                                               'dense_fp8_swa_norm_quant', 'long_index_packed'), default='baseline')
+                                               'dense_fp8_swa_norm_quant', 'long_index_packed',
+                                               'long_index_paged_mme'), default='baseline')
     parser.add_argument('--steps', type=int, default=200)
     parser.add_argument('--reference-result', type=Path,
                         help='Reuse saved matching-context timing and feedback tokens; time only the candidate')

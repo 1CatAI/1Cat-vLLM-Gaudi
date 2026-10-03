@@ -1,9 +1,16 @@
 # TP4 decode 长期开发台账
 
-更新：2026-10-01。只记录具有可比完整消费链微基准收益、通过适用正确性检查的改动。
+更新：2026-10-03。只记录具有可比完整消费链微基准收益、通过适用正确性检查的改动。
 未验证方向、失败或变慢试验留在实验INDEX，不计累计。端到端通过后关账，不再次计入待验收收益。
 
 ## 当前正式测量与待验收累计
+
+当前官方采样口径：temperature=1.0、top_p=0.95、seed=42，512K容量、C16384、缓存开启、完整预热。
+最新安装服务测量为 `visible-prefix-serving-05`：16384→2128自然EOS，prefill8851.110164tokens/s、
+decode10.565244ms/token，14项事实/约束通过。9.5ktokens/s和10ms目标尚未通过。
+用户此前接受发布的回退版本为8914.621782tokens/s、10.599712ms/token。
+当前长文分块、分页MLA、索引镜像组件收益独立记录在下文，未折算为16K官方采样收益，未替换公网服务。
+下述9.933990731ms属于历史greedy验收，不能作为当前官方采样的发布验收数字。
 
 2026-10-01本轮≤10ms目标已完成：最新正式基线 **9.933990731 ms/token（100.6645 tokens/s）**，
 完整56/56预热，16K→2784token→自然EOS，无profiler正式请求；5个固定语义样本全部通过。
@@ -651,7 +658,7 @@ Long-prefill component only, no16Kdecode cumulative credit or whole-request esti
 
 `prefill-paged-mla-chain-01`, same2/3/6/7 and20/25/48/53,4096queries,131072source rows,512Kpage capacity,ratio1. The previous flat-cache budget switched to replicated selected-row gather/generic FP4 decode before MLA. Feed logical selected IDs into the existing sequence exchange instead, decode only the owner’s selected rows inside each128-query MLA recipe, and preserve complete640-column softmax/PV. No new communication or native ABI.
 
-ABABAB200, three changing head shards, actual paged load/decode/MLA consumer in both arms. Maximum-rank wall1129.703831→15.171890ms, saving1114.531941ms exceeds2×IQR5.465538ms;12consumer outputs exact. Source and competing load recorded. Largest query stride/ratio2 and ordinary combined serving remain pending. This is a long-prefill gain, independent of the preceding index chain’s unchanged MLA consumer; do not sum either into16Kdecode or an estimated request-level number.
+ABABAB200, three changing head shards, actual paged load/decode/MLA consumer in both arms. Maximum-rank wall1129.703831→15.171890ms, saving1114.531941ms exceeds2×IQR5.465538ms;12consumer outputs exact. Source and competing load recorded. Largest query stride/ratio2 also passed in `prefill-paged-mla-contract-02`: C16384, ratio2, 12 exact consumer outputs, correctness-only; ordinary combined serving remains pending. This is a long-prefill gain, independent of the preceding index chain’s unchanged MLA consumer; do not sum either into16Kdecode or an estimated request-level number.
 
 
 ### 2026-10-03 configured-capacity decode index mirror — component qualified, real16 pending
@@ -660,4 +667,4 @@ Native32Kcap is a per-score workspace bound, not a context cutoff. Keep canonica
 
 `long-index-mirror-chain-06`: actual native model-entry replay of peer query/weight exchange, canonical/main/mirror writes,Full/Reindex and publish/reuse MLA.2/3/6/7,20/25/48/53,source82944/search131072/capacity512K,ABABAB200,three immutable changing banks. Ratio1 wall2.415673→1.233708ms,delta1.181965,gate0.178182; ratio2 wall1.664854→1.084340ms,delta0.580514,gate0.279144. All96outputs exact.01/03 host-entry measurements were not representative and ratio2 stayed below their IQR gates;02/04/05 failed cold harness capability/binding contracts and collected no timings. They remain outside all credit.
 
-Real16candidate-only measurement against the archived matching42Kchain is pending. No16Kdecode cumulative credit and no whole-model prediction for the different long-context layer mix. Public inference unchanged.
+Real16-01 failed the saved-feedback oracle before qualification. Current source changes prefill query ownership as well as decoder state; archived prefill tensors were not retained, so the old token sequence cannot isolate mirror correctness. No gain credit. Real16-02 compares canonical paged MME and mirror readers from the same current prefill snapshot, using the resident tool and complete native replay; this missing stateful reference is the only new baseline. No16Kdecode cumulative credit and no whole-model prediction for the different long-context layer mix. Public inference unchanged.
