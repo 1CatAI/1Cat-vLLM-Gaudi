@@ -261,11 +261,22 @@ def capture_physical_arms(directory, template, engines, chain, rank, dist, prepa
 
     raw_directory = directory / 'raw-publication'
     config = directory / 'profiler-config.json'
+    saved_environment = {key: os.environ.get(key) for key in ('HABANA_PROF_CONFIG', 'HABANA_PROFILE_WRITE_HLTV')}
+    # Some SDKs cache output settings when the worker starts. Reuse only a
+    # publication buffer inside this resident case, copying each closed raw
+    # bundle into its immutable job/arm directory before the next capture.
+    startup = saved_environment['HABANA_PROF_CONFIG']
+    settings = isolated_trace_config(template, raw_directory)
+    if startup:
+        settings = json.loads(Path(startup).read_text())
+        publication = Path(settings['GeneralSettings']['values']['outdir']['value']).resolve()
+        if not publication.is_relative_to(directory.parents[1].resolve()):
+            raise ValueError('SDK publication buffer must belong to this resident case')
+        raw_directory = publication
     if rank == 0:
         raw_directory.mkdir(parents=True, exist_ok=True)
-        config.write_text(json.dumps(isolated_trace_config(template, raw_directory), indent=2)+'\n')
+        config.write_text(json.dumps(settings, indent=2)+'\n')
     dist.barrier()
-    saved_environment = {key: os.environ.get(key) for key in ('HABANA_PROF_CONFIG', 'HABANA_PROFILE_WRITE_HLTV')}
     os.environ.update(HABANA_PROF_CONFIG=str(config), HABANA_PROFILE_WRITE_HLTV='1')
     results = []
     try:
