@@ -241,6 +241,72 @@ def load_candidate_factory(path, expected_sha256):
     return module.make_candidate, dict(path=str(path), sha256=digest)
 
 
+def isolated_trace_config(template, directory):
+    """Use a fresh raw namespace; repeated SDK publication must not overwrite evidence."""
+    settings = copy.deepcopy(json.loads(Path(template).read_text()))
+    general = settings['GeneralSettings']['values']
+    general['outdir']['value'] = str(Path(directory).resolve())
+    general['session']['value'] = 'resident-node-audit'
+    general['addPid']['value'] = True
+    hardware = [plugin for plugin in settings['Plugins'] if plugin['name'] == 'HwTrace' and plugin['enable']]
+    if len(hardware) != 1:
+        raise ValueError('Physical audit needs exactly one enabled HwTrace plugin')
+    hardware[0]['values']['parseOptions']['skipParse']['value'] = True
+    return settings
+
+
+def capture_physical_arms(directory, template, engines, chain, rank, dist, preparation_counts):
+    from vllm_gaudi.ops.deepseek_v41_native_trace import NativeTrace
+    import shutil
+
+    raw_directory = directory / 'raw-publication'
+    config = directory / 'profiler-config.json'
+    if rank == 0:
+        raw_directory.mkdir(parents=True, exist_ok=True)
+        config.write_text(json.dumps(isolated_trace_config(template, raw_directory), indent=2)+'\n')
+    dist.barrier()
+    saved_environment = {key: os.environ.get(key) for key in ('HABANA_PROF_CONFIG', 'HABANA_PROFILE_WRITE_HLTV')}
+    os.environ.update(HABANA_PROF_CONFIG=str(config), HABANA_PROFILE_WRITE_HLTV='1')
+    results = []
+    try:
+        for label, engine in engines:
+            chain(True, 2, measure=False, engine=engine, warm_steps=6)
+            counts = preparation_counts()
+            wait_for_loading(directory, rank, dist)
+            scopes = directory / label / f'rank{rank}'
+            scopes.mkdir(parents=True, exist_ok=True)
+            tracer = NativeTrace(scopes, scope_only=True)
+            dist.barrier()
+            tracer.start()
+            try:
+                # This is a node/causality audit, never a performance sample.
+                tokens = chain(True, 8, measure=False, engine=engine, warm_steps=0)[0]
+            finally:
+                tracer.stop()
+            assert counts == preparation_counts(), 'Physical audit unexpectedly compiled a hot graph'
+            metadata = copy.deepcopy(tracer.metadata)
+            raw_files = []
+            for source in metadata['raw_files']:
+                target = scopes / Path(source).name
+                shutil.copy2(source, target)
+                raw_files.append(str(target))
+            metadata['raw_files'] = raw_files
+            metadata.update(arm=label, rank=rank, tokens=tokens, graph=graph_info(engine))
+            (scopes/'capture.json').write_text(json.dumps(metadata, indent=2)+'\n')
+            results.append(metadata)
+            dist.barrier()
+    finally:
+        for key, value in saved_environment.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    gathered = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, results)
+    return dict(status='physical_audit_captured', timed=False, formal_gain_credit=False,
+                captures=gathered, warning='Profiler timings cannot qualify an A/B gain')
+
+
 def serve(stage, baseline, shard, chain, report, args, preparation_counts, state_fingerprints=None):
     import torch.distributed as dist
     from vllm_gaudi.ops.deepseek_v41_replay import StageReplay
@@ -520,6 +586,13 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
                             formal_gain_credit=False), indent=2)+'\n')
                         Path(job['request_path']).rename(Path(job['request_path']).with_suffix('.consumed'))
                     continue
+            if job.get('trace_config'):
+                result = capture_physical_arms(directory, job['trace_config'],
+                    [('A', reference), ('B', candidate)], chain, rank, dist, preparation_counts)
+                if rank == 0:
+                    (directory / 'result.json').write_text(json.dumps(result, indent=2)+'\n')
+                    Path(job['request_path']).rename(Path(job['request_path']).with_suffix('.consumed'))
+                continue
             # Resolve both warmed contracts before the no-hot-compilation gate.
             chain(True, 2, measure=False, engine=reference, warm_steps=6)
             counts = preparation_counts()
@@ -661,6 +734,8 @@ def main():
     parser.add_argument('--steps', type=int, default=200)
     parser.add_argument('--candidate-factory', type=Path,
                         help='A repository factory returning an independently owned shared stage clone')
+    parser.add_argument('--trace-config', type=Path,
+                        help='Capture warmed arms for physical-node audit; no timed qualification')
     parser.add_argument('--reference-result', type=Path,
                         help='Reuse saved matching-context timing and feedback tokens; time only the candidate')
     parser.add_argument('--reference-arm', choices=('A', 'B'), default='B')
@@ -669,6 +744,8 @@ def main():
     args = parser.parse_args()
     if not args.stop and not args.candidate:
         parser.error('Select a candidate or --stop')
+    if args.trace_config and (args.reference_result or args.diagnose_index_mirror or args.stop):
+        parser.error('--trace-config requires a separate warmed-arm diagnostic job')
     if args.diagnose_index_mirror and not args.reference_result:
         parser.error('--diagnose-index-mirror needs the saved same-state A/B result')
     if args.steps < 200:
@@ -682,6 +759,8 @@ def main():
     if args.candidate_factory is not None:
         factory_path = args.candidate_factory.resolve()
         job.update(factory=str(factory_path), factory_sha256=hashlib.sha256(factory_path.read_bytes()).hexdigest())
+    if args.trace_config:
+        job['trace_config'] = str(args.trace_config.resolve())
     if args.diagnose_index_mirror:
         job['command'] = 'diagnose_index_mirror'
     if args.reference_result:

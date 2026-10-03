@@ -70,3 +70,11 @@ load1包含驱动D状态线程，不作为门槛。逐秒记录CPU PSI、绑定�
 
 
 `dense_fp8_swa_packed`只改变没有压缩KV的两层decode派发，复用现有packed MLA及静态SWA行/长度输入。它先通过KV pack/写环→MLA的TP4/TP2、C1/C2/C6硬件契约，再在真实16层独立两臂验证；不修改prefill入口。此项仍待正式验收，默认关闭。它和I32通用解码删减重叠，不叠加未经门槛确认的I32差值。
+
+Physical node audit is a separate diagnostic job. Submit the same warmed arms
+with `--trace-config <raw SDK template>` to capture eight steps per arm. It
+checks the mutable-state contract first, stores each arm in its own directory,
+and assigns no performance credit to profiler timings. The SDK config must
+be available before worker startup when the installed SDK reads it only once.
+The capture includes all four ranks so consumer dependencies and arrival skew
+can be inspected along with physical TPC/MME activities.

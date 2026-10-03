@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 from types import MethodType
 import hashlib
+import json
 
 import pytest
 import torch
@@ -12,6 +13,24 @@ _path = Path(__file__).resolve().parents[3] / 'tools/deepseek_v41_resident_ab.py
 _spec = importlib.util.spec_from_file_location('resident_ab', _path)
 ab = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ab)
+
+
+def test_physical_audit_cannot_overwrite_the_template_namespace(tmp_path):
+    original = dict(GeneralSettings=dict(values={
+        'outdir': dict(value='/old/formal/evidence'), 'session': dict(value='formal'),
+        'addPid': dict(value=False)}), Plugins=[dict(name='HwTrace', enable=True,
+        values=dict(parseOptions=dict(skipParse=dict(value=False))))])
+    template = tmp_path / 'template.json'
+    template.write_text(json.dumps(original))
+    changed = ab.isolated_trace_config(template, tmp_path/'audit')
+    assert json.loads(template.read_text()) == original
+    assert changed['GeneralSettings']['values']['outdir']['value'] == str(tmp_path/'audit')
+    assert changed['GeneralSettings']['values']['addPid']['value']
+    assert changed['Plugins'][0]['values']['parseOptions']['skipParse']['value']
+    original['Plugins'].append(original['Plugins'][0].copy())
+    template.write_text(json.dumps(original))
+    with pytest.raises(ValueError, match='exactly one'):
+        ab.isolated_trace_config(template, tmp_path/'audit')
 
 
 def periods(a, b):
