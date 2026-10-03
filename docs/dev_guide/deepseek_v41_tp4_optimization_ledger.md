@@ -12,7 +12,8 @@ prefill8028.980763tokens/s、decode10.568225ms/token、客户端TTFT2.126094s，
 同配置归档父版本b7553683为prefill8851.110164tokens/s、decode10.565244ms/token；
 本次prefill降低9.287%，decode差0.002981ms，原因未归因，不记作正式收益。
 用户此前接受发布的回退版本为8914.621782tokens/s、10.599712ms/token。
-长文组件已组合安装到公网服务，main仍未包含本PR。长文短诊断实测见文末，
+长文组件已组合安装到公网服务；用户于2026-10-03明确要求通过PR57合并当前实现到main。
+此次源码合并不表示速度或长文语义验收通过。长文短诊断实测见文末，
 组件数据不折算为16K官方采样收益；当前未端到端累计16K收益仍0ms。
 下述9.933990731ms属于历史greedy验收，不能作为当前官方采样的发布验收数字。
 
@@ -723,3 +724,15 @@ this does not qualify unrestricted concurrency or every length. No16Kgain or rel
 All long-window/selected-paged-MLA/mirror items have now been exercised together in normal serving,
 so move them out of the untested-component queue without adding or summing overlapping request gains.
 Public API is online on this candidate; PR57 remainsdraft andmain unchanged while strict goals remain open.
+
+
+### 2026-10-03 user-authorized integration of current implementation
+
+User explicitly requested merging currentPR57into main after the recorded qualification results.
+This supersedes the earlier draft-only integration instruction. Retain the failed speed and long-terminal-instruction
+results; do not advance the formally accepted performance baseline, award component gain credit, or create a qualified
+release tag. Ordinary installed API remains online on measuredsource31e519fd; no new model request, profiling,
+service restart or unsupported deployment claim is introduced by this merge. Existing CPU/component/formal evidence
+is reused because the latest changes only clarify documentation and startup audit text. Unrelated localAGENTS.md
+and reproducer artifacts are excluded. Follow-up work must resolve long semantic correctness and prefill regression
+with the accepted prompt tail and exact cold/cache feedback evidence already archived.
