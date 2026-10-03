@@ -164,7 +164,7 @@ def test_mirror_observer_records_keys_without_mutation_and_masks_incomplete_pair
     selection = SimpleNamespace(indices=torch.tensor([[3, 7, 11]], dtype=torch.int32))
     block = SimpleNamespace(layer=2, attention=SimpleNamespace(owns_index=True, selection=selection))
     shared = SimpleNamespace(sources={'2': cache}, physical_rows=lambda rows, ratio: rows)
-    program = SimpleNamespace(shared=shared, stop=16, layers=[block])
+    program = SimpleNamespace(shared=shared, layers=[block])
     hidden = torch.randn(1, 5120).bfloat16()
     record = ab.observe_mirror_step(program, hidden, 256)
     keys = record['keys']['2']

@@ -34,12 +34,21 @@ def forced_feedback_token(value, prototype):
     return prototype.new_tensor([[value]])
 
 
+
+def continuation_page_count(context_tokens, steps, warm_steps=32, page_tokens=128):
+    """Reserve distinct physical pages for every reachable fixture position."""
+    if context_tokens < 0 or steps < 1 or warm_steps < 0 or page_tokens < 1:
+        raise ValueError('Invalid continuation page reservation')
+    return (context_tokens + steps + warm_steps + 1 + page_tokens - 1) // page_tokens
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('prepared', type=Path)
     parser.add_argument('--bindings', type=Path, required=True)
     parser.add_argument('--engram-startup-directory', type=Path)
     parser.add_argument('--steps', type=int, default=32)
+    parser.add_argument('--resident-max-steps', type=int, default=512)
     parser.add_argument('--context-tokens', type=int, default=16384)
     parser.add_argument('--max-model-len', type=int, default=1048576)
     parser.add_argument('--speed-probe', action='store_true',
@@ -250,10 +259,20 @@ def main():
             stage.reduce, stage.all_gather = reduce, gather
             stage.shared = PagedCSA2SharedState(text, 0, 16, 'hpu', stage.length, tensor_parallel_size=4)
             stage.runtime_indexer = stage.shared.runtime_indexer
-            stage.shared.block_table[:256].copy_(torch.arange(1, 257, dtype=torch.int32, device='hpu'))
+            reserved_steps = args.resident_max_steps if args.resident_ab else args.steps
+            page_count = continuation_page_count(context_tokens, reserved_steps,
+                                                 max(32, args.continuous_warm_steps))
+            if page_count > stage.shared.block_table.numel():
+                raise ValueError('Continuation reservation exceeds configured context capacity')
+            stage.shared.block_table[:page_count].copy_(
+                torch.arange(1, page_count + 1, dtype=torch.int32, device='hpu'))
+            report['distinct_fixture_pages'] = page_count
+            report['reserved_continuation_steps'] = reserved_steps
             for cache in stage.shared.sources.values():
-                cache.main = torch.zeros(257 * 128 // cache.ratio, 288, dtype=torch.uint8, device='hpu')
-                cache.index = torch.zeros(257 * 128 // cache.ratio, 68, dtype=torch.uint8, device='hpu')
+                cache.main = torch.zeros((page_count + 1) * 128 // cache.ratio, 288,
+                                         dtype=torch.uint8, device='hpu')
+                cache.index = torch.zeros((page_count + 1) * 128 // cache.ratio, 68,
+                                          dtype=torch.uint8, device='hpu')
             lookup = mxfp4_bf16_lut(torch.device('hpu'))
             stage.layers = torch.nn.ModuleList()
             for layer in layers:

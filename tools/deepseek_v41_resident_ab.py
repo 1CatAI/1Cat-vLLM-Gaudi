@@ -292,6 +292,19 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
             steps = int(job.get('steps', 200))
             if steps < 200:
                 raise ValueError('Resident A/B needs at least 200 steps per period')
+            if steps > args.resident_max_steps:
+                raise ValueError('Resident job exceeds the allocated continuation step reservation')
+            from tools.check_deepseek_v41_tp4_continuation import continuation_page_count
+            import torch
+
+            needed_pages = continuation_page_count(args.context_tokens, steps)
+            pages = stage.shared.block_table[:needed_pages].cpu()
+            if pages.numel() != needed_pages or not bool((pages > 0).all()) \
+                    or torch.unique(pages).numel() != needed_pages:
+                raise ValueError('Visible continuation pages must be nonzero and distinct')
+            for cache in stage.shared.sources.values():
+                if int(pages.max()) >= cache.index.shape[0] // (128 // cache.ratio):
+                    raise ValueError('Continuation page mapping exceeds its physical cache')
             name = job['candidate']
             directory = control / job['id']
             directory.mkdir(exist_ok=True)
@@ -321,7 +334,10 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                     records = []
 
                     def observe(program, hidden, position, records=records):
-                        records.append(observe_mirror_step(program, hidden, position))
+                        try:
+                            records.append(observe_mirror_step(program, hidden, position))
+                        except (AttributeError, KeyError, TypeError, ValueError) as error:
+                            records.append(dict(position=position, observer_error=repr(error)))
 
                     tokens, _, _ = chain(True, len(forced), measure=False, engine=replay,
                                          forced_tokens=forced, observer=observe)
@@ -330,6 +346,10 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                     outputs.append(records)
                 checks = []
                 for old, new in zip(*outputs, strict=True):
+                    if 'observer_error' in old or 'observer_error' in new:
+                        checks.append(dict(position=old['position'],
+                                           observer_error=[old.get('observer_error'), new.get('observer_error')]))
+                        continue
                     a, b = old['hidden'].float().flatten(), new['hidden'].float().flatten()
                     keys_exact = all(torch.equal(k['mirror'][k['visible']], k['canonical'][k['visible']])
                                      for record in (old, new) for k in record['keys'].values())
@@ -344,7 +364,8 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                 (directory / f'checks-rank{rank}.json').write_text(json.dumps(checks, indent=2)+'\n')
                 dist.barrier()
                 if rank == 0:
-                    (directory / 'result.json').write_text(json.dumps(dict(status='diagnostics_completed',
+                    (directory / 'result.json').write_text(json.dumps(dict(status='diagnostics_observer_failed'
+                        if any('observer_error' in row for row in checks) else 'diagnostics_completed',
                         timed=False, formal_gain_credit=False, checks_file='checks-rank*.json'), indent=2)+'\n')
                     Path(job['request_path']).rename(Path(job['request_path']).with_suffix('.consumed'))
                     deadline.cancel()
@@ -496,8 +517,6 @@ def observe_mirror_step(program, hidden, position):
 
     keys = {}
     for source, cache in program.shared.sources.items():
-        if int(source) >= program.stop:
-            continue
         row = position // cache.ratio
         visible_rows = (position + 1) // cache.ratio
         probes = torch.linspace(0, max(0, visible_rows - 1), 33).long().tolist()
