@@ -473,10 +473,23 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
                 old_tokens = chain(True, 8, measure=False, engine=reference, warm_steps=6)[0]
                 old_state = state_fingerprints()
                 new_tokens = chain(True, 8, measure=False, engine=candidate, warm_steps=6)[0]
-                numerical_gate = check_repartition_state(old_tokens, old_state, new_tokens, state_fingerprints())
+                new_state = state_fingerprints()
+                try:
+                    numerical_gate = check_repartition_state(old_tokens, old_state, new_tokens, new_state)
+                except RuntimeError as error:
+                    numerical_gate = dict(tokens_exact=old_tokens == new_tokens, mutable_state_exact=False,
+                                          error=str(error), reference_state=old_state, candidate_state=new_state)
                 (directory / f'numerical-gate-rank{rank}.json').write_text(
                     json.dumps(numerical_gate, indent=2)+'\n')
-                dist.barrier()
+                gates = [None] * dist.get_world_size()
+                dist.all_gather_object(gates, numerical_gate)
+                if any(not gate['mutable_state_exact'] for gate in gates):
+                    if rank == 0:
+                        (directory / 'result.json').write_text(json.dumps(dict(
+                            status='numerical_contract_failed', timed=False, numerical_gates=gates,
+                            formal_gain_credit=False), indent=2)+'\n')
+                        Path(job['request_path']).rename(Path(job['request_path']).with_suffix('.consumed'))
+                    continue
             # Resolve both warmed contracts before the no-hot-compilation gate.
             chain(True, 2, measure=False, engine=reference, warm_steps=6)
             counts = preparation_counts()

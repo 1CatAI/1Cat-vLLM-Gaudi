@@ -1,8 +1,35 @@
 # SPDX-License-Identifier: Apache-2.0
 import pytest
 import torch
+from dataclasses import replace
 
 from vllm_gaudi.ops import tp2_prepared_plan as replay
+
+
+def test_serial_dependency_policy_requires_explicit_native_support():
+    from vllm_gaudi.ops.tp2_model_adapter import DEEPSEEK_V41_PP0_INPUT
+
+    class LegacyGraph:
+        def __init__(self):
+            self.topology = None
+
+        def configure_topology(self, *args):
+            self.topology = args
+
+    legacy = LegacyGraph()
+    replay._configure_native_topology(legacy, 5, DEEPSEEK_V41_PP0_INPUT)
+    assert legacy.topology == (5, 43, False)
+    serial = replace(DEEPSEEK_V41_PP0_INPUT, require_independent_overlap=False)
+    with pytest.raises(RuntimeError, match="dependency-policy API"):
+        replay._configure_native_topology(legacy, 5, serial)
+
+    class Graph(LegacyGraph):
+        def configure_dependency_policy(self, required):
+            self.required = required
+
+    graph = Graph()
+    replay._configure_native_topology(graph, 5, serial)
+    assert graph.topology == legacy.topology and graph.required is False
 
 
 def test_static_scalar_detection_rejects_changing_graph_inputs():

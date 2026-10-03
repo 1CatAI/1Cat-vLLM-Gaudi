@@ -137,6 +137,14 @@ def native_compute_coverage_matches(segments, reductions, groups, compiled_consu
     return segments > reductions
 
 
+def _configure_native_topology(graph, groups, adapter):
+    graph.configure_topology(groups, adapter.collectives, adapter.external_prefix)
+    if not getattr(adapter, "require_independent_overlap", True):
+        if not hasattr(graph, "configure_dependency_policy"):
+            raise RuntimeError("Coarser native replay requires an explicit dependency-policy API")
+        graph.configure_dependency_policy(False)
+
+
 def _flush():
     global _native_captures
     pending = getattr(_local, "pending", None)
@@ -178,7 +186,7 @@ def _flush():
                 if context is not None and context.get("owner") is not None:
                     _native_graph_owners[key] = weakref.ref(context["owner"])
                 if v4:
-                    graph.configure_topology(groups, adapter.collectives, adapter.external_prefix)
+                    _configure_native_topology(graph, groups, adapter)
                 if v41 and gaudi_envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX and adapter.supports_segmented_input:
                     attention_inputs = list(context["attention_inputs"])
                     if gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM:

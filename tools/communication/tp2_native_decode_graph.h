@@ -437,6 +437,12 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
     external_prefix_ = externalPrefix;
   }
 
+  void configureDependencyPolicy(bool requireIndependentOverlap) {
+    TORCH_CHECK(state_.load() == State::Created,
+                "Dependency policy must be configured before native capture");
+    require_independent_overlap_ = requireIndependentOverlap;
+  }
+
   void configureLateInputs(std::vector<at::Tensor> inputs) {
     TORCH_CHECK(state_.load() == State::Created && segmentedPrefixAvailable() && !inputs.empty(),
                 "Late inputs must be configured before segmented PP0 capture");
@@ -862,6 +868,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
   size_t expected_groups_ = 0;
   size_t expected_collectives_ = 0;
   bool external_prefix_ = false;
+  bool require_independent_overlap_ = true;
   std::vector<at::Tensor> late_inputs_;
   NativeInputPrefix input_prefix_;
 
@@ -1024,7 +1031,8 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
                      index, dep.producer, dep.consumer, dep.lastConsumer,
                      static_cast<unsigned long long>(dep.input.bytes));
       }
-      TORCH_CHECK(overlapped > 0, "V4.1 overlap graph has no independent compute between TP producer and consumer");
+      TORCH_CHECK(overlapped > 0 || !require_independent_overlap_,
+                  "V4.1 overlap graph has no independent compute between TP producer and consumer");
     }
     if (tp4_) {
       // Each logical AllReduce keeps the stock RS -> AG sequence. Both

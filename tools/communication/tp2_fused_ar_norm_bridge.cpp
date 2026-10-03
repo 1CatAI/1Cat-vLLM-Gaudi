@@ -1787,6 +1787,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       module, "NativeDecodeGraph")
       .def(py::init<>())
       .def("configure_topology", &tp2_native::NativeDecodeGraph::configureTopology)
+      .def("configure_dependency_policy", &tp2_native::NativeDecodeGraph::configureDependencyPolicy)
       .def("configure_late_inputs", &tp2_native::NativeDecodeGraph::configureLateInputs)
       .def("capture", [](const std::shared_ptr<tp2_native::NativeDecodeGraph>& self,
                           std::vector<std::shared_ptr<PreparedGroupPlan>> plans, py::list inputs) {

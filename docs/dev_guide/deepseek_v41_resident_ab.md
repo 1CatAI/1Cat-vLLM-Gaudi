@@ -21,7 +21,7 @@ A/B各600个样本的中位数与inclusive IQR；另记排空后的整段host均
 每段前采另一组模块2/3/6/7的11次显存/利用率快照，间隔1秒；十秒内显存变化≥16MiB时等待，
 增长和驱动内存池重置下降都必须稳定，避免启动阶段的短暂停顿被误判为加载完成。
 并将全部检查追加到`competing-load.jsonl`。记录已允许的其他组常驻/运行负载，不改它们的进程或锁。
-每个候选最长45分钟；保留失败或部分段数据，再换方向。
+候选不设置自动超时；保留失败或部分段数据。最新 campaign 的批次验收顺序优先于历史累计门槛。
 
 尾部候选只把LM head和argmax并入最后一组，不重复下一步embedding或引入额外embedding AllReduce。
 16层A为41原生点＋1重放外head点；尾部B为42原生点＋0重放外点，完整链通信总数相同。
@@ -44,6 +44,17 @@ load1包含驱动D状态线程，不作为门槛。逐秒记录CPU PSI、绑定�
 未验收的整数常量候选`dense_fp8_static_int32`复用同一份stage源码，只把I32表达式里的不可变标量变成常驻recipe输入；动态位置、I64输入和请求状态保持动态。默认关闭。小链覆盖C1/C2/C6和重排后的gather消费者，完整链还要求A/B反馈token精确相同。
 
 编译器配置候选必须证明两臂实际recipe不同。Synapse配置在冷捕获后恢复，但仅恢复开关不足以隔离Bridge缓存；`compiler_cache_isolation_unverified`结果不能入台账。离线保存post-graph及native plan，用相同输入精度对比真实节点数。默认先捕获参考臂。
+
+重放分段候选 `handoff_static_merged_segments` 必须以 `handoff_static_factories` 为参考臂，
+仅改变共用 backend 的 mHC 分段。计时前从同一恢复点各执行短链，逐位比较 token 和全部可变状态的校验和；
+任一卡不一致则保留差异、跳过计时，常驻工具继续接受后续任务。
+该候选通过 `DecoderTopology.require_independent_overlap=False` 配置每图的
+`NativeDecodeGraph.configure_dependency_policy(False)`。原生缓冲区依赖、通信覆盖与覆盖写检查仍执行；
+只有“必须存在独立计算段”的性能断言被放宽。默认值为 True，正常 TP2/TP4 和 C2–C6 不调用新增方法，
+旧 bridge 保持兼容；合并候选遇到缺少该方法的 bridge 会明确拒绝捕获。
+记录原生计算段数和通信点数；它们不能替代 trace 中的物理 kernel 数。
+并行冷编译默认不导出 post-graph JSON，避免尚未写完的文档阻断编译；
+仅单独诊断时使用 `DSV41_RESIDENT_POST_GRAPH=1`。
 
 
 编译器隔离最小验证工具`tools/check_deepseek_v41_compiler_isolation.py`要求启动前打开诊断用graph-name hash，比较同精度专家完整消费链及冷post-graph。硬件验证已证明两臂recipe不同，且变更输入/专家顺序后的结果精确相同。关闭全部SRAM切分减少节点，却把原有SRAM切片中间权重放到DRAM；小链没有收益，未进入16层。此开关不改变正式服务默认。
