@@ -609,3 +609,12 @@ savings; the1.5×heuristic from the16Kfusion campaign is not used to predict
 this different workload. End-to-end long-request saving is not yet known.
 One fixed official16K EOS request and short arbitrary-length/cache diagnostics
 are pending on the ordinary installed service. No API improvement is claimed yet.
+
+
+### 2026-10-03 shared 64K prefill index bound — component qualified
+
+Parent e9b8b541. Extend existing shared Full/Reindex query partition and native candidate-gather validation from 32768 to 65536 source rows; TPC arithmetic and runtime-sized loading are unchanged. No new communication or native ABI.
+
+`prefill64k-index-chain-06`: modules0/1/4/5, CPU10/15/38/43 with four helpers each, production512Kpage capacity, 1024queries and62464visible rows. Full→Reindex→actual FlashInferMLA consumer, three changing head-shard inputs, ABABAB200. Per-step slowest-rank wall median1356.454539→110.669224ms; device1356.218496→110.542200ms. Difference1245.785315ms exceeds2×baselineIQR16.777981ms. All48outputs exact. First/last A medians1354.849702/1354.690389ms. Other-group startup/CPUpressure overlapped later periods and is archived; absolute times require serving qualification.
+
+This is a long-prefill chain saving. Estimated direction: remove repeated serial Reindex work beyond32K; whole-request magnitude remains unknown because tile/layer scheduling changes. No16Kdecode gain or cumulative ms/token credit. End-to-end and MLA exchange admission are pending; keep this item outside decode totals.

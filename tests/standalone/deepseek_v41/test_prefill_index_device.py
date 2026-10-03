@@ -6,6 +6,18 @@ from test_native_moe import HPU, torch
 from vllm_gaudi.ops.deepseek_v41_math import unpack_fp4
 
 
+def test_candidate_gather_meta_covers_the_shared_key_workspace():
+    from vllm_gaudi.ops.deepseek_v41_prefill_index_scores import SHARED_INDEX_MAX_ROWS
+
+    common = torch.empty(128, SHARED_INDEX_MAX_ROWS, dtype=torch.float32, device="meta")
+    blocks = torch.empty(128, 2048, dtype=torch.int32, device="meta")
+    positions = torch.empty(128, dtype=torch.int32, device="meta")
+    scores, rows = torch.ops.custom_op.custom_deepseek_v41_candidate_gather_f32_gaudi2(
+        common, blocks, positions, 1)
+    assert scores.shape == rows.shape == (128, 16384)
+    assert scores.dtype == torch.float32 and rows.dtype == torch.int32
+
+
 def assert_encoding_equal(actual, expected):
     actual, expected = actual.cpu(), expected.cpu()
     assert torch.equal(actual.isnan(), expected.isnan())

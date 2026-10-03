@@ -33,7 +33,7 @@ def reference(query, weights, packed, table, positions, blocks, ratio):
     return torch.where(selected < limit, selected, -1).int()
 
 
-@pytest.mark.parametrize("ratio,capacity", [(1, 2048), (2, 4096), (1, 32768)])
+@pytest.mark.parametrize("ratio,capacity", [(1, 2048), (2, 4096), (1, 32768), (1, 65536), (2, 65536)])
 @pytest.mark.parametrize("tied", [False, True])
 def test_candidate_slots_causality_and_ties(ratio, capacity, tied):
     torch.manual_seed(793)
@@ -68,7 +68,15 @@ def test_shared_keys_refresh_after_source_write_and_page_rebinding():
     assert torch.equal(after, unpack_fp4(packed[physical], 128, 32))
 
 
-@pytest.mark.parametrize("rows,ratio", [(0, 1), (32769, 1), (512, 4)])
+@pytest.mark.parametrize("rows,ratio", [(0, 1), (65537, 1), (512, 4)])
 def test_workspace_rejects_unbounded_or_unsupported_requests(rows, ratio):
     with pytest.raises(ValueError):
         decode_shared_index_keys(torch.empty(128, 68, dtype=torch.uint8), torch.zeros(1).int(), ratio, rows)
+
+
+@pytest.mark.parametrize("tokens,rows,expected", [(1024, 65536, True), (16384, 65536, True),
+                                               (512, 65536, False), (1024, 65537, False)])
+def test_query_partition_uses_the_same_bounded_key_capacity(tokens, rows, expected):
+    from vllm_gaudi.ops.deepseek_v41_paged_attention import can_partition_prefill_index
+
+    assert can_partition_prefill_index(tokens, rows) is expected

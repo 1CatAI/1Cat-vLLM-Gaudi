@@ -9,7 +9,7 @@ import torch
 from vllm_gaudi.ops.deepseek_v41_math import unpack_fp4
 
 # A transaction-local workspace, never a mirror of the full context cache.
-SHARED_INDEX_MAX_ROWS = 32768
+SHARED_INDEX_MAX_ROWS = 65536
 INDEX_KEY_TILE = 2048
 _index_tp_audit = {
     "full_calls": 0,

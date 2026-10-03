@@ -16,7 +16,7 @@ GlueCodeReturn DeepseekV41CandidateGatherGaudi2::GetGcDefinitions(
     const auto& blocks = p->inputTensors[1].geometry;
     const auto& positions = p->inputTensors[2].geometry;
     if ((ratio != 1 && ratio != 2) || common.dims != 2 || common.dataType != DATA_F32 ||
-        !common.maxSizes[0] || common.maxSizes[0] > 32768 || common.maxSizes[0] % 8 ||
+        !common.maxSizes[0] || common.maxSizes[0] > 65536 || common.maxSizes[0] % 8 ||
         !common.maxSizes[1] || common.maxSizes[1] > 128 || blocks.dims != 2 || blocks.dataType != DATA_I32 ||
         !blocks.maxSizes[0] || blocks.maxSizes[0] > 2048 || blocks.maxSizes[1] != common.maxSizes[1] ||
         positions.dims != 1 || positions.dataType != DATA_I32 || positions.maxSizes[0] != common.maxSizes[1])

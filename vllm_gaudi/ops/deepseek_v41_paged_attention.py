@@ -55,7 +55,9 @@ INDEX_QUERY_TP_MIN_TOKENS = 1024
 
 def can_partition_prefill_index(tokens, source_rows):
     """Use TP query partition only for graph shapes qualified on Gaudi2."""
-    return tokens >= INDEX_QUERY_TP_MIN_TOKENS and 512 < source_rows <= 32768
+    from vllm_gaudi.ops.deepseek_v41_prefill_index_scores import SHARED_INDEX_MAX_ROWS
+
+    return tokens >= INDEX_QUERY_TP_MIN_TOKENS and 512 < source_rows <= SHARED_INDEX_MAX_ROWS
 
 
 def candidate_columns(search_length, ratio, capacity):
