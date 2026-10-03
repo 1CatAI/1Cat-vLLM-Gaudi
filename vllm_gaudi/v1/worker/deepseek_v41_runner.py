@@ -1207,8 +1207,9 @@ class V41ModelRunner:
 
     @torch.inference_mode()
     def _repair_device_sample(self, payload, destination):
-        _, local, controls = payload
-        selected = self._sample_full_local(local, controls, filtered=True)
+        _, local, controls, _ = payload
+        owner = self._device_sampling_owner
+        selected = self._sample_full_local(local, controls, filtered=owner[3] < 1 or owner[4] > 0)
         destination.copy_(selected)
         host, done = self.tp4_token_readback(destination)
         done.synchronize()
@@ -1228,7 +1229,7 @@ class V41ModelRunner:
             if values is not None:
                 self.device_sampling_stats[requests[0].req_id]["bounded_steps"] += 1
                 self._device_sampling_payload = values
-                return values[0][:, :1]
+                return values[3]
             from vllm_gaudi.ops.deepseek_v41_sampling import device_sampling_draw
 
             if not hasattr(self, "device_sampling_draw"):
@@ -2298,10 +2299,11 @@ class V41ModelRunner:
             if payload is not None:
                 host, done = self.tp4_token_readback(payload[0])
                 done.synchronize()
-                covered = int(host[0, 1])
-                if covered not in (0, 1):
-                    raise RuntimeError("Invalid device sampling coverage certificate")
-                token = int(host[0, 0]) if covered else self._repair_device_sample(payload, selected)
+                from vllm_gaudi.ops.deepseek_v41_sampling import unpack_sample_status
+
+                token, covered = unpack_sample_status(host[0].tolist())
+                if not covered:
+                    token = self._repair_device_sample(payload, selected)
                 self._device_sampling_payload = None
             elif self._token_copy is not None:
                 host, done = self._token_copy
@@ -2342,6 +2344,13 @@ class V41ModelRunner:
             self.audit["target_steps"],
         )
         self.state.clear()
+        if (native and tokens == 1 and getattr(self.model.program, "device_sampling", False)
+                and not getattr(self, "_device_sampling_completion_warmed", False)):
+            from types import SimpleNamespace
+
+            request = SimpleNamespace(req_id='__v41_sampling_warmup__', output=[],
+                                      sampling_params=SimpleNamespace(temperature=1., top_p=1., top_k=-1, seed=42))
+            self._prepare_device_sampling_request(request)
         hidden = self._forward(
             "__v41_warmup__",
             [1 + index for index in range(tokens)],
@@ -2418,6 +2427,8 @@ class V41ModelRunner:
                             request = SimpleNamespace(req_id='__v41_sampling_warmup__',
                                                       sampling_params=params, output=[])
                             self._sample_requests(hidden[-1:], (request,))
+                    if native and tokens == 1 and getattr(self.model.program, "device_sampling", False):
+                        self._validate_device_sampling_warmup(hidden[-1:])
         self.pp.drain()
         self.model.complete_step(tokens)
         torch.hpu.synchronize()

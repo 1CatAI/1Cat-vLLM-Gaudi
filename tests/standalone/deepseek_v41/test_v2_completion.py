@@ -63,8 +63,8 @@ def test_sync_sampling_repairs_before_publishing_token(covered):
     runner._v2_async_step = False
     request = SimpleNamespace(req_id="sync", decode_start=1, output=[])
     selected = torch.tensor([[11]], dtype=torch.int32)
-    status = torch.tensor([[11, int(covered)]], dtype=torch.int32)
-    payload = status, torch.zeros(1, 4), torch.zeros(1, 4)
+    status = torch.tensor([[22 + int(covered)]], dtype=torch.int32)
+    payload = status, torch.zeros(1, 4), torch.zeros(1, 4), selected
     runner._device_sampling_payload = payload
     runner.pending = request, 1, 1, 1, False, True, selected
     runner.tp4_token_readback = lambda value: (value, Done())
@@ -535,7 +535,7 @@ def test_device_engram_skips_only_matching_host_layer1(monkeypatch):
 
 def test_covered_sampling_certificate_does_not_repair():
     repaired = []
-    record = CompletionRecord('a', 1, 16, torch.tensor([[31, 1]], dtype=torch.int32), Done(),
+    record = CompletionRecord('a', 1, 16, torch.tensor([[63]], dtype=torch.int32), Done(),
                               torch.tensor([31]), lambda: repaired.append(1))
     assert record.token() == 31
     assert record.token() == 31
@@ -546,7 +546,7 @@ def test_sampling_repair_runs_once_across_two_consumers():
     from concurrent.futures import ThreadPoolExecutor
 
     calls = []
-    record = CompletionRecord('a', 1, 16, torch.tensor([[31, 0]], dtype=torch.int32), Done(),
+    record = CompletionRecord('a', 1, 16, torch.tensor([[62]], dtype=torch.int32), Done(),
                               torch.tensor([31]), lambda: calls.append(1) or 47)
     with ThreadPoolExecutor(2) as pool:
         results = list(pool.map(lambda _: record.token(), range(16)))
@@ -558,3 +558,54 @@ def test_sampling_bad_certificate_is_rejected():
                               torch.tensor([31]), lambda: 47)
     with pytest.raises(RuntimeError, match='certificate'):
         record.token()
+
+
+def test_native_sampling_warmup_exercises_completion_and_same_draw_full_fallback():
+    runner = object.__new__(V41V2ModelRunner)
+    selected = torch.tensor([[31]], dtype=torch.int32)
+    payload = torch.tensor([[62]], dtype=torch.int32), torch.zeros(1, 4), torch.zeros(1, 4), selected
+    runner.model = SimpleNamespace(tp_rank=0, program=SimpleNamespace(
+        replay_owner=SimpleNamespace(sampling_tail_values=lambda hidden: payload)))
+    runner._device_sampling_owner = (123, 'warm', 1., 1., -1, 42)
+    runner.device_sampling_stats = {'warm': {'fallbacks': 0}}
+    calls = []
+
+    def sample():
+        assert runner.pending[-1] is selected
+        assert runner._device_sampling_payload is payload and runner._v2_async_step
+        runner.device_sampling_stats['warm']['fallbacks'] += 1
+        runner._completion = SimpleNamespace(token=lambda: 47)
+        calls.append('completion')
+
+    def full(local, controls, *, filtered):
+        assert local is payload[1] and controls is payload[2] and not filtered
+        calls.append('same-draw-reference')
+        return torch.tensor([[47]], dtype=torch.int32)
+
+    runner._sample_single = sample
+    runner._sample_full_local = full
+    runner.tp4_token_readback = lambda value: (value, Done())
+    runner._validate_device_sampling_warmup(torch.zeros(1, 4))
+    runner._validate_device_sampling_warmup(torch.zeros(1, 4))
+    assert calls == ['completion', 'same-draw-reference']
+    assert runner.pending is None and runner._completion is None and not runner._v2_async_step
+
+
+@pytest.mark.parametrize('top_p,top_k,filtered', [(.95, -1, True), (1., -1, False), (1., 4, True)])
+def test_sampling_repair_retains_original_filter_mode(top_p, top_k, filtered):
+    runner = object.__new__(V41V2ModelRunner)
+    runner._device_sampling_owner = (123, 'repair', 1., top_p, top_k, 42)
+    runner.device_sampling_stats = {'repair': {'fallbacks': 0}}
+    runner.audit = {}
+    local, controls = torch.zeros(1, 4), torch.zeros(1, 4)
+    destination = torch.tensor([[31]], dtype=torch.int32)
+
+    def full(value, params, *, filtered):
+        assert value is local and params is controls
+        assert filtered == (top_p < 1 or top_k > 0)
+        return torch.tensor([[47]], dtype=torch.int32)
+
+    runner._sample_full_local = full
+    runner.tp4_token_readback = lambda value: (value, Done())
+    assert runner._repair_device_sample((torch.zeros(1, 1), local, controls, destination), destination) == 47
+    assert destination.item() == 47 and runner.device_sampling_stats['repair']['fallbacks'] == 1

@@ -66,3 +66,13 @@ def test_greedy_ties_use_global_lowest_id_even_outside_local_topk():
     controls = torch.tensor([[0., .95, .5, -1.]])
     selected, covered = bounded(torch.zeros(1, 64), controls, 4)
     assert covered.item() and selected.item() == 0
+
+
+def test_scalar_completion_wire_preserves_vocabulary_boundary_and_coverage():
+    from vllm_gaudi.ops.deepseek_v41_sampling import pack_sample_status, unpack_sample_status
+
+    for token in (0, 31, 129279):
+        for covered in (False, True):
+            wire = pack_sample_status(torch.tensor([[token]], dtype=torch.int32), torch.tensor([[covered]]))
+            assert wire.dtype == torch.int32 and wire.shape == (1, 1)
+            assert unpack_sample_status(wire[0].tolist()) == (token, covered)

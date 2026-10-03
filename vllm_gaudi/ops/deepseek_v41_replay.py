@@ -378,7 +378,7 @@ class StageReplay:
         values = self._tail_values(hidden)
         if values is None:
             return None
-        return values[0][:, :1] if getattr(self.program(), "device_sampling", False) else values[0]
+        return values[3] if getattr(self.program(), "device_sampling", False) else values[0]
 
     def sampling_tail_values(self, hidden):
         return self._tail_values(hidden) if getattr(self.program(), "device_sampling", False) else None

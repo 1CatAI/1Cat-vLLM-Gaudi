@@ -2018,7 +2018,7 @@ class PreparedGreedyTail(nn.Module):
         local = self._head_projection(hidden)
         if self.device_sampling:
             from vllm_gaudi.ops.deepseek_v41_sampling import (
-                device_sampling_controls, local_nucleus_packet, sample_nucleus_packet)
+                device_sampling_controls, local_nucleus_packet, pack_sample_status, sample_nucleus_packet)
 
             if positions is None:
                 raise ValueError("Replay sampling requires its fixed device position")
@@ -2029,8 +2029,7 @@ class PreparedGreedyTail(nn.Module):
             packet = self.all_gather(local_nucleus_packet(local, controls, self.tp_rank, 128), dim=-1)
             tp_size = packet.shape[-1] // (3 + 2 * 128)
             selected, covered = sample_nucleus_packet(packet, controls, tp_size=tp_size, width=128)
-            status = torch.cat((selected, covered.to(torch.int32)), -1)
-            return status, local, controls
+            return pack_sample_status(selected, covered), local, controls, selected
         candidates = self.all_gather(local_greedy_candidate(local, self.tp_rank), dim=-1)
         return select_greedy_candidate(candidates).to(torch.int32), local
 

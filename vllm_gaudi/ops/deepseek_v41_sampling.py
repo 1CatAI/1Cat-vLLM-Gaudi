@@ -61,6 +61,17 @@ def commit_sampled_token(selected, record):
     return record
 
 
+def pack_sample_status(selected, covered):
+    """One C1 integer for the established native token-copy ABI."""
+    return selected * 2 + covered.to(torch.int32)
+
+
+def unpack_sample_status(values):
+    if len(values) != 1 or values[0] < 0:
+        raise RuntimeError("Invalid bounded-sampling completion certificate")
+    return int(values[0]) // 2, bool(int(values[0]) & 1)
+
+
 def local_nucleus_packet(logits, controls, tp_rank, width):
     """Keep the full local partition function, exchanging only bounded candidates."""
     scaled = logits.float() / controls[:, :1].clamp_min(1e-5)

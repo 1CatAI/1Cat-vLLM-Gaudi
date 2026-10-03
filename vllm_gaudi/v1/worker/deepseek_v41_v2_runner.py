@@ -59,10 +59,10 @@ class CompletionRecord:
                     self.done.synchronize()
                     values = self.host[0].tolist()
                 if self.fallback is not None:
-                    if len(values) != 2 or values[1] not in (0, 1):
-                        raise RuntimeError("Invalid bounded-sampling completion certificate")
-                    if not values[1]:
-                        values[0] = self.fallback()
+                    from vllm_gaudi.ops.deepseek_v41_sampling import unpack_sample_status
+
+                    token, covered = unpack_sample_status(values)
+                    values = [token if covered else self.fallback()]
                 elif len(values) != 1:
                     raise RuntimeError("Invalid V2 PP token completion")
                 if values[0] < 0:
@@ -389,3 +389,40 @@ class V41V2ModelRunner(V41ModelRunner):
         self.pending = self.draft_token_ids = self._token_copy = None
         self.audit["v2_async_completions"] = self.audit.get("v2_async_completions", 0) + 1
         return V41AsyncOutput(record) if self.pp.group.is_last_rank else None
+
+    def _validate_device_sampling_warmup(self, hidden):
+        """Exercise the actual scalar copy, four-worker repair and completion owner."""
+        if getattr(self, "_device_sampling_completion_warmed", False):
+            return
+        from types import SimpleNamespace
+
+        payload = self.model.program.replay_owner.sampling_tail_values(hidden)
+        if payload is None:
+            raise RuntimeError("Device sampling warmup did not retain its native tail outputs")
+        owner = self._device_sampling_owner
+        # The startup sampler leaves the unfiltered request parameters active.
+        # This guarantees the candidate certificate requests the full fallback.
+        if owner[2:5] != (1., 1., -1):
+            raise RuntimeError("Device sampling fallback warmup requires unfiltered startup controls")
+        previous = self.device_sampling_stats[owner[1]]["fallbacks"]
+        request = SimpleNamespace(req_id=owner[1], decode_start=0)
+        self.pending = request, 0, 1, 1, False, True, payload[3]
+        self._device_sampling_payload = payload
+        self._v2_async_step = True
+        try:
+            self._sample_single()
+            result = self._completion.token()
+            if self.device_sampling_stats[owner[1]]["fallbacks"] != previous + 1:
+                raise RuntimeError("Device sampling warmup did not exercise the complete fallback")
+            expected = self._sample_full_local(payload[1], payload[2], filtered=False)
+            host, done = self.tp4_token_readback(expected)
+            done.synchronize()
+            if int(host[0, 0]) != result:
+                raise RuntimeError("Device sampling fallback changed the startup inverse-CDF result")
+        finally:
+            self._v2_async_step = False
+            self._completion = None
+            self._device_sampling_payload = None
+            self.pending = None
+        self._device_sampling_completion_warmed = True
+        logger.info("V4.1 TP%d device sampling scalar completion and full fallback warmup passed", self.model.tp_rank)
