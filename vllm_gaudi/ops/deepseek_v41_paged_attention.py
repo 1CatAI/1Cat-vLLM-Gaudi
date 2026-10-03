@@ -1557,11 +1557,9 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
     def _prefill_attention(self, value, qr, query, kv, positions, ready_outputs=(), prefill_sequence=False):
         """Run one configured prefill transaction with large-M operators.
 
-        As in upstream V4.1 sparse prefill, prompt KV lives in a flat workspace
-        and each query carries causal indices into it. For the common <=64K
-        prefix, decode the small compressed main cache once and submit one MLA
-        operation per layer. A bounded selected-row implementation remains for
-        the rest of the 1M contract.
+        Each query carries causal logical KV indices. Reuse a flat decoded
+        source while it fits the temporary workspace; otherwise load selected
+        paged rows inside bounded tiles of the same query-owner MLA chain.
         """
         if positions.numel() > self.shared.prefill_tokens:
             raise ValueError(f"V4.1 prefill transaction exceeds C{self.shared.prefill_tokens}")
@@ -1613,7 +1611,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 destination / f"layer2-start{first_position}-pid{os.getpid()}.pt",
             )
         boundary("selection")
-        # Both the flat-cache path and its bounded long-prefix fallback use
+        # Both the flat workspace and the bounded selected-paged consumer use
         # the same normalized chronological KV producer. Save its boundary
         # rows before either path commits the final sliding-window tail.
         capture = getattr(getattr(self, "shared", None), "inline_prefix_capture", None)

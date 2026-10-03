@@ -202,8 +202,8 @@ def runtime_search_length(start, count, maximum):
     if start + count <= hot:
         return hot
     # Both TP geometries reuse the bounded derived key cache and MME scorer.
-    # Beyond the mirror, retain the packed scorer but bound its work by a
-    # geometric visible-prefix bucket, rather than the configured capacity.
+    # Geometric buckets bound visible work and finite replay geometries.
+    # Configured-capacity mirrors serve long buckets in native source windows.
     bounded = min(maximum, 32768)
     if start + count <= bounded:
         return bounded
@@ -213,17 +213,15 @@ def runtime_search_length(start, count, maximum):
 def prefill_search_length(start, count, maximum, *, reuse_index_keys=False):
     """Use a bounded shared-key geometry without changing decode capture.
 
-    The hot geometry is shared with decode. Beyond it, the two complete
-    prompt geometries retain the qualified decoder-halo MLA admission and
-    bounded shared-key workspace. Longer prefixes retain the capacity-
-    independent path. Query positions still mask every future row.
+    The hot geometry is shared with decode. Complete prompt geometries avoid
+    scoring unused source rows; longer buckets use the same bounded source
+    windows. Query positions still mask every future row.
     """
     search = runtime_search_length(start, count, maximum)
     if reuse_index_keys and INDEX_MME_HOT_TOKENS < start + count <= 32768:
-        # A complete 16K prompt leaves 4K halo queries in the last decoder
-        # layers. Padding its search to 32K rejects the existing query-owned
-        # MLA path and also scans unused source tiles. Decode keeps its own
-        # fixed 32K geometry; prompt admission depends on this transaction.
+        # Complete prompt buckets avoid scanning unused source tiles while
+        # decode retains its separately captured geometry. These are work
+        # bounds, not admission cutoffs for the shared attention algorithm.
         return min(maximum, 16384 if start + count <= 16384 else 32768)
     if not reuse_index_keys and start + count > INDEX_MME_HOT_TOKENS:
         return maximum
