@@ -119,6 +119,12 @@ def main():
     args, extra = parser.parse_known_args()
     root = args.installation.resolve()
     settings = json.loads((root / "settings.json").read_text())
+    compiler_temp = settings.get("environment", {}).get("TMPDIR")
+    if compiler_temp:
+        # A configured tmpfs scratch directory must be recreated after reboot.
+        temporary_path = Path(compiler_temp).expanduser()
+        compiler_temp = str((temporary_path if temporary_path.is_absolute() else root / temporary_path).resolve())
+        Path(compiler_temp).mkdir(mode=0o700, parents=True, exist_ok=True)
     allocation = settings["cpu_allocation"]
     reserved = set(allocation["worker_main"] + allocation["engine_main"] + allocation["api_main"] +
                    allocation["control_helpers"])
@@ -131,6 +137,8 @@ def main():
     isolated = isolate_desktop(reserved) if settings.get("isolate_user_processes", False) else []
     atomic_json(log_dir / "background-affinity.json", isolated)
     environment = dict(os.environ)
+    if compiler_temp:
+        environment["TMPDIR"] = compiler_temp
     for key in list(environment):
         if key.startswith(("VLLM_HPU_DSV", "VLLM_HPU_TP2", "DSV41_")) or key in ("PYTHONPATH", "LD_PRELOAD"):
             environment.pop(key)
