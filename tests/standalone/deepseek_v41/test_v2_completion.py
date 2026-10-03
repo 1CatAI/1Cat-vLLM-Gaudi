@@ -694,8 +694,8 @@ def test_native_sampling_warmup_exercises_completion_and_same_draw_full_fallback
         calls.append('completion')
 
     def full(local, controls, *, filtered):
-        assert local is payload[1] and controls is payload[2] and not filtered
-        calls.append('same-draw-reference')
+        assert local is payload[1] and controls is payload[2]
+        calls.append('filtered-native-repair' if filtered else 'same-draw-reference')
         return torch.tensor([[47]], dtype=torch.int32)
 
     runner._sample_single = sample
@@ -703,7 +703,7 @@ def test_native_sampling_warmup_exercises_completion_and_same_draw_full_fallback
     runner.tp4_token_readback = lambda value: (value, Done())
     runner._validate_device_sampling_warmup(torch.zeros(1, 4))
     runner._validate_device_sampling_warmup(torch.zeros(1, 4))
-    assert calls == ['completion', 'same-draw-reference']
+    assert calls == ['completion', 'same-draw-reference', 'filtered-native-repair']
     assert runner.pending is None and runner._completion is None and not runner._v2_async_step
 
 

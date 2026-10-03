@@ -462,6 +462,14 @@ class V41V2ModelRunner(V41ModelRunner):
             done.synchronize()
             if int(host[0, 0]) != result:
                 raise RuntimeError("Device sampling fallback changed the startup inverse-CDF result")
+            # The forced top_p=1 certificate warms the unfiltered repair.
+            # A real nucleus miss also needs the filtered recipe with these
+            # actual native-tail tensor layouts and the destination copy.
+            # Discard this synthetic draw with the rest of startup state.
+            filtered = self._sample_full_local(payload[1], payload[2], filtered=True)
+            payload[3].copy_(filtered)
+            host, done = self.tp4_token_readback(payload[3])
+            done.synchronize()
         finally:
             self._v2_async_step = False
             self._completion = None

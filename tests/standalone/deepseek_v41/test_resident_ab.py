@@ -240,3 +240,18 @@ def test_mirror_observer_records_keys_without_mutation_and_masks_incomplete_pair
     assert torch.equal(record['hidden'], hidden) and torch.equal(record['indices']['2'], selection.indices)
     record['hidden'].zero_()
     assert hidden.count_nonzero() > 0
+# A Python compilation count alone misses per-storage-offset GC recipes.
+def test_recipe_count_includes_deferred_position_copy_variants(tmp_path):
+    from tools.deepseek_v41_resident_ab import recipe_cache_count
+
+    root = tmp_path / 'rank2'
+    root.mkdir()
+    environment = {'PT_HPU_RECIPE_CACHE_CONFIG': str(tmp_path / 'rank{rank}') + ',false,8192',
+                   'LOCAL_RANK': '2'}
+    assert recipe_cache_count(environment) == 0
+    (root / 'first.recipe').write_bytes(b'first position')
+    (root / 'first.metadata').write_bytes(b'ignored')
+    assert recipe_cache_count(environment) == 1
+    (root / 'second.recipe').write_bytes(b'next position')
+    assert recipe_cache_count(environment) == 2
+    assert recipe_cache_count({}) == 0

@@ -25,6 +25,16 @@ COMPILER_CANDIDATES = {
 }
 
 
+def recipe_cache_count(environment=None):
+    """Include Bridge's deferred recipe variants in the cold/timed gate."""
+    environment = os.environ if environment is None else environment
+    configured = environment.get('PT_HPU_RECIPE_CACHE_CONFIG', '')
+    if not configured:
+        return 0
+    directory = configured.split(',', 1)[0].format(rank=environment.get('LOCAL_RANK', '0'))
+    return sum(1 for _ in Path(directory).glob('*.recipe'))
+
+
 @contextmanager
 def compiler_settings(settings, library=None):
     """Supported Synapse settings apply only to cold candidate compilation.

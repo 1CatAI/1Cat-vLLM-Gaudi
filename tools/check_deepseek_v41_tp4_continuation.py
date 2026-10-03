@@ -712,11 +712,13 @@ def main():
                 return fingerprints
 
             def preparation_counts():
+                from tools.deepseek_v41_resident_ab import recipe_cache_count
+
                 if args.shared_stage_replay:
                     from vllm_gaudi.ops.tp2_prepared_plan import prepared_group_stats
                     stats = prepared_group_stats()
-                    return [stats['prepares'], stats['native_captures']]
-                return [chunk.preparations for chunk in decoder.chunks]
+                    return [stats['prepares'], stats['native_captures'], recipe_cache_count()]
+                return [chunk.preparations for chunk in decoder.chunks] + [recipe_cache_count()]
 
             if args.resident_ab:
                 if __package__:
