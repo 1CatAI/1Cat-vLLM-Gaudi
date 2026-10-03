@@ -264,7 +264,8 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
     if rank == 0:
         ready = dict(pid=os.getpid(), source=os.environ['DSV41_RUN_EVIDENCE'],
                      candidates=['dense_fp8', 'tail', 'dense_fp8_tail', 'dense_fp8_static_int32',
-                                 'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff', 'long_index_packed', 'long_index_mme', *COMPILER_CANDIDATES])
+                                 'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff',
+                                 'long_index_packed', 'long_index_mme', *COMPILER_CANDIDATES])
         (control / 'ready.json').write_text(json.dumps(ready, indent=2)+'\n')
     print(f'TP{rank}: real16 fixture resident; control {control}', flush=True)
     try:
@@ -304,6 +305,59 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                 deadline.daemon = True
                 deadline.start()
             wait_for_loading(directory, rank, dist)
+            if job.get('reference_result'):
+                saved_path = Path(job['reference_result'])
+                saved = json.loads(saved_path.read_text())
+                saved_periods = json.loads((saved_path.parent / saved['periods_file']).read_text())
+                label = job.get('reference_arm', 'B')
+                saved_periods = [p for p in saved_periods if p['arm'] == label]
+                if saved['status'] != 'completed' or saved['context_tokens'] != args.context_tokens:
+                    raise ValueError('Saved reference must match the complete continuation context')
+                if saved['steps'] != steps or not saved_periods:
+                    raise ValueError('Saved reference must match the measured step count')
+                expected = saved_periods[0]['ranks'][rank]['tokens']
+                assert all(p['ranks'][rank]['tokens'] == expected for p in saved_periods)
+                candidate = arm(name)
+                counts = preparation_counts()
+                periods = []
+                for _ in range(3):
+                    wait_for_loading(directory, rank, dist)
+                    dist.barrier()
+                    tokens, host_ms, device_ms = chain(True, steps, engine=candidate, warm_steps=32)
+                    assert counts == preparation_counts(), 'Hot recompilation invalidates candidate timing'
+                    local = dict(rank=rank, tokens=tokens, delivery_ns=report['token_delivery_ns'],
+                                 host_ms=host_ms, device_ms=device_ms,
+                                 checked_first_device_position=report.get('checked_first_device_position'))
+                    ranks = [None] * dist.get_world_size()
+                    dist.all_gather_object(ranks, local)
+                    assert all(row['tokens'] == tokens for row in ranks), 'Ranks disagree on tokens'
+                    assert tokens == expected, 'Candidate differs from saved feedback tokens'
+                    if rank == 0:
+                        delivery = [max(row['delivery_ns'][i] for row in ranks) for i in range(steps + 1)]
+                        intervals = [(b - a) / 1e6 for a, b in zip(delivery, delivery[1:])]
+                        periods.append(dict(arm='B', ranks=ranks, token_intervals_ms=intervals,
+                                            summary=summarize(intervals)))
+                        (directory / 'periods.json').write_text(json.dumps(periods, indent=2) + '\n')
+                if rank == 0:
+                    old = summarize(v for p in saved_periods for v in p['token_intervals_ms'])
+                    new = summarize(v for p in periods for v in p['token_intervals_ms'])
+                    delta = old['median_ms'] - new['median_ms']
+                    result = dict(status='completed', candidate=name, steps=steps, context_tokens=args.context_tokens,
+                                  reference_result=str(saved_path), reference_arm=label, baseline_measured=False,
+                                  comparison=dict(baseline=old, candidate=new, saving_ms=delta,
+                                                  validity_threshold_ms=2 * old['iqr_ms'],
+                                                  effective=delta > 2 * old['iqr_ms'], formal_gain_credit=False),
+                                  no_profiler=True, no_hot_compilation=True, feedback_tokens_exact=True,
+                                  checked_first_device_positions=[row['checked_first_device_position']
+                                                                  for row in ranks],
+                                  graphs=[graph_info(candidate)], periods_file='periods.json',
+                                  formal_quality_pending=True)
+                    (directory / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
+                    Path(job['request_path']).rename(Path(job['request_path']).with_suffix('.consumed'))
+                    print(json.dumps(result), flush=True)
+                    deadline.cancel()
+                    deadline = None
+                continue
             reference_name = job.get('baseline', 'baseline')
             reference = arm(reference_name)
             candidate = arm(name)
@@ -385,10 +439,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--control-dir', type=Path, required=True)
     parser.add_argument('--candidate', choices=('dense_fp8', 'tail', 'dense_fp8_tail',
-                                              'dense_fp8_static_int32', 'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff', 'long_index_packed', 'long_index_mme', *COMPILER_CANDIDATES))
+                                              'dense_fp8_static_int32', 'dense_fp8_swa_packed',
+                                              'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff',
+                                              'long_index_packed', 'long_index_mme', *COMPILER_CANDIDATES))
     parser.add_argument('--baseline', choices=('baseline', 'dense_fp8', 'dense_fp8_swa_packed',
                                                'dense_fp8_swa_norm_quant', 'long_index_packed'), default='baseline')
     parser.add_argument('--steps', type=int, default=200)
+    parser.add_argument('--reference-result', type=Path,
+                        help='Reuse saved matching-context timing and feedback tokens; time only the candidate')
+    parser.add_argument('--reference-arm', choices=('A', 'B'), default='B')
     parser.add_argument('--stop', action='store_true')
     args = parser.parse_args()
     if not args.stop and not args.candidate:
@@ -399,6 +458,8 @@ def main():
     job_id = f'{time.time_ns()}-{uuid.uuid4().hex[:8]}'
     job = dict(id=job_id, command='stop' if args.stop else 'measure', candidate=args.candidate,
                baseline=args.baseline, steps=args.steps)
+    if args.reference_result:
+        job.update(reference_result=str(args.reference_result.resolve()), reference_arm=args.reference_arm)
     target = args.control_dir / f'{job_id}.request.json'
     temporary = target.with_suffix('.tmp')
     temporary.write_text(json.dumps(job, indent=2)+'\n')

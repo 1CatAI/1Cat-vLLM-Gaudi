@@ -245,7 +245,10 @@ def decode_search_warmups(maximum, *, runtime_indexer=False):
                 yield start, bounded
             while bounded < maximum:
                 search = runtime_search_length(bounded, 1, maximum)
-                yield bounded, search
+                from vllm_gaudi.ops.deepseek_v41_config import decode_source_window_quantum
+
+                for start in range(bounded, search, decode_source_window_quantum(search)):
+                    yield start, search
                 bounded = search
         return
     start = 0
@@ -1268,7 +1271,8 @@ class V41ModelRunner:
 
     @property
     def request_slots_enabled(self):
-        return getattr(self, "request_batches", None) is not None or getattr(self, "prefix_checkpoints", None) is not None
+        return (getattr(self, "request_batches", None) is not None
+                or getattr(self, "prefix_checkpoints", None) is not None)
 
     def _bind_request(self, request):
         if self.request_slots_enabled:

@@ -636,3 +636,28 @@ This is a long-prefill component improvement, separate from the preceding Full/R
 Changed-boundary80token diagnostics:41983prefill9.104279s (4611.348tps),decode12.539508ms;62463prefill11.803032s (5292.115tps),decode12.738289ms. Prior04 same-input engine times52.733681/75.946818s were substantially higher; competing-load conditions differed, so retain both records without a pure isolated end-to-end attribution. These close the64Kprefill component entries as service-observed improvements, outside16Kdecode cumulative totals. Larger-than64Kshared prefill still falls back and is unqualified for speed.
 
 Short1024cold official diagnostic:prefill1.728926s,decode10.527486ms,TTFT1.765307s. Cachehit896rows:prefill1.125010s,decode10.257645ms,TTFT1.148419s. Initial short decode regression is removed after startup handoff-reader warmup. Cachetrajectories are coherent but token-exactness remains unproven;80token diagnostics are not naturalEOS quality acceptance. Public adapter restored to independently installed branch source;main unchanged andPR57draft. Remaining~2mslongdecode gap and short-request fixed prefill latency stay open. Static mirror/direct-score32Kbound is recorded outside gain totals pending measurement.
+
+
+### 2026-10-03 bounded source windows beyond the former prefill cutoff — component qualified
+
+Parent8e92e25d, source patch archived in `prefill-windowed-index-chain-01`. Full query partition no longer stops at65536source rows; Reindex uses transaction-local65536-row key windows and bounded1024-query candidate workspaces. Restore scores into original candidate slots before sequential TopK merges; duplicate IDs, cutoff ties and causal masks remain unchanged.
+
+Modules2/3/6/7, CPU20/25/48/53 plus disjoint helpers, production512Kpage capacity,1024queries,131072source rows,82944visible rows. ABABAB200, three changing inputs, actual Full→Reindex→MLA consumer. Slowest-rank wall median1490.352746→229.049167ms, saving1261.303579ms;2×baselineIQR42.908518ms. All48outputs exact. Early periods overlap existing public prefill on0/1/4/5; HBM oscillates rather than monotonically loading, PSI and protected affinities archived.
+
+Long-prefill component only, no16Kdecode cumulative credit or whole-request estimate. Paged selected-KV query-owner MLA and configured-capacity decode mirrors are still separate pending component gates. Public inference remainsb7553683 until combined normal-service qualification. Final CPU suite1044passed111skipped; native ABI unchanged.
+
+
+### 2026-10-03 query-owner MLA with bounded paged KV loading — component qualified
+
+`prefill-paged-mla-chain-01`, same2/3/6/7 and20/25/48/53,4096queries,131072source rows,512Kpage capacity,ratio1. The previous flat-cache budget switched to replicated selected-row gather/generic FP4 decode before MLA. Feed logical selected IDs into the existing sequence exchange instead, decode only the owner’s selected rows inside each128-query MLA recipe, and preserve complete640-column softmax/PV. No new communication or native ABI.
+
+ABABAB200, three changing head shards, actual paged load/decode/MLA consumer in both arms. Maximum-rank wall1129.703831→15.171890ms, saving1114.531941ms exceeds2×IQR5.465538ms;12consumer outputs exact. Source and competing load recorded. Largest query stride/ratio2 and ordinary combined serving remain pending. This is a long-prefill gain, independent of the preceding index chain’s unchanged MLA consumer; do not sum either into16Kdecode or an estimated request-level number.
+
+
+### 2026-10-03 configured-capacity decode index mirror — component qualified, real16 pending
+
+Native32Kcap is a per-score workspace bound, not a context cutoff. Keep canonical packed pages authoritative, derive index keys for the configured capacity, restore reachable source windows at owner/prefill transitions, maintain only newly written rows during decode, and stream Full scores through the existing native MME epilogue. Prefix pruning and its finite warmup geometries now cover long searches. Extra resident index-key storage for512K is approximately300MiB/card versus the old20MiB; this is static accounting, not serving peak-memory acceptance.
+
+`long-index-mirror-chain-06`: actual native model-entry replay of peer query/weight exchange, canonical/main/mirror writes,Full/Reindex and publish/reuse MLA.2/3/6/7,20/25/48/53,source82944/search131072/capacity512K,ABABAB200,three immutable changing banks. Ratio1 wall2.415673→1.233708ms,delta1.181965,gate0.178182; ratio2 wall1.664854→1.084340ms,delta0.580514,gate0.279144. All96outputs exact.01/03 host-entry measurements were not representative and ratio2 stayed below their IQR gates;02/04/05 failed cold harness capability/binding contracts and collected no timings. They remain outside all credit.
+
+Real16candidate-only measurement against the archived matching42Kchain is pending. No16Kdecode cumulative credit and no whole-model prediction for the different long-context layer mix. Public inference unchanged.

@@ -6,11 +6,17 @@ from vllm_gaudi import envs
 
 def decode_source_prefix_bound(token_end, search_length, tensor_parallel_size, *, runtime_indexer=False):
     """Bound contiguous Full-source work without reading device positions."""
-    if tensor_parallel_size < 2 or search_length > 32768:
+    if tensor_parallel_size < 2:
         return None
     if not 0 < token_end <= search_length:
         raise ValueError("Decode visible prefix is outside the search bucket")
-    return min(search_length, ((token_end + 4095) // 4096) * 4096)
+    quantum = decode_source_window_quantum(search_length)
+    return min(search_length, ((token_end + quantum - 1) // quantum) * quantum)
+
+
+def decode_source_window_quantum(search_length):
+    """Bound replay variants while keeping every prefix on the same scorer."""
+    return min(32768, max(4096, search_length // 8))
 
 
 def is_v41(config):

@@ -11,6 +11,7 @@ from vllm_gaudi.ops.deepseek_v41_math import unpack_fp4
 # A transaction-local workspace, never a mirror of the full context cache.
 SHARED_INDEX_MAX_ROWS = 65536
 INDEX_KEY_TILE = 2048
+REINDEX_QUERY_WORKSPACE = 1024
 _index_tp_audit = {
     "full_calls": 0,
     "reindex_calls": 0,
@@ -201,10 +202,12 @@ def tp_full_prefill_index_selection(
     """
     tokens = positions.numel()
     if (
-        not 0 <= tp_rank < tensor_parallel_size
+        tensor_parallel_size not in (2, 4)
+        or ratio not in (1, 2)
+        or not 0 <= tp_rank < tensor_parallel_size
         or tokens < 1
         or positions.shape != (tokens,)
-        or not 512 <= source_rows <= SHARED_INDEX_MAX_ROWS
+        or not 512 <= source_rows <= table.numel() * (128 // ratio)
     ):
         raise ValueError("Index query partition requires TP2/TP4 and a complete query interval")
     local_tokens = (tokens + tensor_parallel_size - 1) // tensor_parallel_size
@@ -260,6 +263,11 @@ def prefill_reindex_selection(
     tensor_parallel_size=2,
 ):
     """Evaluate a row interval with the production bounded Reindex recipes."""
+    if source_rows > SHARED_INDEX_MAX_ROWS:
+        return windowed_prefill_reindex_selection(
+            query, weights, packed, table, positions, blocks, ratio, source_rows,
+            native_gather, native_scores, tensor_parallel_size,
+        )
     signature = (tuple(packed.shape), tuple(table.shape), ratio, source_rows)
     keys = compiled_decode_shared_index_keys(signature)(packed, table, ratio, source_rows)
     from vllm_gaudi import envs
@@ -324,7 +332,9 @@ def tp_prefill_reindex_selection(
     """Split independent candidate-slot selection and gather only final IDs."""
     tokens = positions.numel()
     if (
-        not 0 <= tp_rank < tensor_parallel_size
+        tensor_parallel_size not in (2, 4)
+        or ratio not in (1, 2)
+        or not 0 <= tp_rank < tensor_parallel_size
         or tokens < 1
         or positions.shape != (tokens,)
         or blocks.shape[0] != tokens
@@ -370,7 +380,7 @@ def tp_prefill_reindex_selection(
         return all_gather(selected.contiguous(), 0)[:tokens]
 
 
-def decode_shared_index_keys(packed, table, ratio, source_rows):
+def decode_shared_index_keys(packed, table, ratio, source_rows, source_start=0):
     """Decode a bounded paged prefix once for all queries in this transaction.
 
     Call after the source's cache write. The result belongs to this invocation:
@@ -378,9 +388,13 @@ def decode_shared_index_keys(packed, table, ratio, source_rows):
     """
     if not 1 <= source_rows <= SHARED_INDEX_MAX_ROWS or ratio not in (1, 2):
         raise ValueError("Shared prefill index keys exceed the bounded workspace")
+    if source_start < 0 or source_start + source_rows > table.numel() * (128 // ratio):
+        raise ValueError("Shared prefill index window exceeds its paged source")
     pieces = []
-    for start in range(0, source_rows, INDEX_KEY_TILE):
-        rows = torch.arange(start, min(start + INDEX_KEY_TILE, source_rows), device=packed.device, dtype=torch.int32)
+    for offset in range(0, source_rows, INDEX_KEY_TILE):
+        start = source_start + offset
+        rows = torch.arange(start, min(start + INDEX_KEY_TILE, source_start + source_rows),
+                            device=packed.device, dtype=torch.int32)
         if packed.device.type == "hpu":
             keys = torch.ops.custom_op.custom_deepseek_v41_index_keys_gaudi2(packed, table, rows.reshape(1, -1), ratio)[
                 0
@@ -423,7 +437,13 @@ def decoded_reindex(
     source_rows = keys.shape[0]
     if not 1 <= source_rows <= SHARED_INDEX_MAX_ROWS or not 1 <= query.shape[0] <= 128:
         raise ValueError("Shared Reindex requires bounded query and source tiles")
+    common = _decoded_source_scores(query, weights, keys, positions, ratio, local_heads, native_scores)
+    return _candidate_slot_topk(common, positions, blocks, ratio, native_gather)
+
+
+def _decoded_source_scores(query, weights, keys, positions, ratio, local_heads, native_scores, source_start=0):
     common = []
+    source_rows = keys.shape[0]
     for start in range(0, source_rows, INDEX_KEY_TILE):
         current = keys[start : start + INDEX_KEY_TILE]
         count = current.shape[0]
@@ -433,15 +453,104 @@ def decoded_reindex(
         if native_scores:
             if local_heads not in (8, 16) or query.shape[1:] != (32, 128):
                 raise ValueError("Native Reindex scoring requires the TP2/TP4 head contract")
-            rows = torch.arange(start, start + current.shape[0], device=query.device, dtype=torch.int32)
+            rows = torch.arange(source_start + start, source_start + start + current.shape[0],
+                                device=query.device, dtype=torch.int32)
             scores = torch.ops.custom_op.custom_deepseek_v41_prefill_index_scores_gaudi2(
                 query, weights, current, positions, rows, ratio, local_heads
             )
         else:
             scores = _weighted_index_scores(query, weights, current, local_heads, True)
         common.append(scores[:, :count])
-    common = torch.cat(common, -1)
-    return _candidate_slot_topk(common, positions, blocks, ratio, native_gather)
+    return torch.cat(common, -1)
+
+
+def reindex_window_scores(query, weights, keys, positions, blocks, ratio, local_heads,
+                         native_gather, native_scores, source_start):
+    """Score a bounded source window into the original global candidate slots."""
+    if source_start < 0 or source_start % 8 or not 1 <= keys.shape[0] <= SHARED_INDEX_MAX_ROWS:
+        raise ValueError("Reindex source window must be block aligned and bounded")
+    common = _decoded_source_scores(query, weights, keys, positions, ratio, local_heads,
+                                    native_scores, source_start)
+    local_blocks = blocks - source_start // 8
+    if native_gather:
+        scores, _ = torch.ops.custom_op.custom_deepseek_v41_candidate_gather_f32_gaudi2(
+            common, local_blocks.contiguous(), positions - source_start * ratio, ratio
+        )
+        return scores
+    rows = local_blocks[..., None] * 8 + torch.arange(8, device=query.device, dtype=torch.int32)
+    rows = rows.flatten(1)
+    count = ((positions + 1) // ratio - source_start)[:, None]
+    valid = (blocks[..., None] >= 0).expand(-1, -1, 8).flatten(1)
+    valid = valid & (rows >= 0) & (rows < keys.shape[0]) & (rows < count)
+    return common.gather(1, rows.clamp(0, keys.shape[0] - 1).long()).masked_fill(~valid, -torch.inf)
+
+
+def select_reindex_slots(scores, positions, blocks, ratio, source_rows):
+    """Merge only after restoring slot order, retaining duplicate and tied IDs."""
+    rows = blocks[..., None] * 8 + torch.arange(8, device=scores.device, dtype=torch.int32)
+    rows = torch.where(blocks[..., None] >= 0, rows, -1).flatten(1)
+    best_values = best_rows = None
+    for start in range(0, rows.shape[-1], INDEX_KEY_TILE):
+        best_values, best_rows = prefill_merge_topk(
+            best_values, best_rows, scores[:, start:start + INDEX_KEY_TILE],
+            rows[:, start:start + INDEX_KEY_TILE], 512,
+        )
+    count = ((positions + 1) // ratio)[:, None]
+    selected = torch.where((best_rows >= 0) & (best_rows < count) & (best_rows < source_rows),
+                           best_rows, source_rows).sort(-1).values
+    return torch.where(selected < source_rows, selected, -1).int()
+
+
+def windowed_prefill_reindex_selection(query, weights, packed, table, positions, blocks, ratio, source_rows,
+                                      native_gather=True, native_scores=True, tensor_parallel_size=2):
+    """Keep source and candidate workspaces bounded independently of context.
+
+    Decode each source window once per query workspace, then restore scores
+    to candidate slots before selection. Windows have disjoint logical IDs;
+    maximum combines their masked scores without altering floating arithmetic.
+    Keys and scores are invocation-local and never survive a producer write.
+    """
+    if ratio not in (1, 2) or not 1 <= source_rows <= table.numel() * (128 // ratio):
+        raise ValueError("Reindex prefix exceeds its paged source")
+    outputs = []
+    for batch in range(0, query.shape[0], REINDEX_QUERY_WORKSPACE):
+        stop = min(batch + REINDEX_QUERY_WORKSPACE, query.shape[0])
+        tiles = [(query[start:min(start + 128, stop)].clone(),
+                  weights[start:min(start + 128, stop)].clone(),
+                  positions[start:min(start + 128, stop)].clone(),
+                  blocks[start:min(start + 128, stop)].clone()) for start in range(batch, stop, 128)]
+        accumulated = [None] * len(tiles)
+        for source_start in range(0, source_rows, SHARED_INDEX_MAX_ROWS):
+            length = min(SHARED_INDEX_MAX_ROWS, source_rows - source_start)
+            signature = (tuple(packed.shape), tuple(table.shape), ratio, length, source_start)
+            keys = compiled_decode_shared_index_keys(signature)(packed, table, ratio, length, source_start)
+            for index, (q, w, p, b) in enumerate(tiles):
+                signature = (tuple(q.shape), tuple(b.shape), length, ratio, 32 // tensor_parallel_size,
+                             native_gather, native_scores, source_start)
+                scores = compiled_reindex_window_scores(signature)(
+                    q, w, keys, p, b, ratio, 32 // tensor_parallel_size,
+                    native_gather, native_scores, source_start,
+                )
+                previous = accumulated[index]
+                accumulated[index] = scores if previous is None else torch.maximum(previous, scores)
+        for scores, (_, _, p, b) in zip(accumulated, tiles, strict=True):
+            signature = (tuple(scores.shape), ratio, source_rows)
+            outputs.append(compiled_select_reindex_slots(signature)(scores, p, b, ratio, source_rows))
+    return torch.cat(outputs, 0)
+
+
+@lru_cache(maxsize=64)
+def compiled_reindex_window_scores(signature):
+    entry = FunctionType(reindex_window_scores.__code__.replace(co_name=f"reindex_window_{signature}"),
+                         reindex_window_scores.__globals__)
+    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+
+
+@lru_cache(maxsize=64)
+def compiled_select_reindex_slots(signature):
+    entry = FunctionType(select_reindex_slots.__code__.replace(co_name=f"reindex_slots_{signature}"),
+                         select_reindex_slots.__globals__)
+    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
 
 
 def _candidate_slot_topk(common, positions, blocks, ratio, native_gather=False):
@@ -473,6 +582,7 @@ def compiled_decode_shared_index_keys(signature):
     entry = FunctionType(
         decode_shared_index_keys.__code__.replace(co_name=f"prefill_shared_keys_{signature}"),
         decode_shared_index_keys.__globals__,
+        argdefs=decode_shared_index_keys.__defaults__,
     )
     return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
 

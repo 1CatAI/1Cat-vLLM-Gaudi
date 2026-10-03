@@ -132,12 +132,46 @@ def test_shared_runtime_contracts_allocate_mirror(monkeypatch, tp, runtime):
     assert shared.index_mirror_tokens == 1024 and hasattr(cache, "index_mirror")
 
 
-def test_capacity_bound_retains_long_context_fallback(monkeypatch):
+def test_mirror_capacity_is_independent_of_native_score_window(monkeypatch):
     _, shared, cache, _ = fixture(monkeypatch, length=65536)
-    assert shared.index_mirror_tokens == 32768
-    assert cache.index_mirror.shape == (16384, 128)
+    assert shared.index_mirror_tokens == 65536
+    assert cache.index_mirror.shape == (32768, 128)
     with pytest.raises(ValueError, match="bounded capacity"):
-        shared.prepare_index_mirror(32769)
+        shared.prepare_index_mirror(65537)
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_long_mirror_restore_uses_current_pages_across_score_windows(monkeypatch, ratio):
+    _, shared, cache, state = fixture(monkeypatch, ratio, length=65536)
+    pages = torch.randperm(512).add(1).tolist()
+    state.activate("long", pages)
+    cache.index_mirror.fill_(99)
+    shared.prepare_index_mirror(41983)
+    rows = torch.arange(65536 // ratio)
+    width = 128 // ratio
+    physical = torch.tensor(pages)[rows // width] * width + rows % width
+    expected = unpack_fp4(cache.index[physical], 128, 32)
+    expected[rows >= 41983 // ratio] = 0
+    assert torch.equal(cache.index_mirror, expected)
+
+
+def test_long_mirror_scoring_preserves_global_rows_and_native_window_bounds(monkeypatch):
+    from vllm_gaudi.ops.deepseek_v41_index_mirror import mirror_source_scores
+    keys = torch.arange(65537, dtype=torch.float32)[:, None].expand(-1, 128).bfloat16()
+    rows = torch.arange(65537).int()
+    positions = torch.tensor([65536]).int()
+    observed = []
+
+    def consume(q, w, current, p, logical, ratio, heads):
+        assert current.shape[0] <= 32768 and current.shape[0] % 128 == 0
+        valid = logical >= 0
+        assert torch.equal(current[valid, 0], keys[logical[valid].long(), 0])
+        observed.append(logical[0].item())
+        return logical.float()[None, :]
+
+    monkeypatch.setattr(torch.ops.custom_op, "custom_deepseek_v41_prefill_index_scores_gaudi2", consume, raising=False)
+    actual = mirror_source_scores(torch.empty(1, 32, 128), torch.empty(1, 32), keys, positions, rows, 1, 8)
+    assert torch.equal(actual[0], rows.float()) and observed == [0, 32768, 65536]
 
 
 def test_segmented_prefix_and_native_replay_distinguish_index_state():

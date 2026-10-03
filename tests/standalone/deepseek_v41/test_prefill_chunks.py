@@ -170,7 +170,9 @@ def test_runtime_indexer_prewarms_and_reuses_one_bounded_2k_bucket():
         (0, 512),
         (512, 2560),
         *[(start, 32768) for start in range(2560, 32768, 4096)],
-        *[(start, start * 2) for start in (32768, 65536, 131072, 262144, 524288)],
+        *[(start, search) for lower, search in ((32768, 65536), (65536, 131072), (131072, 262144),
+                                              (262144, 524288), (524288, 1048576))
+          for start in range(lower, search, min(32768, max(4096, search // 8)))],
     ]
     for start, count in ((0, 2052), (2051, 1), (2306, 254)):
         assert runtime_search_length(start, count, capacity) == 2560
@@ -209,6 +211,16 @@ def test_long_runtime_geometry_covers_crossings_and_is_prepared_before_readiness
     assert len(long_buckets) <= 5
 
 
+@pytest.mark.parametrize("capacity", [65536, 100000, 524288, 1048576])
+def test_every_long_decode_prefix_geometry_is_warmed(capacity):
+    from vllm_gaudi.ops.deepseek_v41_config import decode_source_prefix_bound
+    prepared = {(search, decode_source_prefix_bound(start + 1, search, 4))
+                for start, search in decode_search_warmups(capacity, runtime_indexer=True)}
+    for end in range(32769, capacity + 1):
+        search = runtime_search_length(end - 1, 1, capacity)
+        assert (search, decode_source_prefix_bound(end, search, 4)) in prepared
+
+
 def test_prefill_warmup_covers_residual_tiles_in_each_reachable_search_bucket():
     capacity = 524288
     warmed = {(count, prefill_search_length(start, count, capacity, reuse_index_keys=True))
@@ -232,7 +244,8 @@ def test_complete_prompt_search_retains_decoder_halo_mla_admission():
         assert can_partition_prefill_mla((4096, 16, 512), 640, 4, search)
     assert can_partition_prefill_mla((4096, 16, 512), 640, 4, 32768)
     assert can_partition_prefill_mla((4096, 16, 512), 640, 4, 65536)
-    assert not can_partition_prefill_mla((4096, 16, 512), 640, 4, 131072)
+    for search in (131072, 262144, 524288, 1048576):
+        assert can_partition_prefill_mla((4096, 16, 512), 640, 4, search)
 
 
 def test_prefill_tail_is_exact_and_never_splits_into_dspark_c6():

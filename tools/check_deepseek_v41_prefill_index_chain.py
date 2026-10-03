@@ -22,6 +22,10 @@ def main():
     parser.add_argument("--visible", type=int, default=62464)
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--mla-only", action="store_true")
+    parser.add_argument("--paged-mla", action="store_true",
+                        help="Include bounded selected-KV decode inside the query-owner MLA recipe")
+    parser.add_argument("--mla-ratio", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--checks-only", action="store_true")
     args = parser.parse_args()
     rank = int(os.environ["LOCAL_RANK"])
     os.environ["HLS_MODULE_ID"] = os.environ["HABANA_VISIBLE_MODULES"].split(",")[rank]
@@ -38,10 +42,15 @@ def main():
     from vllm_gaudi.ops.deepseek_v41_prefill_index_exchange import exchange_prefill_index_queries
     from vllm_gaudi.ops.deepseek_v41_replay import stage_collectives
     from vllm_gaudi.ops.deepseek_v41_prefill_sequence import sequence_prefill_mla
+    from vllm_gaudi.ops.deepseek_v41_prefill_mla import sparse_prefill_mla
 
     if (args.tokens < 1024 or args.tokens % 4
-            or not args.tokens <= args.visible <= args.source_rows <= min(65536, args.capacity)):
+            or not args.tokens <= args.visible <= args.source_rows <= args.capacity):
         raise ValueError("Expected finite large-M queries and a bounded source prefix")
+    if args.paged_mla and not args.mla_only:
+        raise ValueError("Paged MLA qualification uses the MLA-only complete producer/consumer chain")
+    if args.paged_mla and args.source_rows > args.capacity // args.mla_ratio:
+        raise ValueError("Paged MLA source exceeds its compressed context capacity")
     torch.set_num_threads(1)
     torch.hpu.set_device(rank)
     bind_worker_cpu(rank)
@@ -52,7 +61,8 @@ def main():
     config = VllmConfig(parallel_config=ParallelConfig(tensor_parallel_size=4, pipeline_parallel_size=1))
     report = dict(status="preparing", rank=rank, scope=__doc__, tokens=args.tokens,
                   source_rows=args.source_rows, capacity=args.capacity, visible=args.visible,
-                  mla_only=args.mla_only, checks=[], periods=[],
+                  mla_only=args.mla_only, paged_mla=args.paged_mla, mla_ratio=args.mla_ratio,
+                  checks_only=args.checks_only, checks=[], periods=[],
                   baseline_reason="No archived four-rank large-M long-prefix producer/consumer measurement",
                   full_model_requests=0, ledger_credit=False)
     args.output.mkdir(parents=True, exist_ok=True)
@@ -75,6 +85,14 @@ def main():
         swa_rows = args.tokens + 127
         swa = torch.randn(swa_rows, 512, generator=generator).bfloat16()
         cache = torch.cat((swa, unpack_fp4(main, 512, 16)), 0).to("hpu")
+        paged_main = None
+        if args.paged_mla:
+            page_rows = 128 // args.mla_ratio
+            physical_main = torch.zeros(args.capacity // args.mla_ratio + page_rows, 288, dtype=torch.uint8)
+            logical = torch.arange(args.source_rows)
+            mapping = table.cpu()[logical // page_rows].long() * page_rows + logical % page_rows
+            physical_main.index_copy_(0, mapping, main)
+            paged_main = physical_main.to("hpu")
         del main
         positions = torch.arange(args.visible - args.tokens, args.visible, dtype=torch.int32).to("hpu")
         banks = []
@@ -129,12 +147,51 @@ def main():
                     query[start:stop].contiguous(), cache, ids[start:stop].contiguous(), sink))
             return torch.cat(outputs)
 
+        def old_paged_tile(query, packed, pages, swa, indices, sink, ratio):
+            # Match the actual replicated selected-row producer used above
+            # the flat-cache workspace budget, including generic FP4 decode.
+            selected = indices[:, 128:]
+            width = 128 // ratio
+            logical = selected.clamp_min(0).long()
+            physical = pages[(logical // width).flatten()].reshape(logical.shape).long() * width + logical % width
+            main = unpack_fp4(packed.index_select(0, physical.flatten()), 512, 16)
+            local = torch.arange(selected.numel(), dtype=torch.int32, device=query.device).reshape_as(selected)
+            local = torch.where(selected >= 0, local + swa.shape[0], -1)
+            cache = torch.cat((swa, main), 0)
+            ids = torch.cat((indices[:, :128], local), -1)
+            lengths = torch.full((query.shape[0],), 640, dtype=torch.int32, device=query.device)
+            return sparse_prefill_mla(query, cache, ids, sink, lengths, query_tile=256)
+
+        old_paged = torch.compile(old_paged_tile, backend="hpu_backend", fullgraph=True, dynamic=False)
+
+        def paged_ids():
+            ids = attention_ids(mla_choices)
+            ids[:, 128:] = mla_choices
+            return ids
+
         def chain(which, inputs):
             query, weights, mla_q = inputs
             if args.mla_only:
-                output = (consume(mla_q, mla_choices) if which == 0 else sequence_prefill_mla(
-                    mla_q, cache, attention_ids(mla_choices), full_sink, rank,
-                    group=group.device_group, retire_chunks=False))
+                if which == 0:
+                    if args.paged_mla:
+                        ids = paged_ids()
+                        output = torch.cat([
+                            old_paged(mla_q[start:start + 128].contiguous(), paged_main, table,
+                                      cache[:swa_rows].contiguous(), ids[start:start + 128].contiguous(),
+                                      sink, args.mla_ratio) for start in range(0, args.tokens, 128)
+                        ], 0)
+                    else:
+                        output = consume(mla_q, mla_choices)
+                elif args.paged_mla:
+                    ids = paged_ids()
+                    output = sequence_prefill_mla(
+                        mla_q, cache[:swa_rows].contiguous(), ids, full_sink, rank,
+                        group=group.device_group, retire_chunks=False,
+                        paged_main=(paged_main, table, args.mla_ratio))
+                else:
+                    output = sequence_prefill_mla(
+                        mla_q, cache, attention_ids(mla_choices), full_sink, rank,
+                        group=group.device_group, retire_chunks=False)
                 return (output,)
             if which == 0:
                 q, w = gather(query, 1), gather(weights, 1)
@@ -162,6 +219,11 @@ def main():
                 report["status"] = "correctness_failed"
                 save()
                 raise RuntimeError(f"Selection/MLA contract differs: {check}")
+        if args.checks_only:
+            report["status"] = "correctness_passed_no_timing"
+            save()
+            dist.destroy_process_group()
+            return
         bind_worker_helpers(rank)
         # The lease launcher watches competing memory growth and CPU pressure.
         # Preparation may overlap loading; timed periods must wait for its gate.
