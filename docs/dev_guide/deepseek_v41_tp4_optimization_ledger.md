@@ -709,10 +709,10 @@ Official-sampling80token changed-boundary diagnostics (length-limited, not natur
 82945:prefill13.168563s/6298.713tps,decode11.423877ms;
 144385:21.310411s/6775.327tps,12.329330ms;
 300001:64.860913s/4625.297tps,14.503627ms.
-Reasoning correctly identifies the request at the actual input end; these short outputs are not a quality cohort.
+The82945/144385/300001reasoning refers to the actual input-end instruction; these short outputs are not a quality cohort.
 1024cold/hit896:TTFT2.142596/.600957s,decode10.570936/10.228068ms;
 cache accounting hits correctly, same-seed tokens differ as in earlier records, exact state equivalence remains unproven.
-No new broad baseline, trace or repeat formal request. Near-capacity524161boundary diagnostic is pending.
+No new broad baseline, trace or repeat formal request. Near-capacity524161boundary completed:prefill136.826331s/3830.849tps,decode17.318101ms,80tokens,noOOM/restart;endingCPU PSIavg10was9.39%,sharedhosttiming only. Its reasoning does not accurately restate the final instruction and has no final answer before the80tokenlimit; long quality remainsunqualified. The500003terminal-instructionnaturalEOScheck FAILED:419EOS; requiredLONG-PREFIX-END-500003, actual askswhatuserwants. Same requestwith499968cachedtokens reproducesall419tokens exactly. Returned inputIDsdetokenizetoactualtailincludingrequestedmarker, soHTTPpromptlossandcache-onlyperturbationdonotexplain thispair. Rootunresolved; no arbitrary-long semanticqualification.
 
 Formal host monitor retained per-core utilization/scheduling and PSI; other group had stable loaded weights,
 then released before the request, with no recorded ongoing growth. Shared-machine conditions are retained.
