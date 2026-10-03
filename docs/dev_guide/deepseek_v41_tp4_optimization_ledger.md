@@ -6,10 +6,14 @@
 ## 当前正式测量与待验收累计
 
 当前官方采样口径：temperature=1.0、top_p=0.95、seed=42，512K容量、C16384、缓存开启、完整预热。
-最新安装服务测量为 `visible-prefix-serving-05`：16384→2128自然EOS，prefill8851.110164tokens/s、
-decode10.565244ms/token，14项事实/约束通过。9.5ktokens/s和10ms目标尚未通过。
+最新安装服务测量为 `long-prefix-serving-01`：源码31e519fd，16384→2128自然EOS，
+prefill8028.980763tokens/s、decode10.568225ms/token、客户端TTFT2.126094s，14项事实/约束通过，
+全部输出token与visible-prefix-serving-05一致。9.5ktokens/s和10ms目标尚未通过。
+同配置归档父版本b7553683为prefill8851.110164tokens/s、decode10.565244ms/token；
+本次prefill降低9.287%，decode差0.002981ms，原因未归因，不记作正式收益。
 用户此前接受发布的回退版本为8914.621782tokens/s、10.599712ms/token。
-当前长文分块、分页MLA、索引镜像组件收益独立记录在下文，未折算为16K官方采样收益，未替换公网服务。
+长文组件已组合安装到公网服务，main仍未包含本PR。长文短诊断实测见文末，
+组件数据不折算为16K官方采样收益；当前未端到端累计16K收益仍0ms。
 下述9.933990731ms属于历史greedy验收，不能作为当前官方采样的发布验收数字。
 
 2026-10-01本轮≤10ms目标已完成：最新正式基线 **9.933990731 ms/token（100.6645 tokens/s）**，
@@ -689,3 +693,33 @@ Allocate distinct pages for context plus the reserved continuation and warm step
 `long-index-mirror-real16-03`, parent0da018c8: actual context41984,logicalcapacity512K,distinct333requestpages plus null,512reservedsteps,modules2/3/6/7,CPU64/69/92/97. Canonical paged MME and mirror share the same valid prefill snapshot/weights/native replay. ABABAB200 with32continuouswarmsteps: medians4.890051/4.297652ms, delta0.592399ms exceeds2×baselineIQR0.165892ms. Allsixperiods have exact cross-arm and four-rank feedback and stable within-arm tokens; no hot compilation/profiler. Retain firstA coldhosttail and its0.234926msperiod drift, no period discarded. Othergrouppublicservice wasidle, no otherweightloading. This resolves the apparent numerical divergence as an invalid fixture ownership contract.
 
 This is a valid long-context whole16-layer component saving, not a16Kdecode or formal end-to-end gain. No×1.5/×2.5 extrapolation or cumulative16Kcredit because the source-range/layer mix differs. All compatible long source-window/MLA/mirror changes now advance together to one normal independently installed serving qualification, officialtemperature1/top_p.95/seed42,512K/C16384/cacheon/diagnostics off. Public remainsoldsource until frozen update/restart; formal result stillpending.
+
+
+### 2026-10-03 combined long-prefix serving — measured, strict release goals not met
+
+`long-prefix-serving-01`, ordinary independently installed31e519fd, all277inferencePython files match;
+512K/C16384/cacheon/defaultacceleration/fullwarmup, diagnostics/profileroff, officialT1/.95/seed42.
+No model injection, workspace imports, native ABI or sampling change. One formal uncached16K→2128naturalEOS
+request: prefill8028.980763tps,decode10.568225ms,TTFT2.126094s,14facts pass,
+all2128tokens exact to archivedb755. CPU1044passed111skipped; diagnostics/fixture21passed.
+The existing formal reference8851.110164tps/10.565244ms is reused, not rerun.
+Prefill regression is unresolved, not explained by context size or assigned to the algorithm without evidence.
+
+Official-sampling80token changed-boundary diagnostics (length-limited, not naturalEOS quality qualification):
+82945:prefill13.168563s/6298.713tps,decode11.423877ms;
+144385:21.310411s/6775.327tps,12.329330ms;
+300001:64.860913s/4625.297tps,14.503627ms.
+Reasoning correctly identifies the request at the actual input end; these short outputs are not a quality cohort.
+1024cold/hit896:TTFT2.142596/.600957s,decode10.570936/10.228068ms;
+cache accounting hits correctly, same-seed tokens differ as in earlier records, exact state equivalence remains unproven.
+No new broad baseline, trace or repeat formal request. Near-capacity524161boundary diagnostic is pending.
+
+Formal host monitor retained per-core utilization/scheduling and PSI; other group had stable loaded weights,
+then released before the request, with no recorded ongoing growth. Shared-machine conditions are retained.
+Startup reports5,271,424KVtokens, mirror335544320bytes/card, profile peak91990273536bytes/card,
+resident devices approximately91259–91264MiB at formal readiness. Long300001completed withoutOOM;
+this does not qualify unrestricted concurrency or every length. No16Kgain or release-goal success is claimed.
+
+All long-window/selected-paged-MLA/mirror items have now been exercised together in normal serving,
+so move them out of the untested-component queue without adding or summing overlapping request gains.
+Public API is online on this candidate; PR57 remainsdraft andmain unchanged while strict goals remain open.
