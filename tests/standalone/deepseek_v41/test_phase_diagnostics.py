@@ -79,3 +79,25 @@ def test_raw_diagnostics_reach_explicit_scopes_without_torch_profiler(monkeypatc
 
     assert entry(None, 4) == 5
     assert len(names) == 1 and phase_fields(names[0])["phase"].endswith("entry")
+
+
+def test_stage_identity_uses_shared_tp_topology(monkeypatch):
+    monkeypatch.setenv('VLLM_HPU_DSV41_PHASE_TRACE', '1')
+    monkeypatch.setattr(torch.distributed, 'get_rank', lambda: 3)
+    names = []
+
+    @contextmanager
+    def record(name):
+        names.append(name)
+        yield
+
+    monkeypatch.setattr(torch.profiler, 'record_function', record)
+    worker = SimpleNamespace(pp=SimpleNamespace(generation=0, packed=None),
+                             model=SimpleNamespace(tensor_parallel_size=4, pp_rank=0))
+
+    @trace_phase
+    def execute_model(self, scheduled):
+        return 17
+
+    assert execute_model(worker, SimpleNamespace(num_scheduled_tokens={'r': 1})) == 17
+    assert phase_fields(names[0])['stage'] == 0

@@ -26,6 +26,7 @@ from vllm_gaudi.extension.logger import logger as init_logger
 from vllm_gaudi.extension.profiler import HabanaHighLevelProfiler
 from vllm_gaudi.ops.deepseek_v41_config import decode_source_prefix_bound
 from vllm_gaudi.ops.deepseek_v41_indexer import INDEX_MME_HOT_TOKENS
+from vllm_gaudi.ops.deepseek_v41_diagnostics import trace_phase
 from vllm_gaudi.ops.deepseek_v41_state import PagedStageState, StageStateBlocks, register_state_spec
 from vllm_gaudi.ops.deepseek_v41_verify import (
     AsyncDeviceOutput,
@@ -1217,6 +1218,7 @@ class V41ModelRunner:
         self.device_sampling_stats[self._device_sampling_owner[1]]["fallbacks"] += 1
         return int(host[0, 0])
 
+    @trace_phase
     def _sample_requests(self, hidden, requests, *, replay=None):
         from functools import partial
         from vllm_gaudi.ops.deepseek_v41_sampling import request_uniform, sample_probabilities
@@ -1404,6 +1406,7 @@ class V41ModelRunner:
         if self.active_request == req_id:
             self.active_request = None
 
+    @trace_phase
     def _update(self, scheduled):
         if self.request_slots_enabled:
             for req_id in getattr(scheduled, "preempted_req_ids", None) or ():
@@ -1989,6 +1992,7 @@ class V41ModelRunner:
         )
 
     @torch.inference_mode()
+    @trace_phase
     def execute_model(self, scheduled):
         if self.pending is not None:
             raise RuntimeError("Previous V4.1 execution has not completed sampling/verify")
@@ -2070,6 +2074,7 @@ class V41ModelRunner:
         self.pending = "batch_ready"
         return None
 
+    @trace_phase
     def _execute_request(self, scheduled, req_id, count):
         if self.round_timing_enabled:
             self.round_context = dict(

@@ -43,9 +43,11 @@ def trace_phase(function):
             request = next(iter(scheduled.num_scheduled_tokens), "")
             rank = torch.distributed.get_rank()
             packed = self.pp.packed
+            model = getattr(self, "model", None)
+            tp_size = getattr(model, "tensor_parallel_size", 2)
             _context.set(
                 dict(rank=rank,
-                     stage=rank // 2,
+                     stage=getattr(model, "pp_rank", rank // tp_size),
                      generation=self.pp.generation + 1,
                      request=hashlib.sha256(request.encode()).hexdigest()[:16],
                      next_packet_slot=packed.generation % len(packed.packets) if packed else None))

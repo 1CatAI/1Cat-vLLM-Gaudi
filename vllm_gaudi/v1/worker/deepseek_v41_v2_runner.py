@@ -12,6 +12,7 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm_gaudi import envs
 from vllm_gaudi.ops.deepseek_v41_config import decode_source_prefix_bound, uses_v2, validate_v2
 from vllm_gaudi.ops.deepseek_v41_native_trace import annotations_enabled, scope
+from vllm_gaudi.ops.deepseek_v41_diagnostics import trace_phase
 from vllm_gaudi.v1.worker.deepseek_v41_runner import (
     V41ModelRunner,
     logger,
@@ -267,6 +268,7 @@ class V41V2ModelRunner(V41ModelRunner):
         self.audit["v2_worker_commits"] = self.audit.get("v2_worker_commits", 0) + 1
 
     @torch.inference_mode()
+    @trace_phase
     def execute_model(self, scheduled):
         if getattr(self, "trace_enabled", False):
             self._step_trace_start = time.perf_counter_ns(), time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
@@ -291,6 +293,7 @@ class V41V2ModelRunner(V41ModelRunner):
         return output
 
     @torch.inference_mode()
+    @trace_phase
     def sample_tokens(self, grammar_output=None):
         if (
             getattr(self.model, "tensor_parallel_size", 2) == 4
@@ -313,6 +316,7 @@ class V41V2ModelRunner(V41ModelRunner):
             self.pending = None
         return result
 
+    @trace_phase
     def _update(self, scheduled):
         request_batches = self.request_slots_enabled
         for new in scheduled.scheduled_new_reqs:
@@ -336,6 +340,7 @@ class V41V2ModelRunner(V41ModelRunner):
                 raise RuntimeError("V2 scheduler placeholder count disagrees with the worker's committed prefix")
         super()._update(scheduled)
 
+    @trace_phase
     def _sample_single(self):
         if not getattr(self, "_v2_async_step", True):
             return super()._sample_single()
