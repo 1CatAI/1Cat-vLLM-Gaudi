@@ -469,8 +469,8 @@ class HPUWorker(WorkerBase):
                 stats["attention"] = {
                     "prefill_mla_sequence": gaudi_envs.VLLM_HPU_DSV41_PREFILL_MLA_SEQUENCE,
                     "sequence_contract": (
-                        "TP4; C4096/search16384 or C16384/search16384,32768; 640 columns; "
-                        "one exchange16384; fused layout; consumer dependencies"
+                        "TP4; query buckets 1024/2048/4096/8192/16384; positive configured search; "
+                        "640 columns; bounded selected paged KV; exchange16384; consumer dependencies"
                     ),
                 }
                 stats["topology"] = {

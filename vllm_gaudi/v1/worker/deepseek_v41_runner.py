@@ -187,7 +187,7 @@ def target_search_length(start, count, maximum):
 
 
 def runtime_search_length(start, count, maximum):
-    """Select the prewarmed hot-MME or capacity-independent index recipe."""
+    """Select a prewarmed search bucket covering the complete visible prefix."""
     if start < 0 or count < 1 or start + count > maximum:
         raise ValueError("V4.1 runtime index range is outside the configured context")
     # Keep the first 512 visible rows on the exact static candidate path.  The
@@ -201,26 +201,27 @@ def runtime_search_length(start, count, maximum):
     hot = min(maximum, INDEX_MME_HOT_TOKENS)
     if start + count <= hot:
         return hot
-    # Both TP geometries reuse the same bounded derived key cache and MME
-    # scorer. Larger requests retain the canonical capacity-independent scan.
+    # Both TP geometries reuse the bounded derived key cache and MME scorer.
+    # Geometric buckets bound visible work and finite replay geometries.
+    # Configured-capacity mirrors serve long buckets in native source windows.
     bounded = min(maximum, 32768)
-    return bounded if start + count <= bounded else maximum
+    if start + count <= bounded:
+        return bounded
+    return min(maximum, 1 << (start + count - 1).bit_length())
 
 
 def prefill_search_length(start, count, maximum, *, reuse_index_keys=False):
     """Use a bounded shared-key geometry without changing decode capture.
 
-    The hot geometry is shared with decode. Beyond it, the two complete
-    prompt geometries retain the qualified decoder-halo MLA admission and
-    bounded shared-key workspace. Longer prefixes retain the capacity-
-    independent path. Query positions still mask every future row.
+    The hot geometry is shared with decode. Complete prompt geometries avoid
+    scoring unused source rows; longer buckets use the same bounded source
+    windows. Query positions still mask every future row.
     """
     search = runtime_search_length(start, count, maximum)
     if reuse_index_keys and INDEX_MME_HOT_TOKENS < start + count <= 32768:
-        # A complete 16K prompt leaves 4K halo queries in the last decoder
-        # layers. Padding its search to 32K rejects the existing query-owned
-        # MLA path and also scans unused source tiles. Decode keeps its own
-        # fixed 32K geometry; prompt admission depends on this transaction.
+        # Complete prompt buckets avoid scanning unused source tiles while
+        # decode retains its separately captured geometry. These are work
+        # bounds, not admission cutoffs for the shared attention algorithm.
         return min(maximum, 16384 if start + count <= 16384 else 32768)
     if not reuse_index_keys and start + count > INDEX_MME_HOT_TOKENS:
         return maximum
@@ -240,14 +241,46 @@ def decode_search_warmups(maximum, *, runtime_indexer=False):
             # Prepare each finite geometry before accepting decode requests.
             for start in range(hot, bounded, 4096):
                 yield start, bounded
-            if bounded < maximum:
-                yield bounded, maximum
+            while bounded < maximum:
+                search = runtime_search_length(bounded, 1, maximum)
+                from vllm_gaudi.ops.deepseek_v41_config import decode_source_window_quantum
+
+                for start in range(bounded, search, decode_source_window_quantum(search)):
+                    yield start, search
+                bounded = search
         return
     start = 0
     while start < maximum:
         search = target_search_length(start, 1, maximum)
         yield start, search
         start = search
+
+
+def prefill_search_warmups(maximum, capacity, *, reuse_index_keys=True):
+    """Cover reachable finite tile/search pairs, including interior tails.
+
+    A scheduler transaction supplies one search geometry to all its internal
+    tiles. Short tiles can therefore execute in any later search bucket;
+    warming each tile only at position zero leaves those real tails cold.
+    """
+    buckets = [512, INDEX_MME_HOT_TOKENS, 16384, 32768]
+    while buckets[-1] < maximum:
+        buckets.append(buckets[-1] * 2)
+    seen = set()
+    for search in dict.fromkeys(min(maximum, size) for size in buckets):
+        if search < 1:
+            continue
+        floor = 0 if search <= 512 else 512 if search <= INDEX_MME_HOT_TOKENS else (
+            INDEX_MME_HOT_TOKENS if search <= 16384 else search // 2
+        )
+        for count in prefill_compute_buckets(capacity):
+            if count > search:
+                continue
+            start = max(0, floor + 1 - count)
+            actual = prefill_search_length(start, count, maximum, reuse_index_keys=reuse_index_keys)
+            if (count, actual) not in seen:
+                seen.add((count, actual))
+                yield start, count
 
 
 def _exchange_payload_views(exchange_wire, capacity, hidden_slots=4, hidden_width=5120):
@@ -1236,7 +1269,8 @@ class V41ModelRunner:
 
     @property
     def request_slots_enabled(self):
-        return getattr(self, "request_batches", None) is not None or getattr(self, "prefix_checkpoints", None) is not None
+        return (getattr(self, "request_batches", None) is not None
+                or getattr(self, "prefix_checkpoints", None) is not None)
 
     def _bind_request(self, request):
         if self.request_slots_enabled:
@@ -1995,8 +2029,7 @@ class V41ModelRunner:
             chunks = prefix_checkpoints.chunks(
                 req_id, start, chunks,
                 inline_eligible=(
-                    count == self.prefill_capacity
-                    and max(prefill_compute_buckets(self.prefill_capacity), default=1) == count
+                    count > 256
                     and len(scheduled.num_scheduled_tokens) == 1
                     and not request.mm_features
                     and getattr(request.sampling_params, "prompt_logprobs", None) is None
@@ -2041,6 +2074,8 @@ class V41ModelRunner:
                 )
             if program is not None:
                 program.prefill_halo_mode = halo_mode
+            if prefix_checkpoints is not None:
+                prefix_checkpoints.activate_chunk(req_id, start + offset, len(chunk))
             try:
                 with prefill_events.span("transaction_chunk", rows=len(chunk)):
                     hidden = self._forward(
@@ -2324,25 +2359,21 @@ class V41ModelRunner:
 
         record_memory(0, 0)
         if not self.use_dspark and isinstance(self.state, PagedStageState):
-            geometries = (0, min(INDEX_MME_HOT_TOKENS, self.model_config.max_model_len - 1))
-            for start_position in geometries:
-                for tokens in prefill_compute_buckets(self.prefill_capacity):
-                    if start_position + tokens > self.model_config.max_model_len:
-                        continue
-                    logger.info(
-                        "V4.1 PP%d starting pre-KV C%d prefill recipe warmup at position %d",
-                        self.model.pp_rank,
-                        tokens,
-                        start_position,
-                    )
-                    self._dummy_run(tokens, start_position=start_position)
-                    record_memory(tokens, start_position)
-                    logger.info(
-                        "V4.1 PP%d completed pre-KV C%d prefill recipe warmup at position %d",
-                        self.model.pp_rank,
-                        tokens,
-                        start_position,
-                    )
+            cases = [(start, count) for start in (0, min(INDEX_MME_HOT_TOKENS,
+                                                       self.model_config.max_model_len - 1))
+                     for count in prefill_compute_buckets(self.prefill_capacity)
+                     if start + count <= self.model_config.max_model_len]
+            for start_position, tokens in cases:
+                logger.info(
+                    "V4.1 PP%d starting pre-KV C%d prefill recipe warmup at position %d",
+                    self.model.pp_rank, tokens, start_position,
+                )
+                self._dummy_run(tokens, start_position=start_position)
+                record_memory(tokens, start_position)
+                logger.info(
+                    "V4.1 PP%d completed pre-KV C%d prefill recipe warmup at position %d",
+                    self.model.pp_rank, tokens, start_position,
+                )
         tokens = 6 if self.use_dspark else 1
         logger.info("V4.1 PP%d starting C%d memory profile", self.model.pp_rank, tokens)
         self._dummy_run(tokens)
@@ -2354,6 +2385,17 @@ class V41ModelRunner:
         if self.request_batches is not None:
             self.request_batches.warmup()
             self.model.batch_state.restore_single_bindings()
+        if getattr(self, "prefix_checkpoints", None) is not None:
+            self.model.batch_state.warmup_single_handoff(self.state.blocks)
+            # Profile-time pages are replaced by the scheduler pool before
+            # this entry. Warm the actual serving tensor contracts, including
+            # tail tiles in later search buckets, before freezing executors.
+            for start, count in prefill_search_warmups(
+                    self.model_config.max_model_len, self.prefill_capacity,
+                    reuse_index_keys=envs.VLLM_HPU_DSV41_PREFILL_REINDEX_REUSE):
+                logger.info("V4.1 PP%d warming serving C%d prefill at position %d",
+                            self.model.pp_rank, count, start)
+                self._dummy_run(count, start_position=start)
         if getattr(self, "prefix_checkpoints", None) is not None and self.prefill_capacity > 8192:
             from vllm_gaudi.ops.deepseek_v41_prefix_state import InlinePrefixCapture
 

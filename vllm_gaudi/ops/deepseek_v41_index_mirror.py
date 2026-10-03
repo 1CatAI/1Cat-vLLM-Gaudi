@@ -20,7 +20,7 @@ def index_mirror_execution_mode(program, search_length=None):
 
 def initialize_index_mirror(shared, tensor_parallel_size, device):
     capacity = getattr(torch.ops.custom_op, "deepseek_v41_decoded_index_capacity", None)
-    shared.index_mirror_tokens = (min(shared.length, INDEX_MIRROR_TOKENS)
+    shared.index_mirror_tokens = (shared.length
                                   if tensor_parallel_size > 1
                                   and capacity is not None and capacity() >= INDEX_MIRROR_TOKENS else 0)
     shared.index_mirror_valid = False
@@ -61,14 +61,38 @@ def prepare_index_mirror(shared, visible_tokens):
         raise ValueError("Index mirror prefix exceeds its bounded capacity")
     shared.index_mirror_visible.fill_(visible_tokens)
     for cache in shared.sources.values():
-        args = (cache.index, shared.block_table, cache.index_mirror_rows,
-                shared.index_mirror_visible, cache.index_mirror, cache.ratio)
-        if cache.index.device.type == "hpu":
-            _compiled(_restore_index, _signature(*args))(*args)
-        else:
-            _restore_index(*args)
+        cache.index_mirror.zero_()
+        window = INDEX_MIRROR_TOKENS // cache.ratio
+        visible_rows = visible_tokens // cache.ratio
+        for start in range(0, visible_rows, window):
+            stop = min(start + window, cache.index_mirror_rows.numel())
+            args = (cache.index, shared.block_table, cache.index_mirror_rows[start:stop],
+                    shared.index_mirror_visible, cache.index_mirror[start:stop], cache.ratio)
+            if cache.index.device.type == "hpu":
+                _compiled(_restore_index, _signature(*args))(*args)
+            else:
+                _restore_index(*args)
     shared.index_mirror_valid = True
     shared.index_mirror_rebuilds += 1
+
+
+def mirror_source_scores(query, weights, keys, positions, rows, ratio, local_heads):
+    """Stream the derived prefix through the native bounded MME epilogue."""
+    if rows.ndim != 1 or rows.numel() > keys.shape[0]:
+        raise ValueError("Mirror Full scoring requires a contiguous logical prefix")
+    pieces = []
+    for start in range(0, rows.numel(), INDEX_MIRROR_TOKENS):
+        stop = min(start + INDEX_MIRROR_TOKENS, rows.numel())
+        current, logical = keys[start:stop].contiguous(), rows[start:stop].contiguous()
+        count = stop - start
+        if count % 128:
+            current = torch.nn.functional.pad(current, (0, 0, 0, (-count) % 128))
+            logical = torch.nn.functional.pad(logical, (0, (-count) % 128), value=-1)
+        result = torch.ops.custom_op.custom_deepseek_v41_prefill_index_scores_gaudi2(
+            query.contiguous(), weights.contiguous(), current,
+            positions.to(torch.int32).contiguous(), logical, ratio, local_heads)
+        pieces.append(result[:, :count] if count % 128 else result)
+    return torch.cat(pieces, -1) if len(pieces) > 1 else pieces[0]
 
 
 def mirror_index_tile(query, weights, keys, positions, rows, ratio, local_heads):

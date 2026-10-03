@@ -1,9 +1,21 @@
 # TP4 decode 长期开发台账
 
-更新：2026-10-01。只记录具有可比完整消费链微基准收益、通过适用正确性检查的改动。
+更新：2026-10-03。只记录具有可比完整消费链微基准收益、通过适用正确性检查的改动。
 未验证方向、失败或变慢试验留在实验INDEX，不计累计。端到端通过后关账，不再次计入待验收收益。
 
 ## 当前正式测量与待验收累计
+
+当前官方采样口径：temperature=1.0、top_p=0.95、seed=42，512K容量、C16384、缓存开启、完整预热。
+最新安装服务测量为 `long-prefix-serving-01`：源码31e519fd，16384→2128自然EOS，
+prefill8028.980763tokens/s、decode10.568225ms/token、客户端TTFT2.126094s，14项事实/约束通过，
+全部输出token与visible-prefix-serving-05一致。9.5ktokens/s和10ms目标尚未通过。
+同配置归档父版本b7553683为prefill8851.110164tokens/s、decode10.565244ms/token；
+本次prefill降低9.287%，decode差0.002981ms，原因未归因，不记作正式收益。
+用户此前接受发布的回退版本为8914.621782tokens/s、10.599712ms/token。
+长文组件已组合安装到公网服务；用户于2026-10-03明确要求通过PR57合并当前实现到main。
+此次源码合并不表示速度或长文语义验收通过。长文短诊断实测见文末，
+组件数据不折算为16K官方采样收益；当前未端到端累计16K收益仍0ms。
+下述9.933990731ms属于历史greedy验收，不能作为当前官方采样的发布验收数字。
 
 2026-10-01本轮≤10ms目标已完成：最新正式基线 **9.933990731 ms/token（100.6645 tokens/s）**，
 完整56/56预热，16K→2784token→自然EOS，无profiler正式请求；5个固定语义样本全部通过。
@@ -585,3 +597,142 @@ version for publication and authorized merging PR56. Publish the measured
 8914.621782 tokens/s and10.599712 ms/token without claiming the original
 >=9000 prefill gate passed or the later10ms sampling target was achieved.
 No additional formal request is required for this unchanged runtime.
+
+
+### 2026-10-03 long-context index path — real-stage qualified, serving pending
+
+Parent main ea017d60; maintained source b51026b5 (measurement checks9056543d).
+The published C1 path falls back from decoded-key MME to serial packed TPC
+dot products past32K. Reuse the existing paged-key/MME producer and ordered
+selection/reindex consumer in the shared runtime; no sampling or native ABI change.
+Capacity clipping alone was rejected and is not credited.
+
+`visible-index-real16-05`: actual41984 prompt,512Kcapacity, modules2/3/6/7,
+CPU64/69/92/97; separate captures and ABABAB200. Four-rank first device
+positions are41984. Latest-token-delivery medians10.0259465→5.0995845ms,
+measured saving4.926362ms;2×baselineIQR0.1233685ms. Baseline drift0.002920ms.
+All200feedbacktokens agree across six periods and four ranks; no hot compile.
+Full/Reindex/packed-row consumer tests at32K/42K/62K/64K boundaries are exact.
+The owned other-group loader was temporarily frozen and automatically thawed;
+interrupted and wrong-position fixtures01–04 remain outside gain totals.
+
+This is a42Kstage comparison. It is excluded from the16Kbaseline cumulative
+savings; the1.5×heuristic from the16Kfusion campaign is not used to predict
+this different workload. End-to-end long-request saving is not yet known.
+One fixed official16K EOS request and short arbitrary-length/cache diagnostics
+are pending on the ordinary installed service. No API improvement is claimed yet.
+
+
+### 2026-10-03 shared 64K prefill index bound — component qualified
+
+Parent e9b8b541. Extend existing shared Full/Reindex query partition and native candidate-gather validation from 32768 to 65536 source rows; TPC arithmetic and runtime-sized loading are unchanged. No new communication or native ABI.
+
+`prefill64k-index-chain-06`: modules0/1/4/5, CPU10/15/38/43 with four helpers each, production512Kpage capacity, 1024queries and62464visible rows. Full→Reindex→actual FlashInferMLA consumer, three changing head-shard inputs, ABABAB200. Per-step slowest-rank wall median1356.454539→110.669224ms; device1356.218496→110.542200ms. Difference1245.785315ms exceeds2×baselineIQR16.777981ms. All48outputs exact. First/last A medians1354.849702/1354.690389ms. Other-group startup/CPUpressure overlapped later periods and is archived; absolute times require serving qualification.
+
+This is a long-prefill chain saving. Estimated direction: remove repeated serial Reindex work beyond32K; whole-request magnitude remains unknown because tile/layer scheduling changes. No16Kdecode gain or cumulative ms/token credit. End-to-end and MLA exchange admission are pending; keep this item outside decode totals.
+
+
+### 2026-10-03 existing MLA query partition at long search — component qualified
+
+Parent97bd46b1. Preserve existing TP query-owner exchange, FlashInferMLA and reverse exchange, admitting4K/16Kquery tiles at32K/64Ksearch. Native ABI and communication interfaces unchanged; shapes beyond64K retain ordinary fallback.
+
+`prefill64k-mla-chain-01/02`, normal0/1/4/5 and10/15/38/43, ABABAB200 with three changing inputs. Four-rank maximum wall:4Kqueries7.564369→6.009738ms (saving1.554632ms,2×IQR1.144491ms);16Kqueries23.228257→16.706033ms (saving6.522224ms,2×IQR1.227978ms). Device timing agrees,24comparisons exact. Other-group warmup is recorded. Query/head/cache tensor contracts match actual MLA production consumer.
+
+This is a long-prefill component improvement, separate from the preceding Full/Reindex chain whose MLA consumer was unchanged. No16Kdecode savings credited; request-level estimate is not quantified before combined serving. Official16KEOS and arbitrary-length/cache diagnostics are the next gates.
+
+
+### 2026-10-03 combined arbitrary-prefix service result — partial acceptance
+
+`visible-prefix-serving-05`, installedb7553683,512K/C16384/prefixON, default paths, officialtemperature1/top_p.95/seed42. Complete warmup, one uncached16384→2128naturalEOS request:8851.110164tps,10.565244ms/token,TTFT1.939030s;14facts/constraints pass and token IDs exactly match prior04. The9.5ktps/10ms goals are NOT achieved; no claim of completing the global target.
+
+Changed-boundary80token diagnostics:41983prefill9.104279s (4611.348tps),decode12.539508ms;62463prefill11.803032s (5292.115tps),decode12.738289ms. Prior04 same-input engine times52.733681/75.946818s were substantially higher; competing-load conditions differed, so retain both records without a pure isolated end-to-end attribution. These close the64Kprefill component entries as service-observed improvements, outside16Kdecode cumulative totals. Larger-than64Kshared prefill still falls back and is unqualified for speed.
+
+Short1024cold official diagnostic:prefill1.728926s,decode10.527486ms,TTFT1.765307s. Cachehit896rows:prefill1.125010s,decode10.257645ms,TTFT1.148419s. Initial short decode regression is removed after startup handoff-reader warmup. Cachetrajectories are coherent but token-exactness remains unproven;80token diagnostics are not naturalEOS quality acceptance. Public adapter restored to independently installed branch source;main unchanged andPR57draft. Remaining~2mslongdecode gap and short-request fixed prefill latency stay open. Static mirror/direct-score32Kbound is recorded outside gain totals pending measurement.
+
+
+### 2026-10-03 bounded source windows beyond the former prefill cutoff — component qualified
+
+Parent8e92e25d, source patch archived in `prefill-windowed-index-chain-01`. Full query partition no longer stops at65536source rows; Reindex uses transaction-local65536-row key windows and bounded1024-query candidate workspaces. Restore scores into original candidate slots before sequential TopK merges; duplicate IDs, cutoff ties and causal masks remain unchanged.
+
+Modules2/3/6/7, CPU20/25/48/53 plus disjoint helpers, production512Kpage capacity,1024queries,131072source rows,82944visible rows. ABABAB200, three changing inputs, actual Full→Reindex→MLA consumer. Slowest-rank wall median1490.352746→229.049167ms, saving1261.303579ms;2×baselineIQR42.908518ms. All48outputs exact. Early periods overlap existing public prefill on0/1/4/5; HBM oscillates rather than monotonically loading, PSI and protected affinities archived.
+
+Long-prefill component only, no16Kdecode cumulative credit or whole-request estimate. Paged selected-KV query-owner MLA and configured-capacity decode mirrors are still separate pending component gates. Public inference remainsb7553683 until combined normal-service qualification. Final CPU suite1044passed111skipped; native ABI unchanged.
+
+
+### 2026-10-03 query-owner MLA with bounded paged KV loading — component qualified
+
+`prefill-paged-mla-chain-01`, same2/3/6/7 and20/25/48/53,4096queries,131072source rows,512Kpage capacity,ratio1. The previous flat-cache budget switched to replicated selected-row gather/generic FP4 decode before MLA. Feed logical selected IDs into the existing sequence exchange instead, decode only the owner’s selected rows inside each128-query MLA recipe, and preserve complete640-column softmax/PV. No new communication or native ABI.
+
+ABABAB200, three changing head shards, actual paged load/decode/MLA consumer in both arms. Maximum-rank wall1129.703831→15.171890ms, saving1114.531941ms exceeds2×IQR5.465538ms;12consumer outputs exact. Source and competing load recorded. Largest query stride/ratio2 also passed in `prefill-paged-mla-contract-02`: C16384, ratio2, 12 exact consumer outputs, correctness-only; ordinary combined serving remains pending. This is a long-prefill gain, independent of the preceding index chain’s unchanged MLA consumer; do not sum either into16Kdecode or an estimated request-level number.
+
+
+### 2026-10-03 configured-capacity decode index mirror — component qualified, real16 numerical diagnosis pending
+
+Native32Kcap is a per-score workspace bound, not a context cutoff. Keep canonical packed pages authoritative, derive index keys for the configured capacity, restore reachable source windows at owner/prefill transitions, maintain only newly written rows during decode, and stream Full scores through the existing native MME epilogue. Prefix pruning and its finite warmup geometries now cover long searches. Extra resident index-key storage for512K is approximately300MiB/card versus the old20MiB; this is static accounting, not serving peak-memory acceptance.
+
+`long-index-mirror-chain-06`: actual native model-entry replay of peer query/weight exchange, canonical/main/mirror writes,Full/Reindex and publish/reuse MLA.2/3/6/7,20/25/48/53,source82944/search131072/capacity512K,ABABAB200,three immutable changing banks. Ratio1 wall2.415673→1.233708ms,delta1.181965,gate0.178182; ratio2 wall1.664854→1.084340ms,delta0.580514,gate0.279144. All96outputs exact.01/03 host-entry measurements were not representative and ratio2 stayed below their IQR gates;02/04/05 failed cold harness capability/binding contracts and collected no timings. They remain outside all credit.
+
+Real16-01 failed the saved-feedback oracle before qualification. Current source changes prefill query ownership as well as decoder state; archived prefill tensors were not retained, so the old token sequence cannot isolate mirror correctness. No gain credit. Real16-02 compares canonical paged MME and mirror readers from the same current prefill snapshot, using the resident tool and complete native replay; this missing stateful reference is the only new baseline. No16Kdecode cumulative credit and no whole-model prediction for the different long-context layer mix. Public inference unchanged.
+
+
+### 2026-10-03 long-mirror real16 qualification withheld — experiment, no credit
+
+`long-index-mirror-real16-02`: same current prefill snapshot, canonical paged MME versus mirror reader, native full16 chain, same weights/modules/CPU, ABABAB200. Observed medians4.886498/4.290870ms, threshold0.140881ms, but cross-arm feedback differs first at warm step11. Within-arm feedback is stable and all four ranks agree. No confirmed gain, no ledger/cumulative credit, and no serving deployment. Retain complete periods and mark this numerical gate unresolved rather than attributing it to host noise.
+
+`long-index-mirror-sequence-01/02`: untimed actual native full producer/consumer replay with advancing positions, changing logical/physical addresses, positive gains and a forced newest key.32steps×2ratios×4ranks×4outputs=1024 exact comparisons per geometry, at82944/search131072 and41984/search65536. This does not reproduce a general dynamic-state failure. A same-forced-token real16 numerical diagnostic now records hidden, selectedIDs and historical/newly written canonical/mirror key probes, without another baseline speed run. Public source remainsb7553683 andPR57draft.
+
+
+### 2026-10-03 corrected long real16 physical-page contract — experiment correction
+
+The long real16 fixture retained256requestpages despitecontext41984. Later block_table entries were0, so all visible tokens beyond32768 aliased nullpage. Canonical writes changed many older aliased logicalrows; mirror maintenance updated one newly written logicalrow. This explains why the valid isolated changing-position chain passed while the invalid full fixture diverged. `visible-index-real16-05` and `long-index-mirror-real16-01/02` are superseded for long-context qualification, including their timing and feedback oracles. Their originals remain archived; historical16Kfixtures stay within their pool and are unaffected. No long real16 gain is credited.
+
+Allocate distinct pages for context plus the reserved continuation and warm steps, check every reachable mapping is positive/unique/inbounds before timing, and establish the missing valid reference once in corrected`long-index-mirror-real16-03`. Two numerical diagnostic attempts also failed tool interfaces before collecting data: nativeI32 token contract and missing fixture stop attribute; their records are invalid and preserved. These are tool failures, not production model evidence. Corrected token and observer CPU contracts plus page uniqueness checks pass21tests. Public source unchanged; no deployment until the corrected complete-chain gate.
+
+
+### 2026-10-03 corrected actual long real16 mirror gate — component qualified
+
+`long-index-mirror-real16-03`, parent0da018c8: actual context41984,logicalcapacity512K,distinct333requestpages plus null,512reservedsteps,modules2/3/6/7,CPU64/69/92/97. Canonical paged MME and mirror share the same valid prefill snapshot/weights/native replay. ABABAB200 with32continuouswarmsteps: medians4.890051/4.297652ms, delta0.592399ms exceeds2×baselineIQR0.165892ms. Allsixperiods have exact cross-arm and four-rank feedback and stable within-arm tokens; no hot compilation/profiler. Retain firstA coldhosttail and its0.234926msperiod drift, no period discarded. Othergrouppublicservice wasidle, no otherweightloading. This resolves the apparent numerical divergence as an invalid fixture ownership contract.
+
+This is a valid long-context whole16-layer component saving, not a16Kdecode or formal end-to-end gain. No×1.5/×2.5 extrapolation or cumulative16Kcredit because the source-range/layer mix differs. All compatible long source-window/MLA/mirror changes now advance together to one normal independently installed serving qualification, officialtemperature1/top_p.95/seed42,512K/C16384/cacheon/diagnostics off. Public remainsoldsource until frozen update/restart; formal result stillpending.
+
+
+### 2026-10-03 combined long-prefix serving — measured, strict release goals not met
+
+`long-prefix-serving-01`, ordinary independently installed31e519fd, all277inferencePython files match;
+512K/C16384/cacheon/defaultacceleration/fullwarmup, diagnostics/profileroff, officialT1/.95/seed42.
+No model injection, workspace imports, native ABI or sampling change. One formal uncached16K→2128naturalEOS
+request: prefill8028.980763tps,decode10.568225ms,TTFT2.126094s,14facts pass,
+all2128tokens exact to archivedb755. CPU1044passed111skipped; diagnostics/fixture21passed.
+The existing formal reference8851.110164tps/10.565244ms is reused, not rerun.
+Prefill regression is unresolved, not explained by context size or assigned to the algorithm without evidence.
+
+Official-sampling80token changed-boundary diagnostics (length-limited, not naturalEOS quality qualification):
+82945:prefill13.168563s/6298.713tps,decode11.423877ms;
+144385:21.310411s/6775.327tps,12.329330ms;
+300001:64.860913s/4625.297tps,14.503627ms.
+The82945/144385/300001reasoning refers to the actual input-end instruction; these short outputs are not a quality cohort.
+1024cold/hit896:TTFT2.142596/.600957s,decode10.570936/10.228068ms;
+cache accounting hits correctly, same-seed tokens differ as in earlier records, exact state equivalence remains unproven.
+No new broad baseline, trace or repeat formal request. Near-capacity524161boundary completed:prefill136.826331s/3830.849tps,decode17.318101ms,80tokens,noOOM/restart;endingCPU PSIavg10was9.39%,sharedhosttiming only. Its reasoning does not accurately restate the final instruction and has no final answer before the80tokenlimit; long quality remainsunqualified. The500003terminal-instructionnaturalEOScheck FAILED:419EOS; requiredLONG-PREFIX-END-500003, actual askswhatuserwants. Same requestwith499968cachedtokens reproducesall419tokens exactly. Returned inputIDsdetokenizetoactualtailincludingrequestedmarker, soHTTPpromptlossandcache-onlyperturbationdonotexplain thispair. Rootunresolved; no arbitrary-long semanticqualification.
+
+Formal host monitor retained per-core utilization/scheduling and PSI; other group had stable loaded weights,
+then released before the request, with no recorded ongoing growth. Shared-machine conditions are retained.
+Startup reports5,271,424KVtokens, mirror335544320bytes/card, profile peak91990273536bytes/card,
+resident devices approximately91259–91264MiB at formal readiness. Long300001completed withoutOOM;
+this does not qualify unrestricted concurrency or every length. No16Kgain or release-goal success is claimed.
+
+All long-window/selected-paged-MLA/mirror items have now been exercised together in normal serving,
+so move them out of the untested-component queue without adding or summing overlapping request gains.
+Public API is online on this candidate; PR57 remainsdraft andmain unchanged while strict goals remain open.
+
+
+### 2026-10-03 user-authorized integration of current implementation
+
+User explicitly requested merging currentPR57into main after the recorded qualification results.
+This supersedes the earlier draft-only integration instruction. Retain the failed speed and long-terminal-instruction
+results; do not advance the formally accepted performance baseline, award component gain credit, or create a qualified
+release tag. Ordinary installed API remains online on measuredsource31e519fd; no new model request, profiling,
+service restart or unsupported deployment claim is introduced by this merge. Existing CPU/component/formal evidence
+is reused because the latest changes only clarify documentation and startup audit text. Unrelated localAGENTS.md
+and reproducer artifacts are excluded. Follow-up work must resolve long semantic correctness and prefill regression
+with the accepted prompt tail and exact cold/cache feedback evidence already archived.

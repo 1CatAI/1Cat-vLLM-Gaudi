@@ -12,8 +12,9 @@ from vllm_gaudi.ops.deepseek_v41_paged_attention import PagedCSA2Attention
 @pytest.mark.parametrize("end,search,wanted", [(1, 512, 512), (8193, 16384, 12288),
                                              (16384, 32768, 16384), (16385, 32768, 20480),
                                              (20480, 32768, 20480), (20481, 32768, 24576),
-                                             (32768, 32768, 32768), (32769, 65536, None),
-                                             (1048576, 1048576, None)])
+                                             (32768, 32768, 32768), (32769, 65536, 40960),
+                                             (82945, 131072, 98304), (144385, 262144, 163840),
+                                             (1048576, 1048576, 1048576)])
 def test_bound_covers_transaction_without_reducing_context_capacity(end, search, wanted):
     assert decode_source_prefix_bound(end, search, 4) == wanted
     assert decode_source_prefix_bound(end, search, 2) == wanted

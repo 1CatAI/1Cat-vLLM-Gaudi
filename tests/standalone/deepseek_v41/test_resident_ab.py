@@ -106,10 +106,10 @@ def test_cold_compiler_settings_restore_on_success_and_failure():
     with ab.compiler_settings({'SRAM_SLICER_MAX_CAPACITY_BYTES': '0'}, lib):
         assert lib.values[b'SRAM_SLICER_MAX_CAPACITY_BYTES'] == b'0'
     assert lib.values == before
-    with pytest.raises(ValueError, match='compile failure'):
-        with ab.compiler_settings({'ENABLE_PIPELINE_MANAGEMENT': 'false'}, lib):
-            assert lib.values[b'ENABLE_PIPELINE_MANAGEMENT'] == b'false'
-            raise ValueError('compile failure')
+    with pytest.raises(ValueError, match='compile failure'), ab.compiler_settings(
+            {'ENABLE_PIPELINE_MANAGEMENT': 'false'}, lib):
+        assert lib.values[b'ENABLE_PIPELINE_MANAGEMENT'] == b'false'
+        raise ValueError('compile failure')
     assert lib.values == before
 
 
@@ -151,3 +151,25 @@ def test_handoff_candidate_keeps_all_reference_dispatch_independent():
     assert cloned.attention is not block.attention
     assert cloned.attention.decode_swa_packed
     assert not block.attention.decode_swa_packed
+
+
+def test_mirror_observer_records_keys_without_mutation_and_masks_incomplete_pair():
+    from types import SimpleNamespace
+    from vllm_gaudi.ops.deepseek_v41_math import pack_fp4, unpack_fp4
+
+    packed = pack_fp4(torch.randn(256, 128).bfloat16(), 32)
+    mirror = unpack_fp4(packed, 128, 32)
+    mirror[128] = 99  # The incomplete pair is invisible to scoring.
+    cache = SimpleNamespace(ratio=2, index=packed, index_mirror=mirror)
+    selection = SimpleNamespace(indices=torch.tensor([[3, 7, 11]], dtype=torch.int32))
+    block = SimpleNamespace(layer=2, attention=SimpleNamespace(owns_index=True, selection=selection))
+    shared = SimpleNamespace(sources={'2': cache}, physical_rows=lambda rows, ratio: rows)
+    program = SimpleNamespace(shared=shared, layers=[block])
+    hidden = torch.randn(1, 5120).bfloat16()
+    record = ab.observe_mirror_step(program, hidden, 256)
+    keys = record['keys']['2']
+    assert not keys['visible'][-1] and keys['rows'][-1] == 128
+    assert torch.equal(keys['mirror'][keys['visible']], keys['canonical'][keys['visible']])
+    assert torch.equal(record['hidden'], hidden) and torch.equal(record['indices']['2'], selection.indices)
+    record['hidden'].zero_()
+    assert hidden.count_nonzero() > 0

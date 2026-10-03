@@ -9,7 +9,7 @@ habana::PartialOutputMetaDataVector metadata(const at::Stack& s) {
     const auto ratio = s.at(3).toInt();
     TORCH_CHECK((ratio == 1 || ratio == 2) && common.scalar_type() == at::kFloat && common.dim() == 2 &&
                 common.size(0) >= 1 && common.size(0) <= 128 && common.size(1) >= 8 &&
-                common.size(1) <= 32768 && common.size(1) % 8 == 0 &&
+                common.size(1) <= 65536 && common.size(1) % 8 == 0 &&
                 blocks.scalar_type() == at::kInt && blocks.dim() == 2 && blocks.size(0) == common.size(0) &&
                 blocks.size(1) >= 1 && blocks.size(1) <= 2048 &&
                 positions.scalar_type() == at::kInt && positions.dim() == 1 && positions.size(0) == common.size(0),

@@ -58,6 +58,33 @@ def populate(bank, owner, blocks, seed):
         getattr(cache, name).index_copy_(0, rows, values)
 
 
+def test_handoff_warmup_uses_canonical_pool_and_retires_its_owner(bank, monkeypatch):
+    calls = []
+    restore = bank._restore_decoded
+
+    def read(slot, position):
+        blocks = bank.page_versions[slot.index][1]
+        assert blocks == tuple(range(1, (position + 127) // 128 + 1))
+        calls.append(position)
+        restore(slot, position)
+
+    monkeypatch.setattr(bank, "_restore_decoded", read)
+    bank.warmup_single_handoff(32)
+    assert calls == [2048]
+    assert not bank.slots.owners and bank.single_owner is None and bank.prefill_owner is None
+    monkeypatch.setattr(bank, "_restore_decoded", restore)
+    real = bank.acquire("real")
+    populate(bank, real, [3, 5, 7, 9, 11], 11)
+    bank.bind_single(real, 513)
+    check_mirror(bank, real, 513)
+
+
+def test_handoff_warmup_cannot_overwrite_an_active_request(bank):
+    bank.acquire("active")
+    with pytest.raises(RuntimeError, match="idle request bank"):
+        bank.warmup_single_handoff(32)
+
+
 def check_mirror(bank, owner, position):
     shared = bank.program.shared
     attention = bank.program.layers[0].attention

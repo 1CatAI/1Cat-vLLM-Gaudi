@@ -19,8 +19,9 @@ SEQUENCE_FUSED_LAYOUT = True
 
 def can_partition_prefill_mla(query_shape, columns, tensor_parallel_size, search_length):
     """Shared admission for query-local indices and the existing MLA exchange."""
-    return (tensor_parallel_size == 4 and tuple(query_shape) in ((4096, 16, 512), (16384, 16, 512)) and columns == 640
-            and (search_length == 16384 or (search_length == 32768 and query_shape[0] == 16384)))
+    return (tensor_parallel_size == 4 and tuple(query_shape) in
+            tuple((rows, 16, 512) for rows in (1024, 2048, 4096, 8192, 16384))
+            and columns == 640 and search_length > 0)
 
 
 def _retire_stream():
@@ -54,6 +55,27 @@ def _compiled_exchanged_mla64(signature):
     return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
 
 
+def _paged_exchanged_mla64(query, swa, indices, sink, packed, pages, ratio):
+    """Load only the query owner's selected KV rows inside the MLA recipe."""
+    selected = indices[:, 128:]
+    if not 1 <= selected.shape[0] <= 128 or selected.shape[1] != 512:
+        raise ValueError("Paged sequence MLA requires a bounded selected-row workspace")
+    main = torch.ops.custom_op.custom_deepseek_v41_prefill_main_decode_gaudi2(
+        packed, pages, selected.reshape(-1).contiguous(), ratio)
+    cache = torch.cat((swa, main), 0)
+    local = torch.arange(selected.numel(), dtype=torch.int32, device=selected.device).reshape_as(selected)
+    local = torch.where(selected >= 0, local + swa.shape[0], -1)
+    ids = torch.cat((indices[:, :128], local), -1)
+    return _exchanged_mla64(query, cache, ids, sink)
+
+
+@lru_cache(maxsize=32)
+def _compiled_paged_exchanged_mla64(signature):
+    entry = FunctionType(_paged_exchanged_mla64.__code__.replace(co_name=f"paged_sequence_mla_{signature}"),
+                         _paged_exchanged_mla64.__globals__)
+    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+
+
 def sequence_prefill_mla(query,
                          cache,
                          indices,
@@ -64,7 +86,8 @@ def sequence_prefill_mla(query,
                          query_chunk=None,
                          fused_layout=None,
                          retire_chunks=True,
-                         indices_partitioned=False):
+                         indices_partitioned=False,
+                         paged_main=None):
     """Exchange complete query rows, preserve each softmax and PV reduction.
 
     HCCL calls use the normal blocking PyTorch contract. All layout copies and
@@ -78,6 +101,9 @@ def sequence_prefill_mla(query,
     index_rows = query.shape[0] // 4 if indices_partitioned else query.shape[0]
     if full_sink.shape != (64, ) or indices.ndim != 2 or indices.shape[0] != index_rows:
         raise ValueError("Sequence MLA requires 64 gathered sinks and matching query-owned index rows")
+    if paged_main is not None and (indices.shape[1] != 640 or len(paged_main) != 3
+                                   or paged_main[2] not in (1, 2)):
+        raise ValueError("Paged sequence MLA requires SWA IDs and logical selected IDs with ratio 1/2")
     chunk = SEQUENCE_QUERY_CHUNK if query_chunk is None else query_chunk
     fused_layout = SEQUENCE_FUSED_LAYOUT if fused_layout is None else fused_layout
     if not isinstance(chunk, int) or chunk < 4 or chunk % 4:
@@ -101,7 +127,8 @@ def sequence_prefill_mla(query,
                        group,
                        output[start:end],
                        fused_layout=fused_layout,
-                       indices_partitioned=indices_partitioned)
+                       indices_partitioned=indices_partitioned,
+                       paged_main=paged_main)
         # Eager HCCL/compiled submissions can retain tensor owners after Python
         # references are gone. Retire the bounded chunk before admitting another
         # exchange working set; keep this cost inside the caller's chain timer.
@@ -119,7 +146,8 @@ def _sequence_tile(query,
                    returned,
                    *,
                    fused_layout=False,
-                   indices_partitioned=False):
+                   indices_partitioned=False,
+                   paged_main=None):
     # Chunk only the independent query dimension. Full selected-row softmax and
     # PV reductions remain unchanged, and every output returns to its head owner.
     tokens, heads, width = query.shape
@@ -128,15 +156,22 @@ def _sequence_tile(query,
     received = torch.empty_like(query)
     with prefill_event_span("mla_query_exchange", rows=tokens):
         dist.all_to_all_single(received, query.contiguous(), group=group)
-    if fused_layout:
+    if fused_layout or paged_main is not None:
         received = received.reshape(4, rows, heads, width)
         packed = torch.empty_like(received)
         with prefill_event_span("mla_local_tiles", rows=rows):
-            for begin in range(0, rows, 512):
-                stop = min(begin + 512, rows)
-                signature = (stop - begin, rows, tuple(cache.shape), indices.shape[1])
+            tile = 128 if paged_main is not None else 512
+            for begin in range(0, rows, tile):
+                stop = min(begin + tile, rows)
                 selected = selected_rows[begin:stop].contiguous()
-                block = _compiled_exchanged_mla64(signature)(received[:, begin:stop], cache, selected, full_sink)
+                if paged_main is not None:
+                    main, pages, ratio = paged_main
+                    signature = (stop - begin, rows, tuple(cache.shape), tuple(main.shape), tuple(pages.shape), ratio)
+                    block = _compiled_paged_exchanged_mla64(signature)(
+                        received[:, begin:stop], cache, selected, full_sink, main, pages, ratio)
+                else:
+                    signature = (stop - begin, rows, tuple(cache.shape), indices.shape[1])
+                    block = _compiled_exchanged_mla64(signature)(received[:, begin:stop], cache, selected, full_sink)
                 packed[:, begin:stop].copy_(block)
                 del block, selected
         del received

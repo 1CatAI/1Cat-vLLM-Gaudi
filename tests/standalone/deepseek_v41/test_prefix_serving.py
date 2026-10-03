@@ -192,6 +192,7 @@ def test_inline_worker_keeps_full_transaction_and_restores_interior_history(monk
     runtime.begin(AuxiliaryPrefixOperations(captures={"source": descriptor}))
     chunks = [(0, tokens)]
     assert runtime.chunks("source", 0, chunks, inline_eligible=True) == chunks
+    runtime.activate_chunk("source", 0, len(tokens))
     capture = bank.program.shared.inline_prefix_capture
     for layer, state in bank.layers.items():
         for name, value in state.named_buffers(recurse=False):
@@ -231,6 +232,35 @@ def test_fallback_checkpoint_retains_boundary_using_only_prepared_buckets(monkey
     assert any(offset + len(values) == 16256 for offset, values in chunks)
     assert not any(offset < 16256 < offset + len(values) for offset, values in chunks)
     assert max(len(values) for _, values in chunks) == 8192
+
+
+@pytest.mark.parametrize("start,sizes,boundary", [(0, [1024], 896),
+                                                (16384, [4096, 1024], 21376),
+                                                (32768, [8192, 1024], 41856)])
+def test_checkpoint_does_not_split_short_or_multi_tile_tail(start, sizes, boundary):
+    bank, source, _, _ = make_bank()
+    bank.program.shared = SimpleNamespace(inline_prefix_capture=None)
+    runner = SimpleNamespace(vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=2)),
+                             model=SimpleNamespace(batch_state=bank), prefill_capacity=16384)
+    runtime = PrefixCheckpoints(runner)
+    descriptor = AuxiliaryPrefixDescriptor(0, 1, boundary, b"prefix", (tuple(range(1, boundary // 128 + 1)),))
+    runtime.operations = AuxiliaryPrefixOperations(captures={"source": descriptor})
+    chunks, offset = [], 0
+    for size in sizes:
+        chunks.append((offset, list(range(start + offset, start + offset + size))))
+        offset += size
+    result = runtime.chunks("source", start, chunks, inline_eligible=True)
+    assert result == chunks
+    capture = runtime.inline["source"]
+    for offset, values in result:
+        runtime.activate_chunk("source", start + offset, len(values))
+        active = bank.program.shared.inline_prefix_capture
+        if start + offset <= boundary < start + offset + len(values):
+            assert active is capture
+        else:
+            assert active is None
+    runtime.activate_chunk("source", start + sum(sizes), 1)
+    assert bank.program.shared.inline_prefix_capture is None
 
 
 def test_checkpoint_publication_preserves_owner_for_remaining_prompt_tail(monkeypatch):

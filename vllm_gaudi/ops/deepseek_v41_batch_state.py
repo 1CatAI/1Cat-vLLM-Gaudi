@@ -257,6 +257,27 @@ class BatchStageState:
                             rows, width=width, group=group: _decode_rows(packed, rows, width=width, group=group))
                     destination[start:end].copy_(read(packed, rows))
 
+    def warmup_single_handoff(self, pool_blocks):
+        """Prepare short-prefix codecs against the final scheduler pool.
+
+        Stage capture alone does not consume these readers: a short request
+        restores its packed rows before the first native stage. Use the same
+        ownership transition at startup, then retire its temporary slot.
+        """
+        from vllm_gaudi.ops.deepseek_v41_indexer import INDEX_MME_HOT_TOKENS
+
+        if self.slots.owners or self.pending is not None:
+            raise RuntimeError("Handoff warmup requires an idle request bank")
+        position = min(INDEX_MME_HOT_TOKENS, self.pages.shape[1] * 128, (pool_blocks - 1) * 128)
+        if position < 1:
+            raise ValueError("Handoff warmup requires a non-null scheduler page")
+        slot = self.acquire("__v41_decode_handoff_warmup__")
+        try:
+            self.publish_pages(slot, range(1, (position + 127) // 128 + 1), pool_blocks)
+            self.bind_single(slot, position)
+        finally:
+            self.release(slot.request_id)
+
     def begin(self, slots):
         if self.pending is not None:
             raise RuntimeError("Batch scratch still has a previous consumer")

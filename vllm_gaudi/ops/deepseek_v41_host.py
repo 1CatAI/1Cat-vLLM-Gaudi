@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import sys
 
 import numpy as np
 import torch
@@ -87,9 +88,24 @@ def _configured_host_native(directory):
     manifest = json.loads((root / "deepseek_v41_build.json").read_text())
     if len(libraries) != 1 or file_hash(libraries[0]) != manifest["binaries"].get(libraries[0].name):
         raise RuntimeError("Engram host binary differs from its configured build manifest")
-    spec = importlib.util.spec_from_file_location("dsv41_host_gather", libraries[0])
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    name = "vllm_gaudi.lib.dsv41_host_gather"
+    module = sys.modules.get(name) or sys.modules.get("dsv41_host_gather")
+    if module is not None:
+        if file_hash(Path(module.__file__)) != manifest["binaries"][libraries[0].name]:
+            raise RuntimeError("Engram host generation changed; start a fresh worker")
+    else:
+        spec = importlib.util.spec_from_file_location(name, libraries[0])
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+    # Package imports and an explicit installed directory must share the same
+    # pybind type registration. Loading both names independently registers the
+    # HostRows type twice even when their binary bytes are identical.
+    sys.modules[name] = module
     if (
         module.abi_version != manifest["host_gather_abi_version"]
         or module.c1_abi_version != manifest["host_c1_abi_version"]

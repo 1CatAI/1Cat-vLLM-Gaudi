@@ -52,9 +52,9 @@ def _bounded_mme_scores(
     else:
         rows = torch.arange(search_rows, dtype=torch.int32, device=positions.device)
     if not reindex and decoded_keys is not None:
-        scores = torch.ops.custom_op.custom_deepseek_v41_prefill_index_scores_gaudi2(
-            query, weights, decoded_keys[:search_rows].contiguous(), positions, rows, ratio, local_heads
-        )
+        from vllm_gaudi.ops.deepseek_v41_index_mirror import mirror_source_scores
+
+        scores = mirror_source_scores(query, weights, decoded_keys, positions, rows, ratio, local_heads)
     else:
         from vllm_gaudi.ops.deepseek_v41_decode_index import native_index_tile
         from vllm_gaudi.ops.deepseek_v41_index_mirror import mirror_index_tile

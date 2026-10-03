@@ -75,17 +75,18 @@ class PrefixCheckpoints:
         descriptor = self.operations.captures.get(request_id) if self.operations is not None else None
         if descriptor is not None and inline_eligible:
             chunks = list(chunks)
-            if len(chunks) == 1:
-                offset, chunk = chunks[0]
+            for offset, chunk in chunks:
                 begin, end = start + offset, start + offset + len(chunk)
-                if begin + 4096 < descriptor.num_tokens < end:
+                # The largest auxiliary ring has 256 rows. The enclosing
+                # finite tile can save its interior boundary without splitting
+                # the prompt, including short prompts and multi-tile tails.
+                if begin + 256 <= descriptor.num_tokens < end:
                     from vllm_gaudi.ops.deepseek_v41_prefix_state import InlinePrefixCapture
 
                     bank = self.runner.model.batch_state
                     slot = bank.slots.owners[request_id]
                     capture = InlinePrefixCapture(bank, slot, begin, end, descriptor.num_tokens)
                     self.inline[request_id] = capture
-                    bank.program.shared.inline_prefix_capture = capture
                     return chunks
         if descriptor is None:
             return chunks
@@ -100,6 +101,12 @@ class PrefixCheckpoints:
             result.extend((offset + inner, part)
                           for inner, part in target_chunks(values, self.runner.prefill_capacity))
         return result
+
+    def activate_chunk(self, request_id, start, count):
+        """Expose a checkpoint only to its actual boundary-producing tile."""
+        capture = self.inline.get(request_id)
+        active = capture if capture is not None and (start, start + count) == (capture.start, capture.end) else None
+        self.runner.model.batch_state.program.shared.inline_prefix_capture = active
 
     def capture_at(self, request_id, position):
         if self.operations is None or request_id in self.captured:

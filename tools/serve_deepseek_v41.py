@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Start an installed V4.1 service and maintain its machine CPU allocation."""
 import argparse
+import errno
 import json
 import os
 from pathlib import Path
@@ -11,10 +12,17 @@ import time
 import urllib.request
 
 
-def atomic_json(path, value):
+def atomic_json(path, value, *, required=True):
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(value, indent=2) + "\n")
-    temporary.replace(path)
+    try:
+        temporary.write_text(json.dumps(value, indent=2) + "\n")
+        temporary.replace(path)
+    except OSError as error:
+        if required or error.errno not in (errno.ENOSPC, errno.EDQUOT):
+            raise
+        temporary.unlink(missing_ok=True)
+        return False
+    return True
 
 
 def cpu_set(values):
@@ -119,6 +127,12 @@ def main():
     args, extra = parser.parse_known_args()
     root = args.installation.resolve()
     settings = json.loads((root / "settings.json").read_text())
+    compiler_temp = settings.get("environment", {}).get("TMPDIR")
+    if compiler_temp:
+        # A configured tmpfs scratch directory must be recreated after reboot.
+        temporary_path = Path(compiler_temp).expanduser()
+        compiler_temp = str((temporary_path if temporary_path.is_absolute() else root / temporary_path).resolve())
+        Path(compiler_temp).mkdir(mode=0o700, parents=True, exist_ok=True)
     allocation = settings["cpu_allocation"]
     reserved = set(allocation["worker_main"] + allocation["engine_main"] + allocation["api_main"] +
                    allocation["control_helpers"])
@@ -131,6 +145,8 @@ def main():
     isolated = isolate_desktop(reserved) if settings.get("isolate_user_processes", False) else []
     atomic_json(log_dir / "background-affinity.json", isolated)
     environment = dict(os.environ)
+    if compiler_temp:
+        environment["TMPDIR"] = compiler_temp
     for key in list(environment):
         if key.startswith(("VLLM_HPU_DSV", "VLLM_HPU_TP2", "DSV41_")) or key in ("PYTHONPATH", "LD_PRELOAD"):
             environment.pop(key)
@@ -156,6 +172,7 @@ def main():
         signal.signal(signal.SIGTERM, stop)
         signal.signal(signal.SIGINT, stop)
         ready = False
+        status_write_failed = False
         while child.poll() is None:
             if not ready:
                 try:
@@ -168,10 +185,15 @@ def main():
                     print("Ready; maintaining main/helper CPU isolation", flush=True)
             if ready:
                 record["processes"] = maintain_affinity(child.pid, settings)
-            atomic_json(log_dir / "process.json", record)
+            status_written = atomic_json(log_dir / "process.json", record, required=False)
+            if not status_written and not status_write_failed:
+                print("Status metadata storage is full; keeping inference running and retrying", flush=True)
+            elif status_written and status_write_failed:
+                print("Status metadata writes recovered", flush=True)
+            status_write_failed = not status_written
             time.sleep(1)
         record.update(exit_code=child.returncode, finished_at=time.time())
-        atomic_json(log_dir / "process.json", record)
+        atomic_json(log_dir / "process.json", record, required=False)
     raise SystemExit(child.returncode)
 
 

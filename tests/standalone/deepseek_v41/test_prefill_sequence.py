@@ -122,7 +122,53 @@ def test_wrong_group_fails_before_communication(monkeypatch):
                                       group=object())
 
 
-@pytest.mark.parametrize("tokens,search", ((4096, 16384), (16384, 16384), (16384, 32768)))
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_paged_consumer_preserves_global_ids_and_uses_current_pages(monkeypatch, ratio):
+    from vllm_gaudi.ops.deepseek_v41_math import pack_fp4, unpack_fp4
+
+    torch.manual_seed(879)
+    rows, width = 3, 128 // ratio
+    source_rows = 131072
+    packed = pack_fp4(torch.randn(source_rows, 512).bfloat16(), 16)
+    pages = torch.randperm(source_rows // width).int()
+    selected = torch.randint(0, source_rows, (rows, 512)).int()
+    selected[:, :5] = torch.tensor([-1, 65535, 65536, 65536, source_rows - 1])
+    swa = torch.randn(20, 512).bfloat16()
+    swa_ids = torch.randint(0, 20, (rows, 128)).int()
+    indices = torch.cat((swa_ids, selected), -1)
+    query = torch.randn(4, rows, 16, 512).bfloat16()
+    sink = torch.arange(64).float()
+
+    def decode(cache, table, logical, actual_ratio):
+        assert actual_ratio == ratio and logical.numel() <= 65536
+        physical = table[(logical.clamp_min(0) // width).long()].long() * width + logical.clamp_min(0) % width
+        decoded = unpack_fp4(cache[physical], 512, 16)
+        return torch.where(logical[:, None] >= 0, decoded, 0)
+
+    def consume(q, cache, ids, sinks):
+        assert torch.equal(sinks, sink)
+        assert cache.shape == (20 + rows * 512, 512)
+        actual = cache[ids.clamp_min(0).long()]
+        actual = torch.where(ids[..., None] >= 0, actual, 0)
+        valid = selected.clamp_min(0).long()
+        physical = pages[(valid // width)].long() * width + valid % width
+        main = torch.where(selected[..., None] >= 0, unpack_fp4(packed[physical], 512, 16), 0)
+        assert torch.equal(actual[:, :128], swa[swa_ids.long()])
+        assert torch.equal(actual[:, 128:], main)
+        return (q.float() + actual.float().sum(1)[:, None, :] / 640).bfloat16()
+
+    monkeypatch.setattr(torch.ops.custom_op, "custom_deepseek_v41_prefill_main_decode_gaudi2", decode, raising=False)
+    monkeypatch.setattr(sequence, "_mla64", consume)
+    first = sequence._paged_exchanged_mla64(query, swa, indices, sink, packed, pages, ratio)
+    pages.copy_(pages.flip(0))
+    second = sequence._paged_exchanged_mla64(query, swa, indices, sink, packed, pages, ratio)
+    assert first.shape == query.shape and second.shape == query.shape and not torch.equal(first, second)
+
+
+@pytest.mark.parametrize("tokens,search", ((4096, 16384), (16384, 16384), (4096, 32768), (16384, 32768),
+                                        (4096, 65536), (16384, 65536), (4096, 131072),
+                                        (16384, 262144), (16384, 524288), (8192, 131072),
+                                        (1024, 524288), (2048, 524288)))
 def test_serving_uses_tp_group_and_caches_only_immutable_sinks(monkeypatch, tokens, search):
     import vllm.distributed
     from vllm_gaudi.ops.deepseek_v41_paged_attention import PagedCSA2Attention
@@ -158,9 +204,8 @@ def test_serving_uses_tp_group_and_caches_only_immutable_sinks(monkeypatch, toke
 
 @pytest.mark.parametrize("tokens,heads,columns,tp,search", [
     (16384, 16, 128, 4, 16384),
-    (8192, 16, 640, 4, 16384),
-    (4096, 16, 640, 4, 32768),
-    (16384, 16, 640, 4, 65536),
+    (512, 16, 640, 4, 16384),
+    (4096, 16, 640, 4, 0),
     (16384, 32, 640, 2, 16384),
 ])
 def test_unqualified_shapes_keep_ordinary_mla(monkeypatch, tokens, heads, columns, tp, search):
