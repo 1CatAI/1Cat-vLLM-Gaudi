@@ -1345,6 +1345,9 @@ class PreparedStage(nn.Module):
         self.decode_static_factories = self.decode_static_int32
         self.bf16_head = gaudi_envs.VLLM_HPU_DSV41_BF16_LM_HEAD
         self.device_sampling = gaudi_envs.VLLM_HPU_DSV41_DEVICE_SAMPLING and not self.dspark
+        self.device_next_position = gaudi_envs.VLLM_HPU_DSV41_DEVICE_NEXT_POSITION
+        if self.device_next_position and (not self.device_sampling or pipeline_parallel_size != 1):
+            raise ValueError("Device position continuation requires sampled C1 replay without a PP boundary")
         if self.device_sampling:
             self.register_buffer("sampling_params", torch.tensor([[0., 1., -1.]], device=device))
             self.register_buffer("sampling_seed", torch.zeros(1, dtype=torch.int32, device=device))
@@ -2025,6 +2028,7 @@ class PreparedGreedyTail(nn.Module):
                                               native_fp32_gather=True)
         self.is_last_stage = True
         self.device_sampling = getattr(stage, "device_sampling", False)
+        self.device_next_position = getattr(stage, "device_next_position", False)
         if self.device_sampling:
             self.register_buffer("sampling_params", stage.sampling_params)
             self.register_buffer("sampling_seed", stage.sampling_seed)
@@ -2047,7 +2051,12 @@ class PreparedGreedyTail(nn.Module):
             packet = self.all_gather(local_nucleus_packet(local, controls, self.tp_rank, 128), dim=-1)
             tp_size = packet.shape[-1] // (3 + 2 * 128)
             selected, covered = sample_nucleus_packet(packet, controls, tp_size=tp_size, width=128)
-            return pack_sample_status(selected, covered), local, controls, selected
+            payload = pack_sample_status(selected, covered), local, controls, selected
+            if self.device_next_position:
+                # A fresh, fixed-address replay output. It does not depend on
+                # the provisional sampled token, so full repair keeps it valid.
+                payload += (positions[:1] + 1,)
+            return payload
         candidates = self.all_gather(local_greedy_candidate(local, self.tp_rank), dim=-1)
         return select_greedy_candidate(candidates).to(torch.int32), local
 

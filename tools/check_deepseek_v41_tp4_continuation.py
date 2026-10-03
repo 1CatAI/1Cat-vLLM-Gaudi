@@ -540,6 +540,7 @@ def main():
 
             def chain(device, steps, *, measure=True, native_positions=True, engine=None, warm_steps=0, trace=None,
                       forced_tokens=None, observer=None):
+                position_tensor = positions
                 queue_markers = []
 
                 def mark(name, index):
@@ -598,8 +599,10 @@ def main():
                         if args.trace_entry_phases or args.queue_marker_only:
                             mark('begin', index)
                         position = continuation_position(context_tokens, index)
+                        next_device_position = None
                         if engine in sampling_payloads:
                             payload = sampling_payloads.pop(engine)
+                            next_device_position = payload[4] if len(payload) == 5 else None
                             cpu_status, status_done = readback
                             status_done.synchronize()
                             covered = bool(int(cpu_status[0, 0]) & 1)
@@ -611,12 +614,14 @@ def main():
                                 readback = bridge.copy_sampled_tokens_to_host(selected)
                                 report['bounded_sampler_fallbacks'] = report.get('bounded_sampler_fallbacks', 0) + 1
                         if device:
-                            if native_positions:
-                                bank.copy_into(positions, position)
+                            if next_device_position is not None:
+                                position_tensor = next_device_position
+                            elif native_positions:
+                                bank.copy_into(position_tensor, position)
                             else:
-                                positions.copy_(bank.view(position, 1))
+                                position_tensor.copy_(bank.view(position, 1))
                             if index == 0:
-                                actual = int(positions.cpu()[0])
+                                actual = int(position_tensor.cpu()[0])
                                 if actual != context_tokens:
                                     raise RuntimeError(f'Continuation device position {actual} != {context_tokens}')
                                 report['checked_first_device_position'] = actual
@@ -627,12 +632,12 @@ def main():
                             if args.shared_stage_replay:
                                 prefix_started = engine.input_variant_ready(stage.search_length)
                                 if prefix_started:
-                                    engine.begin_segmented_from_input_ids(positions, token_input)
+                                    engine.begin_segmented_from_input_ids(position_tensor, token_input)
                                 if args.trace_entry_phases or args.queue_marker_only:
                                     mark('native_prefix_enqueued', index)
                             else:
                                 residual, pre = embedding(token_input)
-                                residual, pre = engine.prefix(residual, pre, positions, token_input,
+                                residual, pre = engine.prefix(residual, pre, position_tensor, token_input,
                                                                (host.device_rows, host.prefix_late_placeholder))
                         cpu, done = readback
                         done.synchronize()
@@ -649,14 +654,16 @@ def main():
                         if device:
                             rows = host.consume_device_c1('chain'), packed[1]
                             if args.shared_stage_replay:
-                                hidden = (engine.finish_segmented(positions, token_input, rows)
-                                          if prefix_started else engine.from_input_ids(positions, token_input, rows))[0]
+                                output = (engine.finish_segmented(position_tensor, token_input, rows)
+                                          if prefix_started
+                                          else engine.from_input_ids(position_tensor, token_input, rows))
+                                hidden = output[0]
                             else:
-                                hidden = engine.suffix(residual, pre, positions, token_input, rows)[0]
+                                hidden = engine.suffix(residual, pre, position_tensor, token_input, rows)[0]
                         else:
                             controls.upload([value], position)
                             residual, pre = embedding(ids)
-                            hidden = engine(residual, pre, positions, ids, packed)[0]
+                            hidden = engine(residual, pre, position_tensor, ids, packed)[0]
                         selected = sampler(hidden, engine)
                         if observer is not None:
                             if measure:

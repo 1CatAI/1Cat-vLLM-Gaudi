@@ -1208,7 +1208,7 @@ class V41ModelRunner:
 
     @torch.inference_mode()
     def _repair_device_sample(self, payload, destination):
-        _, local, controls, _ = payload
+        _, local, controls, _ = payload[:4]
         owner = self._device_sampling_owner
         selected = self._sample_full_local(local, controls, filtered=owner[3] < 1 or owner[4] > 0)
         destination.copy_(selected)
@@ -1547,6 +1547,11 @@ class V41ModelRunner:
         # intentionally owns just the persistent captured view.
         ids = self.input_views[count] if count in self.input_views else self.input_ids[:count]
         positions = self.position_views[count] if count in self.position_views else self.positions[:count]
+        device_position = getattr(self, "_next_position", None)
+        continuing_position = (decode and count == 1 and not reset and device_position is not None
+                               and device_position[:2] == (request_id, start))
+        if continuing_position:
+            positions = device_position[2]
         # A scheduler may feed a normal prompt one token at a time.  The
         # resulting model transaction has exactly the same C1 tensor geometry
         # and cache writes as decode; only sampling/commit semantics remain
@@ -1674,7 +1679,11 @@ class V41ModelRunner:
                     ids.copy_(self._next_input[2])
             else:
                 ids.copy_(torch.tensor(tokens, dtype=ids.dtype, device="cpu"))
-            if self.position_bank is not None and graph_c1:
+            if continuing_position:
+                # The previous native tail produced this row. Bind it as the
+                # next fixed input; no external position-copy recipe is needed.
+                pass
+            elif self.position_bank is not None and graph_c1:
                 if getattr(self.model, "tensor_parallel_size", 2) == 4:
                     if not self.model.decode_prefix_pending:
                         self.position_bank.copy_into(positions, start)

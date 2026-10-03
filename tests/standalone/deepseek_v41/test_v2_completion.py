@@ -23,6 +23,31 @@ class Done:
             raise RuntimeError("not ready")
 
 
+@pytest.mark.parametrize("position", [127, 16384, 131072, 524287])
+@pytest.mark.parametrize("temperature", [0., 1.])
+def test_tail_next_position_is_independent_of_candidate_certificate(position, temperature):
+    from vllm_gaudi.models.deepseek_v41_program import PreparedGreedyTail
+
+    logits = torch.linspace(-1, 1, 512).reshape(1, -1)
+    owner = SimpleNamespace(
+        _head_projection=lambda hidden: logits, device_sampling=True, device_next_position=True,
+        sampling_params=torch.tensor([[temperature, .95, -1.]]),
+        sampling_seed=torch.tensor([42], dtype=torch.int32),
+        sampling_origin=torch.tensor([position - 1], dtype=torch.int32), tp_rank=0,
+        all_gather=lambda packet, dim: torch.cat([packet] * 4, dim),
+    )
+    positions = torch.tensor([position], dtype=torch.int32)
+    payload = PreparedGreedyTail.forward(owner, torch.empty(1, 5120), positions)
+    assert len(payload) == 5
+    assert payload[4].dtype == torch.int32 and payload[4].tolist() == [position + 1]
+    assert positions.tolist() == [position]
+    assert payload[4].data_ptr() != positions.data_ptr()
+    if temperature:
+        # Duplicate candidate scores force exact full fallback, while the
+        # continuation coordinate remains valid and token independent.
+        assert (payload[0] & 1).item() == 0
+
+
 @pytest.mark.parametrize("failed", [False, True])
 def test_sampler_shutdown_drains_before_retirement_and_is_idempotent(failed):
     from concurrent.futures import Future
@@ -399,7 +424,8 @@ def test_device_engram_precedes_prefix_and_host_token_wait(monkeypatch):
 
 
 @pytest.mark.parametrize("covered", [False, True])
-def test_sampling_stages_only_independent_inputs_before_certifying_prefix(monkeypatch, covered):
+@pytest.mark.parametrize("device_position", [False, True])
+def test_sampling_stages_only_independent_inputs_before_certifying_prefix(monkeypatch, covered, device_position):
     for suffix in ("EARLY_INPUT_COMMIT", "SEGMENTED_PREFIX", "DEVICE_ENGRAM"):
         monkeypatch.setenv("VLLM_HPU_DSV41_V2_" + suffix, "1")
     runner, calls = fixture()
@@ -424,13 +450,19 @@ def test_sampling_stages_only_independent_inputs_before_certifying_prefix(monkey
     runner._completion = CompletionRecord(
         "a", 2, 1, torch.tensor([[22 + int(covered)]]), OrderedDone(), runner.pp.commit_token,
         lambda: calls.append(("repair",)) or 19,
+        torch.tensor([2], dtype=torch.int32) if device_position else None,
     )
     runner._consume_completion(SimpleNamespace())
     assert [row[0] for row in calls] == (
-        ["model", "position", "certificate"] + ([] if covered else ["repair"])
+        ["model"] + ([] if device_position else ["position"]) + ["certificate"] + ([] if covered else ["repair"])
         + ["device_engram", "prefix", "handoff", "packet"]
     )
     assert runner.requests["a"].output[-1] == (11 if covered else 19)
+    if device_position:
+        assert runner._next_position[:2] == ("a", 2)
+        assert runner._next_position[2].tolist() == [2]
+    else:
+        assert runner._next_position is None
 
 
 @pytest.mark.parametrize("policy,before,handoff", [

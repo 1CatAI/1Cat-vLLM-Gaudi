@@ -359,8 +359,11 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
             if factory is None:
                 program.decode_static_int32 = name in (
                     'dense_fp8_static_int32', 'handoff_int32_literals',
-                    'handoff_static_factories', 'handoff_static_merged_segments')
-                program.decode_static_factories = name in ('handoff_static_factories', 'handoff_static_merged_segments')
+                    'handoff_static_factories', 'handoff_static_merged_segments',
+                    'handoff_sampling_full', 'handoff_sampling_bounded')
+                program.decode_static_factories = name in (
+                    'handoff_static_factories', 'handoff_static_merged_segments',
+                    'handoff_sampling_full', 'handoff_sampling_bounded')
                 program.decode_merge_mhc_partitions = name == 'handoff_static_merged_segments'
             if name.startswith('handoff_expert_sequential'):
                 import torch
@@ -391,7 +394,8 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
                 program.register_buffer('sampling_origin', torch.tensor(
                     [args.context_tokens-1], dtype=torch.int32, device='hpu'))
             replay = StageReplay(program, greedy_tail=name in (
-                'tail', 'dense_fp8_tail', 'handoff_sampling_full', 'handoff_sampling_bounded'))
+                'tail', 'dense_fp8_tail', 'handoff_sampling_full', 'handoff_sampling_bounded')
+                or getattr(program, 'candidate_replay_tail', False))
             program.replay_owner = replay
             stages[name], arms[name] = program, replay
             # Preserve actual compiler output for kernel-count changes. This
@@ -754,6 +758,7 @@ def main():
                                                'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff',
                                                'handoff_static_factories',
                                                'handoff_sampling_full',
+                                               'handoff_sampling_bounded',
                                                'long_index_packed',
                                                'long_index_paged_mme'), default='baseline')
     parser.add_argument('--steps', type=int, default=200)

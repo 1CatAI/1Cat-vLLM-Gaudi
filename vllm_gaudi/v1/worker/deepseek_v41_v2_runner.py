@@ -39,6 +39,7 @@ class CompletionRecord:
     done: object
     device_token: object
     fallback: object = None
+    device_position: object = None
     _token_lock: object = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
     _token: int | None = field(default=None, init=False, repr=False, compare=False)
 
@@ -252,7 +253,9 @@ class V41V2ModelRunner(V41ModelRunner):
             if self._prefix_started is not None and self._prefix_started != identity:
                 raise RuntimeError("V2 prefix replay belongs to another completion generation")
             if self._prefix_started is None:
-                if getattr(self.model, "tensor_parallel_size", 2) == 4:
+                if record.device_position is not None:
+                    position = record.device_position
+                elif getattr(self.model, "tensor_parallel_size", 2) == 4:
                     # A changing view offset would create a new compiled
                     # input contract every token. The fixed destination is
                     # ordered after its previous consumer by the device copy.
@@ -294,6 +297,8 @@ class V41V2ModelRunner(V41ModelRunner):
             self.model.complete_step(1)
         request.output.append(token)
         self._next_input = (request.req_id, record.start + 1, record.device_token)
+        self._next_position = ((request.req_id, record.start + 1, record.device_position)
+                               if record.device_position is not None else None)
         self._completion = None
         self._input_committed = None
         self.audit["v2_worker_commits"] = self.audit.get("v2_worker_commits", 0) + 1
@@ -401,7 +406,9 @@ class V41V2ModelRunner(V41ModelRunner):
             bridge, _ = resolve_device_runtime(tp_size)
             host, done = bridge.copy_sampled_tokens_to_host(source)
         fallback = (lambda: self._repair_device_sample(payload, token)) if payload is not None else None
-        record = CompletionRecord(request.req_id, self.pp.generation, start, host, done, token.view(1), fallback)
+        position = payload[4] if payload is not None and len(payload) == 5 else None
+        record = CompletionRecord(request.req_id, self.pp.generation, start, host, done, token.view(1), fallback,
+                                  position)
         self._device_sampling_payload = None
         if fallback is not None:
             # The non-output workers do not serialize AsyncOutput. Start
