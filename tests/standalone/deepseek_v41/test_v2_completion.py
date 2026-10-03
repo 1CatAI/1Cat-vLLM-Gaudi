@@ -23,6 +23,30 @@ class Done:
             raise RuntimeError("not ready")
 
 
+@pytest.mark.parametrize("failed", [False, True])
+def test_sampler_shutdown_drains_before_retirement_and_is_idempotent(failed):
+    from concurrent.futures import Future
+
+    runner = object.__new__(V41V2ModelRunner)
+    future = Future()
+    calls = []
+    if failed:
+        future.set_exception(RuntimeError("repair failed"))
+    else:
+        future.set_result(42)
+    runner._sampling_completion_future = future
+    runner._sampling_completion_executor = SimpleNamespace(shutdown=lambda **kwargs: calls.append(kwargs))
+    if failed:
+        with pytest.raises(RuntimeError, match="repair failed"):
+            runner.prepare_shutdown()
+    else:
+        runner.prepare_shutdown()
+    assert calls == [{"wait": True}]
+    assert runner._sampling_completion_future is None
+    runner.prepare_shutdown()
+    assert calls == [{"wait": True}]
+
+
 @pytest.mark.parametrize("value", ["11-14;16-19", "11,12,13,14;16,17,18,19", "11,13-14;19,16-18"])
 def test_sampling_helper_uses_shared_cpu_list_and_range_parser(monkeypatch, value):
     from vllm_gaudi.v1.worker.deepseek_v41_v2_runner import sampling_completion_helper_cpu

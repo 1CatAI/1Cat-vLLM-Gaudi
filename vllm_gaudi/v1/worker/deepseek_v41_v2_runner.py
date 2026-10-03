@@ -92,6 +92,26 @@ class V41AsyncOutput(AsyncModelRunnerOutput):
 class V41V2ModelRunner(V41ModelRunner):
     v2_completion = True
 
+    def prepare_shutdown(self):
+        """Join sampler repair while recipes and the communicator still live."""
+        executor = getattr(self, "_sampling_completion_executor", None)
+        if executor is None:
+            return
+        try:
+            future = getattr(self, "_sampling_completion_future", None)
+            if future is not None:
+                future.result()
+        finally:
+            executor.shutdown(wait=True)
+            self._sampling_completion_executor = None
+            self._sampling_completion_future = None
+
+    def close(self):
+        self.prepare_shutdown()
+        super().close()
+
+    shutdown_inc = close
+
     def __init__(self, vllm_config, is_driver_worker=False):
         if not uses_v2(vllm_config):
             raise ValueError("The V2 HPU adapter requires explicit VLLM_HPU_DSV41_V2 selection")

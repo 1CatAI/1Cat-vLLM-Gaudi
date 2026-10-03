@@ -669,6 +669,8 @@ class HPUWorker(WorkerBase):
                 logger.info("V4.1 worker shutdown: %s", name)
 
         phase("begin")
+        if self.model_runner is not None:
+            getattr(self.model_runner, "prepare_shutdown", lambda: None)()
         if getattr(self, "_profiler_running", False):
             phase("stop active profiler")
             # Export the live sink before retiring recipes/communicators. A
