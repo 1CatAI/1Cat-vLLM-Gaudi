@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Start an installed V4.1 service and maintain its machine CPU allocation."""
 import argparse
+import errno
 import json
 import os
 from pathlib import Path
@@ -11,10 +12,17 @@ import time
 import urllib.request
 
 
-def atomic_json(path, value):
+def atomic_json(path, value, *, required=True):
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(value, indent=2) + "\n")
-    temporary.replace(path)
+    try:
+        temporary.write_text(json.dumps(value, indent=2) + "\n")
+        temporary.replace(path)
+    except OSError as error:
+        if required or error.errno not in (errno.ENOSPC, errno.EDQUOT):
+            raise
+        temporary.unlink(missing_ok=True)
+        return False
+    return True
 
 
 def cpu_set(values):
@@ -164,6 +172,7 @@ def main():
         signal.signal(signal.SIGTERM, stop)
         signal.signal(signal.SIGINT, stop)
         ready = False
+        status_write_failed = False
         while child.poll() is None:
             if not ready:
                 try:
@@ -176,10 +185,15 @@ def main():
                     print("Ready; maintaining main/helper CPU isolation", flush=True)
             if ready:
                 record["processes"] = maintain_affinity(child.pid, settings)
-            atomic_json(log_dir / "process.json", record)
+            status_written = atomic_json(log_dir / "process.json", record, required=False)
+            if not status_written and not status_write_failed:
+                print("Status metadata storage is full; keeping inference running and retrying", flush=True)
+            elif status_written and status_write_failed:
+                print("Status metadata writes recovered", flush=True)
+            status_write_failed = not status_written
             time.sleep(1)
         record.update(exit_code=child.returncode, finished_at=time.time())
-        atomic_json(log_dir / "process.json", record)
+        atomic_json(log_dir / "process.json", record, required=False)
     raise SystemExit(child.returncode)
 
 

@@ -3,6 +3,7 @@
 import argparse
 import hmac
 import http.client
+import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -59,6 +60,7 @@ def handler(upstream, key):
                 self.send_error(413)
                 return
             connection = http.client.HTTPConnection(target.hostname, target.port, timeout=1800)
+            response_started = False
             try:
                 body = self.rfile.read(length) if length else None
                 connection.request(self.command, self.path, body=body, headers={
@@ -70,12 +72,28 @@ def handler(upstream, key):
                 self.send_header("Transfer-Encoding", "chunked")
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
+                response_started = True
                 while chunk := response.read1(65536):
                     self.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
                     self.wfile.flush()
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
             except (OSError, http.client.HTTPException):
+                if not response_started:
+                    payload = json.dumps({"error": {"message": "Model service is starting or unavailable",
+                                                    "type": "service_unavailable",
+                                                    "code": "service_unavailable"}}).encode()
+                    try:
+                        self.send_response(503)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(payload)))
+                        self.send_header("Retry-After", "5")
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        self.wfile.write(payload)
+                        self.wfile.flush()
+                    except OSError:
+                        pass
                 self.close_connection = True
             finally:
                 connection.close()
