@@ -20,6 +20,15 @@ from vllm_gaudi.v1.worker.deepseek_v41_runner import (
 )
 
 
+def sampling_completion_helper_cpu():
+    import os
+    from vllm_gaudi.ops.deepseek_v4_config import parse_cpu_set
+
+    rank = int(os.environ.get("LOCAL_RANK", "0"))
+    groups = os.environ.get("VLLM_HPU_DSV4_WORKER_HELPER_CPUS", "").split(";")
+    return min(parse_cpu_set(groups[rank])) if 0 <= rank < len(groups) and groups[rank] else None
+
+
 @dataclass(frozen=True)
 class CompletionRecord:
     request_id: str
@@ -28,6 +37,7 @@ class CompletionRecord:
     host: object
     done: object
     device_token: object
+    fallback: object = None
     _token_lock: object = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
     _token: int | None = field(default=None, init=False, repr=False, compare=False)
 
@@ -48,7 +58,14 @@ class CompletionRecord:
                 else:
                     self.done.synchronize()
                     values = self.host[0].tolist()
-                if len(values) != 1 or values[0] < 0:
+                if self.fallback is not None:
+                    if len(values) != 2 or values[1] not in (0, 1):
+                        raise RuntimeError("Invalid bounded-sampling completion certificate")
+                    if not values[1]:
+                        values[0] = self.fallback()
+                elif len(values) != 1:
+                    raise RuntimeError("Invalid V2 PP token completion")
+                if values[0] < 0:
                     raise RuntimeError("Invalid V2 PP token completion")
                 object.__setattr__(self, "_token", int(values[0]))
             return self._token
@@ -196,6 +213,11 @@ class V41V2ModelRunner(V41ModelRunner):
             raise RuntimeError("V2 completion outlived its request generation")
         if record.generation != self.pp.generation or len(request.tokens) != record.start + 1:
             raise RuntimeError("V2 completion does not extend the worker's exact token prefix")
+        # Every TP worker resolves its certificate before a provisional token
+        # can enter embedding, Engram or a KV prefix. Output ranks resolve the
+        # same record from AsyncOutput; its lock makes rare repair run once.
+        if record.fallback is not None:
+            record.token()
         early = envs.VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT
         identity = self._identity(record)
         if early:
@@ -332,15 +354,37 @@ class V41V2ModelRunner(V41ModelRunner):
             self.pp.group.broadcast(token, src=1)
         elif tp_size != 4 or not (self.pp.group.is_first_rank and self.pp.group.is_last_rank):
             raise RuntimeError("TP4 device continuation requires a single pipeline stage")
+        payload = getattr(self, "_device_sampling_payload", None)
+        source = payload[0] if payload is not None else token
         if tp_size == 4:
             # load_model already verified the native ABI and retained this
             # producer. Resolving again would hash runtime libraries and scan
             # /proc/self/maps on every token, serializing the serving loop.
-            host, done = self.tp4_token_readback(token)
+            host, done = self.tp4_token_readback(source)
         else:
             bridge, _ = resolve_device_runtime(tp_size)
-            host, done = bridge.copy_sampled_tokens_to_host(token)
-        record = CompletionRecord(request.req_id, self.pp.generation, start, host, done, token.view(1))
+            host, done = bridge.copy_sampled_tokens_to_host(source)
+        fallback = (lambda: self._repair_device_sample(payload, token)) if payload is not None else None
+        record = CompletionRecord(request.req_id, self.pp.generation, start, host, done, token.view(1), fallback)
+        self._device_sampling_payload = None
+        if fallback is not None:
+            # The non-output workers do not serialize AsyncOutput. Start
+            # certificate consumption on every worker so rare full-vocabulary
+            # repair can rendezvous before rank zero publishes a token.
+            if not hasattr(self, "_sampling_completion_executor"):
+                from concurrent.futures import ThreadPoolExecutor
+                import os
+
+                helper = sampling_completion_helper_cpu()
+
+                def bind_completion_thread():
+                    if helper is not None:
+                        os.sched_setaffinity(0, {helper})
+
+                self._sampling_completion_executor = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="v41-sample", initializer=bind_completion_thread
+                )
+            self._sampling_completion_future = self._sampling_completion_executor.submit(record.token)
         self._completion = record
         self.pending = self.draft_token_ids = self._token_copy = None
         self.audit["v2_async_completions"] = self.audit.get("v2_async_completions", 0) + 1

@@ -533,9 +533,14 @@ class PreparedMoE(nn.Module):
                 if tile_shared is not None:
                     if not self.n256_fused_reduce or tile_value.shape[0] != 1:
                         raise ValueError("Shared finalize requires the C1 prequant direct-finalize path")
-                    op = torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_shared_prefetch_w2_fp8_gaudi2
+                    op = (
+                        torch.ops.custom_op
+                        .custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_shared_prefetch_w2_fp8_gaudi2
+                    )
                     if self.feature_silu:
-                        op = torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_prequant_shared_feature_silu_fp8_gaudi2
+                        op = (
+                            torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_prequant_shared_feature_silu_fp8_gaudi2
+                        )
                     return op(
                         *operands,
                         channel13,
@@ -1321,6 +1326,12 @@ class PreparedStage(nn.Module):
         self.decode_static_int32 = gaudi_envs.VLLM_HPU_DSV41_STATIC_COORDINATES
         self.decode_static_factories = self.decode_static_int32
         self.bf16_head = gaudi_envs.VLLM_HPU_DSV41_BF16_LM_HEAD
+        self.device_sampling = gaudi_envs.VLLM_HPU_DSV41_DEVICE_SAMPLING and not self.dspark
+        if self.device_sampling:
+            self.register_buffer("sampling_params", torch.tensor([[0., 1., -1.]], device=device))
+            self.register_buffer("sampling_seed", torch.zeros(1, dtype=torch.int32, device=device))
+            self.register_buffer("sampling_counter", torch.zeros(1, dtype=torch.int32, device=device))
+            self.register_buffer("sampling_origin", torch.zeros(1, dtype=torch.int32, device=device))
         if self.dspark and (self.bf16_head or gaudi_envs.VLLM_HPU_DSV41_BF16_ROUTER_GATE):
             raise ValueError("BF16 projection candidates require ordinary C1 decode")
         if self.dspark and gaudi_envs.VLLM_HPU_DSV41_SHARED_GATE_UP:
@@ -1995,11 +2006,31 @@ class PreparedGreedyTail(nn.Module):
                                               getattr(stage, "tensor_parallel_size", 2),
                                               native_fp32_gather=True)
         self.is_last_stage = True
+        self.device_sampling = getattr(stage, "device_sampling", False)
+        if self.device_sampling:
+            self.register_buffer("sampling_params", stage.sampling_params)
+            self.register_buffer("sampling_seed", stage.sampling_seed)
+            self.register_buffer("sampling_origin", stage.sampling_origin)
 
-    def forward(self, hidden):
+    def forward(self, hidden, positions=None):
         from vllm_gaudi.ops.deepseek_v41_sampling import local_greedy_candidate, select_greedy_candidate
 
         local = self._head_projection(hidden)
+        if self.device_sampling:
+            from vllm_gaudi.ops.deepseek_v41_sampling import (
+                device_sampling_controls, local_nucleus_packet, sample_nucleus_packet)
+
+            if positions is None:
+                raise ValueError("Replay sampling requires its fixed device position")
+            ordinal = positions[:1] - self.sampling_origin
+            controls = device_sampling_controls(self.sampling_params, self.sampling_seed, ordinal)
+            # Communication ownership supplies TP size; vocabulary slices are
+            # equal and token IDs remain exact in the existing FP32 peer wire.
+            packet = self.all_gather(local_nucleus_packet(local, controls, self.tp_rank, 128), dim=-1)
+            tp_size = packet.shape[-1] // (3 + 2 * 128)
+            selected, covered = sample_nucleus_packet(packet, controls, tp_size=tp_size, width=128)
+            status = torch.cat((selected, covered.to(torch.int32)), -1)
+            return status, local, controls
         candidates = self.all_gather(local_greedy_candidate(local, self.tp_rank), dim=-1)
         return select_greedy_candidate(candidates).to(torch.int32), local
 
@@ -2110,7 +2141,7 @@ class PreparedLayerGroup(nn.Module):
         value = final_collapse_rms_norm(residual, pre_mix, self.norm.weight, self.eps)
         aux = torch.cat(target_states, -1) if target_states else None
         if self.greedy_tail is not None and decode and value.shape[0] == 1:
-            return value, pre_mix, aux, *self.greedy_tail(value)
+            return value, pre_mix, aux, *self.greedy_tail(value, positions)
         return value, pre_mix, aux
 
     def forward(self, residual, pre_mix, positions, input_ids, engram_rows):

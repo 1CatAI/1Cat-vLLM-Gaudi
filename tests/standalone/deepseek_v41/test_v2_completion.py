@@ -23,6 +23,64 @@ class Done:
             raise RuntimeError("not ready")
 
 
+@pytest.mark.parametrize("value", ["11-14;16-19", "11,12,13,14;16,17,18,19", "11,13-14;19,16-18"])
+def test_sampling_helper_uses_shared_cpu_list_and_range_parser(monkeypatch, value):
+    from vllm_gaudi.v1.worker.deepseek_v41_v2_runner import sampling_completion_helper_cpu
+
+    monkeypatch.setenv("VLLM_HPU_DSV4_WORKER_HELPER_CPUS", value)
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    assert sampling_completion_helper_cpu() == 16
+    monkeypatch.setenv("LOCAL_RANK", "2")
+    assert sampling_completion_helper_cpu() is None
+
+
+@pytest.mark.parametrize("decode_start", [None, 16384])
+def test_sampling_admission_uploads_once_including_startup_request(decode_start):
+    runner = object.__new__(V41V2ModelRunner)
+    program = SimpleNamespace(device_sampling=True, sampling_params=torch.zeros(1, 3),
+                              sampling_seed=torch.zeros(1, dtype=torch.int32),
+                              sampling_counter=torch.zeros(1, dtype=torch.int32),
+                              sampling_origin=torch.zeros(1, dtype=torch.int32))
+    runner.model = SimpleNamespace(program=program)
+    runner.v2_completion = True
+    request = SimpleNamespace(req_id="admission", output=[], sampling_params=SimpleNamespace(
+        temperature=1., top_p=.95, top_k=-1, seed=42))
+    if decode_start is not None:
+        request.decode_start = decode_start
+    runner._prepare_device_sampling_request(request)
+    assert program.sampling_seed.item() == 42
+    assert program.sampling_origin.item() == (decode_start - 1 if decode_start is not None else 0)
+    program.sampling_counter.fill_(7)
+    program.sampling_origin.fill_(123)
+    runner._prepare_device_sampling_request(request)
+    assert program.sampling_counter.item() == 7
+    assert program.sampling_origin.item() == 123
+
+
+@pytest.mark.parametrize("covered", [False, True])
+def test_sync_sampling_repairs_before_publishing_token(covered):
+    runner = object.__new__(V41V2ModelRunner)
+    runner._v2_async_step = False
+    request = SimpleNamespace(req_id="sync", decode_start=1, output=[])
+    selected = torch.tensor([[11]], dtype=torch.int32)
+    status = torch.tensor([[11, int(covered)]], dtype=torch.int32)
+    payload = status, torch.zeros(1, 4), torch.zeros(1, 4)
+    runner._device_sampling_payload = payload
+    runner.pending = request, 1, 1, 1, False, True, selected
+    runner.tp4_token_readback = lambda value: (value, Done())
+    runner._token_copy = None
+    runner.pp = SimpleNamespace(device_commit_enabled=False, group=SimpleNamespace(is_last_rank=True),
+                                finish_single=lambda count, token: (count, [token]))
+    runner.model = SimpleNamespace(complete_step=lambda count: None)
+    repairs = []
+    runner._repair_device_sample = lambda value, destination: repairs.append(value) or 19
+    result = runner._sample_single()
+    assert result.sampled_token_ids == [[11 if covered else 19]]
+    assert request.output == [11 if covered else 19]
+    assert repairs == ([] if covered else [payload])
+    assert runner._device_sampling_payload is None
+
+
 @pytest.mark.parametrize("tp_size,pp_size", [(2, 2), (4, 1)])
 def test_shared_v2_configuration_accepts_complete_native_dependencies(monkeypatch, tp_size, pp_size):
     from vllm_gaudi.ops.deepseek_v41_config import validate_v2
@@ -473,3 +531,30 @@ def test_device_engram_skips_only_matching_host_layer1(monkeypatch):
     decode = Host("decode")
     model(decode).prepare_step("decode", [12], is_decode=True)
     assert decode.calls == [("prepare", "decode", [12], [False], True, True)]
+
+
+def test_covered_sampling_certificate_does_not_repair():
+    repaired = []
+    record = CompletionRecord('a', 1, 16, torch.tensor([[31, 1]], dtype=torch.int32), Done(),
+                              torch.tensor([31]), lambda: repaired.append(1))
+    assert record.token() == 31
+    assert record.token() == 31
+    assert not repaired
+
+
+def test_sampling_repair_runs_once_across_two_consumers():
+    from concurrent.futures import ThreadPoolExecutor
+
+    calls = []
+    record = CompletionRecord('a', 1, 16, torch.tensor([[31, 0]], dtype=torch.int32), Done(),
+                              torch.tensor([31]), lambda: calls.append(1) or 47)
+    with ThreadPoolExecutor(2) as pool:
+        results = list(pool.map(lambda _: record.token(), range(16)))
+    assert results == [47] * 16 and calls == [1]
+
+
+def test_sampling_bad_certificate_is_rejected():
+    record = CompletionRecord('a', 1, 16, torch.tensor([[31, 2]], dtype=torch.int32), Done(),
+                              torch.tensor([31]), lambda: 47)
+    with pytest.raises(RuntimeError, match='certificate'):
+        record.token()

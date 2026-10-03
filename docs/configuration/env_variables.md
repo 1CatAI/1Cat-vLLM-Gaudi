@@ -892,6 +892,12 @@ default off pending complete-chain and serving qualification.
 
 `VLLM_HPU_DSV41_PREFILL_ROPE` (default `1`) uses native forward and inverse RoPE for BF16 query batches of 7–16384 rows when native V4.1 RoPE is enabled. It preserves the large-query path's separate FP32 products and final BF16 rounding; C1–C6 keep their existing arithmetic. Set it to `0` to diagnose the tensor implementation. Rebuild the native extension before enabling this path.
 
+`VLLM_HPU_DSV41_DEVICE_SAMPLING` (default `0`) enables the experimental ordinary C1 native sampling tail.
+It requires the V2 completion owner. Temperature, top-p, seed and prompt origin are uploaded at request admission;
+replay derives each draw from its device position. Bounded candidates retain the full partition function and return
+an explicit coverage certificate. All TP workers resolve an uncertified result through the full sampler before
+any continuation can consume it. This option remains disabled pending complete-chain and serving qualification.
+
 `VLLM_HPU_DSV41_STATIC_COORDINATES` (default `0`) retains small immutable coordinate factories and I32
 scalar operands as resident buffers in shared native decode compilation. Dynamic positions, mutable state,
 uninitialized allocations and escaping factory outputs remain in the graph. Request data is never frozen.

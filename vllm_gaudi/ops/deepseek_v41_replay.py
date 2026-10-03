@@ -362,8 +362,8 @@ class StageReplay:
         self.latest_tail = None
         self.greedy_tail_enabled = bool(greedy_tail)
 
-    def greedy_tail_token(self, hidden):
-        """Return the token produced by this completed C1 hidden allocation."""
+    def _tail_values(self, hidden):
+        """Return outputs owned by this completed C1 hidden allocation."""
         if self.latest_tail is None:
             return None
         generation, source, values = self.latest_tail
@@ -372,12 +372,20 @@ class StageReplay:
             return None
         if hidden.data_ptr() != source.data_ptr():
             return None
-        return values[0]
+        return values
+
+    def greedy_tail_token(self, hidden):
+        values = self._tail_values(hidden)
+        if values is None:
+            return None
+        return values[0][:, :1] if getattr(self.program(), "device_sampling", False) else values[0]
+
+    def sampling_tail_values(self, hidden):
+        return self._tail_values(hidden) if getattr(self.program(), "device_sampling", False) else None
 
     def tail_local_logits(self, hidden):
-        if self.greedy_tail_token(hidden) is None or len(self.latest_tail[2]) < 2:
-            return None
-        return self.latest_tail[2][1]
+        values = self._tail_values(hidden)
+        return values[1] if values is not None and len(values) > 1 else None
 
     def _publish_tail(self, variant, outputs):
         if variant.tail_values is None:
