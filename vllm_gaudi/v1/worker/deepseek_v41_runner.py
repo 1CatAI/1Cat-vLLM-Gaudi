@@ -2384,6 +2384,7 @@ class V41ModelRunner:
             self.request_batches.warmup()
             self.model.batch_state.restore_single_bindings()
         if getattr(self, "prefix_checkpoints", None) is not None:
+            self.model.batch_state.warmup_single_handoff(self.state.blocks)
             # Profile-time pages are replaced by the scheduler pool before
             # this entry. Warm the actual serving tensor contracts, including
             # tail tiles in later search buckets, before freezing executors.
