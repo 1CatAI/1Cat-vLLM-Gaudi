@@ -234,11 +234,6 @@ class V41V2ModelRunner(V41ModelRunner):
             raise RuntimeError("V2 completion outlived its request generation")
         if record.generation != self.pp.generation or len(request.tokens) != record.start + 1:
             raise RuntimeError("V2 completion does not extend the worker's exact token prefix")
-        # Every TP worker resolves its certificate before a provisional token
-        # can enter embedding, Engram or a KV prefix. Output ranks resolve the
-        # same record from AsyncOutput; its lock makes rare repair run once.
-        if record.fallback is not None:
-            record.token()
         early = envs.VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT
         identity = self._identity(record)
         if early:
@@ -266,6 +261,13 @@ class V41V2ModelRunner(V41ModelRunner):
                         self.position_bank.copy_into(position, record.start + 1)
                 else:
                     position = self.position_bank.view(record.start + 1, 1)
+                # Position staging and ownership checks do not consume the
+                # sampled token. Keep them before the certificate wait so
+                # they can overlap the previous device invocation. Resolve
+                # every TP certificate before embedding/Engram/KV consume
+                # the provisional candidate; rare repair still runs once.
+                if record.fallback is not None:
+                    record.token()
                 if envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM:
                     if annotations_enabled():
                         with scope(f"v41::continuation_engram::P{record.start + 1}"):

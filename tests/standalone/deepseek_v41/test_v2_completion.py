@@ -398,6 +398,38 @@ def test_device_engram_precedes_prefix_and_host_token_wait(monkeypatch):
     assert runner._prefix_started == ("a", 2, 1)
 
 
+@pytest.mark.parametrize("covered", [False, True])
+def test_sampling_stages_only_independent_inputs_before_certifying_prefix(monkeypatch, covered):
+    for suffix in ("EARLY_INPUT_COMMIT", "SEGMENTED_PREFIX", "DEVICE_ENGRAM"):
+        monkeypatch.setenv("VLLM_HPU_DSV41_V2_" + suffix, "1")
+    runner, calls = fixture()
+    runner.pp.group = SimpleNamespace(is_first_rank=True)
+    runner.position_views = {1: torch.empty(1, dtype=torch.int32)}
+    runner.position_bank = SimpleNamespace(copy_into=lambda *args: calls.append(("position",)))
+    runner._prefix_authorized = lambda *args: True
+
+    class OrderedDone:
+        def synchronize(self):
+            calls.append(("certificate",))
+
+    runner.model = SimpleNamespace(
+        tensor_parallel_size=4,
+        complete_step=lambda count: calls.append(("model", count)),
+        prepare_device_engram=lambda *args: calls.append(("device_engram",)),
+        begin_decode_prefix=lambda *args: calls.append(("prefix",)),
+    )
+    runner._completion = CompletionRecord(
+        "a", 2, 1, torch.tensor([[22 + int(covered)]]), OrderedDone(), runner.pp.commit_token,
+        lambda: calls.append(("repair",)) or 19,
+    )
+    runner._consume_completion(SimpleNamespace())
+    assert [row[0] for row in calls] == (
+        ["model", "position", "certificate"] + ([] if covered else ["repair"])
+        + ["device_engram", "prefix", "packet"]
+    )
+    assert runner.requests["a"].output[-1] == (11 if covered else 19)
+
+
 def test_new_search_bucket_captures_complete_plan_before_segmenting(monkeypatch):
     monkeypatch.setenv("VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT", "1")
     monkeypatch.setenv("VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX", "1")
