@@ -323,7 +323,9 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                     def observe(program, hidden, position, records=records):
                         records.append(observe_mirror_step(program, hidden, position))
 
-                    chain(True, len(forced), measure=False, engine=replay, forced_tokens=forced, observer=observe)
+                    tokens, _, _ = chain(True, len(forced), measure=False, engine=replay,
+                                         forced_tokens=forced, observer=observe)
+                    records[-1]['terminal_sample_token'] = tokens[-1]
                     torch.save(records, directory / f'{name}-rank{rank}.pt')
                     outputs.append(records)
                 checks = []
@@ -336,7 +338,9 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                                                          for k, v in old['indices'].items()),
                                        hidden_exact=torch.equal(a, b), max_abs=float((a-b).abs().max()),
                                        relative_l2=float((a-b).norm()/a.norm().clamp_min(1e-30)),
-                                       cosine=float(torch.nn.functional.cosine_similarity(a, b, dim=0))))
+                                       cosine=float(torch.nn.functional.cosine_similarity(a, b, dim=0)),
+                                       terminal_sample_token=[old.get('terminal_sample_token'),
+                                                              new.get('terminal_sample_token')]))
                 (directory / f'checks-rank{rank}.json').write_text(json.dumps(checks, indent=2)+'\n')
                 dist.barrier()
                 if rank == 0:
