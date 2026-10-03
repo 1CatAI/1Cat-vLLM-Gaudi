@@ -124,6 +124,7 @@ def main():
     parser.add_argument("installation", type=Path)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18552)
+    parser.add_argument("--log-root", type=Path, help="Machine-local directory for service logs, such as SSD storage")
     args, extra = parser.parse_known_args()
     root = args.installation.resolve()
     settings = json.loads((root / "settings.json").read_text())
@@ -140,7 +141,8 @@ def main():
         reserved.update(group)
     if not reserved <= set(settings["cpus"]):
         raise ValueError("Machine allocation is outside the installation CPU set")
-    log_dir = root / "logs" / time.strftime("%Y%m%d-%H%M%S")
+    log_root = args.log_root.expanduser().resolve() if args.log_root is not None else root / "logs"
+    log_dir = log_root / time.strftime("%Y%m%d-%H%M%S")
     log_dir.mkdir(parents=True)
     isolated = isolate_desktop(reserved) if settings.get("isolate_user_processes", False) else []
     atomic_json(log_dir / "background-affinity.json", isolated)
