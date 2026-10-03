@@ -16,3 +16,15 @@ def test_continuation_positions_follow_context_through_warm_and_measured_steps(c
 def test_continuation_rejects_negative_positions(context, index):
     with pytest.raises(ValueError, match='nonnegative'):
         continuation_position(context, index)
+
+
+def test_forced_feedback_uses_native_i32_sampler_contract():
+    import torch
+    from tools.check_deepseek_v41_tp4_continuation import forced_feedback_token
+
+    sample = torch.zeros((1, 1), dtype=torch.int32)
+    forced = forced_feedback_token(129276, sample)
+    assert forced.dtype == torch.int32 and forced.shape == (1, 1)
+    assert forced.item() == 129276 and sample.item() == 0
+    with pytest.raises(ValueError, match='I32'):
+        forced_feedback_token(129276, sample.long())

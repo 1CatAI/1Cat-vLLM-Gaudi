@@ -24,6 +24,16 @@ def continuation_position(context_tokens, index):
     return context_tokens + index
 
 
+
+def forced_feedback_token(value, prototype):
+    """Keep the native sampler/Engram I32 contract in untimed diagnostics."""
+    import torch
+
+    if prototype.dtype != torch.int32 or prototype.shape != (1, 1):
+        raise ValueError('Forced feedback requires the native I32 [1,1] sampler prototype')
+    return prototype.new_tensor([[value]])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('prepared', type=Path)
@@ -525,7 +535,7 @@ def main():
                         if forced_tokens is not None:
                             if measure:
                                 raise ValueError('Forced tokens are an untimed numerical diagnostic')
-                            selected = torch.tensor([[forced_tokens[index]]], dtype=torch.int64, device='hpu')
+                            selected = forced_feedback_token(forced_tokens[index], selected)
                             readback = bridge.copy_sampled_tokens_to_host(selected)
                         if args.trace_entry_phases or args.queue_marker_only:
                             mark('begin', index)

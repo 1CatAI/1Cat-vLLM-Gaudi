@@ -310,7 +310,6 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
             wait_for_loading(directory, rank, dist)
             if job.get('command') == 'diagnose_index_mirror':
                 import torch
-                from vllm_gaudi.ops.deepseek_v41_math import unpack_fp4
 
                 saved_path = Path(job['reference_result'])
                 saved = json.loads(saved_path.read_text())
@@ -322,23 +321,7 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                     records = []
 
                     def observe(program, hidden, position, records=records):
-                        keys = {}
-                        for source, cache in program.shared.sources.items():
-                            if int(source) >= program.stop:
-                                continue
-                            row = position // cache.ratio
-                            visible_rows = (position + 1) // cache.ratio
-                            probes = torch.linspace(0, max(0, visible_rows - 1), 33).long().tolist()
-                            ids = torch.tensor([*probes, row], dtype=torch.int64, device=hidden.device)
-                            physical = program.shared.physical_rows(ids, cache.ratio).long()
-                            packed = cache.index.index_select(0, physical).cpu()
-                            mirror = cache.index_mirror.index_select(0, ids).cpu()
-                            valid = (ids.cpu() < visible_rows)
-                            keys[source] = dict(rows=ids.cpu(), visible=valid, mirror=mirror,
-                                                canonical=unpack_fp4(packed, 128, 32))
-                        indices = {str(b.layer): b.attention.selection.indices[:1].cpu().clone()
-                                   for b in program.layers if b.attention.owns_index}
-                        records.append(dict(position=position, hidden=hidden.cpu().clone(), keys=keys, indices=indices))
+                        records.append(observe_mirror_step(program, hidden, position))
 
                     chain(True, len(forced), measure=False, engine=replay, forced_tokens=forced, observer=observe)
                     torch.save(records, directory / f'{name}-rank{rank}.pt')
@@ -501,6 +484,29 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
         for name, replay in arms.items():
             if name != 'baseline':
                 replay.close()
+
+
+def observe_mirror_step(program, hidden, position):
+    import torch
+    from vllm_gaudi.ops.deepseek_v41_math import unpack_fp4
+
+    keys = {}
+    for source, cache in program.shared.sources.items():
+        if int(source) >= program.stop:
+            continue
+        row = position // cache.ratio
+        visible_rows = (position + 1) // cache.ratio
+        probes = torch.linspace(0, max(0, visible_rows - 1), 33).long().tolist()
+        ids = torch.tensor([*probes, row], dtype=torch.int64, device=hidden.device)
+        physical = program.shared.physical_rows(ids, cache.ratio).long()
+        packed = cache.index.index_select(0, physical).cpu()
+        mirror = cache.index_mirror.index_select(0, ids).cpu()
+        valid = (ids.cpu() < visible_rows)
+        keys[source] = dict(rows=ids.cpu(), visible=valid, mirror=mirror,
+                            canonical=unpack_fp4(packed, 128, 32))
+    indices = {str(b.layer): b.attention.selection.indices[:1].cpu().clone()
+               for b in program.layers if b.attention.owns_index}
+    return dict(position=position, hidden=hidden.cpu().clone(), keys=keys, indices=indices)
 
 
 def main():
