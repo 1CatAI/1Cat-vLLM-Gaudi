@@ -230,7 +230,9 @@ def test_complete_prompt_search_retains_decoder_halo_mla_admission():
         search = prefill_search_length(0, 16384, capacity, reuse_index_keys=True)
         assert can_partition_prefill_mla((16384, 16, 512), 640, 4, search)
         assert can_partition_prefill_mla((4096, 16, 512), 640, 4, search)
-    assert not can_partition_prefill_mla((4096, 16, 512), 640, 4, 32768)
+    assert can_partition_prefill_mla((4096, 16, 512), 640, 4, 32768)
+    assert can_partition_prefill_mla((4096, 16, 512), 640, 4, 65536)
+    assert not can_partition_prefill_mla((4096, 16, 512), 640, 4, 131072)
 
 
 def test_prefill_tail_is_exact_and_never_splits_into_dspark_c6():

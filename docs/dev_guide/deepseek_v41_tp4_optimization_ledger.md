@@ -618,3 +618,12 @@ Parent e9b8b541. Extend existing shared Full/Reindex query partition and native 
 `prefill64k-index-chain-06`: modules0/1/4/5, CPU10/15/38/43 with four helpers each, production512Kpage capacity, 1024queries and62464visible rows. Full→Reindex→actual FlashInferMLA consumer, three changing head-shard inputs, ABABAB200. Per-step slowest-rank wall median1356.454539→110.669224ms; device1356.218496→110.542200ms. Difference1245.785315ms exceeds2×baselineIQR16.777981ms. All48outputs exact. First/last A medians1354.849702/1354.690389ms. Other-group startup/CPUpressure overlapped later periods and is archived; absolute times require serving qualification.
 
 This is a long-prefill chain saving. Estimated direction: remove repeated serial Reindex work beyond32K; whole-request magnitude remains unknown because tile/layer scheduling changes. No16Kdecode gain or cumulative ms/token credit. End-to-end and MLA exchange admission are pending; keep this item outside decode totals.
+
+
+### 2026-10-03 existing MLA query partition at long search — component qualified
+
+Parent97bd46b1. Preserve existing TP query-owner exchange, FlashInferMLA and reverse exchange, admitting4K/16Kquery tiles at32K/64Ksearch. Native ABI and communication interfaces unchanged; shapes beyond64K retain ordinary fallback.
+
+`prefill64k-mla-chain-01/02`, normal0/1/4/5 and10/15/38/43, ABABAB200 with three changing inputs. Four-rank maximum wall:4Kqueries7.564369→6.009738ms (saving1.554632ms,2×IQR1.144491ms);16Kqueries23.228257→16.706033ms (saving6.522224ms,2×IQR1.227978ms). Device timing agrees,24comparisons exact. Other-group warmup is recorded. Query/head/cache tensor contracts match actual MLA production consumer.
+
+This is a long-prefill component improvement, separate from the preceding Full/Reindex chain whose MLA consumer was unchanged. No16Kdecode savings credited; request-level estimate is not quantified before combined serving. Official16KEOS and arbitrary-length/cache diagnostics are the next gates.

@@ -20,7 +20,7 @@ SEQUENCE_FUSED_LAYOUT = True
 def can_partition_prefill_mla(query_shape, columns, tensor_parallel_size, search_length):
     """Shared admission for query-local indices and the existing MLA exchange."""
     return (tensor_parallel_size == 4 and tuple(query_shape) in ((4096, 16, 512), (16384, 16, 512)) and columns == 640
-            and (search_length == 16384 or (search_length == 32768 and query_shape[0] == 16384)))
+            and search_length in (16384, 32768, 65536))
 
 
 def _retire_stream():

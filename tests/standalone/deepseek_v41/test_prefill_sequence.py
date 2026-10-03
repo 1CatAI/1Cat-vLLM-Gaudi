@@ -122,7 +122,8 @@ def test_wrong_group_fails_before_communication(monkeypatch):
                                       group=object())
 
 
-@pytest.mark.parametrize("tokens,search", ((4096, 16384), (16384, 16384), (16384, 32768)))
+@pytest.mark.parametrize("tokens,search", ((4096, 16384), (16384, 16384), (4096, 32768), (16384, 32768),
+                                        (4096, 65536), (16384, 65536)))
 def test_serving_uses_tp_group_and_caches_only_immutable_sinks(monkeypatch, tokens, search):
     import vllm.distributed
     from vllm_gaudi.ops.deepseek_v41_paged_attention import PagedCSA2Attention
@@ -159,8 +160,8 @@ def test_serving_uses_tp_group_and_caches_only_immutable_sinks(monkeypatch, toke
 @pytest.mark.parametrize("tokens,heads,columns,tp,search", [
     (16384, 16, 128, 4, 16384),
     (8192, 16, 640, 4, 16384),
-    (4096, 16, 640, 4, 32768),
-    (16384, 16, 640, 4, 65536),
+    (4096, 16, 640, 4, 131072),
+    (16384, 16, 640, 4, 131072),
     (16384, 32, 640, 2, 16384),
 ])
 def test_unqualified_shapes_keep_ordinary_mla(monkeypatch, tokens, heads, columns, tp, search):
