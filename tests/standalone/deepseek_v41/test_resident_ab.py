@@ -3,6 +3,7 @@
 import importlib.util
 from pathlib import Path
 from types import MethodType
+import hashlib
 
 import pytest
 import torch
@@ -40,6 +41,40 @@ def test_repartition_gate_rejects_equal_tokens_with_different_mutable_state():
         ab.check_repartition_state([31, 42], before, [31, 42], changed)
     with pytest.raises(RuntimeError, match='tokens'):
         ab.check_repartition_state([31, 42], before, [31, 43], before)
+
+
+def test_candidate_factory_rejects_external_files_and_changed_source(tmp_path):
+    external = tmp_path / 'candidate.py'
+    external.write_text('raise AssertionError("untrusted code must not execute")\n')
+    with pytest.raises(ValueError, match='repository Python'):
+        ab.load_candidate_factory(external, hashlib.sha256(external.read_bytes()).hexdigest())
+    factory = _path.parent / 'deepseek_v41_candidates/all_route_slots.py'
+    with pytest.raises(RuntimeError, match='changed after submission'):
+        ab.load_candidate_factory(factory, 'not-the-submitted-hash')
+
+
+def test_all_route_factory_preserves_reference_flags_and_weight_ownership(monkeypatch):
+    import importlib
+    from types import SimpleNamespace
+
+    stage = torch.nn.Module()
+    stage.decode_static_int32 = stage.decode_static_factories = True
+    block = torch.nn.Module()
+    block.moe = torch.nn.Module()
+    block.moe.all_route_slots = False
+    block.moe.register_buffer('weight', torch.ones(4))
+    stage.layers = torch.nn.ModuleList([block])
+    implementation = lambda self, *args, **kwargs: self.weight
+    monkeypatch.setattr(importlib, 'reload', lambda module: SimpleNamespace(
+        PreparedMoE=SimpleNamespace(_forward_n256_fp8=implementation)))
+    path = _path.parent / 'deepseek_v41_candidates/all_route_slots.py'
+    factory, _ = ab.load_candidate_factory(path, hashlib.sha256(path.read_bytes()).hexdigest())
+    candidate = factory(stage, ab.clone_module)
+    assert candidate.decode_static_int32 and candidate.decode_static_factories
+    assert candidate.layers[0].moe.all_route_slots and not block.moe.all_route_slots
+    assert candidate.layers[0] is not block and candidate.layers[0].moe is not block.moe
+    assert candidate.layers[0].moe.weight is block.moe.weight
+    assert candidate.layers[0].moe._forward_n256_fp8() is block.moe.weight
 
 
 def test_clones_own_modules_but_share_immutable_storage():

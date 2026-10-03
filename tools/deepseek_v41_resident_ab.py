@@ -4,11 +4,14 @@ import argparse
 import copy
 from contextlib import contextmanager
 import ctypes
+import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import statistics
 import subprocess
+import sys
 import time
 from types import MethodType
 import uuid
@@ -222,6 +225,22 @@ def check_repartition_state(reference_tokens, reference_state, candidate_tokens,
     return dict(tokens_exact=True, mutable_state_exact=True, state_tensors=len(reference_state))
 
 
+def load_candidate_factory(path, expected_sha256):
+    path = Path(path).resolve()
+    root = Path(__file__).resolve().parent / 'deepseek_v41_candidates'
+    if not path.is_relative_to(root) or path.suffix != '.py':
+        raise ValueError('Candidate factories must be repository Python files in tools/deepseek_v41_candidates')
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if digest != expected_sha256:
+        raise RuntimeError('Candidate factory changed after submission')
+    name = f'dsv41_candidate_{digest}'
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module.make_candidate, dict(path=str(path), sha256=digest)
+
+
 def serve(stage, baseline, shard, chain, report, args, preparation_counts, state_fingerprints=None):
     import torch.distributed as dist
     from vllm_gaudi.ops.deepseek_v41_replay import StageReplay
@@ -232,9 +251,11 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
     arms = {'baseline': baseline}
     stages = {'baseline': stage}
 
-    def arm(name):
+    def arm(name, factory=None, factory_reference=None):
         if name not in arms:
-            if name in ('dense_fp8', 'dense_fp8_tail', 'dense_fp8_static_int32',
+            if factory is not None:
+                program = factory(stages[factory_reference], clone_module)
+            elif name in ('dense_fp8', 'dense_fp8_tail', 'dense_fp8_static_int32',
                         'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff',
                         'handoff_int32_literals', 'handoff_static_factories', 'handoff_static_merged_segments',
                         'handoff_fp4_mirror_pack', 'handoff_index_mirror_gather', 'handoff_mhc_packed_gates',
@@ -258,11 +279,12 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
                 program = clone_module(stage)
             else:
                 raise ValueError(f'Unknown resident candidate {name}')
-            program.decode_static_int32 = name in (
-                'dense_fp8_static_int32', 'handoff_int32_literals',
-                'handoff_static_factories', 'handoff_static_merged_segments')
-            program.decode_static_factories = name in ('handoff_static_factories', 'handoff_static_merged_segments')
-            program.decode_merge_mhc_partitions = name == 'handoff_static_merged_segments'
+            if factory is None:
+                program.decode_static_int32 = name in (
+                    'dense_fp8_static_int32', 'handoff_int32_literals',
+                    'handoff_static_factories', 'handoff_static_merged_segments')
+                program.decode_static_factories = name in ('handoff_static_factories', 'handoff_static_merged_segments')
+                program.decode_merge_mhc_partitions = name == 'handoff_static_merged_segments'
             if name.startswith('handoff_expert_sequential'):
                 import torch
                 program.layers = torch.nn.ModuleList([clone_module(block) for block in program.layers])
@@ -465,10 +487,18 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
                 continue
             reference_name = job.get('baseline', 'baseline')
             reference = arm(reference_name)
-            candidate = arm(name)
+            factory_record = None
+            if name == 'factory':
+                factory, factory_record = load_candidate_factory(job['factory'], job['factory_sha256'])
+                name = 'factory_' + factory_record['sha256']
+                candidate = arm(name, factory, reference_name)
+                factory_record['shared_sources'] = getattr(candidate.program(), 'candidate_shared_sources', [])
+            else:
+                candidate = arm(name)
             numerical_gate = None
-            if name == 'handoff_static_merged_segments':
-                if state_fingerprints is None or reference_name != 'handoff_static_factories':
+            if name == 'handoff_static_merged_segments' or factory_record is not None:
+                if state_fingerprints is None or (
+                        name == 'handoff_static_merged_segments' and reference_name != 'handoff_static_factories'):
                     raise ValueError('Repartitioning requires the same static-coordinate reference and state observer')
                 old_tokens = chain(True, 8, measure=False, engine=reference, warm_steps=6)[0]
                 old_state = state_fingerprints()
@@ -495,6 +525,13 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
             counts = preparation_counts()
             periods = []
             for label in ('A', 'B', 'A', 'B', 'A', 'B'):
+                if factory_record is not None and hashlib.sha256(
+                        Path(factory_record['path']).read_bytes()).hexdigest() != factory_record['sha256']:
+                    raise RuntimeError('Candidate factory changed during qualification')
+                if factory_record is not None and any(
+                        hashlib.sha256(Path(row['path']).read_bytes()).hexdigest() != row['sha256']
+                        for row in factory_record['shared_sources']):
+                    raise RuntimeError('Shared candidate implementation changed during qualification')
                 wait_for_loading(directory, rank, dist)
                 dist.barrier()
                 before_steps = report.get('bounded_sampler_steps', 0)
@@ -523,6 +560,7 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
                 result = dict(status='completed', baseline=reference_name, candidate=name, steps=steps, order='ABABAB',
                               elapsed_s=time.monotonic()-begun, graphs=infos, comparison=compare_periods(periods),
                               numerical_gate=numerical_gate,
+                              candidate_factory=factory_record,
                               context_tokens=args.context_tokens,
                               checked_first_device_positions=[row['checked_first_device_position'] for row in ranks],
                               no_profiler=True, no_hot_compilation=True, four_rank_tokens_equal=True,
@@ -548,7 +586,7 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
                     if not result['cross_arm_feedback_exact']:
                         result['comparison']['effective'] = False
                         result['status'] = 'numerical_contract_failed'
-                if name in ('handoff_sampling_bounded',
+                if factory_record is not None or name in ('handoff_sampling_bounded',
                             'handoff_expert_sequential', 'handoff_expert_sequential_sram',
                             'handoff_int32_literals', 'handoff_static_factories', 'handoff_static_merged_segments',
                             'handoff_fp4_mirror_pack', 'handoff_index_mirror_gather'):
@@ -605,6 +643,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--control-dir', type=Path, required=True)
     parser.add_argument('--candidate', choices=('dense_fp8', 'tail', 'dense_fp8_tail',
+                                              'factory',
                                               'dense_fp8_static_int32', 'dense_fp8_swa_packed',
                                               'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff',
                                               'handoff_int32_literals', 'handoff_static_factories',
@@ -620,6 +659,8 @@ def main():
                                                'long_index_packed',
                                                'long_index_paged_mme'), default='baseline')
     parser.add_argument('--steps', type=int, default=200)
+    parser.add_argument('--candidate-factory', type=Path,
+                        help='A repository factory returning an independently owned shared stage clone')
     parser.add_argument('--reference-result', type=Path,
                         help='Reuse saved matching-context timing and feedback tokens; time only the candidate')
     parser.add_argument('--reference-arm', choices=('A', 'B'), default='B')
@@ -632,10 +673,15 @@ def main():
         parser.error('--diagnose-index-mirror needs the saved same-state A/B result')
     if args.steps < 200:
         parser.error('--steps must be at least 200')
+    if (args.candidate == 'factory') != (args.candidate_factory is not None):
+        parser.error('--candidate factory requires --candidate-factory')
     args.control_dir.mkdir(parents=True, exist_ok=True)
     job_id = f'{time.time_ns()}-{uuid.uuid4().hex[:8]}'
     job = dict(id=job_id, command='stop' if args.stop else 'measure', candidate=args.candidate,
                baseline=args.baseline, steps=args.steps)
+    if args.candidate_factory is not None:
+        factory_path = args.candidate_factory.resolve()
+        job.update(factory=str(factory_path), factory_sha256=hashlib.sha256(factory_path.read_bytes()).hexdigest())
     if args.diagnose_index_mirror:
         job['command'] = 'diagnose_index_mirror'
     if args.reference_result:

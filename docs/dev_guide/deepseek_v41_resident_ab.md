@@ -56,6 +56,15 @@ load1包含驱动D状态线程，不作为门槛。逐秒记录CPU PSI、绑定�
 并行冷编译默认不导出 post-graph JSON，避免尚未写完的文档阻断编译；
 仅单独诊断时使用 `DSV41_RESIDENT_POST_GRAPH=1`。
 
+后续候选可用 `--candidate factory --candidate-factory tools/deepseek_v41_candidates/<name>.py`，
+工厂接收指定参考臂及模块克隆函数，返回独立模块所有者，共享不可变权重及约定的可变状态恢复点。
+工具记录工厂及声明的共用实现源码哈希，拒绝外部文件和提交后或计时中被修改的源码。
+每个工厂先通过逐位 token/可变状态检查，再录制自己的计划并执行 ABABAB；
+已有参考计划继续常驻，prepare/capture 计数变化会使计时失败。
+`all_route_slots` 工厂仅选择共用 MoE 的 C1 六专家解码，不改变参考臂、prefill 或 C2–C6 的派发。
+解码后仍按路由顺序归约，并保留 routed/shared 的两次 BF16 边界。
+调用次数、物理 kernel 数和完整链延迟都需要硬件验证，该候选默认关闭。
+
 
 编译器隔离最小验证工具`tools/check_deepseek_v41_compiler_isolation.py`要求启动前打开诊断用graph-name hash，比较同精度专家完整消费链及冷post-graph。硬件验证已证明两臂recipe不同，且变更输入/专家顺序后的结果精确相同。关闭全部SRAM切分减少节点，却把原有SRAM切片中间权重放到DRAM；小链没有收益，未进入16层。此开关不改变正式服务默认。
 
