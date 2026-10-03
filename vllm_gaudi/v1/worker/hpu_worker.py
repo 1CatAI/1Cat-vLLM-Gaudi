@@ -694,6 +694,26 @@ class HPUWorker(WorkerBase):
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()  # type: ignore[union-attr]
 
+    def set_decode_continuation_diagnostic(self, policy: str):
+        """Change CPU handoff only between requests in a private dev service."""
+        import os
+
+        if os.environ.get("VLLM_SERVER_DEV_MODE", "0") != "1":
+            raise RuntimeError("Continuation diagnosis requires development endpoints")
+        if policy not in ("original", "prepare", "yield", "combined"):
+            raise ValueError("Unknown continuation handoff policy")
+        runner = self.model_runner
+        program = getattr(getattr(runner, "model", None), "program", None)
+        if not getattr(program, "device_sampling", False):
+            raise RuntimeError("Continuation diagnosis requires the device sampler")
+        if (getattr(runner, "_completion", None) is not None
+                or getattr(runner, "_prefix_started", None) is not None
+                or getattr(runner, "active_request", None) is not None):
+            raise RuntimeError("Change continuation policy only after request retirement")
+        runner._certificate_before_staging = policy in ("original", "yield")
+        runner._sampling_prefix_handoff = policy in ("yield", "combined")
+        return dict(policy=policy, tp_rank=runner.model.tp_rank, gpu_plan_changed=False)
+
     def reset_encoder_cache(self) -> None:
         self.model_runner.reset_encoder_cache()  # type: ignore[union-attr]
 

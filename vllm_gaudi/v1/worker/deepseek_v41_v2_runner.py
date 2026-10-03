@@ -120,6 +120,7 @@ class V41V2ModelRunner(V41ModelRunner):
         self._completion = None
         self._input_committed = None
         self._prefix_started = None
+        self._sampling_prefix_handoff = envs.VLLM_HPU_DSV41_SAMPLING_PREFIX_HANDOFF
         # The device-token continuation owns one request generation.  A
         # multi-request scheduler step must use the ordinary synchronous
         # completion path so each request retires its PP packet before the
@@ -234,6 +235,8 @@ class V41V2ModelRunner(V41ModelRunner):
             raise RuntimeError("V2 completion outlived its request generation")
         if record.generation != self.pp.generation or len(request.tokens) != record.start + 1:
             raise RuntimeError("V2 completion does not extend the worker's exact token prefix")
+        if record.fallback is not None and getattr(self, "_certificate_before_staging", False):
+            record.token()
         early = envs.VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT
         identity = self._identity(record)
         if early:
@@ -276,6 +279,12 @@ class V41V2ModelRunner(V41ModelRunner):
                         self.model.prepare_device_engram(record.request_id, record.device_token)
                     self.audit["v2_device_engram_starts"] = self.audit.get("v2_device_engram_starts", 0) + 1
                 self.model.begin_decode_prefix(record.device_token, position)
+                if record.fallback is not None and getattr(self, "_sampling_prefix_handoff", False):
+                    # A cached certificate no longer performs the original
+                    # post-prefix blocking read. Yield the interpreter after
+                    # enqueueing, before preparing the late-input suffix.
+                    # This diagnostic candidate remains off until qualified.
+                    time.sleep(0)
                 self._prefix_started = identity
                 self.audit["v2_prefix_starts"] = self.audit.get("v2_prefix_starts", 0) + 1
         token = record.token()

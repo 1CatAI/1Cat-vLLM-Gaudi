@@ -898,6 +898,12 @@ replay derives each draw from its device position. Bounded candidates retain the
 an explicit coverage certificate. All TP workers resolve an uncertified result through the full sampler before
 any continuation can consume it. This option remains disabled pending complete-chain and serving qualification.
 
+`VLLM_HPU_DSV41_SAMPLING_PREFIX_HANDOFF` (default `0`) yields the interpreter after a certified sampling
+continuation enqueues its native prefix, before preparing late inputs. This experimental scheduling option does
+not change device plans or sampling and remains off pending serving qualification. A private development service
+can switch the handoff policy between retired requests through `set_decode_continuation_diagnostic`; production
+services reject this control.
+
 `VLLM_HPU_DSV41_STATIC_COORDINATES` (default `0`) retains small immutable coordinate factories and I32
 scalar operands as resident buffers in shared native decode compilation. Dynamic positions, mutable state,
 uninitialized allocations and escaping factory outputs remain in the graph. Request data is never frozen.

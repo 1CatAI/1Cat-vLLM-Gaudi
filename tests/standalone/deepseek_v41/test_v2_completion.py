@@ -407,6 +407,9 @@ def test_sampling_stages_only_independent_inputs_before_certifying_prefix(monkey
     runner.position_views = {1: torch.empty(1, dtype=torch.int32)}
     runner.position_bank = SimpleNamespace(copy_into=lambda *args: calls.append(("position",)))
     runner._prefix_authorized = lambda *args: True
+    runner._sampling_prefix_handoff = True
+    monkeypatch.setattr("vllm_gaudi.v1.worker.deepseek_v41_v2_runner.time.sleep",
+                        lambda value: calls.append(("handoff", value)))
 
     class OrderedDone:
         def synchronize(self):
@@ -425,9 +428,34 @@ def test_sampling_stages_only_independent_inputs_before_certifying_prefix(monkey
     runner._consume_completion(SimpleNamespace())
     assert [row[0] for row in calls] == (
         ["model", "position", "certificate"] + ([] if covered else ["repair"])
-        + ["device_engram", "prefix", "packet"]
+        + ["device_engram", "prefix", "handoff", "packet"]
     )
     assert runner.requests["a"].output[-1] == (11 if covered else 19)
+
+
+@pytest.mark.parametrize("policy,before,handoff", [
+    ("original", True, False), ("prepare", False, False),
+    ("yield", True, True), ("combined", False, True),
+])
+def test_private_continuation_control_requires_retired_request(monkeypatch, policy, before, handoff):
+    from vllm_gaudi.v1.worker.hpu_worker import HPUWorker
+
+    worker = object.__new__(HPUWorker)
+    runner = SimpleNamespace(model=SimpleNamespace(program=SimpleNamespace(device_sampling=True), tp_rank=1),
+                             _completion=None, _prefix_started=None, active_request=None)
+    worker.model_runner = runner
+    monkeypatch.setenv("VLLM_SERVER_DEV_MODE", "0")
+    with pytest.raises(RuntimeError, match="development endpoints"):
+        worker.set_decode_continuation_diagnostic(policy)
+    monkeypatch.setenv("VLLM_SERVER_DEV_MODE", "1")
+    runner.active_request = "live"
+    with pytest.raises(RuntimeError, match="retirement"):
+        worker.set_decode_continuation_diagnostic(policy)
+    assert not hasattr(runner, "_sampling_prefix_handoff")
+    runner.active_request = None
+    assert worker.set_decode_continuation_diagnostic(policy)["gpu_plan_changed"] is False
+    assert runner._certificate_before_staging == before
+    assert runner._sampling_prefix_handoff == handoff
 
 
 def test_new_search_bucket_captures_complete_plan_before_segmenting(monkeypatch):
