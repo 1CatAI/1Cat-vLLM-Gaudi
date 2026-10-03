@@ -3,6 +3,77 @@
 import torch
 
 
+def retain_static_factories(module, *, device_type='hpu', maximum_elements=4096):
+    """Bind small, read-only coordinate/constant tensors at compilation time.
+
+    Only factories with literal arguments qualify. Dynamic positions, RNG,
+    uninitialized allocations and mutable factory results remain in the graph.
+    This is an experimental pass; serving does not enable it by default.
+    """
+    factories = {torch.ops.aten.full.default, torch.ops.aten.zeros.default,
+                 torch.ops.aten.ones.default, torch.ops.aten.arange.default,
+                 torch.ops.aten.arange.start, torch.ops.aten.arange.start_step}
+    changed = []
+
+    def contains_node(value):
+        if isinstance(value, torch.fx.Node):
+            return True
+        if isinstance(value, (tuple, list)):
+            return any(contains_node(v) for v in value)
+        if isinstance(value, dict):
+            return any(contains_node(v) for v in value.values())
+        return False
+
+    def read_only(node, seen=None):
+        seen = set() if seen is None else seen
+        if node in seen:
+            return True
+        seen.add(node)
+        for user in node.users:
+            if user.op == 'output':
+                return False
+            schema = getattr(user.target, '_schema', None)
+            if schema is None or schema.is_mutable:
+                return False
+            # Follow aliases too: mutating a view would mutate the constant.
+            if any(v.alias_info is not None for v in schema.returns) and not read_only(user, seen):
+                return False
+        return True
+
+    for node in list(module.graph.nodes):
+        if node.op != 'call_function' or node.target not in factories:
+            continue
+        value = node.meta.get('val')
+        if (not isinstance(value, torch.Tensor) or value.device.type != device_type
+                or value.dtype not in (torch.int32, torch.int64, torch.float32)
+                or any(type(d) is not int for d in value.shape)
+                or value.numel() > maximum_elements
+                or contains_node((node.args, node.kwargs)) or not read_only(node)):
+            continue
+        if (node.target in (torch.ops.aten.arange.default, torch.ops.aten.arange.start,
+                            torch.ops.aten.arange.start_step) and value.dtype == torch.float32):
+            # CPU and accelerator range construction may round differently.
+            continue
+        from torch._subclasses.fake_tensor import unset_fake_temporarily
+        kwargs = dict(node.kwargs, device='cpu')
+        with unset_fake_temporarily(), torch.inference_mode():
+            resident = node.target(*node.args, **kwargs).to(value.device)
+        attr = f'_decode_static_factory_{len(changed)}'
+        while hasattr(module, attr):
+            attr += '_'
+        module.register_buffer(attr, resident, persistent=False)
+        with module.graph.inserting_before(node):
+            constant = module.graph.get_attr(attr)
+        constant.meta = dict(node.meta, placement='eager')
+        node.replace_all_uses_with(constant)
+        changed.append(dict(node=node.name, operation=str(node.target), elements=value.numel()))
+        module.graph.erase_node(node)
+    if changed:
+        module.graph.lint()
+        module.recompile()
+    return dict(replaced_factories=len(changed), nodes=changed)
+
+
 def propagate_with_resident_buffers(module, inputs, propagate):
     """Fake propagation must convert real buffers introduced by this pass."""
     from torch._guards import detect_fake_mode

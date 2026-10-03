@@ -149,6 +149,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_FP8_SIDECAR: str = ""
     VLLM_HPU_DSV41_FP8_CONFIG: str = ""
     VLLM_HPU_DSV41_WO_A_FP8: bool = False
+    VLLM_HPU_DSV41_STATIC_COORDINATES: bool = False
     VLLM_HPU_DSV41_WOA_OUTPUT_ROUNDTRIP: bool = False
     VLLM_HPU_DSV41_WO_A_FP8_SIDECAR: str = ""
     VLLM_HPU_DSV41_WO_A_FP8_CONFIG: str = ""
@@ -665,6 +666,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_FP8_CONFIG", ""),
     "VLLM_HPU_DSV41_WO_A_FP8":
     lambda: os.environ.get("VLLM_HPU_DSV41_WO_A_FP8", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_STATIC_COORDINATES":
+    lambda: os.environ.get("VLLM_HPU_DSV41_STATIC_COORDINATES", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_WOA_OUTPUT_ROUNDTRIP":
     lambda: os.environ.get("VLLM_HPU_DSV41_WOA_OUTPUT_ROUNDTRIP", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_WO_A_FP8_SIDECAR":

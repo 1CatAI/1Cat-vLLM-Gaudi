@@ -736,3 +736,18 @@ service restart or unsupported deployment claim is introduced by this merge. Exi
 is reused because the latest changes only clarify documentation and startup audit text. Unrelated localAGENTS.md
 and reproducer artifacts are excluded. Follow-up work must resolve long semantic correctness and prefill regression
 with the accepted prompt tail and exact cold/cache feedback evidence already archived.
+
+
+### 2026-10-03 merged-main single-request decode campaign
+
+User switches scope to officialT1/top_p.95 TP4decode:16Kfirst≤9ms then≤8ms;128K≤11ms.
+Parentmain e6f0a36c (PR57merged), modules0/1/4/5 andmainCPU10/15/38/43.
+Publicgateway/backend stopped; private frozenmain baseline service nowwarming for one16Kdecode trace.
+Reuse archived unprofiled10.568225ms; do not turn theprofilerrequest into a formal baseline or repeat distributions.
+500Ksemantic failure stays inPR57anditsrecord, explicitly deferred rather than being treated as passed.
+
+Work order:one maintrace→sharedI32/coordinates→all-sixexpert decode/MME→mHC→attentionTPCfusion→exactboundedofficialsampling→128K/512Kdecode traces and source submission reduction. Each candidate must pass exact/reference checks, then same-processreal16ABABAB. One formal16KnaturalEOS plus one128K80token diagnostic only after compatible real16savings total≥1ms. Continue all items or attain the requested targets, then merge qualified changes andrestore512K/prefixonpublicAPI. Current confirmed cumulative real16savings0ms; no newgainledgerentry.
+
+Own retiredgraphs were losslessly archived withtarcompare/SHA256 before removing original folders; newtrace/postgraphs/logs remain onSSD. Disk headroom restored beyond30GB. Historical result/trace/source records retained. New I32armuses the qualified norm/SWA/Engram/mHC handoff parent, not the older dense-only parent whose archivedIQR exceeded its measured difference. Its numerical/real16result is pending.
+
+2026-10-03：合并main后的常驻ABABAB200：I32+只读静态工厂4.250790→4.136407 ms/16层，差值0.114383 >2IQR0.071210，跨卡/跨候选token一致，无热编译。按×1.5仅预估整模0.171575 ms，尚未端到端；累计确认16层0.114383 ms。I32单项、FP4双输出、I32镜像gather均未过噪声门槛，不相加。详见本地decode-kernel-resident-01/INITIAL_AB_REPORT.json。

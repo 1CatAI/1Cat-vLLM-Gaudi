@@ -1318,6 +1318,8 @@ class PreparedStage(nn.Module):
         self.runtime_indexer = gaudi_envs.VLLM_HPU_DSV41_RUNTIME_INDEXER
         if self.runtime_indexer and (self.dspark or max_length <= 512):
             raise ValueError("Runtime CSA2 indexer requires paged ordinary decode")
+        self.decode_static_int32 = gaudi_envs.VLLM_HPU_DSV41_STATIC_COORDINATES
+        self.decode_static_factories = self.decode_static_int32
         self.bf16_head = gaudi_envs.VLLM_HPU_DSV41_BF16_LM_HEAD
         if self.dspark and (self.bf16_head or gaudi_envs.VLLM_HPU_DSV41_BF16_ROUTER_GATE):
             raise ValueError("BF16 projection candidates require ordinary C1 decode")
@@ -2186,7 +2188,8 @@ class CompiledStage:
                 raise ValueError("TP/mHC overlap requires BF16 boundaries and a qualified C1 expert layout")
             from vllm_gaudi.compilation.deepseek_v41_overlap import make_backend
 
-            backend = (make_backend(static_int32=True)
+            backend = (make_backend(static_int32=True,
+                                    static_factories=getattr(stage, 'decode_static_factories', False))
                        if getattr(stage, 'decode_static_int32', False) else make_backend())
         if group_size < 1 or len(stage.layers) % group_size:
             raise ValueError(f"Invalid V4.1 compiled layer group size {group_size} for {len(stage.layers)} layers")

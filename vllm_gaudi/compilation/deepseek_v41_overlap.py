@@ -289,23 +289,26 @@ def split_mhc_consumers(module, exchange):
     return audit
 
 
-def make_backend(*, static_int32=False):
+def make_backend(*, static_int32=False, static_factories=False):
     from habana_frameworks.torch.dynamo.compile_backend import passes
     from habana_frameworks.torch.dynamo.compile_backend.backends import hpu_backend
     from vllm_gaudi.extension.logger import logger
 
     def integer_constants(ctx):
         from vllm_gaudi.compilation.deepseek_v41_integer_constants import (
-            propagate_with_resident_buffers, retain_integer_constants)
+            propagate_with_resident_buffers, retain_integer_constants, retain_static_factories)
 
         audit = retain_integer_constants(ctx.graph_module)
-        if audit['replaced_operands']:
+        factories = retain_static_factories(ctx.graph_module) if static_factories else {'replaced_factories': 0}
+        changed = bool(audit['replaced_operands'] or factories['replaced_factories'])
+        if changed:
             # This runs before partitioning; propagate canonical metadata after
             # changing Scalar overloads to equivalent Tensor overloads.
             propagate_with_resident_buffers(ctx.graph_module, ctx.example_inputs,
                                             lambda: passes.pass_fake_propagation(ctx))
             logger().info('V4.1 resident I32 operand audit: %s', audit)
-        return bool(audit['replaced_operands'])
+            logger().info('V4.1 resident static factory audit: %s', factories)
+        return changed
 
     def transform(ctx):
         import os
