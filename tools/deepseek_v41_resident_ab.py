@@ -277,12 +277,12 @@ def capture_physical_arms(directory, template, engines, chain, rank, dist, prepa
             scopes.mkdir(parents=True, exist_ok=True)
             tracer = NativeTrace(scopes, scope_only=True)
             dist.barrier()
-            tracer.start()
             try:
                 # This is a node/causality audit, never a performance sample.
-                tokens = chain(True, 8, measure=False, engine=engine, warm_steps=0)[0]
+                tokens = chain(True, 8, measure=False, engine=engine, warm_steps=0, trace=tracer)[0]
             finally:
-                tracer.stop()
+                if tracer.running:
+                    tracer.stop()
             assert counts == preparation_counts(), 'Physical audit unexpectedly compiled a hot graph'
             metadata = copy.deepcopy(tracer.metadata)
             raw_files = []
