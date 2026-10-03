@@ -289,7 +289,7 @@ def split_mhc_consumers(module, exchange):
     return audit
 
 
-def make_backend(*, static_int32=False, static_factories=False):
+def make_backend(*, static_int32=False, static_factories=False, split_mhc=True):
     from habana_frameworks.torch.dynamo.compile_backend import passes
     from habana_frameworks.torch.dynamo.compile_backend.backends import hpu_backend
     from vllm_gaudi.extension.logger import logger
@@ -328,7 +328,7 @@ def make_backend(*, static_int32=False, static_factories=False):
                 torch.ops.vllm_gaudi.tp_peer_allgather.default,
                 torch.ops.vllm_gaudi.tp_peer_allgather_scheduled.default,
             ),
-        )
+        ) if split_mhc else []
         from vllm_gaudi import envs
 
         tile_partitions = 0

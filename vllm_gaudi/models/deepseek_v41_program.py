@@ -2218,9 +2218,11 @@ class CompiledStage:
                 raise ValueError("TP/mHC overlap requires BF16 boundaries and a qualified C1 expert layout")
             from vllm_gaudi.compilation.deepseek_v41_overlap import make_backend
 
-            backend = (make_backend(static_int32=True,
-                                    static_factories=getattr(stage, 'decode_static_factories', False))
-                       if getattr(stage, 'decode_static_int32', False) else make_backend())
+            backend = make_backend(
+                static_int32=getattr(stage, 'decode_static_int32', False),
+                static_factories=getattr(stage, 'decode_static_factories', False),
+                split_mhc=not getattr(stage, 'decode_merge_mhc_partitions', False),
+            )
         if group_size < 1 or len(stage.layers) % group_size:
             raise ValueError(f"Invalid V4.1 compiled layer group size {group_size} for {len(stage.layers)} layers")
         self.groups = tuple(
