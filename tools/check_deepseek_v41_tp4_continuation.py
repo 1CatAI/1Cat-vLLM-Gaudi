@@ -474,7 +474,8 @@ def main():
                 host.complete(ticket, 1)
                 assert original_projection.prefix_ready(32768)
 
-            def chain(device, steps, *, measure=True, native_positions=True, engine=None, warm_steps=0, trace=None):
+            def chain(device, steps, *, measure=True, native_positions=True, engine=None, warm_steps=0, trace=None,
+                      forced_tokens=None, observer=None):
                 queue_markers = []
 
                 def mark(name, index):
@@ -521,6 +522,11 @@ def main():
                     else:
                         context = nullcontext()
                     with context:
+                        if forced_tokens is not None:
+                            if measure:
+                                raise ValueError('Forced tokens are an untimed numerical diagnostic')
+                            selected = torch.tensor([[forced_tokens[index]]], dtype=torch.int64, device='hpu')
+                            readback = bridge.copy_sampled_tokens_to_host(selected)
                         if args.trace_entry_phases or args.queue_marker_only:
                             mark('begin', index)
                         position = continuation_position(context_tokens, index)
@@ -572,6 +578,10 @@ def main():
                             residual, pre = embedding(ids)
                             hidden = engine(residual, pre, positions, ids, packed)[0]
                         selected = sampler(hidden, engine)
+                        if observer is not None:
+                            if measure:
+                                raise ValueError('State observers are an untimed numerical diagnostic')
+                            observer(engine.program(), hidden, position)
                         if args.trace_entry_phases or args.queue_marker_only:
                             mark('stage_and_sampler_enqueued', index)
                         readback = bridge.copy_sampled_tokens_to_host(selected)

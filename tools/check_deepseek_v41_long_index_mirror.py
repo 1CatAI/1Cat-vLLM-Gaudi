@@ -20,6 +20,8 @@ def main():
     parser.add_argument('--end', type=int, default=82944)
     parser.add_argument('--search', type=int, default=131072)
     parser.add_argument('--steps', type=int, default=200)
+    parser.add_argument('--sequence-checks', type=int, default=0,
+                        help='Correctness only: advance positions and page addresses through native replay')
     args = parser.parse_args()
     rank = int(os.environ['LOCAL_RANK'])
     os.environ['HLS_MODULE_ID'] = os.environ['HABANA_VISIBLE_MODULES'].split(',')[rank]
@@ -94,8 +96,11 @@ def main():
             for _ in range(3):
                 full_query = fp4_roundtrip(torch.randn(1, 32, 128, generator=generator).bfloat16() / 32, 32)
                 gains = (torch.randn(1, 32, generator=generator) * .02).bfloat16()
+                if args.sequence_checks:
+                    gains = gains.abs() + .01
                 mla = (torch.randn(1, 64, 512, generator=generator) / 32).bfloat16()
-                index = torch.randn(1, 128, generator=generator).bfloat16()
+                index = (full_query.float().mean(1) * 65536).bfloat16() if args.sequence_checks else (
+                    torch.randn(1, 128, generator=generator).bfloat16())
                 latent = torch.randn(1, 512, generator=generator).bfloat16()
                 banks.append(tuple(t.to('hpu') for t in (
                     full_query[:, rank * 8:(rank + 1) * 8].contiguous(),
@@ -104,6 +109,8 @@ def main():
             position = torch.tensor([args.end - 1], dtype=torch.int32).to('hpu')
             logical = torch.tensor([(args.end - 1) // ratio], dtype=torch.int64).to('hpu')
             physical = (pages_cpu[logical.cpu() // page_rows].long() * page_rows + logical.cpu() % page_rows).to('hpu')
+            if args.sequence_checks:
+                banks = [(*bank, position.clone(), logical.clone(), physical.clone()) for bank in banks]
             pool = torch.full((1, 2048), -1, dtype=torch.int32, device='hpu')
             sink = torch.zeros(16, dtype=torch.float32, device='hpu')
             scale = torch.tensor([512 ** -.5], device='hpu')
@@ -158,10 +165,12 @@ def main():
 
             def invoke(arm, bank, arms=arms, fixed=fixed, owners=owners, staged=staged,
                        snapshot=Snapshot, adapter=adapter):
-                q, w, mla, index, latent = bank
+                q, w, mla, index, latent = bank[:5]
                 owner = owners[arm]
                 metadata = SimpleNamespace(native_completion=None,
                                            inputs=dict(q=q, w=w, mla=mla, index=index, latent=latent))
+                if args.sequence_checks:
+                    metadata.inputs.update(pos=bank[5], logical=bank[6], physical=bank[7])
                 roots = dict(adapter=adapter, owner=owner, snapshot=snapshot, metadata=metadata,
                              state_generation=0,
                              state_tensors=(fixed[0], fixed[1], fixed[3]) if arm else (fixed[0], fixed[1]))
@@ -172,23 +181,49 @@ def main():
                 # fixture banks that later replay staging would overwrite.
                 for destination, source in zip(staged[arm], bank, strict=True):
                     destination.copy_(source)
-                q, w, mla, index, latent = staged[arm]
+                q, w, mla, index, latent = staged[arm][:5]
                 metadata.inputs = dict(q=q, w=w, mla=mla, index=index, latent=latent)
+                call_fixed = fixed
+                if args.sequence_checks:
+                    metadata.inputs.update(pos=staged[arm][5], logical=staged[arm][6], physical=staged[arm][7])
+                    call_fixed = (*fixed[:6], *staged[arm][5:], *fixed[9:])
                 with collect_prepared_group_replays(**roots) as context:
-                    result = arms[arm](q, w, mla, index, latent, *fixed, bool(arm))
+                    result = arms[arm](q, w, mla, index, latent, *call_fixed, bool(arm))
                     context['outputs'] = result
                 return result
 
             checks = []
             case = dict(ratio=ratio, visible_rows=visible, checks=checks, periods=[])
             report['cases'].append(case)
-            for bank in banks:
+            sequence = banks
+            if args.sequence_checks:
+                sequence = []
+                for step in range(args.sequence_checks):
+                    pos = args.end - 1 + step
+                    row = pos // ratio
+                    physical_row = int(pages_cpu[row // page_rows]) * page_rows + row % page_rows
+                    sequence.append((*banks[step % len(banks)][:5],
+                                     torch.tensor([pos], dtype=torch.int32, device='hpu'),
+                                     torch.tensor([row], dtype=torch.int64, device='hpu'),
+                                     torch.tensor([physical_row], dtype=torch.int64, device='hpu')))
+            for step, bank in enumerate(sequence):
                 old, new = invoke(0, bank), invoke(1, bank)
                 torch.hpu.synchronize()
                 exact = [torch.equal(a.cpu(), b.cpu()) for a, b in zip(old, new, strict=True)]
                 checks.append(exact)
                 save()
-                assert all(exact), (ratio, exact)
+                if not all(exact):
+                    report['failure'] = dict(ratio=ratio, step=step, exact=exact,
+                                            old_ids=old[0].cpu().tolist(), new_ids=new[0].cpu().tolist())
+                    torch.save(dict(packed=cache.index.cpu(), pages=shared.block_table.cpu(),
+                                    mirror=cache.index_mirror.cpu(), inputs=[x.cpu() for x in bank]),
+                               args.output / f'mismatch-ratio{ratio}-rank{rank}.pt')
+                    save()
+                    raise AssertionError((ratio, step, exact))
+            if args.sequence_checks:
+                case['sequence_checks_exact'] = True
+                save()
+                continue
             bind_worker_helpers(rank)
             save()
             for _ in range(1800):

@@ -308,6 +308,61 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                 deadline.daemon = True
                 deadline.start()
             wait_for_loading(directory, rank, dist)
+            if job.get('command') == 'diagnose_index_mirror':
+                import torch
+                from vllm_gaudi.ops.deepseek_v41_math import unpack_fp4
+
+                saved_path = Path(job['reference_result'])
+                saved = json.loads(saved_path.read_text())
+                saved_periods = json.loads((saved_path.parent / saved['periods_file']).read_text())
+                forced = next(p for p in saved_periods if p['arm'] == 'A')['ranks'][rank]['tokens'][:32]
+                outputs = []
+                for name in ('long_index_paged_mme', 'long_index_mme'):
+                    replay = arm(name)
+                    records = []
+
+                    def observe(program, hidden, position, records=records):
+                        keys = {}
+                        for source, cache in program.shared.sources.items():
+                            if int(source) >= program.stop:
+                                continue
+                            row = position // cache.ratio
+                            visible_rows = (position + 1) // cache.ratio
+                            probes = torch.linspace(0, max(0, visible_rows - 1), 33).long().tolist()
+                            ids = torch.tensor([*probes, row], dtype=torch.int64, device=hidden.device)
+                            physical = program.shared.physical_rows(ids, cache.ratio).long()
+                            packed = cache.index.index_select(0, physical).cpu()
+                            mirror = cache.index_mirror.index_select(0, ids).cpu()
+                            valid = (ids.cpu() < visible_rows)
+                            keys[source] = dict(rows=ids.cpu(), visible=valid, mirror=mirror,
+                                                canonical=unpack_fp4(packed, 128, 32))
+                        indices = {str(b.layer): b.attention.selection.indices[:1].cpu().clone()
+                                   for b in program.layers if b.attention.owns_index}
+                        records.append(dict(position=position, hidden=hidden.cpu().clone(), keys=keys, indices=indices))
+
+                    chain(True, len(forced), measure=False, engine=replay, forced_tokens=forced, observer=observe)
+                    torch.save(records, directory / f'{name}-rank{rank}.pt')
+                    outputs.append(records)
+                checks = []
+                for old, new in zip(*outputs, strict=True):
+                    a, b = old['hidden'].float().flatten(), new['hidden'].float().flatten()
+                    keys_exact = all(torch.equal(k['mirror'][k['visible']], k['canonical'][k['visible']])
+                                     for record in (old, new) for k in record['keys'].values())
+                    checks.append(dict(position=old['position'], keys_exact=keys_exact,
+                                       indices_exact=all(torch.equal(v, new['indices'][k])
+                                                         for k, v in old['indices'].items()),
+                                       hidden_exact=torch.equal(a, b), max_abs=float((a-b).abs().max()),
+                                       relative_l2=float((a-b).norm()/a.norm().clamp_min(1e-30)),
+                                       cosine=float(torch.nn.functional.cosine_similarity(a, b, dim=0))))
+                (directory / f'checks-rank{rank}.json').write_text(json.dumps(checks, indent=2)+'\n')
+                dist.barrier()
+                if rank == 0:
+                    (directory / 'result.json').write_text(json.dumps(dict(status='diagnostics_completed',
+                        timed=False, formal_gain_credit=False, checks_file='checks-rank*.json'), indent=2)+'\n')
+                    Path(job['request_path']).rename(Path(job['request_path']).with_suffix('.consumed'))
+                    deadline.cancel()
+                    deadline = None
+                continue
             if job.get('reference_result'):
                 saved_path = Path(job['reference_result'])
                 saved = json.loads(saved_path.read_text())
@@ -464,15 +519,20 @@ def main():
                         help='Reuse saved matching-context timing and feedback tokens; time only the candidate')
     parser.add_argument('--reference-arm', choices=('A', 'B'), default='B')
     parser.add_argument('--stop', action='store_true')
+    parser.add_argument('--diagnose-index-mirror', action='store_true')
     args = parser.parse_args()
     if not args.stop and not args.candidate:
         parser.error('Select a candidate or --stop')
+    if args.diagnose_index_mirror and not args.reference_result:
+        parser.error('--diagnose-index-mirror needs the saved same-state A/B result')
     if args.steps < 200:
         parser.error('--steps must be at least 200')
     args.control_dir.mkdir(parents=True, exist_ok=True)
     job_id = f'{time.time_ns()}-{uuid.uuid4().hex[:8]}'
     job = dict(id=job_id, command='stop' if args.stop else 'measure', candidate=args.candidate,
                baseline=args.baseline, steps=args.steps)
+    if args.diagnose_index_mirror:
+        job['command'] = 'diagnose_index_mirror'
     if args.reference_result:
         job.update(reference_result=str(args.reference_result.resolve()), reference_arm=args.reference_arm)
     target = args.control_dir / f'{job_id}.request.json'
