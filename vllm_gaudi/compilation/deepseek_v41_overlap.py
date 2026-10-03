@@ -299,7 +299,8 @@ def require_candidate_operators(graph, required):
     return counts
 
 
-def make_backend(*, static_int32=False, static_factories=False, split_mhc=True, required_operators=()):
+def make_backend(*, static_int32=False, static_factories=False, split_mhc=True, required_operators=(),
+                 compiler_config=None):
     from habana_frameworks.torch.dynamo.compile_backend import passes
     from habana_frameworks.torch.dynamo.compile_backend.backends import hpu_backend
     from vllm_gaudi.extension.logger import logger
@@ -362,15 +363,29 @@ def make_backend(*, static_int32=False, static_factories=False, split_mhc=True, 
         return bool(audit or tile_partitions)
 
     def backend(graph, inputs, **kwargs):
+        from vllm_gaudi.compilation.deepseek_v41_compiler_config import compiler_configuration
         if required_operators:
             logger().info('V4.1 candidate operator activation: %s',
                           require_candidate_operators(graph, required_operators))
-        with _lock:
+        with _lock, compiler_configuration(compiler_config):
             passes.custom_pass_at_fuse_partition.append(transform)
             if static_int32:
                 passes.custom_pass_at_pre_partition.append(integer_constants)
             try:
-                return hpu_backend(graph, inputs, **kwargs)
+                result = hpu_backend(graph, inputs, **kwargs)
+                if compiler_config:
+                    # Bridge recipe compilation is deferred until its first
+                    # execution. Cover that execution as well as partitioning.
+                    # Captured native replay bypasses this host callable.
+                    from functools import wraps
+
+                    @wraps(result)
+                    def execute(*args, **kw):
+                        with _lock, compiler_configuration(compiler_config):
+                            return result(*args, **kw)
+
+                    return execute
+                return result
             finally:
                 if static_int32:
                     passes.custom_pass_at_pre_partition.remove(integer_constants)

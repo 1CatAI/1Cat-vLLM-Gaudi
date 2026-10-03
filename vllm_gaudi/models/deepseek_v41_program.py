@@ -2241,6 +2241,7 @@ class CompiledStage:
                 static_factories=getattr(stage, 'decode_static_factories', False),
                 split_mhc=not getattr(stage, 'decode_merge_mhc_partitions', False),
                 required_operators=getattr(stage, 'candidate_required_operators', ()),
+                compiler_config=getattr(stage, 'candidate_compiler_config', None),
             )
         if group_size < 1 or len(stage.layers) % group_size:
             raise ValueError(f"Invalid V4.1 compiled layer group size {group_size} for {len(stage.layers)} layers")
