@@ -9,6 +9,7 @@ import gzip
 import json
 import os
 from pathlib import Path
+import resource
 import threading
 import time
 
@@ -126,8 +127,10 @@ class NativeTrace:
         # MONOTONIC_RAW. Keep that common clock instead of stretching durations
         # to a wall clock that may step during NTP correction.
         base = raw0 // 1_000_000_000 * 1_000_000_000
-        events = [
-            dict(
+        events = []
+        for record in self.scope_events:
+            start, end, tid, label, *details = record
+            event = dict(
                 name=label,
                 ph="X",
                 cat="user_annotation",
@@ -136,8 +139,9 @@ class NativeTrace:
                 ts=(start - base) / 1000,
                 dur=(end - start) / 1000,
             )
-            for start, end, tid, label in self.scope_events
-        ]
+            if details:
+                event["args"] = details[0]
+            events.append(event)
         events.append(
             dict(
                 name="NativeTrace scope-only capture",
@@ -289,11 +293,21 @@ def scope(label):
     if _active and recorder is not None:
         start = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
         tid = threading.get_native_id()
+        cpu_start = time.thread_time_ns()
+        usage_start = resource.getrusage(resource.RUSAGE_THREAD)
         try:
             yield
         finally:
             end = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
-            recorder.scope_events.append((start, end, tid, label))
+            cpu_ns = time.thread_time_ns() - cpu_start
+            usage_end = resource.getrusage(resource.RUSAGE_THREAD)
+            recorder.scope_events.append((start, end, tid, label, dict(
+                thread_cpu_ns=cpu_ns,
+                thread_nonrunning_ns=max(0, end - start - cpu_ns),
+                voluntary_switches=usage_end.ru_nvcsw - usage_start.ru_nvcsw,
+                involuntary_switches=usage_end.ru_nivcsw - usage_start.ru_nivcsw,
+                thread_nonrunning_interpretation="waiting or preemption; not CPU execution",
+            )))
         return
     if _torch_active:
         with torch.profiler.record_function(label):

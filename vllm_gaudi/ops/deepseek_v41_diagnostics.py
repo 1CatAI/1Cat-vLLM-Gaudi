@@ -57,6 +57,11 @@ def trace_phase(function):
         # Missing native identifiers stay null; host context does not prove
         # ownership of a device stall or completion of a collective.
         name = phase_name(fields)
+        if os.environ.get("VLLM_HPU_DSV41_RAW_TRACE", "0") == "1":
+            from vllm_gaudi.ops.deepseek_v41_native_trace import scope
+
+            with scope(name):
+                return function(self, *args, **kwargs)
         with torch.profiler.record_function(name):
             return function(self, *args, **kwargs)
 
