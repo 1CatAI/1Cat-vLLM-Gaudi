@@ -322,8 +322,43 @@ def main():
                                        fullgraph=True, dynamic=False)
             compiled_sampler = torch.compile(stage.sample_greedy_token, backend='hpu_backend',
                                              fullgraph=True, dynamic=False)
+            sampling_payloads = {}
+            official_samplers = {}
+
+            def full_official(local, draw):
+                from vllm_gaudi.ops.deepseek_v41_sampling import sample_probabilities
+
+                return sample_probabilities(stage.all_gather(local, dim=-1), draw, filtered=True)
+
+            compiled_official = torch.compile(full_official, backend='hpu_backend', fullgraph=True, dynamic=False)
+            from vllm_gaudi.ops.deepseek_v41_sampling import device_sampling_draw
+            compiled_draw = torch.compile(device_sampling_draw, backend='hpu_backend', fullgraph=True, dynamic=False)
+
             def sampler(hidden, engine=None):
                 owner = decoder if engine is None else engine
+                program = owner.program() if args.shared_stage_replay else stage
+                if getattr(program, 'benchmark_official_sampling', False):
+                    from vllm_gaudi.ops.deepseek_v41_sampling import device_sampling_draw
+
+                    values = owner.sampling_tail_values(hidden)
+                    if values is not None:
+                        sampling_payloads[owner] = values
+                        return values[3]
+                    if owner not in official_samplers:
+                        def official(value):
+                            draw = device_sampling_draw(
+                                program.sampling_params, program.sampling_seed, program.sampling_counter)
+                            local = program._head_projection(value)
+                            return full_official(local, draw)
+
+                        official_samplers[owner] = torch.compile(
+                            official, backend='hpu_backend', fullgraph=True, dynamic=False)
+                    local = owner.tail_local_logits(hidden)
+                    if local is None:
+                        return official_samplers[owner](hidden)
+                    draw = compiled_draw(
+                        program.sampling_params, program.sampling_seed, program.sampling_counter)
+                    return compiled_official(local, draw)
                 cached = owner.greedy_tail_token(hidden) if args.shared_stage_replay else None
                 if cached is not None:
                     report['native_tail_sampler_hits'] = report.get('native_tail_sampler_hits', 0) + 1
@@ -527,6 +562,10 @@ def main():
 
                 engine = decoder if engine is None else engine
                 reset()
+                program = engine.program() if args.shared_stage_replay else stage
+                if getattr(program, 'benchmark_official_sampling', False):
+                    program.sampling_counter.zero_()
+                    sampling_payloads.pop(engine, None)
                 selected = sampler(seed_hidden, engine)
                 readback = bridge.copy_sampled_tokens_to_host(selected)
                 torch.hpu.synchronize()
@@ -559,6 +598,18 @@ def main():
                         if args.trace_entry_phases or args.queue_marker_only:
                             mark('begin', index)
                         position = continuation_position(context_tokens, index)
+                        if engine in sampling_payloads:
+                            payload = sampling_payloads.pop(engine)
+                            cpu_status, status_done = readback
+                            status_done.synchronize()
+                            covered = bool(int(cpu_status[0, 0]) & 1)
+                            readback = (cpu_status // 2, status_done)
+                            report['bounded_sampler_steps'] = report.get('bounded_sampler_steps', 0) + 1
+                            if not covered:
+                                corrected = compiled_official(payload[1], payload[2])
+                                selected.copy_(corrected)
+                                readback = bridge.copy_sampled_tokens_to_host(selected)
+                                report['bounded_sampler_fallbacks'] = report.get('bounded_sampler_fallbacks', 0) + 1
                         if device:
                             if native_positions:
                                 bank.copy_into(positions, position)
@@ -613,7 +664,8 @@ def main():
                             observer(engine.program(), hidden, position)
                         if args.trace_entry_phases or args.queue_marker_only:
                             mark('stage_and_sampler_enqueued', index)
-                        readback = bridge.copy_sampled_tokens_to_host(selected)
+                        source = sampling_payloads[engine][0] if engine in sampling_payloads else selected
+                        readback = bridge.copy_sampled_tokens_to_host(source)
                         if args.trace_entry_phases or args.queue_marker_only:
                             mark('token_readback_enqueued', index)
                         host.complete(ticket, 1)
@@ -664,7 +716,7 @@ def main():
                     from tools.deepseek_v41_resident_ab import serve
                 else:
                     from deepseek_v41_resident_ab import serve
-                serve(stage, decoder, shard, chain, report, args, preparation_counts)
+                serve(stage, decoder, shard, chain, report, args, preparation_counts, state_fingerprints)
                 report.update(status='resident_ab_stopped', formal_gain_credit=False)
                 return
 

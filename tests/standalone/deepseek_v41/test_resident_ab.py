@@ -32,6 +32,16 @@ def test_strict_noise_threshold_and_order():
         ab.summarize([1.] * 199)
 
 
+def test_repartition_gate_rejects_equal_tokens_with_different_mutable_state():
+    before = [dict(shape=[1, 512], dtype='torch.bfloat16', sha256='canonical')]
+    changed = [dict(shape=[1, 512], dtype='torch.bfloat16', sha256='changed')]
+    assert ab.check_repartition_state([31, 42], before, [31, 42], before)['mutable_state_exact']
+    with pytest.raises(RuntimeError, match='mutable state'):
+        ab.check_repartition_state([31, 42], before, [31, 42], changed)
+    with pytest.raises(RuntimeError, match='tokens'):
+        ab.check_repartition_state([31, 42], before, [31, 43], before)
+
+
 def test_clones_own_modules_but_share_immutable_storage():
     root = torch.nn.Module()
     root.child = torch.nn.Module()

@@ -9,13 +9,14 @@ import os
 from pathlib import Path
 import statistics
 import subprocess
-import threading
 import time
 from types import MethodType
 import uuid
 
 
 COMPILER_CANDIDATES = {
+    'handoff_expert_sequential': {},
+    'handoff_expert_sequential_sram': {'SRAM_SLICER_MAX_CAPACITY_BYTES': str(44 * 1024 * 1024)},
     'dense_fp8_unsliced': {'SRAM_SLICER_MAX_CAPACITY_BYTES': '0'},
     'dense_fp8_legacy_slicer': {'ENABLE_PIPELINE_MANAGEMENT': '0'},
 }
@@ -214,7 +215,14 @@ def wait_for_loading(directory, rank, dist):
             return
 
 
-def serve(stage, baseline, shard, chain, report, args, preparation_counts):
+def check_repartition_state(reference_tokens, reference_state, candidate_tokens, candidate_state):
+    """A scheduling change must preserve the complete mutable state, not just argmax."""
+    if reference_tokens != candidate_tokens or reference_state != candidate_state:
+        raise RuntimeError('Repartitioning changed continuation tokens or mutable state')
+    return dict(tokens_exact=True, mutable_state_exact=True, state_tensors=len(reference_state))
+
+
+def serve(stage, baseline, shard, chain, report, args, preparation_counts, state_fingerprints=None):
     import torch.distributed as dist
     from vllm_gaudi.ops.deepseek_v41_replay import StageReplay
 
@@ -223,18 +231,26 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
     control.mkdir(parents=True, exist_ok=True)
     arms = {'baseline': baseline}
     stages = {'baseline': stage}
-    deadline = None
 
     def arm(name):
         if name not in arms:
             if name in ('dense_fp8', 'dense_fp8_tail', 'dense_fp8_static_int32',
                         'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff',
+                        'handoff_int32_literals', 'handoff_static_factories', 'handoff_static_merged_segments',
+                        'handoff_fp4_mirror_pack', 'handoff_index_mirror_gather', 'handoff_mhc_packed_gates',
+                        'handoff_sampling_full', 'handoff_sampling_bounded',
                         'long_index_packed', 'long_index_mme', 'long_index_paged_mme', *COMPILER_CANDIDATES):
                 if 'dense_fp8' not in stages:
                     stages['dense_fp8'] = make_dense_stage(stage, shard, args.ab_dense_sidecar, args.ab_dense_config)
                 program = (make_handoff_stage(stages['dense_fp8'])
-                           if name in ('dense_fp8_swa_norm_handoff', 'long_index_packed',
-                                       'long_index_mme', 'long_index_paged_mme')
+                           if name in ('dense_fp8_swa_norm_handoff', 'handoff_int32_literals',
+                                       'handoff_static_factories', 'handoff_static_merged_segments',
+                                       'handoff_fp4_mirror_pack',
+                                       'handoff_index_mirror_gather', 'handoff_mhc_packed_gates',
+                        'handoff_sampling_full', 'handoff_sampling_bounded',
+                                       'long_index_packed',
+                                       'long_index_mme', 'long_index_paged_mme',
+                                       'handoff_expert_sequential', 'handoff_expert_sequential_sram')
                            else make_attention_norm_stage(stages['dense_fp8']) if name == 'dense_fp8_swa_norm_quant'
                            else make_swa_stage(stages['dense_fp8']) if name == 'dense_fp8_swa_packed'
                            else clone_module(stages['dense_fp8']))
@@ -242,13 +258,41 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                 program = clone_module(stage)
             else:
                 raise ValueError(f'Unknown resident candidate {name}')
-            program.decode_static_int32 = name == 'dense_fp8_static_int32'
+            program.decode_static_int32 = name in (
+                'dense_fp8_static_int32', 'handoff_int32_literals',
+                'handoff_static_factories', 'handoff_static_merged_segments')
+            program.decode_static_factories = name in ('handoff_static_factories', 'handoff_static_merged_segments')
+            program.decode_merge_mhc_partitions = name == 'handoff_static_merged_segments'
+            if name.startswith('handoff_expert_sequential'):
+                import torch
+                program.layers = torch.nn.ModuleList([clone_module(block) for block in program.layers])
+                for block in program.layers:
+                    block.moe = clone_module(block.moe)
+                    block.moe.sequential_w2 = True
+            for block in program.layers:
+                if name == 'handoff_mhc_packed_gates':
+                    block.decode_packed_control_gates = True
+                if name == 'handoff_fp4_mirror_pack':
+                    block.attention.decode_fp4_mirror_pack = True
+                if name == 'handoff_index_mirror_gather':
+                    block.attention.decode_index_mirror_gather = True
             if name in ('long_index_packed', 'long_index_mme', 'long_index_paged_mme'):
                 for block in program.layers:
                     block.attention.runtime_index_mme = name != 'long_index_packed'
                     if name == 'long_index_paged_mme':
                         block.attention.index_mirror_scores = False
-            replay = StageReplay(program, greedy_tail=name in ('tail', 'dense_fp8_tail'))
+            if name in ('handoff_sampling_full', 'handoff_sampling_bounded'):
+                import torch
+
+                program.benchmark_official_sampling = True
+                program.device_sampling = name == 'handoff_sampling_bounded'
+                program.register_buffer('sampling_params', torch.tensor([[1., .95, -1.]], device='hpu'))
+                program.register_buffer('sampling_seed', torch.tensor([42], dtype=torch.int32, device='hpu'))
+                program.register_buffer('sampling_counter', torch.zeros(1, dtype=torch.int32, device='hpu'))
+                program.register_buffer('sampling_origin', torch.tensor(
+                    [args.context_tokens-1], dtype=torch.int32, device='hpu'))
+            replay = StageReplay(program, greedy_tail=name in (
+                'tail', 'dense_fp8_tail', 'handoff_sampling_full', 'handoff_sampling_bounded'))
             program.replay_owner = replay
             stages[name], arms[name] = program, replay
             # Preserve actual compiler output for kernel-count changes. This
@@ -256,8 +300,11 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
             graph_directory = control / 'compiler-graphs' / name / f'rank{rank}'
             graph_directory.mkdir(parents=True, exist_ok=True)
             settings = dict(COMPILER_CANDIDATES.get(name, {}))
-            if name not in ('long_index_packed', 'long_index_mme', 'long_index_paged_mme'):
-                settings['DUMP_POST_GRAPHS'] = str(graph_directory)
+            # Synapse appends all cold compilations in a process to this JSON.
+            # Concurrent eager compilation can leave a truncated document;
+            # graph export therefore belongs in a serialized diagnostic run.
+            if os.environ.get('DSV41_RESIDENT_POST_GRAPH') == '1':
+                settings['DUMP_POST_GRAPHS'] = str(graph_directory / 'graph.post.json')
             with compiler_settings(settings):
                 chain(True, 2, measure=False, engine=replay, warm_steps=6)
             if not replay.input_variant_ready(program.search_length):
@@ -268,6 +315,9 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
         ready = dict(pid=os.getpid(), source=os.environ['DSV41_RUN_EVIDENCE'],
                      candidates=['dense_fp8', 'tail', 'dense_fp8_tail', 'dense_fp8_static_int32',
                                  'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff',
+                                 'handoff_int32_literals', 'handoff_static_factories', 'handoff_static_merged_segments',
+                        'handoff_fp4_mirror_pack', 'handoff_index_mirror_gather', 'handoff_mhc_packed_gates',
+                        'handoff_sampling_full', 'handoff_sampling_bounded',
                                  'long_index_packed', 'long_index_mme', 'long_index_paged_mme', *COMPILER_CANDIDATES])
         (control / 'ready.json').write_text(json.dumps(ready, indent=2)+'\n')
     print(f'TP{rank}: real16 fixture resident; control {control}', flush=True)
@@ -309,17 +359,6 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
             directory = control / job['id']
             directory.mkdir(exist_ok=True)
             begun = time.monotonic()
-            if rank == 0:
-                def expire(path=directory, candidate_name=name, start=begun):
-                    partial = dict(status='candidate_timeout', candidate=candidate_name,
-                                   elapsed_s=time.monotonic()-start, formal_gain_credit=False,
-                                   partial_periods='periods.json', worker_exit_code=124)
-                    (path / 'result.json').write_text(json.dumps(partial, indent=2)+'\n')
-                    # Elastic retires this task's other ranks; foreign card owners are untouched.
-                    os._exit(124)
-                deadline = threading.Timer(45 * 60, expire)
-                deadline.daemon = True
-                deadline.start()
             wait_for_loading(directory, rank, dist)
             if job.get('command') == 'diagnose_index_mirror':
                 import torch
@@ -368,8 +407,6 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                         if any('observer_error' in row for row in checks) else 'diagnostics_completed',
                         timed=False, formal_gain_credit=False, checks_file='checks-rank*.json'), indent=2)+'\n')
                     Path(job['request_path']).rename(Path(job['request_path']).with_suffix('.consumed'))
-                    deadline.cancel()
-                    deadline = None
                 continue
             if job.get('reference_result'):
                 saved_path = Path(job['reference_result'])
@@ -425,25 +462,36 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                     (directory / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
                     Path(job['request_path']).rename(Path(job['request_path']).with_suffix('.consumed'))
                     print(json.dumps(result), flush=True)
-                    deadline.cancel()
-                    deadline = None
                 continue
             reference_name = job.get('baseline', 'baseline')
             reference = arm(reference_name)
             candidate = arm(name)
+            numerical_gate = None
+            if name == 'handoff_static_merged_segments':
+                if state_fingerprints is None or reference_name != 'handoff_static_factories':
+                    raise ValueError('Repartitioning requires the same static-coordinate reference and state observer')
+                old_tokens = chain(True, 8, measure=False, engine=reference, warm_steps=6)[0]
+                old_state = state_fingerprints()
+                new_tokens = chain(True, 8, measure=False, engine=candidate, warm_steps=6)[0]
+                numerical_gate = check_repartition_state(old_tokens, old_state, new_tokens, state_fingerprints())
+                (directory / f'numerical-gate-rank{rank}.json').write_text(
+                    json.dumps(numerical_gate, indent=2)+'\n')
+                dist.barrier()
             # Resolve both warmed contracts before the no-hot-compilation gate.
             chain(True, 2, measure=False, engine=reference, warm_steps=6)
             counts = preparation_counts()
             periods = []
             for label in ('A', 'B', 'A', 'B', 'A', 'B'):
-                if time.monotonic() - begun > 45 * 60:
-                    raise TimeoutError('Candidate reached the 45-minute limit')
                 wait_for_loading(directory, rank, dist)
                 dist.barrier()
+                before_steps = report.get('bounded_sampler_steps', 0)
+                before_fallbacks = report.get('bounded_sampler_fallbacks', 0)
                 tokens, host_ms, device_ms = chain(True, steps, engine=reference if label == 'A' else candidate,
                                                    warm_steps=32)
                 assert counts == preparation_counts(), 'Hot recompilation invalidates the A/B measurement'
                 local = dict(rank=rank, tokens=tokens, delivery_ns=report['token_delivery_ns'],
+                             sampling_steps=report.get('bounded_sampler_steps', 0)-before_steps,
+                             sampling_fallbacks=report.get('bounded_sampler_fallbacks', 0)-before_fallbacks,
                              host_ms=host_ms, device_ms=device_ms,
                              checked_first_device_position=report.get('checked_first_device_position'))
                 ranks = [None] * dist.get_world_size()
@@ -461,6 +509,7 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
             if rank == 0:
                 result = dict(status='completed', baseline=reference_name, candidate=name, steps=steps, order='ABABAB',
                               elapsed_s=time.monotonic()-begun, graphs=infos, comparison=compare_periods(periods),
+                              numerical_gate=numerical_gate,
                               context_tokens=args.context_tokens,
                               checked_first_device_positions=[row['checked_first_device_position'] for row in ranks],
                               no_profiler=True, no_hot_compilation=True, four_rank_tokens_equal=True,
@@ -486,6 +535,17 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                     if not result['cross_arm_feedback_exact']:
                         result['comparison']['effective'] = False
                         result['status'] = 'numerical_contract_failed'
+                if name in ('handoff_sampling_bounded',
+                            'handoff_expert_sequential', 'handoff_expert_sequential_sram',
+                            'handoff_int32_literals', 'handoff_static_factories', 'handoff_static_merged_segments',
+                            'handoff_fp4_mirror_pack', 'handoff_index_mirror_gather'):
+                    result['cross_arm_feedback_exact'] = all(
+                        p['ranks'][0]['tokens'] == periods[0]['ranks'][0]['tokens'] for p in periods)
+                    result['gain_ledger_eligible'] = (
+                        result['cross_arm_feedback_exact'] and result['comparison']['effective'])
+                    if not result['cross_arm_feedback_exact']:
+                        result['comparison']['effective'] = False
+                        result['status'] = 'numerical_contract_failed'
                 if name in COMPILER_CANDIDATES:
                     # Runtime compiler settings are absent from Bridge's recipe
                     # cache key. A/B timing alone cannot establish distinct arms.
@@ -501,11 +561,7 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                 (directory / 'result.json').write_text(json.dumps(result, indent=2)+'\n')
                 Path(job['request_path']).rename(Path(job['request_path']).with_suffix('.consumed'))
                 print(json.dumps(result), flush=True)
-                deadline.cancel()
-                deadline = None
     finally:
-        if deadline is not None:
-            deadline.cancel()
         for name, replay in arms.items():
             if name != 'baseline':
                 replay.close()
@@ -538,10 +594,17 @@ def main():
     parser.add_argument('--candidate', choices=('dense_fp8', 'tail', 'dense_fp8_tail',
                                               'dense_fp8_static_int32', 'dense_fp8_swa_packed',
                                               'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff',
+                                              'handoff_int32_literals', 'handoff_static_factories',
+                                              'handoff_static_merged_segments',
+                        'handoff_fp4_mirror_pack', 'handoff_index_mirror_gather', 'handoff_mhc_packed_gates',
+                        'handoff_sampling_full', 'handoff_sampling_bounded',
                                               'long_index_packed', 'long_index_mme', 'long_index_paged_mme',
                                               *COMPILER_CANDIDATES))
     parser.add_argument('--baseline', choices=('baseline', 'dense_fp8', 'dense_fp8_swa_packed',
-                                               'dense_fp8_swa_norm_quant', 'long_index_packed',
+                                               'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff',
+                                               'handoff_static_factories',
+                                               'handoff_sampling_full',
+                                               'long_index_packed',
                                                'long_index_paged_mme'), default='baseline')
     parser.add_argument('--steps', type=int, default=200)
     parser.add_argument('--reference-result', type=Path,
