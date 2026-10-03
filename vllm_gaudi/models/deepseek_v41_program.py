@@ -455,7 +455,9 @@ class PreparedMoE(nn.Module):
             result = result + down.float()[:, expert]
         return result.to(value.dtype)
 
-    def _forward_n256_fp8(self, value, ids, routing, *, ordinary_decode=False, prequant=None, shared=None):
+    def _forward_n256_fp8(
+        self, value, ids, routing, *, ordinary_decode=False, decode=False, prequant=None, shared=None
+    ):
         """Run the resident FP8 N256 body for decode and bounded prefill."""
         experts = self.weights.experts
         if ordinary_decode and (self.batch_expert_reuse or self.batch_route_pack) and value.shape[0] > 1:
@@ -531,7 +533,7 @@ class PreparedMoE(nn.Module):
                 if not use_fused:
                     raise ValueError("Prequantized N256 input requires the fused expert body")
                 quantized, activation_scale = tile_prequant
-                if getattr(self, "all_route_slots", False) and ordinary_decode and tile_value.shape[0] == 1:
+                if getattr(self, "all_route_slots", False) and (decode or ordinary_decode) and tile_value.shape[0] == 1:
                     if not self.n256_fused_reduce:
                         raise ValueError("All-route decode requires ordered direct finalization")
                     op = (
@@ -726,7 +728,8 @@ class PreparedMoE(nn.Module):
             # runtime shape profile (M128 generic failure).
             if self.n256_fp8:
                 output = self._forward_n256_fp8(
-                    value, ids, routing, ordinary_decode=ordinary_decode, prequant=prequant, shared=shared_out
+                    value, ids, routing, ordinary_decode=ordinary_decode, decode=decode,
+                    prequant=prequant, shared=shared_out
                 )
             else:
                 operands = (
@@ -2237,6 +2240,7 @@ class CompiledStage:
                 static_int32=getattr(stage, 'decode_static_int32', False),
                 static_factories=getattr(stage, 'decode_static_factories', False),
                 split_mhc=not getattr(stage, 'decode_merge_mhc_partitions', False),
+                required_operators=getattr(stage, 'candidate_required_operators', ()),
             )
         if group_size < 1 or len(stage.layers) % group_size:
             raise ValueError(f"Invalid V4.1 compiled layer group size {group_size} for {len(stage.layers)} layers")

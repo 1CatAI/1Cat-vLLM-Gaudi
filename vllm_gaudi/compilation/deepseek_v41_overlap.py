@@ -289,7 +289,17 @@ def split_mhc_consumers(module, exchange):
     return audit
 
 
-def make_backend(*, static_int32=False, static_factories=False, split_mhc=True):
+def require_candidate_operators(graph, required):
+    targets = [str(node.target) for module in graph.modules() if hasattr(module, 'graph')
+               for node in module.graph.nodes if node.op == 'call_function']
+    counts = {name: sum(name in target for target in targets) for name in required}
+    missing = [name for name, count in counts.items() if not count]
+    if missing:
+        raise RuntimeError(f'Candidate graph did not activate its required operators: {missing}')
+    return counts
+
+
+def make_backend(*, static_int32=False, static_factories=False, split_mhc=True, required_operators=()):
     from habana_frameworks.torch.dynamo.compile_backend import passes
     from habana_frameworks.torch.dynamo.compile_backend.backends import hpu_backend
     from vllm_gaudi.extension.logger import logger
@@ -352,6 +362,9 @@ def make_backend(*, static_int32=False, static_factories=False, split_mhc=True):
         return bool(audit or tile_partitions)
 
     def backend(graph, inputs, **kwargs):
+        if required_operators:
+            logger().info('V4.1 candidate operator activation: %s',
+                          require_candidate_operators(graph, required_operators))
         with _lock:
             passes.custom_pass_at_fuse_partition.append(transform)
             if static_int32:

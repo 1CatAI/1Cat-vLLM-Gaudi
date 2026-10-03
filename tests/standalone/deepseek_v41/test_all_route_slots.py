@@ -8,9 +8,32 @@ import torch
 from vllm_gaudi.models.deepseek_v41_program import PreparedMoE
 
 
+@pytest.mark.parametrize('decode', [False, True])
+def test_public_moe_forward_passes_the_serving_decode_flag(decode):
+    value = torch.ones(1, 6, dtype=torch.bfloat16)
+    gate = SimpleNamespace(bias=torch.zeros(6), bias_vl=torch.zeros(6))
+    seen = []
+
+    def body(*args, **kwargs):
+        seen.append(kwargs)
+        return value
+
+    moe = SimpleNamespace(weights=SimpleNamespace(gate=gate, experts=None), router_top6=False,
+                          topk=6, n256=True, n256_fp8=True, n256_fused_reduce=True,
+                          prefill_grouped=False, prefill_mxfp4=False,
+                          _router_logits=lambda *args: torch.ones(1, 6),
+                          shared_expert=lambda *args: torch.zeros_like(value),
+                          _forward_n256_fp8=body, reduce=lambda x: x)
+    PreparedMoE.forward(moe, value, torch.zeros(1, dtype=torch.bool), decode=decode,
+                        prequant=(value, torch.ones(1, 1)))
+    assert seen[0]['decode'] == decode
+    assert not seen[0]['ordinary_decode']
+
+
 @pytest.mark.parametrize('tp_size', [2, 4])
-@pytest.mark.parametrize('tokens,ordinary', [(1, True), (1, False), (2, True), (6, True)])
-def test_all_slots_keeps_shared_rounding_and_non_c1_dispatch(monkeypatch, tp_size, tokens, ordinary):
+@pytest.mark.parametrize('tokens,ordinary,decode', [(1, True, False), (1, False, True),
+                                                 (1, False, False), (2, True, False), (6, True, False)])
+def test_all_slots_keeps_shared_rounding_and_non_c1_dispatch(monkeypatch, tp_size, tokens, ordinary, decode):
     tensor = torch.ones(1)
     experts = SimpleNamespace(**{key: tensor for key in (
         'w13_q16', 'w2_q16', 'w13_s16', 'w2_s16', 'w13_fp8_channel', 'w2_fp8_channel')})
@@ -40,9 +63,9 @@ def test_all_slots_keeps_shared_rounding_and_non_c1_dispatch(monkeypatch, tp_siz
     prequant = value, torch.ones(tokens, 1)
     with_shared = shared if tokens == 1 else None
     output = PreparedMoE._forward_n256_fp8(
-        moe, value, ids, torch.ones_like(ids).float(), ordinary_decode=ordinary,
+        moe, value, ids, torch.ones_like(ids).float(), ordinary_decode=ordinary, decode=decode,
         prequant=prequant, shared=with_shared,
     )
     expected = routed if with_shared is None else (routed.float() + shared.float()).bfloat16()
     assert torch.equal(output.view(torch.int16), expected.view(torch.int16))
-    assert calls == ['slots' if tokens == 1 and ordinary else 'shared' if tokens == 1 else 'batch']
+    assert calls == ['slots' if tokens == 1 and (ordinary or decode) else 'shared' if tokens == 1 else 'batch']

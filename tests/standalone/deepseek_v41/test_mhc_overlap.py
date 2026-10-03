@@ -11,7 +11,15 @@ from vllm_gaudi.compilation.deepseek_v41_overlap import (
     deduplicate_float_casts,
     independent_mhc_nodes,
     split_mhc_consumers,
+    require_candidate_operators,
 )
+
+
+def test_candidate_activation_is_checked_on_the_graph():
+    graph = make_fx(lambda x: torch.sigmoid(x))(torch.ones(1))
+    assert require_candidate_operators(graph, ['aten.sigmoid']) == {'aten.sigmoid': 1}
+    with pytest.raises(RuntimeError, match='did not activate'):
+        require_candidate_operators(graph, ['custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_slots'])
 
 
 @torch.library.custom_op("dsv41_overlap_test::deepseek_v41_control_gemv", mutates_args=())

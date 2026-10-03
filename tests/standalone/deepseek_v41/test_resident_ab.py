@@ -84,8 +84,11 @@ def test_all_route_factory_preserves_reference_flags_and_weight_ownership(monkey
     block.moe.register_buffer('weight', torch.ones(4))
     stage.layers = torch.nn.ModuleList([block])
     implementation = lambda self, *args, **kwargs: self.weight
+    from vllm_gaudi.models import deepseek_v41_program
     monkeypatch.setattr(importlib, 'reload', lambda module: SimpleNamespace(
-        PreparedMoE=SimpleNamespace(_forward_n256_fp8=implementation)))
+        PreparedMoE=SimpleNamespace(_forward_n256_fp8=implementation, forward=implementation),
+        CompiledStage=deepseek_v41_program.CompiledStage)
+        if module is deepseek_v41_program else module)
     path = _path.parent / 'deepseek_v41_candidates/all_route_slots.py'
     factory, _ = ab.load_candidate_factory(path, hashlib.sha256(path.read_bytes()).hexdigest())
     candidate = factory(stage, ab.clone_module)
