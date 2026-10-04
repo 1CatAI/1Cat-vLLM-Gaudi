@@ -283,6 +283,32 @@ class EngramTokenHistory:
                                            head_start)
             return self.pending
 
+    def prepare_mirror(self, request_id, token_ids, image_mask=None):
+        """Track accepted device inputs without recomputing their row hashes.
+
+        This packet is commit-only. Device producers own hashing and lookup;
+        keeping the ordinary pending/generation contract preserves request and
+        prefix-checkpoint lifetime checks.
+        """
+        with self.lock:
+            if request_id != self.request_id or self.pending is not None:
+                raise RuntimeError("Engram request changed or its previous input is still pending")
+            tokens = np.asarray(token_ids, dtype=np.int64)
+            if (tokens.ndim != 1 or not 1 <= tokens.size <= 6
+                    or tokens.min() < 0 or tokens.max() >= self.token_map.size):
+                raise ValueError("Device Engram mirror requires C1-C6 valid token IDs")
+            dead = np.zeros(tokens.size, dtype=bool) if image_mask is None else np.asarray(image_mask, dtype=bool)
+            if dead.shape != tokens.shape:
+                raise ValueError("Image span mask does not match input tokens")
+            compressed = self.token_map[tokens].copy()
+            compressed[dead] = -1
+            hashes = np.empty((tokens.size, len(self.layout.layer_ids), 0), dtype=np.int32)
+            active = ~dead
+            for array in (compressed, hashes, active):
+                array.setflags(write=False)
+            self.pending = EngramHashBatch(request_id, self.generation, self.position, compressed, hashes, active)
+            return self.pending
+
     def commit(self, batch: EngramHashBatch, committed_input_tokens: int):
         with self.lock:
             if batch is not self.pending or batch.generation != self.generation or batch.request_id != self.request_id:

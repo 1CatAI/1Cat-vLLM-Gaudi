@@ -18,6 +18,12 @@ def copy_sampling_frame(destinations, payload, history):
     return destinations
 
 
+@dataclass(frozen=True)
+class DeviceInputTransaction:
+    """Host history mirror for a device-produced ordinary input."""
+    batch: object
+
+
 @dataclass
 class DeviceStep:
     request_id: str

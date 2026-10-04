@@ -76,8 +76,10 @@ def commit_replay_inputs(input_ids, positions, selected):
     """Advance private C1 replay roots after their last current-token consumer.
 
     These allocations belong to StageVariant, never to PositionBank or a
-    scheduler request. The coverage certificate must still be resolved before
-    the next replay. Full sampling repair overwrites the returned token alias.
+    scheduler request. Ordinary continuation resolves the certificate before
+    replay. Device lookahead instead preserves this draw in a separate frame,
+    drains a rejected invocation, and repairs it before publishing its output.
+    Full sampling repair overwrites the returned token alias.
     """
     if (input_ids.dtype != torch.int32 or positions.dtype != torch.int32
             or input_ids.shape != (1,) or positions.shape != (1,)

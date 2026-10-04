@@ -160,7 +160,7 @@ class V41V2ModelRunner(V41ModelRunner):
             # history; device producers already performed both row lookups.
             history = self.model.engram_host.history
             request = self.requests[record.request_id]
-            batch = history.prepare(record.request_id, [request.tokens[record.start]])
+            batch = history.prepare_mirror(record.request_id, [request.tokens[record.start]])
             history.commit(batch, 1)
             self._device_step_input = None
         else:
@@ -239,7 +239,13 @@ class V41V2ModelRunner(V41ModelRunner):
                 self.audit["device_loop_consumed"] = self.audit.get("device_loop_consumed", 0) + 1
                 return step.hidden
             self._discard_device_step()
-        return super()._forward(request_id, tokens, start, **kwargs)
+        output = super()._forward(request_id, tokens, start, **kwargs)
+        if getattr(self, "_device_loop_enabled", False):
+            from vllm_gaudi.ops.deepseek_v41_device_loop import DeviceInputTransaction
+
+            if isinstance(self.model.step_ticket, DeviceInputTransaction):
+                self._device_loop_position = start + 1
+        return output
 
     @staticmethod
     def _continuation_authorized(record, scheduled):

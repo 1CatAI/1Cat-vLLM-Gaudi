@@ -258,6 +258,15 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             if reset:
                 self.engram_host.reset(request_id)
             image_mask = [token in (129264, 129265) for token in token_ids]
+            inputs = getattr(self, "device_engram_inputs", None)
+            if (envs.VLLM_HPU_DSV41_DEVICE_CLOSED_LOOP and self.step_use_replay
+                    and len(token_ids) == 1 and inputs is not None and inputs.owner is not None
+                    and inputs.owner[1] == request_id):
+                from vllm_gaudi.ops.deepseek_v41_device_loop import DeviceInputTransaction
+
+                self.step_ticket = DeviceInputTransaction(self.engram_host.history.prepare_mirror(
+                    request_id, token_ids, image_mask))
+                return
             device_layer1 = bool(
                 envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and is_decode and self.engram_host.device_pending == request_id
             )
@@ -307,7 +316,12 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         if self.pp_rank == 0:
             if self.step_ticket is None:
                 raise RuntimeError("V4.1 completion has no input transaction")
-            self.engram_host.complete(self.step_ticket, committed_inputs)
+            from vllm_gaudi.ops.deepseek_v41_device_loop import DeviceInputTransaction
+
+            if isinstance(self.step_ticket, DeviceInputTransaction):
+                self.engram_host.history.commit(self.step_ticket.batch, committed_inputs)
+            else:
+                self.engram_host.complete(self.step_ticket, committed_inputs)
             self.step_ticket = None
             self._step_request_id = None
 
@@ -490,7 +504,12 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 del values
                 pre = torch.zeros(input_ids.numel(), 4, device=residual.device, dtype=torch.float32)
                 pre[:, 0] = 1
-            if envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and self.step_use_replay and input_ids.numel() == 1:
+            from vllm_gaudi.ops.deepseek_v41_device_loop import DeviceInputTransaction
+
+            if isinstance(self.step_ticket, DeviceInputTransaction):
+                inputs = self.device_decode_inputs()
+                engram = inputs.prepare(inputs.owner, input_ids, inputs.history_views[-1])
+            elif envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and self.step_use_replay and input_ids.numel() == 1:
                 layer1 = self.engram_host.consume_device_c1(self._step_request_id)
                 buffers = self.engram_host.wait(self.step_ticket)
                 engram = (layer1, buffers[1])
