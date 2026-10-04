@@ -1343,10 +1343,12 @@ class PreparedStage(nn.Module):
             raise ValueError("Runtime CSA2 indexer requires paged ordinary decode")
         self.decode_static_int32 = gaudi_envs.VLLM_HPU_DSV41_STATIC_COORDINATES
         self.decode_static_factories = self.decode_static_int32
+        self.decode_merge_mhc_partitions = gaudi_envs.VLLM_HPU_DSV41_MERGE_LOCAL_SEGMENTS
         self.bf16_head = gaudi_envs.VLLM_HPU_DSV41_BF16_LM_HEAD
         self.device_sampling = gaudi_envs.VLLM_HPU_DSV41_DEVICE_SAMPLING and not self.dspark
         self.device_next_position = gaudi_envs.VLLM_HPU_DSV41_DEVICE_NEXT_POSITION
         self.device_input_feedback = gaudi_envs.VLLM_HPU_DSV41_DEVICE_INPUT_FEEDBACK
+        self.device_closed_loop = gaudi_envs.VLLM_HPU_DSV41_DEVICE_CLOSED_LOOP
         if self.device_next_position and (not self.device_sampling or pipeline_parallel_size != 1):
             raise ValueError("Device position continuation requires sampled C1 replay without a PP boundary")
         if self.device_input_feedback and not self.device_next_position:

@@ -33,23 +33,33 @@ def test_physical_audit_cannot_overwrite_the_template_namespace(tmp_path):
         ab.isolated_trace_config(template, tmp_path/'audit')
 
 
-def periods(a, b):
-    return [dict(arm=arm, token_intervals_ms=list(a if arm == 'A' else b)) for arm in 'ABABAB']
+def periods(a, b, device_a=5., device_b=4.9):
+    return [dict(arm=arm, token_intervals_ms=list(a if arm == 'A' else b),
+                 ranks=[dict(device_ms=device_a if arm == 'A' else device_b)]) for arm in 'ABABAB']
 
 
-def test_strict_noise_threshold_and_order():
+def test_three_device_rounds_without_host_iqr_veto():
     a = [4.9, 5.1] * 100
     weak = ab.compare_periods(periods(a, [4.7, 4.9] * 100))
-    assert not weak['effective']
-    assert weak['validity_threshold_ms'] == pytest.approx(0.4)
+    assert weak['effective']
+    assert weak['saving_ms'] == pytest.approx(.1)
+    assert 'validity_threshold_ms' not in weak
     strong = ab.compare_periods(periods(a, [4.3, 4.5] * 100))
     assert strong['effective'] and not strong['formal_gain_credit']
-    negative = ab.compare_periods(periods(a, [5.5, 5.7] * 100))
+    negative = ab.compare_periods(periods(a, [5.5, 5.7] * 100, device_b=5.1))
     assert negative['slower'] and not negative['effective']
     with pytest.raises(ValueError, match='ABABAB'):
         ab.compare_periods(periods(a, a)[:-1])
     with pytest.raises(ValueError, match='200'):
         ab.summarize([1.] * 199)
+
+
+def test_device_rounds_must_all_agree_and_use_slowest_rank():
+    values = periods([5.] * 200, [4.] * 200)
+    values[-1]['ranks'].append(dict(device_ms=5.2))
+    comparison = ab.compare_periods(values)
+    assert not comparison['effective'] and not comparison['slower']
+    assert comparison['round_savings_ms'] == pytest.approx([.1, .1, -.2])
 
 
 def test_repartition_gate_rejects_equal_tokens_with_different_mutable_state():

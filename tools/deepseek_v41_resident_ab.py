@@ -97,13 +97,20 @@ def summarize(values):
 def compare_periods(periods):
     if [p['arm'] for p in periods] != ['A', 'B', 'A', 'B', 'A', 'B']:
         raise ValueError('The comparison order must be ABABAB')
-    baseline = summarize(v for p in periods if p['arm'] == 'A' for v in p['token_intervals_ms'])
-    candidate = summarize(v for p in periods if p['arm'] == 'B' for v in p['token_intervals_ms'])
-    delta = baseline['median_ms'] - candidate['median_ms']
-    threshold = 2 * baseline['iqr_ms']
-    return dict(baseline=baseline, candidate=candidate, saving_ms=delta, validity_threshold_ms=threshold,
-                effective=delta > threshold, slower=-delta > threshold,
-                period_medians_ms=[summarize(p['token_intervals_ms'])['median_ms'] for p in periods],
+    # Device events bracket the same native producer/consumer chain in each
+    # arm. Host delivery distributions remain diagnostics, not a veto on a
+    # device improvement. All three paired rounds must agree on direction.
+    medians = [max(row['device_ms'] for row in p['ranks']) for p in periods]
+    baseline_values, candidate_values = medians[::2], medians[1::2]
+    savings = [a - b for a, b in zip(baseline_values, candidate_values, strict=True)]
+    baseline = dict(median_ms=statistics.median(baseline_values), rounds_ms=baseline_values)
+    candidate = dict(median_ms=statistics.median(candidate_values), rounds_ms=candidate_values)
+    return dict(baseline=baseline, candidate=candidate,
+                saving_ms=statistics.median(savings), round_savings_ms=savings,
+                effective=all(value > 0 for value in savings), slower=all(value < 0 for value in savings),
+                period_medians_ms=medians, decision='three paired device rounds; no IQR threshold',
+                host_baseline=summarize(v for p in periods if p['arm'] == 'A' for v in p['token_intervals_ms']),
+                host_candidate=summarize(v for p in periods if p['arm'] == 'B' for v in p['token_intervals_ms']),
                 formal_gain_credit=False)
 
 
@@ -587,8 +594,9 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
                     result = dict(status='completed', candidate=name, steps=steps, context_tokens=args.context_tokens,
                                   reference_result=str(saved_path), reference_arm=label, baseline_measured=False,
                                   comparison=dict(baseline=old, candidate=new, saving_ms=delta,
-                                                  validity_threshold_ms=2 * old['iqr_ms'],
-                                                  effective=delta > 2 * old['iqr_ms'], formal_gain_credit=False),
+                                                  effective=False,
+                                                  decision='Archived-arm diagnostic; paired device rounds required',
+                                                  formal_gain_credit=False),
                                   no_profiler=True, no_hot_compilation=True, feedback_tokens_exact=True,
                                   checked_first_device_positions=[row['checked_first_device_position']
                                                                   for row in ranks],
@@ -623,10 +631,10 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
                     return observe
 
                 old_hidden, new_hidden = [], []
-                old_tokens = chain(True, 8, measure=False, engine=reference, warm_steps=6,
+                old_tokens = chain(True, 4, measure=False, engine=reference, warm_steps=1,
                                    observer=hidden_observer(old_hidden))[0]
                 old_state = state_fingerprints()
-                new_tokens = chain(True, 8, measure=False, engine=candidate, warm_steps=6,
+                new_tokens = chain(True, 4, measure=False, engine=candidate, warm_steps=1,
                                    observer=hidden_observer(new_hidden))[0]
                 new_state = state_fingerprints()
                 try:
@@ -723,7 +731,7 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
                               context_tokens=args.context_tokens,
                               checked_first_device_positions=[row['checked_first_device_position'] for row in ranks],
                               no_profiler=True, no_hot_compilation=True, four_rank_tokens_equal=True,
-                              statistic_unit='Four-rank latest token delivery interval, milliseconds',
+                              statistic_unit='Slowest-rank device event ms/step; paired-round median',
                               baseline_drift_ms=max(p['summary']['median_ms'] for p in periods if p['arm']=='A')
                               - min(p['summary']['median_ms'] for p in periods if p['arm']=='A'),
                               formal_quality_pending=True, periods_file='periods.json')

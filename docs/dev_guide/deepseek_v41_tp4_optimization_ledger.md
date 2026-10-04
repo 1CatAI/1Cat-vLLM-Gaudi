@@ -751,3 +751,9 @@ Work order:one maintrace→sharedI32/coordinates→all-sixexpert decode/MME→mH
 Own retiredgraphs were losslessly archived withtarcompare/SHA256 before removing original folders; newtrace/postgraphs/logs remain onSSD. Disk headroom restored beyond30GB. Historical result/trace/source records retained. New I32armuses the qualified norm/SWA/Engram/mHC handoff parent, not the older dense-only parent whose archivedIQR exceeded its measured difference. Its numerical/real16result is pending.
 
 2026-10-03：合并main后的常驻ABABAB200：I32+只读静态工厂4.250790→4.136407 ms/16层，差值0.114383 >2IQR0.071210，跨卡/跨候选token一致，无热编译。按×1.5仅预估整模0.171575 ms，尚未端到端；累计确认16层0.114383 ms。I32单项、FP4双输出、I32镜像gather均未过噪声门槛，不相加。详见本地decode-kernel-resident-01/INITIAL_AB_REPORT.json。
+
+### 2026-10-04：当前微基准与批量验收规则
+
+生产形状、真实权重、直接生产者与消费者，使用生产原生重放。正确性检查 3–5 组真实输入；同进程 ABABAB，三轮设备时间差方向一致即可，不用 IQR 门槛。候选默认关闭；仅通过完整链微基准的候选记一行“名称／每 token 或每轮节省／开关”。累计预估 ≥1 ms 或 3–5 项后，统一进行一次官方采样正式请求（seed 42、自然 EOS）及随带 trace。端到端兑现 ≥一半预估才整批默认开启。未测、失败、重复方向不计收益。
+
+固定启动工具：`tools/launch_deepseek_v41_decode_micro.py`，复用卡锁、0/1/4/5 与 CPU 10/15/38/43，SSD 临时目录、编译缓存、诊断默认关闭和桥接接口前置检查。现有微基准收益不改记为端到端收益。
