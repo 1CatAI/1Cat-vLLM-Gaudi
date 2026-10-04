@@ -115,6 +115,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_FIXED_POSITIONS: bool = False
     VLLM_HPU_DSV41_PACKED_PP: bool = False
     VLLM_HPU_DSV41_TPC_MHC: bool = False
+    VLLM_HPU_DSV41_MHC_MME_GATES_NORM: bool = False
     VLLM_HPU_DSV41_MHC_CONTROL_RRMS: bool = False
     VLLM_HPU_DSV41_MHC_GATES_FUSED: bool = False
     VLLM_HPU_DSV41_ENGRAM_NATIVE_C1: bool = False
@@ -608,6 +609,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_PACKED_PP", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_TPC_MHC":
     lambda: os.environ.get("VLLM_HPU_DSV41_TPC_MHC", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_MHC_MME_GATES_NORM":
+    lambda: os.environ.get("VLLM_HPU_DSV41_MHC_MME_GATES_NORM", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_CONTROL_RRMS":
     lambda: os.environ.get("VLLM_HPU_DSV41_MHC_CONTROL_RRMS", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_GATES_FUSED":

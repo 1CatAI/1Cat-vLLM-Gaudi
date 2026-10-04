@@ -30,6 +30,7 @@ foreach(SOURCE IN LISTS KERNEL_SOURCES)
     if(NAME STREQUAL "deepseek_v41_attention_norm_bf16_gaudi2" OR
        NAME STREQUAL "deepseek_v41_final_collapse_norm_bf16_gaudi2" OR
        NAME STREQUAL "deepseek_v41_ffn_norm_quant_gaudi2" OR
+       NAME STREQUAL "deepseek_v41_mhc_mme_gates_norm_gaudi2" OR
        NAME STREQUAL "deepseek_v41_kv_norm_rope_publish_gaudi2" OR
        NAME STREQUAL "deepseek_v41_control_gemv_rrms_bf16_gaudi2" OR
        NAME STREQUAL "deepseek_v41_qnorm_quant_gaudi2" OR

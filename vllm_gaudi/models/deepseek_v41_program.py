@@ -875,6 +875,11 @@ class PreparedDecoderLayer(nn.Module):
         self.batch_control_reuse = gaudi_envs.VLLM_HPU_DSV41_MHC_BATCH_REUSE
         self.batch_control_prefetch = gaudi_envs.VLLM_HPU_DSV41_MHC_CONTROL_PREFETCH
         self.mhc_control_rrms = gaudi_envs.VLLM_HPU_DSV41_MHC_CONTROL_RRMS
+        self.mhc_mme_gates_norm = (
+            gaudi_envs.VLLM_HPU_DSV41_MHC_MME_GATES_NORM and not self.draft
+            and hasattr(torch.ops.custom_op, "custom_deepseek_v41_mhc_mme_gates_norm_gaudi2")
+            and hasattr(torch.ops.custom_op, "custom_deepseek_v41_control_mme_f32_gaudi2")
+        )
         self.decode_attention_norm_quant = hasattr(
             torch.ops.custom_op, "custom_deepseek_v41_attention_norm_quant_gaudi2"
         )
@@ -893,6 +898,7 @@ class PreparedDecoderLayer(nn.Module):
         self.mhc_interlayer_bf16 = True
         self.register_buffer("hc_attn_fn_packed", None, False)
         self.register_buffer("hc_ffn_fn_packed", None, False)
+        self.register_buffer("hc_ffn_fn_mme", None, False)
         if shared.length > 512:
             from vllm_gaudi.ops.deepseek_v41_paged_attention import PagedCSA2Attention
 
@@ -941,6 +947,11 @@ class PreparedDecoderLayer(nn.Module):
 
     def prepare_mhc_control_weights(self):
         self.release_mhc_control_weights()
+        if self.mhc_mme_gates_norm:
+            weight = self._pack_mhc_control_weight(self.weights.hc_ffn_fn)
+            high = weight.to(torch.bfloat16)
+            low = (weight - high.float()).to(torch.bfloat16)
+            self.hc_ffn_fn_mme = torch.cat((high, low), dim=0).contiguous()
         if not self.mhc_control_rrms:
             return
         self.hc_attn_fn_packed = self._pack_mhc_control_weight(self.weights.hc_attn_fn)
@@ -949,6 +960,7 @@ class PreparedDecoderLayer(nn.Module):
     def release_mhc_control_weights(self):
         self.hc_attn_fn_packed = None
         self.hc_ffn_fn_packed = None
+        self.hc_ffn_fn_mme = None
 
     @prefill_span("layer")
     def forward(
@@ -1119,6 +1131,7 @@ class PreparedDecoderLayer(nn.Module):
         else:
             residual = post_update(value, residual, post, comb)
         del value, post, comb
+        fused_ffn_prequant = None
         if prefill_sequence:
             pre_mix, post, comb, value = sequence_hc_input(
                 residual,
@@ -1147,6 +1160,21 @@ class PreparedDecoderLayer(nn.Module):
                 self.hc_ffn_fn_packed,
             )
             del collapsed
+        elif (decode and self.mhc_mme_gates_norm and collapsed_ffn is not None
+              and self.moe.n256_fp8 and self.moe.n256_fused
+              and self.hc_ffn_fn_mme is not None and residual.shape[0] <= 2):
+            projected = torch.ops.custom_op.custom_deepseek_v41_control_mme_f32_gaudi2(
+                residual.flatten(1).contiguous(), self.hc_ffn_fn_mme
+            )
+            gates, value, quantized, activation_scale = (
+                torch.ops.custom_op.custom_deepseek_v41_mhc_mme_gates_norm_gaudi2(
+                    projected, residual.flatten(1).contiguous(), collapsed_ffn,
+                    w.ffn_norm.weight, w.hc_ffn_scale, w.hc_ffn_base, self.eps
+                )
+            )
+            pre_mix, post = gates[:, :4], gates[:, 4:8]
+            comb = gates[:, 8:].reshape(-1, 4, 4)
+            fused_ffn_prequant = quantized, activation_scale
         else:
             value, pre_mix, post, comb = hc_pre(
                 residual,
@@ -1168,9 +1196,13 @@ class PreparedDecoderLayer(nn.Module):
         # The B1/B2 outputs were qualified bit-for-bit against the separate
         # RMSNorm and dynamic-quant nodes before this became the default.
         if decode and value.shape[0] <= 2 and self.moe.n256_fp8 and self.moe.n256_fused:
-            normalized, quantized, activation_scale = torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
-                value.contiguous(), w.ffn_norm.weight, self.eps
-            )
+            if fused_ffn_prequant is None:
+                normalized, quantized, activation_scale = torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
+                    value.contiguous(), w.ffn_norm.weight, self.eps
+                )
+            else:
+                normalized = value
+                quantized, activation_scale = fused_ffn_prequant
             value = self.moe(
                 normalized,
                 image_mask,
