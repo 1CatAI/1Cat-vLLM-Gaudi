@@ -72,6 +72,23 @@ def unpack_sample_status(values):
     return int(values[0]) // 2, bool(int(values[0]) & 1)
 
 
+def commit_replay_inputs(input_ids, positions, selected):
+    """Advance private C1 replay roots after their last current-token consumer.
+
+    These allocations belong to StageVariant, never to PositionBank or a
+    scheduler request. The coverage certificate must still be resolved before
+    the next replay. Full sampling repair overwrites the returned token alias.
+    """
+    if (input_ids.dtype != torch.int32 or positions.dtype != torch.int32
+            or input_ids.shape != (1,) or positions.shape != (1,)
+            or selected.shape != (1, 1) or selected.dtype != torch.int32):
+        raise ValueError("Replay input feedback requires private C1 I32 roots")
+    next_position = positions + 1
+    input_ids.copy_(selected.reshape(1))
+    positions.copy_(next_position)
+    return input_ids.reshape(1, 1), positions
+
+
 def local_nucleus_packet(logits, controls, tp_rank, width):
     """Keep the full local partition function, exchanging only bounded candidates."""
     scaled = logits.float() / controls[:, :1].clamp_min(1e-5)

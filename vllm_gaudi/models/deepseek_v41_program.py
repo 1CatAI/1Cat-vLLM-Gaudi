@@ -1346,8 +1346,11 @@ class PreparedStage(nn.Module):
         self.bf16_head = gaudi_envs.VLLM_HPU_DSV41_BF16_LM_HEAD
         self.device_sampling = gaudi_envs.VLLM_HPU_DSV41_DEVICE_SAMPLING and not self.dspark
         self.device_next_position = gaudi_envs.VLLM_HPU_DSV41_DEVICE_NEXT_POSITION
+        self.device_input_feedback = gaudi_envs.VLLM_HPU_DSV41_DEVICE_INPUT_FEEDBACK
         if self.device_next_position and (not self.device_sampling or pipeline_parallel_size != 1):
             raise ValueError("Device position continuation requires sampled C1 replay without a PP boundary")
+        if self.device_input_feedback and not self.device_next_position:
+            raise ValueError("Device input feedback requires device position continuation")
         if self.device_sampling:
             self.register_buffer("sampling_params", torch.tensor([[0., 1., -1.]], device=device))
             self.register_buffer("sampling_seed", torch.zeros(1, dtype=torch.int32, device=device))
@@ -2029,12 +2032,13 @@ class PreparedGreedyTail(nn.Module):
         self.is_last_stage = True
         self.device_sampling = getattr(stage, "device_sampling", False)
         self.device_next_position = getattr(stage, "device_next_position", False)
+        self.device_input_feedback = getattr(stage, "device_input_feedback", False)
         if self.device_sampling:
             self.register_buffer("sampling_params", stage.sampling_params)
             self.register_buffer("sampling_seed", stage.sampling_seed)
             self.register_buffer("sampling_origin", stage.sampling_origin)
 
-    def forward(self, hidden, positions=None):
+    def forward(self, hidden, positions=None, input_ids=None):
         from vllm_gaudi.ops.deepseek_v41_sampling import local_greedy_candidate, select_greedy_candidate
 
         local = self._head_projection(hidden)
@@ -2051,6 +2055,11 @@ class PreparedGreedyTail(nn.Module):
             packet = self.all_gather(local_nucleus_packet(local, controls, self.tp_rank, 128), dim=-1)
             tp_size = packet.shape[-1] // (3 + 2 * 128)
             selected, covered = sample_nucleus_packet(packet, controls, tp_size=tp_size, width=128)
+            if getattr(self, "device_input_feedback", False):
+                from vllm_gaudi.ops.deepseek_v41_sampling import commit_replay_inputs
+
+                selected, next_position = commit_replay_inputs(input_ids, positions, selected)
+                return pack_sample_status(selected, covered), local, controls, selected, next_position
             payload = pack_sample_status(selected, covered), local, controls, selected
             if self.device_next_position:
                 # A fresh, fixed-address replay output. It does not depend on
@@ -2167,7 +2176,7 @@ class PreparedLayerGroup(nn.Module):
         value = final_collapse_rms_norm(residual, pre_mix, self.norm.weight, self.eps)
         aux = torch.cat(target_states, -1) if target_states else None
         if self.greedy_tail is not None and decode and value.shape[0] == 1:
-            return value, pre_mix, aux, *self.greedy_tail(value, positions)
+            return value, pre_mix, aux, *self.greedy_tail(value, positions, input_ids)
         return value, pre_mix, aux
 
     def forward(self, residual, pre_mix, positions, input_ids, engram_rows):
@@ -2228,6 +2237,8 @@ class CompiledStage:
             raise ValueError("Native input capture requires ordinary BF16 PP0 decode")
         if native_input and (pp_wire_input or fused_text_io):
             raise ValueError("Native input capture has a single PP0 input owner")
+        if replay_tail and getattr(stage, "device_input_feedback", False) and not native_input:
+            raise ValueError("Input feedback requires private roots owned by the native input variant")
         backend = "hpu_backend"
         if not native and getattr(stage, "tensor_parallel_size", 2) == 4:
             from vllm_gaudi.compilation.deepseek_v41_tp4 import make_backend

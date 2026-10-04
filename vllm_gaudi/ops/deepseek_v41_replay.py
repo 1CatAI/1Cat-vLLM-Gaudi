@@ -89,6 +89,19 @@ class _Snapshot:
             destination.copy_(source)
 
 
+class _InputFeedbackSnapshot:
+    """Restore the private roots as well as cache state after cold discovery."""
+
+    def __init__(self, state, roots):
+        self.state = state
+        self.roots = _Snapshot(roots)
+        self.bytes = state.bytes + self.roots.bytes
+
+    def restore(self):
+        self.state.restore()
+        self.roots.restore()
+
+
 def stage_state_tensors(program):
     mutable = {
         "swa",
@@ -265,6 +278,8 @@ class StageVariant(torch.nn.Module):
             snapshot = _PagedSnapshot(self.program, self.fixed[2], self.states)
         else:
             snapshot = _Snapshot(self.states)
+        if self.tail_enabled and getattr(self.program, "device_input_feedback", False):
+            snapshot = _InputFeedbackSnapshot(snapshot, self.fixed[2:4])
         self.capture_bytes = snapshot.bytes
         return snapshot
 
