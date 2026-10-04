@@ -67,9 +67,13 @@ def main():
     parser.add_argument("--eos-token-id", type=int, default=1)
     parser.add_argument("--prefill-only", action="store_true",
                         help="Measure a max_tokens=1 request; does not qualify natural EOS or semantics")
+    parser.add_argument("--diagnostic-only", action="store_true",
+                        help="Allow a length-limited diagnostic; never qualifies formal speed or natural EOS")
     args = parser.parse_args()
     if args.profile_start_before_request and args.profile != "decode":
         parser.error("--profile-start-before-request requires --profile decode")
+    if args.diagnostic_only and args.prefill_only:
+        parser.error("Choose either diagnostic-only or prefill-only")
     body = json.loads(args.request.read_text())
     if args.prefill_only and (body.get("max_tokens") != 1 or args.profile == "decode"):
         raise ValueError("Prefill-only timing requires max_tokens=1 and excludes decode capture")
@@ -102,7 +106,9 @@ def main():
     if args.profile == "prefill" or args.profile_start_before_request:
         profile("start")
     report = {"started_at": datetime.now(timezone.utc).isoformat(), "status": "running",
-              "qualification": "prefill_only" if args.prefill_only else "natural_eos",
+              "qualification": ("diagnostic_only" if args.diagnostic_only else
+                                "prefill_only" if args.prefill_only else "natural_eos"),
+              "formal_measurement_passed": False,
               "profile": args.profile, "request_sha256": hashlib.sha256(args.request.read_bytes()).hexdigest(),
               "client_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               "stream_chunk_size": 65536,
@@ -204,7 +210,8 @@ def main():
         prompt_count = usage["prompt_tokens"] if usage else len(returned_prompt or [])
         assert prompt_count == args.expected_prompt_tokens, ("prompt length", prompt_count)
         cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) if usage else 0
-        assert not cached, ("prefix reuse invalidates the prefill timing", cached)
+        if not args.diagnostic_only:
+            assert not cached, ("prefix reuse invalidates the prefill timing", cached)
         expected_ids_path = args.request.with_name(args.request.name.replace(".request.json", ".token_ids.json"))
         if expected_ids_path != args.request and expected_ids_path.exists() and returned_prompt is not None:
             assert returned_prompt == json.loads(expected_ids_path.read_text()), (
@@ -213,6 +220,8 @@ def main():
         assert usage and usage["completion_tokens"] == len(ids), ("token accounting", usage, len(ids))
         if args.prefill_only:
             assert len(ids) == 1 and finish_reason in ("length", "stop"), (len(ids), finish_reason)
+        elif args.diagnostic_only:
+            assert len(ids) > 0 and finish_reason in ("length", "stop"), (len(ids), finish_reason)
         else:
             assert finish_reason == "stop", ("did not finish naturally", finish_reason, stop_reason)
             assert stop_reason in (None, args.eos_token_id), ("unexpected stop", stop_reason)
@@ -220,7 +229,8 @@ def main():
         # custom stop condition, finish=stop plus the configured EOS suffices;
         # distinguish that proof from directly observing EOS in returned IDs.
         report["eos_proof"] = (None
-                               if args.prefill_only else "returned EOS token" if ids and ids[-1] == args.eos_token_id
+                               if args.prefill_only or args.diagnostic_only
+                               else "returned EOS token" if ids and ids[-1] == args.eos_token_id
                                else "engine stop with ignore_eos=false and no custom stop conditions")
         measured = (("request_prefill_time_seconds", ) if args.prefill_only else
                     ("request_prefill_time_seconds", "request_decode_time_seconds"))
@@ -231,7 +241,8 @@ def main():
         report.update(prefill_tokens_per_s=prompt_count / prefill_s,
                       decode_tokens_per_s=(len(ids) - 1) / decode_s if len(ids) > 1 and decode_s > 0 else None,
                       decode_ms_per_token=1000 * decode_s / (len(ids) - 1) if len(ids) > 1 else None,
-                      status="passed")
+                      status="diagnostic_passed" if args.diagnostic_only else "passed",
+                      formal_measurement_passed=not (args.profile or args.prefill_only or args.diagnostic_only))
     except BaseException as exc:
         error = exc
         report.update(status="failed", error=repr(exc), finish_reason=finish_reason, stop_reason=stop_reason,
