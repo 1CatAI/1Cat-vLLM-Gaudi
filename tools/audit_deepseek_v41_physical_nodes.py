@@ -14,22 +14,28 @@ import re
 
 LOGICAL = {'Placeholder', 'OutputTensor', 'Reshape', 'StaticReshape', 'Slice', 'Split',
            'Concatenate', 'Squeeze', 'ExpandDims', 'Identity', 'Flatten', 'Broadcast',
-           'LogicalTranspose', 'LogicalBroadcast'}
+           'LogicalTranspose', 'LogicalBroadcast', 'ReinterpretCast',
+           'TransposedShape', 'Reduction'}
 
 
 def audit(path):
     raw = path.read_text()
     nodes = []
+    ignored = Counter()
     for block in raw.split('node {'):
         name, op = re.search(r'\n  name: "([^"]+)"', block), re.search(r'\n  op: "([^"]+)"', block)
-        if not name or not op or op[1] in LOGICAL:
+        if not name or not op:
+            continue
+        if op[1] in LOGICAL:
+            ignored[op[1]] += 1
             continue
         attrs = dict(re.findall(r'key: "([^"]+)"\s+value \{\s+s: "([^"]*)"', block))
         nodes.append(dict(name=name[1], op=op[1], inputs=re.findall(r'\n  input: "([^"]+)"', block),
                           execution_index=attrs.get('Exec_idx'), bundle=attrs.get('Bundle_idx'),
                           tensors={k:v for k,v in attrs.items() if k.startswith(('inputTensor:', 'outputTensor:'))}))
     return dict(graph=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
-                physical_nodes=len(nodes), operations=dict(Counter(n['op'] for n in nodes)), nodes=nodes,
+                physical_nodes=len(nodes), operations=dict(Counter(n['op'] for n in nodes)),
+                logical_nodes_excluded=dict(ignored), nodes=nodes,
                 count_scope='post-compiler TPC/MME/DMA nodes; excludes logical views and null descriptors')
 
 

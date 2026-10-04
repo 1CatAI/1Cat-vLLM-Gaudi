@@ -12,19 +12,15 @@ static inline int64 fp4_scale_e4m3(float64 value) {
     code = v_i32_sel_less_f32_b(magnitude, 0.015625f, tiny, code);
     return v_i32_min_b(v_i32_max_b(code, 0), 126);
 }
-static inline void fp4_pack_group(tensor value, tensor output, int group, int input_row,
-                                 int output_row, int group_size
 #ifdef DSV41_DECODED_KV_WRITE
-                                 , tensor decoded, bool write_decoded,
-                                 int decoded_row
+static inline bfloat128 fp4_pack_number(float64 number, tensor output, int group,
+                                       int output_row, int group_size, int width,
+                                       tensor decoded, bool write_decoded, int decoded_row) {
+    bfloat128 result = 0;
+#else
+static inline void fp4_pack_number(float64 number, tensor output, int group,
+                                  int output_row, int group_size, int width) {
 #endif
-                                 ) {
-#ifndef DSV41_FP4_DECODE_ONLY
-    const int width = get_dim_size(value, 0);
-#endif
-    const bfloat128 input = v_bf16_ld_tnsr_partial_b(
-        (int5){group * group_size, input_row, 0, 0, 0}, value, group_size - 1, 0);
-    const float64 number = convert_bfloat128_to_float128(input, SW_LINEAR).v1;
     const float64 magnitude = v_f32_abs_b(number);
     const float64 nan_lanes = v_f32_sel_grt_u32_b(as_uint64(magnitude), 0x7f800000, 1.0f, 0.0f);
     // Match the reference ordered amax: a NaN in the first group lane
@@ -86,16 +82,22 @@ static inline void fp4_pack_group(tensor value, tensor output, int group, int in
         decoded_value = as_float64(as_uint64(decoded_value)
                                    | ((wide.v1 & 8) << 28));
 #else
-        decoded_value = v_f32_sel_eq_f32_b(decoded_value, 0.0f,
-                                           0.0f, decoded_value);
+#ifdef DSV41_FP4_INDEX_ZERO_SIGN
+        if (group_size == 32)
+            decoded_value = as_float64(as_uint64(decoded_value) | ((wide.v1 & 8) << 28));
+        else
+#endif
+            decoded_value = v_f32_sel_eq_f32_b(decoded_value, 0.0f, 0.0f, decoded_value);
 #endif
         float128 converted = {0};
         converted.v1 = decoded_value;
         const bfloat128 decoded_bf16 = convert_float128_to_bfloat128(
             converted, SW_RHNE | SW_LINEAR);
-        v_bf16_st_tnsr_partial(
-            (int5){group * group_size, decoded_row, 0, 0, 0}, decoded,
-            decoded_bf16, group_size - 1, 0);
+        result = decoded_bf16;
+        if (decoded_row >= 0)
+            v_bf16_st_tnsr_partial(
+                (int5){group * group_size, decoded_row, 0, 0, 0}, decoded,
+                decoded_bf16, group_size - 1, 0);
     }
 #endif
 #ifndef DSV41_FP4_DECODE_ONLY
@@ -112,4 +114,23 @@ static inline void fp4_pack_group(tensor value, tensor output, int group, int in
     const uchar256 scales = convert_uint256_to_uchar256(wide, SW_LINEAR);
     v_u8_st_tnsr_partial((int5){width / 2 + group, output_row, 0, 0, 0}, output, scales, 0, 0);
 #endif
+#ifdef DSV41_DECODED_KV_WRITE
+    return result;
+#endif
+}
+static inline void fp4_pack_group(tensor value, tensor output, int group, int input_row,
+                                 int output_row, int group_size
+#ifdef DSV41_DECODED_KV_WRITE
+                                 , tensor decoded, bool write_decoded, int decoded_row
+#endif
+                                 ) {
+    const int width = get_dim_size(value, 0);
+    const bfloat128 input = v_bf16_ld_tnsr_partial_b(
+        (int5){group * group_size, input_row, 0, 0, 0}, value, group_size - 1, 0);
+    const float64 number = convert_bfloat128_to_float128(input, SW_LINEAR).v1;
+    fp4_pack_number(number, output, group, output_row, group_size, width
+#ifdef DSV41_DECODED_KV_WRITE
+                    , decoded, write_decoded, decoded_row
+#endif
+                    );
 }

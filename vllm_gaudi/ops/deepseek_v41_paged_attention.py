@@ -740,6 +740,16 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         )
         return self._rope(norm(value.contiguous(), weight, self.eps), positions)
 
+    def _uses_fused_compressor_publish(self, value):
+        return (
+            gaudi_envs.VLLM_HPU_DSV41_COMPRESSOR_FUSED_PUBLISH
+            and value.device.type == "hpu" and value.shape[0] == 1
+            and self.ratio in (1, 2) and self.native_rope
+            and hasattr(self.cache, "decoded_main")
+            and hasattr(self.cache, "decoded_index_hot")
+            and hasattr(torch.ops.custom_op, "custom_deepseek_v41_fp4_norm_rope_publish_gaudi2")
+        )
+
     def _compress(self, value, positions, decoded=False):
         compressor = self.weights.compressor
         if self.ratio == 2:
@@ -820,6 +830,22 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         else:
             first, latent = positions, self.linear(value, compressor.wkv)
         latent = rms_norm(latent, compressor.norm.weight, self.eps)
+        if self._uses_fused_compressor_publish(value):
+            indexer = self.weights.indexer
+            raw_index = self.linear(latent, indexer.wk)
+            mirror_enabled = bool(
+                getattr(self.shared, "index_mirror_valid", False)
+                and self.search_length <= self.shared.index_mirror_tokens
+            )
+            hot_enabled = self.runtime_indexer and self.search_length <= INDEX_MME_HOT_TOKENS
+            mirror = self.cache.index_mirror if mirror_enabled else self.cache.decoded_index_hot
+            return torch.ops.custom_op.custom_deepseek_v41_fp4_norm_rope_publish_gaudi2(
+                latent.contiguous(), raw_index.contiguous(), indexer.k_norm.weight,
+                positions.to(torch.int32).contiguous(), self._rotary_native_table(),
+                self.shared.block_table, self.cache.main, self.cache.index,
+                self.cache.decoded_main, self.cache.decoded_index_hot, mirror,
+                self.eps, self.ratio, bool(decoded), bool(hot_enabled), mirror_enabled
+            )
         if self.ratio & (self.ratio - 1):
             raise ValueError("V4.1 compressor ratio must be a power of two")
         ratio_shift = self.ratio.bit_length() - 1
@@ -1836,6 +1862,10 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         if self.ratio:
             if self.owns_kv:
                 compressed_completion = self._compress(value, positions, decoded)
+                if self._uses_fused_compressor_publish(value):
+                    # The writer publishes the full logical token position;
+                    # dependent scoring/gather cannot overtake its cache stores.
+                    positions = compressed_completion[:1]
             selected = self._select(value, qr, positions)
             if decoded and value.shape[0] == 1:
                 main_done = compressed_completion if compressed_completion is not None else completion

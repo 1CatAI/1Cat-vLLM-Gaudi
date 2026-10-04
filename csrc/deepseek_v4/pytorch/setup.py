@@ -104,6 +104,7 @@ setup(
                 "hpu_dsv41_bf16_linear_f32_pt2.cpp",
                 "hpu_dsv41_mhc_gates_pt2.cpp",
                 "hpu_dsv41_mhc_mme_gates_norm_pt2.cpp",
+                "hpu_dsv41_fp4_norm_rope_publish_pt2.cpp",
                 "hpu_dsv41_control_mme_pt2.cpp",
                 "hpu_dsv41_index_pt2.cpp",
                 "hpu_dsv41_index_keys_pt2.cpp",

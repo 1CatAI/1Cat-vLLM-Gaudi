@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_EXPERT_FUSED_QUANT: bool = False
     VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE: bool = False
     VLLM_HPU_DSV41_EXPERT_TOKEN_WIDE: bool = False
+    VLLM_HPU_DSV41_COMPRESSOR_FUSED_PUBLISH: bool = False
     VLLM_HPU_DSV41_ATTN_FUSED_PROLOGUE: bool = False
     VLLM_HPU_DSV41_CONCURRENT_MOE_ROWS: int = 0
     VLLM_HPU_DSV41_MLA_MME: bool = False
@@ -540,6 +541,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_FLASHINFER_PREFILL", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_EXPERT_FUSED_QUANT":
     lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_FUSED_QUANT", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_COMPRESSOR_FUSED_PUBLISH":
+    lambda: os.environ.get("VLLM_HPU_DSV41_COMPRESSOR_FUSED_PUBLISH", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_ATTN_FUSED_PROLOGUE":
     lambda: os.environ.get("VLLM_HPU_DSV41_ATTN_FUSED_PROLOGUE", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_EXPERT_TOKEN_WIDE":
