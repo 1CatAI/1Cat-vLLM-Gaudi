@@ -17,7 +17,7 @@ from torch import nn
 
 class RecipeRecorder:
 
-    def __init__(self, evidence, *, backend=None):
+    def __init__(self, evidence, *, backend=None, joint_only=False):
         from habana_frameworks.torch.dynamo.compile_backend.passes import (OptimizationPassPlacement,
                                                                            register_pass_at_optimization_pass)
         from vllm_gaudi.distributed.tp2_fused_ar_norm import _load_bridge, _verify_prepared_runtime
@@ -53,14 +53,16 @@ class RecipeRecorder:
                 indent=2))
         self.backend = (backend if backend is not None else
                         torch.distributed.distributed_c10d._get_default_group()._get_backend(torch.device("hpu")))
-        library = Path(os.environ["DSV41_MICRO_COMPUTE_LIBRARY"])
-        if hashlib.sha256(library.read_bytes()).hexdigest() != os.environ["DSV41_MICRO_COMPUTE_SHA256"]:
-            raise RuntimeError("Native micro diagnostic binary fingerprint differs")
-        spec = importlib.util.spec_from_file_location("dsv41_micro_compute", library)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        self.module = module
-        self.Compute = module.Compute
+        self.Compute = None
+        if not joint_only:
+            library = Path(os.environ["DSV41_MICRO_COMPUTE_LIBRARY"])
+            if hashlib.sha256(library.read_bytes()).hexdigest() != os.environ["DSV41_MICRO_COMPUTE_SHA256"]:
+                raise RuntimeError("Native micro diagnostic binary fingerprint differs")
+            spec = importlib.util.spec_from_file_location("dsv41_micro_compute", library)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            self.module = module
+            self.Compute = module.Compute
 
         owner = self
 
@@ -90,6 +92,8 @@ class RecipeRecorder:
         register_pass_at_optimization_pass(observe, OptimizationPassPlacement.POST_PARTITIONER)
 
     def prepare(self, fn, inputs, weights):
+        if self.Compute is None:
+            raise RuntimeError("Joint-only recorder requires an explicit native compute/collective plan")
         self.calls = []
         results = [fn(x, *w) for x, w in zip(inputs, weights, strict=True)]
         torch.hpu.synchronize()

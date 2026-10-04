@@ -1269,7 +1269,8 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         return self.reduce(partial, ready_outputs=ready_outputs) if ready_outputs else self.reduce(partial)
 
     def _finish_output(
-        self, output, positions, ready_outputs=(), *, prefill=False, prefill_sequence=False, request_batch=False
+        self, output, positions, ready_outputs=(), *, prefill=False, prefill_sequence=False, request_batch=False,
+        decode=False
     ):
         """Apply the shared output projection after either attention path."""
         if prefill:
@@ -1295,11 +1296,16 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             with prefill_event_span("attention_output_reduce", self.layer, output.shape[0]):
                 return self._reduce_prefill_output(partial, ready_outputs, prefill_sequence)
         output = self.project_output(output)
-        return self._finish_projected_output(output, ready_outputs)
+        return self._finish_projected_output(output, ready_outputs, decode=decode)
 
-    def _finish_projected_output(self, output, ready_outputs=()):
+    def _finish_projected_output(self, output, ready_outputs=(), *, decode=False):
         """Consume an already inverse-rotated and wo_a-projected row."""
         partial = self.project_output_consumer(output)
+        return self._reduce_decode_output(partial, ready_outputs, decode=decode)
+
+    def _reduce_decode_output(self, partial, ready_outputs=(), *, decode=False):
+        if decode and getattr(self, "peer_post_collapse", False) and partial.shape[0] <= 2:
+            return self.reduce(partial, ready_outputs=ready_outputs, defer=True)
         return self.reduce(partial, ready_outputs=ready_outputs) if ready_outputs else self.reduce(partial)
 
     def _can_fuse_mla_woa(self, positions):
@@ -1324,11 +1330,11 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 self.scale,
                 lengths,
             )
-            return self._finish_output(output, positions, ready_outputs)
+            return self._finish_output(output, positions, ready_outputs, decode=decode)
         output, _, _ = torch.ops.custom_op.custom_deepseek_v4_sparse_attn_bf16_gaudi2(
             query.contiguous(), cache.contiguous(), indices.contiguous(), self.weights.attn_sink, self.scale
         )
-        return self._finish_output(output, positions, ready_outputs)
+        return self._finish_output(output, positions, ready_outputs, decode=decode)
 
     @prefill_scope("indexer")
     def _prefill_selections(self, value, qr, positions, prepared):
@@ -1851,7 +1857,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                         self.weights.wo_b.weight,
                         self.weights.wo_b.channel_scale,
                     )
-                    return self.reduce(partial, ready_outputs=ready_outputs) if ready_outputs else self.reduce(partial)
+                    return self._reduce_decode_output(partial, ready_outputs, decode=decode)
                 # The paged state keeps SWA as a 256-row ring and main KV as
                 # logical compressed rows.  Reuse the fixed prefix layout so
                 # the decoded mirror sees [SWA ring, logical main] rather than
@@ -1878,7 +1884,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                     self.cache.decoded_main.shape[0],
                     SWA_ROWS,
                 )
-                return self._finish_output(output, positions, ready_outputs)
+                return self._finish_output(output, positions, ready_outputs, decode=decode)
             if native_logical:
                 # Keep page lookup and the sliding-window mapping inside the
                 # first packed-KV consumer, alongside its exact BF16 codec.
@@ -1891,7 +1897,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                     from vllm_gaudi.ops.deepseek_v41_shared_main import shared_main_attention
 
                     output = shared_main_attention(self, query, positions, selected, lengths, selected_main)
-                    return self._finish_output(output, positions, ready_outputs)
+                    return self._finish_output(output, positions, ready_outputs, decode=decode)
                 output = torch.ops.custom_op.custom_deepseek_v41_logical_mla_gaudi2(
                     query.contiguous(),
                     self.swa,
@@ -1904,7 +1910,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                     lengths,
                     self.ratio,
                 )
-                return self._finish_output(output, positions, ready_outputs)
+                return self._finish_output(output, positions, ready_outputs, decode=decode)
             physical = None if native_prefix else self.shared.physical_rows(selected.clamp_min(0), self.ratio)
             if (
                 decode
@@ -1954,7 +1960,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                         self.scale,
                         lengths,
                     )
-                    return self._finish_output(output, positions, ready_outputs)
+                    return self._finish_output(output, positions, ready_outputs, decode=decode)
                 row_ids, attention_indices = _selected_attention_layout(
                     physical, selected, indices, self.swa_offsets, self.selected_offsets
                 )
@@ -1972,7 +1978,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                         self.scale,
                         lengths,
                     )
-                    return self._finish_output(output, positions, ready_outputs)
+                    return self._finish_output(output, positions, ready_outputs, decode=decode)
                 output = torch.ops.custom_op.custom_deepseek_v41_paged_attention_bf16_gaudi2(
                     query.contiguous(),
                     self.swa.contiguous(),
@@ -1982,7 +1988,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                     self.weights.attn_sink,
                     self.scale,
                 )
-                return self._finish_output(output, positions, ready_outputs)
+                return self._finish_output(output, positions, ready_outputs, decode=decode)
             else:
                 packed = self.cache.main.index_select(0, physical.flatten().long())
                 cache = torch.cat((unpack_swa(self.swa), unpack_fp4(packed)), 0)
@@ -1998,7 +2004,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                     self.swa_offsets.reshape(1, -1), indices.contiguous(),
                     self.weights.attn_sink, self.scale, self.swa_only_lengths[:value.shape[0]],
                 )
-                return self._finish_output(output, positions, ready_outputs)
+                return self._finish_output(output, positions, ready_outputs, decode=decode)
             cache = unpack_swa(self.swa)
         return self._output(query, cache, indices, positions, ready_outputs, decode=decode)
 

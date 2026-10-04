@@ -765,3 +765,5 @@ Own retiredgraphs were losslessly archived withtarcompare/SHA256 before removing
 2026-10-04 批量验收：设备闭环完整预热、缓存开启，官方采样 seed42，16K 未命中→2382 tokens 自然EOS，正式 TPOT **9.997343 ms**。token 与正文均与 `decode-position-serving-01` 完全一致（14事实参考已通过）。相对该父版本改善 1.395094 ms，超过微基准预估一半；相对最初10.568225基线改善 0.570882 ms。关闭此项待验收余额，单 stage 原生默认启用采样／设备输入／闭环／已验收静态坐标，PP 阶段及显式禁用不变。目标7ms未完成。随带 trace 启动缺必需写出参数，未生成设备trace；正式数字保留，只修复采集入口。
 
 2026-10-04 资源规则更新：按最新用户指令，不持有显卡锁。启动器检查 HBM、设备利用率及打开的计算设备句柄；优先空闲的 0/1/4/5，否则选其他空闲四卡，不足则等待。记录实际映射；可用 `--modules` 固定某组卡。08 的锁包装进程已结束，原测量进程保留，不影响其他会话。资源调整本身不计收益。
+
+2026-10-04 待整体验收：peer 求和→mHC post/collapse 融合／原生短链每 Attention 边界节省 **0.008950 ms**（三轮0.008950、0.012500、0.005773）／`VLLM_HPU_DSV41_PEER_POST_COLLAPSE=0`。父正式基线9.997343 ms。生产形状与真实 checkpoint 权重、5个 checkpoint embedding 派生输入，投影→四卡交换→mHC→FFN norm/量化全部逐位一致，无热编译。同进程 ABABAB200，取四卡最慢每步设备中位数。原计时完成后的退出异常已修复，另做无计时的资源退出检查，原测量保留。仅按40个 Attention 边界预估 **0.358000 ms/token**；MoE边界未验证不加算，实际 Attention 激活与real16状态接入仍待验证，未跑端到端，不称为正式收益。证据 `decode-peer-post-collapse-01/OUTCOME.json`。当前兼容微基准候选预估余额0.358000 ms；累计不足1ms，暂不重启正式服务。

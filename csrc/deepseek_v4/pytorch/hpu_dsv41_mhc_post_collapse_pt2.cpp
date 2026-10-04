@@ -9,16 +9,19 @@ using Output = std::tuple<at::Tensor, at::Tensor>;
 habana::OutputMetaDataVector meta(const at::Stack& s) {
     const auto x=s.at(0).toTensor(), r=s.at(1).toTensor(), p=s.at(2).toTensor();
     const auto c=s.at(3).toTensor(), n=s.at(4).toTensor();
-    TORCH_CHECK(x.dim()==2 && x.size(0)>=1 && x.size(0)<=6 && x.size(1)==5120 &&
-        r.sizes()==at::IntArrayRef({x.size(0),4,5120}) &&
-        p.sizes()==at::IntArrayRef({x.size(0),4}) && c.sizes()==at::IntArrayRef({x.size(0),4,4}) &&
+    TORCH_CHECK(x.dim()==2 || x.dim()==3, "mHC value must be a row or rank-major peer rows");
+    const auto tokens=x.size(-2);
+    TORCH_CHECK(tokens>=1 && tokens<=6 && x.size(-1)==5120 &&
+        (x.dim()==2 || (x.size(0)>=2 && x.size(0)<=8)) &&
+        r.sizes()==at::IntArrayRef({tokens,4,5120}) &&
+        p.sizes()==at::IntArrayRef({tokens,4}) && c.sizes()==at::IntArrayRef({tokens,4,4}) &&
         n.sizes()==p.sizes(), "mHC post/collapse requires C1-C6 model-width residuals and four-stream gates");
     for (int i=0;i<5;++i) {
         const auto t=s.at(i).toTensor();
         TORCH_CHECK(t.scalar_type()==(i<2?at::kBFloat16:at::kFloat) && t.is_contiguous() &&
             t.device()==x.device() && !t.requires_grad(), "mHC post/collapse requires matching contiguous inference operands");
     }
-    return {{at::kBFloat16,r.sizes().vec()},{at::kBFloat16,x.sizes().vec()}};
+    return {{at::kBFloat16,r.sizes().vec()},{at::kBFloat16,{tokens,5120}}};
 }
 const bool registered=[] {
     habana::custom_op::registerUserCustomOp(schema,guid,[](const at::Stack& s) {

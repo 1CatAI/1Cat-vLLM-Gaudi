@@ -50,6 +50,31 @@ int main() {
     assert(custom_count >= 52);
     assert(selected_kv_seen);
     assert(device_engram_seen);
+    for (unsigned ranks : {1u, 2u, 4u, 8u}) for (unsigned tokens : {1u, 2u, 6u}) {
+        HabanaKernelParams p{}; HabanaKernelInstantiation out{};
+        Tensor inputs[5]{}, outputs[2]{};
+        TensorAccessPattern ia[5]{}, oa[2]{};
+        p.inputTensors=inputs;p.inputTensorNr=5;p.outputTensors=outputs;p.outputTensorNr=2;
+        out.inputTensorAccessPattern=ia;out.outputTensorAccessPattern=oa;
+        std::strcpy(p.guid.name,"custom_deepseek_v41_mhc_post_collapse_gaudi2");
+        auto set=[](Tensor& t,TensorDataType type,std::initializer_list<uint64_t> dims) {
+            t.geometry.dataType=type;t.geometry.dims=dims.size();unsigned i=0;
+            for (auto size:dims)t.geometry.maxSizes[i++]=size;
+        };
+        if (ranks==1) set(inputs[0],DATA_BF16,{5120,tokens});
+        else set(inputs[0],DATA_BF16,{5120,tokens,ranks});
+        set(inputs[1],DATA_BF16,{5120,4,tokens});set(inputs[2],DATA_F32,{4,tokens});
+        set(inputs[3],DATA_F32,{4,4,tokens});set(inputs[4],DATA_F32,{4,tokens});
+        set(outputs[0],DATA_BF16,{5120,4,tokens});set(outputs[1],DATA_BF16,{5120,tokens});
+        assert(InstantiateTpcKernel(&p,&out)==GLUE_INSUFFICIENT_ELF_BUFFER);
+        assert(out.indexSpaceGeometry[0]==40 && out.indexSpaceGeometry[1]==tokens);
+        assert(ia[0].mapping[1].indexSpaceDim==1);
+        if (ranks>1) {
+            assert(ia[0].mapping[2].a==0 && ia[0].mapping[2].end_b==float(ranks-1));
+            inputs[0].geometry.maxSizes[2]=9;
+            assert(InstantiateTpcKernel(&p,&out)==GLUE_INCOMPATIBLE_INPUT_SIZE);
+        }
+    }
     for (unsigned rows : {1u, 2u, 6u}) {
         HabanaKernelParams p{}; HabanaKernelInstantiation out{};
         Tensor inputs[5]{}, outputs[1]{};

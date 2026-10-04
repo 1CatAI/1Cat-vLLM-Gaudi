@@ -932,4 +932,6 @@ end-to-end qualification pass. It does not change C2-C6 replay interfaces.
 
 `VLLM_HPU_DSV41_ORDERED_PEER_SUM` defaults to `0`. The experimental shared native peer consumer accumulates shards in fixed rank order in FP32, then rounds once to BF16. It requires the matching native operator library; it does not change the communication protocol. Keep disabled until the production producer/consumer chain passes numerical and device-time qualification.
 
+`VLLM_HPU_DSV41_PEER_POST_COLLAPSE` defaults to `0`. The experimental native BF16 decode path leaves peer rows for the existing mHC post/collapse kernel to sum, preserving rank order and the BF16 boundary. It supports the qualified small-batch BF16 handoff and requires the updated native library. Prefill, draft and other batches retain their existing reduction path. No serving speedup is qualified yet.
+
 Ordinary V4.1 native replay with one pipeline stage now defaults to device sampling, device positions, device input feedback, the device closed loop, and static coordinates. These defaults require the V2 runner and native graph/input replay. Explicit zero overrides remain supported. Pipeline stages retain their existing token ownership; unqualified ordered peer reduction stays disabled.

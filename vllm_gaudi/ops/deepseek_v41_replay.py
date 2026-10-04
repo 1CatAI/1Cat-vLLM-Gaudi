@@ -21,7 +21,7 @@ def stage_collectives(tp_rank, native, tp_size=2, *, native_fp32_gather=False, o
     maximum = 64 * 5120 if envs.VLLM_HPU_DSV41_BATCH_DECODE else 32768
     fused_peer_sum = envs.VLLM_HPU_DSV41_ORDERED_PEER_SUM if ordered_peer_sum is None else ordered_peer_sum
 
-    def reduce(value, *, ready_outputs=()):
+    def reduce(value, *, ready_outputs=(), defer=False):
         if native and value.dtype == torch.bfloat16 and value.numel() <= maximum:
             flat = value.reshape(1, -1).contiguous()
             if tp_size == 2:
@@ -30,6 +30,9 @@ def stage_collectives(tp_rank, native, tp_size=2, *, native_fp32_gather=False, o
                     if ready_outputs
                     else torch.ops.vllm_gaudi.tp2_exchange_peer(flat)
                 )
+                if defer:
+                    peers = (flat, peer) if tp_rank == 0 else (peer, flat)
+                    return torch.stack(peers).reshape(tp_size, *value.shape)
                 return (flat + peer).reshape(value.shape)
             shards = (
                 torch.ops.vllm_gaudi.tp_peer_allgather_scheduled(flat, tp_size, list(ready_outputs))
@@ -37,6 +40,8 @@ def stage_collectives(tp_rank, native, tp_size=2, *, native_fp32_gather=False, o
                 else torch.ops.vllm_gaudi.tp_peer_allgather(flat, tp_size)
             )
             shards = shards.reshape(tp_size, flat.numel())
+            if defer:
+                return shards.reshape(tp_size, *value.shape)
             if fused_peer_sum and flat.numel() <= 32768 and flat.numel() % 128 == 0:
                 from vllm_gaudi.ops.deepseek_v41_ordered_peer_sum import ordered_peer_sum
 
@@ -45,6 +50,8 @@ def stage_collectives(tp_rank, native, tp_size=2, *, native_fp32_gather=False, o
             for rank in range(1, tp_size):
                 reduced = reduced + shards[rank].float()
             return reduced.to(value.dtype).reshape(value.shape)
+        if defer:
+            raise ValueError("Deferred peer reduction requires the small native BF16 collective")
         return tensor_model_parallel_all_reduce(value)
 
     def gather(value, dim):

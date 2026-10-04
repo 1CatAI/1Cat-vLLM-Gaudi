@@ -831,6 +831,8 @@ class PreparedMoE(nn.Module):
             from vllm_gaudi.ops.deepseek_v41_prefill_sequence_state import reduce_owned_tokens
 
             return reduce_owned_tokens(partial, self.reduce)
+        if decode and not ordinary_decode and getattr(self, "peer_post_collapse", False) and partial.shape[0] <= 2:
+            return self.reduce(partial, ready_outputs=ready_outputs, defer=True)
         return self.reduce(partial, ready_outputs=ready_outputs) if ready_outputs else self.reduce(partial)
 
 
@@ -867,7 +869,9 @@ class PreparedDecoderLayer(nn.Module):
         # Full prompt state already owns token rows. Reuse that ownership for
         # replicated Q/KV inputs on layers without a full hidden-state consumer.
         self.sequence_qkv_input = tensor_parallel_size == 4
-        self.mhc_post_collapse = tensor_parallel_size == 4 and hasattr(
+        self.mhc_post_collapse = (
+            tensor_parallel_size == 4 or gaudi_envs.VLLM_HPU_DSV41_PEER_POST_COLLAPSE
+        ) and hasattr(
             torch.ops.custom_op, "custom_deepseek_v41_mhc_post_collapse_gaudi2"
         )
         # Preserve the BF16 collapse boundary used by the next attention norm.
@@ -903,6 +907,12 @@ class PreparedDecoderLayer(nn.Module):
             tensor_parallel_size=tensor_parallel_size,
         )
         self.moe.layer = layer
+        self.peer_post_collapse = (
+            gaudi_envs.VLLM_HPU_DSV41_PEER_POST_COLLAPSE and self.mhc_post_collapse
+            and self.mhc_interlayer_bf16 and not self.draft
+        )
+        self.attention.peer_post_collapse = self.peer_post_collapse
+        self.moe.peer_post_collapse = self.peer_post_collapse
         self.all_gather = all_gather
 
     @staticmethod
@@ -1085,7 +1095,8 @@ class PreparedDecoderLayer(nn.Module):
                 else self.attention(value, positions, **attention_kwargs)
             )
         collapsed_ffn = None
-        if self.mhc_post_collapse and decode and not self.draft and value.shape[0] <= 2 and value.device.type == "hpu":
+        if (self.mhc_post_collapse and decode and not self.draft
+                and residual.shape[0] <= 2 and value.device.type == "hpu"):
             # Keep forty independently scheduled feature tiles. The residual
             # BF16 boundary is retained inside the fused producer; the next
             # control/RRMS and FFN norm/quant remain independent consumers.
@@ -1165,7 +1176,14 @@ class PreparedDecoderLayer(nn.Module):
                 prefill_router_tokens=prefill_router_tokens,
                 prefill_sequence=prefill_sequence,
             )
-        if (
+        peer_value = getattr(self, "peer_post_collapse", False) and decode and value.ndim == 3
+        if peer_value:
+            residual, collapsed = torch.ops.custom_op.custom_deepseek_v41_mhc_post_collapse_gaudi2(
+                value.contiguous(), residual.contiguous(), post.contiguous(), comb.contiguous(), pre_mix.contiguous()
+            )
+            if publish_collapse and collapse_handoff is not None and self.mhc_interlayer_collapse:
+                collapse_handoff[self.layer + 1] = collapsed
+        elif (
             publish_collapse
             and collapse_handoff is not None
             and self.mhc_interlayer_collapse

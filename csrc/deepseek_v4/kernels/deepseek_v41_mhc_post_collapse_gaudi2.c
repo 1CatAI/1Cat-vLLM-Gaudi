@@ -28,8 +28,21 @@ void main(tensor value, tensor residual, tensor post, tensor comb,
         for (int block = start[0]; block < end[0]; ++block) {
             const int feature = block * 128;
             int5 vc = {feature, token, 0, 0, 0};
-            const float128 x = v_convert_bf16_to_f32_all_b(
+            float128 x = v_convert_bf16_to_f32_all_b(
                 v_bf16_ld_tnsr_b(vc, value));
+            // A peer tensor is [features, tokens, ranks]. Accumulate in the
+            // same fixed FP32 rank order as the shared collective consumer,
+            // then preserve its BF16 boundary before the residual update.
+            const int ranks = get_dim_size(value, 2);
+            for (int rank = 1; rank < ranks; ++rank) {
+                vc[2] = rank;
+                const float128 peer = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_b(vc, value));
+                x.v1 = v_f32_add_b(x.v1, peer.v1);
+                x.v2 = v_f32_add_b(x.v2, peer.v2);
+            }
+            if (ranks > 1) {
+                x = v_convert_bf16_to_f32_all_b(v_convert_f32_to_bf16_all_b(x, SW_RHNE));
+            }
             float128 source_value[4];
             #pragma unroll
             for (int source = 0; source < 4; ++source) {
