@@ -366,6 +366,21 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
     control.mkdir(parents=True, exist_ok=True)
     arms = {'baseline': baseline}
     stages = {'baseline': stage}
+    active_directory = None
+    progress = []
+
+    def phase(name, **details):
+        if active_directory is None:
+            return
+        progress.append(dict(time=time.time(), phase=name, rank=rank, **details))
+        path = active_directory / f'progress-rank{rank}.json'
+        temporary = path.with_suffix('.tmp')
+        temporary.write_text(json.dumps(progress[-100:], indent=2)+'\n')
+        temporary.replace(path)
+
+    from tools.deepseek_v41_device_chain import set_preparation_observer
+    set_preparation_observer(phase)
+
     graph_compilation_count()  # Subscribe before creating either cold arm.
 
     def arm(name, factory=None, factory_reference=None):
@@ -454,7 +469,9 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
             if os.environ.get('DSV41_RESIDENT_POST_GRAPH') == '1':
                 settings['DUMP_POST_GRAPHS'] = str(graph_directory / 'graph.post.json')
             with compiler_settings(settings):
+                phase('cold_plan_start', arm=name)
                 chain(True, 2, measure=False, engine=replay, warm_steps=6)
+                phase('cold_plan_complete', arm=name)
             if not replay.input_variant_ready(program.search_length):
                 raise RuntimeError('Candidate did not capture its own complete native input replay')
         return arms[name]
@@ -506,6 +523,9 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
             name = job['candidate']
             directory = control / job['id']
             directory.mkdir(exist_ok=True)
+            active_directory = directory
+            progress.clear()
+            phase('job_start', candidate=name)
             begun = time.monotonic()
             wait_for_loading(directory, rank, dist)
             if job.get('command') == 'diagnose_index_mirror':
@@ -646,11 +666,15 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
                     return observe
 
                 old_hidden, new_hidden = [], []
+                phase('reference_correctness_start')
                 old_tokens = chain(True, 4, measure=False, engine=reference, warm_steps=1,
                                    observer=hidden_observer(old_hidden))[0]
+                phase('reference_state_readback_start')
                 old_state = state_fingerprints()
+                phase('candidate_correctness_start')
                 new_tokens = chain(True, 4, measure=False, engine=candidate, warm_steps=1,
                                    observer=hidden_observer(new_hidden))[0]
+                phase('candidate_state_readback_start')
                 new_state = state_fingerprints()
                 try:
                     numerical_gate = check_repartition_state(old_tokens, old_state, new_tokens, new_state)
@@ -663,6 +687,7 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
                     json.dumps(numerical_gate, indent=2)+'\n')
                 gates = [None] * dist.get_world_size()
                 dist.all_gather_object(gates, numerical_gate)
+                phase('correctness_complete')
                 if any(not gate['mutable_state_exact'] or not gate['hidden_exact'] for gate in gates):
                     if rank == 0:
                         (directory / 'result.json').write_text(json.dumps(dict(
@@ -682,7 +707,9 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
             # plans, rather than using the first scored period as compilation.
             warmup_counts = preparation_counts()
             for label, engine in [('A', reference), ('B', candidate)]:
+                phase('trajectory_warmup_start', arm=label, steps=steps+32)
                 chain(True, steps, measure=False, engine=engine, warm_steps=32)
+                phase('trajectory_warmup_complete', arm=label)
             import torch
             torch.hpu.synchronize()
             dist.barrier()
@@ -703,11 +730,13 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
                         raise RuntimeError('Shared arm implementation changed during qualification')
                 wait_for_loading(directory, rank, dist)
                 dist.barrier()
+                phase('timing_start', arm=label)
                 before_steps = report.get('bounded_sampler_steps', 0)
                 before_fallbacks = report.get('bounded_sampler_fallbacks', 0)
                 tokens, host_ms, device_ms = chain(True, steps, engine=reference if label == 'A' else candidate,
                                                    warm_steps=32)
                 after_counts = preparation_counts()
+                phase('timing_complete', arm=label)
                 local = dict(rank=rank, tokens=tokens, delivery_ns=report['token_delivery_ns'],
                              sampling_steps=report.get('bounded_sampler_steps', 0)-before_steps,
                              sampling_fallbacks=report.get('bounded_sampler_fallbacks', 0)-before_fallbacks,
@@ -797,6 +826,7 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
                 Path(job['request_path']).rename(Path(job['request_path']).with_suffix('.consumed'))
                 print(json.dumps(result), flush=True)
     finally:
+        set_preparation_observer(None)
         for name, replay in arms.items():
             if name != 'baseline':
                 replay.close()

@@ -14,6 +14,12 @@ from vllm_gaudi.ops.deepseek_v41_device_loop import SamplingFrames
 
 _inputs = {}
 _frames = {}
+_preparation_observer = None
+
+
+def set_preparation_observer(callback):
+    global _preparation_observer
+    _preparation_observer = callback
 
 
 def close_device_chains():
@@ -26,10 +32,16 @@ def close_device_chains():
 @torch.inference_mode()
 def run_device_chain(engine, host, seed_hidden, sampler, full_sample, payloads, bridge,
                      reset, context_tokens, steps, warm_steps, measure, report, *, observer=None):
+    def progress(action, index=-1):
+        if not measure and _preparation_observer is not None:
+            _preparation_observer('device_chain_preparation', action=action, iteration=index)
+
+    progress('reset')
     reset()
     program = engine.program()
     program.sampling_counter.zero_()
     payloads.pop(engine, None)
+    progress('initial_sampler')
     initial = sampler(seed_hidden, engine)
     initial_host, initial_done = bridge.copy_sampled_tokens_to_host(initial)
     history = torch.tensor(host.history.history[-3:][::-1].copy(), dtype=torch.int32, device='hpu')
@@ -59,10 +71,14 @@ def run_device_chain(engine, host, seed_hidden, sampler, full_sample, payloads, 
                 step_events[index-warm_steps][0].record()
             # Producer and real downstream decoder are enqueued before the
             # certificate's native readback is awaited by this host fixture.
+            progress('input_producer', index)
             rows = inputs.prepare(owner, current.reshape(-1), current_history)
+            progress('decoder_submit', index)
             hidden = engine.from_input_ids(current_position, current.reshape(-1), rows)[0]
+            progress('decoder_submitted', index)
             if certificate is not None:
                 host_status, done = certificate
+                progress('certificate_wait', index)
                 done.synchronize()
                 covered = bool(int(host_status[0, 0]) & 1)
                 report['bounded_sampler_steps'] = report.get('bounded_sampler_steps', 0) + 1
@@ -82,12 +98,15 @@ def run_device_chain(engine, host, seed_hidden, sampler, full_sample, payloads, 
             if measure and index >= warm_steps:
                 delivery.append(time.perf_counter_ns())
             if observer is not None:
+                progress('hidden_readback', index)
                 engine._complete_input_variant().metadata.native_completion.synchronize()
                 observer(program, hidden, context_tokens + index)
+            progress('sampler', index)
             sampler(hidden, engine)
             payload = payloads.pop(engine)
             if engine not in _frames:
                 _frames[engine] = SamplingFrames(payload, inputs.histories[1])
+            progress('preserve_frame', index)
             frame = _frames[engine].preserve(payload, inputs.histories[1])
             certificate = bridge.copy_sampled_tokens_to_host(frame[0])
             current, current_position, current_history = frame[3], frame[4], frame[5]
@@ -95,6 +114,7 @@ def run_device_chain(engine, host, seed_hidden, sampler, full_sample, payloads, 
                 step_events[index-warm_steps][1].record()
         if measure:
             end.record()
+        progress('final_certificate_wait')
         host_status, done = certificate
         done.synchronize()
         if int(host_status[0, 0]) & 1:
