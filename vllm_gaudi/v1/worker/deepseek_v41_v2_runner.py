@@ -602,29 +602,45 @@ class V41V2ModelRunner(V41ModelRunner):
             frame[3].copy_(expected)
             self._queue_device_step(request, 0, frame)
             self._device_step.drain()
+            # Warmup snapshots are regular Torch copies, outside the native
+            # completion's ownership. Drain them at this diagnostic boundary.
+            torch.hpu.synchronize()
             reference_hidden = self._device_step.hidden.clone()
             reference = _PagedSnapshot(program, frame[4], variant.states)
+            torch.hpu.synchronize()
             self._device_step = None
             before.restore()
             frame[3].copy_((expected + 1).remainder(129280))
             self._queue_device_step(request, 0, frame)
             result = self._repair_loop_sample(frame, frame[3])
             self._device_step.drain()
+            torch.hpu.synchronize()
             if result != int(expected.cpu().reshape(-1)[0]):
                 raise RuntimeError("Device loop repair changed the preserved inverse-CDF draw")
-            checks = [bitwise_equal(self._device_step.hidden, reference_hidden)]
-            checks.extend(bitwise_equal(value, saved) for value, saved in
-                          zip(reference.small.tensors, reference.small.saved, strict=True))
-            checks.extend(bitwise_equal(value.index_select(0, rows), saved)
-                          for value, rows, saved in reference.rows)
+            pairs = [(self._device_step.hidden, reference_hidden)]
+            pairs.extend(zip(reference.small.tensors, reference.small.saved, strict=True))
+            pairs.extend((value.index_select(0, rows), saved) for value, rows, saved in reference.rows)
+            # Read bytes only at startup. This also diagnoses the actual
+            # changed rows without depending on an HPU equality reduction.
+            host_pairs = [(value.detach().cpu(), saved.detach().cpu()) for value, saved in pairs]
+            checks = [bitwise_equal(value, saved) for value, saved in host_pairs]
             if not all(checks):
                 names = {id(value): name for name, value in program.named_buffers()}
                 labels = ["hidden"] + [names.get(id(value), "small_state") for value in reference.small.tensors]
                 labels += [names.get(id(value), "paged_state") for value, _, _ in reference.rows]
                 logger.error("Device loop repair changed rollback bytes: %s",
                              [label for label, passed in zip(labels, checks, strict=True) if not passed])
+                for label, passed, (value, saved) in zip(labels, checks, host_pairs, strict=True):
+                    if not passed:
+                        actual = value.contiguous().reshape(-1).view(torch.uint8)
+                        expected_bytes = saved.contiguous().reshape(-1).view(torch.uint8)
+                        changed = (actual != expected_bytes).nonzero().flatten()
+                        first = changed[:16]
+                        logger.error("Repair byte difference %s: shape=%s bytes=%d offsets=%s actual=%s expected=%s",
+                                     label, tuple(value.shape), changed.numel(), first.tolist(),
+                                     actual[first].tolist(), expected_bytes[first].tolist())
                 raise RuntimeError("Discarded device step leaked state into same-position repair")
-            if not bool(torch.isfinite(self._device_step.hidden).all()):
+            if not bool(torch.isfinite(host_pairs[0][0]).all()):
                 raise RuntimeError("Device loop repair produced a nonfinite hidden state")
             self.audit["device_loop_repair_warmup_passed"] = True
         finally:
