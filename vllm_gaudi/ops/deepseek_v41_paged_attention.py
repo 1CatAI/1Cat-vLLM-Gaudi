@@ -1802,14 +1802,25 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             and self.ratio in (1, 2)
             and self.search_length // self.ratio <= self.cache.decoded_main.shape[0]
         )
-        fused_publish = (
+        shared_key = ((self.kv_source, self.index_source, self.ratio)
+                      if gaudi_envs.VLLM_HPU_DSV41_KV_REUSE_FUSION and self.ratio else None)
+        fused_reuse = (
             decode and value.shape[0] == 1 and self.fused_norm and self.native_rope
+            and not decoded and self._uses_logical_mla(value, decoded)
+            and self.shared_main_mla and selected_main is not None and shared_key in selected_main
+            and gaudi_envs.VLLM_HPU_DSV41_KV_REUSE_FUSION
+            and hasattr(torch.ops.custom_op, "custom_deepseek_v41_kv_norm_reuse_mla_gaudi2")
+        )
+        fused_publish = (
+            not fused_reuse and decode and value.shape[0] == 1 and self.fused_norm and self.native_rope
             and self.decoded_kv_state and self.shared.decoded_swa is not None
             and self.ratio in (1, 2) and (decoded or self._uses_logical_mla(value, decoded))
             and gaudi_envs.VLLM_HPU_DSV41_ATTN_FUSED_PROLOGUE
         )
         completion = None
-        if fused_publish:
+        if fused_reuse:
+            kv = None  # The current row is normalized/encoded in its consuming gather.
+        elif fused_publish:
             kv, completion = torch.ops.custom_op.custom_deepseek_v41_kv_norm_rope_publish_gaudi2(
                 kv_input.contiguous(), self.weights.kv_norm.weight,
                 positions.to(torch.int32).contiguous(), self._rotary_native_table(),
@@ -1826,8 +1837,8 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         if not decode and value.shape[0] > NATIVE_WORK_TOKENS:
             del query_input, kv_input
             return self._prefill_attention(value, qr, query, kv, positions, ready_outputs, prefill_sequence)
-        if fused_publish:
-            pass  # Canonical packed state and any active mirror were published together.
+        if fused_publish or fused_reuse:
+            pass  # The fused producer owns the canonical SWA ring write.
         elif decoded and value.shape[0] == 1:
             logical_position = positions.to(torch.int32).contiguous()
             completion = torch.ops.custom_op.custom_deepseek_v41_swa_paged_decoded_write_bf16_gaudi2(
@@ -1934,7 +1945,15 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 if self.shared_main_mla and value.shape[0] == 1 and selected_main is not None:
                     from vllm_gaudi.ops.deepseek_v41_shared_main import shared_main_attention
 
-                    output = shared_main_attention(self, query, positions, selected, lengths, selected_main)
+                    if fused_reuse:
+                        main_rows, main_mask = selected_main[shared_key]
+                        output = torch.ops.custom_op.custom_deepseek_v41_kv_norm_reuse_mla_gaudi2(
+                            query.contiguous(), kv_input.contiguous(), self.weights.kv_norm.weight,
+                            self.swa, main_rows, main_mask, positions.to(torch.int32).contiguous(),
+                            self._rotary_native_table(), self.weights.attn_sink, self.scale, lengths, self.eps
+                        )
+                    else:
+                        output = shared_main_attention(self, query, positions, selected, lengths, selected_main)
                     return self._finish_output(output, positions, ready_outputs, decode=decode)
                 output = torch.ops.custom_op.custom_deepseek_v41_logical_mla_gaudi2(
                     query.contiguous(),

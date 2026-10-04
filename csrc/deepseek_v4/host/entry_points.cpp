@@ -80,6 +80,7 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVE
 #include "deepseek_v41_mhc_gates_gaudi2.hpp"
 #include "deepseek_v41_mhc_mme_gates_norm_gaudi2.hpp"
 #include "deepseek_v41_fp4_norm_rope_publish_gaudi2.hpp"
+#include "deepseek_v41_kv_norm_reuse_gather_gaudi2.hpp"
 #include "deepseek_v41_woa_stage_gaudi2.hpp"
 #include "deepseek_v41_router_top6_gaudi2.hpp"
 #include "deepseek_v41_router_logits_top6_gaudi2.hpp"
@@ -236,6 +237,7 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_MHC_GATES,
     GAUDI2_KERNEL_DEEPSEEK_V41_MHC_MME_GATES_NORM,
     GAUDI2_KERNEL_DEEPSEEK_V41_FP4_NORM_ROPE_PUBLISH,
+    GAUDI2_KERNEL_DEEPSEEK_V41_KV_NORM_REUSE_GATHER,
     GAUDI2_KERNEL_DEEPSEEK_V41_MXFP4_SHARED_DEQUANT_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V41_MXFP4_SHARED_DEQUANT_NORMAL_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V41_MXFP4_K128_DEQUANT_BF16,
@@ -491,6 +493,7 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MHC_GATES].name, DeepseekV41MhcGatesGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MHC_MME_GATES_NORM].name, DeepseekV41MhcMmeGatesNormGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_FP4_NORM_ROPE_PUBLISH].name, DeepseekV41Fp4NormRopePublishGaudi2::name);
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_KV_NORM_REUSE_GATHER].name, DeepseekV41KvNormReuseGatherGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_DENSE_QUANT].name, DeepseekV41DenseGaudi2::quant_name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_DENSE_SCALE].name, DeepseekV41DenseGaudi2::scale_name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_DENSE_PAIR_SCALE].name,
@@ -1101,6 +1104,8 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     mainFast4.GetKernelName(kernelName);
     if (std::strcmp(params->guid.name, kernelName) == 0)
         return mainFast4.GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name, DeepseekV41KvNormReuseGatherGaudi2::name) == 0)
+        return DeepseekV41KvNormReuseGatherGaudi2().GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41Fp4NormRopePublishGaudi2::name) == 0)
         return DeepseekV41Fp4NormRopePublishGaudi2().GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41MhcMmeGatesNormGaudi2::name) == 0)
