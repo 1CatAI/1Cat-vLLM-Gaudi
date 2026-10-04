@@ -11,6 +11,19 @@ from dataclasses import dataclass
 import torch
 
 
+def bitwise_equal(left, right):
+    """Compare rollback bytes, including unused floating cache rows.
+
+    A paged snapshot includes unwritten scratch rows, whose bit patterns may
+    encode NaNs. Numeric equality rejects identical NaNs and also treats the
+    two signed zeros as equal; neither implements the rollback contract.
+    """
+    if left.dtype != right.dtype or left.shape != right.shape or left.device != right.device:
+        return False
+    return torch.equal(left.contiguous().reshape(-1).view(torch.uint8),
+                       right.contiguous().reshape(-1).view(torch.uint8))
+
+
 def copy_sampling_frame(destinations, payload, history):
     for destination, source in zip(destinations[:5], payload, strict=True):
         destination.copy_(source)

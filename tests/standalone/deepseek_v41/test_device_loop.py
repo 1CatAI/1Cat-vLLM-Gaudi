@@ -10,6 +10,20 @@ from vllm_gaudi.ops.deepseek_v41_replay import capture_engram_inputs
 from vllm_gaudi.v1.worker.deepseek_v41_v2_runner import V41V2ModelRunner
 
 
+def test_rollback_equality_preserves_nan_payloads_and_signed_zero():
+    from vllm_gaudi.ops.deepseek_v41_device_loop import bitwise_equal
+
+    bits = torch.tensor([0x7fc00001, 0x7fc00002, 0], dtype=torch.int32)
+    values = bits.view(torch.float32)
+    assert not torch.equal(values, values.clone())
+    assert bitwise_equal(values, values.clone())
+    changed = bits.clone()
+    changed[0] = 0x7fc00002
+    assert not bitwise_equal(values, changed.view(torch.float32))
+    assert not bitwise_equal(torch.tensor([0.]), torch.tensor([-0.]))
+    assert bitwise_equal(torch.tensor(3, dtype=torch.int32), torch.tensor(3, dtype=torch.int32))
+
+
 def payload(token=7):
     return (torch.tensor([[token * 2 + 1]], dtype=torch.int32), torch.arange(16.).reshape(1, 16),
             torch.tensor([[1., .95, .125]]), torch.tensor([[token]], dtype=torch.int32),

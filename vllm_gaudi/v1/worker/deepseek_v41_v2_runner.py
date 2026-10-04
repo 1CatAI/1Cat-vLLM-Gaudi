@@ -585,6 +585,7 @@ class V41V2ModelRunner(V41ModelRunner):
         snapshots, comparisons or host tensor reads enter the hot loop.
         """
         from types import SimpleNamespace
+        from vllm_gaudi.ops.deepseek_v41_device_loop import bitwise_equal
         from vllm_gaudi.ops.deepseek_v41_replay import _InputFeedbackSnapshot, _PagedSnapshot
 
         program = self.model.program
@@ -611,13 +612,20 @@ class V41V2ModelRunner(V41ModelRunner):
             self._device_step.drain()
             if result != int(expected.cpu().reshape(-1)[0]):
                 raise RuntimeError("Device loop repair changed the preserved inverse-CDF draw")
-            checks = [torch.equal(self._device_step.hidden, reference_hidden)]
-            checks.extend(torch.equal(value, saved) for value, saved in
+            checks = [bitwise_equal(self._device_step.hidden, reference_hidden)]
+            checks.extend(bitwise_equal(value, saved) for value, saved in
                           zip(reference.small.tensors, reference.small.saved, strict=True))
-            checks.extend(torch.equal(value.index_select(0, rows), saved)
+            checks.extend(bitwise_equal(value.index_select(0, rows), saved)
                           for value, rows, saved in reference.rows)
             if not all(checks):
+                names = {id(value): name for name, value in program.named_buffers()}
+                labels = ["hidden"] + [names.get(id(value), "small_state") for value in reference.small.tensors]
+                labels += [names.get(id(value), "paged_state") for value, _, _ in reference.rows]
+                logger.error("Device loop repair changed rollback bytes: %s",
+                             [label for label, passed in zip(labels, checks, strict=True) if not passed])
                 raise RuntimeError("Discarded device step leaked state into same-position repair")
+            if not bool(torch.isfinite(self._device_step.hidden).all()):
+                raise RuntimeError("Device loop repair produced a nonfinite hidden state")
             self.audit["device_loop_repair_warmup_passed"] = True
         finally:
             self._discard_device_step()
