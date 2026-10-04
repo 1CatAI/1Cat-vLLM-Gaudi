@@ -158,11 +158,17 @@ def stage_state_tensors(program):
     )
 
 
-def capture_engram_inputs(engram, *, direct=False, device_layer1=False, local_heads=12):
+def capture_engram_inputs(engram, *, direct=False, device_layer1=False, device_layers=False, local_heads=12):
     if not direct:
         return tuple(value.clone() for value in engram)
     if len(engram) != 2:
         raise ValueError("Direct Engram capture requires both layer inputs")
+    if device_layers:
+        first, late = engram
+        if any(value.dtype != torch.bfloat16 or tuple(value.shape) != (1, local_heads, 256)
+               or not value.is_contiguous() or value.device != first.device for value in engram):
+            raise ValueError("Device Engram capture requires both fixed BF16 layer inputs")
+        return tuple(engram)
     if device_layer1:
         first, late = engram
         if (
@@ -266,6 +272,7 @@ class StageVariant(torch.nn.Module):
             engram,
             direct=self.direct_engram,
             device_layer1=self.device_engram,
+            device_layers=envs.VLLM_HPU_DSV41_DEVICE_CLOSED_LOOP and self.device_engram,
             local_heads=24 // getattr(program, "tensor_parallel_size", 2),
         )
         self.states = stage_state_tensors(program)

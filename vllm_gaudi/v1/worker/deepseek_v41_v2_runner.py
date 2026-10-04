@@ -109,6 +109,7 @@ class V41V2ModelRunner(V41ModelRunner):
 
     def close(self):
         self.prepare_shutdown()
+        self._discard_device_step()
         super().close()
 
     shutdown_inc = close
@@ -121,6 +122,11 @@ class V41V2ModelRunner(V41ModelRunner):
         self._completion = None
         self._input_committed = None
         self._prefix_started = None
+        self._device_loop_enabled = envs.VLLM_HPU_DSV41_DEVICE_CLOSED_LOOP
+        self._device_step = None
+        self._device_loop_owner = None
+        self._device_loop_position = None
+        self._device_step_input = None
         self._sampling_prefix_handoff = envs.VLLM_HPU_DSV41_SAMPLING_PREFIX_HANDOFF
         # The device-token continuation owns one request generation.  A
         # multi-request scheduler step must use the ordinary synchronous
@@ -142,11 +148,98 @@ class V41V2ModelRunner(V41ModelRunner):
         if committed is None:
             if annotations_enabled():
                 with scope(f"v41::continuation_retire::P{record.start}"):
-                    self.model.complete_step(1)
+                    self._complete_loop_input(record)
             else:
-                self.model.complete_step(1)
+                self._complete_loop_input(record)
             self._input_committed = identity
             self.audit["v2_early_input_commits"] = self.audit.get("v2_early_input_commits", 0) + 1
+
+    def _complete_loop_input(self, record):
+        if getattr(self, "_device_step_input", None) == (record.request_id, record.start):
+            # The scheduler has accepted this input. Only mirror its compressed
+            # history; device producers already performed both row lookups.
+            history = self.model.engram_host.history
+            request = self.requests[record.request_id]
+            batch = history.prepare(record.request_id, [request.tokens[record.start]])
+            history.commit(batch, 1)
+            self._device_step_input = None
+        else:
+            self.model.complete_step(1)
+
+    def _device_ahead_authorized(self, request, start):
+        program = self.model.program
+        following = start + 1
+        if request.req_id not in self.requests:
+            return False
+        maximum = request.sampling_params.max_tokens
+        if maximum is not None and len(request.output) + 1 >= maximum:
+            return False
+        if (not getattr(self, "_device_loop_enabled", False) or getattr(request, "mm_features", ())
+                or not getattr(program, "device_next_position", False)
+                or not self.model.native or program.dspark or not self.pp.group.is_first_rank
+                or not self.pp.group.is_last_rank or self._device_step is not None):
+            return False
+        # The scheduler owns allocation, including the next position's page.
+        # Do not speculate into an unallocated page or an uncaptured geometry.
+        if following >= self.model_config.max_model_len or len(request.block_ids) != 1:
+            return False
+        from vllm_gaudi.ops.deepseek_v41_paged_attention import PAGE_TOKENS
+
+        if following >= len(request.block_ids[0]) * PAGE_TOKENS:
+            return False
+        search = runtime_search_length(following, 1, program.length)
+        bound = decode_source_prefix_bound(following + 1, search, self.model.tensor_parallel_size,
+                                          runtime_indexer=program.runtime_indexer)
+        return (search == program.search_length and bound == program.decode_token_bound
+                and program.replay_owner.input_variant_ready(search))
+
+    def _discard_device_step(self):
+        step, self._device_step = self._device_step, None
+        if step is not None:
+            step.drain()
+            self.audit["device_loop_discards"] = self.audit.get("device_loop_discards", 0) + 1
+        self._device_loop_position = None
+
+    def _queue_device_step(self, request, start, frame):
+        from vllm_gaudi.ops.deepseek_v41_device_loop import DeviceStep
+
+        inputs = self.model.device_decode_inputs()
+        owner = id(request), request.req_id
+        rows = inputs.prepare(owner, frame[3].reshape(-1), frame[5])
+        hidden = self.model.forward_device_input(frame[3], frame[4], rows)
+        variant = self.model.program.replay_owner._complete_input_variant()
+        self._device_step = DeviceStep(request.req_id, start + 1, hidden, variant.metadata.native_completion, frame)
+        self._device_loop_position = start + 2
+        self.audit["device_loop_queued"] = self.audit.get("device_loop_queued", 0) + 1
+
+    @torch.inference_mode()
+    def _repair_loop_sample(self, frame, destination):
+        # Commands already submitted to the device are drained and discarded;
+        # their outputs are never published. Repair uses the preserved draw.
+        step = self._device_step
+        if step is not None:
+            step.drain()
+            self._device_step = None
+        token = self._repair_device_sample(frame[:5], destination)
+        if step is not None:
+            self._queue_device_step(self.requests[step.request_id], step.start - 1, frame)
+            self.audit["device_loop_recomputes"] = self.audit.get("device_loop_recomputes", 0) + 1
+        return token
+
+    @trace_phase
+    def _forward(self, request_id, tokens, start, **kwargs):
+        step = getattr(self, "_device_step", None)
+        if step is not None:
+            if step.request_id == request_id and step.start == start and kwargs.get("decode"):
+                self._device_step = None
+                self._device_step_input = request_id, start
+                self.audit["target_steps"] += 1
+                self.audit["target_tokens"] += 1
+                self.audit["decode_steps"] += 1
+                self.audit["device_loop_consumed"] = self.audit.get("device_loop_consumed", 0) + 1
+                return step.hidden
+            self._discard_device_step()
+        return super()._forward(request_id, tokens, start, **kwargs)
 
     @staticmethod
     def _continuation_authorized(record, scheduled):
@@ -242,7 +335,9 @@ class V41V2ModelRunner(V41ModelRunner):
         identity = self._identity(record)
         if early:
             self._commit_input(record)
-        if annotations_enabled():
+        if getattr(self, "_device_loop_enabled", False):
+            authorized = False
+        elif annotations_enabled():
             with scope(f"v41::continuation_authorize::P{record.start + 1}"):
                 authorized = self._prefix_authorized(record, scheduled)
         else:
@@ -294,7 +389,7 @@ class V41V2ModelRunner(V41ModelRunner):
         self.pp.complete_packet()
         self.pp.commits += 1
         if not early:
-            self.model.complete_step(1)
+            self._complete_loop_input(record)
         request.output.append(token)
         self._next_input = (request.req_id, record.start + 1, record.device_token)
         self._next_position = ((request.req_id, record.start + 1, record.device_position)
@@ -354,6 +449,19 @@ class V41V2ModelRunner(V41ModelRunner):
 
     @trace_phase
     def _update(self, scheduled):
+        if getattr(self, "_device_step", None) is not None:
+            step = self._device_step
+            if (not self._continuation_authorized(
+                    step, scheduled)
+                    or getattr(scheduled, "auxiliary_prefix_operations", None) is not None):
+                self._discard_device_step()
+        retiring = set(scheduled.finished_req_ids) | set(getattr(scheduled, "preempted_req_ids", ()) or ())
+        owner = getattr(self, "_device_loop_owner", None)
+        if owner is not None and owner[1] in retiring:
+            inputs = self.model.device_decode_inputs()
+            if inputs.owner is not None:
+                inputs.retire(owner)
+            self._device_loop_owner = self._device_loop_position = None
         request_batches = self.request_slots_enabled
         for new in scheduled.scheduled_new_reqs:
             operations = getattr(scheduled, "auxiliary_prefix_operations", None)
@@ -396,6 +504,33 @@ class V41V2ModelRunner(V41ModelRunner):
         elif tp_size != 4 or not (self.pp.group.is_first_rank and self.pp.group.is_last_rank):
             raise RuntimeError("TP4 device continuation requires a single pipeline stage")
         payload = getattr(self, "_device_sampling_payload", None)
+        frame = None
+        ahead = payload is not None and self._device_ahead_authorized(request, start)
+        if ahead:
+            from vllm_gaudi.ops.deepseek_v41_device_loop import SamplingFrames
+
+            # Commit the current input transaction before seeding its lookback.
+            from types import SimpleNamespace
+
+            current = SimpleNamespace(request_id=request.req_id, generation=self.pp.generation, start=start)
+            self._commit_input(current)
+            inputs = self.model.device_decode_inputs()
+            owner = id(request), request.req_id
+            if self._device_loop_owner != owner or self._device_loop_position != start + 1:
+                import numpy as np
+
+                if inputs.owner is not None and inputs.owner != owner:
+                    inputs.retire(inputs.owner)
+
+                history = self.model.engram_host.history.history[-3:][::-1]
+                suffix = np.full(3, -1, dtype=np.int32)
+                suffix[:len(history)] = history
+                inputs.history_views[-1].copy_(torch.from_numpy(suffix))
+                self._device_loop_owner = owner
+            if not hasattr(self, "_sampling_frames"):
+                self._sampling_frames = SamplingFrames(payload, inputs.history_views[-1])
+            frame = self._sampling_frames.preserve(payload, inputs.history_views[-1])
+            payload, token = frame[:5], frame[3]
         source = payload[0] if payload is not None else token
         if tp_size == 4:
             # load_model already verified the native ABI and retained this
@@ -405,7 +540,10 @@ class V41V2ModelRunner(V41ModelRunner):
         else:
             bridge, _ = resolve_device_runtime(tp_size)
             host, done = bridge.copy_sampled_tokens_to_host(source)
-        fallback = (lambda: self._repair_device_sample(payload, token)) if payload is not None else None
+        if ahead:
+            self._queue_device_step(request, start, frame)
+        fallback = ((lambda: self._repair_loop_sample(frame, token)) if ahead else
+                    (lambda: self._repair_device_sample(payload, token))) if payload is not None else None
         position = payload[4] if payload is not None and len(payload) == 5 else None
         record = CompletionRecord(request.req_id, self.pp.generation, start, host, done, token.view(1), fallback,
                                   position)
@@ -433,6 +571,57 @@ class V41V2ModelRunner(V41ModelRunner):
         self.audit["v2_async_completions"] = self.audit.get("v2_async_completions", 0) + 1
         return V41AsyncOutput(record) if self.pp.group.is_last_rank else None
 
+    @torch.inference_mode()
+    def _validate_device_loop_repair(self, payload, expected):
+        """Prove same-position replay overwrites a discarded ordinary step.
+
+        This runs only at startup, with sparse canonical row snapshots. No
+        snapshots, comparisons or host tensor reads enter the hot loop.
+        """
+        from types import SimpleNamespace
+        from vllm_gaudi.ops.deepseek_v41_replay import _InputFeedbackSnapshot, _PagedSnapshot
+
+        program = self.model.program
+        variant = program.replay_owner._complete_input_variant()
+        inputs = self.model.device_decode_inputs()
+        history = torch.full((3,), -1, dtype=torch.int32, device=self.device)
+        frame = self._sampling_frames.preserve(payload, history)
+        before = _InputFeedbackSnapshot(_PagedSnapshot(program, frame[4], variant.states), variant.fixed[2:4])
+        saved_rows = tuple(value.clone() for value in (*inputs.rows, inputs.histories))
+        request = SimpleNamespace(req_id="device-loop-startup-repair")
+        owner = id(request), request.req_id
+        self.requests[request.req_id] = request
+        try:
+            frame[3].copy_(expected)
+            self._queue_device_step(request, 0, frame)
+            self._device_step.drain()
+            reference_hidden = self._device_step.hidden.clone()
+            reference = _PagedSnapshot(program, frame[4], variant.states)
+            self._device_step = None
+            before.restore()
+            frame[3].copy_((expected + 1).remainder(129280))
+            self._queue_device_step(request, 0, frame)
+            result = self._repair_loop_sample(frame, frame[3])
+            self._device_step.drain()
+            if result != int(expected.cpu().reshape(-1)[0]):
+                raise RuntimeError("Device loop repair changed the preserved inverse-CDF draw")
+            checks = [torch.equal(self._device_step.hidden, reference_hidden)]
+            checks.extend(torch.equal(value, saved) for value, saved in
+                          zip(reference.small.tensors, reference.small.saved, strict=True))
+            checks.extend(torch.equal(value.index_select(0, rows), saved)
+                          for value, rows, saved in reference.rows)
+            if not all(checks):
+                raise RuntimeError("Discarded device step leaked state into same-position repair")
+            self.audit["device_loop_repair_warmup_passed"] = True
+        finally:
+            self._discard_device_step()
+            before.restore()
+            for destination, source in zip((*inputs.rows, inputs.histories), saved_rows, strict=True):
+                destination.copy_(source)
+            inputs.retire(owner)
+            self.requests.pop(request.req_id)
+            program.replay_owner.latest_tail = None
+
     def _validate_device_sampling_warmup(self, hidden):
         """Exercise the actual scalar copy, four-worker repair and completion owner."""
         if getattr(self, "_device_sampling_completion_warmed", False):
@@ -442,6 +631,20 @@ class V41V2ModelRunner(V41ModelRunner):
         payload = self.model.program.replay_owner.sampling_tail_values(hidden)
         if payload is None:
             raise RuntimeError("Device sampling warmup did not retain its native tail outputs")
+        if getattr(self, "_device_loop_enabled", False) and not hasattr(self, "_sampling_frames"):
+            from vllm_gaudi.ops.deepseek_v41_device_loop import SamplingFrames
+
+            inputs = self.model.device_decode_inputs()
+            saved = tuple(value.clone() for value in (*inputs.rows, inputs.histories))
+            history = torch.full((3,), -1, dtype=torch.int32, device=self.device)
+            self._sampling_frames = SamplingFrames(payload, history)
+            for _ in range(2):
+                self._sampling_frames.preserve(payload, history)
+                inputs.prepare("startup", payload[3].reshape(-1), history)
+            torch.hpu.synchronize()
+            for destination, source in zip((*inputs.rows, inputs.histories), saved, strict=True):
+                destination.copy_(source)
+            inputs.retire("startup")
         owner = self._device_sampling_owner
         # The startup sampler leaves the unfiltered request parameters active.
         # This guarantees the candidate certificate requests the full fallback.
@@ -470,6 +673,8 @@ class V41V2ModelRunner(V41ModelRunner):
             payload[3].copy_(filtered)
             host, done = self.tp4_token_readback(payload[3])
             done.synchronize()
+            if getattr(self, "_device_loop_enabled", False):
+                self._validate_device_loop_repair(payload, expected)
         finally:
             self._v2_async_step = False
             self._completion = None

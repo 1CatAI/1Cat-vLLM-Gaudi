@@ -277,6 +277,25 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             ):
                 self.engram_host.stage_device_c1_reference(request_id, self.step_ticket.buffers[0])
 
+    def device_decode_inputs(self):
+        """Share fixed C1-C6 mapped producers with device-owned continuation."""
+        if not hasattr(self, "device_engram_inputs"):
+            from vllm_gaudi.ops.deepseek_v41_device_engram import DeviceEngramRounds
+
+            ids = torch.empty(1, dtype=torch.int32, device=self.device)
+            history = torch.empty(3, dtype=torch.int32, device=self.device)
+            self.device_engram_inputs = DeviceEngramRounds(self.engram_host, ids, history)
+        return self.device_engram_inputs
+
+    def forward_device_input(self, input_ids, positions, rows):
+        """Submit the warmed embedding-to-sampling stage without a host ticket."""
+        if self.pp_rank != 0 or not self.is_last_stage or self.program.dspark or not self.native:
+            raise RuntimeError("Device continuation requires an ordinary complete native stage")
+        replay = self.program.replay_owner
+        output, _, aux = replay.from_input_ids(positions, input_ids.reshape(-1), rows)
+        self.last_aux = aux
+        return output
+
     def prepare_device_engram(self, request_id, device_token):
         if self.pp_rank != 0 or not envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM:
             raise RuntimeError("Device Engram preparation is outside the qualified PP0 V2 path")
@@ -475,6 +494,8 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 layer1 = self.engram_host.consume_device_c1(self._step_request_id)
                 buffers = self.engram_host.wait(self.step_ticket)
                 engram = (layer1, buffers[1])
+                if envs.VLLM_HPU_DSV41_DEVICE_CLOSED_LOOP:
+                    engram = self.device_decode_inputs().stage_reference(engram)
             else:
                 # The full TP4 prompt consumes the two tables at layers 1/14.
                 # Each consumer binds its own DMA dependency, allowing earlier
@@ -572,6 +593,8 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         for replay in getattr(self, "batch_replay_lanes", ()):
             replay.close()
         self.program.invalidate()
+        if hasattr(self, "device_engram_inputs"):
+            self.device_engram_inputs.close()
         if self.engram_host is not None:
             self.engram_host.close()
 

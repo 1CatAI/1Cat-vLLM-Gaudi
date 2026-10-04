@@ -153,6 +153,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_DEVICE_SAMPLING: bool = False
     VLLM_HPU_DSV41_DEVICE_NEXT_POSITION: bool = False
     VLLM_HPU_DSV41_DEVICE_INPUT_FEEDBACK: bool = False
+    VLLM_HPU_DSV41_DEVICE_CLOSED_LOOP: bool = False
     VLLM_HPU_DSV41_SAMPLING_PREFIX_HANDOFF: bool = False
     VLLM_HPU_DSV41_WOA_OUTPUT_ROUNDTRIP: bool = False
     VLLM_HPU_DSV41_WO_A_FP8_SIDECAR: str = ""
@@ -674,6 +675,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_DEVICE_SAMPLING", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_DEVICE_NEXT_POSITION":
     lambda: os.environ.get("VLLM_HPU_DSV41_DEVICE_NEXT_POSITION", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DEVICE_CLOSED_LOOP":
+    lambda: os.environ.get("VLLM_HPU_DSV41_DEVICE_CLOSED_LOOP", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_DEVICE_INPUT_FEEDBACK":
     lambda: os.environ.get("VLLM_HPU_DSV41_DEVICE_INPUT_FEEDBACK", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_SAMPLING_PREFIX_HANDOFF":

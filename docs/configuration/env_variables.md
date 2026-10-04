@@ -913,3 +913,13 @@ services reject this control.
 scalar operands as resident buffers in shared native decode compilation. Dynamic positions, mutable state,
 uninitialized allocations and escaping factory outputs remain in the graph. Request data is never frozen.
 Enable only for complete-chain and serving qualification; prefill compilation uses its existing backend.
+
+`VLLM_HPU_DSV41_DEVICE_CLOSED_LOOP` (default `0`) selects the candidate ordinary
+native C1 lookahead lifecycle. It requires device sampling, device next-position
+outputs and the existing device Engram/native-input paths. Both mapped Engram
+producers and immutable sampling frames are warmed at startup. One additional
+invocation may be queued before its input certificate is read; a failed
+certificate drains and discards it before full sampling repair with the saved
+draw. Request termination drains queued work before scheduler state is reused.
+This candidate remains disabled until service trace and official-sampling
+end-to-end qualification pass. It does not change C2-C6 replay interfaces.
