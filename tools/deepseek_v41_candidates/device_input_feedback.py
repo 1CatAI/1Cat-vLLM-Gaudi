@@ -10,7 +10,7 @@ def make_candidate(reference, clone):
 
     result = clone(reference)
     if not (getattr(result, 'benchmark_official_sampling', False)
-            and result.device_sampling and result.device_next_position):
+            and result.device_sampling and getattr(result, 'device_next_position', False)):
         raise ValueError('Input feedback requires the official bounded sampler and device position baseline')
     result.device_input_feedback = True
     result.candidate_replay_tail = True

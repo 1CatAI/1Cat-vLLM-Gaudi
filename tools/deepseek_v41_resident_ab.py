@@ -395,9 +395,14 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
                         block.attention.index_mirror_scores = False
             if name in ('handoff_sampling_full', 'handoff_sampling_bounded'):
                 import torch
+                from vllm_gaudi import envs
 
                 program.benchmark_official_sampling = True
                 program.device_sampling = name == 'handoff_sampling_bounded'
+                # The partial fixture builds a plain Module rather than
+                # PreparedStage. Honor the same optional position contract
+                # when constructing this independent cold reference arm.
+                program.device_next_position = program.device_sampling and envs.VLLM_HPU_DSV41_DEVICE_NEXT_POSITION
                 program.register_buffer('sampling_params', torch.tensor([[1., .95, -1.]], device='hpu'))
                 program.register_buffer('sampling_seed', torch.tensor([42], dtype=torch.int32, device='hpu'))
                 program.register_buffer('sampling_counter', torch.zeros(1, dtype=torch.int32, device='hpu'))
