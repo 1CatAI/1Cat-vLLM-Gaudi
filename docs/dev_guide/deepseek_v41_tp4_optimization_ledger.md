@@ -759,3 +759,5 @@ Own retiredgraphs were losslessly archived withtarcompare/SHA256 before removing
 固定启动工具：`tools/launch_deepseek_v41_decode_micro.py`，复用卡锁、0/1/4/5 与 CPU 10/15/38/43，SSD 临时目录、编译缓存、诊断默认关闭和桥接接口前置检查。现有微基准收益不改记为端到端收益。
 
 2026-10-04：设备闭环（采样帧→双 Engram→下一次原生重放）／真实16层三轮设备中位差 1.012987 ms/token（1.012987、1.015639、0.879438）／`VLLM_HPU_DSV41_DEVICE_CLOSED_LOOP=0`。五输入 token、hidden、33 份可变状态逐位一致；计数为一次交接，不乘层数。证据 `decode-micro-resident-06`；相对含有界采样的父路径，端到端待批量验收，不与已含的采样/静态坐标收益重复相加。
+
+2026-10-04 批量验收：设备闭环完整预热、缓存开启，官方采样 seed42，16K 未命中→2382 tokens 自然EOS，正式 TPOT **9.997343 ms**。token 与正文均与 `decode-position-serving-01` 完全一致（14事实参考已通过）。相对该父版本改善 1.395094 ms，超过微基准预估一半；相对最初10.568225基线改善 0.570882 ms。关闭此项待验收余额，单 stage 原生默认启用采样／设备输入／闭环／已验收静态坐标，PP 阶段及显式禁用不变。目标7ms未完成。随带 trace 启动缺必需写出参数，未生成设备trace；正式数字保留，只修复采集入口。

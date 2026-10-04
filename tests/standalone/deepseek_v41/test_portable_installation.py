@@ -183,3 +183,11 @@ def test_public_adapter_forwards_inference_and_hides_internal_routes():
         for server in (proxy, upstream):
             server.shutdown()
             server.server_close()
+
+
+def test_raw_trace_configuration_rejected_before_model_loading():
+    module = tool("serve_deepseek_v41")
+    with pytest.raises(ValueError, match="HABANA_PROFILE_WRITE_HLTV"):
+        module.validate_raw_trace_profile({"environment": {
+            "VLLM_HPU_DSV41_RAW_TRACE": "1", "HABANA_PROF_CONFIG": "/unused"}})
+    module.validate_raw_trace_profile({"environment": {"VLLM_HPU_DSV41_RAW_TRACE": "0"}})

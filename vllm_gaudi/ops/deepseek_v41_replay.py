@@ -37,7 +37,7 @@ def stage_collectives(tp_rank, native, tp_size=2, *, native_fp32_gather=False, o
                 else torch.ops.vllm_gaudi.tp_peer_allgather(flat, tp_size)
             )
             shards = shards.reshape(tp_size, flat.numel())
-            if fused_peer_sum and flat.numel() % 128 == 0:
+            if fused_peer_sum and flat.numel() <= 32768 and flat.numel() % 128 == 0:
                 from vllm_gaudi.ops.deepseek_v41_ordered_peer_sum import ordered_peer_sum
 
                 return ordered_peer_sum(shards).reshape(value.shape)

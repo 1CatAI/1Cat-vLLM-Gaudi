@@ -241,6 +241,16 @@ _TP4_FASTPATH_DEFAULTS.update(
 # A TP-only stage inherits the qualified C1 compute and replay defaults.
 # The three exclusions require a pipeline peer, absent when PP has one rank.
 _TP4_FASTPATH_DEFAULTS = {**_C1_FASTPATH_DEFAULTS, **_NUMERIC_FASTPATH_DEFAULTS, **_TP4_FASTPATH_DEFAULTS}
+# Qualified ordinary replay without a pipeline boundary. PP stages retain
+# their existing token ownership; diagnostic overrides remain authoritative.
+_SINGLE_STAGE_NATIVE_DEFAULTS = {
+    "VLLM_HPU_DSV41_DEVICE_SAMPLING": "1",
+    "VLLM_HPU_DSV41_DEVICE_NEXT_POSITION": "1",
+    "VLLM_HPU_DSV41_DEVICE_INPUT_FEEDBACK": "1",
+    "VLLM_HPU_DSV41_DEVICE_CLOSED_LOOP": "1",
+    "VLLM_HPU_DSV41_STATIC_COORDINATES": "1",
+}
+
 _PIPELINE_ONLY_FASTPATHS = (
     "VLLM_HPU_DSV41_PACKED_PP",
     "VLLM_HPU_DSV41_NATIVE_PP_COPY",
@@ -281,6 +291,12 @@ def prepare_default_fastpaths(model, sidecars=None, tensor_parallel_size=4, pipe
     if pipeline_parallel_size == 1:
         for key in _PIPELINE_ONLY_FASTPATHS:
             os.environ[key] = "0"
+    if pipeline_parallel_size == 1 and all(
+        _enabled(os.environ.get(key, "0"))
+        for key in ("VLLM_HPU_DSV41_V2", "VLLM_HPU_DSV41_GRAPH_REPLAY", "VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH")
+    ):
+        for key, value in _SINGLE_STAGE_NATIVE_DEFAULTS.items():
+            os.environ.setdefault(key, value)
     # Prepared N256 weights select the qualified BF16 prompt implementation.
     # Profiles without this storage layout retain their existing dispatch.
     if any(
@@ -560,7 +576,9 @@ def main():
     prefix_caching = (
         []
         if any(value.split("=")[0] in ("--enable-prefix-caching", "--no-enable-prefix-caching") for value in extra)
-        else ["--enable-prefix-caching" if settings.get("enable_prefix_caching", False) else "--no-enable-prefix-caching"]
+        else [
+            "--enable-prefix-caching" if settings.get("enable_prefix_caching", False) else "--no-enable-prefix-caching"
+        ]
     )
     if "--enable-prefix-caching" in extra + prefix_caching and not any(
         value.split("=")[0] in ("--enable-prompt-tokens-details", "--no-enable-prompt-tokens-details")
@@ -605,7 +623,8 @@ def main():
     residency = None
     try:
         if args.engram_residency == "locked":
-            from vllm_gaudi.ops.deepseek_v41_residency import EngramDeviceGate, EngramResidency, EngramStartup, table_regions
+            from vllm_gaudi.ops.deepseek_v41_residency import (
+                EngramDeviceGate, EngramResidency, EngramStartup, table_regions)
 
             device_layers = (1,) if gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM else ()
             tables = EngramResidency(table_regions(args.model), args.engram_host_budget_gib * 1024**3,

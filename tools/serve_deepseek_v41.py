@@ -119,6 +119,18 @@ def maintain_affinity(pid, settings):
     return processes
 
 
+def validate_raw_trace_profile(profile):
+    environment = profile.get("environment", {})
+    if environment.get("VLLM_HPU_DSV41_RAW_TRACE", "0") != "1":
+        return
+    if not environment.get("HABANA_PROF_CONFIG") or environment.get("HABANA_PROFILE_WRITE_HLTV") != "1":
+        raise ValueError("Raw trace requires HABANA_PROF_CONFIG and HABANA_PROFILE_WRITE_HLTV=1 before loading")
+    config = json.loads(Path(environment["HABANA_PROF_CONFIG"]).read_text())
+    hardware = [p for p in config.get("Plugins", ()) if p.get("enable") and p.get("name") == "HwTrace"]
+    if len(hardware) != 1 or not hardware[0]["values"]["parseOptions"]["skipParse"]["value"]:
+        raise ValueError("Raw trace requires HwTrace skipParse=true before loading")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("installation", type=Path)
@@ -130,6 +142,14 @@ def main():
     root = args.installation.resolve()
     settings_path = args.settings.expanduser().resolve() if args.settings is not None else root / "settings.json"
     settings = json.loads(settings_path.read_text())
+    runtime_path = settings.get("runtime_profile", str(root / "runtime.json"))
+    if "--runtime-profile" in extra:
+        runtime_path = extra[extra.index("--runtime-profile") + 1]
+    runtime_path = Path(runtime_path).expanduser()
+    if not runtime_path.is_absolute():
+        runtime_path = root / runtime_path
+    if runtime_path.is_file():
+        validate_raw_trace_profile(json.loads(runtime_path.read_text()))
     compiler_temp = settings.get("environment", {}).get("TMPDIR")
     if compiler_temp:
         # A configured tmpfs scratch directory must be recreated after reboot.
