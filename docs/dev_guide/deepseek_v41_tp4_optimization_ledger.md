@@ -757,3 +757,5 @@ Own retiredgraphs were losslessly archived withtarcompare/SHA256 before removing
 生产形状、真实权重、直接生产者与消费者，使用生产原生重放。正确性检查 3–5 组真实输入；同进程 ABABAB，三轮设备时间差方向一致即可，不用 IQR 门槛。候选默认关闭；仅通过完整链微基准的候选记一行“名称／每 token 或每轮节省／开关”。累计预估 ≥1 ms 或 3–5 项后，统一进行一次官方采样正式请求（seed 42、自然 EOS）及随带 trace。端到端兑现 ≥一半预估才整批默认开启。未测、失败、重复方向不计收益。
 
 固定启动工具：`tools/launch_deepseek_v41_decode_micro.py`，复用卡锁、0/1/4/5 与 CPU 10/15/38/43，SSD 临时目录、编译缓存、诊断默认关闭和桥接接口前置检查。现有微基准收益不改记为端到端收益。
+
+2026-10-04：设备闭环（采样帧→双 Engram→下一次原生重放）／真实16层三轮设备中位差 1.012987 ms/token（1.012987、1.015639、0.879438）／`VLLM_HPU_DSV41_DEVICE_CLOSED_LOOP=0`。五输入 token、hidden、33 份可变状态逐位一致；计数为一次交接，不乘层数。证据 `decode-micro-resident-06`；相对含有界采样的父路径，端到端待批量验收，不与已含的采样/静态坐标收益重复相加。

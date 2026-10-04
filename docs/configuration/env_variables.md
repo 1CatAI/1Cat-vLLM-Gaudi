@@ -929,3 +929,5 @@ certificate drains and discards it before full sampling repair with the saved
 draw. Request termination drains queued work before scheduler state is reused.
 This candidate remains disabled until service trace and official-sampling
 end-to-end qualification pass. It does not change C2-C6 replay interfaces.
+
+`VLLM_HPU_DSV41_ORDERED_PEER_SUM` defaults to `0`. The experimental shared native peer consumer accumulates shards in fixed rank order in FP32, then rounds once to BF16. It requires the matching native operator library; it does not change the communication protocol. Keep disabled until the production producer/consumer chain passes numerical and device-time qualification.

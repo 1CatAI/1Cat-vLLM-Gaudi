@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import time
 
 
@@ -43,6 +44,30 @@ def main():
     if (hashlib.sha256(content).hexdigest() != manifest['binary_sha256']
             or b'configure_dependency_policy' not in content):
         raise RuntimeError('Resident candidates require the fingerprinted dependency-policy bridge before loading')
+    # A fixed execution snapshot permits offline development in the existing
+    # workspace while a resident plan is preparing or timing. This is an
+    # ordinary source copy, without a Git checkout or runtime code injection.
+    frozen = evidence / 'execution-source'
+    if frozen.exists():
+        raise RuntimeError('Execution snapshot already exists; preserve it and use a fresh measurement case')
+    frozen.mkdir()
+    for package in ('tools', 'vllm_gaudi'):
+        shutil.copytree(root / package, frozen / package,
+                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+    source_hashes = {str(path.relative_to(frozen)): hashlib.sha256(path.read_bytes()).hexdigest()
+                     for package in ('tools', 'vllm_gaudi') for path in (frozen / package).rglob('*.py')}
+    (evidence / 'execution-sources.json').write_text(json.dumps(source_hashes, indent=2)+'\n')
+    for request_path in (evidence / 'control').glob('*.request.json'):
+        request = json.loads(request_path.read_text())
+        if request.get('factory'):
+            factory = Path(request['factory']).resolve()
+            try:
+                relative = factory.relative_to(root)
+            except ValueError as error:
+                raise RuntimeError('Queued factory must belong to the maintained workspace') from error
+            request['factory'] = str(frozen / relative)
+            request['factory_sha256'] = source_hashes[str(relative)]
+            request_path.write_text(json.dumps(request, indent=2)+'\n')
     environment = dict(os.environ)
     environment.update(runtime['environment'])
     for key in ('PYTHONPATH', 'DUMP_POST_GRAPHS', 'GRAPH_VISUALIZATION', 'GRAPH_VISUALIZATION_DIR',
@@ -75,10 +100,11 @@ def main():
                '--ab-dense-config', str(args.dense_config.resolve())]
     os.sched_setaffinity(0, set(range(10, 20)) | set(range(38, 48)))
     with (evidence/'component.log').open('w') as log:
-        process = subprocess.Popen(command, cwd=root, env=environment, stdout=log, stderr=subprocess.STDOUT,
+        process = subprocess.Popen(command, cwd=frozen, env=environment, stdout=log, stderr=subprocess.STDOUT,
                                    start_new_session=True)
         (evidence/'process.json').write_text(json.dumps(dict(
             pid=process.pid, pgid=process.pid, command=command, started=time.time(), cards=load,
+            execution_source=str(frozen), maintained_workspace=str(root),
             cpu_pressure=Path('/proc/pressure/cpu').read_text(), environment=environment,
             protocol='same-process native ABABAB; three consistent device rounds; no IQR veto'), indent=2)+'\n')
         raise SystemExit(process.wait())

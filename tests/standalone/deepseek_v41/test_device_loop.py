@@ -164,3 +164,18 @@ def test_wider_input_keeps_shared_ordinary_transaction(monkeypatch, count):
     HpuDeepseekV41ForCausalLM.prepare_step(model, "r", list(range(count)), is_decode=True)
     assert model.step_ticket is ticket
     host.prepare.assert_called_once()
+
+
+def test_repair_guard_skips_only_unconsumed_candidate_workspace():
+    from vllm_gaudi.ops.deepseek_v41_device_loop import repair_candidate_pool_live
+
+    attention = SimpleNamespace(owns_index=True, layer=24, candidate_source=20, ratio=1, search_length=512)
+    program = SimpleNamespace(layers=[SimpleNamespace(attention=attention)])
+    assert not repair_candidate_pool_live(program)
+    attention.search_length = 1024
+    assert repair_candidate_pool_live(program)
+    attention.ratio = 2
+    assert not repair_candidate_pool_live(program)
+    attention.ratio = 0
+    assert repair_candidate_pool_live(program)
+    assert repair_candidate_pool_live(SimpleNamespace())

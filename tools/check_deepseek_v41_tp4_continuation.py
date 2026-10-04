@@ -562,6 +562,14 @@ def main():
                             queue_markers.append((index-warm_steps, name, bridge.verify_phase_marker()))
 
                 engine = decoder if engine is None else engine
+                if getattr(engine.program(), 'candidate_device_loop', False):
+                    from tools.deepseek_v41_device_chain import run_device_chain
+
+                    if trace is not None or forced_tokens is not None:
+                        raise ValueError('Closed-loop micro uses native A/B without a profiler or forced tokens')
+                    return run_device_chain(
+                        engine, host, seed_hidden, sampler, compiled_official, sampling_payloads, bridge,
+                        reset, context_tokens, steps, warm_steps, measure, report, observer=observer)
                 reset()
                 program = engine.program() if args.shared_stage_replay else stage
                 if getattr(program, 'benchmark_official_sampling', False):
@@ -573,6 +581,8 @@ def main():
                 output_tokens = []
                 device_start = torch.hpu.Event(enable_timing=True) if measure else None
                 device_end = torch.hpu.Event(enable_timing=True) if measure else None
+                step_events = [(torch.hpu.Event(enable_timing=True), torch.hpu.Event(enable_timing=True))
+                               for _ in range(steps)] if measure else ()
                 started = None
                 iteration_marks = []
                 delivery_marks = []
@@ -585,6 +595,8 @@ def main():
                         started = time.perf_counter_ns()
                         device_start.record()
                         iteration_marks.append(time.perf_counter_ns())
+                    if measure and index >= warm_steps:
+                        step_events[index-warm_steps][0].record()
                     if trace is not None and index >= warm_steps:
                         from vllm_gaudi.ops.deepseek_v41_native_trace import scope
                         context = scope(f'v41::real_selection_chain::step{index-warm_steps}::rank{rank}')
@@ -679,11 +691,24 @@ def main():
                         if args.trace_entry_phases or args.queue_marker_only:
                             mark('end', index)
                     if measure and index >= warm_steps:
+                        step_events[index-warm_steps][1].record()
                         iteration_marks.append(time.perf_counter_ns())
                 if measure:
                     device_end.record()
                 cpu, done = readback
                 done.synchronize()
+                final_payload = sampling_payloads.pop(engine, None)
+                if final_payload is not None:
+                    # Ordinary iterations consume their certificate at the
+                    # next entry. The final output has no next entry; decode
+                    # it here rather than returning the packed status as ID.
+                    if int(cpu[0, 0]) & 1:
+                        cpu = cpu // 2
+                    else:
+                        corrected = compiled_official(final_payload[1], final_payload[2])
+                        cpu = corrected.cpu()
+                        report['bounded_sampler_fallbacks'] = report.get('bounded_sampler_fallbacks', 0) + 1
+                    report['bounded_sampler_steps'] = report.get('bounded_sampler_steps', 0) + 1
                 if measure:
                     delivery_marks.append(time.perf_counter_ns())
                 output_tokens.append(int(cpu[0, 0]))
@@ -695,6 +720,7 @@ def main():
                         for start, stop in zip(iteration_marks[:-1], iteration_marks[1:], strict=True)]
                     report['candidate_final_drain_ms'] = (time.perf_counter_ns() - iteration_marks[-1]) / 1e6
                     report['token_delivery_ns'] = delivery_marks
+                    report['device_step_ms'] = [begin.elapsed_time(end) for begin, end in step_events]
                     return output_tokens, elapsed / steps, device_start.elapsed_time(device_end) / steps
                 torch.hpu.synchronize()
                 if queue_markers:
@@ -1107,6 +1133,8 @@ def main():
         raise
     finally:
         output.write_text(json.dumps(report, indent=2)+'\n')
+        from tools.deepseek_v41_device_chain import close_device_chains
+        close_device_chains()
         if args.state_reference_native_groups or args.speed_probe:
             from vllm_gaudi.ops.tp2_prepared_plan import shutdown_prepared_group_plans
             shutdown_prepared_group_plans()

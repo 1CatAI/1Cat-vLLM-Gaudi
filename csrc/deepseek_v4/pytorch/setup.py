@@ -82,6 +82,8 @@ setup(
                 "hpu_dsv41_engram_update_pt2.cpp",
                 "hpu_dsv41_rope_pt2.cpp",
                 "hpu_dsv41_prefix_layout_pt2.cpp",
+                "hpu_dsv41_decode_coordinates_pt2.cpp",
+                "hpu_dsv41_ordered_peer_sum_pt2.cpp",
                 "hpu_dsv41_control_gemv_pt2.cpp",
                 "hpu_dsv41_csa2_prep_pt2.cpp",
                 "hpu_dsv41_compressor_pair_pt2.cpp",

@@ -35,7 +35,8 @@ def test_physical_audit_cannot_overwrite_the_template_namespace(tmp_path):
 
 def periods(a, b, device_a=5., device_b=4.9):
     return [dict(arm=arm, token_intervals_ms=list(a if arm == 'A' else b),
-                 ranks=[dict(device_ms=device_a if arm == 'A' else device_b)]) for arm in 'ABABAB']
+                 ranks=[dict(device_ms=device_a if arm == 'A' else device_b,
+                             device_step_ms=[device_a if arm == 'A' else device_b] * 200)]) for arm in 'ABABAB']
 
 
 def test_three_device_rounds_without_host_iqr_veto():
@@ -56,10 +57,19 @@ def test_three_device_rounds_without_host_iqr_veto():
 
 def test_device_rounds_must_all_agree_and_use_slowest_rank():
     values = periods([5.] * 200, [4.] * 200)
-    values[-1]['ranks'].append(dict(device_ms=5.2))
+    values[-1]['ranks'].append(dict(device_ms=5.2, device_step_ms=[5.2] * 200))
     comparison = ab.compare_periods(values)
     assert not comparison['effective'] and not comparison['slower']
     assert comparison['round_savings_ms'] == pytest.approx([.1, .1, -.2])
+
+
+def test_component_event_samples_are_explicit_and_not_called_host_time():
+    values = periods([.012, .013] * 100, [.011, .012] * 100)
+    for period in values:
+        period.pop('ranks')
+    result = ab.compare_periods(values, device_events=True)
+    assert result['effective'] and result['saving_ms'] == pytest.approx(.001)
+    assert result['host_baseline'] is None and result['host_candidate'] is None
 
 
 def test_repartition_gate_rejects_equal_tokens_with_different_mutable_state():

@@ -14,11 +14,12 @@ def _native_input_precision_compatible(program):
     return not program.dspark and not (program.fp8_decode and not getattr(program, "expert_n256", False))
 
 
-def stage_collectives(tp_rank, native, tp_size=2, *, native_fp32_gather=False):
+def stage_collectives(tp_rank, native, tp_size=2, *, native_fp32_gather=False, ordered_peer_sum=None):
     from vllm.distributed import tensor_model_parallel_all_gather, tensor_model_parallel_all_reduce
     from vllm_gaudi import envs
 
     maximum = 64 * 5120 if envs.VLLM_HPU_DSV41_BATCH_DECODE else 32768
+    fused_peer_sum = envs.VLLM_HPU_DSV41_ORDERED_PEER_SUM if ordered_peer_sum is None else ordered_peer_sum
 
     def reduce(value, *, ready_outputs=()):
         if native and value.dtype == torch.bfloat16 and value.numel() <= maximum:
@@ -36,6 +37,10 @@ def stage_collectives(tp_rank, native, tp_size=2, *, native_fp32_gather=False):
                 else torch.ops.vllm_gaudi.tp_peer_allgather(flat, tp_size)
             )
             shards = shards.reshape(tp_size, flat.numel())
+            if fused_peer_sum and flat.numel() % 128 == 0:
+                from vllm_gaudi.ops.deepseek_v41_ordered_peer_sum import ordered_peer_sum
+
+                return ordered_peer_sum(shards).reshape(value.shape)
             reduced = shards[0].float()
             for rank in range(1, tp_size):
                 reduced = reduced + shards[rank].float()
@@ -272,7 +277,8 @@ class StageVariant(torch.nn.Module):
             engram,
             direct=self.direct_engram,
             device_layer1=self.device_engram,
-            device_layers=envs.VLLM_HPU_DSV41_DEVICE_CLOSED_LOOP and self.device_engram,
+            device_layers=getattr(program, 'device_closed_loop', envs.VLLM_HPU_DSV41_DEVICE_CLOSED_LOOP)
+            and self.device_engram,
             local_heads=24 // getattr(program, "tensor_parallel_size", 2),
         )
         self.states = stage_state_tensors(program)

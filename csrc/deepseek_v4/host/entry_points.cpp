@@ -50,6 +50,8 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVE
 #include "deepseek_v41_kv_pack_gaudi2.hpp"
 #include "deepseek_v41_rope_gaudi2.hpp"
 #include "deepseek_v41_prefix_layout_gaudi2.hpp"
+#include "deepseek_v41_decode_coordinates_gaudi2.hpp"
+#include "deepseek_v41_ordered_peer_sum_gaudi2.hpp"
 #include "deepseek_v41_swa_pack_gaudi2.hpp"
 #include "deepseek_v41_fp4_pack_gaudi2.hpp"
 #include "deepseek_v41_csa2_prep_gaudi2.hpp"
@@ -290,6 +292,8 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_SILU_QUANT_TILE,
     GAUDI2_KERNEL_DEEPSEEK_V41_SHARED_SILU_QUANT,
     GAUDI2_KERNEL_DEEPSEEK_V41_ENGRAM_UPDATE,
+    GAUDI2_KERNEL_DEEPSEEK_V41_DECODE_COORDINATES,
+    GAUDI2_KERNEL_DEEPSEEK_V41_ORDERED_PEER_SUM,
     KERNEL_COUNT
 };
 
@@ -819,6 +823,8 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
         DeepseekV41PrefixLayoutGaudi2 part(ratio);
         part.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_PREFIX_LAYOUT_R1 + ratio - 1].name);
     }
+    DeepseekV41OrderedPeerSumGaudi2().GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_ORDERED_PEER_SUM].name);
+    DeepseekV41DecodeCoordinatesGaudi2().GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_DECODE_COORDINATES].name);
     return stock(deviceId, &stock_count, guids + KERNEL_COUNT);
 }
 
@@ -826,6 +832,10 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     tpc_lib_api::HabanaKernelInstantiation* instance) {
     if (!params || !instance) return tpc_lib_api::GLUE_FAILED;
     char kernelName[tpc_lib_api::MAX_NODE_NAME];
+    if (std::strcmp(params->guid.name, DeepseekV41OrderedPeerSumGaudi2::name) == 0)
+        return DeepseekV41OrderedPeerSumGaudi2().GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name, DeepseekV41DecodeCoordinatesGaudi2::name) == 0)
+        return DeepseekV41DecodeCoordinatesGaudi2().GetGcDefinitions(params, instance);
     for (auto mode : {DeepseekV41DecodedKVGaudi2::SWA_WRITE,
                       DeepseekV41DecodedKVGaudi2::FP4_WRITE,
                       DeepseekV41DecodedKVGaudi2::ATTENTION,

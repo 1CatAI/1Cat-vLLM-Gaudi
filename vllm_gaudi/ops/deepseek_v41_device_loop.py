@@ -11,6 +11,31 @@ from dataclasses import dataclass
 import torch
 
 
+def repair_candidate_pool_live(program):
+    """Whether this decode geometry has a consumer of published block IDs.
+
+    The short-prefix branch in PagedCSA2Attention._select constructs ordered
+    row IDs directly in every owner. Its candidate workspace has no reader
+    and is not a persistent KV/history state. Keep the strict pool check for
+    any longer Reindex geometry, and conservatively for unknown programs.
+    """
+    layers = getattr(program, 'layers', None)
+    if layers is None:
+        return True
+    for block in layers:
+        attention = getattr(block, 'attention', None)
+        if attention is None:
+            return True
+        if not getattr(attention, 'owns_index', False):
+            continue
+        if attention.layer <= attention.candidate_source:
+            continue
+        ratio = getattr(attention, 'ratio', 0)
+        if not ratio or attention.search_length // ratio > 512:
+            return True
+    return False
+
+
 def bitwise_equal(left, right):
     """Compare rollback bytes, including unused floating cache rows.
 

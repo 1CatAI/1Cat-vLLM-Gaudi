@@ -94,13 +94,17 @@ def summarize(values):
                 mean_ms=statistics.mean(values), minimum_ms=min(values), maximum_ms=max(values))
 
 
-def compare_periods(periods):
+def compare_periods(periods, *, device_events=False):
     if [p['arm'] for p in periods] != ['A', 'B', 'A', 'B', 'A', 'B']:
         raise ValueError('The comparison order must be ABABAB')
     # Device events bracket the same native producer/consumer chain in each
     # arm. Host delivery distributions remain diagnostics, not a veto on a
     # device improvement. All three paired rounds must agree on direction.
-    medians = [max(row['device_ms'] for row in p['ranks']) for p in periods]
+    if device_events:
+        medians = [summarize(p['token_intervals_ms'])['median_ms'] for p in periods]
+    else:
+        medians = [summarize(max(values) for values in zip(
+            *(row['device_step_ms'] for row in p['ranks']), strict=True))['median_ms'] for p in periods]
     baseline_values, candidate_values = medians[::2], medians[1::2]
     savings = [a - b for a, b in zip(baseline_values, candidate_values, strict=True)]
     baseline = dict(median_ms=statistics.median(baseline_values), rounds_ms=baseline_values)
@@ -109,8 +113,10 @@ def compare_periods(periods):
                 saving_ms=statistics.median(savings), round_savings_ms=savings,
                 effective=all(value > 0 for value in savings), slower=all(value < 0 for value in savings),
                 period_medians_ms=medians, decision='three paired device rounds; no IQR threshold',
-                host_baseline=summarize(v for p in periods if p['arm'] == 'A' for v in p['token_intervals_ms']),
-                host_candidate=summarize(v for p in periods if p['arm'] == 'B' for v in p['token_intervals_ms']),
+                host_baseline=None if device_events else summarize(
+                    v for p in periods if p['arm'] == 'A' for v in p['token_intervals_ms']),
+                host_candidate=None if device_events else summarize(
+                    v for p in periods if p['arm'] == 'B' for v in p['token_intervals_ms']),
                 formal_gain_credit=False)
 
 
@@ -695,7 +701,7 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
                 local = dict(rank=rank, tokens=tokens, delivery_ns=report['token_delivery_ns'],
                              sampling_steps=report.get('bounded_sampler_steps', 0)-before_steps,
                              sampling_fallbacks=report.get('bounded_sampler_fallbacks', 0)-before_fallbacks,
-                             host_ms=host_ms, device_ms=device_ms,
+                             host_ms=host_ms, device_ms=device_ms, device_step_ms=report['device_step_ms'],
                              preparation_counts_before=counts, preparation_counts_after=after_counts,
                              checked_first_device_position=report.get('checked_first_device_position'))
                 ranks = [None] * dist.get_world_size()
