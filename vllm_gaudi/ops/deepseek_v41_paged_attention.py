@@ -1771,7 +1771,28 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             else:
                 qr = norm(query_input.contiguous(), self.weights.q_norm.weight, self.eps)
                 query = self.project_query(qr, positions, decode=decode)
-        if prefill:
+        decoded = (
+            self.decoded_kv_state
+            and self.ratio in (1, 2)
+            and self.search_length // self.ratio <= self.cache.decoded_main.shape[0]
+        )
+        fused_publish = (
+            decode and value.shape[0] == 1 and self.fused_norm and self.native_rope
+            and self.decoded_kv_state and self.shared.decoded_swa is not None
+            and self.ratio in (1, 2) and (decoded or self._uses_logical_mla(value, decoded))
+            and gaudi_envs.VLLM_HPU_DSV41_ATTN_FUSED_PROLOGUE
+        )
+        completion = None
+        if fused_publish:
+            kv, completion = torch.ops.custom_op.custom_deepseek_v41_kv_norm_rope_publish_gaudi2(
+                kv_input.contiguous(), self.weights.kv_norm.weight,
+                positions.to(torch.int32).contiguous(), self._rotary_native_table(),
+                self.swa, self.shared.decoded_swa, self.eps,
+                self.decoded_swa_offset if decoded else -1)
+            # The emitted logical position is also the cache-consumer edge.
+            # Alias-only writes do not order a packed gather in Synapse.
+            positions = completion[:1]
+        elif prefill:
             with prefill_event_span("attention_kv_norm_rope", self.layer, value.shape[0]):
                 kv = self.project_kv(kv_input, positions, decode=decode)
         else:
@@ -1779,26 +1800,13 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         if not decode and value.shape[0] > NATIVE_WORK_TOKENS:
             del query_input, kv_input
             return self._prefill_attention(value, qr, query, kv, positions, ready_outputs, prefill_sequence)
-        decoded = (
-            self.decoded_kv_state
-            and self.ratio in (1, 2)
-            and self.search_length // self.ratio <= self.cache.decoded_main.shape[0]
-        )
-        completion = None
-        if decoded and value.shape[0] == 1:
-            # The native writer maps this logical position into the shared
-            # 256-row circular namespace for both packed and decoded state.
-            # Keeping the modulo inside that existing TPC pass avoids one
-            # generic div/mod launch in every decoded Attention layer.
+        if fused_publish:
+            pass  # Canonical packed state and any active mirror were published together.
+        elif decoded and value.shape[0] == 1:
             logical_position = positions.to(torch.int32).contiguous()
             completion = torch.ops.custom_op.custom_deepseek_v41_swa_paged_decoded_write_bf16_gaudi2(
-                self.swa,
-                kv.contiguous(),
-                logical_position,
-                logical_position,
-                self.shared.decoded_swa,
-                self.decoded_swa_offset,
-            )
+                self.swa, kv.contiguous(), logical_position, logical_position,
+                self.shared.decoded_swa, self.decoded_swa_offset)
         else:
             packed_swa = pack_swa(kv)
             ring_rows = positions.remainder(SWA_ROWS).long() if metadata is None else metadata[0]

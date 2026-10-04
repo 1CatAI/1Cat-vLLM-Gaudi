@@ -77,6 +77,7 @@ setup(
                 "hpu_dsv41_mhc_post_collapse_f32_pt2.cpp",
                 "hpu_dsv41_kv_pack_pt2.cpp",
                 "hpu_dsv41_kv_norm_rope_pt2.cpp",
+                "hpu_dsv41_kv_norm_rope_publish_pt2.cpp",
                 "hpu_dsv41_ffn_norm_quant_pt2.cpp",
                 "hpu_dsv41_attention_norm_quant_pt2.cpp",
                 "hpu_dsv41_engram_update_pt2.cpp",

@@ -937,3 +937,5 @@ end-to-end qualification pass. It does not change C2-C6 replay interfaces.
 Ordinary V4.1 native replay with one pipeline stage now defaults to device sampling, device positions, device input feedback, the device closed loop, and static coordinates. These defaults require the V2 runner and native graph/input replay. Explicit zero overrides remain supported. Pipeline stages retain their existing token ownership; unqualified ordered peer reduction stays disabled.
 
 `VLLM_HPU_DSV41_EXPERT_TOKEN_WIDE` defaults to `0`. It reuses the shared route-N SAT decoder and MME consumer for C1–C6 decode with checkpoint-qualified scale planes. Prefill remains on its existing path. Promotion requires reduced compiled physical node counts and a production-shaped native-replay microbenchmark; this candidate has no formal serving result yet.
+
+`VLLM_HPU_DSV41_ATTN_FUSED_PROLOGUE` defaults to `0`. A handwritten decode TPC kernel normalizes/rotates KV, writes its canonical SWA ring and optionally publishes the existing decoded mirror. The mirror policy and prefill path remain unchanged. This candidate awaits physical-node, numerical state and native-replay qualification.

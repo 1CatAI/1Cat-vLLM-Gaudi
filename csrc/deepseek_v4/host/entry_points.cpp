@@ -74,6 +74,7 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVE
 #include "deepseek_v41_prefill_topk_gaudi2.hpp"
 #include "deepseek_v41_qnorm_quant_gaudi2.hpp"
 #include "deepseek_v41_kv_norm_rope_gaudi2.hpp"
+#include "deepseek_v41_kv_norm_rope_publish_gaudi2.hpp"
 #include "deepseek_v41_attention_norm_gaudi2.hpp"
 #include "deepseek_v41_final_collapse_norm_gaudi2.hpp"
 #include "deepseek_v41_mhc_gates_gaudi2.hpp"
@@ -256,6 +257,7 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_N256_SAT_SLOTS6,
     GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE6_SAT,
     GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE_SAT,
+    GAUDI2_KERNEL_DEEPSEEK_V41_KV_NORM_ROPE_PUBLISH,
     GAUDI2_KERNEL_DEEPSEEK_V41_N256_FP8,
     GAUDI2_KERNEL_DEEPSEEK_V41_N256_SLOTS_FP8,
     GAUDI2_KERNEL_DEEPSEEK_V41_N256_REUSE_FP8,
@@ -509,6 +511,7 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MLA_SHARED_KV].name, DeepseekV41MlaGaudi2::shared_name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MLA_EXP_BF16].name, DeepseekV41MlaGaudi2::exp_name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MLA_NORMALIZE].name, DeepseekV41MlaNormalizeGaudi2::name);
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_KV_NORM_ROPE_PUBLISH].name, DeepseekV41KVNormRopePublishGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE6_SAT].name, DeepseekV41ExpertTokenWideGaudi2::six_name);
     DeepseekV41ExpertN256Gaudi2(DeepseekV41ExpertN256Gaudi2::FP8SatSlots6).GetKernelName(
         guids[GAUDI2_KERNEL_DEEPSEEK_V41_N256_SAT_SLOTS6].name);
@@ -1034,6 +1037,8 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     vectorScales.GetKernelName(kernelName);
     if (std::strcmp(params->guid.name, kernelName) == 0)
         return vectorScales.GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name, DeepseekV41KVNormRopePublishGaudi2::name) == 0)
+        return DeepseekV41KVNormRopePublishGaudi2().GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41ExpertTokenWideGaudi2::six_name) == 0)
         return DeepseekV41ExpertTokenWideGaudi2(6).GetGcDefinitions(params, instance);
     auto sixSlots = DeepseekV41ExpertN256Gaudi2(DeepseekV41ExpertN256Gaudi2::FP8SatSlots6);

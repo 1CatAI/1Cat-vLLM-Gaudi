@@ -38,6 +38,9 @@ static inline void swa_pack_number(float64 number, tensor output, int group,
     uint256 wide = {0};
     wide.v1 = as_uint64(code) | ((as_uint64(number) >> 24) & 128);
 #ifdef DSV41_DECODED_KV_WRITE
+#ifdef DSV41_OPTIONAL_DECODED_KV_WRITE
+    if (decoded_row >= 0) {
+#endif
     float128 decoded_value = {0};
     decoded_value.v1 = e4m3fn(wide.v1) * ue8m0(as_uint64(scale_code));
     const bfloat128 decoded_bf16 = convert_float128_to_bfloat128(
@@ -45,6 +48,9 @@ static inline void swa_pack_number(float64 number, tensor output, int group,
     v_bf16_st_tnsr_partial(
         (int5){32 * group, decoded_row, 0, 0, 0}, decoded,
         decoded_bf16, 31, 0);
+#ifdef DSV41_OPTIONAL_DECODED_KV_WRITE
+    }
+#endif
 #endif
     const uchar256 encoded = convert_uint256_to_uchar256(wide, SW_LINEAR);
     v_u8_st_tnsr_partial((int5){32 * group, output_row, 0, 0, 0}, output, encoded, 31, 0);
