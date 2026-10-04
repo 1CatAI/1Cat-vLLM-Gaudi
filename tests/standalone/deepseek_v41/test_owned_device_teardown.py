@@ -28,3 +28,47 @@ def test_timeout_leaves_busy_allocations_untouched(monkeypatch, tmp_path):
     monkeypatch.setattr(devices.subprocess, 'check_output', lambda *a, **k: '0, 89000 MiB, 0 %\n')
     with pytest.raises(RuntimeError, match='ownership must be checked'):
         devices.wait_for_released_modules((0,), tmp_path/'release.json', timeout_s=0)
+
+
+def test_selects_other_free_cards_without_a_lease(monkeypatch, tmp_path):
+    load = ''.join(f'{module}, {90000 if module in (0, 1, 4, 5) else 768} MiB, 0 %\n' for module in range(8))
+    monkeypatch.setattr(devices.subprocess, 'check_output', lambda *a, **k: load)
+    selected, actual = devices.wait_for_free_modules(tmp_path/'availability.json', owners=lambda _: [])
+    assert selected == (2, 3, 6, 7)
+    assert actual == load
+
+
+def test_open_worker_is_not_free_even_before_hbm_allocation(monkeypatch, tmp_path):
+    monkeypatch.setattr(devices.subprocess, 'check_output', lambda *a, **k: '0, 768 MiB, 0 %\n')
+    samples = iter([[99], []])
+    monkeypatch.setattr(devices.time, 'sleep', lambda _: None)
+    record = tmp_path/'availability.json'
+    selected, _ = devices.wait_for_free_modules(record, count=1, owners=lambda _: next(samples))
+    assert selected == (0,)
+    assert [row['free'] for row in json.loads(record.read_text())] == [[], [0]]
+
+
+def test_explicit_mapping_does_not_use_busy_or_duplicate_cards(monkeypatch, tmp_path):
+    monkeypatch.setattr(devices.subprocess, 'check_output', lambda *a, **k: '0, 768 MiB, 0 %\n1, 89000 MiB, 0 %\n')
+    with pytest.raises(RuntimeError, match='Not enough free modules'):
+        devices.wait_for_free_modules(tmp_path/'availability.json', count=1, modules=(1,), timeout_s=0,
+                                      owners=lambda _: [])
+    with pytest.raises(ValueError, match='distinct'):
+        devices.wait_for_free_modules(tmp_path/'availability.json', count=2, modules=(0, 0), owners=lambda _: [])
+
+
+def test_maps_compute_handle_to_physical_module(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    module = tmp_path/'sysfs/accel0/device/module_id'
+    module.parent.mkdir(parents=True)
+    module.write_text('2\n')
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout='123 456', stderr='')
+
+    monkeypatch.setattr(devices.subprocess, 'run', run)
+    assert devices.device_owners(2, sysfs=tmp_path/'sysfs', device_root=tmp_path/'devices') == [123, 456]
+    assert calls == [['fuser', str(tmp_path/'devices/accel0')]]
