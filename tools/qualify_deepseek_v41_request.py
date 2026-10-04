@@ -58,6 +58,8 @@ def main():
     parser.add_argument("--url", default="http://127.0.0.1:18444")
     parser.add_argument("--api-key-file", type=Path, help="Authenticate without putting a key on the command line")
     parser.add_argument("--profile", choices=("prefill", "decode"))
+    parser.add_argument("--profile-start-before-request", action="store_true",
+                        help="Initialize decode capture while idle; includes prefill in the raw capture")
     parser.add_argument("--decode-trace-tokens", type=int, default=128)
     parser.add_argument("--decode-trace-skip-tokens", type=int, default=0,
                         help="Let initial decode compilation finish before opening the requested capture")
@@ -66,6 +68,8 @@ def main():
     parser.add_argument("--prefill-only", action="store_true",
                         help="Measure a max_tokens=1 request; does not qualify natural EOS or semantics")
     args = parser.parse_args()
+    if args.profile_start_before_request and args.profile != "decode":
+        parser.error("--profile-start-before-request requires --profile decode")
     body = json.loads(args.request.read_text())
     if args.prefill_only and (body.get("max_tokens") != 1 or args.profile == "decode"):
         raise ValueError("Prefill-only timing requires max_tokens=1 and excludes decode capture")
@@ -95,7 +99,7 @@ def main():
         return histogram_values(response.text)
 
     before = metrics("before")
-    if args.profile == "prefill":
+    if args.profile == "prefill" or args.profile_start_before_request:
         profile("start")
     report = {"started_at": datetime.now(timezone.utc).isoformat(), "status": "running",
               "qualification": "prefill_only" if args.prefill_only else "natural_eos",
@@ -104,6 +108,7 @@ def main():
               "stream_chunk_size": 65536,
               "decode_trace_skip_tokens": args.decode_trace_skip_tokens,
               "decode_trace_tokens": args.decode_trace_tokens,
+              "profile_start_before_request": args.profile_start_before_request,
               "timer": "engine histograms are scheduling-to-first-token and first-to-last-token; SSE is client arrival"}
     events, ids, content, reasoning, usage = [], [], [], [], None
     returned_prompt = None
@@ -112,7 +117,7 @@ def main():
     pending = None
     jobs = []
     stop_submitted = False
-    start_submitted = args.profile == "prefill"
+    start_submitted = args.profile == "prefill" or args.profile_start_before_request
     start_ns, started = time.time_ns(), time.perf_counter()
     report["request_start_ns"] = start_ns
     (args.output / "result.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")

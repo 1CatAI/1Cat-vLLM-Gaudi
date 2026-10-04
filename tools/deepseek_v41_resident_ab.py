@@ -614,6 +614,15 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
                 continue
             reference_name = job.get('baseline', 'baseline')
             reference = arm(reference_name)
+            baseline_factory_record = None
+            if job.get('baseline_factory'):
+                baseline_factory, baseline_factory_record = load_candidate_factory(
+                    job['baseline_factory'], job['baseline_factory_sha256'])
+                parent_name = reference_name
+                reference_name = 'factory_' + baseline_factory_record['sha256']
+                reference = arm(reference_name, baseline_factory, parent_name)
+                baseline_factory_record['shared_sources'] = getattr(
+                    reference.program(), 'candidate_shared_sources', [])
             factory_record = None
             if name == 'factory':
                 factory, factory_record = load_candidate_factory(job['factory'], job['factory_sha256'])
@@ -684,13 +693,14 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
             periods = []
             invalid_period = False
             for label in ('A', 'B', 'A', 'B', 'A', 'B'):
-                if factory_record is not None and hashlib.sha256(
-                        Path(factory_record['path']).read_bytes()).hexdigest() != factory_record['sha256']:
-                    raise RuntimeError('Candidate factory changed during qualification')
-                if factory_record is not None and any(
-                        hashlib.sha256(Path(row['path']).read_bytes()).hexdigest() != row['sha256']
-                        for row in factory_record['shared_sources']):
-                    raise RuntimeError('Shared candidate implementation changed during qualification')
+                for record in (baseline_factory_record, factory_record):
+                    if record is None:
+                        continue
+                    if hashlib.sha256(Path(record['path']).read_bytes()).hexdigest() != record['sha256']:
+                        raise RuntimeError('Arm factory changed during qualification')
+                    if any(hashlib.sha256(Path(row['path']).read_bytes()).hexdigest() != row['sha256']
+                           for row in record['shared_sources']):
+                        raise RuntimeError('Shared arm implementation changed during qualification')
                 wait_for_loading(directory, rank, dist)
                 dist.barrier()
                 before_steps = report.get('bounded_sampler_steps', 0)
@@ -734,6 +744,7 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
                               elapsed_s=time.monotonic()-begun, graphs=infos, comparison=compare_periods(periods),
                               numerical_gate=numerical_gate,
                               candidate_factory=factory_record,
+                              baseline_factory=baseline_factory_record,
                               context_tokens=args.context_tokens,
                               checked_first_device_positions=[row['checked_first_device_position'] for row in ranks],
                               no_profiler=True, no_hot_compilation=True, four_rank_tokens_equal=True,

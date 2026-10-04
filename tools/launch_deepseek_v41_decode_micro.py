@@ -10,6 +10,8 @@ import subprocess
 import shutil
 import time
 
+from deepseek_v41_owned_devices import wait_for_released_modules
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -31,12 +33,7 @@ def main():
         if os.fstat(fd).st_ino != path.stat().st_ino:
             raise RuntimeError('Inherited module reservation changed')
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    load = subprocess.check_output(
-        ['hl-smi', '-Q', 'module_id,memory.used,utilization.aip', '-f', 'csv,noheader'], text=True)
-    for module in (0, 1, 4, 5):
-        row = next(line for line in load.splitlines() if line.startswith(f'{module},'))
-        if '768 MiB' not in row or '0 %' not in row:
-            raise RuntimeError(f'Owned module is not free: {row}')
+    load = wait_for_released_modules((0, 1, 4, 5), evidence/'device-release.json')
     runtime = json.loads(args.runtime_profile.read_text())
     binary = Path(runtime['environment']['VLLM_HPU_TP2_FUSED_AR_NORM_BRIDGE'])
     manifest = json.loads(binary.with_suffix('.abi.json').read_text())
@@ -59,15 +56,17 @@ def main():
     (evidence / 'execution-sources.json').write_text(json.dumps(source_hashes, indent=2)+'\n')
     for request_path in (evidence / 'control').glob('*.request.json'):
         request = json.loads(request_path.read_text())
-        if request.get('factory'):
-            factory = Path(request['factory']).resolve()
+        for key in ('factory', 'baseline_factory'):
+            if not request.get(key):
+                continue
+            factory = Path(request[key]).resolve()
             try:
                 relative = factory.relative_to(root)
             except ValueError as error:
                 raise RuntimeError('Queued factory must belong to the maintained workspace') from error
-            request['factory'] = str(frozen / relative)
-            request['factory_sha256'] = source_hashes[str(relative)]
-            request_path.write_text(json.dumps(request, indent=2)+'\n')
+            request[key] = str(frozen / relative)
+            request[key+'_sha256'] = source_hashes[str(relative)]
+        request_path.write_text(json.dumps(request, indent=2)+'\n')
     environment = dict(os.environ)
     environment.update(runtime['environment'])
     for key in ('PYTHONPATH', 'DUMP_POST_GRAPHS', 'GRAPH_VISUALIZATION', 'GRAPH_VISUALIZATION_DIR',
