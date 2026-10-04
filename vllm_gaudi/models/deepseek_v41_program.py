@@ -319,6 +319,7 @@ class PreparedMoE(nn.Module):
         # Feature-tiled activation/quantization increased complete-chain latency.
         self.feature_silu = False
         self.all_route_slots = False
+        self.token_wide_experts = gaudi_envs.VLLM_HPU_DSV41_EXPERT_TOKEN_WIDE
         self.router_bf16_gate = gaudi_envs.VLLM_HPU_DSV41_BF16_ROUTER_GATE
         self.shared_gate_up = gaudi_envs.VLLM_HPU_DSV41_SHARED_GATE_UP
         self.register_buffer("shared_gate_up_weight", None, False)
@@ -533,6 +534,18 @@ class PreparedMoE(nn.Module):
                 if not use_fused:
                     raise ValueError("Prequantized N256 input requires the fused expert body")
                 quantized, activation_scale = tile_prequant
+                if self.token_wide_experts and (decode or ordinary_decode) and 1 <= tile_value.shape[0] <= 6:
+                    if not (getattr(experts.w13_q16, "dsv41_sat_eligible", False)
+                            and getattr(experts.w2_q16, "dsv41_sat_eligible", False)):
+                        raise ValueError("Token-wide SAT requires checkpoint-qualified scale planes")
+                    if not hasattr(torch.ops.custom_op, "custom_deepseek_v41_expert_n256_moe_token_wide_sat_fp8_gaudi2"):
+                        raise RuntimeError("Token-wide SAT native operator is unavailable")
+                    if tile_shared is not None:
+                        return torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_token_wide_sat_shared_fp8_gaudi2(
+                            *operands, channel13, channel2, quantized, activation_scale, tile_shared, True)
+                    routed = torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_token_wide_sat_fp8_gaudi2(
+                        *operands, channel13, channel2, quantized, activation_scale, True)
+                    return routed if tile_shared is None else (routed.float() + tile_shared.float()).bfloat16()
                 if getattr(self, "all_route_slots", False) and (decode or ordinary_decode) and tile_value.shape[0] == 1:
                     if not self.n256_fused_reduce:
                         raise ValueError("All-route decode requires ordered direct finalization")

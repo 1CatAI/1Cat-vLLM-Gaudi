@@ -34,6 +34,7 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVE
 #include "deepseek_v41_index_tile_reduce_gaudi2.hpp"
 #include "deepseek_v41_quant_roundtrip_gaudi2.hpp"
 #include "deepseek_v41_expert_n256_gaudi2.hpp"
+#include "deepseek_v41_expert_token_wide_gaudi2.hpp"
 #include "deepseek_v41_silu_tile_gaudi2.hpp"
 #include "deepseek_v41_prefill_permuted_gaudi2.hpp"
 #include "deepseek_v41_dynamic_quant_bf16_gaudi2.hpp"
@@ -251,6 +252,10 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_PREFILL_ROPE_INVERSE,
     GAUDI2_KERNEL_DEEPSEEK_V41_PREFIX_LAYOUT_R1,
     GAUDI2_KERNEL_DEEPSEEK_V41_PREFIX_LAYOUT_R2,
+    GAUDI2_KERNEL_DEEPSEEK_V41_N256_SAT_FP8,
+    GAUDI2_KERNEL_DEEPSEEK_V41_N256_SAT_SLOTS6,
+    GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE6_SAT,
+    GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE_SAT,
     GAUDI2_KERNEL_DEEPSEEK_V41_N256_FP8,
     GAUDI2_KERNEL_DEEPSEEK_V41_N256_SLOTS_FP8,
     GAUDI2_KERNEL_DEEPSEEK_V41_N256_REUSE_FP8,
@@ -262,6 +267,7 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_N256_SCALE,
     GAUDI2_KERNEL_DEEPSEEK_V41_N256_SILU_QUANT,
     GAUDI2_KERNEL_DEEPSEEK_V41_N256_SCALE_REDUCE,
+    GAUDI2_KERNEL_DEEPSEEK_V41_EXPERT_SCALE_SHARED,
     GAUDI2_KERNEL_DEEPSEEK_V41_DYNAMIC_QUANT,
     GAUDI2_KERNEL_DEEPSEEK_V41_FFN_NORM_QUANT,
     GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_MLA_GATHER,
@@ -503,6 +509,14 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MLA_SHARED_KV].name, DeepseekV41MlaGaudi2::shared_name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MLA_EXP_BF16].name, DeepseekV41MlaGaudi2::exp_name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MLA_NORMALIZE].name, DeepseekV41MlaNormalizeGaudi2::name);
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE6_SAT].name, DeepseekV41ExpertTokenWideGaudi2::six_name);
+    DeepseekV41ExpertN256Gaudi2(DeepseekV41ExpertN256Gaudi2::FP8SatSlots6).GetKernelName(
+        guids[GAUDI2_KERNEL_DEEPSEEK_V41_N256_SAT_SLOTS6].name);
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE_SAT].name, DeepseekV41ExpertTokenWideGaudi2::name);
+    DeepseekV41ExpertN256Gaudi2(DeepseekV41ExpertN256Gaudi2::FP8Sat).GetKernelName(
+        guids[GAUDI2_KERNEL_DEEPSEEK_V41_N256_SAT_FP8].name);
+    DeepseekV41ExpertN256Gaudi2(DeepseekV41ExpertN256Gaudi2::ScaleReduceShared).GetKernelName(
+        guids[GAUDI2_KERNEL_DEEPSEEK_V41_EXPERT_SCALE_SHARED].name);
     DeepseekV41ExpertN256Gaudi2(DeepseekV41ExpertN256Gaudi2::FP8).GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_N256_FP8].name);
     DeepseekV41ExpertN256Gaudi2(DeepseekV41ExpertN256Gaudi2::FP8Slots).GetKernelName(
         guids[GAUDI2_KERNEL_DEEPSEEK_V41_N256_SLOTS_FP8].name);
@@ -1020,6 +1034,22 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     vectorScales.GetKernelName(kernelName);
     if (std::strcmp(params->guid.name, kernelName) == 0)
         return vectorScales.GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name, DeepseekV41ExpertTokenWideGaudi2::six_name) == 0)
+        return DeepseekV41ExpertTokenWideGaudi2(6).GetGcDefinitions(params, instance);
+    auto sixSlots = DeepseekV41ExpertN256Gaudi2(DeepseekV41ExpertN256Gaudi2::FP8SatSlots6);
+    sixSlots.GetKernelName(kernelName);
+    if (std::strcmp(params->guid.name, kernelName) == 0)
+        return sixSlots.GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name, DeepseekV41ExpertTokenWideGaudi2::name) == 0)
+        return DeepseekV41ExpertTokenWideGaudi2().GetGcDefinitions(params, instance);
+    auto sat = DeepseekV41ExpertN256Gaudi2(DeepseekV41ExpertN256Gaudi2::FP8Sat);
+    sat.GetKernelName(kernelName);
+    if (std::strcmp(params->guid.name, kernelName) == 0)
+        return sat.GetGcDefinitions(params, instance);
+    auto sharedScale = DeepseekV41ExpertN256Gaudi2(DeepseekV41ExpertN256Gaudi2::ScaleReduceShared);
+    sharedScale.GetKernelName(kernelName);
+    if (std::strcmp(params->guid.name, kernelName) == 0)
+        return sharedScale.GetGcDefinitions(params, instance);
     auto mainFast0 = DeepseekV41ExpertN256Gaudi2(DeepseekV41ExpertN256Gaudi2::FP8, true);
     mainFast0.GetKernelName(kernelName);
     if (std::strcmp(params->guid.name, kernelName) == 0)

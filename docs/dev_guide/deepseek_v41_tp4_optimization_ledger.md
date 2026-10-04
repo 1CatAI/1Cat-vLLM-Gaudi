@@ -767,3 +767,5 @@ Own retiredgraphs were losslessly archived withtarcompare/SHA256 before removing
 2026-10-04 资源规则更新：按最新用户指令，不持有显卡锁。启动器检查 HBM、设备利用率及打开的计算设备句柄；优先空闲的 0/1/4/5，否则选其他空闲四卡，不足则等待。记录实际映射；可用 `--modules` 固定某组卡。08 的锁包装进程已结束，原测量进程保留，不影响其他会话。资源调整本身不计收益。
 
 2026-10-04 待整体验收：peer 求和→mHC post/collapse 融合／原生短链每 Attention 边界节省 **0.008950 ms**（三轮0.008950、0.012500、0.005773）／`VLLM_HPU_DSV41_PEER_POST_COLLAPSE=0`。父正式基线9.997343 ms。生产形状与真实 checkpoint 权重、5个 checkpoint embedding 派生输入，投影→四卡交换→mHC→FFN norm/量化全部逐位一致，无热编译。同进程 ABABAB200，取四卡最慢每步设备中位数。原计时完成后的退出异常已修复，另做无计时的资源退出检查，原测量保留。仅按40个 Attention 边界预估 **0.358000 ms/token**；MoE边界未验证不加算，实际 Attention 激活与real16状态接入仍待验证，未跑端到端，不称为正式收益。证据 `decode-peer-post-collapse-01/OUTCOME.json`。当前兼容微基准候选预估余额0.358000 ms；累计不足1ms，暂不重启正式服务。
+
+2026-10-04 最新任务调整：优先手写多输入、多输出 TPC 融合，按 MoE → Attention/CSA2 → mHC → 非通信段合并推进。每项同时验收编译后物理节点数和生产形状原生微基准；三模块累加后一次官方16K→EOS及trace。预期不足0.3ms/token的零碎候选暂停。有序peer/post候选保留历史0.358ms预估及证据，但从当前待验收队列移出，开关保持0；当前这批有效待验收余额为0ms。正式基线仍为9.997343ms，7ms目标未完成。

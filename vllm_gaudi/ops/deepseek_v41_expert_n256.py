@@ -62,6 +62,32 @@ def run_fused_decode(value, ids, routing, q13, q2, s13, s2, lookup, channel13, c
     return _compiled_fused_decode(signature)(*arguments)
 
 
+def saturated_decode_eligible(planes, *, active_k=None):
+    """Reuse the SAT offset gate for full and compact N256 scale planes.
+
+    A caller may exclude a padded K suffix only after proving its FP4 codes
+    are zero. Runtime SAT maps both FP8 zero encodings to positive zero.
+    """
+    if planes.dtype != np.dtype("<i2") or planes.ndim not in (2, 3):
+        raise ValueError("Expected N256 I16 scale planes")
+    words = planes.shape[-1]
+    if words % 512 == 128:
+        groups = (words - 128) // 128
+        values = planes.view(np.uint8).reshape(-1, groups + 1, 256)
+        offsets = (values[:, :-1].astype(np.int16) - values[:, -1:, :].astype(np.int16)) * 8
+    elif words % 1024 == 0:
+        groups = words // 256
+        offsets = planes.view(np.uint8).reshape(-1, groups, 512)[:, :, 256:].view(np.int8)
+    else:
+        raise ValueError("Expected complete K128 full or compact planes")
+    if active_k is not None:
+        if active_k <= 0 or active_k % 32 or active_k > groups * 32:
+            raise ValueError("Invalid active K prefix")
+        offsets = offsets[:, :active_k // 32]
+    return bool(np.all((offsets >= -40) & (offsets <= 48) & ((offsets & 7) == 0)))
+
+
+
 def prepare_expert(q16, s16, *, compact_scales=False):
     """Prepare one expert; preserve its original nibble and scale encodings."""
     if np.any(s16 & 127):
@@ -152,6 +178,10 @@ def load_projection(shard, prefix, device):
     # The staging allocation is at most 128 MiB, plus one bounded expert scan.
     per_expert = (q[0].numel() + p[0].numel() + channel[0].numel()) * 2
     batch = min(16, max(1, 128 * 2**20 // per_expert))
+    import json
+    config = json.loads((shard.directory / "config.json").read_text())["text_config"]
+    active_k = config["moe_intermediate_size"] // shard.tensor_parallel_size if prefix.endswith(".w2") else stream // 32
+    sat_eligible = True
     for first in range(0, experts, batch):
         last = min(first + batch, experts)
         cpu_q = np.empty((last - first, *q.shape[1:]), dtype="<i2")
@@ -162,6 +192,8 @@ def load_projection(shard, prefix, device):
             new_q, new_p, new_c, _ = prepare_expert(
                 read_expert(source_q, expert), read_expert(source_s, expert), compact_scales=compact_scales
             )
+            sat_eligible &= not np.any(new_q[:, active_k * 64:])
+            sat_eligible &= saturated_decode_eligible(new_p, active_k=active_k)
             cpu_q[expert - first] = new_q
             cpu_p[expert - first] = new_p
             cpu_c[expert - first] = new_c
@@ -169,4 +201,5 @@ def load_projection(shard, prefix, device):
         p[first:last].copy_(torch.from_numpy(cpu_p))
         channel[first:last].copy_(torch.from_numpy(cpu_c.view("<i2")).view(torch.bfloat16))
     shard.check_identity()
+    q.dsv41_sat_eligible = bool(sat_eligible)
     return q, p, channel

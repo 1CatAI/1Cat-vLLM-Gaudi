@@ -1,8 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
+#ifndef DSV41_SHARED_FINALIZE
+#define DSV41_SHARED_FINALIZE 0
+#endif
 // Scale the six W2 FP32 rows, preserve each row's BF16 boundary, and reduce
 // them in routing order without materializing the six-row BF16 tensor.
 void main(tensor product, tensor ids, tensor activation_scale, tensor channel,
-          tensor output)
+          tensor output
+#if DSV41_SHARED_FINALIZE
+          , tensor shared
+#endif
+)
 {
     const int5 start = get_index_space_offset();
     const int5 end = start + get_index_space_size();
@@ -42,8 +49,16 @@ void main(tensor product, tensor ids, tensor activation_scale, tensor channel,
             accumulated.v1 += value.v1;
             accumulated.v2 += value.v2;
         }
-        v_bf16_st_tnsr((int5){n, 0, token}, output,
-            v_convert_f32_to_bf16_all_b(accumulated, SW_RHNE));
+        const bfloat128 routed = v_convert_f32_to_bf16_all_b(accumulated, SW_RHNE);
+#if DSV41_SHARED_FINALIZE
+        float128 value = v_convert_bf16_to_f32_all_b(routed);
+        const float128 shared_value = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_b((int5){n, token}, shared));
+        value.v1 += shared_value.v1;
+        value.v2 += shared_value.v2;
+        v_bf16_st_tnsr((int5){n, 0, token}, output, v_convert_f32_to_bf16_all_b(value, SW_RHNE));
+#else
+        v_bf16_st_tnsr((int5){n, 0, token}, output, routed);
+#endif
     }
     }
 }

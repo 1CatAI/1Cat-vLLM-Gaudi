@@ -67,6 +67,8 @@ class N256PreparedShard:
         if relative.is_absolute() or ".." in relative.parts:
             raise ValueError("Unsafe prepared N256 path")
         self.path = directory / relative
+        config = json.loads((shard.directory / "config.json").read_text())["text_config"]
+        self.logical_intermediate = config["moe_intermediate_size"] // shard.tensor_parallel_size
         stat = self.path.stat()
         if stat.st_size != record["bytes"]:
             raise ValueError("Prepared N256 file is truncated")
@@ -96,6 +98,7 @@ class N256PreparedShard:
         import torch
 
         result = []
+        sat_eligible = True
         self.check_identity()
         for suffix in ("_q16", "_s16", "_fp8_channel"):
             source = self.catalog[prefix + suffix]
@@ -111,7 +114,14 @@ class N256PreparedShard:
                     if stream.readinto(data) != len(data):
                         raise RuntimeError("Prepared N256 weight read was truncated")
                     value = torch.frombuffer(data, dtype=dtype).reshape(stop - first, *source.shape[1:])
+                    if suffix == "_q16" and prefix.endswith(".w2"):
+                        sat_eligible &= not value[:, :, self.logical_intermediate * 64:].count_nonzero().item()
+                    if suffix == "_s16":
+                        from vllm_gaudi.ops.deepseek_v41_expert_n256 import saturated_decode_eligible
+                        active_k = self.logical_intermediate if prefix.endswith(".w2") else None
+                        sat_eligible &= saturated_decode_eligible(value.numpy(), active_k=active_k)
                     destination[first:stop].copy_(value, non_blocking=False)
             result.append(destination)
         self.check_identity()
+        result[0].dsv41_sat_eligible = bool(sat_eligible)
         return tuple(result)

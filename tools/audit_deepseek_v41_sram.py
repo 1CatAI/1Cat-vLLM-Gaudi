@@ -27,7 +27,11 @@ def audit(path):
                 "custom_deepseek_v41_mxfp4_n512_dequant", "custom_deepseek_v41_expert_n256_fp8",
                 "custom_deepseek_v41_expert_n256_bf16", "custom_deepseek_v41_expert_n256_normal_bf16",
                 "custom_deepseek_v41_expert_n256_slots_fp8_gaudi2", "custom_deepseek_v41_expert_n256_reuse_fp8_gaudi2",
-                "custom_deepseek_v41_expert_n256_horizontal_fp8_gaudi2")
+                "custom_deepseek_v41_expert_n256_horizontal_fp8_gaudi2",
+                "custom_deepseek_v41_expert_token_wide_sat_fp8_gaudi2",
+                "custom_deepseek_v41_expert_n256_sat_fp8_gaudi2",
+                "custom_deepseek_v41_expert_token_wide6_sat_fp8_gaudi2",
+                "custom_deepseek_v41_expert_n256_slots6_sat_fp8_gaudi2")
     if not any(prefix in raw for prefix in prefixes):
         return None
     decode, matrix = [], []
