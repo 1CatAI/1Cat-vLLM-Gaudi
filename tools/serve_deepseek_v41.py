@@ -125,9 +125,11 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18552)
     parser.add_argument("--log-root", type=Path, help="Machine-local directory for service logs, such as SSD storage")
+    parser.add_argument("--settings", type=Path, help="Override the installation's machine-local settings")
     args, extra = parser.parse_known_args()
     root = args.installation.resolve()
-    settings = json.loads((root / "settings.json").read_text())
+    settings_path = args.settings.expanduser().resolve() if args.settings is not None else root / "settings.json"
+    settings = json.loads(settings_path.read_text())
     compiler_temp = settings.get("environment", {}).get("TMPDIR")
     if compiler_temp:
         # A configured tmpfs scratch directory must be recreated after reboot.
@@ -160,7 +162,7 @@ def main():
     if settings.get("api_key_file"):
         environment["VLLM_API_KEY"] = Path(settings["api_key_file"]).read_text().strip()
     command = [str(root / "venv/bin/python"), "-m", "vllm_gaudi.entrypoints.deepseek_v41",
-               "--settings", str(root / "settings.json"), "--host", args.host, "--port", str(args.port), *extra]
+               "--settings", str(settings_path), "--host", args.host, "--port", str(args.port), *extra]
     with (log_dir / "service.log").open("w") as stream:
         child = subprocess.Popen(command, cwd=root, env=environment, stdout=stream, stderr=subprocess.STDOUT,
                                  start_new_session=True)
