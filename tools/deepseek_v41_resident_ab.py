@@ -35,6 +35,19 @@ def recipe_cache_count(environment=None):
     return sum(1 for _ in Path(directory).glob('*.recipe'))
 
 
+def graph_compilation_count():
+    """Observe actual compiler events separately from delayed cache-file writes."""
+    from habana_frameworks.torch.hpu.metrics import metric_global
+
+    stats = dict(metric_global('graph_compilation').stats())
+    return stats['TotalNumber']
+
+
+def cpu_pressure_avg10(path=Path('/proc/pressure/cpu')):
+    fields = dict(item.split('=', 1) for item in path.read_text().splitlines()[0].split()[1:])
+    return float(fields['avg10'])
+
+
 @contextmanager
 def compiler_settings(settings, library=None):
     """Supported Synapse settings apply only to cold candidate compilation.
@@ -215,10 +228,13 @@ def wait_for_loading(directory, rank, dist):
                 samples.append(device_load())
                 time.sleep(1)
             growing = settling_modules(samples, own_modules=own_modules)
-            history.append(dict(samples=samples, loading_modules=growing))
-            decision[0] = not growing
+            pressure = cpu_pressure_avg10()
+            history.append(dict(samples=samples, loading_modules=growing, cpu_psi_some_avg10=pressure))
+            decision[0] = not growing and pressure < 1
             if growing:
                 print(f'Resident A/B waiting for weight loading on modules {growing}', flush=True)
+            elif pressure >= 1:
+                print(f'Resident A/B waiting for CPU pressure: some avg10={pressure:.2f}%', flush=True)
         dist.broadcast_object_list(decision, src=0)
         if decision[0]:
             if rank == 0:
@@ -337,6 +353,7 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
     control.mkdir(parents=True, exist_ok=True)
     arms = {'baseline': baseline}
     stages = {'baseline': stage}
+    graph_compilation_count()  # Subscribe before creating either cold arm.
 
     def arm(name, factory=None, factory_reference=None):
         if name not in arms:
@@ -637,10 +654,21 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
                     (directory / 'result.json').write_text(json.dumps(result, indent=2)+'\n')
                     Path(job['request_path']).rename(Path(job['request_path']).with_suffix('.consumed'))
                 continue
-            # Resolve both warmed contracts before the no-hot-compilation gate.
-            chain(True, 2, measure=False, engine=reference, warm_steps=6)
+            # Repair/alias variants may first occur after the short numerical
+            # screen. Warm the exact timed trajectory for both independent
+            # plans, rather than using the first scored period as compilation.
+            warmup_counts = preparation_counts()
+            for label, engine in [('A', reference), ('B', candidate)]:
+                chain(True, steps, measure=False, engine=engine, warm_steps=32)
+            import torch
+            torch.hpu.synchronize()
+            dist.barrier()
             counts = preparation_counts()
+            (directory / f'full-warmup-rank{rank}.json').write_text(json.dumps(dict(
+                before=warmup_counts, after=counts, steps_per_arm=steps + 32,
+                timed=False), indent=2)+'\n')
             periods = []
+            invalid_period = False
             for label in ('A', 'B', 'A', 'B', 'A', 'B'):
                 if factory_record is not None and hashlib.sha256(
                         Path(factory_record['path']).read_bytes()).hexdigest() != factory_record['sha256']:
@@ -655,14 +683,26 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
                 before_fallbacks = report.get('bounded_sampler_fallbacks', 0)
                 tokens, host_ms, device_ms = chain(True, steps, engine=reference if label == 'A' else candidate,
                                                    warm_steps=32)
-                assert counts == preparation_counts(), 'Hot recompilation invalidates the A/B measurement'
+                after_counts = preparation_counts()
                 local = dict(rank=rank, tokens=tokens, delivery_ns=report['token_delivery_ns'],
                              sampling_steps=report.get('bounded_sampler_steps', 0)-before_steps,
                              sampling_fallbacks=report.get('bounded_sampler_fallbacks', 0)-before_fallbacks,
                              host_ms=host_ms, device_ms=device_ms,
+                             preparation_counts_before=counts, preparation_counts_after=after_counts,
                              checked_first_device_position=report.get('checked_first_device_position'))
                 ranks = [None] * dist.get_world_size()
                 dist.all_gather_object(ranks, local)
+                if any(row['preparation_counts_before'] != row['preparation_counts_after'] for row in ranks):
+                    if rank == 0:
+                        (directory / 'invalid-period.json').write_text(json.dumps(dict(
+                            arm=label, ranks=ranks, timings_valid=False,
+                            reason='Compiler/plan/cache counters changed during timing'), indent=2)+'\n')
+                        (directory / 'result.json').write_text(json.dumps(dict(
+                            status='timing_invalid_preparation_growth', resident_retained=True,
+                            numerical_gate=numerical_gate, formal_gain_credit=False), indent=2)+'\n')
+                        Path(job['request_path']).rename(Path(job['request_path']).with_suffix('.consumed'))
+                    invalid_period = True
+                    break
                 assert all(row['tokens'] == tokens for row in ranks), 'Ranks disagree on generated tokens'
                 if rank == 0:
                     delivery = [max(row['delivery_ns'][i] for row in ranks) for i in range(steps+1)]
@@ -672,6 +712,8 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
                     (directory / 'periods.json').write_text(json.dumps(periods, indent=2)+'\n')
                     print(f"{name} {label}: {period['summary']['median_ms']:.6f} ms, "
                           f"IQR {period['summary']['iqr_ms']:.6f}", flush=True)
+            if invalid_period:
+                continue
             infos = [graph_info(reference), graph_info(candidate)]
             if rank == 0:
                 result = dict(status='completed', baseline=reference_name, candidate=name, steps=steps, order='ABABAB',

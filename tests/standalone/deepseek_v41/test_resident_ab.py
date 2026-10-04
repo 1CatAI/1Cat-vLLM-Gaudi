@@ -150,6 +150,15 @@ def test_loading_pool_reset_must_settle_before_measurement():
     assert ab.settling_modules([sample(35000), sample(35005), sample(35009)]) == []
 
 
+def test_cpu_queue_gate_uses_pressure_not_driver_d_state_load(tmp_path):
+    pressure = tmp_path / 'cpu'
+    pressure.write_text('some avg10=0.00 avg60=0.25 avg300=0.65 total=1000\n'
+                        'full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n')
+    assert ab.cpu_pressure_avg10(pressure) == 0
+    pressure.write_text('some avg10=42.98 avg60=13.72 avg300=3.70 total=2000\n')
+    assert ab.cpu_pressure_avg10(pressure) == 42.98
+
+
 def test_cold_compiler_settings_restore_on_success_and_failure():
 
     class Library:
