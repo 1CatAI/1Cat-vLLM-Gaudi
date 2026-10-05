@@ -756,7 +756,7 @@
     "real16_saving_ms": 0.06874699999999923,
     "validity_threshold_ms": 0.33305449999999936
   },
-  "updated": 1791073217.8407774,
+  "updated": 1791202546.5163937,
   "device_closed_loop": {
     "candidate_commit": "e8588c95",
     "status": "macro direction unchanged; byte-exact rollback validation candidate warming; no formal result",
@@ -1976,5 +1976,30 @@
     "formal_measured": false,
     "correctness": "Five fixtures x four ranks bit exact",
     "note": "Only ~7 ns per boundary; record literal small micro result, not a meaningful formal improvement."
+  },
+  "merged_parallel_20261005": {
+    "status": "rejected_slower",
+    "reference_ms": 4.186109,
+    "candidate_ms": 4.374776000000001,
+    "round_savings_ms": [
+      -0.1967080000000001,
+      -0.17514050000000125,
+      -0.2021809999999995
+    ],
+    "compute_segments": [
+      73,
+      41
+    ],
+    "collective_points": [
+      42,
+      42
+    ],
+    "correctness_all_four_ranks": true,
+    "no_hot_compilation": true,
+    "cross_arm_feedback_exact": true,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-merged-parallel-control-02",
+    "reason": "Disabling the mHC-independent split reduces32 boundaries but removes32 producer/consumer overlap windows. Counts establish this structural tradeoff; no new trace or exclusive cycle attribution.",
+    "formal_gain_credit": false,
+    "default": false
   }
 }

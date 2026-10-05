@@ -163,3 +163,16 @@ be deleted independently of completion accounting. Formal batch03 logs show
 MERGE_LOCAL_SEGMENTS implementation has no completed historical timing (earlier
 run interrupted by restart). Qualify it with the faster controller, retaining
 native communication dependencies; do not infer savings from null count alone.
+
+Repartitioning with the faster controller (`decode-merged-parallel-control-02`):
+73→41 native compute segments with42 unchanged peer points, five states/four
+ranks exact. Three real16 rounds slow by0.197/0.175/0.202ms;32 independent
+control/communication windows disappear. Fewer recipe boundaries alone do not
+win this tradeoff. No gain credit and no additional service trace.
+
+Next B hypothesis: earlier dense-prefetch failures used a TPC weight-copy kernel.
+The installed Synapse `MemcpyEngineManager` defaults Gaudi2 contiguous semantic
+memcpy to `DmaMemcpy`. A graph-local nonpersistent SRAM section can test DMA
+prefetch alongside activation quantization without cross-recipe lifetime
+assumptions. Require an actual DRAM→DMA→SRAM→MME edge in the final compiler
+graph, then the full WO/control→peer→FFN/router chain; unmeasured.

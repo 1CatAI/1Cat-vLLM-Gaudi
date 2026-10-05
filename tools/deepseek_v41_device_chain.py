@@ -17,6 +17,25 @@ _frames = {}
 _preparation_observer = None
 
 
+def shared_device_inputs(host, initial, history):
+    """Reuse the input producer between drained, serial A/B periods.
+
+    Native replay plans remain per engine. Engram tables and the producer's
+    output roots can be shared because run_device_chain drains its final
+    consumer before retiring the owner, then replaces the complete token and
+    history input at the next period. Keeping one producer per engine instead
+    pins another private checkpoint mapping for every candidate.
+    """
+    key = (host, initial.device, initial.numel())
+    inputs = _inputs.get(key)
+    if inputs is None:
+        inputs = DeviceEngramRounds(host, initial.reshape(-1), history)
+        _inputs[key] = inputs
+    elif inputs.owner is not None:
+        raise RuntimeError('Resident Engram input reuse requires the preceding consumer to retire')
+    return inputs
+
+
 def set_preparation_observer(callback):
     global _preparation_observer
     _preparation_observer = callback
@@ -46,9 +65,8 @@ def run_device_chain(engine, host, seed_hidden, sampler, full_sample, payloads, 
     initial_host, initial_done = bridge.copy_sampled_tokens_to_host(initial)
     history = torch.tensor(host.history.history[-3:][::-1].copy(), dtype=torch.int32, device='hpu')
     position = torch.tensor([context_tokens], dtype=torch.int32, device='hpu')
-    if engine not in _inputs:
-        _inputs[engine] = DeviceEngramRounds(host, initial.reshape(-1), history)
-    inputs = _inputs[engine]
+    inputs = shared_device_inputs(host, initial, history)
+    report['device_engram_input_pools'] = len(_inputs)
     owner = ('native-chain', id(engine))
     torch.hpu.synchronize()
     initial_done.synchronize()
