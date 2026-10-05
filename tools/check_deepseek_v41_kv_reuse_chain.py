@@ -27,6 +27,7 @@ def main():
     parser.add_argument('--phase-rows', type=int, default=32768)
     parser.add_argument('--woa-handoff',action='store_true',help='Compare fused WO scale/roundtrip/dense quant with joint QKV held fixed')
     parser.add_argument('--qkv-fusion',action='store_true',help='Fuse Q preparation with KV publication before Q MME')
+    parser.add_argument('--reference-state-dir',type=Path,help='Archived production packed main KV/page mapping for realistic reuse fixtures')
     parser.add_argument('--prepared', type=Path, required=True)
     parser.add_argument('--sidecar', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
@@ -68,6 +69,7 @@ def main():
     from tools.deepseek_v41_micro_replay import RecipeRecorder
     from tools.deepseek_v41_resident_ab import graph_compilation_count, wait_for_loading
 
+    os.environ['VLLM_HPU_DSV41_TP_MHC_OVERLAP']='0'
     torch.set_num_threads(1)
     torch.hpu.set_device(rank)
     root = args.output.resolve()
@@ -132,6 +134,21 @@ def main():
                       for token in (17, 41, 128, 512, 1024)]
     base_hidden=embeddings[0][:,:512].clone()
     main_values=base_hidden.reshape(1,1,512).expand(1,640,512).contiguous().to('hpu')
+    if args.reference_state_dir:
+        from vllm_gaudi.ops.deepseek_v41_math import unpack_fp4
+        reference=torch.load(args.reference_state_dir/f'state-original-rank{rank}.pt',map_location='cpu',weights_only=True)
+        if not isinstance(reference,(list,tuple)) or len(reference)<2:
+            raise ValueError('Reference KV snapshot must contain pages and packed source2 main rows')
+        pages,packed=reference[:2]
+        if pages.dtype!=torch.int32 or pages.ndim!=1 or packed.dtype!=torch.uint8 or packed.ndim!=2 or packed.shape[1]!=288:
+            raise ValueError('Unsupported reference page/packed-KV format')
+        logical=torch.arange(512)*13
+        physical=pages[logical//64].long()*64+logical%64
+        if bool((physical<0).any() or (physical>=packed.shape[0]).any()):
+            raise ValueError('Reference selected rows exceed packed source storage')
+        selected_main=unpack_fp4(packed).to(torch.bfloat16)[physical]
+        selected_main=torch.where(selected_main==0,torch.zeros_like(selected_main),selected_main)
+        main_values=torch.cat((torch.zeros((128,512),dtype=torch.bfloat16),selected_main),0).unsqueeze(0).to('hpu')
     if args.mla_publish:
         from vllm_gaudi.ops.deepseek_v41_math import pack_fp4
         packed_main=pack_fp4(main_values[0],16).contiguous()

@@ -213,3 +213,30 @@ Current compatible pending forecast remains **.658449527ms/token**; formal remai
 Readonly selected-main KV operands are the next unqualified dataflow candidate: retain
 main K/V while decoding128 private SWA rows at each reuse. It pays extra MME/combine cost;
 only a complete publish/reuse/WO/peer/FFN group can determine the outcome.
+
+## 2026-10-06: selected-KV reuse experiments and next communication check
+
+Readonly split QK/PV pays two extraMMEs+one1MB DMA per reuse and loses8.925us
+per publisher+three-reuse group. Logical concat retains twoMMEs but inserts two
+K/V DMAs, losing2.711us/group. Balanced original640-row work adds no nodes or
+copies, passes all5×4 exact checks, but loses.465/.520/.378us/layer. Actual recipe
+metadata has3ROIs each using24TPCs, so the earlier one640-range/24partitions
+imbalance model is not runtime proof. All three variants are archived and removed.
+
+A concrete common replay/interface gap is now visible in HCL source:
+`CommonState::checkInPlaceOp` recognizes AllGather send=recv+rank×payload;
+standaloneAG omits EDMA_MEMCOPY completion when in-place. Our prepared bridge
+requires distinct source/destination storage, forcing the local-rank copy even
+when a producer could write directly into its own receive slice. The next smallest
+probe must compare producer→nativeAG→consumer, verify relocation/view ownership,
+and count the actual removed EDMA/completion commands. No speed is claimed;
+no PCIe device imports or reset are involved. Small-copy time alone is not the
+expected benefit: test whether its scheduler/completion handoff is also removed.
+
+Intel [TPC coherency](https://docs.habana.ai/en/latest/TPC/TPC_User_Guide/TPC_Coherency.html)
+and the retrieved HabanaAI TPC intrinsic declarations document ASO/cache fencing.
+They do not by themselves establish a safe cross-TPC group barrier or a latency
+gain from master-only gates: existing feature owners compute gates concurrently,
+and waiting for a master can expose the same gate latency. No cooperative-gate
+hardware experiment was started. Evidence: `decode-mhc-cooperative-audit-01`.
+Pendingforecast remains.658449527ms; formal9.564282ms, target7ms not achieved.
