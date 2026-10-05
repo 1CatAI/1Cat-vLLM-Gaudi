@@ -76,3 +76,35 @@ def test_layer_group_ownership_and_each_invocation_are_exact(native_reference, m
                              fp8_decode=False, decode=decode, selected_main=None)[0]
         observed = group(value, pre, positions, torch.zeros(tokens, dtype=torch.int64), (None, None))[0]
         assert torch.equal(observed, expected)
+
+
+def test_projected_publish_preserves_selection_workspace(monkeypatch):
+    calls = []
+    rows, mask = torch.ones((1, 640, 512)), torch.ones((1, 640))
+    partial = torch.ones((1, 5120), dtype=torch.bfloat16)
+
+    def publish(*args):
+        calls.append(('publish', args))
+        return partial, rows, mask
+
+    def reuse(*args):
+        calls.append(('reuse', args))
+        assert args[2] is rows and args[3] is mask
+        return partial
+
+    monkeypatch.setattr(torch.ops.custom_op, 'custom_deepseek_v41_main_publish_projection_gaudi2', publish, raising=False)
+    monkeypatch.setattr(torch.ops.custom_op, 'custom_deepseek_v41_main_reuse_projection_gaudi2', reuse, raising=False)
+    owner = Layer(20, 20, 20, torch.ones(1), torch.ones((1, 512), dtype=torch.int32)).owner
+    owner.weights.wo_a = SimpleNamespace(weight=torch.ones(1), channel_scale=torch.ones(1))
+    owner.weights.wo_b = SimpleNamespace(weight=torch.ones(1), channel_scale=torch.ones(1))
+    phase = torch.ones((128, 64))
+    owner._rotary_native_table = lambda: phase
+    workspace = {}
+    args = owner, torch.ones((1, 16, 512)), torch.tensor([0]), torch.zeros((1, 512), dtype=torch.int32), torch.tensor([640])
+    for _ in range(2):
+        assert shared_main_attention(*args, workspace, projection=True) is partial
+    assert [name for name, _ in calls] == ['publish', 'reuse']
+    assert calls[0][1][-3] is phase and calls[1][1][-3] is phase
+    owner.index_source = 24
+    assert shared_main_attention(*args, workspace, projection=True) is partial
+    assert [name for name, _ in calls] == ['publish', 'reuse', 'publish']

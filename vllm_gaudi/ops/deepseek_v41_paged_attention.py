@@ -1953,7 +1953,13 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                             self._rotary_native_table(), self.weights.attn_sink, self.scale, lengths, self.eps
                         )
                     else:
-                        output = shared_main_attention(self, query, positions, selected, lengths, selected_main)
+                        projection = (gaudi_envs.VLLM_HPU_DSV41_MAIN_MLA_PROJECTION
+                                      and self._can_fuse_mla_woa(positions)
+                                      and getattr(self.weights.wo_b, "dense_fp8", False))
+                        output = shared_main_attention(self, query, positions, selected, lengths, selected_main,
+                                                       projection=projection)
+                        if projection:
+                            return self._reduce_decode_output(output, ready_outputs, decode=decode)
                     return self._finish_output(output, positions, ready_outputs, decode=decode)
                 output = torch.ops.custom_op.custom_deepseek_v41_logical_mla_gaudi2(
                     query.contiguous(),

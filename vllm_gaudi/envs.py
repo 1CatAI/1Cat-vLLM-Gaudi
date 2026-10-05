@@ -154,6 +154,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_FP8_SIDECAR: str = ""
     VLLM_HPU_DSV41_FP8_CONFIG: str = ""
     VLLM_HPU_DSV41_WO_A_FP8: bool = False
+    VLLM_HPU_DSV41_MAIN_MLA_PROJECTION: bool = False
     VLLM_HPU_DSV41_STATIC_COORDINATES: bool = False
     VLLM_HPU_DSV41_MERGE_LOCAL_SEGMENTS: bool = False
     VLLM_HPU_DSV41_ORDERED_PEER_SUM: bool = False
@@ -699,6 +700,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_DEVICE_INPUT_FEEDBACK", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_SAMPLING_PREFIX_HANDOFF":
     lambda: os.environ.get("VLLM_HPU_DSV41_SAMPLING_PREFIX_HANDOFF", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_MAIN_MLA_PROJECTION":
+    lambda: os.environ.get("VLLM_HPU_DSV41_MAIN_MLA_PROJECTION", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_STATIC_COORDINATES":
     lambda: os.environ.get("VLLM_HPU_DSV41_STATIC_COORDINATES", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_ORDERED_PEER_SUM":
