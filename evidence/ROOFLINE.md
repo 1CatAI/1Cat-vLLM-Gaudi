@@ -242,3 +242,11 @@ hardware experiment was started. Evidence: `decode-mhc-cooperative-audit-01`.
 Pendingforecast remains.658449527ms; formal9.564282ms, target7ms not achieved.
 
 A in-place AG05: strict-own-rank view removes1 nativecommand/32bytes per point with identical ARC programs and zero hot copies. Five inputs/four ranks bitexact after repairing two cold contracts (rank0 create equality, cached allocated-output offset). Three producer→peer→post/FFN/router differences −.303/−.359/−.296us. No gain; this disproves own-copy removal as a useful latency remedy on this chain. All unused runtime changes archived/removed. Standalone output-offset source patch and exact-ABI adapter retained only as research artifacts, not a deployment dependency.
+
+## SiLU register-cache offline rejection
+
+Five checkpoint-derived fixtures pass bitexact with the candidate640 kernel; actual TPC simulator instructions increase6976→10698 (+53%), loads548→1548, stores98→412. Eliminating an explicit activated[] array does not guarantee register residency or fewer instructions; fully expanded sigmoid/descriptor and predicate lifetimes create more local traffic. No hardware measurement or gain credit. Archive: `/opt/ssd960/1cat-vllm-decode-archives/decode-silu-register-cache-06/DECISION.json`.
+
+## Native two-rank peer headroom
+
+Checkpoint WO→native exchange→mHC post/FFN norm with an identical TWO-rank partial sum: four-rank AG38.216–38.224us vs direct pair37.965–37.982us; three savings.234/.259/.238us. Five changing fixtures/four ranks bitexact. Two-peer doubling additionally needs another exchange plus F32 intermediate sum, so this screen does not establish useful four-rank headroom. It does not measure absolute transport latency or qualify a TP4 reduction. No model credit or mixed-communicator runtime extension. Evidence: `/opt/ssd960/1cat-vllm-decode-archives/decode-pair-native-transport-01`.
