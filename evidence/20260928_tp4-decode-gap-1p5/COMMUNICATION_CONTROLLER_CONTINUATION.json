@@ -1,0 +1,177 @@
+{
+  "formal_baseline_ms": 9.564282285406788,
+  "target_ms": 7,
+  "formal_completed_this_batch": false,
+  "new_qualified_gain_ms": 0,
+  "compatible_pending_forecast_ms": 0.6584495273437498,
+  "negative_and_prepared_experiments": {
+    "decode-mhc-native-fp32-chain-01": {
+      "status": "rejected_slower",
+      "correctness": "All five fixtures on all four ranks pass official-equation tolerance; router IDs exact. Floating outputs are not bitwise equal.",
+      "reference": "Qualified swizzled parallel TPC controller with deferred gates and shared RRMS post",
+      "candidate": "BF16-to-FP32 residual cast plus native FP32 MME plus shared RRMS finish",
+      "reference_ms": [
+        0.045090914,
+        0.045097734,
+        0.045088363
+      ],
+      "candidate_ms": [
+        0.095041699,
+        0.095041414,
+        0.095051695
+      ],
+      "regression_us": [
+        49.950785,
+        49.94368,
+        49.963332
+      ],
+      "physical_producer_nodes": {
+        "reference": 4,
+        "candidate": 6
+      },
+      "attribution": "Candidate adds residual cast and controller finish TPC nodes and switches control projection to MME. No profiler was acquired; individual attribution of the approximately 50us regression is unresolved. A logical single GEMM is not a speed guarantee.",
+      "gain_ledger_credit_ms": 0,
+      "formal_baseline_ms": 9.564282285406788,
+      "compatible_pending_forecast_ms": 0.6584495273437498,
+      "owners_closed": true,
+      "source_archive": "/opt/ssd960/1cat-vllm-decode-archives/decode-mhc-native-fp32-01/prototype-source.tar.gz"
+    },
+    "decode-pcie-star-parallel-01/two-rank": {
+      "status": "rejected_slower",
+      "scope": "native two-rank primitive, not production TP4 chain",
+      "periods": [
+        {
+          "rank": 0,
+          "round": 0,
+          "arm": "A",
+          "completed_native_us": 16.1288
+        },
+        {
+          "rank": 1,
+          "round": 0,
+          "arm": "A",
+          "completed_native_us": 16.1526
+        },
+        {
+          "rank": 0,
+          "round": 1,
+          "arm": "B",
+          "completed_native_us": 36.9722
+        },
+        {
+          "rank": 1,
+          "round": 1,
+          "arm": "B",
+          "completed_native_us": 37.0297
+        },
+        {
+          "rank": 1,
+          "round": 2,
+          "arm": "A",
+          "completed_native_us": 16.2425
+        },
+        {
+          "rank": 0,
+          "round": 2,
+          "arm": "A",
+          "completed_native_us": 16.2525
+        },
+        {
+          "rank": 0,
+          "round": 3,
+          "arm": "B",
+          "completed_native_us": 37.0175
+        },
+        {
+          "rank": 1,
+          "round": 3,
+          "arm": "B",
+          "completed_native_us": 37.0717
+        },
+        {
+          "rank": 0,
+          "round": 4,
+          "arm": "A",
+          "completed_native_us": 16.2898
+        },
+        {
+          "rank": 1,
+          "round": 4,
+          "arm": "A",
+          "completed_native_us": 16.301
+        },
+        {
+          "rank": 0,
+          "round": 5,
+          "arm": "B",
+          "completed_native_us": 37.0255
+        },
+        {
+          "rank": 1,
+          "round": 5,
+          "arm": "B",
+          "completed_native_us": 37.0868
+        }
+      ],
+      "reference_us": [
+        16.1526,
+        16.2525,
+        16.301
+      ],
+      "candidate_us": [
+        37.0297,
+        37.0717,
+        37.0868
+      ],
+      "regressions_us": [
+        20.8771,
+        20.8192,
+        20.7858
+      ],
+      "correctness": "epoch211/411/611 changing payload exact on both ranks; protocol error zero; one synthetic input bank, not five production fixtures",
+      "cleanup": "Both native children logged imports_remaining=0 and exited before inspection",
+      "launcher_failure": "Python driver used obsolete owned-process helper signature after spawn. This failed tracking/status bookkeeping; the C++ native child completed all periods and its bounded import teardown. Original failed log preserved; corrected launcher in run_probe-fixed.py, no identical retry.",
+      "hypothesis": "40-vector granularity introduces per-vector remote ready and reader ACK traffic; B also reloads own rank through hub instead of local tensor. These are source facts, not individually timed attribution.",
+      "gain_credit_ms": 0,
+      "formal_unchanged_ms": 9.564282285406788
+    },
+    "decode-pcie-star-coarse-01/two-rank": {
+      "status": "invalid_harness_guard",
+      "reason": "C++ guard still checked40 counters although candidate indexSpaceGeometry and protocol have5 workpoints. Kernel error field was zero; failure precedes timing.",
+      "measurements_valid": false,
+      "gain_credit_ms": 0,
+      "devices_released": true,
+      "change_for_retry": "Guard checks five actual workpoint epochs. Preserve kernel, synchronization and both comparison arms; do not change candidate computation in retry."
+    },
+    "decode-pcie-star-coarse-01/two-rank-corrected": {
+      "status": "invalid_before_device_acquisition",
+      "reason": "Existing lease API takes an exact module tuple, not a pool with smaller count. No GPU opened, no measurement. Retry uses automatic selection with healthy-pool assertion before spawn."
+    },
+    "decode-pcie-star-frontier-01": {
+      "status": "CPU_gates_passed_no_hardware_timing",
+      "four_rank_arithmetic_simulator_cases": 40,
+      "instructions_per_four_rank_simulation": 7399,
+      "parent_instructions": 8691,
+      "randomized_protocol_fixtures": 5,
+      "epochs_per_protocol_fixture": 32,
+      "includes_u32_wrap": true,
+      "vector_local_opcode_occurrences": 0,
+      "instruction_scope": "Simulator arithmetic with seeded remote publications, not PCIe stalls or real multi-device execution",
+      "device_gain_credit_ms": 0,
+      "source_sha256": {
+        "parallel.c": "ab5354fb8b8833914670c773660bd69a3bb54309e5088aa8fc81b5e58eaaf8c0",
+        "probe.cpp": "35d683cf1483d51b87f53988b32f6e1abfbde5961524bd706815b9c1b2cdc627",
+        "run_probe.py": "f156867c193df8f14e498ee8d7117abc2a43713c70af81ad65d32045d3bd364f",
+        "build/libkernels.so": "336e4b1cce5408ef1c2984e867161be1f52b7f3bc365d9fb126875af86eb86f3",
+        "build/probe": "1a34ee83df9578beedb7dd54709338ab818d2ccf3134a4a562e6dadebf209dce"
+      }
+    }
+  },
+  "active": "decode-pcie-star-coarse-01/two-rank-corrected-02 waiting for any healthy pair; no model run queued",
+  "excluded_modules": [
+    0,
+    1,
+    4,
+    5
+  ]
+}

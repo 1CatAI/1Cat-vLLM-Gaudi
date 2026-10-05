@@ -254,3 +254,7 @@ Checkpoint WO→native exchange→mHC post/FFN norm with an identical TWO-rank p
 ## Qnorm complete-chain result
 
 Standalone fixed1280 unroll reduces simulator instructions1037→569, but fused QKV register pressure increases local memory traffic. Same19 physical compute nodes;5×4 real-chain outputs bitexact; three native regressions2.640/2.613/2.623us/layer. Two ISA-directed lifetime fixes are also rejected offline, not sent through model startup. This confirms that standalone instruction reduction is insufficient; retain none of these runtime changes. Integer descriptor repair affects simulation tooling only, not production dataflow or formal timing. Baseline9.564282/pending.658449527ms unchanged.
+
+## Latest communication/controller gates
+
+Native FP32 controller full boundary passes official tolerance/router equality but regresses about50us;4->6 producer nodes. Reject, no MME-controller gain. Fine-vector PCIe parallelism also regresses two-rank primitive16.2->37.1us;40 vectors multiply scalar ready/ACK transactions. Parameterized device controls compile/simulate correctly but have no hardware timing. The next screen coarsens synchronization and avoids fetching the local rank over PCIe; it preserves leaf-only imports. Compatible pending forecast remains **.658449527ms**, official baseline **9.564282ms**. Earlier cumulative figures in this chronological document are superseded by the maintained gain ledger.
