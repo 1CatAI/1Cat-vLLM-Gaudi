@@ -6,6 +6,12 @@ extern unsigned char _binary___deepseek_v41_main_publish_gather_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_main_publish_gather_gaudi2_o_end;
 extern unsigned char _binary___deepseek_v41_main_publish_vector_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_main_publish_vector_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_main_publish_vector_mask_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_main_publish_vector_mask_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_main_publish_native_codec_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_main_publish_native_codec_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_main_publish_tensor_mask_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_main_publish_tensor_mask_gaudi2_o_end;
 tpc_lib_api::GlueCodeReturn DeepseekV41MainPublishGatherGaudi2::GetGcDefinitions(
     tpc_lib_api::HabanaKernelParams* in, tpc_lib_api::HabanaKernelInstantiation* out) {
     using namespace tpc_lib_api;
@@ -58,6 +64,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41MainPublishGatherGaudi2::GetGcDefinitions
         in->outputTensors[2].geometry.maxSizes[1] != tokens) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
     map(out->outputTensorAccessPattern[2], 0, 0, 1, 0);
     map(out->outputTensorAccessPattern[2], 1, 1, 1, 0);
+    if (vector_mask_) out->outputTensorAccessPattern[2].allRequired = true;
     out->kernel.paramsNr = 1;
     std::memcpy(out->kernel.scalarParams, &ratio, sizeof(ratio));
     auto* first = &_binary___deepseek_v41_main_publish_gather_gaudi2_o_start;
@@ -65,6 +72,18 @@ tpc_lib_api::GlueCodeReturn DeepseekV41MainPublishGatherGaudi2::GetGcDefinitions
     if (vector_) {
         first = &_binary___deepseek_v41_main_publish_vector_gaudi2_o_start;
         last = &_binary___deepseek_v41_main_publish_vector_gaudi2_o_end;
+    }
+    if (vector_mask_) {
+        first = &_binary___deepseek_v41_main_publish_vector_mask_gaudi2_o_start;
+        last = &_binary___deepseek_v41_main_publish_vector_mask_gaudi2_o_end;
+    }
+    if (native_codec_) {
+        first = &_binary___deepseek_v41_main_publish_native_codec_gaudi2_o_start;
+        last = &_binary___deepseek_v41_main_publish_native_codec_gaudi2_o_end;
+    }
+    if (tensor_mask_) {
+        first = &_binary___deepseek_v41_main_publish_tensor_mask_gaudi2_o_start;
+        last = &_binary___deepseek_v41_main_publish_tensor_mask_gaudi2_o_end;
     }
     const auto capacity = out->kernel.elfSize;
     out->kernel.elfSize = last - first;

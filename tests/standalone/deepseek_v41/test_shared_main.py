@@ -110,10 +110,14 @@ def test_projected_publish_preserves_selection_workspace(monkeypatch):
     assert [name for name, _ in calls] == ['publish', 'reuse', 'publish']
 
 
-def test_vector_mask_reuses_the_current_selection_owner(monkeypatch):
+@pytest.mark.parametrize("publish_mask", [False, True])
+@pytest.mark.parametrize("hardware", [False, True])
+def test_vector_mask_reuses_the_current_selection_owner(monkeypatch, publish_mask, hardware):
     from vllm_gaudi.ops import deepseek_v41_shared_main as module
     monkeypatch.setattr(module.gaudi_envs, "VLLM_HPU_DSV41_MLA_VECTOR_CODEC", True)
     monkeypatch.setattr(module.gaudi_envs, "VLLM_HPU_DSV41_MLA_VECTOR_MASK", True)
+    monkeypatch.setattr(module.gaudi_envs, "VLLM_HPU_DSV41_MLA_PUBLISH_MASK", publish_mask)
+    monkeypatch.setattr(module.gaudi_envs, "VLLM_HPU_DSV41_MLA_REUSE_HW_CODEC", hardware)
     rows, mask = torch.ones((1, 640, 512)), torch.ones((1, 640))
     calls = []
 
@@ -127,7 +131,9 @@ def test_vector_mask_reuses_the_current_selection_owner(monkeypatch):
         return q
 
     monkeypatch.setattr(torch.ops.custom_op, "custom_deepseek_v41_main_publish_vector_mla_gaudi2", publish, raising=False)
+    monkeypatch.setattr(torch.ops.custom_op, "custom_deepseek_v41_main_publish_vector_mask_mla_gaudi2", publish, raising=False)
     monkeypatch.setattr(torch.ops.custom_op, "custom_deepseek_v41_main_reuse_vector_mask_mla_gaudi2", reuse, raising=False)
+    monkeypatch.setattr(torch.ops.custom_op, "custom_deepseek_v41_main_reuse_native_codec_mla_gaudi2", reuse, raising=False)
     owner = Layer(20, 20, 20, torch.ones(1), torch.ones((1, 512), dtype=torch.int32)).owner
     q = torch.ones((1, 16, 512))
     arguments = owner, q, torch.tensor([16384]), torch.zeros((1, 512), dtype=torch.int32), torch.tensor([640])
@@ -146,5 +152,16 @@ def test_vector_mask_requires_its_codec_parent(monkeypatch):
     monkeypatch.setattr(module.gaudi_envs, "VLLM_HPU_DSV41_MLA_VECTOR_MASK", True)
     owner = Layer(20, 20, 20, torch.ones(1), torch.ones((1, 512), dtype=torch.int32)).owner
     with pytest.raises(ValueError, match="vector codec parent"):
+        shared_main_attention(owner, torch.ones((1, 16, 512)), torch.tensor([0]),
+                              torch.zeros((1, 512), dtype=torch.int32), torch.tensor([640]), {})
+
+
+def test_hardware_reuse_requires_the_mask_parent(monkeypatch):
+    from vllm_gaudi.ops import deepseek_v41_shared_main as module
+    monkeypatch.setattr(module.gaudi_envs, "VLLM_HPU_DSV41_MLA_VECTOR_CODEC", True)
+    monkeypatch.setattr(module.gaudi_envs, "VLLM_HPU_DSV41_MLA_VECTOR_MASK", False)
+    monkeypatch.setattr(module.gaudi_envs, "VLLM_HPU_DSV41_MLA_REUSE_HW_CODEC", True)
+    owner = Layer(20, 20, 20, torch.ones(1), torch.ones((1, 512), dtype=torch.int32)).owner
+    with pytest.raises(ValueError, match="vector mask parents"):
         shared_main_attention(owner, torch.ones((1, 16, 512)), torch.tensor([0]),
                               torch.zeros((1, 512), dtype=torch.int32), torch.tensor([640]), {})

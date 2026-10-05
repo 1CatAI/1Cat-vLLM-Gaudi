@@ -86,11 +86,17 @@ void main(tensor swa, tensor shared_rows, tensor shared_mask, tensor positions,
                 bfloat128 output = {0};
                 if (valid_swa) {
                     const uchar256 bytes = v_u8_ld_tnsr_partial_b((int5){chunk * 128, index}, swa, 127, 0);
+#ifndef DSV41_NATIVE_KV_CODEC
                     const ushort128 code = convert_uchar256_to_ushort256(bytes, SW_LINEAR).v1;
+#endif
                     const uchar256 directions128 = ((V_LANE_ID_8 >> 5) + chunk * 4) | 0x80;
                     const uchar256 scale_values = v_u8_shuffle_b(expanded_scales, directions128, 0, (uchar256){0});
                     const ushort128 scales = convert_uchar256_to_ushort256(scale_values, SW_LINEAR).v1;
+#ifdef DSV41_NATIVE_KV_CODEC
+                    output = v_bf16_mul_b(selected_e4m3fn_bytes(bytes), selected_ue8m0(scales));
+#else
                     output = v_bf16_mul_b(selected_e4m3fn(code), selected_ue8m0(scales));
+#endif
                 }
                 v_bf16_st_tnsr((int5){chunk * 128, slot, token}, rows, output);
                 const float128 restored = convert_bfloat128_to_float128(output, SW_LINEAR);

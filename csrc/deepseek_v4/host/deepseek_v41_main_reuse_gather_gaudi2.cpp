@@ -8,6 +8,8 @@ extern unsigned char _binary___deepseek_v41_main_reuse_vector_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_main_reuse_vector_gaudi2_o_end;
 extern unsigned char _binary___deepseek_v41_main_reuse_vector_mask_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_main_reuse_vector_mask_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_main_reuse_native_codec_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_main_reuse_native_codec_gaudi2_o_end;
 tpc_lib_api::GlueCodeReturn DeepseekV41MainReuseGatherGaudi2::GetGcDefinitions(
     tpc_lib_api::HabanaKernelParams* in, tpc_lib_api::HabanaKernelInstantiation* out) {
     using namespace tpc_lib_api;
@@ -70,6 +72,10 @@ tpc_lib_api::GlueCodeReturn DeepseekV41MainReuseGatherGaudi2::GetGcDefinitions(
     if (vector_mask_) {
         first = &_binary___deepseek_v41_main_reuse_vector_mask_gaudi2_o_start;
         last = &_binary___deepseek_v41_main_reuse_vector_mask_gaudi2_o_end;
+    }
+    if (native_codec_) {
+        first = &_binary___deepseek_v41_main_reuse_native_codec_gaudi2_o_start;
+        last = &_binary___deepseek_v41_main_reuse_native_codec_gaudi2_o_end;
     }
     const auto capacity = out->kernel.elfSize;
     out->kernel.elfSize = last - first;

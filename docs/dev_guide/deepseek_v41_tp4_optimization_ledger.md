@@ -1104,3 +1104,22 @@ Default-off `VLLM_HPU_DSV41_MLA_VECTOR_MASK`, requires `MLA_VECTOR_CODEC`.
 27 qualified reuse layers forecast **.137790492ms/token**, additive to the
 vector-codec parent. Active total **.634172625ms/token**; formal baseline
 **9.564282ms/token** unchanged. Combined formal trigger remains1ms.
+
+### 2026-10-05 — corrected hardware E4M3 reuse codec
+
+`decode-kv-hardware-codec-02/reuse-native-03`: vector codec and vector mask
+parents held fixed. Five checkpoint-derived fixtures×four ranks alloutputs
+bit-exact through QKV→MLA→WO→nativepeer→post/FFN. Native paired savings
+**.000899145/.000845145/.000916508ms per reuse layer**. Executable producer
+count stays23→23; the simulator reduces75268→69124 executed instructions.
+Hardware E4M3 finite-upper-exponent, NaN and zero corrections were checked
+for all256 codes; complete producer fixtures are also exact.
+Default-off `VLLM_HPU_DSV41_MLA_REUSE_HW_CODEC` requires both vector parents.
+Only27 reuse layers receive **0.024276902ms/token forecast**; no publish credit.
+Active cumulative forecast **0.658449527ms/token**; formal **9.564282ms/token**
+unchanged and combined formal trigger remains1ms.
+
+The earlier reuse-native-02 attempt failed before timing because its nested
+TMPDIR exceeded the Unix-domain socket limit. The shared component launcher
+now uses a short profile scratch root and checks the UUID path before leasing
+devices; no correctness/performance number is taken from that failed attempt.

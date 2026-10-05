@@ -1742,7 +1742,7 @@
     "gain_credit_ms": 0,
     "next": "Hoist immutable 24 coefficients out of 40-tile loop; ISA change verified, next hardware run queued"
   },
-  "pending_micro_only_ms": 0.6341726249999997,
+  "pending_micro_only_ms": 0.6584495273437498,
   "accepted_baseline_20261005": {
     "case": "decode-physical-fusion-serving-03",
     "official_tpot_ms": 9.564282285406788,
@@ -2334,5 +2334,49 @@
     "default": false,
     "formal_gain_credit": false,
     "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-host-shared-peer-03"
+  },
+  "mla_reuse_hardware_codec_20261005": {
+    "status": "complete_chain_micro_qualified_default_off",
+    "parent": "qualified vector codec and reuse-vector mask heldfixed",
+    "round_savings_ms_per_reuse_layer": [
+      0.0008991445312500068,
+      0.0008451445312500083,
+      0.0009165078125000087
+    ],
+    "layers_credited": 27,
+    "forecast_ms_per_token": 0.024276902343750184,
+    "active_total_forecast_ms_per_token": 0.6584495273437498,
+    "correctness": "Five checkpoint-derived inputs\u00d7four ranks alloutputs exact; simulator complete-output fixtures and all256E4M3 codes exact",
+    "physical_compiler_nodes": [
+      23,
+      23
+    ],
+    "flag": "VLLM_HPU_DSV41_MLA_REUSE_HW_CODEC",
+    "default": false,
+    "formal_qualified": false,
+    "scope": "Reuse-only.11 publisher layers unqualified and receive no credit. Same KV workspace ownership and FP32PV arithmetic. No profiler physical-kernel reduction claim.",
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-kv-hardware-codec-02/reuse-native-03"
+  },
+  "host_peer_burst_20261005": {
+    "status": "completed_primitive_not_qualified_transport",
+    "rank_max_completed_native_us_per_point": {
+      "A": [
+        12.6224,
+        12.6218,
+        12.6192
+      ],
+      "B": [
+        10.6132,
+        10.6213,
+        10.615
+      ]
+    },
+    "verified_epochs": 61200,
+    "scope": "100 device exchanges per single host native replay; actual native completion, changing10KB inputs; two ranks only",
+    "interpretation": "Amortizing host entry does not restore the6us target; five-owner device protocol stays near10.62us before realTP4 producer/consumer. Do not count as model gain or launch cyclic imports.",
+    "next": "Stop this mapped-host primitive family. Keep bounded cleanup/width findings; complete queued MLA chain measurements.",
+    "default": false,
+    "formal_gain_credit": false,
+    "cleanup": "Both owned workers retired and released modules2/3 without reset or imported buffers"
   }
 }

@@ -1000,6 +1000,11 @@ one vector producer. Requires `MLA_VECTOR_CODEC`; QK, softmax, PV and shared
 row ownership remain unchanged. Projection-fused consumers retain their path.
 Default off pending combined serving qualification.
 
+`VLLM_HPU_DSV41_MLA_PUBLISH_MASK=0`: C1 shared-main publication mask
+vectorization and power-of-two paging for the existing ratio1/2 contract.
+Requires `MLA_VECTOR_CODEC`. Selection and negative-page semantics are preserved.
+Default off until complete-chain qualification and combined serving acceptance.
+
 `VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL=0`: experimental C1 FP32 TPC control
 projection with independent K accumulators and shared RRMS. Takes precedence over
 `MHC_LINEAR_LOAD`; changes FP32 summation order and uses the official-equation
@@ -1032,3 +1037,10 @@ quality/performance pending; not enabled by the entrypoint.
 - `VLLM_HPU_DSV41_MHC_RRMS_POST` (default `0`): specialize deferred C1 post/collapse
   for the existing 25-value controller output. Uses its shared RMS statistic;
   arithmetic is unchanged. Combined formal qualification pending.
+
+### VLLM_HPU_DSV41_MLA_REUSE_HW_CODEC
+
+Default: `0`. Component-qualified C1 reuse codec using hardware E4M3 conversion
+with exact finite-FN, NaN and zero corrections. Requires `MLA_VECTOR_CODEC` and
+`MLA_VECTOR_MASK`; publish and wider-batch paths retain their existing implementation.
+Combined end-to-end qualification is pending.
