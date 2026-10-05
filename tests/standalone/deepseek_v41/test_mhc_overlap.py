@@ -117,6 +117,52 @@ def test_dependent_control_cannot_be_hoisted():
     assert not independent_mhc_nodes(child, [0, 3])
 
 
+@torch.library.custom_op("dsv41_overlap_test::deepseek_v41_mhc_gates_f32", mutates_args=())
+def gates_only(projection: torch.Tensor, scale: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
+    return torch.sigmoid(projection * scale + base)
+
+
+@gates_only.register_fake
+def _(projection, scale, base):
+    return torch.empty_like(projection)
+
+
+def _gate_consumer(projection, scale, base, peer):
+    gates = gates_only(projection, scale, base)
+    return (peer.float() + gates[:, :peer.shape[1]]).bfloat16(), gates
+
+
+@pytest.mark.parametrize("tokens", [1, 2, 6])
+def test_gate_only_recipe_runs_before_its_peer_consumer(tokens):
+    projection = torch.randn(tokens, 24)
+    scale, base = torch.ones(24), torch.randn(24)
+    partial = torch.randn(tokens, 8).bfloat16()
+    child = make_fx(_gate_consumer)(projection, scale, base, partial)
+    root = torch.nn.Module()
+    root.add_module("consumer", child)
+    graph = torch.fx.Graph()
+    p, s, b, v = (graph.placeholder(name) for name in ("projection", "scale", "base", "partial"))
+    peer = graph.call_function(torch.ops.dsv41_overlap_test.exchange.default, (v,))
+    result = graph.call_module("consumer", (p, s, b, peer))
+    first = graph.call_function(operator.getitem, (result, 0))
+    second = graph.call_function(operator.getitem, (result, 1))
+    graph.output((first, second))
+    source = torch.fx.GraphModule(root, graph)
+    candidate = copy.deepcopy(source)
+    audit = split_mhc_consumers(candidate, torch.ops.dsv41_overlap_test.exchange.default)
+    assert len(audit) == 1
+    assert any("mhc_gates_f32" in name for name in audit[0]["operators"])
+    calls = [node for node in candidate.graph.nodes if node.op == "call_module"]
+    assert len(calls) == 2
+    assert not any(arg.target == torch.ops.dsv41_overlap_test.exchange.default for arg in calls[0].all_input_nodes)
+    for seed in range(5):
+        torch.manual_seed(seed)
+        values = torch.randn_like(projection), scale, base, torch.randn_like(partial)
+        assert all(torch.equal(a, b) for a, b in zip(source(*values), candidate(*values)))
+    # A gate using peer-derived projection cannot bypass the collective wait.
+    assert not independent_mhc_nodes(child, [0, 3])
+
+
 @pytest.mark.parametrize("name", ["control_batch4", "control_prefetch"])
 def test_batch_control_keeps_independent_work_before_peer_consumer(name):
     source = _graph()

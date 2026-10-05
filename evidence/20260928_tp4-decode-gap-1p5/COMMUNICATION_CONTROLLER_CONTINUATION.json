@@ -2,8 +2,8 @@
   "formal_baseline_ms": 9.564282285406788,
   "target_ms": 7,
   "formal_completed_this_batch": false,
-  "new_qualified_gain_ms": 0,
-  "compatible_pending_forecast_ms": 0.6584495273437498,
+  "new_qualified_gain_ms": 0.136496875,
+  "compatible_pending_forecast_ms": 0.7949464023437499,
   "negative_and_prepared_experiments": {
     "decode-mhc-native-fp32-chain-01": {
       "status": "rejected_slower",
@@ -148,7 +148,7 @@
       "reason": "Existing lease API takes an exact module tuple, not a pool with smaller count. No GPU opened, no measurement. Retry uses automatic selection with healthy-pool assertion before spawn."
     },
     "decode-pcie-star-frontier-01": {
-      "status": "CPU_gates_passed_no_hardware_timing",
+      "status": "four_rank_rejected_inconsistent",
       "four_rank_arithmetic_simulator_cases": 40,
       "instructions_per_four_rank_simulation": 7399,
       "parent_instructions": 8691,
@@ -164,14 +164,38 @@
         "run_probe.py": "f156867c193df8f14e498ee8d7117abc2a43713c70af81ad65d32045d3bd364f",
         "build/libkernels.so": "336e4b1cce5408ef1c2984e867161be1f52b7f3bc365d9fb126875af86eb86f3",
         "build/probe": "1a34ee83df9578beedb7dd54709338ab818d2ccf3134a4a562e6dadebf209dce"
-      }
+      },
+      "gain_credit_ms": 0,
+      "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-pcie-star-frontier-01/four-rank-corrected"
     }
   },
-  "active": "decode-pcie-star-coarse-01/two-rank-corrected-02 waiting for any healthy pair; no model run queued",
+  "active": "Gate scheduling component-qualified and integrated default-off; next test moves exact packed controller into the same communication window. No formal run yet.",
   "excluded_modules": [
     0,
     1,
     4,
     5
-  ]
+  ],
+  "qualified_gate_schedule": {
+    "status": "component_qualified_default_off_pending_combined_serving",
+    "reference": "Swizzled parallel controller + shared-RRMS deferred post",
+    "candidate": "Same producer, gate recipe after peer submission, simple post consumer",
+    "paired_ms_per_boundary": [
+      0.001699148437499999,
+      0.0017206796874999972,
+      0.001706210937500001
+    ],
+    "forecast_occurrences": 80,
+    "forecast_ms_per_token": 0.13649687500000007,
+    "compatible_total_if_integration_passes": 0.7949464023437499,
+    "correctness": "5 checkpoint-derived fixtures x4 ranks, all9 outputs byte-exact, router IDs exact",
+    "execution": "Native explicit TP dependencies,8 communication points/group,200steps ABABAB",
+    "no_formal_result": true,
+    "formal_baseline_ms": 9.564282285406788,
+    "activation_gate": "Actual common helper Meta graph isolates pure gates; runtime native consumer indices defer TP wait until post. Combined serving activation/quality/latency remains unqualified.",
+    "owners_retired": true,
+    "physical_evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-mhc-gates-inflight-chain-01/PHYSICAL_SUMMARY.json",
+    "cpu_checks": 21,
+    "compatible_pending_forecast_ms": 0.7949464023437499
+  }
 }

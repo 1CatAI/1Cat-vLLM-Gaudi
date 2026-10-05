@@ -1126,3 +1126,30 @@ The earlier reuse-native-02 attempt failed before timing because its nested
 TMPDIR exceeded the Unix-domain socket limit. The shared component launcher
 now uses a short profile scratch root and checks the UUID path before leasing
 devices; no correctness/performance number is taken from that failed attempt.
+
+### 2026-10-06 — exact mHC gates during native peer exchange
+
+`decode-mhc-gates-inflight-chain-01`: parent is the qualified swizzled parallel
+controller plus shared-RRMS post. Both arms retain the same WO/control producer;
+the candidate submits peer exchange before running exact gates, then waits at
+post/FFN/router. Five checkpoint-derived fixtures × four ranks have all nine
+outputs byte-exact, including router IDs. ABABAB200 native boundary savings
+**.001699148/.001720680/.001706211 ms** are direction-consistent.
+Eighty mHC boundaries forecast **.136496875 ms/token**; this extrapolates the
+same operator/shape to both posts per layer, not a measured service result.
+Actual consumer inputs are checkpoint-derived embeddings, not captured activations.
+
+Physical nodes **8→9 per boundary**: the extra standalone gate runs in the
+communication window. This is scheduling overlap, not fusion or node-count credit.
+21 CPU checks cover pure-branch isolation and actual native Meta shapes for
+B1/B2/B6 and TP2/TP4. Default-off `VLLM_HPU_DSV41_MHC_COMM_GATES` selects the
+common helper; existing C1/deferred-gate guards keep prefill and C2–C6 unchanged.
+Replay and communication APIs/ABIs do not change. The splitter now recognizes
+a pure gate-only branch when its projection is external to the consumer recipe,
+while retaining communication-taint and mutation checks.
+
+Evidence: `/opt/ssd960/1cat-vllm-decode-archives/decode-mhc-gates-inflight-chain-01/`
+(`result.json`, `PHYSICAL_SUMMARY.json`, `DECISION.json`, native dependency logs),
+with CPU logs in `decode-mhc-gates-inflight-01`. All native owners retired.
+Compatible pending forecast **.794946402 ms/token**, official baseline remains
+**9.564282 ms/token**, batch formal trigger remains **1 ms**.

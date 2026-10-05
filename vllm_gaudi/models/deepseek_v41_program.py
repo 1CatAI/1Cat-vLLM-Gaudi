@@ -894,6 +894,7 @@ class PreparedDecoderLayer(nn.Module):
         self.batch_control_reuse = gaudi_envs.VLLM_HPU_DSV41_MHC_BATCH_REUSE
         self.batch_control_prefetch = gaudi_envs.VLLM_HPU_DSV41_MHC_CONTROL_PREFETCH
         self.mhc_control_rrms = gaudi_envs.VLLM_HPU_DSV41_MHC_CONTROL_RRMS
+        self.mhc_comm_gates = gaudi_envs.VLLM_HPU_DSV41_MHC_COMM_GATES
         self.mhc_mme_gates_norm = (
             gaudi_envs.VLLM_HPU_DSV41_MHC_MME_GATES_NORM and not self.draft
             and hasattr(torch.ops.custom_op, "custom_deepseek_v41_mhc_mme_gates_norm_gaudi2")
@@ -1090,6 +1091,10 @@ class PreparedDecoderLayer(nn.Module):
             deferred_post = (torch.ops.custom_op.custom_deepseek_v41_mhc_rrms_post_gaudi2
                              if gaudi_envs.VLLM_HPU_DSV41_MHC_RRMS_POST else
                              torch.ops.custom_op.custom_deepseek_v41_mhc_mme_post_collapse_gaudi2)
+            if getattr(self, "mhc_comm_gates", False):
+                from vllm_gaudi.ops.deepseek_v41_mhc_gate_schedule import communication_gates_post
+
+                deferred_post = communication_gates_post
         if prefill_sequence:
             new_pre, post, comb, value = sequence_hc_input(
                 residual,

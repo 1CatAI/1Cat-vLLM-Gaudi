@@ -15,6 +15,8 @@ import statistics
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--gates-during-exchange', action='store_true',
+                        help='Schedule exact gates after native exchange submission and before its first consumer')
     parser.add_argument('--bf16-control-weights', action='store_true',
                         help='Cold BF16 controller weights and native BF16 MAC with FP32 accumulation')
     parser.add_argument('--dense-transpose', action='store_true', help='Cold transpose WO weights and flip the native MME transpose flag; no hot weight copies')
@@ -43,6 +45,15 @@ def main():
     parser.add_argument('--retirement-only', action='store_true',
                         help='Reuse measured A/B; check teardown without timing')
     args = parser.parse_args()
+    if args.gates_during_exchange:
+        if any((args.bf16_control_weights, args.dense_transpose, args.early_gates,
+                args.direct_rrms_post, args.swizzled_control, args.late_control,
+                args.peer_prune, args.mme_shared_rrms, args.unpack_controller)):
+            parser.error('--gates-during-exchange is a separate scheduling experiment')
+        if args.chain_repeats % 8:
+            parser.error('--gates-during-exchange requires repetitions divisible by eight')
+        args.parallel_controller = True
+        args.swizzled_control = True
     if args.bf16_control_weights:
         if any((args.dense_transpose, args.early_gates, args.direct_rrms_post, args.swizzled_control,
                 args.late_control, args.peer_prune, args.mme_shared_rrms, args.unpack_controller)):
@@ -64,6 +75,8 @@ def main():
             parser.error('--late-control requires --parallel-controller and excludes other experiments')
         if args.chain_repeats % 8:
             parser.error('--late-control requires repetitions divisible by eight')
+        os.environ['VLLM_HPU_DSV41_TP_MHC_OVERLAP'] = '1'
+    elif args.gates_during_exchange:
         os.environ['VLLM_HPU_DSV41_TP_MHC_OVERLAP'] = '1'
     else:
         # One peer per component group is not the production eight-peer topology.
@@ -180,7 +193,8 @@ def main():
         if fused:
             # The same TPC owns fixed-rank summation and its BF16 boundary;
             # do not materialize a separate collective reduction node.
-            post_op = (torch.ops.custom_op.custom_deepseek_v41_mhc_rrms_post_gaudi2 if positive and args.direct_rrms_post else
+            post_op = (torch.ops.custom_op.custom_deepseek_v41_mhc_rrms_post_gaudi2
+                       if args.gates_during_exchange or (positive and args.direct_rrms_post) else
                        torch.ops.custom_op.custom_deepseek_v41_mhc_mme_post_collapse_gaudi2)
             updated,collapsed,gates=post_op(
                 peers,residual,projection,scale,base,eps)
@@ -197,6 +211,12 @@ def main():
         ids,routing=torch.ops.custom_op.custom_deepseek_v41_router_logits_top6_gaudi2(logits,bias,bias_vl,mask)
         return updated,collapsed,pre,normalized,quantized,act_scale,ids,routing,gates
     arms = (True, False) if args.early_gates else (True, True) if args.late_control or args.swizzled_control or args.direct_rrms_post or args.dense_transpose or args.bf16_control_weights else (False, False) if args.peer_prune else (False, True)
+    if args.gates_during_exchange:
+        arms = (True, False)
+    independent_gates = compiled(lambda projection, scale, base:
+        torch.ops.custom_op.custom_deepseek_v41_mhc_gates_f32_gaudi2(
+            projection[:, :24].contiguous(), projection[:, 24:25].contiguous(), scale, base)
+    ) if args.gates_during_exchange else None
     late_projection = compiled(lambda x,w,s:direct_dense_fp8(x,w,s)) if args.late_control else None
     late_controller = compiled(lambda r,w:
         torch.ops.custom_op.custom_deepseek_v41_control_rrms_parallel_bf16_gaudi2(r.flatten(1),w,eps)
@@ -259,7 +279,7 @@ def main():
             projection=None
         else:
             arm_control = (bf16_control if args.bf16_control_weights and arm == 1 else
-                           packed_control if args.swizzled_control and arm == 1 else control)
+                           packed_control if args.swizzled_control and (arm == 1 or args.gates_during_exchange) else control)
             value,projection=compute(producer,(x,residual,arm_control,mme_weight,transposed_wo if args.dense_transpose and arm == 1 else wo_weight,wo_scale))
         peers=torch.ops.vllm_gaudi.tp_peer_allgather(value,4)
         torch.hpu.synchronize()
@@ -268,9 +288,14 @@ def main():
         recorded_nodes.append(('gather', *gather_slots))
         if args.late_control and arm == 1:
             projection=compute(late_controller,(residual,control))
+        if args.gates_during_exchange and arm == 1:
+            # This recipe reads only control/scale/base. It must not bind peers:
+            # the native tensor dependency plan can defer the collective wait
+            # until the subsequent post consumer actually needs peer output.
+            projection=compute(independent_gates,(projection,control_scale,control_base))
         outputs=tuple(compute(consumer,(peers.reshape(4,1,5120),residual,projection,
             control_scale,control_base,norm,router_weight,bias,bias_vl,mask)))
-        repeats_per_group = 8 if args.late_control else 1
+        repeats_per_group = 8 if args.late_control or args.gates_during_exchange else 1
         for _ in range(repeats_per_group - 1):
             for operation in recorded_nodes:
                 if operation[0] == 'compute':
@@ -280,7 +305,7 @@ def main():
         plan.prepare(backend, [slot(value, False) for value in outputs])
         graph = bridge.NativeDecodeGraph()
         graph.configure_topology(args.chain_repeats // repeats_per_group, args.chain_repeats, False)
-        graph.configure_dependency_policy(args.late_control and arm == 1)
+        graph.configure_dependency_policy((args.late_control or args.gates_during_exchange) and arm == 1)
         graph.capture([plan] * (args.chain_repeats // repeats_per_group),
                       [external] * (args.chain_repeats // repeats_per_group))
         graph.instantiate()
@@ -311,12 +336,16 @@ def main():
         mix=torch.cat((reference_control[:,:24],torch.zeros_like(reference_control[:,:24])),1).contiguous()
         value=direct_dense_fp8(x,wo_weight,wo_scale)
         peers=torch.ops.vllm_gaudi.tp_peer_allgather(value,4).reshape(4,1,5120)
-        pure=consume(peers,residual,mix,control_scale,control_base,norm,router_weight,bias,bias_vl,mask,fused=True)
+        pure=consume(peers,residual,reference_control if args.gates_during_exchange else mix,
+                     control_scale,control_base,norm,router_weight,bias,bias_vl,mask,fused=True)
         torch.hpu.synchronize()
         exact_tpc=[torch.equal(a.view(torch.uint8),b.cpu().view(torch.uint8)) for a,b in zip(observed[0],pure,strict=True)]
-        mme_gates,*_=torch.ops.custom_op.custom_deepseek_v41_mhc_mme_gates_norm_gaudi2(
-            torch.ops.custom_op.custom_deepseek_v41_control_mme_f32_gaudi2(residual.flatten(1),mme_weight),
-            residual.flatten(1),visible[0][1],norm,control_scale,control_base,eps)
+        if args.gates_during_exchange:
+            mme_gates = observed[1][8]
+        else:
+            mme_gates,*_=torch.ops.custom_op.custom_deepseek_v41_mhc_mme_gates_norm_gaudi2(
+                torch.ops.custom_op.custom_deepseek_v41_control_mme_f32_gaudi2(residual.flatten(1),mme_weight),
+                residual.flatten(1),visible[0][1],norm,control_scale,control_base,eps)
         reference_gates=torch.ops.custom_op.custom_deepseek_v41_mhc_gates_f32_gaudi2(
             reference_control[:,:24].contiguous(),reference_control[:,24:].contiguous(),control_scale,control_base)
         gate_error=(reference_gates.cpu()-mme_gates.cpu()).abs()

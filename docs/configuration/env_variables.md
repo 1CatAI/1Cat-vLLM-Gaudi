@@ -1044,3 +1044,14 @@ Default: `0`. Component-qualified C1 reuse codec using hardware E4M3 conversion
 with exact finite-FN, NaN and zero corrections. Requires `MLA_VECTOR_CODEC` and
 `MLA_VECTOR_MASK`; publish and wider-batch paths retain their existing implementation.
 Combined end-to-end qualification is pending.
+
+### VLLM_HPU_DSV41_MHC_COMM_GATES
+
+Default: `0`. Component-qualified scheduling candidate for the existing C1
+deferred mHC path. Computes exact gates after native peer submission, before
+the post consumer needs peer output. Requires `MHC_DEFERRED_GATES`,
+`MHC_GATES_FUSED`, `TP_MHC_OVERLAP`, and the native joint/static replay plan to
+realize overlap. Control precision and fixed-rank peer summation stay unchanged.
+Prefill and C2–C6 retain their current path. Combined official-sampling serving
+qualification is pending. This adds a standalone gate node; no node-count
+reduction or end-to-end saving is claimed.

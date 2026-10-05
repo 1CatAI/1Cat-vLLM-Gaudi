@@ -258,3 +258,10 @@ Standalone fixed1280 unroll reduces simulator instructions1037→569, but fused 
 ## Latest communication/controller gates
 
 Native FP32 controller full boundary passes official tolerance/router equality but regresses about50us;4->6 producer nodes. Reject, no MME-controller gain. Fine-vector PCIe parallelism also regresses two-rank primitive16.2->37.1us;40 vectors multiply scalar ready/ACK transactions. Parameterized device controls compile/simulate correctly but have no hardware timing. The next screen coarsens synchronization and avoids fetching the local rank over PCIe; it preserves leaf-only imports. Compatible pending forecast remains **.658449527ms**, official baseline **9.564282ms**. Earlier cumulative figures in this chronological document are superseded by the maintained gain ledger.
+
+2026-10-06 mHC gate scheduling: a native WO/control→peer→gates→post/FFN/router
+chain saves1.699/1.721/1.706us/boundary with exact outputs on four ranks.
+Producer stays4nodes, reference post/router4nodes; candidate gate1 +post/router4.
+This changes the exposed TP-wait boundary, not bandwidth or node count.
+Component-qualified80-boundary forecast .136496875ms/token; pending compatible
+total .794946402, formal9.564282 unchanged. Full service remains unqualified.
