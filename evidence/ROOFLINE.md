@@ -250,3 +250,7 @@ Five checkpoint-derived fixtures pass bitexact with the candidate640 kernel; act
 ## Native two-rank peer headroom
 
 Checkpoint WO→native exchange→mHC post/FFN norm with an identical TWO-rank partial sum: four-rank AG38.216–38.224us vs direct pair37.965–37.982us; three savings.234/.259/.238us. Five changing fixtures/four ranks bitexact. Two-peer doubling additionally needs another exchange plus F32 intermediate sum, so this screen does not establish useful four-rank headroom. It does not measure absolute transport latency or qualify a TP4 reduction. No model credit or mixed-communicator runtime extension. Evidence: `/opt/ssd960/1cat-vllm-decode-archives/decode-pair-native-transport-01`.
+
+## Qnorm complete-chain result
+
+Standalone fixed1280 unroll reduces simulator instructions1037→569, but fused QKV register pressure increases local memory traffic. Same19 physical compute nodes;5×4 real-chain outputs bitexact; three native regressions2.640/2.613/2.623us/layer. Two ISA-directed lifetime fixes are also rejected offline, not sent through model startup. This confirms that standalone instruction reduction is insufficient; retain none of these runtime changes. Integer descriptor repair affects simulation tooling only, not production dataflow or formal timing. Baseline9.564282/pending.658449527ms unchanged.

@@ -6,15 +6,16 @@
 
 namespace gaudi_validation {
 // TPC tensor_config encodings are not tpc_lib_api::TensorDataType bit flags.
-// In particular FP32 is 7; 3 selects UINT16 and silently truncates simulations.
+// FP32 is 7. Integer encodings are I8/I16/I32=0/1/2 and
+// U8/U16/U32=3/4/5; a wrong size silently changes GEN_ADDR byte strides.
 inline unsigned tensor_config_type(tpc_lib_api::TensorDataType type) {
     using namespace tpc_lib_api;
     switch (type) {
     case DATA_I8: return 0;
-    case DATA_U8: return 1;
-    case DATA_I16: return 2;
-    case DATA_U16: return 3;
-    case DATA_I32: return 4;
+    case DATA_U8: return 3;
+    case DATA_I16: return 1;
+    case DATA_U16: return 4;
+    case DATA_I32: return 2;
     case DATA_U32: return 5;
     case DATA_BF16: return 6;
     case DATA_F32: return 7;
