@@ -1001,3 +1001,22 @@ projection with independent K accumulators and shared RRMS. Takes precedence ove
 numerical tolerance contract. Compatible with `MHC_DEFERRED_GATES`; prefill and
 C2–C6 keep the existing controller. Native component-qualified, combined serving
 quality/performance pending; not enabled by the entrypoint.
+
+- `VLLM_HPU_DSV41_FFN_BF16_QUANT` (default `0`): C1-only vector BF16 product/FP8 conversion
+  inside dual FFN norm quantization. Requires `FFN_DUAL_QUANT`; production-chain micro-qualified,
+  pending combined official-sampling acceptance. Prefill and multi-token decode retain their existing quantizer.
+
+- `VLLM_HPU_DSV41_INDEX_GAIN_REPLICA` (default `0`): cold rank-ordered BF16 index
+  head-gain weight replication. Removes only the gain exchange in C1 paged decode;
+  query weights stay sharded. Prefill and request-batch paths keep both exchanges.
+  Both TP2/TP4 layouts use the same implementation. Requires weight reload to change;
+  experimental until combined official-sampling end-to-end qualification.
+
+- `VLLM_HPU_DSV41_MHC_SWIZZLED_CONTROL` (default `0`): cold K128/head packing for
+  the C1 parallel FP32 controller. Requires `MHC_PARALLEL_CONTROL` and
+  `MHC_DEFERRED_GATES`. Adds one packed copy of each control weight; the ordinary
+  checkpoint layout remains for prefill and C2–C6. Combined formal qualification pending.
+
+- `VLLM_HPU_DSV41_MHC_RRMS_POST` (default `0`): specialize deferred C1 post/collapse
+  for the existing 25-value controller output. Uses its shared RMS statistic;
+  arithmetic is unchanged. Combined formal qualification pending.

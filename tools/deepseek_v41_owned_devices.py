@@ -18,9 +18,16 @@ def wait_for_released_modules(modules, record, *, timeout_s=300, poll_s=5):
     while True:
         load = subprocess.check_output(
             ['hl-smi', '-Q', 'module_id,memory.used,utilization.aip', '-f', 'csv,noheader'], text=True)
-        rows = {int(fields[0]): fields for line in load.splitlines() if (fields := line.split(','))}
-        pending = [module for module in modules
-                   if int(rows[module][1].split()[0]) > 768 or int(rows[module][2].split()[0]) != 0]
+        rows = {int(fields[0]): fields for line in load.splitlines() if (fields := line.split(',')) and fields[0].strip().isdigit()}
+        pending = []
+        for module in modules:
+            try:
+                fields = rows[module]
+                released = int(fields[1].split()[0]) <= 768 and int(fields[2].split()[0]) == 0
+            except (KeyError, ValueError, IndexError):
+                released = False  # Missing/resetting telemetry is not proof of release.
+            if not released:
+                pending.append(module)
         observations.append(dict(time=time.time(), cards=load, pending=pending))
         Path(record).write_text(json.dumps(observations, indent=2)+'\n')
         if not pending:
@@ -58,12 +65,16 @@ def wait_for_free_modules(record, *, count=4, modules=None, preferred=(0, 1, 4, 
     while True:
         load = subprocess.check_output(
             ['hl-smi', '-Q', 'module_id,memory.used,utilization.aip', '-f', 'csv,noheader'], text=True)
-        rows = {int(fields[0]): fields for line in load.splitlines() if (fields := line.split(','))}
+        rows = {int(fields[0]): fields for line in load.splitlines() if (fields := line.split(',')) and fields[0].strip().isdigit()}
         if requested is not None and not set(requested).issubset(rows):
             raise ValueError(f'Requested modules are not present: {requested}')
         free, opened = [], {}
         for module, fields in sorted(rows.items()):
-            if int(fields[1].split()[0]) > 768 or int(fields[2].split()[0]) != 0:
+            try:
+                memory, utilization = int(fields[1].split()[0]), int(fields[2].split()[0])
+            except (ValueError, IndexError):
+                continue  # Unknown telemetry is never an available device.
+            if memory > 768 or utilization != 0:
                 continue
             opened[module] = owners(module)
             if not opened[module] and eligible(module):

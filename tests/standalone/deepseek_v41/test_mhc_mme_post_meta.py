@@ -30,3 +30,12 @@ def test_inference_contract(index):
     values=operands();values[index]=values[index].double()
     with pytest.raises(RuntimeError,match='inference'):
         torch.ops.custom_op.custom_deepseek_v41_mhc_mme_post_collapse_gaudi2(*values,1e-20)
+
+
+@pytest.mark.parametrize('name',['mhc_rrms_post'])
+def test_rrms_only_post_contract(name):
+    op=getattr(torch.ops.custom_op,f'custom_deepseek_v41_{name}_gaudi2')
+    outputs=op(*operands(1,4,25),1e-20)
+    assert [tuple(v.shape) for v in outputs]==[(1,4,5120),(1,5120),(1,24)]
+    with pytest.raises(RuntimeError,match='shared RRMS'):
+        op(*operands(1,4,48),1e-20)

@@ -887,8 +887,40 @@ Existing wide woA epilogue preserved WoB consumer bits at C1/C2/C6 but no small-
 - `decode-pcie-capability-01`: owned2/3, DMA-BUF export/import and16KB data correctness passed; not a timing result.
 - `decode-pcie-oneshot-01/02`: old benchmark's two-input contract disagreed with the current one-input TPC GUID; no timing.
 - `decode-pcie-oneshot-03`: repaired private standalone probe, TP2 10KB exact; host-submitted batch20.86–20.89µs, not a native TP4 gain.
-- `decode-pcie-native-04`: mixing standalone legacy SDK/HCL with serving Synapse invalidated the runtime and crashed; zero credit. Owned orphan retired; all cards released. No inference from this failure about PCIe performance.
+- `decode-pcie-native-04` and05–08: compiler crash; later gdb pins the actual null call to missing `GetSuggestedManipulation` in the old TPC library. Initial runtime-mix attribution withdrawn. Private wrapper adds the hook;09 compiles. Zero performance credit.
 - `decode-mhc-official-tolerance-01`: official-equation tolerance passed, native chain slower13.89µs; no credit.
 - `decode-mhc-shared-rrms-01`: one RRMS statistic removes redundant scans but remains slower13.97µs; disproves scans as the sole cause. MME resource contention with WO remains the next attribution target, not a numerical rejection.
 - `decode-mhc-parallel-k-01`: TPC eight independent K accumulators plus deferred post; upstream tolerance passed5×4,3 positive rounds; replaces linear-post ledger item.
 - `decode-roofline-audit-01`: exact compiler SRAM overlap examples; actual expert ISA109 bundles/33loads/32stores/96decode ops. Two-op dictionary direction stopped; no gain assigned to static analysis.
+
+- `decode-pcie-native-10/11`: port to actual runtime APIs;10 rejected an empty collective plan;11 compiled and captured. No latency credit.
+- `decode-pcie-native-push-12/13`: invalid native timing; stale stream bookkeeping missed native completion; epoch check rejected80/535. Zero credit.
+- `decode-pcie-native-push-14`: explicit SCAL completion wait,535 epochs and10KB BF16 TP2 sum pass;~9.19µs completed primitive. Not TP4 nor production-chain qualification.
+- `decode-mhc-split-k-01`: official accuracy5×4 and55 CPU checks pass;3 rounds slower3.89µs/boundary. Patch archived, production restored; zero credit.
+- `decode-pcie-native-nrank-15`: zero-target completion wait threw after capture; exceptional path missed imported DMA-BUF unmapping. Modules0/1/4/5 retain three driver context references each; ordinary reset cannot finish. No foreign processes stopped. Reboot coordination pending. nrank16 was stopped while waiting, never launched hardware. See SSD incident record.
+
+- `decode-ffn-bf16-quant-01`: simulator5 fixtures exact,3791→3439 instructions. Native graph classification expected the old expert GUID, so no timing; corrected to quantizer GUIDs for the identical expert parent.
+- `decode-ffn-bf16-quant-02`: complete correctness/placement passed; pre-timing monitor failed on unrelated resetting-card N/A telemetry. Owned group retired. Monitoring now preserves unknown rows and requires all owned modules to be present;28 CPU tests pass.
+- `decode-ffn-bf16-quant-03`: user-authorized2/3/6/7, five×four exact,3 positive rounds; incremental forecast.001143438ms, default off.
+- User recovery decision: continue on usable cards. No reboot authorized or performed. Cyclic DMA-BUF test quarantined; all affected0/1/4/5 remain excluded.
+
+- `decode-dense-weight-stream-01`: five x four exact, SRAM producer confirmed; three-fragment copy+MME slower ~5.21 us/boundary.
+- `decode-dense-weight-stream-02`: compile option 1 rejected by the tool allowlist; no timing.
+- `decode-dense-weight-stream-03`: one fitting 10MB SRAM operand, five x four exact; three rounds slower ~3.01 us/boundary. Second performance failure; stop direct weight-copy approach, zero credit.
+- `decode-peer-overlap-control-01`: native topology guard rejected one-point overlap groups before timing.
+- `decode-peer-overlap-control-02`: eight-point groups, five x four exact; ~0.0365 us/boundary prototype improvement, not production integrated and not credited.
+- `decode-index-gain-replica-01`: five x four exact query/gain/score bytes, three positive native rounds. Eight-layer forecast .03070325ms, generic TP C1 integration default off.
+
+- `decode-mhc-swizzled-control-01`: five x four exact, three positive native rounds (~.138us/boundary), same number of logical stages. Cold common-path C1 weight packing default off; .005530156ms forecast for 40 qualified boundaries.
+- `decode-mhc-positive-recip-01/02`: static-only reciprocal trials; uncontracted loop did not shorten critical instructions. No hardware timing/credit. The 25-value specialized post contract removes the unused RMS branch and its invariant setup; checked in `decode-mhc-rrms-post-01` first.
+
+- `decode-mhc-rrms-post-01`: specialized 25-value controller layout, five x four exact. Three minuscule positive differences (2.5–7.3ns/boundary), literal forecast recorded without a material-gain claim.
+- `decode-mhc-early-gates-01`: both arms use the qualified parallel controller; returning gates to the WO producer is slower 1.255–1.268us/boundary. Keep deferred post. Zero credit.
+- `decode-mhc-positive-recip-02`: FMA Newton variant still has an equally long serial Sinkhorn loop. Static rejection; no hardware run. Archived, removed unqualified numerical variant from maintained source.
+
+- `decode-mla-static-softmax-01`: five x four exact, compiler producer still19 nodes and same SRAM locations. Full 640-row unroll is slower .219–.312us/layer in3 native rounds; sparse local traffic reduction did not shorten the full chain. Archived patch; no maintained default and zero gain credit.
+
+- `decode-dense-cold-transpose-01`: five x four exact; WO [N,K]→[K,N] with native MME transpose flag, no hot copy; three rounds slower .104–.114us/boundary. No credit.
+- `decode-qkv-cold-transpose-01`: same cold layout change on QKV [1792,5120], full Q/KV→MLA→WO→peer consumer. Five x four exact; round differences −.000037645/+.000019777/−.000042418ms, inconsistent, no credit. Stop cold-layout transpose for these shapes.
+- Common replay integration: index-gain replica reduces the StageVariant collective count only for C1; C2/C6 retain two query/gain points. 100 CPU checks cover topology, resource teardown, native input/tail and overlap. Fresh native database and50 native metadata checks pass.
+- `decode-merged-parallel-control-01`: queued real16 native official-sampling comparison for existing MERGE_LOCAL_SEGMENTS with the qualified parallel controller/deferred gates in both arms. This earlier direction was interrupted before measurement; formal batch03 logs prove8 extra mHC partitions per4-layer group. No forecast credit yet.

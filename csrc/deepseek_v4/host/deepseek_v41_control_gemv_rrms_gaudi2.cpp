@@ -14,6 +14,9 @@ extern unsigned char _binary___deepseek_v41_control_rrms_unpack_bf16_gaudi2_o_en
 extern unsigned char _binary___deepseek_v41_control_rrms_parallel_bf16_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_control_rrms_parallel_bf16_gaudi2_o_end;
 
+extern unsigned char _binary___deepseek_v41_control_rrms_swizzled_bf16_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_control_rrms_swizzled_bf16_gaudi2_o_end;
+
 tpc_lib_api::GlueCodeReturn
 DeepseekV41ControlGemvRrmsGaudi2::GetGcDefinitions(
     tpc_lib_api::HabanaKernelParams* p,
@@ -33,7 +36,8 @@ DeepseekV41ControlGemvRrmsGaudi2::GetGcDefinitions(
     const auto tokens = x.maxSizes[1];
     if (x.dims != 2 || x.maxSizes[0] != 20480 || tokens < 1 ||
         tokens > 2048 ||
-        w.dims != 2 || w.maxSizes[0] != 20480 || w.maxSizes[1] != 24 ||
+        (unpack_ == 3 ? (w.dims != 3 || w.maxSizes[0] != 128 || w.maxSizes[1] != 24 || w.maxSizes[2] != 160) :
+         (w.dims != 2 || w.maxSizes[0] != 20480 || w.maxSizes[1] != 24)) ||
         y.dims != 2 || y.maxSizes[0] != 25 || y.maxSizes[1] != tokens)
         return GLUE_INCOMPATIBLE_INPUT_SIZE;
     const auto* scalar = static_cast<const float*>(p->nodeParams.nodeParams);
@@ -62,6 +66,12 @@ DeepseekV41ControlGemvRrmsGaudi2::GetGcDefinitions(
     wm[0].end_b = 20479;
     wm[1].indexSpaceDim = 0;
     wm[1].a = 1;
+    if (unpack_ == 3) {
+        wm[0].end_b = 127;
+        wm[2].indexSpaceDim = 0;
+        wm[2].a = 0;
+        wm[2].end_b = 159;
+    }
     auto& ym = out->outputTensorAccessPattern[0].mapping;
     ym[0].indexSpaceDim = 0;
     ym[0].a = 0;
@@ -82,6 +92,10 @@ DeepseekV41ControlGemvRrmsGaudi2::GetGcDefinitions(
     if (unpack_ == 2) {
         begin = &_binary___deepseek_v41_control_rrms_parallel_bf16_gaudi2_o_start;
         end = &_binary___deepseek_v41_control_rrms_parallel_bf16_gaudi2_o_end;
+    }
+    if (unpack_ == 3) {
+        begin = &_binary___deepseek_v41_control_rrms_swizzled_bf16_gaudi2_o_start;
+        end = &_binary___deepseek_v41_control_rrms_swizzled_bf16_gaudi2_o_end;
     }
     const unsigned capacity = out->kernel.elfSize;
     out->kernel.elfSize = end - begin;

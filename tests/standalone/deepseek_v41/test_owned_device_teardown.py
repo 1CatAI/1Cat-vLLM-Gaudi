@@ -30,6 +30,15 @@ def test_timeout_leaves_busy_allocations_untouched(monkeypatch, tmp_path):
         devices.wait_for_released_modules((0,), tmp_path/'release.json', timeout_s=0)
 
 
+def test_release_monitor_keeps_unknown_owned_module_pending(monkeypatch, tmp_path):
+    samples = iter(['N/A, N/A MiB, N/A %\n', '2, N/A MiB, N/A %\n', '2, 768 MiB, 0 %\n'])
+    monkeypatch.setattr(devices.subprocess, 'check_output', lambda *a, **k: next(samples))
+    monkeypatch.setattr(devices.time, 'sleep', lambda _: None)
+    record = tmp_path/'release.json'
+    devices.wait_for_released_modules((2,), record)
+    assert [row['pending'] for row in json.loads(record.read_text())] == [[2], [2], []]
+
+
 def test_selects_other_free_cards_without_a_lease(monkeypatch, tmp_path):
     load = ''.join(f'{module}, {90000 if module in (0, 1, 4, 5) else 768} MiB, 0 %\n' for module in range(8))
     monkeypatch.setattr(devices.subprocess, 'check_output', lambda *a, **k: load)

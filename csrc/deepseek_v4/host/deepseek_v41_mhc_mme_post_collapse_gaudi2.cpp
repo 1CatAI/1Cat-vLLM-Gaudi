@@ -4,6 +4,8 @@
 #include <initializer_list>
 extern unsigned char _binary___deepseek_v41_mhc_mme_post_collapse_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_mhc_mme_post_collapse_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_mhc_rrms_post_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_mhc_rrms_post_gaudi2_o_end;
 namespace {
 bool shape(const tpc_lib_api::Tensor& t, tpc_lib_api::TensorDataType dtype, std::initializer_list<uint64_t> sizes) {
     if(t.geometry.dataType!=dtype || t.geometry.dims!=sizes.size())return false;
@@ -24,6 +26,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41MhcMmePostCollapseGaudi2::GetGcDefinition
        !shape(in->inputTensors[3],DATA_F32,{3}) || !shape(in->inputTensors[4],DATA_F32,{24}))return GLUE_INCOMPATIBLE_INPUT_SIZE;
     if(!shape(in->outputTensors[0],DATA_BF16,{5120,4,tokens}) || !shape(in->outputTensors[1],DATA_BF16,{5120,tokens}) ||
        !shape(in->outputTensors[2],DATA_F32,{24,tokens}))return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+    if (mode_ && !shape(in->inputTensors[2],DATA_F32,{25,tokens})) return GLUE_INCOMPATIBLE_INPUT_SIZE;
     for(unsigned i=0;i<5;++i)out->inputTensorAccessPattern[i].allRequired=true;
     for(unsigned i=0;i<2;++i) {
         auto& a=out->outputTensorAccessPattern[i];a.mapping[0]={0,128,0,127};
@@ -35,6 +38,10 @@ tpc_lib_api::GlueCodeReturn DeepseekV41MhcMmePostCollapseGaudi2::GetGcDefinition
     std::memcpy(out->kernel.scalarParams,in->nodeParams.nodeParams,sizeof(float));out->kernel.paramsNr=1;
     auto* first=&_binary___deepseek_v41_mhc_mme_post_collapse_gaudi2_o_start;
     auto* last=&_binary___deepseek_v41_mhc_mme_post_collapse_gaudi2_o_end;
+    if (mode_ == 2) {
+        first=&_binary___deepseek_v41_mhc_rrms_post_gaudi2_o_start;
+        last=&_binary___deepseek_v41_mhc_rrms_post_gaudi2_o_end;
+    }
     const auto capacity=out->kernel.elfSize;out->kernel.elfSize=last-first;
     if(capacity<out->kernel.elfSize)return GLUE_INSUFFICIENT_ELF_BUFFER;
     std::memcpy(out->kernel.kernelElf,first,out->kernel.elfSize);return GLUE_SUCCESS;

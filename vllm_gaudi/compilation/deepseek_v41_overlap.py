@@ -136,7 +136,12 @@ def independent_mhc_nodes(module, dependent_inputs):
     for node in nodes:
         if any(argument in tainted for argument in node.all_input_nodes):
             tainted.add(node)
-    controls = ("deepseek_v41_control_gemv", "deepseek_v41_control_batch4_f32", "deepseek_v41_control_prefetch_f32")
+    controls = (
+        "deepseek_v41_control_gemv", "deepseek_v41_control_batch4_f32",
+        "deepseek_v41_control_prefetch_f32", "deepseek_v41_control_rrms_unpack",
+        "deepseek_v41_control_rrms_parallel", "deepseek_v41_control_rrms_swizzled",
+        "deepseek_v41_control_mme_f32",
+    )
     seeds = [
         node
         for node in nodes

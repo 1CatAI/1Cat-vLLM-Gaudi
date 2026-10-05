@@ -31,7 +31,7 @@ A bandwidth lower bound excludes launch, dependency, reduction, address and pipe
   must remain unknown until an observable device signal exists. No manufactured four-way time split.
 - 81 large points are embedding plus Attention/MoE outputs; 8×(2048+256B) are index query/weight,
   2×3072B external Engram, remaining256B tail candidate. These 19 small points are not all removable.
-- Current pending qualified micro forecast **.444782008 ms**, formal benefit **unmeasured**.
+- Current pending qualified micro forecast **.459858570 ms**, formal benefit **unmeasured**.
   Use ~40% realization as planning assumption; next formal trigger remains ≥1ms accumulated forecast.
 
 ## Hardware references and limits
@@ -42,7 +42,7 @@ A bandwidth lower bound excludes launch, dependency, reduction, address and pipe
   HLS2 has21 internal100Gb/s ports per device for7 peers. Standard allreduce uses reduce-scatter/allgather.
   This is **not proof** that our already-captured peer allgather uses that two-phase algorithm.
 - [TPC architecture](https://docs.habana.ai/en/latest/TPC/TPC_User_Guide/Processor_Architectural_Overview.html):
-  initial web fetch returned429; cached SDK/ISA must verify Gaudi2-specific load/store throughput and whether read/write overlap.
+  retrieved locally after an initial429; average one256B vector read or write per4cycles, read/write port overlap unspecified.
 - [MonoMoE](https://arxiv.org/abs/2609.04244), [Gaudi kernels](https://github.com/tracycam/gaudi-kernels):
   implementation references; no transferred speed claim.
 - [Gaudi3 white paper](https://cdrdv2-public.intel.com/817486/gaudi-3-ai-accelerator-white-paper.pdf):
@@ -79,7 +79,7 @@ mHC mathematical equations under DeepGEMM's normalized squared-error limits on f
 checkpoint-derived inputs×four ranks. This executes a CPU equation oracle, not CUDA.
 The initial complete boundary still loses **.01389 ms**: its post kernel recomputes the
 20480-element RMS at each of 40 feature owners. A new producer computes the statistic once
-and passes the existing25-value control layout to all consumers; verification pending.
+and passes the existing25-value control layout to all consumers; it also passed accuracy but remained slower (below).
 
 **E, stop the two-instruction lookup direction.** The actual unrolled W13 inner loop emits
 8192 values with33 vector loads (including scales),32 stores,96 decode vector arithmetic
@@ -96,7 +96,7 @@ ISA and calculations: `decode-roofline-audit-01/{expert.s,EXPERT_ISSUE_BUDGET.js
 C follow-up: one shared RRMS did **not** recover the MME regression (three rounds
 −.013972680/−.013972555/−.013980027ms). Thus redundant RMS scans were real but not
 the measured root cause. The compiled candidate places a second GEMM in the WO
-producer; moving TPC work onto the same MME removes engine overlap. No MME gain credited.
+producer; the added MME serialization is a structural explanation to investigate, not a separately measured stall attribution. No MME gain credited.
 Keeping TPC and separating eight K accumulators passed official equations (maximum
 normalized error7.679e-9) and saves .000995863ms per measured boundary; 40-boundary
 forecast.039834531ms replaces the old.025901406ms. Total pending.458715133ms.
@@ -110,3 +110,56 @@ B API evidence: the serving runtime's `synapse/include/synapse_api_types.h` expl
 marks `MEMORY_ATTRIBUTE_SRAM` as unsupported, while persistent storage is a separate
 attribute. Do not model shared SRAM as a persistent cross-recipe cache. An allocator/
 ownership extension is needed before cross-recipe prefetch; current recipes overlap.
+
+
+## Further qualification and hardware incident
+
+- `decode-mhc-split-k-01`: actual eight-way K partition (192 workpoints rather
+  than24), combined with partial reduction inside the post consumer. Five
+  fixtures×four ranks passed the upstream numerical contract,55 CPU checks passed.
+  Three native-chain differences were **−.003891867/−.003892789/−.003883887 ms**.
+  No credit; archived patch and restored production sources. K partitioning alone
+  duplicates partial-reduction work at the40 post owners and adds scheduling waves.
+- `decode-pcie-native-push-14`: two ranks, fixed addresses, double-buffered direct
+  push,10KB. Native completion epoch535 verified; completed batch about9.19µs
+  (device event includes a final host completion wait). This is a primitive
+  qualification, **not** a production TP4 gain or a transport-only lower bound.
+- Earlier native push12/13 sub-microsecond timings are invalid: a stream wait
+  did not join the raw native replay queue. A recurrence check caught80 actual
+  epochs versus535 requested. Those values are excluded from all totals.
+- `decode-pcie-native-nrank-15` failed immediately after capture: the probe tried
+  to wait on an unset native replay completion (target0). Its error path exited
+  without unmapping the three imported DMA-BUFs on each rank. The driver retained
+  three context references on each of modules0/1/4/5. No four-rank correctness or
+  latency result exists. All owned processes exited; no other tasks were stopped.
+- At18:21 targeted resets of these four unowned devices were requested after
+  checking all process FDs. Driver reset repeatedly reports `compute_ctx refcount3`
+  and cannot finish. Recovery coordination has been requested; **do not launch
+  another cyclic DMA-BUF test**. A hard-killed service would expose the same
+  lifetime risk, so this mapping design is not production-ready.
+
+Official baseline remains9.564282ms, pending qualified forecast.458715133ms;
+no new formal request and no claim of reaching7ms.
+
+D follow-up: vector BF16 quantization passed5×4 complete-chain checks and3 positive
+rounds on available modules2/3/6/7. Forecast only.001143438ms/token, not the9.3%
+ISA reduction applied to model time. Pending total.459858570ms. User requested
+continuing on available cards rather than coordinating a reboot now; affected
+0/1/4/5 are not used. Telemetry records N/A instead of crashing or treating it as idle.
+
+Latest native A/B extensions on available2/3/6/7: gain-only index replication
+removes8 small collectives in the C1 candidate (forecast.030703250ms);
+swizzled FP32 control weights add.005530156ms; direct shared-RRMS post adds only
+.000290156ms, too small for a material timing claim. Current literal pending
+forecast **0.496382133ms**, formal baseline unchanged.
+Same-recipe SRAM weight streaming failed twice (3-slice and fitting1-slice),
+so stop that approach. Early gates with the faster controller also regress.
+All default-off until the combined formal gate; no bandwidth-counter claim.
+
+Compiler follow-up (static): Gaudi2 TPC null descriptors program the NOP kernel
+and completion signal registers (`TpcQueue::createNullDescRegsList`); they cannot
+be deleted independently of completion accounting. Formal batch03 logs show
+8 extra independent mHC partitions per four-layer group. The existing common
+MERGE_LOCAL_SEGMENTS implementation has no completed historical timing (earlier
+run interrupted by restart). Qualify it with the faster controller, retaining
+native communication dependencies; do not infer savings from null count alone.

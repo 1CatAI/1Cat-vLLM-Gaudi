@@ -284,3 +284,17 @@ def test_recipe_count_includes_deferred_position_copy_variants(tmp_path):
     (root / 'second.recipe').write_bytes(b'next position')
     assert recipe_cache_count(environment) == 2
     assert recipe_cache_count({}) == 0
+
+
+def test_unavailable_foreign_device_is_recorded_without_becoming_idle():
+    snapshot = ab.parse_device_load('2, 0 %, 768 MiB\nN/A, N/A %, N/A MiB\n3, N/A %, 768 MiB\n')
+    assert snapshot['modules'] == [dict(module=2, utilization=0, memory_mib=768)]
+    assert len(snapshot['unavailable']) == 2
+
+
+def test_telemetry_identity_disappearing_does_not_raise_or_invent_growth():
+    first = ab.parse_device_load('2, 0 %, 8505 MiB\n0, 0 %, 98304 MiB\n')
+    last = ab.parse_device_load('2, 0 %, 8505 MiB\nN/A, N/A %, N/A MiB\n')
+    assert ab.settling_modules([first, last], own_modules=(2,)) == []
+    assert ab.loading_modules([first, last], own_modules=(2,)) == []
+    assert ab._common_device_memory([first, last])[1] == [2]

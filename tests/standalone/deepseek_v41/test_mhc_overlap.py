@@ -183,3 +183,32 @@ def test_residual_and_flat_control_share_exact_float_conversion():
     assert sum(n.target == torch.ops.aten._to_copy.default for n in candidate.graph.nodes) == 1
     for value in (r, r * 0, r * 16):
         assert all(torch.equal(a, b) for a, b in zip(original(value), candidate(value)))
+
+
+def _register_controller_variant(name):
+    @torch.library.custom_op(f"dsv41_overlap_test::{name}", mutates_args=())
+    def project(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.linear(value, weight)
+
+    @project.register_fake
+    def _(value, weight):
+        return value.new_empty(value.shape[0], weight.shape[0])
+
+    return project
+
+
+_controller_variants = [_register_controller_variant(name) for name in (
+    'deepseek_v41_control_rrms_unpack', 'deepseek_v41_control_rrms_parallel',
+    'deepseek_v41_control_rrms_swizzled',
+    'deepseek_v41_control_mme_f32')]
+
+
+@pytest.mark.parametrize('project', _controller_variants)
+def test_controller_variants_keep_residual_only_overlap(project):
+    value, weight, peer = torch.randn(1, 32), torch.randn(24, 32), torch.randn(1, 24)
+    graph = make_fx(lambda x, w, p: project(x, w) + p)(value, weight, peer)
+    selected = independent_mhc_nodes(graph, [2])
+    assert any('control_' in str(node.target) for node in selected)
+    assert all('aten.add' not in str(node.target) for node in selected)
+    dependent = make_fx(lambda x, w, p: project(x + p, w))(value, weight, value)
+    assert independent_mhc_nodes(dependent, [2]) == set()

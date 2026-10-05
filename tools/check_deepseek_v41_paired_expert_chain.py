@@ -20,10 +20,12 @@ def main():
     parser.add_argument('--candidate-operator',choices=('paired','silu','groups3','streamed'),default='paired')
     parser.add_argument('--require-w13-prefetch', action='store_true')
     parser.add_argument('--dual-norm-quant', action='store_true')
+    parser.add_argument('--quant-bf16', action='store_true',
+                        help='Isolate vector BF16 quantization against the qualified streamed/dual parent')
     parser.add_argument('--production-router', action='store_true',
                         help='Include the production BF16 gate and top6; initialize all checkpoint experts')
     parser.add_argument('--require-up-activation-sram', action='store_true')
-    parser.add_argument('--baseline-operator', choices=('legacy', 'groups3'), default='legacy')
+    parser.add_argument('--baseline-operator', choices=('legacy', 'groups3', 'streamed'), default='legacy')
     parser.add_argument('--chain-repeats',type=int,default=16)
     parser.add_argument('--layers', type=int, nargs='+', default=[0, 4, 14, 19])
     parser.add_argument('--output', type=Path, required=True)
@@ -31,6 +33,9 @@ def main():
     parser.add_argument('--retirement-only', action='store_true',
                         help='Reuse measured A/B; check teardown without timing')
     args = parser.parse_args()
+    if args.quant_bf16 and not (args.dual_norm_quant and args.candidate_operator == 'streamed'
+                               and args.baseline_operator == 'streamed'):
+        parser.error('--quant-bf16 requires --dual-norm-quant and streamed in both arms')
     candidate_guid=('custom_deepseek_v41_expert_token_wide3_sat_fp8_gaudi2' if args.candidate_operator in ('groups3','pipeline3','plain_w13','sram_handoff','two_slice','unrolled','streamed','aligned','full_sram','pipeline_sram') else
                     'custom_deepseek_v41_expert_'+('paired_decode' if args.candidate_operator=='paired' else 'silu_decode')+'_fp8_gaudi2')
     if args.candidate_operator in ('unrolled', 'streamed', 'aligned', 'full_sram', 'pipeline_sram'):
@@ -143,11 +148,14 @@ def main():
         fixtures.append((collapsed, residual, post, comb, pre, ids, route))
     x, residual, post, comb, pre, ids, route = [tensor.to('hpu') for tensor in fixtures[0]]
     from vllm_gaudi.compilation.deepseek_v41_overlap import make_backend
-    compiled = lambda fn, candidate=False: torch.compile(fn, backend=make_backend(static_int32=True,static_factories=True,split_mhc=True,compiler_config=({'SYN_RMW_SECTION_MAX_SIZE_BYTES':'41943040'} if candidate and args.candidate_operator in ('full_sram', 'pipeline_sram') else {'NON_COMMON_DIM_MIN_SLICE_NUM_FOR_PIPELINING':'4'} if candidate and args.candidate_operator in ('two_slice', 'unrolled', 'streamed', 'aligned', 'full_sram', 'pipeline_sram') else {'SYN_SRAM_BGEMM_SLICER_MULTIPLE_TINY_GEMMS_PER_SLICE':'false'} if candidate and args.disable_tiny_bgemm else None)), fullgraph=True, dynamic=False)
+    compiled = lambda fn, candidate=False: torch.compile(fn, backend=make_backend(static_int32=True,static_factories=True,split_mhc=True,compiler_config=({'SYN_RMW_SECTION_MAX_SIZE_BYTES':'41943040'} if candidate and args.candidate_operator in ('full_sram', 'pipeline_sram') else {'NON_COMMON_DIM_MIN_SLICE_NUM_FOR_PIPELINING':'4'} if (candidate or args.quant_bf16) and args.candidate_operator in ('two_slice', 'unrolled', 'streamed', 'aligned', 'full_sram', 'pipeline_sram') else {'SYN_SRAM_BGEMM_SLICER_MULTIPLE_TINY_GEMMS_PER_SLICE':'false'} if candidate and args.disable_tiny_bgemm else None)), fullgraph=True, dynamic=False)
     image_mask = torch.zeros((1,), dtype=torch.bool, device='hpu')
     def produce(row, ids, route, q13,q2,s13,s2,lut,c13,c2,norm_weight,shared_weight,shared_channel,shared_down,shared_scale, *gate_weights, sat):
-        if sat and args.dual_norm_quant:
-            normalized, quantized, activation_scale, q, sx = torch.ops.custom_op.custom_deepseek_v41_ffn_norm_dual_quant_gaudi2(
+        if (sat and args.dual_norm_quant) or args.quant_bf16:
+            norm_quant = (torch.ops.custom_op.custom_deepseek_v41_ffn_norm_dual_bf16_quant_gaudi2
+                          if sat and args.quant_bf16 else
+                          torch.ops.custom_op.custom_deepseek_v41_ffn_norm_dual_quant_gaudi2)
+            normalized, quantized, activation_scale, q, sx = norm_quant(
                 row, norm_weight, 1e-20)
         else:
             normalized, quantized, activation_scale = torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
@@ -197,6 +205,13 @@ def main():
             torch.hpu.synchronize()
     physical=[audit(p) for p in (root/'graphs'/f'rank{rank}').rglob('*PostGraph-symbol.pbtxt')]
     def classify(entries):
+        if args.quant_bf16:
+            # Both arms use the same streamed expert producers. Only the
+            # quantizer GUID distinguishes this incremental candidate.
+            return ([p for p in entries if p['operations'].get(
+                        'custom_deepseek_v41_ffn_norm_dual_quant_gaudi2')],
+                    [p for p in entries if p['operations'].get(
+                        'custom_deepseek_v41_ffn_norm_dual_bf16_quant_gaudi2')])
         if args.candidate_operator in ('plain_w13','sram_handoff','two_slice','unrolled','streamed','aligned','full_sram','pipeline_sram'):
             name = 'expert_n256_moe_'+args.candidate_operator+'_sat_shared'
             tagged = lambda p: any(name in n['name'] for n in p['nodes'])
@@ -367,7 +382,7 @@ def main():
                   round_savings_ms=savings,
                   three_consistent_rounds=bool(savings) and all(value > 0 for value in savings),
                   full_model_gain_credit=False, physical_node_gate_pending=False, pipeline_slice_policy=4, layers=args.layers, selected_experts=384 if args.production_router else 12,
-                  production_router=args.production_router, dual_norm_quant=args.dual_norm_quant,
+                  production_router=args.production_router, dual_norm_quant=args.dual_norm_quant, quant_bf16=args.quant_bf16,
                   input_source=__doc__, baseline_operator=args.baseline_operator, candidate_operator=args.candidate_operator, native_replay=True, chain_repeats=args.chain_repeats, production_shared_expert=True,
                   native_library_sha256=hashlib.sha256(Path(os.environ['VLLM_HPU_DSV4_TPC_OP_LIBRARY']).read_bytes()).hexdigest())
     (directory/'result.json').write_text(json.dumps(result, indent=2)+'\n')

@@ -8,6 +8,9 @@ extern unsigned char _binary___deepseek_v41_ffn_norm_quant_gaudi2_o_end;
 extern unsigned char _binary___deepseek_v41_ffn_norm_dual_quant_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_ffn_norm_dual_quant_gaudi2_o_end;
 
+extern unsigned char _binary___deepseek_v41_ffn_norm_dual_bf16_quant_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_ffn_norm_dual_bf16_quant_gaudi2_o_end;
+
 tpc_lib_api::GlueCodeReturn DeepseekV41FfnNormQuantGaudi2::GetGcDefinitions(
     tpc_lib_api::HabanaKernelParams* p,
     tpc_lib_api::HabanaKernelInstantiation* out) {
@@ -76,6 +79,10 @@ tpc_lib_api::GlueCodeReturn DeepseekV41FfnNormQuantGaudi2::GetGcDefinitions(
     if (dual_) {
         begin = &_binary___deepseek_v41_ffn_norm_dual_quant_gaudi2_o_start;
         end = &_binary___deepseek_v41_ffn_norm_dual_quant_gaudi2_o_end;
+    }
+    if (dual_ == 2) {
+        begin = &_binary___deepseek_v41_ffn_norm_dual_bf16_quant_gaudi2_o_start;
+        end = &_binary___deepseek_v41_ffn_norm_dual_bf16_quant_gaudi2_o_end;
     }
     const unsigned capacity = out->kernel.elfSize;
     out->kernel.elfSize = end - begin;

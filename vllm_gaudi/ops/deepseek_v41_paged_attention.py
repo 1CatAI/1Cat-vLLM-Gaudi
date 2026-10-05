@@ -418,6 +418,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         self.tp4_mirror_selection = False
         self.tp4_local_index_queries = False
         self.tp4_packed_index_queries = False
+        self.register_buffer("_index_gain_weight", None, False)
         for shard in range(4):
             self.register_buffer(f"_tp4_index_query_shard_{shard}", None, False)
             self.register_buffer(f"_tp4_index_score_shard_{shard}", None, False)
@@ -558,6 +559,15 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             from vllm_gaudi.ops.deepseek_v41_tp4_selection import prepare_local_index_queries
 
             prepare_local_index_queries(self, release_local=True)
+
+    def prepare_index_gain_weight(self):
+        if gaudi_envs.VLLM_HPU_DSV41_INDEX_GAIN_REPLICA:
+            from vllm_gaudi.ops.deepseek_v41_index_gain import prepare_index_gain_weight
+
+            prepare_index_gain_weight(self)
+
+    def invalidate_index_gain_weight(self):
+        self._index_gain_weight = None
 
     def invalidate_tp4_index_query_weights(self):
         from vllm_gaudi.ops.deepseek_v41_tp4_selection import invalidate_local_index_queries
@@ -897,6 +907,8 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         return None
 
     def _prepare_index_queries(self, value, qr, positions, *, prefill=False, request_batch=False):
+        from vllm_gaudi.ops.deepseek_v41_index_gain import uses_replicated_index_gain
+
         indexer = self.weights.indexer
         local_queries = (
             not prefill and getattr(self, "tp4_local_index_queries", False)
@@ -917,7 +929,12 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         pieces = [fp4_roundtrip(q[start : start + codec_tokens], 32) for start in range(0, q.shape[0], codec_tokens)]
         q = pieces[0] if len(pieces) == 1 else torch.cat(pieces, 0)
         global_heads = self.index_heads * self.tensor_parallel_size
-        if not local_queries:
+        replicated_gain = uses_replicated_index_gain(
+            self, value, prefill=prefill, request_batch=request_batch, local_queries=local_queries
+        )
+        if replicated_gain:
+            weights = F.linear(value, self._index_gain_weight)
+        elif not local_queries:
             weights = self.linear(value, indexer.weights_proj)
         weights = weights * (128**-0.5 * global_heads**-0.5)
         if (
@@ -936,7 +953,9 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             return exchange_prefill_index_queries(q, weights, rank, group=group.device_group)
         # Exchange only small query/head tensors, not one score per cached token.
         if not local_queries:
-            if getattr(self, "tp4_packed_index_queries", False):
+            if replicated_gain:
+                q = self.gather(q, 1)
+            elif getattr(self, "tp4_packed_index_queries", False):
                 from vllm_gaudi.ops.deepseek_v41_index_packet import gather_index_query_packet
 
                 q, weights = gather_index_query_packet(q, weights, self.gather, self.tensor_parallel_size)

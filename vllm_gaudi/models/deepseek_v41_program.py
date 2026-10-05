@@ -890,6 +890,7 @@ class PreparedDecoderLayer(nn.Module):
         self.batch_mhc_fusion = self.batch_main_fusions
         self.batch_ffn_fusion = self.batch_main_fusions or gaudi_envs.VLLM_HPU_DSV41_BATCH_C1_NUMERICS
         self.ffn_dual_quant = gaudi_envs.VLLM_HPU_DSV41_FFN_DUAL_QUANT
+        self.ffn_bf16_quant = gaudi_envs.VLLM_HPU_DSV41_FFN_BF16_QUANT
         self.batch_control_reuse = gaudi_envs.VLLM_HPU_DSV41_MHC_BATCH_REUSE
         self.batch_control_prefetch = gaudi_envs.VLLM_HPU_DSV41_MHC_CONTROL_PREFETCH
         self.mhc_control_rrms = gaudi_envs.VLLM_HPU_DSV41_MHC_CONTROL_RRMS
@@ -917,6 +918,8 @@ class PreparedDecoderLayer(nn.Module):
         self.register_buffer("hc_attn_fn_packed", None, False)
         self.register_buffer("hc_ffn_fn_packed", None, False)
         self.register_buffer("hc_ffn_fn_mme", None, False)
+        self.register_buffer("hc_attn_fn_swizzled", None, False)
+        self.register_buffer("hc_ffn_fn_swizzled", None, False)
         if shared.length > 512:
             from vllm_gaudi.ops.deepseek_v41_paged_attention import PagedCSA2Attention
 
@@ -975,11 +978,18 @@ class PreparedDecoderLayer(nn.Module):
             return
         self.hc_attn_fn_packed = self._pack_mhc_control_weight(self.weights.hc_attn_fn)
         self.hc_ffn_fn_packed = self._pack_mhc_control_weight(self.weights.hc_ffn_fn)
+        if gaudi_envs.VLLM_HPU_DSV41_MHC_SWIZZLED_CONTROL:
+            if not (gaudi_envs.VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL
+                    and gaudi_envs.VLLM_HPU_DSV41_MHC_DEFERRED_GATES):
+                raise ValueError("Swizzled mHC requires the parallel controller and deferred gates")
+            self.hc_attn_fn_swizzled = self.hc_attn_fn_packed.reshape(24, 160, 128).permute(1, 0, 2).contiguous()
+            self.hc_ffn_fn_swizzled = self.hc_ffn_fn_packed.reshape(24, 160, 128).permute(1, 0, 2).contiguous()
 
     def release_mhc_control_weights(self):
         self.hc_attn_fn_packed = None
         self.hc_ffn_fn_packed = None
         self.hc_ffn_fn_mme = None
+        self.hc_attn_fn_swizzled = self.hc_ffn_fn_swizzled = None
 
     @prefill_span("layer")
     def forward(
@@ -1068,6 +1078,10 @@ class PreparedDecoderLayer(nn.Module):
             and self.hc_attn_fn_packed is not None and self.hc_ffn_fn_packed is not None
             and self.mhc_interlayer_bf16
         )
+        if deferred_gates:
+            deferred_post = (torch.ops.custom_op.custom_deepseek_v41_mhc_rrms_post_gaudi2
+                             if gaudi_envs.VLLM_HPU_DSV41_MHC_RRMS_POST else
+                             torch.ops.custom_op.custom_deepseek_v41_mhc_mme_post_collapse_gaudi2)
         if prefill_sequence:
             new_pre, post, comb, value = sequence_hc_input(
                 residual,
@@ -1101,6 +1115,7 @@ class PreparedDecoderLayer(nn.Module):
             if deferred_gates:
                 value, attention_control = hc_control_and_collapse(
                     residual, pre_mix, self.hc_attn_fn_packed, self.eps,
+                    swizzled_fn=self.hc_attn_fn_swizzled,
                     collapsed_input=collapsed_attention,
                 )
                 new_pre = post = comb = None
@@ -1160,7 +1175,7 @@ class PreparedDecoderLayer(nn.Module):
         post_ffn_prequant = None
         if deferred_gates:
             residual, collapsed_ffn, gates = (
-                torch.ops.custom_op.custom_deepseek_v41_mhc_mme_post_collapse_gaudi2(
+                deferred_post(
                     value.contiguous(), residual.contiguous(), attention_control,
                     w.hc_attn_scale, w.hc_attn_base, self.eps
                 )
@@ -1220,6 +1235,7 @@ class PreparedDecoderLayer(nn.Module):
         elif deferred_gates:
             value, ffn_control = hc_control_and_collapse(
                 residual, new_pre, self.hc_ffn_fn_packed, self.eps,
+                swizzled_fn=self.hc_ffn_fn_swizzled,
                 collapsed_input=collapsed_ffn,
             )
             pre_mix = post = comb = None
@@ -1265,9 +1281,11 @@ class PreparedDecoderLayer(nn.Module):
                 normalized, quantized, activation_scale = post_ffn_prequant
             elif fused_ffn_prequant is None:
                 if self.ffn_dual_quant and self.moe.shared_gate_up_channel is not None:
-                    normalized, quantized, activation_scale, shared_q, shared_scale = (
-                        torch.ops.custom_op.custom_deepseek_v41_ffn_norm_dual_quant_gaudi2(
-                            value.contiguous(), w.ffn_norm.weight, self.eps))
+                    quantizer = (torch.ops.custom_op.custom_deepseek_v41_ffn_norm_dual_bf16_quant_gaudi2
+                                 if self.ffn_bf16_quant and value.shape[0] == 1 else
+                                 torch.ops.custom_op.custom_deepseek_v41_ffn_norm_dual_quant_gaudi2)
+                    normalized, quantized, activation_scale, shared_q, shared_scale = quantizer(
+                        value.contiguous(), w.ffn_norm.weight, self.eps)
                     shared_prequant = shared_q, shared_scale
                 else:
                     normalized, quantized, activation_scale = torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
@@ -1298,7 +1316,7 @@ class PreparedDecoderLayer(nn.Module):
         peer_value = getattr(self, "peer_post_collapse", False) and decode and value.ndim == 3
         if deferred_gates:
             residual, collapsed, gates = (
-                torch.ops.custom_op.custom_deepseek_v41_mhc_mme_post_collapse_gaudi2(
+                deferred_post(
                     value.contiguous(), residual.contiguous(), ffn_control,
                     w.hc_ffn_scale, w.hc_ffn_base, self.eps
                 )
@@ -1686,6 +1704,9 @@ class PreparedStage(nn.Module):
                 continue
             attention.prepare_qkv_input_weight()
             attention.prepare_compressor_input_weight()
+            prepare_gain = getattr(attention, "prepare_index_gain_weight", None)
+            if prepare_gain is not None:
+                prepare_gain()
             attention.woa_fp8 = layer.layer in self.woa_config["layers"]
             attention.woa_output_roundtrip = self.woa_output_roundtrip and attention.woa_fp8
             if attention.woa_output_roundtrip:
@@ -1869,6 +1890,9 @@ class PreparedStage(nn.Module):
             if attention is not None:
                 attention.invalidate_qkv_input_weight()
                 attention.invalidate_compressor_input_weight()
+                invalidate_gain = getattr(attention, "invalidate_index_gain_weight", None)
+                if invalidate_gain is not None:
+                    invalidate_gain()
                 invalidate_queries = getattr(attention, "invalidate_tp4_index_query_weights", None)
                 if invalidate_queries is not None:
                     invalidate_queries()

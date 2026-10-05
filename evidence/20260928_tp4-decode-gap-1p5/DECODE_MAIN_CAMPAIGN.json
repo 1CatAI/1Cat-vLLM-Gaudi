@@ -1742,7 +1742,7 @@
     "gain_credit_ms": 0,
     "next": "Hoist immutable 24 coefficients out of 40-tile loop; ISA change verified, next hardware run queued"
   },
-  "pending_micro_only_ms": 0.4587151328124998,
+  "pending_micro_only_ms": 0.49638213281249977,
   "accepted_baseline_20261005": {
     "case": "decode-physical-fusion-serving-03",
     "official_tpot_ms": 9.564282285406788,
@@ -1899,5 +1899,82 @@
     "document": "evidence/ROOFLINE.md",
     "realization_assumption": 0.4,
     "formal_trigger_ms": 1.0
+  },
+  "ffn_bf16_quant_20261005": {
+    "case": "decode-ffn-bf16-quant-03",
+    "parent": "moe_dual_quant_20261005",
+    "round_savings_ms_per_four_layers": [
+      4.7687500000004324e-05,
+      0.00026393749999997773,
+      0.00011434374999996777
+    ],
+    "forecast_ms_per_token": 0.0011434374999996777,
+    "default": false,
+    "switch": "VLLM_HPU_DSV41_FFN_BF16_QUANT",
+    "formal_measured": false,
+    "physical_nodes": [
+      21,
+      21
+    ],
+    "modules": [
+      2,
+      3,
+      6,
+      7
+    ],
+    "correctness": "Five checkpoint-derived fixtures on four ranks exact; TPC simulation exact,3791 to3439 VLIW"
+  },
+  "index_gain_replica_20261005": {
+    "case": "decode-index-gain-replica-01",
+    "round_savings_ms_per_layer": [
+      0.003837906249999995,
+      0.0038639218749999954,
+      0.00383369531250001
+    ],
+    "forecast_ms_per_token": 0.03070324999999996,
+    "qualified_layers": 8,
+    "default": false,
+    "switch": "VLLM_HPU_DSV41_INDEX_GAIN_REPLICA",
+    "formal_measured": false,
+    "modules": [
+      2,
+      3,
+      6,
+      7
+    ],
+    "correctness": "Query, gain, scores exact on five checkpoint-derived fixtures x four ranks",
+    "integration": "Cold rank-ordered weights; C1 paged index only; prefill and request-batch/DSpark unchanged",
+    "extra_resident_bytes_per_rank": 2621440
+  },
+  "mhc_swizzled_20261005": {
+    "case": "decode-mhc-swizzled-control-01",
+    "parent": "mhc_parallel_20261005",
+    "forecast_ms_per_token": 0.00553015625000014,
+    "qualified_boundaries": 40,
+    "round_savings_ms_per_boundary": [
+      0.00014700781249999545,
+      0.0001382539062500035,
+      0.00013816015625000427
+    ],
+    "switch": "VLLM_HPU_DSV41_MHC_SWIZZLED_CONTROL",
+    "default": false,
+    "formal_measured": false,
+    "correctness": "Five fixtures x four ranks bit exact against qualified parallel controller"
+  },
+  "mhc_rrms_post_20261005": {
+    "case": "decode-mhc-rrms-post-01",
+    "parent": "mhc_parallel_20261005",
+    "forecast_ms_per_token": 0.0002901562500001731,
+    "qualified_boundaries": 40,
+    "round_savings_ms_per_boundary": [
+      2.5312499999929905e-06,
+      7.296875000006864e-06,
+      7.253906250004327e-06
+    ],
+    "switch": "VLLM_HPU_DSV41_MHC_RRMS_POST",
+    "default": false,
+    "formal_measured": false,
+    "correctness": "Five fixtures x four ranks bit exact",
+    "note": "Only ~7 ns per boundary; record literal small micro result, not a meaningful formal improvement."
   }
 }

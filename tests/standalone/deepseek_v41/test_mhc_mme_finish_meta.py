@@ -29,3 +29,13 @@ def test_parallel_controller_uses_common_control_layout(tokens):
     weight=torch.empty(24,20480,device='meta',dtype=torch.float32)
     y=torch.ops.custom_op.custom_deepseek_v41_control_rrms_parallel_bf16_gaudi2(x,weight,1e-6)
     assert y.shape==(tokens,25) and y.dtype==torch.float32
+
+
+@pytest.mark.parametrize('tokens',[1,2,6])
+def test_swizzled_controller_layout(tokens):
+    x=torch.empty(tokens,20480,device='meta',dtype=torch.bfloat16)
+    weight=torch.empty(160,24,128,device='meta',dtype=torch.float32)
+    y=torch.ops.custom_op.custom_deepseek_v41_control_rrms_swizzled_bf16_gaudi2(x,weight,1e-6)
+    assert y.shape==(tokens,25) and y.dtype==torch.float32
+    with pytest.raises(RuntimeError):
+        torch.ops.custom_op.custom_deepseek_v41_control_rrms_swizzled_bf16_gaudi2(x,weight.reshape(24,20480),1e-6)

@@ -305,6 +305,7 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_DYNAMIC_QUANT,
     GAUDI2_KERNEL_DEEPSEEK_V41_FFN_NORM_QUANT,
     GAUDI2_KERNEL_DEEPSEEK_V41_FFN_NORM_DUAL_QUANT,
+    GAUDI2_KERNEL_DEEPSEEK_V41_FFN_NORM_DUAL_BF16_QUANT,
     GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_RRMS_UNPACK,
     GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_MLA_GATHER,
     GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_PACKED_MLA_GATHER,
@@ -343,6 +344,8 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_ORDERED_PEER_SUM,
     GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_MME_FINISH,
     GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_RRMS_PARALLEL,
+    GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_RRMS_SWIZZLED,
+    GAUDI2_KERNEL_DEEPSEEK_V41_MHC_RRMS_POST,
     KERNEL_COUNT
 };
 
@@ -421,6 +424,8 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     if (!guids || capacity == 0) return tpc_lib_api::GLUE_SUCCESS;
     if (capacity < *kernelCount) return tpc_lib_api::GLUE_FAILED;
     std::memset(guids, 0, KERNEL_COUNT * sizeof(*guids));
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MHC_RRMS_POST].name, "custom_deepseek_v41_mhc_rrms_post_gaudi2");
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_RRMS_SWIZZLED].name, "custom_deepseek_v41_control_rrms_swizzled_bf16_gaudi2");
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_RRMS_PARALLEL].name, "custom_deepseek_v41_control_rrms_parallel_bf16_gaudi2");
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_MME_FINISH].name, DeepseekV41ControlMmeFinishGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_BATCH_MLA_METADATA].name,
@@ -601,6 +606,8 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
                 DeepseekV41FfnNormQuantGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_RRMS_UNPACK].name,
                 "custom_deepseek_v41_control_rrms_unpack_bf16_gaudi2");
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_FFN_NORM_DUAL_BF16_QUANT].name,
+                "custom_deepseek_v41_ffn_norm_dual_bf16_quant_gaudi2");
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_FFN_NORM_DUAL_QUANT].name,
                 "custom_deepseek_v41_ffn_norm_dual_quant_gaudi2");
     for(unsigned i=0;i<4;++i)
@@ -1194,6 +1201,8 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     auto mainFastDynamicQuant = DeepseekV41DynamicQuantBf16Gaudi2();
     if (std::strcmp(params->guid.name, DeepseekV41DynamicQuantBf16Gaudi2::name) == 0)
         return mainFastDynamicQuant.GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name, "custom_deepseek_v41_ffn_norm_dual_bf16_quant_gaudi2") == 0)
+        return DeepseekV41FfnNormQuantGaudi2(2).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, "custom_deepseek_v41_ffn_norm_dual_quant_gaudi2") == 0)
         return DeepseekV41FfnNormQuantGaudi2(true).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41FfnNormQuantGaudi2::name) == 0)
@@ -1594,10 +1603,14 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
         return DeepseekV41ExpertSiluDecodeFp8Gaudi2().GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41ExpertPairedDecodeFp8Gaudi2::name) == 0)
         return DeepseekV41ExpertPairedDecodeFp8Gaudi2().GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name, "custom_deepseek_v41_control_rrms_swizzled_bf16_gaudi2") == 0)
+        return DeepseekV41ControlGemvRrmsGaudi2(3).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, "custom_deepseek_v41_control_rrms_parallel_bf16_gaudi2") == 0)
         return DeepseekV41ControlGemvRrmsGaudi2(2).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41ControlMmeFinishGaudi2::name) == 0)
         return DeepseekV41ControlMmeFinishGaudi2().GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name, "custom_deepseek_v41_mhc_rrms_post_gaudi2") == 0)
+        return DeepseekV41MhcMmePostCollapseGaudi2(2).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41MhcMmePostCollapseGaudi2::name) == 0)
         return DeepseekV41MhcMmePostCollapseGaudi2().GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41MhcPostCollapseGaudi2::name) == 0)

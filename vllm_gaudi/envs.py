@@ -83,6 +83,10 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE: bool = False
     VLLM_HPU_DSV41_EXPERT_STREAMED_SAT: bool = False
     VLLM_HPU_DSV41_FFN_DUAL_QUANT: bool = False
+    VLLM_HPU_DSV41_FFN_BF16_QUANT: bool = False
+    VLLM_HPU_DSV41_INDEX_GAIN_REPLICA: bool = False
+    VLLM_HPU_DSV41_MHC_SWIZZLED_CONTROL: bool = False
+    VLLM_HPU_DSV41_MHC_RRMS_POST: bool = False
     VLLM_HPU_DSV41_MHC_LINEAR_LOAD: bool = False
     VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL: bool = False
     VLLM_HPU_DSV41_MLA_VECTOR_CODEC: bool = False
@@ -569,6 +573,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_MHC_LINEAR_LOAD", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL":
     lambda: os.environ.get("VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_FFN_BF16_QUANT":
+    lambda: os.environ.get("VLLM_HPU_DSV41_FFN_BF16_QUANT", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_MHC_RRMS_POST":
+    lambda: os.environ.get("VLLM_HPU_DSV41_MHC_RRMS_POST", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_MHC_SWIZZLED_CONTROL":
+    lambda: os.environ.get("VLLM_HPU_DSV41_MHC_SWIZZLED_CONTROL", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_INDEX_GAIN_REPLICA":
+    lambda: os.environ.get("VLLM_HPU_DSV41_INDEX_GAIN_REPLICA", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_FFN_DUAL_QUANT":
     lambda: os.environ.get("VLLM_HPU_DSV41_FFN_DUAL_QUANT", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_EXPERT_STREAMED_SAT":

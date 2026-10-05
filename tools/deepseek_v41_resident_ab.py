@@ -205,29 +205,43 @@ def make_handoff_stage(stage):
     return result
 
 
+def parse_device_load(output):
+    """Retain unavailable telemetry without treating a resetting card as idle."""
+    rows, unavailable = [], []
+    for line in output.splitlines():
+        fields = [value.strip() for value in line.split(',')]
+        try:
+            module, util, memory = fields
+            rows.append(dict(module=int(module), utilization=int(util.split()[0]),
+                             memory_mib=int(memory.split()[0])))
+        except (ValueError, IndexError):
+            unavailable.append(line)
+    return dict(time_ns=time.time_ns(), modules=rows, unavailable=unavailable)
+
+
 def device_load():
     result = subprocess.run(['hl-smi', '-Q', 'module_id,utilization.aip,memory.used', '--format=csv,noheader'],
                             capture_output=True, text=True, check=True)
-    rows = []
-    for line in result.stdout.splitlines():
-        module, util, memory = line.split(',')
-        rows.append(dict(module=int(module), utilization=int(util.strip().split()[0]),
-                         memory_mib=int(memory.strip().split()[0])))
-    return dict(time_ns=time.time_ns(), modules=rows)
+    return parse_device_load(result.stdout)
+
+
+def _common_device_memory(samples):
+    mappings = [{x['module']: x['memory_mib'] for x in sample['modules']} for sample in samples]
+    common = set.intersection(*(set(row) for row in mappings)) if mappings else set()
+    return mappings, sorted(common)
 
 
 def loading_modules(samples, own_modules=(0, 1, 4, 5), minimum_growth_mib=128):
-    mappings = [{x['module']: x['memory_mib'] for x in s['modules']} for s in samples]
-    return [module for module in mappings[0] if module not in own_modules
+    mappings, common = _common_device_memory(samples)
+    return [module for module in common if module not in own_modules
             and mappings[-1][module] - mappings[0][module] >= minimum_growth_mib
             and all(b[module] >= a[module] for a, b in zip(mappings, mappings[1:]))]
 
 
-
 def settling_modules(samples, own_modules=(0, 1, 4, 5), maximum_variation_mib=16):
-    """Driver pool resets can hide weight loading behind a temporary memory drop."""
-    mappings = [{x['module']: x['memory_mib'] for x in sample['modules']} for sample in samples]
-    return [module for module in mappings[0] if module not in own_modules
+    """Measure stable device identities; never infer zero usage from N/A."""
+    mappings, common = _common_device_memory(samples)
+    return [module for module in common if module not in own_modules
             and max(row[module] for row in mappings)-min(row[module] for row in mappings) >= maximum_variation_mib]
 
 def wait_for_loading(directory, rank, dist):
@@ -242,8 +256,13 @@ def wait_for_loading(directory, rank, dist):
                 time.sleep(1)
             growing = settling_modules(samples, own_modules=own_modules)
             pressure = cpu_pressure_avg10()
-            history.append(dict(samples=samples, loading_modules=growing, cpu_psi_some_avg10=pressure))
-            decision[0] = not growing and pressure < 1
+            _, common = _common_device_memory(samples)
+            missing_own = sorted(set(own_modules) - set(common))
+            history.append(dict(samples=samples, loading_modules=growing, unavailable_own=missing_own,
+                                cpu_psi_some_avg10=pressure))
+            decision[0] = not growing and not missing_own and pressure < 1
+            if missing_own:
+                print(f'Resident A/B waiting for telemetry on owned modules {missing_own}', flush=True)
             if growing:
                 print(f'Resident A/B waiting for weight loading on modules {growing}', flush=True)
             elif pressure >= 1:

@@ -1021,3 +1021,54 @@ Planning realization~40%; ≥1ms remains the batch-formal trigger.
 Communication pruning and both MME-controller boundaries had no gain; they are in INDEX,
 not this gain total. Architectural bounds and unresolved communication/SRAM lifetime work:
 [ROOFLINE](../../evidence/ROOFLINE.md).
+
+### 2026-10-05 — vector BF16 multiply at the routed quantization boundary
+
+`decode-ffn-bf16-quant-03`: same-process, same2/3/6/7 and CPU affinity;
+both arms use the already-qualified streamed MoE and dual norm/quant parent.
+Five checkpoint-derived fixtures×four ranks exact. Three native four-layer savings
+**0.000047688 / 0.000263937 / 0.000114344 ms**; median per-layer0.000028586ms.
+40-layer forecast **0.001143438 ms/token**, incremental to the MoE parent.
+TPC simulation3791→3439 VLIWs, same482loads/363stores, all20488 output bytes exact
+for each of five fixtures. Physical nodes stay21→21; no fusion credit.
+Switch `VLLM_HPU_DSV41_FFN_BF16_QUANT=0`, requires dual quantization and C1.
+Active cumulative forecast **0.459858570 ms/token**; formal baseline9.564282 unchanged.
+The small result is recorded without rounding it into a material latency claim.
+
+### 2026-10-05 — cold index gain replica
+
+`decode-index-gain-replica-01`: query projection, gain projection, native peer
+exchange, and a production 2048-row scoring consumer. Five inputs x four ranks
+query/gain/score bytes exact; three native A/B savings **0.003837906 /
+0.003863922 / 0.003833695 ms per index layer**. Eight index layers forecast
+**0.030703250 ms/token**. Only the small [32,5120] BF16 gain projection is
+replicated at load time, adding 2.5 MiB per rank across eight layers while retaining
+local checkpoint shards. Query projection and scoring remain unchanged. Shared
+TP-parameterized C1 source uses `VLLM_HPU_DSV41_INDEX_GAIN_REPLICA=0`; prefill,
+C2–C6 and request-batch keep the original path. 64 relevant CPU checks passed.
+This is a component-qualified forecast, not a formal end-to-end result.
+
+Active cumulative forecast **0.490561820 ms/token**.
+Official baseline **9.564282 ms/token**, next formal trigger **1 ms**.
+
+### 2026-10-05 — mHC K128/head weight layout
+
+`decode-mhc-swizzled-control-01`: original [24,20480] weights prepared once as
+[160,24,128], same parallel controller MAC and reduction order. Five fixtures x
+four ranks exact through peer/post, norm/quant and router; three native boundary
+savings **.000147008 / .000138254 / .000138160 ms**. Only 40 measured boundaries
+receive credit: **0.005530156 ms/token**, incremental to the parallel controller.
+No logical-node reduction; source-layout experiment, not measured HBM utilization.
+Default-off `VLLM_HPU_DSV41_MHC_SWIZZLED_CONTROL`, requires PARALLEL_CONTROL and
+DEFERRED_GATES. Prefill and C2–C6 retain checkpoint layouts. Active forecast
+**0.496091977 ms/token**, still below the 1ms formal trigger.
+
+### 2026-10-05 — direct shared-RRMS post layout
+
+`decode-mhc-rrms-post-01`: five x four exact, native A/B differences
+.000002531 / .000007297 / .000007254ms per boundary. Specializing the known
+25-value input removes unused RMS code and six static VLM reload sites, but
+complete-chain time barely changes. Literal 40-boundary forecast
+**0.000290156 ms/token**, flag `VLLM_HPU_DSV41_MHC_RRMS_POST=0`. This tiny
+component value does not establish a material end-to-end improvement.
+Active forecast **0.496382133 ms/token**; formal unchanged.

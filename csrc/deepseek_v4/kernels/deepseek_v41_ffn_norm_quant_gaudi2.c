@@ -82,6 +82,10 @@ void main(tensor input, tensor weight, tensor normalized, tensor quantized,
         const float64 scale = round_bf16(
             raw_scale + (float)(bf16)(1.0e-8f / 240.0f));
         const float64 inverse = round_bf16(reciprocal_without_lookup(scale));
+#ifdef DSV41_FFN_BF16_QUANT
+        const float128 inverse_pair = {inverse, inverse};
+        const bfloat128 sparse_inverse_bf16 = v_convert_f32_to_bf16_all_b(inverse_pair);
+#endif
         const int5 scale_at = {0, row, 0, 0, 0};
         v_f32_st_tnsr(scale_at, scales, scale);
 #ifdef DSV41_FFN_DUAL_QUANT
@@ -100,6 +104,13 @@ void main(tensor input, tensor weight, tensor normalized, tensor quantized,
 
         for (int tile = 0; tile < tiles; ++tile) {
             const int5 at = {tile * 128, row, 0, 0, 0};
+#ifdef DSV41_FFN_BF16_QUANT
+            // Both operands are BF16 here; retain the explicit BF16 product
+            // boundary before FP8 conversion without a FP32 expand/round trip.
+            const bfloat128 scaled = cached[tile] * sparse_inverse_bf16;
+            minifloat256 packed = v_convert_bf16_to_f8_b(
+                scaled, 0, SW_RHNE | SW_CLIP_FP, (minifloat256)0);
+#else
             const float64_pair_t value =
                 v_convert_bf16_to_f32_all_b(cached[tile]);
             minifloat256 packed = 0;
@@ -107,6 +118,7 @@ void main(tensor input, tensor weight, tensor normalized, tensor quantized,
                 round_bf16(value.v1 * inverse), 0, SW_CLIP_FP, packed);
             packed = v_convert_f32_to_f8_b(
                 round_bf16(value.v2 * inverse), 2, SW_CLIP_FP, packed);
+#endif
             const minifloat256 sparse = packed;
             packed = v_f8_pack_b(sparse, SW_GROUP_0 | SW_STRIDE_2,
                                  (minifloat256)0);
