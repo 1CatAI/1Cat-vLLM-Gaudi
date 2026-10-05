@@ -1742,7 +1742,7 @@
     "gain_credit_ms": 0,
     "next": "Hoist immutable 24 coefficients out of 40-tile loop; ISA change verified, next hardware run queued"
   },
-  "pending_micro_only_ms": 0.4086595078124999,
+  "pending_micro_only_ms": 0.4447820078124997,
   "accepted_baseline_20261005": {
     "case": "decode-physical-fusion-serving-03",
     "official_tpot_ms": 9.564282285406788,
@@ -1858,6 +1858,14 @@
     "estimated_saving_ms_token": 0.17638435156249987,
     "physical_nodes_reduced": false,
     "flag": "VLLM_HPU_DSV41_MLA_VECTOR_CODEC",
+    "default": false,
+    "formal_qualified": false
+  },
+  "quant_single_amax_20261005": {
+    "case": "decode-woa-single-amax-02",
+    "forecast_ms_token": 0.036122499999999835,
+    "layers": 40,
+    "flag": "VLLM_HPU_DSV41_WOA_DENSE_HANDOFF",
     "default": false,
     "formal_qualified": false
   }

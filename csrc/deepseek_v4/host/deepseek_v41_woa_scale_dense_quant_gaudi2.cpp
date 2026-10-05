@@ -23,10 +23,10 @@ tpc_lib_api::GlueCodeReturn DeepseekV41WoaScaleDenseQuantGaudi2::GetGcDefinition
     if (q.dataType != DATA_F8_143 || qs.dataType != DATA_F32) return GLUE_INCOMPATIBLE_DATA_TYPE;
     if (q.dims != 2 || q.maxSizes[0] != groups * 1024 || q.maxSizes[1] != 1 ||
         qs.dims != 2 || qs.maxSizes[0] != 1 || qs.maxSizes[1] != 1) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
-    out->indexSpaceRank = 1; out->indexSpaceGeometry[0] = groups * 8;
+    out->indexSpaceRank = 1; out->indexSpaceGeometry[0] = 1;
     for (unsigned i = 0; i < 3; ++i) out->inputTensorAccessPattern[i].allRequired = true;
     auto& mapping = out->outputTensorAccessPattern[0].mapping[0];
-    mapping.indexSpaceDim = 0; mapping.a = 128; mapping.start_b = 0; mapping.end_b = 127;
+    mapping.indexSpaceDim = 0; mapping.a = 0; mapping.start_b = 0; mapping.end_b = groups * 1024 - 1;
     out->outputTensorAccessPattern[1].allRequired = true;
     out->kernel.paramsNr = 0;
     auto* first = &_binary___deepseek_v41_woa_scale_dense_quant_gaudi2_o_start;

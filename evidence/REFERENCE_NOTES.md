@@ -573,3 +573,15 @@ reload of the full scale row. The source and ISA are archived with each case.
 `decode-mla-reuse-vector-01` and `decode-mla-publish-vector-01` each pass five
 inputs on four ranks and three positive native A/B rounds. Node counts are
 unchanged; classify this as efficiency, not a reduced logical stage count.
+
+### Existing fused quantizer: repeated row work removed
+
+The old disabled `woa_scale_dense_quant` scheduled 16/32 workpoints and each
+repeated the full roundtrip/amax before emitting one tile. The corrected
+implementation assigns the full row once, hoists scale loads and caches at
+most 8 KiB of rounded BF16 values in VLM. The output loop has no tensor
+reloads or row amax. Frontend unroll exposes independent tile loads; the
+previous backend pragma reported an unsupported vector PHI and did nothing.
+`decode-woa-single-amax-02` validates the complete native QKV→MLA→WO→peer/mHC
+chain, rather than the isolated quantizer. Its small but consistent gain is
+retained under the revised accumulation policy; the default stays disabled.

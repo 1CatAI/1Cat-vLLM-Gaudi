@@ -875,3 +875,6 @@ Existing wide woA epilogue preserved WoB consumer bits at C1/C2/C6 but no small-
 - `decode-mhc-unpack-post-02`: exact but two-half loads add load-use dependencies; superseded after ISA review.
 - `decode-mhc-linear-post-01`: native linear conversion + exact deferred gates, five inputs exact; three positive rounds; replaces earlier mHC estimate.
 - `decode-mla-reuse-vector-01` / `decode-mla-publish-vector-01`: exact 128-value codecs through Q/KV→MLA→WO→peer/mHC; consistent positive native A/B, unchanged logical stages; defaults off.
+
+- `decode-woa-single-amax-01`: ISA-only precursor; backend unroll pragma ignored, no timing.
+- `decode-woa-single-amax-02`: cached BF16 row, one amax, one scale load per group, frontend unroll; five inputs/four ranks exact, three positive native rounds; default off.

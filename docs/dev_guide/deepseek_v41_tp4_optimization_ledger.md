@@ -19,8 +19,9 @@ STATIC_COORDINATES 原已默认开启，共六项。显式诊断覆盖仍可关�
 recipe编号冲突停止追查，不再作逐项归因。输出/post-norm/WOa/发布链小融合归档，
 默认关闭；共享-main输出原型提交 `0dd878fb`。旧项目中的组件预测不能继续叠加到新基线。
 
-**当前本轮微基准待验收累计：0.408659508 ms/token（估计，尚未端到端）。**
-MoE 合并候选0.206373750ms、mHC0.025901406ms、Attention主体向量化0.176384352ms。
+**当前本轮微基准待验收累计：0.444782008 ms/token（估计，尚未端到端）。**
+MoE 合并候选0.206373750ms、mHC0.025901406ms、Attention主体向量化0.176384352ms，
+量化整行amax去重0.036122500ms。
 各项5组输入四卡逐位一致、原生重放3轮A/B方向一致，默认均关闭；详见文末。
 新MoE替代旧的两片候选，mHC替代旧0.031500469ms，均不重复相加。
 正式验收触发线仍为累计≥1ms。按逻辑阶段计数，GEMM内部TPC/MME流水切片单列，
@@ -984,3 +985,18 @@ Active micro-qualified cumulative forecast: **0.408659508 ms/token**.
 No new formal request: the ≥1 ms trigger is not reached. The two-instruction
 expert decoder remains unqualified and receives zero credit. Official baseline
 remains **9.564282 ms/token**.
+
+### 2026-10-05 — remove repeated whole-row amax from existing fused quantizer
+
+ISA audit found the disabled WOa scale/dense-quant candidate recalculated the
+whole row for each output tile (16 or 32 copies). The corrected kernel caches
+the rounded BF16 row, computes one amax, loads each group scale once and uses
+frontend loop expansion (the old backend unroll pragma was ignored). No GEMM
+slicing change. Five inputs/four ranks exact; native three-round savings
+**0.000903062 / 0.001213043 / 0.000779516 ms per layer**.
+`decode-woa-single-amax-02`, `VLLM_HPU_DSV41_WOA_DENSE_HANDOFF=0`.
+40-layer estimate **0.036122500 ms/token**. This is a correction to the
+previously inefficient hand-written kernel, not credit for its archived trial.
+
+Active cumulative forecast **0.444782008 ms/token**; formal baseline unchanged.
+No end-to-end request until cumulative forecast reaches at least 1 ms.
