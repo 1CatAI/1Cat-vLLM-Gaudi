@@ -89,7 +89,6 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_MHC_RRMS_POST: bool = False
     VLLM_HPU_DSV41_MHC_LINEAR_LOAD: bool = False
     VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL: bool = False
-    VLLM_HPU_DSV41_MHC_PRODUCER_FUSION: bool = False
     VLLM_HPU_DSV41_MLA_VECTOR_CODEC: bool = False
     VLLM_HPU_DSV41_EXPERT_W2_THREE_ROUTES: bool = False
     VLLM_HPU_DSV41_EXPERT_TOKEN_WIDE: bool = False
@@ -759,8 +758,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_PEER_POST_COLLAPSE", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MERGE_LOCAL_SEGMENTS":
     lambda: os.environ.get("VLLM_HPU_DSV41_MERGE_LOCAL_SEGMENTS", "0").lower() in ("1", "true"),
-    "VLLM_HPU_DSV41_MHC_PRODUCER_FUSION":
-    lambda: os.environ.get("VLLM_HPU_DSV41_MHC_PRODUCER_FUSION", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_WOA_OUTPUT_ROUNDTRIP":
     lambda: os.environ.get("VLLM_HPU_DSV41_WOA_OUTPUT_ROUNDTRIP", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_WO_A_FP8_SIDECAR":

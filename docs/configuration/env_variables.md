@@ -920,14 +920,6 @@ dependencies. TP2 and TP4 use the same compiler and replay implementation.
 This candidate requires a separately recorded native A/B plan and remains
 disabled pending combined serving qualification; prefill uses its existing backend.
 
-`VLLM_HPU_DSV41_MHC_PRODUCER_FUSION` (default `0`) moves an extracted pure
-parallel mHC control branch into the preceding native compute recipe. The peer
-exchange and its dependent consumer remain separate. Inputs must already be
-available at producer entry or be explicit producer outputs, and mutable aliases
-are rejected. This requires TP/mHC overlap and parallel or swizzled control;
-it is incompatible with MERGE_LOCAL_SEGMENTS. Prefill and wider controllers keep
-their original paths. This scheduling candidate has no qualified serving gain.
-
 `VLLM_HPU_DSV41_DEVICE_CLOSED_LOOP` (default `0`) selects the candidate ordinary
 native C1 lookahead lifecycle. It requires device sampling, device next-position
 outputs and the existing device Engram/native-input paths. Both mapped Engram

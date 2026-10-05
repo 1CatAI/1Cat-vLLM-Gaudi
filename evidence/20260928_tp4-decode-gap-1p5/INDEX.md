@@ -939,3 +939,5 @@ Existing wide woA epilogue preserved WoB consumer bits at C1/C2/C6 but no small-
 - Producer-fusion01 failed before timing: initial graph guard rejected resident constants/read-only inter-partition nodes.27 CPU checks now cover those nodes, real split composition and mutable aliases. Retry02 retains every peer point and rejects late peer-dependent inputs; no gain credit.
 
 - `decode-kv-hardware-codec-01`: offline Gaudi2 simulator, all256 E4M3FN encodings. Native conversion alone has15 mismatches; finite-top-exponent/negative-zero correction removes all.79→74 VLIW instructions, unchanged5 loads/7 stores. No hardware latency, no ledger credit, not a new default.
+
+- Producer-fusion02 exposed interleaved Bridge placeholder ABI error before timing. CPU reproducer confirms old order fails. Fixed03:5 states×4 ranks and feedback exact, no hot compile;73→41 compute calls,42 peer points unchanged. Device3-round regressions0.142305/0.150671/0.130405ms; A4.188502→B4.3295135ms. Archive source, stop both consumer/producerside merging directions, remove unqualified pass from runtime. Ledger unchanged.

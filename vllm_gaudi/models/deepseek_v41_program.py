@@ -1509,12 +1509,6 @@ class PreparedStage(nn.Module):
         self.decode_static_int32 = gaudi_envs.VLLM_HPU_DSV41_STATIC_COORDINATES
         self.decode_static_factories = self.decode_static_int32
         self.decode_merge_mhc_partitions = gaudi_envs.VLLM_HPU_DSV41_MERGE_LOCAL_SEGMENTS
-        self.decode_mhc_producer_fusion = gaudi_envs.VLLM_HPU_DSV41_MHC_PRODUCER_FUSION
-        if self.decode_mhc_producer_fusion and (
-            self.decode_merge_mhc_partitions or not gaudi_envs.VLLM_HPU_DSV41_TP_MHC_OVERLAP
-            or not gaudi_envs.VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL
-        ):
-            raise ValueError("mHC producer fusion requires parallel control and independent TP/mHC overlap")
         self.bf16_head = gaudi_envs.VLLM_HPU_DSV41_BF16_LM_HEAD
         self.device_sampling = gaudi_envs.VLLM_HPU_DSV41_DEVICE_SAMPLING and not self.dspark
         self.device_next_position = gaudi_envs.VLLM_HPU_DSV41_DEVICE_NEXT_POSITION
@@ -2461,7 +2455,6 @@ class CompiledStage:
                 static_factories=getattr(stage, 'decode_static_factories', False),
                 static_clamps=getattr(stage, 'decode_static_clamps', False),
                 split_mhc=not getattr(stage, 'decode_merge_mhc_partitions', False),
-                fuse_mhc_producer=getattr(stage, 'decode_mhc_producer_fusion', False),
                 required_operators=getattr(stage, 'candidate_required_operators', ()),
                 compiler_config=getattr(stage, 'candidate_compiler_config', None),
             )

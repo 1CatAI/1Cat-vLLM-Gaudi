@@ -2051,5 +2051,147 @@
     "formal_gain_credit": false,
     "default": false,
     "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-pcie-star-protocol-02"
+  },
+  "mhc_producer_fusion_20261005": {
+    "status": "rejected_slower",
+    "baseline_ms": 4.188502,
+    "candidate_ms": 4.3295135,
+    "round_savings_ms": [
+      -0.14230499999999946,
+      -0.150671,
+      -0.13040500000000055
+    ],
+    "compute_segments": [
+      73,
+      41
+    ],
+    "collective_points": [
+      42,
+      42
+    ],
+    "cross_arm_feedback_exact": true,
+    "no_hot_compilation": true,
+    "numerical_gate": {
+      "tokens_exact": true,
+      "mutable_state_exact": true,
+      "state_tensors": 33,
+      "hidden_exact": true,
+      "reference_hidden": [
+        {
+          "position": 16384,
+          "shape": [
+            1,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "sha256": "01a17f64e3120401163464763f10c25066ff86d984d3a5d432ce8fc48b21695e"
+        },
+        {
+          "position": 16385,
+          "shape": [
+            1,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "sha256": "38d98341cffd7323635626b9bc6b4f806d4868f1e89f4d8dae3dca6b27299be2"
+        },
+        {
+          "position": 16386,
+          "shape": [
+            1,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "sha256": "6538d05a303cd1a6606dd439907b674d5bc8f2e17e273bea4470c0d5d9a60943"
+        },
+        {
+          "position": 16387,
+          "shape": [
+            1,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "sha256": "f86fbbf3fb19320ed3d217f20cd0aa781c8e51f0b2b9cbedee77d174e76d45ea"
+        },
+        {
+          "position": 16388,
+          "shape": [
+            1,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "sha256": "cea5a5682906d6e4cb92d14d37b83b6e911477352998bef6a47372f247b3e0f5"
+        },
+        {
+          "position": 16389,
+          "shape": [
+            1,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "sha256": "7020a3822b80d2790fdf5e5b0bb84b9f7c362fe13b67fe00de4c014271f01108"
+        }
+      ],
+      "candidate_hidden": [
+        {
+          "position": 16384,
+          "shape": [
+            1,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "sha256": "01a17f64e3120401163464763f10c25066ff86d984d3a5d432ce8fc48b21695e"
+        },
+        {
+          "position": 16385,
+          "shape": [
+            1,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "sha256": "38d98341cffd7323635626b9bc6b4f806d4868f1e89f4d8dae3dca6b27299be2"
+        },
+        {
+          "position": 16386,
+          "shape": [
+            1,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "sha256": "6538d05a303cd1a6606dd439907b674d5bc8f2e17e273bea4470c0d5d9a60943"
+        },
+        {
+          "position": 16387,
+          "shape": [
+            1,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "sha256": "f86fbbf3fb19320ed3d217f20cd0aa781c8e51f0b2b9cbedee77d174e76d45ea"
+        },
+        {
+          "position": 16388,
+          "shape": [
+            1,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "sha256": "cea5a5682906d6e4cb92d14d37b83b6e911477352998bef6a47372f247b3e0f5"
+        },
+        {
+          "position": 16389,
+          "shape": [
+            1,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "sha256": "7020a3822b80d2790fdf5e5b0bb84b9f7c362fe13b67fe00de4c014271f01108"
+        }
+      ]
+    },
+    "formal_gain_credit": false,
+    "default": false,
+    "decision": "Both consumer-side and producer-side merging regress in real16. Stop partition coalescing trials; require a concrete compiled-dataflow cause before any further variant.",
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-mhc-producer-fusion-03"
   }
 }

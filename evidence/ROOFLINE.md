@@ -180,3 +180,5 @@ graph, then the full WO/control→peer→FFN/router chain; unmeasured.
 B DMA follow-up completed: final compiler graph proves10MiB DRAM→DmaMemcpy→SRAM→MME on all four ranks. Five states×four ranks exact, but the complete WO/control→peer→FFN/router chain regresses9.744/9.750/9.746µs. Archived candidate sources and removed unused operator. No gain.
 
 A acyclic star protocol passed612 changing native epochs on2/3 with explicit importer-first cleanup. Moving reduction from the hub to each rank reduces two-rank completed primitive18.1661→16.0945µs, still too slow for6µs target beforeTP4 or real producer/consumer. Stop hardware expansion; no gain credit. This avoids cyclic driver ownership but is not a production-qualified transport.
+
+Producer-side scheduling also regresses: real16 73→41 compute calls,42 peer points; five×four states and feedback exact. Three native pairs lose.142305/.150671/.130405ms. This rules out recipe-count reduction alone as an improvement with the current controller. Both partition variants are archived; further trials require a compiler-dataflow explanation, not another placement guess.
