@@ -2306,5 +2306,33 @@
     "formal_qualified": false,
     "default": false,
     "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-mla-vector-mask-01"
+  },
+  "host_shared_peer_width_20261005": {
+    "status": "primitive_correctness_qualified_not_production_gain",
+    "root_cause": "GEN_ADDR inherits8-bit width from the shared U8 mailbox. update_addr changes address only. Unsigned scalar flags were truncated at256; bad-width simulation also has undefined upper bits. Local BF16 anchor analogously limits16-bit flags.",
+    "fix": "DT_OVERRIDE UINT32 at coordinate0, then byte-offset address updates. Payload vector operations unchanged.",
+    "simulator_epochs": [
+      254,
+      255,
+      256,
+      257,
+      65536
+    ],
+    "hardware_epochs_passed": 612,
+    "rank_max_native_us_A": [
+      20.6234,
+      20.7388,
+      21.1017
+    ],
+    "rank_max_native_us_B": [
+      12.9349,
+      12.8834,
+      12.8317
+    ],
+    "scope": "two-rank changing payload primitive only; no producer/downstream consumer qualification; exceeds6us beforeTP4 expansion",
+    "device_cleanup": "Both ranks clean exit, zero imports; healthy modules returned768MiB without reset",
+    "default": false,
+    "formal_gain_credit": false,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-host-shared-peer-03"
   }
 }
