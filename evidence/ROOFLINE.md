@@ -240,3 +240,5 @@ gain from master-only gates: existing feature owners compute gates concurrently,
 and waiting for a master can expose the same gate latency. No cooperative-gate
 hardware experiment was started. Evidence: `decode-mhc-cooperative-audit-01`.
 Pendingforecast remains.658449527ms; formal9.564282ms, target7ms not achieved.
+
+A in-place AG05: strict-own-rank view removes1 nativecommand/32bytes per point with identical ARC programs and zero hot copies. Five inputs/four ranks bitexact after repairing two cold contracts (rank0 create equality, cached allocated-output offset). Three producer→peer→post/FFN/router differences −.303/−.359/−.296us. No gain; this disproves own-copy removal as a useful latency remedy on this chain. All unused runtime changes archived/removed. Standalone output-offset source patch and exact-ABI adapter retained only as research artifacts, not a deployment dependency.

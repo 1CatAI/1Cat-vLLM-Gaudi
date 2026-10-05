@@ -1130,6 +1130,9 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
 
   void captureExchangeOnExecute(size_t index, const PreparedNode& node, torch::jit::Stack values) {
     try {
+      // Later queued exchanges must retain the first capture error rather than
+      // replacing it with a generic invalid-state exception in the pipeline.
+      if (capture_failure_) std::rethrow_exception(capture_failure_);
       TORCH_CHECK(state_.load() == State::Capturing, "Native decoder capture was invalidated");
       TORCH_CHECK(tp4_ || !node.reduction_only,
                   "Native plain AllReduce requires peer transfer and a compiled BF16 sum");
