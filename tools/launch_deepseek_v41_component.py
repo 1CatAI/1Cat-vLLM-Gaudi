@@ -11,6 +11,7 @@ import signal
 import time
 
 from deepseek_v41_owned_devices import lease_free_modules, wait_for_host_memory, retire_process_group, wait_for_owned_process
+from deepseek_v41_component_paths import component_scratch
 
 
 def main():
@@ -23,6 +24,7 @@ def main():
     parser.add_argument('--sidecar', type=Path, required=True)
     parser.add_argument('--min-host-free-gib',type=float,default=64,help='Observed host headroom before loading; no reservation')
     parser.add_argument('--recipe-cache-dir',type=Path,help='Machine-local rebuildable cache, separate from SSD evidence')
+    parser.add_argument('--ipc-tmp-root', type=Path, help='Short SSD directory for Unix-domain IPC sockets')
     parser.add_argument('--port', type=int, required=True)
     parser.add_argument('--modules', help='Optional comma-separated modules to lease')
     parser.add_argument('--lock-dir', type=Path, default=Path(__file__).resolve().parents[2] / 'locks')
@@ -48,7 +50,7 @@ def main():
     ops = native / 'hpu_dsv4_sparse_attn_pt2.cpython-312-x86_64-linux-gnu.so'
     kernels = native / 'libdeepseek_v4_gaudi2_kernels.so'
     hashes = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in (ops, kernels)}
-    scratch=case.parent/'micro-tmp'/hashlib.sha256(str(case).encode()).hexdigest()[:8]
+    scratch = component_scratch(case, profile['environment'].get('TMPDIR'), args.ipc_tmp_root)
     scratch.mkdir(parents=True,exist_ok=True)
     recipe_dir=args.recipe_cache_dir.resolve() if args.recipe_cache_dir else case/'recipes'
     recipe_dir.mkdir(parents=True,exist_ok=True)
