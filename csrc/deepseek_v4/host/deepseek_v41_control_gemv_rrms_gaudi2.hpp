@@ -4,7 +4,9 @@
 #include "tpc_kernel_lib_interface.h"
 
 class DeepseekV41ControlGemvRrmsGaudi2 {
+    bool unpack_;
 public:
+    explicit DeepseekV41ControlGemvRrmsGaudi2(bool unpack = false) : unpack_(unpack) {}
     static constexpr const char* name =
         "custom_deepseek_v41_control_gemv_rrms_bf16_gaudi2";
     tpc_lib_api::GlueCodeReturn GetGcDefinitions(

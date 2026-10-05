@@ -252,6 +252,7 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_EXPERT_SILU_DECODE_FP8,
     GAUDI2_KERNEL_DEEPSEEK_V41_EXPERT_SLOTS3_SAT_FP8,
     GAUDI2_KERNEL_DEEPSEEK_V41_EXPERT_PAIR_SILU_QUANT,
+    GAUDI2_KERNEL_DEEPSEEK_V41_EXPERT_FLAT_SILU_QUANT,
     GAUDI2_KERNEL_DEEPSEEK_V41_QKV_NORM_PUBLISH,
     GAUDI2_KERNEL_DEEPSEEK_V41_PEER_POST_NORM_QUANT,
     GAUDI2_KERNEL_DEEPSEEK_V41_WOA_SCALE_DENSE_QUANT,
@@ -281,6 +282,9 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_N256_SAT_FP8,
     GAUDI2_KERNEL_DEEPSEEK_V41_N256_SAT_SLOTS6,
     GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE6_SAT,
+    GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE3_UNROLL,
+    GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE6_UNROLL,
+    GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE6_ALIGNED,
     GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE3_SAT,
     GAUDI2_KERNEL_DEEPSEEK_V41_EXPERT_DIAGONAL_SCALE_SHARED,
     GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE_SAT,
@@ -299,6 +303,8 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_EXPERT_SCALE_SHARED,
     GAUDI2_KERNEL_DEEPSEEK_V41_DYNAMIC_QUANT,
     GAUDI2_KERNEL_DEEPSEEK_V41_FFN_NORM_QUANT,
+    GAUDI2_KERNEL_DEEPSEEK_V41_FFN_NORM_DUAL_QUANT,
+    GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_RRMS_UNPACK,
     GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_MLA_GATHER,
     GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_PACKED_MLA_GATHER,
     GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_PACKED_MLA_VECTOR,
@@ -321,6 +327,8 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_BATCH_MLA_METADATA,
     GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_PUBLISH_GATHER,
     GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_REUSE_GATHER,
+    GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_REUSE_VECTOR,
+    GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_PUBLISH_VECTOR,
     GAUDI2_KERNEL_DEEPSEEK_V41_MHC_POST_COLLAPSE,
     GAUDI2_KERNEL_DEEPSEEK_V41_MHC_POST_COLLAPSE_F32,
     GAUDI2_KERNEL_DEEPSEEK_V41_SILU_ACTIVATE_TILE,
@@ -520,6 +528,7 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_EXPERT_PAIRED_DECODE_FP8].name, DeepseekV41ExpertPairedDecodeFp8Gaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_EXPERT_SILU_DECODE_FP8].name, DeepseekV41ExpertSiluDecodeFp8Gaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_EXPERT_SLOTS3_SAT_FP8].name, DeepseekV41ExpertSlots3SatFp8Gaudi2::name);
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_EXPERT_FLAT_SILU_QUANT].name, DeepseekV41ExpertPairSiluQuantGaudi2::flat_name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_EXPERT_PAIR_SILU_QUANT].name, DeepseekV41ExpertPairSiluQuantGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_QKV_NORM_PUBLISH].name, DeepseekV41QkvNormPublishGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_PEER_POST_NORM_QUANT].name, DeepseekV41PeerPostNormQuantGaudi2::name);
@@ -554,6 +563,9 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MLA_NORMALIZE].name, DeepseekV41MlaNormalizeGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_KV_NORM_ROPE_PUBLISH].name, DeepseekV41KVNormRopePublishGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE3_SAT].name, DeepseekV41ExpertTokenWideGaudi2::three_name);
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE3_UNROLL].name, DeepseekV41ExpertTokenWideGaudi2::unroll3_name);
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE6_ALIGNED].name, DeepseekV41ExpertTokenWideGaudi2::aligned_name);
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE6_UNROLL].name, DeepseekV41ExpertTokenWideGaudi2::unroll6_name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_EXPERT_DIAGONAL_SCALE_SHARED].name, DeepseekV41ExpertDiagonalScaleSharedGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE6_SAT].name, DeepseekV41ExpertTokenWideGaudi2::six_name);
     DeepseekV41ExpertN256Gaudi2(DeepseekV41ExpertN256Gaudi2::FP8SatSlots6).GetKernelName(
@@ -582,6 +594,10 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_DYNAMIC_QUANT].name, DeepseekV41DynamicQuantBf16Gaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_FFN_NORM_QUANT].name,
                 DeepseekV41FfnNormQuantGaudi2::name);
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_RRMS_UNPACK].name,
+                "custom_deepseek_v41_control_rrms_unpack_bf16_gaudi2");
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_FFN_NORM_DUAL_QUANT].name,
+                "custom_deepseek_v41_ffn_norm_dual_quant_gaudi2");
     for(unsigned i=0;i<4;++i)
         std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_INDEX_SCORES+i].name,DeepseekV41IndexGaudi2::names[i]);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_INDEX_KEYS].name,
@@ -617,6 +633,8 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_PAGED_MLA_GATHER].name, DeepseekV41PagedMlaGatherGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_LOGICAL_MLA_GATHER].name, DeepseekV41LogicalMlaGatherGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_PUBLISH_GATHER].name, DeepseekV41MainPublishGatherGaudi2::name);
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_PUBLISH_VECTOR].name, "custom_deepseek_v41_main_publish_vector_gaudi2");
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_REUSE_VECTOR].name, "custom_deepseek_v41_main_reuse_vector_gaudi2");
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_REUSE_GATHER].name, DeepseekV41MainReuseGatherGaudi2::name);
 
     DeepseekV41SelectedMlaGaudi2(false).GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_MLA_SOFTMAX].name);
@@ -986,6 +1004,9 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     if (std::strcmp(params->guid.name, "custom_deepseek_v41_control_prefetch_f32_gaudi2") == 0)
         return DeepseekV41ControlGemvGaudi2(false, true).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name,
+                    "custom_deepseek_v41_control_rrms_unpack_bf16_gaudi2") == 0)
+        return DeepseekV41ControlGemvRrmsGaudi2(true).GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name,
                     DeepseekV41ControlGemvRrmsGaudi2::name) == 0)
         return DeepseekV41ControlGemvRrmsGaudi2().GetGcDefinitions(
             params, instance);
@@ -1091,6 +1112,12 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
         return vectorScales.GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41KVNormRopePublishGaudi2::name) == 0)
         return DeepseekV41KVNormRopePublishGaudi2().GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name, DeepseekV41ExpertTokenWideGaudi2::unroll3_name) == 0)
+        return DeepseekV41ExpertTokenWideGaudi2(3, true).GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name, DeepseekV41ExpertTokenWideGaudi2::aligned_name) == 0)
+        return DeepseekV41ExpertTokenWideGaudi2(6, true, true).GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name, DeepseekV41ExpertTokenWideGaudi2::unroll6_name) == 0)
+        return DeepseekV41ExpertTokenWideGaudi2(6, true).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41ExpertTokenWideGaudi2::three_name) == 0)
         return DeepseekV41ExpertTokenWideGaudi2(3).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41ExpertDiagonalScaleSharedGaudi2::name) == 0)
@@ -1162,12 +1189,18 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     auto mainFastDynamicQuant = DeepseekV41DynamicQuantBf16Gaudi2();
     if (std::strcmp(params->guid.name, DeepseekV41DynamicQuantBf16Gaudi2::name) == 0)
         return mainFastDynamicQuant.GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name, "custom_deepseek_v41_ffn_norm_dual_quant_gaudi2") == 0)
+        return DeepseekV41FfnNormQuantGaudi2(true).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41FfnNormQuantGaudi2::name) == 0)
         return DeepseekV41FfnNormQuantGaudi2().GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41PagedMlaGatherGaudi2::name) == 0)
         return DeepseekV41PagedMlaGatherGaudi2().GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name, "custom_deepseek_v41_main_publish_vector_gaudi2") == 0)
+        return DeepseekV41MainPublishGatherGaudi2(true).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41MainPublishGatherGaudi2::name) == 0)
         return DeepseekV41MainPublishGatherGaudi2().GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name, "custom_deepseek_v41_main_reuse_vector_gaudi2") == 0)
+        return DeepseekV41MainReuseGatherGaudi2(true).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41MainReuseGatherGaudi2::name) == 0)
         return DeepseekV41MainReuseGatherGaudi2().GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41LogicalMlaGatherGaudi2::name) == 0)
@@ -1546,6 +1579,8 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
         return DeepseekV41PeerPostNormQuantGaudi2().GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41QkvNormPublishGaudi2::name) == 0)
         return DeepseekV41QkvNormPublishGaudi2().GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name, DeepseekV41ExpertPairSiluQuantGaudi2::flat_name) == 0)
+        return DeepseekV41ExpertPairSiluQuantGaudi2(true).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41ExpertPairSiluQuantGaudi2::name) == 0)
         return DeepseekV41ExpertPairSiluQuantGaudi2().GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41ExpertSlots3SatFp8Gaudi2::name) == 0)

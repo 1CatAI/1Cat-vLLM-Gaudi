@@ -18,6 +18,27 @@ LOGICAL = {'Placeholder', 'OutputTensor', 'Reshape', 'StaticReshape', 'Slice', '
            'TransposedShape', 'Reduction'}
 
 
+def logical_stages(nodes):
+    """Collapse only compiler fragments with the same explicit source node.
+
+    Never merge by GUID or bundle alone: two independent GEMMs/quantizers can
+    share either. Source identity before `_bundle_N/op_M` distinguishes them.
+    Compiler-created nodes without that provenance remain independent.
+    """
+    groups = {}
+    for node in nodes:
+        source = re.sub(r'_bundle_\d+/op_\d+.*$', '', node['name'])
+        key = (source, node['op'])
+        group = groups.setdefault(key, dict(source=source, operation=node['op'],
+                                            fragments=[], execution_indices=[]))
+        group['fragments'].append(node['name'])
+        group['execution_indices'].append(node['execution_index'])
+    stages = list(groups.values())
+    return dict(logical_stage_count=len(stages), stages=stages,
+                pipeline_fragment_excess=len(nodes)-len(stages),
+                logical_count_scope='same explicit compiler source node only; not GUID/bundle deduplication')
+
+
 def audit(path):
     raw = path.read_text()
     nodes = []
@@ -35,6 +56,7 @@ def audit(path):
                           tensors={k:v for k,v in attrs.items() if k.startswith(('inputTensor:', 'outputTensor:'))}))
     return dict(graph=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
                 physical_nodes=len(nodes), operations=dict(Counter(n['op'] for n in nodes)),
+                **logical_stages(nodes),
                 logical_nodes_excluded=dict(ignored), nodes=nodes,
                 count_scope='post-compiler TPC/MME/DMA nodes; excludes logical views and null descriptors')
 

@@ -320,6 +320,7 @@ class PreparedMoE(nn.Module):
         # Feature-tiled activation/quantization increased complete-chain latency.
         self.feature_silu = False
         self.all_route_slots = False
+        self.expert_streamed_sat = gaudi_envs.VLLM_HPU_DSV41_EXPERT_STREAMED_SAT
         self.expert_w2_three_routes = gaudi_envs.VLLM_HPU_DSV41_EXPERT_W2_THREE_ROUTES
         self.token_wide_experts = gaudi_envs.VLLM_HPU_DSV41_EXPERT_TOKEN_WIDE
         self.router_bf16_gate = gaudi_envs.VLLM_HPU_DSV41_BF16_ROUTER_GATE
@@ -375,10 +376,11 @@ class PreparedMoE(nn.Module):
             source = projection.weight
             projection.weight = torch.empty(source.shape, dtype=source.dtype, device="meta")
 
-    def shared_expert(self, value):
+    def shared_expert(self, value, prequant=None):
         shared = self.weights.shared_experts
         if self.shared_gate_up_channel is not None:
-            q, sx = torch.ops.custom_op.custom_deepseek_v41_dense_quant_gaudi2(value.contiguous())
+            q, sx = (torch.ops.custom_op.custom_deepseek_v41_dense_quant_gaudi2(value.contiguous())
+                     if prequant is None else prequant)
             product = torch.ops.hpu.fp8_gemm_v2(q, False, self.shared_gate_up_weight, True, None,
                                                torch.float32, None, None, None, False)
             rows = value.shape[0]
@@ -536,12 +538,15 @@ class PreparedMoE(nn.Module):
                 if not use_fused:
                     raise ValueError("Prequantized N256 input requires the fused expert body")
                 quantized, activation_scale = tile_prequant
-                if (self.expert_w2_three_routes and (decode or ordinary_decode)
+                if ((self.expert_w2_three_routes or self.expert_streamed_sat) and (decode or ordinary_decode)
                         and tile_value.shape[0] == 1 and tile_shared is not None):
                     if not (getattr(experts.w13_q16, "dsv41_sat_eligible", False)
                             and getattr(experts.w2_q16, "dsv41_sat_eligible", False)):
                         raise ValueError("Three-route W2 requires checkpoint-qualified SAT scale planes")
-                    return torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_two_group_w2_sat_shared_fp8_gaudi2(
+                    operator = (torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_streamed_sat_shared_fp8_gaudi2
+                                if self.expert_streamed_sat else
+                                torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_two_group_w2_sat_shared_fp8_gaudi2)
+                    return operator(
                         *operands, channel13, channel2, quantized, activation_scale, tile_shared, True)
                 if self.token_wide_experts and (decode or ordinary_decode) and 1 <= tile_value.shape[0] <= 6:
                     if not (getattr(experts.w13_q16, "dsv41_sat_eligible", False)
@@ -665,6 +670,7 @@ class PreparedMoE(nn.Module):
         ordinary_decode=False,
         decode=False,
         prequant=None,
+        shared_prequant=None,
         prefill_router_tokens=0,
         prefill_sequence=False,
     ):
@@ -708,7 +714,8 @@ class PreparedMoE(nn.Module):
         # only its final FP32 addition and BF16 rounding move into the routed
         # compound node. Wider batches keep the common batch implementation.
         fused_shared = self.n256_fp8 and self.n256_fused_reduce and prequant is not None and value.shape[0] == 1
-        shared_out = self.shared_expert(value) if fused_shared else None
+        shared_out = (self.shared_expert(value) if shared_prequant is None
+                      else self.shared_expert(value, shared_prequant)) if fused_shared else None
         if self.prefill_grouped and value.shape[0] > 6 and not ordinary_decode:
             from vllm_gaudi.ops.deepseek_v41_grouped_prefill import run_grouped_prefill
 
@@ -839,7 +846,8 @@ class PreparedMoE(nn.Module):
                 self.normal_scales,
             )
         if shared_out is None:
-            shared_out = self.shared_expert(value)
+            shared_out = (self.shared_expert(value) if shared_prequant is None
+                          else self.shared_expert(value, shared_prequant))
             partial = (
                 _prefill_combine(output, shared_out)
                 if gaudi_envs.VLLM_HPU_DSV41_PREFILL_REGIONS and not decode and value.shape[0] > 6
@@ -881,6 +889,7 @@ class PreparedDecoderLayer(nn.Module):
         self.batch_main_fusions = gaudi_envs.VLLM_HPU_DSV41_BATCH_MAIN_FUSIONS
         self.batch_mhc_fusion = self.batch_main_fusions
         self.batch_ffn_fusion = self.batch_main_fusions or gaudi_envs.VLLM_HPU_DSV41_BATCH_C1_NUMERICS
+        self.ffn_dual_quant = gaudi_envs.VLLM_HPU_DSV41_FFN_DUAL_QUANT
         self.batch_control_reuse = gaudi_envs.VLLM_HPU_DSV41_MHC_BATCH_REUSE
         self.batch_control_prefetch = gaudi_envs.VLLM_HPU_DSV41_MHC_CONTROL_PREFETCH
         self.mhc_control_rrms = gaudi_envs.VLLM_HPU_DSV41_MHC_CONTROL_RRMS
@@ -1249,14 +1258,21 @@ class PreparedDecoderLayer(nn.Module):
         # contract; larger decode batches and prefill retain the generic path.
         # The B1/B2 outputs were qualified bit-for-bit against the separate
         # RMSNorm and dynamic-quant nodes before this became the default.
+        shared_prequant = None
         moe_ready = ((ffn_control,) if deferred_gates else (post, comb)) if schedule else ()
         if decode and value.shape[0] <= 2 and self.moe.n256_fp8 and self.moe.n256_fused:
             if post_ffn_prequant is not None:
                 normalized, quantized, activation_scale = post_ffn_prequant
             elif fused_ffn_prequant is None:
-                normalized, quantized, activation_scale = torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
-                    value.contiguous(), w.ffn_norm.weight, self.eps
-                )
+                if self.ffn_dual_quant and self.moe.shared_gate_up_channel is not None:
+                    normalized, quantized, activation_scale, shared_q, shared_scale = (
+                        torch.ops.custom_op.custom_deepseek_v41_ffn_norm_dual_quant_gaudi2(
+                            value.contiguous(), w.ffn_norm.weight, self.eps))
+                    shared_prequant = shared_q, shared_scale
+                else:
+                    normalized, quantized, activation_scale = torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
+                        value.contiguous(), w.ffn_norm.weight, self.eps
+                    )
             else:
                 normalized = value
                 quantized, activation_scale = fused_ffn_prequant
@@ -1267,6 +1283,7 @@ class PreparedDecoderLayer(nn.Module):
                 fp8_decode=fp8_decode,
                 decode=decode,
                 prequant=(quantized, activation_scale),
+                shared_prequant=shared_prequant,
             )
         else:
             value = self.moe(

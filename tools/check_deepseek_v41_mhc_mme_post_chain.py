@@ -15,6 +15,7 @@ import statistics
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--unpack-controller', action='store_true', help='Use exact linear unpack loads in the candidate control producer')
     parser.add_argument('--exact-controller',action='store_true',help='Keep the production FP32 control/rrms producer and fuse only its exact gates/post consumer')
     parser.add_argument('--prepared', type=Path, required=True)
     parser.add_argument('--sidecar',type=Path,required=True)
@@ -25,6 +26,8 @@ def main():
     parser.add_argument('--retirement-only', action='store_true',
                         help='Reuse measured A/B; check teardown without timing')
     args = parser.parse_args()
+    if args.unpack_controller and not args.exact_controller:
+        raise ValueError('Unpack controller requires --exact-controller')
     if args.chain_repeats < 1:
         raise ValueError('Native chain repetition must be positive')
     rank = int(os.environ['LOCAL_RANK'])
@@ -99,7 +102,9 @@ def main():
     compiled=lambda fn:torch.compile(fn,backend=make_backend(static_int32=True,static_factories=True,split_mhc=True),fullgraph=True,dynamic=False)
     def produce(x,residual,control,mme_weight,wo_weight,wo_scale,*,fused):
         flat=residual.flatten(1)
-        projected=(torch.ops.custom_op.custom_deepseek_v41_control_mme_f32_gaudi2(flat,mme_weight) if fused and not args.exact_controller else
+        projected=(torch.ops.custom_op.custom_deepseek_v41_control_rrms_unpack_bf16_gaudi2(flat,control,eps)
+            if fused and args.unpack_controller else
+            torch.ops.custom_op.custom_deepseek_v41_control_mme_f32_gaudi2(flat,mme_weight) if fused and not args.exact_controller else
             torch.ops.custom_op.custom_deepseek_v41_control_gemv_rrms_bf16_gaudi2(flat,control,eps))
         value=direct_dense_fp8(x,wo_weight,wo_scale)
         if fused:return value,projected

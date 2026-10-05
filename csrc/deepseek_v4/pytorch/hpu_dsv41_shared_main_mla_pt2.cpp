@@ -6,6 +6,8 @@
 #include "hpu_ops/op_backend.h"
 namespace {
 constexpr auto publish_name = "custom_op::custom_deepseek_v41_main_publish_mla_gaudi2";
+constexpr auto vector_publish_name = "custom_op::custom_deepseek_v41_main_publish_vector_mla_gaudi2";
+constexpr auto vector_name = "custom_op::custom_deepseek_v41_main_reuse_vector_mla_gaudi2";
 constexpr auto reuse_name = "custom_op::custom_deepseek_v41_main_reuse_mla_gaudi2";
 constexpr auto publish_projection_name = "custom_op::custom_deepseek_v41_main_publish_projection_gaudi2";
 constexpr auto reuse_projection_name = "custom_op::custom_deepseek_v41_main_reuse_projection_gaudi2";
@@ -60,7 +62,7 @@ template<bool Reuse, bool Projection = false> habana::OutputMetaDataVector meta(
         return {{at::kBFloat16, shape}, {at::kBFloat16, {1, 640, 512}}, {at::kFloat, {1, 640}}};
     }
 }
-template<bool Reuse, bool Projection = false> class SharedMainMla final : public habana::OpBackend {
+template<bool Reuse, bool Projection = false, bool Vector = false> class SharedMainMla final : public habana::OpBackend {
 public:
     SharedMainMla(int device, c10::ScalarType type)
         : OpBackend(device, NO_TPC + std::string(Reuse ? "dsv41_main_reuse" : "dsv41_main_publish"),
@@ -70,12 +72,12 @@ public:
         const int64_t heads = s.at(0).toTensor().size(1);
         auto kv = [&] {
             if constexpr (Reuse) {
-                return BuildNode(this, graph, {"custom_deepseek_v41_main_reuse_gather_gaudi2",
+                return BuildNode(this, graph, {Vector ? "custom_deepseek_v41_main_reuse_vector_gaudi2" : "custom_deepseek_v41_main_reuse_gather_gaudi2",
                     {syn_in(1), syn_in(2), syn_in(3), syn_in(4), syn_in(7)},
                     {{{1, 640, 512}, at::kBFloat16}, {{1, 640, 512}, at::kFloat}, {{1, 640}, at::kFloat}}});
             } else {
                 int ratio = s.at(9).toInt();
-                return BuildNode(this, graph, {"custom_deepseek_v41_main_publish_gather_gaudi2",
+                return BuildNode(this, graph, {Vector ? "custom_deepseek_v41_main_publish_vector_gaudi2" : "custom_deepseek_v41_main_publish_gather_gaudi2",
                     {syn_in(1), syn_in(2), syn_in(3), syn_in(4), syn_in(5), syn_in(8)},
                     {{{1, 640, 512}, at::kBFloat16}, {{1, 640, 512}, at::kFloat},
                      {{1, 640}, at::kFloat, 2}, {{1, 640, 512}, at::kBFloat16, 1}}, &ratio, sizeof(ratio)});
@@ -121,20 +123,20 @@ public:
         }
     }
 };
-template<bool Reuse, bool Projection = false> bool register_op() {
-    const auto name = Projection ? (Reuse ? reuse_projection_name : publish_projection_name) : (Reuse ? reuse_name : publish_name);
+template<bool Reuse, bool Projection = false, bool Vector = false> bool register_op() {
+    const auto name = Vector ? (Reuse ? vector_name : vector_publish_name) : Projection ? (Reuse ? reuse_projection_name : publish_projection_name) : (Reuse ? reuse_name : publish_name);
     habana::custom_op::registerUserCustomOp(name, "batch_gemm", [](const at::Stack& s) {
         habana::PartialOutputMetaDataVector out;
         for (const auto& item : meta<Reuse, Projection>(s)) out.push_back({item.dtype, item.shape});
         return out;
     }, nullptr);
     habana::KernelRegistry().add(name, [](synDeviceId d, c10::ScalarType t) {
-        return std::make_shared<SharedMainMla<Reuse, Projection>>(d, t);
+        return std::make_shared<SharedMainMla<Reuse, Projection, Vector>>(d, t);
     });
     return true;
 }
-const bool registered = register_op<false>() && register_op<true>() && register_op<false,true>() && register_op<true,true>();
-template<bool Meta> std::tuple<at::Tensor, at::Tensor, at::Tensor> publish(
+const bool registered = register_op<false>() && register_op<true>() && register_op<false,true>() && register_op<true,true>() && register_op<true,false,true>() && register_op<false,false,true>();
+template<bool Meta, bool Vector = false> std::tuple<at::Tensor, at::Tensor, at::Tensor> publish(
     const at::Tensor& q, const at::Tensor& swa, const at::Tensor& main, const at::Tensor& selected,
     const at::Tensor& positions, const at::Tensor& pages, const at::Tensor& sink, const at::Tensor& scale,
     const at::Tensor& lengths, int64_t ratio) {
@@ -143,18 +145,18 @@ template<bool Meta> std::tuple<at::Tensor, at::Tensor, at::Tensor> publish(
     if (Meta) return {at::empty(out[0].shape, q.options()), at::empty(out[1].shape, q.options()),
                       at::empty(out[2].shape, q.options().dtype(at::kFloat))};
     TORCH_CHECK(registered && q.device().type() == at::kHPU);
-    auto descriptor = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(publish_name);
+    auto descriptor = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(Vector ? vector_publish_name : publish_name);
     const auto result = descriptor.execute(stack);
     return {result.at(0), result.at(1), result.at(2)};
 }
-template<bool Meta> at::Tensor reuse(const at::Tensor& q, const at::Tensor& swa, const at::Tensor& main,
+template<bool Meta, bool Vector = false> at::Tensor reuse(const at::Tensor& q, const at::Tensor& swa, const at::Tensor& main,
     const at::Tensor& mask, const at::Tensor& positions, const at::Tensor& sink, const at::Tensor& scale,
     const at::Tensor& lengths) {
     const at::Stack stack{q, swa, main, mask, positions, sink, scale, lengths};
     const auto out = meta<true>(stack);
     if (Meta) return at::empty(out[0].shape, q.options());
     TORCH_CHECK(registered && q.device().type() == at::kHPU);
-    auto descriptor = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(reuse_name);
+    auto descriptor = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(Vector ? vector_name : reuse_name);
     return descriptor.execute(stack).at(0);
 }
 template<bool Meta, bool Reuse> std::vector<at::Tensor> projection_execute(const at::Stack& stack) {
@@ -185,18 +187,24 @@ template<bool Meta> std::tuple<at::Tensor,at::Tensor,at::Tensor> publish_project
 }
 }
 TORCH_LIBRARY_FRAGMENT(custom_op, m) {
+    m.def("custom_deepseek_v41_main_publish_vector_mla_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor selected, Tensor positions, Tensor pages, Tensor sink, Tensor scale, Tensor lengths, int ratio) -> (Tensor, Tensor, Tensor)");
+    m.def("custom_deepseek_v41_main_reuse_vector_mla_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor mask, Tensor positions, Tensor sink, Tensor scale, Tensor lengths) -> Tensor");
     m.def("custom_deepseek_v41_main_publish_projection_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor selected, Tensor positions, Tensor pages, Tensor sink, Tensor scale, Tensor lengths, int ratio, Tensor wa, Tensor sa, Tensor phase, Tensor wb, Tensor sb) -> (Tensor, Tensor, Tensor)");
     m.def("custom_deepseek_v41_main_reuse_projection_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor mask, Tensor positions, Tensor sink, Tensor scale, Tensor lengths, Tensor wa, Tensor sa, Tensor phase, Tensor wb, Tensor sb) -> Tensor");
     m.def("custom_deepseek_v41_main_publish_mla_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor selected, Tensor positions, Tensor pages, Tensor sink, Tensor scale, Tensor lengths, int ratio) -> (Tensor, Tensor, Tensor)");
     m.def("custom_deepseek_v41_main_reuse_mla_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor mask, Tensor positions, Tensor sink, Tensor scale, Tensor lengths) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
+    m.impl("custom_deepseek_v41_main_publish_vector_mla_gaudi2", publish<false,true>);
+    m.impl("custom_deepseek_v41_main_reuse_vector_mla_gaudi2", reuse<false,true>);
     m.impl("custom_deepseek_v41_main_publish_projection_gaudi2",publish_projection<false>);
     m.impl("custom_deepseek_v41_main_reuse_projection_gaudi2",reuse_projection<false>);
     m.impl("custom_deepseek_v41_main_publish_mla_gaudi2", publish<false>);
     m.impl("custom_deepseek_v41_main_reuse_mla_gaudi2", reuse<false>);
 }
 TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
+    m.impl("custom_deepseek_v41_main_publish_vector_mla_gaudi2", publish<true,true>);
+    m.impl("custom_deepseek_v41_main_reuse_vector_mla_gaudi2", reuse<true,true>);
     m.impl("custom_deepseek_v41_main_publish_projection_gaudi2",publish_projection<true>);
     m.impl("custom_deepseek_v41_main_reuse_projection_gaudi2",reuse_projection<true>);
     m.impl("custom_deepseek_v41_main_publish_mla_gaudi2", publish<true>);

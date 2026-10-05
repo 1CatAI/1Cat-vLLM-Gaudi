@@ -37,7 +37,11 @@ static inline float64 row_max_without_lookup(float64 value) {
 }
 
 void main(tensor input, tensor weight, tensor normalized, tensor quantized,
-          tensor scales, float epsilon, float inverse_width) {
+          tensor scales,
+#ifdef DSV41_FFN_DUAL_QUANT
+          tensor dense_quantized, tensor dense_scales,
+#endif
+          float epsilon, float inverse_width) {
     const int5 begin = get_index_space_offset();
     const int5 end = begin + get_index_space_size();
     const int tiles = get_dim_size(input, 0) / 128;
@@ -80,6 +84,19 @@ void main(tensor input, tensor weight, tensor normalized, tensor quantized,
         const float64 inverse = round_bf16(reciprocal_without_lookup(scale));
         const int5 scale_at = {0, row, 0, 0, 0};
         v_f32_st_tnsr(scale_at, scales, scale);
+#ifdef DSV41_FFN_DUAL_QUANT
+        // The shared expert uses a power-of-two scale and flushes FP8
+        // subnormals. Reuse the row amax, but preserve both quantizers.
+        const uint64 bits = as_uint64(maximum);
+        int64 power = convert_uint64_to_int64(bits >> 23, 0) - 134;
+        power += v_i32_sel_grt_u32_b(bits & 0x7fffff, 0x700000, 1, 0);
+        power = v_i32_sel_eq_f32_b(maximum, 0.0f, 0, power);
+        const float64 dense_scale = as_float64((power + 127) << 23);
+        const float64 dense_inverse = as_float64((127 - power) << 23);
+        const float128 dense_inverse_pair = {dense_inverse, dense_inverse};
+        const bfloat128 dense_inverse_bf16 = v_convert_f32_to_bf16_all_b(dense_inverse_pair);
+        v_f32_st_tnsr_partial(scale_at, dense_scales, dense_scale, 0, 0);
+#endif
 
         for (int tile = 0; tile < tiles; ++tile) {
             const int5 at = {tile * 128, row, 0, 0, 0};
@@ -97,6 +114,19 @@ void main(tensor input, tensor weight, tensor normalized, tensor quantized,
             packed = v_f8_mov_dual_group_pack_b(
                 packed, SW_PACK21, (minifloat256)0);
             v_f8_st_tnsr_partial(at, quantized, packed, 127, 0);
+#ifdef DSV41_FFN_DUAL_QUANT
+            const bfloat128 dense_value = cached[tile] * dense_inverse_bf16;
+            minifloat256 dense_q = v_convert_bf16_to_f8_b(
+                dense_value, 0, SW_RHNE | SW_CLIP_FP, (minifloat256)0);
+            const minifloat256 dense_sparse = dense_q;
+            dense_q = v_f8_pack_b(dense_sparse, SW_GROUP_0 | SW_STRIDE_2, (minifloat256)0);
+            dense_q = v_f8_pack_b(dense_sparse, SW_GROUP_1 | SW_STRIDE_2, dense_q);
+            dense_q = v_f8_mov_dual_group_pack_b(dense_q, SW_PACK21, (minifloat256)0);
+            uchar256 raw = *((uchar256*)&dense_q);
+            raw = v_u8_sel_eq_u8_b(raw & 0x78, 0, 0, raw);
+            dense_q = *((minifloat256*)&raw);
+            v_f8_st_tnsr_partial(at, dense_quantized, dense_q, 127, 0);
+#endif
         }
     }
 }

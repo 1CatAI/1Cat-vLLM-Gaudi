@@ -33,7 +33,7 @@ def test_unqualified_scales_rejected():
         torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_token_wide_sat_fp8_gaudi2(*operands(1),False)
 
 
-@pytest.mark.parametrize('schema',['paired_decode','silu_decode','two_group_w2_sat'])
+@pytest.mark.parametrize('schema',['paired_decode','silu_decode','two_group_w2_sat','pipeline3_sat','plain_w13_sat','sram_handoff_sat','two_slice_sat','unrolled_sat','streamed_sat','aligned_sat','full_sram_sat','pipeline_sram_sat'])
 @pytest.mark.parametrize('batch',[1,2,6])
 def test_paired_decode_bucket_contract(batch,schema):
     args=operands(batch)
@@ -46,7 +46,7 @@ def test_paired_decode_bucket_contract(batch,schema):
             op(*args,args[0],True)
 
 
-@pytest.mark.parametrize('schema',['paired_decode','silu_decode','two_group_w2_sat'])
+@pytest.mark.parametrize('schema',['paired_decode','silu_decode','two_group_w2_sat','pipeline3_sat','plain_w13_sat','sram_handoff_sat','two_slice_sat','unrolled_sat','streamed_sat','aligned_sat','full_sram_sat','pipeline_sram_sat'])
 def test_paired_decode_rejects_unqualified_scales(schema):
     args=operands(1)
     with pytest.raises(RuntimeError,match='qualif'):

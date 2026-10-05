@@ -81,6 +81,10 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_FLASHINFER_PREFILL: bool = False
     VLLM_HPU_DSV41_EXPERT_FUSED_QUANT: bool = False
     VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE: bool = False
+    VLLM_HPU_DSV41_EXPERT_STREAMED_SAT: bool = False
+    VLLM_HPU_DSV41_FFN_DUAL_QUANT: bool = False
+    VLLM_HPU_DSV41_MHC_LINEAR_LOAD: bool = False
+    VLLM_HPU_DSV41_MLA_VECTOR_CODEC: bool = False
     VLLM_HPU_DSV41_EXPERT_W2_THREE_ROUTES: bool = False
     VLLM_HPU_DSV41_EXPERT_TOKEN_WIDE: bool = False
     VLLM_HPU_DSV41_KV_REUSE_FUSION: bool = False
@@ -558,6 +562,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_QKV_FUSED_PROLOGUE", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_ATTN_FUSED_PROLOGUE":
     lambda: os.environ.get("VLLM_HPU_DSV41_ATTN_FUSED_PROLOGUE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_MLA_VECTOR_CODEC":
+    lambda: os.environ.get("VLLM_HPU_DSV41_MLA_VECTOR_CODEC", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_MHC_LINEAR_LOAD":
+    lambda: os.environ.get("VLLM_HPU_DSV41_MHC_LINEAR_LOAD", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_FFN_DUAL_QUANT":
+    lambda: os.environ.get("VLLM_HPU_DSV41_FFN_DUAL_QUANT", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_EXPERT_STREAMED_SAT":
+    lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_STREAMED_SAT", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_EXPERT_W2_THREE_ROUTES":
     lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_W2_THREE_ROUTES", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_EXPERT_TOKEN_WIDE":

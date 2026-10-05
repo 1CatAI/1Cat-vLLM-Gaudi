@@ -39,7 +39,12 @@ static inline float64 row_max_without_lookup(float64 value) {
 
 static inline float64 projected(tensor product, tensor channel, int n, int row,
                                 int expert, float sx, bool valid) {
+#ifdef DSV41_SILU_FLAT_PRODUCT
+    const int width = get_dim_size(channel, 1) * 256;
+    const float64 acc = v_f32_ld_tnsr_b((int5){n + row * width, 0, 0}, product);
+#else
     const float64 acc = v_f32_ld_tnsr_b((int5){n, 0, row}, product);
+#endif
     const uint64 bits = v_u32_ld_tnsr_b((int5){n % 256, n / 256, expert}, channel,
         SW_UNPACK | SW_UNPCK_16_TO_32, (uint64){0}, valid) << 16;
     return round_bf16(v_f32_mul_b(v_f32_mul_b(acc, *((float64*)&bits)), sx));

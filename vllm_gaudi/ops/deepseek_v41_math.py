@@ -358,9 +358,10 @@ def hc_pre(
         and flat_bf16.shape[-1] == 20480
         and packed_fn.shape == (24, 20480)
     ):
-        control = torch.ops.custom_op.custom_deepseek_v41_control_gemv_rrms_bf16_gaudi2(
-            flat_bf16.contiguous(), packed_fn, eps
-        )
+        control_op = (torch.ops.custom_op.custom_deepseek_v41_control_rrms_unpack_bf16_gaudi2
+                      if not prefill and gaudi_envs.VLLM_HPU_DSV41_MHC_LINEAR_LOAD else
+                      torch.ops.custom_op.custom_deepseek_v41_control_gemv_rrms_bf16_gaudi2)
+        control = control_op(flat_bf16.contiguous(), packed_fn, eps)
         projection, rrms = control[:, :24], control[:, 24:]
     else:
         flat = flat_bf16.float()
@@ -437,9 +438,10 @@ def hc_control_and_collapse(residual, previous_pre, packed_fn, eps, *, collapsed
     Its final value is the production RRMS, so the post kernel need not repeat
     the residual reduction or change its FP32 sum order.
     """
-    control = torch.ops.custom_op.custom_deepseek_v41_control_gemv_rrms_bf16_gaudi2(
-        residual.flatten(1).contiguous(), packed_fn, eps
-    )
+    control_op = (torch.ops.custom_op.custom_deepseek_v41_control_rrms_unpack_bf16_gaudi2
+                  if gaudi_envs.VLLM_HPU_DSV41_MHC_LINEAR_LOAD else
+                  torch.ops.custom_op.custom_deepseek_v41_control_gemv_rrms_bf16_gaudi2)
+    control = control_op(residual.flatten(1).contiguous(), packed_fn, eps)
     collapsed = collapsed_input
     if collapsed is None:
         collapsed = (residual.float() * previous_pre.unsqueeze(-1)).sum(1).to(residual.dtype)

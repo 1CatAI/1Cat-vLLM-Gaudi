@@ -5,6 +5,8 @@
 
 extern unsigned char _binary___deepseek_v41_ffn_norm_quant_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_ffn_norm_quant_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_ffn_norm_dual_quant_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_ffn_norm_dual_quant_gaudi2_o_end;
 
 tpc_lib_api::GlueCodeReturn DeepseekV41FfnNormQuantGaudi2::GetGcDefinitions(
     tpc_lib_api::HabanaKernelParams* p,
@@ -14,7 +16,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41FfnNormQuantGaudi2::GetGcDefinitions(
         p->nodeParams.nodeParamsSize != 2 * sizeof(float))
         return GLUE_FAILED;
     if (p->inputTensorNr != 2) return GLUE_INCOMPATIBLE_INPUT_COUNT;
-    if (p->outputTensorNr != 3) return GLUE_INCOMPATIBLE_OUTPUT_COUNT;
+    if (p->outputTensorNr != (dual_ ? 5U : 3U)) return GLUE_INCOMPATIBLE_OUTPUT_COUNT;
     const auto& x = p->inputTensors[0].geometry;
     const auto& w = p->inputTensors[1].geometry;
     const auto& y = p->outputTensors[0].geometry;
@@ -31,6 +33,15 @@ tpc_lib_api::GlueCodeReturn DeepseekV41FfnNormQuantGaudi2::GetGcDefinitions(
         q.dims != 2 || q.maxSizes[0] != width || q.maxSizes[1] != rows ||
         s.dims != 2 || s.maxSizes[0] != 1 || s.maxSizes[1] != rows)
         return GLUE_INCOMPATIBLE_INPUT_SIZE;
+    if (dual_) {
+        const auto& dq = p->outputTensors[3].geometry;
+        const auto& ds = p->outputTensors[4].geometry;
+        if (dq.dataType != DATA_F8_143 || ds.dataType != DATA_F32)
+            return GLUE_INCOMPATIBLE_DATA_TYPE;
+        if (dq.dims != 2 || dq.maxSizes[0] != width || dq.maxSizes[1] != rows ||
+            ds.dims != 2 || ds.maxSizes[0] != 1 || ds.maxSizes[1] != rows)
+            return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+    }
     const auto* scalar = static_cast<const float*>(p->nodeParams.nodeParams);
     if (!(scalar[0] > 0) || !std::isnormal(scalar[0]) ||
         scalar[1] != 1.0f / float(width))
@@ -54,10 +65,18 @@ tpc_lib_api::GlueCodeReturn DeepseekV41FfnNormQuantGaudi2::GetGcDefinitions(
     map(out->outputTensorAccessPattern[0], width, true);
     map(out->outputTensorAccessPattern[1], width, true);
     map(out->outputTensorAccessPattern[2], 1, true);
+    if (dual_) {
+        map(out->outputTensorAccessPattern[3], width, true);
+        map(out->outputTensorAccessPattern[4], 1, true);
+    }
     out->kernel.paramsNr = 2;
     std::memcpy(out->kernel.scalarParams, scalar, 2 * sizeof(float));
     auto* begin = &_binary___deepseek_v41_ffn_norm_quant_gaudi2_o_start;
     auto* end = &_binary___deepseek_v41_ffn_norm_quant_gaudi2_o_end;
+    if (dual_) {
+        begin = &_binary___deepseek_v41_ffn_norm_dual_quant_gaudi2_o_start;
+        end = &_binary___deepseek_v41_ffn_norm_dual_quant_gaudi2_o_end;
+    }
     const unsigned capacity = out->kernel.elfSize;
     out->kernel.elfSize = end - begin;
     if (capacity < out->kernel.elfSize)

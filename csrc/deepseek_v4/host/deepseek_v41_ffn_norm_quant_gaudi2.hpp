@@ -4,7 +4,9 @@
 #include "tpc_kernel_lib_interface.h"
 
 class DeepseekV41FfnNormQuantGaudi2 {
+    bool dual_;
 public:
+    explicit DeepseekV41FfnNormQuantGaudi2(bool dual = false) : dual_(dual) {}
     static constexpr const char* name =
         "custom_deepseek_v41_ffn_norm_quant_gaudi2";
     tpc_lib_api::GlueCodeReturn GetGcDefinitions(

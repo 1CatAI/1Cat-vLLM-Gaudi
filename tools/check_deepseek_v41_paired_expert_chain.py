@@ -17,7 +17,13 @@ def main():
     parser.add_argument('--prepared', type=Path, required=True)
     parser.add_argument('--sidecar',type=Path,required=True)
     parser.add_argument('--disable-tiny-bgemm',action='store_true',help='Cold compiler screen; the legacy setting has not fixed Gaudi2 batch slicing')
-    parser.add_argument('--candidate-operator',choices=('paired','silu','groups3'),default='paired')
+    parser.add_argument('--candidate-operator',choices=('paired','silu','groups3','streamed'),default='paired')
+    parser.add_argument('--require-w13-prefetch', action='store_true')
+    parser.add_argument('--dual-norm-quant', action='store_true')
+    parser.add_argument('--production-router', action='store_true',
+                        help='Include the production BF16 gate and top6; initialize all checkpoint experts')
+    parser.add_argument('--require-up-activation-sram', action='store_true')
+    parser.add_argument('--baseline-operator', choices=('legacy', 'groups3'), default='legacy')
     parser.add_argument('--chain-repeats',type=int,default=16)
     parser.add_argument('--layers', type=int, nargs='+', default=[0, 4, 14, 19])
     parser.add_argument('--output', type=Path, required=True)
@@ -25,8 +31,14 @@ def main():
     parser.add_argument('--retirement-only', action='store_true',
                         help='Reuse measured A/B; check teardown without timing')
     args = parser.parse_args()
-    candidate_guid=('custom_deepseek_v41_expert_token_wide3_sat_fp8_gaudi2' if args.candidate_operator=='groups3' else
+    candidate_guid=('custom_deepseek_v41_expert_token_wide3_sat_fp8_gaudi2' if args.candidate_operator in ('groups3','pipeline3','plain_w13','sram_handoff','two_slice','unrolled','streamed','aligned','full_sram','pipeline_sram') else
                     'custom_deepseek_v41_expert_'+('paired_decode' if args.candidate_operator=='paired' else 'silu_decode')+'_fp8_gaudi2')
+    if args.candidate_operator in ('unrolled', 'streamed', 'aligned', 'full_sram', 'pipeline_sram'):
+        candidate_guid = 'custom_deepseek_v41_expert_token_wide6_unroll_sat_fp8_gaudi2'
+    if args.candidate_operator == 'aligned':
+        candidate_guid = 'custom_deepseek_v41_expert_token_wide6_aligned_sat_fp8_gaudi2'
+    if args.candidate_operator == 'pipeline_sram':
+        candidate_guid = 'custom_deepseek_v41_expert_token_wide3_unroll_sat_fp8_gaudi2'
     rank = int(os.environ['LOCAL_RANK'])
     modules = os.environ['HABANA_VISIBLE_MODULES'].split(',')
     os.environ['HLS_MODULE_ID'] = modules[rank]
@@ -78,20 +90,26 @@ def main():
         row = []
         for projection in ('w13', 'w2'):
             prefix = f'layers.{layer}.ffn.experts.{projection}'
-            qs, ss = [shard.catalog[prefix+suffix] for suffix in ('_q16', '_s16')]
-            experts, blocks, stream = qs.shape
-            q = torch.empty((experts, blocks//2, stream*2), dtype=torch.int16, device='hpu')
-            scales = torch.empty((experts, blocks//2, stream//8+128), dtype=torch.int16, device='hpu')
-            channels = torch.empty((experts, blocks//2, 256), dtype=torch.bfloat16, device='hpu')
-            for expert in range(12):
-                a,b,c,_ = prepare_expert(read_expert(qs, expert), read_expert(ss, expert), compact_scales=True)
-                config_values = json.loads((args.prepared/"config.json").read_text())["text_config"]
-                active_k = config_values["moe_intermediate_size"] // 4 if projection == "w2" else stream//32
-                if np.any(a[:, active_k * 64:]) or not saturated_decode_eligible(b, active_k=active_k):
-                    raise ValueError(f'Unqualified SAT scales layer={layer} expert={expert} projection={projection}')
-                q[expert].copy_(torch.from_numpy(a))
-                scales[expert].copy_(torch.from_numpy(b))
-                channels[expert].copy_(torch.from_numpy(c.view('<i2')).view(torch.bfloat16))
+            if args.production_router:
+                from vllm_gaudi.ops.deepseek_v41_expert_n256 import load_projection
+                q, scales, channels = load_projection(shard, prefix, 'hpu')
+                if not q.dsv41_sat_eligible:
+                    raise ValueError(f'Unqualified full checkpoint SAT scales: {prefix}')
+            else:
+                qs, ss = [shard.catalog[prefix+suffix] for suffix in ('_q16', '_s16')]
+                experts, blocks, stream = qs.shape
+                q = torch.empty((experts, blocks//2, stream*2), dtype=torch.int16, device='hpu')
+                scales = torch.empty((experts, blocks//2, stream//8+128), dtype=torch.int16, device='hpu')
+                channels = torch.empty((experts, blocks//2, 256), dtype=torch.bfloat16, device='hpu')
+                for expert in range(12):
+                    a,b,c,_ = prepare_expert(read_expert(qs, expert), read_expert(ss, expert), compact_scales=True)
+                    config_values = json.loads((args.prepared/"config.json").read_text())["text_config"]
+                    active_k = config_values["moe_intermediate_size"] // 4 if projection == "w2" else stream//32
+                    if np.any(a[:, active_k * 64:]) or not saturated_decode_eligible(b, active_k=active_k):
+                        raise ValueError(f'Unqualified SAT scales layer={layer} expert={expert} projection={projection}')
+                    q[expert].copy_(torch.from_numpy(a))
+                    scales[expert].copy_(torch.from_numpy(b))
+                    channels[expert].copy_(torch.from_numpy(c.view('<i2')).view(torch.bfloat16))
             row.append((q, scales, channels))
         projections={}
         for projection in ('w1','w3','w2'):
@@ -105,7 +123,11 @@ def main():
         down=projections['w2'][0];down=torch.cat((down,torch.zeros((down.shape[0],padded-width),dtype=down.dtype)),1).to('hpu')
         down_scale=projections['w2'][1].to('hpu')
         weights.append((row[0][0],row[1][0],row[0][1],row[1][1],lookup,row[0][2],row[1][2],
-                        shard.tensor(f'layers.{layer}.ffn_norm.weight','hpu'),gate_up,channel,down,down_scale))
+                        shard.tensor(f'layers.{layer}.ffn_norm.weight','hpu'),gate_up,channel,down,down_scale,
+                        *(tuple(shard.tensor(f'layers.{layer}.ffn.gate.{name}','hpu')
+                                for name in ('weight','bias','bias_vl')) if args.production_router else ())))
+        if rank == 0:
+            print(json.dumps(dict(loaded_layer=layer, production_router=args.production_router)), flush=True)
     norm = weights[0][7]
     control, scale, base = [shard.tensor(f'layers.0.hc_ffn_{name}', 'cpu') for name in ('fn', 'scale', 'base')]
     with safe_open(args.prepared/'pp0-tp0.safetensors', framework='pt', device='cpu') as checkpoint:
@@ -121,11 +143,21 @@ def main():
         fixtures.append((collapsed, residual, post, comb, pre, ids, route))
     x, residual, post, comb, pre, ids, route = [tensor.to('hpu') for tensor in fixtures[0]]
     from vllm_gaudi.compilation.deepseek_v41_overlap import make_backend
-    compiled = lambda fn, candidate=False: torch.compile(fn, backend=make_backend(static_int32=True,static_factories=True,split_mhc=True,compiler_config={'SYN_SRAM_BGEMM_SLICER_MULTIPLE_TINY_GEMMS_PER_SLICE':'false'} if candidate and args.disable_tiny_bgemm else None), fullgraph=True, dynamic=False)
-    def produce(row, ids, route, q13,q2,s13,s2,lut,c13,c2,norm_weight,shared_weight,shared_channel,shared_down,shared_scale, *, sat):
-        normalized, quantized, activation_scale = torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
-            row, norm_weight, 1e-20)
-        q,sx=torch.ops.custom_op.custom_deepseek_v41_dense_quant_gaudi2(normalized)
+    compiled = lambda fn, candidate=False: torch.compile(fn, backend=make_backend(static_int32=True,static_factories=True,split_mhc=True,compiler_config=({'SYN_RMW_SECTION_MAX_SIZE_BYTES':'41943040'} if candidate and args.candidate_operator in ('full_sram', 'pipeline_sram') else {'NON_COMMON_DIM_MIN_SLICE_NUM_FOR_PIPELINING':'4'} if candidate and args.candidate_operator in ('two_slice', 'unrolled', 'streamed', 'aligned', 'full_sram', 'pipeline_sram') else {'SYN_SRAM_BGEMM_SLICER_MULTIPLE_TINY_GEMMS_PER_SLICE':'false'} if candidate and args.disable_tiny_bgemm else None)), fullgraph=True, dynamic=False)
+    image_mask = torch.zeros((1,), dtype=torch.bool, device='hpu')
+    def produce(row, ids, route, q13,q2,s13,s2,lut,c13,c2,norm_weight,shared_weight,shared_channel,shared_down,shared_scale, *gate_weights, sat):
+        if sat and args.dual_norm_quant:
+            normalized, quantized, activation_scale, q, sx = torch.ops.custom_op.custom_deepseek_v41_ffn_norm_dual_quant_gaudi2(
+                row, norm_weight, 1e-20)
+        else:
+            normalized, quantized, activation_scale = torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
+                row, norm_weight, 1e-20)
+            q,sx=torch.ops.custom_op.custom_deepseek_v41_dense_quant_gaudi2(normalized)
+        if args.production_router:
+            logits = torch.ops.custom_op.custom_deepseek_v41_bf16_linear_f32_gaudi2(
+                normalized, gate_weights[0])
+            ids, route = torch.ops.custom_op.custom_deepseek_v41_router_logits_top6_gaudi2(
+                logits, gate_weights[1], gate_weights[2], image_mask)
         product=torch.ops.hpu.fp8_gemm_v2(q,False,shared_weight,True,None,torch.float32,None,None,None,False)
         shared_ids=torch.zeros((1,1),dtype=torch.int32,device=row.device)
         shared_route=torch.ones((1,1),dtype=torch.float32,device=row.device)
@@ -133,8 +165,11 @@ def main():
             product.reshape(1,1,-1),shared_ids,sx,shared_channel,shared_route)
         shared=torch.ops.hpu.fp8_gemm_v2(middle.reshape(1,-1),False,shared_down,True,None,torch.bfloat16,
             shared_sx.reshape(1,1),shared_scale,None,False)
-        op=(getattr(torch.ops.custom_op,'custom_deepseek_v41_expert_n256_moe_'+('paired_decode_shared' if args.candidate_operator=='paired' else 'silu_decode_shared' if args.candidate_operator=='silu' else 'two_group_w2_sat_shared')+'_fp8_gaudi2') if sat else
-            torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_shared_prefetch_w2_fp8_gaudi2)
+        kind = args.candidate_operator if sat else args.baseline_operator
+        names = dict(paired='paired_decode_shared', silu='silu_decode_shared',
+                     groups3='two_group_w2_sat_shared', pipeline3='pipeline3_sat_shared', plain_w13='plain_w13_sat_shared', sram_handoff='sram_handoff_sat_shared', two_slice='two_slice_sat_shared', unrolled='unrolled_sat_shared', streamed='streamed_sat_shared', aligned='aligned_sat_shared', full_sram='full_sram_sat_shared', pipeline_sram='pipeline_sram_sat_shared',
+                     legacy='prequant_direct_finalize_shared_prefetch_w2')
+        op = getattr(torch.ops.custom_op, 'custom_deepseek_v41_expert_n256_moe_'+names[kind]+'_fp8_gaudi2')
         return op(normalized,ids,route,q13,q2,s13,s2,lut,c13,c2,quantized,activation_scale,shared,True)
     producers = [compiled(lambda row, ids, route, *weights, sat=sat:
                           produce(row,ids,route,*weights,sat=sat),candidate=sat) for sat in (False, True)]
@@ -148,18 +183,73 @@ def main():
             collapsed,norm_weight,1e-20)
         return updated,collapsed,normalized,quantized,activation_scale
     consumer = compiled(consume)
-    # Compile both production consumers before native-plan allocation. Reject
-    # a physically larger graph immediately rather than instantiating it.
+    # Compile before timing. Pipeline slices are not independent logical stages;
+    # retain their count separately and validate SRAM/dataflow, not fewer slices.
     from tools.audit_deepseek_v41_physical_nodes import audit
-    for producer in producers:
-        producer(x,ids,route,*weights[0])
-        torch.hpu.synchronize()
+    from vllm_gaudi.compilation.deepseek_v41_compiler_config import compiler_configuration
+    for arm, producer in enumerate(producers):
+        # Bridge lowers on its eager worker after the Python backend returns.
+        # Keep the scoped compiler policy until the cold device call drains.
+        policy = ({'SYN_RMW_SECTION_MAX_SIZE_BYTES':'41943040'} if arm == 1 and args.candidate_operator in ('full_sram', 'pipeline_sram') else {'NON_COMMON_DIM_MIN_SLICE_NUM_FOR_PIPELINING':'4'}
+                  if arm == 1 and args.candidate_operator in ('two_slice', 'unrolled', 'streamed', 'aligned', 'full_sram', 'pipeline_sram') else {})
+        with compiler_configuration(policy):
+            producer(x,ids,route,*weights[0])
+            torch.hpu.synchronize()
     physical=[audit(p) for p in (root/'graphs'/f'rank{rank}').rglob('*PostGraph-symbol.pbtxt')]
-    reference=[p for p in physical if p['operations'].get('custom_deepseek_v41_expert_n256_fp8_gaudi2')]
-    candidate=[p for p in physical if p['operations'].get(candidate_guid)]
+    def classify(entries):
+        if args.candidate_operator in ('plain_w13','sram_handoff','two_slice','unrolled','streamed','aligned','full_sram','pipeline_sram'):
+            name = 'expert_n256_moe_'+args.candidate_operator+'_sat_shared'
+            tagged = lambda p: any(name in n['name'] for n in p['nodes'])
+            return ([p for p in entries if p['operations'].get('custom_deepseek_v41_expert_token_wide6_sat_fp8_gaudi2') and not tagged(p)],
+                    [p for p in entries if tagged(p)])
+        if args.candidate_operator == 'pipeline3':
+            # Both use the 3-route W2 decoder; only the accepted baseline still
+            # has the six-route W13 decoder. Do not classify by shared GUID alone.
+            six = 'custom_deepseek_v41_expert_token_wide6_sat_fp8_gaudi2'
+            return ([p for p in entries if p['operations'].get(six)],
+                    [p for p in entries if p['operations'].get(candidate_guid) and not p['operations'].get(six)])
+        return ([p for p in entries if p['operations'].get('custom_deepseek_v41_expert_n256_fp8_gaudi2')],
+                [p for p in entries if p['operations'].get(candidate_guid)])
+    reference, candidate = classify(physical)
     (directory/'physical_nodes.json').write_text(json.dumps(physical,indent=2)+'\n')
-    local_gate = bool(reference and candidate and
-                      max(p['physical_nodes'] for p in candidate) < max(p['physical_nodes'] for p in reference))
+    local_gate = bool(reference and candidate)
+    if args.candidate_operator in ('pipeline3', 'plain_w13', 'sram_handoff', 'two_slice', 'unrolled', 'streamed', 'aligned', 'full_sram', 'pipeline_sram'):
+        from tools.audit_deepseek_v41_sram import audit as sram_audit
+        placement = [sram_audit(Path(p['graph'])) for p in candidate]
+        (directory/'sram.json').write_text(json.dumps(placement, indent=2)+'\n')
+        # Inspect SRAM and the W13 slices before capturing or timing any plan.
+        sram_gate = bool(placement) and all(
+            p and p['all_decoded_weights_in_sram'] and p['all_mme_weights_in_sram']
+            and p['all_decoded_weights_consumed_once']
+            for p in placement)
+        from tools.audit_deepseek_v41_sram import tensor_info
+        schedules = []
+        for graph in candidate:
+            schedule = []
+            for node in graph['nodes']:
+                if node['op'] == candidate_guid:
+                    shape = tensor_info(node['tensors']['outputTensor:0'])['shape']
+                    schedule.append(dict(projection='w13' if shape[1] == 5120 else 'w2',
+                                         execution_index=int(node['execution_index'])))
+            schedules.append(schedule)
+        (directory/'route_schedule.json').write_text(json.dumps(schedules, indent=2)+'\n')
+        prefetch_gate = (not args.require_w13_prefetch or bool(schedules) and all(
+            max(n['execution_index'] for n in schedule if n['projection'] == 'w13') <
+            min(n['execution_index'] for n in schedule if n['projection'] == 'w2')
+            for schedule in schedules))
+        # Join actual decoded producers to their matrix consumers. Shared W2
+        # also has a 5120-wide stored axis, but it is not the routed W13.
+        up_matrices = [node for graph in placement for node in graph['matrix']
+                       if node.get('decoded_operand_index') is not None and
+                       node['weight']['shape'][-2] == 5120]
+        up_activation_sram = bool(up_matrices) and all(
+            node['output']['location'] == 'SRAM' for node in up_matrices)
+        local_gate = (local_gate and sram_gate and prefetch_gate and
+                      (not args.require_up_activation_sram or up_activation_sram))
+        (directory/'compile_gate.json').write_text(json.dumps(dict(
+            passed=local_gate, sram_and_w13_gate=sram_gate, up_activation_sram=up_activation_sram,
+            reference_nodes=[p['physical_nodes'] for p in reference],
+            candidate_nodes=[p['physical_nodes'] for p in candidate]), indent=2)+'\n')
     # All ranks leave together if one has missing evidence or a physical regression.
     # Otherwise successful ranks would enter native peer exchange indefinitely.
     gate = torch.tensor([int(local_gate)], dtype=torch.int32, device='hpu')
@@ -236,14 +326,13 @@ def main():
             raise RuntimeError(f'Paired W13/W2 chain differs for input {index}: {exact}')
         checks.append(dict(input=index, all_outputs_exact=True))
     (directory/'result.json').write_text(json.dumps(dict(status='correctness_passed', checks=checks))+'\n')
-    # A larger final compiler graph cannot qualify as kernel-count fusion.
+    # Retain actual physical nodes without rewarding a smaller pipeline slice count.
     from tools.audit_deepseek_v41_physical_nodes import audit
     physical=[audit(p) for p in (root/'graphs'/f'rank{rank}').rglob('*PostGraph-symbol.pbtxt')]
-    reference=[p for p in physical if p['operations'].get('custom_deepseek_v41_expert_n256_fp8_gaudi2')]
-    candidate=[p for p in physical if p['operations'].get(candidate_guid)]
+    reference, candidate = classify(physical)
     (directory/'physical_nodes.json').write_text(json.dumps(physical,indent=2)+'\n')
-    if not reference or not candidate or max(p['physical_nodes'] for p in candidate)>=max(p['physical_nodes'] for p in reference):
-        raise RuntimeError('Final physical node count did not decrease; no performance credit or timed run')
+    if not reference or not candidate:
+        raise RuntimeError('Final compiler evidence is missing; no timed run')
     for graph in graphs:
         for _ in range(20):
             graph.replay_fixed_with_completion().synchronize()
@@ -277,8 +366,9 @@ def main():
                   saving_ms_per_layer=statistics.median(savings)/len(args.layers) if savings else None,
                   round_savings_ms=savings,
                   three_consistent_rounds=bool(savings) and all(value > 0 for value in savings),
-                  full_model_gain_credit=False, physical_node_gate_pending=False, layers=args.layers, selected_experts=12,
-                  input_source=__doc__, native_replay=True, chain_repeats=args.chain_repeats, production_shared_expert=True,
+                  full_model_gain_credit=False, physical_node_gate_pending=False, pipeline_slice_policy=4, layers=args.layers, selected_experts=384 if args.production_router else 12,
+                  production_router=args.production_router, dual_norm_quant=args.dual_norm_quant,
+                  input_source=__doc__, baseline_operator=args.baseline_operator, candidate_operator=args.candidate_operator, native_replay=True, chain_repeats=args.chain_repeats, production_shared_expert=True,
                   native_library_sha256=hashlib.sha256(Path(os.environ['VLLM_HPU_DSV4_TPC_OP_LIBRARY']).read_bytes()).hexdigest())
     (directory/'result.json').write_text(json.dumps(result, indent=2)+'\n')
     if rank == 0:

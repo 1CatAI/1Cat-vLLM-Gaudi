@@ -14,6 +14,7 @@ constexpr const char* rrms_schema =
     "custom_op::custom_deepseek_v41_control_gemv_rrms_bf16_gaudi2";
 constexpr const char* rrms_guid =
     "custom_deepseek_v41_control_gemv_rrms_bf16_gaudi2";
+constexpr const char* unpack_schema = "custom_op::custom_deepseek_v41_control_rrms_unpack_bf16_gaudi2";
 struct RrmsParams { float epsilon; float inverse_width; };
 void validate(const at::Tensor& input, const at::Tensor& weight) {
     TORCH_CHECK(input.scalar_type() == at::kFloat && weight.scalar_type() == at::kFloat &&
@@ -49,8 +50,9 @@ const bool registered = [] {
     return true;
 }();
 const bool rrms_registered = [] {
+    for (const auto* name : {rrms_schema, unpack_schema}) {
     habana::custom_op::registerUserCustomOp(
-        rrms_schema, rrms_guid,
+        name, name + 11,
         [](const at::Stack& stack) {
             validate_rrms(stack.at(0).toTensor(), stack.at(1).toTensor(),
                           stack.at(2).toDouble());
@@ -64,6 +66,7 @@ const bool rrms_registered = [] {
             return std::make_shared<RrmsParams>(RrmsParams{
                 float(stack.at(2).toDouble()), 1.0f / 20480.0f});
         });
+    }
     return true;
 }();
 template<bool Batch4 = false, bool Prefetch = false>
@@ -80,7 +83,7 @@ at::Tensor meta(const at::Tensor& input, const at::Tensor& weight) {
     validate(input, weight);
     return at::empty({input.size(0), 24}, input.options());
 }
-template<bool Meta>
+template<bool Meta, bool Unpack = false>
 at::Tensor run_rrms(const at::Tensor& input, const at::Tensor& weight,
                     double epsilon) {
     validate_rrms(input, weight, epsilon);
@@ -89,19 +92,21 @@ at::Tensor run_rrms(const at::Tensor& input, const at::Tensor& weight,
                          input.options().dtype(at::kFloat));
     TORCH_CHECK(rrms_registered && input.device().type() == at::kHPU);
     auto descriptor = habana::custom_op::UserCustomOpDescriptor::
-        getUserCustomOpDescriptor(rrms_schema);
+        getUserCustomOpDescriptor(Unpack ? unpack_schema : rrms_schema);
     auto outputs = descriptor.execute({input, weight, epsilon});
     TORCH_CHECK(outputs.size() == 1);
     return outputs.at(0);
 }
 }
 TORCH_LIBRARY_FRAGMENT(custom_op, m) {
+    m.def("custom_deepseek_v41_control_rrms_unpack_bf16_gaudi2(Tensor input, Tensor weight, float epsilon) -> Tensor");
     m.def("custom_deepseek_v41_control_gemv_f32_gaudi2(Tensor input, Tensor weight) -> Tensor");
     m.def("custom_deepseek_v41_control_batch4_f32_gaudi2(Tensor input, Tensor weight) -> Tensor");
     m.def("custom_deepseek_v41_control_prefetch_f32_gaudi2(Tensor input, Tensor weight) -> Tensor");
     m.def("custom_deepseek_v41_control_gemv_rrms_bf16_gaudi2(Tensor input, Tensor weight, float epsilon) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
+    m.impl("custom_deepseek_v41_control_rrms_unpack_bf16_gaudi2", run_rrms<false, true>);
     m.impl("custom_deepseek_v41_control_gemv_f32_gaudi2", run<false>);
     m.impl("custom_deepseek_v41_control_batch4_f32_gaudi2", run<true>);
     m.impl("custom_deepseek_v41_control_prefetch_f32_gaudi2", run<false, true>);
@@ -109,6 +114,7 @@ TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
            run_rrms<false>);
 }
 TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
+    m.impl("custom_deepseek_v41_control_rrms_unpack_bf16_gaudi2", run_rrms<true, true>);
     m.impl("custom_deepseek_v41_control_gemv_f32_gaudi2", meta);
     m.impl("custom_deepseek_v41_control_batch4_f32_gaudi2", meta);
     m.impl("custom_deepseek_v41_control_prefetch_f32_gaudi2", meta);

@@ -12,6 +12,26 @@ extern "C" tpc_lib_api::GlueCodeReturn GetSupportedDataLayouts(
 
 int main() {
     using namespace tpc_lib_api;
+    // Check dispatch as well as GUID enumeration for the exact unpack loader.
+    {
+        HabanaKernelParams p{}; HabanaKernelInstantiation out{};
+        Tensor inputs[2]{}, outputs[1]{};
+        TensorAccessPattern ia[2]{}, oa[1]{};
+        float scalars[] = {1e-20f, 1.0f/20480.0f};
+        p.inputTensors=inputs; p.inputTensorNr=2;
+        p.outputTensors=outputs; p.outputTensorNr=1;
+        p.nodeParams.nodeParams=scalars; p.nodeParams.nodeParamsSize=sizeof(scalars);
+        out.inputTensorAccessPattern=ia; out.outputTensorAccessPattern=oa;
+        auto shape=[](Tensor& t, TensorDataType dtype, uint64_t columns, uint64_t rows) {
+            t.geometry.dataType=dtype; t.geometry.dims=2;
+            t.geometry.maxSizes[0]=columns; t.geometry.maxSizes[1]=rows;
+        };
+        shape(inputs[0],DATA_BF16,20480,1); shape(inputs[1],DATA_F32,20480,24);
+        shape(outputs[0],DATA_F32,25,1);
+        std::strcpy(p.guid.name,"custom_deepseek_v41_control_rrms_unpack_bf16_gaudi2");
+        assert(InstantiateTpcKernel(&p,&out)==GLUE_INSUFFICIENT_ELF_BUFFER);
+        assert(out.indexSpaceGeometry[0]==24 && out.indexSpaceGeometry[1]==1);
+    }
     assert(GetKernelGuids(DEVICE_ID_GAUDI2, nullptr, nullptr) == GLUE_FAILED);
     uint32_t count = 0;
     assert(GetKernelGuids(DEVICE_ID_GAUDI2, &count, nullptr) == GLUE_SUCCESS);

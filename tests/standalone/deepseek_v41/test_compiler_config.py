@@ -38,3 +38,23 @@ def test_unknown_or_invalid_options_do_not_mutate_sdk():
         with pytest.raises(ValueError), compiler_configuration(settings, library=library):
             pass
     assert set(library.values.values()) == {b'true'}
+
+
+def test_slice_count_is_scoped_and_restored():
+    library = Configuration()
+    key = 'NON_COMMON_DIM_MIN_SLICE_NUM_FOR_PIPELINING'
+    library.values[key.encode()] = b'4'
+    with compiler_configuration({key: '2'}, library=library):
+        assert library.values[key.encode()] == b'2'
+    assert library.values[key.encode()] == b'4'
+    with pytest.raises(ValueError), compiler_configuration({key: '0'}, library=library):
+        pass
+
+
+def test_manual_sram_budget_is_restored():
+    library = Configuration()
+    key = 'SYN_RMW_SECTION_MAX_SIZE_BYTES'
+    library.values[key.encode()] = b'16777216'
+    with compiler_configuration({key: '67108864'}, library=library):
+        assert library.values[key.encode()] == b'67108864'
+    assert library.values[key.encode()] == b'16777216'

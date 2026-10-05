@@ -19,9 +19,13 @@ STATIC_COORDINATES 原已默认开启，共六项。显式诊断覆盖仍可关�
 recipe编号冲突停止追查，不再作逐项归因。输出/post-norm/WOa/发布链小融合归档，
 默认关闭；共享-main输出原型提交 `0dd878fb`。旧项目中的组件预测不能继续叠加到新基线。
 
-**当前活跃 MoE 研发待验收累计：0 ms/token。** 先前 mHC 的0.031500469ms和已归档
-共享-main复用0.043661426ms保留历史证据，但不计入本轮MoE累计。下一次正式验收触发线
-为新MoE/后续Attention主体累计≥1ms。先验收编译物理节点与SRAM驻留，再计时。
+**当前本轮微基准待验收累计：0.408659508 ms/token（估计，尚未端到端）。**
+MoE 合并候选0.206373750ms、mHC0.025901406ms、Attention主体向量化0.176384352ms。
+各项5组输入四卡逐位一致、原生重放3轮A/B方向一致，默认均关闭；详见文末。
+新MoE替代旧的两片候选，mHC替代旧0.031500469ms，均不重复相加。
+正式验收触发线仍为累计≥1ms。按逻辑阶段计数，GEMM内部TPC/MME流水切片单列，
+保留默认切片策略。两指令FP4字典解码尚未通过逐lane验证，收益记0。
+
 
 ## 2026-10-03及以前的测量记录
 
@@ -891,3 +895,92 @@ including this next-batch item is 1.154626469 ms; no new formal result yet.
 Reuse producer physical nodes **19→18**, unchanged downstream **3**. Five checkpoint-derived inputs × four ranks are bit-exact, including SWA writes and post/norm outputs. Three native-chain savings **0.001368859 / 0.001823461 / 0.001617090 ms per reuse layer**. Flag `VLLM_HPU_DSV41_MAIN_MLA_PROJECTION=0`. Source topology with four-layer groups has 27 reuse and 11 publish occurrences at the 16K logical path; only reuse is qualified so far, yielding **0.043661426 ms/token estimated**, not formal. The first publish test failed before timing due to tensor input indexing after a scalar ratio; it receives zero credit. Evidence: SSD `decode-main-mla-projection-01/DECISION.json` and `decode-main-mla-publish-projection-01/DECISION.json`.
 
 Shared-main publish follow-up (`decode-main-mla-publish-projection-02`): five inputs × four ranks exact, 19→18 producer nodes, paired savings 0.000173684/0.000192953/−0.000049105 ms. Mixed direction: retain for the combined module but **0 pending gain**. The nonsliceable producer experiment increases nodes to20 due to two DMA copies and a split scale kernel; reverted, **0 credit**. Qualified pending balance remains **0.075161895 ms/token** (mHC40-boundary estimate plus 27 reuse projections).
+
+### 2026-10-05 — pending MoE decoder schedule (default off)
+
+| Candidate | Parent | Complete-chain saving | 40-layer forecast | Switch / status |
+|---|---|---:|---:|---|
+| Unrolled SAT decode + two W13 slices | batch03 groups3 / 9.564 formal baseline | 0.000310086 ms/layer | 0.0124034 ms/token | `unrolled_sat_shared` experimental schema + scoped slice policy 2; not wired into serving |
+
+Evidence: `/opt/ssd960/1cat-vllm-decode-archives/decode-moe-unroll-chain-01/DECISION.json`.
+Five checkpoint-derived inputs × four ranks exact; native replay ABABAB direction
+consistent; complete producer 21→17 physical nodes, decoded weights in SRAM.
+This entry is micro-qualified only. New accumulated forecast: **0.0124034 ms/token**;
+formal baseline remains **9.564282 ms/token**. Integration into the normal cold
+compile policy is required before any combined serving acceptance.
+
+The entry above is superseded (not added) by `decode-moe-streamed-01`: same
+expanded decoder and two slices, with the exact one-route SiLU kernel. Three
+four-layer differences: 0.00303965625/0.00308975/0.003012375 ms. Five inputs
+× four ranks exact, 21→17 producer nodes and decoded weights in SRAM. Saving
+0.000759914 ms/layer; active forecast **0.0303966 ms/token**. Experimental
+`streamed_sat_shared` schema plus scoped slice policy 2; serving remains off.
+The activation pipeline is **not** in SRAM yet; this forecast does not claim
+completion of the MegaMoE design. Formal baseline is unchanged.
+
+### 2026-10-05 — retain GEMM slicing; revise active micro balance
+
+The two-slice unrolled/streamed experiments above are archived, inactive and
+excluded from the cumulative balance under the revised four-slice policy.
+Their fixed-route fixtures also omitted the production router dependency.
+Active qualified forecast for this MoE batch: **0 ms/token**. The accepted
+formal baseline remains **9.564282 ms/token**. Future reports distinguish
+independent logical stages from physical TPC/MME fragments of one pipeline.
+
+### 2026-10-05 — MoE producer with production routing, slicing retained
+
+| Name | Native micro saving | Forecast | Switch |
+|---|---:|---:|---|
+| SAT load schedule + scalar route scale + per-route SiLU | 0.003281063 ms/layer | 0.1312425 ms/token (40 layers) | `VLLM_HPU_DSV41_EXPERT_STREAMED_SAT=0` |
+
+`decode-moe-router-four-slice-01`: BF16 router GEMM/top6, all 384 checkpoint
+experts in four layers, shared expert, native peer exchange and mHC/FFN consumer.
+Five embedding-derived input rows × four ranks exact; ABABAB four-layer
+savings 0.013155594 / 0.013124250 / 0.013116688 ms. Policy restored to 4;
+compiler chooses three W13 fragments in both arms for this producer graph.
+Independent logical stages 17→16 (scale broadcast removed), physical nodes
+23→22. W13 products and decoded weights reside in SRAM. This supersedes
+all two-slice variants; no addition of their earlier estimates. Active forecast
+**0.1312425 ms/token**, formal baseline unchanged at **9.564282 ms/token**.
+
+The same-baseline combined producer in `decode-moe-dual-quant-01` supersedes
+that estimate: FFN norm emits the routed and shared FP8 operands with one
+amax and distinct rounding. Three four-layer savings: **0.020614031 /
+0.020665156 / 0.020637375 ms**, five inputs × four ranks exact; W13 activation
+remains in SRAM. Combined estimate **0.20637375 ms/token**, not 0.1312425 +
+0.20637375. Add `VLLM_HPU_DSV41_FFN_DUAL_QUANT=0` alongside the streamed SAT
+flag. Both remain off; no formal request is authorized by the ≥1 ms gate yet.
+
+### 2026-10-05 — mHC linear load plus exact deferred gates
+
+Five inputs × four ranks exact in WO/control → native peer → gates/post →
+FFN/router. Native A/B savings **0.000647535 / 0.000645180 / 0.000649762 ms
+per boundary**; physical and logical nodes 9→8. Count only the 40 measured
+Attention post boundaries: **0.025901406 ms/token forecast**. This replaces
+the older 0.031500469 mHC estimate; they must not be added. The other 40 FFN
+boundaries receive no unmeasured credit. Flags `VLLM_HPU_DSV41_MHC_LINEAR_LOAD=0`
+and `VLLM_HPU_DSV41_MHC_DEFERRED_GATES=0`. Evidence: `decode-mhc-linear-post-01`.
+
+Current active forecast with the combined MoE candidate: **0.232275156 ms/token**.
+Official baseline remains **9.564282 ms/token**; the ≥1 ms trigger is not met.
+
+### 2026-10-05 — MLA gather/decode vector utilization
+
+| Scope | Native micro saving | Qualified occurrences | Token forecast |
+|---|---:|---:|---:|
+| Reuse: SWA codec 64→128 values | 0.004391113 ms/layer | 27 | 0.118560059 ms |
+| Publish: SWA + FP4 main codec 64→128 values | 0.005256754 ms/layer | 11 | 0.057824293 ms |
+
+Five checkpoint-derived fixtures × four ranks exact, including modified SWA
+and exported main rows/masks. Both native ABABAB runs are consistently positive.
+The Q/KV producer, QK/softmax/PV, original WO path and peer/mHC consumers are
+retained. Physical/logical node counts do not decrease; this is instruction
+and vector utilization improvement, not fusion credit. Cases:
+`decode-mla-reuse-vector-01`, `decode-mla-publish-vector-01`.
+Flag `VLLM_HPU_DSV41_MLA_VECTOR_CODEC=0`. These distinct reuse/publish
+occurrences total **0.176384352 ms/token estimated**.
+
+Active micro-qualified cumulative forecast: **0.408659508 ms/token**.
+No new formal request: the ≥1 ms trigger is not reached. The two-instruction
+expert decoder remains unqualified and receives zero credit. Official baseline
+remains **9.564282 ms/token**.

@@ -2,7 +2,9 @@
 #pragma once
 #include "tpc_kernel_lib_interface.h"
 class DeepseekV41MainPublishGatherGaudi2 {
+    bool vector_;
 public:
+    explicit DeepseekV41MainPublishGatherGaudi2(bool vector = false) : vector_(vector) {}
     static constexpr const char* name = "custom_deepseek_v41_main_publish_gather_gaudi2";
     tpc_lib_api::GlueCodeReturn GetGcDefinitions(tpc_lib_api::HabanaKernelParams*,
                                                tpc_lib_api::HabanaKernelInstantiation*);

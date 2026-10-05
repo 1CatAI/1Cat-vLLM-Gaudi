@@ -398,3 +398,178 @@ Next shared-main attention candidate reuses the manual MLA product/RoPE/FP8 cons
 The sliceable shared-main PV/RoPE/WO producer reduced actual compiler nodes 19→18. Reuse: five inputs × four ranks exact; three native-chain savings 1.369/1.823/1.617 us. Only 27 configured reuse occurrences receive an estimated 0.043661 ms/token. Publish is also exact and 19→18, but paired savings 0.174/0.193/−0.049 us are mixed: zero separate credit, retained for the larger module.
 
 An attempted nonsliceable full-output producer demonstrates the Ascend/Gaudi ownership distinction: it reduced RoPE/quant physical clones 2→1 but introduced two DMA copies and duplicated WO scale, increasing total producer nodes 19→20. Its all-required mapping was reverted. Keep the compiler's SRAM-consumer slicing unless the complete physical graph improves; a single named producer is not by itself an optimization. Evidence: `decode-main-mla-whole-producer-01/DECISION.json`.
+
+### 2026-10-05 MoE pipeline, after accepted batch03
+
+`decode-moe-pipeline3-02`: two independent three-route W13→SiLU→W2 chains
+compile to 11 routed physical nodes (17 including shared experts/input prep),
+versus 21 in the accepted complete producer. W13 has two 19,660,800-byte SRAM
+blocks and W2 two 9,830,400-byte SRAM blocks, each with exactly one MME consumer.
+Zero-offset same-size reshape aliases must be followed by the SRAM checker.
+Five checkpoint-derived inputs on all four ranks are exact after native peer
+exchange and mHC/FFN consumption. Nevertheless ABABAB is slower by
+0.052748 / 0.052549 / 0.052575 ms per four-layer group. No gain credited.
+
+The final graph schedules W13-A, W2-A, W13-B, W2-B. A follow-up emits both W13
+bundles first and requires that order in the final graph before timing. This
+exposes W13-B preparation while W13-A's matrix consumer can execute. A separate
+structural issue remains: the shared input norm/quant producer is outside both
+W13 bundles when it feeds two MMEs. Compare a single ordinary W13 matrix with
+the accepted batch-GEMM form before changing compiler policies.
+
+Explicit Gaudi2 disassembly confirms three hot vector arithmetic instructions
+per 256 FP4 values: enable-bit OR, table shuffle, saturated exponent subtraction.
+The two-instruction goal remains unmet. The documented shuffle enable bit is
+required. Expert source scales vary by output channel; unlike dense FP8 weights,
+they cannot be treated as uniform 32×32 blocks to hoist scaling before lookup.
+See `decode-moe-pipeline3-01/ISA_REVIEW.json`; no blanket bandwidth claim is made.
+
+### MoE follow-up decisions (same formal baseline)
+
+Two-branch prefetch reduced the regression to3.50us/layer but did not beat the
+accepted chain. Single ordinary W13 uses one39.32MB SRAM weight block and gives
+15 complete /9 routed nodes, yet is1.45us/layer slower. Both are disabled.
+Explicit RMW handoff for W13→SiLU→W2 caused compiler weight spills and was
+rejected without timing. The next compiler check retains the original producer
+bundle and scopes NON_COMMON_DIM_MIN_SLICE_NUM_FOR_PIPELINING=2 to the candidate
+compile. The local solver starts from4 slices; input/consumer ownership is unchanged.
+
+The four-scale dictionary attempt is numerically invalid. CPU scalar LUT parity
+did not model byte SHUFFLE group control or the high half of an unpacked load.
+The real HPU chain failed before timing; isolated simulator probes reproduce it.
+FORM_FP_NUMBER removes the high-bit contamination but does not repair the
+variable group-control behavior. Removed native dispatch and kernel sources;
+archived under decode-moe-dictionary-02/unqualified-source and unqualified.diff.
+No two-instruction claim or gain credit. Full dictionary metadata also exceeds
+production memory headroom; future designs must account for that independently.
+
+### Exact decoder scheduling and the next MoE dependency
+
+`decode-moe-unroll-chain-01` manually expands the three eight-row load/decode
+stages. It removes loop-carried vector register copies without changing the
+three arithmetic instructions (OR, SHUFFLE, saturated subtract). The simulator
+executes 3516→3148 instructions for a six-route K128 block, with zero differing
+bytes for normal and invalid route fixtures. Four-rank producer→peer→mHC/FFN
+validation is exact on five checkpoint-derived inputs. With two W13 slices,
+physical producer nodes are 21→17 and every decoded weight remains in SRAM
+with one matrix consumer. Three four-layer savings are
+0.0013724375/0.00123634375/0.00124034375 ms: 0.000310086 ms/layer,
+0.0124034 ms for 40 occurrences before serving overhead. This is a component
+result only, not a new formal baseline.
+
+The two-slice-only control (`decode-moe-two-slice-02`) was slower by
+0.00235624 ms/layer. Reducing slice count alone delays first MME consumption.
+The current pair-SiLU access pattern processes two routes per index-space tile;
+a W13 half contains three routes. `decode-moe-streamed-01` tests whether a
+one-route SiLU access pattern can stitch the three-route W13 slice through
+the activation boundary. No layout, rounding or scale rule is changed.
+
+`decode-moe-streamed-01` confirms the one-route SiLU is exact and faster in
+all three native-chain rounds (0.760 us/layer total versus accepted groups3),
+but **does not** stitch activation SRAM: the compiler chose W13 slices
+4096/3584, cutting through 1280-column route rows. The next producer maps one
+complete route per index-space tile (rather than one N256 block), retaining
+K128 partitioning across TPCs. This supplies a genuine 1280-column access
+granularity, without adding padding, changing values or imposing fake
+whole-tensor access. Expected slice boundaries are 3840/3840; compiler proof
+and exact outputs determine acceptance.
+
+The aligned route producer does obtain 3840/3840 slices, but alone is slower
+by 0.841 us/layer (`decode-moe-aligned-01`). It does not eliminate activation
+DRAM. The compiler's `isLogicalChainBreaker` requires one-to-one matching
+slicing dimensions across a reshape, and its generic consumer check rejects
+granularity greater than one. A flat-input SiLU removes the reshape boundary
+without changing arithmetic; its required compile gate is SRAM W13 output.
+If that fails, it is not timed as a claimed SRAM pipeline.
+
+The flat-input SiLU still leaves W13 output in DRAM. The pre-timing gate
+rejects `decode-moe-aligned-flat-01`; no timing is taken. Next, the explicit
+RMW scratch experiment changes an earlier failed condition: **both** decoded
+weights and activations share the same on-chip section. The earlier 16 MiB
+experiment reserved only activations, disabling automatic weight bundling.
+Source inspection shows 16 MiB is a configurable compiler validation limit
+(`SYN_RMW_SECTION_MAX_SIZE_BYTES`), not Gaudi2's full SRAM size. A cold-only
+64 MiB limit allows the approximately 59.4 MB complete scratch to be tested.
+All actual tensor locations and sole MME consumption remain compile gates;
+this is not promoted or assumed fast. It trades automatic slicing for an
+explicit one-W13/two-W2 SRAM layout and must be timed before any gain claim.
+
+`decode-moe-full-sram-01` is rejected before timing: its 59.4 MB scratch does
+not fit the compiler's actual **47.5 MiB / 49,807,360-byte** available SRAM
+pool. Raising the validation maximum does not create physical memory. The
+next version reuses the dead W13 weight range for W2 group A and then group B,
+with explicit previous-MME-completion→next-decode dependencies. Activations
+and both W2 products occupy separate tail offsets, so the section fits a
+40 MiB cap. Compilation must prove SRAM storage and no hidden DRAM copy;
+five changing inputs must catch reuse hazards before timing.
+
+`decode-moe-full-sram-reuse-02` proves 21→15 total producer nodes and all
+routed W13→SiLU→W2 intermediates in SRAM. Five fixtures × four ranks are
+exact, including weight-storage reuse. Nevertheless, three four-layer pairs
+are slower by 0.05657/0.05680/0.05664 ms. No gain is credited. The physical
+schedule puts the entire shared expert before the first routed decoder;
+the RMW section pulls the final shared-add consumer into its bundle, so
+shared completion becomes an entry dependency. The next graph returns W2
+products/scales to the finalizer outside the RMW bundle and uses independent
+three-route W13/W2 branches. Only those small terminal operands are DRAM;
+all decoded weights and W13→SiLU→W2 activation handoffs must remain SRAM.
+This addresses the observed dependency, rather than assuming that more SRAM
+residency alone improves latency.
+
+The detailed `aligned-flat-01` compiler log identifies the automatic pipeline
+break more precisely: `expert_flat_silu_quant` is rejected with **creates a
+circle in BP graph**, after `ffn_norm_quant` has been bundled with W13. Its
+second output takes a separate scale broadcast path before re-entering SiLU.
+`aligned-scale-01` makes the six routes read the original C1 scale scalar,
+already supported by the SiLU kernel, avoiding that external broadcast path.
+This is an enabling dependency change for the complete W13→SiLU pipeline;
+correctness and actual residency remain mandatory.
+
+## 2026-10-05: router dependency and four-slice policy correction
+
+The fixed-ID MoE fixture allowed FFN norm to join the W13 bundle. Its scale
+then became a second direct input to SiLU, which `validateConsumerPaths` rule
+4d rejects (an accepted ancestor provides another consumer input). Removing
+the sixfold scale broadcast alone did not remove this diamond. With the real
+BF16 gate GEMM and top6 router included, the W13 activation in
+`decode-moe-router-pipeline-01` is in SRAM; five inputs/four ranks are exact.
+That run used two-slice policy and is archived, not credited or promoted.
+The next qualification retains policy 4, all 384 checkpoint experts and the
+actual router, and reports independent logical stages separately from TPC/MME
+pipeline fragments. Compiler fragments are not kernel-fusion savings.
+
+### MoE dual quantizer ISA review
+
+The routed expert uses BF16-rounded epsilon/240 scaling; the shared expert
+uses power-of-two scaling and FP8 subnormal flush. Reusing one quantized row
+would change arithmetic. The new five-output FFN producer shares normalized
+BF16 values and one amax, then emits both formats separately. The Gaudi2 ISA
+in `decode-moe-dual-quant-01/kernel.s` has three loops: input load/squares,
+weight load/normalization, and one cached VLM read feeding both conversions.
+The amax and both scales are outside the output loop; there is no second
+tensor read of the normalized row. VLM reads preserve the existing cached-row
+implementation, rather than introducing repeated DRAM loads.
+
+Shuffle validation: `check_deepseek_v41_shuffle_lanes.py` matches all 32,768
+outputs of the SDK simulator probe. Explicitly masking the raw high nibble
+still leaves 10,240/20,480 failures for the flat 64-entry class dictionary.
+The first masked counterexample is lane 2, direction 138: group mux returns
+42 rather than 10. The two-instruction dictionary is **not qualified**; the
+three-instruction exact SAT decoder remains selected. Instruction source:
+https://docs.habana.ai/en/latest/TPC/TPC_Intrinsics_Guide/Arithmetic.html#shuffle
+
+## 2026-10-05: retained pipeline, vectorized MLA body
+
+The shared-main gather used 64-value FP32 decoding, while the existing wider
+batch path already contained exact 128-value BF16 codecs. Both operands are
+BF16-representable before the output boundary; the vector codec preserves
+zero/scale rules and writes the identical rounded keys and FP32 PV values.
+The helpers now live in `deepseek_v41_selected_kv_codecs.h`, shared with the
+existing selected-KV implementation. No matrix, softmax/sink, selection order,
+mask, page mapping or exported-row ownership changes. Scale bytes are read
+once per row, outside four 128-value chunks; no amax and no loop-local
+reload of the full scale row. The source and ISA are archived with each case.
+
+`decode-mla-reuse-vector-01` and `decode-mla-publish-vector-01` each pass five
+inputs on four ranks and three positive native A/B rounds. Node counts are
+unchanged; classify this as efficiency, not a reduced logical stage count.

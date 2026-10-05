@@ -971,3 +971,25 @@ candidate blocks depend on an earlier source layer in the same token.
 `VLLM_HPU_DSV41_MAIN_MLA_PROJECTION=0` (experimental): shared-main C1 publish/reuse uses one hand-written PV BF16 rounding, inverse-RoPE and FP8 quantization consumer before the unchanged WOa/WOb MME projections. Selection ownership and cache publication remain unchanged. Pending production component and combined serving qualification.
 
 The qualified TP4 C1 entrypoint now defaults `COMPRESSOR_FUSED_PUBLISH`, `EXPERT_W2_THREE_ROUTES`, `QKV_FUSED_PROLOGUE`, `CANDIDATE_COORDINATES`, and `PEER_POST_COLLAPSE` to1 (each prefixed `VLLM_HPU_DSV41_`). `STATIC_COORDINATES` was already1 for the single-stage path. Raw library defaults remain conservative for direct component imports; the ordinary entrypoint applies the qualified topology defaults and respects explicit overrides. Archived `MAIN_MLA_PROJECTION`, `WOA_DENSE_HANDOFF`, `PEER_POST_NORM`, and `MHC_DEFERRED_GATES` stay0.
+
+
+`VLLM_HPU_DSV41_EXPERT_STREAMED_SAT=0`: checkpoint-qualified C1 MoE SAT decoder
+with expanded load/decode scheduling, scalar route scale and one-route SiLU.
+Retains the normal compiler slicing policy and the shared TP implementation.
+Default off pending combined serving qualification; C2–C6 retain their existing entry.
+
+`VLLM_HPU_DSV41_FFN_DUAL_QUANT=0`: emit the routed and shared expert FP8
+operands from one FFN norm kernel and one row maximum. Their distinct scale,
+rounding and subnormal rules remain separate. Applies where decode already
+uses the standalone FFN norm producer; fused mHC producers retain their path.
+Default off pending combined serving qualification.
+
+`VLLM_HPU_DSV41_MHC_LINEAR_LOAD=0`: exact BF16 load/linear FP32 conversion
+for the decode control GEMV/RRMS. Keeps FP32 weight and accumulation order,
+and avoids the explicit lane-permutation chain. Prefill remains unchanged.
+Default off pending combined mHC producer/consumer qualification.
+
+`VLLM_HPU_DSV41_MLA_VECTOR_CODEC=0`: use the existing exact BF16 vector
+codecs at 128 values per chunk inside shared-main MLA gather/decode. QK,
+softmax/sink, PV and their rounding remain unchanged; selected-row ownership
+and request lifetimes are unchanged. Default off pending combined acceptance.

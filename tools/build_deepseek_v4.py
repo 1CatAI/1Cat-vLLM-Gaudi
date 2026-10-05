@@ -24,6 +24,11 @@ def main():
     source = root / "csrc/deepseek_v4"
     build, output = args.build_root.resolve(), args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
+    def fingerprint_sources():
+        return {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in sorted(source.rglob("*"))
+                if path.is_file() and path.suffix in (".py", ".cpp", ".hpp", ".h", ".c", ".txt")}
+    before = fingerprint_sources()
     subprocess.run(["cmake", "-S", str(source), "-B", str(build / "kernels"),
                     "-DCMAKE_BUILD_TYPE=Release"], check=True)
     subprocess.run(["cmake", "--build", str(build / "kernels"), "--parallel", str(args.jobs)], check=True)
@@ -33,11 +38,19 @@ def main():
         env = dict(os.environ, MAX_JOBS=str(args.jobs))
         subprocess.run([sys.executable, "setup.py", "build_ext", "--build-lib", str(output),
                         "--build-temp", str(build / "pytorch")], cwd=source / "pytorch", env=env, check=True)
-    sources = {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
-               for path in sorted(source.rglob("*"))
-               if path.is_file() and path.suffix in (".py", ".cpp", ".hpp", ".h", ".c", ".txt")}
+    sources = fingerprint_sources()
+    if sources != before:
+        changed = sorted(key for key in set(before) | set(sources) if before.get(key) != sources.get(key))
+        # A compiler can read old contents then give its object a newer mtime.
+        # Force the changed units newer than completed objects before retrying.
+        for key in changed:
+            if (root/key).exists():
+                (root/key).touch()
+        (output/"INVALID_BUILD.json").write_text(json.dumps(dict(changed_during_build=changed), indent=2)+"\n")
+        raise RuntimeError("Native source changed during compilation; no valid build manifest published")
     binaries = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                 for path in output.glob("*.so") if path.name.startswith(("hpu_dsv4_", "libdeepseek_v4_"))}
+    (output / "INVALID_BUILD.json").unlink(missing_ok=True)
     manifest = {"sources": sources, "binaries": binaries}
     (output / "deepseek_v4_build.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
