@@ -187,3 +187,9 @@ A width diagnosis: failed host protocol was an8-bit counter, not cache-line shar
 
 A host-amortization qualification:100 exchanges in one native compute graph,61200 epochs exact. Two-rank five-owner protocol remains~10.62us/point; per-point host submission was not the missing~4.6us to6us. No production forecast; stop this transport family rather than expanding unsafe imports. Evidence:decode-host-shared-peer-05.
 Current qualified pending forecast is0.634172625ms/token; formal baseline remains9.564282ms/token. New publish-mask/native-codec candidates remain outside gain totals until native complete-chain tests finish.
+
+Qualified hardware E4M3 reuse03 adds0.024276902ms/token forecast on the fixed vector-mask parent; pending total0.658449527ms/token, formal9.564282 unchanged. Cached operand retention is unqualified; the partial-output alias path was rejected by final graph/launch evidence.
+
+C one-MME follow-up: coldBF16 rounding passesofficialequations on20inputs; actual24-rowBF16MME+sharedRRMS also passesfull5×4 outputs undernormalizedlimits androuterID equality. Explicitnative dependencies placeitinsideWOpeerwait, addressingearlierproducerMMEserialization hypothesis. Three completechainpairs arestill5.014–5.022us slower/boundary. Addsone logicalcompute node+recipe; noforecast. Archivedunqualifiedprototype andrestorednormalcontroller.
+
+D operand-cache follow-up: partialoutputaliasesfailedsectionvalidation andGCrelocatedoutputs. Explicitmutableinputs repairlaunch but do notrepairallconsumeroutputs undernative replay; firsttwoofthreereuseconsumers differ onsecondfixture. No timing. RejectsharedcacheWAR assumption; no claimofprovenprecisecause. Publisherhardwarecodec onqualifiedscalar-mask parent passes5×4exact but slows2.010–2.036us/layer despite~4%fewerinstructions. Neitherentersgainledger. Activepending0.658449527ms/token; formal9.564282unchanged.
