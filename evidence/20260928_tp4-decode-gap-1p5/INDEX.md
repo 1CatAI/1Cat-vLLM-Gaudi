@@ -941,3 +941,5 @@ Existing wide woA epilogue preserved WoB consumer bits at C1/C2/C6 but no small-
 - `decode-kv-hardware-codec-01`: offline Gaudi2 simulator, all256 E4M3FN encodings. Native conversion alone has15 mismatches; finite-top-exponent/negative-zero correction removes all.79→74 VLIW instructions, unchanged5 loads/7 stores. No hardware latency, no ledger credit, not a new default.
 
 - Producer-fusion02 exposed interleaved Bridge placeholder ABI error before timing. CPU reproducer confirms old order fails. Fixed03:5 states×4 ranks and feedback exact, no hot compile;73→41 compute calls,42 peer points unchanged. Device3-round regressions0.142305/0.150671/0.130405ms; A4.188502→B4.3295135ms. Archive source, stop both consumer/producerside merging directions, remove unqualified pass from runtime. Ledger unchanged.
+
+- Producer-fusion03 compiler diagnosis: all11 observed merged physical graphs place control after their last MME (Exec_idx). Fewer recipes did not establish the intended earlier overlap. This is static ordering evidence, not a measured stall attribution. Require compile-only earlier placement before another device trial; no new trace.
