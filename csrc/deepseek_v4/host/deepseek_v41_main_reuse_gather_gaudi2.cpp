@@ -6,6 +6,8 @@ extern unsigned char _binary___deepseek_v41_main_reuse_gather_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_main_reuse_gather_gaudi2_o_end;
 extern unsigned char _binary___deepseek_v41_main_reuse_vector_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_main_reuse_vector_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_main_reuse_vector_mask_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_main_reuse_vector_mask_gaudi2_o_end;
 tpc_lib_api::GlueCodeReturn DeepseekV41MainReuseGatherGaudi2::GetGcDefinitions(
     tpc_lib_api::HabanaKernelParams* in, tpc_lib_api::HabanaKernelInstantiation* out) {
     using namespace tpc_lib_api;
@@ -52,12 +54,22 @@ tpc_lib_api::GlueCodeReturn DeepseekV41MainReuseGatherGaudi2::GetGcDefinitions(
         in->outputTensors[2].geometry.maxSizes[1] != tokens) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
     map(out->outputTensorAccessPattern[2], 0, 0, 1, 0);
     map(out->outputTensorAccessPattern[2], 1, 1, 1, 0);
+    if (vector_mask_) {
+        // A single workpoint accesses the complete mask row; advertise that
+        // cross-row access so slicing cannot bind a partial row to it.
+        out->inputTensorAccessPattern[2].allRequired = true;
+        out->outputTensorAccessPattern[2].allRequired = true;
+    }
     out->kernel.paramsNr = 0;
     auto* first = &_binary___deepseek_v41_main_reuse_gather_gaudi2_o_start;
     auto* last = &_binary___deepseek_v41_main_reuse_gather_gaudi2_o_end;
     if (vector_) {
         first = &_binary___deepseek_v41_main_reuse_vector_gaudi2_o_start;
         last = &_binary___deepseek_v41_main_reuse_vector_gaudi2_o_end;
+    }
+    if (vector_mask_) {
+        first = &_binary___deepseek_v41_main_reuse_vector_mask_gaudi2_o_start;
+        last = &_binary___deepseek_v41_main_reuse_vector_mask_gaudi2_o_end;
     }
     const auto capacity = out->kernel.elfSize;
     out->kernel.elfSize = last - first;

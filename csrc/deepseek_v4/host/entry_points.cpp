@@ -330,6 +330,7 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_PUBLISH_GATHER,
     GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_REUSE_GATHER,
     GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_REUSE_VECTOR,
+    GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_REUSE_VECTOR_MASK,
     GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_PUBLISH_VECTOR,
     GAUDI2_KERNEL_DEEPSEEK_V41_MHC_POST_COLLAPSE,
     GAUDI2_KERNEL_DEEPSEEK_V41_MHC_POST_COLLAPSE_F32,
@@ -648,6 +649,7 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_LOGICAL_MLA_GATHER].name, DeepseekV41LogicalMlaGatherGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_PUBLISH_GATHER].name, DeepseekV41MainPublishGatherGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_PUBLISH_VECTOR].name, "custom_deepseek_v41_main_publish_vector_gaudi2");
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_REUSE_VECTOR_MASK].name, "custom_deepseek_v41_main_reuse_vector_mask_gaudi2");
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_REUSE_VECTOR].name, "custom_deepseek_v41_main_reuse_vector_gaudi2");
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_REUSE_GATHER].name, DeepseekV41MainReuseGatherGaudi2::name);
 
@@ -1215,6 +1217,8 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
         return DeepseekV41MainPublishGatherGaudi2(true).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41MainPublishGatherGaudi2::name) == 0)
         return DeepseekV41MainPublishGatherGaudi2().GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name, "custom_deepseek_v41_main_reuse_vector_mask_gaudi2") == 0)
+        return DeepseekV41MainReuseGatherGaudi2(true,true).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, "custom_deepseek_v41_main_reuse_vector_gaudi2") == 0)
         return DeepseekV41MainReuseGatherGaudi2(true).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41MainReuseGatherGaudi2::name) == 0)

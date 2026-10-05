@@ -1089,3 +1089,18 @@ Simulation correction: FFN BF16 quantization was rechecked with typed FP32
 descriptors in `decode-ffn-bf16-quant-01/correct-descriptors.log`; all five
 20488-byte outputs exact, instruction counts unchanged. Earlier malformed
 simulator outputs are superseded; hardware evidence and ledger credit unchanged.
+
+### 2026-10-05 — vector shared-main reuse mask producer
+
+`decode-mla-vector-mask-01`: parent vector KV codec held fixed in both arms.
+Five checkpoint-derived inputs x four ranks bit-exact through QKV, MLA, WO,
+native peer and post/FFN. Three native savings **.005064145/.005103352/.005115961ms
+per reuse layer**. Ten vector stores replace640 scalar mask stores; all-row
+access is declared to the compiler, with the original shared-row ownership.
+Five-position simulator outputs exact, including early SWA history and200K
+position. Physical producer count stays23→23; this is ISA/traffic efficiency,
+not fusion credit. 53 relevant CPU checks passed.
+Default-off `VLLM_HPU_DSV41_MLA_VECTOR_MASK`, requires `MLA_VECTOR_CODEC`.
+27 qualified reuse layers forecast **.137790492ms/token**, additive to the
+vector-codec parent. Active total **.634172625ms/token**; formal baseline
+**9.564282ms/token** unchanged. Combined formal trigger remains1ms.

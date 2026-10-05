@@ -38,13 +38,31 @@ void main(tensor swa, tensor shared_rows, tensor shared_mask, tensor positions,
     for (int token = begin[1]; token < end[1]; ++token) {
         const int position = s_i32_ld_g(gen_addr((int5){token}, positions));
         const int length = s_i32_ld_g(gen_addr((int5){token}, lengths));
+#ifdef DSV41_REUSE_VECTOR_MASK
+        // The mask is a contiguous 640-value row. One owner emits it in ten
+        // vector stores instead of every row owner issuing scalar traffic.
+        if (begin[0] == 0) {
+            for (int chunk = 0; chunk < 2; ++chunk) {
+                const int64 slots = (int64)V_LANE_ID_32 + chunk * 64;
+                const int64 absolute = slots + position - 127;
+                float64 enabled = v_f32_sel_grt_i32_b(absolute, -1, 1.0f, 0.0f);
+                enabled = v_f32_sel_less_i32_b(slots, length, enabled, 0.0f);
+                v_f32_st_tnsr((int5){chunk * 64, token}, mask, enabled);
+            }
+            for (int chunk = 2; chunk < 10; ++chunk)
+                v_f32_st_tnsr((int5){chunk * 64, token}, mask,
+                    v_f32_ld_tnsr_b((int5){chunk * 64, token}, shared_mask));
+        }
+#endif
         for (int slot = begin[0]; slot < end[0]; ++slot) {
             const int absolute = position - 127 + slot;
             const int index = absolute & 255;
             const bool valid_swa = slot < length && absolute >= 0;
+#ifndef DSV41_REUSE_VECTOR_MASK
             const float valid = slot < 128 ? (valid_swa ? 1.0f : 0.0f) :
                 s_f32_ld_g(gen_addr((int5){slot, token}, shared_mask));
             s_f32_st_g(gen_addr((int5){slot, token}, mask), valid);
+#endif
             if (slot >= 128) {
                 // Main rows are already BF16. Consume every lane of each
                 // vector, then preserve both FP32 halves for the PV consumer.

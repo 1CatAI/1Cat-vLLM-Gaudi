@@ -108,3 +108,43 @@ def test_projected_publish_preserves_selection_workspace(monkeypatch):
     owner.index_source = 24
     assert shared_main_attention(*args, workspace, projection=True) is partial
     assert [name for name, _ in calls] == ['publish', 'reuse', 'publish']
+
+
+def test_vector_mask_reuses_the_current_selection_owner(monkeypatch):
+    from vllm_gaudi.ops import deepseek_v41_shared_main as module
+    monkeypatch.setattr(module.gaudi_envs, "VLLM_HPU_DSV41_MLA_VECTOR_CODEC", True)
+    monkeypatch.setattr(module.gaudi_envs, "VLLM_HPU_DSV41_MLA_VECTOR_MASK", True)
+    rows, mask = torch.ones((1, 640, 512)), torch.ones((1, 640))
+    calls = []
+
+    def publish(*args):
+        calls.append("publish")
+        return args[0], rows.clone(), mask.clone()
+
+    def reuse(q, swa, selected_rows, selected_mask, *args):
+        calls.append("mask")
+        assert selected_rows.shape == rows.shape and selected_mask.shape == mask.shape
+        return q
+
+    monkeypatch.setattr(torch.ops.custom_op, "custom_deepseek_v41_main_publish_vector_mla_gaudi2", publish, raising=False)
+    monkeypatch.setattr(torch.ops.custom_op, "custom_deepseek_v41_main_reuse_vector_mask_mla_gaudi2", reuse, raising=False)
+    owner = Layer(20, 20, 20, torch.ones(1), torch.ones((1, 512), dtype=torch.int32)).owner
+    q = torch.ones((1, 16, 512))
+    arguments = owner, q, torch.tensor([16384]), torch.zeros((1, 512), dtype=torch.int32), torch.tensor([640])
+    for token in range(2):
+        workspace = {}
+        assert shared_main_attention(*arguments, workspace) is q
+        assert shared_main_attention(*arguments, workspace) is q
+        owner.index_source += 4
+        assert shared_main_attention(*arguments, workspace) is q
+    assert calls == ["publish", "mask", "publish"] * 2
+
+
+def test_vector_mask_requires_its_codec_parent(monkeypatch):
+    from vllm_gaudi.ops import deepseek_v41_shared_main as module
+    monkeypatch.setattr(module.gaudi_envs, "VLLM_HPU_DSV41_MLA_VECTOR_CODEC", False)
+    monkeypatch.setattr(module.gaudi_envs, "VLLM_HPU_DSV41_MLA_VECTOR_MASK", True)
+    owner = Layer(20, 20, 20, torch.ones(1), torch.ones((1, 512), dtype=torch.int32)).owner
+    with pytest.raises(ValueError, match="vector codec parent"):
+        shared_main_attention(owner, torch.ones((1, 16, 512)), torch.tensor([0]),
+                              torch.zeros((1, 512), dtype=torch.int32), torch.tensor([640]), {})

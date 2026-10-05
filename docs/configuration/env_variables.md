@@ -995,6 +995,11 @@ softmax/sink, PV and their rounding remain unchanged; selected-row ownership
 and request lifetimes are unchanged. Default off pending combined acceptance.
 
 
+`VLLM_HPU_DSV41_MLA_VECTOR_MASK=0`: C1 shared-main reuse mask copying in
+one vector producer. Requires `MLA_VECTOR_CODEC`; QK, softmax, PV and shared
+row ownership remain unchanged. Projection-fused consumers retain their path.
+Default off pending combined serving qualification.
+
 `VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL=0`: experimental C1 FP32 TPC control
 projection with independent K accumulators and shared RRMS. Takes precedence over
 `MHC_LINEAR_LOAD`; changes FP32 summation order and uses the official-equation

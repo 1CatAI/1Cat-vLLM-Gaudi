@@ -954,3 +954,5 @@ Existing wide woA epilogue preserved WoB consumer bits at C1/C2/C6 but no small-
 - `decode-index-query-replica-01`: before timing, the native adapter rejects zero collective count. Explicit compute-only replay support is being added to the common adapter; normal collective coverage guards remain. No numerical/performance result yet. Retry02 uses a separately built bridge.
 
 - `decode-index-query-replica-02`: explicit zero-collective native path works; five inputs x four query/gain/score outputs exact. All3 rounds lose16.261/16.331/16.451us per index layer, so do not integrate query replica. Both arms retain gain replica. Metadata correction records actual1→0 query points (old summary2→1 was stale). No gain or formal test.
+
+- `decode-mla-vector-mask-01`: ten vector mask stores replace640 scalar mask stores; full QKV→MLA→WO→native-peer→post/FFN chain exact for5 fixtures x4 ranks. Three native savings5.064/5.103/5.116us per reuse layer; 27-layer forecast.137790492ms. Producer23→23 compute nodes; all-rank new GUID verified. Default-off common C1 integration requires vector codec. Active forecast.634172625ms/token, formal9.564282 unchanged.

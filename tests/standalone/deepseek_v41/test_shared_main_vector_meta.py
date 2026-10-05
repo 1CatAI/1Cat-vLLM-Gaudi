@@ -7,7 +7,7 @@ import habana_frameworks.torch.core  # noqa: F401
 torch.ops.load_library(os.environ['VLLM_HPU_DSV4_TPC_OP_LIBRARY'])
 
 
-@pytest.mark.parametrize('heads', [16, 32])
+@pytest.mark.parametrize('heads', [8, 16, 32])
 def test_vector_body_retains_shared_row_and_mask_contract(heads):
     def tensor(shape, dtype):
         return torch.empty(shape, dtype=dtype, device='meta')
@@ -24,7 +24,9 @@ def test_vector_body_retains_shared_row_and_mask_contract(heads):
         q, swa, main, selection, position, pages, sink, scale, lengths, 1)
     reused = torch.ops.custom_op.custom_deepseek_v41_main_reuse_vector_mla_gaudi2(
         q, swa, rows, mask, position, sink, scale, lengths)
-    assert out.shape == reused.shape == q.shape
+    masked = torch.ops.custom_op.custom_deepseek_v41_main_reuse_vector_mask_mla_gaudi2(
+        q, swa, rows, mask, position, sink, scale, lengths)
+    assert out.shape == reused.shape == masked.shape == q.shape
     assert rows.shape == (1, 640, 512) and rows.dtype == torch.bfloat16
     assert mask.shape == (1, 640) and mask.dtype == torch.float32
 

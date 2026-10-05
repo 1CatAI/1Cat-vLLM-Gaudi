@@ -16,6 +16,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--wait-measurement-file',type=Path,help='Prepare native plans, then wait for the shared service timing window to finish')
     parser.add_argument('--qkv-transpose', action='store_true', help='Cold transpose fused QKV FP8 weights; vector MLA and all consumers held fixed')
+    parser.add_argument('--mla-vector-mask', action='store_true', help='Hold vector codec fixed; copy reuse masks in one vector producer')
     parser.add_argument('--mla-vector', action='store_true', help='Vectorize the MLA reuse gather with QKV and WO held fixed')
     parser.add_argument('--mla-publish',action='store_true',help='Exercise and retain shared-row/mask publication in the projection chain')
     parser.add_argument('--mla-projection',action='store_true',help='Fuse shared-main PV cast/inverse-RoPE/WO quant with both MME projections')
@@ -33,8 +34,10 @@ def main():
     parser.add_argument('--retirement-only', action='store_true',
                         help='Reuse measured A/B; check teardown without timing')
     args = parser.parse_args()
-    if args.qkv_transpose:
+    if args.qkv_transpose or args.mla_vector_mask:
         args.mla_vector = True
+    if args.mla_vector_mask and args.mla_publish:
+        parser.error("Vector mask candidate only changes shared-main reuse")
     if args.mla_publish and not (args.mla_projection or args.mla_vector):
         parser.error("--mla-publish requires --mla-projection")
     if args.rope_handoff and not args.woa_handoff:
@@ -190,8 +193,10 @@ def main():
                 if args.mla_projection and fused:
                     return torch.ops.custom_op.custom_deepseek_v41_main_reuse_projection_gaudi2(
                         q.reshape(1,heads,512),cache,main,mask,pos,sink,scale,lens,wa,sa,phase,wb,sb)
-                mla_op = (torch.ops.custom_op.custom_deepseek_v41_main_reuse_vector_mla_gaudi2
-                          if args.qkv_transpose or (fused and args.mla_vector) else
+                mla_op = (torch.ops.custom_op.custom_deepseek_v41_main_reuse_vector_mask_mla_gaudi2
+                          if fused and args.mla_vector_mask else
+                          torch.ops.custom_op.custom_deepseek_v41_main_reuse_vector_mla_gaudi2
+                          if args.qkv_transpose or args.mla_vector_mask or (fused and args.mla_vector) else
                           torch.ops.custom_op.custom_deepseek_v41_main_reuse_mla_gaudi2)
                 out=mla_op(q.reshape(1,heads,512),cache,main,mask,pos,sink,scale,lens)
             if args.woa_handoff and args.rope_handoff and fused:
@@ -354,7 +359,7 @@ def main():
                   three_consistent_rounds=bool(savings) and all(value > 0 for value in savings),
                   full_model_gain_credit=False, physical_node_gate_pending=True,chain_repeats=args.chain_repeats,
                   production_compiler_static_coordinates=True,full_qkv_query_producer=True,
-                  candidate_kind="qkv_cold_transpose" if args.qkv_transpose else ("mla_publish_vector" if args.mla_publish else "mla_reuse_vector") if args.mla_vector else "main_publish_projection" if args.mla_publish else "main_reuse_projection" if args.mla_projection else "rope_woa_handoff" if args.rope_handoff else "peer_post_norm" if args.peer_post_norm else "woa_handoff" if args.woa_handoff else "qkv_joint" if args.qkv_fusion else "kv_reuse",
+                  candidate_kind="mla_vector_mask" if args.mla_vector_mask else "qkv_cold_transpose" if args.qkv_transpose else ("mla_publish_vector" if args.mla_publish else "mla_reuse_vector") if args.mla_vector else "main_publish_projection" if args.mla_publish else "main_reuse_projection" if args.mla_projection else "rope_woa_handoff" if args.rope_handoff else "peer_post_norm" if args.peer_post_norm else "woa_handoff" if args.woa_handoff else "qkv_joint" if args.qkv_fusion else "kv_reuse",
                   input_source=__doc__, native_replay=True,
                   native_library_sha256=hashlib.sha256(Path(os.environ['VLLM_HPU_DSV4_TPC_OP_LIBRARY']).read_bytes()).hexdigest())
     (directory/'result.json').write_text(json.dumps(result, indent=2)+'\n')
