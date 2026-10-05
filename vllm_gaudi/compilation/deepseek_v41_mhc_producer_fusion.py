@@ -44,8 +44,13 @@ def _plan(module, call, exchanges):
     between = before[before.index(producer_call) + 1:]
     if not any(node.op == "call_function" and node.target in exchanges for node in between):
         raise ValueError("no intervening peer point")
-    if any(not _getitem(node) and not (node.op == "call_function" and node.target in exchanges) for node in between):
-        raise ValueError("intervening operation is not a peer or tuple projection")
+    unsafe = [
+        node for node in between
+        if not (_getitem(node) or _pure(node) or (node.op == "call_function" and node.target in exchanges))
+    ]
+    if unsafe:
+        raise ValueError("intervening operations lack a pure storage contract: " + str([(node.op, str(node.target))
+                                                                                        for node in unsafe]))
     if sum(node.op == "call_module" and node.target == producer_call.target for node in nodes) != 1:
         raise ValueError("producer module is shared by multiple calls")
     producer = module.get_submodule(producer_call.target)
@@ -83,6 +88,7 @@ def _plan(module, call, exchanges):
     if len(placeholders) != len(call.args):
         raise ValueError("controller argument count differs from its graph")
     parent_args = list(producer_call.args)
+    lifted_attributes = []
     first_compute = next((node for node in graph.nodes if node.op != "placeholder"), None)
     available = set(before[:before.index(producer_call)])
     for placeholder, argument in zip(placeholders, call.args):
@@ -98,7 +104,13 @@ def _plan(module, call, exchanges):
             if not isinstance(argument, (torch.fx.Node, int, float, bool, type(None))):
                 raise ValueError("controller input is not a tensor node or scalar literal")
             if isinstance(argument, torch.fx.Node) and argument not in available:
-                raise ValueError("controller input is not ready at producer entry")
+                if argument.op == "get_attr":
+                    # Moving an attribute lookup does not copy its tensor.
+                    # All intervening operations are read-only; storage writes
+                    # inside the producer are checked on the merged graph.
+                    lifted_attributes.append(argument)
+                else:
+                    raise ValueError("controller input is not ready at producer entry: " + str(argument.target))
             with graph.inserting_before(first_compute):
                 added = graph.placeholder(f"mhc_{placeholder.name}")
                 added.meta = dict(placeholder.meta)
@@ -119,7 +131,7 @@ def _plan(module, call, exchanges):
     if crosses_mutable_storage(merged, selected):
         raise ValueError("producer writes controller input storage or alias evidence is missing")
     graph.lint()
-    return producer_call, merged, tuple(parent_args), len(old_outputs), old_tuple, control_tuple
+    return producer_call, merged, tuple(parent_args), len(old_outputs), old_tuple, control_tuple, lifted_attributes
 
 
 def fuse_mhc_producers(module, exchanges):
@@ -137,11 +149,13 @@ def fuse_mhc_producers(module, exchanges):
                    for node in child.graph.nodes):
             continue
         try:
-            producer, merged, args, offset, old_tuple, control_tuple = _plan(module, call, exchanges)
+            producer, merged, args, offset, old_tuple, control_tuple, lifted = _plan(module, call, exchanges)
         except ValueError as error:
             audit.append(dict(controller=call.target, fused=False, reason=str(error)))
             continue
         old_users = list(producer.users)
+        for attribute in lifted:
+            producer.prepend(attribute)
         module.set_submodule(producer.target, merged)
         producer.args = args
         producer.meta = {

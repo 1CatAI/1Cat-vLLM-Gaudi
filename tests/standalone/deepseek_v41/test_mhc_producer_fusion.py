@@ -166,3 +166,21 @@ def test_follows_real_split_across_multiple_peer_boundaries():
     assert sum(node.target == torch.ops.dsv41_producer_test.peer.default for node in candidate.graph.nodes) == 3
     for index in range(5):
         assert torch.equal(source(x + index, weight), candidate(x + index, weight))
+
+
+def test_resident_constants_and_readonly_views_between_peer_and_control():
+    source = _graph()
+    source.register_buffer("resident_weight", _fixture()[1])
+    call = next(node for node in source.graph.nodes if node.op == "call_module" and "_mhc_" in node.target)
+    with source.graph.inserting_before(call):
+        weight = source.graph.get_attr("resident_weight")
+        weight.meta["val"] = source.resident_weight
+        source.graph.call_function(torch.ops.aten.view.default, (call.args[0], [8]))
+    call.args = (call.args[0], weight)
+    source.recompile()
+    candidate = copy.deepcopy(source)
+    audit = fuse_mhc_producers(candidate, torch.ops.dsv41_producer_test.peer.default)
+    assert len(audit) == 1 and audit[0]["fused"], audit
+    for index in range(5):
+        value, weight = _fixture()
+        assert all(torch.equal(a, b) for a, b in zip(source(value + index, weight), candidate(value + index, weight)))

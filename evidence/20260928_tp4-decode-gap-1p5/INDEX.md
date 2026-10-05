@@ -935,3 +935,5 @@ Existing wide woA epilogue preserved WoB consumer bits at C1/C2/C6 but no small-
 - PCIe acyclic star01/02 (SSD): no reciprocal imports. Bounded polling error and612 changing epochs cleanly release2/3. Same-process native primitive A18.1661us→B16.0945us; still above6us even atTP2, do not extend toTP4 or count as model gain. Nrank16 remains quarantined. Maintained CPU import-DAG/epoch guards:19 checks.
 
 - `decode-mhc-producer-fusion-01`: default-off scheduling hypothesis, moves pure parallel control into the PRE-peer producer, unlike rejected post-peer merge. Requires ready inputs and nonaliasing state.50 CPU scheduling/import/DMA checks pass; native real16 A/B queued on available2/3/6/7 with separate recorded plans and shared drained Engram roots. No gain credit before hardware result.
+
+- Producer-fusion01 failed before timing: initial graph guard rejected resident constants/read-only inter-partition nodes.27 CPU checks now cover those nodes, real split composition and mutable aliases. Retry02 retains every peer point and rejects late peer-dependent inputs; no gain credit.
