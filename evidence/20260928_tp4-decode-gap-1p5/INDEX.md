@@ -950,3 +950,7 @@ Existing wide woA epilogue preserved WoB consumer bits at C1/C2/C6 but no small-
 - Simulator descriptor repair: FP32 TensorDesc2 must use hardware type7, not UINT16 type3. Maintained typed descriptor plus actual FP32 echo regression. `decode-ffn-bf16-quant-01/correct-descriptors.log` revalidates all20488 output bytes for five fixtures; old malformed simulation superseded, independent hardware correctness remains valid.
 
 - `decode-peer-post-registers-01`: owner-only final quantization removes1939 simulated instructions (5 exact fixtures). Full QKV→MLA→WO→native peer→post/norm→next control+router passes5x4 exact but loses3.305/3.465/3.395us per layer, despite consumer5→4 compute nodes. Remaining repeated whole-row post/statistics serializes40tiles per owner vs distributed baseline post. Keep fusion off, zero credit; stop variants of this boundary without a different dataflow.
+
+- `decode-index-query-replica-01`: before timing, the native adapter rejects zero collective count. Explicit compute-only replay support is being added to the common adapter; normal collective coverage guards remain. No numerical/performance result yet. Retry02 uses a separately built bridge.
+
+- `decode-index-query-replica-02`: explicit zero-collective native path works; five inputs x four query/gain/score outputs exact. All3 rounds lose16.261/16.331/16.451us per index layer, so do not integrate query replica. Both arms retain gain replica. Metadata correction records actual1→0 query points (old summary2→1 was stale). No gain or formal test.

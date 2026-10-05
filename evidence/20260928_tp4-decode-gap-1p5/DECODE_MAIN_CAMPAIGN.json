@@ -2255,5 +2255,32 @@
     "gain_credit_ms": 0,
     "default": false,
     "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-peer-post-registers-01"
+  },
+  "index_query_replica_20261005": {
+    "status": "five_inputs_four_ranks_exact_three_consistent_regressions",
+    "peer_points_per_iteration": [
+      1,
+      0
+    ],
+    "round_savings_ms_per_index_layer": [
+      -0.01626080468749999,
+      -0.016330914062499993,
+      -0.016450945312499993
+    ],
+    "gain_credit_ms": 0,
+    "default": false,
+    "reason": "Additional full query projection/codec work exceeds saved query collective; retain cold gain-only replica. No serving trial.",
+    "reference_parent": "gain replica present in both arms",
+    "adapter_support": "explicit compute-only native capture/replay qualified; legacy nonzero topology remains covered by CPU topology tests",
+    "formal_result": null,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-index-query-replica-02"
+  },
+  "compute_only_native_adapter_20261005": {
+    "status": "qualified_fixture_support",
+    "interface": "configure_topology(groups,0,False) explicitly allows compute-only capture/replay. Omitted topology retains legacy16/groups checks.",
+    "changes": "No communicator required for explicitly zero points; native compute replay used; no empty HCL back()/batch access; drain before close. Existing nonzero replay unchanged.",
+    "qualification": "C++ topology coverage plus query replica5x4 exact/3 native rounds. This fixture support is not credited as a model optimization.",
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-index-query-replica-02",
+    "formal_gain_credit": false
   }
 }

@@ -56,6 +56,7 @@ class RuntimeApis {
   using SynEndCapture = synStatus (*)(SynGraph);
   using SynAbortCapture = synStatus (*)(SynGraph);
   using SynBeginReplay = synStatus (*)(SynGraph);
+  using SynReplayCompute = synStatus (*)(SynGraph);
   using SynReplaySegment = synStatus (*)(SynGraph, uint64_t, const SyncInfo*, uint8_t, SyncInfo*);
   using SynGetInfo = synStatus (*)(SynGraph, ComputeGraphInfo*);
   using SynGetWorkspaceBytes = synStatus (*)(SynGraph, uint64_t*);
@@ -98,6 +99,7 @@ class RuntimeApis {
       syn_end_capture = resolve<SynEndCapture>("synNativeComputeGraphEndCapture");
       syn_abort_capture = resolve<SynAbortCapture>("synNativeComputeGraphAbortCapture");
       syn_begin_replay = resolve<SynBeginReplay>("synNativeComputeGraphBeginReplay");
+      syn_replay_compute = resolve<SynReplayCompute>("synNativeComputeGraphReplay");
       syn_replay_segment = resolve<SynReplaySegment>("synNativeComputeGraphReplaySegment");
       syn_get_info = resolve<SynGetInfo>("synNativeComputeGraphGetInfo");
       syn_get_workspace_bytes = resolve<SynGetWorkspaceBytes>("synNativeComputeGraphGetWorkspaceBytes");
@@ -185,6 +187,7 @@ class RuntimeApis {
   SynBeginCapture syn_begin_capture = nullptr;
   SynEndCapture syn_end_capture = nullptr;
   SynAbortCapture syn_abort_capture = nullptr;
+  SynReplayCompute syn_replay_compute = nullptr;
   SynBeginReplay syn_begin_replay = nullptr;
   SynReplaySegment syn_replay_segment = nullptr;
   SynGetInfo syn_get_info = nullptr;
@@ -430,8 +433,9 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
   }
 
   void configureTopology(size_t groups, size_t collectives, bool externalPrefix) {
-    TORCH_CHECK(state_.load() == State::Created && groups > 0 && collectives > 0,
+    TORCH_CHECK(state_.load() == State::Created && groups > 0 && (collectives > 0 || !externalPrefix),
                 "Topology must be configured before capture");
+    topology_configured_ = true;
     expected_groups_ = groups;
     expected_collectives_ = collectives;
     external_prefix_ = externalPrefix;
@@ -776,6 +780,9 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
     auto& api = RuntimeApis::get();
     synStatus first_syn = synSuccess;
     hcclResult_t first_hcl = hcclSuccess;
+    if (computeOnly() && syn_graph_ != nullptr)
+      checkSynapse(synStreamSynchronize(habana::HPUDeviceContext::get_device().get_stream(0)),
+                   "synStreamSynchronize(compute-only close)");
     if (hcl_batch_ != nullptr) {
       checkSynapse(synStreamSynchronize(habana::HPUDeviceContext::get_device().get_stream(0)),
                    "synStreamSynchronize(native plan close)");
@@ -867,6 +874,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
  private:
   size_t expected_groups_ = 0;
   size_t expected_collectives_ = 0;
+  bool topology_configured_ = false;
   bool external_prefix_ = false;
   bool require_independent_overlap_ = true;
   std::vector<at::Tensor> late_inputs_;
@@ -892,7 +900,8 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
     for (size_t group = 0; group < plans.size(); ++group) {
       TORCH_CHECK(plans[group] && plans[group]->matches(inputs[group]),
                   "Native decoder capture requires a sealed fixed-shape prepared group");
-      TORCH_CHECK(plans[group]->communicator, "Native decoder capture requires an initialized communicator");
+      TORCH_CHECK(plans[group]->communicator || computeOnly(),
+                  "Native decoder capture requires an initialized communicator");
       if (!communicator) communicator = plans[group]->communicator;
       TORCH_CHECK(plans[group]->communicator == communicator,
                   "Native decoder groups must share one communicator and HCL stream");
@@ -981,7 +990,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
         node_kinds.push_back({node.exchange, node.peer_only});
       }
     const auto topology = NativeGraphTopology::prepare(node_kinds, plans.size(), usesJointPlan(),
-                                                      expected_collectives_, external_prefix_);
+                                                      expected_collectives_, external_prefix_, topology_configured_);
     prefix_node_count_ = topology.prefixNodes;
     segment_count_.store(topology.computeCount);
     collective_count_.store(topology.consumers.size());
@@ -1346,7 +1355,9 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
     try {
       auto& api = RuntimeApis::get();
       auto& device = habana::HPUDeviceContext::get_device();
-      if (hcl_batch_ != nullptr) {
+      if (computeOnly()) {
+        checkSynapse(api.syn_replay_compute(syn_graph_), "synNativeComputeGraphReplay(compute-only)");
+      } else if (hcl_batch_ != nullptr) {
         SyncInfo completion;
         const auto status = bounded_tiles_
             ? api.syn_replay_bounded(syn_graph_, bound, &completion, joint_statistics_.data(), joint_statistics_.size())
@@ -1383,7 +1394,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
                   "Native decoder replay topology changed");
       TORCH_CHECK(api.hcl_submit(hcl_graphs_.back()) == hcclSuccess, "hcclTp2NativeGraphSubmit failed");
       }
-      if (replay_count_.load() == 0) {
+      if (replay_count_.load() == 0 && !hcl_graphs_.empty()) {
         HclGraphInfo replay_info;
         TORCH_CHECK(api.hcl_get_info(hcl_graphs_.back(), &replay_info) == hcclSuccess,
                     "hcclTp2NativeGraphGetInfo failed after first unified replay");
@@ -1473,7 +1484,8 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
     return segmentedPrefixAvailable() && !late_inputs_.empty();
   }
 
-  bool usesJointPlan() const { return tp4_ || jointPlanEnabled(); }
+  bool computeOnly() const { return topology_configured_ && expected_collectives_ == 0; }
+  bool usesJointPlan() const { return !computeOnly() && (tp4_ || jointPlanEnabled()); }
   bool tp4_ = false;
   bool has_reduction_phases_ = false;
 
