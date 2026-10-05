@@ -80,6 +80,8 @@ def _plan(module, call, exchanges):
     producer_placeholders = [node for node in producer.graph.nodes if node.op == "placeholder"]
     if len(producer_placeholders) != len(producer_call.args):
         raise ValueError("producer argument count differs from its graph")
+    if not producer_placeholders:
+        raise ValueError("constant-only producer has no activation handoff")
     existing = {
         arg: copied[node]
         for node, arg in zip(producer_placeholders, producer_call.args) if isinstance(arg, torch.fx.Node)
@@ -89,7 +91,10 @@ def _plan(module, call, exchanges):
         raise ValueError("controller argument count differs from its graph")
     parent_args = list(producer_call.args)
     lifted_attributes = []
-    first_compute = next((node for node in graph.nodes if node.op != "placeholder"), None)
+    # Bridge fused partitions may interleave placeholders and operators. The
+    # callable ABI follows placeholder order, not the first compute position.
+    # New parent arguments are appended, so their placeholders must be too.
+    last_placeholder = copied[producer_placeholders[-1]]
     available = set(before[:before.index(producer_call)])
     for placeholder, argument in zip(placeholders, call.args):
         projection = (isinstance(argument, torch.fx.Node) and _getitem(argument) and argument.args[0] is producer_call
@@ -111,11 +116,12 @@ def _plan(module, call, exchanges):
                     lifted_attributes.append(argument)
                 else:
                     raise ValueError("controller input is not ready at producer entry: " + str(argument.target))
-            with graph.inserting_before(first_compute):
+            with graph.inserting_after(last_placeholder):
                 added = graph.placeholder(f"mhc_{placeholder.name}")
                 added.meta = dict(placeholder.meta)
                 if isinstance(argument, torch.fx.Node):
                     added.meta.update(argument.meta)
+            last_placeholder = added
             env[placeholder] = added
             parent_args.append(argument)
             if isinstance(argument, torch.fx.Node):

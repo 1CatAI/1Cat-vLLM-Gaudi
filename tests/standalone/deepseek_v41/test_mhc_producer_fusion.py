@@ -184,3 +184,32 @@ def test_resident_constants_and_readonly_views_between_peer_and_control():
     for index in range(5):
         value, weight = _fixture()
         assert all(torch.equal(a, b) for a, b in zip(source(value + index, weight), candidate(value + index, weight)))
+
+
+def test_bridge_interleaved_placeholders_keep_parent_argument_order():
+    source = _graph()
+    child = source.producer
+    first_compute = next(node for node in child.graph.nodes if node.op == "call_function")
+    with child.graph.inserting_after(first_compute):
+        gain = child.graph.placeholder("gain")
+    with child.graph.inserting_after(gain):
+        scaled = child.graph.call_function(torch.ops.aten.mul.Tensor, (first_compute, gain))
+    for user in list(first_compute.users):
+        if user is not scaled:
+            user.replace_input_with(first_compute, scaled)
+    child.recompile()
+    source.register_buffer("gain", torch.tensor([1.5]))
+    producer = next(node for node in source.graph.nodes if node.op == "call_module" and node.target == "producer")
+    with source.graph.inserting_before(producer):
+        resident_gain = source.graph.get_attr("gain")
+        resident_gain.meta["val"] = source.gain
+    producer.args = (*producer.args, resident_gain)
+    source.recompile()
+    candidate = copy.deepcopy(source)
+    assert fuse_mhc_producers(candidate, torch.ops.dsv41_producer_test.peer.default)[0]["fused"]
+    placeholder_names = [node.target for node in candidate.producer.graph.nodes if node.op == "placeholder"]
+    assert placeholder_names[1] == "gain"
+    assert placeholder_names[-1].startswith("mhc_")
+    for index in range(5):
+        value, weight = _fixture()
+        assert all(torch.equal(a, b) for a, b in zip(source(value + index, weight), candidate(value + index, weight)))
