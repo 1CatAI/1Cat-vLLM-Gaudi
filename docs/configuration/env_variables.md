@@ -993,3 +993,11 @@ Default off pending combined mHC producer/consumer qualification.
 codecs at 128 values per chunk inside shared-main MLA gather/decode. QK,
 softmax/sink, PV and their rounding remain unchanged; selected-row ownership
 and request lifetimes are unchanged. Default off pending combined acceptance.
+
+
+`VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL=0`: experimental C1 FP32 TPC control
+projection with independent K accumulators and shared RRMS. Takes precedence over
+`MHC_LINEAR_LOAD`; changes FP32 summation order and uses the official-equation
+numerical tolerance contract. Compatible with `MHC_DEFERRED_GATES`; prefill and
+C2–C6 keep the existing controller. Native component-qualified, combined serving
+quality/performance pending; not enabled by the entrypoint.

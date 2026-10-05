@@ -64,7 +64,7 @@
   "deferred": "500K terminal-instruction semantic issue recorded in mergedPR57; outside this task",
   "completed": false,
   "confirmed_cumulative_real16_savings_ms": 0.114383,
-  "last_updated": 1791172777.4543135,
+  "last_updated": 1791193935.7228549,
   "formal_gain_ms": 0,
   "confirmed_real16_gain_ms": 0.114383,
   "baseline_capture": "sole merged-main hardware capture complete and archived; unprofiled10.568225ms reused",
@@ -1742,7 +1742,7 @@
     "gain_credit_ms": 0,
     "next": "Hoist immutable 24 coefficients out of 40-tile loop; ISA change verified, next hardware run queued"
   },
-  "pending_micro_only_ms": 0.4447820078124997,
+  "pending_micro_only_ms": 0.4587151328124998,
   "accepted_baseline_20261005": {
     "case": "decode-physical-fusion-serving-03",
     "official_tpot_ms": 9.564282285406788,
@@ -1844,7 +1844,8 @@
     "boundaries": 40,
     "supersedes": "decode-mhc-exact-post-01",
     "default": false,
-    "formal_qualified": false
+    "formal_qualified": false,
+    "superseded_by": "mhc_parallel_20261005"
   },
   "mla_vector_20261005": {
     "cases": [
@@ -1868,5 +1869,35 @@
     "flag": "VLLM_HPU_DSV41_WOA_DENSE_HANDOFF",
     "default": false,
     "formal_qualified": false
+  },
+  "mhc_parallel_20261005": {
+    "status": "qualified_micro_only",
+    "round_savings_ms": [
+      0.0009889960937499997,
+      0.0009958632812499951,
+      0.001007996093749998
+    ],
+    "estimate_ms_token": 0.039834531249999805,
+    "occurrences_credited": 40,
+    "reference": "DeepSeek dba1be0 CPU equations, DeepGEMM normalized error <5e-5",
+    "max_official_equation_error": 7.678544576858086e-09,
+    "bit_exact": false,
+    "production_shape": true,
+    "native_replay": true,
+    "default": false,
+    "supersedes": "mhc_linear_20261005",
+    "formal_done": false
+  },
+  "roofline_20261005": {
+    "order": [
+      "communication",
+      "dense_gemv",
+      "mhc",
+      "small_tpc",
+      "moe"
+    ],
+    "document": "evidence/ROOFLINE.md",
+    "realization_assumption": 0.4,
+    "formal_trigger_ms": 1.0
   }
 }

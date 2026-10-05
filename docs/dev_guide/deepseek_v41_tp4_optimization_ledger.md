@@ -19,13 +19,14 @@ STATIC_COORDINATES 原已默认开启，共六项。显式诊断覆盖仍可关�
 recipe编号冲突停止追查，不再作逐项归因。输出/post-norm/WOa/发布链小融合归档，
 默认关闭；共享-main输出原型提交 `0dd878fb`。旧项目中的组件预测不能继续叠加到新基线。
 
-**当前本轮微基准待验收累计：0.444782008 ms/token（估计，尚未端到端）。**
-MoE 合并候选0.206373750ms、mHC0.025901406ms、Attention主体向量化0.176384352ms，
+**当前本轮微基准待验收累计：0.458715133 ms/token（估计，尚未端到端）。**
+MoE 合并候选0.206373750ms、mHC0.039834531ms、Attention主体向量化0.176384352ms，
 量化整行amax去重0.036122500ms。
-各项5组输入四卡逐位一致、原生重放3轮A/B方向一致，默认均关闭；详见文末。
+各项5组输入四卡通过适用正确性检查、原生重放3轮A/B方向一致，默认均关闭。
+mHC 新项按官方方程/DeepGEMM归一化误差容差验收，不声称逐位一致；其余保留原逐位检查。详见文末。
 新MoE替代旧的两片候选，mHC替代旧0.031500469ms，均不重复相加。
 正式验收触发线仍为累计≥1ms。按逻辑阶段计数，GEMM内部TPC/MME流水切片单列，
-保留默认切片策略。两指令FP4字典解码尚未通过逐lane验证，收益记0。
+保留默认切片策略。两指令FP4字典解码停止：ISA访存槽位预算高于算术发射预算，收益记0。
 
 
 ## 2026-10-03及以前的测量记录
@@ -1000,3 +1001,23 @@ previously inefficient hand-written kernel, not credit for its archived trial.
 
 Active cumulative forecast **0.444782008 ms/token**; formal baseline unchanged.
 No end-to-end request until cumulative forecast reaches at least 1 ms.
+
+
+### 2026-10-05 — roofline reprioritization and tolerance-qualified controller
+
+`decode-mhc-parallel-k-01`: checkpoint WO/control→native peer→post→FFN/router,
+five inputs×four ranks, three savings **0.000988996 / 0.000995863 / 0.001007996 ms/boundary**.
+TPC controller keeps24 row owners and uses eight independent K accumulators; it changes
+FP32 summation order. CPU oracle implements DeepSeek dba1be0 hc_mixes/Sinkhorn/post equations;
+DeepGEMM 057ca596 normalized squared-error limit5e-5, observed maximum **7.679e-9**.
+The upstream CUDA kernel itself was not executed. Router IDs remain exact on all fixtures.
+Physical/logical producer+consumer **9→8**, no GEMM pipeline slices removed.
+Switches `VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL=0` plus `VLLM_HPU_DSV41_MHC_DEFERRED_GATES=0`.
+Conservative credit only40 measured boundaries: **0.039834531 ms/token forecast**,
+replaces0.025901406 linear-post estimate (not additive); other40 not credited.
+Active total **0.458715133 ms/token**, official baseline **9.564282** unchanged.
+Planning realization~40%; ≥1ms remains the batch-formal trigger.
+
+Communication pruning and both MME-controller boundaries had no gain; they are in INDEX,
+not this gain total. Architectural bounds and unresolved communication/SRAM lifetime work:
+[ROOFLINE](../../evidence/ROOFLINE.md).

@@ -358,7 +358,9 @@ def hc_pre(
         and flat_bf16.shape[-1] == 20480
         and packed_fn.shape == (24, 20480)
     ):
-        control_op = (torch.ops.custom_op.custom_deepseek_v41_control_rrms_unpack_bf16_gaudi2
+        control_op = (torch.ops.custom_op.custom_deepseek_v41_control_rrms_parallel_bf16_gaudi2
+                      if not prefill and gate_tokens == 1 and gaudi_envs.VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL else
+                      torch.ops.custom_op.custom_deepseek_v41_control_rrms_unpack_bf16_gaudi2
                       if not prefill and gaudi_envs.VLLM_HPU_DSV41_MHC_LINEAR_LOAD else
                       torch.ops.custom_op.custom_deepseek_v41_control_gemv_rrms_bf16_gaudi2)
         control = control_op(flat_bf16.contiguous(), packed_fn, eps)
@@ -432,13 +434,15 @@ def hc_pre(
 
 
 def hc_control_and_collapse(residual, previous_pre, packed_fn, eps, *, collapsed_input=None):
-    """Keep the exact controller intact; postpone gates until the post consumer.
+    """Carry the prepared controller output to the post consumer.
 
     The packed 25-value output owns its storage across native recipe boundaries.
     Its final value is the production RRMS, so the post kernel need not repeat
     the residual reduction or change its FP32 sum order.
     """
-    control_op = (torch.ops.custom_op.custom_deepseek_v41_control_rrms_unpack_bf16_gaudi2
+    control_op = (torch.ops.custom_op.custom_deepseek_v41_control_rrms_parallel_bf16_gaudi2
+                  if residual.shape[0] == 1 and gaudi_envs.VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL else
+                  torch.ops.custom_op.custom_deepseek_v41_control_rrms_unpack_bf16_gaudi2
                   if gaudi_envs.VLLM_HPU_DSV41_MHC_LINEAR_LOAD else
                   torch.ops.custom_op.custom_deepseek_v41_control_gemv_rrms_bf16_gaudi2)
     control = control_op(residual.flatten(1).contiguous(), packed_fn, eps)

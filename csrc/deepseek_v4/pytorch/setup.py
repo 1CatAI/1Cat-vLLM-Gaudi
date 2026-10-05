@@ -113,6 +113,7 @@ setup(
                 "hpu_dsv41_fp4_norm_rope_publish_pt2.cpp",
                 "hpu_dsv41_kv_norm_reuse_mla_pt2.cpp",
                 "hpu_dsv41_control_mme_pt2.cpp",
+                "hpu_dsv41_control_mme_finish_pt2.cpp",
                 "hpu_dsv41_index_pt2.cpp",
                 "hpu_dsv41_index_keys_pt2.cpp",
                 "hpu_dsv41_reindex_compact_pt2.cpp",

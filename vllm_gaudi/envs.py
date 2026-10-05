@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_EXPERT_STREAMED_SAT: bool = False
     VLLM_HPU_DSV41_FFN_DUAL_QUANT: bool = False
     VLLM_HPU_DSV41_MHC_LINEAR_LOAD: bool = False
+    VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL: bool = False
     VLLM_HPU_DSV41_MLA_VECTOR_CODEC: bool = False
     VLLM_HPU_DSV41_EXPERT_W2_THREE_ROUTES: bool = False
     VLLM_HPU_DSV41_EXPERT_TOKEN_WIDE: bool = False
@@ -566,6 +567,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_MLA_VECTOR_CODEC", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_LINEAR_LOAD":
     lambda: os.environ.get("VLLM_HPU_DSV41_MHC_LINEAR_LOAD", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL":
+    lambda: os.environ.get("VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_FFN_DUAL_QUANT":
     lambda: os.environ.get("VLLM_HPU_DSV41_FFN_DUAL_QUANT", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_EXPERT_STREAMED_SAT":

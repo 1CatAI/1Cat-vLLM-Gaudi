@@ -11,6 +11,9 @@ extern unsigned char
 extern unsigned char _binary___deepseek_v41_control_rrms_unpack_bf16_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_control_rrms_unpack_bf16_gaudi2_o_end;
 
+extern unsigned char _binary___deepseek_v41_control_rrms_parallel_bf16_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_control_rrms_parallel_bf16_gaudi2_o_end;
+
 tpc_lib_api::GlueCodeReturn
 DeepseekV41ControlGemvRrmsGaudi2::GetGcDefinitions(
     tpc_lib_api::HabanaKernelParams* p,
@@ -75,6 +78,10 @@ DeepseekV41ControlGemvRrmsGaudi2::GetGcDefinitions(
     if (unpack_) {
         begin = &_binary___deepseek_v41_control_rrms_unpack_bf16_gaudi2_o_start;
         end = &_binary___deepseek_v41_control_rrms_unpack_bf16_gaudi2_o_end;
+    }
+    if (unpack_ == 2) {
+        begin = &_binary___deepseek_v41_control_rrms_parallel_bf16_gaudi2_o_start;
+        end = &_binary___deepseek_v41_control_rrms_parallel_bf16_gaudi2_o_end;
     }
     const unsigned capacity = out->kernel.elfSize;
     out->kernel.elfSize = end - begin;

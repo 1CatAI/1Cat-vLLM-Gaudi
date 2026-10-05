@@ -878,3 +878,17 @@ Existing wide woA epilogue preserved WoB consumer bits at C1/C2/C6 but no small-
 
 - `decode-woa-single-amax-01`: ISA-only precursor; backend unroll pragma ignored, no timing.
 - `decode-woa-single-amax-02`: cached BF16 row, one amax, one scale load per group, frontend unroll; five inputs/four ranks exact, three positive native rounds; default off.
+
+
+## 2026-10-05 roofline pass
+
+- `evidence/ROOFLINE.md`: historical named trace vs current official baseline kept separate; priorities A→E.
+- `decode-peer-prune-01`: single-box AG empty scale-out stream pruning;5×4 exact,3 rounds slower~.10µs/point; zero credit.
+- `decode-pcie-capability-01`: owned2/3, DMA-BUF export/import and16KB data correctness passed; not a timing result.
+- `decode-pcie-oneshot-01/02`: old benchmark's two-input contract disagreed with the current one-input TPC GUID; no timing.
+- `decode-pcie-oneshot-03`: repaired private standalone probe, TP2 10KB exact; host-submitted batch20.86–20.89µs, not a native TP4 gain.
+- `decode-pcie-native-04`: mixing standalone legacy SDK/HCL with serving Synapse invalidated the runtime and crashed; zero credit. Owned orphan retired; all cards released. No inference from this failure about PCIe performance.
+- `decode-mhc-official-tolerance-01`: official-equation tolerance passed, native chain slower13.89µs; no credit.
+- `decode-mhc-shared-rrms-01`: one RRMS statistic removes redundant scans but remains slower13.97µs; disproves scans as the sole cause. MME resource contention with WO remains the next attribution target, not a numerical rejection.
+- `decode-mhc-parallel-k-01`: TPC eight independent K accumulators plus deferred post; upstream tolerance passed5×4,3 positive rounds; replaces linear-post ledger item.
+- `decode-roofline-audit-01`: exact compiler SRAM overlap examples; actual expert ISA109 bundles/33loads/32stores/96decode ops. Two-op dictionary direction stopped; no gain assigned to static analysis.
