@@ -937,3 +937,5 @@ Existing wide woA epilogue preserved WoB consumer bits at C1/C2/C6 but no small-
 - `decode-mhc-producer-fusion-01`: default-off scheduling hypothesis, moves pure parallel control into the PRE-peer producer, unlike rejected post-peer merge. Requires ready inputs and nonaliasing state.50 CPU scheduling/import/DMA checks pass; native real16 A/B queued on available2/3/6/7 with separate recorded plans and shared drained Engram roots. No gain credit before hardware result.
 
 - Producer-fusion01 failed before timing: initial graph guard rejected resident constants/read-only inter-partition nodes.27 CPU checks now cover those nodes, real split composition and mutable aliases. Retry02 retains every peer point and rejects late peer-dependent inputs; no gain credit.
+
+- `decode-kv-hardware-codec-01`: offline Gaudi2 simulator, all256 E4M3FN encodings. Native conversion alone has15 mismatches; finite-top-exponent/negative-zero correction removes all.79→74 VLIW instructions, unchanged5 loads/7 stores. No hardware latency, no ledger credit, not a new default.
