@@ -304,8 +304,8 @@ def require_candidate_operators(graph, required):
     return counts
 
 
-def make_backend(*, static_int32=False, static_factories=False, static_clamps=False, split_mhc=True, required_operators=(),
-                 compiler_config=None):
+def make_backend(*, static_int32=False, static_factories=False, static_clamps=False, split_mhc=True,
+                 fuse_mhc_producer=False, required_operators=(), compiler_config=None):
     from habana_frameworks.torch.dynamo.compile_backend import passes
     from habana_frameworks.torch.dynamo.compile_backend.backends import hpu_backend
     from vllm_gaudi.extension.logger import logger
@@ -339,14 +339,22 @@ def make_backend(*, static_int32=False, static_factories=False, static_clamps=Fa
             (root / f"overlap-input-{id(ctx.graph_module)}.py").write_text(
                 ctx.graph_module.print_readable(print_output=False)
             )
-        audit = split_mhc_consumers(
-            ctx.graph_module,
-            (
-                torch.ops.vllm_gaudi.tp2_exchange_peer.default,
-                torch.ops.vllm_gaudi.tp_peer_allgather.default,
-                torch.ops.vllm_gaudi.tp_peer_allgather_scheduled.default,
-            ),
-        ) if split_mhc else []
+        exchanges = (
+            torch.ops.vllm_gaudi.tp2_exchange_peer.default,
+            torch.ops.vllm_gaudi.tp_peer_allgather.default,
+            torch.ops.vllm_gaudi.tp_peer_allgather_scheduled.default,
+        )
+        audit = split_mhc_consumers(ctx.graph_module, exchanges) if split_mhc else []
+        producer_audit = []
+        if fuse_mhc_producer:
+            from vllm_gaudi.compilation.deepseek_v41_mhc_producer_fusion import fuse_mhc_producers
+
+            if not split_mhc:
+                raise ValueError("Producer mHC fusion requires the independent consumer split")
+            producer_audit = fuse_mhc_producers(ctx.graph_module, exchanges)
+            logger().info("V4.1 mHC producer fusion: %s", producer_audit)
+            if producer_audit and not any(item["fused"] for item in producer_audit):
+                raise RuntimeError("Producer mHC fusion did not activate: " + str(producer_audit))
         from vllm_gaudi import envs
 
         tile_partitions = 0

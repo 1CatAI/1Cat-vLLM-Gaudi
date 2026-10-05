@@ -249,7 +249,8 @@ class StageVariant(torch.nn.Module):
         )
         engram_collectives = sum(getattr(layer, "layer", -1) in (1, 14) for layer in program.layers)
         self.adapter = DecoderTopology(name, (4,) * (layers // 4), 2, False, engram_collectives + int(native_input))
-        if getattr(program, "decode_merge_mhc_partitions", False):
+        if (getattr(program, "decode_merge_mhc_partitions", False)
+                or getattr(program, "decode_mhc_producer_fusion", False)):
             self.adapter = replace(self.adapter, require_independent_overlap=False)
         if program.length > 512:
             # Query heads still gather in C1. A cold gain replica removes
