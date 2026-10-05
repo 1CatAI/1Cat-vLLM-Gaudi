@@ -43,7 +43,7 @@
     {
       "id": 4,
       "name": "mHC fusion",
-      "status": "packed control\u2192gates exact; physical2\u21922, no small-chain gain"
+      "status": "packed control→gates exact; physical2→2, no small-chain gain"
     },
     {
       "id": 5,
@@ -128,8 +128,8 @@
           "fallbacks": 1
         }
       ],
-      "formal_result": "/home/ymzx/\u684c\u9762/1cat-vllm-gaudi-work/dsv41-tp4-decode-gap-1p5-20260928/evidence/20260928_tp4-decode-gap-1p5/decode-sampling-static-serving-03/formal/result.json",
-      "evidence": "/home/ymzx/\u684c\u9762/1cat-vllm-gaudi-work/dsv41-tp4-decode-gap-1p5-20260928/evidence/20260928_tp4-decode-gap-1p5/decode-sampling-static-serving-03",
+      "formal_result": "/home/ymzx/桌面/1cat-vllm-gaudi-work/dsv41-tp4-decode-gap-1p5-20260928/evidence/20260928_tp4-decode-gap-1p5/decode-sampling-static-serving-03/formal/result.json",
+      "evidence": "/home/ymzx/桌面/1cat-vllm-gaudi-work/dsv41-tp4-decode-gap-1p5-20260928/evidence/20260928_tp4-decode-gap-1p5/decode-sampling-static-serving-03",
       "diagnostics": false,
       "speed_qualified": false,
       "sampling_fallback_rate": 0.00041981528127623844
@@ -2001,5 +2001,55 @@
     "reason": "Disabling the mHC-independent split reduces32 boundaries but removes32 producer/consumer overlap windows. Counts establish this structural tradeoff; no new trace or exclusive cycle attribution.",
     "formal_gain_credit": false,
     "default": false
+  },
+  "dense_dma_prefetch_20261005": {
+    "status": "rejected_slower",
+    "round_savings_ms": [
+      -0.00974366015625,
+      -0.009750046875000001,
+      -0.00974646875
+    ],
+    "saving_ms_per_boundary": -0.00974646875,
+    "correctness_5x4_exact": true,
+    "dma_sram_mme_proof": [
+      {
+        "graph": ".graph_dumps/graph_0002_fused_0_syn_1002000_1002000_10-PostGraph-symbol.pbtxt",
+        "sha256": "355a35c125d3f9b1451170a61326c6b19eb5247a31809eed8303535ff87f7f5c",
+        "edges": [
+          {
+            "dma": "custom_deepseek_v41_dense_dma_prefetch_gaudi2/memcpy/15",
+            "consumer": "custom_deepseek_v41_dense_dma_prefetch_gaudi2/fp8_gemm_bf16/16_complex/fp8_gemm_bf16_0/gemm_2",
+            "operand": 1,
+            "bytes": 10485760
+          }
+        ],
+        "qualified": true,
+        "physical_nodes": 5
+      }
+    ],
+    "reason": "DMA prefetch is real but adds9.75us at the complete WO/control-peer-FFN boundary. Graph-local prefetch does not recover exposed latency for this production shape.",
+    "formal_gain_credit": false,
+    "default": false,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-dense-dma-prefetch-01"
+  },
+  "pcie_star_20261005": {
+    "status": "primitive_pass_not_advanced",
+    "modules": [
+      2,
+      3
+    ],
+    "savings_us": [
+      1.9913999999999987,
+      2.0716,
+      2.810200000000002
+    ],
+    "median_a_us": 18.1661,
+    "median_b_us": 16.0945,
+    "correctness": "Changing payload and all612 completion epochs; both ranks explicitly unmap their imports; healthy after exit.",
+    "scope": "Completed amortized native primitive, not device-only production compute/communication/consumer chain.",
+    "decision": "Do not extend to TP4: the two-rank star already takes about16us, above6us target; remote inbox reads are still expensive. No extrapolated model gain.",
+    "formal_gain_credit": false,
+    "default": false,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-pcie-star-protocol-02"
   }
 }

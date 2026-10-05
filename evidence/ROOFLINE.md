@@ -176,3 +176,7 @@ memcpy to `DmaMemcpy`. A graph-local nonpersistent SRAM section can test DMA
 prefetch alongside activation quantization without cross-recipe lifetime
 assumptions. Require an actual DRAM→DMA→SRAM→MME edge in the final compiler
 graph, then the full WO/control→peer→FFN/router chain; unmeasured.
+
+B DMA follow-up completed: final compiler graph proves10MiB DRAM→DmaMemcpy→SRAM→MME on all four ranks. Five states×four ranks exact, but the complete WO/control→peer→FFN/router chain regresses9.744/9.750/9.746µs. Archived candidate sources and removed unused operator. No gain.
+
+A acyclic star protocol passed612 changing native epochs on2/3 with explicit importer-first cleanup. Moving reduction from the hub to each rank reduces two-rank completed primitive18.1661→16.0945µs, still too slow for6µs target beforeTP4 or real producer/consumer. Stop hardware expansion; no gain credit. This avoids cyclic driver ownership but is not a production-qualified transport.
