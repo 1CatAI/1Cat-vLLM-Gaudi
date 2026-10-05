@@ -367,9 +367,15 @@ class StageVariant(torch.nn.Module):
         with collect_prepared_group_replays(
             owner=self, adapter=self.adapter, snapshot=self.snapshot, **fixed_roots
         ) as context:
-            for index, chunk in enumerate(self.compiled.chunks):
+            shared_coordinates = None
+            chunks = self.compiled.coordinate_chunks if self.compiled.shared_coordinates else self.compiled.chunks
+            for index, chunk in enumerate(chunks):
                 context["group_index"] = index
-                values = chunk(fixed_hidden, fixed_pre, fixed_positions, fixed_ids, self.engram)
+                if self.compiled.shared_coordinates:
+                    values, shared_coordinates = chunk(fixed_hidden, fixed_pre, fixed_positions, fixed_ids,
+                                                       self.engram, shared_coordinates)
+                else:
+                    values = chunk(fixed_hidden, fixed_pre, fixed_positions, fixed_ids, self.engram)
                 fixed_hidden, fixed_pre, aux = values[:3]
             outputs = values if self.tail_enabled else (fixed_hidden, fixed_pre, aux)
             record_native_decoder_outputs(*outputs)

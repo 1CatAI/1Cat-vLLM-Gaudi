@@ -4,7 +4,8 @@ from contextlib import contextmanager
 import ctypes
 
 
-ALLOWED_SETTINGS = frozenset({'ENABLE_BGEMM_FLATTEN_TO_GEMM_FOR_SLICING'})
+ALLOWED_SETTINGS = frozenset({'ENABLE_BGEMM_FLATTEN_TO_GEMM_FOR_SLICING',
+                              'SYN_SRAM_BGEMM_SLICER_MULTIPLE_TINY_GEMMS_PER_SLICE'})
 
 
 @contextmanager

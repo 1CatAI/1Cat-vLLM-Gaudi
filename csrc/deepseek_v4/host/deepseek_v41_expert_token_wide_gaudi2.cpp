@@ -6,6 +6,8 @@ extern unsigned char _binary___deepseek_v41_expert_token_wide_sat_fp8_gaudi2_o_s
 extern unsigned char _binary___deepseek_v41_expert_token_wide_sat_fp8_gaudi2_o_end;
 extern unsigned char _binary___deepseek_v41_expert_token_wide6_sat_fp8_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_expert_token_wide6_sat_fp8_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_expert_token_wide3_sat_fp8_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_expert_token_wide3_sat_fp8_gaudi2_o_end;
 namespace {
 void map(tpc_lib_api::TensorAccessPattern& p, unsigned dim, unsigned axis,
          int coefficient, int first, int last) {
@@ -31,7 +33,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41ExpertTokenWideGaudi2::GetGcDefinitions(
     const auto& q = in->inputTensors[1].geometry;
     const auto& s = in->inputTensors[2].geometry;
     const auto& lut = in->inputTensors[3].geometry;
-    if (ids.dims != 2 || ids.maxSizes[1] != 1 || !ids.maxSizes[0] || ids.maxSizes[0] % 6 ||
+    if (ids.dims != 2 || ids.maxSizes[1] != 1 || !ids.maxSizes[0] ||
         ids.maxSizes[0] > 192 || q.dims != 3 || !q.maxSizes[0] || q.maxSizes[0] % 8192 ||
         q.maxSizes[0] > 327680 || !q.maxSizes[1] || q.maxSizes[1] > 20 ||
         !q.maxSizes[2] || q.maxSizes[2] > 384 || s.dims != 3 ||
@@ -40,7 +42,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41ExpertTokenWideGaudi2::GetGcDefinitions(
         return GLUE_INCOMPATIBLE_INPUT_SIZE;
     const bool compact = s.maxSizes[0] == q.maxSizes[0] / 16 + 128;
     const unsigned route_pack = routes_;
-    if ((route_pack != 2 && route_pack != 6) || ids.maxSizes[0] % route_pack)
+    if ((route_pack != 2 && route_pack != 3 && route_pack != 6) || ids.maxSizes[0] % route_pack)
         return GLUE_INCOMPATIBLE_INPUT_SIZE;
     const auto blocks = q.maxSizes[1], k = q.maxSizes[0] / 64, batches = ids.maxSizes[0] / route_pack;
     auto& result = in->outputTensors[0].geometry;
@@ -71,8 +73,8 @@ tpc_lib_api::GlueCodeReturn DeepseekV41ExpertTokenWideGaudi2::GetGcDefinitions(
     map(out->outputTensorAccessPattern[0], 1, 2, 128, 0, 127);
     map(out->outputTensorAccessPattern[0], 2, 1, 1, 0, 0);
     out->kernel.paramsNr = 0;
-    const auto* start = routes_ == 6 ? &_binary___deepseek_v41_expert_token_wide6_sat_fp8_gaudi2_o_start : &_binary___deepseek_v41_expert_token_wide_sat_fp8_gaudi2_o_start;
-    const auto* end = routes_ == 6 ? &_binary___deepseek_v41_expert_token_wide6_sat_fp8_gaudi2_o_end : &_binary___deepseek_v41_expert_token_wide_sat_fp8_gaudi2_o_end;
+    const auto* start = routes_ == 3 ? &_binary___deepseek_v41_expert_token_wide3_sat_fp8_gaudi2_o_start : routes_ == 6 ? &_binary___deepseek_v41_expert_token_wide6_sat_fp8_gaudi2_o_start : &_binary___deepseek_v41_expert_token_wide_sat_fp8_gaudi2_o_start;
+    const auto* end = routes_ == 3 ? &_binary___deepseek_v41_expert_token_wide3_sat_fp8_gaudi2_o_end : routes_ == 6 ? &_binary___deepseek_v41_expert_token_wide6_sat_fp8_gaudi2_o_end : &_binary___deepseek_v41_expert_token_wide_sat_fp8_gaudi2_o_end;
     const auto capacity = out->kernel.elfSize;
     out->kernel.elfSize = end - start;
     if (capacity < out->kernel.elfSize) return GLUE_INSUFFICIENT_ELF_BUFFER;

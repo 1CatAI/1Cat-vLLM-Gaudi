@@ -667,12 +667,12 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
 
                 old_hidden, new_hidden = [], []
                 phase('reference_correctness_start')
-                old_tokens = chain(True, 4, measure=False, engine=reference, warm_steps=1,
+                old_tokens = chain(True, 5, measure=False, engine=reference, warm_steps=1,
                                    observer=hidden_observer(old_hidden))[0]
                 phase('reference_state_readback_start')
                 old_state = state_fingerprints()
                 phase('candidate_correctness_start')
-                new_tokens = chain(True, 4, measure=False, engine=candidate, warm_steps=1,
+                new_tokens = chain(True, 5, measure=False, engine=candidate, warm_steps=1,
                                    observer=hidden_observer(new_hidden))[0]
                 phase('candidate_state_readback_start')
                 new_state = state_fingerprints()

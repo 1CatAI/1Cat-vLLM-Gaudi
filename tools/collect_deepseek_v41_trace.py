@@ -92,6 +92,8 @@ def main():
     parser.add_argument("--raw-chunk-ms", type=float, default=200)
     parser.add_argument("--decode-roi-padding-ms", type=float,
                         help="Optional raw-clock decode ROI for offline parsing; complete cycles remain mandatory")
+    parser.add_argument("--decode-position-window", type=int, nargs=2, metavar=("FIRST", "LAST"),
+                        help="Same inclusive C1 position subset on all ranks; preserve the complete raw capture")
     parser.add_argument("--capture-dir",
                         type=Path,
                         help="One archived acquisition with its own worker traces and start/stop counters")
@@ -131,6 +133,7 @@ def main():
         "reuse": "20260909_dsv4-native-joint-decode/extract_native_trace.py and decode_native_recipe_symbols.py",
         "status": "collecting; physical calls and complete token windows not yet reconstructed"
     }
+    record["decode_position_window"] = args.decode_position_window
     active_graphs = {}
     raw_manifest = trace_dir / "manifest.json"
     raw_manifest = json.loads(raw_manifest.read_text()) if raw_manifest.exists() else {}
@@ -157,7 +160,8 @@ def main():
                 futures = [
                     pool.submit(normalize, trace_dir / row["bundle"], trace_dir / row["cpu_trace"], row["metadata"],
                                 output / f"rank{rank}", run / "profiler-config.json", args.raw_chunk_ms,
-                                decode_roi_padding_ms=args.decode_roi_padding_ms)
+                                decode_roi_padding_ms=args.decode_roi_padding_ms,
+                                decode_position_window=args.decode_position_window)
                     for rank, row in sorted(raw_ranks.items())
                 ]
                 for future in futures:

@@ -41,7 +41,7 @@ def test_all_slots_keeps_shared_rounding_and_non_c1_dispatch(monkeypatch, tp_siz
                           tensor_parallel_size=tp_size, batch_expert_reuse=False, batch_route_pack=False,
                           concurrent_moe_rows=0, n256_fused=True, n256_fused_reduce=True, normal_scales=True,
                           all_route_slots=True, batch_w13_horizontal=False, N256_PREFILL_TILE=128,
-                          feature_silu=False)
+                          feature_silu=False, expert_w2_three_routes=False, token_wide_experts=False)
     calls = []
     routed = torch.tensor([[1., -1., 0., -0., 256., -256.]], dtype=torch.bfloat16).expand(tokens, -1).clone()
     shared = torch.tensor([[0.00390625, 0.00390625, -0., -0., 0.5, -0.5]], dtype=torch.bfloat16)

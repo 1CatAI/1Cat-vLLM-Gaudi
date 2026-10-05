@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TP4 resident native-chain launcher; no device locks, diagnostics off by default."""
+"""TP4 resident native-chain launcher; owned device leases, diagnostics off by default."""
 import argparse
 import hashlib
 import json
@@ -7,9 +7,10 @@ import os
 from pathlib import Path
 import subprocess
 import shutil
+import signal
 import time
 
-from deepseek_v41_owned_devices import wait_for_free_modules
+from deepseek_v41_owned_devices import lease_free_modules, wait_for_host_memory, retire_process_group, wait_for_owned_process
 
 
 def main():
@@ -19,8 +20,13 @@ def main():
     parser.add_argument('--evidence', type=Path, required=True)
     parser.add_argument('--dense-sidecar', type=Path, required=True)
     parser.add_argument('--dense-config', type=Path, required=True)
+    parser.add_argument('--physical-audit', action='store_true', help='Save final compiler symbol graphs per rank; no runtime profiler or DUMP settings')
+    parser.add_argument('--resume', action='store_true', help='Reuse an unchanged execution snapshot after waiting was cancelled; no worktree is created')
+    parser.add_argument('--min-host-free-gib',type=float,default=256,help='Observed host headroom before loading; no reservation')
+    parser.add_argument('--recipe-cache-dir', type=Path)
     parser.add_argument('--master-port', type=int, default=29689)
     parser.add_argument('--modules', help='Optional four comma-separated module IDs; otherwise use any free four')
+    parser.add_argument('--lock-dir', type=Path, default=Path(__file__).resolve().parents[2] / 'locks')
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     installation, evidence = args.installation.resolve(), args.evidence.resolve()
@@ -37,13 +43,17 @@ def main():
     # ordinary source copy, without a Git checkout or runtime code injection.
     frozen = evidence / 'execution-source'
     if frozen.exists():
-        raise RuntimeError('Execution snapshot already exists; preserve it and use a fresh measurement case')
-    frozen.mkdir()
-    for package in ('tools', 'vllm_gaudi'):
-        shutil.copytree(root / package, frozen / package,
-                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+        if not args.resume:
+            raise RuntimeError('Execution snapshot already exists; preserve it and use --resume only for unchanged source')
+    else:
+        frozen.mkdir()
+        for package in ('tools', 'vllm_gaudi'):
+            shutil.copytree(root / package, frozen / package,
+                            ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
     source_hashes = {str(path.relative_to(frozen)): hashlib.sha256(path.read_bytes()).hexdigest()
                      for package in ('tools', 'vllm_gaudi') for path in (frozen / package).rglob('*.py')}
+    if args.resume and json.loads((evidence/'execution-sources.json').read_text()) != source_hashes:
+        raise RuntimeError('Execution snapshot changed; resumption is unsafe')
     (evidence / 'execution-sources.json').write_text(json.dumps(source_hashes, indent=2)+'\n')
     for request_path in (evidence / 'control').glob('*.request.json'):
         request = json.loads(request_path.read_text())
@@ -52,7 +62,7 @@ def main():
                 continue
             factory = Path(request[key]).resolve()
             try:
-                relative = factory.relative_to(root)
+                relative = factory.relative_to(frozen) if args.resume and factory.is_relative_to(frozen) else factory.relative_to(root)
             except ValueError as error:
                 raise RuntimeError('Queued factory must belong to the maintained workspace') from error
             request[key] = str(frozen / relative)
@@ -60,6 +70,7 @@ def main():
         request_path.write_text(json.dumps(request, indent=2)+'\n')
     environment = dict(os.environ)
     environment.update(runtime['environment'])
+    environment = {k: v for k, v in environment.items() if 'DUMP' not in k}
     for key in ('PYTHONPATH', 'DUMP_POST_GRAPHS', 'GRAPH_VISUALIZATION', 'GRAPH_VISUALIZATION_DIR',
                 'DSV41_RESIDENT_POST_GRAPH', 'HABANA_PROF_CONFIG', 'HABANA_PROFILE', 'HABANA_PROFILE_WRITE_HLTV',
                 'VLLM_TORCH_PROFILER_DIR', 'VLLM_HPU_DSV41_RAW_TRACE', 'VLLM_HPU_DSV41_PHASE_TRACE',
@@ -70,14 +81,17 @@ def main():
     # Bridge starts. Both prevent previously diagnosed cold-start failures.
     scratch = evidence.parent / 'micro-tmp'
     scratch.mkdir(exist_ok=True)
-    (evidence / 'recipes').mkdir(exist_ok=True)
+    recipe_dir = args.recipe_cache_dir.resolve() if args.recipe_cache_dir else evidence / 'recipes'
+    recipe_dir.mkdir(parents=True, exist_ok=True)
     environment.update(TMPDIR=str(scratch),
                        VLLM_HPU_DSV4_WORKER_CPUS='10,15,38,43',
                        VLLM_HPU_DSV4_WORKER_HELPER_CPUS='11-14;16-19;39-42;44-47',
                        GLOO_SOCKET_IFNAME='lo', OMP_NUM_THREADS='1', DSV41_RUN_EVIDENCE=str(evidence),
                        DSV41_RUNTIME_PROFILE=str(args.runtime_profile.resolve()),
                        HABANA_LOGS=str(evidence/'habana_logs'),
-                       PT_HPU_RECIPE_CACHE_CONFIG=f'{evidence}/recipes,false,8192')
+                       PT_HPU_RECIPE_CACHE_CONFIG=f'{recipe_dir},false,8192')
+    if args.physical_audit:
+        environment['GRAPH_VISUALIZATION'] = '1'
     bindings = evidence / 'bindings.json'
     if not bindings.exists():
         bindings.write_text('{}\n')
@@ -88,20 +102,33 @@ def main():
                '--resident-ab', '--resident-control-dir', str(evidence/'control'), '--context-tokens', '16384',
                '--max-model-len', '524288', '--ab-dense-sidecar', str(args.dense_sidecar.resolve()),
                '--ab-dense-config', str(args.dense_config.resolve())]
+    # Reject incomplete native bundles before any worker opens a device.
+    preflight = [str(installation/'venv/bin/python'), '-c',
+                 "import runpy; runpy.run_path('vllm_gaudi/entrypoints/deepseek_v41.py')['prepare_native_libraries']()"]
+    subprocess.run(preflight, cwd=frozen, env=environment, check=True)
     os.sched_setaffinity(0, set(range(10, 20)) | set(range(38, 48)))
     modules = None if args.modules is None else tuple(int(value) for value in args.modules.split(','))
-    selected, load = wait_for_free_modules(evidence/'device-availability.json', modules=modules)
-    environment['HABANA_VISIBLE_MODULES'] = ','.join(map(str, selected))
-    with (evidence/'component.log').open('w') as log:
-        process = subprocess.Popen(command, cwd=frozen, env=environment, stdout=log, stderr=subprocess.STDOUT,
-                                   start_new_session=True)
-        (evidence/'process.json').write_text(json.dumps(dict(
-            pid=process.pid, pgid=process.pid, command=command, started=time.time(), cards=load,
-            modules=selected, resource_policy='use observed free modules without locks; wait if unavailable',
-            execution_source=str(frozen), maintained_workspace=str(root),
-            cpu_pressure=Path('/proc/pressure/cpu').read_text(), environment=environment,
-            protocol='same-process native ABABAB; three consistent device rounds; no IQR veto'), indent=2)+'\n')
-        raise SystemExit(process.wait())
+    wait_for_host_memory(evidence/'host-memory-availability.json',minimum_gib=args.min_host_free_gib)
+    environment = {k: v for k, v in environment.items() if 'DUMP' not in k}
+    with lease_free_modules(evidence/'device-availability.json', lock_dir=args.lock_dir, modules=modules) as (selected, load):
+        environment['HABANA_VISIBLE_MODULES'] = ','.join(map(str, selected))
+        with (evidence/'component.log').open('w') as log:
+            process = subprocess.Popen(command, cwd=frozen, env=environment, stdout=log, stderr=subprocess.STDOUT,
+                                       start_new_session=True)
+            (evidence/'process.json').write_text(json.dumps(dict(
+                pid=process.pid, pgid=process.pid, command=command, started=time.time(), cards=load,
+                modules=selected, resource_policy='lease idle modules through all existing lock aliases',
+                execution_source=str(frozen), maintained_workspace=str(root),
+                cpu_pressure=Path('/proc/pressure/cpu').read_text(), environment=environment,
+                protocol='same-process native ABABAB; three consistent device rounds; no IQR veto'), indent=2)+'\n')
+            previous = signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+            owned = {}
+            try:
+                result = wait_for_owned_process(process, owned, record=evidence/'owned-processes.json')
+            finally:
+                signal.signal(signal.SIGTERM, previous)
+                retire_process_group(process, owned=owned)
+            raise SystemExit(result)
 
 
 if __name__ == '__main__':

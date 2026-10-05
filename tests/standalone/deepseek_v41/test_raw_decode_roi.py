@@ -60,3 +60,17 @@ def test_missing_decode_scopes_is_rejected():
             'clockDomain': 'CLOCK_MONOTONIC_RAW',
             'traceEvents': []
         }, {'scope_clock_domain': 'CLOCK_MONOTONIC_RAW'}, 0, 100, 50)
+
+
+def test_explicit_position_subset_preserves_clock_and_rejects_missing_commits():
+    metadata = {'scope_clock_domain': 'CLOCK_MONOTONIC_RAW'}
+    cpu = dict(clockDomain='CLOCK_MONOTONIC_RAW', baseTimeNanoseconds=1_000_000_000,
+               traceEvents=[dict(ph='X', name=f'v41::worker_commit::PP0::decode::P{p}::C1::emit1',
+                                 ts=(p-100)*10_000, dur=1000) for p in range(100, 110)])
+    assert raw.decode_parser_window(cpu, metadata, 1_000_000_000, 1_200_000_000, 5,
+                                    (103, 105)) == (1_025_000_000, 1_056_000_000)
+    assert len(cpu['traceEvents']) == 10  # Full CPU/raw capture remains intact.
+    with pytest.raises(ValueError, match='consecutive'):
+        raw.decode_parser_window(cpu, metadata, 1_000_000_000, 1_200_000_000, 5, (103, 110))
+    with pytest.raises(ValueError, match='increasing'):
+        raw.decode_parser_window(cpu, metadata, 1_000_000_000, 1_200_000_000, 5, (105, 103))

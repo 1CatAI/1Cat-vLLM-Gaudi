@@ -241,6 +241,16 @@ _TP4_FASTPATH_DEFAULTS.update(
 # A TP-only stage inherits the qualified C1 compute and replay defaults.
 # The three exclusions require a pipeline peer, absent when PP has one rank.
 _TP4_FASTPATH_DEFAULTS = {**_C1_FASTPATH_DEFAULTS, **_NUMERIC_FASTPATH_DEFAULTS, **_TP4_FASTPATH_DEFAULTS}
+# Qualified together in the ordinary TP-only C1 service. STATIC_COORDINATES
+# is already part of the single-stage defaults below. Explicit diagnostics
+# can still disable any member; non-C1 execution keeps its existing guards.
+_TP4_FASTPATH_DEFAULTS.update({
+    "VLLM_HPU_DSV41_COMPRESSOR_FUSED_PUBLISH": "1",
+    "VLLM_HPU_DSV41_EXPERT_W2_THREE_ROUTES": "1",
+    "VLLM_HPU_DSV41_QKV_FUSED_PROLOGUE": "1",
+    "VLLM_HPU_DSV41_CANDIDATE_COORDINATES": "1",
+    "VLLM_HPU_DSV41_PEER_POST_COLLAPSE": "1",
+})
 # Qualified ordinary replay without a pipeline boundary. PP stages retain
 # their existing token ownership; diagnostic overrides remain authoritative.
 _SINGLE_STAGE_NATIVE_DEFAULTS = {

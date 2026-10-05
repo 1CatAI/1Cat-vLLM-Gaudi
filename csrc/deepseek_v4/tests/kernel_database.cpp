@@ -50,6 +50,46 @@ int main() {
     assert(custom_count >= 52);
     assert(selected_kv_seen);
     assert(device_engram_seen);
+    // Horizontal three-route W2 must retain complete K for every TP width.
+    for (unsigned k : {640u, 1280u, 2560u}) {
+        HabanaKernelParams p{}; HabanaKernelInstantiation out{};
+        Tensor inputs[4]{}, outputs[1]{};
+        TensorAccessPattern ia[4]{}, oa[1]{};
+        p.inputTensors=inputs; p.inputTensorNr=4; p.outputTensors=outputs; p.outputTensorNr=1;
+        out.inputTensorAccessPattern=ia; out.outputTensorAccessPattern=oa;
+        std::strcpy(p.guid.name,"custom_deepseek_v41_expert_token_wide3_sat_fp8_gaudi2");
+        auto set=[](Tensor& t,TensorDataType type,std::initializer_list<uint64_t> dims) {
+            t.geometry.dataType=type; t.geometry.dims=dims.size(); unsigned i=0;
+            for(auto size:dims)t.geometry.maxSizes[i++]=size;
+        };
+        set(inputs[0],DATA_I32,{3,1}); set(inputs[1],DATA_I16,{k*64,20,384});
+        set(inputs[2],DATA_I16,{k*4+128,20,384}); set(inputs[3],DATA_BF16,{128});
+        set(outputs[0],DATA_F8_143,{15360,k,1});
+        assert(InstantiateTpcKernel(&p,&out)==GLUE_INSUFFICIENT_ELF_BUFFER);
+        assert(out.indexSpaceGeometry[0]==60 && out.indexSpaceGeometry[2]==k/128);
+        inputs[0].geometry.maxSizes[0]=4;
+        assert(InstantiateTpcKernel(&p,&out)==GLUE_INCOMPATIBLE_INPUT_SIZE);
+    }
+    {
+        HabanaKernelParams p{}; HabanaKernelInstantiation out{};
+        Tensor inputs[6]{}, outputs[1]{};
+        TensorAccessPattern ia[6]{}, oa[1]{};
+        p.inputTensors=inputs;p.inputTensorNr=6;p.outputTensors=outputs;p.outputTensorNr=1;
+        out.inputTensorAccessPattern=ia;out.outputTensorAccessPattern=oa;
+        std::strcpy(p.guid.name,"custom_deepseek_v41_expert_diagonal_scale_shared_gaudi2");
+        auto set=[](Tensor& t,TensorDataType type,std::initializer_list<uint64_t> dims) {
+            t.geometry.dataType=type;t.geometry.dims=dims.size();unsigned i=0;
+            for(auto size:dims)t.geometry.maxSizes[i++]=size;
+        };
+        for(unsigned i=0;i<2;++i)set(inputs[i],DATA_F32,{15360,3});
+        set(inputs[2],DATA_I32,{6,1});set(inputs[3],DATA_F32,{1,6});
+        set(inputs[4],DATA_BF16,{256,20,384});set(inputs[5],DATA_BF16,{5120,1});
+        set(outputs[0],DATA_BF16,{5120,1,1});
+        assert(InstantiateTpcKernel(&p,&out)==GLUE_INSUFFICIENT_ELF_BUFFER);
+        assert(out.indexSpaceGeometry[0]==40 && oa[0].mapping[0].a==128);
+        inputs[1].geometry.maxSizes[1]=2;
+        assert(InstantiateTpcKernel(&p,&out)==GLUE_INCOMPATIBLE_INPUT_SIZE);
+    }
     for (unsigned ranks : {1u, 2u, 4u, 8u}) for (unsigned tokens : {1u, 2u, 6u}) {
         HabanaKernelParams p{}; HabanaKernelInstantiation out{};
         Tensor inputs[5]{}, outputs[2]{};

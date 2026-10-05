@@ -22,6 +22,9 @@ constexpr auto kMoeK128Schema = "custom_op::custom_deepseek_v41_mxfp4_prepared_m
 constexpr auto kMoeFp8Schema = "custom_op::custom_deepseek_v41_mxfp4_prepared_moe_fp8_gaudi2";
 constexpr auto kDecodeFp8 = "custom_deepseek_v41_mxfp4_prepared_dequant_fp8_gaudi2";
 constexpr auto kDynamicQuant = "custom_deepseek_v41_dynamic_quant_bf16_gaudi2";
+constexpr auto kN256TwoGroupSharedSchema="custom_op::custom_deepseek_v41_expert_n256_moe_two_group_w2_sat_shared_fp8_gaudi2";
+constexpr auto kN256SiluDecodeSharedSchema="custom_op::custom_deepseek_v41_expert_n256_moe_silu_decode_shared_fp8_gaudi2";
+constexpr auto kN256PairedSharedSchema="custom_op::custom_deepseek_v41_expert_n256_moe_paired_decode_shared_fp8_gaudi2";
 constexpr auto kN256SatFp8 = "custom_deepseek_v41_expert_n256_sat_fp8_gaudi2";
 constexpr auto kN256TokenWideSharedSchema = "custom_op::custom_deepseek_v41_expert_n256_moe_token_wide_sat_shared_fp8_gaudi2";
 constexpr auto kN256TokenWideSchema = "custom_op::custom_deepseek_v41_expert_n256_moe_token_wide_sat_fp8_gaudi2";
@@ -252,6 +255,7 @@ class PreparedV41 final : public habana::OpBackend {
     bool fused_reduce_;
     bool direct_finalize_;
     bool prefetch_w2_;
+    bool paired_decode_;
     bool prequant_;
     bool fused_slots_;
     bool fuse_shared_;
@@ -260,6 +264,8 @@ class PreparedV41 final : public habana::OpBackend {
     bool transpose_mme_;
     bool feature_silu_;
     bool token_wide_;
+    bool silu_decode_;
+    bool two_group_w2_;
 
     const char* decode_guid(bool normal) const {
         if (n256_) {
@@ -407,8 +413,56 @@ class PreparedV41 final : public habana::OpBackend {
         return result;
     }
 
+    Tensor paired_route_slice(synapse_helpers::graph& graph,synTensor input,
+                              const std::vector<int64_t>& shape,int axis,int begin,int end,at::ScalarType dtype) {
+        synSliceParams params{};
+        for(unsigned i=0;i<sizeof(params.axes)/sizeof(params.axes[0]);++i){params.axes[i]=i;params.steps[i]=1;}
+        for(unsigned i=0;i<shape.size();++i)params.ends[i]=shape[shape.size()-1-i];
+        params.starts[axis]=begin;params.ends[axis]=end;
+        auto resultShape=shape;resultShape[shape.size()-1-axis]=end-begin;
+        auto result=BuildNode(this,graph,{"slice",{input},{{resultShape,dtype}},&params,sizeof(params)});
+        return std::move(result[0]);
+    }
+    Tensor paired_down(synapse_helpers::graph& graph,synTensor ids,int hidden,int intermediate) {
+        constexpr int slots=6;
+        auto q=ReshapeHelper(graph,syn_in(10),{1,hidden},at::ScalarType::Float8_e4m3fn);
+        auto scale=ReshapeHelper(graph,syn_in(11),{1,1},at::kFloat);
+        auto x=expand_routes(graph,q.get(),1,slots,hidden,at::ScalarType::Float8_e4m3fn);
+        auto sr=expand_routes(graph,scale.get(),1,slots,1,at::kFloat);
+        auto sx=ReshapeHelper(graph,sr.get(),{slots,1},at::kFloat);
+        auto routing=ReshapeHelper(graph,syn_in(2),{1,slots},at::kFloat);
+        std::vector<Tensor> products,scales;
+        for(int pair=0;pair<3;++pair) {
+            auto id=paired_route_slice(graph,ids,{1,slots},0,pair*2,pair*2+2,at::kInt);
+            auto xp=paired_route_slice(graph,x.get(),{slots,1,hidden},2,pair*2,pair*2+2,at::ScalarType::Float8_e4m3fn);
+            auto sp=paired_route_slice(graph,sx.get(),{slots,1},1,pair*2,pair*2+2,at::kFloat);
+            auto rp=paired_route_slice(graph,routing.get(),{1,slots},0,pair*2,pair*2+2,at::kFloat);
+            auto weights=BuildNode(this,graph,{"custom_deepseek_v41_expert_paired_decode_fp8_gaudi2",
+                {id.get(),syn_in(3),syn_in(5),syn_in(4),syn_in(6),syn_in(7)},
+                {{{2,hidden,intermediate*2},at::ScalarType::Float8_e4m3fn},
+                 {{2,intermediate,hidden},at::ScalarType::Float8_e4m3fn}}});
+            auto p13=expert_product(graph,xp.get(),weights[0].get(),{2,1,intermediate*2});
+            auto middle=BuildNode(this,graph,{kN256SiluQuant,
+                {p13[0].get(),id.get(),sp.get(),syn_in(8),rp.get()},
+                {{{2,1,intermediate},at::ScalarType::Float8_e4m3fn},{{2,1,1},at::kFloat}}});
+            auto p2=expert_product(graph,middle[0].get(),weights[1].get(),{2,1,hidden});
+            products.emplace_back(std::move(p2[0]));
+            scales.emplace_back(ReshapeHelper(graph,middle[1].get(),{2,1},at::kFloat));
+        }
+        synConcatenateParams cp{};cp.axis=2;
+        auto p=BuildNode(this,graph,{"concat",{products[0].get(),products[1].get(),products[2].get()},
+            {{{slots,1,hidden},at::kFloat}},&cp,sizeof(cp)});
+        cp.axis=1;
+        auto a=BuildNode(this,graph,{"concat",{scales[0].get(),scales[1].get(),scales[2].get()},
+            {{{slots,1},at::kFloat}},&cp,sizeof(cp)});
+        auto result=BuildNode(this,graph,{"custom_deepseek_v41_expert_scale_shared_gaudi2",
+            {p[0].get(),ids,a[0].get(),syn_in(9),syn_in(12)},{{{1,1,hidden},at::kBFloat16}}});
+        return std::move(result[0]);
+    }
+
     Tensor fused_down(synapse_helpers::graph& graph, synTensor ids, int tokens, int experts,
                       int hidden, int intermediate) {
+        if(paired_decode_){TORCH_CHECK(tokens==1 && experts==6,"Paired preparation requires one six-route token");return paired_down(graph,ids,hidden,intermediate);}
         const int slots = tokens * experts;
         const int routePack = token_wide_ && tokens == 1 ? experts : 2;
         const char* weightDecode = token_wide_ ? (tokens == 1 ? "custom_deepseek_v41_expert_n256_slots6_sat_fp8_gaudi2" : kN256SatFp8) : fused_slots_ ? kN256SlotsFp8 : kN256Fp8;
@@ -438,7 +492,7 @@ class PreparedV41 final : public habana::OpBackend {
         // prepared weights.  Emit it before W13 MME so Synapse can schedule
         // this TPC work while the independent W13 matrix multiply is active.
         std::vector<Tensor> w2;
-        if (prefetch_w2_) {
+        if (prefetch_w2_ && !silu_decode_) {
             w2 = BuildNode(this, graph, {weightDecode, {ids, syn_in(4), syn_in(6), syn_in(7)},
                 {{{slots, intermediate, hidden}, at::ScalarType::Float8_e4m3fn}}});
         }
@@ -447,7 +501,48 @@ class PreparedV41 final : public habana::OpBackend {
             : std::vector<int64_t>{slots, 1, intermediate * 2};
         auto p13 = expert_product(graph, x.get(), w13.at(0).get(), productShape);
         auto routeProduct = ReshapeHelper(graph, p13.at(0).get(), {slots, 1, intermediate * 2}, at::kFloat);
+        if (two_group_w2_) {
+            TORCH_CHECK(tokens==1 && experts==6,"Two-group W2 requires qualified C1 top6");
+            auto middle=BuildNode(this,graph,{"custom_deepseek_v41_expert_pair_silu_quant_gaudi2",
+                {routeProduct.get(),ids,sx.get(),syn_in(8),router.get()},
+                {{{slots,1,intermediate},at::ScalarType::Float8_e4m3fn},{{slots,1,1},at::kFloat}}});
+            auto middleScale=ReshapeHelper(graph,middle[1].get(),{slots,1},at::kFloat);
+            std::vector<Tensor> products;
+            for (int group=0;group<2;++group) {
+                auto id=paired_route_slice(graph,ids,{1,slots},0,group*3,group*3+3,at::kInt);
+                auto rows=paired_route_slice(graph,middle[0].get(),{slots,1,intermediate},2,
+                                             group*3,group*3+3,at::ScalarType::Float8_e4m3fn);
+                auto activation=ReshapeHelper(graph,rows.get(),{3,intermediate},at::ScalarType::Float8_e4m3fn);
+                auto decoded=BuildNode(this,graph,{"custom_deepseek_v41_expert_token_wide3_sat_fp8_gaudi2",
+                    {id.get(),syn_in(4),syn_in(6),syn_in(7)},
+                    {{{1,intermediate,hidden*3},at::ScalarType::Float8_e4m3fn}}});
+                auto weights=ReshapeHelper(graph,decoded[0].get(),{intermediate,hidden*3},at::ScalarType::Float8_e4m3fn);
+                // One ordinary MME consumes all three routed activation rows.
+                // The finalizer reads the matching diagonal blocks directly;
+                // no batch GEMM expansion, gather or concat is needed.
+                synGEMMParams params{false,false};
+                auto down=BuildNode(this,graph,{"gemm",{activation.get(),weights.get()},
+                    {{{3,hidden*3},at::kFloat}},&params,sizeof(params)});
+                products.emplace_back(std::move(down[0]));
+            }
+            auto shared=ReshapeHelper(graph,syn_in(12),{1,hidden},at::kBFloat16);
+            auto result=BuildNode(this,graph,{"custom_deepseek_v41_expert_diagonal_scale_shared_gaudi2",
+                {products[0].get(),products[1].get(),ids,middleScale.get(),syn_in(9),shared.get()},
+                {{{1,1,hidden},at::kBFloat16}}});
+            return std::move(result[0]);
+        }
         auto middle = [&]() {
+            if (silu_decode_) {
+                TORCH_CHECK(tokens==1 && experts==6,"Silu/decode fusion requires qualified C1 top6");
+                auto fused=BuildNode(this,graph,{"custom_deepseek_v41_expert_silu_decode_fp8_gaudi2",
+                    {ids,syn_in(4),syn_in(6),syn_in(7),routeProduct.get(),sx.get(),syn_in(8),router.get()},
+                    {{{slots,intermediate,hidden},at::ScalarType::Float8_e4m3fn},
+                     {{slots,1,intermediate},at::ScalarType::Float8_e4m3fn},{{slots,1,1},at::kFloat}}});
+                w2.emplace_back(std::move(fused[0]));
+                std::vector<Tensor> output;
+                output.emplace_back(std::move(fused[1]));output.emplace_back(std::move(fused[2]));
+                return output;
+            }
             if (feature_silu_) {
                 TORCH_CHECK(intermediate == 640, "Feature Silu requires the TP4 intermediate width");
                 auto tiles = BuildNode(this, graph, {"custom_deepseek_v41_silu_activate_tile_gaudi2",
@@ -461,14 +556,14 @@ class PreparedV41 final : public habana::OpBackend {
                 {routeProduct.get(), ids, sx.get(), syn_in(8), router.get()},
                 {{{slots, 1, intermediate}, at::ScalarType::Float8_e4m3fn}, {{slots, 1, 1}, at::kFloat}}});
         }();
-        if (!prefetch_w2_) {
+        if (!prefetch_w2_ && !silu_decode_) {
             w2 = BuildNode(this, graph, {weightDecode, {ids, syn_in(4), syn_in(6), syn_in(7)},
                 {{{slots, intermediate, hidden}, at::ScalarType::Float8_e4m3fn}}});
         }
         auto p2 = expert_product(graph, middle.at(0).get(), w2.at(0).get(), {slots, 1, hidden});
         auto sx2 = ReshapeHelper(graph, middle.at(1).get(), {slots, 1}, at::kFloat);
         if (direct_finalize_) {
-            if (token_wide_ && fuse_shared_) {
+            if ((token_wide_ || silu_decode_) && fuse_shared_) {
                 auto combined = BuildNode(this, graph, {"custom_deepseek_v41_expert_scale_shared_gaudi2",
                     {p2.at(0).get(), ids, sx2.get(), syn_in(9), syn_in(12)},
                     {{{tokens, 1, hidden}, at::kBFloat16}}});
@@ -539,12 +634,12 @@ class PreparedV41 final : public habana::OpBackend {
                 bool direct_finalize = false, bool prefetch_w2 = false,
                 bool prequant = false, bool fused_slots = false,
                 bool fuse_shared = false, bool resident = false, bool horizontal = false,
-                bool transpose_mme = false, bool feature_silu = false, bool token_wide = false)
+                bool transpose_mme = false, bool feature_silu = false, bool token_wide = false, bool paired_decode = false, bool silu_decode = false, bool two_group_w2 = false)
         : OpBackend(device, NO_TPC + std::string("dsv41_prepared_mxfp4"), dtype, {0}, {}, {}, false), moe_(moe),
           fp8_(fp8), fused_(fused), k128_(k128), n256_(n256), fused_reduce_(fused_reduce),
-          direct_finalize_(direct_finalize), prefetch_w2_(prefetch_w2), prequant_(prequant),
+          direct_finalize_(direct_finalize), prefetch_w2_(prefetch_w2), paired_decode_(paired_decode), prequant_(prequant),
           fused_slots_(fused_slots), fuse_shared_(fuse_shared), resident_(resident), horizontal_(horizontal),
-          transpose_mme_(transpose_mme), feature_silu_(feature_silu), token_wide_(token_wide) {
+          transpose_mme_(transpose_mme), feature_silu_(feature_silu), token_wide_(token_wide), silu_decode_(silu_decode), two_group_w2_(two_group_w2) {
         SetOutputMetaFn([moe, fp8, n256, prequant, fuse_shared, resident, token_wide](const at::Stack& stack) {
             if (resident)
                 return habana::OutputMetaDataVector{{at::kBFloat16, resident_shape(stack)}};
@@ -637,6 +732,37 @@ class PreparedV41 final : public habana::OpBackend {
 };
 
 const bool registered = [] {
+    habana::custom_op::registerUserCustomOp(kN256TwoGroupSharedSchema,kDecode,[](const at::Stack& stack) {
+        prequant_shared_contract(stack);
+        TORCH_CHECK(stack.back().toBool() && stack.at(0).toTensor().size(0)==1,
+                    "Two-group SAT requires qualified single-token scale planes");
+        return habana::PartialOutputMetaDataVector{{at::kBFloat16,moe_shape(stack,true)}};
+    },nullptr);
+    habana::KernelRegistry().add(kN256TwoGroupSharedSchema,[](synDeviceId device,c10::ScalarType dtype) {
+        return std::make_shared<PreparedV41>(device,dtype,true,true,false,true,true,false,true,true,
+            true,false,true,false,true,false,false,true,false,true,true);
+    });
+    habana::custom_op::registerUserCustomOp(kN256SiluDecodeSharedSchema,kDecode,[](const at::Stack& stack) {
+        prequant_shared_contract(stack);
+        TORCH_CHECK(stack.back().toBool() && stack.at(0).toTensor().size(0)==1,
+                    "Silu/decode SAT requires qualified single-token scale planes");
+        return habana::PartialOutputMetaDataVector{{at::kBFloat16,moe_shape(stack,true)}};
+    },nullptr);
+    habana::KernelRegistry().add(kN256SiluDecodeSharedSchema,[](synDeviceId device,c10::ScalarType dtype) {
+        return std::make_shared<PreparedV41>(device,dtype,true,true,false,true,true,false,true,true,
+            true,false,true,false,false,false,false,false,false,true);
+    });
+    habana::custom_op::registerUserCustomOp(kN256PairedSharedSchema,kDecode,[](const at::Stack& stack) {
+        prequant_shared_contract(stack);
+        TORCH_CHECK(stack.back().toBool() && stack.at(0).toTensor().size(0)==1,
+                    "Paired SAT requires qualified single-token scale planes");
+        return habana::PartialOutputMetaDataVector{{at::kBFloat16,moe_shape(stack,true)}};
+    },nullptr);
+    habana::KernelRegistry().add(kN256PairedSharedSchema,[](synDeviceId device,c10::ScalarType dtype) {
+        return std::make_shared<PreparedV41>(device,dtype,true,true,false,true,true,false,true,true,
+            true,false,true,false,false,false,false,false,true);
+    });
+
     habana::custom_op::registerUserCustomOp(kN256TokenWideSharedSchema, kDecode, [](const at::Stack& stack) {
         token_wide_shared_contract(stack);
         return habana::PartialOutputMetaDataVector{{at::kBFloat16, moe_shape(stack, true)}};
@@ -776,7 +902,7 @@ at::Tensor moe_fp8_prequant(
     return descriptor.execute(stack).at(0);
 }
 
-template<bool Meta, bool FeatureSilu = false>
+template<bool Meta, bool FeatureSilu = false, bool Paired = false>
 at::Tensor moe_fp8_prequant_shared(
     const at::Tensor& x, const at::Tensor& ids, const at::Tensor& router,
     const at::Tensor& q13, const at::Tensor& q2, const at::Tensor& s13,
@@ -788,13 +914,14 @@ at::Tensor moe_fp8_prequant_shared(
                          channel13, channel2, quantized, activation_scale,
                          shared, normal};
     prequant_shared_contract(stack);
+    if(Paired) TORCH_CHECK(normal && x.size(0)==1,"Paired SAT requires qualified single-token scale planes");
     if (FeatureSilu)
         TORCH_CHECK(q2.size(2) / 64 == 640, "Feature Silu requires TP4 intermediate width 640");
     if (Meta) return at::empty(moe_shape(stack, true), x.options());
     TORCH_CHECK(registered && x.device().type() == at::kHPU,
                 "V4.1 prequant FP8 shared finalize requires HPU");
     auto descriptor = habana::custom_op::UserCustomOpDescriptor::
-        getUserCustomOpDescriptor(FeatureSilu ? kN256FeatureSiluSchema :
+        getUserCustomOpDescriptor(Paired ? kN256PairedSharedSchema : FeatureSilu ? kN256FeatureSiluSchema :
                                  kN256PrequantDirectFinalizeSharedPrefetchW2Schema);
     return descriptor.execute(stack).at(0);
 }
@@ -826,6 +953,20 @@ template<bool Meta, bool K128 = false, bool N256 = false> at::Tensor moe(const a
                                   const at::Tensor& s2, const at::Tensor& lookup, bool normal) {
     return run({x, ids, router, q13, q2, s13, s2, lookup, normal}, true, Meta, K128, N256);
 }
+template<bool Meta,bool TwoGroup=false>
+at::Tensor moe_silu_decode_shared(const at::Tensor& x, const at::Tensor& ids, const at::Tensor& router,
+    const at::Tensor& q13, const at::Tensor& q2, const at::Tensor& s13, const at::Tensor& s2,
+    const at::Tensor& lookup, const at::Tensor& channel13, const at::Tensor& channel2,
+    const at::Tensor& quantized, const at::Tensor& activation_scale, const at::Tensor& shared, bool qualified) {
+    const at::Stack stack{x,ids,router,q13,q2,s13,s2,lookup,channel13,channel2,quantized,activation_scale,shared,qualified};
+    prequant_shared_contract(stack);
+    TORCH_CHECK(qualified && x.size(0)==1,"Silu/decode SAT requires qualified C1 scale planes");
+    if(Meta)return at::empty(moe_shape(stack,true),x.options());
+    TORCH_CHECK(registered && x.device().type()==at::kHPU);
+    auto descriptor=habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(TwoGroup?kN256TwoGroupSharedSchema:kN256SiluDecodeSharedSchema);
+    return descriptor.execute(stack).at(0);
+}
+
 template<bool Meta>
 at::Tensor moe_token_wide_shared(const at::Tensor& x, const at::Tensor& ids, const at::Tensor& router,
     const at::Tensor& q13, const at::Tensor& q2, const at::Tensor& s13, const at::Tensor& s2,
@@ -843,12 +984,15 @@ at::Tensor moe_token_wide_shared(const at::Tensor& x, const at::Tensor& ids, con
 }
 
 TORCH_LIBRARY_FRAGMENT(custom_op, m) {
+    m.def("custom_deepseek_v41_expert_n256_moe_two_group_w2_sat_shared_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, Tensor quantized, Tensor activation_scale, Tensor shared, bool qualified) -> Tensor");
+    m.def("custom_deepseek_v41_expert_n256_moe_silu_decode_shared_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, Tensor quantized, Tensor activation_scale, Tensor shared, bool qualified) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_moe_token_wide_sat_shared_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, Tensor quantized, Tensor activation_scale, Tensor shared, bool qualified) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_moe_token_wide_sat_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, Tensor quantized, Tensor activation_scale, bool qualified) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_moe_token_wide_sat_prefetch_w2_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, Tensor quantized, Tensor activation_scale, bool qualified) -> Tensor");
     m.def("custom_deepseek_v41_prefill_weight_bf16_gaudi2(Tensor ids, Tensor q16, Tensor s16, Tensor lookup, bool normal=False, bool discard_empty=False) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_moe_prequant_horizontal_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, Tensor quantized, Tensor activation_scale, bool normal) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_shared_prefetch_w2_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, Tensor quantized, Tensor activation_scale, Tensor shared, bool normal) -> Tensor");
+    m.def("custom_deepseek_v41_expert_n256_moe_paired_decode_shared_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, Tensor quantized, Tensor activation_scale, Tensor shared, bool normal) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_moe_prequant_shared_feature_silu_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, Tensor quantized, Tensor activation_scale, Tensor shared, bool normal) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_moe_prequant_resident_direct_finalize_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor w13, Tensor w2, Tensor channel13, Tensor channel2, Tensor quantized, Tensor activation_scale, bool normal) -> Tensor");
     m.def("custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_slots_fp8_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, Tensor channel13, Tensor channel2, Tensor quantized, Tensor activation_scale, bool normal) -> Tensor");
@@ -872,6 +1016,8 @@ TORCH_LIBRARY_FRAGMENT(custom_op, m) {
     m.def("custom_deepseek_v41_mxfp4_prepared_moe_k128_bf16_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, bool normal=False) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
+    m.impl("custom_deepseek_v41_expert_n256_moe_two_group_w2_sat_shared_fp8_gaudi2", moe_silu_decode_shared<false,true>);
+    m.impl("custom_deepseek_v41_expert_n256_moe_silu_decode_shared_fp8_gaudi2", moe_silu_decode_shared<false>);
     m.impl("custom_deepseek_v41_expert_n256_moe_token_wide_sat_shared_fp8_gaudi2", moe_token_wide_shared<false>);
     m.impl("custom_deepseek_v41_expert_n256_moe_token_wide_sat_fp8_gaudi2", moe_fp8_prequant<false, false, false, false, false, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_token_wide_sat_prefetch_w2_fp8_gaudi2", moe_fp8_prequant<false, false, false, false, false, true, true>);
@@ -880,6 +1026,7 @@ TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
            moe_fp8_prequant<false, false, false, true, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_shared_prefetch_w2_fp8_gaudi2", moe_fp8_prequant_shared<false>);
     m.impl("custom_deepseek_v41_expert_n256_moe_prequant_shared_feature_silu_fp8_gaudi2", moe_fp8_prequant_shared<false, true>);
+    m.impl("custom_deepseek_v41_expert_n256_moe_paired_decode_shared_fp8_gaudi2",moe_fp8_prequant_shared<false,false,true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_prequant_resident_direct_finalize_fp8_gaudi2", moe_fp8_resident<false>);
     m.impl("custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_slots_fp8_gaudi2", moe_fp8_prequant<false, true, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_prefetch_w2_fp8_gaudi2", moe_fp8_prequant<false, true>);
@@ -903,6 +1050,8 @@ TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
     m.impl("custom_deepseek_v41_mxfp4_prepared_moe_k128_bf16_gaudi2", moe<false, true>);
 }
 TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
+    m.impl("custom_deepseek_v41_expert_n256_moe_two_group_w2_sat_shared_fp8_gaudi2", moe_silu_decode_shared<true,true>);
+    m.impl("custom_deepseek_v41_expert_n256_moe_silu_decode_shared_fp8_gaudi2", moe_silu_decode_shared<true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_token_wide_sat_shared_fp8_gaudi2", moe_token_wide_shared<true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_token_wide_sat_fp8_gaudi2", moe_fp8_prequant<true, false, false, false, false, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_token_wide_sat_prefetch_w2_fp8_gaudi2", moe_fp8_prequant<true, false, false, false, false, true, true>);
@@ -911,6 +1060,7 @@ TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
            moe_fp8_prequant<true, false, false, true, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_shared_prefetch_w2_fp8_gaudi2", moe_fp8_prequant_shared<true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_prequant_shared_feature_silu_fp8_gaudi2", moe_fp8_prequant_shared<true, true>);
+    m.impl("custom_deepseek_v41_expert_n256_moe_paired_decode_shared_fp8_gaudi2",moe_fp8_prequant_shared<true,false,true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_prequant_resident_direct_finalize_fp8_gaudi2", moe_fp8_resident<true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_slots_fp8_gaudi2", moe_fp8_prequant<true, true, true>);
     m.impl("custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_prefetch_w2_fp8_gaudi2", moe_fp8_prequant<true, true>);

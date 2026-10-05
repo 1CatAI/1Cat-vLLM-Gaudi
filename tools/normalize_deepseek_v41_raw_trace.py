@@ -24,7 +24,7 @@ def digest(path):
 NORMALIZER_SHA256 = digest(Path(__file__))
 
 
-def decode_parser_window(cpu, metadata, low, high, padding_ms):
+def decode_parser_window(cpu, metadata, low, high, padding_ms, positions=None):
     """Bound offline parsing around captured decode scopes, leaving clock calibration intact."""
     if not math.isfinite(padding_ms) or padding_ms < 0:
         raise ValueError("Decode parser padding must be finite and nonnegative")
@@ -34,6 +34,18 @@ def decode_parser_window(cpu, metadata, low, high, padding_ms):
     scopes = [event for event in cpu["traceEvents"]
               if event.get("ph") == "X" and "::decode::" in event.get("name", "")
               and event.get("dur", 0) > 0]
+    if positions is not None:
+        first, last = positions
+        if first < 0 or last < first:
+            raise ValueError("Decode position window must be an increasing inclusive range")
+        commits = {int(match[1]) for event in scopes
+                   if (match := re.fullmatch(
+                       r"v41::worker_commit::PP0::decode::P(\d+)::C1::emit1", event["name"]))}
+        if not set(range(first, last + 1)) <= commits:
+            raise ValueError("Decode position window lacks consecutive C1 completion commits")
+        scopes = [event for event in scopes
+                  if (match := re.search(r"::P(\d+)(?:::|$)", event["name"]))
+                  and first <= int(match[1]) <= last]
     if not scopes:
         raise ValueError("Decode parser ROI has no captured decode scopes")
     base = cpu["baseTimeNanoseconds"]
@@ -155,7 +167,7 @@ def resolve_recipe_starts(pending, names, recipe_ids_at_start, observed_recipe_i
 
 
 def normalize(bundle, cpu_trace, metadata, output, config, chunk_ms=200, overlap_ms=50, csv_source=None,
-              *, required_engines=("TPC", "MME"), decode_roi_padding_ms=None):
+              *, required_engines=("TPC", "MME"), decode_roi_padding_ms=None, decode_position_window=None):
     if not required_engines or not set(required_engines) <= {"TPC", "MME", "DMA"}:
         raise ValueError("Declare at least one supported engine required by this capture")
     subprocess.run([sys.executable, str(Path(__file__).with_name("extract_deepseek_v41_trace.py")),
@@ -234,6 +246,7 @@ def normalize(bundle, cpu_trace, metadata, output, config, chunk_ms=200, overlap
     hardware_config = next(plugin["values"] for plugin in parse_config["Plugins"] if plugin["name"] == "HwTrace")
     options = hardware_config["parseOptions"]
     options.update(skipParse={"value": False}, mergeWithHost={"value": False}, addEnqueuesFlow={"value": False},
+                   showNullDescs={"value": True},
                    traceAnalyzer={"enable": {"value": False}, "traceAnalyzerJson": {"value": False}})
     options["outputPerInvocation"] = {name: {"value": name == "csv"} for name in
                                       ("csv", "binary", "dbgInfo", "hltv", "hltvWithHost", "json", "text", "log")}
@@ -245,10 +258,12 @@ def normalize(bundle, cpu_trace, metadata, output, config, chunk_ms=200, overlap
     low = min(item["first"]["host"] for item in calibrations)
     high = max(item["second"]["host"] for item in calibrations)
     calibration_range = [low, high]
-    if decode_roi_padding_ms is not None:
+    if decode_roi_padding_ms is not None or decode_position_window is not None:
         with gzip.open(cpu_trace, "rt") as stream:
             cpu = json.load(stream)
-        low, high = decode_parser_window(cpu, metadata, low, high, decode_roi_padding_ms)
+        low, high = decode_parser_window(cpu, metadata, low, high,
+                                        25 if decode_roi_padding_ms is None else decode_roi_padding_ms,
+                                        decode_position_window)
     step = max(1, int(chunk_ms * 1e6)) if chunk_ms > 0 else high - low + 1
     padding = int(overlap_ms * 1e6)
     parts = []
@@ -258,7 +273,7 @@ def normalize(bundle, cpu_trace, metadata, output, config, chunk_ms=200, overlap
         assert saved["chunk_ms"] == chunk_ms and saved["overlap_ms"] == overlap_ms
         assert saved["binary_sha256"] == digest(binaries[0])
         assert saved["profile_state"] == state and saved["parser_config"] == parse_config
-        if decode_roi_padding_ms is not None:
+        if decode_roi_padding_ms is not None or decode_position_window is not None:
             assert saved.get("parser_window_ns") == [low, high], "CSV ROI ownership changed"
     commands, files = [], []
     for index, begin in enumerate(range(low, high, step)):
@@ -380,6 +395,7 @@ def normalize(bundle, cpu_trace, metadata, output, config, chunk_ms=200, overlap
                     required_engines=list(required_engines),
                     calibration_range_ns=calibration_range, parser_window_ns=[low, high],
                     decode_roi_padding_ms=decode_roi_padding_ms,
+                    decode_position_window=list(decode_position_window) if decode_position_window else None,
                     reused_csv_source=str(csv_source) if csv_source else None,
                     chunk_ownership="BEGIN in half-open core; complete pair in independently padded CSV")
     (output / "raw-provenance.json").write_text(json.dumps(identity, indent=2) + "\n")
@@ -415,10 +431,12 @@ if __name__ == "__main__":
     parser.add_argument("--csv-source", type=Path)
     parser.add_argument("--decode-roi-padding-ms", type=float,
                         help="Parse around raw-clock decode scopes plus padding; validate complete-cycle coverage")
+    parser.add_argument("--decode-position-window", type=int, nargs=2, metavar=("FIRST", "LAST"),
+                        help="Explicit inclusive C1 position subset of this capture; recorded in provenance")
     parser.add_argument("--required-engine", action="append", choices=("TPC", "MME", "DMA"),
                         help="Explicit engine contract for a component trace; default requires both TPC and MME")
     args = parser.parse_args()
     normalize(args.bundle, args.cpu_trace, json.loads(args.metadata.read_text()), args.output,
               args.config, args.chunk_ms, args.overlap_ms, args.csv_source,
               required_engines=args.required_engine or ("TPC", "MME"),
-              decode_roi_padding_ms=args.decode_roi_padding_ms)
+              decode_roi_padding_ms=args.decode_roi_padding_ms, decode_position_window=args.decode_position_window)

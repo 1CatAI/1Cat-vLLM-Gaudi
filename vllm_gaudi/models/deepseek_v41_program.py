@@ -18,6 +18,7 @@ from vllm_gaudi.ops.deepseek_v41_math import (
     prefill_engram_update,
     hc_post,
     hc_pre,
+    hc_control_and_collapse,
     prefill_hc_input,
     quantize_activation,
     final_collapse_rms_norm,
@@ -319,6 +320,7 @@ class PreparedMoE(nn.Module):
         # Feature-tiled activation/quantization increased complete-chain latency.
         self.feature_silu = False
         self.all_route_slots = False
+        self.expert_w2_three_routes = gaudi_envs.VLLM_HPU_DSV41_EXPERT_W2_THREE_ROUTES
         self.token_wide_experts = gaudi_envs.VLLM_HPU_DSV41_EXPERT_TOKEN_WIDE
         self.router_bf16_gate = gaudi_envs.VLLM_HPU_DSV41_BF16_ROUTER_GATE
         self.shared_gate_up = gaudi_envs.VLLM_HPU_DSV41_SHARED_GATE_UP
@@ -534,6 +536,13 @@ class PreparedMoE(nn.Module):
                 if not use_fused:
                     raise ValueError("Prequantized N256 input requires the fused expert body")
                 quantized, activation_scale = tile_prequant
+                if (self.expert_w2_three_routes and (decode or ordinary_decode)
+                        and tile_value.shape[0] == 1 and tile_shared is not None):
+                    if not (getattr(experts.w13_q16, "dsv41_sat_eligible", False)
+                            and getattr(experts.w2_q16, "dsv41_sat_eligible", False)):
+                        raise ValueError("Three-route W2 requires checkpoint-qualified SAT scale planes")
+                    return torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_two_group_w2_sat_shared_fp8_gaudi2(
+                        *operands, channel13, channel2, quantized, activation_scale, tile_shared, True)
                 if self.token_wide_experts and (decode or ordinary_decode) and 1 <= tile_value.shape[0] <= 6:
                     if not (getattr(experts.w13_q16, "dsv41_sat_eligible", False)
                             and getattr(experts.w2_q16, "dsv41_sat_eligible", False)):
@@ -927,7 +936,8 @@ class PreparedDecoderLayer(nn.Module):
         )
         self.moe.layer = layer
         self.peer_post_collapse = (
-            gaudi_envs.VLLM_HPU_DSV41_PEER_POST_COLLAPSE and self.mhc_post_collapse
+            (gaudi_envs.VLLM_HPU_DSV41_PEER_POST_COLLAPSE or gaudi_envs.VLLM_HPU_DSV41_PEER_POST_NORM)
+            and self.mhc_post_collapse
             and self.mhc_interlayer_bf16 and not self.draft
         )
         self.attention.peer_post_collapse = self.peer_post_collapse
@@ -1039,6 +1049,16 @@ class PreparedDecoderLayer(nn.Module):
             and self.attention._fused_qkv_weight is not None
         )
         input_prequant = None
+        deferred_gates = (
+            decode and gaudi_envs.VLLM_HPU_DSV41_MHC_DEFERRED_GATES
+            and gaudi_envs.VLLM_HPU_DSV41_MHC_GATES_FUSED
+            and not self.draft and not prefill_sequence and not compiled_input
+            and residual.device.type == "hpu" and residual.dtype == torch.bfloat16
+            and residual.shape[0] == 1 and residual.shape[1:] == (4, 5120)
+            and self.hc_eps == 1e-6 and self.iterations == 20
+            and self.hc_attn_fn_packed is not None and self.hc_ffn_fn_packed is not None
+            and self.mhc_interlayer_bf16
+        )
         if prefill_sequence:
             new_pre, post, comb, value = sequence_hc_input(
                 residual,
@@ -1069,19 +1089,26 @@ class PreparedDecoderLayer(nn.Module):
             )
             del collapsed
         else:
-            value, new_pre, post, comb = hc_pre(
-                residual,
-                pre_mix,
-                w.hc_attn_fn,
-                w.hc_attn_scale,
-                w.hc_attn_base,
-                self.eps,
-                self.hc_eps,
-                self.iterations,
-                packed_fn=self.hc_attn_fn_packed,
-                prefill=fused_post,
-                collapsed_input=collapsed_attention,
-            )
+            if deferred_gates:
+                value, attention_control = hc_control_and_collapse(
+                    residual, pre_mix, self.hc_attn_fn_packed, self.eps,
+                    collapsed_input=collapsed_attention,
+                )
+                new_pre = post = comb = None
+            else:
+                value, new_pre, post, comb = hc_pre(
+                    residual,
+                    pre_mix,
+                    w.hc_attn_fn,
+                    w.hc_attn_scale,
+                    w.hc_attn_base,
+                    self.eps,
+                    self.hc_eps,
+                    self.iterations,
+                    packed_fn=self.hc_attn_fn_packed,
+                    prefill=fused_post,
+                    collapsed_input=collapsed_attention,
+                )
             if (
                 self.decode_attention_norm_quant and decode and not self.draft
                 and value.dtype == torch.bfloat16 and 1 <= value.shape[0] <= 6
@@ -1112,7 +1139,8 @@ class PreparedDecoderLayer(nn.Module):
                 value, positions, decode=False, prefill_sequence=True, prefill_qkv_sequence=sequence_qkv
             )
         elif schedule:
-            value = self.attention(value, positions, ready_outputs=(post, comb), **attention_kwargs)
+            ready = (attention_control,) if deferred_gates else (post, comb)
+            value = self.attention(value, positions, ready_outputs=ready, **attention_kwargs)
         else:
             value = (
                 self.attention.draft(value, positions)
@@ -1120,7 +1148,27 @@ class PreparedDecoderLayer(nn.Module):
                 else self.attention(value, positions, **attention_kwargs)
             )
         collapsed_ffn = None
-        if (self.mhc_post_collapse and decode and not self.draft
+        post_ffn_prequant = None
+        if deferred_gates:
+            residual, collapsed_ffn, gates = (
+                torch.ops.custom_op.custom_deepseek_v41_mhc_mme_post_collapse_gaudi2(
+                    value.contiguous(), residual.contiguous(), attention_control,
+                    w.hc_attn_scale, w.hc_attn_base, self.eps
+                )
+            )
+            new_pre = gates[:, :4]
+        elif (decode and gaudi_envs.VLLM_HPU_DSV41_PEER_POST_NORM and not self.draft
+                and not self.mhc_mme_gates_norm
+                and residual.shape[0] == 1 and value.ndim == 3 and value.device.type == "hpu"
+                and self.moe.n256_fp8 and self.moe.n256_fused):
+            residual, collapsed_ffn, normalized, quantized, activation_scale = (
+                torch.ops.custom_op.custom_deepseek_v41_peer_post_norm_quant_gaudi2(
+                    value.contiguous(), residual.contiguous(), post.contiguous(), comb.contiguous(),
+                    new_pre.contiguous(), w.ffn_norm.weight, self.eps
+                )
+            )
+            post_ffn_prequant = normalized, quantized, activation_scale
+        elif (self.mhc_post_collapse and decode and not self.draft
                 and residual.shape[0] <= 2 and value.device.type == "hpu"):
             # Keep forty independently scheduled feature tiles. The residual
             # BF16 boundary is retained inside the fused producer; the next
@@ -1160,7 +1208,13 @@ class PreparedDecoderLayer(nn.Module):
                 self.hc_ffn_fn_packed,
             )
             del collapsed
-        elif (decode and self.mhc_mme_gates_norm and collapsed_ffn is not None
+        elif deferred_gates:
+            value, ffn_control = hc_control_and_collapse(
+                residual, new_pre, self.hc_ffn_fn_packed, self.eps,
+                collapsed_input=collapsed_ffn,
+            )
+            pre_mix = post = comb = None
+        elif (decode and self.mhc_mme_gates_norm and collapsed_ffn is not None and post_ffn_prequant is None
               and self.moe.n256_fp8 and self.moe.n256_fused
               and self.hc_ffn_fn_mme is not None and residual.shape[0] <= 2):
             projected = torch.ops.custom_op.custom_deepseek_v41_control_mme_f32_gaudi2(
@@ -1195,8 +1249,11 @@ class PreparedDecoderLayer(nn.Module):
         # contract; larger decode batches and prefill retain the generic path.
         # The B1/B2 outputs were qualified bit-for-bit against the separate
         # RMSNorm and dynamic-quant nodes before this became the default.
+        moe_ready = ((ffn_control,) if deferred_gates else (post, comb)) if schedule else ()
         if decode and value.shape[0] <= 2 and self.moe.n256_fp8 and self.moe.n256_fused:
-            if fused_ffn_prequant is None:
+            if post_ffn_prequant is not None:
+                normalized, quantized, activation_scale = post_ffn_prequant
+            elif fused_ffn_prequant is None:
                 normalized, quantized, activation_scale = torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
                     value.contiguous(), w.ffn_norm.weight, self.eps
                 )
@@ -1206,7 +1263,7 @@ class PreparedDecoderLayer(nn.Module):
             value = self.moe(
                 normalized,
                 image_mask,
-                ready_outputs=(post, comb) if schedule else (),
+                ready_outputs=moe_ready,
                 fp8_decode=fp8_decode,
                 decode=decode,
                 prequant=(quantized, activation_scale),
@@ -1215,14 +1272,24 @@ class PreparedDecoderLayer(nn.Module):
             value = self.moe(
                 value if compiled_input else rms_norm(value, w.ffn_norm.weight, self.eps),
                 image_mask,
-                ready_outputs=(post, comb) if schedule else (),
+                ready_outputs=moe_ready,
                 fp8_decode=fp8_decode,
                 decode=decode,
                 prefill_router_tokens=prefill_router_tokens,
                 prefill_sequence=prefill_sequence,
             )
         peer_value = getattr(self, "peer_post_collapse", False) and decode and value.ndim == 3
-        if peer_value:
+        if deferred_gates:
+            residual, collapsed, gates = (
+                torch.ops.custom_op.custom_deepseek_v41_mhc_mme_post_collapse_gaudi2(
+                    value.contiguous(), residual.contiguous(), ffn_control,
+                    w.hc_ffn_scale, w.hc_ffn_base, self.eps
+                )
+            )
+            pre_mix = gates[:, :4]
+            if publish_collapse and collapse_handoff is not None and self.mhc_interlayer_collapse:
+                collapse_handoff[self.layer + 1] = collapsed
+        elif peer_value:
             residual, collapsed = torch.ops.custom_op.custom_deepseek_v41_mhc_post_collapse_gaudi2(
                 value.contiguous(), residual.contiguous(), post.contiguous(), comb.contiguous(), pre_mix.contiguous()
             )
@@ -2158,7 +2225,11 @@ class PreparedLayerGroup(nn.Module):
         self.eps = stage.config["text_config"]["rms_norm_eps"]
         self.native_input = None
 
-    def _forward(self, residual, pre_mix, positions, input_ids, engram_rows, *, fp8_decode=False, decode=False):
+    def _forward(self, residual, pre_mix, positions, input_ids, engram_rows, *, fp8_decode=False, decode=False,
+                 shared_coordinates=None):
+        sampling_positions = positions
+        if shared_coordinates is not None:
+            positions = shared_coordinates[0]
         if self.text_input:
             mapped = input_ids.masked_fill(input_ids == 129265, 129264)
             per_rank = self.embedding.weight.shape[0]
@@ -2172,13 +2243,15 @@ class PreparedLayerGroup(nn.Module):
             from vllm_gaudi.ops.deepseek_v41_pp_wire import decode_pp_wire
 
             residual, pre_mix = decode_pp_wire(residual)
-        image_mask = (input_ids == 129264) | (input_ids == 129265)
+        image_mask = ((input_ids == 129264) | (input_ids == 129265)
+                      if shared_coordinates is None else shared_coordinates[1])
         target_states = []
         # Purely local graph values: no cross-token cache or request state.
         selected_main = {} if self.preserve_layer_rounding and decode and residual.shape[0] == 1 else None
-        decode_metadata = None
+        decode_metadata = shared_coordinates[2:4] if shared_coordinates is not None else None
         if (
-            self.preserve_layer_rounding
+            shared_coordinates is None
+            and self.preserve_layer_rounding
             and decode
             and any(
                 getattr(getattr(layer, "attention", None), "shared_decode_metadata", False) for layer in self.layers
@@ -2241,7 +2314,7 @@ class PreparedLayerGroup(nn.Module):
         value = final_collapse_rms_norm(residual, pre_mix, self.norm.weight, self.eps)
         aux = torch.cat(target_states, -1) if target_states else None
         if self.greedy_tail is not None and decode and value.shape[0] == 1:
-            return value, pre_mix, aux, *self.greedy_tail(value, positions, input_ids)
+            return value, pre_mix, aux, *self.greedy_tail(value, sampling_positions, input_ids)
         return value, pre_mix, aux
 
     def forward(self, residual, pre_mix, positions, input_ids, engram_rows):
@@ -2254,6 +2327,21 @@ class PreparedLayerGroup(nn.Module):
             residual, pre_mix, positions, input_ids, engram_rows, fp8_decode=self.fp8_decode, decode=decode
         )
 
+    def coordinate_forward(self, residual, pre_mix, positions, input_ids, engram_rows, shared_coordinates=None):
+        from vllm_gaudi.ops.deepseek_v41_decode_coordinates import prepare_shared_decode_coordinates
+
+        decode = self.decode and positions.numel() <= 6
+        if not decode:
+            raise ValueError("Shared coordinate entry requires a decode bucket")
+        if shared_coordinates is None:
+            shared_coordinates = prepare_shared_decode_coordinates(
+                positions, input_ids, self.layers[0].attention.shared.block_table)
+        if self.native_input is not None:
+            residual, pre_mix = self.native_input(input_ids)
+        outputs = self._forward(residual, pre_mix, positions, input_ids, engram_rows,
+                                fp8_decode=self.fp8_decode, decode=True, shared_coordinates=shared_coordinates)
+        return outputs, shared_coordinates
+
     def native_forward(self, residual, pre_mix, positions, input_ids, engram_rows):
         if self.native_input is not None:
             residual, pre_mix = self.native_input(input_ids)
@@ -2263,7 +2351,7 @@ class PreparedLayerGroup(nn.Module):
 _compile_entry_ids = count()
 
 
-def _compile_group(group, *, native, backend="hpu_backend", tp4_owner=None):
+def _compile_group(group, *, native, backend="hpu_backend", tp4_owner=None, shared_coordinates=False):
     if tp4_owner is not None:
         if native:
             raise ValueError("Prepared TP4 export does not use the TP2 native peer path")
@@ -2272,7 +2360,7 @@ def _compile_group(group, *, native, backend="hpu_backend", tp4_owner=None):
         return PreparedTP4Group(group, tp4_owner, backend)
     # Dynamo caches variants by code object. Each static layer group/bucket
     # owns its entry so legitimate preparations cannot exhaust another group.
-    method = group.native_forward if native else group.forward
+    method = group.coordinate_forward if shared_coordinates else group.native_forward if native else group.forward
     function = method.__func__
     name = f"{function.__name__}_v41_{next(_compile_entry_ids)}"
     entry = FunctionType(
@@ -2324,6 +2412,7 @@ class CompiledStage:
             backend = make_backend(
                 static_int32=getattr(stage, 'decode_static_int32', False),
                 static_factories=getattr(stage, 'decode_static_factories', False),
+                static_clamps=getattr(stage, 'decode_static_clamps', False),
                 split_mhc=not getattr(stage, 'decode_merge_mhc_partitions', False),
                 required_operators=getattr(stage, 'candidate_required_operators', ()),
                 compiler_config=getattr(stage, 'candidate_compiler_config', None),
@@ -2349,6 +2438,12 @@ class CompiledStage:
         compile_options = {"native": native, "backend": backend}
         if tp4_owner is not None:
             compile_options["tp4_owner"] = tp4_owner
+        # Extra coordinate outputs are confined to the full stage native owner.
+        # Ordinary/prefill and speculative entries retain their existing ABI.
+        self.shared_coordinates = bool(native_input and getattr(stage, "decode_shared_coordinates",
+                                                               gaudi_envs.VLLM_HPU_DSV41_SHARED_COORDINATES))
+        self.coordinate_chunks = (tuple(_compile_group(group, shared_coordinates=True, **compile_options)
+                                       for group in self.groups) if self.shared_coordinates else ())
         self.chunks = tuple(_compile_group(group, **compile_options) for group in self.groups)
         self.owner = stage
         self.prefix_groups = (

@@ -144,6 +144,13 @@ def main():
     from vllm_gaudi.v1.worker.deepseek_v41_runner import runtime_search_length, prefill_search_length
     decode_search = runtime_search_length(context_tokens, 1, args.max_model_len)
     rank = int(os.environ['LOCAL_RANK'])
+    if os.environ.get('GRAPH_VISUALIZATION') == '1':
+        from types import SimpleNamespace
+        from tools.deepseek_v41_physical_audit import prepare_physical_audit
+        for name, value in vars(args).items():
+            if isinstance(value, Path):
+                setattr(args, name, value.resolve())
+        prepare_physical_audit(SimpleNamespace(output=Path(os.environ['DSV41_RUN_EVIDENCE'])), rank)
     os.environ['HLS_MODULE_ID'] = os.environ['HABANA_VISIBLE_MODULES'].split(',')[rank]
     for name in ('PT_HPU_RECIPE_CACHE_CONFIG',):
         if '{rank}' in os.environ.get(name, ''):
@@ -345,17 +352,23 @@ def main():
                         sampling_payloads[owner] = values
                         return values[3]
                     if owner not in official_samplers:
-                        def official(value):
-                            draw = device_sampling_draw(
-                                program.sampling_params, program.sampling_seed, program.sampling_counter)
-                            local = program._head_projection(value)
+                        # Capture only this sampler's operands. Closing over
+                        # the whole stage unnecessarily retains its model and
+                        # host-table state during cold graph preparation.
+                        use_bf16 = program.bf16_head
+
+                        def official(value, weight, params, seed, counter):
+                            draw = device_sampling_draw(params, seed, counter)
+                            local = (torch.ops.custom_op.custom_deepseek_v41_bf16_linear_f32_gaudi2(value, weight)
+                                     if use_bf16 else torch.nn.functional.linear(value.float(), weight))
                             return full_official(local, draw)
 
                         official_samplers[owner] = torch.compile(
                             official, backend='hpu_backend', fullgraph=True, dynamic=False)
                     local = owner.tail_local_logits(hidden)
                     if local is None:
-                        return official_samplers[owner](hidden)
+                        return official_samplers[owner](hidden, program.weights.head.weight, program.sampling_params,
+                                                        program.sampling_seed, program.sampling_counter)
                     draw = compiled_draw(
                         program.sampling_params, program.sampling_seed, program.sampling_counter)
                     return compiled_official(local, draw)

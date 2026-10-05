@@ -1,9 +1,29 @@
 # TP4 decode 长期开发台账
 
-更新：2026-10-03。只记录具有可比完整消费链微基准收益、通过适用正确性检查的改动。
+更新：2026-10-05。只记录具有可比完整消费链微基准收益、通过适用正确性检查的改动。
 未验证方向、失败或变慢试验留在实验INDEX，不计累计。端到端通过后关账，不再次计入待验收收益。
 
-## 当前正式测量与待验收累计
+## 当前正式测量与待验收累计（2026-10-05）
+
+官方采样 T=1.0、top_p=0.95、seed=42，512K、C16384、缓存开、完整预热：
+`decode-physical-fusion-serving-03` 独立安装服务，16K未命中→1858 tokens自然EOS，
+**9.564282 ms/token**；14项事实/约束通过，采样回退0。输入token与父版本相同，
+输出从第32个token起不同，未声称逐token相同。前一正式基线为9.997343 ms/token。
+
+本批组件预估1.123126ms，正式减少 **0.433061ms**。用户于2026-10-05明确接受该正式结果，
+撤销“低于预估一半暂不提升默认”的限制：**9.564282 ms/token 为新的正式基线**。
+TP4 正常启动默认开启 CSA publish、W2 三路、Q/KV prologue、候选坐标、peer/post collapse；
+STATIC_COORDINATES 原已默认开启，共六项。显式诊断覆盖仍可关闭，prefill/C2–C6保留既有条件。
+
+原始 trace 已足够指导后续：计算约6.97ms、非计算约2.43ms、<2us碎空隙约1.30ms。
+recipe编号冲突停止追查，不再作逐项归因。输出/post-norm/WOa/发布链小融合归档，
+默认关闭；共享-main输出原型提交 `0dd878fb`。旧项目中的组件预测不能继续叠加到新基线。
+
+**当前活跃 MoE 研发待验收累计：0 ms/token。** 先前 mHC 的0.031500469ms和已归档
+共享-main复用0.043661426ms保留历史证据，但不计入本轮MoE累计。下一次正式验收触发线
+为新MoE/后续Attention主体累计≥1ms。先验收编译物理节点与SRAM驻留，再计时。
+
+## 2026-10-03及以前的测量记录
 
 当前官方采样口径：temperature=1.0、top_p=0.95、seed=42，512K容量、C16384、缓存开启、完整预热。
 最新安装服务测量为 `long-prefix-serving-01`：源码31e519fd，16384→2128自然EOS，
@@ -773,3 +793,101 @@ Own retiredgraphs were losslessly archived withtarcompare/SHA256 before removing
 | CSA2 norm/RoPE/FP4 publication | parent formal 9.997343 ms/token | native repeated16-group production static compiler, actual index-mirror MME→MLA→WO→TP sum; 5 checkpoint-derived inputs, all outputs/states exact/4ranks; physical consumer 44→17 | AB [0.0468718125, 0.0508414375, 0.053027531249999996] ms/source, median 0.050841 | ratio2 sources2/8/14 only: **0.152524 ms/token estimated**; ratio1 source20 unmeasured | `VLLM_HPU_DSV41_COMPRESSOR_FUSED_PUBLISH=0` | decode-csa-publish-07 on SSD | pending combined official-sampling acceptance |
 
 Current compatible pending component estimate: **0.152524 ms/token**. No formal gain; superseded05 and accepted baseline gains are excluded. Weight/input fingerprints and reduced component-native topology are recorded with the evidence.
+
+### 2026-10-05 累加规则更新
+
+按用户最新要求取消小项收益门槛。最终物理节点减少、5 组输入逐位一致、同进程三轮设备 A/B 全部为正即可进入待验收；累计预估达到 0.6 ms/token 或减少 300 个物理节点后，统一官方采样 16K→EOS 加 trace。约 2 µs/节点仅作为节点数量估计，不能替代实测组件或正式收益。方向不一致的候选保留到同模块融合更多后再测。
+
+| 名称 | 完整生产者/消费者微基准节省 | 节点 | 开关 | 状态 |
+| --- | --- | --- | --- | --- |
+| KV norm/RoPE/发布＋main reuse gather，行优先映射 | 三轮每层 0.002396 / 0.002216 / 0.002347 ms；27 个复用层预估 **0.063372 ms/token** | 23→19，27 层少108个 | `VLLM_HPU_DSV41_KV_REUSE_FUSION=0` | 5输入4卡输出及SWA状态逐位一致；decode-kv-reuse-fusion-03；正式待验收 |
+
+CSA publish07 继续计 **0.152524 ms/token**，3 个 ratio2 源少81个节点；不重复计 superseded05 或基线已含收益。当前兼容组件预估合计 **0.215897 ms/token**、少189个节点，尚未正式测量。
+
+KV 发布20→14按用户要求列入整模块组合候选：此前三轮方向不一致，暂不把节点估计当作已确认的微基准节省。它与 reuse 分支存在覆盖关系，组合验收时按实际生效层数计数，不能将两项按40层同时相加。原生分段合并常驻任务在父候选冷准备期间遇到严重主机换页，之后主机重新启动；无有效数值/计时数据，不入账。下一版保留 W13 六路，W2 两组三路，先验收最终编译图及完整链。
+
+在最新累加规则下恢复 mHC 模块中的 peer→post/collapse 融合待验收项：原生完整生产者/消费者5输入精确、三轮每边界节省0.008950/0.012500/0.005773 ms；最终 compiler JSON 确认消费链3→2个物理节点。仅40个Attention边界预估 **0.358000 ms/token**，MoE不计；`VLLM_HPU_DSV41_PEER_POST_COLLAPSE=0`。该项是手写消费融合，未将单独有序求和的未验证变体恢复。当前兼容待验收预估 **0.573897 ms/token**、少229个物理节点；real16状态门槛与整模正式验收仍待验证，不称为端到端收益。
+
+MoE 两组三路试验04：物理24→24，未进入数值/原生计时门槛，不入账。源码确认Gaudi2流水拒绝同一TPC同时供给MME两个输入；把W2权重恢复单输出以维持SRAM，保留W13六路和W2两组三路后重测。
+
+Q/KV联合准备与KV发布／完整输入FP8投影→Q norm/quant＋KV norm/RoPE/SWA→Q MME/RoPE→MLA→WO→TP→mHC→FFN norm/quant，5组输入/4卡结果与SWA字节逐位一致；三轮每层节省 **0.008666 / 0.008529 / 0.008466 ms**，中位0.008529 ms／`VLLM_HPU_DSV41_QKV_FUSED_PROLOGUE=0`。最终物理生产链23→19。按40层预估 **0.341141 ms/token**，实际服务覆盖待核实；证据decode-qkv-prologue-fusion-03。
+
+该项覆盖此前KV发布/reuse生产者，组合中关闭KV_REUSE_FUSION和ATTN_FUSED_PROLOGUE，移出其0.063372ms估计。当前三项兼容余额：CSA07 **0.152524**＋Q/KV **0.341141**＋Attention peer/post **0.358000**＝**0.851666 ms/token预估**；节点估计少281个。已达到最新0.6ms触发线，进入一次组合正式16K→EOS及随带trace。目标7ms、全部逐token物理节点≤1000均未达标，不称为正式收益。
+
+2026-10-05 实验索引（不入收益余额）：WO scale/roundtrip＋dense quant 的手写核，最终生产链19→18，5输入4卡逐位一致；三轮每层差值0.000874、0.076331、-0.074175 ms，方向不一致。按最新规则保留至更大 Attention/mHC 组合，不单独放弃，也不计已确认收益。证据decode-woa-handoff-fusion-01/OUTCOME.json。下一组合已加入 peer/post/collapse＋FFN norm/quant 的手写核，并带更新残差的控制/Gates和归一化输出的router两个实际消费分支；编译与68项CPU接口检查通过，硬件验证等待空卡。
+
+三项0.851666ms预估的正式验收尚未产生数字：02:29模型进程收到终止信号，启动时间未变，不能当作编译器崩溃或主机重启。SSD inode耗尽后迁移本任务安装依赖与recipe缓存至Optane，日志/trace继续SSD；发现并修复ABI校验中预期路径未resolve的问题，保持二进制和运行库SHA256严格校验，三项路径身份/篡改CPU检查通过。正式基线仍9.997343ms，目标7ms未完成。
+
+2026-10-05 启动问题修复（不计收益）：DUMP_PRE_GRAPHS/DUMP_POST_GRAPHS 的字符串0被Bridge当成输出目录，完整预热生成约5.5万个调试文件后耗尽SSD inode；本次预热失败未进入正式请求。移除变量及继承值、加入启动前检查，清理本次未完成预热的导出；14项安装/环境/运行库身份CPU检查通过。正式服务依旧仅三项已确认组件候选，不包含尚未测量的WO和peer/norm新核。
+
+MoE 下一组实验（未测，不入账）：针对batch GEMM物理拆分根因，W13保留六路水平SAT；每组三路W2水平权重配合一个普通GEMM，手写finalizer只读匹配对角块，保留每路BF16边界与有序共享输出归约。额外交叉乘积是否被MME最小M粒度吸收仍需生产编译图与微基准判断，不能仅凭一次GEMM判为收益。实现按route_pack参数化，共用TP路径。
+
+
+### 2026-10-05: candidate-block coordinate screen — not yet in gain ledger
+
+The 16K mirror / 256-block screen produced 26→20 physical nodes, five exact
+fixtures and three positive native replay pairs (2.317578 / 2.317531 / 2.315703 µs).
+However, the current 512K service reserves 262144 ratio-2 mirror rows and consumes
+2048 candidate blocks in eight score tiles. The screen did not use that full
+production shape. Its earlier 0.060256 ms/token extrapolation is withdrawn pending
+that validation; it contributes **zero** to the cumulative forecast.
+
+Qualified pending forecast remains **0.8516655625 ms/token** (CSA publication,
+Q/KV joint prologue, attention peer/post collapse), with no new formal result.
+The small-shape whole-output variant reduced 20→19 nodes but all three pairs
+slowed by 0.106–0.121 µs; it remains off and contributes zero.
+See SSD `decode-candidate-coordinate-chain-01` and
+`decode-candidate-coordinate-whole-chain-01` for preserved raw observations.
+
+### 2026-10-05: Reindex coordinate fusion — qualified production-shape micro
+
+| Name | Savings / Reindex layer | Physical nodes | Flag | Pending token estimate |
+|---|---|---|---|---|
+| Candidate expand + sentinel mask + safe address, stock gather/MME | 0.008844797 ms | 69→49 | `VLLM_HPU_DSV41_CANDIDATE_COORDINATES` (default 0) | 0.035379188 ms |
+
+Evidence: SSD `decode-candidate-coordinate-production-02/DECISION.json`.
+Checkpoint identifies four Reindex layers 24/28/32/36, **ratio 1**; their mirror is
+524288×128, candidate pool 2048 blocks, eight 2048-row scoring tiles. Five
+checkpoint-derived projection fixtures are bit-exact. Native ABABAB savings:
+0.008841797 / 0.008844797 / 0.008850953 ms. Producer is one physical TPC, 13 clamp nodes and three coordinate
+transposes removed; existing 13 gather / 15 MME nodes remain. No whole-output
+variant is needed. Previous smaller / ratio-2 screens remain non-credited.
+
+Qualified pending forecast: **0.887044750 ms/token**. This remains an estimate;
+formal baseline is unchanged at 9.997343230 ms/token. Token-entry shared metadata
+is still unqualified and not included.
+
+### 2026-10-05: six-route W13 / three-route W2 native chain
+
+| Name | Micro saving | Physical nodes | Flag | Pending token estimate |
+|---|---|---|---|---|
+| W13 horizontal SAT, W2 groups3 + diagonal ordered shared finalization | 0.005902031 ms/layer | 24→21 per producer | `VLLM_HPU_DSV41_EXPERT_W2_THREE_ROUTES` (default 0) | 0.236081250 ms |
+
+SSD `decode-sat-horizontal-w2-fusion-04/DECISION.json`: real layers 0/4/14/19,
+12 checkpoint experts, five inputs on all four ranks bit-exact including peer and
+mHC/FFN consumers. Three native four-layer savings: [0.02360812500000009, 0.023651500000000047, 0.02360193750000006].
+W2 FP8 remains in SRAM; W13 still has four physical slices, so the ≤12/≤9 MoE
+node target is not achieved. The previous result-lost run receives no separate
+credit. Qualified pending forecast is **1.123126000 ms/token**;
+formal baseline remains 9.997343230 ms/token until combined serving acceptance.
+
+### 2026-10-05: exact deferred mHC gates/post — next batch only
+
+| Name | Micro saving | Physical nodes | Flag | Pending token estimate |
+|---|---|---|---|---|
+| Original FP32 control/RRMS → fused gates + peer/post/collapse | 0.000787512 ms/boundary | 9→8 complete WO/TP/FFN/router chain | `VLLM_HPU_DSV41_MHC_DEFERRED_GATES` (default 0) | 0.031500469 ms (40 boundaries only) |
+
+Five checkpoint-derived inputs on four ranks are bit-exact. Three paired native
+savings: [0.0007875117187499947, 0.0008048632812499984, 0.0007771210937499995] ms. Evidence: SSD
+`decode-mhc-exact-post-01/DECISION.json`. Reference already contains fused
+peer/post; none of batch03's reduction saving is counted again. Serving prototype
+also covers the MoE post boundary, but that second boundary receives **zero**
+additional credit until its producer chain is measured. This item is **not** in
+the frozen batch03 formal request (forecast 1.123126 ms). Total pending forecast
+including this next-batch item is 1.154626469 ms; no new formal result yet.
+
+### 2026-10-05: shared-main PV / inverse RoPE / WO projection
+
+Reuse producer physical nodes **19→18**, unchanged downstream **3**. Five checkpoint-derived inputs × four ranks are bit-exact, including SWA writes and post/norm outputs. Three native-chain savings **0.001368859 / 0.001823461 / 0.001617090 ms per reuse layer**. Flag `VLLM_HPU_DSV41_MAIN_MLA_PROJECTION=0`. Source topology with four-layer groups has 27 reuse and 11 publish occurrences at the 16K logical path; only reuse is qualified so far, yielding **0.043661426 ms/token estimated**, not formal. The first publish test failed before timing due to tensor input indexing after a scalar ratio; it receives zero credit. Evidence: SSD `decode-main-mla-projection-01/DECISION.json` and `decode-main-mla-publish-projection-01/DECISION.json`.
+
+Shared-main publish follow-up (`decode-main-mla-publish-projection-02`): five inputs × four ranks exact, 19→18 producer nodes, paired savings 0.000173684/0.000192953/−0.000049105 ms. Mixed direction: retain for the combined module but **0 pending gain**. The nonsliceable producer experiment increases nodes to20 due to two DMA copies and a split scale kernel; reverted, **0 credit**. Qualified pending balance remains **0.075161895 ms/token** (mHC40-boundary estimate plus 27 reuse projections).

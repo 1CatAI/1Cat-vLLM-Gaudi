@@ -2,14 +2,20 @@
 #ifndef DSV41_SHARED_FINALIZE
 #define DSV41_SHARED_FINALIZE 0
 #endif
+#ifndef DSV41_DIAGONAL_FINALIZE
+#define DSV41_DIAGONAL_FINALIZE 0
+#endif
 // Scale the six W2 FP32 rows, preserve each row's BF16 boundary, and reduce
 // them in routing order without materializing the six-row BF16 tensor.
-void main(tensor product, tensor ids, tensor activation_scale, tensor channel,
-          tensor output
-#if DSV41_SHARED_FINALIZE
-          , tensor shared
+void main(tensor product,
+#if DSV41_DIAGONAL_FINALIZE
+          tensor product_second,
 #endif
-)
+          tensor ids, tensor activation_scale, tensor channel,
+#if DSV41_SHARED_FINALIZE
+          tensor shared,
+#endif
+          tensor output)
 {
     const int5 start = get_index_space_offset();
     const int5 end = start + get_index_space_size();
@@ -28,10 +34,25 @@ void main(tensor product, tensor ids, tensor activation_scale, tensor channel,
             const bool valid = expert >= 0 && expert < experts;
             const float sx = s_f32_ld_g(
                 gen_addr((int5){0, row}, activation_scale));
+#if DSV41_DIAGONAL_FINALIZE
+            // Each ordinary GEMM emits three rows against three horizontal
+            // weight blocks. Consume only the expert's matching diagonal.
+            const int column = n + (slot % 3) * get_dim_size(output, 0);
+            const int local_row = slot % 3;
+            float64 low_acc, high_acc;
+            if (slot < 3) {
+                low_acc = v_f32_ld_tnsr_b((int5){column, local_row}, product);
+                high_acc = v_f32_ld_tnsr_b((int5){column + 64, local_row}, product);
+            } else {
+                low_acc = v_f32_ld_tnsr_b((int5){column, local_row}, product_second);
+                high_acc = v_f32_ld_tnsr_b((int5){column + 64, local_row}, product_second);
+            }
+#else
             const float64 low_acc = v_f32_ld_tnsr_b(
                 (int5){n, 0, row}, product);
             const float64 high_acc = v_f32_ld_tnsr_b(
                 (int5){n + 64, 0, row}, product);
+#endif
             const uint64 low_scale_bits = v_u32_ld_tnsr_b(
                 (int5){n % 256, n / 256, expert}, channel,
                 SW_UNPACK | SW_UNPCK_16_TO_32, (uint64){0}, valid) << 16;

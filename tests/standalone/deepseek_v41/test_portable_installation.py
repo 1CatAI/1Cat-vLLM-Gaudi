@@ -191,3 +191,10 @@ def test_raw_trace_configuration_rejected_before_model_loading():
         module.validate_raw_trace_profile({"environment": {
             "VLLM_HPU_DSV41_RAW_TRACE": "1", "HABANA_PROF_CONFIG": "/unused"}})
     module.validate_raw_trace_profile({"environment": {"VLLM_HPU_DSV41_RAW_TRACE": "0"}})
+
+
+@pytest.mark.parametrize("key", ["DUMP_PRE_GRAPHS", "DUMP_POST_GRAPHS"])
+def test_zero_dump_directory_rejected_before_model_loading(key):
+    module = tool("serve_deepseek_v41")
+    with pytest.raises(ValueError, match="dump directory"):
+        module.validate_raw_trace_profile({"environment": {key: "0"}})

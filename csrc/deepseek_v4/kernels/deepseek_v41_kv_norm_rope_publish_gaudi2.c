@@ -46,11 +46,21 @@ static inline float64_pair_t kv_bf16_to_f32_linear(bfloat128 input) {
 #define DSV41_OPTIONAL_DECODED_KV_WRITE 1
 #include "deepseek_v41_swa_pack.h"
 
+#ifdef DSV41_KV_PUBLISH_FUNCTION
+static inline void kv_norm_publish_groups(tensor input, tensor weight, tensor positions, tensor phase,
+#else
 void main(tensor input, tensor weight, tensor positions, tensor phase,
+#endif
           tensor cache, tensor decoded, tensor output, tensor completion,
-          float epsilon, float inverse_width, int decoded_offset) {
+          float epsilon, float inverse_width, int decoded_offset
+#ifdef DSV41_KV_PUBLISH_FUNCTION
+          , const int5 begin, const int5 end
+#endif
+          ) {
+#ifndef DSV41_KV_PUBLISH_FUNCTION
     const int5 begin = get_index_space_offset();
     const int5 end = begin + get_index_space_size();
+#endif
     bfloat128 cached[4];
     for (int group = begin[0]; group < end[0]; ++group) {
         const int row = 0;

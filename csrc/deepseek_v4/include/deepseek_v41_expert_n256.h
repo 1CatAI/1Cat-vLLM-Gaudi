@@ -57,11 +57,17 @@ static inline ushort128 exact_bf16(ushort128 nibble, ushort128 code)
 }
 
 #if DSV41_N256_SAT_DECODE
+static inline uchar256 decode_sat_values(uchar256 weights,uchar256 table,uchar256 subtract) {
+    const uchar256 direction=weights|0x80;
+    const uchar256 base=v_u8_shuffle_b(table,direction,0,direction);
+    return v_u8_sub_b(base,subtract,SW_SAT);
+}
+#endif
+
+#if DSV41_N256_SAT_DECODE
 // Reuse the C2-C6 SAT decoder: offsets qualified in [-40,48].
 #define DSV41_N256_STORE(WEIGHTS) do { \
-    const uchar256 direction = (WEIGHTS) | 0x80; \
-    const uchar256 base = v_u8_shuffle_b(table, direction, 0, direction); \
-    const uchar256 encoded = v_u8_sub_b(base, subtract, SW_SAT); \
+    const uchar256 encoded = decode_sat_values((WEIGHTS),table,subtract); \
     DSV41_N256_WRITE(encoded); \
     destination[1] += 1; \
 } while (0)
@@ -75,10 +81,16 @@ static inline ushort128 exact_bf16(ushort128 nibble, ushort128 code)
 } while (0)
 #endif
 
+#ifdef DSV41_N256_PAIRED_FUNCTION
+static inline void decode_paired_half(tensor ids, tensor q16, tensor planes, tensor lookup, tensor output,
+                                     const int5 start, const int5 end)
+{
+#else
 void main(tensor ids, tensor q16, tensor planes, tensor lookup, tensor output)
 {
     const int5 start = get_index_space_offset();
     const int5 end = start + get_index_space_size();
+#endif
     const int experts = get_dim_size(q16, 2);
     const bool compact_scales = get_dim_size(planes, 0) == get_dim_size(q16, 0) / 16 + 128;
     const int scale_stride = compact_scales ? 128 : 256;

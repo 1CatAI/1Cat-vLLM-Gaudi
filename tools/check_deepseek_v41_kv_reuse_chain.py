@@ -14,23 +14,34 @@ import statistics
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--wait-measurement-file',type=Path,help='Prepare native plans, then wait for the shared service timing window to finish')
+    parser.add_argument('--mla-publish',action='store_true',help='Exercise and retain shared-row/mask publication in the projection chain')
+    parser.add_argument('--mla-projection',action='store_true',help='Fuse shared-main PV cast/inverse-RoPE/WO quant with both MME projections')
+    parser.add_argument('--peer-post-norm',action='store_true',help='Fuse qualified peer/post collapse with FFN norm/quant; QKV stays fixed')
+    parser.add_argument('--rope-handoff', action='store_true', help='Combine inverse RoPE/WO quant and WO scale/dense quant as one module; requires --woa-handoff')
+    parser.add_argument('--phase-rows', type=int, default=32768)
+    parser.add_argument('--woa-handoff',action='store_true',help='Compare fused WO scale/roundtrip/dense quant with joint QKV held fixed')
+    parser.add_argument('--qkv-fusion',action='store_true',help='Fuse Q preparation with KV publication before Q MME')
     parser.add_argument('--prepared', type=Path, required=True)
     parser.add_argument('--sidecar', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--steps', type=int, default=200)
-    parser.add_argument('--chain-repeats', type=int, default=16)
+    parser.add_argument('--chain-repeats', type=int, default=128,
+                        help='Keep each native device interval near a full token to amortize rank enqueue skew')
     parser.add_argument('--retirement-only', action='store_true',
                         help='Reuse measured A/B; check teardown without timing')
     args = parser.parse_args()
+    if args.mla_publish and not args.mla_projection:
+        parser.error("--mla-publish requires --mla-projection")
+    if args.rope_handoff and not args.woa_handoff:
+        parser.error("--rope-handoff requires --woa-handoff")
     rank = int(os.environ['LOCAL_RANK'])
     modules = os.environ['HABANA_VISIBLE_MODULES'].split(',')
     os.environ['HLS_MODULE_ID'] = modules[rank]
     if os.environ.get('DSV41_MICRO_RANK_CPUS'):
         os.sched_setaffinity(0, json.loads(os.environ['DSV41_MICRO_RANK_CPUS'])[rank])
-    if os.environ.get('GRAPH_VISUALIZATION') == '1':
-        graph_dir = args.output.resolve() / 'graphs' / f'rank{rank}'
-        graph_dir.mkdir(parents=True, exist_ok=True)
-        os.environ['PT_HPU_GRAPH_DUMP_PREFIX'] = str(graph_dir)
+    from tools.deepseek_v41_physical_audit import prepare_physical_audit
+    prepare_physical_audit(args, rank)
     import torch
     import habana_frameworks.torch.core  # noqa: F401
     from safetensors import safe_open
@@ -42,13 +53,16 @@ def main():
     from vllm_gaudi.ops.deepseek_v41_shard_loader import PreparedV41Shard
     from vllm_gaudi.ops.deepseek_v41_math import hc_pre
     from tools.deepseek_v41_micro_replay import RecipeRecorder
-    from tools.deepseek_v41_resident_ab import graph_compilation_count
+    from tools.deepseek_v41_resident_ab import graph_compilation_count, wait_for_loading
 
     torch.set_num_threads(1)
     torch.hpu.set_device(rank)
     root = args.output.resolve()
     directory = root / f'rank{rank}'
     directory.mkdir(parents=True, exist_ok=True)
+    (directory/"result.json").write_text('{"status":"started"}\n')
+    if rank == 0:
+        (root/"result.json").write_text('{"status":"started"}\n')
     config = set_current_vllm_config(VllmConfig(parallel_config=ParallelConfig(tensor_parallel_size=4)))
     config.__enter__()
     init_distributed_environment(world_size=4, rank=rank, distributed_init_method='env://',
@@ -82,10 +96,15 @@ def main():
     weight_b = output_sidecar.tensor(f'layers.{layer}.attn.wo_b.weight', 'hpu')
     scale_b = output_sidecar.tensor(f'layers.{layer}.attn.wo_b.channel_scale', 'hpu')
     ffn_norm = shard.tensor(f'layers.{layer}.ffn_norm.weight', 'hpu')
+    if args.peer_post_norm:
+        downstream_control=shard.tensor(f'layers.{layer}.hc_ffn_fn','hpu')
+        downstream_scale=shard.tensor(f'layers.{layer}.hc_ffn_scale','hpu')
+        downstream_base=shard.tensor(f'layers.{layer}.hc_ffn_base','hpu')
+        downstream_router=shard.tensor(f'layers.{layer}.ffn.gate.weight','hpu')
     control, control_scale, control_base = [shard.tensor(f'layers.{layer}.hc_attn_{name}', 'cpu')
                                           for name in ('fn','scale','base')]
     scaling = config_values['rope_scaling']
-    table = rotary_table(64, 32768, config_values['compress_rope_theta'],
+    table = rotary_table(64, args.phase_rows, config_values['compress_rope_theta'],
                          scaling['original_max_position_embeddings'],scaling['factor'],
                          scaling['beta_fast'],scaling['beta_slow'])
     phase = torch.cat((table[...,0],table[...,1]),-1).contiguous().to('hpu')
@@ -100,6 +119,11 @@ def main():
                       for token in (17, 41, 128, 512, 1024)]
     base_hidden=embeddings[0][:,:512].clone()
     main_values=base_hidden.reshape(1,1,512).expand(1,640,512).contiguous().to('hpu')
+    if args.mla_publish:
+        from vllm_gaudi.ops.deepseek_v41_math import pack_fp4
+        packed_main=pack_fp4(main_values[0],16).contiguous()
+        selected_rows=torch.arange(512,dtype=torch.int32,device='hpu').reshape(1,512)
+        page_table=torch.arange(4096,dtype=torch.int32,device='hpu')
     history=torch.cat([embeddings[i%5][:,:512] for i in range(256)],0).contiguous().to('hpu')
     base_cache=torch.ops.custom_op.custom_deepseek_v41_swa_pack_bf16_gaudi2(history)
     fixtures=[]
@@ -118,6 +142,7 @@ def main():
         query=torch.ops.custom_op.custom_deepseek_v41_q_norm_projection_rope_gaudi2(
             qr,qnorm,qb,sqb,pos,phase,1e-20).reshape(1,heads,512)
         return query,raw
+    decoded_unused=torch.zeros((512,512),dtype=torch.bfloat16,device='hpu')
     state=[]
     def consume(q,raw,norm,pos,phase,cache,main,mask,sink,scale,lens,wa,sa,wb,sb,*,fused):
         if fused:
@@ -134,19 +159,69 @@ def main():
         out=torch.ops.custom_op.custom_deepseek_v41_dense_fp8_gaudi2(out,wb,sb)
         return out
     def full_chain(x,weight,channel,pos,qnorm,qb,sqb,phase,norm,cache,main,mask,sink,scale,lens,wa,sa,wb,sb,*,fused):
+        if (fused and args.qkv_fusion) or args.woa_handoff or args.peer_post_norm or args.mla_projection:
+            projection=direct_dense_fp8(x,weight,channel)
+            q,kv,completion,qr=torch.ops.custom_op.custom_deepseek_v41_qkv_projection_publish_gaudi2(
+                projection[:,:1280].contiguous(),qnorm,projection[:,1280:].contiguous(),norm,
+                pos,phase,cache,decoded_unused,qb,sqb,1e-20,-1)
+            pos=completion[:1]
+            if args.mla_publish:
+                if fused:
+                    return torch.ops.custom_op.custom_deepseek_v41_main_publish_projection_gaudi2(
+                        q.reshape(1,heads,512),cache,packed_main,selected_rows,pos,page_table,
+                        sink,scale,lens,1,wa,sa,phase,wb,sb)
+                out,published_rows,published_mask=torch.ops.custom_op.custom_deepseek_v41_main_publish_mla_gaudi2(
+                    q.reshape(1,heads,512),cache,packed_main,selected_rows,pos,page_table,sink,scale,lens,1)
+            else:
+                if args.mla_projection and fused:
+                    return torch.ops.custom_op.custom_deepseek_v41_main_reuse_projection_gaudi2(
+                        q.reshape(1,heads,512),cache,main,mask,pos,sink,scale,lens,wa,sa,phase,wb,sb)
+                out=torch.ops.custom_op.custom_deepseek_v41_main_reuse_mla_gaudi2(
+                    q.reshape(1,heads,512),cache,main,mask,pos,sink,scale,lens)
+            if args.woa_handoff and args.rope_handoff and fused:
+                return torch.ops.custom_op.custom_deepseek_v41_rope_woa_wob_roundtrip_fp8_gaudi2(
+                    out,wa,sa,wb,sb,pos,phase)
+            out=torch.ops.custom_op.custom_deepseek_v41_rope_inverse_bf16_gaudi2(out,pos,phase)
+            if args.woa_handoff and fused:
+                return torch.ops.custom_op.custom_deepseek_v41_woa_wob_roundtrip_fp8_gaudi2(
+                    out.reshape(1,heads//8,4096),wa,sa,wb,sb)
+            out=torch.ops.custom_op.custom_deepseek_v41_woa_fp8_roundtrip_gaudi2(out.reshape(1,heads//8,4096),wa,sa)
+            partial=torch.ops.custom_op.custom_deepseek_v41_dense_fp8_gaudi2(out,wb,sb)
+            return (partial,published_rows,published_mask) if args.mla_publish else partial
         q,raw=project(x,weight,channel,pos,qnorm,qb,sqb,phase)
         return consume(q,raw,norm,pos,phase,cache,main,mask,sink,scale,lens,wa,sa,wb,sb,fused=fused)
     consumers=[compiled(lambda *args,fused=fused:full_chain(*args,fused=fused)) for fused in (False,True)]
-    def finish(peers,residual,post,comb,pre,norm):
+    def post_consumers(residual,collapsed,normalized,quantized,scale):
+        # Retain both downstream dependency branches. The control projection
+        # consumes the updated residual; the router consumes the normalized
+        # row. A fused producer must not claim time saved by delaying either.
+        control=torch.ops.custom_op.custom_deepseek_v41_control_gemv_rrms_bf16_gaudi2(
+            residual.flatten(1).contiguous(),downstream_control,1e-20)
+        gates=torch.ops.custom_op.custom_deepseek_v41_mhc_gates_f32_gaudi2(
+            control[:,:24].contiguous(),control[:,24:].contiguous(),downstream_scale,downstream_base)
+        logits=torch.ops.custom_op.custom_deepseek_v41_bf16_linear_f32_gaudi2(normalized,downstream_router)
+        return residual,collapsed,normalized,quantized,scale,control,gates,logits
+
+    def finish(peers,residual,post,comb,pre,norm,*,fused):
+        if args.peer_post_norm:
+            if fused:
+                outputs=torch.ops.custom_op.custom_deepseek_v41_peer_post_norm_quant_gaudi2(
+                    peers,residual,post,comb,pre,norm,1e-20)
+                return post_consumers(*outputs)
+            residual,collapsed=torch.ops.custom_op.custom_deepseek_v41_mhc_post_collapse_gaudi2(
+                peers,residual,post,comb,pre)
+            normalized,quantized,scale=torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
+                collapsed,norm,1e-20)
+            return post_consumers(residual,collapsed,normalized,quantized,scale)
         value=peers[0].float()
         for rank_id in range(1,4):value=value+peers[rank_id].float()
         residual,collapsed=torch.ops.custom_op.custom_deepseek_v41_mhc_post_collapse_gaudi2(
             value.bfloat16(),residual,post,comb,pre)
         normalized,quantized,scale=torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(collapsed,norm,1e-20)
         return residual,collapsed,normalized,quantized,scale
-    finisher=compiled(finish)
+    finishers=[compiled(lambda *args,fused=fused:finish(*args,fused=fused)) for fused in (False,True)]
     plans, graphs, visible, externals = [], [], [], []
-    for consumer in consumers:
+    for consumer,finisher in zip(consumers,finishers,strict=True):
         plan = bridge.PreparedGroupPlan()
         slots, tensors, external = {}, {}, []
 
@@ -183,9 +258,13 @@ def main():
         cache=base_cache.clone();state.append(cache)
         output=compute(consumer,(x,weight,channel,position,qnorm,qb,sqb,phase,norm,cache,main_values,shared_mask,
                                 sink,softmax_scale,lengths,weight_a,scale_a,weight_b,scale_b))
+        publication=()
+        if args.mla_publish:
+            output,*publication=output
         peers=torch.ops.vllm_gaudi.tp_peer_allgather(output,4)
         torch.hpu.synchronize();plan.add_all_gather(slot(output,False),slot(peers,False))
         outputs=(output,)+tuple(compute(finisher,(peers.reshape(4,1,5120),residual,post,comb,pre,ffn_norm)))
+        outputs=outputs+tuple(publication)
         plan.prepare(backend, [slot(value, False) for value in outputs])
         graph = bridge.NativeDecodeGraph()
         graph.configure_topology(args.chain_repeats,args.chain_repeats,False)
@@ -214,6 +293,16 @@ def main():
             torch.save(dict(fixture=fixture, observed=observed), directory/'failure.pt')
             raise RuntimeError(f'KV publication differs for input {index}: {exact}')
         checks.append(dict(input=index, all_outputs_exact=True))
+    (directory/"result.json").write_text(json.dumps(dict(status="correctness_passed",checks=checks))+"\n")
+    if args.wait_measurement_file is not None:
+        import time
+        torch.distributed.barrier()
+        if rank == 0:
+            args.wait_measurement_file.with_suffix('.ready.json').write_text(
+                json.dumps(dict(status='correctness_and_native_capture_ready',checks=checks),indent=2)+'\n')
+        while not args.wait_measurement_file.exists():
+            time.sleep(2)
+        torch.distributed.barrier()
     for graph in graphs:
         for _ in range(20):
             graph.replay_fixed_with_completion().synchronize()
@@ -221,6 +310,7 @@ def main():
     periods = []
     tickets, events = [], []
     for label in '' if args.retirement_only else 'ABABAB':
+        wait_for_loading(directory,rank,torch.distributed)
         graph = graphs[label == 'B']
         events = [(torch.hpu.Event(enable_timing=True), torch.hpu.Event(enable_timing=True))
                   for _ in range(args.steps)]
@@ -236,6 +326,9 @@ def main():
         torch.distributed.all_gather_object(ranks, local)
         periods.append(dict(arm=label, rank_device_ms=ranks,
                             median_ms=statistics.median(max(values) for values in zip(*ranks, strict=True))))
+        (directory/'result.json').write_text(json.dumps(dict(status='measuring',checks=checks,periods=periods))+'\n')
+        if rank == 0:
+            print(json.dumps(dict(arm=label,median_ms=periods[-1]['median_ms'])),flush=True)
     if graph_compilation_count() != compiled_before:
         raise RuntimeError('Hot compilation invalidates timing')
     savings = [a['median_ms']-b['median_ms'] for a, b in zip(periods[::2], periods[1::2], strict=True)]
@@ -245,6 +338,7 @@ def main():
                   three_consistent_rounds=bool(savings) and all(value > 0 for value in savings),
                   full_model_gain_credit=False, physical_node_gate_pending=True,chain_repeats=args.chain_repeats,
                   production_compiler_static_coordinates=True,full_qkv_query_producer=True,
+                  candidate_kind="main_publish_projection" if args.mla_publish else "main_reuse_projection" if args.mla_projection else "rope_woa_handoff" if args.rope_handoff else "peer_post_norm" if args.peer_post_norm else "woa_handoff" if args.woa_handoff else "qkv_joint" if args.qkv_fusion else "kv_reuse",
                   input_source=__doc__, native_replay=True,
                   native_library_sha256=hashlib.sha256(Path(os.environ['VLLM_HPU_DSV4_TPC_OP_LIBRARY']).read_bytes()).hexdigest())
     (directory/'result.json').write_text(json.dumps(result, indent=2)+'\n')
@@ -265,6 +359,7 @@ def main():
     graph = plan = slot = compute = None
     consumer = finisher = None
     consumers.clear()
+    finishers.clear()
     recorder.backend = None
     for attribute in ('_vllm_gaudi_tp2_fused_ar_norm_runtime', '_vllm_gaudi_tp4_allreduce_runtime'):
         if hasattr(torch, attribute):

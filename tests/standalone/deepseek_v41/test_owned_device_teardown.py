@@ -72,3 +72,56 @@ def test_maps_compute_handle_to_physical_module(monkeypatch, tmp_path):
     monkeypatch.setattr(devices.subprocess, 'run', run)
     assert devices.device_owners(2, sysfs=tmp_path/'sysfs', device_root=tmp_path/'devices') == [123, 456]
     assert calls == [['fuser', str(tmp_path/'devices/accel0')]]
+
+
+def test_lease_respects_all_existing_aliases_and_releases(monkeypatch, tmp_path):
+    import fcntl
+    load = '0, 768 MiB, 0 %\n1, 768 MiB, 0 %\n'
+    monkeypatch.setattr(devices.subprocess, 'check_output', lambda *a, **k: load)
+    monkeypatch.setattr(devices, 'device_owners', lambda _: [])
+    # The original default function in wait_for_free_modules is bound at import.
+    select = devices.wait_for_free_modules
+    monkeypatch.setattr(devices, 'wait_for_free_modules',
+                        lambda *a, **k: select(*a, **k, owners=lambda _: []))
+    lock_dir = tmp_path / 'locks'
+    lock_dir.mkdir()
+    with (lock_dir / 'gaudi-module0.lock').open('a+') as other:
+        fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with devices.lease_free_modules(tmp_path / 'lease.json', lock_dir=lock_dir,
+                                         count=1, preferred=(0,)) as (selected, _):
+            assert selected == (1,)
+            for name in ('module-1.lock', 'module1.lock', 'gaudi-module1.lock'):
+                with (lock_dir / name).open('a+') as probe:
+                    with pytest.raises(BlockingIOError):
+                        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with (lock_dir / 'module1.lock').open('a+') as probe:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with devices.lease_free_modules(tmp_path / 'second.json', lock_dir=lock_dir,
+                                     count=1, preferred=(0,)) as (selected, _):
+        assert selected == (0,)
+
+
+def test_retirement_checks_identity_and_separate_sessions(monkeypatch):
+    from types import SimpleNamespace
+    rows = {10: ('S', 1, 10, 100), 11: ('S', 1, 11, 110),
+            12: ('S', 1, 12, 999)}  # PID reused by foreign task.
+    signals = []
+    def kill(pid, sig):
+        signals.append((pid, sig))
+        rows.pop(pid)
+    monkeypatch.setattr(devices, '_process_identity', rows.get)
+    monkeypatch.setattr(devices.os, 'kill', kill)
+    process = SimpleNamespace(pid=10, poll=lambda: 0, wait=lambda: 0)
+    devices.retire_process_group(process, owned={10:100, 11:110, 12:120})
+    assert [pid for pid, sig in signals] == [10, 11]
+    assert 12 in rows
+
+
+def test_retirement_does_not_silently_release_live_worker(monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr(devices, '_process_identity',
+                        lambda pid: ('D', 1, pid, pid*10))
+    monkeypatch.setattr(devices.os, 'kill', lambda *args: None)
+    process = SimpleNamespace(pid=10, poll=lambda: 0, wait=lambda: 0)
+    with pytest.raises(RuntimeError, match='still retiring'):
+        devices.retire_process_group(process, owned={10:100, 11:110}, grace_s=0)

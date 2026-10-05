@@ -121,6 +121,9 @@ def maintain_affinity(pid, settings):
 
 def validate_raw_trace_profile(profile):
     environment = profile.get("environment", {})
+    for key in ("DUMP_PRE_GRAPHS", "DUMP_POST_GRAPHS"):
+        if environment.get(key) == "0":
+            raise ValueError(f"{key}=0 is a dump directory, not disabled; remove the variable")
     if environment.get("VLLM_HPU_DSV41_RAW_TRACE", "0") != "1":
         return
     if not environment.get("HABANA_PROF_CONFIG") or environment.get("HABANA_PROFILE_WRITE_HLTV") != "1":
@@ -172,7 +175,8 @@ def main():
     if compiler_temp:
         environment["TMPDIR"] = compiler_temp
     for key in list(environment):
-        if key.startswith(("VLLM_HPU_DSV", "VLLM_HPU_TP2", "DSV41_")) or key in ("PYTHONPATH", "LD_PRELOAD"):
+        if key.startswith(("VLLM_HPU_DSV", "VLLM_HPU_TP2", "DSV41_", "DUMP_")) or key in (
+                "PYTHONPATH", "LD_PRELOAD", "GRAPH_VISUALIZATION", "GRAPH_VISUALIZATION_DIR", "PT_HPU_GRAPH_DUMP_PREFIX"):
             environment.pop(key)
     environment["VLLM_ENGINE_READY_TIMEOUT_S"] = "3600"
     environment["PYTHONUNBUFFERED"] = "1"

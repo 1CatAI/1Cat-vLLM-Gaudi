@@ -31,10 +31,10 @@ tpc_lib_api::GlueCodeReturn DeepseekV41KvNormReuseGatherGaudi2::GetGcDefinitions
        !match(in->outputTensors[1],DATA_F32,{512,640,1}) ||
        !match(in->outputTensors[2],DATA_F32,{640,1}))return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
     out->indexSpaceRank=2;out->indexSpaceGeometry[0]=4;out->indexSpaceGeometry[1]=640;
-    // Spread the four FCD owners first, then split independent row ranges.
-    // The current row's four codecs/norm tiles run on different TPCs.
-    out->preferredSplitDim=1;
-    for(unsigned i:{0u,2u,3u,6u,7u})out->inputTensorAccessPattern[i].allRequired=true;
+    // Distribute independent rows first: four feature owners alone underfill
+    // the 24 TPCs. Each selected row can be consumed independently.
+    out->preferredSplitDim=2;
+    for(unsigned i:{0u,1u,2u,3u,6u,7u})out->inputTensorAccessPattern[i].allRequired=true;
     map(out->inputTensorAccessPattern[1],0,0,128,127);
     map(out->inputTensorAccessPattern[4],0,0,128,127);
     map(out->inputTensorAccessPattern[4],1,1,1,0);

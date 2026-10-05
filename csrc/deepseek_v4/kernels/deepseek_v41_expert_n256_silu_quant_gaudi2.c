@@ -55,15 +55,24 @@ static inline float64 activated_half(tensor product, tensor channel, int n, int 
     return v_f32_mul_b(v_f32_mul_b(silu, up), route);
 }
 
+#ifndef DSV41_SILU_QUANT_ROW_TILE
+#define DSV41_SILU_QUANT_ROW_TILE 1
+#endif
+
+#ifdef DSV41_SILU_QUANT_FUNCTION
+static inline void silu_quant_rows(tensor product, tensor ids, tensor activation_scale, tensor channel, tensor router,
+                                  tensor output, tensor scales, const int5 start, const int5 end) {
+#else
 void main(tensor product, tensor ids, tensor activation_scale, tensor channel, tensor router,
           tensor output, tensor scales) {
     const int5 start = get_index_space_offset();
     const int5 end = start + get_index_space_size();
+#endif
     const int width = get_dim_size(output, 0);
     const int experts = get_dim_size(channel, 2);
     const int scale_rows = get_dim_size(activation_scale, 1);
     bfloat128 activated[20];
-    for (int row = start[0]; row < end[0]; ++row) {
+    for (int row = start[0]*DSV41_SILU_QUANT_ROW_TILE; row < end[0]*DSV41_SILU_QUANT_ROW_TILE; ++row) {
         const float sx = s_f32_ld_g(gen_addr((int5){0, scale_rows == 1 ? 0 : row}, activation_scale));
         const int expert = s_i32_ld_g(gen_addr((int5){row}, ids));
         const bool valid = expert >= 0 && expert < experts;

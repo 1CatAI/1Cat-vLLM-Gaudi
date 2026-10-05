@@ -81,9 +81,11 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_FLASHINFER_PREFILL: bool = False
     VLLM_HPU_DSV41_EXPERT_FUSED_QUANT: bool = False
     VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE: bool = False
+    VLLM_HPU_DSV41_EXPERT_W2_THREE_ROUTES: bool = False
     VLLM_HPU_DSV41_EXPERT_TOKEN_WIDE: bool = False
     VLLM_HPU_DSV41_KV_REUSE_FUSION: bool = False
     VLLM_HPU_DSV41_COMPRESSOR_FUSED_PUBLISH: bool = False
+    VLLM_HPU_DSV41_QKV_FUSED_PROLOGUE: bool = False
     VLLM_HPU_DSV41_ATTN_FUSED_PROLOGUE: bool = False
     VLLM_HPU_DSV41_CONCURRENT_MOE_ROWS: int = 0
     VLLM_HPU_DSV41_MLA_MME: bool = False
@@ -117,6 +119,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_FIXED_POSITIONS: bool = False
     VLLM_HPU_DSV41_PACKED_PP: bool = False
     VLLM_HPU_DSV41_TPC_MHC: bool = False
+    VLLM_HPU_DSV41_MHC_DEFERRED_GATES: bool = False
     VLLM_HPU_DSV41_MHC_MME_GATES_NORM: bool = False
     VLLM_HPU_DSV41_MHC_CONTROL_RRMS: bool = False
     VLLM_HPU_DSV41_MHC_GATES_FUSED: bool = False
@@ -154,11 +157,15 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_FP8_SIDECAR: str = ""
     VLLM_HPU_DSV41_FP8_CONFIG: str = ""
     VLLM_HPU_DSV41_WO_A_FP8: bool = False
-    VLLM_HPU_DSV41_MAIN_MLA_PROJECTION: bool = False
     VLLM_HPU_DSV41_STATIC_COORDINATES: bool = False
+    VLLM_HPU_DSV41_SHARED_COORDINATES: bool = False
+    VLLM_HPU_DSV41_CANDIDATE_COORDINATES: bool = False
     VLLM_HPU_DSV41_MERGE_LOCAL_SEGMENTS: bool = False
     VLLM_HPU_DSV41_ORDERED_PEER_SUM: bool = False
     VLLM_HPU_DSV41_PEER_POST_COLLAPSE: bool = False
+    VLLM_HPU_DSV41_PEER_POST_NORM: bool = False
+    VLLM_HPU_DSV41_MAIN_MLA_PROJECTION: bool = False
+    VLLM_HPU_DSV41_WOA_DENSE_HANDOFF: bool = False
     VLLM_HPU_DSV41_DEVICE_SAMPLING: bool = False
     VLLM_HPU_DSV41_DEVICE_NEXT_POSITION: bool = False
     VLLM_HPU_DSV41_DEVICE_INPUT_FEEDBACK: bool = False
@@ -547,8 +554,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_KV_REUSE_FUSION", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_COMPRESSOR_FUSED_PUBLISH":
     lambda: os.environ.get("VLLM_HPU_DSV41_COMPRESSOR_FUSED_PUBLISH", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_QKV_FUSED_PROLOGUE":
+    lambda: os.environ.get("VLLM_HPU_DSV41_QKV_FUSED_PROLOGUE", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_ATTN_FUSED_PROLOGUE":
     lambda: os.environ.get("VLLM_HPU_DSV41_ATTN_FUSED_PROLOGUE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_EXPERT_W2_THREE_ROUTES":
+    lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_W2_THREE_ROUTES", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_EXPERT_TOKEN_WIDE":
     lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_TOKEN_WIDE", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE":
@@ -616,6 +627,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_PACKED_PP", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_TPC_MHC":
     lambda: os.environ.get("VLLM_HPU_DSV41_TPC_MHC", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_MHC_DEFERRED_GATES":
+    lambda: os.environ.get("VLLM_HPU_DSV41_MHC_DEFERRED_GATES", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_MME_GATES_NORM":
     lambda: os.environ.get("VLLM_HPU_DSV41_MHC_MME_GATES_NORM", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_CONTROL_RRMS":
@@ -700,12 +713,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_DEVICE_INPUT_FEEDBACK", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_SAMPLING_PREFIX_HANDOFF":
     lambda: os.environ.get("VLLM_HPU_DSV41_SAMPLING_PREFIX_HANDOFF", "0").lower() in ("1", "true"),
-    "VLLM_HPU_DSV41_MAIN_MLA_PROJECTION":
-    lambda: os.environ.get("VLLM_HPU_DSV41_MAIN_MLA_PROJECTION", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_CANDIDATE_COORDINATES":
+    lambda: os.environ.get("VLLM_HPU_DSV41_CANDIDATE_COORDINATES", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_SHARED_COORDINATES":
+    lambda: os.environ.get("VLLM_HPU_DSV41_SHARED_COORDINATES", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_STATIC_COORDINATES":
     lambda: os.environ.get("VLLM_HPU_DSV41_STATIC_COORDINATES", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_ORDERED_PEER_SUM":
     lambda: os.environ.get("VLLM_HPU_DSV41_ORDERED_PEER_SUM", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_PEER_POST_NORM":
+    lambda: os.environ.get("VLLM_HPU_DSV41_PEER_POST_NORM", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_MAIN_MLA_PROJECTION":
+    lambda: os.environ.get("VLLM_HPU_DSV41_MAIN_MLA_PROJECTION", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_WOA_DENSE_HANDOFF":
+    lambda: os.environ.get("VLLM_HPU_DSV41_WOA_DENSE_HANDOFF", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_PEER_POST_COLLAPSE":
     lambda: os.environ.get("VLLM_HPU_DSV41_PEER_POST_COLLAPSE", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MERGE_LOCAL_SEGMENTS":

@@ -162,3 +162,58 @@ def retain_integer_constants(module, *, device_type='hpu'):
         module.graph.lint()
         module.recompile()
     return dict(replaced_operands=len(changed), resident_constants=len(constants), nodes=changed)
+
+
+def retain_integer_clamp_bounds(module, *, device_type='hpu'):
+    """Keep address bounds as I32 inputs to the stock gather/MME pipeline.
+
+    Scalar clamp lowers through a complex node with internally materialized
+    bounds. Tensor bounds preserve that clamp and its SRAM consumer while
+    avoiding literal I64 construction. Only immutable in-range I32 bounds
+    qualify; floating, dynamic and mutable clamps retain their original path.
+    """
+    changed, constants = [], {}
+    variants = {torch.ops.aten.clamp.default: ('min', 'max'),
+                torch.ops.aten.clamp_min.default: ('min',),
+                torch.ops.aten.clamp_max.default: ('max',)}
+    for node in list(module.graph.nodes):
+        if node.op != 'call_function' or node.target not in variants or not node.args:
+            continue
+        source = node.args[0]
+        value = source.meta.get('val') if isinstance(source, torch.fx.Node) else None
+        if not isinstance(value, torch.Tensor) or value.dtype != torch.int32 or value.device.type != device_type:
+            continue
+        names = variants[node.target]
+        bounds = {name: node.args[index+1] if len(node.args)>index+1 else node.kwargs.get(name)
+                  for index, name in enumerate(names)}
+        if not any(v is not None for v in bounds.values()) or any(
+                v is not None and (type(v) is not int or not -(1 << 31) <= v < (1 << 31)) for v in bounds.values()):
+            continue
+        operands = {'min': None, 'max': None}
+        for name, literal in bounds.items():
+            if literal is None:
+                continue
+            key = (literal, value.device)
+            if key not in constants:
+                from torch._subclasses.fake_tensor import unset_fake_temporarily
+                with unset_fake_temporarily(), torch.inference_mode():
+                    resident = torch.tensor(literal, dtype=torch.int32, device=value.device)
+                attr = f'_decode_clamp_bound_{len(constants)}'
+                while hasattr(module, attr):
+                    attr += '_'
+                module.register_buffer(attr, resident, persistent=False)
+                with module.graph.inserting_before(node):
+                    constant = module.graph.get_attr(attr)
+                constant.meta = dict(val=value.new_empty(()), placement='eager',
+                    output_device=value.device, output_dtypes=[torch.int32], output_layouts=[torch.strided],
+                    output_shapes=[[]], output_strides=[()], output_offset=[0], output_contiguous=[True])
+                constants[key] = constant
+            operands[name] = constants[key]
+        node.target = torch.ops.aten.clamp.Tensor
+        node.args = (source, operands['min'], operands['max'])
+        node.kwargs = {}
+        changed.append(dict(node=node.name, bounds=bounds))
+    if changed:
+        module.graph.lint()
+        module.recompile()
+    return dict(replaced_clamps=len(changed), resident_bounds=len(constants), nodes=changed)

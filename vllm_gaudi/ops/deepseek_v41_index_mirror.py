@@ -95,11 +95,13 @@ def mirror_source_scores(query, weights, keys, positions, rows, ratio, local_hea
     return torch.cat(pieces, -1) if len(pieces) > 1 else pieces[0]
 
 
-def mirror_index_tile(query, weights, keys, positions, rows, ratio, local_heads):
+def mirror_index_tile(query, weights, keys, positions, rows, ratio, local_heads, *, safe_rows=None):
     """Retain original K128 products, BF16 shard sums and logical masking."""
     columns = rows.shape[-1]
     logical = rows.reshape(-1).to(torch.int32).contiguous()
-    safe = logical.clamp(0, keys.shape[0] - 1).long()
+    # A shared device producer may supply owned I32 gather coordinates. Keep
+    # the stock gather/MME bundle; the earlier custom gather lost SRAM speed.
+    safe = logical.clamp(0, keys.shape[0] - 1).long() if safe_rows is None else safe_rows.reshape(-1)
     selected = keys.index_select(0, safe)
     if columns % 128:
         padding = (-columns) % 128

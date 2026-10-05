@@ -430,6 +430,22 @@ def hc_pre(
     return collapsed, pre, post, comb
 
 
+def hc_control_and_collapse(residual, previous_pre, packed_fn, eps, *, collapsed_input=None):
+    """Keep the exact controller intact; postpone gates until the post consumer.
+
+    The packed 25-value output owns its storage across native recipe boundaries.
+    Its final value is the production RRMS, so the post kernel need not repeat
+    the residual reduction or change its FP32 sum order.
+    """
+    control = torch.ops.custom_op.custom_deepseek_v41_control_gemv_rrms_bf16_gaudi2(
+        residual.flatten(1).contiguous(), packed_fn, eps
+    )
+    collapsed = collapsed_input
+    if collapsed is None:
+        collapsed = (residual.float() * previous_pre.unsqueeze(-1)).sum(1).to(residual.dtype)
+    return collapsed, control
+
+
 def hc_post(value, residual, post, comb):
     mixed = (comb.unsqueeze(-1) * residual.float().unsqueeze(2)).sum(1)
     return (value.float().unsqueeze(1) * post.unsqueeze(-1) + mixed).to(value.dtype)

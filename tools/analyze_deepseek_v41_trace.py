@@ -83,7 +83,7 @@ def logical_replay_markers(inventory, expected):
     }
 
 
-def tp4_windows(inventory, phase, request_start_ns=None, native_coverage=None):
+def tp4_windows(inventory, phase, request_start_ns=None, native_coverage=None, position_window=None):
     """Use real sampled-token consumers, including host submission/wait time.
 
     Async workers publish their real completion-consumption marker separately
@@ -161,7 +161,13 @@ def tp4_windows(inventory, phase, request_start_ns=None, native_coverage=None):
                 continue
             if current["position"] != previous["position"] + previous["count"]:
                 continue
+            if position_window is not None and not position_window[0] <= current["position"] <= position_window[1]:
+                continue
             low, high = previous["end"], current["end"]
+            if (position_window is not None and
+                    (low < inventory.get("first_us", -float("inf")) or
+                     high > inventory.get("last_us", float("inf")))):
+                continue
             groups = []
             for begin, duration, name in inventory["cpu_markers"]:
                 match = re.fullmatch(r"v41::compiled::layers(\d+)-(\d+)::C1", name)
@@ -180,7 +186,14 @@ def tp4_windows(inventory, phase, request_start_ns=None, native_coverage=None):
                     and row[0] + row[1] <= high
                 ]
                 if len(target) != 1:
-                    continue
+                    # In the device feedback path, the previous commit queued
+                    # this stage. Require counter coverage plus an actual
+                    # completion consumed inside the current worker commit.
+                    consumed = any(name == f"v41::completion_consume::P{current['position']}"
+                                   and current["start"] <= begin and begin + duration <= high
+                                   for begin, duration, name in inventory["cpu_markers"])
+                    if not (native_coverage.get("device_loop_complete") and consumed and not target):
+                        continue
             elif sorted(groups) != [(start, start + 3) for start in range(0, 40, 4)]:
                 continue
             units.append(current["position"])
@@ -192,6 +205,8 @@ def tp4_windows(inventory, phase, request_start_ns=None, native_coverage=None):
             raise ValueError("No complete TP4 forty-layer decode cycle and sampled-token consumer")
         if units != list(range(units[0], units[-1] + 1)):
             raise ValueError("Missing an interior TP4 decode cycle; trace coverage is incomplete")
+        if position_window is not None and units != list(range(position_window[0], position_window[1] + 1)):
+            raise ValueError("Requested position subset lacks complete hardware/consumer windows")
     return dict(
         topology={"tensor_parallel_size": 4, "pipeline_parallel_size": 1},
         phase=phase,
@@ -235,7 +250,8 @@ def analyze(root, rank, phase=None, request_result=None):
         request_start_ns = None
         if request_result is not None:
             request = json.loads(request_result.read_text())
-            if request["status"] != "passed" or request["profile"] != phase:
+            if (request["status"] not in (("passed", "diagnostic_passed") if phase == "decode" else ("passed",))
+                    or request["profile"] != phase):
                 raise ValueError("Trace request does not have a matching successful phase")
             if phase == "prefill":
                 request_start_ns = request["request_start_ns"]
@@ -259,7 +275,20 @@ def analyze(root, rank, phase=None, request_result=None):
                 hot_prepares=0,
                 hot_captures=0,
             )
-        result = tp4_windows(inv, phase, request_start_ns, native_coverage)
+            queued = stats["v41"].get("device_loop_queued", 0) - before["v41"].get("device_loop_queued", 0)
+            if queued:
+                consumed = stats["v41"].get("device_loop_consumed", 0) - before["v41"].get("device_loop_consumed", 0)
+                targets = sum(bool(re.fullmatch(r"v41::target::PP0::decode::C1(?:::P\d+)?", row[2]))
+                              for row in inv["cpu_markers"])
+                repairs = sum(stats["v41"].get(key, 0) - before["v41"].get(key, 0)
+                              for key in ("device_loop_recomputes", "device_loop_discards", "device_sampling_fallbacks"))
+                if queued != consumed or queued + targets != steps or repairs:
+                    raise ValueError("Device-feedback trace needs exact queue/consume coverage without repairs")
+                native_coverage.update(device_loop_complete=True, queued=queued, consumed=consumed,
+                                       explicit_targets=targets, repairs=repairs)
+        position_window = (json.loads(collection.read_text()).get("decode_position_window")
+                           if collection.exists() and phase == "decode" else None)
+        result = tp4_windows(inv, phase, request_start_ns, native_coverage, position_window)
         if request_result is not None and phase == "prefill":
             if result["coverage_proof"]["prompt_tokens"] != request["usage"]["prompt_tokens"]:
                 raise ValueError("Prefill trace does not cover the complete measured prompt")

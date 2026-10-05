@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Reference contract for a shared token coordinate producer, not yet serving."""
+"""Shared token coordinate contract and experimental native replay producer."""
 import torch
 
 COORDINATE_WIDTH = 192
@@ -36,3 +36,16 @@ def decode_coordinates_reference(positions, input_ids, block_table):
     output[:, :16] = torch.where(active[:, None], output[:, :16], invalid)
     output[:, WINDOW_OFFSET:] = torch.where(active[:, None] & (absolute >= 0), absolute & 255, -1)
     return output
+
+
+def prepare_shared_decode_coordinates(positions, input_ids, block_table):
+    """Run inside the first captured layer group, after fixed roots are current.
+
+    Full owned outputs cross recipe boundaries; no partial-storage aliases or
+    host position snapshots are used. Canonical sampling roots stay untouched.
+    """
+    logical = positions.to(torch.int32).contiguous()
+    ids = input_ids.to(torch.int32).contiguous()
+    packed, ring, lengths, image = torch.ops.custom_op.custom_deepseek_v41_decode_metadata_gaudi2(
+        logical, ids, block_table)
+    return logical, image.bool(), ring.long(), lengths, packed

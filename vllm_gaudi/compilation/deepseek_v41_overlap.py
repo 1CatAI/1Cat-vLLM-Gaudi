@@ -299,7 +299,7 @@ def require_candidate_operators(graph, required):
     return counts
 
 
-def make_backend(*, static_int32=False, static_factories=False, split_mhc=True, required_operators=(),
+def make_backend(*, static_int32=False, static_factories=False, static_clamps=False, split_mhc=True, required_operators=(),
                  compiler_config=None):
     from habana_frameworks.torch.dynamo.compile_backend import passes
     from habana_frameworks.torch.dynamo.compile_backend.backends import hpu_backend
@@ -307,11 +307,12 @@ def make_backend(*, static_int32=False, static_factories=False, split_mhc=True, 
 
     def integer_constants(ctx):
         from vllm_gaudi.compilation.deepseek_v41_integer_constants import (
-            propagate_with_resident_buffers, retain_integer_constants, retain_static_factories)
+            propagate_with_resident_buffers, retain_integer_constants, retain_static_factories, retain_integer_clamp_bounds)
 
         audit = retain_integer_constants(ctx.graph_module)
         factories = retain_static_factories(ctx.graph_module) if static_factories else {'replaced_factories': 0}
-        changed = bool(audit['replaced_operands'] or factories['replaced_factories'])
+        clamps = retain_integer_clamp_bounds(ctx.graph_module) if static_clamps else {'replaced_clamps': 0}
+        changed = bool(audit['replaced_operands'] or factories['replaced_factories'] or clamps['replaced_clamps'])
         if changed:
             # This runs before partitioning; propagate canonical metadata after
             # changing Scalar overloads to equivalent Tensor overloads.
@@ -319,6 +320,7 @@ def make_backend(*, static_int32=False, static_factories=False, split_mhc=True, 
                                             lambda: passes.pass_fake_propagation(ctx))
             logger().info('V4.1 resident I32 operand audit: %s', audit)
             logger().info('V4.1 resident static factory audit: %s', factories)
+            logger().info('V4.1 resident I32 clamp audit: %s', clamps)
         return changed
 
     def transform(ctx):

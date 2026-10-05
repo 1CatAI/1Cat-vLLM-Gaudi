@@ -13,13 +13,23 @@
 #ifndef DSV41_QNORM_TILES
 #define DSV41_QNORM_TILES 10
 #endif
+#ifdef DSV41_QNORM_FUNCTION
+static inline void qnorm_quant_row(tensor input, tensor weight, tensor quantized, tensor scales,
+#else
 void main(tensor input, tensor weight, tensor quantized, tensor scales,
+#endif
 #if DSV41_QNORM_PUBLISH
           tensor normalized,
 #endif
-          float epsilon, float inverse_width) {
+          float epsilon, float inverse_width
+#ifdef DSV41_QNORM_FUNCTION
+          , const int5 begin, const int5 end
+#endif
+          ) {
+#ifndef DSV41_QNORM_FUNCTION
     const int5 begin = get_index_space_offset();
     const int5 end = begin + get_index_space_size();
+#endif
     const int tiles = get_dim_size(input, 0) / 128;
     bfloat128 cached[DSV41_QNORM_TILES];
     for (int row = begin[0]; row < end[0]; ++row) {

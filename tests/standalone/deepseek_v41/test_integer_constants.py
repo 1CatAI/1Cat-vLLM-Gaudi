@@ -145,3 +145,24 @@ def test_fake_propagation_converts_resident_buffers_and_restores_mode():
     with pytest.raises(RuntimeError, match='metadata failed'):
         propagate_with_resident_buffers(module, [fake], fail)
     assert not mode.allow_non_fake_inputs
+
+
+@pytest.mark.parametrize('count', [1, 2, 6])
+@pytest.mark.parametrize('bounds', [(0, 32767), (None, 16383), (-1, None), (7, 3)])
+def test_address_bounds_stay_i32_and_preserve_clamp(count, bounds):
+    from vllm_gaudi.compilation.deepseek_v41_integer_constants import retain_integer_clamp_bounds
+    graph = Graph()
+    value = graph.placeholder('rows')
+    value.meta['val'] = torch.empty(count, dtype=torch.int32)
+    result = graph.call_function(torch.ops.aten.clamp.default, (value, *bounds))
+    graph.output(result)
+    module = GraphModule(torch.nn.Module(), graph)
+    fixtures = [torch.tensor([-1, 0, 16383, 32768, -(1 << 31), (1 << 31)-1], dtype=torch.int32).roll(i)[:count]
+                for i in range(5)]
+    expected = [module(x) for x in fixtures]
+    audit = retain_integer_clamp_bounds(module, device_type='cpu')
+    assert audit['replaced_clamps'] == 1
+    assert all(buffer.dtype == torch.int32 for buffer in module.buffers())
+    for actual, reference in zip([module(x) for x in fixtures], expected, strict=True):
+        assert torch.equal(actual, reference)
+    assert retain_integer_clamp_bounds(module, device_type='cpu')['replaced_clamps'] == 0

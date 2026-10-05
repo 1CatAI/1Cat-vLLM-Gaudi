@@ -946,4 +946,28 @@ Ordinary V4.1 native replay with one pipeline stage now defaults to device sampl
 
 `VLLM_HPU_DSV41_KV_REUSE_FUSION` (default `0`) combines C1 KV norm/RoPE, current SWA codec/write and the selected-main reuse gather in one handwritten TPC. The current slot consumes freshly encoded values directly, so no inter-TPC barrier or cache reload is required. Other rows retain the canonical packed read path. Head count is an operand shape; prefill, new main owners and decoded-cache consumers retain the reference. Physical-node and production-native component validation are required.
 
-`VLLM_HPU_DSV41_MAIN_MLA_PROJECTION=0` (archived experimental): preserve PV/BF16 and inverse-RoPE/BF16 rounding inside the shared-main projection consumer. Reuse has a small component gain; publish is inconclusive. It is not a production default. See the attention projection archive.
+`VLLM_HPU_DSV41_QKV_FUSED_PROLOGUE` defaults to `0`. The C1 candidate shares one handwritten TPC launch between Q norm/quantization and KV norm/RoPE/canonical SWA publication, then uses the existing TP-local FP8 Q projection and RoPE epilogue. It preserves the normalized Q row for index owners and all BF16/cache boundaries. When enabled it supersedes the overlapping isolated KV publication/reuse-gather producer; those savings must not be counted twice. Wider scheduler buckets and prefill retain the reference path. Combined formal acceptance is pending.
+
+`VLLM_HPU_DSV41_WOA_DENSE_HANDOFF=0` (experimental): combine the exact WOa scale/group32 boundary with WOb dynamic FP8 preparation on the common C1 output path. Prefill, already fused MLA/WOa projections and larger scheduler buckets retain their existing implementations. Pending complete-chain and combined serving qualification.
+
+`VLLM_HPU_DSV41_PEER_POST_NORM=0` (experimental): C1 attention peer sum, mHC residual update/collapse and FFN norm/FP8 preparation in one TPC node. The updated residual still feeds the ordinary FFN control/gates; MoE boundary and larger buckets retain the existing path. Implies deferred peer inputs under the existing TP communication contract. Pending complete-chain and combined serving qualification.
+
+`VLLM_HPU_DSV41_SHARED_COORDINATES` (default `0`) captures an experimental shared
+I32 coordinate producer in the first native decode group and threads its owned
+outputs through subsequent groups. Sampling continues to update canonical input
+roots. This is distinct from static coordinate factories; hardware qualification
+of the complete path is required before enabling it by default.
+
+`VLLM_HPU_DSV41_CANDIDATE_COORDINATES` (default `0`) combines candidate-block
+expansion, invalid-row masking and I32 safe gather addresses into one native
+producer for the decoded-key C1 Reindex path. The existing gather/MME consumer
+is retained. This candidate is independent of token-entry coordinates because
+candidate blocks depend on an earlier source layer in the same token.
+
+- `VLLM_HPU_DSV41_EXPERT_W2_THREE_ROUTES` (default `0`): experimental C1 six-route W13 with two three-route W2 SRAM groups and ordered shared finalization. Requires checkpoint-qualified SAT planes; C2–C6 and prefill retain their current operators. Enable only for the measured candidate until serving acceptance.
+
+- `VLLM_HPU_DSV41_MHC_DEFERRED_GATES` (default `0`): experimental common C1 path retaining the exact FP32 control/RRMS producer, carrying its owned 25-value output through attention/MoE, and consuming gates, fixed-rank peer sum and post/collapse in one handwritten TPC kernel. Requires prepared control weights and the BF16 collapse contract. It does not change prefill or C2–C6 dispatch. Numerical, physical-node and combined serving qualification are pending.
+
+`VLLM_HPU_DSV41_MAIN_MLA_PROJECTION=0` (experimental): shared-main C1 publish/reuse uses one hand-written PV BF16 rounding, inverse-RoPE and FP8 quantization consumer before the unchanged WOa/WOb MME projections. Selection ownership and cache publication remain unchanged. Pending production component and combined serving qualification.
+
+The qualified TP4 C1 entrypoint now defaults `COMPRESSOR_FUSED_PUBLISH`, `EXPERT_W2_THREE_ROUTES`, `QKV_FUSED_PROLOGUE`, `CANDIDATE_COORDINATES`, and `PEER_POST_COLLAPSE` to1 (each prefixed `VLLM_HPU_DSV41_`). `STATIC_COORDINATES` was already1 for the single-stage path. Raw library defaults remain conservative for direct component imports; the ordinary entrypoint applies the qualified topology defaults and respects explicit overrides. Archived `MAIN_MLA_PROJECTION`, `WOA_DENSE_HANDOFF`, `PEER_POST_NORM`, and `MHC_DEFERRED_GATES` stay0.
