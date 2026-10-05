@@ -43,7 +43,7 @@
     {
       "id": 4,
       "name": "mHC fusion",
-      "status": "packed control→gates exact; physical2→2, no small-chain gain"
+      "status": "packed control\u2192gates exact; physical2\u21922, no small-chain gain"
     },
     {
       "id": 5,
@@ -128,8 +128,8 @@
           "fallbacks": 1
         }
       ],
-      "formal_result": "/home/ymzx/桌面/1cat-vllm-gaudi-work/dsv41-tp4-decode-gap-1p5-20260928/evidence/20260928_tp4-decode-gap-1p5/decode-sampling-static-serving-03/formal/result.json",
-      "evidence": "/home/ymzx/桌面/1cat-vllm-gaudi-work/dsv41-tp4-decode-gap-1p5-20260928/evidence/20260928_tp4-decode-gap-1p5/decode-sampling-static-serving-03",
+      "formal_result": "/home/ymzx/\u684c\u9762/1cat-vllm-gaudi-work/dsv41-tp4-decode-gap-1p5-20260928/evidence/20260928_tp4-decode-gap-1p5/decode-sampling-static-serving-03/formal/result.json",
+      "evidence": "/home/ymzx/\u684c\u9762/1cat-vllm-gaudi-work/dsv41-tp4-decode-gap-1p5-20260928/evidence/20260928_tp4-decode-gap-1p5/decode-sampling-static-serving-03",
       "diagnostics": false,
       "speed_qualified": false,
       "sampling_fallback_rate": 0.00041981528127623844
@@ -2210,5 +2210,27 @@
     "formal_gain_credit": false,
     "default": false,
     "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-host-shared-peer-01"
+  },
+  "mhc_bf16_weight_20261005": {
+    "status": "qualified_component_alternative_default_off",
+    "parent": "parallel controller plus deferred gates; mutually exclusive with swizzled control weights",
+    "round_savings_ms_per_boundary": [
+      0.00015731640625,
+      0.0001756484375,
+      0.0001639609375
+    ],
+    "forty_boundary_forecast_ms": 0.0065584375,
+    "active_forecast_credit_ms": 0,
+    "reason": "Alternative to .00553015625 swizzled forecast, not additive. Keep exact swizzle in active batch; numerical alternative retained for future combined qualification.",
+    "correctness": "5 checkpoint-derived fixtures x4 ranks; router IDs and same-projection post exact; upstream-equation error <=3.201238984e-6 (limit5e-5); FP8 consumer separate limit2e-4",
+    "physical_producer_nodes": [
+      4,
+      4
+    ],
+    "cold_extra_weight_mib_per_rank": 75,
+    "formal_result": null,
+    "default": false,
+    "flag": "VLLM_HPU_DSV41_MHC_BF16_CONTROL_WEIGHT",
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-mhc-bf16-weight-03"
   }
 }

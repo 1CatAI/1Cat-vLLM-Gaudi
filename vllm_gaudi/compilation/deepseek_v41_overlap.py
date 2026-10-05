@@ -140,6 +140,7 @@ def independent_mhc_nodes(module, dependent_inputs):
         "deepseek_v41_control_gemv", "deepseek_v41_control_batch4_f32",
         "deepseek_v41_control_prefetch_f32", "deepseek_v41_control_rrms_unpack",
         "deepseek_v41_control_rrms_parallel", "deepseek_v41_control_rrms_swizzled",
+        "deepseek_v41_control_rrms_bf16_weight",
         "deepseek_v41_control_mme_f32",
     )
     seeds = [

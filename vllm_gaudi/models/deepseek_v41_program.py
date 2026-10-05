@@ -978,6 +978,13 @@ class PreparedDecoderLayer(nn.Module):
             return
         self.hc_attn_fn_packed = self._pack_mhc_control_weight(self.weights.hc_attn_fn)
         self.hc_ffn_fn_packed = self._pack_mhc_control_weight(self.weights.hc_ffn_fn)
+        if gaudi_envs.VLLM_HPU_DSV41_MHC_BF16_CONTROL_WEIGHT:
+            if not (gaudi_envs.VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL
+                    and gaudi_envs.VLLM_HPU_DSV41_MHC_DEFERRED_GATES
+                    and not gaudi_envs.VLLM_HPU_DSV41_MHC_SWIZZLED_CONTROL):
+                raise ValueError("BF16 mHC weight candidate requires parallel/deferred control without swizzled weights")
+            self.hc_attn_fn_bf16 = self.hc_attn_fn_packed.to(torch.bfloat16)
+            self.hc_ffn_fn_bf16 = self.hc_ffn_fn_packed.to(torch.bfloat16)
         if gaudi_envs.VLLM_HPU_DSV41_MHC_SWIZZLED_CONTROL:
             if not (gaudi_envs.VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL
                     and gaudi_envs.VLLM_HPU_DSV41_MHC_DEFERRED_GATES):
@@ -990,6 +997,7 @@ class PreparedDecoderLayer(nn.Module):
         self.hc_ffn_fn_packed = None
         self.hc_ffn_fn_mme = None
         self.hc_attn_fn_swizzled = self.hc_ffn_fn_swizzled = None
+        self.hc_attn_fn_bf16 = self.hc_ffn_fn_bf16 = None
 
     @prefill_span("layer")
     def forward(
@@ -1116,6 +1124,7 @@ class PreparedDecoderLayer(nn.Module):
                 value, attention_control = hc_control_and_collapse(
                     residual, pre_mix, self.hc_attn_fn_packed, self.eps,
                     swizzled_fn=self.hc_attn_fn_swizzled,
+                    bf16_fn=self.hc_attn_fn_bf16,
                     collapsed_input=collapsed_attention,
                 )
                 new_pre = post = comb = None
@@ -1236,6 +1245,7 @@ class PreparedDecoderLayer(nn.Module):
             value, ffn_control = hc_control_and_collapse(
                 residual, new_pre, self.hc_ffn_fn_packed, self.eps,
                 swizzled_fn=self.hc_ffn_fn_swizzled,
+                bf16_fn=self.hc_ffn_fn_bf16,
                 collapsed_input=collapsed_ffn,
             )
             pre_mix = post = comb = None

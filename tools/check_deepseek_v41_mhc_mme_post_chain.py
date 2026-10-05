@@ -15,6 +15,8 @@ import statistics
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--bf16-control-weights', action='store_true',
+                        help='Cold BF16 controller weights and native BF16 MAC with FP32 accumulation')
     parser.add_argument('--dense-transpose', action='store_true', help='Cold transpose WO weights and flip the native MME transpose flag; no hot weight copies')
     parser.add_argument('--early-gates', action='store_true', help='Use qualified parallel control in both arms; compute gates alongside WO before peer')
     parser.add_argument('--direct-rrms-post', action='store_true', help='Specialize the post kernel for the shared control/RRMS layout')
@@ -41,6 +43,12 @@ def main():
     parser.add_argument('--retirement-only', action='store_true',
                         help='Reuse measured A/B; check teardown without timing')
     args = parser.parse_args()
+    if args.bf16_control_weights:
+        if any((args.dense_transpose, args.early_gates, args.direct_rrms_post, args.swizzled_control,
+                args.late_control, args.peer_prune, args.mme_shared_rrms, args.unpack_controller)):
+            parser.error('--bf16-control-weights is a separate controller experiment')
+        args.parallel_controller = True
+        args.official_tolerance = True
     if args.dense_transpose:
         args.parallel_controller = True
     if args.early_gates:
@@ -133,7 +141,13 @@ def main():
     compiled=lambda fn:torch.compile(fn,backend=make_backend(static_int32=True,static_factories=True,split_mhc=True),fullgraph=True,dynamic=False)
     transposed_wo = wo_weight.cpu().T.contiguous().to("hpu") if args.dense_transpose else None
     packed_control = control.reshape(24, 160, 128).permute(1, 0, 2).contiguous() if args.swizzled_control else None
+    bf16_control = control.bfloat16() if args.bf16_control_weights else None
     def produce(x,residual,control,mme_weight,wo_weight,wo_scale,*,fused):
+        if args.bf16_control_weights:
+            op = (torch.ops.custom_op.custom_deepseek_v41_control_rrms_bf16_weight_gaudi2
+                  if control.dtype == torch.bfloat16 else
+                  torch.ops.custom_op.custom_deepseek_v41_control_rrms_parallel_bf16_gaudi2)
+            return direct_dense_fp8(x,wo_weight,wo_scale), op(residual.flatten(1),control,eps)
         if args.dense_transpose:
             q, scale = torch.ops.custom_op.custom_deepseek_v41_dense_quant_gaudi2(x)
             value = torch.ops.hpu.fp8_gemm_v2(q, False, wo_weight, wo_weight.shape[-1] == x.shape[-1],
@@ -179,7 +193,7 @@ def main():
         logits=torch.ops.custom_op.custom_deepseek_v41_bf16_linear_f32_gaudi2(normalized,router)
         ids,routing=torch.ops.custom_op.custom_deepseek_v41_router_logits_top6_gaudi2(logits,bias,bias_vl,mask)
         return updated,collapsed,pre,normalized,quantized,act_scale,ids,routing,gates
-    arms = (True, False) if args.early_gates else (True, True) if args.late_control or args.swizzled_control or args.direct_rrms_post or args.dense_transpose else (False, False) if args.peer_prune else (False, True)
+    arms = (True, False) if args.early_gates else (True, True) if args.late_control or args.swizzled_control or args.direct_rrms_post or args.dense_transpose or args.bf16_control_weights else (False, False) if args.peer_prune else (False, True)
     late_projection = compiled(lambda x,w,s:direct_dense_fp8(x,w,s)) if args.late_control else None
     late_controller = compiled(lambda r,w:
         torch.ops.custom_op.custom_deepseek_v41_control_rrms_parallel_bf16_gaudi2(r.flatten(1),w,eps)
@@ -241,7 +255,9 @@ def main():
             value=compute(late_projection,(x,wo_weight,wo_scale))
             projection=None
         else:
-            value,projection=compute(producer,(x,residual,packed_control if args.swizzled_control and arm == 1 else control,mme_weight,transposed_wo if args.dense_transpose and arm == 1 else wo_weight,wo_scale))
+            arm_control = (bf16_control if args.bf16_control_weights and arm == 1 else
+                           packed_control if args.swizzled_control and arm == 1 else control)
+            value,projection=compute(producer,(x,residual,arm_control,mme_weight,transposed_wo if args.dense_transpose and arm == 1 else wo_weight,wo_scale))
         peers=torch.ops.vllm_gaudi.tp_peer_allgather(value,4)
         torch.hpu.synchronize()
         gather_slots=(slot(value,False),slot(peers,False))
@@ -286,7 +302,7 @@ def main():
         # Check the new TPC byte-for-byte at an identical projection; only
         # the explicit hi/lo controller is permitted to introduce error.
         control_reference=(torch.ops.custom_op.custom_deepseek_v41_control_rrms_parallel_bf16_gaudi2
-                           if args.late_control or args.swizzled_control or args.direct_rrms_post or args.early_gates or args.dense_transpose else
+                           if args.late_control or args.swizzled_control or args.direct_rrms_post or args.early_gates or args.dense_transpose or args.bf16_control_weights else
                            torch.ops.custom_op.custom_deepseek_v41_control_gemv_rrms_bf16_gaudi2)
         reference_control=control_reference(residual.flatten(1),control,eps)
         mix=torch.cat((reference_control[:,:24],torch.zeros_like(reference_control[:,:24])),1).contiguous()

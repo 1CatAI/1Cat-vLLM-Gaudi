@@ -16,6 +16,7 @@ constexpr const char* rrms_guid =
     "custom_deepseek_v41_control_gemv_rrms_bf16_gaudi2";
 constexpr const char* unpack_schema = "custom_op::custom_deepseek_v41_control_rrms_unpack_bf16_gaudi2";
 constexpr const char* parallel_schema = "custom_op::custom_deepseek_v41_control_rrms_parallel_bf16_gaudi2";
+constexpr const char* bf16_weight_schema = "custom_op::custom_deepseek_v41_control_rrms_bf16_weight_gaudi2";
 constexpr const char* swizzled_schema = "custom_op::custom_deepseek_v41_control_rrms_swizzled_bf16_gaudi2";
 struct RrmsParams { float epsilon; float inverse_width; };
 void validate(const at::Tensor& input, const at::Tensor& weight) {
@@ -26,9 +27,9 @@ void validate(const at::Tensor& input, const at::Tensor& weight) {
                 "V4.1 control GEMV requires contiguous FP32 [B1..64,20480] and [24,20480]");
 }
 void validate_rrms(const at::Tensor& input, const at::Tensor& weight,
-                   double epsilon, bool swizzled = false) {
+                   double epsilon, bool swizzled = false, bool bf16_weight = false) {
     TORCH_CHECK(input.scalar_type() == at::kBFloat16 &&
-                weight.scalar_type() == at::kFloat &&
+                weight.scalar_type() == (bf16_weight ? at::kBFloat16 : at::kFloat) &&
                 input.dim() == 2 && input.size(0) >= 1 &&
                 input.size(0) <= 2048 && input.size(1) == 20480 &&
                 (swizzled ? weight.sizes() == at::IntArrayRef({160, 24, 128}) :
@@ -53,12 +54,12 @@ const bool registered = [] {
     return true;
 }();
 const bool rrms_registered = [] {
-    for (const auto* name : {rrms_schema, unpack_schema, parallel_schema, swizzled_schema}) {
+    for (const auto* name : {rrms_schema, unpack_schema, parallel_schema, swizzled_schema, bf16_weight_schema}) {
     habana::custom_op::registerUserCustomOp(
         name, name + 11,
         [name](const at::Stack& stack) {
             validate_rrms(stack.at(0).toTensor(), stack.at(1).toTensor(),
-                          stack.at(2).toDouble(), name == swizzled_schema);
+                          stack.at(2).toDouble(), name == swizzled_schema, name == bf16_weight_schema);
             habana::PartialOutputMetaData output;
             output.dtype = at::kFloat;
             output.shape = {stack.at(0).toTensor().size(0), 25};
@@ -89,19 +90,21 @@ at::Tensor meta(const at::Tensor& input, const at::Tensor& weight) {
 template<bool Meta, int Unpack = 0>
 at::Tensor run_rrms(const at::Tensor& input, const at::Tensor& weight,
                     double epsilon) {
-    validate_rrms(input, weight, epsilon, Unpack == 3);
+    validate_rrms(input, weight, epsilon, Unpack == 3, Unpack == 4);
     if constexpr (Meta)
         return at::empty({input.size(0), 25},
                          input.options().dtype(at::kFloat));
     TORCH_CHECK(rrms_registered && input.device().type() == at::kHPU);
     auto descriptor = habana::custom_op::UserCustomOpDescriptor::
-        getUserCustomOpDescriptor(Unpack == 3 ? swizzled_schema : Unpack == 2 ? parallel_schema : Unpack ? unpack_schema : rrms_schema);
+        getUserCustomOpDescriptor(Unpack == 4 ? bf16_weight_schema : Unpack == 3 ? swizzled_schema :
+                                 Unpack == 2 ? parallel_schema : Unpack ? unpack_schema : rrms_schema);
     auto outputs = descriptor.execute({input, weight, epsilon});
     TORCH_CHECK(outputs.size() == 1);
     return outputs.at(0);
 }
 }
 TORCH_LIBRARY_FRAGMENT(custom_op, m) {
+    m.def("custom_deepseek_v41_control_rrms_bf16_weight_gaudi2(Tensor input, Tensor weight, float epsilon) -> Tensor");
     m.def("custom_deepseek_v41_control_rrms_swizzled_bf16_gaudi2(Tensor input, Tensor weight, float epsilon) -> Tensor");
     m.def("custom_deepseek_v41_control_rrms_parallel_bf16_gaudi2(Tensor input, Tensor weight, float epsilon) -> Tensor");
     m.def("custom_deepseek_v41_control_rrms_unpack_bf16_gaudi2(Tensor input, Tensor weight, float epsilon) -> Tensor");
@@ -111,6 +114,7 @@ TORCH_LIBRARY_FRAGMENT(custom_op, m) {
     m.def("custom_deepseek_v41_control_gemv_rrms_bf16_gaudi2(Tensor input, Tensor weight, float epsilon) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
+    m.impl("custom_deepseek_v41_control_rrms_bf16_weight_gaudi2", run_rrms<false, 4>);
     m.impl("custom_deepseek_v41_control_rrms_swizzled_bf16_gaudi2", run_rrms<false, 3>);
     m.impl("custom_deepseek_v41_control_rrms_parallel_bf16_gaudi2", run_rrms<false, 2>);
     m.impl("custom_deepseek_v41_control_rrms_unpack_bf16_gaudi2", run_rrms<false, true>);
@@ -121,6 +125,7 @@ TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
            run_rrms<false>);
 }
 TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
+    m.impl("custom_deepseek_v41_control_rrms_bf16_weight_gaudi2", run_rrms<true, 4>);
     m.impl("custom_deepseek_v41_control_rrms_swizzled_bf16_gaudi2", run_rrms<true, 3>);
     m.impl("custom_deepseek_v41_control_rrms_parallel_bf16_gaudi2", run_rrms<true, 2>);
     m.impl("custom_deepseek_v41_control_rrms_unpack_bf16_gaudi2", run_rrms<true, true>);

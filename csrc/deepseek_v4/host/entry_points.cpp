@@ -344,6 +344,7 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_ORDERED_PEER_SUM,
     GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_MME_FINISH,
     GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_RRMS_PARALLEL,
+    GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_RRMS_BF16_WEIGHT,
     GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_RRMS_SWIZZLED,
     GAUDI2_KERNEL_DEEPSEEK_V41_MHC_RRMS_POST,
     KERNEL_COUNT
@@ -427,6 +428,7 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MHC_RRMS_POST].name, "custom_deepseek_v41_mhc_rrms_post_gaudi2");
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_RRMS_SWIZZLED].name, "custom_deepseek_v41_control_rrms_swizzled_bf16_gaudi2");
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_RRMS_PARALLEL].name, "custom_deepseek_v41_control_rrms_parallel_bf16_gaudi2");
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_RRMS_BF16_WEIGHT].name, "custom_deepseek_v41_control_rrms_bf16_weight_gaudi2");
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_MME_FINISH].name, DeepseekV41ControlMmeFinishGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_BATCH_MLA_METADATA].name,
                 DeepseekV41BatchMlaMetadataGaudi2::name);
@@ -1605,6 +1607,8 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
         return DeepseekV41ExpertPairedDecodeFp8Gaudi2().GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, "custom_deepseek_v41_control_rrms_swizzled_bf16_gaudi2") == 0)
         return DeepseekV41ControlGemvRrmsGaudi2(3).GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name, "custom_deepseek_v41_control_rrms_bf16_weight_gaudi2") == 0)
+        return DeepseekV41ControlGemvRrmsGaudi2(4).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, "custom_deepseek_v41_control_rrms_parallel_bf16_gaudi2") == 0)
         return DeepseekV41ControlGemvRrmsGaudi2(2).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41ControlMmeFinishGaudi2::name) == 0)

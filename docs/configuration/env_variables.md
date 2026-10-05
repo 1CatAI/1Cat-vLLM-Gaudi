@@ -1012,6 +1012,13 @@ quality/performance pending; not enabled by the entrypoint.
   Both TP2/TP4 layouts use the same implementation. Requires weight reload to change;
   experimental until combined official-sampling end-to-end qualification.
 
+- `VLLM_HPU_DSV41_MHC_BF16_CONTROL_WEIGHT` (default `0`): numerical C1 candidate
+  using cold BF16 controller weights and native BF16 products with FP32 accumulation.
+  Requires parallel control and deferred gates; excludes swizzled control weights.
+  The original FP32 weights remain available for wider batches and prefill.
+  Component checks use the upstream normalized-error limits and exact router IDs;
+  official-sampling serving quality and latency remain unqualified. Its small
+  component saving is an alternative to swizzled weights, not an additive gain.
 - `VLLM_HPU_DSV41_MHC_SWIZZLED_CONTROL` (default `0`): cold K128/head packing for
   the C1 parallel FP32 controller. Requires `MHC_PARALLEL_CONTROL` and
   `MHC_DEFERRED_GATES`. Adds one packed copy of each control weight; the ordinary

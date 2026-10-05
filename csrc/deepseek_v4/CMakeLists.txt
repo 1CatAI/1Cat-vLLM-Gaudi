@@ -39,6 +39,11 @@ foreach(SOURCE IN LISTS KERNEL_SOURCES)
     if(NAME STREQUAL "deepseek_v41_prefill_q_scale_rope_bf16_gaudi2")
         list(APPEND EXTRA_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/deepseek_v41_prefill_q_scale_rope_gaudi2.c")
     endif()
+    if(NAME STREQUAL "deepseek_v41_control_rrms_bf16_weight_gaudi2" OR
+       NAME STREQUAL "deepseek_v41_control_rrms_swizzled_bf16_gaudi2")
+        list(APPEND EXTRA_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/deepseek_v41_control_rrms_parallel_bf16_gaudi2.c")
+        list(APPEND EXTRA_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/../flashinfer_gaudi/kernels/norm_math_gaudi2.h")
+    endif()
     if(NAME STREQUAL "deepseek_v41_attention_norm_bf16_gaudi2" OR
        NAME STREQUAL "deepseek_v41_final_collapse_norm_bf16_gaudi2" OR
        NAME STREQUAL "deepseek_v41_ffn_norm_quant_gaudi2" OR

@@ -1072,3 +1072,20 @@ complete-chain time barely changes. Literal 40-boundary forecast
 **0.000290156 ms/token**, flag `VLLM_HPU_DSV41_MHC_RRMS_POST=0`. This tiny
 component value does not establish a material end-to-end improvement.
 Active forecast **0.496382133 ms/token**; formal unchanged.
+
+### 2026-10-05 — BF16 controller weight alternative (not additive)
+
+`decode-mhc-bf16-weight-03`: five checkpoint fixtures x four ranks, upstream
+equation errors at most3.20124e-6 (limit5e-5), router IDs exact. Native full
+WO/control→peer→post→FFN/router savings .000157316/.000175648/.000163961ms
+per boundary. Forty-boundary forecast **.006558438ms/token**.
+Default-off `VLLM_HPU_DSV41_MHC_BF16_CONTROL_WEIGHT`, requires parallel and
+deferred control. Mutually exclusive with swizzled weights: this replaces
+.005530156ms, never adds to it. Retain swizzle in the active batch for now;
+active forecast **.496382133ms/token** and formal **9.564282ms/token** unchanged.
+The candidate retains original FP32 weights for wider batches and adds75MiB/rank.
+
+Simulation correction: FFN BF16 quantization was rechecked with typed FP32
+descriptors in `decode-ffn-bf16-quant-01/correct-descriptors.log`; all five
+20488-byte outputs exact, instruction counts unchanged. Earlier malformed
+simulator outputs are superseded; hardware evidence and ledger credit unchanged.
