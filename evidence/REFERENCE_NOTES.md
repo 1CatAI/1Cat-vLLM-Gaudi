@@ -585,3 +585,12 @@ previous backend pragma reported an unsupported vector PHI and did nothing.
 `decode-woa-single-amax-02` validates the complete native QKV→MLA→WO→peer/mHC
 chain, rather than the isolated quantizer. Its small but consistent gain is
 retained under the revised accumulation policy; the default stays disabled.
+
+
+### 2026-10-06 — parallel PCIe payload protocol: ordering before timing
+
+The archived star protocol02 has one TPC workpoint handling40 vectors. The parallel01 research candidate uses40 workpoints, per-vector ready/reader-ACK generations and separate two-bank payload storage. Every assigned payload range is written and drained before that instance announces readiness; every assigned reduction output is drained before ACK. Epoch comparisons use signed modulo32-bit differences, including wrap. The import graph remains acyclic: hub exports; leaves import only the hub. No reciprocal imports, no production integration or measured gain yet.
+
+Intel documents that vector stores and later loads are not implicitly coherent; ASO commits earlier vector writes before its semaphore update. The candidate waits for that update before publishing scalar readiness, then invalidates scalar cache around incoming ready polls. This is an ordering design, not proof of remote PCIe visibility or native-chain latency. Sources: [TPC coherency](https://docs.habana.ai/en/latest/TPC/TPC_User_Guide/TPC_Coherency.html), [ASO/cache intrinsics](https://docs.habana.ai/en/latest/TPC/TPC_Intrinsics_Guide/Cache.html), [index execution order](https://docs.habana.ai/en/latest/TPC/TPC_User_Guide/TPC_Programming_Model.html). Direct fetches returned429; official indexed text supplied these definitions.
+
+Offline checks: five four-rank randomized/different-partition scheduler fixtures (three include U32 wrap); five checkpoint BF16 rows through production no-bias mode then stale-data diagnostic mode in the Gaudi2 TPC simulator, all exact; complete P2P-output->FFN norm/quant graph compiles with two physical logical compute stages in both arms. Next gate is bounded primitive/cleanup on healthy cards, then the actual WO->TP4 exchange->mHC/FFN consumer native chain. Never map quarantined modules0/1/4/5.
