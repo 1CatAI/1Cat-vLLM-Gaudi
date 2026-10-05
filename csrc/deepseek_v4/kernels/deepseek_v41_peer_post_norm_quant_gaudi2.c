@@ -186,7 +186,9 @@ void main(tensor value, tensor residual, tensor post, tensor comb, tensor next_p
         const int5 scale_at = {0, row, 0, 0, 0};
         if (owner == 0) v_f32_st_tnsr(scale_at, scales, scale);
 
-        for (int tile = 0; tile < tiles; ++tile) {
+        // Statistics need the complete row, but quantization is elementwise.
+        // Each owner only consumes its ten cached tiles after the global amax.
+        for (int tile = owner; tile < tiles; tile += 4) {
             const int5 at = {tile * 128, row, 0, 0, 0};
             const float64_pair_t value =
                 v_convert_bf16_to_f32_all_b(cached[tile]);
@@ -201,7 +203,7 @@ void main(tensor value, tensor residual, tensor post, tensor comb, tensor next_p
             packed = v_f8_pack_b(sparse, SW_GROUP_1 | SW_STRIDE_2, packed);
             packed = v_f8_mov_dual_group_pack_b(
                 packed, SW_PACK21, (minifloat256)0);
-            if (tile % 4 == owner) v_f8_st_tnsr_partial(at, quantized, packed, 127, 0);
+            v_f8_st_tnsr_partial(at, quantized, packed, 127, 0);
         }
     }
 }

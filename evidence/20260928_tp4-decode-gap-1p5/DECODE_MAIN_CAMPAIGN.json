@@ -2232,5 +2232,28 @@
     "default": false,
     "flag": "VLLM_HPU_DSV41_MHC_BF16_CONTROL_WEIGHT",
     "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-mhc-bf16-weight-03"
+  },
+  "peer_post_owned_quant_20261005": {
+    "status": "rejected_complete_chain_slower",
+    "correctness": "5 fixtures x4 ranks exact; simulator5 fixtures/66564 output bytes exact",
+    "simulator_instructions": [
+      38517,
+      36578
+    ],
+    "physical_consumer_compute_nodes": [
+      5,
+      4
+    ],
+    "round_savings_ms": [
+      -0.0033054765624999927,
+      -0.003464777343750003,
+      -0.0033948867187500037
+    ],
+    "code_retained": "Only safe removal of quantization on unowned tiles in already-disabled fusion candidate",
+    "static_cause": "Fused global normalization recomputes all40 post tiles at each of4 owners; baseline post distributes40 tiles and only norm rescans. Full-row post work becomes serial per owner. This structural redundancy is not removed by narrowing the final quantization loop.",
+    "next": "Stop this fusion boundary; require a dataflow avoiding repeated post+global-statistic work, not another tile/owner variation.",
+    "gain_credit_ms": 0,
+    "default": false,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-peer-post-registers-01"
   }
 }
