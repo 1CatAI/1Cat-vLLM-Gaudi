@@ -195,3 +195,21 @@ C one-MME follow-up: coldBF16 rounding passesofficialequations on20inputs; actua
 D operand-cache follow-up: partialoutputaliasesfailedsectionvalidation andGCrelocatedoutputs. Explicitmutableinputs repairlaunch but do notrepairallconsumeroutputs undernative replay; firsttwoofthreereuseconsumers differ onsecondfixture. No timing. RejectsharedcacheWAR assumption; no claimofprovenprecisecause. Publisherhardwarecodec onqualifiedscalar-mask parent passes5×4exact but slows2.010–2.036us/layer despite~4%fewerinstructions. Neitherentersgainledger. Activepending0.658449527ms/token; formal9.564282unchanged.
 
 A four-rank scope correction:exact05binary verified61200changingepochs onall4healthy modules. Fiveowner protocol risesfromtwo-rank~10.62us tofour-rank[14.8781, 14.8799, 14.8819]us/point. Thisisbefore realWO/postconsumers; itsownerwidthAB isnotcurrentHCCLreference. Noforecast or runtimechange. All4contextsclosed, no deviceimports.
+
+## 2026-10-06: queue mask and blocked mHC controller
+
+Eager ignores scoped `TPC_ENGINES_ENABLED_MASK`: its recipe generator writes an all-ones
+TPC-engine mask. A cold distinct-key complete-chain comparison retained identical consumer
+physical nodes/ARC program size and regressed ~2.74us. This rejects the configuration-only
+hypothesis, not a demonstrated restricted-queue firmware implementation.
+
+The24-workpoint mHC controller removes repeated activation loads and VLM spills, and passes
+official numerical limits/exact routing. But full WO/control→peer→post/FFN/router saves only
+.019–.032us(F32) or .117–.138us(BF16) per boundary, with an extra physical finish node.
+This is not additional to the already faster qualified alternatives. Do not translate the
+historical .50ms controller activity into removable critical-path latency.
+
+Current compatible pending forecast remains **.658449527ms/token**; formal remains9.564282.
+Readonly selected-main KV operands are the next unqualified dataflow candidate: retain
+main K/V while decoding128 private SWA rows at each reuse. It pays extra MME/combine cost;
+only a complete publish/reuse/WO/peer/FFN group can determine the outcome.

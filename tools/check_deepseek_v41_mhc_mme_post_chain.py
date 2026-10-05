@@ -65,6 +65,9 @@ def main():
         if args.chain_repeats % 8:
             parser.error('--late-control requires repetitions divisible by eight')
         os.environ['VLLM_HPU_DSV41_TP_MHC_OVERLAP'] = '1'
+    else:
+        # One peer per component group is not the production eight-peer topology.
+        os.environ['VLLM_HPU_DSV41_TP_MHC_OVERLAP'] = '0'
     if args.unpack_controller and not args.exact_controller:
         raise ValueError('Unpack controller requires --exact-controller')
     if args.chain_repeats < 1:
