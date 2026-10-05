@@ -2193,5 +2193,22 @@
     "default": false,
     "decision": "Both consumer-side and producer-side merging regress in real16. Stop partition coalescing trials; require a concrete compiled-dataflow cause before any further variant.",
     "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-mhc-producer-fusion-03"
+  },
+  "host_shared_peer_20261005": {
+    "status": "rejected_correctness_timeout",
+    "completed_epochs_before_failure": 212,
+    "first_pair_only_us": {
+      "central_host": 20.2858,
+      "local_host_reduce": 12.5998
+    },
+    "error_codes": {
+      "rank0": 2,
+      "rank1": 7
+    },
+    "reason": "A later period hit bounded ready/publication polling. One successful pair is neither a stable timing nor a valid allreduce qualification. Cause unresolved; do not expand toTP4 or integrate.",
+    "device_release": "Both2/3 returned768MiB with no reset; no device-buffer imports.",
+    "formal_gain_credit": false,
+    "default": false,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-host-shared-peer-01"
   }
 }
