@@ -19,11 +19,13 @@ STATIC_COORDINATES 原已默认开启，共六项。显式诊断覆盖仍可关�
 recipe编号冲突停止追查，不再作逐项归因。输出/post-norm/WOa/发布链小融合归档，
 默认关闭；共享-main输出原型提交 `0dd878fb`。旧项目中的组件预测不能继续叠加到新基线。
 
-**当前本轮微基准待验收累计：0.658449527 ms/token（估计，尚未端到端）。**
+**当前本轮微基准待验收累计：0.936105875 ms/token（估计，尚未端到端）。**
 MoE 合并候选0.206373750ms、mHC0.039834531ms、Attention主体向量化0.176384352ms，
 量化整行amax去重0.036122500ms；FFN BF16量化0.001143438ms、索引gain副本0.030703250ms、
 mHC权重布局0.005530156ms、共享RRMS post0.000290156ms、reuse向量mask0.137790492ms、
-reuse硬件E4M3 codec0.024276902ms。这里同步文末已通过的组件记录，没有新增测量或收益。
+reuse硬件E4M3 codec0.024276902ms；gates/peer重叠0.136496875ms、全局SWA镜像读0.016101598ms、
+W2有效K0.020418438ms、正分母Sinkhorn0.001187500ms、索引query codec0.014609813ms、
+整段Reindex评分0.088842125ms。各项微基准与适用范围见文末，未验证方向不计入。
 BF16控制权重候选与mHC权重布局互斥，当前未叠加。
 各项5组输入四卡通过适用正确性检查、原生重放3轮A/B方向一致，默认均关闭。
 mHC 新项按官方方程/DeepGEMM归一化误差容差验收，不声称逐位一致；其余保留原逐位检查。详见文末。
@@ -1235,3 +1237,30 @@ Evidence: `/opt/ssd960/1cat-vllm-decode-archives/decode-index-rope-codec-chain-0
 (`result.json`, `PHYSICAL_NODES.json`, `DECISION.json`); all owners retired.
 chain01 has no performance result: pinned bridge path was rewritten incorrectly
 by the component launcher, now repaired and covered by two CPU regressions.
+
+### 2026-10-06 — complete late Reindex score submission
+
+`decode-index-wide-reindex-chain-02`: checkpoint query/gain producer → one
+query peer → 16384-row score/select → actual packed-main MLA consumer. Parent
+retains qualified query codec/gain replication in both arms. The candidate uses
+the existing K128 MME/head reducer once instead of eight2048-row calls; BF16
+head/shard rounding and ordered selection are unchanged. No TP4-specific kernel.
+
+Five checkpoint embedding-derived input/position pairs ×four ranks: all scores,
+IDs, MLA outputs and publication rows/masks byte-exact. Candidate slots include
+permutations, holes and invalid addresses; actual ratio1,524288-row index/main
+allocations. Native16-repeat ABABAB200 differences
+**.022157844/.022212344/.022210531ms/layer**; four applicable layers24/28/32/36
+forecast **0.088842125ms/token**. Complete consumer physical61→27; query producer13
+unchanged. This removes independent clamps/gathers/head reductions and also
+reduces compiler MME fragments; those fragments are not treated as an isolated
+performance claim.
+
+`VLLM_HPU_DSV41_INDEX_WIDE_REINDEX=0` stays default-off. C1 decoded mirror only;
+other buckets and packed readers retain their current path. Component inputs
+are real-weight-derived, not captured serving QR activations. This is not a
+formal model/state/quality result. Compatible pending **0.936105875ms/token**;
+formal **9.564282ms/token** unchanged. All owned workers retired.
+
+Evidence: `/opt/ssd960/1cat-vllm-decode-archives/decode-index-wide-reindex-chain-02/`
+(`result.json`, `PHYSICAL_NODES.json`, `DECISION.json`).

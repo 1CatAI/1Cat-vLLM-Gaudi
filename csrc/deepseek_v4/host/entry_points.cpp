@@ -357,6 +357,7 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_RRMS_SWIZZLED,
     GAUDI2_KERNEL_DEEPSEEK_V41_MHC_RRMS_POST,
     GAUDI2_KERNEL_DEEPSEEK_V41_INDEX_QUERY_ROPE_FP4,
+    GAUDI2_KERNEL_DEEPSEEK_V41_REGISTER_SOFTMAX,
     KERNEL_COUNT
 };
 
@@ -941,6 +942,7 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     DeepseekV41DecodeMetadataGaudi2().GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_DECODE_METADATA].name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_CANDIDATE_COORDINATES].name, DeepseekV41CandidateCoordinatesGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_CANDIDATE_COORDINATES_GLOBAL].name, DeepseekV41CandidateCoordinatesGaudi2::global_name);
+    DeepseekV41SelectedMlaGaudi2(false,true).GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_REGISTER_SOFTMAX].name);
     return stock(deviceId, &stock_count, guids + KERNEL_COUNT);
 }
 
@@ -1271,6 +1273,9 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     mainFast5.GetKernelName(kernelName);
     if (std::strcmp(params->guid.name, kernelName) == 0)
         return mainFast5.GetGcDefinitions(params, instance);
+    auto registerSoftmax=DeepseekV41SelectedMlaGaudi2(false,true);
+    registerSoftmax.GetKernelName(kernelName);
+    if(std::strcmp(params->guid.name,kernelName)==0)return registerSoftmax.GetGcDefinitions(params,instance);
     auto mainFast6 = DeepseekV41SelectedMlaGaudi2(false);
     mainFast6.GetKernelName(kernelName);
     if (std::strcmp(params->guid.name, kernelName) == 0)

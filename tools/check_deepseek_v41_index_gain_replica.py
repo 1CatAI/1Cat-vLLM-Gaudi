@@ -21,9 +21,19 @@ def main():
     parser.add_argument('--native-query-path', action='store_true', help='Use the production native RoPE table/codec contract in both arms')
     parser.add_argument('--fused-query-codec', action='store_true', help='Hold gain replica and query peer fixed; compare native RoPE+FP4 with the fused codec')
     parser.add_argument('--shared-query-codec', action='store_true', help='Use the qualified fused codec in both query-replication arms')
+    parser.add_argument('--selection-chain', action='store_true', help='Native query producer -> full 16K score -> threshold/emit -> MLA consumer')
+    parser.add_argument('--wide-reindex', action='store_true', help='Hold selection/reference variant fixed; compare eight 2K score calls with one complete 16K call')
+    parser.add_argument('--wide-score-parent', action='store_true', help='Hold qualified complete-pool scoring fixed in both selection arms')
+    parser.add_argument('--threshold-variant', type=int, choices=(1,), default=1)
     parser.add_argument('--steps', type=int, default=200)
     parser.add_argument('--chain-repeats', type=int, default=64)
     args = parser.parse_args()
+    if args.wide_reindex and not args.selection_chain:
+        parser.error('--wide-reindex requires --selection-chain')
+    if args.wide_score_parent and (not args.selection_chain or args.wide_reindex):
+        parser.error('--wide-score-parent requires --selection-chain and excludes --wide-reindex')
+    if args.selection_chain and (not args.native_query_path or args.query_replica or args.fused_query_codec or args.shared_query_codec):
+        parser.error('--selection-chain requires native query path and a fixed shared query/gain parent')
     if args.fused_query_codec and (not args.native_query_path or args.query_replica):
         parser.error('--fused-query-codec requires --native-query-path and excludes --query-replica')
     if args.shared_query_codec and (not args.native_query_path or not args.query_replica or args.fused_query_codec):
@@ -81,8 +91,11 @@ def main():
     knorm = shard.tensor('layers.20.attn.indexer.k_norm.weight', 'cpu')
     with safe_open(args.prepared/'pp0-tp0.safetensors', framework='pt', device='cpu') as checkpoint:
         fixtures = [checkpoint.get_slice('embed.weight')[token:token+1].clone() for token in (17, 41, 128, 512, 1024)]
-    keys = fp4_roundtrip(rms_norm(F.linear(torch.cat(fixtures)[:, :512].contiguous(), wk), knorm, 1e-20), 32)
-    keys = keys.repeat((4096, 1))[:16384].contiguous().to('hpu')
+        key_embeddings = checkpoint.get_slice('embed.weight')[16:16400, :512].clone() if args.selection_chain else None
+    keys = fp4_roundtrip(rms_norm(F.linear(key_embeddings if args.selection_chain else torch.cat(fixtures)[:, :512].contiguous(), wk), knorm, 1e-20), 32)
+    if args.selection_chain:
+        keys = keys.repeat((32, 1))
+    keys = (keys if args.selection_chain else keys.repeat((4096, 1))[:16384]).contiguous().to('hpu')
     cfg = json.loads((args.prepared/'config.json').read_text())['text_config']
     scaling = cfg['rope_scaling']
     phase = rotary_table(64, 32768, cfg['compress_rope_theta'], scaling['original_max_position_embeddings'],
@@ -97,7 +110,7 @@ def main():
     def produce(value, pos, wq, wp, norm, phase, *, replicated):
         qr = rms_norm(value[:, :1280].contiguous(), norm, 1e-20)
         query = F.linear(quantize_activation(qr), wq).reshape(1, wq.shape[0] // 128, 128)
-        if args.shared_query_codec or (args.fused_query_codec and replicated):
+        if args.selection_chain or args.shared_query_codec or (args.fused_query_codec and replicated):
             query = torch.ops.custom_op.custom_deepseek_v41_index_query_rope_fp4_bf16_gaudi2(query, pos, phase)
         else:
             roped = (torch.ops.custom_op.custom_deepseek_v41_rope_bf16_gaudi2(query, pos, phase)
@@ -105,11 +118,44 @@ def main():
             query = fp4_roundtrip(roped, 32)
         query = query.reshape(1, -1).contiguous()
         gains = F.linear(value, wp) * (128**-.5 * total_heads**-.5)
-        return query, gains.contiguous() if replicated or args.query_replica or args.fused_query_codec else F.pad(gains, (0, 128-local_heads)).contiguous()
+        return query, gains.contiguous() if args.selection_chain or replicated or args.query_replica or args.fused_query_codec else F.pad(gains, (0, 128-local_heads)).contiguous()
+
+    if args.selection_chain:
+        from vllm_gaudi.ops.deepseek_v41_math import pack_fp4, pack_swa
+        # Real checkpoint-derived KV values; retain the full physical cache size.
+        wk_main = shard.dense('layers.20.attn.wkv.weight', 'cpu')
+        norm_main = shard.tensor('layers.20.attn.kv_norm.weight', 'cpu')
+        kv_rows = rms_norm(F.linear(torch.cat(fixtures), wk_main), norm_main, 1e-20)
+        packed = pack_fp4(kv_rows, 16)
+        main_cache = packed.repeat((104858, 1))[:524288].contiguous().to('hpu')
+        swa = pack_swa(kv_rows).repeat((52, 1))[:256].contiguous().to('hpu')
+        pages = torch.arange(8192, dtype=torch.int32, device='hpu')
+        candidates = torch.arange(2048, dtype=torch.int32, device='hpu').reshape(1, -1)
+        sink = shard.tensor('layers.24.attn.attn_sink', 'hpu')
+        attn_scale = torch.tensor([512**-.5], device='hpu')
+        lengths = torch.tensor([640], dtype=torch.int32, device='hpu')
 
     def consume(query, gains, keys, positions, rows, *, replicated):
         query = query.reshape(1, total_heads, 128)
-        gains = gains.reshape(1, total_heads) if replicated or args.query_replica or args.fused_query_codec else gains.reshape(tp, 128)[:, :local_heads].reshape(1, total_heads).contiguous()
+        gains = gains.reshape(1, total_heads) if args.selection_chain or replicated or args.query_replica or args.fused_query_codec else gains.reshape(tp, 128)[:, :local_heads].reshape(1, total_heads).contiguous()
+        if args.selection_chain:
+            logical = torch.where(candidates.unsqueeze(-1) >= 0,
+                                  candidates.unsqueeze(-1) * 8 + torch.arange(8, dtype=torch.int32, device=query.device),
+                                  -1).flatten(1)
+            if args.wide_score_parent or (args.wide_reindex and replicated):
+                scores = mirror_index_tile(query, gains, keys, positions, logical, 1, local_heads)
+            else:
+                scores = torch.cat([mirror_index_tile(query, gains, keys, positions, logical[:, tile*2048:(tile+1)*2048],
+                                                      1, local_heads) for tile in range(8)], -1).contiguous()
+            stats = torch.ops.custom_op.custom_deepseek_v41_index_threshold_gaudi2(
+                scores, positions, 1, 1, 0, args.threshold_variant if replicated and not args.wide_reindex else 0)
+            selected = torch.ops.custom_op.custom_deepseek_v41_index_emit_gaudi2(
+                scores, positions, candidates, stats, 1, 1, 0)
+            # First real selected-KV/QK/softmax/PV consumer, including its actual waits.
+            aq = query[:, :sink.numel()].repeat(1, 1, 4).contiguous()
+            output, decoded, mask = torch.ops.custom_op.custom_deepseek_v41_main_publish_native_codec_mla_gaudi2(
+                aq, swa, main_cache, selected, positions, pages, sink, attn_scale, lengths, 1)
+            return scores, selected, output, decoded, mask
         scores = mirror_index_tile(query, gains, keys, positions, rows, 2, local_heads)
         return query, gains, scores
 
@@ -151,14 +197,14 @@ def main():
             return result
 
         query, gains = compute(producer, (x, positions, global_wq if args.query_replica and replica else wq,
-                                            global_wp if replica or args.query_replica or args.fused_query_codec else local_wp, norm, phase))
+                                            global_wp if args.selection_chain or replica or args.query_replica or args.fused_query_codec else local_wp, norm, phase))
         if args.query_replica and replica:
             global_query = query
         else:
             global_query = torch.ops.vllm_gaudi.tp_peer_allgather(query, tp)
             torch.hpu.synchronize()
             plan.add_all_gather(slot(query, False), slot(global_query, False))
-        if not replica and not args.query_replica and not args.fused_query_codec:
+        if not args.selection_chain and not replica and not args.query_replica and not args.fused_query_codec:
             global_gains = torch.ops.vllm_gaudi.tp_peer_allgather(gains, tp)
             torch.hpu.synchronize()
             plan.add_all_gather(slot(gains, False), slot(global_gains, False))
@@ -167,7 +213,7 @@ def main():
         out = compute(consumer, (global_query, global_gains, keys, positions, rows))
         plan.prepare(backend, [slot(v, False) for v in out])
         graph = bridge.NativeDecodeGraph()
-        points = (0 if replica else 1) if args.query_replica else (1 if args.fused_query_codec or replica else 2)
+        points = (0 if replica else 1) if args.query_replica else (1 if args.selection_chain or args.fused_query_codec or replica else 2)
         graph.configure_topology(args.chain_repeats, args.chain_repeats*points, False)
         graph.configure_dependency_policy(False)
         graph.capture([plan]*args.chain_repeats, [external]*args.chain_repeats)
@@ -176,7 +222,11 @@ def main():
         plans.append(plan); graphs.append(graph); outputs.append(out); externals.append(external)
     checks = []
     for index, fixture in enumerate(fixtures):
-        x.copy_(fixture.to('hpu')); positions.fill_(16384+index)
+        x.copy_(fixture.to('hpu')); positions.fill_(16383+index if args.selection_chain else 16384+index)
+        if args.selection_chain:
+            pool = (torch.arange(2048, dtype=torch.int32)*(index+1)) % (keys.shape[0]//8)
+            pool[:4] = torch.tensor([-1,-1000,keys.shape[0]//8,keys.shape[0]//4],dtype=torch.int32)
+            candidates.copy_(pool.reshape(1,-1).to('hpu'))
         torch.hpu.synchronize()
         values = []
         for graph, out in zip(graphs, outputs, strict=True):
@@ -189,6 +239,10 @@ def main():
         (directory/'checks.json').write_text(json.dumps(checks, indent=2))
         if not bool(agreed.cpu().item()):
             raise RuntimeError('Replicated gain projection changed query/gain/score bytes')
+    if args.selection_chain:
+        pool = torch.arange(2048, dtype=torch.int32)
+        candidates.copy_(pool.reshape(1,-1).to('hpu')); positions.fill_(16383); x.copy_(fixtures[0].to('hpu'))
+        torch.hpu.synchronize()
     for graph in graphs:
         for _ in range(8): graph.replay_fixed_with_completion().synchronize()
     before = graph_compilation_count()
@@ -211,7 +265,9 @@ def main():
     savings = [a['median_ms']-b['median_ms'] for a,b in zip(periods[::2], periods[1::2], strict=True)]
     result = dict(status='completed', checks=checks, periods=periods, round_savings_ms=savings,
                   saving_ms_per_index_layer=statistics.median(savings), three_consistent_rounds=all(v>0 for v in savings),
-                  peer_points_per_iteration=[1,0] if args.query_replica else [1,1] if args.fused_query_codec else [2,1],
+                  peer_points_per_iteration=[1,0] if args.query_replica else [1,1] if args.selection_chain or args.fused_query_codec else [2,1],
+                  wide_reindex=args.wide_reindex, wide_score_parent=args.wide_score_parent,
+                  selection_chain=args.selection_chain, threshold_variant=args.threshold_variant if args.selection_chain else None,
                   native_query_path=args.native_query_path, fused_query_codec=args.fused_query_codec,
                   shared_query_codec=args.shared_query_codec,
                   fixture_scope=__doc__, formal_gain=False)

@@ -93,7 +93,8 @@ public:
         synGEMMParams qk{false, true}, pv{false, false};
         auto scores = BuildNode(this, graph, {"batch_gemm", {syn_in(0), kv.at(0).get()},
             {{{1, heads, 640}, at::kFloat}}, &qk, sizeof(qk)});
-        auto probabilities = BuildNode(this, graph, {"custom_deepseek_v41_selected_mla_softmax_gaudi2",
+        const bool register_row = !Projection && s.back().isBool() && s.back().toBool();
+        auto probabilities = BuildNode(this, graph, {register_row ? "custom_deepseek_v41_selected_mla_register_softmax_gaudi2" : "custom_deepseek_v41_selected_mla_softmax_gaudi2",
             {scores.at(0).get(), kv.at(2).get(), syn_in(Reuse ? 5 : 6), syn_in(Reuse ? 6 : 7)},
             {{{1, heads, 640}, at::kFloat}}});
         auto product = BuildNode(this, graph, {"batch_gemm", {probabilities.at(0).get(), kv.at(1).get()},
@@ -146,8 +147,8 @@ const bool registered = register_op<true,false,true,true,false,false,true>() && 
 template<bool Meta, bool Vector = false, bool VectorMask = false, bool NativeCodec = false, bool TensorMask = false> std::tuple<at::Tensor, at::Tensor, at::Tensor> publish(
     const at::Tensor& q, const at::Tensor& swa, const at::Tensor& main, const at::Tensor& selected,
     const at::Tensor& positions, const at::Tensor& pages, const at::Tensor& sink, const at::Tensor& scale,
-    const at::Tensor& lengths, int64_t ratio) {
-    const at::Stack stack{q, swa, main, selected, positions, pages, sink, scale, lengths, ratio};
+    const at::Tensor& lengths, int64_t ratio, bool register_softmax) {
+    const at::Stack stack{q, swa, main, selected, positions, pages, sink, scale, lengths, ratio, register_softmax};
     const auto out = meta<false>(stack);
     if (Meta) return {at::empty(out[0].shape, q.options()), at::empty(out[1].shape, q.options()),
                       at::empty(out[2].shape, q.options().dtype(at::kFloat))};
@@ -158,8 +159,8 @@ template<bool Meta, bool Vector = false, bool VectorMask = false, bool NativeCod
 }
 template<bool Meta, bool Vector = false, bool VectorMask = false, bool NativeCodec = false, bool TensorMask = false, bool DecodedSWA = false> at::Tensor reuse(const at::Tensor& q, const at::Tensor& swa, const at::Tensor& main,
     const at::Tensor& mask, const at::Tensor& positions, const at::Tensor& sink, const at::Tensor& scale,
-    const at::Tensor& lengths) {
-    const at::Stack stack{q, swa, main, mask, positions, sink, scale, lengths};
+    const at::Tensor& lengths, bool register_softmax) {
+    const at::Stack stack{q, swa, main, mask, positions, sink, scale, lengths, register_softmax};
     const auto out = meta<true,false,DecodedSWA>(stack);
     if (Meta) return at::empty(out[0].shape, q.options());
     TORCH_CHECK(registered && q.device().type() == at::kHPU);
@@ -194,18 +195,18 @@ template<bool Meta> std::tuple<at::Tensor,at::Tensor,at::Tensor> publish_project
 }
 }
 TORCH_LIBRARY_FRAGMENT(custom_op, m) {
-    m.def("custom_deepseek_v41_main_publish_vector_mla_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor selected, Tensor positions, Tensor pages, Tensor sink, Tensor scale, Tensor lengths, int ratio) -> (Tensor, Tensor, Tensor)");
-    m.def("custom_deepseek_v41_main_publish_vector_mask_mla_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor selected, Tensor positions, Tensor pages, Tensor sink, Tensor scale, Tensor lengths, int ratio) -> (Tensor, Tensor, Tensor)");
-    m.def("custom_deepseek_v41_main_publish_native_codec_mla_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor selected, Tensor positions, Tensor pages, Tensor sink, Tensor scale, Tensor lengths, int ratio) -> (Tensor, Tensor, Tensor)");
-    m.def("custom_deepseek_v41_main_publish_tensor_mask_mla_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor selected, Tensor positions, Tensor pages, Tensor sink, Tensor scale, Tensor lengths, int ratio) -> (Tensor, Tensor, Tensor)");
-    m.def("custom_deepseek_v41_main_reuse_vector_mla_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor mask, Tensor positions, Tensor sink, Tensor scale, Tensor lengths) -> Tensor");
-    m.def("custom_deepseek_v41_main_reuse_vector_mask_mla_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor mask, Tensor positions, Tensor sink, Tensor scale, Tensor lengths) -> Tensor");
-    m.def("custom_deepseek_v41_main_reuse_native_codec_mla_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor mask, Tensor positions, Tensor sink, Tensor scale, Tensor lengths) -> Tensor");
-    m.def("custom_deepseek_v41_main_reuse_decoded_swa_mla_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor mask, Tensor positions, Tensor sink, Tensor scale, Tensor lengths) -> Tensor");
+    m.def("custom_deepseek_v41_main_publish_vector_mla_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor selected, Tensor positions, Tensor pages, Tensor sink, Tensor scale, Tensor lengths, int ratio, bool register_softmax=False) -> (Tensor, Tensor, Tensor)");
+    m.def("custom_deepseek_v41_main_publish_vector_mask_mla_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor selected, Tensor positions, Tensor pages, Tensor sink, Tensor scale, Tensor lengths, int ratio, bool register_softmax=False) -> (Tensor, Tensor, Tensor)");
+    m.def("custom_deepseek_v41_main_publish_native_codec_mla_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor selected, Tensor positions, Tensor pages, Tensor sink, Tensor scale, Tensor lengths, int ratio, bool register_softmax=False) -> (Tensor, Tensor, Tensor)");
+    m.def("custom_deepseek_v41_main_publish_tensor_mask_mla_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor selected, Tensor positions, Tensor pages, Tensor sink, Tensor scale, Tensor lengths, int ratio, bool register_softmax=False) -> (Tensor, Tensor, Tensor)");
+    m.def("custom_deepseek_v41_main_reuse_vector_mla_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor mask, Tensor positions, Tensor sink, Tensor scale, Tensor lengths, bool register_softmax=False) -> Tensor");
+    m.def("custom_deepseek_v41_main_reuse_vector_mask_mla_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor mask, Tensor positions, Tensor sink, Tensor scale, Tensor lengths, bool register_softmax=False) -> Tensor");
+    m.def("custom_deepseek_v41_main_reuse_native_codec_mla_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor mask, Tensor positions, Tensor sink, Tensor scale, Tensor lengths, bool register_softmax=False) -> Tensor");
+    m.def("custom_deepseek_v41_main_reuse_decoded_swa_mla_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor mask, Tensor positions, Tensor sink, Tensor scale, Tensor lengths, bool register_softmax=False) -> Tensor");
     m.def("custom_deepseek_v41_main_publish_projection_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor selected, Tensor positions, Tensor pages, Tensor sink, Tensor scale, Tensor lengths, int ratio, Tensor wa, Tensor sa, Tensor phase, Tensor wb, Tensor sb) -> (Tensor, Tensor, Tensor)");
     m.def("custom_deepseek_v41_main_reuse_projection_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor mask, Tensor positions, Tensor sink, Tensor scale, Tensor lengths, Tensor wa, Tensor sa, Tensor phase, Tensor wb, Tensor sb) -> Tensor");
-    m.def("custom_deepseek_v41_main_publish_mla_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor selected, Tensor positions, Tensor pages, Tensor sink, Tensor scale, Tensor lengths, int ratio) -> (Tensor, Tensor, Tensor)");
-    m.def("custom_deepseek_v41_main_reuse_mla_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor mask, Tensor positions, Tensor sink, Tensor scale, Tensor lengths) -> Tensor");
+    m.def("custom_deepseek_v41_main_publish_mla_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor selected, Tensor positions, Tensor pages, Tensor sink, Tensor scale, Tensor lengths, int ratio, bool register_softmax=False) -> (Tensor, Tensor, Tensor)");
+    m.def("custom_deepseek_v41_main_reuse_mla_gaudi2(Tensor q, Tensor swa, Tensor main, Tensor mask, Tensor positions, Tensor sink, Tensor scale, Tensor lengths, bool register_softmax=False) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
     m.impl("custom_deepseek_v41_main_publish_vector_mla_gaudi2", publish<false,true>);

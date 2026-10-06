@@ -18,6 +18,7 @@ def main():
                         help='Use the production global decoded-SWA allocation for the mirror reader')
     parser.add_argument('--mirror-layer-slot', type=int, default=0,
                         help='Publish/read this512-row layer window in the global mirror')
+    parser.add_argument('--mla-register-softmax', action='store_true', help='Keep native codec fixed in both arms; replace only the exact ten-vector softmax')
     parser.add_argument('--mla-decoded-swa', action='store_true',
                         help='Read the exact packed-codec BF16 SWA mirror produced in both arms')
     parser.add_argument('--mhc-window', action='store_true',
@@ -47,6 +48,10 @@ def main():
     args = parser.parse_args()
     if not 1 <= args.mirror_global_slots <= 40 or not 0 <= args.mirror_layer_slot < args.mirror_global_slots:
         parser.error("Invalid mirror layer slot ownership")
+    if args.mla_register_softmax:
+        if any((args.mhc_window,args.mla_publish,args.mla_decoded_swa,args.mla_projection,args.qkv_transpose,args.peer_post_norm,args.rope_handoff,args.woa_handoff,args.qkv_fusion)):
+            parser.error("Register softmax holds the native reuse parent fixed")
+        args.mla_hardware_codec=True
     if args.mla_decoded_swa:
         if any((args.mhc_window, args.qkv_transpose, args.mla_tensor_mask,
                 args.mla_publish, args.mla_projection, args.peer_post_norm, args.rope_handoff,
@@ -266,14 +271,14 @@ def main():
                 mla_op = (torch.ops.custom_op.custom_deepseek_v41_main_reuse_decoded_swa_mla_gaudi2
                           if fused and args.mla_decoded_swa else
                           torch.ops.custom_op.custom_deepseek_v41_main_reuse_native_codec_mla_gaudi2
-                          if (fused or args.mla_decoded_swa) and args.mla_hardware_codec else
+                          if (fused or args.mla_decoded_swa or args.mla_register_softmax) and args.mla_hardware_codec else
                           torch.ops.custom_op.custom_deepseek_v41_main_reuse_vector_mask_mla_gaudi2
                           if args.mla_hardware_codec or (fused and args.mla_vector_mask) else
                           torch.ops.custom_op.custom_deepseek_v41_main_reuse_vector_mla_gaudi2
                           if args.mla_tensor_mask or args.qkv_transpose or args.mla_vector_mask or (fused and args.mla_vector) else
                           torch.ops.custom_op.custom_deepseek_v41_main_reuse_mla_gaudi2)
                 out=mla_op(q.reshape(1,heads,512),decoded_unused.narrow(0, decoded_offset, 512) if fused and args.mla_decoded_swa else cache,
-                           main,mask,pos,sink,scale,lens)
+                           main,mask,pos,sink,scale,lens, *([fused] if args.mla_register_softmax else []))
             if args.woa_handoff and args.rope_handoff and fused:
                 return torch.ops.custom_op.custom_deepseek_v41_rope_woa_wob_roundtrip_fp8_gaudi2(
                     out,wa,sa,wb,sb,pos,phase)
@@ -513,7 +518,7 @@ def main():
                       full_model_gain_credit=False, physical_node_gate_pending=True,chain_repeats=args.chain_repeats,
                       mirror_global_slots=args.mirror_global_slots,mirror_layer_slot=args.mirror_layer_slot,
                       production_compiler_static_coordinates=True,full_qkv_query_producer=True,
-                      candidate_kind="mla_decoded_swa" if args.mla_decoded_swa else "mla_publish_tensor_mask" if args.mla_tensor_mask else ("mla_publish_hardware_codec" if args.mla_publish else "mla_reuse_hardware_codec") if args.mla_hardware_codec else ("mla_publish_mask" if args.mla_publish else "mla_vector_mask") if args.mla_vector_mask else "qkv_cold_transpose" if args.qkv_transpose else ("mla_publish_vector" if args.mla_publish else "mla_reuse_vector") if args.mla_vector else "main_publish_projection" if args.mla_publish else "main_reuse_projection" if args.mla_projection else "rope_woa_handoff" if args.rope_handoff else "peer_post_norm" if args.peer_post_norm else "woa_handoff" if args.woa_handoff else "qkv_joint" if args.qkv_fusion else "kv_reuse",
+                      candidate_kind="mla_register_softmax" if args.mla_register_softmax else "mla_decoded_swa" if args.mla_decoded_swa else "mla_publish_tensor_mask" if args.mla_tensor_mask else ("mla_publish_hardware_codec" if args.mla_publish else "mla_reuse_hardware_codec") if args.mla_hardware_codec else ("mla_publish_mask" if args.mla_publish else "mla_vector_mask") if args.mla_vector_mask else "qkv_cold_transpose" if args.qkv_transpose else ("mla_publish_vector" if args.mla_publish else "mla_reuse_vector") if args.mla_vector else "main_publish_projection" if args.mla_publish else "main_reuse_projection" if args.mla_projection else "rope_woa_handoff" if args.rope_handoff else "peer_post_norm" if args.peer_post_norm else "woa_handoff" if args.woa_handoff else "qkv_joint" if args.qkv_fusion else "kv_reuse",
                       input_source=__doc__, native_replay=True,
                       native_library_sha256=hashlib.sha256(Path(os.environ['VLLM_HPU_DSV4_TPC_OP_LIBRARY']).read_bytes()).hexdigest(),
                       native_kernel_library_sha256=hashlib.sha256(Path(os.environ['GC_KERNEL_PATH']).read_bytes()).hexdigest())

@@ -3,7 +3,7 @@
   "target_ms": 7,
   "formal_completed_this_batch": false,
   "new_qualified_gain_ms": 0.014609812499999986,
-  "compatible_pending_forecast_ms": 0.8472637499999995,
+  "compatible_pending_forecast_ms": 0.9361058749999994,
   "negative_and_prepared_experiments": {
     "decode-mhc-native-fp32-chain-01": {
       "status": "rejected_slower",
@@ -506,11 +506,136 @@
     6,
     7
   ],
-  "next_action": "Read native query replica03 result; fused codec held in both arms. No formal request before compatible micro forecast1ms.",
+  "next_action": "Read clean-artifact softmax02 complete native gate when healthycards free; pure predicate full selection on qualified wide-score parent next; normal-source combined acceptance when forecast>=1ms. Formal unchanged9.564ms.",
   "query_replica_native_03": {
-    "status": "queued",
-    "artifact": "/opt/ssd960/1cat-vllm-decode-archives/decode-index-query-replica-native-03",
-    "changes_from_old": "Qualified native RoPE/FP4 and native E4M3 activation codec replace old generic42/44-node producer; current parent13nodes.",
-    "forecast_credit_ms": 0
+    "status": "completed",
+    "checks": [
+      {
+        "fixture": 0,
+        "query_gain_score_exact": [
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "fixture": 1,
+        "query_gain_score_exact": [
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "fixture": 2,
+        "query_gain_score_exact": [
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "fixture": 3,
+        "query_gain_score_exact": [
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "fixture": 4,
+        "query_gain_score_exact": [
+          true,
+          true,
+          true
+        ]
+      }
+    ],
+    "round_savings_ms": [
+      -0.0007000156250000084,
+      -0.0005649687500000056,
+      -0.0004773203125000014
+    ],
+    "saving_ms_per_index_layer": -0.0005649687500000056,
+    "three_consistent_rounds": false,
+    "peer_points_per_iteration": [
+      1,
+      0
+    ],
+    "native_query_path": true,
+    "fused_query_codec": false,
+    "shared_query_codec": true,
+    "fixture_scope": "Checkpoint index projections -> native peer exchange -> 2048-row score tile.\n\nThe default compares cold head-gain replication; --query-replica also tests\nreplicating the query weights, with the qualified gain replica held fixed.\nFive embedding-derived fixtures qualify query/gain/score bytes on all ranks.\n",
+    "formal_gain": false,
+    "decision": "rejected_three_negative_native_rounds",
+    "forecast_credit_ms": 0,
+    "parent": "Qualified fused query codec and gain replica in BOTH arms",
+    "reason": "Removing one query peer via full cold Wq replication still regresses the actual producer/score consumer boundary. No renewed global-query runtime implementation.",
+    "owners_retired": true
+  },
+  "queued_native_candidates": [
+    "decode-mla-register-softmax-chain-02"
+  ],
+  "index_wide_reindex_20261006": {
+    "status": "complete_chain_micro_qualified_default_off",
+    "artifact": "/opt/ssd960/1cat-vllm-decode-archives/decode-index-wide-reindex-chain-02",
+    "formal_baseline_ms": 9.564282285406788,
+    "saving_ms_per_reindex_layer": 0.02221053124999997,
+    "round_savings_ms": [
+      0.02215784374999999,
+      0.02221234375000003,
+      0.02221053124999997
+    ],
+    "forecast_occurrences": 4,
+    "applicable_layers": [
+      24,
+      28,
+      32,
+      36
+    ],
+    "forecast_ms_per_token": 0.08884212499999988,
+    "compatible_pending_forecast_ms": 0.9361058749999994,
+    "flag": "VLLM_HPU_DSV41_INDEX_WIDE_REINDEX=0",
+    "physical": {
+      "query_producer": [
+        13,
+        13
+      ],
+      "complete_score_select_mla": [
+        61,
+        27
+      ],
+      "clamps": [
+        13,
+        4
+      ],
+      "gather": [
+        13,
+        4
+      ],
+      "mmes": [
+        15,
+        6
+      ],
+      "reducers": [
+        8,
+        1
+      ],
+      "raw_preclamped_scorer": [
+        40,
+        9
+      ]
+    },
+    "checks": "Five checkpoint embedding-derived queries/positions x4ranks: scores, selectedIDs, MLA output, publishedrows/mask byte-exact. Permutedcandidate slots,holes,overflow exercised; full524288-row mirrored allocation; originalK128/BF16shard boundaries retained.",
+    "execution": "Native16-repetition query producer->onepeer->fullscore/select->actualMLA ABABAB200; botharms shared querycodec/gainreplica; timingratio1,pos16383,2048blocks",
+    "limitations": "One real-weight layer24, embedding-derived inputs not captured serving QR; four-layer forecast is mapping, not E2E. Fulldecoder state/cache, C2-C6 and formalquality not newlymeasured; unchangedfallback forotherbuckets/packedkeys. No recordedwholemodelgain.",
+    "owners_retired": true
+  },
+  "threshold_band_attempt_20261006": {
+    "status": "aborted_pre_gate_empty_TPC_selfloop_source_removed",
+    "artifact": "/opt/ssd960/1cat-vllm-decode-archives/decode-index-threshold-band-chain-03",
+    "gain_credit_ms": 0,
+    "device_recovered_without_reset": true,
+    "remaining_candidate": "Pure predicate bitpacking; no scalar/VPU waiting. Off/unqualified."
   }
 }

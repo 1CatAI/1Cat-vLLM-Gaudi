@@ -122,6 +122,9 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_SWA_PACK_WRITE: bool = False
     VLLM_HPU_DSV41_FP4_CACHE_WRITE: bool = False
     VLLM_HPU_DSV41_INDEX_QUERY_CODEC: bool = False
+    VLLM_HPU_DSV41_INDEX_PREDICATE_PACK: bool = False
+    VLLM_HPU_DSV41_INDEX_WIDE_REINDEX: bool = False
+    VLLM_HPU_DSV41_MLA_REGISTER_SOFTMAX: bool = False
     VLLM_HPU_DSV41_NATIVE_ROPE: bool = False
     VLLM_HPU_DSV41_C1_INDICES: bool = False
     VLLM_HPU_DSV41_SELECTED_VALID_ONLY: bool = False
@@ -834,6 +837,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.getenv("VLLM_HPU_DSV41_HEAD_VECTOR_ATTN", "0") == "1",
     "VLLM_HPU_DSV41_NATIVE_KV_PACK":
     lambda: os.getenv("VLLM_HPU_DSV41_NATIVE_KV_PACK", "0") == "1",
+    "VLLM_HPU_DSV41_MLA_REGISTER_SOFTMAX":
+    lambda: os.getenv("VLLM_HPU_DSV41_MLA_REGISTER_SOFTMAX", "0") == "1",
+    "VLLM_HPU_DSV41_INDEX_WIDE_REINDEX":
+    lambda: os.getenv("VLLM_HPU_DSV41_INDEX_WIDE_REINDEX", "0") == "1",
+    "VLLM_HPU_DSV41_INDEX_PREDICATE_PACK":
+    lambda: os.getenv("VLLM_HPU_DSV41_INDEX_PREDICATE_PACK", "0") == "1",
     "VLLM_HPU_DSV41_INDEX_QUERY_CODEC":
     lambda: os.getenv("VLLM_HPU_DSV41_INDEX_QUERY_CODEC", "0") == "1",
     "VLLM_HPU_DSV41_NATIVE_ROPE":

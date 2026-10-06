@@ -1082,3 +1082,26 @@ RoPE plus exact group-32 FP4 query roundtrip, retaining the BF16 rounding
 boundary and signed zero. Accepts width128 and up to64 request rows; no
 context-length cutoff. Prefill keeps its existing path. Complete-chain and
 formal serving qualification are required before promotion.
+
+`VLLM_HPU_DSV41_INDEX_PREDICATE_PACK` defaults to `0`: experimental exact
+predicate bit packing for the existing 16-pass ordered-key threshold search.
+The optional threshold-op variant0 preserves the reference; variant1 packs
+predicate bits without widening four predicate vectors. Selection metadata,
+ordered ties and the emit interface are unchanged. No semaphore polling or
+scalar readback is used. Native complete-consumer qualification is pending.
+
+`VLLM_HPU_DSV41_INDEX_WIDE_REINDEX` defaults to `0`: experimental C1 decoded
+index mirror scoring submits the complete 2048-block candidate pool to the
+existing K128 MME/reducer once, retaining all candidate slots and device-valued
+masking. Other buckets and packed readers keep their current path. Full native
+producer/select/MLA microbenchmarks passed on four ranks with five fixtures;
+combined formal serving acceptance remains pending.
+
+`VLLM_HPU_DSV41_MLA_REGISTER_SOFTMAX` defaults to `0`: experimental exact
+640-row softmax with static score-vector names instead of dynamically indexed
+arrays. Shared publish/reuse ops accept an optional final
+`register_softmax=False`; previous argument lists keep their behavior. Projection
+and prefill entrypoints are unchanged. This needs the matching rebuilt native
+library. No replay, runner or communication API changed. Native timing remains
+unqualified; neither simulator instruction counts nor raw graph counts are
+latency evidence.

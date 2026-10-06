@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Build the in-tree DeepSeek V4 Gaudi2 kernels and Bridge registrations."""
 
+from concurrent.futures import ThreadPoolExecutor
 import argparse
 import hashlib
 import json
@@ -32,6 +33,17 @@ def main():
     subprocess.run(["cmake", "-S", str(source), "-B", str(build / "kernels"),
                     "-DCMAKE_BUILD_TYPE=Release"], check=True)
     subprocess.run(["cmake", "--build", str(build / "kernels"), "--parallel", str(args.jobs)], check=True)
+    if __package__:
+        from .audit_deepseek_v41_tpc_loops import audit_object
+    else:
+        from audit_deepseek_v41_tpc_loops import audit_object
+    objects = [build / "kernels" / (path.stem + ".o") for path in sorted((source / "kernels").glob("*.c"))]
+    with ThreadPoolExecutor(max_workers=min(args.jobs, len(os.sched_getaffinity(0)))) as pool:
+        loop_audit = list(pool.map(audit_object, objects))
+    (output / "tpc_loop_audit.json").write_text(json.dumps(loop_audit, indent=2) + "\n")
+    if any(item["empty_self_loops"] for item in loop_audit):
+        (output / "INVALID_BUILD.json").write_text(json.dumps(dict(empty_self_loop=True), indent=2) + "\n")
+        raise RuntimeError("Compiled TPC empty self-loop rejected before native artifact publication")
     kernel = output / "libdeepseek_v4_gaudi2_kernels.so"
     shutil.copy2(build / "kernels" / kernel.name, kernel)
     if not args.kernel_only:
