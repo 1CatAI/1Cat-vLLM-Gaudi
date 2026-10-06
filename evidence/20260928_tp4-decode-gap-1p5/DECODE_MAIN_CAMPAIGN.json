@@ -2486,5 +2486,24 @@
     ],
     "pending": "Normal-installedcombinedserving/cache-state acceptance; unchangedpackedfallbackwhenexistingmirrorunavailable; no publish orC2-C6gain credit.",
     "active_compatible_total_ms": 0.8110479999999997
+  },
+  "expert_active_w2_20261006": {
+    "status": "complete_chain_micro_qualified_default_off",
+    "round_savings_ms_per_four_layers": [
+      0.0020440000000000458,
+      0.001983875000000024,
+      0.002041843749999994
+    ],
+    "saving_ms_per_layer": 0.0005104609374999985,
+    "forecast_occurrences": 40,
+    "forecast_ms_per_token": 0.020418437499999942,
+    "compatible_pending_forecast_ms": 0.8314664374999996,
+    "formal_baseline_ms": 9.564282285406788,
+    "correctness": "5 checkpoint-derived embeddings x4ranks, four real layers, alloutputs byte-exact; production top6/router/shared experts, load-time all384 W2 zero K tail proved",
+    "physical_contract": "/opt/ssd960/1cat-vllm-decode-archives/decode-expert-w2-active-k-chain-01/PHYSICAL_CONTRACT.json",
+    "limitations": "OnlyW2Ktailtrim; W13 stillpadded. Original five-tileSilu/amax retained. Microconsumerdoesnotrepresentcaptured service activations or formal quality.",
+    "flag": "VLLM_HPU_DSV41_EXPERT_ACTIVE_W2=0",
+    "formal_result": null,
+    "retired": true
   }
 }

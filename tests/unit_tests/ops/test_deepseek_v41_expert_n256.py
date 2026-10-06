@@ -54,19 +54,20 @@ def test_invalid_output_width_and_truncated_planes_fail():
         restore_expert(np.zeros((1, 8192), dtype=np.int16), np.zeros((1, 1023), dtype=np.int16))
 
 
-def test_bounded_loader_handles_partial_final_batch(tmp_path):
+@pytest.mark.parametrize("prefix", ["w", "layers.0.ffn.experts.w2"])
+def test_bounded_loader_handles_partial_final_batch(tmp_path, prefix):
     from vllm_gaudi.ops.deepseek_v41_expert_n256 import load_projection
     from vllm_gaudi.ops.deepseek_v41_weights import read_header
     rng = np.random.default_rng(17)
     q = rng.integers(-32768, 32768, (17, 2, 4096), dtype=np.int16)
     s = np.full((17, 2, 512), 127 << 7, dtype=np.uint16)
     header = json.dumps({
-        "w_q16": {
+        prefix+"_q16": {
             "dtype": "I16",
             "shape": list(q.shape),
             "data_offsets": [0, q.nbytes]
         },
-        "w_s16": {
+        prefix+"_s16": {
             "dtype": "BF16",
             "shape": list(s.shape),
             "data_offsets": [q.nbytes, q.nbytes + s.nbytes]
@@ -74,8 +75,14 @@ def test_bounded_loader_handles_partial_final_batch(tmp_path):
     }).encode()
     path = tmp_path / "weights.safetensors"
     path.write_bytes(struct.pack("<Q", len(header)) + header + q.tobytes() + s.tobytes())
-    shard = SimpleNamespace(catalog=read_header(path), check_identity=lambda: None)
-    nq, ns, channels = load_projection(shard, "w", "cpu")
+    (tmp_path/"config.json").write_text(json.dumps({"text_config": {"moe_intermediate_size": 256}}))
+    shard = SimpleNamespace(catalog=read_header(path), check_identity=lambda: None,
+                            directory=tmp_path, tensor_parallel_size=2)
+    nq, ns, channels = load_projection(shard, prefix, "cpu")
+    if prefix.endswith(".w2"):
+        assert nq.dsv41_sat_eligible and nq.dsv41_active_k == 128
+    else:
+        assert not hasattr(nq, "dsv41_active_k")
     assert channels.shape == (17, 1, 256)
     for expert in range(17):
         rq, rs = restore_expert(nq[expert].numpy(), ns[expert].numpy())
@@ -88,7 +95,7 @@ def test_native_stage_retains_mhc_overlap_with_bf16_n256_boundaries(monkeypatch,
     from vllm_gaudi.compilation import deepseek_v41_overlap as overlap
     monkeypatch.setenv("VLLM_HPU_DSV41_TP_MHC_OVERLAP", "1")
     backend = object()
-    monkeypatch.setattr(overlap, "make_backend", lambda: backend)
+    monkeypatch.setattr(overlap, "make_backend", lambda **kwargs: backend)
     calls = []
     monkeypatch.setattr(program, "_compile_group", lambda group, **kwargs: calls.append((group, kwargs)))
     from torch import nn

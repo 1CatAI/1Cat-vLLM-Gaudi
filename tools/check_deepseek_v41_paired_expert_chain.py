@@ -20,6 +20,8 @@ def main():
     parser.add_argument('--candidate-operator',choices=('paired','silu','groups3','streamed'),default='paired')
     parser.add_argument('--require-w13-prefetch', action='store_true')
     parser.add_argument('--dual-norm-quant', action='store_true')
+    parser.add_argument('--trim-w2', action='store_true',
+                        help='Preserve W13/padded amax, trim proved zero W2 K suffix to checkpoint width')
     parser.add_argument('--quant-bf16', action='store_true',
                         help='Isolate vector BF16 quantization against the qualified streamed/dual parent')
     parser.add_argument('--production-router', action='store_true',
@@ -36,6 +38,9 @@ def main():
     if args.quant_bf16 and not (args.dual_norm_quant and args.candidate_operator == 'streamed'
                                and args.baseline_operator == 'streamed'):
         parser.error('--quant-bf16 requires --dual-norm-quant and streamed in both arms')
+    if args.trim_w2 and not (args.dual_norm_quant and args.candidate_operator == 'streamed'
+                            and args.baseline_operator == 'streamed'):
+        parser.error('--trim-w2 requires the qualified streamed/dual parent in both arms')
     candidate_guid=('custom_deepseek_v41_expert_token_wide3_sat_fp8_gaudi2' if args.candidate_operator in ('groups3','pipeline3','plain_w13','sram_handoff','two_slice','unrolled','streamed','aligned','full_sram','pipeline_sram') else
                     'custom_deepseek_v41_expert_'+('paired_decode' if args.candidate_operator=='paired' else 'silu_decode')+'_fp8_gaudi2')
     if args.candidate_operator in ('unrolled', 'streamed', 'aligned', 'full_sram', 'pipeline_sram'):
@@ -133,6 +138,11 @@ def main():
                                 for name in ('weight','bias','bias_vl')) if args.production_router else ())))
         if rank == 0:
             print(json.dumps(dict(loaded_layer=layer, production_router=args.production_router)), flush=True)
+    active_width = json.loads((args.prepared/'config.json').read_text())['text_config']['moe_intermediate_size'] // shard.tensor_parallel_size
+    if args.trim_w2:
+        for row in weights:
+            if torch.count_nonzero(row[1][:, :, active_width * 64:]).cpu().item():
+                raise ValueError('W2 K suffix contains nonzero FP4 codes; no trim allowed')
     norm = weights[0][7]
     control, scale, base = [shard.tensor(f'layers.0.hc_ffn_{name}', 'cpu') for name in ('fn', 'scale', 'base')]
     with safe_open(args.prepared/'pp0-tp0.safetensors', framework='pt', device='cpu') as checkpoint:
@@ -178,6 +188,9 @@ def main():
                      groups3='two_group_w2_sat_shared', pipeline3='pipeline3_sat_shared', plain_w13='plain_w13_sat_shared', sram_handoff='sram_handoff_sat_shared', two_slice='two_slice_sat_shared', unrolled='unrolled_sat_shared', streamed='streamed_sat_shared', aligned='aligned_sat_shared', full_sram='full_sram_sat_shared', pipeline_sram='pipeline_sram_sat_shared',
                      legacy='prequant_direct_finalize_shared_prefetch_w2')
         op = getattr(torch.ops.custom_op, 'custom_deepseek_v41_expert_n256_moe_'+names[kind]+'_fp8_gaudi2')
+        if args.trim_w2 and sat:
+            return torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_active_k_sat_shared_fp8_gaudi2(
+                normalized,ids,route,q13,q2,s13,s2,lut,c13,c2,quantized,activation_scale,shared,active_width,True)
         return op(normalized,ids,route,q13,q2,s13,s2,lut,c13,c2,quantized,activation_scale,shared,True)
     producers = [compiled(lambda row, ids, route, *weights, sat=sat:
                           produce(row,ids,route,*weights,sat=sat),candidate=sat) for sat in (False, True)]
@@ -205,6 +218,10 @@ def main():
             torch.hpu.synchronize()
     physical=[audit(p) for p in (root/'graphs'/f'rank{rank}').rglob('*PostGraph-symbol.pbtxt')]
     def classify(entries):
+        if args.trim_w2:
+            tagged = lambda g: g['operations'].get('custom_deepseek_v41_expert_n256_silu_active_k_quant_gaudi2')
+            return ([g for g in entries if g['operations'].get('custom_deepseek_v41_expert_token_wide6_unroll_sat_fp8_gaudi2') and not tagged(g)],
+                    [g for g in entries if tagged(g)])
         if args.quant_bf16:
             # Both arms use the same streamed expert producers. Only the
             # quantizer GUID distinguishes this incremental candidate.
@@ -232,6 +249,15 @@ def main():
         from tools.audit_deepseek_v41_sram import audit as sram_audit
         placement = [sram_audit(Path(p['graph'])) for p in candidate]
         (directory/'sram.json').write_text(json.dumps(placement, indent=2)+'\n')
+        if args.trim_w2:
+            trimmed = [node for graph in candidate for node in graph['nodes']
+                       if node['op'] == 'custom_deepseek_v41_expert_token_wide3_active_k_sat_fp8_gaudi2']
+            from tools.audit_deepseek_v41_sram import tensor_info
+            trim_geometry_passed = bool(trimmed) and all(
+                tensor_info(node['tensors']['outputTensor:0'])['shape'][1] == active_width
+                for node in trimmed)
+            if not trim_geometry_passed:
+                raise RuntimeError('Active W2 decoder geometry was not retained by the physical graph')
         # Inspect SRAM and the W13 slices before capturing or timing any plan.
         sram_gate = bool(placement) and all(
             p and p['all_decoded_weights_in_sram'] and p['all_mme_weights_in_sram']
@@ -325,69 +351,82 @@ def main():
         graphs.append(graph)
         visible.append(outputs)
         externals.append(external)
-    checks = []
-    for index, fixture in enumerate(fixtures):
-        for destination, value in zip((x, residual, post, comb, pre, ids, route), fixture, strict=True):
-            destination.copy_(value.to('hpu'))
-        torch.hpu.synchronize()
-        observed = []
-        for graph, outputs in zip(graphs, visible, strict=True):
-            graph.replay_fixed_with_completion().synchronize()
-            observed.append([value.cpu() for value in outputs])
-        exact = [torch.equal(a.view(torch.uint8), b.view(torch.uint8))
-                 for a, b in zip(*observed, strict=True)]
-        if not all(exact):
-            torch.save(dict(fixture=fixture, observed=observed), directory/'failure.pt')
-            raise RuntimeError(f'Paired W13/W2 chain differs for input {index}: {exact}')
-        checks.append(dict(input=index, all_outputs_exact=True))
-    (directory/'result.json').write_text(json.dumps(dict(status='correctness_passed', checks=checks))+'\n')
-    # Retain actual physical nodes without rewarding a smaller pipeline slice count.
-    from tools.audit_deepseek_v41_physical_nodes import audit
-    physical=[audit(p) for p in (root/'graphs'/f'rank{rank}').rglob('*PostGraph-symbol.pbtxt')]
-    reference, candidate = classify(physical)
-    (directory/'physical_nodes.json').write_text(json.dumps(physical,indent=2)+'\n')
-    if not reference or not candidate:
-        raise RuntimeError('Final compiler evidence is missing; no timed run')
-    for graph in graphs:
-        for _ in range(20):
-            graph.replay_fixed_with_completion().synchronize()
-    compiled_before = graph_compilation_count()
-    periods = []
     tickets, events = [], []
-    for label in '' if args.retirement_only else 'ABABAB':
-        wait_for_loading(directory,rank,torch.distributed)
-        graph = graphs[label == 'B']
-        events = [(torch.hpu.Event(enable_timing=True), torch.hpu.Event(enable_timing=True))
-                  for _ in range(args.steps)]
-        torch.distributed.barrier()
-        tickets = []
-        for begin, end in events:
-            begin.record()
-            tickets.append(graph.replay_fixed_with_completion())
-            end.record()
-        torch.hpu.synchronize()
-        local = [begin.elapsed_time(end)/args.chain_repeats for begin, end in events]
-        ranks = [None]*4
-        torch.distributed.all_gather_object(ranks, local)
-        periods.append(dict(arm=label, rank_device_ms=ranks,
-                            median_ms=statistics.median(max(values) for values in zip(*ranks, strict=True))))
-        (directory/'result.json').write_text(json.dumps(dict(status='measuring', checks=checks, periods=periods))+'\n')
+    failure = None
+    try:
+        checks = []
+        for index, fixture in enumerate(fixtures):
+            for destination, value in zip((x, residual, post, comb, pre, ids, route), fixture, strict=True):
+                destination.copy_(value.to('hpu'))
+            torch.hpu.synchronize()
+            observed = []
+            for graph, outputs in zip(graphs, visible, strict=True):
+                graph.replay_fixed_with_completion().synchronize()
+                observed.append([value.cpu() for value in outputs])
+            exact = [torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+                     for a, b in zip(*observed, strict=True)]
+            decisions = [None] * 4
+            torch.distributed.all_gather_object(decisions, bool(all(exact)))
+            if not all(decisions):
+                torch.save(dict(fixture=fixture, observed=observed, rank_decisions=decisions), directory/'failure.pt')
+                raise RuntimeError(f'Paired W13/W2 chain differs for input {index}: {exact}')
+            checks.append(dict(input=index, all_outputs_exact=True))
+        (directory/'result.json').write_text(json.dumps(dict(status='correctness_passed', checks=checks))+'\n')
+        # Retain actual physical nodes without rewarding a smaller pipeline slice count.
+        from tools.audit_deepseek_v41_physical_nodes import audit
+        physical=[audit(p) for p in (root/'graphs'/f'rank{rank}').rglob('*PostGraph-symbol.pbtxt')]
+        reference, candidate = classify(physical)
+        (directory/'physical_nodes.json').write_text(json.dumps(physical,indent=2)+'\n')
+        if not reference or not candidate:
+            raise RuntimeError('Final compiler evidence is missing; no timed run')
+        for graph in graphs:
+            for _ in range(20):
+                graph.replay_fixed_with_completion().synchronize()
+        compiled_before = graph_compilation_count()
+        periods = []
+        tickets, events = [], []
+        for label in '' if args.retirement_only else 'ABABAB':
+            wait_for_loading(directory,rank,torch.distributed)
+            graph = graphs[label == 'B']
+            events = [(torch.hpu.Event(enable_timing=True), torch.hpu.Event(enable_timing=True))
+                      for _ in range(args.steps)]
+            torch.distributed.barrier()
+            tickets = []
+            for begin, end in events:
+                begin.record()
+                tickets.append(graph.replay_fixed_with_completion())
+                end.record()
+            torch.hpu.synchronize()
+            local = [begin.elapsed_time(end)/args.chain_repeats for begin, end in events]
+            ranks = [None]*4
+            torch.distributed.all_gather_object(ranks, local)
+            periods.append(dict(arm=label, rank_device_ms=ranks,
+                                median_ms=statistics.median(max(values) for values in zip(*ranks, strict=True))))
+            (directory/'result.json').write_text(json.dumps(dict(status='measuring', checks=checks, periods=periods))+'\n')
+            if rank == 0:
+                print(json.dumps(dict(arm=label, median_ms=periods[-1]['median_ms'])), flush=True)
+        if graph_compilation_count() != compiled_before:
+            raise RuntimeError('Hot compilation invalidates timing')
+        savings = [a['median_ms']-b['median_ms'] for a, b in zip(periods[::2], periods[1::2], strict=True)]
+        result = dict(status='retirement_check' if args.retirement_only else 'completed', checks=checks, periods=periods,
+                      saving_ms_per_layer=statistics.median(savings)/len(args.layers) if savings else None,
+                      round_savings_ms=savings,
+                      three_consistent_rounds=bool(savings) and all(value > 0 for value in savings),
+                      full_model_gain_credit=False, physical_node_gate_pending=False, pipeline_slice_policy=4, layers=args.layers, selected_experts=384 if args.production_router else 12,
+                      production_router=args.production_router, dual_norm_quant=args.dual_norm_quant, quant_bf16=args.quant_bf16, trim_w2=args.trim_w2, active_width=active_width,
+                      input_source=__doc__, baseline_operator=args.baseline_operator, candidate_operator=args.candidate_operator, native_replay=True, chain_repeats=args.chain_repeats, production_shared_expert=True,
+                      native_library_sha256=hashlib.sha256(Path(os.environ['VLLM_HPU_DSV4_TPC_OP_LIBRARY']).read_bytes()).hexdigest())
+        (directory/'result.json').write_text(json.dumps(result, indent=2)+'\n')
         if rank == 0:
-            print(json.dumps(dict(arm=label, median_ms=periods[-1]['median_ms'])), flush=True)
-    if graph_compilation_count() != compiled_before:
-        raise RuntimeError('Hot compilation invalidates timing')
-    savings = [a['median_ms']-b['median_ms'] for a, b in zip(periods[::2], periods[1::2], strict=True)]
-    result = dict(status='retirement_check' if args.retirement_only else 'completed', checks=checks, periods=periods,
-                  saving_ms_per_layer=statistics.median(savings)/len(args.layers) if savings else None,
-                  round_savings_ms=savings,
-                  three_consistent_rounds=bool(savings) and all(value > 0 for value in savings),
-                  full_model_gain_credit=False, physical_node_gate_pending=False, pipeline_slice_policy=4, layers=args.layers, selected_experts=384 if args.production_router else 12,
-                  production_router=args.production_router, dual_norm_quant=args.dual_norm_quant, quant_bf16=args.quant_bf16,
-                  input_source=__doc__, baseline_operator=args.baseline_operator, candidate_operator=args.candidate_operator, native_replay=True, chain_repeats=args.chain_repeats, production_shared_expert=True,
-                  native_library_sha256=hashlib.sha256(Path(os.environ['VLLM_HPU_DSV4_TPC_OP_LIBRARY']).read_bytes()).hexdigest())
-    (directory/'result.json').write_text(json.dumps(result, indent=2)+'\n')
-    if rank == 0:
-        (root/'result.json').write_text(json.dumps(result, indent=2)+'\n')
+            (root/'result.json').write_text(json.dumps(result, indent=2)+'\n')
+    except BaseException as error:
+        import traceback
+        (directory/'validation-error.txt').write_text(traceback.format_exc())
+        failure = RuntimeError(str(error))
+        (directory/'result.json').write_text(json.dumps(dict(status='failed_before_retirement',
+            error=str(error), performance_valid=False))+'\n')
+        if rank == 0:
+            (root/'result.json').write_text((directory/'result.json').read_text())
     for graph, plan in zip(graphs, plans, strict=True):
         graph.close()
         plan.invalidate()
@@ -417,6 +456,8 @@ def main():
     destroy_distributed_environment()
     config.__exit__(None, None, None)
     (directory/'retirement.json').write_text(json.dumps(dict(native_owners_closed=True, groups_destroyed=True))+'\n')
+    if failure is not None:
+        raise failure
 
 
 if __name__ == '__main__':

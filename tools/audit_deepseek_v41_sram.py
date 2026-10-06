@@ -34,6 +34,7 @@ def audit(path):
                 "custom_deepseek_v41_expert_n256_sat_fp8_gaudi2",
                 "custom_deepseek_v41_expert_token_wide6_sat_fp8_gaudi2",
                 "custom_deepseek_v41_expert_token_wide3_sat_fp8_gaudi2",
+                "custom_deepseek_v41_expert_token_wide3_active_k_sat_fp8_gaudi2",
                 "custom_deepseek_v41_expert_token_wide3_unroll_sat_fp8_gaudi2",
                 "custom_deepseek_v41_expert_token_wide6_unroll_sat_fp8_gaudi2",
                 "custom_deepseek_v41_expert_token_wide6_aligned_sat_fp8_gaudi2",

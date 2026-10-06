@@ -1174,3 +1174,24 @@ Compatible pending forecast **.811048000 ms/token**, formal baseline remains
 **9.564282 ms/token**. Combined formal trigger1ms has not been reached.
 Evidence: `/opt/ssd960/1cat-vllm-decode-archives/decode-mla-decoded-swa-chain-02/`
 (`result.json`, `PHYSICAL_CONTRACT.json`, `DECISION.json`). All native owners retired.
+
+### 2026-10-06 — trim proved zero W2 K tail
+
+`decode-expert-w2-active-k-chain-01`: same qualified streamed SAT/dual-BF16-quant
+parent in both arms. Keep W13 and padded SiLU amax/gate-up offset unchanged;
+explicit active width reduces W2 K640→576. Zero suffix checked across all384
+checkpoint experts in each of four real layers. Five checkpoint-derived inputs
+×four ranks all downstream outputs byte-exact. Three native savings per four
+layers **.002044000/.001983875/.002041844ms**, median per layer
+**.000510461ms**; forecast40 layers **.020418438ms/token**.
+
+Physical21→21: W13 slices and both weights/MME consumers remain SRAM, each
+decoder has one consumer, W2 physical geometry is576. No node-count credit.
+Simulator trims9.2% executed instructions and10% stores without per-store
+N-tail branches; that is not a corresponding device latency claim.
+Default-off `VLLM_HPU_DSV41_EXPERT_ACTIVE_W2` requires streamed SAT and
+load-time zero-tail metadata; original prepared file/layout remains valid.
+New native schema adds a cold integer `active_width`; shared replay, communication
+and runner interfaces unchanged. C2–C6/prefill retain the old operator.
+Compatible pending forecast **.831466437ms/token**; formal **9.564282ms/token**
+unchanged. All four native owners retired; normal serving acceptance pending.

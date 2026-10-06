@@ -124,4 +124,6 @@ class N256PreparedShard:
             result.append(destination)
         self.check_identity()
         result[0].dsv41_sat_eligible = bool(sat_eligible)
+        if prefix.endswith(".w2") and sat_eligible:
+            result[0].dsv41_active_k = int(self.logical_intermediate)
         return tuple(result)

@@ -202,4 +202,6 @@ def load_projection(shard, prefix, device):
         channel[first:last].copy_(torch.from_numpy(cpu_c.view("<i2")).view(torch.bfloat16))
     shard.check_identity()
     q.dsv41_sat_eligible = bool(sat_eligible)
+    if prefix.endswith(".w2") and sat_eligible:
+        q.dsv41_active_k = int(active_k)
     return q, p, channel

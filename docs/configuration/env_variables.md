@@ -1067,3 +1067,10 @@ adds no context-capacity cutoff. Publication and C2–C6 selection are unchanged
 It composes with vector/mask/native-codec parents, but only reuse receives
 component gain credit. No performance opt-in is promoted until normal installed
 serving and cache-state acceptance pass together.
+
+`VLLM_HPU_DSV41_EXPERT_ACTIVE_W2` defaults to`0`. With the qualified
+streamed SAT C1 parent, consume only the checkpoint's active W2 K extent after
+load-time zero-tail proof. W13 layout, padded SiLU amax and gate/up offset stay
+unchanged. Wider buckets and prefill retain the existing operator. A new native
+schema adds a cold integer`active_width` argument; replay/runner/communication
+interfaces are unchanged. Complete-chain micro-qualified; serving pending.

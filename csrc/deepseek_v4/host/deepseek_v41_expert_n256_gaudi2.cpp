@@ -19,6 +19,7 @@ ELF(dead_bf16)
 ELF(dead_normal_bf16)
 ELF(scale)
 ELF(silu_quant)
+ELF(silu_active_k_quant)
 ELF(scale_reduce)
 ELF(scale_reduce_direct)
 #undef ELF
@@ -35,7 +36,7 @@ void map(tpc_lib_api::TensorAccessPattern& p, unsigned dim, unsigned axis,
     p.mapping[dim].end_b = last;
 }
 tpc_lib_api::GlueCodeReturn silu_quant(tpc_lib_api::HabanaKernelParams* in,
-                                      tpc_lib_api::HabanaKernelInstantiation* out, bool shared_rne = false) {
+                                      tpc_lib_api::HabanaKernelInstantiation* out, bool shared_rne = false, bool active_k = false) {
     using namespace tpc_lib_api;
     if (in->inputTensorNr != 5) { in->inputTensorNr = 5; return GLUE_INCOMPATIBLE_INPUT_COUNT; }
     if (in->outputTensorNr != 2) { in->outputTensorNr = 2; return GLUE_INCOMPATIBLE_OUTPUT_COUNT; }
@@ -68,9 +69,12 @@ tpc_lib_api::GlueCodeReturn silu_quant(tpc_lib_api::HabanaKernelParams* in,
     }
     out->inputTensorAccessPattern[2].allRequired = true;
     out->inputTensorAccessPattern[3].allRequired = true;
+    const auto active_width = active_k ? in->outputTensors[0].geometry.maxSizes[0] : width;
+    if (!active_width || active_width % 64 || active_width > width || width - active_width >= 128)
+        return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
     for (unsigned i = 0; i < 2; ++i) {
         auto& result = in->outputTensors[i].geometry;
-        const uint64_t n = i == 0 ? width : 1;
+        const uint64_t n = i == 0 ? active_width : 1;
         const auto type = i == 0 ? DATA_F8_143 : DATA_F32;
         if (result.dataType != type) { result.dataType = type; return GLUE_INCOMPATIBLE_DATA_TYPE; }
         if (result.dims != 3 || result.maxSizes[0] != n || result.maxSizes[1] != 1 || result.maxSizes[2] != rows) {
@@ -82,9 +86,9 @@ tpc_lib_api::GlueCodeReturn silu_quant(tpc_lib_api::HabanaKernelParams* in,
         map(out->outputTensorAccessPattern[i], 2, 0, 1, 0, 0);
     }
     out->kernel.paramsNr = 0;
-    const auto* start = shared_rne ? &_binary___deepseek_v41_shared_silu_quant_gaudi2_o_start :
+    const auto* start = active_k ? &_binary___deepseek_v41_expert_n256_silu_active_k_quant_gaudi2_o_start : shared_rne ? &_binary___deepseek_v41_shared_silu_quant_gaudi2_o_start :
                                    &_binary___deepseek_v41_expert_n256_silu_quant_gaudi2_o_start;
-    const auto* end = shared_rne ? &_binary___deepseek_v41_shared_silu_quant_gaudi2_o_end :
+    const auto* end = active_k ? &_binary___deepseek_v41_expert_n256_silu_active_k_quant_gaudi2_o_end : shared_rne ? &_binary___deepseek_v41_shared_silu_quant_gaudi2_o_end :
                                  &_binary___deepseek_v41_expert_n256_silu_quant_gaudi2_o_end;
     const unsigned capacity = out->kernel.elfSize;
     out->kernel.elfSize = end - start;
@@ -214,6 +218,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41ExpertN256Gaudi2::GetKernelName(
         mode_ == DeadNormalBF16 ? "custom_deepseek_v41_expert_n256_dead_normal_bf16_gaudi2" :
         mode_ == NormalBF16 ? "custom_deepseek_v41_expert_n256_normal_bf16_gaudi2" :
         mode_ == Scale ? "custom_deepseek_v41_expert_n256_scale_gaudi2" :
+        mode_ == SiluActiveKQuant ? "custom_deepseek_v41_expert_n256_silu_active_k_quant_gaudi2" :
         mode_ == SiluQuant ? "custom_deepseek_v41_expert_n256_silu_quant_gaudi2" :
         mode_ == ScaleReduceShared ? "custom_deepseek_v41_expert_scale_shared_gaudi2" :
         mode_ == SharedSiluQuant ? "custom_deepseek_v41_shared_silu_quant_gaudi2" :
@@ -223,8 +228,8 @@ tpc_lib_api::GlueCodeReturn DeepseekV41ExpertN256Gaudi2::GetKernelName(
 tpc_lib_api::GlueCodeReturn DeepseekV41ExpertN256Gaudi2::GetGcDefinitions(
     tpc_lib_api::HabanaKernelParams* in, tpc_lib_api::HabanaKernelInstantiation* out) {
     using namespace tpc_lib_api;
-    if (mode_ == SiluQuant || mode_ == SharedSiluQuant)
-        return silu_quant(in, out, mode_ == SharedSiluQuant);
+    if (mode_ == SiluQuant || mode_ == SharedSiluQuant || mode_ == SiluActiveKQuant)
+        return silu_quant(in, out, mode_ == SharedSiluQuant, mode_ == SiluActiveKQuant);
     if (mode_ == ScaleReduce || mode_ == ScaleReduceShared) return scale_reduce(in, out);
     if (in->inputTensorNr != 4) { in->inputTensorNr = 4; return GLUE_INCOMPATIBLE_INPUT_COUNT; }
     if (in->outputTensorNr != 1) { in->outputTensorNr = 1; return GLUE_INCOMPATIBLE_OUTPUT_COUNT; }

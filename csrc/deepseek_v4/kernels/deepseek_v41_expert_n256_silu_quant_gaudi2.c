@@ -73,7 +73,11 @@ void main(tensor product, tensor ids, tensor activation_scale, tensor channel, t
     const int5 start = get_index_space_offset();
     const int5 end = start + get_index_space_size();
 #endif
+#ifdef DSV41_SILU_PADDED_INPUT_WIDTH
+    const int width = get_dim_size(product, 0) / 2;
+#else
     const int width = get_dim_size(output, 0);
+#endif
     const int experts = get_dim_size(channel, 2);
     const int scale_rows = get_dim_size(activation_scale, 1);
     bfloat128 activated[20];

@@ -126,10 +126,18 @@ void main(tensor ids, tensor q16, tensor planes, tensor lookup, tensor output)
     const int last_slot = s_i32_min(end[1] * DSV41_N256_SLOT_TILE, get_dim_size(ids, 0));
 #endif
     const int first_group = start[2] * 4;
+    #ifdef DSV41_N256_ACTIVE_K
+    const int last_group = s_i32_min(end[2] * 4, get_dim_size(output, 1) / 32);
+#else
     const int last_group = end[2] * 4;
+#endif
 #if DSV41_N256_FP8
     const int first_k = start[2] * 128;
+    #ifdef DSV41_N256_ACTIVE_K
+    const int last_k = s_i32_min(end[2] * 128, get_dim_size(output, 1));
+#else
     const int last_k = end[2] * 128;
+#endif
 #endif
 #endif
     for (int slot = first_slot; slot < last_slot; ++slot) {

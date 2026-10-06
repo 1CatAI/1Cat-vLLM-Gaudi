@@ -321,6 +321,9 @@ class PreparedMoE(nn.Module):
         self.feature_silu = False
         self.all_route_slots = False
         self.expert_streamed_sat = gaudi_envs.VLLM_HPU_DSV41_EXPERT_STREAMED_SAT
+        self.expert_active_w2 = gaudi_envs.VLLM_HPU_DSV41_EXPERT_ACTIVE_W2
+        if self.expert_active_w2 and not self.expert_streamed_sat:
+            raise ValueError("Active W2 requires the qualified streamed SAT parent")
         self.expert_w2_three_routes = gaudi_envs.VLLM_HPU_DSV41_EXPERT_W2_THREE_ROUTES
         self.token_wide_experts = gaudi_envs.VLLM_HPU_DSV41_EXPERT_TOKEN_WIDE
         self.router_bf16_gate = gaudi_envs.VLLM_HPU_DSV41_BF16_ROUTER_GATE
@@ -543,6 +546,13 @@ class PreparedMoE(nn.Module):
                     if not (getattr(experts.w13_q16, "dsv41_sat_eligible", False)
                             and getattr(experts.w2_q16, "dsv41_sat_eligible", False)):
                         raise ValueError("Three-route W2 requires checkpoint-qualified SAT scale planes")
+                    if self.expert_active_w2:
+                        active_width = getattr(experts.w2_q16, "dsv41_active_k", None)
+                        if active_width is None:
+                            raise ValueError("Active W2 requires load-time zero-tail qualification")
+                        return torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_active_k_sat_shared_fp8_gaudi2(
+                            *operands, channel13, channel2, quantized, activation_scale, tile_shared,
+                            active_width, True)
                     operator = (torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_streamed_sat_shared_fp8_gaudi2
                                 if self.expert_streamed_sat else
                                 torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_two_group_w2_sat_shared_fp8_gaudi2)

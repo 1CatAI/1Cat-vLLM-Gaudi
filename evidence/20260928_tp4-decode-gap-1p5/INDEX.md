@@ -1073,3 +1073,14 @@ Existing wide woA epilogue preserved WoB consumer bits at C1/C2/C6 but no small-
   mirror + nonzero layer-offset alias through native peer/post/router. Three
   positive differences, five fixtures × four ranks exact, .016101598ms/token
   forecast. Supersedes private-slot01; pending total .811048ms, formal unchanged.
+
+- 2026-10-06: K-only expert-tail fix `decode-expert-w2-active-k-chain-01`
+  qualifies full native router/sharedMoE→peer→post/norm chain. Unlike failed
+  N-tail prototype, only group limits change outside the store loop; five
+  simulator checkpoint prefixes exact,9.2% fewer instructions. Five×four
+  hardware fixtures byte-exact, three positive four-layer differences2.044/
+  1.984/2.042us, physical21→21 with SRAM preserved. Forecast .020418438ms;
+  compatible .831466437ms, formal9.564282 unchanged. Default-off source integrated.
+- Two stale CPU fixtures repaired: loader lacked the existing config/directory
+  contract, and backend mock did not accept existing compile-policy kwargs.
+  Original failing log retained; no production contract loosened.

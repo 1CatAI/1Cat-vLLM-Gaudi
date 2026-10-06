@@ -276,3 +276,8 @@ ISA/node-count reduction does not imply matching device time. BF16-probability
 shared-KV trials are slower twice despite confirmed SRAM alias and19 physical
 nodes; closed with zero credit. Next audit reduces real padded expert work,
 not another speculative buffer placement.
+
+2026-10-06 W2 K-tail:10% fewer decoded K rows reduces actual four-layer native
+chain by only2.042us median, .020418ms/token forecast.21 physical nodes retained
+and SRAM producer/consumer proof passes. Cropping this padded subset is valid,
+but does not support the historical .2–.3ms whole-MoE estimate.

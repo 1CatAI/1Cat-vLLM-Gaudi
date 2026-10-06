@@ -286,6 +286,8 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE3_UNROLL,
     GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE6_UNROLL,
     GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE6_ALIGNED,
+    GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE3_ACTIVE_K,
+    GAUDI2_KERNEL_DEEPSEEK_V41_SILU_ACTIVE_K,
     GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE3_SAT,
     GAUDI2_KERNEL_DEEPSEEK_V41_EXPERT_DIAGONAL_SCALE_SHARED,
     GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE_SAT,
@@ -580,6 +582,9 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MLA_EXP_BF16].name, DeepseekV41MlaGaudi2::exp_name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MLA_NORMALIZE].name, DeepseekV41MlaNormalizeGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_KV_NORM_ROPE_PUBLISH].name, DeepseekV41KVNormRopePublishGaudi2::name);
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE3_ACTIVE_K].name, DeepseekV41ExpertTokenWideGaudi2::active_k_name);
+    DeepseekV41ExpertN256Gaudi2(DeepseekV41ExpertN256Gaudi2::SiluActiveKQuant).GetKernelName(
+        guids[GAUDI2_KERNEL_DEEPSEEK_V41_SILU_ACTIVE_K].name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE3_SAT].name, DeepseekV41ExpertTokenWideGaudi2::three_name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE3_UNROLL].name, DeepseekV41ExpertTokenWideGaudi2::unroll3_name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_TOKEN_WIDE6_ALIGNED].name, DeepseekV41ExpertTokenWideGaudi2::aligned_name);
@@ -1144,6 +1149,13 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
         return DeepseekV41ExpertTokenWideGaudi2(6, true, true).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41ExpertTokenWideGaudi2::unroll6_name) == 0)
         return DeepseekV41ExpertTokenWideGaudi2(6, true).GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name, DeepseekV41ExpertTokenWideGaudi2::active_k_name) == 0)
+        return DeepseekV41ExpertTokenWideGaudi2(3, false, false, true).GetGcDefinitions(params, instance);
+    auto activeSilu = DeepseekV41ExpertN256Gaudi2(DeepseekV41ExpertN256Gaudi2::SiluActiveKQuant);
+    char activeSiluName[tpc_lib_api::MAX_NODE_NAME];
+    activeSilu.GetKernelName(activeSiluName);
+    if (std::strcmp(params->guid.name, activeSiluName) == 0)
+        return activeSilu.GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41ExpertTokenWideGaudi2::three_name) == 0)
         return DeepseekV41ExpertTokenWideGaudi2(3).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41ExpertDiagonalScaleSharedGaudi2::name) == 0)
