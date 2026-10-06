@@ -2378,5 +2378,113 @@
     "default": false,
     "formal_gain_credit": false,
     "cleanup": "Both owned workers retired and released modules2/3 without reset or imported buffers"
+  },
+  "mhc_gates_peer_window_20261006": {
+    "status": "component_qualified_default_off",
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-mhc-gates-inflight-chain-01",
+    "round_savings_ms_per_boundary": [
+      0.0016991484375,
+      0.0017206796875,
+      0.0017062109375
+    ],
+    "forecast_ms_per_token": 0.136496875,
+    "forecast_occurrences": 80,
+    "active_compatible_total_ms": 0.7949464023437499,
+    "correctness": "5 fixtures x4 ranks all9 outputs byte-exact, router IDs exact",
+    "flag": "VLLM_HPU_DSV41_MHC_COMM_GATES",
+    "default": false,
+    "formal_qualified": false
+  },
+  "shared_kv_pv_20261006": {
+    "status": "rejected_slower_second_complete_chain",
+    "gain_credit_ms": 0,
+    "round_savings_ms": [
+      -0.003416499999999989,
+      -0.0034469179687500184,
+      -0.003279511718750003
+    ],
+    "correctness": "All5 fixtures x4 ranks: PV official threshold, exactcandidate-feddownstream/state/router; approximatewholeoutputs.",
+    "physical": "SharedBF16KV stays atsameSRAMaddress; onlyK655360bytespinned, auxiliaryordinaryworkspace. PairedBF16storeloweredISA22910 vs25326; neitherstructural/instructionfiximprovescompletechain.",
+    "stopped": true,
+    "source_archive": "/opt/ssd960/1cat-vllm-decode-archives/decode-mla-bf16-probability-01/closed-family-source.tar.gz",
+    "mixed_pv_probe": "F32probabilities xBF16KV rawMME node rejected bySynapse26. No hardware ornewmodeltrial.",
+    "retirement": [
+      {
+        "native_owners_closed": true,
+        "groups_destroyed": true
+      },
+      {
+        "native_owners_closed": true,
+        "groups_destroyed": true
+      },
+      {
+        "native_owners_closed": true,
+        "groups_destroyed": true
+      },
+      {
+        "native_owners_closed": true,
+        "groups_destroyed": true
+      }
+    ],
+    "next": "Archive/removeapproximateBF16PVprototype. ContinueexactSWAreaderwithproductionglobalmirror/viewcontract. Reopenonlyafternewcompiler/trace evidence."
+  },
+  "early_wo_arena_20261006": {
+    "status": "rejected_slower_twice",
+    "reference": "Native-codec QKV/MLA/WO\u2192peer\u2192mHC/FFN parent",
+    "correctness": "5 fixtures x4 ranks all outputs/cache byte-exact",
+    "physical_contract": "Whole producer19\u219217, WO DMA first, all MLA/WO intermediates SRAM, PV hardware BF16 boundary retained",
+    "round_savings_ms_per_layer": [
+      -0.0022654648437499952,
+      -0.0022400429687499945,
+      -0.002286816406250003
+    ],
+    "gain_credit_ms": 0,
+    "formal_baseline_ms": 9.564282285406788,
+    "compatible_pending_forecast_ms": 0.7949464023437499,
+    "retired": true,
+    "reason": "Retaining BF16 PV corrects the initial dtype difference but the complete native chain remains slower by2.24\u20132.29us/layer. Compiler order proves earlier DMA submission, not DMA/computation overlap. No further timing or slicing sweep for this family.",
+    "next": "Separate BF16 probability/shared-KV SRAM candidate; no SRAM WO weight copy",
+    "limitations": "No standalone profiler; DMA serialization vs exposed copy cost vs changed WO batching are not individually attributed."
+  },
+  "decoded_swa_global_20261006": {
+    "status": "component_qualified",
+    "scope": "productionglobal40-layer20MiB mirror, layer3 slice1536, originalF32normalization/probabilities/PV, nativeQKV->MLA->WO->peer/post/norm/router",
+    "round_savings_ms": [
+      0.0005707460937500047,
+      0.00059635546874999,
+      0.0006642499999999912
+    ],
+    "saving_ms_per_reuse_layer": 0.00059635546874999,
+    "qualified_occurrences": 27,
+    "forecast_ms_per_token": 0.01610159765624973,
+    "physical_nodes": {
+      "A": 19,
+      "B": 19
+    },
+    "correctness": "5checkpoint-derivedinput/positionpairs x4ranks, all10observablesbitexact; canonicalpacked/mirrorbytesexact",
+    "gain_scope": "Micro-only forecast, not formal speed. Replacesprivate-slot01 pilot; do notaddboth.",
+    "flag": "VLLM_HPU_DSV41_MLA_DECODED_SWA=0",
+    "formal_baseline_ms": 9.564282285406788,
+    "formal_gain_credit": false,
+    "retirement": [
+      {
+        "native_owners_closed": true,
+        "groups_destroyed": true
+      },
+      {
+        "native_owners_closed": true,
+        "groups_destroyed": true
+      },
+      {
+        "native_owners_closed": true,
+        "groups_destroyed": true
+      },
+      {
+        "native_owners_closed": true,
+        "groups_destroyed": true
+      }
+    ],
+    "pending": "Normal-installedcombinedserving/cache-state acceptance; unchangedpackedfallbackwhenexistingmirrorunavailable; no publish orC2-C6gain credit.",
+    "active_compatible_total_ms": 0.8110479999999997
   }
 }

@@ -14,6 +14,14 @@ import statistics
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--mirror-global-slots', type=int, default=1,
+                        help='Use the production global decoded-SWA allocation for the mirror reader')
+    parser.add_argument('--mirror-layer-slot', type=int, default=0,
+                        help='Publish/read this512-row layer window in the global mirror')
+    parser.add_argument('--mla-decoded-swa', action='store_true',
+                        help='Read the exact packed-codec BF16 SWA mirror produced in both arms')
+    parser.add_argument('--mhc-window', action='store_true',
+                        help='Hold QKV/native MLA/WO fixed; move exact control into native peer window')
     parser.add_argument('--wait-measurement-file',type=Path,help='Prepare native plans, then wait for the shared service timing window to finish')
     parser.add_argument('--qkv-transpose', action='store_true', help='Cold transpose fused QKV FP8 weights; vector MLA and all consumers held fixed')
     parser.add_argument('--mla-tensor-mask', action='store_true', help='Publish per-row partial tensor masks with unchanged row mapping')
@@ -37,6 +45,22 @@ def main():
     parser.add_argument('--retirement-only', action='store_true',
                         help='Reuse measured A/B; check teardown without timing')
     args = parser.parse_args()
+    if not 1 <= args.mirror_global_slots <= 40 or not 0 <= args.mirror_layer_slot < args.mirror_global_slots:
+        parser.error("Invalid mirror layer slot ownership")
+    if args.mla_decoded_swa:
+        if any((args.mhc_window, args.qkv_transpose, args.mla_tensor_mask,
+                args.mla_publish, args.mla_projection, args.peer_post_norm, args.rope_handoff,
+                args.woa_handoff, args.qkv_fusion)):
+            parser.error('--mla-decoded-swa compares only the exact SWA mirror reader')
+        args.mla_hardware_codec = True
+    if args.mhc_window:
+        if any((args.qkv_transpose, args.mla_tensor_mask, args.mla_publish, args.mla_projection,
+                args.peer_post_norm, args.rope_handoff, args.woa_handoff, args.qkv_fusion)):
+            parser.error('--mhc-window fixes the qualified native-codec attention parent')
+        if args.chain_repeats % 8:
+            parser.error('--mhc-window requires repetitions divisible by eight')
+        args.mla_hardware_codec = True
+        os.environ['VLLM_HPU_DSV41_TP_MHC_OVERLAP'] = '1'
     if args.mla_tensor_mask:
         if not args.mla_publish:
             parser.error("--mla-tensor-mask requires --mla-publish")
@@ -111,6 +135,11 @@ def main():
     weight_b = output_sidecar.tensor(f'layers.{layer}.attn.wo_b.weight', 'hpu')
     scale_b = output_sidecar.tensor(f'layers.{layer}.attn.wo_b.channel_scale', 'hpu')
     ffn_norm = shard.tensor(f'layers.{layer}.ffn_norm.weight', 'hpu')
+    if args.mla_decoded_swa:
+        precision_router = shard.tensor(f'layers.{layer}.ffn.gate.weight', 'hpu')
+        precision_bias = shard.tensor(f'layers.{layer}.ffn.gate.bias', 'hpu')
+        precision_bias_vl = shard.tensor(f'layers.{layer}.ffn.gate.bias_vl', 'hpu')
+        precision_image_mask = torch.zeros(1, dtype=torch.bool, device='hpu')
     if args.peer_post_norm:
         downstream_control=shard.tensor(f'layers.{layer}.hc_ffn_fn','hpu')
         downstream_scale=shard.tensor(f'layers.{layer}.hc_ffn_scale','hpu')
@@ -118,6 +147,9 @@ def main():
         downstream_router=shard.tensor(f'layers.{layer}.ffn.gate.weight','hpu')
     control, control_scale, control_base = [shard.tensor(f'layers.{layer}.hc_attn_{name}', 'cpu')
                                           for name in ('fn','scale','base')]
+    window_weight = control.reshape(24, 160, 128).permute(1, 0, 2).contiguous().to('hpu') if args.mhc_window else None
+    window_scale = control_scale.to('hpu') if args.mhc_window else None
+    window_base = control_base.to('hpu') if args.mhc_window else None
     scaling = config_values['rope_scaling']
     table = rotary_table(64, args.phase_rows, config_values['compress_rope_theta'],
                          scaling['original_max_position_embeddings'],scaling['factor'],
@@ -156,6 +188,12 @@ def main():
         page_table=torch.arange(4096,dtype=torch.int32,device='hpu')
     history=torch.cat([embeddings[i%5][:,:512] for i in range(256)],0).contiguous().to('hpu')
     base_cache=torch.ops.custom_op.custom_deepseek_v41_swa_pack_bf16_gaudi2(history)
+    if args.mla_decoded_swa:
+        from vllm_gaudi.ops.deepseek_v41_math import unpack_swa
+        # Preserve the real publisher contract in both arms. The writer uses
+        # a512-row layer slot; the C1 history reader addresses its first256.
+        mirror_history = unpack_swa(base_cache).bfloat16().contiguous()
+        mirror_history = torch.where(mirror_history == 0, torch.zeros_like(mirror_history), mirror_history)
     fixtures=[]
     for position,embedding in zip((0,127,255,8191,16384),embeddings,strict=True):
         residual=embedding.unsqueeze(1).expand(-1,4,-1).contiguous()
@@ -172,7 +210,10 @@ def main():
         query=torch.ops.custom_op.custom_deepseek_v41_q_norm_projection_rope_gaudi2(
             qr,qnorm,qb,sqb,pos,phase,1e-20).reshape(1,heads,512)
         return query,raw
-    decoded_unused=torch.zeros((512,512),dtype=torch.bfloat16,device='hpu')
+    decoded_offset = args.mirror_layer_slot * 512 if args.mla_decoded_swa else -1
+    decoded_unused=torch.zeros((args.mirror_global_slots * 512,512),dtype=torch.bfloat16,device='hpu')
+    if args.mla_decoded_swa:
+        decoded_unused[decoded_offset:decoded_offset+256].copy_(mirror_history)
     state=[]
     def consume(q,raw,norm,pos,phase,cache,main,mask,sink,scale,lens,wa,sa,wb,sb,*,fused):
         if fused:
@@ -200,7 +241,7 @@ def main():
                 projection=direct_dense_fp8(x,weight,channel)
             q,kv,completion,qr=torch.ops.custom_op.custom_deepseek_v41_qkv_projection_publish_gaudi2(
                 projection[:,:1280].contiguous(),qnorm,projection[:,1280:].contiguous(),norm,
-                pos,phase,cache,decoded_unused,qb,sqb,1e-20,-1)
+                pos,phase,cache,decoded_unused,qb,sqb,1e-20,decoded_offset)
             pos=completion[:1]
             if args.mla_publish:
                 if fused and args.mla_projection:
@@ -222,14 +263,17 @@ def main():
                 if args.mla_projection and fused:
                     return torch.ops.custom_op.custom_deepseek_v41_main_reuse_projection_gaudi2(
                         q.reshape(1,heads,512),cache,main,mask,pos,sink,scale,lens,wa,sa,phase,wb,sb)
-                mla_op = (torch.ops.custom_op.custom_deepseek_v41_main_reuse_native_codec_mla_gaudi2
-                          if fused and args.mla_hardware_codec else
+                mla_op = (torch.ops.custom_op.custom_deepseek_v41_main_reuse_decoded_swa_mla_gaudi2
+                          if fused and args.mla_decoded_swa else
+                          torch.ops.custom_op.custom_deepseek_v41_main_reuse_native_codec_mla_gaudi2
+                          if (fused or args.mla_decoded_swa) and args.mla_hardware_codec else
                           torch.ops.custom_op.custom_deepseek_v41_main_reuse_vector_mask_mla_gaudi2
                           if args.mla_hardware_codec or (fused and args.mla_vector_mask) else
                           torch.ops.custom_op.custom_deepseek_v41_main_reuse_vector_mla_gaudi2
                           if args.mla_tensor_mask or args.qkv_transpose or args.mla_vector_mask or (fused and args.mla_vector) else
                           torch.ops.custom_op.custom_deepseek_v41_main_reuse_mla_gaudi2)
-                out=mla_op(q.reshape(1,heads,512),cache,main,mask,pos,sink,scale,lens)
+                out=mla_op(q.reshape(1,heads,512),decoded_unused.narrow(0, decoded_offset, 512) if fused and args.mla_decoded_swa else cache,
+                           main,mask,pos,sink,scale,lens)
             if args.woa_handoff and args.rope_handoff and fused:
                 return torch.ops.custom_op.custom_deepseek_v41_rope_woa_wob_roundtrip_fp8_gaudi2(
                     out,wa,sa,wb,sb,pos,phase)
@@ -242,7 +286,33 @@ def main():
             return (partial,published_rows,published_mask) if args.mla_publish else partial
         q,raw=project(x,weight,channel,pos,qnorm,qb,sqb,phase)
         return consume(q,raw,norm,pos,phase,cache,main,mask,sink,scale,lens,wa,sa,wb,sb,fused=fused)
-    consumers=[compiled(lambda *args,fused=fused:full_chain(*args,fused=fused)) for fused in (False,True)]
+    def window_control(r, w):
+        return torch.ops.custom_op.custom_deepseek_v41_control_rrms_swizzled_bf16_gaudi2(
+            r.flatten(1), w, config_values['rms_norm_eps'])
+
+    def window_gates(c, scale, base):
+        return torch.ops.custom_op.custom_deepseek_v41_mhc_gates_f32_gaudi2(
+            c[:, :24].contiguous(), c[:, 24:25].contiguous(), scale, base)
+
+    def window_producer(*operands):
+        r, w, *attention_inputs = operands
+        control = window_control(r, w)
+        return full_chain(*attention_inputs, fused=True), control
+
+    def window_finish(peers, residual, gates, norm):
+        updated, collapsed = torch.ops.custom_op.custom_deepseek_v41_mhc_post_collapse_gaudi2(
+            peers, residual, gates[:, 4:8].contiguous(), gates[:, 8:].reshape(1, 4, 4).contiguous(),
+            gates[:, :4].contiguous())
+        normalized, quantized, scale = torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
+            collapsed, norm, config_values['rms_norm_eps'])
+        return updated, collapsed, normalized, quantized, scale, gates
+
+    window_baseline = compiled(window_producer) if args.mhc_window else None
+    window_late = compiled(lambda r, w, scale, base: window_gates(window_control(r, w), scale, base)) if args.mhc_window else None
+    window_gate = compiled(window_gates) if args.mhc_window else None
+    window_consumer = compiled(window_finish) if args.mhc_window else None
+    consumers=[compiled(lambda *args,fused=fused:full_chain(*args,fused=fused))
+               for fused in ((True, True) if args.mhc_window else (False,True))]
     def post_consumers(residual,collapsed,normalized,quantized,scale):
         # Retain both downstream dependency branches. The control projection
         # consumes the updated residual; the router consumes the normalized
@@ -270,12 +340,19 @@ def main():
         residual,collapsed=torch.ops.custom_op.custom_deepseek_v41_mhc_post_collapse_gaudi2(
             value.bfloat16(),residual,post,comb,pre)
         normalized,quantized,scale=torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(collapsed,norm,1e-20)
+        if args.mla_decoded_swa:
+            logits = torch.ops.custom_op.custom_deepseek_v41_bf16_linear_f32_gaudi2(
+                normalized, precision_router)
+            ids, routing = torch.ops.custom_op.custom_deepseek_v41_router_logits_top6_gaudi2(
+                logits, precision_bias, precision_bias_vl, precision_image_mask)
+            return residual, collapsed, normalized, quantized, scale, ids, routing, logits
         return residual,collapsed,normalized,quantized,scale
     finishers=[compiled(lambda *args,fused=fused:finish(*args,fused=fused)) for fused in (False,True)]
     plans, graphs, visible, externals = [], [], [], []
     for arm,(consumer,finisher) in enumerate(zip(consumers,finishers,strict=True)):
         plan = bridge.PreparedGroupPlan()
         slots, tensors, external = {}, {}, []
+        recorded_nodes = []
 
         def slot(value, is_input, slots=slots, tensors=tensors, external=external, plan=plan):
             key = ((value.data_ptr(), tuple(value.shape), value.stride(), value.dtype)
@@ -304,99 +381,153 @@ def main():
             if not calls:
                 raise RuntimeError('Missing physical recipe recording')
             for recipe, inputs, outputs in calls:
-                plan.add_compute(recipe, [slot(v, True) for v in inputs], [slot(v, False) for v in outputs])
+                input_slots, output_slots = [slot(v, True) for v in inputs], [slot(v, False) for v in outputs]
+                plan.add_compute(recipe, input_slots, output_slots)
+                recorded_nodes.append(('compute', recipe, input_slots, output_slots))
             return result
 
         cache=base_cache.clone();state.append(cache)
-        output=compute(consumer,(x,transposed_qkv if args.qkv_transpose and arm else weight,channel,position,qnorm,qb,sqb,phase,norm,cache,main_values,shared_mask,
-                                sink,softmax_scale,lengths,weight_a,scale_a,weight_b,scale_b))
+        attention_inputs = (x,transposed_qkv if args.qkv_transpose and arm else weight,channel,position,qnorm,qb,sqb,
+                            phase,norm,cache,main_values,shared_mask,sink,softmax_scale,lengths,
+                            weight_a,scale_a,weight_b,scale_b)
+        if args.mhc_window and arm == 0:
+            output, current_control = compute(window_baseline, (residual, window_weight, *attention_inputs))
+        else:
+            output = compute(consumer, attention_inputs)
         publication=()
         if args.mla_publish:
             output,*publication=output
         peers=torch.ops.vllm_gaudi.tp_peer_allgather(output,4)
-        torch.hpu.synchronize();plan.add_all_gather(slot(output,False),slot(peers,False))
-        outputs=(output,)+tuple(compute(finisher,(peers.reshape(4,1,5120),residual,post,comb,pre,ffn_norm)))
+        torch.hpu.synchronize()
+        gather_slots = (slot(output,False), slot(peers,False))
+        plan.add_all_gather(*gather_slots)
+        recorded_nodes.append(('gather', *gather_slots))
+        if args.mhc_window:
+            if arm == 0:
+                gates = compute(window_gate, (current_control, window_scale, window_base))
+            else:
+                gates = compute(window_late, (residual, window_weight, window_scale, window_base))
+            outputs = (output,) + tuple(compute(window_consumer, (peers.reshape(4,1,5120),residual,gates,ffn_norm)))
+        else:
+            outputs=(output,)+tuple(compute(finisher,(peers.reshape(4,1,5120),residual,post,comb,pre,ffn_norm)))
         outputs=outputs+tuple(publication)
+        repeats_per_group = 8 if args.mhc_window else 1
+        for _ in range(repeats_per_group - 1):
+            for operation in recorded_nodes:
+                if operation[0] == 'compute':
+                    plan.add_compute(*operation[1:])
+                else:
+                    plan.add_all_gather(*operation[1:])
         plan.prepare(backend, [slot(value, False) for value in outputs])
         graph = bridge.NativeDecodeGraph()
-        graph.configure_topology(args.chain_repeats,args.chain_repeats,False)
-        graph.configure_dependency_policy(False)
-        graph.capture([plan]*args.chain_repeats,[external]*args.chain_repeats)
+        graph.configure_topology(args.chain_repeats // repeats_per_group,args.chain_repeats,False)
+        graph.configure_dependency_policy(args.mhc_window)
+        graph.capture([plan]*(args.chain_repeats // repeats_per_group),
+                      [external]*(args.chain_repeats // repeats_per_group))
         graph.instantiate()
         graph.bind_dynamic_inputs([x,position,residual,post,comb,pre])
         plans.append(plan)
         graphs.append(graph)
         visible.append(outputs)
         externals.append(external)
-    checks = []
-    for index, fixture in enumerate(fixtures):
-        for destination, value in zip((x,position,residual,post,comb,pre), fixture, strict=True):
-            destination.copy_(value.to('hpu'))
-        torch.hpu.synchronize()
-        observed = []
-        for cache in state: cache.copy_(base_cache)
-        torch.hpu.synchronize()
-        for graph,outputs,cache in zip(graphs,visible,state,strict=True):
-            graph.replay_fixed_with_completion().synchronize()
-            observed.append([value.cpu() for value in outputs] + [cache.cpu()])
-        exact = [torch.equal(a.view(torch.uint8),b.view(torch.uint8))
-                 for i,(a, b) in enumerate(zip(*observed, strict=True))]
-        if not all(exact):
-            torch.save(dict(fixture=fixture, observed=observed), directory/'failure.pt')
-            raise RuntimeError(f'KV publication differs for input {index}: {exact}')
-        checks.append(dict(input=index, all_outputs_exact=True))
-    (directory/"result.json").write_text(json.dumps(dict(status="correctness_passed",checks=checks))+"\n")
-    if args.wait_measurement_file is not None:
-        import time
-        torch.distributed.barrier()
-        if rank == 0:
-            args.wait_measurement_file.with_suffix('.ready.json').write_text(
-                json.dumps(dict(status='correctness_and_native_capture_ready',checks=checks),indent=2)+'\n')
-        while not args.wait_measurement_file.exists():
-            time.sleep(2)
-        torch.distributed.barrier()
-    for graph in graphs:
-        for _ in range(20):
-            graph.replay_fixed_with_completion().synchronize()
-    compiled_before = graph_compilation_count()
-    periods = []
     tickets, events = [], []
-    for label in '' if args.retirement_only else 'ABABAB':
-        wait_for_loading(directory,rank,torch.distributed)
-        graph = graphs[label == 'B']
-        events = [(torch.hpu.Event(enable_timing=True), torch.hpu.Event(enable_timing=True))
-                  for _ in range(args.steps)]
-        torch.distributed.barrier()
-        tickets = []
-        for begin, end in events:
-            begin.record()
-            tickets.append(graph.replay_fixed_with_completion())
-            end.record()
-        torch.hpu.synchronize()
-        local = [begin.elapsed_time(end)/args.chain_repeats for begin,end in events]
-        ranks = [None]*4
-        torch.distributed.all_gather_object(ranks, local)
-        periods.append(dict(arm=label, rank_device_ms=ranks,
-                            median_ms=statistics.median(max(values) for values in zip(*ranks, strict=True))))
-        (directory/'result.json').write_text(json.dumps(dict(status='measuring',checks=checks,periods=periods))+'\n')
+    failure = None
+    try:
+        checks = []
+        for index, fixture in enumerate(fixtures):
+            for destination, value in zip((x,position,residual,post,comb,pre), fixture, strict=True):
+                destination.copy_(value.to('hpu'))
+            torch.hpu.synchronize()
+            observed = []
+            mirror_passed = True
+            for cache in state: cache.copy_(base_cache)
+            if args.mla_decoded_swa:
+                decoded_unused[decoded_offset:decoded_offset+256].copy_(mirror_history)
+            torch.hpu.synchronize()
+            for graph,outputs,cache in zip(graphs,visible,state,strict=True):
+                graph.replay_fixed_with_completion().synchronize()
+                observed.append([value.cpu() for value in outputs] + [cache.cpu()])
+                if args.mla_decoded_swa:
+                    mirrored = decoded_unused[decoded_offset:decoded_offset+256].cpu()
+                    canonical = unpack_swa(cache).bfloat16().cpu()
+                    canonical = torch.where(canonical == 0, torch.zeros_like(canonical), canonical)
+                    mirror_passed = mirror_passed and torch.equal(
+                        mirrored.view(torch.uint8), canonical.view(torch.uint8))
+
+            exact = [torch.equal(a.view(torch.uint8),b.view(torch.uint8))
+                     for i,(a, b) in enumerate(zip(*observed, strict=True))]
+            numerical = None
+            passed = all(exact) and mirror_passed
+            decisions = [None] * 4
+            torch.distributed.all_gather_object(decisions, bool(passed))
+            if not all(decisions):
+                torch.save(dict(fixture=fixture, observed=observed, numerical=numerical,
+                                rank_decisions=decisions), directory/'failure.pt')
+                raise RuntimeError(f'KV publication/mirror gate failed for input {index}: {exact}; {numerical}')
+            checks.append(dict(input=index, all_outputs_exact=all(exact), exact_outputs=exact,
+                               numerical=numerical, decoded_swa_canonical_exact=mirror_passed if args.mla_decoded_swa else None,
+                               applicable_correctness_passed=passed))
+        (directory/"result.json").write_text(json.dumps(dict(status="correctness_passed",checks=checks))+"\n")
+        if args.wait_measurement_file is not None:
+            import time
+            torch.distributed.barrier()
+            if rank == 0:
+                args.wait_measurement_file.with_suffix('.ready.json').write_text(
+                    json.dumps(dict(status='correctness_and_native_capture_ready',checks=checks),indent=2)+'\n')
+            while not args.wait_measurement_file.exists():
+                time.sleep(2)
+            torch.distributed.barrier()
+        for graph in graphs:
+            for _ in range(20):
+                graph.replay_fixed_with_completion().synchronize()
+        compiled_before = graph_compilation_count()
+        periods = []
+        tickets, events = [], []
+        for label in '' if args.retirement_only else 'ABABAB':
+            wait_for_loading(directory,rank,torch.distributed)
+            graph = graphs[label == 'B']
+            events = [(torch.hpu.Event(enable_timing=True), torch.hpu.Event(enable_timing=True))
+                      for _ in range(args.steps)]
+            torch.distributed.barrier()
+            tickets = []
+            for begin, end in events:
+                begin.record()
+                tickets.append(graph.replay_fixed_with_completion())
+                end.record()
+            torch.hpu.synchronize()
+            local = [begin.elapsed_time(end)/args.chain_repeats for begin,end in events]
+            ranks = [None]*4
+            torch.distributed.all_gather_object(ranks, local)
+            periods.append(dict(arm=label, rank_device_ms=ranks,
+                                median_ms=statistics.median(max(values) for values in zip(*ranks, strict=True))))
+            (directory/'result.json').write_text(json.dumps(dict(status='measuring',checks=checks,periods=periods))+'\n')
+            if rank == 0:
+                print(json.dumps(dict(arm=label,median_ms=periods[-1]['median_ms'])),flush=True)
+        if graph_compilation_count() != compiled_before:
+            raise RuntimeError('Hot compilation invalidates timing')
+        savings = [a['median_ms']-b['median_ms'] for a, b in zip(periods[::2], periods[1::2], strict=True)]
+        result = dict(status='retirement_check' if args.retirement_only else 'completed', checks=checks, periods=periods,
+                      saving_ms_per_layer=statistics.median(savings) if savings else None,
+                      round_savings_ms=savings,
+                      three_consistent_rounds=bool(savings) and all(value > 0 for value in savings),
+                      full_model_gain_credit=False, physical_node_gate_pending=True,chain_repeats=args.chain_repeats,
+                      mirror_global_slots=args.mirror_global_slots,mirror_layer_slot=args.mirror_layer_slot,
+                      production_compiler_static_coordinates=True,full_qkv_query_producer=True,
+                      candidate_kind="mla_decoded_swa" if args.mla_decoded_swa else "mla_publish_tensor_mask" if args.mla_tensor_mask else ("mla_publish_hardware_codec" if args.mla_publish else "mla_reuse_hardware_codec") if args.mla_hardware_codec else ("mla_publish_mask" if args.mla_publish else "mla_vector_mask") if args.mla_vector_mask else "qkv_cold_transpose" if args.qkv_transpose else ("mla_publish_vector" if args.mla_publish else "mla_reuse_vector") if args.mla_vector else "main_publish_projection" if args.mla_publish else "main_reuse_projection" if args.mla_projection else "rope_woa_handoff" if args.rope_handoff else "peer_post_norm" if args.peer_post_norm else "woa_handoff" if args.woa_handoff else "qkv_joint" if args.qkv_fusion else "kv_reuse",
+                      input_source=__doc__, native_replay=True,
+                      native_library_sha256=hashlib.sha256(Path(os.environ['VLLM_HPU_DSV4_TPC_OP_LIBRARY']).read_bytes()).hexdigest(),
+                      native_kernel_library_sha256=hashlib.sha256(Path(os.environ['GC_KERNEL_PATH']).read_bytes()).hexdigest())
+        (directory/'result.json').write_text(json.dumps(result, indent=2)+'\n')
         if rank == 0:
-            print(json.dumps(dict(arm=label,median_ms=periods[-1]['median_ms'])),flush=True)
-    if graph_compilation_count() != compiled_before:
-        raise RuntimeError('Hot compilation invalidates timing')
-    savings = [a['median_ms']-b['median_ms'] for a, b in zip(periods[::2], periods[1::2], strict=True)]
-    result = dict(status='retirement_check' if args.retirement_only else 'completed', checks=checks, periods=periods,
-                  saving_ms_per_layer=statistics.median(savings) if savings else None,
-                  round_savings_ms=savings,
-                  three_consistent_rounds=bool(savings) and all(value > 0 for value in savings),
-                  full_model_gain_credit=False, physical_node_gate_pending=True,chain_repeats=args.chain_repeats,
-                  production_compiler_static_coordinates=True,full_qkv_query_producer=True,
-                  candidate_kind="mla_publish_tensor_mask" if args.mla_tensor_mask else ("mla_publish_hardware_codec" if args.mla_publish else "mla_reuse_hardware_codec") if args.mla_hardware_codec else ("mla_publish_mask" if args.mla_publish else "mla_vector_mask") if args.mla_vector_mask else "qkv_cold_transpose" if args.qkv_transpose else ("mla_publish_vector" if args.mla_publish else "mla_reuse_vector") if args.mla_vector else "main_publish_projection" if args.mla_publish else "main_reuse_projection" if args.mla_projection else "rope_woa_handoff" if args.rope_handoff else "peer_post_norm" if args.peer_post_norm else "woa_handoff" if args.woa_handoff else "qkv_joint" if args.qkv_fusion else "kv_reuse",
-                  input_source=__doc__, native_replay=True,
-                  native_library_sha256=hashlib.sha256(Path(os.environ['VLLM_HPU_DSV4_TPC_OP_LIBRARY']).read_bytes()).hexdigest(),
-                  native_kernel_library_sha256=hashlib.sha256(Path(os.environ['GC_KERNEL_PATH']).read_bytes()).hexdigest())
-    (directory/'result.json').write_text(json.dumps(result, indent=2)+'\n')
-    if rank == 0:
-        (root/'result.json').write_text(json.dumps(result, indent=2)+'\n')
+            (root/'result.json').write_text(json.dumps(result, indent=2)+'\n')
+    except BaseException as error:
+        import traceback
+        (directory / 'validation-error.txt').write_text(traceback.format_exc())
+        failure = RuntimeError(str(error))
+        (directory / 'result.json').write_text(json.dumps(dict(status='failed_before_retirement',
+            error=str(error), performance_valid=False)) + '\n')
+        if rank == 0:
+            (root / 'result.json').write_text((directory / 'result.json').read_text())
     for graph, plan in zip(graphs, plans, strict=True):
         graph.close()
         plan.invalidate()
@@ -427,6 +558,8 @@ def main():
     destroy_distributed_environment()
     config.__exit__(None, None, None)
     (directory/'retirement.json').write_text(json.dumps(dict(native_owners_closed=True, groups_destroyed=True))+'\n')
+    if failure is not None:
+        raise failure
 
 
 if __name__ == '__main__':

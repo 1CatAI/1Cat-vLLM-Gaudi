@@ -334,6 +334,7 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_PUBLISH_VECTOR,
     GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_PUBLISH_VECTOR_MASK,
     GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_REUSE_NATIVE_CODEC,
+    GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_REUSE_DECODED_SWA,
     GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_PUBLISH_NATIVE_CODEC,
     GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_PUBLISH_TENSOR_MASK,
     GAUDI2_KERNEL_DEEPSEEK_V41_MHC_POST_COLLAPSE,
@@ -658,6 +659,7 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_PUBLISH_VECTOR].name, "custom_deepseek_v41_main_publish_vector_gaudi2");
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_REUSE_VECTOR_MASK].name, "custom_deepseek_v41_main_reuse_vector_mask_gaudi2");
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_REUSE_NATIVE_CODEC].name, "custom_deepseek_v41_main_reuse_native_codec_gaudi2");
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_REUSE_DECODED_SWA].name, "custom_deepseek_v41_main_reuse_decoded_swa_gaudi2");
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_REUSE_VECTOR].name, "custom_deepseek_v41_main_reuse_vector_gaudi2");
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_REUSE_GATHER].name, DeepseekV41MainReuseGatherGaudi2::name);
 
@@ -1231,6 +1233,8 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
         return DeepseekV41MainPublishGatherGaudi2(true).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41MainPublishGatherGaudi2::name) == 0)
         return DeepseekV41MainPublishGatherGaudi2().GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name, "custom_deepseek_v41_main_reuse_decoded_swa_gaudi2") == 0)
+        return DeepseekV41MainReuseGatherGaudi2(true, true, false, true).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, "custom_deepseek_v41_main_reuse_native_codec_gaudi2") == 0)
         return DeepseekV41MainReuseGatherGaudi2(true, true, true).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, "custom_deepseek_v41_main_reuse_vector_mask_gaudi2") == 0)

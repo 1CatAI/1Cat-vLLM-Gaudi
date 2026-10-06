@@ -265,3 +265,14 @@ Producer stays4nodes, reference post/router4nodes; candidate gate1 +post/router4
 This changes the exposed TP-wait boundary, not bandwidth or node count.
 Component-qualified80-boundary forecast .136496875ms/token; pending compatible
 total .794946402, formal9.564282 unchanged. Full service remains unqualified.
+
+2026-10-06 early-WO SRAM arena: two complete native QKV→MLA→WO→peer→FFN attempts are slower. Corrected hardware-BF16 PV boundary still loses2.265/2.240/2.287us/layer despite producer19→17nodes and SRAM intermediates. Stop the family, zero credit; earlier compiler order is not proof of DMA/computation overlap. Removed unused arena API after archiving exact class/dispatch, immutable library and execution snapshot. Separate shared-KV BF16-PV prototype keeps at most1MiB graph-local scratch without a WO weight copy; compiler/simulator/numerical screens pass, hardware fullchain queued. Formal9.564282ms and compatible pending.794946402ms unchanged.
+
+C0 two-part FP8 screen: the extra serial activation producer is the unresolved limiting stage. Five varied-head fixtures produce exact quantization in simulation, but its43826 instructions run in one workpoint. The existing controller’s72874 simulated instructions are distributed across24 workpoints. This comparison is structure, not cycles or hardware timing; no latency/gain claim. Native mixed BF16×FP8 GEMM node is rejected (status26), same geometry FP8×FP8 compiles. Keep this prototype offline until a shared or efficient parallel quantizer exists.
+
+2026-10-06: SWA mirror read reduces simulated instructions69124→31234 but
+native complete-chain savings are only .596us/reuse layer. Stores stay15382;
+ISA/node-count reduction does not imply matching device time. BF16-probability
+shared-KV trials are slower twice despite confirmed SRAM alias and19 physical
+nodes; closed with zero credit. Next audit reduces real padded expert work,
+not another speculative buffer placement.

@@ -76,6 +76,18 @@ void main(tensor swa, tensor shared_rows, tensor shared_mask, tensor positions,
                 }
                 continue;
             }
+#ifdef DSV41_REUSE_DECODED_SWA
+            // The canonical publisher already mirrors the packed-codec result.
+            // Read that exact BF16 boundary instead of decoding history again.
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                const bfloat128 output = valid_swa ? v_bf16_ld_tnsr_b(
+                    (int5){chunk * 128, index}, swa) : (bfloat128){0};
+                v_bf16_st_tnsr((int5){chunk * 128, slot, token}, rows, output);
+                const float128 restored = convert_bfloat128_to_float128(output, SW_LINEAR);
+                v_f32_st_tnsr((int5){chunk * 128, slot, token}, values, restored.v1);
+                v_f32_st_tnsr((int5){chunk * 128 + 64, slot, token}, values, restored.v2);
+            }
+#else
             uchar256 scale_bytes = {0};
             if (valid_swa)
                 scale_bytes = v_u8_ld_tnsr_partial_b((int5){512, index}, swa, 15, 0);
@@ -120,6 +132,7 @@ void main(tensor swa, tensor shared_rows, tensor shared_mask, tensor positions,
                 const float128 restored = convert_bfloat128_to_float128(output, SW_LINEAR);
                 v_f32_st_tnsr((int5){chunk * 64, slot, token}, values, restored.v1);
             }
+#endif
 #endif
         }
     }

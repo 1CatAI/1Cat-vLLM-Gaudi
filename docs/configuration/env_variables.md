@@ -1055,3 +1055,15 @@ realize overlap. Control precision and fixed-rank peer summation stay unchanged.
 Prefill and C2–C6 retain their current path. Combined official-sampling serving
 qualification is pending. This adds a standalone gate node; no node-count
 reduction or end-to-end saving is claimed.
+
+### VLLM_HPU_DSV41_MLA_DECODED_SWA
+
+Default: `0` (complete-chain qualified; combined serving acceptance pending).
+C1 shared-main reuse can read the canonical publisher's BF16 decoded SWA layer
+slot, preserving FP32 softmax/PV and all quantization boundaries. The existing
+writer and request/cache state must supply a current owned mirror. When that
+mirror is unavailable, the shared packed reader remains selected; this flag
+adds no context-capacity cutoff. Publication and C2–C6 selection are unchanged.
+It composes with vector/mask/native-codec parents, but only reuse receives
+component gain credit. No performance opt-in is promoted until normal installed
+serving and cache-state acceptance pass together.

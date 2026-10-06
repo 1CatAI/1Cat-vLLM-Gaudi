@@ -27,8 +27,12 @@ def main():
     parser.add_argument('--ipc-tmp-root', type=Path, help='Short SSD directory for Unix-domain IPC sockets')
     parser.add_argument('--port', type=int, required=True)
     parser.add_argument('--modules', help='Optional comma-separated modules to lease')
+    parser.add_argument('--device-poll-seconds', type=float, default=5,
+                        help='Recheck free ownership/locks this often while queued; no reservation of occupied cards')
     parser.add_argument('--lock-dir', type=Path, default=Path(__file__).resolve().parents[2] / 'locks')
     args = parser.parse_args()
+    if not 0.25 <= args.device_poll_seconds <= 60:
+        parser.error('--device-poll-seconds must be between0.25 and60')
     root = Path(__file__).resolve().parents[1]
     case = args.output.resolve()
     case.mkdir(parents=True, exist_ok=True)
@@ -75,7 +79,8 @@ def main():
     # DUMP_* values are paths in the bridge, including the string "0".
     environment = {k: v for k, v in environment.items() if 'DUMP' not in k}
     child_environment = {k: v for k, v in os.environ.items() if 'DUMP' not in k}
-    with lease_free_modules(case / 'devices.json', lock_dir=args.lock_dir, modules=modules) as (selected, load):
+    with lease_free_modules(case / 'devices.json', lock_dir=args.lock_dir, modules=modules,
+                            poll_s=args.device_poll_seconds) as (selected, load):
         environment['HABANA_VISIBLE_MODULES'] = ','.join(map(str, selected))
         (case / 'launch.json').write_text(json.dumps(dict(command=command, environment=environment,
                                                         working_directory=str(frozen)), indent=2) + '\n')

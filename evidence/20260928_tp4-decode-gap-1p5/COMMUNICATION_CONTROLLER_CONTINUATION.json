@@ -2,8 +2,8 @@
   "formal_baseline_ms": 9.564282285406788,
   "target_ms": 7,
   "formal_completed_this_batch": false,
-  "new_qualified_gain_ms": 0.136496875,
-  "compatible_pending_forecast_ms": 0.7949464023437499,
+  "new_qualified_gain_ms": 0.01610159765624973,
+  "compatible_pending_forecast_ms": 0.8110479999999997,
   "negative_and_prepared_experiments": {
     "decode-mhc-native-fp32-chain-01": {
       "status": "rejected_slower",
@@ -167,9 +167,52 @@
       },
       "gain_credit_ms": 0,
       "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-pcie-star-frontier-01/four-rank-corrected"
+    },
+    "decode-mhc-fp8-two-part-01": {
+      "status": "offline_quantizer_correct_but_serial_workpoint_rejected_for_native_queue",
+      "cpu_equation_cases": 15,
+      "simulator_fixtures": 5,
+      "quantized_bytes_exact": true,
+      "power_scales_exact": true,
+      "quantizer_instructions_per_single_tpc_workpoint": 43826,
+      "reference_total_controller_instructions": 72874,
+      "reference_workpoints": 24,
+      "mixed_input_gemm_status": "BF16 x FP8 raw node rejected by Synapse status26; FP8 x FP8 control compiled successfully",
+      "scope": "CPU and simulator only. No hardware timing or demonstrated performance regression; zero forecast.",
+      "next_constraint": "Find a shared upstream quantizer or efficient parallel producer before adding serial conversion to the complete chain",
+      "gain_credit_ms": 0,
+      "artifact": "/opt/ssd960/1cat-vllm-decode-archives/decode-mhc-fp8-two-part-01/RESULT.json"
+    },
+    "decode-mla-decoded-swa-01": {
+      "status": "global_mirror_complete_chain_qualified",
+      "hypothesis": "Canonical Q/KV publisher already has an optional exact packed-codec SWA mirror; consume it directly rather than redecode128 history rows in each reuse layer.",
+      "formal_baseline_ms": 9.564282285406788,
+      "target_ms": 7,
+      "gain_credit_ms": 0.01610159765624973,
+      "numerical": "F32 probabilities/PV and all WO/post consumers unchanged; exact arithmetic experiment.",
+      "input_contract": "BF16 [512,512] full decoded layer slot; first256 ring rows are read. The real Q/KV mirror writer is enabled in BOTH timed arms. Archived packed main/page fixture and five checkpoint input/position pairs retained.",
+      "simulator": {
+        "fixtures": 5,
+        "keys_values_masks_byte_exact": true,
+        "normal_position_reference_instructions": 69124,
+        "candidate_instructions": 31234,
+        "reference_loads": 5206,
+        "candidate_loads": 5142,
+        "stores": 15382
+      },
+      "cpu_meta_passed": 29,
+      "unqualified_serving_constraints": [
+        "Ensure mirror is current after full prefill and prefix restore, independently of main-cache search length.",
+        "Keep canonical packed SWA and request-slot ownership. Do not alias another layer/request mirror.",
+        "Current source only registers the research op; no model default/flag enabled. C2-C6 and prefill selection remain unchanged."
+      ],
+      "minimum_native_validation": "QKV with exact mirror publication -> MLA -> WO -> native peer -> post/norm/router, 5 inputs x4 ranks; physical producer/mirror binding audit; ABABAB200 with three positive differences.",
+      "native_dir": "/opt/ssd960/1cat-vllm-decode-archives/decode-mla-decoded-swa-01/native",
+      "qualified_evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-mla-decoded-swa-chain-02",
+      "native_retired": true
     }
   },
-  "active": "Gate scheduling component-qualified and integrated default-off; next test moves exact packed controller into the same communication window. No formal run yet.",
+  "active": "Exact global SWA reader micro-qualified; integrating default-off source. Continue routed-expert padding/dataflow audit.",
   "excluded_modules": [
     0,
     1,
@@ -197,5 +240,131 @@
     "physical_evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-mhc-gates-inflight-chain-01/PHYSICAL_SUMMARY.json",
     "cpu_checks": 21,
     "compatible_pending_forecast_ms": 0.7949464023437499
+  },
+  "late_controller_full_attention": {
+    "status": "rejected_slower",
+    "round_savings_ms": [
+      -0.0019640078125,
+      -0.0018855390625,
+      -0.0019288984375
+    ],
+    "gain_credit_ms": 0,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-mhc-attention-window-chain-01"
+  },
+  "early_wo_arena_first": {
+    "status": "slower_dtype_correction_pending",
+    "round_savings_ms": [
+      -0.0027568046875,
+      -0.00282808203125,
+      -0.00281136328125
+    ],
+    "gain_credit_ms": 0,
+    "physical_nodes": [
+      19,
+      17
+    ],
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-mla-early-wo-arena-chain-01"
+  },
+  "prepared_bf16_pv": {
+    "status": "rejected_slower_second_complete_chain",
+    "gain_credit_ms": 0,
+    "round_savings_ms": [
+      -0.003416499999999989,
+      -0.0034469179687500184,
+      -0.003279511718750003
+    ],
+    "correctness": "All5 fixtures x4 ranks: PV official threshold, exactcandidate-feddownstream/state/router; approximatewholeoutputs.",
+    "physical": "SharedBF16KV stays atsameSRAMaddress; onlyK655360bytespinned, auxiliaryordinaryworkspace. PairedBF16storeloweredISA22910 vs25326; neitherstructural/instructionfiximprovescompletechain.",
+    "stopped": true,
+    "source_archive": "/opt/ssd960/1cat-vllm-decode-archives/decode-mla-bf16-probability-01/closed-family-source.tar.gz",
+    "mixed_pv_probe": "F32probabilities xBF16KV rawMME node rejected bySynapse26. No hardware ornewmodeltrial.",
+    "retirement": [
+      {
+        "native_owners_closed": true,
+        "groups_destroyed": true
+      },
+      {
+        "native_owners_closed": true,
+        "groups_destroyed": true
+      },
+      {
+        "native_owners_closed": true,
+        "groups_destroyed": true
+      },
+      {
+        "native_owners_closed": true,
+        "groups_destroyed": true
+      }
+    ],
+    "next": "Archive/removeapproximateBF16PVprototype. ContinueexactSWAreaderwithproductionglobalmirror/viewcontract. Reopenonlyafternewcompiler/trace evidence."
+  },
+  "early_wo_arena_corrected": {
+    "status": "rejected_slower_twice",
+    "reference": "Native-codec QKV/MLA/WO\u2192peer\u2192mHC/FFN parent",
+    "correctness": "5 fixtures x4 ranks all outputs/cache byte-exact",
+    "physical_contract": "Whole producer19\u219217, WO DMA first, all MLA/WO intermediates SRAM, PV hardware BF16 boundary retained",
+    "round_savings_ms_per_layer": [
+      -0.0022654648437499952,
+      -0.0022400429687499945,
+      -0.002286816406250003
+    ],
+    "gain_credit_ms": 0,
+    "formal_baseline_ms": 9.564282285406788,
+    "compatible_pending_forecast_ms": 0.7949464023437499,
+    "retired": true,
+    "reason": "Retaining BF16 PV corrects the initial dtype difference but the complete native chain remains slower by2.24\u20132.29us/layer. Compiler order proves earlier DMA submission, not DMA/computation overlap. No further timing or slicing sweep for this family.",
+    "next": "Separate BF16 probability/shared-KV SRAM candidate; no SRAM WO weight copy",
+    "limitations": "No standalone profiler; DMA serialization vs exposed copy cost vs changed WO batching are not individually attributed."
+  },
+  "offline_fp8_controller": {
+    "status": "cpu_numerical_screen_only",
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-mhc-fp8-two-part-01",
+    "fixtures": 15,
+    "max_normalized_gate_error": 1.0514780248587623e-08,
+    "limit": 5e-05,
+    "max_gate_abs": 0.0001837015151977539,
+    "gain_credit_ms": 0,
+    "risk": "Extra activation-decomposition and MME boundaries; no complete-chain performance proof, no model implementation yet"
+  },
+  "active_native_candidate": null,
+  "qualified_decoded_swa": {
+    "status": "component_qualified",
+    "scope": "productionglobal40-layer20MiB mirror, layer3 slice1536, originalF32normalization/probabilities/PV, nativeQKV->MLA->WO->peer/post/norm/router",
+    "round_savings_ms": [
+      0.0005707460937500047,
+      0.00059635546874999,
+      0.0006642499999999912
+    ],
+    "saving_ms_per_reuse_layer": 0.00059635546874999,
+    "qualified_occurrences": 27,
+    "forecast_ms_per_token": 0.01610159765624973,
+    "physical_nodes": {
+      "A": 19,
+      "B": 19
+    },
+    "correctness": "5checkpoint-derivedinput/positionpairs x4ranks, all10observablesbitexact; canonicalpacked/mirrorbytesexact",
+    "gain_scope": "Micro-only forecast, not formal speed. Replacesprivate-slot01 pilot; do notaddboth.",
+    "flag": "VLLM_HPU_DSV41_MLA_DECODED_SWA=0",
+    "formal_baseline_ms": 9.564282285406788,
+    "formal_gain_credit": false,
+    "retirement": [
+      {
+        "native_owners_closed": true,
+        "groups_destroyed": true
+      },
+      {
+        "native_owners_closed": true,
+        "groups_destroyed": true
+      },
+      {
+        "native_owners_closed": true,
+        "groups_destroyed": true
+      },
+      {
+        "native_owners_closed": true,
+        "groups_destroyed": true
+      }
+    ],
+    "pending": "Normal-installedcombinedserving/cache-state acceptance; unchangedpackedfallbackwhenexistingmirrorunavailable; no publish orC2-C6gain credit."
   }
 }

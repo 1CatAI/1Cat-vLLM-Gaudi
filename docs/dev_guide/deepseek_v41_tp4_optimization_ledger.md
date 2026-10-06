@@ -1153,3 +1153,24 @@ Evidence: `/opt/ssd960/1cat-vllm-decode-archives/decode-mhc-gates-inflight-chain
 with CPU logs in `decode-mhc-gates-inflight-01`. All native owners retired.
 Compatible pending forecast **.794946402 ms/token**, official baseline remains
 **9.564282 ms/token**, batch formal trigger remains **1 ms**.
+
+### 2026-10-06 — reuse existing canonical SWA mirror
+
+`decode-mla-decoded-swa-chain-02`: publisher writes the real 40-layer
+20MiB BF16 mirror in both arms; reader aliases layer3 at byte offset1572864.
+Five checkpoint-derived fixtures × four ranks have all10 observables exact,
+including canonical packed cache, mirror and router. Native ABABAB200 savings
+**.000570746/.000596355/.000664250 ms/reuse layer**; only27 reuse layers receive
+**.016101598 ms/token forecast**. Original F32 normalization, probabilities
+and PV arithmetic retained. Physical producer nodes23→19; no slice DMA.
+
+Default-off `VLLM_HPU_DSV41_MLA_DECODED_SWA` consumes the current owner's
+existing mirror only when publication is already active; absent mirror retains
+the packed reader. No new context cutoff or TP-size branch. Publisher, wider
+buckets and serving/cache-state acceptance remain unqualified for this flag.
+Private-slot chain01 is superseded and receives no additive credit.
+
+Compatible pending forecast **.811048000 ms/token**, formal baseline remains
+**9.564282 ms/token**. Combined formal trigger1ms has not been reached.
+Evidence: `/opt/ssd960/1cat-vllm-decode-archives/decode-mla-decoded-swa-chain-02/`
+(`result.json`, `PHYSICAL_CONTRACT.json`, `DECISION.json`). All native owners retired.

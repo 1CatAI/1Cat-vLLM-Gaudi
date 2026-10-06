@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL: bool = False
     VLLM_HPU_DSV41_MLA_VECTOR_CODEC: bool = False
     VLLM_HPU_DSV41_MLA_VECTOR_MASK: bool = False
+    VLLM_HPU_DSV41_MLA_DECODED_SWA: bool = False
     VLLM_HPU_DSV41_MLA_REUSE_HW_CODEC: bool = False
     VLLM_HPU_DSV41_MLA_PUBLISH_MASK: bool = False
     VLLM_HPU_DSV41_EXPERT_W2_THREE_ROUTES: bool = False
@@ -574,6 +575,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_ATTN_FUSED_PROLOGUE", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MLA_PUBLISH_MASK":
     lambda: os.environ.get("VLLM_HPU_DSV41_MLA_PUBLISH_MASK", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_MLA_DECODED_SWA":
+    lambda: os.environ.get("VLLM_HPU_DSV41_MLA_DECODED_SWA", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MLA_REUSE_HW_CODEC":
     lambda: os.environ.get("VLLM_HPU_DSV41_MLA_REUSE_HW_CODEC", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MLA_VECTOR_MASK":

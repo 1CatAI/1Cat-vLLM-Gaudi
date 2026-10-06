@@ -2010,8 +2010,13 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                         projection = (gaudi_envs.VLLM_HPU_DSV41_MAIN_MLA_PROJECTION
                                       and self._can_fuse_mla_woa(positions)
                                       and getattr(self.weights.wo_b, "dense_fp8", False))
+                        # The existing decoded publisher/prefill/cache state owns
+                        # this mirror. Unavailable mirrors retain the packed
+                        # reader; no context cutoff is added to the MLA path.
+                        mirror = (self.shared.decoded_swa.narrow(0, self.decoded_swa_offset, 512)
+                                  if decoded and gaudi_envs.VLLM_HPU_DSV41_MLA_DECODED_SWA else None)
                         output = shared_main_attention(self, query, positions, selected, lengths, selected_main,
-                                                       projection=projection)
+                                                       projection=projection, decoded_swa=mirror)
                         if projection:
                             return self._reduce_decode_output(output, ready_outputs, decode=decode)
                     return self._finish_output(output, positions, ready_outputs, decode=decode)

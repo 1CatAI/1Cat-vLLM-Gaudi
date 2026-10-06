@@ -5,7 +5,7 @@ import torch
 from vllm_gaudi import envs as gaudi_envs
 
 
-def shared_main_attention(owner, query, positions, selected, lengths, workspace, *, projection=False):
+def shared_main_attention(owner, query, positions, selected, lengths, workspace, *, projection=False, decoded_swa=None):
     # A selection owner can change without a KV owner change (reindex layers).
     # Neither ownership key alone identifies the reusable selected rows.
     key = (owner.kv_source, owner.index_source, owner.ratio)
@@ -25,6 +25,12 @@ def shared_main_attention(owner, query, positions, selected, lengths, workspace,
         rows, mask = workspace[key]
         if projection:
             operation = torch.ops.custom_op.custom_deepseek_v41_main_reuse_projection_gaudi2
+        elif gaudi_envs.VLLM_HPU_DSV41_MLA_DECODED_SWA and decoded_swa is not None and query.shape[0] == 1:
+            if (decoded_swa.dtype != torch.bfloat16 or decoded_swa.shape != (512, 512)
+                    or decoded_swa.device != query.device or not decoded_swa.is_contiguous()):
+                raise ValueError("Decoded SWA reader requires the current publisher's contiguous layer slot")
+            operation = torch.ops.custom_op.custom_deepseek_v41_main_reuse_decoded_swa_mla_gaudi2
+            return operation(query, decoded_swa, rows, mask, positions, owner.weights.attn_sink, owner.scale, lengths)
         elif gaudi_envs.VLLM_HPU_DSV41_MLA_REUSE_HW_CODEC and query.shape[0] == 1:
             operation = torch.ops.custom_op.custom_deepseek_v41_main_reuse_native_codec_mla_gaudi2
         elif gaudi_envs.VLLM_HPU_DSV41_MLA_VECTOR_MASK and query.shape[0] == 1:

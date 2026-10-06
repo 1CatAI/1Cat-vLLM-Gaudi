@@ -165,3 +165,64 @@ def test_hardware_reuse_requires_the_mask_parent(monkeypatch):
     with pytest.raises(ValueError, match="vector mask parents"):
         shared_main_attention(owner, torch.ones((1, 16, 512)), torch.tensor([0]),
                               torch.zeros((1, 512), dtype=torch.int32), torch.tensor([640]), {})
+
+
+def test_decoded_swa_reader_uses_current_owned_slot_after_rebind(monkeypatch):
+    from vllm_gaudi.ops import deepseek_v41_shared_main as module
+    monkeypatch.setattr(module.gaudi_envs, 'VLLM_HPU_DSV41_MLA_DECODED_SWA', True)
+    owner = Layer(20, 20, 20, torch.ones(1), torch.ones((1, 512), dtype=torch.int32)).owner
+    q = torch.ones((1, 16, 512), dtype=torch.bfloat16)
+    rows = torch.ones((1, 640, 512), dtype=torch.bfloat16)
+    mask = torch.ones((1, 640))
+    selected = torch.zeros((1, 512), dtype=torch.int32)
+    first = torch.zeros((1536, 512), dtype=torch.bfloat16).narrow(0, 1024, 512)
+    second = torch.ones((2048, 512), dtype=torch.bfloat16).narrow(0, 512, 512)
+    received = []
+
+    def reader(query, mirror, main, validity, *args):
+        received.append(mirror)
+        assert main is rows and validity is mask
+        return query
+
+    monkeypatch.setattr(torch.ops.custom_op, 'custom_deepseek_v41_main_reuse_decoded_swa_mla_gaudi2',
+                        reader, raising=False)
+    for slot in (first, second):
+        workspace = {(20, 20, 1): (rows, mask)}
+        assert shared_main_attention(owner, q, torch.tensor([16384]), selected, torch.tensor([640]),
+                                     workspace, decoded_swa=slot) is q
+    assert received[0] is first and received[1] is second
+    assert first.storage_offset() == 1024 * 512
+
+
+def test_unavailable_mirror_retains_packed_reader(monkeypatch):
+    from vllm_gaudi.ops import deepseek_v41_shared_main as module
+    monkeypatch.setattr(module.gaudi_envs, 'VLLM_HPU_DSV41_MLA_DECODED_SWA', True)
+    monkeypatch.setattr(module.gaudi_envs, 'VLLM_HPU_DSV41_MLA_REUSE_HW_CODEC', True)
+    monkeypatch.setattr(module.gaudi_envs, 'VLLM_HPU_DSV41_MLA_VECTOR_CODEC', True)
+    monkeypatch.setattr(module.gaudi_envs, 'VLLM_HPU_DSV41_MLA_VECTOR_MASK', True)
+    owner = Layer(20, 20, 20, torch.ones(1), torch.ones((1, 512), dtype=torch.int32)).owner
+    q = torch.ones((1, 16, 512), dtype=torch.bfloat16)
+    received = []
+
+    def reader(query, cache, *args):
+        received.append(cache)
+        return query
+
+    monkeypatch.setattr(torch.ops.custom_op, 'custom_deepseek_v41_main_reuse_native_codec_mla_gaudi2',
+                        reader, raising=False)
+    workspace = {(20, 20, 1): (torch.ones((1, 640, 512)), torch.ones((1, 640)))}
+    assert shared_main_attention(owner, q, torch.tensor([200000]), torch.zeros((1, 512), dtype=torch.int32),
+                                 torch.tensor([640]), workspace) is q
+    assert received == [owner.swa]
+
+
+@pytest.mark.parametrize('shape,dtype', [((256, 512), torch.bfloat16), ((512, 512), torch.float32)])
+def test_decoded_reader_rejects_an_incompatible_owned_slot(monkeypatch, shape, dtype):
+    from vllm_gaudi.ops import deepseek_v41_shared_main as module
+    monkeypatch.setattr(module.gaudi_envs, 'VLLM_HPU_DSV41_MLA_DECODED_SWA', True)
+    owner = Layer(20, 20, 20, torch.ones(1), torch.ones((1, 512), dtype=torch.int32)).owner
+    workspace = {(20, 20, 1): (torch.ones((1, 640, 512)), torch.ones((1, 640)))}
+    with pytest.raises(ValueError, match='current publisher'):
+        shared_main_attention(owner, torch.ones((1, 16, 512)), torch.tensor([16384]),
+                              torch.zeros((1, 512), dtype=torch.int32), torch.tensor([640]),
+                              workspace, decoded_swa=torch.zeros(shape, dtype=dtype))
