@@ -383,9 +383,8 @@ class HPUWorker(WorkerBase):
                         "native_token_readback": self.model_runner.tp4_token_readback is not None,
                         "device_continuation": bool(self.model_runner.v2_completion),
                         "prefix_groups": self.model_runner.model.ordinary.prefix_groups,
-                        "prefix_ready": self.model_runner.model.ordinary.prefix_ready(
-                            self.model_runner.model.program.search_length
-                        ),
+                        "prefix_ready": (getattr(program, "search_length", None) is not None
+                                         and self.model_runner.model.ordinary.prefix_ready(program.search_length)),
                         "decode_token_bound": getattr(program, "decode_token_bound", None),
                         "index_mirror": {
                             "capacity_tokens": getattr(program.shared, "index_mirror_tokens", 0),
@@ -669,27 +668,36 @@ class HPUWorker(WorkerBase):
                 logger.info("V4.1 worker shutdown: %s", name)
 
         phase("begin")
-        if self.model_runner is not None:
-            getattr(self.model_runner, "prepare_shutdown", lambda: None)()
-        if getattr(self, "_profiler_running", False):
-            phase("stop active profiler")
-            # Export the live sink before retiring recipes/communicators. A
-            # failed start_profile can leave this owner active as well.
-            self.stop_profile(refresh_native=False)
-            phase("profiler stopped")
-        if gaudi_envs.VLLM_HPU_TP2_STATIC_GROUP_PLAN:
-            self._write_native_decoder_stats("shutdown")
-            from vllm_gaudi.ops.tp2_prepared_plan import shutdown_prepared_group_plans
+        try:
+            if self.model_runner is not None:
+                getattr(self.model_runner, "prepare_shutdown", lambda: None)()
+            if getattr(self, "_profiler_running", False):
+                phase("stop active profiler")
+                # Export the live sink before retiring recipes/communicators. A
+                # failed start_profile can leave this owner active as well.
+                self.stop_profile(refresh_native=False)
+                phase("profiler stopped")
+        finally:
+            try:
+                if gaudi_envs.VLLM_HPU_TP2_STATIC_GROUP_PLAN:
+                    # Startup may be interrupted before decode bindings exist.
+                    # Optional diagnostics must not prevent recipe retirement.
+                    try:
+                        self._write_native_decoder_stats("shutdown")
+                    except Exception:
+                        logger.warning("Could not write shutdown decoder statistics", exc_info=True)
+                    from vllm_gaudi.ops.tp2_prepared_plan import shutdown_prepared_group_plans
 
-            phase("retire native programs")
-            shutdown_prepared_group_plans()
-            phase("native programs retired")
-        self._model_runner_stash.clear()
-        self._model_runner_state_stash.clear()
-        if self.model_runner is not None:
-            phase("close runner")
-            getattr(self.model_runner, "shutdown_inc", lambda: None)()
-        phase("complete")
+                    phase("retire native programs")
+                    shutdown_prepared_group_plans()
+                    phase("native programs retired")
+            finally:
+                self._model_runner_stash.clear()
+                self._model_runner_state_stash.clear()
+                if self.model_runner is not None:
+                    phase("close runner")
+                    getattr(self.model_runner, "shutdown_inc", lambda: None)()
+                phase("complete")
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()  # type: ignore[union-attr]

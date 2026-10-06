@@ -31,6 +31,7 @@ def test_tail_next_position_is_independent_of_candidate_certificate(position, te
     logits = torch.linspace(-1, 1, 512).reshape(1, -1)
     owner = SimpleNamespace(
         _head_projection=lambda hidden: logits, device_sampling=True, device_next_position=True,
+        sampling_threshold=False, sampling_fused_packet=False, sampling_shared_max=False,
         sampling_params=torch.tensor([[temperature, .95, -1.]]),
         sampling_seed=torch.tensor([42], dtype=torch.int32),
         sampling_origin=torch.tensor([position - 1], dtype=torch.int32), tp_rank=0,

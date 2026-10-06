@@ -1742,7 +1742,7 @@
     "gain_credit_ms": 0,
     "next": "Hoist immutable 24 coefficients out of 40-tile loop; ISA change verified, next hardware run queued"
   },
-  "pending_micro_only_ms": 0.9445251249999994,
+  "pending_micro_only_ms": 1.0324461875,
   "accepted_baseline_20261005": {
     "case": "decode-physical-fusion-serving-03",
     "official_tpot_ms": 9.564282285406788,
@@ -2716,7 +2716,7 @@
       93
     ]
   ],
-  "resource_state": "0/1/4/5 quarantined after earlier DMA-BUF experiment;2/3/6/7 currently occupied by foreign DSpark service. Queue only, no foreign process/device action.",
+  "resource_state": "Healthy2/3/6/7 released after preformal startup correction; corrected independent service relaunch next",
   "predicate_pack_20261006": {
     "status": "complete_chain_micro_qualified_default_off",
     "round_savings_ms": [
@@ -2777,7 +2777,7 @@
     "owners_retired": true
   },
   "queued_native_candidates": [],
-  "next_action": "Align combined wide+predicate comparison with default native candidate coordinates; no repeat of unchanged SSA softmax. Formal unchanged9.564ms; micro forecast0.944525ms below1ms gate.",
+  "next_action": "Run one installed official16K/EOS plus companion160token trace with all component-qualified flags; no baseline repeat",
   "qualified_production_coordinate_selection": {
     "status": "complete_chain_micro_qualified_default_off",
     "round_savings_ms_per_layer": [
@@ -2875,5 +2875,13 @@
     "forecast_ms_token": 0.037524406249999975,
     "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-sampling-shared-max-chain-02",
     "formal_result": null
+  },
+  "startup_correction_20261006": {
+    "case": "/opt/ssd960/1cat-vllm-decode-archives/decode-accumulated-serving-04/startup-attempt-01",
+    "formal_requests": 0,
+    "trace_directory_preflight_added": true,
+    "shutdown_diagnostics_nonfatal": true,
+    "owners_retired": true,
+    "formal_gain_credit": 0
   }
 }
