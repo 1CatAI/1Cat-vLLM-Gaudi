@@ -20,6 +20,28 @@ def normalized_error(actual, reference):
     return float((a-b).square().sum() / denominator) if denominator else 0.0
 
 
+def routing_error_by_expert(reference_ids, reference_weights, actual_ids, actual_weights):
+    """Compare the same selected experts without treating a permutation as error.
+
+    A changed expert set or duplicate selected ID remains a failed contract.
+    This aligns only the diagnostic weights; it never changes model routing.
+    """
+    if (reference_ids.ndim != 2 or not reference_ids.numel() or reference_ids.shape != actual_ids.shape
+            or reference_weights.shape != reference_ids.shape or actual_weights.shape != actual_ids.shape):
+        raise ValueError('Routing IDs and weights must have matching [tokens, experts] shapes')
+    if reference_ids.dtype not in (torch.int32, torch.int64) or actual_ids.dtype not in (torch.int32, torch.int64):
+        raise ValueError('Routing IDs must be integer tensors')
+    left, right = reference_ids.cpu().tolist(), actual_ids.cpu().tolist()
+    same_set = all(len(set(a)) == len(a) and len(set(b)) == len(b) and sorted(a) == sorted(b)
+                   for a, b in zip(left, right, strict=True))
+    if not same_set:
+        return {'same_expert_set': False, 'order_equal': left == right, 'error': float('inf')}
+    indices = torch.tensor([[b.index(expert) for expert in a] for a, b in zip(left, right, strict=True)],
+                           dtype=torch.int64, device=actual_weights.device)
+    return {'same_expert_set': True, 'order_equal': left == right,
+            'error': normalized_error(actual_weights.gather(1, indices), reference_weights)}
+
+
 def gate_reference(residual, weight, scale, base, eps):
     flat = residual.flatten(1).float()
     mixes = (flat @ weight.float().T) * torch.rsqrt(flat.square().mean(-1, keepdim=True) + eps)
