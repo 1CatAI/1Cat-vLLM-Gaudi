@@ -1,8 +1,12 @@
 # TP4 C1 decode roofline — 2026-10-05
 
-Official baseline: **9.564282 ms/token**, T=1, top_p=.95, seed=42,
-16384 input → 1858 natural-EOS output, profiler off (`decode-physical-fusion-serving-03/formal/result.json`).
-Current trace rank0 compute union **6.981807 ms**, stage noncompute **2.417838 ms**.
+Current official baseline: **8.239257597 ms/token**, T=1, top_p=.95, seed=42,
+16384 uncached input →2365 natural-EOS output, profiler off (`decode-accumulated-serving-07/formal/result.json`).
+Same-code companion repair03 rank0 period **8.183174083 ms**, compute union **5.820636539 ms**, not computing **2.362537544 ms**;
+no-engine idle is **2.252 ms**, the remainder has HCL/DMA activity. These are the same 24-cycle analysis window.
+Batch05's shared expert finalizer, gate-packet and weighted-statistics paths are accepted defaults; pending qualified forecast is **0**.
+Target7ms remains unmet by **1.239257597 ms**. The older9.564282 trace is6.981807/2.417838ms;
+the row accounting and experiment sequence below remain historical and are not a current additive breakdown.
 The detailed operator accounting below is historical `kernel-fusion-serving-02`, not a fresh attribution of 9.564.
 That directory's REPORT still names an earlier 11.021 formal result; its physical timeline is usable independently,
 but the folder name alone does not establish which later 9.997 formal request it represents.
@@ -281,3 +285,5 @@ not another speculative buffer placement.
 chain by only2.042us median, .020418ms/token forecast.21 physical nodes retained
 and SRAM producer/consumer proof passes. Cropping this padded subset is valid,
 but does not support the historical .2–.3ms whole-MoE estimate.
+
+2026-10-06 active-six W2 ordinary-diagonal screen:21→19nodes and decodedweightsSRAM, but W13 activation spills. Pinning only30KiB activation before its live producer fails compiler-created logical concat relocation; stop before timing, zero credit. Qualified two-three W2 consumer bundle remains selected. The important constraint is producer/consumer SRAM lifetimes, not GEMM command count.
