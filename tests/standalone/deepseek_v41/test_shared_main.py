@@ -226,3 +226,33 @@ def test_decoded_reader_rejects_an_incompatible_owned_slot(monkeypatch, shape, d
         shared_main_attention(owner, torch.ones((1, 16, 512)), torch.tensor([16384]),
                               torch.zeros((1, 512), dtype=torch.int32), torch.tensor([640]),
                               workspace, decoded_swa=torch.zeros(shape, dtype=dtype))
+
+
+@pytest.mark.parametrize('tokens', [1, 2, 6])
+def test_register_softmax_switch_preserves_larger_decode_entrypoints(monkeypatch, tokens):
+    from vllm_gaudi.ops import deepseek_v41_shared_main as module
+    for flag in ('MLA_VECTOR_CODEC', 'MLA_VECTOR_MASK', 'MLA_PUBLISH_MASK',
+                 'MLA_REUSE_HW_CODEC', 'MLA_DECODED_SWA'):
+        monkeypatch.setattr(module.gaudi_envs, f'VLLM_HPU_DSV41_{flag}', False)
+    monkeypatch.setattr(module.gaudi_envs, 'VLLM_HPU_DSV41_MLA_REGISTER_SOFTMAX', True)
+    calls = []
+
+    def publish(*args):
+        calls.append(('publish', args[10:]))
+        return args[0], torch.zeros((tokens, 640, 512)), torch.ones((tokens, 640))
+
+    def reuse(*args):
+        calls.append(('reuse', args[8:]))
+        return args[0]
+
+    monkeypatch.setattr(torch.ops.custom_op, 'custom_deepseek_v41_main_publish_mla_gaudi2', publish, raising=False)
+    monkeypatch.setattr(torch.ops.custom_op, 'custom_deepseek_v41_main_reuse_mla_gaudi2', reuse, raising=False)
+    owner = Layer(20, 20, 20, torch.ones(1), torch.ones((tokens, 512), dtype=torch.int32)).owner
+    q = torch.ones((tokens, 16, 512))
+    args = (owner, q, torch.zeros(tokens, dtype=torch.int32),
+            torch.zeros((tokens, 512), dtype=torch.int32), torch.full((tokens,), 640, dtype=torch.int32))
+    workspace = {}
+    assert shared_main_attention(*args, workspace) is q
+    assert shared_main_attention(*args, workspace) is q
+    extra = (True,) if tokens == 1 else ()
+    assert calls == [('publish', extra), ('reuse', extra)]
