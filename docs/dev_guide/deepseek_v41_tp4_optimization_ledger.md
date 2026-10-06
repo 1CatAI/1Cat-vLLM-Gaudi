@@ -5,6 +5,33 @@
 
 ## 当前正式测量与待验收累计（2026-10-06）
 
+官方采样 temperature=1.0、top_p=0.95、seed=42；512K、C16384、前缀缓存开、完整预热。
+独立安装服务 `decode-accumulated-serving-04`，冻结源码 `71d4f203`：一次无 profiler 正式请求，
+16384 未命中输入 → **1868 tokens 自然 EOS**，**8.532522828 ms/token**。
+固定输入 token 与上一基线一致，14 项事实/约束通过；四卡启动验收到正式请求后的采样回退增量均为0。
+额外采一份160-token companion trace，不能把启动/导出 profiler 的整请求均值当作正式 TPOT。
+
+前一基线 **9.564282285 ms/token**；本批兼容组件预估 **1.032446188 ms/token**，
+正式观测下降 **1.031759458 ms/token**（预估兑现99.93%）。本批所有计入的组件项关账，
+**未端到端的兼容收益累计归零**，不得继续叠加到8.532523的新基线。
+22个共用路径控制已改为默认开启；未验证的 BF16控制权重、
+linear-load控制、register softmax等仍默认关闭。保留各组件原有形状、权重、状态及批次条件。
+
+本次健康模块2/3/6/7，worker主核56/61/84/89；旧正式基线使用0/1/4/5、10/15/38/43。
+当前旧组设备处于隔离状态，按用户“有卡就用”执行。上述是正式模型观测差值，
+没有把不同卡位的 trace 分类耗时相减或逐项分配。机器其他任务、CPU压力和切换记录在本次host-load中。
+
+正式结果/语义/回退/默认提升清单：SSD `decode-accumulated-serving-04/`
+`formal/result.json`、`QUALITY.json`、`SAMPLING_FALLBACK_AUDIT.json`、`DEFAULT_PROMOTION.json`。
+配套trace归档 `trace-request/capture`，四卡活动分布见
+`trace-analysis-window/RAW_ACTIVITY_REPORT.md`：周期8.407–8.409ms，
+计算5.988–6.005ms，非计算2.402–2.421ms；不等同于正式请求的计时。
+**7.0 ms 目标尚未完成，还差1.532523 ms/token。**
+有用BF16转换象限完成了数值及完整链检查，但三轮均略慢，已归档并恢复共用接口。
+该失败留在实验INDEX，不进入此台账。
+
+### 上一基线及本批预测快照（已关账）
+
 官方采样 T=1.0、top_p=0.95、seed=42，512K、C16384、缓存开、完整预热：
 `decode-physical-fusion-serving-03` 独立安装服务，16K未命中→1858 tokens自然EOS，
 **9.564282 ms/token**；14项事实/约束通过，采样回退0。输入token与父版本相同，
@@ -19,7 +46,8 @@ STATIC_COORDINATES 原已默认开启，共六项。显式诊断覆盖仍可关�
 recipe编号冲突停止追查，不再作逐项归因。输出/post-norm/WOa/发布链小融合归档，
 默认关闭；共享-main输出原型提交 `0dd878fb`。旧项目中的组件预测不能继续叠加到新基线。
 
-**当前本轮微基准待验收累计：0.944525125 ms/token（估计，尚未端到端）。**
+**以下是上一基线下保留的历史预测快照；本批已关账，当前待验收累计为0。**
+当时记录的累计为0.944525125 ms/token，后续修正和新增项见文末。
 MoE 合并候选0.206373750ms、mHC0.039834531ms、Attention主体向量化0.176384352ms，
 量化整行amax去重0.036122500ms；FFN BF16量化0.001143438ms、索引gain副本0.030703250ms、
 mHC权重布局0.005530156ms、共享RRMS post0.000290156ms、reuse向量mask0.137790492ms、
@@ -1351,3 +1379,13 @@ Producer30→27, consumer16same. Forecastonce **0.037524406ms/token**, compatibl
 pending **1.032446187ms/token**, formal9.564282unchanged.
 `VLLM_HPU_DSV41_SAMPLING_SHARED_MAX=0` until combinedserving.
 Evidence SSD `decode-sampling-shared-max-chain-02`/`decode-sampling-shared-max-packet-01`.
+
+### 2026-10-06 — batch04 official-sampling serving closure
+
+All compatible pending entries above through shared local max/index are now
+included in formal **8.532522828ms/token**. Saved forecast **1.032446188ms/token**,
+observed model change **1.031759458ms/token**; pending total **0**. Entries retain
+historical micro-only labels for their measurement dates, but cannot be counted
+again. 16K fixed prompt,1868 naturalEOS,14facts pass,zero additional sampler
+fallbacks. Ordinary independent installation, source71d4f203,healthy2/3/6/7.
+See SSD `decode-accumulated-serving-04/FORMAL_DECISION.json` and `QUALITY.json`.

@@ -1059,11 +1059,10 @@
     "formal_result": "/opt/ssd960/1cat-vllm-decode-archives/decode-device-loop-serving-02/formal/result.json"
   },
   "qualified_baseline": {
-    "decode_ms_token": 9.997343230176622,
-    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-device-loop-serving-02/formal/result.json",
-    "token_exact_reference": "/opt/ssd960/1cat-vllm-decode-archives/decode-position-serving-01/formal/token_ids.json",
+    "decode_ms_token": 8.532522827530956,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-accumulated-serving-04/formal/result.json",
     "natural_eos": true,
-    "tokens": 2382,
+    "tokens": 1868,
     "full_warmup": true,
     "temperature": 1.0,
     "top_p": 0.95,
@@ -1742,7 +1741,7 @@
     "gain_credit_ms": 0,
     "next": "Hoist immutable 24 coefficients out of 40-tile loop; ISA change verified, next hardware run queued"
   },
-  "pending_micro_only_ms": 1.0324461875,
+  "pending_micro_only_ms": 0.0,
   "accepted_baseline_20261005": {
     "case": "decode-physical-fusion-serving-03",
     "official_tpot_ms": 9.564282285406788,
@@ -2551,7 +2550,7 @@
     "formal_baseline_ms": 9.564282285406788,
     "flag": "VLLM_HPU_DSV41_INDEX_QUERY_CODEC=0"
   },
-  "compatible_pending_forecast_ms": 1.0324461875,
+  "compatible_pending_forecast_ms": 0.0,
   "current_micro_cards": [
     2,
     3,
@@ -2716,7 +2715,7 @@
       93
     ]
   ],
-  "resource_state": "Healthy2/3/6/7 released after preformal startup correction; corrected independent service relaunch next",
+  "resource_state": "Formal/companion done; own workers retired; next complete-chain queued behind actual healthy-card owners",
   "predicate_pack_20261006": {
     "status": "complete_chain_micro_qualified_default_off",
     "round_savings_ms": [
@@ -2777,7 +2776,7 @@
     "owners_retired": true
   },
   "queued_native_candidates": [],
-  "next_action": "Run one installed official16K/EOS plus companion160token trace with all component-qualified flags; no baseline repeat",
+  "next_action": "Preserve8.532523 formal baseline; audit half-width packed FP4 load issue cost offline before a production native candidate; no repeat of cached-operand or partition-merging negatives",
   "qualified_production_coordinate_selection": {
     "status": "complete_chain_micro_qualified_default_off",
     "round_savings_ms_per_layer": [
@@ -2857,24 +2856,27 @@
     "formal_result": null
   },
   "sampling_threshold": {
-    "status": "component_qualified_default_off",
+    "status": "included_in_formal_batch04_default_on",
     "forecast_ms_token": 0.024228749999999966,
     "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-sampling-threshold-chain-04",
     "extra_fullserving_fallback_rate": "unmeasured",
-    "formal_result": null
+    "formal_result": "/opt/ssd960/1cat-vllm-decode-archives/decode-accumulated-serving-04/formal/result.json",
+    "formal_gain_individually_attributed": false
   },
   "sampling_fused_packet": {
-    "status": "component_qualified_default_off",
+    "status": "included_in_formal_batch04_default_on",
     "forecast_ms_token": 0.03901128125000003,
     "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-sampling-fused-chain-02",
-    "formal_result": null,
-    "supersedes": "decode-sampling-fused-chain-01"
+    "formal_result": "/opt/ssd960/1cat-vllm-decode-archives/decode-accumulated-serving-04/formal/result.json",
+    "supersedes": "decode-sampling-fused-chain-01",
+    "formal_gain_individually_attributed": false
   },
   "sampling_shared_max": {
-    "status": "component_qualified_default_off",
+    "status": "included_in_formal_batch04_default_on",
     "forecast_ms_token": 0.037524406249999975,
     "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-sampling-shared-max-chain-02",
-    "formal_result": null
+    "formal_result": "/opt/ssd960/1cat-vllm-decode-archives/decode-accumulated-serving-04/formal/result.json",
+    "formal_gain_individually_attributed": false
   },
   "startup_correction_20261006": {
     "case": "/opt/ssd960/1cat-vllm-decode-archives/decode-accumulated-serving-04/startup-attempt-01",
@@ -2883,5 +2885,65 @@
     "shutdown_diagnostics_nonfatal": true,
     "owners_retired": true,
     "formal_gain_credit": 0
+  },
+  "silu_rounding_quarter": {
+    "status": "rejected_three_slower_complete_chain_rounds",
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-silu-quarter-chain-02",
+    "round_savings_ms": [
+      -0.00052375,
+      -0.00049684375,
+      -0.00041409375
+    ],
+    "gain_credit_ms": 0,
+    "maintained_runtime_restored": true
+  },
+  "accepted_baseline_20261006": {
+    "case": "decode-accumulated-serving-04",
+    "source_formal_commit": "71d4f203",
+    "official_tpot_ms": 8.532522827530956,
+    "formal_quality_passed": true,
+    "compatible_defaults_promoted": true
+  },
+  "physical_module_batch04": {
+    "status": "formal_passed_quality_passed_promote_compatible_batch",
+    "baseline_ms": 9.564282285406788,
+    "candidate_ms": 8.532522827530956,
+    "measured_saving_ms": 1.0317594578758325,
+    "forecast_ms": 1.0324461875,
+    "forecast_fraction": 0.9993348518959324,
+    "output_tokens": 1868,
+    "official_sampling": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "seed": 42
+    },
+    "natural_eos": true,
+    "formal_profile": null,
+    "quality_facts": 14,
+    "prompt_ids_match": true,
+    "cached_prompt_tokens": 0,
+    "module_mapping": [
+      2,
+      3,
+      6,
+      7
+    ],
+    "baseline_module_mapping": [
+      0,
+      1,
+      4,
+      5
+    ],
+    "target_7ms_achieved": false,
+    "trace_analysis_pending": false,
+    "case": "/opt/ssd960/1cat-vllm-decode-archives/decode-accumulated-serving-04",
+    "sampling_fallbacks": 0,
+    "defaults_promoted": true,
+    "trace_rank0": {
+      "period_ms": 8.4093494167,
+      "compute_ms": 5.9884868665,
+      "not_compute_ms": 2.4208625501,
+      "small_gaps_ms": 1.1817346159
+    }
   }
 }

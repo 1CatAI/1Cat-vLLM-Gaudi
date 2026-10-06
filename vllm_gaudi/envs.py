@@ -81,22 +81,22 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_FLASHINFER_PREFILL: bool = False
     VLLM_HPU_DSV41_EXPERT_FUSED_QUANT: bool = False
     VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE: bool = False
-    VLLM_HPU_DSV41_EXPERT_STREAMED_SAT: bool = False
-    VLLM_HPU_DSV41_EXPERT_ACTIVE_W2: bool = False
-    VLLM_HPU_DSV41_FFN_DUAL_QUANT: bool = False
-    VLLM_HPU_DSV41_FFN_BF16_QUANT: bool = False
-    VLLM_HPU_DSV41_INDEX_GAIN_REPLICA: bool = False
-    VLLM_HPU_DSV41_MHC_SWIZZLED_CONTROL: bool = False
+    VLLM_HPU_DSV41_EXPERT_STREAMED_SAT: bool = True
+    VLLM_HPU_DSV41_EXPERT_ACTIVE_W2: bool = True
+    VLLM_HPU_DSV41_FFN_DUAL_QUANT: bool = True
+    VLLM_HPU_DSV41_FFN_BF16_QUANT: bool = True
+    VLLM_HPU_DSV41_INDEX_GAIN_REPLICA: bool = True
+    VLLM_HPU_DSV41_MHC_SWIZZLED_CONTROL: bool = True
     VLLM_HPU_DSV41_MHC_BF16_CONTROL_WEIGHT: bool = False
-    VLLM_HPU_DSV41_MHC_RRMS_POST: bool = False
-    VLLM_HPU_DSV41_MHC_POSITIVE_GATES: bool = False
-    VLLM_HPU_DSV41_MHC_COMM_GATES: bool = False
+    VLLM_HPU_DSV41_MHC_RRMS_POST: bool = True
+    VLLM_HPU_DSV41_MHC_POSITIVE_GATES: bool = True
+    VLLM_HPU_DSV41_MHC_COMM_GATES: bool = True
     VLLM_HPU_DSV41_MHC_LINEAR_LOAD: bool = False
-    VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL: bool = False
-    VLLM_HPU_DSV41_MLA_VECTOR_CODEC: bool = False
-    VLLM_HPU_DSV41_MLA_VECTOR_MASK: bool = False
-    VLLM_HPU_DSV41_MLA_DECODED_SWA: bool = False
-    VLLM_HPU_DSV41_MLA_REUSE_HW_CODEC: bool = False
+    VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL: bool = True
+    VLLM_HPU_DSV41_MLA_VECTOR_CODEC: bool = True
+    VLLM_HPU_DSV41_MLA_VECTOR_MASK: bool = True
+    VLLM_HPU_DSV41_MLA_DECODED_SWA: bool = True
+    VLLM_HPU_DSV41_MLA_REUSE_HW_CODEC: bool = True
     VLLM_HPU_DSV41_MLA_PUBLISH_MASK: bool = False
     VLLM_HPU_DSV41_EXPERT_W2_THREE_ROUTES: bool = False
     VLLM_HPU_DSV41_EXPERT_TOKEN_WIDE: bool = False
@@ -121,12 +121,12 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_PREFILL_OUTPUT_PROJECTION: bool = False
     VLLM_HPU_DSV41_SWA_PACK_WRITE: bool = False
     VLLM_HPU_DSV41_FP4_CACHE_WRITE: bool = False
-    VLLM_HPU_DSV41_INDEX_QUERY_CODEC: bool = False
-    VLLM_HPU_DSV41_INDEX_PREDICATE_PACK: bool = False
-    VLLM_HPU_DSV41_SAMPLING_THRESHOLD: bool = False
-    VLLM_HPU_DSV41_SAMPLING_FUSED_PACKET: bool = False
-    VLLM_HPU_DSV41_SAMPLING_SHARED_MAX: bool = False
-    VLLM_HPU_DSV41_INDEX_WIDE_REINDEX: bool = False
+    VLLM_HPU_DSV41_INDEX_QUERY_CODEC: bool = True
+    VLLM_HPU_DSV41_INDEX_PREDICATE_PACK: bool = True
+    VLLM_HPU_DSV41_SAMPLING_THRESHOLD: bool = True
+    VLLM_HPU_DSV41_SAMPLING_FUSED_PACKET: bool = True
+    VLLM_HPU_DSV41_SAMPLING_SHARED_MAX: bool = True
+    VLLM_HPU_DSV41_INDEX_WIDE_REINDEX: bool = True
     VLLM_HPU_DSV41_MLA_REGISTER_SOFTMAX: bool = False
     VLLM_HPU_DSV41_NATIVE_ROPE: bool = False
     VLLM_HPU_DSV41_C1_INDICES: bool = False
@@ -143,7 +143,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_FIXED_POSITIONS: bool = False
     VLLM_HPU_DSV41_PACKED_PP: bool = False
     VLLM_HPU_DSV41_TPC_MHC: bool = False
-    VLLM_HPU_DSV41_MHC_DEFERRED_GATES: bool = False
+    VLLM_HPU_DSV41_MHC_DEFERRED_GATES: bool = True
     VLLM_HPU_DSV41_MHC_MME_GATES_NORM: bool = False
     VLLM_HPU_DSV41_MHC_CONTROL_RRMS: bool = False
     VLLM_HPU_DSV41_MHC_GATES_FUSED: bool = False
@@ -189,7 +189,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_PEER_POST_COLLAPSE: bool = False
     VLLM_HPU_DSV41_PEER_POST_NORM: bool = False
     VLLM_HPU_DSV41_MAIN_MLA_PROJECTION: bool = False
-    VLLM_HPU_DSV41_WOA_DENSE_HANDOFF: bool = False
+    VLLM_HPU_DSV41_WOA_DENSE_HANDOFF: bool = True
     VLLM_HPU_DSV41_DEVICE_SAMPLING: bool = False
     VLLM_HPU_DSV41_DEVICE_NEXT_POSITION: bool = False
     VLLM_HPU_DSV41_DEVICE_INPUT_FEEDBACK: bool = False
@@ -585,36 +585,36 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HPU_DSV41_MLA_PUBLISH_MASK":
     lambda: os.environ.get("VLLM_HPU_DSV41_MLA_PUBLISH_MASK", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MLA_DECODED_SWA":
-    lambda: os.environ.get("VLLM_HPU_DSV41_MLA_DECODED_SWA", "0").lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV41_MLA_DECODED_SWA", "1").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MLA_REUSE_HW_CODEC":
-    lambda: os.environ.get("VLLM_HPU_DSV41_MLA_REUSE_HW_CODEC", "0").lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV41_MLA_REUSE_HW_CODEC", "1").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MLA_VECTOR_MASK":
-    lambda: os.environ.get("VLLM_HPU_DSV41_MLA_VECTOR_MASK", "0").lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV41_MLA_VECTOR_MASK", "1").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MLA_VECTOR_CODEC":
-    lambda: os.environ.get("VLLM_HPU_DSV41_MLA_VECTOR_CODEC", "0").lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV41_MLA_VECTOR_CODEC", "1").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_LINEAR_LOAD":
     lambda: os.environ.get("VLLM_HPU_DSV41_MHC_LINEAR_LOAD", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL":
-    lambda: os.environ.get("VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL", "0").lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL", "1").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_FFN_BF16_QUANT":
-    lambda: os.environ.get("VLLM_HPU_DSV41_FFN_BF16_QUANT", "0").lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV41_FFN_BF16_QUANT", "1").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_RRMS_POST":
-    lambda: os.environ.get("VLLM_HPU_DSV41_MHC_RRMS_POST", "0").lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV41_MHC_RRMS_POST", "1").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_POSITIVE_GATES":
-    lambda: os.environ.get("VLLM_HPU_DSV41_MHC_POSITIVE_GATES", "0").lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV41_MHC_POSITIVE_GATES", "1").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_COMM_GATES":
-    lambda: os.environ.get("VLLM_HPU_DSV41_MHC_COMM_GATES", "0").lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV41_MHC_COMM_GATES", "1").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_SWIZZLED_CONTROL":
-    lambda: os.environ.get("VLLM_HPU_DSV41_MHC_SWIZZLED_CONTROL", "0").lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV41_MHC_SWIZZLED_CONTROL", "1").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_BF16_CONTROL_WEIGHT":
     lambda: os.environ.get("VLLM_HPU_DSV41_MHC_BF16_CONTROL_WEIGHT", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_INDEX_GAIN_REPLICA":
-    lambda: os.environ.get("VLLM_HPU_DSV41_INDEX_GAIN_REPLICA", "0").lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV41_INDEX_GAIN_REPLICA", "1").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_FFN_DUAL_QUANT":
-    lambda: os.environ.get("VLLM_HPU_DSV41_FFN_DUAL_QUANT", "0").lower() in ("1", "true"),
-    "VLLM_HPU_DSV41_EXPERT_ACTIVE_W2": lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_ACTIVE_W2", "0") == "1",
+    lambda: os.environ.get("VLLM_HPU_DSV41_FFN_DUAL_QUANT", "1").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_EXPERT_ACTIVE_W2": lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_ACTIVE_W2", "1") == "1",
     "VLLM_HPU_DSV41_EXPERT_STREAMED_SAT":
-    lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_STREAMED_SAT", "0").lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_STREAMED_SAT", "1").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_EXPERT_W2_THREE_ROUTES":
     lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_W2_THREE_ROUTES", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_EXPERT_TOKEN_WIDE":
@@ -685,7 +685,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HPU_DSV41_TPC_MHC":
     lambda: os.environ.get("VLLM_HPU_DSV41_TPC_MHC", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_DEFERRED_GATES":
-    lambda: os.environ.get("VLLM_HPU_DSV41_MHC_DEFERRED_GATES", "0").lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV41_MHC_DEFERRED_GATES", "1").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_MME_GATES_NORM":
     lambda: os.environ.get("VLLM_HPU_DSV41_MHC_MME_GATES_NORM", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_CONTROL_RRMS":
@@ -783,7 +783,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HPU_DSV41_MAIN_MLA_PROJECTION":
     lambda: os.environ.get("VLLM_HPU_DSV41_MAIN_MLA_PROJECTION", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_WOA_DENSE_HANDOFF":
-    lambda: os.environ.get("VLLM_HPU_DSV41_WOA_DENSE_HANDOFF", "0").lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV41_WOA_DENSE_HANDOFF", "1").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_PEER_POST_COLLAPSE":
     lambda: os.environ.get("VLLM_HPU_DSV41_PEER_POST_COLLAPSE", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MERGE_LOCAL_SEGMENTS":
@@ -843,17 +843,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HPU_DSV41_MLA_REGISTER_SOFTMAX":
     lambda: os.getenv("VLLM_HPU_DSV41_MLA_REGISTER_SOFTMAX", "0") == "1",
     "VLLM_HPU_DSV41_INDEX_WIDE_REINDEX":
-    lambda: os.getenv("VLLM_HPU_DSV41_INDEX_WIDE_REINDEX", "0") == "1",
+    lambda: os.getenv("VLLM_HPU_DSV41_INDEX_WIDE_REINDEX", "1") == "1",
     "VLLM_HPU_DSV41_SAMPLING_SHARED_MAX":
-    lambda: os.getenv("VLLM_HPU_DSV41_SAMPLING_SHARED_MAX", "0") == "1",
+    lambda: os.getenv("VLLM_HPU_DSV41_SAMPLING_SHARED_MAX", "1") == "1",
     "VLLM_HPU_DSV41_SAMPLING_FUSED_PACKET":
-    lambda: os.getenv("VLLM_HPU_DSV41_SAMPLING_FUSED_PACKET", "0") == "1",
+    lambda: os.getenv("VLLM_HPU_DSV41_SAMPLING_FUSED_PACKET", "1") == "1",
     "VLLM_HPU_DSV41_SAMPLING_THRESHOLD":
-    lambda: os.getenv("VLLM_HPU_DSV41_SAMPLING_THRESHOLD", "0") == "1",
+    lambda: os.getenv("VLLM_HPU_DSV41_SAMPLING_THRESHOLD", "1") == "1",
     "VLLM_HPU_DSV41_INDEX_PREDICATE_PACK":
-    lambda: os.getenv("VLLM_HPU_DSV41_INDEX_PREDICATE_PACK", "0") == "1",
+    lambda: os.getenv("VLLM_HPU_DSV41_INDEX_PREDICATE_PACK", "1") == "1",
     "VLLM_HPU_DSV41_INDEX_QUERY_CODEC":
-    lambda: os.getenv("VLLM_HPU_DSV41_INDEX_QUERY_CODEC", "0") == "1",
+    lambda: os.getenv("VLLM_HPU_DSV41_INDEX_QUERY_CODEC", "1") == "1",
     "VLLM_HPU_DSV41_NATIVE_ROPE":
     lambda: os.getenv("VLLM_HPU_DSV41_NATIVE_ROPE", "0") == "1",
     "VLLM_HPU_DSV41_FUSED_PREFIX_LAYOUT":
