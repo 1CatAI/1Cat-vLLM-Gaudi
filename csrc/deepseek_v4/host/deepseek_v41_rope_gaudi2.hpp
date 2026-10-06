@@ -5,8 +5,10 @@
 class DeepseekV41RopeGaudi2 {
     bool inverse_;
     bool prefill_;
+    bool index_codec_;
 public:
-    explicit DeepseekV41RopeGaudi2(bool inverse, bool prefill = false) : inverse_(inverse), prefill_(prefill) {}
+    explicit DeepseekV41RopeGaudi2(bool inverse, bool prefill = false, bool index_codec = false)
+        : inverse_(inverse), prefill_(prefill), index_codec_(index_codec) {}
     tpc_lib_api::GlueCodeReturn GetKernelName(char name[tpc_lib_api::MAX_NODE_NAME]);
     tpc_lib_api::GlueCodeReturn GetGcDefinitions(tpc_lib_api::HabanaKernelParams*,
                                                tpc_lib_api::HabanaKernelInstantiation*);

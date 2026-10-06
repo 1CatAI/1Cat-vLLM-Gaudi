@@ -18,9 +18,16 @@ def main():
     parser.add_argument('--sidecar', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--query-replica', action='store_true', help='Hold gain replica fixed; compare sharded query+peer against cold full query weights')
+    parser.add_argument('--native-query-path', action='store_true', help='Use the production native RoPE table/codec contract in both arms')
+    parser.add_argument('--fused-query-codec', action='store_true', help='Hold gain replica and query peer fixed; compare native RoPE+FP4 with the fused codec')
     parser.add_argument('--steps', type=int, default=200)
     parser.add_argument('--chain-repeats', type=int, default=64)
     args = parser.parse_args()
+    if args.fused_query_codec and (not args.native_query_path or args.query_replica):
+        parser.error('--fused-query-codec requires --native-query-path and excludes --query-replica')
+    if args.native_query_path:
+        os.environ['VLLM_HPU_DSV41_NATIVE_KV_PACK'] = '1'
+        os.environ['VLLM_HPU_DSV41_QUANT_ROUNDTRIP'] = '1'
     rank = int(os.environ['LOCAL_RANK'])
     modules = os.environ['HABANA_VISIBLE_MODULES'].split(',')
     tp = len(modules)
@@ -77,6 +84,9 @@ def main():
     scaling = cfg['rope_scaling']
     phase = rotary_table(64, 32768, cfg['compress_rope_theta'], scaling['original_max_position_embeddings'],
                          scaling['factor'], scaling['beta_fast'], scaling['beta_slow']).to('hpu')
+    if args.native_query_path:
+        # Native input is [cos32,sin32], not the generic interleaved pair table.
+        phase = torch.cat((phase[..., 0], phase[..., 1]), -1).contiguous()
     x = fixtures[0].to('hpu')
     positions = torch.tensor([16384], dtype=torch.int32, device='hpu')
     rows = torch.arange(2048, dtype=torch.int32, device='hpu').reshape(1, -1)
@@ -84,13 +94,19 @@ def main():
     def produce(value, pos, wq, wp, norm, phase, *, replicated):
         qr = rms_norm(value[:, :1280].contiguous(), norm, 1e-20)
         query = F.linear(quantize_activation(qr), wq).reshape(1, wq.shape[0] // 128, 128)
-        query = fp4_roundtrip(apply_rope(query, pos, phase), 32).reshape(1, -1).contiguous()
+        if args.fused_query_codec and replicated:
+            query = torch.ops.custom_op.custom_deepseek_v41_index_query_rope_fp4_bf16_gaudi2(query, pos, phase)
+        else:
+            roped = (torch.ops.custom_op.custom_deepseek_v41_rope_bf16_gaudi2(query, pos, phase)
+                     if args.native_query_path else apply_rope(query, pos, phase))
+            query = fp4_roundtrip(roped, 32)
+        query = query.reshape(1, -1).contiguous()
         gains = F.linear(value, wp) * (128**-.5 * total_heads**-.5)
-        return query, gains.contiguous() if replicated or args.query_replica else F.pad(gains, (0, 128-local_heads)).contiguous()
+        return query, gains.contiguous() if replicated or args.query_replica or args.fused_query_codec else F.pad(gains, (0, 128-local_heads)).contiguous()
 
     def consume(query, gains, keys, positions, rows, *, replicated):
         query = query.reshape(1, total_heads, 128)
-        gains = gains.reshape(1, total_heads) if replicated or args.query_replica else gains.reshape(tp, 128)[:, :local_heads].reshape(1, total_heads).contiguous()
+        gains = gains.reshape(1, total_heads) if replicated or args.query_replica or args.fused_query_codec else gains.reshape(tp, 128)[:, :local_heads].reshape(1, total_heads).contiguous()
         scores = mirror_index_tile(query, gains, keys, positions, rows, 2, local_heads)
         return query, gains, scores
 
@@ -132,14 +148,14 @@ def main():
             return result
 
         query, gains = compute(producer, (x, positions, global_wq if args.query_replica and replica else wq,
-                                            global_wp if replica or args.query_replica else local_wp, norm, phase))
+                                            global_wp if replica or args.query_replica or args.fused_query_codec else local_wp, norm, phase))
         if args.query_replica and replica:
             global_query = query
         else:
             global_query = torch.ops.vllm_gaudi.tp_peer_allgather(query, tp)
             torch.hpu.synchronize()
             plan.add_all_gather(slot(query, False), slot(global_query, False))
-        if not replica and not args.query_replica:
+        if not replica and not args.query_replica and not args.fused_query_codec:
             global_gains = torch.ops.vllm_gaudi.tp_peer_allgather(gains, tp)
             torch.hpu.synchronize()
             plan.add_all_gather(slot(gains, False), slot(global_gains, False))
@@ -148,7 +164,7 @@ def main():
         out = compute(consumer, (global_query, global_gains, keys, positions, rows))
         plan.prepare(backend, [slot(v, False) for v in out])
         graph = bridge.NativeDecodeGraph()
-        points = (0 if replica else 1) if args.query_replica else (1 if replica else 2)
+        points = (0 if replica else 1) if args.query_replica else (1 if args.fused_query_codec or replica else 2)
         graph.configure_topology(args.chain_repeats, args.chain_repeats*points, False)
         graph.configure_dependency_policy(False)
         graph.capture([plan]*args.chain_repeats, [external]*args.chain_repeats)
@@ -192,7 +208,9 @@ def main():
     savings = [a['median_ms']-b['median_ms'] for a,b in zip(periods[::2], periods[1::2], strict=True)]
     result = dict(status='completed', checks=checks, periods=periods, round_savings_ms=savings,
                   saving_ms_per_index_layer=statistics.median(savings), three_consistent_rounds=all(v>0 for v in savings),
-                  peer_points_per_iteration=[1,0] if args.query_replica else [2,1], fixture_scope=__doc__, formal_gain=False)
+                  peer_points_per_iteration=[1,0] if args.query_replica else [1,1] if args.fused_query_codec else [2,1],
+                  native_query_path=args.native_query_path, fused_query_codec=args.fused_query_codec,
+                  fixture_scope=__doc__, formal_gain=False)
     (directory/'result.json').write_text(json.dumps(result, indent=2))
     if rank == 0:(root/'result.json').write_text(json.dumps(result, indent=2))
     for graph, plan in zip(graphs, plans, strict=True):graph.close();plan.invalidate()

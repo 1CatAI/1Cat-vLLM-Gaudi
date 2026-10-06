@@ -356,6 +356,7 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_RRMS_BF16_WEIGHT,
     GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_RRMS_SWIZZLED,
     GAUDI2_KERNEL_DEEPSEEK_V41_MHC_RRMS_POST,
+    GAUDI2_KERNEL_DEEPSEEK_V41_INDEX_QUERY_ROPE_FP4,
     KERNEL_COUNT
 };
 
@@ -924,6 +925,7 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
         DeepseekV41KVPackGaudi2 part(codec_modes[mode]);
         part.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_SWA_PACK + mode].name);
     }
+    DeepseekV41RopeGaudi2(false, false, true).GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_INDEX_QUERY_ROPE_FP4].name);
     for (int inverse = 0; inverse < 2; ++inverse) {
         DeepseekV41RopeGaudi2 part(inverse);
         part.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_ROPE + inverse].name);
@@ -1121,6 +1123,10 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
         part.GetKernelName(kernelName);
         if (std::strcmp(params->guid.name, kernelName) == 0) return part.GetGcDefinitions(params, instance);
     }
+    DeepseekV41RopeGaudi2 indexQueryCodec(false, false, true);
+    indexQueryCodec.GetKernelName(kernelName);
+    if (std::strcmp(params->guid.name, kernelName) == 0)
+        return indexQueryCodec.GetGcDefinitions(params, instance);
     for (int inverse = 0; inverse < 2; ++inverse) {
         DeepseekV41RopeGaudi2 part(inverse);
         part.GetKernelName(kernelName);

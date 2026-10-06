@@ -1076,3 +1076,9 @@ schema adds a cold integer`active_width` argument; replay/runner/communication
 interfaces are unchanged. Complete-chain micro-qualified; serving pending.
 
 `VLLM_HPU_DSV41_MHC_POSITIVE_GATES` defaults to `0`: component-qualified positive-denominator Sinkhorn reciprocal for decode; preserves20 iterations with FP32 accumulation, but is not bitwise-equivalent. Prefill retains its original gates. Combined serving quality/latency acceptance remains pending.
+
+`VLLM_HPU_DSV41_INDEX_QUERY_CODEC` defaults to `0`: experimental shared decode
+RoPE plus exact group-32 FP4 query roundtrip, retaining the BF16 rounding
+boundary and signed zero. Accepts width128 and up to64 request rows; no
+context-length cutoff. Prefill keeps its existing path. Complete-chain and
+formal serving qualification are required before promotion.

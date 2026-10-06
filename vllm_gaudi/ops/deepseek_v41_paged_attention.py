@@ -920,14 +920,23 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             q, weights = local_index_query_projections(self, value, qr)
         else:
             q = self.linear(qr, indexer.wq_b).reshape(-1, self.index_heads, 128)
-        q = self._rope(q, positions, request_batch=request_batch)
-        # Quantize and restore in one TPC pass.  The codec keeps packed FP4
-        # codes and UE8M0 scales in registers, so prefill does not materialize
-        # a packed query in HBM or compile a generic bit-unpack graph.  Tile by
-        # the native flattened-row contract; for TP2's 16 heads this is C512.
-        codec_tokens = max(1, 8192 // q.shape[1])
-        pieces = [fp4_roundtrip(q[start : start + codec_tokens], 32) for start in range(0, q.shape[0], codec_tokens)]
-        q = pieces[0] if len(pieces) == 1 else torch.cat(pieces, 0)
+        if (
+            not prefill and self.native_rope
+            and gaudi_envs.VLLM_HPU_DSV41_NATIVE_KV_PACK
+            and gaudi_envs.VLLM_HPU_DSV41_INDEX_QUERY_CODEC
+            and q.dtype == torch.bfloat16 and 1 <= q.shape[0] <= 64
+        ):
+            # Preserve the BF16 RoPE boundary, then quantize four group-32
+            # segments in one vector without materializing the rotated query.
+            q = torch.ops.custom_op.custom_deepseek_v41_index_query_rope_fp4_bf16_gaudi2(
+                q.contiguous(), positions.to(torch.int32).contiguous(), self._rotary_native_table()
+            )
+        else:
+            q = self._rope(q, positions, request_batch=request_batch)
+            # Flattened-row tiling retains the original prefill codec contract.
+            codec_tokens = max(1, 8192 // q.shape[1])
+            pieces = [fp4_roundtrip(q[start : start + codec_tokens], 32) for start in range(0, q.shape[0], codec_tokens)]
+            q = pieces[0] if len(pieces) == 1 else torch.cat(pieces, 0)
         global_heads = self.index_heads * self.tensor_parallel_size
         replicated_gain = uses_replicated_index_gain(
             self, value, prefill=prefill, request_batch=request_batch, local_queries=local_queries
