@@ -1046,11 +1046,11 @@ Combined end-to-end qualification passed.
 
 ### VLLM_HPU_DSV41_MHC_GATE_PACKET
 
-Default: `0`. Component-qualified gate-packet consumer for the common deferred
+Default: `1`. Serving-qualified gate-packet consumer for the common deferred
 mHC decode path. Reads the existing complete gate tensor with vector loads,
 retaining ordered peer summation, BF16 residual rounding and collapse. No
 communication, replay, sampling or precision interface changes. Requires the
-matching native operator artifact; combined serving acceptance is pending.
+matching native operator artifact; combined serving acceptance passed.
 
 ### VLLM_HPU_DSV41_MHC_COMM_GATES
 
@@ -1123,12 +1123,12 @@ EOS. Their shape, checkpoint and state eligibility guards still apply. Explicit
 linear-load control, BF16 control weights and register softmax,
 remain off. Replay, runner and peer-communication interfaces are unchanged.
 
-`VLLM_HPU_DSV41_EXPERT_SHARED_SCALE` defaults to `0`. This component-qualified
+`VLLM_HPU_DSV41_EXPERT_SHARED_SCALE` defaults to `1`. This serving-qualified
 candidate consumes the raw shared-expert BF16 down-projection and its FP32
 activation/channel scales inside the ordered routed-expert finalizer. It retains
 the scale-first BF16 rounding and shared/routed BF16 addition boundaries.
 It requires the existing C1 streamed SAT, active-W2 and three-route-W2 path with
 FP8 shared weights. Other batch and prefill paths retain their existing implementation.
-Keep it disabled until combined normal-serving acceptance.
+Combined normal-serving acceptance passed; explicit `0` remains a diagnostic disable control.
 
-`VLLM_HPU_DSV41_MHC_POST_NORM_STATS` (default `0`) enables experimental peer/post statistics and feature-parallel FFN normalization with both quantizers. The existing next mHC controller remains independent. Serving selection is limited to the BF16 dual-quant single-row decode contract; prefill and larger batches retain their existing paths. End-to-end qualification is pending.
+`VLLM_HPU_DSV41_MHC_POST_NORM_STATS` (default `1`) enables serving-qualified peer/post statistics and feature-parallel FFN normalization with both quantizers. The existing next mHC controller remains independent. Serving selection is limited to the BF16 dual-quant single-row decode contract; prefill and larger batches retain their existing paths. End-to-end qualification passed.

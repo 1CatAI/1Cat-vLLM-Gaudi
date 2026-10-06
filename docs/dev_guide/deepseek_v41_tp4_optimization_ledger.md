@@ -1,34 +1,32 @@
 # TP4 decode 长期开发台账
 
-更新：2026-10-06。只记录具有可比完整消费链微基准收益、通过适用正确性检查的改动。
-未验证方向、失败或变慢试验留在实验INDEX，不计累计。端到端通过后关账，不再次计入待验收收益。
+更新：2026-10-07。只记录通过完整消费链微基准与适用正确性检查的改动。
+未验证、失败、变慢试验留在实验INDEX，不计累计；端到端通过后关账，不重复计入。
 
-## 当前正式测量与待验收累计（2026-10-06）
+## 当前正式测量与待验收累计（2026-10-07）
 
 官方采样 temperature=1.0、top_p=0.95、seed=42；512K、C16384、前缀缓存开、完整预热。
-独立安装服务 `decode-accumulated-serving-04`，冻结源码 `71d4f203`：一次无 profiler 正式请求，
-16384 未命中输入 → **1868 tokens 自然 EOS**，**8.532522828 ms/token**。
-固定输入 token 与上一基线一致，14 项事实/约束通过；四卡启动验收到正式请求后的采样回退增量均为0。
-额外采一份160-token companion trace，不能把启动/导出 profiler 的整请求均值当作正式 TPOT。
+独立安装服务 `decode-accumulated-serving-07`，冻结源码 `46ccb98a`：一次无 profiler 正式请求，
+16384 未命中输入 → **2365 tokens 自然 EOS**，**8.239257597 ms/token**。
+输入 token 与父基线一致，14项事实/约束通过；不要求随机输出逐 token 相同。
+正式模块0/1/4/5，worker主核56/61/84/89。负载和CPU压力保存于该次记录。
 
-前一基线 **9.564282285 ms/token**；本批兼容组件预估 **1.032446188 ms/token**，
-正式观测下降 **1.031759458 ms/token**（预估兑现99.93%）。本批所有计入的组件项关账，
-**未端到端的兼容收益累计归零**，不得继续叠加到8.532523的新基线。
-22个共用路径控制已改为默认开启；未验证的 BF16控制权重、
-linear-load控制、register softmax等仍默认关闭。保留各组件原有形状、权重、状态及批次条件。
+父基线 **8.532522828 ms/token**；三项兼容微基准预估 **0.145667500ms/token**，
+正式观测减少 **0.293265230ms/token**。共享专家缩放 finalizer、gate packet、weighted post statistics
+三项关账并默认开启；不能把观测总差分配给各组件。
+**未端到端的兼容收益累计为0；7.0ms目标未完成，还差1.239257597ms/token。**
 
-本次健康模块2/3/6/7，worker主核56/61/84/89；旧正式基线使用0/1/4/5、10/15/38/43。
-当前旧组设备处于隔离状态，按用户“有卡就用”执行。上述是正式模型观测差值，
-没有把不同卡位的 trace 分类耗时相减或逐项分配。机器其他任务、CPU压力和切换记录在本次host-load中。
+配套 trace 保存在 SSD `decode-accumulated-serving-07-trace-repair-03`，只补 companion，未重复正式请求。
+完整预热后224-token诊断，其中160-token采集；预选连续24周期、四rank原始活动归一化。
+rank0周期8.183ms：计算5.821ms（TPC-only2.912、MME-only1.847、交叠1.062），
+无引擎空闲2.252ms，HCL/DMA-only0.111ms。四卡周期8.176–8.184ms。
+这些是同一trace内的活动分配，不能与无profiler正式TPOT混成一个加和表。
+TPC→TPC空档0.944ms、通信相邻空档0.566ms、TPC→MME0.337ms，作为下一批选点依据；
+通信相邻标签不证明全部是链路传输。匿名recipe仍不支持逐节点源码归因。
 
-正式结果/语义/回退/默认提升清单：SSD `decode-accumulated-serving-04/`
-`formal/result.json`、`QUALITY.json`、`SAMPLING_FALLBACK_AUDIT.json`、`DEFAULT_PROMOTION.json`。
-配套trace归档 `trace-request/capture`，四卡活动分布见
-`trace-analysis-window/RAW_ACTIVITY_REPORT.md`：周期8.407–8.409ms，
-计算5.988–6.005ms，非计算2.402–2.421ms；不等同于正式请求的计时。
-**7.0 ms 目标尚未完成，还差1.532523 ms/token。**
-有用BF16转换象限完成了数值及完整链检查，但三轮均略慢，已归档并恢复共用接口。
-该失败留在实验INDEX，不进入此台账。
+证据：SSD `decode-accumulated-serving-07/formal/result.json`、`QUALITY.json`、`DEFAULT_PROMOTION.json`；
+trace各rank `raw-activity-screen.json`、`TRACE_ANATOMY_rank0.txt`。
+主PV缓存候选默认关；SDK/Meta及单reuse链不足以记账，还需含publisher成本的完整链。
 
 ### 上一基线及本批预测快照（已关账）
 
@@ -1389,3 +1387,34 @@ historical micro-only labels for their measurement dates, but cannot be counted
 again. 16K fixed prompt,1868 naturalEOS,14facts pass,zero additional sampler
 fallbacks. Ordinary independent installation, source71d4f203,healthy2/3/6/7.
 See SSD `decode-accumulated-serving-04/FORMAL_DECISION.json` and `QUALITY.json`.
+
+### 2026-10-07 — complete mHC gate packet consumer
+
+Qualified current swizzled/positive/deferred producer → native peer → vector
+gate-packet post/collapse → dual BF16 norm/quant → real router MME. Five real
+checkpoint-derived fixtures × four ranks are byte-exact. Three same-process
+native AB savings **.000704078/.000697492/.000721773 ms/boundary**;
+80 corresponding posts forecast **.056326250 ms/token**. The count is a scope
+extrapolation, not measured full-model saving or physical-node reduction.
+34 CPU/Meta checks preserve C1/C2/C6 and independent-gate scheduling.
+
+`VLLM_HPU_DSV41_MHC_GATE_PACKET=0` until combined serving qualification.
+Compatible pending with shared-expert scaling is **.126202813 ms/token**;
+formal baseline remains **8.532522828 ms/token**, target7ms is unmet.
+Other owned four-card component overlapped part of the acquisition; this is
+recorded with the same-process three-round device timing and preserved raw
+periods. Owners retired to768MiB. Evidence SSD
+`decode-peer-gates-vector-chain-01/DECISION.json`.
+
+### 2026-10-07：post 统计量供给分片 FFN 双量化（待端到端）
+
+父配置包含完整 gate packet；真实 WO/control → 原生 peer → post/statistics → 归一化/双量化 → router、共享 W13/SiLU、下一 FFN control/gates。5组 checkpoint 输入×4rank 通过官方容差，路由集合一致；同链 A/B 三轮每边界省 .000486617/.000477492/.000490664ms。仅按40个 FFN 边界折算 **0.019464688ms/token**，不按80个边界重复计数。`MHC_POST_NORM_STATS` 默认关，30个Meta/依赖隔离检查通过；无物理节点减少声明。SSD `decode-post-weighted-statistics-chain-03`。
+
+兼容待验收三项累计 **0.145667500ms/token**（共享缩放 .069876563、gate packet .056326250、本项 .019464688）。当前官方基线仍 **8.532522828ms/token**。按最新“≥0.5ms或3项”规则进入一次合并正式请求+trace，不代表已获得端到端收益。失败的两次测试脚手架记录均保留，未计收益。
+
+### 2026-10-07 — batch05 combined acceptance closed
+
+共享专家缩放、gate packet、weighted post statistics兼容预估合计0.145667500ms/token；
+一次正式官方采样自然EOS观测8.239257597ms/token，比8.532522828减少0.293265230ms/token。
+三项已默认开启并包含在新基线；上述历史pending条目全部关账，当前待验收累计0。
+未验证的主PV缓存、BF16控制权重继续关闭。三项未改变runner/replay/通信接口。

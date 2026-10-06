@@ -83,7 +83,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE: bool = False
     VLLM_HPU_DSV41_EXPERT_STREAMED_SAT: bool = True
     VLLM_HPU_DSV41_EXPERT_ACTIVE_W2: bool = True
-    VLLM_HPU_DSV41_EXPERT_SHARED_SCALE: bool = False
+    VLLM_HPU_DSV41_EXPERT_SHARED_SCALE: bool = True
     VLLM_HPU_DSV41_FFN_DUAL_QUANT: bool = True
     VLLM_HPU_DSV41_FFN_BF16_QUANT: bool = True
     VLLM_HPU_DSV41_INDEX_GAIN_REPLICA: bool = True
@@ -92,8 +92,8 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_MHC_RRMS_POST: bool = True
     VLLM_HPU_DSV41_MHC_POSITIVE_GATES: bool = True
     VLLM_HPU_DSV41_MHC_COMM_GATES: bool = True
-    VLLM_HPU_DSV41_MHC_GATE_PACKET: bool = False
-    VLLM_HPU_DSV41_MHC_POST_NORM_STATS: bool = False
+    VLLM_HPU_DSV41_MHC_GATE_PACKET: bool = True
+    VLLM_HPU_DSV41_MHC_POST_NORM_STATS: bool = True
     VLLM_HPU_DSV41_MHC_LINEAR_LOAD: bool = False
     VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL: bool = True
     VLLM_HPU_DSV41_MLA_VECTOR_CODEC: bool = True
@@ -606,9 +606,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HPU_DSV41_MHC_POSITIVE_GATES":
     lambda: os.environ.get("VLLM_HPU_DSV41_MHC_POSITIVE_GATES", "1").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_POST_NORM_STATS":
-    lambda: os.environ.get("VLLM_HPU_DSV41_MHC_POST_NORM_STATS", "0").lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV41_MHC_POST_NORM_STATS", "1").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_GATE_PACKET":
-    lambda: os.environ.get("VLLM_HPU_DSV41_MHC_GATE_PACKET", "0").lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV41_MHC_GATE_PACKET", "1").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_COMM_GATES":
     lambda: os.environ.get("VLLM_HPU_DSV41_MHC_COMM_GATES", "1").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_SWIZZLED_CONTROL":
@@ -619,7 +619,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_INDEX_GAIN_REPLICA", "1").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_FFN_DUAL_QUANT":
     lambda: os.environ.get("VLLM_HPU_DSV41_FFN_DUAL_QUANT", "1").lower() in ("1", "true"),
-    "VLLM_HPU_DSV41_EXPERT_SHARED_SCALE": lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_SHARED_SCALE", "0") == "1",
+    "VLLM_HPU_DSV41_EXPERT_SHARED_SCALE": lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_SHARED_SCALE", "1") == "1",
     "VLLM_HPU_DSV41_EXPERT_ACTIVE_W2": lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_ACTIVE_W2", "1") == "1",
     "VLLM_HPU_DSV41_EXPERT_STREAMED_SAT":
     lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_STREAMED_SAT", "1").lower() in ("1", "true"),

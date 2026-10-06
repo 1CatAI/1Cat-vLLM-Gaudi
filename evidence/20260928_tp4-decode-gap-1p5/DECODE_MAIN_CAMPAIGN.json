@@ -23,7 +23,12 @@
     "16K_final": 7.0,
     "128K": 11.0
   },
-  "formal_trigger": "New MoE / later MLA body accumulated qualified expectation >= 1 ms; no per-candidate formal requests",
+  "formal_trigger": {
+    "forecast_ms": 0.5,
+    "qualified_items": 3,
+    "aggregation": "either",
+    "user_update": "2026-10-07 trace-guided methodology"
+  },
   "steps": [
     {
       "id": 1,
@@ -64,7 +69,7 @@
   "deferred": "500K terminal-instruction semantic issue recorded in mergedPR57; outside this task",
   "completed": false,
   "confirmed_cumulative_real16_savings_ms": 0.114383,
-  "last_updated": 1791193935.7228549,
+  "last_updated": 1791318574.13591,
   "formal_gain_ms": 0,
   "confirmed_real16_gain_ms": 0.114383,
   "baseline_capture": "sole merged-main hardware capture complete and archived; unprofiled10.568225ms reused",
@@ -1741,7 +1746,7 @@
     "gain_credit_ms": 0,
     "next": "Hoist immutable 24 coefficients out of 40-tile loop; ISA change verified, next hardware run queued"
   },
-  "pending_micro_only_ms": 0.0,
+  "pending_micro_only_ms": 0,
   "accepted_baseline_20261005": {
     "case": "decode-physical-fusion-serving-03",
     "official_tpot_ms": 9.564282285406788,
@@ -2550,7 +2555,7 @@
     "formal_baseline_ms": 9.564282285406788,
     "flag": "VLLM_HPU_DSV41_INDEX_QUERY_CODEC=0"
   },
-  "compatible_pending_forecast_ms": 0.0,
+  "compatible_pending_forecast_ms": 0,
   "current_micro_cards": [
     2,
     3,
@@ -2776,7 +2781,7 @@
     "owners_retired": true
   },
   "queued_native_candidates": [],
-  "next_action": "Preserve8.532523 formal baseline; audit half-width packed FP4 load issue cost offline before a production native candidate; no repeat of cached-operand or partition-merging negatives",
+  "next_action": "Complete main-PV cache production publish/reuse chain qualification; use latest anatomy to select next >=0.1ms hotspot.",
   "qualified_production_coordinate_selection": {
     "status": "complete_chain_micro_qualified_default_off",
     "round_savings_ms_per_layer": [
@@ -2945,5 +2950,223 @@
       "not_compute_ms": 2.4208625501,
       "small_gaps_ms": 1.1817346159
     }
+  },
+  "last_experiment": {
+    "status": "micro_qualified_default_off",
+    "flag": "VLLM_HPU_DSV41_MHC_GATE_PACKET",
+    "formal_baseline_ms": 8.532522827530956,
+    "round_savings_ms_per_boundary": [
+      0.000704078125,
+      0.0006974921875,
+      0.0007217734375
+    ],
+    "estimated_ms_token": 0.05632625,
+    "qualified_boundaries_forecast": 80,
+    "all_five_inputs_four_ranks_exact": true,
+    "cpu_checks_passed": 34,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-peer-gates-vector-chain-01",
+    "physical_nodes_change_claimed": false,
+    "formal_request_ran": false
+  },
+  "mhc_parallel_fp8": {
+    "status": "rejected_complete_chain_slower",
+    "all_5x4_correctness_passed": true,
+    "bitwise_outputs": false,
+    "same_expert_set_required": true,
+    "routing_error_aligned_by_expert": true,
+    "allrank_sram_passed": true,
+    "physical_nodes": {
+      "reference": 20,
+      "candidate": 23
+    },
+    "round_savings_ms": [
+      -0.015023539062499994,
+      -0.014984921875000001,
+      -0.014982304687500003
+    ],
+    "saving_ms_per_layer": -0.014984921875000001,
+    "formal_baseline_ms": 8.532522827530956,
+    "forecast_credit_ms": 0,
+    "formal_request_ran": false,
+    "all_devices_retired": true,
+    "source_archived": "/opt/ssd960/1cat-vllm-decode-archives/decode-mhc-fp8-parallel-02/prototype-source",
+    "reason": "Additional statistics, quantization and matrix stages increase complete early-attention/control latency despite SRAM placement. Node-count and full-chain gates reject this implementation; do not retry unchanged FP8 or placement variants.",
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-mhc-fp8-full-chain-03"
+  },
+  "expert_shared_scale_20261006": {
+    "status": "closed_accepted_in_batch05",
+    "formal_baseline_ms": 8.532522827530956,
+    "expected_ms_token": [
+      0.05,
+      0.12
+    ],
+    "round_savings_four_layer_ms": [
+      0.007190156249999968,
+      0.0069876562500000294,
+      0.006979000000000013
+    ],
+    "saving_ms_per_layer": 0.0017469140625000074,
+    "estimated_ms_token": 0.0698765625000003,
+    "flag": "VLLM_HPU_DSV41_EXPERT_SHARED_SCALE",
+    "five_inputs_four_ranks_byte_exact": true,
+    "physical_nodes": {
+      "parent": 21,
+      "candidate": 20
+    },
+    "w13_and_expert_weights_sram": true,
+    "activation_sram": true,
+    "full_model_gain_credit": false,
+    "formal_request_ran": false,
+    "retired": true,
+    "source_scope": "Raw shared BF16 MME -> combine shared scales and preserve BF16 scale/product rounding inside existing diagonal ordered expert finalizer. Independent shared W13 and routed SRAM slice scheduling retained.",
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-shared-down-finalize-chain-01",
+    "limitations": "Four actual checkpoint layers/all384 experts, native replay incl peer and next mHC/norm consumer; 40-layer saving is a forecast. Existing C2-C6 path unchanged. Five SDK arithmetic cases use checkpoint-derived shared products with generated routed products, while native five-fixture allrank gate uses real shared/routed producers.",
+    "formal_ms_token": 8.23925759729292,
+    "included_in_baseline": true,
+    "default": true
+  },
+  "trace_guided_trials": [
+    {
+      "name": "post_control_stream",
+      "evidence": [
+        "/opt/ssd960/1cat-vllm-decode-archives/decode-post-control-stream-chain-01",
+        "/opt/ssd960/1cat-vllm-decode-archives/decode-post-control-stream-chain-02-fixed"
+      ],
+      "status": "two_variants_rejected_slower",
+      "savings_ms_per_boundary": [
+        -0.0041285234375,
+        -0.0042647578125
+      ],
+      "gain_credit_ms": 0
+    },
+    {
+      "name": "monitor_high_reuse",
+      "status": "two_variants_closed_no_gain",
+      "evidence": [
+        "/opt/ssd960/1cat-vllm-decode-archives/decode-native-monitor-high-reuse-chain-03",
+        "/opt/ssd960/1cat-vllm-decode-archives/decode-native-monitor-compact-chain-01"
+      ],
+      "gain_credit_ms": 0
+    }
+  ],
+  "mhc_gate_packet_20261007": {
+    "status": "closed_accepted_in_batch05",
+    "flag": "VLLM_HPU_DSV41_MHC_GATE_PACKET",
+    "formal_baseline_ms": 8.532522827530956,
+    "round_savings_ms_per_boundary": [
+      0.000704078125,
+      0.0006974921875,
+      0.0007217734375
+    ],
+    "estimated_ms_token": 0.05632625,
+    "qualified_boundaries_forecast": 80,
+    "all_five_inputs_four_ranks_exact": true,
+    "cpu_checks_passed": 34,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-peer-gates-vector-chain-01",
+    "physical_nodes_change_claimed": false,
+    "formal_request_ran": false,
+    "formal_ms_token": 8.23925759729292,
+    "included_in_baseline": true,
+    "default": true
+  },
+  "mhc_post_norm_stats_20261007": {
+    "status": "closed_accepted_in_batch05",
+    "flag": "VLLM_HPU_DSV41_MHC_POST_NORM_STATS",
+    "formal_baseline_ms": 8.532522827530956,
+    "round_savings_ms_per_ffn_boundary": [
+      0.0004866171875000033,
+      0.00047749218750001154,
+      0.0004906640625000069
+    ],
+    "estimated_ms_token": 0.019464687500000133,
+    "qualified_boundaries_forecast": 40,
+    "official_tolerance_passed_five_inputs_four_ranks": true,
+    "cpu_checks_passed": 30,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-post-weighted-statistics-chain-03",
+    "physical_node_change_claimed": false,
+    "formal_request_ran": false,
+    "formal_ms_token": 8.23925759729292,
+    "included_in_baseline": true,
+    "default": true
+  },
+  "next_batch_trigger": {
+    "qualified_items": 0,
+    "forecast_ms": 0,
+    "rule": "forecast >=0.5 ms OR three compatible qualified items"
+  },
+  "latest_components_in_progress": {
+    "bf16_single_plane": {
+      "status": "failed_correctness_before_timing",
+      "case": "/opt/ssd960/1cat-vllm-decode-archives/decode-control-bf16-swizzled-chain-02",
+      "reason": "FP8 shared SiLU normalized error above2e-4; router exact"
+    },
+    "bf16_pair": {
+      "status": "closed_no_consistent_complete_chain_gain",
+      "checks": "5 checkpoint-derived fixtures x4 working layers x4 ranks pass existing official tolerances; router IDs exact.",
+      "round_savings_ms_per_layer": [
+        -2.9632812499992556e-05,
+        -2.211718749999675e-05,
+        1.8515624999951297e-06
+      ],
+      "forecast_ms_token": -0.00088468749999987,
+      "gain_credit_ms": 0,
+      "default": false,
+      "measured_formal": false,
+      "why": "Fewer simulated VPU instructions does not improve complete WO/native-peer/post/router/shared/next-control chain; read transactions unchanged and independent controller already overlaps actual MME work. Single-plane precision failed; high/low precision passed but gain direction inconsistent. Stop this BF16 precision direction, no third format variant.",
+      "cpu_meta_checks": 14,
+      "case": "/opt/ssd960/1cat-vllm-decode-archives/decode-control-bf16-pair-chain-01"
+    },
+    "mme_full_strategy": {
+      "status": "closed_below_hotspot_budget",
+      "forecast_ms": 0.0012515625,
+      "gain_credit_ms": 0
+    },
+    "main_pv_cache": {
+      "status": "sdk_meta_pass_native_chain_queued",
+      "case": "/opt/ssd960/1cat-vllm-decode-archives/decode-main-pv-cache-chain-01",
+      "gate": "5 SDK byte-exact buffers,13 Meta contracts; correct inplace memory-section outputs feed MME dependencies",
+      "hypothesis_ceiling_ms_token": 0.35,
+      "publisher_cost_pending": true,
+      "gain_credit_ms": 0,
+      "default": false
+    }
+  },
+  "accepted_baseline_20261007": {
+    "ms_token": 8.23925759729292,
+    "source": "46ccb98a",
+    "formal_profile": null,
+    "input_tokens": 16384,
+    "natural_eos_tokens": 2365,
+    "sampling": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "seed": 42
+    },
+    "quality": "14 facts pass",
+    "combined_forecast_ms": 0.1456675,
+    "observed_difference_ms": 0.293265230238036,
+    "case": "/opt/ssd960/1cat-vllm-decode-archives/decode-accumulated-serving-07",
+    "trace_status": "Repair03 diagnostic224tokens with160captured succeeded; all owned2/3/6/7 retired768MiB. Offline24-cycle/all-rank normalization in progress. No scoredrequestrepeat.",
+    "promotion_pending_companion": false,
+    "companion_case": "/opt/ssd960/1cat-vllm-decode-archives/decode-accumulated-serving-07-trace-repair-03",
+    "status": "combined_formal_accepted",
+    "formal_ms_token": 8.23925759729292,
+    "parent_ms_token": 8.532522827530956,
+    "observed_improvement_ms_token": 0.293265230238036,
+    "saved_compatible_forecast_ms_token": 0.1456675,
+    "flags_promoted": [
+      "VLLM_HPU_DSV41_EXPERT_SHARED_SCALE",
+      "VLLM_HPU_DSV41_MHC_GATE_PACKET",
+      "VLLM_HPU_DSV41_MHC_POST_NORM_STATS"
+    ],
+    "pending_gain_ms_token": 0,
+    "formal_request_repeated": false,
+    "quality_facts": 14,
+    "trace_case": "/opt/ssd960/1cat-vllm-decode-archives/decode-accumulated-serving-07-trace-repair-03",
+    "trace_windows": 24,
+    "scope": "Four-rank raw activity normalized; rank0 complete anatomy. Other rank anatomy generation still running.",
+    "target_ms_token": 7,
+    "target_met": false,
+    "unqualified_main_pv_cache_remains_off": true
   }
 }
