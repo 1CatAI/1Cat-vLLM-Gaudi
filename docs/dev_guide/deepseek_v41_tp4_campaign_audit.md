@@ -2,8 +2,10 @@
 
 These are diagnostic decisions, outside the microbenchmark gain ledger. None
 establishes a new end-to-end baseline or satisfies the official-sampling target.
-The accepted formal baseline remains 10.568 ms/token; the current target is
+The accepted formal baseline is now 8.239257597 ms/token; the current target is
 7.0 ms/token at 16K, temperature 1.0, top_p 0.95 and seed 42.
+The table below preserves earlier decisions; later accepted defaults and pending
+totals are maintained in the optimization ledger.
 
 | Candidate | Actual evidence | Decision |
 | --- | --- | --- |
@@ -37,3 +39,45 @@ Raw measurements, compiler allocations, numerical checks and launch manifests
 are indexed under the existing local decode campaign evidence root. Failed
 screens do not contribute to cumulative savings. Graph export is a serialized
 compiler diagnostic and remains disabled during formal serving measurement.
+
+## Receive readiness and transport retirement
+
+The ordered completion-group variant passed five checkpoint-derived fixtures
+on four ranks, with all thirteen outputs byte-exact between arms. Its complete
+native WO/control → peer → post/statistics → norm/quant → router/shared-W13
+chain was slower in all three pairs: 0.210, 0.204 and 0.251 microseconds per
+boundary. Reject this variant; it supplies no gain-ledger entry or new baseline.
+Evidence: SSD `decode-hcl-data-ready-01/chain-04/DECISION.json`.
+
+The short-monitor prototype initially retained a long-monitor capture validator,
+then passed a SOB number where the helper expected a SOB group number. Both
+cold-gate failures are archived and supply no timing result. Checking the actual
+SDK helper and candidate call now covers all sixty-four slots and both flag
+values. A separate million-phase CPU model covers additive signal ordering and
+slot reuse; neither test establishes device correctness or performance.
+
+The owned read-only hardware snapshot found the remaining cold-wait cause:
+the received-data SOB is in SM1, while the existing long monitor is in SM3.
+The data reached its expected flag, but a short monitor in SM3 cannot consume
+SM1's SOB. The revised private prototype reused the receiver's
+regular SM1 monitor and leases the unassigned tail of the first network monitor
+pool for the compute stream. The fourth monitor pool was absent in the actual
+runtime and its failed preflight is archived. A public query reports 384 entries
+in the first pool; the source assigns five complete quotients of 76 entries,
+leaving four unassigned entries. Public geometry and all source-derived reserved
+monitor ranges are checked before commands, including HFC and long-monitor pools.
+Original long monitors and full SEND/RECV/copy
+retirement remain unchanged. The private wait-domain API has a distinct version;
+unmatched runtime versions are rejected.
+
+Evidence: SSD `decode-hcl-short-ready-01/PLAN.json` and
+`cold-snapshot-01/DECISION.json`. The later same-SM run stopped on first slot
+reuse: each rank's automatic DFA kernel log reports calculated SO value
+overflow/underflow at SOB 0x4c0. Fifteen-bit register storage does not imply
+modular increment semantics. This invalidates the CPU model's wrapping-add
+assumption and closes the short-monitor prototype without timing or gain credit.
+It remained outside installed serving source and defaults. All owned workers
+retired and modules returned to 768 MiB; no manual reset or PCIe experiment was
+performed. See `chain-05/DECISION.json`. Pending savings remain zero. The next
+independent hypothesis preserves the original completion and retirement
+mechanism while preposting receives with a proved epoch boundary.
