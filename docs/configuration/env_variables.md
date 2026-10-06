@@ -1044,6 +1044,14 @@ with exact finite-FN, NaN and zero corrections. Requires `MLA_VECTOR_CODEC` and
 `MLA_VECTOR_MASK`; publish and wider-batch paths retain their existing implementation.
 Combined end-to-end qualification passed.
 
+### VLLM_HPU_DSV41_MHC_GATE_PACKET
+
+Default: `0`. Component-qualified gate-packet consumer for the common deferred
+mHC decode path. Reads the existing complete gate tensor with vector loads,
+retaining ordered peer summation, BF16 residual rounding and collapse. No
+communication, replay, sampling or precision interface changes. Requires the
+matching native operator artifact; combined serving acceptance is pending.
+
 ### VLLM_HPU_DSV41_MHC_COMM_GATES
 
 Default: `1`. Component-qualified scheduling candidate for the existing C1

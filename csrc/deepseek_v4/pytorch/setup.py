@@ -73,6 +73,7 @@ setup(
                 "hpu_dsv41_logical_mla_pt2.cpp",
                 "hpu_dsv41_shared_main_mla_pt2.cpp",
                 "hpu_dsv41_mhc_post_collapse_pt2.cpp",
+                "hpu_dsv41_mhc_gates_post_pt2.cpp",
                 "hpu_dsv41_feature_silu_pt2.cpp",
                 "hpu_dsv41_mhc_post_collapse_f32_pt2.cpp",
                 "hpu_dsv41_kv_pack_pt2.cpp",

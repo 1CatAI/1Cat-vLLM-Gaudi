@@ -20,8 +20,13 @@ def communication_gates_post(value, residual, control, scale, base, epsilon):
         control[:, :24].contiguous(), control[:, 24:25].contiguous(), scale, base
     )
     pre = gates[:, :4].contiguous()
-    updated, collapsed = torch.ops.custom_op.custom_deepseek_v41_mhc_post_collapse_gaudi2(
-        value, residual, gates[:, 4:8].contiguous(),
-        gates[:, 8:].reshape(residual.shape[0], 4, 4).contiguous(), pre
-    )
+    if gaudi_envs.VLLM_HPU_DSV41_MHC_GATE_PACKET:
+        updated, collapsed = torch.ops.custom_op.custom_deepseek_v41_mhc_gates_post_gaudi2(
+            value, residual, gates
+        )
+    else:
+        updated, collapsed = torch.ops.custom_op.custom_deepseek_v41_mhc_post_collapse_gaudi2(
+            value, residual, gates[:, 4:8].contiguous(),
+            gates[:, 8:].reshape(residual.shape[0], 4, 4).contiguous(), pre
+        )
     return updated, collapsed, gates
