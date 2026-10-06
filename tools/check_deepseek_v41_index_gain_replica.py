@@ -24,6 +24,8 @@ def main():
     parser.add_argument('--selection-chain', action='store_true', help='Native query producer -> full 16K score -> threshold/emit -> MLA consumer')
     parser.add_argument('--wide-reindex', action='store_true', help='Hold selection/reference variant fixed; compare eight 2K score calls with one complete 16K call')
     parser.add_argument('--wide-score-parent', action='store_true', help='Hold qualified complete-pool scoring fixed in both selection arms')
+    parser.add_argument('--production-coordinates', action='store_true', help='Hold the default native candidate-coordinate producer fixed in both arms')
+    parser.add_argument('--combined-selection', action='store_true', help='Compare wide scoring plus predicate packing with the original scorer/selection pair')
     parser.add_argument('--threshold-variant', type=int, choices=(1,), default=1)
     parser.add_argument('--steps', type=int, default=200)
     parser.add_argument('--chain-repeats', type=int, default=64)
@@ -32,6 +34,10 @@ def main():
         parser.error('--wide-reindex requires --selection-chain')
     if args.wide_score_parent and (not args.selection_chain or args.wide_reindex):
         parser.error('--wide-score-parent requires --selection-chain and excludes --wide-reindex')
+    if args.production_coordinates and not args.selection_chain:
+        parser.error('--production-coordinates requires --selection-chain')
+    if args.combined_selection and not args.wide_reindex:
+        parser.error('--combined-selection requires --wide-reindex')
     if args.selection_chain and (not args.native_query_path or args.query_replica or args.fused_query_codec or args.shared_query_codec):
         parser.error('--selection-chain requires native query path and a fixed shared query/gain parent')
     if args.fused_query_codec and (not args.native_query_path or args.query_replica):
@@ -139,16 +145,24 @@ def main():
         query = query.reshape(1, total_heads, 128)
         gains = gains.reshape(1, total_heads) if args.selection_chain or replicated or args.query_replica or args.fused_query_codec else gains.reshape(tp, 128)[:, :local_heads].reshape(1, total_heads).contiguous()
         if args.selection_chain:
-            logical = torch.where(candidates.unsqueeze(-1) >= 0,
-                                  candidates.unsqueeze(-1) * 8 + torch.arange(8, dtype=torch.int32, device=query.device),
-                                  -1).flatten(1)
+            if args.production_coordinates:
+                logical, safe = torch.ops.custom_op.custom_deepseek_v41_candidate_coordinates_gaudi2(
+                    candidates, keys.shape[0] - 1)
+            else:
+                logical = torch.where(candidates.unsqueeze(-1) >= 0,
+                                      candidates.unsqueeze(-1) * 8 + torch.arange(8, dtype=torch.int32, device=query.device),
+                                      -1).flatten(1)
+                safe = None
             if args.wide_score_parent or (args.wide_reindex and replicated):
-                scores = mirror_index_tile(query, gains, keys, positions, logical, 1, local_heads)
+                scores = mirror_index_tile(query, gains, keys, positions, logical, 1, local_heads, safe_rows=safe)
             else:
                 scores = torch.cat([mirror_index_tile(query, gains, keys, positions, logical[:, tile*2048:(tile+1)*2048],
-                                                      1, local_heads) for tile in range(8)], -1).contiguous()
+                                                      1, local_heads,
+                                                      safe_rows=None if safe is None else safe[:, tile*2048:(tile+1)*2048])
+                                    for tile in range(8)], -1).contiguous()
             stats = torch.ops.custom_op.custom_deepseek_v41_index_threshold_gaudi2(
-                scores, positions, 1, 1, 0, args.threshold_variant if replicated and not args.wide_reindex else 0)
+                scores, positions, 1, 1, 0,
+                args.threshold_variant if replicated and (not args.wide_reindex or args.combined_selection) else 0)
             selected = torch.ops.custom_op.custom_deepseek_v41_index_emit_gaudi2(
                 scores, positions, candidates, stats, 1, 1, 0)
             # First real selected-KV/QK/softmax/PV consumer, including its actual waits.
@@ -267,6 +281,7 @@ def main():
                   saving_ms_per_index_layer=statistics.median(savings), three_consistent_rounds=all(v>0 for v in savings),
                   peer_points_per_iteration=[1,0] if args.query_replica else [1,1] if args.selection_chain or args.fused_query_codec else [2,1],
                   wide_reindex=args.wide_reindex, wide_score_parent=args.wide_score_parent,
+                  production_coordinates=args.production_coordinates, combined_selection=args.combined_selection,
                   selection_chain=args.selection_chain, threshold_variant=args.threshold_variant if args.selection_chain else None,
                   native_query_path=args.native_query_path, fused_query_codec=args.fused_query_codec,
                   shared_query_codec=args.shared_query_codec,

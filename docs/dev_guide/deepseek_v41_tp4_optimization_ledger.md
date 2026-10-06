@@ -19,13 +19,13 @@ STATIC_COORDINATES 原已默认开启，共六项。显式诊断覆盖仍可关�
 recipe编号冲突停止追查，不再作逐项归因。输出/post-norm/WOa/发布链小融合归档，
 默认关闭；共享-main输出原型提交 `0dd878fb`。旧项目中的组件预测不能继续叠加到新基线。
 
-**当前本轮微基准待验收累计：0.936105875 ms/token（估计，尚未端到端）。**
+**当前本轮微基准待验收累计：0.944525125 ms/token（估计，尚未端到端）。**
 MoE 合并候选0.206373750ms、mHC0.039834531ms、Attention主体向量化0.176384352ms，
 量化整行amax去重0.036122500ms；FFN BF16量化0.001143438ms、索引gain副本0.030703250ms、
 mHC权重布局0.005530156ms、共享RRMS post0.000290156ms、reuse向量mask0.137790492ms、
 reuse硬件E4M3 codec0.024276902ms；gates/peer重叠0.136496875ms、全局SWA镜像读0.016101598ms、
 W2有效K0.020418438ms、正分母Sinkhorn0.001187500ms、索引query codec0.014609813ms、
-整段Reindex评分0.088842125ms。各项微基准与适用范围见文末，未验证方向不计入。
+整段Reindex评分0.088842125ms；predicate位图0.008419250ms。各项微基准与适用范围见文末，未验证方向不计入。
 BF16控制权重候选与mHC权重布局互斥，当前未叠加。
 各项5组输入四卡通过适用正确性检查、原生重放3轮A/B方向一致，默认均关闭。
 mHC 新项按官方方程/DeepGEMM归一化误差容差验收，不声称逐位一致；其余保留原逐位检查。详见文末。
@@ -1263,4 +1263,24 @@ formal model/state/quality result. Compatible pending **0.936105875ms/token**;
 formal **9.564282ms/token** unchanged. All owned workers retired.
 
 Evidence: `/opt/ssd960/1cat-vllm-decode-archives/decode-index-wide-reindex-chain-02/`
+(`result.json`, `PHYSICAL_NODES.json`, `DECISION.json`).
+
+### 2026-10-06 — predicate bitmap packing, wide-score parent
+
+Native query/gain → onepeer → complete16384-row scoring → threshold/emit →
+actualMLA, with qualified wide scoring held in BOTH arms. Five fixture
+queries/positions/pools ×four ranks have exact scores, IDs, MLA results and
+publication rows/masks. ABABAB200 native16repeat savings
+**.002104813/.002126813/.001769813ms per late Reindex layer**; same13 query
+producer nodes and27 score/select/MLA nodes. This is bitmap instruction
+efficiency, not node reduction. Four measured-scope occurrences24/28/32/36
+forecast **.008419250ms/token**, not an eight-layer extrapolation.
+
+`VLLM_HPU_DSV41_INDEX_PREDICATE_PACK=0`, compatible pending
+**.944525125ms/token**, formal **9.564282ms/token** unchanged. These fixtures
+use framework candidate coordinates; the next combined wide+packing comparison
+holds the already-default native coordinate producer fixed. That combined
+measurement must replace these overlapping forecasts, not add another value.
+
+Evidence: `/opt/ssd960/1cat-vllm-decode-archives/decode-index-predicate-pack-chain-01/`
 (`result.json`, `PHYSICAL_NODES.json`, `DECISION.json`).

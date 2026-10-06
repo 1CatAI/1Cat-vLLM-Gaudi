@@ -1742,7 +1742,7 @@
     "gain_credit_ms": 0,
     "next": "Hoist immutable 24 coefficients out of 40-tile loop; ISA change verified, next hardware run queued"
   },
-  "pending_micro_only_ms": 0.9361058749999994,
+  "pending_micro_only_ms": 0.9445251249999994,
   "accepted_baseline_20261005": {
     "case": "decode-physical-fusion-serving-03",
     "official_tpot_ms": 9.564282285406788,
@@ -2551,7 +2551,7 @@
     "formal_baseline_ms": 9.564282285406788,
     "flag": "VLLM_HPU_DSV41_INDEX_QUERY_CODEC=0"
   },
-  "compatible_pending_forecast_ms": 0.9361058749999994,
+  "compatible_pending_forecast_ms": 0.9445251249999994,
   "current_micro_cards": [
     2,
     3,
@@ -2716,5 +2716,66 @@
       93
     ]
   ],
-  "resource_state": "0/1/4/5 quarantined after earlier DMA-BUF experiment;2/3/6/7 currently occupied by foreign DSpark service. Queue only, no foreign process/device action."
+  "resource_state": "0/1/4/5 quarantined after earlier DMA-BUF experiment;2/3/6/7 currently occupied by foreign DSpark service. Queue only, no foreign process/device action.",
+  "predicate_pack_20261006": {
+    "status": "complete_chain_micro_qualified_default_off",
+    "round_savings_ms": [
+      0.0021048124999999973,
+      0.0021268125000000193,
+      0.0017698124999999953
+    ],
+    "saving_ms_per_reindex_layer": 0.0021048124999999973,
+    "forecast_occurrences": 4,
+    "applicable_layers": [
+      24,
+      28,
+      32,
+      36
+    ],
+    "forecast_ms_per_token": 0.00841924999999999,
+    "compatible_pending_forecast_ms": 0.9445251249999994,
+    "physical_nodes": {
+      "query_producer": [
+        13,
+        13
+      ],
+      "score_select_mla": [
+        27,
+        27
+      ]
+    },
+    "correctness": "5checkpoint-derived queries/positions/candidate permutations/holes x4ranks; allscores/IDs/MLA/publication bytes exact",
+    "parent": "Qualified querycodec/gainreplica and wide-score held in both arms; native16-repeat ABABAB200; full524K key/main allocation",
+    "limitation": "Native candidate-coordinate producer was not active in this fixture. Next combined wide+pack run aligns that already-default producer; replace overlapping estimate, never add it.",
+    "flag": "VLLM_HPU_DSV41_INDEX_PREDICATE_PACK=0",
+    "formal_baseline_ms": 9.564282285406788,
+    "formal_gain": false,
+    "owners_retired": true
+  },
+  "softmax_static_20261006": {
+    "status": "rejected_three_slower_native_rounds",
+    "correctness": "5checkpoint-derived fixtures x4ranks; all7 outputs exact",
+    "round_savings_ms": [
+      -0.0012327539062500087,
+      -0.0010446992187500004,
+      -0.0011662695312499999
+    ],
+    "physical_nodes": {
+      "producer": [
+        19,
+        19
+      ],
+      "post": [
+        3,
+        3
+      ]
+    },
+    "same_QK_PV_layout": true,
+    "gain_credit_ms": 0,
+    "flag": "VLLM_HPU_DSV41_MLA_REGISTER_SOFTMAX=0",
+    "reason": "Lower simulator bundle/load/store counts do not imply faster native chain. Critical per-node cause not isolated; no extra profiler. Keep original arithmetic default.",
+    "owners_retired": true
+  },
+  "queued_native_candidates": [],
+  "next_action": "Align combined wide+predicate comparison with default native candidate coordinates; no repeat of unchanged SSA softmax. Formal unchanged9.564ms; micro forecast0.944525ms below1ms gate."
 }

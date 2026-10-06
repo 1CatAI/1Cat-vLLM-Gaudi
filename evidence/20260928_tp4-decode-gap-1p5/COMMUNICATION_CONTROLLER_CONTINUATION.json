@@ -3,7 +3,7 @@
   "target_ms": 7,
   "formal_completed_this_batch": false,
   "new_qualified_gain_ms": 0.014609812499999986,
-  "compatible_pending_forecast_ms": 0.9361058749999994,
+  "compatible_pending_forecast_ms": 0.9445251249999994,
   "negative_and_prepared_experiments": {
     "decode-mhc-native-fp32-chain-01": {
       "status": "rejected_slower",
@@ -506,7 +506,7 @@
     6,
     7
   ],
-  "next_action": "Read clean-artifact softmax02 complete native gate when healthycards free; pure predicate full selection on qualified wide-score parent next; normal-source combined acceptance when forecast>=1ms. Formal unchanged9.564ms.",
+  "next_action": "Align combined wide+predicate comparison with default native candidate coordinates; no repeat of unchanged SSA softmax. Formal unchanged9.564ms; micro forecast0.944525ms below1ms gate.",
   "query_replica_native_03": {
     "status": "completed",
     "checks": [
@@ -573,9 +573,7 @@
     "reason": "Removing one query peer via full cold Wq replication still regresses the actual producer/score consumer boundary. No renewed global-query runtime implementation.",
     "owners_retired": true
   },
-  "queued_native_candidates": [
-    "decode-mla-register-softmax-chain-02"
-  ],
+  "queued_native_candidates": [],
   "index_wide_reindex_20261006": {
     "status": "complete_chain_micro_qualified_default_off",
     "artifact": "/opt/ssd960/1cat-vllm-decode-archives/decode-index-wide-reindex-chain-02",
@@ -637,5 +635,64 @@
     "gain_credit_ms": 0,
     "device_recovered_without_reset": true,
     "remaining_candidate": "Pure predicate bitpacking; no scalar/VPU waiting. Off/unqualified."
+  },
+  "predicate_pack_20261006": {
+    "status": "complete_chain_micro_qualified_default_off",
+    "round_savings_ms": [
+      0.0021048124999999973,
+      0.0021268125000000193,
+      0.0017698124999999953
+    ],
+    "saving_ms_per_reindex_layer": 0.0021048124999999973,
+    "forecast_occurrences": 4,
+    "applicable_layers": [
+      24,
+      28,
+      32,
+      36
+    ],
+    "forecast_ms_per_token": 0.00841924999999999,
+    "compatible_pending_forecast_ms": 0.9445251249999994,
+    "physical_nodes": {
+      "query_producer": [
+        13,
+        13
+      ],
+      "score_select_mla": [
+        27,
+        27
+      ]
+    },
+    "correctness": "5checkpoint-derived queries/positions/candidate permutations/holes x4ranks; allscores/IDs/MLA/publication bytes exact",
+    "parent": "Qualified querycodec/gainreplica and wide-score held in both arms; native16-repeat ABABAB200; full524K key/main allocation",
+    "limitation": "Native candidate-coordinate producer was not active in this fixture. Next combined wide+pack run aligns that already-default producer; replace overlapping estimate, never add it.",
+    "flag": "VLLM_HPU_DSV41_INDEX_PREDICATE_PACK=0",
+    "formal_baseline_ms": 9.564282285406788,
+    "formal_gain": false,
+    "owners_retired": true
+  },
+  "softmax_static_20261006": {
+    "status": "rejected_three_slower_native_rounds",
+    "correctness": "5checkpoint-derived fixtures x4ranks; all7 outputs exact",
+    "round_savings_ms": [
+      -0.0012327539062500087,
+      -0.0010446992187500004,
+      -0.0011662695312499999
+    ],
+    "physical_nodes": {
+      "producer": [
+        19,
+        19
+      ],
+      "post": [
+        3,
+        3
+      ]
+    },
+    "same_QK_PV_layout": true,
+    "gain_credit_ms": 0,
+    "flag": "VLLM_HPU_DSV41_MLA_REGISTER_SOFTMAX=0",
+    "reason": "Lower simulator bundle/load/store counts do not imply faster native chain. Critical per-node cause not isolated; no extra profiler. Keep original arithmetic default.",
+    "owners_retired": true
   }
 }
