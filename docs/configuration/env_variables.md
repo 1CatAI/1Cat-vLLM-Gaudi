@@ -1105,3 +1105,7 @@ and prefill entrypoints are unchanged. This needs the matching rebuilt native
 library. No replay, runner or communication API changed. Native timing remains
 unqualified; neither simulator instruction counts nor raw graph counts are
 latency evidence.
+
+`VLLM_HPU_DSV41_SAMPLING_THRESHOLD` (default `0`) is an experimental bounded-sampler selector. It screens512 candidates with the shared index threshold/emit kernels, then sorts their original F32 scores to obtain the local Top128. A device coverage check requires at least128 scores strictly above the coarse cutoff; otherwise the existing full-vocabulary repair uses the same random draw. The full partition function is unchanged. Selection coordinates are allocated once at tail construction. Vocabulary shards must fit the selector's private key cache; no TP-size-specific implementation or context-length cutoff is introduced. Performance and combined serving qualification are pending.
+
+`VLLM_HPU_DSV41_SAMPLING_FUSED_PACKET` (default `0`) is an experimental shared sampling consumer. Three handwritten TPC kernels perform packet layout, nucleus retention/certification and ID selection; the original FP32 sort, exponentials, full partition function and both cumsums remain unchanged. The certificate uses I32 0/1 in the existing scalar status ABI. No host upload, RNG change or communication interface change is introduced. Component and serving qualification are pending.

@@ -2235,6 +2235,16 @@ class PreparedGreedyTail(nn.Module):
             self.register_buffer("sampling_params", stage.sampling_params)
             self.register_buffer("sampling_seed", stage.sampling_seed)
             self.register_buffer("sampling_origin", stage.sampling_origin)
+            self.sampling_threshold = False
+            self.sampling_fused_packet = gaudi_envs.VLLM_HPU_DSV41_SAMPLING_FUSED_PACKET
+            if gaudi_envs.VLLM_HPU_DSV41_SAMPLING_THRESHOLD:
+                columns = self.weights.head.weight.shape[0]
+                if 512 < columns <= 32768 and columns % 64 == 0:
+                    self.register_buffer("sampling_selection_position", torch.full(
+                        (1,), columns - 1, dtype=torch.int32, device=self.weights.head.weight.device))
+                    self.register_buffer("sampling_selection_ids", torch.zeros(
+                        (1, 2048), dtype=torch.int32, device=self.weights.head.weight.device))
+                    self.sampling_threshold = True
 
     def forward(self, hidden, positions=None, input_ids=None):
         from vllm_gaudi.ops.deepseek_v41_sampling import local_greedy_candidate, select_greedy_candidate
@@ -2250,9 +2260,16 @@ class PreparedGreedyTail(nn.Module):
             controls = device_sampling_controls(self.sampling_params, self.sampling_seed, ordinal)
             # Communication ownership supplies TP size; vocabulary slices are
             # equal and token IDs remain exact in the existing FP32 peer wire.
-            packet = self.all_gather(local_nucleus_packet(local, controls, self.tp_rank, 128), dim=-1)
+            threshold_state = ((self.sampling_selection_position, self.sampling_selection_ids)
+                               if self.sampling_threshold else None)
+            packet = self.all_gather(local_nucleus_packet(
+                local, controls, self.tp_rank, 128, threshold_state=threshold_state), dim=-1)
             tp_size = packet.shape[-1] // (3 + 2 * 128)
-            selected, covered = sample_nucleus_packet(packet, controls, tp_size=tp_size, width=128)
+            if self.sampling_fused_packet:
+                from vllm_gaudi.ops.deepseek_v41_sampling import sample_nucleus_packet_fused
+                selected, covered = sample_nucleus_packet_fused(packet, controls, tp_size=tp_size, width=128)
+            else:
+                selected, covered = sample_nucleus_packet(packet, controls, tp_size=tp_size, width=128)
             if getattr(self, "device_input_feedback", False):
                 from vllm_gaudi.ops.deepseek_v41_sampling import commit_replay_inputs
 

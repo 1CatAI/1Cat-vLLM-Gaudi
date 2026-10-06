@@ -86,6 +86,7 @@ setup(
                 "hpu_dsv41_decode_coordinates_pt2.cpp",
                 "hpu_dsv41_decode_metadata_pt2.cpp",
                 "hpu_dsv41_candidate_coordinates_pt2.cpp",
+                "hpu_dsv41_sampling_pt2.cpp",
                 "hpu_dsv41_ordered_peer_sum_pt2.cpp",
                 "hpu_dsv41_control_gemv_pt2.cpp",
                 "hpu_dsv41_csa2_prep_pt2.cpp",

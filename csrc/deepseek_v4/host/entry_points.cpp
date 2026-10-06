@@ -14,6 +14,7 @@ OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY TH
 NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ********************************************************************/
 
+#include "deepseek_v41_sampling_gaudi2.hpp"
 #include "deepseek_v41_control_mme_finish_gaudi2.hpp"
 #include <cstring>
 #include <dlfcn.h>
@@ -358,6 +359,9 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_MHC_RRMS_POST,
     GAUDI2_KERNEL_DEEPSEEK_V41_INDEX_QUERY_ROPE_FP4,
     GAUDI2_KERNEL_DEEPSEEK_V41_REGISTER_SOFTMAX,
+    GAUDI2_KERNEL_DEEPSEEK_V41_SAMPLING_UNPACK,
+    GAUDI2_KERNEL_DEEPSEEK_V41_SAMPLING_MASK,
+    GAUDI2_KERNEL_DEEPSEEK_V41_SAMPLING_SELECT,
     KERNEL_COUNT
 };
 
@@ -943,6 +947,8 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_CANDIDATE_COORDINATES].name, DeepseekV41CandidateCoordinatesGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_CANDIDATE_COORDINATES_GLOBAL].name, DeepseekV41CandidateCoordinatesGaudi2::global_name);
     DeepseekV41SelectedMlaGaudi2(false,true).GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_REGISTER_SOFTMAX].name);
+    for(unsigned mode=0;mode<3;++mode)
+        std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_SAMPLING_UNPACK+mode].name,DeepseekV41SamplingGaudi2::names[mode]);
     return stock(deviceId, &stock_count, guids + KERNEL_COUNT);
 }
 
@@ -950,6 +956,9 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     tpc_lib_api::HabanaKernelInstantiation* instance) {
     if (!params || !instance) return tpc_lib_api::GLUE_FAILED;
     char kernelName[tpc_lib_api::MAX_NODE_NAME];
+    for(unsigned mode=0;mode<3;++mode)
+        if(std::strcmp(params->guid.name,DeepseekV41SamplingGaudi2::names[mode])==0)
+            return DeepseekV41SamplingGaudi2(mode).GetGcDefinitions(params,instance);
     if (std::strcmp(params->guid.name, DeepseekV41OrderedPeerSumGaudi2::name) == 0)
         return DeepseekV41OrderedPeerSumGaudi2().GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41CandidateCoordinatesGaudi2::global_name) == 0)

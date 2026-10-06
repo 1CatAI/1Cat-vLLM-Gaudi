@@ -1299,3 +1299,34 @@ framework coordinates. Do not add allthree. Compatible pending is now
 **0.931681750ms/token**; formal **9.564282ms/token** unchanged. Both runtime
 flags staydefaultoff until combined serving. Owners retired; no new formal
 request/trace. Evidence: SSD `decode-index-wide-predicate-production-chain-01/DECISION.json`.
+
+### 2026-10-06 — exact local sampling candidates with coarse coverage
+
+Real checkpoint head/norm → localpacket → production padded BF16 peer →
+original nucleus → embedding, native16-repeat ABABAB200, fivefixtures×fourranks.
+Token/certificate/embedding/logits bytes exact; separate onecard actualpacket
+fivefixtures exact, coarse tie bucket rejects coverage, greedy tie chooses0.
+Three savings **.024229938/.024228750/.024157406ms/token**; forecast once
+**0.024228750ms/token**. Physical producer30→30 andconsumer74→74: this
+reduces full32K sort work ratherthan nodecount.
+
+`VLLM_HPU_DSV41_SAMPLING_THRESHOLD=0`, pending **0.955910500ms/token**,
+formal **9.564282ms/token** unchanged. These5 embedding-derived inputs have
+ordinary nucleus coveragefalse in BOTHarms; timed endpoint is the provisional
+device embedding, not fullrepair. No extra coarse rejection in their localpackets.
+Full-serving extra fallbackrate and semantic qualification remain pending.
+Evidence SSD `decode-sampling-threshold-chain-04/DECISION.json` and
+`decode-sampling-threshold-packet-01/result.json`.
+
+### 2026-10-06 — handwritten sampling packet consumer
+
+Qualified threshold producer BOTHarms → same peer → original versus fused
+consumer → embedding. Five real fixtures×fourranks have exact token/I32
+certificate/embedding/logits; nine simulator frames allthreekernels exact.
+Native16-repeat ABABAB200 savings **.036573594/.036707625/.036733375ms/token**.
+Physical consumer **75→22**, producer30 unchanged. Forecast once
+**0.036707625ms/token**; pending **0.992618125ms/token**.
+`VLLM_HPU_DSV41_SAMPLING_FUSED_PACKET=0`. Sort/exp/fullpartitionfunction/both
+cumsums are unchanged; no RNG/hostupload/replay/communication ABI change.
+Same provisional-endpoint/fullrepair scope as the threshold parent; formal
+**9.564282ms/token** unchanged. Evidence SSD `decode-sampling-fused-chain-01`.

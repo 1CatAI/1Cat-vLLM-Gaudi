@@ -91,12 +91,29 @@ def commit_replay_inputs(input_ids, positions, selected):
     return input_ids.reshape(1, 1), positions
 
 
-def local_nucleus_packet(logits, controls, tp_rank, width):
+def local_nucleus_packet(logits, controls, tp_rank, width, *, threshold_state=None):
     """Keep the full local partition function, exchanging only bounded candidates."""
     scaled = logits.float() / controls[:, :1].clamp_min(1e-5)
     maximum = scaled.amax(-1, keepdim=True)
     total = (scaled - maximum).exp().sum(-1, keepdim=True)
-    values, ids = scaled.topk(width, dim=-1, sorted=True)
+    if threshold_state is None or logits.shape[0] != 1 or logits.shape[-1] <= 512:
+        values, ids = scaled.topk(width, dim=-1, sorted=True)
+    else:
+        # The index selector uses monotone upper16-bit score keys. All scores
+        # strictly above its512th key are included. If at least K such scores
+        # exist, the true F32 TopK is wholly inside the emitted512 candidates.
+        # Otherwise invalidate the normalizer so the existing full repair uses
+        # the same random draw. Never treat truncated keys as exact F32 ranks.
+        position, scratch_ids = threshold_state
+        metadata = torch.ops.custom_op.custom_deepseek_v41_index_threshold_gaudi2(
+            scaled.contiguous(), position, 1, 0, 0, 1)
+        candidates = torch.ops.custom_op.custom_deepseek_v41_index_emit_gaudi2(
+            scaled.contiguous(), position, scratch_ids, metadata, 1, 0, 0)
+        candidates = candidates.clamp_min(0).long()
+        subset = scaled.gather(-1, candidates)
+        values, offsets = subset.topk(width, dim=-1, sorted=True)
+        ids = candidates.gather(-1, offsets)
+        total = torch.where(metadata[:, 1:2] >= width, total, float("nan"))
     global_ids = ids.to(torch.float32) + tp_rank * logits.shape[-1]
     greedy = scaled.argmax(-1, keepdim=True).float() + tp_rank * logits.shape[-1]
     return torch.cat((maximum, total, greedy, values, global_ids), -1)
@@ -139,6 +156,32 @@ def sample_nucleus_packet(packet, controls, *, tp_size, width):
     greedy = greedy.to(torch.int32)
     return torch.where(controls[:, :1] == 0, greedy, sampled), covered | (controls[:, :1] == 0)
 
+
+
+def sample_nucleus_packet_fused(packet, controls, *, tp_size, width):
+    """Same FP32 sort/exp/normalizer/cumsums; fused layout, mask and ID selection.
+
+    The completion certificate is I32 0/1, directly consumed by the existing
+    scalar status ABI. No RNG, host upload or state mutation is introduced.
+    """
+    if packet.shape[0] != controls.shape[0]:
+        return sample_nucleus_packet(packet, controls, tp_size=tp_size, width=width)
+    values, ids, norms, cuts = torch.ops.custom_op.custom_deepseek_v41_sampling_unpack_gaudi2(
+        packet.contiguous(), tp_size, width)
+    shards = norms.reshape(packet.shape[0], tp_size, 3)
+    maximum = shards[..., 0].amax(-1, keepdim=True)
+    total = (shards[..., 1] * (shards[..., 0] - maximum).exp()).sum(-1, keepdim=True)
+    values, order = values.sort(-1, descending=True)
+    ids = ids.gather(-1, order)
+    probabilities = (values - maximum).exp() / total
+    cumulative = probabilities.cumsum(-1)
+    retained, covered = torch.ops.custom_op.custom_deepseek_v41_sampling_mask_gaudi2(
+        values, probabilities, cumulative, cuts, controls, total, tp_size)
+    cumulative = retained.cumsum(-1)
+    greedy = torch.where(shards[..., 0] == maximum, shards[..., 2], float(2**24)).amin(-1, keepdim=True)
+    selected = torch.ops.custom_op.custom_deepseek_v41_sampling_select_gaudi2(
+        cumulative, ids, controls, greedy.to(torch.int32))
+    return selected, covered
 
 def device_sampling_controls(parameters, seed, counter):
     """A counter-based uniform draw using only fixed-address device inputs.
