@@ -212,7 +212,7 @@
       "native_retired": true
     }
   },
-  "active": "Offline W13 N-tail audit: compact cold gate/up weights and replace per-store scalar tail checks with one partial-store bound per workpoint, preserving sliced SRAM pipeline.",
+  "active": "W13 compact route-N layout: five real checkpoint packed-word roundtrips and zero suffixes proved offline; next TPC lane simulation and affine SRAM producer/consumer qualification. No new hardware timing/credit.",
   "excluded_modules": [
     0,
     1,
@@ -462,5 +462,25 @@
     "formal_baseline_ms": 9.564282285406788,
     "gain_scope": "Forecast only; no formal gain",
     "retired": true
+  },
+  "w13_compact_preparation": {
+    "artifact": "/opt/ssd960/1cat-vllm-decode-archives/decode-expert-w13-compact-01",
+    "status": "five_checkpoint_bit_layout_checks_passed_only",
+    "source": "Offline utility only; production prepared layout unchanged",
+    "tested_layers": [
+      0,
+      4,
+      14,
+      19,
+      39
+    ],
+    "active_w13_columns": 1152,
+    "old_columns": 1280,
+    "gain_credit_ms": 0,
+    "constraints": [
+      "Current N256 blocked format cannot cheaply emit compact1152 route boundaries. Plain packed N row layout allows contiguous unaligned loads; crossingexpert tiles need two bounded reads.",
+      "Need metadata and actual compiled SRAM evidence, not an assumed node reduction.",
+      "Serving must not retain duplicate full expert weights; preserve common prefill/DSpark prepared-weight contracts."
+    ]
   }
 }
