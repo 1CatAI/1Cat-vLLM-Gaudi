@@ -3,6 +3,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -10,6 +11,18 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+
+
+def check_pytorch_source_coverage(directory):
+    """Reject source fingerprints that include an unbuilt registration unit."""
+    tree = ast.parse((directory / "setup.py").read_text())
+    declared = {
+        node.value for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.endswith(".cpp")
+    }
+    missing = sorted(path.name for path in directory.glob("hpu_*.cpp") if path.name not in declared)
+    if missing:
+        raise RuntimeError("Custom operator sources missing from setup.py: " + ", ".join(missing))
 
 
 def main():
@@ -23,6 +36,8 @@ def main():
     if args.jobs < 1:
         parser.error("--jobs must be positive")
     source = root / "csrc/deepseek_v4"
+    if not args.kernel_only:
+        check_pytorch_source_coverage(source / "pytorch")
     build, output = args.build_root.resolve(), args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
     def fingerprint_sources():
