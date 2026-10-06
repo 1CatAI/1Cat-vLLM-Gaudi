@@ -1135,3 +1135,7 @@ Existing wide woA epilogue preserved WoB consumer bits at C1/C2/C6 but no small-
 
 - SoftmaxSSA02 completed/owners retired:5x4all7outputs exact, producer19→19/post3→3; three native regressions1.233/1.045/1.166us/layer. Zero credit, default-off. Simulator instructions alone were insufficient; no invented per-node rootcause or extra trace.
 - PredicatePack01 completed/retired:5x4scores/IDs/MLA/publishedrows/mask exact; wide-score parent BOTH arms, native16-repeat ABABAB200 savings2.104813/2.126813/1.769813us/layer. Physical27→27, pure bitmap ISA gain. Fourlate-layer forecast0.00841925ms; compatible0.944525125ms, formal9.564282 unchanged. Next combined verification activates already-default native candidate coordinates in both arms, replacing overlapping wide/pack estimates rather than summing again.
+
+- Production-coordinate combined selection01 completed/retired:5x4exact, 3positive native rounds21.125/21.080/21.105us/layer; score/select/MLA42→20, query13same. Fourlate-layer forecast0.084418000 replaces earlierwide+.pack estimate, activepending0.931681750; formal9.564282 unchanged. No serving request.
+
+- Compact exactsoftmax01 completed/retired:5x4all outputs/cache exact, plus10simulator probability fixtures exact. Qualified decodedSWA parent BOTH arms, producer19→19 andpost3→3. Three losses.384/.393/.445us/layer, zero credit. Second slower complete-chain instruction/lifetime variant; stopsoftmax family. Prototype API/kernel archived onSSD and maintained runtime restored. Pending.931681750ms, formal9.564282 unchanged.

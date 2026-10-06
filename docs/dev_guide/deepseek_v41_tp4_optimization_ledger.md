@@ -1284,3 +1284,18 @@ measurement must replace these overlapping forecasts, not add another value.
 
 Evidence: `/opt/ssd960/1cat-vllm-decode-archives/decode-index-predicate-pack-chain-01/`
 (`result.json`, `PHYSICAL_NODES.json`, `DECISION.json`).
+
+### 2026-10-06 — production-coordinate combined score/selection correction
+
+`decode-index-wide-predicate-production-chain-01` holds already-default native
+candidate coordinates and qualified query/gain in both arms. Full524K storage,
+5 changing queries/positions/pools ×four ranks: all scores/IDs/MLA/publication
+bytes exact. Native16-repeat ABABAB200 saves **.021125375/.021080187/.021104500
+ms/layer**. Physical query13→13; complete score/select/MLA42→20. Fourlate
+Reindex occurrences yield **0.084418000ms/token forecast**.
+
+This REPLACES the earlier wide+.predicate **.097261375** estimate, which used
+framework coordinates. Do not add allthree. Compatible pending is now
+**0.931681750ms/token**; formal **9.564282ms/token** unchanged. Both runtime
+flags staydefaultoff until combined serving. Owners retired; no new formal
+request/trace. Evidence: SSD `decode-index-wide-predicate-production-chain-01/DECISION.json`.

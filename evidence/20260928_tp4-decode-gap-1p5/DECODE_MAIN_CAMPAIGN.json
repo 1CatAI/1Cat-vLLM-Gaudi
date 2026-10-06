@@ -2551,7 +2551,7 @@
     "formal_baseline_ms": 9.564282285406788,
     "flag": "VLLM_HPU_DSV41_INDEX_QUERY_CODEC=0"
   },
-  "compatible_pending_forecast_ms": 0.9445251249999994,
+  "compatible_pending_forecast_ms": 0.9316817499999996,
   "current_micro_cards": [
     2,
     3,
@@ -2777,5 +2777,74 @@
     "owners_retired": true
   },
   "queued_native_candidates": [],
-  "next_action": "Align combined wide+predicate comparison with default native candidate coordinates; no repeat of unchanged SSA softmax. Formal unchanged9.564ms; micro forecast0.944525ms below1ms gate."
+  "next_action": "Align combined wide+predicate comparison with default native candidate coordinates; no repeat of unchanged SSA softmax. Formal unchanged9.564ms; micro forecast0.944525ms below1ms gate.",
+  "qualified_production_coordinate_selection": {
+    "status": "complete_chain_micro_qualified_default_off",
+    "round_savings_ms_per_layer": [
+      0.021125375000000002,
+      0.021080187499999972,
+      0.021104500000000012
+    ],
+    "forecast_occurrences": 4,
+    "applicable_layers": [
+      24,
+      28,
+      32,
+      36
+    ],
+    "forecast_ms_per_token": 0.08441800000000005,
+    "compatible_pending_forecast_ms": 0.9316817499999996,
+    "physical_nodes": {
+      "query": [
+        13,
+        13
+      ],
+      "score_select_mla": [
+        42,
+        20
+      ]
+    },
+    "parent": "Shared querycodec/gainreplica and already-default native candidate coordinates in both arms",
+    "correctness": "5checkpoint-derived input/position/pool fixtures x4ranks, allscore/ID/MLA/publicationbytes exact",
+    "supersedes": [
+      "decode-index-wide-reindex-chain-02",
+      "decode-index-predicate-pack-chain-01"
+    ],
+    "superseded_forecast_ms": 0.09726137499999987,
+    "formal_gain": false,
+    "formal_baseline_ms": 9.564282285406788,
+    "owners_retired": true,
+    "flag": [
+      "VLLM_HPU_DSV41_INDEX_WIDE_REINDEX=0",
+      "VLLM_HPU_DSV41_INDEX_PREDICATE_PACK=0"
+    ]
+  },
+  "active_native_candidate": null,
+  "rejected_compact_softmax": {
+    "status": "rejected_three_slower_native_rounds",
+    "round_savings_ms": [
+      -0.00038376562499999045,
+      -0.0003929023437500012,
+      -0.0004449023437499977
+    ],
+    "saving_ms_per_layer": -0.0003929023437500012,
+    "correctness": "5real-weight-derived fixtures x4ranks, packed/mirror/query/output byte-exact;5preserved+5edge probability simulator fixtures exact",
+    "physical_nodes": {
+      "producer": [
+        19,
+        19
+      ],
+      "post": [
+        3,
+        3
+      ]
+    },
+    "parent": "Qualified hardwarecodec/global decodedSWA in botharms; actual QKV->MLA/WO->peer/post/FFN/router native128-repeat",
+    "gain_credit_ms": 0,
+    "formal_baseline_ms": 9.564282285406788,
+    "prototype_archived": "/opt/ssd960/1cat-vllm-decode-archives/decode-mla-compact-softmax-01/prototype-source",
+    "maintained_runtime_restored": true,
+    "owners_retired": true,
+    "reason": "Fewer private stores and nonpositive-domain instructions did not reduce the complete-chain latency. This is the second slower softmax instruction/lifetime native trial; stop family, no further unroll/lookup variants."
+  }
 }
