@@ -330,12 +330,9 @@ def main():
             compiled_sampler = torch.compile(stage.sample_greedy_token, backend='hpu_backend',
                                              fullgraph=True, dynamic=False)
             sampling_payloads = {}
-            official_samplers = {}
-
-            def full_official(local, draw):
-                from vllm_gaudi.ops.deepseek_v41_sampling import sample_probabilities
-
-                return sample_probabilities(stage.all_gather(local, dim=-1), draw, filtered=True)
+            from tools.deepseek_v41_sampling_fixture import full_official_sampler, OfficialSamplerCache
+            full_official = full_official_sampler(stage.all_gather)
+            official_samplers = OfficialSamplerCache(full_official)
 
             compiled_official = torch.compile(full_official, backend='hpu_backend', fullgraph=True, dynamic=False)
             from vllm_gaudi.ops.deepseek_v41_sampling import device_sampling_draw
@@ -351,23 +348,9 @@ def main():
                     if values is not None:
                         sampling_payloads[owner] = values
                         return values[3]
-                    if owner not in official_samplers:
-                        # Capture only this sampler's operands. Closing over
-                        # the whole stage unnecessarily retains its model and
-                        # host-table state during cold graph preparation.
-                        use_bf16 = program.bf16_head
-
-                        def official(value, weight, params, seed, counter):
-                            draw = device_sampling_draw(params, seed, counter)
-                            local = (torch.ops.custom_op.custom_deepseek_v41_bf16_linear_f32_gaudi2(value, weight)
-                                     if use_bf16 else torch.nn.functional.linear(value.float(), weight))
-                            return full_official(local, draw)
-
-                        official_samplers[owner] = torch.compile(
-                            official, backend='hpu_backend', fullgraph=True, dynamic=False)
                     local = owner.tail_local_logits(hidden)
                     if local is None:
-                        return official_samplers[owner](hidden, program.weights.head.weight, program.sampling_params,
+                        return official_samplers.get(program.bf16_head)(hidden, program.weights.head.weight, program.sampling_params,
                                                         program.sampling_seed, program.sampling_counter)
                     draw = compiled_draw(
                         program.sampling_params, program.sampling_seed, program.sampling_counter)

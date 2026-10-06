@@ -15,7 +15,7 @@ import re
 LOGICAL = {'Placeholder', 'OutputTensor', 'Reshape', 'StaticReshape', 'Slice', 'Split',
            'Concatenate', 'Squeeze', 'ExpandDims', 'Identity', 'Flatten', 'Broadcast',
            'LogicalTranspose', 'LogicalBroadcast', 'ReinterpretCast',
-           'TransposedShape', 'Reduction'}
+           'TransposedShape', 'Reduction', 'StridedView'}
 
 
 def logical_stages(nodes):
