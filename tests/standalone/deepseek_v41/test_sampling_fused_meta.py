@@ -16,15 +16,15 @@ def t(shape, dtype=torch.float32):
 @pytest.mark.parametrize('ranks', [2, 4, 8])
 def test_tp_geometry_and_concurrent_row_contracts(batch, ranks):
     width = 128
-    values, ids, norms, cuts = torch.ops.custom_op.custom_deepseek_v41_sampling_unpack_gaudi2(
+    values, ids, maxima, totals, cuts = torch.ops.custom_op.custom_deepseek_v41_sampling_unpack_gaudi2(
         t((batch, ranks * (3 + 2 * width))), ranks, width)
-    assert [tuple(v.shape) for v in (values, ids, norms, cuts)] == [(batch, ranks * width), (batch, ranks * width),
-                                                                    (batch, ranks * 3), (batch, ranks)]
+    assert [tuple(v.shape) for v in (values, ids, maxima, totals, cuts)] == [
+        (batch, ranks * width), (batch, ranks * width), (batch, ranks), (batch, ranks), (batch, ranks)]
     assert ids.dtype == torch.int32
     probabilities, coverage = torch.ops.custom_op.custom_deepseek_v41_sampling_mask_gaudi2(
         values, t(values.shape), t(values.shape), cuts, t((batch, 4)), t((batch, 1)), ranks)
-    selected = torch.ops.custom_op.custom_deepseek_v41_sampling_select_gaudi2(probabilities, ids, t((batch, 4)),
-                                                                              t((batch, 1), torch.int32))
+    selected = torch.ops.custom_op.custom_deepseek_v41_sampling_select_gaudi2(
+        probabilities, ids, t((batch, 4)), t((batch, ranks * (3 + 2 * width))), t((batch, 1)), ranks)
     assert coverage.dtype == selected.dtype == torch.int32
     assert coverage.shape == selected.shape == (batch, 1)
 

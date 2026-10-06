@@ -91,10 +91,13 @@ def commit_replay_inputs(input_ids, positions, selected):
     return input_ids.reshape(1, 1), positions
 
 
-def local_nucleus_packet(logits, controls, tp_rank, width, *, threshold_state=None):
+def local_nucleus_packet(logits, controls, tp_rank, width, *, threshold_state=None, shared_max=False):
     """Keep the full local partition function, exchanging only bounded candidates."""
     scaled = logits.float() / controls[:, :1].clamp_min(1e-5)
-    maximum = scaled.amax(-1, keepdim=True)
+    if shared_max:
+        maximum, greedy_ids = scaled.max(-1, keepdim=True)
+    else:
+        maximum = scaled.amax(-1, keepdim=True)
     total = (scaled - maximum).exp().sum(-1, keepdim=True)
     if threshold_state is None or logits.shape[0] != 1 or logits.shape[-1] <= 512:
         values, ids = scaled.topk(width, dim=-1, sorted=True)
@@ -115,7 +118,9 @@ def local_nucleus_packet(logits, controls, tp_rank, width, *, threshold_state=No
         ids = candidates.gather(-1, offsets)
         total = torch.where(metadata[:, 1:2] >= width, total, float("nan"))
     global_ids = ids.to(torch.float32) + tp_rank * logits.shape[-1]
-    greedy = scaled.argmax(-1, keepdim=True).float() + tp_rank * logits.shape[-1]
+    if not shared_max:
+        greedy_ids = scaled.argmax(-1, keepdim=True)
+    greedy = greedy_ids.float() + tp_rank * logits.shape[-1]
     return torch.cat((maximum, total, greedy, values, global_ids), -1)
 
 
@@ -166,11 +171,10 @@ def sample_nucleus_packet_fused(packet, controls, *, tp_size, width):
     """
     if packet.shape[0] != controls.shape[0]:
         return sample_nucleus_packet(packet, controls, tp_size=tp_size, width=width)
-    values, ids, norms, cuts = torch.ops.custom_op.custom_deepseek_v41_sampling_unpack_gaudi2(
+    values, ids, maxima, totals, cuts = torch.ops.custom_op.custom_deepseek_v41_sampling_unpack_gaudi2(
         packet.contiguous(), tp_size, width)
-    shards = norms.reshape(packet.shape[0], tp_size, 3)
-    maximum = shards[..., 0].amax(-1, keepdim=True)
-    total = (shards[..., 1] * (shards[..., 0] - maximum).exp()).sum(-1, keepdim=True)
+    maximum = maxima.amax(-1, keepdim=True)
+    total = (totals * (maxima - maximum).exp()).sum(-1, keepdim=True)
     values, order = values.sort(-1, descending=True)
     ids = ids.gather(-1, order)
     probabilities = (values - maximum).exp() / total
@@ -178,9 +182,8 @@ def sample_nucleus_packet_fused(packet, controls, *, tp_size, width):
     retained, covered = torch.ops.custom_op.custom_deepseek_v41_sampling_mask_gaudi2(
         values, probabilities, cumulative, cuts, controls, total, tp_size)
     cumulative = retained.cumsum(-1)
-    greedy = torch.where(shards[..., 0] == maximum, shards[..., 2], float(2**24)).amin(-1, keepdim=True)
     selected = torch.ops.custom_op.custom_deepseek_v41_sampling_select_gaudi2(
-        cumulative, ids, controls, greedy.to(torch.int32))
+        cumulative, ids, controls, packet, maximum, tp_size)
     return selected, covered
 
 def device_sampling_controls(parameters, seed, counter):

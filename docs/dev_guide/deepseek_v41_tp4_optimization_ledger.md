@@ -1330,3 +1330,24 @@ Physical consumer **75→22**, producer30 unchanged. Forecast once
 cumsums are unchanged; no RNG/hostupload/replay/communication ABI change.
 Same provisional-endpoint/fullrepair scope as the threshold parent; formal
 **9.564282ms/token** unchanged. Evidence SSD `decode-sampling-fused-chain-01`.
+
+### 2026-10-06 — contiguous sampling statistics and in-kernel greedy
+
+`decode-sampling-fused-chain-02`: same threshold parent/original reference;
+shared consumer now publishes max/sum arrays directly and performs greedy
+only whenT0 inside the selection TPC. FP32 math and bothcumsums retained.
+Fivefixtures×fourranks exact, nine simulation frames exact,29Meta/CPUchecks.
+Three savings **0.039011281/0.038945594/0.039038656ms/token**.
+Forecast **0.039011281ms/token REPLACES .036707625**; do not addboth.
+Pending **0.994921781ms/token**, formal9.564282 unchanged, defaultoff.
+
+### 2026-10-06 — shared local max/index reduction
+
+Threshold and fusedconsumerv2 BOTHarms. One max.dim replaces duplicate full
+vocabulary max/argmax passes. Fivefixtures×fourranks token/certificate/embedding
+/logits bytes exact; nativepacket5exact pluscoarse/greedy edgespass. Native16
+repeat ABABAB200 savings **.037635625/.037480969/.037524406ms/token**.
+Producer30→27, consumer16same. Forecastonce **0.037524406ms/token**, compatible
+pending **1.032446187ms/token**, formal9.564282unchanged.
+`VLLM_HPU_DSV41_SAMPLING_SHARED_MAX=0` until combinedserving.
+Evidence SSD `decode-sampling-shared-max-chain-02`/`decode-sampling-shared-max-packet-01`.

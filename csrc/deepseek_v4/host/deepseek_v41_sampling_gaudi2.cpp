@@ -11,7 +11,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41SamplingGaudi2::GetGcDefinitions(
     tpc_lib_api::HabanaKernelParams* p,tpc_lib_api::HabanaKernelInstantiation* out) {
     using namespace tpc_lib_api;
     if(mode_>2)return GLUE_FAILED;
-    const unsigned ni[]={1,6,4},no[]={4,2,1};
+    const unsigned ni[]={1,6,5},no[]={5,2,1};
     if(p->inputTensorNr!=ni[mode_])return GLUE_INCOMPATIBLE_INPUT_COUNT;
     if(p->outputTensorNr!=no[mode_])return GLUE_INCOMPATIBLE_OUTPUT_COUNT;
     if(!p->nodeParams.nodeParams || p->nodeParams.nodeParamsSize!=sizeof(DeepseekV41SamplingParams))return GLUE_FAILED;
@@ -27,13 +27,14 @@ tpc_lib_api::GlueCodeReturn DeepseekV41SamplingGaudi2::GetGcDefinitions(
            !shape(p->inputTensors[0].geometry,DATA_F32,ranks*(3+2*width)))return GLUE_INCOMPATIBLE_INPUT_SIZE;
         if(!shape(p->outputTensors[0].geometry,DATA_F32,columns) ||
            !shape(p->outputTensors[1].geometry,DATA_I32,columns) ||
-           !shape(p->outputTensors[2].geometry,DATA_F32,ranks*3) ||
-           !shape(p->outputTensors[3].geometry,DATA_F32,ranks))return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+           !shape(p->outputTensors[2].geometry,DATA_F32,ranks) ||
+           !shape(p->outputTensors[3].geometry,DATA_F32,ranks) ||
+           !shape(p->outputTensors[4].geometry,DATA_F32,ranks))return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
         out->indexSpaceRank=2;out->indexSpaceGeometry[0]=ranks;out->indexSpaceGeometry[1]=batch;
         out->inputTensorAccessPattern[0].mapping[0]={0,3+2*width,0,2+2*width};
         out->inputTensorAccessPattern[0].mapping[1]={1,1,0,0};
-        const int spans[]={width,width,3,1};
-        for(unsigned i=0;i<4;++i) {
+        const int spans[]={width,width,1,1,1};
+        for(unsigned i=0;i<5;++i) {
             out->outputTensorAccessPattern[i].mapping[0]={0,spans[i],0,spans[i]-1};
             out->outputTensorAccessPattern[i].mapping[1]={1,1,0,0};
         }
@@ -52,7 +53,9 @@ tpc_lib_api::GlueCodeReturn DeepseekV41SamplingGaudi2::GetGcDefinitions(
             if(!shape(p->inputTensors[0].geometry,DATA_F32,columns) ||
                !shape(p->inputTensors[1].geometry,DATA_I32,columns) ||
                !shape(p->inputTensors[2].geometry,DATA_F32,4) ||
-               !shape(p->inputTensors[3].geometry,DATA_I32,1))return GLUE_INCOMPATIBLE_INPUT_SIZE;
+               ranks<2 || ranks>8 || columns!=ranks*width ||
+               !shape(p->inputTensors[3].geometry,DATA_F32,ranks*(3+2*width)) ||
+               !shape(p->inputTensors[4].geometry,DATA_F32,1))return GLUE_INCOMPATIBLE_INPUT_SIZE;
             if(!shape(p->outputTensors[0].geometry,DATA_I32,1))return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
         }
         out->indexSpaceRank=1;out->indexSpaceGeometry[0]=batch;

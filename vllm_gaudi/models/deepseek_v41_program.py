@@ -2235,6 +2235,7 @@ class PreparedGreedyTail(nn.Module):
             self.register_buffer("sampling_params", stage.sampling_params)
             self.register_buffer("sampling_seed", stage.sampling_seed)
             self.register_buffer("sampling_origin", stage.sampling_origin)
+            self.sampling_shared_max = gaudi_envs.VLLM_HPU_DSV41_SAMPLING_SHARED_MAX
             self.sampling_threshold = False
             self.sampling_fused_packet = gaudi_envs.VLLM_HPU_DSV41_SAMPLING_FUSED_PACKET
             if gaudi_envs.VLLM_HPU_DSV41_SAMPLING_THRESHOLD:
@@ -2263,7 +2264,7 @@ class PreparedGreedyTail(nn.Module):
             threshold_state = ((self.sampling_selection_position, self.sampling_selection_ids)
                                if self.sampling_threshold else None)
             packet = self.all_gather(local_nucleus_packet(
-                local, controls, self.tp_rank, 128, threshold_state=threshold_state), dim=-1)
+                local, controls, self.tp_rank, 128, threshold_state=threshold_state, shared_max=self.sampling_shared_max), dim=-1)
             tp_size = packet.shape[-1] // (3 + 2 * 128)
             if self.sampling_fused_packet:
                 from vllm_gaudi.ops.deepseek_v41_sampling import sample_nucleus_packet_fused

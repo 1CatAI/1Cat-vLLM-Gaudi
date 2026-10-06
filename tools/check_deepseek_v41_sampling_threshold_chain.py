@@ -17,6 +17,9 @@ def main():
     parser.add_argument('--sidecar', type=Path, required=True)  # Shared launcher contract.
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--fused-consumer', action='store_true', help='Hold qualified threshold producer in BOTH arms')
+    parser.add_argument('--shared-max',
+                        action='store_true',
+                        help='Hold qualified fused producer/consumer parent, reuse one max/index pass')
     parser.add_argument('--steps', type=int, default=200)
     parser.add_argument('--chain-repeats', type=int, default=16)
     args = parser.parse_args()
@@ -75,14 +78,15 @@ def main():
     controls = torch.tensor([[1., .95, .5, -1.]], dtype=torch.float32, device='hpu')
     x = fixtures[0].to('hpu')
 
-    def produce(value, norm, weight, controls, position, scratch, *, threshold):
+    def produce(value, norm, weight, controls, position, scratch, *, threshold, shared_max):
         value = torch.ops.custom_op.custom_deepseek_v41_attention_norm_bf16_gaudi2(value, norm, epsilon)
         logits = torch.ops.custom_op.custom_deepseek_v41_bf16_linear_f32_gaudi2(value, weight)
         packet = local_nucleus_packet(logits,
                                       controls,
                                       rank,
                                       128,
-                                      threshold_state=(position, scratch) if threshold else None)
+                                      threshold_state=(position, scratch) if threshold else None,
+                                      shared_max=shared_max)
         # Same exact FP32 -> padded BF16 wire used by stage_collectives.
         wire = packet.view(torch.bfloat16)
         wire = F.pad(wire, (0, -wire.shape[-1] % 128))
@@ -103,13 +107,14 @@ def main():
 
     compiler = make_backend(static_int32=True, static_factories=True)
     producers = [
-        torch.compile(lambda *v, flag=flag: produce(*v, threshold=True if args.fused_consumer else flag),
+        torch.compile(lambda *v, flag=flag: produce(
+            *v, threshold=True if args.fused_consumer else flag, shared_max=flag and args.shared_max),
                       backend=compiler,
                       fullgraph=True,
                       dynamic=False) for flag in (False, True)
     ]
     consumers = [
-        torch.compile(lambda *v, fused=fused: consume(*v, fused=fused and args.fused_consumer),
+        torch.compile(lambda *v, fused=fused: consume(*v, fused=args.shared_max or (fused and args.fused_consumer)),
                       backend=compiler,
                       fullgraph=True,
                       dynamic=False) for fused in (False, True)
