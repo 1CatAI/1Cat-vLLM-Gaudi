@@ -219,6 +219,7 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_GEMV_F32,
     GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_BATCH4_F32,
     GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_PREFETCH_F32,
+    GAUDI2_KERNEL_DEEPSEEK_V41_MHC_GATES_POSITIVE,
     GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_GEMV_RRMS_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V41_MXFP4_PREPARED_DEQUANT_FP8,
     GAUDI2_KERNEL_DEEPSEEK_V41_WOA_QUANT,
@@ -515,6 +516,7 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
         guids[GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_BATCH4_F32].name);
     DeepseekV41ControlGemvGaudi2(false, true).GetKernelName(
         guids[GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_PREFETCH_F32].name);
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MHC_GATES_POSITIVE].name, "custom_deepseek_v41_mhc_gates_positive_gaudi2");
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_GEMV_RRMS_BF16].name,
                 DeepseekV41ControlGemvRrmsGaudi2::name);
     DeepseekV41EngramHashGatherBf16Gaudi2 engramHashGather;
@@ -1143,6 +1145,8 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
         return vectorScales.GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41KVNormRopePublishGaudi2::name) == 0)
         return DeepseekV41KVNormRopePublishGaudi2().GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name,"custom_deepseek_v41_mhc_gates_positive_gaudi2") == 0)
+        return DeepseekV41MhcGatesGaudi2(true).GetGcDefinitions(params,instance);
     if (std::strcmp(params->guid.name, DeepseekV41ExpertTokenWideGaudi2::unroll3_name) == 0)
         return DeepseekV41ExpertTokenWideGaudi2(3, true).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41ExpertTokenWideGaudi2::aligned_name) == 0)

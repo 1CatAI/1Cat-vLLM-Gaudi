@@ -15,6 +15,13 @@ import statistics
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--positive-gates',action='store_true',help='Same parallel controller, Sinkhorn uses positive-denominator Newton reciprocal')
+    parser.add_argument('--k-controller-peer-window', action='store_true',
+                        help='Move the qualified K-controller recipe behind peer submit, before gates/post')
+    parser.add_argument('--require-controller-sram', action='store_true',
+                        help='Before timing, require real K-controller producer/consumer SRAM alias')
+    parser.add_argument('--k-tiled-controller', action='store_true',
+                        help='K23 BF16-weight controller; qualified gates-in-exchange parent in both arms')
     parser.add_argument('--gates-during-exchange', action='store_true',
                         help='Schedule exact gates after native exchange submission and before its first consumer')
     parser.add_argument('--bf16-control-weights', action='store_true',
@@ -45,6 +52,14 @@ def main():
     parser.add_argument('--retirement-only', action='store_true',
                         help='Reuse measured A/B; check teardown without timing')
     args = parser.parse_args()
+    if args.positive_gates:
+        args.gates_during_exchange=True
+        args.official_tolerance=True
+    if args.k_controller_peer_window:
+        args.k_tiled_controller = True
+    if args.k_tiled_controller:
+        args.gates_during_exchange = True
+        args.official_tolerance = True
     if args.gates_during_exchange:
         if any((args.bf16_control_weights, args.dense_transpose, args.early_gates,
                 args.direct_rrms_post, args.swizzled_control, args.late_control,
@@ -157,8 +172,14 @@ def main():
     compiled=lambda fn:torch.compile(fn,backend=make_backend(static_int32=True,static_factories=True,split_mhc=True),fullgraph=True,dynamic=False)
     transposed_wo = wo_weight.cpu().T.contiguous().to("hpu") if args.dense_transpose else None
     packed_control = control.reshape(24, 160, 128).permute(1, 0, 2).contiguous() if args.swizzled_control else None
-    bf16_control = control.bfloat16() if args.bf16_control_weights else None
+    bf16_control = (packed_control.bfloat16() if args.k_tiled_controller else
+                    control.bfloat16() if args.bf16_control_weights else None)
     def produce(x,residual,control,mme_weight,wo_weight,wo_scale,*,fused):
+        if args.k_tiled_controller:
+            op = (torch.ops.custom_op.custom_deepseek_v41_control_k_tiled_bf16_gaudi2
+                  if control.dtype == torch.bfloat16 else
+                  torch.ops.custom_op.custom_deepseek_v41_control_rrms_swizzled_bf16_gaudi2)
+            return direct_dense_fp8(x,wo_weight,wo_scale), op(residual.flatten(1),control,eps)
         if args.bf16_control_weights:
             op = (torch.ops.custom_op.custom_deepseek_v41_control_rrms_bf16_weight_gaudi2
                   if control.dtype == torch.bfloat16 else
@@ -212,15 +233,18 @@ def main():
         return updated,collapsed,pre,normalized,quantized,act_scale,ids,routing,gates
     arms = (True, False) if args.early_gates else (True, True) if args.late_control or args.swizzled_control or args.direct_rrms_post or args.dense_transpose or args.bf16_control_weights else (False, False) if args.peer_prune else (False, True)
     if args.gates_during_exchange:
-        arms = (True, False)
+        arms = (False, False) if args.k_tiled_controller or args.positive_gates else (True, False)
     independent_gates = compiled(lambda projection, scale, base:
         torch.ops.custom_op.custom_deepseek_v41_mhc_gates_f32_gaudi2(
             projection[:, :24].contiguous(), projection[:, 24:25].contiguous(), scale, base)
     ) if args.gates_during_exchange else None
-    late_projection = compiled(lambda x,w,s:direct_dense_fp8(x,w,s)) if args.late_control else None
-    late_controller = compiled(lambda r,w:
-        torch.ops.custom_op.custom_deepseek_v41_control_rrms_parallel_bf16_gaudi2(r.flatten(1),w,eps)
-    ) if args.late_control else None
+    positive_gates=compiled(lambda projection,scale,base:torch.ops.custom_op.custom_deepseek_v41_mhc_gates_positive_gaudi2(projection[:,:24].contiguous(),projection[:,24:25].contiguous(),scale,base)) if args.positive_gates else None
+    late_projection = compiled(lambda x,w,s:direct_dense_fp8(x,w,s)) if args.late_control or args.k_controller_peer_window else None
+    late_controller = (compiled(lambda r,w:
+        torch.ops.custom_op.custom_deepseek_v41_control_k_tiled_bf16_gaudi2(r.flatten(1),w,eps))
+        if args.k_controller_peer_window else compiled(lambda r,w:
+        torch.ops.custom_op.custom_deepseek_v41_control_rrms_parallel_bf16_gaudi2(r.flatten(1),w,eps))
+        if args.late_control else None)
     producers=[compiled(lambda *args,fused=fused:produce(*args,fused=fused)) for fused in arms]
     consumers=[compiled(lambda *values,fused=fused,positive=bool(args.direct_rrms_post and arm):consume(*values,fused=fused,positive=positive)) for arm,fused in enumerate(arms)]
     prune_setter = None
@@ -274,11 +298,11 @@ def main():
                 recorded_nodes.append(('compute', recipe, input_slots, output_slots))
             return result
 
-        if args.late_control and arm == 1:
+        if (args.late_control or args.k_controller_peer_window) and arm == 1:
             value=compute(late_projection,(x,wo_weight,wo_scale))
             projection=None
         else:
-            arm_control = (bf16_control if args.bf16_control_weights and arm == 1 else
+            arm_control = (bf16_control if (args.bf16_control_weights or args.k_tiled_controller) and arm == 1 else
                            packed_control if args.swizzled_control and (arm == 1 or args.gates_during_exchange) else control)
             value,projection=compute(producer,(x,residual,arm_control,mme_weight,transposed_wo if args.dense_transpose and arm == 1 else wo_weight,wo_scale))
         peers=torch.ops.vllm_gaudi.tp_peer_allgather(value,4)
@@ -286,13 +310,13 @@ def main():
         gather_slots=(slot(value,False),slot(peers,False))
         plan.add_all_gather(*gather_slots)
         recorded_nodes.append(('gather', *gather_slots))
-        if args.late_control and arm == 1:
-            projection=compute(late_controller,(residual,control))
-        if args.gates_during_exchange and arm == 1:
+        if (args.late_control or args.k_controller_peer_window) and arm == 1:
+            projection=compute(late_controller,(residual,bf16_control if args.k_controller_peer_window else control))
+        if args.gates_during_exchange and (arm == 1 or args.k_tiled_controller or args.positive_gates):
             # This recipe reads only control/scale/base. It must not bind peers:
             # the native tensor dependency plan can defer the collective wait
             # until the subsequent post consumer actually needs peer output.
-            projection=compute(independent_gates,(projection,control_scale,control_base))
+            projection=compute(positive_gates if args.positive_gates and arm==1 else independent_gates,(projection,control_scale,control_base))
         outputs=tuple(compute(consumer,(peers.reshape(4,1,5120),residual,projection,
             control_scale,control_base,norm,router_weight,bias,bias_vl,mask)))
         repeats_per_group = 8 if args.late_control or args.gates_during_exchange else 1
@@ -305,7 +329,7 @@ def main():
         plan.prepare(backend, [slot(value, False) for value in outputs])
         graph = bridge.NativeDecodeGraph()
         graph.configure_topology(args.chain_repeats // repeats_per_group, args.chain_repeats, False)
-        graph.configure_dependency_policy((args.late_control or args.gates_during_exchange) and arm == 1)
+        graph.configure_dependency_policy((args.late_control or args.gates_during_exchange) and (arm == 1 or args.k_tiled_controller or args.positive_gates))
         graph.capture([plan] * (args.chain_repeats // repeats_per_group),
                       [external] * (args.chain_repeats // repeats_per_group))
         graph.instantiate()
@@ -316,104 +340,137 @@ def main():
         externals.append(external)
     if prune_setter is not None:
         prune_setter(0)
-    checks = []
-    for index, fixture in enumerate(fixtures):
-        for destination, value in zip((x,residual,post,comb,pre), fixture, strict=True):
-            destination.copy_(value.to('hpu'))
-        torch.hpu.synchronize()
-        observed=[]
-        for graph,outputs in zip(graphs,visible,strict=True):
-            graph.replay_fixed_with_completion().synchronize()
-            observed.append([value.cpu() for value in outputs])
-        exact=[torch.equal(a.view(torch.uint8),b.view(torch.uint8))
-               for a,b in zip(*observed,strict=True)]
-        # Check the new TPC byte-for-byte at an identical projection; only
-        # the explicit hi/lo controller is permitted to introduce error.
-        control_reference=(torch.ops.custom_op.custom_deepseek_v41_control_rrms_parallel_bf16_gaudi2
-                           if args.late_control or args.swizzled_control or args.direct_rrms_post or args.early_gates or args.dense_transpose or args.bf16_control_weights else
-                           torch.ops.custom_op.custom_deepseek_v41_control_gemv_rrms_bf16_gaudi2)
-        reference_control=control_reference(residual.flatten(1),control,eps)
-        mix=torch.cat((reference_control[:,:24],torch.zeros_like(reference_control[:,:24])),1).contiguous()
-        value=direct_dense_fp8(x,wo_weight,wo_scale)
-        peers=torch.ops.vllm_gaudi.tp_peer_allgather(value,4).reshape(4,1,5120)
-        pure=consume(peers,residual,reference_control if args.gates_during_exchange else mix,
-                     control_scale,control_base,norm,router_weight,bias,bias_vl,mask,fused=True)
-        torch.hpu.synchronize()
-        exact_tpc=[torch.equal(a.view(torch.uint8),b.cpu().view(torch.uint8)) for a,b in zip(observed[0],pure,strict=True)]
-        if args.gates_during_exchange:
-            mme_gates = observed[1][8]
-        else:
-            mme_gates,*_=torch.ops.custom_op.custom_deepseek_v41_mhc_mme_gates_norm_gaudi2(
-                torch.ops.custom_op.custom_deepseek_v41_control_mme_f32_gaudi2(residual.flatten(1),mme_weight),
-                residual.flatten(1),visible[0][1],norm,control_scale,control_base,eps)
-        reference_gates=torch.ops.custom_op.custom_deepseek_v41_mhc_gates_f32_gaudi2(
-            reference_control[:,:24].contiguous(),reference_control[:,24:].contiguous(),control_scale,control_base)
-        gate_error=(reference_gates.cpu()-mme_gates.cpu()).abs()
-        entry=dict(input=index,outputs_exact=exact,same_projection_tpc_exact=exact_tpc,
-            mme_gates_max_abs=float(gate_error.max()),router_ids_exact=exact[6],
-            residual_max_abs=float((observed[0][0].float()-observed[1][0].float()).abs().max()))
-        if args.official_tolerance:
-            from tools.deepseek_v41_mhc_reference import post_reference, check_outputs, normalized_error
-            reference = post_reference(peers.cpu(), residual.cpu(), control.cpu(),
-                                       control_scale.cpu(), control_base.cpu(), norm.cpu(), eps)
-            entry['official_equation_errors'] = [check_outputs(arm, reference) for arm in observed]
-            entry['remaining_output_errors'] = {
-                str(i): dict(error=normalized_error(observed[1][i].float(), observed[0][i].float()),
-                             limit=2e-4 if i == 4 else 5e-5)
-                for i in (4, 5, 7)}
-            errors = [v for arm in entry['official_equation_errors'] for v in arm.values()]
-            errors += list(entry['remaining_output_errors'].values())
-            if any(not row['error'] < row['limit'] for row in errors):
-                (directory/'failure.json').write_text(json.dumps(entry, indent=2)+'\n')
-                raise RuntimeError('mHC official-equation numerical contract failed')
-        checks.append(entry)
-        if not all(exact_tpc) or not torch.allclose(reference_gates.cpu(),mme_gates.cpu(),rtol=1e-5,atol=1e-5) or not exact[6]:
-            torch.save(dict(fixture=fixture,observed=observed),directory/'failure.pt')
-            (directory/'failure.json').write_text(json.dumps(entry,indent=2)+'\n')
-            raise RuntimeError(f'mHC fused post correctness failed: {entry}')
-    (directory/"result.json").write_text(json.dumps(dict(status="correctness_checked",checks=checks))+"\n")
-    # Retain the exact gate for exact-controller/communication experiments.
-    # MME may opt into the upstream equation/metric gate; report both errors.
-    if not args.official_tolerance and not all(all(row["outputs_exact"]) for row in checks):
-        raise RuntimeError("MME controller changed observable outputs; not bit-exact qualified")
-    for graph in graphs:
-        for _ in range(20):
-            graph.replay_fixed_with_completion().synchronize()
-    compiled_before = graph_compilation_count()
-    periods = []
     tickets, events = [], []
-    for label in '' if args.retirement_only else 'ABABAB':
-        wait_for_loading(directory,rank,torch.distributed)
-        graph = graphs[label == 'B']
-        events = [(torch.hpu.Event(enable_timing=True), torch.hpu.Event(enable_timing=True))
-                  for _ in range(args.steps)]
-        torch.distributed.barrier()
-        tickets = []
-        for begin, end in events:
-            begin.record()
-            tickets.append(graph.replay_fixed_with_completion())
-            end.record()
-        torch.hpu.synchronize()
-        local = [begin.elapsed_time(end)/args.chain_repeats for begin, end in events]
-        ranks = [None]*4
-        torch.distributed.all_gather_object(ranks, local)
-        periods.append(dict(arm=label, rank_device_ms=ranks,
-                            median_ms=statistics.median(max(values) for values in zip(*ranks, strict=True))))
-        (directory/'result.json').write_text(json.dumps(dict(status='measuring',checks=checks,periods=periods))+'\n')
-        if rank == 0:print(json.dumps(dict(arm=label,median_ms=periods[-1]['median_ms'])),flush=True)
-    if graph_compilation_count() != compiled_before:
-        raise RuntimeError('Hot compilation invalidates timing')
-    savings = [a['median_ms']-b['median_ms'] for a, b in zip(periods[::2], periods[1::2], strict=True)]
-    result = dict(status='retirement_check' if args.retirement_only else 'completed', checks=checks, periods=periods,
-                  saving_ms_per_layer=statistics.median(savings) if savings else None,
-                  round_savings_ms=savings,
-                  three_consistent_rounds=bool(savings) and all(value > 0 for value in savings),
-                  full_model_gain_credit=False, physical_node_gate_pending=True, chain_repeats=args.chain_repeats,
-                  input_source=__doc__, native_replay=True,
-                  native_library_sha256=hashlib.sha256(Path(os.environ['VLLM_HPU_DSV4_TPC_OP_LIBRARY']).read_bytes()).hexdigest())
-    (directory/'result.json').write_text(json.dumps(result, indent=2)+'\n')
-    if rank == 0:
-        (root/'result.json').write_text(json.dumps(result, indent=2)+'\n')
+    failure = None
+    try:
+        checks = []
+        for index, fixture in enumerate(fixtures):
+            for destination, value in zip((x,residual,post,comb,pre), fixture, strict=True):
+                destination.copy_(value.to('hpu'))
+            torch.hpu.synchronize()
+            observed=[]
+            for graph,outputs in zip(graphs,visible,strict=True):
+                graph.replay_fixed_with_completion().synchronize()
+                observed.append([value.cpu() for value in outputs])
+            exact=[torch.equal(a.view(torch.uint8),b.view(torch.uint8))
+                   for a,b in zip(*observed,strict=True)]
+            # Check the new TPC byte-for-byte at an identical projection; only
+            # the explicit hi/lo controller is permitted to introduce error.
+            control_reference=(torch.ops.custom_op.custom_deepseek_v41_control_rrms_parallel_bf16_gaudi2
+                               if args.late_control or args.swizzled_control or args.direct_rrms_post or args.early_gates or args.dense_transpose or args.bf16_control_weights else
+                               torch.ops.custom_op.custom_deepseek_v41_control_gemv_rrms_bf16_gaudi2)
+            reference_control=control_reference(residual.flatten(1),control,eps)
+            mix=torch.cat((reference_control[:,:24],torch.zeros_like(reference_control[:,:24])),1).contiguous()
+            value=direct_dense_fp8(x,wo_weight,wo_scale)
+            peers=torch.ops.vllm_gaudi.tp_peer_allgather(value,4).reshape(4,1,5120)
+            pure=consume(peers,residual,reference_control if args.gates_during_exchange else mix,
+                         control_scale,control_base,norm,router_weight,bias,bias_vl,mask,fused=True)
+            torch.hpu.synchronize()
+            exact_tpc=[torch.equal(a.view(torch.uint8),b.cpu().view(torch.uint8)) for a,b in zip(observed[0],pure,strict=True)]
+            if args.gates_during_exchange:
+                mme_gates = observed[1][8]
+            else:
+                mme_gates,*_=torch.ops.custom_op.custom_deepseek_v41_mhc_mme_gates_norm_gaudi2(
+                    torch.ops.custom_op.custom_deepseek_v41_control_mme_f32_gaudi2(residual.flatten(1),mme_weight),
+                    residual.flatten(1),visible[0][1],norm,control_scale,control_base,eps)
+            reference_gates=torch.ops.custom_op.custom_deepseek_v41_mhc_gates_f32_gaudi2(
+                reference_control[:,:24].contiguous(),reference_control[:,24:].contiguous(),control_scale,control_base)
+            gate_error=(reference_gates.cpu()-mme_gates.cpu()).abs()
+            entry=dict(input=index,outputs_exact=exact,same_projection_tpc_exact=exact_tpc,
+                mme_gates_max_abs=float(gate_error.max()),router_ids_exact=exact[6],
+                residual_max_abs=float((observed[0][0].float()-observed[1][0].float()).abs().max()))
+            if args.official_tolerance:
+                from tools.deepseek_v41_mhc_reference import post_reference, check_outputs, normalized_error
+                reference = post_reference(peers.cpu(), residual.cpu(), control.cpu(),
+                                           control_scale.cpu(), control_base.cpu(), norm.cpu(), eps)
+                entry['official_equation_errors'] = [check_outputs(arm, reference) for arm in observed]
+                entry['remaining_output_errors'] = {
+                    str(i): dict(error=normalized_error(observed[1][i].float(), observed[0][i].float()),
+                                 limit=2e-4 if i == 4 else 5e-5)
+                    for i in (4, 5, 7)}
+                errors = [v for arm in entry['official_equation_errors'] for v in arm.values()]
+                errors += list(entry['remaining_output_errors'].values())
+                decisions = [None] * 4
+                torch.distributed.all_gather_object(decisions, all(row['error'] < row['limit'] for row in errors))
+                if not all(decisions):
+                    (directory/'failure.json').write_text(json.dumps(entry, indent=2)+'\n')
+                    raise RuntimeError('mHC official-equation numerical contract failed')
+            checks.append(entry)
+            if (not all(exact_tpc) or not exact[6] or
+                    (not args.official_tolerance and not torch.allclose(reference_gates.cpu(),mme_gates.cpu(),rtol=1e-5,atol=1e-5))):
+                torch.save(dict(fixture=fixture,observed=observed),directory/'failure.pt')
+                (directory/'failure.json').write_text(json.dumps(entry,indent=2)+'\n')
+                raise RuntimeError(f'mHC fused post correctness failed: {entry}')
+        (directory/"result.json").write_text(json.dumps(dict(status="correctness_checked",checks=checks))+"\n")
+        # Retain the exact gate for exact-controller/communication experiments.
+        # MME may opt into the upstream equation/metric gate; report both errors.
+        if not args.official_tolerance and not all(all(row["outputs_exact"]) for row in checks):
+            raise RuntimeError("MME controller changed observable outputs; not bit-exact qualified")
+        if args.require_controller_sram:
+            from tools.audit_deepseek_v41_physical_nodes import audit
+            inspected=[]
+            for path in (root/'graphs'/f'rank{rank}').rglob('*PostGraph-symbol.pbtxt'):
+                graph_data=audit(path)
+                partial=[n for n in graph_data['nodes'] if n['op']=='custom_deepseek_v41_control_k_partial_gaudi2']
+                finish=[n for n in graph_data['nodes'] if n['op']=='custom_deepseek_v41_control_k_finish_gaudi2']
+                if not partial: continue
+                passed=(len(partial)==1 and len(finish)==1 and
+                    'location = in SRAM' in partial[0]['tensors']['outputTensor:0'] and
+                    'location = in SRAM' in finish[0]['tensors']['inputTensor:0'] and
+                    partial[0]['tensors']['outputTensor:0'].split('|')[0].strip()==
+                    finish[0]['tensors']['inputTensor:0'].split('|')[0].strip())
+                inspected.append(dict(graph=graph_data['graph'],passed=passed,physical_nodes=graph_data['physical_nodes']))
+            (directory/'sram-gate.json').write_text(json.dumps(inspected,indent=2)+'\n')
+            decisions=[None]*4
+            torch.distributed.all_gather_object(decisions,bool(inspected) and all(v['passed'] for v in inspected))
+            if not all(decisions):
+                raise RuntimeError('K-controller SRAM producer/consumer contract failed before timing')
+        for graph in graphs:
+            for _ in range(20):
+                graph.replay_fixed_with_completion().synchronize()
+        compiled_before = graph_compilation_count()
+        periods = []
+        tickets, events = [], []
+        for label in '' if args.retirement_only else 'ABABAB':
+            wait_for_loading(directory,rank,torch.distributed)
+            graph = graphs[label == 'B']
+            events = [(torch.hpu.Event(enable_timing=True), torch.hpu.Event(enable_timing=True))
+                      for _ in range(args.steps)]
+            torch.distributed.barrier()
+            tickets = []
+            for begin, end in events:
+                begin.record()
+                tickets.append(graph.replay_fixed_with_completion())
+                end.record()
+            torch.hpu.synchronize()
+            local = [begin.elapsed_time(end)/args.chain_repeats for begin, end in events]
+            ranks = [None]*4
+            torch.distributed.all_gather_object(ranks, local)
+            periods.append(dict(arm=label, rank_device_ms=ranks,
+                                median_ms=statistics.median(max(values) for values in zip(*ranks, strict=True))))
+            (directory/'result.json').write_text(json.dumps(dict(status='measuring',checks=checks,periods=periods))+'\n')
+            if rank == 0:print(json.dumps(dict(arm=label,median_ms=periods[-1]['median_ms'])),flush=True)
+        if graph_compilation_count() != compiled_before:
+            raise RuntimeError('Hot compilation invalidates timing')
+        savings = [a['median_ms']-b['median_ms'] for a, b in zip(periods[::2], periods[1::2], strict=True)]
+        result = dict(status='retirement_check' if args.retirement_only else 'completed', checks=checks, periods=periods,
+                      saving_ms_per_layer=statistics.median(savings) if savings else None,
+                      round_savings_ms=savings,
+                      three_consistent_rounds=bool(savings) and all(value > 0 for value in savings),
+                      full_model_gain_credit=False, physical_node_gate_pending=True, chain_repeats=args.chain_repeats,
+                      input_source=__doc__, native_replay=True, k_tiled_controller=args.k_tiled_controller, k_controller_peer_window=args.k_controller_peer_window, positive_gates=args.positive_gates,
+                      native_library_sha256=hashlib.sha256(Path(os.environ['VLLM_HPU_DSV4_TPC_OP_LIBRARY']).read_bytes()).hexdigest())
+        (directory/'result.json').write_text(json.dumps(result, indent=2)+'\n')
+        if rank == 0:
+            (root/'result.json').write_text(json.dumps(result, indent=2)+'\n')
+    except BaseException as error:
+        import traceback
+        (directory/'validation-error.txt').write_text(traceback.format_exc())
+        failure = RuntimeError(str(error))
+        (directory/'result.json').write_text(json.dumps(dict(status='failed_before_retirement',
+            error=str(error), performance_valid=False))+'\n')
+        if rank == 0:
+            (root/'result.json').write_text((directory/'result.json').read_text())
     for graph, plan in zip(graphs, plans, strict=True):
         graph.close()
         plan.invalidate()
@@ -444,6 +501,8 @@ def main():
     destroy_distributed_environment()
     config.__exit__(None, None, None)
     (directory/'retirement.json').write_text(json.dumps(dict(native_owners_closed=True, groups_destroyed=True))+'\n')
+    if failure is not None:
+        raise failure
 
 
 if __name__ == '__main__':

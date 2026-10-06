@@ -1084,3 +1084,19 @@ Existing wide woA epilogue preserved WoB consumer bits at C1/C2/C6 but no small-
 - Two stale CPU fixtures repaired: loader lacked the existing config/directory
   contract, and backend mock did not accept existing compile-policy kwargs.
   Original failing log retained; no production contract loosened.
+
+- mHC K-tile prototype `decode-mhc-k-tiled-01`: first scalar-reduction
+  version repeats24 horizontal reductions per tile;136958+273 simulator
+  instructions vs62312 reference. Vector partials remove repeated reductions
+  but still expose cached-array/signed-division overhead. BF16 native MAC plus
+  seven statically unfolded masked blocks removes local array spills/division:
+  partial26085 + finish6547 instructions, loads8002+1176 vs23042. Five actual
+  checkpoint input/controller fixtures pass official gate error (max3.67e-8).
+  Simulation is not cycle measurement. Native build/Meta/fullchain next; no
+  gain credit, no default change, compatible pending remains .831466437ms.
+
+- K-tile complete native trials01(DRAM) and02(SRAM) regress .23–.27 and .18–.21us/boundary; official-equation/route correctness pass. Moving same control after peer also regresses .675–.693us. All owners retired, zero credit. Stop tile/placement family; any next trial must remove a measured extra consumer node, not change tile or SRAM layout.
+
+- Controller K-finish→gate fusion offline passes five numerical fixtures but serializes24 reductions (6911instructions/oneTPC,147200B scan). Rejected before hardware, zero credit, archived `decode-mhc-k-gates-01/SOURCE.tar.gz`. All unused K-tile runtime schemas/glue/tests removed; archived native micro checks remain reproducible with pinned old libraries.
+
+- Positive Sinkhorn chain01: five×four official-equation/router checks pass; gates1→1 physical nodes. Three positive differences give only 0.001187500ms/token forecast; firstround effectivelyzero.28CPU checks, default-off shared source, no formal gain. Pending 0.832653937ms, formal9.564282 unchanged.

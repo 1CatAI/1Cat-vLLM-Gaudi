@@ -1195,3 +1195,20 @@ New native schema adds a cold integer `active_width`; shared replay, communicati
 and runner interfaces unchanged. C2–C6/prefill retain the old operator.
 Compatible pending forecast **.831466437ms/token**; formal **9.564282ms/token**
 unchanged. All four native owners retired; normal serving acceptance pending.
+
+### 2026-10-06 — positive-denominator Sinkhorn reciprocal
+
+`decode-mhc-positive-gates-chain-01`: same swizzled controller and independent
+gates during native peer in both arms; two FP32 Newton corrections replace
+generic positive-denominator divisions. Twenty Sinkhorn iterations remain.
+Five checkpoint-derived fixtures ×four ranks pass official equations and exact
+router IDs; floating outputs are not bitwise equal. Three savings per boundary
+**0.000000039063/0.000017515625/0.000014843750ms**, literal80-boundary forecast
+**0.001187500ms/token**. The first difference is effectively zero; this
+is not a material model performance result. Physical gates1→1, no node credit.
+
+`VLLM_HPU_DSV41_MHC_POSITIVE_GATES=0` remains default-off; common decode helpers
+select it without a TP-size branch, prefill retains original gates. Native B1/B2/B6
+Meta and helper/overlap checks:28 passed. All owned workers retired. Compatible
+pending forecast **0.832653937ms/token**, formal **9.564282ms/token** unchanged.
+No serving latency or quality qualification yet.

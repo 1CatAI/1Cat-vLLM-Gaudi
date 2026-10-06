@@ -1,13 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Expose exact mHC gates independently of the arriving TP partials."""
+"""Expose mHC gates independently of the arriving TP partials."""
 import torch
+
+from vllm_gaudi import envs as gaudi_envs
+
+
+def native_gates(mixes, rrms, scale, base, *, prefill=False):
+    op = (torch.ops.custom_op.custom_deepseek_v41_mhc_gates_positive_gaudi2
+          if not prefill and gaudi_envs.VLLM_HPU_DSV41_MHC_POSITIVE_GATES else
+          torch.ops.custom_op.custom_deepseek_v41_mhc_gates_f32_gaudi2)
+    return op(mixes, rrms, scale, base)
 
 
 def communication_gates_post(value, residual, control, scale, base, epsilon):
     # The control producer owns both the 24 projections and the shared RRMS.
     # This branch reads neither value nor residual, so the native tensor
     # dependency plan can execute it while the exchange remains in flight.
-    gates = torch.ops.custom_op.custom_deepseek_v41_mhc_gates_f32_gaudi2(
+    gates = native_gates(
         control[:, :24].contiguous(), control[:, 24:25].contiguous(), scale, base
     )
     pre = gates[:, :4].contiguous()

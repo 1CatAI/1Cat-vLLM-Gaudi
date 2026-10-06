@@ -2505,5 +2505,23 @@
     "flag": "VLLM_HPU_DSV41_EXPERT_ACTIVE_W2=0",
     "formal_result": null,
     "retired": true
+  },
+  "mhc_positive_gates_20261006": {
+    "status": "micro_qualified_default_off",
+    "round_savings_ms_per_boundary": [
+      3.906250000546008e-08,
+      1.751562499999887e-05,
+      1.48437500000001e-05
+    ],
+    "forecast_occurrences": 80,
+    "forecast_ms_per_token": 0.001187500000000008,
+    "compatible_pending_forecast_ms": 0.8326539374999996,
+    "correctness": "5checkpoint fixtures x4ranks pass official mHC equations, exactrouterIDs; floatingoutputs are not bitwise equal",
+    "physical": "Both arms standalone gates=1TPC, actualnative peer/post/norm/router consumes outputs; no physical-node reduction",
+    "limitations": "Smallest round is effectively zero; literal3positive directions per user rule, no material wholemodel performance claim. Both arms retain alreadyqualified gates/peer overlap. No formal request.",
+    "flag": "VLLM_HPU_DSV41_MHC_POSITIVE_GATES=0",
+    "formal_baseline_ms": 9.564282285406788,
+    "gain_scope": "Forecast only; no formal gain",
+    "retired": true
   }
 }

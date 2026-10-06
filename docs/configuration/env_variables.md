@@ -1074,3 +1074,5 @@ load-time zero-tail proof. W13 layout, padded SiLU amax and gate/up offset stay
 unchanged. Wider buckets and prefill retain the existing operator. A new native
 schema adds a cold integer`active_width` argument; replay/runner/communication
 interfaces are unchanged. Complete-chain micro-qualified; serving pending.
+
+`VLLM_HPU_DSV41_MHC_POSITIVE_GATES` defaults to `0`: component-qualified positive-denominator Sinkhorn reciprocal for decode; preserves20 iterations with FP32 accumulation, but is not bitwise-equivalent. Prefill retains its original gates. Combined serving quality/latency acceptance remains pending.

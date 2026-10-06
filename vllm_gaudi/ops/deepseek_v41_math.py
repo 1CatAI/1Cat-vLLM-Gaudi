@@ -399,8 +399,9 @@ def hc_pre(
         and projection.shape[-1] == 24
         and gate_tokens <= 2048
     ):
-        gates = torch.ops.custom_op.custom_deepseek_v41_mhc_gates_f32_gaudi2(
-            projection.contiguous(), rrms.contiguous(), scale.contiguous(), base.contiguous()
+        from vllm_gaudi.ops.deepseek_v41_mhc_gate_schedule import native_gates
+        gates = native_gates(
+            projection.contiguous(), rrms.contiguous(), scale.contiguous(), base.contiguous(), prefill=prefill
         )
         pre, post = gates[:, :copies], gates[:, copies : 2 * copies]
         comb = gates[:, 2 * copies :].reshape(-1, copies, copies)

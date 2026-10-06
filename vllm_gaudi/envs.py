@@ -89,6 +89,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_MHC_SWIZZLED_CONTROL: bool = False
     VLLM_HPU_DSV41_MHC_BF16_CONTROL_WEIGHT: bool = False
     VLLM_HPU_DSV41_MHC_RRMS_POST: bool = False
+    VLLM_HPU_DSV41_MHC_POSITIVE_GATES: bool = False
     VLLM_HPU_DSV41_MHC_COMM_GATES: bool = False
     VLLM_HPU_DSV41_MHC_LINEAR_LOAD: bool = False
     VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL: bool = False
@@ -592,6 +593,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_FFN_BF16_QUANT", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_RRMS_POST":
     lambda: os.environ.get("VLLM_HPU_DSV41_MHC_RRMS_POST", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_MHC_POSITIVE_GATES":
+    lambda: os.environ.get("VLLM_HPU_DSV41_MHC_POSITIVE_GATES", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_COMM_GATES":
     lambda: os.environ.get("VLLM_HPU_DSV41_MHC_COMM_GATES", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_SWIZZLED_CONTROL":
