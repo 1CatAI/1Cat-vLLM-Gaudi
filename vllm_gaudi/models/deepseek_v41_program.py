@@ -1213,12 +1213,21 @@ class PreparedDecoderLayer(nn.Module):
         collapsed_ffn = None
         post_ffn_prequant = None
         if deferred_gates:
-            residual, collapsed_ffn, gates = (
-                deferred_post(
+            if (gaudi_envs.VLLM_HPU_DSV41_MHC_POST_NORM_STATS and residual.shape[0] == 1
+                    and self.ffn_dual_quant and self.ffn_bf16_quant
+                    and self.moe.n256_fp8 and self.moe.n256_fused
+                    and self.moe.shared_gate_up_channel is not None):
+                from vllm_gaudi.ops.deepseek_v41_mhc_gate_schedule import communication_gates_post_quant
+
+                residual, collapsed_ffn, gates, *post_ffn_prequant = communication_gates_post_quant(
+                    value.contiguous(), residual.contiguous(), attention_control,
+                    w.hc_attn_scale, w.hc_attn_base, w.ffn_norm.weight, self.eps
+                )
+            else:
+                residual, collapsed_ffn, gates = deferred_post(
                     value.contiguous(), residual.contiguous(), attention_control,
                     w.hc_attn_scale, w.hc_attn_base, self.eps
                 )
-            )
             new_pre = gates[:, :4]
         elif (decode and gaudi_envs.VLLM_HPU_DSV41_PEER_POST_NORM and not self.draft
                 and not self.mhc_mme_gates_norm
@@ -1318,7 +1327,9 @@ class PreparedDecoderLayer(nn.Module):
         moe_ready = ((ffn_control,) if deferred_gates else (post, comb)) if schedule else ()
         if decode and value.shape[0] <= 2 and self.moe.n256_fp8 and self.moe.n256_fused:
             if post_ffn_prequant is not None:
-                normalized, quantized, activation_scale = post_ffn_prequant
+                normalized, quantized, activation_scale = post_ffn_prequant[:3]
+                if len(post_ffn_prequant) == 5:
+                    shared_prequant = post_ffn_prequant[3], post_ffn_prequant[4]
             elif fused_ffn_prequant is None:
                 if self.ffn_dual_quant and self.moe.shared_gate_up_channel is not None:
                     quantizer = (torch.ops.custom_op.custom_deepseek_v41_ffn_norm_dual_bf16_quant_gaudi2

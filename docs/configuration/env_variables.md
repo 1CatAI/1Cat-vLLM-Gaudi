@@ -1130,3 +1130,5 @@ the scale-first BF16 rounding and shared/routed BF16 addition boundaries.
 It requires the existing C1 streamed SAT, active-W2 and three-route-W2 path with
 FP8 shared weights. Other batch and prefill paths retain their existing implementation.
 Keep it disabled until combined normal-serving acceptance.
+
+`VLLM_HPU_DSV41_MHC_POST_NORM_STATS` (default `0`) enables experimental peer/post statistics and feature-parallel FFN normalization with both quantizers. The existing next mHC controller remains independent. Serving selection is limited to the BF16 dual-quant single-row decode contract; prefill and larger batches retain their existing paths. End-to-end qualification is pending.

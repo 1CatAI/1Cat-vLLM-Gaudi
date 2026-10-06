@@ -15,6 +15,8 @@ import statistics
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--weighted-post-statistics',action='store_true',help='Use producer RSS/weighted amax with feature-parallel norm dual quant; include shared W13/Silu and next actual mHC consumer')
+    parser.add_argument('--peer-gates-vector',action='store_true',help='Compare whole gate-packet peer/post against the existing sliced-gate consumer')
     parser.add_argument('--positive-gates',action='store_true',help='Same parallel controller, Sinkhorn uses positive-denominator Newton reciprocal')
     parser.add_argument('--k-controller-peer-window', action='store_true',
                         help='Move the qualified K-controller recipe behind peer submit, before gates/post')
@@ -52,6 +54,10 @@ def main():
     parser.add_argument('--retirement-only', action='store_true',
                         help='Reuse measured A/B; check teardown without timing')
     args = parser.parse_args()
+    if args.weighted_post_statistics:
+        args.peer_gates_vector=True
+    if args.peer_gates_vector:
+        args.positive_gates=True
     if args.positive_gates:
         args.gates_during_exchange=True
         args.official_tolerance=True
@@ -147,12 +153,25 @@ def main():
     wo_weight=sidecar.tensor(f'layers.{layer}.attn.wo_b.weight','hpu')
     wo_scale=sidecar.tensor(f'layers.{layer}.attn.wo_b.channel_scale','hpu')
     norm = shard.tensor(f'layers.{layer}.ffn_norm.weight','hpu')
-    control = shard.tensor(f'layers.{layer}.hc_ffn_fn','hpu').contiguous()
+    control = shard.tensor(f'layers.{layer}.hc_attn_fn' if args.weighted_post_statistics else f'layers.{layer}.hc_ffn_fn','hpu').contiguous()
+    if args.weighted_post_statistics:
+        shared_sidecar = DenseFP8Sidecar(args.sidecar,shard)
+        projections={name:(shared_sidecar.tensor(f'layers.{layer}.ffn.shared_experts.{name}.weight','cpu'),
+                          shared_sidecar.tensor(f'layers.{layer}.ffn.shared_experts.{name}.channel_scale','cpu')) for name in ('w1','w3')}
+        width=projections['w1'][0].shape[0];padded=(width+127)//128*128
+        pad=lambda v:torch.cat((v,torch.zeros((padded-width,v.shape[1]),dtype=v.dtype)),0)
+        shared_weight=torch.cat((pad(projections['w1'][0]),pad(projections['w3'][0])),0).to('hpu')
+        shared_channel=torch.cat((torch.nn.functional.pad(projections['w1'][1],(0,padded-width),value=1),
+            torch.nn.functional.pad(projections['w3'][1],(0,padded-width),value=1)),1).bfloat16().reshape(1,padded*2//256,256).to('hpu')
+        shared_id=torch.zeros((1,1),dtype=torch.int32,device='hpu');shared_route=torch.ones((1,1),dtype=torch.float32,device='hpu')
+        next_control=shard.tensor(f'layers.{layer}.hc_ffn_fn','hpu').contiguous()
+        next_weight=next_control.reshape(24,160,128).permute(1,0,2).contiguous()
+        next_scale=shard.tensor(f'layers.{layer}.hc_ffn_scale','hpu');next_base=shard.tensor(f'layers.{layer}.hc_ffn_base','hpu')
     high = control.bfloat16()
     low = (control - high.float()).bfloat16()
     mme_weight = torch.cat((high,low),0).contiguous()
-    control_scale = shard.tensor(f'layers.{layer}.hc_ffn_scale','hpu')
-    control_base = shard.tensor(f'layers.{layer}.hc_ffn_base','hpu')
+    control_scale = shard.tensor(f'layers.{layer}.hc_attn_scale' if args.weighted_post_statistics else f'layers.{layer}.hc_ffn_scale','hpu')
+    control_base = shard.tensor(f'layers.{layer}.hc_attn_base' if args.weighted_post_statistics else f'layers.{layer}.hc_ffn_base','hpu')
     router_weight = shard.tensor(f'layers.{layer}.ffn.gate.weight','hpu')
     bias = shard.tensor(f'layers.{layer}.ffn.gate.bias','hpu')
     bias_vl = shard.tensor(f'layers.{layer}.ffn.gate.bias_vl','hpu')
@@ -211,6 +230,7 @@ def main():
             projected[:,:24].contiguous(),projected[:,24:].contiguous(),control_scale,control_base)
         return value,gates
     def consume(peers,residual,projection,scale,base,norm,router,bias,bias_vl,mask,*,fused,positive=False):
+        ready_quant=None
         if fused:
             # The same TPC owns fixed-rank summation and its BF16 boundary;
             # do not materialize a separate collective reduction node.
@@ -225,12 +245,35 @@ def main():
             pre=projection[:,:4].contiguous()
             # Match the already-qualified peer/post baseline. Counting a
             # separate rank sum here would double-credit the preceding batch.
-            updated,collapsed=torch.ops.custom_op.custom_deepseek_v41_mhc_post_collapse_gaudi2(
-                peers,residual,projection[:,4:8].contiguous(),projection[:,8:].reshape(1,4,4).contiguous(),pre)
-        normalized,quantized,act_scale=torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(collapsed,norm,eps)
+            if args.weighted_post_statistics and positive:
+                updated,collapsed,normalized,quantized,act_scale,dense_q,dense_scale = (
+                    torch.ops.custom_op.custom_deepseek_v41_mhc_post_norm_statistics_gaudi2(
+                        peers,residual,projection.contiguous(),norm,eps))
+                ready_quant=normalized,quantized,act_scale,dense_q,dense_scale
+            elif (args.peer_gates_vector and positive) or args.weighted_post_statistics:
+                updated,collapsed=torch.ops.custom_op.custom_deepseek_v41_mhc_gates_post_gaudi2(
+                    peers,residual,projection.contiguous())
+            else:
+                updated,collapsed=torch.ops.custom_op.custom_deepseek_v41_mhc_post_collapse_gaudi2(
+                    peers,residual,projection[:,4:8].contiguous(),projection[:,8:].reshape(1,4,4).contiguous(),pre)
+        if ready_quant is not None:
+            normalized,quantized,act_scale,dense_q,dense_scale=ready_quant
+        elif args.peer_gates_vector:
+            normalized,quantized,act_scale,dense_q,dense_scale=torch.ops.custom_op.custom_deepseek_v41_ffn_norm_dual_bf16_quant_gaudi2(collapsed,norm,eps)
+        else:
+            normalized,quantized,act_scale=torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(collapsed,norm,eps)
         logits=torch.ops.custom_op.custom_deepseek_v41_bf16_linear_f32_gaudi2(normalized,router)
         ids,routing=torch.ops.custom_op.custom_deepseek_v41_router_logits_top6_gaudi2(logits,bias,bias_vl,mask)
-        return updated,collapsed,pre,normalized,quantized,act_scale,ids,routing,gates
+        outputs=(updated,collapsed,pre,normalized,quantized,act_scale,ids,routing,gates)
+        if args.weighted_post_statistics:
+            product=torch.ops.hpu.fp8_gemm_v2(dense_q,False,shared_weight,True,None,torch.float32,None,None,None,False)
+            middle,middle_scale=torch.ops.custom_op.custom_deepseek_v41_shared_silu_quant_gaudi2(
+                product.reshape(1,1,-1),shared_id,dense_scale,shared_channel,shared_route)
+            control_next=torch.ops.custom_op.custom_deepseek_v41_control_rrms_swizzled_bf16_gaudi2(updated.flatten(1),next_weight,eps)
+            gates_next=torch.ops.custom_op.custom_deepseek_v41_mhc_gates_positive_gaudi2(
+                control_next[:,:24].contiguous(),control_next[:,24:].contiguous(),next_scale,next_base)
+            outputs+=(middle,middle_scale,control_next,gates_next)
+        return outputs
     arms = (True, False) if args.early_gates else (True, True) if args.late_control or args.swizzled_control or args.direct_rrms_post or args.dense_transpose or args.bf16_control_weights else (False, False) if args.peer_prune else (False, True)
     if args.gates_during_exchange:
         arms = (False, False) if args.k_tiled_controller or args.positive_gates else (True, False)
@@ -238,6 +281,8 @@ def main():
         torch.ops.custom_op.custom_deepseek_v41_mhc_gates_f32_gaudi2(
             projection[:, :24].contiguous(), projection[:, 24:25].contiguous(), scale, base)
     ) if args.gates_during_exchange else None
+    if args.peer_gates_vector:
+        independent_gates = compiled(lambda projection,scale,base:torch.ops.custom_op.custom_deepseek_v41_mhc_gates_positive_gaudi2(projection[:,:24].contiguous(),projection[:,24:25].contiguous(),scale,base))
     positive_gates=compiled(lambda projection,scale,base:torch.ops.custom_op.custom_deepseek_v41_mhc_gates_positive_gaudi2(projection[:,:24].contiguous(),projection[:,24:25].contiguous(),scale,base)) if args.positive_gates else None
     late_projection = compiled(lambda x,w,s:direct_dense_fp8(x,w,s)) if args.late_control or args.k_controller_peer_window else None
     late_controller = (compiled(lambda r,w:
@@ -246,7 +291,7 @@ def main():
         torch.ops.custom_op.custom_deepseek_v41_control_rrms_parallel_bf16_gaudi2(r.flatten(1),w,eps))
         if args.late_control else None)
     producers=[compiled(lambda *args,fused=fused:produce(*args,fused=fused)) for fused in arms]
-    consumers=[compiled(lambda *values,fused=fused,positive=bool(args.direct_rrms_post and arm):consume(*values,fused=fused,positive=positive)) for arm,fused in enumerate(arms)]
+    consumers=[compiled(lambda *values,fused=fused,positive=bool((args.direct_rrms_post or args.peer_gates_vector) and arm):consume(*values,fused=fused,positive=positive)) for arm,fused in enumerate(arms)]
     prune_setter = None
     if args.peer_prune:
         import ctypes
@@ -363,8 +408,13 @@ def main():
             mix=torch.cat((reference_control[:,:24],torch.zeros_like(reference_control[:,:24])),1).contiguous()
             value=direct_dense_fp8(x,wo_weight,wo_scale)
             peers=torch.ops.vllm_gaudi.tp_peer_allgather(value,4).reshape(4,1,5120)
-            pure=consume(peers,residual,reference_control if args.gates_during_exchange else mix,
-                         control_scale,control_base,norm,router_weight,bias,bias_vl,mask,fused=True)
+            if args.peer_gates_vector:
+                reference_projection=torch.ops.custom_op.custom_deepseek_v41_mhc_gates_positive_gaudi2(
+                    reference_control[:,:24].contiguous(),reference_control[:,24:].contiguous(),control_scale,control_base)
+            else:
+                reference_projection=reference_control if args.gates_during_exchange else mix
+            pure=consume(peers,residual,reference_projection,
+                         control_scale,control_base,norm,router_weight,bias,bias_vl,mask,fused=not args.peer_gates_vector)
             torch.hpu.synchronize()
             exact_tpc=[torch.equal(a.view(torch.uint8),b.cpu().view(torch.uint8)) for a,b in zip(observed[0],pure,strict=True)]
             if args.gates_during_exchange:
@@ -386,8 +436,8 @@ def main():
                 entry['official_equation_errors'] = [check_outputs(arm, reference) for arm in observed]
                 entry['remaining_output_errors'] = {
                     str(i): dict(error=normalized_error(observed[1][i].float(), observed[0][i].float()),
-                                 limit=2e-4 if i == 4 else 5e-5)
-                    for i in (4, 5, 7)}
+                                 limit=2e-4 if i in (4,9) else 5e-5)
+                    for i in ((4,5,7,9,10,11,12) if args.weighted_post_statistics else (4,5,7))}
                 errors = [v for arm in entry['official_equation_errors'] for v in arm.values()]
                 errors += list(entry['remaining_output_errors'].values())
                 decisions = [None] * 4
@@ -396,7 +446,22 @@ def main():
                     (directory/'failure.json').write_text(json.dumps(entry, indent=2)+'\n')
                     raise RuntimeError('mHC official-equation numerical contract failed')
             checks.append(entry)
-            if (not all(exact_tpc) or not exact[6] or
+            if args.weighted_post_statistics:
+                # The compiled shared MME and the independent eager reference
+                # can use different legal accumulation orders. Apply the same
+                # official downstream error contract; retain exact post state.
+                pure_cpu=[tensor.cpu() for tensor in pure]
+                entry['same_projection_downstream_errors']={
+                    str(i):dict(error=normalized_error(observed[0][i].float(),pure_cpu[i].float()),
+                                limit=2e-4 if i==9 else 5e-5)
+                    for i in (9,10,11,12)}
+                for row in entry['same_projection_downstream_errors'].values():
+                    if row['error']>=row['limit']:
+                        raise RuntimeError('Independent downstream reference tolerance failed')
+                exact_prefix=all(exact_tpc[:9])
+            else:
+                exact_prefix=all(exact_tpc)
+            if (not exact_prefix or not exact[6] or
                     (not args.official_tolerance and not torch.allclose(reference_gates.cpu(),mme_gates.cpu(),rtol=1e-5,atol=1e-5))):
                 torch.save(dict(fixture=fixture,observed=observed),directory/'failure.pt')
                 (directory/'failure.json').write_text(json.dumps(entry,indent=2)+'\n')

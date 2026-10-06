@@ -30,3 +30,16 @@ def communication_gates_post(value, residual, control, scale, base, epsilon):
             gates[:, 8:].reshape(residual.shape[0], 4, 4).contiguous(), pre
         )
     return updated, collapsed, gates
+
+
+def communication_gates_post_quant(value, residual, control, scale, base, norm_weight, epsilon):
+    """Keep independent gates while publishing the next FFN's two quantizers."""
+    gates = native_gates(
+        control[:, :24].contiguous(), control[:, 24:25].contiguous(), scale, base
+    )
+    updated, collapsed, normalized, quantized, activation_scale, shared_q, shared_scale = (
+        torch.ops.custom_op.custom_deepseek_v41_mhc_post_norm_statistics_gaudi2(
+            value, residual, gates, norm_weight, epsilon
+        )
+    )
+    return updated, collapsed, gates, normalized, quantized, activation_scale, shared_q, shared_scale

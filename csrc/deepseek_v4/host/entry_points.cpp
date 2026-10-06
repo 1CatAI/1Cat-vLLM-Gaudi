@@ -25,6 +25,7 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVE
 #include "deepseek_v41_prefill_mhc_gaudi2.hpp"
 #include "deepseek_v41_mhc_post_collapse_gaudi2.hpp"
 #include "deepseek_v41_mhc_gates_post_gaudi2.hpp"
+#include "deepseek_v41_mhc_weighted_stats_gaudi2.hpp"
 #include "deepseek_v41_mhc_post_collapse_f32_gaudi2.hpp"
 #include "deepseek_v41_index_gaudi2.hpp"
 #include "deepseek_v41_index_reduce_gaudi2.hpp"
@@ -344,6 +345,8 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_REUSE_DECODED_SWA,
     GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_PUBLISH_NATIVE_CODEC,
     GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_PUBLISH_TENSOR_MASK,
+    GAUDI2_KERNEL_DEEPSEEK_V41_MHC_POST_WEIGHTED_STATS,
+    GAUDI2_KERNEL_DEEPSEEK_V41_NORM_WEIGHTED_STATS,
     GAUDI2_KERNEL_DEEPSEEK_V41_MHC_GATES_POST,
     GAUDI2_KERNEL_DEEPSEEK_V41_MHC_POST_COLLAPSE,
     GAUDI2_KERNEL_DEEPSEEK_V41_MHC_POST_COLLAPSE_F32,
@@ -653,6 +656,8 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     for (unsigned i = 0; i < 6; ++i)
         std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_STATE_ROWS_WRITE_U8 + i].name, DeepseekV41StateRowsGaudi2::names[i]);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_PREFILL_MHC_POST].name, DeepseekV41PrefillMhcGaudi2::name);
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MHC_POST_WEIGHTED_STATS].name,"custom_deepseek_v41_mhc_post_weighted_stats_gaudi2");
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_NORM_WEIGHTED_STATS].name,"custom_deepseek_v41_norm_from_weighted_stats_gaudi2");
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MHC_GATES_POST].name,DeepseekV41MhcGatesPostGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MHC_POST_COLLAPSE].name, DeepseekV41MhcPostCollapseGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_SILU_ACTIVATE_TILE].name, DeepseekV41SiluActivateTileGaudi2::name);
@@ -1685,6 +1690,10 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
         return DeepseekV41MhcMmePostCollapseGaudi2(2).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41MhcMmePostCollapseGaudi2::name) == 0)
         return DeepseekV41MhcMmePostCollapseGaudi2().GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name,"custom_deepseek_v41_mhc_post_weighted_stats_gaudi2")==0)
+        return DeepseekV41MhcWeightedStatsGaudi2().GetGcDefinitions(params,instance);
+    if (std::strcmp(params->guid.name,"custom_deepseek_v41_norm_from_weighted_stats_gaudi2")==0)
+        return DeepseekV41MhcWeightedStatsGaudi2(true).GetGcDefinitions(params,instance);
     if (std::strcmp(params->guid.name, DeepseekV41MhcGatesPostGaudi2::name) == 0)
         return DeepseekV41MhcGatesPostGaudi2().GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41MhcPostCollapseGaudi2::name) == 0)
