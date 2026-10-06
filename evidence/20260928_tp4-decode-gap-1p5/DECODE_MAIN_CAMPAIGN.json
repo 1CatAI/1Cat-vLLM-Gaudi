@@ -2781,7 +2781,7 @@
     "owners_retired": true
   },
   "queued_native_candidates": [],
-  "next_action": "Complete main-PV cache production publish/reuse chain qualification; use latest anatomy to select next >=0.1ms hotspot.",
+  "next_action": "Investigate supported tensor-ready scheduled sending while retaining recipe retirement and native lifetime/wrap guards; no more main PV cache variants.",
   "qualified_production_coordinate_selection": {
     "status": "complete_chain_micro_qualified_default_off",
     "round_savings_ms_per_layer": [
@@ -3122,13 +3122,33 @@
       "gain_credit_ms": 0
     },
     "main_pv_cache": {
-      "status": "sdk_meta_pass_native_chain_queued",
+      "status": "closed_two_measured_variants_slower",
       "case": "/opt/ssd960/1cat-vllm-decode-archives/decode-main-pv-cache-chain-01",
       "gate": "5 SDK byte-exact buffers,13 Meta contracts; correct inplace memory-section outputs feed MME dependencies",
       "hypothesis_ceiling_ms_token": 0.35,
       "publisher_cost_pending": true,
       "gain_credit_ms": 0,
-      "default": false
+      "default": false,
+      "latest_case": "/opt/ssd960/1cat-vllm-decode-archives/decode-main-pv-cache-chain-04",
+      "first_measured_case": "/opt/ssd960/1cat-vllm-decode-archives/decode-main-pv-cache-chain-03",
+      "first_savings_ms_per_layer": [
+        -0.0012792421875,
+        -0.001327203125,
+        -0.00135450390625
+      ],
+      "binding_repairs": "Explicit Bridge scratch outputs and mandatory SRAM input/output reuse binding restore five-input byte-exact native chain. Unfixedlaunch/incorrect variants preserved.",
+      "five_input_four_rank_exact": true,
+      "native_ABABAB_savings_ms_per_reuse": [
+        -0.0012349726562499996,
+        -0.0012949179687499895,
+        -0.0013186835937500085
+      ],
+      "formal_not_run": true,
+      "publisher_not_tested": true,
+      "frontend_copy_check": "No extra aten.copy/clone operator in cached QKV/MLA/WO graph; return alias annotation does not remove the complete-chain regression. Do not label the physical gap as Python wrapping.",
+      "why_stop": "Both properly bound native variants regress all three pairs. A publisher output escape adds cost; do not proceed to serving or a third slicing/layout variant.",
+      "scope_limit": "Anonymous physical-node/SRAM transfer provenance not reconstructed; negative complete-chain timings sufficient to reject.",
+      "preserved_source": "archived-source/"
     }
   },
   "accepted_baseline_20261007": {
@@ -3146,7 +3166,7 @@
     "combined_forecast_ms": 0.1456675,
     "observed_difference_ms": 0.293265230238036,
     "case": "/opt/ssd960/1cat-vllm-decode-archives/decode-accumulated-serving-07",
-    "trace_status": "Repair03 diagnostic224tokens with160captured succeeded; all owned2/3/6/7 retired768MiB. Offline24-cycle/all-rank normalization in progress. No scoredrequestrepeat.",
+    "trace_status": "complete",
     "promotion_pending_companion": false,
     "companion_case": "/opt/ssd960/1cat-vllm-decode-archives/decode-accumulated-serving-07-trace-repair-03",
     "status": "combined_formal_accepted",
@@ -3164,9 +3184,15 @@
     "quality_facts": 14,
     "trace_case": "/opt/ssd960/1cat-vllm-decode-archives/decode-accumulated-serving-07-trace-repair-03",
     "trace_windows": 24,
-    "scope": "Four-rank raw activity normalized; rank0 complete anatomy. Other rank anatomy generation still running.",
+    "scope": "Companion analysis completed for all four ranks,24 contiguous cycles, no scored request repeated",
     "target_ms_token": 7,
     "target_met": false,
-    "unqualified_main_pv_cache_remains_off": true
+    "unqualified_main_pv_cache_remains_off": true,
+    "four_rank_trace_period_ms": [
+      8.183174083333347,
+      8.17892804166667,
+      8.184153916666672,
+      8.176476749999992
+    ]
   }
 }
