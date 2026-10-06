@@ -28,6 +28,23 @@ def test_timeout_leaves_busy_allocations_untouched(monkeypatch, tmp_path):
     monkeypatch.setattr(devices.subprocess, 'check_output', lambda *a, **k: '0, 89000 MiB, 0 %\n')
     with pytest.raises(RuntimeError, match='ownership must be checked'):
         devices.wait_for_released_modules((0,), tmp_path/'release.json', timeout_s=0)
+    assert not (tmp_path/'release.json').exists()
+    assert json.loads((tmp_path/'release.progress.json').read_text())[-1]['pending'] == [0]
+
+
+def test_completion_marker_is_absent_while_driver_teardown_is_pending(monkeypatch, tmp_path):
+    record = tmp_path/'release.json'
+    samples = iter(['0, 89000 MiB, 0 %\n', '0, 768 MiB, 0 %\n'])
+    monkeypatch.setattr(devices.subprocess, 'check_output', lambda *a, **k: next(samples))
+
+    def observe_wait(_):
+        assert not record.exists()
+        assert json.loads((tmp_path/'release.progress.json').read_text())[-1]['pending'] == [0]
+
+    monkeypatch.setattr(devices.time, 'sleep', observe_wait)
+    devices.wait_for_released_modules((0,), record)
+    assert json.loads(record.read_text())[-1]['pending'] == []
+    assert not (tmp_path/'release.progress.json').exists()
 
 
 def test_release_monitor_keeps_unknown_owned_module_pending(monkeypatch, tmp_path):

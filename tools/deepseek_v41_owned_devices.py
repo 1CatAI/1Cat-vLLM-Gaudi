@@ -13,6 +13,8 @@ import time
 
 def wait_for_released_modules(modules, record, *, timeout_s=300, poll_s=5):
     """Wait for asynchronous allocation teardown; this function acquires no lock."""
+    record = Path(record)
+    progress = record.with_name(record.stem + '.progress' + record.suffix)
     deadline = time.monotonic() + timeout_s
     observations = []
     while True:
@@ -29,8 +31,13 @@ def wait_for_released_modules(modules, record, *, timeout_s=300, poll_s=5):
             if not released:
                 pending.append(module)
         observations.append(dict(time=time.time(), cards=load, pending=pending))
-        Path(record).write_text(json.dumps(observations, indent=2)+'\n')
+        progress.write_text(json.dumps(observations, indent=2)+'\n')
         if not pending:
+            # A completed launcher can leave asynchronous driver cleanup in
+            # flight. Publish the completion marker only after every owned
+            # module is observed released; readers must not mistake progress
+            # file existence for proof that measurement can resume.
+            os.replace(progress, record)
             return load
         if time.monotonic() >= deadline:
             raise RuntimeError(f'Modules still have live allocations: {pending}; ownership must be checked')
