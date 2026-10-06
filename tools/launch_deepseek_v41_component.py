@@ -48,12 +48,20 @@ def main():
                    for p in frozen.rglob('*.py')}
     (case/'execution-sources.json').write_text(json.dumps(source_hashes,indent=2)+'\n')
     profile = json.loads(args.template.read_text())
-    source_case = Path(profile['command'][profile['command'].index('--output') + 1])
-    environment = {k: v.replace(str(source_case), str(case)) for k, v in profile['environment'].items()}
+    # Artifact paths are immutable, even when the old run built them inside
+    # its output directory. Rewrite only our explicitly assigned writable
+    # paths below; a blanket replacement silently relocates the native bridge.
+    environment = dict(profile['environment'])
     native = args.native_dir.resolve()
     ops = native / 'hpu_dsv4_sparse_attn_pt2.cpython-312-x86_64-linux-gnu.so'
     kernels = native / 'libdeepseek_v4_gaudi2_kernels.so'
     hashes = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in (ops, kernels)}
+    bridge = environment.get('VLLM_HPU_TP2_FUSED_AR_NORM_BRIDGE')
+    if bridge:
+        bridge = Path(bridge)
+        if not bridge.is_file():
+            raise RuntimeError(f'Pinned native bridge absent before device lease: {bridge}')
+        hashes[str(bridge)] = hashlib.sha256(bridge.read_bytes()).hexdigest()
     scratch = component_scratch(case, profile['environment'].get('TMPDIR'), args.ipc_tmp_root)
     scratch.mkdir(parents=True,exist_ok=True)
     recipe_dir=args.recipe_cache_dir.resolve() if args.recipe_cache_dir else case/'recipes'

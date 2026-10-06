@@ -2,8 +2,8 @@
   "formal_baseline_ms": 9.564282285406788,
   "target_ms": 7,
   "formal_completed_this_batch": false,
-  "new_qualified_gain_ms": 0.01610159765624973,
-  "compatible_pending_forecast_ms": 0.8326539374999996,
+  "new_qualified_gain_ms": 0.014609812499999986,
+  "compatible_pending_forecast_ms": 0.8472637499999995,
   "negative_and_prepared_experiments": {
     "decode-mhc-native-fp32-chain-01": {
       "status": "rejected_slower",
@@ -465,7 +465,7 @@
   },
   "w13_compact_preparation": {
     "artifact": "/opt/ssd960/1cat-vllm-decode-archives/decode-expert-w13-compact-01",
-    "status": "five_checkpoint_bit_layout_checks_passed_only",
+    "status": "closed_no_gain: plain ISA/load regression; strided alias loses SRAM handoff",
     "source": "Offline utility only; production prepared layout unchanged",
     "tested_layers": [
       0,
@@ -482,5 +482,35 @@
       "Need metadata and actual compiled SRAM evidence, not an assumed node reduction.",
       "Serving must not retain duplicate full expert weights; preserve common prefill/DSpark prepared-weight contracts."
     ]
+  },
+  "index_query_rope_codec_20261006": {
+    "status": "complete_chain_micro_qualified_default_off",
+    "saving_ms_per_index_layer": 0.0018262265624999982,
+    "forecast_occurrences": 8,
+    "forecast_ms_per_token": 0.014609812499999986,
+    "compatible_pending_forecast_ms": 0.8472637499999995,
+    "round_savings_ms": [
+      0.0018213125000000052,
+      0.0018349843749999942,
+      0.0018262265624999982
+    ],
+    "correctness": "5 checkpoint embedding-derived input rows x4ranks; all query, gain and score bytes exact",
+    "execution": "native64-repetition producer->one query peer->2048row score consumer, ABABAB200; both arms replicate gain and use native query preparation",
+    "limitations": "One bounded score tile, not full serving trace; no formal/EOS/quality request. No measured wholemodel gain. Fixtures are real-weight-derived, not captured serving activations.",
+    "formal_baseline_ms": 9.564282285406788,
+    "flag": "VLLM_HPU_DSV41_INDEX_QUERY_CODEC=0"
+  },
+  "current_micro_cards": [
+    2,
+    3,
+    6,
+    7
+  ],
+  "next_action": "Read native query replica03 result; fused codec held in both arms. No formal request before compatible micro forecast1ms.",
+  "query_replica_native_03": {
+    "status": "queued",
+    "artifact": "/opt/ssd960/1cat-vllm-decode-archives/decode-index-query-replica-native-03",
+    "changes_from_old": "Qualified native RoPE/FP4 and native E4M3 activation codec replace old generic42/44-node producer; current parent13nodes.",
+    "forecast_credit_ms": 0
   }
 }

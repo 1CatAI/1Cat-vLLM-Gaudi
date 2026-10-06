@@ -1212,3 +1212,26 @@ select it without a TP-size branch, prefill retains original gates. Native B1/B2
 Meta and helper/overlap checks:28 passed. All owned workers retired. Compatible
 pending forecast **0.832653937ms/token**, formal **9.564282ms/token** unchanged.
 No serving latency or quality qualification yet.
+
+### 2026-10-06 — shared native index query RoPE/FP4 boundary
+
+`decode-index-rope-codec-chain-02`: retain replicated gain and one query peer in
+both arms; BF16 query GEMM → native RoPE/FP4 → 2048-row score consumer. Five
+checkpoint embedding-derived inputs ×four ranks give byte-exact query/gain/score.
+Same-process native64-repetition ABABAB200 savings per index layer
+**.001821313/.001834984/.001826227ms**; eight-layer forecast
+**.014609813ms/token**. Actual producer14→13 physical nodes; consumer7 unchanged.
+
+`VLLM_HPU_DSV41_INDEX_QUERY_CODEC=0` stays default-off. Common width128 native
+contract supports TP2/TP4 heads and B1/B2/B6; CPU Meta22checks and five simulator
+fixtures across H8/H16/H32/B2/B6 pass, with signed-zero/subnormal/NaN/Inf/ties.
+Both BF16 rounding boundaries and first-lane-NaN codec semantics are retained.
+No replay/communication/runner API change; prefill retains its original path.
+This is a bounded component chain, not captured serving activations/full index
+selection or a model latency result. Compatible pending forecast
+**.847263750ms/token**, formal baseline **9.564282ms/token** unchanged.
+
+Evidence: `/opt/ssd960/1cat-vllm-decode-archives/decode-index-rope-codec-chain-02/`
+(`result.json`, `PHYSICAL_NODES.json`, `DECISION.json`); all owners retired.
+chain01 has no performance result: pinned bridge path was rewritten incorrectly
+by the component launcher, now repaired and covered by two CPU regressions.

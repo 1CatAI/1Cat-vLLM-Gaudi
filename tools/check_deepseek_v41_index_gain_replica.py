@@ -20,11 +20,14 @@ def main():
     parser.add_argument('--query-replica', action='store_true', help='Hold gain replica fixed; compare sharded query+peer against cold full query weights')
     parser.add_argument('--native-query-path', action='store_true', help='Use the production native RoPE table/codec contract in both arms')
     parser.add_argument('--fused-query-codec', action='store_true', help='Hold gain replica and query peer fixed; compare native RoPE+FP4 with the fused codec')
+    parser.add_argument('--shared-query-codec', action='store_true', help='Use the qualified fused codec in both query-replication arms')
     parser.add_argument('--steps', type=int, default=200)
     parser.add_argument('--chain-repeats', type=int, default=64)
     args = parser.parse_args()
     if args.fused_query_codec and (not args.native_query_path or args.query_replica):
         parser.error('--fused-query-codec requires --native-query-path and excludes --query-replica')
+    if args.shared_query_codec and (not args.native_query_path or not args.query_replica or args.fused_query_codec):
+        parser.error('--shared-query-codec requires the native query-replication comparison')
     if args.native_query_path:
         os.environ['VLLM_HPU_DSV41_NATIVE_KV_PACK'] = '1'
         os.environ['VLLM_HPU_DSV41_QUANT_ROUNDTRIP'] = '1'
@@ -94,7 +97,7 @@ def main():
     def produce(value, pos, wq, wp, norm, phase, *, replicated):
         qr = rms_norm(value[:, :1280].contiguous(), norm, 1e-20)
         query = F.linear(quantize_activation(qr), wq).reshape(1, wq.shape[0] // 128, 128)
-        if args.fused_query_codec and replicated:
+        if args.shared_query_codec or (args.fused_query_codec and replicated):
             query = torch.ops.custom_op.custom_deepseek_v41_index_query_rope_fp4_bf16_gaudi2(query, pos, phase)
         else:
             roped = (torch.ops.custom_op.custom_deepseek_v41_rope_bf16_gaudi2(query, pos, phase)
@@ -210,6 +213,7 @@ def main():
                   saving_ms_per_index_layer=statistics.median(savings), three_consistent_rounds=all(v>0 for v in savings),
                   peer_points_per_iteration=[1,0] if args.query_replica else [1,1] if args.fused_query_codec else [2,1],
                   native_query_path=args.native_query_path, fused_query_codec=args.fused_query_codec,
+                  shared_query_codec=args.shared_query_codec,
                   fixture_scope=__doc__, formal_gain=False)
     (directory/'result.json').write_text(json.dumps(result, indent=2))
     if rank == 0:(root/'result.json').write_text(json.dumps(result, indent=2))

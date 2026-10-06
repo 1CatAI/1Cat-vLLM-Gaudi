@@ -2535,10 +2535,33 @@
     "forecast_ms": 0
   },
   "index_query_rope_codec_20261006": {
-    "status": "simulator_compile_pass_native_chain_queued",
-    "qualification": "/opt/ssd960/1cat-vllm-decode-archives/decode-index-rope-codec-01/QUALIFICATION.json",
-    "forecast_credit_ms": 0,
-    "formal_result": null,
+    "status": "complete_chain_micro_qualified_default_off",
+    "saving_ms_per_index_layer": 0.0018262265624999982,
+    "forecast_occurrences": 8,
+    "forecast_ms_per_token": 0.014609812499999986,
+    "compatible_pending_forecast_ms": 0.8472637499999995,
+    "round_savings_ms": [
+      0.0018213125000000052,
+      0.0018349843749999942,
+      0.0018262265624999982
+    ],
+    "correctness": "5 checkpoint embedding-derived input rows x4ranks; all query, gain and score bytes exact",
+    "execution": "native64-repetition producer->one query peer->2048row score consumer, ABABAB200; both arms replicate gain and use native query preparation",
+    "limitations": "One bounded score tile, not full serving trace; no formal/EOS/quality request. No measured wholemodel gain. Fixtures are real-weight-derived, not captured serving activations.",
+    "formal_baseline_ms": 9.564282285406788,
     "flag": "VLLM_HPU_DSV41_INDEX_QUERY_CODEC=0"
+  },
+  "compatible_pending_forecast_ms": 0.8472637499999995,
+  "current_micro_cards": [
+    2,
+    3,
+    6,
+    7
+  ],
+  "query_replica_native_03": {
+    "status": "queued",
+    "artifact": "/opt/ssd960/1cat-vllm-decode-archives/decode-index-query-replica-native-03",
+    "changes_from_old": "Qualified native RoPE/FP4 and native E4M3 activation codec replace old generic42/44-node producer; current parent13nodes.",
+    "forecast_credit_ms": 0
   }
 }
