@@ -322,6 +322,7 @@ class PreparedMoE(nn.Module):
         self.all_route_slots = False
         self.expert_streamed_sat = gaudi_envs.VLLM_HPU_DSV41_EXPERT_STREAMED_SAT
         self.expert_active_w2 = gaudi_envs.VLLM_HPU_DSV41_EXPERT_ACTIVE_W2
+        self.expert_shared_scale = gaudi_envs.VLLM_HPU_DSV41_EXPERT_SHARED_SCALE
         if self.expert_active_w2 and not self.expert_streamed_sat:
             raise ValueError("Active W2 requires the qualified streamed SAT parent")
         self.expert_w2_three_routes = gaudi_envs.VLLM_HPU_DSV41_EXPERT_W2_THREE_ROUTES
@@ -379,7 +380,7 @@ class PreparedMoE(nn.Module):
             source = projection.weight
             projection.weight = torch.empty(source.shape, dtype=source.dtype, device="meta")
 
-    def shared_expert(self, value, prequant=None):
+    def shared_expert(self, value, prequant=None, *, deferred_scale=False):
         shared = self.weights.shared_experts
         if self.shared_gate_up_channel is not None:
             q, sx = (torch.ops.custom_op.custom_deepseek_v41_dense_quant_gaudi2(value.contiguous())
@@ -391,6 +392,11 @@ class PreparedMoE(nn.Module):
             route = torch.ones((1, rows), dtype=torch.float32, device=value.device)
             middle, scale = torch.ops.custom_op.custom_deepseek_v41_shared_silu_quant_gaudi2(
                 product.reshape(rows, 1, -1), ids, sx, self.shared_gate_up_channel, route)
+            if deferred_scale:
+                product = torch.ops.hpu.fp8_gemm_v2(
+                    middle.reshape(rows, -1), False, self.shared_down_weight, True,
+                    None, torch.bfloat16, None, None, None, False)
+                return product, scale.reshape(rows, 1), shared.w2.channel_scale
             return torch.ops.hpu.fp8_gemm_v2(middle.reshape(rows, -1), False, self.shared_down_weight, True,
                                            None, torch.bfloat16, scale.reshape(rows, 1), shared.w2.channel_scale,
                                            None, False)
@@ -550,6 +556,11 @@ class PreparedMoE(nn.Module):
                         active_width = getattr(experts.w2_q16, "dsv41_active_k", None)
                         if active_width is None:
                             raise ValueError("Active W2 requires load-time zero-tail qualification")
+                        if isinstance(tile_shared, tuple):
+                            product, shared_scale, shared_channel = tile_shared
+                            return torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_shared_scale_sat_fp8_gaudi2(
+                                *operands, channel13, channel2, quantized, activation_scale,
+                                product, shared_scale, shared_channel, active_width, True)
                         return torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_active_k_sat_shared_fp8_gaudi2(
                             *operands, channel13, channel2, quantized, activation_scale, tile_shared,
                             active_width, True)
@@ -724,8 +735,12 @@ class PreparedMoE(nn.Module):
         # only its final FP32 addition and BF16 rounding move into the routed
         # compound node. Wider batches keep the common batch implementation.
         fused_shared = self.n256_fp8 and self.n256_fused_reduce and prequant is not None and value.shape[0] == 1
-        shared_out = (self.shared_expert(value) if shared_prequant is None
-                      else self.shared_expert(value, shared_prequant)) if fused_shared else None
+        deferred_shared_scale = (decode and fused_shared and self.expert_shared_scale and self.topk == 6
+                                 and self.expert_streamed_sat and self.expert_active_w2
+                                 and self.expert_w2_three_routes and self.shared_gate_up_channel is not None)
+        shared_out = (self.shared_expert(value, shared_prequant, deferred_scale=True)
+                      if deferred_shared_scale else
+                      self.shared_expert(value, shared_prequant)) if fused_shared else None
         if self.prefill_grouped and value.shape[0] > 6 and not ordinary_decode:
             from vllm_gaudi.ops.deepseek_v41_grouped_prefill import run_grouped_prefill
 

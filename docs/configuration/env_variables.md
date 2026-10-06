@@ -1114,3 +1114,11 @@ EOS. Their shape, checkpoint and state eligibility guards still apply. Explicit
 `0` values remain diagnostic disable controls. Unqualified alternatives, including
 linear-load control, BF16 control weights and register softmax,
 remain off. Replay, runner and peer-communication interfaces are unchanged.
+
+`VLLM_HPU_DSV41_EXPERT_SHARED_SCALE` defaults to `0`. This component-qualified
+candidate consumes the raw shared-expert BF16 down-projection and its FP32
+activation/channel scales inside the ordered routed-expert finalizer. It retains
+the scale-first BF16 rounding and shared/routed BF16 addition boundaries.
+It requires the existing C1 streamed SAT, active-W2 and three-route-W2 path with
+FP8 shared weights. Other batch and prefill paths retain their existing implementation.
+Keep it disabled until combined normal-serving acceptance.

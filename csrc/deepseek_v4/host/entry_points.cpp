@@ -15,6 +15,7 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVE
 ********************************************************************/
 
 #include "deepseek_v41_sampling_gaudi2.hpp"
+#include "deepseek_v41_expert_diagonal_shared_scale_gaudi2.hpp"
 #include "deepseek_v41_control_mme_finish_gaudi2.hpp"
 #include <cstring>
 #include <dlfcn.h>
@@ -240,6 +241,7 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_MLA_NORMALIZE,
     GAUDI2_KERNEL_DEEPSEEK_V41_DENSE_QUANT,
     GAUDI2_KERNEL_DEEPSEEK_V41_DENSE_SCALE,
+    GAUDI2_KERNEL_DEEPSEEK_V41_DIAGONAL_SHARED_SCALE,
     GAUDI2_KERNEL_DEEPSEEK_V41_DENSE_PAIR_SCALE,
     GAUDI2_KERNEL_DEEPSEEK_V41_ATTENTION_NORM,
     GAUDI2_KERNEL_DEEPSEEK_V41_FINAL_COLLAPSE_NORM,
@@ -565,6 +567,7 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_KV_NORM_REUSE_GATHER].name, DeepseekV41KvNormReuseGatherGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_DENSE_QUANT].name, DeepseekV41DenseGaudi2::quant_name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_DENSE_SCALE].name, DeepseekV41DenseGaudi2::scale_name);
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_DIAGONAL_SHARED_SCALE].name,DeepseekV41ExpertDiagonalSharedScaleGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_DENSE_PAIR_SCALE].name,
                 DeepseekV41DensePairScaleGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_WOA_QUANT].name, DeepseekV41WoaGaudi2::quant_name);
@@ -1091,6 +1094,8 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
         return DeepseekV41KVNormRopeGaudi2().GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41DenseGaudi2::quant_name) == 0)
         return DeepseekV41DenseGaudi2(true).GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name, DeepseekV41ExpertDiagonalSharedScaleGaudi2::name) == 0)
+        return DeepseekV41ExpertDiagonalSharedScaleGaudi2().GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41DenseGaudi2::scale_name) == 0)
         return DeepseekV41DenseGaudi2(false).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name,

@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE: bool = False
     VLLM_HPU_DSV41_EXPERT_STREAMED_SAT: bool = True
     VLLM_HPU_DSV41_EXPERT_ACTIVE_W2: bool = True
+    VLLM_HPU_DSV41_EXPERT_SHARED_SCALE: bool = False
     VLLM_HPU_DSV41_FFN_DUAL_QUANT: bool = True
     VLLM_HPU_DSV41_FFN_BF16_QUANT: bool = True
     VLLM_HPU_DSV41_INDEX_GAIN_REPLICA: bool = True
@@ -612,6 +613,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_INDEX_GAIN_REPLICA", "1").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_FFN_DUAL_QUANT":
     lambda: os.environ.get("VLLM_HPU_DSV41_FFN_DUAL_QUANT", "1").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_EXPERT_SHARED_SCALE": lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_SHARED_SCALE", "0") == "1",
     "VLLM_HPU_DSV41_EXPERT_ACTIVE_W2": lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_ACTIVE_W2", "1") == "1",
     "VLLM_HPU_DSV41_EXPERT_STREAMED_SAT":
     lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_STREAMED_SAT", "1").lower() in ("1", "true"),

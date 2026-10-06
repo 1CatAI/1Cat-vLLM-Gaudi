@@ -19,6 +19,10 @@ def main():
     parser.add_argument('--disable-tiny-bgemm',action='store_true',help='Cold compiler screen; the legacy setting has not fixed Gaudi2 batch slicing')
     parser.add_argument('--candidate-operator',choices=('paired','silu','groups3','streamed'),default='paired')
     parser.add_argument('--require-w13-prefetch', action='store_true')
+    parser.add_argument('--shared-down-finalize', action='store_true',
+                        help='Fuse shared down scales into the existing ordered routed finalizer')
+    parser.add_argument('--shared-down-fused', action='store_true',
+                        help='Keep the qualified MoE in both arms; fuse only shared W2 scale rounding')
     parser.add_argument('--dual-norm-quant', action='store_true')
     parser.add_argument('--trim-w2', action='store_true',
                         help='Preserve W13/padded amax, trim proved zero W2 K suffix to checkpoint width')
@@ -41,6 +45,12 @@ def main():
     if args.trim_w2 and not (args.dual_norm_quant and args.candidate_operator == 'streamed'
                             and args.baseline_operator == 'streamed'):
         parser.error('--trim-w2 requires the qualified streamed/dual parent in both arms')
+    if args.shared_down_fused and not args.shared_down_finalize:
+        parser.error('Standalone shared-down replacement is archived: parent compiler already fuses its scale')
+    if args.shared_down_finalize:
+        args.shared_down_fused = True
+    if args.shared_down_fused and not (args.quant_bf16 and args.trim_w2 and args.production_router):
+        parser.error('--shared-down-fused requires the complete qualified routed/shared parent')
     candidate_guid=('custom_deepseek_v41_expert_token_wide3_sat_fp8_gaudi2' if args.candidate_operator in ('groups3','pipeline3','plain_w13','sram_handoff','two_slice','unrolled','streamed','aligned','full_sram','pipeline_sram') else
                     'custom_deepseek_v41_expert_'+('paired_decode' if args.candidate_operator=='paired' else 'silu_decode')+'_fp8_gaudi2')
     if args.candidate_operator in ('unrolled', 'streamed', 'aligned', 'full_sram', 'pipeline_sram'):
@@ -158,12 +168,12 @@ def main():
         fixtures.append((collapsed, residual, post, comb, pre, ids, route))
     x, residual, post, comb, pre, ids, route = [tensor.to('hpu') for tensor in fixtures[0]]
     from vllm_gaudi.compilation.deepseek_v41_overlap import make_backend
-    compiled = lambda fn, candidate=False: torch.compile(fn, backend=make_backend(static_int32=True,static_factories=True,split_mhc=True,compiler_config=({'SYN_RMW_SECTION_MAX_SIZE_BYTES':'41943040'} if candidate and args.candidate_operator in ('full_sram', 'pipeline_sram') else {'NON_COMMON_DIM_MIN_SLICE_NUM_FOR_PIPELINING':'4'} if (candidate or args.quant_bf16) and args.candidate_operator in ('two_slice', 'unrolled', 'streamed', 'aligned', 'full_sram', 'pipeline_sram') else {'SYN_SRAM_BGEMM_SLICER_MULTIPLE_TINY_GEMMS_PER_SLICE':'false'} if candidate and args.disable_tiny_bgemm else None)), fullgraph=True, dynamic=False)
+    compiled = lambda fn, candidate=False: torch.compile(fn, backend=make_backend(static_int32=True,static_factories=True,split_mhc=True,compiler_config=({'SYN_RMW_SECTION_MAX_SIZE_BYTES':'41943040'} if candidate and args.candidate_operator in ('full_sram', 'pipeline_sram') else {'NON_COMMON_DIM_MIN_SLICE_NUM_FOR_PIPELINING':'4'} if (candidate or args.quant_bf16 or args.shared_down_fused) and args.candidate_operator in ('two_slice', 'unrolled', 'streamed', 'aligned', 'full_sram', 'pipeline_sram') else {'SYN_SRAM_BGEMM_SLICER_MULTIPLE_TINY_GEMMS_PER_SLICE':'false'} if candidate and args.disable_tiny_bgemm else None)), fullgraph=True, dynamic=False)
     image_mask = torch.zeros((1,), dtype=torch.bool, device='hpu')
     def produce(row, ids, route, q13,q2,s13,s2,lut,c13,c2,norm_weight,shared_weight,shared_channel,shared_down,shared_scale, *gate_weights, sat):
-        if (sat and args.dual_norm_quant) or args.quant_bf16:
+        if ((sat or args.shared_down_fused) and args.dual_norm_quant) or args.quant_bf16:
             norm_quant = (torch.ops.custom_op.custom_deepseek_v41_ffn_norm_dual_bf16_quant_gaudi2
-                          if sat and args.quant_bf16 else
+                          if (sat or args.shared_down_fused) and args.quant_bf16 else
                           torch.ops.custom_op.custom_deepseek_v41_ffn_norm_dual_quant_gaudi2)
             normalized, quantized, activation_scale, q, sx = norm_quant(
                 row, norm_weight, 1e-20)
@@ -181,25 +191,37 @@ def main():
         shared_route=torch.ones((1,1),dtype=torch.float32,device=row.device)
         middle,shared_sx=torch.ops.custom_op.custom_deepseek_v41_shared_silu_quant_gaudi2(
             product.reshape(1,1,-1),shared_ids,sx,shared_channel,shared_route)
-        shared=torch.ops.hpu.fp8_gemm_v2(middle.reshape(1,-1),False,shared_down,True,None,torch.bfloat16,
-            shared_sx.reshape(1,1),shared_scale,None,False)
+        if sat and args.shared_down_finalize:
+            shared=torch.ops.hpu.fp8_gemm_v2(middle.reshape(1,-1),False,shared_down,True,None,
+                torch.bfloat16,None,None,None,False)
+        else:
+            shared=torch.ops.hpu.fp8_gemm_v2(middle.reshape(1,-1),False,shared_down,True,None,torch.bfloat16,
+                shared_sx.reshape(1,1),shared_scale,None,False)
         kind = args.candidate_operator if sat else args.baseline_operator
         names = dict(paired='paired_decode_shared', silu='silu_decode_shared',
                      groups3='two_group_w2_sat_shared', pipeline3='pipeline3_sat_shared', plain_w13='plain_w13_sat_shared', sram_handoff='sram_handoff_sat_shared', two_slice='two_slice_sat_shared', unrolled='unrolled_sat_shared', streamed='streamed_sat_shared', aligned='aligned_sat_shared', full_sram='full_sram_sat_shared', pipeline_sram='pipeline_sram_sat_shared',
                      legacy='prequant_direct_finalize_shared_prefetch_w2')
         op = getattr(torch.ops.custom_op, 'custom_deepseek_v41_expert_n256_moe_'+names[kind]+'_fp8_gaudi2')
-        if args.trim_w2 and sat:
+        if sat and args.shared_down_finalize:
+            return torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_shared_scale_sat_fp8_gaudi2(
+                normalized,ids,route,q13,q2,s13,s2,lut,c13,c2,quantized,activation_scale,
+                shared,shared_sx.reshape(1,1),shared_scale,active_width,True)
+        if args.trim_w2 and (sat or args.shared_down_fused):
             return torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_active_k_sat_shared_fp8_gaudi2(
                 normalized,ids,route,q13,q2,s13,s2,lut,c13,c2,quantized,activation_scale,shared,active_width,True)
         return op(normalized,ids,route,q13,q2,s13,s2,lut,c13,c2,quantized,activation_scale,shared,True)
     producers = [compiled(lambda row, ids, route, *weights, sat=sat:
                           produce(row,ids,route,*weights,sat=sat),candidate=sat) for sat in (False, True)]
     def consume(peers, r,p,c,n,norm_weight):
-        value = peers[0].float()
-        for index in range(1,4):
-            value = value + peers[index].float()
+        if args.shared_down_fused:
+            value = peers
+        else:
+            value = peers[0].float()
+            for index in range(1,4):
+                value = value + peers[index].float()
+            value = value.bfloat16()
         updated,collapsed = torch.ops.custom_op.custom_deepseek_v41_mhc_post_collapse_gaudi2(
-            value.bfloat16(),r,p,c,n)
+            value,r,p,c,n)
         normalized,quantized,activation_scale = torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
             collapsed,norm_weight,1e-20)
         return updated,collapsed,normalized,quantized,activation_scale
@@ -218,6 +240,12 @@ def main():
             torch.hpu.synchronize()
     physical=[audit(p) for p in (root/'graphs'/f'rank{rank}').rglob('*PostGraph-symbol.pbtxt')]
     def classify(entries):
+        if args.shared_down_fused:
+            producers=[g for g in entries if g['operations'].get(
+                'custom_deepseek_v41_expert_n256_silu_active_k_quant_gaudi2')]
+            fused=lambda g:g['operations'].get('custom_deepseek_v41_expert_diagonal_shared_scale_gaudi2'
+                if args.shared_down_finalize else 'custom_deepseek_v41_shared_down_scale_gaudi2')
+            return ([g for g in producers if not fused(g)],[g for g in producers if fused(g)])
         if args.trim_w2:
             tagged = lambda g: g['operations'].get('custom_deepseek_v41_expert_n256_silu_active_k_quant_gaudi2')
             return ([g for g in entries if g['operations'].get('custom_deepseek_v41_expert_token_wide6_unroll_sat_fp8_gaudi2') and not tagged(g)],
@@ -285,7 +313,10 @@ def main():
                        node['weight']['shape'][-2] == 5120]
         up_activation_sram = bool(up_matrices) and all(
             node['output']['location'] == 'SRAM' for node in up_matrices)
-        local_gate = (local_gate and sram_gate and prefetch_gate and
+        node_gate = (not args.shared_down_fused or
+                     bool(reference and candidate) and min(p['physical_nodes'] for p in candidate)
+                     <= min(p['physical_nodes'] for p in reference)-(1 if args.shared_down_finalize else 2))
+        local_gate = (local_gate and sram_gate and prefetch_gate and node_gate and
                       (not args.require_up_activation_sram or up_activation_sram))
         (directory/'compile_gate.json').write_text(json.dumps(dict(
             passed=local_gate, sram_and_w13_gate=sram_gate, up_activation_sram=up_activation_sram,
@@ -414,7 +445,7 @@ def main():
                       three_consistent_rounds=bool(savings) and all(value > 0 for value in savings),
                       full_model_gain_credit=False, physical_node_gate_pending=False, pipeline_slice_policy=4, layers=args.layers, selected_experts=384 if args.production_router else 12,
                       production_router=args.production_router, dual_norm_quant=args.dual_norm_quant, quant_bf16=args.quant_bf16, trim_w2=args.trim_w2, active_width=active_width,
-                      input_source=__doc__, baseline_operator=args.baseline_operator, candidate_operator=args.candidate_operator, native_replay=True, chain_repeats=args.chain_repeats, production_shared_expert=True,
+                      input_source=__doc__, baseline_operator=args.baseline_operator, candidate_operator=args.candidate_operator, native_replay=True, chain_repeats=args.chain_repeats, production_shared_expert=True, shared_down_fused=args.shared_down_fused, shared_down_finalize=args.shared_down_finalize,
                       native_library_sha256=hashlib.sha256(Path(os.environ['VLLM_HPU_DSV4_TPC_OP_LIBRARY']).read_bytes()).hexdigest())
         (directory/'result.json').write_text(json.dumps(result, indent=2)+'\n')
         if rank == 0:

@@ -14,6 +14,9 @@ void main(tensor product,
           tensor ids, tensor activation_scale, tensor channel,
 #if DSV41_SHARED_FINALIZE
           tensor shared,
+#if defined(DSV41_SCALED_SHARED)
+          tensor shared_channel, tensor shared_activation_scale,
+#endif
 #endif
           tensor output)
 {
@@ -73,7 +76,15 @@ void main(tensor product,
         const bfloat128 routed = v_convert_f32_to_bf16_all_b(accumulated, SW_RHNE);
 #if DSV41_SHARED_FINALIZE
         float128 value = v_convert_bf16_to_f32_all_b(routed);
-        const float128 shared_value = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_b((int5){n, token}, shared));
+        bfloat128 shared_row = v_bf16_ld_tnsr_b((int5){n, token}, shared);
+#if defined(DSV41_SCALED_SHARED)
+        const float shared_sx=s_f32_ld_g(gen_addr((int5){0,token},shared_activation_scale));
+        float128 combined_scale;
+        combined_scale.v1=v_f32_ld_tnsr_b((int5){n,0},shared_channel)*shared_sx;
+        combined_scale.v2=v_f32_ld_tnsr_b((int5){n+64,0},shared_channel)*shared_sx;
+        shared_row=shared_row*convert_float128_to_bfloat128(combined_scale,SW_RHNE|SW_LINEAR);
+#endif
+        const float128 shared_value = v_convert_bf16_to_f32_all_b(shared_row);
         value.v1 += shared_value.v1;
         value.v2 += shared_value.v2;
         v_bf16_st_tnsr((int5){n, 0, token}, output, v_convert_f32_to_bf16_all_b(value, SW_RHNE));
