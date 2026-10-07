@@ -414,7 +414,8 @@ struct ReceiveEpochApis {
  using Replay=hcclResult_t(*)(void*,const SyncInfo*,const SyncInfo*,size_t,SyncInfo*);
  using Callback=int(*)(void*,const SyncInfo*,const SyncInfo*,uint64_t,SyncInfo*);
  using Prepare=synStatus(*)(void*,const uint32_t*,const uint32_t*,uint64_t,uint32_t,Callback,void*);
- Enable enable=nullptr;Replay replay=nullptr;Prepare prepare=nullptr;
+ using PrepareSegmented=synStatus(*)(void*,const uint32_t*,const uint32_t*,uint64_t,uint64_t,uint32_t,uint32_t,Callback,void*);
+ Enable enable=nullptr;Replay replay=nullptr;Prepare prepare=nullptr;PrepareSegmented prepare_segmented=nullptr;
  ReceiveEpochApis(){
   auto resolve=[](const char* name){
     auto* address=dlsym(RTLD_DEFAULT,name);
@@ -422,12 +423,13 @@ struct ReceiveEpochApis {
     return address;
   };
   using Version=uint32_t(*)();
-  TORCH_CHECK(reinterpret_cast<Version>(resolve("hcclTpNativeReceiveEpochVersion"))()==1 &&
-              reinterpret_cast<Version>(resolve("synNativeComputeGraphEpochPlanVersion"))()==1,
+  TORCH_CHECK(reinterpret_cast<Version>(resolve("hcclTpNativeReceiveEpochVersion"))()==2 &&
+              reinterpret_cast<Version>(resolve("synNativeComputeGraphEpochPlanVersion"))()==2,
               "Receive epoch ABI mismatch");
   enable=reinterpret_cast<Enable>(resolve("hcclTpNativeGraphEnableReceivePrepostV1"));
-  replay=reinterpret_cast<Replay>(resolve("hcclTpNativeBatchReplayReceiveEpochV1"));
+  replay=reinterpret_cast<Replay>(resolve("hcclTpNativeBatchReplayReceiveEpochV2"));
   prepare=reinterpret_cast<Prepare>(resolve("synNativeComputeGraphPrepareEpochPlanV1"));
+  prepare_segmented=reinterpret_cast<PrepareSegmented>(resolve("synNativeComputeGraphPrepareSegmentedEpochPlanV2"));
  }
  static ReceiveEpochApis& get(){static ReceiveEpochApis result;return result;}
 };
@@ -1054,8 +1056,8 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
         }
       prepared_dependencies_ = prepareNativeDependencies(bindings);
       if(preposted_receives_){
-        TORCH_CHECK(!external_prefix_ && !bounded_tiles_ && !segmentedPrefixConfigured(),
-                    "Receive prepost requires a complete explicit dependency plan");
+        TORCH_CHECK(!external_prefix_ && !bounded_tiles_,
+                    "Receive prepost requires a complete explicit dependency plan without bounded tiles");
         validateReceiveEpochBindings(bindings,prepared_dependencies_);
       }
       if (segmentedPrefixConfigured()) {
@@ -1287,7 +1289,16 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
                     "hcclTp2NativeBatchCreate(decoder) failed");
         HclGraphInfo last;
         TORCH_CHECK(api.hcl_get_info(hcl_graphs_.back(), &last) == hcclSuccess, "HCL batch completion unavailable");
-        if(preposted_receives_){
+        if(preposted_receives_ && segmentedPrefixConfigured()){
+          TORCH_CHECK(prepared_producers_.size() == hcl_graphs_.size(), "Receive epoch dependency coverage differs");
+          api.requireSegmentedPlan();
+          TORCH_CHECK(api.hcl_batch_configure_split(hcl_batch_, input_prefix_.collectives) == hcclSuccess,
+                      "hcclTp2NativeBatchConfigureSplit(receive epoch) failed");
+          checkSynapse(ReceiveEpochApis::get().prepare_segmented(
+              syn_graph_, prepared_producers_.data(), prepared_consumers_.data(), prepared_consumers_.size(),
+              input_prefix_.collectives, input_prefix_.computes, last.completion.longSoIndex,
+              replayReceiveEpoch, hcl_batch_), "synNativeComputeGraphPrepareSegmentedEpochPlanV2(decoder)");
+        } else if(preposted_receives_){
           checkSynapse(ReceiveEpochApis::get().prepare(syn_graph_,prepared_producers_.data(),prepared_consumers_.data(),
             prepared_consumers_.size(),last.completion.longSoIndex,replayReceiveEpoch,hcl_batch_),
             "synNativeComputeGraphPrepareEpochPlanV1(decoder)");

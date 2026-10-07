@@ -27,7 +27,43 @@
          for (size_t n = 0; n < plan.completions.size(); ++n)
              if (plan.completions[n].longSoIndex != plan.nicLongSoIndex || !plan.completions[n].targetValue ||
                  plan.completions[n].targetValue >= (uint64_t(1) << 60) ||
-@@ -1546,3 +1555,19 @@
+@@ -535,9 +544,12 @@
+         for (size_t n = 0; n < plan.collectiveSplit; ++n)
+             plan.producers[n] = {uint32_t(base.m_index), base.m_targetValue + plan.program.producerOffsets[n]};
+         ++plan.statistics[11];
+-        if (plan.callback(plan.context, plan.producers.data(), plan.collectiveSplit,
+-                          plan.completions.data()) != 0)
+-            return fail();
++        const synNativeGraphSyncInfo epoch{uint32_t(base.m_index), base.m_targetValue};
++        const int status = plan.epochCallback
++            ? plan.epochCallback(plan.context, &epoch, plan.producers.data(), plan.collectiveSplit,
++                                 plan.completions.data())
++            : plan.callback(plan.context, plan.producers.data(), plan.collectiveSplit, plan.completions.data());
++        if (status != 0) return fail();
+         for (size_t n = 0; n < plan.collectiveSplit; ++n)
+             if (plan.completions[n].longSoIndex != plan.nicLongSoIndex ||
+                 !plan.completions[n].targetValue || plan.completions[n].targetValue >= (uint64_t(1) << 60) ||
+@@ -591,10 +603,15 @@
+                                      NativeComputeProgram::continuationProducerOffset(
+                                          plan.program.producerOffsets[n], plan.prefixProgram.completionDelta)};
+         ++plan.statistics[11];
+-        if (plan.callback(plan.context, plan.producers.data() + plan.collectiveSplit,
+-                          plan.producers.size() - plan.collectiveSplit,
+-                          plan.completions.data() + plan.collectiveSplit) != 0)
+-            return fail();
++        const synNativeGraphSyncInfo epoch{uint32_t(suffixBase.m_index), suffixBase.m_targetValue};
++        const int status = plan.epochCallback
++            ? plan.epochCallback(plan.context, &epoch, plan.producers.data() + plan.collectiveSplit,
++                                 plan.producers.size() - plan.collectiveSplit,
++                                 plan.completions.data() + plan.collectiveSplit)
++            : plan.callback(plan.context, plan.producers.data() + plan.collectiveSplit,
++                            plan.producers.size() - plan.collectiveSplit,
++                            plan.completions.data() + plan.collectiveSplit);
++        if (status != 0) return fail();
+         for (size_t n = plan.collectiveSplit; n < plan.completions.size(); ++n)
+             if (plan.completions[n].longSoIndex != plan.nicLongSoIndex ||
+                 !plan.completions[n].targetValue || plan.completions[n].targetValue >= (uint64_t(1) << 60) ||
+@@ -1546,3 +1563,41 @@
  
      return set;
  }
@@ -46,7 +82,29 @@
 + handle->preparedReplayJob=std::make_unique<NativeComputeReplayJob>(*handle,NativeComputeReplayJob::Part::Full);
 + return synSuccess;
 +}
-+extern "C" uint32_t SYN_API_CALL synNativeComputeGraphEpochPlanVersion(){return 1;}
++extern "C" uint32_t SYN_API_CALL synNativeComputeGraphEpochPlanVersion(){return 2;}
++
++extern "C" synStatus SYN_API_CALL synNativeComputeGraphPrepareSegmentedEpochPlanV2(
++    synNativeComputeGraphHandle handle, const uint32_t* producers, const uint32_t* consumers,
++    uint64_t count, uint64_t prefixCollectives, uint32_t prefixComputes, uint32_t nicIndex,
++    NativeComputeGraph::EpochExchangeReplay callback, void* context)
++{
++    if (!callback || !producers || !handle || !handle->queue || !handle->graph || !handle->stream)
++        return synInvalidArgument;
++    std::lock_guard<std::mutex> lock(handle->replayMutex);
++    if (handle->preparedReplayJob || handle->preparedPrefixReplayJob || handle->preparedFinishReplayJob)
++        return synInvalidArgument;
++    auto unused = [](void*, const synNativeGraphSyncInfo*, uint64_t, synNativeGraphSyncInfo*) -> int { return -1; };
++    auto status = handle->queue->prepareSegmentedNativeComputePlan(
++        *handle->graph, producers, consumers, count, prefixCollectives, prefixComputes, nicIndex, unused, context);
++    if (status != synSuccess) return status;
++    status = handle->graph->configureEpochCallback(callback);
++    if (status != synSuccess) return status;
++    handle->preparedReplayJob = std::make_unique<NativeComputeReplayJob>(*handle, NativeComputeReplayJob::Part::Full);
++    handle->preparedPrefixReplayJob = std::make_unique<NativeComputeReplayJob>(*handle, NativeComputeReplayJob::Part::Prefix);
++    handle->preparedFinishReplayJob = std::make_unique<NativeComputeReplayJob>(*handle, NativeComputeReplayJob::Part::Finish);
++    return synSuccess;
++}
 --- a/src/runtime/scal/common/native_compute_graph.hpp
 +++ b/src/runtime/scal/common/native_compute_graph.hpp
 @@ -59,6 +59,8 @@

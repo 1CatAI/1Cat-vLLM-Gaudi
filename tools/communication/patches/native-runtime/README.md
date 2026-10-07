@@ -54,11 +54,14 @@ wait on the explicit previous compute epoch. Capture rejects reused receive
 destinations or reads/writes before the first consumer.
 
 `VLLM_HPU_NATIVE_RECEIVE_PREPOST` remains disabled by default. Its current
-contract is a complete unsegmented standalone BF16 AllGather plan, including
-the compiled peer reduction and downstream consumers. Partial, bounded and
-segmented plans are rejected; TP2 and DSpark/batched serving have not been
-qualified. Complete-chain microbenchmark qualification does not establish
-full-model performance or a release default.
+contract uses standalone BF16 AllGather, including the compiled peer reduction
+and downstream consumers. Epoch ABI v2 also supports the existing Engram input
+split: prefix and suffix receives use their respective compute epochs and
+original phase tables. Send dependencies and full NIC retirement are retained.
+Partial and bounded plans are rejected. The segmented option, TP2 and
+DSpark/batched serving remain unqualified until their complete-chain gates
+pass. Microbenchmark qualification does not establish full-model performance
+or a release default.
 
 Build HCL with its bundled dependencies and SDK development libraries. Set
 `HCL_SRC_PKG_DIR` to its checkout and `HCL_LIB_DIR` to the SDK library directory;

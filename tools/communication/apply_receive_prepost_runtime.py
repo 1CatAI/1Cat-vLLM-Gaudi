@@ -27,7 +27,8 @@ def main():
         raise RuntimeError("Receive overlay differs from its manifest")
     source = args.source.resolve()
     for name, hashes in entry["files"].items():
-        if digest(source / name) != hashes["before"]:
+        current = digest(source / name) if (source / name).is_file() else None
+        if current != hashes["before"]:
             raise RuntimeError(f"Unmatched receive-overlay parent: {name}")
     subprocess.run(["git", "apply", "--check", str(patch)], cwd=source, check=True)
     if args.apply:

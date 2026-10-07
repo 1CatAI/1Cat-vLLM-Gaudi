@@ -1,6 +1,11 @@
 --- a/hcl/src/hccl/hccl.cpp
 +++ b/hcl/src/hccl/hccl.cpp
-@@ -101,6 +101,7 @@
+@@ -1,3 +1,4 @@
++#include "native_receive_epoch_window.h"
+ /******************************************************************************
+  * Copyright (C) 2020-2021 Habana Labs, Ltd. an Intel Company
+  * All Rights Reserved.
+@@ -101,6 +102,7 @@
      uint64_t                                        preparedReplayCount = 0;
      uint64_t                                        nativeReplayCount = 0;
      uint64_t                                        nativeWrapReplayCount = 0;
@@ -8,7 +13,7 @@
      bool                                            nativeRelocationsValidated = false;
      bool                                            batchOwned = false;
      uint64_t                                        completionRingSize = 0;
-@@ -1728,6 +1729,27 @@
+@@ -1728,6 +1730,27 @@
                               hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_ADDRESS));
              std::fflush(stderr);
          }
@@ -36,7 +41,7 @@
          graphHandle->state = hcclTp2NativeGraphInstantiated;
          return hcclSuccess;
      }
-@@ -1835,7 +1857,7 @@
+@@ -1835,7 +1858,7 @@
                                                 hcclTp2NativeSyncInfo*       completion,
                                                 bool                         submit)
  {
@@ -45,7 +50,7 @@
          graphHandle->replayPath == InternalHcclTp2NativeGraph::ReplayPath::Prepared)
      {
          return hcclInvalidUsage;
-@@ -2125,6 +2147,8 @@
+@@ -2125,6 +2148,8 @@
      if (!batch || count != batch->graphs.size()) return hcclInvalidArgument;
      std::lock_guard<std::mutex> lock(batch->mutex);
      if (batch->segmentedActive) return hcclInvalidUsage;
@@ -54,7 +59,16 @@
      return replayNativeBatchRangeLocked(*batch, 0, batch->phases, dependencies, count, completions);
  }
  
-@@ -2192,3 +2216,27 @@
+@@ -2157,6 +2182,8 @@
+     if (!batch || !dependencies || !completions) return hcclInvalidArgument;
+     std::lock_guard<std::mutex> lock(batch->mutex);
+     if (!batch->valid || !batch->split) return hcclInvalidUsage;
++    if (std::any_of(batch->graphs.begin(), batch->graphs.end(),
++                    [](auto graph) { return graph->prepostedReceives; })) return hcclInvalidUsage;
+     if (!batch->segmentedActive)
+     {
+         if (count == batch->graphs.size())
+@@ -2192,3 +2219,42 @@
      delete batch;
      return hcclSuccess;
  }
@@ -66,22 +80,37 @@
 +    graph->params.m_dataType!=hcclBfloat16)return hcclInvalidUsage;
 + graph->prepostedReceives=true;return hcclSuccess;
 +}
-+extern "C" hcclResult_t HCCL_API_CALL hcclTpNativeBatchReplayReceiveEpochV1(hcclTp2NativeBatchHandle batch,
-+ const hcclTp2NativeSyncInfo* epoch,const hcclTp2NativeSyncInfo* dependencies,size_t count,
-+ hcclTp2NativeSyncInfo* completions){
-+ if(!batch || !epoch || !dependencies || !completions || count!=batch->graphs.size() ||
-+    !epoch->targetValue || epoch->targetValue>=(uint64_t(1)<<60))return hcclInvalidArgument;
-+ std::lock_guard<std::mutex> lock(batch->mutex);
-+ if(!batch->valid || batch->split || batch->segmentedActive)return hcclInvalidUsage;
-+ for(size_t node=0;node<count;++node){
-+  if(!batch->graphs[node]->prepostedReceives || dependencies[node].longSoIndex!=epoch->longSoIndex ||
-+     dependencies[node].targetValue<epoch->targetValue)return hcclInvalidUsage;
-+  batch->states[node].values[static_cast<size_t>(hcl::NativeHclRelocationKind::RECEIVE_EPOCH_TARGET)]=epoch->targetValue;
-+  batch->states[node].values[static_cast<size_t>(hcl::NativeHclRelocationKind::RECEIVE_EPOCH_LONG_SO_INDEX)]=epoch->longSoIndex;
-+ }
-+ return replayNativeBatchRangeLocked(*batch,0,batch->phases,dependencies,count,completions);
++extern "C" hcclResult_t HCCL_API_CALL hcclTpNativeBatchReplayReceiveEpochV2(
++    hcclTp2NativeBatchHandle batch, const hcclTp2NativeSyncInfo* epoch,
++    const hcclTp2NativeSyncInfo* dependencies, size_t count, hcclTp2NativeSyncInfo* completions)
++{
++    if (!batch || !epoch || !dependencies || !completions || !epoch->targetValue ||
++        epoch->targetValue >= (uint64_t(1) << 60) || epoch->longSoIndex % 8 ||
++        (epoch->longSoIndex >> 3) > 0xff) return hcclInvalidArgument;
++    std::lock_guard<std::mutex> lock(batch->mutex);
++    if (!batch->valid) return hcclInvalidUsage;
++    try {
++        const auto window = hcl::NativeReceiveEpochWindow::prepare(
++            batch->graphs.size(), batch->split, batch->segmentedActive, count);
++        for (size_t node = 0; node < count; ++node) {
++            if (!batch->graphs[window.offset + node]->prepostedReceives ||
++                dependencies[node].longSoIndex != epoch->longSoIndex ||
++                dependencies[node].targetValue < epoch->targetValue ||
++                dependencies[node].targetValue >= (uint64_t(1) << 60)) return hcclInvalidUsage;
++        }
++        for (size_t node = 0; node < count; ++node) {
++            auto& values = batch->states[window.offset + node].values;
++            values[static_cast<size_t>(hcl::NativeHclRelocationKind::RECEIVE_EPOCH_TARGET)] = epoch->targetValue;
++            values[static_cast<size_t>(hcl::NativeHclRelocationKind::RECEIVE_EPOCH_LONG_SO_INDEX)] = epoch->longSoIndex;
++        }
++        const auto& phases = window.part == hcl::NativeReceiveEpochWindow::Part::Full ? batch->phases
++            : window.part == hcl::NativeReceiveEpochWindow::Part::Prefix ? batch->prefixPhases : batch->suffixPhases;
++        const auto result = replayNativeBatchRangeLocked(*batch, window.offset, phases, dependencies, count, completions);
++        if (result == hcclSuccess) batch->segmentedActive = window.nextActive;
++        return result;
++    } catch (const std::invalid_argument&) { return hcclInvalidArgument; }
 +}
-+extern "C" HCCL_API_CALL uint32_t hcclTpNativeReceiveEpochVersion(){return 1;}
++extern "C" HCCL_API_CALL uint32_t hcclTpNativeReceiveEpochVersion(){return 2;}
 --- a/hcl/src/infra/scal/gen2_arch_common/native_hcl_relocation.h
 +++ b/hcl/src/infra/scal/gen2_arch_common/native_hcl_relocation.h
 @@ -43,6 +43,8 @@
@@ -93,3 +122,34 @@
      COUNT
  };
  
+--- /dev/null
++++ b/hcl/src/hccl/native_receive_epoch_window.h
+@@ -0,0 +1,28 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include <cstddef>
++#include <stdexcept>
++
++namespace hcl {
++struct NativeReceiveEpochWindow {
++    enum class Part { Full, Prefix, Suffix };
++    Part part;
++    size_t offset;
++    bool nextActive;
++    static NativeReceiveEpochWindow prepare(size_t total, size_t split, bool active, size_t count) {
++        if (!total || !count || count > total || split >= total)
++            throw std::invalid_argument("Invalid receive epoch range");
++        if (!split) {
++            if (active || count != total) throw std::invalid_argument("Invalid full receive epoch");
++            return {Part::Full, 0, false};
++        }
++        if (!active) {
++            if (count == total) return {Part::Full, 0, false};
++            if (count == split) return {Part::Prefix, 0, true};
++        } else if (count == total - split) {
++            return {Part::Suffix, split, false};
++        }
++        throw std::invalid_argument("Receive epoch range is out of sequence");
++    }
++};
++}

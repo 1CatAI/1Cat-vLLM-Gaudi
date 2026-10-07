@@ -54,7 +54,9 @@ are in progress.
 path for a complete V4.1 native replay plan. It requires matching versioned HCL,
 Synapse and Bridge overlays, independent receive destinations, and standalone
 BF16 AllGather communication. The capture checks reject early buffer aliases,
-partial, bounded and segmented plans. SEND and local-copy producer dependencies
+partial and bounded plans. Epoch ABI v2 preserves the Engram prefix/suffix
+split by binding receives to each part's actual compute epoch; that production
+integration is still under qualification. SEND and local-copy producer dependencies
 and full communication retirement remain intact. Default `0`; only the C1
 complete-chain microbenchmark is qualified. Full serving, TP2 and DSpark/batched
 qualification remain pending. See the optional overlay instructions in

@@ -1435,3 +1435,7 @@ The accepted formal baseline remains **8.239257597 ms/token**. Compatible
 pending savings: **0.137452500 ms/token**, one item. Evidence: SSD
 `decode-receive-prepost-01/chain-02/DECISION.json`. The cold missing-export failure
 is retained separately and supplies no gain. All owned modules retired to768MiB.
+
+### 2026-10-07 — receive-prepost production segmented replay gate
+
+The same optional epoch runtime now retains the actual Engram prefix/suffix plans. Five checkpoint-derived continuation inputs × four ranks preserve token IDs, hidden bytes and33 state tensors. Native200-step ABABAB saves **0.063748 / 0.078593 / 0.113867ms per16-layer step**; A median3.6146745, B3.5440835. No hot compilation or profiler. Conservatively using the campaign's ×1.5 mapping gives **0.117889500ms/token forecast**, replacing the earlier standalone0.137452500 estimate; do not add both. Only one compatible pending item, `VLLM_HPU_NATIVE_RECEIVE_PREPOST=0`. TP2/DSpark/B>1 and full-serving remain unqualified. Official formal baseline **8.239257597ms/token**, target7 unmet. Evidence SSD `decode-receive-prepost-real16-04/DECISION.json`; original cold failures retained.
