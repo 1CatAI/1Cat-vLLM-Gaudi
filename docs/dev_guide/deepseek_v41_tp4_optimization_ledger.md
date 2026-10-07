@@ -1464,3 +1464,21 @@ Gaudi2 recvScaleUp没有EDMA命令；发布在sendScaleUp，所有SEND/Full退�
 候选仍是私有原型、默认关闭；当前明确排斥segmented Engram/receive-prepost，
 **此项单列，不能加进上方0.118749500的兼容组合累计**。下一步共用16层入口和组合状态验证。
 没有新的正式请求、trace或默认提升，目标7ms仍未完成。
+
+同项接入版更新：chain12增加冷预热admission控制，5组四卡64边界/13端点逐位一致，
+三轮每边界减少0.004817813、0.003010242、0.004424773ms，40个FFN位置最新预估
+**0.176990938ms/token**，替代上方0.129735938，不能相加。code0、四卡768MiB。
+控制只在冷准备与原生录制交接时更新，原生图禁止写入该常量；每步无H2D/event。
+HCL_NATIVE_RX_READY只申请冷资源，A没有request/relay，不给A人为添加就绪等待。
+共用stage源码与8192个分段计划CPU用例已接上，real16-01将比较E与E＋首读获取，
+组合尚未通过，兼容累计仍不增加。正式基线8.239257597不变。
+
+## 2026-10-07：全加速组合正式验收（候选保持关闭）
+
+用户明确解除本轮端到端延后，独立安装组合 serving07 的全部已验收路径、receive epoch preposting 与40个FFN首读memory-ready。完整预热、512K/C16384/前缀缓存开、T=1/top_p=.95/seed42，同一个16K未命中样本一次无profiler正式请求。
+
+实测 **8.205229343 ms/token**，父版本8.239257597，差0.034028255；组合预估0.294880438，兑现11.54%，不足一半。因此不提升新候选默认值，不将两项组件估算宣布为端到端收益，正式默认基线暂保留8.239257597。2365 token自然EOS，14事实通过；token、正文、思考内容与父版本完全一致。未命中prefill5527.309tokens/s，仅记录本次结果，不声称恢复prefill目标。微小PV转换仍未集成，未计入本次组合。
+
+证据 SSD `decode-full-acceleration-serving-08/startup-07/{formal/result.json,QUALITY.json,formal/reference-equality.json,DECISION.json}`。伴随trace已捕获，解析中；新的TPC内轮询占用必须与有效计算区分。0/1/4/5、CPU56/61/84/89，正式前另一组四卡全部768MiB，CPU PSI0。退出超过初始清理超时，随后按原PID/start-time核对所有自有worker消失并确认四卡768MiB。首次到第六次启动失败均发生在正式请求前，详情在同案STARTUP_STATUS.md；不计为性能测量。
+
+同次伴随trace已完成：四卡相同24位置，rank0周期8.132346，TPC/MME并集5.878611（含标志轮询），非计算2.253735；四卡周期8.132–8.139。父trace活动并集5.820637、非计算2.362538：空闲减少0.108803，但活动增加0.057975，净周期仅减少0.050828。TPC→TPC空隙约少0.24ms、通信相邻约多0.10ms，未完成逐GUID成因归属。匿名recipe/重叠预提交尚无可靠逐通信点跨rank映射，不用周期差冒充错位。完整报告同案startup-07/REPORT.md；不再累计这两项未经兑现的预估。

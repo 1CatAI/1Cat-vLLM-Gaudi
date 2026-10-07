@@ -277,7 +277,14 @@ class StageVariant(torch.nn.Module):
         self.compiled = CompiledStage(
             program, native=True, pp_wire_input=self.wire_input, fused_text_io=fused_text_io,
             native_input=native_input, replay_tail=self.tail_enabled,
+            memory_ready=getattr(program, "native_memory_ready", False) and positions.numel() == 1,
         )
+        self.memory_ready = getattr(self.compiled, "memory_ready", False)
+        self.memory_ready_status = None
+        self.memory_ready_enabled = (torch.zeros(32, dtype=torch.int32, device=positions.device)
+                                     if self.memory_ready else None)
+        self.memory_ready_ones = (torch.ones(32, dtype=torch.int32, device=positions.device)
+                                 if self.memory_ready else None)
         self.fixed = tuple(
             value.clone() if value is not None else None for value in (hidden, pre_mix, positions, input_ids)
         )
@@ -341,6 +348,10 @@ class StageVariant(torch.nn.Module):
         outputs = replay_native_decoder(self, **roots)
         if outputs is not None:
             return self.publish_outputs(outputs)
+        if self.memory_ready:
+            # Only uncaptured preparation uses stock Full waits without flag publication.
+            self.memory_ready_enabled.fill_(0)
+            torch.hpu.synchronize()
         for destination, source in zip(self.fixed, (hidden, pre_mix, positions, input_ids), strict=True):
             if destination is not None:
                 destination.copy_(source)
@@ -376,16 +387,29 @@ class StageVariant(torch.nn.Module):
             owner=self, adapter=self.adapter, snapshot=self.snapshot, **fixed_roots
         ) as context:
             shared_coordinates = None
-            chunks = self.compiled.coordinate_chunks if self.compiled.shared_coordinates else self.compiled.chunks
+            memory_ready_root = None
+            memory_valid = None
+            memory_statuses = []
+            chunks = (self.compiled.memory_ready_chunks if self.memory_ready else self.compiled.coordinate_chunks
+                      if self.compiled.shared_coordinates else self.compiled.chunks)
             for index, chunk in enumerate(chunks):
                 context["group_index"] = index
-                if self.compiled.shared_coordinates:
+                if self.memory_ready:
+                    values, memory_ready_root, status, memory_valid = chunk(
+                        fixed_hidden, fixed_pre, fixed_positions, fixed_ids, self.engram, memory_ready_root,
+                        self.memory_ready_enabled, memory_valid)
+                    memory_statuses.append(status)
+                elif self.compiled.shared_coordinates:
                     values, shared_coordinates = chunk(fixed_hidden, fixed_pre, fixed_positions, fixed_ids,
                                                        self.engram, shared_coordinates)
                 else:
                     values = chunk(fixed_hidden, fixed_pre, fixed_positions, fixed_ids, self.engram)
                 fixed_hidden, fixed_pre, aux = values[:3]
             outputs = values if self.tail_enabled else (fixed_hidden, fixed_pre, aux)
+            if self.memory_ready:
+                # Retain component status roots; serving also propagates their
+                # device reduction into the existing token certificate.
+                self.memory_ready_status = tuple(memory_statuses)
             record_native_decoder_outputs(*outputs)
         self.warm_calls += 1
         return self.publish_outputs(outputs)

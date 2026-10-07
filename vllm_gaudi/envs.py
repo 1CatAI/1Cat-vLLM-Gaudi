@@ -346,6 +346,7 @@ if TYPE_CHECKING:
     VLLM_HPU_TP2_STATIC_GROUP_PLAN: bool = False
     VLLM_HPU_TP2_PLAN_DUMP_DIR: str | None = None
     VLLM_HPU_NATIVE_RECEIVE_PREPOST: bool = False
+    VLLM_HPU_DSV41_NATIVE_MEMORY_READY: bool = False
     VLLM_HPU_TP2_NATIVE_JOINT_PLAN: bool = False
     VLLM_HPU_TP2_GQA_COMPACT_KV: bool = False
     VLLM_HPU_GQA_COMPACT_KV: bool = False
@@ -1110,6 +1111,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Experimental receive posting; source-matched epoch runtime required.
     "VLLM_HPU_NATIVE_RECEIVE_PREPOST":
     lambda: os.environ.get("VLLM_HPU_NATIVE_RECEIVE_PREPOST", "0") == "1",
+    "VLLM_HPU_DSV41_NATIVE_MEMORY_READY":
+    lambda: os.environ.get("VLLM_HPU_DSV41_NATIVE_MEMORY_READY", "0") == "1",
     "VLLM_HPU_TP2_NATIVE_JOINT_PLAN":
     lambda: os.environ.get("VLLM_HPU_TP2_NATIVE_JOINT_PLAN", "0") == "1",
     "VLLM_HPU_TP2_GQA_COMPACT_KV":

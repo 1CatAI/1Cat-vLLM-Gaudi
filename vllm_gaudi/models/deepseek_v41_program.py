@@ -1042,6 +1042,7 @@ class PreparedDecoderLayer(nn.Module):
         decode_metadata=None,
         collapse_handoff=None,
         publish_collapse=False,
+        memory_ready=None,
     ):
         w = self.weights
         collapsed_attention = None if collapse_handoff is None else collapse_handoff.pop(self.layer, None)
@@ -1219,10 +1220,23 @@ class PreparedDecoderLayer(nn.Module):
                     and self.moe.shared_gate_up_channel is not None):
                 from vllm_gaudi.ops.deepseek_v41_mhc_gate_schedule import communication_gates_post_quant
 
-                residual, collapsed_ffn, gates, *post_ffn_prequant = communication_gates_post_quant(
-                    value.contiguous(), residual.contiguous(), attention_control,
-                    w.hc_attn_scale, w.hc_attn_base, w.ffn_norm.weight, self.eps
-                )
+                if memory_ready is None:
+                    residual, collapsed_ffn, gates, *post_ffn_prequant = communication_gates_post_quant(
+                        value.contiguous(), residual.contiguous(), attention_control,
+                        w.hc_attn_scale, w.hc_attn_base, w.ffn_norm.weight, self.eps
+                    )
+                else:
+                    from vllm_gaudi.ops.deepseek_v41_mhc_gate_schedule import (
+                        communication_gates_post_quant_memory_ready,
+                    )
+
+                    flags, statuses, enabled = memory_ready
+                    residual, collapsed_ffn, gates, *post_ffn_prequant, status = (
+                        communication_gates_post_quant_memory_ready(
+                            value.contiguous(), residual.contiguous(), attention_control,
+                            w.hc_attn_scale, w.hc_attn_base, w.ffn_norm.weight, self.eps, flags, self.layer, enabled)
+                    )
+                    statuses.append(status)
             else:
                 residual, collapsed_ffn, gates = deferred_post(
                     value.contiguous(), residual.contiguous(), attention_control,
@@ -1565,6 +1579,7 @@ class PreparedStage(nn.Module):
         self.device_next_position = gaudi_envs.VLLM_HPU_DSV41_DEVICE_NEXT_POSITION
         self.device_input_feedback = gaudi_envs.VLLM_HPU_DSV41_DEVICE_INPUT_FEEDBACK
         self.device_closed_loop = gaudi_envs.VLLM_HPU_DSV41_DEVICE_CLOSED_LOOP
+        self.native_memory_ready = gaudi_envs.VLLM_HPU_DSV41_NATIVE_MEMORY_READY and not self.dspark
         if self.device_next_position and (not self.device_sampling or pipeline_parallel_size != 1):
             raise ValueError("Device position continuation requires sampled C1 replay without a PP boundary")
         if self.device_input_feedback and not self.device_next_position:
@@ -2336,7 +2351,7 @@ class PreparedLayerGroup(nn.Module):
         self.native_input = None
 
     def _forward(self, residual, pre_mix, positions, input_ids, engram_rows, *, fp8_decode=False, decode=False,
-                 shared_coordinates=None):
+                 shared_coordinates=None, memory_ready=None):
         sampling_positions = positions
         if shared_coordinates is not None:
             positions = shared_coordinates[0]
@@ -2396,6 +2411,7 @@ class PreparedLayerGroup(nn.Module):
                 selected_main=selected_main,
                 decode_metadata=decode_metadata,
                 **collapse_kwargs,
+                **({"memory_ready": memory_ready} if memory_ready is not None else {}),
             )
             if target is not None:
                 target_states.append(target)
@@ -2452,6 +2468,31 @@ class PreparedLayerGroup(nn.Module):
                                 fp8_decode=self.fp8_decode, decode=True, shared_coordinates=shared_coordinates)
         return outputs, shared_coordinates
 
+    def memory_ready_forward(self, residual, pre_mix, positions, input_ids, engram_rows, root=None, enabled=None,
+                             prior_status=None):
+        if positions.numel() != 1:
+            raise ValueError("Memory-ready component qualification currently requires ordinary C1")
+        if enabled is None:
+            raise ValueError("Acquiring component requires a fixed cold admission input")
+        if root is None:
+            root = torch.ops.custom_op.private_memory_flags_zero(self.memory_ready_template)
+        if self.native_input is not None:
+            residual, pre_mix = self.native_input(input_ids)
+        statuses = []
+        outputs = self._forward(residual, pre_mix, positions, input_ids, engram_rows,
+                                fp8_decode=self.fp8_decode, decode=True, memory_ready=(root, statuses, enabled))
+        if len(statuses) != len(self.layers):
+            raise ValueError("Every experimental reader requires the qualified weighted FFN path")
+        status = torch.stack(statuses)
+        valid = (status == 1).all()
+        if prior_status is not None:
+            valid = valid & prior_status
+        if self.greedy_tail is not None:
+            # The existing token readback rejects a negative certificate.
+            # No host copy or event is added to the decode submission path.
+            outputs = (*outputs[:3], torch.where(valid, outputs[3], -1), *outputs[4:])
+        return outputs, root, status, valid
+
     def native_forward(self, residual, pre_mix, positions, input_ids, engram_rows):
         if self.native_input is not None:
             residual, pre_mix = self.native_input(input_ids)
@@ -2461,7 +2502,8 @@ class PreparedLayerGroup(nn.Module):
 _compile_entry_ids = count()
 
 
-def _compile_group(group, *, native, backend="hpu_backend", tp4_owner=None, shared_coordinates=False):
+def _compile_group(group, *, native, backend="hpu_backend", tp4_owner=None, shared_coordinates=False,
+                   memory_ready=False):
     if tp4_owner is not None:
         if native:
             raise ValueError("Prepared TP4 export does not use the TP2 native peer path")
@@ -2470,7 +2512,10 @@ def _compile_group(group, *, native, backend="hpu_backend", tp4_owner=None, shar
         return PreparedTP4Group(group, tp4_owner, backend)
     # Dynamo caches variants by code object. Each static layer group/bucket
     # owns its entry so legitimate preparations cannot exhaust another group.
-    method = group.coordinate_forward if shared_coordinates else group.native_forward if native else group.forward
+    if memory_ready and (not native or shared_coordinates or tp4_owner is not None):
+        raise ValueError("Memory-ready qualification requires the shared native entry")
+    method = (group.memory_ready_forward if memory_ready else group.coordinate_forward if shared_coordinates
+              else group.native_forward if native else group.forward)
     function = method.__func__
     name = f"{function.__name__}_v41_{next(_compile_entry_ids)}"
     entry = FunctionType(
@@ -2494,6 +2539,7 @@ class CompiledStage:
         prepared_tp4=False,
         native_tp4=False,
         replay_tail=False,
+        memory_ready=None,
     ):
         legacy_fp8 = getattr(stage, "fp8_decode", False) and not getattr(stage, "expert_n256", False)
         if native_input and (not native or stage.pp_rank != 0 or stage.dspark or legacy_fp8):
@@ -2552,6 +2598,16 @@ class CompiledStage:
         # Ordinary/prefill and speculative entries retain their existing ABI.
         self.shared_coordinates = bool(native_input and getattr(stage, "decode_shared_coordinates",
                                                                gaudi_envs.VLLM_HPU_DSV41_SHARED_COORDINATES))
+        self.memory_ready = bool(native and (getattr(stage, "native_memory_ready", False)
+                                            if memory_ready is None else memory_ready))
+        if self.memory_ready:
+            if self.shared_coordinates or stage.dspark:
+                raise ValueError("Memory-ready shared-coordinate/DSpark combination is not qualified")
+            lines = stage.config["text_config"]["num_hidden_layers"]
+            self.groups[0].register_buffer("memory_ready_template", torch.empty(
+                (lines, 32), dtype=torch.int32, device=self.groups[0].layers[0].weights.ffn_norm.weight.device))
+        self.memory_ready_chunks = (tuple(_compile_group(group, memory_ready=True, **compile_options)
+                                         for group in self.groups) if self.memory_ready else ())
         self.coordinate_chunks = (tuple(_compile_group(group, shared_coordinates=True, **compile_options)
                                        for group in self.groups) if self.shared_coordinates else ())
         self.chunks = tuple(_compile_group(group, **compile_options) for group in self.groups)

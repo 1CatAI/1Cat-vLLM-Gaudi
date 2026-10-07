@@ -1144,3 +1144,14 @@ FP8 shared weights. Other batch and prefill paths retain their existing implemen
 Combined normal-serving acceptance passed; explicit `0` remains a diagnostic disable control.
 
 `VLLM_HPU_DSV41_MHC_POST_NORM_STATS` (default `1`) enables serving-qualified peer/post statistics and feature-parallel FFN normalization with both quantizers. The existing next mHC controller remains independent. Serving selection is limited to the BF16 dual-quant single-row decode contract; prefill and larger batches retain their existing paths. End-to-end qualification passed.
+
+`VLLM_HPU_DSV41_NATIVE_MEMORY_READY` (default `0`) enables the experimental
+NIC-ready first-reader for ordinary single-row decode FFN entries. It requires
+the manifest-pinned acquiring operator, matching native HCL/Synapse memory-ready
+interfaces and an immutable cold admission buffer. Root reset is isolated before
+communication; the actual first payload reader polls the device flag and retains
+ordered arithmetic. A timeout propagates through the existing invalid-token
+certificate. Full communication retirement remains required. Shared-coordinate
+plans are excluded; prefill, DSpark and wider buckets retain their existing path.
+Combined serving correctness passed, but the experimental switches remain off
+because the combined latency reduction did not meet the promotion gate.

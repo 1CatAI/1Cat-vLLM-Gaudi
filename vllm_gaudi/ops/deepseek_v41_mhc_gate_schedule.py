@@ -43,3 +43,13 @@ def communication_gates_post_quant(value, residual, control, scale, base, norm_w
         )
     )
     return updated, collapsed, gates, normalized, quantized, activation_scale, shared_q, shared_scale
+
+
+def communication_gates_post_quant_memory_ready(value, residual, control, scale, base, norm_weight,
+                                               epsilon, flags, line, enabled):
+    """Experimental acquiring reader with unchanged weighted post arithmetic."""
+    gates = native_gates(control[:, :24].contiguous(), control[:, 24:25].contiguous(), scale, base)
+    updated, collapsed, normalized, quantized, activation_scale, shared_q, shared_scale, status = (
+        torch.ops.custom_op.private_memory_ready_post(value, residual, gates, norm_weight, flags, epsilon, line, enabled)
+    )
+    return updated, collapsed, gates, normalized, quantized, activation_scale, shared_q, shared_scale, status

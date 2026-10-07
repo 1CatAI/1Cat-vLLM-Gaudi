@@ -341,6 +341,9 @@ def make_backend(*, static_int32=False, static_factories=False, static_clamps=Fa
             (root / f"overlap-input-{id(ctx.graph_module)}.py").write_text(
                 ctx.graph_module.print_readable(print_output=False)
             )
+        from vllm_gaudi.compilation.deepseek_v41_memory_ready import isolate_memory_resets
+
+        memory_resets = isolate_memory_resets(ctx.graph_module)
         audit = split_mhc_consumers(
             ctx.graph_module,
             (
@@ -361,7 +364,7 @@ def make_backend(*, static_int32=False, static_factories=False, static_clamps=Fa
             sum(node.op == "call_module" for node in ctx.graph_module.graph.nodes),
             len(audit),
         )
-        if audit or tile_partitions:
+        if audit or tile_partitions or memory_resets:
             # Full fake propagation after Bridge partitioning replays already
             # canonicalized views and rejects their saved storage offsets.
             # New calls/getitems inherit the exact child-output contract above.
@@ -369,7 +372,7 @@ def make_backend(*, static_int32=False, static_factories=False, static_clamps=Fa
             logger().info("V4.1 TP/mHC independent partitions: %s", audit)
             if tile_partitions:
                 logger().info("V4.1 isolated optional Reindex tile recipes: %d", tile_partitions)
-        return bool(audit or tile_partitions)
+        return bool(audit or tile_partitions or memory_resets)
 
     def backend(graph, inputs, **kwargs):
         from vllm_gaudi.compilation.deepseek_v41_compiler_config import compiler_configuration

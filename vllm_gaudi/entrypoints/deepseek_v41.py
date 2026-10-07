@@ -386,6 +386,15 @@ def load_native_operators(required=()):
 
     library = os.environ["VLLM_HPU_DSV4_TPC_OP_LIBRARY"]
     torch.ops.load_library(library)
+    if os.environ.get("VLLM_HPU_DSV41_NATIVE_MEMORY_READY", "0") == "1":
+        directory = Path(library).parent
+        manifest = json.loads((directory / "deepseek_v4_build.json").read_text())
+        acquiring = directory / "dsv41_memory_ready.so"
+        if (not acquiring.is_file() or hashlib.sha256(acquiring.read_bytes()).hexdigest()
+                != manifest["binaries"].get(acquiring.name)):
+            raise RuntimeError("Acquiring operator differs from its native build manifest")
+        torch.ops.load_library(str(acquiring))
+        required = (*required, "private_memory_ready_post", "private_memory_flags_zero")
     baseline = (
         "custom_deepseek_v41_mxfp4_prepared_moe_bf16_gaudi2",
         "custom_deepseek_v41_paged_attention_bf16_gaudi2",

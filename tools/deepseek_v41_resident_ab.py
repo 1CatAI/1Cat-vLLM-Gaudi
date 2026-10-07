@@ -680,6 +680,18 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts, state
                         import torch
 
                         value = hidden.detach().cpu().contiguous()
+                        if getattr(program, "native_memory_ready", False):
+                            checked = 0
+                            for variant in program.replay_owner.variants.values():
+                                statuses = getattr(variant, "memory_ready_status", None)
+                                if statuses is None:
+                                    continue
+                                for status in statuses:
+                                    if not bool((status.detach().cpu() == 1).all()):
+                                        raise RuntimeError("Device acquiring reader reported a timeout")
+                                    checked += status.numel()
+                            if not checked:
+                                raise RuntimeError("No actual acquiring-reader status endpoints")
                         destination.append(dict(position=position, shape=list(value.shape), dtype=str(value.dtype),
                             sha256=hashlib.sha256(value.view(torch.uint8).numpy().tobytes()).hexdigest()))
                     return observe
