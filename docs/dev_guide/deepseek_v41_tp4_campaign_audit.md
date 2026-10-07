@@ -96,3 +96,29 @@ Reject this optional hoist. Auxiliary receive streams without such waits remain
 byte-identical; the initial overly strict cold guard is retained as an invalid
 untimed attempt. No defaults, gain credit, or formal request follow this trial.
 Evidence: SSD `decode-receive-epoch-hoist-01/chain-02/DECISION.json`.
+
+### Signed short receive completion and shared replay follow-up
+
+Installed SCAL `SobG2::buildVal` explicitly accepts a signed16 ADD operand;
+its generated register's bit15 carries the sign. The earlier short prototype
+incorrectly masked the initializer to15bits. An exact SDK-encoder oracle now
+passes33,693,692 encoding/arrival/lifecycle cases. The corrected isolated
+prototype, including low16-bit relocation and a prior-consumer reuse guard,
+passes104 independent communication frames, five fixtures/four ranks and
+13 exact downstream outputs. Its native A/B savings are −0.282/−0.157/−0.109us
+per boundary. Correctness is recovered, performance is not: close the
+receive-only completion family after the long-CG and signed-short regressions.
+No serving default or gain-ledger credit changes. SSD
+`decode-hcl-signed-ready-01/DECISION.json`; all owners retired to768MiB.
+
+Receive-prepost remains the sole pending qualified component. The replay
+policy is now frozen on each stage owner and included in the native-plan
+cache key; retained A/B plans can share allocations without sharing policy.
+A CPU regression checks identical plan allocations across both policies.
+The real16 fixture prepares the same already-accepted cold index-gain replica
+as serving. The launcher accepts explicit rank/helper CPUs and checks the
+actual loaded GraphExec ABI before acquiring devices. C1/C2–C6 CPU checks
+remain passing; this is preparation for a multi-layer contract check, not a
+new performance result or formal request. The two pre-measurement cold path
+guard failures remain in `decode-receive-prepost-real16-01` and `-02`; `-03`
+uses matching same-byte runtime manifests and a fresh immutable source copy.

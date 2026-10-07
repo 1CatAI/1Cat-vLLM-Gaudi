@@ -3230,5 +3230,26 @@
     "formal_ran": false,
     "default": false,
     "retired": true
+  },
+  "signed_receive_ready": {
+    "status": "closed_correct_no_gain",
+    "phase_count": 104,
+    "checks": "5 checkpoint-derived fixtures x4 ranks, 13 actual producer/peer/post/router/shared/Silu/next-control outputs byte-exact",
+    "round_savings_ms_per_boundary": [
+      -0.0002821538461538556,
+      -0.00015702884615384494,
+      -0.00010915384615384216
+    ],
+    "forecast_ms_token": 0,
+    "gain_credit_ms": 0,
+    "default": false,
+    "formal_request": false,
+    "why": "Actual SDK signed16 encoding fixes old bit15-dropping overflow and passes repeated ring reuse, but short Ready+Full relay complete chain is slower in every native replay pair. Ordered Ready long-CG and this signed short variant are both valid measured regressions; close receive-only completion family, retain ordinary Full completion.",
+    "own_devices_retired": true,
+    "formal_baseline_ms": 8.23925759729292,
+    "pending_compatible_ms": 0.1374525,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-hcl-signed-ready-01",
+    "sdk_cpu_cases": 33693692,
+    "source_sha256": "d55bcc6455cfac3f985bff31145780aec7e99406fcb7ad648f42692a6b66f892"
   }
 }

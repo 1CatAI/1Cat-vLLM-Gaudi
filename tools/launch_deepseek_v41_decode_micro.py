@@ -25,6 +25,9 @@ def main():
     parser.add_argument('--min-host-free-gib',type=float,default=256,help='Observed host headroom before loading; no reservation')
     parser.add_argument('--recipe-cache-dir', type=Path)
     parser.add_argument('--master-port', type=int, default=29689)
+    parser.add_argument('--worker-cpus', default='10,15,38,43', help='One main CPU for each TP rank')
+    parser.add_argument('--worker-helper-cpus', default='11-14;16-19;39-42;44-47',
+                        help='Four semicolon-separated helper CPU ranges')
     parser.add_argument('--modules', help='Optional four comma-separated module IDs; otherwise use any free four')
     parser.add_argument('--lock-dir', type=Path, default=Path(__file__).resolve().parents[2] / 'locks')
     args = parser.parse_args()
@@ -83,9 +86,20 @@ def main():
     scratch.mkdir(exist_ok=True)
     recipe_dir = args.recipe_cache_dir.resolve() if args.recipe_cache_dir else evidence / 'recipes'
     recipe_dir.mkdir(parents=True, exist_ok=True)
+    worker_cpus = [int(cpu) for cpu in args.worker_cpus.split(',')]
+    helper_ranges = args.worker_helper_cpus.split(';')
+    if len(worker_cpus) != 4 or len(set(worker_cpus)) != 4 or len(helper_ranges) != 4:
+        raise ValueError('Four distinct main CPUs and four helper ranges are required')
+    affinity = set(worker_cpus)
+    for group in helper_ranges:
+        for item in group.split(','):
+            bounds = [int(value) for value in item.split('-')]
+            affinity.update(range(bounds[0], bounds[-1] + 1))
+    if not affinity.issubset(os.sched_getaffinity(0)):
+        raise ValueError('Worker CPUs are outside the available CPU affinity')
     environment.update(TMPDIR=str(scratch),
-                       VLLM_HPU_DSV4_WORKER_CPUS='10,15,38,43',
-                       VLLM_HPU_DSV4_WORKER_HELPER_CPUS='11-14;16-19;39-42;44-47',
+                       VLLM_HPU_DSV4_WORKER_CPUS=args.worker_cpus,
+                       VLLM_HPU_DSV4_WORKER_HELPER_CPUS=args.worker_helper_cpus,
                        GLOO_SOCKET_IFNAME='lo', OMP_NUM_THREADS='1', DSV41_RUN_EVIDENCE=str(evidence),
                        DSV41_RUNTIME_PROFILE=str(args.runtime_profile.resolve()),
                        HABANA_LOGS=str(evidence/'habana_logs'),
@@ -104,9 +118,14 @@ def main():
                '--ab-dense-config', str(args.dense_config.resolve())]
     # Reject incomplete native bundles before any worker opens a device.
     preflight = [str(installation/'venv/bin/python'), '-c',
-                 "import runpy; runpy.run_path('vllm_gaudi/entrypoints/deepseek_v41.py')['prepare_native_libraries']()"]
+                 "import runpy, os; from pathlib import Path; import torch; "
+                 "import habana_frameworks.torch; "
+                 "runpy.run_path('vllm_gaudi/entrypoints/deepseek_v41.py')['prepare_native_libraries'](); "
+                 "from vllm_gaudi.distributed.tp2_fused_ar_norm import _load_bridge, _verify_prepared_runtime; "
+                 "p=Path(os.environ['VLLM_HPU_TP2_FUSED_AR_NORM_BRIDGE']).resolve(); "
+                 "_load_bridge(p); _verify_prepared_runtime(p)"]
     subprocess.run(preflight, cwd=frozen, env=environment, check=True)
-    os.sched_setaffinity(0, set(range(10, 20)) | set(range(38, 48)))
+    os.sched_setaffinity(0, affinity)
     modules = None if args.modules is None else tuple(int(value) for value in args.modules.split(','))
     wait_for_host_memory(evidence/'host-memory-availability.json',minimum_gib=args.min_host_free_gib)
     environment = {k: v for k, v in environment.items() if 'DUMP' not in k}

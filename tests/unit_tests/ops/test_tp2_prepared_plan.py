@@ -114,6 +114,58 @@ def test_consecutive_groups_share_one_submission(runtime):
     assert runtime == [((1, 2), [[1], [2]])]
 
 
+def test_receive_policy_cannot_alias_a_cached_plan_with_the_same_allocations(monkeypatch):
+    from vllm_gaudi.ops.tp2_model_adapter import DEEPSEEK_V41_PP0_INPUT
+
+    graphs = []
+
+    class Graph:
+        def __init__(self):
+            self.prepost = False
+            self.replays = 0
+            graphs.append(self)
+
+        def configure_topology(self, *_):
+            pass
+
+        def configure_preposted_receives(self, enabled):
+            self.prepost = enabled
+
+        def capture(self, *_):
+            pass
+
+        def instantiate(self):
+            pass
+
+        def update_inputs(self, *_):
+            pass
+
+        def replay(self):
+            self.replays += 1
+
+    class Bridge:
+        NativeDecodeGraph = Graph
+        native_decode_graph_available = staticmethod(lambda: True)
+
+    monkeypatch.setenv('VLLM_HPU_DSV41_GRAPH_REPLAY', '1')
+    monkeypatch.setenv('VLLM_HPU_NATIVE_RECEIVE_PREPOST', '0')
+    monkeypatch.setenv('VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX', '0')
+    monkeypatch.setattr(replay, '_runtime', lambda: (Bridge(), None))
+    monkeypatch.setattr(replay, '_native_graph_owners', {})
+    adapter = replace(DEEPSEEK_V41_PP0_INPUT, group_layers=(4,))
+    owner = torch.nn.Identity()
+    plan = Plan(1, torch.tensor(1))
+    for enabled in (False, True, False):
+        owner.receive_prepost = enabled
+        monkeypatch.setattr(replay._local, 'pending', [(plan, [1])], raising=False)
+        monkeypatch.setattr(replay._local, 'native_context',
+                            dict(adapter=adapter, owner=owner, snapshot=lambda: None), raising=False)
+        replay._flush()
+    assert len(graphs) == 2
+    assert [graph.prepost for graph in graphs] == [False, True]
+    assert [graph.replays for graph in graphs] == [1, 0]
+
+
 def test_v4_callsite_prevents_cross_group_plan_aliasing(runtime, monkeypatch):
     from vllm_gaudi.ops.tp2_model_adapter import DEEPSEEK_V4
     owner = torch.nn.Identity()

@@ -298,6 +298,9 @@ def main():
                 block.attention.prefill_tp_rank = rank
                 block.attention.prepare_qkv_input_weight()
                 block.attention.prepare_compressor_input_weight()
+                # Match normal serving's cold replica preparation before any
+                # prefill or native decode plan is recorded.
+                block.attention.prepare_index_gain_weight()
                 if args.candidate_local_index_queries:
                     block.attention.prepare_tp4_index_query_weights()
                 block.attention.woa_fp8 = block.attention.woa_output_roundtrip = True

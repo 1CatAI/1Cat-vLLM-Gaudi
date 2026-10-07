@@ -232,7 +232,12 @@ class StageVariant(torch.nn.Module):
         replay_tail=False,
     ):
         super().__init__()
+        from vllm_gaudi import envs as gaudi_envs
+
         self.program = program
+        # Native scheduling policy belongs to this cold execution owner. Keep
+        # separate replay plans independent even when they share allocations.
+        self.receive_prepost = getattr(program, "native_receive_prepost", gaudi_envs.VLLM_HPU_NATIVE_RECEIVE_PREPOST)
         self.native_input = native_input
         self.tail_enabled = (replay_tail and native_input and getattr(program, "is_last_stage", False)
                              and not program.dspark)

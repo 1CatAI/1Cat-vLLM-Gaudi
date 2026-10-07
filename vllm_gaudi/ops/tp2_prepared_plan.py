@@ -176,7 +176,11 @@ def _flush():
             if start:
                 bridge.replay_prepared_groups(plans[:start], inputs[:start])
             native_plans, native_inputs = plans[start:stop], inputs[start:stop]
-            key = (adapter.name if adapter else "qwen3_next", groups, *(id(plan) for plan in native_plans))
+            receive_prepost = v41 and getattr(
+                context.get("owner"), "receive_prepost", gaudi_envs.VLLM_HPU_NATIVE_RECEIVE_PREPOST
+            )
+            key = (adapter.name if adapter else "qwen3_next", groups, receive_prepost,
+                   *(id(plan) for plan in native_plans))
             graph = _native_graphs.get(key)
             if graph is None:
                 if not bridge.native_decode_graph_available():
@@ -187,7 +191,7 @@ def _flush():
                     _native_graph_owners[key] = weakref.ref(context["owner"])
                 if v4:
                     _configure_native_topology(graph, groups, adapter)
-                if v41 and gaudi_envs.VLLM_HPU_NATIVE_RECEIVE_PREPOST:
+                if receive_prepost:
                     if not hasattr(graph, "configure_preposted_receives"):
                         raise RuntimeError("Receive preposting requires the matching native epoch runtime")
                     graph.configure_preposted_receives(True)
