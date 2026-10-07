@@ -1447,3 +1447,20 @@ The same optional epoch runtime now retains the actual Engram prefix/suffix plan
 开关是私有组件工具的 `fused=B`，默认关闭；正常模型/服务入口尚未集成，不声称 main 默认已具备该路径。编译器仍将 cast 收入 PV bundle，不声称 QK/转换已经交叠。第二个显式 F32V 输出方案数值通过、编译门槛失败，未计时，不计入收益。两项兼容待验收为 receive preposting **0.117889500** + 本项 **0.000860000** = **0.118749500ms/token**；远低于正式触发线，也未达7ms目标。
 
 证据：`/opt/ssd960/1cat-vllm-decode-archives/decode-mla-deferred-pv-01/{DECISION.json,chain01/rank0/result.json,chain01/native-snapshot/RESTORATION.txt}`。第一版对象文件/源码保留并重新链接，原始运行没有记录私有扩展 SHA，不能声称重链接二进制与当时逐字节一致；原生输出接口及实际编译记录保留。
+
+## 2026-10-07 — 首读 TPC 等待设备就绪标志（未端到端）
+
+SSD `decode-memory-ready-overlap-01/QUALIFICATION.json`，正式父基线8.239257597。
+WO/control → 原生四卡 peer → weighted post/statistics → norm/双量化 → 真实router、共享W13/SiLU、下一mHC。
+5组checkpoint输入 × 四卡 × 64个变化边界 × 13端点逐位一致，无就绪超时。
+三轮原生ABABAB各200设备区间，每边界减少0.003368398、0.002140633、0.003243398ms。
+已覆盖的生产位置为40个FFN入口，预估 **0.129735938ms/token**；80点的0.259471875只是假设，
+另一种Attention入口尚未移植/验证，不能计入。每张卡的最大设备时间用于比较，不用四卡活动并集。
+计时卡2/3/6/7、CPU70/74/100/104；另一组负载记录保留于chain08。
+独立NIC EDMA在全部RX/本地拷贝就绪后发布128B标志，第一实际payload读者在TPC内获取。
+Gaudi2 recvScaleUp没有EDMA命令；发布在sendScaleUp，所有SEND/Full退休等待仍保留。
+编译器普通日志确认peer/标志直接读DRAM；不宣称权重DMA提前/交叠。
+计时后发现Python事件/计划引用延迟清理，chain09只做退出验证；清理后code0、四卡768MiB。
+候选仍是私有原型、默认关闭；当前明确排斥segmented Engram/receive-prepost，
+**此项单列，不能加进上方0.118749500的兼容组合累计**。下一步共用16层入口和组合状态验证。
+没有新的正式请求、trace或默认提升，目标7ms仍未完成。
