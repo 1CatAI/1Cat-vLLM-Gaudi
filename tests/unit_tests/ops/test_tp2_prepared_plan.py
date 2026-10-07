@@ -1,8 +1,35 @@
 # SPDX-License-Identifier: Apache-2.0
 import pytest
 import torch
+from dataclasses import replace
 
 from vllm_gaudi.ops import tp2_prepared_plan as replay
+
+
+def test_serial_dependency_policy_requires_explicit_native_support():
+    from vllm_gaudi.ops.tp2_model_adapter import DEEPSEEK_V41_PP0_INPUT
+
+    class LegacyGraph:
+        def __init__(self):
+            self.topology = None
+
+        def configure_topology(self, *args):
+            self.topology = args
+
+    legacy = LegacyGraph()
+    replay._configure_native_topology(legacy, 5, DEEPSEEK_V41_PP0_INPUT)
+    assert legacy.topology == (5, 43, False)
+    serial = replace(DEEPSEEK_V41_PP0_INPUT, require_independent_overlap=False)
+    with pytest.raises(RuntimeError, match="dependency-policy API"):
+        replay._configure_native_topology(legacy, 5, serial)
+
+    class Graph(LegacyGraph):
+        def configure_dependency_policy(self, required):
+            self.required = required
+
+    graph = Graph()
+    replay._configure_native_topology(graph, 5, serial)
+    assert graph.topology == legacy.topology and graph.required is False
 
 
 def test_static_scalar_detection_rejects_changing_graph_inputs():
@@ -85,6 +112,58 @@ def test_consecutive_groups_share_one_submission(runtime):
             second([2])
         assert runtime == []
     assert runtime == [((1, 2), [[1], [2]])]
+
+
+def test_receive_policy_cannot_alias_a_cached_plan_with_the_same_allocations(monkeypatch):
+    from vllm_gaudi.ops.tp2_model_adapter import DEEPSEEK_V41_PP0_INPUT
+
+    graphs = []
+
+    class Graph:
+        def __init__(self):
+            self.prepost = False
+            self.replays = 0
+            graphs.append(self)
+
+        def configure_topology(self, *_):
+            pass
+
+        def configure_preposted_receives(self, enabled):
+            self.prepost = enabled
+
+        def capture(self, *_):
+            pass
+
+        def instantiate(self):
+            pass
+
+        def update_inputs(self, *_):
+            pass
+
+        def replay(self):
+            self.replays += 1
+
+    class Bridge:
+        NativeDecodeGraph = Graph
+        native_decode_graph_available = staticmethod(lambda: True)
+
+    monkeypatch.setenv('VLLM_HPU_DSV41_GRAPH_REPLAY', '1')
+    monkeypatch.setenv('VLLM_HPU_NATIVE_RECEIVE_PREPOST', '0')
+    monkeypatch.setenv('VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX', '0')
+    monkeypatch.setattr(replay, '_runtime', lambda: (Bridge(), None))
+    monkeypatch.setattr(replay, '_native_graph_owners', {})
+    adapter = replace(DEEPSEEK_V41_PP0_INPUT, group_layers=(4,))
+    owner = torch.nn.Identity()
+    plan = Plan(1, torch.tensor(1))
+    for enabled in (False, True, False):
+        owner.receive_prepost = enabled
+        monkeypatch.setattr(replay._local, 'pending', [(plan, [1])], raising=False)
+        monkeypatch.setattr(replay._local, 'native_context',
+                            dict(adapter=adapter, owner=owner, snapshot=lambda: None), raising=False)
+        replay._flush()
+    assert len(graphs) == 2
+    assert [graph.prepost for graph in graphs] == [False, True]
+    assert [graph.replays for graph in graphs] == [1, 0]
 
 
 def test_v4_callsite_prevents_cross_group_plan_aliasing(runtime, monkeypatch):

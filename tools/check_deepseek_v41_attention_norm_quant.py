@@ -197,7 +197,7 @@ def main():
     periods = []
     for label in 'ABABAB':
         plan = arms['separate' if label == 'A' else 'fused']
-        fn = (lambda *ignored: plan()) if options.native_replay else plan
+        fn = (lambda *ignored, active=plan: active()) if options.native_replay else plan
         for _ in range(32):
             fn(*args)
         torch.hpu.synchronize()
@@ -214,7 +214,7 @@ def main():
         periods.append(dict(arm=label, token_intervals_ms=values, competing_load=load, summary=summarize(values)))
         print(label, periods[-1]['summary'], flush=True)
     timing = dict(periods=periods,
-                  comparison=compare_periods(periods),
+                  comparison=compare_periods(periods, device_events=True),
                   no_real16_gain_credit=True,
                   prepared_replay=options.prepared_replay,
                   native_replay=options.native_replay,

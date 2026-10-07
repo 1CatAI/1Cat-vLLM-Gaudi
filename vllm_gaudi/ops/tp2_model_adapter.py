@@ -10,6 +10,7 @@ class DecoderTopology:
     reductions_per_layer: int
     external_prefix: bool
     extra_collectives: int = 0
+    require_independent_overlap: bool = True
 
     @property
     def groups(self):

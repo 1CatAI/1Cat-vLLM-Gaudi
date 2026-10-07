@@ -134,7 +134,7 @@ def main():
         periods.append(dict(arm=label, token_intervals_ms=values, summary=summarize(values), competing_load=load))
         print(label, periods[-1]['summary'], flush=True)
     report = dict(periods=periods,
-                  comparison=compare_periods(periods),
+                  comparison=compare_periods(periods, device_events=True),
                   repeat=32,
                   synchronize_each_interval=True,
                   no_real16_gain_credit=True,

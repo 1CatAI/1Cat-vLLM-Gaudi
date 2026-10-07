@@ -119,14 +119,40 @@ def maintain_affinity(pid, settings):
     return processes
 
 
+def validate_raw_trace_profile(profile):
+    environment = profile.get("environment", {})
+    for key in ("DUMP_PRE_GRAPHS", "DUMP_POST_GRAPHS"):
+        if environment.get(key) == "0":
+            raise ValueError(f"{key}=0 is a dump directory, not disabled; remove the variable")
+    if environment.get("VLLM_HPU_DSV41_RAW_TRACE", "0") != "1":
+        return
+    if not environment.get("HABANA_PROF_CONFIG") or environment.get("HABANA_PROFILE_WRITE_HLTV") != "1":
+        raise ValueError("Raw trace requires HABANA_PROF_CONFIG and HABANA_PROFILE_WRITE_HLTV=1 before loading")
+    config = json.loads(Path(environment["HABANA_PROF_CONFIG"]).read_text())
+    hardware = [p for p in config.get("Plugins", ()) if p.get("enable") and p.get("name") == "HwTrace"]
+    if len(hardware) != 1 or not hardware[0]["values"]["parseOptions"]["skipParse"]["value"]:
+        raise ValueError("Raw trace requires HwTrace skipParse=true before loading")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("installation", type=Path)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18552)
+    parser.add_argument("--log-root", type=Path, help="Machine-local directory for service logs, such as SSD storage")
+    parser.add_argument("--settings", type=Path, help="Override the installation's machine-local settings")
     args, extra = parser.parse_known_args()
     root = args.installation.resolve()
-    settings = json.loads((root / "settings.json").read_text())
+    settings_path = args.settings.expanduser().resolve() if args.settings is not None else root / "settings.json"
+    settings = json.loads(settings_path.read_text())
+    runtime_path = settings.get("runtime_profile", str(root / "runtime.json"))
+    if "--runtime-profile" in extra:
+        runtime_path = extra[extra.index("--runtime-profile") + 1]
+    runtime_path = Path(runtime_path).expanduser()
+    if not runtime_path.is_absolute():
+        runtime_path = root / runtime_path
+    if runtime_path.is_file():
+        validate_raw_trace_profile(json.loads(runtime_path.read_text()))
     compiler_temp = settings.get("environment", {}).get("TMPDIR")
     if compiler_temp:
         # A configured tmpfs scratch directory must be recreated after reboot.
@@ -140,7 +166,8 @@ def main():
         reserved.update(group)
     if not reserved <= set(settings["cpus"]):
         raise ValueError("Machine allocation is outside the installation CPU set")
-    log_dir = root / "logs" / time.strftime("%Y%m%d-%H%M%S")
+    log_root = args.log_root.expanduser().resolve() if args.log_root is not None else root / "logs"
+    log_dir = log_root / time.strftime("%Y%m%d-%H%M%S")
     log_dir.mkdir(parents=True)
     isolated = isolate_desktop(reserved) if settings.get("isolate_user_processes", False) else []
     atomic_json(log_dir / "background-affinity.json", isolated)
@@ -148,7 +175,8 @@ def main():
     if compiler_temp:
         environment["TMPDIR"] = compiler_temp
     for key in list(environment):
-        if key.startswith(("VLLM_HPU_DSV", "VLLM_HPU_TP2", "DSV41_")) or key in ("PYTHONPATH", "LD_PRELOAD"):
+        if key.startswith(("VLLM_HPU_DSV", "VLLM_HPU_TP2", "DSV41_", "DUMP_")) or key in (
+                "PYTHONPATH", "LD_PRELOAD", "GRAPH_VISUALIZATION", "GRAPH_VISUALIZATION_DIR", "PT_HPU_GRAPH_DUMP_PREFIX"):
             environment.pop(key)
     environment["VLLM_ENGINE_READY_TIMEOUT_S"] = "3600"
     environment["PYTHONUNBUFFERED"] = "1"
@@ -158,7 +186,7 @@ def main():
     if settings.get("api_key_file"):
         environment["VLLM_API_KEY"] = Path(settings["api_key_file"]).read_text().strip()
     command = [str(root / "venv/bin/python"), "-m", "vllm_gaudi.entrypoints.deepseek_v41",
-               "--settings", str(root / "settings.json"), "--host", args.host, "--port", str(args.port), *extra]
+               "--settings", str(settings_path), "--host", args.host, "--port", str(args.port), *extra]
     with (log_dir / "service.log").open("w") as stream:
         child = subprocess.Popen(command, cwd=root, env=environment, stdout=stream, stderr=subprocess.STDOUT,
                                  start_new_session=True)

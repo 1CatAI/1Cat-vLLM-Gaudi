@@ -74,7 +74,13 @@ def restore(run, analysis, post_base, ranks=None, recipe_cache=None):
             for graph in json.loads(data)['graphs']:
                 raw_id = graph['recipe_debug_id']
                 nodes = physical_nodes(graph)
-                if raw_id in needed and needed[raw_id] <= nodes.keys():
+                # Recipe IDs are short and can collide across the shared warmup
+                # cache. A one-TPC decode recipe must not match the first node
+                # of an unrelated, much larger prefill recipe with that ID.
+                observed_tpc = {pair for pair in needed.get(raw_id, ()) if pair[0] == 'TPC'}
+                compiled_tpc = {pair for pair in nodes if pair[0] == 'TPC'}
+                if (raw_id in needed and needed[raw_id] <= nodes.keys()
+                        and (not observed_tpc or observed_tpc == compiled_tpc)):
                     candidates[raw_id].append((cold, graph, nodes))
         selected = {}
         for raw_id, observed in needed.items():

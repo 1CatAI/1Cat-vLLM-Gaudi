@@ -6,6 +6,9 @@
 extern unsigned char _binary___deepseek_v41_mhc_gates_f32_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_mhc_gates_f32_gaudi2_o_end;
 
+extern unsigned char _binary___deepseek_v41_mhc_gates_positive_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_mhc_gates_positive_gaudi2_o_end;
+
 namespace {
 using namespace tpc_lib_api;
 
@@ -64,8 +67,8 @@ tpc_lib_api::GlueCodeReturn DeepseekV41MhcGatesGaudi2::GetGcDefinitions(
     out->indexSpaceRank = 1;
     out->indexSpaceGeometry[0] = tokens;
     out->kernel.paramsNr = 0;
-    auto* begin = &_binary___deepseek_v41_mhc_gates_f32_gaudi2_o_start;
-    auto* end = &_binary___deepseek_v41_mhc_gates_f32_gaudi2_o_end;
+    auto* begin = positive_ ? &_binary___deepseek_v41_mhc_gates_positive_gaudi2_o_start : &_binary___deepseek_v41_mhc_gates_f32_gaudi2_o_start;
+    auto* end = positive_ ? &_binary___deepseek_v41_mhc_gates_positive_gaudi2_o_end : &_binary___deepseek_v41_mhc_gates_f32_gaudi2_o_end;
     const unsigned capacity = out->kernel.elfSize;
     out->kernel.elfSize = end - begin;
     if (capacity < out->kernel.elfSize) return GLUE_INSUFFICIENT_ELF_BUFFER;

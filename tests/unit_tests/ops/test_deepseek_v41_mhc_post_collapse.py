@@ -33,6 +33,29 @@ def test_native_shapes(native_meta, tokens):
     assert collapsed.shape == (tokens, 5120) and collapsed.dtype == collapsed_dtype
 
 
+@pytest.mark.parametrize('ranks', [2, 4, 8])
+@pytest.mark.parametrize('tokens', [1, 2, 6])
+def test_peer_rows_keep_residual_and_collapsed_shapes(native_meta, ranks, tokens):
+    operation, collapsed_dtype = native_meta
+    if collapsed_dtype != torch.bfloat16:
+        pytest.skip('FP32 collapse does not implement deferred peer summation')
+    args = operands(tokens)
+    args[0] = torch.empty((ranks, tokens, 5120), dtype=torch.bfloat16, device='meta')
+    updated, collapsed = operation(*args)
+    assert updated.shape == (tokens, 4, 5120)
+    assert collapsed.shape == (tokens, 5120)
+
+
+@pytest.mark.parametrize('ranks', [0, 1, 9])
+def test_peer_rows_reject_invalid_rank_count(native_meta, ranks):
+    if native_meta[1] != torch.bfloat16:
+        pytest.skip('Only the BF16 peer consumer is extended')
+    args = operands(1)
+    args[0] = torch.empty((ranks, 1, 5120), dtype=torch.bfloat16, device='meta')
+    with pytest.raises(RuntimeError):
+        native_meta[0](*args)
+
+
 @pytest.mark.parametrize('tokens', [0, 7])
 def test_native_rejects_unsupported_bucket(native_meta, tokens):
     with pytest.raises(RuntimeError):

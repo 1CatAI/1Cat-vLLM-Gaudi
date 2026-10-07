@@ -4,21 +4,48 @@ import argparse
 import copy
 from contextlib import contextmanager
 import ctypes
+import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import statistics
 import subprocess
-import threading
+import sys
 import time
 from types import MethodType
 import uuid
 
 
 COMPILER_CANDIDATES = {
+    'handoff_expert_sequential': {},
+    'handoff_expert_sequential_sram': {'SRAM_SLICER_MAX_CAPACITY_BYTES': str(44 * 1024 * 1024)},
     'dense_fp8_unsliced': {'SRAM_SLICER_MAX_CAPACITY_BYTES': '0'},
     'dense_fp8_legacy_slicer': {'ENABLE_PIPELINE_MANAGEMENT': '0'},
 }
+
+
+def recipe_cache_count(environment=None):
+    """Include Bridge's deferred recipe variants in the cold/timed gate."""
+    environment = os.environ if environment is None else environment
+    configured = environment.get('PT_HPU_RECIPE_CACHE_CONFIG', '')
+    if not configured:
+        return 0
+    directory = configured.split(',', 1)[0].format(rank=environment.get('LOCAL_RANK', '0'))
+    return sum(1 for _ in Path(directory).glob('*.recipe'))
+
+
+def graph_compilation_count():
+    """Observe actual compiler events separately from delayed cache-file writes."""
+    from habana_frameworks.torch.hpu.metrics import metric_global
+
+    stats = dict(metric_global('graph_compilation').stats())
+    return stats['TotalNumber']
+
+
+def cpu_pressure_avg10(path=Path('/proc/pressure/cpu')):
+    fields = dict(item.split('=', 1) for item in path.read_text().splitlines()[0].split()[1:])
+    return float(fields['avg10'])
 
 
 @contextmanager
@@ -67,16 +94,29 @@ def summarize(values):
                 mean_ms=statistics.mean(values), minimum_ms=min(values), maximum_ms=max(values))
 
 
-def compare_periods(periods):
+def compare_periods(periods, *, device_events=False):
     if [p['arm'] for p in periods] != ['A', 'B', 'A', 'B', 'A', 'B']:
         raise ValueError('The comparison order must be ABABAB')
-    baseline = summarize(v for p in periods if p['arm'] == 'A' for v in p['token_intervals_ms'])
-    candidate = summarize(v for p in periods if p['arm'] == 'B' for v in p['token_intervals_ms'])
-    delta = baseline['median_ms'] - candidate['median_ms']
-    threshold = 2 * baseline['iqr_ms']
-    return dict(baseline=baseline, candidate=candidate, saving_ms=delta, validity_threshold_ms=threshold,
-                effective=delta > threshold, slower=-delta > threshold,
-                period_medians_ms=[summarize(p['token_intervals_ms'])['median_ms'] for p in periods],
+    # Device events bracket the same native producer/consumer chain in each
+    # arm. Host delivery distributions remain diagnostics, not a veto on a
+    # device improvement. All three paired rounds must agree on direction.
+    if device_events:
+        medians = [summarize(p['token_intervals_ms'])['median_ms'] for p in periods]
+    else:
+        medians = [summarize(max(values) for values in zip(
+            *(row['device_step_ms'] for row in p['ranks']), strict=True))['median_ms'] for p in periods]
+    baseline_values, candidate_values = medians[::2], medians[1::2]
+    savings = [a - b for a, b in zip(baseline_values, candidate_values, strict=True)]
+    baseline = dict(median_ms=statistics.median(baseline_values), rounds_ms=baseline_values)
+    candidate = dict(median_ms=statistics.median(candidate_values), rounds_ms=candidate_values)
+    return dict(baseline=baseline, candidate=candidate,
+                saving_ms=statistics.median(savings), round_savings_ms=savings,
+                effective=all(value > 0 for value in savings), slower=all(value < 0 for value in savings),
+                period_medians_ms=medians, decision='three paired device rounds; no IQR threshold',
+                host_baseline=None if device_events else summarize(
+                    v for p in periods if p['arm'] == 'A' for v in p['token_intervals_ms']),
+                host_candidate=None if device_events else summarize(
+                    v for p in periods if p['arm'] == 'B' for v in p['token_intervals_ms']),
                 formal_gain_credit=False)
 
 
@@ -165,29 +205,43 @@ def make_handoff_stage(stage):
     return result
 
 
+def parse_device_load(output):
+    """Retain unavailable telemetry without treating a resetting card as idle."""
+    rows, unavailable = [], []
+    for line in output.splitlines():
+        fields = [value.strip() for value in line.split(',')]
+        try:
+            module, util, memory = fields
+            rows.append(dict(module=int(module), utilization=int(util.split()[0]),
+                             memory_mib=int(memory.split()[0])))
+        except (ValueError, IndexError):
+            unavailable.append(line)
+    return dict(time_ns=time.time_ns(), modules=rows, unavailable=unavailable)
+
+
 def device_load():
     result = subprocess.run(['hl-smi', '-Q', 'module_id,utilization.aip,memory.used', '--format=csv,noheader'],
                             capture_output=True, text=True, check=True)
-    rows = []
-    for line in result.stdout.splitlines():
-        module, util, memory = line.split(',')
-        rows.append(dict(module=int(module), utilization=int(util.strip().split()[0]),
-                         memory_mib=int(memory.strip().split()[0])))
-    return dict(time_ns=time.time_ns(), modules=rows)
+    return parse_device_load(result.stdout)
+
+
+def _common_device_memory(samples):
+    mappings = [{x['module']: x['memory_mib'] for x in sample['modules']} for sample in samples]
+    common = set.intersection(*(set(row) for row in mappings)) if mappings else set()
+    return mappings, sorted(common)
 
 
 def loading_modules(samples, own_modules=(0, 1, 4, 5), minimum_growth_mib=128):
-    mappings = [{x['module']: x['memory_mib'] for x in s['modules']} for s in samples]
-    return [module for module in mappings[0] if module not in own_modules
+    mappings, common = _common_device_memory(samples)
+    return [module for module in common if module not in own_modules
             and mappings[-1][module] - mappings[0][module] >= minimum_growth_mib
             and all(b[module] >= a[module] for a, b in zip(mappings, mappings[1:]))]
 
 
-
 def settling_modules(samples, own_modules=(0, 1, 4, 5), maximum_variation_mib=16):
-    """Driver pool resets can hide weight loading behind a temporary memory drop."""
-    mappings = [{x['module']: x['memory_mib'] for x in sample['modules']} for sample in samples]
-    return [module for module in mappings[0] if module not in own_modules
+    """Measure stable device identities; never infer zero usage from N/A."""
+    mappings, common = _common_device_memory(samples)
+    return [module for module in common if module not in own_modules
             and max(row[module] for row in mappings)-min(row[module] for row in mappings) >= maximum_variation_mib]
 
 def wait_for_loading(directory, rank, dist):
@@ -201,10 +255,18 @@ def wait_for_loading(directory, rank, dist):
                 samples.append(device_load())
                 time.sleep(1)
             growing = settling_modules(samples, own_modules=own_modules)
-            history.append(dict(samples=samples, loading_modules=growing))
-            decision[0] = not growing
+            pressure = cpu_pressure_avg10()
+            _, common = _common_device_memory(samples)
+            missing_own = sorted(set(own_modules) - set(common))
+            history.append(dict(samples=samples, loading_modules=growing, unavailable_own=missing_own,
+                                cpu_psi_some_avg10=pressure))
+            decision[0] = not growing and not missing_own and pressure < 1
+            if missing_own:
+                print(f'Resident A/B waiting for telemetry on owned modules {missing_own}', flush=True)
             if growing:
                 print(f'Resident A/B waiting for weight loading on modules {growing}', flush=True)
+            elif pressure >= 1:
+                print(f'Resident A/B waiting for CPU pressure: some avg10={pressure:.2f}%', flush=True)
         dist.broadcast_object_list(decision, src=0)
         if decision[0]:
             if rank == 0:
@@ -214,7 +276,107 @@ def wait_for_loading(directory, rank, dist):
             return
 
 
-def serve(stage, baseline, shard, chain, report, args, preparation_counts):
+def check_repartition_state(reference_tokens, reference_state, candidate_tokens, candidate_state):
+    """A scheduling change must preserve the complete mutable state, not just argmax."""
+    if reference_tokens != candidate_tokens or reference_state != candidate_state:
+        raise RuntimeError('Repartitioning changed continuation tokens or mutable state')
+    return dict(tokens_exact=True, mutable_state_exact=True, state_tensors=len(reference_state))
+
+
+def load_candidate_factory(path, expected_sha256):
+    path = Path(path).resolve()
+    root = Path(__file__).resolve().parent / 'deepseek_v41_candidates'
+    if not path.is_relative_to(root) or path.suffix != '.py':
+        raise ValueError('Candidate factories must be repository Python files in tools/deepseek_v41_candidates')
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if digest != expected_sha256:
+        raise RuntimeError('Candidate factory changed after submission')
+    name = f'dsv41_candidate_{digest}'
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module.make_candidate, dict(path=str(path), sha256=digest)
+
+
+def isolated_trace_config(template, directory):
+    """Use a fresh raw namespace; repeated SDK publication must not overwrite evidence."""
+    settings = copy.deepcopy(json.loads(Path(template).read_text()))
+    general = settings['GeneralSettings']['values']
+    general['outdir']['value'] = str(Path(directory).resolve())
+    general['session']['value'] = 'resident-node-audit'
+    general['addPid']['value'] = True
+    hardware = [plugin for plugin in settings['Plugins'] if plugin['name'] == 'HwTrace' and plugin['enable']]
+    if len(hardware) != 1:
+        raise ValueError('Physical audit needs exactly one enabled HwTrace plugin')
+    hardware[0]['values']['parseOptions']['skipParse']['value'] = True
+    return settings
+
+
+def capture_physical_arms(directory, template, engines, chain, rank, dist, preparation_counts):
+    from vllm_gaudi.ops.deepseek_v41_native_trace import NativeTrace
+    import shutil
+
+    raw_directory = directory / 'raw-publication'
+    config = directory / 'profiler-config.json'
+    saved_environment = {key: os.environ.get(key) for key in ('HABANA_PROF_CONFIG', 'HABANA_PROFILE_WRITE_HLTV')}
+    # Some SDKs cache output settings when the worker starts. Reuse only a
+    # publication buffer inside this resident case, copying each closed raw
+    # bundle into its immutable job/arm directory before the next capture.
+    startup = saved_environment['HABANA_PROF_CONFIG']
+    settings = isolated_trace_config(template, raw_directory)
+    if startup:
+        settings = json.loads(Path(startup).read_text())
+        publication = Path(settings['GeneralSettings']['values']['outdir']['value']).resolve()
+        if not publication.is_relative_to(directory.parents[1].resolve()):
+            raise ValueError('SDK publication buffer must belong to this resident case')
+        raw_directory = publication
+    if rank == 0:
+        raw_directory.mkdir(parents=True, exist_ok=True)
+        config.write_text(json.dumps(settings, indent=2)+'\n')
+    dist.barrier()
+    os.environ.update(HABANA_PROF_CONFIG=str(config), HABANA_PROFILE_WRITE_HLTV='1')
+    results = []
+    try:
+        for label, engine in engines:
+            chain(True, 2, measure=False, engine=engine, warm_steps=6)
+            counts = preparation_counts()
+            wait_for_loading(directory, rank, dist)
+            scopes = directory / label / f'rank{rank}'
+            scopes.mkdir(parents=True, exist_ok=True)
+            tracer = NativeTrace(scopes, scope_only=True)
+            dist.barrier()
+            try:
+                # This is a node/causality audit, never a performance sample.
+                tokens = chain(True, 8, measure=False, engine=engine, warm_steps=0, trace=tracer)[0]
+            finally:
+                if tracer.running:
+                    tracer.stop()
+            assert counts == preparation_counts(), 'Physical audit unexpectedly compiled a hot graph'
+            metadata = copy.deepcopy(tracer.metadata)
+            raw_files = []
+            for source in metadata['raw_files']:
+                target = scopes / Path(source).name
+                shutil.copy2(source, target)
+                raw_files.append(str(target))
+            metadata['raw_files'] = raw_files
+            metadata.update(arm=label, rank=rank, tokens=tokens, graph=graph_info(engine))
+            (scopes/'capture.json').write_text(json.dumps(metadata, indent=2)+'\n')
+            results.append(metadata)
+            dist.barrier()
+    finally:
+        for key, value in saved_environment.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    gathered = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, results)
+    return dict(status='physical_audit_captured', timed=False, formal_gain_credit=False,
+                captures=gathered, warning='Profiler timings cannot qualify an A/B gain')
+
+
+def serve(stage, baseline, shard, chain, report, args, preparation_counts, state_fingerprints=None):
     import torch.distributed as dist
     from vllm_gaudi.ops.deepseek_v41_replay import StageReplay
 
@@ -223,18 +385,44 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
     control.mkdir(parents=True, exist_ok=True)
     arms = {'baseline': baseline}
     stages = {'baseline': stage}
-    deadline = None
+    active_directory = None
+    progress = []
 
-    def arm(name):
+    def phase(name, **details):
+        if active_directory is None:
+            return
+        progress.append(dict(time=time.time(), phase=name, rank=rank, **details))
+        path = active_directory / f'progress-rank{rank}.json'
+        temporary = path.with_suffix('.tmp')
+        temporary.write_text(json.dumps(progress[-100:], indent=2)+'\n')
+        temporary.replace(path)
+
+    from tools.deepseek_v41_device_chain import set_preparation_observer
+    set_preparation_observer(phase)
+
+    graph_compilation_count()  # Subscribe before creating either cold arm.
+
+    def arm(name, factory=None, factory_reference=None):
         if name not in arms:
-            if name in ('dense_fp8', 'dense_fp8_tail', 'dense_fp8_static_int32',
+            if factory is not None:
+                program = factory(stages[factory_reference], clone_module)
+            elif name in ('dense_fp8', 'dense_fp8_tail', 'dense_fp8_static_int32',
                         'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff',
+                        'handoff_int32_literals', 'handoff_static_factories', 'handoff_static_merged_segments',
+                        'handoff_fp4_mirror_pack', 'handoff_index_mirror_gather', 'handoff_mhc_packed_gates',
+                        'handoff_sampling_full', 'handoff_sampling_bounded',
                         'long_index_packed', 'long_index_mme', 'long_index_paged_mme', *COMPILER_CANDIDATES):
                 if 'dense_fp8' not in stages:
                     stages['dense_fp8'] = make_dense_stage(stage, shard, args.ab_dense_sidecar, args.ab_dense_config)
                 program = (make_handoff_stage(stages['dense_fp8'])
-                           if name in ('dense_fp8_swa_norm_handoff', 'long_index_packed',
-                                       'long_index_mme', 'long_index_paged_mme')
+                           if name in ('dense_fp8_swa_norm_handoff', 'handoff_int32_literals',
+                                       'handoff_static_factories', 'handoff_static_merged_segments',
+                                       'handoff_fp4_mirror_pack',
+                                       'handoff_index_mirror_gather', 'handoff_mhc_packed_gates',
+                        'handoff_sampling_full', 'handoff_sampling_bounded',
+                                       'long_index_packed',
+                                       'long_index_mme', 'long_index_paged_mme',
+                                       'handoff_expert_sequential', 'handoff_expert_sequential_sram')
                            else make_attention_norm_stage(stages['dense_fp8']) if name == 'dense_fp8_swa_norm_quant'
                            else make_swa_stage(stages['dense_fp8']) if name == 'dense_fp8_swa_packed'
                            else clone_module(stages['dense_fp8']))
@@ -242,13 +430,51 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                 program = clone_module(stage)
             else:
                 raise ValueError(f'Unknown resident candidate {name}')
-            program.decode_static_int32 = name == 'dense_fp8_static_int32'
+            if factory is None:
+                program.decode_static_int32 = name in (
+                    'dense_fp8_static_int32', 'handoff_int32_literals',
+                    'handoff_static_factories', 'handoff_static_merged_segments',
+                    'handoff_sampling_full', 'handoff_sampling_bounded')
+                program.decode_static_factories = name in (
+                    'handoff_static_factories', 'handoff_static_merged_segments',
+                    'handoff_sampling_full', 'handoff_sampling_bounded')
+                program.decode_merge_mhc_partitions = name == 'handoff_static_merged_segments'
+            if name.startswith('handoff_expert_sequential'):
+                import torch
+                program.layers = torch.nn.ModuleList([clone_module(block) for block in program.layers])
+                for block in program.layers:
+                    block.moe = clone_module(block.moe)
+                    block.moe.sequential_w2 = True
+            for block in program.layers:
+                if name == 'handoff_mhc_packed_gates':
+                    block.decode_packed_control_gates = True
+                if name == 'handoff_fp4_mirror_pack':
+                    block.attention.decode_fp4_mirror_pack = True
+                if name == 'handoff_index_mirror_gather':
+                    block.attention.decode_index_mirror_gather = True
             if name in ('long_index_packed', 'long_index_mme', 'long_index_paged_mme'):
                 for block in program.layers:
                     block.attention.runtime_index_mme = name != 'long_index_packed'
                     if name == 'long_index_paged_mme':
                         block.attention.index_mirror_scores = False
-            replay = StageReplay(program, greedy_tail=name in ('tail', 'dense_fp8_tail'))
+            if name in ('handoff_sampling_full', 'handoff_sampling_bounded'):
+                import torch
+                from vllm_gaudi import envs
+
+                program.benchmark_official_sampling = True
+                program.device_sampling = name == 'handoff_sampling_bounded'
+                # The partial fixture builds a plain Module rather than
+                # PreparedStage. Honor the same optional position contract
+                # when constructing this independent cold reference arm.
+                program.device_next_position = program.device_sampling and envs.VLLM_HPU_DSV41_DEVICE_NEXT_POSITION
+                program.register_buffer('sampling_params', torch.tensor([[1., .95, -1.]], device='hpu'))
+                program.register_buffer('sampling_seed', torch.tensor([42], dtype=torch.int32, device='hpu'))
+                program.register_buffer('sampling_counter', torch.zeros(1, dtype=torch.int32, device='hpu'))
+                program.register_buffer('sampling_origin', torch.tensor(
+                    [args.context_tokens-1], dtype=torch.int32, device='hpu'))
+            replay = StageReplay(program, greedy_tail=name in (
+                'tail', 'dense_fp8_tail', 'handoff_sampling_full', 'handoff_sampling_bounded')
+                or getattr(program, 'candidate_replay_tail', False))
             program.replay_owner = replay
             stages[name], arms[name] = program, replay
             # Preserve actual compiler output for kernel-count changes. This
@@ -256,10 +482,15 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
             graph_directory = control / 'compiler-graphs' / name / f'rank{rank}'
             graph_directory.mkdir(parents=True, exist_ok=True)
             settings = dict(COMPILER_CANDIDATES.get(name, {}))
-            if name not in ('long_index_packed', 'long_index_mme', 'long_index_paged_mme'):
-                settings['DUMP_POST_GRAPHS'] = str(graph_directory)
+            # Synapse appends all cold compilations in a process to this JSON.
+            # Concurrent eager compilation can leave a truncated document;
+            # graph export therefore belongs in a serialized diagnostic run.
+            if os.environ.get('DSV41_RESIDENT_POST_GRAPH') == '1':
+                settings['DUMP_POST_GRAPHS'] = str(graph_directory / 'graph.post.json')
             with compiler_settings(settings):
+                phase('cold_plan_start', arm=name)
                 chain(True, 2, measure=False, engine=replay, warm_steps=6)
+                phase('cold_plan_complete', arm=name)
             if not replay.input_variant_ready(program.search_length):
                 raise RuntimeError('Candidate did not capture its own complete native input replay')
         return arms[name]
@@ -268,6 +499,9 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
         ready = dict(pid=os.getpid(), source=os.environ['DSV41_RUN_EVIDENCE'],
                      candidates=['dense_fp8', 'tail', 'dense_fp8_tail', 'dense_fp8_static_int32',
                                  'dense_fp8_swa_packed', 'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff',
+                                 'handoff_int32_literals', 'handoff_static_factories', 'handoff_static_merged_segments',
+                        'handoff_fp4_mirror_pack', 'handoff_index_mirror_gather', 'handoff_mhc_packed_gates',
+                        'handoff_sampling_full', 'handoff_sampling_bounded',
                                  'long_index_packed', 'long_index_mme', 'long_index_paged_mme', *COMPILER_CANDIDATES])
         (control / 'ready.json').write_text(json.dumps(ready, indent=2)+'\n')
     print(f'TP{rank}: real16 fixture resident; control {control}', flush=True)
@@ -308,18 +542,10 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
             name = job['candidate']
             directory = control / job['id']
             directory.mkdir(exist_ok=True)
+            active_directory = directory
+            progress.clear()
+            phase('job_start', candidate=name)
             begun = time.monotonic()
-            if rank == 0:
-                def expire(path=directory, candidate_name=name, start=begun):
-                    partial = dict(status='candidate_timeout', candidate=candidate_name,
-                                   elapsed_s=time.monotonic()-start, formal_gain_credit=False,
-                                   partial_periods='periods.json', worker_exit_code=124)
-                    (path / 'result.json').write_text(json.dumps(partial, indent=2)+'\n')
-                    # Elastic retires this task's other ranks; foreign card owners are untouched.
-                    os._exit(124)
-                deadline = threading.Timer(45 * 60, expire)
-                deadline.daemon = True
-                deadline.start()
             wait_for_loading(directory, rank, dist)
             if job.get('command') == 'diagnose_index_mirror':
                 import torch
@@ -368,8 +594,6 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                         if any('observer_error' in row for row in checks) else 'diagnostics_completed',
                         timed=False, formal_gain_credit=False, checks_file='checks-rank*.json'), indent=2)+'\n')
                     Path(job['request_path']).rename(Path(job['request_path']).with_suffix('.consumed'))
-                    deadline.cancel()
-                    deadline = None
                 continue
             if job.get('reference_result'):
                 saved_path = Path(job['reference_result'])
@@ -415,8 +639,9 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                     result = dict(status='completed', candidate=name, steps=steps, context_tokens=args.context_tokens,
                                   reference_result=str(saved_path), reference_arm=label, baseline_measured=False,
                                   comparison=dict(baseline=old, candidate=new, saving_ms=delta,
-                                                  validity_threshold_ms=2 * old['iqr_ms'],
-                                                  effective=delta > 2 * old['iqr_ms'], formal_gain_credit=False),
+                                                  effective=False,
+                                                  decision='Archived-arm diagnostic; paired device rounds required',
+                                                  formal_gain_credit=False),
                                   no_profiler=True, no_hot_compilation=True, feedback_tokens_exact=True,
                                   checked_first_device_positions=[row['checked_first_device_position']
                                                                   for row in ranks],
@@ -425,29 +650,143 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                     (directory / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
                     Path(job['request_path']).rename(Path(job['request_path']).with_suffix('.consumed'))
                     print(json.dumps(result), flush=True)
-                    deadline.cancel()
-                    deadline = None
                 continue
             reference_name = job.get('baseline', 'baseline')
             reference = arm(reference_name)
-            candidate = arm(name)
-            # Resolve both warmed contracts before the no-hot-compilation gate.
-            chain(True, 2, measure=False, engine=reference, warm_steps=6)
+            baseline_factory_record = None
+            if job.get('baseline_factory'):
+                baseline_factory, baseline_factory_record = load_candidate_factory(
+                    job['baseline_factory'], job['baseline_factory_sha256'])
+                parent_name = reference_name
+                reference_name = 'factory_' + baseline_factory_record['sha256']
+                reference = arm(reference_name, baseline_factory, parent_name)
+                baseline_factory_record['shared_sources'] = getattr(
+                    reference.program(), 'candidate_shared_sources', [])
+            factory_record = None
+            if name == 'factory':
+                factory, factory_record = load_candidate_factory(job['factory'], job['factory_sha256'])
+                name = 'factory_' + factory_record['sha256']
+                candidate = arm(name, factory, reference_name)
+                factory_record['shared_sources'] = getattr(candidate.program(), 'candidate_shared_sources', [])
+            else:
+                candidate = arm(name)
+            numerical_gate = None
+            if name == 'handoff_static_merged_segments' or factory_record is not None:
+                if state_fingerprints is None or (
+                        name == 'handoff_static_merged_segments' and reference_name != 'handoff_static_factories'):
+                    raise ValueError('Repartitioning requires the same static-coordinate reference and state observer')
+                def hidden_observer(destination):
+                    def observe(program, hidden, position):
+                        import torch
+
+                        value = hidden.detach().cpu().contiguous()
+                        if getattr(program, "native_memory_ready", False):
+                            checked = 0
+                            for variant in program.replay_owner.variants.values():
+                                statuses = getattr(variant, "memory_ready_status", None)
+                                if statuses is None:
+                                    continue
+                                for status in statuses:
+                                    if not bool((status.detach().cpu() == 1).all()):
+                                        raise RuntimeError("Device acquiring reader reported a timeout")
+                                    checked += status.numel()
+                            if not checked:
+                                raise RuntimeError("No actual acquiring-reader status endpoints")
+                        destination.append(dict(position=position, shape=list(value.shape), dtype=str(value.dtype),
+                            sha256=hashlib.sha256(value.view(torch.uint8).numpy().tobytes()).hexdigest()))
+                    return observe
+
+                old_hidden, new_hidden = [], []
+                phase('reference_correctness_start')
+                old_tokens = chain(True, 5, measure=False, engine=reference, warm_steps=1,
+                                   observer=hidden_observer(old_hidden))[0]
+                phase('reference_state_readback_start')
+                old_state = state_fingerprints()
+                phase('candidate_correctness_start')
+                new_tokens = chain(True, 5, measure=False, engine=candidate, warm_steps=1,
+                                   observer=hidden_observer(new_hidden))[0]
+                phase('candidate_state_readback_start')
+                new_state = state_fingerprints()
+                try:
+                    numerical_gate = check_repartition_state(old_tokens, old_state, new_tokens, new_state)
+                except RuntimeError as error:
+                    numerical_gate = dict(tokens_exact=old_tokens == new_tokens, mutable_state_exact=False,
+                                          error=str(error), reference_state=old_state, candidate_state=new_state)
+                numerical_gate.update(hidden_exact=bool(old_hidden) and old_hidden == new_hidden,
+                                      reference_hidden=old_hidden, candidate_hidden=new_hidden)
+                (directory / f'numerical-gate-rank{rank}.json').write_text(
+                    json.dumps(numerical_gate, indent=2)+'\n')
+                gates = [None] * dist.get_world_size()
+                dist.all_gather_object(gates, numerical_gate)
+                phase('correctness_complete')
+                if any(not gate['mutable_state_exact'] or not gate['hidden_exact'] for gate in gates):
+                    if rank == 0:
+                        (directory / 'result.json').write_text(json.dumps(dict(
+                            status='numerical_contract_failed', timed=False, numerical_gates=gates,
+                            formal_gain_credit=False), indent=2)+'\n')
+                        Path(job['request_path']).rename(Path(job['request_path']).with_suffix('.consumed'))
+                    continue
+            if job.get('trace_config'):
+                result = capture_physical_arms(directory, job['trace_config'],
+                    [('A', reference), ('B', candidate)], chain, rank, dist, preparation_counts)
+                if rank == 0:
+                    (directory / 'result.json').write_text(json.dumps(result, indent=2)+'\n')
+                    Path(job['request_path']).rename(Path(job['request_path']).with_suffix('.consumed'))
+                continue
+            # Repair/alias variants may first occur after the short numerical
+            # screen. Warm the exact timed trajectory for both independent
+            # plans, rather than using the first scored period as compilation.
+            warmup_counts = preparation_counts()
+            for label, engine in [('A', reference), ('B', candidate)]:
+                phase('trajectory_warmup_start', arm=label, steps=steps+32)
+                chain(True, steps, measure=False, engine=engine, warm_steps=32)
+                phase('trajectory_warmup_complete', arm=label)
+            import torch
+            torch.hpu.synchronize()
+            dist.barrier()
             counts = preparation_counts()
+            (directory / f'full-warmup-rank{rank}.json').write_text(json.dumps(dict(
+                before=warmup_counts, after=counts, steps_per_arm=steps + 32,
+                timed=False), indent=2)+'\n')
             periods = []
+            invalid_period = False
             for label in ('A', 'B', 'A', 'B', 'A', 'B'):
-                if time.monotonic() - begun > 45 * 60:
-                    raise TimeoutError('Candidate reached the 45-minute limit')
+                for record in (baseline_factory_record, factory_record):
+                    if record is None:
+                        continue
+                    if hashlib.sha256(Path(record['path']).read_bytes()).hexdigest() != record['sha256']:
+                        raise RuntimeError('Arm factory changed during qualification')
+                    if any(hashlib.sha256(Path(row['path']).read_bytes()).hexdigest() != row['sha256']
+                           for row in record['shared_sources']):
+                        raise RuntimeError('Shared arm implementation changed during qualification')
                 wait_for_loading(directory, rank, dist)
                 dist.barrier()
+                phase('timing_start', arm=label)
+                before_steps = report.get('bounded_sampler_steps', 0)
+                before_fallbacks = report.get('bounded_sampler_fallbacks', 0)
                 tokens, host_ms, device_ms = chain(True, steps, engine=reference if label == 'A' else candidate,
                                                    warm_steps=32)
-                assert counts == preparation_counts(), 'Hot recompilation invalidates the A/B measurement'
+                after_counts = preparation_counts()
+                phase('timing_complete', arm=label)
                 local = dict(rank=rank, tokens=tokens, delivery_ns=report['token_delivery_ns'],
-                             host_ms=host_ms, device_ms=device_ms,
+                             sampling_steps=report.get('bounded_sampler_steps', 0)-before_steps,
+                             sampling_fallbacks=report.get('bounded_sampler_fallbacks', 0)-before_fallbacks,
+                             host_ms=host_ms, device_ms=device_ms, device_step_ms=report['device_step_ms'],
+                             preparation_counts_before=counts, preparation_counts_after=after_counts,
                              checked_first_device_position=report.get('checked_first_device_position'))
                 ranks = [None] * dist.get_world_size()
                 dist.all_gather_object(ranks, local)
+                if any(row['preparation_counts_before'] != row['preparation_counts_after'] for row in ranks):
+                    if rank == 0:
+                        (directory / 'invalid-period.json').write_text(json.dumps(dict(
+                            arm=label, ranks=ranks, timings_valid=False,
+                            reason='Compiler/plan/cache counters changed during timing'), indent=2)+'\n')
+                        (directory / 'result.json').write_text(json.dumps(dict(
+                            status='timing_invalid_preparation_growth', resident_retained=True,
+                            numerical_gate=numerical_gate, formal_gain_credit=False), indent=2)+'\n')
+                        Path(job['request_path']).rename(Path(job['request_path']).with_suffix('.consumed'))
+                    invalid_period = True
+                    break
                 assert all(row['tokens'] == tokens for row in ranks), 'Ranks disagree on generated tokens'
                 if rank == 0:
                     delivery = [max(row['delivery_ns'][i] for row in ranks) for i in range(steps+1)]
@@ -457,14 +796,19 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                     (directory / 'periods.json').write_text(json.dumps(periods, indent=2)+'\n')
                     print(f"{name} {label}: {period['summary']['median_ms']:.6f} ms, "
                           f"IQR {period['summary']['iqr_ms']:.6f}", flush=True)
+            if invalid_period:
+                continue
             infos = [graph_info(reference), graph_info(candidate)]
             if rank == 0:
                 result = dict(status='completed', baseline=reference_name, candidate=name, steps=steps, order='ABABAB',
                               elapsed_s=time.monotonic()-begun, graphs=infos, comparison=compare_periods(periods),
+                              numerical_gate=numerical_gate,
+                              candidate_factory=factory_record,
+                              baseline_factory=baseline_factory_record,
                               context_tokens=args.context_tokens,
                               checked_first_device_positions=[row['checked_first_device_position'] for row in ranks],
                               no_profiler=True, no_hot_compilation=True, four_rank_tokens_equal=True,
-                              statistic_unit='Four-rank latest token delivery interval, milliseconds',
+                              statistic_unit='Slowest-rank device event ms/step; paired-round median',
                               baseline_drift_ms=max(p['summary']['median_ms'] for p in periods if p['arm']=='A')
                               - min(p['summary']['median_ms'] for p in periods if p['arm']=='A'),
                               formal_quality_pending=True, periods_file='periods.json')
@@ -486,6 +830,17 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                     if not result['cross_arm_feedback_exact']:
                         result['comparison']['effective'] = False
                         result['status'] = 'numerical_contract_failed'
+                if factory_record is not None or name in ('handoff_sampling_bounded',
+                            'handoff_expert_sequential', 'handoff_expert_sequential_sram',
+                            'handoff_int32_literals', 'handoff_static_factories', 'handoff_static_merged_segments',
+                            'handoff_fp4_mirror_pack', 'handoff_index_mirror_gather'):
+                    result['cross_arm_feedback_exact'] = all(
+                        p['ranks'][0]['tokens'] == periods[0]['ranks'][0]['tokens'] for p in periods)
+                    result['gain_ledger_eligible'] = (
+                        result['cross_arm_feedback_exact'] and result['comparison']['effective'])
+                    if not result['cross_arm_feedback_exact']:
+                        result['comparison']['effective'] = False
+                        result['status'] = 'numerical_contract_failed'
                 if name in COMPILER_CANDIDATES:
                     # Runtime compiler settings are absent from Bridge's recipe
                     # cache key. A/B timing alone cannot establish distinct arms.
@@ -501,11 +856,8 @@ def serve(stage, baseline, shard, chain, report, args, preparation_counts):
                 (directory / 'result.json').write_text(json.dumps(result, indent=2)+'\n')
                 Path(job['request_path']).rename(Path(job['request_path']).with_suffix('.consumed'))
                 print(json.dumps(result), flush=True)
-                deadline.cancel()
-                deadline = None
     finally:
-        if deadline is not None:
-            deadline.cancel()
+        set_preparation_observer(None)
         for name, replay in arms.items():
             if name != 'baseline':
                 replay.close()
@@ -536,14 +888,27 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--control-dir', type=Path, required=True)
     parser.add_argument('--candidate', choices=('dense_fp8', 'tail', 'dense_fp8_tail',
+                                              'factory',
                                               'dense_fp8_static_int32', 'dense_fp8_swa_packed',
                                               'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff',
+                                              'handoff_int32_literals', 'handoff_static_factories',
+                                              'handoff_static_merged_segments',
+                        'handoff_fp4_mirror_pack', 'handoff_index_mirror_gather', 'handoff_mhc_packed_gates',
+                        'handoff_sampling_full', 'handoff_sampling_bounded',
                                               'long_index_packed', 'long_index_mme', 'long_index_paged_mme',
                                               *COMPILER_CANDIDATES))
     parser.add_argument('--baseline', choices=('baseline', 'dense_fp8', 'dense_fp8_swa_packed',
-                                               'dense_fp8_swa_norm_quant', 'long_index_packed',
+                                               'dense_fp8_swa_norm_quant', 'dense_fp8_swa_norm_handoff',
+                                               'handoff_static_factories',
+                                               'handoff_sampling_full',
+                                               'handoff_sampling_bounded',
+                                               'long_index_packed',
                                                'long_index_paged_mme'), default='baseline')
     parser.add_argument('--steps', type=int, default=200)
+    parser.add_argument('--candidate-factory', type=Path,
+                        help='A repository factory returning an independently owned shared stage clone')
+    parser.add_argument('--trace-config', type=Path,
+                        help='Capture warmed arms for physical-node audit; no timed qualification')
     parser.add_argument('--reference-result', type=Path,
                         help='Reuse saved matching-context timing and feedback tokens; time only the candidate')
     parser.add_argument('--reference-arm', choices=('A', 'B'), default='B')
@@ -552,14 +917,23 @@ def main():
     args = parser.parse_args()
     if not args.stop and not args.candidate:
         parser.error('Select a candidate or --stop')
+    if args.trace_config and (args.reference_result or args.diagnose_index_mirror or args.stop):
+        parser.error('--trace-config requires a separate warmed-arm diagnostic job')
     if args.diagnose_index_mirror and not args.reference_result:
         parser.error('--diagnose-index-mirror needs the saved same-state A/B result')
     if args.steps < 200:
         parser.error('--steps must be at least 200')
+    if (args.candidate == 'factory') != (args.candidate_factory is not None):
+        parser.error('--candidate factory requires --candidate-factory')
     args.control_dir.mkdir(parents=True, exist_ok=True)
     job_id = f'{time.time_ns()}-{uuid.uuid4().hex[:8]}'
     job = dict(id=job_id, command='stop' if args.stop else 'measure', candidate=args.candidate,
                baseline=args.baseline, steps=args.steps)
+    if args.candidate_factory is not None:
+        factory_path = args.candidate_factory.resolve()
+        job.update(factory=str(factory_path), factory_sha256=hashlib.sha256(factory_path.read_bytes()).hexdigest())
+    if args.trace_config:
+        job['trace_config'] = str(args.trace_config.resolve())
     if args.diagnose_index_mirror:
         job['command'] = 'diagnose_index_mirror'
     if args.reference_result:

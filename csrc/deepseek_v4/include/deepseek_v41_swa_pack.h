@@ -4,7 +4,11 @@
 #ifdef DSV41_DECODED_KV_WRITE
 #include "deepseek_v41_kv_decode.h"
 #endif
+#ifdef DSV41_RETURN_DECODED_KV
+static inline bfloat128 swa_pack_number(float64 number, tensor output, int group,
+#else
 static inline void swa_pack_number(float64 number, tensor output, int group,
+#endif
                                    int output_row, int width
 #ifdef DSV41_DECODED_KV_WRITE
                                   , tensor decoded, int decoded_row
@@ -38,19 +42,31 @@ static inline void swa_pack_number(float64 number, tensor output, int group,
     uint256 wide = {0};
     wide.v1 = as_uint64(code) | ((as_uint64(number) >> 24) & 128);
 #ifdef DSV41_DECODED_KV_WRITE
+#if defined(DSV41_OPTIONAL_DECODED_KV_WRITE) && !defined(DSV41_RETURN_DECODED_KV)
+    if (decoded_row >= 0) {
+#endif
     float128 decoded_value = {0};
     decoded_value.v1 = e4m3fn(wide.v1) * ue8m0(as_uint64(scale_code));
     const bfloat128 decoded_bf16 = convert_float128_to_bfloat128(
         decoded_value, SW_RHNE | SW_LINEAR);
+#if defined(DSV41_OPTIONAL_DECODED_KV_WRITE) && defined(DSV41_RETURN_DECODED_KV)
+    if (decoded_row >= 0)
+#endif
     v_bf16_st_tnsr_partial(
         (int5){32 * group, decoded_row, 0, 0, 0}, decoded,
         decoded_bf16, 31, 0);
+#if defined(DSV41_OPTIONAL_DECODED_KV_WRITE) && !defined(DSV41_RETURN_DECODED_KV)
+    }
+#endif
 #endif
     const uchar256 encoded = convert_uint256_to_uchar256(wide, SW_LINEAR);
     v_u8_st_tnsr_partial((int5){32 * group, output_row, 0, 0, 0}, output, encoded, 31, 0);
     wide.v1 = as_uint64(scale_code);
     const uchar256 scales = convert_uint256_to_uchar256(wide, SW_LINEAR);
     v_u8_st_tnsr_partial((int5){width + group, output_row, 0, 0, 0}, output, scales, 0, 0);
+#ifdef DSV41_RETURN_DECODED_KV
+    return decoded_bf16;
+#endif
 }
 
 static inline void swa_pack_group(tensor value, tensor output, int group,

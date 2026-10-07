@@ -60,6 +60,7 @@ def test_index_query_scale_uses_global_head_count(monkeypatch, tp_size):
     attention = SimpleNamespace(
         index_heads=local_heads,
         tensor_parallel_size=tp_size,
+        native_rope=False,
         weights=SimpleNamespace(indexer=SimpleNamespace(wq_b=projection, weights_proj=weight_projection)),
         linear=lambda value, weight: torch.ones(2, local_heads * 128 if weight is projection else local_heads),
         _rope=lambda value, positions, request_batch=False: value,

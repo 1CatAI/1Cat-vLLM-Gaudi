@@ -34,8 +34,9 @@ struct NativeGraphTopology {
 
   static NativeGraphTopology prepare(const std::vector<NativeNodeKind>& nodes, size_t groups,
                                      bool externalInputCompletion = false,
-                                     size_t expectedCollectives = 0, bool externalPrefix = false) {
-    const bool explicitTopology = expectedCollectives != 0;
+                                     size_t expectedCollectives = 0, bool externalPrefix = false,
+                                     bool topologyConfigured = false) {
+    const bool explicitTopology = topologyConfigured || expectedCollectives != 0;
     if (!groups || (!explicitTopology && groups != 1 && groups != 8))
       throw std::invalid_argument("Invalid native group coverage");
     const size_t expected = explicitTopology ? expectedCollectives : groups * 16;
@@ -64,7 +65,8 @@ struct NativeGraphTopology {
       }
       if (!node.peerOnly) ++result.computeCount;
     }
-    if (result.consumers.size() != expected || result.consumers.back() >= result.computeCount)
+    if (!result.computeCount || result.consumers.size() != expected ||
+        (!result.consumers.empty() && result.consumers.back() >= result.computeCount))
       throw std::invalid_argument("Native exchange has no compiled consumer");
     return result;
   }

@@ -1,0 +1,3286 @@
+{
+  "base_main": "e6f0a36c11bc406c028ebfc0acbea4b0a190f830",
+  "branch": "codex/tp4-decode-kernel-fusion",
+  "cards": [
+    0,
+    1,
+    4,
+    5
+  ],
+  "cpus": [
+    10,
+    15,
+    38,
+    43
+  ],
+  "official_sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "seed": 42
+  },
+  "targets_ms": {
+    "16K_first": 7.0,
+    "16K_final": 7.0,
+    "128K": 11.0
+  },
+  "formal_trigger": {
+    "forecast_ms": 0.5,
+    "qualified_items": 3,
+    "aggregation": "either",
+    "user_update": "2026-10-07 trace-guided methodology"
+  },
+  "steps": [
+    {
+      "id": 1,
+      "name": "main16Ktrace",
+      "status": "sole main16K raw capture complete; four-rank extraction complete; native operators not fully symbolized"
+    },
+    {
+      "id": 2,
+      "name": "shared coordinates and misc",
+      "status": "I32+static factories real16 saving0.114383ms valid, not formal; pair pack/gather mirror candidates rejected"
+    },
+    {
+      "id": 3,
+      "name": "all-six-expert decode/MME",
+      "status": "old sequential W2/larger SRAM trials rejected; requested new all-six compound and ISA reduction not yet tried"
+    },
+    {
+      "id": 4,
+      "name": "mHC fusion",
+      "status": "packed control→gates exact; physical2→2, no small-chain gain"
+    },
+    {
+      "id": 5,
+      "name": "attention preprocessing fusion",
+      "status": "wide woA exact; small-chain26.0477 to26.0910us, rejected/off"
+    },
+    {
+      "id": 6,
+      "name": "exact bounded official sampling",
+      "status": "bounded scalar completion ABI repaired; formal 16.533458ms regression, 2382 natural EOS/semantic pass, one fallback per rank; no qualified formal gain"
+    },
+    {
+      "id": 7,
+      "name": "longdecode128K/512Ktrace and fewer source submissions",
+      "status": "deferred by latest batch ordering; prior launch stopped before capture"
+    }
+  ],
+  "deferred": "500K terminal-instruction semantic issue recorded in mergedPR57; outside this task",
+  "completed": false,
+  "confirmed_cumulative_real16_savings_ms": 0.114383,
+  "last_updated": 1791332805.9054482,
+  "formal_gain_ms": 0,
+  "confirmed_real16_gain_ms": 0.114383,
+  "baseline_capture": "sole merged-main hardware capture complete and archived; unprofiled10.568225ms reused",
+  "step2_candidates": [
+    "handoff_int32_literals",
+    "handoff_static_factories",
+    "handoff_fp4_mirror_pack",
+    "handoff_index_mirror_gather"
+  ],
+  "cpu_checks_passed": 85,
+  "native_build": "unchanged qualified main native runtime; prior unsuccessful binaries archived",
+  "native_database_passed": true,
+  "estimated_whole_ms": 0.1715745,
+  "qualified_code_commit": "7c9f86228d4281ccd718439ae1f8de290e6719a6",
+  "static_coordinates_serving_flag": "defaultOFF; official combined serving acceptance pending",
+  "latest_scope": "7ms official sampling; batch1 bounded sampling/static, batch2 host entry skew, batch3a/b global coordinates/segment merging, batch3c/d mHC/attention fusion, batch4 expert physical<=6 and ISA reduction",
+  "latest_goal": {
+    "tpot16k_ms": 7.0,
+    "tpot128k_ms": 11.0,
+    "official_temperature": 1.0,
+    "official_top_p": 0.95,
+    "seed": 42,
+    "formal_per_batch_once": true,
+    "real16_required_for_batch1": false,
+    "candidate_time_cap": null
+  },
+  "batches": [
+    {
+      "id": "1",
+      "name": "bounded_sampler_and_static_coordinates",
+      "expected_ms": 9.6,
+      "source_commit": "0ec9eb3937e04a00298ea5895ab2c972d03835ff",
+      "status": "formal regressed; semantic14 facts passed; sampler fallback1/2382 percard; no defaults promoted; host completion contention diagnostic next",
+      "actual_ms": 16.533458296939845,
+      "sampling_fallbacks": 1,
+      "candidate_case": "decode-sampling-static-serving-03",
+      "natural_eos": true,
+      "sampling_records": [
+        {
+          "rank": 3,
+          "request_id": "chatcmpl-ad06870c920c6a1c-9f403205",
+          "bounded_steps": 2382,
+          "fallbacks": 1
+        },
+        {
+          "rank": 2,
+          "request_id": "chatcmpl-ad06870c920c6a1c-9f403205",
+          "bounded_steps": 2382,
+          "fallbacks": 1
+        },
+        {
+          "rank": 1,
+          "request_id": "chatcmpl-ad06870c920c6a1c-9f403205",
+          "bounded_steps": 2382,
+          "fallbacks": 1
+        },
+        {
+          "rank": 0,
+          "request_id": "chatcmpl-ad06870c920c6a1c-9f403205",
+          "bounded_steps": 2382,
+          "fallbacks": 1
+        }
+      ],
+      "formal_result": "/home/ymzx/桌面/1cat-vllm-gaudi-work/dsv41-tp4-decode-gap-1p5-20260928/evidence/20260928_tp4-decode-gap-1p5/decode-sampling-static-serving-03/formal/result.json",
+      "evidence": "/home/ymzx/桌面/1cat-vllm-gaudi-work/dsv41-tp4-decode-gap-1p5-20260928/evidence/20260928_tp4-decode-gap-1p5/decode-sampling-static-serving-03",
+      "diagnostics": false,
+      "speed_qualified": false,
+      "sampling_fallback_rate": 0.00041981528127623844
+    },
+    {
+      "id": "2",
+      "name": "host_entry_alignment",
+      "expected_saving_ms": [
+        0.7,
+        1.0
+      ],
+      "status": "private same-plan official 80-token diagnosis complete: original12.244420ms, prepare11.443458ms, combined11.621215ms; yield rejected; no formal request/default promotion",
+      "instrumentation_commit": "94266a675ca6a0c0ea2aa0265ca4935e02c59f29",
+      "measurement_mode": "SDK raw HW + explicit host scopes with thread_cpu_ns and context switches; no torch CPU operator profiler",
+      "instrumentation_cpu_checks_passed": 8,
+      "evidence": "decode-host-entry-01/ENTRY_WINDOW_SUMMARY.json",
+      "stage_ms": [
+        9.80687,
+        9.954737,
+        10.115912,
+        9.983005
+      ],
+      "compute_union_ms": [
+        7.225923,
+        7.220352,
+        7.223396,
+        7.223725
+      ],
+      "producer_skew_median_us": 2.9205,
+      "physical_contexts_per_token": 3140,
+      "completion_return_to_next_device_ms": [
+        7.59031,
+        7.5363485,
+        7.2949749375,
+        7.506842625
+      ],
+      "diagnostic_case": "decode-sampling-handoff-serving-01",
+      "diagnostic_source_commit": "50b87e5b",
+      "diagnostic_expected_saving_ms": 4.0,
+      "diagnostic_actual_ms": null,
+      "formal_gain_credit": 0,
+      "short_diagnostics": {
+        "original": {
+          "status": "diagnostic_complete",
+          "formal": false,
+          "policy": "original",
+          "tokens": 80,
+          "prompt_tokens": 16384,
+          "cached_tokens": 0,
+          "decode_ms_token": 12.244420316176418,
+          "itl": {
+            "count": 79,
+            "mean_ms": 11.82719163266541,
+            "p50_ms": 12.07370194606483,
+            "p95_ms": 12.49420482199639,
+            "p99_ms": 12.757115704007447
+          },
+          "exit_code": 1,
+          "baseline_formal_ms": 16.533458296939845,
+          "formal_gain_credit": 0
+        },
+        "prepare": {
+          "status": "diagnostic_complete",
+          "formal": false,
+          "policy": "prepare",
+          "tokens": 80,
+          "prompt_tokens": 16384,
+          "cached_tokens": 0,
+          "decode_ms_token": 11.443458279429734,
+          "itl": {
+            "count": 79,
+            "mean_ms": 11.092820607090392,
+            "p50_ms": 11.20713900309056,
+            "p95_ms": 11.40596754848957,
+            "p99_ms": 11.795904871542007
+          },
+          "exit_code": 1,
+          "baseline_formal_ms": 16.533458296939845,
+          "formal_gain_credit": 0
+        },
+        "combined": {
+          "status": "diagnostic_complete",
+          "formal": false,
+          "policy": "combined",
+          "tokens": 80,
+          "prompt_tokens": 16384,
+          "cached_tokens": 0,
+          "decode_ms_token": 11.62121478391552,
+          "itl": null,
+          "exit_code": 1,
+          "baseline_formal_ms": 16.533458296939845,
+          "formal_gain_credit": 0
+        }
+      },
+      "short_expected_ms_saving": 4.0,
+      "short_best_ms_difference": 0.800962036746684,
+      "next": "same static-coordinate real16 baseline vs coarser mHC replay partitions, complete mutable-state gate before ABABAB"
+    },
+    {
+      "id": "3ab",
+      "name": "global_coordinate_buffer_and_replay_segments",
+      "expected_saving_ms": [
+        1.0,
+        1.2
+      ],
+      "target_physical_nodes": 1800,
+      "status": "coarser repartition exact mutable-state/token gate passed; ABABAB no confirmed gain; retain split/overlap baseline; global coordinate producer not integrated",
+      "candidate_case": "decode-kernel-resident-03",
+      "source_commit": "82f95711",
+      "expected_component_saving_ms": 0.3,
+      "actual_component_saving_ms": -0.2620320000000014,
+      "formal_gain_credit": 0,
+      "component_result": "evidence/20260928_tp4-decode-gap-1p5/decode-kernel-resident-03/control/1791054254034798348-4814d93f/result.json",
+      "component_comparison": {
+        "baseline": {
+          "n": 600,
+          "median_ms": 4.148187999999999,
+          "q1_ms": 4.124569,
+          "q3_ms": 4.29102225,
+          "iqr_ms": 0.16645325,
+          "mean_ms": 4.333419003333334,
+          "minimum_ms": 4.045791,
+          "maximum_ms": 14.927628
+        },
+        "candidate": {
+          "n": 600,
+          "median_ms": 4.410220000000001,
+          "q1_ms": 4.39082325,
+          "q3_ms": 4.427118500000001,
+          "iqr_ms": 0.03629525000000022,
+          "mean_ms": 4.409737081666667,
+          "minimum_ms": 4.337817,
+          "maximum_ms": 4.490099
+        },
+        "saving_ms": -0.2620320000000014,
+        "validity_threshold_ms": 0.3329065,
+        "effective": false,
+        "slower": false,
+        "period_medians_ms": [
+          4.582046,
+          4.409967,
+          4.132702,
+          4.411605,
+          4.132697,
+          4.4087685
+        ],
+        "formal_gain_credit": false
+      },
+      "compute_calls": [
+        72,
+        40
+      ],
+      "native_collectives": 41
+    },
+    {
+      "id": "3cd",
+      "name": "mHC_and_attention_fusion",
+      "targets": {
+        "mHC_per_layer": 2,
+        "attentionTPC_per_layer": 3
+      },
+      "status": "pending"
+    },
+    {
+      "id": "4",
+      "name": "new_expert_compound_and_ISA_reduction",
+      "target_physical_nodes_per_layer": 6,
+      "target_expert_ms": 1.4,
+      "target_vector_instruction_reduction": 0.4,
+      "status": "All-route compound tested twice and rejected; SRAM/DRAM root proven by physical graph; return to host/coordinate path"
+    }
+  ],
+  "offline_candidates": {
+    "global_coordinates": {
+      "simulator_exact_cases": 33,
+      "physical_nodes": null,
+      "measured_ms": null
+    },
+    "merged_mhc_segments": {
+      "expected_ms": 0.3,
+      "measured_ms": null,
+      "default_on": false
+    },
+    "expert_grouped_lut": {
+      "case": "decode-expert-lut-02",
+      "status": "Parked before hardware; uniform32 path fails real-weight eligibility; four-class one-shuffle address mapping fails ISA simulation",
+      "sampled_experts": 60,
+      "sampled_N256_blocks": 750,
+      "uniform32_eligible_blocks": 0,
+      "two_class_whole_vectors_eligible_fraction": 0.2623611,
+      "qualified_gain_ms": 0,
+      "notes": "Uniform toy2940-ish instruction counts are simulator evidence only, not a production microbenchmark or end-to-end gain"
+    }
+  },
+  "host_entry_diagnostic": {
+    "capture": "decode-host-entry-01",
+    "captured_tokens": 128,
+    "prefix_host_skew_median_us": 383.45745849609375,
+    "prefix_host_skew_p95_us": 812.0570068359375,
+    "new_completion_guard": "125/128 rank0 waits occur in main thread before continuation position/Engram/prefix preparation",
+    "guard_wait_median_us": 11763.84,
+    "device_alignment_pending": true,
+    "safe_overlap_patch_cpu_checks": 60,
+    "new_formal_gain_ms": 0
+  },
+  "all_route_slots_resident_04": {
+    "status": "invalid_candidate_activation",
+    "reference_ms": 4.141984,
+    "candidate_ms": 4.1280095,
+    "difference_ms": 0.0139745,
+    "two_iqr_threshold_ms": 0.248617,
+    "tokens_and_33_mutable_states_exact": true,
+    "formal_gain_credit_ms": 0,
+    "default_enabled": false,
+    "result": "decode-kernel-resident-04/control/1791057451322741769-2e91b26a/result.json",
+    "physical_nodes": "same candidate/reference recipes; not an enabled all-route comparison",
+    "reason": "Serving passes decode=True but candidate tested ordinary_decode only; same raw compute recipe IDs in A and B",
+    "difference_is_gain": false,
+    "qualification_valid": false
+  },
+  "all_route_slots_resident_05_retry": {
+    "status": "activated_candidate_regression",
+    "dispatch_fix": "Pass serving decode into the shared expert body; bind both public and internal candidate methods",
+    "activation_gate": "Every compiled layer group must contain the slots compound operator before timing",
+    "cpu_tests_passed": 48,
+    "job": "decode-kernel-resident-05/control/1791059507437760448-c424160b",
+    "formal_gain_credit_ms": 0,
+    "comparison": {
+      "baseline": {
+        "n": 600,
+        "median_ms": 4.1437574999999995,
+        "q1_ms": 4.123469500000001,
+        "q3_ms": 4.41573375,
+        "iqr_ms": 0.29226424999999967,
+        "mean_ms": 4.423765351666667,
+        "minimum_ms": 2.063996,
+        "maximum_ms": 13.981279
+      },
+      "candidate": {
+        "n": 600,
+        "median_ms": 4.7309205,
+        "q1_ms": 4.71425225,
+        "q3_ms": 4.7481475,
+        "iqr_ms": 0.0338952499999996,
+        "mean_ms": 4.730984991666666,
+        "minimum_ms": 4.660179,
+        "maximum_ms": 5.009953
+      },
+      "saving_ms": -0.5871630000000003,
+      "validity_threshold_ms": 0.5845284999999993,
+      "effective": false,
+      "slower": true,
+      "period_medians_ms": [
+        4.7542825,
+        4.730681000000001,
+        4.1309345,
+        4.7324455,
+        4.133022,
+        4.730296
+      ],
+      "formal_gain_credit": false
+    },
+    "numerical_gate": {
+      "tokens_exact": true,
+      "mutable_state_exact": true,
+      "state_tensors": 33
+    },
+    "default_enabled": false
+  },
+  "resident_05_physical_retry_failure": {
+    "status": "native_capture_out_of_memory",
+    "scal_request_bytes": 59144447,
+    "scal_free_bytes": 44770379,
+    "sdk_error": "synNativeComputeGraphEndCapture status1",
+    "trace_job": "1791059640860532630-47428f9c",
+    "new_arm_capture_after_prior_arms_and_profiler": true,
+    "cause_scope": "confirmed allocation exhaustion, not compiler arithmetic or model numerical failure",
+    "fix": "Audit existing warmed candidate plan rather than capturing a duplicate; reserve native SCAL headroom in the fixture",
+    "formal_gain_credit_ms": 0
+  },
+  "all_route_physical_audit": {
+    "case": "decode-kernel-resident-06",
+    "raw_complete_ranks": 8,
+    "calls_per_token_scope": "All captured TPC/MME lane-union components, eight real16 invocations, includes entry/head outside72-call native stage",
+    "A_physical_calls": [
+      1348.125,
+      1367.625,
+      1370.25,
+      1389.25
+    ],
+    "B_physical_calls": [
+      1482.375,
+      1509.25,
+      1490.25,
+      1511.375
+    ],
+    "rank0_compute_union_ms": [
+      3.046494,
+      3.685396
+    ],
+    "stage_calls": 72,
+    "communication_points": 41,
+    "rank0_stage_median_ms": [
+      3.88054925,
+      4.483581125
+    ],
+    "stage_producer_skew_median_us": [
+      3.0165,
+      2.70475
+    ],
+    "stage_producer_skew_p95_us": [
+      5.01025,
+      4.425625
+    ],
+    "stage_producer_skew_max_us": [
+      6160.20675,
+      2015.603
+    ],
+    "causal_violations": 0,
+    "status": "Candidate rejected: slots decoder96to32 but downstream Silu48to96 and batch products unroll into single GEMMs",
+    "default_enabled": false,
+    "formal_gain_credit": 0
+  },
+  "compiler_bgemm_candidate": {
+    "case": "decode-kernel-resident-07",
+    "expected_recovery_ms_real16": [
+      0.3,
+      0.6
+    ],
+    "setting": "ENABLE_BGEMM_FLATTEN_TO_GEMM_FOR_SLICING=false",
+    "status": "Rejected; second all-route real16 no-gain direction; no additional all-route compiler attempts",
+    "formal_gain_credit": 0,
+    "source_commit": "d3c99102",
+    "comparison": {
+      "baseline": {
+        "n": 600,
+        "median_ms": 4.139819,
+        "q1_ms": 4.119986,
+        "q3_ms": 4.15868675,
+        "iqr_ms": 0.038700750000000284,
+        "mean_ms": 4.170062068333333,
+        "minimum_ms": 3.750017,
+        "maximum_ms": 14.79635
+      },
+      "candidate": {
+        "n": 600,
+        "median_ms": 4.7384465,
+        "q1_ms": 4.71931425,
+        "q3_ms": 4.75437275,
+        "iqr_ms": 0.03505849999999988,
+        "mean_ms": 4.7375562916666665,
+        "minimum_ms": 4.644724,
+        "maximum_ms": 4.814981
+      },
+      "saving_ms": -0.5986275000000001,
+      "validity_threshold_ms": 0.07740150000000057,
+      "effective": false,
+      "slower": true,
+      "period_medians_ms": [
+        4.1451895,
+        4.7390465,
+        4.1350525000000005,
+        4.736958,
+        4.135809,
+        4.739615000000001
+      ],
+      "formal_gain_credit": false
+    },
+    "four_rank_hidden_exact": true,
+    "four_rank_states_exact": true,
+    "physical_result": "Cold layer0 graph retains15 GEMMs incl3dense +6Silu +2DRAM slot decoders; no pipeline restoration"
+  },
+  "device_next_position_candidate": {
+    "case": "decode-position-resident-01",
+    "expected_saving_ms": [
+      0.3,
+      0.5
+    ],
+    "status": "Two ABABAB attempts are numerically exact but fail two-IQR; fresh physical/host trace captured after attempts",
+    "default_enabled": false,
+    "formal_gain_credit": 0,
+    "abi_change": "Optional fifth sampling-tail tensor and optional CompletionRecord.device_position; existing first four payload fields unchanged",
+    "old_DMA_variants": "Not retried: archived V2/V3 positions DMA already regressed",
+    "attempts": [
+      {
+        "job": "1791063154115876448-b73d8989",
+        "comparison": {
+          "baseline": {
+            "n": 600,
+            "median_ms": 5.797824,
+            "q1_ms": 5.54873325,
+            "q3_ms": 10.875028,
+            "iqr_ms": 5.326294750000001,
+            "mean_ms": 8.575586826666667,
+            "minimum_ms": 4.66363,
+            "maximum_ms": 436.884789
+          },
+          "candidate": {
+            "n": 600,
+            "median_ms": 5.231869,
+            "q1_ms": 5.19572725,
+            "q3_ms": 5.361534750000001,
+            "iqr_ms": 0.16580750000000055,
+            "mean_ms": 5.723756,
+            "minimum_ms": 4.648623,
+            "maximum_ms": 9.220072
+          },
+          "saving_ms": 0.5659550000000007,
+          "validity_threshold_ms": 10.652589500000001,
+          "effective": false,
+          "slower": false,
+          "period_medians_ms": [
+            11.559227499999999,
+            5.219058,
+            5.5621385,
+            5.2511985,
+            5.572706999999999,
+            5.215675
+          ],
+          "formal_gain_credit": false
+        },
+        "sampling_fallbacks_per_rank_per_period": [
+          47,
+          47,
+          47,
+          47
+        ],
+        "gain_qualified": false
+      },
+      {
+        "job": "1791063732324977417-48594080",
+        "comparison": {
+          "baseline": {
+            "n": 600,
+            "median_ms": 5.631821,
+            "q1_ms": 5.5466905,
+            "q3_ms": 6.5261335,
+            "iqr_ms": 0.9794429999999998,
+            "mean_ms": 6.093718263333334,
+            "minimum_ms": 4.650648,
+            "maximum_ms": 12.199475
+          },
+          "candidate": {
+            "n": 600,
+            "median_ms": 5.2176255000000005,
+            "q1_ms": 5.1863935,
+            "q3_ms": 5.30831,
+            "iqr_ms": 0.12191649999999932,
+            "mean_ms": 5.687655935,
+            "minimum_ms": 4.643714,
+            "maximum_ms": 8.45118
+          },
+          "saving_ms": 0.41419549999999994,
+          "validity_threshold_ms": 1.9588859999999997,
+          "effective": false,
+          "slower": false,
+          "period_medians_ms": [
+            5.5846795,
+            5.23584,
+            6.042453500000001,
+            5.2112615,
+            5.56602,
+            5.20668
+          ],
+          "formal_gain_credit": false
+        },
+        "sampling_fallbacks_per_rank_per_period": [
+          47,
+          47,
+          47,
+          47
+        ],
+        "gain_qualified": false
+      },
+      {
+        "job": "1791065734418445410-a34fb066",
+        "baseline_ms": 5.5763095,
+        "candidate_ms": 5.2118785,
+        "saving_ms": 0.364431,
+        "threshold_ms": 0.546232,
+        "effective": false,
+        "recipe_counts_before": [
+          333,
+          333,
+          333,
+          333
+        ],
+        "recipe_counts_after": [
+          333,
+          333,
+          333,
+          333
+        ],
+        "numeric_tokens_state_hidden_exact": true
+      }
+    ],
+    "physical_trace_job": "1791064304705242002-f4a4935e",
+    "deferred_compilation_evidence": {
+      "total_copy_recipes": 235,
+      "varying_single_row_recipes": 232,
+      "positions": [
+        16384,
+        16615
+      ],
+      "recipe_offsets_equal_position_times4": true,
+      "first_attempt_no_hot_compilation_claim_invalid": true,
+      "native_plan_counter_missed_bridge_recipe_variants": true,
+      "evidence": "decode-position-resident-01/POSITION_RECIPE_EVIDENCE.json"
+    }
+  },
+  "all_route_access_repair": {
+    "status": "rejected before16timing",
+    "numerical": "0 differences in1/2/6slot simulator with valid/invalid routes; full production-shape BF16 consumer exact",
+    "physical_compute_nodes": {
+      "paired": 18,
+      "candidate": 23
+    },
+    "expert_decoder_outputs": {
+      "paired": "SRAM",
+      "candidate": "DRAM"
+    },
+    "gemm_calls": {
+      "paired": 6,
+      "candidate": 12
+    },
+    "actual_ms": null,
+    "gain_credit": false,
+    "decision": "Access-axis repair and prefetch16 do not recover compiler batch slicing; leave disabled and avoid another identical16trial"
+  },
+  "mhc_gate_norm_candidate": {
+    "status": "small-chain no gain; not advanced to16layer",
+    "numerical": "B1/B2/B6 five outputs exact bytes",
+    "physical_TPC_nodes": {
+      "A": 2,
+      "B": 1
+    },
+    "device_us": {
+      "A": 37.79,
+      "B": 40.926,
+      "delta_saving": -3.136,
+      "threshold": 4.101
+    },
+    "host_us": {
+      "A": 53.164,
+      "B": 55.042
+    },
+    "performance_credit": false,
+    "remaining_question": "This combines independent gates/norm consumers, not control GEMV or producer post-collapse; those dependencies still need a different dataflow design",
+    "decision": "Archive native source and remove unqualified operator registration; no serving/default changes"
+  },
+  "position_serving_repair": {
+    "status": "formal finished; regression partly repaired; slower than accepted baseline; investigate remaining gap",
+    "actual_ms": 11.39243708612301,
+    "natural_eos": true,
+    "sampling_records": [
+      {
+        "rank": 3,
+        "request_id": "chatcmpl-abb5af3dff84f91c-a9e2070f",
+        "bounded_steps": 2382,
+        "fallbacks": 1
+      },
+      {
+        "rank": 1,
+        "request_id": "chatcmpl-abb5af3dff84f91c-a9e2070f",
+        "bounded_steps": 2382,
+        "fallbacks": 1
+      },
+      {
+        "rank": 0,
+        "request_id": "chatcmpl-abb5af3dff84f91c-a9e2070f",
+        "bounded_steps": 2382,
+        "fallbacks": 1
+      },
+      {
+        "rank": 2,
+        "request_id": "chatcmpl-abb5af3dff84f91c-a9e2070f",
+        "bounded_steps": 2382,
+        "fallbacks": 1
+      }
+    ],
+    "formal_result": "/opt/ssd960/1cat-vllm-decode-archives/decode-position-serving-01/formal/result.json",
+    "decode_ms": 11.39243708612301,
+    "accepted_baseline_ms": 10.568225,
+    "difference_vs_accepted_ms": 0.8242120861230102,
+    "previous_regressed_formal_ms": 16.533458296939845,
+    "prefill_tokens_s": 8785.904837537677,
+    "output_tokens": 2382,
+    "all_prior_token_ids_equal": true,
+    "gain_credit": false,
+    "defaults_promoted": false,
+    "source_head": "559a79be"
+  },
+  "sampling_head_dataflow_screen": {
+    "status": "prepared, not launched",
+    "question": "The quoted-.784ms micro starts at already resident synthetic logits; the service has a real MME head producer and externally visible fallback logits. Inspect the head-to-selection allocation and dependencies before transferring its estimate",
+    "production_cold_contract": "actual head checkpoint and next embedding; same4cards/CPUs after current capture; never time an uncovered synthetic nucleus",
+    "formal": false,
+    "gain_credit": false,
+    "created": 1791070002.4050667
+  },
+  "position_trace_diagnosis": {
+    "report": "/opt/ssd960/1cat-vllm-decode-archives/decode-position-trace-01/REPORT.md",
+    "cycles": 31,
+    "formal_gain_credit": false,
+    "entry_skew_median_us": 295.127685546875,
+    "entry_skew_p95_us": 874.224365234375,
+    "span_spread_median_ms": 0.2930901249996385,
+    "rank0_handoff_mean_ms": 1.8354250773111978,
+    "partial_point_attribution": true
+  },
+  "device_input_feedback_candidate": {
+    "source": "74ec9e5b",
+    "case": "/opt/ssd960/1cat-vllm-decode-archives/decode-input-feedback-03",
+    "expected_full_model_ms": [
+      0.25,
+      0.4
+    ],
+    "cpu_tests": 92,
+    "status": "not_qualified_below_2iqr",
+    "formal_gain_credit": false,
+    "default_enabled": false,
+    "real16_baseline_ms": 5.218984,
+    "real16_candidate_ms": 5.150237000000001,
+    "real16_saving_ms": 0.06874699999999923,
+    "validity_threshold_ms": 0.33305449999999936
+  },
+  "updated": 1791202546.5163937,
+  "device_closed_loop": {
+    "candidate_commit": "e8588c95",
+    "status": "macro direction unchanged; byte-exact rollback validation candidate warming; no formal result",
+    "expected_formal_ms": 9.8,
+    "accepted_gain_ms": 0,
+    "device_frames": 2,
+    "lookahead_steps": 1,
+    "sampling_controls": "request admission only; preserved device uniform for repair",
+    "native_abi_change": false,
+    "cpu_tests_passed": 90,
+    "request_slot_tests_passed": 19,
+    "trace_evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-device-loop-trace-02",
+    "failed_startup": "/opt/ssd960/1cat-vllm-decode-archives/decode-device-loop-trace-01",
+    "measurement_gate": "160-token service trace handoff <=0.15ms, entry skew <=50us; one official formal request; no real16 IQR veto",
+    "remaining": [
+      "startup native repaired-state proof",
+      "160-token service trace",
+      "formal16K natural EOS"
+    ],
+    "development_commit": "72e1312e",
+    "installed_candidate_commit": "e8588c95",
+    "development_tests_passed": 92,
+    "pending_installation_change": "DeviceInputTransaction + commit-only history mirror keeps device producers across ordinary geometry entries; bundle after current native repair startup proof",
+    "live_case": "decode-device-loop-trace-02",
+    "live_workers": [
+      2569066,
+      2569067,
+      2569068,
+      2569069
+    ],
+    "live_api_pid": 2568727,
+    "trace_handoff_us": {
+      "sampling_to_embedding": [
+        {
+          "rank": 0,
+          "n": 30,
+          "median_us": 35.67468750011176,
+          "max_us": 36.55475000012666,
+          "all_us": [
+            35.754625000059605,
+            36.07462499989197,
+            35.51475000008941,
+            34.87474999995902,
+            35.59462499991059,
+            35.754750000312924,
+            36.23474999982864,
+            35.83474999992177,
+            35.35462500015274,
+            35.35475000040606,
+            35.99475000007078,
+            35.6746249999851,
+            31.594750000163913,
+            35.99474999960512,
+            35.51475000008941,
+            35.83474999992177,
+            35.034624999854714,
+            35.99462499981746,
+            35.67487500002608,
+            35.6746249999851,
+            35.754750000312924,
+            36.55475000012666,
+            36.2347500002943,
+            33.67474999977276,
+            31.034749999642372,
+            36.39475000044331,
+            35.354749999940395,
+            35.354749999940395,
+            35.194625000003725,
+            35.67475000023842
+          ]
+        },
+        {
+          "rank": 1,
+          "n": 30,
+          "median_us": 35.67468750011176,
+          "max_us": 36.474624999798834,
+          "all_us": [
+            36.154625000432134,
+            35.194625000003725,
+            35.27474999986589,
+            36.23462500004098,
+            35.99462500028312,
+            35.27462500007823,
+            36.474624999798834,
+            35.43449999997392,
+            35.43462500022724,
+            35.43462500022724,
+            36.07462500035763,
+            36.07462499989197,
+            36.07462499989197,
+            34.95475000003353,
+            35.914624999742955,
+            35.914624999742955,
+            35.914625000208616,
+            35.754625000059605,
+            35.99462500028312,
+            35.35462500015274,
+            35.27462500007823,
+            35.754625000059605,
+            35.99462500028312,
+            35.354624999687076,
+            31.754625000059605,
+            35.83474999992177,
+            35.594625000376254,
+            35.59475000016391,
+            35.11462499992922,
+            35.43449999997392
+          ]
+        },
+        {
+          "rank": 2,
+          "n": 30,
+          "median_us": 35.55462499987334,
+          "max_us": 36.55449999962002,
+          "all_us": [
+            35.51450000004843,
+            36.314375000074506,
+            35.67450000019744,
+            35.51450000004843,
+            35.83462500013411,
+            35.9144999999553,
+            35.51462499983609,
+            35.67450000019744,
+            35.754500000271946,
+            35.35462500015274,
+            35.35462500015274,
+            35.59462499991059,
+            36.55449999962002,
+            36.07462499989197,
+            35.11462499992922,
+            35.51462499983609,
+            36.39462499972433,
+            35.43449999997392,
+            36.07462499989197,
+            35.59462499991059,
+            35.034500000067055,
+            35.754499999806285,
+            35.43449999997392,
+            35.27462500007823,
+            34.87462500017136,
+            36.314499999862164,
+            35.034500000067055,
+            35.1144999996759,
+            34.874499999918044,
+            35.67449999973178
+          ]
+        },
+        {
+          "rank": 3,
+          "n": 30,
+          "median_us": 35.59456249978393,
+          "max_us": 36.794749999884516,
+          "all_us": [
+            35.35462500015274,
+            36.314499999862164,
+            35.59462499991059,
+            35.11462499992922,
+            36.39462500018999,
+            35.6746249999851,
+            35.19450000021607,
+            36.71450000023469,
+            34.7945000003092,
+            35.034500000067055,
+            35.67449999973178,
+            34.23474999982864,
+            36.154500000178814,
+            35.6746249999851,
+            34.634749999735504,
+            36.794749999884516,
+            36.07449999963865,
+            35.754625000059605,
+            34.87462500017136,
+            35.43449999997392,
+            36.474625000264496,
+            36.07462499989197,
+            35.03475000010803,
+            35.99462500028312,
+            34.874500000383705,
+            35.59449999965727,
+            35.754625000059605,
+            34.874499999918044,
+            34.95449999999255,
+            34.95462500024587
+          ]
+        }
+      ],
+      "entry_skew": {
+        "n": 30,
+        "median_us": 1.7734375,
+        "p95_us": 2.67962499987334,
+        "max_us": 5.570999999996275,
+        "all_us": [
+          1.236999999731779,
+          1.7927500000223517,
+          1.6566249998286366,
+          1.552375000435859,
+          1.422374999616295,
+          0.9683750001713634,
+          1.4622499998658895,
+          1.3961249999701977,
+          2.1551250000484288,
+          2.103624999988824,
+          1.837749999947846,
+          2.16025000018999,
+          5.570999999996275,
+          2.1193749997764826,
+          1.765625,
+          1.78125,
+          0.25837499974295497,
+          2.461499999742955,
+          2.67962499987334,
+          1.66800000006333,
+          2.5366250001825392,
+          1.190500000026077,
+          2.436625000089407,
+          1.1812499999068677,
+          3.181875000242144,
+          1.3203750001266599,
+          1.899874999653548,
+          1.4954999997280538,
+          1.9745000000111759,
+          1.2147499998100102
+        ]
+      },
+      "first_profile_cycle_excluded_from_entry_skew": true,
+      "source": "Actual embedding and final sample recipe hardware completion; recipes from cache source labels and late pipeline order"
+    },
+    "compilation_fallback_evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-device-loop-trace-02/FUSION_FAILURE_DIAGNOSIS.json",
+    "source_head": "dc7df85f",
+    "next_case": "decode-device-loop-trace-03",
+    "formal_gain_accepted": false,
+    "latest_case": "decode-device-loop-trace-05",
+    "previous_failure": "decode-device-loop-trace-04 startup numeric state comparison rejected repair",
+    "hypothesis": "Untouched floating scratch rows may contain identical NaN bytes; comparator now enforces byte identity and finite hidden state; HPU result pending",
+    "accepted_formal_gain_ms": 0.0,
+    "physical_nodes_unfused_trace": 3955,
+    "physical_nodes_reference_same_method": 2907
+  },
+  "active_measurement_protocol": {
+    "updated": 1791088312.9300137,
+    "candidate_correctness_inputs": "3-5 actual producer/consumer inputs, exact or agreed tolerance",
+    "micro_execution": "production native replay, true checkpoint shapes and weights",
+    "micro_perf": "same process A/B, three alternating rounds, device medians; all three directions consistent; no IQR veto",
+    "formal_trigger": "expected >=1 ms/token or 3-5 qualified candidates",
+    "formal": "one official temperature1/top_p.95/seed42 request plus one accompanying trace",
+    "promotion": "at least half accumulated forecast manifested; then default enable together",
+    "attribution": "use that one trace; stage/category precision +/-0.5 ms sufficient",
+    "minimum_forecast_ms_token": 0.1,
+    "minimum_forecast_ms_round": 0.3,
+    "compile_or_formal_wait": "write next major optimization while it runs",
+    "standalone_trace_cancelled": "/opt/ssd960/1cat-vllm-decode-archives/decode-device-loop-trace-06"
+  },
+  "pending_micro_batch": {
+    "items": [
+      {
+        "name": "device_closed_loop",
+        "micro_saving_ms_token": 1.0129874999999995,
+        "flag": "VLLM_HPU_DSV41_DEVICE_CLOSED_LOOP",
+        "default": false,
+        "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-micro-resident-06/control/1791093020265071283-96702816/result.json"
+      }
+    ],
+    "cumulative_expected_ms_token": 0.0,
+    "formal_pending": false,
+    "parent": "decode-position-serving-01; bounded sampling/static coordinates already included",
+    "projection_factor": 1.0,
+    "accepted": true,
+    "actual_ms_token": 9.997343230176622
+  },
+  "device_closed_loop_formal": {
+    "status": "formal measured; semantic review pending",
+    "actual_ms": 9.997343230176622,
+    "natural_eos": true,
+    "sampling_records": [
+      {
+        "rank": 1,
+        "request_id": "chatcmpl-bd3084b80dc71cc6-8cdd17d5",
+        "bounded_steps": 2382,
+        "fallbacks": 1
+      },
+      {
+        "rank": 3,
+        "request_id": "chatcmpl-bd3084b80dc71cc6-8cdd17d5",
+        "bounded_steps": 2382,
+        "fallbacks": 1
+      },
+      {
+        "rank": 0,
+        "request_id": "chatcmpl-bd3084b80dc71cc6-8cdd17d5",
+        "bounded_steps": 2382,
+        "fallbacks": 1
+      },
+      {
+        "rank": 2,
+        "request_id": "chatcmpl-bd3084b80dc71cc6-8cdd17d5",
+        "bounded_steps": 2382,
+        "fallbacks": 1
+      }
+    ],
+    "formal_result": "/opt/ssd960/1cat-vllm-decode-archives/decode-device-loop-serving-02/formal/result.json"
+  },
+  "qualified_baseline": {
+    "decode_ms_token": 8.23925759729292,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-accumulated-serving-07/formal/result.json",
+    "natural_eos": true,
+    "tokens": 2365,
+    "full_warmup": true,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "seed": 42,
+    "target_ms": 7.0,
+    "target_reached": false
+  },
+  "physical_fusion_wave_20261004": {
+    "formal_parent_tpot_ms": 9.997343230176622,
+    "target_tpot_ms": 7.0,
+    "target_nodes_per_token": 1000,
+    "order": [
+      "MoE",
+      "Attention/CSA2",
+      "mHC",
+      "non-communication replay merge"
+    ],
+    "batch_gate": "After three module-qualified candidates, one official T=1/top_p=.95 seed42 16K natural-EOS request and companion trace",
+    "active_micro_estimate_ms": 0.8516655624999999,
+    "paused": [
+      "ordered peer sum",
+      "peer post/collapse",
+      "address variants",
+      "LUT variants"
+    ],
+    "expert_sat_c1": {
+      "status": "paused after two physical-count failures",
+      "round2_nodes": [
+        19,
+        28
+      ],
+      "round3_nodes": [
+        19,
+        24
+      ],
+      "round3_savings_ms_four_layers": [
+        -0.047896,
+        -0.0476545,
+        -0.047748
+      ],
+      "correctness": "5 checkpoint-derived inputs exact on four ranks",
+      "sram_gate": "six-route W2 output spills to DRAM",
+      "formal_gain_credit": 0
+    },
+    "attention_prologue": {
+      "status": "handwritten KV normalization/rotation/packed publication kernel in numerical/dependency validation",
+      "flag": "VLLM_HPU_DSV41_ATTN_FUSED_PROLOGUE=0",
+      "formal_gain_credit": 0
+    },
+    "attention_status": {
+      "flag_default": 0,
+      "physical_consumer_nodes": [
+        20,
+        14
+      ],
+      "five_inputs_four_ranks_exact": true,
+      "round_savings_ms": [
+        0.005690000000000028,
+        0.01693550000000002,
+        -0.0005055000000000059
+      ],
+      "gain_credit_ms": 0,
+      "status": "isolated variant paused after two inconsistent numerical-correct A/B runs"
+    },
+    "mhc_status": {
+      "default_flag": 0,
+      "consumer_physical_nodes": [
+        5,
+        4
+      ],
+      "five_input_norm_quant_router_exact": true,
+      "mme_gates_max_abs": 7.748603820800781e-07,
+      "round_savings_ms": [
+        -0.015280875,
+        -0.015333718750000003,
+        -0.015293062499999996
+      ],
+      "gain_credit_ms": 0,
+      "status": "slower partition paused; fused norm introduced a control-to-router dependency; register reduction failed exact gate contract and was reverted"
+    },
+    "csa_publish": {
+      "flag": "VLLM_HPU_DSV41_COMPRESSOR_FUSED_PUBLISH",
+      "default": 0,
+      "physical_nodes": {
+        "reference": 44,
+        "candidate": 17
+      },
+      "five_inputs_four_ranks_exact": true,
+      "round_savings_ms_per_source": [
+        0.0468718125,
+        0.0508414375,
+        0.053027531249999996
+      ],
+      "ratio2_sources": [
+        2,
+        8,
+        14
+      ],
+      "model_estimate_ms": 0.1525243125,
+      "formal_gain_credit_ms": 0,
+      "status": "micro-qualified production compiler/mirror consumer; cumulative pending; R1 unknown",
+      "evidence": "decode-csa-publish-07"
+    },
+    "active_micro_model_estimate_ms": 0.8516655624999999,
+    "kv_reuse_fusion": {
+      "status": "paused_insufficient_large_module_gain",
+      "correctness": "5 checkpoint-derived inputs, outputs and mutable SWA bytes exact on all four ranks",
+      "physical_nodes": {
+        "reference": 23,
+        "candidate": 19,
+        "shared_finisher": 3
+      },
+      "round_savings_ms_per_reuse_layer": [
+        0.0016547499999999965,
+        0.001648406249999998,
+        0.0016014687500000013
+      ],
+      "estimated_ms_token": 0.044506968749999945,
+      "gain_ledger_credit": false,
+      "reason": "All three rounds improve, but only 0.044507 ms/token across 27 reuse layers. This does not meet the current 0.3 ms large-module criterion; no formal run or default promotion.",
+      "baseline_ms": 9.997343230176622,
+      "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-kv-reuse-fusion-02",
+      "flag": "VLLM_HPU_DSV41_KV_REUSE_FUSION=0"
+    },
+    "mhc_mme_post_fusion": {
+      "status": "paused_slower_despite_fewer_physical_nodes",
+      "same_projection_tpc_exact": true,
+      "mme_gates_max_abs": 7.450580596923828e-07,
+      "router_ids_exact": true,
+      "physical_complete_chain": {
+        "reference": 10,
+        "candidate": 9
+      },
+      "round_savings_ms_per_phase": [
+        -0.013679781250000009,
+        -0.013744375000000003,
+        -0.01376878125
+      ],
+      "reason": "Late gates/post avoids serializing FFN norm before the controller, but repeats the full residual RRMS/Sinkhorn at 40 feature owners after communication. The original control/gates overlaps the WO producer; removing one physical node adds a longer post-collective dependency. No service dispatch or gain ledger entry.",
+      "gain_ledger_credit": false,
+      "formal_baseline_ms": 9.997343230176622,
+      "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-mhc-mme-post-09"
+    },
+    "kv_reuse_fusion_latest": {
+      "status": "superseded in current batch by overlapping Q/KV shared prologue, not counted twice",
+      "correctness": "5 checkpoint-derived inputs, outputs and mutable SWA bytes exact on all four ranks",
+      "physical_nodes": {
+        "reference": 23,
+        "candidate": 19,
+        "shared_finisher": 3
+      },
+      "round_savings_ms_per_reuse_layer": [
+        0.0023956249999999985,
+        0.002216093750000009,
+        0.0023471249999999916
+      ],
+      "estimated_ms_token": 0.06337237499999977,
+      "gain_ledger_credit": true,
+      "reason": "Row-preferred final host mapping remains exact and positive in all three rounds, but estimated 27-layer saving stays below the current 0.3 ms criterion. Stop after two valid runs; no ledger credit or formal request.",
+      "baseline_ms": 9.997343230176622,
+      "variant": "row-preferred physical index-space mapping",
+      "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-kv-reuse-fusion-03",
+      "formal_gain_credit": false
+    },
+    "expert_paired_decode": {
+      "status": "failed_final_physical_node_gate",
+      "physical_nodes": {
+        "reference": 24,
+        "candidate": 30
+      },
+      "candidate": {
+        "decode": 3,
+        "gemm": 12,
+        "silu": 6
+      },
+      "correctness_measured": false,
+      "native_replay_measured": false,
+      "performance_measured": false,
+      "gain_ledger_credit": false,
+      "cold_setting": {
+        "SYN_SRAM_BGEMM_SLICER_MULTIPLE_TINY_GEMMS_PER_SLICE": false
+      },
+      "reason": "Fresh final Gaudi2 graph still slices every B2 BatchGemm into B1 GEMMs and duplicates activation nodes. The legacy tiny solver flag is not the cause. Decoded multi-output producer tensors are DRAM in the final graph; do not repeat this partition.",
+      "invalid_previous_case": "07 inherited stale recipe/graph paths; launcher now namespaces paths explicitly",
+      "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-paired-expert-08"
+    },
+    "merged_segments": {
+      "status": "interrupted by host restart before numerical/performance gate",
+      "flag": "VLLM_HPU_DSV41_MERGE_LOCAL_SEGMENTS=0",
+      "formal_gain_credit": 0
+    },
+    "expert_silu_w2_fusion": {
+      "status": "04 physical count unchanged; compiler multi-connecting-output chain breaker identified; single-output three-route decoder building",
+      "estimated_module_gain_ms": [
+        0.4,
+        0.8
+      ],
+      "default": 0,
+      "formal_gain_credit": 0,
+      "w13_routes": 6,
+      "w2_groups": [
+        3,
+        3
+      ]
+    },
+    "accumulation_rule_20261005": {
+      "positive_all_three_rounds": true,
+      "no_small_gain_floor": true,
+      "estimated_ms_per_removed_physical_node": 0.002,
+      "formal_trigger_estimated_ms": 0.6,
+      "formal_trigger_removed_nodes": 300,
+      "direction_inconsistent": "retain for larger same-module fusion and combined retest",
+      "sat_geometry": "W13 six routes; W2 two groups of three routes"
+    },
+    "peer_post_collapse_reactivated": {
+      "status": "component_passed",
+      "median_boundary_saving_ms": 0.008949999999999986,
+      "round_savings_ms": [
+        0.008949999999999986,
+        0.012500000000000011,
+        0.005773
+      ],
+      "checks": 5,
+      "retirement": "verified clean process exit in retirement-check; original timed teardown failure retained",
+      "attention_boundaries": 40,
+      "estimated_model_ms": 0.35799999999999943,
+      "moe_boundaries_credited": 0,
+      "real16_state_gate_pending": true,
+      "formal_gain_credit": false,
+      "default_enabled": false,
+      "input_limit": "checkpoint embedding-derived inputs; not captured attention activations",
+      "resource_modules": [
+        0,
+        1,
+        4,
+        5
+      ],
+      "other_modules": "2/3/6/7 loaded at about90GB/card; see process.json",
+      "commit": "d17ce371",
+      "cpu_tests_final": 41,
+      "meta_passed": 35,
+      "meta_skipped": 12,
+      "reason": "Latest user accumulation rule removes small-item pause; complete native producer/consumer five-input exact and all three device rounds positive; final compiler JSON confirms one removed physical node per Attention boundary",
+      "physical_consumer_nodes": [
+        3,
+        2
+      ],
+      "default": 0
+    },
+    "qualified_removed_nodes_per_token": 281,
+    "qkv_shared_prologue": {
+      "status": "component_qualified",
+      "five_inputs_four_ranks_exact": true,
+      "physical_producer_chain": [
+        23,
+        19
+      ],
+      "shared_consumer_nodes": 3,
+      "round_savings_ms_per_layer": [
+        0.008665531250000011,
+        0.008528531249999999,
+        0.0084661875
+      ],
+      "saving_ms_per_layer": 0.008528531249999999,
+      "estimated_40_layer_ms": 0.34114124999999995,
+      "formal_gain_credit": false,
+      "flag": "VLLM_HPU_DSV41_QKV_FUSED_PROLOGUE=0",
+      "supersedes": [
+        "KV reuse fusion",
+        "isolated KV publication"
+      ],
+      "runtime_actual_coverage_pending": true
+    },
+    "batch_formal": {
+      "status": "ordinary isolated installation preparing",
+      "estimated_ms_token": 0.8516655624999999,
+      "candidate_flags": [
+        "COMPRESSOR_FUSED_PUBLISH",
+        "QKV_FUSED_PROLOGUE",
+        "PEER_POST_COLLAPSE"
+      ],
+      "inactive_overlaps": [
+        "KV_REUSE_FUSION",
+        "ATTN_FUSED_PROLOGUE"
+      ],
+      "natural_eos_pending": true,
+      "trace_pending": true,
+      "formal_gain_credit": false
+    }
+  },
+  "latest_module_experiments": {
+    "woa_handoff": {
+      "status": "fewer_nodes_exact_but_mixed_rounds",
+      "nodes": [
+        19,
+        18
+      ],
+      "savings_ms": [
+        0.000874125,
+        0.07633096875,
+        -0.0741746875
+      ],
+      "credit_ms": 0,
+      "evidence": "decode-woa-handoff-fusion-01"
+    },
+    "peer_post_norm": {
+      "status": "compiled_cpu_pass_68_waiting_free_cards",
+      "credit_ms": 0,
+      "evidence": "decode-peer-post-norm-fusion-01"
+    },
+    "formal": {
+      "status": "warming",
+      "source": "independent installation",
+      "evidence": "decode-physical-fusion-serving-01",
+      "official_temperature": 1,
+      "official_top_p": 0.95,
+      "seed": 42,
+      "formal_result": null
+    },
+    "sat_horizontal_w2": {
+      "status": "native compilation and CPU schema/table validation passed; device verification pending",
+      "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-sat-horizontal-w2-fusion-01",
+      "w13_routes": 6,
+      "w2_groups": [
+        3,
+        3
+      ],
+      "mechanism": "two ordinary three-row GEMMs against horizontally concatenated W2 weights, one direct diagonal ordered finalizer",
+      "gain_credit_ms": 0,
+      "tests": "68 CPU schema tests + native database assertion checks (TP widths K640/1280/2560, diagonal output contract)"
+    },
+    "formal_startup_dump_fix": {
+      "status": "interrupted by actual host reboot at10:49:38 before formal request",
+      "service_pid": 656459,
+      "client_pid": 656460,
+      "removed": [
+        "DUMP_PRE_GRAPHS",
+        "DUMP_POST_GRAPHS",
+        "GRAPH_VISUALIZATION",
+        "PT_HPU_GRAPH_DUMP_PREFIX"
+      ],
+      "reason": "DUMP variables are path-valued; value0 generated 55K debug files and exhausted SSD inodes",
+      "formal_gain_credit_ms": 0
+    }
+  },
+  "upstream_reference_phase": {
+    "order": [
+      "shared coordinates",
+      "MoE",
+      "Attention",
+      "quant/scale boundaries",
+      "mHC"
+    ],
+    "status": "pinned source study recorded; module a integration and native producer/consumer qualification in progress",
+    "notes": "evidence/REFERENCE_NOTES.md",
+    "device_policy": "take existing per-module locks, verify free device handles, terminate only recorded owned process groups and release on completion",
+    "no_dump_environment": true,
+    "formal_baseline_ms": 9.997343230176622,
+    "physical_node_target_per_token": 900,
+    "latest_update": 1791172541.7366955
+  },
+  "coordinate_module_progress": {
+    "shared_stage_flag": "VLLM_HPU_DSV41_SHARED_COORDINATES default 0",
+    "producer_functional": "C1/C2/C6, five boundary fixtures each, all HPU outputs exact",
+    "cpu_contracts": "47 shared/replay/reference checks; 22 ownership/handoff checks; 25 constant-pass checks passed (overlapping suites)",
+    "real16_status": "interrupted before candidate; legacy bootstrap/two-layer Engram mismatch fixed in profile, later initial official sampler exhausted host memory; no gain",
+    "fixture_followup": "isolate initial sampler explicit operands; track separate torchrun sessions by PID/start-time; abort at low host headroom before swap storm",
+    "clamp_bound_screen": {
+      "path": "/opt/ssd960/1cat-vllm-decode-archives/decode-index-clamp-bound-02",
+      "saving_ms": -6.521875e-05,
+      "gain_credit_ms": 0,
+      "status": "off; no physical reduction established"
+    },
+    "candidate_coordinates_flag": "VLLM_HPU_DSV41_CANDIDATE_COORDINATES default 0",
+    "candidate_coordinates_screen": "/opt/ssd960/1cat-vllm-decode-archives/decode-candidate-coordinate-chain-01",
+    "current_formal_ms": 9.997343230176622,
+    "new_formal_result": false,
+    "candidate_coordinates_screen_result": {
+      "status": "small_shape_positive_pending_production_geometry",
+      "checks": [
+        {
+          "fixture": 0,
+          "exact": true
+        },
+        {
+          "fixture": 1,
+          "exact": true
+        },
+        {
+          "fixture": 2,
+          "exact": true
+        },
+        {
+          "fixture": 3,
+          "exact": true
+        },
+        {
+          "fixture": 4,
+          "exact": true
+        }
+      ],
+      "saving_ms_per_2048_row_chain": 0.0023175312499999975,
+      "physical_nodes": {
+        "baseline": 26,
+        "candidate": 20
+      },
+      "whole_model_estimate_ms": 0,
+      "estimate_mapping": "Previous 0.0602558125 extrapolation withdrawn: 16384 mirror rows / 256 candidate blocks do not match 512K capacity / 2048-block service.",
+      "flag": "VLLM_HPU_DSV41_CANDIDATE_COORDINATES",
+      "default": false,
+      "formal_gain_credit": false
+    },
+    "candidate_coordinates_production": {
+      "status": "production_shape_micro_qualified",
+      "geometry": {
+        "compression_ratio": 1,
+        "key_rows": 524288,
+        "candidate_blocks": 2048,
+        "score_tiles": 8
+      },
+      "checks": [
+        {
+          "fixture": 0,
+          "exact": true
+        },
+        {
+          "fixture": 1,
+          "exact": true
+        },
+        {
+          "fixture": 2,
+          "exact": true
+        },
+        {
+          "fixture": 3,
+          "exact": true
+        },
+        {
+          "fixture": 4,
+          "exact": true
+        }
+      ],
+      "physical_nodes": {
+        "A": 69,
+        "B": 49
+      },
+      "saving_ms_per_reindex": 0.008844796875000005,
+      "layer_ids": [
+        24,
+        28,
+        32,
+        36
+      ],
+      "estimated_saving_ms_per_token": 0.03537918750000002,
+      "flag": "VLLM_HPU_DSV41_CANDIDATE_COORDINATES",
+      "default": false,
+      "formal_gain_credit": false,
+      "notes": "5 embedding-derived fixtures with real checkpoint projections, native replay; unchanged TP communication excluded. No inference from old gather counts.",
+      "path": "/opt/ssd960/1cat-vllm-decode-archives/decode-candidate-coordinate-production-02"
+    }
+  },
+  "expert_three_route_W2": {
+    "status": "production_component_qualified",
+    "flag": "VLLM_HPU_DSV41_EXPERT_W2_THREE_ROUTES",
+    "default": false,
+    "physical_nodes": {
+      "baseline": 24,
+      "candidate": 21
+    },
+    "layers": [
+      0,
+      4,
+      14,
+      19
+    ],
+    "fixtures_per_rank": 5,
+    "ranks": 4,
+    "round_savings_ms": [
+      0.02360812500000009,
+      0.023651500000000047,
+      0.02360193750000006
+    ],
+    "saving_ms_per_layer": 0.005902031250000023,
+    "estimated_saving_ms_per_token": 0.2360812500000009,
+    "formal_gain_credit": false,
+    "SRAM": "W13 four decode/MME slices; W2 two three-route decode/MME groups, FP8 in SRAM",
+    "ABI_fix": "Place shared input before output in TPC signature to match input-then-output tensor ABI; five fixtures bit-exact after fix",
+    "path": "/opt/ssd960/1cat-vllm-decode-archives/decode-sat-horizontal-w2-fusion-04"
+  },
+  "physical_module_batch02": {
+    "status": "warmup_failed_no_formal_or_trace",
+    "case": "/opt/ssd960/1cat-vllm-decode-archives/decode-physical-fusion-serving-02",
+    "baseline_formal_ms": 9.997343230176622,
+    "forecast_ms": 1.1231259999999998,
+    "modules": [
+      0,
+      1,
+      4,
+      5
+    ],
+    "candidate_flags": [
+      "COMPRESSOR_FUSED_PUBLISH",
+      "QKV_FUSED_PROLOGUE",
+      "PEER_POST_COLLAPSE",
+      "CANDIDATE_COORDINATES",
+      "EXPERT_W2_THREE_ROUTES"
+    ],
+    "new_output_boundary_in_batch": false,
+    "formal_result": null,
+    "failure": "QKV intermediate public output storage indices missing"
+  },
+  "output_boundary_module": {
+    "status": "5_fixture_exact_19_to_17_mixed_AB_keep_accumulating",
+    "case": "/opt/ssd960/1cat-vllm-decode-archives/decode-output-boundary-fusion-01",
+    "gain_credit_ms": 0,
+    "next": "Merge peer/post/norm, measure after batch02 service releases devices"
+  },
+  "qkv_output_binding_fix": {
+    "parent_reproduced": true,
+    "fixed_checks": 5,
+    "native_recipes": 2,
+    "path": "/opt/ssd960/1cat-vllm-decode-archives/decode-qkv-public-output-repro-02"
+  },
+  "physical_module_batch03": {
+    "status": "formal_passed_gain_below_half_forecast_trace_required",
+    "case": "/opt/ssd960/1cat-vllm-decode-archives/decode-physical-fusion-serving-03",
+    "forecast_ms": 1.123126,
+    "formal_result": "/opt/ssd960/1cat-vllm-decode-archives/decode-physical-fusion-serving-03/formal/result.json",
+    "baseline_ms": 9.997343230176622,
+    "candidate_ms": 9.564282285406788,
+    "measured_saving_ms": 0.43306094476983326,
+    "forecast_fraction": 0.3855853615443265,
+    "output_tokens": 1858,
+    "sampling": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "seed": 42
+    },
+    "semantic_facts": 14,
+    "prompt_ids_match": true,
+    "cached_prompt_tokens": 0,
+    "sampling_fallbacks": 0,
+    "defaults_promoted": false,
+    "target_7ms_achieved": false
+  },
+  "mhc_deferred_gates": {
+    "status": "production_component_qualified",
+    "flag": "VLLM_HPU_DSV41_MHC_DEFERRED_GATES",
+    "default": false,
+    "controller": "Original FP32 GEMV/RRMS, no BF16 hi/lo approximation",
+    "physical_nodes": {
+      "baseline": 9,
+      "candidate": 8
+    },
+    "fixtures_per_rank": 5,
+    "ranks": 4,
+    "round_savings_ms": [
+      0.0007875117187499947,
+      0.0008048632812499984,
+      0.0007771210937499995
+    ],
+    "saving_ms_per_boundary": 0.0007875117187499947,
+    "credited_boundaries": 40,
+    "estimated_saving_ms_per_token": 0.03150046874999979,
+    "other_sublayer_credit_ms": 0,
+    "formal_gain_credit": false,
+    "baseline": "Already-fused peer/post, avoids double-credit with batch03",
+    "in_batch03": false,
+    "case": "/opt/ssd960/1cat-vllm-decode-archives/decode-mhc-exact-post-01"
+  },
+  "post_norm_invariant_loads": {
+    "status": "exact_fewer_nodes_still_slower_after_ISA_fix",
+    "checks": "5 fixtures on 4 ranks bit-exact",
+    "physical_nodes": {
+      "0": [
+        {
+          "graph": "graph_0003_fused_0_syn_1003000_1003000_10-PostGraph-symbol.pbtxt",
+          "nodes": 4
+        },
+        {
+          "graph": "graph_0000_fused_0_syn_1000000_1000000_6-PostGraph-symbol.pbtxt",
+          "nodes": 19
+        },
+        {
+          "graph": "graph_0001_fused_0_syn_1001000_1001000_7-PostGraph-symbol.pbtxt",
+          "nodes": 5
+        },
+        {
+          "graph": "graph_0002_fused_0_syn_1002000_1002000_9-PostGraph-symbol.pbtxt",
+          "nodes": 17
+        }
+      ],
+      "1": [
+        {
+          "graph": "graph_0003_fused_0_syn_1003000_1003000_10-PostGraph-symbol.pbtxt",
+          "nodes": 4
+        },
+        {
+          "graph": "graph_0000_fused_0_syn_1000000_1000000_6-PostGraph-symbol.pbtxt",
+          "nodes": 19
+        },
+        {
+          "graph": "graph_0001_fused_0_syn_1001000_1001000_7-PostGraph-symbol.pbtxt",
+          "nodes": 5
+        },
+        {
+          "graph": "graph_0002_fused_0_syn_1002000_1002000_9-PostGraph-symbol.pbtxt",
+          "nodes": 17
+        }
+      ],
+      "2": [
+        {
+          "graph": "graph_0003_fused_0_syn_1003000_1003000_10-PostGraph-symbol.pbtxt",
+          "nodes": 4
+        },
+        {
+          "graph": "graph_0000_fused_0_syn_1000000_1000000_6-PostGraph-symbol.pbtxt",
+          "nodes": 19
+        },
+        {
+          "graph": "graph_0001_fused_0_syn_1001000_1001000_7-PostGraph-symbol.pbtxt",
+          "nodes": 5
+        },
+        {
+          "graph": "graph_0002_fused_0_syn_1002000_1002000_9-PostGraph-symbol.pbtxt",
+          "nodes": 17
+        }
+      ],
+      "3": [
+        {
+          "graph": "graph_0003_fused_0_syn_1003000_1003000_10-PostGraph-symbol.pbtxt",
+          "nodes": 4
+        },
+        {
+          "graph": "graph_0000_fused_0_syn_1000000_1000000_6-PostGraph-symbol.pbtxt",
+          "nodes": 19
+        },
+        {
+          "graph": "graph_0001_fused_0_syn_1001000_1001000_7-PostGraph-symbol.pbtxt",
+          "nodes": 5
+        },
+        {
+          "graph": "graph_0002_fused_0_syn_1002000_1002000_9-PostGraph-symbol.pbtxt",
+          "nodes": 17
+        }
+      ]
+    },
+    "round_savings_ms": [
+      -0.0026013320312500143,
+      -0.0026493085937500105,
+      -0.0026626953125000047
+    ],
+    "gain_credit_ms": 0,
+    "default": false,
+    "ISA": "24 immutable coefficient loads moved out of 40-tile loop; 960 to 24 loads per owner",
+    "remaining_issue": "WO scale/roundtrip+global quantizer repeats the whole-row roundtrip/amax across 16 owners; its sx scalar load is already outside the inner tile loop in emitted ISA. No unsupported hoist trial added.",
+    "next": "Use completed service trace for category and active-path coverage; retain candidate off",
+    "case": "/opt/ssd960/1cat-vllm-decode-archives/decode-post-norm-invariant-01"
+  },
+  "output_boundary_post_norm_128": {
+    "status": "5_exact_inputs_4_ranks_three_slower_pairs",
+    "case": "/opt/ssd960/1cat-vllm-decode-archives/decode-attention-output-post-norm-02",
+    "physical_producer_nodes": [
+      19,
+      17
+    ],
+    "physical_consumer_nodes": [
+      5,
+      4
+    ],
+    "round_savings_ms": [
+      -0.007605640624999993,
+      -0.007578566406250001,
+      -0.007535976562499991
+    ],
+    "gain_credit_ms": 0,
+    "next": "Hoist immutable 24 coefficients out of 40-tile loop; ISA change verified, next hardware run queued"
+  },
+  "pending_micro_only_ms": 0,
+  "accepted_baseline_20261005": {
+    "case": "decode-physical-fusion-serving-03",
+    "official_tpot_ms": 9.564282285406788,
+    "user_accepted": true,
+    "source_default_commit": "23551208"
+  },
+  "moe_20261005": {
+    "gain_credit_ms": 0,
+    "stage": "archived two-slice and explicit SRAM trials",
+    "cases": [
+      {
+        "case": "decode-moe-pipeline3-02",
+        "status": "exact but slower",
+        "layer_delta_ms": 0.013143804687499996
+      },
+      {
+        "case": "decode-moe-pipeline3-prefetch-01",
+        "status": "exact but slower",
+        "layer_delta_ms": 0.0035014843749999885
+      },
+      {
+        "case": "decode-moe-plain-w13-01",
+        "status": "exact but slower",
+        "layer_delta_ms": 0.0014484999999999915
+      },
+      {
+        "case": "decode-moe-dictionary-02",
+        "status": "numerical failure; removed runtime prototype"
+      },
+      {
+        "case": "decode-moe-sram-handoff-01",
+        "status": "weights spilled; no timing"
+      }
+    ],
+    "decoder_unroll": {
+      "case": "/opt/ssd960/1cat-vllm-decode-archives/decode-moe-unroll-chain-01",
+      "forecast_ms": 0.0124034375,
+      "status": "superseded_by_streamed"
+    },
+    "single_route_silu": {
+      "case": "/opt/ssd960/1cat-vllm-decode-archives/decode-moe-streamed-01",
+      "forecast_ms": 0.030396562500000224,
+      "status": "archived_not_active_under_retained_slicing_policy",
+      "w13_slices": 2,
+      "producer_nodes": 17,
+      "all_decoded_weights_sram": true,
+      "activation_sram_pipeline": false
+    },
+    "two_slice_only": {
+      "case": "/opt/ssd960/1cat-vllm-decode-archives/decode-moe-two-slice-02",
+      "status": "slower",
+      "saving_ms_per_layer": -0.0023562421875
+    }
+  },
+  "logical_stage_policy_20261005": {
+    "preserve_w13_pipeline_slices": 4,
+    "inactive_experiments": [
+      "decode-moe-unroll-chain-01",
+      "decode-moe-streamed-01",
+      "decode-moe-router-pipeline-01"
+    ],
+    "reason": "Do not credit slice-count reduction; qualify independent stages and instruction efficiency with production router dependency.",
+    "formal_baseline_ms": 9.564282285406788
+  },
+  "moe_four_slice_20261005": {
+    "case": "decode-moe-router-four-slice-01",
+    "logical_stages": [
+      17,
+      16
+    ],
+    "physical_nodes": [
+      23,
+      22
+    ],
+    "compiler_policy": 4,
+    "actual_w13_fragments_each_arm": 3,
+    "micro_saving_ms_per_layer": 0.0032810625,
+    "forecast_ms_token": 0.1312425,
+    "official_qualified": false,
+    "switch": "VLLM_HPU_DSV41_EXPERT_STREAMED_SAT",
+    "default": false,
+    "active": false,
+    "superseded_by": "moe_dual_quant_20261005"
+  },
+  "moe_dual_quant_20261005": {
+    "case": "decode-moe-dual-quant-01",
+    "supersedes": "moe_four_slice_20261005",
+    "combined_forecast_ms_token": 0.20637375,
+    "formal_qualified": false,
+    "flags": [
+      "VLLM_HPU_DSV41_EXPERT_STREAMED_SAT",
+      "VLLM_HPU_DSV41_FFN_DUAL_QUANT"
+    ],
+    "defaults": false
+  },
+  "mhc_linear_20261005": {
+    "case": "decode-mhc-linear-post-01",
+    "forecast_ms_token": 0.02590140625,
+    "boundaries": 40,
+    "supersedes": "decode-mhc-exact-post-01",
+    "default": false,
+    "formal_qualified": false,
+    "superseded_by": "mhc_parallel_20261005"
+  },
+  "mla_vector_20261005": {
+    "cases": [
+      "decode-mla-reuse-vector-01",
+      "decode-mla-publish-vector-01"
+    ],
+    "layers": [
+      27,
+      11
+    ],
+    "estimated_saving_ms_token": 0.17638435156249987,
+    "physical_nodes_reduced": false,
+    "flag": "VLLM_HPU_DSV41_MLA_VECTOR_CODEC",
+    "default": false,
+    "formal_qualified": false
+  },
+  "quant_single_amax_20261005": {
+    "case": "decode-woa-single-amax-02",
+    "forecast_ms_token": 0.036122499999999835,
+    "layers": 40,
+    "flag": "VLLM_HPU_DSV41_WOA_DENSE_HANDOFF",
+    "default": false,
+    "formal_qualified": false
+  },
+  "mhc_parallel_20261005": {
+    "status": "qualified_micro_only",
+    "round_savings_ms": [
+      0.0009889960937499997,
+      0.0009958632812499951,
+      0.001007996093749998
+    ],
+    "estimate_ms_token": 0.039834531249999805,
+    "occurrences_credited": 40,
+    "reference": "DeepSeek dba1be0 CPU equations, DeepGEMM normalized error <5e-5",
+    "max_official_equation_error": 7.678544576858086e-09,
+    "bit_exact": false,
+    "production_shape": true,
+    "native_replay": true,
+    "default": false,
+    "supersedes": "mhc_linear_20261005",
+    "formal_done": false
+  },
+  "roofline_20261005": {
+    "order": [
+      "communication",
+      "dense_gemv",
+      "mhc",
+      "small_tpc",
+      "moe"
+    ],
+    "document": "evidence/ROOFLINE.md",
+    "realization_assumption": 0.4,
+    "formal_trigger_ms": 1.0
+  },
+  "ffn_bf16_quant_20261005": {
+    "case": "decode-ffn-bf16-quant-03",
+    "parent": "moe_dual_quant_20261005",
+    "round_savings_ms_per_four_layers": [
+      4.7687500000004324e-05,
+      0.00026393749999997773,
+      0.00011434374999996777
+    ],
+    "forecast_ms_per_token": 0.0011434374999996777,
+    "default": false,
+    "switch": "VLLM_HPU_DSV41_FFN_BF16_QUANT",
+    "formal_measured": false,
+    "physical_nodes": [
+      21,
+      21
+    ],
+    "modules": [
+      2,
+      3,
+      6,
+      7
+    ],
+    "correctness": "Five checkpoint-derived fixtures on four ranks exact; TPC simulation exact,3791 to3439 VLIW"
+  },
+  "index_gain_replica_20261005": {
+    "case": "decode-index-gain-replica-01",
+    "round_savings_ms_per_layer": [
+      0.003837906249999995,
+      0.0038639218749999954,
+      0.00383369531250001
+    ],
+    "forecast_ms_per_token": 0.03070324999999996,
+    "qualified_layers": 8,
+    "default": false,
+    "switch": "VLLM_HPU_DSV41_INDEX_GAIN_REPLICA",
+    "formal_measured": false,
+    "modules": [
+      2,
+      3,
+      6,
+      7
+    ],
+    "correctness": "Query, gain, scores exact on five checkpoint-derived fixtures x four ranks",
+    "integration": "Cold rank-ordered weights; C1 paged index only; prefill and request-batch/DSpark unchanged",
+    "extra_resident_bytes_per_rank": 2621440
+  },
+  "mhc_swizzled_20261005": {
+    "case": "decode-mhc-swizzled-control-01",
+    "parent": "mhc_parallel_20261005",
+    "forecast_ms_per_token": 0.00553015625000014,
+    "qualified_boundaries": 40,
+    "round_savings_ms_per_boundary": [
+      0.00014700781249999545,
+      0.0001382539062500035,
+      0.00013816015625000427
+    ],
+    "switch": "VLLM_HPU_DSV41_MHC_SWIZZLED_CONTROL",
+    "default": false,
+    "formal_measured": false,
+    "correctness": "Five fixtures x four ranks bit exact against qualified parallel controller"
+  },
+  "mhc_rrms_post_20261005": {
+    "case": "decode-mhc-rrms-post-01",
+    "parent": "mhc_parallel_20261005",
+    "forecast_ms_per_token": 0.0002901562500001731,
+    "qualified_boundaries": 40,
+    "round_savings_ms_per_boundary": [
+      2.5312499999929905e-06,
+      7.296875000006864e-06,
+      7.253906250004327e-06
+    ],
+    "switch": "VLLM_HPU_DSV41_MHC_RRMS_POST",
+    "default": false,
+    "formal_measured": false,
+    "correctness": "Five fixtures x four ranks bit exact",
+    "note": "Only ~7 ns per boundary; record literal small micro result, not a meaningful formal improvement."
+  },
+  "merged_parallel_20261005": {
+    "status": "rejected_slower",
+    "reference_ms": 4.186109,
+    "candidate_ms": 4.374776000000001,
+    "round_savings_ms": [
+      -0.1967080000000001,
+      -0.17514050000000125,
+      -0.2021809999999995
+    ],
+    "compute_segments": [
+      73,
+      41
+    ],
+    "collective_points": [
+      42,
+      42
+    ],
+    "correctness_all_four_ranks": true,
+    "no_hot_compilation": true,
+    "cross_arm_feedback_exact": true,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-merged-parallel-control-02",
+    "reason": "Disabling the mHC-independent split reduces32 boundaries but removes32 producer/consumer overlap windows. Counts establish this structural tradeoff; no new trace or exclusive cycle attribution.",
+    "formal_gain_credit": false,
+    "default": false
+  },
+  "dense_dma_prefetch_20261005": {
+    "status": "rejected_slower",
+    "round_savings_ms": [
+      -0.00974366015625,
+      -0.009750046875000001,
+      -0.00974646875
+    ],
+    "saving_ms_per_boundary": -0.00974646875,
+    "correctness_5x4_exact": true,
+    "dma_sram_mme_proof": [
+      {
+        "graph": ".graph_dumps/graph_0002_fused_0_syn_1002000_1002000_10-PostGraph-symbol.pbtxt",
+        "sha256": "355a35c125d3f9b1451170a61326c6b19eb5247a31809eed8303535ff87f7f5c",
+        "edges": [
+          {
+            "dma": "custom_deepseek_v41_dense_dma_prefetch_gaudi2/memcpy/15",
+            "consumer": "custom_deepseek_v41_dense_dma_prefetch_gaudi2/fp8_gemm_bf16/16_complex/fp8_gemm_bf16_0/gemm_2",
+            "operand": 1,
+            "bytes": 10485760
+          }
+        ],
+        "qualified": true,
+        "physical_nodes": 5
+      }
+    ],
+    "reason": "DMA prefetch is real but adds9.75us at the complete WO/control-peer-FFN boundary. Graph-local prefetch does not recover exposed latency for this production shape.",
+    "formal_gain_credit": false,
+    "default": false,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-dense-dma-prefetch-01"
+  },
+  "pcie_star_20261005": {
+    "status": "primitive_pass_not_advanced",
+    "modules": [
+      2,
+      3
+    ],
+    "savings_us": [
+      1.9913999999999987,
+      2.0716,
+      2.810200000000002
+    ],
+    "median_a_us": 18.1661,
+    "median_b_us": 16.0945,
+    "correctness": "Changing payload and all612 completion epochs; both ranks explicitly unmap their imports; healthy after exit.",
+    "scope": "Completed amortized native primitive, not device-only production compute/communication/consumer chain.",
+    "decision": "Do not extend to TP4: the two-rank star already takes about16us, above6us target; remote inbox reads are still expensive. No extrapolated model gain.",
+    "formal_gain_credit": false,
+    "default": false,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-pcie-star-protocol-02"
+  },
+  "mhc_producer_fusion_20261005": {
+    "status": "rejected_slower",
+    "baseline_ms": 4.188502,
+    "candidate_ms": 4.3295135,
+    "round_savings_ms": [
+      -0.14230499999999946,
+      -0.150671,
+      -0.13040500000000055
+    ],
+    "compute_segments": [
+      73,
+      41
+    ],
+    "collective_points": [
+      42,
+      42
+    ],
+    "cross_arm_feedback_exact": true,
+    "no_hot_compilation": true,
+    "numerical_gate": {
+      "tokens_exact": true,
+      "mutable_state_exact": true,
+      "state_tensors": 33,
+      "hidden_exact": true,
+      "reference_hidden": [
+        {
+          "position": 16384,
+          "shape": [
+            1,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "sha256": "01a17f64e3120401163464763f10c25066ff86d984d3a5d432ce8fc48b21695e"
+        },
+        {
+          "position": 16385,
+          "shape": [
+            1,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "sha256": "38d98341cffd7323635626b9bc6b4f806d4868f1e89f4d8dae3dca6b27299be2"
+        },
+        {
+          "position": 16386,
+          "shape": [
+            1,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "sha256": "6538d05a303cd1a6606dd439907b674d5bc8f2e17e273bea4470c0d5d9a60943"
+        },
+        {
+          "position": 16387,
+          "shape": [
+            1,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "sha256": "f86fbbf3fb19320ed3d217f20cd0aa781c8e51f0b2b9cbedee77d174e76d45ea"
+        },
+        {
+          "position": 16388,
+          "shape": [
+            1,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "sha256": "cea5a5682906d6e4cb92d14d37b83b6e911477352998bef6a47372f247b3e0f5"
+        },
+        {
+          "position": 16389,
+          "shape": [
+            1,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "sha256": "7020a3822b80d2790fdf5e5b0bb84b9f7c362fe13b67fe00de4c014271f01108"
+        }
+      ],
+      "candidate_hidden": [
+        {
+          "position": 16384,
+          "shape": [
+            1,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "sha256": "01a17f64e3120401163464763f10c25066ff86d984d3a5d432ce8fc48b21695e"
+        },
+        {
+          "position": 16385,
+          "shape": [
+            1,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "sha256": "38d98341cffd7323635626b9bc6b4f806d4868f1e89f4d8dae3dca6b27299be2"
+        },
+        {
+          "position": 16386,
+          "shape": [
+            1,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "sha256": "6538d05a303cd1a6606dd439907b674d5bc8f2e17e273bea4470c0d5d9a60943"
+        },
+        {
+          "position": 16387,
+          "shape": [
+            1,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "sha256": "f86fbbf3fb19320ed3d217f20cd0aa781c8e51f0b2b9cbedee77d174e76d45ea"
+        },
+        {
+          "position": 16388,
+          "shape": [
+            1,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "sha256": "cea5a5682906d6e4cb92d14d37b83b6e911477352998bef6a47372f247b3e0f5"
+        },
+        {
+          "position": 16389,
+          "shape": [
+            1,
+            5120
+          ],
+          "dtype": "torch.bfloat16",
+          "sha256": "7020a3822b80d2790fdf5e5b0bb84b9f7c362fe13b67fe00de4c014271f01108"
+        }
+      ]
+    },
+    "formal_gain_credit": false,
+    "default": false,
+    "decision": "Both consumer-side and producer-side merging regress in real16. Stop partition coalescing trials; require a concrete compiled-dataflow cause before any further variant.",
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-mhc-producer-fusion-03"
+  },
+  "host_shared_peer_20261005": {
+    "status": "rejected_correctness_timeout",
+    "completed_epochs_before_failure": 212,
+    "first_pair_only_us": {
+      "central_host": 20.2858,
+      "local_host_reduce": 12.5998
+    },
+    "error_codes": {
+      "rank0": 2,
+      "rank1": 7
+    },
+    "reason": "A later period hit bounded ready/publication polling. One successful pair is neither a stable timing nor a valid allreduce qualification. Cause unresolved; do not expand toTP4 or integrate.",
+    "device_release": "Both2/3 returned768MiB with no reset; no device-buffer imports.",
+    "formal_gain_credit": false,
+    "default": false,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-host-shared-peer-01"
+  },
+  "mhc_bf16_weight_20261005": {
+    "status": "qualified_component_alternative_default_off",
+    "parent": "parallel controller plus deferred gates; mutually exclusive with swizzled control weights",
+    "round_savings_ms_per_boundary": [
+      0.00015731640625,
+      0.0001756484375,
+      0.0001639609375
+    ],
+    "forty_boundary_forecast_ms": 0.0065584375,
+    "active_forecast_credit_ms": 0,
+    "reason": "Alternative to .00553015625 swizzled forecast, not additive. Keep exact swizzle in active batch; numerical alternative retained for future combined qualification.",
+    "correctness": "5 checkpoint-derived fixtures x4 ranks; router IDs and same-projection post exact; upstream-equation error <=3.201238984e-6 (limit5e-5); FP8 consumer separate limit2e-4",
+    "physical_producer_nodes": [
+      4,
+      4
+    ],
+    "cold_extra_weight_mib_per_rank": 75,
+    "formal_result": null,
+    "default": false,
+    "flag": "VLLM_HPU_DSV41_MHC_BF16_CONTROL_WEIGHT",
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-mhc-bf16-weight-03"
+  },
+  "peer_post_owned_quant_20261005": {
+    "status": "rejected_complete_chain_slower",
+    "correctness": "5 fixtures x4 ranks exact; simulator5 fixtures/66564 output bytes exact",
+    "simulator_instructions": [
+      38517,
+      36578
+    ],
+    "physical_consumer_compute_nodes": [
+      5,
+      4
+    ],
+    "round_savings_ms": [
+      -0.0033054765624999927,
+      -0.003464777343750003,
+      -0.0033948867187500037
+    ],
+    "code_retained": "Only safe removal of quantization on unowned tiles in already-disabled fusion candidate",
+    "static_cause": "Fused global normalization recomputes all40 post tiles at each of4 owners; baseline post distributes40 tiles and only norm rescans. Full-row post work becomes serial per owner. This structural redundancy is not removed by narrowing the final quantization loop.",
+    "next": "Stop this fusion boundary; require a dataflow avoiding repeated post+global-statistic work, not another tile/owner variation.",
+    "gain_credit_ms": 0,
+    "default": false,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-peer-post-registers-01"
+  },
+  "index_query_replica_20261005": {
+    "status": "five_inputs_four_ranks_exact_three_consistent_regressions",
+    "peer_points_per_iteration": [
+      1,
+      0
+    ],
+    "round_savings_ms_per_index_layer": [
+      -0.01626080468749999,
+      -0.016330914062499993,
+      -0.016450945312499993
+    ],
+    "gain_credit_ms": 0,
+    "default": false,
+    "reason": "Additional full query projection/codec work exceeds saved query collective; retain cold gain-only replica. No serving trial.",
+    "reference_parent": "gain replica present in both arms",
+    "adapter_support": "explicit compute-only native capture/replay qualified; legacy nonzero topology remains covered by CPU topology tests",
+    "formal_result": null,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-index-query-replica-02"
+  },
+  "compute_only_native_adapter_20261005": {
+    "status": "qualified_fixture_support",
+    "interface": "configure_topology(groups,0,False) explicitly allows compute-only capture/replay. Omitted topology retains legacy16/groups checks.",
+    "changes": "No communicator required for explicitly zero points; native compute replay used; no empty HCL back()/batch access; drain before close. Existing nonzero replay unchanged.",
+    "qualification": "C++ topology coverage plus query replica5x4 exact/3 native rounds. This fixture support is not credited as a model optimization.",
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-index-query-replica-02",
+    "formal_gain_credit": false
+  },
+  "mla_vector_mask_20261005": {
+    "status": "component_qualified_default_off",
+    "flag": "VLLM_HPU_DSV41_MLA_VECTOR_MASK",
+    "parent_flag": "VLLM_HPU_DSV41_MLA_VECTOR_CODEC",
+    "parent_held_fixed": true,
+    "round_savings_ms_per_reuse_layer": [
+      0.005064144531249981,
+      0.005103351562499997,
+      0.005115960937500011
+    ],
+    "credited_reuse_layers": 27,
+    "estimated_saving_ms_token": 0.13779049218749992,
+    "correctness": "5 checkpoint-derived inputs x4 ranks bit-exact, including full QKV/MLA/WO/native-peer/post/FFN chain",
+    "physical_producer_compute_nodes": [
+      23,
+      23
+    ],
+    "simulator": "5 positions0/127/255/16384/200000, full1968640 output bytes exact; valid full-history instructions76010→75268; loads6534→6038; stores16002→15382",
+    "scope": "Masks only, same arithmetic and downstream MME. Main/SWA outputs and workspace lifecycle unchanged.",
+    "cpu_checks": 53,
+    "formal_qualified": false,
+    "default": false,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-mla-vector-mask-01"
+  },
+  "host_shared_peer_width_20261005": {
+    "status": "primitive_correctness_qualified_not_production_gain",
+    "root_cause": "GEN_ADDR inherits8-bit width from the shared U8 mailbox. update_addr changes address only. Unsigned scalar flags were truncated at256; bad-width simulation also has undefined upper bits. Local BF16 anchor analogously limits16-bit flags.",
+    "fix": "DT_OVERRIDE UINT32 at coordinate0, then byte-offset address updates. Payload vector operations unchanged.",
+    "simulator_epochs": [
+      254,
+      255,
+      256,
+      257,
+      65536
+    ],
+    "hardware_epochs_passed": 612,
+    "rank_max_native_us_A": [
+      20.6234,
+      20.7388,
+      21.1017
+    ],
+    "rank_max_native_us_B": [
+      12.9349,
+      12.8834,
+      12.8317
+    ],
+    "scope": "two-rank changing payload primitive only; no producer/downstream consumer qualification; exceeds6us beforeTP4 expansion",
+    "device_cleanup": "Both ranks clean exit, zero imports; healthy modules returned768MiB without reset",
+    "default": false,
+    "formal_gain_credit": false,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-host-shared-peer-03"
+  },
+  "mla_reuse_hardware_codec_20261005": {
+    "status": "complete_chain_micro_qualified_default_off",
+    "parent": "qualified vector codec and reuse-vector mask heldfixed",
+    "round_savings_ms_per_reuse_layer": [
+      0.0008991445312500068,
+      0.0008451445312500083,
+      0.0009165078125000087
+    ],
+    "layers_credited": 27,
+    "forecast_ms_per_token": 0.024276902343750184,
+    "active_total_forecast_ms_per_token": 0.6584495273437498,
+    "correctness": "Five checkpoint-derived inputs×four ranks alloutputs exact; simulator complete-output fixtures and all256E4M3 codes exact",
+    "physical_compiler_nodes": [
+      23,
+      23
+    ],
+    "flag": "VLLM_HPU_DSV41_MLA_REUSE_HW_CODEC",
+    "default": false,
+    "formal_qualified": false,
+    "scope": "Reuse-only.11 publisher layers unqualified and receive no credit. Same KV workspace ownership and FP32PV arithmetic. No profiler physical-kernel reduction claim.",
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-kv-hardware-codec-02/reuse-native-03"
+  },
+  "host_peer_burst_20261005": {
+    "status": "completed_primitive_not_qualified_transport",
+    "rank_max_completed_native_us_per_point": {
+      "A": [
+        12.6224,
+        12.6218,
+        12.6192
+      ],
+      "B": [
+        10.6132,
+        10.6213,
+        10.615
+      ]
+    },
+    "verified_epochs": 61200,
+    "scope": "100 device exchanges per single host native replay; actual native completion, changing10KB inputs; two ranks only",
+    "interpretation": "Amortizing host entry does not restore the6us target; five-owner device protocol stays near10.62us before realTP4 producer/consumer. Do not count as model gain or launch cyclic imports.",
+    "next": "Stop this mapped-host primitive family. Keep bounded cleanup/width findings; complete queued MLA chain measurements.",
+    "default": false,
+    "formal_gain_credit": false,
+    "cleanup": "Both owned workers retired and released modules2/3 without reset or imported buffers"
+  },
+  "mhc_gates_peer_window_20261006": {
+    "status": "component_qualified_default_off",
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-mhc-gates-inflight-chain-01",
+    "round_savings_ms_per_boundary": [
+      0.0016991484375,
+      0.0017206796875,
+      0.0017062109375
+    ],
+    "forecast_ms_per_token": 0.136496875,
+    "forecast_occurrences": 80,
+    "active_compatible_total_ms": 0.7949464023437499,
+    "correctness": "5 fixtures x4 ranks all9 outputs byte-exact, router IDs exact",
+    "flag": "VLLM_HPU_DSV41_MHC_COMM_GATES",
+    "default": false,
+    "formal_qualified": false
+  },
+  "shared_kv_pv_20261006": {
+    "status": "rejected_slower_second_complete_chain",
+    "gain_credit_ms": 0,
+    "round_savings_ms": [
+      -0.003416499999999989,
+      -0.0034469179687500184,
+      -0.003279511718750003
+    ],
+    "correctness": "All5 fixtures x4 ranks: PV official threshold, exactcandidate-feddownstream/state/router; approximatewholeoutputs.",
+    "physical": "SharedBF16KV stays atsameSRAMaddress; onlyK655360bytespinned, auxiliaryordinaryworkspace. PairedBF16storeloweredISA22910 vs25326; neitherstructural/instructionfiximprovescompletechain.",
+    "stopped": true,
+    "source_archive": "/opt/ssd960/1cat-vllm-decode-archives/decode-mla-bf16-probability-01/closed-family-source.tar.gz",
+    "mixed_pv_probe": "F32probabilities xBF16KV rawMME node rejected bySynapse26. No hardware ornewmodeltrial.",
+    "retirement": [
+      {
+        "native_owners_closed": true,
+        "groups_destroyed": true
+      },
+      {
+        "native_owners_closed": true,
+        "groups_destroyed": true
+      },
+      {
+        "native_owners_closed": true,
+        "groups_destroyed": true
+      },
+      {
+        "native_owners_closed": true,
+        "groups_destroyed": true
+      }
+    ],
+    "next": "Archive/removeapproximateBF16PVprototype. ContinueexactSWAreaderwithproductionglobalmirror/viewcontract. Reopenonlyafternewcompiler/trace evidence."
+  },
+  "early_wo_arena_20261006": {
+    "status": "rejected_slower_twice",
+    "reference": "Native-codec QKV/MLA/WO→peer→mHC/FFN parent",
+    "correctness": "5 fixtures x4 ranks all outputs/cache byte-exact",
+    "physical_contract": "Whole producer19→17, WO DMA first, all MLA/WO intermediates SRAM, PV hardware BF16 boundary retained",
+    "round_savings_ms_per_layer": [
+      -0.0022654648437499952,
+      -0.0022400429687499945,
+      -0.002286816406250003
+    ],
+    "gain_credit_ms": 0,
+    "formal_baseline_ms": 9.564282285406788,
+    "compatible_pending_forecast_ms": 0.7949464023437499,
+    "retired": true,
+    "reason": "Retaining BF16 PV corrects the initial dtype difference but the complete native chain remains slower by2.24–2.29us/layer. Compiler order proves earlier DMA submission, not DMA/computation overlap. No further timing or slicing sweep for this family.",
+    "next": "Separate BF16 probability/shared-KV SRAM candidate; no SRAM WO weight copy",
+    "limitations": "No standalone profiler; DMA serialization vs exposed copy cost vs changed WO batching are not individually attributed."
+  },
+  "decoded_swa_global_20261006": {
+    "status": "component_qualified",
+    "scope": "productionglobal40-layer20MiB mirror, layer3 slice1536, originalF32normalization/probabilities/PV, nativeQKV->MLA->WO->peer/post/norm/router",
+    "round_savings_ms": [
+      0.0005707460937500047,
+      0.00059635546874999,
+      0.0006642499999999912
+    ],
+    "saving_ms_per_reuse_layer": 0.00059635546874999,
+    "qualified_occurrences": 27,
+    "forecast_ms_per_token": 0.01610159765624973,
+    "physical_nodes": {
+      "A": 19,
+      "B": 19
+    },
+    "correctness": "5checkpoint-derivedinput/positionpairs x4ranks, all10observablesbitexact; canonicalpacked/mirrorbytesexact",
+    "gain_scope": "Micro-only forecast, not formal speed. Replacesprivate-slot01 pilot; do notaddboth.",
+    "flag": "VLLM_HPU_DSV41_MLA_DECODED_SWA=0",
+    "formal_baseline_ms": 9.564282285406788,
+    "formal_gain_credit": false,
+    "retirement": [
+      {
+        "native_owners_closed": true,
+        "groups_destroyed": true
+      },
+      {
+        "native_owners_closed": true,
+        "groups_destroyed": true
+      },
+      {
+        "native_owners_closed": true,
+        "groups_destroyed": true
+      },
+      {
+        "native_owners_closed": true,
+        "groups_destroyed": true
+      }
+    ],
+    "pending": "Normal-installedcombinedserving/cache-state acceptance; unchangedpackedfallbackwhenexistingmirrorunavailable; no publish orC2-C6gain credit.",
+    "active_compatible_total_ms": 0.8110479999999997
+  },
+  "expert_active_w2_20261006": {
+    "status": "complete_chain_micro_qualified_default_off",
+    "round_savings_ms_per_four_layers": [
+      0.0020440000000000458,
+      0.001983875000000024,
+      0.002041843749999994
+    ],
+    "saving_ms_per_layer": 0.0005104609374999985,
+    "forecast_occurrences": 40,
+    "forecast_ms_per_token": 0.020418437499999942,
+    "compatible_pending_forecast_ms": 0.8314664374999996,
+    "formal_baseline_ms": 9.564282285406788,
+    "correctness": "5 checkpoint-derived embeddings x4ranks, four real layers, alloutputs byte-exact; production top6/router/shared experts, load-time all384 W2 zero K tail proved",
+    "physical_contract": "/opt/ssd960/1cat-vllm-decode-archives/decode-expert-w2-active-k-chain-01/PHYSICAL_CONTRACT.json",
+    "limitations": "OnlyW2Ktailtrim; W13 stillpadded. Original five-tileSilu/amax retained. Microconsumerdoesnotrepresentcaptured service activations or formal quality.",
+    "flag": "VLLM_HPU_DSV41_EXPERT_ACTIVE_W2=0",
+    "formal_result": null,
+    "retired": true
+  },
+  "mhc_positive_gates_20261006": {
+    "status": "micro_qualified_default_off",
+    "round_savings_ms_per_boundary": [
+      3.906250000546008e-08,
+      1.751562499999887e-05,
+      1.48437500000001e-05
+    ],
+    "forecast_occurrences": 80,
+    "forecast_ms_per_token": 0.001187500000000008,
+    "compatible_pending_forecast_ms": 0.8326539374999996,
+    "correctness": "5checkpoint fixtures x4ranks pass official mHC equations, exactrouterIDs; floatingoutputs are not bitwise equal",
+    "physical": "Both arms standalone gates=1TPC, actualnative peer/post/norm/router consumes outputs; no physical-node reduction",
+    "limitations": "Smallest round is effectively zero; literal3positive directions per user rule, no material wholemodel performance claim. Both arms retain alreadyqualified gates/peer overlap. No formal request.",
+    "flag": "VLLM_HPU_DSV41_MHC_POSITIVE_GATES=0",
+    "formal_baseline_ms": 9.564282285406788,
+    "gain_scope": "Forecast only; no formal gain",
+    "retired": true
+  },
+  "w13_compact_offline_20261006": {
+    "status": "closed_no_gain",
+    "plain": "/opt/ssd960/1cat-vllm-decode-archives/decode-expert-w13-compact-01/DECISION.json",
+    "strided": "/opt/ssd960/1cat-vllm-decode-archives/decode-expert-w13-strided-01/DECISION.json",
+    "forecast_ms": 0
+  },
+  "resident_sampler_scope_20261006": {
+    "status": "cpu_tests_pass_hardware_memory_unmeasured",
+    "forecast_ms": 0
+  },
+  "index_query_rope_codec_20261006": {
+    "status": "complete_chain_micro_qualified_default_off",
+    "saving_ms_per_index_layer": 0.0018262265624999982,
+    "forecast_occurrences": 8,
+    "forecast_ms_per_token": 0.014609812499999986,
+    "compatible_pending_forecast_ms": 0.8472637499999995,
+    "round_savings_ms": [
+      0.0018213125000000052,
+      0.0018349843749999942,
+      0.0018262265624999982
+    ],
+    "correctness": "5 checkpoint embedding-derived input rows x4ranks; all query, gain and score bytes exact",
+    "execution": "native64-repetition producer->one query peer->2048row score consumer, ABABAB200; both arms replicate gain and use native query preparation",
+    "limitations": "One bounded score tile, not full serving trace; no formal/EOS/quality request. No measured wholemodel gain. Fixtures are real-weight-derived, not captured serving activations.",
+    "formal_baseline_ms": 9.564282285406788,
+    "flag": "VLLM_HPU_DSV41_INDEX_QUERY_CODEC=0"
+  },
+  "compatible_pending_forecast_ms": 0.11788950000000087,
+  "current_micro_cards": [
+    2,
+    3,
+    6,
+    7
+  ],
+  "query_replica_native_03": {
+    "status": "completed",
+    "checks": [
+      {
+        "fixture": 0,
+        "query_gain_score_exact": [
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "fixture": 1,
+        "query_gain_score_exact": [
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "fixture": 2,
+        "query_gain_score_exact": [
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "fixture": 3,
+        "query_gain_score_exact": [
+          true,
+          true,
+          true
+        ]
+      },
+      {
+        "fixture": 4,
+        "query_gain_score_exact": [
+          true,
+          true,
+          true
+        ]
+      }
+    ],
+    "round_savings_ms": [
+      -0.0007000156250000084,
+      -0.0005649687500000056,
+      -0.0004773203125000014
+    ],
+    "saving_ms_per_index_layer": -0.0005649687500000056,
+    "three_consistent_rounds": false,
+    "peer_points_per_iteration": [
+      1,
+      0
+    ],
+    "native_query_path": true,
+    "fused_query_codec": false,
+    "shared_query_codec": true,
+    "fixture_scope": "Checkpoint index projections -> native peer exchange -> 2048-row score tile.\n\nThe default compares cold head-gain replication; --query-replica also tests\nreplicating the query weights, with the qualified gain replica held fixed.\nFive embedding-derived fixtures qualify query/gain/score bytes on all ranks.\n",
+    "formal_gain": false,
+    "decision": "rejected_three_negative_native_rounds",
+    "forecast_credit_ms": 0,
+    "parent": "Qualified fused query codec and gain replica in BOTH arms",
+    "reason": "Removing one query peer via full cold Wq replication still regresses the actual producer/score consumer boundary. No renewed global-query runtime implementation.",
+    "owners_retired": true
+  },
+  "index_wide_reindex_20261006": {
+    "status": "complete_chain_micro_qualified_default_off",
+    "artifact": "/opt/ssd960/1cat-vllm-decode-archives/decode-index-wide-reindex-chain-02",
+    "formal_baseline_ms": 9.564282285406788,
+    "saving_ms_per_reindex_layer": 0.02221053124999997,
+    "round_savings_ms": [
+      0.02215784374999999,
+      0.02221234375000003,
+      0.02221053124999997
+    ],
+    "forecast_occurrences": 4,
+    "applicable_layers": [
+      24,
+      28,
+      32,
+      36
+    ],
+    "forecast_ms_per_token": 0.08884212499999988,
+    "compatible_pending_forecast_ms": 0.9361058749999994,
+    "flag": "VLLM_HPU_DSV41_INDEX_WIDE_REINDEX=0",
+    "physical": {
+      "query_producer": [
+        13,
+        13
+      ],
+      "complete_score_select_mla": [
+        61,
+        27
+      ],
+      "clamps": [
+        13,
+        4
+      ],
+      "gather": [
+        13,
+        4
+      ],
+      "mmes": [
+        15,
+        6
+      ],
+      "reducers": [
+        8,
+        1
+      ],
+      "raw_preclamped_scorer": [
+        40,
+        9
+      ]
+    },
+    "checks": "Five checkpoint embedding-derived queries/positions x4ranks: scores, selectedIDs, MLA output, publishedrows/mask byte-exact. Permutedcandidate slots,holes,overflow exercised; full524288-row mirrored allocation; originalK128/BF16shard boundaries retained.",
+    "execution": "Native16-repetition query producer->onepeer->fullscore/select->actualMLA ABABAB200; botharms shared querycodec/gainreplica; timingratio1,pos16383,2048blocks",
+    "limitations": "One real-weight layer24, embedding-derived inputs not captured serving QR; four-layer forecast is mapping, not E2E. Fulldecoder state/cache, C2-C6 and formalquality not newlymeasured; unchangedfallback forotherbuckets/packedkeys. No recordedwholemodelgain.",
+    "owners_retired": true
+  },
+  "threshold_band_attempt_20261006": {
+    "status": "aborted_pre_gate_empty_TPC_selfloop_source_removed",
+    "artifact": "/opt/ssd960/1cat-vllm-decode-archives/decode-index-threshold-band-chain-03",
+    "gain_credit_ms": 0,
+    "device_recovered_without_reset": true,
+    "remaining_candidate": "Pure predicate bitpacking; no scalar/VPU waiting. Off/unqualified."
+  },
+  "current_micro_cpus": [
+    [
+      56,
+      57,
+      58,
+      59,
+      60
+    ],
+    [
+      61,
+      62,
+      63,
+      64,
+      65
+    ],
+    [
+      84,
+      85,
+      86,
+      87,
+      88
+    ],
+    [
+      89,
+      90,
+      91,
+      92,
+      93
+    ]
+  ],
+  "resource_state": "Formal/companion done; own workers retired; next complete-chain queued behind actual healthy-card owners",
+  "predicate_pack_20261006": {
+    "status": "complete_chain_micro_qualified_default_off",
+    "round_savings_ms": [
+      0.0021048124999999973,
+      0.0021268125000000193,
+      0.0017698124999999953
+    ],
+    "saving_ms_per_reindex_layer": 0.0021048124999999973,
+    "forecast_occurrences": 4,
+    "applicable_layers": [
+      24,
+      28,
+      32,
+      36
+    ],
+    "forecast_ms_per_token": 0.00841924999999999,
+    "compatible_pending_forecast_ms": 0.9445251249999994,
+    "physical_nodes": {
+      "query_producer": [
+        13,
+        13
+      ],
+      "score_select_mla": [
+        27,
+        27
+      ]
+    },
+    "correctness": "5checkpoint-derived queries/positions/candidate permutations/holes x4ranks; allscores/IDs/MLA/publication bytes exact",
+    "parent": "Qualified querycodec/gainreplica and wide-score held in both arms; native16-repeat ABABAB200; full524K key/main allocation",
+    "limitation": "Native candidate-coordinate producer was not active in this fixture. Next combined wide+pack run aligns that already-default producer; replace overlapping estimate, never add it.",
+    "flag": "VLLM_HPU_DSV41_INDEX_PREDICATE_PACK=0",
+    "formal_baseline_ms": 9.564282285406788,
+    "formal_gain": false,
+    "owners_retired": true
+  },
+  "softmax_static_20261006": {
+    "status": "rejected_three_slower_native_rounds",
+    "correctness": "5checkpoint-derived fixtures x4ranks; all7 outputs exact",
+    "round_savings_ms": [
+      -0.0012327539062500087,
+      -0.0010446992187500004,
+      -0.0011662695312499999
+    ],
+    "physical_nodes": {
+      "producer": [
+        19,
+        19
+      ],
+      "post": [
+        3,
+        3
+      ]
+    },
+    "same_QK_PV_layout": true,
+    "gain_credit_ms": 0,
+    "flag": "VLLM_HPU_DSV41_MLA_REGISTER_SOFTMAX=0",
+    "reason": "Lower simulator bundle/load/store counts do not imply faster native chain. Critical per-node cause not isolated; no extra profiler. Keep original arithmetic default.",
+    "owners_retired": true
+  },
+  "queued_native_candidates": [],
+  "next_action": "Retain one default-off segmented receive-prepost item (.1178895ms forecast); continue source-supported distinct hotspot work. Trigger formal only at .5ms or3 items.",
+  "qualified_production_coordinate_selection": {
+    "status": "complete_chain_micro_qualified_default_off",
+    "round_savings_ms_per_layer": [
+      0.021125375000000002,
+      0.021080187499999972,
+      0.021104500000000012
+    ],
+    "forecast_occurrences": 4,
+    "applicable_layers": [
+      24,
+      28,
+      32,
+      36
+    ],
+    "forecast_ms_per_token": 0.08441800000000005,
+    "compatible_pending_forecast_ms": 0.9316817499999996,
+    "physical_nodes": {
+      "query": [
+        13,
+        13
+      ],
+      "score_select_mla": [
+        42,
+        20
+      ]
+    },
+    "parent": "Shared querycodec/gainreplica and already-default native candidate coordinates in both arms",
+    "correctness": "5checkpoint-derived input/position/pool fixtures x4ranks, allscore/ID/MLA/publicationbytes exact",
+    "supersedes": [
+      "decode-index-wide-reindex-chain-02",
+      "decode-index-predicate-pack-chain-01"
+    ],
+    "superseded_forecast_ms": 0.09726137499999987,
+    "formal_gain": false,
+    "formal_baseline_ms": 9.564282285406788,
+    "owners_retired": true,
+    "flag": [
+      "VLLM_HPU_DSV41_INDEX_WIDE_REINDEX=0",
+      "VLLM_HPU_DSV41_INDEX_PREDICATE_PACK=0"
+    ]
+  },
+  "active_native_candidate": null,
+  "rejected_compact_softmax": {
+    "status": "rejected_three_slower_native_rounds",
+    "round_savings_ms": [
+      -0.00038376562499999045,
+      -0.0003929023437500012,
+      -0.0004449023437499977
+    ],
+    "saving_ms_per_layer": -0.0003929023437500012,
+    "correctness": "5real-weight-derived fixtures x4ranks, packed/mirror/query/output byte-exact;5preserved+5edge probability simulator fixtures exact",
+    "physical_nodes": {
+      "producer": [
+        19,
+        19
+      ],
+      "post": [
+        3,
+        3
+      ]
+    },
+    "parent": "Qualified hardwarecodec/global decodedSWA in botharms; actual QKV->MLA/WO->peer/post/FFN/router native128-repeat",
+    "gain_credit_ms": 0,
+    "formal_baseline_ms": 9.564282285406788,
+    "prototype_archived": "/opt/ssd960/1cat-vllm-decode-archives/decode-mla-compact-softmax-01/prototype-source",
+    "maintained_runtime_restored": true,
+    "owners_retired": true,
+    "reason": "Fewer private stores and nonpositive-domain instructions did not reduce the complete-chain latency. This is the second slower softmax instruction/lifetime native trial; stop family, no further unroll/lookup variants."
+  },
+  "qkv_input_scale_handoff": {
+    "status": "two_slower_native_variants_stopped_archived",
+    "evidence": [
+      "/opt/ssd960/1cat-vllm-decode-archives/decode-qkv-input-scale-chain-01",
+      "/opt/ssd960/1cat-vllm-decode-archives/decode-qkv-input-scale-chain-02"
+    ],
+    "gain_credit_ms": 0,
+    "formal_result": null
+  },
+  "sampling_threshold": {
+    "status": "included_in_formal_batch04_default_on",
+    "forecast_ms_token": 0.024228749999999966,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-sampling-threshold-chain-04",
+    "extra_fullserving_fallback_rate": "unmeasured",
+    "formal_result": "/opt/ssd960/1cat-vllm-decode-archives/decode-accumulated-serving-04/formal/result.json",
+    "formal_gain_individually_attributed": false
+  },
+  "sampling_fused_packet": {
+    "status": "included_in_formal_batch04_default_on",
+    "forecast_ms_token": 0.03901128125000003,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-sampling-fused-chain-02",
+    "formal_result": "/opt/ssd960/1cat-vllm-decode-archives/decode-accumulated-serving-04/formal/result.json",
+    "supersedes": "decode-sampling-fused-chain-01",
+    "formal_gain_individually_attributed": false
+  },
+  "sampling_shared_max": {
+    "status": "included_in_formal_batch04_default_on",
+    "forecast_ms_token": 0.037524406249999975,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-sampling-shared-max-chain-02",
+    "formal_result": "/opt/ssd960/1cat-vllm-decode-archives/decode-accumulated-serving-04/formal/result.json",
+    "formal_gain_individually_attributed": false
+  },
+  "startup_correction_20261006": {
+    "case": "/opt/ssd960/1cat-vllm-decode-archives/decode-accumulated-serving-04/startup-attempt-01",
+    "formal_requests": 0,
+    "trace_directory_preflight_added": true,
+    "shutdown_diagnostics_nonfatal": true,
+    "owners_retired": true,
+    "formal_gain_credit": 0
+  },
+  "silu_rounding_quarter": {
+    "status": "rejected_three_slower_complete_chain_rounds",
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-silu-quarter-chain-02",
+    "round_savings_ms": [
+      -0.00052375,
+      -0.00049684375,
+      -0.00041409375
+    ],
+    "gain_credit_ms": 0,
+    "maintained_runtime_restored": true
+  },
+  "accepted_baseline_20261006": {
+    "case": "decode-accumulated-serving-04",
+    "source_formal_commit": "71d4f203",
+    "official_tpot_ms": 8.532522827530956,
+    "formal_quality_passed": true,
+    "compatible_defaults_promoted": true
+  },
+  "physical_module_batch04": {
+    "status": "formal_passed_quality_passed_promote_compatible_batch",
+    "baseline_ms": 9.564282285406788,
+    "candidate_ms": 8.532522827530956,
+    "measured_saving_ms": 1.0317594578758325,
+    "forecast_ms": 1.0324461875,
+    "forecast_fraction": 0.9993348518959324,
+    "output_tokens": 1868,
+    "official_sampling": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "seed": 42
+    },
+    "natural_eos": true,
+    "formal_profile": null,
+    "quality_facts": 14,
+    "prompt_ids_match": true,
+    "cached_prompt_tokens": 0,
+    "module_mapping": [
+      2,
+      3,
+      6,
+      7
+    ],
+    "baseline_module_mapping": [
+      0,
+      1,
+      4,
+      5
+    ],
+    "target_7ms_achieved": false,
+    "trace_analysis_pending": false,
+    "case": "/opt/ssd960/1cat-vllm-decode-archives/decode-accumulated-serving-04",
+    "sampling_fallbacks": 0,
+    "defaults_promoted": true,
+    "trace_rank0": {
+      "period_ms": 8.4093494167,
+      "compute_ms": 5.9884868665,
+      "not_compute_ms": 2.4208625501,
+      "small_gaps_ms": 1.1817346159
+    }
+  },
+  "last_experiment": {
+    "status": "micro_qualified_default_off",
+    "flag": "VLLM_HPU_DSV41_MHC_GATE_PACKET",
+    "formal_baseline_ms": 8.532522827530956,
+    "round_savings_ms_per_boundary": [
+      0.000704078125,
+      0.0006974921875,
+      0.0007217734375
+    ],
+    "estimated_ms_token": 0.05632625,
+    "qualified_boundaries_forecast": 80,
+    "all_five_inputs_four_ranks_exact": true,
+    "cpu_checks_passed": 34,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-peer-gates-vector-chain-01",
+    "physical_nodes_change_claimed": false,
+    "formal_request_ran": false
+  },
+  "mhc_parallel_fp8": {
+    "status": "rejected_complete_chain_slower",
+    "all_5x4_correctness_passed": true,
+    "bitwise_outputs": false,
+    "same_expert_set_required": true,
+    "routing_error_aligned_by_expert": true,
+    "allrank_sram_passed": true,
+    "physical_nodes": {
+      "reference": 20,
+      "candidate": 23
+    },
+    "round_savings_ms": [
+      -0.015023539062499994,
+      -0.014984921875000001,
+      -0.014982304687500003
+    ],
+    "saving_ms_per_layer": -0.014984921875000001,
+    "formal_baseline_ms": 8.532522827530956,
+    "forecast_credit_ms": 0,
+    "formal_request_ran": false,
+    "all_devices_retired": true,
+    "source_archived": "/opt/ssd960/1cat-vllm-decode-archives/decode-mhc-fp8-parallel-02/prototype-source",
+    "reason": "Additional statistics, quantization and matrix stages increase complete early-attention/control latency despite SRAM placement. Node-count and full-chain gates reject this implementation; do not retry unchanged FP8 or placement variants.",
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-mhc-fp8-full-chain-03"
+  },
+  "expert_shared_scale_20261006": {
+    "status": "closed_accepted_in_batch05",
+    "formal_baseline_ms": 8.532522827530956,
+    "expected_ms_token": [
+      0.05,
+      0.12
+    ],
+    "round_savings_four_layer_ms": [
+      0.007190156249999968,
+      0.0069876562500000294,
+      0.006979000000000013
+    ],
+    "saving_ms_per_layer": 0.0017469140625000074,
+    "estimated_ms_token": 0.0698765625000003,
+    "flag": "VLLM_HPU_DSV41_EXPERT_SHARED_SCALE",
+    "five_inputs_four_ranks_byte_exact": true,
+    "physical_nodes": {
+      "parent": 21,
+      "candidate": 20
+    },
+    "w13_and_expert_weights_sram": true,
+    "activation_sram": true,
+    "full_model_gain_credit": false,
+    "formal_request_ran": false,
+    "retired": true,
+    "source_scope": "Raw shared BF16 MME -> combine shared scales and preserve BF16 scale/product rounding inside existing diagonal ordered expert finalizer. Independent shared W13 and routed SRAM slice scheduling retained.",
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-shared-down-finalize-chain-01",
+    "limitations": "Four actual checkpoint layers/all384 experts, native replay incl peer and next mHC/norm consumer; 40-layer saving is a forecast. Existing C2-C6 path unchanged. Five SDK arithmetic cases use checkpoint-derived shared products with generated routed products, while native five-fixture allrank gate uses real shared/routed producers.",
+    "formal_ms_token": 8.23925759729292,
+    "included_in_baseline": true,
+    "default": true
+  },
+  "trace_guided_trials": [
+    {
+      "name": "post_control_stream",
+      "evidence": [
+        "/opt/ssd960/1cat-vllm-decode-archives/decode-post-control-stream-chain-01",
+        "/opt/ssd960/1cat-vllm-decode-archives/decode-post-control-stream-chain-02-fixed"
+      ],
+      "status": "two_variants_rejected_slower",
+      "savings_ms_per_boundary": [
+        -0.0041285234375,
+        -0.0042647578125
+      ],
+      "gain_credit_ms": 0
+    },
+    {
+      "name": "monitor_high_reuse",
+      "status": "two_variants_closed_no_gain",
+      "evidence": [
+        "/opt/ssd960/1cat-vllm-decode-archives/decode-native-monitor-high-reuse-chain-03",
+        "/opt/ssd960/1cat-vllm-decode-archives/decode-native-monitor-compact-chain-01"
+      ],
+      "gain_credit_ms": 0
+    }
+  ],
+  "mhc_gate_packet_20261007": {
+    "status": "closed_accepted_in_batch05",
+    "flag": "VLLM_HPU_DSV41_MHC_GATE_PACKET",
+    "formal_baseline_ms": 8.532522827530956,
+    "round_savings_ms_per_boundary": [
+      0.000704078125,
+      0.0006974921875,
+      0.0007217734375
+    ],
+    "estimated_ms_token": 0.05632625,
+    "qualified_boundaries_forecast": 80,
+    "all_five_inputs_four_ranks_exact": true,
+    "cpu_checks_passed": 34,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-peer-gates-vector-chain-01",
+    "physical_nodes_change_claimed": false,
+    "formal_request_ran": false,
+    "formal_ms_token": 8.23925759729292,
+    "included_in_baseline": true,
+    "default": true
+  },
+  "mhc_post_norm_stats_20261007": {
+    "status": "closed_accepted_in_batch05",
+    "flag": "VLLM_HPU_DSV41_MHC_POST_NORM_STATS",
+    "formal_baseline_ms": 8.532522827530956,
+    "round_savings_ms_per_ffn_boundary": [
+      0.0004866171875000033,
+      0.00047749218750001154,
+      0.0004906640625000069
+    ],
+    "estimated_ms_token": 0.019464687500000133,
+    "qualified_boundaries_forecast": 40,
+    "official_tolerance_passed_five_inputs_four_ranks": true,
+    "cpu_checks_passed": 30,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-post-weighted-statistics-chain-03",
+    "physical_node_change_claimed": false,
+    "formal_request_ran": false,
+    "formal_ms_token": 8.23925759729292,
+    "included_in_baseline": true,
+    "default": true
+  },
+  "next_batch_trigger": {
+    "qualified_items": 1,
+    "forecast_ms": 0.13745249999999987,
+    "rule": "forecast >=0.5 ms OR three compatible qualified items"
+  },
+  "latest_components_in_progress": {
+    "bf16_single_plane": {
+      "status": "failed_correctness_before_timing",
+      "case": "/opt/ssd960/1cat-vllm-decode-archives/decode-control-bf16-swizzled-chain-02",
+      "reason": "FP8 shared SiLU normalized error above2e-4; router exact"
+    },
+    "bf16_pair": {
+      "status": "closed_no_consistent_complete_chain_gain",
+      "checks": "5 checkpoint-derived fixtures x4 working layers x4 ranks pass existing official tolerances; router IDs exact.",
+      "round_savings_ms_per_layer": [
+        -2.9632812499992556e-05,
+        -2.211718749999675e-05,
+        1.8515624999951297e-06
+      ],
+      "forecast_ms_token": -0.00088468749999987,
+      "gain_credit_ms": 0,
+      "default": false,
+      "measured_formal": false,
+      "why": "Fewer simulated VPU instructions does not improve complete WO/native-peer/post/router/shared/next-control chain; read transactions unchanged and independent controller already overlaps actual MME work. Single-plane precision failed; high/low precision passed but gain direction inconsistent. Stop this BF16 precision direction, no third format variant.",
+      "cpu_meta_checks": 14,
+      "case": "/opt/ssd960/1cat-vllm-decode-archives/decode-control-bf16-pair-chain-01"
+    },
+    "mme_full_strategy": {
+      "status": "closed_below_hotspot_budget",
+      "forecast_ms": 0.0012515625,
+      "gain_credit_ms": 0
+    },
+    "main_pv_cache": {
+      "status": "closed_two_measured_variants_slower",
+      "case": "/opt/ssd960/1cat-vllm-decode-archives/decode-main-pv-cache-chain-01",
+      "gate": "5 SDK byte-exact buffers,13 Meta contracts; correct inplace memory-section outputs feed MME dependencies",
+      "hypothesis_ceiling_ms_token": 0.35,
+      "publisher_cost_pending": true,
+      "gain_credit_ms": 0,
+      "default": false,
+      "latest_case": "/opt/ssd960/1cat-vllm-decode-archives/decode-main-pv-cache-chain-04",
+      "first_measured_case": "/opt/ssd960/1cat-vllm-decode-archives/decode-main-pv-cache-chain-03",
+      "first_savings_ms_per_layer": [
+        -0.0012792421875,
+        -0.001327203125,
+        -0.00135450390625
+      ],
+      "binding_repairs": "Explicit Bridge scratch outputs and mandatory SRAM input/output reuse binding restore five-input byte-exact native chain. Unfixedlaunch/incorrect variants preserved.",
+      "five_input_four_rank_exact": true,
+      "native_ABABAB_savings_ms_per_reuse": [
+        -0.0012349726562499996,
+        -0.0012949179687499895,
+        -0.0013186835937500085
+      ],
+      "formal_not_run": true,
+      "publisher_not_tested": true,
+      "frontend_copy_check": "No extra aten.copy/clone operator in cached QKV/MLA/WO graph; return alias annotation does not remove the complete-chain regression. Do not label the physical gap as Python wrapping.",
+      "why_stop": "Both properly bound native variants regress all three pairs. A publisher output escape adds cost; do not proceed to serving or a third slicing/layout variant.",
+      "scope_limit": "Anonymous physical-node/SRAM transfer provenance not reconstructed; negative complete-chain timings sufficient to reject.",
+      "preserved_source": "archived-source/"
+    }
+  },
+  "accepted_baseline_20261007": {
+    "ms_token": 8.23925759729292,
+    "source": "46ccb98a",
+    "formal_profile": null,
+    "input_tokens": 16384,
+    "natural_eos_tokens": 2365,
+    "sampling": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "seed": 42
+    },
+    "quality": "14 facts pass",
+    "combined_forecast_ms": 0.1456675,
+    "observed_difference_ms": 0.293265230238036,
+    "case": "/opt/ssd960/1cat-vllm-decode-archives/decode-accumulated-serving-07",
+    "trace_status": "complete",
+    "promotion_pending_companion": false,
+    "companion_case": "/opt/ssd960/1cat-vllm-decode-archives/decode-accumulated-serving-07-trace-repair-03",
+    "status": "combined_formal_accepted",
+    "formal_ms_token": 8.23925759729292,
+    "parent_ms_token": 8.532522827530956,
+    "observed_improvement_ms_token": 0.293265230238036,
+    "saved_compatible_forecast_ms_token": 0.1456675,
+    "flags_promoted": [
+      "VLLM_HPU_DSV41_EXPERT_SHARED_SCALE",
+      "VLLM_HPU_DSV41_MHC_GATE_PACKET",
+      "VLLM_HPU_DSV41_MHC_POST_NORM_STATS"
+    ],
+    "pending_gain_ms_token": 0,
+    "formal_request_repeated": false,
+    "quality_facts": 14,
+    "trace_case": "/opt/ssd960/1cat-vllm-decode-archives/decode-accumulated-serving-07-trace-repair-03",
+    "trace_windows": 24,
+    "scope": "Companion analysis completed for all four ranks,24 contiguous cycles, no scored request repeated",
+    "target_ms_token": 7,
+    "target_met": false,
+    "unqualified_main_pv_cache_remains_off": true,
+    "four_rank_trace_period_ms": [
+      8.183174083333347,
+      8.17892804166667,
+      8.184153916666672,
+      8.176476749999992
+    ]
+  },
+  "receive_prepost_20261007": {
+    "status": "qualified_segmented_production_real16_default_off",
+    "formal_baseline_ms": 8.23925759729292,
+    "round_savings_ms_per_boundary": [
+      0.0017220859374999994,
+      0.0017120078124999993,
+      0.0017181562499999983
+    ],
+    "forecast_occurrences": 80,
+    "forecast_ms_token": 0.11788950000000087,
+    "checks": "five checkpoint-derived fixtures x four ranks, 13 outputs exact",
+    "scope": "WO/control->four-rank BF16 peer->post/norm/router/shared-W13 and SiLU",
+    "full_model_gain_credit_ms": 0,
+    "formal_ran": false,
+    "normal_runtime_integration_pending": false,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-receive-prepost-real16-04",
+    "flag": "VLLM_HPU_NATIVE_RECEIVE_PREPOST",
+    "default": false,
+    "integration": "Default-off shared native entry, typed runtime API and source-fingerprinted optional overlays",
+    "full_serving_capture_tested": false,
+    "additional_contract_gate": "Standalone104-frame ring-wrap gate exact. Production real16-03 cold rejected SEGMENTED Engram input, not bounded Reindex. ABI v2 separate prefix/suffix actual epoch attachment being checked.",
+    "latest_case": "/opt/ssd960/1cat-vllm-decode-archives/decode-receive-prepost-real16-04",
+    "forecast_method": "Latest campaign real16 conservative x1.5; replaces .1374525 standalone forecast",
+    "round_savings_ms_real16": [
+      0.06374799999999992,
+      0.07859300000000058,
+      0.11386699999999994
+    ],
+    "saving_ms_real16": 0.07859300000000058
+  },
+  "receive_epoch_hoist_20261007": {
+    "status": "rejected_three_slower_complete_chain_rounds",
+    "round_savings_ms_per_boundary": [
+      -6.878125000000374e-05,
+      -6.230468750000051e-05,
+      -6.163281250000374e-05
+    ],
+    "correctness": "5 checkpoint-derived fixtures x4 ranks,13 outputs exact",
+    "source_change": "Only repeated receive epoch arm and fence packets omitted; original retirement and credit packets retained",
+    "gain_credit_ms": 0,
+    "formal_ran": false,
+    "default": false,
+    "retired": true
+  },
+  "signed_receive_ready": {
+    "status": "closed_correct_no_gain",
+    "phase_count": 104,
+    "checks": "5 checkpoint-derived fixtures x4 ranks, 13 actual producer/peer/post/router/shared/Silu/next-control outputs byte-exact",
+    "round_savings_ms_per_boundary": [
+      -0.0002821538461538556,
+      -0.00015702884615384494,
+      -0.00010915384615384216
+    ],
+    "forecast_ms_token": 0,
+    "gain_credit_ms": 0,
+    "default": false,
+    "formal_request": false,
+    "why": "Actual SDK signed16 encoding fixes old bit15-dropping overflow and passes repeated ring reuse, but short Ready+Full relay complete chain is slower in every native replay pair. Ordered Ready long-CG and this signed short variant are both valid measured regressions; close receive-only completion family, retain ordinary Full completion.",
+    "own_devices_retired": true,
+    "formal_baseline_ms": 8.23925759729292,
+    "pending_compatible_ms": 0.1374525,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-hcl-signed-ready-01",
+    "sdk_cpu_cases": 33693692,
+    "source_sha256": "d55bcc6455cfac3f985bff31145780aec7e99406fcb7ad648f42692a6b66f892"
+  },
+  "receive_epoch_segmented_20261007": {
+    "status": "production_real16_micro_qualified_default_off",
+    "runtime_abi": 2,
+    "range_checks": 261538,
+    "cpu_tests_passed": 36,
+    "source_overlay_exact_parent_checks": true,
+    "single_mapped_synapse_hcl_pair": true,
+    "formal_request": false,
+    "default": false,
+    "measured_gain_ms": null,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-receive-prepost-segmented-01",
+    "production_case": "/opt/ssd960/1cat-vllm-decode-archives/decode-receive-prepost-real16-04",
+    "formal_gain_credit_ms": 0,
+    "round_savings_ms_real16": [
+      0.06374799999999992,
+      0.07859300000000058,
+      0.11386699999999994
+    ],
+    "candidate_median_ms": 3.5440835,
+    "reference_median_ms": 3.6146745,
+    "forecast_ms_token": 0.11788950000000087,
+    "numerical_gate": "5 checkpoint-derived continuation inputs x4 ranks, all hidden bytes and33 state tensors exact"
+  }
+}

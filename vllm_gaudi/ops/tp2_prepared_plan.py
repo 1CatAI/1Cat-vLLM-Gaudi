@@ -137,6 +137,14 @@ def native_compute_coverage_matches(segments, reductions, groups, compiled_consu
     return segments > reductions
 
 
+def _configure_native_topology(graph, groups, adapter):
+    graph.configure_topology(groups, adapter.collectives, adapter.external_prefix)
+    if not getattr(adapter, "require_independent_overlap", True):
+        if not hasattr(graph, "configure_dependency_policy"):
+            raise RuntimeError("Coarser native replay requires an explicit dependency-policy API")
+        graph.configure_dependency_policy(False)
+
+
 def _flush():
     global _native_captures
     pending = getattr(_local, "pending", None)
@@ -168,7 +176,12 @@ def _flush():
             if start:
                 bridge.replay_prepared_groups(plans[:start], inputs[:start])
             native_plans, native_inputs = plans[start:stop], inputs[start:stop]
-            key = (adapter.name if adapter else "qwen3_next", groups, *(id(plan) for plan in native_plans))
+            receive_prepost = v41 and getattr(
+                context.get("owner"), "receive_prepost", gaudi_envs.VLLM_HPU_NATIVE_RECEIVE_PREPOST
+            )
+            memory_ready = v41 and getattr(context.get("owner"), "memory_ready", False)
+            key = (adapter.name if adapter else "qwen3_next", groups, receive_prepost, memory_ready,
+                   *(id(plan) for plan in native_plans))
             graph = _native_graphs.get(key)
             if graph is None:
                 if not bridge.native_decode_graph_available():
@@ -178,7 +191,18 @@ def _flush():
                 if context is not None and context.get("owner") is not None:
                     _native_graph_owners[key] = weakref.ref(context["owner"])
                 if v4:
-                    graph.configure_topology(groups, adapter.collectives, adapter.external_prefix)
+                    _configure_native_topology(graph, groups, adapter)
+                if v41 and getattr(context.get("owner"), "memory_ready", False):
+                    if not hasattr(graph, "configure_memory_ready_from_plans"):
+                        raise RuntimeError("Memory-ready capture requires the matching cold reader runtime")
+                    context["owner"].memory_ready_enabled.fill_(1)
+                    torch.hpu.synchronize()
+                    graph.configure_memory_ready_from_plans(context["owner"].memory_ready_ones,
+                                                           context["owner"].memory_ready_enabled)
+                if receive_prepost:
+                    if not hasattr(graph, "configure_preposted_receives"):
+                        raise RuntimeError("Receive preposting requires the matching native epoch runtime")
+                    graph.configure_preposted_receives(True)
                 if v41 and gaudi_envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX and adapter.supports_segmented_input:
                     attention_inputs = list(context["attention_inputs"])
                     if gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM:
@@ -705,6 +729,10 @@ class PreparedGroupModule(torch.nn.Module):
                         allocated_slots.append(current.index)
                     visible_slots.append(current)
                 native.add_compute(child._recipe_id, [x.index for x in arguments], allocated_slots)
+                from vllm_gaudi.compilation.deepseek_v41_memory_ready import mark_memory_ready_recipe
+
+                mark_memory_ready_recipe(native, child.fx_module, [x.index for x in arguments],
+                                         [x.index for x in visible_slots])
                 if tile_bound:
                     native.mark_last_optional_tile(tile_bound)
                 env[node] = (

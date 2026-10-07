@@ -80,7 +80,7 @@ def main():
         values = [start.elapsed_time(end) / 32 for start, end in events]
         periods.append(dict(arm=label, token_intervals_ms=values, summary=summarize(values), competing_load=load))
         print(label, periods[-1]['summary'], flush=True)
-    result = dict(periods=periods, comparison=compare_periods(periods), repeat=32,
+    result = dict(periods=periods, comparison=compare_periods(periods, device_events=True), repeat=32,
                   no_real16_gain_credit=True, no_formal_gain_credit=True)
     (root / 'SMALL_CHAIN_AB.json').write_text(json.dumps(result, indent=2)+'\n')
     print(json.dumps(result['comparison']), flush=True)

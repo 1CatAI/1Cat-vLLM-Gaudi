@@ -14,13 +14,14 @@ def _native_input_precision_compatible(program):
     return not program.dspark and not (program.fp8_decode and not getattr(program, "expert_n256", False))
 
 
-def stage_collectives(tp_rank, native, tp_size=2, *, native_fp32_gather=False):
+def stage_collectives(tp_rank, native, tp_size=2, *, native_fp32_gather=False, ordered_peer_sum=None):
     from vllm.distributed import tensor_model_parallel_all_gather, tensor_model_parallel_all_reduce
     from vllm_gaudi import envs
 
     maximum = 64 * 5120 if envs.VLLM_HPU_DSV41_BATCH_DECODE else 32768
+    fused_peer_sum = envs.VLLM_HPU_DSV41_ORDERED_PEER_SUM if ordered_peer_sum is None else ordered_peer_sum
 
-    def reduce(value, *, ready_outputs=()):
+    def reduce(value, *, ready_outputs=(), defer=False):
         if native and value.dtype == torch.bfloat16 and value.numel() <= maximum:
             flat = value.reshape(1, -1).contiguous()
             if tp_size == 2:
@@ -29,6 +30,9 @@ def stage_collectives(tp_rank, native, tp_size=2, *, native_fp32_gather=False):
                     if ready_outputs
                     else torch.ops.vllm_gaudi.tp2_exchange_peer(flat)
                 )
+                if defer:
+                    peers = (flat, peer) if tp_rank == 0 else (peer, flat)
+                    return torch.stack(peers).reshape(tp_size, *value.shape)
                 return (flat + peer).reshape(value.shape)
             shards = (
                 torch.ops.vllm_gaudi.tp_peer_allgather_scheduled(flat, tp_size, list(ready_outputs))
@@ -36,10 +40,18 @@ def stage_collectives(tp_rank, native, tp_size=2, *, native_fp32_gather=False):
                 else torch.ops.vllm_gaudi.tp_peer_allgather(flat, tp_size)
             )
             shards = shards.reshape(tp_size, flat.numel())
+            if defer:
+                return shards.reshape(tp_size, *value.shape)
+            if fused_peer_sum and flat.numel() <= 32768 and flat.numel() % 128 == 0:
+                from vllm_gaudi.ops.deepseek_v41_ordered_peer_sum import ordered_peer_sum
+
+                return ordered_peer_sum(shards).reshape(value.shape)
             reduced = shards[0].float()
             for rank in range(1, tp_size):
                 reduced = reduced + shards[rank].float()
             return reduced.to(value.dtype).reshape(value.shape)
+        if defer:
+            raise ValueError("Deferred peer reduction requires the small native BF16 collective")
         return tensor_model_parallel_all_reduce(value)
 
     def gather(value, dim):
@@ -87,6 +99,19 @@ class _Snapshot:
     def restore(self):
         for destination, source in zip(self.tensors, self.saved, strict=True):
             destination.copy_(source)
+
+
+class _InputFeedbackSnapshot:
+    """Restore the private roots as well as cache state after cold discovery."""
+
+    def __init__(self, state, roots):
+        self.state = state
+        self.roots = _Snapshot(roots)
+        self.bytes = state.bytes + self.roots.bytes
+
+    def restore(self):
+        self.state.restore()
+        self.roots.restore()
 
 
 def stage_state_tensors(program):
@@ -145,11 +170,17 @@ def stage_state_tensors(program):
     )
 
 
-def capture_engram_inputs(engram, *, direct=False, device_layer1=False, local_heads=12):
+def capture_engram_inputs(engram, *, direct=False, device_layer1=False, device_layers=False, local_heads=12):
     if not direct:
         return tuple(value.clone() for value in engram)
     if len(engram) != 2:
         raise ValueError("Direct Engram capture requires both layer inputs")
+    if device_layers:
+        first, late = engram
+        if any(value.dtype != torch.bfloat16 or tuple(value.shape) != (1, local_heads, 256)
+               or not value.is_contiguous() or value.device != first.device for value in engram):
+            raise ValueError("Device Engram capture requires both fixed BF16 layer inputs")
+        return tuple(engram)
     if device_layer1:
         first, late = engram
         if (
@@ -201,7 +232,12 @@ class StageVariant(torch.nn.Module):
         replay_tail=False,
     ):
         super().__init__()
+        from vllm_gaudi import envs as gaudi_envs
+
         self.program = program
+        # Native scheduling policy belongs to this cold execution owner. Keep
+        # separate replay plans independent even when they share allocations.
+        self.receive_prepost = getattr(program, "native_receive_prepost", gaudi_envs.VLLM_HPU_NATIVE_RECEIVE_PREPOST)
         self.native_input = native_input
         self.tail_enabled = (replay_tail and native_input and getattr(program, "is_last_stage", False)
                              and not program.dspark)
@@ -218,9 +254,14 @@ class StageVariant(torch.nn.Module):
         )
         engram_collectives = sum(getattr(layer, "layer", -1) in (1, 14) for layer in program.layers)
         self.adapter = DecoderTopology(name, (4,) * (layers // 4), 2, False, engram_collectives + int(native_input))
+        if getattr(program, "decode_merge_mhc_partitions", False):
+            self.adapter = replace(self.adapter, require_independent_overlap=False)
         if program.length > 512:
+            # Query heads still gather in C1. A cold gain replica removes
+            # only its second collective; wider variants retain both points.
             extra = sum(
-                2
+                (1 if positions.numel() == 1 and getattr(layer.attention, "_index_gain_weight", None) is not None
+                 and not getattr(layer.attention, "tp4_local_index_queries", False) else 2)
                 for layer in program.layers
                 if layer.attention.owns_index and layer.attention.search_length // layer.attention.ratio > 512
             )
@@ -236,7 +277,14 @@ class StageVariant(torch.nn.Module):
         self.compiled = CompiledStage(
             program, native=True, pp_wire_input=self.wire_input, fused_text_io=fused_text_io,
             native_input=native_input, replay_tail=self.tail_enabled,
+            memory_ready=getattr(program, "native_memory_ready", False) and positions.numel() == 1,
         )
+        self.memory_ready = getattr(self.compiled, "memory_ready", False)
+        self.memory_ready_status = None
+        self.memory_ready_enabled = (torch.zeros(32, dtype=torch.int32, device=positions.device)
+                                     if self.memory_ready else None)
+        self.memory_ready_ones = (torch.ones(32, dtype=torch.int32, device=positions.device)
+                                 if self.memory_ready else None)
         self.fixed = tuple(
             value.clone() if value is not None else None for value in (hidden, pre_mix, positions, input_ids)
         )
@@ -251,6 +299,8 @@ class StageVariant(torch.nn.Module):
             engram,
             direct=self.direct_engram,
             device_layer1=self.device_engram,
+            device_layers=getattr(program, 'device_closed_loop', envs.VLLM_HPU_DSV41_DEVICE_CLOSED_LOOP)
+            and self.device_engram,
             local_heads=24 // getattr(program, "tensor_parallel_size", 2),
         )
         self.states = stage_state_tensors(program)
@@ -263,6 +313,8 @@ class StageVariant(torch.nn.Module):
             snapshot = _PagedSnapshot(self.program, self.fixed[2], self.states)
         else:
             snapshot = _Snapshot(self.states)
+        if self.tail_enabled and getattr(self.program, "device_input_feedback", False):
+            snapshot = _InputFeedbackSnapshot(snapshot, self.fixed[2:4])
         self.capture_bytes = snapshot.bytes
         return snapshot
 
@@ -296,6 +348,10 @@ class StageVariant(torch.nn.Module):
         outputs = replay_native_decoder(self, **roots)
         if outputs is not None:
             return self.publish_outputs(outputs)
+        if self.memory_ready:
+            # Only uncaptured preparation uses stock Full waits without flag publication.
+            self.memory_ready_enabled.fill_(0)
+            torch.hpu.synchronize()
         for destination, source in zip(self.fixed, (hidden, pre_mix, positions, input_ids), strict=True):
             if destination is not None:
                 destination.copy_(source)
@@ -330,11 +386,30 @@ class StageVariant(torch.nn.Module):
         with collect_prepared_group_replays(
             owner=self, adapter=self.adapter, snapshot=self.snapshot, **fixed_roots
         ) as context:
-            for index, chunk in enumerate(self.compiled.chunks):
+            shared_coordinates = None
+            memory_ready_root = None
+            memory_valid = None
+            memory_statuses = []
+            chunks = (self.compiled.memory_ready_chunks if self.memory_ready else self.compiled.coordinate_chunks
+                      if self.compiled.shared_coordinates else self.compiled.chunks)
+            for index, chunk in enumerate(chunks):
                 context["group_index"] = index
-                values = chunk(fixed_hidden, fixed_pre, fixed_positions, fixed_ids, self.engram)
+                if self.memory_ready:
+                    values, memory_ready_root, status, memory_valid = chunk(
+                        fixed_hidden, fixed_pre, fixed_positions, fixed_ids, self.engram, memory_ready_root,
+                        self.memory_ready_enabled, memory_valid)
+                    memory_statuses.append(status)
+                elif self.compiled.shared_coordinates:
+                    values, shared_coordinates = chunk(fixed_hidden, fixed_pre, fixed_positions, fixed_ids,
+                                                       self.engram, shared_coordinates)
+                else:
+                    values = chunk(fixed_hidden, fixed_pre, fixed_positions, fixed_ids, self.engram)
                 fixed_hidden, fixed_pre, aux = values[:3]
             outputs = values if self.tail_enabled else (fixed_hidden, fixed_pre, aux)
+            if self.memory_ready:
+                # Retain component status roots; serving also propagates their
+                # device reduction into the existing token certificate.
+                self.memory_ready_status = tuple(memory_statuses)
             record_native_decoder_outputs(*outputs)
         self.warm_calls += 1
         return self.publish_outputs(outputs)
@@ -362,8 +437,8 @@ class StageReplay:
         self.latest_tail = None
         self.greedy_tail_enabled = bool(greedy_tail)
 
-    def greedy_tail_token(self, hidden):
-        """Return the token produced by this completed C1 hidden allocation."""
+    def _tail_values(self, hidden):
+        """Return outputs owned by this completed C1 hidden allocation."""
         if self.latest_tail is None:
             return None
         generation, source, values = self.latest_tail
@@ -372,12 +447,20 @@ class StageReplay:
             return None
         if hidden.data_ptr() != source.data_ptr():
             return None
-        return values[0]
+        return values
+
+    def greedy_tail_token(self, hidden):
+        values = self._tail_values(hidden)
+        if values is None:
+            return None
+        return values[3] if getattr(self.program(), "device_sampling", False) else values[0]
+
+    def sampling_tail_values(self, hidden):
+        return self._tail_values(hidden) if getattr(self.program(), "device_sampling", False) else None
 
     def tail_local_logits(self, hidden):
-        if self.greedy_tail_token(hidden) is None or len(self.latest_tail[2]) < 2:
-            return None
-        return self.latest_tail[2][1]
+        values = self._tail_values(hidden)
+        return values[1] if values is not None and len(values) > 1 else None
 
     def _publish_tail(self, variant, outputs):
         if variant.tail_values is None:

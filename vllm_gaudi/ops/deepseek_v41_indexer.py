@@ -8,6 +8,7 @@ FP4 roundtrip and two BF16 shard-sum boundaries.
 """
 
 import torch
+from vllm_gaudi import envs as gaudi_envs
 
 # A 2052-token prompt followed by 256 decode steps stays below this bound.
 # The bounded mirror accelerates that common production profile while longer
@@ -36,7 +37,11 @@ def ordered_index_ids(scores, positions, candidates, ratio, *, reindex=False, bl
     """Shared threshold/bitmap emission with TP2 C1's ordered tie rule."""
     ops = torch.ops.custom_op
     scores = scores.contiguous()
-    metadata = ops.custom_deepseek_v41_index_threshold_gaudi2(scores, positions, ratio, int(reindex), int(blocks))
+    if gaudi_envs.VLLM_HPU_DSV41_INDEX_PREDICATE_PACK:
+        metadata = ops.custom_deepseek_v41_index_threshold_gaudi2(
+            scores, positions, ratio, int(reindex), int(blocks), 1)
+    else:
+        metadata = ops.custom_deepseek_v41_index_threshold_gaudi2(scores, positions, ratio, int(reindex), int(blocks))
     return ops.custom_deepseek_v41_index_emit_gaudi2(
         scores, positions, candidates, metadata, ratio, int(reindex), int(blocks)
     )
@@ -46,7 +51,12 @@ def _bounded_mme_scores(
     query, weights, cache, pages, positions, candidates, ratio, local_heads, search_rows, reindex, decoded_keys
 ):
     """Use the same paged-key/MME producer for any TP shard geometry."""
-    if reindex:
+    safe_rows = None
+    if (reindex and query.shape[0] == 1 and decoded_keys is not None
+            and gaudi_envs.VLLM_HPU_DSV41_CANDIDATE_COORDINATES):
+        rows, safe_rows = torch.ops.custom_op.custom_deepseek_v41_candidate_coordinates_gaudi2(
+            candidates.contiguous(), decoded_keys.shape[0] - 1)
+    elif reindex:
         rows = candidates.unsqueeze(-1) * 8 + torch.arange(8, dtype=torch.int32, device=positions.device)
         rows = torch.where(candidates.unsqueeze(-1) >= 0, rows, -1).flatten(1)
     else:
@@ -60,13 +70,18 @@ def _bounded_mme_scores(
         from vllm_gaudi.ops.deepseek_v41_index_mirror import mirror_index_tile
 
         score = native_index_tile if decoded_keys is None else mirror_index_tile
+        if (reindex and decoded_keys is not None and query.shape[0] == 1
+                and gaudi_envs.VLLM_HPU_DSV41_INDEX_WIDE_REINDEX):
+            return mirror_index_tile(query, weights, decoded_keys, positions, rows, ratio, local_heads,
+                                     safe_rows=safe_rows)
         scores = torch.cat(
             [
                 (
                     score(query, weights, cache, pages, positions, rows[..., first : first + 2048], ratio, local_heads)
                     if decoded_keys is None
                     else score(
-                        query, weights, decoded_keys, positions, rows[..., first : first + 2048], ratio, local_heads
+                        query, weights, decoded_keys, positions, rows[..., first : first + 2048], ratio, local_heads,
+                        safe_rows=None if safe_rows is None else safe_rows[..., first : first + 2048]
                     )
                 )
                 for first in range(0, rows.shape[-1], 2048)

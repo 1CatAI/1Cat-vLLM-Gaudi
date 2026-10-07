@@ -136,7 +136,14 @@ def independent_mhc_nodes(module, dependent_inputs):
     for node in nodes:
         if any(argument in tainted for argument in node.all_input_nodes):
             tainted.add(node)
-    controls = ("deepseek_v41_control_gemv", "deepseek_v41_control_batch4_f32", "deepseek_v41_control_prefetch_f32")
+    controls = (
+        "deepseek_v41_control_gemv", "deepseek_v41_control_batch4_f32",
+        "deepseek_v41_control_prefetch_f32", "deepseek_v41_control_rrms_unpack",
+        "deepseek_v41_control_rrms_parallel", "deepseek_v41_control_rrms_swizzled",
+        "deepseek_v41_control_rrms_bf16_weight",
+        "deepseek_v41_control_mme_f32",
+        "deepseek_v41_mhc_gates_f32", "deepseek_v41_mhc_gates_positive",
+    )
     seeds = [
         node
         for node in nodes
@@ -289,23 +296,39 @@ def split_mhc_consumers(module, exchange):
     return audit
 
 
-def make_backend(*, static_int32=False):
+def require_candidate_operators(graph, required):
+    targets = [str(node.target) for module in graph.modules() if hasattr(module, 'graph')
+               for node in module.graph.nodes if node.op == 'call_function']
+    counts = {name: sum(name in target for target in targets) for name in required}
+    missing = [name for name, count in counts.items() if not count]
+    if missing:
+        raise RuntimeError(f'Candidate graph did not activate its required operators: {missing}')
+    return counts
+
+
+def make_backend(*, static_int32=False, static_factories=False, static_clamps=False, split_mhc=True, required_operators=(),
+                 compiler_config=None):
     from habana_frameworks.torch.dynamo.compile_backend import passes
     from habana_frameworks.torch.dynamo.compile_backend.backends import hpu_backend
     from vllm_gaudi.extension.logger import logger
 
     def integer_constants(ctx):
         from vllm_gaudi.compilation.deepseek_v41_integer_constants import (
-            propagate_with_resident_buffers, retain_integer_constants)
+            propagate_with_resident_buffers, retain_integer_constants, retain_static_factories, retain_integer_clamp_bounds)
 
         audit = retain_integer_constants(ctx.graph_module)
-        if audit['replaced_operands']:
+        factories = retain_static_factories(ctx.graph_module) if static_factories else {'replaced_factories': 0}
+        clamps = retain_integer_clamp_bounds(ctx.graph_module) if static_clamps else {'replaced_clamps': 0}
+        changed = bool(audit['replaced_operands'] or factories['replaced_factories'] or clamps['replaced_clamps'])
+        if changed:
             # This runs before partitioning; propagate canonical metadata after
             # changing Scalar overloads to equivalent Tensor overloads.
             propagate_with_resident_buffers(ctx.graph_module, ctx.example_inputs,
                                             lambda: passes.pass_fake_propagation(ctx))
             logger().info('V4.1 resident I32 operand audit: %s', audit)
-        return bool(audit['replaced_operands'])
+            logger().info('V4.1 resident static factory audit: %s', factories)
+            logger().info('V4.1 resident I32 clamp audit: %s', clamps)
+        return changed
 
     def transform(ctx):
         import os
@@ -318,6 +341,9 @@ def make_backend(*, static_int32=False):
             (root / f"overlap-input-{id(ctx.graph_module)}.py").write_text(
                 ctx.graph_module.print_readable(print_output=False)
             )
+        from vllm_gaudi.compilation.deepseek_v41_memory_ready import isolate_memory_resets
+
+        memory_resets = isolate_memory_resets(ctx.graph_module)
         audit = split_mhc_consumers(
             ctx.graph_module,
             (
@@ -325,7 +351,7 @@ def make_backend(*, static_int32=False):
                 torch.ops.vllm_gaudi.tp_peer_allgather.default,
                 torch.ops.vllm_gaudi.tp_peer_allgather_scheduled.default,
             ),
-        )
+        ) if split_mhc else []
         from vllm_gaudi import envs
 
         tile_partitions = 0
@@ -338,7 +364,7 @@ def make_backend(*, static_int32=False):
             sum(node.op == "call_module" for node in ctx.graph_module.graph.nodes),
             len(audit),
         )
-        if audit or tile_partitions:
+        if audit or tile_partitions or memory_resets:
             # Full fake propagation after Bridge partitioning replays already
             # canonicalized views and rejects their saved storage offsets.
             # New calls/getitems inherit the exact child-output contract above.
@@ -346,15 +372,32 @@ def make_backend(*, static_int32=False):
             logger().info("V4.1 TP/mHC independent partitions: %s", audit)
             if tile_partitions:
                 logger().info("V4.1 isolated optional Reindex tile recipes: %d", tile_partitions)
-        return bool(audit or tile_partitions)
+        return bool(audit or tile_partitions or memory_resets)
 
     def backend(graph, inputs, **kwargs):
-        with _lock:
+        from vllm_gaudi.compilation.deepseek_v41_compiler_config import compiler_configuration
+        if required_operators:
+            logger().info('V4.1 candidate operator activation: %s',
+                          require_candidate_operators(graph, required_operators))
+        with _lock, compiler_configuration(compiler_config):
             passes.custom_pass_at_fuse_partition.append(transform)
             if static_int32:
                 passes.custom_pass_at_pre_partition.append(integer_constants)
             try:
-                return hpu_backend(graph, inputs, **kwargs)
+                result = hpu_backend(graph, inputs, **kwargs)
+                if compiler_config:
+                    # Bridge recipe compilation is deferred until its first
+                    # execution. Cover that execution as well as partitioning.
+                    # Captured native replay bypasses this host callable.
+                    from functools import wraps
+
+                    @wraps(result)
+                    def execute(*args, **kw):
+                        with _lock, compiler_configuration(compiler_config):
+                            return result(*args, **kw)
+
+                    return execute
+                return result
             finally:
                 if static_int32:
                     passes.custom_pass_at_pre_partition.remove(integer_constants)

@@ -26,18 +26,30 @@ def hardware_events(path):
     return dict(counts)
 
 
+def diagnostic_capture(result, *, allow_diagnostic=False, allow_truncated_diagnostic=False):
+    truncated = (allow_truncated_diagnostic and result["status"] == "failed"
+                 and result.get("profile") == "decode" and result.get("finish_reason") == "length")
+    diagnostic = (allow_diagnostic and result["status"] == "diagnostic_passed"
+                  and result.get("profile") == "decode")
+    if result["status"] != "passed" and not (truncated or diagnostic):
+        raise ValueError("Capture requires a passed request or an explicitly allowed decode diagnostic")
+    return bool(truncated or diagnostic)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run", type=Path)
     parser.add_argument("request", type=Path)
     parser.add_argument("--allow-truncated-diagnostic", action="store_true",
                         help="Archive a length-limited decode diagnostic without changing its failed EOS gate")
+    parser.add_argument("--allow-diagnostic", action="store_true",
+                        help="Archive diagnostic_passed decode capture without granting EOS qualification")
     args = parser.parse_args()
     result = json.loads((args.request / "result.json").read_text())
     profile = json.loads((args.request / "profile.json").read_text())
-    truncated = (args.allow_truncated_diagnostic and result["status"] == "failed"
-                 and result["profile"] == "decode" and result.get("finish_reason") == "length")
-    assert (result["status"] == "passed" or truncated) and result["profile"] in ("prefill", "decode")
+    diagnostic = diagnostic_capture(result, allow_diagnostic=args.allow_diagnostic,
+                                    allow_truncated_diagnostic=args.allow_truncated_diagnostic)
+    assert result["profile"] in ("prefill", "decode")
     assert [event["action"] for event in profile] == ["start", "stop"]
     assert all(event["status"] == 200 for event in profile)
     start_ns = profile[0]["start_ns"]
@@ -46,7 +58,7 @@ def main():
     output.mkdir(exist_ok=False)
     log = (args.run / "run.log").read_text(errors="replace")
     manifest = dict(phase=result["profile"], request=str(args.request.resolve()), files=[], hardware=[])
-    manifest["diagnostic_only"] = truncated
+    manifest["diagnostic_only"] = diagnostic
     manifest["natural_eos_qualified"] = (result["status"] == "passed"
                                           and result.get("qualification") == "natural_eos")
     for rank in range(4):

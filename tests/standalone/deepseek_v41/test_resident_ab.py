@@ -3,6 +3,8 @@
 import importlib.util
 from pathlib import Path
 from types import MethodType
+import hashlib
+import json
 
 import pytest
 import torch
@@ -13,23 +15,108 @@ ab = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ab)
 
 
-def periods(a, b):
-    return [dict(arm=arm, token_intervals_ms=list(a if arm == 'A' else b)) for arm in 'ABABAB']
+def test_physical_audit_cannot_overwrite_the_template_namespace(tmp_path):
+    original = dict(GeneralSettings=dict(values={
+        'outdir': dict(value='/old/formal/evidence'), 'session': dict(value='formal'),
+        'addPid': dict(value=False)}), Plugins=[dict(name='HwTrace', enable=True,
+        values=dict(parseOptions=dict(skipParse=dict(value=False))))])
+    template = tmp_path / 'template.json'
+    template.write_text(json.dumps(original))
+    changed = ab.isolated_trace_config(template, tmp_path/'audit')
+    assert json.loads(template.read_text()) == original
+    assert changed['GeneralSettings']['values']['outdir']['value'] == str(tmp_path/'audit')
+    assert changed['GeneralSettings']['values']['addPid']['value']
+    assert changed['Plugins'][0]['values']['parseOptions']['skipParse']['value']
+    original['Plugins'].append(original['Plugins'][0].copy())
+    template.write_text(json.dumps(original))
+    with pytest.raises(ValueError, match='exactly one'):
+        ab.isolated_trace_config(template, tmp_path/'audit')
 
 
-def test_strict_noise_threshold_and_order():
+def periods(a, b, device_a=5., device_b=4.9):
+    return [dict(arm=arm, token_intervals_ms=list(a if arm == 'A' else b),
+                 ranks=[dict(device_ms=device_a if arm == 'A' else device_b,
+                             device_step_ms=[device_a if arm == 'A' else device_b] * 200)]) for arm in 'ABABAB']
+
+
+def test_three_device_rounds_without_host_iqr_veto():
     a = [4.9, 5.1] * 100
     weak = ab.compare_periods(periods(a, [4.7, 4.9] * 100))
-    assert not weak['effective']
-    assert weak['validity_threshold_ms'] == pytest.approx(0.4)
+    assert weak['effective']
+    assert weak['saving_ms'] == pytest.approx(.1)
+    assert 'validity_threshold_ms' not in weak
     strong = ab.compare_periods(periods(a, [4.3, 4.5] * 100))
     assert strong['effective'] and not strong['formal_gain_credit']
-    negative = ab.compare_periods(periods(a, [5.5, 5.7] * 100))
+    negative = ab.compare_periods(periods(a, [5.5, 5.7] * 100, device_b=5.1))
     assert negative['slower'] and not negative['effective']
     with pytest.raises(ValueError, match='ABABAB'):
         ab.compare_periods(periods(a, a)[:-1])
     with pytest.raises(ValueError, match='200'):
         ab.summarize([1.] * 199)
+
+
+def test_device_rounds_must_all_agree_and_use_slowest_rank():
+    values = periods([5.] * 200, [4.] * 200)
+    values[-1]['ranks'].append(dict(device_ms=5.2, device_step_ms=[5.2] * 200))
+    comparison = ab.compare_periods(values)
+    assert not comparison['effective'] and not comparison['slower']
+    assert comparison['round_savings_ms'] == pytest.approx([.1, .1, -.2])
+
+
+def test_component_event_samples_are_explicit_and_not_called_host_time():
+    values = periods([.012, .013] * 100, [.011, .012] * 100)
+    for period in values:
+        period.pop('ranks')
+    result = ab.compare_periods(values, device_events=True)
+    assert result['effective'] and result['saving_ms'] == pytest.approx(.001)
+    assert result['host_baseline'] is None and result['host_candidate'] is None
+
+
+def test_repartition_gate_rejects_equal_tokens_with_different_mutable_state():
+    before = [dict(shape=[1, 512], dtype='torch.bfloat16', sha256='canonical')]
+    changed = [dict(shape=[1, 512], dtype='torch.bfloat16', sha256='changed')]
+    assert ab.check_repartition_state([31, 42], before, [31, 42], before)['mutable_state_exact']
+    with pytest.raises(RuntimeError, match='mutable state'):
+        ab.check_repartition_state([31, 42], before, [31, 42], changed)
+    with pytest.raises(RuntimeError, match='tokens'):
+        ab.check_repartition_state([31, 42], before, [31, 43], before)
+
+
+def test_candidate_factory_rejects_external_files_and_changed_source(tmp_path):
+    external = tmp_path / 'candidate.py'
+    external.write_text('raise AssertionError("untrusted code must not execute")\n')
+    with pytest.raises(ValueError, match='repository Python'):
+        ab.load_candidate_factory(external, hashlib.sha256(external.read_bytes()).hexdigest())
+    factory = _path.parent / 'deepseek_v41_candidates/all_route_slots.py'
+    with pytest.raises(RuntimeError, match='changed after submission'):
+        ab.load_candidate_factory(factory, 'not-the-submitted-hash')
+
+
+def test_all_route_factory_preserves_reference_flags_and_weight_ownership(monkeypatch):
+    import importlib
+    from types import SimpleNamespace
+
+    stage = torch.nn.Module()
+    stage.decode_static_int32 = stage.decode_static_factories = True
+    block = torch.nn.Module()
+    block.moe = torch.nn.Module()
+    block.moe.all_route_slots = False
+    block.moe.register_buffer('weight', torch.ones(4))
+    stage.layers = torch.nn.ModuleList([block])
+    implementation = lambda self, *args, **kwargs: self.weight
+    from vllm_gaudi.models import deepseek_v41_program
+    monkeypatch.setattr(importlib, 'reload', lambda module: SimpleNamespace(
+        PreparedMoE=SimpleNamespace(_forward_n256_fp8=implementation, forward=implementation),
+        CompiledStage=deepseek_v41_program.CompiledStage)
+        if module is deepseek_v41_program else module)
+    path = _path.parent / 'deepseek_v41_candidates/all_route_slots.py'
+    factory, _ = ab.load_candidate_factory(path, hashlib.sha256(path.read_bytes()).hexdigest())
+    candidate = factory(stage, ab.clone_module)
+    assert candidate.decode_static_int32 and candidate.decode_static_factories
+    assert candidate.layers[0].moe.all_route_slots and not block.moe.all_route_slots
+    assert candidate.layers[0] is not block and candidate.layers[0].moe is not block.moe
+    assert candidate.layers[0].moe.weight is block.moe.weight
+    assert candidate.layers[0].moe._forward_n256_fp8() is block.moe.weight
 
 
 def test_clones_own_modules_but_share_immutable_storage():
@@ -81,6 +168,15 @@ def test_loading_pool_reset_must_settle_before_measurement():
 
     assert ab.settling_modules([sample(768), sample(98304), sample(773)]) == [2]
     assert ab.settling_modules([sample(35000), sample(35005), sample(35009)]) == []
+
+
+def test_cpu_queue_gate_uses_pressure_not_driver_d_state_load(tmp_path):
+    pressure = tmp_path / 'cpu'
+    pressure.write_text('some avg10=0.00 avg60=0.25 avg300=0.65 total=1000\n'
+                        'full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n')
+    assert ab.cpu_pressure_avg10(pressure) == 0
+    pressure.write_text('some avg10=42.98 avg60=13.72 avg300=3.70 total=2000\n')
+    assert ab.cpu_pressure_avg10(pressure) == 42.98
 
 
 def test_cold_compiler_settings_restore_on_success_and_failure():
@@ -173,3 +269,32 @@ def test_mirror_observer_records_keys_without_mutation_and_masks_incomplete_pair
     assert torch.equal(record['hidden'], hidden) and torch.equal(record['indices']['2'], selection.indices)
     record['hidden'].zero_()
     assert hidden.count_nonzero() > 0
+# A Python compilation count alone misses per-storage-offset GC recipes.
+def test_recipe_count_includes_deferred_position_copy_variants(tmp_path):
+    from tools.deepseek_v41_resident_ab import recipe_cache_count
+
+    root = tmp_path / 'rank2'
+    root.mkdir()
+    environment = {'PT_HPU_RECIPE_CACHE_CONFIG': str(tmp_path / 'rank{rank}') + ',false,8192',
+                   'LOCAL_RANK': '2'}
+    assert recipe_cache_count(environment) == 0
+    (root / 'first.recipe').write_bytes(b'first position')
+    (root / 'first.metadata').write_bytes(b'ignored')
+    assert recipe_cache_count(environment) == 1
+    (root / 'second.recipe').write_bytes(b'next position')
+    assert recipe_cache_count(environment) == 2
+    assert recipe_cache_count({}) == 0
+
+
+def test_unavailable_foreign_device_is_recorded_without_becoming_idle():
+    snapshot = ab.parse_device_load('2, 0 %, 768 MiB\nN/A, N/A %, N/A MiB\n3, N/A %, 768 MiB\n')
+    assert snapshot['modules'] == [dict(module=2, utilization=0, memory_mib=768)]
+    assert len(snapshot['unavailable']) == 2
+
+
+def test_telemetry_identity_disappearing_does_not_raise_or_invent_growth():
+    first = ab.parse_device_load('2, 0 %, 8505 MiB\n0, 0 %, 98304 MiB\n')
+    last = ab.parse_device_load('2, 0 %, 8505 MiB\nN/A, N/A %, N/A MiB\n')
+    assert ab.settling_modules([first, last], own_modules=(2,)) == []
+    assert ab.loading_modules([first, last], own_modules=(2,)) == []
+    assert ab._common_device_memory([first, last])[1] == [2]

@@ -77,8 +77,10 @@ static inline void store_bits(tensor metadata, int request, int tile, int word_c
                    pack_half(live1 & v_u32_cmp_eq_b(wide.v2, cut.v2))), 3, 0);
 }
 
+#include "deepseek_v41_index_predicate_pack.h"
+
 static inline void cached_threshold(tensor scores, tensor metadata, int request,
-                                    int count, int partition_count, int width) {
+                                    int count, int partition_count, int width, int variant) {
     const int tiles = (count + 127) / 128;
     for (int tile = 0; tile < tiles; ++tile) {
         const int offset = tile * 128;
@@ -107,8 +109,13 @@ static inline void cached_threshold(tensor scores, tensor metadata, int request,
         threshold = v_u16_sel_geq_u16_b(total16, width, trial, threshold);
     }
     const int word_capacity = (get_dim_size(scores, 0) + 127) / 128 * 4;
-    for (int tile = 0; tile < tiles; ++tile)
-        store_bits(metadata, request, tile, word_capacity, selection_keys[tile], threshold);
+    if (variant == 1) {
+        for (int tile = 0; tile < tiles; ++tile)
+            store_bits_packed(metadata, request, tile, word_capacity, selection_keys[tile], threshold);
+    } else {
+        for (int tile = 0; tile < tiles; ++tile)
+            store_bits(metadata, request, tile, word_capacity, selection_keys[tile], threshold);
+    }
     const ushort128 lanes = (ushort128)V_LANE_ID_16;
     int64 greater = 0, equal = 0;
     for (int worker = 0; worker < 24; ++worker) {
@@ -136,7 +143,7 @@ static inline void cached_threshold(tensor scores, tensor metadata, int request,
     v_i32_st_tnsr_partial((int5){1, request}, metadata, greater, 0, 0);
 }
 
-void main(tensor scores, tensor positions, tensor metadata, int ratio, int reindex, int blocks_mode) {
+void main(tensor scores, tensor positions, tensor metadata, int ratio, int reindex, int blocks_mode, int variant) {
     const int5 begin=get_index_space_offset(),end=begin+get_index_space_size();
     for(int request=begin[1];request<end[1];++request) {
     int valid_count=(s_i32_ld_g(gen_addr((int5){request},positions))+1)/ratio;
@@ -158,7 +165,7 @@ void main(tensor scores, tensor positions, tensor metadata, int ratio, int reind
     }
     const int width=blocks_mode ? 2048 : 512;
     if (valid_count <= 32768) {
-        cached_threshold(scores, metadata, request, valid_count, partition_count, width);
+        cached_threshold(scores, metadata, request, valid_count, partition_count, width, variant);
         continue;
     }
     const int64 lanes=(int64)V_LANE_ID_32;

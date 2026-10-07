@@ -21,6 +21,19 @@ static inline uchar256 matrix_direction(uint64 index)
     return v_convert_u32_to_u8_all_b(packed);
 }
 
+#ifdef DSV41_MHC_POSITIVE_DIV
+// Sinkhorn row/column denominators are finite and strictly positive after epsilon.
+// Two FP32 Newton corrections avoid generic reciprocal range/LUT machinery.
+static inline float64 sinkhorn_div(float64 numerator,float64 denominator) {
+    float64 inverse=as_float64((int64)0x7ef311c3-as_int64(denominator));
+    inverse*=v_f32_mac_b(-denominator,inverse,2.0f);
+    inverse*=v_f32_mac_b(-denominator,inverse,2.0f);
+    return numerator*inverse;
+}
+#else
+static inline float64 sinkhorn_div(float64 numerator,float64 denominator) { return numerator/denominator; }
+#endif
+
 void main(tensor raw_mixes, tensor rrms, tensor hc_scale, tensor hc_base,
           tensor gates_out)
 {
@@ -71,7 +84,7 @@ void main(tensor raw_mixes, tensor rrms, tensor hc_scale, tensor hc_base,
         sum += v_f32_shuffle_b(values, r1, 0, 0.0f);
         sum += v_f32_shuffle_b(values, r2, 0, 0.0f);
         sum += v_f32_shuffle_b(values, r3, 0, 0.0f);
-        values = values / sum + HC_EPS;
+        values = sinkhorn_div(values,sum) + HC_EPS;
 
         for (int iteration = 0; iteration < SINKHORN_ITERS; ++iteration) {
             if (iteration != 0) {
@@ -79,14 +92,14 @@ void main(tensor raw_mixes, tensor rrms, tensor hc_scale, tensor hc_base,
                                 + v_f32_shuffle_b(values, r1, 0, 0.0f);
                 const float64 b = v_f32_shuffle_b(values, r2, 0, 0.0f)
                                 + v_f32_shuffle_b(values, r3, 0, 0.0f);
-                values /= (a + b) + HC_EPS;
+                values = sinkhorn_div(values,(a + b) + HC_EPS);
             }
             float64 column_sum = 0.0f;
             column_sum += v_f32_shuffle_b(values, c0, 0, 0.0f);
             column_sum += v_f32_shuffle_b(values, c1, 0, 0.0f);
             column_sum += v_f32_shuffle_b(values, c2, 0, 0.0f);
             column_sum += v_f32_shuffle_b(values, c3, 0, 0.0f);
-            values /= column_sum + HC_EPS;
+            values = sinkhorn_div(values,column_sum + HC_EPS);
         }
         v_f32_st_tnsr_partial((int5){8, token, 0, 0, 0}, gates_out, values, 15, 0);
     }

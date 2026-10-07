@@ -9,7 +9,12 @@ namespace {
 constexpr auto kSchema =
     "custom_op::custom_deepseek_v41_ffn_norm_quant_gaudi2";
 constexpr auto kGuid = "custom_deepseek_v41_ffn_norm_quant_gaudi2";
+constexpr auto kDualSchema = "custom_op::custom_deepseek_v41_ffn_norm_dual_quant_gaudi2";
+constexpr auto kDualGuid = "custom_deepseek_v41_ffn_norm_dual_quant_gaudi2";
+constexpr auto kBf16Schema = "custom_op::custom_deepseek_v41_ffn_norm_dual_bf16_quant_gaudi2";
+constexpr auto kBf16Guid = "custom_deepseek_v41_ffn_norm_dual_bf16_quant_gaudi2";
 using Outputs = std::tuple<at::Tensor, at::Tensor, at::Tensor>;
+using DualOutputs = std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>;
 struct Params { float epsilon; float inverse_width; };
 
 void contract(const at::Tensor& x, const at::Tensor& weight, double epsilon) {
@@ -56,6 +61,34 @@ public:
     }
 };
 
+template<bool Bf16 = false>
+class FfnNormDualQuant final : public habana::OpBackend {
+public:
+    FfnNormDualQuant(int device, c10::ScalarType dtype)
+        : OpBackend(device, NO_TPC + std::string("dsv41_ffn_norm_dual_quant"),
+                    dtype, {0, 1, 2, 3, 4}, {}, {}, false) {
+        SetOutputMetaFn([](const at::Stack& stack) {
+            auto meta = metadata(stack);
+            auto q = meta.at(1), scale = meta.at(2);
+            meta.push_back(q);
+            meta.push_back(scale);
+            return meta;
+        });
+    }
+    void AddNode(synapse_helpers::graph& graph, const at::Stack& stack) override {
+        const auto meta = metadata(stack);
+        Params scalar{float(stack.at(2).toDouble()), 1.0f / 5120.0f};
+        auto result = BuildNode(this, graph,
+            {Bf16 ? kBf16Guid : kDualGuid, {syn_in(0), syn_in(1)},
+             {{meta.at(0).shape, at::kBFloat16, 0},
+              {meta.at(1).shape, at::ScalarType::Float8_e4m3fn, 1},
+              {meta.at(2).shape, at::kFloat, 2},
+              {meta.at(1).shape, at::ScalarType::Float8_e4m3fn, 3},
+              {meta.at(2).shape, at::kFloat, 4}}, &scalar, sizeof(scalar)});
+        for (size_t i = 0; i < 5; ++i) syn_out(i) = std::move(result.at(i));
+    }
+};
+
 const bool registered = [] {
     habana::custom_op::registerUserCustomOp(
         kSchema, kGuid,
@@ -75,6 +108,28 @@ const bool registered = [] {
         kSchema, [](synDeviceId device, c10::ScalarType dtype) {
             return std::make_shared<FfnNormQuant>(device, dtype);
         });
+    for (const auto* name : {kDualSchema, kBf16Schema}) {
+    habana::custom_op::registerUserCustomOp(name, name + 11,
+        [](const at::Stack& stack) {
+            const auto meta = metadata(stack);
+            return habana::PartialOutputMetaDataVector{
+                {meta.at(0).dtype, meta.at(0).shape},
+                {meta.at(1).dtype, meta.at(1).shape},
+                {meta.at(2).dtype, meta.at(2).shape},
+                {meta.at(1).dtype, meta.at(1).shape},
+                {meta.at(2).dtype, meta.at(2).shape}};
+        },
+        [](const at::Stack& stack, size_t& size) -> std::shared_ptr<void> {
+            size = sizeof(Params);
+            return std::make_shared<Params>(Params{float(stack.at(2).toDouble()), 1.0f / 5120.0f});
+        });
+    }
+    habana::KernelRegistry().add(kBf16Schema, [](synDeviceId device, c10::ScalarType dtype) {
+        return std::make_shared<FfnNormDualQuant<true>>(device, dtype);
+    });
+    habana::KernelRegistry().add(kDualSchema, [](synDeviceId device, c10::ScalarType dtype) {
+        return std::make_shared<FfnNormDualQuant<false>>(device, dtype);
+    });
     return true;
 }();
 
@@ -93,14 +148,37 @@ Outputs run(const at::Tensor& x, const at::Tensor& weight, double epsilon) {
     auto output = descriptor.execute(stack);
     return {output.at(0), output.at(1), output.at(2)};
 }
+template<bool Meta, bool Bf16 = false>
+DualOutputs run_dual(const at::Tensor& x, const at::Tensor& weight, double epsilon) {
+    const at::Stack stack{x, weight, epsilon};
+    const auto meta = metadata(stack);
+    if constexpr (Meta) {
+        return {at::empty(meta[0].shape, x.options().dtype(meta[0].dtype)),
+                at::empty(meta[1].shape, x.options().dtype(meta[1].dtype)),
+                at::empty(meta[2].shape, x.options().dtype(meta[2].dtype)),
+                at::empty(meta[1].shape, x.options().dtype(meta[1].dtype)),
+                at::empty(meta[2].shape, x.options().dtype(meta[2].dtype))};
+    }
+    TORCH_CHECK(registered && x.device().type() == at::kHPU);
+    auto descriptor = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(Bf16 ? kBf16Schema : kDualSchema);
+    auto output = descriptor.execute(stack);
+    return {output.at(0), output.at(1), output.at(2), output.at(3), output.at(4)};
+}
+
 }
 
 TORCH_LIBRARY_FRAGMENT(custom_op, m) {
+    m.def("custom_deepseek_v41_ffn_norm_dual_bf16_quant_gaudi2(Tensor value, Tensor weight, float epsilon) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
+    m.def("custom_deepseek_v41_ffn_norm_dual_quant_gaudi2(Tensor value, Tensor weight, float epsilon) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def("custom_deepseek_v41_ffn_norm_quant_gaudi2(Tensor value, Tensor weight, float epsilon) -> (Tensor, Tensor, Tensor)");
 }
 TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
+    m.impl("custom_deepseek_v41_ffn_norm_dual_bf16_quant_gaudi2", run_dual<false, true>);
+    m.impl("custom_deepseek_v41_ffn_norm_dual_quant_gaudi2", run_dual<false>);
     m.impl("custom_deepseek_v41_ffn_norm_quant_gaudi2", run<false>);
 }
 TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
+    m.impl("custom_deepseek_v41_ffn_norm_dual_bf16_quant_gaudi2", run_dual<true, true>);
+    m.impl("custom_deepseek_v41_ffn_norm_dual_quant_gaudi2", run_dual<true>);
     m.impl("custom_deepseek_v41_ffn_norm_quant_gaudi2", run<true>);
 }

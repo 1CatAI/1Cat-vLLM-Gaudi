@@ -102,5 +102,19 @@ int main() {
   try { NativeGraphTopology::prepare(incomplete_v4, 6, false, 86, false); }
   catch (const std::invalid_argument&) { rejected = true; }
   assert(rejected);
+  for (size_t groups : {1, 64}) {
+    std::vector<NativeNodeKind> compute(groups * 2, {false, false});
+    const auto pure = NativeGraphTopology::prepare(compute, groups, false, 0, false, true);
+    assert(pure.computeCount == groups * 2 && pure.consumers.empty() && pure.prefixNodes == 0);
+    compute.push_back({true, true});
+    bool rejected = false;
+    try { NativeGraphTopology::prepare(compute, groups, false, 0, false, true); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    assert(rejected);
+  }
+  bool emptyRejected = false;
+  try { NativeGraphTopology::prepare({}, 1, false, 0, false, true); }
+  catch (const std::invalid_argument&) { emptyRejected = true; }
+  assert(emptyRejected);
   std::cout << "NATIVE_TOPOLOGY_EXACT\n";
 }

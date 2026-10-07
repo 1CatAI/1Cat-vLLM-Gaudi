@@ -8,6 +8,7 @@ constexpr const char* names[]={"custom_op::custom_deepseek_v41_index_scores_gaud
     "custom_op::custom_deepseek_v41_index_scores_decoded_gaudi2"};
 using Meta=habana::PartialOutputMetaDataVector;
 struct Params {int ratio,reindex,blocks,local_heads;};
+struct ThresholdParams {int ratio,reindex,blocks,variant;};
 constexpr auto reduce_schema = "custom_op::custom_deepseek_v41_index_reduce_bf16_gaudi2";
 struct ReduceParams {int ratio,local_heads;};
 Meta reduce_metadata(const at::Stack& s) {
@@ -62,6 +63,7 @@ Meta metadata(unsigned mode,const at::Stack& s) {
         first.scalar_type()==at::kFloat&&(first.dim()==1||batched)&&first.size(-1)%64==0 &&
         position.scalar_type()==at::kInt&&position.sizes()==at::IntArrayRef({batch})&&
         (blocks==0||blocks==1),"Invalid index selection score/length contract");
+    if(mode==1)TORCH_CHECK(s.at(5).toInt()>=0&&s.at(5).toInt()<=1,"Invalid exact threshold variant");
     const int64_t stats_width=50+((first.size(-1)+127)/128)*8;
     if(mode==1)return {{at::kInt,batched?std::vector<int64_t>{batch,stats_width}:std::vector<int64_t>{stats_width}}};
     const auto candidates=s.at(2).toTensor();
@@ -81,6 +83,10 @@ const bool registered=[] {
         [mode](const at::Stack& s,size_t& bytes)->std::shared_ptr<void> {
             const bool score_mode=mode==0||mode==3;
             const unsigned base=score_mode?6:mode==1?2:4;
+            if(mode==1){
+                bytes=sizeof(ThresholdParams);
+                return std::make_shared<ThresholdParams>(ThresholdParams{int(s.at(2).toInt()),int(s.at(3).toInt()),int(s.at(4).toInt()),int(s.at(5).toInt())});
+            }
             bytes=score_mode?sizeof(Params):3*sizeof(int);
             return std::make_shared<Params>(Params{int(s.at(base).toInt()),int(s.at(base+1).toInt()),
                 score_mode?0:int(s.at(base+2).toInt()),score_mode?int(s.at(9).toInt()):16});
@@ -107,8 +113,8 @@ template<bool Fake> std::tuple<at::Tensor,at::Tensor> score_decoded(const at::Te
     const at::Tensor& pages,const at::Tensor& pos,const at::Tensor& candidates,int64_t ratio,int64_t reindex,int64_t capacity,int64_t local_heads) {
     auto out=execute<Fake,3>({q,w,cache,pages,pos,candidates,ratio,reindex,capacity,local_heads});return {out[0],out[1]};
 }
-template<bool Fake> at::Tensor threshold(const at::Tensor& scores,const at::Tensor& pos,int64_t ratio,int64_t reindex,int64_t blocks) {
-    return execute<Fake,1>({scores,pos,ratio,reindex,blocks})[0];
+template<bool Fake> at::Tensor threshold(const at::Tensor& scores,const at::Tensor& pos,int64_t ratio,int64_t reindex,int64_t blocks,int64_t variant) {
+    return execute<Fake,1>({scores,pos,ratio,reindex,blocks,variant})[0];
 }
 template<bool Fake> at::Tensor emit(const at::Tensor& scores,const at::Tensor& pos,const at::Tensor& candidates,
     const at::Tensor& stats,int64_t ratio,int64_t reindex,int64_t blocks) {
@@ -126,7 +132,7 @@ template<bool Fake> at::Tensor reduce(const at::Tensor& raw,const at::Tensor& we
 TORCH_LIBRARY_FRAGMENT(custom_op,m) {
     m.def("custom_deepseek_v41_index_scores_gaudi2(Tensor query, Tensor weights, Tensor cache, Tensor pages, Tensor position, Tensor candidates, int ratio, int reindex, int capacity, int local_heads=16) -> (Tensor, Tensor)");
     m.def("custom_deepseek_v41_index_scores_decoded_gaudi2(Tensor query, Tensor weights, Tensor cache, Tensor pages, Tensor position, Tensor candidates, int ratio, int reindex, int capacity, int local_heads=16) -> (Tensor, Tensor)");
-    m.def("custom_deepseek_v41_index_threshold_gaudi2(Tensor scores, Tensor position, int ratio, int reindex, int blocks) -> Tensor");
+    m.def("custom_deepseek_v41_index_threshold_gaudi2(Tensor scores, Tensor position, int ratio, int reindex, int blocks, int variant=0) -> Tensor");
     m.def("custom_deepseek_v41_index_emit_gaudi2(Tensor scores, Tensor position, Tensor candidates, Tensor metadata, int ratio, int reindex, int blocks) -> Tensor");
     m.def("custom_deepseek_v41_index_reduce_bf16_gaudi2(Tensor raw_scores, Tensor weights, Tensor positions, int ratio, int local_heads=16) -> Tensor");
 }

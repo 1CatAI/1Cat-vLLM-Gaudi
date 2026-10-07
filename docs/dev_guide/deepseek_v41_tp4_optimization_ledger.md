@@ -1,9 +1,66 @@
 # TP4 decode 长期开发台账
 
-更新：2026-10-03。只记录具有可比完整消费链微基准收益、通过适用正确性检查的改动。
-未验证方向、失败或变慢试验留在实验INDEX，不计累计。端到端通过后关账，不再次计入待验收收益。
+更新：2026-10-07。只记录通过完整消费链微基准与适用正确性检查的改动。
+未验证、失败、变慢试验留在实验INDEX，不计累计；端到端通过后关账，不重复计入。
 
-## 当前正式测量与待验收累计
+## 当前正式测量与待验收累计（2026-10-07）
+
+官方采样 temperature=1.0、top_p=0.95、seed=42；512K、C16384、前缀缓存开、完整预热。
+独立安装服务 `decode-accumulated-serving-07`，冻结源码 `46ccb98a`：一次无 profiler 正式请求，
+16384 未命中输入 → **2365 tokens 自然 EOS**，**8.239257597 ms/token**。
+输入 token 与父基线一致，14项事实/约束通过；不要求随机输出逐 token 相同。
+正式模块0/1/4/5，worker主核56/61/84/89。负载和CPU压力保存于该次记录。
+
+父基线 **8.532522828 ms/token**；三项兼容微基准预估 **0.145667500ms/token**，
+正式观测减少 **0.293265230ms/token**。共享专家缩放 finalizer、gate packet、weighted post statistics
+三项关账并默认开启；不能把观测总差分配给各组件。
+**未端到端的兼容组件预估累计为0.118749500ms/token（receive preposting 0.117889500 + 精确PV旁支0.000860000）；正常服务尚未组合验收。7.0ms目标未完成，正式数字仍差1.239257597ms/token。**
+
+配套 trace 保存在 SSD `decode-accumulated-serving-07-trace-repair-03`，只补 companion，未重复正式请求。
+完整预热后224-token诊断，其中160-token采集；预选连续24周期、四rank原始活动归一化。
+rank0周期8.183ms：计算5.821ms（TPC-only2.912、MME-only1.847、交叠1.062），
+无引擎空闲2.252ms，HCL/DMA-only0.111ms。四卡周期8.176–8.184ms。
+这些是同一trace内的活动分配，不能与无profiler正式TPOT混成一个加和表。
+TPC→TPC空档0.944ms、通信相邻空档0.566ms、TPC→MME0.337ms，作为下一批选点依据；
+通信相邻标签不证明全部是链路传输。匿名recipe仍不支持逐节点源码归因。
+
+证据：SSD `decode-accumulated-serving-07/formal/result.json`、`QUALITY.json`、`DEFAULT_PROMOTION.json`；
+trace各rank `raw-activity-screen.json`、`TRACE_ANATOMY_rank0.txt`。
+主PV缓存候选默认关；SDK/Meta及单reuse链不足以记账，还需含publisher成本的完整链。
+
+### 上一基线及本批预测快照（已关账）
+
+官方采样 T=1.0、top_p=0.95、seed=42，512K、C16384、缓存开、完整预热：
+`decode-physical-fusion-serving-03` 独立安装服务，16K未命中→1858 tokens自然EOS，
+**9.564282 ms/token**；14项事实/约束通过，采样回退0。输入token与父版本相同，
+输出从第32个token起不同，未声称逐token相同。前一正式基线为9.997343 ms/token。
+
+本批组件预估1.123126ms，正式减少 **0.433061ms**。用户于2026-10-05明确接受该正式结果，
+撤销“低于预估一半暂不提升默认”的限制：**9.564282 ms/token 为新的正式基线**。
+TP4 正常启动默认开启 CSA publish、W2 三路、Q/KV prologue、候选坐标、peer/post collapse；
+STATIC_COORDINATES 原已默认开启，共六项。显式诊断覆盖仍可关闭，prefill/C2–C6保留既有条件。
+
+原始 trace 已足够指导后续：计算约6.97ms、非计算约2.43ms、<2us碎空隙约1.30ms。
+recipe编号冲突停止追查，不再作逐项归因。输出/post-norm/WOa/发布链小融合归档，
+默认关闭；共享-main输出原型提交 `0dd878fb`。旧项目中的组件预测不能继续叠加到新基线。
+
+**以下是上一基线下保留的历史预测快照；本批已关账，当前待验收累计为0。**
+当时记录的累计为0.944525125 ms/token，后续修正和新增项见文末。
+MoE 合并候选0.206373750ms、mHC0.039834531ms、Attention主体向量化0.176384352ms，
+量化整行amax去重0.036122500ms；FFN BF16量化0.001143438ms、索引gain副本0.030703250ms、
+mHC权重布局0.005530156ms、共享RRMS post0.000290156ms、reuse向量mask0.137790492ms、
+reuse硬件E4M3 codec0.024276902ms；gates/peer重叠0.136496875ms、全局SWA镜像读0.016101598ms、
+W2有效K0.020418438ms、正分母Sinkhorn0.001187500ms、索引query codec0.014609813ms、
+整段Reindex评分0.088842125ms；predicate位图0.008419250ms。各项微基准与适用范围见文末，未验证方向不计入。
+BF16控制权重候选与mHC权重布局互斥，当前未叠加。
+各项5组输入四卡通过适用正确性检查、原生重放3轮A/B方向一致，默认均关闭。
+mHC 新项按官方方程/DeepGEMM归一化误差容差验收，不声称逐位一致；其余保留原逐位检查。详见文末。
+新MoE替代旧的两片候选，mHC替代旧0.031500469ms，均不重复相加。
+正式验收触发线仍为累计≥1ms。按逻辑阶段计数，GEMM内部TPC/MME流水切片单列，
+保留默认切片策略。两指令FP4字典解码停止：ISA访存槽位预算高于算术发射预算，收益记0。
+
+
+## 2026-10-03及以前的测量记录
 
 当前官方采样口径：temperature=1.0、top_p=0.95、seed=42，512K容量、C16384、缓存开启、完整预热。
 最新安装服务测量为 `long-prefix-serving-01`：源码31e519fd，16384→2128自然EOS，
@@ -736,3 +793,692 @@ service restart or unsupported deployment claim is introduced by this merge. Exi
 is reused because the latest changes only clarify documentation and startup audit text. Unrelated localAGENTS.md
 and reproducer artifacts are excluded. Follow-up work must resolve long semantic correctness and prefill regression
 with the accepted prompt tail and exact cold/cache feedback evidence already archived.
+
+
+### 2026-10-03 merged-main single-request decode campaign
+
+User switches scope to officialT1/top_p.95 TP4decode:16Kfirst≤9ms then≤8ms;128K≤11ms.
+Parentmain e6f0a36c (PR57merged), modules0/1/4/5 andmainCPU10/15/38/43.
+Publicgateway/backend stopped; private frozenmain baseline service nowwarming for one16Kdecode trace.
+Reuse archived unprofiled10.568225ms; do not turn theprofilerrequest into a formal baseline or repeat distributions.
+500Ksemantic failure stays inPR57anditsrecord, explicitly deferred rather than being treated as passed.
+
+Work order:one maintrace→sharedI32/coordinates→all-sixexpert decode/MME→mHC→attentionTPCfusion→exactboundedofficialsampling→128K/512Kdecode traces and source submission reduction. Each candidate must pass exact/reference checks, then same-processreal16ABABAB. One formal16KnaturalEOS plus one128K80token diagnostic only after compatible real16savings total≥1ms. Continue all items or attain the requested targets, then merge qualified changes andrestore512K/prefixonpublicAPI. Current confirmed cumulative real16savings0ms; no newgainledgerentry.
+
+Own retiredgraphs were losslessly archived withtarcompare/SHA256 before removing original folders; newtrace/postgraphs/logs remain onSSD. Disk headroom restored beyond30GB. Historical result/trace/source records retained. New I32armuses the qualified norm/SWA/Engram/mHC handoff parent, not the older dense-only parent whose archivedIQR exceeded its measured difference. Its numerical/real16result is pending.
+
+2026-10-03：合并main后的常驻ABABAB200：I32+只读静态工厂4.250790→4.136407 ms/16层，差值0.114383 >2IQR0.071210，跨卡/跨候选token一致，无热编译。按×1.5仅预估整模0.171575 ms，尚未端到端；累计确认16层0.114383 ms。I32单项、FP4双输出、I32镜像gather均未过噪声门槛，不相加。详见本地decode-kernel-resident-01/INITIAL_AB_REPORT.json。
+
+### 2026-10-04：当前微基准与批量验收规则
+
+生产形状、真实权重、直接生产者与消费者，使用生产原生重放。正确性检查 3–5 组真实输入；同进程 ABABAB，三轮设备时间差方向一致即可，不用 IQR 门槛。候选默认关闭；仅通过完整链微基准的候选记一行“名称／每 token 或每轮节省／开关”。累计预估 ≥1 ms 或 3–5 项后，统一进行一次官方采样正式请求（seed 42、自然 EOS）及随带 trace。端到端兑现 ≥一半预估才整批默认开启。未测、失败、重复方向不计收益。
+
+固定启动工具：`tools/launch_deepseek_v41_decode_micro.py`，CPU 10/15/38/43，SSD 临时目录、编译缓存、诊断默认关闭和桥接接口前置检查。现有微基准收益不改记为端到端收益。
+
+写完候选到微基准结论以 30 分钟为目标；超过先完善复用脚本。预期不足 0.1 ms/token（或 0.3 ms/轮）不做，同方向失败两次先读已有 trace／编译图。归因精度 ±0.5 ms 即可指导下一步，只随批量验收采集；编译／服务运行期间继续写下一项。固定启动器已加入设备异步退出等待，常驻工具可直接构建已验收父候选作为 A/B 基线，避免重测父优化。短诊断明确标记，不通过自然 EOS 正式验收。
+
+2026-10-04：设备闭环（采样帧→双 Engram→下一次原生重放）／真实16层三轮设备中位差 1.012987 ms/token（1.012987、1.015639、0.879438）／`VLLM_HPU_DSV41_DEVICE_CLOSED_LOOP=0`。五输入 token、hidden、33 份可变状态逐位一致；计数为一次交接，不乘层数。证据 `decode-micro-resident-06`；相对含有界采样的父路径，端到端待批量验收，不与已含的采样/静态坐标收益重复相加。
+
+2026-10-04 批量验收：设备闭环完整预热、缓存开启，官方采样 seed42，16K 未命中→2382 tokens 自然EOS，正式 TPOT **9.997343 ms**。token 与正文均与 `decode-position-serving-01` 完全一致（14事实参考已通过）。相对该父版本改善 1.395094 ms，超过微基准预估一半；相对最初10.568225基线改善 0.570882 ms。关闭此项待验收余额，单 stage 原生默认启用采样／设备输入／闭环／已验收静态坐标，PP 阶段及显式禁用不变。目标7ms未完成。随带 trace 启动缺必需写出参数，未生成设备trace；正式数字保留，只修复采集入口。
+
+2026-10-04 资源规则更新：按最新用户指令，不持有显卡锁。启动器检查 HBM、设备利用率及打开的计算设备句柄；优先空闲的 0/1/4/5，否则选其他空闲四卡，不足则等待。记录实际映射；可用 `--modules` 固定某组卡。08 的锁包装进程已结束，原测量进程保留，不影响其他会话。资源调整本身不计收益。
+
+2026-10-04 待整体验收：peer 求和→mHC post/collapse 融合／原生短链每 Attention 边界节省 **0.008950 ms**（三轮0.008950、0.012500、0.005773）／`VLLM_HPU_DSV41_PEER_POST_COLLAPSE=0`。父正式基线9.997343 ms。生产形状与真实 checkpoint 权重、5个 checkpoint embedding 派生输入，投影→四卡交换→mHC→FFN norm/量化全部逐位一致，无热编译。同进程 ABABAB200，取四卡最慢每步设备中位数。原计时完成后的退出异常已修复，另做无计时的资源退出检查，原测量保留。仅按40个 Attention 边界预估 **0.358000 ms/token**；MoE边界未验证不加算，实际 Attention 激活与real16状态接入仍待验证，未跑端到端，不称为正式收益。证据 `decode-peer-post-collapse-01/OUTCOME.json`。当前兼容微基准候选预估余额0.358000 ms；累计不足1ms，暂不重启正式服务。
+
+2026-10-04 最新任务调整：优先手写多输入、多输出 TPC 融合，按 MoE → Attention/CSA2 → mHC → 非通信段合并推进。每项同时验收编译后物理节点数和生产形状原生微基准；三模块累加后一次官方16K→EOS及trace。预期不足0.3ms/token的零碎候选暂停。有序peer/post候选保留历史0.358ms预估及证据，但从当前待验收队列移出，开关保持0；当前这批有效待验收余额为0ms。正式基线仍为9.997343ms，7ms目标未完成。
+
+| CSA2 norm/RoPE/FP4 publication | parent formal 9.997343 ms/token | native repeated16-group production static compiler, actual index-mirror MME→MLA→WO→TP sum; 5 checkpoint-derived inputs, all outputs/states exact/4ranks; physical consumer 44→17 | AB [0.0468718125, 0.0508414375, 0.053027531249999996] ms/source, median 0.050841 | ratio2 sources2/8/14 only: **0.152524 ms/token estimated**; ratio1 source20 unmeasured | `VLLM_HPU_DSV41_COMPRESSOR_FUSED_PUBLISH=0` | decode-csa-publish-07 on SSD | pending combined official-sampling acceptance |
+
+Current compatible pending component estimate: **0.152524 ms/token**. No formal gain; superseded05 and accepted baseline gains are excluded. Weight/input fingerprints and reduced component-native topology are recorded with the evidence.
+
+### 2026-10-05 累加规则更新
+
+按用户最新要求取消小项收益门槛。最终物理节点减少、5 组输入逐位一致、同进程三轮设备 A/B 全部为正即可进入待验收；累计预估达到 0.6 ms/token 或减少 300 个物理节点后，统一官方采样 16K→EOS 加 trace。约 2 µs/节点仅作为节点数量估计，不能替代实测组件或正式收益。方向不一致的候选保留到同模块融合更多后再测。
+
+| 名称 | 完整生产者/消费者微基准节省 | 节点 | 开关 | 状态 |
+| --- | --- | --- | --- | --- |
+| KV norm/RoPE/发布＋main reuse gather，行优先映射 | 三轮每层 0.002396 / 0.002216 / 0.002347 ms；27 个复用层预估 **0.063372 ms/token** | 23→19，27 层少108个 | `VLLM_HPU_DSV41_KV_REUSE_FUSION=0` | 5输入4卡输出及SWA状态逐位一致；decode-kv-reuse-fusion-03；正式待验收 |
+
+CSA publish07 继续计 **0.152524 ms/token**，3 个 ratio2 源少81个节点；不重复计 superseded05 或基线已含收益。当前兼容组件预估合计 **0.215897 ms/token**、少189个节点，尚未正式测量。
+
+KV 发布20→14按用户要求列入整模块组合候选：此前三轮方向不一致，暂不把节点估计当作已确认的微基准节省。它与 reuse 分支存在覆盖关系，组合验收时按实际生效层数计数，不能将两项按40层同时相加。原生分段合并常驻任务在父候选冷准备期间遇到严重主机换页，之后主机重新启动；无有效数值/计时数据，不入账。下一版保留 W13 六路，W2 两组三路，先验收最终编译图及完整链。
+
+在最新累加规则下恢复 mHC 模块中的 peer→post/collapse 融合待验收项：原生完整生产者/消费者5输入精确、三轮每边界节省0.008950/0.012500/0.005773 ms；最终 compiler JSON 确认消费链3→2个物理节点。仅40个Attention边界预估 **0.358000 ms/token**，MoE不计；`VLLM_HPU_DSV41_PEER_POST_COLLAPSE=0`。该项是手写消费融合，未将单独有序求和的未验证变体恢复。当前兼容待验收预估 **0.573897 ms/token**、少229个物理节点；real16状态门槛与整模正式验收仍待验证，不称为端到端收益。
+
+MoE 两组三路试验04：物理24→24，未进入数值/原生计时门槛，不入账。源码确认Gaudi2流水拒绝同一TPC同时供给MME两个输入；把W2权重恢复单输出以维持SRAM，保留W13六路和W2两组三路后重测。
+
+Q/KV联合准备与KV发布／完整输入FP8投影→Q norm/quant＋KV norm/RoPE/SWA→Q MME/RoPE→MLA→WO→TP→mHC→FFN norm/quant，5组输入/4卡结果与SWA字节逐位一致；三轮每层节省 **0.008666 / 0.008529 / 0.008466 ms**，中位0.008529 ms／`VLLM_HPU_DSV41_QKV_FUSED_PROLOGUE=0`。最终物理生产链23→19。按40层预估 **0.341141 ms/token**，实际服务覆盖待核实；证据decode-qkv-prologue-fusion-03。
+
+该项覆盖此前KV发布/reuse生产者，组合中关闭KV_REUSE_FUSION和ATTN_FUSED_PROLOGUE，移出其0.063372ms估计。当前三项兼容余额：CSA07 **0.152524**＋Q/KV **0.341141**＋Attention peer/post **0.358000**＝**0.851666 ms/token预估**；节点估计少281个。已达到最新0.6ms触发线，进入一次组合正式16K→EOS及随带trace。目标7ms、全部逐token物理节点≤1000均未达标，不称为正式收益。
+
+2026-10-05 实验索引（不入收益余额）：WO scale/roundtrip＋dense quant 的手写核，最终生产链19→18，5输入4卡逐位一致；三轮每层差值0.000874、0.076331、-0.074175 ms，方向不一致。按最新规则保留至更大 Attention/mHC 组合，不单独放弃，也不计已确认收益。证据decode-woa-handoff-fusion-01/OUTCOME.json。下一组合已加入 peer/post/collapse＋FFN norm/quant 的手写核，并带更新残差的控制/Gates和归一化输出的router两个实际消费分支；编译与68项CPU接口检查通过，硬件验证等待空卡。
+
+三项0.851666ms预估的正式验收尚未产生数字：02:29模型进程收到终止信号，启动时间未变，不能当作编译器崩溃或主机重启。SSD inode耗尽后迁移本任务安装依赖与recipe缓存至Optane，日志/trace继续SSD；发现并修复ABI校验中预期路径未resolve的问题，保持二进制和运行库SHA256严格校验，三项路径身份/篡改CPU检查通过。正式基线仍9.997343ms，目标7ms未完成。
+
+2026-10-05 启动问题修复（不计收益）：DUMP_PRE_GRAPHS/DUMP_POST_GRAPHS 的字符串0被Bridge当成输出目录，完整预热生成约5.5万个调试文件后耗尽SSD inode；本次预热失败未进入正式请求。移除变量及继承值、加入启动前检查，清理本次未完成预热的导出；14项安装/环境/运行库身份CPU检查通过。正式服务依旧仅三项已确认组件候选，不包含尚未测量的WO和peer/norm新核。
+
+MoE 下一组实验（未测，不入账）：针对batch GEMM物理拆分根因，W13保留六路水平SAT；每组三路W2水平权重配合一个普通GEMM，手写finalizer只读匹配对角块，保留每路BF16边界与有序共享输出归约。额外交叉乘积是否被MME最小M粒度吸收仍需生产编译图与微基准判断，不能仅凭一次GEMM判为收益。实现按route_pack参数化，共用TP路径。
+
+
+### 2026-10-05: candidate-block coordinate screen — not yet in gain ledger
+
+The 16K mirror / 256-block screen produced 26→20 physical nodes, five exact
+fixtures and three positive native replay pairs (2.317578 / 2.317531 / 2.315703 µs).
+However, the current 512K service reserves 262144 ratio-2 mirror rows and consumes
+2048 candidate blocks in eight score tiles. The screen did not use that full
+production shape. Its earlier 0.060256 ms/token extrapolation is withdrawn pending
+that validation; it contributes **zero** to the cumulative forecast.
+
+Qualified pending forecast remains **0.8516655625 ms/token** (CSA publication,
+Q/KV joint prologue, attention peer/post collapse), with no new formal result.
+The small-shape whole-output variant reduced 20→19 nodes but all three pairs
+slowed by 0.106–0.121 µs; it remains off and contributes zero.
+See SSD `decode-candidate-coordinate-chain-01` and
+`decode-candidate-coordinate-whole-chain-01` for preserved raw observations.
+
+### 2026-10-05: Reindex coordinate fusion — qualified production-shape micro
+
+| Name | Savings / Reindex layer | Physical nodes | Flag | Pending token estimate |
+|---|---|---|---|---|
+| Candidate expand + sentinel mask + safe address, stock gather/MME | 0.008844797 ms | 69→49 | `VLLM_HPU_DSV41_CANDIDATE_COORDINATES` (default 0) | 0.035379188 ms |
+
+Evidence: SSD `decode-candidate-coordinate-production-02/DECISION.json`.
+Checkpoint identifies four Reindex layers 24/28/32/36, **ratio 1**; their mirror is
+524288×128, candidate pool 2048 blocks, eight 2048-row scoring tiles. Five
+checkpoint-derived projection fixtures are bit-exact. Native ABABAB savings:
+0.008841797 / 0.008844797 / 0.008850953 ms. Producer is one physical TPC, 13 clamp nodes and three coordinate
+transposes removed; existing 13 gather / 15 MME nodes remain. No whole-output
+variant is needed. Previous smaller / ratio-2 screens remain non-credited.
+
+Qualified pending forecast: **0.887044750 ms/token**. This remains an estimate;
+formal baseline is unchanged at 9.997343230 ms/token. Token-entry shared metadata
+is still unqualified and not included.
+
+### 2026-10-05: six-route W13 / three-route W2 native chain
+
+| Name | Micro saving | Physical nodes | Flag | Pending token estimate |
+|---|---|---|---|---|
+| W13 horizontal SAT, W2 groups3 + diagonal ordered shared finalization | 0.005902031 ms/layer | 24→21 per producer | `VLLM_HPU_DSV41_EXPERT_W2_THREE_ROUTES` (default 0) | 0.236081250 ms |
+
+SSD `decode-sat-horizontal-w2-fusion-04/DECISION.json`: real layers 0/4/14/19,
+12 checkpoint experts, five inputs on all four ranks bit-exact including peer and
+mHC/FFN consumers. Three native four-layer savings: [0.02360812500000009, 0.023651500000000047, 0.02360193750000006].
+W2 FP8 remains in SRAM; W13 still has four physical slices, so the ≤12/≤9 MoE
+node target is not achieved. The previous result-lost run receives no separate
+credit. Qualified pending forecast is **1.123126000 ms/token**;
+formal baseline remains 9.997343230 ms/token until combined serving acceptance.
+
+### 2026-10-05: exact deferred mHC gates/post — next batch only
+
+| Name | Micro saving | Physical nodes | Flag | Pending token estimate |
+|---|---|---|---|---|
+| Original FP32 control/RRMS → fused gates + peer/post/collapse | 0.000787512 ms/boundary | 9→8 complete WO/TP/FFN/router chain | `VLLM_HPU_DSV41_MHC_DEFERRED_GATES` (default 0) | 0.031500469 ms (40 boundaries only) |
+
+Five checkpoint-derived inputs on four ranks are bit-exact. Three paired native
+savings: [0.0007875117187499947, 0.0008048632812499984, 0.0007771210937499995] ms. Evidence: SSD
+`decode-mhc-exact-post-01/DECISION.json`. Reference already contains fused
+peer/post; none of batch03's reduction saving is counted again. Serving prototype
+also covers the MoE post boundary, but that second boundary receives **zero**
+additional credit until its producer chain is measured. This item is **not** in
+the frozen batch03 formal request (forecast 1.123126 ms). Total pending forecast
+including this next-batch item is 1.154626469 ms; no new formal result yet.
+
+### 2026-10-05: shared-main PV / inverse RoPE / WO projection
+
+Reuse producer physical nodes **19→18**, unchanged downstream **3**. Five checkpoint-derived inputs × four ranks are bit-exact, including SWA writes and post/norm outputs. Three native-chain savings **0.001368859 / 0.001823461 / 0.001617090 ms per reuse layer**. Flag `VLLM_HPU_DSV41_MAIN_MLA_PROJECTION=0`. Source topology with four-layer groups has 27 reuse and 11 publish occurrences at the 16K logical path; only reuse is qualified so far, yielding **0.043661426 ms/token estimated**, not formal. The first publish test failed before timing due to tensor input indexing after a scalar ratio; it receives zero credit. Evidence: SSD `decode-main-mla-projection-01/DECISION.json` and `decode-main-mla-publish-projection-01/DECISION.json`.
+
+Shared-main publish follow-up (`decode-main-mla-publish-projection-02`): five inputs × four ranks exact, 19→18 producer nodes, paired savings 0.000173684/0.000192953/−0.000049105 ms. Mixed direction: retain for the combined module but **0 pending gain**. The nonsliceable producer experiment increases nodes to20 due to two DMA copies and a split scale kernel; reverted, **0 credit**. Qualified pending balance remains **0.075161895 ms/token** (mHC40-boundary estimate plus 27 reuse projections).
+
+### 2026-10-05 — pending MoE decoder schedule (default off)
+
+| Candidate | Parent | Complete-chain saving | 40-layer forecast | Switch / status |
+|---|---|---:|---:|---|
+| Unrolled SAT decode + two W13 slices | batch03 groups3 / 9.564 formal baseline | 0.000310086 ms/layer | 0.0124034 ms/token | `unrolled_sat_shared` experimental schema + scoped slice policy 2; not wired into serving |
+
+Evidence: `/opt/ssd960/1cat-vllm-decode-archives/decode-moe-unroll-chain-01/DECISION.json`.
+Five checkpoint-derived inputs × four ranks exact; native replay ABABAB direction
+consistent; complete producer 21→17 physical nodes, decoded weights in SRAM.
+This entry is micro-qualified only. New accumulated forecast: **0.0124034 ms/token**;
+formal baseline remains **9.564282 ms/token**. Integration into the normal cold
+compile policy is required before any combined serving acceptance.
+
+The entry above is superseded (not added) by `decode-moe-streamed-01`: same
+expanded decoder and two slices, with the exact one-route SiLU kernel. Three
+four-layer differences: 0.00303965625/0.00308975/0.003012375 ms. Five inputs
+× four ranks exact, 21→17 producer nodes and decoded weights in SRAM. Saving
+0.000759914 ms/layer; active forecast **0.0303966 ms/token**. Experimental
+`streamed_sat_shared` schema plus scoped slice policy 2; serving remains off.
+The activation pipeline is **not** in SRAM yet; this forecast does not claim
+completion of the MegaMoE design. Formal baseline is unchanged.
+
+### 2026-10-05 — retain GEMM slicing; revise active micro balance
+
+The two-slice unrolled/streamed experiments above are archived, inactive and
+excluded from the cumulative balance under the revised four-slice policy.
+Their fixed-route fixtures also omitted the production router dependency.
+Active qualified forecast for this MoE batch: **0 ms/token**. The accepted
+formal baseline remains **9.564282 ms/token**. Future reports distinguish
+independent logical stages from physical TPC/MME fragments of one pipeline.
+
+### 2026-10-05 — MoE producer with production routing, slicing retained
+
+| Name | Native micro saving | Forecast | Switch |
+|---|---:|---:|---|
+| SAT load schedule + scalar route scale + per-route SiLU | 0.003281063 ms/layer | 0.1312425 ms/token (40 layers) | `VLLM_HPU_DSV41_EXPERT_STREAMED_SAT=0` |
+
+`decode-moe-router-four-slice-01`: BF16 router GEMM/top6, all 384 checkpoint
+experts in four layers, shared expert, native peer exchange and mHC/FFN consumer.
+Five embedding-derived input rows × four ranks exact; ABABAB four-layer
+savings 0.013155594 / 0.013124250 / 0.013116688 ms. Policy restored to 4;
+compiler chooses three W13 fragments in both arms for this producer graph.
+Independent logical stages 17→16 (scale broadcast removed), physical nodes
+23→22. W13 products and decoded weights reside in SRAM. This supersedes
+all two-slice variants; no addition of their earlier estimates. Active forecast
+**0.1312425 ms/token**, formal baseline unchanged at **9.564282 ms/token**.
+
+The same-baseline combined producer in `decode-moe-dual-quant-01` supersedes
+that estimate: FFN norm emits the routed and shared FP8 operands with one
+amax and distinct rounding. Three four-layer savings: **0.020614031 /
+0.020665156 / 0.020637375 ms**, five inputs × four ranks exact; W13 activation
+remains in SRAM. Combined estimate **0.20637375 ms/token**, not 0.1312425 +
+0.20637375. Add `VLLM_HPU_DSV41_FFN_DUAL_QUANT=0` alongside the streamed SAT
+flag. Both remain off; no formal request is authorized by the ≥1 ms gate yet.
+
+### 2026-10-05 — mHC linear load plus exact deferred gates
+
+Five inputs × four ranks exact in WO/control → native peer → gates/post →
+FFN/router. Native A/B savings **0.000647535 / 0.000645180 / 0.000649762 ms
+per boundary**; physical and logical nodes 9→8. Count only the 40 measured
+Attention post boundaries: **0.025901406 ms/token forecast**. This replaces
+the older 0.031500469 mHC estimate; they must not be added. The other 40 FFN
+boundaries receive no unmeasured credit. Flags `VLLM_HPU_DSV41_MHC_LINEAR_LOAD=0`
+and `VLLM_HPU_DSV41_MHC_DEFERRED_GATES=0`. Evidence: `decode-mhc-linear-post-01`.
+
+Current active forecast with the combined MoE candidate: **0.232275156 ms/token**.
+Official baseline remains **9.564282 ms/token**; the ≥1 ms trigger is not met.
+
+### 2026-10-05 — MLA gather/decode vector utilization
+
+| Scope | Native micro saving | Qualified occurrences | Token forecast |
+|---|---:|---:|---:|
+| Reuse: SWA codec 64→128 values | 0.004391113 ms/layer | 27 | 0.118560059 ms |
+| Publish: SWA + FP4 main codec 64→128 values | 0.005256754 ms/layer | 11 | 0.057824293 ms |
+
+Five checkpoint-derived fixtures × four ranks exact, including modified SWA
+and exported main rows/masks. Both native ABABAB runs are consistently positive.
+The Q/KV producer, QK/softmax/PV, original WO path and peer/mHC consumers are
+retained. Physical/logical node counts do not decrease; this is instruction
+and vector utilization improvement, not fusion credit. Cases:
+`decode-mla-reuse-vector-01`, `decode-mla-publish-vector-01`.
+Flag `VLLM_HPU_DSV41_MLA_VECTOR_CODEC=0`. These distinct reuse/publish
+occurrences total **0.176384352 ms/token estimated**.
+
+Active micro-qualified cumulative forecast: **0.408659508 ms/token**.
+No new formal request: the ≥1 ms trigger is not reached. The two-instruction
+expert decoder remains unqualified and receives zero credit. Official baseline
+remains **9.564282 ms/token**.
+
+### 2026-10-05 — remove repeated whole-row amax from existing fused quantizer
+
+ISA audit found the disabled WOa scale/dense-quant candidate recalculated the
+whole row for each output tile (16 or 32 copies). The corrected kernel caches
+the rounded BF16 row, computes one amax, loads each group scale once and uses
+frontend loop expansion (the old backend unroll pragma was ignored). No GEMM
+slicing change. Five inputs/four ranks exact; native three-round savings
+**0.000903062 / 0.001213043 / 0.000779516 ms per layer**.
+`decode-woa-single-amax-02`, `VLLM_HPU_DSV41_WOA_DENSE_HANDOFF=0`.
+40-layer estimate **0.036122500 ms/token**. This is a correction to the
+previously inefficient hand-written kernel, not credit for its archived trial.
+
+Active cumulative forecast **0.444782008 ms/token**; formal baseline unchanged.
+No end-to-end request until cumulative forecast reaches at least 1 ms.
+
+
+### 2026-10-05 — roofline reprioritization and tolerance-qualified controller
+
+`decode-mhc-parallel-k-01`: checkpoint WO/control→native peer→post→FFN/router,
+five inputs×four ranks, three savings **0.000988996 / 0.000995863 / 0.001007996 ms/boundary**.
+TPC controller keeps24 row owners and uses eight independent K accumulators; it changes
+FP32 summation order. CPU oracle implements DeepSeek dba1be0 hc_mixes/Sinkhorn/post equations;
+DeepGEMM 057ca596 normalized squared-error limit5e-5, observed maximum **7.679e-9**.
+The upstream CUDA kernel itself was not executed. Router IDs remain exact on all fixtures.
+Physical/logical producer+consumer **9→8**, no GEMM pipeline slices removed.
+Switches `VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL=0` plus `VLLM_HPU_DSV41_MHC_DEFERRED_GATES=0`.
+Conservative credit only40 measured boundaries: **0.039834531 ms/token forecast**,
+replaces0.025901406 linear-post estimate (not additive); other40 not credited.
+Active total **0.458715133 ms/token**, official baseline **9.564282** unchanged.
+Planning realization~40%; ≥1ms remains the batch-formal trigger.
+
+Communication pruning and both MME-controller boundaries had no gain; they are in INDEX,
+not this gain total. Architectural bounds and unresolved communication/SRAM lifetime work:
+[ROOFLINE](../../evidence/ROOFLINE.md).
+
+### 2026-10-05 — vector BF16 multiply at the routed quantization boundary
+
+`decode-ffn-bf16-quant-03`: same-process, same2/3/6/7 and CPU affinity;
+both arms use the already-qualified streamed MoE and dual norm/quant parent.
+Five checkpoint-derived fixtures×four ranks exact. Three native four-layer savings
+**0.000047688 / 0.000263937 / 0.000114344 ms**; median per-layer0.000028586ms.
+40-layer forecast **0.001143438 ms/token**, incremental to the MoE parent.
+TPC simulation3791→3439 VLIWs, same482loads/363stores, all20488 output bytes exact
+for each of five fixtures. Physical nodes stay21→21; no fusion credit.
+Switch `VLLM_HPU_DSV41_FFN_BF16_QUANT=0`, requires dual quantization and C1.
+Active cumulative forecast **0.459858570 ms/token**; formal baseline9.564282 unchanged.
+The small result is recorded without rounding it into a material latency claim.
+
+### 2026-10-05 — cold index gain replica
+
+`decode-index-gain-replica-01`: query projection, gain projection, native peer
+exchange, and a production 2048-row scoring consumer. Five inputs x four ranks
+query/gain/score bytes exact; three native A/B savings **0.003837906 /
+0.003863922 / 0.003833695 ms per index layer**. Eight index layers forecast
+**0.030703250 ms/token**. Only the small [32,5120] BF16 gain projection is
+replicated at load time, adding 2.5 MiB per rank across eight layers while retaining
+local checkpoint shards. Query projection and scoring remain unchanged. Shared
+TP-parameterized C1 source uses `VLLM_HPU_DSV41_INDEX_GAIN_REPLICA=0`; prefill,
+C2–C6 and request-batch keep the original path. 64 relevant CPU checks passed.
+This is a component-qualified forecast, not a formal end-to-end result.
+
+Active cumulative forecast **0.490561820 ms/token**.
+Official baseline **9.564282 ms/token**, next formal trigger **1 ms**.
+
+### 2026-10-05 — mHC K128/head weight layout
+
+`decode-mhc-swizzled-control-01`: original [24,20480] weights prepared once as
+[160,24,128], same parallel controller MAC and reduction order. Five fixtures x
+four ranks exact through peer/post, norm/quant and router; three native boundary
+savings **.000147008 / .000138254 / .000138160 ms**. Only 40 measured boundaries
+receive credit: **0.005530156 ms/token**, incremental to the parallel controller.
+No logical-node reduction; source-layout experiment, not measured HBM utilization.
+Default-off `VLLM_HPU_DSV41_MHC_SWIZZLED_CONTROL`, requires PARALLEL_CONTROL and
+DEFERRED_GATES. Prefill and C2–C6 retain checkpoint layouts. Active forecast
+**0.496091977 ms/token**, still below the 1ms formal trigger.
+
+### 2026-10-05 — direct shared-RRMS post layout
+
+`decode-mhc-rrms-post-01`: five x four exact, native A/B differences
+.000002531 / .000007297 / .000007254ms per boundary. Specializing the known
+25-value input removes unused RMS code and six static VLM reload sites, but
+complete-chain time barely changes. Literal 40-boundary forecast
+**0.000290156 ms/token**, flag `VLLM_HPU_DSV41_MHC_RRMS_POST=0`. This tiny
+component value does not establish a material end-to-end improvement.
+Active forecast **0.496382133 ms/token**; formal unchanged.
+
+### 2026-10-05 — BF16 controller weight alternative (not additive)
+
+`decode-mhc-bf16-weight-03`: five checkpoint fixtures x four ranks, upstream
+equation errors at most3.20124e-6 (limit5e-5), router IDs exact. Native full
+WO/control→peer→post→FFN/router savings .000157316/.000175648/.000163961ms
+per boundary. Forty-boundary forecast **.006558438ms/token**.
+Default-off `VLLM_HPU_DSV41_MHC_BF16_CONTROL_WEIGHT`, requires parallel and
+deferred control. Mutually exclusive with swizzled weights: this replaces
+.005530156ms, never adds to it. Retain swizzle in the active batch for now;
+active forecast **.496382133ms/token** and formal **9.564282ms/token** unchanged.
+The candidate retains original FP32 weights for wider batches and adds75MiB/rank.
+
+Simulation correction: FFN BF16 quantization was rechecked with typed FP32
+descriptors in `decode-ffn-bf16-quant-01/correct-descriptors.log`; all five
+20488-byte outputs exact, instruction counts unchanged. Earlier malformed
+simulator outputs are superseded; hardware evidence and ledger credit unchanged.
+
+### 2026-10-05 — vector shared-main reuse mask producer
+
+`decode-mla-vector-mask-01`: parent vector KV codec held fixed in both arms.
+Five checkpoint-derived inputs x four ranks bit-exact through QKV, MLA, WO,
+native peer and post/FFN. Three native savings **.005064145/.005103352/.005115961ms
+per reuse layer**. Ten vector stores replace640 scalar mask stores; all-row
+access is declared to the compiler, with the original shared-row ownership.
+Five-position simulator outputs exact, including early SWA history and200K
+position. Physical producer count stays23→23; this is ISA/traffic efficiency,
+not fusion credit. 53 relevant CPU checks passed.
+Default-off `VLLM_HPU_DSV41_MLA_VECTOR_MASK`, requires `MLA_VECTOR_CODEC`.
+27 qualified reuse layers forecast **.137790492ms/token**, additive to the
+vector-codec parent. Active total **.634172625ms/token**; formal baseline
+**9.564282ms/token** unchanged. Combined formal trigger remains1ms.
+
+### 2026-10-05 — corrected hardware E4M3 reuse codec
+
+`decode-kv-hardware-codec-02/reuse-native-03`: vector codec and vector mask
+parents held fixed. Five checkpoint-derived fixtures×four ranks alloutputs
+bit-exact through QKV→MLA→WO→nativepeer→post/FFN. Native paired savings
+**.000899145/.000845145/.000916508ms per reuse layer**. Executable producer
+count stays23→23; the simulator reduces75268→69124 executed instructions.
+Hardware E4M3 finite-upper-exponent, NaN and zero corrections were checked
+for all256 codes; complete producer fixtures are also exact.
+Default-off `VLLM_HPU_DSV41_MLA_REUSE_HW_CODEC` requires both vector parents.
+Only27 reuse layers receive **0.024276902ms/token forecast**; no publish credit.
+Active cumulative forecast **0.658449527ms/token**; formal **9.564282ms/token**
+unchanged and combined formal trigger remains1ms.
+
+The earlier reuse-native-02 attempt failed before timing because its nested
+TMPDIR exceeded the Unix-domain socket limit. The shared component launcher
+now uses a short profile scratch root and checks the UUID path before leasing
+devices; no correctness/performance number is taken from that failed attempt.
+
+### 2026-10-06 — exact mHC gates during native peer exchange
+
+`decode-mhc-gates-inflight-chain-01`: parent is the qualified swizzled parallel
+controller plus shared-RRMS post. Both arms retain the same WO/control producer;
+the candidate submits peer exchange before running exact gates, then waits at
+post/FFN/router. Five checkpoint-derived fixtures × four ranks have all nine
+outputs byte-exact, including router IDs. ABABAB200 native boundary savings
+**.001699148/.001720680/.001706211 ms** are direction-consistent.
+Eighty mHC boundaries forecast **.136496875 ms/token**; this extrapolates the
+same operator/shape to both posts per layer, not a measured service result.
+Actual consumer inputs are checkpoint-derived embeddings, not captured activations.
+
+Physical nodes **8→9 per boundary**: the extra standalone gate runs in the
+communication window. This is scheduling overlap, not fusion or node-count credit.
+21 CPU checks cover pure-branch isolation and actual native Meta shapes for
+B1/B2/B6 and TP2/TP4. Default-off `VLLM_HPU_DSV41_MHC_COMM_GATES` selects the
+common helper; existing C1/deferred-gate guards keep prefill and C2–C6 unchanged.
+Replay and communication APIs/ABIs do not change. The splitter now recognizes
+a pure gate-only branch when its projection is external to the consumer recipe,
+while retaining communication-taint and mutation checks.
+
+Evidence: `/opt/ssd960/1cat-vllm-decode-archives/decode-mhc-gates-inflight-chain-01/`
+(`result.json`, `PHYSICAL_SUMMARY.json`, `DECISION.json`, native dependency logs),
+with CPU logs in `decode-mhc-gates-inflight-01`. All native owners retired.
+Compatible pending forecast **.794946402 ms/token**, official baseline remains
+**9.564282 ms/token**, batch formal trigger remains **1 ms**.
+
+### 2026-10-06 — reuse existing canonical SWA mirror
+
+`decode-mla-decoded-swa-chain-02`: publisher writes the real 40-layer
+20MiB BF16 mirror in both arms; reader aliases layer3 at byte offset1572864.
+Five checkpoint-derived fixtures × four ranks have all10 observables exact,
+including canonical packed cache, mirror and router. Native ABABAB200 savings
+**.000570746/.000596355/.000664250 ms/reuse layer**; only27 reuse layers receive
+**.016101598 ms/token forecast**. Original F32 normalization, probabilities
+and PV arithmetic retained. Physical producer nodes23→19; no slice DMA.
+
+Default-off `VLLM_HPU_DSV41_MLA_DECODED_SWA` consumes the current owner's
+existing mirror only when publication is already active; absent mirror retains
+the packed reader. No new context cutoff or TP-size branch. Publisher, wider
+buckets and serving/cache-state acceptance remain unqualified for this flag.
+Private-slot chain01 is superseded and receives no additive credit.
+
+Compatible pending forecast **.811048000 ms/token**, formal baseline remains
+**9.564282 ms/token**. Combined formal trigger1ms has not been reached.
+Evidence: `/opt/ssd960/1cat-vllm-decode-archives/decode-mla-decoded-swa-chain-02/`
+(`result.json`, `PHYSICAL_CONTRACT.json`, `DECISION.json`). All native owners retired.
+
+### 2026-10-06 — trim proved zero W2 K tail
+
+`decode-expert-w2-active-k-chain-01`: same qualified streamed SAT/dual-BF16-quant
+parent in both arms. Keep W13 and padded SiLU amax/gate-up offset unchanged;
+explicit active width reduces W2 K640→576. Zero suffix checked across all384
+checkpoint experts in each of four real layers. Five checkpoint-derived inputs
+×four ranks all downstream outputs byte-exact. Three native savings per four
+layers **.002044000/.001983875/.002041844ms**, median per layer
+**.000510461ms**; forecast40 layers **.020418438ms/token**.
+
+Physical21→21: W13 slices and both weights/MME consumers remain SRAM, each
+decoder has one consumer, W2 physical geometry is576. No node-count credit.
+Simulator trims9.2% executed instructions and10% stores without per-store
+N-tail branches; that is not a corresponding device latency claim.
+Default-off `VLLM_HPU_DSV41_EXPERT_ACTIVE_W2` requires streamed SAT and
+load-time zero-tail metadata; original prepared file/layout remains valid.
+New native schema adds a cold integer `active_width`; shared replay, communication
+and runner interfaces unchanged. C2–C6/prefill retain the old operator.
+Compatible pending forecast **.831466437ms/token**; formal **9.564282ms/token**
+unchanged. All four native owners retired; normal serving acceptance pending.
+
+### 2026-10-06 — positive-denominator Sinkhorn reciprocal
+
+`decode-mhc-positive-gates-chain-01`: same swizzled controller and independent
+gates during native peer in both arms; two FP32 Newton corrections replace
+generic positive-denominator divisions. Twenty Sinkhorn iterations remain.
+Five checkpoint-derived fixtures ×four ranks pass official equations and exact
+router IDs; floating outputs are not bitwise equal. Three savings per boundary
+**0.000000039063/0.000017515625/0.000014843750ms**, literal80-boundary forecast
+**0.001187500ms/token**. The first difference is effectively zero; this
+is not a material model performance result. Physical gates1→1, no node credit.
+
+`VLLM_HPU_DSV41_MHC_POSITIVE_GATES=0` remains default-off; common decode helpers
+select it without a TP-size branch, prefill retains original gates. Native B1/B2/B6
+Meta and helper/overlap checks:28 passed. All owned workers retired. Compatible
+pending forecast **0.832653937ms/token**, formal **9.564282ms/token** unchanged.
+No serving latency or quality qualification yet.
+
+### 2026-10-06 — shared native index query RoPE/FP4 boundary
+
+`decode-index-rope-codec-chain-02`: retain replicated gain and one query peer in
+both arms; BF16 query GEMM → native RoPE/FP4 → 2048-row score consumer. Five
+checkpoint embedding-derived inputs ×four ranks give byte-exact query/gain/score.
+Same-process native64-repetition ABABAB200 savings per index layer
+**.001821313/.001834984/.001826227ms**; eight-layer forecast
+**.014609813ms/token**. Actual producer14→13 physical nodes; consumer7 unchanged.
+
+`VLLM_HPU_DSV41_INDEX_QUERY_CODEC=0` stays default-off. Common width128 native
+contract supports TP2/TP4 heads and B1/B2/B6; CPU Meta22checks and five simulator
+fixtures across H8/H16/H32/B2/B6 pass, with signed-zero/subnormal/NaN/Inf/ties.
+Both BF16 rounding boundaries and first-lane-NaN codec semantics are retained.
+No replay/communication/runner API change; prefill retains its original path.
+This is a bounded component chain, not captured serving activations/full index
+selection or a model latency result. Compatible pending forecast
+**.847263750ms/token**, formal baseline **9.564282ms/token** unchanged.
+
+Evidence: `/opt/ssd960/1cat-vllm-decode-archives/decode-index-rope-codec-chain-02/`
+(`result.json`, `PHYSICAL_NODES.json`, `DECISION.json`); all owners retired.
+chain01 has no performance result: pinned bridge path was rewritten incorrectly
+by the component launcher, now repaired and covered by two CPU regressions.
+
+### 2026-10-06 — complete late Reindex score submission
+
+`decode-index-wide-reindex-chain-02`: checkpoint query/gain producer → one
+query peer → 16384-row score/select → actual packed-main MLA consumer. Parent
+retains qualified query codec/gain replication in both arms. The candidate uses
+the existing K128 MME/head reducer once instead of eight2048-row calls; BF16
+head/shard rounding and ordered selection are unchanged. No TP4-specific kernel.
+
+Five checkpoint embedding-derived input/position pairs ×four ranks: all scores,
+IDs, MLA outputs and publication rows/masks byte-exact. Candidate slots include
+permutations, holes and invalid addresses; actual ratio1,524288-row index/main
+allocations. Native16-repeat ABABAB200 differences
+**.022157844/.022212344/.022210531ms/layer**; four applicable layers24/28/32/36
+forecast **0.088842125ms/token**. Complete consumer physical61→27; query producer13
+unchanged. This removes independent clamps/gathers/head reductions and also
+reduces compiler MME fragments; those fragments are not treated as an isolated
+performance claim.
+
+`VLLM_HPU_DSV41_INDEX_WIDE_REINDEX=0` stays default-off. C1 decoded mirror only;
+other buckets and packed readers retain their current path. Component inputs
+are real-weight-derived, not captured serving QR activations. This is not a
+formal model/state/quality result. Compatible pending **0.936105875ms/token**;
+formal **9.564282ms/token** unchanged. All owned workers retired.
+
+Evidence: `/opt/ssd960/1cat-vllm-decode-archives/decode-index-wide-reindex-chain-02/`
+(`result.json`, `PHYSICAL_NODES.json`, `DECISION.json`).
+
+### 2026-10-06 — predicate bitmap packing, wide-score parent
+
+Native query/gain → onepeer → complete16384-row scoring → threshold/emit →
+actualMLA, with qualified wide scoring held in BOTH arms. Five fixture
+queries/positions/pools ×four ranks have exact scores, IDs, MLA results and
+publication rows/masks. ABABAB200 native16repeat savings
+**.002104813/.002126813/.001769813ms per late Reindex layer**; same13 query
+producer nodes and27 score/select/MLA nodes. This is bitmap instruction
+efficiency, not node reduction. Four measured-scope occurrences24/28/32/36
+forecast **.008419250ms/token**, not an eight-layer extrapolation.
+
+`VLLM_HPU_DSV41_INDEX_PREDICATE_PACK=0`, compatible pending
+**.944525125ms/token**, formal **9.564282ms/token** unchanged. These fixtures
+use framework candidate coordinates; the next combined wide+packing comparison
+holds the already-default native coordinate producer fixed. That combined
+measurement must replace these overlapping forecasts, not add another value.
+
+Evidence: `/opt/ssd960/1cat-vllm-decode-archives/decode-index-predicate-pack-chain-01/`
+(`result.json`, `PHYSICAL_NODES.json`, `DECISION.json`).
+
+### 2026-10-06 — production-coordinate combined score/selection correction
+
+`decode-index-wide-predicate-production-chain-01` holds already-default native
+candidate coordinates and qualified query/gain in both arms. Full524K storage,
+5 changing queries/positions/pools ×four ranks: all scores/IDs/MLA/publication
+bytes exact. Native16-repeat ABABAB200 saves **.021125375/.021080187/.021104500
+ms/layer**. Physical query13→13; complete score/select/MLA42→20. Fourlate
+Reindex occurrences yield **0.084418000ms/token forecast**.
+
+This REPLACES the earlier wide+.predicate **.097261375** estimate, which used
+framework coordinates. Do not add allthree. Compatible pending is now
+**0.931681750ms/token**; formal **9.564282ms/token** unchanged. Both runtime
+flags staydefaultoff until combined serving. Owners retired; no new formal
+request/trace. Evidence: SSD `decode-index-wide-predicate-production-chain-01/DECISION.json`.
+
+### 2026-10-06 — exact local sampling candidates with coarse coverage
+
+Real checkpoint head/norm → localpacket → production padded BF16 peer →
+original nucleus → embedding, native16-repeat ABABAB200, fivefixtures×fourranks.
+Token/certificate/embedding/logits bytes exact; separate onecard actualpacket
+fivefixtures exact, coarse tie bucket rejects coverage, greedy tie chooses0.
+Three savings **.024229938/.024228750/.024157406ms/token**; forecast once
+**0.024228750ms/token**. Physical producer30→30 andconsumer74→74: this
+reduces full32K sort work ratherthan nodecount.
+
+`VLLM_HPU_DSV41_SAMPLING_THRESHOLD=0`, pending **0.955910500ms/token**,
+formal **9.564282ms/token** unchanged. These5 embedding-derived inputs have
+ordinary nucleus coveragefalse in BOTHarms; timed endpoint is the provisional
+device embedding, not fullrepair. No extra coarse rejection in their localpackets.
+Full-serving extra fallbackrate and semantic qualification remain pending.
+Evidence SSD `decode-sampling-threshold-chain-04/DECISION.json` and
+`decode-sampling-threshold-packet-01/result.json`.
+
+### 2026-10-06 — handwritten sampling packet consumer
+
+Qualified threshold producer BOTHarms → same peer → original versus fused
+consumer → embedding. Five real fixtures×fourranks have exact token/I32
+certificate/embedding/logits; nine simulator frames allthreekernels exact.
+Native16-repeat ABABAB200 savings **.036573594/.036707625/.036733375ms/token**.
+Physical consumer **75→22**, producer30 unchanged. Forecast once
+**0.036707625ms/token**; pending **0.992618125ms/token**.
+`VLLM_HPU_DSV41_SAMPLING_FUSED_PACKET=0`. Sort/exp/fullpartitionfunction/both
+cumsums are unchanged; no RNG/hostupload/replay/communication ABI change.
+Same provisional-endpoint/fullrepair scope as the threshold parent; formal
+**9.564282ms/token** unchanged. Evidence SSD `decode-sampling-fused-chain-01`.
+
+### 2026-10-06 — contiguous sampling statistics and in-kernel greedy
+
+`decode-sampling-fused-chain-02`: same threshold parent/original reference;
+shared consumer now publishes max/sum arrays directly and performs greedy
+only whenT0 inside the selection TPC. FP32 math and bothcumsums retained.
+Fivefixtures×fourranks exact, nine simulation frames exact,29Meta/CPUchecks.
+Three savings **0.039011281/0.038945594/0.039038656ms/token**.
+Forecast **0.039011281ms/token REPLACES .036707625**; do not addboth.
+Pending **0.994921781ms/token**, formal9.564282 unchanged, defaultoff.
+
+### 2026-10-06 — shared local max/index reduction
+
+Threshold and fusedconsumerv2 BOTHarms. One max.dim replaces duplicate full
+vocabulary max/argmax passes. Fivefixtures×fourranks token/certificate/embedding
+/logits bytes exact; nativepacket5exact pluscoarse/greedy edgespass. Native16
+repeat ABABAB200 savings **.037635625/.037480969/.037524406ms/token**.
+Producer30→27, consumer16same. Forecastonce **0.037524406ms/token**, compatible
+pending **1.032446187ms/token**, formal9.564282unchanged.
+`VLLM_HPU_DSV41_SAMPLING_SHARED_MAX=0` until combinedserving.
+Evidence SSD `decode-sampling-shared-max-chain-02`/`decode-sampling-shared-max-packet-01`.
+
+### 2026-10-06 — batch04 official-sampling serving closure
+
+All compatible pending entries above through shared local max/index are now
+included in formal **8.532522828ms/token**. Saved forecast **1.032446188ms/token**,
+observed model change **1.031759458ms/token**; pending total **0**. Entries retain
+historical micro-only labels for their measurement dates, but cannot be counted
+again. 16K fixed prompt,1868 naturalEOS,14facts pass,zero additional sampler
+fallbacks. Ordinary independent installation, source71d4f203,healthy2/3/6/7.
+See SSD `decode-accumulated-serving-04/FORMAL_DECISION.json` and `QUALITY.json`.
+
+### 2026-10-07 — complete mHC gate packet consumer
+
+Qualified current swizzled/positive/deferred producer → native peer → vector
+gate-packet post/collapse → dual BF16 norm/quant → real router MME. Five real
+checkpoint-derived fixtures × four ranks are byte-exact. Three same-process
+native AB savings **.000704078/.000697492/.000721773 ms/boundary**;
+80 corresponding posts forecast **.056326250 ms/token**. The count is a scope
+extrapolation, not measured full-model saving or physical-node reduction.
+34 CPU/Meta checks preserve C1/C2/C6 and independent-gate scheduling.
+
+`VLLM_HPU_DSV41_MHC_GATE_PACKET=0` until combined serving qualification.
+Compatible pending with shared-expert scaling is **.126202813 ms/token**;
+formal baseline remains **8.532522828 ms/token**, target7ms is unmet.
+Other owned four-card component overlapped part of the acquisition; this is
+recorded with the same-process three-round device timing and preserved raw
+periods. Owners retired to768MiB. Evidence SSD
+`decode-peer-gates-vector-chain-01/DECISION.json`.
+
+### 2026-10-07：post 统计量供给分片 FFN 双量化（待端到端）
+
+父配置包含完整 gate packet；真实 WO/control → 原生 peer → post/statistics → 归一化/双量化 → router、共享 W13/SiLU、下一 FFN control/gates。5组 checkpoint 输入×4rank 通过官方容差，路由集合一致；同链 A/B 三轮每边界省 .000486617/.000477492/.000490664ms。仅按40个 FFN 边界折算 **0.019464688ms/token**，不按80个边界重复计数。`MHC_POST_NORM_STATS` 默认关，30个Meta/依赖隔离检查通过；无物理节点减少声明。SSD `decode-post-weighted-statistics-chain-03`。
+
+兼容待验收三项累计 **0.145667500ms/token**（共享缩放 .069876563、gate packet .056326250、本项 .019464688）。当前官方基线仍 **8.532522828ms/token**。按最新“≥0.5ms或3项”规则进入一次合并正式请求+trace，不代表已获得端到端收益。失败的两次测试脚手架记录均保留，未计收益。
+
+### 2026-10-07 — batch05 combined acceptance closed
+
+共享专家缩放、gate packet、weighted post statistics兼容预估合计0.145667500ms/token；
+一次正式官方采样自然EOS观测8.239257597ms/token，比8.532522828减少0.293265230ms/token。
+三项已默认开启并包含在新基线；上述历史pending条目全部关账，当前待验收累计0。
+未验证的主PV缓存、BF16控制权重继续关闭。三项未改变runner/replay/通信接口。
+
+### 2026-10-07 — RX preposting after the explicit previous compute epoch
+
+WO/control → four-card BF16 peer → weighted post/statistics → norm/dual quant
+→ real router/shared-W13/SiLU native chain: 5 checkpoint-derived fixtures ×
+4 ranks, all 13 outputs byte-exact. Three A/B savings are
+0.001722086 / 0.001712008 / 0.001718156 ms per boundary. Conservatively applying
+the median to the 80 model reduction boundaries gives **0.137452500 ms/token**
+waiting for serving qualification. This is not measured full-model improvement.
+`VLLM_HPU_NATIVE_RECEIVE_PREPOST=0`; matching HCL/Synapse epoch APIs, independent
+receive destinations and a complete unsegmented dependency plan are mandatory.
+TP2 and DSpark/batched serving have not been qualified for this option.
+
+The accepted formal baseline remains **8.239257597 ms/token**. Compatible
+pending savings: **0.137452500 ms/token**, one item. Evidence: SSD
+`decode-receive-prepost-01/chain-02/DECISION.json`. The cold missing-export failure
+is retained separately and supplies no gain. All owned modules retired to768MiB.
+
+### 2026-10-07 — receive-prepost production segmented replay gate
+
+The same optional epoch runtime now retains the actual Engram prefix/suffix plans. Five checkpoint-derived continuation inputs × four ranks preserve token IDs, hidden bytes and33 state tensors. Native200-step ABABAB saves **0.063748 / 0.078593 / 0.113867ms per16-layer step**; A median3.6146745, B3.5440835. No hot compilation or profiler. Conservatively using the campaign's ×1.5 mapping gives **0.117889500ms/token forecast**, replacing the earlier standalone0.137452500 estimate; do not add both. Only one compatible pending item, `VLLM_HPU_NATIVE_RECEIVE_PREPOST=0`. TP2/DSpark/B>1 and full-serving remain unqualified. Official formal baseline **8.239257597ms/token**, target7 unmet. Evidence SSD `decode-receive-prepost-real16-04/DECISION.json`; original cold failures retained.
+
+## 2026-10-07：精确 PV 转换旁支（组件合格，服务未接入）
+
+父基线 `decode-accumulated-serving-07`：8.239257597ms/token。完整 QKV→MLA→WO→原生四卡 peer→weighted post/norm→router，五组真实输入×四卡的12项输出/缓存逐位一致。三轮原生 A/B 节省 0.000026875 / 0.000060906250 / 0.000003382813ms/reuse，方向均正；中位 0.000026875ms/reuse。按32个 reuse 层估算 **0.000860000ms/token**，实际兑现未测。无额外存储常驻；所有格式转换和下游消费者包含在计时里。
+
+开关是私有组件工具的 `fused=B`，默认关闭；正常模型/服务入口尚未集成，不声称 main 默认已具备该路径。编译器仍将 cast 收入 PV bundle，不声称 QK/转换已经交叠。第二个显式 F32V 输出方案数值通过、编译门槛失败，未计时，不计入收益。两项兼容待验收为 receive preposting **0.117889500** + 本项 **0.000860000** = **0.118749500ms/token**；远低于正式触发线，也未达7ms目标。
+
+证据：`/opt/ssd960/1cat-vllm-decode-archives/decode-mla-deferred-pv-01/{DECISION.json,chain01/rank0/result.json,chain01/native-snapshot/RESTORATION.txt}`。第一版对象文件/源码保留并重新链接，原始运行没有记录私有扩展 SHA，不能声称重链接二进制与当时逐字节一致；原生输出接口及实际编译记录保留。
+
+## 2026-10-07 — 首读 TPC 等待设备就绪标志（未端到端）
+
+SSD `decode-memory-ready-overlap-01/QUALIFICATION.json`，正式父基线8.239257597。
+WO/control → 原生四卡 peer → weighted post/statistics → norm/双量化 → 真实router、共享W13/SiLU、下一mHC。
+5组checkpoint输入 × 四卡 × 64个变化边界 × 13端点逐位一致，无就绪超时。
+三轮原生ABABAB各200设备区间，每边界减少0.003368398、0.002140633、0.003243398ms。
+已覆盖的生产位置为40个FFN入口，预估 **0.129735938ms/token**；80点的0.259471875只是假设，
+另一种Attention入口尚未移植/验证，不能计入。每张卡的最大设备时间用于比较，不用四卡活动并集。
+计时卡2/3/6/7、CPU70/74/100/104；另一组负载记录保留于chain08。
+独立NIC EDMA在全部RX/本地拷贝就绪后发布128B标志，第一实际payload读者在TPC内获取。
+Gaudi2 recvScaleUp没有EDMA命令；发布在sendScaleUp，所有SEND/Full退休等待仍保留。
+编译器普通日志确认peer/标志直接读DRAM；不宣称权重DMA提前/交叠。
+计时后发现Python事件/计划引用延迟清理，chain09只做退出验证；清理后code0、四卡768MiB。
+候选仍是私有原型、默认关闭；当前明确排斥segmented Engram/receive-prepost，
+**此项单列，不能加进上方0.118749500的兼容组合累计**。下一步共用16层入口和组合状态验证。
+没有新的正式请求、trace或默认提升，目标7ms仍未完成。
+
+同项接入版更新：chain12增加冷预热admission控制，5组四卡64边界/13端点逐位一致，
+三轮每边界减少0.004817813、0.003010242、0.004424773ms，40个FFN位置最新预估
+**0.176990938ms/token**，替代上方0.129735938，不能相加。code0、四卡768MiB。
+控制只在冷准备与原生录制交接时更新，原生图禁止写入该常量；每步无H2D/event。
+HCL_NATIVE_RX_READY只申请冷资源，A没有request/relay，不给A人为添加就绪等待。
+共用stage源码与8192个分段计划CPU用例已接上，real16-01将比较E与E＋首读获取，
+组合尚未通过，兼容累计仍不增加。正式基线8.239257597不变。
+
+## 2026-10-07：全加速组合正式验收（候选保持关闭）
+
+用户明确解除本轮端到端延后，独立安装组合 serving07 的全部已验收路径、receive epoch preposting 与40个FFN首读memory-ready。完整预热、512K/C16384/前缀缓存开、T=1/top_p=.95/seed42，同一个16K未命中样本一次无profiler正式请求。
+
+实测 **8.205229343 ms/token**，父版本8.239257597，差0.034028255；组合预估0.294880438，兑现11.54%，不足一半。因此不提升新候选默认值，不将两项组件估算宣布为端到端收益，正式默认基线暂保留8.239257597。2365 token自然EOS，14事实通过；token、正文、思考内容与父版本完全一致。未命中prefill5527.309tokens/s，仅记录本次结果，不声称恢复prefill目标。微小PV转换仍未集成，未计入本次组合。
+
+证据 SSD `decode-full-acceleration-serving-08/startup-07/{formal/result.json,QUALITY.json,formal/reference-equality.json,DECISION.json}`。伴随trace已捕获，解析中；新的TPC内轮询占用必须与有效计算区分。0/1/4/5、CPU56/61/84/89，正式前另一组四卡全部768MiB，CPU PSI0。退出超过初始清理超时，随后按原PID/start-time核对所有自有worker消失并确认四卡768MiB。首次到第六次启动失败均发生在正式请求前，详情在同案STARTUP_STATUS.md；不计为性能测量。
+
+同次伴随trace已完成：四卡相同24位置，rank0周期8.132346，TPC/MME并集5.878611（含标志轮询），非计算2.253735；四卡周期8.132–8.139。父trace活动并集5.820637、非计算2.362538：空闲减少0.108803，但活动增加0.057975，净周期仅减少0.050828。TPC→TPC空隙约少0.24ms、通信相邻约多0.10ms，未完成逐GUID成因归属。匿名recipe/重叠预提交尚无可靠逐通信点跨rank映射，不用周期差冒充错位。完整报告同案startup-07/REPORT.md；不再累计这两项未经兑现的预估。

@@ -93,7 +93,7 @@ def main():
         values = [start.elapsed_time(end) for start, end in events]
         periods.append(dict(arm=label, token_intervals_ms=values, competing_load=load, summary=summarize(values)))
         print(label, periods[-1]['summary'], flush=True)
-    timing = dict(periods=periods, comparison=compare_periods(periods),
+    timing = dict(periods=periods, comparison=compare_periods(periods, device_events=True),
                   scope='Single SWA-only Attention chain, device events include exposed submission gaps',
                   no_real16_gain_credit=True)
     (root / 'SMALL_CHAIN_AB.json').write_text(json.dumps(timing, indent=2)+'\n')

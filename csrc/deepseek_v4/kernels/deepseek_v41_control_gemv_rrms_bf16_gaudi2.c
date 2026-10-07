@@ -52,8 +52,17 @@ void main(tensor activation, tensor weight, tensor output,
             float64_pair_t squares = {0};
             for (int k = 0; k < 20480; k += 128) {
                 const int5 ac = {k, token, 0, 0, 0};
+#ifdef DSV41_CONTROL_UNPACK_LOAD
+                // SW_LINEAR lets the compiler combine the packed load and
+                // lane conversion. The explicit two-half load prototype had
+                // twice as many activation loads and a longer load-use chain.
+                const bfloat128 packed = v_bf16_ld_tnsr_b(ac, activation);
+                const float128 linear = convert_bfloat128_to_float128(packed, SW_LINEAR);
+                const float64_pair_t value = {linear.v1, linear.v2};
+#else
                 const bfloat128 packed = v_bf16_ld_tnsr_b(ac, activation);
                 const float64_pair_t value = mhc_bf16_to_f32_linear(packed);
+#endif
                 const int5 wc0 = {k, row, 0, 0, 0};
                 const int5 wc1 = {k + 64, row, 0, 0, 0};
                 accumulator = v_f32_mac_b(value.v1,

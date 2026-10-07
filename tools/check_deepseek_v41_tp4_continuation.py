@@ -144,6 +144,13 @@ def main():
     from vllm_gaudi.v1.worker.deepseek_v41_runner import runtime_search_length, prefill_search_length
     decode_search = runtime_search_length(context_tokens, 1, args.max_model_len)
     rank = int(os.environ['LOCAL_RANK'])
+    if os.environ.get('GRAPH_VISUALIZATION') == '1':
+        from types import SimpleNamespace
+        from tools.deepseek_v41_physical_audit import prepare_physical_audit
+        for name, value in vars(args).items():
+            if isinstance(value, Path):
+                setattr(args, name, value.resolve())
+        prepare_physical_audit(SimpleNamespace(output=Path(os.environ['DSV41_RUN_EVIDENCE'])), rank)
     os.environ['HLS_MODULE_ID'] = os.environ['HABANA_VISIBLE_MODULES'].split(',')[rank]
     for name in ('PT_HPU_RECIPE_CACHE_CONFIG',):
         if '{rank}' in os.environ.get(name, ''):
@@ -291,6 +298,9 @@ def main():
                 block.attention.prefill_tp_rank = rank
                 block.attention.prepare_qkv_input_weight()
                 block.attention.prepare_compressor_input_weight()
+                # Match normal serving's cold replica preparation before any
+                # prefill or native decode plan is recorded.
+                block.attention.prepare_index_gain_weight()
                 if args.candidate_local_index_queries:
                     block.attention.prepare_tp4_index_query_weights()
                 block.attention.woa_fp8 = block.attention.woa_output_roundtrip = True
@@ -322,8 +332,32 @@ def main():
                                        fullgraph=True, dynamic=False)
             compiled_sampler = torch.compile(stage.sample_greedy_token, backend='hpu_backend',
                                              fullgraph=True, dynamic=False)
+            sampling_payloads = {}
+            from tools.deepseek_v41_sampling_fixture import full_official_sampler, OfficialSamplerCache
+            full_official = full_official_sampler(stage.all_gather)
+            official_samplers = OfficialSamplerCache(full_official)
+
+            compiled_official = torch.compile(full_official, backend='hpu_backend', fullgraph=True, dynamic=False)
+            from vllm_gaudi.ops.deepseek_v41_sampling import device_sampling_draw
+            compiled_draw = torch.compile(device_sampling_draw, backend='hpu_backend', fullgraph=True, dynamic=False)
+
             def sampler(hidden, engine=None):
                 owner = decoder if engine is None else engine
+                program = owner.program() if args.shared_stage_replay else stage
+                if getattr(program, 'benchmark_official_sampling', False):
+                    from vllm_gaudi.ops.deepseek_v41_sampling import device_sampling_draw
+
+                    values = owner.sampling_tail_values(hidden)
+                    if values is not None:
+                        sampling_payloads[owner] = values
+                        return values[3]
+                    local = owner.tail_local_logits(hidden)
+                    if local is None:
+                        return official_samplers.get(program.bf16_head)(hidden, program.weights.head.weight, program.sampling_params,
+                                                        program.sampling_seed, program.sampling_counter)
+                    draw = compiled_draw(
+                        program.sampling_params, program.sampling_seed, program.sampling_counter)
+                    return compiled_official(local, draw)
                 cached = owner.greedy_tail_token(hidden) if args.shared_stage_replay else None
                 if cached is not None:
                     report['native_tail_sampler_hits'] = report.get('native_tail_sampler_hits', 0) + 1
@@ -505,6 +539,7 @@ def main():
 
             def chain(device, steps, *, measure=True, native_positions=True, engine=None, warm_steps=0, trace=None,
                       forced_tokens=None, observer=None):
+                position_tensor = positions
                 queue_markers = []
 
                 def mark(name, index):
@@ -526,13 +561,27 @@ def main():
                             queue_markers.append((index-warm_steps, name, bridge.verify_phase_marker()))
 
                 engine = decoder if engine is None else engine
+                if getattr(engine.program(), 'candidate_device_loop', False):
+                    from tools.deepseek_v41_device_chain import run_device_chain
+
+                    if trace is not None or forced_tokens is not None:
+                        raise ValueError('Closed-loop micro uses native A/B without a profiler or forced tokens')
+                    return run_device_chain(
+                        engine, host, seed_hidden, sampler, compiled_official, sampling_payloads, bridge,
+                        reset, context_tokens, steps, warm_steps, measure, report, observer=observer)
                 reset()
+                program = engine.program() if args.shared_stage_replay else stage
+                if getattr(program, 'benchmark_official_sampling', False):
+                    program.sampling_counter.zero_()
+                    sampling_payloads.pop(engine, None)
                 selected = sampler(seed_hidden, engine)
                 readback = bridge.copy_sampled_tokens_to_host(selected)
                 torch.hpu.synchronize()
                 output_tokens = []
                 device_start = torch.hpu.Event(enable_timing=True) if measure else None
                 device_end = torch.hpu.Event(enable_timing=True) if measure else None
+                step_events = [(torch.hpu.Event(enable_timing=True), torch.hpu.Event(enable_timing=True))
+                               for _ in range(steps)] if measure else ()
                 started = None
                 iteration_marks = []
                 delivery_marks = []
@@ -545,6 +594,8 @@ def main():
                         started = time.perf_counter_ns()
                         device_start.record()
                         iteration_marks.append(time.perf_counter_ns())
+                    if measure and index >= warm_steps:
+                        step_events[index-warm_steps][0].record()
                     if trace is not None and index >= warm_steps:
                         from vllm_gaudi.ops.deepseek_v41_native_trace import scope
                         context = scope(f'v41::real_selection_chain::step{index-warm_steps}::rank{rank}')
@@ -559,13 +610,29 @@ def main():
                         if args.trace_entry_phases or args.queue_marker_only:
                             mark('begin', index)
                         position = continuation_position(context_tokens, index)
+                        next_device_position = None
+                        if engine in sampling_payloads:
+                            payload = sampling_payloads.pop(engine)
+                            next_device_position = payload[4] if len(payload) == 5 else None
+                            cpu_status, status_done = readback
+                            status_done.synchronize()
+                            covered = bool(int(cpu_status[0, 0]) & 1)
+                            readback = (cpu_status // 2, status_done)
+                            report['bounded_sampler_steps'] = report.get('bounded_sampler_steps', 0) + 1
+                            if not covered:
+                                corrected = compiled_official(payload[1], payload[2])
+                                selected.copy_(corrected)
+                                readback = bridge.copy_sampled_tokens_to_host(selected)
+                                report['bounded_sampler_fallbacks'] = report.get('bounded_sampler_fallbacks', 0) + 1
                         if device:
-                            if native_positions:
-                                bank.copy_into(positions, position)
+                            if next_device_position is not None:
+                                position_tensor = next_device_position
+                            elif native_positions:
+                                bank.copy_into(position_tensor, position)
                             else:
-                                positions.copy_(bank.view(position, 1))
+                                position_tensor.copy_(bank.view(position, 1))
                             if index == 0:
-                                actual = int(positions.cpu()[0])
+                                actual = int(position_tensor.cpu()[0])
                                 if actual != context_tokens:
                                     raise RuntimeError(f'Continuation device position {actual} != {context_tokens}')
                                 report['checked_first_device_position'] = actual
@@ -576,12 +643,12 @@ def main():
                             if args.shared_stage_replay:
                                 prefix_started = engine.input_variant_ready(stage.search_length)
                                 if prefix_started:
-                                    engine.begin_segmented_from_input_ids(positions, token_input)
+                                    engine.begin_segmented_from_input_ids(position_tensor, token_input)
                                 if args.trace_entry_phases or args.queue_marker_only:
                                     mark('native_prefix_enqueued', index)
                             else:
                                 residual, pre = embedding(token_input)
-                                residual, pre = engine.prefix(residual, pre, positions, token_input,
+                                residual, pre = engine.prefix(residual, pre, position_tensor, token_input,
                                                                (host.device_rows, host.prefix_late_placeholder))
                         cpu, done = readback
                         done.synchronize()
@@ -598,14 +665,16 @@ def main():
                         if device:
                             rows = host.consume_device_c1('chain'), packed[1]
                             if args.shared_stage_replay:
-                                hidden = (engine.finish_segmented(positions, token_input, rows)
-                                          if prefix_started else engine.from_input_ids(positions, token_input, rows))[0]
+                                output = (engine.finish_segmented(position_tensor, token_input, rows)
+                                          if prefix_started
+                                          else engine.from_input_ids(position_tensor, token_input, rows))
+                                hidden = output[0]
                             else:
-                                hidden = engine.suffix(residual, pre, positions, token_input, rows)[0]
+                                hidden = engine.suffix(residual, pre, position_tensor, token_input, rows)[0]
                         else:
                             controls.upload([value], position)
                             residual, pre = embedding(ids)
-                            hidden = engine(residual, pre, positions, ids, packed)[0]
+                            hidden = engine(residual, pre, position_tensor, ids, packed)[0]
                         selected = sampler(hidden, engine)
                         if observer is not None:
                             if measure:
@@ -613,18 +682,32 @@ def main():
                             observer(engine.program(), hidden, position)
                         if args.trace_entry_phases or args.queue_marker_only:
                             mark('stage_and_sampler_enqueued', index)
-                        readback = bridge.copy_sampled_tokens_to_host(selected)
+                        source = sampling_payloads[engine][0] if engine in sampling_payloads else selected
+                        readback = bridge.copy_sampled_tokens_to_host(source)
                         if args.trace_entry_phases or args.queue_marker_only:
                             mark('token_readback_enqueued', index)
                         host.complete(ticket, 1)
                         if args.trace_entry_phases or args.queue_marker_only:
                             mark('end', index)
                     if measure and index >= warm_steps:
+                        step_events[index-warm_steps][1].record()
                         iteration_marks.append(time.perf_counter_ns())
                 if measure:
                     device_end.record()
                 cpu, done = readback
                 done.synchronize()
+                final_payload = sampling_payloads.pop(engine, None)
+                if final_payload is not None:
+                    # Ordinary iterations consume their certificate at the
+                    # next entry. The final output has no next entry; decode
+                    # it here rather than returning the packed status as ID.
+                    if int(cpu[0, 0]) & 1:
+                        cpu = cpu // 2
+                    else:
+                        corrected = compiled_official(final_payload[1], final_payload[2])
+                        cpu = corrected.cpu()
+                        report['bounded_sampler_fallbacks'] = report.get('bounded_sampler_fallbacks', 0) + 1
+                    report['bounded_sampler_steps'] = report.get('bounded_sampler_steps', 0) + 1
                 if measure:
                     delivery_marks.append(time.perf_counter_ns())
                 output_tokens.append(int(cpu[0, 0]))
@@ -636,6 +719,7 @@ def main():
                         for start, stop in zip(iteration_marks[:-1], iteration_marks[1:], strict=True)]
                     report['candidate_final_drain_ms'] = (time.perf_counter_ns() - iteration_marks[-1]) / 1e6
                     report['token_delivery_ns'] = delivery_marks
+                    report['device_step_ms'] = [begin.elapsed_time(end) for begin, end in step_events]
                     return output_tokens, elapsed / steps, device_start.elapsed_time(device_end) / steps
                 torch.hpu.synchronize()
                 if queue_markers:
@@ -653,18 +737,22 @@ def main():
                 return fingerprints
 
             def preparation_counts():
+                from tools.deepseek_v41_resident_ab import graph_compilation_count, recipe_cache_count
+
                 if args.shared_stage_replay:
                     from vllm_gaudi.ops.tp2_prepared_plan import prepared_group_stats
                     stats = prepared_group_stats()
-                    return [stats['prepares'], stats['native_captures']]
-                return [chunk.preparations for chunk in decoder.chunks]
+                    return [stats['prepares'], stats['native_captures'],
+                            recipe_cache_count(), graph_compilation_count()]
+                return ([chunk.preparations for chunk in decoder.chunks]
+                        + [recipe_cache_count(), graph_compilation_count()])
 
             if args.resident_ab:
                 if __package__:
                     from tools.deepseek_v41_resident_ab import serve
                 else:
                     from deepseek_v41_resident_ab import serve
-                serve(stage, decoder, shard, chain, report, args, preparation_counts)
+                serve(stage, decoder, shard, chain, report, args, preparation_counts, state_fingerprints)
                 report.update(status='resident_ab_stopped', formal_gain_credit=False)
                 return
 
@@ -1044,6 +1132,8 @@ def main():
         raise
     finally:
         output.write_text(json.dumps(report, indent=2)+'\n')
+        from tools.deepseek_v41_device_chain import close_device_chains
+        close_device_chains()
         if args.state_reference_native_groups or args.speed_probe:
             from vllm_gaudi.ops.tp2_prepared_plan import shutdown_prepared_group_plans
             shutdown_prepared_group_plans()

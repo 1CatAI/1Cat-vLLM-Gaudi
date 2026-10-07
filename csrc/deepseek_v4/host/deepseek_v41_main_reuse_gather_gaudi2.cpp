@@ -4,6 +4,15 @@
 #include <initializer_list>
 extern unsigned char _binary___deepseek_v41_main_reuse_gather_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_main_reuse_gather_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_main_reuse_vector_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_main_reuse_vector_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_main_reuse_vector_mask_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_main_reuse_vector_mask_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_main_reuse_native_codec_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_main_reuse_native_codec_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_main_reuse_decoded_swa_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_main_reuse_decoded_swa_gaudi2_o_end;
+
 tpc_lib_api::GlueCodeReturn DeepseekV41MainReuseGatherGaudi2::GetGcDefinitions(
     tpc_lib_api::HabanaKernelParams* in, tpc_lib_api::HabanaKernelInstantiation* out) {
     using namespace tpc_lib_api;
@@ -14,7 +23,8 @@ tpc_lib_api::GlueCodeReturn DeepseekV41MainReuseGatherGaudi2::GetGcDefinitions(
     auto matches = [](const Tensor& t, unsigned type, unsigned dims, uint64_t d0) {
         return t.geometry.dataType == type && t.geometry.dims == dims && t.geometry.maxSizes[0] == d0;
     };
-    if (!matches(in->inputTensors[0], DATA_U8, 2, 528) || in->inputTensors[0].geometry.maxSizes[1] != 256 ||
+    if (!matches(in->inputTensors[0], decoded_swa_ ? DATA_BF16 : DATA_U8, 2, decoded_swa_ ? 512 : 528) ||
+        in->inputTensors[0].geometry.maxSizes[1] != (decoded_swa_ ? 512 : 256) ||
         !matches(in->inputTensors[1], DATA_BF16, 3, 512) || in->inputTensors[1].geometry.maxSizes[1] != 640 ||
         in->inputTensors[1].geometry.maxSizes[2] != tokens ||
         !matches(in->inputTensors[2], DATA_F32, 2, 640) || in->inputTensors[2].geometry.maxSizes[1] != tokens ||
@@ -29,7 +39,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41MainReuseGatherGaudi2::GetGcDefinitions(
     auto& swa = out->inputTensorAccessPattern[0];
     std::memset(&swa, 0, sizeof(swa));
     swa.sparseAccess = true;
-    map(swa, 0, 0, 0, 527);
+    map(swa, 0, 0, 0, decoded_swa_ ? 511 : 527);
     map(swa, 1, 0, 0, 255);
     map(out->inputTensorAccessPattern[1], 0, 0, 0, 511);
     map(out->inputTensorAccessPattern[1], 1, 0, 1, 0);
@@ -50,9 +60,31 @@ tpc_lib_api::GlueCodeReturn DeepseekV41MainReuseGatherGaudi2::GetGcDefinitions(
         in->outputTensors[2].geometry.maxSizes[1] != tokens) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
     map(out->outputTensorAccessPattern[2], 0, 0, 1, 0);
     map(out->outputTensorAccessPattern[2], 1, 1, 1, 0);
+    if (vector_mask_) {
+        // A single workpoint accesses the complete mask row; advertise that
+        // cross-row access so slicing cannot bind a partial row to it.
+        out->inputTensorAccessPattern[2].allRequired = true;
+        out->outputTensorAccessPattern[2].allRequired = true;
+    }
     out->kernel.paramsNr = 0;
     auto* first = &_binary___deepseek_v41_main_reuse_gather_gaudi2_o_start;
     auto* last = &_binary___deepseek_v41_main_reuse_gather_gaudi2_o_end;
+    if (vector_) {
+        first = &_binary___deepseek_v41_main_reuse_vector_gaudi2_o_start;
+        last = &_binary___deepseek_v41_main_reuse_vector_gaudi2_o_end;
+    }
+    if (vector_mask_) {
+        first = &_binary___deepseek_v41_main_reuse_vector_mask_gaudi2_o_start;
+        last = &_binary___deepseek_v41_main_reuse_vector_mask_gaudi2_o_end;
+    }
+    if (native_codec_) {
+        first = &_binary___deepseek_v41_main_reuse_native_codec_gaudi2_o_start;
+        last = &_binary___deepseek_v41_main_reuse_native_codec_gaudi2_o_end;
+    }
+    if (decoded_swa_) {
+        first = &_binary___deepseek_v41_main_reuse_decoded_swa_gaudi2_o_start;
+        last = &_binary___deepseek_v41_main_reuse_decoded_swa_gaudi2_o_end;
+    }
     const auto capacity = out->kernel.elfSize;
     out->kernel.elfSize = last - first;
     if (capacity < out->kernel.elfSize) return GLUE_INSUFFICIENT_ELF_BUFFER;

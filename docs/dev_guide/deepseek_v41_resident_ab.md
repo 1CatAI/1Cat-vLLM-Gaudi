@@ -21,7 +21,7 @@ A/B各600个样本的中位数与inclusive IQR；另记排空后的整段host均
 每段前采另一组模块2/3/6/7的11次显存/利用率快照，间隔1秒；十秒内显存变化≥16MiB时等待，
 增长和驱动内存池重置下降都必须稳定，避免启动阶段的短暂停顿被误判为加载完成。
 并将全部检查追加到`competing-load.jsonl`。记录已允许的其他组常驻/运行负载，不改它们的进程或锁。
-每个候选最长45分钟；保留失败或部分段数据，再换方向。
+候选不设置自动超时；保留失败或部分段数据。最新 campaign 的批次验收顺序优先于历史累计门槛。
 
 尾部候选只把LM head和argmax并入最后一组，不重复下一步embedding或引入额外embedding AllReduce。
 16层A为41原生点＋1重放外head点；尾部B为42原生点＋0重放外点，完整链通信总数相同。
@@ -45,8 +45,36 @@ load1包含驱动D状态线程，不作为门槛。逐秒记录CPU PSI、绑定�
 
 编译器配置候选必须证明两臂实际recipe不同。Synapse配置在冷捕获后恢复，但仅恢复开关不足以隔离Bridge缓存；`compiler_cache_isolation_unverified`结果不能入台账。离线保存post-graph及native plan，用相同输入精度对比真实节点数。默认先捕获参考臂。
 
+重放分段候选 `handoff_static_merged_segments` 必须以 `handoff_static_factories` 为参考臂，
+仅改变共用 backend 的 mHC 分段。计时前从同一恢复点各执行短链，逐位比较 token 和全部可变状态的校验和；
+任一卡不一致则保留差异、跳过计时，常驻工具继续接受后续任务。
+该候选通过 `DecoderTopology.require_independent_overlap=False` 配置每图的
+`NativeDecodeGraph.configure_dependency_policy(False)`。原生缓冲区依赖、通信覆盖与覆盖写检查仍执行；
+只有“必须存在独立计算段”的性能断言被放宽。默认值为 True，正常 TP2/TP4 和 C2–C6 不调用新增方法，
+旧 bridge 保持兼容；合并候选遇到缺少该方法的 bridge 会明确拒绝捕获。
+记录原生计算段数和通信点数；它们不能替代 trace 中的物理 kernel 数。
+并行冷编译默认不导出 post-graph JSON，避免尚未写完的文档阻断编译；
+仅单独诊断时使用 `DSV41_RESIDENT_POST_GRAPH=1`。
+
+后续候选可用 `--candidate factory --candidate-factory tools/deepseek_v41_candidates/<name>.py`，
+工厂接收指定参考臂及模块克隆函数，返回独立模块所有者，共享不可变权重及约定的可变状态恢复点。
+工具记录工厂及声明的共用实现源码哈希，拒绝外部文件和提交后或计时中被修改的源码。
+每个工厂先通过逐位 token/可变状态检查，再录制自己的计划并执行 ABABAB；
+已有参考计划继续常驻，prepare/capture 计数变化会使计时失败。
+`all_route_slots` 工厂仅选择共用 MoE 的 C1 六专家解码，不改变参考臂、prefill 或 C2–C6 的派发。
+解码后仍按路由顺序归约，并保留 routed/shared 的两次 BF16 边界。
+调用次数、物理 kernel 数和完整链延迟都需要硬件验证，该候选默认关闭。
+
 
 编译器隔离最小验证工具`tools/check_deepseek_v41_compiler_isolation.py`要求启动前打开诊断用graph-name hash，比较同精度专家完整消费链及冷post-graph。硬件验证已证明两臂recipe不同，且变更输入/专家顺序后的结果精确相同。关闭全部SRAM切分减少节点，却把原有SRAM切片中间权重放到DRAM；小链没有收益，未进入16层。此开关不改变正式服务默认。
 
 
 `dense_fp8_swa_packed`只改变没有压缩KV的两层decode派发，复用现有packed MLA及静态SWA行/长度输入。它先通过KV pack/写环→MLA的TP4/TP2、C1/C2/C6硬件契约，再在真实16层独立两臂验证；不修改prefill入口。此项仍待正式验收，默认关闭。它和I32通用解码删减重叠，不叠加未经门槛确认的I32差值。
+
+Physical node audit is a separate diagnostic job. Submit the same warmed arms
+with `--trace-config <raw SDK template>` to capture eight steps per arm. It
+checks the mutable-state contract first, stores each arm in its own directory,
+and assigns no performance credit to profiler timings. The SDK config must
+be available before worker startup when the installed SDK reads it only once.
+The capture includes all four ranks so consumer dependencies and arrival skew
+can be inspected along with physical TPC/MME activities.

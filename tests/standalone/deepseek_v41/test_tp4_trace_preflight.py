@@ -524,3 +524,20 @@ def test_tp4_prefill_single_16k_chunk_includes_first_token_consumer():
     assert set(result["coverage_proof"]["layer_counts"].values()) == {1}
     with pytest.raises(ValueError, match="forty-layer"):
         tp4_windows({"cpu_markers": marks[:20] + marks[21:]}, "prefill")
+def test_device_feedback_windows_require_counter_proof_and_consumed_completion():
+    from tools.analyze_deepseek_v41_trace import tp4_windows
+
+    marks = [
+        [0, 100, 'v41::worker_commit::PP0::decode::P10::C1::emit1'],
+        [10000, 1000, 'v41::worker_commit::PP0::decode::P11::C1::emit1'],
+        [10100, 800, 'v41::completion_consume::P11'],
+    ]
+    inventory = dict(cpu_markers=marks, first_us=0, last_us=12000)
+    proof = dict(device_loop_complete=True, decode_steps=2, queued=1, consumed=1, explicit_targets=1)
+    assert tp4_windows(inventory, 'decode', native_coverage=proof, position_window=(11, 11))['tokens'] == [11]
+    with pytest.raises(ValueError, match='No complete'):
+        tp4_windows(inventory, 'decode', native_coverage=dict(decode_steps=2))
+    with pytest.raises(ValueError, match='No complete'):
+        tp4_windows(dict(cpu_markers=marks[:2]), 'decode', native_coverage=proof)
+    with pytest.raises(ValueError, match='subset'):
+        tp4_windows(inventory, 'decode', native_coverage=proof, position_window=(11, 12))

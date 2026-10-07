@@ -119,7 +119,7 @@ def main():
         values = [start.elapsed_time(end) / (32 if plans else 1) for start, end in events]
         periods.append(dict(arm=label, token_intervals_ms=values, competing_load=load, summary=summarize(values)))
         print(label, periods[-1]['summary'], flush=True)
-    timing = dict(periods=periods, comparison=compare_periods(periods),
+    timing = dict(periods=periods, comparison=compare_periods(periods, device_events=True),
                   scope='Single expert producer/consumer chain through native replay' if plans else
                         'Single expert producer/consumer chain, device events include exposed submission gaps',
                   capacity_bytes=options.capacity_bytes, replay_repeats=32 if plans else 1,

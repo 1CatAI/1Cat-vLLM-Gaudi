@@ -50,6 +50,18 @@ are in progress.
 
 ## Performance Tuning Parameters
 
+`VLLM_HPU_NATIVE_RECEIVE_PREPOST=1` enables the optional explicit-epoch receive
+path for a complete V4.1 native replay plan. It requires matching versioned HCL,
+Synapse and Bridge overlays, independent receive destinations, and standalone
+BF16 AllGather communication. The capture checks reject early buffer aliases,
+partial and bounded plans. Epoch ABI v2 preserves the Engram prefix/suffix
+split by binding receives to each part's actual compute epoch; that production
+integration is still under qualification. SEND and local-copy producer dependencies
+and full communication retirement remain intact. Default `0`; only the C1
+complete-chain microbenchmark is qualified. Full serving, TP2 and DSpark/batched
+qualification remain pending. See the optional overlay instructions in
+`tools/communication/patches/native-runtime/README.md`.
+
 `VLLM_HPU_DSV41_N256_PREPARED_DIR` selects immutable TP2×PP2 expert files
 created by `tools/prepare_deepseek_v41_n256.py PREPARED_CHECKPOINT OUTPUT`.
 The tool prepares the N256 layout and channel scales once, verifies exact
@@ -891,3 +903,255 @@ BF16 route-output tensor. Requires horizontal W13 and fused expert reduction;
 default off pending complete-chain and serving qualification.
 
 `VLLM_HPU_DSV41_PREFILL_ROPE` (default `1`) uses native forward and inverse RoPE for BF16 query batches of 7–16384 rows when native V4.1 RoPE is enabled. It preserves the large-query path's separate FP32 products and final BF16 rounding; C1–C6 keep their existing arithmetic. Set it to `0` to diagnose the tensor implementation. Rebuild the native extension before enabling this path.
+
+`VLLM_HPU_DSV41_DEVICE_SAMPLING` (default `0`) enables the experimental ordinary C1 native sampling tail.
+`VLLM_HPU_DSV41_DEVICE_INPUT_FEEDBACK` (default `0`) lets that tail advance the private native input
+token and position allocations. It requires device position continuation and a native input graph without a PP
+boundary. The next replay still waits for the coverage certificate; full sampling repair updates the same token
+allocation. Scheduler inputs and PositionBank are never mutated. This candidate remains disabled until its
+producer-to-consumer and serving checks pass.
+It requires the V2 completion owner. Temperature, top-p, seed and prompt origin are uploaded at request admission;
+replay derives each draw from its device position. Bounded candidates retain the full partition function and return
+an explicit coverage certificate. All TP workers resolve an uncertified result through the full sampler before
+any continuation can consume it. This option remains disabled pending complete-chain and serving qualification.
+
+`VLLM_HPU_DSV41_SAMPLING_PREFIX_HANDOFF` (default `0`) yields the interpreter after a certified sampling
+continuation enqueues its native prefix, before preparing late inputs. This experimental scheduling option does
+not change device plans or sampling and remains off pending serving qualification. A private development service
+can switch the handoff policy between retired requests through `set_decode_continuation_diagnostic`; production
+services reject this control.
+
+`VLLM_HPU_DSV41_STATIC_COORDINATES` (default `0`) retains small immutable coordinate factories and I32
+scalar operands as resident buffers in shared native decode compilation. Dynamic positions, mutable state,
+uninitialized allocations and escaping factory outputs remain in the graph. Request data is never frozen.
+Enable only for complete-chain and serving qualification; prefill compilation uses its existing backend.
+
+`VLLM_HPU_DSV41_MERGE_LOCAL_SEGMENTS` (default `0`) disables extra mHC
+partition boundaries in native decode compilation while retaining collective
+dependencies. TP2 and TP4 use the same compiler and replay implementation.
+This candidate requires a separately recorded native A/B plan and remains
+disabled pending combined serving qualification; prefill uses its existing backend.
+
+`VLLM_HPU_DSV41_DEVICE_CLOSED_LOOP` (default `0`) selects the candidate ordinary
+native C1 lookahead lifecycle. It requires device sampling, device next-position
+outputs and the existing device Engram/native-input paths. Both mapped Engram
+producers and immutable sampling frames are warmed at startup. One additional
+invocation may be queued before its input certificate is read; a failed
+certificate drains and discards it before full sampling repair with the saved
+draw. Request termination drains queued work before scheduler state is reused.
+This candidate remains disabled until service trace and official-sampling
+end-to-end qualification pass. It does not change C2-C6 replay interfaces.
+
+`VLLM_HPU_DSV41_ORDERED_PEER_SUM` defaults to `0`. The experimental shared native peer consumer accumulates shards in fixed rank order in FP32, then rounds once to BF16. It requires the matching native operator library; it does not change the communication protocol. Keep disabled until the production producer/consumer chain passes numerical and device-time qualification.
+
+`VLLM_HPU_DSV41_PEER_POST_COLLAPSE` defaults to `0`. The experimental native BF16 decode path leaves peer rows for the existing mHC post/collapse kernel to sum, preserving rank order and the BF16 boundary. It supports the qualified small-batch BF16 handoff and requires the updated native library. Prefill, draft and other batches retain their existing reduction path. No serving speedup is qualified yet.
+
+Ordinary V4.1 native replay with one pipeline stage now defaults to device sampling, device positions, device input feedback, the device closed loop, and static coordinates. These defaults require the V2 runner and native graph/input replay. Explicit zero overrides remain supported. Pipeline stages retain their existing token ownership; unqualified ordered peer reduction stays disabled.
+
+`VLLM_HPU_DSV41_EXPERT_TOKEN_WIDE` defaults to `0`. It reuses the shared route-N SAT decoder and MME consumer for C1–C6 decode with checkpoint-qualified scale planes. Prefill remains on its existing path. Promotion requires reduced compiled physical node counts and a production-shaped native-replay microbenchmark; this candidate has no formal serving result yet.
+
+`VLLM_HPU_DSV41_ATTN_FUSED_PROLOGUE` defaults to `0`. A handwritten decode TPC kernel normalizes/rotates KV, writes its canonical SWA ring and optionally publishes the existing decoded mirror. The mirror policy and prefill path remain unchanged. This candidate awaits physical-node, numerical state and native-replay qualification.
+
+`VLLM_HPU_DSV41_MHC_MME_GATES_NORM` (default `0`) selects the shared decode FFN control hi/lo BF16 MME and handwritten RRMS/gates plus norm/quant TPC candidate when a BF16 collapse handoff is available. Weight preparation happens once; no TP-size-specific implementation. Control accumulation is an approximation to the FP32 checkpoint projection; complete-chain error and quality qualification are required before promotion. Prefill and absent-handoff paths retain the reference.
+
+`VLLM_HPU_DSV41_COMPRESSOR_FUSED_PUBLISH` (default `0`) fuses the common C1 compressor index norm/RoPE, latent RoPE, page addressing, packed FP4 cache stores and scheduler-owned derived mirrors. It returns a logical-position dependency for scoring and MLA consumers. Ratios and mirror ownership are parameters; the reference remains available for prefill and absent state. Requires physical-node and complete-chain qualification.
+
+`VLLM_HPU_DSV41_KV_REUSE_FUSION` (default `0`) combines C1 KV norm/RoPE, current SWA codec/write and the selected-main reuse gather in one handwritten TPC. The current slot consumes freshly encoded values directly, so no inter-TPC barrier or cache reload is required. Other rows retain the canonical packed read path. Head count is an operand shape; prefill, new main owners and decoded-cache consumers retain the reference. Physical-node and production-native component validation are required.
+
+`VLLM_HPU_DSV41_QKV_FUSED_PROLOGUE` defaults to `0`. The C1 candidate shares one handwritten TPC launch between Q norm/quantization and KV norm/RoPE/canonical SWA publication, then uses the existing TP-local FP8 Q projection and RoPE epilogue. It preserves the normalized Q row for index owners and all BF16/cache boundaries. When enabled it supersedes the overlapping isolated KV publication/reuse-gather producer; those savings must not be counted twice. Wider scheduler buckets and prefill retain the reference path. Combined formal acceptance is pending.
+
+`VLLM_HPU_DSV41_WOA_DENSE_HANDOFF=1` (experimental): combine the exact WOa scale/group32 boundary with WOb dynamic FP8 preparation on the common C1 output path. Prefill, already fused MLA/WOa projections and larger scheduler buckets retain their existing implementations. Pending complete-chain and combined serving qualification.
+
+`VLLM_HPU_DSV41_PEER_POST_NORM=0` (experimental): C1 attention peer sum, mHC residual update/collapse and FFN norm/FP8 preparation in one TPC node. The updated residual still feeds the ordinary FFN control/gates; MoE boundary and larger buckets retain the existing path. Implies deferred peer inputs under the existing TP communication contract. Pending complete-chain and combined serving qualification.
+
+`VLLM_HPU_DSV41_SHARED_COORDINATES` (default `0`) captures an experimental shared
+I32 coordinate producer in the first native decode group and threads its owned
+outputs through subsequent groups. Sampling continues to update canonical input
+roots. This is distinct from static coordinate factories; hardware qualification
+of the complete path is required before enabling it by default.
+
+`VLLM_HPU_DSV41_CANDIDATE_COORDINATES` (default `0`) combines candidate-block
+expansion, invalid-row masking and I32 safe gather addresses into one native
+producer for the decoded-key C1 Reindex path. The existing gather/MME consumer
+is retained. This candidate is independent of token-entry coordinates because
+candidate blocks depend on an earlier source layer in the same token.
+
+- `VLLM_HPU_DSV41_EXPERT_W2_THREE_ROUTES` (default `0`): experimental C1 six-route W13 with two three-route W2 SRAM groups and ordered shared finalization. Requires checkpoint-qualified SAT planes; C2–C6 and prefill retain their current operators. Enable only for the measured candidate until serving acceptance.
+
+- `VLLM_HPU_DSV41_MHC_DEFERRED_GATES` (default `1`): experimental common C1 path retaining the exact FP32 control/RRMS producer, carrying its owned 25-value output through attention/MoE, and consuming gates, fixed-rank peer sum and post/collapse in one handwritten TPC kernel. Requires prepared control weights and the BF16 collapse contract. It does not change prefill or C2–C6 dispatch. Numerical, physical-node and combined serving qualification are pending.
+
+`VLLM_HPU_DSV41_MAIN_MLA_PROJECTION=0` (experimental): shared-main C1 publish/reuse uses one hand-written PV BF16 rounding, inverse-RoPE and FP8 quantization consumer before the unchanged WOa/WOb MME projections. Selection ownership and cache publication remain unchanged. Pending production component and combined serving qualification.
+
+The qualified TP4 C1 entrypoint now defaults `COMPRESSOR_FUSED_PUBLISH`, `EXPERT_W2_THREE_ROUTES`, `QKV_FUSED_PROLOGUE`, `CANDIDATE_COORDINATES`, and `PEER_POST_COLLAPSE` to1 (each prefixed `VLLM_HPU_DSV41_`). `STATIC_COORDINATES` was already1 for the single-stage path. Raw library defaults remain conservative for direct component imports; the ordinary entrypoint applies the qualified topology defaults and respects explicit overrides. Archived `MAIN_MLA_PROJECTION`, `WOA_DENSE_HANDOFF`, `PEER_POST_NORM`, and `MHC_DEFERRED_GATES` stay0.
+
+
+`VLLM_HPU_DSV41_EXPERT_STREAMED_SAT=1`: checkpoint-qualified C1 MoE SAT decoder
+with expanded load/decode scheduling, scalar route scale and one-route SiLU.
+Retains the normal compiler slicing policy and the shared TP implementation.
+Enabled by default after combined official-sampling acceptance; C2–C6 retain their existing entry.
+
+`VLLM_HPU_DSV41_FFN_DUAL_QUANT=1`: emit the routed and shared expert FP8
+operands from one FFN norm kernel and one row maximum. Their distinct scale,
+rounding and subnormal rules remain separate. Applies where decode already
+uses the standalone FFN norm producer; fused mHC producers retain their path.
+Enabled by default after combined official-sampling acceptance.
+
+`VLLM_HPU_DSV41_MHC_LINEAR_LOAD=0`: exact BF16 load/linear FP32 conversion
+for the decode control GEMV/RRMS. Keeps FP32 weight and accumulation order,
+and avoids the explicit lane-permutation chain. Prefill remains unchanged.
+Default off pending combined mHC producer/consumer qualification.
+
+`VLLM_HPU_DSV41_MLA_VECTOR_CODEC=1`: use the existing exact BF16 vector
+codecs at 128 values per chunk inside shared-main MLA gather/decode. QK,
+softmax/sink, PV and their rounding remain unchanged; selected-row ownership
+and request lifetimes are unchanged. Combined official-sampling acceptance passed.
+
+
+`VLLM_HPU_DSV41_MLA_VECTOR_MASK=1`: C1 shared-main reuse mask copying in
+one vector producer. Requires `MLA_VECTOR_CODEC`; QK, softmax, PV and shared
+row ownership remain unchanged. Projection-fused consumers retain their path.
+Enabled by default after combined official-sampling acceptance.
+
+`VLLM_HPU_DSV41_MLA_PUBLISH_MASK=0`: C1 shared-main publication mask
+vectorization and power-of-two paging for the existing ratio1/2 contract.
+Requires `MLA_VECTOR_CODEC`. Selection and negative-page semantics are preserved.
+Default off until complete-chain qualification and combined serving acceptance.
+
+`VLLM_HPU_DSV41_MHC_PARALLEL_CONTROL=1`: C1 FP32 TPC control
+projection with independent K accumulators and shared RRMS. Takes precedence over
+`MHC_LINEAR_LOAD`; changes FP32 summation order and uses the official-equation
+numerical tolerance contract. Compatible with `MHC_DEFERRED_GATES`; prefill and
+C2–C6 keep the existing controller. Component and combined official-sampling serving qualification passed.
+
+- `VLLM_HPU_DSV41_FFN_BF16_QUANT` (default `1`): C1-only vector BF16 product/FP8 conversion
+  inside dual FFN norm quantization. Requires `FFN_DUAL_QUANT`; production-chain micro-qualified,
+  combined official-sampling acceptance passed. Prefill and multi-token decode retain their existing quantizer.
+
+- `VLLM_HPU_DSV41_INDEX_GAIN_REPLICA` (default `1`): cold rank-ordered BF16 index
+  head-gain weight replication. Removes only the gain exchange in C1 paged decode;
+  query weights stay sharded. Prefill and request-batch paths keep both exchanges.
+  Both TP2/TP4 layouts use the same implementation. Requires weight reload to change;
+  combined official-sampling serving qualification passed.
+
+- `VLLM_HPU_DSV41_MHC_BF16_CONTROL_WEIGHT` (default `0`): numerical C1 candidate
+  using cold BF16 controller weights and native BF16 products with FP32 accumulation.
+  Requires parallel control and deferred gates; excludes swizzled control weights.
+  The original FP32 weights remain available for wider batches and prefill.
+  Component checks use the upstream normalized-error limits and exact router IDs;
+  official-sampling serving quality and latency remain unqualified. Its small
+  component saving is an alternative to swizzled weights, not an additive gain.
+- `VLLM_HPU_DSV41_MHC_SWIZZLED_CONTROL` (default `1`): cold K128/head packing for
+  the C1 parallel FP32 controller. Requires `MHC_PARALLEL_CONTROL` and
+  `MHC_DEFERRED_GATES`. Adds one packed copy of each control weight; the ordinary
+  checkpoint layout remains for prefill and C2–C6. Combined formal qualification passed.
+
+- `VLLM_HPU_DSV41_MHC_RRMS_POST` (default `1`): specialize deferred C1 post/collapse
+  for the existing 25-value controller output. Uses its shared RMS statistic;
+  arithmetic is unchanged. Combined formal qualification passed.
+
+### VLLM_HPU_DSV41_MLA_REUSE_HW_CODEC
+
+Default: `1`. Component-qualified C1 reuse codec using hardware E4M3 conversion
+with exact finite-FN, NaN and zero corrections. Requires `MLA_VECTOR_CODEC` and
+`MLA_VECTOR_MASK`; publish and wider-batch paths retain their existing implementation.
+Combined end-to-end qualification passed.
+
+### VLLM_HPU_DSV41_MHC_GATE_PACKET
+
+Default: `1`. Serving-qualified gate-packet consumer for the common deferred
+mHC decode path. Reads the existing complete gate tensor with vector loads,
+retaining ordered peer summation, BF16 residual rounding and collapse. No
+communication, replay, sampling or precision interface changes. Requires the
+matching native operator artifact; combined serving acceptance passed.
+
+### VLLM_HPU_DSV41_MHC_COMM_GATES
+
+Default: `1`. Component-qualified scheduling candidate for the existing C1
+deferred mHC path. Computes exact gates after native peer submission, before
+the post consumer needs peer output. Requires `MHC_DEFERRED_GATES`,
+`MHC_GATES_FUSED`, `TP_MHC_OVERLAP`, and the native joint/static replay plan to
+realize overlap. Control precision and fixed-rank peer summation stay unchanged.
+Prefill and C2–C6 retain their current path. Combined official-sampling serving qualification passed. This adds a standalone gate node; no node-count
+reduction or end-to-end saving is claimed.
+
+### VLLM_HPU_DSV41_MLA_DECODED_SWA
+
+Default: `1`.
+C1 shared-main reuse can read the canonical publisher's BF16 decoded SWA layer
+slot, preserving FP32 softmax/PV and all quantization boundaries. The existing
+writer and request/cache state must supply a current owned mirror. When that
+mirror is unavailable, the shared packed reader remains selected; this flag
+adds no context-capacity cutoff. Publication and C2–C6 selection are unchanged.
+It composes with vector/mask/native-codec parents, but only reuse receives
+component gain credit. Normal installed serving and cache-state acceptance passed together.
+
+`VLLM_HPU_DSV41_EXPERT_ACTIVE_W2` defaults to`1`. With the qualified
+streamed SAT C1 parent, consume only the checkpoint's active W2 K extent after
+load-time zero-tail proof. W13 layout, padded SiLU amax and gate/up offset stay
+unchanged. Wider buckets and prefill retain the existing operator. A new native
+schema adds a cold integer`active_width` argument; replay/runner/communication
+interfaces are unchanged. Complete-chain and official-sampling serving qualification passed.
+
+`VLLM_HPU_DSV41_MHC_POSITIVE_GATES` defaults to `1`: component-qualified positive-denominator Sinkhorn reciprocal for decode; preserves20 iterations with FP32 accumulation, but is not bitwise-equivalent. Prefill retains its original gates. Combined serving quality/latency acceptance passed.
+
+`VLLM_HPU_DSV41_INDEX_QUERY_CODEC` defaults to `1`: shared decode
+RoPE plus exact group-32 FP4 query roundtrip, retaining the BF16 rounding
+boundary and signed zero. Accepts width128 and up to64 request rows; no
+context-length cutoff. Prefill keeps its existing path. Complete-chain and combined formal serving qualification passed.
+
+`VLLM_HPU_DSV41_INDEX_PREDICATE_PACK` defaults to `1`: exact
+predicate bit packing for the existing 16-pass ordered-key threshold search.
+The optional threshold-op variant0 preserves the reference; variant1 packs
+predicate bits without widening four predicate vectors. Selection metadata,
+ordered ties and the emit interface are unchanged. No semaphore polling or
+scalar readback is used. Native complete-consumer and combined serving qualification passed.
+
+`VLLM_HPU_DSV41_INDEX_WIDE_REINDEX` defaults to `1`: C1 decoded
+index mirror scoring submits the complete 2048-block candidate pool to the
+existing K128 MME/reducer once, retaining all candidate slots and device-valued
+masking. Other buckets and packed readers keep their current path. Full native
+producer/select/MLA microbenchmarks passed on four ranks with five fixtures;
+combined formal serving acceptance passed.
+
+`VLLM_HPU_DSV41_MLA_REGISTER_SOFTMAX` defaults to `0`: experimental exact
+640-row softmax with static score-vector names instead of dynamically indexed
+arrays. Shared publish/reuse ops accept an optional final
+`register_softmax=False`; previous argument lists keep their behavior. Projection
+and prefill entrypoints are unchanged. This needs the matching rebuilt native
+library. No replay, runner or communication API changed. Native timing remains
+unqualified; neither simulator instruction counts nor raw graph counts are
+latency evidence.
+
+`VLLM_HPU_DSV41_SAMPLING_THRESHOLD` (default `1`) is a bounded-sampler selector. It screens512 candidates with the shared index threshold/emit kernels, then sorts their original F32 scores to obtain the local Top128. A device coverage check requires at least128 scores strictly above the coarse cutoff; otherwise the existing full-vocabulary repair uses the same random draw. The full partition function is unchanged. Selection coordinates are allocated once at tail construction. Vocabulary shards must fit the selector's private key cache; no TP-size-specific implementation or context-length cutoff is introduced. Complete-chain and combined serving qualification passed.
+
+`VLLM_HPU_DSV41_SAMPLING_FUSED_PACKET` (default `1`) is a shared sampling consumer. Three handwritten TPC kernels perform packet layout, nucleus retention/certification and ID selection; the original FP32 sort, exponentials, full partition function and both cumsums remain unchanged. The certificate uses I32 0/1 in the existing scalar status ABI. No host upload, RNG change or communication interface change is introduced. Component and combined serving qualification passed.
+
+`VLLM_HPU_DSV41_SAMPLING_SHARED_MAX` (default `1`) reuses one full-vocabulary max/index reduction for the local packet's maximum and greedy ID. It shares the existing sampler, temperature handling and probability arithmetic. Component and combined serving qualification passed; it introduces no request-length condition.
+
+The C1 defaults above were qualified together through the ordinary installed
+service, with official sampling, complete warmup, a cache-miss prompt and natural
+EOS. Their shape, checkpoint and state eligibility guards still apply. Explicit
+`0` values remain diagnostic disable controls. Unqualified alternatives, including
+linear-load control, BF16 control weights and register softmax,
+remain off. Replay, runner and peer-communication interfaces are unchanged.
+
+`VLLM_HPU_DSV41_EXPERT_SHARED_SCALE` defaults to `1`. This serving-qualified
+candidate consumes the raw shared-expert BF16 down-projection and its FP32
+activation/channel scales inside the ordered routed-expert finalizer. It retains
+the scale-first BF16 rounding and shared/routed BF16 addition boundaries.
+It requires the existing C1 streamed SAT, active-W2 and three-route-W2 path with
+FP8 shared weights. Other batch and prefill paths retain their existing implementation.
+Combined normal-serving acceptance passed; explicit `0` remains a diagnostic disable control.
+
+`VLLM_HPU_DSV41_MHC_POST_NORM_STATS` (default `1`) enables serving-qualified peer/post statistics and feature-parallel FFN normalization with both quantizers. The existing next mHC controller remains independent. Serving selection is limited to the BF16 dual-quant single-row decode contract; prefill and larger batches retain their existing paths. End-to-end qualification passed.
+
+`VLLM_HPU_DSV41_NATIVE_MEMORY_READY` (default `0`) enables the experimental
+NIC-ready first-reader for ordinary single-row decode FFN entries. It requires
+the manifest-pinned acquiring operator, matching native HCL/Synapse memory-ready
+interfaces and an immutable cold admission buffer. Root reset is isolated before
+communication; the actual first payload reader polls the device flag and retains
+ordered arithmetic. A timeout propagates through the existing invalid-token
+certificate. Full communication retirement remains required. Shared-coordinate
+plans are excluded; prefill, DSpark and wider buckets retain their existing path.
+Combined serving correctness passed, but the experimental switches remain off
+because the combined latency reduction did not meet the promotion gate.

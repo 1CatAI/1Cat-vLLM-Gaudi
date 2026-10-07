@@ -43,9 +43,11 @@ def trace_phase(function):
             request = next(iter(scheduled.num_scheduled_tokens), "")
             rank = torch.distributed.get_rank()
             packed = self.pp.packed
+            model = getattr(self, "model", None)
+            tp_size = getattr(model, "tensor_parallel_size", 2)
             _context.set(
                 dict(rank=rank,
-                     stage=rank // 2,
+                     stage=getattr(model, "pp_rank", rank // tp_size),
                      generation=self.pp.generation + 1,
                      request=hashlib.sha256(request.encode()).hexdigest()[:16],
                      next_packet_slot=packed.generation % len(packed.packets) if packed else None))
@@ -57,6 +59,11 @@ def trace_phase(function):
         # Missing native identifiers stay null; host context does not prove
         # ownership of a device stall or completion of a collective.
         name = phase_name(fields)
+        if os.environ.get("VLLM_HPU_DSV41_RAW_TRACE", "0") == "1":
+            from vllm_gaudi.ops.deepseek_v41_native_trace import scope
+
+            with scope(name):
+                return function(self, *args, **kwargs)
         with torch.profiler.record_function(name):
             return function(self, *args, **kwargs)
 

@@ -11,7 +11,15 @@ from vllm_gaudi.compilation.deepseek_v41_overlap import (
     deduplicate_float_casts,
     independent_mhc_nodes,
     split_mhc_consumers,
+    require_candidate_operators,
 )
+
+
+def test_candidate_activation_is_checked_on_the_graph():
+    graph = make_fx(lambda x: torch.sigmoid(x))(torch.ones(1))
+    assert require_candidate_operators(graph, ['aten.sigmoid']) == {'aten.sigmoid': 1}
+    with pytest.raises(RuntimeError, match='did not activate'):
+        require_candidate_operators(graph, ['custom_deepseek_v41_expert_n256_moe_prequant_direct_finalize_slots'])
 
 
 @torch.library.custom_op("dsv41_overlap_test::deepseek_v41_control_gemv", mutates_args=())
@@ -109,6 +117,52 @@ def test_dependent_control_cannot_be_hoisted():
     assert not independent_mhc_nodes(child, [0, 3])
 
 
+@torch.library.custom_op("dsv41_overlap_test::deepseek_v41_mhc_gates_f32", mutates_args=())
+def gates_only(projection: torch.Tensor, scale: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
+    return torch.sigmoid(projection * scale + base)
+
+
+@gates_only.register_fake
+def _(projection, scale, base):
+    return torch.empty_like(projection)
+
+
+def _gate_consumer(projection, scale, base, peer):
+    gates = gates_only(projection, scale, base)
+    return (peer.float() + gates[:, :peer.shape[1]]).bfloat16(), gates
+
+
+@pytest.mark.parametrize("tokens", [1, 2, 6])
+def test_gate_only_recipe_runs_before_its_peer_consumer(tokens):
+    projection = torch.randn(tokens, 24)
+    scale, base = torch.ones(24), torch.randn(24)
+    partial = torch.randn(tokens, 8).bfloat16()
+    child = make_fx(_gate_consumer)(projection, scale, base, partial)
+    root = torch.nn.Module()
+    root.add_module("consumer", child)
+    graph = torch.fx.Graph()
+    p, s, b, v = (graph.placeholder(name) for name in ("projection", "scale", "base", "partial"))
+    peer = graph.call_function(torch.ops.dsv41_overlap_test.exchange.default, (v,))
+    result = graph.call_module("consumer", (p, s, b, peer))
+    first = graph.call_function(operator.getitem, (result, 0))
+    second = graph.call_function(operator.getitem, (result, 1))
+    graph.output((first, second))
+    source = torch.fx.GraphModule(root, graph)
+    candidate = copy.deepcopy(source)
+    audit = split_mhc_consumers(candidate, torch.ops.dsv41_overlap_test.exchange.default)
+    assert len(audit) == 1
+    assert any("mhc_gates_f32" in name for name in audit[0]["operators"])
+    calls = [node for node in candidate.graph.nodes if node.op == "call_module"]
+    assert len(calls) == 2
+    assert not any(arg.target == torch.ops.dsv41_overlap_test.exchange.default for arg in calls[0].all_input_nodes)
+    for seed in range(5):
+        torch.manual_seed(seed)
+        values = torch.randn_like(projection), scale, base, torch.randn_like(partial)
+        assert all(torch.equal(a, b) for a, b in zip(source(*values), candidate(*values)))
+    # A gate using peer-derived projection cannot bypass the collective wait.
+    assert not independent_mhc_nodes(child, [0, 3])
+
+
 @pytest.mark.parametrize("name", ["control_batch4", "control_prefetch"])
 def test_batch_control_keeps_independent_work_before_peer_consumer(name):
     source = _graph()
@@ -175,3 +229,32 @@ def test_residual_and_flat_control_share_exact_float_conversion():
     assert sum(n.target == torch.ops.aten._to_copy.default for n in candidate.graph.nodes) == 1
     for value in (r, r * 0, r * 16):
         assert all(torch.equal(a, b) for a, b in zip(original(value), candidate(value)))
+
+
+def _register_controller_variant(name):
+    @torch.library.custom_op(f"dsv41_overlap_test::{name}", mutates_args=())
+    def project(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.linear(value, weight)
+
+    @project.register_fake
+    def _(value, weight):
+        return value.new_empty(value.shape[0], weight.shape[0])
+
+    return project
+
+
+_controller_variants = [_register_controller_variant(name) for name in (
+    'deepseek_v41_control_rrms_unpack', 'deepseek_v41_control_rrms_parallel',
+    'deepseek_v41_control_rrms_swizzled',
+    'deepseek_v41_control_mme_f32')]
+
+
+@pytest.mark.parametrize('project', _controller_variants)
+def test_controller_variants_keep_residual_only_overlap(project):
+    value, weight, peer = torch.randn(1, 32), torch.randn(24, 32), torch.randn(1, 24)
+    graph = make_fx(lambda x, w, p: project(x, w) + p)(value, weight, peer)
+    selected = independent_mhc_nodes(graph, [2])
+    assert any('control_' in str(node.target) for node in selected)
+    assert all('aten.add' not in str(node.target) for node in selected)
+    dependent = make_fx(lambda x, w, p: project(x + p, w))(value, weight, value)
+    assert independent_mhc_nodes(dependent, [2]) == set()

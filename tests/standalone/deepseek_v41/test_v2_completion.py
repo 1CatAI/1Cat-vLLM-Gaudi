@@ -23,6 +23,114 @@ class Done:
             raise RuntimeError("not ready")
 
 
+@pytest.mark.parametrize("position", [127, 16384, 131072, 524287])
+@pytest.mark.parametrize("temperature", [0., 1.])
+def test_tail_next_position_is_independent_of_candidate_certificate(position, temperature):
+    from vllm_gaudi.models.deepseek_v41_program import PreparedGreedyTail
+
+    logits = torch.linspace(-1, 1, 512).reshape(1, -1)
+    owner = SimpleNamespace(
+        _head_projection=lambda hidden: logits, device_sampling=True, device_next_position=True,
+        sampling_threshold=False, sampling_fused_packet=False, sampling_shared_max=False,
+        sampling_params=torch.tensor([[temperature, .95, -1.]]),
+        sampling_seed=torch.tensor([42], dtype=torch.int32),
+        sampling_origin=torch.tensor([position - 1], dtype=torch.int32), tp_rank=0,
+        all_gather=lambda packet, dim: torch.cat([packet] * 4, dim),
+    )
+    positions = torch.tensor([position], dtype=torch.int32)
+    payload = PreparedGreedyTail.forward(owner, torch.empty(1, 5120), positions)
+    assert len(payload) == 5
+    assert payload[4].dtype == torch.int32 and payload[4].tolist() == [position + 1]
+    assert positions.tolist() == [position]
+    assert payload[4].data_ptr() != positions.data_ptr()
+    if temperature:
+        # Duplicate candidate scores force exact full fallback, while the
+        # continuation coordinate remains valid and token independent.
+        assert (payload[0] & 1).item() == 0
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_sampler_shutdown_drains_before_retirement_and_is_idempotent(failed):
+    from concurrent.futures import Future
+
+    runner = object.__new__(V41V2ModelRunner)
+    future = Future()
+    calls = []
+    if failed:
+        future.set_exception(RuntimeError("repair failed"))
+    else:
+        future.set_result(42)
+    runner._sampling_completion_future = future
+    runner._sampling_completion_executor = SimpleNamespace(shutdown=lambda **kwargs: calls.append(kwargs))
+    if failed:
+        with pytest.raises(RuntimeError, match="repair failed"):
+            runner.prepare_shutdown()
+    else:
+        runner.prepare_shutdown()
+    assert calls == [{"wait": True}]
+    assert runner._sampling_completion_future is None
+    runner.prepare_shutdown()
+    assert calls == [{"wait": True}]
+
+
+@pytest.mark.parametrize("value", ["11-14;16-19", "11,12,13,14;16,17,18,19", "11,13-14;19,16-18"])
+def test_sampling_helper_uses_shared_cpu_list_and_range_parser(monkeypatch, value):
+    from vllm_gaudi.v1.worker.deepseek_v41_v2_runner import sampling_completion_helper_cpu
+
+    monkeypatch.setenv("VLLM_HPU_DSV4_WORKER_HELPER_CPUS", value)
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    assert sampling_completion_helper_cpu() == 16
+    monkeypatch.setenv("LOCAL_RANK", "2")
+    assert sampling_completion_helper_cpu() is None
+
+
+@pytest.mark.parametrize("decode_start", [None, 16384])
+def test_sampling_admission_uploads_once_including_startup_request(decode_start):
+    runner = object.__new__(V41V2ModelRunner)
+    program = SimpleNamespace(device_sampling=True, sampling_params=torch.zeros(1, 3),
+                              sampling_seed=torch.zeros(1, dtype=torch.int32),
+                              sampling_counter=torch.zeros(1, dtype=torch.int32),
+                              sampling_origin=torch.zeros(1, dtype=torch.int32))
+    runner.model = SimpleNamespace(program=program)
+    runner.v2_completion = True
+    request = SimpleNamespace(req_id="admission", output=[], sampling_params=SimpleNamespace(
+        temperature=1., top_p=.95, top_k=-1, seed=42))
+    if decode_start is not None:
+        request.decode_start = decode_start
+    runner._prepare_device_sampling_request(request)
+    assert program.sampling_seed.item() == 42
+    assert program.sampling_origin.item() == (decode_start - 1 if decode_start is not None else 0)
+    program.sampling_counter.fill_(7)
+    program.sampling_origin.fill_(123)
+    runner._prepare_device_sampling_request(request)
+    assert program.sampling_counter.item() == 7
+    assert program.sampling_origin.item() == 123
+
+
+@pytest.mark.parametrize("covered", [False, True])
+def test_sync_sampling_repairs_before_publishing_token(covered):
+    runner = object.__new__(V41V2ModelRunner)
+    runner._v2_async_step = False
+    request = SimpleNamespace(req_id="sync", decode_start=1, output=[])
+    selected = torch.tensor([[11]], dtype=torch.int32)
+    status = torch.tensor([[22 + int(covered)]], dtype=torch.int32)
+    payload = status, torch.zeros(1, 4), torch.zeros(1, 4), selected
+    runner._device_sampling_payload = payload
+    runner.pending = request, 1, 1, 1, False, True, selected
+    runner.tp4_token_readback = lambda value: (value, Done())
+    runner._token_copy = None
+    runner.pp = SimpleNamespace(device_commit_enabled=False, group=SimpleNamespace(is_last_rank=True),
+                                finish_single=lambda count, token: (count, [token]))
+    runner.model = SimpleNamespace(complete_step=lambda count: None)
+    repairs = []
+    runner._repair_device_sample = lambda value, destination: repairs.append(value) or 19
+    result = runner._sample_single()
+    assert result.sampled_token_ids == [[11 if covered else 19]]
+    assert request.output == [11 if covered else 19]
+    assert repairs == ([] if covered else [payload])
+    assert runner._device_sampling_payload is None
+
+
 @pytest.mark.parametrize("tp_size,pp_size", [(2, 2), (4, 1)])
 def test_shared_v2_configuration_accepts_complete_native_dependencies(monkeypatch, tp_size, pp_size):
     from vllm_gaudi.ops.deepseek_v41_config import validate_v2
@@ -316,6 +424,73 @@ def test_device_engram_precedes_prefix_and_host_token_wait(monkeypatch):
     assert runner._prefix_started == ("a", 2, 1)
 
 
+@pytest.mark.parametrize("covered", [False, True])
+@pytest.mark.parametrize("device_position", [False, True])
+def test_sampling_stages_only_independent_inputs_before_certifying_prefix(monkeypatch, covered, device_position):
+    for suffix in ("EARLY_INPUT_COMMIT", "SEGMENTED_PREFIX", "DEVICE_ENGRAM"):
+        monkeypatch.setenv("VLLM_HPU_DSV41_V2_" + suffix, "1")
+    runner, calls = fixture()
+    runner.pp.group = SimpleNamespace(is_first_rank=True)
+    runner.position_views = {1: torch.empty(1, dtype=torch.int32)}
+    runner.position_bank = SimpleNamespace(copy_into=lambda *args: calls.append(("position",)))
+    runner._prefix_authorized = lambda *args: True
+    runner._sampling_prefix_handoff = True
+    monkeypatch.setattr("vllm_gaudi.v1.worker.deepseek_v41_v2_runner.time.sleep",
+                        lambda value: calls.append(("handoff", value)))
+
+    class OrderedDone:
+        def synchronize(self):
+            calls.append(("certificate",))
+
+    runner.model = SimpleNamespace(
+        tensor_parallel_size=4,
+        complete_step=lambda count: calls.append(("model", count)),
+        prepare_device_engram=lambda *args: calls.append(("device_engram",)),
+        begin_decode_prefix=lambda *args: calls.append(("prefix",)),
+    )
+    runner._completion = CompletionRecord(
+        "a", 2, 1, torch.tensor([[22 + int(covered)]]), OrderedDone(), runner.pp.commit_token,
+        lambda: calls.append(("repair",)) or 19,
+        torch.tensor([2], dtype=torch.int32) if device_position else None,
+    )
+    runner._consume_completion(SimpleNamespace())
+    assert [row[0] for row in calls] == (
+        ["model"] + ([] if device_position else ["position"]) + ["certificate"] + ([] if covered else ["repair"])
+        + ["device_engram", "prefix", "handoff", "packet"]
+    )
+    assert runner.requests["a"].output[-1] == (11 if covered else 19)
+    if device_position:
+        assert runner._next_position[:2] == ("a", 2)
+        assert runner._next_position[2].tolist() == [2]
+    else:
+        assert runner._next_position is None
+
+
+@pytest.mark.parametrize("policy,before,handoff", [
+    ("original", True, False), ("prepare", False, False),
+    ("yield", True, True), ("combined", False, True),
+])
+def test_private_continuation_control_requires_retired_request(monkeypatch, policy, before, handoff):
+    from vllm_gaudi.v1.worker.hpu_worker import HPUWorker
+
+    worker = object.__new__(HPUWorker)
+    runner = SimpleNamespace(model=SimpleNamespace(program=SimpleNamespace(device_sampling=True), tp_rank=1),
+                             _completion=None, _prefix_started=None, active_request=None)
+    worker.model_runner = runner
+    monkeypatch.setenv("VLLM_SERVER_DEV_MODE", "0")
+    with pytest.raises(RuntimeError, match="development endpoints"):
+        worker.set_decode_continuation_diagnostic(policy)
+    monkeypatch.setenv("VLLM_SERVER_DEV_MODE", "1")
+    runner.active_request = "live"
+    with pytest.raises(RuntimeError, match="retirement"):
+        worker.set_decode_continuation_diagnostic(policy)
+    assert not hasattr(runner, "_sampling_prefix_handoff")
+    runner.active_request = None
+    assert worker.set_decode_continuation_diagnostic(policy)["gpu_plan_changed"] is False
+    assert runner._certificate_before_staging == before
+    assert runner._sampling_prefix_handoff == handoff
+
+
 def test_new_search_bucket_captures_complete_plan_before_segmenting(monkeypatch):
     monkeypatch.setenv("VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT", "1")
     monkeypatch.setenv("VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX", "1")
@@ -473,3 +648,81 @@ def test_device_engram_skips_only_matching_host_layer1(monkeypatch):
     decode = Host("decode")
     model(decode).prepare_step("decode", [12], is_decode=True)
     assert decode.calls == [("prepare", "decode", [12], [False], True, True)]
+
+
+def test_covered_sampling_certificate_does_not_repair():
+    repaired = []
+    record = CompletionRecord('a', 1, 16, torch.tensor([[63]], dtype=torch.int32), Done(),
+                              torch.tensor([31]), lambda: repaired.append(1))
+    assert record.token() == 31
+    assert record.token() == 31
+    assert not repaired
+
+
+def test_sampling_repair_runs_once_across_two_consumers():
+    from concurrent.futures import ThreadPoolExecutor
+
+    calls = []
+    record = CompletionRecord('a', 1, 16, torch.tensor([[62]], dtype=torch.int32), Done(),
+                              torch.tensor([31]), lambda: calls.append(1) or 47)
+    with ThreadPoolExecutor(2) as pool:
+        results = list(pool.map(lambda _: record.token(), range(16)))
+    assert results == [47] * 16 and calls == [1]
+
+
+def test_sampling_bad_certificate_is_rejected():
+    record = CompletionRecord('a', 1, 16, torch.tensor([[31, 2]], dtype=torch.int32), Done(),
+                              torch.tensor([31]), lambda: 47)
+    with pytest.raises(RuntimeError, match='certificate'):
+        record.token()
+
+
+def test_native_sampling_warmup_exercises_completion_and_same_draw_full_fallback():
+    runner = object.__new__(V41V2ModelRunner)
+    selected = torch.tensor([[31]], dtype=torch.int32)
+    payload = torch.tensor([[62]], dtype=torch.int32), torch.zeros(1, 4), torch.zeros(1, 4), selected
+    runner.model = SimpleNamespace(tp_rank=0, program=SimpleNamespace(
+        replay_owner=SimpleNamespace(sampling_tail_values=lambda hidden: payload)))
+    runner._device_sampling_owner = (123, 'warm', 1., 1., -1, 42)
+    runner.device_sampling_stats = {'warm': {'fallbacks': 0}}
+    calls = []
+
+    def sample():
+        assert runner.pending[-1] is selected
+        assert runner._device_sampling_payload is payload and runner._v2_async_step
+        runner.device_sampling_stats['warm']['fallbacks'] += 1
+        runner._completion = SimpleNamespace(token=lambda: 47)
+        calls.append('completion')
+
+    def full(local, controls, *, filtered):
+        assert local is payload[1] and controls is payload[2]
+        calls.append('filtered-native-repair' if filtered else 'same-draw-reference')
+        return torch.tensor([[47]], dtype=torch.int32)
+
+    runner._sample_single = sample
+    runner._sample_full_local = full
+    runner.tp4_token_readback = lambda value: (value, Done())
+    runner._validate_device_sampling_warmup(torch.zeros(1, 4))
+    runner._validate_device_sampling_warmup(torch.zeros(1, 4))
+    assert calls == ['completion', 'same-draw-reference', 'filtered-native-repair']
+    assert runner.pending is None and runner._completion is None and not runner._v2_async_step
+
+
+@pytest.mark.parametrize('top_p,top_k,filtered', [(.95, -1, True), (1., -1, False), (1., 4, True)])
+def test_sampling_repair_retains_original_filter_mode(top_p, top_k, filtered):
+    runner = object.__new__(V41V2ModelRunner)
+    runner._device_sampling_owner = (123, 'repair', 1., top_p, top_k, 42)
+    runner.device_sampling_stats = {'repair': {'fallbacks': 0}}
+    runner.audit = {}
+    local, controls = torch.zeros(1, 4), torch.zeros(1, 4)
+    destination = torch.tensor([[31]], dtype=torch.int32)
+
+    def full(value, params, *, filtered):
+        assert value is local and params is controls
+        assert filtered == (top_p < 1 or top_k > 0)
+        return torch.tensor([[47]], dtype=torch.int32)
+
+    runner._sample_full_local = full
+    runner.tp4_token_readback = lambda value: (value, Done())
+    assert runner._repair_device_sample((torch.zeros(1, 1), local, controls, destination), destination) == 47
+    assert destination.item() == 47 and runner.device_sampling_stats['repair']['fallbacks'] == 1

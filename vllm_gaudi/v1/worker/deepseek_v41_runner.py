@@ -26,6 +26,7 @@ from vllm_gaudi.extension.logger import logger as init_logger
 from vllm_gaudi.extension.profiler import HabanaHighLevelProfiler
 from vllm_gaudi.ops.deepseek_v41_config import decode_source_prefix_bound
 from vllm_gaudi.ops.deepseek_v41_indexer import INDEX_MME_HOT_TOKENS
+from vllm_gaudi.ops.deepseek_v41_diagnostics import trace_phase
 from vllm_gaudi.ops.deepseek_v41_state import PagedStageState, StageStateBlocks, register_state_spec
 from vllm_gaudi.ops.deepseek_v41_verify import (
     AsyncDeviceOutput,
@@ -1161,12 +1162,87 @@ class V41ModelRunner:
             "V4.1 PP%d prepared weights loaded; allocated %d bytes", self.model.pp_rank, self.model_memory_usage
         )
 
+    def _prepare_device_sampling_request(self, request):
+        program = getattr(self.model, "program", None)
+        if not getattr(program, "device_sampling", False):
+            return
+        if not getattr(self, "v2_completion", False):
+            raise ValueError("Device sampling requires the asynchronous C1 completion owner")
+        params = request.sampling_params
+        owner = (id(request), request.req_id, params.temperature, params.top_p, params.top_k, params.seed)
+        if getattr(self, "_device_sampling_owner", None) == owner:
+            return
+        import hashlib
+
+        seed = (int(params.seed) if params.seed is not None else
+                int.from_bytes(hashlib.blake2b(request.req_id.encode(), digest_size=4).digest(), "little"))
+        seed &= 0xffffffff
+        seed = seed - 2**32 if seed >= 2**31 else seed
+        # Request admission is the sole host-to-device parameter upload. The
+        # replay derives the draw ordinal from its device position input;
+        # neither pinned staging nor an HPU event is created in the token loop.
+        program.sampling_params.copy_(torch.tensor([[params.temperature, params.top_p, params.top_k]]))
+        program.sampling_seed.copy_(torch.tensor([seed], dtype=torch.int32))
+        program.sampling_counter.copy_(torch.tensor([len(request.output)], dtype=torch.int32))
+        # Synthetic startup requests have no decode boundary. Their origin is
+        # zero; a real request replaces it once at admission.
+        prompt_length = len(request.prompt) if hasattr(request, "prompt") else getattr(request, "decode_start", 1)
+        program.sampling_origin.copy_(torch.tensor([prompt_length - 1], dtype=torch.int32))
+        if not hasattr(self, "device_sampling_stats"):
+            self.device_sampling_stats = {}
+        self.device_sampling_stats.setdefault(request.req_id, dict(bounded_steps=0, fallbacks=0))
+        self._device_sampling_owner = owner
+
+    def _sample_full_local(self, local, controls, *, filtered):
+        from functools import partial
+        from vllm_gaudi.ops.deepseek_v41_sampling import sample_probabilities
+
+        logits = self.model.program.all_gather(local, dim=-1)
+        key = local.shape[0], filtered
+        if key not in self.stochastic_samplers:
+            self.stochastic_samplers[key] = torch.compile(
+                partial(sample_probabilities, filtered=filtered), backend=self.sampling_backend,
+                fullgraph=True, dynamic=False
+            )
+        return self.stochastic_samplers[key](logits, controls)
+
+    @torch.inference_mode()
+    def _repair_device_sample(self, payload, destination):
+        _, local, controls, _ = payload[:4]
+        owner = self._device_sampling_owner
+        selected = self._sample_full_local(local, controls, filtered=owner[3] < 1 or owner[4] > 0)
+        destination.copy_(selected)
+        host, done = self.tp4_token_readback(destination)
+        done.synchronize()
+        self.audit["device_sampling_fallbacks"] = self.audit.get("device_sampling_fallbacks", 0) + 1
+        self.device_sampling_stats[self._device_sampling_owner[1]]["fallbacks"] += 1
+        return int(host[0, 0])
+
+    @trace_phase
     def _sample_requests(self, hidden, requests, *, replay=None):
         from functools import partial
         from vllm_gaudi.ops.deepseek_v41_sampling import request_uniform, sample_probabilities
 
         batch = hidden.shape[0]
         filtered = any(req.sampling_params.top_p < 1 or req.sampling_params.top_k > 0 for req in requests)
+        if getattr(self.model.program, "device_sampling", False) and batch == 1:
+            self._prepare_device_sampling_request(requests[0])
+            values = replay.sampling_tail_values(hidden) if replay is not None else None
+            if values is not None:
+                self.device_sampling_stats[requests[0].req_id]["bounded_steps"] += 1
+                self._device_sampling_payload = values
+                return values[3]
+            from vllm_gaudi.ops.deepseek_v41_sampling import device_sampling_draw
+
+            if not hasattr(self, "device_sampling_draw"):
+                self.device_sampling_draw = torch.compile(
+                    device_sampling_draw, backend=self.sampling_backend, fullgraph=True, dynamic=False
+                )
+            program = self.model.program
+            controls = self.device_sampling_draw(
+                program.sampling_params, program.sampling_seed, program.sampling_counter
+            )
+            return self._sample_full_local(self.sample_local_head(hidden), controls, filtered=filtered)
         if batch not in self.sampling_buffers:
             host = torch.zeros(batch, 4, dtype=torch.float32).pin_memory("hpu")
             device = torch.empty_like(host, device=self.device)
@@ -1330,12 +1406,17 @@ class V41ModelRunner:
         if self.active_request == req_id:
             self.active_request = None
 
+    @trace_phase
     def _update(self, scheduled):
         if self.request_slots_enabled:
             for req_id in getattr(scheduled, "preempted_req_ids", None) or ():
                 self._release_batch_state(req_id)
                 self.audit["batch_preemptions"] = self.audit.get("batch_preemptions", 0) + 1
         for req_id in scheduled.finished_req_ids:
+            sampling = getattr(self, "device_sampling_stats", {}).pop(req_id, None)
+            if sampling is not None:
+                logger.info("V4.1 sampling completion TP%d: %s", self.model.tp_rank,
+                            json.dumps(dict(request_id=req_id, **sampling)))
             if self.verify_timing:
                 self.verify_timing.flush()
             records = self.verify_records.pop(req_id, None)
@@ -1466,6 +1547,11 @@ class V41ModelRunner:
         # intentionally owns just the persistent captured view.
         ids = self.input_views[count] if count in self.input_views else self.input_ids[:count]
         positions = self.position_views[count] if count in self.position_views else self.positions[:count]
+        device_position = getattr(self, "_next_position", None)
+        continuing_position = (decode and count == 1 and not reset and device_position is not None
+                               and device_position[:2] == (request_id, start))
+        if continuing_position:
+            positions = device_position[2]
         # A scheduler may feed a normal prompt one token at a time.  The
         # resulting model transaction has exactly the same C1 tensor geometry
         # and cache writes as decode; only sampling/commit semantics remain
@@ -1593,7 +1679,11 @@ class V41ModelRunner:
                     ids.copy_(self._next_input[2])
             else:
                 ids.copy_(torch.tensor(tokens, dtype=ids.dtype, device="cpu"))
-            if self.position_bank is not None and graph_c1:
+            if continuing_position:
+                # The previous native tail produced this row. Bind it as the
+                # next fixed input; no external position-copy recipe is needed.
+                pass
+            elif self.position_bank is not None and graph_c1:
                 if getattr(self.model, "tensor_parallel_size", 2) == 4:
                     if not self.model.decode_prefix_pending:
                         self.position_bank.copy_into(positions, start)
@@ -1911,6 +2001,7 @@ class V41ModelRunner:
         )
 
     @torch.inference_mode()
+    @trace_phase
     def execute_model(self, scheduled):
         if self.pending is not None:
             raise RuntimeError("Previous V4.1 execution has not completed sampling/verify")
@@ -1992,6 +2083,7 @@ class V41ModelRunner:
         self.pending = "batch_ready"
         return None
 
+    @trace_phase
     def _execute_request(self, scheduled, req_id, count):
         if self.round_timing_enabled:
             self.round_context = dict(
@@ -2002,6 +2094,8 @@ class V41ModelRunner:
             )
         request = self.requests[req_id]
         self._bind_request(request)
+        self._prepare_device_sampling_request(request)
+        self._device_sampling_payload = None
         start = request.num_computed_tokens
         proposed = scheduled.scheduled_spec_decode_tokens.get(req_id, [])
         if proposed and not self.use_dspark:
@@ -2215,7 +2309,17 @@ class V41ModelRunner:
         device_commit = device_commit_enabled and need_sample and start >= request.decode_start
         token = None
         if self.pp.group.is_last_rank and need_sample and not device_commit:
-            if self._token_copy is not None:
+            payload = getattr(self, "_device_sampling_payload", None)
+            if payload is not None:
+                host, done = self.tp4_token_readback(payload[0])
+                done.synchronize()
+                from vllm_gaudi.ops.deepseek_v41_sampling import unpack_sample_status
+
+                token, covered = unpack_sample_status(host[0].tolist())
+                if not covered:
+                    token = self._repair_device_sample(payload, selected)
+                self._device_sampling_payload = None
+            elif self._token_copy is not None:
                 host, done = self._token_copy
                 done.synchronize()
                 token = int(host[0, 0])
@@ -2254,6 +2358,13 @@ class V41ModelRunner:
             self.audit["target_steps"],
         )
         self.state.clear()
+        if (native and tokens == 1 and getattr(self.model.program, "device_sampling", False)
+                and not getattr(self, "_device_sampling_completion_warmed", False)):
+            from types import SimpleNamespace
+
+            request = SimpleNamespace(req_id='__v41_sampling_warmup__', output=[],
+                                      sampling_params=SimpleNamespace(temperature=1., top_p=1., top_k=-1, seed=42))
+            self._prepare_device_sampling_request(request)
         hidden = self._forward(
             "__v41_warmup__",
             [1 + index for index in range(tokens)],
@@ -2330,6 +2441,8 @@ class V41ModelRunner:
                             request = SimpleNamespace(req_id='__v41_sampling_warmup__',
                                                       sampling_params=params, output=[])
                             self._sample_requests(hidden[-1:], (request,))
+                    if native and tokens == 1 and getattr(self.model.program, "device_sampling", False):
+                        self._validate_device_sampling_warmup(hidden[-1:])
         self.pp.drain()
         self.model.complete_step(tokens)
         torch.hpu.synchronize()

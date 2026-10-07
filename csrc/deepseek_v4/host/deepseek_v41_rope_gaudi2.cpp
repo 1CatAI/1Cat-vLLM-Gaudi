@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "deepseek_v41_rope_gaudi2.hpp"
 #include <cstring>
+extern unsigned char _binary___deepseek_v41_index_query_rope_fp4_bf16_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_index_query_rope_fp4_bf16_gaudi2_o_end;
 extern unsigned char _binary___deepseek_v41_rope_bf16_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_rope_bf16_gaudi2_o_end;
 extern unsigned char _binary___deepseek_v41_rope_inverse_bf16_gaudi2_o_start;
@@ -10,7 +12,7 @@ extern unsigned char _binary___deepseek_v41_prefill_rope_bf16_gaudi2_o_end;
 extern unsigned char _binary___deepseek_v41_prefill_rope_inverse_bf16_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_prefill_rope_inverse_bf16_gaudi2_o_end;
 tpc_lib_api::GlueCodeReturn DeepseekV41RopeGaudi2::GetKernelName(char name[tpc_lib_api::MAX_NODE_NAME]) {
-    std::strcpy(name, prefill_ ? (inverse_ ? "custom_deepseek_v41_prefill_rope_inverse_bf16_gaudi2"
+    std::strcpy(name, index_codec_ ? "custom_deepseek_v41_index_query_rope_fp4_bf16_gaudi2" : prefill_ ? (inverse_ ? "custom_deepseek_v41_prefill_rope_inverse_bf16_gaudi2"
                                          : "custom_deepseek_v41_prefill_rope_bf16_gaudi2")
                                : (inverse_ ? "custom_deepseek_v41_rope_inverse_bf16_gaudi2"
                                            : "custom_deepseek_v41_rope_bf16_gaudi2"));
@@ -31,6 +33,8 @@ tpc_lib_api::GlueCodeReturn DeepseekV41RopeGaudi2::GetGcDefinitions(
        !x.maxSizes[1] || x.maxSizes[1]>128 || !x.maxSizes[2] || x.maxSizes[2]>(prefill_ ? 16384 : 64) ||
        p.dims!=1 || p.maxSizes[0]!=x.maxSizes[2] || t.dims!=2 || t.maxSizes[0]!=64 || !t.maxSizes[1])
         return GLUE_INCOMPATIBLE_INPUT_SIZE;
+    if (index_codec_ && (x.maxSizes[0] != 128 || inverse_ || prefill_))
+        return GLUE_INCOMPATIBLE_INPUT_SIZE;
     if(y.dims!=3 || y.maxSizes[0]!=x.maxSizes[0] || y.maxSizes[1]!=x.maxSizes[1] || y.maxSizes[2]!=x.maxSizes[2])
         return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
     out->indexSpaceRank=3;
@@ -45,11 +49,11 @@ tpc_lib_api::GlueCodeReturn DeepseekV41RopeGaudi2::GetGcDefinitions(
     out->inputTensorAccessPattern[2].allRequired=true;
     out->inputTensorAccessPattern[2].sparseAccess=true;
     out->kernel.paramsNr=0;
-    const auto* start = prefill_ ? (inverse_ ? &_binary___deepseek_v41_prefill_rope_inverse_bf16_gaudi2_o_start
+    const auto* start = index_codec_ ? &_binary___deepseek_v41_index_query_rope_fp4_bf16_gaudi2_o_start : prefill_ ? (inverse_ ? &_binary___deepseek_v41_prefill_rope_inverse_bf16_gaudi2_o_start
                                            : &_binary___deepseek_v41_prefill_rope_bf16_gaudi2_o_start)
                                 : (inverse_ ? &_binary___deepseek_v41_rope_inverse_bf16_gaudi2_o_start
                                             : &_binary___deepseek_v41_rope_bf16_gaudi2_o_start);
-    const auto* end = prefill_ ? (inverse_ ? &_binary___deepseek_v41_prefill_rope_inverse_bf16_gaudi2_o_end
+    const auto* end = index_codec_ ? &_binary___deepseek_v41_index_query_rope_fp4_bf16_gaudi2_o_end : prefill_ ? (inverse_ ? &_binary___deepseek_v41_prefill_rope_inverse_bf16_gaudi2_o_end
                                          : &_binary___deepseek_v41_prefill_rope_bf16_gaudi2_o_end)
                               : (inverse_ ? &_binary___deepseek_v41_rope_inverse_bf16_gaudi2_o_end
                                           : &_binary___deepseek_v41_rope_bf16_gaudi2_o_end);

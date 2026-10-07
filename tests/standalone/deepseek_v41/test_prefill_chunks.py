@@ -118,6 +118,7 @@ def test_prefill_retires_completed_tail_packets_before_reuse(monkeypatch, count)
         prefill_capacity=8192,
         requests={"request": request},
         _bind_request=lambda _request: None,
+        _prepare_device_sampling_request=lambda _request: None,
         use_dspark=False,
         model_config=SimpleNamespace(max_model_len=1 << 20),
         verify_timing=None,

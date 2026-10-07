@@ -25,8 +25,13 @@ def dump(path, value):
     Path(path).write_text(json.dumps(value, indent=2) + "\n")
 
 
-def copy_tree(source, target, exclude=()):
-    shutil.copytree(source, target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".git", *exclude))
+def copy_tree(source, target, exclude=(), *, resume=False):
+    def verified_copy(src, dst):
+        if resume and Path(dst).is_file() and digest(src) == digest(dst):
+            return dst
+        return shutil.copy2(src, dst)
+    shutil.copytree(source, target, dirs_exist_ok=resume, copy_function=verified_copy,
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".git", *exclude))
 
 
 def relocate(value, mapping):
@@ -48,15 +53,17 @@ def main():
     parser.add_argument("--prepared", type=Path, required=True)
     parser.add_argument("--machine-settings", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--python-storage-dir", type=Path, help="Independent dependency storage on a filesystem with sufficient inodes")
     parser.add_argument("--asset-output", type=Path,
                         help="Separate immutable sidecar installation on the model filesystem")
+    parser.add_argument("--resume",action="store_true",help="Complete an interrupted unpublished installation; verify reused dependency files")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     output = args.output.resolve()
-    if output.exists():
-        raise ValueError("Installation destination must be new; existing services are never overwritten")
+    if output.exists() and (not args.resume or (output/"installation.json").exists() or (output/"service.json").exists()):
+        raise ValueError("Only an interrupted unpublished installation may be resumed")
     assets = args.asset_output.resolve() if args.asset_output else output / "sidecars"
-    if assets.exists():
+    if assets.exists() and not args.resume:
         raise ValueError("Sidecar installation destination must be new")
     profile = json.loads(args.runtime_profile.read_text())
     for item in profile.get("additional_libraries", []) + profile.get("configuration_files", []):
@@ -76,33 +83,53 @@ def main():
         storage_parent = storage_parent.parent
     if shutil.disk_usage(storage_parent).free < 6 * 2**30:
         raise ValueError("Keep at least 6 GiB free for the Python/runtime installation and startup logs")
+    if os.statvfs(storage_parent).f_favail < 4096:
+        raise ValueError('Installation filesystem needs at least 4096 free inodes; relocate dependency storage first')
     # Copy dependencies, excluding editable import hooks. Never retain external symlinks.
     source_site = Path(sys.prefix) / f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
     if not source_site.is_dir():
         raise ValueError("Run the installer with the qualified serving virtual environment's Python")
-    output.mkdir(parents=True)
-    venv.EnvBuilder(with_pip=False, symlinks=True).create(output / "venv")
+    output.mkdir(parents=True,exist_ok=args.resume)
+    python_dir = output / "venv"
+    if args.python_storage_dir:
+        storage = args.python_storage_dir.resolve()
+        if storage.exists() and not args.resume:
+            raise ValueError("Python storage must be new unless resuming an unpublished installation")
+        storage.parent.mkdir(parents=True, exist_ok=True)
+        if python_dir.is_symlink():
+            if python_dir.resolve() != storage:
+                raise ValueError("Interrupted Python storage symlink differs from the requested location")
+        elif python_dir.exists():
+            raise ValueError("Existing in-place Python directory cannot be silently relocated")
+        else:
+            python_dir.symlink_to(storage, target_is_directory=True)
+        python_target = storage
+    else:
+        if python_dir.is_symlink():
+            raise ValueError("Pass --python-storage-dir explicitly to resume separate dependency storage")
+        python_target = python_dir
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(python_target)
     site = output / "venv" / source_site.relative_to(sys.prefix)
     for source in source_site.iterdir():
-        if source.name.startswith("__editable__") or source.name in ("__pycache__", "vllm", "vllm_gaudi"):
+        if source.name.startswith("__editable__") or source.name in ("__pycache__", "vllm", "vllm_gaudi", "flashinfer_gaudi"):
             continue
         destination = site / source.name
         if source.is_dir():
-            copy_tree(source, destination)
+            copy_tree(source, destination,resume=args.resume)
         elif source.is_file():
             shutil.copy2(source, destination)
-    copy_tree(args.engine_source.resolve() / "vllm", site / "vllm")
-    copy_tree(root / "vllm_gaudi", site / "vllm_gaudi", exclude=("lib",))
+    copy_tree(args.engine_source.resolve() / "vllm", site / "vllm",resume=args.resume)
+    copy_tree(root / "vllm_gaudi", site / "vllm_gaudi", exclude=("lib",),resume=args.resume)
     for name in ("flashinfer_gaudi",):
-        copy_tree(root / name, site / name)
+        copy_tree(root / name, site / name,resume=args.resume)
     shutil.copy2(root / "pytest_compat.py", site / "pytest_compat.py")
     # Ignored development lib symlinks must not become the installation's native selection.
     shutil.rmtree(site / "vllm_gaudi/lib", ignore_errors=True)
     library_dir = output / "lib"
-    library_dir.mkdir()
+    library_dir.mkdir(exist_ok=args.resume)
     env = profile["environment"]
     native = Path(env["VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR"])
-    copy_tree(native, output / "native")
+    copy_tree(native, output / "native",resume=args.resume)
     bridge = Path(env["VLLM_HPU_TP2_FUSED_AR_NORM_BRIDGE"])
     shutil.copy2(bridge, library_dir / bridge.name)
     mapping = {str(source_site): str(site), str(native): str(output / "native"),
@@ -148,13 +175,16 @@ def main():
             # Assets are immutable; cross-filesystem copies use normal materialization.
             def copy_asset(src, dst):
                 Path(dst).parent.mkdir(parents=True, exist_ok=True)
+                if args.resume and Path(dst).is_file():
+                    if digest(src)!=digest(dst):raise ValueError("Interrupted immutable sidecar differs: "+str(dst))
+                    return dst
                 if Path(src).stat().st_dev == Path(dst).parent.stat().st_dev:
                     os.link(Path(src).resolve(), dst)
                     return dst
                 return shutil.copy2(src, dst)
-            shutil.copytree(source, target, copy_function=copy_asset)
+            shutil.copytree(source, target, copy_function=copy_asset,dirs_exist_ok=args.resume)
         else:
-            copy_tree(source, target)
+            copy_tree(source, target,resume=args.resume)
         mapping[str(source)] = str(target)
         sidecars[name] = str(target)
     precision = env.get("VLLM_HPU_DSV41_ATTN_DENSE_FP8_CONFIG")
@@ -182,9 +212,10 @@ def main():
     dump(output / "runtime.json", {"schema": 1, "environment": installed_env,
                                   "additional_libraries": records, "configuration_files": configurations})
     settings = json.loads(args.machine_settings.read_text())
-    lock_path = Path(settings["device_lock_dir"])
-    if not lock_path.is_absolute():
-        settings["device_lock_dir"] = str(output.parent / lock_path)
+    if settings.get("device_lock_dir"):
+        lock_path = Path(settings["device_lock_dir"])
+        if not lock_path.is_absolute():
+            settings["device_lock_dir"] = str(output.parent / lock_path)
     if not settings.get("api_key_file"):
         key = output / "api-key"
         descriptor = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -193,7 +224,7 @@ def main():
         settings["api_key_file"] = str(key)
     settings.update(model=str(args.prepared.resolve()), runtime_profile=str(output / "runtime.json"), sidecars=sidecars)
     dump(output / "settings.json", settings)
-    copy_tree(root / "tools", output / "tools")
+    copy_tree(root / "tools", output / "tools",resume=args.resume)
     files = {str(p.relative_to(output)): digest(p) for p in output.rglob("*") if p.is_file() and
              (p.suffix in (".py", ".json") or p.name.endswith(".so"))}
     dump(output / "installation.json", {"schema": 1, "plugin_commit": subprocess.check_output(

@@ -8,6 +8,17 @@ extern unsigned char
 extern unsigned char
     _binary___deepseek_v41_control_gemv_rrms_bf16_gaudi2_o_end;
 
+extern unsigned char _binary___deepseek_v41_control_rrms_unpack_bf16_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_control_rrms_unpack_bf16_gaudi2_o_end;
+
+extern unsigned char _binary___deepseek_v41_control_rrms_parallel_bf16_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_control_rrms_parallel_bf16_gaudi2_o_end;
+
+extern unsigned char _binary___deepseek_v41_control_rrms_swizzled_bf16_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_control_rrms_swizzled_bf16_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_control_rrms_bf16_weight_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_control_rrms_bf16_weight_gaudi2_o_end;
+
 tpc_lib_api::GlueCodeReturn
 DeepseekV41ControlGemvRrmsGaudi2::GetGcDefinitions(
     tpc_lib_api::HabanaKernelParams* p,
@@ -21,13 +32,14 @@ DeepseekV41ControlGemvRrmsGaudi2::GetGcDefinitions(
     const auto& x = p->inputTensors[0].geometry;
     const auto& w = p->inputTensors[1].geometry;
     const auto& y = p->outputTensors[0].geometry;
-    if (x.dataType != DATA_BF16 || w.dataType != DATA_F32 ||
+    if (x.dataType != DATA_BF16 || w.dataType != (unpack_ == 4 ? DATA_BF16 : DATA_F32) ||
         y.dataType != DATA_F32)
         return GLUE_INCOMPATIBLE_DATA_TYPE;
     const auto tokens = x.maxSizes[1];
     if (x.dims != 2 || x.maxSizes[0] != 20480 || tokens < 1 ||
         tokens > 2048 ||
-        w.dims != 2 || w.maxSizes[0] != 20480 || w.maxSizes[1] != 24 ||
+        (unpack_ == 3 ? (w.dims != 3 || w.maxSizes[0] != 128 || w.maxSizes[1] != 24 || w.maxSizes[2] != 160) :
+         (w.dims != 2 || w.maxSizes[0] != 20480 || w.maxSizes[1] != 24)) ||
         y.dims != 2 || y.maxSizes[0] != 25 || y.maxSizes[1] != tokens)
         return GLUE_INCOMPATIBLE_INPUT_SIZE;
     const auto* scalar = static_cast<const float*>(p->nodeParams.nodeParams);
@@ -56,6 +68,12 @@ DeepseekV41ControlGemvRrmsGaudi2::GetGcDefinitions(
     wm[0].end_b = 20479;
     wm[1].indexSpaceDim = 0;
     wm[1].a = 1;
+    if (unpack_ == 3) {
+        wm[0].end_b = 127;
+        wm[2].indexSpaceDim = 0;
+        wm[2].a = 0;
+        wm[2].end_b = 159;
+    }
     auto& ym = out->outputTensorAccessPattern[0].mapping;
     ym[0].indexSpaceDim = 0;
     ym[0].a = 0;
@@ -69,6 +87,22 @@ DeepseekV41ControlGemvRrmsGaudi2::GetGcDefinitions(
         &_binary___deepseek_v41_control_gemv_rrms_bf16_gaudi2_o_start;
     auto* end =
         &_binary___deepseek_v41_control_gemv_rrms_bf16_gaudi2_o_end;
+    if (unpack_) {
+        begin = &_binary___deepseek_v41_control_rrms_unpack_bf16_gaudi2_o_start;
+        end = &_binary___deepseek_v41_control_rrms_unpack_bf16_gaudi2_o_end;
+    }
+    if (unpack_ == 2) {
+        begin = &_binary___deepseek_v41_control_rrms_parallel_bf16_gaudi2_o_start;
+        end = &_binary___deepseek_v41_control_rrms_parallel_bf16_gaudi2_o_end;
+    }
+    if (unpack_ == 3) {
+        begin = &_binary___deepseek_v41_control_rrms_swizzled_bf16_gaudi2_o_start;
+        end = &_binary___deepseek_v41_control_rrms_swizzled_bf16_gaudi2_o_end;
+    }
+    if (unpack_ == 4) {
+        begin = &_binary___deepseek_v41_control_rrms_bf16_weight_gaudi2_o_start;
+        end = &_binary___deepseek_v41_control_rrms_bf16_weight_gaudi2_o_end;
+    }
     const unsigned capacity = out->kernel.elfSize;
     out->kernel.elfSize = end - begin;
     if (capacity < out->kernel.elfSize)

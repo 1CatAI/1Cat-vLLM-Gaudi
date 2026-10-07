@@ -57,6 +57,39 @@ def test_optional_status_write_does_not_hide_permission_errors(tmp_path, monkeyp
         module.atomic_json(tmp_path / "process.json", {}, required=False)
 
 
+def test_settings_override_creates_actual_compiler_scratch_before_launch(tmp_path, monkeypatch):
+    import json
+    import sys
+
+    module = tool("serve_deepseek_v41")
+    installation = tmp_path / "installation"
+    installation.mkdir()
+    scratch = tmp_path / "scratch" / "compiler"
+    override = tmp_path / "candidate-settings.json"
+    allocation = {"worker_main": [0], "worker_helpers": [[1]], "engine_main": [2],
+                  "api_main": [3], "control_helpers": [4]}
+    settings = {"cpus": list(range(5)), "cpu_allocation": allocation,
+                "environment": {"TMPDIR": str(scratch)}}
+    override.write_text(json.dumps(settings))
+    (installation / "settings.json").write_text("{}")
+    captured = {}
+
+    def launch(command, **kwargs):
+        assert scratch.is_dir()
+        captured.update(command=command, environment=kwargs["env"])
+        return SimpleNamespace(pid=123, returncode=0, poll=lambda: 0)
+
+    monkeypatch.setattr(module.subprocess, "Popen", launch)
+    monkeypatch.setattr(module.signal, "signal", lambda *args: None)
+    monkeypatch.setattr(sys, "argv", ["serve", str(installation), "--settings", str(override)])
+    with pytest.raises(SystemExit) as finished:
+        module.main()
+    assert finished.value.code == 0
+    assert captured["command"].count("--settings") == 1
+    assert captured["command"][captured["command"].index("--settings") + 1] == str(override)
+    assert captured["environment"]["TMPDIR"] == str(scratch)
+
+
 def test_public_adapter_returns_unavailable_when_backend_has_stopped():
     import http.client
     import json
@@ -150,3 +183,18 @@ def test_public_adapter_forwards_inference_and_hides_internal_routes():
         for server in (proxy, upstream):
             server.shutdown()
             server.server_close()
+
+
+def test_raw_trace_configuration_rejected_before_model_loading():
+    module = tool("serve_deepseek_v41")
+    with pytest.raises(ValueError, match="HABANA_PROFILE_WRITE_HLTV"):
+        module.validate_raw_trace_profile({"environment": {
+            "VLLM_HPU_DSV41_RAW_TRACE": "1", "HABANA_PROF_CONFIG": "/unused"}})
+    module.validate_raw_trace_profile({"environment": {"VLLM_HPU_DSV41_RAW_TRACE": "0"}})
+
+
+@pytest.mark.parametrize("key", ["DUMP_PRE_GRAPHS", "DUMP_POST_GRAPHS"])
+def test_zero_dump_directory_rejected_before_model_loading(key):
+    module = tool("serve_deepseek_v41")
+    with pytest.raises(ValueError, match="dump directory"):
+        module.validate_raw_trace_profile({"environment": {key: "0"}})

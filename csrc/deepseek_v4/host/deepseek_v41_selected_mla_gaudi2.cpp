@@ -7,9 +7,12 @@ extern unsigned char _binary___deepseek_v41_selected_mla_gather_gaudi2_o_end;
 extern unsigned char _binary___deepseek_v41_selected_mla_softmax_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_selected_mla_softmax_gaudi2_o_end;
 
+extern unsigned char _binary___deepseek_v41_selected_mla_register_softmax_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_selected_mla_register_softmax_gaudi2_o_end;
+
 tpc_lib_api::GlueCodeReturn DeepseekV41SelectedMlaGaudi2::GetKernelName(
     char name[tpc_lib_api::MAX_NODE_NAME]) {
-    std::strcpy(name, gather_ ? "custom_deepseek_v41_selected_mla_gather_gaudi2"
+    std::strcpy(name, register_row_ ? "custom_deepseek_v41_selected_mla_register_softmax_gaudi2" : gather_ ? "custom_deepseek_v41_selected_mla_gather_gaudi2"
                              : "custom_deepseek_v41_selected_mla_softmax_gaudi2");
     return tpc_lib_api::GLUE_SUCCESS;
 }
@@ -30,6 +33,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41SelectedMlaGaudi2::GetGcDefinitions(
     // The common gather/softmax implementation also serves bounded prefill
     // tiles. Public op metadata retains the smaller decode contract.
     if (!width || width > 640 || width % 64 || !tokens || tokens > 64) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+    if(register_row_ && (gather_ || width!=640))return GLUE_INCOMPATIBLE_INPUT_SIZE;
     out->indexSpaceRank = 2;
     out->indexSpaceGeometry[1] = tokens;
     for (unsigned i = 0; i < inputs; ++i) out->inputTensorAccessPattern[i].allRequired = true;
@@ -72,9 +76,9 @@ tpc_lib_api::GlueCodeReturn DeepseekV41SelectedMlaGaudi2::GetGcDefinitions(
         out->outputTensorAccessPattern[0] = out->inputTensorAccessPattern[0];
     }
     out->kernel.paramsNr = 0;
-    auto* first = gather_ ? &_binary___deepseek_v41_selected_mla_gather_gaudi2_o_start
+    auto* first = register_row_ ? &_binary___deepseek_v41_selected_mla_register_softmax_gaudi2_o_start : gather_ ? &_binary___deepseek_v41_selected_mla_gather_gaudi2_o_start
                           : &_binary___deepseek_v41_selected_mla_softmax_gaudi2_o_start;
-    auto* last = gather_ ? &_binary___deepseek_v41_selected_mla_gather_gaudi2_o_end
+    auto* last = register_row_ ? &_binary___deepseek_v41_selected_mla_register_softmax_gaudi2_o_end : gather_ ? &_binary___deepseek_v41_selected_mla_gather_gaudi2_o_end
                          : &_binary___deepseek_v41_selected_mla_softmax_gaudi2_o_end;
     const unsigned capacity = out->kernel.elfSize;
     out->kernel.elfSize = last - first;

@@ -12,15 +12,18 @@ from vllm_gaudi.entrypoints.deepseek_v41 import (
     _PREFILL_MOE_DEFAULTS,
     _PIPELINE_ONLY_FASTPATHS,
     _TP4_FASTPATH_DEFAULTS,
+    _SINGLE_STAGE_NATIVE_DEFAULTS,
     prepare_default_fastpaths,
 )
 
 _PROFILE_KEYS = set().union(
     _PIPELINE_ONLY_FASTPATHS,
     _TP4_FASTPATH_DEFAULTS,
+    _SINGLE_STAGE_NATIVE_DEFAULTS,
     _C1_FASTPATH_DEFAULTS,
     _NUMERIC_FASTPATH_DEFAULTS,
     _PREFILL_MOE_DEFAULTS,
+    _SINGLE_STAGE_NATIVE_DEFAULTS,
 ) | {
     "VLLM_HPU_DSV41_DEFAULT_FASTPATHS",
     "VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS",
@@ -315,3 +318,23 @@ def test_installed_dense_precision_is_discovered_without_opt_in(monkeypatch, tmp
     monkeypatch.setenv("VLLM_HPU_DSV41_ATTN_DENSE_FP8_CONFIG", "diagnostic.json")
     prepare_default_fastpaths(tmp_path)
     assert os.environ["VLLM_HPU_DSV41_ATTN_DENSE_FP8_CONFIG"] == "diagnostic.json"
+
+
+def test_single_stage_native_defaults_preserve_explicit_disable(monkeypatch, tmp_path):
+    _clear_profile(monkeypatch)
+    for sidecar in ("wo_a_fp8", "attention_dense_fp8", "engram_fp8"):
+        (tmp_path / "sidecars" / sidecar).mkdir(parents=True)
+    monkeypatch.setenv("VLLM_HPU_DSV41_DEVICE_CLOSED_LOOP", "0")
+    prepare_default_fastpaths(tmp_path, tensor_parallel_size=4, pipeline_parallel_size=1)
+    assert os.environ["VLLM_HPU_DSV41_DEVICE_CLOSED_LOOP"] == "0"
+    for key, value in _SINGLE_STAGE_NATIVE_DEFAULTS.items():
+        if key != "VLLM_HPU_DSV41_DEVICE_CLOSED_LOOP":
+            assert os.environ[key] == value
+
+
+def test_pipeline_stages_keep_existing_token_ownership(monkeypatch, tmp_path):
+    _clear_profile(monkeypatch)
+    for sidecar in ("wo_a_fp8", "attention_dense_fp8", "engram_fp8"):
+        (tmp_path / "sidecars" / sidecar).mkdir(parents=True)
+    prepare_default_fastpaths(tmp_path, tensor_parallel_size=2, pipeline_parallel_size=2)
+    assert not any(key in os.environ for key in _SINGLE_STAGE_NATIVE_DEFAULTS)

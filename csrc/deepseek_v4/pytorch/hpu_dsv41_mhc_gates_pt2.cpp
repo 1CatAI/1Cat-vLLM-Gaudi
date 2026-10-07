@@ -32,6 +32,7 @@ habana::PartialOutputMetaDataVector metadata(const at::Stack& inputs) {
 
 const bool registered = [] {
     habana::custom_op::registerUserCustomOp(kSchema, kName, metadata, nullptr);
+    habana::custom_op::registerUserCustomOp("custom_op::custom_deepseek_v41_mhc_gates_positive_gaudi2", "custom_deepseek_v41_mhc_gates_positive_gaudi2", metadata, nullptr);
     return true;
 }();
 
@@ -45,6 +46,13 @@ at::Tensor run(
     return outputs.at(0);
 }
 
+at::Tensor run_positive(const at::Tensor& mixes,const at::Tensor& rrms,const at::Tensor& scale,const at::Tensor& base) {
+    validate(mixes,rrms,scale,base);
+    TORCH_CHECK(registered && mixes.device().type()==at::kHPU);
+    auto descriptor=habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("custom_op::custom_deepseek_v41_mhc_gates_positive_gaudi2");
+    return descriptor.execute({mixes,rrms,scale,base}).at(0);
+}
+
 at::Tensor meta(
     const at::Tensor& mixes, const at::Tensor& rrms, const at::Tensor& scale, const at::Tensor& base) {
     validate(mixes, rrms, scale, base);
@@ -53,12 +61,15 @@ at::Tensor meta(
 }
 
 TORCH_LIBRARY_FRAGMENT(custom_op, m) {
+    m.def("custom_deepseek_v41_mhc_gates_positive_gaudi2(Tensor mixes, Tensor rrms, Tensor scale, Tensor base) -> Tensor");
     m.def("custom_deepseek_v41_mhc_gates_f32_gaudi2(Tensor mixes, Tensor rrms, Tensor scale, Tensor base) "
           "-> Tensor");
 }
 TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
     m.impl("custom_deepseek_v41_mhc_gates_f32_gaudi2", run);
+    m.impl("custom_deepseek_v41_mhc_gates_positive_gaudi2", run_positive);
 }
 TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
     m.impl("custom_deepseek_v41_mhc_gates_f32_gaudi2", meta);
+    m.impl("custom_deepseek_v41_mhc_gates_positive_gaudi2", meta);
 }

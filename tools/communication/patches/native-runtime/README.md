@@ -43,6 +43,26 @@ stage-native replay for both supported TP geometries. The earlier TP4
 per-group replay remains a diagnostic path. Primitive correctness and timing
 alone do not establish whole-model performance.
 
+The optional receive-epoch overlay is separate from the base patches.
+`receive-prepost.json` pins every changed parent and result file; apply it with
+`tools/communication/apply_receive_prepost_runtime.py` only to that matching
+HCL or Synapse source. Rebuild all HCL translation units after its relocation
+layout changes, then rebuild the shared Bridge adapter. Both runtime API
+versions must match before capture. It preserves original SEND/local-copy
+producer waits and full communication retirement while allowing receives to
+wait on the explicit previous compute epoch. Capture rejects reused receive
+destinations or reads/writes before the first consumer.
+
+`VLLM_HPU_NATIVE_RECEIVE_PREPOST` remains disabled by default. Its current
+contract uses standalone BF16 AllGather, including the compiled peer reduction
+and downstream consumers. Epoch ABI v2 also supports the existing Engram input
+split: prefix and suffix receives use their respective compute epochs and
+original phase tables. Send dependencies and full NIC retirement are retained.
+Partial and bounded plans are rejected. The segmented option, TP2 and
+DSpark/batched serving remain unqualified until their complete-chain gates
+pass. Microbenchmark qualification does not establish full-model performance
+or a release default.
+
 Build HCL with its bundled dependencies and SDK development libraries. Set
 `HCL_SRC_PKG_DIR` to its checkout and `HCL_LIB_DIR` to the SDK library directory;
 configure `hcl/src` into a separate CMake build directory. The patch makes
