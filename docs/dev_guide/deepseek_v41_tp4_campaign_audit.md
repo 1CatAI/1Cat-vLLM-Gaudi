@@ -81,3 +81,18 @@ retired and modules returned to 768 MiB; no manual reset or PCIe experiment was
 performed. See `chain-05/DECISION.json`. Pending savings remain zero. The next
 independent hypothesis preserves the original completion and retirement
 mechanism while preposting receives with a proved epoch boundary.
+
+The separate receive-prepost chain passed five checkpoint fixtures on four
+ranks, with three consistent native A/B savings. It is recorded in the gain
+ledger and remains default-off pending full serving qualification. Its epoch
+callback and source-fingerprinted optional runtime overlays are maintained in
+the shared replay path. Legacy standalone/native-batch entrypoints reject an
+epoch-configured graph instead of omitting its prior-compute dependency.
+
+Removing repeated epoch arm/fence packets from each receive scheduler stream
+passed the SDK packet checks and all five four-rank fixtures, but slowed all
+three complete-chain pairs by 0.069, 0.062 and 0.062 microseconds per boundary.
+Reject this optional hoist. Auxiliary receive streams without such waits remain
+byte-identical; the initial overly strict cold guard is retained as an invalid
+untimed attempt. No defaults, gain credit, or formal request follow this trial.
+Evidence: SSD `decode-receive-epoch-hoist-01/chain-02/DECISION.json`.

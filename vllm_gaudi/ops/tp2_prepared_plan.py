@@ -187,6 +187,10 @@ def _flush():
                     _native_graph_owners[key] = weakref.ref(context["owner"])
                 if v4:
                     _configure_native_topology(graph, groups, adapter)
+                if v41 and gaudi_envs.VLLM_HPU_NATIVE_RECEIVE_PREPOST:
+                    if not hasattr(graph, "configure_preposted_receives"):
+                        raise RuntimeError("Receive preposting requires the matching native epoch runtime")
+                    graph.configure_preposted_receives(True)
                 if v41 and gaudi_envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX and adapter.supports_segmented_input:
                     attention_inputs = list(context["attention_inputs"])
                     if gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM:

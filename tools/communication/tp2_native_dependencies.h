@@ -120,3 +120,24 @@ inline std::vector<NativeCollectiveDependency> prepareNativeDependencies(
   }
   return result;
 }
+
+inline void validateReceiveEpochBindings(const std::vector<NativeDependencyNode>& nodes,
+ const std::vector<NativeCollectiveDependency>& dependencies){
+ if(dependencies.empty())throw std::invalid_argument("No receive epoch bindings");
+ for(size_t i=0;i<dependencies.size();++i){
+  const auto& dst=dependencies[i].output;
+  for(size_t j=0;j<i;++j)if(dst.overlaps(dependencies[j].output))
+    throw std::invalid_argument("Receive destinations are reused inside the epoch");
+  uint32_t compute=0;
+  for(const auto& node:nodes){
+   if(node.exchange)continue;
+   if(compute<dependencies[i].consumer){
+    for(const auto& input:node.inputs)if(dst.overlaps(input))
+      throw std::invalid_argument("Receive prepost overwrites a pre-producer read");
+    for(const auto& output:node.outputs)if(dst.overlaps(output))
+      throw std::invalid_argument("Receive prepost races a pre-producer write");
+   }
+   ++compute;
+  }
+ }
+}

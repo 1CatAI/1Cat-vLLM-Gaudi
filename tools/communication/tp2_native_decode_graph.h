@@ -409,6 +409,33 @@ inline std::pair<at::Tensor, std::shared_ptr<NativeCompletion>> copyIntegerRecor
   return copyIntegerRowToHost(source, 4);
 }
 
+struct ReceiveEpochApis {
+ using Enable=hcclResult_t(*)(void*);
+ using Replay=hcclResult_t(*)(void*,const SyncInfo*,const SyncInfo*,size_t,SyncInfo*);
+ using Callback=int(*)(void*,const SyncInfo*,const SyncInfo*,uint64_t,SyncInfo*);
+ using Prepare=synStatus(*)(void*,const uint32_t*,const uint32_t*,uint64_t,uint32_t,Callback,void*);
+ Enable enable=nullptr;Replay replay=nullptr;Prepare prepare=nullptr;
+ ReceiveEpochApis(){
+  auto resolve=[](const char* name){
+    auto* address=dlsym(RTLD_DEFAULT,name);
+    TORCH_CHECK(address,"Missing receive epoch API ",name);
+    return address;
+  };
+  using Version=uint32_t(*)();
+  TORCH_CHECK(reinterpret_cast<Version>(resolve("hcclTpNativeReceiveEpochVersion"))()==1 &&
+              reinterpret_cast<Version>(resolve("synNativeComputeGraphEpochPlanVersion"))()==1,
+              "Receive epoch ABI mismatch");
+  enable=reinterpret_cast<Enable>(resolve("hcclTpNativeGraphEnableReceivePrepostV1"));
+  replay=reinterpret_cast<Replay>(resolve("hcclTpNativeBatchReplayReceiveEpochV1"));
+  prepare=reinterpret_cast<Prepare>(resolve("synNativeComputeGraphPrepareEpochPlanV1"));
+ }
+ static ReceiveEpochApis& get(){static ReceiveEpochApis result;return result;}
+};
+inline int replayReceiveEpoch(void* context,const SyncInfo* epoch,const SyncInfo* producers,
+ uint64_t count,SyncInfo* completions){
+ return static_cast<int>(ReceiveEpochApis::get().replay(context,epoch,producers,count,completions));
+}
+
 class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph> {
  public:
   enum class State { Created, Capturing, Instantiated, Invalid, Closed };
@@ -439,6 +466,11 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
     expected_groups_ = groups;
     expected_collectives_ = collectives;
     external_prefix_ = externalPrefix;
+  }
+
+  void configurePrepostedReceives(bool enabled){
+    TORCH_CHECK(state_.load()==State::Created,"Receive prepost is a cold plan option");
+    if(enabled)ReceiveEpochApis::get();preposted_receives_=enabled;
   }
 
   void configureDependencyPolicy(bool requireIndependentOverlap) {
@@ -875,6 +907,7 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
   size_t expected_groups_ = 0;
   size_t expected_collectives_ = 0;
   bool topology_configured_ = false;
+  bool preposted_receives_ = false;
   bool external_prefix_ = false;
   bool require_independent_overlap_ = true;
   std::vector<at::Tensor> late_inputs_;
@@ -1020,6 +1053,11 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
           bindings.push_back(std::move(binding));
         }
       prepared_dependencies_ = prepareNativeDependencies(bindings);
+      if(preposted_receives_){
+        TORCH_CHECK(!external_prefix_ && !bounded_tiles_ && !segmentedPrefixConfigured(),
+                    "Receive prepost requires a complete explicit dependency plan");
+        validateReceiveEpochBindings(bindings,prepared_dependencies_);
+      }
       if (segmentedPrefixConfigured()) {
         std::vector<NativeBufferRange> late;
         for (const auto& input : late_inputs_) late.push_back(tensorRange(input));
@@ -1160,6 +1198,10 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
           *(communicator_->GetHcclHandle()), stream,
           tp4_ ? (node.all_gather ? 2 : 0) : exchange_mode, &hcl_graphs_[index]);
       TORCH_CHECK(create == hcclSuccess, "hcclTp2NativeGraphCreate failed: ", create);
+      if(preposted_receives_){
+        TORCH_CHECK(ReceiveEpochApis::get().enable(hcl_graphs_[index])==hcclSuccess,
+                    "Receive prepost requires standalone non-inplace BF16 AllGather");
+      }
       const hcclResult_t capture = api.hcl_capture(hcl_graphs_[index]);
       TORCH_CHECK(capture == hcclSuccess, "hcclTp2NativeGraphCapture failed: ", capture);
       if (tp4_ && node.reduction_only) {
@@ -1245,7 +1287,11 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
                     "hcclTp2NativeBatchCreate(decoder) failed");
         HclGraphInfo last;
         TORCH_CHECK(api.hcl_get_info(hcl_graphs_.back(), &last) == hcclSuccess, "HCL batch completion unavailable");
-        if (bounded_tiles_) {
+        if(preposted_receives_){
+          checkSynapse(ReceiveEpochApis::get().prepare(syn_graph_,prepared_producers_.data(),prepared_consumers_.data(),
+            prepared_consumers_.size(),last.completion.longSoIndex,replayReceiveEpoch,hcl_batch_),
+            "synNativeComputeGraphPrepareEpochPlanV1(decoder)");
+        } else if (bounded_tiles_) {
           TORCH_CHECK(minimum_tile_bounds_.size() == segment_count_.load() &&
                       prepared_producers_.size() == hcl_graphs_.size(),
                       "Bounded plan compute/collective coverage differs");

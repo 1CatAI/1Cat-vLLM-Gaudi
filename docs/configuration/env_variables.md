@@ -50,6 +50,16 @@ are in progress.
 
 ## Performance Tuning Parameters
 
+`VLLM_HPU_NATIVE_RECEIVE_PREPOST=1` enables the optional explicit-epoch receive
+path for a complete V4.1 native replay plan. It requires matching versioned HCL,
+Synapse and Bridge overlays, independent receive destinations, and standalone
+BF16 AllGather communication. The capture checks reject early buffer aliases,
+partial, bounded and segmented plans. SEND and local-copy producer dependencies
+and full communication retirement remain intact. Default `0`; only the C1
+complete-chain microbenchmark is qualified. Full serving, TP2 and DSpark/batched
+qualification remain pending. See the optional overlay instructions in
+`tools/communication/patches/native-runtime/README.md`.
+
 `VLLM_HPU_DSV41_N256_PREPARED_DIR` selects immutable TP2×PP2 expert files
 created by `tools/prepare_deepseek_v41_n256.py PREPARED_CHECKPOINT OUTPUT`.
 The tool prepares the N256 layout and channel scales once, verifies exact

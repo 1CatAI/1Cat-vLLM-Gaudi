@@ -1,0 +1,95 @@
+--- a/hcl/src/hccl/hccl.cpp
++++ b/hcl/src/hccl/hccl.cpp
+@@ -101,6 +101,7 @@
+     uint64_t                                        preparedReplayCount = 0;
+     uint64_t                                        nativeReplayCount = 0;
+     uint64_t                                        nativeWrapReplayCount = 0;
++    bool prepostedReceives = false;
+     bool                                            nativeRelocationsValidated = false;
+     bool                                            batchOwned = false;
+     uint64_t                                        completionRingSize = 0;
+@@ -1728,6 +1729,27 @@
+                              hcl::NativeHclRelocationKind::INTERNAL_COMPLETION_ADDRESS));
+             std::fflush(stderr);
+         }
++        if(graphHandle->prepostedReceives){
++          auto& controller=graphHandle->routines->m_deviceController;
++          const auto arch=graphHandle->routines->getArchStream();
++          for(auto* capture:{&graphHandle->capture,&graphHandle->wrapCapture}){
++            size_t receiverTargets=0,receiverIndexes=0;
++            for(auto& stream:capture->streams){
++              auto& actual=controller.getScalStream(arch,stream.streamIndex);
++              if(actual.getSchedIdx()!=static_cast<unsigned>(hcl::SchedulersIndex::recvScaleUp))continue;
++              for(auto& relocation:stream.commandTemplate.relocations){
++                if(relocation.kind==hcl::NativeHclRelocationKind::DEPENDENCY_TARGET){
++                  relocation.kind=hcl::NativeHclRelocationKind::RECEIVE_EPOCH_TARGET;++receiverTargets;
++                }else if(relocation.kind==hcl::NativeHclRelocationKind::DEPENDENCY_LONG_SO_INDEX){
++                  relocation.kind=hcl::NativeHclRelocationKind::RECEIVE_EPOCH_LONG_SO_INDEX;++receiverIndexes;
++                }
++              }
++              stream.program=hcl::NativeHclProgram::prepare({{&stream.commandTemplate,0}},actual.nativeCommandAlignment());
++            }
++            if(!receiverTargets || receiverTargets%4 || !receiverIndexes || !capture->validate())
++              return reject("receive_epoch_relocation_contract");
++          }
++        }
+         graphHandle->state = hcclTp2NativeGraphInstantiated;
+         return hcclSuccess;
+     }
+@@ -1835,7 +1857,7 @@
+                                                hcclTp2NativeSyncInfo*       completion,
+                                                bool                         submit)
+ {
+-    if (graphHandle->state != hcclTp2NativeGraphInstantiated ||
++    if (graphHandle->prepostedReceives || graphHandle->state != hcclTp2NativeGraphInstantiated ||
+         graphHandle->replayPath == InternalHcclTp2NativeGraph::ReplayPath::Prepared)
+     {
+         return hcclInvalidUsage;
+@@ -2125,6 +2147,8 @@
+     if (!batch || count != batch->graphs.size()) return hcclInvalidArgument;
+     std::lock_guard<std::mutex> lock(batch->mutex);
+     if (batch->segmentedActive) return hcclInvalidUsage;
++    if (std::any_of(batch->graphs.begin(), batch->graphs.end(),
++                    [](auto graph) { return graph->prepostedReceives; })) return hcclInvalidUsage;
+     return replayNativeBatchRangeLocked(*batch, 0, batch->phases, dependencies, count, completions);
+ }
+ 
+@@ -2192,3 +2216,27 @@
+     delete batch;
+     return hcclSuccess;
+ }
++
++extern "C" hcclResult_t HCCL_API_CALL hcclTpNativeGraphEnableReceivePrepostV1(hcclTp2NativeGraphHandle graph){
++ if(!graph)return hcclInvalidArgument;
++ std::lock_guard<std::mutex> lock(graph->mutex);
++ if(graph->state!=hcclTp2NativeGraphCreated || graph->tp4Phase!=2 ||
++    graph->params.m_dataType!=hcclBfloat16)return hcclInvalidUsage;
++ graph->prepostedReceives=true;return hcclSuccess;
++}
++extern "C" hcclResult_t HCCL_API_CALL hcclTpNativeBatchReplayReceiveEpochV1(hcclTp2NativeBatchHandle batch,
++ const hcclTp2NativeSyncInfo* epoch,const hcclTp2NativeSyncInfo* dependencies,size_t count,
++ hcclTp2NativeSyncInfo* completions){
++ if(!batch || !epoch || !dependencies || !completions || count!=batch->graphs.size() ||
++    !epoch->targetValue || epoch->targetValue>=(uint64_t(1)<<60))return hcclInvalidArgument;
++ std::lock_guard<std::mutex> lock(batch->mutex);
++ if(!batch->valid || batch->split || batch->segmentedActive)return hcclInvalidUsage;
++ for(size_t node=0;node<count;++node){
++  if(!batch->graphs[node]->prepostedReceives || dependencies[node].longSoIndex!=epoch->longSoIndex ||
++     dependencies[node].targetValue<epoch->targetValue)return hcclInvalidUsage;
++  batch->states[node].values[static_cast<size_t>(hcl::NativeHclRelocationKind::RECEIVE_EPOCH_TARGET)]=epoch->targetValue;
++  batch->states[node].values[static_cast<size_t>(hcl::NativeHclRelocationKind::RECEIVE_EPOCH_LONG_SO_INDEX)]=epoch->longSoIndex;
++ }
++ return replayNativeBatchRangeLocked(*batch,0,batch->phases,dependencies,count,completions);
++}
++extern "C" HCCL_API_CALL uint32_t hcclTpNativeReceiveEpochVersion(){return 1;}
+--- a/hcl/src/infra/scal/gen2_arch_common/native_hcl_relocation.h
++++ b/hcl/src/infra/scal/gen2_arch_common/native_hcl_relocation.h
+@@ -43,6 +43,8 @@
+     GPSO_0_SHORT_MONITOR,
+     GPSO_1_SHORT_MONITOR,
+     PENDING_SHORT_MONITOR,
++    RECEIVE_EPOCH_TARGET,
++    RECEIVE_EPOCH_LONG_SO_INDEX,
+     COUNT
+ };
+ 

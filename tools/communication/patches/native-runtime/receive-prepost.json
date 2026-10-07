@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "qualification": "Complete-chain microbenchmark qualified; disabled pending combined official serving validation",
+  "default_flag": "VLLM_HPU_NATIVE_RECEIVE_PREPOST=0",
+  "api_version": 1,
+  "components": {
+    "hcl": {
+      "patch": "hcl-receive-prepost.patch",
+      "sha256": "48e2db2e5e789ecc77edc285e24d6db649f5900faab84dbf1bf587f25ce238c1",
+      "files": {
+        "hcl/src/hccl/hccl.cpp": {
+          "before": "a460d5d1ad4275656357903c9a99f8dac2b28ab62cf21d55e27ee5e1f5ad8188",
+          "after": "a5adaebcb26b2d1bf3b95968fdbacbb6b310afd47823c9d624b837832d522c50"
+        },
+        "hcl/src/infra/scal/gen2_arch_common/native_hcl_relocation.h": {
+          "before": "dff0a86b120f82e42d570b494b5a51b678ab3b200ea7f325c9f928d17e505781",
+          "after": "8bad4e734d8c30a16f1907175c4baf62efbca708bb0729e323756db5eb95f9a1"
+        }
+      }
+    },
+    "synapse": {
+      "patch": "synapse-receive-prepost.patch",
+      "sha256": "9a711c34de9e981a3039a7d6aa2a27894f9147db5148e2b46be33259a38fc324",
+      "files": {
+        "src/runtime/scal/common/stream_compute_scal.cpp": {
+          "before": "4b10f8d1e4c0ab668a317e291aa672879dbb30f0f8d1ac689e0c502c07d23e50",
+          "after": "02b37ef06256f6be4b55c85369621e07a7d2253769ee2424a4fc753341e18088"
+        },
+        "src/runtime/scal/common/native_compute_graph.hpp": {
+          "before": "3da9ff6e9fc782b04e96ca8c9a1392d2236b50b1b6548cbf925070c63cbb4b92",
+          "after": "7789fbc2acfcdaea63048919cb22b74b0d5a4b1160a81da52a08ce2c792fb2e8"
+        }
+      }
+    }
+  }
+}

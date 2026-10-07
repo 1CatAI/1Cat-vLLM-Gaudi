@@ -1418,3 +1418,20 @@ periods. Owners retired to768MiB. Evidence SSD
 一次正式官方采样自然EOS观测8.239257597ms/token，比8.532522828减少0.293265230ms/token。
 三项已默认开启并包含在新基线；上述历史pending条目全部关账，当前待验收累计0。
 未验证的主PV缓存、BF16控制权重继续关闭。三项未改变runner/replay/通信接口。
+
+### 2026-10-07 — RX preposting after the explicit previous compute epoch
+
+WO/control → four-card BF16 peer → weighted post/statistics → norm/dual quant
+→ real router/shared-W13/SiLU native chain: 5 checkpoint-derived fixtures ×
+4 ranks, all 13 outputs byte-exact. Three A/B savings are
+0.001722086 / 0.001712008 / 0.001718156 ms per boundary. Conservatively applying
+the median to the 80 model reduction boundaries gives **0.137452500 ms/token**
+waiting for serving qualification. This is not measured full-model improvement.
+`VLLM_HPU_NATIVE_RECEIVE_PREPOST=0`; matching HCL/Synapse epoch APIs, independent
+receive destinations and a complete unsegmented dependency plan are mandatory.
+TP2 and DSpark/batched serving have not been qualified for this option.
+
+The accepted formal baseline remains **8.239257597 ms/token**. Compatible
+pending savings: **0.137452500 ms/token**, one item. Evidence: SSD
+`decode-receive-prepost-01/chain-02/DECISION.json`. The cold missing-export failure
+is retained separately and supplies no gain. All owned modules retired to768MiB.

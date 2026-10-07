@@ -84,5 +84,24 @@ int main() {
   assert(deviceDependencies[3].producer == UINT32_MAX && deviceDependencies[3].consumer == 5);
   const auto devicePrefix = prepareNativeInputPrefix(deviceEngram, {late}, deviceDependencies);
   assert(devicePrefix.computes == 6 && devicePrefix.collectives == 4);
+  // RX may post after the previous compute epoch only when all destinations
+  // are independent until their first consumer, including partial aliases.
+  validateReceiveEpochBindings(nodes, plan);
+  validateReceiveEpochBindings(external, prepareNativeDependencies(external));
+  validateReceiveEpochBindings(shared, prepareNativeDependencies(shared));
+  auto rejectsPrepost = [](const auto& bad) {
+    try { validateReceiveEpochBindings(bad, prepareNativeDependencies(bad)); }
+    catch (const std::invalid_argument&) { return; }
+    assert(false && "Unsafe receive epoch accepted");
+  };
+  auto early = nodes; early[0].inputs.push_back({208, 4}); rejectsPrepost(early);
+  early = nodes; early[0].outputs.push_back({208, 4}); rejectsPrepost(early);
+  early = nodes; early[2].inputs.push_back({208, 4});
+  validateReceiveEpochBindings(early, prepareNativeDependencies(early));
+  auto reused = nodes;
+  reused.push_back({false, {out}, {{800, 16}}});
+  reused.push_back({true, {{800, 16}}, {peer}});
+  reused.push_back({false, {peer}, {{900, 16}}});
+  rejectsPrepost(reused);
   std::cout << "TP dependencies: independent work, shared consumers, aliases and overwrite guards passed\n";
 }

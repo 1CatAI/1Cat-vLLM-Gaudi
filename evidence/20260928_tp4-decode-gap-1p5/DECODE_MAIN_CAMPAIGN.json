@@ -69,7 +69,7 @@
   "deferred": "500K terminal-instruction semantic issue recorded in mergedPR57; outside this task",
   "completed": false,
   "confirmed_cumulative_real16_savings_ms": 0.114383,
-  "last_updated": 1791318574.13591,
+  "last_updated": 1791332805.9054482,
   "formal_gain_ms": 0,
   "confirmed_real16_gain_ms": 0.114383,
   "baseline_capture": "sole merged-main hardware capture complete and archived; unprofiled10.568225ms reused",
@@ -3090,8 +3090,8 @@
     "default": true
   },
   "next_batch_trigger": {
-    "qualified_items": 0,
-    "forecast_ms": 0,
+    "qualified_items": 1,
+    "forecast_ms": 0.13745249999999987,
     "rule": "forecast >=0.5 ms OR three compatible qualified items"
   },
   "latest_components_in_progress": {
@@ -3194,5 +3194,41 @@
       8.184153916666672,
       8.176476749999992
     ]
+  },
+  "receive_prepost_20261007": {
+    "status": "qualified_complete_native_chain_default_off",
+    "formal_baseline_ms": 8.23925759729292,
+    "round_savings_ms_per_boundary": [
+      0.0017220859374999994,
+      0.0017120078124999993,
+      0.0017181562499999983
+    ],
+    "forecast_occurrences": 80,
+    "forecast_ms_token": 0.13745249999999987,
+    "checks": "five checkpoint-derived fixtures x four ranks, 13 outputs exact",
+    "scope": "WO/control->four-rank BF16 peer->post/norm/router/shared-W13 and SiLU",
+    "full_model_gain_credit_ms": 0,
+    "formal_ran": false,
+    "normal_runtime_integration_pending": false,
+    "evidence": "/opt/ssd960/1cat-vllm-decode-archives/decode-receive-prepost-01/chain-02",
+    "flag": "VLLM_HPU_NATIVE_RECEIVE_PREPOST",
+    "default": false,
+    "integration": "Default-off shared native entry, typed runtime API and source-fingerprinted optional overlays",
+    "full_serving_capture_tested": false,
+    "additional_contract_gate": "104 independent output frames,13groups,5fixtures x4ranks pass across completion-ring wrap; retired768MiB; no repeated timing"
+  },
+  "receive_epoch_hoist_20261007": {
+    "status": "rejected_three_slower_complete_chain_rounds",
+    "round_savings_ms_per_boundary": [
+      -6.878125000000374e-05,
+      -6.230468750000051e-05,
+      -6.163281250000374e-05
+    ],
+    "correctness": "5 checkpoint-derived fixtures x4 ranks,13 outputs exact",
+    "source_change": "Only repeated receive epoch arm and fence packets omitted; original retirement and credit packets retained",
+    "gain_credit_ms": 0,
+    "formal_ran": false,
+    "default": false,
+    "retired": true
   }
 }

@@ -2,6 +2,7 @@
 """Configured Engram native binaries must satisfy both hash and ABI contracts."""
 import hashlib
 import json
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,10 @@ from vllm_gaudi.ops import deepseek_v41_host as host
 
 @pytest.mark.parametrize("failure", [None, "hash", "abi", "ambiguous"])
 def test_configured_host_binary_validation(tmp_path, monkeypatch, failure):
+    # The configured loader retains the extension in sys.modules. Isolate each
+    # mocked ABI case while restoring any real module after the test.
+    monkeypatch.setitem(sys.modules, "vllm_gaudi.lib.dsv41_host_gather", None)
+    monkeypatch.setitem(sys.modules, "dsv41_host_gather", None)
     binary = tmp_path / "dsv41_host_gather.test.so"
     binary.write_bytes(b"test fixture")
     digest = hashlib.sha256(binary.read_bytes()).hexdigest()

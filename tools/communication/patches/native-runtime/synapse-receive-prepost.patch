@@ -1,0 +1,68 @@
+--- a/src/runtime/scal/common/stream_compute_scal.cpp
++++ b/src/runtime/scal/common/stream_compute_scal.cpp
+@@ -381,6 +381,12 @@
+         std::fprintf(stderr, "NATIVE_PLAN_REJECT reason=%s\n", error.what());
+         return synInvalidArgument;
+     }
++}
++
++synStatus NativeComputeGraph::configureEpochCallback(EpochExchangeReplay callback){
++ if(!callback || !m_jointPlan || m_jointPlan->epochCallback || m_replayActive || m_state!=State::INSTANTIATED)
++  return synInvalidArgument;
++ m_jointPlan->epochCallback=callback;return synSuccess;
+ }
+ 
+ synStatus NativeComputeGraph::prepareSegmentedPlan(
+@@ -486,8 +492,11 @@
+         for (size_t n = 0; n < plan.producers.size(); ++n)
+             plan.producers[n] = {uint32_t(base.m_index), base.m_targetValue + plan.program.producerOffsets[n]};
+         ++plan.statistics[11];
+-        if (plan.callback(plan.context, plan.producers.data(), plan.producers.size(), plan.completions.data()) != 0)
+-            return fail();
++        const synNativeGraphSyncInfo epoch{uint32_t(base.m_index),base.m_targetValue};
++        const int exchangeStatus=plan.epochCallback ?
++            plan.epochCallback(plan.context,&epoch,plan.producers.data(),plan.producers.size(),plan.completions.data()) :
++            plan.callback(plan.context,plan.producers.data(),plan.producers.size(),plan.completions.data());
++        if(exchangeStatus!=0)return fail();
+         for (size_t n = 0; n < plan.completions.size(); ++n)
+             if (plan.completions[n].longSoIndex != plan.nicLongSoIndex || !plan.completions[n].targetValue ||
+                 plan.completions[n].targetValue >= (uint64_t(1) << 60) ||
+@@ -1546,3 +1555,19 @@
+ 
+     return set;
+ }
++
++extern "C" synStatus SYN_API_CALL synNativeComputeGraphPrepareEpochPlanV1(synNativeComputeGraphHandle handle,
++ const uint32_t* producers,const uint32_t* consumers,uint64_t count,uint32_t index,
++ NativeComputeGraph::EpochExchangeReplay callback,void* context){
++ if(!callback || !producers || !handle || !handle->queue || !handle->graph || !handle->stream)return synInvalidArgument;
++ std::lock_guard<std::mutex> lock(handle->replayMutex);
++ if(handle->preparedReplayJob)return synInvalidArgument;
++ auto unused=[](void*,const synNativeGraphSyncInfo*,uint64_t,synNativeGraphSyncInfo*) -> int {return -1;};
++ auto status=handle->queue->prepareNativeComputePlan(*handle->graph,consumers,count,index,unused,context,producers);
++ if(status!=synSuccess)return status;
++ status=handle->graph->configureEpochCallback(callback);
++ if(status!=synSuccess)return status;
++ handle->preparedReplayJob=std::make_unique<NativeComputeReplayJob>(*handle,NativeComputeReplayJob::Part::Full);
++ return synSuccess;
++}
++extern "C" uint32_t SYN_API_CALL synNativeComputeGraphEpochPlanVersion(){return 1;}
+--- a/src/runtime/scal/common/native_compute_graph.hpp
++++ b/src/runtime/scal/common/native_compute_graph.hpp
+@@ -59,6 +59,8 @@
+                             bool                      submit,
+                             ScalLongSyncObject&       completion);
+     synStatus close();
++    using EpochExchangeReplay = int (*)(void*,const synNativeGraphSyncInfo*,const synNativeGraphSyncInfo*,uint64_t,synNativeGraphSyncInfo*);
++    synStatus configureEpochCallback(EpochExchangeReplay callback);
+     synStatus preparePlan(const uint32_t* consumerSegments, uint64_t count, uint32_t nicLongSoIndex,
+                           synNativeGraphExchangeReplay callback, void* context, const uint32_t* producers = nullptr);
+     synStatus prepareSegmentedPlan(const uint32_t* producerSegments, const uint32_t* consumerSegments,
+@@ -96,6 +98,7 @@
+         NativeComputeProgram suffixProgram;
+         uint32_t nicLongSoIndex = 0;
+         synNativeGraphExchangeReplay callback = nullptr;
++        EpochExchangeReplay epochCallback = nullptr;
+         void* context = nullptr;
+         std::vector<synNativeGraphSyncInfo> producers, completions;
+         std::vector<CommandSubmissionData> submissionScratch;
