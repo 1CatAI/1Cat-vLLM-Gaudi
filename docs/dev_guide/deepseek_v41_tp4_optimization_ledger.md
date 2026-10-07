@@ -14,7 +14,7 @@
 父基线 **8.532522828 ms/token**；三项兼容微基准预估 **0.145667500ms/token**，
 正式观测减少 **0.293265230ms/token**。共享专家缩放 finalizer、gate packet、weighted post statistics
 三项关账并默认开启；不能把观测总差分配给各组件。
-**未端到端的兼容收益累计为0；7.0ms目标未完成，还差1.239257597ms/token。**
+**未端到端的兼容组件预估累计为0.118749500ms/token（receive preposting 0.117889500 + 精确PV旁支0.000860000）；正常服务尚未组合验收。7.0ms目标未完成，正式数字仍差1.239257597ms/token。**
 
 配套 trace 保存在 SSD `decode-accumulated-serving-07-trace-repair-03`，只补 companion，未重复正式请求。
 完整预热后224-token诊断，其中160-token采集；预选连续24周期、四rank原始活动归一化。
@@ -1439,3 +1439,11 @@ is retained separately and supplies no gain. All owned modules retired to768MiB.
 ### 2026-10-07 — receive-prepost production segmented replay gate
 
 The same optional epoch runtime now retains the actual Engram prefix/suffix plans. Five checkpoint-derived continuation inputs × four ranks preserve token IDs, hidden bytes and33 state tensors. Native200-step ABABAB saves **0.063748 / 0.078593 / 0.113867ms per16-layer step**; A median3.6146745, B3.5440835. No hot compilation or profiler. Conservatively using the campaign's ×1.5 mapping gives **0.117889500ms/token forecast**, replacing the earlier standalone0.137452500 estimate; do not add both. Only one compatible pending item, `VLLM_HPU_NATIVE_RECEIVE_PREPOST=0`. TP2/DSpark/B>1 and full-serving remain unqualified. Official formal baseline **8.239257597ms/token**, target7 unmet. Evidence SSD `decode-receive-prepost-real16-04/DECISION.json`; original cold failures retained.
+
+## 2026-10-07：精确 PV 转换旁支（组件合格，服务未接入）
+
+父基线 `decode-accumulated-serving-07`：8.239257597ms/token。完整 QKV→MLA→WO→原生四卡 peer→weighted post/norm→router，五组真实输入×四卡的12项输出/缓存逐位一致。三轮原生 A/B 节省 0.000026875 / 0.000060906250 / 0.000003382813ms/reuse，方向均正；中位 0.000026875ms/reuse。按32个 reuse 层估算 **0.000860000ms/token**，实际兑现未测。无额外存储常驻；所有格式转换和下游消费者包含在计时里。
+
+开关是私有组件工具的 `fused=B`，默认关闭；正常模型/服务入口尚未集成，不声称 main 默认已具备该路径。编译器仍将 cast 收入 PV bundle，不声称 QK/转换已经交叠。第二个显式 F32V 输出方案数值通过、编译门槛失败，未计时，不计入收益。两项兼容待验收为 receive preposting **0.117889500** + 本项 **0.000860000** = **0.118749500ms/token**；远低于正式触发线，也未达7ms目标。
+
+证据：`/opt/ssd960/1cat-vllm-decode-archives/decode-mla-deferred-pv-01/{DECISION.json,chain01/rank0/result.json,chain01/native-snapshot/RESTORATION.txt}`。第一版对象文件/源码保留并重新链接，原始运行没有记录私有扩展 SHA，不能声称重链接二进制与当时逐字节一致；原生输出接口及实际编译记录保留。
