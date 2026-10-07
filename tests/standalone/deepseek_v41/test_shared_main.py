@@ -18,8 +18,11 @@ def native_reference(monkeypatch):
     def reuse(q, swa, rows, mask, positions, sink, scale, lengths):
         return q + rows.sum() + swa.sum()
 
-    monkeypatch.setattr(torch.ops.custom_op, 'custom_deepseek_v41_main_publish_mla_gaudi2', publish, raising=False)
-    monkeypatch.setattr(torch.ops.custom_op, 'custom_deepseek_v41_main_reuse_mla_gaudi2', reuse, raising=False)
+    for name in ('main_publish_mla', 'main_publish_vector_mla', 'main_publish_vector_mask_mla'):
+        monkeypatch.setattr(torch.ops.custom_op, f'custom_deepseek_v41_{name}_gaudi2', publish, raising=False)
+    for name in ('main_reuse_mla', 'main_reuse_vector_mla', 'main_reuse_vector_mask_mla',
+                 'main_reuse_native_codec_mla'):
+        monkeypatch.setattr(torch.ops.custom_op, f'custom_deepseek_v41_{name}_gaudi2', reuse, raising=False)
     monkeypatch.setattr(torch.ops.custom_op, 'custom_deepseek_v41_bf16_identity_gaudi2',
                         lambda x: x.clone(), raising=False)
     return publish

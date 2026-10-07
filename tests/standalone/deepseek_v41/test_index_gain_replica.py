@@ -17,6 +17,7 @@ def owner_for(tp):
     query = torch.randn(32 // tp * 128, 16, generator=generator).bfloat16()
     owner = SimpleNamespace(
         owns_index=True, tensor_parallel_size=tp, index_heads=32 // tp, _index_gain_weight=None,
+        native_rope=False,
         weights=SimpleNamespace(indexer=SimpleNamespace(
             weights_proj=SimpleNamespace(weight=gain[:32 // tp].clone()), wq_b=SimpleNamespace(weight=query))),
         gather=lambda value, dim: gain.clone(),

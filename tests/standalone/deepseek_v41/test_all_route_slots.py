@@ -20,6 +20,7 @@ def test_public_moe_forward_passes_the_serving_decode_flag(decode):
 
     moe = SimpleNamespace(weights=SimpleNamespace(gate=gate, experts=None), router_top6=False,
                           topk=6, n256=True, n256_fp8=True, n256_fused_reduce=True,
+                          expert_shared_scale=False,
                           prefill_grouped=False, prefill_mxfp4=False,
                           _router_logits=lambda *args: torch.ones(1, 6),
                           shared_expert=lambda *args: torch.zeros_like(value),
