@@ -4,8 +4,9 @@ import numpy as np
 import pytest
 import torch
 from types import SimpleNamespace
+import threading
 
-from vllm_gaudi.ops.deepseek_v41_device_prepare import prepare_expert_device, read_source_batch
+from vllm_gaudi.ops.deepseek_v41_device_prepare import prepare_expert_device, read_source_batch, staged_source_batches
 from vllm_gaudi.ops.deepseek_v41_expert_n256 import prepare_expert, saturated_decode_eligible
 
 
@@ -48,3 +49,18 @@ def test_source_batch_offset_and_truncation(tmp_path):
     path.write_bytes(b"header" + value[:20].tobytes())
     with pytest.raises(ValueError, match="Truncated"):
         read_source_batch(source, 19, 24)
+
+
+def test_staged_reader_keeps_order_and_checks_immutable_source(tmp_path):
+    value = np.arange(20 * 2 * 16, dtype=np.int16).reshape(20, 2, 16)
+    path = tmp_path / "source"
+    path.write_bytes(value.tobytes())
+    source = SimpleNamespace(file=path, offset=0, shape=value.shape, nbytes=value.nbytes, dtype="I16")
+    threads = []
+    shard = SimpleNamespace(check_identity=lambda: threads.append(threading.get_ident()))
+    result = list(staged_source_batches(shard, source, source, 8))
+    assert [(first, last) for first, last, _, _ in result] == [(0, 8), (8, 16), (16, 20)]
+    for first, last, q, s in result:
+        assert np.array_equal(q, value[first:last])
+        assert np.array_equal(s, value[first:last])
+    assert len(threads) == 6 and threading.get_ident() not in threads

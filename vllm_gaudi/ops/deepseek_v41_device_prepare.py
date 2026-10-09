@@ -5,6 +5,7 @@ All layout and exponent decisions use integer arithmetic. The serving loader
 does not select this prototype until its complete upload/consumer gate passes.
 """
 from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
@@ -95,6 +96,28 @@ def read_source_batch(source, first, last):
     return result
 
 
+def staged_source_batches(shard, source_q, source_s, batch):
+    """One reader prepares the next compressed batch; it never calls HPU APIs."""
+    experts = source_q.shape[0]
+
+    def read(first):
+        last = min(first + batch, experts)
+        shard.check_identity()
+        q = read_source_batch(source_q, first, last)
+        s = read_source_batch(source_s, first, last)
+        shard.check_identity()
+        return first, last, q, s
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(read, 0)
+        for first in range(0, experts, batch):
+            current = future.result()
+            if first + batch < experts:
+                future = pool.submit(read, first + batch)
+            yield current
+            del current
+
+
 def fill_projection_device(shard, source_q, source_s, q, planes, channel, *, compact_scales, active_k):
     """Fill the sole resident allocation with bounded device preparation batches.
 
@@ -106,22 +129,22 @@ def fill_projection_device(shard, source_q, source_s, q, planes, channel, *, com
     source_bytes = (source_q.nbytes + source_s.nbytes) // experts
     # Conservative simultaneous-lifetime allowance for the integer conversion
     # graph. Source staging stays <=128 MiB; transient device storage <=2 GiB.
-    batch = min(16, max(1, (128 << 20) // source_bytes), max(1, (2 << 30) // (24 * source_bytes)))
+    batch = min(16, max(1, (64 << 20) // source_bytes), max(1, (2 << 30) // (24 * source_bytes)))
+    if source_bytes > 64 << 20:
+        raise ValueError("Device expert source exceeds double-buffer staging budget")
     if 24 * source_bytes > 2 << 30:
         raise ValueError("Device expert preparation exceeds its temporary budget")
     convert = compiled_preparation(compact_scales, active_k)
     certificates = torch.empty((experts, 2), dtype=torch.int32, device=q.device)
-    for first in range(0, experts, batch):
-        last = min(first + batch, experts)
-        shard.check_identity()
-        raw_q = read_source_batch(source_q, first, last)
-        raw_s = read_source_batch(source_s, first, last)
-        shard.check_identity()
+    for first, last, raw_q, raw_s in staged_source_batches(shard, source_q, source_s, batch):
         prepared = convert(torch.from_numpy(raw_q).to(q.device), torch.from_numpy(raw_s.view("<i2")).to(q.device))
         q[first:last].copy_(prepared[0])
         planes[first:last].copy_(prepared[1])
         channel[first:last].copy_(prepared[2].view(torch.bfloat16))
         certificates[first:last].copy_(prepared[3])
+        # Uploads are synchronous; do not retain the caller's previous source
+        # arrays when the reader advances its two-buffer window.
+        del raw_q, raw_s
     valid, eligible = certificates.bool().all(0).cpu().tolist()
     if not valid:
         raise ValueError("Device preparation rejected the source FP4/scale qualification")
