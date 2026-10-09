@@ -4,6 +4,8 @@
 #include <initializer_list>
 extern unsigned char _binary___deepseek_v41_logical_mla_gather_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_logical_mla_gather_gaudi2_o_end;
+extern unsigned char _binary___deepseek_v41_logical_mla_vector_gaudi2_o_start;
+extern unsigned char _binary___deepseek_v41_logical_mla_vector_gaudi2_o_end;
 tpc_lib_api::GlueCodeReturn DeepseekV41LogicalMlaGatherGaudi2::GetGcDefinitions(
     tpc_lib_api::HabanaKernelParams* in, tpc_lib_api::HabanaKernelInstantiation* out) {
     using namespace tpc_lib_api;
@@ -58,8 +60,10 @@ tpc_lib_api::GlueCodeReturn DeepseekV41LogicalMlaGatherGaudi2::GetGcDefinitions(
     map(out->outputTensorAccessPattern[2], 1, 1, 1, 0);
     out->kernel.paramsNr = 1;
     std::memcpy(out->kernel.scalarParams, &ratio, sizeof(ratio));
-    auto* first = &_binary___deepseek_v41_logical_mla_gather_gaudi2_o_start;
-    auto* last = &_binary___deepseek_v41_logical_mla_gather_gaudi2_o_end;
+    auto* first = vector_ ? &_binary___deepseek_v41_logical_mla_vector_gaudi2_o_start
+                         : &_binary___deepseek_v41_logical_mla_gather_gaudi2_o_start;
+    auto* last = vector_ ? &_binary___deepseek_v41_logical_mla_vector_gaudi2_o_end
+                        : &_binary___deepseek_v41_logical_mla_gather_gaudi2_o_end;
     const auto capacity = out->kernel.elfSize;
     out->kernel.elfSize = last - first;
     if (capacity < out->kernel.elfSize) return GLUE_INSUFFICIENT_ELF_BUFFER;

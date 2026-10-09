@@ -126,11 +126,14 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             pipeline_parallel_size=self.pipeline_parallel_size,
             dspark=envs.VLLM_HPU_DSV41_DSPARK,
         )
-        self.program.replay_owner = StageReplay(self.program, greedy_tail=not self.program.dspark) if self.native else None
+        self.program.replay_owner = (StageReplay(self.program, greedy_tail=not self.program.dspark)
+                                     if self.native else None)
         self.ordinary = CompiledStage(self.program, prepared_tp4=not self.native and self.tensor_parallel_size == 4)
         self.compiled_input = None
         self.compiled_input_calls = 0
-        if not self.native and self.tensor_parallel_size == 4:
+        if (not self.native and self.tensor_parallel_size == 4) or (
+            envs.VLLM_HPU_DSV41_DEVICE_ROUNDS and self.program.dspark and self.is_first_stage
+        ):
             from vllm_gaudi.compilation.deepseek_v41_tp4 import make_backend
 
             self.compiled_input = torch.compile(
@@ -333,8 +336,10 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
 
     def initialize_request_state(self, capacity):
         """Request-owned state shared by native C1 and optional batch replay."""
-        if self.program.dspark or not self.native:
+        if not self.native:
             raise RuntimeError("Request slots require ordinary native replay")
+        if self.program.dspark and capacity != 1:
+            raise ValueError("DSpark prefix state currently requires one active request")
         from vllm_gaudi.ops.deepseek_v41_batch_state import BatchStageState
 
         self.batch_state = BatchStageState(self.program, capacity)
@@ -479,14 +484,16 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             and self.step_use_replay
             and inputs_embeds is None
         )
+        from vllm_gaudi.ops.deepseek_v41_replay import _native_input_count_compatible
+
         native_input = (
             self.pp_rank == 0
             and self.native
             and self.step_use_replay
-            and envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH
-            and not self.program.dspark
+            and (envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH
+                 or self.program.dspark and envs.VLLM_HPU_DSV41_DSPARK_NATIVE_TARGET_INPUT)
+            and _native_input_count_compatible(self.program, input_ids.numel())
             and inputs_embeds is None
-            and input_ids.numel() == 1
             and not fused_text_io
         )
         tp4_prefix = not self.native and self.tensor_parallel_size == 4 and self._decode_prefix is not None
@@ -540,6 +547,13 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             else:
                 residual = pre = None
             engram = ()
+        if (envs.VLLM_HPU_DSV41_DEVICE_ROUNDS and self.program.dspark
+                and self.step_use_replay and input_ids.numel() == 6):
+            from vllm_gaudi.ops.deepseek_v41_math import unpack_swa
+
+            # Ordinary startup and request entry must bind the same BF16
+            # rows as the device producer used by subsequent rounds.
+            engram = tuple(row if row.dtype == torch.bfloat16 else unpack_swa(row, 256) for row in engram)
         compiled_tp4 = self.tensor_parallel_size == 4 and 1 <= input_ids.numel() <= 6
         if self.program.length > 512 and not self.step_use_replay and not compiled_tp4:
             # Keep prompt geometries out of the shape-specialized compile
@@ -549,6 +563,11 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             execute = self.program
         else:
             execute = self.program.replay_owner if self.native and self.step_use_replay else self.ordinary
+        timing = getattr(self, "verify_timing", None)
+        if timing:
+            # Inputs and Engram are already staged. These nonblocking device
+            # markers exclude frontend gaps from the target replay interval.
+            timing.device("target_native_start")
         if tp4_prefix:
             ids_signature, position_signature, residual, pre, generation, search = self._decode_prefix
             if (
@@ -593,11 +612,28 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 output, pre, aux = execute(initial, None, positions, input_ids, engram)
             else:
                 output, pre, aux = execute(residual, pre, positions, input_ids, engram)
+        if timing:
+            timing.device("target_native_done")
         self.last_aux = aux
         if self.is_first_stage and not self.is_last_stage:
             if fused_text_io:
                 return IntermediateTensors({"pp_wire": output})
             return IntermediateTensors({"hidden_states": output, "pre_mix": pre})
+        return output
+
+    def forward_device_round(self, input_ids, positions, engram):
+        """Consume device-produced C6 inputs through the shared stage replay."""
+        if (not envs.VLLM_HPU_DSV41_DEVICE_ROUNDS or not self.program.dspark or not self.native
+                or not self.is_first_stage or not self.is_last_stage or input_ids.numel() != 6):
+            raise RuntimeError("Device round requires one native stage owning input and sampling")
+        fused = envs.VLLM_HPU_DSV41_FUSED_STAGE_IO
+        if fused:
+            residual = pre = None
+        else:
+            residual, pre = self.compiled_input(input_ids)
+        output, _, self.last_aux = self.program.replay_owner(
+            residual, pre, positions, input_ids, engram, fused_text_io=fused
+        )
         return output
 
     def compute_logits(self, hidden_states):

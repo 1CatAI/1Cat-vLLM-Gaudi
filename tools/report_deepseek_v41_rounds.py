@@ -30,9 +30,17 @@ def indexed(document):
     return result
 
 
-def reconcile(workers, engine):
+def reconcile(workers, engine, *, tensor_parallel_size=2):
     if set(workers) != set(range(4)):
         raise ValueError("Full-round qualification requires all four worker ledgers")
+    if tensor_parallel_size not in (2, 4):
+        raise ValueError("The four-worker geometry must be TP2/PP2 or TP4/PP1")
+    sampling_ranks = range(4 - tensor_parallel_size, 4)
+    for rank, document in workers.items():
+        if document.get("tensor_parallel_size", tensor_parallel_size) != tensor_parallel_size:
+            raise ValueError(f"Worker {rank} has a different TP geometry")
+        if document.get("sampling_owner", rank in sampling_ranks) != (rank in sampling_ranks):
+            raise ValueError(f"Worker {rank} has an inconsistent sampling owner")
     ranks = {rank: indexed(doc) for rank, doc in workers.items()}
     consumed = indexed(engine)
     keys = set(consumed)
@@ -49,8 +57,8 @@ def reconcile(workers, engine):
             raise ValueError(f"Scheduler C-shape disagreement for {key}")
         if any(row["end_ns"] < row["start_ns"] for row in rows):
             raise ValueError(f"Invalid worker interval for {key}")
-        if any(not row.get("ring_released") for row in rows[2:]):
-            raise ValueError(f"Missing PP1 post-release completion for {key}")
+        if any(not rows[rank].get("ring_released") for rank in sampling_ranks):
+            raise ValueError(f"Missing sampling-owner post-release completion for {key}")
         start = min(row["start_ns"] for row in rows)
         end = max(record["scheduler_consumed_ns"], *(row["end_ns"] for row in rows))
         if record["scheduler_consumed_ns"] < start:
@@ -73,7 +81,9 @@ def reconcile(workers, engine):
     return result
 
 
-def summarize(rows, discard):
+def summarize(rows, discard, *, c1_tpot_ms=None):
+    if c1_tpot_ms is not None and not c1_tpot_ms > 0:
+        raise ValueError("C1 TPOT must be positive")
     summaries = {}
     for request_id in dict.fromkeys(row["request_id"] for row in rows):
         request = [row for row in rows if row["request_id"] == request_id]
@@ -84,7 +94,15 @@ def summarize(rows, discard):
         prefill = [row for row in request if row["target_count"] > 6]
         proposed = sum(row["proposed_count"] for row in steady)
         accepted = sum(row["committed"] - 1 for row in steady)
+        histogram = {str(count): sum(row["committed"] - 1 == count for row in steady) for count in range(6)}
+        if any(not 1 <= row["committed"] <= 6 for row in complete):
+            raise ValueError("C6 must commit its anchor and zero to five drafts")
+        committed = sum(row["committed"] for row in steady)
+        round_ms = sum(row["full_round_ms"] for row in steady)
+        effective = round_ms / committed if committed else None
+        break_even = bool(c1_tpot_ms and effective is not None and effective < c1_tpot_ms)
         summaries[request_id] = dict(steady_c6=stats([row["full_round_ms"] for row in steady]),
+                                     all_c6=stats([row["full_round_ms"] for row in complete]),
                                      discarded_c6=min(discard, len(complete)),
                                      total_c6=len(complete),
                                      c1=stats([row["full_round_ms"] for row in c1]),
@@ -92,9 +110,19 @@ def summarize(rows, discard):
                                      prefill=stats([row["full_round_ms"] for row in prefill]),
                                      accepted_drafts=accepted,
                                      proposed_drafts=proposed,
+                                     accepted_count_distribution=histogram,
+                                     mean_committed=committed / len(steady) if steady else None,
+                                     full_accept_fraction=histogram["5"] / len(steady) if steady else None,
+                                     zero_accept_fraction=histogram["0"] / len(steady) if steady else None,
                                      acceptance_rate=accepted / proposed if proposed else None,
-                                     full_round_speed_pass=bool(steady)
-                                     and mean(row["full_round_ms"] for row in steady) < 50)
+                                     round_derived_ms_per_token=effective,
+                                     c1_tpot_ms=c1_tpot_ms,
+                                     break_even=break_even,
+                                     full_round_target_pass=bool(steady)
+                                     and mean(row["full_round_ms"] for row in steady) <= 25,
+                                     round_derived_speed_target_pass=bool(
+                                         break_even and effective <= min(8, .75 * c1_tpot_ms)),
+                                     formal_qualification=False)
     return summaries
 
 
@@ -102,6 +130,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run", type=Path)
     parser.add_argument("--discard", type=int, default=10)
+    parser.add_argument("--tensor-parallel-size", type=int, choices=(2, 4), default=2)
+    parser.add_argument("--c1-tpot-ms", type=float, help="Unprofiled C1 TPOT measured from the same source")
     args = parser.parse_args()
     if args.discard < 0:
         raise ValueError("Discard count cannot be negative")
@@ -110,18 +140,21 @@ def main():
     engines = list(directory.glob("engine-*.json"))
     if len(engines) != 1:
         raise ValueError("Expected one EngineCore timing ledger")
-    rows = reconcile(workers, json.loads(engines[0].read_text()))
-    summaries = summarize(rows, args.discard)
+    rows = reconcile(workers, json.loads(engines[0].read_text()), tensor_parallel_size=args.tensor_parallel_size)
+    summaries = summarize(rows, args.discard, c1_tpot_ms=args.c1_tpot_ms)
     result = dict(units="ms",
                   boundary="earliest worker input preparation through latest worker commit or scheduler consume",
                   discard=args.discard,
+                  tensor_parallel_size=args.tensor_parallel_size,
+                  formal_qualification=False,
                   requests=summaries,
                   rounds=rows)
     (args.run / "full-rounds.json").write_text(json.dumps(result, indent=2) + "\n")
     lines = [
         "# DSpark 完整轮次", "", "四个 rank 输入准备最早时刻至所有 worker 提交及 scheduler 消费的最晚时刻。",
         f"同主机 perf_counter_ns；无新增设备同步。每请求丢弃前 {args.discard} 个完整 C6，C1/尾部/prefill 单列。", "",
-        "| 请求 | 稳态 C6 数 | 平均 ms | P95 ms | 最大 ms | Draft 接受率 | <50 ms |", "|---|---:|---:|---:|---:|---:|---|"
+        "轮次推算不代替正式 EOS 请求、同代码 C1 对照和质量验收。", "",
+        "| 请求 | 稳态 C6 数 | 平均 ms | P95 ms | 平均提交 | Draft 接受率 | 盈亏平衡 |", "|---|---:|---:|---:|---:|---:|---|"
     ]
     for request_id, summary in summaries.items():
         timing = summary["steady_c6"]
@@ -129,8 +162,8 @@ def main():
             lines.append(f"| {request_id} | 0 | — | — | — | — | 未验收 |")
             continue
         lines.append(f"| {request_id} | {timing['count']} | {timing['mean_ms']:.6f} | {timing['p95_ms']:.6f} | "
-                     f"{timing['max_ms']:.6f} | {summary['acceptance_rate']:.2%} | "
-                     f"{'通过速度门' if summary['full_round_speed_pass'] else '未达标'} |")
+                     f"{summary['mean_committed']:.4f} | {summary['acceptance_rate']:.2%} | "
+                     f"{'低于 C1' if summary['break_even'] else '未通过或缺少 C1 对照'} |")
     (args.run / "FULL_ROUND_REPORT.md").write_text("\n".join(lines) + "\n")
     print(json.dumps(summaries, ensure_ascii=False))
 

@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 
+os.environ["PT_HPU_RECIPE_CACHE_CONFIG"] = os.environ.get("PT_HPU_RECIPE_CACHE_CONFIG", "").replace("{rank}", "0")
+
 from vllm_gaudi.entrypoints.deepseek_v41 import prepare_environment
 
 prepare_environment()

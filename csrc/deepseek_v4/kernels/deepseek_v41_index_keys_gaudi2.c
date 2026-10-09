@@ -25,7 +25,11 @@ static inline bfloat128 index_key(tensor cache, int row) {
 }
 
 
-void main(tensor cache, tensor pages, tensor rows, tensor output,
+void main(tensor cache, tensor pages, tensor rows,
+#ifdef DSV41_INDEX_WRITE_COMPLETION
+          tensor completion,
+#endif
+          tensor output,
           int ratio) {
     const int5 begin=get_index_space_offset(), end=begin+get_index_space_size();
     const int page_rows=128/ratio;
@@ -34,7 +38,11 @@ void main(tensor cache, tensor pages, tensor rows, tensor output,
         for(int column=begin[0];column<end[0];++column) {
                 const int logical=s_i32_ld_g(gen_addr((int5){column,batch},rows));
                 bfloat128 key=0;
-                if(logical>=0 && logical<page_count*page_rows) {
+                if(logical>=0 && logical<page_count*page_rows
+#ifdef DSV41_INDEX_WRITE_COMPLETION
+                   && s_i32_ld_g(gen_addr((int5){0},completion))>=-1
+#endif
+                ) {
                     const int request=get_dim_size(pages,1)>1?batch:0;
                     const int page=s_i32_ld_g(gen_addr((int5){logical/page_rows,request},pages));
                     const int offset=logical%page_rows;

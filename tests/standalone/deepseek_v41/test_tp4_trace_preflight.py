@@ -39,6 +39,30 @@ def test_raw_sdk_capture_keeps_compiler_debug_disabled(tmp_path):
     assert not host["api_group"]["SYNAPSE"]["value"] and not host["api_group"]["SCAL"]["value"]
 
 
+def test_recipe_identity_ignores_only_capture_destination(tmp_path):
+    import json
+
+    identities, environments = [], []
+    for name in ("first", "second"):
+        run = tmp_path / name
+        run.mkdir()
+        environment = {}
+        identities.append(configure_trace_artifacts(
+            environment, run, dump_plans=True, enable_profiler=False, raw_profiler=True))
+        environments.append(environment)
+        config = json.loads((run / "profiler-config.json").read_text())
+        assert config["GeneralSettings"]["values"]["outdir"]["value"] == str(run / "raw")
+    assert identities[0] == identities[1]
+    assert environments[0]["HABANA_PROF_CONFIG"] != environments[1]["HABANA_PROF_CONFIG"]
+    path = Path(environments[1]["HABANA_PROF_CONFIG"])
+    config = json.loads(path.read_text())
+    config["Plugins"][0]["values"]["api_group"]["HCCL"]["value"] = False
+    path.write_text(json.dumps(config))
+    changed = configure_trace_artifacts(
+        environments[1], path.parent, dump_plans=True, enable_profiler=False, raw_profiler=True)
+    assert changed != identities[1]
+
+
 @pytest.mark.parametrize("ignore_frontend", [True, False])
 def test_profile_control_reaches_workers_when_frontend_capture_is_disabled(monkeypatch, tmp_path, ignore_frontend):
     import asyncio
@@ -510,6 +534,36 @@ def test_mme_role_requires_unambiguous_weight_producer(monkeypatch):
     )
     rows["mme"]["inputs"][1] = dict(name="mixed")
     assert "mme" not in expert_mme_owners(rows)
+
+
+@pytest.mark.parametrize("packed,stage", [([384, 5, 327680], "W13 gate/up"), ([384, 20, 40960], "W2 down")])
+def test_sat_decoder_role_uses_packed_operand_contract(packed, stage, monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[3] / "tools"))
+    from report_deepseek_v41_trace import classify
+
+    role, purpose = classify("decoder", "custom_deepseek_v41_expert_token_wide_sat_fp8_gaudi2",
+                             [dict(shape=[36]), dict(shape=packed, dtype="int16")], [])
+    assert role == "路由专家" and purpose.startswith(stage)
+    role, purpose = classify("decoder", "custom_deepseek_v41_expert_token_wide_sat_fp8_gaudi2", [], [])
+    assert role == "路由专家" and purpose.startswith("阶段见张量合同")
+
+
+def test_sat_mme_role_follows_decoded_weight_alias(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[3] / "tools"))
+    from report_deepseek_v41_trace import expert_mme_owners
+
+    graph = dict(path="captured.json")
+    contracts = dict(
+        decoder=dict(graph=graph, symbol=dict(device_type=1, node="decoder",
+                      kernel="custom_deepseek_v41_expert_token_wide_sat_fp8_gaudi2"),
+                     inputs=[dict(name="ids"), dict(name="packed", shape=[384, 5, 327680], dtype="int16")],
+                     outputs=[dict(name="tile")]),
+        mme=dict(graph=graph, symbol=dict(device_type=0, node="consumer", kernel="batch_gemm"),
+                 inputs=[dict(name="activation"), dict(name="weight-view", alias="tile")], outputs=[]),
+    )
+    assert expert_mme_owners(contracts)["mme"]["role"] == "W13"
+    contracts["decoder"]["inputs"][1]["dtype"] = "unknown"
+    assert "mme" not in expert_mme_owners(contracts)
 
 
 def test_tp4_prefill_single_16k_chunk_includes_first_token_consumer():

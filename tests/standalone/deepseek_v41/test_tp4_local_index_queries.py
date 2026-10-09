@@ -11,10 +11,11 @@ from vllm_gaudi.ops.deepseek_v41_tp4_selection import (
     invalidate_local_index_queries, local_index_query_projections, prepare_local_index_queries)
 
 
-def owner_with_shards(rank):
+def owner_with_shards(rank, tp_size=4):
     generator = torch.Generator().manual_seed(615)
-    query = torch.randn(4, 1024, 1280, generator=generator).bfloat16()
-    score = torch.randn(4, 8, 5120, generator=generator).bfloat16()
+    heads = 32 // tp_size
+    query = torch.randn(tp_size, heads * 128, 1280, generator=generator).bfloat16()
+    score = torch.randn(tp_size, heads, 5120, generator=generator).bfloat16()
     indexer = SimpleNamespace(wq_b=SimpleNamespace(weight=query[rank].clone(), scale=torch.empty(0)),
                               weights_proj=SimpleNamespace(weight=score[rank].clone()))
     calls = []
@@ -22,10 +23,10 @@ def owner_with_shards(rank):
     def gather(value, dim):
         assert dim == 0
         calls.append(tuple(value.shape))
-        shards = query if value.shape == (1024, 1280) else score
+        shards = query if value.shape == (heads * 128, 1280) else score
         return shards.flatten(0, 1).clone()
 
-    owner = SimpleNamespace(tensor_parallel_size=4, owns_index=True, index_heads=8, prefill_tp_rank=rank,
+    owner = SimpleNamespace(tensor_parallel_size=tp_size, owns_index=True, index_heads=heads, prefill_tp_rank=rank,
                             weights=SimpleNamespace(indexer=indexer), gather=gather,
                             tp4_local_index_queries=False)
     return owner, query, score, calls
@@ -65,9 +66,29 @@ def test_projections_equal_original_rank_order_and_activation_rounding(tokens):
 
 def test_prepare_rejects_unsupported_owner():
     owner, _, _, _ = owner_with_shards(0)
-    owner.tensor_parallel_size = 2
-    with pytest.raises(ValueError, match="TP4"):
+    owner.tensor_parallel_size = 3
+    with pytest.raises(ValueError, match="supported TP"):
         prepare_local_index_queries(owner)
+
+
+@pytest.mark.parametrize("tp_size", [2, 4])
+@pytest.mark.parametrize("tokens", [1, 2, 6])
+def test_joint_weight_reads_keep_global_head_order_and_shard_views(tp_size, tokens):
+    owner, query, score, _ = owner_with_shards(1, tp_size)
+    prepare_local_index_queries(owner, release_local=True, joint=True)
+    generator = torch.Generator().manual_seed(742)
+    value = torch.randn(tokens, 5120, generator=generator).bfloat16()
+    qr = torch.randn(tokens, 1280, generator=generator).bfloat16()
+    actual = local_index_query_projections(owner, value, qr, joint=True)
+    expected = local_index_query_projections(owner, value, qr)
+    assert all(torch.equal(a, b) for a, b in zip(actual, expected, strict=True))
+    assert torch.equal(owner._index_query_full_weight, query.flatten(0, 1))
+    assert torch.equal(owner._index_score_full_weight, score.flatten(0, 1))
+    assert owner.weights.indexer.wq_b.weight.is_set_to(owner._tp4_index_query_shard_1)
+    assert owner.weights.indexer.wq_b.weight.untyped_storage().data_ptr() == (
+        owner._index_query_full_weight.untyped_storage().data_ptr())
+    invalidate_local_index_queries(owner)
+    assert owner._index_query_full_weight is None and owner._index_score_full_weight is None
 
 
 @pytest.mark.parametrize("rank", range(4))

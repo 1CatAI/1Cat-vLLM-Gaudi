@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
+#if defined(DSV41_MAIN_PUBLISH_SCHEMA) || defined(DSV41_MAIN_REUSE_SCHEMA)
+#include "dsv41_c6_shared_main_backend.h"
+#else
+// SPDX-License-Identifier: Apache-2.0
 // Share only selected main rows within one C1 layer group; SWA stays per layer.
 #include <ATen/ATen.h>
 #include <torch/library.h>
@@ -236,3 +240,5 @@ TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
     m.impl("custom_deepseek_v41_main_publish_mla_gaudi2", publish<true>);
     m.impl("custom_deepseek_v41_main_reuse_mla_gaudi2", reuse<true>);
 }
+
+#endif

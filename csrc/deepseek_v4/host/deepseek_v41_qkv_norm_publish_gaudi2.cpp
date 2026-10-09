@@ -16,9 +16,10 @@ tpc_lib_api::GlueCodeReturn DeepseekV41QkvNormPublishGaudi2::GetGcDefinitions(
     const auto& kv=in->inputTensors[2].geometry;const auto& kn=in->inputTensors[3].geometry;
     const auto& pos=in->inputTensors[4].geometry;const auto& phase=in->inputTensors[5].geometry;
     const auto& cache=in->inputTensors[6].geometry;const auto& dec=in->inputTensors[7].geometry;
-    if(q.dims!=2 || q.maxSizes[0]!=1280 || q.maxSizes[1]!=1 || qn.dims!=1 || qn.maxSizes[0]!=1280 ||
-       kv.dims!=2 || kv.maxSizes[0]!=512 || kv.maxSizes[1]!=1 || kn.dims!=1 || kn.maxSizes[0]!=512 ||
-       pos.dims!=1 || pos.maxSizes[0]!=1 || phase.dims!=2 || phase.maxSizes[0]!=64 || !phase.maxSizes[1] ||
+    const auto rows=q.maxSizes[1];
+    if(q.dims!=2 || q.maxSizes[0]!=1280 || (!rows || rows>6) || qn.dims!=1 || qn.maxSizes[0]!=1280 ||
+       kv.dims!=2 || kv.maxSizes[0]!=512 || kv.maxSizes[1]!=rows || kn.dims!=1 || kn.maxSizes[0]!=512 ||
+       pos.dims!=1 || pos.maxSizes[0]!=rows || phase.dims!=2 || phase.maxSizes[0]!=64 || !phase.maxSizes[1] ||
        phase.maxSizes[1]>1048576 || cache.dims!=2 || cache.maxSizes[0]!=528 || cache.maxSizes[1]<256 ||
        dec.dims!=2 || dec.maxSizes[0]!=512 || dec.maxSizes[1]<512)return GLUE_INCOMPATIBLE_INPUT_SIZE;
     const auto* raw=static_cast<const char*>(in->nodeParams.nodeParams);float epsilon;int offset;
@@ -30,11 +31,11 @@ tpc_lib_api::GlueCodeReturn DeepseekV41QkvNormPublishGaudi2::GetGcDefinitions(
     for(unsigned i=0;i<5;++i) {
         const auto& y=in->outputTensors[i].geometry;
         if(y.dataType!=outputs[i])return GLUE_INCOMPATIBLE_DATA_TYPE;
-        if(y.dims!=(i==4?1:2) || y.maxSizes[0]!=widths[i] || (i!=4 && y.maxSizes[1]!=1))return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+        if(y.dims!=(i==4 && rows==1?1:2) || y.maxSizes[0]!=widths[i] || ((i!=4 || rows!=1) && y.maxSizes[1]!=rows))return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
         out->outputTensorAccessPattern[i].allRequired=true;
     }
     for(unsigned i=0;i<8;++i)out->inputTensorAccessPattern[i].allRequired=true;
-    out->indexSpaceRank=1;out->indexSpaceGeometry[0]=17;
+    out->indexSpaceRank=rows==1?1:2;out->indexSpaceGeometry[0]=17;out->indexSpaceGeometry[1]=rows;
     out->kernel.paramsNr=2;std::memcpy(out->kernel.scalarParams,raw,sizeof(float)+sizeof(int));
     auto* first=&_binary___deepseek_v41_qkv_norm_publish_gaudi2_o_start;
     auto* last=&_binary___deepseek_v41_qkv_norm_publish_gaudi2_o_end;

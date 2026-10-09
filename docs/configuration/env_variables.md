@@ -75,6 +75,22 @@ continue to use their existing sources. The variable is unset by default.
 
 `VLLM_HPU_DSV41_MHC_BATCH_REUSE=1` tests four-request control-weight reuse in the ordinary decode batch path. It keeps FP32 operands and each request's original K accumulation and reduction order. It is disabled by default pending complete-chain and serving qualification.
 
+`VLLM_HPU_DSV41_DSPARK_BF16_PROJECTIONS=1` retains BF16 checkpoint vocabulary/router weights in DSpark. FP32 activations use BF16 high/low rows in one GEMM with FP32 accumulation; BF16 activations use their exact single term. Disabled by default pending batch qualification.
+
+`VLLM_HPU_DSV41_MHC_CONTROL_MME=1` enables the C2–C6 Target control projection using BF16 high/low weight terms and FP32 MME results. It preserves the C1 and prefill paths. Enabled by default after the official sampled serving12 round qualification (32.1803 ms/round). Set it to 0 for the reference path.
+
+`VLLM_HPU_DSV41_DSPARK_SAMPLING_WIDTH` selects 64, 128 or 256 candidates for the separately gated bounded p/q samplers; its default is 64. All bounded sampler modes remain disabled pending batch qualification. Uncovered rows retain the complete probability reference.
+
+`VLLM_HPU_DSV41_DSPARK_FEATURE_SILU` (default `0`) tests the shared 128-channel SiLU/quantization tiles in the C2–C6 token-wide expert body. The prepared intermediate width determines tile count; checkpoint scales, FP8 boundaries and route reduction remain unchanged. This requires the separate DSpark operator build and a complete producer/consumer microbenchmark before batch qualification.
+
+`VLLM_HPU_DSV41_DSPARK_NATIVE_SAMPLED_PROTOCOL` (default `0`) prepares two native official-sampling control plans, one per device cursor frame. Verification, drafting, the original RNG draw and a bounded journal of the next Target's writable cache rows are captured together. The next Target is queued before the host consumes the certificate. An uncovered packet discards that unpublished lookahead, restores the original draw/cache state and executes the complete probability reference. This remains a development candidate pending production-chain numerical and performance qualification.
+
+`VLLM_HPU_DSV41_DSPARK_SAMPLING_WIDTH` (default `64`) selects the per-shard candidate count for both Target probabilities and all five Markov proposal steps in the native sampled protocol. Supported development buckets are `64`, `128`, and `256`. The full-vocabulary normalization and coverage certificate are retained; increasing this count does not change the native five-draft block size or remove exact repair.
+
+`VLLM_HPU_DSV41_DSPARK_COHESIVE_MLA` (default `0`) tests a conservative full-query-row access mapping for the existing logical MLA compound operator in ratio-one cache layers. Its arithmetic, index space and packed KV format are unchanged; the separate DSpark library supplies the glue alias. Compiled placement and complete-chain timing must confirm that the compiler actually retains one C2–C6 producer.
+
+`VLLM_HPU_DSV41_REQUEST_FIXTURE_DIR` exports three actual 16K official sampled C6 input boundaries, including request-owned q, RNG and draft cache state, in an unscored diagnostic request. It synchronizes and must be unset for performance qualification. Startup warmup exports do not qualify as 16K production inputs.
+
 `VLLM_HPU_DSV41_MHC_CONTROL_PREFETCH=1` tests four-vector load lookahead for the concurrent FP32 mHC control projection. It preserves the ordered MAC and reduction sequence and leaves the fused C1 RRMS path unchanged. Disabled by default pending complete-chain and serving qualification.
 
 `VLLM_HPU_DSV41_BATCH_COMPRESSOR_PAIR=1` tests request-slot history updates and
@@ -352,6 +368,7 @@ generic vLLM entrypoint keeps the individual switches disabled.
 | `VLLM_HPU_DSV41_GRAPH_REPLAY` | Captures each PP stage with the ABI-locked native compute/communication plan. Requires prepared communication and the static group plan. | `true` in the dedicated entrypoint; otherwise `false` |
 | `VLLM_HPU_DSV41_V2` | Selects the V2 HPU adapter with device token relay and deferred host output. Requires `VLLM_USE_V2_MODEL_RUNNER=1`, async scheduling, native replay, direct token IDs, and the engine's non-Triton V2 platform capability hook. Ordinary C1 only; incompatible with DSpark and inline completion. The complete device-continuation bundle passed the frozen 3x192-token output and end-to-end gates. | `true` in the dedicated entrypoint; otherwise `false` |
 | `VLLM_HPU_DSV41_DSPARK` | Runs the three-layer draft on PP1 with accepted-prefix context insertion and Engram rollback. Requires `method=dspark`, five speculative tokens. | `false` |
+| `VLLM_HPU_DSV41_DSPARK_INDEX_QUERY_LOCAL` | C1–C6 index query/gains projections from cold rank-ordered BF16 weight replicas, without their per-call collectives. TP size is parameterized; enabled by default in DSpark after combined official qualification. Explicit `0` restores the reference. | DSpark: `true`; otherwise `false` |
 | `VLLM_HPU_DSV41_VISION` | Binds the portable upstream ViT/aligner to prepared PP0 weights. Requires `mm_encoder_tp_mode=data`. | `false` |
 | `VLLM_HPU_DSV41_QUANT_ROUNDTRIP` | Fuses BF16 activation group-32 E4M3FN quantization and restoration in TPC. Matrix operands remain BF16. Experimental. | `false` |
 | `VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT` | Uses independent group-32 codecs sharing a full TPC vector for large prompt activations and wo_a emission. Keeps checkpoint rounding and requires the matching native library. | `true` in the dedicated entrypoint; otherwise `false` |
@@ -765,6 +782,7 @@ after a state update terminates execution rather than retrying another path.
 | Parameter | Default | Description |
 | --- | --- | --- |
 | `VLLM_HPU_DSV41_DEVICE_VERIFY` | `0` | Keep accepted-prefix control and PP commit on the device, with final asynchronous scheduler consumption. |
+| `VLLM_HPU_DSV41_DEVICE_ROUNDS` | `0` | Diagnostic C6 continuation on a stage owning both embedding and sampling. Keeps accepted Engram history and the next round's inputs on device, with one queued round ahead of scheduler output consumption. Requires native replay and device verification. |
 | `VLLM_HPU_DSV41_FUSED_STAGE_IO` | `0` | Fuse text embedding and PP wire transforms into the stage graph. Use pinned packed Engram staging; requires the packed-output host extension. |
 | `VLLM_HPU_DSV41_ENGRAM_PACKED_STAGING` | `0` | Gather Engram rows directly into the final pinned packed staging buffer, without changing stage replay or PP wire transforms. Requires packed-output host extension version 1. |
 | `VLLM_HPU_DSV41_BATCH_C1_PREPARE` | `0` | Reuse native C1 Engram preparation for a single ordinary request in the slot-based batch runner. Requires `VLLM_HPU_DSV41_ENGRAM_NATIVE_C1`; larger batches retain their packed staging path. |
@@ -904,6 +922,278 @@ default off pending complete-chain and serving qualification.
 
 `VLLM_HPU_DSV41_PREFILL_ROPE` (default `1`) uses native forward and inverse RoPE for BF16 query batches of 7–16384 rows when native V4.1 RoPE is enabled. It preserves the large-query path's separate FP32 products and final BF16 rounding; C1–C6 keep their existing arithmetic. Set it to `0` to diagnose the tensor implementation. Rebuild the native extension before enabling this path.
 
+`VLLM_HPU_DSV41_WARMUP_FIXTURE_DIR` optionally exports three real model-generated C6 activation sets during sampled startup warmup for reusable microbenchmarks. It performs no export during scored requests. Unset by default.
+
+`VLLM_HPU_DSV41_DSPARK_BOUNDED_SAMPLING=1` tests conservative top-256 nucleus filtering for both Target and proposal probability paths, retaining a complete-sort fallback for uncovered/tied rows. Disabled by default; device conditional replay must pass changing-coverage checks before serving qualification.
+
+`VLLM_HPU_DSV41_DSPARK_RADIX_SAMPLING=1` selects the private full-FP32 radix threshold/emit candidate inside bounded sampling. Requires the candidate operator library and the bounded-sampling switch; disabled by default. It never rounds logits to BF16 keys.
+
+`VLLM_HPU_DSV41_DSPARK_SHARDED_BOUNDED_SAMPLING=1` tests the common C1 partition-function/candidate packet for exact speculative p/q, with full-logit fallback when coverage fails. Alternative to global bounded sampling, not an additive optimization. Disabled by default; changing coverage and collective execution must be qualified before use.
+
+`VLLM_HPU_DSV41_DSPARK_MERGED_MLA` (default `0`) selects the additive C2–C6 ratio-one MLA codec for search buckets through 65536. It merges the indexer’s sorted selections in 128 device partitions, decodes each shared KV row once, and preserves the existing batch GEMM operands and slot order. No host metadata or graph export is required. Other buckets retain the shared reference path.
+
+`VLLM_HPU_DSV41_DSPARK_NATIVE_FULL_REPAIR` (default `0`): capture the exact full-vocabulary official-sampling repair through the shared native executor before serving. Applies only to the experimental sampled DSpark continuation; no speed or profiler qualification yet.
+
+`VLLM_HPU_DSV41_DSPARK_PARTITION_RADIX_SAMPLING` (default `0`): select local vocabulary candidates in eight partitions using the shared FP32 threshold/emit implementation, then merge the bounded candidates. C1–C6 sampling rows only; production geometry and native replay gate pending. This changes the parallel index space; it is not the single-pass DeepSelect algorithm.
+
+`VLLM_HPU_DSV41_DSPARK_STREAM_FILTER_SAMPLING` (default `0`): scan each vocabulary partition once against a conservative score threshold, then compact and merge bounded candidates. The full partition function is preserved. Overflow or insufficient coverage requires the same exact asynchronous repair; an uncertified truncated proposal is never published. Bulk scores are scanned once, with a bounded reread of retained candidates for emission. Production native replay and service qualification are required before enabling.
+
+`VLLM_HPU_DSV41_DSPARK_SHARED_KV_MME` (default `0`): private C2-C6 validation candidate. Device-generated membership maps let QK/PV consume shared decoded KV directly; per-query visibility, sink and FP32 probabilities are retained.
+
+`VLLM_HPU_DSV41_DSPARK_GROUP_PIPELINE` (default `0`): private C2-C6 SAT decoder validation. Carry the existing eight weight vectors and the next scale across K32 groups. Quantization, weight layout, route order and window size stay unchanged.
+
+`VLLM_HPU_DSV41_DSPARK_COMPACT_KV_MME` (default `0`): private ratio-one C2-C6 experiment for a bounded packed-cache search. Device range merges and prefix sums compact shared rows before MME; softmax scans actual active rows. Larger contexts retain the common path and full configured capacity.
+
+`VLLM_HPU_DSV41_DSPARK_CHANNEL_SILU` (default `0`): private C2-C6 SAT consumer experiment. Aligned 128-channel BF16 loads and paired rounding replace half-vector channel loads; row amax, FP8 scale, activation ordering and route reduction are retained.
+
+`VLLM_HPU_DSV41_DSPARK_W13_UNROLL` (default `0`): private C2-C6 SAT W13 experiment. Unroll the three fixed inner steps to remove loop-carried vector moves. The eight-vector window, W2, quantization and ordered reduction stay unchanged.
+
+`VLLM_HPU_DSV41_DSPARK_MAIN_MIRROR` (default `0`): private C2-C6 selected-KV experiment. Maintain the canonical packed-FP4 roundtrip once in a bounded logical BF16 mirror shared by later layers and query rows. Beyond 32768 tokens the paged cache remains the source. Mirror writes participate in native state and repair journals.
+
+`VLLM_HPU_DSV41_DSPARK_EXACT_DRAFT_SAMPLING` (default `0`): keep official draft q on the exact full-vocabulary sampler inside the shared C5/native protocol while Target p may use certified bounded candidates. This preserves draft probabilities and request RNG draws; an uncovered Target still requires exact asynchronous repair. It does not enable a host sampler.
+
+`VLLM_HPU_DSV41_DSPARK_EXP_PV` (default `0`): private C2–C6 MLA experiment using BF16 unnormalized softmax exponents for one PV matrix multiplication, FP32 accumulation, and FP32 inverse-denominator normalization before the BF16 output boundary. Requires the additive native library and the existing attention numerical gate; C1 and other geometries retain the reference path.
+
+`VLLM_HPU_DSV41_DSPARK_WO_HANDOFF` (default `0`): experiment extending the common C1 inverse-RoPE/FP8 wo_a/group32 roundtrip/FP8 wo_b producer-consumer to C2–C6. Uses the existing immutable wo_a and dense wo_b sidecars, common TP geometry, and unchanged ordered TP reduction. Requires the additive handoff library and C1 numerical/native-chain qualification.
+
+`VLLM_HPU_DSV41_DSPARK_RESIDENT_CONSTANTS` (default `0`): apply the common C1 resident I32 operands, immutable small factories and clamp bounds to native DSpark Target capture. Request positions, mutable buffers, large/uninitialized factories and dynamic fills retain their original ownership. TP reductions and mHC partitioning are unchanged.
+
+`VLLM_HPU_DSV41_DSPARK_HEAD_INPUT_BOUNDARY` (default `0`): use the existing native BF16 row RMSNorm before the draft vocabulary projection for C1–C6. Its opaque TPC output preserves the checkpoint BF16 value boundary when the head implementation changes. The row-reduction numerical difference is separately checked; no host readback or debug state is introduced. Pending production native-chain qualification.
+
+`VLLM_HPU_DSV41_DSPARK_DECODED_PUBLISH` (default `0`): with the bounded DSpark main mirror, reuse the C1 FP4 packing/decoded-value producer for C1–C6. The last row for each duplicate physical slot publishes both packed and decoded values, replacing the per-step gather/unpack/scatter refresh. Packed pages remain authoritative; prefill and requests beyond the mirror use their existing path. Pending native producer/consumer qualification.
+
+`VLLM_HPU_DSV41_DSPARK_WEIGHTED_DRAFT_NUCLEUS` (default `0`): experimental score-order weighted radix selection for official C5 draft probabilities. It retains the request random draw and requires the existing asynchronous exact repair for a boundary tie or invalid certificate. Target bounded sampling and non-DSpark decoding are unchanged. Requires the private weighted-nucleus addon; no performance qualification yet.
+
+`VLLM_HPU_DSV41_DSPARK_MTP_FP8` (default `0`): experimental common N128 FP8 expert path for C1–C6 checkpoint top3/E128 draft layers. Requires the additive MTP addon and `VLLM_HPU_DSV41_DSPARK_MTP_FP8_SIDECAR`, prepared with `tools/prepare_deepseek_v41_fp8.py PREPARED OUTPUT --draft`. Target routing is unchanged; not performance or quality qualified.
+
+`VLLM_HPU_DSV41_DSPARK_WIDE_CODEC` (default `0`): reuse the existing four-group BF16 activation codec for C2–C6. Group32 scale and rounding rules are unchanged; pending native producer/consumer qualification.
+
+`VLLM_HPU_DSV41_DSPARK_SHARED_FINALIZE` (default `0`): reuse the ordered W2 TPC finalize for C2–C6 and add the independently produced BF16 shared expert row at the existing model rounding boundary. Requires the additive shared-finalize registration; pending producer/consumer qualification.
+
+`VLLM_HPU_DSV41_DSPARK_ROW_CACHE` (default `0`): C2–C6 reuse of three decoded KV rows within one TPC invocation. The cache retains the largest logical priorities, checks exact physical row identity, and stores each query’s original KV/mask layout. Requires the additive row-cache registration; pending native producer/consumer qualification.
+
+`VLLM_HPU_DSV41_DSPARK_FP4_TABLE` (default `0`): C2–C6 logical MLA gather uses a sixteen-entry exact BF16 nibble table. Cache layout, scales, output dtypes and sparse access contract match the parent; requires the additive registration and native-chain qualification.
+
+`VLLM_HPU_DSV41_DSPARK_SILU_SCALAR_CACHE` (default `0`): qualified SAT C2–C6 with padded640 intermediate retains five named BF16 activation vectors instead of an indexed array. Both arithmetic passes and amax are unchanged; requires the additive registration and native-chain qualification.
+
+`VLLM_HPU_DSV41_DSPARK_FULL_ROW` (default `0`): C2–C6 main-KV gather loads the256-byte packed row once, then selects its four64-byte groups in registers. Canonical cache, arithmetic and consumer shapes match the parent; requires the additive registration and native-chain qualification.
+
+`VLLM_HPU_DSV41_DSPARK_QUERY_NORM` (default `0`): C2–C6 query normalization reuses the accepted C1 BF16 norm. Projection precision and KV writer remain unchanged; requires native-chain and existing numerical-tolerance qualification.
+
+`VLLM_HPU_DSV41_DSPARK_Q_BF16_ROPE` (default `0`): C2–C6 BF16 query projection consumes its FP32 MME product in the shared128-channel RoPE epilogue. The original activation quantization, pre-RoPE BF16 boundary and final BF16 result are retained; requires the additive registration and native-chain qualification.
+
+`VLLM_HPU_DSV41_DSPARK_SWA_SOURCE_REUSE` (default `0`) experiments with source-owned packed SWA decoding for C2–C6, retaining split-main attention operands and arithmetic. Enable only with its validated native addon.
+
+`VLLM_HPU_DSV41_DSPARK_MAIN_ADJACENT_PV` (default `0`) experiments with BF16 high/low probability terms and an affine adjacent-head layout in the C2–C6 shared-main reuse path. Requires its validated native addon and numerical qualification.
+
+`VLLM_HPU_DSV41_DSPARK_BATCH_ENGRAM` (default `0`): batch C2–C6 device Engram rows and histories using the common producer. Requires the batched producer ABI; C1 remains unchanged. The prepared single-stage DSpark entrypoint enables it by default after qualification.
+
+`VLLM_HPU_DSV41_DSPARK_DRAFT_VOCAB_CDF` (default `0`, enabled by the prepared single-stage DSpark entrypoint)
+draws from the unchanged official draft probabilities using a blocked vocabulary-order CDF. Both
+native sampling and exact repair use the same mapping. Target sampling and request RNG allocation
+are unchanged; seeded draft trajectories can differ while proposal probabilities and rejection stay
+unchanged. Requires the qualified probability-draw registration.
+
+`VLLM_HPU_DSV41_DSPARK_NORM_ROUNDTRIP` (default `0`) fuses the C1 BF16 row normalization and
+block32 activation roundtrip at C2–C6 Attention input and query projection boundaries. It returns
+both normalized and rounded BF16 operands, retaining the normalized input for indexer consumers.
+The BF16 joined Q/KV and query MME operands keep their checkpoint scale contract. Requires the
+compound registration, native chain timing, and fixed-prefix acceptance qualification; FP8, draft,
+prefill and other shapes retain their reference paths.
+
+`VLLM_HPU_DSV41_DSPARK_C1_DENSE_CHAIN` (default `0`) selects the shared C1 FP8 attention input, query and output projections together with C2–C6 normalization/RoPE fusion. Requires the immutable dense sidecar; draft precision is unchanged. Experimental until fixed-prefix acceptance and serving qualification pass.
+
+`VLLM_HPU_DSV41_DSPARK_RUNTIME_SELECTION` (default `0`) reuses the common C1 threshold/emit selector for bounded C2–C6 ratio-one Reindex layers. It retains per-query candidate planes, causal scoring, the current wide MME producer and logical-ID sorting. Full-source publication and C1 selection remain unchanged. Experimental until the native chain and fixed-prefix quality gates pass.
+
+`VLLM_HPU_DSV41_DSPARK_INPUT_NORM` (default `0`) reuses the C1 native BF16 RMSNorm at the decoder Attention input for C1–C6 rows of width 5120. It retains the BF16 collapse boundary and existing Q/KV projection weights, layouts, communication and FP8 selection. Prefill and request-batched arithmetic remain unchanged. Experimental until the native chain and fixed-prefix quality gates pass.
+
+`VLLM_HPU_DSV41_DSPARK_NATIVE_TARGET_INPUT` (default `0`) records the existing Target embedding, TP reduction and residual initialization in the shared native stage for fixed C1–C6 decode shapes. C6 uses ordinary complete stage capture; the existing C1 segmented Engram protocol is unchanged. Experimental until a complete producer/consumer native gate and serving qualification pass.
+
+`VLLM_HPU_DSV41_DSPARK_MHC_OVERLAP` (default `0`) enables the shared independent-mHC graph partitioner for C2–C6 control MME branches. It preserves arithmetic, mutation barriers and peer-result dependencies. Experimental until native complete-chain and serving qualification pass.
+
+`VLLM_HPU_DSV41_DSPARK_MTP_SAT` (default `0`) gates the experimental shared N256 expert
+producer/activation chain for native top3/128-expert C1–C6 draft rows. It requires independently
+registered operators and qualified normal exponent ranges; MTP FP8 and SAT flags are mutually exclusive.
+
+`VLLM_HPU_DSV41_DSPARK_N512_DECODE` (default `0`) tests two adjacent N256 decode blocks per TPC workpoint
+in the C2–C6 routed-expert SAT producer. Matrix dimensions, packed weights, arithmetic and MME consumers
+remain unchanged. Requires the independent decoder registration and native complete-chain qualification.
+
+`VLLM_HPU_DSV41_DSPARK_DENSE_KN` (default `0`) tests persistent contiguous K,N BF16 operands
+for the fused Q/KV input, query and output projections at C2–C6. It retains activation codecs and
+BF16 MME outputs, and requires native-chain and quality qualification. FP8, C1 and prefill dispatch
+remain on their existing layouts; the reference operands remain resident while this experiment is gated.
+
+`VLLM_HPU_DSV41_DSPARK_SCHEDULED_PEER` (default `0`) tests the maintained scheduled peer
+operands feeding the C2–C6 post/collapse/norm consumer directly. It passes mHC ready outputs to
+the existing transport and avoids the old gather reconstruction. Requires its independent consumer
+registration and native-chain qualification; it does not change C1 or the communication implementation.
+
+`VLLM_HPU_DSV41_DSPARK_ROPE_COHERENT` (default `0`) tests full-row access footprints for C2–C6
+forward/inverse RoPE. It preserves the original Gaudi2 RoPE arithmetic and assigns every row of one head to a
+workpoint, with precise full-row footprints preventing separate single-row producers/consumers. Requires
+the independent access-map registration and native-chain qualification; C1 and prefill remain unchanged.
+
+`VLLM_HPU_DSV41_DSPARK_ROUTER_SHARED` (default `0`) tests a common FP8 FFN projection producing
+Router and shared gate/up columns for C2–C6. It preserves the shared expert codec and requires
+fixed-prefix probability-overlap and native-chain qualification for the Router approximation. C1,
+draft and prefill retain their reference numerical paths.
+
+`VLLM_HPU_DSV41_DSPARK_ROUTER_SHARED_FUSED` (default `0`) additionally folds the
+joint Router's scaling into its selection kernel and feeds the complete product directly
+to the unchanged shared activation kernel, avoiding a prefix copy. Requires its private
+registration, operator equivalence, conditional acceptance and native-chain gates.
+
+`VLLM_HPU_DSV41_DSPARK_HW_DENSE` (default `0`) is an unqualified static-scale FP8
+QKV/query experiment for C2–C6. It prepares separate weights and uses RMS bounds to choose
+Gaudi2 exponent biases, retaining the C1/prefill references. It requires a matching private
+registration and runtime capability validation; the current installed MME lowering rejects
+its scale metadata, so this flag must remain disabled.
+
+- `VLLM_HPU_DSV41_DSPARK_HW_DENSE_FUSED_QUANT` (default `0`): private C2–C6
+  QKV/query compound with the checkpoint block32 round trip and fixed FP8
+  encoding in one TPC producer, then a two-input MME. Requires its additive
+  registration and kernel database. Timing, whole-Target acceptance, and serving
+  qualification remain mandatory; this flag does not change shared C1 defaults.
+
+`VLLM_HPU_DSV41_DSPARK_SILU_DECODE` (default `0`) selects an experimental C2–C6
+port of the shared SwiGLU/W2-decode compound. It requires the additive native
+registration and qualified top-six SAT operands; draft top-three and C1 stay
+on their existing paths. It remains disabled because complete native-chain
+validation regressed. Fewer nodes alone do not establish a pipeline improvement.
+
+`VLLM_HPU_DSV41_DSPARK_MHC_DEFERRED` (default `0`) carries the prepared MME
+controller and its original RRMS to the shared C1 gates/post/collapse consumer
+for C2–C6 Target decode. The additive query-owner implementation requires the
+25-column controller payload. It leaves the shared replay and communication
+interfaces intact. Both native-chain ownership variants regressed, so this
+experimental gate remains disabled.
+
+`VLLM_HPU_DSV41_DSPARK_OUTPUT_FP8` (default `0`) selects the shared C1 FP8
+WoB consumer without changing Q/KV weights, row normalization, or WoA. It
+requires the immutable dense sidecar and retains the upstream BF16 and block32
+boundaries. The native-chain comparison regressed, so this experimental gate
+remains disabled and has no serving qualification.
+
+`VLLM_HPU_DSV41_DSPARK_OUTPUT_LAYOUT` (default `0`) selects the existing
+prepared N-by-K WoA layout for Target layers. The shared projection consumes
+it through a transposed RHS; the checkpoint precision and WoB path are retained.
+The transposed-RHS native comparison regressed, so this remains disabled.
+
+`VLLM_HPU_DSV41_DSPARK_MHC_HIGH_PLANE` (default `0`) selects the prepared
+BF16 high plane alone for Target control projections. It retains FP32 MME
+accumulation, RRMS and gates. This numerical candidate requires the complete
+consumer tolerance and fixed-prefix acceptance gate before serving. The native
+chain comparison saved less than the candidate threshold, so it remains off.
+
+`VLLM_HPU_DSV41_DSPARK_INPUT_FP8` (default `0`) selects the shared C1 Q/KV
+input sidecars and their common normalized FP8 producer. Query and output
+projections retain their selected precision. This numerical candidate requires
+a native producer/consumer gate and nondecreasing fixed-prefix acceptance.
+The isolated input-chain gain was below the threshold; it remains off.
+
+`VLLM_HPU_DSV41_DSPARK_EXPLICIT_STEPS` (default `0`) selects explicit fixed
+SAT decode steps for the existing C2–C6 Target expert graph. It retains the
+eight-vector window, compact scales, route packing and MME access mapping.
+The native-chain comparison regressed despite the ISA change; this remains
+disabled and has no serving qualification.
+
+`VLLM_HPU_DSV41_DSPARK_CONTROL_FP8` (default `0`) prepares channel-scaled
+FP8 Target control weights and combines activation statistics, FP8 preparation
+and FP32-output MME. C1 and prefill retain their selected reference path.
+This gate requires downstream tolerance and fixed-prefix acceptance before
+native-chain admission to the serving batch.
+
+`VLLM_HPU_DSV41_DSPARK_SCALED_W13` (default `0`) selects an experimental Target C2–C6 scaled FP8 W13 MME producer with a BF16 activation handoff. It preserves the existing route layout and leaves C1 and draft dispatch unchanged.
+
+`VLLM_HPU_DSV41_DSPARK_MOE_PEER_POST` defaults to `0`. Experimental Target C2–C6 MoE peer operands feed the shared rank-ordered mHC post/collapse kernel directly. Requires the additive operator; C1, draft and prefill are unchanged.
+
+`VLLM_HPU_DSV41_DSPARK_INPUT_QUANT_REMAT` defaults to `0`. Experimental C2–C6 FP8 attention input preparation recomputes the same C1-rounded row instead of a dynamic local vector cache. Requires its additive operator and the existing FP8 input path; C1 and prefill retain the qualified producer.
+
+`VLLM_HPU_DSV41_DSPARK_RECORD_READBACK` (default `0`) uses one producer-ordered native copy for the full speculative transaction record. It requires the matching private bridge ABI; ordinary decode and the four-word completion interface are unchanged.
+
+`VLLM_HPU_DSV41_DSPARK_VOCAB_SOFTMAX` (default `1` in DSpark, otherwise `0`) uses distributed local statistics and one normalization node for full official draft probabilities. It retains full vocabulary support, weighted nucleus selection and the request's random draws. The qualified additive softmax registration/kernel build is required; explicit `0` restores the reference. Ordinary C1 sampling is unchanged.
+
+`VLLM_HPU_DSV41_DSPARK_W2_REDUCE_N256` (default `1` in DSpark, otherwise `0`) uses the qualified output-channel W2 reduction after the existing SAT/MME producer. BF16 route boundaries and reduction order remain unchanged. The additive registration must match its build manifest; explicit `0` restores the previous reduction.
+
+`VLLM_HPU_DSV41_DSPARK_ROUTER_SHARED_BF16` (default `0`) joins C2–C6 Target Router and shared gate/up projections in one BF16-input, FP32-output GEMM. The input producer emits original BF16 Router rows and the exact effective C1 FP8-rounded shared rows. Shared weights retain the existing FP8 encoding and power-of-two scales, decoded once into BF16 during preparation. Existing Router, expert, SiLU and shared down-projection consumers remain; C1, draft and prefill retain their established path. Native-chain performance and teacher acceptance must pass before promotion.
+
+`VLLM_HPU_DSV41_DSPARK_COOPERATIVE_SILU` (default `0`) splits the Target C2–C6 SAT activation across channel workers inside one TPC node. It uses an internal, cleared row workspace and bounded readiness checks; the existing W13 K2 and W2 N256 producers/consumers remain required. C1, draft top3 and prefill keep their existing path. This experimental option requires its isolated native build and is not serving-qualified.
+
+`VLLM_HPU_DSV41_DSPARK_SHARED_SCALE` (default `0`) defers the shared expert's W2 scale and rounded addition to the existing C2–C6 routed W2 reduction. It requires the prepared shared FP8 weights, two-stage W13 and W2 N256 consumer, and its additive native registration. C1, MTP top3 and prefill keep their existing path. This option remains unqualified until complete-chain and serving validation.
+
+`VLLM_HPU_DSV41_DSPARK_PHASE_EVENTS` (default `0`) adds ordered HPU events around queued DSpark Target stages during raw capture. Events are read after the existing trace drain; they introduce no per-round host wait and remain inactive for unprofiled serving. The raw capture metadata records the completed current-stream interval, separately from hardware activity unions. Qualification of the event ordering with the native executor is required before using these diagnostic intervals as completed Target latency.
+
+`VLLM_HPU_DSV41_DSPARK_VOCAB_HEAD_FP8` (default `0`) prepares one additional channel-scaled vocabulary bank shared by Target and MTP heads, using FP8 MME with FP32 output for C1–C6 row counts inside DSpark. It retains BF16 checkpoint weights for the reference, prefill and non-DSpark C1. This numerical candidate requires actual native head/sampling-chain timing, fixed-prefix p/q teacher acceptance and full official quality qualification before activation. Weight preparation alone provides no performance or accuracy qualification.
+
+`VLLM_HPU_DSV41_DSPARK_DEEP_QUEUE` (default `0`) retains two device-generated speculative rounds ahead of the host consumer, with four control/readback frames and a twelve-position rollback journal. Scheduler page/search/length bounds remain authoritative. Cancellation or exact-probability repair drains and discards all retained work before restoring or releasing state. This capability is unqualified; it changes neither C1 nor the shared native replay/communication core.
+
+`VLLM_HPU_DSV41_DSPARK_CONTROL_FP8_PAIR` (default `0`) prepares two FP8 residual weight planes and two activation planes for the C2–C6 Target controller, using one FP8 GEMM and an FP32 combining kernel. It requires the private paired registration and unchanged C1 consumer error and teacher-forced acceptance gates before serving qualification.
+
+`VLLM_HPU_DSV41_DSPARK_COHERENT_SWA` (default `0`) uses one consecutive-window SWA KV operand for all speculative query/head rows. The selected-main path, ordinary decode and prefill retain their existing consumers.
+
+`VLLM_HPU_DSV41_DSPARK_MAIN_SINGLE_BANK` (default `0`) publishes one rounded BF16 selected-KV bank for both QK and PV, without a duplicate BF16 bank or persistent FP32 value cache. C2–C6 use the existing high/low BF16 probability arithmetic; the 128-row per-query SWA layout is retained. Requires the additive single-bank native registration and independent attention/acceptance qualification.
+
+`VLLM_HPU_DSV41_DSPARK_MHC_POST_STATS` (default `0`) reuses the C1 feature-parallel post/weighted statistics and dual FFN quantizer for C2–C6. The independent gate producer and the separate routed/shared scales are retained. Requires the additive registration plus complete-chain and teacher-forced acceptance qualification.
+
+`VLLM_HPU_DSV41_DSPARK_SPLIT_SCALE_PLANES` (default `0`) exposes compact expert group scales and fixed channel codes as separate storage-sharing views. The C2–C6 Target decoder keeps the original SAT arithmetic and route axes while declaring an affine K access map. This requires the additive split-scale native library; draft, C1 and prefill dispatch remain unchanged. Compiled layout, complete-chain timing and numerical validation are required before promotion.
+
+`VLLM_HPU_DSV41_DSPARK_W13_K_PIPELINE` (default `0`) uses two partial K GEMMs in the C2–C6 Target expert body. It retains the original route grouping and SAT encoding and adds the FP32 products before the existing SiLU consumer. Requires the additive pipeline library, common prepared scale views and full-model acceptance qualification.
+
+`VLLM_HPU_DSV41_DSPARK_W13_K_PIPELINE_STAGES` (default `2`) selects two or four decoded ranges when the pipeline experiment is enabled. Four stages require the separate additive registration; they preserve the existing SAT ISA and route grouping. This setting does not affect the default or C1 execution path.
+
+`VLLM_HPU_DSV41_DSPARK_MHC_GATE_PACKET` (default `0`) reuses the C1 vector-loaded gate packet consumer for C2–C6 attention post/collapse and existing published BF16 FFN collapses. The independent gate producer and communication remain unchanged; readiness references the complete packet instead of separate field copies. Requires the common gate-packet native library and combined serving qualification.
+
+`VLLM_HPU_DSV41_DSPARK_EXPERT_K_TILE` (default `128`) selects the decoder workpoint width for the opt-in W13 pipeline. The experimental `512` registration preserves the two partial GEMMs and original SAT encoding; its scalar bound clips the final W2 K block to the actual tensor extent. It requires its additive kernel and operator libraries. C1 and the default path are unchanged.
+
+`VLLM_HPU_DSV41_DSPARK_ROUND_INPUT_PUBLICATION` (default `0`) captures accepted-prefix cursor advancement and batched Engram input staging inside the sampled main native control plan. It retains request-owned proposal/RNG buffers and the existing exact-repair generation path. It requires batched device Engram and full sampled main replay; C1 and PP communication are unchanged. Enable only after the complete native consumer-chain and combined serving gates pass.
+
+`VLLM_HPU_DSV41_DSPARK_NATIVE_PAGE_COALESCE` (default `0`) selects coalesced native compute-page publication at plan capture in the DSpark private runtime. Automatic alignment/chunk submissions, per-page completion retirement and all NIC dependencies remain enabled. Coalescing is refused if the whole program's conservative padded size exceeds safe CCB capacity; segmented prefix/suffix plans retain their established policy. The same policy applies to parameterized TP plans. It requires the matching private Synapse build and complete consumer-chain qualification.
+
+`VLLM_HPU_DSV41_DSPARK_ORDERED_PEER_SUM` (default `0`) selects the shared C1 fixed-rank BF16
+peer consumer for aligned Target C6 packets up to 32768 elements during DSpark native replay.
+It retains the existing peer exchange and FP32 rank order, then rounds once to BF16.
+The ordinary C1 path is unchanged. This candidate requires the additive native registration.
+
+`VLLM_HPU_DSV41_DSPARK_PEER_POST_COLLAPSE` (default `0`) reuses the C1 feature-tiled
+consumer for C2–C6 Target rows: fixed-rank peer sum, BF16 rounding, residual post and
+next collapse. RRMS and norm/quant retain their separate consumers. It preserves
+the native peer transport and requires the additive peer-consumer registration.
+Prefill, draft rows and the default C1 path keep their existing behavior.
+
+`VLLM_HPU_DSV41_DSPARK_TP_PACKET_TARGET` (default `0`) uses C1 partition
+statistics and lane candidates for the six official Target rows. It exchanges
+K128 local packets, preserves the proposal distribution and RNG, and leaves
+uncertified rows to asynchronous exact repair. The production head/rejection
+native-chain gate790 found mixed performance; this candidate remains OFF.
+
+`VLLM_HPU_DSV41_DSPARK_TENSOR_READY_PEER` (default `0`) is an isolated C2–C6
+Target experiment. It keeps an independent mHC branch in the peer producer
+recipe and marks the byte-exact BF16 payload as an external tensor. Its private
+native runtime derives NIC readiness from captured tensor-signal ordinals;
+final recipe completion still owns storage and CCB retirement. C1, draft and
+prefill captures retain the ordinary path. Requires the fingerprinted additive
+registration and runtime; it remains OFF until complete-chain qualification.
+
+`VLLM_HPU_DSV41_DSPARK_DRAFT_PACKED_MLA` (default `0`) experimentally reuses packed SWA QK/softmax/PV MME for the joint five-row MTP proposal. It retains visibility of all five tentative rows without changing the accepted-prefix ring. Alignment rows are masked. Native producer/consumer timing and same-prefix conditional acceptance must qualify before promotion. Target, prefill and ordinary C1 paths are unchanged.
+
+`VLLM_HPU_DSV41_DSPARK_DRAFT_KV_DECODE` (default `1`) replaces DSpark MTP ring/tentative-row unpacking with one shared native packed decoder. It retains the original sparse Attention consumer, five-row visibility, indices and accepted-prefix ring. The native sampling/input chain, conditional teacher probabilities and combined official request are qualified. Set `0` to restore the reference decoder.
+
+`VLLM_HPU_DSV41_DSPARK_MTP_K128` (default `1`) selects the common prepared K128 BF16 MoE decoder for qualified C1–C6 top3/E128 MTP rows with H5120/I640 and normal scales. Wider expert shards retain the reference prepared decoder. It retains checkpoint scales, BF16 matrix operands, ordered route reduction, shared experts and Target routing. Requires the additive draft K128 native registration, included in the normal additive build. It does not enable draft FP8 or regroup routes. Set `0` to restore the reference entry.
+
+`VLLM_HPU_DSV41_DSPARK_DRAFT_MHC` (default `0`) prepares the shared mHC MME controller for the three MTP layers and reuses its gate epilogue, BF16 residual update and immediate next-layer collapse. Draft attention, expert routing and accepted-prefix state retain their existing ownership. Teacher acceptance and the complete native sampling/input chain must qualify before activation.
+
+`VLLM_HPU_DSV41_DSPARK_ROUTER_READY_FP8` (default `0`) projects the eligible C2–C6 Target Router using FP8 rows/scales already emitted by the fused FFN norm/quant producer. Its small prepared Router matrix feeds the existing scaled top6 program directly. It adds no activation quantization and leaves the shared expert, C1, draft and prefill paths unchanged. Requires its fingerprinted native registration/database and fixed-prefix acceptance plus native-chain qualification.
+
+`VLLM_HPU_DSV41_DSPARK_ROUTER_READY_PAIR` is a default-off precision experiment under prepared Router: both checkpoint and normalized activations use residual FP8 planes. It requires the additive Router-pair library and teacher-forced acceptance qualification.
+
+`VLLM_HPU_DSV41_DSPARK_ROUTER_BATCHED_F32` (default `0`) uses a shared immutable FP32 K,N Router bank for C2–C6 Target rows. A 24-point TPC producer partitions K into four regions and consumes every row per weight read. The existing softplus/sqrt/top6 kernel sums the partial logits. Checkpoint values, expert/shared arithmetic and C1/draft/prefill dispatch remain unchanged. FP32 association differences require the established C1 component and teacher acceptance gates before promotion.
+
+`VLLM_HPU_DSV41_DSPARK_DRAFT_SHARED_FP8` (default `0`): prepare draft shared projections once and reuse the common C1 FP8 shared body. Original BF16 modules remain available. Requires official conditional probability and complete native-chain qualification.
+
+`VLLM_HPU_DSV41_DSPARK_DRAFT_QUERY_FP8` (default `0`): draft-only channel-scaled Q weight preparation and common C1 FP8 projection/RoPE. Retains reference weights; conditional acceptance and native complete-chain gates required.
+
+`VLLM_HPU_DSV41_DSPARK_DRAFT_DENSE_FP8` (default `0`): draft Q/KV input fusion and WO_B through the common C1 FP8 paths, with original BF16 reference modules retained. Requires conditional acceptance and native complete-chain gates.
 `VLLM_HPU_DSV41_DEVICE_SAMPLING` (default `0`) enables the experimental ordinary C1 native sampling tail.
 `VLLM_HPU_DSV41_DEVICE_INPUT_FEEDBACK` (default `0`) lets that tail advance the private native input
 token and position allocations. It requires device position continuation and a native input graph without a PP

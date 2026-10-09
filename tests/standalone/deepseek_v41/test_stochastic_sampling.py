@@ -43,14 +43,17 @@ def test_mixed_rows_and_replayed_controls_change():
     assert sample_probabilities(logits, controls, filtered=False).tolist() == [[2], [2]]
 
 
-def test_sampling_validation_distinguishes_dspark():
+def test_sampling_validation_distinguishes_dspark(monkeypatch):
     from vllm.sampling_params import SamplingParams
     from vllm_gaudi.ops.deepseek_v41_config import validate_sampling
     from vllm.exceptions import VLLMValidationError
 
     params = SamplingParams(temperature=1, top_p=0.95, seed=42)
     validate_sampling(params, dspark=False)
-    with pytest.raises(VLLMValidationError, match="DSpark requires greedy"):
+    monkeypatch.setenv("VLLM_HPU_DSV41_DEVICE_VERIFY", "0")
+    with pytest.raises(VLLMValidationError, match="requires device probability verification"):
         validate_sampling(params, dspark=True)
+    monkeypatch.setenv("VLLM_HPU_DSV41_DEVICE_VERIFY", "1")
+    validate_sampling(params, dspark=True)
     with pytest.raises(VLLMValidationError, match="penalties"):
         validate_sampling(SamplingParams(temperature=1, presence_penalty=0.1), dspark=False)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Explain an aligned TP4 token period using module activity and observed gaps."""
+"""Explain an aligned decode cycle using module activity and observed gaps."""
 import argparse
 from bisect import bisect_right
 import collections
@@ -16,9 +16,12 @@ from deepseek_v41_trace_accounting import clipped, duration
 def scope_kind(name):
     if name.startswith("v41::compiled::"):
         return "compiled分组入口内"
-    if name.startswith("v41::target::"):
+    if name.startswith(("v41::target::", "v41::device_round::target", "v41::device_round::advance",
+                        "v41::device_round::engram")):
         return "target输入/分组衔接入口内"
-    if name.startswith(("v41::verify_and_commit::", "v41::worker_commit::")):
+    if name.startswith(("v41::verify_and_commit::", "v41::worker_commit::",
+                        "v41::device_round::verify", "v41::device_round::draft", "v41::device_round::sampled_",
+                        "v41::device_round::readback_enqueue")):
         return "采样/结果消费与状态提交入口内"
     return None
 
@@ -96,12 +99,18 @@ def report(root, output, kernel_report_link="../kernel-report/index.html"):
     tokens = records[0]["tokens"]
     contract = json.loads((root / "rank0/device-windows.json").read_text())
     phase, unit = contract.get("phase", "decode"), contract.get("unit", "token")
-    assert (phase, unit) in (("decode", "token"), ("prefill", "request"))
+    assert (phase, unit) in (("decode", "token"), ("decode", "round"), ("prefill", "request"))
     asynchronous = contract.get("asynchronous_completion", False)
-    boundary_note = ("这是连续worker提交之间的吞吐周期，包含当前token的后段与下一token的前缀；"
-                     "不能解释为同一逻辑token的独立forward耗时。" if asynchronous else
-                     "Prefill覆盖完整请求提交至首token消费，包含所有prompt分块。" if phase == "prefill" else
-                     "Decode覆盖连续采样token消费完成之间的完整周期。")
+    if unit == "round":
+        boundary_note = ("这是连续C6结果消费完成之间的吞吐周期，包含轮间提交、ring释放、调度及设备等待。"
+                         "每轮实际提交数来自下一轮位置差；不是6个输出token，也不是无profiler正式TPOT。")
+    elif asynchronous:
+        boundary_note = ("这是连续worker提交之间的吞吐周期，包含当前token的后段与下一token的前缀；"
+                         "不能解释为同一逻辑token的独立forward耗时。")
+    elif phase == "prefill":
+        boundary_note = "Prefill覆盖完整请求提交至首token消费，包含所有prompt分块。"
+    else:
+        boundary_note = "Decode覆盖连续采样token消费完成之间的完整周期。"
     all_cycles = output.parent / f"latency-report-{phase}" / "index.html"
     if not all_cycles.exists():
         all_cycles = output.parent / "latency-report/index.html"
@@ -170,6 +179,14 @@ def report(root, output, kernel_report_link="../kernel-report/index.html"):
                                   "coincidence identify where a gap occurs, not its causal dependency "
                                   "or network latency. "
                                   "No time is scaled to the historical unprofiled result.")
+    if unit == "round":
+        prefixes = dict(zip(contract["tokens"], contract["committed_tokens"]))
+        committed = [prefixes[token] for token in tokens]
+        details.update(committed_tokens=committed,
+                       total_committed_tokens=sum(committed),
+                       mean_committed=sum(committed) / count,
+                       trace_ms_per_committed_token=sum(periods) / sum(committed),
+                       formal_qualification=False)
     (output / "latency-ledger.json").write_text(json.dumps(details, ensure_ascii=False, indent=2) + "\n")
     md = [f"# TP4 {phase}：实际消费周期的功能与空档拆解", "",
           f"同一采集的{count}个完整{unit}周期："

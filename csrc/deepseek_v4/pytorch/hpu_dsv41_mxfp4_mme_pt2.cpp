@@ -12,7 +12,11 @@ namespace {
 constexpr auto kDecode = "custom_deepseek_v41_mxfp4_prepared_dequant_bf16_gaudi2";
 constexpr auto kDecodeNormal = "custom_deepseek_v41_mxfp4_prepared_dequant_normal_bf16_gaudi2";
 constexpr auto kDecodeSchema = "custom_op::custom_deepseek_v41_mxfp4_prepared_dequant_bf16_gaudi2";
+#ifdef DSV41_PREDECODED_MTP
+constexpr auto kMoeSchema = "custom_op::custom_deepseek_v41_mtp_cached_moe_bf16_gaudi2";
+#else
 constexpr auto kMoeSchema = "custom_op::custom_deepseek_v41_mxfp4_prepared_moe_bf16_gaudi2";
+#endif
 constexpr auto kTiledMoeSchema = "custom_op::custom_deepseek_v41_mxfp4_k128_moe_bf16_gaudi2";
 constexpr auto kN512MoeSchema = "custom_op::custom_deepseek_v41_mxfp4_n512_moe_bf16_gaudi2";
 constexpr auto kColumnMoeSchema = "custom_op::custom_deepseek_v41_mxfp4_column_moe_bf16_gaudi2";
@@ -56,6 +60,17 @@ std::vector<int64_t> moe_shape(const at::Stack& stack) {
                 first[2] == 2 * second[1] && second[2] == x.size(1) &&
                 stack.at(3).toTensor().size(0) == stack.at(4).toTensor().size(0),
                 "V4.1 MoE shape must connect W13, W2 and ordered top-3/top-6 routing");
+#ifdef DSV41_PREDECODED_MTP
+    TORCH_CHECK(stack.size() == 11 && ids.size(1) == 3 && x.size(0) <= 6 &&
+                stack.at(8).toBool(), "Cached draft weights require normal top-three C1-C6");
+    for (int projection=0; projection<2; ++projection) {
+        const auto bank=stack.at(9+projection).toTensor();
+        const auto decoded=projection ? second : first;
+        contract(bank,at::kBFloat16,x.device());
+        TORCH_CHECK(bank.sizes()==at::IntArrayRef({stack.at(3).toTensor().size(0),decoded[1],decoded[2]}),
+                    "Cached draft weight bank has a different physical layout");
+    }
+#endif
     return {x.size(0), x.size(1)};
 }
 
@@ -144,10 +159,15 @@ class PreparedV41 final : public habana::OpBackend {
                                            : "custom_deepseek_v41_mxfp4_k128_dequant_bf16_gaudi2")
                                  : (normal ? kDecodeNormal : kDecode);
         std::vector<Tensor> decoded;
+#ifdef DSV41_PREDECODED_MTP
+        decoded = BuildNode(this,graph,{"custom_deepseek_v41_expert_cached_gather_bf16_gaudi2",
+            {ids,syn_in(broadcast ? 8 : 9)},{{{tokens*experts,k,n},at::kBFloat16}}});
+#else
         if (!(n512_ && broadcast)) {
             decoded = BuildNode(this, graph, {guid, {ids, q, s, lookup},
                 {{{tokens * experts, k, n}, at::kBFloat16}}});
         }
+#endif
         // Keep the TPC and MME batch axes identical. A [T,E,K,N] reshape
         // between them prevents the Gaudi2 slicer from composing the access
         // maps when T > 1 and spills the full decoded weights into HBM.
@@ -204,7 +224,11 @@ class PreparedV41 final : public habana::OpBackend {
     }
 
     void AddNode(synapse_helpers::graph& graph, const at::Stack& stack) override {
+#ifdef DSV41_PREDECODED_MTP
+        const bool normal = stack.at(8).toBool();
+#else
         const bool normal = stack.back().toBool();
+#endif
         const auto resultShape = moe_ ? moe_shape(stack) : decode_shape(stack);
         const auto& idsTensor = stack.at(moe_ ? 1 : 0).toTensor();
         auto ids = ReshapeHelper(graph, syn_in(moe_ ? 1 : 0), {1, idsTensor.numel()}, at::kInt);
@@ -256,6 +280,14 @@ class PreparedV41 final : public habana::OpBackend {
 };
 
 const bool registered = [] {
+#ifdef DSV41_PREDECODED_MTP
+    habana::custom_op::registerUserCustomOp(kMoeSchema,kDecode,[](const at::Stack& stack) {
+        return habana::PartialOutputMetaDataVector{{at::kBFloat16,moe_shape(stack)}};
+    },nullptr);
+    habana::KernelRegistry().add(kMoeSchema,[](synDeviceId device,c10::ScalarType dtype) {
+        return std::make_shared<PreparedV41>(device,dtype,true);
+    });
+#else
     for (bool moe : {false, true}) {
         const char* schema = moe ? kMoeSchema : kDecodeSchema;
         habana::custom_op::registerUserCustomOp(schema, kDecode, [moe](const at::Stack& stack) {
@@ -283,6 +315,7 @@ const bool registered = [] {
     habana::KernelRegistry().add(kColumnMoeSchema, [](synDeviceId device, c10::ScalarType dtype) {
         return std::make_shared<PreparedV41>(device, dtype, true, true, false, true);
     });
+#endif
     return true;
 }();
 
@@ -304,8 +337,22 @@ template<bool Meta, bool Tiled = false, bool N512 = false, bool Column = false> 
                                   const at::Tensor& s2, const at::Tensor& lookup, bool normal) {
     return run({x, ids, router, q13, q2, s13, s2, lookup, normal}, true, Meta, Tiled, N512, Column);
 }
+#ifdef DSV41_PREDECODED_MTP
+template<bool Meta> at::Tensor cached_moe(const at::Tensor& x,const at::Tensor& ids,const at::Tensor& router,
+    const at::Tensor& q13,const at::Tensor& q2,const at::Tensor& s13,const at::Tensor& s2,
+    const at::Tensor& lookup,bool normal,const at::Tensor& bank13,const at::Tensor& bank2) {
+    return run({x,ids,router,q13,q2,s13,s2,lookup,normal,bank13,bank2},true,Meta);
+}
+#endif
 }
 
+#ifdef DSV41_PREDECODED_MTP
+TORCH_LIBRARY_FRAGMENT(custom_op,m) {
+    m.def("custom_deepseek_v41_mtp_cached_moe_bf16_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, bool normal, Tensor bank13, Tensor bank2) -> Tensor");
+}
+TORCH_LIBRARY_IMPL(custom_op,HPU,m) {m.impl("custom_deepseek_v41_mtp_cached_moe_bf16_gaudi2",cached_moe<false>);}
+TORCH_LIBRARY_IMPL(custom_op,Meta,m) {m.impl("custom_deepseek_v41_mtp_cached_moe_bf16_gaudi2",cached_moe<true>);}
+#else
 TORCH_LIBRARY_FRAGMENT(custom_op, m) {
     m.def("custom_deepseek_v41_mxfp4_prepared_dequant_bf16_gaudi2(Tensor ids, Tensor q16, Tensor s16, Tensor lookup, bool normal=False) -> Tensor");
     m.def("custom_deepseek_v41_mxfp4_prepared_moe_bf16_gaudi2(Tensor x, Tensor ids, Tensor router, Tensor q13, Tensor q2, Tensor s13, Tensor s2, Tensor lookup, bool normal=False) -> Tensor");
@@ -447,3 +494,5 @@ TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
     m.impl("custom_deepseek_v41_mxfp4_shared_k128_linear_bf16_gaudi2", shared_linear<true, true>);
     m.impl("custom_deepseek_v41_bf16_identity_gaudi2", barrier<true>);
 }
+
+#endif // DSV41_PREDECODED_MTP

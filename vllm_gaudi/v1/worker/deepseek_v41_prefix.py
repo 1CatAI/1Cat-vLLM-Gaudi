@@ -6,6 +6,31 @@ import torch
 from vllm_gaudi.ops.deepseek_v41_prefix_state import BatchPrefixStore, PrefixStateTicket
 
 
+def draft_context_views(program):
+    """Persistent accepted context, excluding tentative draft activations."""
+    draft = getattr(program, "draft", None)
+    if draft is None:
+        return ()
+    result = []
+    for layer in draft.layers:
+        attention = layer.attention
+        result.append(attention.swa)
+        decoded = getattr(attention, "swa_decoded", None)
+        if decoded is not None:
+            result.append(decoded.swa)
+    return tuple(result)
+
+
+def restore_draft_context(program, values):
+    destinations = draft_context_views(program)
+    if len(destinations) != len(values) or any(
+        (destination.shape, destination.dtype, destination.device) != (source.shape, source.dtype, source.device)
+            for destination, source in zip(destinations, values, strict=True)):
+        raise ValueError("Draft prefix context differs from the serving state layout")
+    for destination, source in zip(destinations, values, strict=True):
+        destination.copy_(source)
+
+
 def split_at_checkpoint(chunks, start, boundary):
     result = []
     for offset, values in chunks:
@@ -24,6 +49,7 @@ class PrefixCheckpoints:
         self.runner = runner
         self.store = BatchPrefixStore(min(128, 2 * runner.vllm_config.scheduler_config.max_num_seqs))
         self.histories = {}
+        self.draft_histories = {}
         self.operations = None
         self.captured = set()
         self.inline = {}
@@ -67,6 +93,12 @@ class PrefixCheckpoints:
                                       self._done(),
                                       record_done=self._done)
             done.synchronize()
+            if getattr(runner, "use_dspark", False):
+                draft_history = self.draft_histories.get(ticket)
+                if draft_history is None or draft_history[0] != descriptor.num_tokens:
+                    raise RuntimeError("Auxiliary restore lacks matching accepted draft context")
+                restore_draft_context(runner.model.program, draft_history[1])
+                self._done()
             if runner.model.engram_host is not None:
                 runner.model.engram_host.restore_checkpoint(request_id, history)
             runner.audit["prefix_restores"] = runner.audit.get("prefix_restores", 0) + 1
@@ -98,8 +130,7 @@ class PrefixCheckpoints:
 
         result = []
         for offset, values in split_at_checkpoint(chunks, start, descriptor.num_tokens):
-            result.extend((offset + inner, part)
-                          for inner, part in target_chunks(values, self.runner.prefill_capacity))
+            result.extend((offset + inner, part) for inner, part in target_chunks(values, self.runner.prefill_capacity))
         return result
 
     def activate_chunk(self, request_id, start, count):
@@ -134,7 +165,8 @@ class PrefixCheckpoints:
         host = runner.model.engram_host
         if host is not None and inline is not None:
             tokens = runner.requests[request_id].token_slice(0, boundary)
-            history = host.snapshot_prefix(request_id, token_ids=tokens,
+            history = host.snapshot_prefix(request_id,
+                                           token_ids=tokens,
                                            image_mask=[token in (129264, 129265) for token in tokens])
         else:
             history = host.snapshot_prefix(request_id) if host is not None else None
@@ -142,8 +174,22 @@ class PrefixCheckpoints:
             raise RuntimeError("Engram history did not commit the exact checkpoint boundary")
         ticket = PrefixStateTicket(descriptor.slot, descriptor.generation)
         options = {"state_tensors": inline.require_complete()} if inline is not None else {}
-        self.store.capture(ticket, bank, slot, boundary, descriptor.block_hash, self._done(),
-                           record_done=self._done, **options)
+        self.store.capture(ticket,
+                           bank,
+                           slot,
+                           boundary,
+                           descriptor.block_hash,
+                           self._done(),
+                           record_done=self._done,
+                           **options)
+        if getattr(runner, "use_dspark", False):
+            values = tuple(value.detach().clone() for value in draft_context_views(runner.model.program))
+            self._done()
+            self.draft_histories = {
+                key: value
+                for key, value in self.draft_histories.items() if key.index != ticket.index
+            }
+            self.draft_histories[ticket] = boundary, values
         self.store.publish(ticket)
         self.histories = {key: value for key, value in self.histories.items() if key.index != ticket.index}
         if history is not None:
@@ -178,3 +224,4 @@ class PrefixCheckpoints:
     def close(self):
         self.store.close()
         self.histories.clear()
+        self.draft_histories.clear()

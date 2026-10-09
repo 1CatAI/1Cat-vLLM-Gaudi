@@ -11,7 +11,16 @@ from vllm_gaudi.ops.tp2_model_adapter import DecoderTopology
 
 
 def _native_input_precision_compatible(program):
-    return not program.dspark and not (program.fp8_decode and not getattr(program, "expert_n256", False))
+    from vllm_gaudi import envs
+
+    dspark_input = program.dspark and envs.VLLM_HPU_DSV41_DSPARK_NATIVE_TARGET_INPUT
+    return (not program.dspark or dspark_input) and not (
+        program.fp8_decode and not getattr(program, "expert_n256", False))
+
+
+def _native_input_count_compatible(program, count):
+    return _native_input_precision_compatible(program) and (
+        count == 1 or program.dspark and 2 <= count <= 6)
 
 
 def stage_collectives(tp_rank, native, tp_size=2, *, native_fp32_gather=False, ordered_peer_sum=None):
@@ -128,6 +137,11 @@ def stage_state_tensors(program):
         "score_history",
         "block_table",
     }
+    # DSpark-only derived state participates in the same ownership/snapshot contract.
+    if (getattr(program.shared, "dspark_main_mirror", False) and program.search_length <= 32768
+            and any(getattr(getattr(layer, "attention", None), "dspark_main_mirror", False)
+                    for layer in program.layers)):
+        mutable.add("main_mirror")
     active_decoded = None
     if getattr(program, "length", 512) > 512 and getattr(program, "search_length", 512) > 512:
         # Hot paged variants also consume decoded mirrors. Bind only the
@@ -264,6 +278,7 @@ class StageVariant(torch.nn.Module):
                  and not getattr(layer.attention, "tp4_local_index_queries", False) else 2)
                 for layer in program.layers
                 if layer.attention.owns_index and layer.attention.search_length // layer.attention.ratio > 512
+                and not getattr(layer.attention, "uses_local_index_queries", lambda _: False)(positions.numel())
             )
             self.adapter = replace(self.adapter, extra_collectives=self.adapter.extra_collectives + extra)
         from vllm_gaudi.models.deepseek_v41_program import CompiledStage
@@ -293,7 +308,8 @@ class StageVariant(torch.nn.Module):
         # The PP receive tensor has a persistent allocation. Native input
         # dependencies wait for its producer and register its last consumer.
         self.pp_wire = (pp_wire if envs.VLLM_HPU_DSV41_DIRECT_PP_WIRE else pp_wire.clone()) if self.wire_input else None
-        self.direct_engram = bool(engram) and native_input and envs.VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT
+        self.direct_engram = (bool(engram) and native_input and not program.dspark
+                              and envs.VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT)
         self.device_engram = bool(engram) and native_input and envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM
         self.engram = capture_engram_inputs(
             engram,
@@ -425,7 +441,9 @@ class StageReplay:
 
         self.program = weakref.ref(program)
         self.variants = {}
-        self.native_input_enabled = envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH and program.pp_rank == 0
+        self.native_input_enabled = program.pp_rank == 0 and (
+            envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH
+            or program.dspark and envs.VLLM_HPU_DSV41_DSPARK_NATIVE_TARGET_INPUT)
         self.segmented_prefix_enabled = envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX and program.pp_rank == 0
         if self.segmented_prefix_enabled and not self.native_input_enabled:
             raise ValueError("V2 segmented prefix requires native PP0 input replay")
@@ -434,6 +452,7 @@ class StageReplay:
         ):
             raise ValueError("Direct Engram capture requires ordinary BF16 native input replay")
         self.input_seed = None
+        self.input_seeds = {}
         self.latest_tail = None
         self.greedy_tail_enabled = bool(greedy_tail)
 
@@ -470,18 +489,24 @@ class StageReplay:
         return outputs
 
     def _input_seed(self, input_ids):
-        if self.input_seed is None:
-            self.input_seed = (
-                torch.zeros(1, 4, 5120, device=input_ids.device, dtype=torch.bfloat16),
-                torch.zeros(1, 4, device=input_ids.device, dtype=torch.float32),
+        count = input_ids.numel()
+        if not _native_input_count_compatible(self.program(), count):
+            raise ValueError("Native input seed requires a supported fixed decode count")
+        if count not in self.input_seeds:
+            self.input_seeds[count] = (
+                torch.zeros(count, 4, 5120, device=input_ids.device, dtype=torch.bfloat16),
+                torch.zeros(count, 4, device=input_ids.device, dtype=torch.float32),
             )
-        return self.input_seed
+        if count == 1:
+            self.input_seed = self.input_seeds[count]
+        return self.input_seeds[count]
 
     def from_input_ids(self, positions, input_ids, engram):
         program = self.program()
-        if not self.native_input_enabled or input_ids.numel() != 1 or not _native_input_precision_compatible(program):
-            raise ValueError("Native input capture requires enabled ordinary BF16 C1 PP0 decode")
-        if self.segmented_prefix_enabled:
+        if not self.native_input_enabled or not _native_input_count_compatible(program, input_ids.numel()):
+            raise ValueError("Native input capture requires enabled C1 PP0 decode or a "
+                             "qualified C2-C6 DSpark input plan")
+        if self.segmented_prefix_enabled and input_ids.numel() == 1:
             from vllm_gaudi.ops.tp2_prepared_plan import _native_entries
 
             variant = self.variants.get(self._input_key())
@@ -586,9 +611,10 @@ class StageReplay:
         if not program.dspark and tokens != 1:
             raise ValueError("V4.1 replay shape must be C1 when DSpark is disabled")
         if native_input and (
-            not self.native_input_enabled or not _native_input_precision_compatible(program) or tokens != 1
+            not self.native_input_enabled or not _native_input_count_compatible(program, tokens)
         ):
-            raise ValueError("Native input capture requires enabled ordinary BF16 C1 PP0 decode")
+            raise ValueError("Native input capture requires enabled C1 PP0 decode or a "
+                             "qualified C2-C6 DSpark input plan")
         search = getattr(program, "search_length", 512)
         key = (
             ((tokens, "input") if search <= 512 else (tokens, "input", search))
@@ -620,7 +646,7 @@ class StageReplay:
         from vllm_gaudi import envs
 
         program = self.program()
-        native_input = self.native_input_enabled and tokens == 1 and _native_input_precision_compatible(program)
+        native_input = self.native_input_enabled and _native_input_count_compatible(program, tokens)
         fused = program.pp_rank == 0 and envs.VLLM_HPU_DSV41_FUSED_STAGE_IO
         key = (
             ((tokens, "input") if search <= 512 else (tokens, "input", search))
@@ -641,6 +667,7 @@ class StageReplay:
             invalidate_prepared_group_plans(owner=variant, reason="stage_close")
         self.variants.clear()
         self.input_seed = None
+        self.input_seeds = {}
         self.latest_tail = None
 
 

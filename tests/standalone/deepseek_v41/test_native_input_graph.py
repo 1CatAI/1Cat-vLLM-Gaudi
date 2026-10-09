@@ -282,3 +282,28 @@ def test_warmup_checks_the_selected_mode(monkeypatch, pp_rank, native_input):
 def test_input_capture_requires_native_compilation():
     with pytest.raises(ValueError, match="ordinary BF16 PP0"):
         CompiledStage(program(), native=False, native_input=True)
+
+
+@pytest.mark.parametrize("tokens", [1, 6, 7, 256])
+@pytest.mark.parametrize("fused", [False, True])
+def test_layer_group_classifies_decode_before_fused_embedding(tokens, fused):
+    stage = torch.nn.Module()
+    stage.weights = torch.nn.Module()
+    stage.weights.embed = torch.nn.Embedding(16, 8, dtype=torch.bfloat16)
+    stage.config = {"text_config": {"rms_norm_eps": 1e-20}}
+    stage.pp_rank, stage.is_last_stage, stage.tensor_parallel_size = 0, False, 4
+    stage.reduce = lambda value: value
+    stage.layers = torch.nn.ModuleList()
+    group = PreparedLayerGroup(stage, 0, 0, fused_text_io=fused, decode=True)
+    # Exercise the input-producing group before its downstream layer groups.
+    group.wire_output = False
+    incoming = PreparedInput(stage.weights.embed, 0, stage.reduce)
+    ids = torch.arange(tokens) % 16
+    positions = torch.arange(tokens, dtype=torch.int32)
+    residual, pre = incoming(ids)
+    arguments = (None, None, positions, ids, ()) if fused else (residual, pre, positions, ids, ())
+    observed = group(*arguments)
+    compiled = torch.compile(group, backend="eager", fullgraph=True, dynamic=False)(*arguments)
+    for output in (observed, compiled):
+        assert torch.equal(output[0], residual) and torch.equal(output[1], pre)
+        assert output[2] is None

@@ -643,6 +643,17 @@ class HPUWorker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             self.model_runner = self._create_model_runner()
         self.init_profiler()
+        if is_v41(self.vllm_config) and os.environ.get("GRAPH_VISUALIZATION") == "1":
+            # SDK initialization resets its dump directory independently of
+            # the bridge prefix. Configure it after that initialization.
+            from vllm_gaudi.ops.deepseek_v41_native_trace import configure_post_graph_directory
+
+            configure_post_graph_directory(os.environ["GRAPH_VISUALIZATION_DIR"])
+        elif (is_v41(self.vllm_config) and os.environ.get("VLLM_HPU_DSV41_RAW_TRACE") == "1"
+              and os.environ.get("VLLM_HPU_DSV41_DSPARK") == "1"):
+            from vllm_gaudi.ops.deepseek_v41_native_trace import disable_automatic_graph_exports
+
+            disable_automatic_graph_exports()
 
     def _create_model_runner(self):
         from vllm_gaudi.ops.deepseek_v41_config import is_v41

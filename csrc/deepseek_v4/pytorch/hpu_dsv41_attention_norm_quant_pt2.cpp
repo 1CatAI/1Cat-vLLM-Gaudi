@@ -5,10 +5,12 @@
 #include <cmath>
 #include "hpu_ops/op_backend.h"
 
+#ifndef DSV41_ATTN_NORM_QUANT_OP
+#define DSV41_ATTN_NORM_QUANT_OP "custom_deepseek_v41_attention_norm_quant_gaudi2"
+#endif
 namespace {
-constexpr auto kSchema =
-    "custom_op::custom_deepseek_v41_attention_norm_quant_gaudi2";
-constexpr auto kGuid = "custom_deepseek_v41_attention_norm_quant_gaudi2";
+constexpr auto kSchema = "custom_op::" DSV41_ATTN_NORM_QUANT_OP;
+constexpr auto kGuid = DSV41_ATTN_NORM_QUANT_OP;
 using Outputs = std::tuple<at::Tensor, at::Tensor, at::Tensor>;
 struct Params { float epsilon; float inverse_width; };
 
@@ -96,11 +98,11 @@ Outputs run(const at::Tensor& x, const at::Tensor& weight, double epsilon) {
 }
 
 TORCH_LIBRARY_FRAGMENT(custom_op, m) {
-    m.def("custom_deepseek_v41_attention_norm_quant_gaudi2(Tensor value, Tensor weight, float epsilon) -> (Tensor, Tensor, Tensor)");
+    m.def(DSV41_ATTN_NORM_QUANT_OP "(Tensor value, Tensor weight, float epsilon) -> (Tensor, Tensor, Tensor)");
 }
 TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
-    m.impl("custom_deepseek_v41_attention_norm_quant_gaudi2", run<false>);
+    m.impl(DSV41_ATTN_NORM_QUANT_OP, run<false>);
 }
 TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
-    m.impl("custom_deepseek_v41_attention_norm_quant_gaudi2", run<true>);
+    m.impl(DSV41_ATTN_NORM_QUANT_OP, run<true>);
 }

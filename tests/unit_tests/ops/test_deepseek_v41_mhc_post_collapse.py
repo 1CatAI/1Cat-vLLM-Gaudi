@@ -86,3 +86,15 @@ def test_precomputed_collapse_preserves_all_control_outputs(tokens):
     observed = hc_pre(*args, collapsed_input=collapsed)
     for a, b in zip(observed, expected, strict=True):
         assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize("tokens", [1, 2, 6, 7, 256])
+@pytest.mark.parametrize("decode", [False, True])
+def test_speculative_control_scope_keeps_prompt_arithmetic(monkeypatch, tokens, decode):
+    from vllm_gaudi import envs
+    from vllm_gaudi.ops.deepseek_v41_math import mhc_control_scope
+
+    monkeypatch.setattr(envs, "VLLM_HPU_DSV41_DSPARK", True)
+    assert mhc_control_scope(decode=decode, tokens=tokens) == (decode and tokens <= 6)
+    monkeypatch.setattr(envs, "VLLM_HPU_DSV41_DSPARK", False)
+    assert mhc_control_scope(decode=decode, tokens=tokens)

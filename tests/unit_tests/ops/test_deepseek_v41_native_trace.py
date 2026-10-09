@@ -12,6 +12,23 @@ import pytest
 from vllm_gaudi.ops import deepseek_v41_native_trace as trace
 
 
+def test_post_graph_directory_uses_capture_filesystem(monkeypatch, tmp_path):
+    calls = []
+    configure = lambda key, value: calls.append((key, value)) or 0
+    monkeypatch.setattr(trace, "_api", lambda: SimpleNamespace(synConfigurationSet=configure))
+    graph_directory = tmp_path / "capture" / "rank0"
+    destination = trace.configure_post_graph_directory(graph_directory)
+    assert destination.is_dir()
+    assert calls == [(b"DUMP_POST_GRAPHS", os.fsencode(destination))]
+
+
+def test_post_graph_directory_rejects_sdk_configuration_failure(monkeypatch, tmp_path):
+    configure = lambda *_: 26
+    monkeypatch.setattr(trace, "_api", lambda: SimpleNamespace(synConfigurationSet=configure))
+    with pytest.raises(RuntimeError, match="Set SDK post-graph directory failed"):
+        trace.configure_post_graph_directory(tmp_path / "capture")
+
+
 def configure(monkeypatch, tmp_path, *, skip_parse=True):
     config = {
         "GeneralSettings": {

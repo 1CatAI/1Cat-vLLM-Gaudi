@@ -20,6 +20,30 @@ _active = False
 _torch_active = False
 _annotations_supported = None
 _scope_recorder = None
+_device_recorder = None
+
+
+def configure_post_graph_directory(graph_directory):
+    """Configure SDK dump placement after its initialization sets defaults."""
+    destination = Path(graph_directory).resolve() / "sdk-post-graphs"
+    destination.mkdir(parents=True, exist_ok=True)
+    api = _api()
+    api.synConfigurationSet.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+    _check(api.synConfigurationSet(b"DUMP_POST_GRAPHS", os.fsencode(destination)), "Set SDK post-graph directory")
+    return destination
+
+
+def disable_automatic_graph_exports():
+    """Clear SDK profiler defaults without enabling any graph export variable.
+
+    Raw acquisition still records hardware/debug metadata. SDK startup can
+    independently enable full graph JSON in the user's home directory even
+    with start-disabled capture; disable that automatic artifact generation.
+    """
+    api = _api()
+    api.synConfigurationSet.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+    for key in (b"DUMP_PRE_GRAPHS", b"DUMP_POST_GRAPHS"):
+        _check(api.synConfigurationSet(key, b""), "Disable automatic SDK graph export")
 
 
 def set_torch_annotations(enabled):
@@ -118,6 +142,7 @@ class NativeTrace:
         self.metadata = None
         self.scope_only = scope_only
         self.scope_events = []
+        self.device_events = []
 
     def _export_scopes(self):
         first, last = self.clock_samples
@@ -211,7 +236,7 @@ class NativeTrace:
         self._output_before = self._published_files()
 
     def start(self):
-        global _active, _annotations_supported, _scope_recorder
+        global _active, _annotations_supported, _scope_recorder, _device_recorder
         if self.running:
             raise RuntimeError("Native trace is already running")
         self._prepare_output()
@@ -239,9 +264,10 @@ class NativeTrace:
         _annotations_supported = None
         self.running = _active = True
         _scope_recorder = self if self.scope_only else None
+        _device_recorder = self
 
     def stop(self):
-        global _active, _scope_recorder
+        global _active, _scope_recorder, _device_recorder
         if not self.running:
             raise RuntimeError("Native trace is not running")
         torch.hpu.synchronize()
@@ -251,6 +277,7 @@ class NativeTrace:
         _check(api.synProfilerStop(1, 0), "trace stop")
         self.running = _active = False
         _scope_recorder = None
+        _device_recorder = None
         # A null size requests file publication. Unlike the size-query and
         # caller-buffer forms used by Kineto, this honors the configured raw
         # output/skipParse mode without materializing all events in Python.
@@ -279,11 +306,36 @@ class NativeTrace:
             cpu_trace_mode="scopes_only" if self.scope_only else "torch_cpu",
             scope_clock_domain="CLOCK_MONOTONIC_RAW" if self.scope_only else "wall",
             explicit_scope_count=len(self.scope_events),
+            device_stage_intervals=[dict(label=label, submit_start_raw_ns=start, submit_stop_raw_ns=end,
+                                         elapsed_device_ms=begin.elapsed_time(done))
+                                    for label, start, end, begin, done in self.device_events],
+            device_stage_interval_contract=(
+                'Ordered current-stream event interval after complete trace drain; includes required '
+                'staging/waits inside the scope, not a hardware activity union. Diagnostic trace only.'),
             stop_complete_wall_ns=time.time_ns(),
         )
         if self.cpu_trace_dir is not None:
             destination = self.cpu_trace_dir / f"raw-capture-{os.getpid()}-{time.time_ns()}.json"
             destination.write_text(json.dumps(self.metadata, indent=2) + "\n")
+        self.device_events.clear()
+
+
+@contextmanager
+def device_scope(label):
+    """Bound one queued stage only during raw capture, with no in-round wait."""
+    recorder = _device_recorder
+    if not _active or recorder is None or len(recorder.device_events) >= 512:
+        with scope(label):
+            yield
+        return
+    begin, done = torch.hpu.Event(enable_timing=True), torch.hpu.Event(enable_timing=True)
+    start = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+    begin.record()
+    with scope(label):
+        yield
+    done.record()
+    end = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+    recorder.device_events.append((label, start, end, begin, done))
 
 
 @contextmanager

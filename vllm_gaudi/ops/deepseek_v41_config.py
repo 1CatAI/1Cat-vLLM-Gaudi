@@ -4,6 +4,20 @@
 from vllm_gaudi import envs
 
 
+def select_native_warmup_geometries(geometries, additional_config):
+    """Select deployment context plans without changing compute or decode shapes."""
+    requested = additional_config.get("dsv41_native_warmup_searches")
+    if requested is None:
+        return geometries
+    available = {search for _, search in geometries}
+    if (not isinstance(requested, (list, tuple)) or not requested
+            or any(type(search) is not int or search not in available for search in requested)
+            or len(set(requested)) != len(requested)):
+        raise ValueError("dsv41_native_warmup_searches must contain distinct supported search buckets")
+    selected = set(requested)
+    return tuple(geometry for geometry in geometries if geometry[1] in selected)
+
+
 def decode_source_prefix_bound(token_end, search_length, tensor_parallel_size, *, runtime_indexer=False):
     """Bound contiguous Full-source work without reading device positions."""
     if tensor_parallel_size < 2:
@@ -94,8 +108,8 @@ def validate_sampling(params, *, dspark=None):
         raise VLLMValidationError("V4.1 runner requires sampling parameters")
     if dspark is None:
         dspark = envs.VLLM_HPU_DSV41_DSPARK
-    if dspark and params.temperature != 0:
-        raise VLLMValidationError("V4.1 DSpark requires greedy sampling (temperature=0)")
+    if dspark and params.temperature != 0 and not envs.VLLM_HPU_DSV41_DEVICE_VERIFY:
+        raise VLLMValidationError("V4.1 sampled DSpark requires device probability verification")
     if (
         params.logprobs is not None
         or params.prompt_logprobs is not None
@@ -187,11 +201,8 @@ def configure(config):
         enabled = next((name for name in _PIPELINE_ONLY_FASTPATHS if getattr(envs, name, False)), None)
         if enabled is not None:
             raise ValueError(f"V4.1 {enabled} requires a pipeline peer")
-    if is_tp4(config):
-        if envs.VLLM_HPU_DSV41_DSPARK or spec is not None:
-            raise ValueError("V4.1 TP4 does not yet support DSpark")
-        if envs.VLLM_HPU_DSV41_PREFILL_GROUPED_FP8 not in ("", "w13_single_bucket"):
-            raise ValueError("V4.1 TP4 supports BF16 or W13 single-FP8 bucketed prefill")
+    if is_tp4(config) and envs.VLLM_HPU_DSV41_PREFILL_GROUPED_FP8 not in ("", "w13_single_bucket"):
+        raise ValueError("V4.1 TP4 supports BF16 or W13 single-FP8 bucketed prefill")
     if config.scheduler_config.async_scheduling and not uses_v2(config):
         raise ValueError("V4.1 PP verify commits currently require --no-async-scheduling")
     if config.use_v2_model_runner and not uses_v2(config):

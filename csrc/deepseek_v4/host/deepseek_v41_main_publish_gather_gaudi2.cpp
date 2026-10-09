@@ -22,7 +22,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41MainPublishGatherGaudi2::GetGcDefinitions
     const int ratio = *static_cast<const int*>(in->nodeParams.nodeParams);
     if (ratio != 1 && ratio != 2) return GLUE_INCOMPATIBLE_INPUT_SIZE;
     const auto tokens = in->inputTensors[2].geometry.maxSizes[1];
-    if (tokens != 1) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+    if (tokens < 1 || tokens > 6) return GLUE_INCOMPATIBLE_INPUT_SIZE;
     auto matches = [](const Tensor& t, unsigned type, unsigned dims, uint64_t d0) {
         return t.geometry.dataType == type && t.geometry.dims == dims && t.geometry.maxSizes[0] == d0;
     };
@@ -35,7 +35,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41MainPublishGatherGaudi2::GetGcDefinitions
         !in->inputTensors[4].geometry.maxSizes[0] || in->inputTensors[4].geometry.maxSizes[0] > 8192 ||
         !matches(in->inputTensors[5], DATA_I32, 1, tokens)) return GLUE_INCOMPATIBLE_INPUT_SIZE;
     auto map = [](TensorAccessPattern& p, unsigned dim, unsigned axis, int a, int last) {
-        p.mapping[dim] = {axis, float(a), 0, float(last)};
+        p.mapping[dim] = {axis, float(a), 0, float(last), false};
     };
     out->indexSpaceRank = 2;
     out->indexSpaceGeometry[0] = 640;

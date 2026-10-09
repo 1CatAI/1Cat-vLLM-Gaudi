@@ -34,6 +34,7 @@ _native_invalidations = Counter()
 class _Slot:
     index: int
     warm: object
+    tensor_ready_ordinal: int = 0
 
 
 def prepared_group_stats():
@@ -209,6 +210,11 @@ def _flush():
                         attention_inputs = attention_inputs[1:]
                     graph.configure_late_inputs(attention_inputs)
                 snapshot = context["snapshot"]() if v4 else None
+                compact_inputs = tuple(getattr(context.get("owner"), "compact_pipeline_inputs", ())) if context else ()
+                if compact_inputs:
+                    if not hasattr(graph, "set_compact_inputs"):
+                        raise RuntimeError("Unique experts require device row-program replay support")
+                    graph.set_compact_inputs(list(compact_inputs))
                 graph.capture(native_plans, native_inputs)
                 graph.instantiate()
                 _native_captures += 1
@@ -426,6 +432,8 @@ def invalidate_prepared_group_plans(owner=None, *, reason="explicit"):
         for plan in module.plans:
             plan.invalidate()
         module.plans.clear()
+        if hasattr(module, 'tensor_ready_ordinals'):
+            module.tensor_ready_ordinals.clear()
         module.signature_keys.clear()
         module.plan_owners.clear()
         module.communicator_backend = None
@@ -451,6 +459,30 @@ def _is_clear(target):
 
 def _view_targets():
     return (torch.ops.aten.view.default, torch.ops.aten.as_strided.default)
+
+
+def _tensor_ready_output_indices(module):
+    """A signal may pass through aliases, never through further arithmetic."""
+    markers = [node for node in module.graph.nodes
+               if node.op == 'call_function'
+               and 'custom_deepseek_v41_peer_ready_identity_gaudi2' in str(node.target)
+               and node.args[1] is True]
+    if not markers:
+        return set()
+    if len(markers) != 1:
+        raise RuntimeError('A payload recipe must expose exactly one tensor-ready signal')
+    result = next(node for node in module.graph.nodes if node.op == 'output').args[0]
+    values = result if isinstance(result, (tuple, list)) else (result,)
+    aliases = (*_view_targets(), torch.ops.aten.reshape.default, torch.ops.aten._unsafe_view.default)
+    selected = set()
+    for index, value in enumerate(values):
+        while isinstance(value, torch.fx.Node) and value.op == 'call_function' and value.target in aliases:
+            value = value.args[0]
+        if value is markers[0]:
+            selected.add(index)
+    if len(selected) != 1:
+        raise RuntimeError('Tensor-ready marker must be an unchanged, unique persistent recipe output')
+    return selected
 
 
 def _verify_identity_view(source, result):
@@ -578,7 +610,8 @@ def _eligible(graph, *, tp4=False):
             continue
         if _is_static_scalar(node):
             continue
-        raise RuntimeError(f"Unsupported operation in prepared TP2 group: {node.op}:{node.target}")
+        raise RuntimeError(f"Unsupported operation in prepared TP2 group: {node.op}:{node.target}; "
+                           f"node={node.format_node()}; origin={node.meta.get('stack_trace', '')}")
     return True
 
 
@@ -594,6 +627,7 @@ class PreparedGroupModule(torch.nn.Module):
         self.prepares = 0
         self.scheduled_exchanges = 0
         self.replays = 0
+        self.tensor_ready_ordinals = {}
         _modules.add(self)
 
     def _runtime(self):
@@ -604,6 +638,7 @@ class PreparedGroupModule(torch.nn.Module):
         from vllm_gaudi.distributed.tp2_fused_ar_norm import _allocate_outputs
 
         signature = tuple(_signature_key(value) for value in inputs)
+        ready_ordinals = []
         directory = os.environ.get("GDN_STATE_DIAGNOSTIC_DIR")
         if directory and self.plans:
             import json
@@ -681,7 +716,7 @@ class PreparedGroupModule(torch.nn.Module):
                 actual = node.target(*warm(arguments), **node.kwargs)
                 if (self.tp4 or self._owner_key() is not None) and _is_contiguous_reshape(source.warm, actual):
                     index = native.add_reshape_view(source.index, list(actual.shape))
-                    env[node] = _Slot(index, actual)
+                    env[node] = _Slot(index, actual, source.tensor_ready_ordinal)
                     continue
                 if _is_norm_singleton_view(source.warm, actual) and tuple(source.warm.shape) != tuple(actual.shape):
                     # Keep a separate TensorImpl for each logical shape while
@@ -721,12 +756,15 @@ class PreparedGroupModule(torch.nn.Module):
                         f"recipe={child._fx_module.code}"
                     )
                 visible_slots, allocated_slots = [], []
+                ready_outputs = _tensor_ready_output_indices(child.fx_module)
                 for index, actual in enumerate(visible):
                     if index in duplicates:
                         current = arguments[duplicates[index]]
                     else:
                         current = slot(actual, planned=next(allocations))
                         allocated_slots.append(current.index)
+                    if index in ready_outputs:
+                        current.tensor_ready_ordinal = 1
                     visible_slots.append(current)
                 native.add_compute(child._recipe_id, [x.index for x in arguments], allocated_slots)
                 from vllm_gaudi.compilation.deepseek_v41_memory_ready import mark_memory_ready_recipe
@@ -782,6 +820,7 @@ class PreparedGroupModule(torch.nn.Module):
                     else native.add_peer_exchange
                 )
                 add_collective(arguments[0].index, result.index)
+                ready_ordinals.append(arguments[0].tensor_ready_ordinal)
                 env[node] = result
             elif node.op == "call_function" and node.target == collective:
                 resolved = resolve(node.args)
@@ -794,6 +833,7 @@ class PreparedGroupModule(torch.nn.Module):
                     for i, value in enumerate(allocated)
                 ]
                 native.add_exchange([x.index for x in arguments], [x.index for x in results_], epsilon)
+                ready_ordinals.append(0)
                 env[node] = results_[1], results_[2]
             elif node.op == "output":
                 results = resolve(node.args[0])
@@ -805,6 +845,7 @@ class PreparedGroupModule(torch.nn.Module):
             raise RuntimeError("Prepared decoder output must be a flat tuple of tensors")
         native.prepare(backend, [x.index for x in results])
         self.plans.append(native)
+        self.tensor_ready_ordinals[id(native)] = tuple(ready_ordinals)
         self.signature_keys.append(signature)
         self.plan_owners.append(self._owner_key())
         self.prepares += 1

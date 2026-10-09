@@ -32,6 +32,16 @@ def io(node, prefix):
 
 def classify(node, kernel, inputs, outputs):
     name = node.lower()
+    if "deepseek_v41_expert_token_wide_sat_fp8" in kernel:
+        packed = inputs[1].get("shape", []) if len(inputs) > 1 else []
+        stage = "阶段见张量合同"
+        if (len(packed) == 3 and inputs[1].get("dtype") in ("int16", "i16")
+                and packed[-1] > 0 and packed[-1] % 64 == 0):
+            # The token-wide ABI stores 64 packed I16 words per K element
+            # and 256 output channels per block, before route-pair packing.
+            k, n = packed[-1] // 64, packed[-2] * 256
+            stage = "W13 gate/up" if k > n else "W2 down" if n > k else stage
+        return "路由专家", stage + " SAT 打包权重寻址/FP4 解码，供 FP8 MME 消费"
     if kernel == "unresolved_mme_recipe0":
         return "矩阵计算未归因", "SDK recipeId=0 的完整 MME 区间；源矩阵、精度与物理调用边界尚未恢复"
     if kernel.startswith("TPC_SPU_"):
@@ -68,6 +78,10 @@ def classify(node, kernel, inputs, outputs):
         ),
         "deepseek_v41_selected_mla_softmax": ("Attention", "选中 MLA 行的 softmax/sink 与概率准备"),
         "deepseek_v41_index_keys": ("CSA2", "物理 page 查找与 FP4 index key 解码，供多头 MME 复用"),
+        "deepseek_v41_fp4_pack": ("CSA2", "主 KV/index 行的精确 FP4 编码；具体生产者见源节点"),
+        "deepseek_v41_logical_mla_vector": ("Attention", "逻辑页寻址与选中 KV 的向量解码"),
+        "deepseek_v41_logical_mla_write_ordered": ("Attention", "完成依赖之后的共用逻辑页寻址与 KV 解码"),
+        "deepseek_v41_logical_mla_decoded": ("Attention", "完成依赖之后的逻辑 BF16 KV 读取"),
         "deepseek_v41_prefill_main_decode": ("CSA2", "prefill 主 KV page 查找与 FP4 解码，共享 BF16 工作区"),
         "deepseek_v41_prefill_topk": ("CSA2", "prefill 选择阈值/有序候选发射，具体阶段见 GUID"),
         "deepseek_v41_prefill_sparse_kv": ("Attention", "prefill 稀疏 KV 选择与矩阵操作数准备"),
@@ -409,7 +423,14 @@ def expert_mme_owners(contracts):
                     continue
                 visited.add(name)
                 for source in producers.get((contract["graph"]["path"], name), []):
-                    if "deepseek_v41_prefill_permuted_bf16" in source["symbol"]["kernel"]:
+                    if "deepseek_v41_expert_token_wide_sat_fp8" in source["symbol"]["kernel"]:
+                        _, stage = classify(source["symbol"]["node"], source["symbol"]["kernel"],
+                                            source.get("inputs", []), source.get("outputs", []))
+                        role = "W13" if stage.startswith("W13") else "W2" if stage.startswith("W2") else None
+                        if role:
+                            anchors[source["symbol"]["node"]] = dict(
+                                role=role, packed_weight_shape=source["inputs"][1]["shape"])
+                    elif "deepseek_v41_prefill_permuted_bf16" in source["symbol"]["kernel"]:
                         shape = source["inputs"][1]["shape"]
                         role = "W13" if shape[-1] == 327680 else "W2" if shape[-1] in (40960, 73728) else None
                         if role:
@@ -422,7 +443,7 @@ def expert_mme_owners(contracts):
         roles = {row["role"] for row in anchors.values()}
         if len(roles) == 1:
             owners[key] = dict(
-                rule="same-capture PostGraph dependency from MME B to N256 weight decoder",
+                rule="same-capture PostGraph dependency from MME B to packed expert weight decoder",
                 role=roles.pop(),
                 producers=anchors,
             )
@@ -640,7 +661,7 @@ def analyze(root, rank, common):
         origin = expert_owners.get(key)
         if origin:
             category = "路由专家"
-            purpose = ("W13 gate/up" if origin["role"] == "W13" else "W2 down") + " 预填充物理 MME 分块"
+            purpose = ("W13 gate/up" if origin["role"] == "W13" else "W2 down") + " 打包专家权重的物理 MME 分块"
         norm = norm_owners.get((contract.get("graph") or {}).get("path"), {}).get(source) if contract else None
         if norm:
             category, purpose = "Attention", norm["role"] + " RMSNorm：投影后的转换、统计、归一化及权重乘法"
@@ -854,6 +875,14 @@ if __name__ == "__main__":
         "anchor_rank": anchor_rank,
         "export_activity_intervals": args.activity_intervals,
     }
+    if common["unit"] == "round":
+        prefixes = [dict(zip(item["tokens"], item["committed_tokens"])) for item in data]
+        for token in tokens:
+            if len({item[token] for item in prefixes}) != 1:
+                raise ValueError("Four-rank speculative committed prefixes disagree")
+        common["committed_tokens"] = [prefixes[anchor_rank][token] for token in tokens]
+        common["total_committed_tokens"] = sum(common["committed_tokens"])
+        common["mean_committed"] = common["total_committed_tokens"] / len(tokens) if tokens else None
     if not tokens:
         raise ValueError("No complete common four-rank cycle")
     (args.analysis / "common-windows.json").write_text(json.dumps(common, indent=2) + "\n")

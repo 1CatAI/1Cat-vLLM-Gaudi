@@ -12,12 +12,12 @@ using Pair = std::tuple<at::Tensor, at::Tensor>;
 habana::OutputMetaDataVector meta(const at::Stack& s, bool projection, bool rope = false) {
     TORCH_CHECK(s.size() == (rope ? 7 : projection ? 5 : 3), "WO handoff requires its complete operands");
     const auto x = s.at(0).toTensor();
-    TORCH_CHECK(x.dim() == 3, "WO handoff requires a C1 tensor");
+    TORCH_CHECK(x.dim() == 3, "WO handoff requires a batched tensor");
     const auto groups = projection ? x.size(1) / (rope ? 8 : 1) : x.size(0);
-    TORCH_CHECK((groups == 2 || groups == 4) &&
-                x.sizes() == (projection ? (rope ? at::IntArrayRef({1,groups*8,512}) : at::IntArrayRef({1,groups,4096})) : at::IntArrayRef({groups,1,1024})) &&
+    TORCH_CHECK((groups == 2 || groups == 4) && x.size(projection ? 0 : 1) >= 1 && x.size(projection ? 0 : 1) <= 6 &&
+                x.sizes() == (projection ? (rope ? at::IntArrayRef({x.size(0),groups*8,512}) : at::IntArrayRef({x.size(0),groups,4096})) : at::IntArrayRef({groups,x.size(1),1024})) &&
                 x.scalar_type() == (projection ? at::kBFloat16 : at::kFloat),
-                "WO handoff requires the TP-parametric C1 projection geometry");
+                "WO handoff requires the TP-parametric C1-C6 projection geometry");
     for (const auto& item : s) {
         const auto t = item.toTensor();
         TORCH_CHECK(t.device() == x.device() && t.is_contiguous() && !t.requires_grad(),
@@ -25,7 +25,7 @@ habana::OutputMetaDataVector meta(const at::Stack& s, bool projection, bool rope
     }
     if (rope) {
         const auto pos=s.at(5).toTensor(), phase=s.at(6).toTensor();
-        TORCH_CHECK(pos.scalar_type()==at::kInt && pos.sizes()==at::IntArrayRef({1}) &&
+        TORCH_CHECK(pos.scalar_type()==at::kInt && pos.sizes()==at::IntArrayRef({x.size(0)}) &&
                     phase.scalar_type()==at::kFloat && phase.dim()==2 && phase.size(1)==64,
                     "WO inverse RoPE requires I32 position and packed F32 phase");
     }
@@ -33,9 +33,9 @@ habana::OutputMetaDataVector meta(const at::Stack& s, bool projection, bool rope
         TORCH_CHECK(s.at(1).toTensor().scalar_type() == at::kFloat &&
                     s.at(1).toTensor().sizes() == at::IntArrayRef({groups,1,1024}) &&
                     s.at(2).toTensor().scalar_type() == at::kFloat &&
-                    s.at(2).toTensor().sizes() == at::IntArrayRef({groups,1,1}),
+                    s.at(2).toTensor().sizes() == at::IntArrayRef({groups,x.size(1),1}),
                     "WO handoff requires FP32 product and channel/activation scales");
-        return {{at::ScalarType::Float8_e4m3fn,{1,groups*1024}}, {at::kFloat,{1,1}}};
+        return {{at::ScalarType::Float8_e4m3fn,{x.size(1),groups*1024}}, {at::kFloat,{x.size(1),1}}};
     }
     TORCH_CHECK(s.at(1).toTensor().scalar_type() == at::ScalarType::Float8_e4m3fn &&
                 s.at(1).toTensor().sizes() == at::IntArrayRef({groups,4096,1024}) &&
@@ -46,7 +46,7 @@ habana::OutputMetaDataVector meta(const at::Stack& s, bool projection, bool rope
                 s.at(4).toTensor().scalar_type() == at::kFloat &&
                 s.at(4).toTensor().sizes() == at::IntArrayRef({1,5120}),
                 "WO handoff requires prepared FP8 WO weights and FP32 channel scales");
-    return {{at::kBFloat16,{1,5120}}};
+    return {{at::kBFloat16,{x.size(0),5120}}};
 }
 class Handoff final : public habana::OpBackend {
     bool projection_;
@@ -59,6 +59,7 @@ class Handoff final : public habana::OpBackend {
     }
     void AddNode(synapse_helpers::graph& graph, const at::Stack& s) override {
         const auto outputs = meta(s,projection_,rope_);
+        const auto tokens = s.at(0).toTensor().size(projection_ ? 0 : 1);
         const auto groups = s.at(0).toTensor().size(projection_ ? 1 : 0) / (rope_ ? 8 : 1);
         if (!projection_) {
             auto q = BuildNode(this,graph,{kQuant,{syn_in(0),syn_in(1),syn_in(2)},
@@ -69,18 +70,18 @@ class Handoff final : public habana::OpBackend {
         // between them; do not materialize inverse-RoPE or rounded BF16 rows.
         auto q = rope_
             ? BuildNode(this,graph,{"custom_deepseek_v41_woa_rope_quant_gaudi2",{syn_in(0),syn_in(5),syn_in(6)},
-                {{{groups,1,4096},at::ScalarType::Float8_e4m3fn},{{groups,1,1},at::kFloat}}})
+                {{{groups,tokens,4096},at::ScalarType::Float8_e4m3fn},{{groups,tokens,1},at::kFloat}}})
             : BuildNode(this,graph,{"custom_deepseek_v41_woa_quant_gaudi2",{syn_in(0)},
-                {{{groups,1,4096},at::ScalarType::Float8_e4m3fn},{{groups,1,1},at::kFloat}}});
+                {{{groups,tokens,4096},at::ScalarType::Float8_e4m3fn},{{groups,tokens,1},at::kFloat}}});
         synGEMMParams ap{false,false}, bp{false,true};
         auto a = BuildNode(this,graph,{"batch_gemm",{q[0].get(),syn_in(1)},
-            {{{groups,1,1024},at::kFloat}},&ap,sizeof(ap)});
+            {{{groups,tokens,1024},at::kFloat}},&ap,sizeof(ap)});
         auto bq = BuildNode(this,graph,{kQuant,{a[0].get(),syn_in(2),q[1].get()},
-            {{{1,groups*1024},at::ScalarType::Float8_e4m3fn},{{1,1},at::kFloat}}});
+            {{{tokens,groups*1024},at::ScalarType::Float8_e4m3fn},{{tokens,1},at::kFloat}}});
         auto b = BuildNode(this,graph,{"gemm",{bq[0].get(),syn_in(3)},
-            {{{1,5120},at::kFloat}},&bp,sizeof(bp)});
+            {{{tokens,5120},at::kFloat}},&bp,sizeof(bp)});
         syn_out(0)=std::move(BuildNode(this,graph,{"custom_deepseek_v41_dense_scale_gaudi2",
-            {b[0].get(),syn_in(4),bq[1].get()},{{{1,5120},at::kBFloat16,0}}})[0]);
+            {b[0].get(),syn_in(4),bq[1].get()},{{{tokens,5120},at::kBFloat16,0}}})[0]);
     }
 };
 const bool registered = [] {

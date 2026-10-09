@@ -12,14 +12,17 @@ def tensor_info(text):
     shape = re.search(r"Sizes = (\[[^\]]+\])", text)
     size = re.search(r"sizeInBytes = (\d+)", text)
     location = re.search(r"location = in (\w+)", text)
-    alias = re.search(r"isAliased = ([^,]+), type = alias, offset: 0(?: |$)", text)
+    alias = re.search(r"isAliased = ([^,]+),", text)
+    offset = re.search(r"offset: (\d+)", text)
     return {
         "alias": alias[1] if alias else None,
         "name": text.split("  |", 1)[0],
         "description": text,
         "shape": json.loads(shape[1]) if shape else None,
         "bytes": int(size[1]) if size else None,
-        "location": location[1] if location else None
+        "location": location[1] if location else None,
+        "alias_of": alias[1].strip() if alias else None,
+        "alias_offset": int(offset[1]) if offset else None
     }
 
 
@@ -30,18 +33,11 @@ def audit(path):
                 "custom_deepseek_v41_expert_n256_bf16", "custom_deepseek_v41_expert_n256_normal_bf16",
                 "custom_deepseek_v41_expert_n256_slots_fp8_gaudi2", "custom_deepseek_v41_expert_n256_reuse_fp8_gaudi2",
                 "custom_deepseek_v41_expert_n256_horizontal_fp8_gaudi2",
-                "custom_deepseek_v41_expert_token_wide_sat_fp8_gaudi2",
                 "custom_deepseek_v41_expert_n256_sat_fp8_gaudi2",
-                "custom_deepseek_v41_expert_token_wide6_sat_fp8_gaudi2",
-                "custom_deepseek_v41_expert_token_wide3_sat_fp8_gaudi2",
-                "custom_deepseek_v41_expert_token_wide3_active_k_sat_fp8_gaudi2",
-                "custom_deepseek_v41_expert_token_wide3_unroll_sat_fp8_gaudi2",
-                "custom_deepseek_v41_expert_token_wide6_unroll_sat_fp8_gaudi2",
-                "custom_deepseek_v41_expert_token_wide6_aligned_sat_fp8_gaudi2",
-                "custom_deepseek_v41_expert_n256_slots6_sat_fp8_gaudi2")
+                "custom_deepseek_v41_expert_token_wide_sat_fp8_gaudi2")
     if not any(prefix in raw for prefix in prefixes):
         return None
-    decode, matrix, tensors = [], [], {}
+    decode, matrix, aliases = [], [], {}
     for node in raw.split("\nnode {"):
         name, op = re.search(r'  name: "([^"]+)"', node), re.search(r'  op: "([^"]+)"', node)
         if not name or not op:
@@ -50,7 +46,8 @@ def audit(path):
         for key, value in attrs.items():
             if key.startswith(("inputTensor:", "outputTensor:")):
                 info = tensor_info(value)
-                tensors[info["name"]] = info
+                if info["alias_of"] and info["alias_offset"] == 0:
+                    aliases[info["name"]] = info["alias_of"]
         if op[1].startswith(prefixes):
             decode.append({"node": name[1], "output": tensor_info(attrs["outputTensor:0"])})
         if "gemm" in op[1].lower():
@@ -61,23 +58,22 @@ def audit(path):
                 "weight": tensor_info(attrs.get("inputTensor:1", "")),
                 "output": tensor_info(attrs.get("outputTensor:0", ""))
             })
-    def canonical(info):
-        seen = set()
-        while info.get('alias') and info['name'] not in seen:
-            seen.add(info['name'])
-            target = tensors.get(info['alias'])
-            if not target or target['bytes'] != info['bytes'] or target['location'] != info['location']:
-                break
-            info = target
-        return info['name']
+    def root(name):
+        visited = set()
+        while name in aliases:
+            if name in visited:
+                raise ValueError("Cyclic tensor aliases in compiled graph")
+            visited.add(name)
+            name = aliases[name]
+        return name
 
-    decoded_names = {canonical(node["output"]) for node in decode}
+    decoded_names = {root(node["output"]["name"]) for node in decode}
     expert_matrices = []
     for node in matrix:
-        if canonical(node["weight"]) in decoded_names:
+        if root(node["weight"]["name"]) in decoded_names:
             node["decoded_operand_index"] = 1
             expert_matrices.append(node)
-        elif canonical(node["activation"]) in decoded_names:
+        elif root(node["activation"]["name"]) in decoded_names:
             # W^T x^T reverses operand roles without moving either tensor.
             # Follow the actual decoded producer, not a fixed operand index.
             node["activation"], node["weight"] = node["weight"], node["activation"]
@@ -88,7 +84,7 @@ def audit(path):
     # A weight DMA may hide direct producer names. Keep the failing allocation
     # evidence rather than silently dropping a graph with decoded DRAM weights.
     consumers = {
-        name: [node["node"] for node in expert_matrices if canonical(node["weight"]) == name]
+        name: [node["node"] for node in expert_matrices if root(node["weight"]["name"]) == name]
         for name in decoded_names
     }
     return {

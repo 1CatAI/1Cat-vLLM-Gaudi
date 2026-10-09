@@ -83,6 +83,30 @@ def verify_control(logits, proposed, metadata):
     return verify_control_from_target(logits.argmax(-1), proposed, metadata)
 
 
+def verify_control_from_sampled(output, committed, probability_valid, metadata):
+    """Apply the existing commit protocol to probability-correct rejection.
+
+    ``output`` already contains the accepted draft prefix and its correction
+    or bonus token. Do not recompute acceptance by comparing token IDs: a
+    rejected correction may legitimately equal the rejected proposal.
+    This fixed-C6 entry handles verification rounds, not the C1 seed/prefill
+    transaction. Those remain ordinary target sampling transactions.
+    """
+    generation, count, proposal_count, remaining, start, limit, sample = metadata.unbind()
+    committed = committed.long().reshape(1)
+    output_count = torch.where(sample.bool(), committed, 0)
+    lane = torch.arange(6, dtype=torch.int64, device=output.device)
+    output = torch.where(lane < output_count, output.long(), -1)
+    anchor = output.gather(0, (output_count - 1).clamp(0, 5)).clamp_min(0)
+    draft_enabled = sample.bool() & (remaining - output_count >= 6) & (start + committed + 6 <= limit)
+    valid = ((generation > 0) & (count >= 2) & (count <= 6)
+             & (proposal_count >= 1) & (proposal_count == count - 1)
+             & (committed >= 1) & (committed <= count) & probability_valid.bool().reshape(1)
+             & ((lane >= output_count) | (output >= 0)).all())
+    status = (~valid).long()
+    return output, committed, output_count, anchor, draft_enabled, status
+
+
 def pack_record(metadata, committed, output_count, output, draft_ids, draft_enabled, status):
     draft_count = torch.where(draft_enabled, 5, 0).long().reshape(1)
     return torch.cat((metadata[:1], committed.long(), output_count.long(), draft_count, output.long(),
@@ -191,10 +215,15 @@ class AsyncDeviceOutput(AsyncModelRunnerOutput):
             return self.consume(self.result)
 
 
+def _copy_commit_words(record, destinations):
+    for index, destination in enumerate(destinations):
+        destination.copy_(record[index * 4:(index + 1) * 4].reshape(1, 4))
+
+
 class VerifyRing:
     """Persistent device/pinned buffers retained until the final consumer."""
 
-    def __init__(self, device, *, last_rank, size=2):
+    def __init__(self, device, *, last_rank, size=2, native_readback=None, native_record_readback=None):
         self.device, self.last_rank = torch.device(device), last_rank
         self.records = [torch.empty(RECORD_SIZE, dtype=torch.int64, device=device) for _ in range(size)]
         self.wires = ([torch.empty(RECORD_SIZE * 4, dtype=torch.bfloat16, device=device)
@@ -213,6 +242,22 @@ class VerifyRing:
         self.expected = torch.empty(1, dtype=torch.int64, device=device)
         self.limit = torch.empty(1, dtype=torch.int64, device=device)
         self._validate = torch.compile(validate_commit, backend="hpu_backend", fullgraph=True, dynamic=False)
+        self.native_readback = native_readback
+        self.native_record_readback = native_record_readback
+        if native_record_readback is not None:
+            if not last_rank or native_readback is None:
+                raise ValueError("Bulk speculative readback requires the native sampling ring")
+            self.readbacks = [None] * size
+        elif native_readback is not None:
+            if not last_rank:
+                raise ValueError("Native verify readback requires the sampling-stage record")
+            # The qualified native readback ABI transports four integer words
+            # from a base allocation. Four fixed frames retain that ABI and
+            # producer ordering without a frontend Event.record queue drain.
+            self.readback_words = [tuple(torch.empty((1, 4), dtype=torch.int64, device=device)
+                                         for _ in range(4)) for _ in range(size)]
+            self.readbacks = [None] * size
+            self.copy_words = torch.compile(_copy_commit_words, backend="hpu_backend", fullgraph=True, dynamic=False)
 
     def acquire(self, max_committed, *, generation=None):
         if self.closed:
@@ -233,6 +278,14 @@ class VerifyRing:
 
     def stage(self, ticket):
         self._check(ticket)
+        if self.native_record_readback is not None:
+            self.readbacks[ticket.slot] = (self.native_record_readback(ticket.record),)
+            return
+        if self.native_readback is not None:
+            words = self.readback_words[ticket.slot]
+            self.copy_words(ticket.record, words)
+            self.readbacks[ticket.slot] = tuple(self.native_readback(value) for value in words)
+            return
         if self.last_rank:
             source = ticket.record
         else:
@@ -247,15 +300,33 @@ class VerifyRing:
                 or self.consumed[ticket.slot] == ticket.generation):
             raise RuntimeError("Stale or already consumed DSpark verify result")
 
-    def consume(self, ticket):
+    def await_record(self, ticket):
+        """Wait for an unpublished record without accepting or releasing it."""
         self._check(ticket)
-        ticket.completion.synchronize()
-        values = ticket.host.tolist()  # pinned CPU data; never a device read
+        if self.native_readback is not None:
+            values = []
+            for host, done in self.readbacks[ticket.slot]:
+                done.synchronize()
+                values.extend(host.tolist()[0])
+        else:
+            ticket.completion.synchronize()
+            values = ticket.host.tolist()  # pinned CPU data; never a device read
+        return values
+
+    def consume(self, ticket, *, repair=None):
+        values = self.await_record(ticket)
+        if self.last_rank and values[STATUS] == 2 and repair is not None:
+            # Every TP sampling owner observes the same certificate. Repair
+            # replaces this generation's record before any output is accepted.
+            repair()
+            values = self.await_record(ticket)
         if self.last_rank:
             generation, committed, output_count, draft_count = values[:4]
             if (generation != ticket.generation or values[STATUS] != 0 or not 1 <= committed <= ticket.max_committed
                     or not 0 <= output_count <= 6 or not 0 <= draft_count <= 5):
-                raise RuntimeError("Invalid DSpark device verify generation or counts")
+                raise RuntimeError(
+                    "Invalid DSpark device verify generation or counts: "
+                    f"expected={ticket.generation}, maximum={ticket.max_committed}, record={values}")
             output, draft = values[4:4 + output_count], values[10:10 + draft_count]
         else:
             committed, output_count = values[:2]
@@ -273,7 +344,11 @@ class VerifyRing:
             return
         for slot, generation in enumerate(self.generations):
             if generation != self.consumed[slot]:
-                self.events[slot].synchronize()
+                if self.native_readback is not None:
+                    for _, done in self.readbacks[slot] or ():
+                        done.synchronize()
+                else:
+                    self.events[slot].synchronize()
         self.closed = True
 
 
@@ -285,9 +360,11 @@ class AsyncDSparkOutput(AsyncModelRunnerOutput):
     its uniprocess future resolves at EngineCore's final result consumption.
     """
 
-    def __init__(self, ring: VerifyRing, ticket: DeviceVerifyResult, finish: Callable, after_release=None):
+    def __init__(self, ring: VerifyRing, ticket: DeviceVerifyResult, finish: Callable, after_release=None, *,
+                 repair=None):
         self.ring, self.ticket, self.finish = ring, ticket, finish
         self.after_release = after_release
+        self.repair = repair
         self.consumed = False
 
     def get_output(self):
@@ -296,7 +373,9 @@ class AsyncDSparkOutput(AsyncModelRunnerOutput):
         self.consumed = True
         # Do not retry or switch paths if completion/commit fails after writes.
         with torch.profiler.record_function("v41::verify_and_commit::final_consume"):
-            result = self.finish(*self.ring.consume(self.ticket))
+            values = (self.ring.consume(self.ticket) if self.repair is None else
+                      self.ring.consume(self.ticket, repair=self.repair))
+            result = self.finish(*values)
         self.ring.release(self.ticket)
         if self.after_release is not None:
             self.after_release(result)

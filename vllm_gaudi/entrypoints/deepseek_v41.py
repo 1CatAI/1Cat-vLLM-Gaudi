@@ -267,9 +267,102 @@ _PIPELINE_ONLY_FASTPATHS = (
     "VLLM_HPU_DSV41_PREFILL_PP_WAVEFRONT",
 )
 
+# DSpark shares the prepared compute and prompt paths. The existing native
+# input/prefix, decoded-state and V2 adapters still have C1-only contracts.
+_DSPARK_FASTPATH_DEFAULTS = {
+    **_C1_FASTPATH_DEFAULTS,
+    **_PREFILL_MOE_DEFAULTS,
+    "VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS": "0",
+    "VLLM_HPU_DSV41_BF16_LM_HEAD": "0",
+    "VLLM_HPU_DSV41_BF16_ROUTER_GATE": "0",
+    "VLLM_HPU_DSV41_SHARED_GATE_UP": "0",
+    # Packed speculative control remains opt-in until final token identity
+    # is qualified; hc_pre keeps its prompt arithmetic and decode scope.
+    "VLLM_HPU_DSV41_MHC_CONTROL_RRMS": "0",
+    # These prompt regions require the dense FP8 sidecars, whose stage
+    # contract currently excludes speculative verification. Keep their
+    # existing BF16 producers until that shared contract is qualified.
+    "VLLM_HPU_DSV41_PREFILL_Q_PROJECTION": "0",
+    "VLLM_HPU_DSV41_PREFILL_OUTPUT_PROJECTION": "0",
+    "VLLM_HPU_DSV41_V2": "0",
+    "VLLM_USE_V2_MODEL_RUNNER": "0",
+    "VLLM_HPU_DSV41_RUNTIME_INDEXER": "0",
+    "VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH": "0",
+    "VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT": "0",
+    "VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT": "0",
+    "VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX": "0",
+    "VLLM_HPU_DSV41_V2_DEVICE_ENGRAM": "0",
+    "VLLM_HPU_DSV41_DECODED_KV_STATE": "0",
+    "VLLM_HPU_DSV41_PAGED_DECODED_KV_STATE": "0",
+    "VLLM_HPU_DSV41_ENGRAM_NATIVE_C1": "0",
+    "VLLM_HPU_DSV41_ENGRAM_C1_PACKET": "0",
+    "VLLM_HPU_DSV41_TP_MHC_OVERLAP": "0",
+    "VLLM_HPU_DSV41_DEVICE_VERIFY": "1",
+    "VLLM_HPU_DSV41_EXPERT_N256_FP8": "1",
+    "VLLM_HPU_DSV41_EXPERT_FUSED_QUANT": "1",
+    "VLLM_HPU_DSV41_EXPERT_FUSED_REDUCE": "1",
+    "VLLM_HPU_DSV41_MHC_GATES_FUSED": "1",
+    "VLLM_HPU_DSV41_MHC_SCHEDULE": "1",
+    "VLLM_HPU_DSV41_MLA_MME": "1",
+    "VLLM_HPU_DSV41_QKV_FUSED_INPUT": "1",
+    # PREPARED_OUTPUT already owns the BF16 wo_a layout. Applying the old
+    # loader's four-group transpose first scrambles the target and MTP
+    # matrices; TP4 owns two output groups. C1 FP8 sidecars bypass this path.
+    "VLLM_HPU_DSV41_PRETRANSPOSE_ATTN": "0",
+    # Fused text entry currently reads residual.shape before creating its
+    # residual. Use the existing explicit embedding entry until the shared
+    # replay boundary receives its row-count fix.
+    "VLLM_HPU_DSV41_FUSED_STAGE_IO": "0",
+    "VLLM_HPU_DSV41_BATCHED_INPUT_STAGING": "0",
+    "VLLM_HPU_TP2_NATIVE_JOINT_PLAN": "1",
+    "VLLM_HPU_TP2_PREPARED_COMM": "1",
+    "VLLM_HPU_TP2_STATIC_GROUP_PLAN": "1",
+}
+
 
 def _enabled(value):
     return str(value).strip().lower() in ("1", "true")
+
+
+# The qualified official sampling profile applies to the stage owning both
+# input and sampling. Explicit disables retain their priority; PP2 keeps its
+# separately qualified defaults.
+_DSPARK_SINGLE_STAGE_DEFAULTS = {
+    "VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS": "1",
+    "VLLM_HPU_DSV41_BF16_LM_HEAD": "1",
+    "VLLM_HPU_DSV41_MHC_CONTROL_RRMS": "1",
+    "VLLM_HPU_DSV41_MHC_CONTROL_MME": "1",
+    "VLLM_HPU_DSV41_ROUTER_TOP6": "1",
+    "VLLM_HPU_DSV41_FUSED_STAGE_IO": "1",
+    "VLLM_HPU_DSV41_BATCHED_INPUT_STAGING": "1",
+    "VLLM_HPU_DSV41_DEVICE_ROUNDS": "1",
+    "VLLM_HPU_DSV41_PREFILL_NATIVE_PLAN": "0",
+    "VLLM_HPU_DSV41_PREFILL_HYBRID_ROWS": "0",
+    "VLLM_HPU_DSV41_DSPARK_NATIVE_SAMPLED_PROTOCOL": "1",
+    "VLLM_HPU_DSV41_DSPARK_NATIVE_FULL_MAIN": "1",
+    "VLLM_HPU_DSV41_DSPARK_NATIVE_FULL_REPAIR": "1",
+    "VLLM_HPU_DSV41_DSPARK_GLOBAL_BOUNDED_SAMPLING": "1",
+    "VLLM_HPU_DSV41_DSPARK_LARGE_HCCL": "1",
+    "VLLM_HPU_DSV41_DSPARK_FULL_HCCL_MAIN": "1",
+    "VLLM_HPU_DSV41_DSPARK_LANE_CANDIDATES": "1",
+    "VLLM_HPU_DSV41_DSPARK_FUSED_BOUNDED_NUCLEUS": "1",
+    "VLLM_HPU_DSV41_DSPARK_JOURNAL_COPY": "1",
+    "VLLM_HPU_DSV41_DSPARK_CONSUMED_TARGET_CERTIFICATE": "1",
+    "VLLM_HPU_DSV41_DSPARK_COVERAGE_AUDIT": "1",
+    "VLLM_HPU_DSV41_DSPARK_HEAD_INPUT_BOUNDARY": "1",
+    "VLLM_HPU_DSV41_DSPARK_WEIGHTED_DRAFT_NUCLEUS": "1",
+    "VLLM_HPU_DSV41_DSPARK_LAYER_MAIN_SPLIT": "1",
+    "VLLM_HPU_DSV41_DSPARK_NORM_ROUNDTRIP": "1",
+    "VLLM_HPU_DSV41_DSPARK_W13_K_PIPELINE": "1",
+    "VLLM_HPU_DSV41_DSPARK_W13_K_PIPELINE_STAGES": "2",
+    "VLLM_HPU_DSV41_DSPARK_MHC_HIGH_PLANE": "1",
+    "VLLM_HPU_DSV41_DSPARK_SHARED_FP8": "1",
+    "VLLM_HPU_DSV41_DSPARK_SCALE_CACHE": "1",
+    "VLLM_HPU_DSV41_DSPARK_STOCHASTIC_ONLY": "1",
+    "VLLM_HPU_DSV41_DSPARK_THRESHOLD_SELECTION": "1",
+    "VLLM_HPU_DSV41_DSPARK_BATCH_ENGRAM": "1",
+    "VLLM_HPU_DSV41_DSPARK_DRAFT_VOCAB_CDF": "1",
+}
 
 
 def prepare_default_fastpaths(model, sidecars=None, tensor_parallel_size=4, pipeline_parallel_size=1):
@@ -278,10 +371,17 @@ def prepare_default_fastpaths(model, sidecars=None, tensor_parallel_size=4, pipe
         raise ValueError("The prepared V4.1 path supports TP4 x PP1 or legacy TP2 x PP2")
     if not _enabled(os.environ.get("VLLM_HPU_DSV41_DEFAULT_FASTPATHS", "1")):
         return
-    if (tensor_parallel_size, pipeline_parallel_size) == (4, 1):
-        os.environ["VLLM_HPU_DSV41_DSPARK"] = "0"
     os.environ.setdefault("VLLM_HPU_DSV41_DSPARK", "0")
     if _enabled(os.environ["VLLM_HPU_DSV41_DSPARK"]):
+        defaults = dict(_DSPARK_FASTPATH_DEFAULTS)
+        if pipeline_parallel_size == 1:
+            defaults.update(_DSPARK_SINGLE_STAGE_DEFAULTS)
+        for key, value in defaults.items():
+            os.environ.setdefault(key, value)
+        if pipeline_parallel_size == 1:
+            for key in _PIPELINE_ONLY_FASTPATHS:
+                os.environ[key] = "0"
+        prepare_precision_sidecars(model, sidecars)
         return
     selected_v2 = os.environ.get("VLLM_USE_V2_MODEL_RUNNER")
     selected_adapter = os.environ.get("VLLM_HPU_DSV41_V2")
@@ -314,6 +414,11 @@ def prepare_default_fastpaths(model, sidecars=None, tensor_parallel_size=4, pipe
     ):
         for key, value in _PREFILL_MOE_DEFAULTS.items():
             os.environ.setdefault(key, value)
+    prepare_precision_sidecars(model, sidecars)
+
+
+def prepare_precision_sidecars(model, sidecars=None):
+    """Resolve the same prepared precision artifacts for target C1 and C2-C6."""
     model = Path(model).resolve()
     configured = sidecars or {}
     for name, (enabled_key, path_key) in _SIDECARS.items():
@@ -365,10 +470,150 @@ def prepare_native_libraries():
         # The worker imports this exact file through deepseek_v41_host after
         # the HPU environment is initialized and validates the live ABI there.
     configured = os.environ.get("GC_KERNEL_PATH", str(kernel))
-    if configured not in (str(kernel), "/usr/lib/habanalabs/libtpc_kernels.so"):
+    selected_kernel = kernel
+    unique_manifest = library_dir / "deepseek_v41_unique_build.json"
+    if unique_manifest.is_file():
+        addon = json.loads(unique_manifest.read_text())
+        selected_kernel = library_dir / "libdeepseek_v41_unique_kernels.so"
+        if addon.get("base_kernel_sha256") != hashlib.sha256(kernel.read_bytes()).hexdigest():
+            raise RuntimeError("Unique expert database was built for a different base kernel")
+        if (hashlib.sha256(selected_kernel.read_bytes()).hexdigest()
+                != addon.get("binaries", {}).get(selected_kernel.name)):
+            raise RuntimeError("Unique expert database differs from its build manifest")
+        configure_probability_repair_parent(addon, selected_kernel)
+        pair = addon.get("router_pair")
+        if pair:
+            parent = Path(pair["parent"]).resolve()
+            variable = "VLLM_HPU_DSV41_ROUTER_PAIR_PARENT_KERNEL"
+            if (parent == selected_kernel.resolve() or not parent.is_file()
+                    or hashlib.sha256(parent.read_bytes()).hexdigest() != pair["parent_sha256"]):
+                raise RuntimeError("Router precision database differs from its locked parent")
+            if os.environ.get(variable) and Path(os.environ[variable]).resolve() != parent:
+                raise RuntimeError("Router precision parent differs from its build manifest")
+            os.environ[variable] = str(parent)
+        ready = addon.get("router_ready")
+        if ready:
+            parent = Path(ready["parent"]).resolve()
+            variable = "VLLM_HPU_DSV41_ROUTER_READY_PARENT_KERNEL"
+            if (parent == selected_kernel.resolve() or not parent.is_file()
+                    or hashlib.sha256(parent.read_bytes()).hexdigest() != ready["parent_sha256"]):
+                raise RuntimeError("Prepared Router database differs from its locked parent")
+            if os.environ.get(variable) and Path(os.environ[variable]).resolve() != parent:
+                raise RuntimeError("Prepared Router parent override differs from its build manifest")
+            os.environ[variable] = str(parent)
+        softmax = addon.get("vocab_softmax")
+        if softmax:
+            parent = Path(softmax["parent"]).resolve()
+            variable = "VLLM_HPU_DSV41_SOFTMAX_PARENT_KERNEL"
+            if (parent == selected_kernel.resolve() or not parent.is_file()
+                    or hashlib.sha256(parent.read_bytes()).hexdigest() != softmax["parent_sha256"]):
+                raise RuntimeError("Vocabulary softmax database differs from its locked parent")
+            if os.environ.get(variable) and Path(os.environ[variable]).resolve() != parent:
+                raise RuntimeError("Vocabulary softmax parent override differs from its build manifest")
+            os.environ[variable] = str(parent)
+        factor = addon.get("w2_factor_build")
+        if factor:
+            parent = Path(factor["parent_gc_path"]).resolve()
+            if (parent == selected_kernel.resolve() or not parent.is_file()
+                    or hashlib.sha256(parent.read_bytes()).hexdigest() != factor["parent_gc_sha256"]):
+                raise RuntimeError("W2 factor database differs from its locked parent")
+            variable = "VLLM_HPU_DSV41_W2_FACTOR_PARENT_KERNEL"
+            configured_parent = os.environ.get(variable)
+            if configured_parent and Path(configured_parent).resolve() != parent:
+                raise RuntimeError("W2 factor parent override differs from its build manifest")
+            os.environ[variable] = str(parent)
+        consumer = addon.get("w2_consumer_build")
+        if consumer:
+            parent = Path(consumer["parent_gc_path"]).resolve()
+            if (parent == selected_kernel.resolve() or not parent.is_file()
+                    or hashlib.sha256(parent.read_bytes()).hexdigest() != consumer["parent_gc_sha256"]):
+                raise RuntimeError("W2 consumer database differs from its locked parent")
+            variable = "VLLM_HPU_DSV41_W2_REDUCE_PARENT_KERNEL"
+            configured_parent = os.environ.get(variable)
+            if configured_parent and Path(configured_parent).resolve() != parent:
+                raise RuntimeError("W2 consumer parent override differs from its build manifest")
+            os.environ[variable] = str(parent)
+        shared_consumer = addon.get("w2_shared_scale_build")
+        if shared_consumer:
+            parent = Path(shared_consumer["parent_gc_path"]).resolve()
+            variable = "VLLM_HPU_DSV41_W2_SHARED_PARENT_KERNEL"
+            if (parent == selected_kernel.resolve() or not parent.is_file()
+                    or hashlib.sha256(parent.read_bytes()).hexdigest() != shared_consumer["parent_gc_sha256"]):
+                raise RuntimeError("Shared W2 scale database differs from its locked parent")
+            if os.environ.get(variable) and Path(os.environ[variable]).resolve() != parent:
+                raise RuntimeError("Shared W2 scale parent override differs from its build manifest")
+            os.environ[variable] = str(parent)
+        channels = addon.get("w2_channels_build")
+        if channels:
+            parent = Path(channels["parent_gc_path"]).resolve()
+            variable = "VLLM_HPU_DSV41_W2_CHANNELS_PARENT_KERNEL"
+            if (parent == selected_kernel.resolve() or not parent.is_file()
+                    or hashlib.sha256(parent.read_bytes()).hexdigest() != channels["parent_gc_sha256"]):
+                raise RuntimeError("Channel W2 database differs from its locked parent")
+            if os.environ.get(variable) and Path(os.environ[variable]).resolve() != parent:
+                raise RuntimeError("Channel W2 parent differs from its build manifest")
+            os.environ[variable] = str(parent)
+        interleaved = addon.get("attention_interleave_build")
+        if interleaved:
+            parent = Path(interleaved["parent_gc_path"]).resolve()
+            variable = "VLLM_HPU_DSV41_ATTENTION_INTERLEAVE_PARENT_KERNEL"
+            if (parent == selected_kernel.resolve() or not parent.is_file()
+                    or hashlib.sha256(parent.read_bytes()).hexdigest() != interleaved["parent_gc_sha256"]):
+                raise RuntimeError("Interleaved attention database differs from its locked parent")
+            if os.environ.get(variable) and Path(os.environ[variable]).resolve() != parent:
+                raise RuntimeError("Interleaved attention parent differs from its build manifest")
+            os.environ[variable] = str(parent)
+        batched = addon.get("router_batched_build")
+        if batched:
+            parent = Path(batched["parent_gc_path"]).resolve()
+            variable = "VLLM_HPU_DSV41_ROUTER_BATCHED_PARENT_KERNEL"
+            if (parent == selected_kernel.resolve() or not parent.is_file()
+                    or hashlib.sha256(parent.read_bytes()).hexdigest() != batched["parent_gc_sha256"]):
+                raise RuntimeError("Batched Router database differs from its locked parent")
+            if os.environ.get(variable) and Path(os.environ[variable]).resolve() != parent:
+                raise RuntimeError("Batched Router parent differs from its build manifest")
+            os.environ[variable] = str(parent)
+        paired = addon.get("dense_bf16_pair_build")
+        if paired:
+            parent = Path(paired["parent_gc_path"]).resolve()
+            variable = "VLLM_HPU_DSV41_DENSE_BF16_PAIR_PARENT_KERNEL"
+            if (parent == selected_kernel.resolve() or not parent.is_file()
+                    or hashlib.sha256(parent.read_bytes()).hexdigest() != paired["parent_gc_sha256"]):
+                raise RuntimeError("Joint BF16 input database differs from its locked parent")
+            if os.environ.get(variable) and Path(os.environ[variable]).resolve() != parent:
+                raise RuntimeError("Joint BF16 input parent differs from its build manifest")
+            os.environ[variable] = str(parent)
+        cooperative = addon.get("cooperative_silu_build")
+        if cooperative:
+            parent = Path(cooperative["parent_gc_path"]).resolve()
+            variable = "VLLM_HPU_DSV41_COOPERATIVE_SILU_PARENT_KERNEL"
+            if (parent == selected_kernel.resolve() or not parent.is_file()
+                    or hashlib.sha256(parent.read_bytes()).hexdigest() != cooperative["parent_gc_sha256"]):
+                raise RuntimeError("Cooperative SiLU database differs from its locked parent")
+            if os.environ.get(variable) and Path(os.environ[variable]).resolve() != parent:
+                raise RuntimeError("Cooperative SiLU parent override differs from its build manifest")
+            os.environ[variable] = str(parent)
+        os.environ["VLLM_HPU_DSV41_UNIQUE_BASE_KERNEL"] = str(kernel)
+    if configured not in (str(kernel), str(selected_kernel), "/usr/lib/habanalabs/libtpc_kernels.so"):
         raise RuntimeError("The V4.1 launch profile requires its combined kernel database")
-    os.environ["GC_KERNEL_PATH"] = str(kernel)
+    os.environ["GC_KERNEL_PATH"] = str(selected_kernel)
     os.environ["VLLM_HPU_DSV4_TPC_OP_LIBRARY"] = str(extensions[0])
+
+
+def configure_probability_repair_parent(manifest, selected_kernel):
+    """Resolve the additive database's locked parent from its build manifest."""
+    repair = manifest.get("repair_build")
+    if not repair:
+        return
+    parent = Path(repair["parent_gc_path"]).resolve()
+    variable = "VLLM_HPU_DSV41_FULL_CDF_PARENT_KERNEL"
+    if (parent == selected_kernel.resolve() or not parent.is_file()
+            or hashlib.sha256(parent.read_bytes()).hexdigest() != repair["parent_gc_sha256"]):
+        raise RuntimeError("Probability repair database differs from its locked parent")
+    configured = os.environ.get(variable)
+    if configured and Path(configured).resolve() != parent:
+        raise RuntimeError("Probability repair parent override differs from its build manifest")
+    os.environ[variable] = str(parent)
 
 
 def load_native_operators(required=()):
@@ -386,6 +631,162 @@ def load_native_operators(required=()):
 
     library = os.environ["VLLM_HPU_DSV4_TPC_OP_LIBRARY"]
     torch.ops.load_library(library)
+    directory = Path(library).parent
+    controls = list(directory.glob("hpu_dsv4_control_mme_pt2*.so"))
+    if controls:
+        if len(controls) != 1:
+            raise RuntimeError("Expected one prepared mHC MME extension")
+        manifest = json.loads((directory / "deepseek_v4_build.json").read_text())
+        control = controls[0]
+        if hashlib.sha256(control.read_bytes()).hexdigest() != manifest["binaries"].get(control.name):
+            raise RuntimeError("mHC MME extension differs from its build manifest")
+        if not hasattr(torch.ops.custom_op, "custom_deepseek_v41_control_mme_f32_gaudi2"):
+            torch.ops.load_library(str(control))
+    from vllm_gaudi import envs
+
+    optional = []
+    if envs.VLLM_HPU_DSV41_DSPARK_ROUTER_BATCHED_F32:
+        optional.append("custom_deepseek_v41_router_batched_f32_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_VOCAB_SOFTMAX:
+        optional.append("custom_deepseek_v41_vocab_softmax_f32_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_TENSOR_READY_PEER:
+        optional.append("custom_deepseek_v41_peer_ready_identity_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_ROUTER_SHARED_BF16:
+        optional.extend(("custom_deepseek_v41_dense_bf16_pair_gaudi2",
+                         "custom_deepseek_v41_router_shared_scaled_gaudi2",
+                         "custom_deepseek_v41_shared_silu_full_product_gaudi2",
+                         "custom_deepseek_v41_bf16_linear_f32_gaudi2"))
+    if envs.VLLM_HPU_DSV41_DSPARK_COOPERATIVE_SILU:
+        optional.append("custom_deepseek_v41_expert_n256_moe_cooperative_silu_fp8_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_W2_CHANNELS:
+        optional.append("custom_deepseek_v41_expert_n256_moe_w2_channels_fp8_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_W2_REDUCE_N256:
+        optional.append("custom_deepseek_v41_expert_n256_moe_w2_reduce_n256_fp8_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_W2_READY_SCALE:
+        optional.append("custom_deepseek_v41_expert_n256_moe_w2_ready_scale_fp8_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_WEIGHTED_STATIC_MASK:
+        optional.extend(("custom_deepseek_v41_weighted_finish_mask_gaudi2",
+                         "custom_deepseek_v41_weighted_sparse_bins_gaudi2"))
+    if envs.VLLM_HPU_DSV41_DSPARK_MAIN_ADJACENT_PV:
+        optional.append("custom_deepseek_v41_main_adjacent_reuse_mla_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_SWA_SOURCE_REUSE:
+        optional.append("custom_deepseek_v41_swa_source_reuse_mla_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_SILU_FULL_ROWS:
+        optional.append("custom_deepseek_v41_expert_n256_moe_token_wide_silu_full_rows_fp8_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_COMPRESSOR_SEQUENCE:
+        optional.append("custom_deepseek_v41_compressor_sequence_bf16_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_PHYSICAL_ROLE_SILU:
+        optional.append("custom_deepseek_v41_expert_n256_moe_token_wide_physical_role_silu_fp8_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_JOURNAL_COPY:
+        optional.append("custom_deepseek_v41_journal_copy_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_FUSED_BOUNDED_NUCLEUS:
+        optional.append("custom_deepseek_v41_bounded_local_nucleus_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_LANE_CANDIDATES:
+        optional.append("custom_deepseek_v41_vocab_lane_candidates_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_MHC_CONTROL_TILES:
+        optional.append("custom_deepseek_v41_mhc_control_tiles_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_EXP_PV:
+        optional.append("custom_deepseek_v41_logical_scale_exp_pv_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_WO_HANDOFF:
+        optional.append("custom_deepseek_v41_rope_woa_wob_roundtrip_fp8_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_N512_DECODE:
+        optional.append("custom_deepseek_v41_expert_n256_moe_token_wide_n512_decode_fp8_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_CONTROL_FP8:
+        optional.append("custom_deepseek_v41_control_fp8_rrms_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_INPUT_QUANT_REMAT:
+        optional.append("custom_deepseek_v41_attention_norm_quant_gaudi2_remat")
+    if envs.VLLM_HPU_DSV41_DSPARK_MOE_PEER_POST:
+        optional.append("custom_deepseek_v41_dspark_moe_peer_post_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_SCALED_W13:
+        optional.append("custom_deepseek_v41_expert_n256_moe_token_wide_scaled_w13_fp8_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_EXPLICIT_STEPS:
+        optional.append("custom_deepseek_v41_expert_n256_moe_token_wide_explicit_steps_fp8_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_MHC_DEFERRED:
+        optional.append("custom_deepseek_v41_mhc_mme_post_collapse_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_SILU_DECODE:
+        optional.append("custom_deepseek_v41_expert_n256_moe_token_wide_silu_decode_fp8_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_NORM_ROUNDTRIP:
+        optional.append("custom_deepseek_v41_norm_roundtrip_bf16_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_DRAFT_VOCAB_CDF:
+        optional.append("custom_deepseek_v41_probability_draw_gaudi2")
+        optional.append("custom_deepseek_v41_probability_full_draw_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_MTP_CACHE:
+        optional.append("custom_deepseek_v41_mtp_cached_moe_bf16_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_MTP_SAT:
+        optional.append("custom_deepseek_v41_mtp_sat_moe_fp8_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_MHC_WEIGHT_REUSE:
+        optional.append("custom_deepseek_v41_mhc_control_reuse_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_MERGE_CACHE:
+        optional.append("custom_deepseek_v41_logical_merge_cache_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_MHC_MME_EPILOGUE:
+        optional.append("custom_deepseek_v41_mhc_mme_epilogue_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_UNPAIRED_W13:
+        optional.append("custom_deepseek_v41_expert_n256_moe_unpaired_w13_fp8_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_CANDIDATE_KEYS:
+        optional.append("custom_deepseek_v41_candidate_mirror_keys_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_SILU_AFFINE:
+        optional.append("custom_deepseek_v41_expert_n256_moe_token_wide_silu_affine_fp8_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_SCALE_CACHE:
+        optional.append("custom_deepseek_v41_logical_scale_cache_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_MAIN_MIRROR:
+        optional.append("custom_deepseek_v41_logical_main_mirror_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_W13_UNROLL:
+        optional.append("custom_deepseek_v41_expert_n256_moe_token_wide_unroll_steps_fp8_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_CHANNEL_SILU:
+        optional.append("custom_deepseek_v41_expert_n256_moe_token_wide_channel_silu_fp8_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_COMPACT_KV_MME:
+        optional.append("custom_deepseek_v41_logical_mla_compact_mme_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_GROUP_PIPELINE:
+        optional.append("custom_deepseek_v41_expert_n256_moe_token_wide_group_pipe_fp8_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_SHARED_KV_MME:
+        optional.append("custom_deepseek_v41_logical_mla_shared_mme_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_MLA_COORD_CACHE:
+        optional.append("custom_deepseek_v41_logical_mla_coord_cached_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_HASH_MLA:
+        optional.append("custom_deepseek_v41_logical_mla_hash_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_NUCLEUS_MASS:
+        optional.append("custom_deepseek_v41_nucleus_mass_sample_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_QKV_PUBLISH:
+        optional.append("custom_deepseek_v41_dspark_qkv_projection_publish_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_COHESIVE_MLA:
+        optional.append("custom_deepseek_v41_logical_mla_cohesive_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_MERGED_MLA:
+        optional.append("custom_deepseek_v41_logical_mla_merged_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_PV_ROPE:
+        optional.append("custom_deepseek_v41_logical_mla_pv_rope_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_KV_PUBLISH:
+        optional.append("custom_deepseek_v41_dspark_kv_norm_publish_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_PHYSICAL_SILU:
+        optional.append("custom_deepseek_v41_expert_n256_moe_token_wide_physical_silu_fp8_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_SILU_UNROLL:
+        optional.append("custom_deepseek_v41_expert_n256_moe_token_wide_silu_unroll_fp8_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_HW_DENSE_FUSED_QUANT:
+        optional.append("custom_deepseek_v41_hw_dense_roundtrip_fp8_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_HW_DENSE:
+        optional.append("custom_deepseek_v41_hw_dense_fp8_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_ROUTER_SHARED_FUSED:
+        optional.extend(("custom_deepseek_v41_router_shared_scaled_gaudi2",
+                         "custom_deepseek_v41_shared_silu_full_product_gaudi2"))
+    if envs.VLLM_HPU_DSV41_DSPARK_ROPE_COHERENT:
+        optional.extend(("custom_deepseek_v41_rope_coherent_bf16_gaudi2",
+                         "custom_deepseek_v41_rope_inverse_coherent_bf16_gaudi2"))
+    if (envs.VLLM_HPU_DSV41_DSPARK_PEER_POST_NORM or envs.VLLM_HPU_DSV41_DSPARK_SCHEDULED_PEER):
+        optional.append("custom_deepseek_v41_dspark_peer_post_norm_quant_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_W2_THREE_ROUTES:
+        optional.append("custom_deepseek_v41_expert_n256_moe_token_wide_three_route_w2_fp8_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_FEATURE_SILU:
+        optional.append("custom_deepseek_v41_expert_n256_moe_token_wide_feature_silu_fp8_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_PARTITION_RADIX_SAMPLING:
+        optional.append("custom_deepseek_v41_vocab_partition_topk_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_NATIVE_FULL_REPAIR:
+        optional.append("custom_deepseek_v41_sampling_wire_view_gaudi2")
+    if envs.VLLM_HPU_DSV41_DSPARK_STREAM_FILTER_SAMPLING:
+        optional.append("custom_deepseek_v41_vocab_filter_gaudi2")
+    if optional:
+        from vllm_gaudi.ops.deepseek_v41_unique_experts import load_unique_expert_operators
+
+        load_unique_expert_operators()
+        required = (*required, *optional)
     if os.environ.get("VLLM_HPU_DSV41_NATIVE_MEMORY_READY", "0") == "1":
         directory = Path(library).parent
         manifest = json.loads((directory / "deepseek_v4_build.json").read_text())
@@ -586,11 +987,8 @@ def main():
         extra += ["--served-model-name", "DeepSeek-V4.1-Flash"]
     from vllm_gaudi import envs as gaudi_envs
 
-    speculative = (
-        ["--speculative-config", '{"method":"dspark","num_speculative_tokens":5}']
-        if gaudi_envs.VLLM_HPU_DSV41_DSPARK
-        else []
-    )
+    speculative = (["--speculative-config", '{"method":"dspark","num_speculative_tokens":5}']
+                   if gaudi_envs.VLLM_HPU_DSV41_DSPARK else [])
     scheduling = "--async-scheduling" if gaudi_envs.VLLM_HPU_DSV41_V2 else "--no-async-scheduling"
     prefix_caching = (
         []
@@ -600,9 +998,8 @@ def main():
         ]
     )
     if "--enable-prefix-caching" in extra + prefix_caching and not any(
-        value.split("=")[0] in ("--enable-prompt-tokens-details", "--no-enable-prompt-tokens-details")
-        for value in extra
-    ):
+            value.split("=")[0] in ("--enable-prompt-tokens-details", "--no-enable-prompt-tokens-details")
+            for value in extra):
         extra += ["--enable-prompt-tokens-details"]
     sys.argv = [
         "vllm",
@@ -643,10 +1040,12 @@ def main():
     try:
         if args.engram_residency == "locked":
             from vllm_gaudi.ops.deepseek_v41_residency import (
-                EngramDeviceGate, EngramResidency, EngramStartup, table_regions)
+                EngramDeviceGate, EngramResidency, EngramStartup, table_regions,
+            )
 
-            device_layers = (1,) if gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM else ()
-            tables = EngramResidency(table_regions(args.model), args.engram_host_budget_gib * 1024**3,
+            device_layers = (1, ) if gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM else ()
+            tables = EngramResidency(table_regions(args.model),
+                                     args.engram_host_budget_gib * 1024**3,
                                      device_layers=device_layers)
             if device_layers:
                 bridge = Path(os.environ["VLLM_HPU_TP2_FUSED_AR_NORM_BRIDGE"])

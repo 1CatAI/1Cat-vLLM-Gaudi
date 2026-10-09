@@ -13,6 +13,7 @@ from vllm_gaudi.compilation.deepseek_v41_overlap import (
     split_mhc_consumers,
     require_candidate_operators,
 )
+from vllm_gaudi.compilation.deepseek_v41_mhc_producer import merge_mhc_producers
 
 
 def test_candidate_activation_is_checked_on_the_graph():
@@ -77,8 +78,10 @@ def _example():
     return torch.randn(1, 4, 8).bfloat16(), torch.randn(24, 32), torch.randn(1, 8).bfloat16()
 
 
-def _graph():
+def _graph(rows=1):
     residual, weight, partial = _example()
+    residual = residual.expand(rows, -1, -1).clone()
+    partial = partial.expand(rows, -1).clone()
     child = make_fx(_consumer)(residual, weight, partial, partial.clone())
     root = torch.nn.Module()
     root.add_module("consumer0", child)
@@ -104,10 +107,48 @@ def test_mhc_split_preserves_outputs_with_changing_inputs_and_multiple_exchanges
         r, w, p = _example()
         r = r + seed
         assert torch.equal(source(r, w, p).view(torch.int16), candidate(r, w, p).view(torch.int16))
+
     calls = [node for node in candidate.graph.nodes if node.op == "call_module"]
     assert len(calls) == 4
     for call in calls[::2]:
         assert not any(arg.target == torch.ops.dsv41_overlap_test.exchange.default for arg in call.all_input_nodes)
+
+
+@pytest.mark.parametrize('rows', [2, 4, 6])
+@pytest.mark.parametrize('wire_view', [False, True])
+def test_join_mhc_into_payload_recipe_keeps_peer_and_avoids_extra_recipe(rows, wire_view):
+    r, w, p = _example()
+    r, p = r.expand(rows, -1, -1).clone(), p.expand(rows, -1).clone()
+    root = torch.nn.Module()
+    root.producer = make_fx(lambda x, y: (x * 3, y + 1))(p, r)
+    root.consumer = make_fx(_consumer)(r, w, p, p.clone())
+    graph = torch.fx.Graph()
+    residual, weight, partial = [graph.placeholder(x) for x in ('r', 'w', 'p')]
+    produced = graph.call_module('producer', (partial, residual))
+    payload = graph.call_function(operator.getitem, (produced, 0))
+    owned_residual = graph.call_function(operator.getitem, (produced, 1))
+    wire = graph.call_function(torch.ops.aten.view.default, (payload, [1, -1])) if wire_view else payload
+    peer = graph.call_function(torch.ops.dsv41_overlap_test.exchange.default, (wire,))
+    if wire_view:
+        peer = graph.call_function(torch.ops.aten.view.default, (peer, [rows, 8]))
+    result = graph.call_module('consumer', (owned_residual, weight, payload, peer))
+    out = graph.call_function(operator.getitem, (result, 0))
+    graph.output(out)
+    source = torch.fx.GraphModule(root, graph)
+    candidate = copy.deepcopy(source)
+    exchange_op = torch.ops.dsv41_overlap_test.exchange.default
+    splits = split_mhc_consumers(candidate, exchange_op)
+    assert len(splits) == 1
+    merged = merge_mhc_producers(candidate, splits, (exchange_op,))
+    assert len(merged) == 1
+    assert sum(n.op == 'call_module' for n in candidate.graph.nodes) == 2
+    assert sum(n.target == exchange_op for n in candidate.graph.nodes) == 1
+    for seed in range(3):
+        torch.manual_seed(seed)
+        r, w, p = torch.randn(rows, 4, 8).bfloat16(), torch.randn(24, 32), torch.randn(rows, 8).bfloat16()
+        assert torch.equal(source(r, w, p).view(torch.int16), candidate(r, w, p).view(torch.int16))
+    traced = torch.jit.trace(candidate, (r, w, p), check_trace=False)
+    assert torch.equal(source(r, w, p).view(torch.int16), traced(r, w, p).view(torch.int16))
 
 
 def test_dependent_control_cannot_be_hoisted():
@@ -231,6 +272,33 @@ def test_residual_and_flat_control_share_exact_float_conversion():
         assert all(torch.equal(a, b) for a, b in zip(original(value), candidate(value)))
 
 
+@torch.library.custom_op("dsv41_overlap_test::deepseek_v41_control_mme_f32", mutates_args=())
+def control_mme(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.linear(value, weight)
+
+
+@control_mme.register_fake
+def _(value, weight):
+    return value.new_empty(value.shape[0], weight.shape[0])
+
+
+@pytest.mark.parametrize("rows", [2, 4, 6])
+def test_c6_mme_control_uses_shared_pure_dependency_proof(rows):
+    source = _graph(rows)
+    for child in (source.consumer0, source.consumer1):
+        for node in child.graph.nodes:
+            if node.target == torch.ops.dsv41_overlap_test.deepseek_v41_control_gemv.default:
+                node.target = torch.ops.dsv41_overlap_test.deepseek_v41_control_mme_f32.default
+        child.recompile()
+    assert independent_mhc_nodes(source.consumer0, [3], control_mme=True)
+    assert not independent_mhc_nodes(source.consumer0, [0, 3], control_mme=True)
+    candidate = copy.deepcopy(source)
+    audit = split_mhc_consumers(candidate, torch.ops.dsv41_overlap_test.exchange.default, control_mme=True)
+    assert len(audit) == 2
+    for seed in range(3):
+        torch.manual_seed(seed)
+        r, w, p = torch.randn(rows, 4, 8).bfloat16(), torch.randn(24, 32), torch.randn(rows, 8).bfloat16()
+        assert torch.equal(source(r, w, p).view(torch.int16), candidate(r, w, p).view(torch.int16))
 def _register_controller_variant(name):
     @torch.library.custom_op(f"dsv41_overlap_test::{name}", mutates_args=())
     def project(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -246,7 +314,7 @@ def _register_controller_variant(name):
 _controller_variants = [_register_controller_variant(name) for name in (
     'deepseek_v41_control_rrms_unpack', 'deepseek_v41_control_rrms_parallel',
     'deepseek_v41_control_rrms_swizzled',
-    'deepseek_v41_control_mme_f32')]
+    'deepseek_v41_control_rrms_bf16_weight')]
 
 
 @pytest.mark.parametrize('project', _controller_variants)

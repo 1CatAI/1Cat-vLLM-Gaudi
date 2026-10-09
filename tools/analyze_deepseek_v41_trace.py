@@ -231,6 +231,79 @@ def tp4_windows(inventory, phase, request_start_ns=None, native_coverage=None, p
     )
 
 
+def speculative_windows(inventory, topology, native_coverage):
+    """Account a completed verify round and its actual accepted prefix.
+
+    Scheduled C6 rows are not six committed output tokens. Consecutive
+    scheduler positions prove the committed prefix; final-consume scopes
+    delimit steady throughput cycles without assuming a fixed acceptance.
+    """
+    if native_coverage is None:
+        raise ValueError("Speculative trace requires complete native target coverage")
+    stage = topology["pipeline_parallel_size"] - 1
+    pattern = re.compile(rf"v41::verify_and_commit::PP{stage}::decode::P(\d+)::C([1-6])::emit1")
+    verifies = []
+    for begin, duration, name in inventory["cpu_markers"]:
+        match = pattern.fullmatch(name)
+        if match:
+            verifies.append(dict(start=begin, end=begin + duration, position=int(match[1]), count=int(match[2])))
+    verifies.sort(key=lambda row: row["start"])
+    consumers = sorted((begin, begin + duration) for begin, duration, name in inventory["cpu_markers"]
+                       if name == "v41::verify_and_commit::final_consume")
+    for index, verify in enumerate(verifies):
+        next_start = verifies[index + 1]["start"] if index + 1 < len(verifies) else float("inf")
+        owned = [row for row in consumers if verify["start"] <= row[0] < next_start]
+        if not owned and index in (0, len(verifies) - 1):
+            continue
+        if len(owned) != 1:
+            raise ValueError(f"Ambiguous final-consume ownership: {verify}, consumers={owned}")
+        verify["consumer_us"] = owned[0]
+    verifies = [row for row in verifies if "consumer_us" in row]
+    units, windows, committed, proof = [], [], [], []
+    for previous, current, following in zip(verifies, verifies[1:], verifies[2:]):
+        if current["count"] <= 1:
+            continue
+        accepted_prefix = following["position"] - current["position"]
+        previous_prefix = current["position"] - previous["position"]
+        if not 1 <= accepted_prefix <= current["count"] or not 1 <= previous_prefix <= previous["count"]:
+            raise ValueError("Missing or invalid committed speculative prefix")
+        low, high = previous["consumer_us"][1], current["consumer_us"][1]
+        target_name = f"v41::target::PP{stage}::decode::C{current['count']}"
+        targets = [
+            row for row in inventory["cpu_markers"]
+            if row[2] == target_name and low <= row[0] and row[0] + row[1] <= high
+        ]
+        if len(targets) != 1 or not low <= current["start"] < high:
+            raise ValueError("Round lacks one complete target and verify consumer")
+        units.append(current["position"])
+        windows.append((low, high))
+        committed.append(accepted_prefix)
+        proof.append(
+            dict(position=current["position"],
+                 target_rows=current["count"],
+                 committed=accepted_prefix,
+                 next_position=following["position"],
+                 target=targets[0],
+                 consumer=current,
+                 native_coverage=native_coverage))
+    if not windows:
+        raise ValueError("No complete speculative round with a measured next scheduler position")
+    return dict(topology=topology,
+                phase="decode",
+                unit="round",
+                tokens=units,
+                windows_us=windows,
+                committed_tokens=committed,
+                total_committed_tokens=sum(committed),
+                mean_committed=sum(committed) / len(committed),
+                capture_order=[],
+                coverage_proof=proof,
+                base_time_nanoseconds=inventory.get("base_time_nanoseconds"),
+                asynchronous_completion=True,
+                boundary="successive verify final-consume completions; includes inter-round scheduler, "
+                "ring release, submission and device waits; committed tokens from next scheduled position")
+
+
 def analyze(root, rank, phase=None, request_result=None):
     path = root / f"rank{rank}"
     inv = json.loads((path / "inventory.json").read_text())
@@ -266,32 +339,16 @@ def analyze(root, rank, phase=None, request_result=None):
                 raise ValueError("Native serving coverage differs from completed decode steps")
             if stats["prepares"] != before["prepares"] or stats["native_captures"] != before["native_captures"]:
                 raise ValueError("Native trace contains compilation or graph capture")
-            native_coverage = dict(
-                kind="complete native stage replay",
-                decode_steps=steps,
-                native_entry_replays=entries,
-                native_joint_replays=joint,
-                direct_group_replays=0,
-                hot_prepares=0,
-                hot_captures=0,
-            )
-            queued = stats["v41"].get("device_loop_queued", 0) - before["v41"].get("device_loop_queued", 0)
-            if queued:
-                consumed = stats["v41"].get("device_loop_consumed", 0) - before["v41"].get("device_loop_consumed", 0)
-                targets = sum(bool(re.fullmatch(r"v41::target::PP0::decode::C1(?:::P\d+)?", row[2]))
-                              for row in inv["cpu_markers"])
-                repairs = sum(stats["v41"].get(key, 0) - before["v41"].get(key, 0)
-                              for key in ("device_loop_recomputes", "device_loop_discards", "device_sampling_fallbacks"))
-                if queued != consumed or queued + targets != steps or repairs:
-                    raise ValueError("Device-feedback trace needs exact queue/consume coverage without repairs")
-                native_coverage.update(device_loop_complete=True, queued=queued, consumed=consumed,
-                                       explicit_targets=targets, repairs=repairs)
-        position_window = (json.loads(collection.read_text()).get("decode_position_window")
-                           if collection.exists() and phase == "decode" else None)
-        result = tp4_windows(inv, phase, request_start_ns, native_coverage, position_window)
-        if request_result is not None and phase == "prefill":
-            if result["coverage_proof"]["prompt_tokens"] != request["usage"]["prompt_tokens"]:
-                raise ValueError("Prefill trace does not cover the complete measured prompt")
+            native_coverage = dict(kind="complete native stage replay", decode_steps=steps,
+                                   native_entry_replays=entries, native_joint_replays=joint,
+                                   direct_group_replays=0, hot_prepares=0, hot_captures=0)
+        speculative = phase == "decode" and any(
+            re.fullmatch(r"v41::target::PP\d+::decode::C[2-6]", row[2]) for row in inv["cpu_markers"])
+        result = (speculative_windows(inv, stats["topology"], native_coverage) if speculative else tp4_windows(
+            inv, phase, request_start_ns, native_coverage))
+        if (request_result is not None and phase == "prefill"
+                and result["coverage_proof"]["prompt_tokens"] != request["usage"]["prompt_tokens"]):
+            raise ValueError("Prefill trace does not cover the complete measured prompt")
         (path / "device-windows.json").write_text(json.dumps(result, indent=2) + "\n")
         print(json.dumps({key: value for key, value in result.items() if key != "coverage_proof"}), flush=True)
         return

@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
+#if defined(DSV41_N256_DIAGONAL_ROUTES) || defined(DSV41_N256_REDUCE_SHARED)
+#include "deepseek_v41_c6_scale_reduce_direct.h"
+#else
+// SPDX-License-Identifier: Apache-2.0
 #ifndef DSV41_SHARED_FINALIZE
 #define DSV41_SHARED_FINALIZE 0
 #endif
@@ -94,3 +98,5 @@ void main(tensor product,
     }
     }
 }
+
+#endif

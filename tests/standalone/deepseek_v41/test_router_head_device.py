@@ -13,7 +13,7 @@ HEAD = torch.ops.custom_op.custom_deepseek_v41_bf16_linear_f32_gaudi2
 
 
 @HPU
-@pytest.mark.parametrize("tokens", [1, 3, 129, 512])
+@pytest.mark.parametrize("tokens", [1, 3, 6, 129, 512])
 def test_router_score_bias_ties_and_changing_inputs(tokens):
     torch.manual_seed(641)
     compiled = torch.compile(ROUTER, backend="hpu_backend", fullgraph=True, dynamic=False)
@@ -58,7 +58,7 @@ def test_router_score_bias_ties_and_changing_inputs(tokens):
 
 
 @HPU
-@pytest.mark.parametrize("tokens,width", [(1, 64640), (3, 1024), (129, 1024)])
+@pytest.mark.parametrize("tokens,width", [(1, 64640), (3, 1024), (6, 1024), (129, 1024)])
 def test_head_bf16_inputs_accumulate_and_return_fp32(tokens, width):
     torch.manual_seed(1541)
     # Dot products of small BF16 integers have exact FP32 sums here. This

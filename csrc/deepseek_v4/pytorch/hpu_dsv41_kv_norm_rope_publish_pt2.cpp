@@ -7,10 +7,14 @@
 #include <cmath>
 #include "hpu_ops/op_backend.h"
 
+#ifndef DSV41_KV_PUBLISH_SCHEMA
+#define DSV41_KV_PUBLISH_SCHEMA "custom_deepseek_v41_kv_norm_rope_publish_gaudi2"
+#define DSV41_KV_PUBLISH_ORDERED "custom_deepseek_v41_kv_norm_rope_publish_ordered_gaudi2"
+#endif
 namespace {
 constexpr auto kSchema =
-    "custom_op::custom_deepseek_v41_kv_norm_rope_publish_gaudi2";
-constexpr auto kOrdered = "custom_op::custom_deepseek_v41_kv_norm_rope_publish_ordered_gaudi2";
+    "custom_op::" DSV41_KV_PUBLISH_SCHEMA;
+constexpr auto kOrdered = "custom_op::" DSV41_KV_PUBLISH_ORDERED;
 constexpr auto kGuid = "custom_deepseek_v41_kv_norm_rope_publish_gaudi2";
 struct Params { float epsilon; float inverse_width; int offset; };
 
@@ -47,12 +51,12 @@ habana::PartialOutputMetaDataVector metadata(const at::Stack& stack) {
                              stack.at(3).toTensor(),stack.at(6).toDouble());
     const auto x=stack.at(0).toTensor(), cache=stack.at(4).toTensor(), decoded=stack.at(5).toTensor();
     const auto offset=stack.at(7).toInt();
-    TORCH_CHECK(x.size(0)==1 && cache.scalar_type()==at::kByte && cache.dim()==2 && cache.size(1)==528 &&
+    TORCH_CHECK(x.size(0)>=1 && x.size(0)<=6 && cache.scalar_type()==at::kByte && cache.dim()==2 && cache.size(1)==528 &&
                 cache.size(0)>=256 && decoded.scalar_type()==at::kBFloat16 && decoded.dim()==2 &&
                 decoded.size(1)==512 && decoded.size(0)>=512 && (offset==-1 || (offset>=0 && offset%512==0 && offset<=decoded.size(0)-512)) && cache.device()==x.device() && decoded.device()==x.device() &&
                 cache.is_contiguous() && decoded.is_contiguous() && !cache.requires_grad() && !decoded.requires_grad(),
                 "KV publication requires scheduler-owned packed and decoded circular state");
-    return {{at::kBFloat16,sizes},{at::kInt,{16}}};
+    return {{at::kBFloat16,sizes},{at::kInt,x.size(0)==1 ? std::vector<int64_t>{16} : std::vector<int64_t>{x.size(0),16}}};
 }
 
 const bool registered = [] {
@@ -76,7 +80,7 @@ std::tuple<at::Tensor,at::Tensor> run(const at::Tensor& input,const at::Tensor& 
     const at::Stack stack{input,weight,positions,phase,cache,decoded,epsilon,offset};
     const auto meta=metadata(stack);
     if (Meta) return {at::empty(meta.at(0).shape,input.options()),
-                      at::empty({16},input.options().dtype(at::kInt))};
+                      at::empty(meta.at(1).shape,input.options().dtype(at::kInt))};
     TORCH_CHECK(registered && input.device().type()==at::kHPU);
     auto descriptor=habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(Ordered ? kOrdered : kSchema);
     const auto result=descriptor.execute(stack);
@@ -108,18 +112,18 @@ std::tuple<at::Tensor,at::Tensor> functionalize(const at::Tensor& input,const at
 }
 
 TORCH_LIBRARY_FRAGMENT(custom_op, m) {
-    m.def("custom_deepseek_v41_kv_norm_rope_publish_ordered_gaudi2(Tensor input, Tensor weight, Tensor positions, Tensor phase, Tensor cache, Tensor decoded, float epsilon, int offset) -> (Tensor, Tensor)");
-    m.def("custom_deepseek_v41_kv_norm_rope_publish_gaudi2(Tensor input, Tensor weight, Tensor positions, Tensor phase, Tensor(a!) cache, Tensor(b!) decoded, float epsilon, int offset) -> (Tensor, Tensor)");
+    m.def(DSV41_KV_PUBLISH_ORDERED "(Tensor input, Tensor weight, Tensor positions, Tensor phase, Tensor cache, Tensor decoded, float epsilon, int offset) -> (Tensor, Tensor)");
+    m.def(DSV41_KV_PUBLISH_SCHEMA "(Tensor input, Tensor weight, Tensor positions, Tensor phase, Tensor(a!) cache, Tensor(b!) decoded, float epsilon, int offset) -> (Tensor, Tensor)");
 }
 TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
-    m.impl("custom_deepseek_v41_kv_norm_rope_publish_ordered_gaudi2", run<false,true>);
-    m.impl("custom_deepseek_v41_kv_norm_rope_publish_gaudi2", run<false>);
+    m.impl(DSV41_KV_PUBLISH_ORDERED, run<false,true>);
+    m.impl(DSV41_KV_PUBLISH_SCHEMA, run<false>);
 }
 TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
-    m.impl("custom_deepseek_v41_kv_norm_rope_publish_ordered_gaudi2", run<true,true>);
-    m.impl("custom_deepseek_v41_kv_norm_rope_publish_gaudi2", run<true>);
+    m.impl(DSV41_KV_PUBLISH_ORDERED, run<true,true>);
+    m.impl(DSV41_KV_PUBLISH_SCHEMA, run<true>);
 }
 
 TORCH_LIBRARY_IMPL(custom_op, Functionalize, m) {
-    m.impl("custom_deepseek_v41_kv_norm_rope_publish_gaudi2", functionalize);
+    m.impl(DSV41_KV_PUBLISH_SCHEMA, functionalize);
 }

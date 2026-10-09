@@ -39,7 +39,8 @@ class Layer(torch.nn.Module):
     (4, 2, True, [12, 13, 14, 15], 14, None, [False, True, False, True]),
     (4, 1, True, [4, 5, 6, 7], None, 5, [False, False, False, True]),
     (4, 1, True, [32, 34, 37, 38], None, None, [False, False, False, True]),
-    (4, 6, True, [4, 5, 6, 7], None, None, [False] * 4),
+    (4, 6, True, [4, 5, 6, 7], None, None, [False, True, True, True]),
+    (4, 6, True, [12, 13, 14, 15], 14, None, [False, True, False, True]),
     (4, 8, False, [4, 5, 6, 7], None, None, [False] * 4),
     (2, 1, True, [4, 5, 6, 7], None, None, [False] * 4),
 ])

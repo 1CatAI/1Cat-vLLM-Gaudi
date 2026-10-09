@@ -72,6 +72,20 @@ def prepare_index_mirror(shared, visible_tokens):
                 _compiled(_restore_index, _signature(*args))(*args)
             else:
                 _restore_index(*args)
+    if getattr(shared, "dspark_main_mirror", False) and visible_tokens <= 32768:
+        # Rebuild once at the existing request/page binding boundary, including
+        # a reused prefill prefix. The serving DSpark contract admits one
+        # in-flight request; no per-round host lookup or union is introduced.
+        from vllm_gaudi.ops.deepseek_v41_math import unpack_fp4
+
+        for cache in shared.sources.values():
+            cache.main_mirror.zero_()
+            count = visible_tokens // cache.ratio
+            for start in range(0, count, 2048):
+                rows = torch.arange(start, min(start + 2048, count), dtype=torch.int32, device=cache.main.device)
+                physical = shared.physical_rows(rows, cache.ratio).long()
+                packed = cache.main.index_select(0, physical)
+                cache.main_mirror.index_copy_(0, rows.long(), unpack_fp4(packed))
     shared.index_mirror_valid = True
     shared.index_mirror_rebuilds += 1
 
@@ -111,3 +125,40 @@ def mirror_index_tile(query, weights, keys, positions, rows, ratio, local_heads,
         query.contiguous(), weights.contiguous(), selected.contiguous(),
         positions.to(torch.int32).contiguous(), logical, ratio, local_heads)
     return result[:, :columns]
+
+
+def per_query_mirror_keys(keys, rows):
+    """Gather canonical decoded keys without changing each query's row order."""
+    logical = rows.to(torch.int32)
+    safe = logical.clamp(0, keys.shape[0] - 1).reshape(-1).long()
+    selected = keys.index_select(0, safe).reshape(*rows.shape, 128)
+    valid = (logical >= 0) & (logical < keys.shape[0])
+    return torch.where(valid.unsqueeze(-1), selected, 0)
+
+
+def refresh_index_mirror_rows(packed, pages, rows, mirror, ratio, completion=None):
+    """Read after the canonical writer, including ratio-2 incomplete pairs.
+
+    Several queries can name the same compressed row. Reading the packed
+    cache after its writes makes all duplicates identical and avoids racing
+    complete and incomplete query values in the derived mirror.
+    """
+    logical = rows.to(torch.int32).reshape(1, -1).contiguous()
+    if completion is None:
+        restored = torch.ops.custom_op.custom_deepseek_v41_index_keys_gaudi2(
+            packed, pages, logical, ratio).reshape(-1, 128)
+    else:
+        restored = torch.ops.custom_op.custom_deepseek_v41_index_keys_write_ordered_gaudi2(
+            packed, pages, logical, completion, ratio).reshape(-1, 128)
+    mirror.index_copy_(0, rows.long(), restored)
+
+
+def candidate_mirror_scores(owner, query, weights, positions, blocks):
+    """Consume common eight-row coordinates directly in the index MME chain."""
+    rows, keys = torch.ops.custom_op.custom_deepseek_v41_candidate_mirror_keys_gaudi2(
+        owner.cache.index_mirror, blocks.contiguous())
+    dots = torch.bmm(query.contiguous(), keys.transpose(1, 2).contiguous())
+    scores = torch.ops.custom_op.custom_deepseek_v41_prefill_index_reduce_gaudi2(
+        dots.contiguous(), weights.contiguous(), positions.to(torch.int32).contiguous(),
+        rows, owner.ratio, owner.index_heads)
+    return rows, scores

@@ -50,8 +50,9 @@ void main(tensor scores, tensor weights, tensor positions, tensor rows,
             }
             const bfloat128 combined = convert_float128_to_bfloat128(total, SW_RHNE);
             const float128 reduced = convert_bfloat128_to_float128(combined, SW_LINEAR);
-            const int5 low_row = {tile * 128, 0, 0, 0, 0};
-            const int5 high_row = {tile * 128 + 64, 0, 0, 0, 0};
+            const int owner = get_dim_size(rows, 1) > 1 ? token : 0;
+            const int5 low_row = {tile * 128, owner, 0, 0, 0};
+            const int5 high_row = {tile * 128 + 64, owner, 0, 0, 0};
             const int64 lo = v_i32_ld_tnsr_b(low_row, rows);
             const int64 hi = v_i32_ld_tnsr_b(high_row, rows);
             const float64 invalid = as_float64((uint64)0xff800000);

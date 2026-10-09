@@ -78,8 +78,10 @@ and have bounded slot/byte budgets. Request-slot reuse reconstructs decoded
 mirrors before native replay consumes them. Equal text alone does not imply a
 hit: the token prefix must match. Checkpoints currently capture the prompt
 boundary; generated tokens do not automatically extend that auxiliary
-checkpoint for the next chat turn. Speculative execution does not support this
-checkpoint contract. The option remains off unless requested.
+checkpoint for the next chat turn. Single-stage DSpark can reuse this contract
+with one active request: its checkpoint also retains the accepted draft KV
+history, so an intervening request cannot contaminate the next draft. Additional
+requests wait in the normal scheduler. The option remains off unless requested.
 
 For complete long-prompt tiles, the worker saves the checkpoint's small ring
 states directly from the live producers, including a trailing decoder halo.
@@ -128,11 +130,13 @@ that respects existing per-module locks and actual device ownership. The
 model implementation resides in the plugin's normal worker, loader and model
 registration paths; the wrapper does not inject or replace code.
 
-PP0 owns target layers 0–19, embedding, vision and both host Engram tables.
-PP1 owns target layers 20–39, output normalization/head, and the three-layer
-DSpark draft. Its draft embedding is part of the prepared PP1 file. Hidden
-states and previous mHC mixing coefficients cross the PP boundary together.
-Target states from layers 37–39 feed draft context insertion.
+With TP2×PP2, PP0 owns target layers 0–19, embedding, vision and both host
+Engram tables. PP1 owns target layers 20–39 and output normalization/head.
+With TP4×PP1, one pipeline stage owns all target layers and sampling. The
+three-layer DSpark draft belongs to the sampling tensor-parallel group and
+uses that group's shard count in both configurations. Hidden states and mHC
+mixing coefficients cross an existing PP boundary; a single pipeline stage
+uses local commits. Target states from layers 37–39 feed draft context insertion.
 
 Ordinary single-token decode is the dedicated entrypoint's default. It omits
 speculative configuration, skips all
@@ -140,8 +144,25 @@ speculative configuration, skips all
 state or target-state auxiliary outputs. The normal runner commits one output
 token without proposal or verification. Native warmup captures C1 only;
 multi-token prefill uses bounded expert-grouped BMMs and exact tail handling.
-Set `VLLM_HPU_DSV41_DSPARK=1` explicitly to select the separate speculative
-profile; the ordinary-C1 bundle is not applied in that mode.
+Set `VLLM_HPU_DSV41_DSPARK=1` explicitly to select the speculative profile,
+which reuses the shared defaults and gates producers with C1-only contracts.
+
+DSpark retains the checkpoint's five draft positions and verifies an anchor
+plus five drafts as C6. It uses the shared V1 runner, `PreparedDraft`, device
+verification and `VerifyRing` protocol. Native target warmup prepares C1/C6;
+accepted prefixes of length one through six are a separate state-commit
+contract. Grouped prefill retains only the auxiliary tail consumed by the
+draft's physical SWA ring, with matching positions. End-to-end performance
+and fixed-sample semantic qualification are required separately from component
+correctness checks.
+
+Native context plans own workspace independently. Deployments with fixed
+request-length ranges can select their warm context buckets through
+`--additional-config '{"dsv41_native_warmup_searches":[512,1024,32768,65536]}'`.
+The default retains the complete context sweep. This option preserves all
+prefill shapes and compute paths; an unprepared context may capture a plan on
+first use. Performance qualification must check that its request creates no
+new native captures.
 
 ### Accelerated C1 candidates
 

@@ -4,11 +4,29 @@
 #include <cmath>
 #include "hpu_ops/op_backend.h"
 #include "synapse_common_types.h"
+#ifndef DSV41_Q_BF16_WEIGHT
+#define DSV41_Q_BF16_WEIGHT 0
+#endif
+#ifndef DSV41_Q_PROJECTION_BACKEND_ONLY
+#define DSV41_Q_PROJECTION_BACKEND_ONLY 0
+#endif
+#ifndef DSV41_Q_PROJECTION_SCHEMA
+#define DSV41_Q_PROJECTION_SCHEMA "custom_deepseek_v41_q_projection_rope_gaudi2"
+#endif
+#ifndef DSV41_Q_NORM_SCHEMA
+#define DSV41_Q_NORM_SCHEMA "custom_deepseek_v41_q_norm_projection_rope_gaudi2"
+#endif
+#ifndef DSV41_Q_SCALE_SCHEMA
+#define DSV41_Q_SCALE_SCHEMA "custom_deepseek_v41_q_scale_rope_gaudi2"
+#endif
+#ifndef DSV41_Q_SCALE_GUID
+#define DSV41_Q_SCALE_GUID DSV41_Q_SCALE_SCHEMA
+#endif
 namespace {
-constexpr auto kProjection = "custom_op::custom_deepseek_v41_q_projection_rope_gaudi2";
-constexpr auto kNormProjection = "custom_op::custom_deepseek_v41_q_norm_projection_rope_gaudi2";
-constexpr auto kEpilogue = "custom_op::custom_deepseek_v41_q_scale_rope_gaudi2";
-constexpr auto kGuid = "custom_deepseek_v41_q_scale_rope_gaudi2";
+constexpr auto kProjection = "custom_op::" DSV41_Q_PROJECTION_SCHEMA;
+constexpr auto kNormProjection = "custom_op::" DSV41_Q_NORM_SCHEMA;
+constexpr auto kEpilogue = "custom_op::" DSV41_Q_SCALE_SCHEMA;
+constexpr auto kGuid = DSV41_Q_SCALE_GUID;
 constexpr auto kNormQuant = "custom_deepseek_v41_qnorm_quant_gaudi2";
 struct NormParams { float epsilon; float inverse_width; };
 habana::OutputMetaDataVector meta(const at::Stack& stack, bool epilogue) {
@@ -70,6 +88,25 @@ habana::OutputMetaDataVector norm_meta(const at::Stack& stack) {
                 "F32 [1,16384], I32 [B], F32 [L,64], positive normal epsilon");
     return {{at::kBFloat16, {rows,width}}};
 }
+#if DSV41_Q_BF16_WEIGHT
+habana::OutputMetaDataVector bf16_meta(const at::Stack& stack) {
+    TORCH_CHECK(stack.size()==5,"BF16 Q projection requires four tensors and quantization policy");
+    const auto x=stack.at(0).toTensor(),w=stack.at(1).toTensor();
+    const auto p=stack.at(2).toTensor(),phase=stack.at(3).toTensor();
+    TORCH_CHECK(x.dim()==2 && x.size(0)>=1 && x.size(0)<=64 && x.size(1)==1280 &&
+                w.dim()==2 && (w.size(0)==8192 || w.size(0)==16384) && w.size(1)==1280 &&
+                x.scalar_type()==at::kBFloat16 && w.scalar_type()==at::kBFloat16 &&
+                p.scalar_type()==at::kInt && p.sizes()==at::IntArrayRef({x.size(0)}) &&
+                phase.scalar_type()==at::kFloat && phase.dim()==2 && phase.size(1)==64 &&
+                phase.size(0)>0 && phase.size(0)<=1048576,
+                "BF16 Q projection requires actual TP2/TP4 weights, I32 positions and F32 RoPE table");
+    for(int i=0;i<4;++i) {
+        const auto t=stack.at(i).toTensor();
+        TORCH_CHECK(t.is_contiguous() && !t.requires_grad() && t.device()==x.device());
+    }
+    return {{at::kBFloat16,{x.size(0),w.size(0)}}};
+}
+#endif
 class Projection final : public habana::OpBackend {
     bool epilogue_;
     bool fused_norm_;
@@ -77,11 +114,31 @@ public:
     Projection(int device, c10::ScalarType dtype, bool epilogue, bool fused_norm = false)
         : OpBackend(device, NO_TPC + std::string("dsv41_q_projection_rope"), dtype, {0}, {}, {}, false),
           epilogue_(epilogue), fused_norm_(fused_norm) {
+#if DSV41_Q_BF16_WEIGHT
+        SetOutputMetaFn(bf16_meta);
+#else
         SetOutputMetaFn([epilogue, fused_norm](const at::Stack& s) {
             return fused_norm ? norm_meta(s) : meta(s, epilogue);
         });
+#endif
     }
     void AddNode(synapse_helpers::graph& graph, const at::Stack& stack) override {
+#if DSV41_Q_BF16_WEIGHT
+        const auto output=bf16_meta(stack);
+        std::vector<synapse_helpers::tensor> quantized;
+        synTensor input=syn_in(0);
+        if(stack.at(4).toBool()) {
+            quantized=BuildNode(this,graph,{"custom_deepseek_v41_quant_roundtrip_bf16_gaudi2",
+                {input},{{{output[0].shape[0],1280},at::kBFloat16}}});
+            input=quantized[0].get();
+        }
+        synGEMMParams params{false,true};
+        auto product=BuildNode(this,graph,{"gemm",{input,syn_in(1)},
+            {{output[0].shape,at::kFloat}},&params,sizeof(params)});
+        auto result=BuildNode(this,graph,{kGuid,{product[0].get(),syn_in(2),syn_in(3)},
+            {{output[0].shape,at::kBFloat16,0}}});
+        syn_out(0)=std::move(result[0]);
+#else
         const auto output = fused_norm_ ? norm_meta(stack) : meta(stack, epilogue_);
         const auto rows = output.at(0).shape.at(0);
         if (epilogue_) {
@@ -108,8 +165,10 @@ public:
             {product.at(0).get(),syn_in(channel),q.at(1).get(),syn_in(position),syn_in(table)},
             {{output.at(0).shape, at::kBFloat16, 0}}});
         syn_out(0) = std::move(node.at(0));
+#endif
     }
 };
+#if !DSV41_Q_PROJECTION_BACKEND_ONLY
 const bool registered = [] {
     for (bool epilogue : {false,true}) {
         const auto schema = epilogue ? kEpilogue : kProjection;
@@ -149,19 +208,23 @@ at::Tensor norm_run(const at::Tensor& x, const at::Tensor& norm, const at::Tenso
     auto descriptor = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(kNormProjection);
     return descriptor.execute({x,norm,w,s,pos,table,epsilon}).at(0);
 }
+#endif
 }
+#if !DSV41_Q_PROJECTION_BACKEND_ONLY
 TORCH_LIBRARY_FRAGMENT(custom_op,m) {
-    m.def("custom_deepseek_v41_q_projection_rope_gaudi2(Tensor input, Tensor weight, Tensor channel_scale, Tensor position, Tensor table) -> Tensor");
-    m.def("custom_deepseek_v41_q_scale_rope_gaudi2(Tensor product, Tensor channel_scale, Tensor activation_scale, Tensor position, Tensor table) -> Tensor");
-    m.def("custom_deepseek_v41_q_norm_projection_rope_gaudi2(Tensor input, Tensor norm_weight, Tensor weight, Tensor channel_scale, Tensor position, Tensor table, float epsilon) -> Tensor");
+    m.def(DSV41_Q_PROJECTION_SCHEMA "(Tensor input, Tensor weight, Tensor channel_scale, Tensor position, Tensor table) -> Tensor");
+    m.def(DSV41_Q_SCALE_SCHEMA "(Tensor product, Tensor channel_scale, Tensor activation_scale, Tensor position, Tensor table) -> Tensor");
+    m.def(DSV41_Q_NORM_SCHEMA "(Tensor input, Tensor norm_weight, Tensor weight, Tensor channel_scale, Tensor position, Tensor table, float epsilon) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(custom_op,HPU,m) {
-    m.impl("custom_deepseek_v41_q_projection_rope_gaudi2",run<false,false>);
-    m.impl("custom_deepseek_v41_q_scale_rope_gaudi2",run<false,true>);
-    m.impl("custom_deepseek_v41_q_norm_projection_rope_gaudi2",norm_run<false>);
+    m.impl(DSV41_Q_PROJECTION_SCHEMA,run<false,false>);
+    m.impl(DSV41_Q_SCALE_SCHEMA,run<false,true>);
+    m.impl(DSV41_Q_NORM_SCHEMA,norm_run<false>);
 }
 TORCH_LIBRARY_IMPL(custom_op,Meta,m) {
-    m.impl("custom_deepseek_v41_q_projection_rope_gaudi2",run<true,false>);
-    m.impl("custom_deepseek_v41_q_scale_rope_gaudi2",run<true,true>);
-    m.impl("custom_deepseek_v41_q_norm_projection_rope_gaudi2",norm_run<true>);
+    m.impl(DSV41_Q_PROJECTION_SCHEMA,run<true,false>);
+    m.impl(DSV41_Q_SCALE_SCHEMA,run<true,true>);
+    m.impl(DSV41_Q_NORM_SCHEMA,norm_run<true>);
 }
+
+#endif

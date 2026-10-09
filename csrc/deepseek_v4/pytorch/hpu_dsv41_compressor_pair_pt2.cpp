@@ -6,11 +6,19 @@
 #include "backend/habana_operator.h"
 #include "hpu_ops/op_backend.h"
 
+#ifndef DSV41_COMPRESSOR_PAIR_ROWS
+#define DSV41_COMPRESSOR_PAIR_ROWS 1
+#endif
+#ifndef DSV41_COMPRESSOR_PAIR_SCHEMA
+#define DSV41_COMPRESSOR_PAIR_SCHEMA "custom_deepseek_v41_compressor_pair_bf16_gaudi2"
+#define DSV41_COMPRESSOR_PAIR_ORDERED "custom_deepseek_v41_compressor_pair_ordered_bf16_gaudi2"
+#define DSV41_COMPRESSOR_PAIR_GUID "custom_deepseek_v41_compressor_pair_bf16_gaudi2"
+#endif
 namespace {
 constexpr auto kPair =
-    "custom_op::custom_deepseek_v41_compressor_pair_bf16_gaudi2";
+    "custom_op::" DSV41_COMPRESSOR_PAIR_SCHEMA;
 constexpr auto kPairOrdered =
-    "custom_op::custom_deepseek_v41_compressor_pair_ordered_bf16_gaudi2";
+    "custom_op::" DSV41_COMPRESSOR_PAIR_ORDERED;
 
 void validate(const at::Tensor& kv_history,
               const at::Tensor& score_history,
@@ -25,10 +33,10 @@ void validate(const at::Tensor& kv_history,
                     "V4.1 compressor pair requires contiguous inference FP32 tensors");
     TORCH_CHECK(kv_history.sizes() == at::IntArrayRef({8, 512}) &&
                     score_history.sizes() == at::IntArrayRef({8, 512}) &&
-                    kv.sizes() == at::IntArrayRef({1, 512}) &&
-                    score.sizes() == at::IntArrayRef({1, 512}) &&
+                    kv.dim() == 2 && kv.size(1) == 512 && kv.size(0) >= 1 &&
+                    kv.size(0) <= DSV41_COMPRESSOR_PAIR_ROWS && score.sizes() == kv.sizes() &&
                     position.scalar_type() == at::kInt &&
-                    position.sizes() == at::IntArrayRef({1}) &&
+                    position.dim() == 1 && position.size(0) == kv.size(0) &&
                     position.device() == device && position.is_contiguous() &&
                     !position.requires_grad(),
                 "V4.1 compressor pair requires history [8,512], rows [1,512], position I32[1]");
@@ -37,13 +45,13 @@ void validate(const at::Tensor& kv_history,
 const bool registered = [] {
     for (auto name : {kPair, kPairOrdered}) {
         habana::custom_op::registerUserCustomOp(
-            name, "custom_deepseek_v41_compressor_pair_bf16_gaudi2",
+            name, DSV41_COMPRESSOR_PAIR_GUID,
             [](const at::Stack& stack) {
                 validate(stack.at(0).toTensor(), stack.at(1).toTensor(),
                          stack.at(2).toTensor(), stack.at(3).toTensor(),
                          stack.at(4).toTensor());
                 return habana::PartialOutputMetaDataVector{
-                    {at::kBFloat16, {1, 512}}};
+                    {at::kBFloat16, {stack.at(2).toTensor().size(0), 512}}};
             }, nullptr);
     }
     return true;
@@ -57,7 +65,7 @@ at::Tensor pair(const at::Tensor& kv_history,
                 const at::Tensor& position) {
     validate(kv_history, score_history, kv, score, position);
     if constexpr (Meta)
-        return at::empty({1, 512}, kv.options().dtype(at::kBFloat16));
+        return at::empty({kv.size(0), 512}, kv.options().dtype(at::kBFloat16));
     TORCH_CHECK(registered && kv.device().type() == at::kHPU);
     auto descriptor = habana::custom_op::UserCustomOpDescriptor::
         getUserCustomOpDescriptor(Ordered ? kPairOrdered : kPair);
@@ -101,21 +109,21 @@ at::Tensor functionalize(const at::Tensor& kv_history,
 }
 
 TORCH_LIBRARY_FRAGMENT(custom_op, m) {
-    m.def("custom_deepseek_v41_compressor_pair_bf16_gaudi2(Tensor(a!) kv_history, Tensor(b!) score_history, Tensor kv, Tensor score, Tensor position) -> Tensor");
-    m.def("custom_deepseek_v41_compressor_pair_ordered_bf16_gaudi2(Tensor kv_history, Tensor score_history, Tensor kv, Tensor score, Tensor position) -> Tensor");
+    m.def(DSV41_COMPRESSOR_PAIR_SCHEMA "(Tensor(a!) kv_history, Tensor(b!) score_history, Tensor kv, Tensor score, Tensor position) -> Tensor");
+    m.def(DSV41_COMPRESSOR_PAIR_ORDERED "(Tensor kv_history, Tensor score_history, Tensor kv, Tensor score, Tensor position) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(custom_op, HPU, m) {
-    m.impl("custom_deepseek_v41_compressor_pair_bf16_gaudi2",
+    m.impl(DSV41_COMPRESSOR_PAIR_SCHEMA,
            pair<false, false>);
-    m.impl("custom_deepseek_v41_compressor_pair_ordered_bf16_gaudi2",
+    m.impl(DSV41_COMPRESSOR_PAIR_ORDERED,
            pair<false, true>);
 }
 TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
-    m.impl("custom_deepseek_v41_compressor_pair_bf16_gaudi2",
+    m.impl(DSV41_COMPRESSOR_PAIR_SCHEMA,
            pair<true, false>);
-    m.impl("custom_deepseek_v41_compressor_pair_ordered_bf16_gaudi2",
+    m.impl(DSV41_COMPRESSOR_PAIR_ORDERED,
            pair<true, true>);
 }
 TORCH_LIBRARY_IMPL(custom_op, Functionalize, m) {
-    m.impl("custom_deepseek_v41_compressor_pair_bf16_gaudi2", functionalize);
+    m.impl(DSV41_COMPRESSOR_PAIR_SCHEMA, functionalize);
 }
