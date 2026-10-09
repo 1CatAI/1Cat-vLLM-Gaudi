@@ -81,6 +81,19 @@ ordering. CPU staging remains bounded, and workers leave file-cache eviction
 to the operating system. The default is `1`; increasing it is opt-in pending
 complete startup qualification. This option does not change model arithmetic.
 
+`VLLM_HPU_DSV41_N256_DEVICE_PREPARE` (default `0`) selects bounded Gaudi-side
+integer weight layout, channel scale preparation, and qualification. Only
+compressed source bytes are uploaded; converted weights fill the existing
+resident allocation. Certificates are checked once per projection before its
+publication. The candidate does not change the numerical decode path or skip
+any warmup shapes; complete model startup qualification is still required.
+
+`VLLM_HPU_DSV41_N256_PACK_LIBRARY` selects the independently built CPU layout
+helper from `tools/build_deepseek_v41_startup_pack.py`. The loader validates its
+manifest and ABI before copying any converted expert batch. The helper only
+reorders compressed integer bytes; scale selection and all HPU consumers stay
+on the shared path. Unset by default pending device and startup qualification.
+
 `VLLM_HPU_DSV41_MHC_BATCH_REUSE=1` tests four-request control-weight reuse in the ordinary decode batch path. It keeps FP32 operands and each request's original K accumulation and reduction order. It is disabled by default pending complete-chain and serving qualification.
 
 `VLLM_HPU_DSV41_DSPARK_BF16_PROJECTIONS=1` retains BF16 checkpoint vocabulary/router weights in DSpark. FP32 activations use BF16 high/low rows in one GEMM with FP32 accumulation; BF16 activations use their exact single term. Disabled by default pending batch qualification.

@@ -23,7 +23,7 @@ def preparation_workers(source_q, source_s, requested, staging_bytes):
     return min(requested, max(1, budget // per_worker))
 
 
-def prepare_expert_batch(shard, source_q, source_s, first, last, *, compact_scales, active_k, workers=1):
+def prepare_expert_batch(shard, source_q, source_s, first, last, *, compact_scales, active_k, workers=1, pack_q16=None):
     if not 0 <= first < last <= source_q.shape[0] or last - first > 16:
         raise ValueError("Expert preparation requires a nonempty bounded rank-local batch")
     if source_q.shape[0] != source_s.shape[0]:
@@ -39,6 +39,7 @@ def prepare_expert_batch(shard, source_q, source_s, first, last, *, compact_scal
             read_expert(source_q, expert, keep_file_cache=True),
             read_expert(source_s, expert, keep_file_cache=True),
             compact_scales=compact_scales,
+            pack_q16=pack_q16,
         )
         import numpy as np
 

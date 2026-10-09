@@ -88,7 +88,7 @@ def saturated_decode_eligible(planes, *, active_k=None):
 
 
 
-def prepare_expert(q16, s16, *, compact_scales=False):
+def prepare_expert(q16, s16, *, compact_scales=False, pack_q16=None):
     """Prepare one expert; preserve its original nibble and scale encodings."""
     if np.any(s16 & 127):
         raise ValueError("Prepared scales must retain exact E8M0 encodings")
@@ -98,15 +98,20 @@ def prepare_expert(q16, s16, *, compact_scales=False):
         raise ValueError("N256 expert output width must be divisible by 256")
     k = stream // 32
     n = blocks * 128
-    raw = q16.view(np.uint8).reshape(blocks, k // 2, 128)
-    packed = np.empty((blocks // 2, k, 128), dtype=np.uint8)
-    for half in range(2):
-        rows = raw[half::2]
-        low = rows[..., 0::2]
-        high = rows[..., 1::2]
-        packed[:, 0::2, half * 64 : (half + 1) * 64] = (low & 15) | ((high & 15) << 4)
-        packed[:, 1::2, half * 64 : (half + 1) * 64] = (low >> 4) | (high & 240)
-    q = packed.view("<i2").reshape(n // 256, k * 64)
+    if pack_q16 is None:
+        raw = q16.view(np.uint8).reshape(blocks, k // 2, 128)
+        packed = np.empty((blocks // 2, k, 128), dtype=np.uint8)
+        for half in range(2):
+            rows = raw[half::2]
+            low = rows[..., 0::2]
+            high = rows[..., 1::2]
+            packed[:, 0::2, half * 64 : (half + 1) * 64] = (low & 15) | ((high & 15) << 4)
+            packed[:, 1::2, half * 64 : (half + 1) * 64] = (low >> 4) | (high & 240)
+        q = packed.view("<i2").reshape(n // 256, k * 64)
+    else:
+        q = pack_q16(q16)
+        if q.dtype != np.dtype("<i2") or q.shape != (n // 256, k * 64) or not q.flags.c_contiguous:
+            raise ValueError("CPU packing changed the resident N256 tensor contract")
     codes = (s16.reshape(blocks, k // 32, 128) >> 7).astype(np.uint8)
     original = codes.reshape(blocks // 2, 2, k // 32, 128).transpose(0, 2, 1, 3).reshape(n // 256, k // 32, 256)
     channel = channels.reshape(n // 256, 256)
@@ -174,8 +179,6 @@ def load_projection(shard, prefix, device):
     scale_words = stream // 8 + 128 if compact_scales else source_s.shape[2] * 2
     p = torch.empty((experts, blocks // 2, scale_words), dtype=torch.int16, device=device)
     channel = torch.empty((experts, blocks // 2, 256), dtype=torch.bfloat16, device=device)
-    active_k = getattr(shard, "specs", {}).get(prefix + "_q16", {}).get("original_shape", [stream // 32])[-1]
-    sat_eligible = True
     # Batch host-to-device copies without keeping another resident weight copy.
     # The staging allocation is at most 128 MiB, plus one bounded expert scan.
     per_expert = (q[0].numel() + p[0].numel() + channel[0].numel()) * 2
@@ -184,9 +187,25 @@ def load_projection(shard, prefix, device):
     config = json.loads((shard.directory / "config.json").read_text())["text_config"]
     active_k = config["moe_intermediate_size"] // shard.tensor_parallel_size if prefix.endswith(".w2") else stream // 32
     sat_eligible = True
+    if os.environ.get("VLLM_HPU_DSV41_N256_DEVICE_PREPARE", "0") == "1":
+        if q.device.type != "hpu":
+            raise ValueError("Device expert preparation requires an HPU allocation")
+        from vllm_gaudi.ops.deepseek_v41_device_prepare import fill_projection_device
+
+        sat_eligible = fill_projection_device(
+            shard, source_q, source_s, q, p, channel, compact_scales=compact_scales, active_k=active_k)
+        q.dsv41_sat_eligible = sat_eligible
+        if prefix.endswith(".w2") and sat_eligible:
+            q.dsv41_active_k = int(active_k)
+        return q, p, channel
     from vllm_gaudi.ops.deepseek_v41_expert_load import prepare_expert_batch
 
     load_workers = int(os.environ.get("VLLM_HPU_DSV41_N256_LOAD_WORKERS", "1"))
+    pack_q16 = None
+    if pack_library := os.environ.get("VLLM_HPU_DSV41_N256_PACK_LIBRARY"):
+        from vllm_gaudi.ops.deepseek_v41_startup_pack import native_q16_packer
+
+        pack_q16 = native_q16_packer(pack_library)
     for first in range(0, experts, batch):
         last = min(first + batch, experts)
         cpu_q = np.empty((last - first, *q.shape[1:]), dtype="<i2")
@@ -194,7 +213,7 @@ def load_projection(shard, prefix, device):
         cpu_c = np.empty((last - first, *channel.shape[1:]), dtype="<u2")
         for expert, new_q, new_p, new_c, eligible in prepare_expert_batch(
             shard, source_q, source_s, first, last,
-            compact_scales=compact_scales, active_k=active_k, workers=load_workers,
+            compact_scales=compact_scales, active_k=active_k, workers=load_workers, pack_q16=pack_q16,
         ):
             sat_eligible &= eligible
             cpu_q[expert - first] = new_q
