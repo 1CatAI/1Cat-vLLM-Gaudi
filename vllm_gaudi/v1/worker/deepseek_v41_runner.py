@@ -1682,7 +1682,7 @@ class V41ModelRunner:
         c1_replay = (
             getattr(self.model, "native", False)
             and count == 1
-            and (getattr(program, "runtime_indexer", False) or start + count <= 1024)
+            and (self.use_dspark or getattr(program, "runtime_indexer", False) or start + count <= 1024)
         )
         graph_c1 = decode or c1_replay
         if self.request_slots_enabled and request is not None and not decode and c1_replay:
@@ -1697,7 +1697,12 @@ class V41ModelRunner:
                 raise ValueError("Direct V4.1 token binding requires a C1 transaction")
             ids = self.decode_ids
         if program is not None and program.length > 512:
-            if search_length is not None:
+            # Scalar prompt tails consume the same finite geometry as native
+            # decode. DSpark prewarms power-of-two C1 searches; a larger prompt
+            # transaction can instead use a non-power-of-two hot index bucket.
+            # Keep that prompt geometry on its large tiles, outside C1 replay.
+            native_scalar_search = c1_replay and not decode and not getattr(program, "runtime_indexer", False)
+            if search_length is not None and not native_scalar_search:
                 search = int(search_length)
             elif graph_c1:
                 search = (runtime_search_length(start, count, program.length)
@@ -1812,9 +1817,8 @@ class V41ModelRunner:
             else:
                 positions.copy_(torch.arange(start, start + count, dtype=torch.int32, device="cpu"))
         self._round_phase("inputs_staged_ns")
-        # Slot-owned scalar C1 tails have already published their state to
-        # the fixed replay addresses. They use the same warmed search buckets
-        # as decode; the legacy prompt/DSpark path keeps its bounded capture.
+        # Slot-owned scalar tails have already published their state to the
+        # fixed C1 replay addresses for ordinary and speculative requests.
         use_replay = (
             getattr(self.model, "native", False)
             or (self.v2_completion and getattr(self.model, "tensor_parallel_size", 2) == 4)
