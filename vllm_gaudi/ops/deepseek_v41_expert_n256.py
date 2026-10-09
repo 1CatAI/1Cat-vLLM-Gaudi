@@ -11,7 +11,7 @@ import numpy as np
 from functools import lru_cache
 from types import FunctionType
 
-from vllm_gaudi.ops.deepseek_v41_fp8 import channel_scales, read_expert
+from vllm_gaudi.ops.deepseek_v41_fp8 import channel_scales
 from vllm_gaudi.ops.deepseek_v41_weights import canonical_hash
 
 LAYOUT = {
@@ -184,18 +184,19 @@ def load_projection(shard, prefix, device):
     config = json.loads((shard.directory / "config.json").read_text())["text_config"]
     active_k = config["moe_intermediate_size"] // shard.tensor_parallel_size if prefix.endswith(".w2") else stream // 32
     sat_eligible = True
+    from vllm_gaudi.ops.deepseek_v41_expert_load import prepare_expert_batch
+
+    load_workers = int(os.environ.get("VLLM_HPU_DSV41_N256_LOAD_WORKERS", "1"))
     for first in range(0, experts, batch):
         last = min(first + batch, experts)
         cpu_q = np.empty((last - first, *q.shape[1:]), dtype="<i2")
         cpu_p = np.empty((last - first, *p.shape[1:]), dtype="<i2")
         cpu_c = np.empty((last - first, *channel.shape[1:]), dtype="<u2")
-        for expert in range(first, last):
-            shard.check_identity()
-            new_q, new_p, new_c, _ = prepare_expert(
-                read_expert(source_q, expert), read_expert(source_s, expert), compact_scales=compact_scales
-            )
-            sat_eligible &= not np.any(new_q[:, active_k * 64:])
-            sat_eligible &= saturated_decode_eligible(new_p, active_k=active_k)
+        for expert, new_q, new_p, new_c, eligible in prepare_expert_batch(
+            shard, source_q, source_s, first, last,
+            compact_scales=compact_scales, active_k=active_k, workers=load_workers,
+        ):
+            sat_eligible &= eligible
             cpu_q[expert - first] = new_q
             cpu_p[expert - first] = new_p
             cpu_c[expert - first] = new_c

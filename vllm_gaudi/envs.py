@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH: bool = False
     VLLM_HPU_DSV41_EXPERT_N256: bool = False
     VLLM_HPU_DSV41_N256_PREPARED_DIR: Optional[str] = None
+    VLLM_HPU_DSV41_N256_LOAD_WORKERS: int = 1
     VLLM_HPU_DSV41_DEFAULT_FASTPATHS: bool = False
     VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS: bool = False
     VLLM_HPU_DSV41_EXPERT_N256_FP8: bool = False
@@ -631,6 +632,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_N256", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_N256_PREPARED_DIR":
     lambda: os.environ.get("VLLM_HPU_DSV41_N256_PREPARED_DIR"),
+    "VLLM_HPU_DSV41_N256_LOAD_WORKERS":
+    lambda: int(os.environ.get("VLLM_HPU_DSV41_N256_LOAD_WORKERS", "1")),
     "VLLM_HPU_DSV41_EXPERT_N256_FP8":
     lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_N256_FP8", "0").lower() in ("1", "true"),
     # Keep the resident N256 allocation for C1 decode, but restore bounded
