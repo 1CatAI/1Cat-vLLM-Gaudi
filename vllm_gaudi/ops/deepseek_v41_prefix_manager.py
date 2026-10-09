@@ -22,8 +22,12 @@ class V41PrefixManager(FullAttentionManager):
                                pcp_world_size=1):
         if (not kv_cache_spec.requires_auxiliary_prefix_state or not kv_cache_spec.prefix_cacheable
                 or kv_cache_spec.block_size != 128 or block_pool.hash_block_size != 128 or alignment_tokens != 128
-                or drop_eagle_block or dcp_world_size != 1 or pcp_world_size != 1):
+                or dcp_world_size != 1 or pcp_world_size != 1):
             raise ValueError("V4.1 prefix lookup requires complete 128-token pages and auxiliary checkpoints")
+        # DSpark shares the engine's EAGLE-family flag, but its accepted draft
+        # context is restored with the auxiliary checkpoint. The manager below
+        # clamps to that acknowledged boundary and keeps an uncached prompt tail;
+        # dropping another page would discard the only matching checkpoint.
         blocks = tuple([] for _ in kv_cache_group_ids)
         for digest in itertools.islice(block_hashes, max_length // 128):
             cached = block_pool.get_cached_block(digest, kv_cache_group_ids)
