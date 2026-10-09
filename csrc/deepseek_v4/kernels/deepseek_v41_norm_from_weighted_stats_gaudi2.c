@@ -42,6 +42,11 @@ void main(tensor input,tensor weight,tensor statistics,tensor normalized,tensor 
           tensor dense_quantized,tensor dense_scales,float epsilon,float inverse_width) {
  const int5 begin=get_index_space_offset(),end=begin+get_index_space_size();
  for(int row=begin[1];row<end[1];++row) {
+#ifdef DSV41_WEIGHTED_STATS_PREPARED
+        const float64 rrms=s_f32_ld_g(gen_addr((int5){0,row},statistics));
+        const float64 inverse=s_f32_ld_g(gen_addr((int5){1,row},statistics));
+        const float64 scale=s_f32_ld_g(gen_addr((int5){2,row},statistics));
+#else
   const float64 squares=v_f32_ld_tnsr_b((int5){0,0,row},statistics);
   const float64 weighted=v_f32_ld_tnsr_b((int5){0,1,row},statistics);
   const float64 rrms=positive_rsqrt(row_sum(squares)*inverse_width+epsilon);
@@ -52,6 +57,7 @@ void main(tensor input,tensor weight,tensor statistics,tensor normalized,tensor 
         const float64 scale = round_bf16(
             raw_scale + (float)(bf16)(1.0e-8f / 240.0f));
         const float64 inverse = round_bf16(reciprocal_without_lookup(scale));
+#endif
 #ifdef DSV41_FFN_BF16_QUANT
         const float128 inverse_pair = {inverse, inverse};
         const bfloat128 sparse_inverse_bf16 = v_convert_f32_to_bf16_all_b(inverse_pair);
@@ -61,12 +67,17 @@ void main(tensor input,tensor weight,tensor statistics,tensor normalized,tensor 
 #ifdef DSV41_FFN_DUAL_QUANT
         // The shared expert uses a power-of-two scale and flushes FP8
         // subnormals. Reuse the row amax, but preserve both quantizers.
+#ifdef DSV41_WEIGHTED_STATS_PREPARED
+        const float64 dense_inverse=s_f32_ld_g(gen_addr((int5){3,row},statistics));
+        const float64 dense_scale=s_f32_ld_g(gen_addr((int5){4,row},statistics));
+#else
         const uint64 bits = as_uint64(maximum);
         int64 power = convert_uint64_to_int64(bits >> 23, 0) - 134;
         power += v_i32_sel_grt_u32_b(bits & 0x7fffff, 0x700000, 1, 0);
         power = v_i32_sel_eq_f32_b(maximum, 0.0f, 0, power);
         const float64 dense_scale = as_float64((power + 127) << 23);
         const float64 dense_inverse = as_float64((127 - power) << 23);
+#endif
         const float128 dense_inverse_pair = {dense_inverse, dense_inverse};
         const bfloat128 dense_inverse_bf16 = v_convert_f32_to_bf16_all_b(dense_inverse_pair);
         if(begin[0]==0) v_f32_st_tnsr_partial(scale_at, dense_scales, dense_scale, 0, 0);

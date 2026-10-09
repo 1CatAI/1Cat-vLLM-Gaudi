@@ -94,6 +94,9 @@ static inline float64 router_score(float64 logits) {
 }
 
 void main(tensor logits, tensor text_bias, tensor image_bias, tensor image_mask,
+#ifdef DSV41_ROUTER_SHARED_SCALED
+          tensor channel_scale, tensor activation_scale,
+#endif
           tensor output_ids, tensor output_weights) {
     const int5 start = get_index_space_offset();
     const int5 end = start + get_index_space_size();
@@ -101,6 +104,15 @@ void main(tensor logits, tensor text_bias, tensor image_bias, tensor image_mask,
     for (int token = start[0]; token < end[0]; ++token) {
         const int5 image_at = {token, 0, 0, 0, 0};
         const char is_image = s_i8_ld_g(gen_addr(image_at, image_mask));
+#ifdef DSV41_ROUTER_SHARED_SCALED
+#ifdef DSV41_ROUTER_READY_PAIR
+        const int first = 0;
+        const int rows = get_dim_size(logits, 1) / 2;
+#else
+        const int first = get_dim_size(logits, 0) - 512;
+#endif
+        const float sx = s_f32_ld_g(gen_addr((int5){0, token}, activation_scale));
+#endif
         float64 scores[6], choices[6];
         float64 packed_weights = 0;
         int64 packed_ids = 0;
@@ -108,9 +120,34 @@ void main(tensor logits, tensor text_bias, tensor image_bias, tensor image_mask,
         float64 sum = 0;
         #pragma unroll
         for (int c = 0; c < 6; ++c) {
+#if !defined(DSV41_ROUTER_SHARED_SCALED) && !defined(DSV41_ROUTER_PARTIAL_LOGITS)
             const int5 at = {c * 64, token, 0, 0, 0};
+#endif
             const int5 bias_at = {c * 64, 0, 0, 0, 0};
+#ifdef DSV41_ROUTER_SHARED_SCALED
+            float64 projected = v_f32_ld_tnsr_b((int5){first + c * 64, token}, logits);
+            projected = v_f32_mul_b(projected, v_f32_ld_tnsr_b((int5){c * 64, 0}, channel_scale));
+#ifdef DSV41_ROUTER_READY_PAIR
+            const float64 low_scale = v_f32_ld_tnsr_b((int5){c * 64, 1}, channel_scale);
+            projected += v_f32_ld_tnsr_b((int5){512 + c * 64, token}, logits) * low_scale;
+            float64 low_input = v_f32_ld_tnsr_b((int5){c * 64, token + rows}, logits) *
+                v_f32_ld_tnsr_b((int5){c * 64, 0}, channel_scale);
+            low_input += v_f32_ld_tnsr_b((int5){512 + c * 64, token + rows}, logits) * low_scale;
+            projected += low_input * .0625f;
+#endif
+            projected = v_f32_mul_b(projected, sx);
+            scores[c] = router_score(projected);
+#else
+#ifdef DSV41_ROUTER_PARTIAL_LOGITS
+            float64 projected=v_f32_ld_tnsr_b((int5){c*64,token,0},logits);
+            projected+=v_f32_ld_tnsr_b((int5){c*64,token,1},logits);
+            projected+=v_f32_ld_tnsr_b((int5){c*64,token,2},logits);
+            projected+=v_f32_ld_tnsr_b((int5){c*64,token,3},logits);
+            scores[c]=router_score(projected);
+#else
             scores[c] = router_score(v_f32_ld_tnsr_b(at, logits));
+#endif
+#endif
             const float64 bias = is_image
                 ? v_f32_ld_tnsr_b(bias_at, image_bias)
                 : v_f32_ld_tnsr_b(bias_at, text_bias);

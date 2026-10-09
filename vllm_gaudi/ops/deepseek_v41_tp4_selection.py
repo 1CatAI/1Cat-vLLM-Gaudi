@@ -16,32 +16,38 @@ def invalidate_local_index_queries(owner):
     """Release cold replicas after the execution owner has retired its plans."""
     owner.tp4_local_index_queries = False
     for kind in ("query", "score"):
-        for rank in range(4):
+        for rank in range(owner.tensor_parallel_size):
             setattr(owner, f"_tp4_index_{kind}_shard_{rank}", None)
+    owner._index_query_full_weight = None
+    owner._index_score_full_weight = None
 
 
-def prepare_local_index_queries(owner, *, release_local=False):
+def prepare_local_index_queries(owner, *, release_local=False, joint=False):
     """Prepare immutable rank-ordered projection shards outside execution."""
-    if owner.tensor_parallel_size != 4 or not owner.owns_index:
-        raise ValueError("Replicated index projections require a TP4 index owner")
+    tp_size = owner.tensor_parallel_size
+    if tp_size not in (2, 4) or not owner.owns_index:
+        raise ValueError("Replicated index projections require a supported TP index owner")
     if owner.tp4_local_index_queries or any(
             getattr(owner, f"_tp4_index_{kind}_shard_{rank}", None) is not None
-            for kind in ("query", "score") for rank in range(4)):
+            for kind in ("query", "score") for rank in range(tp_size)):
         raise ValueError("Index projections must be invalidated before preparing again")
     indexer = owner.weights.indexer
     query, score = indexer.wq_b.weight, indexer.weights_proj.weight
-    if (query.dtype != torch.bfloat16 or tuple(query.shape) != (1024, 1280)
-            or score.dtype != torch.bfloat16 or tuple(score.shape) != (8, 5120)
-            or owner.index_heads != 8 or hasattr(indexer.wq_b, "bias")
+    heads = 32 // tp_size
+    if (query.dtype != torch.bfloat16 or tuple(query.shape) != (heads * 128, 1280)
+            or score.dtype != torch.bfloat16 or tuple(score.shape) != (heads, 5120)
+            or owner.index_heads != heads or hasattr(indexer.wq_b, "bias")
             or hasattr(indexer.weights_proj, "bias") or hasattr(indexer.weights_proj, "scale")):
-        raise ValueError("Index projections differ from the qualified TP4 BF16 shard contract")
-    query_shards = owner.gather(query.contiguous(), 0).reshape(4, 1024, 1280)
-    score_shards = owner.gather(score.contiguous(), 0).reshape(4, 8, 5120)
-    for rank in range(4):
+        raise ValueError("Index projections differ from the BF16 head-shard contract")
+    query_shards = owner.gather(query.contiguous(), 0).reshape(tp_size, heads * 128, 1280)
+    score_shards = owner.gather(score.contiguous(), 0).reshape(tp_size, heads, 5120)
+    owner._index_query_full_weight = query_shards.flatten(0, 1) if joint else None
+    owner._index_score_full_weight = score_shards.flatten(0, 1) if joint else None
+    for rank in range(tp_size):
         # Materialize each immutable shard outside execution. Linear's weight
         # transposes can still produce batch_as_strided in the compiled plan.
-        setattr(owner, f"_tp4_index_query_shard_{rank}", query_shards[rank].clone())
-        setattr(owner, f"_tp4_index_score_shard_{rank}", score_shards[rank].clone())
+        setattr(owner, f"_tp4_index_query_shard_{rank}", query_shards[rank] if joint else query_shards[rank].clone())
+        setattr(owner, f"_tp4_index_score_shard_{rank}", score_shards[rank] if joint else score_shards[rank].clone())
     if release_local:
         # Prefill and wider decode retain their original local shard geometry
         # through references, without keeping duplicate rank-local allocations.
@@ -51,16 +57,23 @@ def prepare_local_index_queries(owner, *, release_local=False):
     owner.tp4_local_index_queries = True
 
 
-def local_index_query_projections(owner, value, qr):
+def local_index_query_projections(owner, value, qr, *, joint=False):
     """Keep each original shard GEMM and activation rounding boundary."""
     from vllm_gaudi.ops.deepseek_v41_math import quantize_activation
-    query_weight = [getattr(owner, f"_tp4_index_query_shard_{rank}") for rank in range(4)]
-    score_weight = [getattr(owner, f"_tp4_index_score_shard_{rank}") for rank in range(4)]
+    tp_size = owner.tensor_parallel_size
+    query_weight = [getattr(owner, f"_tp4_index_query_shard_{rank}") for rank in range(tp_size)]
+    score_weight = [getattr(owner, f"_tp4_index_score_shard_{rank}") for rank in range(tp_size)]
     if any(value is None for value in (*query_weight, *score_weight)):
         raise ValueError("Local index query projections were not prepared")
     quantized = quantize_activation(qr) if hasattr(owner.weights.indexer.wq_b, "scale") else qr
-    query = torch.cat([F.linear(quantized, query_weight[rank]) for rank in range(4)], dim=-1)
-    scores = torch.cat([F.linear(value, score_weight[rank]) for rank in range(4)], dim=-1)
+    if joint:
+        if owner._index_query_full_weight is None or owner._index_score_full_weight is None:
+            raise ValueError("Joint index projection requires the prepared full-head operands")
+        query = F.linear(quantized, owner._index_query_full_weight)
+        scores = F.linear(value, owner._index_score_full_weight)
+    else:
+        query = torch.cat([F.linear(quantized, query_weight[rank]) for rank in range(tp_size)], dim=-1)
+        scores = torch.cat([F.linear(value, score_weight[rank]) for rank in range(tp_size)], dim=-1)
     return query.reshape(value.shape[0], 32, 128), scores
 
 

@@ -1,0 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+#define DSV41_N256_W13_K_PIPELINE 1
+#define DSV41_N256_COOPERATIVE_SILU 1
+#define DSV41_N256_SILU_GUID "custom_deepseek_v41_cooperative_silu_gaudi2"
+#define DSV41_N256_SCALE_REDUCE_GUID "custom_deepseek_v41_w2_reduce_n256_gaudi2"
+#define DSV41_SPLIT_SCALE_OPERATOR custom_deepseek_v41_expert_n256_moe_cooperative_silu_fp8_gaudi2
+#include "sat_split_scale_planes.cpp"

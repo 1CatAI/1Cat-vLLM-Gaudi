@@ -9,6 +9,7 @@ void main(tensor value, tensor residual, tensor post, tensor comb,
 {
     const int5 start = get_index_space_offset();
     const int5 end = start + get_index_space_size();
+    const int ranks = get_dim_size(value, 2);
     for (int token = start[1]; token < end[1]; ++token) {
         float post_weight[4];
         float comb_weight[4][4];
@@ -33,14 +34,22 @@ void main(tensor value, tensor residual, tensor post, tensor comb,
             // A peer tensor is [features, tokens, ranks]. Accumulate in the
             // same fixed FP32 rank order as the shared collective consumer,
             // then preserve its BF16 boundary before the residual update.
-            const int ranks = get_dim_size(value, 2);
-            for (int rank = 1; rank < ranks; ++rank) {
-                vc[2] = rank;
-                const float128 peer = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_b(vc, value));
-                x.v1 = v_f32_add_b(x.v1, peer.v1);
-                x.v2 = v_f32_add_b(x.v2, peer.v2);
-            }
             if (ranks > 1) {
+                bfloat128 packets[7];
+                // Independent loads precede the dependent ordered additions.
+                // Predication preserves the same consumer for any 2..8 ranks;
+                // unused ranks do not access tensor storage or alter signed zero.
+                #pragma unroll
+                for (int rank = 1; rank < 8; ++rank) {
+                    vc[2] = rank;
+                    packets[rank-1] = v_bf16_ld_tnsr_b(vc, value, 0, (bfloat128)0, rank < ranks);
+                }
+                #pragma unroll
+                for (int rank = 1; rank < 8; ++rank) {
+                    const float128 peer = v_convert_bf16_to_f32_all_b(packets[rank-1]);
+                    x.v1 = v_f32_add_b(x.v1, peer.v1, 0, x.v1, rank < ranks);
+                    x.v2 = v_f32_add_b(x.v2, peer.v2, 0, x.v2, rank < ranks);
+                }
                 x = v_convert_bf16_to_f32_all_b(v_convert_f32_to_bf16_all_b(x, SW_RHNE));
             }
             float128 source_value[4];

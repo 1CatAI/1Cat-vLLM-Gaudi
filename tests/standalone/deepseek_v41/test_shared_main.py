@@ -248,8 +248,9 @@ def test_register_softmax_switch_preserves_larger_decode_entrypoints(monkeypatch
         calls.append(('reuse', args[8:]))
         return args[0]
 
-    monkeypatch.setattr(torch.ops.custom_op, 'custom_deepseek_v41_main_publish_mla_gaudi2', publish, raising=False)
-    monkeypatch.setattr(torch.ops.custom_op, 'custom_deepseek_v41_main_reuse_mla_gaudi2', reuse, raising=False)
+    prefix = 'custom_deepseek_v41_main' if tokens == 1 else 'custom_deepseek_v41_main_batch'
+    monkeypatch.setattr(torch.ops.custom_op, prefix + '_publish_mla_gaudi2', publish, raising=False)
+    monkeypatch.setattr(torch.ops.custom_op, prefix + '_reuse_mla_gaudi2', reuse, raising=False)
     owner = Layer(20, 20, 20, torch.ones(1), torch.ones((tokens, 512), dtype=torch.int32)).owner
     q = torch.ones((tokens, 16, 512))
     args = (owner, q, torch.zeros(tokens, dtype=torch.int32),

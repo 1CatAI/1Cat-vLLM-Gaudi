@@ -4,6 +4,20 @@
 from vllm_gaudi import envs
 
 
+def select_native_warmup_geometries(geometries, additional_config):
+    """Select deployment context plans without changing compute or decode shapes."""
+    requested = additional_config.get("dsv41_native_warmup_searches")
+    if requested is None:
+        return geometries
+    available = {search for _, search in geometries}
+    if (not isinstance(requested, (list, tuple)) or not requested
+            or any(type(search) is not int or search not in available for search in requested)
+            or len(set(requested)) != len(requested)):
+        raise ValueError("dsv41_native_warmup_searches must contain distinct supported search buckets")
+    selected = set(requested)
+    return tuple(geometry for geometry in geometries if geometry[1] in selected)
+
+
 def decode_source_prefix_bound(token_end, search_length, tensor_parallel_size, *, runtime_indexer=False):
     """Bound contiguous Full-source work without reading device positions."""
     if tensor_parallel_size < 2:
@@ -59,27 +73,20 @@ def validate_v2(config):
         )
         if config.parallel_config.pipeline_parallel_size != 1 or any(not getattr(envs, key) for key in required):
             raise ValueError(
-                "TP4 continuation requires fixed device inputs, device Engram and the complete prefix contract"
-            )
+                "TP4 continuation requires fixed device inputs, device Engram and the complete prefix contract")
         return
     if not envs.VLLM_HPU_DSV41_GRAPH_REPLAY or not envs.VLLM_HPU_DSV41_DIRECT_TOKEN_IDS:
         raise ValueError("V4.1 V2 requires native graph replay and direct device token inputs")
     if envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX and not (
-        envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH
-        and envs.VLLM_HPU_DSV41_FIXED_POSITIONS
-        and envs.VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT
-        and envs.VLLM_HPU_TP2_NATIVE_JOINT_PLAN
-        and envs.VLLM_HPU_DSV41_TP_MHC_OVERLAP
-    ):
+            envs.VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH and envs.VLLM_HPU_DSV41_FIXED_POSITIONS
+            and envs.VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT and envs.VLLM_HPU_TP2_NATIVE_JOINT_PLAN
+            and envs.VLLM_HPU_DSV41_TP_MHC_OVERLAP):
         raise ValueError("V4.1 segmented prefix requires native fixed inputs, early commit, and TP dependencies")
     if envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX and envs.VLLM_HPU_DSV41_FUSED_STAGE_IO:
         raise ValueError("V4.1 segmented prefix requires the native input graph instead of fused stage I/O")
     if envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and not (
-        envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX
-        and envs.VLLM_HPU_DSV41_ENGRAM_NATIVE_C1
-        and envs.VLLM_HPU_DSV41_ENGRAM_C1_PACKET
-        and envs.VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT
-    ):
+            envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX and envs.VLLM_HPU_DSV41_ENGRAM_NATIVE_C1
+            and envs.VLLM_HPU_DSV41_ENGRAM_C1_PACKET and envs.VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT):
         raise ValueError("Device Engram requires segmented PP0 replay, native C1 packets, and direct inputs")
     # Device Engram is a C1 producer over the current token and a three-token
     # rolling history.  It is independent of the paged CSA2 capacity; prompt
@@ -94,24 +101,14 @@ def validate_sampling(params, *, dspark=None):
         raise VLLMValidationError("V4.1 runner requires sampling parameters")
     if dspark is None:
         dspark = envs.VLLM_HPU_DSV41_DSPARK
-    if dspark and params.temperature != 0:
-        raise VLLMValidationError("V4.1 DSpark requires greedy sampling (temperature=0)")
-    if (
-        params.logprobs is not None
-        or params.prompt_logprobs is not None
-        or params.presence_penalty != 0
-        or params.frequency_penalty != 0
-        or params.repetition_penalty != 1
-        or params.allowed_token_ids is not None
-        or params.bad_words
-        or params.logit_bias
-        or params.structured_outputs is not None
-        or params.min_tokens
-    ):
+    if dspark and params.temperature != 0 and not envs.VLLM_HPU_DSV41_DEVICE_VERIFY:
+        raise VLLMValidationError("V4.1 sampled DSpark requires device probability verification")
+    if (params.logprobs is not None or params.prompt_logprobs is not None or params.presence_penalty != 0
+            or params.frequency_penalty != 0 or params.repetition_penalty != 1 or params.allowed_token_ids is not None
+            or params.bad_words or params.logit_bias or params.structured_outputs is not None or params.min_tokens):
         raise VLLMValidationError(
             "V4.1 supports temperature, top_p, top_k and seed; penalties, logprobs and constrained sampling "
-            "are not supported"
-        )
+            "are not supported")
 
 
 def configure(config):
@@ -136,28 +133,20 @@ def configure(config):
         from vllm.v1.outputs import ModelRunnerOutput
         from vllm.v1.kv_cache_interface import KVCacheSpec, UniformTypeKVCacheSpecs
 
-        if (
-            not paged
-            or not envs.VLLM_HPU_DSV41_GRAPH_REPLAY
-            or not envs.VLLM_HPU_DSV41_RUNTIME_INDEXER
-            or envs.VLLM_HPU_DSV41_DSPARK
-            or "auxiliary_prefix_operations" not in SchedulerOutput.__dataclass_fields__
-            or "auxiliary_prefix_acknowledgments" not in ModelRunnerOutput.__dataclass_fields__
-            or not hasattr(KVCacheSpec, "requires_auxiliary_prefix_state")
-            or "requires_auxiliary_prefix_state" not in UniformTypeKVCacheSpecs.__dict__
-        ):
+        if (not paged or not envs.VLLM_HPU_DSV41_GRAPH_REPLAY
+                or (not envs.VLLM_HPU_DSV41_RUNTIME_INDEXER and not envs.VLLM_HPU_DSV41_DSPARK)
+                or "auxiliary_prefix_operations" not in SchedulerOutput.__dataclass_fields__
+                or "auxiliary_prefix_acknowledgments" not in ModelRunnerOutput.__dataclass_fields__
+                or not hasattr(KVCacheSpec, "requires_auxiliary_prefix_state")
+                or "requires_auxiliary_prefix_state" not in UniformTypeKVCacheSpecs.__dict__):
             raise ValueError("V4.1 prefix caching requires request slots and the auxiliary-checkpoint engine ABI")
+        if envs.VLLM_HPU_DSV41_DSPARK and config.scheduler_config.max_num_seqs != 1:
+            raise ValueError("V4.1 DSpark prefix caching requires one active request")
     if envs.VLLM_HPU_DSV41_BATCH_DECODE:
-        if (
-            not paged
-            or not envs.VLLM_HPU_DSV41_GRAPH_REPLAY
-            or not envs.VLLM_HPU_DSV41_RUNTIME_INDEXER
-            or envs.VLLM_HPU_DSV41_DSPARK
-            or not 1 <= config.scheduler_config.max_num_seqs <= 64
-        ):
+        if (not paged or not envs.VLLM_HPU_DSV41_GRAPH_REPLAY or not envs.VLLM_HPU_DSV41_RUNTIME_INDEXER
+                or envs.VLLM_HPU_DSV41_DSPARK or not 1 <= config.scheduler_config.max_num_seqs <= 64):
             raise ValueError(
-                "V4.1 request batches require paged native runtime-position decode, DSpark off, capacity1..64"
-            )
+                "V4.1 request batches require paged native runtime-position decode, DSpark off, capacity1..64")
         if uses_v2(config) and config.scheduler_config.scheduler_cls is None:
             # Select through the normal scheduler interface, independently
             # of whether another HPU utility happened to import first.
@@ -187,20 +176,16 @@ def configure(config):
         enabled = next((name for name in _PIPELINE_ONLY_FASTPATHS if getattr(envs, name, False)), None)
         if enabled is not None:
             raise ValueError(f"V4.1 {enabled} requires a pipeline peer")
-    if is_tp4(config):
-        if envs.VLLM_HPU_DSV41_DSPARK or spec is not None:
-            raise ValueError("V4.1 TP4 does not yet support DSpark")
-        if envs.VLLM_HPU_DSV41_PREFILL_GROUPED_FP8 not in ("", "w13_single_bucket"):
-            raise ValueError("V4.1 TP4 supports BF16 or W13 single-FP8 bucketed prefill")
+    if is_tp4(config) and envs.VLLM_HPU_DSV41_PREFILL_GROUPED_FP8 not in ("", "w13_single_bucket"):
+        raise ValueError("V4.1 TP4 supports BF16 or W13 single-FP8 bucketed prefill")
     if config.scheduler_config.async_scheduling and not uses_v2(config):
         raise ValueError("V4.1 PP verify commits currently require --no-async-scheduling")
     if config.use_v2_model_runner and not uses_v2(config):
         raise ValueError("V4.1 V2 needs the explicit VLLM_HPU_DSV41_V2 backend adapter")
     if config.lora_config is not None or config.kv_transfer_config is not None:
         raise ValueError("V4.1 prepared state does not support LoRA or external KV transfer")
-    if envs.VLLM_HPU_DSV41_GRAPH_REPLAY and not (
-        envs.VLLM_HPU_TP2_STATIC_GROUP_PLAN and envs.VLLM_HPU_TP2_PREPARED_COMM
-    ):
+    if envs.VLLM_HPU_DSV41_GRAPH_REPLAY and not (envs.VLLM_HPU_TP2_STATIC_GROUP_PLAN
+                                                 and envs.VLLM_HPU_TP2_PREPARED_COMM):
         raise ValueError("V4.1 graph replay requires the static group plan and prepared communication")
     from vllm_gaudi.ops.deepseek_v41_state import register_state_spec
 

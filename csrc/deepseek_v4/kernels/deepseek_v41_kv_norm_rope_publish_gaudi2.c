@@ -62,8 +62,13 @@ void main(tensor input, tensor weight, tensor positions, tensor phase,
     const int5 end = begin + get_index_space_size();
 #endif
     bfloat128 cached[4];
+#ifdef DSV41_KV_PUBLISH_FUNCTION
+    const int row_end = end[1] ? end[1] : 1;
+#else
+    const int row_end = end[1];
+#endif
+    for (int row = begin[1]; row < row_end; ++row) {
     for (int group = begin[0]; group < end[0]; ++group) {
-        const int row = 0;
         float128 squares = {0};
         #pragma unroll (4)
         for (int tile = 0; tile < 4; ++tile) {
@@ -105,11 +110,12 @@ void main(tensor input, tensor weight, tensor positions, tensor phase,
                     : half_values;
                 const float64 group_value = v_f32_sel_less_i32_b((int64)V_LANE_ID_32, 32, selected, (float64)0);
                 const float128 packed_group = {group_value, (float64)0};
-                v_bf16_st_tnsr_partial((int5){32 * group, 0}, output,
+                v_bf16_st_tnsr_partial((int5){32 * group, row}, output,
                     convert_float128_to_bfloat128(packed_group, SW_RHNE | SW_LINEAR), 31, 0);
                 if (valid) swa_pack_number(group_value, cache, group, ring, 512, decoded, decoded_offset < 0 ? -1 : decoded_offset + ring);
-                s_i32_st_g(gen_addr((int5){group}, completion), valid ? position : -1);
+                s_i32_st_g(gen_addr((int5){group, row}, completion), valid ? position : -1);
             }
         }
     }
+}
 }

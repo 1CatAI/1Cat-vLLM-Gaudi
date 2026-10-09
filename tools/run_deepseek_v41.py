@@ -55,6 +55,56 @@ def retire_process_group(pgid, *, grace_seconds=10, terminate_seconds=10):
     return record
 
 
+def record_device_release(selected, *, timeout_seconds=10):
+    """Inspect owned modules after retirement, while their leases are held."""
+    deadline = time.monotonic() + timeout_seconds
+    samples = []
+    while True:
+        current = []
+        for item in selected:
+            try:
+                raw = subprocess.check_output(
+                    ["hl-smi", "-i", item["bus"], "--query-aip=memory.used,utilization.aip",
+                     "--format=csv,noheader,nounits"], text=True, timeout=3)
+                memory, utilization = map(float, raw.strip().split(","))
+                current.append(dict(module=item["module"], memory_mib=memory,
+                                    utilization=utilization))
+            except (subprocess.SubprocessError, ValueError) as error:
+                current.append(dict(module=item["module"], error=str(error)))
+        samples.append(current)
+        idle = all(row.get("memory_mib", float("inf")) <= 1024
+                   and row.get("utilization", 1) == 0 for row in current)
+        if idle or time.monotonic() >= deadline:
+            return dict(healthy_cards_idle=idle, target_memory_mib=768,
+                        admission_ceiling_mib=1024, samples=samples,
+                        checked_before_unlock=True)
+        time.sleep(0.25)
+
+
+def validate_native_database_path(environment):
+    directory = environment.get("VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR")
+    if not directory:
+        return
+    root = Path(directory).resolve()
+    accepted = {str(root / "libdeepseek_v4_gaudi2_kernels.so"), "/usr/lib/habanalabs/libtpc_kernels.so"}
+    if (root / "deepseek_v41_unique_build.json").is_file():
+        accepted.add(str(root / "libdeepseek_v41_unique_kernels.so"))
+    # Bind additive registration hashes before acquiring cards or weights.
+    # Pinning the manifest file alone does not verify its internal binaries.
+    manifest = root / "deepseek_v41_unique_build.json"
+    if manifest.is_file():
+        for name, expected in json.loads(manifest.read_text()).get("binaries", {}).items():
+            path = root / name
+            if Path(name).name != name or not path.is_file():
+                raise ValueError(f"Invalid or missing additive registration: {name}")
+            if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+                raise ValueError(f"Additive registration differs from its build manifest: {name}")
+    configured = environment.get("GC_KERNEL_PATH")
+    if configured and configured not in accepted:
+        raise ValueError("GC_KERNEL_PATH must match the database in VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR; "
+                         "update both paths when installing a candidate")
+
+
 def cpuset(value):
     result = set()
     for field in value.strip().split(","):
@@ -171,8 +221,15 @@ def configure_trace_artifacts(environment, evidence, *, dump_plans, enable_profi
             environment["HABANA_PROF_CONFIG"] = str(config_path)
     identity = {key: environment.get(key, "0") for key in ("ENABLE_PROFILER", "GRAPH_VISUALIZATION", "HABANA_PROFILE")}
     if enable_profiler or raw_profiler:
+        config_identity = json.loads(Path(environment["HABANA_PROF_CONFIG"]).read_text())
+        output = config_identity.get("GeneralSettings", {}).get("values", {}).get("outdir")
+        if isinstance(output, dict) and isinstance(output.get("value"), str):
+            # Capture destinations do not change compiled execution. Keep all
+            # profiler policies in the key while allowing archived runs to
+            # reuse recipes without overwriting each other's trace files.
+            output["value"] = "<capture-output>"
         identity["profiler_config_sha256"] = hashlib.sha256(
-            Path(environment["HABANA_PROF_CONFIG"]).read_bytes()
+            json.dumps(config_identity, sort_keys=True).encode()
         ).hexdigest()
     return identity
 
@@ -188,6 +245,40 @@ def acquire(lock_dir, count, requested_modules=None, secondary_lock_dirs=()):
         except BlockingIOError:
             return None, []
         return _acquire_modules(lock_dir, count, requested_modules, secondary_lock_dirs)
+
+
+def host_available_gib():
+    memory = {line.split(':', 1)[0]: int(line.split(':', 1)[1].split()[0])
+              for line in Path('/proc/meminfo').read_text().splitlines()}
+    return memory['MemAvailable'] / 1048576
+
+
+def ipc_scratch_path(requested, identity):
+    """Leave room for the engine's UUID inside Linux's Unix-socket limit."""
+    if len(os.fsencode(requested)) + 37 <= 107:
+        return Path(requested)
+    suffix = hashlib.sha256(os.fsencode(identity)).hexdigest()[:8]
+    return Path('/opt/optane/dsv41-tmp') / suffix
+
+
+def acquire_admitted(lock_dir, count, requested_modules, secondary_lock_dirs, minimum_gib, evidence):
+    """Leave modules available while a model lacks its host-memory budget."""
+    available = host_available_gib()
+    selected, locks = None, []
+    if available >= minimum_gib:
+        selected, locks = acquire(lock_dir, count, requested_modules, secondary_lock_dirs)
+        # A competing loader can consume RAM during device discovery. Return
+        # its unused leases immediately, rather than wait while owning cards.
+        if selected is not None:
+            available = host_available_gib()
+            if available < minimum_gib:
+                for stream in locks:
+                    stream.close()
+                selected, locks = None, []
+    (evidence / 'host-admission.json').write_text(json.dumps(
+        dict(launcher_pid=os.getpid(), available_gib=available, required_gib=minimum_gib,
+             ready=selected is not None, owns_cards=selected is not None, time_ns=time.time_ns()), indent=2) + '\n')
+    return selected, locks
 
 
 def _acquire_modules(lock_dir, count, requested_modules=None, secondary_lock_dirs=()):
@@ -276,6 +367,12 @@ def main():
         help="Four for normal serving; fewer only for bounded component diagnostics",
     )
     parser.add_argument("--modules", type=str, help="Optional comma-separated physical module IDs, in rank order")
+    parser.add_argument("--cpu-conflict-policy", choices=("wait", "relocate-or-measure"), default="wait",
+                        help="Relocate this run within NUMA, or record CPU overlap when no cores are free")
+    parser.add_argument("--preferred-cpus", type=str,
+                        help="Prefer this CPU pool when available; retain the selected NUMA conflict policy")
+    parser.add_argument("--min-host-available-gib", type=float, default=0,
+                        help="Recheck available host RAM after acquiring card locks, before model startup")
     parser.add_argument(
         "--recipe-cache-dir",
         type=Path,
@@ -293,6 +390,8 @@ def main():
     )
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    if args.min_host_available_gib < 0:
+        parser.error("Host memory admission threshold must be nonnegative")
     # The child runs inside the immutable source snapshot, so environment
     # and artifact paths must not depend on the caller's working directory.
     args.evidence = args.evidence.resolve()
@@ -318,6 +417,19 @@ def main():
     for key in ("PYTHONPATH", "LD_PRELOAD", "HABANA_PROFILE", "VLLM_PLUGINS"):
         env.pop(key, None)
     env.update(profile["environment"])
+    validate_native_database_path(env)
+    auto_scratch = None
+    if env.get('TMPDIR'):
+        requested_scratch = Path(env['TMPDIR'])
+        scratch = ipc_scratch_path(requested_scratch, args.evidence)
+        scratch.mkdir(parents=True, exist_ok=True)
+        if scratch != requested_scratch:
+            auto_scratch = scratch
+            env['TMPDIR'] = str(scratch)
+            profile['environment']['TMPDIR'] = str(scratch)
+        (args.evidence / 'ipc-scratch.json').write_text(json.dumps(
+            dict(requested=str(requested_scratch), effective=str(scratch),
+                 normalized=scratch != requested_scratch, socket_path_limit_bytes=107), indent=2) + '\n')
     if env.get("VLLM_HPU_DSV41_RAW_TRACE", "0") == "1" and not (args.enable_profiler or args.raw_profiler):
         parser.error("Raw trace capture requires --enable-profiler or --raw-profiler")
     requested_modules = None
@@ -325,12 +437,14 @@ def main():
         requested_modules = tuple(int(value) for value in args.modules.split(",") if value.strip())
         if len(requested_modules) != args.devices or len(set(requested_modules)) != len(requested_modules):
             raise RuntimeError("--modules must contain exactly --devices distinct module IDs")
-    selected, locks = acquire(args.lock_dir, args.devices, requested_modules, args.secondary_lock_dir)
+    selected, locks = acquire_admitted(args.lock_dir, args.devices, requested_modules,
+                                      args.secondary_lock_dir, args.min_host_available_gib, args.evidence)
     while selected is None:
         target = args.modules if args.modules else f"{args.devices} unowned Gaudi2 modules"
-        print(f"Waiting for {target}; existing jobs remain untouched", flush=True)
-        time.sleep(30)
-        selected, locks = acquire(args.lock_dir, args.devices, requested_modules, args.secondary_lock_dir)
+        print(f"Waiting for {target} and host-memory budget; no card leases held", flush=True)
+        time.sleep(2 if args.cpu_conflict_policy == "relocate-or-measure" else 30)
+        selected, locks = acquire_admitted(args.lock_dir, args.devices, requested_modules,
+                                          args.secondary_lock_dir, args.min_host_available_gib, args.evidence)
     record = {
         "started_at": datetime.now(timezone.utc).isoformat(),
         "command": command,
@@ -340,17 +454,66 @@ def main():
     }
     try:
         allowed = os.sched_getaffinity(0)
+        if args.cpu_conflict_policy == "relocate-or-measure":
+            effective = Path("/sys/fs/cgroup/cpuset.cpus.effective")
+            if effective.is_file() and effective.read_text().strip():
+                permitted = cpuset(effective.read_text())
+                if permitted:
+                    os.sched_setaffinity(0, permitted)
+                    allowed = permitted
+        # Host admission precedes the card lease. A retiring worker can
+        # briefly reappear in /proc between those two steps; wait within the
+        # owned lease rather than fail and reload the whole serving model.
+        # Archive the actual affinity and reservations so a repeated resource
+        # failure is actionable without another model launch.
+        node_counts = {}
+        for item in selected:
+            node_counts[item["numa"]] = node_counts.get(item["numa"], 0) + 1
+        while True:
+            busy = active_worker_cpus()
+            free = {node: sorted(cpuset(Path(f"/sys/devices/system/node/node{node}/cpulist").read_text())
+                                 & allowed - busy) for node in node_counts}
+            cpu_ready = all(len(free[node]) >= 5 * count for node, count in node_counts.items())
+            memory = {line.split(':', 1)[0]: int(line.split(':', 1)[1].split()[0])
+                      for line in Path('/proc/meminfo').read_text().splitlines()}
+            available_gib = memory['MemAvailable'] / 1048576
+            ready = ((cpu_ready or args.cpu_conflict_policy == "relocate-or-measure")
+                     and available_gib >= args.min_host_available_gib)
+            (args.evidence / "cpu-admission.json").write_text(json.dumps(
+                dict(allowed=sorted(allowed), reserved=sorted(busy), nodes=node_counts,
+                     free=free, ready=ready, cpu_ready=cpu_ready, available_gib=available_gib,
+                     required_gib=args.min_host_available_gib, launcher_pid=os.getpid()), indent=2) + "\n")
+            if ready:
+                break
+            print(f"Waiting after card acquisition: CPU pool ready={cpu_ready}; "
+                  f"host RAM {available_gib:.1f}/{args.min_host_available_gib:.1f} GiB", flush=True)
+            time.sleep(10)
         reserved, mains, helpers = active_worker_cpus(), [], []
+        preferred = cpuset(args.preferred_cpus) if args.preferred_cpus else set()
+        record["preferred_cpus"] = sorted(preferred)
         record["excluded_active_worker_cpus"] = sorted(reserved)
         for item in selected:
             available = cpuset(Path(f"/sys/devices/system/node/node{item['numa']}/cpulist").read_text()) & allowed
-            physical = [cpu for cpu in sorted(available) if cpu not in reserved]
-            if len(physical) < 6:
-                raise RuntimeError("Insufficient free CPU affinity for the selected device NUMA node")
+            physical = [cpu for cpu in sorted(available, key=lambda cpu: (cpu not in preferred, cpu))
+                        if cpu not in reserved]
+            # One main and four helpers consume five physical cores. Control
+            # process isolation, when requested, has its own explicit check.
+            overlap = False
+            if len(physical) < 5:
+                if args.cpu_conflict_policy != "relocate-or-measure":
+                    raise RuntimeError("Insufficient free CPU affinity for the selected device NUMA node")
+                assigned = set(mains) | {int(cpu) for group in helpers for cpu in group.split(",")}
+                physical = sorted(available - assigned)[:5]
+                if len(physical) < 5:
+                    raise RuntimeError("NUMA node has fewer than five permitted CPU cores")
+                overlap = True
+                record.setdefault("cpu_overlap_fallback", []).append(dict(module=item["module"], cpus=physical))
             main_cpu = physical[0]
             siblings = cpuset(Path(f"/sys/devices/system/cpu/cpu{main_cpu}/topology/thread_siblings_list").read_text())
             reserved.update(siblings)
-            helper = [cpu for cpu in physical if cpu not in reserved][:4]
+            helper = ([cpu for cpu in physical if cpu != main_cpu][:4]
+                      if overlap
+                      else [cpu for cpu in physical if cpu not in reserved][:4])
             for cpu in helper:
                 reserved.update(
                     cpuset(Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read_text())
@@ -371,7 +534,14 @@ def main():
                     if len(group) == count:
                         break
                 if len(group) != count:
-                    raise RuntimeError("Insufficient free NUMA-local CPUs for the V4.1 control processes")
+                    if args.cpu_conflict_policy != "relocate-or-measure":
+                        raise RuntimeError("Insufficient free NUMA-local CPUs for the V4.1 control processes")
+                    worker_cpus = set(mains) | {int(cpu) for value in helpers for cpu in value.split(",")}
+                    choices = sorted(local - worker_cpus) or sorted(local)
+                    group = choices[:count]
+                    if len(group) != count:
+                        raise RuntimeError("Insufficient permitted NUMA-local control CPUs")
+                    record.setdefault("cpu_overlap_fallback", []).append(dict(role=role, cpus=group))
                 env[f"VLLM_HPU_DSV41_{role.upper()}_CPUS"] = ",".join(map(str, group))
                 record.setdefault("control_cpus", {})[role] = group
                 control_cpus.update(group)
@@ -408,6 +578,7 @@ def main():
                 "ENABLE_PROFILER",
                 "GRAPH_VISUALIZATION",
                 "GRAPH_VISUALIZATION_DIR",
+                "TMPDIR",
             )
         }
         root = Path(__file__).resolve().parents[1]
@@ -444,7 +615,12 @@ def main():
         env["PYTHONPATH"] = os.pathsep.join((str(execution_root), *paths))
         record["execution_source_root"] = str(execution_root)
         record["environment"]["PYTHONPATH"] = env["PYTHONPATH"]
-        (args.evidence / "runtime-profile.json").write_bytes(args.runtime_profile.read_bytes())
+        # Serving re-execs against this file. Persist the normalized scratch
+        # path as well as exporting it, or the old overlong value returns.
+        runtime_bytes = json.dumps(profile, indent=2).encode() + b'\n'
+        (args.evidence / "runtime-profile.json").write_bytes(runtime_bytes)
+        record['runtime_profile_source_sha256'] = hashlib.sha256(args.runtime_profile.read_bytes()).hexdigest()
+        record['effective_runtime_profile_sha256'] = hashlib.sha256(runtime_bytes).hexdigest()
         if args.source_snapshot:
             archive_patch = source_root.parent / "source.patch"
             (args.evidence / "source.patch").write_bytes(archive_patch.read_bytes() if archive_patch.is_file() else b"")
@@ -534,6 +710,18 @@ def main():
         record["process_group_retirement"] = retire_process_group(process.pid)
         if record["process_group_retirement"]["forced_cleanup"] and record["exit_code"] == 0:
             record["exit_code"] = 1
+        record["device_release"] = record_device_release(selected)
+        while not record["device_release"]["healthy_cards_idle"]:
+            # Large native plans can retire their driver allocation after the
+            # owned process group has already disappeared. Keep the card lease
+            # across that delay; an observation timeout is not permission to
+            # unlock a still-allocated module or reset a shared device.
+            (args.evidence / "device-release.json").write_text(
+                json.dumps(record["device_release"], indent=2) + "\n")
+            print("Owned workers retired; retaining leases until device memory is idle", flush=True)
+            record["device_release"] = record_device_release(selected)
+        (args.evidence / "device-release.json").write_text(
+            json.dumps(record["device_release"], indent=2) + "\n")
         record["finished_at"] = datetime.now(timezone.utc).isoformat()
         (args.evidence / "process.json").write_text(json.dumps(record, indent=2) + "\n")
         print((args.evidence / "run.log").read_text()[-14000:])
@@ -541,6 +729,8 @@ def main():
     finally:
         for stream in locks:
             stream.close()
+        if auto_scratch is not None:
+            shutil.rmtree(auto_scratch)
 
 
 if __name__ == "__main__":

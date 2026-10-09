@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Fuse the checkpoint group-32 E4M3FN activation round trip. MME stays BF16.
+#ifdef DSV41_FIXED_FP8_QUANT
+void main(tensor input, tensor output, float reciprocal_fixed) {
+#else
 void main(tensor input, tensor output) {
+#endif
     const int5 begin = get_index_space_offset();
     const int5 end = begin + get_index_space_size();
     for (int row = begin[1]; row < end[1]; ++row) {
@@ -40,7 +44,20 @@ void main(tensor input, tensor output) {
             float128 wide = {0};
             wide.v1 = result;
             const bfloat128 converted = convert_float128_to_bfloat128(wide, SW_RHNE | SW_LINEAR);
+#ifdef DSV41_FIXED_FP8_QUANT
+            // Preserve the original BF16 round-trip boundary, then encode
+            // the fixed-bias operand without a second read or row amax.
+            const bfloat128 scaled_fixed = converted * (bfloat128)reciprocal_fixed;
+            minifloat256 encoded = v_convert_bf16_to_f8_b(
+                scaled_fixed, 0, SW_RHNE | SW_CLIP_FP, (minifloat256)0);
+            const minifloat256 sparse = encoded;
+            encoded = v_f8_pack_b(sparse, SW_GROUP_0 | SW_STRIDE_2, (minifloat256)0);
+            encoded = v_f8_pack_b(sparse, SW_GROUP_1 | SW_STRIDE_2, encoded);
+            encoded = v_f8_mov_dual_group_pack_b(encoded, SW_PACK21, (minifloat256)0);
+            v_f8_st_tnsr_partial(at, output, encoded, 31, 0);
+#else
             v_bf16_st_tnsr_partial(at, output, converted, 31, 0);
+#endif
         }
     }
 }

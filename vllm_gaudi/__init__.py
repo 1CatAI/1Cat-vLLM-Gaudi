@@ -173,3 +173,6 @@ def register_tool_parsers():
     processes (general plugin), matching how vLLM loads tool parsers.
     """
     import vllm_gaudi.entrypoints.openai.tool_parsers  # noqa: F401
+    from vllm_gaudi.entrypoints.openai.deepseek_v41_streaming import install
+
+    install()

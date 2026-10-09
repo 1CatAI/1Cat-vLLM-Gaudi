@@ -5,6 +5,9 @@
 #pragma clang fp contract(off)
 #define FLASHINFER_NORM_USE_LOOKUP_RSQRT
 #include "../../flashinfer_gaudi/kernels/norm_math_gaudi2.h"
+#ifndef DSV41_CONTROL_BATCH_REUSE
+#define DSV41_CONTROL_BATCH_REUSE 0
+#endif
 
 // v_convert_bf16_to_f32_all_b exposes the source as even/odd lanes.  Rebuild
 // two linear float64 vectors so both the projection and norm visit K in the
@@ -46,6 +49,37 @@ void main(tensor activation, tensor weight, tensor output,
           float epsilon, float inverse_width) {
     const int5 begin = get_index_space_offset();
     const int5 end = begin + get_index_space_size();
+#if DSV41_CONTROL_BATCH_REUSE
+    const int tokens=get_dim_size(activation,1);
+    for(int row=begin[0];row<end[0];++row) {
+        float64 accumulator[6]={{0}};
+        float64_pair_t squares={0};
+        for(int k=0;k<20480;k+=128) {
+            const float64 first=v_f32_ld_tnsr_b((int5){k,row},weight);
+            const float64 second=v_f32_ld_tnsr_b((int5){k+64,row},weight);
+            #pragma loop_unroll(6)
+            for(int token=0;token<6;++token) {
+                if(token<tokens) {
+                    const float128 x=convert_bfloat128_to_float128(
+                        v_bf16_ld_tnsr_b((int5){k,token},activation),SW_LINEAR);
+                    accumulator[token]=v_f32_mac_b(x.v1,first,accumulator[token]);
+                    accumulator[token]=v_f32_mac_b(x.v2,second,accumulator[token]);
+                    if(row==token) {
+                        squares.v1+=x.v1*x.v1;squares.v2+=x.v2*x.v2;
+                    }
+                }
+            }
+        }
+        #pragma loop_unroll(6)
+        for(int token=0;token<6;++token)
+            if(token<tokens)v_f32_st_tnsr_partial((int5){row,token},output,
+                v_f32_reduce_add(accumulator[token]),0,0);
+        if(row<tokens) {
+            const float64 mean=v_f32_reduce_add(squares.v1+squares.v2)*inverse_width;
+            v_f32_st_tnsr_partial((int5){24,row},output,positive_rsqrt(mean+epsilon),0,0);
+        }
+    }
+#else
     for (int token = begin[1]; token < end[1]; ++token) {
         for (int row = begin[0]; row < end[0]; ++row) {
             float64 accumulator = 0.0f;
@@ -90,4 +124,5 @@ void main(tensor activation, tensor weight, tensor output,
             }
         }
     }
+#endif
 }

@@ -128,7 +128,7 @@ def _private_add(node):
     )
 
 
-def independent_mhc_nodes(module, dependent_inputs):
+def independent_mhc_nodes(module, dependent_inputs, *, control_mme=False):
     """Return a closed, pure mHC branch that cannot read a peer result."""
     nodes = list(module.graph.nodes)
     placeholders = [node for node in nodes if node.op == "placeholder"]
@@ -203,7 +203,7 @@ def crosses_mutable_storage(module, selected):
     return False
 
 
-def split_mhc_consumers(module, exchange):
+def split_mhc_consumers(module, exchange, *, control_mme=False):
     graph = module.graph
     exchanges = exchange if isinstance(exchange, tuple) else (exchange,)
 
@@ -222,7 +222,7 @@ def split_mhc_consumers(module, exchange):
         dependent = [index for index, value in enumerate(call.args) if peer_value(value)]
         if not dependent:
             continue
-        selected = independent_mhc_nodes(child, dependent)
+        selected = independent_mhc_nodes(child, dependent, control_mme=control_mme)
         if not selected:
             continue
         private_adds = [node for node in selected if _private_add(node)]
@@ -234,7 +234,7 @@ def split_mhc_consumers(module, exchange):
             continue
         casts_removed = deduplicate_float_casts(child, selected)
         if casts_removed:
-            selected = independent_mhc_nodes(child, dependent)
+            selected = independent_mhc_nodes(child, dependent, control_mme=control_mme)
         wrapper = split_module(child, child, lambda node, selected=selected: 0 if node in selected else 1)
         env = dict(zip((n for n in wrapper.graph.nodes if n.op == "placeholder"), call.args, strict=True))
         with graph.inserting_before(call):
@@ -284,6 +284,7 @@ def split_mhc_consumers(module, exchange):
         audit.append(
             {
                 "partition": call.target,
+                "independent_partition": f"{call.target}_mhc_submod_0",
                 "independent_nodes": len(selected),
                 "casts_removed": casts_removed,
                 "private_adds_restored": len(private_adds),
@@ -307,7 +308,7 @@ def require_candidate_operators(graph, required):
 
 
 def make_backend(*, static_int32=False, static_factories=False, static_clamps=False, split_mhc=True, required_operators=(),
-                 compiler_config=None):
+                 compiler_config=None, control_mme=False, merge_producer=False, mark_tensor_ready=False):
     from habana_frameworks.torch.dynamo.compile_backend import passes
     from habana_frameworks.torch.dynamo.compile_backend.backends import hpu_backend
     from vllm_gaudi.extension.logger import logger
@@ -334,6 +335,21 @@ def make_backend(*, static_int32=False, static_factories=False, static_clamps=Fa
         import os
         from pathlib import Path
 
+        if mark_tensor_ready:
+            control_rows = []
+            for child in ctx.graph_module.modules():
+                if not isinstance(child, torch.fx.GraphModule):
+                    continue
+                for node in child.graph.nodes:
+                    if 'deepseek_v41_control_mme_f32' not in str(node.target) or not node.args:
+                        continue
+                    value = getattr(node.args[0], 'meta', {}).get('val')
+                    if isinstance(value, torch.Tensor) and value.dim() == 2:
+                        control_rows.append(value.shape[0])
+            # The private signal experiment must not change C1/prefill or
+            # draft captures selected by the same stage owner.
+            if not control_rows or not all(2 <= rows <= 6 for rows in control_rows):
+                return False
         directory = os.environ.get("VLLM_HPU_TP2_PLAN_DUMP_DIR")
         if directory:
             root = Path(directory) / f"rank{os.environ.get('LOCAL_RANK', '0')}"
@@ -351,7 +367,18 @@ def make_backend(*, static_int32=False, static_factories=False, static_clamps=Fa
                 torch.ops.vllm_gaudi.tp_peer_allgather.default,
                 torch.ops.vllm_gaudi.tp_peer_allgather_scheduled.default,
             ),
+            control_mme=control_mme,
         ) if split_mhc else []
+        if merge_producer:
+            from vllm_gaudi.compilation.deepseek_v41_mhc_producer import merge_mhc_producers
+
+            merged = merge_mhc_producers(ctx.graph_module, audit, (
+                torch.ops.vllm_gaudi.tp2_exchange_peer.default,
+                torch.ops.vllm_gaudi.tp_peer_allgather.default,
+                torch.ops.vllm_gaudi.tp_peer_allgather_scheduled.default,
+            ), mark_tensor_ready=mark_tensor_ready)
+            ctx.graph_module._dsv41_mhc_producer_merges = merged
+            logger().info("V4.1 independent mHC branches joined to payload producers: %s", merged)
         from vllm_gaudi import envs
 
         tile_partitions = 0

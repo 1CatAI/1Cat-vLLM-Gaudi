@@ -215,6 +215,11 @@ int main() {
             assert(InstantiateTpcKernel(&p, &q) == GLUE_INSUFFICIENT_ELF_BUFFER);
             assert(q.indexSpaceGeometry[0] == 640 && q.indexSpaceGeometry[1] == tokens);
             assert(ia[0].sparseAccess && ia[1].sparseAccess && ia[4].sparseAccess);
+            std::strcpy(p.guid.name, "custom_deepseek_v41_logical_mla_vector_gaudi2");
+            q.kernel.elfSize = 0;
+            assert(InstantiateTpcKernel(&p, &q) == GLUE_INSUFFICIENT_ELF_BUFFER);
+            assert(q.indexSpaceGeometry[0] == 640 && q.indexSpaceGeometry[1] == tokens);
+            assert(ia[0].sparseAccess && ia[1].sparseAccess && ia[4].sparseAccess);
             inputs[4].geometry.maxSizes[0] = 0;
             assert(InstantiateTpcKernel(&p, &q) == GLUE_INCOMPATIBLE_INPUT_SIZE);
             inputs[4].geometry.maxSizes[0] = 8192;

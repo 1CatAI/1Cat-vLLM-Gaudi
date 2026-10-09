@@ -14,6 +14,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("prepared", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--draft", action="store_true", help="Qualify checkpoint MTP N128 top3 channels")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     manifest = {
@@ -23,8 +24,12 @@ def main():
         "source_manifest_sha256": file_hash(args.prepared / "manifest.json"),
         "rank_files": {}
     }
-    for pp in range(2):
-        for tp in range(2):
+    import json
+    topology = json.loads((args.prepared / "manifest.json").read_text())
+    manifest["role"] = "draft" if args.draft else "target"
+    prefix_scope = "mtp." if args.draft else "layers."
+    for pp in range(topology["pipeline_parallel_size"]):
+        for tp in range(topology["tensor_parallel_size"]):
             shard = PreparedV41Shard(args.prepared, pp, tp)
             rank = f"pp{pp}-tp{tp}"
             specs = {
@@ -32,7 +37,7 @@ def main():
                     "dtype": "BF16",
                     "shape": [spec["shape"][0], spec["shape"][1], 128]
                 }
-                for name, spec in shard.specs.items() if name.startswith("layers.") and name.endswith("_q16")
+                for name, spec in shard.specs.items() if name.startswith(prefix_scope) and name.endswith("_q16")
             }
             path = args.output / f"{rank}.safetensors"
             writer = RankWriter(path.with_suffix(".partial"), specs, {

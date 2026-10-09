@@ -24,16 +24,16 @@ tpc_lib_api::GlueCodeReturn DeepseekV41MhcWeightedStatsGaudi2::GetGcDefinitions(
   for(unsigned i=0;i<5;++i) {
    const bool scale=i==2 || i==4;const auto type=scale?DATA_F32:i==0?DATA_BF16:DATA_F8_143;
    if(!check(p->outputTensors[i],type,{scale?1UL:5120UL,tokens}))return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
-   if(scale)g->outputTensorAccessPattern[i].mapping[0]={0,0,0,0};
-   else g->outputTensorAccessPattern[i].mapping[0]={0,128,0,127};
-   g->outputTensorAccessPattern[i].mapping[1]={1,1,0,0};
+   if(scale)g->outputTensorAccessPattern[i].mapping[0]={0,0,0,0,false};
+   else g->outputTensorAccessPattern[i].mapping[0]={0,128,0,127,false};
+   g->outputTensorAccessPattern[i].mapping[1]={1,1,0,0,false};
   }
-  g->inputTensorAccessPattern[0].mapping[0]={0,128,0,127};
-  g->inputTensorAccessPattern[0].mapping[1]={1,1,0,0};
-  g->inputTensorAccessPattern[1].mapping[0]={0,128,0,127};
-  g->inputTensorAccessPattern[2].mapping[0]={0,0,0,39};
-  g->inputTensorAccessPattern[2].mapping[1]={0,0,0,1};
-  g->inputTensorAccessPattern[2].mapping[2]={1,1,0,0};
+  g->inputTensorAccessPattern[0].mapping[0]={0,128,0,127,false};
+  g->inputTensorAccessPattern[0].mapping[1]={1,1,0,0,false};
+  g->inputTensorAccessPattern[1].mapping[0]={0,128,0,127,false};
+  g->inputTensorAccessPattern[2].mapping[0]={0,0,0,39,false};
+  g->inputTensorAccessPattern[2].mapping[1]={0,0,0,1,false};
+  g->inputTensorAccessPattern[2].mapping[2]={1,1,0,0,false};
   if(!p->nodeParams.nodeParams || p->nodeParams.nodeParamsSize!=8)return GLUE_FAILED;
   const auto* params=static_cast<const float*>(p->nodeParams.nodeParams);
   if(!std::isnormal(params[0]) || params[0]<=0 || params[1]!=1.f/5120)return GLUE_FAILED;
@@ -46,23 +46,23 @@ tpc_lib_api::GlueCodeReturn DeepseekV41MhcWeightedStatsGaudi2::GetGcDefinitions(
      !check(p->outputTensors[0],DATA_BF16,{5120,4,tokens}) ||
      !check(p->outputTensors[1],DATA_BF16,{5120,tokens}) ||
      !check(p->outputTensors[2],DATA_F32,{40,2,tokens}))return GLUE_INCOMPATIBLE_INPUT_SIZE;
-  g->inputTensorAccessPattern[0].mapping[0]={0,128,0,127};
-  g->inputTensorAccessPattern[0].mapping[1]={1,1,0,0};
-  if(x.dims==3)g->inputTensorAccessPattern[0].mapping[2]={0,0,0,float(ranks-1)};
-  g->inputTensorAccessPattern[1].mapping[0]={0,128,0,127};
-  g->inputTensorAccessPattern[1].mapping[1]={0,0,0,3};
-  g->inputTensorAccessPattern[1].mapping[2]={1,1,0,0};
-  g->inputTensorAccessPattern[2].mapping[0]={0,0,0,23};
-  g->inputTensorAccessPattern[2].mapping[1]={1,1,0,0};
-  g->inputTensorAccessPattern[3].mapping[0]={0,128,0,127};
-  g->outputTensorAccessPattern[0].mapping[0]={0,128,0,127};
-  g->outputTensorAccessPattern[0].mapping[1]={0,0,0,3};
-  g->outputTensorAccessPattern[0].mapping[2]={1,1,0,0};
-  g->outputTensorAccessPattern[1].mapping[0]={0,128,0,127};
-  g->outputTensorAccessPattern[1].mapping[1]={1,1,0,0};
-  g->outputTensorAccessPattern[2].mapping[0]={0,1,0,0};
-  g->outputTensorAccessPattern[2].mapping[1]={0,0,0,1};
-  g->outputTensorAccessPattern[2].mapping[2]={1,1,0,0};g->kernel.paramsNr=0;
+  g->inputTensorAccessPattern[0].mapping[0]={0,128,0,127,false};
+  g->inputTensorAccessPattern[0].mapping[1]={1,1,0,0,false};
+  if(x.dims==3)g->inputTensorAccessPattern[0].mapping[2]={0,0,0,float(ranks-1),false};
+  g->inputTensorAccessPattern[1].mapping[0]={0,128,0,127,false};
+  g->inputTensorAccessPattern[1].mapping[1]={0,0,0,3,false};
+  g->inputTensorAccessPattern[1].mapping[2]={1,1,0,0,false};
+  g->inputTensorAccessPattern[2].mapping[0]={0,0,0,23,false};
+  g->inputTensorAccessPattern[2].mapping[1]={1,1,0,0,false};
+  g->inputTensorAccessPattern[3].mapping[0]={0,128,0,127,false};
+  g->outputTensorAccessPattern[0].mapping[0]={0,128,0,127,false};
+  g->outputTensorAccessPattern[0].mapping[1]={0,0,0,3,false};
+  g->outputTensorAccessPattern[0].mapping[2]={1,1,0,0,false};
+  g->outputTensorAccessPattern[1].mapping[0]={0,128,0,127,false};
+  g->outputTensorAccessPattern[1].mapping[1]={1,1,0,0,false};
+  g->outputTensorAccessPattern[2].mapping[0]={0,1,0,0,false};
+  g->outputTensorAccessPattern[2].mapping[1]={0,0,0,1,false};
+  g->outputTensorAccessPattern[2].mapping[2]={1,1,0,0,false};g->kernel.paramsNr=0;
  }
  g->indexSpaceRank=2;g->indexSpaceGeometry[0]=40;g->indexSpaceGeometry[1]=tokens;
  auto* first=finish_?&_binary___deepseek_v41_norm_from_weighted_stats_gaudi2_o_start:&_binary___deepseek_v41_mhc_post_weighted_stats_gaudi2_o_start;

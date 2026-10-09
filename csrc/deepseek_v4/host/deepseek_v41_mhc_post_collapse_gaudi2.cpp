@@ -27,10 +27,10 @@ tpc_lib_api::GlueCodeReturn DeepseekV41MhcPostCollapseGaudi2::GetGcDefinitions(
         auto& ap = input ? out->inputTensorAccessPattern[i] : out->outputTensorAccessPattern[i-5];
         for (unsigned d = 0; d < dims[i]; ++d) {
             if (g.maxSizes[d] != sizes[i][d]) return input ? GLUE_INCOMPATIBLE_INPUT_SIZE : GLUE_INCOMPATIBLE_OUTPUT_SIZE;
-            if (i == 0 && d == 2) ap.mapping[d] = {0,0,0,float(ranks-1)};
-            else if ((i == 0 && d == 1) || (i != 0 && d == dims[i]-1)) ap.mapping[d] = {1,1,0,0};
-            else if (d == 0 && type == DATA_BF16) ap.mapping[d] = {0,128,0,127};
-            else ap.mapping[d] = {0,0,0,float(g.maxSizes[d]-1)};
+            if (i == 0 && d == 2) ap.mapping[d] = {0,0,0,float(ranks-1),false};
+            else if ((i == 0 && d == 1) || (i != 0 && d == dims[i]-1)) ap.mapping[d] = {1,1,0,0,false};
+            else if (d == 0 && type == DATA_BF16) ap.mapping[d] = {0,128,0,127,false};
+            else ap.mapping[d] = {0,0,0,float(g.maxSizes[d]-1),false};
         }
     }
     out->indexSpaceRank = 2;

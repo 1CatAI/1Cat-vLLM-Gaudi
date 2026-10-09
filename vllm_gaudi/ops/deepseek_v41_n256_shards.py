@@ -81,6 +81,12 @@ class N256PreparedShard:
             raise ValueError("Prepared N256 file hash mismatch")
         self.identity = stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
         self.catalog = read_header(self.path)
+        self.active_k = {
+            name.removesuffix("_q16"): getattr(shard, "specs", {}).get(name, {}).get(
+                "original_shape", [source.shape[-1] // 64])[-1]
+            for name, source in self.catalog.items()
+            if name.endswith("_q16")
+        }
         specs = runtime_specs(shard, compact_scales=self.layout == COMPACT_LAYOUT)
         if set(specs) != set(self.catalog) or any(
             src.dtype != specs[name]["dtype"] or src.shape != tuple(specs[name]["shape"])
@@ -95,10 +101,13 @@ class N256PreparedShard:
             raise RuntimeError("Prepared N256 weights changed during loading")
 
     def projection(self, prefix, device):
+        import numpy as np
         import torch
+        from vllm_gaudi.ops.deepseek_v41_expert_n256 import saturated_decode_eligible
 
         result = []
         sat_eligible = True
+        active_k = self.active_k[prefix]
         self.check_identity()
         for suffix in ("_q16", "_s16", "_fp8_channel"):
             source = self.catalog[prefix + suffix]
@@ -114,11 +123,9 @@ class N256PreparedShard:
                     if stream.readinto(data) != len(data):
                         raise RuntimeError("Prepared N256 weight read was truncated")
                     value = torch.frombuffer(data, dtype=dtype).reshape(stop - first, *source.shape[1:])
-                    if suffix == "_q16" and prefix.endswith(".w2"):
-                        sat_eligible &= not value[:, :, self.logical_intermediate * 64:].count_nonzero().item()
-                    if suffix == "_s16":
-                        from vllm_gaudi.ops.deepseek_v41_expert_n256 import saturated_decode_eligible
-                        active_k = self.logical_intermediate if prefix.endswith(".w2") else None
+                    if suffix == "_q16":
+                        sat_eligible &= not np.any(value.numpy()[..., active_k * 64:])
+                    elif suffix == "_s16":
                         sat_eligible &= saturated_decode_eligible(value.numpy(), active_k=active_k)
                     destination[first:stop].copy_(value, non_blocking=False)
             result.append(destination)

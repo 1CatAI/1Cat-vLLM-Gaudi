@@ -16,7 +16,7 @@ WOA = torch.ops.custom_op.custom_deepseek_v41_woa_fp8_gaudi2
 
 @HPU
 @pytest.mark.parametrize("groups", [2, 4])
-@pytest.mark.parametrize("tokens", [1, 3, 32, 129, 512])
+@pytest.mark.parametrize("tokens", [1, 3, 6, 32, 129, 512])
 def test_quantization_group_layout_and_replay(tokens, groups):
     torch._dynamo.reset()
     torch.manual_seed(1041)
@@ -38,7 +38,7 @@ def test_quantization_group_layout_and_replay(tokens, groups):
 
 @HPU
 @pytest.mark.parametrize("groups", [2, 4])
-@pytest.mark.parametrize("tokens", [1, 3, 32, 512])
+@pytest.mark.parametrize("tokens", [1, 3, 6, 32, 512])
 def test_complete_projection_and_persistent_replay(tokens, groups):
     torch._dynamo.reset()
     torch.manual_seed(4141)

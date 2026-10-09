@@ -1,0 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+#define DeepseekV41MainReuseGatherGaudi2 DeepseekV41SwaOnlyReuseGatherGaudi2
+#define DSV41_MAIN_REUSE_OUTPUT_WIDTH 128
+#define _binary___deepseek_v41_main_reuse_gather_gaudi2_o_start _binary___deepseek_v41_main_batch_reuse_gather_gaudi2_o_start
+#define _binary___deepseek_v41_main_reuse_gather_gaudi2_o_end _binary___deepseek_v41_main_batch_reuse_gather_gaudi2_o_end
+#include "../deepseek_v4/host/deepseek_v41_main_reuse_gather_gaudi2.cpp"

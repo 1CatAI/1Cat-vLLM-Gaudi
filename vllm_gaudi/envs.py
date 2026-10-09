@@ -60,6 +60,162 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_BATCH_C1_NUMERICS: bool = False
     VLLM_HPU_DSV41_MHC_BATCH_REUSE: bool = False
     VLLM_HPU_DSV41_MHC_CONTROL_PREFETCH: bool = False
+    VLLM_HPU_DSV41_MHC_CONTROL_MME: bool = True
+    VLLM_HPU_DSV41_DSPARK_BF16_PROJECTIONS: bool = False
+    VLLM_HPU_DSV41_DSPARK_BOUNDED_SAMPLING: bool = False
+    VLLM_HPU_DSV41_DSPARK_RADIX_SAMPLING: bool = False
+    VLLM_HPU_DSV41_DSPARK_SHARDED_BOUNDED_SAMPLING: bool = False
+    VLLM_HPU_DSV41_DSPARK_INDEX_QUERY_LOCAL: bool = True
+    VLLM_HPU_DSV41_DSPARK_SAMPLING_WIDTH: int = 64
+    VLLM_HPU_DSV41_REQUEST_FIXTURE_DIR: str = ""
+    VLLM_HPU_DSV41_DSPARK_COHESIVE_MLA: bool = False
+    VLLM_HPU_DSV41_DSPARK_PARTITION_RADIX_SAMPLING: bool = False
+    VLLM_HPU_DSV41_DSPARK_NATIVE_FULL_REPAIR: bool = False
+    VLLM_HPU_DSV41_DSPARK_JOURNAL_COPY: bool = False
+    VLLM_HPU_DSV41_DSPARK_FUSED_BOUNDED_NUCLEUS: bool = False
+    VLLM_HPU_DSV41_DSPARK_LANE_CANDIDATES: bool = False
+    VLLM_HPU_DSV41_DSPARK_STREAM_FILTER_SAMPLING: bool = False
+    VLLM_HPU_DSV41_DSPARK_MERGED_MLA: bool = False
+    VLLM_HPU_DSV41_DSPARK_SWA_CACHE: bool = False
+    VLLM_HPU_DSV41_DSPARK_SPLIT_FEATURE_SILU: bool = False
+    VLLM_HPU_DSV41_DSPARK_UNPAIRED_FEATURE_SILU: bool = False
+    VLLM_HPU_DSV41_DSPARK_FEATURE_SILU: bool = False
+    VLLM_HPU_DSV41_DSPARK_W2_THREE_ROUTES: bool = False
+    VLLM_HPU_DSV41_DSPARK_COVERAGE_AUDIT: bool = False
+    VLLM_HPU_DSV41_DSPARK_CONSUMED_TARGET_CERTIFICATE: bool = False
+    VLLM_HPU_DSV41_DSPARK_NATIVE_FULL_MAIN: bool = False
+    VLLM_HPU_DSV41_DSPARK_LARGE_HCCL: bool = False
+    VLLM_HPU_DSV41_DSPARK_FULL_HCCL_MAIN: bool = False
+    VLLM_HPU_DSV41_DSPARK_NATIVE_DRAFT_BODY: bool = False
+    VLLM_HPU_DSV41_DSPARK_STOCHASTIC_ONLY: bool = False
+    VLLM_HPU_DSV41_DSPARK_AFFINE_ROUTE: bool = False
+    VLLM_HPU_DSV41_DSPARK_GLOBAL_BOUNDED_SAMPLING: bool = False
+    VLLM_HPU_DSV41_DSPARK_EXACT_DRAFT_SAMPLING: bool = False
+    VLLM_HPU_DSV41_DSPARK_HEAD_INPUT_BOUNDARY: bool = False
+    VLLM_HPU_DSV41_DSPARK_SILU_SCALAR_CACHE: bool = False
+    VLLM_HPU_DSV41_DSPARK_Q_BF16_ROPE: bool = False
+    VLLM_HPU_DSV41_DSPARK_QUERY_NORM: bool = False
+    VLLM_HPU_DSV41_DSPARK_FULL_ROW: bool = False
+    VLLM_HPU_DSV41_DSPARK_FP4_TABLE: bool = False
+    VLLM_HPU_DSV41_DSPARK_ROW_CACHE: bool = False
+    VLLM_HPU_DSV41_DSPARK_SHARED_FINALIZE: bool = False
+    VLLM_HPU_DSV41_DSPARK_WIDE_CODEC: bool = False
+    VLLM_HPU_DSV41_DSPARK_N512_DECODE: bool = False
+    VLLM_HPU_DSV41_DSPARK_BATCH_INPUT_STAGING: bool = False
+    VLLM_HPU_DSV41_DSPARK_MTP_CACHE: bool = False
+    VLLM_HPU_DSV41_DSPARK_MTP_SAT: bool = False
+    VLLM_HPU_DSV41_DSPARK_MTP_FP8: bool = False
+    VLLM_HPU_DSV41_DSPARK_MTP_FP8_SIDECAR: str = ""
+    VLLM_HPU_DSV41_DSPARK_WEIGHTED_STATIC_MASK: bool = False
+    VLLM_HPU_DSV41_DSPARK_WEIGHTED_SPARSE_BINS: bool = False
+    VLLM_HPU_DSV41_DSPARK_CONTROL_FP8: bool = False
+    VLLM_HPU_DSV41_DSPARK_CONTROL_FP8_PAIR: bool = False
+    VLLM_HPU_DSV41_DSPARK_MHC_POST_STATS: bool = False
+    VLLM_HPU_DSV41_DSPARK_MAIN_SINGLE_BANK: bool = False
+    VLLM_HPU_DSV41_DSPARK_COHERENT_SWA: bool = False
+    VLLM_HPU_DSV41_DSPARK_RECORD_READBACK: bool = False
+    VLLM_HPU_DSV41_DSPARK_VOCAB_SOFTMAX: bool = True
+    VLLM_HPU_DSV41_DSPARK_W2_CHANNELS: bool = False
+    VLLM_HPU_DSV41_DSPARK_FP8_QKV_PROLOGUE: bool = False
+    VLLM_HPU_DSV41_DSPARK_FP8_QKV_PROLOGUE_SPLIT: bool = False
+    VLLM_HPU_DSV41_DSPARK_DENSE_BITS12: bool = False
+    VLLM_HPU_DSV41_DSPARK_DENSE_BITS12_MAP: str = ""
+    VLLM_HPU_DSV41_DSPARK_W2_REDUCE_N256: bool = True
+    VLLM_HPU_DSV41_DSPARK_COOPERATIVE_SILU: bool = False
+    VLLM_HPU_DSV41_DSPARK_ROUTER_BATCHED_F32: bool = False
+    VLLM_HPU_DSV41_DSPARK_ROUTER_SHARED_BF16: bool = False
+    VLLM_HPU_DSV41_DSPARK_SHARED_SCALE: bool = False
+    VLLM_HPU_DSV41_DSPARK_PHASE_EVENTS: bool = False
+    VLLM_HPU_DSV41_DSPARK_VOCAB_HEAD_FP8: bool = False
+    VLLM_HPU_DSV41_DSPARK_DRAFT_PACKED_MLA: bool = False
+    VLLM_HPU_DSV41_DSPARK_DRAFT_KV_DECODE: bool = True
+    VLLM_HPU_DSV41_DSPARK_MTP_K128: bool = True
+    VLLM_HPU_DSV41_DSPARK_DRAFT_MHC: bool = False
+    VLLM_HPU_DSV41_DSPARK_DRAFT_SHARED_FP8: bool = False
+    VLLM_HPU_DSV41_DSPARK_DRAFT_QUERY_FP8: bool = False
+    VLLM_HPU_DSV41_DSPARK_DRAFT_DENSE_FP8: bool = False
+    VLLM_HPU_DSV41_DSPARK_ROUTER_READY_FP8: bool = False
+    VLLM_HPU_DSV41_DSPARK_DEEP_QUEUE: bool = False
+    VLLM_HPU_DSV41_DSPARK_ROUND_INPUT_PUBLICATION: bool = False
+    VLLM_HPU_DSV41_DSPARK_NATIVE_PAGE_COALESCE: bool = False
+    VLLM_HPU_DSV41_DSPARK_INPUT_QUANT_REMAT: bool = False
+    VLLM_HPU_DSV41_DSPARK_MOE_PEER_POST: bool = False
+    VLLM_HPU_DSV41_DSPARK_SCALED_W13: bool = False
+    VLLM_HPU_DSV41_DSPARK_EXPLICIT_STEPS: bool = False
+    VLLM_HPU_DSV41_DSPARK_INPUT_FP8: bool = False
+    VLLM_HPU_DSV41_DSPARK_MHC_HIGH_PLANE: bool = False
+    VLLM_HPU_DSV41_DSPARK_OUTPUT_LAYOUT: bool = False
+    VLLM_HPU_DSV41_DSPARK_OUTPUT_FP8: bool = False
+    VLLM_HPU_DSV41_DSPARK_MHC_DEFERRED: bool = False
+    VLLM_HPU_DSV41_DSPARK_NORM_ROUNDTRIP: bool = False
+    VLLM_HPU_DSV41_DSPARK_DRAFT_VOCAB_CDF: bool = False
+    VLLM_HPU_DSV41_DSPARK_ORDERED_PEER_SUM: bool = False
+    VLLM_HPU_DSV41_DSPARK_PEER_POST_COLLAPSE: bool = False
+    VLLM_HPU_DSV41_DSPARK_TP_PACKET_TARGET: bool = False
+    VLLM_HPU_DSV41_DSPARK_WEIGHTED_DRAFT_NUCLEUS: bool = False
+    VLLM_HPU_DSV41_DSPARK_DECODED_PUBLISH: bool = False
+    VLLM_HPU_DSV41_DSPARK_NUCLEUS_MASS: bool = False
+    VLLM_HPU_DSV41_DSPARK_JOURNAL_COORDINATES: bool = False
+    VLLM_HPU_DSV41_DSPARK_PV_ROPE: bool = False
+    VLLM_HPU_DSV41_DSPARK_MLA_COORD_CACHE: bool = False
+    VLLM_HPU_DSV41_DSPARK_SHARED_KV_MME: bool = False
+    VLLM_HPU_DSV41_DSPARK_LAYER_MAIN_SPLIT: bool = False
+    VLLM_HPU_DSV41_DSPARK_LAYER_MAIN_REUSE: bool = False
+    VLLM_HPU_DSV41_DSPARK_COMPACT_STREAM_MME: bool = False
+    VLLM_HPU_DSV41_DSPARK_COMPACT_KV_MME: bool = False
+    VLLM_HPU_DSV41_DSPARK_GROUP_PIPELINE: bool = False
+    VLLM_HPU_DSV41_DSPARK_SILU_AFFINE: bool = False
+    VLLM_HPU_DSV41_DSPARK_CANDIDATE_KEYS: bool = False
+    VLLM_HPU_DSV41_DSPARK_THRESHOLD_SELECTION: bool = False
+    VLLM_HPU_DSV41_DSPARK_SHARED_PREQUANT: bool = False
+    VLLM_HPU_DSV41_DSPARK_SHARED_FP8: bool = False
+    VLLM_HPU_DSV41_DSPARK_SCALE_CACHE: bool = False
+    VLLM_HPU_DSV41_DSPARK_Q_PROLOGUE: bool = False
+    VLLM_HPU_DSV41_DSPARK_MHC_MME_EPILOGUE: bool = False
+    VLLM_HPU_DSV41_DSPARK_UNPAIRED_W13: bool = False
+    VLLM_HPU_DSV41_DSPARK_STACKED_PV: bool = False
+    VLLM_HPU_DSV41_DSPARK_BATCH6_KV: bool = False
+    VLLM_HPU_DSV41_DSPARK_MERGE_CACHE: bool = False
+    VLLM_HPU_DSV41_DSPARK_MHC_WEIGHT_REUSE: bool = False
+    VLLM_HPU_DSV41_DSPARK_PAIR_PV: bool = False
+    VLLM_HPU_DSV41_DSPARK_K64_PARTITION: bool = False
+    VLLM_HPU_DSV41_DSPARK_TRANSPOSE_SAT: bool = False
+    VLLM_HPU_DSV41_DSPARK_ROUTER_BF16: bool = False
+    VLLM_HPU_DSV41_DSPARK_MAIN_MIRROR: bool = False
+    VLLM_HPU_DSV41_DSPARK_W13_UNROLL: bool = False
+    VLLM_HPU_DSV41_DSPARK_CHANNEL_SILU: bool = False
+    VLLM_HPU_DSV41_DSPARK_HASH_MLA: bool = False
+    VLLM_HPU_DSV41_DSPARK_MHC_OVERLAP: bool = False
+    VLLM_HPU_DSV41_DSPARK_MHC_PRODUCER: bool = False
+    VLLM_HPU_DSV41_DSPARK_TENSOR_READY_PEER: bool = False
+    VLLM_HPU_DSV41_DSPARK_NATIVE_TARGET_INPUT: bool = False
+    VLLM_HPU_DSV41_DSPARK_C1_DENSE_CHAIN: bool = False
+    VLLM_HPU_DSV41_DSPARK_HW_DENSE: bool = False
+    VLLM_HPU_DSV41_DSPARK_HW_DENSE_FUSED_QUANT: bool = False
+    VLLM_HPU_DSV41_DSPARK_ROUTER_SHARED: bool = False
+    VLLM_HPU_DSV41_DSPARK_ROUTER_SHARED_FUSED: bool = False
+    VLLM_HPU_DSV41_DSPARK_ROPE_COHERENT: bool = False
+    VLLM_HPU_DSV41_DSPARK_DENSE_KN: bool = False
+    VLLM_HPU_DSV41_DSPARK_INPUT_NORM: bool = False
+    VLLM_HPU_DSV41_DSPARK_RUNTIME_SELECTION: bool = False
+    VLLM_HPU_DSV41_DSPARK_QKV_PUBLISH: bool = False
+    VLLM_HPU_DSV41_DSPARK_KV_PUBLISH: bool = False
+    VLLM_HPU_DSV41_DSPARK_MAIN_ADJACENT_PV: bool = False
+    VLLM_HPU_DSV41_DSPARK_SWA_SOURCE_REUSE: bool = False
+    VLLM_HPU_DSV41_DSPARK_SILU_FULL_ROWS: bool = False
+    VLLM_HPU_DSV41_DSPARK_COMPRESSOR_SEQUENCE: bool = False
+    VLLM_HPU_DSV41_DSPARK_PAIR_SILU: bool = False
+    VLLM_HPU_DSV41_DSPARK_PHYSICAL_ROLE_SILU: bool = False
+    VLLM_HPU_DSV41_DSPARK_MHC_CONTROL_TILES: bool = False
+    VLLM_HPU_DSV41_DSPARK_EXP_PV: bool = False
+    VLLM_HPU_DSV41_DSPARK_WO_HANDOFF: bool = False
+    VLLM_HPU_DSV41_DSPARK_RESIDENT_CONSTANTS: bool = False
+    VLLM_HPU_DSV41_DSPARK_PHYSICAL_SILU: bool = False
+    VLLM_HPU_DSV41_DSPARK_SILU_UNROLL: bool = False
+    VLLM_HPU_DSV41_DSPARK_SCHEDULED_PEER: bool = False
+    VLLM_HPU_DSV41_DSPARK_PEER_POST_NORM: bool = False
+    VLLM_HPU_DSV41_DSPARK_NATIVE_SAMPLED_PROTOCOL: bool = False
+    VLLM_HPU_DSV41_WARMUP_FIXTURE_DIR: str | None = None
     VLLM_HPU_DSV41_BATCH_COMPRESSOR_PAIR: bool = False
     VLLM_HPU_DSV41_BATCH_COMPRESSOR_GATHER: bool = False
     VLLM_HPU_DSV41_BATCH_EXPERT_PREFETCH_W2: bool = False
@@ -114,7 +270,10 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_PREPARED_SHARDS: bool = False
     VLLM_HPU_DSV41_ENGRAM_HOST_TABLE: bool = False
     VLLM_HPU_DSV41_GRAPH_REPLAY: bool = False
+    VLLM_HPU_DSV41_DSPARK_RECIPE_CONSTANTS: bool = False
     VLLM_HPU_DSV41_DSPARK: bool = False
+    VLLM_HPU_DSV41_DEVICE_ROUNDS: bool = False
+    VLLM_HPU_DSV41_NATIVE_DRAFT_PROTOCOL: bool = False
     VLLM_HPU_DSV41_VISION: bool = False
     VLLM_HPU_DSV41_QUANT_ROUNDTRIP: bool = False
     VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT: bool = False
@@ -176,7 +335,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_ENGRAM_FP8_SIDECAR: str = ""
     VLLM_HPU_DSV41_EXPERT_K128: bool = False
     VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE: bool = False
-    VLLM_HPU_DSV41_ROUTER_TOP6: bool = False
+    VLLM_HPU_DSV41_ROUTER_TOP6: bool = True
     VLLM_HPU_DSV41_BF16_LM_HEAD: bool = False
     VLLM_HPU_DSV41_SHARED_GATE_UP: bool = False
     VLLM_HPU_DSV41_BF16_ROUTER_GATE: bool = False
@@ -531,6 +690,364 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.getenv("VLLM_HPU_DSV41_BATCH_MAIN_FUSIONS", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_BATCH_C1_NUMERICS":
     lambda: os.getenv("VLLM_HPU_DSV41_BATCH_C1_NUMERICS", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_WARMUP_FIXTURE_DIR":
+    lambda: os.getenv("VLLM_HPU_DSV41_WARMUP_FIXTURE_DIR"),
+    "VLLM_HPU_DSV41_DSPARK_BOUNDED_SAMPLING":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_BOUNDED_SAMPLING", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_RADIX_SAMPLING":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_RADIX_SAMPLING", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_SHARDED_BOUNDED_SAMPLING":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_SHARDED_BOUNDED_SAMPLING", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_SAMPLING_WIDTH":
+    lambda: int(os.getenv("VLLM_HPU_DSV41_DSPARK_SAMPLING_WIDTH", "64")),
+    "VLLM_HPU_DSV41_REQUEST_FIXTURE_DIR":
+    lambda: os.getenv("VLLM_HPU_DSV41_REQUEST_FIXTURE_DIR", ""),
+    "VLLM_HPU_DSV41_DSPARK_COHESIVE_MLA":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_COHESIVE_MLA", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_PARTITION_RADIX_SAMPLING":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_PARTITION_RADIX_SAMPLING", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_NATIVE_FULL_REPAIR":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_NATIVE_FULL_REPAIR", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_PROTOCOL_WRITEBACK": lambda: bool(
+        int(os.environ.get("VLLM_HPU_DSV41_DSPARK_PROTOCOL_WRITEBACK", "0"))),
+    "VLLM_HPU_DSV41_DSPARK_JOURNAL_BATCH_DIRECT": lambda: bool(
+        int(os.environ.get("VLLM_HPU_DSV41_DSPARK_JOURNAL_BATCH_DIRECT", "0"))),
+    "VLLM_HPU_DSV41_DSPARK_JOURNAL_BATCH": lambda: bool(
+        int(os.environ.get("VLLM_HPU_DSV41_DSPARK_JOURNAL_BATCH", "0"))),
+    "VLLM_HPU_DSV41_DSPARK_JOURNAL_COPY":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_JOURNAL_COPY", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_FUSED_BOUNDED_NUCLEUS":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_FUSED_BOUNDED_NUCLEUS", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_LANE_CANDIDATES":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_LANE_CANDIDATES", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_STREAM_FILTER_SAMPLING":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_STREAM_FILTER_SAMPLING", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_MERGED_MLA":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_MERGED_MLA", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_NATIVE_FULL_MAIN":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_NATIVE_FULL_MAIN", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_LARGE_HCCL":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_LARGE_HCCL", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_FULL_HCCL_MAIN":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_FULL_HCCL_MAIN", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_NATIVE_DRAFT_BODY":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_NATIVE_DRAFT_BODY", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_STOCHASTIC_ONLY":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_STOCHASTIC_ONLY", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_AFFINE_ROUTE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_AFFINE_ROUTE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_GLOBAL_BOUNDED_SAMPLING":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_GLOBAL_BOUNDED_SAMPLING", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_DECODED_PUBLISH":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_DECODED_PUBLISH", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_HEAD_INPUT_BOUNDARY":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_HEAD_INPUT_BOUNDARY", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_SILU_SCALAR_CACHE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_SILU_SCALAR_CACHE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_Q_BF16_ROPE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_Q_BF16_ROPE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_QUERY_NORM":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_QUERY_NORM", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_FULL_ROW":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_FULL_ROW", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_FP4_TABLE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_FP4_TABLE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_ROW_CACHE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_ROW_CACHE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_SHARED_FINALIZE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_SHARED_FINALIZE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_WIDE_CODEC":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_WIDE_CODEC", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_N512_DECODE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_N512_DECODE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_BATCH_INPUT_STAGING":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_BATCH_INPUT_STAGING", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_MTP_CACHE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_MTP_CACHE", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_MTP_SAT":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_MTP_SAT", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_MTP_FP8":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_MTP_FP8", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_MTP_FP8_SIDECAR":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_MTP_FP8_SIDECAR", ""),
+    "VLLM_HPU_DSV41_DSPARK_DRAFT_SHARED_FP8":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_DRAFT_SHARED_FP8", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_DRAFT_QUERY_FP8":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_DRAFT_QUERY_FP8", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_DRAFT_DENSE_FP8":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_DRAFT_DENSE_FP8", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_WEIGHTED_STATIC_MASK":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_WEIGHTED_STATIC_MASK", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_INDEX_QUERY_LOCAL":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_INDEX_QUERY_LOCAL",
+                      "1" if os.getenv("VLLM_HPU_DSV41_DSPARK", "0").lower() in ("1", "true") else "0"
+                      ).lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_WEIGHTED_SPARSE_BINS":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_WEIGHTED_SPARSE_BINS", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_CONTROL_FP8":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_CONTROL_FP8", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_CONTROL_FP8_PAIR":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_CONTROL_FP8_PAIR", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_MHC_POST_STATS": lambda: bool(
+        int(os.environ.get("VLLM_HPU_DSV41_DSPARK_MHC_POST_STATS", "0"))),
+    "VLLM_HPU_DSV41_DSPARK_MAIN_SINGLE_BANK": lambda: bool(
+        int(os.environ.get("VLLM_HPU_DSV41_DSPARK_MAIN_SINGLE_BANK", "0"))),
+    "VLLM_HPU_DSV41_DSPARK_COHERENT_SWA":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_COHERENT_SWA", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_RECORD_READBACK":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_RECORD_READBACK", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_VOCAB_SOFTMAX":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_VOCAB_SOFTMAX",
+                      "1" if os.getenv("VLLM_HPU_DSV41_DSPARK", "0").lower() in ("1", "true") else "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_PHASE_EVENTS":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_PHASE_EVENTS", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_VOCAB_HEAD_FP8":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_VOCAB_HEAD_FP8", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_DRAFT_PACKED_MLA":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_DRAFT_PACKED_MLA", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_DRAFT_KV_DECODE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_DRAFT_KV_DECODE", "1") == "1",
+    "VLLM_HPU_DSV41_DSPARK_MTP_K128":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_MTP_K128", "1") == "1",
+    "VLLM_HPU_DSV41_DSPARK_DRAFT_MHC":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_DRAFT_MHC", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_ROUTER_READY_PAIR": lambda: bool(int(
+        os.getenv("VLLM_HPU_DSV41_DSPARK_ROUTER_READY_PAIR", "0"))),
+    "VLLM_HPU_DSV41_DSPARK_ROUTER_READY_FP8":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_ROUTER_READY_FP8", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_DEEP_QUEUE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_DEEP_QUEUE", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_INPUT_QUANT_REMAT":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_INPUT_QUANT_REMAT", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_MOE_PEER_POST":
+    lambda: os.environ.get("VLLM_HPU_DSV41_DSPARK_MOE_PEER_POST", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_SCALED_W13":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_SCALED_W13", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_EXPLICIT_STEPS":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_EXPLICIT_STEPS", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_INPUT_FP8":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_INPUT_FP8", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_MHC_HIGH_PLANE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_MHC_HIGH_PLANE", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_OUTPUT_LAYOUT":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_OUTPUT_LAYOUT", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_OUTPUT_FP8":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_OUTPUT_FP8", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_MHC_DEFERRED":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_MHC_DEFERRED", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_RECIPE_CONSTANTS": lambda: bool(
+        int(os.environ.get("VLLM_HPU_DSV41_DSPARK_RECIPE_CONSTANTS", "0"))),
+    "VLLM_HPU_DSV41_DSPARK_MHC_GATE_PACKET": lambda: bool(
+        int(os.environ.get("VLLM_HPU_DSV41_DSPARK_MHC_GATE_PACKET", "0"))),
+    "VLLM_HPU_DSV41_DSPARK_STREAM_EXP": lambda: bool(
+        int(os.environ.get("VLLM_HPU_DSV41_DSPARK_STREAM_EXP", "0"))),
+    "VLLM_HPU_DSV41_DSPARK_QK_FLAT_DIRECT": lambda: bool(
+        int(os.environ.get("VLLM_HPU_DSV41_DSPARK_QK_FLAT_DIRECT", "0"))),
+    "VLLM_HPU_DSV41_DSPARK_QK_FLAT": lambda: bool(
+        int(os.environ.get("VLLM_HPU_DSV41_DSPARK_QK_FLAT", "0"))),
+    "VLLM_HPU_DSV41_DSPARK_EXPERT_CONSUMER_STITCH_PAIR": lambda: bool(
+        int(os.environ.get("VLLM_HPU_DSV41_DSPARK_EXPERT_CONSUMER_STITCH_PAIR", "0"))),
+    "VLLM_HPU_DSV41_DSPARK_EXPERT_CONSUMER_STITCH": lambda: bool(
+        int(os.environ.get("VLLM_HPU_DSV41_DSPARK_EXPERT_CONSUMER_STITCH", "0"))),
+    "VLLM_HPU_DSV41_DSPARK_W2_K_PIPELINE": lambda: bool(
+        int(os.environ.get("VLLM_HPU_DSV41_DSPARK_W2_K_PIPELINE", "0"))),
+    "VLLM_HPU_DSV41_DSPARK_W13_K_PIPELINE": lambda: bool(
+        int(os.environ.get("VLLM_HPU_DSV41_DSPARK_W13_K_PIPELINE", "0"))),
+    "VLLM_HPU_DSV41_DSPARK_PEER_POST_COLLAPSE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_PEER_POST_COLLAPSE", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_TP_PACKET_TARGET":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_TP_PACKET_TARGET", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_ORDERED_PEER_SUM":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_ORDERED_PEER_SUM", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_W2_CHANNELS":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_W2_CHANNELS", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_FP8_QKV_PROLOGUE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_FP8_QKV_PROLOGUE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_FP8_QKV_PROLOGUE_SPLIT":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_FP8_QKV_PROLOGUE_SPLIT", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_DENSE_BITS12":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_DENSE_BITS12", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_DENSE_BITS12_MAP":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_DENSE_BITS12_MAP", ""),
+    "VLLM_HPU_DSV41_DSPARK_W2_REDUCE_N256":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_W2_REDUCE_N256",
+                      "1" if os.getenv("VLLM_HPU_DSV41_DSPARK", "0").lower() in ("1", "true") else "0"
+                      ).lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_COOPERATIVE_SILU":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_COOPERATIVE_SILU", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_ROUTER_BATCHED_F32":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_ROUTER_BATCHED_F32", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_ROUTER_SHARED_BF16":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_ROUTER_SHARED_BF16", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_SHARED_SCALE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_SHARED_SCALE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_W2_READY_SCALE": lambda: bool(
+        int(os.environ.get("VLLM_HPU_DSV41_DSPARK_W2_READY_SCALE", "0"))),
+    "VLLM_HPU_DSV41_DSPARK_W13_K_PIPELINE_STAGES": lambda: int(
+        os.environ.get("VLLM_HPU_DSV41_DSPARK_W13_K_PIPELINE_STAGES", "2")),
+    "VLLM_HPU_DSV41_DSPARK_EXPERT_K_TILE": lambda: int(
+        os.environ.get("VLLM_HPU_DSV41_DSPARK_EXPERT_K_TILE", "128")),
+    "VLLM_HPU_DSV41_DSPARK_SPLIT_SCALE_PLANES": lambda: bool(
+        int(os.environ.get("VLLM_HPU_DSV41_DSPARK_SPLIT_SCALE_PLANES", "0"))),
+    "VLLM_HPU_DSV41_DSPARK_SILU_DECODE_AFFINE": lambda: bool(
+        int(os.environ.get("VLLM_HPU_DSV41_DSPARK_SILU_DECODE_AFFINE", "0"))),
+    "VLLM_HPU_DSV41_DSPARK_SILU_DECODE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_SILU_DECODE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_NORM_ROUNDTRIP":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_NORM_ROUNDTRIP", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_NATIVE_PAGE_COALESCE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_NATIVE_PAGE_COALESCE", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_ROUND_INPUT_PUBLICATION":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_ROUND_INPUT_PUBLICATION", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_DRAFT_VOCAB_CDF":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_DRAFT_VOCAB_CDF", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_WEIGHTED_DRAFT_NUCLEUS":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_WEIGHTED_DRAFT_NUCLEUS", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_EXACT_DRAFT_SAMPLING":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_EXACT_DRAFT_SAMPLING", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_NUCLEUS_MASS":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_NUCLEUS_MASS", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_JOURNAL_COORDINATES":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_JOURNAL_COORDINATES", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_PV_ROPE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_PV_ROPE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_SILU_AFFINE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_SILU_AFFINE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_CANDIDATE_KEYS":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_CANDIDATE_KEYS", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_THRESHOLD_SELECTION":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_THRESHOLD_SELECTION", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_SHARED_PREQUANT":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_SHARED_PREQUANT", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_SHARED_FP8":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_SHARED_FP8", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_SCALE_CACHE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_SCALE_CACHE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_MHC_PRODUCER":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_MHC_PRODUCER", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_TENSOR_READY_PEER":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_TENSOR_READY_PEER", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_MHC_OVERLAP":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_MHC_OVERLAP", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_NATIVE_TARGET_INPUT":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_NATIVE_TARGET_INPUT", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_C1_DENSE_CHAIN":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_C1_DENSE_CHAIN", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_HW_DENSE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_HW_DENSE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_HW_DENSE_FUSED_QUANT": lambda: (
+        os.getenv("VLLM_HPU_DSV41_DSPARK_HW_DENSE_FUSED_QUANT", "0") == "1"
+    ),
+    "VLLM_HPU_DSV41_DSPARK_ROUTER_SHARED":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_ROUTER_SHARED", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_ROUTER_SHARED_FUSED":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_ROUTER_SHARED_FUSED", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_ROPE_COHERENT":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_ROPE_COHERENT", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_DENSE_KN":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_DENSE_KN", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_INPUT_NORM":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_INPUT_NORM", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_Q_PROLOGUE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_Q_PROLOGUE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_MHC_MME_EPILOGUE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_MHC_MME_EPILOGUE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_UNPAIRED_W13":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_UNPAIRED_W13", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_STACKED_PV":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_STACKED_PV", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_BATCH6_KV":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_BATCH6_KV", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_MERGE_CACHE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_MERGE_CACHE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_MHC_WEIGHT_REUSE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_MHC_WEIGHT_REUSE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_PAIR_PV":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_PAIR_PV", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_K64_PARTITION":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_K64_PARTITION", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_TRANSPOSE_SAT":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_TRANSPOSE_SAT", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_ROUTER_BF16":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_ROUTER_BF16", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_MAIN_MIRROR":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_MAIN_MIRROR", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_W13_UNROLL":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_W13_UNROLL", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_CHANNEL_SILU":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_CHANNEL_SILU", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_GROUP_PIPELINE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_GROUP_PIPELINE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_LAYER_MAIN_SPLIT":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_LAYER_MAIN_SPLIT", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_LAYER_MAIN_REUSE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_LAYER_MAIN_REUSE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_COMPACT_STREAM_MME":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_COMPACT_STREAM_MME", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_COMPACT_KV_MME":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_COMPACT_KV_MME", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_SHARED_KV_MME":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_SHARED_KV_MME", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_MLA_COORD_CACHE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_MLA_COORD_CACHE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_HASH_MLA":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_HASH_MLA", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_QKV_PUBLISH":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_QKV_PUBLISH", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_KV_PUBLISH":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_KV_PUBLISH", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_MHC_CONTROL_TILES":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_MHC_CONTROL_TILES", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_EXP_PV":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_EXP_PV", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_WO_HANDOFF":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_WO_HANDOFF", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_RESIDENT_CONSTANTS":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_RESIDENT_CONSTANTS", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_RUNTIME_SELECTION":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_RUNTIME_SELECTION", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_MAIN_ADJACENT_PV":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_MAIN_ADJACENT_PV", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_BATCH_ENGRAM": lambda: os.environ.get(
+        "VLLM_HPU_DSV41_DSPARK_BATCH_ENGRAM", "0") == "1",
+    "VLLM_HPU_DSV41_DSPARK_SWA_SOURCE_REUSE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_SWA_SOURCE_REUSE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_SILU_FULL_ROWS":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_SILU_FULL_ROWS", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_COMPRESSOR_SEQUENCE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_COMPRESSOR_SEQUENCE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_PAIR_SILU":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_PAIR_SILU", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_PHYSICAL_ROLE_SILU":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_PHYSICAL_ROLE_SILU", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_PHYSICAL_SILU":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_PHYSICAL_SILU", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_SILU_UNROLL":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_SILU_UNROLL", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_SCHEDULED_PEER":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_SCHEDULED_PEER", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_PEER_POST_NORM":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_PEER_POST_NORM", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_CONSUMED_TARGET_CERTIFICATE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_CONSUMED_TARGET_CERTIFICATE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_COVERAGE_AUDIT":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_COVERAGE_AUDIT", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_W2_THREE_ROUTES":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_W2_THREE_ROUTES", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_SWA_CACHE":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_SWA_CACHE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_SPLIT_FEATURE_SILU":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_SPLIT_FEATURE_SILU", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_UNPAIRED_FEATURE_SILU":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_UNPAIRED_FEATURE_SILU", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_FEATURE_SILU":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_FEATURE_SILU", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_NATIVE_SAMPLED_PROTOCOL":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_NATIVE_SAMPLED_PROTOCOL", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DSPARK_BF16_PROJECTIONS":
+    lambda: os.getenv("VLLM_HPU_DSV41_DSPARK_BF16_PROJECTIONS", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_MHC_CONTROL_MME":
+    lambda: os.getenv("VLLM_HPU_DSV41_MHC_CONTROL_MME", "1").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_CONTROL_PREFETCH":
     lambda: os.getenv("VLLM_HPU_DSV41_MHC_CONTROL_PREFETCH", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_BATCH_REUSE":
@@ -648,6 +1165,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_GRAPH_REPLAY", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_DSPARK":
     lambda: os.environ.get("VLLM_HPU_DSV41_DSPARK", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_DEVICE_ROUNDS":
+    lambda: os.environ.get("VLLM_HPU_DSV41_DEVICE_ROUNDS", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_NATIVE_DRAFT_PROTOCOL":
+    lambda: os.environ.get("VLLM_HPU_DSV41_NATIVE_DRAFT_PROTOCOL", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_VISION":
     lambda: os.environ.get("VLLM_HPU_DSV41_VISION", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT":
@@ -755,7 +1276,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE":
     lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_COORD_PIPELINE", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_ROUTER_TOP6":
-    lambda: os.environ.get("VLLM_HPU_DSV41_ROUTER_TOP6", "0").lower() in ("1", "true"),
+    lambda: os.environ.get("VLLM_HPU_DSV41_ROUTER_TOP6", "1").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_BF16_LM_HEAD":
     lambda: os.environ.get("VLLM_HPU_DSV41_BF16_LM_HEAD", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_SHARED_GATE_UP":

@@ -23,7 +23,7 @@ def physical_nodes(graph):
              if not node.get('is_logical') and engine(node['engine']) in ('TPC', 'MME', 'DMA') }
 
 
-def restore(run, analysis, post_base, ranks=None, recipe_cache=None):
+def restore(run, analysis, post_base, ranks=None, recipe_cache=None, allow_partial=False):
     collection_path = analysis / 'collection.json'
     if collection_path.exists():
         collection = json.loads(collection_path.read_text())
@@ -36,6 +36,8 @@ def restore(run, analysis, post_base, ranks=None, recipe_cache=None):
         rank, pid = worker['rank'], worker['pid']
         if ranks is not None and rank not in ranks:
             continue
+        if recipe_cache is not None and not (recipe_cache / f'rank{rank}').is_dir():
+            raise ValueError(f'Use the fingerprinted cache containing rank{rank}: {recipe_cache}')
         directory = analysis / f'rank{rank}'
         proof = directory / 'cached-native-metadata-proof.json'
         if proof.exists():
@@ -54,11 +56,12 @@ def restore(run, analysis, post_base, ranks=None, recipe_cache=None):
                 needed[int(raw_id)].add(pair)
                 pending.append((index, int(raw_id), pair))
         root = (recipe_cache / f'rank{rank}' if recipe_cache is not None else
-                post_base / str(pid) / str(run / 'graphs' / f'rank{rank}').lstrip('/'))
+                post_base / str(pid) / str(run / 'graphs' / f'rank{rank}').lstrip('/') if post_base is not None else
+                run / 'graphs' / f'rank{rank}' / 'sdk-post-graphs')
         candidates = collections.defaultdict(list)
         pattern = '*.recipe_debug_files/graph.post.json' if recipe_cache is not None else 'graph_*_syn_*.post.json'
         cache_proofs = {}
-        for cold in root.glob(pattern):
+        for cold in root.rglob(pattern):
             if f'.{pid}.' in cold.name:
                 continue
             data = cold.read_bytes()
@@ -83,25 +86,48 @@ def restore(run, analysis, post_base, ranks=None, recipe_cache=None):
                         and (not observed_tpc or observed_tpc == compiled_tpc)):
                     candidates[raw_id].append((cold, graph, nodes))
         selected = {}
+        ambiguities = []
+        resolutions = {}
         for raw_id, observed in needed.items():
             matches = candidates[raw_id]
+            if allow_partial and not matches:
+                continue
+            if len(matches) > 1:
+                # Recipe IDs can wrap across cached warm shapes. A longer
+                # unrelated graph can contain the same context prefix. Prefer
+                # a unique *complete* observed TPC/MME context set; never pick
+                # an arbitrary strict superset based on its filename.
+                complete = [match for match in matches
+                            if observed == {pair for pair in match[2] if pair[0] in ('TPC', 'MME')}]
+                if len(complete) == 1:
+                    resolutions[raw_id] = dict(method='unique complete observed TPC/MME context set',
+                                               excluded_strict_superset_matches=len(matches)-1)
+                    matches = complete
+                elif allow_partial:
+                    ambiguities.append(dict(recipe_id=raw_id, observed=sorted(observed),
+                                            paths=[str(row[0]) for row in matches]))
+                    continue
             if len(matches) != 1:
                 raise ValueError(f'rank{rank} recipe{raw_id}: {len(matches)} cold matches for {sorted(observed)}')
             selected[raw_id] = matches[0]
+        (directory / 'cached-native-metadata-ambiguities.json').write_text(json.dumps(ambiguities, indent=2)+'\n')
         backup = directory / 'before-cached-metadata'
-        backup.mkdir(exist_ok=False)
+        backup.mkdir(exist_ok=True)
         for name in ('inventory.json', 'recipe-symbols.json', 'node-contracts.json', 'raw-graph-manifest.json'):
-            shutil.copy2(directory / name, backup / name)
+            if not (backup / name).exists():
+                shutil.copy2(directory / name, backup / name)
         recipes_doc = json.loads((directory / 'recipe-symbols.json').read_text())
         contracts = json.loads((directory / 'node-contracts.json').read_text())
         graphs = json.loads((directory / 'raw-graph-manifest.json').read_text())
         output = directory / 'cached-native-graphs'
-        output.mkdir(exist_ok=False)
+        output.mkdir(exist_ok=True)
         symbols = {}
         evidence = []
         for raw_id, (cold, graph, nodes) in selected.items():
             data = cold.read_bytes()
             destination = output / (f'recipe-{raw_id}.post.json' if recipe_cache is not None else cold.name)
+            if destination.exists() and destination.read_bytes() != data:
+                raise ValueError(f'Existing exact graph identity changed: {destination}')
             destination.write_bytes(data)
             record = dict(path=str(destination.resolve()), sha256=hashlib.sha256(data).hexdigest(),
                           format='Synapse cold post-graph JSON', original_path=str(cold), owned_pid=pid,
@@ -110,6 +136,8 @@ def restore(run, analysis, post_base, ranks=None, recipe_cache=None):
                                       'same-worker cold compiled graph; unique recipeID/engine/context match'))
             if recipe_cache is not None:
                 record['cached_binary'] = cache_proofs[str(cold)]
+            if raw_id in resolutions:
+                record['identity_resolution'] = resolutions[raw_id]
             graphs.append(record)
             identity = f"{raw_id}@{graph['name']}"
             tensors = {tensor['name']: tensor_contract(tensor) for tensor in graph['tensors']}
@@ -130,25 +158,34 @@ def restore(run, analysis, post_base, ranks=None, recipe_cache=None):
             recipes_doc['recipes'].append(dict(recipe_id=identity, raw_recipe_id=raw_id,
                                               path=record['path'], sha256=record['sha256'], nodes=recipe_nodes))
             evidence.append(dict(recipe_id=raw_id, identity=identity, observed=sorted(needed[raw_id]), graph=record))
+        restored_nodes = 0
         for index, raw_id, (kind, context) in pending:
+            if raw_id not in selected:
+                continue
+            restored_nodes += 1
             node = inventory['nodes'][index]
             symbol = symbols[(raw_id, kind, context)]
             graph = selected[raw_id][1]
             node['cached_original'] = dict(node)
             node.update(recipe=f"{raw_id}@{graph['name']}:", node=symbol['node'], kernel=symbol['kernel'],
                         raw_unique_node_id=str(symbol['unique_node_id']),
-                          metadata_provenance=record['provenance'])
+                          metadata_provenance=('cached binary debug table and graph; unique recipe/context match'
+                                               if recipe_cache is not None else
+                                               'same-worker cold compiled graph; unique recipeID/engine/context match'))
         inventory['kernel_counts_before_cached_metadata'] = inventory.pop('kernel_counts', [])
-        inventory['cached_native_metadata'] = dict(restored_nodes=len(pending), restored_recipes=len(selected),
-                                                   timestamps_unchanged=True, node_indices_unchanged=True)
+        inventory['cached_native_metadata'] = dict(restored_nodes=restored_nodes, restored_recipes=len(selected),
+                                                   timestamps_unchanged=True, node_indices_unchanged=True,
+                                                   unmatched_recipe_ids=sorted(set(needed)-set(selected)))
         path.write_text(json.dumps(inventory, indent=2) + '\n')
         (directory / 'recipe-symbols.json').write_text(json.dumps(recipes_doc, indent=2) + '\n')
         (directory / 'node-contracts.json').write_text(json.dumps(contracts, indent=2) + '\n')
         (directory / 'raw-graph-manifest.json').write_text(json.dumps(graphs, indent=2) + '\n')
-        row = dict(rank=rank, pid=pid, restored_nodes=len(pending), restored_recipes=len(selected), evidence=evidence)
+        row = dict(rank=rank, pid=pid, restored_nodes=restored_nodes, restored_recipes=len(selected), evidence=evidence,
+                   identity_resolutions=resolutions, unresolved_ambiguities=ambiguities,
+                   unmatched_recipe_ids=sorted(set(needed)-set(selected)))
         proof.write_text(json.dumps(row, indent=2) + '\n')
         report.append(row)
-        print(f'rank{rank}: restored {len(pending)} native nodes from {len(selected)} exact cold recipes', flush=True)
+        print(f'rank{rank}: restored {restored_nodes} native nodes from {len(selected)} exact cold recipes', flush=True)
     merged = {row['rank']: row for row in report}
     for proof in analysis.glob('rank*/cached-native-metadata-proof.json'):
         row = json.loads(proof.read_text())
@@ -163,7 +200,11 @@ if __name__ == '__main__':
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument('--post-base', type=Path)
     source.add_argument('--recipe-cache', type=Path, help='Exact archived per-rank recipe binaries and debug graphs')
+    source.add_argument('--same-run-post-graphs', action='store_true',
+                        help='Use the same launch\'s per-rank sdk-post-graphs, including nested SDK output paths')
     parser.add_argument('--rank', type=int, action='append')
+    parser.add_argument('--allow-partial', action='store_true',
+                        help='Keep unmatched recipes unresolved; retain exact identity proof for every join')
     args = parser.parse_args()
     restore(args.run.resolve(), args.analysis.resolve(), args.post_base.resolve() if args.post_base else None,
-            args.rank, args.recipe_cache.resolve() if args.recipe_cache else None)
+            args.rank, args.recipe_cache.resolve() if args.recipe_cache else None, args.allow_partial)

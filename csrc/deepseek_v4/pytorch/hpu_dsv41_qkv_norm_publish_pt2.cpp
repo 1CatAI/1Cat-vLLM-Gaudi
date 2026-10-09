@@ -7,9 +7,14 @@
 #include <initializer_list>
 #include "hpu_ops/op_backend.h"
 namespace {
-constexpr auto kSchema="custom_op::custom_deepseek_v41_qkv_projection_publish_gaudi2";
-constexpr auto kOrdered="custom_op::custom_deepseek_v41_qkv_projection_publish_ordered_gaudi2";
-constexpr auto kGuid="custom_deepseek_v41_qkv_norm_publish_gaudi2";
+#ifndef DSV41_QKV_PUBLISH_SCHEMA
+#define DSV41_QKV_PUBLISH_SCHEMA "custom_deepseek_v41_qkv_projection_publish_gaudi2"
+#define DSV41_QKV_PUBLISH_ORDERED "custom_deepseek_v41_qkv_projection_publish_ordered_gaudi2"
+#define DSV41_QKV_PUBLISH_GUID "custom_deepseek_v41_qkv_norm_publish_gaudi2"
+#endif
+constexpr auto kSchema="custom_op::" DSV41_QKV_PUBLISH_SCHEMA;
+constexpr auto kOrdered="custom_op::" DSV41_QKV_PUBLISH_ORDERED;
+constexpr auto kGuid=DSV41_QKV_PUBLISH_GUID;
 using Result=std::tuple<at::Tensor,at::Tensor,at::Tensor,at::Tensor>;
 struct Params { float epsilon; int offset; };
 habana::OutputMetaDataVector metadata(const at::Stack& s) {
@@ -22,12 +27,13 @@ habana::OutputMetaDataVector metadata(const at::Stack& s) {
         TORCH_CHECK(t.device()==q.device() && t.is_contiguous() && !t.requires_grad(),
                     "Q/KV publication requires contiguous inference operands on one device");
     }
-    TORCH_CHECK(q.scalar_type()==at::kBFloat16 && q.sizes()==at::IntArrayRef({1,1280}) &&
+    const auto rows=q.dim()==2?q.size(0):0;
+    TORCH_CHECK(rows>=1 && rows<=6 && q.scalar_type()==at::kBFloat16 && q.sizes()==at::IntArrayRef({rows,1280}) &&
                 qn.scalar_type()==at::kBFloat16 && qn.sizes()==at::IntArrayRef({1280}) &&
-                kv.scalar_type()==at::kBFloat16 && kv.sizes()==at::IntArrayRef({1,512}) &&
+                kv.scalar_type()==at::kBFloat16 && kv.sizes()==at::IntArrayRef({rows,512}) &&
                 kn.scalar_type()==at::kBFloat16 && kn.sizes()==at::IntArrayRef({512}),
-                "Q/KV publication requires C1 BF16 [1,1280]/[1,512] and matching norms");
-    TORCH_CHECK(pos.scalar_type()==at::kInt && pos.sizes()==at::IntArrayRef({1}) &&
+                "Q/KV publication requires C1-C6 BF16 rows and matching norms");
+    TORCH_CHECK(pos.scalar_type()==at::kInt && pos.sizes()==at::IntArrayRef({rows}) &&
                 phase.scalar_type()==at::kFloat && phase.dim()==2 && phase.size(1)==64 &&
                 phase.size(0)>0 && phase.size(0)<=1048576,"Q/KV publication requires I32 position and F32 rotary table");
     TORCH_CHECK(cache.scalar_type()==at::kByte && cache.dim()==2 && cache.size(0)>=256 && cache.size(1)==528 &&
@@ -41,21 +47,23 @@ habana::OutputMetaDataVector metadata(const at::Stack& s) {
                 (w.size(0)==8192 || w.size(0)==16384) && w.size(1)==1280 &&
                 scale.scalar_type()==at::kFloat && scale.sizes()==at::IntArrayRef({1,w.size(0)}),
                 "Q/KV publication requires prepared FP8 Q projection with TP-local channel scales");
-    return {{at::kBFloat16,{1,w.size(0)}},{at::kBFloat16,{1,512}},{at::kInt,{16}},{at::kBFloat16,{1,1280}}};
+    return {{at::kBFloat16,{rows,w.size(0)}},{at::kBFloat16,{rows,512}},
+            {at::kInt,rows==1?std::vector<int64_t>{16}:std::vector<int64_t>{rows,16}},
+            {at::kBFloat16,{rows,1280}}};
 }
 class Projection final:public habana::OpBackend {
  public:
     Projection(int device,c10::ScalarType dtype):OpBackend(device,NO_TPC+std::string("dsv41_qkv_projection_publish"),
           dtype,{0,1,2,3},{},{},false){SetOutputMetaFn(metadata);}
     void AddNode(synapse_helpers::graph& graph,const at::Stack& s) override {
-        const auto output=metadata(s);Params params{static_cast<float>(s.at(10).toDouble()),static_cast<int>(s.at(11).toInt())};
+        const auto output=metadata(s);const auto rows=output[0].shape[0];Params params{static_cast<float>(s.at(10).toDouble()),static_cast<int>(s.at(11).toInt())};
         auto prepared=BuildNode(this,graph,{kGuid,
             {syn_in(0),syn_in(1),syn_in(2),syn_in(3),syn_in(4),syn_in(5),syn_in(6),syn_in(7)},
-            {{{1,1280},at::ScalarType::Float8_e4m3fn},{{1,1},at::kFloat},
+            {{{rows,1280},at::ScalarType::Float8_e4m3fn},{{rows,1},at::kFloat},
              // These are public outputs even when their producer precedes
              // Q GEMM. Register the true result indices for cached/native
              // recipe replay; syn_out assignment alone loses storage mapping.
-             {{1,1280},at::kBFloat16,3},{{1,512},at::kBFloat16,1},{{16},at::kInt,2}},&params,sizeof(params)});
+             {output[3].shape,at::kBFloat16,3},{output[1].shape,at::kBFloat16,1},{output[2].shape,at::kInt,2}},&params,sizeof(params)});
         synGEMMParams gp{false,true};
         auto product=BuildNode(this,graph,{"gemm",{prepared[0].get(),syn_in(8)},
             {{output[0].shape,at::kFloat}},&gp,sizeof(gp)});
@@ -110,17 +118,17 @@ Result functionalize(const at::Tensor& q,const at::Tensor& qn,const at::Tensor& 
 }
 }
 TORCH_LIBRARY_FRAGMENT(custom_op,m) {
-    m.def("custom_deepseek_v41_qkv_projection_publish_gaudi2(Tensor q, Tensor qnorm, Tensor kv, Tensor kvnorm, Tensor positions, Tensor phase, Tensor(a!) cache, Tensor(b!) decoded, Tensor weight, Tensor scale, float epsilon, int offset) -> (Tensor, Tensor, Tensor, Tensor)");
-    m.def("custom_deepseek_v41_qkv_projection_publish_ordered_gaudi2(Tensor q, Tensor qnorm, Tensor kv, Tensor kvnorm, Tensor positions, Tensor phase, Tensor cache, Tensor decoded, Tensor weight, Tensor scale, float epsilon, int offset) -> (Tensor, Tensor, Tensor, Tensor)");
+    m.def(DSV41_QKV_PUBLISH_SCHEMA "(Tensor q, Tensor qnorm, Tensor kv, Tensor kvnorm, Tensor positions, Tensor phase, Tensor(a!) cache, Tensor(b!) decoded, Tensor weight, Tensor scale, float epsilon, int offset) -> (Tensor, Tensor, Tensor, Tensor)");
+    m.def(DSV41_QKV_PUBLISH_ORDERED "(Tensor q, Tensor qnorm, Tensor kv, Tensor kvnorm, Tensor positions, Tensor phase, Tensor cache, Tensor decoded, Tensor weight, Tensor scale, float epsilon, int offset) -> (Tensor, Tensor, Tensor, Tensor)");
 }
 TORCH_LIBRARY_IMPL(custom_op,HPU,m) {
-    m.impl("custom_deepseek_v41_qkv_projection_publish_gaudi2",execute<false>);
-    m.impl("custom_deepseek_v41_qkv_projection_publish_ordered_gaudi2",execute<false,true>);
+    m.impl(DSV41_QKV_PUBLISH_SCHEMA,execute<false>);
+    m.impl(DSV41_QKV_PUBLISH_ORDERED,execute<false,true>);
 }
 TORCH_LIBRARY_IMPL(custom_op,Meta,m) {
-    m.impl("custom_deepseek_v41_qkv_projection_publish_gaudi2",execute<true>);
-    m.impl("custom_deepseek_v41_qkv_projection_publish_ordered_gaudi2",execute<true,true>);
+    m.impl(DSV41_QKV_PUBLISH_SCHEMA,execute<true>);
+    m.impl(DSV41_QKV_PUBLISH_ORDERED,execute<true,true>);
 }
 TORCH_LIBRARY_IMPL(custom_op,Functionalize,m) {
-    m.impl("custom_deepseek_v41_qkv_projection_publish_gaudi2",functionalize);
+    m.impl(DSV41_QKV_PUBLISH_SCHEMA,functionalize);
 }

@@ -86,6 +86,22 @@ static inline bfloat128 decode_ue8m0(ushort128 code)
     return *((bfloat128*)&bits);
 }
 
+#ifdef DSV41_ENGRAM_BATCH
+// Derive each row's lookback from the fixed initial history. Work items do
+// not consume another work item's history store.
+static inline int compressed_token(tensor raw_token, tensor token_map, int index)
+{
+    const int raw = s_i32_ld_g(gen_addr((int5){index, 0, 0, 0, 0}, raw_token));
+    if (raw == 129264 || raw == 129265) return -1;
+    return s_i32_ld_g(gen_addr((int5){raw, 0, 0, 0, 0}, token_map));
+}
+static inline int lookback(tensor raw_token, tensor token_map, tensor history, int index, int slot)
+{
+    if (index > slot) return compressed_token(raw_token, token_map, index - slot - 1);
+    return s_i32_ld_g(gen_addr((int5){slot - index, 0, 0, 0, 0}, history));
+}
+#endif
+
 void main(
     tensor raw_token,
     tensor history,
@@ -96,9 +112,17 @@ void main(
     tensor decoded_rows,
     tensor next_history)
 {
+#ifdef DSV41_ENGRAM_BATCH
+    const int5 offset = get_index_space_offset();
+    const int5 end = offset + get_index_space_size();
+    for (int token_index = offset[1]; token_index < end[1]; ++token_index) {
+    for (int local_head = offset[0]; local_head < end[0]; ++local_head) {
+#else
+    const int token_index = 0;
     const int local_head = get_index_space_offset()[0];
+#endif
     const int raw = s_i32_ld_g(
-        gen_addr((int5){0, 0, 0, 0, 0}, raw_token));
+        gen_addr((int5){token_index, 0, 0, 0, 0}, raw_token));
     int compressed = s_i32_ld_g(
         gen_addr((int5){raw, 0, 0, 0, 0}, token_map));
     if (raw == 129264 || raw == 129265) {
@@ -118,8 +142,12 @@ void main(
     for (int shift = 0; shift <= selected_shift; ++shift) {
         int value = blocked ? pad : compressed;
         if (shift > 0) {
+#ifdef DSV41_ENGRAM_BATCH
+            value = lookback(raw_token, token_map, history, token_index, shift - 1);
+#else
             value = s_i32_ld_g(
                 gen_addr((int5){shift - 1, 0, 0, 0, 0}, history));
+#endif
             blocked |= value < 0;
             value = blocked ? pad : value;
         }
@@ -174,12 +202,23 @@ void main(
         const bfloat128 value = v_bf16_mul_b(
             decode_e4m3fn(code), decode_ue8m0(scale_code));
         v_bf16_st_tnsr(
-            (int5){chunk * 128, local_head, 0, 0, 0},
+            (int5){chunk * 128, local_head, token_index, 0, 0},
             decoded_rows,
             value);
     }
 
     if (local_head == 0) {
+#ifdef DSV41_ENGRAM_BATCH
+        if (token_index == 0) {
+            for (int slot = 0; slot < 3; ++slot)
+                s_i32_st_g(gen_addr((int5){slot, 0, 0, 0, 0}, next_history),
+                           s_i32_ld_g(gen_addr((int5){slot, 0, 0, 0, 0}, history)));
+        }
+        s_i32_st_g(gen_addr((int5){0, token_index + 1, 0, 0, 0}, next_history), compressed);
+        for (int slot = 0; slot < 2; ++slot)
+            s_i32_st_g(gen_addr((int5){slot + 1, token_index + 1, 0, 0, 0}, next_history),
+                       lookback(raw_token, token_map, history, token_index, slot));
+#else
         s_i32_st_g(
             gen_addr((int5){0, 0, 0, 0, 0}, next_history), compressed);
         s_i32_st_g(
@@ -188,5 +227,10 @@ void main(
         s_i32_st_g(
             gen_addr((int5){2, 0, 0, 0, 0}, next_history),
             s_i32_ld_g(gen_addr((int5){1, 0, 0, 0, 0}, history)));
+    #endif
     }
+#ifdef DSV41_ENGRAM_BATCH
+    }
+    }
+#endif
 }

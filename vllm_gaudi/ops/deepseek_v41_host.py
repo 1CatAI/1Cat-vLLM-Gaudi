@@ -246,6 +246,7 @@ class _TransferSlot:
         self.dma_done, self.consumer_done = torch.hpu.Event(), torch.hpu.Event()
         self.inflight = False
         self.generation = 0
+        self.compute_upload = False
         self.weight_view = torch.from_numpy(self.gather.weights)
         self.scale_view = torch.from_numpy(self.gather.scales)
         self.decode_host, self.decode_device = self.host[:1], self.device[:1]
@@ -276,8 +277,28 @@ class _TransferSlot:
     def reuse(self):
         if self.inflight:
             self.consumer_done.synchronize()
-            self.dma_done.synchronize()
+            if not self.compute_upload:
+                self.dma_done.synchronize()
         self.inflight = False
+
+    def upload(self, count, stream=None):
+        """Keep a short input packet in its consumer's execution FIFO.
+
+        The pinned ring slot remains owned until consumer_done retires both
+        the copy and its downstream reader. A separate DMA event is needed
+        only when the caller selects a different transfer stream.
+        """
+        if not 1 <= count <= self.host.shape[0] or self.inflight:
+            raise RuntimeError("Invalid or occupied Engram upload slot")
+        self.compute_upload = stream is None
+        if stream is None:
+            self.device[:count].copy_(self.host[:count], non_blocking=True)
+        else:
+            with torch.hpu.stream(stream):
+                self.device[:count].copy_(self.host[:count], non_blocking=True)
+                self.dma_done.record(stream)
+            torch.hpu.current_stream().wait_event(self.dma_done)
+
 
 
 class _TransferBatch:
@@ -933,12 +954,9 @@ class EngramHost:
             )
         slot.gather.release(slot.generation)
         if batch_owner is None:
-            with torch.hpu.stream(self.stream):
-                if transfer_count > count:
-                    slot.host[count:transfer_count].zero_()
-                slot.device[:transfer_count].copy_(slot.host[:transfer_count], non_blocking=True)
-                slot.dma_done.record(self.stream)
-            torch.hpu.current_stream().wait_event(slot.dma_done)
+            if transfer_count > count:
+                slot.host[count:transfer_count].zero_()
+            slot.upload(transfer_count, self.stream)
             self.audit["dma_bytes"] += transfer_count * heads * (width + width // 32)
 
     def wait(self, ticket):

@@ -50,9 +50,9 @@ def bitwise_equal(left, right):
 
 
 def copy_sampling_frame(destinations, payload, history):
-    for destination, source in zip(destinations[:5], payload, strict=True):
+    for destination, source in zip(destinations[:-1], payload, strict=True):
         destination.copy_(source)
-    destinations[5].copy_(history)
+    destinations[-1].copy_(history)
     return destinations
 
 
@@ -79,9 +79,9 @@ class DeviceStep:
 class SamplingFrames:
     """Two fixed-address frames, alternated only after the prior certificate."""
 
-    def __init__(self, payload, history, *, compile_copy=True):
-        if len(payload) != 5:
-            raise ValueError("Device continuation requires token and next-position outputs")
+    def __init__(self, payload, history, *, compile_copy=True, expected_payload_size=5):
+        if len(payload) != expected_payload_size:
+            raise ValueError("Device continuation payload differs from its declared frame contract")
         self.frames = tuple(tuple(torch.empty_like(value) for value in (*payload, history)) for _ in range(2))
         self.copy = (torch.compile(copy_sampling_frame, backend="hpu_backend", fullgraph=True, dynamic=False)
                      if compile_copy else copy_sampling_frame)

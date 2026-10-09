@@ -555,7 +555,12 @@ def _tp_peer_allgather_fake(partial, tp_size):
 
 def _tp_peer_allgather_impl(partial, tp_size):
     bridge, backend, _ = _resolve_runtime()
-    if (partial.ndim != 2 or partial.shape[0] != 1 or not 0 < partial.numel() <= 32768
+    # Match the opt-in DSpark bridge's existing full-vocabulary C6 wire.
+    # Its expanded capacity is currently registered only for a four-rank
+    # group; ordinary peer exchange and C1 retain their original limit.
+    maximum = (387840 if tp_size == 4 and
+               os.environ.get("VLLM_HPU_DSV41_DSPARK_LARGE_HCCL") == "1" else 32768)
+    if (partial.ndim != 2 or partial.shape[0] != 1 or not 0 < partial.numel() <= maximum
             or partial.dtype != torch.bfloat16 or not partial.is_contiguous()
             or backend.size() != tp_size):
         raise RuntimeError("Peer exchange requires a bounded BF16 row and the bound TP group size")

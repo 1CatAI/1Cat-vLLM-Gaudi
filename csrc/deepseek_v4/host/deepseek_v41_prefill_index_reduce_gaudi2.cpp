@@ -37,10 +37,14 @@ tpc_lib_api::GlueCodeReturn DeepseekV41PrefillIndexReduceGaudi2::GetGcDefinition
             access.mapping[0] = {0, 0, 0, 31};
             access.mapping[1] = {1, 1, 0, 0};
         } else {
-            if (x.dims != 1 || x.maxSizes[0] != (i == 2 ? tokens : columns))
+            const bool query_rows = i == 3 && tokens <= 6 && x.dims == 2 && x.maxSizes[1] == tokens;
+            if ((x.dims != 1 && !query_rows) || x.maxSizes[0] != (i == 2 ? tokens : columns))
                 return GLUE_INCOMPATIBLE_INPUT_SIZE;
             if (i == 2) access.mapping[0] = {1, 1, 0, 0};
-            else access.mapping[0] = {0, 128, 0, 127};
+            else {
+                access.mapping[0] = {0, 128, 0, 127};
+                if (query_rows) access.mapping[1] = {1, 1, 0, 0};
+            }
         }
     }
     out->indexSpaceRank = 2;

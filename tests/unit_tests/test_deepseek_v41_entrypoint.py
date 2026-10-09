@@ -8,6 +8,8 @@ import pytest
 
 from vllm_gaudi.entrypoints.deepseek_v41 import (
     _C1_FASTPATH_DEFAULTS,
+    _DSPARK_FASTPATH_DEFAULTS,
+    _DSPARK_SINGLE_STAGE_DEFAULTS,
     _NUMERIC_FASTPATH_DEFAULTS,
     _PREFILL_MOE_DEFAULTS,
     _PIPELINE_ONLY_FASTPATHS,
@@ -17,6 +19,8 @@ from vllm_gaudi.entrypoints.deepseek_v41 import (
 )
 
 _PROFILE_KEYS = set().union(
+    _DSPARK_FASTPATH_DEFAULTS,
+    _DSPARK_SINGLE_STAGE_DEFAULTS,
     _PIPELINE_ONLY_FASTPATHS,
     _TP4_FASTPATH_DEFAULTS,
     _SINGLE_STAGE_NATIVE_DEFAULTS,
@@ -166,7 +170,7 @@ def test_tp_only_stage_inherits_c1_except_pipeline_transport(monkeypatch, tmp_pa
     for profile in (_C1_FASTPATH_DEFAULTS, _NUMERIC_FASTPATH_DEFAULTS, _PREFILL_MOE_DEFAULTS):
         for key, value in profile.items():
             monkeypatch.setenv(key, value)
-    monkeypatch.setenv("VLLM_HPU_DSV41_DSPARK", "1")
+    monkeypatch.setenv("VLLM_HPU_DSV41_DSPARK", "0")
     monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_GROUPED_FP8", "w13_single_bucket")
     for sidecar in ("wo_a_fp8", "attention_dense_fp8", "engram_fp8"):
         (tmp_path / "sidecars" / sidecar).mkdir(parents=True)
@@ -245,6 +249,56 @@ def test_c1_defaults_preserve_scheduler_prefill_tile_and_halo(monkeypatch, tmp_p
     monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_COMPUTE_TOKENS", "8192")
     prepare_default_fastpaths(tmp_path, tensor_parallel_size=tp, pipeline_parallel_size=pp)
     assert max(prefill_compute_buckets(capacity)) == 8192
+
+
+@pytest.mark.parametrize("tp,pp", ((2, 2), (4, 1)))
+def test_explicit_dspark_keeps_shared_speculative_profile(monkeypatch, tmp_path, tp, pp):
+    _clear_profile(monkeypatch)
+    monkeypatch.setenv("VLLM_HPU_DSV41_DSPARK", "1")
+    monkeypatch.setenv("VLLM_HPU_DSV41_DEVICE_VERIFY", "1")
+    prepare_default_fastpaths(tmp_path, tensor_parallel_size=tp, pipeline_parallel_size=pp)
+    assert os.environ["VLLM_HPU_DSV41_DSPARK"] == "1"
+    assert os.environ["VLLM_HPU_DSV41_DEVICE_VERIFY"] == "1"
+    assert os.environ["VLLM_HPU_DSV41_MHC_CONTROL_RRMS"] == ("1" if pp == 1 else "0")
+    assert os.environ["VLLM_HPU_DSV41_GRAPH_REPLAY"] == "1"
+    assert os.environ["VLLM_HPU_DSV41_EXPERT_N256_FP8"] == "1"
+    assert os.environ["VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH"] == "0"
+    assert os.environ["VLLM_HPU_DSV41_PREPARED_OUTPUT"] == "1"
+    assert os.environ["VLLM_HPU_DSV41_PRETRANSPOSE_ATTN"] == "0"
+    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "0"
+    from vllm_gaudi.ops.deepseek_v41_prefill_regions import validate_prefill_region_config
+    validate_prefill_region_config()
+    assert (os.environ["VLLM_HPU_DSV41_BATCHED_INPUT_STAGING"] != "1"
+            or os.environ["VLLM_HPU_DSV41_FUSED_STAGE_IO"] == "1")
+    if pp == 1:
+        assert all(os.environ[key] == "0" for key in _PIPELINE_ONLY_FASTPATHS)
+
+
+@pytest.mark.parametrize("tp,pp", ((2, 2), (4, 1)))
+def test_dspark_explicit_precision_uses_common_sidecar_discovery(monkeypatch, tmp_path, tp, pp):
+    _clear_profile(monkeypatch)
+    monkeypatch.setenv("VLLM_HPU_DSV41_DSPARK", "1")
+    for name, option in (("wo_a_fp8", "WO_A_FP8"), ("attention_dense_fp8", "ATTN_DENSE_FP8"),
+                         ("engram_fp8", "ENGRAM_FP8")):
+        monkeypatch.setenv(f"VLLM_HPU_DSV41_{option}", "1")
+        (tmp_path / "sidecars" / name).mkdir(parents=True)
+    precision = tmp_path / "sidecars" / "attention_dense_fp8" / "precision.json"
+    precision.write_text(json.dumps({"version": 1, "wq_b": [20], "wo_b": [20]}))
+
+    prepare_default_fastpaths(tmp_path, tensor_parallel_size=tp, pipeline_parallel_size=pp)
+
+    for name, option in (("wo_a_fp8", "WO_A_FP8"), ("attention_dense_fp8", "ATTN_DENSE_FP8"),
+                         ("engram_fp8", "ENGRAM_FP8")):
+        assert os.environ[f"VLLM_HPU_DSV41_{option}_SIDECAR"] == str((tmp_path / "sidecars" / name).resolve())
+    assert os.environ["VLLM_HPU_DSV41_ATTN_DENSE_FP8_CONFIG"] == str(precision)
+
+
+def test_dspark_enabled_precision_rejects_missing_artifacts(monkeypatch, tmp_path):
+    _clear_profile(monkeypatch)
+    monkeypatch.setenv("VLLM_HPU_DSV41_DSPARK", "1")
+    monkeypatch.setenv("VLLM_HPU_DSV41_ATTN_DENSE_FP8", "1")
+    with pytest.raises(RuntimeError, match="require the attention_dense_fp8 sidecar"):
+        prepare_default_fastpaths(tmp_path)
 
 
 def test_tp4_rejects_generic_moe_instead_of_silent_fallback(monkeypatch, tmp_path):

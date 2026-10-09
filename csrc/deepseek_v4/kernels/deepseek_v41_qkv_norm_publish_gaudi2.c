@@ -11,12 +11,14 @@ void main(tensor q,tensor qnorm,tensor kv,tensor kvnorm,tensor positions,tensor 
           tensor rotated,tensor completion,float epsilon,int offset) {
     const int5 begin=get_index_space_offset();
     const int5 end=begin+get_index_space_size();
+    for(int row=begin[1];row<(end[1] ? end[1] : 1);++row) {
     for(int point=begin[0];point<end[0];++point) {
         if(point==0) {
-            qnorm_quant_row(q,qnorm,quantized,scales,normalized,epsilon,1.0f/1280.0f,(int5){0},(int5){1});
+            qnorm_quant_row(q,qnorm,quantized,scales,normalized,epsilon,1.0f/1280.0f,(int5){row},(int5){row+1});
         } else {
             kv_norm_publish_groups(kv,kvnorm,positions,phase,cache,decoded,rotated,completion,
-                                   epsilon,1.0f/512.0f,offset,(int5){point-1},(int5){point});
+                                   epsilon,1.0f/512.0f,offset,(int5){point-1,row},(int5){point,row+1});
         }
+    }
     }
 }

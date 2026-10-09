@@ -1149,7 +1149,7 @@ struct DeviceEngramRecipe {
     return result;
   }
 
-  void compile(uint64_t vocab_size, uint64_t rows, uint64_t local_heads) {
+  void compile(uint64_t vocab_size, uint64_t rows, uint64_t local_heads, uint64_t tokens) {
     checkSynapse(synGraphCreate(&graph, synDeviceGaudi2),
                  "synGraphCreate(device Engram)");
     std::array<uint8_t, 1> compile_byte{};
@@ -1161,7 +1161,7 @@ struct DeviceEngramRecipe {
     void* compile_data = static_table ? nullptr : compile_byte.data();
     const uint64_t compile_bytes = static_table ? 0 : compile_byte.size();
     synTensor inputs[6] = {
-        tensor(DATA_TENSOR, "raw_token", {1, 1}, syn_type_int32),
+        tensor(DATA_TENSOR, "raw_token", {tokens, 1}, syn_type_int32),
         tensor(DATA_TENSOR, "history", {kDeviceEngramHistory, 1},
                syn_type_int32),
         tensor(DATA_TENSOR, "token_map", {vocab_size, 1}, syn_type_int32),
@@ -1173,13 +1173,14 @@ struct DeviceEngramRecipe {
                syn_type_uint8, compile_data, compile_bytes),
     };
     synTensor outputs[2] = {
-        tensor(DATA_TENSOR, "decoded_rows",
-               {kDeviceEngramWidth, local_heads}, syn_type_bf16),
-        tensor(DATA_TENSOR, "next_history", {kDeviceEngramHistory, 1},
+        tokens == 1 ? tensor(DATA_TENSOR, "decoded_rows",
+               {kDeviceEngramWidth, local_heads}, syn_type_bf16) :
+            tensor(DATA_TENSOR, "decoded_rows", {kDeviceEngramWidth, local_heads, tokens}, syn_type_bf16),
+        tensor(DATA_TENSOR, "next_history", {kDeviceEngramHistory, tokens == 1 ? 1 : tokens + 1},
                syn_type_int32),
     };
     checkSynapse(synNodeCreate(graph, inputs, outputs, 6, 2, nullptr, 0,
-                               kDeviceEngramGuid, "device_engram_layer1",
+                               tokens == 1 ? kDeviceEngramGuid : "custom_deepseek_v41_engram_batch_gaudi2", "device_engram_layer1",
                                nullptr, nullptr),
                  "synNodeCreate(device Engram)");
     checkSynapse(synGraphCompile(&handle, graph,
@@ -1242,8 +1243,9 @@ class DeviceEngramProducer
                        const std::string &scale_file, uint64_t scale_offset,
                        uint64_t scale_bytes, uint64_t rows,
                        at::Tensor token_map, at::Tensor parameters,
-                       bool shared_checkpoint, uint64_t local_heads = kDeviceEngramHeads)
-      : token_map_(std::move(token_map)), parameters_(std::move(parameters)), local_heads_(local_heads) {
+                       bool shared_checkpoint, uint64_t local_heads = kDeviceEngramHeads, uint64_t tokens = 1)
+      : token_map_(std::move(token_map)), parameters_(std::move(parameters)), local_heads_(local_heads), tokens_(tokens) {
+    TORCH_CHECK(tokens_ >= 1 && tokens_ <= 6, "Device Engram requires C1-C6");
     TORCH_CHECK(local_heads_ == 6 || local_heads_ == 12,
                 "Device Engram requires 6 or 12 local heads");
     auto *group = dynamic_cast<c10d::ProcessGroupEagerHCCL *>(backend.get());
@@ -1267,7 +1269,7 @@ class DeviceEngramProducer
         device.id(), weight_file, weight_offset, weight_bytes, shared_checkpoint);
     scales_ = std::make_unique<MappedCheckpointRange>(
         device.id(), scale_file, scale_offset, scale_bytes, shared_checkpoint);
-    recipe_.compile(token_map_.numel(), rows, local_heads_);
+    recipe_.compile(token_map_.numel(), rows, local_heads_, tokens_);
   }
 
   ~DeviceEngramProducer() {
@@ -1285,13 +1287,13 @@ class DeviceEngramProducer
       std::lock_guard<std::mutex> lock(mutex_);
       TORCH_CHECK(!closed_, "Device Engram producer is closed");
     }
-    validateI32(raw_token, "raw_token", 1, true);
+    validateI32(raw_token, "raw_token", tokens_, true);
     validateI32(history, "history", kDeviceEngramHistory, true);
-    validateI32(next_history, "next_history", kDeviceEngramHistory, true);
+    validateI32(next_history, "next_history", kDeviceEngramHistory * (tokens_ == 1 ? 1 : tokens_ + 1), true);
     TORCH_CHECK(decoded_rows.device().type() == at::kHPU &&
                     decoded_rows.scalar_type() == at::kBFloat16 &&
                     decoded_rows.numel() ==
-                        local_heads_ * kDeviceEngramWidth &&
+                        tokens_ * local_heads_ * kDeviceEngramWidth &&
                     decoded_rows.is_contiguous(),
                 "Device Engram decoded_rows must match the prepared local head count");
     TORCH_CHECK(raw_token.device() == history.device() &&
@@ -1403,6 +1405,7 @@ class DeviceEngramProducer
   at::Tensor token_map_;
   at::Tensor parameters_;
   uint64_t local_heads_;
+  uint64_t tokens_;
   std::unique_ptr<MappedCheckpointRange> weights_;
   std::unique_ptr<MappedCheckpointRange> scales_;
   DeviceEngramRecipe recipe_;
@@ -1751,6 +1754,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("record_native_completion", &tp2_native::recordNativeCompletion);
   module.def("copy_sampled_tokens_to_host", &tp2_native::copySampledTokensToHost);
   module.def("copy_integer_record_to_host", &tp2_native::copyIntegerRecordToHost);
+  module.def("copy_dspark_record_to_host", &tp2_native::copyDSparkRecordToHost);
+  module.attr("dspark_record_readback_version") = 1;
   module.def("copy_c1_pipeline_tensors",
       [](const c10::intrusive_ptr<c10d::Backend>& backend, std::vector<at::Tensor> sources,
          std::vector<at::Tensor> destinations) {
@@ -1760,19 +1765,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       });
   module.attr("device_engram_shared_mapping_version") = 1;
   module.attr("device_engram_tp4_version") = 3;
+  module.attr("device_engram_batch_version") = 1;
   py::class_<DeviceEngramProducer, std::shared_ptr<DeviceEngramProducer>>(
       module, "DeviceEngramProducer")
       .def(py::init<const c10::intrusive_ptr<c10d::Backend> &,
                     const std::string &, uint64_t, uint64_t,
                     const std::string &, uint64_t, uint64_t, uint64_t,
-                    at::Tensor, at::Tensor, bool, uint64_t>(),
+                    at::Tensor, at::Tensor, bool, uint64_t, uint64_t>(),
            py::arg("backend"), py::arg("weight_file"),
            py::arg("weight_offset"), py::arg("weight_bytes"),
            py::arg("scale_file"), py::arg("scale_offset"),
            py::arg("scale_bytes"), py::arg("rows"),
            py::arg("token_map"), py::arg("parameters"),
            py::arg("shared_checkpoint") = false,
-           py::arg("local_heads") = kDeviceEngramHeads)
+           py::arg("local_heads") = kDeviceEngramHeads, py::arg("tokens") = 1)
       .def("launch", &DeviceEngramProducer::launch)
       .def("mapped_bytes", &DeviceEngramProducer::mappedBytes)
       .def("workspace_bytes", &DeviceEngramProducer::workspaceBytes)

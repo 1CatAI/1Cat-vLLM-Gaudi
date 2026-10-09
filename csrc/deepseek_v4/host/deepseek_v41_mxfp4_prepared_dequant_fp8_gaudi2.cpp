@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "deepseek_v41_mxfp4_prepared_dequant_fp8_gaudi2.hpp"
+#ifndef DSV41_N128_DRAFT_ROWS
+#define DSV41_N128_DRAFT_ROWS 0
+#endif
+#ifndef DSV41_N128_DECODE_FP8_GUID
+#define DSV41_N128_DECODE_FP8_GUID "custom_deepseek_v41_mxfp4_prepared_dequant_fp8_gaudi2"
+#endif
 
 #include <cstring>
 
@@ -27,7 +33,7 @@ tpc_lib_api::GlueCodeReturn
 DeepseekV41Mxfp4PreparedDequantFP8Gaudi2::GetKernelName(
     char name[tpc_lib_api::MAX_NODE_NAME]) {
     std::strcpy(
-        name, "custom_deepseek_v41_mxfp4_prepared_dequant_fp8_gaudi2");
+        name, DSV41_N128_DECODE_FP8_GUID);
     return tpc_lib_api::GLUE_SUCCESS;
 }
 
@@ -66,7 +72,8 @@ DeepseekV41Mxfp4PreparedDequantFP8Gaudi2::GetGcDefinitions(
     auto& s16 = in->inputTensors[2].geometry;
     auto& channel = in->inputTensors[3].geometry;
     auto& lookup = in->inputTensors[4].geometry;
-    if (ids.dims != 2 || ids.maxSizes[0] != 6 || ids.maxSizes[1] != 1 ||
+    const uint64_t slots=DSV41_N128_DRAFT_ROWS?ids.maxSizes[0]:6;
+    if (slots<3 || slots>18 || slots%3 || ids.dims != 2 || ids.maxSizes[0] != slots || ids.maxSizes[1] != 1 ||
         q16.dims != 3 || s16.dims != 3 || channel.dims != 3 ||
         q16.maxSizes[0] == 0 || q16.maxSizes[0] % 4096 ||
         q16.maxSizes[1] == 0 || q16.maxSizes[1] > 40 ||
@@ -86,26 +93,26 @@ DeepseekV41Mxfp4PreparedDequantFP8Gaudi2::GetGcDefinitions(
     auto& weights = in->outputTensors[0].geometry;
     auto& selected_scale = in->outputTensors[1].geometry;
     if (weights.dims != 3 || weights.maxSizes[0] != n ||
-        weights.maxSizes[1] != k || weights.maxSizes[2] != 6) {
+        weights.maxSizes[1] != k || weights.maxSizes[2] != slots) {
         weights.dims = 3;
         weights.maxSizes[0] = n;
         weights.maxSizes[1] = k;
-        weights.maxSizes[2] = 6;
+        weights.maxSizes[2] = slots;
         return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
     }
     if (selected_scale.dims != 3 || selected_scale.maxSizes[0] != n ||
         selected_scale.maxSizes[1] != 1 ||
-        selected_scale.maxSizes[2] != 6) {
+        selected_scale.maxSizes[2] != slots) {
         selected_scale.dims = 3;
         selected_scale.maxSizes[0] = n;
         selected_scale.maxSizes[1] = 1;
-        selected_scale.maxSizes[2] = 6;
+        selected_scale.maxSizes[2] = slots;
         return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
     }
 
     out->indexSpaceRank = 2;
     out->indexSpaceGeometry[0] = q16.maxSizes[1];
-    out->indexSpaceGeometry[1] = 6;
+    out->indexSpaceGeometry[1] = slots;
     map_dimension(out->inputTensorAccessPattern[0], 0, 1, 1, 0, 0);
     map_dimension(out->inputTensorAccessPattern[0], 1, 0, 0, 0, 0);
     map_dimension(

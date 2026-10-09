@@ -3,6 +3,52 @@
 
 import torch
 
+
+def threshold_decode_selection(score_tiles, rows, positions, ratio, *, collect_blocks=False):
+    """Reuse the common ordered selection kernel after existing causal scoring.
+
+    Scores retain the checkpoint BF16 boundary. Source offsets are mapped
+    back to logical IDs after selection, including Reindex candidate pools.
+    No scoring, TP communication, or per-query visibility is changed.
+    """
+    from vllm_gaudi.ops.deepseek_v41_indexer import ordered_index_ids
+
+    scores = torch.cat(score_tiles, -1).contiguous()
+    tokens, columns = scores.shape
+    if (not 1 <= tokens <= 6 or columns < 512 or columns > 32768 or columns % 64
+            or rows.shape[-1] != columns or rows.ndim not in (1, 2)
+            or (rows.ndim == 2 and rows.shape[0] != tokens) or positions.shape != (tokens,)):
+        raise ValueError("Invalid causal decode threshold selection geometry")
+    # Visibility has already been applied by the unchanged score producer.
+    # The native selector here selects offsets in that fixed score tensor.
+    extent = torch.full_like(positions, columns - 1)
+    unused = torch.empty((tokens, 2048), dtype=torch.int32, device=scores.device)
+    if rows.ndim == 1:
+        # Full's source is the unchanged arange(0, columns). The common C1
+        # emitter already returns these logical IDs; an i64 gather is redundant.
+        indices = ordered_index_ids(scores, extent, unused, 1)
+    else:
+        # Reindex source rows are blocks*8 + arange(8). Reuse C1's native
+        # logical-ID mapping in its emitter, preserving the supplied block
+        # order and all causal score masks, rather than gather offsets later.
+        candidates = torch.where(rows[:, ::8] >= 0, rows[:, ::8] // 8, -1).int().contiguous()
+        candidates = torch.nn.functional.pad(candidates, (0, 2048 - candidates.shape[-1]), value=-1)
+        indices = ordered_index_ids(scores, extent, candidates, 1, reindex=True)
+    block_scores = block_ids = None
+    if collect_blocks:
+        grouped = scores.reshape(tokens, -1, 8).amax(-1)
+        block_ids = torch.arange(columns // 8, dtype=torch.int32, device=positions.device)
+        newest = (((positions + 1) // ratio - 1) // 8).unsqueeze(-1)
+        grouped = grouped.masked_fill(block_ids == newest, torch.inf).contiguous()
+        if grouped.shape[-1] > 2048:
+            block_ids = ordered_index_ids(grouped, extent, unused, 1, blocks=True)
+            block_scores = grouped.gather(1, block_ids.clamp_min(0).long())
+            block_scores = torch.where(block_ids >= 0, block_scores, -torch.inf)
+        else:
+            block_scores = grouped
+            block_ids = block_ids.expand(tokens, -1)
+    return indices, block_scores, block_ids
+
 def can_batch_full_r1(owner, query, rows, prefix_scores, native_scores, active_columns):
     return (getattr(owner, "decode_batched_selection", False) and owner.tensor_parallel_size == 4
             and not native_scores and owner.ratio == 1 and owner.layer == owner.candidate_source

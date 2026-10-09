@@ -1,0 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+#define DSV41_N128_DRAFT_ROWS 1
+#define DSV41_N128_DECODE_FP8_GUID "custom_deepseek_v41_mtp_dequant_fp8_gaudi2"
+#define DeepseekV41Mxfp4PreparedDequantFP8Gaudi2 DeepseekV41MtpDequantFP8Gaudi2
+#define _binary___deepseek_v41_mxfp4_prepared_dequant_fp8_gaudi2_o_start _binary___deepseek_v41_mtp_dequant_fp8_gaudi2_o_start
+#define _binary___deepseek_v41_mxfp4_prepared_dequant_fp8_gaudi2_o_end _binary___deepseek_v41_mtp_dequant_fp8_gaudi2_o_end
+#include "../deepseek_v4/host/deepseek_v41_mxfp4_prepared_dequant_fp8_gaudi2.cpp"

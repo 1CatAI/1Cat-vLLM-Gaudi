@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
+#if defined(DSV41_MAIN_REUSE_VECTOR128) || defined(DSV41_MAIN_FP16_VALUES) || defined(DSV41_MAIN_SWA_CACHED) || defined(DSV41_MAIN_REUSE_KEYS_ONLY)
+#include "deepseek_v41_c6_main_reuse_gather.h"
+#else
+// SPDX-License-Identifier: Apache-2.0
 // Decode selected SWA/CSA2 rows once, preserving selection order and duplicates.
 #ifdef DSV41_REUSE_VECTOR
 #include "deepseek_v41_selected_kv_codecs.h"
@@ -137,3 +141,5 @@ void main(tensor swa, tensor shared_rows, tensor shared_mask, tensor positions,
         }
     }
 }
+
+#endif

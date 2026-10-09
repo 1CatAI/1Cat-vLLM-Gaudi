@@ -1,0 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+#define DeepseekV41MainPublishGatherGaudi2 DeepseekV41BatchedMainPublishGatherGaudi2
+#define _binary___deepseek_v41_main_publish_gather_gaudi2_o_start _binary___deepseek_v41_main_batch_publish_gather_gaudi2_o_start
+#define _binary___deepseek_v41_main_publish_gather_gaudi2_o_end _binary___deepseek_v41_main_batch_publish_gather_gaudi2_o_end
+#include "../deepseek_v4/host/deepseek_v41_main_publish_gather_gaudi2.cpp"

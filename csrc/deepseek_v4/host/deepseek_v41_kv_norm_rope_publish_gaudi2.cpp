@@ -25,7 +25,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41KVNormRopePublishGaudi2::GetGcDefinitions
         pos.dataType != DATA_I32 || phase.dataType != DATA_F32 ||
         y.dataType != DATA_BF16)
         return GLUE_INCOMPATIBLE_DATA_TYPE;
-    if (x.dims != 2 || x.maxSizes[0] != 512 || rows != 1 ||
+    if (x.dims != 2 || x.maxSizes[0] != 512 || (rows < 1 || rows > 6) ||
         w.dims != 1 || w.maxSizes[0] != 512 ||
         pos.dims != 1 || pos.maxSizes[0] != rows ||
         phase.dims != 2 || phase.maxSizes[0] != 64 ||
@@ -45,14 +45,16 @@ tpc_lib_api::GlueCodeReturn DeepseekV41KVNormRopePublishGaudi2::GetGcDefinitions
         return GLUE_INCOMPATIBLE_DATA_TYPE;
     if (cache.dims != 2 || cache.maxSizes[0] != 528 || cache.maxSizes[1] < 256 ||
         decoded.dims != 2 || decoded.maxSizes[0] != 512 || decoded.maxSizes[1] < 512 ||
-        completion.dims != 1 || completion.maxSizes[0] != 16 ||
+        completion.maxSizes[0] != 16 ||
+        (rows == 1 ? completion.dims != 1 : completion.dims != 2 || completion.maxSizes[1] != rows) ||
         (offset != -1 && (offset < 0 || offset % 512 || static_cast<uint64_t>(offset) + 512 > decoded.maxSizes[1])))
         return GLUE_INCOMPATIBLE_INPUT_SIZE;
-    out->indexSpaceRank = 1;
+    out->indexSpaceRank = 2;
     out->indexSpaceGeometry[0] = 16;
+    out->indexSpaceGeometry[1] = rows;
     out->inputTensorAccessPattern[0].allRequired = true;
-    out->outputTensorAccessPattern[0].mapping[0] = {0, 32, 0, 31};
-    out->outputTensorAccessPattern[0].mapping[1] = {0, 0, 0, 0};
+    out->outputTensorAccessPattern[0].mapping[0] = {0, 32, 0, 31, false};
+    out->outputTensorAccessPattern[0].mapping[1] = {1, 1, 0, 0, false};
     out->inputTensorAccessPattern[1].allRequired = true;
     out->inputTensorAccessPattern[2].allRequired = true;
     // Runtime positions select phase rows, so retain the complete bounded
@@ -60,7 +62,8 @@ tpc_lib_api::GlueCodeReturn DeepseekV41KVNormRopePublishGaudi2::GetGcDefinitions
     out->inputTensorAccessPattern[3].allRequired = true;
     out->inputTensorAccessPattern[4].allRequired = true;
     out->inputTensorAccessPattern[5].allRequired = true;
-    out->outputTensorAccessPattern[1].mapping[0] = {0, 1, 0, 0};
+    out->outputTensorAccessPattern[1].mapping[0] = {0, 1, 0, 0, false};
+    if (rows > 1) out->outputTensorAccessPattern[1].mapping[1] = {1, 1, 0, 0, false};
     out->kernel.paramsNr = 3;
     std::memcpy(out->kernel.scalarParams, scalar, 2 * sizeof(float) + sizeof(int));
     auto* begin = &_binary___deepseek_v41_kv_norm_rope_publish_gaudi2_o_start;

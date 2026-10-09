@@ -28,7 +28,14 @@ def row_mean_square(value, *, request_batch=False):
     return value.square().mean(-1, keepdim=True)
 
 
-def rms_norm(x, weight, eps=1e-20, *, request_batch=False):
+def rms_norm(x, weight, eps=1e-20, *, request_batch=False, native_decode=False):
+    if (native_decode and not request_batch and x.device.type == "hpu"
+            and x.dtype == torch.bfloat16 and x.ndim == 2 and 1 <= x.shape[0] <= 6
+            and x.shape[1] == 5120
+            and hasattr(torch.ops.custom_op, "custom_deepseek_v41_attention_norm_bf16_gaudi2")):
+        operation = getattr(torch.ops.custom_op, "custom_deepseek_v41_input_norm_bf16_gaudi2",
+                            torch.ops.custom_op.custom_deepseek_v41_attention_norm_bf16_gaudi2)
+        return operation(x.contiguous(), weight, eps)
     value = x.float()
     return (value * torch.rsqrt(row_mean_square(value, request_batch=request_batch) + eps) * weight.float()).to(x.dtype)
 
@@ -183,7 +190,8 @@ def quantize_activation(value):
         # rows rather than treating independent heads as extra requests.
         operation = (
             torch.ops.custom_op.custom_deepseek_v41_quant_roundtrip_wide_bf16_gaudi2
-            if gaudi_envs.VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT and shape[0] >= 16
+            if (gaudi_envs.VLLM_HPU_DSV41_PREFILL_VECTOR_QUANT and shape[0] >= 16
+                or gaudi_envs.VLLM_HPU_DSV41_DSPARK_WIDE_CODEC and 2 <= shape[0] <= 6)
             else torch.ops.custom_op.custom_deepseek_v41_quant_roundtrip_bf16_gaudi2
         )
         result = operation(value.reshape(-1, shape[-1]).contiguous())
@@ -297,6 +305,9 @@ def apply_rope(value, positions, table, inverse=False):
             if inverse
             else torch.ops.custom_op.custom_deepseek_v41_rope_bf16_gaudi2
         )
+        if gaudi_envs.VLLM_HPU_DSV41_DSPARK_ROPE_COHERENT and 2 <= value.shape[0] <= 6:
+            op = (torch.ops.custom_op.custom_deepseek_v41_rope_inverse_coherent_bf16_gaudi2 if inverse else
+                  torch.ops.custom_op.custom_deepseek_v41_rope_coherent_bf16_gaudi2)
         shaped = value.reshape(value.shape[0], -1, value.shape[-1]).contiguous()
         return op(shaped, positions.to(torch.int32).contiguous(), table.reshape(-1, 64)).reshape(value.shape)
     return _apply_rope_torch(value, positions, table, inverse)
@@ -324,6 +335,11 @@ def _prefill_hc_collapse(residual, previous_pre):
     )
 
 
+def mhc_control_scope(*, decode, tokens):
+    """Keep speculative prompt controls on their established arithmetic path."""
+    return not gaudi_envs.VLLM_HPU_DSV41_DSPARK or (decode and 1 <= tokens <= 6)
+
+
 @prefill_span("mhc_pre")
 def hc_pre(
     residual,
@@ -337,11 +353,17 @@ def hc_pre(
     packed_fn=None,
     *,
     prefill=False,
+    decode=False,
     logical_tokens=None,
     request_batch=False,
     batch_control_reuse=False,
     batch_control_prefetch=False,
     collapsed_input=None,
+    control_mme_weight=None,
+    control_fp8_weight=None,
+    control_epilogue=False,
+    defer_gates=False,
+    return_gates=False,
 ):
     """vLLM mhc_pre_delayed_torch's previous-sublayer mixing contract."""
     copies = residual.shape[1]
@@ -349,8 +371,47 @@ def hc_pre(
     gate_tokens = residual.shape[0] if logical_tokens is None else logical_tokens
     if not isinstance(gate_tokens, int) or gate_tokens < residual.shape[0]:
         raise ValueError("mHC logical token count must cover the owned rows")
-    if (
+    control_reuse = (
+        (gaudi_envs.VLLM_HPU_DSV41_DSPARK_MHC_WEIGHT_REUSE
+         or gaudi_envs.VLLM_HPU_DSV41_DSPARK_MHC_CONTROL_TILES) and gaudi_envs.VLLM_HPU_DSV41_DSPARK
+        and decode and not request_batch and 2 <= gate_tokens <= 6
+        and gate_tokens == residual.shape[0] and flat_bf16.dtype == torch.bfloat16
+        and flat_bf16.device.type == "hpu" and packed_fn is not None
+        and flat_bf16.shape[1] == 20480 and packed_fn.shape == (24, 20480)
+    )
+    mme_epilogue = (
+        (gaudi_envs.VLLM_HPU_DSV41_DSPARK_MHC_MME_EPILOGUE or control_epilogue)
+        and gaudi_envs.VLLM_HPU_DSV41_DSPARK and not request_batch
+        and not control_reuse and control_mme_weight is not None and decode and 2 <= gate_tokens <= 6
+        and gate_tokens == residual.shape[0] and copies == 4 and flat_bf16.shape[1] == 20480
+        and eps == 1e-20 and hc_eps == 1e-6 and iterations == 20
+        and hasattr(torch.ops.custom_op, "custom_deepseek_v41_mhc_mme_epilogue_gaudi2")
+    )
+    if defer_gates and (control_mme_weight is None or mme_epilogue or control_reuse):
+        raise ValueError("Deferred mHC requires the prepared MME controller and its original RRMS")
+    if control_reuse:
+        operator = (torch.ops.custom_op.custom_deepseek_v41_mhc_control_tiles_gaudi2
+                    if gaudi_envs.VLLM_HPU_DSV41_DSPARK_MHC_CONTROL_TILES
+                    else torch.ops.custom_op.custom_deepseek_v41_mhc_control_reuse_gaudi2)
+        control = operator(
+            flat_bf16.contiguous(), packed_fn.contiguous(), eps)
+        projection, rrms = control[:, :24], control[:, 24:]
+    elif control_fp8_weight is not None and decode and 2 <= gate_tokens <= 6:
+        control_op = (torch.ops.custom_op.custom_deepseek_v41_control_fp8_pair_gaudi2
+                      if control_fp8_weight[0].shape[0] == 48 else
+                      torch.ops.custom_op.custom_deepseek_v41_control_fp8_rrms_gaudi2)
+        projection, rrms = control_op(
+            flat_bf16.contiguous(), *control_fp8_weight, eps)
+    elif control_mme_weight is not None and decode and 2 <= gate_tokens <= 6:
+        projection = torch.ops.custom_op.custom_deepseek_v41_control_mme_f32_gaudi2(
+            flat_bf16.contiguous(), control_mme_weight)
+        if control_mme_weight.shape[0] == 48 and not mme_epilogue:
+            projection = projection[:, :24] + projection[:, 24:]
+        rrms = None if mme_epilogue else torch.rsqrt(row_mean_square(flat_bf16.float()) + eps)
+    elif (
         gaudi_envs.VLLM_HPU_DSV41_MHC_CONTROL_RRMS
+        and not (batch_control_reuse and decode and 2 <= gate_tokens <= 6)
+        and mhc_control_scope(decode=decode, tokens=gate_tokens)
         and packed_fn is not None
         and flat_bf16.device.type == "hpu"
         and flat_bf16.dtype == torch.bfloat16
@@ -367,18 +428,19 @@ def hc_pre(
         projection, rrms = control[:, :24], control[:, 24:]
     else:
         flat = flat_bf16.float()
+        control_batch = request_batch or (batch_control_reuse and decode and 2 <= gate_tokens <= 6)
         if (
             gaudi_envs.VLLM_HPU_DSV41_TPC_MHC
             and flat.device.type == "hpu"
             and flat.shape[1] == 20480
-            and (flat.shape[0] == 1 or (request_batch and flat.shape[0] <= 64))
+            and (flat.shape[0] == 1 or (control_batch and flat.shape[0] <= 64))
             and fn.shape == (24, 20480)
         ):
             op = (
                 torch.ops.custom_op.custom_deepseek_v41_control_prefetch_f32_gaudi2
                 if request_batch and batch_control_prefetch and flat.shape[0] >= 32
                 else torch.ops.custom_op.custom_deepseek_v41_control_batch4_f32_gaudi2
-                if request_batch and flat.shape[0] >= 4 and batch_control_reuse
+                if control_batch and flat.shape[0] >= 4 and batch_control_reuse
                 else torch.ops.custom_op.custom_deepseek_v41_control_gemv_f32_gaudi2
             )
             projection = op(flat, fn)
@@ -389,7 +451,17 @@ def hc_pre(
     # TPC program measures slower than the compiler's wide elementwise chain,
     # so retain the same math and native
     # Sinkhorn while letting large-M prefill use the better scheduled graph.
-    if (
+    if defer_gates:
+        control = torch.cat((projection, rrms), dim=-1).contiguous()
+        pre, post, comb = control, None, None
+    elif mme_epilogue:
+        epilogue = getattr(torch.ops.custom_op, "custom_deepseek_v41_mhc_statistics_epilogue_gaudi2",
+                           torch.ops.custom_op.custom_deepseek_v41_mhc_mme_epilogue_gaudi2)
+        gates = epilogue(
+            projection.contiguous(), flat_bf16.contiguous(), scale.contiguous(), base.contiguous())
+        pre, post = gates[:, :copies], gates[:, copies:2 * copies]
+        comb = gates[:, 2 * copies:].reshape(-1, copies, copies)
+    elif (
         gaudi_envs.VLLM_HPU_DSV41_MHC_GATES_FUSED
         and residual.device.type == "hpu"
         and iterations == 20
@@ -431,6 +503,10 @@ def hc_pre(
         collapsed = _prefill_hc_collapse(residual, previous_pre)
     else:
         collapsed = (residual.float() * previous_pre.unsqueeze(-1)).sum(1).to(residual.dtype)
+    if return_gates:
+        if defer_gates or not gaudi_envs.VLLM_HPU_DSV41_MHC_GATES_FUSED:
+            raise ValueError("Raw gate packet requires the independent native production gate producer")
+        return collapsed, pre, post, comb, gates
     return collapsed, pre, post, comb
 
 

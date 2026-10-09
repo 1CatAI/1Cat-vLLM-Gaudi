@@ -3,11 +3,64 @@
 import numpy as np
 import pytest
 import json
+import os
 import struct
 from types import SimpleNamespace
 
 from vllm_gaudi.ops.deepseek_v41_expert_n256 import prepare_expert, restore_expert
 from vllm_gaudi.ops.deepseek_v41_weights import prepare_q16, prepare_s16
+
+
+@pytest.fixture(scope="module")
+def sat_prefetch_meta():
+    if os.getenv("DSV41_TEST_NATIVE_META") != "1":
+        pytest.skip("Requires built native library without HPU allocation")
+    import torch
+    import habana_frameworks.torch.core  # noqa: F401
+
+    torch.ops.load_library(os.environ["VLLM_HPU_DSV4_TPC_OP_LIBRARY"])
+    return (
+        torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_token_wide_sat_fp8_gaudi2,
+        torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_token_wide_sat_prefetch_w2_fp8_gaudi2,
+    )
+
+
+def sat_meta_operands(tokens, intermediate):
+    import torch
+
+    def tensor(shape, dtype):
+        return torch.empty(shape, dtype=dtype, device="meta")
+
+    w13_blocks, w2_blocks = intermediate // 128, 5120 // 256
+    return (
+        tensor((tokens, 5120), torch.bfloat16), tensor((tokens, 6), torch.int32),
+        tensor((tokens, 6), torch.float32),
+        tensor((2, w13_blocks, 5120 * 64), torch.int16),
+        tensor((2, w2_blocks, intermediate * 64), torch.int16),
+        tensor((2, w13_blocks, 5120 * 4 + 128), torch.int16),
+        tensor((2, w2_blocks, intermediate * 4 + 128), torch.int16),
+        tensor((128,), torch.bfloat16),
+        tensor((2, w13_blocks, 256), torch.bfloat16),
+        tensor((2, w2_blocks, 256), torch.bfloat16),
+        tensor((tokens, 5120), torch.float8_e4m3fn), tensor((tokens, 1), torch.float32), True,
+    )
+
+
+@pytest.mark.parametrize("tokens", [2, 3, 4, 5, 6])
+@pytest.mark.parametrize("intermediate", [640, 1280])
+def test_sat_prefetch_preserves_shard_meta_contract(sat_prefetch_meta, tokens, intermediate):
+    args = sat_meta_operands(tokens, intermediate)
+    reference, candidate = (op(*args) for op in sat_prefetch_meta)
+    assert candidate.shape == reference.shape == (tokens, 5120)
+    assert candidate.dtype == reference.dtype
+
+
+@pytest.mark.parametrize("tokens,qualified", [(1, True), (7, True), (6, False)])
+def test_sat_prefetch_rejects_unqualified_buckets(sat_prefetch_meta, tokens, qualified):
+    args = (*sat_meta_operands(tokens, 640)[:-1], qualified)
+    for op in sat_prefetch_meta:
+        with pytest.raises(RuntimeError):
+            op(*args)
 
 
 @pytest.mark.parametrize("n,k", [(256, 128), (2304, 5120), (5120, 1152), (1280, 5120), (5120, 640)])

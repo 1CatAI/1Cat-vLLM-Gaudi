@@ -3,8 +3,11 @@
 #include <torch/library.h>
 #include <cmath>
 #include "hpu_ops/op_backend.h"
+#ifndef DSV41_MHC_STATS_SCHEMA
+#define DSV41_MHC_STATS_SCHEMA "custom_deepseek_v41_mhc_post_norm_statistics_gaudi2"
+#endif
 namespace {
-constexpr auto schema="custom_op::custom_deepseek_v41_mhc_post_norm_statistics_gaudi2";
+constexpr auto schema="custom_op::" DSV41_MHC_STATS_SCHEMA;
 constexpr auto guid="custom_deepseek_v41_mhc_post_weighted_stats_gaudi2";
 using Output=std::tuple<at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor>;
 habana::OutputMetaDataVector meta(const at::Stack& s) {
@@ -32,7 +35,14 @@ public:
   auto partial=BuildNode(this,graph,{guid,{syn_in(0),syn_in(1),syn_in(2),syn_in(3)},
    {{m[0].shape,m[0].dtype,0},{m[1].shape,m[1].dtype,1},{{tokens,2,40},at::kFloat}}});
   float params[2]={float(s.at(4).toDouble()),1.f/5120};
+#if DSV41_WEIGHTED_STATS_PREPARED
+  auto parameters=BuildNode(this,graph,{"custom_deepseek_v41_weighted_row_parameters_gaudi2",
+      {partial[2].get()},{{{tokens,5},at::kFloat}},params,sizeof(params)});
+  auto finish=BuildNode(this,graph,{"custom_deepseek_v41_norm_prepared_weighted_stats_gaudi2",
+      {partial[1].get(),syn_in(3),parameters[0].get()},
+#else
   auto finish=BuildNode(this,graph,{"custom_deepseek_v41_norm_from_weighted_stats_gaudi2",{partial[1].get(),syn_in(3),partial[2].get()},
+#endif
    {{m[2].shape,m[2].dtype,2},{m[3].shape,m[3].dtype,3},{m[4].shape,m[4].dtype,4},
     {m[5].shape,m[5].dtype,5},{m[6].shape,m[6].dtype,6}},params,sizeof(params)});
   syn_out(0)=std::move(partial[0]);syn_out(1)=std::move(partial[1]);
@@ -53,6 +63,6 @@ template<bool Meta> Output run(const at::Tensor& x,const at::Tensor& r,const at:
  return {out[0],out[1],out[2],out[3],out[4],out[5],out[6]};
 }
 }
-TORCH_LIBRARY_FRAGMENT(custom_op,m){m.def("custom_deepseek_v41_mhc_post_norm_statistics_gaudi2(Tensor value, Tensor residual, Tensor gates, Tensor norm_weight, float epsilon) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");}
-TORCH_LIBRARY_IMPL(custom_op,HPU,m){m.impl("custom_deepseek_v41_mhc_post_norm_statistics_gaudi2",run<false>);}
-TORCH_LIBRARY_IMPL(custom_op,Meta,m){m.impl("custom_deepseek_v41_mhc_post_norm_statistics_gaudi2",run<true>);}
+TORCH_LIBRARY_FRAGMENT(custom_op,m){m.def(DSV41_MHC_STATS_SCHEMA "(Tensor value, Tensor residual, Tensor gates, Tensor norm_weight, float epsilon) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");}
+TORCH_LIBRARY_IMPL(custom_op,HPU,m){m.impl(DSV41_MHC_STATS_SCHEMA,run<false>);}
+TORCH_LIBRARY_IMPL(custom_op,Meta,m){m.impl(DSV41_MHC_STATS_SCHEMA,run<true>);}

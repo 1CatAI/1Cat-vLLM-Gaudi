@@ -177,6 +177,7 @@ class PagedCSA2SharedState(nn.Module):
         # instead.  Compiled recipes bind these stable tensor addresses, so the
         # cache intentionally keeps strong references for the process lifetime.
         self._rotary_buckets = {}
+        self.dspark_main_mirror = gaudi_envs.VLLM_HPU_DSV41_DSPARK_MAIN_MIRROR
         self.decoded_kv_state = gaudi_envs.VLLM_HPU_DSV41_PAGED_DECODED_KV_STATE
         self.sources, self.topk = nn.ModuleDict(), nn.ModuleDict()
         self.prefill_kv_generation = 0
@@ -212,6 +213,9 @@ class PagedCSA2SharedState(nn.Module):
                     cache.register_buffer(
                         "decoded_main", torch.zeros(decoded_rows, 512, dtype=torch.bfloat16, device=device), False
                     )
+                if self.dspark_main_mirror:
+                    cache.register_buffer("main_mirror",
+                                          torch.zeros(32768 // ratio, 512, dtype=torch.bfloat16, device=device), False)
                 self.sources[str(source)] = cache
         shared_selection = None
         for source in config["index_source_layer_ids"]:
@@ -351,6 +355,12 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
     def __init__(self, weights, config, layer, shared, linear, reduce, gather, device, tensor_parallel_size=2):
         super().__init__()
         self.weights, self.shared = weights, shared
+        self.draft_query_fp8 = (layer >= config['num_hidden_layers']
+                               and gaudi_envs.VLLM_HPU_DSV41_DSPARK
+                               and gaudi_envs.VLLM_HPU_DSV41_DSPARK_DRAFT_QUERY_FP8)
+        self.draft_dense_fp8 = (layer >= config['num_hidden_layers']
+                               and gaudi_envs.VLLM_HPU_DSV41_DSPARK
+                               and gaudi_envs.VLLM_HPU_DSV41_DSPARK_DRAFT_DENSE_FP8)
         if (
             gaudi_envs.VLLM_HPU_DSV41_PREFILL_INDEX_MME or gaudi_envs.VLLM_HPU_DSV41_PREFILL_INDEX_SHARED
         ) and not hasattr(torch.ops.custom_op, "custom_deepseek_v41_index_keys_gaudi2"):
@@ -362,7 +372,10 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         # wo_a -> group32 BF16 boundary -> FP8 wo_b chain as well.
         self.woa_output_roundtrip = False
         self.prepared_output = gaudi_envs.VLLM_HPU_DSV41_PREPARED_OUTPUT and layer < config["num_hidden_layers"]
-        self.output_gemm_layout = gaudi_envs.VLLM_HPU_DSV41_OUTPUT_GEMM_LAYOUT and layer < config["num_hidden_layers"]
+        self.output_gemm_layout = (
+            gaudi_envs.VLLM_HPU_DSV41_OUTPUT_GEMM_LAYOUT
+            or (gaudi_envs.VLLM_HPU_DSV41_DSPARK and gaudi_envs.VLLM_HPU_DSV41_DSPARK_OUTPUT_LAYOUT)
+        ) and layer < config["num_hidden_layers"]
         if self.output_gemm_layout and not self.prepared_output:
             raise ValueError("V4.1 output GEMM layout requires prepared output weights")
         self.qkv_fused_input = gaudi_envs.VLLM_HPU_DSV41_QKV_FUSED_INPUT and layer < config["num_hidden_layers"]
@@ -375,13 +388,27 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         self._fused_compressor_kv_width = 0
         self.mla_mme = gaudi_envs.VLLM_HPU_DSV41_MLA_MME and layer < config["num_hidden_layers"]
         self.native_rope = gaudi_envs.VLLM_HPU_DSV41_NATIVE_ROPE
-        self.q_scale_rope = gaudi_envs.VLLM_HPU_DSV41_Q_SCALE_ROPE and layer < config["num_hidden_layers"]
+        self.kv_norm_rope_decode = True
+        self.c6_query_fusion = (gaudi_envs.VLLM_HPU_DSV41_DSPARK
+                                and (gaudi_envs.VLLM_HPU_DSV41_DSPARK_Q_PROLOGUE
+                                     or gaudi_envs.VLLM_HPU_DSV41_DSPARK_C1_DENSE_CHAIN)
+                                and layer < config["num_hidden_layers"])
+        self.fp8_qkv_prologue_split = gaudi_envs.VLLM_HPU_DSV41_DSPARK_FP8_QKV_PROLOGUE_SPLIT
+        self.fp8_qkv_prologue = (gaudi_envs.VLLM_HPU_DSV41_DSPARK
+                                and (gaudi_envs.VLLM_HPU_DSV41_DSPARK_FP8_QKV_PROLOGUE
+                                     or self.fp8_qkv_prologue_split)
+                                and layer < config["num_hidden_layers"])
+        self.c6_query_fusion |= self.fp8_qkv_prologue
+        self.q_scale_rope = (gaudi_envs.VLLM_HPU_DSV41_Q_SCALE_ROPE or self.c6_query_fusion) \
+            and layer < config["num_hidden_layers"]
         self.batch_c1_numerics = gaudi_envs.VLLM_HPU_DSV41_BATCH_C1_NUMERICS
         if self.q_scale_rope and not (
-            gaudi_envs.VLLM_HPU_DSV41_NATIVE_ROPE and gaudi_envs.VLLM_HPU_DSV41_ATTN_DENSE_FP8
+            gaudi_envs.VLLM_HPU_DSV41_NATIVE_ROPE
+            and (gaudi_envs.VLLM_HPU_DSV41_ATTN_DENSE_FP8 or self.c6_query_fusion)
         ):
             raise ValueError("Q scale/RoPE fusion requires native RoPE and prepared dense FP8")
-        self.fused_norm = gaudi_envs.VLLM_HPU_DSV41_ATTN_FUSED_NORM and layer < config["num_hidden_layers"]
+        self.fused_norm = (gaudi_envs.VLLM_HPU_DSV41_ATTN_FUSED_NORM or self.c6_query_fusion) \
+            and layer < config["num_hidden_layers"]
         self.linear, self.reduce, self.gather = linear, reduce, gather
         self.layer, self.ratio, self.length = layer, config["compress_ratios"][layer], shared.length
         self.runtime_indexer = getattr(shared, "runtime_indexer", False)
@@ -399,12 +426,83 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         ):
             raise ValueError("V4.1 paged attention head geometry is not divisible by the runtime TP size")
         self.tensor_parallel_size = tensor_parallel_size
+        self.scheduled_peer_operands = None
+        if gaudi_envs.VLLM_HPU_DSV41_DSPARK_SCHEDULED_PEER:
+            from vllm.distributed import get_tp_group
+            from vllm_gaudi.ops.deepseek_v41_dspark_peer_operands import make_peer_operands
+
+            self.scheduled_peer_operands = make_peer_operands(get_tp_group().rank_in_group, tensor_parallel_size)
         self.shared_decode_metadata = tensor_parallel_size == 4
         self.paged_mla_direct = tensor_parallel_size == 4 and hasattr(
             torch.ops.custom_op, "custom_deepseek_v41_paged_mla_direct_mme_gaudi2"
         )
         self.paged_mla_logical = tensor_parallel_size == 4 and hasattr(
             torch.ops.custom_op, "custom_deepseek_v41_logical_mla_gaudi2"
+        )
+        self.logical_mla_vector = True
+        self.dspark_candidate_keys = gaudi_envs.VLLM_HPU_DSV41_DSPARK_CANDIDATE_KEYS
+        self.dspark_runtime_selection = gaudi_envs.VLLM_HPU_DSV41_DSPARK_RUNTIME_SELECTION
+        self.decode_threshold_selection = gaudi_envs.VLLM_HPU_DSV41_DSPARK_THRESHOLD_SELECTION
+        self.dspark_scale_cache = gaudi_envs.VLLM_HPU_DSV41_DSPARK_SCALE_CACHE
+        self.dspark_stacked_pv = gaudi_envs.VLLM_HPU_DSV41_DSPARK_STACKED_PV
+        self.dspark_batch6_kv = gaudi_envs.VLLM_HPU_DSV41_DSPARK_BATCH6_KV
+        self.dspark_merge_cache = gaudi_envs.VLLM_HPU_DSV41_DSPARK_MERGE_CACHE
+        self.dspark_pair_pv = gaudi_envs.VLLM_HPU_DSV41_DSPARK_PAIR_PV
+        self.dspark_mla_coord_cache = gaudi_envs.VLLM_HPU_DSV41_DSPARK_MLA_COORD_CACHE
+        self.dspark_shared_kv_mme = gaudi_envs.VLLM_HPU_DSV41_DSPARK_SHARED_KV_MME
+        self.dspark_compact_stream_mme = gaudi_envs.VLLM_HPU_DSV41_DSPARK_COMPACT_STREAM_MME
+        self.dspark_compact_kv_mme = gaudi_envs.VLLM_HPU_DSV41_DSPARK_COMPACT_KV_MME
+        self.dspark_hash_mla = gaudi_envs.VLLM_HPU_DSV41_DSPARK_HASH_MLA
+        self.dspark_pv_rope = gaudi_envs.VLLM_HPU_DSV41_DSPARK_PV_ROPE
+        self.dspark_q_bf16_rope = gaudi_envs.VLLM_HPU_DSV41_DSPARK_Q_BF16_ROPE
+        self.dspark_query_norm = gaudi_envs.VLLM_HPU_DSV41_DSPARK_QUERY_NORM
+        self.dspark_full_row = gaudi_envs.VLLM_HPU_DSV41_DSPARK_FULL_ROW
+        self.dspark_fp4_table = gaudi_envs.VLLM_HPU_DSV41_DSPARK_FP4_TABLE
+        self.dspark_row_cache = gaudi_envs.VLLM_HPU_DSV41_DSPARK_ROW_CACHE
+        self.dspark_qkv_publish = gaudi_envs.VLLM_HPU_DSV41_DSPARK_QKV_PUBLISH
+        self.dspark_kv_publish = gaudi_envs.VLLM_HPU_DSV41_DSPARK_KV_PUBLISH
+        if self.dspark_kv_publish or self.dspark_qkv_publish:
+            self.register_buffer("publish_decoded_unused",
+                                 torch.zeros((512, 512), dtype=torch.bfloat16, device=device), False)
+        self.dspark_cohesive_mla = gaudi_envs.VLLM_HPU_DSV41_DSPARK_COHESIVE_MLA
+        self.dspark_exp_pv = gaudi_envs.VLLM_HPU_DSV41_DSPARK_EXP_PV
+        self.dspark_merged_mla = gaudi_envs.VLLM_HPU_DSV41_DSPARK_MERGED_MLA
+        self.dspark_main_adjacent_pv = gaudi_envs.VLLM_HPU_DSV41_DSPARK_MAIN_ADJACENT_PV
+        self.dspark_swa_source_reuse = gaudi_envs.VLLM_HPU_DSV41_DSPARK_SWA_SOURCE_REUSE
+        self.dspark_main_single_bank = (gaudi_envs.VLLM_HPU_DSV41_DSPARK
+                                        and gaudi_envs.VLLM_HPU_DSV41_DSPARK_MAIN_SINGLE_BANK)
+        self.dspark_coherent_swa = (gaudi_envs.VLLM_HPU_DSV41_DSPARK
+                                    and gaudi_envs.VLLM_HPU_DSV41_DSPARK_COHERENT_SWA)
+        self.dspark_layer_main_split = gaudi_envs.VLLM_HPU_DSV41_DSPARK_LAYER_MAIN_SPLIT and all(
+            hasattr(torch.ops.custom_op, name)
+            for name in ("custom_deepseek_v41_main_split_publish_mla_gaudi2",
+                         "custom_deepseek_v41_main_split_reuse_mla_gaudi2")
+        )
+        self.dspark_qk_flat = (gaudi_envs.VLLM_HPU_DSV41_DSPARK
+                               and gaudi_envs.VLLM_HPU_DSV41_DSPARK_QK_FLAT)
+        if self.dspark_qk_flat and (not self.dspark_layer_main_split or not all(
+            hasattr(torch.ops.custom_op, name) for name in (
+                "custom_deepseek_v41_main_qk_flat_publish_mla_gaudi2",
+                "custom_deepseek_v41_main_qk_flat_reuse_mla_gaudi2"))):
+            raise RuntimeError("QK flat candidate requires the shared main split path and both operators")
+        self.dspark_qk_flat_direct = (gaudi_envs.VLLM_HPU_DSV41_DSPARK
+                                      and gaudi_envs.VLLM_HPU_DSV41_DSPARK_QK_FLAT_DIRECT)
+        if self.dspark_qk_flat_direct and (not self.dspark_layer_main_split or not all(
+            hasattr(torch.ops.custom_op, name) for name in (
+                "custom_deepseek_v41_main_qk_flat_direct_publish_mla_gaudi2",
+                "custom_deepseek_v41_main_qk_flat_direct_reuse_mla_gaudi2"))):
+            raise RuntimeError("QK direct consumer requires both shared main operators")
+        self.dspark_stream_exp = (gaudi_envs.VLLM_HPU_DSV41_DSPARK
+                                  and gaudi_envs.VLLM_HPU_DSV41_DSPARK_STREAM_EXP)
+        if self.dspark_stream_exp and (not self.dspark_layer_main_split or not all(
+            hasattr(torch.ops.custom_op, name) for name in (
+                "custom_deepseek_v41_main_stream_exp_publish_mla_gaudi2",
+                "custom_deepseek_v41_main_stream_exp_reuse_mla_gaudi2"))):
+            raise RuntimeError("Streaming C1 PV requires the shared main publisher and reuser")
+        self.dspark_layer_main_reuse = gaudi_envs.VLLM_HPU_DSV41_DSPARK_LAYER_MAIN_REUSE and all(
+            hasattr(torch.ops.custom_op, name)
+            for name in ("custom_deepseek_v41_main_batch_publish_mla_gaudi2",
+                         "custom_deepseek_v41_main_batch_reuse_mla_gaudi2")
         )
         self.shared_main_mla = tensor_parallel_size == 4 and all(
             hasattr(torch.ops.custom_op, name)
@@ -417,6 +515,10 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         # Distributed mirror selection regresses the complete decode chain.
         self.tp4_mirror_selection = False
         self.tp4_local_index_queries = False
+        self.local_index_query_joint = (gaudi_envs.VLLM_HPU_DSV41_DSPARK
+                                       and gaudi_envs.VLLM_HPU_DSV41_DSPARK_INDEX_QUERY_LOCAL)
+        self.register_buffer("_index_query_full_weight", None, False)
+        self.register_buffer("_index_score_full_weight", None, False)
         self.tp4_packed_index_queries = False
         self.register_buffer("_index_gain_weight", None, False)
         for shard in range(4):
@@ -488,6 +590,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             raise RuntimeError("Bounded Reindex SRAM keys require the matching native compound library")
         if self.batch_reindex_mme and not hasattr(torch.ops.custom_op, "custom_deepseek_v41_index_reduce_gaudi2"):
             raise RuntimeError("Batch Reindex MME requires the native ordered index head reducer")
+        self.dspark_main_mirror = shared.dspark_main_mirror
         self.decoded_kv_state = shared.decoded_kv_state
         self.decoded_swa_offset = (layer - shared.layer_start) * 512 if self.decoded_kv_state else 0
         if self.decoded_kv_state and not (self.mla_mme and self.direct_selected_kv and self.shared_prefix_kv):
@@ -496,7 +599,30 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         # Both selection variants are retained for diagnosis, not enabled:
         # carried-ID sorting regressed; score-only batching has no resolved gain.
         self.decode_batched_selection = False
+        from vllm_gaudi.ops.deepseek_v41_decode_index import supports_query_row_reduction
+        self.c6_index_reduce = supports_query_row_reduction(self.index_heads)
+        # Independent query rows share a score producer while retaining the
+        # same per-tile TopK and merge order. The ABI/mirror gate is below.
+        self.c6_index_wide_scores = True
         self.decode_swa_packed = not self.ratio
+        self.draft_packed_mla = (
+            gaudi_envs.VLLM_HPU_DSV41_DSPARK
+            and gaudi_envs.VLLM_HPU_DSV41_DSPARK_DRAFT_PACKED_MLA
+            and layer >= config["num_hidden_layers"]
+        )
+        self.draft_kv_decode = (
+            gaudi_envs.VLLM_HPU_DSV41_DSPARK
+            and gaudi_envs.VLLM_HPU_DSV41_DSPARK_DRAFT_KV_DECODE
+            and layer >= config["num_hidden_layers"]
+        )
+        if layer >= config["num_hidden_layers"]:
+            self.register_buffer(
+                "draft_mla_rows", torch.arange(SWA_ROWS + 5, dtype=torch.int32, device=device).reshape(1, -1), False
+            )
+            self.register_buffer(
+                "draft_mla_lengths", torch.full((5,), config["sliding_window"] + 5,
+                                                dtype=torch.int32, device=device), False
+            )
         if self.ratio:
             kv_source = max(source for source in config["kv_source_layer_ids"] if source <= layer)
             self.kv_source = kv_source
@@ -506,6 +632,26 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             self.cache = shared.sources[str(kv_source)]
             self.selection = shared.topk[str(index_source)]
         self.register_buffer("swa", torch.zeros(SWA_ROWS, 528, dtype=torch.uint8, device=device), False)
+        self.dspark_swa_cache = (gaudi_envs.VLLM_HPU_DSV41_DSPARK_SWA_CACHE and gaudi_envs.VLLM_HPU_DSV41_DSPARK
+                                 and self.ratio in (1, 2) and layer < config["num_hidden_layers"])
+        if self.dspark_swa_cache:
+            if not self.dspark_layer_main_split or self.dspark_qkv_publish or self.dspark_kv_publish:
+                raise ValueError("SWA-only cache requires the qualified main operand path and its explicit row writer")
+            for name in ("custom_deepseek_v41_swa_batch_cache_ordered_gaudi2",
+                         "custom_deepseek_v41_swa_cached_publish_mla_gaudi2",
+                         "custom_deepseek_v41_swa_cached_reuse_mla_gaudi2"):
+                if not hasattr(torch.ops.custom_op, name):
+                    raise RuntimeError(f"SWA-only cache native operator unavailable: {name}")
+            from vllm_gaudi.ops.deepseek_v41_shared_main import DecodedSwaRing
+
+            self.swa_decoded = DecodedSwaRing(device)
+        if self.dspark_main_single_bank:
+            if not self.dspark_layer_main_split or self.dspark_swa_cache:
+                raise ValueError("Single KV bank requires selected-main split and canonical packed SWA")
+            for name in ("custom_deepseek_v41_main_single_bank_publish_mla_gaudi2",
+                         "custom_deepseek_v41_main_single_bank_reuse_mla_gaudi2"):
+                if not hasattr(torch.ops.custom_op, name):
+                    raise RuntimeError(f"Single KV bank native operator unavailable: {name}")
         self.register_buffer("_prefill_sequence_sink", None, persistent=False)
         if self.owns_kv and self.ratio == 2:
             self.register_buffer(
@@ -560,6 +706,15 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
 
             prepare_local_index_queries(self, release_local=True)
 
+    def prepare_local_index_query_weights(self, *, release_local=False):
+        if self.local_index_query_joint and self.owns_index:
+            from vllm_gaudi.ops.deepseek_v41_tp4_selection import prepare_local_index_queries
+
+            prepare_local_index_queries(self, release_local=release_local, joint=True)
+
+    def uses_local_index_queries(self, tokens):
+        return (self.tp4_local_index_queries and self.search_length <= 32768
+                and (tokens == 1 or self.local_index_query_joint and 2 <= tokens <= NATIVE_WORK_TOKENS))
     def prepare_index_gain_weight(self):
         if gaudi_envs.VLLM_HPU_DSV41_INDEX_GAIN_REPLICA:
             from vllm_gaudi.ops.deepseek_v41_index_gain import prepare_index_gain_weight
@@ -640,6 +795,10 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 if inverse
                 else torch.ops.custom_op.custom_deepseek_v41_rope_bf16_gaudi2
             )
+            if (not request_batch and gaudi_envs.VLLM_HPU_DSV41_DSPARK_ROPE_COHERENT
+                    and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS):
+                op = (torch.ops.custom_op.custom_deepseek_v41_rope_inverse_coherent_bf16_gaudi2 if inverse else
+                      torch.ops.custom_op.custom_deepseek_v41_rope_coherent_bf16_gaudi2)
             shaped = value.reshape(value.shape[0], -1, value.shape[-1]).contiguous()
             return op(shaped, positions.to(torch.int32).contiguous(), self._rotary_native_table()).reshape(value.shape)
         return _apply_rope_torch(value, positions, self._rotary_table(), inverse)
@@ -669,6 +828,8 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
 
     def project_output_consumer(self, value):
         """Consume the qualified wo_a roundtrip without a BF16 HBM detour."""
+        if self.draft_dense_fp8 and 1 <= value.shape[0] <= NATIVE_WORK_TOKENS:
+            return self.linear(value, self.draft_output_projection)
         if self.woa_output_roundtrip:
             weight = self.weights.wo_b
             return torch.ops.custom_op.custom_deepseek_v41_dense_fp8_gaudi2(
@@ -676,8 +837,32 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             )
         return self.linear(value, self.weights.wo_b)
 
-    def project_query(self, value, positions, *, decode=False, request_batch=False):
+    def project_query(self, value, positions, *, decode=False, request_batch=False, roundtrip=None):
         weight = self.weights.wq_b
+        if self.draft_query_fp8 and not request_batch and 1 <= value.shape[0] <= NATIVE_WORK_TOKENS:
+            prepared = (roundtrip if roundtrip is not None else
+                        quantize_activation(value) if hasattr(weight, 'scale') else value)
+            return torch.ops.custom_op.custom_deepseek_v41_q_projection_rope_gaudi2(
+                prepared.contiguous(), self.draft_query_weight, self.draft_query_channel,
+                positions.to(torch.int32).contiguous(), self._rotary_native_table()).reshape(-1, self.heads, 512)
+        if roundtrip is not None:
+            if (not decode or weight.weight.dtype != torch.bfloat16 or not hasattr(weight, "scale")
+                    or roundtrip.shape != value.shape or roundtrip.dtype != torch.bfloat16):
+                raise ValueError("Prepared query roundtrip requires the BF16 production projection")
+            if (gaudi_envs.VLLM_HPU_DSV41_DSPARK_DENSE_BITS12 and hasattr(weight, "dense_bits12_high")
+                    and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS):
+                from vllm_gaudi.ops.deepseek_v41_dense_bits12 import project
+                projected = project(roundtrip, weight, "dense_bits12").reshape(-1, self.heads, 512)
+            else:
+                projected = torch.nn.functional.linear(roundtrip, weight.weight).reshape(-1, self.heads, 512)
+            return self._rope(projected, positions, request_batch=request_batch)
+        if (self.dspark_q_bf16_rope and decode and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS
+                and value.dtype == torch.bfloat16 and weight.weight.dtype == torch.bfloat16
+                and not getattr(weight, "dense_fp8", False)
+                and (not hasattr(weight, "scale") or gaudi_envs.VLLM_HPU_DSV41_QUANT_ROUNDTRIP)):
+            return torch.ops.custom_op.custom_deepseek_v41_q_bf16_projection_rope_gaudi2(
+                value.contiguous(), weight.weight.contiguous(), positions.to(torch.int32).contiguous(),
+                self._rotary_native_table(), hasattr(weight, "scale")).reshape(-1, self.heads, 512)
         if not decode and gaudi_envs.VLLM_HPU_DSV41_PREFILL_Q_PROJECTION and 6 < value.shape[0] <= 16384:
             if not getattr(weight, "dense_fp8", False) or self.heads not in (16, 32):
                 raise ValueError("Prefill Q projection requires prepared FP8 weights and 16/32 local heads")
@@ -691,7 +876,9 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                     positions.to(torch.int32).contiguous(),
                     self._rotary_native_table(),
                 )
-        if self.q_scale_rope and value.shape[0] == 1 and getattr(weight, "dense_fp8", False):
+        if (self.q_scale_rope and (value.shape[0] == 1 or self.c6_query_fusion
+                                  and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS)
+                and getattr(weight, "dense_fp8", False)):
             value = quantize_activation(value) if hasattr(weight, "scale") else value
             return torch.ops.custom_op.custom_deepseek_v41_q_projection_rope_gaudi2(
                 value, weight.weight, weight.channel_scale, positions, self._rotary_native_table()
@@ -699,6 +886,15 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         return self._rope(
             self.linear(value, weight).reshape(-1, self.heads, 512), positions, request_batch=request_batch
         )
+
+    def project_qkv_publish(self, query_input, kv_input, positions, publish_decoded):
+        """Shared Q/KV normalization, query projection and canonical SWA write."""
+        return torch.ops.custom_op.custom_deepseek_v41_dspark_qkv_projection_publish_gaudi2(
+            query_input.contiguous(), self.weights.q_norm.weight, kv_input.contiguous(),
+            self.weights.kv_norm.weight, positions.to(torch.int32).contiguous(), self._rotary_native_table(),
+            self.swa, self.shared.decoded_swa if publish_decoded else self.publish_decoded_unused,
+            self.weights.wq_b.weight, self.weights.wq_b.channel_scale, self.eps,
+            self.decoded_swa_offset if publish_decoded else -1)
 
     def project_query_input(self, value, positions):
         """Apply Q norm directly in the FP8 projection producer.
@@ -721,13 +917,17 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         ).reshape(-1, self.heads, 512)
 
     def project_kv(self, value, positions, *, decode=False):
-        """Normalize and rotate KV without materializing the C1 norm output."""
+        """Normalize and rotate KV at its exact BF16 boundary."""
         weight = self.weights.kv_norm.weight
-        if decode and self.fused_norm and self.native_rope and value.shape[0] == 1:
+        fused_decode = (
+            value.shape[0] == 1 and self.fused_norm
+            or 2 <= value.shape[0] <= NATIVE_WORK_TOKENS and self.kv_norm_rope_decode
+        )
+        if decode and self.native_rope and fused_decode:
             # KV has no consumer between its BF16 RMSNorm boundary and RoPE.
             # The compound TPC kernel preserves that boundary bit-for-bit and
-            # feeds the existing cache writer directly.  Wider batches retain
-            # the batch-generic implementation used by prefill and B2+.
+            # feeds the existing cache writer directly. Wider batches and
+            # prefill retain their existing normalization implementation.
             return torch.ops.custom_op.custom_deepseek_v41_kv_norm_rope_bf16_gaudi2(
                 value.contiguous(),
                 weight,
@@ -764,16 +964,18 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         compressor = self.weights.compressor
         if self.ratio == 2:
             if (
-                self.tp4_local_index_queries
-                and value.shape[0] == 1
+                self.uses_local_index_queries(value.shape[0])
                 and self.search_length // self.ratio > 512
-                and self.search_length <= 32768
             ):
                 # Removing the query collectives joins this FP32 projection
                 # to its BF16 producer. Synapse otherwise cancels the adjacent
                 # FP32 -> BF16 -> FP32 casts and changes compressor history.
                 # Keep the original BF16 input boundary inside one opaque TPC.
-                value = torch.ops.custom_op.custom_deepseek_v41_bf16_identity_gaudi2(value.contiguous())
+                # This identity ABI consumes one contiguous flattened row;
+                # batching changes only its width, never its BF16 values.
+                shape = value.shape
+                value = torch.ops.custom_op.custom_deepseek_v41_bf16_identity_gaudi2(
+                    value.contiguous().reshape(1, -1)).reshape(shape)
             kv, score = self._project_compressor_input(value)
             # Positions and all circular capacities are non-negative powers
             # of two.  The stock `%` expressions emitted a div_mod kernel for
@@ -796,6 +998,10 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                     score.contiguous(),
                     positions.to(torch.int32).contiguous(),
                 )
+            elif gaudi_envs.VLLM_HPU_DSV41_DSPARK_COMPRESSOR_SEQUENCE and positions.numel() <= 6:
+                latent = torch.ops.custom_op.custom_deepseek_v41_compressor_sequence_bf16_gaudi2(
+                    self.kv_history, self.score_history, kv.contiguous(), score.contiguous(),
+                    positions.to(torch.int32).contiguous())
             elif positions.numel() <= 6:
                 # Preserve the qualified C1/C6 graph and its exact state
                 # mutation order.
@@ -870,7 +1076,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         index, latent = self._rope(index, first), self._rope(latent, first)
         if (
             getattr(self.shared, "index_mirror_valid", False)
-            and positions.numel() <= NATIVE_WORK_TOKENS
+            and positions.numel() == 1
             and self.search_length <= self.shared.index_mirror_tokens
         ):
             # Maintain the exact packed-key value, including its BF16 FP4
@@ -889,6 +1095,20 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             # cache.  Keeping the pre-quantization key would silently change
             # candidate selection when this MME path replaces packed scoring.
             self.cache.decoded_index_hot.index_copy_(0, rows.long(), fp4_roundtrip(index, 32))
+        if (gaudi_envs.VLLM_HPU_DSV41_DSPARK_DECODED_PUBLISH
+                and self.dspark_main_mirror and self.search_length <= 32768
+                and 1 <= positions.numel() <= NATIVE_WORK_TOKENS):
+            decoded_rows = torch.where(visible, rows, -1).to(torch.int32).contiguous()
+            done = torch.ops.custom_op.custom_deepseek_v41_fp4_paged_decoded_rows_gaudi2(
+                self.cache.main, self.cache.index, latent.contiguous(), index.contiguous(),
+                slots.to(torch.int32).contiguous(), decoded_rows, self.cache.main_mirror)
+            if (getattr(self.shared, "index_mirror_valid", False)
+                    and self.search_length <= self.shared.index_mirror_tokens):
+                from vllm_gaudi.ops.deepseek_v41_index_mirror import refresh_index_mirror_rows
+
+                refresh_index_mirror_rows(self.cache.index, self.shared.block_table, rows,
+                                         self.cache.index_mirror, self.ratio, completion=done)
+            return done
         if decoded and value.shape[0] == 1:
             return torch.ops.custom_op.custom_deepseek_v41_fp4_paged_decoded_write_bf16_gaudi2(
                 self.cache.main,
@@ -899,11 +1119,36 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 rows.to(torch.int32).contiguous(),
                 self.cache.decoded_main,
             )
+        if (getattr(self, "c6_fp4_cache_write", False) and not decoded
+                and not (self.dspark_main_mirror and self.search_length <= 32768)
+                and 2 <= positions.numel() <= NATIVE_WORK_TOKENS):
+            done = torch.ops.custom_op.custom_deepseek_v41_fp4_cache_write_rows_gaudi2(
+                self.cache.main, self.cache.index, latent.contiguous(), index.contiguous(),
+                slots.to(torch.int32).contiguous())
+            if (getattr(self.shared, "index_mirror_valid", False)
+                    and self.search_length <= self.shared.index_mirror_tokens):
+                from vllm_gaudi.ops.deepseek_v41_index_mirror import refresh_index_mirror_rows
+
+                refresh_index_mirror_rows(self.cache.index, self.shared.block_table, rows,
+                                         self.cache.index_mirror, self.ratio, completion=done)
+            return done
         packed_index, packed_main = pack_fp4(index, 32), pack_fp4(latent, 16)
         self.cache.index.index_copy_(0, slots.long(), packed_index)
         self.cache.main.index_copy_(0, slots.long(), packed_main)
+        if (getattr(self.shared, "index_mirror_valid", False)
+                and 2 <= positions.numel() <= NATIVE_WORK_TOKENS
+                and self.search_length <= self.shared.index_mirror_tokens):
+            from vllm_gaudi.ops.deepseek_v41_index_mirror import refresh_index_mirror_rows
+            refresh_index_mirror_rows(self.cache.index, self.shared.block_table, rows,
+                                      self.cache.index_mirror, self.ratio)
         if decoded:
             self.cache.decoded_main.index_copy_(0, rows.long(), unpack_fp4(packed_main))
+        if self.dspark_main_mirror and self.search_length <= 32768:
+            # C6 ratio-two rows alias. Decode after the canonical physical
+            # writes so complete/incomplete duplicates all read the same row.
+            physical = self.shared.physical_rows(rows, self.ratio).long()
+            packed_canonical = self.cache.main.index_select(0, physical)
+            self.cache.main_mirror.index_copy_(0, rows.long(), unpack_fp4(packed_canonical))
         return None
 
     def _prepare_index_queries(self, value, qr, positions, *, prefill=False, request_batch=False):
@@ -911,13 +1156,12 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
 
         indexer = self.weights.indexer
         local_queries = (
-            not prefill and getattr(self, "tp4_local_index_queries", False)
-            and value.shape[0] == 1 and self.search_length <= 32768
+            not prefill and self.uses_local_index_queries(value.shape[0])
         )
         if local_queries:
             from vllm_gaudi.ops.deepseek_v41_tp4_selection import local_index_query_projections
 
-            q, weights = local_index_query_projections(self, value, qr)
+            q, weights = local_index_query_projections(self, value, qr, joint=self.local_index_query_joint)
         else:
             q = self.linear(qr, indexer.wq_b).reshape(-1, self.index_heads, 128)
         if (
@@ -975,7 +1219,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
     def _uses_index_mirror(self, q):
         return (
             getattr(self, "index_mirror_scores", False)
-            and q.shape[0] == 1
+            and 1 <= q.shape[0] <= NATIVE_WORK_TOKENS
             and self.shared.index_mirror_valid
             and self.search_length <= self.shared.index_mirror_tokens
         )
@@ -987,23 +1231,24 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             if supports_native_index_tile(q, logical_rows):
                 if self._uses_index_mirror(q):
                     from vllm_gaudi.ops.deepseek_v41_index_mirror import mirror_index_tile
-
-                    return mirror_index_tile(
-                        q, weights, self.cache.index_mirror, positions, logical_rows, self.ratio, self.index_heads
-                    )
-                return native_index_tile(
-                    q,
-                    weights,
-                    self.cache.index,
-                    self.shared.block_table,
-                    positions,
-                    logical_rows,
-                    self.ratio,
-                    self.index_heads,
-                )
-        physical = self.shared.physical_rows(logical_rows.clamp_min(0), self.ratio)
-        packed = self.cache.index.index_select(0, physical.flatten().long()).reshape(*physical.shape, 68)
-        keys = unpack_fp4(packed, 128, 32)
+                    return mirror_index_tile(q, weights, self.cache.index_mirror, positions, logical_rows,
+                                             self.ratio, self.index_heads)
+                return native_index_tile(q, weights, self.cache.index, self.shared.block_table, positions,
+                                         logical_rows, self.ratio, self.index_heads)
+        from vllm_gaudi.ops.deepseek_v41_decode_index import per_query_index_keys, supports_per_query_index_keys
+        if (logical_rows.ndim == 2 and getattr(self, "index_mirror_scores", False)
+                and self._uses_index_mirror(q)):
+            from vllm_gaudi.ops.deepseek_v41_index_mirror import per_query_mirror_keys
+            keys = per_query_mirror_keys(self.cache.index_mirror, logical_rows)
+        elif supports_per_query_index_keys(q, logical_rows):
+            # C2-C6 Reindex has a separate candidate row range per query.
+            # Reuse the existing paged gather/codec; the MME and both BF16
+            # partial sums below retain the shared TP2/TP4 score contract.
+            keys = per_query_index_keys(self.cache.index, self.shared.block_table, logical_rows, self.ratio)
+        else:
+            physical = self.shared.physical_rows(logical_rows.clamp_min(0), self.ratio)
+            packed = self.cache.index.index_select(0, physical.flatten().long()).reshape(*physical.shape, 68)
+            keys = unpack_fp4(packed, 128, 32)
         # Use explicit contiguous GEMMs.  The generic einsum accepted strided
         # query/key views and could require a new, much larger recipe beside
         # the 1M-context resident set.  These forms produce bitwise-identical
@@ -1013,6 +1258,13 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             if keys.ndim == 2
             else torch.bmm(q.contiguous(), keys.transpose(1, 2).contiguous())
         )
+        if (getattr(self, "c6_index_reduce", False) and logical_rows.ndim == 2
+                and 2 <= q.shape[0] <= NATIVE_WORK_TOKENS and q.device.type == "hpu"
+                and 128 <= logical_rows.shape[-1] <= 32768
+                and logical_rows.shape[-1] % 128 == 0):
+            return torch.ops.custom_op.custom_deepseek_v41_prefill_index_reduce_gaudi2(
+                scores.contiguous(), weights.contiguous(), positions.to(torch.int32).contiguous(),
+                logical_rows.to(torch.int32).contiguous(), self.ratio, self.index_heads)
         scores = scores.relu() * weights.unsqueeze(-1)
         # Preserve the local-head BF16 sums before reducing across all TP
         # ranks. The gathered head axis includes four shards for TP4.
@@ -1064,6 +1316,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         visible_rows=None,
         partition_tiles=False,
         partition_mirror=False,
+        prepared_scores=None,
     ):
         """Exact bounded-memory index selection for a large prompt block."""
         columns = rows.shape[-1]
@@ -1099,9 +1352,9 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         best_scores = best_rows = None
         block_scores = block_ids = None
         invalid_scores = None
-        prefix_scores = None
+        prefix_scores = prepared_scores
         if (
-            not native_scores
+            prefix_scores is None and not native_scores
             and rows.ndim == 1
             and getattr(self, "index_mirror_scores", False)
             and self._uses_index_mirror(q)
@@ -1112,9 +1365,22 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
 
             prefix_scores = mirror_source_scores(q, weights, self.cache.index_mirror, positions,
                                                  rows[:active_columns], self.ratio, self.index_heads)
+        from vllm_gaudi.ops.deepseek_v41_decode_index import can_score_query_rows_together
+
+        if prefix_scores is None and not native_scores and can_score_query_rows_together(self, q, rows):
+            # Compute independent source tiles in one BMM/reduction. Slice
+            # scores below, preserving every streamed TopK merge and tie rule.
+            prefix_scores = self._scores(positions, rows, q, weights)
         from vllm_gaudi.ops.deepseek_v41_decode_selection import can_batch_full_r1
 
         batched_selection = can_batch_full_r1(self, q, rows, prefix_scores, native_scores, active_columns)
+        threshold_selection = (not native_scores and 2 <= q.shape[0] <= 6 and width == 512
+                               and ((getattr(self, "decode_threshold_selection", False)
+                                     and self.layer == self.candidate_source)
+                                    or (getattr(self, "dspark_runtime_selection", False)
+                                        and self.ratio == 1 and self.layer > self.candidate_source
+                                        and rows.ndim == 2))
+                               and 512 <= columns <= 32768 and columns % 64 == 0)
         selection_scores = []
         for start in range(0, columns, PREFILL_INDEX_ROWS):
             current_rows = (
@@ -1143,6 +1409,9 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             if batched_selection:
                 selection_scores.append(scores)
                 continue
+            if threshold_selection:
+                selection_scores.append(scores)
+                continue
             # An all-invalid tile cannot change valid Top512 rows. Omitting the
             # large merge is exact after invalid rows are normalized to -1,
             # while retaining candidate-block merges preserves their tie order.
@@ -1164,6 +1433,11 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 with prefill_event_span("index_candidates", getattr(self, "layer", None), positions.numel()):
                     block_scores, block_ids = self._merge_topk(block_scores, block_ids, grouped, ids, 2048)
 
+        if threshold_selection:
+            from vllm_gaudi.ops.deepseek_v41_decode_selection import threshold_decode_selection
+
+            return threshold_decode_selection(selection_scores, rows, positions, self.ratio,
+                                              collect_blocks=collect_blocks)
         if batched_selection:
             from vllm_gaudi.ops.deepseek_v41_decode_selection import batched_decode_selection
 
@@ -1286,12 +1560,20 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 else:
                     rows = torch.arange(self.search_length // self.ratio, device=positions.device, dtype=torch.int32)
                 q, weights = self._prepare_index_queries(value, qr, positions) if prepared is None else prepared
+                prepared_scores = None
+                if (self.dspark_candidate_keys and not prefill and 2 <= tokens <= NATIVE_WORK_TOKENS
+                        and self.layer > self.candidate_source and self._uses_index_mirror(q)
+                        and self.c6_index_reduce and blocks.shape[-1] % 8 == 0):
+                    from vllm_gaudi.ops.deepseek_v41_index_mirror import candidate_mirror_scores
+
+                    rows, prepared_scores = candidate_mirror_scores(self, q, weights, positions, blocks)
                 indices, candidate_scores, candidate_blocks = self._stream_topk(
                     positions,
                     rows,
                     q,
                     weights,
                     collect_blocks=self.layer == self.candidate_source,
+                    prepared_scores=prepared_scores,
                     native_scores=prefill and gaudi_envs.VLLM_HPU_DSV41_PREFILL_INDEX_MME,
                     visible_rows=None if prefill else self.decode_visible_rows,
                     partition_tiles=not prefill and tokens == 1 and getattr(self, "tp4_tile_selection", False),
@@ -1307,9 +1589,19 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                     )
                     self.shared.candidate_pool[target].copy_(candidate_blocks)
                 # Sort logical positions, with invalid picks after reachable ones.
-                indices = torch.where((indices >= 0) & (indices < count.unsqueeze(-1)), indices, self.length)
-                indices = indices.sort(-1).values
-                indices = torch.where(indices < self.length, indices, -1).int()
+                threshold_ordered = (self.decode_threshold_selection and rows.ndim == 1
+                                     and self.layer == self.candidate_source
+                                     and not prefill and 2 <= tokens <= 6
+                                     and 512 <= rows.shape[-1] <= 32768 and rows.shape[-1] % 64 == 0)
+                if threshold_ordered:
+                    # Full source offsets are increasing logical rows.
+                    # Reindex retains its logical-ID sort: its supplied
+                    # candidate pool can originate from an older capture.
+                    indices = torch.where((indices >= 0) & (indices < count.unsqueeze(-1)), indices, -1).int()
+                else:
+                    indices = torch.where((indices >= 0) & (indices < count.unsqueeze(-1)), indices, self.length)
+                    indices = indices.sort(-1).values
+                    indices = torch.where(indices < self.length, indices, -1).int()
             self.selection.indices[target].copy_(indices)
         return self.selection.indices[target]
 
@@ -1324,9 +1616,23 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
 
     def _finish_output(
         self, output, positions, ready_outputs=(), *, prefill=False, prefill_sequence=False, request_batch=False,
-        decode=False
+        decode=False, deferred_output=False, inverse_rotated=False
     ):
         """Apply the shared output projection after either attention path."""
+        if (not prefill and 2 <= output.shape[0] <= NATIVE_WORK_TOKENS
+                and gaudi_envs.VLLM_HPU_DSV41_DSPARK_WO_HANDOFF):
+            wa, wb = self.weights.wo_a, self.weights.wo_b
+            if not (self.woa_fp8 and self.woa_output_roundtrip and getattr(wb, "dense_fp8", False)):
+                raise ValueError("C2-C6 output handoff requires the accepted C1 FP8 sidecars")
+            if inverse_rotated:
+                grouped = output.reshape(-1, self.groups, self.heads // self.groups * 512).contiguous()
+                partial = torch.ops.custom_op.custom_deepseek_v41_woa_wob_roundtrip_fp8_gaudi2(
+                    grouped, wa.weight, wa.channel_scale, wb.weight, wb.channel_scale)
+            else:
+                partial = torch.ops.custom_op.custom_deepseek_v41_rope_woa_wob_roundtrip_fp8_gaudi2(
+                    output.contiguous(), wa.weight, wa.channel_scale, wb.weight, wb.channel_scale,
+                    positions.to(torch.int32).contiguous(), self._rotary_native_table())
+            return self._reduce_output(partial, ready_outputs, decode=decode, deferred_output=deferred_output)
         if (decode and not prefill and output.shape[0] == 1 and self.native_rope
                 and gaudi_envs.VLLM_HPU_DSV41_WOA_DENSE_HANDOFF and self.woa_fp8
                 and self.woa_output_roundtrip and getattr(self.weights.wo_b, "dense_fp8", False)):
@@ -1338,7 +1644,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         if prefill:
             with prefill_event_span("attention_output_inverse_rope", self.layer, output.shape[0]):
                 output = self._rope(output, positions, inverse=True, request_batch=request_batch)
-        else:
+        elif not inverse_rotated:
             output = self._rope(output, positions, inverse=True, request_batch=request_batch)
         output = output.reshape(-1, self.groups, self.heads // self.groups * 512)
         if prefill and gaudi_envs.VLLM_HPU_DSV41_PREFILL_OUTPUT_PROJECTION and 6 < output.shape[0] <= 16384:
@@ -1366,17 +1672,27 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             )
             return self._reduce_decode_output(partial, ready_outputs, decode=decode)
         output = self.project_output(output)
-        return self._finish_projected_output(output, ready_outputs, decode=decode)
+        return self._finish_projected_output(output, ready_outputs, decode=decode, deferred_output=deferred_output)
 
-    def _finish_projected_output(self, output, ready_outputs=(), *, decode=False):
+    def _finish_projected_output(self, output, ready_outputs=(), *, decode=False, deferred_output=False):
         """Consume an already inverse-rotated and wo_a-projected row."""
         partial = self.project_output_consumer(output)
-        return self._reduce_decode_output(partial, ready_outputs, decode=decode)
+        return self._reduce_output(partial, ready_outputs, decode=decode, deferred_output=deferred_output)
 
-    def _reduce_decode_output(self, partial, ready_outputs=(), *, decode=False):
+    def _reduce_output(self, partial, ready_outputs=(), *, decode=False, deferred_output=False):
+        if deferred_output:
+            if self.scheduled_peer_operands is not None:
+                return self.scheduled_peer_operands(partial, ready_outputs)
+            # Keep the existing native peer exchange. Its rank-ordered BF16
+            # operands go directly to the shared post/collapse/norm consumer.
+            # C6 is 30720 elements, within the established small-message path.
+            return self.gather(partial.reshape(1, -1), 1).reshape(self.tensor_parallel_size, *partial.shape)
         if decode and getattr(self, "peer_post_collapse", False) and partial.shape[0] <= 2:
             return self.reduce(partial, ready_outputs=ready_outputs, defer=True)
         return self.reduce(partial, ready_outputs=ready_outputs) if ready_outputs else self.reduce(partial)
+
+    def _reduce_decode_output(self, partial, ready_outputs=(), *, decode=False):
+        return self._reduce_output(partial, ready_outputs, decode=decode)
 
     def _can_fuse_mla_woa(self, positions):
         """Return whether the exact MLA-product/wo_a producer is available."""
@@ -1389,7 +1705,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             return torch.ops.custom_op.custom_deepseek_v41_paged_mla_direct_mme_gaudi2
         return torch.ops.custom_op.custom_deepseek_v41_paged_mla_mme_gaudi2
 
-    def _output(self, query, cache, indices, positions, ready_outputs=(), *, decode=False):
+    def _output(self, query, cache, indices, positions, ready_outputs=(), *, decode=False, deferred_output=False):
         if decode and self.mla_mme and 1 <= query.shape[0] <= NATIVE_WORK_TOKENS:
             lengths = torch.full((query.shape[0],), indices.shape[1], dtype=torch.int32, device=query.device)
             output = torch.ops.custom_op.custom_deepseek_v41_selected_mla_mme_gaudi2(
@@ -1400,11 +1716,11 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 self.scale,
                 lengths,
             )
-            return self._finish_output(output, positions, ready_outputs, decode=decode)
+            return self._finish_output(output, positions, ready_outputs, decode=decode, deferred_output=deferred_output)
         output, _, _ = torch.ops.custom_op.custom_deepseek_v4_sparse_attn_bf16_gaudi2(
             query.contiguous(), cache.contiguous(), indices.contiguous(), self.weights.attn_sink, self.scale
         )
-        return self._finish_output(output, positions, ready_outputs, decode=decode)
+        return self._finish_output(output, positions, ready_outputs, decode=decode, deferred_output=deferred_output)
 
     @prefill_scope("indexer")
     def _prefill_selections(self, value, qr, positions, prepared):
@@ -1531,8 +1847,8 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             positions,
             self.swa,
             self.window_offsets,
-            self.shared.decoded_swa if decoded else None,
-            self.decoded_swa_offset if decoded else 0,
+            self.swa_decoded.swa if self.dspark_swa_cache else self.shared.decoded_swa if decoded else None,
+            0 if self.dspark_swa_cache else self.decoded_swa_offset if decoded else 0,
         )
 
     def _prefill_attention_tiled(self, value, query, kv, positions, selected, ready_outputs=(), prefill_sequence=False):
@@ -1543,6 +1859,9 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             pos = positions[start:stop]
             packed_swa = pack_swa(kv[start:stop])
             self.swa.index_copy_(0, pos.remainder(SWA_ROWS).long(), packed_swa)
+            if self.dspark_swa_cache:
+                self.swa_decoded.swa.index_copy_(
+                    0, pos.remainder(SWA_ROWS).long(), unpack_swa(packed_swa).bfloat16())
             window = pos.unsqueeze(-1) - self.window + 1 + self.window_offsets.unsqueeze(0)
             indices = torch.where(window >= 0, window.remainder(SWA_ROWS), -1).int()
             cache = None
@@ -1766,13 +2085,19 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
     @prefill_scope("attention")
     def forward(
         self, value, positions, ready_outputs=(), *, decode=False, prefill_sequence=False,
-        prefill_qkv_sequence=False, selected_main=None, decode_metadata=None, input_prequant=None
+        prefill_qkv_sequence=False, selected_main=None, decode_metadata=None, input_prequant=None,
+        deferred_output=False, input_roundtrip=None
     ):
+        if deferred_output and (not decode or not 2 <= value.shape[0] <= NATIVE_WORK_TOKENS):
+            raise ValueError("Deferred attention output requires C2-C6 decode")
         metadata = decode_metadata if decode and self.shared_decode_metadata else None
         prefill = not decode and value.shape[0] > NATIVE_WORK_TOKENS
         if prefill_sequence and not prefill:
             raise ValueError("Token ownership is confined to the prompt path")
         token_group = None
+        if input_roundtrip is not None and (not decode or prefill_sequence or prefill_qkv_sequence):
+            raise ValueError("Prepared roundtrip is confined to ordinary decode")
+        fused_fp8_prologue = False
         if input_prequant is not None and (not decode or prefill_sequence or prefill_qkv_sequence):
             raise ValueError("Attention input prequantization is confined to ordinary decode")
         projection_value = value
@@ -1796,13 +2121,20 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             with prefill_event_span("attention_input_projection", self.layer, projection_value.shape[0]):
                 query_input, kv_input = self._project_qkv_input(projection_value, token_group=token_group)
         else:
-            query_input, kv_input = (self._project_qkv_input(value) if input_prequant is None
-                                     else self._project_qkv_input(value, prequant=input_prequant))
+            fused_fp8_prologue = (self.fp8_qkv_prologue and decode and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS
+                                 and not prefill_qkv_sequence)
+            if fused_fp8_prologue:
+                query_input = kv_input = None
+            else:
+                query_input, kv_input = self._project_qkv_input(
+                    value, prequant=input_prequant, roundtrip=input_roundtrip)
         norm = (
             torch.ops.custom_op.custom_deepseek_v41_attention_norm_bf16_gaudi2
-            if self.fused_norm
+            if (self.dspark_query_norm and decode and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS)
+            or self.fused_norm
             and (
                 value.shape[0] == 1
+                or self.c6_query_fusion and decode and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS
                 or (
                     not decode
                     and gaudi_envs.VLLM_HPU_DSV41_PREFILL_NATIVE_NORM
@@ -1822,7 +2154,8 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         needs_index_query = self.ratio and self.owns_index and self.search_length // self.ratio > 512
         fused_query_norm = (
             decode
-            and value.shape[0] == 1
+            and (value.shape[0] == 1 or self.c6_query_fusion
+                 and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS)
             and self.fused_norm
             and self.q_scale_rope
             and self.native_rope
@@ -1835,14 +2168,31 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             and self.search_length // self.ratio <= self.cache.decoded_main.shape[0]
         )
         joint_qkv = (
+            self.dspark_qkv_publish and decode and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS
+            and self.fused_norm and self.q_scale_rope and self.native_rope
+            and getattr(self.weights.wq_b, "dense_fp8", False)
+        )
+        c1_joint_qkv = (
             decode and value.shape[0] == 1 and self.fused_norm and self.native_rope and self.q_scale_rope
             and getattr(self.weights.wq_b, "dense_fp8", False)
             and getattr(self.shared, "decoded_swa", None) is not None
             and gaudi_envs.VLLM_HPU_DSV41_QKV_FUSED_PROLOGUE
             and hasattr(torch.ops.custom_op, "custom_deepseek_v41_qkv_projection_publish_gaudi2")
         )
+        publish_completion = None
         completion = None
-        if joint_qkv:
+        if not prefill and fused_fp8_prologue:
+            qr, query, kv = self._project_fp8_qkv_prologue(value, positions, prequant=input_prequant)
+            joint_qkv = False
+        elif joint_qkv:
+            publish_decoded = (self.decoded_kv_state and self.ratio in (1, 2)
+                               and self.search_length // self.ratio <= self.cache.decoded_main.shape[0])
+            query, kv, publish_completion, qr = self.project_qkv_publish(
+                query_input, kv_input, positions, publish_decoded)
+            query = query.reshape(-1, self.heads, 512)
+            positions = publish_completion[:, 0].contiguous()
+        elif c1_joint_qkv:
+            joint_qkv = True
             query, kv, completion, qr = torch.ops.custom_op.custom_deepseek_v41_qkv_projection_publish_gaudi2(
                 query_input.contiguous(), self.weights.q_norm.weight, kv_input.contiguous(),
                 self.weights.kv_norm.weight, positions.to(torch.int32).contiguous(), self._rotary_native_table(),
@@ -1852,6 +2202,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             # A real query output and the completed publication both depend on
             # the same TPC producer, retaining canonical cache store ordering.
             positions = completion[:1]
+            publish_completion = completion
         elif fused_query_norm:
             qr = None
             query = self.project_query_input(query_input, positions)
@@ -1862,8 +2213,17 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                         qr = norm(query_input.contiguous(), self.weights.q_norm.weight, self.eps)
                     query = self.project_query(qr, positions, decode=decode)
             else:
-                qr = norm(query_input.contiguous(), self.weights.q_norm.weight, self.eps)
-                query = self.project_query(qr, positions, decode=decode)
+                weight = self.weights.wq_b
+                if (gaudi_envs.VLLM_HPU_DSV41_DSPARK_NORM_ROUNDTRIP and decode
+                        and 2 <= value.shape[0] <= 6 and weight.weight.dtype == torch.bfloat16
+                        and hasattr(weight, "scale") and not getattr(weight, "dense_fp8", False)
+                        and "dspark_hw_weight" not in weight._buffers):
+                    qr, query_roundtrip = torch.ops.custom_op.custom_deepseek_v41_norm_roundtrip_bf16_gaudi2(
+                        query_input.contiguous(), self.weights.q_norm.weight, self.eps)
+                    query = self.project_query(qr, positions, decode=decode, roundtrip=query_roundtrip)
+                else:
+                    qr = norm(query_input.contiguous(), self.weights.q_norm.weight, self.eps)
+                    query = self.project_query(qr, positions, decode=decode)
         shared_key = ((self.kv_source, self.index_source, self.ratio)
                       if gaudi_envs.VLLM_HPU_DSV41_KV_REUSE_FUSION and self.ratio else None)
         fused_reuse = (
@@ -1873,25 +2233,37 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             and gaudi_envs.VLLM_HPU_DSV41_KV_REUSE_FUSION
             and hasattr(torch.ops.custom_op, "custom_deepseek_v41_kv_norm_reuse_mla_gaudi2")
         )
-        fused_publish = (
+        c1_fused_publish = (
             not fused_reuse and not joint_qkv and decode and value.shape[0] == 1 and self.fused_norm and self.native_rope
             and self.decoded_kv_state and self.shared.decoded_swa is not None
             and self.ratio in (1, 2) and (decoded or self._uses_logical_mla(value, decoded))
             and gaudi_envs.VLLM_HPU_DSV41_ATTN_FUSED_PROLOGUE
         )
-        if joint_qkv:
-            pass  # The common producer already emits KV and owns its cache write.
+        fused_publish = (self.dspark_kv_publish and decode and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS
+                         and not fused_fp8_prologue)
+        if joint_qkv or fused_fp8_prologue:
+            pass
         elif fused_reuse:
-            kv = None  # The current row is normalized/encoded in its consuming gather.
-        elif fused_publish:
+            kv = None
+        elif c1_fused_publish:
             kv, completion = torch.ops.custom_op.custom_deepseek_v41_kv_norm_rope_publish_gaudi2(
-                kv_input.contiguous(), self.weights.kv_norm.weight,
-                positions.to(torch.int32).contiguous(), self._rotary_native_table(),
-                self.swa, self.shared.decoded_swa, self.eps,
+                kv_input.contiguous(), self.weights.kv_norm.weight, positions.to(torch.int32).contiguous(),
+                self._rotary_native_table(), self.swa, self.shared.decoded_swa, self.eps,
                 self.decoded_swa_offset if decoded else -1)
-            # The emitted logical position is also the cache-consumer edge.
-            # Alias-only writes do not order a packed gather in Synapse.
             positions = completion[:1]
+            publish_completion = completion
+            fused_publish = True
+        elif fused_publish:
+            publish_decoded = (self.decoded_kv_state and self.ratio in (1, 2)
+                               and self.search_length // self.ratio <= self.cache.decoded_main.shape[0])
+            kv, publish_completion = torch.ops.custom_op.custom_deepseek_v41_dspark_kv_norm_publish_gaudi2(
+                kv_input.contiguous(), self.weights.kv_norm.weight, positions.to(torch.int32).contiguous(),
+                self._rotary_native_table(), self.swa,
+                self.shared.decoded_swa if publish_decoded else self.publish_decoded_unused,
+                self.eps, self.decoded_swa_offset if publish_decoded else -1)
+            # A real position result orders every SWA byte store before the
+            # subsequent logical gather; alias annotations alone do not.
+            positions = publish_completion[:, 0].contiguous()
         elif prefill:
             with prefill_event_span("attention_kv_norm_rope", self.layer, value.shape[0]):
                 kv = self.project_kv(kv_input, positions, decode=decode)
@@ -1900,9 +2272,22 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         if not decode and value.shape[0] > NATIVE_WORK_TOKENS:
             del query_input, kv_input
             return self._prefill_attention(value, qr, query, kv, positions, ready_outputs, prefill_sequence)
-        if joint_qkv or fused_publish or fused_reuse:
-            pass  # The fused producer owns the canonical SWA ring write.
+        decoded = (
+            self.decoded_kv_state
+            and self.ratio in (1, 2)
+            and self.search_length // self.ratio <= self.cache.decoded_main.shape[0]
+        )
+        completion = publish_completion
+        if self.dspark_swa_cache and decode and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS:
+            completion = torch.ops.custom_op.custom_deepseek_v41_swa_batch_cache_ordered_gaudi2(
+                self.swa, kv.contiguous(), positions.to(torch.int32).contiguous(), self.swa_decoded.swa)
+        elif fused_publish or joint_qkv or fused_reuse:
+            pass
         elif decoded and value.shape[0] == 1:
+            # The native writer maps this logical position into the shared
+            # 256-row circular namespace for both packed and decoded state.
+            # Keeping the modulo inside that existing TPC pass avoids one
+            # generic div/mod launch in every decoded Attention layer.
             logical_position = positions.to(torch.int32).contiguous()
             completion = torch.ops.custom_op.custom_deepseek_v41_swa_paged_decoded_write_bf16_gaudi2(
                 self.swa, kv.contiguous(), logical_position, logical_position,
@@ -1911,6 +2296,8 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             packed_swa = pack_swa(kv)
             ring_rows = positions.remainder(SWA_ROWS).long() if metadata is None else metadata[0]
             self.swa.index_copy_(0, ring_rows, packed_swa)
+            if self.dspark_swa_cache:
+                self.swa_decoded.swa.index_copy_(0, ring_rows, unpack_swa(packed_swa).bfloat16())
             if decoded:
                 self.shared.decoded_swa.index_copy_(
                     0, positions.remainder(SWA_ROWS).long() + self.decoded_swa_offset, unpack_swa(packed_swa)
@@ -1969,7 +2356,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                         self.weights.wo_b.weight,
                         self.weights.wo_b.channel_scale,
                     )
-                    return self._reduce_decode_output(partial, ready_outputs, decode=decode)
+                    return self._reduce_output(partial, ready_outputs, decode=decode, deferred_output=deferred_output)
                 # The paged state keeps SWA as a 256-row ring and main KV as
                 # logical compressed rows.  Reuse the fixed prefix layout so
                 # the decoded mirror sees [SWA ring, logical main] rather than
@@ -1996,7 +2383,15 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                     self.cache.decoded_main.shape[0],
                     SWA_ROWS,
                 )
-                return self._finish_output(output, positions, ready_outputs, decode=decode)
+                return self._finish_output(output, positions, ready_outputs, decode=decode, deferred_output=deferred_output)
+            if self.dspark_main_mirror and decode and self.search_length <= 32768 and 2 <= value.shape[0] <= 6:
+                lengths = (torch.full((value.shape[0],), 640, dtype=torch.int32, device=value.device)
+                           if metadata is None else metadata[1])
+                output = torch.ops.custom_op.custom_deepseek_v41_logical_main_mirror_gaudi2(
+                    query.contiguous(), self.swa, self.cache.main_mirror, selected.contiguous(),
+                    positions.to(torch.int32).contiguous(), self.shared.block_table, self.weights.attn_sink,
+                    self.scale, lengths.contiguous(), self.ratio, True)
+                return self._finish_output(output, positions, ready_outputs, decode=decode, deferred_output=deferred_output)
             if native_logical:
                 # Keep page lookup and the sliding-window mapping inside the
                 # first packed-KV consumer, alongside its exact BF16 codec.
@@ -2005,31 +2400,38 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                     if metadata is None
                     else metadata[1]
                 )
-                if self.shared_main_mla and value.shape[0] == 1 and selected_main is not None:
+                if selected_main is not None and (
+                    self.shared_main_mla and value.shape[0] == 1
+                    or (self.dspark_layer_main_reuse or self.dspark_layer_main_split)
+                    and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS
+                ):
                     from vllm_gaudi.ops.deepseek_v41_shared_main import shared_main_attention
 
-                    if fused_reuse:
-                        main_rows, main_mask = selected_main[shared_key]
-                        output = torch.ops.custom_op.custom_deepseek_v41_kv_norm_reuse_mla_gaudi2(
-                            query.contiguous(), kv_input.contiguous(), self.weights.kv_norm.weight,
-                            self.swa, main_rows, main_mask, positions.to(torch.int32).contiguous(),
-                            self._rotary_native_table(), self.weights.attn_sink, self.scale, lengths, self.eps
-                        )
+                    if value.shape[0] == 1:
+                        if fused_reuse:
+                            main_rows, main_mask = selected_main[shared_key]
+                            output = torch.ops.custom_op.custom_deepseek_v41_kv_norm_reuse_mla_gaudi2(
+                                query.contiguous(), kv_input.contiguous(), self.weights.kv_norm.weight,
+                                self.swa, main_rows, main_mask, positions.to(torch.int32).contiguous(),
+                                self._rotary_native_table(), self.weights.attn_sink, self.scale, lengths, self.eps
+                            )
+                        else:
+                            projection = (gaudi_envs.VLLM_HPU_DSV41_MAIN_MLA_PROJECTION
+                                          and self._can_fuse_mla_woa(positions)
+                                          and getattr(self.weights.wo_b, "dense_fp8", False))
+                            mirror = (self.shared.decoded_swa.narrow(0, self.decoded_swa_offset, 512)
+                                      if decoded and gaudi_envs.VLLM_HPU_DSV41_MLA_DECODED_SWA else None)
+                            output = shared_main_attention(self, query, positions, selected, lengths, selected_main,
+                                                           projection=projection, decoded_swa=mirror)
+                            if projection:
+                                return self._reduce_output(output, ready_outputs, decode=decode,
+                                                           deferred_output=deferred_output)
                     else:
-                        projection = (gaudi_envs.VLLM_HPU_DSV41_MAIN_MLA_PROJECTION
-                                      and self._can_fuse_mla_woa(positions)
-                                      and getattr(self.weights.wo_b, "dense_fp8", False))
-                        # The existing decoded publisher/prefill/cache state owns
-                        # this mirror. Unavailable mirrors retain the packed
-                        # reader; no context cutoff is added to the MLA path.
-                        mirror = (self.shared.decoded_swa.narrow(0, self.decoded_swa_offset, 512)
-                                  if decoded and gaudi_envs.VLLM_HPU_DSV41_MLA_DECODED_SWA else None)
                         output = shared_main_attention(self, query, positions, selected, lengths, selected_main,
-                                                       projection=projection, decoded_swa=mirror)
-                        if projection:
-                            return self._reduce_decode_output(output, ready_outputs, decode=decode)
-                    return self._finish_output(output, positions, ready_outputs, decode=decode)
-                output = torch.ops.custom_op.custom_deepseek_v41_logical_mla_gaudi2(
+                                                       completion=completion)
+                    return self._finish_output(output, positions, ready_outputs, decode=decode, deferred_output=deferred_output,
+                                               inverse_rotated=self.dspark_stream_exp and 2 <= value.shape[0] <= 6)
+                logical_operands = (
                     query.contiguous(),
                     self.swa,
                     self.cache.main,
@@ -2041,7 +2443,87 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                     lengths,
                     self.ratio,
                 )
-                return self._finish_output(output, positions, ready_outputs, decode=decode)
+                if (self.dspark_compact_stream_mme and self.ratio in (1, 2)
+                        and self.search_length // self.ratio <= 65536
+                        and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS):
+                    output = torch.ops.custom_op.custom_deepseek_v41_logical_mla_compact_stream_mme_gaudi2(
+                        *logical_operands, True)
+                    return self._finish_output(output, positions, ready_outputs, decode=decode, deferred_output=deferred_output)
+                if (self.dspark_compact_kv_mme and self.ratio == 1 and self.search_length <= 65536
+                        and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS):
+                    output = torch.ops.custom_op.custom_deepseek_v41_logical_mla_compact_mme_gaudi2(
+                        *logical_operands, True)
+                    return self._finish_output(output, positions, ready_outputs, decode=decode, deferred_output=deferred_output)
+                if self.dspark_shared_kv_mme and self.ratio == 1 and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS:
+                    output = torch.ops.custom_op.custom_deepseek_v41_logical_mla_shared_mme_gaudi2(
+                        *logical_operands, True)
+                    return self._finish_output(output, positions, ready_outputs, decode=decode, deferred_output=deferred_output)
+                if self.dspark_mla_coord_cache and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS:
+                    output = torch.ops.custom_op.custom_deepseek_v41_logical_mla_coord_cached_gaudi2(
+                        *logical_operands, True)
+                    return self._finish_output(output, positions, ready_outputs, decode=decode, deferred_output=deferred_output)
+                if self.dspark_hash_mla and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS:
+                    output = torch.ops.custom_op.custom_deepseek_v41_logical_mla_hash_gaudi2(
+                        *logical_operands, bool(self.logical_mla_vector))
+                    return self._finish_output(output, positions, ready_outputs, decode=decode, deferred_output=deferred_output)
+                if self.dspark_pv_rope and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS:
+                    output = torch.ops.custom_op.custom_deepseek_v41_logical_mla_pv_rope_gaudi2(
+                        *logical_operands, bool(self.logical_mla_vector), self._rotary_native_table())
+                    return self._finish_output(output, positions, ready_outputs, decode=decode, deferred_output=deferred_output,
+                                               inverse_rotated=True)
+                if self.dspark_full_row and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS:
+                    output = torch.ops.custom_op.custom_deepseek_v41_logical_full_row_gaudi2(
+                        *logical_operands, True)
+                    return self._finish_output(output, positions, ready_outputs, decode=decode, deferred_output=deferred_output)
+                if self.dspark_fp4_table and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS:
+                    output = torch.ops.custom_op.custom_deepseek_v41_logical_fp4_table_gaudi2(
+                        *logical_operands, True)
+                    return self._finish_output(output, positions, ready_outputs, decode=decode, deferred_output=deferred_output)
+                if self.dspark_row_cache and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS:
+                    output = torch.ops.custom_op.custom_deepseek_v41_logical_row_cache_gaudi2(
+                        *logical_operands, True)
+                    return self._finish_output(output, positions, ready_outputs, decode=decode, deferred_output=deferred_output)
+                logical_op = torch.ops.custom_op.custom_deepseek_v41_logical_mla_gaudi2
+                if self.dspark_merge_cache and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS:
+                    output = torch.ops.custom_op.custom_deepseek_v41_logical_merge_cache_gaudi2(
+                        *logical_operands, True)
+                    return self._finish_output(output, positions, ready_outputs, decode=decode, deferred_output=deferred_output)
+                if self.dspark_batch6_kv and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS:
+                    output = torch.ops.custom_op.custom_deepseek_v41_logical_scale_batch6_gaudi2(
+                        *logical_operands, True)
+                    return self._finish_output(output, positions, ready_outputs, decode=decode, deferred_output=deferred_output)
+                if self.dspark_stacked_pv and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS:
+                    output = torch.ops.custom_op.custom_deepseek_v41_logical_scale_stacked_pv_gaudi2(
+                        *logical_operands, True)
+                    return self._finish_output(output, positions, ready_outputs, decode=decode, deferred_output=deferred_output)
+                if self.dspark_exp_pv and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS:
+                    output = torch.ops.custom_op.custom_deepseek_v41_logical_scale_exp_pv_gaudi2(
+                        *logical_operands, True)
+                    return self._finish_output(output, positions, ready_outputs, decode=decode, deferred_output=deferred_output)
+                if self.dspark_pair_pv and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS:
+                    # Gather remains batched; retain one BF16 KV operand for
+                    # QK and both high/low probability PV products. No FP32
+                    # copy of every selected KV value is materialized.
+                    output = torch.ops.custom_op.custom_deepseek_v41_logical_scale_pair_pv_gaudi2(
+                        *logical_operands, True)
+                    return self._finish_output(output, positions, ready_outputs, decode=decode, deferred_output=deferred_output)
+                if self.dspark_scale_cache and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS:
+                    logical_op = torch.ops.custom_op.custom_deepseek_v41_logical_scale_cache_gaudi2
+                if getattr(self, "c6_fp4_cache_write", False) and compressed_completion is not None:
+                    output = torch.ops.custom_op.custom_deepseek_v41_logical_mla_write_ordered_gaudi2(
+                        *logical_operands, compressed_completion, True)
+                elif value.shape[0] > 1 and getattr(self, "logical_mla_vector", False):
+                    if (self.dspark_merged_mla and self.ratio == 1
+                            and 512 < self.search_length <= 65536):
+                        output = torch.ops.custom_op.custom_deepseek_v41_logical_mla_merged_gaudi2(
+                            *logical_operands, True, self.search_length)
+                        return self._finish_output(output, positions, ready_outputs, decode=decode, deferred_output=deferred_output)
+                    if self.dspark_cohesive_mla and self.ratio == 1:
+                        logical_op = torch.ops.custom_op.custom_deepseek_v41_logical_mla_cohesive_gaudi2
+                    output = logical_op(*logical_operands, True)
+                else:
+                    output = logical_op(*logical_operands)
+                return self._finish_output(output, positions, ready_outputs, decode=decode, deferred_output=deferred_output)
             physical = None if native_prefix else self.shared.physical_rows(selected.clamp_min(0), self.ratio)
             if (
                 decode
@@ -2091,7 +2573,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                         self.scale,
                         lengths,
                     )
-                    return self._finish_output(output, positions, ready_outputs, decode=decode)
+                    return self._finish_output(output, positions, ready_outputs, decode=decode, deferred_output=deferred_output)
                 row_ids, attention_indices = _selected_attention_layout(
                     physical, selected, indices, self.swa_offsets, self.selected_offsets
                 )
@@ -2109,7 +2591,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                         self.scale,
                         lengths,
                     )
-                    return self._finish_output(output, positions, ready_outputs, decode=decode)
+                    return self._finish_output(output, positions, ready_outputs, decode=decode, deferred_output=deferred_output)
                 output = torch.ops.custom_op.custom_deepseek_v41_paged_attention_bf16_gaudi2(
                     query.contiguous(),
                     self.swa.contiguous(),
@@ -2119,7 +2601,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                     self.weights.attn_sink,
                     self.scale,
                 )
-                return self._finish_output(output, positions, ready_outputs, decode=decode)
+                return self._finish_output(output, positions, ready_outputs, decode=decode, deferred_output=deferred_output)
             else:
                 packed = self.cache.main.index_select(0, physical.flatten().long())
                 cache = torch.cat((unpack_swa(self.swa), unpack_fp4(packed)), 0)
@@ -2135,9 +2617,10 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                     self.swa_offsets.reshape(1, -1), indices.contiguous(),
                     self.weights.attn_sink, self.scale, self.swa_only_lengths[:value.shape[0]],
                 )
-                return self._finish_output(output, positions, ready_outputs, decode=decode)
+                return self._finish_output(output, positions, ready_outputs, decode=decode, deferred_output=deferred_output)
             cache = unpack_swa(self.swa)
-        return self._output(query, cache, indices, positions, ready_outputs, decode=decode)
+        return self._output(query, cache, indices, positions, ready_outputs, decode=decode,
+                            deferred_output=deferred_output)
 
     def _compress_batch(self, value, positions, slots, pages):
         from vllm_gaudi.ops.deepseek_v41_batch_attention import batch_physical_rows, read_state_rows, write_state_rows
@@ -2340,16 +2823,44 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             mask = torch.arange(indices.numel(), device=indices.device) < valid_count.reshape(1)
             packed = torch.where(mask.reshape(-1, 1), packed, old)
         self.swa.index_copy_(0, indices, packed)
+        if self.dspark_swa_cache:
+            self.swa_decoded.swa.index_copy_(0, indices, unpack_swa(packed).bfloat16())
         return self.swa
 
     def draft(self, value, positions):
-        query = rms_norm(self.linear(value, self.weights.wq_a), self.weights.q_norm.weight, self.eps)
-        query = self._rope(self.linear(query, self.weights.wq_b).reshape(-1, self.heads, 512), positions)
-        kv = rms_norm(self.linear(value, self.weights.wkv), self.weights.kv_norm.weight, self.eps)
-        kv = unpack_swa(pack_swa(self._rope(kv, positions)))
-        cache = torch.cat((unpack_swa(self.swa), kv), 0)
+        if self.draft_dense_fp8:
+            query_input, kv_input = self.draft_input_projection(value)
+        else:
+            query_input, kv_input = self._project_qkv_input(value)
+        query = rms_norm(query_input.contiguous(), self.weights.q_norm.weight, self.eps)
+        query = self.project_query(query, positions)
+        kv = rms_norm(kv_input.contiguous(), self.weights.kv_norm.weight, self.eps)
+        packed_kv = pack_swa(self._rope(kv, positions))
         window = positions[:1] - self.window + self.window_offsets
         window = torch.where(window >= 0, window.remainder(SWA_ROWS), -1)
         draft_slots = SWA_ROWS + positions - positions[:1]
         indices = torch.cat((window, draft_slots), 0).unsqueeze(0).expand(5, -1).int()
+        if self.draft_packed_mla:
+            # Preserve the model's joint five-row visibility: all five new
+            # rows are visible to every query. Tentative KV never mutates the
+            # accepted-prefix ring. Reuse the ordinary packed MLA codec,
+            # QK/softmax/PV and BF16 output boundary, with masked alignment.
+            packed = torch.cat((self.swa, packed_kv), 0).contiguous()
+            indices = F.pad(indices, (0, -indices.shape[-1] % 64), value=-1).contiguous()
+            output = torch.ops.custom_op.custom_deepseek_v41_paged_mla_mme_gaudi2(
+                query.contiguous(), packed, self.swa_only_main,
+                self.draft_mla_rows, indices,
+                self.weights.attn_sink, self.scale, self.draft_mla_lengths,
+            )
+            return self._finish_output(output, positions)
+        if self.draft_kv_decode:
+            # Isolate cache decoding from the matrix numerical path. Keep
+            # the original133-column indices and original sparse consumer;
+            # one shared decoder replaces graph-wide unpack/cast/where.
+            cache, _ = torch.ops.custom_op.custom_deepseek_v41_selected_kv_bf16_gaudi2(
+                torch.cat((self.swa, packed_kv), 0).contiguous(),
+                self.swa_only_main, self.draft_mla_rows, False)
+        else:
+            kv = unpack_swa(packed_kv)
+            cache = torch.cat((unpack_swa(self.swa), kv), 0)
         return self._output(query, cache, indices, positions)

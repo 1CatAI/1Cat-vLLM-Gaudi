@@ -42,17 +42,29 @@ static inline float64_pair_t kv_bf16_to_f32_linear(bfloat128 input) {
     return (float64_pair_t){first.v1, second.v1};
 }
 
+#ifndef DSV41_KV_NORM_EXTRA_INPUTS
+#define DSV41_KV_NORM_EXTRA_INPUTS
+#endif
+#ifndef DSV41_KV_NORM_LOAD_VALUE
+#define DSV41_KV_NORM_LOAD_VALUE(at) v_bf16_ld_tnsr_b(at, input)
+#endif
+#ifdef DSV41_KV_NORM_FUNCTION
+static inline void kv_norm_rope_row(tensor input, tensor weight, DSV41_KV_NORM_EXTRA_INPUTS
+          tensor positions, tensor phase, tensor output, float epsilon, float inverse_width,
+          const int5 begin, const int5 end) {
+#else
 void main(tensor input, tensor weight, tensor positions, tensor phase,
           tensor output, float epsilon, float inverse_width) {
     const int5 begin = get_index_space_offset();
     const int5 end = begin + get_index_space_size();
+#endif
     bfloat128 cached[4];
     for (int row = begin[0]; row < end[0]; ++row) {
         float128 squares = {0};
         #pragma unroll (4)
         for (int tile = 0; tile < 4; ++tile) {
             const int5 at = {tile * 128, row, 0, 0, 0};
-            const bfloat128 value = v_bf16_ld_tnsr_b(at, input);
+            const bfloat128 value = DSV41_KV_NORM_LOAD_VALUE(at);
             cached[tile] = value;
             squares = v_bf16_mac_acc32_b(
                 value, value, squares, (e_no_negation) << 1);

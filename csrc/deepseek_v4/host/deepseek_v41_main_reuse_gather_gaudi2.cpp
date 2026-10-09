@@ -2,6 +2,9 @@
 #include "deepseek_v41_main_reuse_gather_gaudi2.hpp"
 #include <cstring>
 #include <initializer_list>
+#ifndef DSV41_MAIN_REUSE_OUTPUT_WIDTH
+#define DSV41_MAIN_REUSE_OUTPUT_WIDTH 640
+#endif
 extern unsigned char _binary___deepseek_v41_main_reuse_gather_gaudi2_o_start;
 extern unsigned char _binary___deepseek_v41_main_reuse_gather_gaudi2_o_end;
 extern unsigned char _binary___deepseek_v41_main_reuse_vector_gaudi2_o_start;
@@ -19,7 +22,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41MainReuseGatherGaudi2::GetGcDefinitions(
     if (in->inputTensorNr != 5) { in->inputTensorNr = 5; return GLUE_INCOMPATIBLE_INPUT_COUNT; }
     if (in->outputTensorNr != 3) { in->outputTensorNr = 3; return GLUE_INCOMPATIBLE_OUTPUT_COUNT; }
     const auto tokens = in->inputTensors[3].geometry.maxSizes[0];
-    if (tokens != 1) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+    if (tokens < 1 || tokens > 6) return GLUE_INCOMPATIBLE_INPUT_SIZE;
     auto matches = [](const Tensor& t, unsigned type, unsigned dims, uint64_t d0) {
         return t.geometry.dataType == type && t.geometry.dims == dims && t.geometry.maxSizes[0] == d0;
     };
@@ -31,10 +34,10 @@ tpc_lib_api::GlueCodeReturn DeepseekV41MainReuseGatherGaudi2::GetGcDefinitions(
         !matches(in->inputTensors[3], DATA_I32, 1, tokens) ||
         !matches(in->inputTensors[4], DATA_I32, 1, tokens)) return GLUE_INCOMPATIBLE_INPUT_SIZE;
     auto map = [](TensorAccessPattern& p, unsigned dim, unsigned axis, int a, int last) {
-        p.mapping[dim] = {axis, float(a), 0, float(last)};
+        p.mapping[dim] = {axis, float(a), 0, float(last), false};
     };
     out->indexSpaceRank = 2;
-    out->indexSpaceGeometry[0] = 640;
+    out->indexSpaceGeometry[0] = DSV41_MAIN_REUSE_OUTPUT_WIDTH;
     out->indexSpaceGeometry[1] = tokens;
     auto& swa = out->inputTensorAccessPattern[0];
     std::memset(&swa, 0, sizeof(swa));
@@ -51,12 +54,12 @@ tpc_lib_api::GlueCodeReturn DeepseekV41MainReuseGatherGaudi2::GetGcDefinitions(
     for (unsigned i = 0; i < 2; ++i) {
         const auto& g = in->outputTensors[i].geometry;
         if (!matches(in->outputTensors[i], i == 0 ? DATA_BF16 : DATA_F32, 3, 512) ||
-            g.maxSizes[1] != 640 || g.maxSizes[2] != tokens) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+            g.maxSizes[1] != DSV41_MAIN_REUSE_OUTPUT_WIDTH || g.maxSizes[2] != tokens) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
         map(out->outputTensorAccessPattern[i], 0, 0, 0, 511);
         map(out->outputTensorAccessPattern[i], 1, 0, 1, 0);
         map(out->outputTensorAccessPattern[i], 2, 1, 1, 0);
     }
-    if (!matches(in->outputTensors[2], DATA_F32, 2, 640) ||
+    if (!matches(in->outputTensors[2], DATA_F32, 2, DSV41_MAIN_REUSE_OUTPUT_WIDTH) ||
         in->outputTensors[2].geometry.maxSizes[1] != tokens) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
     map(out->outputTensorAccessPattern[2], 0, 0, 1, 0);
     map(out->outputTensorAccessPattern[2], 1, 1, 1, 0);

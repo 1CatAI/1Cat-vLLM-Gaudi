@@ -2,6 +2,9 @@
 #include <ATen/ATen.h>
 #include <torch/library.h>
 #include "hpu_ops/op_backend.h"
+#ifndef DSV41_MHC_CARRIED_RRMS_ONLY
+#define DSV41_MHC_CARRIED_RRMS_ONLY 0
+#endif
 namespace {
 constexpr auto schema = "custom_op::custom_deepseek_v41_mhc_mme_post_collapse_gaudi2";
 constexpr auto rrms_schema = "custom_op::custom_deepseek_v41_mhc_rrms_post_gaudi2";
@@ -13,7 +16,7 @@ habana::OutputMetaDataVector meta(const at::Stack& s) {
     const auto tokens=x.size(-2);
     TORCH_CHECK(tokens>=1 && tokens<=6 && x.size(-1)==5120 &&
         (x.dim()==2 || (x.size(0)>=2 && x.size(0)<=8)) &&
-        r.sizes()==at::IntArrayRef({tokens,4,5120}) && (raw.sizes()==at::IntArrayRef({tokens,48}) || raw.sizes()==at::IntArrayRef({tokens,25})) &&
+        r.sizes()==at::IntArrayRef({tokens,4,5120}) && ((!DSV41_MHC_CARRIED_RRMS_ONLY && raw.sizes()==at::IntArrayRef({tokens,48})) || raw.sizes()==at::IntArrayRef({tokens,25})) &&
         scale.sizes()==at::IntArrayRef({3}) && base.sizes()==at::IntArrayRef({24}),"Invalid mHC MME post/collapse geometry");
     for(int i=0;i<5;++i) {
         const auto t=s.at(i).toTensor();

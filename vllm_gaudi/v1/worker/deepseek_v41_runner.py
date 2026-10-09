@@ -7,8 +7,9 @@ Transport uses persistent HPU buffers and HCCL, with one outstanding request.
 
 from dataclasses import dataclass, field
 from contextlib import nullcontext
-from functools import wraps
+from functools import partial, wraps
 from pathlib import Path
+from types import FunctionType, MethodType
 import json
 import os
 import time
@@ -24,7 +25,7 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, EMPTY_MODEL_R
 from vllm_gaudi import envs
 from vllm_gaudi.extension.logger import logger as init_logger
 from vllm_gaudi.extension.profiler import HabanaHighLevelProfiler
-from vllm_gaudi.ops.deepseek_v41_config import decode_source_prefix_bound
+from vllm_gaudi.ops.deepseek_v41_config import decode_source_prefix_bound, select_native_warmup_geometries
 from vllm_gaudi.ops.deepseek_v41_indexer import INDEX_MME_HOT_TOKENS
 from vllm_gaudi.ops.deepseek_v41_diagnostics import trace_phase
 from vllm_gaudi.ops.deepseek_v41_state import PagedStageState, StageStateBlocks, register_state_spec
@@ -33,6 +34,7 @@ from vllm_gaudi.ops.deepseek_v41_verify import (
     AsyncDSparkOutput,
     DevicePPCommit,
     RECORD_SIZE,
+    STATUS,
     VerifyRing,
     validate_commit,
     validate_commit_wire,
@@ -52,6 +54,30 @@ VERIFY_METADATA_SIZE = 7
 VERIFY_PROPOSED_SIZE = 5
 VERIFY_CONTROL_SIZE = VERIFY_METADATA_SIZE + VERIFY_PROPOSED_SIZE
 PREFILL_BLOCK_TOKENS = DEFAULT_PREFILL_TOKENS
+
+
+class DraftContextPlans:
+    """Keep prompt and accepted-prefix shapes in separate compile entries."""
+
+    def __init__(self, insert_context):
+        self.insert_context = insert_context
+        self.plans = {}
+
+    def __call__(self, aux, positions):
+        signature = tuple(
+            (tuple(value.shape), tuple(value.stride()), value.dtype, value.device) for value in (aux, positions))
+        plan = self.plans.get(signature)
+        if plan is None:
+            function = self.insert_context.__func__
+            entry = FunctionType(function.__code__.replace(co_name=f"draft_insert_{len(self.plans)}"),
+                                 function.__globals__, function.__name__, function.__defaults__, function.__closure__)
+            entry.__kwdefaults__ = function.__kwdefaults__
+            bound = MethodType(entry, self.insert_context.__self__)
+            plan = torch.compile(bound, backend="hpu_backend", fullgraph=True, dynamic=False)
+            self.plans[signature] = plan
+        return plan(aux, positions)
+
+
 # Scheduler admission and device execution have different jobs.  vLLM may
 # admit a complete C8192 transaction, while the model executes it with this
 # finite set of exact (unpadded) shapes.  Powers down to C128 keep large-M
@@ -104,6 +130,7 @@ class RequestState:
     num_computed_tokens: int = 0
     output: list[int] = field(default_factory=list)
     recompute_until: int = 0
+    speculative_sampling: object | None = None
 
     @property
     def tokens(self):
@@ -333,8 +360,6 @@ class PPBuffers:
         self.dspark = bool(dspark)
         self.single_stage = getattr(self.group, "is_first_rank", False) and getattr(self.group, "is_last_rank", False)
         if self.single_stage:
-            if self.dspark:
-                raise ValueError("Single-stage V4.1 does not yet support DSpark")
             # No pipeline peer consumes hidden/pre buffers in TP4 x PP1.
             # Avoid reserving a full prompt-sized transport allocation.
             capacity = 0
@@ -476,9 +501,8 @@ class PPBuffers:
         # event on PP1; PP0 has no local producer dependency.  This lets the
         # two stages submit the small commit exchange while their compute
         # streams drain independently.
-        self.commit_stream = (
-            torch.hpu.Stream() if (envs.VLLM_HPU_DSV41_DEVICE_VERIFY and envs.VLLM_HPU_DSV41_INLINE_PP_COMMIT) else None
-        )
+        self.commit_stream = (torch.hpu.Stream() if not self.single_stage and
+                              (envs.VLLM_HPU_DSV41_DEVICE_VERIFY and envs.VLLM_HPU_DSV41_INLINE_PP_COMMIT) else None)
         self.commit_record_events = {}
         # PP1 can overlap the next stage-boundary exchange with a prior commit
         # broadcast.  Keep the work handle by source-ring address so a record
@@ -488,12 +512,8 @@ class PPBuffers:
 
     def prepare_commit_graph(self):
         """Compile the fixed direct PP commit exchange once per worker."""
-        if (
-            not self.dspark
-            or not envs.VLLM_HPU_DSV41_DEVICE_VERIFY
-            or not envs.VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE
-            or not envs.VLLM_HPU_DSV41_COMPILED_PP_COMMIT
-        ):
+        if (self.single_stage or not self.dspark or not envs.VLLM_HPU_DSV41_DEVICE_VERIFY
+                or not envs.VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE or not envs.VLLM_HPU_DSV41_COMPILED_PP_COMMIT):
             return
         from vllm_gaudi.ops.deepseek_v41_verify import pp_commit_receive, pp_commit_send
 
@@ -693,7 +713,8 @@ class PPBuffers:
             values += [-1] * (10 - len(values))
             values += list(draft) + [-1] * (5 - len(draft))
             self.commit.copy_(torch.tensor(values, dtype=torch.int64, device="cpu"))
-        self.group.broadcast(self.commit, src=1)
+        if not self.single_stage:
+            self.group.broadcast(self.commit, src=len(self.group.ranks) - 1)
         record = self.commit.cpu().tolist()
         if record[0] != self.generation or not 0 <= record[2] <= 6 or not 0 <= record[3] <= 5:
             raise RuntimeError("Stale or invalid PP verify commit generation")
@@ -757,7 +778,13 @@ class PPBuffers:
         PP0 validates and reads it only from the returned async result at the
         scheduler's actual consume point.
         """
-        if self.group.is_first_rank and self.generation != self.commit_consumed_generation:
+        if self.single_stage:
+            if record is None or record.numel() != RECORD_SIZE or record.dtype != self.device_commit.dtype:
+                raise RuntimeError("Sampling stage did not produce a complete device verify record")
+            self.generation += 1
+            self.commits += 1
+            return None
+        if (self.group.is_first_rank and self.generation != self.commit_consumed_generation):
             raise RuntimeError("PP device commit still has an unconsumed result")
         # PP0 must not reuse its receive/validation buffer before the prior
         # commit has been consumed.  PP1's source is a verify-ring slot,
@@ -1033,6 +1060,19 @@ class V41ModelRunner:
         self.verify_and_propose = None
         self.verify_prefix = None
         self.draft_from_prefix = None
+        self.sampled_verify_prefix = None
+        self.sampled_draft_from_prefix = None
+        self.native_draft_protocol = None
+        self.native_draft_body = None
+        self.sampled_native_protocols = {}
+        self.sampled_native_full_protocols = {}
+        self.sampled_round_frames = {}
+        self.device_round_inputs = self.device_round_engram = None
+        self.device_round_queue = None
+        self.device_round_tail = []
+        self.device_round_lookahead = 2 if envs.VLLM_HPU_DSV41_DSPARK_DEEP_QUEUE else 1
+        self.device_round_current = None
+        self.device_round_eligible = False
         # Metadata and draft ids are one fixed control payload.  Keeping views
         # for the compiled entry preserves its interface while turning two
         # independent tiny H2D copies into one 96-byte transfer.
@@ -1115,9 +1155,7 @@ class V41ModelRunner:
         self.model_memory_usage = torch.hpu.memory_allocated() - before
         if self.pp.group.is_last_rank and envs.VLLM_HPU_DSV41_DSPARK:
             draft = self.model.program.draft
-            self.insert_context = torch.compile(
-                draft.insert_context, backend="hpu_backend", fullgraph=True, dynamic=False
-            )
+            self.insert_context = DraftContextPlans(draft.insert_context)
             self.run_draft = torch.compile(draft, backend="hpu_backend", fullgraph=True, dynamic=False)
             self.sample_draft = torch.compile(draft.sample_greedy, backend="hpu_backend", fullgraph=True, dynamic=False)
             if envs.VLLM_HPU_DSV41_DEVICE_VERIFY:
@@ -1131,7 +1169,84 @@ class V41ModelRunner:
                 self.draft_from_prefix = torch.compile(
                     draft.draft_from_prefix, backend="hpu_backend", fullgraph=True, dynamic=False
                 )
-                self.verify_ring = VerifyRing(self.device, last_rank=True)
+                # These entries are used only by positive-temperature requests.
+                # The generic/greedy entries retain their original dispatch.
+                stochastic_only = envs.VLLM_HPU_DSV41_DSPARK_STOCHASTIC_ONLY
+                self.sampled_verify_prefix = torch.compile(
+                    partial(draft.verify_sampled_prefix_full, known_stochastic=stochastic_only),
+                    backend="hpu_backend", fullgraph=True, dynamic=False)
+                self.sampled_draft_from_prefix = torch.compile(
+                    partial(draft.draft_sampled_from_prefix, known_stochastic=stochastic_only),
+                    backend="hpu_backend", fullgraph=True, dynamic=False)
+                self.sampled_propose = torch.compile(
+                    partial(draft.propose_sampled_local, known_stochastic=stochastic_only),
+                    backend="hpu_backend", fullgraph=True, dynamic=False)
+                if envs.VLLM_HPU_DSV41_DSPARK_NATIVE_DRAFT_BODY:
+                    if not self.model.native:
+                        raise RuntimeError("Native C5 body requires the common native stage executor")
+                    from vllm_gaudi.ops.deepseek_v41_draft_body_replay import NativeDraftBody
+                    from vllm_gaudi.ops.deepseek_v41_verify import pack_record, encode_record_wire
+
+                    # Target search-bucket generations do not replace these
+                    # immutable MTP weights/ring allocations. Track the actual
+                    # draft ring identities instead of recapturing per bucket.
+                    self.native_draft_body = NativeDraftBody(
+                        draft, generation=lambda: tuple(id(layer.attention.swa) for layer in draft.layers))
+
+                    def body_inputs(anchor, positions, committed):
+                        return anchor.reshape(1), positions[0].int() + committed.int() + draft.offsets
+
+                    def body_sample(anchor, hidden, logits, controls):
+                        return draft.sample_proposal_local(
+                            anchor, hidden, logits, controls, full=True, force_legacy=True,
+                            known_stochastic=stochastic_only)
+
+                    def body_publish(metadata, output, committed, count, ids, enabled, status):
+                        record = pack_record(metadata, committed, count, output, ids, enabled, status)
+                        return record, encode_record_wire(record)
+
+                    self.native_body_inputs = torch.compile(
+                        body_inputs, backend="hpu_backend", fullgraph=True, dynamic=False)
+                    self.native_body_sample = torch.compile(
+                        body_sample, backend="hpu_backend", fullgraph=True, dynamic=False)
+                    self.native_body_publish = torch.compile(
+                        body_publish, backend="hpu_backend", fullgraph=True, dynamic=False)
+                    self.sampled_draft_from_prefix = self._sampled_draft_body_from_prefix
+                from vllm_gaudi.ops.deepseek_v41_speculative_sampling import speculative_sampling_draws
+
+                self.draw_speculative = torch.compile(
+                    speculative_sampling_draws, backend="hpu_backend", fullgraph=True, dynamic=False)
+                from vllm_gaudi.ops.deepseek_v41_sampling import sample_probabilities
+
+                self.sampled_prompt_target = torch.compile(
+                    partial(sample_probabilities, filtered=True), backend="hpu_backend", fullgraph=True, dynamic=False)
+                native_readback = native_record_readback = None
+                if envs.VLLM_HPU_DSV41_DEVICE_ROUNDS:
+                    from vllm_gaudi.ops.deepseek_v41_completion import resolve_device_runtime
+                    from vllm_gaudi.ops.deepseek_v41_device_engram import DeviceEngramRounds
+                    from vllm_gaudi.ops.deepseek_v41_round_inputs import DeviceRoundInputs
+
+                    if not self.pp.single_stage or not self.model.native:
+                        raise RuntimeError("Device rounds require one native stage owning input and sampling")
+                    bridge, _ = resolve_device_runtime(self.model.tensor_parallel_size)
+                    native_readback = bridge.copy_integer_record_to_host
+                    if envs.VLLM_HPU_DSV41_DSPARK_RECORD_READBACK:
+                        if getattr(bridge, "dspark_record_readback_version", None) != 1:
+                            raise RuntimeError("Bulk speculative readback requires its private bridge ABI")
+                        native_record_readback = bridge.copy_dspark_record_to_host
+                    self.device_round_inputs = DeviceRoundInputs(
+                        self.input_views[6], self.position_views[6],
+                        frames=4 if self.device_round_lookahead == 2 else 2)
+                    self.device_round_engram = DeviceEngramRounds(
+                        self.model.engram_host, self.input_views[6], self.device_round_inputs.history)
+                    if envs.VLLM_HPU_DSV41_NATIVE_DRAFT_PROTOCOL:
+                        from vllm_gaudi.ops.deepseek_v41_draft_replay import NativeDraftProtocol
+
+                        self.native_draft_protocol = NativeDraftProtocol(
+                            draft, generation=lambda: self.model.program.generation)
+                self.verify_ring = VerifyRing(self.device, last_rank=True, native_readback=native_readback,
+                                              native_record_readback=native_record_readback,
+                                              size=4 if self.device_round_lookahead == 2 else 2)
         elif envs.VLLM_HPU_DSV41_DEVICE_VERIFY and envs.VLLM_HPU_DSV41_DSPARK:
             self.verify_ring = VerifyRing(self.device, last_rank=False)
         elif self.pp.group.is_last_rank:
@@ -1408,6 +1523,11 @@ class V41ModelRunner:
 
     @trace_phase
     def _update(self, scheduled):
+        queued = getattr(self, "device_round_queue", None)
+        if queued is not None and queued[0] in (
+            set(scheduled.finished_req_ids) | set(getattr(scheduled, "preempted_req_ids", None) or ())
+        ):
+            self._discard_device_round()
         if self.request_slots_enabled:
             for req_id in getattr(scheduled, "preempted_req_ids", None) or ():
                 self._release_batch_state(req_id)
@@ -1624,7 +1744,7 @@ class V41ModelRunner:
                 # _bind_request has already installed canonical pages. Rebuild
                 # only at an ownership/prefill transition, before any compiled
                 # consumer; ordinary decode only maintains newly written rows.
-                if graph_c1 and count <= 6 and 512 < search <= mirror_capacity:
+                if (graph_c1 or (decode and self.use_dspark)) and count <= 6 and 512 < search <= mirror_capacity:
                     shared.prepare_index_mirror(start)
                 else:
                     shared.invalidate_index_mirror()
@@ -1699,7 +1819,7 @@ class V41ModelRunner:
             getattr(self.model, "native", False)
             or (self.v2_completion and getattr(self.model, "tensor_parallel_size", 2) == 4)
         ) and (
-            decode
+            (decode and 1 <= count <= (6 if self.use_dspark else 1))
             or (c1_replay and (self.request_slots_enabled or start + count <= 1024))
             or (start + count <= 1024 and self.use_dspark and request is not None)
         )
@@ -1770,13 +1890,9 @@ class V41ModelRunner:
         return result
 
     def _use_direct_verify_inputs(self, hidden, count):
-        return (
-            count == 6
-            and hidden.shape == self.verify_hidden.shape
-            and self.model.last_aux is not None
-            and self.model.last_aux.shape[0] == 6
-            and self.positions.shape[0] >= 6
-        )
+        positions = self.position_views.get(6)
+        return (count == 6 and hidden.shape == self.verify_hidden.shape and self.model.last_aux is not None
+                and self.model.last_aux.shape[0] == 6 and positions is not None and positions.shape == (6, ))
 
     def _finish_request_device(self, request, start, count, last_count, proposed, target_hidden):
         """Run one fixed C6 verify transaction and defer its sole host read."""
@@ -1810,7 +1926,7 @@ class V41ModelRunner:
             direct_c6 = self._use_direct_verify_inputs(target_hidden, last_count)
             verify_hidden = target_hidden if direct_c6 else self.verify_hidden
             verify_aux = self.model.last_aux if direct_c6 else self.verify_aux
-            verify_positions = self.positions if direct_c6 else self.verify_positions
+            verify_positions = self.position_views[6] if direct_c6 else self.verify_positions
             if not direct_c6:
                 self.verify_hidden.zero_()
                 self.verify_hidden[: target_hidden.shape[0]].copy_(target_hidden)
@@ -1850,17 +1966,22 @@ class V41ModelRunner:
             if timing:
                 timing.host("prefix_submit_start")
                 timing.device("prefix_start")
-            (
-                _,
-                prefix_output,
-                prefix_committed,
-                prefix_output_count,
-                anchor,
-                draft_enabled,
-                status,
-                commit_record,
-                commit_wire,
-            ) = self.verify_prefix(verify_hidden, self.verify_proposed, metadata, verify_aux, verify_positions)
+            sampled = request.sampling_params.temperature != 0
+            if sampled:
+                state = self._request_speculative_sampling(request)
+                draft_controls, acceptance, correction, target_controls = self.draw_speculative(
+                    state.parameters, state.seed, state.counter, state.offsets)
+                (
+                    prefix_output, prefix_committed, prefix_output_count, anchor, draft_enabled, status,
+                    commit_record, commit_wire,
+                ) = self.sampled_verify_prefix(
+                    verify_hidden, self.verify_proposed, state.proposal, metadata, verify_aux, verify_positions,
+                    target_controls, acceptance, correction)
+            else:
+                (
+                    _, prefix_output, prefix_committed, prefix_output_count, anchor, draft_enabled, status,
+                    commit_record, commit_wire,
+                ) = self.verify_prefix(verify_hidden, self.verify_proposed, metadata, verify_aux, verify_positions)
             if timing:
                 timing.device("prefix_done")
                 timing.host("prefix_submit_done")
@@ -1889,23 +2010,22 @@ class V41ModelRunner:
             # Continue draft control on the normal compute stream only after
             # the commit source has been snapshotted. PP0 can now validate the
             # prefix while these three layers execute on PP1.
-            record, wire_record, confidence = self.draft_from_prefix(
-                metadata,
-                verify_positions,
-                prefix_output,
-                prefix_committed,
-                prefix_output_count,
-                anchor,
-                draft_enabled,
-                status,
-            )
+            arguments = (metadata, verify_positions, prefix_output, prefix_committed, prefix_output_count,
+                         anchor, draft_enabled, status)
+            if sampled:
+                record, wire_record, confidence, probability, covered = self.sampled_draft_from_prefix(
+                    *arguments, draft_controls)
+                state.proposal.copy_(probability)
+                state.proposal_valid.copy_(covered.all().reshape(1) & draft_enabled & (status == 0))
+            else:
+                record, wire_record, confidence = self.draft_from_prefix(*arguments)
             ticket.record.copy_(record)
             if ticket.wire is not None:
                 ticket.wire.copy_(wire_record)
             self.last_draft_confidence = confidence
             if timing:
                 timing.device("draft_done")
-        if self.pp.group.is_first_rank and envs.VLLM_HPU_DSV41_INLINE_PP_COMMIT:
+        if (self.pp.group.is_first_rank and not self.pp.single_stage and envs.VLLM_HPU_DSV41_INLINE_PP_COMMIT):
             # Engram receives the validated count; PP0 also retains final token
             # ids because its scheduler cache does not resend that full prefix.
             # PP0 has no scheduler-visible sampled output.  Consume its small
@@ -1937,7 +2057,7 @@ class V41ModelRunner:
             self._record_round_completion(request, proposed, committed_value, output)
             self.pending = None
             return None
-        if self.pp.group.is_first_rank:
+        if self.pp.group.is_first_rank and not self.pp.single_stage:
             # Compatibility mode retains the asynchronous handoff until a
             # candidate proves the inline PP0 consume is safe and faster.
             def consume_pp(result):
@@ -2000,6 +2120,22 @@ class V41ModelRunner:
             self.verify_ring, ticket, consume, self._record_round_released if self.round_timing_enabled else None
         )
 
+    def _request_speculative_sampling(self, request):
+        """Bind probability and RNG state to the scheduler's request owner."""
+        from vllm_gaudi.ops.deepseek_v41_speculative_sampling import SpeculativeRequestSampling
+
+        if request.speculative_sampling is None:
+            import hashlib
+
+            params = request.sampling_params
+            seed = params.seed
+            if seed is None:
+                seed = int.from_bytes(hashlib.blake2b(request.req_id.encode(), digest_size=4).digest(), "little")
+            request.speculative_sampling = SpeculativeRequestSampling(
+                (params.temperature, params.top_p, params.top_k), seed,
+                self.model.program.draft.output_head.weight.shape[0], self.device)
+        return request.speculative_sampling
+
     @torch.inference_mode()
     @trace_phase
     def execute_model(self, scheduled):
@@ -2046,6 +2182,11 @@ class V41ModelRunner:
             with single_trace:
                 self._execute_request(scheduled, req_id, count)
                 result = self._finish_request()
+            if operations is not None and isinstance(result, AsyncModelRunnerOutput):
+                # Admission/checkpoint transactions must retire the accepted
+                # input before publishing auxiliary state or acknowledgments.
+                # Steady speculative decode keeps its asynchronous output.
+                result = result.get_output()
             if self.prefix_checkpoints is not None:
                 self.prefix_checkpoints.capture_at(req_id, self.requests[req_id].num_computed_tokens + count)
             ids.append(req_id)
@@ -2104,6 +2245,26 @@ class V41ModelRunner:
         if len(tokens) != count or start + count > self.model_config.max_model_len:
             raise RuntimeError("Scheduled V4.1 inputs do not match the committed prefix and context budget")
         decode = start >= request.decode_start
+        self.device_round_eligible = bool(
+            getattr(self, "device_round_inputs", None) is not None and decode and count == 6 and len(proposed) == 5
+            and len(scheduled.num_scheduled_tokens) == 1 and not request.mm_features
+        )
+        if getattr(self, "device_round_queue", None) is not None:
+            queued = self.device_round_queue
+            if not self.device_round_eligible or queued[0] != req_id:
+                self._discard_device_round()
+            else:
+                # Target, verification and draft are already enqueued, before
+                # the preceding output was read by the scheduler. The host
+                # supplies ownership/lifetime checks, never the next tokens.
+                self.device_round_current = queued
+                tail = getattr(self, "device_round_tail", [])
+                self.device_round_queue = tail.pop(0) if tail else None
+                self.round_context = queued[2]
+                self._bind_request(request)
+                self.pending = (request, start, count, count, proposed, True, None)
+                return None
+        self._bind_request(request)
         from vllm_gaudi.ops import deepseek_v41_prefill_event_trace as prefill_events
 
         tracing_prefill = not decode and prefill_events.begin(
@@ -2224,7 +2385,13 @@ class V41ModelRunner:
             else:
                 # Device verification owns projection, argmax and the small
                 # TP candidate exchange, so it consumes target hidden state.
-                sample_input = hidden if envs.VLLM_HPU_DSV41_DEVICE_VERIFY else self.model.compute_logits(hidden)
+                if envs.VLLM_HPU_DSV41_DEVICE_VERIFY and len(chunk) <= 6:
+                    sample_input = hidden
+                else:
+                    # A large prompt commits all its input rows and samples
+                    # only its final row. It cannot enter the C6 prefix/ring
+                    # protocol or materialize a full prompt vocabulary tensor.
+                    sample_input = self.model.compute_logits(hidden if decode else hidden[-1:])
         else:
             sample_input = None
         self.pending = (request, start, count, len(chunk), proposed, need_sample, sample_input)
@@ -2260,17 +2427,26 @@ class V41ModelRunner:
         request, start, count, last_count, proposed, need_sample, sample_input = self.pending
         if not self.use_dspark:
             return self._sample_single()
-        if (
-            envs.VLLM_HPU_DSV41_DEVICE_VERIFY
-            and envs.VLLM_HPU_DSV41_DSPARK
-            and need_sample
-            and (self.verify_prefix is not None or self.pp.group.is_first_rank)
-        ):
+        if getattr(self, "device_round_eligible", False):
+            return self._finish_device_round(request, start, count, proposed, sample_input)
+        if (envs.VLLM_HPU_DSV41_DEVICE_VERIFY and envs.VLLM_HPU_DSV41_DSPARK and need_sample and last_count <= 6
+                and (self.verify_prefix is not None or self.pp.group.is_first_rank)):
             return self._finish_request_device(request, start, count, last_count, proposed, sample_input)
         output, draft, committed = [], [], last_count
         if self.pp.group.is_last_rank:
+            sampled = request.sampling_params.temperature != 0
+            if sampled and need_sample:
+                state = self._request_speculative_sampling(request)
+                proposal_controls, _, _, target_controls = self.draw_speculative(
+                    state.parameters, state.seed, state.counter, state.offsets)
             if need_sample:
-                target = sample_input.argmax(-1).cpu().tolist()
+                if sampled:
+                    if proposed:
+                        raise RuntimeError("Sampled proposal verification must enter the bounded C1-C6 protocol")
+                    selected = self.sampled_prompt_target(sample_input[-1:], target_controls[-1:])
+                    target = selected.reshape(-1).cpu().tolist()
+                else:
+                    target = sample_input.argmax(-1).cpu().tolist()
                 if proposed:
                     output, accepted = greedy_verify(target, proposed)
                     committed = accepted + 1
@@ -2287,7 +2463,17 @@ class V41ModelRunner:
                 and remaining >= 6
                 and next_position + 6 <= self.model_config.max_model_len
             ):
-                draft = self._propose(output[-1], next_position)
+                if sampled:
+                    first = torch.tensor([output[-1]], dtype=torch.int64, device=self.device)
+                    positions = torch.arange(next_position, next_position + 5, dtype=torch.int32, device=self.device)
+                    draft_ids, q, confidence, covered = self.sampled_propose(first, positions, proposal_controls)
+                    state.proposal.copy_(q)
+                    state.proposal_valid.copy_(covered.all().reshape(1))
+                    self.last_draft_confidence = confidence
+                    draft = draft_ids.cpu().tolist()
+                    self.audit["draft_steps"] += 1
+                else:
+                    draft = self._propose(output[-1], next_position)
         committed, output, draft = self.pp.finish(committed, output, draft)
         if not 1 <= committed <= last_count:
             raise RuntimeError("PP accepted prefix exceeds the target's pending input transaction")
@@ -2300,6 +2486,423 @@ class V41ModelRunner:
         return ModelRunnerOutput(
             req_ids=[request.req_id], req_id_to_index={request.req_id: 0}, sampled_token_ids=[output]
         )
+
+    def _device_round_scope(self, name):
+        if not getattr(self, "trace_enabled", False):
+            return nullcontext()
+        label = f"v41::device_round::{name}"
+        if os.getenv("VLLM_HPU_DSV41_RAW_TRACE", "0") == "1":
+            from vllm_gaudi.ops.deepseek_v41_native_trace import device_scope, scope
+
+            if name == "target" and os.getenv("VLLM_HPU_DSV41_DSPARK_PHASE_EVENTS", "0") == "1":
+                return device_scope(label)
+            return scope(label)
+        return torch.profiler.record_function(label)
+
+    def _submit_round_verify(self, request, hidden, aux, context):
+        control = self.device_round_inputs.control
+        self.pp.generation += 1
+        ticket = self.verify_ring.acquire(6, generation=self.pp.generation)
+        parameters = getattr(request, "sampling_params", None)
+        sampled = parameters is not None and parameters.temperature != 0
+        if sampled:
+            state = self._request_speculative_sampling(request)
+            if envs.VLLM_HPU_DSV41_REQUEST_FIXTURE_DIR:
+                from vllm_gaudi.ops.deepseek_v41_micro_fixtures import export_request_fixture
+
+                export_request_fixture(self.model.program, hidden, aux, self.device_round_inputs, state,
+                                       envs.VLLM_HPU_DSV41_REQUEST_FIXTURE_DIR, request)
+            if envs.VLLM_HPU_DSV41_DSPARK_PROTOCOL_WRITEBACK and not request.req_id.startswith("__v41_"):
+                self._prepare_sampled_native_protocols(hidden, aux, state)
+            native = getattr(self, "sampled_native_protocols", {}).get(self.device_round_inputs.parity)
+            if native is not None and not request.req_id.startswith("__v41_"):
+                with self._device_round_scope("sampled_native_protocol"):
+                    record, _, q, confidence, counter = native(
+                        hidden, control[7:], control[:7], aux, self.position_views[6], state.proposal,
+                        state.parameters, state.seed, state.counter, state.offsets)
+                    if native.state_publication is None:
+                        state.proposal.copy_(q)
+                        state.counter.copy_(counter)
+                        state.proposal_valid.copy_(record[STATUS:STATUS + 1] == 0)
+                if native.repair_frame is not None:
+                    self.sampled_round_frames[ticket.generation] = native.repair_frame
+            else:
+                record, confidence = self._sampled_round_reference(request, hidden, aux, control)
+        elif getattr(self, "native_draft_protocol", None) is not None:
+            with self._device_round_scope("verify_draft_native"):
+                record, _, _, confidence = self.native_draft_protocol(
+                    hidden, control[7:], control[:7], aux, self.position_views[6])
+        else:
+            with self._device_round_scope("verify"):
+                _, output, committed, output_count, anchor, enabled, status, _, _ = self.verify_prefix(
+                    hidden, control[7:], control[:7], aux, self.position_views[6])
+            with self._device_round_scope("draft"):
+                record, _, confidence = self.draft_from_prefix(
+                    control[:7], self.position_views[6], output, committed, output_count, anchor, enabled, status)
+        ticket.record.copy_(record)
+        self.last_draft_confidence = confidence
+        # Queue the output read before the next round, retaining producer
+        # ordering without a frontend event or a control upload.
+        with self._device_round_scope("readback_enqueue"):
+            self.verify_ring.stage(ticket)
+        if context is not None:
+            context["device_round_pipeline"] = True
+        return request.req_id, ticket, context
+
+    def _sampled_draft_body_from_prefix(self, metadata, target_positions, output, committed, count,
+                                      anchor, enabled, status, controls, *, prepare=False):
+        first_token, positions = self.native_body_inputs(anchor, target_positions, committed)
+        if prepare:
+            self.native_draft_body.prepare(first_token, positions)
+        else:
+            self.native_draft_body.require_ready()
+        hidden, logits = self.native_draft_body(first_token, positions)
+        ids, q, confidence, covered = self.native_body_sample(first_token, hidden, logits, controls)
+        record, wire = self.native_body_publish(metadata, output, committed, count, ids, enabled, status)
+        return record, wire, confidence, q, covered
+
+    def _sampled_round_reference(self, request, hidden, aux, control):
+        """Original exact probability protocol, also used with the saved draw."""
+        state = self._request_speculative_sampling(request)
+        with self._device_round_scope("sampled_draws"):
+            proposal_controls, acceptance, correction, target_controls = self.draw_speculative(
+                state.parameters, state.seed, state.counter, state.offsets)
+        with self._device_round_scope("sampled_verify"):
+            output, committed, output_count, anchor, enabled, status, _, _ = self.sampled_verify_prefix(
+                hidden, control[7:], state.proposal, control[:7], aux, self.position_views[6],
+                target_controls, acceptance, correction)
+        with self._device_round_scope("sampled_draft"):
+            record, _, confidence, q, covered = self.sampled_draft_from_prefix(
+                control[:7], self.position_views[6], output, committed, output_count, anchor, enabled, status,
+                proposal_controls)
+            state.proposal.copy_(q)
+            state.proposal_valid.copy_(covered.all().reshape(1) & enabled & (status == 0))
+        return record, confidence
+
+    def _prepare_sampled_native_protocols(self, hidden, aux, state):
+        if not envs.VLLM_HPU_DSV41_DSPARK_NATIVE_SAMPLED_PROTOCOL:
+            return
+        writeback = envs.VLLM_HPU_DSV41_DSPARK_PROTOCOL_WRITEBACK
+        if self.sampled_native_protocols:
+            if not writeback or getattr(self, "sampled_publication_owner", None) is state:
+                return
+            # A publication owns one request's allocations. Retire all old
+            # captures at this request boundary; no per-round rebinding or
+            # cross-request q/counter storage is allowed.
+            if self.device_round_queue is not None or self.device_round_tail:
+                raise RuntimeError("Drain the previous device request before replacing sampling publication")
+            torch.hpu.synchronize()
+            for plan in (*self.sampled_native_protocols.values(), *self.sampled_native_full_protocols.values()):
+                plan.close()
+            self.sampled_native_protocols.clear()
+            self.sampled_native_full_protocols.clear()
+            self.sampled_round_frames.clear()
+        state_publication = None
+        if writeback:
+            from vllm_gaudi.ops.deepseek_v41_sampling_publication import SamplingStatePublication
+
+            state_publication = SamplingStatePublication(state)
+            self.sampled_publication_owner = state
+        if not self.pp.single_stage or not self.model.native:
+            raise RuntimeError("Sampled native continuation requires a stage owning input and sampling")
+        from vllm_gaudi.ops.deepseek_v41_draft_replay import NativeDraftProtocol
+        from vllm_gaudi.ops.deepseek_v41_round_repair import SampledRoundRepairFrame
+
+        cursor, engram, program = self.device_round_inputs, self.device_round_engram, self.model.program
+        prototype = (hidden, cursor.control[7:], cursor.control[:7], aux, cursor.positions, state.proposal,
+                     state.parameters, state.seed, state.counter, state.offsets)
+        for parity in range(len(cursor.controls)):
+            publication = None
+            if envs.VLLM_HPU_DSV41_DSPARK_ROUND_INPUT_PUBLICATION:
+                from vllm_gaudi.ops.deepseek_v41_round_inputs import RoundInputPublication
+
+                publication = RoundInputPublication(cursor, engram, parity)
+            if (envs.VLLM_HPU_DSV41_DSPARK_NATIVE_FULL_MAIN
+                    and not envs.VLLM_HPU_DSV41_DSPARK_GLOBAL_BOUNDED_SAMPLING):
+                if (not envs.VLLM_HPU_DSV41_DSPARK_NATIVE_FULL_REPAIR
+                        or envs.VLLM_HPU_DSV41_DSPARK_NUCLEUS_MASS):
+                    raise RuntimeError("Exact full main requires full peer transport and the legacy official sampler")
+                # Exact full-vocabulary p/q has no coverage repair. Keep the
+                # whole verification/C5/Markov protocol in the same native
+                # plan, without a speculative rollback journal on every round.
+                plan = NativeDraftProtocol(program.draft, generation=lambda: program.generation,
+                                           sampled=True, full=True, full_main=True,
+                                           known_stochastic=envs.VLLM_HPU_DSV41_DSPARK_STOCHASTIC_ONLY,
+                                           input_publication=publication, state_publication=state_publication)
+                plan.prepare(*prototype)
+                plan.require_ready()
+                self.sampled_native_protocols[parity] = plan
+                continue
+            frame = SampledRoundRepairFrame(
+                program, cursor, engram, prototype, parity,
+                lookahead=getattr(self, "device_round_lookahead", 1))
+            full_main = (envs.VLLM_HPU_DSV41_DSPARK_NUCLEUS_MASS
+                         or envs.VLLM_HPU_DSV41_DSPARK_GLOBAL_BOUNDED_SAMPLING)
+            if full_main and not envs.VLLM_HPU_DSV41_DSPARK_NATIVE_FULL_REPAIR:
+                raise RuntimeError("Nucleus main plan requires captured exact official repair")
+            plan = NativeDraftProtocol(program.draft, generation=lambda: program.generation,
+                                       sampled=True, repair_frame=frame, full=full_main, full_main=full_main,
+                                       known_stochastic=envs.VLLM_HPU_DSV41_DSPARK_STOCHASTIC_ONLY,
+                                       input_publication=publication, state_publication=state_publication)
+            plan.prepare(*prototype)
+            plan.require_ready()
+            self.sampled_native_protocols[parity] = plan
+            if envs.VLLM_HPU_DSV41_DSPARK_NATIVE_FULL_REPAIR:
+                # Cold capture must never restore uninitialized journal rows.
+                full_plan = NativeDraftProtocol(program.draft, generation=lambda: program.generation,
+                                                sampled=True, full=True, repair_frame=frame,
+                                                known_stochastic=envs.VLLM_HPU_DSV41_DSPARK_STOCHASTIC_ONLY,
+                                                state_publication=state_publication)
+                full_plan.prepare_repair(*prototype, journal_positions=cursor.positions)
+                full_plan.require_ready()
+                self.sampled_native_full_protocols[parity] = full_plan
+
+    def _queue_next_device_round(self, request, *, published=False):
+        next_context = (dict(request_id=request.req_id, generation=self.pp.generation + 1,
+                             target_count=6, start_ns=time.perf_counter_ns())
+                        if self.round_timing_enabled else None)
+        cursor, engram = self.device_round_inputs, self.device_round_engram
+        with self._device_round_scope("engram"):
+            rows = engram.prepare(request.req_id, cursor.ids, cursor.history, published=published)
+        with self._device_round_scope("target"):
+            next_hidden = self.model.forward_device_round(cursor.ids, cursor.positions, rows)
+        for name, increment in (("target_steps", 1), ("target_tokens", 6), ("decode_steps", 1)):
+            self.audit[name] = self.audit.get(name, 0) + increment
+        if next_context is not None:
+            next_context["stage_submitted_ns"] = time.perf_counter_ns()
+        queued = self._submit_round_verify(request, next_hidden, self.model.last_aux, next_context)
+        if self.device_round_queue is None:
+            self.device_round_queue = queued
+        else:
+            self.device_round_tail.append(queued)
+
+    @torch.inference_mode()
+    def _repair_sampled_round(self, request, ticket):
+        """Discard lookahead, restore the exact official draw, then requeue."""
+        frame = self.sampled_round_frames.get(ticket.generation)
+        if frame is None:
+            raise RuntimeError("Exact full official protocol published an invalid distribution; "
+                               "no bounded repair exists")
+        queued = self.device_round_queue
+        retained_count = 0
+        if queued is not None:
+            if queued[0] != request.req_id:
+                raise RuntimeError("Official-sampling repair cannot discard another request's lookahead")
+            discarded_rounds = [queued, *getattr(self, "device_round_tail", [])]
+            retained_count = len(discarded_rounds)
+            for discarded in discarded_rounds:
+                if discarded[0] != request.req_id:
+                    raise RuntimeError("Repair cannot discard another request's retained round")
+                self.verify_ring.await_record(discarded[1])
+                self.verify_ring.release(discarded[1])
+                self.sampled_round_frames.pop(discarded[1].generation, None)
+            self.device_round_queue = None
+            self.device_round_tail = []
+        # Both Target and draft writes are complete before restoring their
+        # bounded write sets. Restore the original counter, not a fresh draw.
+        if hasattr(frame, "coverage_flags"):
+            target_failed, draft_failed = frame.coverage_flags.cpu().tolist()
+            requests = self.audit.setdefault("sampled_coverage_by_request", {})
+            counts = requests.setdefault(request.req_id, {"target_only": 0, "draft_only": 0, "both": 0,
+                                                          "unclassified": 0})
+            category = ("both" if target_failed and draft_failed else "target_only" if target_failed
+                        else "draft_only" if draft_failed else "unclassified")
+            counts[category] += 1
+        native = getattr(self, "sampled_native_full_protocols", {}).get(frame.parity)
+        if native is None:
+            frame.journal.restore()
+            frame.restore_protocol()
+        cursor, engram = self.device_round_inputs, self.device_round_engram
+        cursor.parity = frame.parity
+        hidden, _, _, aux, _, proposal, _, _, counter, _ = frame.payload
+        state = self._request_speculative_sampling(request)
+        with self._device_round_scope("sampled_exact_repair"):
+            if native is None:
+                state.proposal.copy_(proposal)
+                state.counter.copy_(counter)
+                record, confidence = self._sampled_round_reference(request, hidden, aux, cursor.control)
+            else:
+                record, _, q, confidence, advanced_counter = native(*frame.payload)
+                if native.state_publication is None:
+                    state.proposal.copy_(q)
+                    state.counter.copy_(advanced_counter)
+                    state.proposal_valid.copy_(record[STATUS:STATUS + 1] == 0)
+            ticket.record.copy_(record)
+            self.last_draft_confidence = confidence
+            self.verify_ring.stage(ticket)
+        if queued is not None:
+            # A discarded ticket's generation is never reused. The repaired
+            # current record retains its original generation; only the next
+            # cursor advances past the discarded unpublished transaction.
+            next_generation = self.verify_ring.generation + 1
+            while any((next_generation + offset - 1) % len(self.verify_ring.records) == ticket.slot
+                      for offset in range(retained_count)):
+                next_generation += 1
+            self.pp.generation = next_generation - 1
+            cursor.control[:1].fill_(self.pp.generation)
+            cursor.next(ticket.record, engram.histories)
+            self._queue_next_device_round(request)
+            for _ in range(retained_count - 1):
+                tail = getattr(self, "device_round_tail", [])
+                latest = tail[-1] if tail else self.device_round_queue
+                cursor.next(latest[1].record, engram.histories)
+                self._queue_next_device_round(request)
+        self.audit["sampled_exact_repairs"] = self.audit.get("sampled_exact_repairs", 0) + 1
+
+    def _discard_device_round(self):
+        queued = self.device_round_queue
+        if queued is None:
+            return
+        # Cancellation, request reuse and a capacity boundary can discard one
+        # extra round. Drain its writes before releasing scheduler pages.
+        torch.hpu.synchronize()
+        for discarded in [queued, *getattr(self, "device_round_tail", [])]:
+            self.verify_ring.release(discarded[1])
+            getattr(self, "sampled_round_frames", {}).pop(discarded[1].generation, None)
+        self.device_round_inputs.retire(queued[0])
+        self.device_round_engram.retire(queued[0])
+        self.device_round_queue = None
+        self.device_round_tail = []
+
+    def _warm_device_round_inputs(self):
+        """Warm both control frames and readback slots before API readiness."""
+        if getattr(self, "device_round_inputs", None) is None:
+            return
+        from types import SimpleNamespace
+
+        cursor, engram = self.device_round_inputs, self.device_round_engram
+        from vllm.sampling_params import SamplingParams
+
+        start = int(cursor.positions[0].cpu())
+        seed_tokens = cursor.ids.cpu().tolist()
+        for parameters in (None, SamplingParams(temperature=1., top_p=.95, seed=42)):
+            owner = "__v41_device_round_warmup__" if parameters is None else "__v41_sampled_round_warmup__"
+            request = SimpleNamespace(req_id=owner, sampling_params=parameters, speculative_sampling=None)
+            tokens = seed_tokens
+            if parameters is not None:
+                state = self._request_speculative_sampling(request)
+                controls, _, _, _ = self.draw_speculative(state.parameters, state.seed, state.counter, state.offsets)
+                first = torch.tensor([tokens[0]], dtype=torch.int64, device=self.device)
+                positions = torch.arange(start + 1, start + 6, dtype=torch.int32, device=self.device)
+                proposed, q, _, covered = self.sampled_propose(first, positions, controls)
+                state.proposal.copy_(q)
+                state.proposal_valid.copy_(covered.all().reshape(1))
+                tokens = tokens[:1] + proposed.cpu().tolist()
+            cursor.seed(owner, tokens, start, 64, self.model_config.max_model_len,
+                        self.pp.generation + 1, [-1, -1, -1])
+            previous = None
+            for _ in range(4):
+                rows = engram.prepare(owner, cursor.ids, cursor.history)
+                hidden = self.model.forward_device_round(cursor.ids, cursor.positions, rows)
+                if parameters is not None:
+                    self._prepare_sampled_native_protocols(hidden, self.model.last_aux, state)
+                if parameters is not None and envs.VLLM_HPU_DSV41_WARMUP_FIXTURE_DIR:
+                    from vllm_gaudi.ops.deepseek_v41_micro_fixtures import export_warmup_fixture
+
+                    export_warmup_fixture(self.model.program, hidden, cursor.ids, cursor.positions,
+                                          envs.VLLM_HPU_DSV41_WARMUP_FIXTURE_DIR, proposal=state.proposal)
+                queued = self._submit_round_verify(request, hidden, self.model.last_aux, None)
+                # The real next consumer is queued before the previous result
+                # is read, for both greedy and official sampled rounds.
+                if previous is not None:
+                    self.verify_ring.consume(previous[1])
+                    self.verify_ring.release(previous[1])
+                cursor.next(queued[1].record, engram.histories)
+                previous = queued
+            self.verify_ring.consume(previous[1])
+            self.verify_ring.release(previous[1])
+            torch.hpu.synchronize()
+            cursor.retire(owner)
+            engram.retire(owner)
+        logger.info("V4.1 warmed device round controls, Engram, input producer and readback slots")
+
+    def _finish_device_round(self, request, start, count, proposed, hidden):
+        cursor, engram = self.device_round_inputs, self.device_round_engram
+        queued = self.device_round_current
+        initial = queued is None
+        tokens = request.token_slice(start, start + 1) + proposed
+        if initial:
+            if cursor.owner is not None:
+                raise RuntimeError("A device cursor survived its previous request transaction")
+            history = self.model.engram_host.history
+            lookback = [-1] * 3
+            tail = history.history[-3:][::-1].tolist()
+            lookback[:len(tail)] = tail
+            cursor.seed(request.req_id, tokens, start, request.sampling_params.max_tokens - len(request.output),
+                        self.model_config.max_model_len, self.pp.generation + 1, lookback)
+            # The first C6 used the host reference inputs; build its device
+            # prefix histories once. Later rounds consume these producers.
+            engram.prepare(request.req_id, cursor.ids, cursor.history)
+            queued = self._submit_round_verify(request, hidden, self.model.last_aux, self.round_context)
+        self.device_round_current = None
+        ticket, context = queued[1:]
+        remaining = request.sampling_params.max_tokens - len(request.output)
+        search = self.model.program.search_length
+        # Scheduler pages are still authoritative. Do not execute ahead of an
+        # unallocated page, a search-bucket transition or a short final tail.
+        page_capacity = len(request.block_ids[0]) * self.vllm_config.cache_config.block_size
+        visible_bound = self.model.program.decode_token_bound or search
+        ahead = remaining >= 12 and start + 12 <= min(
+            self.model_config.max_model_len, search, visible_bound, page_capacity)
+        capacity = getattr(self, "device_round_lookahead", 1)
+        bound = min(self.model_config.max_model_len, search, visible_bound, page_capacity)
+        while ahead:
+            retained = ([self.device_round_queue] if self.device_round_queue is not None else [])
+            retained += getattr(self, "device_round_tail", [])
+            if len(retained) >= capacity:
+                break
+            required = 6 * (len(retained) + 2)
+            if remaining < required or start + required > bound:
+                break
+            predecessor = retained[-1] if retained else queued
+            native = self.sampled_native_protocols.get(cursor.parity)
+            published = (request.sampling_params.temperature != 0
+                         and not request.req_id.startswith("__v41_")
+                         and native is not None and native.input_publication is not None)
+            with self._device_round_scope("advance"):
+                cursor.next(predecessor[1].record, engram.histories, published=published)
+            self._queue_next_device_round(request, published=published)
+        ahead = self.device_round_queue is not None
+
+        def consume(committed, output, draft):
+            timing = getattr(self, "verify_timing", None)
+            if timing is not None and timing.active is not None:
+                if timing.active["generation"] != ticket.generation:
+                    raise RuntimeError("Device round diagnostic belongs to another generation")
+                timing.finish(committed, len(output))
+            if initial:
+                self.model.complete_step_device(committed)
+            else:
+                # The device history has already selected this prefix. Keep
+                # the host mirror for cancellation, page boundaries and the
+                # ordinary fallback; it does no lookup or device transfer.
+                history = self.model.engram_host.history
+                transaction = history.prepare(request.req_id, tokens)
+                history.commit(transaction, committed)
+            request.output.extend(output)
+            self.audit["accepted_drafts"] += committed - 1
+            self.audit["rejected_drafts"] += 6 - committed
+            self.draft_token_ids = DraftTokenIds([request.req_id], [draft])
+            self.round_context = context
+            result = ModelRunnerOutput(req_ids=[request.req_id], req_id_to_index={request.req_id: 0},
+                                       sampled_token_ids=[output])
+            result.execution_rounds = self._record_round_completion(
+                request, proposed, committed, output, generation=ticket.generation)
+            self.pending = None
+            if not ahead:
+                cursor.retire(request.req_id)
+                engram.retire(request.req_id)
+            return result
+
+        repair = ((lambda: self._repair_sampled_round(request, ticket))
+                  if ticket.generation in getattr(self, "sampled_round_frames", {}) else None)
+
+        def release(result):
+            getattr(self, "sampled_round_frames", {}).pop(ticket.generation, None)
+            if self.round_timing_enabled:
+                self._record_round_released(result)
+
+        return AsyncDSparkOutput(self.verify_ring, ticket, consume, release, repair=repair)
 
     def _sample_single(self):
         request, start, count, last_count, proposed, need_sample, selected = self.pending
@@ -2383,7 +2986,9 @@ class V41ModelRunner:
             stats["native_entry_replays"],
         )
         if self.pp.group.is_last_rank:
-            if envs.VLLM_HPU_DSV41_DEVICE_VERIFY and self.verify_prefix is not None and envs.VLLM_HPU_DSV41_DSPARK:
+            if self.use_dspark and tokens > 6:
+                self._insert(self.model.last_aux, self.positions[:tokens])
+            elif (envs.VLLM_HPU_DSV41_DEVICE_VERIFY and self.verify_prefix is not None and envs.VLLM_HPU_DSV41_DSPARK):
                 # Compile and exercise the fixed control graph during warmup;
                 # this invocation is discarded with the warmup state.
                 self.verify_hidden.zero_()
@@ -2409,20 +3014,31 @@ class V41ModelRunner:
                 direct_c6 = self._use_direct_verify_inputs(hidden, tokens)
                 verify_hidden = hidden if direct_c6 else self.verify_hidden
                 verify_aux = self.model.last_aux if direct_c6 else self.verify_aux
-                verify_positions = self.positions if direct_c6 else self.verify_positions
-                prefix = self.verify_prefix(
-                    verify_hidden, self.verify_proposed, self.verify_metadata, verify_aux, verify_positions
-                )
-                self.draft_from_prefix(
-                    self.verify_metadata,
-                    verify_positions,
-                    prefix[1],
-                    prefix[2],
-                    prefix[3],
-                    prefix[4],
-                    prefix[5],
-                    prefix[6],
-                )
+                verify_positions = self.position_views[6] if direct_c6 else self.verify_positions
+                if self.native_draft_protocol is not None and direct_c6:
+                    self.native_draft_protocol.prepare(verify_hidden, self.verify_proposed, self.verify_metadata,
+                                                       verify_aux, verify_positions)
+                else:
+                    prefix = self.verify_prefix(verify_hidden, self.verify_proposed, self.verify_metadata, verify_aux,
+                                                verify_positions)
+                    self.draft_from_prefix(self.verify_metadata, verify_positions, prefix[1], prefix[2], prefix[3],
+                                           prefix[4], prefix[5], prefix[6])
+                sampled_aliases = getattr(self, "sampled_warm_aliases", set())
+                if direct_c6 not in sampled_aliases:
+                    from vllm_gaudi.ops.deepseek_v41_speculative_sampling import SpeculativeRequestSampling
+
+                    local_vocab = self.model.program.draft.output_head.weight.shape[0]
+                    sampled_state = SpeculativeRequestSampling((1., .95, -1.), 42, local_vocab, self.device)
+                    proposal_controls, acceptance, correction, target_controls = self.draw_speculative(
+                        sampled_state.parameters, sampled_state.seed, sampled_state.counter, sampled_state.offsets)
+                    prefix = self.sampled_verify_prefix(
+                        verify_hidden, self.verify_proposed, sampled_state.proposal, self.verify_metadata,
+                        verify_aux, verify_positions, target_controls, acceptance, correction)
+                    warm_body = {"prepare": True} if self.native_draft_body is not None else {}
+                    self.sampled_draft_from_prefix(
+                        self.verify_metadata, verify_positions, *prefix[:6], proposal_controls, **warm_body)
+                    sampled_aliases.add(direct_c6)
+                    self.sampled_warm_aliases = sampled_aliases
             else:
                 if self.use_dspark:
                     self.model.compute_logits(hidden)
@@ -2455,6 +3071,36 @@ class V41ModelRunner:
 
     def profile_run(self, initialize_only=False):
         del initialize_only
+        if self.use_dspark:
+            self.profile_phase_memory = []
+            for phase in (("compile_warmup", "warmed_execution") if self.use_dspark else ("profile", )):
+                if phase == "warmed_execution":
+                    # Separate first-time compilation from serving allocations.
+                    # Re-execute every qualified shape after compilation
+                    # before measuring the persistent cache/working-state budget.
+                    torch.hpu.synchronize()
+                    torch.hpu.reset_peak_memory_stats()
+                if isinstance(self.state, PagedStageState):
+                    warmup_buckets = prefill_compute_buckets()
+                    geometries = (0, min(INDEX_MME_HOT_TOKENS, self.model_config.max_model_len - 1))
+                    for start_position in geometries:
+                        for tokens in warmup_buckets:
+                            if start_position + tokens > self.model_config.max_model_len:
+                                continue
+                            logger.info("V4.1 PP%d starting pre-KV C%d prefill recipe warmup at position %d",
+                                        self.model.pp_rank, tokens, start_position)
+                            self._dummy_run(tokens, start_position=start_position)
+                            logger.info("V4.1 PP%d completed pre-KV C%d prefill recipe warmup at position %d",
+                                        self.model.pp_rank, tokens, start_position)
+                            if self.use_dspark:
+                                self._record_profile_memory(phase, tokens, start_position)
+                tokens = 6 if self.use_dspark else 1
+                logger.info("V4.1 PP%d starting C%d memory profile", self.model.pp_rank, tokens)
+                self._dummy_run(tokens)
+                logger.info("V4.1 PP%d completed C%d memory profile", self.model.pp_rank, tokens)
+                if self.use_dspark:
+                    self._record_profile_memory(phase, tokens, 0)
+            return
         self.profile_memory_steps = []
 
         def record_memory(tokens, position):
@@ -2492,6 +3138,15 @@ class V41ModelRunner:
         self._dummy_run(tokens)
         record_memory(tokens, 0)
         logger.info("V4.1 PP%d completed C%d memory profile", self.model.pp_rank, tokens)
+
+    def _record_profile_memory(self, phase, tokens, start_position):
+        row = dict(phase=phase,
+                   tokens=tokens,
+                   start_position=start_position,
+                   resident_bytes=torch.hpu.memory_allocated(),
+                   peak_bytes=torch.hpu.max_memory_allocated())
+        self.profile_phase_memory.append(row)
+        logger.info("V4.1 PP%d TP%d profile phase memory: %s", self.model.pp_rank, self.model.tp_rank, row)
 
     @torch.inference_mode()
     def warmup_model(self):
@@ -2536,13 +3191,18 @@ class V41ModelRunner:
         # Ordinary serving keeps the qualified C1 native replay for decode.
         # C6 is a DSpark-only anchor-plus-draft geometry. Prompt C128 recipes
         # are compiled by real prefill qualification and persisted in cache.
-        for count in (1, 6) if self.use_dspark else (1,):
+        # Fixed five-draft serving produces a C1 seed or C6 target. Accepted
+        # prefixes still cover C1-C6 in the control graph below; they are not
+        # separate target shapes. Retaining C2-C5 native target graphs here
+        # exhausts the native HBM allocator before C6 can be prepared.
+        for count in ((1, 6) if self.use_dspark else (1, )):
             runtime = count == 1 and getattr(self.model.program, "runtime_indexer", False)
-            geometries = (
-                tuple(decode_search_warmups(self.model.program.length, runtime_indexer=True))
-                if runtime
-                else ((0, 512),)
-            )
+            paged_dspark = self.use_dspark and isinstance(self.state, PagedStageState)
+            geometries = (tuple(decode_search_warmups(self.model.program.length, runtime_indexer=runtime))
+                          if runtime or paged_dspark else ((0, 512), ))
+            additional = getattr(getattr(self, "vllm_config", None), "additional_config", {}) or {}
+            geometries = select_native_warmup_geometries(geometries, additional)
+            logger.info("V4.1 C%d native warmup searches: %s", count, [search for _, search in geometries])
             for start_position, search in geometries:
                 for _ in range(4 if self.model.native else 1):
                     self._dummy_run(count, native=self.model.native, start_position=start_position)
@@ -2581,6 +3241,7 @@ class V41ModelRunner:
             for count in (2, 3, 4, 5):
                 self._insert(self.model.last_aux[:count], self.positions[:count])
             torch.hpu.synchronize()
+        self._warm_device_round_inputs()
         self.pp.group.barrier()
         self.state.clear()
         self.active_request = None
@@ -2591,26 +3252,35 @@ class V41ModelRunner:
             # Inline capture preserves complete tiles; other checkpoint cuts
             # reuse the finite prefill buckets already warmed above.
         if envs.VLLM_HPU_DSV41_VERIFY_TIMING:
-            if (
-                not envs.VLLM_HPU_DSV41_DEVICE_VERIFY
-                or not envs.VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE
-                or not envs.VLLM_HPU_DSV41_INLINE_PP_COMMIT
-                or envs.VLLM_HPU_DSV41_COMPILED_PP_COMMIT
-            ):
-                raise RuntimeError("Verify timing requires the qualified eager direct commit path")
+            direct_commit = (self.pp.single_stage
+                             or (envs.VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE and envs.VLLM_HPU_DSV41_INLINE_PP_COMMIT
+                                 and not envs.VLLM_HPU_DSV41_COMPILED_PP_COMMIT))
+            if not envs.VLLM_HPU_DSV41_DEVICE_VERIFY or not direct_commit:
+                raise RuntimeError("Verify timing requires device verification and a direct commit path")
             from vllm_gaudi.ops.deepseek_v41_verify_timing import VerifyPhaseTiming
             from pathlib import Path
 
             self.verify_timing = VerifyPhaseTiming(
-                Path(os.environ["DSV41_RUN_EVIDENCE"]) / "verify-phases", self.model.pp_rank * 2 + self.model.tp_rank
-            )
+                Path(os.environ["DSV41_RUN_EVIDENCE"]) / "verify-phases",
+                self.model.pp_rank * self.model.tensor_parallel_size + self.model.tp_rank)
             self.pp.timing = self.verify_timing
             self.verify_timing.calibrate()
+            self.model.verify_timing = self.verify_timing
 
     def close(self):
         if isinstance(getattr(self, "batch_result", None), AsyncModelRunnerOutput):
             self.batch_result.get_output()
         self.pp.drain()
+        self._discard_device_round()
+        if getattr(self, "native_draft_protocol", None) is not None:
+            self.native_draft_protocol.close()
+        if getattr(self, "native_draft_body", None) is not None:
+            self.native_draft_body.close()
+        for plan in (*getattr(self, "sampled_native_protocols", {}).values(),
+                     *getattr(self, "sampled_native_full_protocols", {}).values()):
+            plan.close()
+        if self.device_round_engram is not None:
+            self.device_round_engram.close()
         if self.prefix_checkpoints is not None:
             self.prefix_checkpoints.close()
         if self.verify_ring is not None:
@@ -2630,10 +3300,15 @@ class V41ModelRunner:
             return
         directory = Path(os.environ["DSV41_RUN_EVIDENCE"]) / "round-timing"
         directory.mkdir(exist_ok=True)
-        rank = self.model.pp_rank * 2 + self.model.tp_rank
+        rank = self.model.pp_rank * self.model.tensor_parallel_size + self.model.tp_rank
         (directory / f"rank{rank}.json").write_text(
-            json.dumps({"rank": rank, "clock": "perf_counter_ns", "records": self.round_records}) + "\n"
-        )
+            json.dumps({
+                "rank": rank,
+                "tensor_parallel_size": self.model.tensor_parallel_size,
+                "sampling_owner": self.pp.group.is_last_rank,
+                "clock": "perf_counter_ns",
+                "records": self.round_records
+            }) + "\n")
 
     def _round_phase(self, name):
         if getattr(self, "round_context", None) is not None:
@@ -2646,12 +3321,22 @@ class V41ModelRunner:
             raise RuntimeError("Released DSpark ring does not own the completed round")
         row["end_ns"] = time.perf_counter_ns()
         row["ring_released"] = True
+        if row.get("device_round_pipeline"):
+            row["enqueue_start_ns"] = row["start_ns"]
+            previous = self.round_records[-2] if len(self.round_records) > 1 else None
+            if previous is not None and previous["request_id"] == row["request_id"]:
+                # Queue residence overlaps preceding rounds. Report delivered
+                # completion periods, never sum overlapping queue latencies
+                # into the complete-round throughput cost.
+                row["start_ns"] = previous["end_ns"]
+                row["timer_mode"] = "completion_period"
 
-    def _record_round_completion(self, request, proposed, committed, output):
+    def _record_round_completion(self, request, proposed, committed, output, *, generation=None):
         if not self.round_timing_enabled:
             return None
         context = self.round_context
-        if context is None or context["request_id"] != request.req_id or context["generation"] != self.pp.generation:
+        expected = self.pp.generation if generation is None else generation
+        if context is None or context["request_id"] != request.req_id or context["generation"] != expected:
             raise RuntimeError("V4.1 round completion does not match its input generation")
         if len(self.round_records) >= 65536:
             raise RuntimeError("V4.1 round timing capacity exceeded")

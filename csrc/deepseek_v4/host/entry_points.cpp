@@ -320,6 +320,7 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_PACKED_MLA_VECTOR,
     GAUDI2_KERNEL_DEEPSEEK_V41_PAGED_MLA_GATHER,
     GAUDI2_KERNEL_DEEPSEEK_V41_LOGICAL_MLA_GATHER,
+    GAUDI2_KERNEL_DEEPSEEK_V41_LOGICAL_MLA_VECTOR,
     GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_MLA_SOFTMAX,
     GAUDI2_KERNEL_DEEPSEEK_V41_ENGRAM_HASH_GATHER_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V41_INDEX_SCORES,
@@ -676,6 +677,7 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
     DeepseekV41SelectedMlaGaudi2(true).GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_SELECTED_MLA_GATHER].name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_PAGED_MLA_GATHER].name, DeepseekV41PagedMlaGatherGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_LOGICAL_MLA_GATHER].name, DeepseekV41LogicalMlaGatherGaudi2::name);
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_LOGICAL_MLA_VECTOR].name, DeepseekV41LogicalMlaGatherGaudi2::vector_name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_PUBLISH_GATHER].name, DeepseekV41MainPublishGatherGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_PUBLISH_VECTOR_MASK].name, "custom_deepseek_v41_main_publish_vector_mask_gaudi2");
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_MAIN_PUBLISH_NATIVE_CODEC].name, "custom_deepseek_v41_main_publish_native_codec_gaudi2");
@@ -1289,8 +1291,14 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
         return DeepseekV41MainReuseGatherGaudi2(true).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41MainReuseGatherGaudi2::name) == 0)
         return DeepseekV41MainReuseGatherGaudi2().GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name, DeepseekV41ExpertTokenWideGaudi2::name) == 0)
+        return DeepseekV41ExpertTokenWideGaudi2().GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name, "custom_deepseek_v41_expert_n256_sat_fp8_gaudi2") == 0)
+        return DeepseekV41ExpertN256Gaudi2(DeepseekV41ExpertN256Gaudi2::FP8Sat).GetGcDefinitions(params, instance);
     if (std::strcmp(params->guid.name, DeepseekV41LogicalMlaGatherGaudi2::name) == 0)
         return DeepseekV41LogicalMlaGatherGaudi2().GetGcDefinitions(params, instance);
+    if (std::strcmp(params->guid.name, DeepseekV41LogicalMlaGatherGaudi2::vector_name) == 0)
+        return DeepseekV41LogicalMlaGatherGaudi2(true).GetGcDefinitions(params, instance);
     auto mainFast5 = DeepseekV41SelectedMlaGaudi2(true);
     mainFast5.GetKernelName(kernelName);
     if (std::strcmp(params->guid.name, kernelName) == 0)

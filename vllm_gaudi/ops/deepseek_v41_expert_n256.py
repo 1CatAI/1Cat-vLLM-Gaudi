@@ -157,7 +157,7 @@ def load_projection(shard, prefix, device):
     import torch
 
     prepared = os.environ.get("VLLM_HPU_DSV41_N256_PREPARED_DIR")
-    if prepared:
+    if prepared and prefix.startswith("layers."):
         from vllm_gaudi.ops.deepseek_v41_n256_shards import N256PreparedShard
 
         if not hasattr(shard, "_n256_runtime_shard"):
@@ -174,6 +174,8 @@ def load_projection(shard, prefix, device):
     scale_words = stream // 8 + 128 if compact_scales else source_s.shape[2] * 2
     p = torch.empty((experts, blocks // 2, scale_words), dtype=torch.int16, device=device)
     channel = torch.empty((experts, blocks // 2, 256), dtype=torch.bfloat16, device=device)
+    active_k = getattr(shard, "specs", {}).get(prefix + "_q16", {}).get("original_shape", [stream // 32])[-1]
+    sat_eligible = True
     # Batch host-to-device copies without keeping another resident weight copy.
     # The staging allocation is at most 128 MiB, plus one bounded expert scan.
     per_expert = (q[0].numel() + p[0].numel() + channel[0].numel()) * 2

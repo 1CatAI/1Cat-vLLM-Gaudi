@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
+#if defined(DSV41_N256_BACKEND_ONLY) && DSV41_N256_BACKEND_ONLY
+#include "dsv41_c6_expert_backend.h"
+#else
+// SPDX-License-Identifier: Apache-2.0
 // Adapted from main 92c82b97 N256 compound. This translation unit owns the
 // N256 paths plus the legacy FP8 and prepared-K128 aliases; the retained
 // DSpark BF16 registrations keep their original implementation.
@@ -1493,3 +1497,5 @@ TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
     m.impl("custom_deepseek_v41_mxfp4_prepared_dequant_k128_bf16_gaudi2", dequant<true, true>);
     m.impl("custom_deepseek_v41_mxfp4_prepared_moe_k128_bf16_gaudi2", moe<true, true>);
 }
+
+#endif

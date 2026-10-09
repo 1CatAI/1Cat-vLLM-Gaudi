@@ -20,11 +20,12 @@ habana::OutputMetaDataVector metadata(const at::Stack& stack, bool reduce_only) 
     TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.dim() == 3 &&
                 x.size(0) >= 1 && x.size(0) <= 16384 && x.size(1) == 32,
                 "Prefill index requires BF16 [T,32,K] with T1..16384");
-    const auto tokens = x.size(0), columns = rows.numel();
+    const auto tokens = x.size(0), columns = rows.dim() > 0 ? rows.size(-1) : 0;
+    const bool query_rows = reduce_only && tokens <= 6 && rows.dim() == 2 && rows.size(0) == tokens;
     TORCH_CHECK(weights.scalar_type() == at::kBFloat16 &&
                 weights.sizes() == at::IntArrayRef({tokens, 32}) &&
                 positions.scalar_type() == at::kInt && positions.sizes() == at::IntArrayRef({tokens}) &&
-                rows.scalar_type() == at::kInt && rows.dim() == 1 &&
+                rows.scalar_type() == at::kInt && (rows.dim() == 1 || query_rows) &&
                 columns >= 128 && columns <= (tokens <= 6 ? 32768 : 2048) && columns % 128 == 0 &&
                 (ratio == 1 || ratio == 2),
                 "Invalid prefill index weights, positions or source tile");

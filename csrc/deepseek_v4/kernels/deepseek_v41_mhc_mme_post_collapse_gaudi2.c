@@ -5,6 +5,9 @@
 #pragma clang fp contract(off)
 #define FLASHINFER_NORM_USE_LOOKUP_RSQRT
 #include "../../flashinfer_gaudi/kernels/norm_math_gaudi2.h"
+#ifndef DSV41_MHC_POST_FEATURE_TILE
+#define DSV41_MHC_POST_FEATURE_TILE 1
+#endif
 #define HC_EPS 1.0e-6f
 #define SINKHORN_ITERS 20
 static inline float64_pair_t mhc_bf16_to_f32_linear(bfloat128 input) {
@@ -57,12 +60,8 @@ static inline uchar256 matrix_direction(uint64 index)
 
 static inline float64 load_mix(tensor mixes, int feature, int token, int last) {
     const float64 high=v_f32_ld_tnsr_partial_b((int5){feature, token, 0, 0, 0}, mixes, last, 0);
-#ifdef DSV41_MHC_CONTROL_HAS_RRMS
-    return high;
-#else
     if (get_dim_size(mixes,0)==25) return high;
     return high + v_f32_ld_tnsr_partial_b((int5){feature + 24, token, 0, 0, 0}, mixes, last, 0);
-#endif
 }
 typedef struct {float64 pre;float64 post;float64 comb;} GateRegisters;
 static inline GateRegisters compute_gates(tensor raw_mixes, tensor residual,
@@ -79,9 +78,6 @@ static inline GateRegisters compute_gates(tensor raw_mixes, tensor residual,
     const uchar256 c3 = matrix_direction((lane & 3) | 12);
 
         float64 inverse_rms;
-#ifdef DSV41_MHC_CONTROL_HAS_RRMS
-        inverse_rms=s_f32_ld_g(gen_addr((int5){24,token},raw_mixes));
-#else
         if (get_dim_size(raw_mixes,0)==25) {
             // The exact FP32 control producer already computed this statistic.
             // Carry its bits instead of repeating the 20480-value reduction
@@ -98,7 +94,6 @@ static inline GateRegisters compute_gates(tensor raw_mixes, tensor residual,
         inverse_rms = positive_rsqrt(
             v_f32_reduce_add(squares.v1 + squares.v2) * (1.0f / 20480.0f) + epsilon);
         }
-#endif
         const float64 pre_scale = s_f32_ld_g(gen_addr((int5){0}, hc_scale));
         const float64 post_scale = s_f32_ld_g(gen_addr((int5){1, 0, 0, 0, 0}, hc_scale));
         const float64 comb_scale = s_f32_ld_g(gen_addr((int5){2, 0, 0, 0, 0}, hc_scale));
@@ -129,7 +124,7 @@ static inline GateRegisters compute_gates(tensor raw_mixes, tensor residual,
         sum += v_f32_shuffle_b(values, r1, 0, 0.0f);
         sum += v_f32_shuffle_b(values, r2, 0, 0.0f);
         sum += v_f32_shuffle_b(values, r3, 0, 0.0f);
-        values = (values / sum) + HC_EPS;
+        values = values / sum + HC_EPS;
 
         for (int iteration = 0; iteration < SINKHORN_ITERS; ++iteration) {
             if (iteration != 0) {
@@ -167,7 +162,8 @@ void main(tensor value,tensor residual,tensor raw,tensor hc_scale,tensor hc_base
             v_f32_st_tnsr_partial((int5){4,token},next_pre,gates.post,3,0);
             v_f32_st_tnsr_partial((int5){8,token},next_pre,gates.comb,15,0);
         }
-        for(int block=start[0];block<end[0];++block) {
+        for(int block=start[0]*DSV41_MHC_POST_FEATURE_TILE;
+            block<end[0]*DSV41_MHC_POST_FEATURE_TILE;++block) {
             const int feature = block * 128;
             int5 vc = {feature, token, 0, 0, 0};
             float128 x = v_convert_bf16_to_f32_all_b(

@@ -311,8 +311,8 @@ class CSA2Attention(FusedQKVInput, FusedCompressorInput, nn.Module):
         return self.selection.indices.index_select(0, positions.long())
 
     @prefill_span("attention")
-    def forward(self, value, positions, ready_outputs=(), *, decode=False):
-        query_input, kv_input = self._project_qkv_input(value)
+    def forward(self, value, positions, ready_outputs=(), *, decode=False, input_roundtrip=None):
+        query_input, kv_input = self._project_qkv_input(value, roundtrip=input_roundtrip)
         norm = (torch.ops.custom_op.custom_deepseek_v41_attention_norm_bf16_gaudi2 if self.fused_norm and
                 (value.shape[0] == 1 or
                  (not decode and gaudi_envs.VLLM_HPU_DSV41_PREFILL_NATIVE_NORM and 6 < value.shape[0] <= 16384)) else

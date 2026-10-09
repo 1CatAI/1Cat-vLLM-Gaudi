@@ -100,12 +100,14 @@ def read_expert(source, expert):
 
 class FP8Sidecar:
 
-    def __init__(self, directory, shard):
+    def __init__(self, directory, shard, *, draft=False):
         directory = Path(directory)
         manifest = json.loads((directory / "manifest.json").read_text())
         if (manifest["quantization"] != QUANTIZATION or manifest["quantization_fingerprint"] != FINGERPRINT
                 or manifest["source_manifest_sha256"] != file_hash(shard.directory / "manifest.json")):
             raise ValueError("V4.1 FP8 sidecar is bound to different source weights or quantization")
+        if manifest.get("role", "target") != ("draft" if draft else "target"):
+            raise ValueError("FP8 channel sidecar has a different target/draft owner")
         rank = f"pp{shard.pp_rank}-tp{shard.tp_rank}"
         record = manifest["rank_files"][rank]
         relative = Path(record["file"])
@@ -119,7 +121,7 @@ class FP8Sidecar:
         self.catalog = read_header(self.path)
         expected = {}
         for name, spec in shard.specs.items():
-            if name.startswith("layers.") and name.endswith("_q16"):
+            if name.startswith("mtp." if draft else "layers.") and name.endswith("_q16"):
                 expected[name.removesuffix("_q16") + "_fp8_channel_scale"] = (spec["shape"][0], spec["shape"][1], 128)
         if set(self.catalog) != set(expected) or any(source.dtype != "BF16" or source.shape != expected[name]
                                                      for name, source in self.catalog.items()):
