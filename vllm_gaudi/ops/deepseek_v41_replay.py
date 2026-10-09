@@ -271,11 +271,11 @@ class StageVariant(torch.nn.Module):
         if getattr(program, "decode_merge_mhc_partitions", False):
             self.adapter = replace(self.adapter, require_independent_overlap=False)
         if program.length > 512:
-            # Query heads still gather in C1. A cold gain replica removes
-            # only its second collective; wider variants retain both points.
+            # Count the active query path, not merely the presence of cold
+            # replicas. Local query replicas stop at their capacity; beyond
+            # it C1 still uses the gain replica and exchanges only queries.
             extra = sum(
-                (1 if positions.numel() == 1 and getattr(layer.attention, "_index_gain_weight", None) is not None
-                 and not getattr(layer.attention, "tp4_local_index_queries", False) else 2)
+                (1 if positions.numel() == 1 and getattr(layer.attention, "_index_gain_weight", None) is not None else 2)
                 for layer in program.layers
                 if layer.attention.owns_index and layer.attention.search_length // layer.attention.ratio > 512
                 and not getattr(layer.attention, "uses_local_index_queries", lambda _: False)(positions.numel())

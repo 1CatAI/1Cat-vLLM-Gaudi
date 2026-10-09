@@ -18,6 +18,7 @@ def owner_for(tp):
     owner = SimpleNamespace(
         owns_index=True, tensor_parallel_size=tp, index_heads=32 // tp, _index_gain_weight=None,
         native_rope=False,
+        uses_local_index_queries=lambda count: False,
         weights=SimpleNamespace(indexer=SimpleNamespace(
             weights_proj=SimpleNamespace(weight=gain[:32 // tp].clone()), wq_b=SimpleNamespace(weight=query))),
         gather=lambda value, dim: gain.clone(),
@@ -95,19 +96,25 @@ def test_non_index_layer_does_not_collect():
 
 @pytest.mark.parametrize("tokens", (1, 2, 6))
 @pytest.mark.parametrize("replicated", (False, True))
-def test_native_topology_counts_the_collectives_actually_recorded(monkeypatch, tokens, replicated):
+@pytest.mark.parametrize("search", (8192, 65536, 262144))
+@pytest.mark.parametrize("local_replicas", (False, True))
+def test_native_topology_counts_the_collectives_actually_recorded(monkeypatch, tokens, replicated, search,
+                                                                 local_replicas):
     from vllm_gaudi.models import deepseek_v41_program as program_module
     from vllm_gaudi.ops import deepseek_v41_replay as replay_module
 
     monkeypatch.setattr(program_module, "CompiledStage", lambda *args, **kwargs: torch.nn.Identity())
     monkeypatch.setattr(replay_module, "stage_state_tensors", lambda program: ())
     layers = [SimpleNamespace(layer=8 + i, attention=SimpleNamespace(
-        owns_index=i == 0, search_length=8192, ratio=2,
+        owns_index=i == 0, search_length=search, ratio=2,
         _index_gain_weight=torch.empty(32, 16) if replicated and i == 0 else None,
+        tp4_local_index_queries=local_replicas,
+        uses_local_index_queries=lambda count: local_replicas and search <= 32768 and count == 1,
     )) for i in range(4)]
-    program = SimpleNamespace(layers=layers, dspark=False, pp_rank=0, length=8192)
+    program = SimpleNamespace(layers=layers, dspark=False, pp_rank=0, length=262144)
     variant = replay_module.StageVariant(
         program, torch.empty(tokens, 4, 5120), torch.empty(tokens, 4),
         torch.arange(tokens), torch.zeros(tokens, dtype=torch.int32), (),
     )
-    assert variant.adapter.collectives == (9 if replicated and tokens == 1 else 10)
+    local_active = local_replicas and search <= 32768 and tokens == 1
+    assert variant.adapter.collectives == (8 if local_active else 9 if replicated and tokens == 1 else 10)
