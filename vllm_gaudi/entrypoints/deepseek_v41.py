@@ -645,6 +645,8 @@ def load_native_operators(required=()):
     from vllm_gaudi import envs
 
     optional = []
+    if envs.VLLM_HPU_DSV41_MHC_RRMS_POST:
+        optional.append("custom_deepseek_v41_mhc_rrms_post_gaudi2")
     if envs.VLLM_HPU_DSV41_DSPARK_ROUTER_BATCHED_F32:
         optional.append("custom_deepseek_v41_router_batched_f32_gaudi2")
     if envs.VLLM_HPU_DSV41_DSPARK_VOCAB_SOFTMAX:
