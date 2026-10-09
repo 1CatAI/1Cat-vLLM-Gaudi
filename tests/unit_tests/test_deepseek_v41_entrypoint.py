@@ -229,6 +229,23 @@ def test_tp4_prefill_diagnostic_disable_controls(monkeypatch, tmp_path):
     assert os.environ["VLLM_HPU_DSV41_PREFILL_MLA_SEQUENCE"] == "0"
 
 
+@pytest.mark.parametrize("disabled", (False, True))
+def test_dspark_inherits_complete_single_stage_prefill_defaults(monkeypatch, tmp_path, disabled):
+    _clear_profile(monkeypatch)
+    monkeypatch.setenv("VLLM_HPU_DSV41_DSPARK", "1")
+    for sidecar in ("wo_a_fp8", "attention_dense_fp8", "engram_fp8"):
+        (tmp_path / "sidecars" / sidecar).mkdir(parents=True)
+    overrides = {"VLLM_HPU_DSV41_PREFILL_DECODER_HALO", "VLLM_HPU_DSV41_PREFILL_MLA_SEQUENCE"}
+    if disabled:
+        for key in overrides:
+            monkeypatch.setenv(key, "0")
+    prepare_default_fastpaths(tmp_path)
+    for key, value in _TP4_FASTPATH_DEFAULTS.items():
+        if key.startswith("VLLM_HPU_DSV41_PREFILL_") and key not in _PIPELINE_ONLY_FASTPATHS:
+            assert os.environ[key] == ("0" if disabled and key in overrides else value)
+    assert os.environ["VLLM_HPU_DSV41_PREFILL_PP_WAVEFRONT"] == "0"
+
+
 @pytest.mark.parametrize("tp,pp,expected_tile", ((2, 2, 8192), (4, 1, 16384)))
 def test_c1_defaults_preserve_scheduler_prefill_tile_and_halo(monkeypatch, tmp_path, tp, pp, expected_tile):
     from vllm_gaudi.ops.deepseek_v41_decoder_halo import decoder_halo_mode
@@ -256,6 +273,9 @@ def test_explicit_dspark_keeps_shared_speculative_profile(monkeypatch, tmp_path,
     _clear_profile(monkeypatch)
     monkeypatch.setenv("VLLM_HPU_DSV41_DSPARK", "1")
     monkeypatch.setenv("VLLM_HPU_DSV41_DEVICE_VERIFY", "1")
+    if pp == 1:
+        for sidecar in ("wo_a_fp8", "attention_dense_fp8"):
+            (tmp_path / "sidecars" / sidecar).mkdir(parents=True)
     prepare_default_fastpaths(tmp_path, tensor_parallel_size=tp, pipeline_parallel_size=pp)
     assert os.environ["VLLM_HPU_DSV41_DSPARK"] == "1"
     assert os.environ["VLLM_HPU_DSV41_DEVICE_VERIFY"] == "1"
@@ -297,6 +317,7 @@ def test_dspark_enabled_precision_rejects_missing_artifacts(monkeypatch, tmp_pat
     _clear_profile(monkeypatch)
     monkeypatch.setenv("VLLM_HPU_DSV41_DSPARK", "1")
     monkeypatch.setenv("VLLM_HPU_DSV41_ATTN_DENSE_FP8", "1")
+    (tmp_path / "sidecars" / "wo_a_fp8").mkdir(parents=True)
     with pytest.raises(RuntimeError, match="require the attention_dense_fp8 sidecar"):
         prepare_default_fastpaths(tmp_path)
 
