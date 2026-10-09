@@ -20,6 +20,39 @@ from vllm_gaudi.v1.worker.deepseek_v41_runner import (
 from vllm_gaudi.ops.deepseek_v41_math import NATIVE_KV_CODEC_TOKENS
 
 
+def test_serving_prefill_warmup_bounds_pool_pages_to_request_capacity(monkeypatch):
+    from vllm_gaudi.ops.deepseek_v41_batch import RequestSlots
+    from vllm_gaudi.ops.deepseek_v41_batch_state import BatchStageState
+
+    slots = RequestSlots(1)
+    slot = slots.acquire("warmup")
+    retired = []
+    bank = SimpleNamespace(slots=slots, pages=torch.zeros(1, 2048, dtype=torch.int32),
+                           page_host=torch.zeros(1, 2048, dtype=torch.int32), page_versions={}, pending=None,
+                           _invalidate_index_mirror=lambda: None, acquire=lambda _: slot,
+                           warmup_single_handoff=lambda _: None, bind_prefill=lambda _: None,
+                           restore_single_bindings=lambda: retired.append("restore"),
+                           release=lambda _: retired.append("release"))
+    bank.publish_pages = lambda *args: BatchStageState.publish_pages(bank, *args)
+    runner = V41ModelRunner.__new__(V41ModelRunner)
+    runner.request_batches = None
+    runner.prefix_checkpoints = object()
+    runner.model = SimpleNamespace(batch_state=bank, pp_rank=0)
+    runner.state = SimpleNamespace(blocks=2056)
+    runner.model_config = SimpleNamespace(max_model_len=262144)
+    runner.prefill_capacity = 16384
+
+    def first_prefill(count, *, start_position, prefill):
+        assert prefill
+        assert torch.equal(bank.pages[0], torch.arange(1, 2049, dtype=torch.int32))
+        raise RuntimeError("checked first production prefill contract")
+
+    runner._dummy_run = first_prefill
+    with pytest.raises(RuntimeError, match="checked first production"):
+        runner.warmup_model()
+    assert retired == ["restore", "release"]
+
+
 def test_decode_warmup_covers_all_context_buckets_without_scanning_tokens():
     for maximum in (128, 512, 513, 8192, 10000, 1 << 20):
         warmups = list(decode_search_warmups(maximum))

@@ -3156,7 +3156,8 @@ class V41ModelRunner:
             bank = self.model.batch_state
             owner = "__v41_serving_prefill_warmup__"
             slot = bank.acquire(owner)
-            bank.publish_pages(slot, range(1, self.state.blocks), self.state.blocks)
+            pages = min(bank.pages.shape[1], self.state.blocks - 1)
+            bank.publish_pages(slot, range(1, pages + 1), self.state.blocks)
             try:
                 for start, count in prefill_search_warmups(
                         self.model_config.max_model_len, self.prefill_capacity,
