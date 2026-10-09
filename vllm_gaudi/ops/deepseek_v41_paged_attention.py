@@ -2410,8 +2410,25 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                     if value.shape[0] == 1:
                         if fused_reuse:
                             main_rows, main_mask = selected_main[shared_key]
+                            output = torch.ops.custom_op.custom_deepseek_v41_kv_norm_reuse_mla_gaudi2(
+                                query.contiguous(), kv_input.contiguous(), self.weights.kv_norm.weight,
+                                self.swa, main_rows, main_mask, positions.to(torch.int32).contiguous(),
+                                self._rotary_native_table(), self.weights.attn_sink, self.scale, lengths, self.eps
+                            )
+                        else:
+                            projection = (gaudi_envs.VLLM_HPU_DSV41_MAIN_MLA_PROJECTION
+                                          and self._can_fuse_mla_woa(positions)
+                                          and getattr(self.weights.wo_b, "dense_fp8", False))
+                            mirror = (self.shared.decoded_swa.narrow(0, self.decoded_swa_offset, 512)
+                                      if decoded and gaudi_envs.VLLM_HPU_DSV41_MLA_DECODED_SWA else None)
                             output = shared_main_attention(self, query, positions, selected, lengths, selected_main,
-                                                   completion=completion)
+                                                           projection=projection, decoded_swa=mirror)
+                            if projection:
+                                return self._reduce_output(output, ready_outputs, decode=decode,
+                                                           deferred_output=deferred_output)
+                    else:
+                        output = shared_main_attention(self, query, positions, selected, lengths, selected_main,
+                                                       completion=completion)
                     return self._finish_output(output, positions, ready_outputs, decode=decode, deferred_output=deferred_output,
                                                inverse_rotated=self.dspark_stream_exp and 2 <= value.shape[0] <= 6)
                 logical_operands = (
