@@ -88,6 +88,7 @@ def prepare_serving_resources(settings, model, arguments):
             "model": hashlib.sha256((Path(model) / "manifest.json").read_bytes()).hexdigest()
         }
         digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+        os.environ["DSV41_SERVING_COMPILE_IDENTITY"] = digest
         cache = Path(cache_dir) / digest
         cache.mkdir(parents=True, exist_ok=True)
         os.environ["PT_HPU_RECIPE_CACHE_CONFIG"] = f"{cache / 'rank{rank}'},false,8192,false"

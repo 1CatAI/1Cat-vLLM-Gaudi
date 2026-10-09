@@ -94,6 +94,15 @@ manifest and ABI before copying any converted expert batch. The helper only
 reorders compressed integer bytes; scale selection and all HPU consumers stay
 on the shared path. Unset by default pending device and startup qualification.
 
+`VLLM_HPU_DSV41_FRONTEND_CACHE_DIR` selects experimental persistent Dynamo
+frontend metadata for the shared native stage. It requires normal serving
+resource validation and a persistent recipe cache. A compatible restored entry
+rebinds current weights/state, checks its input guards, and rebuilds backend
+recipes and native communication bindings through the existing code. No device
+addresses or communication plans are restored. Complete warmup shapes remain
+enabled. Source, runtime, model or feature changes select another namespace.
+Unset by default; full-stage startup and decode qualification remain pending.
+
 `VLLM_HPU_DSV41_MHC_BATCH_REUSE=1` tests four-request control-weight reuse in the ordinary decode batch path. It keeps FP32 operands and each request's original K accumulation and reduction order. It is disabled by default pending complete-chain and serving qualification.
 
 `VLLM_HPU_DSV41_DSPARK_BF16_PROJECTIONS=1` retains BF16 checkpoint vocabulary/router weights in DSpark. FP32 activations use BF16 high/low rows in one GEMM with FP32 accumulation; BF16 activations use their exact single term. Disabled by default pending batch qualification.

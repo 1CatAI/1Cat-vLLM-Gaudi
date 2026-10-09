@@ -3297,6 +3297,11 @@ def _compile_group(group, *, native, backend="hpu_backend", tp4_owner=None, shar
     method = (group.memory_ready_forward if memory_ready else group.coordinate_forward if shared_coordinates
               else group.native_forward if native else group.forward)
     function = method.__func__
+    if native and gaudi_envs.VLLM_HPU_DSV41_FRONTEND_CACHE_DIR:
+        from vllm_gaudi.compilation.deepseek_v41_frontend_cache import cached_group_entry
+
+        return cached_group_entry(function, group, backend, gaudi_envs.VLLM_HPU_DSV41_FRONTEND_CACHE_DIR,
+                                  native=native, shared_coordinates=shared_coordinates, memory_ready=memory_ready)
     name = f"{function.__name__}_v41_{next(_compile_entry_ids)}"
     entry = FunctionType(
         function.__code__.replace(co_name=name), function.__globals__, name, function.__defaults__, function.__closure__
