@@ -677,7 +677,15 @@ class _PagedSnapshot:
     def __init__(self, program, positions, states):
         from vllm_gaudi.ops.deepseek_v41_paged_attention import PAGE_TOKENS
 
+        # Derived mirrors use logical rows, while canonical packed caches use
+        # physical pages and the null-page rows for incomplete compression.
+        # Saving an entire long-context mirror for a C1/C6 capture wastes the
+        # pool headroom needed by the native command/workspace allocator.
+        active = {id(value) for value in states}
+        mirrors = ("main_mirror", "index_mirror")
         pooled = {id(getattr(cache, name)) for cache in program.shared.sources.values() for name in ("main", "index")}
+        pooled.update(id(value) for cache in program.shared.sources.values() for name in mirrors
+                      if (value := getattr(cache, name, None)) is not None and id(value) in active)
         self.small = _Snapshot(tuple(value for value in states if id(value) not in pooled))
         self.rows = []
         for cache in program.shared.sources.values():
@@ -689,6 +697,11 @@ class _PagedSnapshot:
             for name in ("main", "index"):
                 value = getattr(cache, name)
                 self.rows.append((value, indices, value.index_select(0, indices).clone()))
+            logical_indices = logical.cpu().unique().to(device=positions.device, dtype=torch.int64)
+            for name in mirrors:
+                value = getattr(cache, name, None)
+                if value is not None and id(value) in active:
+                    self.rows.append((value, logical_indices, value.index_select(0, logical_indices).clone()))
         self.bytes = self.small.bytes + sum(value.numel() * value.element_size() for _, _, value in self.rows)
 
     def restore(self):

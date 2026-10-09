@@ -9,7 +9,7 @@ import pytest
 import torch
 from transformers import OPTConfig
 
-from vllm.config import CacheConfig, ModelConfig, ParallelConfig, SchedulerConfig, VllmConfig
+from vllm.config import CacheConfig, ModelConfig, ParallelConfig, SchedulerConfig, SpeculativeConfig, VllmConfig
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 
@@ -31,7 +31,7 @@ from test_engram import layout
 from test_prefix_state import Event, make_bank, slot_values
 
 
-def make_scheduler(tmp_path):
+def make_scheduler(tmp_path, *, speculative_method=None, maximum_requests=32):
     OPTConfig(architectures=["OPTForCausalLM"],
               hidden_size=32,
               ffn_dim=64,
@@ -41,13 +41,23 @@ def make_scheduler(tmp_path):
     config = VllmConfig(model_config=ModelConfig(model=str(tmp_path), dtype="float16", max_model_len=8192),
                         parallel_config=ParallelConfig(tensor_parallel_size=2, pipeline_parallel_size=2),
                         cache_config=CacheConfig(block_size=128, enable_prefix_caching=True),
-                        scheduler_config=SchedulerConfig(max_num_seqs=32,
+                        scheduler_config=SchedulerConfig(max_num_seqs=maximum_requests,
                                                          max_num_batched_tokens=8192,
                                                          max_model_len=8192,
                                                          enable_chunked_prefill=True,
                                                          is_encoder_decoder=False,
-                                                         async_scheduling=True,
+                                                         async_scheduling=speculative_method is None,
                                                          watermark=0.0))
+    if speculative_method is not None:
+        # Exercise the real scheduler methods without loading a draft checkpoint
+        # for this tiny CPU-only OPT fixture.
+        speculative = object.__new__(SpeculativeConfig)
+        speculative.method = speculative_method
+        speculative.num_speculative_tokens = 5
+        speculative.num_speculative_tokens_per_batch_size = None
+        speculative.disable_eagle_block_drop = False
+        speculative.draft_model_config = None
+        config.speculative_config = speculative
     config.cache_config.num_gpu_blocks = 8193
     register_state_spec(config)
     spec = V41StateSpec(block_size=128,
@@ -68,6 +78,18 @@ def make_scheduler(tmp_path):
     scheduler._completed_batch_reentry = True
     init_none_hash(sha256)
     return scheduler
+
+
+@pytest.mark.parametrize("method,capacity,allowed", (("dspark", 1, True), ("dspark", 2, False),
+                                                   ("eagle", 1, False), ("mtp", 1, False)))
+def test_real_scheduler_checks_owned_speculative_prefix_admission(tmp_path, method, capacity, allowed):
+    if not allowed:
+        with pytest.raises(ValueError, match="owned DSpark"):
+            make_scheduler(tmp_path, speculative_method=method, maximum_requests=capacity)
+        return
+    scheduler = make_scheduler(tmp_path, speculative_method=method, maximum_requests=capacity)
+    assert scheduler.num_spec_tokens == 5
+    assert scheduler.kv_cache_manager.auxiliary_prefix_cache.capacity == 2
 
 
 def request(name):
