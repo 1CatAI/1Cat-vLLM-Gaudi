@@ -5,7 +5,7 @@ import torch.distributed as dist
 
 def can_sequence_prefill_state(stage, tokens):
     from vllm_gaudi import envs
-    return (stage.tensor_parallel_size == 4 and not stage.dspark and tokens == 16384
+    return (stage.tensor_parallel_size == 4 and tokens == 16384
             and envs.VLLM_HPU_DSV41_PREFILL_REGIONS and envs.VLLM_HPU_DSV41_PREFILL_MHC_INPUT
             and envs.VLLM_HPU_DSV41_PREFILL_MHC_POST)
 

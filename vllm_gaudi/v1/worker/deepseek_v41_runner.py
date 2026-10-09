@@ -1699,10 +1699,10 @@ class V41ModelRunner:
         if program is not None and program.length > 512:
             if search_length is not None:
                 search = int(search_length)
-            elif not getattr(program, "runtime_indexer", False):
-                search = target_search_length(start, count, program.length)
             elif graph_c1:
-                search = runtime_search_length(start, count, program.length)
+                search = (runtime_search_length(start, count, program.length)
+                          if getattr(program, "runtime_indexer", False)
+                          else target_search_length(start, count, program.length))
             else:
                 search = prefill_search_length(
                     start, count, program.length, reuse_index_keys=envs.VLLM_HPU_DSV41_PREFILL_REINDEX_REUSE
@@ -2288,17 +2288,12 @@ class V41ModelRunner:
                     and len(scheduled.num_scheduled_tokens) == 1
                     and not request.mm_features
                     and getattr(request.sampling_params, "prompt_logprobs", None) is None
-                    and not self.use_dspark
                 ),
             )
         program = getattr(self.model, "program", None)
         transaction_search = (
-            (
-                prefill_search_length(
-                    start, count, program.length, reuse_index_keys=envs.VLLM_HPU_DSV41_PREFILL_REINDEX_REUSE
-                )
-                if getattr(program, "runtime_indexer", False)
-                else target_search_length(start, count, program.length)
+            prefill_search_length(
+                start, count, program.length, reuse_index_keys=envs.VLLM_HPU_DSV41_PREFILL_REINDEX_REUSE
             )
             if not decode and program is not None and program.length > 512
             else None
@@ -2316,7 +2311,6 @@ class V41ModelRunner:
                     len(request.prompt),
                     eligible=(
                         envs.VLLM_HPU_DSV41_PREFILL_DECODER_HALO
-                        and not self.use_dspark
                         and (not tp4_halo or self.prefill_capacity == 16384)
                         and (tp4_halo or (start == 0 and count == len(request.prompt)))
                         and max(prefill_compute_buckets(self.prefill_capacity), default=1) == halo_block
@@ -2952,7 +2946,7 @@ class V41ModelRunner:
         return value if self.pp.group.is_last_rank else None
 
     @torch.inference_mode()
-    def _dummy_run(self, tokens, *, native=False, start_position=0):
+    def _dummy_run(self, tokens, *, native=False, start_position=0, prefill=False):
         logger.info(
             "V4.1 PP%d C%d warmup target start (native=%s, preceding steps=%d)",
             self.model.pp_rank,
@@ -2972,7 +2966,8 @@ class V41ModelRunner:
             "__v41_warmup__",
             [1 + index for index in range(tokens)],
             start_position,
-            decode=(native or getattr(self.model, "tensor_parallel_size", 2) == 4) and (self.use_dspark or tokens == 1),
+            decode=(not prefill and (native or getattr(self.model, "tensor_parallel_size", 2) == 4)
+                    and tokens <= (6 if self.use_dspark else 1)),
             reset=True,
         )
         from vllm_gaudi.ops.tp2_prepared_plan import prepared_group_stats
@@ -3081,7 +3076,7 @@ class V41ModelRunner:
                     torch.hpu.synchronize()
                     torch.hpu.reset_peak_memory_stats()
                 if isinstance(self.state, PagedStageState):
-                    warmup_buckets = prefill_compute_buckets()
+                    warmup_buckets = prefill_compute_buckets(self.prefill_capacity)
                     geometries = (0, min(INDEX_MME_HOT_TOKENS, self.model_config.max_model_len - 1))
                     for start_position in geometries:
                         for tokens in warmup_buckets:
@@ -3158,12 +3153,21 @@ class V41ModelRunner:
             # Profile-time pages are replaced by the scheduler pool before
             # this entry. Warm the actual serving tensor contracts, including
             # tail tiles in later search buckets, before freezing executors.
-            for start, count in prefill_search_warmups(
-                    self.model_config.max_model_len, self.prefill_capacity,
-                    reuse_index_keys=envs.VLLM_HPU_DSV41_PREFILL_REINDEX_REUSE):
-                logger.info("V4.1 PP%d warming serving C%d prefill at position %d",
-                            self.model.pp_rank, count, start)
-                self._dummy_run(count, start_position=start)
+            bank = self.model.batch_state
+            owner = "__v41_serving_prefill_warmup__"
+            slot = bank.acquire(owner)
+            bank.publish_pages(slot, range(1, self.state.blocks), self.state.blocks)
+            try:
+                for start, count in prefill_search_warmups(
+                        self.model_config.max_model_len, self.prefill_capacity,
+                        reuse_index_keys=envs.VLLM_HPU_DSV41_PREFILL_REINDEX_REUSE):
+                    bank.bind_prefill(slot)
+                    logger.info("V4.1 PP%d warming serving C%d prefill at position %d",
+                                self.model.pp_rank, count, start)
+                    self._dummy_run(count, start_position=start, prefill=True)
+            finally:
+                bank.restore_single_bindings()
+                bank.release(owner)
         if getattr(self, "prefix_checkpoints", None) is not None and self.prefill_capacity > 8192:
             from vllm_gaudi.ops.deepseek_v41_prefix_state import InlinePrefixCapture
 
@@ -3177,7 +3181,7 @@ class V41ModelRunner:
             program.shared.inline_prefix_capture = capture
             program.prefill_halo_mode = "final" if program.stop == 40 else "full"
             try:
-                self._dummy_run(count)
+                self._dummy_run(count, prefill=True)
                 capture.require_complete()
                 bank.bind_single(slot, count)
                 logger.info("V4.1 PP%d warmed slot-owned prefill and %d inline prefix states",

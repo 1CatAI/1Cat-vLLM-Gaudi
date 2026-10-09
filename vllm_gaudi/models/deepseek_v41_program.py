@@ -1672,13 +1672,25 @@ class PreparedDecoderLayer(nn.Module):
             active_mask = ~image_mask[owned] if prefill_sequence else ~image_mask
             residual = update(residual, kv, w.engram.q_weight, w.engram.k_weight, active_mask, self.eps)
             del kv, rows, local_rows
-        target_state = (draft_context_state(
-            residual, self.attention.swa.shape[0],
-            grouped_prefill=(gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED
-                             or gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4))
-            if self.collect_target_state else None)
-        if target_state is not None and prefill_sequence:
-            target_state = gather_tokens(target_state.contiguous(), group=group.device_group)
+        target_state = None
+        if self.collect_target_state:
+            capacity = self.attention.swa.shape[0]
+            capture = None if decode else getattr(self.attention.shared, "inline_prefix_capture", None)
+            retained = capacity + (capture.end - capture.boundary if capture is not None else 0)
+            target_state = draft_context_state(
+                residual, retained,
+                grouped_prefill=(gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED
+                                 or gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4),
+            )
+            if prefill_sequence:
+                from vllm_gaudi.ops.deepseek_v41_prefill_sequence_state import replicate_owned_tail
+
+                # The draft consumes the global causal tail, not a concatenation
+                # of four independently truncated token-owner intervals.
+                target_state = replicate_owned_tail(target_state.contiguous(), retained, group=group.device_group)
+            if capture is not None:
+                capture.record_draft(self.layer, target_state, capacity)
+            target_state = target_state[-capacity:]
         compiled_input = prefill and gaudi_envs.VLLM_HPU_DSV41_PREFILL_MHC_INPUT
         requires_full_input = self.attention.owns_kv or self.attention.owns_index if prefill_sequence else False
         sequence_qkv = (
@@ -2795,10 +2807,15 @@ class PreparedStage(nn.Module):
         supported = (tp4 and self.pp_rank == 0 and self.start in (0, 20)) or (
             not tp4 and self.pp_rank == 1 and self.start == 20
         )
-        if not supported or self.dspark or self.stop != 40 or len(self.layers) != 40 - self.start:
+        if not supported or self.stop != 40 or len(self.layers) != 40 - self.start:
             raise RuntimeError("Decoder prefill halo requires complete layers through source20 and decoder39")
         if mode not in ("prefix_only", "final"):
             raise RuntimeError("Decoder prefill halo requires an explicit request phase")
+        if self.dspark and mode == "prefix_only":
+            # DSpark also publishes the trailing target states for its draft
+            # SWA ring. Execute the bounded decoder halo for intermediate
+            # prompt chunks rather than omitting their context producers.
+            mode = "final"
         if isinstance(residual, PrefillInput):
             residual, pre_mix = residual.take()
         retire = torch.hpu.Event() if tp4 and residual.device.type == "hpu" and positions.numel() > 8192 else None
@@ -2869,6 +2886,7 @@ class PreparedStage(nn.Module):
         elif sequence_state:
             residual = gather_tokens(residual, group=group.device_group)
             pre_mix = gather_tokens(pre_mix.contiguous(), group=group.device_group)
+        target_states = []
         for layer in self.layers[source_index + 1 :]:
             if tp4 and cut:
                 residual, pre_mix, target = layer(
@@ -2877,10 +2895,11 @@ class PreparedStage(nn.Module):
             else:
                 residual, pre_mix, target = layer(residual, pre_mix, positions, image_mask)
             if target is not None:
-                raise RuntimeError("Decoder halo cannot suppress DSpark target-state rows")
+                target_states.append(target)
         value = final_collapse_rms_norm(
             residual, pre_mix, self.weights.norm.weight, self.config["text_config"]["rms_norm_eps"]
         )
+        target = torch.cat(target_states, -1) if target_states else None
         if cut:
             # The vLLM sampler still indexes the last row of the original
             # scheduler transaction. Prefix rows are deliberately invalid.
@@ -2888,8 +2907,8 @@ class PreparedStage(nn.Module):
             full[cut:].copy_(value)
             full_pre = pre_mix.new_zeros((cut + retained, *pre_mix.shape[1:]))
             full_pre[cut:].copy_(pre_mix)
-            return full, full_pre, None
-        return value, pre_mix, None
+            return full, full_pre, target
+        return value, pre_mix, target
 
     def forward(self, residual, pre_mix, positions, input_ids, engram_rows):
         """Run normal vLLM prefill with bounded internal token tiles.

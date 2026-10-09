@@ -45,6 +45,60 @@ def test_ordinary_prefix_has_no_draft_state():
     restore_draft_context(owner, ())
 
 
+def test_inline_prefix_saves_causal_draft_ring_and_preserves_live_tile_end(monkeypatch):
+    from test_prefix_state import Event, make_bank
+    from vllm.v1.core.auxiliary_prefix_cache import AuxiliaryPrefixDescriptor, AuxiliaryPrefixOperations
+    from vllm_gaudi.v1.worker.deepseek_v41_prefix import PrefixCheckpoints
+
+    bank, source, target, _ = make_bank()
+    bank.program.shared = SimpleNamespace(inline_prefix_capture=None)
+    bank.program.draft = program().draft
+    requests = {name: SimpleNamespace(num_computed_tokens=896, block_ids=(list(range(1, 8193)),))
+                for name in ("source", "target")}
+    runner = SimpleNamespace(use_dspark=True, prefill_capacity=16384,
+                             vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=3)),
+                             model=SimpleNamespace(batch_state=bank, engram_host=None, program=bank.program),
+                             state=SimpleNamespace(blocks=8193), pp=SimpleNamespace(drain=lambda: None),
+                             audit={}, requests=requests)
+    bank.acquire = bank.slots.acquire
+    bank.publish_pages = lambda *_: None
+    monkeypatch.setattr(torch.hpu, "synchronize", lambda: None)
+    monkeypatch.setattr(PrefixCheckpoints, "_done", staticmethod(Event))
+    monkeypatch.setattr(Event, "synchronize", lambda self: None, raising=False)
+
+    def insert(values, positions):
+        for index, layer in enumerate(bank.program.draft.layers):
+            rows = (positions % 256).long()
+            packed = values[:, index:index + 1].to(torch.uint8).expand(-1, 528)
+            layer.attention.swa.index_copy_(0, rows, packed)
+            decoded = getattr(layer.attention, "swa_decoded", None)
+            if decoded is not None:
+                decoded.swa.index_copy_(0, rows, values[:, index:index + 1].bfloat16().expand(-1, 512))
+
+    runner._insert = insert
+    runtime = PrefixCheckpoints(runner)
+    descriptor = AuxiliaryPrefixDescriptor(0, 1, 896, b"prefix", (tuple(range(1, 8)),))
+    runtime.begin(AuxiliaryPrefixOperations(captures={"source": descriptor}))
+    runtime.chunks("source", 0, [(0, list(range(1024)))], inline_eligible=True)
+    capture = runtime.inline["source"]
+    for layer, state in bank.layers.items():
+        for name, value in state.named_buffers(recurse=False):
+            capture.record(layer, name, torch.full((1024, value.shape[1]), layer + 7, dtype=value.dtype))
+    for layer in (37, 38, 39):
+        capture.record_draft(layer, (torch.arange(640, 1024)[:, None] + layer).float(), 256)
+    expected_states = capture.draft_context()
+    live = tuple(value.clone() for value in draft_context_views(bank.program))
+    runtime.capture_at("source", 1024)
+    assert all(torch.equal(value, before) for value, before in zip(draft_context_views(bank.program), live, strict=True))
+    runtime.operations = None
+    runtime.begin(AuxiliaryPrefixOperations(restores={"target": descriptor}))
+    for index, layer in enumerate(bank.program.draft.layers):
+        expected = torch.empty_like(layer.attention.swa)
+        expected.index_copy_(0, torch.arange(640, 896).remainder(256),
+                             expected_states[:, index:index + 1].to(torch.uint8).expand(-1, 528))
+        assert torch.equal(layer.attention.swa, expected)
+
+
 @pytest.mark.parametrize("capacity", (1, 2))
 def test_speculative_prefix_admission_matches_owned_draft_capacity(monkeypatch, capacity):
     pytest.importorskip("vllm.v1.core.auxiliary_prefix_cache")
