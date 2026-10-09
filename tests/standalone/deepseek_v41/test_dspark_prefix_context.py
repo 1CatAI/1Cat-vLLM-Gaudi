@@ -80,3 +80,42 @@ def test_speculative_prefix_admission_matches_owned_draft_capacity(monkeypatch, 
     else:
         with pytest.raises(ValueError, match="one active request"):
             contract.configure(config)
+
+
+@pytest.mark.parametrize("checkpoint", (False, True))
+def test_prefix_transaction_retires_async_commit_before_checkpoint(checkpoint):
+    from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+    from vllm_gaudi.v1.worker.deepseek_v41_runner import V41ModelRunner
+
+    retired = []
+    acknowledgment = object()
+
+    class Pending(AsyncModelRunnerOutput):
+        def get_output(self):
+            retired.append(True)
+            return ModelRunnerOutput(req_ids=["r"], req_id_to_index={"r": 0}, sampled_token_ids=[[13]])
+
+    def capture(request_id, position):
+        assert request_id == "r" and position == 257
+        assert bool(retired) == checkpoint
+
+    runner = object.__new__(V41ModelRunner)
+    runner.pending = None
+    runner._update = lambda scheduled: None
+    runner._execute_request = lambda *args: None
+    runner._finish_request = lambda: Pending()
+    runner.model = SimpleNamespace(batch_state=SimpleNamespace(leave_single=lambda: None))
+    runner.requests = {"r": SimpleNamespace(num_computed_tokens=256)}
+    runner.request_batches = None
+    runner.draft_token_ids = None
+    runner.pp = SimpleNamespace(group=SimpleNamespace(is_last_rank=True))
+    runner.prefix_checkpoints = SimpleNamespace(begin=lambda operations: None, capture_at=capture,
+                                               finish=lambda: [acknowledgment] if checkpoint else [])
+    scheduled = SimpleNamespace(num_scheduled_tokens={"r": 1},
+                                auxiliary_prefix_operations=object() if checkpoint else None)
+    runner.execute_model(scheduled)
+    if checkpoint:
+        assert runner.batch_result.sampled_token_ids == [[13]]
+        assert runner.batch_result.auxiliary_prefix_acknowledgments == [acknowledgment]
+    else:
+        assert isinstance(runner.batch_result, Pending) and not retired

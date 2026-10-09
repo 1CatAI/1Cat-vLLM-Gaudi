@@ -2182,6 +2182,11 @@ class V41ModelRunner:
             with single_trace:
                 self._execute_request(scheduled, req_id, count)
                 result = self._finish_request()
+            if operations is not None and isinstance(result, AsyncModelRunnerOutput):
+                # Admission/checkpoint transactions must retire the accepted
+                # input before publishing auxiliary state or acknowledgments.
+                # Steady speculative decode keeps its asynchronous output.
+                result = result.get_output()
             if self.prefix_checkpoints is not None:
                 self.prefix_checkpoints.capture_at(req_id, self.requests[req_id].num_computed_tokens + count)
             ids.append(req_id)
