@@ -1683,11 +1683,11 @@ class PreparedDecoderLayer(nn.Module):
                                  or gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4),
             )
             if prefill_sequence:
-                from vllm_gaudi.ops.deepseek_v41_prefill_sequence_state import replicate_owned_tail
+                from vllm_gaudi.ops.deepseek_v41_prefill_sequence_state import causal_context_tail
 
                 # The draft consumes the global causal tail, not a concatenation
                 # of four independently truncated token-owner intervals.
-                target_state = replicate_owned_tail(target_state.contiguous(), retained, group=group.device_group)
+                target_state = causal_context_tail(target_state, retained, group=group.device_group)
             if capture is not None:
                 capture.record_draft(self.layer, target_state, capacity)
             target_state = target_state[-capacity:]

@@ -13,9 +13,19 @@ def test_complete_prefill_token_ownership_is_independent_of_decode_method(monkey
     for name in ("PREFILL_REGIONS", "PREFILL_MHC_INPUT", "PREFILL_MHC_POST"):
         monkeypatch.setenv("VLLM_HPU_DSV41_" + name, "1")
     stage = SimpleNamespace(tensor_parallel_size=4, dspark=dspark)
-    assert sequence.can_sequence_prefill_state(stage, 16384)
+    for count in (1024, 2048, 4096, 8192, 16384):
+        assert sequence.can_sequence_prefill_state(stage, count)
     assert not sequence.can_sequence_prefill_state(stage, 6)
-    assert not sequence.can_sequence_prefill_state(stage, 8192)
+    assert not sequence.can_sequence_prefill_state(stage, 512)
+
+
+@pytest.mark.parametrize("retained", (256, 384))
+def test_draft_context_ring_preserves_global_tail_across_token_owners(monkeypatch, retained):
+    full = torch.arange(1024 * 4).reshape(1024, 4).bfloat16()
+    local = full[-256:]
+    monkeypatch.setattr(sequence, "gather_tokens", lambda value, *, group: full)
+    monkeypatch.setattr(sequence, "replicate_owned_tail", lambda value, count, *, group: full[-count:])
+    assert torch.equal(sequence.causal_context_tail(local, retained, group=object()), full[-retained:])
 
 
 @pytest.mark.parametrize("rank", range(4))
