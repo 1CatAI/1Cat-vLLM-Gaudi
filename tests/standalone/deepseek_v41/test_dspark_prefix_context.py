@@ -43,3 +43,40 @@ def test_ordinary_prefix_has_no_draft_state():
     owner = SimpleNamespace(draft=None)
     assert draft_context_views(owner) == ()
     restore_draft_context(owner, ())
+
+
+@pytest.mark.parametrize("capacity", (1, 2))
+def test_speculative_prefix_admission_matches_owned_draft_capacity(monkeypatch, capacity):
+    pytest.importorskip("vllm.v1.core.auxiliary_prefix_cache")
+    from vllm_gaudi.entrypoints import deepseek_v41 as entrypoint
+    from vllm_gaudi.ops import deepseek_v41_config as contract
+    from vllm_gaudi.ops import deepseek_v41_state
+
+    monkeypatch.setattr(entrypoint, "prepare_native_libraries", lambda: None)
+    monkeypatch.setattr(deepseek_v41_state, "register_state_spec", lambda config: None)
+    for name in ("PREPARED_SHARDS", "GRAPH_REPLAY", "DSPARK"):
+        monkeypatch.setenv("VLLM_HPU_DSV41_" + name, "1")
+    for name in ("V2", "BATCH_DECODE", "RUNTIME_INDEXER"):
+        monkeypatch.setenv("VLLM_HPU_DSV41_" + name, "0")
+    for name in entrypoint._PIPELINE_ONLY_FASTPATHS:
+        monkeypatch.setenv(name, "0")
+    monkeypatch.setenv("VLLM_HPU_TP2_STATIC_GROUP_PLAN", "1")
+    monkeypatch.setenv("VLLM_HPU_TP2_PREPARED_COMM", "1")
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v41"), max_model_len=262144),
+        parallel_config=SimpleNamespace(data_parallel_size=1, tensor_parallel_size=4, pipeline_parallel_size=1),
+        cache_config=SimpleNamespace(enable_prefix_caching=True, user_specified_block_size=False, block_size=128),
+        scheduler_config=SimpleNamespace(max_num_seqs=capacity, async_scheduling=False),
+        load_config=SimpleNamespace(load_format="dsv41_prepared"),
+        speculative_config=SimpleNamespace(method="dspark",
+                                           num_speculative_tokens=5,
+                                           enable_adaptive_verification=False),
+        use_v2_model_runner=False,
+        lora_config=None,
+        kv_transfer_config=None,
+    )
+    if capacity == 1:
+        contract.configure(config)
+    else:
+        with pytest.raises(ValueError, match="one active request"):
+            contract.configure(config)
