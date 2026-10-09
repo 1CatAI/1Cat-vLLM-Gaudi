@@ -670,15 +670,18 @@
          return cls(
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
-@@ -31,6 +31,7 @@
+@@ -31,6 +31,10 @@
  from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
  from vllm.multimodal.encoder_budget import MultiModalBudget
  from vllm.multimodal.utils import get_mm_features_in_window
-+from vllm.v1.core.auxiliary_prefix_cache import AuxiliaryPrefixCache
++from vllm.v1.core.auxiliary_prefix_cache import (
++    AuxiliaryPrefixCache,
++    supports_auxiliary_prefix_speculation,
++)
  from vllm.v1.core.encoder_cache_manager import (
      EncoderCacheManager,
      EncoderDecoderCacheManager,
-@@ -292,6 +293,30 @@
+@@ -292,6 +296,35 @@
          if hash_block_size is None:
              hash_block_size = block_size
          self.hash_block_size = hash_block_size
@@ -692,11 +695,16 @@
 +                or hash_block_size != block_size
 +                or self.dcp_world_size != 1
 +                or self.connector is not None
-+                or vllm_config.speculative_config is not None
++                or not supports_auxiliary_prefix_speculation(
++                    vllm_config.speculative_config.method
++                    if vllm_config.speculative_config is not None else None,
++                    self.max_num_running_reqs,
++                )
 +            ):
 +                raise ValueError(
 +                    "Auxiliary prefix checkpoints require one uniform local page group "
-+                    "without context parallelism or speculative execution"
++                    "without context parallelism; speculative state is supported "
++                    "only for one owned DSpark request"
 +                )
 +            auxiliary_prefix_cache = AuxiliaryPrefixCache(
 +                capacity=min(128, 2 * self.max_num_running_reqs),
@@ -709,7 +717,7 @@
          self.kv_cache_manager = KVCacheManager(
              kv_cache_config=kv_cache_config,
              max_model_len=self.max_model_len,
-@@ -307,6 +332,7 @@
+@@ -307,6 +340,7 @@
              hash_block_size=hash_block_size,
              metrics_collector=self.kv_metrics_collector,
              watermark=self.scheduler_config.watermark,
@@ -717,7 +725,7 @@
          )
          # Bind GPU block pool to the KV connector. This must happen after
          # kv_cache_manager is constructed so block_pool is available.
-@@ -1363,6 +1389,11 @@
+@@ -1363,6 +1397,11 @@
              kv_connector_block_state=kv_connector_block_state,
              num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
              ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
@@ -729,7 +737,7 @@
          )
  
          # NOTE(Kuntai): this function is designed for multiple purposes:
-@@ -1813,6 +1844,15 @@
+@@ -1813,6 +1852,15 @@
          scheduler_output: SchedulerOutput,
          model_runner_output: ModelRunnerOutput,
      ) -> dict[int, EngineCoreOutputs]:
@@ -774,7 +782,7 @@
      def first_spec(self) -> KVCacheSpec:
 --- /dev/null
 +++ b/vllm/v1/core/auxiliary_prefix_cache.py
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,190 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Publication and leases for prefix state outside the token-page pool.
@@ -788,6 +796,11 @@
 +from collections import OrderedDict
 +from collections.abc import Sequence
 +from dataclasses import dataclass, field
++
++
++def supports_auxiliary_prefix_speculation(method: str | None, maximum_requests: int) -> bool:
++    """DSpark owns accepted draft state alongside its single target request."""
++    return method is None or (method == "dspark" and maximum_requests == 1)
 +
 +
 +@dataclass(frozen=True)

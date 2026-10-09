@@ -142,6 +142,12 @@ def configure(config):
             raise ValueError("V4.1 prefix caching requires request slots and the auxiliary-checkpoint engine ABI")
         if envs.VLLM_HPU_DSV41_DSPARK and config.scheduler_config.max_num_seqs != 1:
             raise ValueError("V4.1 DSpark prefix caching requires one active request")
+        if envs.VLLM_HPU_DSV41_DSPARK:
+            from vllm.v1.core import auxiliary_prefix_cache
+
+            supported = getattr(auxiliary_prefix_cache, "supports_auxiliary_prefix_speculation", None)
+            if supported is None or not supported("dspark", config.scheduler_config.max_num_seqs):
+                raise ValueError("V4.1 DSpark prefix caching requires the engine's owned speculative-state ABI")
     if envs.VLLM_HPU_DSV41_BATCH_DECODE:
         if (not paged or not envs.VLLM_HPU_DSV41_GRAPH_REPLAY or not envs.VLLM_HPU_DSV41_RUNTIME_INDEXER
                 or envs.VLLM_HPU_DSV41_DSPARK or not 1 <= config.scheduler_config.max_num_seqs <= 64):

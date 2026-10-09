@@ -80,7 +80,7 @@
     {
       "path": "vllm/v1/core/sched/scheduler.py",
       "parent_sha256": "e5e1c18b1d7a6ea73adbb4921f64a35b00a96abe673691bf6a7f57281a524519",
-      "candidate_sha256": "543f7a059df9a6e243293921f1fb84f65b7b82d39dfcc896204b845ce3aa08f8"
+      "candidate_sha256": "03284cd1377b79f9897f0700880bf64b756474913dcf368a38b962687a5d3c4b"
     },
     {
       "path": "vllm/v1/kv_cache_interface.py",
@@ -90,8 +90,8 @@
     {
       "path": "vllm/v1/core/auxiliary_prefix_cache.py",
       "parent_sha256": null,
-      "candidate_sha256": "c3e2b136c94fcf1b6194e2c2a6ecc54559c895bdf12e040c4995d997011a3bc7"
+      "candidate_sha256": "b52f4e72ccd85e42cda29d33102c374dd88a4eaa9b3df5e215ee55d144feb0cd"
     }
   ],
-  "patch_sha256": "4a35e7221ac47e1a88137d8a38ff9093b7c5bbd7fab01ba385055ff734198f52"
+  "patch_sha256": "dc4293ca1d821b2bad46195dae15582fac79bbe0efe7858d72a45d08dae2e46f"
 }
