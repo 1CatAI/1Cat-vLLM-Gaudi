@@ -98,9 +98,10 @@ def request(name):
     return Request(name, [13] * 2048, params, None, block_hasher=get_request_block_hasher(128, sha256))
 
 
-def test_real_scheduler_requires_all_rank_state_then_reuses_only_1920_tokens(tmp_path, monkeypatch):
+@pytest.mark.parametrize("method", (None, "dspark"))
+def test_real_scheduler_requires_all_rank_state_then_reuses_only_1920_tokens(tmp_path, monkeypatch, method):
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "0")
-    scheduler = make_scheduler(tmp_path)
+    scheduler = make_scheduler(tmp_path, speculative_method=method, maximum_requests=1 if method else 32)
     first = request("cold")
     scheduler.add_request(first)
     cold = scheduler.schedule()
