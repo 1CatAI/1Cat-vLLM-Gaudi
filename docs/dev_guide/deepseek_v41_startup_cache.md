@@ -47,6 +47,20 @@ lengths, and official-sampling protocols still run before API readiness.
 
 ## Qualification
 
+Immutable Engram CPU tables can have an owner independent of the model service.
+`tools/keep_deepseek_v41_engram_tables.py` prepares sealed shared backings and
+keeps them resident across service restarts. Configure the live `ready.json`
+through the machine setting `engram_shared_table_manifest`. Each service validates
+the checkpoint identities, sealed extents and current residency, retains its own
+descriptors, then creates fresh device registrations. Missing or stale owners
+fall back to ordinary loading with the full host-memory admission requirement.
+
+This is a host-memory cache, not a persisted device binding or an expanded disk
+weight copy. Record initial backing creation separately from hot restart time;
+after a machine reboot the owner must establish those backings again. The owner
+must be managed separately from the model process group, and stopped when that
+cache is no longer needed. It consumes the configured table memory budget.
+
 Record initialization/weight preparation, prefill preparation, C1 native
 preparation, C6 native preparation, and protocol/API readiness separately. Reader,
 conversion, and upload timers can overlap and must not be added as exclusive
