@@ -254,6 +254,7 @@ class ReboundFrontend(SerializableCallable):
         self.backend = None
         self.compiled = None
         self.backend_seconds = 0.0
+        self.backend_directory = None
 
     @classmethod
     def from_graph(cls, graph, example_inputs=None):
@@ -288,10 +289,11 @@ class ReboundFrontend(SerializableCallable):
     def deserialize_compile_artifacts(cls, data):
         return cls(data)
 
-    def bind(self, backend):
+    def bind(self, backend, *, directory=None):
         if self.compiled is not None or self.backend is not None:
             raise RuntimeError("A restored frontend backend can only be bound once")
         self.backend = backend
+        self.backend_directory = directory
 
     def __call__(self, *args):
         if self.backend is None:
@@ -303,7 +305,13 @@ class ReboundFrontend(SerializableCallable):
                 if node.name in sources:
                     node._dynamo_source = sources[node.name]
             started = time.perf_counter()
-            self.compiled = self.backend(graph, list(args))
+            if self.backend_directory is not None and os.environ.get("VLLM_HPU_DSV41_BACKEND_CACHE", "0") == "1":
+                from vllm_gaudi.compilation.deepseek_v41_backend_cache import restore_or_compile
+
+                self.compiled = restore_or_compile(self.backend, graph, list(args), self.backend_directory,
+                                                   hashlib.sha256(self.graph_bytes).hexdigest())
+            else:
+                self.compiled = self.backend(graph, list(args))
             self.backend_seconds += time.perf_counter() - started
         return self.compiled(*args)
 
@@ -348,6 +356,7 @@ class GuardedFrontendEntry:
         self.variants = []
         self.pending = []
         self.stats = dict(captures=0, restores=0, hits=0, capture_seconds=0.0, restore_seconds=0.0)
+        self.guard_miss_reported = False
         if self.directory.exists():
             self._index()
 
@@ -376,7 +385,7 @@ class GuardedFrontendEntry:
             started = time.perf_counter()
             artifact = _GuardedCompiledFunction.deserialize(data, self.function.__globals__, owner_bindings(self.owner),
                                                             record["defaults"], record["tensor_attributes"])
-            artifact._artifacts.compiled_fn.bind(self.backend)
+            artifact._artifacts.compiled_fn.bind(self.backend, directory=self.directory / "lowered")
             self.variants.append(artifact)
             self.pending.remove((binary, record))
             self.stats["restores"] += 1
@@ -393,9 +402,17 @@ class GuardedFrontendEntry:
         arguments = (self.owner, *args)
         self._restore(args)
         for artifact in self.variants:
-            if _defaults_match(artifact, arguments) and artifact.guard_check(*arguments):
+            defaults_match = _defaults_match(artifact, arguments)
+            if defaults_match and artifact.guard_check(*arguments):
                 self.stats["hits"] += 1
                 return artifact(*arguments)
+            if not self.guard_miss_reported:
+                from vllm_gaudi.extension.logger import logger
+
+                reason = (artifact._artifacts.guard_manager.check_verbose(artifact.prepare_f_locals(
+                    *arguments)) if defaults_match else "callable default or tensor qualification differs")
+                logger().warning("V4.1 frontend guard rejected: entry=%s reason=%s", self.function.__qualname__, reason)
+                self.guard_miss_reported = True
         if len(self.variants) + len(self.pending) == self.max_variants:
             raise RuntimeError("Frontend variant capacity exhausted before execution")
         started = time.perf_counter()
@@ -424,7 +441,7 @@ class GuardedFrontendEntry:
                       inputs=_input_signature(args))
         temporary.write_text(json.dumps(record, sort_keys=True) + "\n")
         temporary.replace(binary.with_suffix(".json"))
-        artifact._artifacts.compiled_fn.bind(self.backend)
+        artifact._artifacts.compiled_fn.bind(self.backend, directory=self.directory / "lowered")
         self.variants.append(artifact)
         self.stats["captures"] += 1
         return artifact(*arguments)
@@ -441,18 +458,14 @@ def immutable_package_sources(package):
 def cached_group_entry(function, group, backend, directory, *, native, shared_coordinates, memory_ready):
     """Bind one common TP stage entry; topology remains an ordinary contract."""
     from vllm_gaudi.extension.logger import logger
+    from vllm_gaudi.compilation.deepseek_v41_cache_identity import computation_dependencies, semantic_environment
 
-    package = Path(__file__).resolve().parents[1]
-    sources = immutable_package_sources(package)
+    sources = computation_dependencies(function, group)
     if isinstance(backend, str):
         from torch._dynamo.backends.registry import lookup_backend
 
         backend = lookup_backend(backend)
-    environment = {
-        name: value
-        for name, value in os.environ.items()
-        if name.startswith(("VLLM_HPU_", "PT_HPU_", "HCCL_", "HCL_")) and name not in _LOCATION_ENVIRONMENT
-    }
+    environment = semantic_environment(os.environ)
     contract = dict(sources=sources,
                     torch_version=torch.__version__,
                     environment=environment,

@@ -57,6 +57,7 @@ def prepare_serving_resources(settings, model, arguments):
     if cpus := settings.get("cpus"):
         os.sched_setaffinity(0, set(cpus))
     if cache_dir := settings.get("recipe_cache_dir"):
+        from vllm_gaudi.compilation.deepseek_v41_cache_identity import runtime_content_identity, stable_serving_contract
         package = Path(__file__).resolve().parents[1]
         engine = Path(importlib.util.find_spec("vllm").origin).resolve().parents[1]
         sources = {
@@ -79,14 +80,13 @@ def prepare_serving_resources(settings, model, arguments):
             }
             engine_patch = json.dumps(engine_sources, sort_keys=True).encode()
             engine_head = "materialized"
-        identity = {
-            "sources": sources,
-            "arguments": arguments,
-            "engine_head": engine_head,
-            "engine_diff": hashlib.sha256(engine_patch).hexdigest(),
-            "runtime": os.environ.get("DSV41_SERVING_RUNTIME"),
-            "model": hashlib.sha256((Path(model) / "manifest.json").read_bytes()).hexdigest()
-        }
+        runtime_identity = os.environ.get("DSV41_SERVING_RUNTIME")
+        if profile := os.environ.get("DSV41_RUNTIME_PROFILE"):
+            runtime_identity = runtime_content_identity(json.loads(Path(profile).read_text()))
+        identity = stable_serving_contract(model, runtime_identity, arguments)
+        # Archive the complete source inventory separately from the reusable
+        # runtime namespace. Individual guarded entries bind their actual
+        # computation dependencies, so unrelated edits do not flush all keys.
         digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
         os.environ["DSV41_SERVING_COMPILE_IDENTITY"] = digest
         cache = Path(cache_dir) / digest
@@ -97,3 +97,6 @@ def prepare_serving_resources(settings, model, arguments):
         # explicit value remains a diagnostic way to disable frontend reuse.
         os.environ.setdefault("VLLM_HPU_DSV41_FRONTEND_CACHE_DIR", str(cache / "frontend"))
         (cache / "identity.json").write_text(json.dumps(identity, indent=2) + "\n")
+        (cache / "source-inventory.json").write_text(json.dumps(dict(sources=sources, engine_head=engine_head,
+                                                                    engine_diff=hashlib.sha256(engine_patch).hexdigest()),
+                                                                indent=2) + "\n")

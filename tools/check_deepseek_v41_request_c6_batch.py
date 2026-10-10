@@ -128,6 +128,8 @@ def main():
     parser.add_argument("--frontend-restore-only", action="store_true")
     parser.add_argument("--frontend-identity", help="Validated common runtime/model identity for fresh-process reuse")
     parser.add_argument("--frontend-rows", type=int, choices=(1, 6), default=6)
+    parser.add_argument("--frontend-first", action="store_true",
+                        help="Exercise cache capture before ordinary compilation, matching service startup")
     parser.add_argument(
         "--attention-oracle",
         action="store_true",
@@ -392,7 +394,7 @@ def main():
                 raise ValueError("Precision proof belongs to other actual inputs")
             start, stop = args.group * 4, args.group * 4 + args.real_layer_count
             if args.real_layer_count != 4:
-                if (args.candidate not in ("mhc_post_stats", "main_single_bank", "coherent_swa", "c1_dense_chain", "fp8_prologue",
+                if (args.candidate not in ("startup_frontend", "mhc_post_stats", "main_single_bank", "coherent_swa", "c1_dense_chain", "fp8_prologue",
                                           "runtime_selection", "mhc_producer", "tensor_ready_peer",
                                           "mhc_native_dependencies", "index_query_local", "norm_roundtrip",
                                           "recipe_constants", "silu_decode", "silu_decode_affine",
@@ -609,7 +611,8 @@ def main():
             reduce, gather = stage_collectives(rank, True, tp)
             lookup = mxfp4_bf16_lut(torch.device("hpu"))
             programs, plans = [], []
-            for arm in (0, 1):
+            arm_order = (1, 0) if args.candidate == "startup_frontend" and args.frontend_first else (0, 1)
+            for arm in arm_order:
                 if args.candidate in ("joined_sampled_tail", "deep_queue", "round_input_publication") and arm:
                     break
                 os.environ[flag] = str(arm)
@@ -1399,7 +1402,7 @@ def main():
                 elif args.candidate == "startup_frontend":
                     selected = int(bool(arm) and bool(report["startup_preparation"][-1]["cache"]))
                     required_arm_calls = arm
-                    if arm:
+                    if arm and not args.frontend_first:
                         parent = report["captured_arms"][0]
                         report["frontend_operator_delta"] = {
                             name: operators[name] - parent["operators"].get(name, 0)
@@ -1462,6 +1465,17 @@ def main():
                          native_dependency_flag=os.environ.get(native_dependency_flag, "0"))
                 )
                 save()
+            if args.candidate == "startup_frontend" and args.frontend_first:
+                plans.reverse()
+                programs.reverse()
+                report["captured_arms"].sort(key=lambda item: item["arm"])
+                parent, changed = report["captured_arms"]
+                if changed["native_collectives"] != parent["native_collectives"]:
+                    raise RuntimeError("Frontend restoration changed the native communication contract")
+                report["frontend_operator_delta"] = {
+                    name: changed["operators"].get(name, 0) - parent["operators"].get(name, 0)
+                    for name in set(changed["operators"]) | set(parent["operators"])
+                    if changed["operators"].get(name, 0) != parent["operators"].get(name, 0)}
             cases = []
             states = []
             for data in raw:

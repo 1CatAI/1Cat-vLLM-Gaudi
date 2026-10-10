@@ -8,6 +8,7 @@ from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
+import time
 
 
 def signed_words(value):
@@ -103,8 +104,12 @@ def staged_source_batches(shard, source_q, source_s, batch):
     def read(first):
         last = min(first + batch, experts)
         shard.check_identity()
+        started = time.perf_counter()
         q = read_source_batch(source_q, first, last)
         s = read_source_batch(source_s, first, last)
+        if hasattr(shard, "startup_timings"):
+            shard.startup_timings["read_seconds"] += time.perf_counter() - started
+            shard.startup_timings["source_bytes"] += q.nbytes + s.nbytes
         shard.check_identity()
         return first, last, q, s
 
@@ -137,15 +142,27 @@ def fill_projection_device(shard, source_q, source_s, q, planes, channel, *, com
     convert = compiled_preparation(compact_scales, active_k)
     certificates = torch.empty((experts, 2), dtype=torch.int32, device=q.device)
     for first, last, raw_q, raw_s in staged_source_batches(shard, source_q, source_s, batch):
-        prepared = convert(torch.from_numpy(raw_q).to(q.device), torch.from_numpy(raw_s.view("<i2")).to(q.device))
+        started = time.perf_counter()
+        source_device_q = torch.from_numpy(raw_q).to(q.device)
+        source_device_s = torch.from_numpy(raw_s.view("<i2")).to(q.device)
+        if hasattr(shard, "startup_timings"):
+            shard.startup_timings["upload_seconds"] += time.perf_counter() - started
+            shard.startup_timings["upload_bytes"] += raw_q.nbytes + raw_s.nbytes
+        started = time.perf_counter()
+        prepared = convert(source_device_q, source_device_s)
         q[first:last].copy_(prepared[0])
         planes[first:last].copy_(prepared[1])
         channel[first:last].copy_(prepared[2].view(torch.bfloat16))
         certificates[first:last].copy_(prepared[3])
+        if hasattr(shard, "startup_timings"):
+            shard.startup_timings["conversion_enqueue_seconds"] += time.perf_counter() - started
         # Uploads are synchronous; do not retain the caller's previous source
         # arrays when the reader advances its two-buffer window.
         del raw_q, raw_s
+    started = time.perf_counter()
     valid, eligible = certificates.bool().all(0).cpu().tolist()
+    if hasattr(shard, "startup_timings"):
+        shard.startup_timings["device_finish_seconds"] += time.perf_counter() - started
     if not valid:
         raise ValueError("Device preparation rejected the source FP4/scale qualification")
     shard.check_identity()

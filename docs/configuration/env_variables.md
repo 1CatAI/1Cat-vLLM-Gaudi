@@ -94,6 +94,12 @@ manifest and ABI before copying any converted expert batch. The helper only
 reorders compressed integer bytes; scale selection and all HPU consumers stay
 on the shared path. Unset by default pending device and startup qualification.
 
+`VLLM_HPU_DSV41_BACKEND_CACHE` enables persistent lowered inference modules
+alongside guarded frontends. It restores partitioned modules, JIT descriptions
+and input/output metadata; native plans, recipe handles and communication
+ownership are created in the current process. It is disabled by default until
+complete serving startup qualification. Set it to `0` to disable reuse.
+
 `VLLM_HPU_DSV41_FRONTEND_CACHE_DIR` selects persistent Dynamo frontend metadata
 for the shared native stage. Normal serving resource preparation selects a
 directory beside its persistent recipes; an explicit empty value disables it.

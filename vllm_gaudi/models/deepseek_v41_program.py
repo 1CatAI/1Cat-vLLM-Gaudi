@@ -2,6 +2,7 @@
 """Prepared V4.1 stage program shared by normal loading, compile and replay."""
 
 import json
+import time
 from itertools import count
 from pathlib import Path
 from types import FunctionType, MethodType
@@ -152,7 +153,9 @@ def load_weight_tree(
         if projection != "version"
         for layer in layers
     }
-    for name, spec in (shard.specs if specs is None else specs).items():
+    selected_specs = shard.specs if specs is None else specs
+    items = shard.timed_specs(selected_specs) if hasattr(shard, "timed_specs") else selected_specs.items()
+    for name, spec in items:
         layer = int(name.split(".")[1]) if name.startswith("layers.") else None
         selected_n256 = n256 and layer is not None and (expert_n256_layers is None or layer in expert_n256_layers)
         if engram_sidecar is not None and name in {"layers.1.engram.wkv.weight", "layers.14.engram.wkv.weight"}:
@@ -2435,6 +2438,7 @@ class PreparedStage(nn.Module):
         self.draft = PreparedDraft(self, lookup, device) if self.dspark and self.is_last_stage else None
 
     def load_prepared(self, device):
+        load_started = time.perf_counter()
         if self.loaded:
             self.invalidate()
         else:
@@ -2482,6 +2486,7 @@ class PreparedStage(nn.Module):
             dense_config=self.dense_config,
             engram_sidecar=engram_sidecar,
         )
+        derived_started = time.perf_counter()
         for layer in self.layers:
             prepare = getattr(layer, "prepare_mhc_control_weights", None)
             if prepare is not None:
@@ -2696,6 +2701,14 @@ class PreparedStage(nn.Module):
             ]
         self.loaded = True
         self.generation += 1
+        if hasattr(self.shard, "startup_timings"):
+            from vllm_gaudi.extension.logger import logger
+
+            self.shard.startup_timings["derived_seconds"] += time.perf_counter() - derived_started
+            logger().info("V4.1 weight startup: rank=%d total_seconds=%.3f families=%s counters=%s "
+                          "reader and enqueue counters may overlap", self.tp_rank,
+                          time.perf_counter() - load_started, json.dumps(self.shard.startup_families),
+                          json.dumps(self.shard.startup_timings))
 
     def _invalidate_prefill_regions(self):
         from vllm_gaudi.ops.deepseek_v41_prefill_plan import invalidate_prefill_plans
