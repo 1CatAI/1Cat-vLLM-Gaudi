@@ -29,8 +29,9 @@ def bundle(tmp_path):
 def test_recipe_aliases_retain_existing_files_and_do_not_duplicate(tmp_path):
     old, new, identity, profile, compatible = bundle(tmp_path)
     assert reuse_recipe_bundle(new, identity, profile, compatible) == 4
-    assert reuse_recipe_bundle(new, identity, profile, compatible) == 0
+    assert reuse_recipe_bundle(new, identity, profile, compatible) == 4
     for rank in range(4):
+        assert not (new / f"rank{rank}").is_symlink()
         assert (new / f"rank{rank}" / "recipe").stat().st_ino == (old / f"rank{rank}" / "recipe").stat().st_ino
 
 

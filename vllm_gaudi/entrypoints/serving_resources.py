@@ -38,9 +38,22 @@ def reuse_recipe_bundle(cache, identity, profile, compatibility):
         if not rank.is_dir() or not rank.name[4:].isdecimal():
             continue
         destination = cache / rank.name
-        if not destination.exists():
-            destination.symlink_to(rank.resolve(), target_is_directory=True)
-            retained += 1
+        # The SDK rejects symlink cache directories. Share immutable recipe
+        # bytes through ordinary hardlinked files, retaining independent names.
+        if destination.is_symlink():
+            if destination.resolve() != rank.resolve():
+                raise ValueError("Recipe destination points to an unrelated bundle")
+            destination.unlink()
+        destination.mkdir(exist_ok=True)
+        for source in rank.rglob("*"):
+            target = destination / source.relative_to(rank)
+            if source.is_symlink():
+                raise ValueError("Recipe compatibility contains a symbolic link")
+            if source.is_dir():
+                target.mkdir(exist_ok=True)
+            elif source.is_file() and not target.exists():
+                os.link(source, target)
+        retained += 1
     return retained
 
 
