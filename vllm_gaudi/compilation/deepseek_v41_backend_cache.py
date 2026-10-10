@@ -113,10 +113,15 @@ def _restore_graph(data):
         if isinstance(module, torch.fx.GraphModule):
             for name, record in module.meta.pop("dsv41_literal_buffers", {}).items():
                 module._buffers[name] = restore_literal(record)
+            changed = False
             for node in module.graph.nodes:
                 if node.meta.pop("dsv41_boxed_list_clear", False):
                     node.op, node.target = "call_function", list_clear
-            module.recompile()
+                    changed = True
+            # GraphPickler already reconstructs the executable forward. Buffer
+            # rebinding does not change that code; only edited nodes need it.
+            if changed:
+                module.recompile()
     return graph
 
 

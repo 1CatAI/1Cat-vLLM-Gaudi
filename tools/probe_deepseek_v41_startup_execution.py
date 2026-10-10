@@ -16,6 +16,54 @@ from vllm_gaudi.compilation import deepseek_v41_backend_cache as lowered
 _stats = {}
 _skipped = []
 _profile = cProfile.Profile()
+_restore_inputs = []
+_candidate_restore = lowered._restore_graph
+
+
+def retain_restore_input(data):
+    if len(_restore_inputs) < 16:
+        _restore_inputs.append(data)
+    return _candidate_restore(data)
+
+
+lowered._restore_graph = retain_restore_input
+
+
+def restore_metadata_ab():
+    import ast
+    import inspect
+    import gc
+
+    class Reference(ast.NodeTransformer):
+
+        def visit_Assign(self, node):
+            if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and node.targets[0].id == 'changed':
+                return None
+            return self.generic_visit(node)
+
+        def visit_If(self, node):
+            if isinstance(node.test, ast.Name) and node.test.id == 'changed':
+                return node.body
+            return self.generic_visit(node)
+
+    tree = Reference().visit(ast.parse(inspect.getsource(_candidate_restore)))
+    ast.fix_missing_locations(tree)
+    scope = dict(_candidate_restore.__globals__)
+    exec(compile(tree, '<reference_restore>', 'exec'), scope)
+    reference = scope['_restore_graph']
+    rows = []
+    for _ in range(3):
+        row = {}
+        for label, operation in (('original', reference), ('candidate', _candidate_restore)):
+            gc.collect()
+            start = time.perf_counter()
+            for payload in _restore_inputs:
+                restored = operation(payload)
+                del restored
+            gc.collect()
+            row[label] = time.perf_counter() - start
+        rows.append(row)
+    return dict(payloads=len(_restore_inputs), rounds=rows)
 
 
 def wrap(owner, name, label):
@@ -85,6 +133,7 @@ source = source.replace(
                     if plan not in _native_entries:
                         raise RuntimeError("Startup probe did not retain the native replay")
                     _profile.disable()
+                    report["metadata_restore_ab"] = restore_metadata_ab()
                     import pstats
                     statistics = pstats.Stats(_profile).stats
                     report["host_profile"] = [
@@ -107,5 +156,12 @@ source = source.replace(
                                   diagnostic_only=True, performance_gain_qualified=False)
                     return
 ''' + marker, 1)
-namespace = dict(__name__='__main__', __file__=str(script), _stats=_stats, _skipped=_skipped, _profile=_profile)
+namespace = dict(__name__='__main__',
+                 __file__=str(script),
+                 _stats=_stats,
+                 _skipped=_skipped,
+                 _profile=_profile,
+                 _candidate_restore=_candidate_restore,
+                 _restore_inputs=_restore_inputs,
+                 restore_metadata_ab=restore_metadata_ab)
 exec(compile(source, str(script), 'exec'), namespace)
