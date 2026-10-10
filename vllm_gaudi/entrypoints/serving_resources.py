@@ -55,7 +55,7 @@ def prepare_serving_resources(settings, model, arguments):
             _borrowed_tables.append(tables)
             settings["engram_resident_tables"] = tables.bindings
             reused_bytes = tables.reused_bytes
-            print(f"Validated shared Engram reuse: {reused_bytes} resident bytes; no second table allocation", flush=True)
+            print(f"Shared Engram reuse validated: {reused_bytes} resident bytes; no duplicate allocation", flush=True)
     minimum = settings.get("min_host_available_gib", 0)
     while minimum:
         memory = {
