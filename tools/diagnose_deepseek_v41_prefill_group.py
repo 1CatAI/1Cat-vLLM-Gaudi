@@ -6,6 +6,7 @@ request trace, and group timing must not be called the measured full-model split
 """
 import argparse
 from contextlib import contextmanager
+from collections import OrderedDict
 import json
 import os
 from pathlib import Path
@@ -20,7 +21,19 @@ def main():
     parser.add_argument('--tokens', type=int, default=16384)
     parser.add_argument('--probe-frozen-cache', action='store_true')
     parser.add_argument('--synchronized-phases', action='store_true')
+    parser.add_argument('--host-timing-only', action='store_true',
+                        help='Measure drained wall/CPU time without inserting per-layer HPU events')
+    parser.add_argument('--c1-prefill-reference', action='store_true',
+                        help='Diagnose the shared Target prompt body with C1 precision/state flags')
     args = parser.parse_args()
+    if args.c1_prefill_reference:
+        # This is a diagnostic profile, not a new serving implementation. The
+        # bounded group omits Engram and the DSpark seed/prefix consumer.
+        for name in ('DSPARK', 'DSPARK_SHARED_FP8'):
+            os.environ['VLLM_HPU_DSV41_' + name] = '0'
+        for name in ('BF16_ROUTER_GATE', 'SHARED_GATE_UP', 'RUNTIME_INDEXER',
+                     'DECODED_KV_STATE', 'PAGED_DECODED_KV_STATE', 'TP_MHC_OVERLAP'):
+            os.environ['VLLM_HPU_DSV41_' + name] = '1'
     rank = int(os.environ['LOCAL_RANK'])
     os.environ['HLS_MODULE_ID'] = os.environ['HABANA_VISIBLE_MODULES'].split(',')[rank]
     os.environ['PT_HPU_RECIPE_CACHE_CONFIG'] = os.environ.get('PT_HPU_RECIPE_CACHE_CONFIG',
@@ -59,6 +72,8 @@ def main():
                   scope=__doc__,
                   full_model_requests=0,
                   formal_gain_credit=False,
+                  c1_prefill_reference=args.c1_prefill_reference,
+                  hpu_events_inserted=not args.host_timing_only,
                   synchronization_added=args.synchronized_phases,
                   rounds=[])
 
@@ -88,9 +103,9 @@ def main():
                          dense_config={
                              'wq_b': layers,
                              'wo_b': layers,
-                             'shared_w1': layers,
-                             'shared_w3': layers,
-                             'shared_w2': layers
+                             'shared_w1': [] if args.c1_prefill_reference else layers,
+                             'shared_w3': [] if args.c1_prefill_reference else layers,
+                             'shared_w2': [] if args.c1_prefill_reference else layers
                          })
         shared = PagedCSA2SharedState(text, 0, 40, 'hpu', 32768, prefill_tokens=args.tokens, tensor_parallel_size=4)
         shared.block_table[:256].copy_(torch.arange(1, 257, dtype=torch.int32, device='hpu'))
@@ -103,7 +118,7 @@ def main():
 
         @contextmanager
         def span(name, layer):
-            if records is None or torch.compiler.is_compiling():
+            if records is None or args.host_timing_only or torch.compiler.is_compiling():
                 yield
                 return
             if args.synchronized_phases:
@@ -190,6 +205,24 @@ def main():
         report['status'] = 'measuring'
         save()
         from vllm_gaudi.ops import deepseek_v41_prefill_regions as regions
+        # Count exact compiled contracts after warmup. This observes this
+        # component only; no conclusion about live service hits is implied.
+        class CountedContracts(OrderedDict):
+            def __init__(self, source):
+                super().__init__(source)
+                self.hits = self.misses = 0
+
+            def get(self, key, default=None):
+                found = super().get(key, default)
+                if found is default:
+                    self.misses += 1
+                else:
+                    self.hits += 1
+                return found
+
+        for family in regions._function_regions.values():
+            for rows, cache in family.items():
+                family[rows] = CountedContracts(cache)
         retained_regions = regions._function_regions
         arms = ('retained', 'frozen_empty') if args.probe_frozen_cache else ('retained', )
         for repeat in range(3 * len(arms)):
@@ -197,12 +230,14 @@ def main():
             regions._function_regions = retained_regions if arm == 'retained' else {}
             records = []
             begin = time.perf_counter_ns()
+            cpu_begin = time.process_time_ns()
             output = run()
             torch.hpu.synchronize()
+            cpu_ms = (time.process_time_ns() - cpu_begin) / 1e6
             wall = (time.perf_counter_ns() - begin) / 1e6
             rows = []
-            anchor = None if args.synchronized_phases else next(item['first'] for item in records
-                                                                if item['name'] == 'layer')
+            anchor = None if args.synchronized_phases or args.host_timing_only else next(
+                item['first'] for item in records if item['name'] == 'layer')
             for item in records:
                 if args.synchronized_phases:
                     rows.append(item)
@@ -217,10 +252,15 @@ def main():
                 dict(repeat=repeat,
                      arm=arm,
                      host_drained_ms=wall,
+                     process_cpu_ms=cpu_ms,
                      spans=rows,
                      finite=bool(output[0].isfinite().all().cpu())))
             save()
         regions._function_regions = retained_regions
+        report['regional_contracts'] = [dict(family='.'.join(family), rows=rows, entries=len(cache),
+                                            hits=cache.hits, misses=cache.misses)
+                                        for family, geometries in retained_regions.items()
+                                        for rows, cache in geometries.items()]
         report['status'] = 'passed'
         save()
     print(json.dumps(report), flush=True)
