@@ -117,11 +117,26 @@ def lowering_dependencies():
         result[f"bridge:{path.relative_to(package)}"] = hashlib.sha256(
             ast.dump(ast.parse(path.read_text()), include_attributes=False).encode()).hexdigest()
     plugin = Path(__file__).resolve().parents[1]
-    for name in ("ops/tp2_prepared_plan.py", "compilation/deepseek_v41_prepared.py",
-                 "compilation/deepseek_v41_backend_cache.py"):
+    for name in ("ops/tp2_prepared_plan.py", "compilation/deepseek_v41_prepared.py"):
         result[name] = hashlib.sha256(
             ast.dump(ast.parse((plugin / name).read_text()), include_attributes=False).encode()).hexdigest()
     return result
+
+
+def lowered_keys(graph_bytes):
+    """Keep compatible metadata transport changes out of compiler identities."""
+    dependencies = lowering_dependencies()
+    key = hashlib.sha256(graph_bytes)
+    key.update(json.dumps(dependencies, sort_keys=True).encode())
+    # The first metadata schema included its encoder in the compiler key.
+    # These artifacts remain usable only when every actual compiler dependency
+    # and the entire frontend graph still match. Unknown encoders are rejected.
+    legacy = dict(dependencies)
+    legacy["compilation/deepseek_v41_backend_cache.py"] = (
+        "8f115516a301fa93d090b05f11232291b329f36c055fcada2625f9f40d1c107a")
+    previous = hashlib.sha256(graph_bytes)
+    previous.update(json.dumps(legacy, sort_keys=True).encode())
+    return key.hexdigest(), (previous.hexdigest(), )
 
 
 def semantic_environment(environment):

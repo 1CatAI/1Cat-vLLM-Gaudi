@@ -80,6 +80,7 @@ class PreparedV41Shard:
         self.startup_timings = dict(read_seconds=0.,
                                     upload_seconds=0.,
                                     conversion_enqueue_seconds=0.,
+                                    cpu_conversion_seconds=0.,
                                     device_finish_seconds=0.,
                                     derived_seconds=0.,
                                     source_bytes=0,
@@ -233,6 +234,7 @@ class PreparedV41Shard:
         chunk_rows = max(32, (COPY_BYTES // (k * 8) // 32) * 32)
         with self.path.open("rb") as stream:
             for start in range(0, n, chunk_rows):
+                read_started = time.perf_counter()
                 stop = min(n, start + chunk_rows)
                 stream.seek(source.offset + start * k)
                 raw = bytearray(stream.read((stop - start) * k))
@@ -243,13 +245,21 @@ class PreparedV41Shard:
                 raw_scale = bytearray(stream.read(scale_rows * scale_source.shape[1]))
                 if len(raw_scale) != scale_rows * scale_source.shape[1]:
                     raise ValueError("Dense FP8 scale source was truncated")
+                self.startup_timings["read_seconds"] += time.perf_counter() - read_started
+                self.startup_timings["source_bytes"] += len(raw) + len(raw_scale)
+                converted = time.perf_counter()
                 value = torch.frombuffer(raw, dtype=torch.float8_e4m3fn).reshape(stop - start, k).float()
                 codes = torch.frombuffer(raw_scale, dtype=torch.uint8).reshape(scale_rows, -1)
                 scales = torch.exp2(codes.float() - 127)
                 scales.masked_fill_(codes == 255, float("nan"))
                 expanded = scales.repeat_interleave(32, 0).repeat_interleave(32, 1)[:stop - start, :k]
                 value.mul_(expanded)
-                destination[start:stop].copy_(value.to(torch.bfloat16))
+                staged = value.to(torch.bfloat16)
+                self.startup_timings["cpu_conversion_seconds"] += time.perf_counter() - converted
+                uploaded = time.perf_counter()
+                destination[start:stop].copy_(staged)
+                self.startup_timings["upload_seconds"] += time.perf_counter() - uploaded
+                self.startup_timings["upload_bytes"] += staged.numel() * staged.element_size()
                 temporary = len(raw) + len(raw_scale) + value.numel() * 4 + expanded.numel() * 4
                 self.max_host_chunk_bytes = max(self.max_host_chunk_bytes, temporary)
                 # Do not issue per-chunk DONTNEED while TP2×PP2 workers load

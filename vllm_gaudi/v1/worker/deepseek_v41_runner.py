@@ -1426,7 +1426,11 @@ class V41ModelRunner:
     def uses_framework_kv_cache_layout(self, name):
         return name in self.state.specs
 
+    @torch.inference_mode(False)
     def allocate_framework_kv_cache_layer(self, spec, num_blocks):
+        # The worker invokes profiling under inference_mode, whereas the
+        # scheduler's persistent allocation is ordinary. Preserve the same
+        # dispatch/alias contract through both phases and across cache restore.
         return torch.zeros((num_blocks, *spec.state_shape), device=self.device, dtype=spec.state_dtype)
 
     def profile_kv_cache_blocks(self):

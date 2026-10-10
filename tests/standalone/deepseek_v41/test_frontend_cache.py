@@ -6,7 +6,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_gaudi.compilation.deepseek_v41_frontend_cache import GuardedFrontendEntry, cached_group_entry
+from vllm_gaudi.compilation.deepseek_v41_frontend_cache import (GuardedFrontendEntry, cached_group_entry,
+                                                                cached_tensor_entry)
 
 
 @pytest.fixture(autouse=True)
@@ -340,3 +341,27 @@ def test_serving_workers_use_distributed_rank_without_torchrun_environment(tmp_p
         assert torch.equal(entry(torch.ones((6, 8)))[0], torch.full((6, 8), 16.))
         assert entry.stats["captures"] == 0
         assert entry.stats["restores"] == 1
+
+
+def test_tensor_region_method_restores_current_owner_and_keyword_arguments(tmp_path, monkeypatch):
+    from torch._dynamo.backends import registry
+
+    monkeypatch.setenv("VLLM_HPU_DSV41_FRONTEND_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("DSV41_SERVING_RUNTIME", "runtime-proof")
+    monkeypatch.setenv("DSV41_SERVING_COMPILE_IDENTITY", "1" * 64)
+    monkeypatch.setattr(registry, "lookup_backend", lambda name: backend)
+    inputs = torch.ones((6, 8))
+    old = StateGroup(1.)
+    first = cached_tensor_entry(StateGroup.forward, (inputs, ), {}, owner=old)
+    first(inputs)
+    fresh = StateGroup(2.)
+    restored = cached_tensor_entry(StateGroup.forward, (inputs, ), {}, owner=fresh)
+    for value in (1., 2., 3.):
+        inputs.fill_(value)
+        output, state = restored(inputs)
+        assert torch.equal(output, inputs @ fresh.weight)
+        assert state.data_ptr() == fresh.state.data_ptr()
+    pure = cached_tensor_entry(defaults_transform, (inputs, ), {"shift": 1.5})
+    assert torch.equal(pure(inputs, shift=1.5), inputs * 2 + 1.5)
+    again = cached_tensor_entry(defaults_transform, (inputs, ), {"shift": 1.5})
+    assert torch.equal(again(inputs, shift=1.5), inputs * 2 + 1.5)

@@ -8,6 +8,7 @@ from vllm_gaudi.compilation.deepseek_v41_cache_identity import (
     computation_dependencies,
     runtime_content_identity,
     semantic_environment,
+    lowered_keys,
 )
 
 
@@ -24,6 +25,18 @@ def test_computation_identity_includes_selected_callable():
     second = computation_dependencies(changed, SimpleNamespace())
     assert first != second
     assert computation_dependencies(forward, SimpleNamespace(unrelated="diagnostic")) == first
+
+
+def test_lowered_compatibility_requires_identical_graph_and_compiler(monkeypatch):
+    from vllm_gaudi.compilation import deepseek_v41_cache_identity as identity
+
+    monkeypatch.setattr(identity, "lowering_dependencies", lambda: {"compiler": "one"})
+    first = lowered_keys(b"graph")
+    assert first != lowered_keys(b"different graph")
+    monkeypatch.setattr(identity, "lowering_dependencies", lambda: {"compiler": "two"})
+    second = lowered_keys(b"graph")
+    assert first[0] != second[0]
+    assert first[1][0] != second[1][0]
 
 
 def test_relocated_binary_and_cache_paths_keep_semantic_environment(tmp_path):

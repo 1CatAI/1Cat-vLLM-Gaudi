@@ -315,12 +315,15 @@ class ReboundFrontend(SerializableCallable):
             started = time.perf_counter()
             if self.backend_directory is not None and os.environ.get("VLLM_HPU_DSV41_BACKEND_CACHE", "0") == "1":
                 from vllm_gaudi.compilation.deepseek_v41_backend_cache import restore_or_compile
-                from vllm_gaudi.compilation.deepseek_v41_cache_identity import lowering_dependencies
+                from vllm_gaudi.compilation.deepseek_v41_cache_identity import lowered_keys
 
-                key = hashlib.sha256(self.graph_bytes)
-                key.update(json.dumps(lowering_dependencies(), sort_keys=True).encode())
-                self.compiled = restore_or_compile(self.backend, graph, list(args), self.backend_directory,
-                                                   key.hexdigest())
+                key, compatible = lowered_keys(self.graph_bytes)
+                self.compiled = restore_or_compile(self.backend,
+                                                   graph,
+                                                   list(args),
+                                                   self.backend_directory,
+                                                   key,
+                                                   compatible=compatible)
             else:
                 self.compiled = self.backend(graph, list(args))
             self.backend_seconds += time.perf_counter() - started
@@ -482,6 +485,53 @@ class GuardedFrontendEntry:
         self.variants.append(artifact)
         self.stats["captures"] += 1
         return artifact(*arguments)
+
+
+class TensorCallableOwner(torch.nn.Module):
+    """Bind a pure tensor region or method to the current process's owner."""
+
+    def __init__(self, function, owner=None):
+        super().__init__()
+        self.function = function
+        self.method_owner = owner
+
+    def forward(self, arguments, keywords):
+        if self.method_owner is None:
+            return self.function(*arguments, **keywords)
+        return self.function(self.method_owner, *arguments, **keywords)
+
+
+def cached_tensor_entry(function, arguments, keywords, *, owner=None):
+    """Persist the existing per-contract prefill/protocol compilation boundary."""
+    from vllm_gaudi.compilation.deepseek_v41_cache_identity import computation_dependencies, runtime_content_identity
+    from torch._dynamo.backends.registry import lookup_backend
+
+    directory = os.environ.get("VLLM_HPU_DSV41_FRONTEND_CACHE_DIR")
+    if not directory:
+        return None
+    identity = os.environ.get("DSV41_SERVING_COMPILE_IDENTITY")
+    profile = os.environ.get("DSV41_RUNTIME_PROFILE")
+    runtime = (runtime_content_identity(json.loads(Path(profile).read_text()))
+               if profile else os.environ.get("DSV41_SERVING_RUNTIME"))
+    if not identity or not runtime:
+        raise RuntimeError("Tensor region reuse requires the validated serving identity")
+    proxy = TensorCallableOwner(function, owner)
+    contract = dict(sources=computation_dependencies(function, proxy),
+                    runtime=runtime,
+                    model=identity,
+                    arguments=_input_signature((arguments, keywords)),
+                    torch_version=torch.__version__)
+    key = hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest()
+    entry = GuardedFrontendEntry(TensorCallableOwner.forward,
+                                 proxy,
+                                 lookup_backend("hpu_backend"),
+                                 Path(directory) / "tensor-regions" / key / f"rank{cache_rank()}",
+                                 identity=key)
+
+    def call(*args, **kwargs):
+        return entry(args, kwargs)
+
+    return call
 
 
 @lru_cache(maxsize=4)

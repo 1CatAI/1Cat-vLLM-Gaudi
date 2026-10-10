@@ -64,8 +64,12 @@ def isolate_desktop(reserved):
                 if original & protected:
                     selected = original & available or available
                     os.sched_setaffinity(tid, selected)
-                    records.append(dict(pid=int(process.name), tid=tid, start_ticks=identity,
-                                        original=sorted(original), selected=sorted(selected)))
+                    records.append(
+                        dict(pid=int(process.name),
+                             tid=tid,
+                             start_ticks=identity,
+                             original=sorted(original),
+                             selected=sorted(selected)))
         except (OSError, ValueError):
             continue
     return records
@@ -175,8 +179,9 @@ def main():
     if compiler_temp:
         environment["TMPDIR"] = compiler_temp
     for key in list(environment):
-        if key.startswith(("VLLM_HPU_DSV", "VLLM_HPU_TP2", "DSV41_", "DUMP_")) or key in (
-                "PYTHONPATH", "LD_PRELOAD", "GRAPH_VISUALIZATION", "GRAPH_VISUALIZATION_DIR", "PT_HPU_GRAPH_DUMP_PREFIX"):
+        if key.startswith(("VLLM_HPU_DSV", "VLLM_HPU_TP2", "DSV41_",
+                           "DUMP_")) or key in ("PYTHONPATH", "LD_PRELOAD", "GRAPH_VISUALIZATION",
+                                                "GRAPH_VISUALIZATION_DIR", "PT_HPU_GRAPH_DUMP_PREFIX"):
             environment.pop(key)
     environment["VLLM_ENGINE_READY_TIMEOUT_S"] = "3600"
     environment["PYTHONUNBUFFERED"] = "1"
@@ -185,18 +190,31 @@ def main():
     environment["GLOO_SOCKET_IFNAME"] = settings.get("environment", {}).get("GLOO_SOCKET_IFNAME", "lo")
     if settings.get("api_key_file"):
         environment["VLLM_API_KEY"] = Path(settings["api_key_file"]).read_text().strip()
-    command = [str(root / "venv/bin/python"), "-m", "vllm_gaudi.entrypoints.deepseek_v41",
-               "--settings", str(settings_path), "--host", args.host, "--port", str(args.port), *extra]
+    command = [
+        str(root / "venv/bin/python"), "-m", "vllm_gaudi.entrypoints.deepseek_v41", "--settings",
+        str(settings_path), "--host", args.host, "--port",
+        str(args.port), *extra
+    ]
     with (log_dir / "service.log").open("w") as stream:
-        child = subprocess.Popen(command, cwd=root, env=environment, stdout=stream, stderr=subprocess.STDOUT,
+        child = subprocess.Popen(command,
+                                 cwd=root,
+                                 env=environment,
+                                 stdout=stream,
+                                 stderr=subprocess.STDOUT,
                                  start_new_session=True)
-        record = dict(pid=child.pid, pgid=child.pid, command=command, installation=str(root),
-                      started_at=time.time(), cpu_allocation=allocation)
+        record = dict(pid=child.pid,
+                      pgid=child.pid,
+                      command=command,
+                      installation=str(root),
+                      started_at=time.time(),
+                      cpu_allocation=allocation)
         atomic_json(log_dir / "process.json", record)
         atomic_json(root / "service.json", dict(**record, log_dir=str(log_dir)))
+
         def stop(signum, frame):
             if child.poll() is None:
                 os.killpg(child.pid, signal.SIGTERM)
+
         signal.signal(signal.SIGTERM, stop)
         signal.signal(signal.SIGINT, stop)
         ready = False
@@ -210,6 +228,11 @@ def main():
                     pass
                 if ready:
                     record["ready_at"] = time.time()
+                    from report_deepseek_v41_startup import summarize
+
+                    summary = summarize(record, (log_dir / "service.log").read_text(errors="replace"))
+                    atomic_json(log_dir / "startup-summary.json", summary, required=False)
+                    print("Startup cache summary: " + json.dumps(summary["cache_by_rank"]), flush=True)
                     print("Ready; maintaining main/helper CPU isolation", flush=True)
             if ready:
                 record["processes"] = maintain_affinity(child.pid, settings)
