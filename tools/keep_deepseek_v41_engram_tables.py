@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
 import threading
 import time
 
@@ -45,6 +46,11 @@ def main():
         (args.output / "preparation.json").write_text(json.dumps(
             dict(elapsed_seconds=record["ready_at"] - started, owners=tables.reports,
                  admission=tables.admission), indent=2) + "\n")
+        if address := os.environ.get("NOTIFY_SOCKET"):
+            address = "\0" + address[1:] if address.startswith("@") else address
+            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notification:
+                notification.connect(address)
+                notification.sendall(b"READY=1")
         print("Immutable CPU table backings ready", flush=True)
         while not stopped.wait(1):
             tables.check()
