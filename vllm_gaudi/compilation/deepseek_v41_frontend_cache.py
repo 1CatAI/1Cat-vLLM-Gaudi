@@ -29,6 +29,14 @@ _LOCATION_ENVIRONMENT = frozenset((
 ))
 
 
+def cache_rank():
+    # vLLM starts workers itself; torchrun's LOCAL_RANK is not its contract.
+    # Use the initialized process group for both TP and PP installations.
+    if torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return int(os.environ.get("LOCAL_RANK", "0"))
+
+
 class _SourcePickler(pickle.Pickler):
 
     def reducer_override(self, value):
@@ -510,7 +518,7 @@ def cached_group_entry(function, group, backend, directory, *, native, shared_co
     if not contract["runtime"] or not contract["serving_identity"]:
         raise RuntimeError("Persistent frontend reuse requires the validated serving runtime and model identity")
     identity = hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest()
-    root = Path(directory) / identity / f"rank{os.environ.get('LOCAL_RANK', '0')}"
+    root = Path(directory) / identity / f"rank{cache_rank()}"
     result = GuardedFrontendEntry(function, group, backend, root, identity=identity)
     logger().info("V4.1 guarded frontend indexed: layers=%s cached_variants=%d", contract["layers"],
                   len(result.pending))

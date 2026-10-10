@@ -135,8 +135,9 @@ def _portable_graph(module):
             raise ValueError(f"Unqualified lowered child: {type(child).__name__}")
     if any(True for _ in result.named_parameters()):
         raise ValueError("Lowered artifacts must receive current model parameters as inputs")
-    if any(True for _ in result.named_buffers()):
-        raise ValueError("Lowered tensor constants need explicit current-process binding")
+    buffers = [(name, tuple(value.shape), str(value.dtype)) for name, value in result.named_buffers()]
+    if buffers:
+        raise ValueError(f"Lowered tensor constants need explicit current-process binding: {buffers}")
     return result
 
 

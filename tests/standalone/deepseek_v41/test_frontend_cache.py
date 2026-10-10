@@ -303,3 +303,40 @@ def test_cpu_relocation_keeps_frontend_but_precision_change_invalidates_it(tmp_p
     monkeypatch.setenv("VLLM_HPU_DSV41_ATTN_DENSE_FP8", "1")
     changed = make(2.)
     assert changed.stats["restores"] == 0
+
+
+def test_serving_workers_use_distributed_rank_without_torchrun_environment(tmp_path, monkeypatch):
+    monkeypatch.delenv("LOCAL_RANK", raising=False)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setenv("DSV41_SERVING_RUNTIME", "runtime-proof")
+    monkeypatch.setenv("DSV41_SERVING_COMPILE_IDENTITY", "1" * 64)
+    for rank in range(4):
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda rank=rank: rank)
+        group = StateGroup(float(rank + 1))
+        group.layers = [SimpleNamespace(layer=20)]
+        entry = cached_group_entry(StateGroup.forward,
+                                   group,
+                                   "eager",
+                                   tmp_path,
+                                   native=True,
+                                   shared_coordinates=False,
+                                   memory_ready=False)
+        for _ in range(4):
+            assert torch.equal(entry(torch.ones((6, 8)))[0], torch.full((6, 8), float((rank + 1) * 8)))
+        assert entry.stats["captures"] == 1
+        assert entry.directory.name == f"rank{rank}"
+        assert len(list(entry.directory.glob("*.json"))) == 1
+    for rank in range(4):
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda rank=rank: rank)
+        group = StateGroup(2.)
+        group.layers = [SimpleNamespace(layer=20)]
+        entry = cached_group_entry(StateGroup.forward,
+                                   group,
+                                   "eager",
+                                   tmp_path,
+                                   native=True,
+                                   shared_coordinates=False,
+                                   memory_ready=False)
+        assert torch.equal(entry(torch.ones((6, 8)))[0], torch.full((6, 8), 16.))
+        assert entry.stats["captures"] == 0
+        assert entry.stats["restores"] == 1
