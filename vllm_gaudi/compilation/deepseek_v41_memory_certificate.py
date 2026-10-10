@@ -42,6 +42,8 @@ class MemoryCertificate:
 
     def restore(self):
         try:
+            if self.path.stat().st_size > 16 << 20:
+                raise ValueError("Memory certificate exceeds its metadata budget")
             envelope = json.loads(self.path.read_text())
             record = envelope["record"]
             if hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest() != envelope["sha256"]:
@@ -62,7 +64,7 @@ class MemoryCertificate:
             if any(type(value) is not int or value < 0 for value in (resident, peak, workspace)) or peak < resident:
                 raise ValueError("Invalid measured memory headroom")
             return max(peak, resident + workspace)
-        except (OSError, ValueError, KeyError, TypeError) as error:
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
             self.rejection = str(error)
             return None
 

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import hashlib
 import json
 
 from vllm_gaudi.compilation.deepseek_v41_memory_certificate import MemoryCertificate
@@ -59,4 +60,14 @@ def test_missing_sdk_recipe_invalidates_memory_measurement(tmp_path):
     cold.publish_after_warmup()
     assert cold.restore() == 55
     recipe.unlink()
+    assert cold.restore() is None
+
+
+def test_malformed_inventory_repeats_profiling(tmp_path):
+    cold, _ = established(tmp_path)
+    cold.publish_after_warmup()
+    envelope = json.loads(cold.path.read_text())
+    envelope["record"]["inventory"] = ["not a mapping"]
+    envelope["sha256"] = hashlib.sha256(json.dumps(envelope["record"], sort_keys=True).encode()).hexdigest()
+    cold.path.write_text(json.dumps(envelope))
     assert cold.restore() is None
