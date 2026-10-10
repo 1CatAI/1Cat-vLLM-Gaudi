@@ -66,6 +66,23 @@ def test_decode_warmup_covers_all_context_buckets_without_scanning_tokens():
                 assert search > position
 
 
+@pytest.mark.parametrize("count", (1, 6))
+def test_native_warmup_covers_interior_visible_prefix_keys(count):
+    from vllm_gaudi.ops.deepseek_v41_config import decode_source_prefix_bound
+
+    maximum = 262144
+    warmups = list(decode_search_warmups(maximum, native_visible_prefixes=True))
+    covered = {(search, decode_source_prefix_bound(start + count, search, 4))
+               for start, search in warmups if search <= 32768}
+    for start in range(32768 - count + 1):
+        search = target_search_length(start, count, maximum)
+        assert (search, decode_source_prefix_bound(start + count, search, 4)) in covered
+    old = list(decode_search_warmups(maximum))
+    assert set(warmups) - set(old) == {(12288, 16384), (20480, 32768), (24576, 32768), (28672, 32768)}
+    assert [(start, search) for start, search in warmups if search > 32768] == [(start, search) for start, search in old
+                                                                                if search > 32768]
+
+
 def test_native_readiness_requires_every_bucket_and_clears_warmup_state(monkeypatch):
     from vllm_gaudi.v1.worker import deepseek_v41_runner as module
 

@@ -256,7 +256,7 @@ def prefill_search_length(start, count, maximum, *, reuse_index_keys=False):
     return search
 
 
-def decode_search_warmups(maximum, *, runtime_indexer=False):
+def decode_search_warmups(maximum, *, runtime_indexer=False, native_visible_prefixes=False):
     """Yield one valid position per decode graph geometry."""
     if runtime_indexer:
         hot = min(maximum, INDEX_MME_HOT_TOKENS)
@@ -281,6 +281,14 @@ def decode_search_warmups(maximum, *, runtime_indexer=False):
     while start < maximum:
         search = target_search_length(start, 1, maximum)
         yield start, search
+        if native_visible_prefixes and search <= 32768:
+            from vllm_gaudi.ops.deepseek_v41_config import decode_source_window_quantum
+
+            # Search length alone does not identify a native recipe: its
+            # visible-prefix bound changes within the finite search bucket.
+            for position in range(start + decode_source_window_quantum(search), search,
+                                  decode_source_window_quantum(search)):
+                yield position, search
         start = search
 
 
@@ -3207,7 +3215,8 @@ class V41ModelRunner:
         for count in ((1, 6) if self.use_dspark else (1, )):
             runtime = count == 1 and getattr(self.model.program, "runtime_indexer", False)
             paged_dspark = self.use_dspark and isinstance(self.state, PagedStageState)
-            geometries = (tuple(decode_search_warmups(self.model.program.length, runtime_indexer=runtime))
+            geometries = (tuple(decode_search_warmups(self.model.program.length, runtime_indexer=runtime,
+                                                     native_visible_prefixes=self.model.native))
                           if runtime or paged_dspark else ((0, 512), ))
             additional = getattr(getattr(self, "vllm_config", None), "additional_config", {}) or {}
             geometries = select_native_warmup_geometries(geometries, additional)
@@ -3228,7 +3237,8 @@ class V41ModelRunner:
             # Otherwise a healthy stream pauses for compilation at each new
             # bucket, and already-warmed buckets remain untested at startup.
             for start, search in decode_search_warmups(
-                self.model.program.length, runtime_indexer=getattr(self.model.program, "runtime_indexer", False)
+                self.model.program.length, runtime_indexer=getattr(self.model.program, "runtime_indexer", False),
+                native_visible_prefixes=True
             ):
                 if start == 0:
                     continue
