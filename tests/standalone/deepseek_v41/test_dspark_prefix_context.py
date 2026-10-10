@@ -120,10 +120,12 @@ def test_speculative_prefix_admission_matches_owned_draft_capacity(monkeypatch, 
         model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v41"), max_model_len=262144),
         parallel_config=SimpleNamespace(data_parallel_size=1, tensor_parallel_size=4, pipeline_parallel_size=1),
         cache_config=SimpleNamespace(enable_prefix_caching=True, user_specified_block_size=False, block_size=128),
-        scheduler_config=SimpleNamespace(max_num_seqs=capacity, async_scheduling=False),
+        scheduler_config=SimpleNamespace(max_num_seqs=capacity, async_scheduling=False,
+                                         max_num_batched_tokens=16384, max_num_scheduled_tokens=None),
         load_config=SimpleNamespace(load_format="dsv41_prepared"),
         speculative_config=SimpleNamespace(method="dspark",
                                            num_speculative_tokens=5,
+                                           max_num_new_slots_for_drafting=4,
                                            enable_adaptive_verification=False),
         use_v2_model_runner=False,
         lora_config=None,
@@ -131,6 +133,9 @@ def test_speculative_prefix_admission_matches_owned_draft_capacity(monkeypatch, 
     )
     if capacity == 1:
         contract.configure(config)
+        contract.configure(config)
+        assert config.scheduler_config.max_num_batched_tokens == 16388
+        assert config.scheduler_config.max_num_scheduled_tokens == 16384
     else:
         with pytest.raises(ValueError, match="one active request"):
             contract.configure(config)
