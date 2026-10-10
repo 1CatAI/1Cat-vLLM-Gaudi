@@ -14,6 +14,36 @@ _leases = []
 _borrowed_tables = []
 
 
+def reuse_recipe_bundle(cache, identity, profile, compatibility):
+    """Retain SDK recipes across the path-certificate schema transition.
+
+    Frontend guards and lowered modules keep their independent computation
+    identities. Only SDK recipes use the certified equivalent namespace;
+    their ordinary graph/recipe validation remains in the SDK.
+    """
+    from vllm_gaudi.compilation.deepseek_v41_cache_identity import runtime_content_identity
+
+    previous = Path(compatibility["directory"]).resolve()
+    if previous.parent != cache.parent.resolve():
+        raise ValueError("Recipe compatibility must belong to the same cache root")
+    record = json.loads((previous / "identity.json").read_text())
+    prior_profile = json.loads(Path(compatibility["runtime_profile"]).read_text())
+    if (record.get("schema") != identity["schema"] or record.get("model") != identity["model"]
+            or record.get("arguments") != identity["arguments"] or record.get("runtime")
+            not in (runtime_content_identity(prior_profile, legacy=True), runtime_content_identity(prior_profile))
+            or runtime_content_identity(prior_profile) != runtime_content_identity(profile)):
+        raise ValueError("Previous recipe bundle differs in model, runtime or serving contract")
+    retained = 0
+    for rank in previous.glob("rank[0-9]*"):
+        if not rank.is_dir() or not rank.name[4:].isdecimal():
+            continue
+        destination = cache / rank.name
+        if not destination.exists():
+            destination.symlink_to(rank.resolve(), target_is_directory=True)
+            retained += 1
+    return retained
+
+
 def prepare_serving_resources(settings, model, arguments):
     lock_dir = settings.get("device_lock_dir")
     wait = settings.get("wait_for_resources", False)
@@ -95,8 +125,10 @@ def prepare_serving_resources(settings, model, arguments):
             engine_patch = json.dumps(engine_sources, sort_keys=True).encode()
             engine_head = "materialized"
         runtime_identity = os.environ.get("DSV41_SERVING_RUNTIME")
+        runtime_profile = None
         if profile := os.environ.get("DSV41_RUNTIME_PROFILE"):
-            runtime_identity = runtime_content_identity(json.loads(Path(profile).read_text()))
+            runtime_profile = json.loads(Path(profile).read_text())
+            runtime_identity = runtime_content_identity(runtime_profile)
         identity = stable_serving_contract(model, runtime_identity, arguments)
         # Archive the complete source inventory separately from the reusable
         # runtime namespace. Individual guarded entries bind their actual
@@ -105,6 +137,16 @@ def prepare_serving_resources(settings, model, arguments):
         os.environ["DSV41_SERVING_COMPILE_IDENTITY"] = digest
         cache = Path(cache_dir) / digest
         cache.mkdir(parents=True, exist_ok=True)
+        if compatibility := settings.get("recipe_cache_compatibility"):
+            try:
+                if runtime_profile is None:
+                    raise ValueError("Recipe migration requires a validated runtime profile")
+                retained = reuse_recipe_bundle(cache, identity, runtime_profile, compatibility)
+                print(f"Equivalent SDK recipe bundle retained: {retained} rank directories", flush=True)
+            except (OSError, KeyError, ValueError) as error:
+                print(f"Recipe compatibility rejected; rebuilding affected recipes: {error}", flush=True)
+        if runtime_profile is not None:
+            (cache / "runtime-profile.json").write_text(json.dumps(runtime_profile, indent=2) + "\n")
         os.environ["PT_HPU_RECIPE_CACHE_CONFIG"] = f"{cache / 'rank{rank}'},false,8192,false"
         # Native entries restore guarded frontend graphs before rebinding this
         # process's tensors, recipes and communication resources. An empty

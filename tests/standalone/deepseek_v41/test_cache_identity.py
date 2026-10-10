@@ -74,3 +74,36 @@ def test_runtime_relocation_preserves_binary_certificate(tmp_path):
     assert runtime_content_identity(profiles[0]) == runtime_content_identity(profiles[1])
     (tmp_path / "second/runtime.so").write_bytes(b"changed runtime")
     assert runtime_content_identity(profiles[0]) != runtime_content_identity(profiles[1])
+
+
+def test_nested_parent_and_link_paths_are_bound_by_binary_content(tmp_path):
+    profiles = []
+    for name in ("first", "relocated"):
+        directory = tmp_path / name
+        directory.mkdir()
+        binary = directory / "kernels.so"
+        binary.write_bytes(b"identical compiled operators")
+        sha = hashlib.sha256(binary.read_bytes()).hexdigest()
+        metadata = directory / "build.json"
+        metadata.write_text(
+            json.dumps(
+                dict(binaries={"kernels.so": sha},
+                     link_command=["c++", "-shared",
+                                   str(directory / "kernel.o"), "-Wl,-rpath," + str(directory)],
+                     addon=dict(parent_gc_path=str(binary), parent_gc_sha256=sha),
+                     softmax=dict(parent=str(binary), parent_sha256=sha))))
+        profiles.append(
+            dict(environment={},
+                 additional_libraries=[dict(path=str(binary))],
+                 configuration_files=[dict(path=str(metadata))]))
+    assert runtime_content_identity(profiles[0]) == runtime_content_identity(profiles[1])
+    record = json.loads(metadata.read_text())
+    record["addon"]["parent_gc_sha256"] = "different content"
+    metadata.write_text(json.dumps(record))
+    assert runtime_content_identity(profiles[0]) != runtime_content_identity(profiles[1])
+
+
+def test_uncertified_configuration_paths_remain_semantic(tmp_path):
+    from vllm_gaudi.compilation.deepseek_v41_cache_identity import relocated_content
+
+    assert relocated_content(dict(file="/first/data")) != relocated_content(dict(file="/second/data"))

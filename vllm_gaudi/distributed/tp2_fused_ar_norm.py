@@ -93,7 +93,8 @@ def _verify_prepared_runtime(binary: Path) -> None:
     }
     for runtime in metadata["eager_runtime"]:
         path = Path(runtime["path"]).resolve()
-        if path not in loaded or digest(path) != runtime["sha256"]:
+        candidates = ([path] if path in loaded else [item for item in loaded if item.name == path.name])
+        if len(candidates) != 1 or digest(candidates[0]) != runtime["sha256"]:
             raise RuntimeError("Prepared TP2 GraphExec runtime changed; rebuild and requalify")
 
 

@@ -5,6 +5,7 @@ import hashlib
 import inspect
 import json
 from pathlib import Path
+import re
 import textwrap
 from functools import lru_cache
 from types import FunctionType, MethodType, ModuleType
@@ -65,12 +66,33 @@ def computation_dependencies(function, owner):
 def relocated_content(value):
     """Keep content fingerprints while removing machine-specific path spelling."""
     if isinstance(value, dict):
+        result = {}
+        for key, item in value.items():
+            certificate = ("sha256" if key == "path" else key.removesuffix("_path") + "_sha256")
+            if isinstance(item, str) and item.startswith("/") and certificate in value:
+                # Parent libraries occur as parent/parent_sha256 and
+                # parent_gc_path/parent_gc_sha256, not only path/sha256.
+                continue
+            if key == "link_command" and "binaries" in value and isinstance(item, list):
+                # Build operands are provenance. Executable identity remains
+                # bound to every binary digest and the original link flags.
+                item = [re.sub(r"/[^,\s]+", "<build-path>", argument) for argument in item]
+            result[Path(key).name if str(key).startswith("/") else str(key)] = relocated_content(item)
+        return result
+    if isinstance(value, list):
+        return [relocated_content(item) for item in value]
+    return value
+
+
+def _legacy_relocated_content(value):
+    """Read the previous namespace certificate solely for validated migration."""
+    if isinstance(value, dict):
         return {
-            (Path(key).name if str(key).startswith("/") else str(key)): relocated_content(item)
+            (Path(key).name if str(key).startswith("/") else str(key)): _legacy_relocated_content(item)
             for key, item in value.items() if key != "path" or "sha256" not in value
         }
     if isinstance(value, list):
-        return [relocated_content(item) for item in value]
+        return [_legacy_relocated_content(item) for item in value]
     return value
 
 
@@ -82,25 +104,27 @@ def stable_serving_contract(model, runtime_identity, arguments):
 
 
 @lru_cache(maxsize=128)
-def _file_content(path, device, inode, size, modified):
+def _file_content(path, device, inode, size, modified, legacy):
     path = Path(path)
     if path.suffix == ".json":
-        data = json.dumps(relocated_content(json.loads(path.read_text())), sort_keys=True).encode()
+        normalize = _legacy_relocated_content if legacy else relocated_content
+        data = json.dumps(normalize(json.loads(path.read_text())), sort_keys=True).encode()
         return hashlib.sha256(data).hexdigest()
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def file_content(path):
+def file_content(path, *, legacy=False):
     stat = Path(path).stat()
-    return _file_content(str(path), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    return _file_content(str(path), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, legacy)
 
 
-def runtime_content_identity(profile):
-    environment = semantic_environment(profile["environment"])
+def runtime_content_identity(profile, *, legacy=False):
+    environment = semantic_environment(profile["environment"], legacy=legacy)
     records = {}
     for kind in ("additional_libraries", "configuration_files"):
-        records[kind] = [(Path(item["path"]).name, file_content(item["path"])) for item in profile.get(kind, ())]
+        records[kind] = [(Path(item["path"]).name, file_content(item["path"], legacy=legacy))
+                         for item in profile.get(kind, ())]
     return hashlib.sha256(json.dumps(dict(environment=environment, records=records),
                                      sort_keys=True).encode()).hexdigest()
 
@@ -139,9 +163,11 @@ def lowered_keys(graph_bytes):
     return key.hexdigest(), (previous.hexdigest(), )
 
 
-def semantic_environment(environment):
+def semantic_environment(environment, *, legacy=False):
     ignored = ("TMPDIR", "HABANA_LOGS", "VLLM_HPU_DSV4_WORKER_CPUS", "VLLM_HPU_DSV4_WORKER_HELPER_CPUS",
                "VLLM_HPU_DSV41_FRONTEND_CACHE_DIR", "PT_HPU_RECIPE_CACHE_CONFIG")
+    if not legacy:
+        ignored += ("VLLM_HPU_DSV41_BACKEND_CACHE",)
     result = {}
     for key, value in environment.items():
         if key in ignored or not key.startswith(("VLLM_HPU_", "PT_HPU_", "HCCL_", "HCL_")):
@@ -150,7 +176,7 @@ def semantic_environment(environment):
             path = Path(value)
             manifest = path / "manifest.json" if path.is_dir() else path
             if manifest.is_file():
-                result[key] = file_content(manifest)
+                result[key] = file_content(manifest, legacy=legacy)
             else:
                 # Runtime binary directories are separately content-certified
                 # by the serving runtime profile and native build manifest.
