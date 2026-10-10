@@ -308,11 +308,15 @@ class ReboundFrontend(SerializableCallable):
         if self.backend is None:
             raise RuntimeError("Frontend backend must be rebound before execution")
         if self.compiled is None:
-            data, sources = _source_loads(self.graph_bytes)
-            graph = GraphModuleSerializableCallable.deserialize_compile_artifacts(data).graph_module
-            for node in graph.graph.nodes:
-                if node.name in sources:
-                    node._dynamo_source = sources[node.name]
+
+            def restore_graph():
+                data, sources = _source_loads(self.graph_bytes)
+                graph = GraphModuleSerializableCallable.deserialize_compile_artifacts(data).graph_module
+                for node in graph.graph.nodes:
+                    if node.name in sources:
+                        node._dynamo_source = sources[node.name]
+                return graph
+
             started = time.perf_counter()
             if self.backend_directory is not None and os.environ.get("VLLM_HPU_DSV41_BACKEND_CACHE", "1") == "1":
                 from vllm_gaudi.compilation.deepseek_v41_backend_cache import restore_or_compile
@@ -320,13 +324,14 @@ class ReboundFrontend(SerializableCallable):
 
                 key, compatible = lowered_keys(self.graph_bytes)
                 self.compiled = restore_or_compile(self.backend,
-                                                   graph,
+                                                   None,
                                                    list(args),
                                                    self.backend_directory,
                                                    key,
-                                                   compatible=compatible)
+                                                   compatible=compatible,
+                                                   graph_factory=restore_graph)
             else:
-                self.compiled = self.backend(graph, list(args))
+                self.compiled = self.backend(restore_graph(), list(args))
             self.backend_seconds += time.perf_counter() - started
         return self.compiled(*args)
 

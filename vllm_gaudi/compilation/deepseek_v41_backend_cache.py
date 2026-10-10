@@ -285,7 +285,7 @@ def serialize_callable(function, *, literals=()):
     return buffer.getvalue()
 
 
-def restore_or_compile(backend, graph, arguments, directory, identity, *, compatible=()):
+def restore_or_compile(backend, graph, arguments, directory, identity, *, compatible=(), graph_factory=None):
     """Cache only validated metadata; native capture still binds current state."""
     from vllm_gaudi.extension.logger import logger
 
@@ -307,6 +307,8 @@ def restore_or_compile(backend, graph, arguments, directory, identity, *, compat
         except (ValueError, KeyError, EOFError, ImportError, TypeError, AttributeError, OSError,
                 pickle.UnpicklingError) as error:
             logger().warning("V4.1 lowered backend rejected: %s", error)
+    if graph_factory is not None:
+        graph = graph_factory()
     function = backend(graph, arguments)
     try:
         data = serialize_callable(function, literals=frontend_literals(graph))

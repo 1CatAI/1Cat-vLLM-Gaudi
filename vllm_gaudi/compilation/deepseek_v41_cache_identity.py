@@ -49,6 +49,16 @@ def python_source_digest(path):
     return _python_source_digest(str(path), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
 
 
+@lru_cache(maxsize=512)
+def _dependency_syntax(value):
+    nodes = tuple(ast.walk(_source_tree(value)))
+    names = frozenset(node.id for node in nodes if isinstance(node, ast.Name))
+    imports = tuple(
+        dict.fromkeys(node.module for node in nodes
+                      if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("vllm_gaudi.")))
+    return names, imports
+
+
 def computation_dependencies(function, owner):
     """Include actual module types, bound callbacks and their Python helpers."""
     pending = [function]
@@ -69,7 +79,7 @@ def computation_dependencies(function, owner):
         defining = inspect.getmodule(value)
         if defining is None:
             continue
-        names = {node.id for node in ast.walk(_source_tree(value)) if isinstance(node, ast.Name)}
+        names, imports = _dependency_syntax(value)
         for used in names:
             dependency = vars(defining).get(used)
             if isinstance(dependency, (FunctionType, type)) and dependency.__module__.startswith("vllm_gaudi."):
@@ -82,12 +92,10 @@ def computation_dependencies(function, owner):
         # Deferred imports must be covered even when the chosen numerical
         # branch has not imported their module in this process yet.
         package = Path(__file__).resolve().parents[1]
-        tree = _source_tree(value)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("vllm_gaudi."):
-                path = package / (node.module.removeprefix("vllm_gaudi.").replace(".", "/") + ".py")
-                if path.is_file():
-                    result[f"module:{node.module}"] = python_source_digest(path)
+        for module in imports:
+            path = package / (module.removeprefix("vllm_gaudi.").replace(".", "/") + ".py")
+            if path.is_file():
+                result[f"module:{module}"] = python_source_digest(path)
     return result
 
 

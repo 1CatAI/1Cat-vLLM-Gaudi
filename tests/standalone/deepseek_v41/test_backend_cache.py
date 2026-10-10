@@ -65,6 +65,31 @@ def test_changed_identity_does_not_select_other_recipes(tmp_path):
     assert changed(5) == 15
 
 
+def test_hot_lowered_restore_does_not_reconstruct_unused_frontend(tmp_path):
+    calls = []
+
+    def graph_factory():
+        calls.append("graph")
+        return torch.fx.symbolic_trace(lambda x: x * 2)
+
+    def backend(graph, inputs):
+        return graph.forward
+
+    restore_or_compile(backend, None, [], tmp_path, "1" * 64, graph_factory=graph_factory)
+    assert calls == ["graph"]
+
+    def must_not_restore():
+        raise AssertionError("A complete lowered hit must not deserialize the unused frontend")
+
+    result = restore_or_compile(backend, None, [], tmp_path, "1" * 64, graph_factory=must_not_restore)
+    for value in (1., 2., 3.):
+        assert torch.equal(result(torch.full((6, 8), value)), torch.full((6, 8), value * 2))
+    (tmp_path / ("1" * 64 + ".bin")).write_bytes(b"corrupt")
+    repaired = restore_or_compile(backend, None, [], tmp_path, "1" * 64, graph_factory=graph_factory)
+    assert repaired(3) == 6
+    assert calls == ["graph", "graph"]
+
+
 def test_only_certified_literal_buffers_are_restored_in_fresh_allocations():
     root = torch.nn.Module()
     literal = torch.tensor([1., 0., 0., 0.])

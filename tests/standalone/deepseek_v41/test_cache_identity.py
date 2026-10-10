@@ -20,6 +20,20 @@ def changed(owner, value):
     return value * 3
 
 
+IDENTITY_TEST_SCALE = 2
+
+
+def mutable_global(owner, value):
+    return value * IDENTITY_TEST_SCALE
+
+
+def test_syntax_reuse_still_resolves_current_global_values(monkeypatch):
+    first = computation_dependencies(mutable_global, SimpleNamespace())
+    assert computation_dependencies(mutable_global, SimpleNamespace()) == first
+    monkeypatch.setitem(mutable_global.__globals__, "IDENTITY_TEST_SCALE", 3)
+    assert computation_dependencies(mutable_global, SimpleNamespace()) != first
+
+
 def test_computation_identity_includes_selected_callable():
     first = computation_dependencies(forward, SimpleNamespace())
     second = computation_dependencies(changed, SimpleNamespace())

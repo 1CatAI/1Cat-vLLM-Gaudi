@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Measure one cached four-layer preparation without another reference arm."""
+import cProfile
 import functools
 from pathlib import Path
 import time
@@ -10,9 +11,11 @@ import habana_frameworks.torch.dynamo.compile_backend._recipe_compiler_C as sdk
 from vllm_gaudi.ops import tp2_prepared_plan as prepared
 from vllm_gaudi.ops.deepseek_v41_replay import StageVariant, _Snapshot
 from vllm_gaudi.compilation import deepseek_v41_frontend_cache as front
+from vllm_gaudi.compilation import deepseek_v41_backend_cache as lowered
 
 _stats = {}
 _skipped = []
+_profile = cProfile.Profile()
 
 
 def wrap(owner, name, label):
@@ -63,24 +66,40 @@ def runtime():
 
 
 prepared._runtime = runtime
+for name in ('_restore_graph', '_restore_fake', 'restore_or_compile'):
+    wrap(lowered, name, 'Lowered.' + name)
+wrap(front.GuardedFrontendEntry, '_index', 'Frontend.index')
+wrap(front, '_owner_scalars_match', 'Frontend.scalar_guards')
+
 script = Path(__file__).with_name('check_deepseek_v41_request_c6_batch.py')
 source = script.read_text()
 old = 'arm_order = (1, 0) if args.candidate == "startup_frontend" and args.frontend_first else (0, 1)'
 assert old in source
 source = source.replace(old, 'arm_order = (1,)')
+source = source.replace('                prepare_started = time.perf_counter()',
+                        '                _profile.enable()\n                prepare_started = time.perf_counter()')
 marker = '                if plan not in _native_entries:\n'
 assert marker in source
 source = source.replace(
     marker, '''                if args.candidate == "startup_frontend":
                     if plan not in _native_entries:
                         raise RuntimeError("Startup probe did not retain the native replay")
+                    _profile.disable()
+                    import pstats
+                    statistics = pstats.Stats(_profile).stats
+                    report["host_profile"] = [
+                        dict(file=key[0], line=key[1], function=key[2], calls=value[1],
+                             self_seconds=value[2], cumulative_seconds=value[3])
+                        for key, value in sorted(statistics.items(), key=lambda item: item[1][3], reverse=True)[:50]
+                    ]
                     repeated = []
                     for _ in range(3):
                         t0 = time.perf_counter()
                         additional = StageVariant(program, *values, plan_engram,
                                                   native_input=False, fused_text_io=False)
                         repeated.append(time.perf_counter() - t0)
-                        if [entry.identity for entry in additional.compiled.chunks] != [entry.identity for entry in plan.compiled.chunks]:
+                        if ([entry.identity for entry in additional.compiled.chunks]
+                                != [entry.identity for entry in plan.compiled.chunks]):
                             raise RuntimeError("Metadata memoization changed the compute identity")
                     report["repeated_constructor_seconds"] = repeated
                     report.update(status="startup_execution_diagnosed", host_execution_timings=_stats,
@@ -88,5 +107,5 @@ source = source.replace(
                                   diagnostic_only=True, performance_gain_qualified=False)
                     return
 ''' + marker, 1)
-namespace = dict(__name__='__main__', __file__=str(script), _stats=_stats, _skipped=_skipped)
+namespace = dict(__name__='__main__', __file__=str(script), _stats=_stats, _skipped=_skipped, _profile=_profile)
 exec(compile(source, str(script), 'exec'), namespace)
