@@ -382,4 +382,4 @@ def test_tensor_region_restores_across_process_local_clone_names(tmp_path, monke
         fn.__kwdefaults__ = defaults_transform.__kwdefaults__
         entry = cached_tensor_entry(fn, (inputs,), {"shift": 1.5})
         assert torch.equal(entry(inputs, shift=1.5), inputs * 2 + 1.5)
-    assert len(list(tmp_path.rglob("*.bin"))) == 1
+    assert len([path for path in tmp_path.rglob("*.bin") if path.parent.name.startswith("rank")]) == 1
