@@ -94,14 +94,17 @@ manifest and ABI before copying any converted expert batch. The helper only
 reorders compressed integer bytes; scale selection and all HPU consumers stay
 on the shared path. Unset by default pending device and startup qualification.
 
-`VLLM_HPU_DSV41_FRONTEND_CACHE_DIR` selects experimental persistent Dynamo
-frontend metadata for the shared native stage. It requires normal serving
-resource validation and a persistent recipe cache. A compatible restored entry
-rebinds current weights/state, checks its input guards, and rebuilds backend
-recipes and native communication bindings through the existing code. No device
+`VLLM_HPU_DSV41_FRONTEND_CACHE_DIR` selects persistent Dynamo frontend metadata
+for the shared native stage. Normal serving resource preparation selects a
+directory beside its persistent recipes; an explicit empty value disables it.
+Only the matching input bucket is deserialized. Restored entries rebind current
+weights/state and retain Torch's tensor, alias and shape guards, together with
+scalar weight-layout qualifications and callable defaults. Backend recipes and
+native communication bindings are rebuilt through the existing code; no device
 addresses or communication plans are restored. Complete warmup shapes remain
-enabled. Source, runtime, model or feature changes select another namespace.
-Unset by default; full-stage startup and decode qualification remain pending.
+enabled. Source, runtime, model or arithmetic-feature changes select another
+namespace; CPU placement and cache locations alone do not invalidate frontend
+artifacts. Full-service startup and decode qualification remain pending.
 
 `VLLM_HPU_DSV41_MHC_BATCH_REUSE=1` tests four-request control-weight reuse in the ordinary decode batch path. It keeps FP32 operands and each request's original K accumulation and reduction order. It is disabled by default pending complete-chain and serving qualification.
 

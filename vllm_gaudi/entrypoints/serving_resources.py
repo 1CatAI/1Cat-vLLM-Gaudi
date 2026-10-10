@@ -92,4 +92,8 @@ def prepare_serving_resources(settings, model, arguments):
         cache = Path(cache_dir) / digest
         cache.mkdir(parents=True, exist_ok=True)
         os.environ["PT_HPU_RECIPE_CACHE_CONFIG"] = f"{cache / 'rank{rank}'},false,8192,false"
+        # Native entries restore guarded frontend graphs before rebinding this
+        # process's tensors, recipes and communication resources. An empty
+        # explicit value remains a diagnostic way to disable frontend reuse.
+        os.environ.setdefault("VLLM_HPU_DSV41_FRONTEND_CACHE_DIR", str(cache / "frontend"))
         (cache / "identity.json").write_text(json.dumps(identity, indent=2) + "\n")

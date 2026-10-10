@@ -33,6 +33,143 @@ def backend(graph, inputs):
     return graph.forward
 
 
+def defaults_transform(value, multiplier=2., *, shift=.5):
+    return value * multiplier + shift
+
+
+class DefaultedStateGroup(StateGroup):
+
+    def forward(self, inputs):
+        value = defaults_transform(inputs @ self.weight)
+        self.state.copy_(value)
+        return value, self.state
+
+
+def nested_transform():
+
+    def transform(value, *, multiplier=2., shift=.5):
+        return value * multiplier + shift
+
+    return transform
+
+
+class NestedDefaultGroup(StateGroup):
+
+    def __init__(self, value):
+        super().__init__(value)
+        self.transform = nested_transform()
+
+    def forward(self, inputs):
+        value = self.transform(inputs @ self.weight)
+        self.state.copy_(value)
+        return value, self.state
+
+
+class QualifiedTensorGroup(StateGroup):
+
+    def __init__(self, value, active=8):
+        super().__init__(value)
+        self.weight.dsv41_active_k = active
+        self.weight.dsv41_sat_eligible = True
+
+    def forward(self, inputs):
+        assert self.weight.dsv41_sat_eligible
+        value = inputs @ self.weight[:, :self.weight.dsv41_active_k]
+        self.state.copy_(value)
+        return value, self.state
+
+
+def test_restored_tensor_qualification_keeps_current_weights_and_guards(tmp_path):
+    inputs = torch.ones((6, 8))
+    old = QualifiedTensorGroup(1.)
+    GuardedFrontendEntry(QualifiedTensorGroup.forward, old, backend, tmp_path, identity="1" * 64,
+                         max_variants=1)(inputs)
+    fresh = QualifiedTensorGroup(2.)
+    entry = GuardedFrontendEntry(QualifiedTensorGroup.forward,
+                                 fresh,
+                                 backend,
+                                 tmp_path,
+                                 identity="1" * 64,
+                                 max_variants=1)
+    assert torch.equal(entry(inputs)[0], torch.full((6, 8), 16.))
+    assert entry.stats["captures"] == 0
+    assert entry.stats["restores"] == 1
+    fresh.weight.dsv41_active_k = 7
+    before = fresh.state.clone()
+    with pytest.raises(RuntimeError, match="capacity"):
+        entry(inputs)
+    assert torch.equal(fresh.state, before)
+
+
+class BucketGroup(torch.nn.Module):
+
+    def __init__(self, value):
+        super().__init__()
+        self.register_buffer("weight", torch.full((8, 8), value))
+
+    def forward(self, inputs):
+        return inputs @ self.weight
+
+
+def test_only_matching_input_bucket_is_restored(tmp_path):
+    previous = BucketGroup(1.)
+    entry = GuardedFrontendEntry(BucketGroup.forward, previous, backend, tmp_path, identity="1" * 64)
+    for rows in (1, 2, 6):
+        entry(torch.ones((rows, 8)))
+    fresh = BucketGroup(2.)
+    restored = GuardedFrontendEntry(BucketGroup.forward, fresh, backend, tmp_path, identity="1" * 64)
+    assert restored.stats["restores"] == 0
+    assert torch.equal(restored(torch.ones((6, 8))), torch.full((6, 8), 16.))
+    assert restored.stats["restores"] == 1
+    assert restored.stats["captures"] == 0
+    assert len(restored.pending) == 2
+
+
+def test_restored_nested_keyword_defaults_keep_live_callable_unchanged(tmp_path):
+    inputs = torch.ones((6, 8))
+    previous, fresh = NestedDefaultGroup(1.), NestedDefaultGroup(2.)
+    original = GuardedFrontendEntry(NestedDefaultGroup.forward, previous, backend, tmp_path, identity="1" * 64)
+    original(inputs)
+    restored = GuardedFrontendEntry(NestedDefaultGroup.forward, fresh, backend, tmp_path, identity="1" * 64)
+    for value in (1., 2., 3.):
+        inputs.fill_(value)
+        assert torch.equal(restored(inputs)[0], (inputs @ fresh.weight) * 2. + .5)
+    assert fresh.transform.__kwdefaults__ == {"multiplier": 2., "shift": .5}
+    assert restored.stats["restores"] == 1
+    assert restored.stats["captures"] == 0
+
+
+def test_restored_default_arguments_retain_current_weight_binding(tmp_path):
+    inputs = torch.ones((6, 8))
+
+    def make(value):
+        return GuardedFrontendEntry(DefaultedStateGroup.forward,
+                                    DefaultedStateGroup(value),
+                                    backend,
+                                    tmp_path,
+                                    identity="1" * 64,
+                                    max_variants=1)
+
+    make(1.)(inputs)
+    restored = make(2.)
+    assert torch.equal(restored(inputs)[0], torch.full((6, 8), 32.5))
+    assert restored.stats["restores"] == 1
+    assert restored.stats["captures"] == 0
+
+
+def test_cached_default_sources_restore_positional_and_keyword_names():
+    import pickle
+    from torch._dynamo.source import DefaultsSource, GlobalSource
+    from vllm_gaudi.compilation.deepseek_v41_frontend_cache import _source_dumps, _source_loads
+
+    sources = (DefaultsSource(GlobalSource("defaults_transform"),
+                              0), DefaultsSource(GlobalSource("defaults_transform"), "shift", True))
+    for data in (pickle.dumps(sources), _source_dumps(sources)):
+        restored = _source_loads(data)
+        assert restored == sources
+        assert [source.name for source in restored] == [source.name for source in sources]
+
+
 def cached(owner, directory, **options):
     return GuardedFrontendEntry(StateGroup.forward, owner, backend, directory, identity="1" * 64, **options)
 
@@ -75,8 +212,9 @@ def test_changed_artifact_or_dependencies_fail_closed(tmp_path):
     record = json.loads(path.read_text())
     record["sha256"] = "0" * 64
     path.write_text(json.dumps(record))
+    restored = cached(StateGroup(1.), tmp_path)
     with pytest.raises(ValueError, match="digest"):
-        cached(StateGroup(1.), tmp_path)
+        restored(torch.ones((6, 8)))
 
 
 def test_shared_group_factory_rebinds_a_named_backend(tmp_path, monkeypatch):
@@ -104,3 +242,33 @@ def test_shared_group_factory_rebinds_a_named_backend(tmp_path, monkeypatch):
                                   memory_ready=False)
     assert torch.equal(restored(inputs)[0], inputs @ fresh.weight)
     assert restored.stats["captures"] == 0
+
+
+def test_cpu_relocation_keeps_frontend_but_precision_change_invalidates_it(tmp_path, monkeypatch):
+    monkeypatch.setenv("DSV41_SERVING_RUNTIME", "runtime-proof")
+    monkeypatch.setenv("DSV41_SERVING_COMPILE_IDENTITY", "1" * 64)
+    monkeypatch.setenv("VLLM_HPU_DSV4_WORKER_CPUS", "10,15,38,43")
+    monkeypatch.setenv("VLLM_HPU_DSV4_WORKER_HELPER_CPUS", "11,12;16,17;39,40;44,45")
+
+    def make(value):
+        group = StateGroup(value)
+        group.layers = [SimpleNamespace(layer=20)]
+        return cached_group_entry(StateGroup.forward,
+                                  group,
+                                  "eager",
+                                  tmp_path,
+                                  native=True,
+                                  shared_coordinates=False,
+                                  memory_ready=False)
+
+    inputs = torch.ones((6, 8))
+    make(1.)(inputs)
+    monkeypatch.setenv("VLLM_HPU_DSV4_WORKER_CPUS", "10,1,38,43")
+    monkeypatch.setenv("VLLM_HPU_DSV4_WORKER_HELPER_CPUS", "11,12;2,3;39,40;28,29")
+    restored = make(2.)
+    assert torch.equal(restored(inputs)[0], torch.full((6, 8), 16.))
+    assert restored.stats["restores"] == 1
+    assert restored.stats["captures"] == 0
+    monkeypatch.setenv("VLLM_HPU_DSV41_ATTN_DENSE_FP8", "1")
+    changed = make(2.)
+    assert changed.stats["restores"] == 0

@@ -114,7 +114,7 @@ def main():
             "k64_partition",
             "unpaired_w13",
             "merge_cache",
-            "mhc_weight_reuse", "mhc_control_tiles",
+            "mhc_weight_reuse", "mhc_control_tiles", "startup_frontend",
         ),
         required=True,
     )
@@ -124,6 +124,10 @@ def main():
     parser.add_argument("--group", type=int, default=5, choices=range(0, 9))
     parser.add_argument("--real-layer-count", type=int, choices=(4, 16), default=4)
     parser.add_argument("--samples", type=int, default=6)
+    parser.add_argument("--frontend-cache-dir", type=Path)
+    parser.add_argument("--frontend-restore-only", action="store_true")
+    parser.add_argument("--frontend-identity", help="Validated common runtime/model identity for fresh-process reuse")
+    parser.add_argument("--frontend-rows", type=int, choices=(1, 6), default=6)
     parser.add_argument(
         "--attention-oracle",
         action="store_true",
@@ -146,6 +150,14 @@ def main():
     parser.add_argument("--precision-proof", type=Path)
     parser.add_argument("--independent-prologue", action="store_true")
     args = parser.parse_args()
+    if args.candidate == "startup_frontend":
+        if args.frontend_cache_dir is None or not args.frontend_identity or len(args.frontend_identity) != 64:
+            parser.error("Startup frontend qualification requires a cache directory and complete runtime identity")
+        os.environ["DSV41_SERVING_RUNTIME"] = args.frontend_identity
+        os.environ["DSV41_SERVING_COMPILE_IDENTITY"] = hashlib.sha256(
+            (args.prepared / "manifest.json").read_bytes() + args.frontend_identity.encode()).hexdigest()
+    elif args.frontend_cache_dir or args.frontend_restore_only or args.frontend_rows != 6:
+        parser.error("Frontend controls belong only to the startup_frontend candidate")
     if args.independent_prologue and args.candidate != "fp8_prologue":
         parser.error("Independent Q/KV readiness belongs to the FP8 prologue capability")
     if args.quality_only and not args.fixed_prefix_acceptance:
@@ -361,6 +373,14 @@ def main():
             if not 3 <= len(files) <= 5 or args.samples < 3:
                 raise ValueError("Need 3-5 actual request fixtures and at least three device samples")
             raw = [torch.load(path, map_location="cpu", weights_only=True) for path in files]
+            if args.candidate == "startup_frontend" and args.frontend_rows == 1:
+                for data in raw:
+                    data["positions"] = data["positions"][:1]
+                    data["ids"] = data["ids"][:1]
+                    for group in data["groups"].values():
+                        for name in ("residual", "pre"):
+                            if name in group:
+                                group[name] = group[name][:1]
             for path, data in zip(files, raw, strict=True):
                 if not data.get("request_context_qualified") or data["rank"] != rank:
                     raise ValueError("Only rank-matched actual request state is accepted")
@@ -798,6 +818,9 @@ def main():
                 )
                 plan_engram = (engram_cases[0]
                                if args.candidate == "native_target_input" or args.fixed_prefix_acceptance else ())
+                if args.candidate == "startup_frontend":
+                    os.environ["VLLM_HPU_DSV41_FRONTEND_CACHE_DIR"] = str(args.frontend_cache_dir) if arm else ""
+                prepare_started = time.perf_counter()
                 plan = StageVariant(program, *values, plan_engram,
                                     native_input=args.candidate == "native_target_input" and bool(arm),
                                     fused_text_io=args.fixed_prefix_acceptance)
@@ -847,6 +870,20 @@ def main():
                     plan(*values, plan_engram, native_input=plan.native_input,
                              fused_text_io=args.fixed_prefix_acceptance)
                     torch.hpu.synchronize()
+                if args.candidate == "startup_frontend":
+                    entries = plan.compiled.chunks
+                    cache_stats = [dict(entry.stats) for entry in entries if hasattr(entry, "stats")]
+                    report.setdefault("startup_preparation", []).append(dict(
+                        arm=arm, rows=args.frontend_rows,
+                        wall_seconds=time.perf_counter() - prepare_started,
+                        cache=cache_stats,
+                        backend_seconds=sum(getattr(artifact._artifacts.compiled_fn, "backend_seconds", 0.)
+                                            for entry in entries if hasattr(entry, "variants")
+                                            for artifact in entry.variants)))
+                    if arm and (len(cache_stats) != len(entries) or args.frontend_restore_only and
+                                any(row["captures"] or not row["restores"] for row in cache_stats)):
+                        raise RuntimeError("Full native group did not reuse its guarded frontend without tracing")
+                    save()
                 if plan not in _native_entries:
                     from vllm_gaudi.ops.tp2_prepared_plan import prepared_group_stats
                     from vllm_gaudi import envs
@@ -1359,6 +1396,17 @@ def main():
                     report["selection_scope"] = dict(local_owners=[layer.layer for layer in active],
                                                       global_owners=global_owners,
                                                       preserves_existing_score_producer=True)
+                elif args.candidate == "startup_frontend":
+                    selected = int(bool(arm) and bool(report["startup_preparation"][-1]["cache"]))
+                    required_arm_calls = arm
+                    if arm:
+                        parent = report["captured_arms"][0]
+                        report["frontend_operator_delta"] = {
+                            name: operators[name] - parent["operators"].get(name, 0)
+                            for name in set(operators) | set(parent["operators"])
+                            if operators[name] != parent["operators"].get(name, 0)}
+                        if _native_entries[plan][0].collective_count() != parent["native_collectives"]:
+                            raise RuntimeError("Frontend restoration changed the native communication contract")
                 else:
                     required_arm_calls = (required_calls if arm or args.candidate in
                                           ("resident_constants", "output_layout", "mhc_high_plane") else 0)
