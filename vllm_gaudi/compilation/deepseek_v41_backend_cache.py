@@ -5,6 +5,7 @@ import hashlib
 import io
 import importlib
 import json
+import pickle
 from pathlib import Path
 import time
 import uuid
@@ -182,7 +183,8 @@ def restore_or_compile(backend, graph, arguments, directory, identity):
             function = cloudpickle.loads(data)
             logger().info("V4.1 lowered backend restored: seconds=%.3f", time.perf_counter() - started)
             return function
-        except (ValueError, KeyError, EOFError, ImportError, TypeError) as error:
+        except (ValueError, KeyError, EOFError, ImportError, TypeError, AttributeError, OSError,
+                pickle.UnpicklingError) as error:
             logger().warning("V4.1 lowered backend rejected: %s", error)
     function = backend(graph, arguments)
     try:

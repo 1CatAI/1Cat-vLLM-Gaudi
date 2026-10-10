@@ -307,9 +307,12 @@ class ReboundFrontend(SerializableCallable):
             started = time.perf_counter()
             if self.backend_directory is not None and os.environ.get("VLLM_HPU_DSV41_BACKEND_CACHE", "0") == "1":
                 from vllm_gaudi.compilation.deepseek_v41_backend_cache import restore_or_compile
+                from vllm_gaudi.compilation.deepseek_v41_cache_identity import lowering_dependencies
 
+                key = hashlib.sha256(self.graph_bytes)
+                key.update(json.dumps(lowering_dependencies(), sort_keys=True).encode())
                 self.compiled = restore_or_compile(self.backend, graph, list(args), self.backend_directory,
-                                                   hashlib.sha256(self.graph_bytes).hexdigest())
+                                                   key.hexdigest())
             else:
                 self.compiled = self.backend(graph, list(args))
             self.backend_seconds += time.perf_counter() - started
@@ -362,16 +365,29 @@ class GuardedFrontendEntry:
 
     def _index(self):
         manifests = sorted(self.directory.glob("*.json"))
-        if len(manifests) > self.max_variants:
-            raise ValueError("Frontend cache contains too many variants")
         for path in manifests:
-            record = json.loads(path.read_text())
-            if record["identity"] != self.identity or record["schema"] != 3:
-                raise ValueError("Frontend dependency fingerprint changed")
-            binary = path.with_suffix(".bin")
-            if binary.stat().st_size > 16 << 20:
-                raise ValueError("Frontend artifact exceeds the metadata-only size bound")
+            try:
+                record = json.loads(path.read_text())
+                if record["identity"] != self.identity or record["schema"] != 3:
+                    raise ValueError("Frontend dependency fingerprint changed")
+                binary = path.with_suffix(".bin")
+                if binary.stat().st_size > 16 << 20:
+                    raise ValueError("Frontend artifact exceeds the metadata-only size bound")
+            except (ValueError, KeyError, OSError) as error:
+                self._reject(path, error)
+                continue
             self.pending.append((binary, record))
+        if len(self.pending) > self.max_variants:
+            raise ValueError("Frontend cache contains too many variants")
+
+    def _reject(self, manifest, error):
+        from vllm_gaudi.extension.logger import logger
+
+        logger().warning("V4.1 frontend artifact rejected; rebuilding affected entry: %s", error)
+        suffix = f".rejected-{uuid.uuid4().hex}"
+        for path in (manifest, manifest.with_suffix(".bin")):
+            if path.exists():
+                path.rename(path.with_name(path.name + suffix))
 
     def _restore(self, args):
         signature = _input_signature(args)
@@ -379,13 +395,22 @@ class GuardedFrontendEntry:
             if record["inputs"] != signature or not _owner_scalars_match(self.owner, self.function.__globals__,
                                                                          record.get("owner_scalars", {})):
                 continue
-            data = binary.read_bytes()
-            if hashlib.sha256(data).hexdigest() != record["sha256"]:
-                raise ValueError("Frontend artifact digest differs from its publication")
             started = time.perf_counter()
-            artifact = _GuardedCompiledFunction.deserialize(data, self.function.__globals__, owner_bindings(self.owner),
-                                                            record["defaults"], record["tensor_attributes"])
+            try:
+                data = binary.read_bytes()
+                if hashlib.sha256(data).hexdigest() != record["sha256"]:
+                    raise ValueError("Frontend artifact digest differs from its publication")
+                artifact = _GuardedCompiledFunction.deserialize(data, self.function.__globals__,
+                                                                owner_bindings(self.owner), record["defaults"],
+                                                                record["tensor_attributes"])
+            except (ValueError, KeyError, OSError, EOFError, ImportError, AttributeError, TypeError,
+                    pickle.UnpicklingError) as error:
+                self.pending.remove((binary, record))
+                self._reject(binary.with_suffix(".json"), error)
+                continue
             artifact._artifacts.compiled_fn.bind(self.backend, directory=self.directory / "lowered")
+            artifact._frontend_input_signature = record["inputs"]
+            artifact._frontend_owner_scalars = record.get("owner_scalars", {})
             self.variants.append(artifact)
             self.pending.remove((binary, record))
             self.stats["restores"] += 1
@@ -406,7 +431,9 @@ class GuardedFrontendEntry:
             if defaults_match and artifact.guard_check(*arguments):
                 self.stats["hits"] += 1
                 return artifact(*arguments)
-            if not self.guard_miss_reported:
+            same_geometry = (artifact._frontend_input_signature == _input_signature(args) and _owner_scalars_match(
+                self.owner, self.function.__globals__, artifact._frontend_owner_scalars))
+            if same_geometry and not self.guard_miss_reported:
                 from vllm_gaudi.extension.logger import logger
 
                 reason = (artifact._artifacts.guard_manager.check_verbose(artifact.prepare_f_locals(
@@ -439,6 +466,8 @@ class GuardedFrontendEntry:
                       tensor_attributes=artifact._frontend_tensor_attributes,
                       owner_scalars=_owner_scalar_guards(_source_loads(artifact._artifacts.guards_state)),
                       inputs=_input_signature(args))
+        artifact._frontend_input_signature = record["inputs"]
+        artifact._frontend_owner_scalars = record["owner_scalars"]
         temporary.write_text(json.dumps(record, sort_keys=True) + "\n")
         temporary.replace(binary.with_suffix(".json"))
         artifact._artifacts.compiled_fn.bind(self.backend, directory=self.directory / "lowered")
@@ -458,7 +487,8 @@ def immutable_package_sources(package):
 def cached_group_entry(function, group, backend, directory, *, native, shared_coordinates, memory_ready):
     """Bind one common TP stage entry; topology remains an ordinary contract."""
     from vllm_gaudi.extension.logger import logger
-    from vllm_gaudi.compilation.deepseek_v41_cache_identity import computation_dependencies, semantic_environment
+    from vllm_gaudi.compilation.deepseek_v41_cache_identity import (computation_dependencies, runtime_content_identity,
+                                                                    semantic_environment)
 
     sources = computation_dependencies(function, group)
     if isinstance(backend, str):
@@ -469,7 +499,8 @@ def cached_group_entry(function, group, backend, directory, *, native, shared_co
     contract = dict(sources=sources,
                     torch_version=torch.__version__,
                     environment=environment,
-                    runtime=os.environ.get("DSV41_SERVING_RUNTIME"),
+                    runtime=(runtime_content_identity(json.loads(Path(os.environ["DSV41_RUNTIME_PROFILE"]).read_text()))
+                             if os.environ.get("DSV41_RUNTIME_PROFILE") else os.environ.get("DSV41_SERVING_RUNTIME")),
                     serving_identity=os.environ.get("DSV41_SERVING_COMPILE_IDENTITY"),
                     function=function.__qualname__,
                     layers=[layer.layer for layer in group.layers],

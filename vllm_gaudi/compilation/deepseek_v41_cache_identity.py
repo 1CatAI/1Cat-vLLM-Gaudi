@@ -105,6 +105,25 @@ def runtime_content_identity(profile):
                                      sort_keys=True).encode()).hexdigest()
 
 
+@lru_cache(maxsize=1)
+def lowering_dependencies():
+    """Backend transformations invalidate lowered artifacts, not frontend captures."""
+    import habana_frameworks.torch.dynamo.compile_backend as compiler
+    import torch
+
+    package = Path(compiler.__file__).parent
+    result = {"torch_version": torch.__version__}
+    for path in sorted(package.rglob("*.py")):
+        result[f"bridge:{path.relative_to(package)}"] = hashlib.sha256(
+            ast.dump(ast.parse(path.read_text()), include_attributes=False).encode()).hexdigest()
+    plugin = Path(__file__).resolve().parents[1]
+    for name in ("ops/tp2_prepared_plan.py", "compilation/deepseek_v41_prepared.py",
+                 "compilation/deepseek_v41_backend_cache.py"):
+        result[name] = hashlib.sha256(
+            ast.dump(ast.parse((plugin / name).read_text()), include_attributes=False).encode()).hexdigest()
+    return result
+
+
 def semantic_environment(environment):
     ignored = ("TMPDIR", "HABANA_LOGS", "VLLM_HPU_DSV4_WORKER_CPUS", "VLLM_HPU_DSV4_WORKER_HELPER_CPUS",
                "VLLM_HPU_DSV41_FRONTEND_CACHE_DIR", "PT_HPU_RECIPE_CACHE_CONFIG")

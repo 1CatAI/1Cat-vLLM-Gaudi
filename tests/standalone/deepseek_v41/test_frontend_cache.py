@@ -218,18 +218,34 @@ def test_incompatible_shape_fails_before_state_execution(tmp_path):
     assert torch.equal(group.state, before)
 
 
-def test_changed_artifact_or_dependencies_fail_closed(tmp_path):
+def test_changed_artifact_or_dependencies_rebuild_without_using_old_graph(tmp_path):
     group = StateGroup(1.)
     cached(group, tmp_path)(torch.ones((6, 8)))
-    with pytest.raises(ValueError, match="fingerprint"):
-        GuardedFrontendEntry(StateGroup.forward, StateGroup(1.), backend, tmp_path, identity="2" * 64)
+    changed = GuardedFrontendEntry(StateGroup.forward, StateGroup(2.), backend, tmp_path, identity="2" * 64)
+    assert torch.equal(changed(torch.ones((6, 8)))[0], torch.full((6, 8), 16.))
+    assert changed.stats["captures"] == 1
     path = next(tmp_path.glob("*.json"))
     record = json.loads(path.read_text())
     record["sha256"] = "0" * 64
     path.write_text(json.dumps(record))
-    restored = cached(StateGroup(1.), tmp_path)
-    with pytest.raises(ValueError, match="digest"):
-        restored(torch.ones((6, 8)))
+    restored = GuardedFrontendEntry(StateGroup.forward, StateGroup(3.), backend, tmp_path, identity="2" * 64)
+    assert torch.equal(restored(torch.ones((6, 8)))[0], torch.full((6, 8), 24.))
+    assert restored.stats["captures"] == 1
+    assert len(list(tmp_path.glob("*.json"))) == 1
+
+
+def test_corruption_rebuilds_only_affected_shape(tmp_path):
+    previous = cached(StateGroup(1.), tmp_path)
+    for rows in (1, 6):
+        previous(torch.ones((rows, 8)))
+    for manifest in tmp_path.glob("*.json"):
+        if json.loads(manifest.read_text())["inputs"][1][0][1] == [1, 8]:
+            manifest.with_suffix(".bin").write_bytes(b"invalid")
+    fresh = cached(StateGroup(2.), tmp_path)
+    assert torch.equal(fresh(torch.ones((1, 8)))[0], torch.full((1, 8), 16.))
+    assert torch.equal(fresh(torch.ones((6, 8)))[0], torch.full((6, 8), 16.))
+    assert fresh.stats["captures"] == 1
+    assert fresh.stats["restores"] == 1
 
 
 def test_shared_group_factory_rebinds_a_named_backend(tmp_path, monkeypatch):
