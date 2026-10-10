@@ -968,6 +968,8 @@ def main():
         os.environ["VLLM_HPU_DSV41_N256_PREPARED_DIR"] = str(directory)
     prepare_environment(args.model, settings.get("sidecars"), args.tensor_parallel_size, args.pipeline_parallel_size)
     loader = {} if args.checkpoint_audit is None else {"checkpoint_audit": args.checkpoint_audit}
+    if settings.get("engram_resident_tables"):
+        loader["engram_resident_tables"] = settings["engram_resident_tables"]
     trace_dir = os.environ.get("VLLM_TORCH_PROFILER_DIR")
     if trace_dir and not any(value.startswith("--profiler-config") for value in extra):
         # The engine registers /start_profile only from ProfilerConfig. The
@@ -1044,7 +1046,7 @@ def main():
     ]
     residency = None
     try:
-        if args.engram_residency == "locked":
+        if args.engram_residency == "locked" and not loader.get("engram_resident_tables"):
             from vllm_gaudi.ops.deepseek_v41_residency import (
                 EngramDeviceGate, EngramResidency, EngramStartup, table_regions,
             )

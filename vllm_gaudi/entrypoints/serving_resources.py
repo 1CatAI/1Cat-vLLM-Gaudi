@@ -11,6 +11,7 @@ import subprocess
 import time
 
 _leases = []
+_borrowed_tables = []
 
 
 def prepare_serving_resources(settings, model, arguments):
@@ -42,6 +43,19 @@ def prepare_serving_resources(settings, model, arguments):
                 if not wait:
                     raise RuntimeError(f"HPU module {module} already has an owner")
                 time.sleep(1)
+    reused_bytes = 0
+    if manifest := settings.get("engram_shared_table_manifest"):
+        from vllm_gaudi.ops.deepseek_v41_borrowed_tables import BorrowedEngramTables
+
+        try:
+            tables = BorrowedEngramTables(model, manifest)
+        except (OSError, ValueError, KeyError, RuntimeError) as error:
+            print(f"Shared Engram backing rejected; rebuilding with full host budget: {error}", flush=True)
+        else:
+            _borrowed_tables.append(tables)
+            settings["engram_resident_tables"] = tables.bindings
+            reused_bytes = tables.reused_bytes
+            print(f"Validated shared Engram reuse: {reused_bytes} resident bytes; no second table allocation", flush=True)
     minimum = settings.get("min_host_available_gib", 0)
     while minimum:
         memory = {
@@ -49,7 +63,7 @@ def prepare_serving_resources(settings, model, arguments):
             for line in Path("/proc/meminfo").read_text().splitlines()
         }
         available = memory["MemAvailable"] / 1048576
-        if available >= minimum:
+        if available + reused_bytes / 2**30 >= minimum:
             break
         if not wait:
             raise RuntimeError(f"Serving requires {minimum} GiB available host RAM; found {available:.1f}")
@@ -97,6 +111,7 @@ def prepare_serving_resources(settings, model, arguments):
         # explicit value remains a diagnostic way to disable frontend reuse.
         os.environ.setdefault("VLLM_HPU_DSV41_FRONTEND_CACHE_DIR", str(cache / "frontend"))
         (cache / "identity.json").write_text(json.dumps(identity, indent=2) + "\n")
-        (cache / "source-inventory.json").write_text(json.dumps(dict(sources=sources, engine_head=engine_head,
-                                                                    engine_diff=hashlib.sha256(engine_patch).hexdigest()),
-                                                                indent=2) + "\n")
+        (cache / "source-inventory.json").write_text(
+            json.dumps(dict(
+                sources=sources, engine_head=engine_head, engine_diff=hashlib.sha256(engine_patch).hexdigest()),
+                       indent=2) + "\n")
