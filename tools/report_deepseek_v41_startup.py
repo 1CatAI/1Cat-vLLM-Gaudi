@@ -24,6 +24,8 @@ def summarize(record, text):
         for count in (1, 6):
             if f"C{count} native warmup searches:" in line:
                 phases.setdefault(f"c{count}_start", when)
+        if "V4.1 starting sampling protocol preparation" in line:
+            phases.setdefault("protocol_start", when)
         match = re.search(r"weight startup: rank=(\d+) total_seconds=([\d.]+) families=(.*?) counters=(.*?) reader",
                           line)
         if match:
@@ -38,15 +40,17 @@ def summarize(record, text):
                                                                                  "backend_rebuilt"),
                                  ("lowered backend not cacheable:",
                                   "backend_uncacheable"), ("lowered backend rejected:", "backend_rejected"),
-                                 ("guarded frontend restored:", "frontend_hits"), ("frontend artifact rejected;",
-                                                                                   "frontend_rejected"),
-                                 ("frontend guard rejected:", "same_geometry_guard_rejected")):
+                                 ("guarded frontend restored:", "frontend_hits"), ("guarded frontend captured:",
+                                                                                   "frontend_rebuilt"),
+                                 ("frontend artifact rejected;",
+                                  "frontend_rejected"), ("frontend guard rejected:", "same_geometry_guard_rejected")):
                 if marker in line:
                     counters[name] += 1
     durations = {}
     previous = start
-    for marker, name in (("weights_ready", "initialization_and_weights"),
-                         ("c1_start", "prefill_and_protocol_preparation"), ("c6_start", "c1_native_preparation")):
+    for marker, name in (("weights_ready", "initialization_and_weights"), ("c1_start",
+                                                                           "prefill_and_protocol_preparation"),
+                         ("c6_start", "c1_native_preparation"), ("protocol_start", "c6_native_preparation")):
         if marker not in phases:
             break
         durations[name] = phases[marker] - previous

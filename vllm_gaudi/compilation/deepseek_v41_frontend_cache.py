@@ -313,7 +313,7 @@ class ReboundFrontend(SerializableCallable):
                 if node.name in sources:
                     node._dynamo_source = sources[node.name]
             started = time.perf_counter()
-            if self.backend_directory is not None and os.environ.get("VLLM_HPU_DSV41_BACKEND_CACHE", "0") == "1":
+            if self.backend_directory is not None and os.environ.get("VLLM_HPU_DSV41_BACKEND_CACHE", "1") == "1":
                 from vllm_gaudi.compilation.deepseek_v41_backend_cache import restore_or_compile
                 from vllm_gaudi.compilation.deepseek_v41_cache_identity import lowered_keys
 
@@ -484,6 +484,10 @@ class GuardedFrontendEntry:
         artifact._artifacts.compiled_fn.bind(self.backend, directory=self.directory / "lowered")
         self.variants.append(artifact)
         self.stats["captures"] += 1
+        from vllm_gaudi.extension.logger import logger
+
+        logger().info("V4.1 guarded frontend captured: entry=%s seconds=%.3f", self.function.__qualname__,
+                      time.perf_counter() - started)
         return artifact(*arguments)
 
 

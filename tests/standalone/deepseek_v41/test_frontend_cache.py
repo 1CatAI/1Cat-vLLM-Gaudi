@@ -365,3 +365,21 @@ def test_tensor_region_method_restores_current_owner_and_keyword_arguments(tmp_p
     assert torch.equal(pure(inputs, shift=1.5), inputs * 2 + 1.5)
     again = cached_tensor_entry(defaults_transform, (inputs, ), {"shift": 1.5})
     assert torch.equal(again(inputs, shift=1.5), inputs * 2 + 1.5)
+
+
+def test_tensor_region_restores_across_process_local_clone_names(tmp_path, monkeypatch):
+    from types import FunctionType
+    from torch._dynamo.backends import registry
+
+    monkeypatch.setenv("VLLM_HPU_DSV41_FRONTEND_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("DSV41_SERVING_RUNTIME", "runtime-proof")
+    monkeypatch.setenv("DSV41_SERVING_COMPILE_IDENTITY", "1" * 64)
+    monkeypatch.setattr(registry, "lookup_backend", lambda name: backend)
+    inputs = torch.ones((6, 8))
+    for name in ("region_1", "region_719"):
+        fn = FunctionType(defaults_transform.__code__.replace(co_name=name), defaults_transform.__globals__,
+                          name, defaults_transform.__defaults__, defaults_transform.__closure__)
+        fn.__kwdefaults__ = defaults_transform.__kwdefaults__
+        entry = cached_tensor_entry(fn, (inputs,), {"shift": 1.5})
+        assert torch.equal(entry(inputs, shift=1.5), inputs * 2 + 1.5)
+    assert len(list(tmp_path.rglob("*.bin"))) == 1

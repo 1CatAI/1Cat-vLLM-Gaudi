@@ -97,8 +97,8 @@ on the shared path. Unset by default pending device and startup qualification.
 `VLLM_HPU_DSV41_BACKEND_CACHE` enables persistent lowered inference modules
 alongside guarded frontends. It restores partitioned modules, JIT descriptions
 and input/output metadata; native plans, recipe handles and communication
-ownership are created in the current process. It is disabled by default until
-complete serving startup qualification. Set it to `0` to disable reuse.
+ownership are created in the current process. It is enabled when a guarded
+frontend cache directory is configured. Set it to `0` to disable backend reuse.
 
 `VLLM_HPU_DSV41_FRONTEND_CACHE_DIR` selects persistent Dynamo frontend metadata
 for the shared native stage. Normal serving resource preparation selects a

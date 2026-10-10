@@ -82,33 +82,35 @@ class NativeDraftProtocol(torch.nn.Module):
         self.closed = False
 
     def _new_entry(self):
-        method = (self.draft.verify_and_propose_sampled_full if self.full and not self.full_main else
-                  self.draft.verify_and_propose_sampled_bound if self.sampled else self.draft.verify_and_propose)
-        function = method.__func__
+        function = type(self)._compiled_protocol
         name = f"{function.__name__}_native_control_{next(_entries)}"
         entry = FunctionType(function.__code__.replace(co_name=name), function.__globals__, name,
                              function.__defaults__, function.__closure__)
         entry.__kwdefaults__, entry.__module__ = dict(function.__kwdefaults__ or {}), function.__module__
-        if self.sampled:
-            entry.__kwdefaults__["repair_frame"] = self.repair_frame
-            entry.__kwdefaults__["known_stochastic"] = self.known_stochastic
-            if self.full_main:
-                entry.__kwdefaults__["full"] = True
-        bound = MethodType(entry, self.draft)
-        if self.input_publication is None and self.state_publication is None:
-            return torch.compile(bound, backend="hpu_backend", fullgraph=True, dynamic=False)
-        publication = self.input_publication
-        state_publication = self.state_publication
+        from vllm_gaudi.compilation.deepseek_v41_frontend_cache import cached_tensor_entry
 
-        def publish_inputs(*inputs):
-            values = bound(*inputs)
-            if state_publication is not None:
-                state_publication(values)
-            if publication is not None:
-                publication(values[0], inputs[2])
-            return values
+        cached = cached_tensor_entry(entry, self.fixed, {}, owner=self)
+        if cached is not None:
+            return cached
+        return torch.compile(MethodType(entry, self), backend="hpu_backend", fullgraph=True, dynamic=False)
 
-        return torch.compile(publish_inputs, backend="hpu_backend", fullgraph=True, dynamic=False)
+    def _compiled_protocol(self, *inputs):
+        # All bindings are current owner attributes, including request-owned
+        # rollback/publication buffers. No closure persists an earlier request.
+        if self.full and not self.full_main:
+            values = self.draft.verify_and_propose_sampled_full(
+                *inputs, repair_frame=self.repair_frame, known_stochastic=self.known_stochastic)
+        elif self.sampled:
+            values = self.draft.verify_and_propose_sampled_bound(
+                *inputs, repair_frame=self.repair_frame, known_stochastic=self.known_stochastic,
+                full=self.full_main)
+        else:
+            values = self.draft.verify_and_propose(*inputs)
+        if self.state_publication is not None:
+            self.state_publication(values)
+        if self.input_publication is not None:
+            self.input_publication(values[0], inputs[2])
+        return values
 
     @staticmethod
     def _validate(hidden, proposed, control, auxiliary, positions):

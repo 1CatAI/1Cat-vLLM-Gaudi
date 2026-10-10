@@ -3265,7 +3265,9 @@ class V41ModelRunner:
             for count in (2, 3, 4, 5):
                 self._insert(self.model.last_aux[:count], self.positions[:count])
             torch.hpu.synchronize()
+        logger.info("V4.1 starting sampling protocol preparation")
         self._warm_device_round_inputs()
+        logger.info("V4.1 sampling protocol preparation complete")
         self.pp.group.barrier()
         self.state.clear()
         self.active_request = None
