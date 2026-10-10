@@ -132,3 +132,21 @@ def test_frontend_lookup_policy_keeps_math_identity_and_bounded_legacy_lookup():
     }))
     assert first != frontend_contract_keys(dict(contract, model="different-weights"))
     assert len(first[1]) == 1
+
+
+def test_python_source_digest_keeps_semantics_and_detects_restored_mtime(tmp_path):
+    import ast
+    import os
+    from vllm_gaudi.compilation.deepseek_v41_cache_identity import python_source_digest, _python_source_digest
+
+    path = tmp_path / "operator.py"
+    path.write_text("def operation(x):\n    return x * 2\n")
+    expected = hashlib.sha256(ast.dump(ast.parse(path.read_text()), include_attributes=False).encode()).hexdigest()
+    assert python_source_digest(path) == expected
+    hits = _python_source_digest.cache_info().hits
+    assert python_source_digest(path) == expected
+    assert _python_source_digest.cache_info().hits == hits + 1
+    previous = path.stat()
+    path.write_text("def operation(x):\n    return x * 3\n")
+    os.utime(path, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+    assert python_source_digest(path) != expected

@@ -37,6 +37,18 @@ def normalized_source(value):
     return ast.dump(_source_tree(value), include_attributes=False)
 
 
+@lru_cache(maxsize=512)
+def _python_source_digest(path, device, inode, size, modified, changed):
+    return hashlib.sha256(ast.dump(ast.parse(Path(path).read_text()), include_attributes=False).encode()).hexdigest()
+
+
+def python_source_digest(path):
+    """Reuse immutable source normalization while tracking every file revision."""
+    path = Path(path)
+    stat = path.stat()
+    return _python_source_digest(str(path), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
 def computation_dependencies(function, owner):
     """Include actual module types, bound callbacks and their Python helpers."""
     pending = [function]
@@ -64,8 +76,7 @@ def computation_dependencies(function, owner):
                 pending.append(dependency)
             elif isinstance(dependency, ModuleType) and dependency.__name__.startswith("vllm_gaudi."):
                 path = Path(dependency.__file__)
-                result[f"module:{dependency.__name__}"] = hashlib.sha256(
-                    ast.dump(ast.parse(path.read_text()), include_attributes=False).encode()).hexdigest()
+                result[f"module:{dependency.__name__}"] = python_source_digest(path)
             elif type(dependency) in (bool, int, float, str, tuple) and used.isupper():
                 result[f"constant:{defining.__name__}:{used}"] = hashlib.sha256(repr(dependency).encode()).hexdigest()
         # Deferred imports must be covered even when the chosen numerical
@@ -76,8 +87,7 @@ def computation_dependencies(function, owner):
             if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("vllm_gaudi."):
                 path = package / (node.module.removeprefix("vllm_gaudi.").replace(".", "/") + ".py")
                 if path.is_file():
-                    result[f"module:{node.module}"] = hashlib.sha256(
-                        ast.dump(ast.parse(path.read_text()), include_attributes=False).encode()).hexdigest()
+                    result[f"module:{node.module}"] = python_source_digest(path)
     return result
 
 
