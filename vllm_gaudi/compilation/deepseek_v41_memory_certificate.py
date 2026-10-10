@@ -11,6 +11,41 @@ def _digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def relocate_certificates(root, source_profile, target_profile):
+    """Migrate the preceding path-sensitive schema only with content proof."""
+    from vllm_gaudi.compilation.deepseek_v41_cache_identity import runtime_content_identity
+
+    profiles = [json.loads(Path(path).read_text()) for path in (source_profile, target_profile)]
+    for profile in profiles:
+        for item in (*profile.get("additional_libraries", ()), *profile.get("configuration_files", ())):
+            if _digest(Path(item["path"])) != item["sha256"]:
+                raise ValueError("Memory certificate runtime profile is not frozen")
+    canonical = runtime_content_identity(profiles[0])
+    if canonical != runtime_content_identity(profiles[1]):
+        raise ValueError("Memory certificate runtime contents changed")
+    previous = _digest(Path(source_profile))
+    count = 0
+    for path in (Path(root) / "memory-admission").glob("rank*-*.json"):
+        record = json.loads(path.read_text())["record"]
+        if record["contract"]["runtime"] != previous:
+            continue
+        rank = int(path.name.split("-", 1)[0].removeprefix("rank"))
+        original = MemoryCertificate(root, rank, record["contract"])
+        if original.path != path or original.restore() is None:
+            raise ValueError("Memory certificate migration lacks its measured inventory")
+        target = MemoryCertificate(root, rank, dict(record["contract"], runtime=canonical))
+        updated = dict(record, identity=target.identity, contract=target.contract)
+        envelope = dict(record=updated, sha256=hashlib.sha256(json.dumps(updated, sort_keys=True).encode()).hexdigest())
+        temporary = target.path.with_name(f".{uuid.uuid4().hex}.tmp")
+        try:
+            temporary.write_text(json.dumps(envelope, sort_keys=True) + "\n")
+            temporary.replace(target.path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        count += 1
+    return count
+
+
 class MemoryCertificate:
     """No allocation, recipe or communicator identity survives a restart."""
 
@@ -95,18 +130,25 @@ class MemoryCertificate:
 
 def runner_certificate(runner, rank, specs, total_device_bytes):
     import os
-    from vllm_gaudi.compilation.deepseek_v41_cache_identity import computation_dependencies, normalized_source
+    from vllm_gaudi.compilation.deepseek_v41_cache_identity import (
+        computation_dependencies,
+        normalized_source,
+        runtime_content_identity,
+    )
 
     root = os.environ.get("VLLM_HPU_DSV41_FRONTEND_CACHE_DIR")
     if not root or not getattr(runner, "use_dspark", False):
         return None
     program = runner.model.program
+    profile = os.environ.get("DSV41_RUNTIME_PROFILE")
+    runtime = (runtime_content_identity(json.loads(Path(profile).read_text()))
+               if profile else os.environ.get("DSV41_SERVING_RUNTIME"))
     sources = computation_dependencies(type(runner)._dummy_run, program)
     for name in ("_forward", "profile_run", "warmup_model"):
         sources[f"runner:{name}"] = hashlib.sha256(normalized_source(getattr(type(runner), name)).encode()).hexdigest()
     contract = dict(sources=sources,
                     serving_identity=os.environ.get("DSV41_SERVING_COMPILE_IDENTITY"),
-                    runtime=os.environ.get("DSV41_SERVING_RUNTIME"),
+                    runtime=runtime,
                     precision=program.precision_fingerprint,
                     total_device_bytes=int(total_device_bytes),
                     profile_pages=runner.profile_kv_cache_blocks(),

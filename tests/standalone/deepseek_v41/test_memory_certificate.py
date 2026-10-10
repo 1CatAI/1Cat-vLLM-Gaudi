@@ -2,7 +2,7 @@
 import hashlib
 import json
 
-from vllm_gaudi.compilation.deepseek_v41_memory_certificate import MemoryCertificate
+from vllm_gaudi.compilation.deepseek_v41_memory_certificate import MemoryCertificate, relocate_certificates
 
 
 def established(tmp_path):
@@ -71,3 +71,37 @@ def test_malformed_inventory_repeats_profiling(tmp_path):
     envelope["sha256"] = hashlib.sha256(json.dumps(envelope["record"], sort_keys=True).encode()).hexdigest()
     cold.path.write_text(json.dumps(envelope))
     assert cold.restore() is None
+
+
+def test_relocated_profile_migration_keeps_measured_inventory(tmp_path):
+    from vllm_gaudi.compilation.deepseek_v41_cache_identity import runtime_content_identity
+
+    profiles = []
+    for name in ("old", "relocated"):
+        directory = tmp_path / name
+        directory.mkdir()
+        binary = directory / "runtime.so"
+        binary.write_bytes(b"same runtime")
+        profile = directory / "runtime.json"
+        profile.write_text(
+            json.dumps(
+                dict(environment={"TMPDIR": str(directory)},
+                     additional_libraries=[
+                         dict(path=str(binary), sha256=hashlib.sha256(binary.read_bytes()).hexdigest())
+                     ])))
+        profiles.append(profile)
+    root = tmp_path / "frontend"
+    root.mkdir()
+    cold, _ = established(root)
+    contract = dict(cold.contract, runtime=hashlib.sha256(profiles[0].read_bytes()).hexdigest())
+    cold = MemoryCertificate(root, 0, contract)
+    cold.measured(100, 150, 125, 30)
+    cold.publish_after_warmup()
+    assert relocate_certificates(root, *profiles) == 1
+    target = MemoryCertificate(root, 0,
+                               dict(contract, runtime=runtime_content_identity(json.loads(profiles[1].read_text()))))
+    assert target.restore() == 55
+    (profiles[1].parent / "runtime.so").write_bytes(b"changed runtime")
+    import pytest
+    with pytest.raises(ValueError, match="not frozen"):
+        relocate_certificates(root, *profiles)
