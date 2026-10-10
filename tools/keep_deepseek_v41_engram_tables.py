@@ -36,8 +36,9 @@ def main():
     if manifest.exists():
         previous = json.loads(manifest.read_text())
         try:
-            alive = (previous.get("boot_id") == boot_id
-                     and process_start(previous["pid"]) == previous.get("process_start"))
+            previous_start = process_start(previous["pid"])
+            alive = ("boot_id" not in previous or
+                     previous["boot_id"] == boot_id and previous_start == previous.get("process_start"))
         except ProcessLookupError:
             alive = False
         except FileNotFoundError:
