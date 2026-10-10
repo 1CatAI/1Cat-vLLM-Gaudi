@@ -12,8 +12,27 @@ from types import FunctionType, MethodType, ModuleType
 
 
 @lru_cache(maxsize=512)
+def _source_tree(value):
+    try:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(value)))
+    except SyntaxError:
+        if not isinstance(value, FunctionType) or value.__code__.co_name != "<lambda>":
+            raise
+        # inspect can return only the final line of a multiline call, with
+        # its closing parenthesis. Read the lambda from the complete source;
+        # never discard an unparseable computation dependency.
+        path = Path(inspect.getsourcefile(value))
+        matches = [node for node in ast.walk(ast.parse(path.read_text()))
+                   if isinstance(node, ast.Lambda) and node.lineno == value.__code__.co_firstlineno]
+        if len(matches) != 1:
+            raise ValueError("Computation dependency has an ambiguous lambda source") from None
+        tree = ast.Expression(matches[0])
+    return tree
+
+
+@lru_cache(maxsize=512)
 def normalized_source(value):
-    return ast.dump(ast.parse(textwrap.dedent(inspect.getsource(value))), include_attributes=False)
+    return ast.dump(_source_tree(value), include_attributes=False)
 
 
 def computation_dependencies(function, owner):
@@ -38,7 +57,7 @@ def computation_dependencies(function, owner):
             continue
         names = {
             node.id
-            for node in ast.walk(ast.parse(textwrap.dedent(inspect.getsource(value)))) if isinstance(node, ast.Name)
+            for node in ast.walk(_source_tree(value)) if isinstance(node, ast.Name)
         }
         for used in names:
             dependency = vars(defining).get(used)
@@ -53,7 +72,7 @@ def computation_dependencies(function, owner):
         # Deferred imports must be covered even when the chosen numerical
         # branch has not imported their module in this process yet.
         package = Path(__file__).resolve().parents[1]
-        tree = ast.parse(textwrap.dedent(inspect.getsource(value)))
+        tree = _source_tree(value)
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("vllm_gaudi."):
                 path = package / (node.module.removeprefix("vllm_gaudi.").replace(".", "/") + ".py")

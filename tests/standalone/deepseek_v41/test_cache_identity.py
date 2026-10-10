@@ -107,3 +107,15 @@ def test_uncertified_configuration_paths_remain_semantic(tmp_path):
     from vllm_gaudi.compilation.deepseek_v41_cache_identity import relocated_content
 
     assert relocated_content(dict(file="/first/data")) != relocated_content(dict(file="/second/data"))
+
+
+def test_lambda_on_the_final_line_of_a_call_keeps_its_dependency():
+    from vllm_gaudi.compilation.deepseek_v41_cache_identity import normalized_source
+
+    def build(*, generation):
+        return generation
+
+    callback = build(
+        generation=lambda: 17)
+    assert "Constant(value=17)" in normalized_source(callback)
+    assert computation_dependencies(callback, SimpleNamespace())
