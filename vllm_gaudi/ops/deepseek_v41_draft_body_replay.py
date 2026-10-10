@@ -29,6 +29,11 @@ class NativeDraftBody(NativeDraftProtocol):
     def _new_entry(self):
         name = f"native_c5_body_{next(_entries)}"
         entry = FunctionType(_body.__code__.replace(co_name=name), _body.__globals__, name)
+        from vllm_gaudi.compilation.deepseek_v41_frontend_cache import cached_tensor_entry
+
+        cached = cached_tensor_entry(entry, self.fixed, {}, owner=self.draft)
+        if cached is not None:
+            return cached
         return torch.compile(MethodType(entry, self.draft), backend="hpu_backend", fullgraph=True, dynamic=False)
 
     @staticmethod

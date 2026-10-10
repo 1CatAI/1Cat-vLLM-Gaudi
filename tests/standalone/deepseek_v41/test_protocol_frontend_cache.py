@@ -8,6 +8,9 @@ from vllm_gaudi.ops.deepseek_v41_draft_replay import NativeDraftProtocol
 
 class Draft(torch.nn.Module):
 
+    def forward_local(self, proposed, positions):
+        return proposed + positions, positions * 2
+
     def verify_and_propose(self, value, proposed, control):
         return value * 2, proposed + control
 
@@ -64,3 +67,27 @@ def test_cached_protocol_uses_fresh_state_and_preserves_protocol_choice(tmp_path
         assert torch.equal(fresh.state_publication.state, actual[0])
         assert torch.equal(fresh.input_publication.state, actual[0] + values[2])
     assert len(list(tmp_path.rglob("*.bin"))) == before
+
+
+def test_draft_body_restores_without_recapturing(tmp_path, monkeypatch):
+    from torch._dynamo.backends import registry
+    from vllm_gaudi.ops.deepseek_v41_draft_body_replay import NativeDraftBody
+
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
+    monkeypatch.setenv("VLLM_HPU_DSV41_FRONTEND_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("DSV41_SERVING_RUNTIME", "runtime-proof")
+    monkeypatch.setenv("DSV41_SERVING_COMPILE_IDENTITY", "1" * 64)
+    monkeypatch.setattr(registry, "lookup_backend", lambda name: lambda graph, inputs: graph.forward)
+    for repetition in range(2):
+        owner = NativeDraftBody.__new__(NativeDraftBody)
+        torch.nn.Module.__init__(owner)
+        owner.draft = Draft()
+        token, positions = torch.ones(1), torch.arange(5)
+        owner.fixed = (token, token, token, token, positions)
+        execute = owner._new_entry()
+        for value in (1., 2., 3.):
+            token.fill_(value)
+            actual = execute(*owner.fixed)
+            reference = owner.draft.forward_local(token, positions)
+            assert all(torch.equal(a, b) for a, b in zip(actual, reference, strict=True))
+    assert len([path for path in tmp_path.rglob("*.bin") if path.parent.name.startswith("rank")]) == 1
