@@ -6,6 +6,7 @@ Dynamo's graph and input/output mapping, not recipes, device addresses or native
 The caller must supply a namespace bound to its sources, runtime and model.
 """
 import hashlib
+from itertools import chain
 from functools import lru_cache
 import dataclasses
 import io
@@ -430,14 +431,20 @@ class GuardedFrontendEntry:
 
             logger().info("V4.1 guarded frontend restored: entry=%s seconds=%.3f", self.function.__qualname__,
                           time.perf_counter() - started)
+            # Deserialize one candidate at a time. A compatible guard ends
+            # lookup immediately; other finite variants remain indexed for
+            # their actual input/state contract instead of being rebuilt on
+            # every newly created stage owner.
+            yield artifact
 
     def __call__(self, *args):
         from torch._dynamo.aot_compile import AOTCompiledFunction, aot_compile_fullgraph
         from torch._dynamo.hooks import Hooks
 
         arguments = (self.owner, *args)
-        self._restore(args)
-        for artifact in self.variants:
+        # Snapshot existing variants: restoration appends to the live list.
+        # Check already-loaded guards before reading any further artifacts.
+        for artifact in chain(tuple(self.variants), self._restore(args)):
             defaults_match = _defaults_match(artifact, arguments)
             if defaults_match and artifact.guard_check(*arguments):
                 self.stats["hits"] += 1
@@ -505,6 +512,18 @@ class TensorCallableOwner(torch.nn.Module):
         return self.function(self.method_owner, *arguments, **keywords)
 
 
+def _contract_directory(directory, contract):
+    from vllm_gaudi.compilation.deepseek_v41_cache_identity import frontend_contract_keys
+
+    current, compatible = frontend_contract_keys(contract)
+    directory = Path(directory)
+    for identity in (current, *compatible):
+        root = directory / identity
+        if root.is_dir():
+            return root, identity
+    return directory / current, current
+
+
 def cached_tensor_entry(function, arguments, keywords, *, owner=None):
     """Persist the existing per-contract prefill/protocol compilation boundary."""
     from vllm_gaudi.compilation.deepseek_v41_cache_identity import computation_dependencies, runtime_content_identity
@@ -525,11 +544,11 @@ def cached_tensor_entry(function, arguments, keywords, *, owner=None):
                     model=identity,
                     arguments=_input_signature((arguments, keywords)),
                     torch_version=torch.__version__)
-    key = hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest()
+    root, key = _contract_directory(Path(directory) / "tensor-regions", contract)
     entry = GuardedFrontendEntry(TensorCallableOwner.forward,
                                  proxy,
                                  lookup_backend("hpu_backend"),
-                                 Path(directory) / "tensor-regions" / key / f"rank{cache_rank()}",
+                                 root / f"rank{cache_rank()}",
                                  identity=key)
 
     def call(*args, **kwargs):
@@ -571,9 +590,8 @@ def cached_group_entry(function, group, backend, directory, *, native, shared_co
                     memory_ready=memory_ready)
     if not contract["runtime"] or not contract["serving_identity"]:
         raise RuntimeError("Persistent frontend reuse requires the validated serving runtime and model identity")
-    identity = hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest()
-    root = Path(directory) / identity / f"rank{cache_rank()}"
-    result = GuardedFrontendEntry(function, group, backend, root, identity=identity)
+    root, identity = _contract_directory(directory, contract)
+    result = GuardedFrontendEntry(function, group, backend, root / f"rank{cache_rank()}", identity=identity)
     logger().info("V4.1 guarded frontend indexed: layers=%s cached_variants=%d", contract["layers"],
                   len(result.pending))
     return result

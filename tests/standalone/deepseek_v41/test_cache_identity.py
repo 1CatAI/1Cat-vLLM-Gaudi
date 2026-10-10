@@ -115,7 +115,20 @@ def test_lambda_on_the_final_line_of_a_call_keeps_its_dependency():
     def build(*, generation):
         return generation
 
-    callback = build(
-        generation=lambda: 17)
+    callback = build(generation=lambda: 17)
     assert "Constant(value=17)" in normalized_source(callback)
     assert computation_dependencies(callback, SimpleNamespace())
+
+
+def test_frontend_lookup_policy_keeps_math_identity_and_bounded_legacy_lookup():
+    from vllm_gaudi.compilation.deepseek_v41_cache_identity import frontend_contract_keys
+
+    transport = "module:vllm_gaudi.compilation.deepseek_v41_frontend_cache"
+    contract = dict(sources={"actual_forward": "math-one", transport: "new-lookup-policy"}, model="weights")
+    first = frontend_contract_keys(contract)
+    assert first == frontend_contract_keys(dict(contract, sources={**contract["sources"], transport: "another-policy"}))
+    assert first != frontend_contract_keys(dict(contract, sources={
+        **contract["sources"], "actual_forward": "math-two"
+    }))
+    assert first != frontend_contract_keys(dict(contract, model="different-weights"))
+    assert len(first[1]) == 1

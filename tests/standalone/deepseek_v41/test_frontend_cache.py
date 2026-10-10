@@ -377,9 +377,35 @@ def test_tensor_region_restores_across_process_local_clone_names(tmp_path, monke
     monkeypatch.setattr(registry, "lookup_backend", lambda name: backend)
     inputs = torch.ones((6, 8))
     for name in ("region_1", "region_719"):
-        fn = FunctionType(defaults_transform.__code__.replace(co_name=name), defaults_transform.__globals__,
-                          name, defaults_transform.__defaults__, defaults_transform.__closure__)
+        fn = FunctionType(defaults_transform.__code__.replace(co_name=name), defaults_transform.__globals__, name,
+                          defaults_transform.__defaults__, defaults_transform.__closure__)
         fn.__kwdefaults__ = defaults_transform.__kwdefaults__
-        entry = cached_tensor_entry(fn, (inputs,), {"shift": 1.5})
+        entry = cached_tensor_entry(fn, (inputs, ), {"shift": 1.5})
         assert torch.equal(entry(inputs, shift=1.5), inputs * 2 + 1.5)
     assert len([path for path in tmp_path.rglob("*.bin") if path.parent.name.startswith("rank")]) == 1
+
+
+def test_restore_stops_after_a_matching_guard_and_reuses_loaded_variant(tmp_path):
+    inputs = torch.ones((6, 8))
+    old = StateGroup(1.)
+    captured = GuardedFrontendEntry(StateGroup.forward, old, backend, tmp_path, identity="1" * 64)
+    captured(inputs)
+    manifest = next(tmp_path.glob("*.json"))
+    binary = manifest.with_suffix(".bin")
+    first = tmp_path / "000-first.json"
+    first.write_bytes(manifest.read_bytes())
+    first.with_suffix(".bin").write_bytes(binary.read_bytes())
+    later = tmp_path / "999-later.json"
+    later.write_bytes(manifest.read_bytes())
+    later.with_suffix(".bin").write_bytes(b"unused invalid artifact")
+    manifest.unlink()
+    binary.unlink()
+    fresh = StateGroup(2.)
+    restored = GuardedFrontendEntry(StateGroup.forward, fresh, backend, tmp_path, identity="1" * 64)
+    for value in (1., 2., 3.):
+        inputs.fill_(value)
+        assert torch.equal(restored(inputs)[0], inputs @ fresh.weight)
+    assert restored.stats["captures"] == 0
+    assert restored.stats["restores"] == 1
+    assert len(restored.pending) == 1
+    assert later.exists()

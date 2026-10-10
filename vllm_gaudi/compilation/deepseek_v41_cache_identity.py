@@ -22,8 +22,10 @@ def _source_tree(value):
         # its closing parenthesis. Read the lambda from the complete source;
         # never discard an unparseable computation dependency.
         path = Path(inspect.getsourcefile(value))
-        matches = [node for node in ast.walk(ast.parse(path.read_text()))
-                   if isinstance(node, ast.Lambda) and node.lineno == value.__code__.co_firstlineno]
+        matches = [
+            node for node in ast.walk(ast.parse(path.read_text()))
+            if isinstance(node, ast.Lambda) and node.lineno == value.__code__.co_firstlineno
+        ]
         if len(matches) != 1:
             raise ValueError("Computation dependency has an ambiguous lambda source") from None
         tree = ast.Expression(matches[0])
@@ -55,10 +57,7 @@ def computation_dependencies(function, owner):
         defining = inspect.getmodule(value)
         if defining is None:
             continue
-        names = {
-            node.id
-            for node in ast.walk(_source_tree(value)) if isinstance(node, ast.Name)
-        }
+        names = {node.id for node in ast.walk(_source_tree(value)) if isinstance(node, ast.Name)}
         for used in names:
             dependency = vars(defining).get(used)
             if isinstance(dependency, (FunctionType, type)) and dependency.__module__.startswith("vllm_gaudi."):
@@ -80,6 +79,31 @@ def computation_dependencies(function, owner):
                     result[f"module:{node.module}"] = hashlib.sha256(
                         ast.dump(ast.parse(path.read_text()), include_attributes=False).encode()).hexdigest()
     return result
+
+
+def frontend_contract_keys(contract):
+    """Separate metadata lookup policy from the guarded computation identity.
+
+    TensorCallableOwner and the actual entry/functions remain source-bound.
+    The cache reader's module is transport; its schema validates artifacts.
+    Read the preceding schema's namespace only when all other computation,
+    model, runtime, environment and layout dependencies still match.
+    """
+    sources = dict(contract["sources"])
+    transport = "module:vllm_gaudi.compilation.deepseek_v41_frontend_cache"
+    had_transport = transport in sources
+    sources.pop(transport, None)
+    canonical = dict(contract, sources=sources)
+
+    def digest(value):
+        return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+    current = digest(canonical)
+    if not had_transport:
+        return current, ()
+    previous = dict(sources)
+    previous[transport] = "9f120732e0046d5e193fbc6528ef674522d70b0b6599ca30791ee644f6b16e6e"
+    return current, (digest(dict(contract, sources=previous)), )
 
 
 def relocated_content(value):
@@ -186,7 +210,7 @@ def semantic_environment(environment, *, legacy=False):
     ignored = ("TMPDIR", "HABANA_LOGS", "VLLM_HPU_DSV4_WORKER_CPUS", "VLLM_HPU_DSV4_WORKER_HELPER_CPUS",
                "VLLM_HPU_DSV41_FRONTEND_CACHE_DIR", "PT_HPU_RECIPE_CACHE_CONFIG")
     if not legacy:
-        ignored += ("VLLM_HPU_DSV41_BACKEND_CACHE",)
+        ignored += ("VLLM_HPU_DSV41_BACKEND_CACHE", )
     result = {}
     for key, value in environment.items():
         if key in ignored or not key.startswith(("VLLM_HPU_", "PT_HPU_", "HCCL_", "HCL_")):
