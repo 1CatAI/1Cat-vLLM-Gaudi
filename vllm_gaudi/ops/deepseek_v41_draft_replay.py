@@ -133,6 +133,11 @@ class NativeDraftProtocol(torch.nn.Module):
             states += tuple(self.state_publication.buffers())
         return states
 
+    def capture_snapshot(self):
+        if self.repair_frame is not None:
+            return self.repair_frame.capture_snapshot(self.states, exact_repair=self.full and not self.full_main)
+        return _Snapshot(self.states)
+
     def forward(self, hidden, proposed, control, auxiliary, positions, *sampling):
         if self.closed:
             raise RuntimeError("A retired speculative control plan cannot be replayed")
@@ -192,7 +197,7 @@ class NativeDraftProtocol(torch.nn.Module):
         fixed_roots = dict(roots, hidden_states=fixed_hidden, input_ids=fixed_proposed, positions=fixed_positions,
                            metadata=self.metadata, state_tensors=self.states)
         with collect_prepared_group_replays(owner=self, adapter=self.adapter,
-                                           snapshot=lambda: _Snapshot(self.states), **fixed_roots) as context:
+                                           snapshot=self.capture_snapshot, **fixed_roots) as context:
             context["group_index"] = 0
             values = self.compiled(*self.fixed)
             record_native_decoder_outputs(values[0], None, *values[1:])
@@ -208,7 +213,9 @@ class NativeDraftProtocol(torch.nn.Module):
         """Discover cold recipes, then capture the complete warmed control plan."""
         # The capture invokes publication too. Preserve its request cursor
         # and input staging allocations during cold discovery and warmup.
-        initial = _Snapshot(tuple({id(value): value for value in (*self.states, *self.mutable_states())}.values()))
+        states = tuple({id(value): value for value in (*self.states, *self.mutable_states())}.values())
+        initial = (self.repair_frame.capture_snapshot(states, exact_repair=self.full and not self.full_main)
+                   if self.repair_frame is not None else _Snapshot(states))
         try:
             # Cold recipe discovery may flush an incomplete prefix. As for
             # StageReplay, capture requires a subsequent complete invocation.
