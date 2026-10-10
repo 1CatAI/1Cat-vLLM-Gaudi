@@ -28,7 +28,9 @@ def main():
     from vllm_gaudi.v1.core.sched.hpu_async_scheduler import HPUAsyncScheduler
     from vllm_gaudi.v1.worker.deepseek_v41_runner import target_chunks
     from vllm_gaudi.ops.deepseek_v41_decoder_halo import decoder_halo_mode
-    from vllm_gaudi.ops.deepseek_v41_prefill_capacity import prefill_capacity
+    from vllm_gaudi.ops.deepseek_v41_prefill_capacity import (
+        prefill_capacity, prefill_target_tokens, reserve_dspark_input_slots,
+    )
 
     tiny = args.output / 'scheduler-only-model'
     OPTConfig(architectures=['OPTForCausalLM'], hidden_size=32, ffn_dim=64,
@@ -39,7 +41,7 @@ def main():
         raise ValueError('Use the saved exact 16K formal prompt token IDs')
     reports = []
     for label, dspark, budget in [('C1', False, 16384), ('DSpark-current', True, 16384),
-                                  ('DSpark-separate-slot-budget', True, 16388)]:
+                                  ('DSpark-separate-slot-budget', True, 16384)]:
         config = VllmConfig(
             model_config=ModelConfig(model=str(tiny), dtype='float16', max_model_len=262144),
             parallel_config=ParallelConfig(),
@@ -58,6 +60,10 @@ def main():
                                     disable_eagle_block_drop=True).items():
                 object.__setattr__(spec, name, value)
             config.speculative_config = spec
+        if label == 'DSpark-separate-slot-budget':
+            reserve_dspark_input_slots(config)
+            # Engine/worker deserialization must not reserve the slots twice.
+            reserve_dspark_input_slots(config)
         config.cache_config.num_gpu_blocks = 2056
         register_all_kvcache_specs(config)
         cache = KVCacheConfig(num_blocks=2056, kv_cache_tensors=[],
@@ -88,8 +94,9 @@ def main():
                 break
             scheduler.update_from_output(scheduled, ModelRunnerOutput(
                 req_ids=[label], req_id_to_index={label: 0}, sampled_token_ids=[[]]))
-        reports.append(dict(profile=label, admission_budget=budget,
-                            worker_prefill_capacity=prefill_capacity(budget, 4),
+        reports.append(dict(profile=label, admission_budget=config.scheduler_config.max_num_batched_tokens,
+                            target_compute_budget=prefill_target_tokens(config.scheduler_config),
+                            worker_prefill_capacity=prefill_capacity(prefill_target_tokens(config.scheduler_config), 4),
                             draft_slots=config.speculative_config.max_num_new_slots_for_drafting if dspark else 0,
                             schedule=rounds, worker_calls=sum(r['worker_calls'] for r in rounds),
                             scalar_calls=sum(r['scalar_calls'] for r in rounds)))

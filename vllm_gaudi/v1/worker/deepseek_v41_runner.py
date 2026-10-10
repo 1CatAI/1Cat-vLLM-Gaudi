@@ -46,6 +46,7 @@ from vllm_gaudi.ops.deepseek_v41_prefill_capacity import (
     PREFILL_COMPUTE_BUCKETS,  # noqa: F401 - compatibility export for existing callers.
     prefill_capacity,
     prefill_compute_buckets,
+    prefill_target_tokens,
 )
 
 logger = init_logger()
@@ -1015,7 +1016,7 @@ class V41ModelRunner:
         self.model_memory_usage = self.mem_margin = 0
         self.serving_workspace_reserve = (3 << 30) if self.model_config.max_model_len > 512 else 0
         self.prefill_capacity = prefill_capacity(
-            vllm_config.scheduler_config.max_num_batched_tokens, vllm_config.parallel_config.tensor_parallel_size
+            prefill_target_tokens(vllm_config.scheduler_config), vllm_config.parallel_config.tensor_parallel_size
         )
         self.pp = PPBuffers(
             self.device,
