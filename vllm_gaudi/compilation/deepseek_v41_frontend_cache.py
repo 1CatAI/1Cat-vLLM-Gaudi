@@ -120,6 +120,35 @@ def _capture_tensor_attributes(artifact, arguments):
     return result
 
 
+def _owner_scalar_guards(guards):
+    """Index existing equality guards without loading executable frontends."""
+    saved = {"L": guards.output_graph.local_scope, "G": guards.output_graph.global_scope}
+    result = {}
+    for guard in guards.output_graph.guards:
+        create = getattr(guard.create_fn, "func", guard.create_fn)
+        if getattr(create, "__name__", "") not in ("EQUALS_MATCH", "CONSTANT_MATCH", "BOOL_MATCH"):
+            continue
+        source = guard.originating_source
+        if source is None or not source.name.startswith("L['self']"):
+            continue
+        try:
+            result[source.name] = _default_signature(eval(source.name, saved))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            continue
+    return result
+
+
+def _owner_scalars_match(owner, globals_, expected):
+    scope = {"L": {"self": owner}, "G": globals_}
+    try:
+        # Search geometry rejects incompatible variants before their many
+        # unchanged model/configuration scalar guards need evaluation.
+        ordered = sorted(expected.items(), key=lambda pair: not pair[0].endswith(".search_length"))
+        return all(_default_signature(eval(name, scope)) == value for name, value in ordered)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+
+
 def _defaults_match(artifact, arguments):
     try:
         return all(
@@ -338,7 +367,8 @@ class GuardedFrontendEntry:
     def _restore(self, args):
         signature = _input_signature(args)
         for binary, record in tuple(self.pending):
-            if record["inputs"] != signature:
+            if record["inputs"] != signature or not _owner_scalars_match(self.owner, self.function.__globals__,
+                                                                         record.get("owner_scalars", {})):
                 continue
             data = binary.read_bytes()
             if hashlib.sha256(data).hexdigest() != record["sha256"]:
@@ -390,6 +420,7 @@ class GuardedFrontendEntry:
                       sha256=hashlib.sha256(data).hexdigest(),
                       defaults=artifact._frontend_defaults,
                       tensor_attributes=artifact._frontend_tensor_attributes,
+                      owner_scalars=_owner_scalar_guards(_source_loads(artifact._artifacts.guards_state)),
                       inputs=_input_signature(args))
         temporary.write_text(json.dumps(record, sort_keys=True) + "\n")
         temporary.replace(binary.with_suffix(".json"))

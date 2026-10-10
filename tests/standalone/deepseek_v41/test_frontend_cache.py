@@ -103,12 +103,13 @@ def test_restored_tensor_qualification_keeps_current_weights_and_guards(tmp_path
 
 class BucketGroup(torch.nn.Module):
 
-    def __init__(self, value):
+    def __init__(self, value, search_length=8):
         super().__init__()
         self.register_buffer("weight", torch.full((8, 8), value))
+        self.search_length = search_length
 
     def forward(self, inputs):
-        return inputs @ self.weight
+        return (inputs @ self.weight) * self.search_length
 
 
 def test_only_matching_input_bucket_is_restored(tmp_path):
@@ -119,10 +120,24 @@ def test_only_matching_input_bucket_is_restored(tmp_path):
     fresh = BucketGroup(2.)
     restored = GuardedFrontendEntry(BucketGroup.forward, fresh, backend, tmp_path, identity="1" * 64)
     assert restored.stats["restores"] == 0
-    assert torch.equal(restored(torch.ones((6, 8))), torch.full((6, 8), 16.))
+    assert torch.equal(restored(torch.ones((6, 8))), torch.full((6, 8), 128.))
     assert restored.stats["restores"] == 1
     assert restored.stats["captures"] == 0
     assert len(restored.pending) == 2
+
+
+def test_owner_search_bucket_is_indexed_before_restore(tmp_path):
+    inputs = torch.ones((6, 8))
+    for search in (8, 16, 32):
+        owner = BucketGroup(1., search)
+        entry = GuardedFrontendEntry(BucketGroup.forward, owner, backend, tmp_path, identity="1" * 64)
+        entry(inputs)
+    fresh = BucketGroup(2., 32)
+    entry = GuardedFrontendEntry(BucketGroup.forward, fresh, backend, tmp_path, identity="1" * 64)
+    assert torch.equal(entry(inputs), torch.full((6, 8), 512.))
+    assert entry.stats["restores"] == 1
+    assert entry.stats["captures"] == 0
+    assert len(entry.pending) == 2
 
 
 def test_restored_nested_keyword_defaults_keep_live_callable_unchanged(tmp_path):
