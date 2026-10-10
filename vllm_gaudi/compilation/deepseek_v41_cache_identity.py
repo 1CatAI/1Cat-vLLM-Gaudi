@@ -38,15 +38,15 @@ def normalized_source(value):
 
 
 @lru_cache(maxsize=512)
-def _python_source_digest(path, device, inode, size, modified, changed):
-    return hashlib.sha256(ast.dump(ast.parse(Path(path).read_text()), include_attributes=False).encode()).hexdigest()
+def _python_source_digest(source):
+    return hashlib.sha256(ast.dump(ast.parse(source), include_attributes=False).encode()).hexdigest()
 
 
 def python_source_digest(path):
-    """Reuse immutable source normalization while tracking every file revision."""
-    path = Path(path)
-    stat = path.stat()
-    return _python_source_digest(str(path), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    """Reuse source normalization by content, including same-timestamp edits."""
+    # Filesystems can coalesce ctime updates for back-to-back writes. Read
+    # source text to identify revisions; reuse the expensive AST conversion.
+    return _python_source_digest(Path(path).read_text())
 
 
 @lru_cache(maxsize=512)
