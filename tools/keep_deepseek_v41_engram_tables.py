@@ -28,8 +28,25 @@ def main():
         signal.signal(signum, lambda *_: stopped.set())
     args.output.mkdir(parents=True, exist_ok=True)
     manifest = args.output / "ready.json"
+    boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+
+    def process_start(pid):
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+
     if manifest.exists():
-        raise RuntimeError("Use a fresh owner directory; never overwrite a live backing manifest")
+        previous = json.loads(manifest.read_text())
+        try:
+            alive = (previous.get("boot_id") == boot_id
+                     and process_start(previous["pid"]) == previous.get("process_start"))
+        except ProcessLookupError:
+            alive = False
+        except FileNotFoundError:
+            alive = False
+        if alive:
+            raise RuntimeError("Never overwrite a live backing manifest")
+        # A dead owner has no retained descriptors. Establish fresh backings;
+        # never reuse its file names as though the allocations still existed.
+        manifest.unlink()
     owners = table_regions(args.prepared)
     layers = tuple(sorted({owner["layer"] for owner in owners}))
     tables = EngramResidency(owners, args.budget_gib * 1024**3, device_layers=layers)
@@ -38,7 +55,8 @@ def main():
         tables.start(cancel=stopped)
         if stopped.is_set():
             return
-        record = dict(schema=1, pid=os.getpid(), model=str(args.prepared.resolve()),
+        record = dict(schema=1, pid=os.getpid(), boot_id=boot_id, process_start=process_start(os.getpid()),
+                      model=str(args.prepared.resolve()),
                       started_at=started, ready_at=time.time(), bindings=tables.worker_bindings())
         temporary = args.output / "ready.tmp"
         temporary.write_text(json.dumps(record, indent=2) + "\n")
