@@ -162,6 +162,9 @@ def main():
         # A configured tmpfs scratch directory must be recreated after reboot.
         temporary_path = Path(compiler_temp).expanduser()
         compiler_temp = str((temporary_path if temporary_path.is_absolute() else root / temporary_path).resolve())
+        from run_deepseek_v41 import ipc_scratch_path
+
+        compiler_temp = str(ipc_scratch_path(compiler_temp, root))
         Path(compiler_temp).mkdir(mode=0o700, parents=True, exist_ok=True)
     allocation = settings["cpu_allocation"]
     reserved = set(allocation["worker_main"] + allocation["engine_main"] + allocation["api_main"] +
