@@ -81,3 +81,18 @@ def test_inline_snapshot_rejects_missing_or_incompatible_producers_without_live_
     with pytest.raises(ValueError, match="complete stage"):
         BatchPrefixSnapshot.capture(bank, source, 16256, b"hash", Event(), record_done=Event, state_tensors={})
     assert all(torch.equal(a, b) for a, b in zip(live, slot_values(bank, source), strict=True))
+
+
+@pytest.mark.parametrize("start,end,boundary", [(0, 16384, 16256), (16384, 32768, 32640), (0, 1024, 896)])
+def test_inline_draft_context_retains_boundary_instead_of_live_end(start, end, boundary):
+    bank, source, _, _ = make_bank()
+    capture = InlinePrefixCapture(bank, source, start, end, boundary)
+    positions = torch.arange(boundary - 256, end, dtype=torch.int32)
+    for layer in (37, 38, 39):
+        values = (positions[:, None] + layer).float().expand(-1, 4).clone()
+        capture.record_draft(layer, values, 256)
+        values.zero_()
+    expected = torch.cat([(torch.arange(boundary - 256, boundary)[:, None] + layer).float().expand(-1, 4)
+                          for layer in (37, 38, 39)], -1)
+    assert torch.equal(capture.draft_context(), expected)
+    assert not torch.equal(expected[-1], torch.full((12,), end - 1.))

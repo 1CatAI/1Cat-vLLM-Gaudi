@@ -68,3 +68,29 @@ def test_zero_disables_trace_even_for_a_matching_request(monkeypatch):
     monkeypatch.setattr(trace.torch.hpu, "Event", unexpected_event)
     assert not trace.begin("chatcmpl-phase-disabled", 1, 16384, 0, 0)
     assert trace._completed == 0 and trace._active is None
+
+
+def test_host_only_never_allocates_or_waits_on_a_device_event(monkeypatch, tmp_path):
+    monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_EVENT_TRACE", str(tmp_path))
+    monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_HOST_ONLY", "1")
+    monkeypatch.setattr(trace, "_active", None)
+    monkeypatch.setattr(trace, "_completed", 0)
+    monkeypatch.setattr(trace.torch.hpu, "memory_allocated", lambda: 1024)
+    monkeypatch.setattr(trace.torch.hpu, "max_memory_allocated", lambda: 2048)
+
+    def unexpected_event(**kwargs):
+        raise AssertionError("Host-only tracing must not use the native replay's event pool")
+
+    monkeypatch.setattr(trace.torch.hpu, "Event", unexpected_event)
+    assert trace.begin("chatcmpl-host", 1, 16384, 0, 0)
+    with trace.span("layer", layer=20, rows=16384):
+        with trace.span("attention", layer=20, rows=16384):
+            pass
+    trace.finish()
+    result = json.loads(next(tmp_path.glob("*.json")).read_text())
+    assert result["device_ms"] is None
+    assert trace._completed == 1 and trace._active is None
+    for span in result["spans"]:
+        assert span["host_end_ns"] >= span["host_start_ns"]
+        assert span["thread_cpu_end_ns"] >= span["thread_cpu_start_ns"]
+        assert "device_duration_ms" not in span

@@ -97,8 +97,11 @@ def test_decode_geometry_rebinds_after_prefill_generation_and_search_changes():
     assert len(uploads) == 5
 
 
-@pytest.mark.parametrize("position,search", [(384, 512), (2048, 2560), (16384, 32768)])
-def test_scalar_prefill_slot_handoff_precedes_native_replay(position, search):
+@pytest.mark.parametrize("dspark,position,search", [
+    (False, 384, 512), (False, 2048, 2560), (False, 16384, 32768),
+    (True, 384, 512), (True, 2048, 4096), (True, 16384, 32768), (True, 259968, 262144),
+])
+def test_scalar_prefill_slot_handoff_precedes_native_replay(dspark, position, search):
     from vllm_gaudi.v1.worker.deepseek_v41_runner import V41ModelRunner
 
     calls = []
@@ -118,11 +121,11 @@ def test_scalar_prefill_slot_handoff_precedes_native_replay(position, search):
     runner.prefix_checkpoints = object()
     runner.model = Model()
     runner.model.program = SimpleNamespace(length=1048576, generation=1, tensor_parallel_size=4,
-                                           runtime_indexer=True, layers=[])
+                                           runtime_indexer=not dspark, layers=[])
     owner = object()
     runner.model.batch_state = SimpleNamespace(acquire=lambda name: owner,
                                                bind_single=lambda slot, position: calls.append((slot, position)))
-    runner.use_dspark = runner.direct_token_ids = False
+    runner.use_dspark, runner.direct_token_ids = dspark, False
     runner.input_views = {1: torch.empty(1, dtype=torch.int64)}
     runner.position_views = {1: torch.empty(1, dtype=torch.int32)}
     runner.position_bank = runner._next_input = None
@@ -135,8 +138,12 @@ def test_scalar_prefill_slot_handoff_precedes_native_replay(position, search):
     runner.pp = SimpleNamespace(group=SimpleNamespace(is_first_rank=True, is_last_rank=True))
     runner.audit = {"target_steps": 0, "target_tokens": 0, "prefill_steps": 0}
     runner._image_embeddings = lambda *_: None
-    runner._forward("cached", [42], position, decode=False, request=object(), search_length=search)
+    # A DSpark prompt transaction may use the 2560-row hot index bucket;
+    # its scalar tail must select the already-captured C1 decode geometry.
+    prompt_search = 2560 if dspark and position == 2048 else search
+    runner._forward("cached", [42], position, decode=False, request=object(), search_length=prompt_search)
     assert calls == [(owner, position), "replay"]
+    assert runner.model.program.search_length == search
 
 
 @pytest.mark.parametrize("start,stop", [(0, 0), (0, 2), (2, 5), (4, 5), (4, 9), (9, 12)])

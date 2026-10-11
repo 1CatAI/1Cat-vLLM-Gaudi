@@ -46,6 +46,7 @@ from vllm_gaudi.ops.deepseek_v41_prefill_capacity import (
     PREFILL_COMPUTE_BUCKETS,  # noqa: F401 - compatibility export for existing callers.
     prefill_capacity,
     prefill_compute_buckets,
+    prefill_target_tokens,
 )
 
 logger = init_logger()
@@ -256,7 +257,7 @@ def prefill_search_length(start, count, maximum, *, reuse_index_keys=False):
     return search
 
 
-def decode_search_warmups(maximum, *, runtime_indexer=False):
+def decode_search_warmups(maximum, *, runtime_indexer=False, native_visible_prefixes=False):
     """Yield one valid position per decode graph geometry."""
     if runtime_indexer:
         hot = min(maximum, INDEX_MME_HOT_TOKENS)
@@ -281,6 +282,14 @@ def decode_search_warmups(maximum, *, runtime_indexer=False):
     while start < maximum:
         search = target_search_length(start, 1, maximum)
         yield start, search
+        if native_visible_prefixes and search <= 32768:
+            from vllm_gaudi.ops.deepseek_v41_config import decode_source_window_quantum
+
+            # Search length alone does not identify a native recipe: its
+            # visible-prefix bound changes within the finite search bucket.
+            for position in range(start + decode_source_window_quantum(search), search,
+                                  decode_source_window_quantum(search)):
+                yield position, search
         start = search
 
 
@@ -1007,7 +1016,7 @@ class V41ModelRunner:
         self.model_memory_usage = self.mem_margin = 0
         self.serving_workspace_reserve = (3 << 30) if self.model_config.max_model_len > 512 else 0
         self.prefill_capacity = prefill_capacity(
-            vllm_config.scheduler_config.max_num_batched_tokens, vllm_config.parallel_config.tensor_parallel_size
+            prefill_target_tokens(vllm_config.scheduler_config), vllm_config.parallel_config.tensor_parallel_size
         )
         self.pp = PPBuffers(
             self.device,
@@ -1417,7 +1426,11 @@ class V41ModelRunner:
     def uses_framework_kv_cache_layout(self, name):
         return name in self.state.specs
 
+    @torch.inference_mode(False)
     def allocate_framework_kv_cache_layer(self, spec, num_blocks):
+        # The worker invokes profiling under inference_mode, whereas the
+        # scheduler's persistent allocation is ordinary. Preserve the same
+        # dispatch/alias contract through both phases and across cache restore.
         return torch.zeros((num_blocks, *spec.state_shape), device=self.device, dtype=spec.state_dtype)
 
     def profile_kv_cache_blocks(self):
@@ -1682,7 +1695,7 @@ class V41ModelRunner:
         c1_replay = (
             getattr(self.model, "native", False)
             and count == 1
-            and (getattr(program, "runtime_indexer", False) or start + count <= 1024)
+            and (self.use_dspark or getattr(program, "runtime_indexer", False) or start + count <= 1024)
         )
         graph_c1 = decode or c1_replay
         if self.request_slots_enabled and request is not None and not decode and c1_replay:
@@ -1697,12 +1710,17 @@ class V41ModelRunner:
                 raise ValueError("Direct V4.1 token binding requires a C1 transaction")
             ids = self.decode_ids
         if program is not None and program.length > 512:
-            if search_length is not None:
+            # Scalar prompt tails consume the same finite geometry as native
+            # decode. DSpark prewarms power-of-two C1 searches; a larger prompt
+            # transaction can instead use a non-power-of-two hot index bucket.
+            # Keep that prompt geometry on its large tiles, outside C1 replay.
+            native_scalar_search = c1_replay and not decode and not getattr(program, "runtime_indexer", False)
+            if search_length is not None and not native_scalar_search:
                 search = int(search_length)
-            elif not getattr(program, "runtime_indexer", False):
-                search = target_search_length(start, count, program.length)
             elif graph_c1:
-                search = runtime_search_length(start, count, program.length)
+                search = (runtime_search_length(start, count, program.length)
+                          if getattr(program, "runtime_indexer", False)
+                          else target_search_length(start, count, program.length))
             else:
                 search = prefill_search_length(
                     start, count, program.length, reuse_index_keys=envs.VLLM_HPU_DSV41_PREFILL_REINDEX_REUSE
@@ -1812,9 +1830,8 @@ class V41ModelRunner:
             else:
                 positions.copy_(torch.arange(start, start + count, dtype=torch.int32, device="cpu"))
         self._round_phase("inputs_staged_ns")
-        # Slot-owned scalar C1 tails have already published their state to
-        # the fixed replay addresses. They use the same warmed search buckets
-        # as decode; the legacy prompt/DSpark path keeps its bounded capture.
+        # Slot-owned scalar tails have already published their state to the
+        # fixed C1 replay addresses for ordinary and speculative requests.
         use_replay = (
             getattr(self.model, "native", False)
             or (self.v2_completion and getattr(self.model, "tensor_parallel_size", 2) == 4)
@@ -2288,17 +2305,12 @@ class V41ModelRunner:
                     and len(scheduled.num_scheduled_tokens) == 1
                     and not request.mm_features
                     and getattr(request.sampling_params, "prompt_logprobs", None) is None
-                    and not self.use_dspark
                 ),
             )
         program = getattr(self.model, "program", None)
         transaction_search = (
-            (
-                prefill_search_length(
-                    start, count, program.length, reuse_index_keys=envs.VLLM_HPU_DSV41_PREFILL_REINDEX_REUSE
-                )
-                if getattr(program, "runtime_indexer", False)
-                else target_search_length(start, count, program.length)
+            prefill_search_length(
+                start, count, program.length, reuse_index_keys=envs.VLLM_HPU_DSV41_PREFILL_REINDEX_REUSE
             )
             if not decode and program is not None and program.length > 512
             else None
@@ -2316,7 +2328,6 @@ class V41ModelRunner:
                     len(request.prompt),
                     eligible=(
                         envs.VLLM_HPU_DSV41_PREFILL_DECODER_HALO
-                        and not self.use_dspark
                         and (not tp4_halo or self.prefill_capacity == 16384)
                         and (tp4_halo or (start == 0 and count == len(request.prompt)))
                         and max(prefill_compute_buckets(self.prefill_capacity), default=1) == halo_block
@@ -2952,7 +2963,7 @@ class V41ModelRunner:
         return value if self.pp.group.is_last_rank else None
 
     @torch.inference_mode()
-    def _dummy_run(self, tokens, *, native=False, start_position=0):
+    def _dummy_run(self, tokens, *, native=False, start_position=0, prefill=False):
         logger.info(
             "V4.1 PP%d C%d warmup target start (native=%s, preceding steps=%d)",
             self.model.pp_rank,
@@ -2972,7 +2983,8 @@ class V41ModelRunner:
             "__v41_warmup__",
             [1 + index for index in range(tokens)],
             start_position,
-            decode=(native or getattr(self.model, "tensor_parallel_size", 2) == 4) and (self.use_dspark or tokens == 1),
+            decode=(not prefill and (native or getattr(self.model, "tensor_parallel_size", 2) == 4)
+                    and tokens <= (6 if self.use_dspark else 1)),
             reset=True,
         )
         from vllm_gaudi.ops.tp2_prepared_plan import prepared_group_stats
@@ -3081,7 +3093,7 @@ class V41ModelRunner:
                     torch.hpu.synchronize()
                     torch.hpu.reset_peak_memory_stats()
                 if isinstance(self.state, PagedStageState):
-                    warmup_buckets = prefill_compute_buckets()
+                    warmup_buckets = prefill_compute_buckets(self.prefill_capacity)
                     geometries = (0, min(INDEX_MME_HOT_TOKENS, self.model_config.max_model_len - 1))
                     for start_position in geometries:
                         for tokens in warmup_buckets:
@@ -3158,12 +3170,22 @@ class V41ModelRunner:
             # Profile-time pages are replaced by the scheduler pool before
             # this entry. Warm the actual serving tensor contracts, including
             # tail tiles in later search buckets, before freezing executors.
-            for start, count in prefill_search_warmups(
-                    self.model_config.max_model_len, self.prefill_capacity,
-                    reuse_index_keys=envs.VLLM_HPU_DSV41_PREFILL_REINDEX_REUSE):
-                logger.info("V4.1 PP%d warming serving C%d prefill at position %d",
-                            self.model.pp_rank, count, start)
-                self._dummy_run(count, start_position=start)
+            bank = self.model.batch_state
+            owner = "__v41_serving_prefill_warmup__"
+            slot = bank.acquire(owner)
+            pages = min(bank.pages.shape[1], self.state.blocks - 1)
+            bank.publish_pages(slot, range(1, pages + 1), self.state.blocks)
+            try:
+                for start, count in prefill_search_warmups(
+                        self.model_config.max_model_len, self.prefill_capacity,
+                        reuse_index_keys=envs.VLLM_HPU_DSV41_PREFILL_REINDEX_REUSE):
+                    bank.bind_prefill(slot)
+                    logger.info("V4.1 PP%d warming serving C%d prefill at position %d",
+                                self.model.pp_rank, count, start)
+                    self._dummy_run(count, start_position=start, prefill=True)
+            finally:
+                bank.restore_single_bindings()
+                bank.release(owner)
         if getattr(self, "prefix_checkpoints", None) is not None and self.prefill_capacity > 8192:
             from vllm_gaudi.ops.deepseek_v41_prefix_state import InlinePrefixCapture
 
@@ -3177,7 +3199,7 @@ class V41ModelRunner:
             program.shared.inline_prefix_capture = capture
             program.prefill_halo_mode = "final" if program.stop == 40 else "full"
             try:
-                self._dummy_run(count)
+                self._dummy_run(count, prefill=True)
                 capture.require_complete()
                 bank.bind_single(slot, count)
                 logger.info("V4.1 PP%d warmed slot-owned prefill and %d inline prefix states",
@@ -3198,7 +3220,8 @@ class V41ModelRunner:
         for count in ((1, 6) if self.use_dspark else (1, )):
             runtime = count == 1 and getattr(self.model.program, "runtime_indexer", False)
             paged_dspark = self.use_dspark and isinstance(self.state, PagedStageState)
-            geometries = (tuple(decode_search_warmups(self.model.program.length, runtime_indexer=runtime))
+            geometries = (tuple(decode_search_warmups(self.model.program.length, runtime_indexer=runtime,
+                                                     native_visible_prefixes=self.model.native))
                           if runtime or paged_dspark else ((0, 512), ))
             additional = getattr(getattr(self, "vllm_config", None), "additional_config", {}) or {}
             geometries = select_native_warmup_geometries(geometries, additional)
@@ -3219,7 +3242,8 @@ class V41ModelRunner:
             # Otherwise a healthy stream pauses for compilation at each new
             # bucket, and already-warmed buckets remain untested at startup.
             for start, search in decode_search_warmups(
-                self.model.program.length, runtime_indexer=getattr(self.model.program, "runtime_indexer", False)
+                self.model.program.length, runtime_indexer=getattr(self.model.program, "runtime_indexer", False),
+                native_visible_prefixes=True
             ):
                 if start == 0:
                     continue
@@ -3241,7 +3265,9 @@ class V41ModelRunner:
             for count in (2, 3, 4, 5):
                 self._insert(self.model.last_aux[:count], self.positions[:count])
             torch.hpu.synchronize()
+        logger.info("V4.1 starting sampling protocol preparation")
         self._warm_device_round_inputs()
+        logger.info("V4.1 sampling protocol preparation complete")
         self.pp.group.barrier()
         self.state.clear()
         self.active_request = None

@@ -11,6 +11,50 @@ import subprocess
 import time
 
 _leases = []
+_borrowed_tables = []
+
+
+def reuse_recipe_bundle(cache, identity, profile, compatibility):
+    """Retain SDK recipes across the path-certificate schema transition.
+
+    Frontend guards and lowered modules keep their independent computation
+    identities. Only SDK recipes use the certified equivalent namespace;
+    their ordinary graph/recipe validation remains in the SDK.
+    """
+    from vllm_gaudi.compilation.deepseek_v41_cache_identity import runtime_content_identity
+
+    previous = Path(compatibility["directory"]).resolve()
+    if previous.parent != cache.parent.resolve():
+        raise ValueError("Recipe compatibility must belong to the same cache root")
+    record = json.loads((previous / "identity.json").read_text())
+    prior_profile = json.loads(Path(compatibility["runtime_profile"]).read_text())
+    if (record.get("schema") != identity["schema"] or record.get("model") != identity["model"]
+            or record.get("arguments") != identity["arguments"] or record.get("runtime")
+            not in (runtime_content_identity(prior_profile, legacy=True), runtime_content_identity(prior_profile))
+            or runtime_content_identity(prior_profile) != runtime_content_identity(profile)):
+        raise ValueError("Previous recipe bundle differs in model, runtime or serving contract")
+    retained = 0
+    for rank in previous.glob("rank[0-9]*"):
+        if not rank.is_dir() or not rank.name[4:].isdecimal():
+            continue
+        destination = cache / rank.name
+        # The SDK rejects symlink cache directories. Share immutable recipe
+        # bytes through ordinary hardlinked files, retaining independent names.
+        if destination.is_symlink():
+            if destination.resolve() != rank.resolve():
+                raise ValueError("Recipe destination points to an unrelated bundle")
+            destination.unlink()
+        destination.mkdir(exist_ok=True)
+        for source in rank.rglob("*"):
+            target = destination / source.relative_to(rank)
+            if source.is_symlink():
+                raise ValueError("Recipe compatibility contains a symbolic link")
+            if source.is_dir():
+                target.mkdir(exist_ok=True)
+            elif source.is_file() and not target.exists():
+                os.link(source, target)
+        retained += 1
+    return retained
 
 
 def prepare_serving_resources(settings, model, arguments):
@@ -42,6 +86,19 @@ def prepare_serving_resources(settings, model, arguments):
                 if not wait:
                     raise RuntimeError(f"HPU module {module} already has an owner")
                 time.sleep(1)
+    reused_bytes = 0
+    if manifest := settings.get("engram_shared_table_manifest"):
+        from vllm_gaudi.ops.deepseek_v41_borrowed_tables import BorrowedEngramTables
+
+        try:
+            tables = BorrowedEngramTables(model, manifest)
+        except (OSError, ValueError, KeyError, RuntimeError) as error:
+            print(f"Shared Engram backing rejected; rebuilding with full host budget: {error}", flush=True)
+        else:
+            _borrowed_tables.append(tables)
+            settings["engram_resident_tables"] = tables.bindings
+            reused_bytes = tables.reused_bytes
+            print(f"Shared Engram reuse validated: {reused_bytes} resident bytes; no duplicate allocation", flush=True)
     minimum = settings.get("min_host_available_gib", 0)
     while minimum:
         memory = {
@@ -49,7 +106,7 @@ def prepare_serving_resources(settings, model, arguments):
             for line in Path("/proc/meminfo").read_text().splitlines()
         }
         available = memory["MemAvailable"] / 1048576
-        if available >= minimum:
+        if available + reused_bytes / 2**30 >= minimum:
             break
         if not wait:
             raise RuntimeError(f"Serving requires {minimum} GiB available host RAM; found {available:.1f}")
@@ -57,6 +114,7 @@ def prepare_serving_resources(settings, model, arguments):
     if cpus := settings.get("cpus"):
         os.sched_setaffinity(0, set(cpus))
     if cache_dir := settings.get("recipe_cache_dir"):
+        from vllm_gaudi.compilation.deepseek_v41_cache_identity import runtime_content_identity, stable_serving_contract
         package = Path(__file__).resolve().parents[1]
         engine = Path(importlib.util.find_spec("vllm").origin).resolve().parents[1]
         sources = {
@@ -79,16 +137,36 @@ def prepare_serving_resources(settings, model, arguments):
             }
             engine_patch = json.dumps(engine_sources, sort_keys=True).encode()
             engine_head = "materialized"
-        identity = {
-            "sources": sources,
-            "arguments": arguments,
-            "engine_head": engine_head,
-            "engine_diff": hashlib.sha256(engine_patch).hexdigest(),
-            "runtime": os.environ.get("DSV41_SERVING_RUNTIME"),
-            "model": hashlib.sha256((Path(model) / "manifest.json").read_bytes()).hexdigest()
-        }
+        runtime_identity = os.environ.get("DSV41_SERVING_RUNTIME")
+        runtime_profile = None
+        if profile := os.environ.get("DSV41_RUNTIME_PROFILE"):
+            runtime_profile = json.loads(Path(profile).read_text())
+            runtime_identity = runtime_content_identity(runtime_profile)
+        identity = stable_serving_contract(model, runtime_identity, arguments)
+        # Archive the complete source inventory separately from the reusable
+        # runtime namespace. Individual guarded entries bind their actual
+        # computation dependencies, so unrelated edits do not flush all keys.
         digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+        os.environ["DSV41_SERVING_COMPILE_IDENTITY"] = digest
         cache = Path(cache_dir) / digest
         cache.mkdir(parents=True, exist_ok=True)
+        if compatibility := settings.get("recipe_cache_compatibility"):
+            try:
+                if runtime_profile is None:
+                    raise ValueError("Recipe migration requires a validated runtime profile")
+                retained = reuse_recipe_bundle(cache, identity, runtime_profile, compatibility)
+                print(f"Equivalent SDK recipe bundle retained: {retained} rank directories", flush=True)
+            except (OSError, KeyError, ValueError) as error:
+                print(f"Recipe compatibility rejected; rebuilding affected recipes: {error}", flush=True)
+        if runtime_profile is not None:
+            (cache / "runtime-profile.json").write_text(json.dumps(runtime_profile, indent=2) + "\n")
         os.environ["PT_HPU_RECIPE_CACHE_CONFIG"] = f"{cache / 'rank{rank}'},false,8192,false"
+        # Native entries restore guarded frontend graphs before rebinding this
+        # process's tensors, recipes and communication resources. An empty
+        # explicit value remains a diagnostic way to disable frontend reuse.
+        os.environ.setdefault("VLLM_HPU_DSV41_FRONTEND_CACHE_DIR", str(cache / "frontend"))
         (cache / "identity.json").write_text(json.dumps(identity, indent=2) + "\n")
+        (cache / "source-inventory.json").write_text(
+            json.dumps(dict(
+                sources=sources, engine_head=engine_head, engine_diff=hashlib.sha256(engine_patch).hexdigest()),
+                       indent=2) + "\n")

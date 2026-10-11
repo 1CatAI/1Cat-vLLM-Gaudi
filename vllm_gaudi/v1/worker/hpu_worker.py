@@ -973,11 +973,24 @@ class HPUWorker(WorkerBase):
             fake_hpu_cache_alloc = 4 * 2**30  # take 4 GiB flat on fake hpu
             return fake_hpu_cache_alloc
         workspace_reserve = int(getattr(self.model_runner, "serving_workspace_reserve", 0))
+        certificate = None
+        cached_headroom = None
+        if self.model_config.hf_config.model_type == "deepseek_v41" and workspace_reserve:
+            from vllm_gaudi.compilation.deepseek_v41_memory_certificate import runner_certificate
+
+            certificate = runner_certificate(self.model_runner, self.rank, kv_cache_spec, torch.hpu.mem_get_info()[1])
+            self._v41_memory_certificate = certificate
+            if certificate is not None:
+                cached_headroom = certificate.restore()
+                logger.info("V4.1 memory certificate: %s",
+                            "hit" if cached_headroom is not None else certificate.rejection)
         if workspace_reserve:
             torch.hpu.synchronize()
             torch.hpu.reset_peak_memory_stats()
+        profile_before = torch.hpu.memory_allocated()
         with HabanaMemoryProfiler() as m:
-            self.model_runner.profile_run(initialize_only=True)  # type: ignore[union-attr]
+            if cached_headroom is None:
+                self.model_runner.profile_run(initialize_only=True)  # type: ignore[union-attr]
             torch.hpu.synchronize()
         if workspace_reserve:
             profile_peak = torch.hpu.max_memory_allocated()
@@ -986,6 +999,12 @@ class HPUWorker(WorkerBase):
             # margin alone can admit a cache that collides with that peak on
             # the first real request. Keep the larger observed headroom.
             workspace_reserve = max(workspace_reserve, profile_peak - profile_resident)
+            if cached_headroom is not None:
+                # No profiling allocations have been recreated yet. Reserve
+                # their full growth as well as measured temporary headroom.
+                workspace_reserve = max(workspace_reserve, cached_headroom)
+            elif certificate is not None:
+                certificate.measured(profile_before, profile_peak, profile_resident, workspace_reserve)
             self.model_runner.profile_memory = dict(
                 peak_bytes=profile_peak, resident_bytes=profile_resident, reserved_working_bytes=workspace_reserve
             )
@@ -1206,6 +1225,18 @@ class HPUWorker(WorkerBase):
         # Don't run the warmup if the model is already warmed up
         if not getattr(self.model_runner, "graphed_buckets", None):
             self.model_runner.warmup_model()  # type: ignore[union-attr]
+        if self.model_config.hf_config.model_type == "deepseek_v41":
+            torch.hpu.synchronize()
+            free_bytes, pool_bytes = torch.hpu.mem_get_info()
+            working = int(getattr(self.model_runner, "serving_workspace_reserve", 0))
+            logger.info("V4.1 ready memory admission: free_bytes=%d pool_bytes=%d working_reserve_bytes=%d",
+                        free_bytes, pool_bytes, working)
+            if working and free_bytes < working:
+                raise RuntimeError("Completed V4.1 warmup leaves insufficient serving working memory: "
+                                   f"{free_bytes} available, {working} required; retain context/shape capacity "
+                                   "and correct the allocation budget before advertising API readiness")
+        if certificate := getattr(self, "_v41_memory_certificate", None):
+            certificate.publish_after_warmup()
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)

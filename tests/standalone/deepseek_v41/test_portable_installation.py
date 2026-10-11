@@ -2,6 +2,7 @@
 """Serving installation ownership and runtime relocation contracts, CPU only."""
 import importlib.util
 import errno
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,11 +35,14 @@ def test_materialized_engine_cache_does_not_require_a_git_checkout(tmp_path, mon
     settings = {"recipe_cache_dir": str(tmp_path / "recipes")}
     module.prepare_serving_resources(settings, model, [])
     first = module.os.environ["PT_HPU_RECIPE_CACHE_CONFIG"]
+    inventory = Path(first.split(",")[0]).parent / "source-inventory.json"
+    previous_inventory = inventory.read_text()
     module.prepare_serving_resources(settings, model, [])
     assert module.os.environ["PT_HPU_RECIPE_CACHE_CONFIG"] == first
     origin.write_text("VERSION = 2\n")
     module.prepare_serving_resources(settings, model, [])
-    assert module.os.environ["PT_HPU_RECIPE_CACHE_CONFIG"] != first
+    assert module.os.environ["PT_HPU_RECIPE_CACHE_CONFIG"] == first
+    assert inventory.read_text() != previous_inventory
 
 
 def test_runtime_relocation_keeps_dependency_hashes_and_path_boundaries():
@@ -56,6 +60,44 @@ def test_runtime_relocation_keeps_dependency_hashes_and_path_boundaries():
     assert relocated["native"] == "/runtime/libhcl.so"
     assert relocated["description"] == "/installation/native-other/not-an-artifact"
     assert original["native"] == "/old/native/libhcl.so"
+
+
+def test_compilation_proof_survives_source_retirement(tmp_path):
+    module = tool("install_deepseek_v41_runtime")
+    source = tmp_path / "build"
+    source.mkdir()
+    patch = source / "source.patch"
+    patch.write_text("allocation patch")
+    proof = source / "RESULT.json"
+    proof.write_text(json.dumps(dict(sha256="runtime", source_patch_sha256=module.digest(patch))))
+    profile = dict(additional_libraries=[dict(path="/build/libSynapse.so", compilation_proof=dict(
+        path=str(proof), sha256=module.digest(proof)))])
+    output = tmp_path / "installation"
+    records = [dict(path=str(output / "lib/libSynapse.so"), sha256="runtime")]
+    module.install_compilation_proofs(profile, output, records)
+    installed = records[0]["compilation_proof"]
+    proof.unlink()
+    patch.unlink()
+    assert module.digest(installed["path"]) == installed["sha256"]
+    assert (Path(installed["path"]).parent / "source.patch").read_text() == "allocation patch"
+    profile["additional_libraries"][0]["compilation_proof"] = installed
+    (Path(installed["path"]).parent / "source.patch").write_text("corrupt")
+    with pytest.raises(ValueError, match="does not describe"):
+        module.install_compilation_proofs(profile, tmp_path / "another", records)
+
+
+def test_native_loader_entry_does_not_redirect_selected_kernel_database(tmp_path):
+    module = tool("install_deepseek_v41_runtime")
+    native = tmp_path / "native-build"
+    output = tmp_path / "installation"
+    kernel = native / "libdeepseek_v41_unique_kernels.so"
+    target = module.relocated_library_target(kernel, native, output)
+    mapping = {str(native): str(output / "native"), str(kernel): str(target)}
+    relocated = module.relocate(dict(GC_KERNEL_PATH=str(kernel), native=str(native)), mapping)
+    assert relocated["GC_KERNEL_PATH"] == str(output / "native" / kernel.name)
+    assert relocated["native"] == str(output / "native")
+    external = tmp_path / "sdk" / "libSynapse.so"
+    assert module.relocated_library_target(external, native, output) == output / "lib" / external.name
 
 
 @pytest.mark.parametrize("error_code", (errno.ENOSPC, errno.EDQUOT))
@@ -89,6 +131,7 @@ def test_optional_status_write_does_not_hide_permission_errors(tmp_path, monkeyp
 
 
 def test_settings_override_creates_actual_compiler_scratch_before_launch(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(ROOT / "tools"))
     import json
     import sys
 
@@ -110,7 +153,7 @@ def test_settings_override_creates_actual_compiler_scratch_before_launch(tmp_pat
     captured = {}
 
     def launch(command, **kwargs):
-        assert scratch.is_dir()
+        assert Path(kwargs["env"]["TMPDIR"]).is_dir()
         captured.update(command=command, environment=kwargs["env"])
         return SimpleNamespace(pid=123, returncode=0, poll=lambda: 0)
 
@@ -122,7 +165,9 @@ def test_settings_override_creates_actual_compiler_scratch_before_launch(tmp_pat
     assert finished.value.code == 0
     assert captured["command"].count("--settings") == 1
     assert captured["command"][captured["command"].index("--settings") + 1] == str(override)
-    assert captured["environment"]["TMPDIR"] == str(scratch)
+    from run_deepseek_v41 import ipc_scratch_path
+
+    assert captured["environment"]["TMPDIR"] == str(ipc_scratch_path(str(scratch), installation))
 
 
 def test_public_adapter_returns_unavailable_when_backend_has_stopped():

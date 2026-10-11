@@ -62,6 +62,22 @@ class InlinePrefixCapture:
         self.start, self.end, self.boundary = start, end, boundary
         self.expected = _views(bank, slot)
         self.tensors = {}
+        self.draft_states = {}
+
+    def record_draft(self, layer, values, ring_capacity):
+        """Retain causal target rows before the live draft ring advances."""
+        if layer not in (37, 38, 39) or layer in self.draft_states:
+            raise RuntimeError("Inline draft context producer is missing or duplicated")
+        base = self.end - values.shape[0]
+        offset = self.boundary - base - ring_capacity
+        if values.ndim != 2 or base < self.start or offset < 0 or offset + ring_capacity > values.shape[0]:
+            raise ValueError("Inline draft context does not cover the complete boundary ring")
+        self.draft_states[layer] = values[offset:offset + ring_capacity].clone()
+
+    def draft_context(self):
+        if self.draft_states.keys() != {37, 38, 39}:
+            raise RuntimeError("Inline draft context does not cover all target-state layers")
+        return torch.cat([self.draft_states[layer] for layer in (37, 38, 39)], -1)
 
     def record(self, layer, name, values, *, pack=None):
         key = layer, name

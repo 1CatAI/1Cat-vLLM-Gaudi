@@ -51,6 +51,37 @@ def relocate(value, mapping):
     return value
 
 
+def install_compilation_proofs(profile, output, records):
+    """Retain resource-only compiler certificates inside the installation."""
+    by_name = {Path(item["path"]).name: item for item in records}
+    for item in profile.get("additional_libraries", []):
+        certificate = item.get("compilation_proof")
+        if not certificate:
+            continue
+        name = Path(item["path"]).name
+        source = Path(certificate["path"])
+        if digest(source) != certificate["sha256"]:
+            raise ValueError("Compilation proof fingerprint mismatch")
+        proof = json.loads(source.read_text())
+        patch = source.parent / "source.patch"
+        if (proof.get("sha256") != by_name[name]["sha256"]
+                or digest(patch) != proof.get("source_patch_sha256")):
+            raise ValueError("Compilation proof does not describe installed runtime")
+        directory = output / "compilation-proofs" / name
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / "RESULT.json"
+        shutil.copy2(source, target)
+        shutil.copy2(patch, directory / "source.patch")
+        by_name[name]["compilation_proof"] = dict(path=str(target), sha256=digest(target))
+
+
+def relocated_library_target(binary, native, output):
+    """Keep selected kernel paths within their installed native database."""
+    if binary.is_relative_to(native):
+        return output / "native" / binary.relative_to(native)
+    return output / "lib" / binary.name
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime-profile", type=Path, required=True)
@@ -163,7 +194,7 @@ def main():
             if binary.name.endswith(".debug") or (library_dir / binary.name).exists():
                 continue
             shutil.copy2(binary, library_dir / binary.name)
-            mapping[str(binary)] = str(library_dir / binary.name)
+            mapping[str(binary)] = str(relocated_library_target(binary, native, output))
     preload = []
     for name in env.get("LD_PRELOAD", "").split(":"):
         if name:
@@ -259,6 +290,7 @@ def main():
                 "VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR", "VLLM_HPU_DSV41_ATTN_DENSE_FP8_SIDECAR"):
             installed_env.pop(key)
     records = [{"path": str(p), "sha256": digest(p)} for p in library_dir.glob("*.so")]
+    install_compilation_proofs(profile, output, records)
     configurations = [{"path": str(p), "sha256": digest(p)} for p in library_dir.glob("*.json")]
     configurations.extend({"path": str(p), "sha256": digest(p)} for p in native_configs)
     dump(output / "runtime.json", {

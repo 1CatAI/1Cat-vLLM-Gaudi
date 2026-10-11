@@ -6,6 +6,8 @@ import math
 import os
 from pathlib import Path
 import struct
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 from vllm_gaudi.ops.deepseek_v41_weights import (
     COPY_BYTES,
@@ -75,6 +77,26 @@ class PreparedV41Shard:
         self.pp_rank, self.tp_rank = pp_rank, tp_rank
         self.tensor_parallel_size, self.pipeline_parallel_size = tp_size, pp_size
         self.max_host_chunk_bytes = 0
+        self.startup_timings = dict(read_seconds=0.,
+                                    upload_seconds=0.,
+                                    conversion_enqueue_seconds=0.,
+                                    cpu_conversion_seconds=0.,
+                                    device_finish_seconds=0.,
+                                    derived_seconds=0.,
+                                    source_bytes=0,
+                                    upload_bytes=0)
+        self.startup_families = {}
+
+    def timed_specs(self, specs):
+        """Family wall times are exclusive; reader/queue counters may overlap."""
+        for name, spec in specs.items():
+            family = ("experts" if ".ffn.experts." in name else
+                      "draft" if name.startswith("mtp.") else "dense_fp8" if spec["dtype"] == "F8_E4M3" else "direct")
+            started = time.perf_counter()
+            try:
+                yield name, spec
+            finally:
+                self.startup_families[family] = (self.startup_families.get(family, 0.) + time.perf_counter() - started)
 
     def _local_path(self, name):
         relative = Path(name)
@@ -87,9 +109,40 @@ class PreparedV41Shard:
         if self.source_identity != (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns):
             raise RuntimeError("Prepared weight file changed during loading; invalidate the model and recipes")
 
+    def staged_rows(self, source, row_bytes, rows, chunk_rows):
+        """Read the next bounded chunk while the caller consumes this one."""
+        timings = getattr(self, "startup_timings", None)
+        with self.path.open("rb") as stream:
+
+            def read(start):
+                self.check_identity()
+                stop = min(rows, start + chunk_rows)
+                storage = bytearray((stop - start) * row_bytes)
+                stream.seek(source.offset + start * row_bytes)
+                started = time.perf_counter()
+                if stream.readinto(storage) != len(storage):
+                    raise ValueError("Prepared rank file was truncated during loading")
+                if timings is not None:
+                    timings["read_seconds"] += time.perf_counter() - started
+                    timings["source_bytes"] += len(storage)
+                return start, stop, storage
+
+            if rows <= chunk_rows:
+                yield read(0)
+                return
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(read, 0)
+                for start in range(0, rows, chunk_rows):
+                    current = future.result()
+                    if start + chunk_rows < rows:
+                        future = pool.submit(read, start + chunk_rows)
+                    yield current
+                    del current
+
     def tensor(self, name: str, device, *, keep_file_cache=True):
         """Copy one pre-sliced tensor; no expert gather, transpose or repacking."""
         import torch
+        timings = getattr(self, "startup_timings", None)
         self.check_identity()
         source = self.catalog[name]
         dtype_names = {
@@ -113,31 +166,31 @@ class PreparedV41Shard:
         row_bytes = math.prod(source.shape[1:]) * ITEM_BYTES[source.dtype]
         chunk_rows = max(1, COPY_BYTES // row_bytes)
         rows = source.shape[0] if source.shape else 1
-        for start in range(0, rows, chunk_rows):
-            stop = min(rows, start + chunk_rows)
+        for start, stop, storage in self.staged_rows(source, row_bytes, rows, chunk_rows):
             # bytearray is writable; frombuffer keeps the owner alive until
             # the synchronous H2D copy has consumed it. The destination is the
             # single persistent prepared tensor, not a temporary weight copy.
-            with self.path.open("rb") as stream:
-                offset = source.offset + start * row_bytes
-                stream.seek(offset)
-                storage = bytearray((stop - start) * row_bytes)
-                if stream.readinto(storage) != len(storage):
-                    raise ValueError("Prepared rank file was truncated during loading")
-                chunk_shape = (stop - start, *source.shape[1:]) if source.shape else ()
-                chunk = torch.frombuffer(storage, dtype=dtype).reshape(chunk_shape)
-                if source.shape:
-                    destination[start:stop].copy_(chunk, non_blocking=False)
-                else:
-                    destination.copy_(chunk, non_blocking=False)
-                self.max_host_chunk_bytes = max(self.max_host_chunk_bytes, len(storage))
-                # The four rank loaders read distinct 75–78 GiB files in
-                # parallel.  Synchronous DONTNEED for every copied chunk can
-                # block all workers in generic_fadvise/lru_add_drain_all;
-                # normally leave eviction to the VM.  The explicit opt-out
-                # remains for an isolated/offline loader.
-                if not keep_file_cache and hasattr(os, "posix_fadvise"):
+            offset = source.offset + start * row_bytes
+            chunk_shape = (stop - start, *source.shape[1:]) if source.shape else ()
+            chunk = torch.frombuffer(storage, dtype=dtype).reshape(chunk_shape)
+            started = time.perf_counter()
+            if source.shape:
+                destination[start:stop].copy_(chunk, non_blocking=False)
+            else:
+                destination.copy_(chunk, non_blocking=False)
+            if timings is not None:
+                timings["upload_seconds"] += time.perf_counter() - started
+                timings["upload_bytes"] += len(storage)
+            self.max_host_chunk_bytes = max(self.max_host_chunk_bytes, len(storage))
+            # The four rank loaders read distinct 75–78 GiB files in
+            # parallel.  Synchronous DONTNEED for every copied chunk can
+            # block all workers in generic_fadvise/lru_add_drain_all;
+            # normally leave eviction to the VM.  The explicit opt-out
+            # remains for an isolated/offline loader.
+            if not keep_file_cache and hasattr(os, "posix_fadvise"):
+                with self.path.open("rb") as stream:
                     os.posix_fadvise(stream.fileno(), offset, len(storage), os.POSIX_FADV_DONTNEED)
+            del chunk, storage
         self.check_identity()
         return destination
 
@@ -181,6 +234,7 @@ class PreparedV41Shard:
         chunk_rows = max(32, (COPY_BYTES // (k * 8) // 32) * 32)
         with self.path.open("rb") as stream:
             for start in range(0, n, chunk_rows):
+                read_started = time.perf_counter()
                 stop = min(n, start + chunk_rows)
                 stream.seek(source.offset + start * k)
                 raw = bytearray(stream.read((stop - start) * k))
@@ -191,13 +245,21 @@ class PreparedV41Shard:
                 raw_scale = bytearray(stream.read(scale_rows * scale_source.shape[1]))
                 if len(raw_scale) != scale_rows * scale_source.shape[1]:
                     raise ValueError("Dense FP8 scale source was truncated")
+                self.startup_timings["read_seconds"] += time.perf_counter() - read_started
+                self.startup_timings["source_bytes"] += len(raw) + len(raw_scale)
+                converted = time.perf_counter()
                 value = torch.frombuffer(raw, dtype=torch.float8_e4m3fn).reshape(stop - start, k).float()
                 codes = torch.frombuffer(raw_scale, dtype=torch.uint8).reshape(scale_rows, -1)
                 scales = torch.exp2(codes.float() - 127)
                 scales.masked_fill_(codes == 255, float("nan"))
                 expanded = scales.repeat_interleave(32, 0).repeat_interleave(32, 1)[:stop - start, :k]
                 value.mul_(expanded)
-                destination[start:stop].copy_(value.to(torch.bfloat16))
+                staged = value.to(torch.bfloat16)
+                self.startup_timings["cpu_conversion_seconds"] += time.perf_counter() - converted
+                uploaded = time.perf_counter()
+                destination[start:stop].copy_(staged)
+                self.startup_timings["upload_seconds"] += time.perf_counter() - uploaded
+                self.startup_timings["upload_bytes"] += staged.numel() * staged.element_size()
                 temporary = len(raw) + len(raw_scale) + value.numel() * 4 + expanded.numel() * 4
                 self.max_host_chunk_bytes = max(self.max_host_chunk_bytes, temporary)
                 # Do not issue per-chunk DONTNEED while TP2×PP2 workers load

@@ -10,6 +10,20 @@ import pytest
 from tools.run_deepseek_v41 import configure_trace_artifacts
 
 
+def test_recipe_runtime_keeps_arithmetic_but_ignores_scratch_placement():
+    from tools.run_deepseek_v41 import recipe_runtime_identity
+
+    profile = dict(environment=dict(TMPDIR="/scratch/a", HABANA_LOGS="/logs/a", PT_HPU_LAZY_MODE="0"),
+                   additional_libraries=[dict(path="runtime.so", sha256="a" * 64)])
+    relocated = {**profile, "environment": {**profile["environment"], "TMPDIR": "/scratch/b", "HABANA_LOGS": "/logs/b"}}
+    assert recipe_runtime_identity(profile) == recipe_runtime_identity(relocated)
+    assert profile["environment"]["TMPDIR"] == "/scratch/a"
+    changed = {**profile, "environment": {**profile["environment"], "PT_HPU_LAZY_MODE": "1"}}
+    assert recipe_runtime_identity(profile) != recipe_runtime_identity(changed)
+    changed = {**profile, "additional_libraries": [dict(path="runtime.so", sha256="b" * 64)]}
+    assert recipe_runtime_identity(profile) != recipe_runtime_identity(changed)
+
+
 def test_trace_symbols_and_graphs_are_selected_before_compilation(tmp_path):
     environment = {}
     identity = configure_trace_artifacts(environment, tmp_path, dump_plans=True, enable_profiler=True)
@@ -26,9 +40,11 @@ def test_raw_sdk_capture_keeps_compiler_debug_disabled(tmp_path):
     import json
 
     environment = {"GRAPH_VISUALIZATION": "0"}
-    identity = configure_trace_artifacts(
-        environment, tmp_path, dump_plans=False, enable_profiler=False, raw_profiler=True
-    )
+    identity = configure_trace_artifacts(environment,
+                                         tmp_path,
+                                         dump_plans=False,
+                                         enable_profiler=False,
+                                         raw_profiler=True)
     assert identity["ENABLE_PROFILER"] == "false"
     assert identity["HABANA_PROFILE"] == "1" and identity["GRAPH_VISUALIZATION"] == "0"
     assert environment["VLLM_HPU_DSV41_RAW_TRACE"] == "1"
@@ -47,8 +63,8 @@ def test_recipe_identity_ignores_only_capture_destination(tmp_path):
         run = tmp_path / name
         run.mkdir()
         environment = {}
-        identities.append(configure_trace_artifacts(
-            environment, run, dump_plans=True, enable_profiler=False, raw_profiler=True))
+        identities.append(
+            configure_trace_artifacts(environment, run, dump_plans=True, enable_profiler=False, raw_profiler=True))
         environments.append(environment)
         config = json.loads((run / "profiler-config.json").read_text())
         assert config["GeneralSettings"]["values"]["outdir"]["value"] == str(run / "raw")
@@ -58,8 +74,11 @@ def test_recipe_identity_ignores_only_capture_destination(tmp_path):
     config = json.loads(path.read_text())
     config["Plugins"][0]["values"]["api_group"]["HCCL"]["value"] = False
     path.write_text(json.dumps(config))
-    changed = configure_trace_artifacts(
-        environments[1], path.parent, dump_plans=True, enable_profiler=False, raw_profiler=True)
+    changed = configure_trace_artifacts(environments[1],
+                                        path.parent,
+                                        dump_plans=True,
+                                        enable_profiler=False,
+                                        raw_profiler=True)
     assert changed != identities[1]
 
 
@@ -84,9 +103,9 @@ def test_profile_control_reaches_workers_when_frontend_capture_is_disabled(monke
         model_config=None,
         scheduler_config=SimpleNamespace(stream_interval=1),
         observability_config=SimpleNamespace(otlp_traces_endpoint=None),
-        profiler_config=SimpleNamespace(
-            profiler="torch", ignore_frontend=ignore_frontend, torch_profiler_dir=str(tmp_path)
-        ),
+        profiler_config=SimpleNamespace(profiler="torch",
+                                        ignore_frontend=ignore_frontend,
+                                        torch_profiler_dir=str(tmp_path)),
     )
     engine = async_llm.AsyncLLM(config, executor_class=object, log_stats=False)
     asyncio.run(engine.start_profile("scope-only"))
@@ -174,12 +193,13 @@ def test_activity_export_retains_packet_api_and_merges_lanes(tmp_path, monkeypat
         for engine, kernel in [("TPC", "null"), ("DMA", "pdma_tx_commands"), ("DMA", "hcl_transfer")]
     ]
     for name, value in {
-        "inventory.json": dict(
-            nodes=nodes, host_enqueues=[], cpu_markers=[], trace_sha256="fixture", base_time_nanoseconds=0
-        ),
-        "recipe-symbols.json": dict(recipes=[]),
-        "node-contracts.json": [],
-        "device-windows.json": dict(capture_order=[], topology=dict(tensor_parallel_size=4)),
+            "inventory.json":
+            dict(nodes=nodes, host_enqueues=[], cpu_markers=[], trace_sha256="fixture", base_time_nanoseconds=0),
+            "recipe-symbols.json":
+            dict(recipes=[]),
+            "node-contracts.json": [],
+            "device-windows.json":
+            dict(capture_order=[], topology=dict(tensor_parallel_size=4)),
     }.items():
         (rank / name).write_text(json.dumps(value))
     (tmp_path / "graph-manifest.json").write_text("[]")
@@ -267,17 +287,19 @@ def test_tp4_prefill_combines_both_chunks_through_first_token():
     for start in (0, 100):
         marks.append([start, 50, "v41::target::PP0::prefill::C8192"])
         marks.extend([start + layer, 1, f"v41::prefill::layer::layer{layer}::C8192"] for layer in range(40))
-    marks.extend(
-        [
-            [60, 1, "v41::verify_and_commit::PP0::prefill::P0::C8192::emit0"],
-            [160, 15, "v41::verify_and_commit::PP0::prefill::P8192::C8192::emit1"],
-        ]
-    )
+    marks.extend([
+        [60, 1, "v41::verify_and_commit::PP0::prefill::P0::C8192::emit0"],
+        [160, 15, "v41::verify_and_commit::PP0::prefill::P8192::C8192::emit1"],
+    ])
     result = tp4_windows({"cpu_markers": marks}, "prefill")
     assert result["unit"] == "request" and result["windows_us"] == [(0, 175)]
     assert set(result["coverage_proof"]["layer_counts"].values()) == {2}
     complete = tp4_windows(
-        {"cpu_markers": marks, "base_time_nanoseconds": 1_000_000, "all_activity_start_us": -100},
+        {
+            "cpu_markers": marks,
+            "base_time_nanoseconds": 1_000_000,
+            "all_activity_start_us": -100
+        },
         "prefill",
         request_start_ns=950_000,
     )
@@ -326,9 +348,9 @@ def test_host_overlap_counts_duplicated_device_lanes_once(tmp_path):
     compute = [(0, 3000), (2000, 8000)] * 24
     result = host_accounting(tmp_path, [(0, 10000)], compute, 1000, export_intervals=True)
     assert result["CPU_operator_dispatch"] == dict(activity_ms=10, overlap_with_compute_ms=8, outside_compute_ms=2)
-    assert result["observed_synchronization_or_wait"] == dict(
-        activity_ms=5, overlap_with_compute_ms=3, outside_compute_ms=2
-    )
+    assert result["observed_synchronization_or_wait"] == dict(activity_ms=5,
+                                                              overlap_with_compute_ms=3,
+                                                              outside_compute_ms=2)
     saved = json.loads((tmp_path / "host-breakdown.json").read_text())
     assert saved["activity_intervals_us"]["CPU_operator_dispatch"] == [[0, 10000]]
 
@@ -354,8 +376,16 @@ def test_tp4_ledger_distinguishes_peer_work_from_all_rank_gaps(monkeypatch):
     assert result["rank0_no_device_other_rank_active_us"] == 4
     assert result["hccl_overlap_with_gap_us"] == {"四卡无可见设备活动：compiled分组入口内": 1}
     assert result["per_window_totals_us"] == [
-        {"设备kernel：Attention": 2, "设备kernel：跨模块重叠": 2, "设备kernel：路由专家": 1},
-        {"设备kernel：路由专家": 1, "仅设备搬运：通信相关DMA": 2, "四卡无可见设备活动：compiled分组入口内": 2},
+        {
+            "设备kernel：Attention": 2,
+            "设备kernel：跨模块重叠": 2,
+            "设备kernel：路由专家": 1
+        },
+        {
+            "设备kernel：路由专家": 1,
+            "仅设备搬运：通信相关DMA": 2,
+            "四卡无可见设备活动：compiled分组入口内": 2
+        },
     ]
 
 
@@ -425,14 +455,16 @@ def test_selected_mla_fp32_pv_is_not_misclassified_as_compressor(monkeypatch):
     category, purpose = report.classify(
         node,
         "gemm",
-        [dict(dtype="float32", shape=[1, 16, 640]), dict(dtype="float32", shape=[1, 640, 512])],
+        [dict(dtype="float32", shape=[1, 16, 640]),
+         dict(dtype="float32", shape=[1, 640, 512])],
         [dict(dtype="bf16", shape=[1, 16, 512])],
     )
     assert category == "Attention" and "PV" in purpose and "Compressor" not in purpose
     category, purpose = report.classify(
         node,
         "gemm",
-        [dict(dtype="bf16", shape=[1, 16, 512]), dict(dtype="bf16", shape=[1, 640, 512])],
+        [dict(dtype="bf16", shape=[1, 16, 512]),
+         dict(dtype="bf16", shape=[1, 640, 512])],
         [dict(dtype="float32", shape=[1, 16, 640])],
     )
     assert category == "Attention" and "QK" in purpose
@@ -443,9 +475,10 @@ def test_raw_recipe_name_reuse_needs_exact_device_identity(monkeypatch):
     from normalize_deepseek_v41_raw_trace import resolve_recipe_starts
 
     starts = [(1.0, "1000", "reused"), (2.0, "2000", "reused"), (3.0, "3000", "reused")]
-    resolved, unknown = resolve_recipe_starts(
-        starts, {"reused": {10, 20}}, {("1000", "reused"): {10}, ("2000", "reused"): {20}}, {"reused": {10, 20}}
-    )
+    resolved, unknown = resolve_recipe_starts(starts, {"reused": {10, 20}}, {
+        ("1000", "reused"): {10},
+        ("2000", "reused"): {20}
+    }, {"reused": {10, 20}})
     assert [row[2] for row in resolved] == ["10@reused:", "20@reused:"]
     assert len(unknown) == 1 and unknown[0]["candidate_ids"] == [10, 20]
 
@@ -466,8 +499,7 @@ def test_scope_only_raw_clock_survives_wall_clock_steps(monkeypatch, wall_step_n
                 wall_before_ns=wall,
                 wall_after_ns=wall,
                 synapse_clock_ns=2 * (raw0 + delta),
-            )
-        )
+            ))
     metadata = dict(clock_samples=samples, scope_clock_domain="CLOCK_MONOTONIC_RAW")
     clock = Clock(metadata, raw0)
     assert clock.raw((raw0 + 123_000_000) / 1000) == 123_000
@@ -516,9 +548,12 @@ def test_mme_role_requires_unambiguous_weight_producer(monkeypatch):
         )
 
     rows = {
-        "w13": decode("w13", 327680),
-        "w2": decode("w2", 40960),
-        "mme": dict(
+        "w13":
+        decode("w13", 327680),
+        "w2":
+        decode("w2", 40960),
+        "mme":
+        dict(
             graph=graph,
             symbol=dict(device_type=0, node="tile", kernel="batch_gemm"),
             inputs=[dict(name="activation"), dict(name="tile-view", alias="w13")],
@@ -554,12 +589,17 @@ def test_sat_mme_role_follows_decoded_weight_alias(monkeypatch):
 
     graph = dict(path="captured.json")
     contracts = dict(
-        decoder=dict(graph=graph, symbol=dict(device_type=1, node="decoder",
-                      kernel="custom_deepseek_v41_expert_token_wide_sat_fp8_gaudi2"),
-                     inputs=[dict(name="ids"), dict(name="packed", shape=[384, 5, 327680], dtype="int16")],
+        decoder=dict(graph=graph,
+                     symbol=dict(device_type=1,
+                                 node="decoder",
+                                 kernel="custom_deepseek_v41_expert_token_wide_sat_fp8_gaudi2"),
+                     inputs=[dict(name="ids"),
+                             dict(name="packed", shape=[384, 5, 327680], dtype="int16")],
                      outputs=[dict(name="tile")]),
-        mme=dict(graph=graph, symbol=dict(device_type=0, node="consumer", kernel="batch_gemm"),
-                 inputs=[dict(name="activation"), dict(name="weight-view", alias="tile")], outputs=[]),
+        mme=dict(graph=graph,
+                 symbol=dict(device_type=0, node="consumer", kernel="batch_gemm"),
+                 inputs=[dict(name="activation"), dict(name="weight-view", alias="tile")],
+                 outputs=[]),
     )
     assert expert_mme_owners(contracts)["mme"]["role"] == "W13"
     contracts["decoder"]["inputs"][1]["dtype"] = "unknown"
@@ -578,6 +618,8 @@ def test_tp4_prefill_single_16k_chunk_includes_first_token_consumer():
     assert set(result["coverage_proof"]["layer_counts"].values()) == {1}
     with pytest.raises(ValueError, match="forty-layer"):
         tp4_windows({"cpu_markers": marks[:20] + marks[21:]}, "prefill")
+
+
 def test_device_feedback_windows_require_counter_proof_and_consumed_completion():
     from tools.analyze_deepseek_v41_trace import tp4_windows
 

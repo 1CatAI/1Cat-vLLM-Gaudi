@@ -81,18 +81,18 @@ def channel_scales(q16, s16):
     }
 
 
-def read_expert(source, expert):
-    """Keep only this bounded read in DRAM; do not populate a full weight mmap."""
+def read_expert(source, expert, *, keep_file_cache=False):
+    """Read one bounded expert; offline callers may retire its file pages."""
     count = source.nbytes // source.shape[0]
     if count > 64 * 2**20 or not 0 <= expert < source.shape[0]:
         raise ValueError("FP8 preparation source read exceeds its bounded expert contract")
     with source.file.open("rb") as stream:
         offset = source.offset + expert * count
         stream.seek(offset)
-        raw = bytearray(stream.read(count))
-        if len(raw) != count:
+        raw = bytearray(count)
+        if stream.readinto(raw) != count:
             raise ValueError("Truncated prepared FP8 source")
-        if hasattr(os, "posix_fadvise"):
+        if not keep_file_cache and hasattr(os, "posix_fadvise"):
             os.posix_fadvise(stream.fileno(), offset, count, os.POSIX_FADV_DONTNEED)
     dtype = "<i2" if source.dtype == "I16" else "<u2"
     return np.frombuffer(raw, dtype=dtype).reshape(source.shape[1:])

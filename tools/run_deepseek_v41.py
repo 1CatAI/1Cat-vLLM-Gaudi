@@ -144,6 +144,14 @@ def recipe_source_hashes(source_hashes):
     }
 
 
+def recipe_runtime_identity(profile):
+    """Scratch/log placement changes ownership, not the compiled arithmetic."""
+    environment = dict(profile["environment"])
+    for name in ("TMPDIR", "HABANA_LOGS"):
+        environment.pop(name, None)
+    return {**profile, "environment": environment}
+
+
 def configure_trace_artifacts(environment, evidence, *, dump_plans, enable_profiler, raw_profiler=False):
     """Generate symbols at compilation time, before any profiler acquisition."""
     if dump_plans:
@@ -659,12 +667,12 @@ def main():
             native_dir = Path(env.get("VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR", root / "vllm_gaudi/lib"))
             native_build = native_dir / "deepseek_v4_build.json"
             cache_identity = {
-                "schema": 4,
+                "schema": 5,
                 "source": recipe_source_hashes(record["source_hashes"]),
                 "engine": record["engine_commit"],
                 "engine_patch": record["engine_patch_sha256"],
                 "engine_sources": record["engine_sources_sha256"],
-                "runtime": profile,
+                "runtime": recipe_runtime_identity(profile),
                 "instrumentation": instrumentation,
                 "command": command,
                 "model_manifests": model_manifests,
@@ -679,7 +687,7 @@ def main():
             env["PT_HPU_RECIPE_CACHE_CONFIG"] = f"{cache / cache_rank},false,8192,false"
             record["environment"]["PT_HPU_RECIPE_CACHE_CONFIG"] = env["PT_HPU_RECIPE_CACHE_CONFIG"]
             record["recipe_cache_identity"] = fingerprint
-            record["recipe_cache_identity_schema"] = 4
+            record["recipe_cache_identity_schema"] = 5
         process = None
         launch_cpus = set(mains)
         launch_cpus.update(control_cpus)
