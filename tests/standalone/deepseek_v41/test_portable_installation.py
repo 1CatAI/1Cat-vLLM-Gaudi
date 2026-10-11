@@ -35,11 +35,14 @@ def test_materialized_engine_cache_does_not_require_a_git_checkout(tmp_path, mon
     settings = {"recipe_cache_dir": str(tmp_path / "recipes")}
     module.prepare_serving_resources(settings, model, [])
     first = module.os.environ["PT_HPU_RECIPE_CACHE_CONFIG"]
+    inventory = Path(first.split(",")[0]).parent / "source-inventory.json"
+    previous_inventory = inventory.read_text()
     module.prepare_serving_resources(settings, model, [])
     assert module.os.environ["PT_HPU_RECIPE_CACHE_CONFIG"] == first
     origin.write_text("VERSION = 2\n")
     module.prepare_serving_resources(settings, model, [])
-    assert module.os.environ["PT_HPU_RECIPE_CACHE_CONFIG"] != first
+    assert module.os.environ["PT_HPU_RECIPE_CACHE_CONFIG"] == first
+    assert inventory.read_text() != previous_inventory
 
 
 def test_runtime_relocation_keeps_dependency_hashes_and_path_boundaries():
@@ -114,6 +117,7 @@ def test_optional_status_write_does_not_hide_permission_errors(tmp_path, monkeyp
 
 
 def test_settings_override_creates_actual_compiler_scratch_before_launch(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(ROOT / "tools"))
     import json
     import sys
 
@@ -135,7 +139,7 @@ def test_settings_override_creates_actual_compiler_scratch_before_launch(tmp_pat
     captured = {}
 
     def launch(command, **kwargs):
-        assert scratch.is_dir()
+        assert Path(kwargs["env"]["TMPDIR"]).is_dir()
         captured.update(command=command, environment=kwargs["env"])
         return SimpleNamespace(pid=123, returncode=0, poll=lambda: 0)
 
@@ -147,7 +151,9 @@ def test_settings_override_creates_actual_compiler_scratch_before_launch(tmp_pat
     assert finished.value.code == 0
     assert captured["command"].count("--settings") == 1
     assert captured["command"][captured["command"].index("--settings") + 1] == str(override)
-    assert captured["environment"]["TMPDIR"] == str(scratch)
+    from run_deepseek_v41 import ipc_scratch_path
+
+    assert captured["environment"]["TMPDIR"] == str(ipc_scratch_path(str(scratch), installation))
 
 
 def test_public_adapter_returns_unavailable_when_backend_has_stopped():

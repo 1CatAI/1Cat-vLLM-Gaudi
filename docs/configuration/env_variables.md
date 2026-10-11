@@ -1484,3 +1484,11 @@ certificate. Full communication retirement remains required. Shared-coordinate
 plans are excluded; prefill, DSpark and wider buckets retain their existing path.
 Combined serving correctness passed, but the experimental switches remain off
 because the combined latency reduction did not meet the promotion gate.
+# Native replay workspace allocation
+
+`VLLM_HPU_DSV41_NATIVE_WORKSPACE_REUSE` (default `0`) selects graph-local
+scratch reuse in a compatible native runtime built with the private workspace
+builder. Ordered recipes may reuse adequate retained scratch. Different graphs
+remain isolated, addresses remain stable, and graph completion controls release.
+This changes allocation policy rather than numerical computation; actual pool
+headroom must still pass final admission after all production warmup shapes.

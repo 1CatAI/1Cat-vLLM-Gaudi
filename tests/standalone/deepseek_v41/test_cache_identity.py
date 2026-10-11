@@ -10,6 +10,7 @@ from vllm_gaudi.compilation.deepseek_v41_cache_identity import (
     runtime_content_identity,
     semantic_environment,
     lowered_keys,
+    python_source_digest,
 )
 
 
@@ -54,6 +55,20 @@ def test_verified_resource_runtime_keeps_compiler_cache(resource_runtime):
     assert runtime_content_identity(first) == runtime_content_identity(second)
     changed = dict(second, environment={**second["environment"], "VLLM_HPU_PRECISION": "bf16"})
     assert runtime_content_identity(first) != runtime_content_identity(changed)
+
+
+def test_native_resource_registration_preserves_numerical_environment_sources(tmp_path):
+    package = tmp_path / "vllm_gaudi"
+    package.mkdir()
+    path = package / "envs.py"
+    original = 'if TYPE_CHECKING:\n    PRECISION: str = "fp8"\nvariables = {"PRECISION": lambda: "fp8"}\n'
+    path.write_text(original)
+    before = python_source_digest(path)
+    path.write_text(original.replace('variables =', '    VLLM_HPU_DSV41_NATIVE_WORKSPACE_REUSE: bool = False\nvariables =')
+                    .replace('{"PRECISION":', '{"VLLM_HPU_DSV41_NATIVE_WORKSPACE_REUSE": lambda: "1", "PRECISION":'))
+    assert python_source_digest(path) == before
+    path.write_text(path.read_text().replace('"fp8"', '"bf16"'))
+    assert python_source_digest(path) != before
 
 
 @pytest.mark.parametrize("changed", ["binary", "patch", "record", "missing", "compiler", "parent_relink"])

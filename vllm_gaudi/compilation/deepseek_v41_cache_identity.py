@@ -46,7 +46,27 @@ def python_source_digest(path):
     """Reuse source normalization by content, including same-timestamp edits."""
     # Filesystems can coalesce ctime updates for back-to-back writes. Read
     # source text to identify revisions; reuse the expensive AST conversion.
-    return _python_source_digest(Path(path).read_text())
+    path = Path(path)
+    source = path.read_text()
+    if path.name == "envs.py" and path.parent.name == "vllm_gaudi":
+        # Registration of this native allocation-only setting does not
+        # change any Python numerical path. Keep every other environment
+        # definition and statement in the computation dependency.
+        tree = ast.parse(source)
+        resource = "VLLM_HPU_DSV41_NATIVE_WORKSPACE_REUSE"
+        for node in ast.walk(tree):
+            for field in ("body", "orelse"):
+                body = getattr(node, field, None)
+                if isinstance(body, list):
+                    setattr(node, field, [item for item in body if not (
+                        isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name)
+                        and item.target.id == resource)])
+            if isinstance(node, ast.Dict):
+                items = [(key, value) for key, value in zip(node.keys, node.values)
+                         if not (isinstance(key, ast.Constant) and key.value == resource)]
+                node.keys, node.values = [key for key, _ in items], [value for _, value in items]
+        return hashlib.sha256(ast.dump(tree, include_attributes=False).encode()).hexdigest()
+    return _python_source_digest(source)
 
 
 @lru_cache(maxsize=512)

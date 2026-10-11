@@ -317,6 +317,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_ENGRAM_NATIVE_C1: bool = False
     VLLM_HPU_DSV41_ENGRAM_C1_PACKET: bool = False
     VLLM_HPU_DSV41_TP_MHC_OVERLAP: bool = False
+    VLLM_HPU_DSV41_NATIVE_WORKSPACE_REUSE: bool = False
     VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH: bool = False
     VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT: bool = False
     VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT: bool = False
@@ -1244,6 +1245,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_ENGRAM_C1_PACKET", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_TP_MHC_OVERLAP":
     lambda: os.environ.get("VLLM_HPU_DSV41_TP_MHC_OVERLAP", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_NATIVE_WORKSPACE_REUSE":
+    lambda: os.environ.get("VLLM_HPU_DSV41_NATIVE_WORKSPACE_REUSE", "0") == "1",
     "VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH":
     lambda: os.environ.get("VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT":
