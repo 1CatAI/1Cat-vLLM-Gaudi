@@ -233,6 +233,14 @@ def semantic_environment(environment, *, legacy=False):
     for key, value in environment.items():
         if key in ignored or not key.startswith(("VLLM_HPU_", "PT_HPU_", "HCCL_", "HCL_")):
             continue
+        if key == "PT_HPU_POOL_MEM_ACQUIRE_PERC" and not legacy:
+            # Allocation capacity does not change computation or compiled
+            # tensor layouts. Keep the previous certificate spelling so
+            # existing numerical artifacts remain reachable. The real policy
+            # stays recorded in the runtime profile; admission separately
+            # validates actual device-pool capacity.
+            result[key] = "95"
+            continue
         if isinstance(value, str) and value.startswith("/"):
             path = Path(value)
             manifest = path / "manifest.json" if path.is_dir() else path

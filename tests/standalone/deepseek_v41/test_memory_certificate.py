@@ -23,6 +23,30 @@ def test_measured_budget_requires_completed_serving_warmup(tmp_path):
     assert fresh.restore() == 55  # Both resident growth and working headroom are reserved.
 
 
+def test_larger_pool_retains_measured_reserve_only_with_identical_inventory(tmp_path):
+    template, directory = established(tmp_path)
+    cold = MemoryCertificate(tmp_path, 0, dict(template.contract, total_device_bytes=1000))
+    cold.measured(100, 150, 125, 30)
+    cold.publish_after_warmup()
+    larger = MemoryCertificate(tmp_path, 0, dict(cold.contract, total_device_bytes=1200))
+    assert larger.restore() == 55
+    assert not larger.path.exists()  # No invented new measurement.
+    assert MemoryCertificate(tmp_path, 0, dict(cold.contract, total_device_bytes=900)).restore() is None
+    assert MemoryCertificate(tmp_path, 0, dict(larger.contract, precision="bf16")).restore() is None
+    (directory / "frontend.bin").write_bytes(b"changed")
+    assert larger.restore() is None
+
+
+def test_invalid_current_certificate_does_not_fall_back_to_smaller_pool(tmp_path):
+    template, _ = established(tmp_path)
+    cold = MemoryCertificate(tmp_path, 0, dict(template.contract, total_device_bytes=1000))
+    cold.measured(100, 150, 125, 30)
+    cold.publish_after_warmup()
+    larger = MemoryCertificate(tmp_path, 0, dict(cold.contract, total_device_bytes=1200))
+    larger.path.write_text('{"invalid":true}')
+    assert larger.restore() is None
+
+
 def test_missing_and_corrupted_artifacts_repeat_profiling(tmp_path):
     cold, directory = established(tmp_path)
     cold.publish_after_warmup()

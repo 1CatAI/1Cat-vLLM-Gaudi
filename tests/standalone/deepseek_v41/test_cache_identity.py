@@ -12,6 +12,16 @@ from vllm_gaudi.compilation.deepseek_v41_cache_identity import (
 )
 
 
+def test_allocator_capacity_keeps_numerical_cache_identity():
+    first = dict(environment={"PT_HPU_POOL_MEM_ACQUIRE_PERC": "95", "VLLM_HPU_PRECISION": "fp8"})
+    larger = dict(environment={"PT_HPU_POOL_MEM_ACQUIRE_PERC": "98", "VLLM_HPU_PRECISION": "fp8"})
+    assert runtime_content_identity(first) == runtime_content_identity(larger)
+    assert semantic_environment(larger["environment"])["PT_HPU_POOL_MEM_ACQUIRE_PERC"] == "95"
+    assert larger["environment"]["PT_HPU_POOL_MEM_ACQUIRE_PERC"] == "98"
+    changed = dict(environment={**larger["environment"], "VLLM_HPU_PRECISION": "bf16"})
+    assert runtime_content_identity(first) != runtime_content_identity(changed)
+
+
 def forward(owner, value):
     return value * 2
 

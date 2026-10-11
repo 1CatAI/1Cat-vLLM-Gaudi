@@ -75,7 +75,7 @@ class MemoryCertificate:
                     result[f"sdk/{path.relative_to(recipes)}"] = _digest(path)
         return result
 
-    def restore(self):
+    def _restore_exact(self):
         try:
             if self.path.stat().st_size > 16 << 20:
                 raise ValueError("Memory certificate exceeds its metadata budget")
@@ -102,6 +102,34 @@ class MemoryCertificate:
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
             self.rejection = str(error)
             return None
+
+    def restore(self):
+        if self.path.exists():
+            return self._restore_exact()
+        # Only an expanded allocation pool can reuse the original measured
+        # byte reserve. Every numerical/layout/runtime dependency and the
+        # complete artifact inventory must still validate unchanged.
+        current_total = self.contract.get("total_device_bytes")
+        if type(current_total) is int and current_total > 0:
+            for path in sorted(self.path.parent.glob(f"rank{self.rank}-*.json")):
+                try:
+                    if path.stat().st_size > 16 << 20:
+                        continue
+                    contract = json.loads(path.read_text())["record"]["contract"]
+                    previous_total = contract.get("total_device_bytes")
+                    if (type(previous_total) is not int or not 0 < previous_total < current_total
+                            or dict(contract, total_device_bytes=current_total) != self.contract):
+                        continue
+                    previous = MemoryCertificate(self.root, self.rank, contract)
+                    if previous.path != path:
+                        continue
+                    reserve = previous._restore_exact()
+                    if reserve is not None:
+                        self.rejection = None
+                        return reserve
+                except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                    continue
+        return self._restore_exact()
 
     def measured(self, before, peak, resident, workspace):
         self.pending = dict(schema=1,

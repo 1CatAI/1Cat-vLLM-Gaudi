@@ -1225,6 +1225,16 @@ class HPUWorker(WorkerBase):
         # Don't run the warmup if the model is already warmed up
         if not getattr(self.model_runner, "graphed_buckets", None):
             self.model_runner.warmup_model()  # type: ignore[union-attr]
+        if self.model_config.hf_config.model_type == "deepseek_v41":
+            torch.hpu.synchronize()
+            free_bytes, pool_bytes = torch.hpu.mem_get_info()
+            working = int(getattr(self.model_runner, "serving_workspace_reserve", 0))
+            logger.info("V4.1 ready memory admission: free_bytes=%d pool_bytes=%d working_reserve_bytes=%d",
+                        free_bytes, pool_bytes, working)
+            if working and free_bytes < working:
+                raise RuntimeError("Completed V4.1 warmup leaves insufficient serving working memory: "
+                                   f"{free_bytes} available, {working} required; retain context/shape capacity "
+                                   "and correct the allocation budget before advertising API readiness")
         if certificate := getattr(self, "_v41_memory_certificate", None):
             certificate.publish_after_warmup()
         # Reset the seed to ensure that the random state is not affected by
