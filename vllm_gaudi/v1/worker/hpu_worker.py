@@ -1227,6 +1227,16 @@ class HPUWorker(WorkerBase):
             self.model_runner.warmup_model()  # type: ignore[union-attr]
         if certificate := getattr(self, "_v41_memory_certificate", None):
             certificate.publish_after_warmup()
+        if self.model_config.hf_config.model_type == "deepseek_v41":
+            # Compilation creates cyclic Python owners of temporary tensors.
+            # Retire only unreachable objects after all captured work drains;
+            # live recipes, bindings and complete shape coverage stay owned.
+            torch.hpu.synchronize()
+            allocated_before = torch.hpu.memory_allocated()
+            collected = gc.collect()
+            torch.hpu.synchronize()
+            logger.info("V4.1 startup temporary retirement: collected=%d allocated_before=%d allocated_after=%d",
+                        collected, allocated_before, torch.hpu.memory_allocated())
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
