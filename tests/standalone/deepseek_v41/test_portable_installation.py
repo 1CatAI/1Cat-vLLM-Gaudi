@@ -2,6 +2,7 @@
 """Serving installation ownership and runtime relocation contracts, CPU only."""
 import importlib.util
 import errno
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -56,6 +57,30 @@ def test_runtime_relocation_keeps_dependency_hashes_and_path_boundaries():
     assert relocated["native"] == "/runtime/libhcl.so"
     assert relocated["description"] == "/installation/native-other/not-an-artifact"
     assert original["native"] == "/old/native/libhcl.so"
+
+
+def test_compilation_proof_survives_source_retirement(tmp_path):
+    module = tool("install_deepseek_v41_runtime")
+    source = tmp_path / "build"
+    source.mkdir()
+    patch = source / "source.patch"
+    patch.write_text("allocation patch")
+    proof = source / "RESULT.json"
+    proof.write_text(json.dumps(dict(sha256="runtime", source_patch_sha256=module.digest(patch))))
+    profile = dict(additional_libraries=[dict(path="/build/libSynapse.so", compilation_proof=dict(
+        path=str(proof), sha256=module.digest(proof)))])
+    output = tmp_path / "installation"
+    records = [dict(path=str(output / "lib/libSynapse.so"), sha256="runtime")]
+    module.install_compilation_proofs(profile, output, records)
+    installed = records[0]["compilation_proof"]
+    proof.unlink()
+    patch.unlink()
+    assert module.digest(installed["path"]) == installed["sha256"]
+    assert (Path(installed["path"]).parent / "source.patch").read_text() == "allocation patch"
+    profile["additional_libraries"][0]["compilation_proof"] = installed
+    (Path(installed["path"]).parent / "source.patch").write_text("corrupt")
+    with pytest.raises(ValueError, match="does not describe"):
+        module.install_compilation_proofs(profile, tmp_path / "another", records)
 
 
 @pytest.mark.parametrize("error_code", (errno.ENOSPC, errno.EDQUOT))
