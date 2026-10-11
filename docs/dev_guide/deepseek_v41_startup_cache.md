@@ -86,3 +86,19 @@ frontend capture or backend repartitioning. Component improvements alone do not
 qualify startup. After readiness, exercise fixed quality samples, prefix reuse,
 tool calls, and one unprofiled official long-input request to natural EOS. Keep
 those results tied to the serving installation and its effective settings.
+
+Native replay scratch must be included in device admission alongside the
+framework allocator. Increasing the framework pool can starve the separate
+native pool. Ordered segments within a graph may reuse adequate scratch owned
+by an earlier segment. Growing arenas retain their original addresses and are
+released only after final graph completion; graphs do not share arenas.
+
+The private native workspace builder can certify a resource-only runtime
+rebuild. It first relinks the original inputs and requires byte-for-byte
+reproduction of the parent runtime, then replaces only the compute-stream
+allocation unit. Compiler objects, class layouts, communication and retirement
+remain unchanged. A library record may reference that content-certified build
+proof through `compilation_proof`. The numerical cache identity retains the
+parent compiler fingerprint only while the actual binary, proof and source
+patch match. Missing or corrupt proof uses the actual binary identity and
+rebuilds artifacts. Native plans and addresses are still recreated each start.

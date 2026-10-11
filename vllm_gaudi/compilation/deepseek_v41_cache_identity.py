@@ -180,11 +180,47 @@ def file_content(path, *, legacy=False):
     return _file_content(str(path), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, legacy)
 
 
+def compilation_library_content(item, *, legacy=False):
+    """Use a verified compiler identity for a resource-only native rebuild.
+
+    The private builder must reproduce the entire parent binary before
+    replacing only the ordered compute-stream allocation unit. Missing or
+    changed evidence falls back to the actual binary hash and rebuilds graphs.
+    Execution still uses the actual library; native plans always bind afresh.
+    """
+    actual = file_content(item["path"], legacy=legacy)
+    certificate = item.get("compilation_proof")
+    if legacy or Path(item["path"]).name != "libSynapse.so" or not certificate:
+        return actual
+    try:
+        path = Path(certificate["path"])
+        if hashlib.sha256(path.read_bytes()).hexdigest() != certificate["sha256"]:
+            return actual
+        proof = json.loads(path.read_text())
+        if (not re.fullmatch(r"[0-9a-f]{64}", str(proof.get("compilation_sha256")))
+                or proof.get("schema") != 1 or proof.get("kind") != "native_ordered_scratch_v1"
+                or proof.get("sha256") != actual or proof.get("compilation_sha256") != proof.get("parent_sha256")
+                or proof.get("parent_relinked_sha256") != proof.get("parent_sha256")
+                or proof.get("replaced_runtime_unit") != "stream_compute_scal.cpp.o"
+                or proof.get("class_layout_changed") is not False
+                or proof.get("graph_compiler_objects_unchanged") is not True
+                or proof.get("final_completion_retirement_unchanged") is not True
+                or proof.get("hcl_unchanged") is not True
+                or hashlib.sha256((path.parent / "source.patch").read_bytes()).hexdigest()
+                != proof.get("source_patch_sha256")):
+            return actual
+        return proof["compilation_sha256"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return actual
+
+
 def runtime_content_identity(profile, *, legacy=False):
     environment = semantic_environment(profile["environment"], legacy=legacy)
     records = {}
     for kind in ("additional_libraries", "configuration_files"):
-        records[kind] = [(Path(item["path"]).name, file_content(item["path"], legacy=legacy))
+        records[kind] = [(Path(item["path"]).name,
+                          compilation_library_content(item, legacy=legacy) if kind == "additional_libraries"
+                          else file_content(item["path"], legacy=legacy))
                          for item in profile.get(kind, ())]
     return hashlib.sha256(json.dumps(dict(environment=environment, records=records),
                                      sort_keys=True).encode()).hexdigest()
@@ -226,7 +262,8 @@ def lowered_keys(graph_bytes):
 
 def semantic_environment(environment, *, legacy=False):
     ignored = ("TMPDIR", "HABANA_LOGS", "VLLM_HPU_DSV4_WORKER_CPUS", "VLLM_HPU_DSV4_WORKER_HELPER_CPUS",
-               "VLLM_HPU_DSV41_FRONTEND_CACHE_DIR", "PT_HPU_RECIPE_CACHE_CONFIG")
+               "VLLM_HPU_DSV41_FRONTEND_CACHE_DIR", "PT_HPU_RECIPE_CACHE_CONFIG",
+               "VLLM_HPU_DSV41_NATIVE_WORKSPACE_REUSE")
     if not legacy:
         ignored += ("VLLM_HPU_DSV41_BACKEND_CACHE", )
     result = {}

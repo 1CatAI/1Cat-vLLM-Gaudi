@@ -3,6 +3,7 @@
 import hashlib
 import json
 from types import SimpleNamespace
+import pytest
 
 from vllm_gaudi.compilation.deepseek_v41_cache_identity import (
     computation_dependencies,
@@ -20,6 +21,61 @@ def test_allocator_capacity_keeps_numerical_cache_identity():
     assert larger["environment"]["PT_HPU_POOL_MEM_ACQUIRE_PERC"] == "98"
     changed = dict(environment={**larger["environment"], "VLLM_HPU_PRECISION": "bf16"})
     assert runtime_content_identity(first) != runtime_content_identity(changed)
+
+
+@pytest.fixture
+def resource_runtime(tmp_path):
+    old = tmp_path / "old" / "libSynapse.so"
+    new = tmp_path / "new" / "libSynapse.so"
+    old.parent.mkdir()
+    new.parent.mkdir()
+    old.write_bytes(b"compiler plus original allocation runtime")
+    new.write_bytes(b"same compiler plus graph-local allocation runtime")
+    def sha(path):
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    patch = tmp_path / "source.patch"
+    patch.write_text("runtime allocation only")
+    proof = dict(schema=1, kind="native_ordered_scratch_v1", sha256=sha(new),
+                 compilation_sha256=sha(old), parent_sha256=sha(old), parent_relinked_sha256=sha(old),
+                 replaced_runtime_unit="stream_compute_scal.cpp.o", class_layout_changed=False,
+                 graph_compiler_objects_unchanged=True, final_completion_retirement_unchanged=True,
+                 hcl_unchanged=True, source_patch_sha256=sha(patch))
+    record = tmp_path / "RESULT.json"
+    record.write_text(json.dumps(proof))
+    first = dict(environment={}, additional_libraries=[dict(path=str(old))])
+    second = dict(environment={"VLLM_HPU_DSV41_NATIVE_WORKSPACE_REUSE": "1"},
+                  additional_libraries=[dict(path=str(new),
+                                            compilation_proof=dict(path=str(record), sha256=sha(record)))])
+    return first, second, new, patch, record, proof
+
+
+def test_verified_resource_runtime_keeps_compiler_cache(resource_runtime):
+    first, second, *_ = resource_runtime
+    assert runtime_content_identity(first) == runtime_content_identity(second)
+    changed = dict(second, environment={**second["environment"], "VLLM_HPU_PRECISION": "bf16"})
+    assert runtime_content_identity(first) != runtime_content_identity(changed)
+
+
+@pytest.mark.parametrize("changed", ["binary", "patch", "record", "missing", "compiler", "parent_relink"])
+def test_changed_resource_proof_rebuilds_graphs(resource_runtime, changed):
+    first, second, binary, patch, record, proof = resource_runtime
+    if changed == "binary":
+        binary.write_bytes(binary.read_bytes() + b"operator change")
+    elif changed == "patch":
+        patch.write_text("different runtime patch")
+    elif changed == "record":
+        record.write_text("corrupt")
+    elif changed == "missing":
+        record.unlink()
+    else:
+        if changed == "compiler":
+            proof["graph_compiler_objects_unchanged"] = False
+        else:
+            proof["parent_relinked_sha256"] = "0" * 64
+        record.write_text(json.dumps(proof))
+        second["additional_libraries"][0]["compilation_proof"]["sha256"] = hashlib.sha256(
+            record.read_bytes()).hexdigest()
+    assert runtime_content_identity(first) != runtime_content_identity(second)
 
 
 def forward(owner, value):
