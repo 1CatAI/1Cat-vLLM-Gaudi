@@ -75,6 +75,13 @@ def install_compilation_proofs(profile, output, records):
         by_name[name]["compilation_proof"] = dict(path=str(target), sha256=digest(target))
 
 
+def relocated_library_target(binary, native, output):
+    """Keep selected kernel paths within their installed native database."""
+    if binary.is_relative_to(native):
+        return output / "native" / binary.relative_to(native)
+    return output / "lib" / binary.name
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime-profile", type=Path, required=True)
@@ -187,7 +194,7 @@ def main():
             if binary.name.endswith(".debug") or (library_dir / binary.name).exists():
                 continue
             shutil.copy2(binary, library_dir / binary.name)
-            mapping[str(binary)] = str(library_dir / binary.name)
+            mapping[str(binary)] = str(relocated_library_target(binary, native, output))
     preload = []
     for name in env.get("LD_PRELOAD", "").split(":"):
         if name:

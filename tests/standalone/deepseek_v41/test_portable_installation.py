@@ -86,6 +86,20 @@ def test_compilation_proof_survives_source_retirement(tmp_path):
         module.install_compilation_proofs(profile, tmp_path / "another", records)
 
 
+def test_native_loader_entry_does_not_redirect_selected_kernel_database(tmp_path):
+    module = tool("install_deepseek_v41_runtime")
+    native = tmp_path / "native-build"
+    output = tmp_path / "installation"
+    kernel = native / "libdeepseek_v41_unique_kernels.so"
+    target = module.relocated_library_target(kernel, native, output)
+    mapping = {str(native): str(output / "native"), str(kernel): str(target)}
+    relocated = module.relocate(dict(GC_KERNEL_PATH=str(kernel), native=str(native)), mapping)
+    assert relocated["GC_KERNEL_PATH"] == str(output / "native" / kernel.name)
+    assert relocated["native"] == str(output / "native")
+    external = tmp_path / "sdk" / "libSynapse.so"
+    assert module.relocated_library_target(external, native, output) == output / "lib" / external.name
+
+
 @pytest.mark.parametrize("error_code", (errno.ENOSPC, errno.EDQUOT))
 def test_optional_status_write_survives_full_storage_and_retries(tmp_path, monkeypatch, error_code):
     module = tool("serve_deepseek_v41")
