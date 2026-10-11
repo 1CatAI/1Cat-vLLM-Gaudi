@@ -39,6 +39,20 @@ configured working reserve. It records allocation growth and peak headroom as
 byte counts. Admission reserves the greater of peak growth and persistent growth
 plus working headroom, since profiling allocations have not yet been recreated.
 
+The allocation-pool fraction is a machine resource policy, not a numerical
+compilation dependency. Cache fingerprints preserve its previous canonical
+spelling for compatibility; the runtime profile records the actual configured
+fraction. Memory admission still binds the actual pool size. An expanded pool
+may retain a smaller pool's measured byte reserve only with every other contract
+field and all recorded artifacts unchanged. A reduced pool cannot borrow it,
+and a malformed current certificate must repeat profiling.
+
+After all native and protocol preparation, the worker checks actual free pool
+bytes against its serving workspace reserve before publishing readiness. A
+successful warmup alone does not prove a subsequent long prompt can allocate
+its working buffers. Retain context capacity and correct the resource budget
+when this final admission fails.
+
 Publication occurs only after full serving warmup succeeds. Missing, malformed,
 oversized, corrupted, or incompatible certificates repeat ordinary profiling.
 Missing or changed recorded artifacts also repeat profiling. No warmup shape is
