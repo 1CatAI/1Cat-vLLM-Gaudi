@@ -38,21 +38,12 @@ def normalized_source(value):
 
 
 @lru_cache(maxsize=512)
-def _python_source_digest(source):
-    return hashlib.sha256(ast.dump(ast.parse(source), include_attributes=False).encode()).hexdigest()
-
-
-def python_source_digest(path):
-    """Reuse source normalization by content, including same-timestamp edits."""
-    # Filesystems can coalesce ctime updates for back-to-back writes. Read
-    # source text to identify revisions; reuse the expensive AST conversion.
-    path = Path(path)
-    source = path.read_text()
-    if path.name == "envs.py" and path.parent.name == "vllm_gaudi":
+def _python_source_digest(source, resource_environment=False):
+    tree = ast.parse(source)
+    if resource_environment:
         # Registration of this native allocation-only setting does not
         # change any Python numerical path. Keep every other environment
         # definition and statement in the computation dependency.
-        tree = ast.parse(source)
         resource = "VLLM_HPU_DSV41_NATIVE_WORKSPACE_REUSE"
         for node in ast.walk(tree):
             for field in ("body", "orelse"):
@@ -65,8 +56,15 @@ def python_source_digest(path):
                 items = [(key, value) for key, value in zip(node.keys, node.values)
                          if not (isinstance(key, ast.Constant) and key.value == resource)]
                 node.keys, node.values = [key for key, _ in items], [value for _, value in items]
-        return hashlib.sha256(ast.dump(tree, include_attributes=False).encode()).hexdigest()
-    return _python_source_digest(source)
+    return hashlib.sha256(ast.dump(tree, include_attributes=False).encode()).hexdigest()
+
+
+def python_source_digest(path):
+    """Reuse source normalization by content, including same-timestamp edits."""
+    # Read content to identify revisions; cache the expensive AST conversion,
+    # including resource-setting normalization used by every stage owner.
+    path = Path(path)
+    return _python_source_digest(path.read_text(), path.name == "envs.py" and path.parent.name == "vllm_gaudi")
 
 
 @lru_cache(maxsize=512)

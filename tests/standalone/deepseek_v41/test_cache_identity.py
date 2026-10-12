@@ -71,6 +71,30 @@ def test_native_resource_registration_preserves_numerical_environment_sources(tm
     assert python_source_digest(path) != before
 
 
+def test_resource_environment_normalization_reuses_content_without_hiding_edits(tmp_path, monkeypatch):
+    from vllm_gaudi.compilation import deepseek_v41_cache_identity as module
+
+    package = tmp_path / "vllm_gaudi"
+    package.mkdir()
+    path = package / "envs.py"
+    path.write_text('variables = {"PRECISION": "fp8"}\n')
+    module._python_source_digest.cache_clear()
+    original = module.ast.parse
+    parsed = []
+
+    def counted(source, *args, **kwargs):
+        parsed.append(source)
+        return original(source, *args, **kwargs)
+
+    monkeypatch.setattr(module.ast, "parse", counted)
+    before = python_source_digest(path)
+    assert python_source_digest(path) == before
+    assert len(parsed) == 1
+    path.write_text('variables = {"PRECISION": "bf16"}\n')
+    assert python_source_digest(path) != before
+    assert len(parsed) == 2
+
+
 @pytest.mark.parametrize("changed", ["binary", "patch", "record", "missing", "compiler", "parent_relink"])
 def test_changed_resource_proof_rebuilds_graphs(resource_runtime, changed):
     first, second, binary, patch, record, proof = resource_runtime
