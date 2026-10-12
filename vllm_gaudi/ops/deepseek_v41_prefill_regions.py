@@ -203,7 +203,11 @@ def prefill_function_region(function):
                 function.__closure__,
             )
             cloned.__kwdefaults__ = function.__kwdefaults__
-            entry = torch.compile(cloned, backend="hpu_backend", fullgraph=True, dynamic=False)
+            from vllm_gaudi.compilation.deepseek_v41_frontend_cache import cached_tensor_entry
+
+            entry = cached_tensor_entry(cloned, args, kwargs)
+            if entry is None:
+                entry = torch.compile(cloned, backend="hpu_backend", fullgraph=True, dynamic=False)
             cache[key] = entry
             if len(cache) > 64:
                 cache.popitem(last=False)
@@ -249,7 +253,11 @@ def prefill_region(function):
                 function.__closure__,
             )
             cloned.__kwdefaults__ = function.__kwdefaults__
-            entry = torch.compile(MethodType(cloned, owner), backend="hpu_backend", fullgraph=True, dynamic=False)
+            from vllm_gaudi.compilation.deepseek_v41_frontend_cache import cached_tensor_entry
+
+            entry = cached_tensor_entry(cloned, args, kwargs, owner=owner)
+            if entry is None:
+                entry = torch.compile(MethodType(cloned, owner), backend="hpu_backend", fullgraph=True, dynamic=False)
             cache[key] = entry
             # This bounds Python/recipe ownership; the framework retains any
             # executor still referenced by an in-flight launch.

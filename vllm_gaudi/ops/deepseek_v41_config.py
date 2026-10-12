@@ -173,6 +173,9 @@ def configure(config):
             raise ValueError("V4.1 DSpark requires method=dspark and num_speculative_tokens=5")
         if spec.enable_adaptive_verification:
             raise ValueError("Adaptive DSpark verification is outside the bounded V4.1 profile")
+        from vllm_gaudi.ops.deepseek_v41_prefill_capacity import reserve_dspark_input_slots
+
+        reserve_dspark_input_slots(config)
     elif spec is not None:
         raise ValueError("Enable VLLM_HPU_DSV41_DSPARK for the integrated draft")
     validate_v2(config)

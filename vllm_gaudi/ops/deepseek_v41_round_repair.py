@@ -211,6 +211,19 @@ class C6LookaheadJournal(torch.nn.Module):
         self.second.restore()
 
 
+class _ProtocolCaptureSnapshot:
+    """Private cold-capture rollback; never retained by a serving replay."""
+
+    def __init__(self, small, rows):
+        self.small, self.rows = small, rows
+        self.bytes = small.bytes + sum(saved.numel() * saved.element_size() for _, _, saved in rows)
+
+    def restore(self):
+        self.small.restore()
+        for target, indices, saved in self.rows:
+            target.index_copy_(0, indices, saved)
+
+
 class SampledRoundRepairFrame(torch.nn.Module):
     """One retained official draw, draft state and following Target journal.
 
@@ -266,6 +279,32 @@ class SampledRoundRepairFrame(torch.nn.Module):
                     continue
             values.append(value)
         return tuple(values)
+
+    def capture_snapshot(self, states, *, exact_repair):
+        """Save the protocol's write set without cloning the whole Target KV.
+
+        The covered protocol only reads journal targets. Exact repair writes
+        the rows named by the initialized journal indices. Keep those indices
+        private to this capture, independently of the mutable journal buffers.
+        All other state keeps the ordinary complete snapshot contract.
+        """
+        from vllm_gaudi.ops.deepseek_v41_replay import _Snapshot
+
+        journals = ((self.journal.first, self.journal.second)
+                    if isinstance(self.journal, C6LookaheadJournal) else (self.journal,))
+        targets = {id(getattr(journal, f"target_{i}"))
+                   for journal in journals for i in range(len(journal.specs))}
+        small = _Snapshot(tuple(value for value in states if id(value) not in targets))
+        rows = []
+        if exact_repair:
+            active = {id(value) for value in states}
+            for journal in journals:
+                for i in range(len(journal.specs)):
+                    target = getattr(journal, f"target_{i}")
+                    if id(target) in active:
+                        indices = getattr(journal, f"indices_{i}").to(dtype=torch.int64).clone()
+                        rows.append((target, indices, target.index_select(0, indices).clone()))
+        return _ProtocolCaptureSnapshot(small, rows)
 
     def capture_inputs(self, *values):
         for index, value in enumerate(values):

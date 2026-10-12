@@ -26,7 +26,7 @@ def test_tp4_scheduler_chunks_and_short_tail(prompt, chunks, expected):
     assert actual == expected
 
 
-def make_stage(monkeypatch):
+def make_stage(monkeypatch, *, dspark=False):
     from vllm_gaudi.models import deepseek_v41_program as program
     from vllm_gaudi.ops import deepseek_v41_prefill_sequence_state as sequence
     monkeypatch.setattr(sequence, "can_sequence_prefill_state", lambda stage, tokens: False)
@@ -64,11 +64,12 @@ def make_stage(monkeypatch):
             if self.layer > 20:
                 assert torch.equal(shared.candidate_pool[:count, 0], positions)
                 assert torch.equal(shared.topk["20"].indices[:count, 0], positions)
-            return residual + 1, pre, None
+            target = residual[-256:].mean(1) if dspark and self.layer in (37, 38, 39) else None
+            return residual + 1, pre, target
 
     stage = program.PreparedStage.__new__(program.PreparedStage)
     nn.Module.__init__(stage)
-    stage.tensor_parallel_size, stage.pp_rank, stage.dspark = 4, 0, False
+    stage.tensor_parallel_size, stage.pp_rank, stage.dspark = 4, 0, dspark
     stage.start, stage.stop, stage.is_last_stage = 0, 40, True
     stage.shared = shared
     stage.layers = nn.ModuleList([Layer(index) for index in range(40)])
@@ -76,6 +77,23 @@ def make_stage(monkeypatch):
     stage.weights = SimpleNamespace(norm=SimpleNamespace(weight=torch.ones(1)))
     monkeypatch.setattr(program, "final_collapse_rms_norm", lambda residual, pre, weight, eps: residual[:, 0])
     return stage, calls
+
+
+@pytest.mark.parametrize("mode", ("final", "prefix_only"))
+def test_dspark_halo_publishes_causal_target_context_for_every_prompt_chunk(monkeypatch, mode):
+    stage, calls = make_stage(monkeypatch, dspark=True)
+    positions = torch.arange(16384, 32768, dtype=torch.int32)
+    residual = positions.float().reshape(-1, 1, 1).expand(-1, 4, -1).clone()
+    output, pre, context = stage._forward_prefill_halo(
+        residual, torch.zeros(16384, 4), positions, positions, mode, (None, None)
+    )
+    assert [(layer, count) for layer, count, _ in calls] == [
+        (layer, 16384 if layer <= 20 else 4096) for layer in range(40)
+    ]
+    assert output.shape == (16384, 1) and pre.shape == (16384, 4)
+    assert torch.equal(output[-4096:, 0], positions[-4096:].float() + 40)
+    assert context.shape == (256, 3)
+    assert torch.equal(context, positions[-256:, None].float() + torch.tensor([37, 38, 39]))
 
 
 def test_owned_tp4_final_keeps_full_front_and_rebinds_source20(monkeypatch):
@@ -154,6 +172,7 @@ def test_normal_runner_transactions_and_ineligible_requests(monkeypatch, batch, 
                                                             expected):
     from vllm_gaudi.v1.worker.deepseek_v41_runner import V41ModelRunner
     monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_DECODER_HALO", "1")
+    monkeypatch.setenv("VLLM_HPU_DSV41_PREFILL_REINDEX_REUSE", "1")
     monkeypatch.delenv("VLLM_HPU_DSV41_PREFILL_EVENT_TRACE", raising=False)
     monkeypatch.delenv("VLLM_HPU_DSV41_PREFILL_COMPUTE_TOKENS", raising=False)
     program = SimpleNamespace(tensor_parallel_size=4, runtime_indexer=False, length=524288, prefill_halo_mode="full")
@@ -190,7 +209,7 @@ def test_normal_runner_transactions_and_ineligible_requests(monkeypatch, batch, 
         V41ModelRunner._execute_request(runner, scheduled, "A", capacity)
         assert program.prefill_halo_mode == "full"
     assert [mode for mode, _, _, _ in calls] == expected
-    geometry = ([(0, 16384, 16384), (16384, 16384, 32768)] if capacity == 16384 else [(0, 8192, 8192),
+    geometry = ([(0, 16384, 16384), (16384, 16384, 32768)] if capacity == 16384 else [(0, 8192, 16384),
                                                                                       (8192, 8192, 16384),
                                                                                       (16384, 8192, 32768),
                                                                                       (24576, 8192, 32768)])

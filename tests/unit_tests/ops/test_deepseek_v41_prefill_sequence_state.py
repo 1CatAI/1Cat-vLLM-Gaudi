@@ -7,6 +7,27 @@ from vllm_gaudi.ops import deepseek_v41_prefill_sequence_state as sequence
 from vllm_gaudi.ops.deepseek_v41_math import hc_post
 
 
+@pytest.mark.parametrize("dspark", (False, True))
+def test_complete_prefill_token_ownership_is_independent_of_decode_method(monkeypatch, dspark):
+    from types import SimpleNamespace
+    for name in ("PREFILL_REGIONS", "PREFILL_MHC_INPUT", "PREFILL_MHC_POST"):
+        monkeypatch.setenv("VLLM_HPU_DSV41_" + name, "1")
+    stage = SimpleNamespace(tensor_parallel_size=4, dspark=dspark)
+    for count in (1024, 2048, 4096, 8192, 16384):
+        assert sequence.can_sequence_prefill_state(stage, count)
+    assert not sequence.can_sequence_prefill_state(stage, 6)
+    assert not sequence.can_sequence_prefill_state(stage, 512)
+
+
+@pytest.mark.parametrize("retained", (256, 384))
+def test_draft_context_ring_preserves_global_tail_across_token_owners(monkeypatch, retained):
+    full = torch.arange(1024 * 4).reshape(1024, 4).bfloat16()
+    local = full[-256:]
+    monkeypatch.setattr(sequence, "gather_tokens", lambda value, *, group: full)
+    monkeypatch.setattr(sequence, "replicate_owned_tail", lambda value, count, *, group: full[-count:])
+    assert torch.equal(sequence.causal_context_tail(local, retained, group=object()), full[-retained:])
+
+
 @pytest.mark.parametrize("rank", range(4))
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.bfloat16])
 def test_engram_exchange_keeps_all_heads_for_the_owned_rows(monkeypatch, rank, dtype):

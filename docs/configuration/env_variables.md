@@ -73,6 +73,45 @@ Source, topology, tensor layout and quantization fingerprints must match;
 invalid or incomplete caches fail explicitly. Dense weights and Engram
 continue to use their existing sources. The variable is unset by default.
 
+`VLLM_HPU_DSV41_N256_LOAD_WORKERS` selects one to four CPU workers for
+rank-local expert conversion when no prepared N256 directory is selected.
+Workers read bounded expert ranges and prepare the original compressed layout
+and channel scales; device allocations and copies retain their original
+ordering. CPU staging remains bounded, and workers leave file-cache eviction
+to the operating system. The default is `1`; increasing it is opt-in pending
+complete startup qualification. This option does not change model arithmetic.
+
+`VLLM_HPU_DSV41_N256_DEVICE_PREPARE` (default `0`) selects bounded Gaudi-side
+integer weight layout, channel scale preparation, and qualification. Only
+compressed source bytes are uploaded; converted weights fill the existing
+resident allocation. Certificates are checked once per projection before its
+publication. The candidate does not change the numerical decode path or skip
+any warmup shapes; complete model startup qualification is still required.
+
+`VLLM_HPU_DSV41_N256_PACK_LIBRARY` selects the independently built CPU layout
+helper from `tools/build_deepseek_v41_startup_pack.py`. The loader validates its
+manifest and ABI before copying any converted expert batch. The helper only
+reorders compressed integer bytes; scale selection and all HPU consumers stay
+on the shared path. Unset by default pending device and startup qualification.
+
+`VLLM_HPU_DSV41_BACKEND_CACHE` enables persistent lowered inference modules
+alongside guarded frontends. It restores partitioned modules, JIT descriptions
+and input/output metadata; native plans, recipe handles and communication
+ownership are created in the current process. It is enabled when a guarded
+frontend cache directory is configured. Set it to `0` to disable backend reuse.
+
+`VLLM_HPU_DSV41_FRONTEND_CACHE_DIR` selects persistent Dynamo frontend metadata
+for the shared native stage. Normal serving resource preparation selects a
+directory beside its persistent recipes; an explicit empty value disables it.
+Only the matching input bucket is deserialized. Restored entries rebind current
+weights/state and retain Torch's tensor, alias and shape guards, together with
+scalar weight-layout qualifications and callable defaults. Backend recipes and
+native communication bindings are rebuilt through the existing code; no device
+addresses or communication plans are restored. Complete warmup shapes remain
+enabled. Source, runtime, model or arithmetic-feature changes select another
+namespace; CPU placement and cache locations alone do not invalidate frontend
+artifacts. Full-service startup and decode qualification remain pending.
+
 `VLLM_HPU_DSV41_MHC_BATCH_REUSE=1` tests four-request control-weight reuse in the ordinary decode batch path. It keeps FP32 operands and each request's original K accumulation and reduction order. It is disabled by default pending complete-chain and serving qualification.
 
 `VLLM_HPU_DSV41_DSPARK_BF16_PROJECTIONS=1` retains BF16 checkpoint vocabulary/router weights in DSpark. FP32 activations use BF16 high/low rows in one GEMM with FP32 accumulation; BF16 activations use their exact single term. Disabled by default pending batch qualification.
@@ -1445,3 +1484,11 @@ certificate. Full communication retirement remains required. Shared-coordinate
 plans are excluded; prefill, DSpark and wider buckets retain their existing path.
 Combined serving correctness passed, but the experimental switches remain off
 because the combined latency reduction did not meet the promotion gate.
+# Native replay workspace allocation
+
+`VLLM_HPU_DSV41_NATIVE_WORKSPACE_REUSE` (default `0`) selects graph-local
+scratch reuse in a compatible native runtime built with the private workspace
+builder. Ordered recipes may reuse adequate retained scratch. Different graphs
+remain isolated, addresses remain stable, and graph completion controls release.
+This changes allocation policy rather than numerical computation; actual pool
+headroom must still pass final admission after all production warmup shapes.

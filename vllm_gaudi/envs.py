@@ -39,6 +39,11 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH: bool = False
     VLLM_HPU_DSV41_EXPERT_N256: bool = False
     VLLM_HPU_DSV41_N256_PREPARED_DIR: Optional[str] = None
+    VLLM_HPU_DSV41_N256_LOAD_WORKERS: int = 1
+    VLLM_HPU_DSV41_N256_DEVICE_PREPARE: bool = False
+    VLLM_HPU_DSV41_N256_PACK_LIBRARY: Optional[str] = None
+    VLLM_HPU_DSV41_FRONTEND_CACHE_DIR: Optional[str] = None
+    VLLM_HPU_DSV41_BACKEND_CACHE: bool = True
     VLLM_HPU_DSV41_DEFAULT_FASTPATHS: bool = False
     VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS: bool = False
     VLLM_HPU_DSV41_EXPERT_N256_FP8: bool = False
@@ -312,6 +317,7 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_ENGRAM_NATIVE_C1: bool = False
     VLLM_HPU_DSV41_ENGRAM_C1_PACKET: bool = False
     VLLM_HPU_DSV41_TP_MHC_OVERLAP: bool = False
+    VLLM_HPU_DSV41_NATIVE_WORKSPACE_REUSE: bool = False
     VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH: bool = False
     VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT: bool = False
     VLLM_HPU_DSV41_V2_EARLY_INPUT_COMMIT: bool = False
@@ -631,6 +637,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_N256", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_N256_PREPARED_DIR":
     lambda: os.environ.get("VLLM_HPU_DSV41_N256_PREPARED_DIR"),
+    "VLLM_HPU_DSV41_N256_LOAD_WORKERS":
+    lambda: int(os.environ.get("VLLM_HPU_DSV41_N256_LOAD_WORKERS", "1")),
+    "VLLM_HPU_DSV41_N256_DEVICE_PREPARE":
+    lambda: os.environ.get("VLLM_HPU_DSV41_N256_DEVICE_PREPARE", "0") == "1",
+    "VLLM_HPU_DSV41_N256_PACK_LIBRARY":
+    lambda: os.environ.get("VLLM_HPU_DSV41_N256_PACK_LIBRARY"),
+    "VLLM_HPU_DSV41_FRONTEND_CACHE_DIR":
+    lambda: os.environ.get("VLLM_HPU_DSV41_FRONTEND_CACHE_DIR"),
+    "VLLM_HPU_DSV41_BACKEND_CACHE":
+    lambda: os.environ.get("VLLM_HPU_DSV41_BACKEND_CACHE", "1") == "1",
     "VLLM_HPU_DSV41_EXPERT_N256_FP8":
     lambda: os.environ.get("VLLM_HPU_DSV41_EXPERT_N256_FP8", "0").lower() in ("1", "true"),
     # Keep the resident N256 allocation for C1 decode, but restore bounded
@@ -1229,6 +1245,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_ENGRAM_C1_PACKET", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_TP_MHC_OVERLAP":
     lambda: os.environ.get("VLLM_HPU_DSV41_TP_MHC_OVERLAP", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_NATIVE_WORKSPACE_REUSE":
+    lambda: os.environ.get("VLLM_HPU_DSV41_NATIVE_WORKSPACE_REUSE", "0") == "1",
     "VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH":
     lambda: os.environ.get("VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_ENGRAM_DIRECT_INPUT":

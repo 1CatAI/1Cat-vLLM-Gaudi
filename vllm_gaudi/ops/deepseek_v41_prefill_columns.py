@@ -5,6 +5,8 @@ import functools
 from types import FunctionType
 
 import torch
+
+from vllm_gaudi.compilation.deepseek_v41_frontend_cache import persistent_tensor_function
 import torch.nn.functional as F
 
 
@@ -90,25 +92,25 @@ def permuted_body_single_fp8_pair_tail(value, routing, slots, expert_ids, q13, q
 def compiled_permuted_write_body(signature):
     entry = FunctionType(permuted_body_write.__code__.replace(co_name=f"permuted_expert_write_{signature}"),
                          permuted_body_write.__globals__)
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 @functools.lru_cache(maxsize=32)
 def compiled_permuted_single_fp8_write_body(signature):
     entry = FunctionType(permuted_body_single_fp8_write.__code__.replace(co_name=f"permuted_single_fp8_{signature}"),
                          permuted_body_single_fp8_write.__globals__)
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 @functools.lru_cache(maxsize=32)
 def compiled_permuted_single_fp8_pair_tail(signature):
     entry = FunctionType(permuted_body_single_fp8_pair_tail.__code__.replace(co_name=f"fp8_pair_tail_{signature}"),
                          permuted_body_single_fp8_pair_tail.__globals__)
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 @functools.lru_cache(maxsize=32)
 def compiled_permuted_reduce(signature):
     entry = FunctionType(permuted_ordered_reduce.__code__.replace(co_name=f"permuted_expert_reduce_{signature}"),
                          permuted_ordered_reduce.__globals__)
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)

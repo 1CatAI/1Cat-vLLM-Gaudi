@@ -12,6 +12,27 @@ import time
 import urllib.request
 
 
+class StartupFailureMonitor:
+    """Detect fatal worker exits even when the API parent remains alive."""
+
+    def __init__(self, path):
+        self.path, self.offset, self.pending = path, 0, ""
+
+    def poll(self):
+        with self.path.open(errors="replace") as stream:
+            stream.seek(self.offset)
+            text = self.pending + stream.read(1 << 20)
+            self.offset = stream.tell()
+        lines = text.split("\n")
+        self.pending = lines.pop()[-16384:]
+        for line in (*lines, self.pending):
+            if re.search(r"\b(?:ERROR|CRITICAL|FATAL)\b", line) and any(
+                    term in line for term in ("WorkerProc hit an exception", "Engine core initialization failed",
+                                              "synLaunch failed", "FATAL ERROR")):
+                return line[-4096:]
+        return None
+
+
 def atomic_json(path, value, *, required=True):
     temporary = path.with_suffix(".tmp")
     try:
@@ -64,8 +85,12 @@ def isolate_desktop(reserved):
                 if original & protected:
                     selected = original & available or available
                     os.sched_setaffinity(tid, selected)
-                    records.append(dict(pid=int(process.name), tid=tid, start_ticks=identity,
-                                        original=sorted(original), selected=sorted(selected)))
+                    records.append(
+                        dict(pid=int(process.name),
+                             tid=tid,
+                             start_ticks=identity,
+                             original=sorted(original),
+                             selected=sorted(selected)))
         except (OSError, ValueError):
             continue
     return records
@@ -158,6 +183,9 @@ def main():
         # A configured tmpfs scratch directory must be recreated after reboot.
         temporary_path = Path(compiler_temp).expanduser()
         compiler_temp = str((temporary_path if temporary_path.is_absolute() else root / temporary_path).resolve())
+        from run_deepseek_v41 import ipc_scratch_path
+
+        compiler_temp = str(ipc_scratch_path(compiler_temp, root))
         Path(compiler_temp).mkdir(mode=0o700, parents=True, exist_ok=True)
     allocation = settings["cpu_allocation"]
     reserved = set(allocation["worker_main"] + allocation["engine_main"] + allocation["api_main"] +
@@ -175,8 +203,9 @@ def main():
     if compiler_temp:
         environment["TMPDIR"] = compiler_temp
     for key in list(environment):
-        if key.startswith(("VLLM_HPU_DSV", "VLLM_HPU_TP2", "DSV41_", "DUMP_")) or key in (
-                "PYTHONPATH", "LD_PRELOAD", "GRAPH_VISUALIZATION", "GRAPH_VISUALIZATION_DIR", "PT_HPU_GRAPH_DUMP_PREFIX"):
+        if key.startswith(("VLLM_HPU_DSV", "VLLM_HPU_TP2", "DSV41_",
+                           "DUMP_")) or key in ("PYTHONPATH", "LD_PRELOAD", "GRAPH_VISUALIZATION",
+                                                "GRAPH_VISUALIZATION_DIR", "PT_HPU_GRAPH_DUMP_PREFIX"):
             environment.pop(key)
     environment["VLLM_ENGINE_READY_TIMEOUT_S"] = "3600"
     environment["PYTHONUNBUFFERED"] = "1"
@@ -185,24 +214,54 @@ def main():
     environment["GLOO_SOCKET_IFNAME"] = settings.get("environment", {}).get("GLOO_SOCKET_IFNAME", "lo")
     if settings.get("api_key_file"):
         environment["VLLM_API_KEY"] = Path(settings["api_key_file"]).read_text().strip()
-    command = [str(root / "venv/bin/python"), "-m", "vllm_gaudi.entrypoints.deepseek_v41",
-               "--settings", str(settings_path), "--host", args.host, "--port", str(args.port), *extra]
+    command = [
+        str(root / "venv/bin/python"), "-m", "vllm_gaudi.entrypoints.deepseek_v41", "--settings",
+        str(settings_path), "--host", args.host, "--port",
+        str(args.port), *extra
+    ]
     with (log_dir / "service.log").open("w") as stream:
-        child = subprocess.Popen(command, cwd=root, env=environment, stdout=stream, stderr=subprocess.STDOUT,
+        child = subprocess.Popen(command,
+                                 cwd=root,
+                                 env=environment,
+                                 stdout=stream,
+                                 stderr=subprocess.STDOUT,
                                  start_new_session=True)
-        record = dict(pid=child.pid, pgid=child.pid, command=command, installation=str(root),
-                      started_at=time.time(), cpu_allocation=allocation)
+        record = dict(pid=child.pid,
+                      pgid=child.pid,
+                      command=command,
+                      installation=str(root),
+                      started_at=time.time(),
+                      cpu_allocation=allocation)
         atomic_json(log_dir / "process.json", record)
         atomic_json(root / "service.json", dict(**record, log_dir=str(log_dir)))
+
         def stop(signum, frame):
             if child.poll() is None:
                 os.killpg(child.pid, signal.SIGTERM)
+
         signal.signal(signal.SIGTERM, stop)
         signal.signal(signal.SIGINT, stop)
         ready = False
         status_write_failed = False
+        startup_monitor = StartupFailureMonitor(log_dir / "service.log")
+        startup_failure = None
         while child.poll() is None:
             if not ready:
+                startup_failure = startup_monitor.poll()
+                if startup_failure:
+                    record["startup_failure"] = startup_failure
+                    print("Startup failed; retiring owned workers: " + startup_failure, flush=True)
+                    stop(signal.SIGTERM, None)
+                    try:
+                        child.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    child.wait()
+                    break
                 try:
                     with urllib.request.urlopen(f"http://127.0.0.1:{args.port}/health", timeout=1) as response:
                         ready = response.status == 200
@@ -210,6 +269,11 @@ def main():
                     pass
                 if ready:
                     record["ready_at"] = time.time()
+                    from report_deepseek_v41_startup import summarize
+
+                    summary = summarize(record, (log_dir / "service.log").read_text(errors="replace"))
+                    atomic_json(log_dir / "startup-summary.json", summary, required=False)
+                    print("Startup cache summary: " + json.dumps(summary["cache_by_rank"]), flush=True)
                     print("Ready; maintaining main/helper CPU isolation", flush=True)
             if ready:
                 record["processes"] = maintain_affinity(child.pid, settings)
@@ -222,7 +286,7 @@ def main():
             time.sleep(1)
         record.update(exit_code=child.returncode, finished_at=time.time())
         atomic_json(log_dir / "process.json", record, required=False)
-    raise SystemExit(child.returncode)
+    raise SystemExit(child.returncode or (1 if startup_failure else 0))
 
 
 if __name__ == "__main__":

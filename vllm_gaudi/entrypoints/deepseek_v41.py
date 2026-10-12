@@ -328,16 +328,20 @@ def _enabled(value):
 # input and sampling. Explicit disables retain their priority; PP2 keeps its
 # separately qualified defaults.
 _DSPARK_SINGLE_STAGE_DEFAULTS = {
+    **{key: value for key, value in _TP4_FASTPATH_DEFAULTS.items()
+       if (key.startswith("VLLM_HPU_DSV41_PREFILL_") or key == "VLLM_HPU_DSV41_FLASHINFER_PREFILL")
+       and key not in _PIPELINE_ONLY_FASTPATHS},
     "VLLM_HPU_DSV41_EXPERIMENTAL_NUMERIC_FASTPATHS": "1",
     "VLLM_HPU_DSV41_BF16_LM_HEAD": "1",
+    "VLLM_HPU_DSV41_WO_A_FP8": "1",
+    "VLLM_HPU_DSV41_WOA_OUTPUT_ROUNDTRIP": "1",
+    "VLLM_HPU_DSV41_ATTN_DENSE_FP8": "1",
     "VLLM_HPU_DSV41_MHC_CONTROL_RRMS": "1",
     "VLLM_HPU_DSV41_MHC_CONTROL_MME": "1",
     "VLLM_HPU_DSV41_ROUTER_TOP6": "1",
     "VLLM_HPU_DSV41_FUSED_STAGE_IO": "1",
     "VLLM_HPU_DSV41_BATCHED_INPUT_STAGING": "1",
     "VLLM_HPU_DSV41_DEVICE_ROUNDS": "1",
-    "VLLM_HPU_DSV41_PREFILL_NATIVE_PLAN": "0",
-    "VLLM_HPU_DSV41_PREFILL_HYBRID_ROWS": "0",
     "VLLM_HPU_DSV41_DSPARK_NATIVE_SAMPLED_PROTOCOL": "1",
     "VLLM_HPU_DSV41_DSPARK_NATIVE_FULL_MAIN": "1",
     "VLLM_HPU_DSV41_DSPARK_NATIVE_FULL_REPAIR": "1",
@@ -964,6 +968,8 @@ def main():
         os.environ["VLLM_HPU_DSV41_N256_PREPARED_DIR"] = str(directory)
     prepare_environment(args.model, settings.get("sidecars"), args.tensor_parallel_size, args.pipeline_parallel_size)
     loader = {} if args.checkpoint_audit is None else {"checkpoint_audit": args.checkpoint_audit}
+    if settings.get("engram_resident_tables"):
+        loader["engram_resident_tables"] = settings["engram_resident_tables"]
     trace_dir = os.environ.get("VLLM_TORCH_PROFILER_DIR")
     if trace_dir and not any(value.startswith("--profiler-config") for value in extra):
         # The engine registers /start_profile only from ProfilerConfig. The
@@ -1040,7 +1046,7 @@ def main():
     ]
     residency = None
     try:
-        if args.engram_residency == "locked":
+        if args.engram_residency == "locked" and not loader.get("engram_resident_tables"):
             from vllm_gaudi.ops.deepseek_v41_residency import (
                 EngramDeviceGate, EngramResidency, EngramStartup, table_regions,
             )

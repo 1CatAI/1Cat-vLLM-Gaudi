@@ -75,6 +75,19 @@ def test_direct_load_binds_prepared_bytes_without_requantization(tmp_path):
     assert shard.max_host_chunk_bytes == 64
 
 
+def test_prefetched_chunks_preserve_order_bytes_and_metrics(tmp_path, monkeypatch):
+    import vllm_gaudi.ops.deepseek_v41_shard_loader as loader
+
+    bits, _ = make_checkpoint(tmp_path)
+    monkeypatch.setattr(loader, "COPY_BYTES", 16)
+    shard = PreparedV41Shard(tmp_path, 0, 0)
+    actual = shard.tensor("weight", "cpu")
+    assert np.array_equal(actual.view(torch.int16).numpy().view(np.uint16), bits)
+    assert shard.max_host_chunk_bytes == 16
+    assert shard.startup_timings["source_bytes"] == bits.nbytes
+    assert shard.startup_timings["upload_bytes"] == bits.nbytes
+
+
 def test_loader_rejects_weight_changes_and_wrong_manifests(tmp_path):
     make_checkpoint(tmp_path)
     shard = PreparedV41Shard(tmp_path, 0, 0)

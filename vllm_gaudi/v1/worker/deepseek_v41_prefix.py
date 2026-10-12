@@ -183,7 +183,21 @@ class PrefixCheckpoints:
                            record_done=self._done,
                            **options)
         if getattr(runner, "use_dspark", False):
-            values = tuple(value.detach().clone() for value in draft_context_views(runner.model.program))
+            program = runner.model.program
+            values = tuple(value.detach().clone() for value in draft_context_views(program))
+            if inline is not None and getattr(program, "draft", None) is not None:
+                target = inline.draft_context()
+                positions = torch.arange(boundary - target.shape[0], boundary, dtype=torch.int32,
+                                         device=target.device)
+                # The ordinary draft producer defines its packed/decoded state.
+                # Save that exact boundary without rewinding the live end-of-tile
+                # context or keeping full prompt hidden-state intermediates.
+                live = values
+                try:
+                    runner._insert(target, positions)
+                    values = tuple(value.detach().clone() for value in draft_context_views(program))
+                finally:
+                    restore_draft_context(program, live)
             self._done()
             self.draft_histories = {
                 key: value

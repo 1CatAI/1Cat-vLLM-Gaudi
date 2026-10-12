@@ -5,7 +5,7 @@ import torch.distributed as dist
 
 def can_sequence_prefill_state(stage, tokens):
     from vllm_gaudi import envs
-    return (stage.tensor_parallel_size == 4 and not stage.dspark and tokens == 16384
+    return (stage.tensor_parallel_size == 4 and tokens in (1024, 2048, 4096, 8192, 16384)
             and envs.VLLM_HPU_DSV41_PREFILL_REGIONS and envs.VLLM_HPU_DSV41_PREFILL_MHC_INPUT
             and envs.VLLM_HPU_DSV41_PREFILL_MHC_POST)
 
@@ -64,6 +64,16 @@ def replicate_owned_tail(local, retained, *, group):
         (retained, *local.shape[1:])))
     dist.broadcast(result, src=dist.get_global_rank(group, 3), group=group)
     return result
+
+
+def causal_context_tail(local, retained, *, group):
+    """Collect a draft ring even when its rows cross token-owner intervals."""
+    if local.shape[0] >= retained:
+        return replicate_owned_tail(local.contiguous(), retained, group=group)
+    full = gather_tokens(local.contiguous(), group=group)
+    if retained > full.shape[0]:
+        raise ValueError("Draft context tail exceeds the full prompt transaction")
+    return full[-retained:].contiguous()
 
 
 def sequence_hc_input(residual,

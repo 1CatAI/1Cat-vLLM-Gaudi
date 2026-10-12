@@ -63,4 +63,9 @@ class NativeSampledRoundProtocol(NativeDraftProtocol):
         entry = FunctionType(function.__code__.replace(co_name=name), function.__globals__, name,
                              function.__defaults__, function.__closure__)
         entry.__module__ = function.__module__
+        from vllm_gaudi.compilation.deepseek_v41_frontend_cache import cached_tensor_entry
+
+        cached = cached_tensor_entry(entry, self.fixed, {}, owner=self)
+        if cached is not None:
+            return cached
         return torch.compile(MethodType(entry, self), backend="hpu_backend", fullgraph=True, dynamic=False)

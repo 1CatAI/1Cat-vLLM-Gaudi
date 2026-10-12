@@ -8,6 +8,8 @@ from functools import lru_cache
 from types import FunctionType
 
 import torch
+
+from vllm_gaudi.compilation.deepseek_v41_frontend_cache import persistent_tensor_function
 import torch.distributed as dist
 
 from vllm_gaudi.ops.deepseek_v41_prefill_mla import sparse_prefill_mla
@@ -36,7 +38,7 @@ def _mla64(query, cache, indices, sink):
 @lru_cache(maxsize=16)
 def _compiled_mla64(signature):
     entry = FunctionType(_mla64.__code__.replace(co_name=f"sequence_mla_{signature}"), _mla64.__globals__)
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 def _exchanged_mla64(query, cache, indices, sink):
@@ -52,7 +54,7 @@ def _exchanged_mla64(query, cache, indices, sink):
 def _compiled_exchanged_mla64(signature):
     entry = FunctionType(_exchanged_mla64.__code__.replace(co_name=f"exchanged_mla_{signature}"),
                          _exchanged_mla64.__globals__)
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 def _paged_exchanged_mla64(query, swa, indices, sink, packed, pages, ratio):
@@ -73,7 +75,7 @@ def _paged_exchanged_mla64(query, swa, indices, sink, packed, pages, ratio):
 def _compiled_paged_exchanged_mla64(signature):
     entry = FunctionType(_paged_exchanged_mla64.__code__.replace(co_name=f"paged_sequence_mla_{signature}"),
                          _paged_exchanged_mla64.__globals__)
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 def sequence_prefill_mla(query,

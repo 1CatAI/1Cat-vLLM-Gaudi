@@ -6,6 +6,8 @@ from types import FunctionType
 
 import torch
 
+from vllm_gaudi.compilation.deepseek_v41_frontend_cache import persistent_tensor_function
+
 from vllm_gaudi.ops.deepseek_v41_math import unpack_fp4
 
 # A transaction-local workspace, never a mirror of the full context cache.
@@ -90,7 +92,7 @@ def compiled_prefill_full_selection_step(signature):
         prefill_full_selection_step.__code__.replace(co_name=f"prefill_full_select_{signature}"),
         prefill_full_selection_step.__globals__,
     )
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 def native_prefill_index_scores(query, weights, packed, table, positions, rows, ratio, local_heads=16):
@@ -112,7 +114,7 @@ def compiled_native_prefill_index_scores(signature):
         native_prefill_index_scores.__code__.replace(co_name=f"prefill_native_index_{signature}"),
         native_prefill_index_scores.__globals__,
     )
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 def full_prefill_sram_scores(query, weights, packed, table, positions, rows, ratio, local_heads=16):
@@ -543,14 +545,14 @@ def windowed_prefill_reindex_selection(query, weights, packed, table, positions,
 def compiled_reindex_window_scores(signature):
     entry = FunctionType(reindex_window_scores.__code__.replace(co_name=f"reindex_window_{signature}"),
                          reindex_window_scores.__globals__)
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 @lru_cache(maxsize=64)
 def compiled_select_reindex_slots(signature):
     entry = FunctionType(select_reindex_slots.__code__.replace(co_name=f"reindex_slots_{signature}"),
                          select_reindex_slots.__globals__)
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 def _candidate_slot_topk(common, positions, blocks, ratio, native_gather=False):
@@ -584,7 +586,7 @@ def compiled_decode_shared_index_keys(signature):
         decode_shared_index_keys.__globals__,
         argdefs=decode_shared_index_keys.__defaults__,
     )
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 @lru_cache(maxsize=64)
@@ -594,7 +596,7 @@ def compiled_decoded_reindex(signature):
         decoded_reindex.__globals__,
         argdefs=decoded_reindex.__defaults__,
     )
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 def index_scores(
@@ -636,7 +638,7 @@ def compiled_index_scores(signature):
         index_scores.__globals__,
         argdefs=index_scores.__defaults__,
     )
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 def shared_index_scores(query, weights, packed, table, positions, ratio, local_heads, source_rows):
@@ -661,7 +663,7 @@ def compiled_shared_index_scores(signature):
         shared_index_scores.__code__.replace(co_name=f"shared_index_scores_{signature}"),
         shared_index_scores.__globals__,
     )
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 def shared_reindex(query, weights, packed, table, positions, blocks, ratio, local_heads, source_rows):
@@ -699,4 +701,4 @@ def compiled_shared_reindex(signature):
     entry = FunctionType(
         shared_reindex.__code__.replace(co_name=f"shared_reindex_{signature}"), shared_reindex.__globals__
     )
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)

@@ -7,6 +7,28 @@ DEFAULT_PREFILL_TOKENS = 8192
 PREFILL_COMPUTE_BUCKETS = (16384, 8192, 4096, 2048, 1024, 512, 256, 128)
 
 
+def prefill_target_tokens(scheduler_config):
+    """Separate target compute/storage from additional parallel-draft inputs."""
+    scheduled = scheduler_config.max_num_scheduled_tokens
+    return scheduler_config.max_num_batched_tokens if scheduled is None else scheduled
+
+
+def reserve_dspark_input_slots(config):
+    """Keep the requested target budget while reserving separate draft inputs.
+
+    The scheduler deducts parallel-draft input slots even for prompt chunks.
+    Target and draft execute in separate prepared plans; a full target chunk
+    must not become an unaligned remainder when speculation is enabled.
+    Configuration can run again after serialization, so retain an explicit
+    compute budget rather than adding the reservation repeatedly.
+    """
+    scheduler = config.scheduler_config
+    target = prefill_target_tokens(scheduler)
+    slots = config.speculative_config.max_num_new_slots_for_drafting
+    scheduler.max_num_scheduled_tokens = target
+    scheduler.max_num_batched_tokens = max(scheduler.max_num_batched_tokens, target + scheduler.max_num_seqs * slots)
+
+
 def prefill_capacity(scheduler_tokens, tensor_parallel_size=4):
     if scheduler_tokens < 1:
         raise ValueError("Prefill scheduler capacity must be positive")

@@ -15,6 +15,8 @@ from types import FunctionType
 
 import numpy as np
 import torch
+
+from vllm_gaudi.compilation.deepseek_v41_frontend_cache import persistent_tensor_function
 import torch.nn.functional as F
 
 from vllm_gaudi import envs
@@ -207,7 +209,7 @@ def compiled_single_prequant(signature):
     entry = FunctionType(
         single_prequant.__code__.replace(co_name=f"prefill_single_prequant_{signature}"), single_prequant.__globals__
     )
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 @functools.lru_cache(maxsize=32)
@@ -215,7 +217,7 @@ def compiled_dual_prequant(signature):
     entry = FunctionType(
         dual_prequant.__code__.replace(co_name=f"prefill_dual_prequant_{signature}"), dual_prequant.__globals__
     )
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 def grouped_project_fp8(
@@ -393,7 +395,7 @@ def compiled_write_body_single_prequant(signature):
         grouped_body_single_prequant_write.__code__.replace(co_name=f"prefill_write_single_{signature}"),
         grouped_body_single_prequant_write.__globals__,
     )
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 @functools.lru_cache(maxsize=32)
@@ -402,7 +404,7 @@ def compiled_write_body_dual_prequant(signature):
         grouped_body_dual_prequant_write.__code__.replace(co_name=f"prefill_write_dual_{signature}"),
         grouped_body_dual_prequant_write.__globals__,
     )
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 @functools.lru_cache(maxsize=32)
@@ -410,7 +412,7 @@ def compiled_write_body(signature):
     entry = FunctionType(
         grouped_body_write.__code__.replace(co_name=f"prefill_write_{signature}"), grouped_body_write.__globals__
     )
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 @functools.lru_cache(maxsize=32)
@@ -419,7 +421,7 @@ def compiled_write_body_fp8(signature):
         grouped_body_fp8_write.__code__.replace(co_name=f"prefill_write_fp8_{signature}"),
         grouped_body_fp8_write.__globals__,
     )
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 @functools.lru_cache(maxsize=128)
@@ -429,7 +431,7 @@ def compiled_body(signature):
     entry = FunctionType(
         grouped_body.__code__.replace(co_name=f"grouped_prefill_{signature}"), grouped_body.__globals__
     )
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 @functools.lru_cache(maxsize=16)
@@ -437,7 +439,7 @@ def compiled_project(signature):
     entry = FunctionType(
         grouped_project.__code__.replace(co_name=f"grouped_project_{signature}"), grouped_project.__globals__
     )
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 @functools.lru_cache(maxsize=16)
@@ -446,7 +448,7 @@ def compiled_project_fp8(signature):
         grouped_project_fp8.__code__.replace(co_name=f"grouped_project_fp8_{signature}"),
         grouped_project_fp8.__globals__,
     )
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 def grouped_gather(value, routing, slots):
@@ -463,7 +465,7 @@ def compiled_gather(signature):
     entry = FunctionType(
         grouped_gather.__code__.replace(co_name=f"grouped_gather_{signature}"), grouped_gather.__globals__
     )
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 def prepare_device_grouped_prefill_recipes(normal_scales: bool = True, *, tensor_parallel_size=2, prefill_tokens=8192):
@@ -598,7 +600,7 @@ def compiled_reduce(signature):
     entry = FunctionType(
         ordered_reduce.__code__.replace(co_name=f"grouped_reduce_{signature}"), ordered_reduce.__globals__
     )
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 @functools.lru_cache(maxsize=32)
@@ -606,7 +608,7 @@ def compiled_routes(signature):
     entry = FunctionType(
         device_route_blocks.__code__.replace(co_name=f"prefill_routes_{signature}"), device_route_blocks.__globals__
     )
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 @functools.lru_cache(maxsize=32)
@@ -615,7 +617,7 @@ def compiled_hybrid_routes(signature):
         device_hybrid_route_blocks.__code__.replace(co_name=f"prefill_hybrid_routes_{signature}"),
         device_hybrid_route_blocks.__globals__,
     )
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 @functools.lru_cache(maxsize=32)
@@ -628,7 +630,7 @@ def compiled_destinations(signature):
     entry = FunctionType(
         destination_slots.__code__.replace(co_name=f"route_output_{signature}"), destination_slots.__globals__
     )
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 def grouped_scatter_(padded, destinations, output):
@@ -649,7 +651,7 @@ def compiled_scatter(signature):
     entry = FunctionType(
         grouped_scatter_.__code__.replace(co_name=f"route_scatter_{signature}"), grouped_scatter_.__globals__
     )
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 def run_device_grouped_prefill(
