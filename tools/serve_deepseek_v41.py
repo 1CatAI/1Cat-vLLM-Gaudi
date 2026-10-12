@@ -12,6 +12,27 @@ import time
 import urllib.request
 
 
+class StartupFailureMonitor:
+    """Detect fatal worker exits even when the API parent remains alive."""
+
+    def __init__(self, path):
+        self.path, self.offset, self.pending = path, 0, ""
+
+    def poll(self):
+        with self.path.open(errors="replace") as stream:
+            stream.seek(self.offset)
+            text = self.pending + stream.read(1 << 20)
+            self.offset = stream.tell()
+        lines = text.split("\n")
+        self.pending = lines.pop()[-16384:]
+        for line in (*lines, self.pending):
+            if re.search(r"\b(?:ERROR|CRITICAL|FATAL)\b", line) and any(
+                    term in line for term in ("WorkerProc hit an exception", "Engine core initialization failed",
+                                              "synLaunch failed", "FATAL ERROR")):
+                return line[-4096:]
+        return None
+
+
 def atomic_json(path, value, *, required=True):
     temporary = path.with_suffix(".tmp")
     try:
@@ -222,8 +243,25 @@ def main():
         signal.signal(signal.SIGINT, stop)
         ready = False
         status_write_failed = False
+        startup_monitor = StartupFailureMonitor(log_dir / "service.log")
+        startup_failure = None
         while child.poll() is None:
             if not ready:
+                startup_failure = startup_monitor.poll()
+                if startup_failure:
+                    record["startup_failure"] = startup_failure
+                    print("Startup failed; retiring owned workers: " + startup_failure, flush=True)
+                    stop(signal.SIGTERM, None)
+                    try:
+                        child.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    child.wait()
+                    break
                 try:
                     with urllib.request.urlopen(f"http://127.0.0.1:{args.port}/health", timeout=1) as response:
                         ready = response.status == 200
@@ -248,7 +286,7 @@ def main():
             time.sleep(1)
         record.update(exit_code=child.returncode, finished_at=time.time())
         atomic_json(log_dir / "process.json", record, required=False)
-    raise SystemExit(child.returncode)
+    raise SystemExit(child.returncode or (1 if startup_failure else 0))
 
 
 if __name__ == "__main__":

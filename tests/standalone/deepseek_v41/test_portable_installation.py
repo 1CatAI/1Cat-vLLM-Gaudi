@@ -300,3 +300,28 @@ def test_zero_dump_directory_rejected_before_model_loading(key):
     module = tool("serve_deepseek_v41")
     with pytest.raises(ValueError, match="dump directory"):
         module.validate_raw_trace_profile({"environment": {key: "0"}})
+
+
+def test_startup_worker_failure_is_detected_across_log_writes(tmp_path):
+    module = tool("serve_deepseek_v41")
+    log = tmp_path / "service.log"
+    log.write_text("WARNING frontend guard rejected; trying another cached variant\n")
+    monitor = module.StartupFailureMonitor(log)
+    assert monitor.poll() is None
+    assert monitor.poll() is None
+    with log.open("a") as stream:
+        stream.write("(Worker_TP1 pid=123) ERROR [multiproc_executor.py] WorkerProc hit an ")
+    assert monitor.poll() is None
+    with log.open("a") as stream:
+        stream.write("exception.")
+    assert "WorkerProc hit an exception" in monitor.poll()
+
+
+def test_startup_monitor_bounds_reads_and_reaches_late_failure(tmp_path):
+    module = tool("serve_deepseek_v41")
+    log = tmp_path / "service.log"
+    log.write_text("INFO cache hit\n" * 100000 + "ERROR RuntimeError: synLaunch failed. synStatus 30\n")
+    monitor = module.StartupFailureMonitor(log)
+    assert monitor.poll() is None
+    assert len(monitor.pending) <= 16384
+    assert "synLaunch failed" in monitor.poll()
