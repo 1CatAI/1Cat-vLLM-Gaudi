@@ -271,7 +271,8 @@ def test_python_source_digest_keeps_semantics_and_detects_restored_mtime(tmp_pat
     assert python_source_digest(path) != expected
 
 
-def test_static_helper_metadata_reuse_keeps_body_and_compile_option_dependencies():
+@pytest.mark.parametrize("factory", ("compiled_body", "_compiled_body", "_compiled"))
+def test_static_helper_metadata_reuse_keeps_body_and_compile_option_dependencies(factory):
     from vllm_gaudi.compilation.deepseek_v41_cache_identity import _python_source_digest
 
     original = '''import torch
@@ -281,6 +282,7 @@ def compiled_body(signature):
     entry = body
     return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
 '''
+    original = original.replace("compiled_body", factory)
     reused = original.replace('import torch\n', 'import torch\nfrom '
                               'vllm_gaudi.compilation.deepseek_v41_frontend_cache import persistent_tensor_function\n')
     reused = reused.replace('torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)',

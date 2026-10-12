@@ -50,7 +50,8 @@ def _python_source_digest(source, resource_environment=False):
     if helper_imports:
         tree.body = [node for node in tree.body if node not in helper_imports]
         for function in tree.body:
-            if not isinstance(function, ast.FunctionDef) or not function.name.startswith(("compiled_", "_compiled_")):
+            if (not isinstance(function, ast.FunctionDef)
+                    or not (function.name == "_compiled" or function.name.startswith(("compiled_", "_compiled_")))):
                 continue
             for node in ast.walk(function):
                 if (isinstance(node, ast.Return) and isinstance(node.value, ast.Call)

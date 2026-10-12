@@ -2032,6 +2032,10 @@ def main():
                     or args.selection_oracle or args.peer_input_oracle):
                 report.update(status="diagnostic_completed", micro_qualified=False, performance_measured=False)
                 return
+            if args.candidate == "startup_frontend":
+                report.update(status="startup_cache_correctness_qualified", performance_measured=False,
+                              performance_gain_qualified=False)
+                return
             for iteration in range(3):
                 medians = []
                 for arm, plan in enumerate(plans):
