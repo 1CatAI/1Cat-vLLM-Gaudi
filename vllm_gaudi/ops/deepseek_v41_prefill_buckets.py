@@ -8,6 +8,8 @@ import time
 
 import torch
 
+from vllm_gaudi.compilation.deepseek_v41_frontend_cache import persistent_tensor_function
+
 _ROW_BUCKETS = (64, 128, 192, 256)
 _FP8_ROW_BUCKETS = tuple(range(32, 257, 32))
 _executors = {}
@@ -78,7 +80,7 @@ def device_bucketed_route_blocks(ids, experts=384, quantum=64):
 def _compiled_routes(signature):
     entry = FunctionType(device_bucketed_route_blocks.__code__.replace(co_name=f"expert_buckets_{signature}"),
                          device_bucketed_route_blocks.__globals__)
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 class _BucketedPrefillPlans:

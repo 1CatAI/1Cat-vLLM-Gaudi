@@ -371,6 +371,7 @@ class GuardedFrontendEntry:
         if not 1 <= max_variants <= 128:
             raise ValueError("Frontend cache variant limit exceeds its bounded inventory")
         self.function, self.owner, self.backend = function, owner, backend
+        self.label = getattr(getattr(owner, "function", function), "__qualname__", function.__qualname__)
         self.directory = Path(directory)
         self.identity, self.max_variants = identity, max_variants
         self.variants = []
@@ -434,7 +435,7 @@ class GuardedFrontendEntry:
             self.stats["restore_seconds"] += time.perf_counter() - started
             from vllm_gaudi.extension.logger import logger
 
-            logger().info("V4.1 guarded frontend restored: entry=%s seconds=%.3f", self.function.__qualname__,
+            logger().info("V4.1 guarded frontend restored: entry=%s seconds=%.3f", self.label,
                           time.perf_counter() - started)
             # Deserialize one candidate at a time. A compatible guard ends
             # lookup immediately; other finite variants remain indexed for
@@ -461,7 +462,7 @@ class GuardedFrontendEntry:
 
                 reason = (artifact._artifacts.guard_manager.check_verbose(artifact.prepare_f_locals(
                     *arguments)) if defaults_match else "callable default or tensor qualification differs")
-                logger().warning("V4.1 frontend guard rejected: entry=%s reason=%s", self.function.__qualname__, reason)
+                logger().warning("V4.1 frontend guard rejected: entry=%s reason=%s", self.label, reason)
                 self.guard_miss_reported = True
         if len(self.variants) + len(self.pending) == self.max_variants:
             raise RuntimeError("Frontend variant capacity exhausted before execution")
@@ -498,7 +499,7 @@ class GuardedFrontendEntry:
         self.stats["captures"] += 1
         from vllm_gaudi.extension.logger import logger
 
-        logger().info("V4.1 guarded frontend captured: entry=%s seconds=%.3f", self.function.__qualname__,
+        logger().info("V4.1 guarded frontend captured: entry=%s seconds=%.3f", self.label,
                       time.perf_counter() - started)
         return artifact(*arguments)
 
@@ -558,6 +559,21 @@ def cached_tensor_entry(function, arguments, keywords, *, owner=None):
 
     def call(*args, **kwargs):
         return entry(args, kwargs)
+
+    return call
+
+
+def persistent_tensor_function(function):
+    """Reuse an explicit static helper's frontend and lowered backend."""
+    compiled = None
+
+    def call(*arguments, **keywords):
+        nonlocal compiled
+        if compiled is None:
+            compiled = cached_tensor_entry(function, arguments, keywords)
+            if compiled is None:
+                compiled = torch.compile(function, backend="hpu_backend", fullgraph=True, dynamic=False)
+        return compiled(*arguments, **keywords)
 
     return call
 

@@ -269,3 +269,22 @@ def test_python_source_digest_keeps_semantics_and_detects_restored_mtime(tmp_pat
     path.write_text("def operation(x):\n    return x * 3\n")
     os.utime(path, ns=(previous.st_atime_ns, previous.st_mtime_ns))
     assert python_source_digest(path) != expected
+
+
+def test_static_helper_metadata_reuse_keeps_body_and_compile_option_dependencies():
+    from vllm_gaudi.compilation.deepseek_v41_cache_identity import _python_source_digest
+
+    original = '''import torch
+def body(x):
+    return x * 2
+def compiled_body(signature):
+    entry = body
+    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+'''
+    reused = original.replace('import torch\n', 'import torch\nfrom '
+                              'vllm_gaudi.compilation.deepseek_v41_frontend_cache import persistent_tensor_function\n')
+    reused = reused.replace('torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)',
+                            'persistent_tensor_function(entry)')
+    assert _python_source_digest(original) == _python_source_digest(reused)
+    assert _python_source_digest(reused.replace('x * 2', 'x * 3')) != _python_source_digest(original)
+    assert _python_source_digest(original.replace('dynamic=False', 'dynamic=True')) != _python_source_digest(reused)

@@ -26,6 +26,19 @@ insufficient to identify edits. Syntax discovery is memoized separately; global
 values, module contents, and deferred imports are still resolved when building
 each computation identity.
 
+Static prefill helper factories use the same guarded frontend and lowered
+backend cache as the layer and protocol entries. This includes expert occupancy
+descriptors, quantization, expert bodies and reductions, selected-KV preparation,
+and index scoring. A raw `torch.compile` helper would otherwise repeat frontend
+capture and backend partitioning outside the layer cache's accounting.
+
+Prefill native-plan construction still observes current recipe inputs and
+outputs after a lowered restore. The cache stores the wrapped recipe description,
+not an old thread-local observer or captured input tensors. Tensor body and
+compilation-option fingerprints remain semantic; replacing an equivalent static
+compile factory with its metadata-cache reader does not invalidate unrelated
+decode entries. Logs identify each helper by its function name.
+
 ## Memory admission certificate
 
 DSpark startup historically measured the temporary profiling pool before warming
@@ -86,6 +99,11 @@ frontend capture or backend repartitioning. Component improvements alone do not
 qualify startup. After readiness, exercise fixed quality samples, prefix reuse,
 tool calls, and one unprofiled official long-input request to natural EOS. Keep
 those results tied to the serving installation and its effective settings.
+
+Before readiness, the service launcher monitors fatal worker errors as well as
+the API parent process. A worker failure retires the owned process group promptly
+and records startup failure; a surviving API parent cannot turn a failed warmup
+into a prolonged readiness wait.
 
 Native replay scratch must be included in device admission alongside the
 framework allocator. Increasing the framework pool can starve the separate

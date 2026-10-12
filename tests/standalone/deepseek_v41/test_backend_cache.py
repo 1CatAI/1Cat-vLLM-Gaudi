@@ -130,3 +130,26 @@ def test_jit_tensor_literal_transport_preserves_scalar_nodes_and_values():
     restored = torch._C._create_function_from_graph("restored", restore_jit(text, records))
     for value in (1., 2., 3.):
         assert torch.equal(restored(torch.full((4, ), value)), original(torch.full((4, ), value)))
+
+
+def test_restored_prefill_recipe_records_current_native_plan_inputs(monkeypatch):
+    from vllm_gaudi.compilation.deepseek_v41_backend_cache import DeferredRecipe
+    from vllm_gaudi.ops.deepseek_v41_prefill_plan import _local
+
+    class Recipe:
+        _recipe_id = 123
+        _in_to_out_dups = {0: 1}
+
+        def __call__(self, value):
+            return value * 2, value
+
+    deferred = DeferredRecipe({})
+    deferred.runtime = Recipe()
+    calls = []
+    monkeypatch.setattr(_local, "calls", calls, raising=False)
+    for value in (torch.ones(6), torch.full((6,), 2.), torch.full((6,), 3.)):
+        output, alias = deferred(value)
+        recipe, inputs, outputs = calls[-1]
+        assert recipe == 123 and inputs[0] is value
+        assert len(outputs) == 1 and outputs[0] is output and alias is value
+    assert len(calls) == 3

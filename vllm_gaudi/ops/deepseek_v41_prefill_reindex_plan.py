@@ -6,6 +6,8 @@ from types import FunctionType
 
 import torch
 
+from vllm_gaudi.compilation.deepseek_v41_frontend_cache import persistent_tensor_function
+
 from vllm_gaudi.ops.deepseek_v41_prefill_index_scores import INDEX_KEY_TILE, _candidate_slot_topk
 
 SOURCE_WINDOW = 8192
@@ -40,14 +42,14 @@ def layout(value):
 def compiled_scores(signature):
     entry = FunctionType(source_scores.__code__.replace(co_name=f"reindex_scores_{signature}"),
                          source_scores.__globals__)
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 @lru_cache(maxsize=64)
 def compiled_select(signature):
     entry = FunctionType(select_scores.__code__.replace(co_name=f"reindex_choices_{signature}"),
                          select_scores.__globals__)
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 class _Step:

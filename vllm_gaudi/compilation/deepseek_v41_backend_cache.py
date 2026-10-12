@@ -147,7 +147,16 @@ class DeferredRecipe(torch.nn.Module):
         self.runtime = None
 
     def forward(self, *args):
-        return self.materialize()(*args)
+        recipe = self.materialize()
+        result = recipe(*args)
+        from vllm_gaudi.ops.deepseek_v41_prefill_plan import _local
+
+        calls = getattr(_local, "calls", None)
+        if calls is not None:
+            outputs = list(result) if isinstance(result, (tuple, list)) else [result]
+            aliases = set((recipe._in_to_out_dups or {}).values())
+            calls.append((recipe._recipe_id, list(args), [v for i, v in enumerate(outputs) if i not in aliases]))
+        return result
 
     def materialize(self):
         if self.runtime is None:
@@ -221,6 +230,13 @@ def _portable_graph(module):
             node.meta["dsv41_boxed_list_clear"] = True
     result.recompile()
     for name, child in module.named_children():
+        # This wrapper observes only the current plan-construction scope.
+        # Persist its recipe description; the restored owner records fresh
+        # bindings above instead of retaining the old thread-local observer.
+        if (type(child).__module__ == "vllm_gaudi.ops.deepseek_v41_prefill_plan"
+                and type(child).__qualname__ == "register_prefill_plan_pass.<locals>.Observe"
+                and isinstance(child.recipe, HabanaGraphModule)):
+            child = child.recipe
         if isinstance(child, HabanaGraphModule):
             if child.is_dynamic or not child.is_inference:
                 raise ValueError("Persistent lowered recipes require static inference")

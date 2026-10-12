@@ -9,6 +9,8 @@ from functools import lru_cache
 from types import FunctionType
 
 import torch
+
+from vllm_gaudi.compilation.deepseek_v41_frontend_cache import persistent_tensor_function
 from vllm_gaudi import envs as gaudi_envs
 
 
@@ -51,7 +53,7 @@ def _assemble(main, swa, indices, selected):
 def _compiled(function, signature):
     entry = FunctionType(function.__code__.replace(co_name=f"prefill_shared_kv_{function.__name__}_{signature}"),
                          function.__globals__)
-    return torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)
+    return persistent_tensor_function(entry)
 
 
 def _signature(*values):

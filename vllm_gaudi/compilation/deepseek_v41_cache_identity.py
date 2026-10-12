@@ -40,6 +40,25 @@ def normalized_source(value):
 @lru_cache(maxsize=512)
 def _python_source_digest(source, resource_environment=False):
     tree = ast.parse(source)
+    # Explicit static-helper factories gain metadata reuse without changing
+    # their tensor bodies or compilation options. Retain those bodies' old
+    # identities so adding a cache reader cannot flush unrelated decode graphs.
+    helper_module = "vllm_gaudi.compilation.deepseek_v41_frontend_cache"
+    helper_imports = [node for node in tree.body if isinstance(node, ast.ImportFrom)
+                      and node.module == helper_module and len(node.names) == 1
+                      and node.names[0].name == "persistent_tensor_function" and node.names[0].asname is None]
+    if helper_imports:
+        tree.body = [node for node in tree.body if node not in helper_imports]
+        for function in tree.body:
+            if not isinstance(function, ast.FunctionDef) or not function.name.startswith(("compiled_", "_compiled_")):
+                continue
+            for node in ast.walk(function):
+                if (isinstance(node, ast.Return) and isinstance(node.value, ast.Call)
+                        and isinstance(node.value.func, ast.Name) and node.value.func.id == "persistent_tensor_function"
+                        and len(node.value.args) == 1 and isinstance(node.value.args[0], ast.Name)
+                        and node.value.args[0].id == "entry" and not node.value.keywords):
+                    node.value = ast.parse(
+                        'torch.compile(entry, backend="hpu_backend", fullgraph=True, dynamic=False)', mode="eval").body
     if resource_environment:
         # Registration of this native allocation-only setting does not
         # change any Python numerical path. Keep every other environment

@@ -38,6 +38,43 @@ def defaults_transform(value, multiplier=2., *, shift=.5):
     return value * multiplier + shift
 
 
+def helper_state(value, weight, state):
+    output = value @ weight
+    state.copy_(output)
+    return output, state
+
+
+def test_static_helper_restarts_without_frontend_or_backend_reconstruction(tmp_path, monkeypatch):
+    from torch._dynamo.backends import registry
+    from vllm_gaudi.compilation.deepseek_v41_frontend_cache import persistent_tensor_function
+
+    monkeypatch.setenv("VLLM_HPU_DSV41_FRONTEND_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("DSV41_SERVING_RUNTIME", "runtime-proof")
+    monkeypatch.setenv("DSV41_SERVING_COMPILE_IDENTITY", "1" * 64)
+    compilations = []
+
+    def counted_backend(graph, inputs):
+        compilations.append(True)
+        return graph.forward
+
+    monkeypatch.setattr(registry, "lookup_backend", lambda name: counted_backend)
+    first = persistent_tensor_function(helper_state)
+    inputs, weight, state = torch.ones((6, 8)), torch.ones((8, 8)), torch.zeros((6, 8))
+    for _ in range(4):
+        first(inputs, weight, state)
+    assert len(compilations) == 1
+    artifacts = {p: p.stat().st_mtime_ns for p in tmp_path.rglob("*.bin")}
+    assert artifacts
+    restored = persistent_tensor_function(helper_state)
+    for value in (1., 2., 3.):
+        inputs, weight, state = torch.full((6, 8), value), torch.full((8, 8), value + 1), torch.zeros((6, 8))
+        output, changed = restored(inputs, weight, state)
+        assert torch.equal(output, inputs @ weight)
+        assert torch.equal(changed, output) and changed.data_ptr() == state.data_ptr()
+    assert len(compilations) == 1
+    assert artifacts == {p: p.stat().st_mtime_ns for p in tmp_path.rglob("*.bin")}
+
+
 class DefaultedStateGroup(StateGroup):
 
     def forward(self, inputs):
