@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "qualification": "experimental; bounded short-prefix and whole-pool recipe selection; service qualification pending",
-  "requires_base_patch_sha256": "eeeb7478d958920b8d8282081ef2479d170d5c188c68932a5542f1fbe796f641",
+  "requires_base_patch_sha256": "718784421296e4373fce5678580eef79a030cc69c39dac92b676b3062037ee04",
   "patch": "synapse-bounded-reindex.patch",
   "sha256": "1860c18a827b446f7c583eb80661303d46b8d376de0301ce890a278dd237c1ec",
   "files": {

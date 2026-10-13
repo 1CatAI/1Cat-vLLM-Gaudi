@@ -3561,10 +3561,10 @@ index ef3d760..755a14d 100644
 \ No newline at end of file
 +#endif  // _OP_VALIDATOR_H_
 diff --git a/synapse/src/graph_compiler/passes/allocate_tensors.cpp b/synapse/src/graph_compiler/passes/allocate_tensors.cpp
-index 58d6357..8f655d6 100644
+index 58d6357..5d884cd 100644
 --- a/synapse/src/graph_compiler/passes/allocate_tensors.cpp
 +++ b/synapse/src/graph_compiler/passes/allocate_tensors.cpp
-@@ -82,45 +82,56 @@ static void clearAllocationStateBeforeRecalculation(HabanaGraph& g, const Tensor
+@@ -82,45 +82,62 @@ static void clearAllocationStateBeforeRecalculation(HabanaGraph& g, const Tensor
      std::for_each(tensors.begin(), tensors.end(), [](auto& tensor) { tensor->unsetDramOffset(); });
  }
  
@@ -3590,8 +3590,15 @@ index 58d6357..8f655d6 100644
 +                                    GCFG_ENABLE_PERSISTENT_INPUT_REUSE.value();
 +            if (reuseOutput || reuseInput)
              {
-                 if (memoryCoherence->previousOverlapsWithOthersInSection(t)) continue;
+-                if (memoryCoherence->previousOverlapsWithOthersInSection(t)) continue;
 -                outputTensors.push_back(t);
++                // An output's memory is lent out before the output is produced, so nothing written there
++                // earlier may overlap it. An input's memory is lent out after its final consumer, so nothing
++                // else may overlap it at all: an output written in place into the input's memory, or one
++                // written there before, must survive to the end of the graph.
++                const bool overlaps = reuseInput ? memoryCoherence->overlapsWithOthersInSection(t)
++                                                 : memoryCoherence->previousOverlapsWithOthersInSection(t);
++                if (overlaps) continue;
 +                reusableTensors.push_back(t);
              }
          }
@@ -3632,7 +3639,7 @@ index 58d6357..8f655d6 100644
  }
  
  static bool allocateRemainingTensors(HabanaGraph& g, const TensorVector& tensors)
-@@ -131,12 +142,12 @@ static bool allocateRemainingTensors(HabanaGraph& g, const TensorVector& tensors
+@@ -131,12 +148,12 @@ static bool allocateRemainingTensors(HabanaGraph& g, const TensorVector& tensors
      AllLivenessAnalysis            allLivenessAnalysis(&g);
      auto                           maxLiveCapacity = livenessAnalysis.getGraphMaxCapacity();
      const std::vector<uint64_t>&   usedMem         = livenessAnalysis.getUsedMem();
@@ -3650,7 +3657,7 @@ index 58d6357..8f655d6 100644
                                                allLivenessAnalysis,
                                                workSpaceAllocator,
                                                0);
-@@ -150,7 +161,7 @@ static bool allocateRemainingTensors(HabanaGraph& g, const TensorVector& tensors
+@@ -150,7 +167,7 @@ static bool allocateRemainingTensors(HabanaGraph& g, const TensorVector& tensors
          // actual allocation
          LOG_INFO(TENSORS_ALLOC,
                   "DRAM allocation using default allocator -- Tensors workspace size: {}, max live capacity measured: "
@@ -3659,7 +3666,7 @@ index 58d6357..8f655d6 100644
                   initialWorkspaceSize,
                   maxLiveCapacity,
                   adjustedMaxLiveCapacity);
-@@ -177,7 +188,7 @@ static bool allocateRemainingTensors(HabanaGraph& g, const TensorVector& tensors
+@@ -177,7 +194,7 @@ static bool allocateRemainingTensors(HabanaGraph& g, const TensorVector& tensors
      {
          // learning of the workspace size, we use a local allocator in here
          currentWorkspaceSize            = (minWorkspaceSize + maxWorkspaceSize) / 2;
@@ -3668,7 +3675,7 @@ index 58d6357..8f655d6 100644
          double workspaceSizeRangeFactor = static_cast<double>(maxWorkspaceSize) / minWorkspaceSize;
          if (workspaceSizeRangeFactor <= 1 + GCFG_WORKSPACE_EPOCH_SIZE_PERCISION.value()) break;
          clearAllocationStateBeforeRecalculation(g, tensors);
-@@ -222,7 +233,7 @@ static bool allocateRemainingTensors(HabanaGraph& g, const TensorVector& tensors
+@@ -222,7 +239,7 @@ static bool allocateRemainingTensors(HabanaGraph& g, const TensorVector& tensors
          LOG_INFO(TENSORS_ALLOC,
                   "DRAM allocation using epoch allocator -- Epoch size {} Tensors workspace size: {}, default allocator "
                   "workspace "
@@ -3677,7 +3684,7 @@ index 58d6357..8f655d6 100644
                   bestEpochSize,
                   bestWorkspaceSize,
                   defaultAllocationSuccess ? initialWorkspaceSize : UINT64_MAX,
-@@ -237,7 +248,7 @@ static bool allocateRemainingTensors(HabanaGraph& g, const TensorVector& tensors
+@@ -237,7 +254,7 @@ static bool allocateRemainingTensors(HabanaGraph& g, const TensorVector& tensors
      }
      LOG_INFO(TENSORS_ALLOC,
               "DRAM allocation using default allocator -- Tensors workspace size: {}, max live capacity measured: {}, "
@@ -3686,7 +3693,7 @@ index 58d6357..8f655d6 100644
               initialWorkspaceSize,
               maxLiveCapacity,
               adjustedMaxLiveCapacity);
-@@ -373,9 +384,9 @@ bool allocateTensors(HabanaGraph& g)
+@@ -373,9 +390,9 @@ bool allocateTensors(HabanaGraph& g)
          }
      }
  
