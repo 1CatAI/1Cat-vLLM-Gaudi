@@ -8,7 +8,7 @@ import time
 
 import torch
 
-from vllm_gaudi.ops.deepseek_v41_batch_input import fill_request_metadata
+from vllm_gaudi.ops.deepseek_v41_batch_input import RequestInputFrame
 import torch.distributed as dist
 
 from vllm.sequence import IntermediateTensors
@@ -23,7 +23,7 @@ class BatchExecution:
         self.model, self.device = runner.model, runner.device
         self.bank = self.model.batch_state
         self.buckets = tuple(b for b in (1, 2, 4, 8, 16, 32, 64) if b <= 1 << (capacity - 1).bit_length())
-        self.buffers, self.samplers = {}, {}
+        self.buffers, self.samplers, self.input_frames = {}, {}, {}
         for b in self.buckets:
             host = torch.zeros(3, b, dtype=torch.int32).pin_memory("hpu")
             meta = torch.zeros_like(host, device=self.device)
@@ -34,6 +34,7 @@ class BatchExecution:
             token = torch.zeros(b, 1, dtype=torch.int32, device=self.device)
             token_host = torch.zeros(b, 1, dtype=torch.int32).pin_memory("hpu")
             self.buffers[b] = (host, meta, pages, packet, hidden, pre, token, token_host)
+            self.input_frames[b] = RequestInputFrame(self.bank, host, meta, pages)
             if self.model.pp_rank == 1:
                 self.samplers[b] = torch.compile(self.model.program.sample_greedy_token,
                                                  backend="hpu_backend",
@@ -131,10 +132,7 @@ class BatchExecution:
             with torch.profiler.record_function(f"v41::batch_slots::generation{self.generation}::{mapping}"):
                 pass
         host, meta, pages, packet, hidden, pre, token, token_host = self.buffers[b]
-        fill_request_metadata(host, requests, owners, input_ids=(span[2][0] for span in spans))
-        meta.copy_(host, non_blocking=True)
-        ids, positions, slots = meta.unbind(0)
-        torch.index_select(self.bank.pages, 0, slots.clamp_min(0).long(), out=pages)
+        ids, positions, slots = self.input_frames[b].prepare(requests, owners, input_ids=(span[2][0] for span in spans))
         pp = self.runner.pp.group
         if self.model.pp_rank == 0:
             values = self.model.forward_request_batch(ids, positions, slots, pages, spans)
